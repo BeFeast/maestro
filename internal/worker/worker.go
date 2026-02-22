@@ -56,7 +56,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 
 	// Assemble worker prompt
-	prompt := assemblePrompt(promptBase, issue, worktreePath, cfg)
+	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 
 	// Write prompt to file
 	promptFile := filepath.Join(state.StateDir(repo), fmt.Sprintf("%s-prompt.md", slotName))
@@ -185,7 +185,24 @@ func slugify(title string) string {
 	return s
 }
 
-func assemblePrompt(base string, issue github.Issue, worktreePath string, cfg *config.Config) string {
+// assemblePrompt builds the final worker prompt.
+// If the base template contains {{ISSUE_NUMBER}} placeholders, it performs
+// template substitution. Otherwise it falls back to appending a task block.
+func assemblePrompt(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config) string {
+	if strings.Contains(base, "{{ISSUE_NUMBER}}") {
+		// Template-style substitution
+		r := strings.NewReplacer(
+			"{{ISSUE_NUMBER}}", fmt.Sprintf("%d", issue.Number),
+			"{{ISSUE_TITLE}}", issue.Title,
+			"{{ISSUE_BODY}}", issue.Body,
+			"{{BRANCH}}", branchName,
+			"{{WORKTREE}}", worktreePath,
+			"{{REPO}}", cfg.Repo,
+		)
+		return r.Replace(base)
+	}
+
+	// Legacy: append task block after base prompt
 	return fmt.Sprintf(`%s
 
 ---

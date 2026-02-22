@@ -6,6 +6,7 @@ claude_cmd: claude
 issue_label: enhancement
 exclude_labels:
   - blocked
+worker_prompt: /home/shtrudel/src/maestro/worker-prompt-template.md
 telegram:
   target: "79510949"
   openclaw_url: "http://localhost:18789"

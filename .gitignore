@@ -1,0 +1,10 @@
+# Binary
+maestro
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

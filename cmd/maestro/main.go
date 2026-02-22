@@ -168,10 +168,14 @@ func spawnCmd(args []string) {
 		log.Fatalf("load state: %v", err)
 	}
 
-	// Load prompt
+	// Load prompt: flag > config.WorkerPrompt > built-in fallback
+	resolvedPromptPath := *promptPath
+	if resolvedPromptPath == "" {
+		resolvedPromptPath = cfg.WorkerPrompt
+	}
 	var promptBase string
-	if *promptPath != "" {
-		data, err := os.ReadFile(*promptPath)
+	if resolvedPromptPath != "" {
+		data, err := os.ReadFile(resolvedPromptPath)
 		if err != nil {
 			log.Fatalf("read prompt: %v", err)
 		}

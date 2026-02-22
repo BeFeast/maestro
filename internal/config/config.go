@@ -21,6 +21,7 @@ type Config struct {
 	ClaudeCmd     string         `yaml:"claude_cmd"`
 	IssueLabel    string         `yaml:"issue_label"`
 	ExcludeLabels []string       `yaml:"exclude_labels"`
+	WorkerPrompt  string         `yaml:"worker_prompt"`
 	Telegram      TelegramConfig `yaml:"telegram"`
 }
 
@@ -60,6 +61,7 @@ func Load() (*Config, error) {
 	// Expand ~ in paths
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
+	cfg.WorkerPrompt = expandHome(cfg.WorkerPrompt)
 
 	if cfg.Telegram.OpenclawURL == "" {
 		cfg.Telegram.OpenclawURL = "http://localhost:18789"

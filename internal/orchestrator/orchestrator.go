@@ -32,10 +32,16 @@ func New(cfg *config.Config) *Orchestrator {
 	}
 }
 
-// LoadPromptBase reads the orchestrator prompt from known location
+// LoadPromptBase reads the worker prompt template from config or a provided path.
+// Priority: 1) explicit promptPath arg, 2) cfg.WorkerPrompt, 3) built-in fallback.
 func (o *Orchestrator) LoadPromptBase(promptPath string) error {
 	if promptPath == "" {
-		promptPath = fmt.Sprintf("%s/.agent-orchestrator/b15d7eaaac6c-panoptikon/orchestrator-prompt.md", os.Getenv("HOME"))
+		promptPath = o.cfg.WorkerPrompt
+	}
+	if promptPath == "" {
+		log.Printf("[orch] warn: no worker_prompt configured, using built-in fallback")
+		o.promptBase = "You are a coding agent. Implement the given issue in the provided worktree."
+		return nil
 	}
 	data, err := os.ReadFile(promptPath)
 	if err != nil {
