@@ -181,3 +181,11 @@ maestro run --interval 10m
 - `gh` CLI (GitHub operations)
 - `git` (worktree management)
 - `claude` CLI (agent invocation)
+
+## Acknowledgments
+
+Inspired by [agent-orchestrator (ao)](https://www.npmjs.com/package/agent-orchestrator) — a great tool for parallelizing AI coding agents across git worktrees. maestro started as a replacement for our ao + shell scripts setup, borrowing the core idea of session-per-issue isolation in worktrees and rewriting it in Go for faster iteration cycles and better process reliability.
+
+## License
+
+[MIT](./LICENSE) — Copyright (c) 2026 Oleg Kossoy
