@@ -1,0 +1,11 @@
+repo: BeFeast/panoptikon
+local_path: /home/shtrudel/src/panoptikon
+worktree_base: /home/shtrudel/.worktrees/panoptikon
+max_parallel: 5
+claude_cmd: claude
+issue_label: enhancement
+exclude_labels:
+  - blocked
+telegram:
+  target: "79510949"
+  openclaw_url: "http://localhost:18789"
