@@ -182,6 +182,26 @@ func (c *Client) MergePR(prNumber int) error {
 	return nil
 }
 
+// CloseIssue closes a GitHub issue and leaves a comment explaining why
+func (c *Client) CloseIssue(number int, comment string) error {
+	if comment != "" {
+		out, err := exec.Command("gh", "issue", "comment",
+			fmt.Sprint(number),
+			"--repo", c.Repo,
+			"--body", comment).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("gh issue comment %d: %w\n%s", number, err, out)
+		}
+	}
+	out, err := exec.Command("gh", "issue", "close",
+		fmt.Sprint(number),
+		"--repo", c.Repo).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh issue close %d: %w\n%s", number, err, out)
+	}
+	return nil
+}
+
 // HasLabel returns true if any of the issue's labels match
 func HasLabel(issue Issue, labels []string) bool {
 	for _, l := range issue.Labels {
