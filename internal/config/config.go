@@ -50,8 +50,9 @@ type Config struct {
 	LocalPath         string           `yaml:"local_path"`
 	WorktreeBase      string           `yaml:"worktree_base"`
 	MaxParallel       int              `yaml:"max_parallel"`
-	ClaudeCmd         string           `yaml:"claude_cmd"`  // deprecated: use model.backends.claude.cmd
-	IssueLabel        string           `yaml:"issue_label"` // deprecated: use issue_labels
+	MaxRuntimeMinutes int              `yaml:"max_runtime_minutes"` // max worker runtime in minutes (default: 120)
+	ClaudeCmd         string           `yaml:"claude_cmd"`          // deprecated: use model.backends.claude.cmd
+	IssueLabel        string           `yaml:"issue_label"`         // deprecated: use issue_labels
 	IssueLabels       []string         `yaml:"issue_labels"`
 	ExcludeLabels     []string         `yaml:"exclude_labels"`
 	WorkerPrompt      string           `yaml:"worker_prompt"`
@@ -99,8 +100,9 @@ func Load() (*Config, error) {
 func parse(data []byte) (*Config, error) {
 
 	cfg := &Config{
-		MaxParallel: 5,
-		ClaudeCmd:   "claude",
+		MaxParallel:       5,
+		MaxRuntimeMinutes: 120,
+		ClaudeCmd:         "claude",
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)

@@ -221,11 +221,21 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				continue
 			}
 
-			// Check for stale sessions (> 2h)
+			// Check if worker exceeded max runtime — kill if so
+			maxMinutes := o.cfg.MaxRuntimeMinutes
+			if sess.LongRunning {
+				maxMinutes *= 2
+			}
+			maxRuntime := time.Duration(maxMinutes) * time.Minute
 			age := time.Since(sess.StartedAt)
-			if age > 2*time.Hour {
-				o.notifier.Sendf("⏰ maestro: worker %s has been running for %s (issue #%d: %s) — might be stuck",
-					slotName, age.Round(time.Minute), sess.IssueNumber, sess.IssueTitle)
+			if age > maxRuntime {
+				log.Printf("[orch] worker %s exceeded max runtime (%dm), killing", slotName, maxMinutes)
+				worker.Stop(o.cfg, slotName, sess)
+				sess.Status = state.StatusDead
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
+				o.notifier.Sendf("💀 maestro: worker for #%d killed after %dm (max runtime exceeded)",
+					sess.IssueNumber, int(age.Minutes()))
 			}
 		}
 	}
@@ -373,14 +383,18 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
-		// Detect model: label for backend selection (label takes precedence)
+		// Detect model: label for backend selection (label takes precedence) and long-running label
 		backendName := ""
+		longRunning := false
 		for _, label := range issue.Labels {
 			if strings.HasPrefix(label.Name, "model:") {
 				if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
 					backendName = name
 					log.Printf("[router] issue #%d → %s (label override)", issue.Number, backendName)
 				}
+			}
+			if strings.EqualFold(label.Name, "long-running") {
+				longRunning = true
 			}
 		}
 
@@ -401,7 +415,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 
 		promptBase := o.selectPrompt(issue)
-		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s)", issue.Number, issue.Title, backendName)
+		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, long_running=%v)", issue.Number, issue.Title, backendName, longRunning)
 		slotName, err := worker.Start(o.cfg, s, o.repo, issue, promptBase, backendName)
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
@@ -410,6 +424,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
+		if longRunning {
+			s.Sessions[slotName].LongRunning = true
+		}
 		o.notifier.Sendf("🚀 maestro: started worker %s for issue #%d: %s", slotName, issue.Number, issue.Title)
 		started++
 	}
