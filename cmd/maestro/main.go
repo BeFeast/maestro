@@ -38,6 +38,7 @@ Commands:
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
+  history       Show recently completed sessions
   version-bump  Bump project version based on merged PR labels
   version       Print version
 
@@ -65,6 +66,12 @@ Version-bump flags:
 Logs:
   maestro logs              List active worker logs + tmux attach hints
   maestro logs <slot>       tail -f specific worker log (e.g. maestro logs pan-20)
+
+History:
+  maestro history              Show last 20 completed sessions
+  maestro history --limit 50   Show last 50 completed sessions
+  maestro history --json       Machine-readable JSON output
+  maestro history --prune      Remove sessions older than retention period
 
 Watch:
   maestro watch             Open tmux dashboard with all active worker logs
@@ -101,6 +108,8 @@ func main() {
 		killCmd(args)
 	case "import":
 		importCmd(args)
+	case "history":
+		historyCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
 	case "version":
@@ -588,6 +597,96 @@ func importCmd(args []string) {
 	}
 }
 
+func historyCmd(args []string) {
+	fs := flag.NewFlagSet("history", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
+	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	limit := fs.Int("limit", 20, "Number of recent sessions to show")
+	prune := fs.Bool("prune", false, "Remove sessions older than retention period")
+	retentionDays := fs.Int("retention-days", 30, "Retention period in days for pruning")
+	fs.Parse(args)
+
+	cfg := loadConfig(*configPath)
+
+	s, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+
+	if *prune {
+		maxAge := time.Duration(*retentionDays) * 24 * time.Hour
+		pruned := s.PruneOldSessions(maxAge)
+		if pruned > 0 {
+			if err := state.Save(cfg.StateDir, s); err != nil {
+				log.Fatalf("save state: %v", err)
+			}
+		}
+		fmt.Printf("Pruned %d sessions older than %d days.\n", pruned, *retentionDays)
+		return
+	}
+
+	completed := s.CompletedSessions()
+	if *limit > 0 && len(completed) > *limit {
+		completed = completed[:*limit]
+	}
+
+	if *jsonOutput {
+		type jsonEntry struct {
+			Session    string `json:"session"`
+			Issue      int    `json:"issue"`
+			Title      string `json:"title"`
+			Status     string `json:"status"`
+			PRNumber   int    `json:"pr_number,omitempty"`
+			Duration   string `json:"duration"`
+			FinishedAt string `json:"finished_at,omitempty"`
+			Backend    string `json:"backend,omitempty"`
+		}
+		entries := make([]jsonEntry, 0, len(completed))
+		for _, c := range completed {
+			entry := jsonEntry{
+				Session:  c.SlotName,
+				Issue:    c.IssueNumber,
+				Title:    c.IssueTitle,
+				Status:   string(c.Status),
+				PRNumber: c.PRNumber,
+				Duration: sessionDuration(c.Session),
+				Backend:  c.Backend,
+			}
+			if c.FinishedAt != nil {
+				entry.FinishedAt = c.FinishedAt.Format(time.RFC3339)
+			}
+			entries = append(entries, entry)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(entries)
+		return
+	}
+
+	if len(completed) == 0 {
+		fmt.Println("No completed sessions.")
+		return
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SESSION\tISSUE\tOUTCOME\tPR\tDURATION\tFINISHED\tTITLE")
+	fmt.Fprintln(w, "-------\t-----\t-------\t--\t--------\t--------\t-----")
+	for _, c := range completed {
+		pr := "-"
+		if c.PRNumber > 0 {
+			pr = fmt.Sprintf("#%d", c.PRNumber)
+		}
+		finished := "-"
+		if c.FinishedAt != nil {
+			finished = formatRelativeTime(*c.FinishedAt)
+		}
+		fmt.Fprintf(w, "%s\t#%d\t%s\t%s\t%s\t%s\t%s\n",
+			c.SlotName, c.IssueNumber, outcomeLabel(c.Status),
+			pr, sessionDuration(c.Session), finished, truncate(c.IssueTitle, 40))
+	}
+	w.Flush()
+}
+
 func versionBumpCmd(args []string) {
 	fs := flag.NewFlagSet("version-bump", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to config file")
@@ -607,6 +706,59 @@ func versionBumpCmd(args []string) {
 	}
 
 	fmt.Println("Version bump complete.")
+}
+
+func sessionDuration(sess *state.Session) string {
+	end := time.Now()
+	if sess.FinishedAt != nil {
+		end = *sess.FinishedAt
+	}
+	d := end.Sub(sess.StartedAt).Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh%dm", h, m)
+}
+
+func outcomeLabel(status state.SessionStatus) string {
+	switch status {
+	case state.StatusDone:
+		return "merged"
+	case state.StatusDead:
+		return "died"
+	case state.StatusConflictFailed:
+		return "conflict"
+	case state.StatusFailed:
+		return "failed"
+	default:
+		return string(status)
+	}
+}
+
+func formatRelativeTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		days := int(d.Hours()) / 24
+		if days == 1 {
+			return "1d ago"
+		}
+		return fmt.Sprintf("%dd ago", days)
+	}
 }
 
 func truncate(s string, max int) string {

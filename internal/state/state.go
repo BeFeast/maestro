@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -121,4 +122,64 @@ func (s *State) IssueInProgress(issueNum int) bool {
 		}
 	}
 	return false
+}
+
+// IsTerminal returns true if the status represents a completed/dead session.
+func IsTerminal(status SessionStatus) bool {
+	switch status {
+	case StatusDone, StatusFailed, StatusConflictFailed, StatusDead:
+		return true
+	}
+	return false
+}
+
+// CompletedSession is a Session paired with its slot name.
+type CompletedSession struct {
+	SlotName string
+	*Session
+}
+
+// CompletedSessions returns sessions in a terminal state, sorted by FinishedAt descending.
+func (s *State) CompletedSessions() []CompletedSession {
+	var result []CompletedSession
+	for name, sess := range s.Sessions {
+		if IsTerminal(sess.Status) {
+			result = append(result, CompletedSession{SlotName: name, Session: sess})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		fi, fj := result[i].FinishedAt, result[j].FinishedAt
+		if fi == nil && fj == nil {
+			return result[i].StartedAt.After(result[j].StartedAt)
+		}
+		if fi == nil {
+			return false
+		}
+		if fj == nil {
+			return true
+		}
+		return fi.After(*fj)
+	})
+	return result
+}
+
+// PruneOldSessions removes completed sessions older than maxAge.
+// Returns the number of pruned sessions.
+func (s *State) PruneOldSessions(maxAge time.Duration) int {
+	pruned := 0
+	for name, sess := range s.Sessions {
+		if !IsTerminal(sess.Status) {
+			continue
+		}
+		finished := sess.FinishedAt
+		if finished == nil {
+			// Fallback: use StartedAt if FinishedAt is not set
+			finished = &sess.StartedAt
+		}
+		if time.Since(*finished) > maxAge {
+			delete(s.Sessions, name)
+			pruned++
+		}
+	}
+	return pruned
 }
