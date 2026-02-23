@@ -31,6 +31,7 @@ type Session struct {
 	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
 	Status      SessionStatus `json:"status"`
 	PRNumber    int           `json:"pr_number,omitempty"`
+	Backend     string        `json:"backend,omitempty"` // "claude", "codex", etc.
 }
 
 type State struct {

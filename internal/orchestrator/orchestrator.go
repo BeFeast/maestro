@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -300,7 +301,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 
 // startNewWorkers picks eligible issues and starts workers for them
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
-	issues, err := o.gh.ListOpenIssues(o.cfg.IssueLabel)
+	issues, err := o.gh.ListOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
 		return
@@ -321,8 +322,18 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
-		log.Printf("[orch] starting worker for issue #%d: %s", issue.Number, issue.Title)
-		slotName, err := worker.Start(o.cfg, s, o.repo, issue, o.promptBase)
+		// Detect model: label for backend selection
+		backendName := o.cfg.Model.Default
+		for _, label := range issue.Labels {
+			if strings.HasPrefix(label.Name, "model:") {
+				if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
+					backendName = name
+				}
+			}
+		}
+
+		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s)", issue.Number, issue.Title, backendName)
+		slotName, err := worker.Start(o.cfg, s, o.repo, issue, o.promptBase, backendName)
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",

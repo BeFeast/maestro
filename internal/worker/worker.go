@@ -44,8 +44,9 @@ func TmuxSessionName(slotName string) string {
 	return "maestro-" + slotName
 }
 
-// Start spawns a new worker for the given issue inside a tmux session
-func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string) (string, error) {
+// Start spawns a new worker for the given issue inside a tmux session.
+// backendName selects the model backend ("claude", "codex", etc.); empty defaults to config.
+func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string) (string, error) {
 	prefix := SlotPrefix(cfg.Repo)
 	slotName := s.NextSlotName(prefix)
 
@@ -70,6 +71,24 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		return "", fmt.Errorf("write prompt file: %w", err)
 	}
 
+	// Determine backend
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return "", fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := BackendConfig{
+		Cmd:       backendDef.Cmd,
+		ExtraArgs: backendDef.ExtraArgs,
+	}
+
 	// Prepare log file
 	logDir := state.LogDir(repo)
 	if err := os.MkdirAll(logDir, 0755); err != nil {
@@ -77,10 +96,24 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 	logFile := filepath.Join(logDir, slotName+".log")
 
-	// Write runner script that execs claude and tees to log
+	// Build the worker command to generate the runner script
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
+	if err != nil {
+		return "", fmt.Errorf("build worker cmd: %w", err)
+	}
+
+	// Write runner script
 	runnerPath := filepath.Join(stateDir, slotName+"-run.sh")
-	runnerContent := fmt.Sprintf("#!/bin/bash\nexec %s --dangerously-skip-permissions -p \"$(cat %q)\" 2>&1 | tee -a %q\n",
-		cfg.ClaudeCmd, promptFile, logFile)
+	var runnerContent string
+	if stdinFile != "" {
+		// Stdin-based backends (e.g. codex): redirect prompt file to stdin via shell
+		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s < %q 2>&1 | tee -a %q\n",
+			shellJoin(workerCmd.Args), stdinFile, logFile)
+	} else {
+		// Arg-based backends (e.g. claude): prompt is already in args
+		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s 2>&1 | tee -a %q\n",
+			shellJoin(workerCmd.Args), logFile)
+	}
 	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
 		return "", fmt.Errorf("write runner script: %w", err)
 	}
@@ -114,6 +147,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		LogFile:     logFile,
 		StartedAt:   time.Now().UTC(),
 		Status:      state.StatusRunning,
+		Backend:     backendName,
 	}
 
 	return slotName, nil
@@ -161,6 +195,19 @@ func RebaseWorktree(worktreePath, branch string) error {
 		}
 	}
 	return nil
+}
+
+// shellJoin quotes args for shell safety in generated scripts.
+func shellJoin(args []string) string {
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		// Simple quoting: wrap in single quotes, escape existing single quotes
+		if strings.ContainsAny(a, " \t\n'\"\\$`!#&|;(){}[]<>?*~") {
+			a = "'" + strings.ReplaceAll(a, "'", "'\\''") + "'"
+		}
+		quoted[i] = a
+	}
+	return strings.Join(quoted, " ")
 }
 
 func slugify(title string) string {
