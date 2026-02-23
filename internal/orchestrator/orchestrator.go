@@ -113,10 +113,28 @@ func (o *Orchestrator) Run(interval time.Duration, once bool) error {
 
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
+	// Fetch open PRs once for the whole check cycle
+	prs, prErr := o.gh.ListOpenPRs()
+	branchToPR := make(map[string]github.PR)
+	if prErr != nil {
+		log.Printf("[orch] list PRs (check): %v", prErr)
+	} else {
+		for _, pr := range prs {
+			branchToPR[pr.HeadRefName] = pr
+		}
+	}
+
 	for slotName, sess := range s.Sessions {
 		switch sess.Status {
 		case state.StatusDone, state.StatusDead, state.StatusConflictFailed, state.StatusFailed:
-			// Terminal states — skip
+			// Terminal states — cleanup old worktrees after 1h
+			if sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour && sess.Worktree != "" {
+				if _, err := os.Stat(sess.Worktree); err == nil {
+					log.Printf("[orch] cleaning up stale worktree for %s (finished %s ago)", slotName, time.Since(*sess.FinishedAt).Round(time.Minute))
+					worker.Stop(o.cfg, slotName, sess)
+					sess.Worktree = "" // Mark as cleaned
+				}
+			}
 			continue
 		}
 
@@ -129,15 +147,38 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				log.Printf("[orch] issue #%d closed, stopping worker %s", sess.IssueNumber, slotName)
 				worker.Stop(o.cfg, slotName, sess)
 				sess.Status = state.StatusDone
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
 				continue
 			}
 
 			// Check if process is still alive
 			if sess.PID > 0 && !worker.IsAlive(sess.PID) {
-				log.Printf("[orch] worker %s (pid=%d) is dead", slotName, sess.PID)
-				sess.Status = state.StatusDead
-				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) process died.\nCheck log: %s",
-					slotName, sess.IssueNumber, sess.IssueTitle, sess.LogFile)
+				// Check if there's an open PR for this branch BEFORE marking dead
+				if pr, found := branchToPR[sess.Branch]; found {
+					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
+					sess.Status = state.StatusPROpen
+					sess.PRNumber = pr.Number
+					o.notifier.Sendf("🔀 maestro: worker %s completed, PR #%d open for issue #%d (%s)",
+						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
+				} else {
+					log.Printf("[orch] worker %s (pid=%d) is dead", slotName, sess.PID)
+					sess.Status = state.StatusDead
+					now := time.Now().UTC()
+					sess.FinishedAt = &now
+					o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) process died.\nCheck log: %s",
+						slotName, sess.IssueNumber, sess.IssueTitle, sess.LogFile)
+				}
+				continue
+			}
+
+			// Check if running session has opened a PR (worker still alive)
+			if pr, found := branchToPR[sess.Branch]; found {
+				log.Printf("[orch] worker %s opened PR #%d while still running — transitioning to pr_open", slotName, pr.Number)
+				sess.Status = state.StatusPROpen
+				sess.PRNumber = pr.Number
+				o.notifier.Sendf("🔀 maestro: worker %s opened PR #%d for issue #%d (%s)",
+					slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
 				continue
 			}
 
@@ -174,6 +215,8 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if !found {
 			log.Printf("[orch] no open PR found for branch %s (slot %s) — assuming merged/closed", sess.Branch, slotName)
 			sess.Status = state.StatusDone
+			now := time.Now().UTC()
+			sess.FinishedAt = &now
 			continue
 		}
 
@@ -199,6 +242,8 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			} else {
 				log.Printf("[orch] merged PR #%d ✓", pr.Number)
 				sess.Status = state.StatusDone
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
 				worker.Stop(o.cfg, slotName, sess)
 				o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s)", pr.Number, sess.IssueNumber, sess.IssueTitle)
 			}
@@ -241,6 +286,8 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch); err != nil {
 				log.Printf("[orch] rebase failed for %s: %v", slotName, err)
 				sess.Status = state.StatusConflictFailed
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
 				o.notifier.Sendf("❌ maestro: rebase failed for %s (issue #%d: %s)\n%v",
 					slotName, sess.IssueNumber, sess.IssueTitle, err)
 			} else {

@@ -28,6 +28,7 @@ type Session struct {
 	PID         int           `json:"pid"`
 	LogFile     string        `json:"log_file"`
 	StartedAt   time.Time     `json:"started_at"`
+	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
 	Status      SessionStatus `json:"status"`
 	PRNumber    int           `json:"pr_number,omitempty"`
 }
