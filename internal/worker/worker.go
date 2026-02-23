@@ -83,8 +83,9 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		}
 	}
 	backendCfg := BackendConfig{
-		Cmd:       backendDef.Cmd,
-		ExtraArgs: backendDef.ExtraArgs,
+		Cmd:        backendDef.Cmd,
+		ExtraArgs:  backendDef.ExtraArgs,
+		PromptMode: backendDef.PromptMode,
 	}
 
 	// Prepare log file

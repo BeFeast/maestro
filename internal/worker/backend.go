@@ -8,16 +8,34 @@ import (
 
 // BackendConfig holds the CLI command and any extra args from config.
 type BackendConfig struct {
-	Cmd       string   // binary name (e.g. "claude", "codex")
-	ExtraArgs []string // additional args from config
+	Cmd        string   // binary name (e.g. "claude", "codex", "gemini")
+	ExtraArgs  []string // additional args from config
+	PromptMode string   // how to deliver prompt: "arg", "stdin", "file"
 }
 
-// NewClaudeCmd builds a claude --dangerously-skip-permissions -p "$(cat promptFile)" command.
-// Prompt is read from file to avoid shell quoting issues.
-func NewClaudeCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, error) {
+// Backend builds the exec.Cmd for a specific model CLI.
+type Backend interface {
+	// BuildCmd creates the command to run the model CLI.
+	// Returns the command, an optional stdinFile path (for backends that read
+	// the prompt via stdin), and any error.
+	BuildCmd(cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error)
+}
+
+// knownBackends maps backend names to their implementations.
+var knownBackends = map[string]Backend{
+	"claude": claudeBackend{},
+	"codex":  codexBackend{},
+	"gemini": geminiBackend{},
+}
+
+// --- Claude Backend ---
+
+type claudeBackend struct{}
+
+func (claudeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
 	promptData, err := os.ReadFile(promptFile)
 	if err != nil {
-		return nil, fmt.Errorf("read prompt file: %w", err)
+		return nil, "", fmt.Errorf("read prompt file: %w", err)
 	}
 	claudeCmd := cfg.Cmd
 	if claudeCmd == "" {
@@ -27,13 +45,14 @@ func NewClaudeCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, er
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(claudeCmd, args...)
 	cmd.Dir = worktree
-	return cmd, nil
+	return cmd, "", nil
 }
 
-// NewCodexCmd builds: codex exec --dangerously-bypass-approvals-and-sandbox -C <worktree> - < promptFile
-// Note: the prompt file is NOT opened here. The runner script in worker.go handles
-// stdin redirection via shell `< promptFile`, so no file descriptor is held open.
-func NewCodexCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, error) {
+// --- Codex Backend ---
+
+type codexBackend struct{}
+
+func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
 	codexCmd := cfg.Cmd
 	if codexCmd == "" {
 		codexCmd = "codex"
@@ -43,21 +62,97 @@ func NewCodexCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, err
 	cmd := exec.Command(codexCmd, args...)
 	cmd.Dir = worktree
 	// Stdin redirection is handled by the runner script — no file opened here
-	return cmd, nil
+	return cmd, promptFile, nil
+}
+
+// --- Gemini Backend ---
+
+type geminiBackend struct{}
+
+func (geminiBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	geminiCmd := cfg.Cmd
+	if geminiCmd == "" {
+		geminiCmd = "gemini"
+	}
+	promptData, err := os.ReadFile(promptFile)
+	if err != nil {
+		return nil, "", fmt.Errorf("read prompt file: %w", err)
+	}
+	args := []string{"-p", string(promptData)}
+	args = append(args, cfg.ExtraArgs...)
+	cmd := exec.Command(geminiCmd, args...)
+	cmd.Dir = worktree
+	return cmd, "", nil
+}
+
+// --- Generic Backend ---
+
+// genericBackend handles arbitrary CLIs using the prompt_mode config field.
+// Supported prompt modes:
+//   - "arg" (default): pass prompt content as the last CLI argument
+//   - "stdin": redirect prompt file to stdin via the runner script
+//   - "file": pass prompt file path as the last CLI argument
+type genericBackend struct{}
+
+func (genericBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	binary := cfg.Cmd
+	if binary == "" {
+		return nil, "", fmt.Errorf("generic backend requires cmd to be set")
+	}
+
+	mode := cfg.PromptMode
+	if mode == "" {
+		mode = "arg"
+	}
+
+	var args []string
+	var stdinFile string
+
+	args = append(args, cfg.ExtraArgs...)
+
+	switch mode {
+	case "arg":
+		promptData, err := os.ReadFile(promptFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("read prompt file: %w", err)
+		}
+		args = append(args, string(promptData))
+	case "stdin":
+		stdinFile = promptFile
+	case "file":
+		args = append(args, promptFile)
+	default:
+		return nil, "", fmt.Errorf("unknown prompt_mode %q (supported: arg, stdin, file)", mode)
+	}
+
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = worktree
+	return cmd, stdinFile, nil
 }
 
 // BuildWorkerCmd creates the right exec.Cmd based on backend name.
+// Known backends (claude, codex, gemini) use their specific command builders.
+// Unknown backends use the generic builder with prompt_mode from config.
 // Returns the command, an optional stdinFile path (for backends that read
 // the prompt via stdin, e.g. codex), and any error.
 func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
-	switch backendName {
-	case "claude", "":
-		cmd, err = NewClaudeCmd(cfg, promptFile, worktree)
-		return cmd, "", err
-	case "codex":
-		cmd, err = NewCodexCmd(cfg, promptFile, worktree)
-		return cmd, promptFile, err
-	default:
-		return nil, "", fmt.Errorf("unknown backend: %s", backendName)
+	if backendName == "" {
+		backendName = "claude"
 	}
+
+	if b, ok := knownBackends[backendName]; ok {
+		return b.BuildCmd(cfg, promptFile, worktree)
+	}
+
+	// Fallback: use generic backend for unknown backends
+	return (genericBackend{}).BuildCmd(cfg, promptFile, worktree)
+}
+
+// KnownBackends returns a list of built-in backend names.
+func KnownBackends() []string {
+	names := make([]string, 0, len(knownBackends))
+	for name := range knownBackends {
+		names = append(names, name)
+	}
+	return names
 }
