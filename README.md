@@ -8,7 +8,7 @@ Replaces the previous `ao` (agent-orchestrator npm package) + shell scripts setu
 
 maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini), each working on a separate GitHub issue in its own git worktree. It:
 
-- Picks open GitHub issues matching a label (e.g. `enhancement`)
+- Picks open GitHub issues matching any configured label (e.g. `enhancement`, `bug`)
 - Creates git worktrees for each agent
 - Spawns `claude --dangerously-skip-permissions` in each worktree with a task prompt
 - Monitors agent progress (process alive? PR created? CI green?)
@@ -77,7 +77,9 @@ max_parallel: 5
 session_prefix: pan         # worker session name prefix (default: first 3 chars of repo name)
 state_dir: ~/.maestro/pan   # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude          # the claude CLI binary
-issue_label: enhancement    # label to filter issues
+issue_labels:               # issues matching ANY label are picked up (OR filter)
+  - enhancement
+  - bug
 exclude_labels:
   - blocked
 telegram:
