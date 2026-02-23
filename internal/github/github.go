@@ -86,6 +86,21 @@ func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 	return issues, nil
 }
 
+// GetIssue fetches a single issue by number
+func (c *Client) GetIssue(number int) (Issue, error) {
+	out, err := exec.Command("gh", "issue", "view", fmt.Sprint(number),
+		"--repo", c.Repo,
+		"--json", "number,title,body,labels").Output()
+	if err != nil {
+		return Issue{}, fmt.Errorf("gh issue view %d: %w", number, err)
+	}
+	var issue Issue
+	if err := json.Unmarshal(out, &issue); err != nil {
+		return Issue{}, fmt.Errorf("parse issue %d: %w", number, err)
+	}
+	return issue, nil
+}
+
 // IsIssueClosed returns true if the issue is closed
 func (c *Client) IsIssueClosed(number int) (bool, error) {
 	out, err := exec.Command("gh", "issue", "view", fmt.Sprint(number),

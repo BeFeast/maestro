@@ -189,8 +189,8 @@ func statusCmd(args []string) {
 	sort.Strings(names)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SESSION\tISSUE\tSTATUS\tPID\tALIVE\tAGE\tTITLE")
-	fmt.Fprintln(w, "-------\t-----\t------\t---\t-----\t---\t-----")
+	fmt.Fprintln(w, "SESSION\tISSUE\tSTATUS\tPID\tALIVE\tAGE\tRETRIES\tTITLE")
+	fmt.Fprintln(w, "-------\t-----\t------\t---\t-----\t---\t-------\t-----")
 	for _, name := range names {
 		sess := s.Sessions[name]
 		alive := "-"
@@ -202,8 +202,12 @@ func statusCmd(args []string) {
 			}
 		}
 		age := time.Since(sess.StartedAt).Round(time.Minute)
-		fmt.Fprintf(w, "%s\t#%d\t%s\t%d\t%s\t%s\t%s\n",
-			name, sess.IssueNumber, sess.Status, sess.PID, alive, age, truncate(sess.IssueTitle, 50))
+		retries := "-"
+		if sess.RetryCount > 0 {
+			retries = fmt.Sprintf("%d", sess.RetryCount)
+		}
+		fmt.Fprintf(w, "%s\t#%d\t%s\t%d\t%s\t%s\t%s\t%s\n",
+			name, sess.IssueNumber, sess.Status, sess.PID, alive, age, retries, truncate(sess.IssueTitle, 50))
 	}
 	w.Flush()
 
