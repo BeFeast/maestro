@@ -36,7 +36,7 @@ Commands:
   run           Run the orchestration loop
   status        Show current state
   logs          Show worker logs (tail -f)
-  watch         Open tmux dashboard with all worker logs
+  watch         Open tmux dashboard with live worker output
   spawn         Spawn a worker for a specific issue number
   stop          Stop a worker session
   kill          Kill a worker session by slot name
@@ -71,7 +71,7 @@ Version-bump flags:
 
 Logs:
   maestro logs              List active worker logs + tmux attach hints
-  maestro logs <slot>       tail -f specific worker log (e.g. maestro logs pan-20)
+  maestro logs <slot>       Attach to worker tmux session (live), or tail log if done
 
 History:
   maestro history              Show last 20 completed sessions
@@ -80,7 +80,7 @@ History:
   maestro history --prune      Remove sessions older than retention period
 
 Watch:
-  maestro watch             Open tmux dashboard with all active worker logs
+  maestro watch             Open tmux dashboard attached to live worker sessions
 `
 
 // multiFlag accumulates repeated --config flag values.
@@ -361,6 +361,20 @@ func logsCmd(args []string) {
 			if !ok {
 				continue
 			}
+
+			// If worker's tmux session is alive, attach to it for live output
+			tmuxName := worker.TmuxSessionName(slotName)
+			if sess.Status == state.StatusRunning && exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil {
+				tmuxPath, err := exec.LookPath("tmux")
+				if err != nil {
+					log.Fatalf("find tmux: %v", err)
+				}
+				fmt.Printf("Attaching to tmux session %s (read-only)...\n", tmuxName)
+				syscall.Exec(tmuxPath, []string{"tmux", "attach-session", "-t", tmuxName, "-r"}, os.Environ())
+				log.Fatalf("exec tmux attach: should not reach here")
+			}
+
+			// Fallback: tail the log file
 			if _, err := os.Stat(sess.LogFile); os.IsNotExist(err) {
 				fmt.Fprintf(os.Stderr, "error: log file not found: %s\n", sess.LogFile)
 				os.Exit(1)
@@ -438,6 +452,32 @@ func logsCmd(args []string) {
 	}
 }
 
+// watchPaneCmd builds a shell command for a watch pane.
+// If the worker's tmux session is alive, attach read-only for live output.
+// When the session ends (or is already gone), show the log file.
+func watchPaneCmd(w struct {
+	name string
+	sess *state.Session
+}) string {
+	tmuxName := worker.TmuxSessionName(w.name)
+	// Shell script that:
+	// 1. If worker tmux session exists → attach read-only (env -u TMUX to allow nesting)
+	// 2. After attach exits (worker done) or if session gone → show log tail
+	return fmt.Sprintf(
+		`if tmux has-session -t %q 2>/dev/null; then `+
+			`env -u TMUX tmux attach-session -t %q -r; `+
+			`echo; echo '=== Worker session ended ==='; echo; `+
+			`fi; `+
+			`if [ -f %q ]; then `+
+			`echo '--- Log output (%s) ---'; `+
+			`tail -100 %q; `+
+			`else `+
+			`echo 'No log file found.'; `+
+			`fi; `+
+			`echo; echo 'Press any key to exit...'; read -n1`,
+		tmuxName, tmuxName, w.sess.LogFile, w.name, w.sess.LogFile)
+}
+
 func watchCmd(args []string) {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
 	var configs multiFlag
@@ -480,9 +520,9 @@ func watchCmd(args []string) {
 	// Kill stale session if exists
 	exec.Command("tmux", "kill-session", "-t", tmuxSession).Run()
 
-	// Create new session with first worker's log
-	firstCmd := fmt.Sprintf("tail -f %s", workers[0].sess.LogFile)
-	if out, err := exec.Command("tmux", "new-session", "-d", "-s", tmuxSession, firstCmd).CombinedOutput(); err != nil {
+	// Create new session with first worker — attach to its tmux session
+	firstCmd := watchPaneCmd(workers[0])
+	if out, err := exec.Command("tmux", "new-session", "-d", "-s", tmuxSession, "bash", "-c", firstCmd).CombinedOutput(); err != nil {
 		log.Fatalf("tmux new-session: %v\n%s", err, out)
 	}
 
@@ -492,8 +532,8 @@ func watchCmd(args []string) {
 
 	// Split for each additional worker
 	for i := 1; i < len(workers); i++ {
-		tailCmd := fmt.Sprintf("tail -f %s", workers[i].sess.LogFile)
-		if out, err := exec.Command("tmux", "split-window", "-t", tmuxSession, tailCmd).CombinedOutput(); err != nil {
+		paneCmd := watchPaneCmd(workers[i])
+		if out, err := exec.Command("tmux", "split-window", "-t", tmuxSession, "bash", "-c", paneCmd).CombinedOutput(); err != nil {
 			log.Printf("tmux split-window for %s: %v\n%s", workers[i].name, err, out)
 			continue
 		}
