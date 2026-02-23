@@ -1,0 +1,37 @@
+# Maestro configuration example
+# Copy this file to maestro.yaml and fill in your values.
+#
+# For multi-project setups, create separate files:
+#   maestro-panoptikon.yaml, maestro-self.yaml, etc.
+
+repo: YOUR_ORG/YOUR_REPO
+local_path: /path/to/local/repo
+worktree_base: /path/to/worktrees/repo
+max_parallel: 5
+
+# Model backend — default is Claude CLI
+# Supported: claude (default), codex (OpenAI), gemini
+claude_cmd: claude
+issue_label: enhancement
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: /path/to/codex
+exclude_labels:
+  - blocked
+  - wontfix
+
+# Worker prompt template (Markdown file with instructions for AI workers)
+worker_prompt: /path/to/worker-prompt-template.md
+
+# Optional: command to run after successful merge (build + deploy)
+# deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
+
+# Telegram notifications
+telegram:
+  target: "YOUR_TELEGRAM_CHAT_ID"
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  openclaw_url: "http://localhost:18789"
