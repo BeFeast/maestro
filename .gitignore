@@ -8,3 +8,7 @@
 .vscode/
 .idea/
 *.swp
+
+# Config files with secrets
+*.yaml
+*.yml
