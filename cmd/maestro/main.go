@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -43,7 +46,10 @@ Commands:
   version       Print version
 
 Global flags:
-  --config string       Path to config file (default: maestro.yaml)
+  --config string       Path to config file (can be repeated for multiple projects)
+
+  Multiple projects: pass --config for each project config file, or place
+  configs in a maestro.d/ directory for automatic discovery.
 
 Run flags:
   --interval duration   Loop interval (default 10m)
@@ -76,6 +82,15 @@ History:
 Watch:
   maestro watch             Open tmux dashboard with all active worker logs
 `
+
+// multiFlag accumulates repeated --config flag values.
+type multiFlag []string
+
+func (f *multiFlag) String() string { return strings.Join(*f, ", ") }
+func (f *multiFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
@@ -137,42 +152,134 @@ func loadConfig(configPath string) *config.Config {
 	return cfg
 }
 
+// loadConfigs resolves multiple config paths, maestro.d/ directory, or default discovery.
+func loadConfigs(paths []string) []*config.Config {
+	if len(paths) > 0 {
+		var cfgs []*config.Config
+		for _, p := range paths {
+			cfg, err := config.LoadFrom(p)
+			if err != nil {
+				log.Fatalf("load config %s: %v", p, err)
+			}
+			cfgs = append(cfgs, cfg)
+		}
+		return cfgs
+	}
+
+	// Check for maestro.d/ directory
+	if info, err := os.Stat("maestro.d"); err == nil && info.IsDir() {
+		cfgs, err := config.LoadDir("maestro.d")
+		if err != nil {
+			log.Fatalf("load configs from maestro.d/: %v", err)
+		}
+		return cfgs
+	}
+
+	// Fall back to default single config discovery
+	return []*config.Config{loadConfig("")}
+}
+
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	interval := fs.Duration("interval", 10*time.Minute, "Loop interval")
 	once := fs.Bool("once", false, "Run once and exit")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	fs.Parse(args)
 
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
 
-	orch := orchestrator.New(cfg)
-	if err := orch.LoadPromptBase(*promptPath); err != nil {
-		log.Printf("warn: load prompt: %v", err)
+	if len(cfgs) == 1 {
+		cfg := cfgs[0]
+		orch := orchestrator.New(cfg)
+		if err := orch.LoadPromptBase(*promptPath); err != nil {
+			log.Printf("warn: load prompt: %v", err)
+		}
+		log.Printf("starting maestro — repo=%s prefix=%s interval=%s once=%v", cfg.Repo, cfg.SessionPrefix, *interval, *once)
+		if err := orch.Run(context.Background(), *interval, *once); err != nil {
+			log.Fatalf("run: %v", err)
+		}
+		return
 	}
 
-	log.Printf("starting maestro — repo=%s prefix=%s interval=%s once=%v", cfg.Repo, cfg.SessionPrefix, *interval, *once)
+	// Multiple projects — run each in its own goroutine
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if err := orch.Run(*interval, *once); err != nil {
-		log.Fatalf("run: %v", err)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Printf("received signal, shutting down all projects...")
+		cancel()
+	}()
+
+	log.Printf("starting maestro with %d projects", len(cfgs))
+
+	var wg sync.WaitGroup
+	for _, cfg := range cfgs {
+		wg.Add(1)
+		go func(c *config.Config) {
+			defer wg.Done()
+			orch := orchestrator.New(c)
+			if err := orch.LoadPromptBase(*promptPath); err != nil {
+				log.Printf("[%s] warn: load prompt: %v", c.SessionPrefix, err)
+			}
+			log.Printf("[%s] starting — repo=%s interval=%s once=%v", c.SessionPrefix, c.Repo, *interval, *once)
+			if err := orch.Run(ctx, *interval, *once); err != nil {
+				log.Printf("[%s] run error: %v", c.SessionPrefix, err)
+			}
+		}(cfg)
 	}
+	wg.Wait()
 }
 
 func statusCmd(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	fs.Parse(args)
 
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
 
-	s, err := state.Load(cfg.StateDir)
-	if err != nil {
-		log.Fatalf("load state: %v", err)
+	// JSON: for multiple projects, emit an array of objects
+	if *jsonOutput && len(cfgs) > 1 {
+		var results []map[string]interface{}
+		for _, cfg := range cfgs {
+			s, err := state.Load(cfg.StateDir)
+			if err != nil {
+				log.Printf("load state for %s: %v", cfg.Repo, err)
+				continue
+			}
+			results = append(results, map[string]interface{}{
+				"repo":   cfg.Repo,
+				"prefix": cfg.SessionPrefix,
+				"state":  s,
+			})
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(results)
+		return
 	}
 
-	if *jsonOutput {
+	for i, cfg := range cfgs {
+		if i > 0 {
+			fmt.Print("\n---\n\n")
+		}
+		showProjectStatus(cfg, *jsonOutput)
+	}
+}
+
+func showProjectStatus(cfg *config.Config, jsonOutput bool) {
+	s, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("load state for %s: %v", cfg.Repo, err)
+	}
+
+	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		enc.Encode(s)
@@ -235,97 +342,126 @@ func statusCmd(args []string) {
 
 func logsCmd(args []string) {
 	fs := flag.NewFlagSet("logs", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	fs.Parse(args)
 	args = fs.Args() // remaining args after flags
 
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
 
-	s, err := state.Load(cfg.StateDir)
-	if err != nil {
-		log.Fatalf("load state: %v", err)
-	}
-
-	// If a specific slot is given, exec tail -f on it
+	// If a specific slot is given, find it across all projects
 	if len(args) > 0 && args[0] != "" && !strings.HasPrefix(args[0], "-") {
 		slotName := args[0]
-		sess, ok := s.Sessions[slotName]
-		if !ok {
-			fmt.Fprintf(os.Stderr, "error: session %q not found\n", slotName)
-			os.Exit(1)
+		for _, cfg := range cfgs {
+			s, err := state.Load(cfg.StateDir)
+			if err != nil {
+				continue
+			}
+			sess, ok := s.Sessions[slotName]
+			if !ok {
+				continue
+			}
+			if _, err := os.Stat(sess.LogFile); os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "error: log file not found: %s\n", sess.LogFile)
+				os.Exit(1)
+			}
+			tailPath, err := exec.LookPath("tail")
+			if err != nil {
+				log.Fatalf("find tail: %v", err)
+			}
+			syscall.Exec(tailPath, []string{"tail", "-f", sess.LogFile}, os.Environ())
+			log.Fatalf("exec tail: should not reach here")
 		}
-		if _, err := os.Stat(sess.LogFile); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "error: log file not found: %s\n", sess.LogFile)
-			os.Exit(1)
-		}
+		fmt.Fprintf(os.Stderr, "error: session %q not found\n", slotName)
+		os.Exit(1)
+	}
 
-		// Replace process with tail -f
-		tailPath, err := exec.LookPath("tail")
+	// No args — list all active worker logs across all projects
+	type logEntry struct {
+		name    string
+		sess    *state.Session
+		logDir  string
+		prefix  string
+		project string
+	}
+	var entries []logEntry
+	for _, cfg := range cfgs {
+		s, err := state.Load(cfg.StateDir)
 		if err != nil {
-			log.Fatalf("find tail: %v", err)
+			log.Printf("load state for %s: %v", cfg.Repo, err)
+			continue
 		}
-		syscall.Exec(tailPath, []string{"tail", "-f", sess.LogFile}, os.Environ())
-		// If exec fails we fall through
-		log.Fatalf("exec tail: should not reach here")
+		for name, sess := range s.Sessions {
+			if sess.Status == state.StatusRunning {
+				entries = append(entries, logEntry{
+					name:    name,
+					sess:    sess,
+					logDir:  state.LogDir(cfg.StateDir),
+					prefix:  cfg.SessionPrefix,
+					project: cfg.Repo,
+				})
+			}
+		}
 	}
 
-	// No args — list all active worker logs
-	names := make([]string, 0, len(s.Sessions))
-	for name, sess := range s.Sessions {
-		if sess.Status == state.StatusRunning {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 
-	if len(names) == 0 {
+	if len(entries) == 0 {
 		fmt.Println("No active worker sessions.")
 		return
 	}
 
+	multiProject := len(cfgs) > 1
 	fmt.Println("Active worker logs:")
-	logDir := ""
-	for _, name := range names {
-		sess := s.Sessions[name]
+	currentProject := ""
+	for _, e := range entries {
+		if multiProject && e.project != currentProject {
+			fmt.Printf("\n  [%s] %s:\n", e.prefix, e.project)
+			currentProject = e.project
+		}
 		alive := ""
-		if !worker.IsAlive(sess.PID) {
+		if !worker.IsAlive(e.sess.PID) {
 			alive = " (dead)"
 		}
-		fmt.Printf("  %s (#%d): %s%s\n", name, sess.IssueNumber, sess.LogFile, alive)
-		logDir = state.LogDir(cfg.StateDir)
+		fmt.Printf("  %s (#%d): %s%s\n", e.name, e.sess.IssueNumber, e.sess.LogFile, alive)
 	}
 
 	fmt.Println()
 	fmt.Println("To attach to a worker:")
-	for _, name := range names {
-		fmt.Printf("  tmux attach -t %s\n", worker.TmuxSessionName(name))
+	for _, e := range entries {
+		fmt.Printf("  tmux attach -t %s\n", worker.TmuxSessionName(e.name))
 	}
 
-	fmt.Println()
-	fmt.Printf("To watch all logs:\n  tail -f %s/%s-*.log\n", logDir, cfg.SessionPrefix)
+	if !multiProject && len(entries) > 0 {
+		fmt.Println()
+		fmt.Printf("To watch all logs:\n  tail -f %s/%s-*.log\n", entries[0].logDir, entries[0].prefix)
+	}
 }
 
 func watchCmd(args []string) {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	fs.Parse(args)
 
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
 
-	s, err := state.Load(cfg.StateDir)
-	if err != nil {
-		log.Fatalf("load state: %v", err)
-	}
-
-	// Collect active running sessions
+	// Collect active running sessions across all projects
 	type activeWorker struct {
 		name string
 		sess *state.Session
 	}
 	var workers []activeWorker
-	for name, sess := range s.Sessions {
-		if sess.Status == state.StatusRunning && worker.IsAlive(sess.PID) {
-			workers = append(workers, activeWorker{name, sess})
+	for _, cfg := range cfgs {
+		s, err := state.Load(cfg.StateDir)
+		if err != nil {
+			log.Printf("load state for %s: %v", cfg.Repo, err)
+			continue
+		}
+		for name, sess := range s.Sessions {
+			if sess.Status == state.StatusRunning && worker.IsAlive(sess.PID) {
+				workers = append(workers, activeWorker{name, sess})
+			}
 		}
 	}
 
@@ -384,7 +520,8 @@ func watchCmd(args []string) {
 
 func spawnCmd(args []string) {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	issueNum := fs.Int("issue", 0, "Issue number")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	fs.Parse(args)
@@ -394,7 +531,12 @@ func spawnCmd(args []string) {
 		os.Exit(1)
 	}
 
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
+	if len(cfgs) > 1 {
+		fmt.Fprintln(os.Stderr, "error: spawn requires a single --config (ambiguous with multiple projects)")
+		os.Exit(1)
+	}
+	cfg := cfgs[0]
 
 	s, err := state.Load(cfg.StateDir)
 	if err != nil {
@@ -476,7 +618,8 @@ func spawnCmd(args []string) {
 
 func stopCmd(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	sessionName := fs.String("session", "", "Session name to stop")
 	fs.Parse(args)
 
@@ -485,34 +628,39 @@ func stopCmd(args []string) {
 		os.Exit(1)
 	}
 
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
 
-	s, err := state.Load(cfg.StateDir)
-	if err != nil {
-		log.Fatalf("load state: %v", err)
+	// Search across all projects for the session
+	for _, cfg := range cfgs {
+		s, err := state.Load(cfg.StateDir)
+		if err != nil {
+			continue
+		}
+		sess, ok := s.Sessions[*sessionName]
+		if !ok {
+			continue
+		}
+
+		if err := worker.Stop(cfg, *sessionName, sess); err != nil {
+			log.Fatalf("stop worker: %v", err)
+		}
+
+		delete(s.Sessions, *sessionName)
+		if err := state.Save(cfg.StateDir, s); err != nil {
+			log.Fatalf("save state: %v", err)
+		}
+
+		fmt.Printf("Stopped and removed session %s\n", *sessionName)
+		return
 	}
 
-	sess, ok := s.Sessions[*sessionName]
-	if !ok {
-		log.Fatalf("session %s not found", *sessionName)
-	}
-
-	if err := worker.Stop(cfg, *sessionName, sess); err != nil {
-		log.Fatalf("stop worker: %v", err)
-	}
-
-	delete(s.Sessions, *sessionName)
-
-	if err := state.Save(cfg.StateDir, s); err != nil {
-		log.Fatalf("save state: %v", err)
-	}
-
-	fmt.Printf("Stopped and removed session %s\n", *sessionName)
+	log.Fatalf("session %s not found", *sessionName)
 }
 
 func killCmd(args []string) {
 	fs := flag.NewFlagSet("kill", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	fs.Parse(args)
 	args = fs.Args()
 
@@ -522,78 +670,96 @@ func killCmd(args []string) {
 	}
 
 	slotName := args[0]
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
 
-	s, err := state.Load(cfg.StateDir)
-	if err != nil {
-		log.Fatalf("load state: %v", err)
+	// Search across all projects for the session
+	for _, cfg := range cfgs {
+		s, err := state.Load(cfg.StateDir)
+		if err != nil {
+			continue
+		}
+		sess, ok := s.Sessions[slotName]
+		if !ok {
+			continue
+		}
+
+		if err := worker.Stop(cfg, slotName, sess); err != nil {
+			log.Fatalf("kill worker: %v", err)
+		}
+
+		now := time.Now().UTC()
+		sess.Status = state.StatusDead
+		sess.FinishedAt = &now
+
+		if err := state.Save(cfg.StateDir, s); err != nil {
+			log.Fatalf("save state: %v", err)
+		}
+
+		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL)
+		n.Sendf("maestro: manually killed worker %s (issue #%d: %s)", slotName, sess.IssueNumber, sess.IssueTitle)
+
+		fmt.Printf("Killed session %s (issue #%d: %s)\n", slotName, sess.IssueNumber, sess.IssueTitle)
+		return
 	}
 
-	sess, ok := s.Sessions[slotName]
-	if !ok {
-		fmt.Fprintf(os.Stderr, "error: session %q not found\n", slotName)
-		os.Exit(1)
-	}
-
-	if err := worker.Stop(cfg, slotName, sess); err != nil {
-		log.Fatalf("kill worker: %v", err)
-	}
-
-	now := time.Now().UTC()
-	sess.Status = state.StatusDead
-	sess.FinishedAt = &now
-
-	if err := state.Save(cfg.StateDir, s); err != nil {
-		log.Fatalf("save state: %v", err)
-	}
-
-	n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL)
-	n.Sendf("maestro: manually killed worker %s (issue #%d: %s)", slotName, sess.IssueNumber, sess.IssueTitle)
-
-	fmt.Printf("Killed session %s (issue #%d: %s)\n", slotName, sess.IssueNumber, sess.IssueTitle)
+	fmt.Fprintf(os.Stderr, "error: session %q not found\n", slotName)
+	os.Exit(1)
 }
 
 func importCmd(args []string) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	fs.Parse(args)
 
-	cfg := loadConfig(*configPath)
+	cfgs := loadConfigs(configs)
 
-	s, err := state.Load(cfg.StateDir)
-	if err != nil {
-		log.Fatalf("load state: %v", err)
-	}
-
-	results, err := worker.Import(cfg, s)
-	if err != nil {
-		log.Fatalf("import: %v", err)
-	}
-
-	if len(results) == 0 {
-		fmt.Println("No worktrees found to import.")
-		return
-	}
-
-	imported := 0
-	skipped := 0
-	for _, r := range results {
-		if r.Skipped {
-			fmt.Printf("  skip: %s (%s) — %s\n", r.SlotName, r.Branch, r.SkipReason)
-			skipped++
-		} else {
-			fmt.Printf("  imported: %s → issue #%d [%s]\n", r.SlotName, r.IssueNumber, r.Status)
-			imported++
+	for i, cfg := range cfgs {
+		if len(cfgs) > 1 {
+			if i > 0 {
+				fmt.Println()
+			}
+			fmt.Printf("=== %s ===\n", cfg.Repo)
 		}
-	}
 
-	fmt.Printf("\nImported %d, skipped %d.\n", imported, skipped)
-
-	if imported > 0 {
-		if err := state.Save(cfg.StateDir, s); err != nil {
-			log.Fatalf("save state: %v", err)
+		s, err := state.Load(cfg.StateDir)
+		if err != nil {
+			log.Printf("load state for %s: %v", cfg.Repo, err)
+			continue
 		}
-		fmt.Printf("State saved to %s\n", state.StatePath(cfg.StateDir))
+
+		results, err := worker.Import(cfg, s)
+		if err != nil {
+			log.Printf("import for %s: %v", cfg.Repo, err)
+			continue
+		}
+
+		if len(results) == 0 {
+			fmt.Println("No worktrees found to import.")
+			continue
+		}
+
+		imported := 0
+		skipped := 0
+		for _, r := range results {
+			if r.Skipped {
+				fmt.Printf("  skip: %s (%s) — %s\n", r.SlotName, r.Branch, r.SkipReason)
+				skipped++
+			} else {
+				fmt.Printf("  imported: %s → issue #%d [%s]\n", r.SlotName, r.IssueNumber, r.Status)
+				imported++
+			}
+		}
+
+		fmt.Printf("\nImported %d, skipped %d.\n", imported, skipped)
+
+		if imported > 0 {
+			if err := state.Save(cfg.StateDir, s); err != nil {
+				log.Printf("save state for %s: %v", cfg.Repo, err)
+				continue
+			}
+			fmt.Printf("State saved to %s\n", state.StatePath(cfg.StateDir))
+		}
 	}
 }
 

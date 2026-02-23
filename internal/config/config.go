@@ -202,6 +202,33 @@ func parse(data []byte) (*Config, error) {
 	return cfg, nil
 }
 
+// LoadDir loads all YAML config files from a directory, sorted by filename.
+func LoadDir(dir string) ([]*Config, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read config dir %s: %w", dir, err)
+	}
+	var cfgs []*Config
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
+			continue
+		}
+		cfg, err := LoadFrom(filepath.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("load %s: %w", name, err)
+		}
+		cfgs = append(cfgs, cfg)
+	}
+	if len(cfgs) == 0 {
+		return nil, fmt.Errorf("no config files found in %s", dir)
+	}
+	return cfgs, nil
+}
+
 func expandHome(path string) string {
 	if len(path) > 1 && path[:2] == "~/" {
 		return filepath.Join(os.Getenv("HOME"), path[2:])

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -142,8 +143,9 @@ func (o *Orchestrator) RunOnce() error {
 	return nil
 }
 
-// Run loops with the given interval; if once=true, runs once and returns
-func (o *Orchestrator) Run(interval time.Duration, once bool) error {
+// Run loops with the given interval; if once=true, runs once and returns.
+// The context can be used to stop the loop (e.g. for multi-project shutdown).
+func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once bool) error {
 	if err := o.RunOnce(); err != nil {
 		log.Printf("[orch] run error: %v", err)
 	}
@@ -152,12 +154,17 @@ func (o *Orchestrator) Run(interval time.Duration, once bool) error {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		if err := o.RunOnce(); err != nil {
-			log.Printf("[orch] run error: %v", err)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[orch] shutting down (%s)", o.repo)
+			return nil
+		case <-ticker.C:
+			if err := o.RunOnce(); err != nil {
+				log.Printf("[orch] run error: %v", err)
+			}
 		}
 	}
-	return nil
 }
 
 // checkSessions inspects all sessions and updates their status
