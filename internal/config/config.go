@@ -46,21 +46,23 @@ type RoutingConfig struct {
 }
 
 type Config struct {
-	Repo          string           `yaml:"repo"`
-	LocalPath     string           `yaml:"local_path"`
-	WorktreeBase  string           `yaml:"worktree_base"`
-	MaxParallel   int              `yaml:"max_parallel"`
-	ClaudeCmd     string           `yaml:"claude_cmd"`  // deprecated: use model.backends.claude.cmd
-	IssueLabel    string           `yaml:"issue_label"` // deprecated: use issue_labels
-	IssueLabels   []string         `yaml:"issue_labels"`
-	ExcludeLabels []string         `yaml:"exclude_labels"`
-	WorkerPrompt  string           `yaml:"worker_prompt"`
-	SessionPrefix string           `yaml:"session_prefix"` // worker session name prefix (default: first 3 chars of repo name)
-	StateDir      string           `yaml:"state_dir"`      // state/log directory (default: ~/.maestro/<repo-hash>)
-	Model         ModelConfig      `yaml:"model"`
-	Routing       RoutingConfig    `yaml:"routing"`
-	Telegram      TelegramConfig   `yaml:"telegram"`
-	Versioning    VersioningConfig `yaml:"versioning"`
+	Repo              string           `yaml:"repo"`
+	LocalPath         string           `yaml:"local_path"`
+	WorktreeBase      string           `yaml:"worktree_base"`
+	MaxParallel       int              `yaml:"max_parallel"`
+	ClaudeCmd         string           `yaml:"claude_cmd"`  // deprecated: use model.backends.claude.cmd
+	IssueLabel        string           `yaml:"issue_label"` // deprecated: use issue_labels
+	IssueLabels       []string         `yaml:"issue_labels"`
+	ExcludeLabels     []string         `yaml:"exclude_labels"`
+	WorkerPrompt      string           `yaml:"worker_prompt"`
+	BugPrompt         string           `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
+	EnhancementPrompt string           `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
+	SessionPrefix     string           `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
+	StateDir          string           `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
+	Model             ModelConfig      `yaml:"model"`
+	Routing           RoutingConfig    `yaml:"routing"`
+	Telegram          TelegramConfig   `yaml:"telegram"`
+	Versioning        VersioningConfig `yaml:"versioning"`
 }
 
 // LoadFrom loads config from a specific path.
@@ -130,6 +132,8 @@ func parse(data []byte) (*Config, error) {
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
 	cfg.WorkerPrompt = expandHome(cfg.WorkerPrompt)
+	cfg.BugPrompt = expandHome(cfg.BugPrompt)
+	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.StateDir = expandHome(cfg.StateDir)
 
 	// Default session_prefix: first 3 chars of repo name
