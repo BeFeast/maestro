@@ -466,3 +466,61 @@ telegram:
 		t.Error("DigestMode should be true when explicitly set")
 	}
 }
+
+func TestLoadDir(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write two config files
+	cfg1 := `repo: owner/alpha`
+	cfg2 := `repo: owner/beta`
+	if err := os.WriteFile(filepath.Join(dir, "alpha.yaml"), []byte(cfg1), 0644); err != nil {
+		t.Fatalf("write alpha.yaml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "beta.yml"), []byte(cfg2), 0644); err != nil {
+		t.Fatalf("write beta.yml: %v", err)
+	}
+	// Write a non-yaml file that should be ignored
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("ignore me"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+
+	cfgs, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
+	}
+	if len(cfgs) != 2 {
+		t.Fatalf("expected 2 configs, got %d", len(cfgs))
+	}
+	// os.ReadDir returns entries sorted by name, so alpha first
+	if cfgs[0].Repo != "owner/alpha" {
+		t.Errorf("cfgs[0].Repo = %q, want owner/alpha", cfgs[0].Repo)
+	}
+	if cfgs[1].Repo != "owner/beta" {
+		t.Errorf("cfgs[1].Repo = %q, want owner/beta", cfgs[1].Repo)
+	}
+}
+
+func TestLoadDir_Empty(t *testing.T) {
+	dir := t.TempDir()
+	_, err := LoadDir(dir)
+	if err == nil {
+		t.Fatal("expected error for empty directory, got nil")
+	}
+}
+
+func TestLoadDir_SkipsSubdirectories(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "project.yaml"), []byte("repo: owner/proj"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfgs, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
+	}
+	if len(cfgs) != 1 {
+		t.Fatalf("expected 1 config, got %d", len(cfgs))
+	}
+}
