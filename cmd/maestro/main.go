@@ -83,6 +83,9 @@ Watch:
   maestro watch             Open tmux dashboard attached to live worker sessions
 `
 
+// version is set at build time via -ldflags "-X main.version=vX.Y.Z".
+var version = "dev"
+
 // multiFlag accumulates repeated --config flag values.
 type multiFlag []string
 
@@ -128,7 +131,7 @@ func main() {
 	case "version-bump":
 		versionBumpCmd(args)
 	case "version":
-		fmt.Println("maestro v0.1.0")
+		fmt.Printf("maestro %s\n", version)
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 	default:
