@@ -37,6 +37,8 @@ repo: BeFeast/panoptikon
 local_path: /home/shtrudel/src/panoptikon
 worktree_base: /home/shtrudel/.worktrees/panoptikon
 max_parallel: 5
+session_prefix: pan         # worker session name prefix (default: first 3 chars of repo name)
+state_dir: ~/.maestro/pan   # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude          # the claude CLI binary
 issue_label: enhancement    # label to filter issues
 exclude_labels:
@@ -75,9 +77,10 @@ maestro status --json   # JSON output
 
 Example output:
 ```
-Repo:         BeFeast/panoptikon
-State file:   /home/shtrudel/.maestro/d581c91d05cc/state.json
-Max parallel: 5
+Repo:           BeFeast/panoptikon
+Session prefix: pan
+State file:     /home/shtrudel/.maestro/d581c91d05cc/state.json
+Max parallel:   5
 
 SESSION  ISSUE  STATUS   PID    ALIVE  AGE    TITLE
 -------  -----  ------   ---    -----  ---    -----
@@ -172,6 +175,49 @@ For automatic operation, run on a cron schedule:
 Or run as a daemon:
 ```bash
 maestro run --interval 10m
+```
+
+## Multi-Project Setup
+
+To run maestro for multiple projects simultaneously, use `session_prefix` and `state_dir` to keep workers and state isolated:
+
+```yaml
+# ~/.maestro/maestro-panoptikon.yaml
+repo: BeFeast/panoptikon
+session_prefix: pan           # workers: pan-1, pan-2, ...
+state_dir: ~/.maestro/pan
+worktree_base: ~/.worktrees/panoptikon
+max_parallel: 5
+```
+
+```yaml
+# ~/.maestro/maestro-myapp.yaml
+repo: BeFeast/myapp
+session_prefix: app           # workers: app-1, app-2, ...
+state_dir: ~/.maestro/app
+worktree_base: ~/.worktrees/myapp
+max_parallel: 3
+```
+
+### systemd Template Unit
+
+A `maestro@.service` template is included for running multiple instances as user services:
+
+```bash
+# Install the template
+cp maestro@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# Start per-project instances (uses ~/.maestro/maestro-<name>.yaml)
+systemctl --user start maestro@panoptikon
+systemctl --user start maestro@myapp
+
+# Enable on boot
+systemctl --user enable maestro@panoptikon
+
+# Check status
+systemctl --user status maestro@panoptikon
+journalctl --user -u maestro@panoptikon -f
 ```
 
 ## Dependencies

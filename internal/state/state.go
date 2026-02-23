@@ -1,7 +1,6 @@
 package state
 
 import (
-	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -46,21 +45,16 @@ func NewState() *State {
 	}
 }
 
-func StateDir(repo string) string {
-	hash := fmt.Sprintf("%x", md5.Sum([]byte(repo)))[:12]
-	return filepath.Join(os.Getenv("HOME"), ".maestro", hash)
+func StatePath(stateDir string) string {
+	return filepath.Join(stateDir, "state.json")
 }
 
-func StatePath(repo string) string {
-	return filepath.Join(StateDir(repo), "state.json")
+func LogDir(stateDir string) string {
+	return filepath.Join(stateDir, "logs")
 }
 
-func LogDir(repo string) string {
-	return filepath.Join(StateDir(repo), "logs")
-}
-
-func Load(repo string) (*State, error) {
-	path := StatePath(repo)
+func Load(stateDir string) (*State, error) {
+	path := StatePath(stateDir)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return NewState(), nil
@@ -76,9 +70,8 @@ func Load(repo string) (*State, error) {
 	return s, nil
 }
 
-func Save(repo string, s *State) error {
-	dir := StateDir(repo)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+func Save(stateDir string, s *State) error {
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
 	}
 
@@ -87,7 +80,7 @@ func Save(repo string, s *State) error {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 
-	path := StatePath(repo)
+	path := StatePath(stateDir)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return fmt.Errorf("write temp state: %w", err)
@@ -98,7 +91,7 @@ func Save(repo string, s *State) error {
 	return nil
 }
 
-// NextSlotName returns "pan-N" for the next available slot
+// NextSlotName returns "{prefix}-N" for the next available slot
 func (s *State) NextSlotName(prefix string) string {
 	name := fmt.Sprintf("%s-%d", prefix, s.NextSlot)
 	s.NextSlot++

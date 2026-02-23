@@ -1,9 +1,11 @@
 package config
 
 import (
+	"crypto/md5"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -21,7 +23,7 @@ type BackendDef struct {
 
 // ModelConfig holds multi-backend configuration.
 type ModelConfig struct {
-	Default  string                `yaml:"default"`  // "claude", "codex", etc.
+	Default  string                `yaml:"default"` // "claude", "codex", etc.
 	Backends map[string]BackendDef `yaml:"backends"`
 }
 
@@ -34,6 +36,8 @@ type Config struct {
 	IssueLabel    string         `yaml:"issue_label"`
 	ExcludeLabels []string       `yaml:"exclude_labels"`
 	WorkerPrompt  string         `yaml:"worker_prompt"`
+	SessionPrefix string         `yaml:"session_prefix"` // worker session name prefix (default: first 3 chars of repo name)
+	StateDir      string         `yaml:"state_dir"`      // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model         ModelConfig    `yaml:"model"`
 	Telegram      TelegramConfig `yaml:"telegram"`
 }
@@ -88,6 +92,24 @@ func parse(data []byte) (*Config, error) {
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
 	cfg.WorkerPrompt = expandHome(cfg.WorkerPrompt)
+	cfg.StateDir = expandHome(cfg.StateDir)
+
+	// Default session_prefix: first 3 chars of repo name
+	if cfg.SessionPrefix == "" {
+		parts := strings.Split(cfg.Repo, "/")
+		name := parts[len(parts)-1]
+		if len(name) >= 3 {
+			cfg.SessionPrefix = name[:3]
+		} else {
+			cfg.SessionPrefix = name
+		}
+	}
+
+	// Default state_dir: ~/.maestro/<md5-hash-of-repo>
+	if cfg.StateDir == "" {
+		hash := fmt.Sprintf("%x", md5.Sum([]byte(cfg.Repo)))[:12]
+		cfg.StateDir = filepath.Join(os.Getenv("HOME"), ".maestro", hash)
+	}
 
 	if cfg.Telegram.OpenclawURL == "" {
 		cfg.Telegram.OpenclawURL = "http://localhost:18789"
