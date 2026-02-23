@@ -12,6 +12,7 @@ import (
 
 type TelegramConfig struct {
 	Target      string `yaml:"target"`
+	BotToken    string `yaml:"bot_token"`
 	OpenclawURL string `yaml:"openclaw_url"`
 }
 
