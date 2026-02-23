@@ -10,58 +10,69 @@ import (
 )
 
 type Notifier struct {
-	OpenclawURL string
+	BotToken    string
 	Target      string
+	OpenclawURL string
 }
 
 func New(openclawURL, target string) *Notifier {
-	return &Notifier{
-		OpenclawURL: openclawURL,
-		Target:      target,
-	}
+	return &Notifier{OpenclawURL: openclawURL, Target: target}
 }
 
-type messagePayload struct {
-	Channel string `json:"channel"`
-	Target  string `json:"target"`
-	Message string `json:"message"`
+func NewWithToken(botToken, target, openclawURL string) *Notifier {
+	return &Notifier{BotToken: botToken, Target: target, OpenclawURL: openclawURL}
 }
 
 func (n *Notifier) Send(msg string) error {
-	if n.OpenclawURL == "" || n.Target == "" {
-		log.Printf("[notify] skipping notification (no openclaw_url or target): %s", msg)
+	if n.Target == "" {
 		return nil
 	}
-
-	payload := messagePayload{
-		Channel: "telegram",
-		Target:  n.Target,
-		Message: msg,
+	if n.BotToken != "" {
+		return n.sendTelegram(msg)
 	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+	if n.OpenclawURL != "" {
+		return n.sendOpenclaw(msg)
 	}
+	log.Printf("[notify] no transport configured, skipping: %s", msg)
+	return nil
+}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	url := n.OpenclawURL + "/api/v1/message/send"
-	resp, err := client.Post(url, "application/json", bytes.NewReader(data))
+func (n *Notifier) sendTelegram(msg string) error {
+	payload, _ := json.Marshal(map[string]string{
+		"chat_id":    n.Target,
+		"text":       msg,
+		"parse_mode": "Markdown",
+	})
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", n.BotToken)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("post to openclaw: %w", err)
+		return fmt.Errorf("telegram api: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("telegram returned %d", resp.StatusCode)
+	}
+	return nil
+}
 
+func (n *Notifier) sendOpenclaw(msg string) error {
+	payload, _ := json.Marshal(map[string]string{
+		"channel": "telegram", "target": n.Target, "message": msg,
+	})
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+		n.OpenclawURL+"/api/v1/message/send", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("openclaw: %w", err)
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("openclaw returned %d", resp.StatusCode)
 	}
-
 	return nil
 }
 
 func (n *Notifier) Sendf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	if err := n.Send(msg); err != nil {
+	if err := n.Send(fmt.Sprintf(format, args...)); err != nil {
 		log.Printf("[notify] failed to send: %v", err)
 	}
 }
