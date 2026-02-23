@@ -107,6 +107,11 @@ func parse(data []byte) (*Config, error) {
 		}
 	}
 
+	// Ensure the default backend is always present in the map
+	if _, ok := cfg.Model.Backends[cfg.Model.Default]; !ok {
+		cfg.Model.Backends[cfg.Model.Default] = BackendDef{Cmd: cfg.Model.Default}
+	}
+
 	return cfg, nil
 }
 

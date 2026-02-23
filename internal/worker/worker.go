@@ -79,7 +79,10 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	if !ok {
 		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
 		backendName = cfg.Model.Default
-		backendDef = cfg.Model.Backends[backendName]
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return "", fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
 	}
 	backendCfg := BackendConfig{
 		Cmd:       backendDef.Cmd,
@@ -94,7 +97,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	logFile := filepath.Join(logDir, slotName+".log")
 
 	// Build the worker command to generate the runner script
-	workerCmd, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
 	if err != nil {
 		return "", fmt.Errorf("build worker cmd: %w", err)
 	}
@@ -102,10 +105,10 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	// Write runner script
 	runnerPath := filepath.Join(stateDir, slotName+"-run.sh")
 	var runnerContent string
-	if workerCmd.Stdin != nil {
-		// Stdin-based backends (e.g. codex): pipe prompt file to stdin
+	if stdinFile != "" {
+		// Stdin-based backends (e.g. codex): redirect prompt file to stdin via shell
 		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s < %q 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), promptFile, logFile)
+			shellJoin(workerCmd.Args), stdinFile, logFile)
 	} else {
 		// Arg-based backends (e.g. claude): prompt is already in args
 		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s 2>&1 | tee -a %q\n",

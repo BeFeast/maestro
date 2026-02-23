@@ -404,7 +404,9 @@ func spawnCmd(args []string) {
 	backendName := cfg.Model.Default
 	for _, label := range targetIssue.Labels {
 		if strings.HasPrefix(label.Name, "model:") {
-			backendName = strings.TrimPrefix(label.Name, "model:")
+			if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
+				backendName = name
+			}
 		}
 	}
 	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)

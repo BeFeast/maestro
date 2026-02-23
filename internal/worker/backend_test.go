@@ -17,13 +17,16 @@ func TestBuildWorkerCmd_Claude(t *testing.T) {
 	worktree := "/tmp/test-worktree"
 
 	cfg := BackendConfig{Cmd: "claude", ExtraArgs: []string{"--model", "opus"}}
-	cmd, err := BuildWorkerCmd("claude", cfg, promptFile, worktree)
+	cmd, stdinFile, err := BuildWorkerCmd("claude", cfg, promptFile, worktree)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	if cmd.Path == "" {
 		t.Fatal("cmd.Path is empty")
+	}
+	if stdinFile != "" {
+		t.Errorf("expected empty stdinFile for claude, got: %s", stdinFile)
 	}
 	args := strings.Join(cmd.Args, " ")
 	if !strings.Contains(args, "--dangerously-skip-permissions") {
@@ -49,13 +52,16 @@ func TestBuildWorkerCmd_ClaudeDefault(t *testing.T) {
 
 	// Empty backend name should default to claude
 	cfg := BackendConfig{}
-	cmd, err := BuildWorkerCmd("", cfg, promptFile, "/tmp/wt")
+	cmd, stdinFile, err := BuildWorkerCmd("", cfg, promptFile, "/tmp/wt")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Should use "claude" as default cmd
 	if !strings.HasSuffix(cmd.Path, "claude") && !strings.Contains(cmd.Args[0], "claude") {
 		t.Errorf("expected claude command, got: %v", cmd.Args)
+	}
+	if stdinFile != "" {
+		t.Errorf("expected empty stdinFile for default claude, got: %s", stdinFile)
 	}
 }
 
@@ -68,7 +74,7 @@ func TestBuildWorkerCmd_Codex(t *testing.T) {
 	worktree := "/tmp/codex-worktree"
 
 	cfg := BackendConfig{Cmd: "/usr/local/bin/codex"}
-	cmd, err := BuildWorkerCmd("codex", cfg, promptFile, worktree)
+	cmd, stdinFile, err := BuildWorkerCmd("codex", cfg, promptFile, worktree)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -86,8 +92,11 @@ func TestBuildWorkerCmd_Codex(t *testing.T) {
 	if !strings.Contains(args, worktree) {
 		t.Errorf("expected worktree path in args, got: %s", args)
 	}
-	if cmd.Stdin == nil {
-		t.Error("expected stdin to be set for codex backend")
+	if stdinFile != promptFile {
+		t.Errorf("expected stdinFile=%s, got %s", promptFile, stdinFile)
+	}
+	if cmd.Stdin != nil {
+		t.Error("expected cmd.Stdin to be nil (stdin handled by runner script)")
 	}
 	if cmd.Dir != worktree {
 		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
@@ -95,7 +104,7 @@ func TestBuildWorkerCmd_Codex(t *testing.T) {
 }
 
 func TestBuildWorkerCmd_Unknown(t *testing.T) {
-	_, err := BuildWorkerCmd("gemini", BackendConfig{}, "/tmp/prompt.md", "/tmp/wt")
+	_, _, err := BuildWorkerCmd("gemini", BackendConfig{}, "/tmp/prompt.md", "/tmp/wt")
 	if err == nil {
 		t.Fatal("expected error for unknown backend")
 	}

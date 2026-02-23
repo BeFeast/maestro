@@ -31,6 +31,8 @@ func NewClaudeCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, er
 }
 
 // NewCodexCmd builds: codex exec --dangerously-bypass-approvals-and-sandbox -C <worktree> - < promptFile
+// Note: the prompt file is NOT opened here. The runner script in worker.go handles
+// stdin redirection via shell `< promptFile`, so no file descriptor is held open.
 func NewCodexCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, error) {
 	codexCmd := cfg.Cmd
 	if codexCmd == "" {
@@ -40,23 +42,22 @@ func NewCodexCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, err
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(codexCmd, args...)
 	cmd.Dir = worktree
-	// Prompt via stdin
-	f, err := os.Open(promptFile)
-	if err != nil {
-		return nil, fmt.Errorf("open prompt file: %w", err)
-	}
-	cmd.Stdin = f
+	// Stdin redirection is handled by the runner script — no file opened here
 	return cmd, nil
 }
 
 // BuildWorkerCmd creates the right exec.Cmd based on backend name.
-func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, error) {
+// Returns the command, an optional stdinFile path (for backends that read
+// the prompt via stdin, e.g. codex), and any error.
+func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
 	switch backendName {
 	case "claude", "":
-		return NewClaudeCmd(cfg, promptFile, worktree)
+		cmd, err = NewClaudeCmd(cfg, promptFile, worktree)
+		return cmd, "", err
 	case "codex":
-		return NewCodexCmd(cfg, promptFile, worktree)
+		cmd, err = NewCodexCmd(cfg, promptFile, worktree)
+		return cmd, promptFile, err
 	default:
-		return nil, fmt.Errorf("unknown backend: %s", backendName)
+		return nil, "", fmt.Errorf("unknown backend: %s", backendName)
 	}
 }

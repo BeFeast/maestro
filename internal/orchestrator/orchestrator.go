@@ -326,7 +326,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		backendName := o.cfg.Model.Default
 		for _, label := range issue.Labels {
 			if strings.HasPrefix(label.Name, "model:") {
-				backendName = strings.TrimPrefix(label.Name, "model:")
+				if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
+					backendName = name
+				}
 			}
 		}
 
