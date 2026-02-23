@@ -203,3 +203,28 @@ func TestParse_DifferentReposDifferentStateDirs(t *testing.T) {
 		t.Errorf("different repos should have different default state_dirs, both got %q", cfg1.StateDir)
 	}
 }
+
+func TestParse_MaxRuntimeMinutesDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxRuntimeMinutes != 120 {
+		t.Errorf("MaxRuntimeMinutes = %d, want 120", cfg.MaxRuntimeMinutes)
+	}
+}
+
+func TestParse_MaxRuntimeMinutesExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+max_runtime_minutes: 60
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxRuntimeMinutes != 60 {
+		t.Errorf("MaxRuntimeMinutes = %d, want 60", cfg.MaxRuntimeMinutes)
+	}
+}

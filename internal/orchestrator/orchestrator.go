@@ -183,11 +183,24 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				continue
 			}
 
-			// Check for stale sessions (> 2h)
+			// Check if worker exceeded max runtime — kill if so
+			maxMinutes := o.cfg.MaxRuntimeMinutes
+			if maxMinutes <= 0 {
+				maxMinutes = 120
+			}
+			// Double the limit if the issue has a "long-running" label
+			if hasLabel(sess.IssueLabels, "long-running") {
+				maxMinutes *= 2
+			}
 			age := time.Since(sess.StartedAt)
-			if age > 2*time.Hour {
-				o.notifier.Sendf("⏰ maestro: worker %s has been running for %s (issue #%d: %s) — might be stuck",
-					slotName, age.Round(time.Minute), sess.IssueNumber, sess.IssueTitle)
+			if age > time.Duration(maxMinutes)*time.Minute {
+				log.Printf("[orch] worker %s exceeded max runtime (%dm), killing", slotName, maxMinutes)
+				worker.Stop(o.cfg, slotName, sess)
+				sess.Status = state.StatusDead
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
+				o.notifier.Sendf("💀 maestro: worker for #%d killed after %dm (max runtime exceeded)",
+					sess.IssueNumber, int(age.Minutes()))
 			}
 		}
 	}
@@ -351,4 +364,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	if started == 0 {
 		log.Printf("[orch] no new workers started (%d issues checked)", len(issues))
 	}
+}
+
+// hasLabel checks if a label name exists in a slice (case-insensitive).
+func hasLabel(labels []string, name string) bool {
+	for _, l := range labels {
+		if strings.EqualFold(l, name) {
+			return true
+		}
+	}
+	return false
 }

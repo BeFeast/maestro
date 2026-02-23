@@ -22,6 +22,7 @@ const (
 type Session struct {
 	IssueNumber int           `json:"issue_number"`
 	IssueTitle  string        `json:"issue_title"`
+	IssueLabels []string      `json:"issue_labels,omitempty"` // labels from the GitHub issue at spawn time
 	Worktree    string        `json:"worktree"`
 	Branch      string        `json:"branch"`
 	PID         int           `json:"pid"`

@@ -29,19 +29,20 @@ type ModelConfig struct {
 }
 
 type Config struct {
-	Repo          string         `yaml:"repo"`
-	LocalPath     string         `yaml:"local_path"`
-	WorktreeBase  string         `yaml:"worktree_base"`
-	MaxParallel   int            `yaml:"max_parallel"`
-	ClaudeCmd     string         `yaml:"claude_cmd"`  // deprecated: use model.backends.claude.cmd
-	IssueLabel    string         `yaml:"issue_label"` // deprecated: use issue_labels
-	IssueLabels   []string       `yaml:"issue_labels"`
-	ExcludeLabels []string       `yaml:"exclude_labels"`
-	WorkerPrompt  string         `yaml:"worker_prompt"`
-	SessionPrefix string         `yaml:"session_prefix"` // worker session name prefix (default: first 3 chars of repo name)
-	StateDir      string         `yaml:"state_dir"`      // state/log directory (default: ~/.maestro/<repo-hash>)
-	Model         ModelConfig    `yaml:"model"`
-	Telegram      TelegramConfig `yaml:"telegram"`
+	Repo              string         `yaml:"repo"`
+	LocalPath         string         `yaml:"local_path"`
+	WorktreeBase      string         `yaml:"worktree_base"`
+	MaxParallel       int            `yaml:"max_parallel"`
+	MaxRuntimeMinutes int            `yaml:"max_runtime_minutes"` // max worker runtime in minutes (default: 120)
+	ClaudeCmd         string         `yaml:"claude_cmd"`          // deprecated: use model.backends.claude.cmd
+	IssueLabel        string         `yaml:"issue_label"`         // deprecated: use issue_labels
+	IssueLabels       []string       `yaml:"issue_labels"`
+	ExcludeLabels     []string       `yaml:"exclude_labels"`
+	WorkerPrompt      string         `yaml:"worker_prompt"`
+	SessionPrefix     string         `yaml:"session_prefix"` // worker session name prefix (default: first 3 chars of repo name)
+	StateDir          string         `yaml:"state_dir"`      // state/log directory (default: ~/.maestro/<repo-hash>)
+	Model             ModelConfig    `yaml:"model"`
+	Telegram          TelegramConfig `yaml:"telegram"`
 }
 
 // LoadFrom loads config from a specific path.
@@ -78,8 +79,9 @@ func Load() (*Config, error) {
 func parse(data []byte) (*Config, error) {
 
 	cfg := &Config{
-		MaxParallel: 5,
-		ClaudeCmd:   "claude",
+		MaxParallel:       5,
+		MaxRuntimeMinutes: 120,
+		ClaudeCmd:         "claude",
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)

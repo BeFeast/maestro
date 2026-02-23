@@ -135,10 +135,17 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	log.Printf("[worker] started %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
 
+	// Collect issue label names for runtime decisions (e.g. long-running)
+	var labelNames []string
+	for _, l := range issue.Labels {
+		labelNames = append(labelNames, l.Name)
+	}
+
 	// Save session to state
 	s.Sessions[slotName] = &state.Session{
 		IssueNumber: issue.Number,
 		IssueTitle:  issue.Title,
+		IssueLabels: labelNames,
 		Worktree:    worktreePath,
 		Branch:      branchName,
 		PID:         pid,
