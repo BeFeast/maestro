@@ -18,12 +18,14 @@ import (
 
 // Orchestrator coordinates all agent sessions
 type Orchestrator struct {
-	cfg        *config.Config
-	notifier   *notify.Notifier
-	gh         *github.Client
-	router     *router.Router
-	repo       string
-	promptBase string
+	cfg                   *config.Config
+	notifier              *notify.Notifier
+	gh                    *github.Client
+	router                *router.Router
+	repo                  string
+	promptBase            string
+	bugPromptBase         string
+	enhancementPromptBase string
 }
 
 // New creates a new Orchestrator
@@ -39,6 +41,7 @@ func New(cfg *config.Config) *Orchestrator {
 
 // LoadPromptBase reads the worker prompt template from config or a provided path.
 // Priority: 1) explicit promptPath arg, 2) cfg.WorkerPrompt, 3) built-in fallback.
+// Also loads optional bug_prompt and enhancement_prompt from config.
 func (o *Orchestrator) LoadPromptBase(promptPath string) error {
 	if promptPath == "" {
 		promptPath = o.cfg.WorkerPrompt
@@ -56,7 +59,38 @@ func (o *Orchestrator) LoadPromptBase(promptPath string) error {
 	}
 	o.promptBase = string(data)
 	log.Printf("[orch] loaded prompt base from %s (%d bytes)", promptPath, len(data))
+
+	// Load optional per-issue-type prompts
+	if o.cfg.BugPrompt != "" {
+		if data, err := os.ReadFile(o.cfg.BugPrompt); err != nil {
+			log.Printf("[orch] warn: could not read bug_prompt from %s: %v", o.cfg.BugPrompt, err)
+		} else {
+			o.bugPromptBase = string(data)
+			log.Printf("[orch] loaded bug_prompt from %s (%d bytes)", o.cfg.BugPrompt, len(data))
+		}
+	}
+	if o.cfg.EnhancementPrompt != "" {
+		if data, err := os.ReadFile(o.cfg.EnhancementPrompt); err != nil {
+			log.Printf("[orch] warn: could not read enhancement_prompt from %s: %v", o.cfg.EnhancementPrompt, err)
+		} else {
+			o.enhancementPromptBase = string(data)
+			log.Printf("[orch] loaded enhancement_prompt from %s (%d bytes)", o.cfg.EnhancementPrompt, len(data))
+		}
+	}
+
 	return nil
+}
+
+// selectPrompt returns the appropriate prompt template for an issue based on its labels.
+// Priority: bug label → bug_prompt, enhancement label → enhancement_prompt, fallback → worker_prompt.
+func (o *Orchestrator) selectPrompt(issue github.Issue) string {
+	if o.bugPromptBase != "" && github.HasLabel(issue, []string{"bug"}) {
+		return o.bugPromptBase
+	}
+	if o.enhancementPromptBase != "" && github.HasLabel(issue, []string{"enhancement"}) {
+		return o.enhancementPromptBase
+	}
+	return o.promptBase
 }
 
 // RunOnce executes one orchestration cycle
@@ -366,8 +400,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			backendName = o.cfg.Model.Default
 		}
 
+		promptBase := o.selectPrompt(issue)
 		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s)", issue.Number, issue.Title, backendName)
-		slotName, err := worker.Start(o.cfg, s, o.repo, issue, o.promptBase, backendName)
+		slotName, err := worker.Start(o.cfg, s, o.repo, issue, promptBase, backendName)
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
