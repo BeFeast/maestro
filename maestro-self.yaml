@@ -24,4 +24,5 @@ deploy_cmd: "cd /home/shtrudel/src/maestro && go build ./cmd/maestro/ && systemc
 
 telegram:
   target: "79510949"
+  bot_token: "8572055931:AAGbLuK8JJ4YG7SoulsxZx7jl1JoJyfUTSY"
   openclaw_url: "http://localhost:18789"
