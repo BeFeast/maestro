@@ -23,6 +23,7 @@ import (
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/versioning"
+	"github.com/befeast/maestro/internal/watch"
 	"github.com/befeast/maestro/internal/worker"
 )
 
@@ -130,6 +131,8 @@ func main() {
 		historyCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
+	case "_watch-updater":
+		watchUpdaterCmd(args)
 	case "version":
 		fmt.Printf("maestro %s\n", version)
 	case "help", "--help", "-h":
@@ -458,11 +461,8 @@ func logsCmd(args []string) {
 // watchPaneCmd builds a shell command for a watch pane.
 // If the worker's tmux session is alive, attach read-only for live output.
 // When the session ends (or is already gone), show the log file.
-func watchPaneCmd(w struct {
-	name string
-	sess *state.Session
-}) string {
-	tmuxName := worker.TmuxSessionName(w.name)
+func watchPaneCmd(name string, sess *state.Session) string {
+	tmuxName := worker.TmuxSessionName(name)
 	// Shell script that:
 	// 1. If worker tmux session exists → attach read-only (env -u TMUX to allow nesting)
 	// 2. After attach exits (worker done) or if session gone → show log tail
@@ -478,7 +478,7 @@ func watchPaneCmd(w struct {
 			`echo 'No log file found.'; `+
 			`fi; `+
 			`echo; echo 'Press any key to exit...'; read -n1`,
-		tmuxName, tmuxName, w.sess.LogFile, w.name, w.sess.LogFile)
+		tmuxName, tmuxName, sess.LogFile, name, sess.LogFile)
 }
 
 func watchCmd(args []string) {
@@ -491,8 +491,9 @@ func watchCmd(args []string) {
 
 	// Collect active running sessions across all projects
 	type activeWorker struct {
-		name string
-		sess *state.Session
+		name     string
+		sess     *state.Session
+		stateDir string
 	}
 	var workers []activeWorker
 	for _, cfg := range cfgs {
@@ -503,7 +504,7 @@ func watchCmd(args []string) {
 		}
 		for name, sess := range s.Sessions {
 			if sess.Status == state.StatusRunning && worker.IsAlive(sess.PID) {
-				workers = append(workers, activeWorker{name, sess})
+				workers = append(workers, activeWorker{name, sess, cfg.StateDir})
 			}
 		}
 	}
@@ -523,34 +524,70 @@ func watchCmd(args []string) {
 	// Kill stale session if exists
 	exec.Command("tmux", "kill-session", "-t", tmuxSession).Run()
 
+	// Build pane mappings for the background status updater
+	var paneMappings []watch.PaneMapping
+
 	// Create new session with first worker — attach to its tmux session
-	firstCmd := watchPaneCmd(workers[0])
+	firstCmd := watchPaneCmd(workers[0].name, workers[0].sess)
 	if out, err := exec.Command("tmux", "new-session", "-d", "-s", tmuxSession, "bash", "-c", firstCmd).CombinedOutput(); err != nil {
 		log.Fatalf("tmux new-session: %v\n%s", err, out)
 	}
 
-	// Set pane title for first pane
-	paneTitle := fmt.Sprintf("%s #%d", workers[0].name, workers[0].sess.IssueNumber)
+	// Set rich pane title for first pane
+	paneTitle := watch.FormatPaneTitle(workers[0].name, workers[0].sess)
 	exec.Command("tmux", "select-pane", "-t", tmuxSession+":0.0", "-T", paneTitle).Run()
+	paneMappings = append(paneMappings, watch.PaneMapping{
+		PaneIndex: 0,
+		SlotName:  workers[0].name,
+		StateDir:  workers[0].stateDir,
+	})
 
 	// Split for each additional worker
 	for i := 1; i < len(workers); i++ {
-		paneCmd := watchPaneCmd(workers[i])
+		paneCmd := watchPaneCmd(workers[i].name, workers[i].sess)
 		if out, err := exec.Command("tmux", "split-window", "-t", tmuxSession, "bash", "-c", paneCmd).CombinedOutput(); err != nil {
 			log.Printf("tmux split-window for %s: %v\n%s", workers[i].name, err, out)
 			continue
 		}
-		// Set pane title
-		paneTitle := fmt.Sprintf("%s #%d", workers[i].name, workers[i].sess.IssueNumber)
+		// Set rich pane title
+		paneTitle := watch.FormatPaneTitle(workers[i].name, workers[i].sess)
 		exec.Command("tmux", "select-pane", "-t", tmuxSession, "-T", paneTitle).Run()
+
+		paneMappings = append(paneMappings, watch.PaneMapping{
+			PaneIndex: i,
+			SlotName:  workers[i].name,
+			StateDir:  workers[i].stateDir,
+		})
 
 		// Re-tile after each split to keep things balanced
 		exec.Command("tmux", "select-layout", "-t", tmuxSession, "tiled").Run()
 	}
 
-	// Enable pane titles display
+	// Enable pane titles display with rich border format
 	exec.Command("tmux", "set-option", "-t", tmuxSession, "pane-border-status", "top").Run()
-	exec.Command("tmux", "set-option", "-t", tmuxSession, "pane-border-format", " #{pane_title} ").Run()
+	exec.Command("tmux", "set-option", "-t", tmuxSession, "pane-border-format",
+		"#[fg=white,bold] #{pane_title}").Run()
+
+	// Write pane mapping and start background updater to keep titles fresh
+	if err := watch.WritePaneMap(watch.PaneMapFile, paneMappings); err != nil {
+		log.Printf("[watch] warn: write pane map: %v (titles won't auto-refresh)", err)
+	} else {
+		selfBin, _ := os.Executable()
+		if selfBin == "" {
+			selfBin = os.Args[0]
+		}
+		updaterArgs := []string{selfBin, "_watch-updater"}
+		for _, c := range configs {
+			updaterArgs = append(updaterArgs, "--config", c)
+		}
+		updater := exec.Command(updaterArgs[0], updaterArgs[1:]...)
+		updater.Stdout = nil
+		updater.Stderr = nil
+		if err := updater.Start(); err != nil {
+			log.Printf("[watch] warn: start updater: %v (titles won't auto-refresh)", err)
+		}
+		// Detach — the updater will exit when the watch session dies
+	}
 
 	// Attach — replaces current process
 	tmuxPath, err := exec.LookPath("tmux")
@@ -559,6 +596,16 @@ func watchCmd(args []string) {
 	}
 	syscall.Exec(tmuxPath, []string{"tmux", "attach", "-t", tmuxSession}, os.Environ())
 	log.Fatalf("exec tmux attach: should not reach here")
+}
+
+func watchUpdaterCmd(args []string) {
+	fs := flag.NewFlagSet("_watch-updater", flag.ExitOnError)
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	fs.Parse(args)
+
+	// The updater runs as a background daemon, refreshing pane titles every 3 seconds
+	watch.RunUpdater(watch.PaneMapFile, 3*time.Second)
 }
 
 func spawnCmd(args []string) {
