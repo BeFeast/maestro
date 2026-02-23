@@ -6,7 +6,7 @@ Replaces the previous `ao` (agent-orchestrator npm package) + shell scripts setu
 
 ## What it does
 
-maestro orchestrates multiple parallel Claude AI agents, each working on a separate GitHub issue in its own git worktree. It:
+maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini), each working on a separate GitHub issue in its own git worktree. It:
 
 - Picks open GitHub issues matching a label (e.g. `enhancement`)
 - Creates git worktrees for each agent
@@ -44,6 +44,45 @@ exclude_labels:
 telegram:
   target: "79510949"        # Telegram user ID
   openclaw_url: "http://localhost:18789"  # OpenClaw gateway
+```
+
+## AI Backends
+
+Maestro supports multiple AI coding agents. Configure via `model:` in `maestro.yaml`:
+
+```yaml
+model:
+  default: claude        # which backend to use by default
+  backends:
+    claude:
+      cmd: claude        # Anthropic Claude Code CLI
+    codex:
+      cmd: codex         # OpenAI Codex CLI
+    gemini:
+      cmd: gemini        # Google Gemini CLI
+```
+
+### Supported backends
+
+> [!NOTE]
+> **Claude** (default) — Anthropic Claude Code CLI
+> Install: https://claude.ai/code | `claude --version`
+
+> [!NOTE]
+> **OpenAI Codex** — OpenAI Codex CLI
+> Install: `npm install -g @openai/codex` or `bun add -g @openai/codex`
+> Auth: `codex auth` or set `OPENAI_API_KEY`
+
+> [!NOTE]
+> **Gemini** — Google Gemini CLI
+> Install: `npm install -g @google/gemini-cli`
+> Auth: `gemini auth` or set `GEMINI_API_KEY`
+
+### Per-issue routing
+Label a GitHub issue with `model:codex` or `model:gemini` to override the default backend for that specific issue:
+```
+issue #42 labels: enhancement, model:codex  → runs with Codex
+issue #43 labels: enhancement               → runs with default (claude)
 ```
 
 ## Commands
@@ -180,7 +219,7 @@ maestro run --interval 10m
 - `gopkg.in/yaml.v3` (config parsing)
 - `gh` CLI (GitHub operations)
 - `git` (worktree management)
-- `claude` CLI (agent invocation)
+- `claude` / `codex` / `gemini` CLI (agent invocation — at least one required)
 
 ## Acknowledgments
 
