@@ -244,3 +244,136 @@ func searchString(s, substr string) bool {
 	}
 	return false
 }
+
+func TestIsTerminal(t *testing.T) {
+	tests := []struct {
+		status SessionStatus
+		want   bool
+	}{
+		{StatusRunning, false},
+		{StatusPROpen, false},
+		{StatusDone, true},
+		{StatusFailed, true},
+		{StatusConflictFailed, true},
+		{StatusDead, true},
+	}
+	for _, tt := range tests {
+		if got := IsTerminal(tt.status); got != tt.want {
+			t.Errorf("IsTerminal(%q) = %v, want %v", tt.status, got, tt.want)
+		}
+	}
+}
+
+func TestCompletedSessions_Empty(t *testing.T) {
+	s := NewState()
+	if got := s.CompletedSessions(); len(got) != 0 {
+		t.Errorf("expected 0 completed sessions, got %d", len(got))
+	}
+}
+
+func TestCompletedSessions_FiltersAndSorts(t *testing.T) {
+	now := time.Now().UTC()
+	t1 := now.Add(-3 * time.Hour)
+	t2 := now.Add(-1 * time.Hour)
+	t3 := now.Add(-2 * time.Hour)
+
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{
+		IssueNumber: 1,
+		Status:      StatusDone,
+		StartedAt:   now.Add(-4 * time.Hour),
+		FinishedAt:  &t1,
+	}
+	s.Sessions["slot-2"] = &Session{
+		IssueNumber: 2,
+		Status:      StatusRunning, // should be excluded
+		StartedAt:   now.Add(-2 * time.Hour),
+	}
+	s.Sessions["slot-3"] = &Session{
+		IssueNumber: 3,
+		Status:      StatusDead,
+		StartedAt:   now.Add(-3 * time.Hour),
+		FinishedAt:  &t2,
+	}
+	s.Sessions["slot-4"] = &Session{
+		IssueNumber: 4,
+		Status:      StatusConflictFailed,
+		StartedAt:   now.Add(-5 * time.Hour),
+		FinishedAt:  &t3,
+	}
+
+	completed := s.CompletedSessions()
+	if len(completed) != 3 {
+		t.Fatalf("expected 3 completed, got %d", len(completed))
+	}
+
+	// Should be sorted by FinishedAt descending: slot-3 (1h), slot-4 (2h), slot-1 (3h)
+	if completed[0].IssueNumber != 3 {
+		t.Errorf("first should be issue 3 (most recent), got %d", completed[0].IssueNumber)
+	}
+	if completed[1].IssueNumber != 4 {
+		t.Errorf("second should be issue 4, got %d", completed[1].IssueNumber)
+	}
+	if completed[2].IssueNumber != 1 {
+		t.Errorf("third should be issue 1 (oldest), got %d", completed[2].IssueNumber)
+	}
+}
+
+func TestPruneOldSessions(t *testing.T) {
+	now := time.Now().UTC()
+	old := now.Add(-40 * 24 * time.Hour)
+	recent := now.Add(-5 * 24 * time.Hour)
+
+	s := NewState()
+	s.Sessions["old-done"] = &Session{
+		IssueNumber: 1,
+		Status:      StatusDone,
+		StartedAt:   old.Add(-time.Hour),
+		FinishedAt:  &old,
+	}
+	s.Sessions["recent-done"] = &Session{
+		IssueNumber: 2,
+		Status:      StatusDone,
+		StartedAt:   recent.Add(-time.Hour),
+		FinishedAt:  &recent,
+	}
+	s.Sessions["running"] = &Session{
+		IssueNumber: 3,
+		Status:      StatusRunning,
+		StartedAt:   old, // old but running — should NOT be pruned
+	}
+
+	maxAge := 30 * 24 * time.Hour
+	pruned := s.PruneOldSessions(maxAge)
+
+	if pruned != 1 {
+		t.Errorf("expected 1 pruned, got %d", pruned)
+	}
+	if _, ok := s.Sessions["old-done"]; ok {
+		t.Error("old-done should have been pruned")
+	}
+	if _, ok := s.Sessions["recent-done"]; !ok {
+		t.Error("recent-done should still exist")
+	}
+	if _, ok := s.Sessions["running"]; !ok {
+		t.Error("running should still exist (not terminal)")
+	}
+}
+
+func TestPruneOldSessions_NoFinishedAt(t *testing.T) {
+	// Edge case: terminal session without FinishedAt falls back to StartedAt
+	old := time.Now().UTC().Add(-40 * 24 * time.Hour)
+
+	s := NewState()
+	s.Sessions["dead-no-finish"] = &Session{
+		IssueNumber: 1,
+		Status:      StatusDead,
+		StartedAt:   old,
+		FinishedAt:  nil, // no FinishedAt
+	}
+
+	pruned := s.PruneOldSessions(30 * 24 * time.Hour)
+	if pruned != 1 {
+		t.Errorf("expected 1 pruned, got %d", pruned)
+	}
+}
