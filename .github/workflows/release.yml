@@ -8,23 +8,31 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" --generate-notes --draft
+
+  build:
     name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
-    runs-on: ${{ matrix.os }}
+    needs: create-release
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            goos: linux
+          - goos: linux
             goarch: amd64
-          - os: ubuntu-latest
-            goos: linux
+          - goos: linux
             goarch: arm64
-          - os: macos-latest
-            goos: darwin
+          - goos: darwin
             goarch: amd64
-          - os: macos-latest
-            goos: darwin
+          - goos: darwin
             goarch: arm64
     steps:
       - uses: actions/checkout@v4
@@ -40,14 +48,40 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
-        run: go build -trimpath -o maestro-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/maestro/
-
-      - name: Create release if needed
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" --generate-notes || true
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o maestro-${{ matrix.goos }}-${{ matrix.goarch }} \
+            ./cmd/maestro/
 
       - name: Upload binary
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" maestro-${{ matrix.goos }}-${{ matrix.goarch }} --clobber
+        run: gh release upload "${{ github.ref_name }}" maestro-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          cd dist
+          gh release download "${{ github.ref_name }}" --pattern 'maestro-*'
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum maestro-* > checksums.txt
+
+      - name: Upload checksums and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" dist/checksums.txt
+          gh release edit "${{ github.ref_name }}" --draft=false
