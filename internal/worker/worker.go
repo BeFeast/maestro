@@ -75,7 +75,12 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	if backendName == "" {
 		backendName = cfg.Model.Default
 	}
-	backendDef := cfg.Model.Backends[backendName]
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
+		backendName = cfg.Model.Default
+		backendDef = cfg.Model.Backends[backendName]
+	}
 	backendCfg := BackendConfig{
 		Cmd:       backendDef.Cmd,
 		ExtraArgs: backendDef.ExtraArgs,

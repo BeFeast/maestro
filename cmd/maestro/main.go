@@ -403,8 +403,8 @@ func spawnCmd(args []string) {
 	// Use default backend for manual starts (can be overridden via model: label)
 	backendName := cfg.Model.Default
 	for _, label := range targetIssue.Labels {
-		if len(label.Name) > 6 && label.Name[:6] == "model:" {
-			backendName = label.Name[6:]
+		if strings.HasPrefix(label.Name, "model:") {
+			backendName = strings.TrimPrefix(label.Name, "model:")
 		}
 	}
 	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)

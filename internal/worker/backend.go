@@ -14,8 +14,11 @@ type BackendConfig struct {
 
 // NewClaudeCmd builds a claude --dangerously-skip-permissions -p "$(cat promptFile)" command.
 // Prompt is read from file to avoid shell quoting issues.
-func NewClaudeCmd(cfg BackendConfig, promptFile, worktree string) *exec.Cmd {
-	promptData, _ := os.ReadFile(promptFile)
+func NewClaudeCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, error) {
+	promptData, err := os.ReadFile(promptFile)
+	if err != nil {
+		return nil, fmt.Errorf("read prompt file: %w", err)
+	}
 	claudeCmd := cfg.Cmd
 	if claudeCmd == "" {
 		claudeCmd = "claude"
@@ -24,11 +27,11 @@ func NewClaudeCmd(cfg BackendConfig, promptFile, worktree string) *exec.Cmd {
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(claudeCmd, args...)
 	cmd.Dir = worktree
-	return cmd
+	return cmd, nil
 }
 
 // NewCodexCmd builds: codex exec --dangerously-bypass-approvals-and-sandbox -C <worktree> - < promptFile
-func NewCodexCmd(cfg BackendConfig, promptFile, worktree string) *exec.Cmd {
+func NewCodexCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, error) {
 	codexCmd := cfg.Cmd
 	if codexCmd == "" {
 		codexCmd = "codex"
@@ -39,19 +42,20 @@ func NewCodexCmd(cfg BackendConfig, promptFile, worktree string) *exec.Cmd {
 	cmd.Dir = worktree
 	// Prompt via stdin
 	f, err := os.Open(promptFile)
-	if err == nil {
-		cmd.Stdin = f
+	if err != nil {
+		return nil, fmt.Errorf("open prompt file: %w", err)
 	}
-	return cmd
+	cmd.Stdin = f
+	return cmd, nil
 }
 
 // BuildWorkerCmd creates the right exec.Cmd based on backend name.
 func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, error) {
 	switch backendName {
 	case "claude", "":
-		return NewClaudeCmd(cfg, promptFile, worktree), nil
+		return NewClaudeCmd(cfg, promptFile, worktree)
 	case "codex":
-		return NewCodexCmd(cfg, promptFile, worktree), nil
+		return NewCodexCmd(cfg, promptFile, worktree)
 	default:
 		return nil, fmt.Errorf("unknown backend: %s", backendName)
 	}
