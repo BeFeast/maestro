@@ -242,6 +242,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				o.notifier.Sendf("❌ maestro: failed to merge PR #%d (%s): %v", pr.Number, sess.Branch, err)
 			} else {
 				log.Printf("[orch] merged PR #%d ✓", pr.Number)
+				if err := o.gh.CloseIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
+					log.Printf("[orch] warning: failed to close issue #%d: %v", sess.IssueNumber, err)
+				}
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
