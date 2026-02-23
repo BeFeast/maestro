@@ -1,10 +1,12 @@
 package orchestrator
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/notify"
 )
 
 func makeIssue(number int, title string, labels ...string) github.Issue {
@@ -118,5 +120,55 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 	got := o.selectPrompt(makeIssue(8, "Fix crash", "Bug"))
 	if got != "bug prompt" {
 		t.Errorf("selectPrompt() = %q, want %q (label matching should be case-insensitive)", got, "bug prompt")
+	}
+}
+
+func TestRunDeployCmd_Success(t *testing.T) {
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:      "owner/repo",
+			LocalPath: "/tmp",
+			DeployCmd: "echo deploy-ok",
+		},
+		notifier: &notify.Notifier{},
+	}
+	if err := o.runDeployCmd(42); err != nil {
+		t.Errorf("runDeployCmd() unexpected error: %v", err)
+	}
+}
+
+func TestRunDeployCmd_Failure(t *testing.T) {
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:      "owner/repo",
+			LocalPath: "/tmp",
+			DeployCmd: "exit 1",
+		},
+		notifier: &notify.Notifier{},
+	}
+	err := o.runDeployCmd(42)
+	if err == nil {
+		t.Fatal("runDeployCmd() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "deploy command failed") {
+		t.Errorf("error = %q, want it to contain 'deploy command failed'", err.Error())
+	}
+}
+
+func TestRunDeployCmd_CapturesOutput(t *testing.T) {
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:      "owner/repo",
+			LocalPath: "/tmp",
+			DeployCmd: "echo hello-deploy && exit 1",
+		},
+		notifier: &notify.Notifier{},
+	}
+	err := o.runDeployCmd(42)
+	if err == nil {
+		t.Fatal("runDeployCmd() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "hello-deploy") {
+		t.Errorf("error = %q, want it to contain command output 'hello-deploy'", err.Error())
 	}
 }

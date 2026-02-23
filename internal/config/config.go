@@ -64,6 +64,7 @@ type Config struct {
 	StateDir          string           `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model             ModelConfig      `yaml:"model"`
 	Routing           RoutingConfig    `yaml:"routing"`
+	DeployCmd         string           `yaml:"deploy_cmd"` // shell command to run after successful PR merge
 	Telegram          TelegramConfig   `yaml:"telegram"`
 	Versioning        VersioningConfig `yaml:"versioning"`
 }
