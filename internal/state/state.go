@@ -31,6 +31,7 @@ type Session struct {
 	Status      SessionStatus `json:"status"`
 	PRNumber    int           `json:"pr_number,omitempty"`
 	Backend     string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	LongRunning bool          `json:"long_running,omitempty"`
 }
 
 type State struct {
