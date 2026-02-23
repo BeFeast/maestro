@@ -46,6 +46,16 @@ Maestro works with private repos — all GitHub operations go through `gh` CLI. 
 
 ## Installation
 
+### Quick install
+
+```bash
+# One-liner install
+curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/scripts/install.sh | bash
+
+# Or download manually from:
+# https://github.com/BeFeast/maestro/releases/latest
+```
+
 ### Release binaries
 
 Download the latest binary from [Releases](https://github.com/BeFeast/maestro/releases) and add it to your PATH.
