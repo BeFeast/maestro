@@ -186,6 +186,66 @@ state_dir: ~/.maestro/panoptikon
 	}
 }
 
+func TestParse_PromptTemplateFields(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_prompt: /path/to/default.md
+bug_prompt: /path/to/bug.md
+enhancement_prompt: /path/to/enhancement.md
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerPrompt != "/path/to/default.md" {
+		t.Errorf("WorkerPrompt = %q, want /path/to/default.md", cfg.WorkerPrompt)
+	}
+	if cfg.BugPrompt != "/path/to/bug.md" {
+		t.Errorf("BugPrompt = %q, want /path/to/bug.md", cfg.BugPrompt)
+	}
+	if cfg.EnhancementPrompt != "/path/to/enhancement.md" {
+		t.Errorf("EnhancementPrompt = %q, want /path/to/enhancement.md", cfg.EnhancementPrompt)
+	}
+}
+
+func TestParse_PromptTemplateExpandsHome(t *testing.T) {
+	yaml := `
+repo: owner/repo
+bug_prompt: ~/prompts/bug.md
+enhancement_prompt: ~/prompts/enhancement.md
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	home := os.Getenv("HOME")
+	expectedBug := filepath.Join(home, "prompts/bug.md")
+	expectedEnh := filepath.Join(home, "prompts/enhancement.md")
+	if cfg.BugPrompt != expectedBug {
+		t.Errorf("BugPrompt = %q, want %q", cfg.BugPrompt, expectedBug)
+	}
+	if cfg.EnhancementPrompt != expectedEnh {
+		t.Errorf("EnhancementPrompt = %q, want %q", cfg.EnhancementPrompt, expectedEnh)
+	}
+}
+
+func TestParse_PromptTemplateFieldsOptional(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_prompt: /path/to/default.md
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.BugPrompt != "" {
+		t.Errorf("BugPrompt = %q, want empty", cfg.BugPrompt)
+	}
+	if cfg.EnhancementPrompt != "" {
+		t.Errorf("EnhancementPrompt = %q, want empty", cfg.EnhancementPrompt)
+	}
+}
+
 func TestParse_DifferentReposDifferentStateDirs(t *testing.T) {
 	yaml1 := `repo: BeFeast/panoptikon`
 	yaml2 := `repo: BeFeast/myapp`
