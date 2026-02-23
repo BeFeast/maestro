@@ -34,6 +34,9 @@ Commands:
   stop      Stop a worker session
   version   Print version
 
+Global flags:
+  --config string       Path to config file (default: maestro.yaml)
+
 Run flags:
   --interval duration   Loop interval (default 10m)
   --once                Run once and exit
@@ -89,17 +92,30 @@ func main() {
 	}
 }
 
+// loadConfig loads config from a specific path or uses default discovery.
+func loadConfig(configPath string) *config.Config {
+	var cfg *config.Config
+	var err error
+	if configPath != "" {
+		cfg, err = config.LoadFrom(configPath)
+	} else {
+		cfg, err = config.Load()
+	}
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	return cfg
+}
+
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
 	interval := fs.Duration("interval", 10*time.Minute, "Loop interval")
 	once := fs.Bool("once", false, "Run once and exit")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
+	cfg := loadConfig(*configPath)
 
 	orch := orchestrator.New(cfg)
 	if err := orch.LoadPromptBase(*promptPath); err != nil {
@@ -115,13 +131,11 @@ func runCmd(args []string) {
 
 func statusCmd(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
+	cfg := loadConfig(*configPath)
 
 	s, err := state.Load(cfg.Repo)
 	if err != nil {
@@ -185,10 +199,12 @@ func statusCmd(args []string) {
 }
 
 func logsCmd(args []string) {
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
+	fs.Parse(args)
+	args = fs.Args() // remaining args after flags
+
+	cfg := loadConfig(*configPath)
 
 	s, err := state.Load(cfg.Repo)
 	if err != nil {
@@ -255,10 +271,11 @@ func logsCmd(args []string) {
 }
 
 func watchCmd(args []string) {
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
+	fs.Parse(args)
+
+	cfg := loadConfig(*configPath)
 
 	s, err := state.Load(cfg.Repo)
 	if err != nil {
@@ -332,6 +349,7 @@ func watchCmd(args []string) {
 
 func spawnCmd(args []string) {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
 	issueNum := fs.Int("issue", 0, "Issue number")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	fs.Parse(args)
@@ -341,10 +359,7 @@ func spawnCmd(args []string) {
 		os.Exit(1)
 	}
 
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
+	cfg := loadConfig(*configPath)
 
 	s, err := state.Load(cfg.Repo)
 	if err != nil {
@@ -399,6 +414,7 @@ func spawnCmd(args []string) {
 
 func stopCmd(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
 	sessionName := fs.String("session", "", "Session name to stop")
 	fs.Parse(args)
 
@@ -407,10 +423,7 @@ func stopCmd(args []string) {
 		os.Exit(1)
 	}
 
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
+	cfg := loadConfig(*configPath)
 
 	s, err := state.Load(cfg.Repo)
 	if err != nil {

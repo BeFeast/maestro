@@ -25,6 +25,15 @@ type Config struct {
 	Telegram      TelegramConfig `yaml:"telegram"`
 }
 
+// LoadFrom loads config from a specific path.
+func LoadFrom(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	return parse(data)
+}
+
 func Load() (*Config, error) {
 	candidates := []string{
 		"maestro.yaml",
@@ -44,6 +53,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("no config file found (tried maestro.yaml, ~/.maestro/config.yaml): %w", err)
 	}
+	return parse(data)
+}
+
+func parse(data []byte) (*Config, error) {
 
 	cfg := &Config{
 		MaxParallel: 5,

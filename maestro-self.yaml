@@ -1,0 +1,26 @@
+repo: BeFeast/maestro
+local_path: /home/shtrudel/src/maestro
+worktree_base: /home/shtrudel/.worktrees/maestro
+max_parallel: 2
+
+# Model backend — default is Claude CLI
+# Supported: claude (default), codex (OpenAI), gemini
+claude_cmd: claude
+# Future: uncomment to use Codex
+# model:
+#   backend: codex
+#   cmd: codex
+#   args: ["--approval-mode", "full-auto"]
+
+issue_label: enhancement
+exclude_labels:
+  - blocked
+  - wontfix
+worker_prompt: /home/shtrudel/src/maestro/worker-prompt-go.md
+
+# deploy_cmd doesn't exist yet (see issue #1) — ready for when it lands
+deploy_cmd: "cd /home/shtrudel/src/maestro && go build ./cmd/maestro/ && systemctl --user restart maestro"
+
+telegram:
+  target: "79510949"
+  openclaw_url: "http://localhost:18789"
