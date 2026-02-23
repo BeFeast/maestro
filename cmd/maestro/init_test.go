@@ -216,6 +216,50 @@ func TestRunInitWizardEmptyRepo(t *testing.T) {
 	}
 }
 
+func TestRunInitWizardInvalidRepoFormat(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"no slash", "justrepo\n"},
+		{"empty owner", "/repo\n"},
+		{"empty repo name", "owner/\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			var output bytes.Buffer
+			err := runInitWizard(strings.NewReader(tt.input), &output, tmpDir)
+			if err == nil {
+				t.Fatal("expected error for invalid repo format")
+			}
+			if !strings.Contains(err.Error(), "owner/repo") {
+				t.Errorf("error should mention 'owner/repo', got: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunInitWizardStateDirConfirmation(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	out := output.String()
+	maestroDir := filepath.Join(tmpDir, ".maestro")
+	if !strings.Contains(out, maestroDir) {
+		t.Errorf("output should mention state directory %s, got:\n%s", maestroDir, out)
+	}
+}
+
 func TestRunInitWizardInvalidMaxParallel(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)

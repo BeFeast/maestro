@@ -56,8 +56,11 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 		return fmt.Errorf("repo is required")
 	}
 
-	parts := strings.Split(repo, "/")
-	repoName := parts[len(parts)-1]
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("repo must be in owner/repo format (e.g. BeFeast/panoptikon)")
+	}
+	repoName := parts[1]
 
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
@@ -108,7 +111,11 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 
 	// Create ~/.maestro/ state directory
 	maestroDir := filepath.Join(os.Getenv("HOME"), ".maestro")
-	os.MkdirAll(maestroDir, 0755) //nolint: state dir is best-effort
+	if err := os.MkdirAll(maestroDir, 0755); err != nil {
+		fmt.Fprintf(w, "Note: could not create state directory: %v\n", err)
+	} else {
+		fmt.Fprintf(w, "\u2705 Created %s\n", maestroDir)
+	}
 
 	// Create service file (non-fatal)
 	binPath, _ := os.Executable()
