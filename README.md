@@ -52,7 +52,7 @@ Maestro works with private repos — all GitHub operations go through `gh` CLI. 
 curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/scripts/install.sh | bash
 ```
 
-Or download a binary manually from [Releases](https://github.com/BeFeast/maestro/releases/latest).
+Or download a binary manually from the [latest release](https://github.com/BeFeast/maestro/releases/latest).
 
 ### Build from source
 
