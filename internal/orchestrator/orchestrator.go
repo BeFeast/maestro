@@ -317,6 +317,26 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			// Reset CI failure notification flag when CI goes green
 			sess.NotifiedCIFail = false
 
+			// Check greptile review before merging
+			grState, grBody, grErr := o.gh.GreptileReviewStatus(pr.Number)
+			if grErr != nil {
+				log.Printf("[orch] greptile review check for PR #%d: %v — skipping merge this cycle", pr.Number, grErr)
+				continue
+			}
+			if grState == "CHANGES_REQUESTED" {
+				log.Printf("[orch] PR #%d blocked by greptile CHANGES_REQUESTED review", pr.Number)
+				if !sess.NotifiedGreptileBlock {
+					body := grBody
+					if len(body) > 500 {
+						body = body[:500] + "…"
+					}
+					o.notifier.Sendf("⚠️ maestro: PR #%d (issue #%d: %s) blocked by greptile review — CHANGES REQUESTED\n\n%s",
+						pr.Number, sess.IssueNumber, sess.IssueTitle, body)
+					sess.NotifiedGreptileBlock = true
+				}
+				continue
+			}
+
 			log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 			if err := o.gh.MergePR(pr.Number); err != nil {
 				log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
