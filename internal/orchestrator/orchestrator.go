@@ -11,6 +11,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/worker"
 )
 
@@ -250,6 +251,16 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				sess.FinishedAt = &now
 				worker.Stop(o.cfg, slotName, sess)
 				o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s)", pr.Number, sess.IssueNumber, sess.IssueTitle)
+
+				// Auto version bump
+				if o.cfg.Versioning.Enabled {
+					if err := versioning.Run(o.cfg, o.gh, pr.Number); err != nil {
+						log.Printf("[orch] version bump for PR #%d: %v", pr.Number, err)
+						o.notifier.Sendf("⚠️ maestro: version bump failed for PR #%d: %v", pr.Number, err)
+					} else {
+						o.notifier.Sendf("🏷️ maestro: version bumped after PR #%d merge", pr.Number)
+					}
+				}
 			}
 		case "failure":
 			o.notifier.Sendf("❌ maestro: CI failing for PR #%d (%s, issue #%d)", pr.Number, sess.Branch, sess.IssueNumber)
