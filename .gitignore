@@ -12,3 +12,5 @@
 # Config files with secrets
 *.yaml
 *.yml
+# But keep CI workflows
+!.github/workflows/*.yml
