@@ -400,7 +400,14 @@ func spawnCmd(args []string) {
 		log.Fatalf("issue #%d not found in open issues", *issueNum)
 	}
 
-	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase)
+	// Use default backend for manual starts (can be overridden via model: label)
+	backendName := cfg.Model.Default
+	for _, label := range targetIssue.Labels {
+		if len(label.Name) > 6 && label.Name[:6] == "model:" {
+			backendName = label.Name[6:]
+		}
+	}
+	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)
 	if err != nil {
 		log.Fatalf("start worker: %v", err)
 	}

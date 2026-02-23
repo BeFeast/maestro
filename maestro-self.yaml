@@ -6,13 +6,14 @@ max_parallel: 2
 # Model backend — default is Claude CLI
 # Supported: claude (default), codex (OpenAI), gemini
 claude_cmd: claude
-# Future: uncomment to use Codex
-# model:
-#   backend: codex
-#   cmd: codex
-#   args: ["--approval-mode", "full-auto"]
-
 issue_label: enhancement
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: /home/shtrudel/.bun/bin/codex
 exclude_labels:
   - blocked
   - wontfix
