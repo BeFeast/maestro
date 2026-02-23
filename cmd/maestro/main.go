@@ -125,7 +125,7 @@ func runCmd(args []string) {
 		log.Printf("warn: load prompt: %v", err)
 	}
 
-	log.Printf("starting maestro — repo=%s interval=%s once=%v", cfg.Repo, *interval, *once)
+	log.Printf("starting maestro — repo=%s prefix=%s interval=%s once=%v", cfg.Repo, cfg.SessionPrefix, *interval, *once)
 
 	if err := orch.Run(*interval, *once); err != nil {
 		log.Fatalf("run: %v", err)
@@ -140,7 +140,7 @@ func statusCmd(args []string) {
 
 	cfg := loadConfig(*configPath)
 
-	s, err := state.Load(cfg.Repo)
+	s, err := state.Load(cfg.StateDir)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
@@ -153,9 +153,10 @@ func statusCmd(args []string) {
 	}
 
 	// Pretty table
-	fmt.Printf("Repo:       %s\n", cfg.Repo)
-	fmt.Printf("State file: %s\n", state.StatePath(cfg.Repo))
-	fmt.Printf("Max parallel: %d\n\n", cfg.MaxParallel)
+	fmt.Printf("Repo:           %s\n", cfg.Repo)
+	fmt.Printf("Session prefix: %s\n", cfg.SessionPrefix)
+	fmt.Printf("State file:     %s\n", state.StatePath(cfg.StateDir))
+	fmt.Printf("Max parallel:   %d\n\n", cfg.MaxParallel)
 
 	if len(s.Sessions) == 0 {
 		fmt.Println("No sessions.")
@@ -209,7 +210,7 @@ func logsCmd(args []string) {
 
 	cfg := loadConfig(*configPath)
 
-	s, err := state.Load(cfg.Repo)
+	s, err := state.Load(cfg.StateDir)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
@@ -260,7 +261,7 @@ func logsCmd(args []string) {
 			alive = " (dead)"
 		}
 		fmt.Printf("  %s (#%d): %s%s\n", name, sess.IssueNumber, sess.LogFile, alive)
-		logDir = state.LogDir(cfg.Repo)
+		logDir = state.LogDir(cfg.StateDir)
 	}
 
 	fmt.Println()
@@ -270,7 +271,7 @@ func logsCmd(args []string) {
 	}
 
 	fmt.Println()
-	fmt.Printf("To watch all logs:\n  tail -f %s/pan-*.log\n", logDir)
+	fmt.Printf("To watch all logs:\n  tail -f %s/%s-*.log\n", logDir, cfg.SessionPrefix)
 }
 
 func watchCmd(args []string) {
@@ -280,7 +281,7 @@ func watchCmd(args []string) {
 
 	cfg := loadConfig(*configPath)
 
-	s, err := state.Load(cfg.Repo)
+	s, err := state.Load(cfg.StateDir)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
@@ -364,7 +365,7 @@ func spawnCmd(args []string) {
 
 	cfg := loadConfig(*configPath)
 
-	s, err := state.Load(cfg.Repo)
+	s, err := state.Load(cfg.StateDir)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
@@ -417,7 +418,7 @@ func spawnCmd(args []string) {
 		log.Fatalf("start worker: %v", err)
 	}
 
-	if err := state.Save(cfg.Repo, s); err != nil {
+	if err := state.Save(cfg.StateDir, s); err != nil {
 		log.Fatalf("save state: %v", err)
 	}
 
@@ -437,7 +438,7 @@ func stopCmd(args []string) {
 
 	cfg := loadConfig(*configPath)
 
-	s, err := state.Load(cfg.Repo)
+	s, err := state.Load(cfg.StateDir)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
@@ -453,7 +454,7 @@ func stopCmd(args []string) {
 
 	delete(s.Sessions, *sessionName)
 
-	if err := state.Save(cfg.Repo, s); err != nil {
+	if err := state.Save(cfg.StateDir, s); err != nil {
 		log.Fatalf("save state: %v", err)
 	}
 

@@ -57,7 +57,7 @@ func (o *Orchestrator) LoadPromptBase(promptPath string) error {
 
 // RunOnce executes one orchestration cycle
 func (o *Orchestrator) RunOnce() error {
-	s, err := state.Load(o.repo)
+	s, err := state.Load(o.cfg.StateDir)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
@@ -74,7 +74,7 @@ func (o *Orchestrator) RunOnce() error {
 	o.rebaseConflicts(s)
 
 	// Save after all checks
-	if err := state.Save(o.repo, s); err != nil {
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 
@@ -85,7 +85,7 @@ func (o *Orchestrator) RunOnce() error {
 
 	if slots > 0 {
 		o.startNewWorkers(s, slots)
-		if err := state.Save(o.repo, s); err != nil {
+		if err := state.Save(o.cfg.StateDir, s); err != nil {
 			return fmt.Errorf("save state after workers: %w", err)
 		}
 	}

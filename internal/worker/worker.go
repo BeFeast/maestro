@@ -47,8 +47,7 @@ func TmuxSessionName(slotName string) string {
 // Start spawns a new worker for the given issue inside a tmux session.
 // backendName selects the model backend ("claude", "codex", etc.); empty defaults to config.
 func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string) (string, error) {
-	prefix := SlotPrefix(cfg.Repo)
-	slotName := s.NextSlotName(prefix)
+	slotName := s.NextSlotName(cfg.SessionPrefix)
 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
@@ -65,8 +64,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 
 	// Write prompt to file
-	stateDir := state.StateDir(repo)
-	promptFile := filepath.Join(stateDir, fmt.Sprintf("%s-prompt.md", slotName))
+	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
 	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
 		return "", fmt.Errorf("write prompt file: %w", err)
 	}
@@ -90,7 +88,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 
 	// Prepare log file
-	logDir := state.LogDir(repo)
+	logDir := state.LogDir(cfg.StateDir)
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return "", fmt.Errorf("create log dir: %w", err)
 	}
@@ -103,7 +101,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 
 	// Write runner script
-	runnerPath := filepath.Join(stateDir, slotName+"-run.sh")
+	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	var runnerContent string
 	if stdinFile != "" {
 		// Stdin-based backends (e.g. codex): redirect prompt file to stdin via shell
