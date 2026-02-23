@@ -28,20 +28,30 @@ type ModelConfig struct {
 	Backends map[string]BackendDef `yaml:"backends"`
 }
 
+// VersioningConfig controls automatic version bumping on PR merge.
+type VersioningConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	Files         []string `yaml:"files"`          // Files containing version strings to update
+	DefaultBump   string   `yaml:"default_bump"`   // "patch", "minor", or "major"
+	TagPrefix     string   `yaml:"tag_prefix"`     // e.g. "v"
+	CreateRelease bool     `yaml:"create_release"` // Create GitHub release on bump
+}
+
 type Config struct {
-	Repo          string         `yaml:"repo"`
-	LocalPath     string         `yaml:"local_path"`
-	WorktreeBase  string         `yaml:"worktree_base"`
-	MaxParallel   int            `yaml:"max_parallel"`
-	ClaudeCmd     string         `yaml:"claude_cmd"`  // deprecated: use model.backends.claude.cmd
-	IssueLabel    string         `yaml:"issue_label"` // deprecated: use issue_labels
-	IssueLabels   []string       `yaml:"issue_labels"`
-	ExcludeLabels []string       `yaml:"exclude_labels"`
-	WorkerPrompt  string         `yaml:"worker_prompt"`
-	SessionPrefix string         `yaml:"session_prefix"` // worker session name prefix (default: first 3 chars of repo name)
-	StateDir      string         `yaml:"state_dir"`      // state/log directory (default: ~/.maestro/<repo-hash>)
-	Model         ModelConfig    `yaml:"model"`
-	Telegram      TelegramConfig `yaml:"telegram"`
+	Repo          string           `yaml:"repo"`
+	LocalPath     string           `yaml:"local_path"`
+	WorktreeBase  string           `yaml:"worktree_base"`
+	MaxParallel   int              `yaml:"max_parallel"`
+	ClaudeCmd     string           `yaml:"claude_cmd"`  // deprecated: use model.backends.claude.cmd
+	IssueLabel    string           `yaml:"issue_label"` // deprecated: use issue_labels
+	IssueLabels   []string         `yaml:"issue_labels"`
+	ExcludeLabels []string         `yaml:"exclude_labels"`
+	WorkerPrompt  string           `yaml:"worker_prompt"`
+	SessionPrefix string           `yaml:"session_prefix"` // worker session name prefix (default: first 3 chars of repo name)
+	StateDir      string           `yaml:"state_dir"`      // state/log directory (default: ~/.maestro/<repo-hash>)
+	Model         ModelConfig      `yaml:"model"`
+	Telegram      TelegramConfig   `yaml:"telegram"`
+	Versioning    VersioningConfig `yaml:"versioning"`
 }
 
 // LoadFrom loads config from a specific path.
@@ -151,6 +161,14 @@ func parse(data []byte) (*Config, error) {
 	// Ensure the default backend is always present in the map
 	if _, ok := cfg.Model.Backends[cfg.Model.Default]; !ok {
 		cfg.Model.Backends[cfg.Model.Default] = BackendDef{Cmd: cfg.Model.Default}
+	}
+
+	// Versioning defaults
+	if cfg.Versioning.DefaultBump == "" {
+		cfg.Versioning.DefaultBump = "patch"
+	}
+	if cfg.Versioning.TagPrefix == "" {
+		cfg.Versioning.TagPrefix = "v"
 	}
 
 	return cfg, nil

@@ -17,6 +17,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/worker"
 )
 
@@ -26,14 +27,15 @@ Usage:
   maestro <command> [flags]
 
 Commands:
-  init      Interactive setup wizard for new projects
-  run       Run the orchestration loop
-  status    Show current state
-  logs      Show worker logs (tail -f)
-  watch     Open tmux dashboard with all worker logs
-  spawn     Spawn a worker for a specific issue number
-  stop      Stop a worker session
-  version   Print version
+  init          Interactive setup wizard for new projects
+  run           Run the orchestration loop
+  status        Show current state
+  logs          Show worker logs (tail -f)
+  watch         Open tmux dashboard with all worker logs
+  spawn         Spawn a worker for a specific issue number
+  stop          Stop a worker session
+  version-bump  Bump project version based on merged PR labels
+  version       Print version
 
 Global flags:
   --config string       Path to config file (default: maestro.yaml)
@@ -49,6 +51,9 @@ Spawn flags:
 
 Stop flags:
   --session string      Session name to stop (e.g. pan-1)
+
+Version-bump flags:
+  --pr int              PR number to read labels/commits from
 
 Logs:
   maestro logs              List active worker logs + tmux attach hints
@@ -85,6 +90,8 @@ func main() {
 		spawnCmd(args)
 	case "stop":
 		stopCmd(args)
+	case "version-bump":
+		versionBumpCmd(args)
 	case "version":
 		fmt.Println("maestro v0.1.0")
 	case "help", "--help", "-h":
@@ -459,6 +466,27 @@ func stopCmd(args []string) {
 	}
 
 	fmt.Printf("Stopped and removed session %s\n", *sessionName)
+}
+
+func versionBumpCmd(args []string) {
+	fs := flag.NewFlagSet("version-bump", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
+	prNumber := fs.Int("pr", 0, "PR number to read labels/commits from")
+	fs.Parse(args)
+
+	if *prNumber == 0 {
+		fmt.Fprintln(os.Stderr, "error: --pr is required")
+		os.Exit(1)
+	}
+
+	cfg := loadConfig(*configPath)
+	gh := github.New(cfg.Repo)
+
+	if err := versioning.Run(cfg, gh, *prNumber); err != nil {
+		log.Fatalf("version bump: %v", err)
+	}
+
+	fmt.Println("Version bump complete.")
 }
 
 func truncate(s string, max int) string {
