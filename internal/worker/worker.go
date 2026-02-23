@@ -39,7 +39,12 @@ func IsAlive(pid int) bool {
 	return err == nil
 }
 
-// Start spawns a new worker for the given issue
+// TmuxSessionName returns the tmux session name for a worker slot
+func TmuxSessionName(slotName string) string {
+	return "maestro-" + slotName
+}
+
+// Start spawns a new worker for the given issue inside a tmux session
 func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string) (string, error) {
 	prefix := SlotPrefix(cfg.Repo)
 	slotName := s.NextSlotName(prefix)
@@ -59,7 +64,8 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 
 	// Write prompt to file
-	promptFile := filepath.Join(state.StateDir(repo), fmt.Sprintf("%s-prompt.md", slotName))
+	stateDir := state.StateDir(repo)
+	promptFile := filepath.Join(stateDir, fmt.Sprintf("%s-prompt.md", slotName))
 	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
 		return "", fmt.Errorf("write prompt file: %w", err)
 	}
@@ -71,40 +77,32 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 	logFile := filepath.Join(logDir, slotName+".log")
 
-	// Build claude command
-	claudeArgs := []string{
-		"--dangerously-skip-permissions",
-		"-p", prompt,
+	// Write runner script that execs claude and tees to log
+	runnerPath := filepath.Join(stateDir, slotName+"-run.sh")
+	runnerContent := fmt.Sprintf("#!/bin/bash\nexec %s --dangerously-skip-permissions -p \"$(cat %q)\" 2>&1 | tee -a %q\n",
+		cfg.ClaudeCmd, promptFile, logFile)
+	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
+		return "", fmt.Errorf("write runner script: %w", err)
 	}
 
-	cmd := exec.Command(cfg.ClaudeCmd, claudeArgs...)
-	cmd.Dir = worktreePath
+	// Start tmux session
+	tmuxName := TmuxSessionName(slotName)
+	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
+	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
+	}
 
-	// Redirect stdin from /dev/null
-	devNull, err := os.Open(os.DevNull)
+	// Get PID of the shell running inside the tmux pane
+	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
 	if err != nil {
-		return "", fmt.Errorf("open /dev/null: %w", err)
+		return "", fmt.Errorf("tmux list-panes: %w", err)
 	}
-	cmd.Stdin = devNull
-
-	// Redirect stdout/stderr to log file
-	lf, err := os.Create(logFile)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
 	if err != nil {
-		return "", fmt.Errorf("create log file: %w", err)
-	}
-	cmd.Stdout = lf
-	cmd.Stderr = lf
-
-	// Detach from parent process group
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	if err := cmd.Start(); err != nil {
-		lf.Close()
-		return "", fmt.Errorf("start claude: %w", err)
+		return "", fmt.Errorf("parse pane pid: %w", err)
 	}
 
-	pid := cmd.Process.Pid
-	log.Printf("[worker] started %s (pid=%d, log=%s)", slotName, pid, logFile)
+	log.Printf("[worker] started %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
 
 	// Save session to state
 	s.Sessions[slotName] = &state.Session{
@@ -118,19 +116,18 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		Status:      state.StatusRunning,
 	}
 
-	// Don't wait — let it run in background
-	go func() {
-		cmd.Wait()
-		devNull.Close()
-		lf.Close()
-	}()
-
 	return slotName, nil
 }
 
 // Stop kills a worker and removes its worktree
 func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
-	// Kill process if alive
+	// Try to kill the tmux session first (covers tmux-spawned workers)
+	tmuxName := TmuxSessionName(slotName)
+	if out, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
+		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
+	}
+
+	// Kill process if alive (fallback for pre-tmux workers)
 	if sess.PID > 0 && IsAlive(sess.PID) {
 		proc, _ := os.FindProcess(sess.PID)
 		if err := proc.Kill(); err != nil {

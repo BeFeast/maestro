@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"sort"
+	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -24,6 +28,8 @@ Usage:
 Commands:
   run       Run the orchestration loop
   status    Show current state
+  logs      Show worker logs (tail -f)
+  watch     Open tmux dashboard with all worker logs
   spawn     Spawn a worker for a specific issue number
   stop      Stop a worker session
   version   Print version
@@ -39,6 +45,13 @@ Spawn flags:
 
 Stop flags:
   --session string      Session name to stop (e.g. pan-1)
+
+Logs:
+  maestro logs              List active worker logs + tmux attach hints
+  maestro logs <slot>       tail -f specific worker log (e.g. maestro logs pan-20)
+
+Watch:
+  maestro watch             Open tmux dashboard with all active worker logs
 `
 
 func main() {
@@ -58,6 +71,10 @@ func main() {
 		runCmd(args)
 	case "status":
 		statusCmd(args)
+	case "logs":
+		logsCmd(args)
+	case "watch":
+		watchCmd(args)
 	case "spawn":
 		spawnCmd(args)
 	case "stop":
@@ -128,10 +145,18 @@ func statusCmd(args []string) {
 		return
 	}
 
+	// Sort session names for stable output
+	names := make([]string, 0, len(s.Sessions))
+	for name := range s.Sessions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "SESSION\tISSUE\tSTATUS\tPID\tALIVE\tAGE\tTITLE")
 	fmt.Fprintln(w, "-------\t-----\t------\t---\t-----\t---\t-----")
-	for name, sess := range s.Sessions {
+	for _, name := range names {
+		sess := s.Sessions[name]
 		alive := "-"
 		if sess.Status == state.StatusRunning {
 			if worker.IsAlive(sess.PID) {
@@ -145,6 +170,164 @@ func statusCmd(args []string) {
 			name, sess.IssueNumber, sess.Status, sess.PID, alive, age, truncate(sess.IssueTitle, 50))
 	}
 	w.Flush()
+
+	// Show attach/log hints for running sessions
+	fmt.Println()
+	for _, name := range names {
+		sess := s.Sessions[name]
+		if sess.Status == state.StatusRunning && worker.IsAlive(sess.PID) {
+			tmuxName := worker.TmuxSessionName(name)
+			fmt.Printf("  %s:\n", name)
+			fmt.Printf("    attach: tmux attach -t %s\n", tmuxName)
+			fmt.Printf("    log:    tail -f %s\n", sess.LogFile)
+		}
+	}
+}
+
+func logsCmd(args []string) {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+
+	s, err := state.Load(cfg.Repo)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+
+	// If a specific slot is given, exec tail -f on it
+	if len(args) > 0 && args[0] != "" && !strings.HasPrefix(args[0], "-") {
+		slotName := args[0]
+		sess, ok := s.Sessions[slotName]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "error: session %q not found\n", slotName)
+			os.Exit(1)
+		}
+		if _, err := os.Stat(sess.LogFile); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "error: log file not found: %s\n", sess.LogFile)
+			os.Exit(1)
+		}
+
+		// Replace process with tail -f
+		tailPath, err := exec.LookPath("tail")
+		if err != nil {
+			log.Fatalf("find tail: %v", err)
+		}
+		syscall.Exec(tailPath, []string{"tail", "-f", sess.LogFile}, os.Environ())
+		// If exec fails we fall through
+		log.Fatalf("exec tail: should not reach here")
+	}
+
+	// No args — list all active worker logs
+	names := make([]string, 0, len(s.Sessions))
+	for name, sess := range s.Sessions {
+		if sess.Status == state.StatusRunning {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	if len(names) == 0 {
+		fmt.Println("No active worker sessions.")
+		return
+	}
+
+	fmt.Println("Active worker logs:")
+	logDir := ""
+	for _, name := range names {
+		sess := s.Sessions[name]
+		alive := ""
+		if !worker.IsAlive(sess.PID) {
+			alive = " (dead)"
+		}
+		fmt.Printf("  %s (#%d): %s%s\n", name, sess.IssueNumber, sess.LogFile, alive)
+		logDir = state.LogDir(cfg.Repo)
+	}
+
+	fmt.Println()
+	fmt.Println("To attach to a worker:")
+	for _, name := range names {
+		fmt.Printf("  tmux attach -t %s\n", worker.TmuxSessionName(name))
+	}
+
+	fmt.Println()
+	fmt.Printf("To watch all logs:\n  tail -f %s/pan-*.log\n", logDir)
+}
+
+func watchCmd(args []string) {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+
+	s, err := state.Load(cfg.Repo)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+
+	// Collect active running sessions
+	type activeWorker struct {
+		name string
+		sess *state.Session
+	}
+	var workers []activeWorker
+	for name, sess := range s.Sessions {
+		if sess.Status == state.StatusRunning && worker.IsAlive(sess.PID) {
+			workers = append(workers, activeWorker{name, sess})
+		}
+	}
+
+	if len(workers) == 0 {
+		fmt.Println("No active workers.")
+		os.Exit(0)
+	}
+
+	// Sort by name for deterministic pane order
+	sort.Slice(workers, func(i, j int) bool {
+		return workers[i].name < workers[j].name
+	})
+
+	const tmuxSession = "maestro-watch"
+
+	// Kill stale session if exists
+	exec.Command("tmux", "kill-session", "-t", tmuxSession).Run()
+
+	// Create new session with first worker's log
+	firstCmd := fmt.Sprintf("tail -f %s", workers[0].sess.LogFile)
+	if out, err := exec.Command("tmux", "new-session", "-d", "-s", tmuxSession, firstCmd).CombinedOutput(); err != nil {
+		log.Fatalf("tmux new-session: %v\n%s", err, out)
+	}
+
+	// Set pane title for first pane
+	paneTitle := fmt.Sprintf("%s #%d", workers[0].name, workers[0].sess.IssueNumber)
+	exec.Command("tmux", "select-pane", "-t", tmuxSession+":0.0", "-T", paneTitle).Run()
+
+	// Split for each additional worker
+	for i := 1; i < len(workers); i++ {
+		tailCmd := fmt.Sprintf("tail -f %s", workers[i].sess.LogFile)
+		if out, err := exec.Command("tmux", "split-window", "-t", tmuxSession, tailCmd).CombinedOutput(); err != nil {
+			log.Printf("tmux split-window for %s: %v\n%s", workers[i].name, err, out)
+			continue
+		}
+		// Set pane title
+		paneTitle := fmt.Sprintf("%s #%d", workers[i].name, workers[i].sess.IssueNumber)
+		exec.Command("tmux", "select-pane", "-t", tmuxSession, "-T", paneTitle).Run()
+
+		// Re-tile after each split to keep things balanced
+		exec.Command("tmux", "select-layout", "-t", tmuxSession, "tiled").Run()
+	}
+
+	// Enable pane titles display
+	exec.Command("tmux", "set-option", "-t", tmuxSession, "pane-border-status", "top").Run()
+	exec.Command("tmux", "set-option", "-t", tmuxSession, "pane-border-format", " #{pane_title} ").Run()
+
+	// Attach — replaces current process
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		log.Fatalf("find tmux: %v", err)
+	}
+	syscall.Exec(tmuxPath, []string{"tmux", "attach", "-t", tmuxSession}, os.Environ())
+	log.Fatalf("exec tmux attach: should not reach here")
 }
 
 func spawnCmd(args []string) {
