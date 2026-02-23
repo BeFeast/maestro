@@ -4,6 +4,13 @@ worktree_base: /home/shtrudel/.worktrees/panoptikon
 max_parallel: 5
 claude_cmd: claude
 issue_label: enhancement
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: /home/shtrudel/.bun/bin/codex
 exclude_labels:
   - blocked
 worker_prompt: /home/shtrudel/src/maestro/worker-prompt-template.md

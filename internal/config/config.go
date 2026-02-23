@@ -13,15 +13,29 @@ type TelegramConfig struct {
 	OpenclawURL string `yaml:"openclaw_url"`
 }
 
+// BackendDef defines a model backend CLI.
+type BackendDef struct {
+	Cmd       string   `yaml:"cmd"`
+	ExtraArgs []string `yaml:"extra_args"`
+}
+
+// ModelConfig holds multi-backend configuration.
+type ModelConfig struct {
+	Default  string                `yaml:"default"` // "claude", "codex", etc.
+	Backends map[string]BackendDef `yaml:"backends"`
+}
+
 type Config struct {
 	Repo          string         `yaml:"repo"`
 	LocalPath     string         `yaml:"local_path"`
 	WorktreeBase  string         `yaml:"worktree_base"`
 	MaxParallel   int            `yaml:"max_parallel"`
-	ClaudeCmd     string         `yaml:"claude_cmd"`
-	IssueLabel    string         `yaml:"issue_label"`
+	ClaudeCmd     string         `yaml:"claude_cmd"`  // deprecated: use model.backends.claude.cmd
+	IssueLabel    string         `yaml:"issue_label"` // deprecated: use issue_labels
+	IssueLabels   []string       `yaml:"issue_labels"`
 	ExcludeLabels []string       `yaml:"exclude_labels"`
 	WorkerPrompt  string         `yaml:"worker_prompt"`
+	Model         ModelConfig    `yaml:"model"`
 	Telegram      TelegramConfig `yaml:"telegram"`
 }
 
@@ -61,7 +75,6 @@ func parse(data []byte) (*Config, error) {
 	cfg := &Config{
 		MaxParallel: 5,
 		ClaudeCmd:   "claude",
-		IssueLabel:  "enhancement",
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -71,6 +84,24 @@ func parse(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("config: repo is required")
 	}
 
+	// Merge deprecated issue_label into issue_labels (OR filter)
+	if cfg.IssueLabel != "" {
+		found := false
+		for _, l := range cfg.IssueLabels {
+			if l == cfg.IssueLabel {
+				found = true
+				break
+			}
+		}
+		if !found {
+			cfg.IssueLabels = append(cfg.IssueLabels, cfg.IssueLabel)
+		}
+	}
+	// Default to "enhancement" if neither field is set
+	if len(cfg.IssueLabels) == 0 {
+		cfg.IssueLabels = []string{"enhancement"}
+	}
+
 	// Expand ~ in paths
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
@@ -78,6 +109,25 @@ func parse(data []byte) (*Config, error) {
 
 	if cfg.Telegram.OpenclawURL == "" {
 		cfg.Telegram.OpenclawURL = "http://localhost:18789"
+	}
+
+	// Model backend defaults
+	if cfg.Model.Default == "" {
+		cfg.Model.Default = "claude"
+	}
+	if cfg.Model.Backends == nil {
+		cfg.Model.Backends = make(map[string]BackendDef)
+	}
+	// Backward compat: claude_cmd populates the claude backend if not explicitly set
+	if cfg.ClaudeCmd != "" {
+		if _, ok := cfg.Model.Backends["claude"]; !ok {
+			cfg.Model.Backends["claude"] = BackendDef{Cmd: cfg.ClaudeCmd}
+		}
+	}
+
+	// Ensure the default backend is always present in the map
+	if _, ok := cfg.Model.Backends[cfg.Model.Default]; !ok {
+		cfg.Model.Backends[cfg.Model.Default] = BackendDef{Cmd: cfg.Model.Default}
 	}
 
 	return cfg, nil

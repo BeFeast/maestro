@@ -384,7 +384,7 @@ func spawnCmd(args []string) {
 
 	// Fetch issue details via gh CLI
 	gh := github.New(cfg.Repo)
-	issues, err := gh.ListOpenIssues("")
+	issues, err := gh.ListOpenIssues(nil)
 	if err != nil {
 		log.Fatalf("fetch issues: %v", err)
 	}
@@ -400,7 +400,16 @@ func spawnCmd(args []string) {
 		log.Fatalf("issue #%d not found in open issues", *issueNum)
 	}
 
-	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase)
+	// Use default backend for manual starts (can be overridden via model: label)
+	backendName := cfg.Model.Default
+	for _, label := range targetIssue.Labels {
+		if strings.HasPrefix(label.Name, "model:") {
+			if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
+				backendName = name
+			}
+		}
+	}
+	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)
 	if err != nil {
 		log.Fatalf("start worker: %v", err)
 	}
