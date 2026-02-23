@@ -14,6 +14,7 @@ type TelegramConfig struct {
 	Target      string `yaml:"target"`
 	BotToken    string `yaml:"bot_token"`
 	OpenclawURL string `yaml:"openclaw_url"`
+	DigestMode  bool   `yaml:"digest_mode"` // batch notifications per cycle instead of sending immediately
 }
 
 // BackendDef defines a model backend CLI.

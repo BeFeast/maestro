@@ -30,9 +30,14 @@ type Orchestrator struct {
 
 // New creates a new Orchestrator
 func New(cfg *config.Config) *Orchestrator {
+	n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL)
+	if cfg.Telegram.DigestMode {
+		n.SetDigestMode(true)
+		log.Printf("[orch] digest mode enabled — notifications will be batched per cycle")
+	}
 	return &Orchestrator{
 		cfg:      cfg,
-		notifier: notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL),
+		notifier: n,
 		gh:       github.New(cfg.Repo),
 		router:   router.New(cfg),
 		repo:     cfg.Repo,
@@ -126,6 +131,11 @@ func (o *Orchestrator) RunOnce() error {
 		if err := state.Save(o.cfg.StateDir, s); err != nil {
 			return fmt.Errorf("save state after workers: %w", err)
 		}
+	}
+
+	// Flush digest buffer (no-op if digest mode is off or buffer is empty)
+	if err := o.notifier.Flush(); err != nil {
+		log.Printf("[orch] digest flush: %v", err)
 	}
 
 	log.Printf("[orch] === cycle done ===")
@@ -314,13 +324,18 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 
 		switch ciStatus {
 		case "success":
-			// Reset CI failure notification flag when CI goes green
-			sess.NotifiedCIFail = false
+			// Reset notification status when CI goes green
+			sess.LastNotifiedStatus = ""
+			sess.NotifiedCIFail = false // backward compat
 
 			log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 			if err := o.gh.MergePR(pr.Number); err != nil {
 				log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
-				o.notifier.Sendf("❌ maestro: failed to merge PR #%d (%s): %v", pr.Number, sess.Branch, err)
+				// Only notify merge failure once per PR
+				if sess.LastNotifiedStatus != "merge_failed" {
+					o.notifier.Sendf("❌ maestro: failed to merge PR #%d (%s): %v", pr.Number, sess.Branch, err)
+					sess.LastNotifiedStatus = "merge_failed"
+				}
 			} else {
 				log.Printf("[orch] merged PR #%d ✓", pr.Number)
 				if err := o.gh.CloseIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
@@ -343,9 +358,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				}
 			}
 		case "failure":
-			if !sess.NotifiedCIFail {
+			// Only notify CI failure once — dedup via LastNotifiedStatus
+			if sess.LastNotifiedStatus != "ci_failure" {
 				o.notifier.Sendf("❌ maestro: CI failing for PR #%d (%s, issue #%d)", pr.Number, sess.Branch, sess.IssueNumber)
-				sess.NotifiedCIFail = true
+				sess.LastNotifiedStatus = "ci_failure"
+				sess.NotifiedCIFail = true // backward compat
 			}
 		}
 	}

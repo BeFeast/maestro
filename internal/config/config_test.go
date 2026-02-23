@@ -439,3 +439,30 @@ model:
 		t.Errorf("explicit model.backends.claude.cmd should take precedence, got %q", claude.Cmd)
 	}
 }
+
+func TestParse_DigestModeDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Telegram.DigestMode {
+		t.Error("DigestMode should default to false")
+	}
+}
+
+func TestParse_DigestModeExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+telegram:
+  target: "12345"
+  digest_mode: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Telegram.DigestMode {
+		t.Error("DigestMode should be true when explicitly set")
+	}
+}
