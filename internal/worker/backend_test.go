@@ -103,12 +103,218 @@ func TestBuildWorkerCmd_Codex(t *testing.T) {
 	}
 }
 
-func TestBuildWorkerCmd_Unknown(t *testing.T) {
-	_, _, err := BuildWorkerCmd("gemini", BackendConfig{}, "/tmp/prompt.md", "/tmp/wt")
-	if err == nil {
-		t.Fatal("expected error for unknown backend")
+func TestBuildWorkerCmd_Gemini(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("analyze this codebase"), 0644); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "unknown backend") {
-		t.Errorf("expected 'unknown backend' error, got: %v", err)
+	worktree := "/tmp/gemini-worktree"
+
+	cfg := BackendConfig{Cmd: "gemini-cli", ExtraArgs: []string{"--yolo"}}
+	cmd, stdinFile, err := BuildWorkerCmd("gemini", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stdinFile != "" {
+		t.Errorf("expected empty stdinFile for gemini, got: %s", stdinFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "-p") {
+		t.Errorf("expected -p flag in args, got: %s", args)
+	}
+	if !strings.Contains(args, "analyze this codebase") {
+		t.Errorf("expected prompt content in args, got: %s", args)
+	}
+	if !strings.Contains(args, "--yolo") {
+		t.Errorf("expected extra args in command, got: %s", args)
+	}
+	if cmd.Dir != worktree {
+		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+func TestBuildWorkerCmd_GeminiDefaultCmd(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{}
+	cmd, _, err := BuildWorkerCmd("gemini", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should use "gemini" as default cmd when none specified
+	if !strings.HasSuffix(cmd.Path, "gemini") && !strings.Contains(cmd.Args[0], "gemini") {
+		t.Errorf("expected gemini command, got: %v", cmd.Args)
+	}
+}
+
+func TestBuildWorkerCmd_GenericArgMode(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("do custom task"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/custom-worktree"
+
+	cfg := BackendConfig{
+		Cmd:        "my-custom-cli",
+		ExtraArgs:  []string{"--flag1", "val1"},
+		PromptMode: "arg",
+	}
+	cmd, stdinFile, err := BuildWorkerCmd("my-custom-backend", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stdinFile != "" {
+		t.Errorf("expected empty stdinFile for arg mode, got: %s", stdinFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--flag1") {
+		t.Errorf("expected extra args in command, got: %s", args)
+	}
+	if !strings.Contains(args, "do custom task") {
+		t.Errorf("expected prompt content as last arg, got: %s", args)
+	}
+	if cmd.Dir != worktree {
+		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+func TestBuildWorkerCmd_GenericStdinMode(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("stdin prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/stdin-worktree"
+
+	cfg := BackendConfig{
+		Cmd:        "stdin-cli",
+		ExtraArgs:  []string{"--auto"},
+		PromptMode: "stdin",
+	}
+	cmd, stdinFile, err := BuildWorkerCmd("stdin-backend", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stdinFile != promptFile {
+		t.Errorf("expected stdinFile=%s, got %s", promptFile, stdinFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--auto") {
+		t.Errorf("expected extra args in command, got: %s", args)
+	}
+	// Prompt content should NOT be in args for stdin mode
+	if strings.Contains(args, "stdin prompt") {
+		t.Errorf("prompt content should not be in args for stdin mode, got: %s", args)
+	}
+	if cmd.Dir != worktree {
+		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+func TestBuildWorkerCmd_GenericFileMode(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("file prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/file-worktree"
+
+	cfg := BackendConfig{
+		Cmd:        "file-cli",
+		PromptMode: "file",
+	}
+	cmd, stdinFile, err := BuildWorkerCmd("file-backend", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stdinFile != "" {
+		t.Errorf("expected empty stdinFile for file mode, got: %s", stdinFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, promptFile) {
+		t.Errorf("expected prompt file path in args, got: %s", args)
+	}
+	// Prompt content should NOT be in args
+	if strings.Contains(args, "file prompt") {
+		t.Errorf("prompt content should not be in args for file mode, got: %s", args)
+	}
+	if cmd.Dir != worktree {
+		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+func TestBuildWorkerCmd_GenericDefaultArgMode(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("default mode"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// No PromptMode set — should default to "arg"
+	cfg := BackendConfig{Cmd: "some-cli"}
+	cmd, stdinFile, err := BuildWorkerCmd("unknown-backend", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stdinFile != "" {
+		t.Errorf("expected empty stdinFile for default arg mode, got: %s", stdinFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "default mode") {
+		t.Errorf("expected prompt content in args, got: %s", args)
+	}
+}
+
+func TestBuildWorkerCmd_GenericNoCmdError(t *testing.T) {
+	cfg := BackendConfig{} // no Cmd set
+	_, _, err := BuildWorkerCmd("no-cmd-backend", cfg, "/tmp/prompt.md", "/tmp/wt")
+	if err == nil {
+		t.Fatal("expected error for generic backend with no cmd")
+	}
+	if !strings.Contains(err.Error(), "requires cmd") {
+		t.Errorf("expected 'requires cmd' error, got: %v", err)
+	}
+}
+
+func TestBuildWorkerCmd_GenericInvalidPromptMode(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{Cmd: "some-cli", PromptMode: "invalid"}
+	_, _, err := BuildWorkerCmd("bad-mode-backend", cfg, promptFile, "/tmp/wt")
+	if err == nil {
+		t.Fatal("expected error for invalid prompt_mode")
+	}
+	if !strings.Contains(err.Error(), "unknown prompt_mode") {
+		t.Errorf("expected 'unknown prompt_mode' error, got: %v", err)
+	}
+}
+
+func TestKnownBackends(t *testing.T) {
+	backends := KnownBackends()
+	expected := map[string]bool{"claude": false, "codex": false, "gemini": false}
+	for _, name := range backends {
+		if _, ok := expected[name]; ok {
+			expected[name] = true
+		}
+	}
+	for name, found := range expected {
+		if !found {
+			t.Errorf("expected %q in KnownBackends(), got: %v", name, backends)
+		}
 	}
 }
