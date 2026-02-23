@@ -37,6 +37,14 @@ type VersioningConfig struct {
 	CreateRelease bool     `yaml:"create_release"` // Create GitHub release on bump
 }
 
+// RoutingConfig controls automatic backend selection via LLM router.
+type RoutingConfig struct {
+	Mode            string `yaml:"mode"`              // "auto", "manual" (labels only)
+	RouterModel     string `yaml:"router_model"`      // backend name from model.backends (default: "claude")
+	RouterModelName string `yaml:"router_model_name"` // specific model to use (default: "claude-sonnet-4-6")
+	RouterPrompt    string `yaml:"router_prompt"`     // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
+}
+
 type Config struct {
 	Repo          string           `yaml:"repo"`
 	LocalPath     string           `yaml:"local_path"`
@@ -50,6 +58,7 @@ type Config struct {
 	SessionPrefix string           `yaml:"session_prefix"` // worker session name prefix (default: first 3 chars of repo name)
 	StateDir      string           `yaml:"state_dir"`      // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model         ModelConfig      `yaml:"model"`
+	Routing       RoutingConfig    `yaml:"routing"`
 	Telegram      TelegramConfig   `yaml:"telegram"`
 	Versioning    VersioningConfig `yaml:"versioning"`
 }
@@ -161,6 +170,17 @@ func parse(data []byte) (*Config, error) {
 	// Ensure the default backend is always present in the map
 	if _, ok := cfg.Model.Backends[cfg.Model.Default]; !ok {
 		cfg.Model.Backends[cfg.Model.Default] = BackendDef{Cmd: cfg.Model.Default}
+	}
+
+	// Routing defaults
+	if cfg.Routing.Mode == "" {
+		cfg.Routing.Mode = "manual"
+	}
+	if cfg.Routing.RouterModel == "" {
+		cfg.Routing.RouterModel = "claude"
+	}
+	if cfg.Routing.RouterModelName == "" {
+		cfg.Routing.RouterModelName = "claude-sonnet-4-6"
 	}
 
 	// Versioning defaults

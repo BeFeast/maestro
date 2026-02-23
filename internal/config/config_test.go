@@ -203,3 +203,44 @@ func TestParse_DifferentReposDifferentStateDirs(t *testing.T) {
 		t.Errorf("different repos should have different default state_dirs, both got %q", cfg1.StateDir)
 	}
 }
+
+func TestParse_RoutingDefaults(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Routing.Mode != "manual" {
+		t.Errorf("Routing.Mode = %q, want %q", cfg.Routing.Mode, "manual")
+	}
+	if cfg.Routing.RouterModel != "claude" {
+		t.Errorf("Routing.RouterModel = %q, want %q", cfg.Routing.RouterModel, "claude")
+	}
+	if cfg.Routing.RouterModelName != "claude-sonnet-4-6" {
+		t.Errorf("Routing.RouterModelName = %q, want %q", cfg.Routing.RouterModelName, "claude-sonnet-4-6")
+	}
+}
+
+func TestParse_RoutingExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+routing:
+  mode: auto
+  router_model: claude
+  router_model_name: claude-haiku-4-5-20251001
+  router_prompt: "Pick: {{BACKENDS}} for #{{NUMBER}}"
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Routing.Mode != "auto" {
+		t.Errorf("Routing.Mode = %q, want %q", cfg.Routing.Mode, "auto")
+	}
+	if cfg.Routing.RouterModelName != "claude-haiku-4-5-20251001" {
+		t.Errorf("Routing.RouterModelName = %q, want %q", cfg.Routing.RouterModelName, "claude-haiku-4-5-20251001")
+	}
+	if cfg.Routing.RouterPrompt != "Pick: {{BACKENDS}} for #{{NUMBER}}" {
+		t.Errorf("Routing.RouterPrompt = %q", cfg.Routing.RouterPrompt)
+	}
+}
