@@ -24,6 +24,7 @@ type Backend interface {
 // knownBackends maps backend names to their implementations.
 var knownBackends = map[string]Backend{
 	"claude": claudeBackend{},
+	"cline":  clineBackend{},
 	"codex":  codexBackend{},
 	"gemini": geminiBackend{},
 }
@@ -81,6 +82,26 @@ func (geminiBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	args := []string{"-p", string(promptData)}
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(geminiCmd, args...)
+	cmd.Dir = worktree
+	return cmd, "", nil
+}
+
+// --- Cline Backend ---
+
+type clineBackend struct{}
+
+func (clineBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	promptData, err := os.ReadFile(promptFile)
+	if err != nil {
+		return nil, "", fmt.Errorf("read prompt file: %w", err)
+	}
+	clineCmd := cfg.Cmd
+	if clineCmd == "" {
+		clineCmd = "cline"
+	}
+	args := []string{"-y", string(promptData)}
+	args = append(args, cfg.ExtraArgs...)
+	cmd := exec.Command(clineCmd, args...)
 	cmd.Dir = worktree
 	return cmd, "", nil
 }
