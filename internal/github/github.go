@@ -202,6 +202,67 @@ func (c *Client) CloseIssue(number int, comment string) error {
 	return nil
 }
 
+// PRLabels returns the labels on a PR.
+func (c *Client) PRLabels(prNumber int) ([]string, error) {
+	out, err := exec.Command("gh", "pr", "view",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo,
+		"--json", "labels").Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr view %d labels: %w", prNumber, err)
+	}
+	var result struct {
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, err
+	}
+	names := make([]string, len(result.Labels))
+	for i, l := range result.Labels {
+		names[i] = l.Name
+	}
+	return names, nil
+}
+
+// PRCommits returns commit messages for a PR.
+func (c *Client) PRCommits(prNumber int) ([]string, error) {
+	out, err := exec.Command("gh", "pr", "view",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo,
+		"--json", "commits").Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr view %d commits: %w", prNumber, err)
+	}
+	var result struct {
+		Commits []struct {
+			MessageHeadline string `json:"messageHeadline"`
+		} `json:"commits"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, err
+	}
+	msgs := make([]string, len(result.Commits))
+	for i, c := range result.Commits {
+		msgs[i] = c.MessageHeadline
+	}
+	return msgs, nil
+}
+
+// CreateRelease creates a GitHub release for the given tag.
+func (c *Client) CreateRelease(tag, title string) error {
+	out, err := exec.Command("gh", "release", "create",
+		tag,
+		"--repo", c.Repo,
+		"--title", title,
+		"--generate-notes").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh release create %s: %w\n%s", tag, err, out)
+	}
+	return nil
+}
+
 // HasLabel returns true if any of the issue's labels match
 func HasLabel(issue Issue, labels []string) bool {
 	for _, l := range issue.Labels {
