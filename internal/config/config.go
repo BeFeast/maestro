@@ -18,8 +18,9 @@ type TelegramConfig struct {
 
 // BackendDef defines a model backend CLI.
 type BackendDef struct {
-	Cmd       string   `yaml:"cmd"`
-	ExtraArgs []string `yaml:"extra_args"`
+	Cmd        string   `yaml:"cmd"`
+	ExtraArgs  []string `yaml:"extra_args"`
+	PromptMode string   `yaml:"prompt_mode"` // how to deliver prompt: "arg" (last argument), "stdin" (via stdin), "file" (file path as argument)
 }
 
 // ModelConfig holds multi-backend configuration.

@@ -329,3 +329,113 @@ max_runtime_minutes: 60
 		t.Errorf("MaxRuntimeMinutes = %d, want 60", cfg.MaxRuntimeMinutes)
 	}
 }
+
+func TestParse_ModelConfigDefaults(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Model.Default != "claude" {
+		t.Errorf("expected default backend=claude, got %q", cfg.Model.Default)
+	}
+	if _, ok := cfg.Model.Backends["claude"]; !ok {
+		t.Error("expected claude backend to be present in map")
+	}
+}
+
+func TestParse_ModelConfigExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: codex
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: /usr/local/bin/codex
+      extra_args: ["--approval-mode", "full-auto"]
+    gemini:
+      cmd: gemini-cli
+      extra_args: ["--yolo"]
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Model.Default != "codex" {
+		t.Errorf("expected default=codex, got %q", cfg.Model.Default)
+	}
+	if len(cfg.Model.Backends) < 3 {
+		t.Errorf("expected at least 3 backends, got %d", len(cfg.Model.Backends))
+	}
+	codex := cfg.Model.Backends["codex"]
+	if codex.Cmd != "/usr/local/bin/codex" {
+		t.Errorf("expected codex cmd=/usr/local/bin/codex, got %q", codex.Cmd)
+	}
+	if len(codex.ExtraArgs) != 2 || codex.ExtraArgs[0] != "--approval-mode" {
+		t.Errorf("expected codex extra_args=[--approval-mode full-auto], got %v", codex.ExtraArgs)
+	}
+	gemini := cfg.Model.Backends["gemini"]
+	if gemini.Cmd != "gemini-cli" {
+		t.Errorf("expected gemini cmd=gemini-cli, got %q", gemini.Cmd)
+	}
+}
+
+func TestParse_ModelConfigPromptMode(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: custom
+  backends:
+    custom:
+      cmd: my-cli
+      prompt_mode: stdin
+      extra_args: ["--auto"]
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	custom := cfg.Model.Backends["custom"]
+	if custom.PromptMode != "stdin" {
+		t.Errorf("expected prompt_mode=stdin, got %q", custom.PromptMode)
+	}
+	if custom.Cmd != "my-cli" {
+		t.Errorf("expected cmd=my-cli, got %q", custom.Cmd)
+	}
+}
+
+func TestParse_ClaudeCmdBackwardCompat(t *testing.T) {
+	yaml := `
+repo: owner/repo
+claude_cmd: /custom/path/claude
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	claude := cfg.Model.Backends["claude"]
+	if claude.Cmd != "/custom/path/claude" {
+		t.Errorf("expected claude_cmd to populate backends[claude].cmd, got %q", claude.Cmd)
+	}
+}
+
+func TestParse_ClaudeCmdDoesNotOverrideExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+claude_cmd: /old/claude
+model:
+  backends:
+    claude:
+      cmd: /new/claude
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	claude := cfg.Model.Backends["claude"]
+	if claude.Cmd != "/new/claude" {
+		t.Errorf("explicit model.backends.claude.cmd should take precedence, got %q", claude.Cmd)
+	}
+}
