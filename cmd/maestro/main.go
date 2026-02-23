@@ -384,7 +384,7 @@ func spawnCmd(args []string) {
 
 	// Fetch issue details via gh CLI
 	gh := github.New(cfg.Repo)
-	issues, err := gh.ListOpenIssues("")
+	issues, err := gh.ListOpenIssues(nil)
 	if err != nil {
 		log.Fatalf("fetch issues: %v", err)
 	}

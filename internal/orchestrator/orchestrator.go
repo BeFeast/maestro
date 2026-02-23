@@ -301,7 +301,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 
 // startNewWorkers picks eligible issues and starts workers for them
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
-	issues, err := o.gh.ListOpenIssues(o.cfg.IssueLabel)
+	issues, err := o.gh.ListOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
 		return

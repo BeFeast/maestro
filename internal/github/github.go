@@ -32,8 +32,37 @@ func New(repo string) *Client {
 	return &Client{Repo: repo}
 }
 
-// ListOpenIssues returns open issues with the given label
-func (c *Client) ListOpenIssues(label string) ([]Issue, error) {
+// ListOpenIssues returns open issues matching any of the given labels (OR filter).
+// If labels is empty, all open issues are returned.
+func (c *Client) ListOpenIssues(labels []string) ([]Issue, error) {
+	if len(labels) <= 1 {
+		// Single label or no labels — one call suffices
+		label := ""
+		if len(labels) == 1 {
+			label = labels[0]
+		}
+		return c.listOpenIssuesByLabel(label)
+	}
+
+	// Multiple labels: fetch per-label and deduplicate (OR semantics)
+	seen := make(map[int]struct{})
+	var result []Issue
+	for _, label := range labels {
+		issues, err := c.listOpenIssuesByLabel(label)
+		if err != nil {
+			return nil, err
+		}
+		for _, issue := range issues {
+			if _, ok := seen[issue.Number]; !ok {
+				seen[issue.Number] = struct{}{}
+				result = append(result, issue)
+			}
+		}
+	}
+	return result, nil
+}
+
+func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 	args := []string{
 		"issue", "list",
 		"--repo", c.Repo,
