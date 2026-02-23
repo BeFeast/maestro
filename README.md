@@ -99,6 +99,8 @@ model:
       cmd: codex         # OpenAI Codex CLI
     gemini:
       cmd: gemini        # Google Gemini CLI
+    cline:
+      cmd: cline         # Cline CLI (e.g. SAP AI Core / any OpenAI-compatible provider)
 ```
 
 ### Supported backends
@@ -117,11 +119,19 @@ model:
 > Install: `npm install -g @google/gemini-cli`
 > Auth: `gemini auth` or set `GEMINI_API_KEY`
 
+> [!NOTE]
+> **Cline** — Cline CLI, supports any OpenAI-compatible provider (including SAP AI Core, Azure OpenAI, etc.)
+> Install: `bun add -g cline` | `cline --version`
+> Config: `~/.cline/data/globalState.json` + `secrets.json` — configure provider and model before use.
+> Headless mode: `cline -y "task"` — auto-approves all actions and exits when done.
+> SAP AI Core example: set provider to `sapaicore`, model to `anthropic--claude-4.5-opus`.
+
 ### Per-issue routing
-Label a GitHub issue with `model:codex` or `model:gemini` to override the default backend for that specific issue:
+Label a GitHub issue with `model:codex`, `model:gemini`, or `model:cline` to override the default backend for that specific issue:
 ```
 issue #42 labels: enhancement, model:codex  → runs with Codex
-issue #43 labels: enhancement               → runs with default (claude)
+issue #43 labels: enhancement, model:cline  → runs with Cline
+issue #44 labels: enhancement               → runs with default (claude)
 ```
 
 ## Commands
