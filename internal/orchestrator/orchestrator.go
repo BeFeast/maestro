@@ -200,13 +200,43 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					sess.PRNumber = pr.Number
 					o.notifier.Sendf("🔀 maestro: worker %s completed, PR #%d open for issue #%d (%s)",
 						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
+				} else if sess.RetryCount < 1 {
+					// First failure — retry with fresh worktree
+					log.Printf("[orch] worker %s (pid=%d) died, retrying (attempt %d)", slotName, sess.PID, sess.RetryCount+1)
+					sess.RetryCount++
+
+					issue, err := o.gh.GetIssue(sess.IssueNumber)
+					if err != nil {
+						log.Printf("[orch] fetch issue #%d for retry: %v — marking as failed", sess.IssueNumber, err)
+						sess.Status = state.StatusFailed
+						now := time.Now().UTC()
+						sess.FinishedAt = &now
+						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) died and retry failed (could not fetch issue)",
+							slotName, sess.IssueNumber, sess.IssueTitle)
+						continue
+					}
+
+					promptBase := o.selectPrompt(issue)
+					if err := worker.Respawn(o.cfg, slotName, sess, o.repo, issue, promptBase, sess.Backend); err != nil {
+						log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, err)
+						sess.Status = state.StatusFailed
+						now := time.Now().UTC()
+						sess.FinishedAt = &now
+						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) died and respawn failed: %v",
+							slotName, sess.IssueNumber, sess.IssueTitle, err)
+						continue
+					}
+
+					o.notifier.Sendf("🔄 maestro: retrying worker %s for issue #%d: %s (attempt %d)",
+						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount)
 				} else {
-					log.Printf("[orch] worker %s (pid=%d) is dead", slotName, sess.PID)
-					sess.Status = state.StatusDead
+					// Already retried — mark as permanently failed
+					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
+					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
-					o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) process died.\nCheck log: %s",
-						slotName, sess.IssueNumber, sess.IssueTitle, sess.LogFile)
+					o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) permanently failed after %d retry.\nCheck log: %s",
+						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, sess.LogFile)
 				}
 				continue
 			}

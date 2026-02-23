@@ -33,6 +33,7 @@ type Session struct {
 	Backend        string        `json:"backend,omitempty"` // "claude", "codex", etc.
 	LongRunning    bool          `json:"long_running,omitempty"`
 	NotifiedCIFail bool          `json:"notified_ci_fail,omitempty"`
+	RetryCount     int           `json:"retry_count,omitempty"`
 }
 
 type State struct {

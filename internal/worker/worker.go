@@ -152,6 +152,114 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	return slotName, nil
 }
 
+// Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
+// The session is updated in place with new PID, worktree, branch, and timestamps.
+func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	// Clean up old worker (tmux session, process, worktree)
+	Stop(cfg, slotName, sess)
+
+	// Delete old local branch (ignore errors — branch may not exist locally)
+	exec.Command("git", "-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
+
+	// Create fresh worktree with new branch
+	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
+	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+
+	log.Printf("[worker] respawn: creating worktree %s on branch %s", worktreePath, branchName)
+	out, err := exec.Command("git", "-C", cfg.LocalPath,
+		"worktree", "add", worktreePath, "-b", branchName).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git worktree add: %w\n%s", err, out)
+	}
+
+	// Assemble worker prompt
+	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+
+	// Write prompt to file
+	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
+	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
+		return fmt.Errorf("write prompt file: %w", err)
+	}
+
+	// Determine backend
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := BackendConfig{
+		Cmd:        backendDef.Cmd,
+		ExtraArgs:  backendDef.ExtraArgs,
+		PromptMode: backendDef.PromptMode,
+	}
+
+	// Prepare log file
+	logDir := state.LogDir(cfg.StateDir)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+	logFile := filepath.Join(logDir, slotName+".log")
+
+	// Build the worker command
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
+	if err != nil {
+		return fmt.Errorf("build worker cmd: %w", err)
+	}
+
+	// Write runner script
+	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
+	var runnerContent string
+	if stdinFile != "" {
+		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s < %q 2>&1 | tee -a %q\n",
+			shellJoin(workerCmd.Args), stdinFile, logFile)
+	} else {
+		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s 2>&1 | tee -a %q\n",
+			shellJoin(workerCmd.Args), logFile)
+	}
+	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
+		return fmt.Errorf("write runner script: %w", err)
+	}
+
+	// Start tmux session
+	tmuxName := TmuxSessionName(slotName)
+	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
+	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
+	}
+
+	// Get PID
+	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return fmt.Errorf("tmux list-panes: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
+	if err != nil {
+		return fmt.Errorf("parse pane pid: %w", err)
+	}
+
+	log.Printf("[worker] respawned %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
+
+	// Update session in place
+	sess.Worktree = worktreePath
+	sess.Branch = branchName
+	sess.PID = pid
+	sess.LogFile = logFile
+	sess.StartedAt = time.Now().UTC()
+	sess.FinishedAt = nil
+	sess.Status = state.StatusRunning
+	sess.PRNumber = 0
+	sess.Backend = backendName
+	sess.NotifiedCIFail = false
+
+	return nil
+}
+
 // Stop kills a worker and removes its worktree
 func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	// Try to kill the tmux session first (covers tmux-spawned workers)
