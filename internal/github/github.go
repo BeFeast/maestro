@@ -265,6 +265,50 @@ func (c *Client) PRCommits(prNumber int) ([]string, error) {
 	return msgs, nil
 }
 
+// Review represents a single PR review from the GitHub API.
+type Review struct {
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	State string `json:"state"` // APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING
+	Body  string `json:"body"`
+}
+
+// GreptileReviewStatus checks if greptile-apps[bot] left a review on the PR.
+// Returns ("CHANGES_REQUESTED", body, nil) if greptile requested changes.
+// Returns ("", "", nil) if greptile only COMMENTED or has no review.
+func (c *Client) GreptileReviewStatus(prNumber int) (string, string, error) {
+	out, err := exec.Command("gh", "pr", "view",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo,
+		"--json", "reviews").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("gh pr view %d reviews: %w", prNumber, err)
+	}
+
+	var result struct {
+		Reviews []Review `json:"reviews"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return "", "", fmt.Errorf("parse reviews for PR %d: %w", prNumber, err)
+	}
+
+	// Walk reviews in reverse to find the latest from greptile-apps[bot]
+	for i := len(result.Reviews) - 1; i >= 0; i-- {
+		r := result.Reviews[i]
+		if r.Author.Login == "greptile-apps[bot]" {
+			if r.State == "CHANGES_REQUESTED" {
+				return "CHANGES_REQUESTED", r.Body, nil
+			}
+			// COMMENTED, APPROVED, DISMISSED — not blocking
+			return "", "", nil
+		}
+	}
+
+	// No review from greptile — not blocking
+	return "", "", nil
+}
+
 // CreateRelease creates a GitHub release for the given tag.
 func (c *Client) CreateRelease(tag, title string) error {
 	out, err := exec.Command("gh", "release", "create",
