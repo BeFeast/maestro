@@ -39,7 +39,8 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-        run: go build -o maestro-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/maestro/
+          CGO_ENABLED: '0'
+        run: go build -trimpath -o maestro-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/maestro/
 
       - name: Create release if needed
         env:
