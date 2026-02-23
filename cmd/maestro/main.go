@@ -15,6 +15,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
@@ -35,6 +36,7 @@ Commands:
   watch         Open tmux dashboard with all worker logs
   spawn         Spawn a worker for a specific issue number
   stop          Stop a worker session
+  kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
   version-bump  Bump project version based on merged PR labels
   version       Print version
@@ -53,6 +55,9 @@ Spawn flags:
 
 Stop flags:
   --session string      Session name to stop (e.g. pan-1)
+
+Kill:
+  maestro kill <slot>   Kill a specific worker (e.g. maestro kill pan-1)
 
 Version-bump flags:
   --pr int              PR number to read labels/commits from
@@ -92,6 +97,8 @@ func main() {
 		spawnCmd(args)
 	case "stop":
 		stopCmd(args)
+	case "kill":
+		killCmd(args)
 	case "import":
 		importCmd(args)
 	case "version-bump":
@@ -488,6 +495,49 @@ func stopCmd(args []string) {
 	}
 
 	fmt.Printf("Stopped and removed session %s\n", *sessionName)
+}
+
+func killCmd(args []string) {
+	fs := flag.NewFlagSet("kill", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
+	fs.Parse(args)
+	args = fs.Args()
+
+	if len(args) == 0 || args[0] == "" {
+		fmt.Fprintln(os.Stderr, "error: slot name is required\nUsage: maestro kill <slot>")
+		os.Exit(1)
+	}
+
+	slotName := args[0]
+	cfg := loadConfig(*configPath)
+
+	s, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+
+	sess, ok := s.Sessions[slotName]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "error: session %q not found\n", slotName)
+		os.Exit(1)
+	}
+
+	if err := worker.Stop(cfg, slotName, sess); err != nil {
+		log.Fatalf("kill worker: %v", err)
+	}
+
+	now := time.Now().UTC()
+	sess.Status = state.StatusDead
+	sess.FinishedAt = &now
+
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		log.Fatalf("save state: %v", err)
+	}
+
+	n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL)
+	n.Sendf("maestro: manually killed worker %s (issue #%d: %s)", slotName, sess.IssueNumber, sess.IssueTitle)
+
+	fmt.Printf("Killed session %s (issue #%d: %s)\n", slotName, sess.IssueNumber, sess.IssueTitle)
 }
 
 func importCmd(args []string) {
