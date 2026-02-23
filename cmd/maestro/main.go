@@ -26,6 +26,7 @@ Usage:
   maestro <command> [flags]
 
 Commands:
+  init      Interactive setup wizard for new projects
   run       Run the orchestration loop
   status    Show current state
   logs      Show worker logs (tail -f)
@@ -70,6 +71,8 @@ func main() {
 	args := os.Args[2:]
 
 	switch cmd {
+	case "init":
+		initCmd(args)
 	case "run":
 		runCmd(args)
 	case "status":
