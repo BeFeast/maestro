@@ -10,6 +10,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/worker"
@@ -20,6 +21,7 @@ type Orchestrator struct {
 	cfg        *config.Config
 	notifier   *notify.Notifier
 	gh         *github.Client
+	router     *router.Router
 	repo       string
 	promptBase string
 }
@@ -30,6 +32,7 @@ func New(cfg *config.Config) *Orchestrator {
 		cfg:      cfg,
 		notifier: notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL),
 		gh:       github.New(cfg.Repo),
+		router:   router.New(cfg),
 		repo:     cfg.Repo,
 	}
 }
@@ -336,14 +339,31 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
-		// Detect model: label for backend selection
-		backendName := o.cfg.Model.Default
+		// Detect model: label for backend selection (label takes precedence)
+		backendName := ""
 		for _, label := range issue.Labels {
 			if strings.HasPrefix(label.Name, "model:") {
 				if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
 					backendName = name
+					log.Printf("[router] issue #%d → %s (label override)", issue.Number, backendName)
 				}
 			}
+		}
+
+		// If no label, try auto-routing via LLM
+		if backendName == "" && o.cfg.Routing.Mode == "auto" {
+			routedBackend, reason, err := o.router.Route(issue)
+			if err != nil {
+				log.Printf("[router] issue #%d: error %v — using default", issue.Number, err)
+			} else {
+				log.Printf("[router] issue #%d → %s (%s)", issue.Number, routedBackend, reason)
+			}
+			backendName = routedBackend
+		}
+
+		// Fall back to default
+		if backendName == "" {
+			backendName = o.cfg.Model.Default
 		}
 
 		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s)", issue.Number, issue.Title, backendName)
