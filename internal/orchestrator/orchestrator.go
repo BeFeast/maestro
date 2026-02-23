@@ -27,7 +27,7 @@ type Orchestrator struct {
 func New(cfg *config.Config) *Orchestrator {
 	return &Orchestrator{
 		cfg:      cfg,
-		notifier: notify.New(cfg.Telegram.OpenclawURL, cfg.Telegram.Target),
+		notifier: notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL),
 		gh:       github.New(cfg.Repo),
 		repo:     cfg.Repo,
 	}
