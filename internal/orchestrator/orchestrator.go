@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -363,6 +364,16 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 						o.notifier.Sendf("🏷️ maestro: version bumped after PR #%d merge", pr.Number)
 					}
 				}
+
+				// Deploy hook
+				if o.cfg.DeployCmd != "" {
+					if err := o.runDeployCmd(pr.Number); err != nil {
+						log.Printf("[orch] deploy command failed for PR #%d: %v", pr.Number, err)
+						o.notifier.Sendf("⚠️ maestro: deploy failed after PR #%d merge: %v", pr.Number, err)
+					} else {
+						o.notifier.Sendf("🚀 maestro: deploy succeeded after PR #%d merge", pr.Number)
+					}
+				}
 			}
 		case "failure":
 			// Only notify CI failure once — dedup via LastNotifiedStatus
@@ -373,6 +384,28 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 		}
 	}
+}
+
+// runDeployCmd executes the configured deploy command with a 5-minute timeout.
+func (o *Orchestrator) runDeployCmd(prNumber int) error {
+	log.Printf("[orch] running deploy command after PR #%d merge: %s", prNumber, o.cfg.DeployCmd)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-c", o.cfg.DeployCmd)
+	cmd.Dir = o.cfg.LocalPath
+	out, err := cmd.CombinedOutput()
+	if len(out) > 0 {
+		log.Printf("[orch] deploy output:\n%s", out)
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("deploy command timed out after 5 minutes")
+	}
+	if err != nil {
+		return fmt.Errorf("deploy command failed: %w\n%s", err, out)
+	}
+	return nil
 }
 
 // rebaseConflicts finds PRs with conflicts and rebases them

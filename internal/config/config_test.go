@@ -524,3 +524,29 @@ func TestLoadDir_SkipsSubdirectories(t *testing.T) {
 		t.Fatalf("expected 1 config, got %d", len(cfgs))
 	}
 }
+
+func TestParse_DeployCmdEmpty(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.DeployCmd != "" {
+		t.Errorf("DeployCmd = %q, want empty", cfg.DeployCmd)
+	}
+}
+
+func TestParse_DeployCmdExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+deploy_cmd: "go build ./cmd/app/ && systemctl --user restart app"
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := "go build ./cmd/app/ && systemctl --user restart app"
+	if cfg.DeployCmd != want {
+		t.Errorf("DeployCmd = %q, want %q", cfg.DeployCmd, want)
+	}
+}
