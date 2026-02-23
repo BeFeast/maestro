@@ -17,7 +17,42 @@ maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini),
 - Notifies you via Telegram (through OpenClaw gateway) on important events
 - Cleans up dead/stale sessions
 
+## Prerequisites
+
+### Required
+- `gh` (GitHub CLI) — [cli.github.com](https://cli.github.com)
+- `git` — pre-installed on most systems
+- **One of the following AI CLIs:**
+
+| CLI | Provider | Install |
+|-----|----------|---------|
+| `claude` | Anthropic Claude Code | [claude.ai/code](https://claude.ai/code) |
+| `codex` | OpenAI Codex | `bun add -g @openai/codex` |
+| `gemini` | Google Gemini | `npm i -g @google/gemini-cli` |
+
+You only need one — whichever you have access to.
+
+### Setup
+```bash
+# Authenticate GitHub CLI
+gh auth login
+
+# Authenticate your chosen AI CLI (example for Claude):
+claude auth   # or codex auth / gemini auth
+```
+
+### Private repositories
+Maestro works with private repos — all GitHub operations go through `gh` CLI. As long as `gh auth status` shows access to the repo, maestro works.
+
 ## Installation
+
+### Release binaries
+
+Download the latest binary from [Releases](https://github.com/BeFeast/maestro/releases) and add it to your PATH.
+
+### Build from source
+
+Requires Go 1.22+.
 
 ```bash
 git clone https://github.com/BeFeast/maestro
@@ -25,8 +60,6 @@ cd maestro
 go build ./cmd/maestro/
 sudo mv maestro /usr/local/bin/  # or add to PATH
 ```
-
-Requires Go 1.22+.
 
 ## Configuration
 
