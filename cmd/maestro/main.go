@@ -35,6 +35,7 @@ Commands:
   watch         Open tmux dashboard with all worker logs
   spawn         Spawn a worker for a specific issue number
   stop          Stop a worker session
+  import        Seed state from existing worktrees
   version-bump  Bump project version based on merged PR labels
   version       Print version
 
@@ -91,6 +92,8 @@ func main() {
 		spawnCmd(args)
 	case "stop":
 		stopCmd(args)
+	case "import":
+		importCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
 	case "version":
@@ -485,6 +488,50 @@ func stopCmd(args []string) {
 	}
 
 	fmt.Printf("Stopped and removed session %s\n", *sessionName)
+}
+
+func importCmd(args []string) {
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
+	fs.Parse(args)
+
+	cfg := loadConfig(*configPath)
+
+	s, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+
+	results, err := worker.Import(cfg, s)
+	if err != nil {
+		log.Fatalf("import: %v", err)
+	}
+
+	if len(results) == 0 {
+		fmt.Println("No worktrees found to import.")
+		return
+	}
+
+	imported := 0
+	skipped := 0
+	for _, r := range results {
+		if r.Skipped {
+			fmt.Printf("  skip: %s (%s) — %s\n", r.SlotName, r.Branch, r.SkipReason)
+			skipped++
+		} else {
+			fmt.Printf("  imported: %s → issue #%d [%s]\n", r.SlotName, r.IssueNumber, r.Status)
+			imported++
+		}
+	}
+
+	fmt.Printf("\nImported %d, skipped %d.\n", imported, skipped)
+
+	if imported > 0 {
+		if err := state.Save(cfg.StateDir, s); err != nil {
+			log.Fatalf("save state: %v", err)
+		}
+		fmt.Printf("State saved to %s\n", state.StatePath(cfg.StateDir))
+	}
 }
 
 func versionBumpCmd(args []string) {
