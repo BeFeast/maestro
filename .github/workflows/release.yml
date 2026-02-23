@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   release:
-    name: Build & Upload
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -41,7 +41,12 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: go build -o maestro-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/maestro/
 
-      - name: Upload to release
+      - name: Create release if needed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload ${{ github.ref_name }} maestro-${{ matrix.goos }}-${{ matrix.goarch }} --clobber
+        run: gh release create "${{ github.ref_name }}" --generate-notes || true
+
+      - name: Upload binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" maestro-${{ matrix.goos }}-${{ matrix.goarch }} --clobber
