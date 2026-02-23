@@ -20,18 +20,19 @@ const (
 )
 
 type Session struct {
-	IssueNumber int           `json:"issue_number"`
-	IssueTitle  string        `json:"issue_title"`
-	Worktree    string        `json:"worktree"`
-	Branch      string        `json:"branch"`
-	PID         int           `json:"pid"`
-	LogFile     string        `json:"log_file"`
-	StartedAt   time.Time     `json:"started_at"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	Status      SessionStatus `json:"status"`
-	PRNumber    int           `json:"pr_number,omitempty"`
-	Backend     string        `json:"backend,omitempty"` // "claude", "codex", etc.
-	LongRunning bool          `json:"long_running,omitempty"`
+	IssueNumber    int           `json:"issue_number"`
+	IssueTitle     string        `json:"issue_title"`
+	Worktree       string        `json:"worktree"`
+	Branch         string        `json:"branch"`
+	PID            int           `json:"pid"`
+	LogFile        string        `json:"log_file"`
+	StartedAt      time.Time     `json:"started_at"`
+	FinishedAt     *time.Time    `json:"finished_at,omitempty"`
+	Status         SessionStatus `json:"status"`
+	PRNumber       int           `json:"pr_number,omitempty"`
+	Backend        string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	LongRunning    bool          `json:"long_running,omitempty"`
+	NotifiedCIFail bool          `json:"notified_ci_fail,omitempty"`
 }
 
 type State struct {

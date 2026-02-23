@@ -284,6 +284,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 
 		switch ciStatus {
 		case "success":
+			// Reset CI failure notification flag when CI goes green
+			sess.NotifiedCIFail = false
+
 			log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 			if err := o.gh.MergePR(pr.Number); err != nil {
 				log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
@@ -310,7 +313,10 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				}
 			}
 		case "failure":
-			o.notifier.Sendf("❌ maestro: CI failing for PR #%d (%s, issue #%d)", pr.Number, sess.Branch, sess.IssueNumber)
+			if !sess.NotifiedCIFail {
+				o.notifier.Sendf("❌ maestro: CI failing for PR #%d (%s, issue #%d)", pr.Number, sess.Branch, sess.IssueNumber)
+				sess.NotifiedCIFail = true
+			}
 		}
 	}
 }
