@@ -45,7 +45,7 @@ func (n *Notifier) Send(msg string) error {
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	url := n.OpenclawURL + "/api/v1/message"
+	url := n.OpenclawURL + "/api/v1/message/send"
 	resp, err := client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("post to openclaw: %w", err)
