@@ -65,6 +65,37 @@ go build ./cmd/maestro/
 sudo mv maestro /usr/local/bin/  # or add to PATH
 ```
 
+## Quickstart
+
+Get maestro running in under 5 minutes:
+
+```bash
+# 1. Install maestro
+curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/install.sh | sh
+
+# 2. Clone your repo and cd into it
+git clone https://github.com/yourorg/yourrepo
+cd yourrepo
+
+# 3. Run the interactive setup wizard
+maestro init
+```
+
+The wizard will ask for your repo name, local paths, max parallel workers, and preferred AI backend. It generates a `maestro.yaml` in the current directory.
+
+```bash
+# 4. Do a test run (picks one issue, runs once, then exits)
+maestro run --once
+
+# 5. Check status
+maestro status
+
+# 6. When ready, run continuously
+maestro run
+```
+
+That's it. Maestro will now pick up issues matching your configured label, spawn AI agents in isolated worktrees, and auto-merge PRs when CI passes.
+
 ## Configuration
 
 Create `~/.maestro/config.yaml` or `./maestro.yaml`:
@@ -285,7 +316,30 @@ worktree_base: ~/.worktrees/myapp
 max_parallel: 3
 ```
 
-### systemd Template Unit
+### Running as a Service
+
+#### Single project (Linux — systemd)
+
+`maestro init` automatically creates a systemd user service at `~/.config/systemd/user/maestro.service`. To enable it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now maestro.service
+
+# Check status
+systemctl --user status maestro.service
+journalctl --user -u maestro.service -f
+```
+
+#### Single project (macOS — launchd)
+
+`maestro init` creates a launchd plist at `~/Library/LaunchAgents/com.maestro.agent.plist`:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.maestro.agent.plist
+```
+
+#### Multiple projects (systemd template)
 
 A `maestro@.service` template is included for running multiple instances as user services:
 
@@ -304,6 +358,79 @@ systemctl --user enable maestro@panoptikon
 # Check status
 systemctl --user status maestro@panoptikon
 journalctl --user -u maestro@panoptikon -f
+```
+
+## Troubleshooting
+
+### `gh auth status` fails or maestro can't access the repo
+
+```bash
+gh auth login          # re-authenticate
+gh auth status         # verify token has repo access
+```
+
+For private repos, ensure your token includes the `repo` scope.
+
+### Workers start but immediately die
+
+Check the worker log for errors:
+
+```bash
+maestro logs <slot>    # e.g. maestro logs pan-1
+```
+
+Common causes:
+- AI CLI not authenticated — run `claude auth` (or `codex auth` / `gemini auth`)
+- AI CLI not found in PATH — verify with `which claude` (or `which codex` / `which gemini`)
+- The repo has no open issues matching the configured `issue_label`
+
+### `maestro run` exits with "load config" error
+
+Maestro looks for config in this order:
+1. `--config` flag path
+2. `maestro.yaml` in the current directory
+3. `~/.maestro/config.yaml`
+
+Run `maestro init` in your repo directory to create a config, or pass an explicit path:
+
+```bash
+maestro run --config ~/.maestro/maestro-myapp.yaml
+```
+
+### Worktree conflicts or stale worktrees
+
+If a worker died and left a stale worktree:
+
+```bash
+maestro stop --session <slot>   # cleans up worktree + state
+# or manually:
+git worktree remove /path/to/worktree --force
+```
+
+### systemd service won't start
+
+```bash
+# Check logs
+journalctl --user -u maestro@myapp -f
+
+# Verify the binary is at /usr/local/bin/maestro
+which maestro
+
+# Verify the config file exists
+ls ~/.maestro/maestro-myapp.yaml
+
+# Reload after editing the unit file
+systemctl --user daemon-reload
+systemctl --user restart maestro@myapp
+```
+
+### Workers stuck for hours
+
+Maestro sends a Telegram notification when a worker runs longer than 2 hours. You can manually kill and retry:
+
+```bash
+maestro kill <slot>              # kills the stuck worker
+maestro spawn --issue <number>   # retry the issue
 ```
 
 ## Dependencies
