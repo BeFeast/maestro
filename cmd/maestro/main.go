@@ -597,6 +597,9 @@ func watchCmd(args []string) {
 	exec.Command("tmux", "set-option", "-t", tmuxSession, "pane-border-format",
 		"#[fg=white,bold] #{pane_title}").Run()
 
+	// Kill stale updater processes before starting new one
+	exec.Command("pkill", "-f", "maestro _watch-updater").Run()
+
 	// Write pane mapping and start background updater to keep titles fresh
 	if err := watch.WritePaneMap(watch.PaneMapFile, paneMappings); err != nil {
 		log.Printf("[watch] warn: write pane map: %v (titles won't auto-refresh)", err)
