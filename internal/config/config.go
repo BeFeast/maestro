@@ -128,10 +128,8 @@ func parse(data []byte) (*Config, error) {
 			cfg.IssueLabels = append(cfg.IssueLabels, cfg.IssueLabel)
 		}
 	}
-	// Default to "enhancement" if neither field is set
-	if len(cfg.IssueLabels) == 0 {
-		cfg.IssueLabels = []string{"enhancement"}
-	}
+	// If no labels configured, IssueLabels stays nil — meaning no label filter
+	// (all open issues will be fetched).
 
 	// Expand ~ in paths
 	cfg.LocalPath = expandHome(cfg.LocalPath)
