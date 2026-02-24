@@ -43,7 +43,7 @@ issue_label: bug
 	}
 }
 
-func TestParse_IssueLabelsDefault(t *testing.T) {
+func TestParse_IssueLabelsDefault_Empty(t *testing.T) {
 	yaml := `
 repo: owner/repo
 `
@@ -51,8 +51,22 @@ repo: owner/repo
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(cfg.IssueLabels) != 1 || cfg.IssueLabels[0] != "enhancement" {
-		t.Errorf("IssueLabels = %v, want [enhancement]", cfg.IssueLabels)
+	if len(cfg.IssueLabels) != 0 {
+		t.Errorf("IssueLabels = %v, want empty (no label filter)", cfg.IssueLabels)
+	}
+}
+
+func TestParse_IssueLabelsExplicitEmpty(t *testing.T) {
+	yaml := `
+repo: owner/repo
+issue_labels: []
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.IssueLabels) != 0 {
+		t.Errorf("IssueLabels = %v, want empty (no label filter)", cfg.IssueLabels)
 	}
 }
 
