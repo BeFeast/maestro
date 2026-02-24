@@ -310,9 +310,33 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	}
 	sort.Strings(names)
 
+	// Fetch CI status for pr_open sessions
+	gh := github.New(cfg.Repo)
+	ciStatuses := make(map[string]string) // session name → CI display string
+	for _, name := range names {
+		sess := s.Sessions[name]
+		if sess.Status == state.StatusPROpen && sess.PRNumber > 0 {
+			ciStatus, err := gh.PRCIStatus(sess.PRNumber)
+			if err != nil {
+				ciStatuses[name] = "?"
+			} else {
+				switch ciStatus {
+				case "success":
+					ciStatuses[name] = "✅ pass"
+				case "failure":
+					ciStatuses[name] = "❌ fail"
+				case "pending":
+					ciStatuses[name] = "⏳ pending"
+				default:
+					ciStatuses[name] = "?"
+				}
+			}
+		}
+	}
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SESSION\tISSUE\tSTATUS\tPID\tALIVE\tAGE\tRETRIES\tTITLE")
-	fmt.Fprintln(w, "-------\t-----\t------\t---\t-----\t---\t-------\t-----")
+	fmt.Fprintln(w, "SESSION\tISSUE\tSTATUS\tPR\tCI\tPID\tALIVE\tAGE\tRETRIES\tTITLE")
+	fmt.Fprintln(w, "-------\t-----\t------\t--\t--\t---\t-----\t---\t-------\t-----")
 	for _, name := range names {
 		sess := s.Sessions[name]
 		alive := "-"
@@ -328,8 +352,16 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 		if sess.RetryCount > 0 {
 			retries = fmt.Sprintf("%d", sess.RetryCount)
 		}
-		fmt.Fprintf(w, "%s\t#%d\t%s\t%d\t%s\t%s\t%s\t%s\n",
-			name, sess.IssueNumber, sess.Status, sess.PID, alive, age, retries, truncate(sess.IssueTitle, 50))
+		pr := "-"
+		if sess.PRNumber > 0 {
+			pr = fmt.Sprintf("#%d", sess.PRNumber)
+		}
+		ci := "-"
+		if cs, ok := ciStatuses[name]; ok {
+			ci = cs
+		}
+		fmt.Fprintf(w, "%s\t#%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+			name, sess.IssueNumber, sess.Status, pr, ci, sess.PID, alive, age, retries, truncate(sess.IssueTitle, 50))
 	}
 	w.Flush()
 
