@@ -28,6 +28,8 @@ type Orchestrator struct {
 	promptBase            string
 	bugPromptBase         string
 	enhancementPromptBase string
+	pidAliveFn            func(pid int) bool
+	tmuxSessionExistsFn   func(name string) bool
 }
 
 // New creates a new Orchestrator
@@ -44,6 +46,23 @@ func New(cfg *config.Config) *Orchestrator {
 		router:   router.New(cfg),
 		repo:     cfg.Repo,
 	}
+}
+
+func (o *Orchestrator) pidAlive(pid int) bool {
+	if o.pidAliveFn != nil {
+		return o.pidAliveFn(pid)
+	}
+	return worker.IsAlive(pid)
+}
+
+func (o *Orchestrator) tmuxSessionExists(name string) bool {
+	if o.tmuxSessionExistsFn != nil {
+		return o.tmuxSessionExistsFn(name)
+	}
+	if name == "" {
+		return false
+	}
+	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
 }
 
 // LoadPromptBase reads the worker prompt template from config or a provided path.
@@ -109,21 +128,24 @@ func (o *Orchestrator) RunOnce() error {
 
 	log.Printf("[orch] === cycle start — %d sessions in state ===", len(s.Sessions))
 
-	// Step 1: Check running sessions for dead processes / stale / closed issues
+	// Step 1: Reconcile stale running sessions before scheduling/slot calculation.
+	o.reconcileRunningSessions(s)
+
+	// Step 2: Check running sessions for dead processes / stale / closed issues
 	o.checkSessions(s)
 
-	// Step 2: Auto-merge green PRs
+	// Step 3: Auto-merge green PRs
 	o.autoMergePRs(s)
 
-	// Step 3: Rebase conflicting PRs
+	// Step 4: Rebase conflicting PRs
 	o.rebaseConflicts(s)
 
-	// Save after all checks
+	// Save after all checks/reconciliation
 	if err := state.Save(o.cfg.StateDir, s); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 
-	// Step 4: Start new workers for available slots
+	// Step 5: Start new workers for available slots
 	active := len(s.ActiveSessions())
 	slots := o.cfg.MaxParallel - active
 	log.Printf("[orch] active=%d max=%d available_slots=%d", active, o.cfg.MaxParallel, slots)
@@ -165,6 +187,42 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 				log.Printf("[orch] run error: %v", err)
 			}
 		}
+	}
+}
+
+// reconcileRunningSessions self-heals stale "running" sessions.
+// If a session is marked running but its PID is dead (or missing), or its tmux session
+// is missing (when tracked in state), the session is re-queued so scheduler can restart work.
+func (o *Orchestrator) reconcileRunningSessions(s *state.State) {
+	for slotName, sess := range s.Sessions {
+		if sess.Status != state.StatusRunning {
+			continue
+		}
+
+		var reasons []string
+		if sess.PID <= 0 {
+			reasons = append(reasons, "pid missing")
+		} else if !o.pidAlive(sess.PID) {
+			reasons = append(reasons, fmt.Sprintf("pid %d dead", sess.PID))
+		}
+
+		if sess.TmuxSession != "" && !o.tmuxSessionExists(sess.TmuxSession) {
+			reasons = append(reasons, fmt.Sprintf("tmux session %q missing", sess.TmuxSession))
+		}
+
+		if len(reasons) == 0 {
+			continue
+		}
+
+		oldPID := sess.PID
+		oldTmux := sess.TmuxSession
+		sess.Status = state.StatusQueued
+		sess.PID = 0
+		sess.TmuxSession = ""
+		sess.RetryCount++
+
+		log.Printf("[orch] reconcile: %s running->queued (%s); pid=%d tmux=%q retries=%d",
+			slotName, strings.Join(reasons, ", "), oldPID, oldTmux, sess.RetryCount)
 	}
 }
 

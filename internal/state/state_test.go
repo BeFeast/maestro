@@ -365,6 +365,7 @@ func TestIsTerminal(t *testing.T) {
 		status SessionStatus
 		want   bool
 	}{
+		{StatusQueued, false},
 		{StatusRunning, false},
 		{StatusPROpen, false},
 		{StatusDone, true},

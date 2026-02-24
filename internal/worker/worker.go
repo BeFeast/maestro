@@ -143,6 +143,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		Worktree:    worktreePath,
 		Branch:      branchName,
 		PID:         pid,
+		TmuxSession: tmuxName,
 		LogFile:     logFile,
 		StartedAt:   time.Now().UTC(),
 		Status:      state.StatusRunning,
@@ -249,6 +250,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.Worktree = worktreePath
 	sess.Branch = branchName
 	sess.PID = pid
+	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
 	sess.StartedAt = time.Now().UTC()
 	sess.FinishedAt = nil

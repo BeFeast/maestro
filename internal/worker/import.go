@@ -110,6 +110,7 @@ func Import(cfg *config.Config, s *state.State) ([]ImportResult, error) {
 			Worktree:    wtPath,
 			Branch:      branch,
 			PID:         pid,
+			TmuxSession: tmuxName,
 			LogFile:     logFile,
 			StartedAt:   time.Now().UTC(),
 			Status:      status,

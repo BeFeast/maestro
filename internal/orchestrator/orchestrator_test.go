@@ -7,6 +7,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/state"
 )
 
 func makeIssue(number int, title string, labels ...string) github.Issue {
@@ -120,6 +121,71 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 	got := o.selectPrompt(makeIssue(8, "Fix crash", "Bug"))
 	if got != "bug prompt" {
 		t.Errorf("selectPrompt() = %q, want %q (label matching should be case-insensitive)", got, "bug prompt")
+	}
+}
+
+func TestReconcileRunningSessions_DeadPIDGetsQueued(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["pan-1"] = &state.Session{
+		IssueNumber:        71,
+		Status:             state.StatusRunning,
+		PID:                4242,
+		TmuxSession:        "maestro-pan-1",
+		RetryCount:         2,
+		IssueTitle:         "stale worker",
+		LastNotifiedStatus: "",
+	}
+
+	o := &Orchestrator{
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return true },
+	}
+
+	o.reconcileRunningSessions(s)
+
+	sess := s.Sessions["pan-1"]
+	if sess.Status != state.StatusQueued {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusQueued)
+	}
+	if sess.PID != 0 {
+		t.Fatalf("pid = %d, want 0", sess.PID)
+	}
+	if sess.TmuxSession != "" {
+		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.RetryCount != 3 {
+		t.Fatalf("retry_count = %d, want 3", sess.RetryCount)
+	}
+}
+
+func TestReconcileRunningSessions_MissingTmuxGetsQueued(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["pan-2"] = &state.Session{
+		IssueNumber: 71,
+		Status:      state.StatusRunning,
+		PID:         5151,
+		TmuxSession: "maestro-pan-2",
+	}
+
+	o := &Orchestrator{
+		pidAliveFn:          func(pid int) bool { return true },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+	}
+
+	o.reconcileRunningSessions(s)
+
+	sess := s.Sessions["pan-2"]
+	if sess.Status != state.StatusQueued {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusQueued)
+	}
+	if sess.PID != 0 {
+		t.Fatalf("pid = %d, want 0", sess.PID)
+	}
+	if sess.TmuxSession != "" {
+		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", sess.RetryCount)
 	}
 }
 

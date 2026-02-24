@@ -12,6 +12,7 @@ import (
 type SessionStatus string
 
 const (
+	StatusQueued         SessionStatus = "queued"
 	StatusRunning        SessionStatus = "running"
 	StatusPROpen         SessionStatus = "pr_open"
 	StatusDone           SessionStatus = "done"
@@ -26,6 +27,7 @@ type Session struct {
 	Worktree           string        `json:"worktree"`
 	Branch             string        `json:"branch"`
 	PID                int           `json:"pid"`
+	TmuxSession        string        `json:"tmux_session,omitempty"`
 	LogFile            string        `json:"log_file"`
 	StartedAt          time.Time     `json:"started_at"`
 	FinishedAt         *time.Time    `json:"finished_at,omitempty"`
