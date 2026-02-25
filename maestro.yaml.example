@@ -8,9 +8,11 @@ repo: YOUR_ORG/YOUR_REPO
 local_path: /path/to/local/repo
 worktree_base: /path/to/worktrees/repo
 max_parallel: 5
-max_runtime_minutes: 120
-worker_silent_timeout_minutes: 30 # 0 disables silent-worker timeout
-auto_rebase: true
+max_runtime_minutes: 120           # hard timeout per worker (default: 120)
+worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N min (0 = disabled)
+auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
+merge_strategy: sequential         # "sequential" (default) or "parallel"
+merge_interval_seconds: 30         # minimum seconds between sequential merges (default: 30)
 
 # Files to auto-resolve conflicts by keeping both sides during rebase.
 # Useful for generated/aggregated files that accumulate changes from multiple branches.
@@ -18,13 +20,6 @@ auto_rebase: true
 #   - server/src/api/mod.rs
 #   - web/src/lib/api.ts
 #   - web/src/lib/types.ts
-
-# Timeouts and merge behaviour
-max_runtime_minutes: 120           # hard timeout per worker (default: 120)
-worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N min (0 = disabled)
-auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
-merge_strategy: sequential         # "sequential" (default) or "parallel"
-merge_interval_seconds: 30         # minimum seconds between sequential merges (default: 30)
 
 # Model backend — default is Claude CLI
 # Supported: claude (default), codex (OpenAI), gemini, cline
@@ -48,10 +43,6 @@ exclude_labels:
 
 # Worker prompt template (Markdown file with instructions for AI workers)
 worker_prompt: /path/to/worker-prompt-template.md
-
-# Merge behavior
-merge_strategy: sequential      # "sequential" (default) or "parallel"
-merge_interval_seconds: 30      # minimum seconds between merges in sequential mode
 
 # Optional: command to run after successful merge (build + deploy)
 # deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
