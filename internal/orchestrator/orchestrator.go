@@ -441,11 +441,15 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
 							}
 
+							// Count previous silent-timeout kills before updating this session,
+							// so the current kill is not included in the count.
+							prevSilentKills := countSilentTimeoutKillsForIssue(s, sess.IssueNumber)
+
 							sess.Status = state.StatusDead
 							sess.LastNotifiedStatus = "silent_timeout"
 							sess.FinishedAt = &now
 
-							if countSilentTimeoutKillsForIssue(s, sess.IssueNumber) > 1 {
+							if prevSilentKills > 0 {
 								if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 									log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 								}
