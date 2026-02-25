@@ -431,7 +431,7 @@ maestro run --config ~/.maestro/maestro-myapp.yaml
 
 ### `maestro run` picks no issues
 
-- Verify your `issue_labels` config matches existing issue labels on GitHub
+- Verify your `issue_labels` config (or deprecated `issue_label`) matches existing issue labels on GitHub
 - Check that issues aren't already assigned or have `exclude_labels`
 - Run `gh issue list --label enhancement` to confirm matching issues exist
 
