@@ -308,6 +308,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					// Already retried — mark as permanently failed
 					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
+					if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+					}
 					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
@@ -393,6 +396,23 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			// Reset notification status when CI goes green
 			sess.LastNotifiedStatus = ""
 			sess.NotifiedCIFail = false // backward compat
+
+			greptileOK, greptilePending, err := o.gh.PRGreptileApproved(pr.Number)
+			if err != nil {
+				log.Printf("[orch] greptile check PR #%d: %v", pr.Number, err)
+				continue // skip this cycle, try next
+			}
+			if greptilePending {
+				log.Printf("[orch] PR #%d waiting for Greptile review", pr.Number)
+				continue // not ready yet
+			}
+			if !greptileOK {
+				log.Printf("[orch] PR #%d not approved by Greptile, labeling blocked", pr.Number)
+				if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+				}
+				continue
+			}
 
 			log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 			if err := o.gh.MergePR(pr.Number); err != nil {
