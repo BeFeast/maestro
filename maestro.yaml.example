@@ -10,6 +10,14 @@ worktree_base: /path/to/worktrees/repo
 max_parallel: 5
 max_runtime_minutes: 120
 worker_silent_timeout_minutes: 30 # 0 disables silent-worker timeout
+auto_rebase: true
+
+# Files to auto-resolve conflicts by keeping both sides during rebase.
+# Useful for generated/aggregated files that accumulate changes from multiple branches.
+# auto_resolve_files:
+#   - server/src/api/mod.rs
+#   - web/src/lib/api.ts
+#   - web/src/lib/types.ts
 
 # Model backend — default is Claude CLI
 # Supported: claude (default), codex (OpenAI), gemini

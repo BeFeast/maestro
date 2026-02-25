@@ -54,6 +54,7 @@ type Config struct {
 	MaxParallel                int              `yaml:"max_parallel"`
 	MaxRuntimeMinutes          int              `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes int              `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
+	AutoRebase                 bool             `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
 	ClaudeCmd                  string           `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
 	IssueLabel                 string           `yaml:"issue_label"`                   // deprecated: use issue_labels
 	IssueLabels                []string         `yaml:"issue_labels"`
@@ -70,6 +71,7 @@ type Config struct {
 	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"`        // minimum seconds between merges in sequential mode
 	Telegram                   TelegramConfig   `yaml:"telegram"`
 	Versioning                 VersioningConfig `yaml:"versioning"`
+	AutoResolveFiles           []string         `yaml:"auto_resolve_files"`            // files to auto-resolve conflicts by keeping both sides
 }
 
 // LoadFrom loads config from a specific path.
@@ -108,9 +110,15 @@ func parse(data []byte) (*Config, error) {
 	cfg := &Config{
 		MaxParallel:          5,
 		MaxRuntimeMinutes:    120,
+		AutoRebase:           true,
 		ClaudeCmd:            "claude",
 		MergeStrategy:        "sequential",
 		MergeIntervalSeconds: 30,
+		AutoResolveFiles: []string{
+			"server/src/api/mod.rs",
+			"web/src/lib/api.ts",
+			"web/src/lib/types.ts",
+		},
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)

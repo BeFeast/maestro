@@ -317,7 +317,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	ciStatuses := make(map[string]string) // session name → CI display string
 	for _, name := range names {
 		sess := s.Sessions[name]
-		if sess.Status == state.StatusPROpen && sess.PRNumber > 0 {
+		if (sess.Status == state.StatusPROpen || sess.Status == state.StatusQueued) && sess.PRNumber > 0 {
 			ciStatus, err := gh.PRCIStatus(sess.PRNumber)
 			if err != nil {
 				ciStatuses[name] = "?"

@@ -137,6 +137,11 @@ worktree_base: /home/shtrudel/.worktrees/panoptikon
 max_parallel: 5
 max_runtime_minutes: 120          # hard timeout for worker runtime (default: 120)
 worker_silent_timeout_minutes: 30 # kill worker if tmux output is unchanged for N minutes (0 = disabled)
+auto_rebase: true                 # auto-rebase conflicting PR branches (default: true)
+auto_resolve_files:               # files to auto-resolve by keeping both sides (configurable)
+  - server/src/api/mod.rs
+  - web/src/lib/api.ts
+  - web/src/lib/types.ts
 session_prefix: pan               # worker session name prefix (default: first 3 chars of repo name)
 state_dir: ~/.maestro/pan         # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude                # the claude CLI binary
@@ -280,10 +285,11 @@ State is stored in `~/.maestro/<repo-hash>/state.json`:
 
 Session statuses:
 - `running` — Claude agent is working
+- `queued` — Rebased and queued for CI rerun
 - `pr_open` — PR created, waiting for CI / review
 - `done` — PR merged and worktree cleaned up
 - `failed` — Something went wrong
-- `conflict_failed` — Rebase failed, needs manual intervention
+- `conflict_failed` — Unresolvable conflicts; manual intervention required
 - `dead` — Process died unexpectedly
 
 State writes are atomic (temp file + rename).

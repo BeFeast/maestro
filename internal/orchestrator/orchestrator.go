@@ -519,7 +519,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	ready := make([]mergeCandidate, 0)
 
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusPROpen {
+		if sess.Status != state.StatusPROpen && sess.Status != state.StatusQueued {
 			continue
 		}
 
@@ -570,11 +570,18 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 
 			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 		case "failure":
+			if sess.Status == state.StatusQueued {
+				sess.Status = state.StatusPROpen
+			}
 			// Only notify CI failure once — dedup via LastNotifiedStatus
 			if sess.LastNotifiedStatus != "ci_failure" {
 				o.notifier.Sendf("❌ maestro: CI failing for PR #%d (%s, issue #%d)", pr.Number, sess.Branch, sess.IssueNumber)
 				sess.LastNotifiedStatus = "ci_failure"
 				sess.NotifiedCIFail = true // backward compat
+			}
+		case "pending":
+			if sess.Status == state.StatusQueued {
+				sess.Status = state.StatusPROpen
 			}
 		}
 	}
@@ -699,7 +706,9 @@ func (o *Orchestrator) runDeployCmd(prNumber int) error {
 	return nil
 }
 
-// rebaseConflicts finds PRs with conflicts and rebases them
+// rebaseConflicts handles branch conflicts in two phases:
+//  1. Auto-rebase (if enabled)
+//  2. Label issue as blocked + keep session in conflict_failed permanently
 func (o *Orchestrator) rebaseConflicts(s *state.State) {
 	prs, err := o.gh.ListOpenPRs()
 	if err != nil {
@@ -713,35 +722,81 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 	}
 
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusPROpen {
-			continue
-		}
-		pr, found := branchToPR[sess.Branch]
-		if !found {
-			continue
-		}
+		pr, hasPR := branchToPR[sess.Branch]
 
-		mergeable, err := o.gh.PRMergeable(pr.Number)
-		if err != nil {
-			log.Printf("[orch] mergeable PR #%d: %v", pr.Number, err)
-			continue
-		}
-
-		if mergeable == "CONFLICTING" {
-			log.Printf("[orch] PR #%d has conflicts, rebasing %s", pr.Number, slotName)
-			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch); err != nil {
-				log.Printf("[orch] rebase failed for %s: %v", slotName, err)
-				sess.Status = state.StatusConflictFailed
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				o.notifier.Sendf("❌ maestro: rebase failed for %s (issue #%d: %s)\n%v",
-					slotName, sess.IssueNumber, sess.IssueTitle, err)
-			} else {
-				log.Printf("[orch] rebase succeeded for %s", slotName)
-				o.notifier.Sendf("🔄 maestro: rebased %s (PR #%d) successfully", slotName, pr.Number)
+		switch sess.Status {
+		case state.StatusPROpen:
+			if !hasPR {
+				continue
 			}
+			mergeable, err := o.gh.PRMergeable(pr.Number)
+			if err != nil {
+				log.Printf("[orch] mergeable PR #%d: %v", pr.Number, err)
+				continue
+			}
+			if mergeable != "CONFLICTING" {
+				continue
+			}
+
+			if !o.cfg.AutoRebase {
+				log.Printf("[orch] PR #%d has conflicts for %s, auto_rebase disabled", pr.Number, slotName)
+				o.markUnresolvableConflict(slotName, sess, pr.Number, fmt.Errorf("auto_rebase disabled"))
+				continue
+			}
+
+			log.Printf("[orch] PR #%d has conflicts, auto-rebasing %s", pr.Number, slotName)
+			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch, o.cfg.AutoResolveFiles); err != nil {
+				log.Printf("[orch] rebase failed for %s: %v", slotName, err)
+				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
+				continue
+			}
+			o.markRebaseQueued(slotName, sess, pr.Number)
+
+		case state.StatusConflictFailed:
+			if !o.cfg.AutoRebase || sess.RebaseAttempted {
+				continue
+			}
+			if !hasPR {
+				log.Printf("[orch] conflict_failed session %s has no open PR, skipping auto-rebase", slotName)
+				continue
+			}
+
+			log.Printf("[orch] retrying auto-rebase for conflict_failed session %s (PR #%d)", slotName, pr.Number)
+			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch, o.cfg.AutoResolveFiles); err != nil {
+				log.Printf("[orch] rebase retry failed for %s: %v", slotName, err)
+				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
+				continue
+			}
+			o.markRebaseQueued(slotName, sess, pr.Number)
 		}
 	}
+}
+
+func (o *Orchestrator) markRebaseQueued(slotName string, sess *state.Session, prNumber int) {
+	log.Printf("[orch] rebase succeeded for %s", slotName)
+	sess.Status = state.StatusQueued
+	sess.RebaseAttempted = true
+	sess.FinishedAt = nil
+	sess.PRNumber = prNumber
+	sess.NotifiedCIFail = false
+	sess.LastNotifiedStatus = ""
+	o.notifier.Sendf("🔄 maestro: rebased %s (PR #%d) successfully; session moved to queued", slotName, prNumber)
+}
+
+func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Session, prNumber int, cause error) {
+	if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+		log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+	}
+	if cause != nil {
+		log.Printf("[orch] conflict for %s is unresolvable: %v", slotName, cause)
+	}
+
+	sess.Status = state.StatusConflictFailed
+	sess.RebaseAttempted = true
+	sess.PRNumber = prNumber
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+	o.notifier.Sendf("⚠️ Worker %s (issue #%d) has unresolvable conflicts — manual intervention needed", slotName, sess.IssueNumber)
 }
 
 // startNewWorkers picks eligible issues and starts workers for them
