@@ -416,8 +416,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				continue
 			}
 
-			// Silent worker detection: compare tmux pane output hash over time.
-			if o.cfg.WorkerSilentTimeoutMinutes > 0 {
+			// Capture tmux pane output for silent-timeout detection and token tracking.
+			if o.cfg.WorkerSilentTimeoutMinutes > 0 || o.cfg.WorkerMaxTokens > 0 {
 				tmuxName := sess.TmuxSession
 				if tmuxName == "" {
 					tmuxName = worker.TmuxSessionName(slotName)
@@ -427,38 +427,75 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				if err != nil {
 					log.Printf("[orch] warn: tmux capture-pane failed for %s (%s): %v", slotName, tmuxName, err)
 				} else {
-					hash := hashOutput(output)
-					now := time.Now().UTC()
+					// --- Token tracking ---
+					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsed {
+						sess.TokensUsed = tokens
+						log.Printf("[orch] %s tokens_used updated to %d", slotName, tokens)
+					}
 
-					if sess.LastOutputHash == "" || sess.LastOutputChangedAt.IsZero() || hash != sess.LastOutputHash {
-						sess.LastOutputHash = hash
-						sess.LastOutputChangedAt = now
-					} else {
-						timeout := time.Duration(o.cfg.WorkerSilentTimeoutMinutes) * time.Minute
-						if time.Since(sess.LastOutputChangedAt) > timeout {
-							log.Printf("[orch] worker %s silent for >%dm, killing", slotName, o.cfg.WorkerSilentTimeoutMinutes)
-							if err := worker.Stop(o.cfg, slotName, sess); err != nil {
-								log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
-							}
-
-							// Count previous silent-timeout kills before updating this session,
-							// so the current kill is not included in the count.
-							prevSilentKills := countSilentTimeoutKillsForIssue(s, sess.IssueNumber)
-
-							sess.Status = state.StatusDead
-							sess.LastNotifiedStatus = "silent_timeout"
-							sess.FinishedAt = &now
-
-							if prevSilentKills > 0 {
-								if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
-									log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
-								}
-							}
-
-							o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d) killed — no output for %d minutes",
-								slotName, sess.IssueNumber, o.cfg.WorkerSilentTimeoutMinutes)
-							continue
+					// --- Token limit enforcement ---
+					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsed > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
+						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
+							slotName, sess.TokensUsed, o.cfg.WorkerMaxTokens)
+						if err := worker.Stop(o.cfg, slotName, sess); err != nil {
+							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
 						}
+						now := time.Now().UTC()
+						sess.Status = state.StatusDead
+						sess.LastNotifiedStatus = "token_limit"
+						sess.FinishedAt = &now
+						o.notifier.Sendf("⚠️ Worker %s (issue #%d) exceeded token limit: %s tokens used",
+							slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsed))
+						continue
+					}
+
+					// --- Silent worker detection ---
+					if o.cfg.WorkerSilentTimeoutMinutes > 0 {
+						hash := hashOutput(output)
+						now := time.Now().UTC()
+
+						if sess.LastOutputHash == "" || sess.LastOutputChangedAt.IsZero() || hash != sess.LastOutputHash {
+							sess.LastOutputHash = hash
+							sess.LastOutputChangedAt = now
+						} else {
+							timeout := time.Duration(o.cfg.WorkerSilentTimeoutMinutes) * time.Minute
+							if time.Since(sess.LastOutputChangedAt) > timeout {
+								log.Printf("[orch] worker %s silent for >%dm, killing", slotName, o.cfg.WorkerSilentTimeoutMinutes)
+								if err := worker.Stop(o.cfg, slotName, sess); err != nil {
+									log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
+								}
+
+								// Count previous silent-timeout kills before updating this session,
+								// so the current kill is not included in the count.
+								prevSilentKills := countSilentTimeoutKillsForIssue(s, sess.IssueNumber)
+
+								sess.Status = state.StatusDead
+								sess.LastNotifiedStatus = "silent_timeout"
+								sess.FinishedAt = &now
+
+								if prevSilentKills > 0 {
+									if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+										log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+									}
+								}
+
+								o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d) killed — no output for %d minutes",
+									slotName, sess.IssueNumber, o.cfg.WorkerSilentTimeoutMinutes)
+								continue
+							}
+						}
+					}
+				}
+			} else {
+				// Neither silent-timeout nor token-limit is configured, but we still
+				// want to track tokens when possible. Capture pane output cheaply.
+				tmuxName := sess.TmuxSession
+				if tmuxName == "" {
+					tmuxName = worker.TmuxSessionName(slotName)
+				}
+				if output, err := tmuxCapture(tmuxName); err == nil {
+					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsed {
+						sess.TokensUsed = tokens
 					}
 				}
 			}
