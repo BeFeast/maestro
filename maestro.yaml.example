@@ -27,6 +27,10 @@ exclude_labels:
 # Worker prompt template (Markdown file with instructions for AI workers)
 worker_prompt: /path/to/worker-prompt-template.md
 
+# Merge behavior
+merge_strategy: sequential      # "sequential" (default) or "parallel"
+merge_interval_seconds: 30      # minimum seconds between merges in sequential mode
+
 # Optional: command to run after successful merge (build + deploy)
 # deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
 

@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
@@ -275,5 +276,33 @@ func TestRunDeployCmd_CapturesOutput(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "hello-deploy") {
 		t.Errorf("error = %q, want it to contain command output 'hello-deploy'", err.Error())
+	}
+}
+
+func TestMergeStrategy_DefaultSequential(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Repo: "owner/repo"}}
+	if got := o.mergeStrategy(); got != "sequential" {
+		t.Fatalf("mergeStrategy() = %q, want %q", got, "sequential")
+	}
+}
+
+func TestMergeStrategy_Parallel(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}}
+	if got := o.mergeStrategy(); got != "parallel" {
+		t.Fatalf("mergeStrategy() = %q, want %q", got, "parallel")
+	}
+}
+
+func TestMergeInterval_Default30s(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Repo: "owner/repo"}}
+	if got := o.mergeInterval(); got != 30*time.Second {
+		t.Fatalf("mergeInterval() = %s, want %s", got, 30*time.Second)
+	}
+}
+
+func TestMergeInterval_Explicit(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Repo: "owner/repo", MergeIntervalSeconds: 45}}
+	if got := o.mergeInterval(); got != 45*time.Second {
+		t.Fatalf("mergeInterval() = %s, want %s", got, 45*time.Second)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -428,6 +429,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		branchToPR[pr.HeadRefName] = pr
 	}
 
+	type mergeCandidate struct {
+		slotName string
+		sess     *state.Session
+		pr       github.PR
+	}
+
+	ready := make([]mergeCandidate, 0)
+
 	for slotName, sess := range s.Sessions {
 		if sess.Status != state.StatusPROpen {
 			continue
@@ -478,45 +487,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue
 			}
 
-			log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
-			if err := o.gh.MergePR(pr.Number); err != nil {
-				log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
-				// Only notify merge failure once per PR
-				if sess.LastNotifiedStatus != "merge_failed" {
-					o.notifier.Sendf("❌ maestro: failed to merge PR #%d (%s): %v", pr.Number, sess.Branch, err)
-					sess.LastNotifiedStatus = "merge_failed"
-				}
-			} else {
-				log.Printf("[orch] merged PR #%d ✓", pr.Number)
-				if err := o.gh.CloseIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
-					log.Printf("[orch] warning: failed to close issue #%d: %v", sess.IssueNumber, err)
-				}
-				sess.Status = state.StatusDone
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				worker.Stop(o.cfg, slotName, sess)
-				o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s)", pr.Number, sess.IssueNumber, sess.IssueTitle)
-
-				// Auto version bump
-				if o.cfg.Versioning.Enabled {
-					if err := versioning.Run(o.cfg, o.gh, pr.Number); err != nil {
-						log.Printf("[orch] version bump for PR #%d: %v", pr.Number, err)
-						o.notifier.Sendf("⚠️ maestro: version bump failed for PR #%d: %v", pr.Number, err)
-					} else {
-						o.notifier.Sendf("🏷️ maestro: version bumped after PR #%d merge", pr.Number)
-					}
-				}
-
-				// Deploy hook
-				if o.cfg.DeployCmd != "" {
-					if err := o.runDeployCmd(pr.Number); err != nil {
-						log.Printf("[orch] deploy command failed for PR #%d: %v", pr.Number, err)
-						o.notifier.Sendf("⚠️ maestro: deploy failed after PR #%d merge: %v", pr.Number, err)
-					} else {
-						o.notifier.Sendf("🚀 maestro: deploy succeeded after PR #%d merge", pr.Number)
-					}
-				}
-			}
+			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 		case "failure":
 			// Only notify CI failure once — dedup via LastNotifiedStatus
 			if sess.LastNotifiedStatus != "ci_failure" {
@@ -526,6 +497,103 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 		}
 	}
+
+	if len(ready) == 0 {
+		return
+	}
+
+	sort.Slice(ready, func(i, j int) bool {
+		return ready[i].pr.Number < ready[j].pr.Number
+	})
+
+	strategy := o.mergeStrategy()
+	if strategy == "parallel" {
+		for _, candidate := range ready {
+			if o.mergeReadyPR(candidate.slotName, candidate.sess, candidate.pr) {
+				s.LastMergeAt = time.Now().UTC()
+			}
+		}
+		return
+	}
+
+	interval := o.mergeInterval()
+	if !s.LastMergeAt.IsZero() {
+		sinceLastMerge := time.Since(s.LastMergeAt)
+		if sinceLastMerge < interval {
+			log.Printf("[orch] sequential merge mode: waiting for merge interval (%s remaining), skipping %d ready PR(s)", (interval - sinceLastMerge).Round(time.Second), len(ready))
+			return
+		}
+	}
+
+	candidate := ready[0]
+	merged := o.mergeReadyPR(candidate.slotName, candidate.sess, candidate.pr)
+	if merged {
+		s.LastMergeAt = time.Now().UTC()
+	}
+	if len(ready) > 1 {
+		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
+	}
+}
+
+func (o *Orchestrator) mergeStrategy() string {
+	strategy := strings.ToLower(strings.TrimSpace(o.cfg.MergeStrategy))
+	if strategy == "parallel" {
+		return "parallel"
+	}
+	return "sequential"
+}
+
+func (o *Orchestrator) mergeInterval() time.Duration {
+	seconds := o.cfg.MergeIntervalSeconds
+	if seconds <= 0 {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr github.PR) bool {
+	log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
+	if err := o.gh.MergePR(pr.Number); err != nil {
+		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
+		// Only notify merge failure once per PR
+		if sess.LastNotifiedStatus != "merge_failed" {
+			o.notifier.Sendf("❌ maestro: failed to merge PR #%d (%s): %v", pr.Number, sess.Branch, err)
+			sess.LastNotifiedStatus = "merge_failed"
+		}
+		return false
+	}
+
+	log.Printf("[orch] merged PR #%d ✓", pr.Number)
+	if err := o.gh.CloseIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
+		log.Printf("[orch] warning: failed to close issue #%d: %v", sess.IssueNumber, err)
+	}
+	sess.Status = state.StatusDone
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+	worker.Stop(o.cfg, slotName, sess)
+	o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s)", pr.Number, sess.IssueNumber, sess.IssueTitle)
+
+	// Auto version bump
+	if o.cfg.Versioning.Enabled {
+		if err := versioning.Run(o.cfg, o.gh, pr.Number); err != nil {
+			log.Printf("[orch] version bump for PR #%d: %v", pr.Number, err)
+			o.notifier.Sendf("⚠️ maestro: version bump failed for PR #%d: %v", pr.Number, err)
+		} else {
+			o.notifier.Sendf("🏷️ maestro: version bumped after PR #%d merge", pr.Number)
+		}
+	}
+
+	// Deploy hook
+	if o.cfg.DeployCmd != "" {
+		if err := o.runDeployCmd(pr.Number); err != nil {
+			log.Printf("[orch] deploy command failed for PR #%d: %v", pr.Number, err)
+			o.notifier.Sendf("⚠️ maestro: deploy failed after PR #%d merge: %v", pr.Number, err)
+		} else {
+			o.notifier.Sendf("🚀 maestro: deploy succeeded after PR #%d merge", pr.Number)
+		}
+	}
+
+	return true
 }
 
 // runDeployCmd executes the configured deploy command with a 5-minute timeout.

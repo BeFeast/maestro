@@ -48,25 +48,27 @@ type RoutingConfig struct {
 }
 
 type Config struct {
-	Repo              string           `yaml:"repo"`
-	LocalPath         string           `yaml:"local_path"`
-	WorktreeBase      string           `yaml:"worktree_base"`
-	MaxParallel       int              `yaml:"max_parallel"`
-	MaxRuntimeMinutes int              `yaml:"max_runtime_minutes"` // max worker runtime in minutes (default: 120)
-	ClaudeCmd         string           `yaml:"claude_cmd"`          // deprecated: use model.backends.claude.cmd
-	IssueLabel        string           `yaml:"issue_label"`         // deprecated: use issue_labels
-	IssueLabels       []string         `yaml:"issue_labels"`
-	ExcludeLabels     []string         `yaml:"exclude_labels"`
-	WorkerPrompt      string           `yaml:"worker_prompt"`
-	BugPrompt         string           `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
-	EnhancementPrompt string           `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
-	SessionPrefix     string           `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
-	StateDir          string           `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
-	Model             ModelConfig      `yaml:"model"`
-	Routing           RoutingConfig    `yaml:"routing"`
-	DeployCmd         string           `yaml:"deploy_cmd"` // shell command to run after successful PR merge
-	Telegram          TelegramConfig   `yaml:"telegram"`
-	Versioning        VersioningConfig `yaml:"versioning"`
+	Repo                 string           `yaml:"repo"`
+	LocalPath            string           `yaml:"local_path"`
+	WorktreeBase         string           `yaml:"worktree_base"`
+	MaxParallel          int              `yaml:"max_parallel"`
+	MaxRuntimeMinutes    int              `yaml:"max_runtime_minutes"` // max worker runtime in minutes (default: 120)
+	ClaudeCmd            string           `yaml:"claude_cmd"`          // deprecated: use model.backends.claude.cmd
+	IssueLabel           string           `yaml:"issue_label"`         // deprecated: use issue_labels
+	IssueLabels          []string         `yaml:"issue_labels"`
+	ExcludeLabels        []string         `yaml:"exclude_labels"`
+	WorkerPrompt         string           `yaml:"worker_prompt"`
+	BugPrompt            string           `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
+	EnhancementPrompt    string           `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
+	SessionPrefix        string           `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
+	StateDir             string           `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
+	Model                ModelConfig      `yaml:"model"`
+	Routing              RoutingConfig    `yaml:"routing"`
+	DeployCmd            string           `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
+	MergeStrategy        string           `yaml:"merge_strategy"`         // "sequential" | "parallel"
+	MergeIntervalSeconds int              `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
+	Telegram             TelegramConfig   `yaml:"telegram"`
+	Versioning           VersioningConfig `yaml:"versioning"`
 }
 
 // LoadFrom loads config from a specific path.
@@ -103,9 +105,11 @@ func Load() (*Config, error) {
 func parse(data []byte) (*Config, error) {
 
 	cfg := &Config{
-		MaxParallel:       5,
-		MaxRuntimeMinutes: 120,
-		ClaudeCmd:         "claude",
+		MaxParallel:          5,
+		MaxRuntimeMinutes:    120,
+		ClaudeCmd:            "claude",
+		MergeStrategy:        "sequential",
+		MergeIntervalSeconds: 30,
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -196,6 +200,19 @@ func parse(data []byte) (*Config, error) {
 	}
 	if cfg.Versioning.TagPrefix == "" {
 		cfg.Versioning.TagPrefix = "v"
+	}
+
+	// Merge defaults
+	switch strings.ToLower(strings.TrimSpace(cfg.MergeStrategy)) {
+	case "", "sequential":
+		cfg.MergeStrategy = "sequential"
+	case "parallel":
+		cfg.MergeStrategy = "parallel"
+	default:
+		cfg.MergeStrategy = "sequential"
+	}
+	if cfg.MergeIntervalSeconds <= 0 {
+		cfg.MergeIntervalSeconds = 30
 	}
 
 	return cfg, nil

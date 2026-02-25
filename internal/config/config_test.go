@@ -564,3 +564,53 @@ deploy_cmd: "go build ./cmd/app/ && systemctl --user restart app"
 		t.Errorf("DeployCmd = %q, want %q", cfg.DeployCmd, want)
 	}
 }
+
+func TestParse_MergeDefaults(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MergeStrategy != "sequential" {
+		t.Errorf("MergeStrategy = %q, want %q", cfg.MergeStrategy, "sequential")
+	}
+	if cfg.MergeIntervalSeconds != 30 {
+		t.Errorf("MergeIntervalSeconds = %d, want 30", cfg.MergeIntervalSeconds)
+	}
+}
+
+func TestParse_MergeConfigExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+merge_strategy: parallel
+merge_interval_seconds: 45
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MergeStrategy != "parallel" {
+		t.Errorf("MergeStrategy = %q, want %q", cfg.MergeStrategy, "parallel")
+	}
+	if cfg.MergeIntervalSeconds != 45 {
+		t.Errorf("MergeIntervalSeconds = %d, want 45", cfg.MergeIntervalSeconds)
+	}
+}
+
+func TestParse_MergeConfigInvalidFallsBack(t *testing.T) {
+	yaml := `
+repo: owner/repo
+merge_strategy: weird
+merge_interval_seconds: 0
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MergeStrategy != "sequential" {
+		t.Errorf("MergeStrategy = %q, want %q", cfg.MergeStrategy, "sequential")
+	}
+	if cfg.MergeIntervalSeconds != 30 {
+		t.Errorf("MergeIntervalSeconds = %d, want 30", cfg.MergeIntervalSeconds)
+	}
+}
