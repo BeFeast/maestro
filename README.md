@@ -20,8 +20,9 @@ maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini),
 ## Prerequisites
 
 ### Required
-- `gh` (GitHub CLI) — [cli.github.com](https://cli.github.com)
-- `git` — pre-installed on most systems
+- **`git`** — pre-installed on most systems
+- **`gh`** (GitHub CLI) — [cli.github.com](https://cli.github.com)
+- **`tmux`** — required for worker session management
 - **One of the following AI CLIs:**
 
 | CLI | Provider | Install |
@@ -32,10 +33,21 @@ maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini),
 
 You only need one — whichever you have access to.
 
+### Verify prerequisites
+```bash
+git --version        # any recent version
+gh --version         # 2.x+
+tmux -V              # any recent version
+claude --version     # or: codex --version / gemini --version
+```
+
 ### Setup
 ```bash
 # Authenticate GitHub CLI
 gh auth login
+
+# Verify access to your target repo
+gh auth status
 
 # Authenticate your chosen AI CLI (example for Claude):
 claude auth   # or codex auth / gemini auth
@@ -72,15 +84,24 @@ Get maestro running in under 5 minutes:
 # 1. Install maestro
 curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/install.sh | sh
 
-# 2. Clone your repo and cd into it
-git clone https://github.com/yourorg/yourrepo
-cd yourrepo
+# 2. Clone your target repo (if not already)
+gh repo clone owner/myrepo ~/src/myrepo
 
 # 3. Run the interactive setup wizard
+cd ~/src/myrepo
 maestro init
 ```
 
-The wizard will ask for your repo name, local paths, max parallel workers, and preferred AI backend. It generates a `maestro.yaml` in the current directory.
+The `maestro init` wizard will ask you for:
+- **GitHub repo** (owner/repo format)
+- **Local clone path** (where the repo lives on disk)
+- **Worktree base dir** (where worker worktrees are created)
+- **Max parallel workers** (how many agents run simultaneously)
+- **Default model backend** (claude, codex, or gemini)
+- **Issue label filter** (which issues to pick up, e.g. `enhancement`)
+- **Telegram notifications** (optional)
+
+It generates a `maestro.yaml` config file and a systemd/launchd service file.
 
 ```bash
 # 4. Do a test run (picks one issue, runs once, then exits)
@@ -94,6 +115,16 @@ maestro run
 ```
 
 That's it. Maestro will now pick up issues matching your configured label, spawn AI agents in isolated worktrees, and auto-merge PRs when CI passes.
+
+To manually spawn a worker for a specific issue:
+```bash
+maestro spawn --issue 42
+```
+
+To watch workers live in a tmux dashboard:
+```bash
+maestro watch
+```
 
 ## Configuration
 
@@ -330,6 +361,8 @@ systemctl --user status maestro.service
 journalctl --user -u maestro.service -f
 ```
 
+> **Note:** User services require `loginctl enable-linger $USER` to keep running when you're not logged in.
+
 #### Single project (macOS — launchd)
 
 `maestro init` creates a launchd plist at `~/Library/LaunchAgents/com.maestro.agent.plist`:
@@ -380,8 +413,8 @@ maestro logs <slot>    # e.g. maestro logs pan-1
 
 Common causes:
 - AI CLI not authenticated — run `claude auth` (or `codex auth` / `gemini auth`)
-- AI CLI not found in PATH — verify with `which claude` (or `which codex` / `which gemini`)
-- The repo has no open issues matching the configured `issue_label`
+- AI CLI not found in PATH — verify with `which claude`, or use an absolute path in config: `cmd: /usr/local/bin/claude`
+- Git worktree creation failed (ensure the local repo clone is clean)
 
 ### `maestro run` exits with "load config" error
 
@@ -396,21 +429,42 @@ Run `maestro init` in your repo directory to create a config, or pass an explici
 maestro run --config ~/.maestro/maestro-myapp.yaml
 ```
 
+### `maestro run` picks no issues
+
+- Verify your `issue_labels` config (or deprecated `issue_label`) matches existing issue labels on GitHub
+- Check that issues aren't already assigned or have `exclude_labels`
+- Run `gh issue list --label enhancement` to confirm matching issues exist
+
+### tmux errors
+
+maestro requires tmux to manage worker sessions. Install it:
+
+```bash
+# Ubuntu/Debian
+sudo apt install tmux
+
+# macOS
+brew install tmux
+```
+
 ### Worktree conflicts or stale worktrees
 
 If a worker died and left a stale worktree:
 
 ```bash
 maestro stop --session <slot>   # cleans up worktree + state
-# or manually:
-git worktree remove /path/to/worktree --force
+# or force-kill:
+maestro kill <slot>
+
+# Manual cleanup if needed:
+git -C /path/to/repo worktree remove /path/to/worktree --force
 ```
 
 ### systemd service won't start
 
 ```bash
 # Check logs
-journalctl --user -u maestro@myapp -f
+journalctl --user -u maestro.service -f
 
 # Verify the binary is at /usr/local/bin/maestro
 which maestro
@@ -420,7 +474,10 @@ ls ~/.maestro/maestro-myapp.yaml
 
 # Reload after editing the unit file
 systemctl --user daemon-reload
-systemctl --user restart maestro@myapp
+systemctl --user restart maestro.service
+
+# Ensure linger is enabled (required for services when not logged in)
+loginctl enable-linger $USER
 ```
 
 ### Workers stuck for hours
