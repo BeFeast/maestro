@@ -124,7 +124,7 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 	}
 }
 
-func TestReconcileRunningSessions_DeadPIDGetsQueued(t *testing.T) {
+func TestReconcileRunningSessions_DeadPIDGetsMarkedDead(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["pan-1"] = &state.Session{
 		IssueNumber:        71,
@@ -141,11 +141,14 @@ func TestReconcileRunningSessions_DeadPIDGetsQueued(t *testing.T) {
 		tmuxSessionExistsFn: func(name string) bool { return true },
 	}
 
-	o.reconcileRunningSessions(s)
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
 
 	sess := s.Sessions["pan-1"]
-	if sess.Status != state.StatusQueued {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusQueued)
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
 	}
 	if sess.PID != 0 {
 		t.Fatalf("pid = %d, want 0", sess.PID)
@@ -153,12 +156,15 @@ func TestReconcileRunningSessions_DeadPIDGetsQueued(t *testing.T) {
 	if sess.TmuxSession != "" {
 		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
 	}
-	if sess.RetryCount != 3 {
-		t.Fatalf("retry_count = %d, want 3", sess.RetryCount)
+	if sess.RetryCount != 2 {
+		t.Fatalf("retry_count = %d, want 2", sess.RetryCount)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("finished_at should be set when session is marked dead")
 	}
 }
 
-func TestReconcileRunningSessions_MissingTmuxGetsQueued(t *testing.T) {
+func TestReconcileRunningSessions_MissingTmuxGetsMarkedDead(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["pan-2"] = &state.Session{
 		IssueNumber: 71,
@@ -172,11 +178,14 @@ func TestReconcileRunningSessions_MissingTmuxGetsQueued(t *testing.T) {
 		tmuxSessionExistsFn: func(name string) bool { return false },
 	}
 
-	o.reconcileRunningSessions(s)
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
 
 	sess := s.Sessions["pan-2"]
-	if sess.Status != state.StatusQueued {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusQueued)
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
 	}
 	if sess.PID != 0 {
 		t.Fatalf("pid = %d, want 0", sess.PID)
@@ -184,8 +193,38 @@ func TestReconcileRunningSessions_MissingTmuxGetsQueued(t *testing.T) {
 	if sess.TmuxSession != "" {
 		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
 	}
-	if sess.RetryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", sess.RetryCount)
+	if sess.RetryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0", sess.RetryCount)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("finished_at should be set when session is marked dead")
+	}
+}
+
+func TestReconcileRunningSessions_UsesDefaultTmuxNameWhenMissingInState(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["pan-3"] = &state.Session{
+		IssueNumber: 73,
+		Status:      state.StatusRunning,
+		PID:         6262,
+		// TmuxSession intentionally empty; should fall back to worker.TmuxSessionName(slot)
+	}
+
+	calledWith := ""
+	o := &Orchestrator{
+		pidAliveFn: func(pid int) bool { return true },
+		tmuxSessionExistsFn: func(name string) bool {
+			calledWith = name
+			return true
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if changed {
+		t.Fatal("expected no reconciliation changes when pid and tmux are healthy")
+	}
+	if calledWith != "maestro-pan-3" {
+		t.Fatalf("tmux session checked = %q, want %q", calledWith, "maestro-pan-3")
 	}
 }
 

@@ -496,12 +496,26 @@ func logsCmd(args []string) {
 // It tails the worker's log file with spinner/dot filtering via _watch-tail,
 // then shows an exit prompt when the worker finishes.
 func watchPaneCmd(selfBin string, name string, sess *state.Session) string {
-	tmuxName := worker.TmuxSessionName(name)
+	tmuxName := watchSessionName(name, sess)
 	return fmt.Sprintf(
 		`%s _watch-tail %q %q; `+
 			`echo; echo '=== Worker session ended ==='; `+
 			`echo; echo 'Press any key to exit...'; read -n1`,
 		selfBin, sess.LogFile, tmuxName)
+}
+
+func watchSessionName(slotName string, sess *state.Session) string {
+	if sess != nil && strings.TrimSpace(sess.TmuxSession) != "" {
+		return sess.TmuxSession
+	}
+	return worker.TmuxSessionName(slotName)
+}
+
+func tmuxSessionAlive(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
 }
 
 func watchCmd(args []string) {
@@ -512,7 +526,7 @@ func watchCmd(args []string) {
 
 	cfgs := loadConfigs(configs)
 
-	// Collect active running sessions across all projects
+	// Collect workers that still have an active tmux session across all projects.
 	type activeWorker struct {
 		name     string
 		sess     *state.Session
@@ -526,7 +540,8 @@ func watchCmd(args []string) {
 			continue
 		}
 		for name, sess := range s.Sessions {
-			if sess.Status == state.StatusRunning && worker.IsAlive(sess.PID) {
+			tmuxName := watchSessionName(name, sess)
+			if tmuxSessionAlive(tmuxName) {
 				workers = append(workers, activeWorker{name, sess, cfg.StateDir})
 			}
 		}

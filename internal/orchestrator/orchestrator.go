@@ -163,7 +163,15 @@ func (o *Orchestrator) RunOnce() error {
 	log.Printf("[orch] === cycle start — %d sessions in state ===", len(s.Sessions))
 
 	// Step 1: Reconcile stale running sessions before scheduling/slot calculation.
-	o.reconcileRunningSessions(s)
+	reconciled := o.reconcileRunningSessions(s)
+
+	// Persist immediately when reconciliation changes state, so slot calculation
+	// always sees healed state on disk.
+	if reconciled {
+		if err := state.Save(o.cfg.StateDir, s); err != nil {
+			return fmt.Errorf("save state after reconcile: %w", err)
+		}
+	}
 
 	// Step 2: Check running sessions for dead processes / stale / closed issues
 	o.checkSessions(s)
@@ -225,12 +233,18 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 }
 
 // reconcileRunningSessions self-heals stale "running" sessions.
-// If a session is marked running but its PID is dead (or missing), or its tmux session
-// is missing (when tracked in state), the session is re-queued so scheduler can restart work.
-func (o *Orchestrator) reconcileRunningSessions(s *state.State) {
+// If a session is marked running but either its PID is dead/missing OR its tmux session
+// is missing, the session is marked dead and its PID/tmux fields are cleared.
+func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
+	reconciled := false
 	for slotName, sess := range s.Sessions {
 		if sess.Status != state.StatusRunning {
 			continue
+		}
+
+		tmuxName := sess.TmuxSession
+		if tmuxName == "" {
+			tmuxName = worker.TmuxSessionName(slotName)
 		}
 
 		var reasons []string
@@ -240,8 +254,8 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) {
 			reasons = append(reasons, fmt.Sprintf("pid %d dead", sess.PID))
 		}
 
-		if sess.TmuxSession != "" && !o.tmuxSessionExists(sess.TmuxSession) {
-			reasons = append(reasons, fmt.Sprintf("tmux session %q missing", sess.TmuxSession))
+		if !o.tmuxSessionExists(tmuxName) {
+			reasons = append(reasons, fmt.Sprintf("tmux session %q missing", tmuxName))
 		}
 
 		if len(reasons) == 0 {
@@ -249,15 +263,18 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) {
 		}
 
 		oldPID := sess.PID
-		oldTmux := sess.TmuxSession
-		sess.Status = state.StatusQueued
+		oldTmux := tmuxName
+		sess.Status = state.StatusDead
 		sess.PID = 0
 		sess.TmuxSession = ""
-		sess.RetryCount++
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		reconciled = true
 
-		log.Printf("[orch] reconcile: %s running->queued (%s); pid=%d tmux=%q retries=%d",
-			slotName, strings.Join(reasons, ", "), oldPID, oldTmux, sess.RetryCount)
+		log.Printf("[orch] reconcile: %s running->dead (%s); pid=%d tmux=%q",
+			slotName, strings.Join(reasons, ", "), oldPID, oldTmux)
 	}
+	return reconciled
 }
 
 // checkSessions inspects all sessions and updates their status
