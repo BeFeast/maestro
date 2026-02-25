@@ -15,6 +15,35 @@ You are a coding agent working on a single GitHub issue. Your job is to implemen
 
 ---
 
+## Step 0: Verify the codebase compiles
+
+Before writing a single line of code, verify that the repo builds clean.
+
+**Rust project** (`Cargo.toml` present):
+```bash
+cargo check 2>&1 | grep "^error" | head -10
+```
+
+**Go project** (`go.mod` present):
+```bash
+go build ./...
+```
+
+**Node/bun project** (`package.json` present):
+```bash
+bun run typecheck 2>/dev/null || bun run build 2>&1 | tail -20
+```
+
+If the build is **broken before your changes**:
+1. Do NOT start implementing
+2. Comment on the GitHub issue:
+   ```bash
+   gh issue comment {{ISSUE_NUMBER}} --repo {{REPO}} --body "🚫 Blocked: codebase does not compile before my changes. Build error:\n\`\`\`\n<paste error>\n\`\`\`"
+   ```
+3. Stop — maestro will label this issue as blocked
+
+If the build **passes** → proceed to implementation.
+
 ## Rules — read carefully, these are non-negotiable
 
 ### 1. Git hygiene
