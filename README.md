@@ -6,11 +6,11 @@ Replaces the previous `ao` (agent-orchestrator npm package) + shell scripts setu
 
 ## What it does
 
-maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini), each working on a separate GitHub issue in its own git worktree. It:
+maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini, Cline), each working on a separate GitHub issue in its own git worktree. It:
 
 - Picks open GitHub issues matching a label (e.g. `enhancement`)
 - Creates git worktrees for each agent
-- Spawns `claude --dangerously-skip-permissions` in each worktree with a task prompt
+- Spawns the configured backend CLI (e.g. `claude`, `codex`, `gemini`, or `cline`) in each worktree with a task prompt
 - Monitors agent progress (process alive? PR created? CI green?)
 - Auto-merges PRs when CI passes
 - Rebases PRs that have merge conflicts
@@ -30,6 +30,7 @@ maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini),
 | `claude` | Anthropic Claude Code | [claude.ai/code](https://claude.ai/code) |
 | `codex` | OpenAI Codex | `bun add -g @openai/codex` |
 | `gemini` | Google Gemini | `npm i -g @google/gemini-cli` |
+| `cline` | Cline (OpenAI-compatible providers) | `bun add -g cline` |
 
 You only need one — whichever you have access to.
 
@@ -38,7 +39,7 @@ You only need one — whichever you have access to.
 git --version        # any recent version
 gh --version         # 2.x+
 tmux -V              # any recent version
-claude --version     # or: codex --version / gemini --version
+claude --version     # or: codex --version / gemini --version / cline --version
 ```
 
 ### Setup
@@ -49,8 +50,9 @@ gh auth login
 # Verify access to your target repo
 gh auth status
 
-# Authenticate your chosen AI CLI (example for Claude):
+# Authenticate/configure your chosen AI CLI (example for Claude):
 claude auth   # or codex auth / gemini auth
+# For Cline: configure provider + model in ~/.cline/data/globalState.json and secrets.json
 ```
 
 ### Private repositories
@@ -64,6 +66,13 @@ Maestro works with private repos — all GitHub operations go through `gh` CLI. 
 curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/install.sh | sh
 ```
 
+`install.sh` downloads the latest release tarball for your OS/arch (`maestro-<os>-<arch>.tar.gz`), extracts the binary, and installs it to `/usr/local/bin/maestro` (uses `sudo` only if needed).
+
+To install somewhere else:
+
+```bash
+INSTALL_DIR="$HOME/.local/bin" curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/install.sh | sh
+```
 
 ### Build from source
 
@@ -97,7 +106,7 @@ The `maestro init` wizard will ask you for:
 - **Local clone path** (where the repo lives on disk)
 - **Worktree base dir** (where worker worktrees are created)
 - **Max parallel workers** (how many agents run simultaneously)
-- **Default model backend** (claude, codex, or gemini)
+- **Default model backend** (claude, codex, gemini, or cline)
 - **Issue label filter** (which issues to pick up, e.g. `enhancement`)
 - **Telegram notifications** (optional)
 
@@ -135,25 +144,24 @@ repo: BeFeast/panoptikon
 local_path: /home/shtrudel/src/panoptikon
 worktree_base: /home/shtrudel/.worktrees/panoptikon
 max_parallel: 5
-max_runtime_minutes: 120          # hard timeout for worker runtime (default: 120)
-worker_silent_timeout_minutes: 30 # kill worker if tmux output is unchanged for N minutes (0 = disabled)
-auto_rebase: true                 # auto-rebase conflicting PR branches (default: true)
-auto_resolve_files:               # files to auto-resolve by keeping both sides (configurable)
-  - server/src/api/mod.rs
-  - web/src/lib/api.ts
-  - web/src/lib/types.ts
-session_prefix: pan               # worker session name prefix (default: first 3 chars of repo name)
-state_dir: ~/.maestro/pan         # state/log directory (default: ~/.maestro/<repo-hash>)
-claude_cmd: claude                # the claude CLI binary
-issue_label: enhancement          # label to filter issues
-merge_strategy: sequential        # "sequential" (default) or "parallel"
-merge_interval_seconds: 30        # min delay between merges in sequential mode
+max_runtime_minutes: 120           # hard timeout per worker (default: 120)
+worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N minutes (0 = disabled)
+auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
+merge_strategy: sequential         # "sequential" (default) or "parallel"
+merge_interval_seconds: 30         # minimum seconds between merges in sequential mode
+session_prefix: pan                # worker session name prefix (default: first 3 chars of repo name)
+state_dir: ~/.maestro/pan          # state/log directory (default: ~/.maestro/<repo-hash>)
+claude_cmd: claude                 # deprecated: use model.backends.claude.cmd
+issue_labels:                      # preferred label filter (OR semantics)
+  - enhancement
 exclude_labels:
   - blocked
 telegram:
-  target: "79510949"        # Telegram user ID
+  target: "79510949"              # Telegram user ID
   openclaw_url: "http://localhost:18789"  # OpenClaw gateway
 ```
+
+`issue_label` is still supported for backward compatibility, but `issue_labels` is recommended for new configs.
 
 ## AI Backends
 
@@ -210,7 +218,7 @@ issue #44 labels: enhancement               → runs with default (claude)
 
 Runs the orchestration loop. Every interval:
 1. Checks running sessions (kill dead, clean stale)
-2. Auto-merges PRs where CI is green (sequential by default, configurable)
+2. Auto-merges PRs where CI is green (sequential by default, configurable via `merge_strategy`)
 3. Rebases PRs with conflicts
 4. Picks new issues to work on (up to `max_parallel - active`)
 5. Starts new workers for picked issues
@@ -284,12 +292,11 @@ State is stored in `~/.maestro/<repo-hash>/state.json`:
 ```
 
 Session statuses:
-- `running` — Claude agent is working
-- `queued` — Rebased and queued for CI rerun
+- `running` — AI agent is working
 - `pr_open` — PR created, waiting for CI / review
 - `done` — PR merged and worktree cleaned up
 - `failed` — Something went wrong
-- `conflict_failed` — Unresolvable conflicts; manual intervention required
+- `conflict_failed` — Rebase failed, needs manual intervention
 - `dead` — Process died unexpectedly
 
 State writes are atomic (temp file + rename).
@@ -311,13 +318,21 @@ maestro sends Telegram notifications via the OpenClaw gateway API at `http://loc
 ## Worker Prompt
 
 The worker prompt is assembled from:
-1. A base prompt (from `orchestrator-prompt.md` or `--prompt`)
+1. A base prompt (from `worker_prompt` config or `--prompt`)
 2. Issue number, title, and body
 3. Worktree path and instructions for creating a PR
 
-The agent runs as:
+The exact command depends on the selected backend. Examples:
+
 ```bash
+# Claude
 cd /worktree/path && claude --dangerously-skip-permissions -p "<assembled prompt>"
+
+# Codex
+cd /worktree/path && codex exec --dangerously-bypass-approvals-and-sandbox -C /worktree/path - < /path/to/prompt.txt
+
+# Cline
+cd /worktree/path && cline -y "<assembled prompt>"
 ```
 
 ## Cron Mode
@@ -422,8 +437,8 @@ maestro logs <slot>    # e.g. maestro logs pan-1
 ```
 
 Common causes:
-- AI CLI not authenticated — run `claude auth` (or `codex auth` / `gemini auth`)
-- AI CLI not found in PATH — verify with `which claude`, or use an absolute path in config: `cmd: /usr/local/bin/claude`
+- AI CLI not authenticated/configured — run `claude auth` (or `codex auth` / `gemini auth`); for Cline, configure provider credentials in `~/.cline/data/globalState.json` + `secrets.json`
+- AI CLI not found in PATH — verify with `which claude` / `which codex` / `which gemini` / `which cline`, or use an absolute path in config: `cmd: /usr/local/bin/claude`
 - Git worktree creation failed (ensure the local repo clone is clean)
 
 ### `maestro run` exits with "load config" error
@@ -505,7 +520,7 @@ maestro spawn --issue <number>   # retry the issue
 - `gopkg.in/yaml.v3` (config parsing)
 - `gh` CLI (GitHub operations)
 - `git` (worktree management)
-- `claude` / `codex` / `gemini` CLI (agent invocation — at least one required)
+- `claude` / `codex` / `gemini` / `cline` CLI (agent invocation — at least one required)
 
 ## Acknowledgments
 
