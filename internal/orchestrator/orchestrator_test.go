@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,33 @@ func makeIssue(number int, title string, labels ...string) github.Issue {
 		}{Name: l})
 	}
 	return issue
+}
+
+func TestHashOutput_UsesLast50LinesOnly(t *testing.T) {
+	lines := make([]string, 0, 60)
+	for i := 1; i <= 60; i++ {
+		lines = append(lines, fmt.Sprintf("line-%d", i))
+	}
+	all := strings.Join(lines, "\n")
+	last50 := strings.Join(lines[10:], "\n")
+
+	got := hashOutput(all)
+	want := hashOutput(last50)
+	if got != want {
+		t.Fatalf("hashOutput() should only depend on last 50 lines; got %q want %q", got, want)
+	}
+}
+
+func TestCountSilentTimeoutKillsForIssue(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["pan-1"] = &state.Session{IssueNumber: 78, LastNotifiedStatus: "silent_timeout"}
+	s.Sessions["pan-2"] = &state.Session{IssueNumber: 78, LastNotifiedStatus: "silent_timeout"}
+	s.Sessions["pan-3"] = &state.Session{IssueNumber: 78, LastNotifiedStatus: "ci_failure"}
+	s.Sessions["pan-4"] = &state.Session{IssueNumber: 79, LastNotifiedStatus: "silent_timeout"}
+
+	if got := countSilentTimeoutKillsForIssue(s, 78); got != 2 {
+		t.Fatalf("countSilentTimeoutKillsForIssue(78)=%d, want 2", got)
+	}
 }
 
 func TestSelectPrompt_BugLabel(t *testing.T) {

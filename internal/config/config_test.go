@@ -344,6 +344,31 @@ max_runtime_minutes: 60
 	}
 }
 
+func TestParse_WorkerSilentTimeoutMinutesDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSilentTimeoutMinutes != 0 {
+		t.Errorf("WorkerSilentTimeoutMinutes = %d, want 0", cfg.WorkerSilentTimeoutMinutes)
+	}
+}
+
+func TestParse_WorkerSilentTimeoutMinutesExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_silent_timeout_minutes: 25
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSilentTimeoutMinutes != 25 {
+		t.Errorf("WorkerSilentTimeoutMinutes = %d, want 25", cfg.WorkerSilentTimeoutMinutes)
+	}
+}
+
 func TestParse_ModelConfigDefaults(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
