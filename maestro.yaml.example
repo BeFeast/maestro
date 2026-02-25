@@ -10,6 +10,7 @@ worktree_base: /path/to/worktrees/repo
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
 worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N min (0 = disabled)
+worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 merge_strategy: sequential         # "sequential" (default) or "parallel"
 merge_interval_seconds: 30         # minimum seconds between sequential merges (default: 30)
