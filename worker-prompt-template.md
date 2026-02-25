@@ -31,14 +31,14 @@ go build ./...
 
 **Node/bun project** (`package.json` present):
 ```bash
-bun run typecheck 2>&1 | tail -20; bun run build 2>&1 | tail -20
+bun run typecheck 2>/dev/null || bun run build 2>&1 | tail -20
 ```
 
 If the build is **broken before your changes**:
 1. Do NOT start implementing
 2. Comment on the GitHub issue:
    ```bash
-   gh issue comment {{ISSUE_NUMBER}} --repo {{REPO}} --body "🚫 Blocked: codebase does not compile before my changes. Build error:\n```\n<paste error>\n```"
+   gh issue comment {{ISSUE_NUMBER}} --repo {{REPO}} --body "🚫 Blocked: codebase does not compile before my changes. Build error:\n\`\`\`\n<paste error>\n\`\`\`"
    ```
 3. Stop — maestro will label this issue as blocked
 
