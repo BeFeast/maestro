@@ -34,10 +34,11 @@ main() {
         exit 1
     fi
 
-    BINARY="maestro-${OS}-${ARCH}"
+    BINARY="maestro-${OS}-${ARCH}.tar.gz"
     URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY}"
-    TMPFILE=$(mktemp)
-    trap 'rm -f "$TMPFILE"' EXIT
+    TMPDIR=$(mktemp -d)
+    TMPFILE="${TMPDIR}/maestro-${OS}-${ARCH}.tar.gz"
+    trap 'rm -rf "$TMPDIR"' EXIT
 
     echo "Downloading maestro ${LATEST} (${OS}/${ARCH})..."
     if ! curl -fsSL "$URL" -o "$TMPFILE"; then
@@ -45,13 +46,15 @@ main() {
         echo "Check available binaries at https://github.com/${REPO}/releases/latest" >&2
         exit 1
     fi
-    chmod +x "$TMPFILE"
+    tar xzf "$TMPFILE" -C "$TMPDIR"
+    BINARY_PATH="${TMPDIR}/maestro-${OS}-${ARCH}"
+    chmod +x "$BINARY_PATH"
 
     if [ -w "$INSTALL_DIR" ]; then
-        mv "$TMPFILE" "${INSTALL_DIR}/maestro"
+        mv "$BINARY_PATH" "${INSTALL_DIR}/maestro"
     else
         echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo mv "$TMPFILE" "${INSTALL_DIR}/maestro"
+        sudo mv "$BINARY_PATH" "${INSTALL_DIR}/maestro"
     fi
 
     echo "maestro ${LATEST} installed to ${INSTALL_DIR}/maestro"

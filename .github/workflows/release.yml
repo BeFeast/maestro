@@ -43,21 +43,27 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
+      - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           go build -trimpath \
-            -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -ldflags "-s -w -X main.version=${VERSION}" \
             -o maestro-${{ matrix.goos }}-${{ matrix.goarch }} \
             ./cmd/maestro/
 
-      - name: Upload binary
+      - name: Compress binary
+        run: |
+          tar czf maestro-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz \
+            maestro-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" maestro-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: gh release upload "${{ github.ref_name }}" maestro-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
 
   publish:
     name: Publish release
@@ -66,18 +72,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all binaries
+      - name: Download all assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p dist
           cd dist
-          gh release download "${{ github.ref_name }}" --pattern 'maestro-*'
+          gh release download "${{ github.ref_name }}" --pattern '*.tar.gz'
 
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum maestro-* > checksums.txt
+          sha256sum *.tar.gz > checksums.txt
 
       - name: Upload checksums and publish
         env:
