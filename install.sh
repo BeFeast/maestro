@@ -34,7 +34,7 @@ main() {
         exit 1
     fi
 
-    BINARY="maestro-${OS}-${ARCH}"
+    BINARY="maestro-${OS}-${ARCH}.tar.gz"
     URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY}"
     TMPFILE=$(mktemp)
     trap 'rm -f "$TMPFILE"' EXIT
@@ -45,6 +45,8 @@ main() {
         echo "Check available binaries at https://github.com/${REPO}/releases/latest" >&2
         exit 1
     fi
+    tar xzf "$TMPFILE" -C "$(dirname "$TMPFILE")"
+    TMPFILE="$(dirname "$TMPFILE")/maestro-${OS}-${ARCH}"
     chmod +x "$TMPFILE"
 
     if [ -w "$INSTALL_DIR" ]; then
