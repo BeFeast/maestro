@@ -139,6 +139,8 @@ session_prefix: pan         # worker session name prefix (default: first 3 chars
 state_dir: ~/.maestro/pan   # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude          # the claude CLI binary
 issue_label: enhancement    # label to filter issues
+merge_strategy: sequential  # "sequential" (default) or "parallel"
+merge_interval_seconds: 30  # min delay between merges in sequential mode
 exclude_labels:
   - blocked
 telegram:
@@ -201,7 +203,7 @@ issue #44 labels: enhancement               → runs with default (claude)
 
 Runs the orchestration loop. Every interval:
 1. Checks running sessions (kill dead, clean stale)
-2. Auto-merges PRs where CI is green
+2. Auto-merges PRs where CI is green (sequential by default, configurable)
 3. Rebases PRs with conflicts
 4. Picks new issues to work on (up to `max_parallel - active`)
 5. Starts new workers for picked issues

@@ -41,8 +41,9 @@ type Session struct {
 }
 
 type State struct {
-	Sessions map[string]*Session `json:"sessions"`
-	NextSlot int                 `json:"next_slot"`
+	Sessions    map[string]*Session `json:"sessions"`
+	NextSlot    int                 `json:"next_slot"`
+	LastMergeAt time.Time           `json:"last_merge_at,omitempty"`
 }
 
 func NewState() *State {
