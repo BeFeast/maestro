@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -184,6 +185,55 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 	return result.Mergeable, nil
 }
 
+// PRGreptileApproved checks PR comments for Greptile review status.
+// Returns:
+//   - approved=true when Greptile marked it safe to merge (or confidence 4/5, 5/5)
+//   - pending=true when no Greptile comment exists yet
+//   - approved=false,pending=false when Greptile commented but did not approve
+func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, err error) {
+	out, err := exec.Command("gh", "pr", "view",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo,
+		"--comments",
+		"--json", "comments").Output()
+	if err != nil {
+		return false, false, fmt.Errorf("gh pr view %d comments: %w", prNumber, err)
+	}
+
+	var result struct {
+		Comments []struct {
+			Body string `json:"body"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return false, false, fmt.Errorf("parse pr %d comments: %w", prNumber, err)
+	}
+
+	foundGreptile := false
+	for _, comment := range result.Comments {
+		bodyLower := strings.ToLower(comment.Body)
+		if !strings.Contains(bodyLower, "greptile") {
+			continue
+		}
+
+		foundGreptile = true
+
+		if strings.Contains(bodyLower, "safe to merge") {
+			return true, false, nil
+		}
+
+		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
+			return true, false, nil
+		}
+	}
+
+	if !foundGreptile {
+		return false, true, nil
+	}
+
+	return false, false, nil
+}
+
 // MergePR squash-merges a PR
 func (c *Client) MergePR(prNumber int) error {
 	out, err := exec.Command("gh", "pr", "merge",
@@ -213,6 +263,19 @@ func (c *Client) CloseIssue(number int, comment string) error {
 		"--repo", c.Repo).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("gh issue close %d: %w\n%s", number, err, out)
+	}
+	return nil
+}
+
+// AddIssueLabel adds a label to an issue.
+func (c *Client) AddIssueLabel(issueNumber int, label string) error {
+	out, err := exec.Command("gh", "issue", "edit",
+		strconv.Itoa(issueNumber),
+		"--repo", c.Repo,
+		"--add-label", label,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh issue edit --add-label: %w\n%s", err, out)
 	}
 	return nil
 }

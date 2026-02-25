@@ -107,4 +107,13 @@ panoptikon/
 - GitHub CLI: `gh` is configured and authenticated
 - SQLite: the database is at `/tmp/panoptikon-dev.db` for local testing
 
+### 8. Before opening PR — smoke test your changes
+After implementing, verify the feature actually works:
+- If you changed a Settings page: use curl to POST the new value, then GET settings and verify it was saved correctly
+- If you changed a default value in UI: grep the source to confirm the correct default is in the code
+- If you changed a redirect: verify the redirect target matches the PRD (MikroTik is primary, VyOS is legacy)
+- If you added an API endpoint: curl it against the running server at http://localhost:8080
+
+Document your smoke test result in the PR body under "## Smoke Test".
+
 Start implementing now. No need to ask for clarification — make reasonable decisions and document them.

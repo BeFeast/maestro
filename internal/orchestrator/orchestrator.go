@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -63,6 +64,39 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 		return false
 	}
 	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+}
+
+func readLastLines(path string, limit int) (string, error) {
+	if limit <= 0 {
+		return "", nil
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("empty log file path")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	lines := make([]string, 0, limit)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		if len(lines) > limit {
+			lines = lines[1:]
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	if len(lines) == 0 {
+		return "(log file is empty)", nil
+	}
+	return strings.Join(lines, "\n"), nil
 }
 
 // LoadPromptBase reads the worker prompt template from config or a provided path.
@@ -308,6 +342,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					// Already retried — mark as permanently failed
 					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
+					if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+					}
 					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
@@ -327,7 +364,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				continue
 			}
 
-			// Check if worker exceeded max runtime — kill if so
+			// Check if worker exceeded max runtime — hard fail (no retry) with diagnostics
 			maxMinutes := o.cfg.MaxRuntimeMinutes
 			if sess.LongRunning {
 				maxMinutes *= 2
@@ -335,13 +372,26 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			maxRuntime := time.Duration(maxMinutes) * time.Minute
 			age := time.Since(sess.StartedAt)
 			if age > maxRuntime {
-				log.Printf("[orch] worker %s exceeded max runtime (%dm), killing", slotName, maxMinutes)
-				worker.Stop(o.cfg, slotName, sess)
-				sess.Status = state.StatusDead
+				log.Printf("[orch] worker %s exceeded max runtime (%dm), killing and marking failed", slotName, maxMinutes)
+
+				logTail, err := readLastLines(sess.LogFile, 20)
+				if err != nil {
+					log.Printf("[orch] warn: could not read log tail for %s (%s): %v", slotName, sess.LogFile, err)
+					logTail = fmt.Sprintf("(could not read log file %s: %v)", sess.LogFile, err)
+				}
+
+				if err := worker.Stop(o.cfg, slotName, sess); err != nil {
+					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
+				}
+				if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+				}
+				sess.Status = state.StatusFailed
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
-				o.notifier.Sendf("💀 maestro: worker for #%d killed after %dm (max runtime exceeded)",
-					sess.IssueNumber, int(age.Minutes()))
+
+				o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d: %s) timed out after %d min.\nLast log lines:\n%s",
+					slotName, sess.IssueNumber, sess.IssueTitle, maxMinutes, logTail)
 			}
 		}
 	}
@@ -393,6 +443,23 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			// Reset notification status when CI goes green
 			sess.LastNotifiedStatus = ""
 			sess.NotifiedCIFail = false // backward compat
+
+			greptileOK, greptilePending, err := o.gh.PRGreptileApproved(pr.Number)
+			if err != nil {
+				log.Printf("[orch] greptile check PR #%d: %v", pr.Number, err)
+				continue // skip this cycle, try next
+			}
+			if greptilePending {
+				log.Printf("[orch] PR #%d waiting for Greptile review", pr.Number)
+				continue // not ready yet
+			}
+			if !greptileOK {
+				log.Printf("[orch] PR #%d not approved by Greptile, labeling blocked", pr.Number)
+				if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+				}
+				continue
+			}
 
 			log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 			if err := o.gh.MergePR(pr.Number); err != nil {
