@@ -48,27 +48,28 @@ type RoutingConfig struct {
 }
 
 type Config struct {
-	Repo                 string           `yaml:"repo"`
-	LocalPath            string           `yaml:"local_path"`
-	WorktreeBase         string           `yaml:"worktree_base"`
-	MaxParallel          int              `yaml:"max_parallel"`
-	MaxRuntimeMinutes    int              `yaml:"max_runtime_minutes"` // max worker runtime in minutes (default: 120)
-	ClaudeCmd            string           `yaml:"claude_cmd"`          // deprecated: use model.backends.claude.cmd
-	IssueLabel           string           `yaml:"issue_label"`         // deprecated: use issue_labels
-	IssueLabels          []string         `yaml:"issue_labels"`
-	ExcludeLabels        []string         `yaml:"exclude_labels"`
-	WorkerPrompt         string           `yaml:"worker_prompt"`
-	BugPrompt            string           `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
-	EnhancementPrompt    string           `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
-	SessionPrefix        string           `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
-	StateDir             string           `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
-	Model                ModelConfig      `yaml:"model"`
-	Routing              RoutingConfig    `yaml:"routing"`
-	DeployCmd            string           `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
-	MergeStrategy        string           `yaml:"merge_strategy"`         // "sequential" | "parallel"
-	MergeIntervalSeconds int              `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
-	Telegram             TelegramConfig   `yaml:"telegram"`
-	Versioning           VersioningConfig `yaml:"versioning"`
+	Repo                       string           `yaml:"repo"`
+	LocalPath                  string           `yaml:"local_path"`
+	WorktreeBase               string           `yaml:"worktree_base"`
+	MaxParallel                int              `yaml:"max_parallel"`
+	MaxRuntimeMinutes          int              `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
+	WorkerSilentTimeoutMinutes int              `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
+	ClaudeCmd                  string           `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
+	IssueLabel                 string           `yaml:"issue_label"`                   // deprecated: use issue_labels
+	IssueLabels                []string         `yaml:"issue_labels"`
+	ExcludeLabels              []string         `yaml:"exclude_labels"`
+	WorkerPrompt               string           `yaml:"worker_prompt"`
+	BugPrompt                  string           `yaml:"bug_prompt"`                    // prompt template for issues with "bug" label
+	EnhancementPrompt          string           `yaml:"enhancement_prompt"`            // prompt template for issues with "enhancement" label
+	SessionPrefix              string           `yaml:"session_prefix"`                // worker session name prefix (default: first 3 chars of repo name)
+	StateDir                   string           `yaml:"state_dir"`                     // state/log directory (default: ~/.maestro/<repo-hash>)
+	Model                      ModelConfig      `yaml:"model"`
+	Routing                    RoutingConfig    `yaml:"routing"`
+	DeployCmd                  string           `yaml:"deploy_cmd"`                    // shell command to run after successful PR merge
+	MergeStrategy              string           `yaml:"merge_strategy"`                // "sequential" | "parallel"
+	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"`        // minimum seconds between merges in sequential mode
+	Telegram                   TelegramConfig   `yaml:"telegram"`
+	Versioning                 VersioningConfig `yaml:"versioning"`
 }
 
 // LoadFrom loads config from a specific path.

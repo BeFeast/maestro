@@ -22,22 +22,24 @@ const (
 )
 
 type Session struct {
-	IssueNumber        int           `json:"issue_number"`
-	IssueTitle         string        `json:"issue_title"`
-	Worktree           string        `json:"worktree"`
-	Branch             string        `json:"branch"`
-	PID                int           `json:"pid"`
-	TmuxSession        string        `json:"tmux_session,omitempty"`
-	LogFile            string        `json:"log_file"`
-	StartedAt          time.Time     `json:"started_at"`
-	FinishedAt         *time.Time    `json:"finished_at,omitempty"`
-	Status             SessionStatus `json:"status"`
-	PRNumber           int           `json:"pr_number,omitempty"`
-	Backend            string        `json:"backend,omitempty"` // "claude", "codex", etc.
-	LongRunning        bool          `json:"long_running,omitempty"`
-	NotifiedCIFail     bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
-	LastNotifiedStatus string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
-	RetryCount         int           `json:"retry_count,omitempty"`
+	IssueNumber         int           `json:"issue_number"`
+	IssueTitle          string        `json:"issue_title"`
+	Worktree            string        `json:"worktree"`
+	Branch              string        `json:"branch"`
+	PID                 int           `json:"pid"`
+	TmuxSession         string        `json:"tmux_session,omitempty"`
+	LogFile             string        `json:"log_file"`
+	StartedAt           time.Time     `json:"started_at"`
+	FinishedAt          *time.Time    `json:"finished_at,omitempty"`
+	Status              SessionStatus `json:"status"`
+	PRNumber            int           `json:"pr_number,omitempty"`
+	Backend             string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	LongRunning         bool          `json:"long_running,omitempty"`
+	NotifiedCIFail      bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
+	LastNotifiedStatus  string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
+	RetryCount          int           `json:"retry_count,omitempty"`
+	LastOutputHash      string        `json:"last_output_hash,omitempty"`
+	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`
 }
 
 type State struct {

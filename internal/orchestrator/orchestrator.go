@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
@@ -98,6 +99,39 @@ func readLastLines(path string, limit int) (string, error) {
 		return "(log file is empty)", nil
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+func tmuxCapture(session string) (string, error) {
+	if strings.TrimSpace(session) == "" {
+		return "", fmt.Errorf("empty tmux session")
+	}
+	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func hashOutput(output string) string {
+	const tailLines = 50
+
+	lines := strings.Split(output, "\n")
+	if len(lines) > tailLines {
+		lines = lines[len(lines)-tailLines:]
+	}
+	tail := strings.Join(lines, "\n")
+	sum := sha256.Sum256([]byte(tail))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func countSilentTimeoutKillsForIssue(s *state.State, issueNumber int) int {
+	count := 0
+	for _, sess := range s.Sessions {
+		if sess.IssueNumber == issueNumber && sess.LastNotifiedStatus == "silent_timeout" {
+			count++
+		}
+	}
+	return count
 }
 
 // LoadPromptBase reads the worker prompt template from config or a provided path.
@@ -380,6 +414,53 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				o.notifier.Sendf("🔀 maestro: worker %s opened PR #%d for issue #%d (%s)",
 					slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
 				continue
+			}
+
+			// Silent worker detection: compare tmux pane output hash over time.
+			if o.cfg.WorkerSilentTimeoutMinutes > 0 {
+				tmuxName := sess.TmuxSession
+				if tmuxName == "" {
+					tmuxName = worker.TmuxSessionName(slotName)
+				}
+
+				output, err := tmuxCapture(tmuxName)
+				if err != nil {
+					log.Printf("[orch] warn: tmux capture-pane failed for %s (%s): %v", slotName, tmuxName, err)
+				} else {
+					hash := hashOutput(output)
+					now := time.Now().UTC()
+
+					if sess.LastOutputHash == "" || sess.LastOutputChangedAt.IsZero() || hash != sess.LastOutputHash {
+						sess.LastOutputHash = hash
+						sess.LastOutputChangedAt = now
+					} else {
+						timeout := time.Duration(o.cfg.WorkerSilentTimeoutMinutes) * time.Minute
+						if time.Since(sess.LastOutputChangedAt) > timeout {
+							log.Printf("[orch] worker %s silent for >%dm, killing", slotName, o.cfg.WorkerSilentTimeoutMinutes)
+							if err := worker.Stop(o.cfg, slotName, sess); err != nil {
+								log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
+							}
+
+							// Count previous silent-timeout kills before updating this session,
+							// so the current kill is not included in the count.
+							prevSilentKills := countSilentTimeoutKillsForIssue(s, sess.IssueNumber)
+
+							sess.Status = state.StatusDead
+							sess.LastNotifiedStatus = "silent_timeout"
+							sess.FinishedAt = &now
+
+							if prevSilentKills > 0 {
+								if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+									log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+								}
+							}
+
+							o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d) killed — no output for %d minutes",
+								slotName, sess.IssueNumber, o.cfg.WorkerSilentTimeoutMinutes)
+							continue
+						}
+					}
+				}
 			}
 
 			// Check if worker exceeded max runtime — hard fail (no retry) with diagnostics

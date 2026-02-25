@@ -135,12 +135,14 @@ repo: BeFeast/panoptikon
 local_path: /home/shtrudel/src/panoptikon
 worktree_base: /home/shtrudel/.worktrees/panoptikon
 max_parallel: 5
-session_prefix: pan         # worker session name prefix (default: first 3 chars of repo name)
-state_dir: ~/.maestro/pan   # state/log directory (default: ~/.maestro/<repo-hash>)
-claude_cmd: claude          # the claude CLI binary
-issue_label: enhancement    # label to filter issues
-merge_strategy: sequential  # "sequential" (default) or "parallel"
-merge_interval_seconds: 30  # min delay between merges in sequential mode
+max_runtime_minutes: 120          # hard timeout for worker runtime (default: 120)
+worker_silent_timeout_minutes: 30 # kill worker if tmux output is unchanged for N minutes (0 = disabled)
+session_prefix: pan               # worker session name prefix (default: first 3 chars of repo name)
+state_dir: ~/.maestro/pan         # state/log directory (default: ~/.maestro/<repo-hash>)
+claude_cmd: claude                # the claude CLI binary
+issue_label: enhancement          # label to filter issues
+merge_strategy: sequential        # "sequential" (default) or "parallel"
+merge_interval_seconds: 30        # min delay between merges in sequential mode
 exclude_labels:
   - blocked
 telegram:
