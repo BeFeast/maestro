@@ -222,7 +222,7 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 			return true, false, nil
 		}
 
-		if strings.Contains(bodyLower, "confidence score: 5/5") || strings.Contains(bodyLower, "confidence score: 4/5") {
+		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
 			return true, false, nil
 		}
 	}
