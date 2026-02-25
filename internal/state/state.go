@@ -35,6 +35,7 @@ type Session struct {
 	PRNumber            int           `json:"pr_number,omitempty"`
 	Backend             string        `json:"backend,omitempty"` // "claude", "codex", etc.
 	LongRunning         bool          `json:"long_running,omitempty"`
+	RebaseAttempted     bool          `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail      bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
 	LastNotifiedStatus  string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
 	RetryCount          int           `json:"retry_count,omitempty"`
@@ -123,7 +124,7 @@ func (s *State) ActiveSessions() []*Session {
 func (s *State) IssueInProgress(issueNum int) bool {
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum &&
-			(sess.Status == StatusRunning || sess.Status == StatusPROpen) {
+			(sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued) {
 			return true
 		}
 	}

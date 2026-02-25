@@ -369,6 +369,31 @@ worker_silent_timeout_minutes: 25
 	}
 }
 
+func TestParse_AutoRebaseDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.AutoRebase {
+		t.Error("AutoRebase should default to true")
+	}
+}
+
+func TestParse_AutoRebaseExplicitFalse(t *testing.T) {
+	yaml := `
+repo: owner/repo
+auto_rebase: false
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.AutoRebase {
+		t.Error("AutoRebase should be false when explicitly configured")
+	}
+}
+
 func TestParse_ModelConfigDefaults(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))

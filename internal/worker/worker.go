@@ -293,20 +293,203 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	return nil
 }
 
-// RebaseWorktree runs git fetch + rebase in the worktree
+var autoResolveConflictFiles = map[string]struct{}{
+	"server/src/api/mod.rs": {},
+	"web/src/lib/api.ts":    {},
+	"web/src/lib/types.ts":  {},
+}
+
+// RebaseWorktree runs git fetch + rebase in the worktree.
+// If rebase hits conflicts in known shared files, it auto-resolves by keeping
+// both sides, continues the rebase, then force-pushes the branch.
 func RebaseWorktree(worktreePath, branch string) error {
-	cmds := [][]string{
-		{"git", "fetch", "origin"},
-		{"git", "rebase", "origin/main"},
-		{"git", "push", "--force-with-lease", "origin", branch},
+	if strings.TrimSpace(worktreePath) == "" {
+		return fmt.Errorf("empty worktree path")
 	}
-	for _, c := range cmds {
-		out, err := exec.Command(c[0], c[1:]...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s: %w\n%s", strings.Join(c, " "), err, out)
+	if strings.TrimSpace(branch) == "" {
+		return fmt.Errorf("empty branch")
+	}
+
+	if _, err := runGit(worktreePath, "fetch", "origin"); err != nil {
+		return err
+	}
+
+	if _, rebaseErr := runGit(worktreePath, "rebase", "origin/main"); rebaseErr != nil {
+		if _, resolveErr := continueRebaseWithAutoResolvedConflicts(worktreePath); resolveErr != nil {
+			if _, abortErr := runGit(worktreePath, "rebase", "--abort"); abortErr != nil {
+				return fmt.Errorf("rebase failed: %v; auto-resolve failed: %v; additionally failed to abort rebase: %v", rebaseErr, resolveErr, abortErr)
+			}
+			return fmt.Errorf("rebase failed: %v; auto-resolve failed: %v", rebaseErr, resolveErr)
 		}
 	}
+
+	if _, err := runGit(worktreePath, "push", "--force-with-lease", "origin", branch); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func runGit(worktreePath string, args ...string) (string, error) {
+	cmdArgs := append([]string{"-C", worktreePath}, args...)
+	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out), nil
+}
+
+func continueRebaseWithAutoResolvedConflicts(worktreePath string) ([]string, error) {
+	for {
+		conflicted, err := conflictedFiles(worktreePath)
+		if err != nil {
+			return nil, err
+		}
+		if len(conflicted) == 0 {
+			return nil, fmt.Errorf("rebase failed without conflicted files")
+		}
+
+		var resolved []string
+		var unresolved []string
+		for _, file := range conflicted {
+			if _, ok := autoResolveConflictFiles[toSlash(file)]; !ok {
+				unresolved = append(unresolved, file)
+				continue
+			}
+
+			fullPath := filepath.Join(worktreePath, filepath.FromSlash(file))
+			if err := resolveConflictFileKeepBothSides(fullPath); err != nil {
+				return nil, fmt.Errorf("resolve %s: %w", file, err)
+			}
+			if _, err := runGit(worktreePath, "add", "--", file); err != nil {
+				return nil, err
+			}
+			resolved = append(resolved, file)
+		}
+
+		if len(unresolved) > 0 {
+			return nil, fmt.Errorf("unresolvable conflicts in files: %s", strings.Join(unresolved, ", "))
+		}
+		if len(resolved) == 0 {
+			return nil, fmt.Errorf("rebase has conflicts but none are auto-resolvable")
+		}
+
+		if _, err := runGit(worktreePath, "-c", "core.editor=true", "rebase", "--continue"); err != nil {
+			nextConflicted, diffErr := conflictedFiles(worktreePath)
+			if diffErr != nil {
+				return nil, fmt.Errorf("git rebase --continue failed: %w (and could not inspect next conflicts: %v)", err, diffErr)
+			}
+			if len(nextConflicted) == 0 {
+				return nil, fmt.Errorf("git rebase --continue failed: %w", err)
+			}
+			// There are more conflict rounds; resolve in next loop.
+			continue
+		}
+
+		return resolved, nil
+	}
+}
+
+func conflictedFiles(worktreePath string) ([]string, error) {
+	out, err := runGit(worktreePath, "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(out, "\n")
+	files := make([]string, 0, len(lines))
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		files = append(files, toSlash(l))
+	}
+	return files, nil
+}
+
+func toSlash(path string) string {
+	return strings.ReplaceAll(path, "\\", "/")
+}
+
+func resolveConflictFileKeepBothSides(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+
+	resolved, changed, err := keepBothSides(string(data))
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return fmt.Errorf("no conflict markers found")
+	}
+
+	fi, statErr := os.Stat(path)
+	mode := os.FileMode(0644)
+	if statErr == nil {
+		mode = fi.Mode()
+	}
+	if err := os.WriteFile(path, []byte(resolved), mode); err != nil {
+		return fmt.Errorf("write resolved file: %w", err)
+	}
+	return nil
+}
+
+func keepBothSides(content string) (string, bool, error) {
+	const (
+		stateNormal = iota
+		stateOurs
+		stateBase
+		stateTheirs
+	)
+
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	ours := make([]string, 0)
+	theirs := make([]string, 0)
+	state := stateNormal
+	hadConflict := false
+
+	for _, line := range lines {
+		switch state {
+		case stateNormal:
+			if strings.HasPrefix(line, "<<<<<<<") {
+				hadConflict = true
+				ours = ours[:0]
+				theirs = theirs[:0]
+				state = stateOurs
+				continue
+			}
+			out = append(out, line)
+		case stateOurs:
+			switch {
+			case strings.HasPrefix(line, "|||||||"):
+				state = stateBase
+			case strings.HasPrefix(line, "======="):
+				state = stateTheirs
+			default:
+				ours = append(ours, line)
+			}
+		case stateBase:
+			if strings.HasPrefix(line, "=======") {
+				state = stateTheirs
+			}
+		case stateTheirs:
+			if strings.HasPrefix(line, ">>>>>>>") {
+				out = append(out, ours...)
+				out = append(out, theirs...)
+				state = stateNormal
+				continue
+			}
+			theirs = append(theirs, line)
+		}
+	}
+
+	if state != stateNormal {
+		return "", hadConflict, fmt.Errorf("unterminated conflict markers")
+	}
+	return strings.Join(out, "\n"), hadConflict, nil
 }
 
 // shellJoin quotes args for shell safety in generated scripts.

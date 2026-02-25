@@ -347,6 +347,106 @@ func TestLastNotifiedStatus_BackwardCompatibility(t *testing.T) {
 	}
 }
 
+func TestRebaseAttempted_Persistence(t *testing.T) {
+	dir := t.TempDir()
+
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{
+		IssueNumber:     42,
+		Branch:          "feat/test",
+		Status:          StatusConflictFailed,
+		StartedAt:       time.Now().UTC(),
+		RebaseAttempted: true,
+	}
+	s.Sessions["slot-2"] = &Session{
+		IssueNumber:     43,
+		Branch:          "feat/other",
+		Status:          StatusPROpen,
+		StartedAt:       time.Now().UTC(),
+		RebaseAttempted: false,
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if !loaded.Sessions["slot-1"].RebaseAttempted {
+		t.Error("slot-1: RebaseAttempted should be true after load")
+	}
+	if loaded.Sessions["slot-2"].RebaseAttempted {
+		t.Error("slot-2: RebaseAttempted should be false after load")
+	}
+}
+
+func TestRebaseAttempted_OmittedWhenFalse(t *testing.T) {
+	dir := t.TempDir()
+
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{
+		IssueNumber: 42,
+		Branch:      "feat/test",
+		Status:      StatusPROpen,
+		StartedAt:   time.Now().UTC(),
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if containsString(string(data), "rebase_attempted") {
+		t.Error("rebase_attempted should be omitted from JSON when false")
+	}
+}
+
+func TestRebaseAttempted_BackwardCompatibility(t *testing.T) {
+	dir := t.TempDir()
+
+	oldJSON := `{
+  "sessions": {
+    "slot-1": {
+      "issue_number": 42,
+      "branch": "feat/test",
+      "status": "conflict_failed",
+      "started_at": "2025-01-01T00:00:00Z"
+    }
+  },
+  "next_slot": 2
+}`
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(oldJSON), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if loaded.Sessions["slot-1"].RebaseAttempted {
+		t.Error("RebaseAttempted should default to false for old state files")
+	}
+}
+
+func TestIssueInProgress_QueuedCountsAsInProgress(t *testing.T) {
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 100, Status: StatusQueued}
+
+	if !s.IssueInProgress(100) {
+		t.Error("IssueInProgress should return true for queued session")
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }
