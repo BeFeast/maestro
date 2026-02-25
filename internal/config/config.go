@@ -71,6 +71,7 @@ type Config struct {
 	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"`        // minimum seconds between merges in sequential mode
 	Telegram                   TelegramConfig   `yaml:"telegram"`
 	Versioning                 VersioningConfig `yaml:"versioning"`
+	AutoResolveFiles           []string         `yaml:"auto_resolve_files"`            // files to auto-resolve conflicts by keeping both sides
 }
 
 // LoadFrom loads config from a specific path.
@@ -113,6 +114,11 @@ func parse(data []byte) (*Config, error) {
 		ClaudeCmd:            "claude",
 		MergeStrategy:        "sequential",
 		MergeIntervalSeconds: 30,
+		AutoResolveFiles: []string{
+			"server/src/api/mod.rs",
+			"web/src/lib/api.ts",
+			"web/src/lib/types.ts",
+		},
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)

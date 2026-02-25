@@ -745,7 +745,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			}
 
 			log.Printf("[orch] PR #%d has conflicts, auto-rebasing %s", pr.Number, slotName)
-			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch); err != nil {
+			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch, o.cfg.AutoResolveFiles); err != nil {
 				log.Printf("[orch] rebase failed for %s: %v", slotName, err)
 				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
 				continue
@@ -762,7 +762,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			}
 
 			log.Printf("[orch] retrying auto-rebase for conflict_failed session %s (PR #%d)", slotName, pr.Number)
-			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch); err != nil {
+			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch, o.cfg.AutoResolveFiles); err != nil {
 				log.Printf("[orch] rebase retry failed for %s: %v", slotName, err)
 				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
 				continue

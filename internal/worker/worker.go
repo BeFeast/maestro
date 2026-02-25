@@ -293,16 +293,12 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	return nil
 }
 
-var autoResolveConflictFiles = map[string]struct{}{
-	"server/src/api/mod.rs": {},
-	"web/src/lib/api.ts":    {},
-	"web/src/lib/types.ts":  {},
-}
-
 // RebaseWorktree runs git fetch + rebase in the worktree.
 // If rebase hits conflicts in known shared files, it auto-resolves by keeping
 // both sides, continues the rebase, then force-pushes the branch.
-func RebaseWorktree(worktreePath, branch string) error {
+// autoResolveFiles is the list of file paths (relative to repo root) that may
+// be auto-resolved by keeping both sides; it comes from cfg.AutoResolveFiles.
+func RebaseWorktree(worktreePath, branch string, autoResolveFiles []string) error {
 	if strings.TrimSpace(worktreePath) == "" {
 		return fmt.Errorf("empty worktree path")
 	}
@@ -315,7 +311,7 @@ func RebaseWorktree(worktreePath, branch string) error {
 	}
 
 	if _, rebaseErr := runGit(worktreePath, "rebase", "origin/main"); rebaseErr != nil {
-		if _, resolveErr := continueRebaseWithAutoResolvedConflicts(worktreePath); resolveErr != nil {
+		if _, resolveErr := continueRebaseWithAutoResolvedConflicts(worktreePath, autoResolveFiles); resolveErr != nil {
 			if _, abortErr := runGit(worktreePath, "rebase", "--abort"); abortErr != nil {
 				return fmt.Errorf("rebase failed: %v; auto-resolve failed: %v; additionally failed to abort rebase: %v", rebaseErr, resolveErr, abortErr)
 			}
@@ -339,7 +335,12 @@ func runGit(worktreePath string, args ...string) (string, error) {
 	return string(out), nil
 }
 
-func continueRebaseWithAutoResolvedConflicts(worktreePath string) ([]string, error) {
+func continueRebaseWithAutoResolvedConflicts(worktreePath string, autoResolveFiles []string) ([]string, error) {
+	autoResolveSet := make(map[string]struct{}, len(autoResolveFiles))
+	for _, f := range autoResolveFiles {
+		autoResolveSet[f] = struct{}{}
+	}
+
 	for {
 		conflicted, err := conflictedFiles(worktreePath)
 		if err != nil {
@@ -352,7 +353,7 @@ func continueRebaseWithAutoResolvedConflicts(worktreePath string) ([]string, err
 		var resolved []string
 		var unresolved []string
 		for _, file := range conflicted {
-			if _, ok := autoResolveConflictFiles[toSlash(file)]; !ok {
+			if _, ok := autoResolveSet[toSlash(file)]; !ok {
 				unresolved = append(unresolved, file)
 				continue
 			}
