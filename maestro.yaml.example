@@ -19,17 +19,29 @@ auto_rebase: true
 #   - web/src/lib/api.ts
 #   - web/src/lib/types.ts
 
+# Timeouts and merge behaviour
+max_runtime_minutes: 120           # hard timeout per worker (default: 120)
+worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N min (0 = disabled)
+auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
+merge_strategy: sequential         # "sequential" (default) or "parallel"
+merge_interval_seconds: 30         # minimum seconds between sequential merges (default: 30)
+
 # Model backend — default is Claude CLI
-# Supported: claude (default), codex (OpenAI), gemini
-claude_cmd: claude
-issue_label: enhancement
+# Supported: claude (default), codex (OpenAI), gemini, cline
+claude_cmd: claude                 # deprecated: use model.backends.claude.cmd
+issue_labels:                      # label filter (OR semantics); use issue_label for single label
+  - enhancement
 model:
   default: claude
   backends:
     claude:
       cmd: claude
     codex:
-      cmd: /path/to/codex
+      cmd: codex
+    gemini:
+      cmd: gemini
+    cline:
+      cmd: cline          # Cline CLI — configure provider in ~/.cline/data/globalState.json
 exclude_labels:
   - blocked
   - wontfix
