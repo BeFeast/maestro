@@ -10,8 +10,14 @@ import (
 	"strings"
 
 	"github.com/befeast/maestro/internal/config"
-	"github.com/befeast/maestro/internal/github"
 )
+
+// PRClient abstracts the GitHub PR methods needed by the version bump flow.
+type PRClient interface {
+	PRLabels(prNumber int) ([]string, error)
+	PRCommits(prNumber int) ([]string, error)
+	CreateRelease(tag, title string) error
+}
 
 // BumpType represents a semver bump level.
 type BumpType int
@@ -229,8 +235,64 @@ func runGit(dir string, args ...string) (string, error) {
 	return string(out), err
 }
 
+// ResolveFiles resolves version file paths relative to the repo local path.
+func ResolveFiles(localPath string, files []string) []string {
+	resolved := make([]string, len(files))
+	for i, f := range files {
+		if strings.HasPrefix(f, "/") {
+			resolved[i] = f
+		} else {
+			resolved[i] = localPath + "/" + f
+		}
+	}
+	return resolved
+}
+
+// BumpResult holds the result of a version bump detection.
+type BumpResult struct {
+	OldVersion Version
+	NewVersion Version
+	BumpType   BumpType
+}
+
+// DetectBump reads PR labels and commits to determine the bump type,
+// then computes the new version. It reads the current version from the
+// given files and uses labels-first with commit-message fallback.
+func DetectBump(gh PRClient, prNumber int, files []string, defaultBump string) (BumpResult, error) {
+	// Read current version
+	currentStr, err := ReadCurrentVersion(files)
+	if err != nil {
+		return BumpResult{}, fmt.Errorf("read current version: %w", err)
+	}
+	current, err := ParseVersion(currentStr)
+	if err != nil {
+		return BumpResult{}, fmt.Errorf("parse current version: %w", err)
+	}
+
+	// Detect bump type from PR labels
+	labels, err := gh.PRLabels(prNumber)
+	if err != nil {
+		return BumpResult{}, fmt.Errorf("get PR labels: %w", err)
+	}
+
+	bumpType, fromLabel := DetectBumpFromLabels(labels, defaultBump)
+
+	// Fallback to conventional commits if no version label found
+	if !fromLabel {
+		commits, err := gh.PRCommits(prNumber)
+		if err != nil {
+			log.Printf("[versioning] warn: could not read PR commits: %v, using default bump", err)
+		} else {
+			bumpType = DetectBumpFromCommits(commits, defaultBump)
+		}
+	}
+
+	newVer := Bump(current, bumpType)
+	return BumpResult{OldVersion: current, NewVersion: newVer, BumpType: bumpType}, nil
+}
+
 // Run executes the full version bump flow for a merged PR.
-func Run(cfg *config.Config, gh *github.Client, prNumber int) error {
+func Run(cfg *config.Config, gh PRClient, prNumber int) error {
 	if !cfg.Versioning.Enabled {
 		log.Printf("[versioning] disabled, skipping")
 		return nil
@@ -240,51 +302,16 @@ func Run(cfg *config.Config, gh *github.Client, prNumber int) error {
 		return fmt.Errorf("versioning enabled but no files configured")
 	}
 
-	// Resolve file paths relative to repo local path
-	files := make([]string, len(cfg.Versioning.Files))
-	for i, f := range cfg.Versioning.Files {
-		if strings.HasPrefix(f, "/") {
-			files[i] = f
-		} else {
-			files[i] = cfg.LocalPath + "/" + f
-		}
-	}
+	files := ResolveFiles(cfg.LocalPath, cfg.Versioning.Files)
 
-	// Read current version
-	currentStr, err := ReadCurrentVersion(files)
+	result, err := DetectBump(gh, prNumber, files, cfg.Versioning.DefaultBump)
 	if err != nil {
-		return fmt.Errorf("read current version: %w", err)
+		return err
 	}
-	current, err := ParseVersion(currentStr)
-	if err != nil {
-		return fmt.Errorf("parse current version: %w", err)
-	}
-	log.Printf("[versioning] current version: %s", current)
+	log.Printf("[versioning] bumping %s → %s (%s)", result.OldVersion, result.NewVersion, result.BumpType)
 
-	// Detect bump type from PR labels
-	labels, err := gh.PRLabels(prNumber)
-	if err != nil {
-		return fmt.Errorf("get PR labels: %w", err)
-	}
-
-	bumpType, fromLabel := DetectBumpFromLabels(labels, cfg.Versioning.DefaultBump)
-
-	// Fallback to conventional commits if no version label found
-	if !fromLabel {
-		commits, err := gh.PRCommits(prNumber)
-		if err != nil {
-			log.Printf("[versioning] warn: could not read PR commits: %v, using default bump", err)
-		} else {
-			bumpType = DetectBumpFromCommits(commits, cfg.Versioning.DefaultBump)
-			log.Printf("[versioning] no version label, detected %s from commits", bumpType)
-		}
-	} else {
-		log.Printf("[versioning] detected %s from PR labels", bumpType)
-	}
-
-	// Bump version
-	newVer := Bump(current, bumpType)
-	log.Printf("[versioning] bumping %s → %s (%s)", current, newVer, bumpType)
+	oldStr := result.OldVersion.String()
+	newStr := result.NewVersion.String()
 
 	// Pull latest main before modifying
 	if out, err := runGit(cfg.LocalPath, "checkout", "main"); err != nil {
@@ -296,7 +323,7 @@ func Run(cfg *config.Config, gh *github.Client, prNumber int) error {
 
 	// Update version in all configured files
 	for _, f := range files {
-		if err := UpdateVersionInFile(f, currentStr, newVer.String()); err != nil {
+		if err := UpdateVersionInFile(f, oldStr, newStr); err != nil {
 			log.Printf("[versioning] warn: %v", err)
 			continue
 		}
@@ -304,14 +331,14 @@ func Run(cfg *config.Config, gh *github.Client, prNumber int) error {
 	}
 
 	// Commit, tag, push
-	if err := CommitAndTag(cfg.LocalPath, newVer.String(), cfg.Versioning.TagPrefix); err != nil {
+	if err := CommitAndTag(cfg.LocalPath, newStr, cfg.Versioning.TagPrefix); err != nil {
 		return fmt.Errorf("commit and tag: %w", err)
 	}
-	log.Printf("[versioning] committed and tagged %s%s", cfg.Versioning.TagPrefix, newVer)
+	log.Printf("[versioning] committed and tagged %s%s", cfg.Versioning.TagPrefix, result.NewVersion)
 
 	// Optionally create GitHub release
 	if cfg.Versioning.CreateRelease {
-		tag := cfg.Versioning.TagPrefix + newVer.String()
+		tag := cfg.Versioning.TagPrefix + newStr
 		if err := gh.CreateRelease(tag, tag); err != nil {
 			return fmt.Errorf("create release: %w", err)
 		}
