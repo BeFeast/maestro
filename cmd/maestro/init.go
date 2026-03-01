@@ -13,6 +13,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// validBackends lists the accepted model backend values for init.
+var validBackends = []string{"claude", "codex", "gemini", "cline"}
+
+// isValidBackend checks whether a backend name is in the valid set.
+func isValidBackend(name string) bool {
+	for _, b := range validBackends {
+		if b == name {
+			return true
+		}
+	}
+	return false
+}
+
 // initYAMLConfig is the config structure written to maestro.yaml by init.
 type initYAMLConfig struct {
 	Repo         string            `yaml:"repo"`
@@ -31,6 +44,19 @@ type initYAMLModel struct {
 type initYAMLTelegram struct {
 	Target string `yaml:"target"`
 }
+
+// initConfigExtras contains commented-out examples appended to the
+// generated maestro.yaml so new users can discover features.
+const initConfigExtras = `
+# --- Optional settings (uncomment to enable) ---
+# max_runtime_minutes: 120
+# auto_rebase: true
+# merge_strategy: sequential
+# worker_prompt: ./worker-prompt.md
+# exclude_labels:
+#   - wontfix
+#   - blocked
+`
 
 func initCmd(args []string) {
 	if err := runInitWizard(os.Stdin, os.Stdout, "."); err != nil {
@@ -65,7 +91,10 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini/cline)", "claude")
+	if !isValidBackend(modelBackend) {
+		return fmt.Errorf("invalid model backend %q — valid options: %s", modelBackend, strings.Join(validBackends, ", "))
+	}
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -103,6 +132,9 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
+
+	// Append commented-out examples for commonly used settings
+	yamlData = append(yamlData, []byte(initConfigExtras)...)
 
 	if err := os.WriteFile(yamlPath, yamlData, 0644); err != nil {
 		return fmt.Errorf("write maestro.yaml: %w", err)

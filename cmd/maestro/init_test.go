@@ -260,6 +260,71 @@ func TestRunInitWizardStateDirConfirmation(t *testing.T) {
 	}
 }
 
+func TestIsValidBackend(t *testing.T) {
+	for _, b := range []string{"claude", "codex", "gemini", "cline"} {
+		if !isValidBackend(b) {
+			t.Errorf("expected %q to be valid", b)
+		}
+	}
+	for _, b := range []string{"gpt", "openai", "", "Claude"} {
+		if isValidBackend(b) {
+			t.Errorf("expected %q to be invalid", b)
+		}
+	}
+}
+
+func TestRunInitWizardInvalidBackend(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	// repo, local_path, worktree, max_parallel, model=gpt, ...
+	input := "org/repo\n\n\n\ngpt\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err == nil {
+		t.Fatal("expected error for invalid backend")
+	}
+	if !strings.Contains(err.Error(), "invalid model backend") {
+		t.Errorf("error should mention 'invalid model backend', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error should list valid options, got: %v", err)
+	}
+}
+
+func TestRunInitWizardRicherConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+
+	yamlStr := string(data)
+	extras := []string{
+		"# max_runtime_minutes: 120",
+		"# auto_rebase: true",
+		"# merge_strategy: sequential",
+		"# worker_prompt:",
+		"# exclude_labels:",
+	}
+	for _, want := range extras {
+		if !strings.Contains(yamlStr, want) {
+			t.Errorf("yaml missing commented-out extra %q, got:\n%s", want, yamlStr)
+		}
+	}
+}
+
 func TestRunInitWizardInvalidMaxParallel(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
