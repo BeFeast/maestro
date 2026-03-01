@@ -9,9 +9,19 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
+
+// validBackends lists the accepted model backend names for init.
+var validBackends = []string{"claude", "codex", "gemini", "cline"}
+
+func isValidBackend(name string) bool {
+	for _, b := range validBackends {
+		if b == name {
+			return true
+		}
+	}
+	return false
+}
 
 // initYAMLConfig is the config structure written to maestro.yaml by init.
 type initYAMLConfig struct {
@@ -65,7 +75,10 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini/cline)", "claude")
+	if !isValidBackend(modelBackend) {
+		return fmt.Errorf("invalid model backend %q — valid options: %s", modelBackend, strings.Join(validBackends, ", "))
+	}
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -99,12 +112,9 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 		Telegram:     telegram,
 	}
 
-	yamlData, err := yaml.Marshal(&cfg)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
+	yamlData := buildInitYAML(cfg)
 
-	if err := os.WriteFile(yamlPath, yamlData, 0644); err != nil {
+	if err := os.WriteFile(yamlPath, []byte(yamlData), 0644); err != nil {
 		return fmt.Errorf("write maestro.yaml: %w", err)
 	}
 	fmt.Fprintln(w, "\u2705 Created maestro.yaml")
@@ -218,6 +228,33 @@ func launchdPlist(binPath, configPath, pathEnv string) string {
 </dict>
 </plist>
 `, pathEnv, binPath, configPath)
+}
+
+func buildInitYAML(cfg initYAMLConfig) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("repo: %s\n", cfg.Repo))
+	sb.WriteString(fmt.Sprintf("local_path: %s\n", cfg.LocalPath))
+	sb.WriteString(fmt.Sprintf("worktree_base: %s\n", cfg.WorktreeBase))
+	sb.WriteString(fmt.Sprintf("max_parallel: %d\n", cfg.MaxParallel))
+	sb.WriteString("issue_labels:\n")
+	for _, l := range cfg.IssueLabels {
+		sb.WriteString(fmt.Sprintf("  - %s\n", l))
+	}
+	sb.WriteString("model:\n")
+	sb.WriteString(fmt.Sprintf("  default: %s\n", cfg.Model.Default))
+	if cfg.Telegram != nil {
+		sb.WriteString("telegram:\n")
+		sb.WriteString(fmt.Sprintf("  target: \"%s\"\n", cfg.Telegram.Target))
+	}
+	sb.WriteString("\n# --- Optional settings (uncomment to enable) ---\n")
+	sb.WriteString("# max_runtime_minutes: 120\n")
+	sb.WriteString("# auto_rebase: true\n")
+	sb.WriteString("# merge_strategy: sequential\n")
+	sb.WriteString("# worker_prompt: ./worker-prompt.md\n")
+	sb.WriteString("# exclude_labels:\n")
+	sb.WriteString("#   - wontfix\n")
+	sb.WriteString("#   - duplicate\n")
+	return sb.String()
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {
