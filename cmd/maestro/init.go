@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -60,6 +61,9 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Welcome to Maestro! Let's set up your first project.")
 	fmt.Fprintln(w)
+
+	// Check prerequisites
+	checkInitPrerequisites(w)
 
 	repo := promptInit(scanner, w, "GitHub repo (owner/repo)", "")
 	if repo == "" {
@@ -255,6 +259,43 @@ func buildInitYAML(cfg initYAMLConfig) string {
 	sb.WriteString("#   - wontfix\n")
 	sb.WriteString("#   - duplicate\n")
 	return sb.String()
+}
+
+func checkInitPrerequisites(w io.Writer) {
+	required := []struct {
+		cmd  string
+		hint string
+	}{
+		{"git", "install git: https://git-scm.com"},
+		{"gh", "install GitHub CLI: https://cli.github.com"},
+		{"tmux", "install tmux: apt install tmux / brew install tmux"},
+	}
+
+	allOK := true
+	for _, req := range required {
+		if _, err := exec.LookPath(req.cmd); err != nil {
+			fmt.Fprintf(w, "  WARNING: %s not found — %s\n", req.cmd, req.hint)
+			allOK = false
+		}
+	}
+
+	// Check for at least one AI backend
+	backends := []string{"claude", "codex", "gemini", "cline"}
+	hasBackend := false
+	for _, b := range backends {
+		if _, err := exec.LookPath(b); err == nil {
+			hasBackend = true
+			break
+		}
+	}
+	if !hasBackend {
+		fmt.Fprintf(w, "  WARNING: no AI CLI found (claude/codex/gemini/cline) — install at least one\n")
+		allOK = false
+	}
+
+	if !allOK {
+		fmt.Fprintln(w)
+	}
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {

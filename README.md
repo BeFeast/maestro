@@ -92,6 +92,7 @@ Get maestro running in under 5 minutes:
 ```bash
 # 1. Install maestro
 curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/install.sh | sh
+maestro version   # verify installation
 
 # 2. Clone your target repo (if not already)
 gh repo clone owner/myrepo ~/src/myrepo
@@ -99,6 +100,9 @@ gh repo clone owner/myrepo ~/src/myrepo
 # 3. Run the interactive setup wizard
 cd ~/src/myrepo
 maestro init
+
+# 4. Add maestro.yaml to .gitignore (it contains local paths)
+echo "maestro.yaml" >> .gitignore
 ```
 
 The `maestro init` wizard will ask you for:
