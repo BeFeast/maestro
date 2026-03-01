@@ -53,9 +53,12 @@ func TestPromptInitOutput(t *testing.T) {
 }
 
 func TestSystemdUnit(t *testing.T) {
-	content := systemdUnit("/usr/bin/maestro", "/etc/maestro.yaml")
+	content := systemdUnit("/usr/bin/maestro", "/etc/maestro.yaml", "/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin")
 	if !strings.Contains(content, "ExecStart=/usr/bin/maestro run --config /etc/maestro.yaml") {
 		t.Error("should contain correct ExecStart line")
+	}
+	if !strings.Contains(content, "Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin") {
+		t.Error("should contain Environment=PATH line")
 	}
 	for _, section := range []string{"[Unit]", "[Service]", "[Install]"} {
 		if !strings.Contains(content, section) {
@@ -65,7 +68,7 @@ func TestSystemdUnit(t *testing.T) {
 }
 
 func TestLaunchdPlist(t *testing.T) {
-	content := launchdPlist("/usr/bin/maestro", "/etc/maestro.yaml")
+	content := launchdPlist("/usr/bin/maestro", "/etc/maestro.yaml", "/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin")
 	if !strings.Contains(content, "<string>/usr/bin/maestro</string>") {
 		t.Error("should contain binary path")
 	}
@@ -74,6 +77,12 @@ func TestLaunchdPlist(t *testing.T) {
 	}
 	if !strings.Contains(content, "com.maestro.agent") {
 		t.Error("should contain label")
+	}
+	if !strings.Contains(content, "<key>EnvironmentVariables</key>") {
+		t.Error("should contain EnvironmentVariables key")
+	}
+	if !strings.Contains(content, "<string>/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin</string>") {
+		t.Error("should contain PATH value in EnvironmentVariables")
 	}
 }
 
