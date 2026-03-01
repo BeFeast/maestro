@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/befeast/maestro/internal/worker"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,6 +33,19 @@ type initYAMLModel struct {
 type initYAMLTelegram struct {
 	Target string `yaml:"target"`
 }
+
+// initCommentedDefaults is appended to the generated YAML to help new users
+// discover commonly used settings without reading the full README.
+const initCommentedDefaults = `
+# --- Optional settings (uncomment to enable) ---
+# max_runtime_minutes: 120
+# auto_rebase: true
+# merge_strategy: sequential
+# worker_prompt: worker-prompt.md
+# exclude_labels:
+#   - wontfix
+#   - duplicate
+`
 
 func initCmd(args []string) {
 	if err := runInitWizard(os.Stdin, os.Stdout, "."); err != nil {
@@ -65,7 +80,19 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	validBackends := worker.KnownBackends()
+	sort.Strings(validBackends)
+	backendHint := strings.Join(validBackends, "/")
+	modelBackend := promptInit(scanner, w, "Default model backend ("+backendHint+")", "claude")
+
+	validSet := make(map[string]bool, len(validBackends))
+	for _, b := range validBackends {
+		validSet[b] = true
+	}
+	if !validSet[modelBackend] {
+		return fmt.Errorf("invalid model backend %q — valid options: %s", modelBackend, strings.Join(validBackends, ", "))
+	}
+
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -103,6 +130,9 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
+
+	// Append commented-out examples for commonly used settings
+	yamlData = append(yamlData, []byte(initCommentedDefaults)...)
 
 	if err := os.WriteFile(yamlPath, yamlData, 0644); err != nil {
 		return fmt.Errorf("write maestro.yaml: %w", err)
