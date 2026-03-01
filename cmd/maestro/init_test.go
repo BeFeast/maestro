@@ -53,9 +53,12 @@ func TestPromptInitOutput(t *testing.T) {
 }
 
 func TestSystemdUnit(t *testing.T) {
-	content := systemdUnit("/usr/bin/maestro", "/etc/maestro.yaml")
+	content := systemdUnit("/usr/bin/maestro", "/etc/maestro.yaml", "/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin")
 	if !strings.Contains(content, "ExecStart=/usr/bin/maestro run --config /etc/maestro.yaml") {
 		t.Error("should contain correct ExecStart line")
+	}
+	if !strings.Contains(content, "Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin") {
+		t.Error("should contain Environment=PATH line with user's PATH")
 	}
 	for _, section := range []string{"[Unit]", "[Service]", "[Install]"} {
 		if !strings.Contains(content, section) {
@@ -64,8 +67,15 @@ func TestSystemdUnit(t *testing.T) {
 	}
 }
 
+func TestSystemdUnitEmptyPath(t *testing.T) {
+	content := systemdUnit("/usr/bin/maestro", "/etc/maestro.yaml", "")
+	if !strings.Contains(content, "Environment=PATH=") {
+		t.Error("should contain Environment=PATH line even when empty")
+	}
+}
+
 func TestLaunchdPlist(t *testing.T) {
-	content := launchdPlist("/usr/bin/maestro", "/etc/maestro.yaml")
+	content := launchdPlist("/usr/bin/maestro", "/etc/maestro.yaml", "/usr/local/bin:/usr/bin:/bin:/Users/user/.bun/bin")
 	if !strings.Contains(content, "<string>/usr/bin/maestro</string>") {
 		t.Error("should contain binary path")
 	}
@@ -74,6 +84,15 @@ func TestLaunchdPlist(t *testing.T) {
 	}
 	if !strings.Contains(content, "com.maestro.agent") {
 		t.Error("should contain label")
+	}
+	if !strings.Contains(content, "<key>EnvironmentVariables</key>") {
+		t.Error("should contain EnvironmentVariables dict")
+	}
+	if !strings.Contains(content, "<key>PATH</key>") {
+		t.Error("should contain PATH key in EnvironmentVariables")
+	}
+	if !strings.Contains(content, "<string>/usr/local/bin:/usr/bin:/bin:/Users/user/.bun/bin</string>") {
+		t.Error("should contain user's PATH value")
 	}
 }
 
@@ -120,7 +139,7 @@ func TestRunInitWizard(t *testing.T) {
 	if !strings.Contains(out, "Welcome to Maestro") {
 		t.Error("should show welcome message")
 	}
-	if !strings.Contains(out, "\u2705 Created maestro.yaml") {
+	if !strings.Contains(out, "Created maestro.yaml") {
 		t.Error("should show config created message")
 	}
 

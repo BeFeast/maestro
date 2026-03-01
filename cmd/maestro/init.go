@@ -78,7 +78,7 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 
 	var telegram *initYAMLTelegram
 	if wantsTelegram {
-		fmt.Fprintf(w, "  \u2192 Telegram target ID: ")
+		fmt.Fprintf(w, "  → Telegram target ID: ")
 		if scanner.Scan() {
 			if id := strings.TrimSpace(scanner.Text()); id != "" {
 				telegram = &initYAMLTelegram{Target: id}
@@ -107,14 +107,14 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	if err := os.WriteFile(yamlPath, yamlData, 0644); err != nil {
 		return fmt.Errorf("write maestro.yaml: %w", err)
 	}
-	fmt.Fprintln(w, "\u2705 Created maestro.yaml")
+	fmt.Fprintln(w, "✅ Created maestro.yaml")
 
 	// Create ~/.maestro/ state directory
 	maestroDir := filepath.Join(os.Getenv("HOME"), ".maestro")
 	if err := os.MkdirAll(maestroDir, 0755); err != nil {
 		fmt.Fprintf(w, "Note: could not create state directory: %v\n", err)
 	} else {
-		fmt.Fprintf(w, "\u2705 Created %s\n", maestroDir)
+		fmt.Fprintf(w, "✅ Created %s\n", maestroDir)
 	}
 
 	// Create service file (non-fatal)
@@ -145,6 +145,7 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 }
 
 func writeInitServiceFile(w io.Writer, binPath, configPath string) error {
+	pathEnv := os.Getenv("PATH")
 	switch runtime.GOOS {
 	case "linux":
 		dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
@@ -152,47 +153,53 @@ func writeInitServiceFile(w io.Writer, binPath, configPath string) error {
 			return err
 		}
 		path := filepath.Join(dir, "maestro.service")
-		if err := os.WriteFile(path, []byte(systemdUnit(binPath, configPath)), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(systemdUnit(binPath, configPath, pathEnv)), 0644); err != nil {
 			return err
 		}
-		fmt.Fprintf(w, "\u2705 Created %s\n", path)
+		fmt.Fprintf(w, "✅ Created %s\n", path)
 	case "darwin":
 		dir := filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents")
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
 		}
 		path := filepath.Join(dir, "com.maestro.agent.plist")
-		if err := os.WriteFile(path, []byte(launchdPlist(binPath, configPath)), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(launchdPlist(binPath, configPath, pathEnv)), 0644); err != nil {
 			return err
 		}
-		fmt.Fprintf(w, "\u2705 Created %s\n", path)
+		fmt.Fprintf(w, "✅ Created %s\n", path)
 	}
 	return nil
 }
 
-func systemdUnit(binPath, configPath string) string {
+func systemdUnit(binPath, configPath, pathEnv string) string {
 	return fmt.Sprintf(`[Unit]
 Description=Maestro - AI coding agent orchestrator
 After=network.target
 
 [Service]
 Type=simple
+Environment=PATH=%s
 ExecStart=%s run --config %s
 Restart=on-failure
 RestartSec=30
 
 [Install]
 WantedBy=default.target
-`, binPath, configPath)
+`, pathEnv, binPath, configPath)
 }
 
-func launchdPlist(binPath, configPath string) string {
+func launchdPlist(binPath, configPath, pathEnv string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.maestro.agent</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>%s</string>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>%s</string>
@@ -210,7 +217,7 @@ func launchdPlist(binPath, configPath string) string {
     <string>/tmp/maestro.stderr.log</string>
 </dict>
 </plist>
-`, binPath, configPath)
+`, pathEnv, binPath, configPath)
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {
