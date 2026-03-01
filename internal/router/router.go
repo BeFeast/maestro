@@ -28,6 +28,9 @@ type routerResponse struct {
 // Router selects the best backend for a given issue using an LLM call.
 type Router struct {
 	cfg *config.Config
+
+	// RouteFn overrides the default Route method (used in tests).
+	RouteFn func(issue github.Issue) (string, string, error)
 }
 
 // New creates a new Router.
