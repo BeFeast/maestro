@@ -153,6 +153,55 @@ func TestBuildWorkerCmd_GeminiDefaultCmd(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerCmd_Cline(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("fix the login flow"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/cline-worktree"
+
+	cfg := BackendConfig{Cmd: "cline", ExtraArgs: []string{"--verbose"}}
+	cmd, stdinFile, err := BuildWorkerCmd("cline", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if stdinFile != "" {
+		t.Errorf("expected empty stdinFile for cline, got: %s", stdinFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "-y") {
+		t.Errorf("expected -y flag in args, got: %s", args)
+	}
+	if !strings.Contains(args, "fix the login flow") {
+		t.Errorf("expected prompt content in args, got: %s", args)
+	}
+	if !strings.Contains(args, "--verbose") {
+		t.Errorf("expected extra args in command, got: %s", args)
+	}
+	if cmd.Dir != worktree {
+		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+func TestBuildWorkerCmd_ClineDefaultCmd(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{}
+	cmd, _, err := BuildWorkerCmd("cline", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasSuffix(cmd.Path, "cline") && !strings.Contains(cmd.Args[0], "cline") {
+		t.Errorf("expected cline command, got: %v", cmd.Args)
+	}
+}
+
 func TestBuildWorkerCmd_GenericArgMode(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")
@@ -306,7 +355,7 @@ func TestBuildWorkerCmd_GenericInvalidPromptMode(t *testing.T) {
 
 func TestKnownBackends(t *testing.T) {
 	backends := KnownBackends()
-	expected := map[string]bool{"claude": false, "codex": false, "gemini": false}
+	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false}
 	for _, name := range backends {
 		if _, ok := expected[name]; ok {
 			expected[name] = true
