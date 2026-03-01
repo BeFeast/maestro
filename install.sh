@@ -58,6 +58,21 @@ main() {
     fi
 
     echo "maestro ${LATEST} installed to ${INSTALL_DIR}/maestro"
+
+    # Verify installation
+    if command -v maestro >/dev/null 2>&1; then
+        echo "Verified: $(maestro version)"
+    else
+        echo ""
+        echo "Note: maestro was installed to ${INSTALL_DIR}/maestro"
+        echo "Make sure ${INSTALL_DIR} is in your PATH."
+    fi
+
+    echo ""
+    echo "Next steps:"
+    echo "  cd /path/to/your/repo"
+    echo "  maestro init          # interactive setup wizard"
+    echo "  maestro run --once    # test run"
 }
 
 main

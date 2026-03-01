@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -15,13 +16,14 @@ import (
 
 // initYAMLConfig is the config structure written to maestro.yaml by init.
 type initYAMLConfig struct {
-	Repo         string            `yaml:"repo"`
-	LocalPath    string            `yaml:"local_path"`
-	WorktreeBase string            `yaml:"worktree_base"`
-	MaxParallel  int               `yaml:"max_parallel"`
-	IssueLabels  []string          `yaml:"issue_labels"`
-	Model        initYAMLModel     `yaml:"model"`
-	Telegram     *initYAMLTelegram `yaml:"telegram,omitempty"`
+	Repo          string            `yaml:"repo"`
+	LocalPath     string            `yaml:"local_path"`
+	WorktreeBase  string            `yaml:"worktree_base"`
+	MaxParallel   int               `yaml:"max_parallel"`
+	SessionPrefix string            `yaml:"session_prefix"`
+	IssueLabels   []string          `yaml:"issue_labels"`
+	Model         initYAMLModel     `yaml:"model"`
+	Telegram      *initYAMLTelegram `yaml:"telegram,omitempty"`
 }
 
 type initYAMLModel struct {
@@ -51,6 +53,9 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	fmt.Fprintln(w, "Welcome to Maestro! Let's set up your first project.")
 	fmt.Fprintln(w)
 
+	// Check prerequisites and warn about missing ones
+	checkPrerequisites(w)
+
 	repo := promptInit(scanner, w, "GitHub repo (owner/repo)", "")
 	if repo == "" {
 		return fmt.Errorf("repo is required")
@@ -65,7 +70,7 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini/cline)", "claude")
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -88,15 +93,22 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 
 	fmt.Fprintln(w)
 
+	// Derive session_prefix from repo name (first 3 chars)
+	sessionPrefix := repoName
+	if len(sessionPrefix) > 3 {
+		sessionPrefix = sessionPrefix[:3]
+	}
+
 	// Build config
 	cfg := initYAMLConfig{
-		Repo:         repo,
-		LocalPath:    localPath,
-		WorktreeBase: worktreeBase,
-		MaxParallel:  maxParallel,
-		IssueLabels:  []string{issueLabel},
-		Model:        initYAMLModel{Default: modelBackend},
-		Telegram:     telegram,
+		Repo:          repo,
+		LocalPath:     localPath,
+		WorktreeBase:  worktreeBase,
+		MaxParallel:   maxParallel,
+		SessionPrefix: sessionPrefix,
+		IssueLabels:   []string{issueLabel},
+		Model:         initYAMLModel{Default: modelBackend},
+		Telegram:      telegram,
 	}
 
 	yamlData, err := yaml.Marshal(&cfg)
@@ -211,6 +223,58 @@ func launchdPlist(binPath, configPath string) string {
 </dict>
 </plist>
 `, binPath, configPath)
+}
+
+func checkPrerequisites(w io.Writer) {
+	type prereq struct {
+		name     string
+		cmd      string
+		required bool
+		hint     string
+	}
+	prereqs := []prereq{
+		{"git", "git", true, "install git: https://git-scm.com"},
+		{"gh", "gh", true, "install gh: https://cli.github.com"},
+		{"tmux", "tmux", true, "install tmux: sudo apt install tmux (Linux) / brew install tmux (macOS)"},
+	}
+	aiCLIs := []prereq{
+		{"claude", "claude", false, ""},
+		{"codex", "codex", false, ""},
+		{"gemini", "gemini", false, ""},
+		{"cline", "cline", false, ""},
+	}
+
+	missing := false
+	for _, p := range prereqs {
+		if _, err := exec.LookPath(p.cmd); err != nil {
+			fmt.Fprintf(w, "  Warning: %s not found — %s\n", p.name, p.hint)
+			missing = true
+		}
+	}
+
+	hasAI := false
+	for _, p := range aiCLIs {
+		if _, err := exec.LookPath(p.cmd); err == nil {
+			hasAI = true
+			break
+		}
+	}
+	if !hasAI {
+		fmt.Fprintf(w, "  Warning: no AI CLI found (claude, codex, gemini, cline) — install at least one\n")
+		missing = true
+	}
+
+	// Check gh auth
+	if _, err := exec.LookPath("gh"); err == nil {
+		if err := exec.Command("gh", "auth", "status").Run(); err != nil {
+			fmt.Fprintf(w, "  Warning: gh not authenticated — run: gh auth login\n")
+			missing = true
+		}
+	}
+
+	if missing {
+		fmt.Fprintln(w)
+	}
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {

@@ -98,12 +98,13 @@ func TestRunInitWizard(t *testing.T) {
 
 	yamlStr := string(data)
 	checks := map[string]string{
-		"repo":          "repo: BeFeast/myrepo",
-		"local_path":    "local_path: ~/src/myrepo",
-		"worktree_base": "worktree_base: ~/.worktrees/myrepo",
-		"max_parallel":  "max_parallel: 3",
-		"issue_labels":  "enhancement",
-		"model":         "default: claude",
+		"repo":           "repo: BeFeast/myrepo",
+		"local_path":     "local_path: ~/src/myrepo",
+		"worktree_base":  "worktree_base: ~/.worktrees/myrepo",
+		"max_parallel":   "max_parallel: 3",
+		"session_prefix": "session_prefix: myr",
+		"issue_labels":   "enhancement",
+		"model":          "default: claude",
 	}
 	for field, want := range checks {
 		if !strings.Contains(yamlStr, want) {
@@ -175,12 +176,13 @@ func TestRunInitWizardCustomValues(t *testing.T) {
 
 	yamlStr := string(data)
 	checks := map[string]string{
-		"repo":          "repo: myorg/myapp",
-		"local_path":    "local_path: ~/code/myapp",
-		"worktree_base": "worktree_base: ~/.wt/myapp",
-		"max_parallel":  "max_parallel: 5",
-		"issue_labels":  "bug",
-		"model":         "default: codex",
+		"repo":           "repo: myorg/myapp",
+		"local_path":     "local_path: ~/code/myapp",
+		"worktree_base":  "worktree_base: ~/.wt/myapp",
+		"max_parallel":   "max_parallel: 5",
+		"session_prefix": "session_prefix: mya",
+		"issue_labels":   "bug",
+		"model":          "default: codex",
 	}
 	for field, want := range checks {
 		if !strings.Contains(yamlStr, want) {
@@ -257,6 +259,35 @@ func TestRunInitWizardStateDirConfirmation(t *testing.T) {
 	maestroDir := filepath.Join(tmpDir, ".maestro")
 	if !strings.Contains(out, maestroDir) {
 		t.Errorf("output should mention state directory %s, got:\n%s", maestroDir, out)
+	}
+}
+
+func TestCheckPrerequisites(t *testing.T) {
+	var buf bytes.Buffer
+	checkPrerequisites(&buf)
+	// Just verify it doesn't panic — output depends on the test environment
+}
+
+func TestSessionPrefixShortName(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	// "ab" is only 2 chars — session_prefix should be "ab" (not truncated)
+	input := "org/ab\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+
+	if !strings.Contains(string(data), "session_prefix: ab") {
+		t.Errorf("short repo name should use full name as prefix, got:\n%s", string(data))
 	}
 }
 
