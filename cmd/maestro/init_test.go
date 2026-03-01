@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -257,6 +258,69 @@ func TestRunInitWizardStateDirConfirmation(t *testing.T) {
 	maestroDir := filepath.Join(tmpDir, ".maestro")
 	if !strings.Contains(out, maestroDir) {
 		t.Errorf("output should mention state directory %s, got:\n%s", maestroDir, out)
+	}
+}
+
+func TestCheckPrerequisitesAllPresent(t *testing.T) {
+	var buf bytes.Buffer
+	found := func(name string) (string, error) { return "/usr/bin/" + name, nil }
+	checkPrerequisitesWithLookPath(&buf, found)
+
+	out := buf.String()
+	if !strings.Contains(out, "Checking prerequisites") {
+		t.Error("should show checking message")
+	}
+	if !strings.Contains(out, "All prerequisites found") {
+		t.Errorf("should show all-ok message, got:\n%s", out)
+	}
+	if strings.Contains(out, "[!]") {
+		t.Errorf("should not show warnings, got:\n%s", out)
+	}
+}
+
+func TestCheckPrerequisitesMissing(t *testing.T) {
+	var buf bytes.Buffer
+	// Only git is present
+	found := func(name string) (string, error) {
+		if name == "git" {
+			return "/usr/bin/git", nil
+		}
+		return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+	}
+	checkPrerequisitesWithLookPath(&buf, found)
+
+	out := buf.String()
+	if !strings.Contains(out, "[!] gh not found") {
+		t.Errorf("should warn about missing gh, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[!] tmux not found") {
+		t.Errorf("should warn about missing tmux, got:\n%s", out)
+	}
+	if !strings.Contains(out, "No AI backend CLI found") {
+		t.Errorf("should warn about missing backends, got:\n%s", out)
+	}
+	if strings.Contains(out, "All prerequisites found") {
+		t.Errorf("should not show all-ok message when tools missing, got:\n%s", out)
+	}
+}
+
+func TestCheckPrerequisitesOneBackend(t *testing.T) {
+	var buf bytes.Buffer
+	found := func(name string) (string, error) {
+		switch name {
+		case "git", "gh", "tmux", "codex":
+			return "/usr/bin/" + name, nil
+		}
+		return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+	}
+	checkPrerequisitesWithLookPath(&buf, found)
+
+	out := buf.String()
+	if strings.Contains(out, "No AI backend CLI found") {
+		t.Errorf("should not warn about backends when codex is present, got:\n%s", out)
+	}
+	if !strings.Contains(out, "All prerequisites found") {
+		t.Errorf("should show all-ok when all required + one backend found, got:\n%s", out)
 	}
 }
 

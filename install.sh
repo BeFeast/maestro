@@ -58,6 +58,11 @@ main() {
     fi
 
     echo "maestro ${LATEST} installed to ${INSTALL_DIR}/maestro"
+
+    # Verify the installed binary works
+    if "${INSTALL_DIR}/maestro" version >/dev/null 2>&1; then
+        echo "Verified: $("${INSTALL_DIR}/maestro" version)"
+    fi
 }
 
 main
