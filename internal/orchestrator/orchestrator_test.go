@@ -1025,3 +1025,126 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		t.Errorf("merged PR #%d, want #20", merged[0])
 	}
 }
+
+func TestAutoMergePRs_ParallelAllFailures(t *testing.T) {
+	// When every merge fails in parallel mode, no sessions should transition
+	// to done, and LastMergeAt should remain unchanged.
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+		{Number: 30, HeadRefName: "feat/c"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghPRGreptileApprovedFn: func(prNumber int) (bool, bool, error) {
+			return true, false, nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("merge conflict on PR #%d", prNumber)
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 0 {
+		t.Fatalf("expected 0 successful merges, got %d", len(merged))
+	}
+
+	// All sessions should remain in pr_open status
+	for slotName, sess := range s.Sessions {
+		if sess.Status != state.StatusPROpen {
+			t.Errorf("session %s: status = %q, want %q", slotName, sess.Status, state.StatusPROpen)
+		}
+		if sess.FinishedAt != nil {
+			t.Errorf("session %s: FinishedAt should be nil when merge failed", slotName)
+		}
+	}
+
+	// LastMergeAt should remain zero (no successful merge)
+	if !s.LastMergeAt.IsZero() {
+		t.Errorf("LastMergeAt should be zero when all merges fail, got %v", s.LastMergeAt)
+	}
+}
+
+func TestAutoMergePRs_ParallelStatePersistence(t *testing.T) {
+	// Verify that state survives a save/load cycle after parallel merges.
+	// This addresses the "race conditions on the state file" concern from issue #159.
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+		{Number: 30, HeadRefName: "feat/c"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 3 {
+		t.Fatalf("expected 3 merges, got %d", len(*merged))
+	}
+
+	// Save state to a temp directory and reload it
+	stateDir := t.TempDir()
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	loaded, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+
+	// Verify loaded state matches in-memory state
+	if len(loaded.Sessions) != len(s.Sessions) {
+		t.Fatalf("loaded %d sessions, want %d", len(loaded.Sessions), len(s.Sessions))
+	}
+
+	for slotName, origSess := range s.Sessions {
+		loadedSess, ok := loaded.Sessions[slotName]
+		if !ok {
+			t.Errorf("session %s missing after load", slotName)
+			continue
+		}
+		if loadedSess.Status != origSess.Status {
+			t.Errorf("session %s: loaded status = %q, want %q", slotName, loadedSess.Status, origSess.Status)
+		}
+		if loadedSess.FinishedAt == nil {
+			t.Errorf("session %s: loaded FinishedAt is nil", slotName)
+		}
+		if loadedSess.PRNumber != origSess.PRNumber {
+			t.Errorf("session %s: loaded PRNumber = %d, want %d", slotName, loadedSess.PRNumber, origSess.PRNumber)
+		}
+	}
+
+	if loaded.LastMergeAt.IsZero() {
+		t.Error("loaded LastMergeAt should not be zero")
+	}
+	// Time precision: JSON round-trip truncates to seconds on some platforms,
+	// so check that the times are within 1 second of each other.
+	diff := s.LastMergeAt.Sub(loaded.LastMergeAt)
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > time.Second {
+		t.Errorf("LastMergeAt drift after round-trip: original=%v loaded=%v", s.LastMergeAt, loaded.LastMergeAt)
+	}
+}
