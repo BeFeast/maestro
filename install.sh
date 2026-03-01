@@ -46,6 +46,22 @@ main() {
         echo "Check available binaries at https://github.com/${REPO}/releases/latest" >&2
         exit 1
     fi
+
+    CHECKSUM_URL="https://github.com/${REPO}/releases/download/${LATEST}/checksums.txt"
+    if ! curl -fsSL "$CHECKSUM_URL" -o "$TMPDIR/checksums.txt"; then
+        echo "error: failed to download checksums from ${CHECKSUM_URL}" >&2
+        exit 1
+    fi
+
+    echo "Verifying checksum..."
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$TMPDIR" && sha256sum -c checksums.txt --ignore-missing)
+    elif command -v shasum >/dev/null 2>&1; then
+        (cd "$TMPDIR" && shasum -a 256 -c checksums.txt --ignore-missing)
+    else
+        echo "warning: sha256sum/shasum not found, skipping checksum verification" >&2
+    fi
+
     tar xzf "$TMPFILE" -C "$TMPDIR"
     BINARY_PATH="${TMPDIR}/maestro-${OS}-${ARCH}"
     chmod +x "$BINARY_PATH"
