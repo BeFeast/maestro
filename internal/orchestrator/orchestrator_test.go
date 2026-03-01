@@ -1307,3 +1307,265 @@ func TestMergeReadyPR_OtherMergeErrorNoRebase(t *testing.T) {
 		t.Errorf("LastNotifiedStatus = %q, want %q", sess.LastNotifiedStatus, "merge_failed")
 	}
 }
+
+// --- silent timeout tests ---
+
+// newSilentTimeoutOrchestrator creates an Orchestrator wired for checkSessions
+// testing. The tmux capture function returns the provided output string.
+// It records whether stopWorker was called and which labels were added.
+func newSilentTimeoutOrchestrator(timeoutMinutes int, tmuxOutput string) (*Orchestrator, *bool, *[]string) {
+	stopped := false
+	labels := make([]string, 0)
+	return &Orchestrator{
+		cfg: &config.Config{
+			Repo:                       "owner/repo",
+			WorkerSilentTimeoutMinutes: timeoutMinutes,
+			MaxRuntimeMinutes:          120,
+		},
+		notifier:        &notify.Notifier{},
+		pidAliveFn:      func(pid int) bool { return true },
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(number int) (bool, error) { return false, nil },
+		tmuxCaptureFn:   func(session string) (string, error) { return tmuxOutput, nil },
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = true
+			return nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labels = append(labels, label)
+			return nil
+		},
+	}, &stopped, &labels
+}
+
+func TestCheckSessions_SilentTimeoutKillsStuckWorker(t *testing.T) {
+	output := "some static output\nline 2\nline 3"
+	o, stopped, _ := newSilentTimeoutOrchestrator(10, output)
+
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "stuck worker",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-stuck",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput(output),                // same hash as current output
+		LastOutputChangedAt: time.Now().Add(-15 * time.Minute), // 15 min ago > 10 min timeout
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if !*stopped {
+		t.Fatal("expected worker to be stopped")
+	}
+	if sess.Status != state.StatusDead {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus != "silent_timeout" {
+		t.Errorf("LastNotifiedStatus = %q, want %q", sess.LastNotifiedStatus, "silent_timeout")
+	}
+	if sess.FinishedAt == nil {
+		t.Error("FinishedAt should be set")
+	}
+}
+
+func TestCheckSessions_SilentTimeoutWithinTimeout_NoKill(t *testing.T) {
+	output := "some static output\nline 2\nline 3"
+	o, stopped, _ := newSilentTimeoutOrchestrator(10, output)
+
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "not yet stuck",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-not-stuck",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput(output),
+		LastOutputChangedAt: time.Now().Add(-5 * time.Minute), // 5 min ago < 10 min timeout
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if *stopped {
+		t.Fatal("worker should NOT be stopped within timeout")
+	}
+	if sess.Status != state.StatusRunning {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+}
+
+func TestCheckSessions_SilentTimeoutOutputChanges_NoKill(t *testing.T) {
+	// Tmux returns different output than last recorded hash
+	o, stopped, _ := newSilentTimeoutOrchestrator(10, "new output line\nline 2")
+
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "active worker",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-active",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput("old output"), // different from current
+		LastOutputChangedAt: time.Now().Add(-15 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if *stopped {
+		t.Fatal("worker should NOT be stopped when output changes")
+	}
+	if sess.Status != state.StatusRunning {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+	// Hash should be updated to new output
+	if sess.LastOutputHash != hashOutput("new output line\nline 2") {
+		t.Error("LastOutputHash should be updated to new output hash")
+	}
+}
+
+func TestCheckSessions_SilentTimeoutDisabled_NoKill(t *testing.T) {
+	output := "static output"
+	o, stopped, _ := newSilentTimeoutOrchestrator(0, output) // timeout=0 means disabled
+
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "no timeout",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-no-timeout",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput(output),
+		LastOutputChangedAt: time.Now().Add(-60 * time.Minute), // way past any timeout
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if *stopped {
+		t.Fatal("worker should NOT be stopped when timeout is disabled (0)")
+	}
+	if sess.Status != state.StatusRunning {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+}
+
+func TestCheckSessions_SilentTimeoutFirstKill_NoBlockedLabel(t *testing.T) {
+	output := "static output"
+	o, _, labels := newSilentTimeoutOrchestrator(10, output)
+
+	s := state.NewState()
+	// Only one session for this issue — first silent timeout
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "first timeout",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-first",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput(output),
+		LastOutputChangedAt: time.Now().Add(-15 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if sess.Status != state.StatusDead {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	// First silent timeout should NOT add "blocked" label
+	for _, label := range *labels {
+		if label == "blocked" {
+			t.Error("first silent timeout should NOT add 'blocked' label")
+		}
+	}
+}
+
+func TestCheckSessions_SilentTimeoutSecondKill_LabelsBlocked(t *testing.T) {
+	output := "static output"
+	o, _, labels := newSilentTimeoutOrchestrator(10, output)
+
+	s := state.NewState()
+	// Previous silent timeout for same issue
+	s.Sessions["slot-old"] = &state.Session{
+		IssueNumber:        42,
+		LastNotifiedStatus: "silent_timeout",
+		Status:             state.StatusDead,
+	}
+	// Current running session — will be killed
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "second timeout",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-second",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput(output),
+		LastOutputChangedAt: time.Now().Add(-15 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if sess.Status != state.StatusDead {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	// Second silent timeout SHOULD add "blocked" label
+	found := false
+	for _, label := range *labels {
+		if label == "blocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("second silent timeout should add 'blocked' label")
+	}
+}
+
+func TestCheckSessions_SilentTimeoutFirstObservation_SetsHash(t *testing.T) {
+	output := "initial output\nline 2"
+	o, stopped, _ := newSilentTimeoutOrchestrator(10, output)
+
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "new worker",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-slot-1",
+		Branch:      "feat/slot-1-42-new",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+		// LastOutputHash and LastOutputChangedAt are zero values (first observation)
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if *stopped {
+		t.Fatal("worker should NOT be stopped on first observation")
+	}
+	if sess.Status != state.StatusRunning {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+	if sess.LastOutputHash == "" {
+		t.Error("LastOutputHash should be set on first observation")
+	}
+	if sess.LastOutputHash != hashOutput(output) {
+		t.Errorf("LastOutputHash = %q, want hash of output", sess.LastOutputHash)
+	}
+	if sess.LastOutputChangedAt.IsZero() {
+		t.Error("LastOutputChangedAt should be set on first observation")
+	}
+}
