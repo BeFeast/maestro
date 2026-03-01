@@ -1151,3 +1151,159 @@ func TestAutoMergePRs_ParallelStatePersistence(t *testing.T) {
 		t.Errorf("LastMergeAt drift after round-trip: original=%v loaded=%v", s.LastMergeAt, loaded.LastMergeAt)
 	}
 }
+
+func TestMergeReadyPR_BehindMainTriggersRebase(t *testing.T) {
+	rebased := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: the head branch is not up to date with the base branch")
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+			rebased = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR("slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false when merge fails")
+	}
+	if !rebased {
+		t.Fatal("expected rebase to be triggered for 'not up to date' error")
+	}
+	if sess.Status != state.StatusQueued {
+		t.Errorf("session status = %q, want %q", sess.Status, state.StatusQueued)
+	}
+	if !sess.RebaseAttempted {
+		t.Error("RebaseAttempted should be true after successful rebase")
+	}
+}
+
+func TestMergeReadyPR_BehindMainRebaseFailsMarksConflict(t *testing.T) {
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		gh:       github.New("owner/repo"),
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: the head branch is not up to date with the base branch")
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+			return fmt.Errorf("rebase failed: conflict in main.go")
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR("slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false when rebase fails")
+	}
+	if sess.Status != state.StatusConflictFailed {
+		t.Errorf("session status = %q, want %q", sess.Status, state.StatusConflictFailed)
+	}
+	if !sess.RebaseAttempted {
+		t.Error("RebaseAttempted should be true after failed rebase")
+	}
+	if sess.FinishedAt == nil {
+		t.Error("FinishedAt should be set for conflict_failed session")
+	}
+}
+
+func TestMergeReadyPR_BehindMainNoAutoRebase(t *testing.T) {
+	rebased := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: false},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: the head branch is not up to date with the base branch")
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+			rebased = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR("slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false")
+	}
+	if rebased {
+		t.Fatal("rebase should not be triggered when AutoRebase is disabled")
+	}
+	if sess.Status != state.StatusPROpen {
+		t.Errorf("session status = %q, want %q (should stay pr_open)", sess.Status, state.StatusPROpen)
+	}
+}
+
+func TestMergeReadyPR_OtherMergeErrorNoRebase(t *testing.T) {
+	rebased := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: some other error")
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+			rebased = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR("slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false")
+	}
+	if rebased {
+		t.Fatal("rebase should not be triggered for non-'not up to date' errors")
+	}
+	if sess.Status != state.StatusPROpen {
+		t.Errorf("session status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.LastNotifiedStatus != "merge_failed" {
+		t.Errorf("LastNotifiedStatus = %q, want %q", sess.LastNotifiedStatus, "merge_failed")
+	}
+}

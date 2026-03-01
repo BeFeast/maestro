@@ -42,6 +42,7 @@ type Orchestrator struct {
 	ghMergePRFn            func(prNumber int) error
 	ghCloseIssueFn         func(number int, comment string) error
 	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
+	rebaseWorktreeFn       func(worktreePath, branch string, autoResolveFiles []string) error
 }
 
 // New creates a new Orchestrator
@@ -124,6 +125,13 @@ func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
 		return o.workerStopFn(o.cfg, slotName, sess)
 	}
 	return worker.Stop(o.cfg, slotName, sess)
+}
+
+func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
+	if o.rebaseWorktreeFn != nil {
+		return o.rebaseWorktreeFn(worktreePath, branch, o.cfg.AutoResolveFiles)
+	}
+	return worker.RebaseWorktree(worktreePath, branch, o.cfg.AutoResolveFiles)
 }
 
 func readLastLines(path string, limit int) (string, error) {
@@ -772,6 +780,19 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 	if err := o.mergePR(pr.Number); err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
+
+		// If the branch is behind main (not conflicting, just outdated), auto-rebase
+		if strings.Contains(err.Error(), "not up to date") && o.cfg.AutoRebase {
+			log.Printf("[orch] PR #%d branch is behind main, auto-rebasing %s", pr.Number, slotName)
+			if rebaseErr := o.rebaseWorktree(sess.Worktree, sess.Branch); rebaseErr != nil {
+				log.Printf("[orch] auto-rebase failed for %s: %v", slotName, rebaseErr)
+				o.markUnresolvableConflict(slotName, sess, pr.Number, rebaseErr)
+			} else {
+				o.markRebaseQueued(slotName, sess, pr.Number)
+			}
+			return false
+		}
+
 		// Only notify merge failure once per PR
 		if sess.LastNotifiedStatus != "merge_failed" {
 			o.notifier.Sendf("❌ maestro: failed to merge PR #%d (%s): %v", pr.Number, sess.Branch, err)
@@ -874,7 +895,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			}
 
 			log.Printf("[orch] PR #%d has conflicts, auto-rebasing %s", pr.Number, slotName)
-			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch, o.cfg.AutoResolveFiles); err != nil {
+			if err := o.rebaseWorktree(sess.Worktree, sess.Branch); err != nil {
 				log.Printf("[orch] rebase failed for %s: %v", slotName, err)
 				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
 				continue
@@ -891,7 +912,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			}
 
 			log.Printf("[orch] retrying auto-rebase for conflict_failed session %s (PR #%d)", slotName, pr.Number)
-			if err := worker.RebaseWorktree(sess.Worktree, sess.Branch, o.cfg.AutoResolveFiles); err != nil {
+			if err := o.rebaseWorktree(sess.Worktree, sess.Branch); err != nil {
 				log.Printf("[orch] rebase retry failed for %s: %v", slotName, err)
 				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
 				continue
