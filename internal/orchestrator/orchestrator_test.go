@@ -153,6 +153,122 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 	}
 }
 
+// TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen verifies
+// the fix for the infinite-spawn bug (issue #152): when a worker exits after
+// creating a PR, reconcile must NOT mark the session dead — it must transition
+// to pr_open so that IssueInProgress returns true and no duplicate worker is spawned.
+func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["mae-5"] = &state.Session{
+		IssueNumber: 105,
+		IssueTitle:  "fix crash",
+		Status:      state.StatusRunning,
+		PID:         9999,
+		TmuxSession: "maestro-mae-5",
+		Branch:      "feat/mae-5-105-fix-crash",
+	}
+
+	openPRs := []github.PR{
+		{Number: 137, HeadRefName: "feat/mae-5-105-fix-crash", Title: "fix crash"},
+	}
+
+	o := &Orchestrator{
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return openPRs, nil },
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["mae-5"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q (worker created PR before exiting — should not be dead)", sess.Status, state.StatusPROpen)
+	}
+	if sess.PRNumber != 137 {
+		t.Fatalf("pr_number = %d, want 137", sess.PRNumber)
+	}
+	if sess.PID != 0 {
+		t.Fatalf("pid = %d, want 0", sess.PID)
+	}
+	if sess.TmuxSession != "" {
+		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("finished_at should be set")
+	}
+	// Crucially: IssueInProgress must return true so no duplicate worker is spawned
+	if !s.IssueInProgress(105) {
+		t.Fatal("IssueInProgress(105) must return true after transition to pr_open")
+	}
+}
+
+// TestReconcileRunningSessions_DeadWorkerNoPR_TransitionsToDead verifies that
+// the existing behaviour is preserved when no PR exists for the dead worker.
+func TestReconcileRunningSessions_DeadWorkerNoPR_TransitionsToDead(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["mae-6"] = &state.Session{
+		IssueNumber: 106,
+		IssueTitle:  "add feature",
+		Status:      state.StatusRunning,
+		PID:         8888,
+		TmuxSession: "maestro-mae-6",
+		Branch:      "feat/mae-6-106-add-feature",
+	}
+
+	// No open PRs for this branch
+	o := &Orchestrator{
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["mae-6"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.PRNumber != 0 {
+		t.Fatalf("pr_number = %d, want 0", sess.PRNumber)
+	}
+}
+
+// TestReconcileRunningSessions_PRListError_FallsBackToDead ensures that when
+// the GitHub PR listing fails, reconcile still marks the session dead (degraded
+// mode) rather than panicking or blocking indefinitely.
+func TestReconcileRunningSessions_PRListError_FallsBackToDead(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["mae-7"] = &state.Session{
+		IssueNumber: 107,
+		Status:      state.StatusRunning,
+		PID:         7777,
+		TmuxSession: "maestro-mae-7",
+		Branch:      "feat/mae-7-107-something",
+	}
+
+	o := &Orchestrator{
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, fmt.Errorf("network error") },
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+	sess := s.Sessions["mae-7"]
+	// Falls back to dead when PR list unavailable — better to mark dead than to loop forever
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (should fall back to dead when PR list fails)", sess.Status, state.StatusDead)
+	}
+}
+
 func TestReconcileRunningSessions_DeadPIDGetsMarkedDead(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["pan-1"] = &state.Session{
@@ -163,11 +279,13 @@ func TestReconcileRunningSessions_DeadPIDGetsMarkedDead(t *testing.T) {
 		RetryCount:         2,
 		IssueTitle:         "stale worker",
 		LastNotifiedStatus: "",
+		Branch:             "feat/pan-1-71-stale-worker",
 	}
 
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return true },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
 	}
 
 	changed := o.reconcileRunningSessions(s)
@@ -200,11 +318,13 @@ func TestReconcileRunningSessions_MissingTmuxGetsMarkedDead(t *testing.T) {
 		Status:      state.StatusRunning,
 		PID:         5151,
 		TmuxSession: "maestro-pan-2",
+		Branch:      "feat/pan-2-71-stale",
 	}
 
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return true },
 		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
 	}
 
 	changed := o.reconcileRunningSessions(s)
@@ -236,6 +356,7 @@ func TestReconcileRunningSessions_UsesDefaultTmuxNameWhenMissingInState(t *testi
 		IssueNumber: 73,
 		Status:      state.StatusRunning,
 		PID:         6262,
+		Branch:      "feat/pan-3-73-something",
 		// TmuxSession intentionally empty; should fall back to worker.TmuxSessionName(slot)
 	}
 
@@ -246,6 +367,7 @@ func TestReconcileRunningSessions_UsesDefaultTmuxNameWhenMissingInState(t *testi
 			calledWith = name
 			return true
 		},
+		listOpenPRsFn: func() ([]github.PR, error) { return []github.PR{}, nil },
 	}
 
 	changed := o.reconcileRunningSessions(s)

@@ -33,6 +33,8 @@ type Orchestrator struct {
 	enhancementPromptBase string
 	pidAliveFn            func(pid int) bool
 	tmuxSessionExistsFn   func(name string) bool
+	listOpenPRsFn         func() ([]github.PR, error)
+	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 }
 
 // New creates a new Orchestrator
@@ -66,6 +68,20 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 		return false
 	}
 	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+}
+
+func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
+	if o.listOpenPRsFn != nil {
+		return o.listOpenPRsFn()
+	}
+	return o.gh.ListOpenPRs()
+}
+
+func (o *Orchestrator) hasOpenPRForIssue(issueNumber int) (bool, error) {
+	if o.hasOpenPRForIssueFn != nil {
+		return o.hasOpenPRForIssueFn(issueNumber)
+	}
+	return o.gh.HasOpenPRForIssue(issueNumber)
 }
 
 func readLastLines(path string, limit int) (string, error) {
@@ -269,8 +285,25 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 
 // reconcileRunningSessions self-heals stale "running" sessions.
 // If a session is marked running but either its PID is dead/missing OR its tmux session
-// is missing, the session is marked dead and its PID/tmux fields are cleared.
+// is missing, the session is transitioned to a terminal state.
+//
+// Before marking a session dead, it checks whether the worker already opened a PR
+// for its branch. If a PR exists, the session transitions to pr_open instead of dead.
+// This prevents the infinite-spawn loop where reconcile kills a session whose worker
+// had successfully created a PR before the tmux session was cleaned up.
 func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
+	// Fetch open PRs once — used to rescue sessions where the worker exited
+	// after creating a PR (process/tmux gone, but PR is already open on GitHub).
+	prs, prErr := o.listOpenPRs()
+	branchToPR := make(map[string]github.PR)
+	if prErr != nil {
+		log.Printf("[orch] reconcile: warn — could not list PRs: %v (will mark stale sessions dead)", prErr)
+	} else {
+		for _, pr := range prs {
+			branchToPR[pr.HeadRefName] = pr
+		}
+	}
+
 	reconciled := false
 	for slotName, sess := range s.Sessions {
 		if sess.Status != state.StatusRunning {
@@ -294,6 +327,23 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		}
 
 		if len(reasons) == 0 {
+			continue
+		}
+
+		// Worker process/session is gone. Before marking dead, check whether it
+		// already opened a PR. If so, transition to pr_open — the worker succeeded.
+		// Without this check, reconcile would mark the session dead, causing
+		// IssueInProgress to return false and startNewWorkers to spawn a duplicate.
+		if pr, found := branchToPR[sess.Branch]; found {
+			log.Printf("[orch] reconcile: %s running->pr_open (PR #%d already open for branch %q; %s)",
+				slotName, pr.Number, sess.Branch, strings.Join(reasons, ", "))
+			sess.Status = state.StatusPROpen
+			sess.PRNumber = pr.Number
+			sess.PID = 0
+			sess.TmuxSession = ""
+			now := time.Now().UTC()
+			sess.FinishedAt = &now
+			reconciled = true
 			continue
 		}
 
@@ -856,6 +906,16 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
 			log.Printf("[orch] skipping issue #%d (excluded label)", issue.Number)
+			continue
+		}
+
+		// Safety net: check GitHub directly for any open PR referencing this issue.
+		// This guards against the race where reconcileRunningSessions marked a session
+		// dead before checkSessions could detect its PR and transition it to pr_open.
+		if hasOpenPR, err := o.hasOpenPRForIssue(issue.Number); err != nil {
+			log.Printf("[orch] warn: could not check open PRs for issue #%d: %v", issue.Number, err)
+		} else if hasOpenPR {
+			log.Printf("[orch] skipping issue #%d: open PR already exists", issue.Number)
 			continue
 		}
 
