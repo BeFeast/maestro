@@ -127,7 +127,8 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 		absConfigPath = yamlPath
 	}
 
-	if err := writeInitServiceFile(w, binPath, absConfigPath); err != nil {
+	currentPATH := os.Getenv("PATH")
+	if err := writeInitServiceFile(w, binPath, absConfigPath, currentPATH); err != nil {
 		fmt.Fprintf(w, "Note: could not create service file: %v\n", err)
 	}
 
@@ -144,7 +145,7 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	return nil
 }
 
-func writeInitServiceFile(w io.Writer, binPath, configPath string) error {
+func writeInitServiceFile(w io.Writer, binPath, configPath, pathEnv string) error {
 	switch runtime.GOOS {
 	case "linux":
 		dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
@@ -152,7 +153,7 @@ func writeInitServiceFile(w io.Writer, binPath, configPath string) error {
 			return err
 		}
 		path := filepath.Join(dir, "maestro.service")
-		if err := os.WriteFile(path, []byte(systemdUnit(binPath, configPath)), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(systemdUnit(binPath, configPath, pathEnv)), 0644); err != nil {
 			return err
 		}
 		fmt.Fprintf(w, "\u2705 Created %s\n", path)
@@ -162,7 +163,7 @@ func writeInitServiceFile(w io.Writer, binPath, configPath string) error {
 			return err
 		}
 		path := filepath.Join(dir, "com.maestro.agent.plist")
-		if err := os.WriteFile(path, []byte(launchdPlist(binPath, configPath)), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(launchdPlist(binPath, configPath, pathEnv)), 0644); err != nil {
 			return err
 		}
 		fmt.Fprintf(w, "\u2705 Created %s\n", path)
@@ -170,23 +171,24 @@ func writeInitServiceFile(w io.Writer, binPath, configPath string) error {
 	return nil
 }
 
-func systemdUnit(binPath, configPath string) string {
+func systemdUnit(binPath, configPath, pathEnv string) string {
 	return fmt.Sprintf(`[Unit]
 Description=Maestro - AI coding agent orchestrator
 After=network.target
 
 [Service]
 Type=simple
+Environment=PATH=%s
 ExecStart=%s run --config %s
 Restart=on-failure
 RestartSec=30
 
 [Install]
 WantedBy=default.target
-`, binPath, configPath)
+`, pathEnv, binPath, configPath)
 }
 
-func launchdPlist(binPath, configPath string) string {
+func launchdPlist(binPath, configPath, pathEnv string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -200,6 +202,11 @@ func launchdPlist(binPath, configPath string) string {
         <string>--config</string>
         <string>%s</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>%s</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -210,7 +217,7 @@ func launchdPlist(binPath, configPath string) string {
     <string>/tmp/maestro.stderr.log</string>
 </dict>
 </plist>
-`, binPath, configPath)
+`, binPath, configPath, pathEnv)
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {
