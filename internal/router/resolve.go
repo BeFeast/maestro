@@ -51,14 +51,18 @@ func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string)
 
 	// 2. Auto-routing via LLM (if enabled)
 	if r.cfg.Routing.Mode == "auto" {
-		routedBackend, routeReason, err := r.Route(issue)
+		routeFn := r.Route
+		if r.RouteFn != nil {
+			routeFn = r.RouteFn
+		}
+		routedBackend, routeReason, err := routeFn(issue)
 		if err != nil {
 			log.Printf("[router] issue #%d: error %v — using default", issue.Number, err)
-		} else {
+		} else if routedBackend != "" {
 			log.Printf("[router] issue #%d → %s (%s)", issue.Number, routedBackend, routeReason)
+			return routedBackend, routeReason
 		}
-		// Route already falls back to default on error
-		return routedBackend, routeReason
+		// Fall through to default on error or empty backend
 	}
 
 	// 3. Default backend

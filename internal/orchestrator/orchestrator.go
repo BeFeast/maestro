@@ -35,7 +35,6 @@ type Orchestrator struct {
 	tmuxSessionExistsFn   func(name string) bool
 	listOpenPRsFn         func() ([]github.PR, error)
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
-	routeFn               func(issue github.Issue) (string, string, error)
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn         func(prNumber int) (string, error)
@@ -930,35 +929,13 @@ func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Ses
 }
 
 // resolveBackend determines which backend to use for the given issue.
-// Priority: 1) model:<name> label override, 2) auto-routing via LLM, 3) default.
+// Delegates to router.ResolveBackend which applies 3-tier priority:
+//  1. model:<backend> label on the issue (highest priority)
+//  2. Auto-routing via LLM (if routing.mode == "auto")
+//  3. Default backend from config
 func (o *Orchestrator) resolveBackend(issue github.Issue) string {
-	// Check for model: label (highest priority)
-	if name := router.BackendFromLabels(issue); name != "" {
-		validated, ok := router.ValidateBackend(name, o.cfg)
-		if !ok {
-			log.Printf("[router] issue #%d: label model:%s references unknown backend — falling back to default %q", issue.Number, name, o.cfg.Model.Default)
-		} else {
-			log.Printf("[router] issue #%d → %s (label override)", issue.Number, validated)
-		}
-		return validated
-	}
-
-	// Try auto-routing via LLM
-	if o.cfg.Routing.Mode == "auto" {
-		routeFn := o.router.Route
-		if o.routeFn != nil {
-			routeFn = o.routeFn
-		}
-		routedBackend, reason, err := routeFn(issue)
-		if err != nil {
-			log.Printf("[router] issue #%d: error %v — using default", issue.Number, err)
-		} else if routedBackend != "" {
-			log.Printf("[router] issue #%d → %s (%s)", issue.Number, routedBackend, reason)
-			return routedBackend
-		}
-	}
-
-	return o.cfg.Model.Default
+	name, _ := o.router.ResolveBackend(issue)
+	return name
 }
 
 // startNewWorkers picks eligible issues and starts workers for them

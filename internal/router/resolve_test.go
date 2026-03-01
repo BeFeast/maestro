@@ -1,6 +1,7 @@
 package router
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/befeast/maestro/internal/config"
@@ -211,6 +212,58 @@ func TestResolveBackend_NoLabelsManualMode(t *testing.T) {
 	name, reason := r.ResolveBackend(issue)
 	if name != "codex" {
 		t.Errorf("ResolveBackend() name = %q, want %q (default)", name, "codex")
+	}
+	if reason != "default" {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "default")
+	}
+}
+
+func TestResolveBackend_AutoRoutingViaRouteFn(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "auto"},
+	}
+	r := New(cfg)
+	r.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "codex", "simple fix", nil
+	}
+
+	issue := makeIssue(47, "Simple fix")
+	name, reason := r.ResolveBackend(issue)
+	if name != "codex" {
+		t.Errorf("ResolveBackend() name = %q, want %q", name, "codex")
+	}
+	if reason != "simple fix" {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "simple fix")
+	}
+}
+
+func TestResolveBackend_AutoRoutingErrorFallsToDefault(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "auto"},
+	}
+	r := New(cfg)
+	r.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "", "", fmt.Errorf("network error")
+	}
+
+	issue := makeIssue(48, "Fix bug")
+	name, reason := r.ResolveBackend(issue)
+	if name != "claude" {
+		t.Errorf("ResolveBackend() name = %q, want %q (should fall back to default)", name, "claude")
 	}
 	if reason != "default" {
 		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "default")
