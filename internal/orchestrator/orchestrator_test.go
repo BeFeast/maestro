@@ -1848,3 +1848,123 @@ func TestCheckSessions_SilentTimeoutFirstObservation_SetsHash(t *testing.T) {
 		t.Error("LastOutputChangedAt should be set on first observation")
 	}
 }
+
+func TestCheckSessions_SilentTimeoutTmuxCaptureFails_NoKill(t *testing.T) {
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:                       "owner/repo",
+			WorkerSilentTimeoutMinutes: 10,
+			MaxRuntimeMinutes:          120,
+		},
+		notifier:        &notify.Notifier{},
+		pidAliveFn:      func(pid int) bool { return true },
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(number int) (bool, error) { return false, nil },
+		tmuxCaptureFn: func(session string) (string, error) {
+			return "", fmt.Errorf("tmux session not found")
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			t.Fatal("stopWorker should not be called when tmux capture fails")
+			return nil
+		},
+	}
+
+	output := "static output"
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "tmux broken",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-tmux-broken",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput(output),
+		LastOutputChangedAt: time.Now().Add(-15 * time.Minute), // past timeout
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if sess.Status != state.StatusRunning {
+		t.Errorf("status = %q, want %q — worker must survive tmux capture failure", sess.Status, state.StatusRunning)
+	}
+}
+
+func TestCheckSessions_SilentTimeoutStopFails_StillMarksDead(t *testing.T) {
+	output := "static output"
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:                       "owner/repo",
+			WorkerSilentTimeoutMinutes: 10,
+			MaxRuntimeMinutes:          120,
+		},
+		notifier:        &notify.Notifier{},
+		pidAliveFn:      func(pid int) bool { return true },
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(number int) (bool, error) { return false, nil },
+		tmuxCaptureFn:   func(session string) (string, error) { return output, nil },
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return fmt.Errorf("permission denied")
+		},
+		addIssueLabelFn: func(number int, label string) error { return nil },
+	}
+
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         42,
+		IssueTitle:          "stop will fail",
+		Status:              state.StatusRunning,
+		PID:                 1234,
+		TmuxSession:         "maestro-slot-1",
+		Branch:              "feat/slot-1-42-stop-fail",
+		StartedAt:           time.Now().Add(-30 * time.Minute),
+		LastOutputHash:      hashOutput(output),
+		LastOutputChangedAt: time.Now().Add(-15 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-1"]
+	if sess.Status != state.StatusDead {
+		t.Errorf("status = %q, want %q — session must be marked dead even if stop fails", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus != "silent_timeout" {
+		t.Errorf("LastNotifiedStatus = %q, want %q", sess.LastNotifiedStatus, "silent_timeout")
+	}
+	if sess.FinishedAt == nil {
+		t.Error("FinishedAt should be set even when stop fails")
+	}
+}
+
+func TestHashOutput_FewerThan50Lines(t *testing.T) {
+	short := "line1\nline2\nline3"
+	h1 := hashOutput(short)
+	h2 := hashOutput(short)
+	if h1 != h2 {
+		t.Fatal("hashOutput should be deterministic")
+	}
+	if h1 == "" {
+		t.Fatal("hashOutput should not return empty string")
+	}
+}
+
+func TestHashOutput_EmptyString(t *testing.T) {
+	h := hashOutput("")
+	if h == "" {
+		t.Fatal("hashOutput should not return empty string for empty input")
+	}
+}
+
+func TestCountSilentTimeoutKillsForIssue_NoMatches(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{IssueNumber: 10, LastNotifiedStatus: "ci_failure"}
+	s.Sessions["slot-2"] = &state.Session{IssueNumber: 20, LastNotifiedStatus: "silent_timeout"}
+
+	if got := countSilentTimeoutKillsForIssue(s, 10); got != 0 {
+		t.Fatalf("countSilentTimeoutKillsForIssue(10) = %d, want 0 (ci_failure != silent_timeout)", got)
+	}
+	if got := countSilentTimeoutKillsForIssue(s, 99); got != 0 {
+		t.Fatalf("countSilentTimeoutKillsForIssue(99) = %d, want 0 (no sessions for issue)", got)
+	}
+}
