@@ -20,7 +20,9 @@ jobs:
           cache: true
 
       - name: Build
-        run: go build ./cmd/maestro/
+        run: |
+          VERSION=$(git describe --tags --always)
+          go build -ldflags "-X main.version=${VERSION#v}" ./cmd/maestro/
 
       - name: Vet
         run: go vet ./...
