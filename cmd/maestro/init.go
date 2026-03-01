@@ -9,27 +9,20 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
-// initYAMLConfig is the config structure written to maestro.yaml by init.
-type initYAMLConfig struct {
-	Repo         string            `yaml:"repo"`
-	LocalPath    string            `yaml:"local_path"`
-	WorktreeBase string            `yaml:"worktree_base"`
-	MaxParallel  int               `yaml:"max_parallel"`
-	IssueLabels  []string          `yaml:"issue_labels"`
-	Model        initYAMLModel     `yaml:"model"`
-	Telegram     *initYAMLTelegram `yaml:"telegram,omitempty"`
-}
+// validBackends is the set of supported model backends for init validation.
+var validBackends = []string{"claude", "codex", "gemini", "cline"}
 
-type initYAMLModel struct {
-	Default string `yaml:"default"`
-}
-
-type initYAMLTelegram struct {
-	Target string `yaml:"target"`
+// initConfig holds the values collected by the init wizard.
+type initConfig struct {
+	Repo         string
+	LocalPath    string
+	WorktreeBase string
+	MaxParallel  int
+	IssueLabel   string
+	ModelBackend string
+	TelegramID   string
 }
 
 func initCmd(args []string) {
@@ -65,7 +58,13 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	backendHint := strings.Join(validBackends, "/")
+	modelBackend := promptInit(scanner, w, fmt.Sprintf("Default model backend (%s)", backendHint), "claude")
+
+	if !isValidBackend(modelBackend) {
+		return fmt.Errorf("invalid model backend %q — valid options: %s", modelBackend, strings.Join(validBackends, ", "))
+	}
+
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -76,35 +75,29 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	telegramAnswer := promptInit(scanner, w, "Telegram notifications? (y/N)", "")
 	wantsTelegram := strings.EqualFold(telegramAnswer, "y") || strings.EqualFold(telegramAnswer, "yes")
 
-	var telegram *initYAMLTelegram
+	var telegramID string
 	if wantsTelegram {
 		fmt.Fprintf(w, "  \u2192 Telegram target ID: ")
 		if scanner.Scan() {
-			if id := strings.TrimSpace(scanner.Text()); id != "" {
-				telegram = &initYAMLTelegram{Target: id}
-			}
+			telegramID = strings.TrimSpace(scanner.Text())
 		}
 	}
 
 	fmt.Fprintln(w)
 
 	// Build config
-	cfg := initYAMLConfig{
+	cfg := initConfig{
 		Repo:         repo,
 		LocalPath:    localPath,
 		WorktreeBase: worktreeBase,
 		MaxParallel:  maxParallel,
-		IssueLabels:  []string{issueLabel},
-		Model:        initYAMLModel{Default: modelBackend},
-		Telegram:     telegram,
+		IssueLabel:   issueLabel,
+		ModelBackend: modelBackend,
+		TelegramID:   telegramID,
 	}
 
-	yamlData, err := yaml.Marshal(&cfg)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-
-	if err := os.WriteFile(yamlPath, yamlData, 0644); err != nil {
+	yamlData := renderInitConfig(cfg)
+	if err := os.WriteFile(yamlPath, []byte(yamlData), 0644); err != nil {
 		return fmt.Errorf("write maestro.yaml: %w", err)
 	}
 	fmt.Fprintln(w, "\u2705 Created maestro.yaml")
@@ -211,6 +204,43 @@ func launchdPlist(binPath, configPath string) string {
 </dict>
 </plist>
 `, binPath, configPath)
+}
+
+func isValidBackend(name string) bool {
+	for _, b := range validBackends {
+		if b == name {
+			return true
+		}
+	}
+	return false
+}
+
+// renderInitConfig produces the YAML config file content with commented-out
+// examples for commonly used settings so new users can discover features.
+func renderInitConfig(cfg initConfig) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "repo: %s\n", cfg.Repo)
+	fmt.Fprintf(&b, "local_path: %s\n", cfg.LocalPath)
+	fmt.Fprintf(&b, "worktree_base: %s\n", cfg.WorktreeBase)
+	fmt.Fprintf(&b, "max_parallel: %d\n", cfg.MaxParallel)
+	fmt.Fprintf(&b, "issue_labels:\n  - %s\n", cfg.IssueLabel)
+	fmt.Fprintf(&b, "model:\n  default: %s\n", cfg.ModelBackend)
+
+	if cfg.TelegramID != "" {
+		fmt.Fprintf(&b, "telegram:\n  target: \"%s\"\n", cfg.TelegramID)
+	}
+
+	// Commented-out examples for discoverability
+	b.WriteString("\n# --- Optional settings (uncomment to enable) ---\n")
+	b.WriteString("# max_runtime_minutes: 120\n")
+	b.WriteString("# auto_rebase: true\n")
+	b.WriteString("# merge_strategy: sequential\n")
+	b.WriteString("# worker_prompt: ./worker-prompt.md\n")
+	b.WriteString("# exclude_labels:\n")
+	b.WriteString("#   - wontfix\n")
+	b.WriteString("#   - blocked\n")
+
+	return b.String()
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {

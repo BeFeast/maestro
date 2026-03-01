@@ -281,3 +281,132 @@ func TestRunInitWizardInvalidMaxParallel(t *testing.T) {
 		t.Errorf("invalid max_parallel should default to 3, got:\n%s", string(data))
 	}
 }
+
+func TestIsValidBackend(t *testing.T) {
+	for _, b := range []string{"claude", "codex", "gemini", "cline"} {
+		if !isValidBackend(b) {
+			t.Errorf("isValidBackend(%q) = false, want true", b)
+		}
+	}
+	for _, b := range []string{"gpt", "llama", "", "Claude"} {
+		if isValidBackend(b) {
+			t.Errorf("isValidBackend(%q) = true, want false", b)
+		}
+	}
+}
+
+func TestRunInitWizardInvalidBackend(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	// repo, local_path, worktree, max_parallel, model=gpt (invalid), ...
+	input := "org/repo\n\n\n\ngpt\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err == nil {
+		t.Fatal("expected error for invalid model backend")
+	}
+	if !strings.Contains(err.Error(), "invalid model backend") {
+		t.Errorf("error should mention 'invalid model backend', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error should list valid options, got: %v", err)
+	}
+}
+
+func TestRenderInitConfig(t *testing.T) {
+	cfg := initConfig{
+		Repo:         "org/repo",
+		LocalPath:    "~/src/repo",
+		WorktreeBase: "~/.worktrees/repo",
+		MaxParallel:  3,
+		IssueLabel:   "enhancement",
+		ModelBackend: "claude",
+	}
+	out := renderInitConfig(cfg)
+
+	// Check active settings
+	for _, want := range []string{
+		"repo: org/repo",
+		"local_path: ~/src/repo",
+		"worktree_base: ~/.worktrees/repo",
+		"max_parallel: 3",
+		"- enhancement",
+		"default: claude",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q, got:\n%s", want, out)
+		}
+	}
+
+	// Check commented-out examples
+	for _, want := range []string{
+		"# max_runtime_minutes: 120",
+		"# auto_rebase: true",
+		"# merge_strategy: sequential",
+		"# worker_prompt:",
+		"# exclude_labels:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing commented example %q, got:\n%s", want, out)
+		}
+	}
+
+	// No telegram when empty
+	if strings.Contains(out, "telegram") {
+		t.Errorf("should not contain telegram when TelegramID is empty, got:\n%s", out)
+	}
+}
+
+func TestRenderInitConfigWithTelegram(t *testing.T) {
+	cfg := initConfig{
+		Repo:         "org/repo",
+		LocalPath:    "~/src/repo",
+		WorktreeBase: "~/.worktrees/repo",
+		MaxParallel:  3,
+		IssueLabel:   "enhancement",
+		ModelBackend: "claude",
+		TelegramID:   "12345",
+	}
+	out := renderInitConfig(cfg)
+
+	if !strings.Contains(out, "telegram:") {
+		t.Errorf("should contain telegram section, got:\n%s", out)
+	}
+	if !strings.Contains(out, "12345") {
+		t.Errorf("should contain telegram target, got:\n%s", out)
+	}
+}
+
+func TestRunInitWizardRicherConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+
+	yamlStr := string(data)
+	// Verify commented-out examples are present in the generated file
+	for _, want := range []string{
+		"# max_runtime_minutes: 120",
+		"# auto_rebase: true",
+		"# merge_strategy: sequential",
+		"# worker_prompt:",
+		"# exclude_labels:",
+	} {
+		if !strings.Contains(yamlStr, want) {
+			t.Errorf("generated config missing commented example %q, got:\n%s", want, yamlStr)
+		}
+	}
+}
