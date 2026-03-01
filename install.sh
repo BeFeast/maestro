@@ -58,6 +58,25 @@ main() {
     fi
 
     echo "maestro ${LATEST} installed to ${INSTALL_DIR}/maestro"
+
+    # Verify the install worked
+    if command -v maestro >/dev/null 2>&1; then
+        maestro version
+    fi
+
+    # Remind about prerequisites
+    echo
+    echo "Prerequisites (install if missing):"
+    for dep in git gh tmux; do
+        if command -v "$dep" >/dev/null 2>&1; then
+            printf "  ✓ %s\n" "$dep"
+        else
+            printf "  ✗ %s  ← install before running maestro\n" "$dep"
+        fi
+    done
+
+    echo
+    echo "Next: cd <your-repo> && maestro init"
 }
 
 main

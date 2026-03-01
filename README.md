@@ -101,16 +101,17 @@ cd ~/src/myrepo
 maestro init
 ```
 
-The `maestro init` wizard will ask you for:
-- **GitHub repo** (owner/repo format)
-- **Local clone path** (where the repo lives on disk)
-- **Worktree base dir** (where worker worktrees are created)
-- **Max parallel workers** (how many agents run simultaneously)
-- **Default model backend** (claude, codex, gemini, or cline)
-- **Issue label filter** (which issues to pick up, e.g. `enhancement`)
-- **Telegram notifications** (optional)
-
-It generates a `maestro.yaml` config file and a systemd/launchd service file.
+The `maestro init` wizard will:
+1. **Check prerequisites** (git, gh, tmux, AI CLI) and warn about anything missing
+2. Ask you for:
+   - **GitHub repo** (owner/repo format)
+   - **Local clone path** (where the repo lives on disk)
+   - **Worktree base dir** (where worker worktrees are created)
+   - **Max parallel workers** (how many agents run simultaneously)
+   - **Default model backend** (claude, codex, gemini, or cline)
+   - **Issue label filter** (which issues to pick up, e.g. `enhancement`)
+   - **Telegram notifications** (optional)
+3. Generate a `maestro.yaml` config file and a systemd/launchd service file
 
 ```bash
 # 4. Do a test run (picks one issue, runs once, then exits)

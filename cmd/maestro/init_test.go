@@ -120,6 +120,9 @@ func TestRunInitWizard(t *testing.T) {
 	if !strings.Contains(out, "Welcome to Maestro") {
 		t.Error("should show welcome message")
 	}
+	if !strings.Contains(out, "Checking prerequisites") {
+		t.Error("should show prerequisite check")
+	}
 	if !strings.Contains(out, "\u2705 Created maestro.yaml") {
 		t.Error("should show config created message")
 	}
@@ -257,6 +260,45 @@ func TestRunInitWizardStateDirConfirmation(t *testing.T) {
 	maestroDir := filepath.Join(tmpDir, ".maestro")
 	if !strings.Contains(out, maestroDir) {
 		t.Errorf("output should mention state directory %s, got:\n%s", maestroDir, out)
+	}
+}
+
+func TestCheckPrerequisites(t *testing.T) {
+	var buf bytes.Buffer
+	checkPrerequisites(&buf)
+	out := buf.String()
+	if !strings.Contains(out, "Checking prerequisites") {
+		t.Error("should print header")
+	}
+	// git should always be present in test environment
+	if !strings.Contains(out, "git") {
+		t.Error("should check for git")
+	}
+}
+
+func TestRunInitWizardUnknownBackend(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\ncustomai\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	out := output.String()
+	if !strings.Contains(out, "not a known backend") {
+		t.Errorf("should warn about unknown backend, got:\n%s", out)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+	if !strings.Contains(string(data), "default: customai") {
+		t.Errorf("should still use the custom backend, got:\n%s", string(data))
 	}
 }
 

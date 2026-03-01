@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -51,6 +52,9 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	fmt.Fprintln(w, "Welcome to Maestro! Let's set up your first project.")
 	fmt.Fprintln(w)
 
+	// Check prerequisites
+	checkPrerequisites(w)
+
 	repo := promptInit(scanner, w, "GitHub repo (owner/repo)", "")
 	if repo == "" {
 		return fmt.Errorf("repo is required")
@@ -65,12 +69,17 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini/cline)", "claude")
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
 	if err != nil || maxParallel < 1 {
 		maxParallel = 3
+	}
+
+	validBackends := map[string]bool{"claude": true, "codex": true, "gemini": true, "cline": true}
+	if !validBackends[modelBackend] {
+		fmt.Fprintf(w, "  Note: %q is not a known backend; using anyway.\n", modelBackend)
 	}
 
 	telegramAnswer := promptInit(scanner, w, "Telegram notifications? (y/N)", "")
@@ -211,6 +220,49 @@ func launchdPlist(binPath, configPath string) string {
 </dict>
 </plist>
 `, binPath, configPath)
+}
+
+// checkPrerequisites prints a summary of required tools and their availability.
+func checkPrerequisites(w io.Writer) {
+	fmt.Fprintln(w, "Checking prerequisites...")
+
+	required := []struct {
+		name string
+		hint string
+	}{
+		{"git", "install from https://git-scm.com"},
+		{"gh", "install from https://cli.github.com"},
+		{"tmux", "install: apt install tmux / brew install tmux"},
+	}
+
+	aiCLIs := []string{"claude", "codex", "gemini", "cline"}
+
+	allOK := true
+	for _, dep := range required {
+		if _, err := exec.LookPath(dep.name); err != nil {
+			fmt.Fprintf(w, "  \u2717 %s — %s\n", dep.name, dep.hint)
+			allOK = false
+		} else {
+			fmt.Fprintf(w, "  \u2713 %s\n", dep.name)
+		}
+	}
+
+	foundAI := false
+	for _, cli := range aiCLIs {
+		if _, err := exec.LookPath(cli); err == nil {
+			fmt.Fprintf(w, "  \u2713 %s\n", cli)
+			foundAI = true
+		}
+	}
+	if !foundAI {
+		fmt.Fprintln(w, "  \u2717 no AI CLI found (install one of: claude, codex, gemini, cline)")
+		allOK = false
+	}
+
+	if !allOK {
+		fmt.Fprintln(w, "  Warning: some prerequisites are missing. Install them before running maestro.")
+	}
+	fmt.Fprintln(w)
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {
