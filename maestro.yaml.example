@@ -47,6 +47,7 @@ worker_prompt: /path/to/worker-prompt-template.md
 
 # Optional: command to run after successful merge (build + deploy)
 # deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
+# deploy_timeout_minutes: 15         # timeout for deploy command in minutes (default: 15)
 
 # Telegram notifications
 telegram:

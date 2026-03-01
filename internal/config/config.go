@@ -69,6 +69,7 @@ type Config struct {
 	Model                      ModelConfig      `yaml:"model"`
 	Routing                    RoutingConfig    `yaml:"routing"`
 	DeployCmd                  string           `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
+	DeployTimeoutMinutes       int              `yaml:"deploy_timeout_minutes"` // timeout for deploy command in minutes (default: 15)
 	MergeStrategy              string           `yaml:"merge_strategy"`         // "sequential" | "parallel"
 	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
 	Telegram                   TelegramConfig   `yaml:"telegram"`
@@ -113,6 +114,7 @@ func parse(data []byte) (*Config, error) {
 		MaxParallel:          5,
 		MaxRuntimeMinutes:    120,
 		MaxRetriesPerIssue:   3,
+		DeployTimeoutMinutes: 15,
 		AutoRebase:           true,
 		ClaudeCmd:            "claude",
 		MergeStrategy:        "sequential",

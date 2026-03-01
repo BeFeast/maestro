@@ -868,11 +868,12 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	return true
 }
 
-// runDeployCmd executes the configured deploy command with a 5-minute timeout.
+// runDeployCmd executes the configured deploy command with a configurable timeout.
 func (o *Orchestrator) runDeployCmd(prNumber int) error {
-	log.Printf("[orch] running deploy command after PR #%d merge: %s", prNumber, o.cfg.DeployCmd)
+	timeout := time.Duration(o.cfg.DeployTimeoutMinutes) * time.Minute
+	log.Printf("[orch] running deploy command after PR #%d merge (timeout %dm): %s", prNumber, o.cfg.DeployTimeoutMinutes, o.cfg.DeployCmd)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", o.cfg.DeployCmd)
@@ -882,7 +883,7 @@ func (o *Orchestrator) runDeployCmd(prNumber int) error {
 		log.Printf("[orch] deploy output:\n%s", out)
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("deploy command timed out after 5 minutes")
+		return fmt.Errorf("deploy command timed out after %d minutes", o.cfg.DeployTimeoutMinutes)
 	}
 	if err != nil {
 		return fmt.Errorf("deploy command failed: %w\n%s", err, out)

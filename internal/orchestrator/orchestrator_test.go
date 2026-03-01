@@ -383,9 +383,10 @@ func TestReconcileRunningSessions_UsesDefaultTmuxNameWhenMissingInState(t *testi
 func TestRunDeployCmd_Success(t *testing.T) {
 	o := &Orchestrator{
 		cfg: &config.Config{
-			Repo:      "owner/repo",
-			LocalPath: "/tmp",
-			DeployCmd: "echo deploy-ok",
+			Repo:                 "owner/repo",
+			LocalPath:            "/tmp",
+			DeployCmd:            "echo deploy-ok",
+			DeployTimeoutMinutes: 15,
 		},
 		notifier: &notify.Notifier{},
 	}
@@ -397,9 +398,10 @@ func TestRunDeployCmd_Success(t *testing.T) {
 func TestRunDeployCmd_Failure(t *testing.T) {
 	o := &Orchestrator{
 		cfg: &config.Config{
-			Repo:      "owner/repo",
-			LocalPath: "/tmp",
-			DeployCmd: "exit 1",
+			Repo:                 "owner/repo",
+			LocalPath:            "/tmp",
+			DeployCmd:            "exit 1",
+			DeployTimeoutMinutes: 15,
 		},
 		notifier: &notify.Notifier{},
 	}
@@ -415,9 +417,10 @@ func TestRunDeployCmd_Failure(t *testing.T) {
 func TestRunDeployCmd_CapturesOutput(t *testing.T) {
 	o := &Orchestrator{
 		cfg: &config.Config{
-			Repo:      "owner/repo",
-			LocalPath: "/tmp",
-			DeployCmd: "echo hello-deploy && exit 1",
+			Repo:                 "owner/repo",
+			LocalPath:            "/tmp",
+			DeployCmd:            "echo hello-deploy && exit 1",
+			DeployTimeoutMinutes: 15,
 		},
 		notifier: &notify.Notifier{},
 	}
@@ -427,6 +430,21 @@ func TestRunDeployCmd_CapturesOutput(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "hello-deploy") {
 		t.Errorf("error = %q, want it to contain command output 'hello-deploy'", err.Error())
+	}
+}
+
+func TestRunDeployCmd_UsesConfiguredTimeout(t *testing.T) {
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:                 "owner/repo",
+			LocalPath:            "/tmp",
+			DeployCmd:            "sleep 5",
+			DeployTimeoutMinutes: 1, // 1 minute — command should succeed well within this
+		},
+		notifier: &notify.Notifier{},
+	}
+	if err := o.runDeployCmd(42); err != nil {
+		t.Errorf("runDeployCmd() unexpected error: %v", err)
 	}
 }
 

@@ -615,6 +615,31 @@ deploy_cmd: "go build ./cmd/app/ && systemctl --user restart app"
 	}
 }
 
+func TestParse_DeployTimeoutMinutesDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.DeployTimeoutMinutes != 15 {
+		t.Errorf("DeployTimeoutMinutes = %d, want 15", cfg.DeployTimeoutMinutes)
+	}
+}
+
+func TestParse_DeployTimeoutMinutesExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+deploy_timeout_minutes: 30
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.DeployTimeoutMinutes != 30 {
+		t.Errorf("DeployTimeoutMinutes = %d, want 30", cfg.DeployTimeoutMinutes)
+	}
+}
+
 func TestParse_MergeDefaults(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
