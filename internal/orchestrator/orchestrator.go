@@ -933,17 +933,14 @@ func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Ses
 // Priority: 1) model:<name> label override, 2) auto-routing via LLM, 3) default.
 func (o *Orchestrator) resolveBackend(issue github.Issue) string {
 	// Check for model: label (highest priority)
-	for _, label := range issue.Labels {
-		if strings.HasPrefix(label.Name, "model:") {
-			if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
-				if _, ok := o.cfg.Model.Backends[name]; !ok {
-					log.Printf("[router] issue #%d: label model:%s references unknown backend — falling back to default %q", issue.Number, name, o.cfg.Model.Default)
-					return o.cfg.Model.Default
-				}
-				log.Printf("[router] issue #%d → %s (label override)", issue.Number, name)
-				return name
-			}
+	if name := router.BackendFromLabels(issue); name != "" {
+		validated, ok := router.ValidateBackend(name, o.cfg)
+		if !ok {
+			log.Printf("[router] issue #%d: label model:%s references unknown backend — falling back to default %q", issue.Number, name, o.cfg.Model.Default)
+		} else {
+			log.Printf("[router] issue #%d → %s (label override)", issue.Number, validated)
 		}
+		return validated
 	}
 
 	// Try auto-routing via LLM

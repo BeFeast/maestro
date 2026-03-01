@@ -753,33 +753,9 @@ func spawnCmd(args []string) {
 		log.Fatalf("issue #%d not found in open issues", *issueNum)
 	}
 
-	// Detect model: label for backend selection (label takes precedence)
-	backendName := ""
-	for _, label := range targetIssue.Labels {
-		if strings.HasPrefix(label.Name, "model:") {
-			if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
-				backendName = name
-				log.Printf("[router] issue #%d → %s (label override)", targetIssue.Number, backendName)
-			}
-		}
-	}
-
-	// If no label, try auto-routing via LLM
-	if backendName == "" && cfg.Routing.Mode == "auto" {
-		r := router.New(cfg)
-		routedBackend, reason, err := r.Route(*targetIssue)
-		if err != nil {
-			log.Printf("[router] issue #%d: error %v — using default", targetIssue.Number, err)
-		} else {
-			log.Printf("[router] issue #%d → %s (%s)", targetIssue.Number, routedBackend, reason)
-		}
-		backendName = routedBackend
-	}
-
-	// Fall back to default
-	if backendName == "" {
-		backendName = cfg.Model.Default
-	}
+	// Resolve backend via 3-tier priority: label → auto-routing → default
+	r := router.New(cfg)
+	backendName, _ := r.ResolveBackend(*targetIssue)
 	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)
 	if err != nil {
 		log.Fatalf("start worker: %v", err)
