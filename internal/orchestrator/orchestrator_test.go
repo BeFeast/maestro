@@ -1086,6 +1086,285 @@ func TestAutoMergePRs_ParallelAllFailures(t *testing.T) {
 	}
 }
 
+// --- checkSessions: worker_max_tokens enforcement tests ---
+
+// newCheckSessionsOrchestrator creates an Orchestrator wired with test fakes for
+// checkSessions. The captureTmuxOutput is returned by the captureTmuxFn hook.
+// The stopped slice records slot names of stopped workers.
+func newCheckSessionsOrchestrator(cfg *config.Config, tmuxOutput string) (*Orchestrator, *[]string) {
+	stopped := make([]string, 0)
+	return &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true // worker is alive
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return tmuxOutput, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+	}, &stopped
+}
+
+func TestCheckSessions_TokenLimitExceeded_KillsWorker(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		WorkerMaxTokens:   50000,
+		MaxRuntimeMinutes: 999,
+	}
+	// Worker output reports 75,000 tokens — exceeds 50,000 limit
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 75000 (in 25000 / out 50000)")
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-101-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-1"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus != "token_limit" {
+		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "token_limit")
+	}
+	if sess.TokensUsed != 75000 {
+		t.Fatalf("tokens_used = %d, want 75000", sess.TokensUsed)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("finished_at should be set")
+	}
+	if len(*stopped) != 1 || (*stopped)[0] != "mae-1" {
+		t.Fatalf("stopped = %v, want [mae-1]", *stopped)
+	}
+}
+
+func TestCheckSessions_TokensBelowLimit_WorkerSurvives(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		WorkerMaxTokens:   100000,
+		MaxRuntimeMinutes: 999,
+	}
+	// Worker output reports 50,000 tokens — below 100,000 limit
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 50000 (in 10000 / out 40000)")
+
+	s := state.NewState()
+	s.Sessions["mae-2"] = &state.Session{
+		IssueNumber: 102,
+		Status:      state.StatusRunning,
+		PID:         2345,
+		TmuxSession: "maestro-mae-2",
+		Branch:      "feat/mae-2-102-test",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-2"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+	if sess.TokensUsed != 50000 {
+		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsed)
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+}
+
+func TestCheckSessions_TokenLimitZero_NoEnforcement(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		WorkerMaxTokens:   0, // disabled
+		MaxRuntimeMinutes: 999,
+	}
+	// Worker reports 999,999 tokens — but limit is disabled
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 999999")
+
+	s := state.NewState()
+	s.Sessions["mae-3"] = &state.Session{
+		IssueNumber: 103,
+		Status:      state.StatusRunning,
+		PID:         3456,
+		TmuxSession: "maestro-mae-3",
+		Branch:      "feat/mae-3-103-test",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-3"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (limit disabled)", sess.Status, state.StatusRunning)
+	}
+	// Tokens should still be tracked even when limit is disabled
+	if sess.TokensUsed != 999999 {
+		t.Fatalf("tokens_used = %d, want 999999 (should track even when limit=0)", sess.TokensUsed)
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+}
+
+func TestCheckSessions_TokenLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		WorkerMaxTokens:   50000,
+		MaxRuntimeMinutes: 999,
+	}
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 75000")
+
+	s := state.NewState()
+	s.Sessions["mae-4"] = &state.Session{
+		IssueNumber:        104,
+		Status:             state.StatusRunning,
+		PID:                4567,
+		TmuxSession:        "maestro-mae-4",
+		Branch:             "feat/mae-4-104-test",
+		StartedAt:          time.Now().Add(-10 * time.Minute),
+		TokensUsed:         75000,
+		LastNotifiedStatus: "token_limit", // already notified
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-4"]
+	// Should remain running — the token_limit kill was already applied in a prior cycle
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (already notified, should not re-kill)", sess.Status, state.StatusRunning)
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty (should not duplicate kill)", *stopped)
+	}
+}
+
+func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		WorkerMaxTokens:   50000,
+		MaxRuntimeMinutes: 999,
+	}
+	// Worker output reports exactly 50,000 tokens — at limit, not over (strict >)
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 50000")
+
+	s := state.NewState()
+	s.Sessions["mae-5"] = &state.Session{
+		IssueNumber: 105,
+		Status:      state.StatusRunning,
+		PID:         5678,
+		TmuxSession: "maestro-mae-5",
+		Branch:      "feat/mae-5-105-test",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-5"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (at exact limit, uses strict >)", sess.Status, state.StatusRunning)
+	}
+	if sess.TokensUsed != 50000 {
+		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsed)
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+}
+
+func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		WorkerMaxTokens:   50000,
+		MaxRuntimeMinutes: 999,
+	}
+
+	// Per-session tmux output: mae-6 is over limit, mae-7 is under
+	tmuxOutputs := map[string]string{
+		"maestro-mae-6": "tokens 75000 (in 25000 / out 50000)",
+		"maestro-mae-7": "tokens 30000 (in 10000 / out 20000)",
+	}
+	stopped := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			if out, ok := tmuxOutputs[session]; ok {
+				return out, nil
+			}
+			return "", nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-6"] = &state.Session{
+		IssueNumber: 106,
+		Status:      state.StatusRunning,
+		PID:         6789,
+		TmuxSession: "maestro-mae-6",
+		Branch:      "feat/mae-6-106-over",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+	s.Sessions["mae-7"] = &state.Session{
+		IssueNumber: 107,
+		Status:      state.StatusRunning,
+		PID:         7890,
+		TmuxSession: "maestro-mae-7",
+		Branch:      "feat/mae-7-107-under",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess6 := s.Sessions["mae-6"]
+	if sess6.Status != state.StatusDead {
+		t.Fatalf("mae-6 status = %q, want %q", sess6.Status, state.StatusDead)
+	}
+	if sess6.TokensUsed != 75000 {
+		t.Fatalf("mae-6 tokens_used = %d, want 75000", sess6.TokensUsed)
+	}
+
+	sess7 := s.Sessions["mae-7"]
+	if sess7.Status != state.StatusRunning {
+		t.Fatalf("mae-7 status = %q, want %q", sess7.Status, state.StatusRunning)
+	}
+	if sess7.TokensUsed != 30000 {
+		t.Fatalf("mae-7 tokens_used = %d, want 30000", sess7.TokensUsed)
+	}
+
+	if len(stopped) != 1 || stopped[0] != "mae-6" {
+		t.Fatalf("stopped = %v, want [mae-6]", stopped)
+	}
+}
+
 func TestAutoMergePRs_ParallelStatePersistence(t *testing.T) {
 	// Verify that state survives a save/load cycle after parallel merges.
 	// This addresses the "race conditions on the state file" concern from issue #159.

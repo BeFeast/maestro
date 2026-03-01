@@ -36,6 +36,12 @@ type Orchestrator struct {
 	listOpenPRsFn         func() ([]github.PR, error)
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 
+	// Testing hooks for checkSessions
+	captureTmuxFn   func(session string) (string, error)
+	tmuxCaptureFn   func(session string) (string, error)
+	isIssueClosedFn func(issueNumber int) (bool, error)
+	addIssueLabelFn func(number int, label string) error
+
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn         func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
@@ -43,11 +49,6 @@ type Orchestrator struct {
 	ghCloseIssueFn         func(number int, comment string) error
 	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
 	rebaseWorktreeFn       func(worktreePath, branch string, autoResolveFiles []string) error
-
-	// Testing hooks for checkSessions
-	tmuxCaptureFn   func(session string) (string, error)
-	isIssueClosedFn func(number int) (bool, error)
-	addIssueLabelFn func(number int, label string) error
 }
 
 // New creates a new Orchestrator
@@ -142,6 +143,9 @@ func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
 func (o *Orchestrator) captureTmux(session string) (string, error) {
 	if o.tmuxCaptureFn != nil {
 		return o.tmuxCaptureFn(session)
+	}
+	if o.captureTmuxFn != nil {
+		return o.captureTmuxFn(session)
 	}
 	return tmuxCapture(session)
 }
