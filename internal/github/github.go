@@ -185,13 +185,78 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 	return result.Mergeable, nil
 }
 
-// PRGreptileApproved checks PR comments for Greptile review status.
-// Returns:
-//   - approved=true when Greptile marked it safe to merge (or confidence 4/5, 5/5)
-//   - pending=true when no Greptile comment exists yet
-//   - approved=false,pending=false when Greptile commented but did not approve
+// PRGreptileApproved checks whether Greptile has approved the PR.
+//
+// Primary path: reads GitHub Check Runs for the PR's head SHA.
+//   - Looks for a check whose name contains "greptile" (case-insensitive).
+//   - conclusion == "success" or "neutral" → approved=true
+//   - check found, other conclusion → approved=false, pending=false
+//   - check not found → falls through to comment-based fallback
+//
+// Fallback path: reads PR comments for legacy Greptile comment-mode setups.
+//   - "safe to merge" or confidence 4/5 / 5/5 → approved=true
+//   - comment found but not approving → approved=false, pending=false
+//   - no greptile signal at all → pending=true
 func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, err error) {
-	out, err := exec.Command("gh", "pr", "view",
+	// --- 1. Get head SHA of the PR ---
+	prOut, err := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber)).Output()
+	if err != nil {
+		return false, false, fmt.Errorf("gh api pulls/%d: %w", prNumber, err)
+	}
+	var prData struct {
+		Head struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if err := json.Unmarshal(prOut, &prData); err != nil {
+		return false, false, fmt.Errorf("parse pr %d head sha: %w", prNumber, err)
+	}
+	sha := prData.Head.SHA
+
+	// --- 2. Get check runs for the head SHA ---
+	checksOut, err := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/commits/%s/check-runs", c.Repo, sha),
+		"--paginate").Output()
+	if err != nil {
+		// Non-fatal: fall through to comment fallback
+		goto commentFallback
+	}
+
+	{
+		var checksData struct {
+			CheckRuns []struct {
+				Name       string `json:"name"`
+				Status     string `json:"status"`
+				Conclusion string `json:"conclusion"`
+			} `json:"check_runs"`
+		}
+		if err := json.Unmarshal(checksOut, &checksData); err != nil {
+			goto commentFallback
+		}
+
+		for _, cr := range checksData.CheckRuns {
+			if !strings.Contains(strings.ToLower(cr.Name), "greptile") {
+				continue
+			}
+			// Found a Greptile check run
+			// neutral = Greptile reviewed but no blocking issues; treat as passing
+			if cr.Conclusion == "success" || cr.Conclusion == "neutral" {
+				return true, false, nil
+			}
+			// Check is still running
+			if cr.Status == "in_progress" || cr.Status == "queued" || cr.Status == "waiting" || cr.Conclusion == "" {
+				return false, true, nil
+			}
+			// Only failure and action_required should block merge
+			return false, false, nil
+		}
+		// No greptile check run found → fall through to comment fallback
+	}
+
+commentFallback:
+	// --- 3. Fallback: check PR comments (legacy Greptile comment-mode) ---
+	commentsOut, err := exec.Command("gh", "pr", "view",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo,
 		"--comments",
@@ -200,17 +265,17 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 		return false, false, fmt.Errorf("gh pr view %d comments: %w", prNumber, err)
 	}
 
-	var result struct {
+	var commentsResult struct {
 		Comments []struct {
 			Body string `json:"body"`
 		} `json:"comments"`
 	}
-	if err := json.Unmarshal(out, &result); err != nil {
+	if err := json.Unmarshal(commentsOut, &commentsResult); err != nil {
 		return false, false, fmt.Errorf("parse pr %d comments: %w", prNumber, err)
 	}
 
 	foundGreptile := false
-	for _, comment := range result.Comments {
+	for _, comment := range commentsResult.Comments {
 		bodyLower := strings.ToLower(comment.Body)
 		if !strings.Contains(bodyLower, "greptile") {
 			continue
