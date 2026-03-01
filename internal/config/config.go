@@ -61,18 +61,18 @@ type Config struct {
 	IssueLabels                []string         `yaml:"issue_labels"`
 	ExcludeLabels              []string         `yaml:"exclude_labels"`
 	WorkerPrompt               string           `yaml:"worker_prompt"`
-	BugPrompt                  string           `yaml:"bug_prompt"`                    // prompt template for issues with "bug" label
-	EnhancementPrompt          string           `yaml:"enhancement_prompt"`            // prompt template for issues with "enhancement" label
-	SessionPrefix              string           `yaml:"session_prefix"`                // worker session name prefix (default: first 3 chars of repo name)
-	StateDir                   string           `yaml:"state_dir"`                     // state/log directory (default: ~/.maestro/<repo-hash>)
+	BugPrompt                  string           `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
+	EnhancementPrompt          string           `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
+	SessionPrefix              string           `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
+	StateDir                   string           `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model                      ModelConfig      `yaml:"model"`
 	Routing                    RoutingConfig    `yaml:"routing"`
-	DeployCmd                  string           `yaml:"deploy_cmd"`                    // shell command to run after successful PR merge
-	MergeStrategy              string           `yaml:"merge_strategy"`                // "sequential" | "parallel"
-	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"`        // minimum seconds between merges in sequential mode
+	DeployCmd                  string           `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
+	MergeStrategy              string           `yaml:"merge_strategy"`         // "sequential" | "parallel"
+	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
 	Telegram                   TelegramConfig   `yaml:"telegram"`
 	Versioning                 VersioningConfig `yaml:"versioning"`
-	AutoResolveFiles           []string         `yaml:"auto_resolve_files"`            // files to auto-resolve conflicts by keeping both sides
+	AutoResolveFiles           []string         `yaml:"auto_resolve_files"` // files to auto-resolve conflicts by keeping both sides
 }
 
 // LoadFrom loads config from a specific path.
