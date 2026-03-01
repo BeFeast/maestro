@@ -43,6 +43,11 @@ type Orchestrator struct {
 	ghCloseIssueFn         func(number int, comment string) error
 	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
 	rebaseWorktreeFn       func(worktreePath, branch string, autoResolveFiles []string) error
+
+	// Testing hooks for checkSessions
+	tmuxCaptureFn   func(session string) (string, error)
+	isIssueClosedFn func(number int) (bool, error)
+	addIssueLabelFn func(number int, label string) error
 }
 
 // New creates a new Orchestrator
@@ -132,6 +137,27 @@ func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
 		return o.rebaseWorktreeFn(worktreePath, branch, o.cfg.AutoResolveFiles)
 	}
 	return worker.RebaseWorktree(worktreePath, branch, o.cfg.AutoResolveFiles)
+}
+
+func (o *Orchestrator) captureTmux(session string) (string, error) {
+	if o.tmuxCaptureFn != nil {
+		return o.tmuxCaptureFn(session)
+	}
+	return tmuxCapture(session)
+}
+
+func (o *Orchestrator) isIssueClosed(number int) (bool, error) {
+	if o.isIssueClosedFn != nil {
+		return o.isIssueClosedFn(number)
+	}
+	return o.gh.IsIssueClosed(number)
+}
+
+func (o *Orchestrator) addIssueLabel(number int, label string) error {
+	if o.addIssueLabelFn != nil {
+		return o.addIssueLabelFn(number, label)
+	}
+	return o.gh.AddIssueLabel(number, label)
 }
 
 func readLastLines(path string, limit int) (string, error) {
@@ -415,7 +441,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
 	// Fetch open PRs once for the whole check cycle
-	prs, prErr := o.gh.ListOpenPRs()
+	prs, prErr := o.listOpenPRs()
 	branchToPR := make(map[string]github.PR)
 	if prErr != nil {
 		log.Printf("[orch] list PRs (check): %v", prErr)
@@ -441,12 +467,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 		// Check if issue is now closed (only for running sessions)
 		if sess.Status == state.StatusRunning {
-			closed, err := o.gh.IsIssueClosed(sess.IssueNumber)
+			closed, err := o.isIssueClosed(sess.IssueNumber)
 			if err != nil {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 			} else if closed {
 				log.Printf("[orch] issue #%d closed, stopping worker %s", sess.IssueNumber, slotName)
-				worker.Stop(o.cfg, slotName, sess)
+				o.stopWorker(slotName, sess)
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
@@ -454,7 +480,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 
 			// Check if process is still alive
-			if sess.PID > 0 && !worker.IsAlive(sess.PID) {
+			if sess.PID > 0 && !o.pidAlive(sess.PID) {
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
@@ -494,7 +520,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					// Already retried — mark as permanently failed
 					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
-					if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+					if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 					}
 					sess.Status = state.StatusFailed
@@ -523,7 +549,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					tmuxName = worker.TmuxSessionName(slotName)
 				}
 
-				output, err := tmuxCapture(tmuxName)
+				output, err := o.captureTmux(tmuxName)
 				if err != nil {
 					log.Printf("[orch] warn: tmux capture-pane failed for %s (%s): %v", slotName, tmuxName, err)
 				} else {
@@ -537,7 +563,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsed > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
 						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
 							slotName, sess.TokensUsed, o.cfg.WorkerMaxTokens)
-						if err := worker.Stop(o.cfg, slotName, sess); err != nil {
+						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
 						}
 						now := time.Now().UTC()
@@ -561,7 +587,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							timeout := time.Duration(o.cfg.WorkerSilentTimeoutMinutes) * time.Minute
 							if time.Since(sess.LastOutputChangedAt) > timeout {
 								log.Printf("[orch] worker %s silent for >%dm, killing", slotName, o.cfg.WorkerSilentTimeoutMinutes)
-								if err := worker.Stop(o.cfg, slotName, sess); err != nil {
+								if err := o.stopWorker(slotName, sess); err != nil {
 									log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
 								}
 
@@ -574,7 +600,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								sess.FinishedAt = &now
 
 								if prevSilentKills > 0 {
-									if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+									if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 										log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 									}
 								}
@@ -593,7 +619,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				if tmuxName == "" {
 					tmuxName = worker.TmuxSessionName(slotName)
 				}
-				if output, err := tmuxCapture(tmuxName); err == nil {
+				if output, err := o.captureTmux(tmuxName); err == nil {
 					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsed {
 						sess.TokensUsed = tokens
 					}
@@ -616,10 +642,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					logTail = fmt.Sprintf("(could not read log file %s: %v)", sess.LogFile, err)
 				}
 
-				if err := worker.Stop(o.cfg, slotName, sess); err != nil {
+				if err := o.stopWorker(slotName, sess); err != nil {
 					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
 				}
-				if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+				if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 				}
 				sess.Status = state.StatusFailed
