@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/maestro run --config %h/.maestro/maestro-%i.yaml
 Restart=on-failure
 RestartSec=30
