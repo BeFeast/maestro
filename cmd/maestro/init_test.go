@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -288,5 +289,123 @@ func TestRunInitWizardInvalidMaxParallel(t *testing.T) {
 
 	if !strings.Contains(string(data), "max_parallel: 3") {
 		t.Errorf("invalid max_parallel should default to 3, got:\n%s", string(data))
+	}
+}
+
+func TestRunInitWizardInvalidBackend(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// repo, local_path(default), worktree(default), max_parallel(default),
+	// model(invalid), ...
+	input := "org/repo\n\n\n\ngpt4\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err == nil {
+		t.Fatal("expected error for invalid backend")
+	}
+	if !strings.Contains(err.Error(), "invalid model backend") {
+		t.Errorf("error should mention 'invalid model backend', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error should list valid backends, got: %v", err)
+	}
+}
+
+func TestRunInitWizardAllValidBackends(t *testing.T) {
+	for _, backend := range validBackends {
+		t.Run(backend, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			t.Setenv("HOME", tmpDir)
+
+			input := fmt.Sprintf("org/repo\n\n\n\n%s\n\n\n", backend)
+			var output bytes.Buffer
+
+			err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+			if err != nil {
+				t.Fatalf("valid backend %q should not error: %v", backend, err)
+			}
+
+			data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+			if err != nil {
+				t.Fatal("maestro.yaml not created")
+			}
+			if !strings.Contains(string(data), "default: "+backend) {
+				t.Errorf("yaml should contain 'default: %s', got:\n%s", backend, string(data))
+			}
+		})
+	}
+}
+
+func TestRunInitWizardRicherConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+
+	yamlStr := string(data)
+	commentedKeys := []string{
+		"# max_runtime_minutes: 120",
+		"# auto_rebase: true",
+		"# merge_strategy: sequential",
+		"# worker_prompt:",
+		"# exclude_labels:",
+	}
+	for _, key := range commentedKeys {
+		if !strings.Contains(yamlStr, key) {
+			t.Errorf("yaml should contain commented-out %q, got:\n%s", key, yamlStr)
+		}
+	}
+}
+
+func TestBuildInitYAML(t *testing.T) {
+	cfg := initYAMLConfig{
+		Repo:         "org/repo",
+		LocalPath:    "~/src/repo",
+		WorktreeBase: "~/.worktrees/repo",
+		MaxParallel:  3,
+		IssueLabels:  []string{"enhancement"},
+		Model:        initYAMLModel{Default: "claude"},
+	}
+
+	yaml := buildInitYAML(cfg)
+
+	// Active config present
+	if !strings.Contains(yaml, "repo: org/repo") {
+		t.Error("should contain repo")
+	}
+	if !strings.Contains(yaml, "max_parallel: 3") {
+		t.Error("should contain max_parallel")
+	}
+
+	// Commented examples present
+	if !strings.Contains(yaml, "# max_runtime_minutes: 120") {
+		t.Error("should contain commented max_runtime_minutes")
+	}
+
+	// No telegram when nil
+	if strings.Contains(yaml, "telegram") {
+		t.Error("should not contain telegram when nil")
+	}
+
+	// With telegram
+	cfg.Telegram = &initYAMLTelegram{Target: "12345"}
+	yaml = buildInitYAML(cfg)
+	if !strings.Contains(yaml, "telegram:") {
+		t.Error("should contain telegram section")
+	}
+	if !strings.Contains(yaml, `target: "12345"`) {
+		t.Error("should contain telegram target")
 	}
 }
