@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/befeast/maestro/internal/worker"
 	"gopkg.in/yaml.v3"
 )
 
@@ -65,7 +67,15 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+
+	validBackends := worker.KnownBackends()
+	sort.Strings(validBackends)
+	backendList := strings.Join(validBackends, "/")
+	modelBackend := promptInit(scanner, w, fmt.Sprintf("Default model backend (%s)", backendList), "claude")
+	if !isValidBackend(modelBackend, validBackends) {
+		return fmt.Errorf("unknown model backend %q — valid options: %s", modelBackend, strings.Join(validBackends, ", "))
+	}
+
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -103,6 +113,19 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
+
+	// Append commented-out examples for commonly used optional settings
+	examples := `
+# --- Optional settings (uncomment to enable) ---
+# max_runtime_minutes: 120
+# auto_rebase: true
+# merge_strategy: sequential
+# worker_prompt: worker-prompt.md
+# exclude_labels:
+#   - wontfix
+#   - duplicate
+`
+	yamlData = append(yamlData, []byte(examples)...)
 
 	if err := os.WriteFile(yamlPath, yamlData, 0644); err != nil {
 		return fmt.Errorf("write maestro.yaml: %w", err)
@@ -227,4 +250,13 @@ func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string
 		return defaultVal
 	}
 	return answer
+}
+
+func isValidBackend(name string, valid []string) bool {
+	for _, v := range valid {
+		if name == v {
+			return true
+		}
+	}
+	return false
 }

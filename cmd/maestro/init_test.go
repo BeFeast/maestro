@@ -9,6 +9,22 @@ import (
 	"testing"
 )
 
+func TestIsValidBackend(t *testing.T) {
+	valid := []string{"claude", "cline", "codex", "gemini"}
+	if !isValidBackend("claude", valid) {
+		t.Error("claude should be valid")
+	}
+	if !isValidBackend("gemini", valid) {
+		t.Error("gemini should be valid")
+	}
+	if isValidBackend("gpt", valid) {
+		t.Error("gpt should not be valid")
+	}
+	if isValidBackend("", valid) {
+		t.Error("empty string should not be valid")
+	}
+}
+
 func TestPromptInit(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -257,6 +273,65 @@ func TestRunInitWizardStateDirConfirmation(t *testing.T) {
 	maestroDir := filepath.Join(tmpDir, ".maestro")
 	if !strings.Contains(out, maestroDir) {
 		t.Errorf("output should mention state directory %s, got:\n%s", maestroDir, out)
+	}
+}
+
+func TestRunInitWizardInvalidBackend(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	// repo, local_path(default), worktree(default), max_parallel(default),
+	// model=invalid, ...
+	input := "org/repo\n\n\n\nnotabackend\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err == nil {
+		t.Fatal("expected error for invalid backend")
+	}
+	if !strings.Contains(err.Error(), "unknown model backend") {
+		t.Errorf("error should mention 'unknown model backend', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "notabackend") {
+		t.Errorf("error should mention the invalid value, got: %v", err)
+	}
+	// Should list valid options
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error should list valid options, got: %v", err)
+	}
+}
+
+func TestRunInitWizardRicherConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+
+	yamlStr := string(data)
+	commentedExamples := []string{
+		"# max_runtime_minutes: 120",
+		"# auto_rebase: true",
+		"# merge_strategy: sequential",
+		"# worker_prompt: worker-prompt.md",
+		"# exclude_labels:",
+		"#   - wontfix",
+		"#   - duplicate",
+	}
+	for _, want := range commentedExamples {
+		if !strings.Contains(yamlStr, want) {
+			t.Errorf("yaml should contain commented example %q, got:\n%s", want, yamlStr)
+		}
 	}
 }
 
