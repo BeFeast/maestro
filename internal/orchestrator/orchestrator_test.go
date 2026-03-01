@@ -1968,3 +1968,238 @@ func TestCountSilentTimeoutKillsForIssue_NoMatches(t *testing.T) {
 		t.Fatalf("countSilentTimeoutKillsForIssue(99) = %d, want 0 (no sessions for issue)", got)
 	}
 }
+
+// --- retry limit tests ---
+
+// newStartWorkersOrchestrator creates an Orchestrator wired with test fakes for
+// startNewWorkers. It returns the orchestrator, a slice of started issue numbers,
+// and a slice of labels added.
+func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Orchestrator, *[]int, *[]string) {
+	started := make([]int, 0)
+	labels := make([]string, 0)
+	slotCounter := 0
+	return &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		router:   router.New(cfg),
+		listOpenIssuesFn: func(labelFilter []string) ([]github.Issue, error) {
+			return issues, nil
+		},
+		hasOpenPRForIssueFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labels = append(labels, fmt.Sprintf("#%d:%s", number, label))
+			return nil
+		},
+		workerStartFn: func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error) {
+			slotCounter++
+			slotName := fmt.Sprintf("slot-%d", slotCounter)
+			s.Sessions[slotName] = &state.Session{
+				IssueNumber: issue.Number,
+				IssueTitle:  issue.Title,
+				Status:      state.StatusRunning,
+				PID:         1000 + slotCounter,
+				Branch:      fmt.Sprintf("feat/%s", slotName),
+				StartedAt:   time.Now().UTC(),
+			}
+			started = append(started, issue.Number)
+			return slotName, nil
+		},
+	}, &started, &labels
+}
+
+func TestStartNewWorkers_SkipsRetryExhaustedIssue(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxRetriesPerIssue = 3
+
+	issues := []github.Issue{
+		makeIssue(42, "failing issue"),
+		makeIssue(43, "fresh issue"),
+	}
+
+	o, started, labels := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+
+	// Simulate 3 prior failed attempts for issue #42 (dead without PR)
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		slotName := fmt.Sprintf("old-%d", i)
+		finished := now.Add(-time.Duration(3-i) * time.Hour)
+		s.Sessions[slotName] = &state.Session{
+			IssueNumber: 42,
+			Status:      state.StatusDead,
+			PRNumber:    0,
+			StartedAt:   finished.Add(-30 * time.Minute),
+			FinishedAt:  &finished,
+		}
+	}
+
+	o.startNewWorkers(s, 5)
+
+	// Only issue #43 should be started
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1", len(*started))
+	}
+	if (*started)[0] != 43 {
+		t.Errorf("started issue #%d, want #43", (*started)[0])
+	}
+
+	// Issue #42 should be labeled blocked
+	foundBlocked := false
+	for _, label := range *labels {
+		if label == "#42:blocked" {
+			foundBlocked = true
+		}
+	}
+	if !foundBlocked {
+		t.Errorf("expected issue #42 to be labeled blocked, labels = %v", *labels)
+	}
+
+	// The most recent dead session for issue #42 should be marked retry_exhausted
+	if !s.IssueRetryExhausted(42) {
+		t.Error("issue #42 should have a retry_exhausted session")
+	}
+}
+
+func TestStartNewWorkers_RetryLimitDisabledWhenZero(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxRetriesPerIssue = 0 // unlimited
+
+	issues := []github.Issue{
+		makeIssue(42, "failing issue"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+
+	// 10 prior failures — should still spawn because limit is disabled
+	now := time.Now().UTC()
+	for i := 0; i < 10; i++ {
+		slotName := fmt.Sprintf("old-%d", i)
+		finished := now.Add(-time.Duration(10-i) * time.Hour)
+		s.Sessions[slotName] = &state.Session{
+			IssueNumber: 42,
+			Status:      state.StatusDead,
+			PRNumber:    0,
+			StartedAt:   finished.Add(-30 * time.Minute),
+			FinishedAt:  &finished,
+		}
+	}
+
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1 (limit disabled)", len(*started))
+	}
+}
+
+func TestStartNewWorkers_RetryExhaustedNotifiesOnce(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxRetriesPerIssue = 2
+
+	issues := []github.Issue{
+		makeIssue(42, "failing issue"),
+	}
+
+	o, _, labels := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+
+	// 2 prior failures
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		slotName := fmt.Sprintf("old-%d", i)
+		finished := now.Add(-time.Duration(2-i) * time.Hour)
+		s.Sessions[slotName] = &state.Session{
+			IssueNumber: 42,
+			Status:      state.StatusDead,
+			PRNumber:    0,
+			StartedAt:   finished.Add(-30 * time.Minute),
+			FinishedAt:  &finished,
+		}
+	}
+
+	// First cycle: should mark retry_exhausted and label blocked
+	o.startNewWorkers(s, 5)
+	if !s.IssueRetryExhausted(42) {
+		t.Fatal("issue #42 should be retry_exhausted after first detection")
+	}
+	firstLabelCount := len(*labels)
+	if firstLabelCount == 0 {
+		t.Fatal("expected blocked label on first detection")
+	}
+
+	// Second cycle: should skip but NOT re-label or re-notify
+	o.startNewWorkers(s, 5)
+	if len(*labels) != firstLabelCount {
+		t.Errorf("labels added on second cycle: %v (should not duplicate)", *labels)
+	}
+}
+
+func TestStartNewWorkers_BelowLimitStillSpawns(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxRetriesPerIssue = 3
+
+	issues := []github.Issue{
+		makeIssue(42, "failing issue"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+
+	// Only 2 prior failures — below limit of 3
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		slotName := fmt.Sprintf("old-%d", i)
+		finished := now.Add(-time.Duration(2-i) * time.Hour)
+		s.Sessions[slotName] = &state.Session{
+			IssueNumber: 42,
+			Status:      state.StatusDead,
+			PRNumber:    0,
+			StartedAt:   finished.Add(-30 * time.Minute),
+			FinishedAt:  &finished,
+		}
+	}
+
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1 (below retry limit)", len(*started))
+	}
+	if (*started)[0] != 42 {
+		t.Errorf("started issue #%d, want #42", (*started)[0])
+	}
+}
+
+func TestStartNewWorkers_FailedWithPRNotCounted(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxRetriesPerIssue = 2
+
+	issues := []github.Issue{
+		makeIssue(42, "issue with PR failures"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+
+	// 3 "failed" sessions, but all have PRs — should NOT count toward retry limit
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		slotName := fmt.Sprintf("old-%d", i)
+		finished := now.Add(-time.Duration(3-i) * time.Hour)
+		s.Sessions[slotName] = &state.Session{
+			IssueNumber: 42,
+			Status:      state.StatusFailed,
+			PRNumber:    100 + i, // has PR
+			StartedAt:   finished.Add(-30 * time.Minute),
+			FinishedAt:  &finished,
+		}
+	}
+
+	o.startNewWorkers(s, 5)
+
+	// Should still spawn because failed-with-PR doesn't count
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1 (PR failures don't count)", len(*started))
+	}
+}

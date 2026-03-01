@@ -42,6 +42,10 @@ type Orchestrator struct {
 	isIssueClosedFn func(issueNumber int) (bool, error)
 	addIssueLabelFn func(number int, label string) error
 
+	// Testing hooks for startNewWorkers
+	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
+	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
+
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn         func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
@@ -990,8 +994,22 @@ func (o *Orchestrator) resolveBackend(issue github.Issue) string {
 }
 
 // startNewWorkers picks eligible issues and starts workers for them
+func (o *Orchestrator) listOpenIssues(labels []string) ([]github.Issue, error) {
+	if o.listOpenIssuesFn != nil {
+		return o.listOpenIssuesFn(labels)
+	}
+	return o.gh.ListOpenIssues(labels)
+}
+
+func (o *Orchestrator) startWorker(s *state.State, issue github.Issue, promptBase, backend string) (string, error) {
+	if o.workerStartFn != nil {
+		return o.workerStartFn(o.cfg, s, o.repo, issue, promptBase, backend)
+	}
+	return worker.Start(o.cfg, s, o.repo, issue, promptBase, backend)
+}
+
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
-	issues, err := o.gh.ListOpenIssues(o.cfg.IssueLabels)
+	issues, err := o.listOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
 		return
@@ -1010,6 +1028,25 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
 			log.Printf("[orch] skipping issue #%d (excluded label)", issue.Number)
 			continue
+		}
+
+		// Check retry limit: skip issues that have exhausted their retry budget
+		if o.cfg.MaxRetriesPerIssue > 0 {
+			failed := s.FailedAttemptsForIssue(issue.Number)
+			if failed >= o.cfg.MaxRetriesPerIssue {
+				if !s.IssueRetryExhausted(issue.Number) {
+					// First time hitting the limit — mark, label, and notify
+					s.MarkIssueRetryExhausted(issue.Number)
+					if err := o.addIssueLabel(issue.Number, "blocked"); err != nil {
+						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", issue.Number, err)
+					}
+					o.notifier.Sendf("⚠️ Issue #%d hit max retries (%d) — needs manual review",
+						issue.Number, o.cfg.MaxRetriesPerIssue)
+				}
+				log.Printf("[orch] skipping issue #%d: retry limit exhausted (%d/%d attempts)",
+					issue.Number, failed, o.cfg.MaxRetriesPerIssue)
+				continue
+			}
 		}
 
 		// Safety net: check GitHub directly for any open PR referencing this issue.
@@ -1036,7 +1073,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 		promptBase := o.selectPrompt(issue)
 		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, long_running=%v)", issue.Number, issue.Title, backendName, longRunning)
-		slotName, err := worker.Start(o.cfg, s, o.repo, issue, promptBase, backendName)
+		slotName, err := o.startWorker(s, issue, promptBase, backendName)
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",

@@ -664,3 +664,42 @@ merge_interval_seconds: 0
 		t.Errorf("MergeIntervalSeconds = %d, want 30", cfg.MergeIntervalSeconds)
 	}
 }
+
+func TestParse_MaxRetriesPerIssueDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxRetriesPerIssue != 3 {
+		t.Errorf("MaxRetriesPerIssue = %d, want 3", cfg.MaxRetriesPerIssue)
+	}
+}
+
+func TestParse_MaxRetriesPerIssueExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+max_retries_per_issue: 5
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxRetriesPerIssue != 5 {
+		t.Errorf("MaxRetriesPerIssue = %d, want 5", cfg.MaxRetriesPerIssue)
+	}
+}
+
+func TestParse_MaxRetriesPerIssueZero(t *testing.T) {
+	yaml := `
+repo: owner/repo
+max_retries_per_issue: 0
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxRetriesPerIssue != 0 {
+		t.Errorf("MaxRetriesPerIssue = %d, want 0 (unlimited)", cfg.MaxRetriesPerIssue)
+	}
+}
