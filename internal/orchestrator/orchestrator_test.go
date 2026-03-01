@@ -591,3 +591,437 @@ func TestResolveBackend_MultipleLabelsFirstModelWins(t *testing.T) {
 		t.Errorf("resolveBackend() = %q, want %q (first model: label should win)", got, "codex")
 	}
 }
+
+// newMergeTestOrchestrator creates an Orchestrator wired with test fakes for
+// autoMergePRs / mergeReadyPR. It records which PR numbers were merged and
+// stubs CI + Greptile to always return "success" / approved.
+func newMergeTestOrchestrator(cfg *config.Config, prs []github.PR) (*Orchestrator, *[]int) {
+	merged := make([]int, 0)
+	return &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghPRGreptileApprovedFn: func(prNumber int) (bool, bool, error) {
+			return true, false, nil // approved, not pending
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}, &merged
+}
+
+// makeTestState creates a State with N sessions in pr_open status, each mapped
+// to the corresponding PR in prs (by index). Slot names are "slot-0", "slot-1", etc.
+func makeTestState(prs []github.PR) *state.State {
+	s := state.NewState()
+	for i, pr := range prs {
+		slotName := fmt.Sprintf("slot-%d", i)
+		s.Sessions[slotName] = &state.Session{
+			IssueNumber: 100 + i,
+			IssueTitle:  fmt.Sprintf("issue %d", 100+i),
+			Branch:      pr.HeadRefName,
+			Status:      state.StatusPROpen,
+			PRNumber:    pr.Number,
+		}
+	}
+	return s
+}
+
+func TestAutoMergePRs_ParallelMergesAllReady(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+		{Number: 30, HeadRefName: "feat/c"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 3 {
+		t.Fatalf("parallel mode merged %d PRs, want 3", len(*merged))
+	}
+	// Verify all three PR numbers are present (sorted by PR number)
+	for i, want := range []int{10, 20, 30} {
+		if (*merged)[i] != want {
+			t.Errorf("merged[%d] = %d, want %d", i, (*merged)[i], want)
+		}
+	}
+}
+
+func TestAutoMergePRs_ParallelUpdatesState(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	o, _ := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+
+	before := time.Now()
+	o.autoMergePRs(s)
+
+	// All sessions should be marked done
+	for slotName, sess := range s.Sessions {
+		if sess.Status != state.StatusDone {
+			t.Errorf("session %s status = %q, want %q", slotName, sess.Status, state.StatusDone)
+		}
+		if sess.FinishedAt == nil {
+			t.Errorf("session %s has nil FinishedAt", slotName)
+		}
+	}
+
+	// LastMergeAt should be updated
+	if s.LastMergeAt.Before(before) {
+		t.Errorf("LastMergeAt = %v, expected after %v", s.LastMergeAt, before)
+	}
+}
+
+func TestAutoMergePRs_ParallelIgnoresInterval(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+	}
+
+	cfg := &config.Config{
+		Repo:                 "owner/repo",
+		MergeStrategy:        "parallel",
+		MergeIntervalSeconds: 300, // 5 minutes — should be ignored in parallel mode
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+	// Set LastMergeAt to 1 second ago — sequential would skip, parallel should not
+	s.LastMergeAt = time.Now().Add(-1 * time.Second)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 2 {
+		t.Fatalf("parallel mode should ignore interval; merged %d PRs, want 2", len(*merged))
+	}
+}
+
+func TestAutoMergePRs_ParallelMergeOrder(t *testing.T) {
+	// PRs given in reverse order — should still merge in ascending PR number order
+	prs := []github.PR{
+		{Number: 30, HeadRefName: "feat/c"},
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	want := []int{10, 20, 30}
+	for i, w := range want {
+		if (*merged)[i] != w {
+			t.Errorf("merged[%d] = %d, want %d (should be sorted by PR number)", i, (*merged)[i], w)
+		}
+	}
+}
+
+func TestAutoMergePRs_ParallelPartialFailure(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+		{Number: 30, HeadRefName: "feat/c"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghPRGreptileApprovedFn: func(prNumber int) (bool, bool, error) {
+			return true, false, nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			if prNumber == 20 {
+				return fmt.Errorf("merge conflict")
+			}
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	// PRs 10 and 30 should merge; PR 20 should fail
+	if len(merged) != 2 {
+		t.Fatalf("expected 2 successful merges, got %d", len(merged))
+	}
+	if merged[0] != 10 || merged[1] != 30 {
+		t.Errorf("merged = %v, want [10, 30]", merged)
+	}
+
+	// Verify state: sessions for PR 10 and 30 should be done, PR 20 should still be pr_open
+	doneCount := 0
+	openCount := 0
+	for _, sess := range s.Sessions {
+		if sess.Status == state.StatusDone {
+			doneCount++
+		}
+		if sess.Status == state.StatusPROpen {
+			openCount++
+		}
+	}
+	if doneCount != 2 {
+		t.Errorf("expected 2 done sessions, got %d", doneCount)
+	}
+	if openCount != 1 {
+		t.Errorf("expected 1 still-open session, got %d", openCount)
+	}
+}
+
+func TestAutoMergePRs_ParallelStateConsistency(t *testing.T) {
+	// Verify that after parallel merges, the state is consistent:
+	// - All merged sessions are StatusDone with FinishedAt set
+	// - LastMergeAt is recent
+	// - No session is in an inconsistent intermediate state
+	prs := []github.PR{
+		{Number: 1, HeadRefName: "feat/one"},
+		{Number: 2, HeadRefName: "feat/two"},
+		{Number: 3, HeadRefName: "feat/three"},
+		{Number: 4, HeadRefName: "feat/four"},
+		{Number: 5, HeadRefName: "feat/five"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 5 {
+		t.Fatalf("expected 5 merges, got %d", len(*merged))
+	}
+
+	for slotName, sess := range s.Sessions {
+		if sess.Status != state.StatusDone {
+			t.Errorf("session %s: status = %q, want %q", slotName, sess.Status, state.StatusDone)
+		}
+		if sess.FinishedAt == nil {
+			t.Errorf("session %s: FinishedAt is nil", slotName)
+		}
+	}
+
+	if s.LastMergeAt.IsZero() {
+		t.Error("LastMergeAt should not be zero after parallel merges")
+	}
+}
+
+func TestAutoMergePRs_SequentialMergesOnlyFirst(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+		{Number: 30, HeadRefName: "feat/c"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "sequential"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 1 {
+		t.Fatalf("sequential mode merged %d PRs, want 1", len(*merged))
+	}
+	if (*merged)[0] != 10 {
+		t.Errorf("sequential should merge lowest PR number first; merged PR #%d, want #10", (*merged)[0])
+	}
+}
+
+func TestAutoMergePRs_SequentialRespectsInterval(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+
+	cfg := &config.Config{
+		Repo:                 "owner/repo",
+		MergeStrategy:        "sequential",
+		MergeIntervalSeconds: 60,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+	// Last merge was 5 seconds ago, interval is 60s — should skip
+	s.LastMergeAt = time.Now().Add(-5 * time.Second)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 0 {
+		t.Fatalf("sequential mode should respect interval; merged %d PRs, want 0", len(*merged))
+	}
+}
+
+func TestAutoMergePRs_SequentialMergesAfterInterval(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+	}
+
+	cfg := &config.Config{
+		Repo:                 "owner/repo",
+		MergeStrategy:        "sequential",
+		MergeIntervalSeconds: 1,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+	// Last merge was 2 seconds ago, interval is 1s — should merge
+	s.LastMergeAt = time.Now().Add(-2 * time.Second)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 1 {
+		t.Fatalf("sequential mode should merge after interval elapsed; merged %d PRs, want 1", len(*merged))
+	}
+	if (*merged)[0] != 10 {
+		t.Errorf("merged PR #%d, want #10", (*merged)[0])
+	}
+}
+
+func TestAutoMergePRs_SequentialFirstMergeNoWait(t *testing.T) {
+	// When LastMergeAt is zero (no prior merges), sequential mode should merge immediately
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+
+	cfg := &config.Config{
+		Repo:                 "owner/repo",
+		MergeStrategy:        "sequential",
+		MergeIntervalSeconds: 300, // large interval
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+	// LastMergeAt is zero — first ever merge
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 1 {
+		t.Fatalf("sequential first merge should not wait; merged %d PRs, want 1", len(*merged))
+	}
+}
+
+func TestAutoMergePRs_SkipsNonReadySessions(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := makeTestState(prs)
+
+	// Mark one session as already done — should not be picked for merge
+	for _, sess := range s.Sessions {
+		if sess.PRNumber == 20 {
+			sess.Status = state.StatusDone
+		}
+	}
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 1 {
+		t.Fatalf("expected 1 merge (other session is done), got %d", len(*merged))
+	}
+	if (*merged)[0] != 10 {
+		t.Errorf("merged PR #%d, want #10", (*merged)[0])
+	}
+}
+
+func TestAutoMergePRs_QueuedSessionsAreEligible(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 100,
+		Branch:      "feat/a",
+		Status:      state.StatusQueued,
+		PRNumber:    10,
+	}
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 1 {
+		t.Fatalf("queued session should be eligible for merge; merged %d PRs, want 1", len(*merged))
+	}
+}
+
+func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+		{Number: 20, HeadRefName: "feat/b"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			if prNumber == 10 {
+				return "failure", nil
+			}
+			return "success", nil
+		},
+		ghPRGreptileApprovedFn: func(prNumber int) (bool, bool, error) {
+			return true, false, nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 1 {
+		t.Fatalf("expected 1 merge (CI failing on PR #10), got %d", len(merged))
+	}
+	if merged[0] != 20 {
+		t.Errorf("merged PR #%d, want #20", merged[0])
+	}
+}
