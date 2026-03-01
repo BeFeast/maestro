@@ -36,6 +36,13 @@ type Orchestrator struct {
 	listOpenPRsFn         func() ([]github.PR, error)
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 	routeFn               func(issue github.Issue) (string, string, error)
+
+	// Testing hooks for autoMergePRs / mergeReadyPR
+	ghPRCIStatusFn         func(prNumber int) (string, error)
+	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
+	ghMergePRFn            func(prNumber int) error
+	ghCloseIssueFn         func(number int, comment string) error
+	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
 }
 
 // New creates a new Orchestrator
@@ -83,6 +90,41 @@ func (o *Orchestrator) hasOpenPRForIssue(issueNumber int) (bool, error) {
 		return o.hasOpenPRForIssueFn(issueNumber)
 	}
 	return o.gh.HasOpenPRForIssue(issueNumber)
+}
+
+func (o *Orchestrator) prCIStatus(prNumber int) (string, error) {
+	if o.ghPRCIStatusFn != nil {
+		return o.ghPRCIStatusFn(prNumber)
+	}
+	return o.gh.PRCIStatus(prNumber)
+}
+
+func (o *Orchestrator) prGreptileApproved(prNumber int) (bool, bool, error) {
+	if o.ghPRGreptileApprovedFn != nil {
+		return o.ghPRGreptileApprovedFn(prNumber)
+	}
+	return o.gh.PRGreptileApproved(prNumber)
+}
+
+func (o *Orchestrator) mergePR(prNumber int) error {
+	if o.ghMergePRFn != nil {
+		return o.ghMergePRFn(prNumber)
+	}
+	return o.gh.MergePR(prNumber)
+}
+
+func (o *Orchestrator) closeIssue(number int, comment string) error {
+	if o.ghCloseIssueFn != nil {
+		return o.ghCloseIssueFn(number, comment)
+	}
+	return o.gh.CloseIssue(number, comment)
+}
+
+func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
+	if o.workerStopFn != nil {
+		return o.workerStopFn(o.cfg, slotName, sess)
+	}
+	return worker.Stop(o.cfg, slotName, sess)
 }
 
 func readLastLines(path string, limit int) (string, error) {
@@ -586,7 +628,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 // autoMergePRs checks open PRs and merges ones with green CI
 func (o *Orchestrator) autoMergePRs(s *state.State) {
-	prs, err := o.gh.ListOpenPRs()
+	prs, err := o.listOpenPRs()
 	if err != nil {
 		log.Printf("[orch] list PRs: %v", err)
 		return
@@ -625,7 +667,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		}
 
 		// Check CI
-		ciStatus, err := o.gh.PRCIStatus(pr.Number)
+		ciStatus, err := o.prCIStatus(pr.Number)
 		if err != nil {
 			log.Printf("[orch] CI status for PR #%d: %v", pr.Number, err)
 			continue
@@ -639,7 +681,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			sess.LastNotifiedStatus = ""
 			sess.NotifiedCIFail = false // backward compat
 
-			greptileOK, greptilePending, err := o.gh.PRGreptileApproved(pr.Number)
+			greptileOK, greptilePending, err := o.prGreptileApproved(pr.Number)
 			if err != nil {
 				log.Printf("[orch] greptile check PR #%d: %v", pr.Number, err)
 				continue // skip this cycle, try next
@@ -729,7 +771,7 @@ func (o *Orchestrator) mergeInterval() time.Duration {
 
 func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr github.PR) bool {
 	log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
-	if err := o.gh.MergePR(pr.Number); err != nil {
+	if err := o.mergePR(pr.Number); err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
 		// Only notify merge failure once per PR
 		if sess.LastNotifiedStatus != "merge_failed" {
@@ -740,13 +782,13 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	}
 
 	log.Printf("[orch] merged PR #%d ✓", pr.Number)
-	if err := o.gh.CloseIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
+	if err := o.closeIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
 		log.Printf("[orch] warning: failed to close issue #%d: %v", sess.IssueNumber, err)
 	}
 	sess.Status = state.StatusDone
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
-	worker.Stop(o.cfg, slotName, sess)
+	o.stopWorker(slotName, sess)
 	o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s)", pr.Number, sess.IssueNumber, sess.IssueTitle)
 
 	// Auto version bump
