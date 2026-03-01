@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -51,6 +52,9 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	fmt.Fprintln(w, "Welcome to Maestro! Let's set up your first project.")
 	fmt.Fprintln(w)
 
+	// Check prerequisites
+	checkPrerequisites(w)
+
 	repo := promptInit(scanner, w, "GitHub repo (owner/repo)", "")
 	if repo == "" {
 		return fmt.Errorf("repo is required")
@@ -65,7 +69,7 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini/cline)", "claude")
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -211,6 +215,43 @@ func launchdPlist(binPath, configPath string) string {
 </dict>
 </plist>
 `, binPath, configPath)
+}
+
+// checkPrerequisites verifies that required tools are installed and prints warnings.
+// It does not abort — missing tools are shown as warnings so the user can fix them.
+func checkPrerequisites(w io.Writer) {
+	type prereq struct {
+		cmd  string
+		hint string
+	}
+	required := []prereq{
+		{"git", "install git: https://git-scm.com"},
+		{"gh", "install gh: https://cli.github.com"},
+		{"tmux", "install tmux: apt install tmux / brew install tmux"},
+	}
+
+	var missing []prereq
+	for _, p := range required {
+		if _, err := exec.LookPath(p.cmd); err != nil {
+			missing = append(missing, p)
+		}
+	}
+
+	if len(missing) > 0 {
+		fmt.Fprintln(w, "Prerequisites check:")
+		for _, p := range missing {
+			fmt.Fprintf(w, "  WARNING: %s not found — %s\n", p.cmd, p.hint)
+		}
+		fmt.Fprintln(w)
+	}
+
+	// Check gh auth status
+	if _, err := exec.LookPath("gh"); err == nil {
+		if err := exec.Command("gh", "auth", "status").Run(); err != nil {
+			fmt.Fprintln(w, "  WARNING: gh is not authenticated — run: gh auth login")
+			fmt.Fprintln(w)
+		}
+	}
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {

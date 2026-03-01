@@ -260,6 +260,43 @@ func TestRunInitWizardStateDirConfirmation(t *testing.T) {
 	}
 }
 
+func TestCheckPrerequisites(t *testing.T) {
+	var buf bytes.Buffer
+	checkPrerequisites(&buf)
+
+	// git and tmux should be found on the test system;
+	// we just verify the function runs without panic.
+	// If a tool is missing, it prints a WARNING line.
+	out := buf.String()
+	_ = out // output depends on the host environment
+}
+
+func TestInitWizardShowsCline(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\ncline\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	out := output.String()
+	if !strings.Contains(out, "cline") {
+		t.Errorf("prompt should mention cline as a backend option, got:\n%s", out)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+	if !strings.Contains(string(data), "default: cline") {
+		t.Errorf("yaml should contain 'default: cline', got:\n%s", string(data))
+	}
+}
+
 func TestRunInitWizardInvalidMaxParallel(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)

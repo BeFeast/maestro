@@ -58,6 +58,19 @@ main() {
     fi
 
     echo "maestro ${LATEST} installed to ${INSTALL_DIR}/maestro"
+
+    # Verify the installed binary works
+    if "${INSTALL_DIR}/maestro" version >/dev/null 2>&1; then
+        echo "Verified: $("${INSTALL_DIR}/maestro" version)"
+    else
+        echo "warning: installed binary failed verification — try running: ${INSTALL_DIR}/maestro version" >&2
+    fi
+
+    echo
+    echo "Next steps:"
+    echo "  1. cd into your repo directory"
+    echo "  2. maestro init    (interactive setup wizard)"
+    echo "  3. maestro run --once  (test run)"
 }
 
 main
