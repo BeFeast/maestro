@@ -306,7 +306,7 @@ func TestBuildWorkerCmd_GenericInvalidPromptMode(t *testing.T) {
 
 func TestKnownBackends(t *testing.T) {
 	backends := KnownBackends()
-	expected := map[string]bool{"claude": false, "codex": false, "gemini": false}
+	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false}
 	for _, name := range backends {
 		if _, ok := expected[name]; ok {
 			expected[name] = true

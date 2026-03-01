@@ -260,6 +260,59 @@ func TestRunInitWizardStateDirConfirmation(t *testing.T) {
 	}
 }
 
+func TestRunInitWizardInvalidBackend(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	// repo, local_path(default), worktree(default), max_parallel(default),
+	// model=invalid_backend
+	input := "org/repo\n\n\n\ninvalid_backend\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err == nil {
+		t.Fatal("expected error for invalid model backend")
+	}
+	if !strings.Contains(err.Error(), "unknown model backend") {
+		t.Errorf("error should mention 'unknown model backend', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "claude") {
+		t.Errorf("error should list valid backends, got: %v", err)
+	}
+}
+
+func TestRunInitWizardRicherConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "BeFeast/myrepo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "maestro.yaml"))
+	if err != nil {
+		t.Fatal("maestro.yaml not created")
+	}
+
+	yamlStr := string(data)
+	commentedSettings := []string{
+		"# max_runtime_minutes: 120",
+		"# auto_rebase: true",
+		"# merge_strategy: sequential",
+		"# worker_prompt: worker-prompt.md",
+		"# exclude_labels:",
+	}
+	for _, setting := range commentedSettings {
+		if !strings.Contains(yamlStr, setting) {
+			t.Errorf("yaml missing commented-out setting %q, got:\n%s", setting, yamlStr)
+		}
+	}
+}
+
 func TestRunInitWizardInvalidMaxParallel(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)

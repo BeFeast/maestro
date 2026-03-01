@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/befeast/maestro/internal/worker"
 	"gopkg.in/yaml.v3"
 )
 
@@ -65,7 +67,13 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	localPath := promptInit(scanner, w, "Local clone path", "~/src/"+repoName)
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
-	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	validBackends := worker.KnownBackends()
+	sort.Strings(validBackends)
+	backendList := strings.Join(validBackends, "/")
+	modelBackend := promptInit(scanner, w, fmt.Sprintf("Default model backend (%s)", backendList), "claude")
+	if !isValidBackend(modelBackend, validBackends) {
+		return fmt.Errorf("unknown model backend %q — valid options: %s", modelBackend, strings.Join(validBackends, ", "))
+	}
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -88,7 +96,8 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 
 	fmt.Fprintln(w)
 
-	// Build config
+	// Build config — marshal active settings via YAML, then append
+	// commented-out examples so new users can discover features.
 	cfg := initYAMLConfig{
 		Repo:         repo,
 		LocalPath:    localPath,
@@ -104,7 +113,18 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(yamlPath, yamlData, 0644); err != nil {
+	var buf strings.Builder
+	buf.Write(yamlData)
+	buf.WriteString("\n# --- Optional settings (uncomment to enable) ---\n")
+	buf.WriteString("# max_runtime_minutes: 120\n")
+	buf.WriteString("# auto_rebase: true\n")
+	buf.WriteString("# merge_strategy: sequential\n")
+	buf.WriteString("# worker_prompt: worker-prompt.md\n")
+	buf.WriteString("# exclude_labels:\n")
+	buf.WriteString("#   - wontfix\n")
+	buf.WriteString("#   - duplicate\n")
+
+	if err := os.WriteFile(yamlPath, []byte(buf.String()), 0644); err != nil {
 		return fmt.Errorf("write maestro.yaml: %w", err)
 	}
 	fmt.Fprintln(w, "\u2705 Created maestro.yaml")
@@ -211,6 +231,15 @@ func launchdPlist(binPath, configPath string) string {
 </dict>
 </plist>
 `, binPath, configPath)
+}
+
+func isValidBackend(name string, valid []string) bool {
+	for _, v := range valid {
+		if name == v {
+			return true
+		}
+	}
+	return false
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {
