@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -85,7 +86,41 @@ Watch:
 `
 
 // version is set at build time via -ldflags "-X main.version=X.Y.Z".
+// When not set (local builds), resolveVersion falls back to Go module/VCS info.
 var version = "dev"
+
+func resolveVersion() string {
+	if version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+	// go install github.com/befeast/maestro/cmd/maestro@v1.2.3 sets info.Main.Version
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return strings.TrimPrefix(v, "v")
+	}
+	// Local build from git checkout — use VCS revision
+	var rev, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if rev != "" {
+		if len(rev) > 12 {
+			rev = rev[:12]
+		}
+		return "dev-" + rev + dirty
+	}
+	return version
+}
 
 // multiFlag accumulates repeated --config flag values.
 type multiFlag []string
@@ -136,7 +171,7 @@ func main() {
 	case "_watch-tail":
 		watchTailCmd(args)
 	case "version":
-		fmt.Printf("maestro v%s\n", version)
+		fmt.Printf("maestro v%s\n", resolveVersion())
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 	default:
