@@ -456,3 +456,138 @@ func TestMergeInterval_Explicit(t *testing.T) {
 		t.Fatalf("mergeInterval() = %s, want %s", got, 45*time.Second)
 	}
 }
+
+// --- resolveBackend tests ---
+
+func cfgWithBackends(defaultBackend string, backends ...string) *config.Config {
+	m := make(map[string]config.BackendDef, len(backends))
+	for _, b := range backends {
+		m[b] = config.BackendDef{Cmd: b}
+	}
+	return &config.Config{
+		Repo: "owner/repo",
+		Model: config.ModelConfig{
+			Default:  defaultBackend,
+			Backends: m,
+		},
+	}
+}
+
+func TestResolveBackend_ModelLabelOverride(t *testing.T) {
+	o := &Orchestrator{cfg: cfgWithBackends("claude", "claude", "codex", "gemini")}
+	got := o.resolveBackend(makeIssue(1, "Fix bug", "model:codex"))
+	if got != "codex" {
+		t.Errorf("resolveBackend() = %q, want %q", got, "codex")
+	}
+}
+
+func TestResolveBackend_ModelLabelGemini(t *testing.T) {
+	o := &Orchestrator{cfg: cfgWithBackends("claude", "claude", "codex", "gemini")}
+	got := o.resolveBackend(makeIssue(2, "Add feature", "enhancement", "model:gemini"))
+	if got != "gemini" {
+		t.Errorf("resolveBackend() = %q, want %q", got, "gemini")
+	}
+}
+
+func TestResolveBackend_UnknownBackendFallsToDefault(t *testing.T) {
+	o := &Orchestrator{cfg: cfgWithBackends("claude", "claude", "codex")}
+	got := o.resolveBackend(makeIssue(3, "Fix bug", "model:nonexistent"))
+	if got != "claude" {
+		t.Errorf("resolveBackend() = %q, want %q (unknown backend should fall back to default)", got, "claude")
+	}
+}
+
+func TestResolveBackend_NoLabelReturnsDefault(t *testing.T) {
+	o := &Orchestrator{cfg: cfgWithBackends("claude", "claude", "codex")}
+	got := o.resolveBackend(makeIssue(4, "Fix bug"))
+	if got != "claude" {
+		t.Errorf("resolveBackend() = %q, want %q", got, "claude")
+	}
+}
+
+func TestResolveBackend_NoLabelWithAutoRouting(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Routing.Mode = "auto"
+	o := &Orchestrator{
+		cfg: cfg,
+		routeFn: func(issue github.Issue) (string, string, error) {
+			return "codex", "simple fix", nil
+		},
+	}
+	got := o.resolveBackend(makeIssue(5, "Simple fix"))
+	if got != "codex" {
+		t.Errorf("resolveBackend() = %q, want %q", got, "codex")
+	}
+}
+
+func TestResolveBackend_LabelOverridesAutoRouting(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Routing.Mode = "auto"
+	routerCalled := false
+	o := &Orchestrator{
+		cfg: cfg,
+		routeFn: func(issue github.Issue) (string, string, error) {
+			routerCalled = true
+			return "codex", "router pick", nil
+		},
+	}
+	got := o.resolveBackend(makeIssue(6, "Fix bug", "model:gemini"))
+	if got != "gemini" {
+		t.Errorf("resolveBackend() = %q, want %q (label should override auto-routing)", got, "gemini")
+	}
+	if routerCalled {
+		t.Error("router should not be called when model: label is present")
+	}
+}
+
+func TestResolveBackend_AutoRoutingErrorFallsToDefault(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Routing.Mode = "auto"
+	o := &Orchestrator{
+		cfg: cfg,
+		routeFn: func(issue github.Issue) (string, string, error) {
+			return "", "", fmt.Errorf("network error")
+		},
+	}
+	got := o.resolveBackend(makeIssue(7, "Fix bug"))
+	if got != "claude" {
+		t.Errorf("resolveBackend() = %q, want %q (should fall back on router error)", got, "claude")
+	}
+}
+
+func TestResolveBackend_AutoRoutingDisabled(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Routing.Mode = "manual"
+	routerCalled := false
+	o := &Orchestrator{
+		cfg: cfg,
+		routeFn: func(issue github.Issue) (string, string, error) {
+			routerCalled = true
+			return "codex", "router pick", nil
+		},
+	}
+	got := o.resolveBackend(makeIssue(8, "Fix bug"))
+	if got != "claude" {
+		t.Errorf("resolveBackend() = %q, want %q", got, "claude")
+	}
+	if routerCalled {
+		t.Error("router should not be called when routing mode is not auto")
+	}
+}
+
+func TestResolveBackend_EmptyModelLabelIgnored(t *testing.T) {
+	o := &Orchestrator{cfg: cfgWithBackends("claude", "claude", "codex")}
+	// "model:" with no value after the colon should be ignored
+	got := o.resolveBackend(makeIssue(9, "Fix bug", "model:"))
+	if got != "claude" {
+		t.Errorf("resolveBackend() = %q, want %q (empty model: label should be ignored)", got, "claude")
+	}
+}
+
+func TestResolveBackend_MultipleLabelsFirstModelWins(t *testing.T) {
+	o := &Orchestrator{cfg: cfgWithBackends("claude", "claude", "codex", "gemini")}
+	got := o.resolveBackend(makeIssue(10, "Fix bug", "bug", "model:codex", "model:gemini"))
+	if got != "codex" {
+		t.Errorf("resolveBackend() = %q, want %q (first model: label should win)", got, "codex")
+	}
+}

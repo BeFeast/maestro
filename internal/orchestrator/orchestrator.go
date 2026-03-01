@@ -35,6 +35,7 @@ type Orchestrator struct {
 	tmuxSessionExistsFn   func(name string) bool
 	listOpenPRsFn         func() ([]github.PR, error)
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
+	routeFn               func(issue github.Issue) (string, string, error)
 }
 
 // New creates a new Orchestrator
@@ -886,6 +887,41 @@ func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Ses
 	o.notifier.Sendf("⚠️ Worker %s (issue #%d) has unresolvable conflicts — manual intervention needed", slotName, sess.IssueNumber)
 }
 
+// resolveBackend determines which backend to use for the given issue.
+// Priority: 1) model:<name> label override, 2) auto-routing via LLM, 3) default.
+func (o *Orchestrator) resolveBackend(issue github.Issue) string {
+	// Check for model: label (highest priority)
+	for _, label := range issue.Labels {
+		if strings.HasPrefix(label.Name, "model:") {
+			if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
+				if _, ok := o.cfg.Model.Backends[name]; !ok {
+					log.Printf("[router] issue #%d: label model:%s references unknown backend — falling back to default %q", issue.Number, name, o.cfg.Model.Default)
+					return o.cfg.Model.Default
+				}
+				log.Printf("[router] issue #%d → %s (label override)", issue.Number, name)
+				return name
+			}
+		}
+	}
+
+	// Try auto-routing via LLM
+	if o.cfg.Routing.Mode == "auto" {
+		routeFn := o.router.Route
+		if o.routeFn != nil {
+			routeFn = o.routeFn
+		}
+		routedBackend, reason, err := routeFn(issue)
+		if err != nil {
+			log.Printf("[router] issue #%d: error %v — using default", issue.Number, err)
+		} else if routedBackend != "" {
+			log.Printf("[router] issue #%d → %s (%s)", issue.Number, routedBackend, reason)
+			return routedBackend
+		}
+	}
+
+	return o.cfg.Model.Default
+}
+
 // startNewWorkers picks eligible issues and starts workers for them
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	issues, err := o.gh.ListOpenIssues(o.cfg.IssueLabels)
@@ -919,35 +955,16 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
-		// Detect model: label for backend selection (label takes precedence) and long-running label
-		backendName := ""
+		// Resolve backend from label / auto-routing / default
+		backendName := o.resolveBackend(issue)
+
+		// Detect long-running label
 		longRunning := false
 		for _, label := range issue.Labels {
-			if strings.HasPrefix(label.Name, "model:") {
-				if name := strings.TrimPrefix(label.Name, "model:"); name != "" {
-					backendName = name
-					log.Printf("[router] issue #%d → %s (label override)", issue.Number, backendName)
-				}
-			}
 			if strings.EqualFold(label.Name, "long-running") {
 				longRunning = true
+				break
 			}
-		}
-
-		// If no label, try auto-routing via LLM
-		if backendName == "" && o.cfg.Routing.Mode == "auto" {
-			routedBackend, reason, err := o.router.Route(issue)
-			if err != nil {
-				log.Printf("[router] issue #%d: error %v — using default", issue.Number, err)
-			} else {
-				log.Printf("[router] issue #%d → %s (%s)", issue.Number, routedBackend, reason)
-			}
-			backendName = routedBackend
-		}
-
-		// Fall back to default
-		if backendName == "" {
-			backendName = o.cfg.Model.Default
 		}
 
 		promptBase := o.selectPrompt(issue)
