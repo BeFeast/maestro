@@ -337,6 +337,15 @@ func TestRunInitWizardAllValidBackends(t *testing.T) {
 	}
 }
 
+func TestCheckInitPrerequisites(t *testing.T) {
+	var buf bytes.Buffer
+	checkInitPrerequisites(&buf)
+	// git should always be available in test environments
+	if strings.Contains(buf.String(), "git not found") {
+		t.Error("git should be found in test environment")
+	}
+}
+
 func TestRunInitWizardRicherConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
@@ -407,5 +416,23 @@ func TestBuildInitYAML(t *testing.T) {
 	}
 	if !strings.Contains(yaml, `target: "12345"`) {
 		t.Error("should contain telegram target")
+	}
+}
+
+func TestRunInitWizardShowsBackendOptions(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	out := output.String()
+	if !strings.Contains(out, "cline") {
+		t.Errorf("model backend prompt should mention cline, got:\n%s", out)
 	}
 }
