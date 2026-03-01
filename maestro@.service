@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
+# Set PATH so AI CLIs installed via npm/bun (e.g. in ~/.local/bin) are found.
+# Replace with the output of: echo $PATH
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/maestro run --config %h/.maestro/maestro-%i.yaml
 Restart=on-failure
 RestartSec=30
