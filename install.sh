@@ -58,6 +58,26 @@ main() {
     fi
 
     echo "maestro ${LATEST} installed to ${INSTALL_DIR}/maestro"
+
+    # Verify the installed binary works
+    if "${INSTALL_DIR}/maestro" version >/dev/null 2>&1; then
+        echo "Verified: $("${INSTALL_DIR}/maestro" version)"
+    else
+        echo "warning: installed binary could not be executed" >&2
+    fi
+
+    # Check if INSTALL_DIR is in PATH
+    case ":${PATH}:" in
+        *":${INSTALL_DIR}:"*) ;;
+        *)
+            echo ""
+            echo "Note: ${INSTALL_DIR} is not in your PATH."
+            echo "Add it with:  export PATH=\"${INSTALL_DIR}:\$PATH\""
+            ;;
+    esac
+
+    echo ""
+    echo "Next: run 'maestro init' in your project directory to get started."
 }
 
 main

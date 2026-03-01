@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -279,5 +280,144 @@ func TestRunInitWizardInvalidMaxParallel(t *testing.T) {
 
 	if !strings.Contains(string(data), "max_parallel: 3") {
 		t.Errorf("invalid max_parallel should default to 3, got:\n%s", string(data))
+	}
+}
+
+func TestCheckPrerequisitesAllPresent(t *testing.T) {
+	var buf bytes.Buffer
+	found := func(name string) (string, error) {
+		return "/usr/bin/" + name, nil
+	}
+	missing := checkPrerequisites(&buf, found)
+	if len(missing) != 0 {
+		t.Errorf("expected no missing, got %v", missing)
+	}
+	if strings.Contains(buf.String(), "not found") {
+		t.Errorf("output should not contain 'not found', got: %s", buf.String())
+	}
+}
+
+func TestCheckPrerequisitesMissing(t *testing.T) {
+	var buf bytes.Buffer
+	notFound := func(name string) (string, error) {
+		return "", fmt.Errorf("not found: %s", name)
+	}
+	missing := checkPrerequisites(&buf, notFound)
+	if len(missing) != 3 {
+		t.Errorf("expected 3 missing, got %d: %v", len(missing), missing)
+	}
+	for _, tool := range []string{"git", "gh", "tmux"} {
+		found := false
+		for _, m := range missing {
+			if m == tool {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %s in missing list", tool)
+		}
+	}
+	out := buf.String()
+	if !strings.Contains(out, "git not found") {
+		t.Error("should mention git not found")
+	}
+	if !strings.Contains(out, "gh not found") {
+		t.Error("should mention gh not found")
+	}
+	if !strings.Contains(out, "tmux not found") {
+		t.Error("should mention tmux not found")
+	}
+}
+
+func TestCheckPrerequisitesPartial(t *testing.T) {
+	var buf bytes.Buffer
+	// Only gh is missing
+	lookup := func(name string) (string, error) {
+		if name == "gh" {
+			return "", fmt.Errorf("not found")
+		}
+		return "/usr/bin/" + name, nil
+	}
+	missing := checkPrerequisites(&buf, lookup)
+	if len(missing) != 1 || missing[0] != "gh" {
+		t.Errorf("expected [gh], got %v", missing)
+	}
+}
+
+func TestCheckBackendFound(t *testing.T) {
+	var buf bytes.Buffer
+	found := func(name string) (string, error) {
+		return "/usr/bin/" + name, nil
+	}
+	checkBackend(&buf, "claude", found)
+	if strings.Contains(buf.String(), "not found") {
+		t.Errorf("should not warn when backend is found, got: %s", buf.String())
+	}
+}
+
+func TestCheckBackendMissing(t *testing.T) {
+	var buf bytes.Buffer
+	notFound := func(name string) (string, error) {
+		return "", fmt.Errorf("not found")
+	}
+	checkBackend(&buf, "codex", notFound)
+	if !strings.Contains(buf.String(), "codex not found") {
+		t.Errorf("should warn about missing codex, got: %s", buf.String())
+	}
+}
+
+func TestCheckBackendDefaultsClaude(t *testing.T) {
+	var buf bytes.Buffer
+	var checked string
+	lookup := func(name string) (string, error) {
+		checked = name
+		return "", fmt.Errorf("not found")
+	}
+	checkBackend(&buf, "", lookup)
+	if checked != "claude" {
+		t.Errorf("empty backend should check claude, got: %s", checked)
+	}
+}
+
+func TestRunInitWizardShowsPrerequisites(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	out := output.String()
+	if !strings.Contains(out, "Checking prerequisites") {
+		t.Error("should show prerequisite check header")
+	}
+}
+
+func TestRunInitWizardShowsNextSteps(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	input := "org/repo\n\n\n\n\n\n\n"
+	var output bytes.Buffer
+
+	err := runInitWizard(strings.NewReader(input), &output, tmpDir)
+	if err != nil {
+		t.Fatalf("runInitWizard error: %v", err)
+	}
+
+	out := output.String()
+	if !strings.Contains(out, "Next steps:") {
+		t.Error("should show 'Next steps:' header")
+	}
+	if !strings.Contains(out, "maestro run --once") {
+		t.Error("should suggest maestro run --once")
+	}
+	if !strings.Contains(out, "maestro status") {
+		t.Error("should suggest maestro status")
 	}
 }

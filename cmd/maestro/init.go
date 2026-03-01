@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -51,6 +52,16 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	fmt.Fprintln(w, "Welcome to Maestro! Let's set up your first project.")
 	fmt.Fprintln(w)
 
+	// Check prerequisites
+	fmt.Fprintln(w, "Checking prerequisites...")
+	missing := checkPrerequisites(w, nil)
+	if len(missing) > 0 {
+		fmt.Fprintf(w, "\n  ⚠ Missing tools: %s — install them before running maestro\n", strings.Join(missing, ", "))
+	} else {
+		fmt.Fprintln(w, "  ✓ All prerequisites found (git, gh, tmux)")
+	}
+	fmt.Fprintln(w)
+
 	repo := promptInit(scanner, w, "GitHub repo (owner/repo)", "")
 	if repo == "" {
 		return fmt.Errorf("repo is required")
@@ -66,6 +77,7 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 	worktreeBase := promptInit(scanner, w, "Worktree base dir", "~/.worktrees/"+repoName)
 	maxParallelStr := promptInit(scanner, w, "Max parallel workers", "3")
 	modelBackend := promptInit(scanner, w, "Default model backend (claude/codex/gemini)", "claude")
+	checkBackend(w, modelBackend, nil)
 	issueLabel := promptInit(scanner, w, "Issue label filter", "enhancement")
 
 	maxParallel, err := strconv.Atoi(maxParallelStr)
@@ -133,12 +145,15 @@ func runInitWizard(r io.Reader, w io.Writer, outDir string) error {
 
 	// Next steps
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Run: maestro run --once    (test run)")
+	fmt.Fprintln(w, "Next steps:")
+	fmt.Fprintln(w, "  1. maestro run --once              (test run — picks one issue)")
+	fmt.Fprintln(w, "  2. maestro status                  (check worker state)")
 	switch runtime.GOOS {
 	case "linux":
+		fmt.Fprintln(w, "  3. systemctl --user daemon-reload")
 		fmt.Fprintln(w, "     systemctl --user enable --now maestro.service")
 	case "darwin":
-		fmt.Fprintln(w, "     launchctl load ~/Library/LaunchAgents/com.maestro.agent.plist")
+		fmt.Fprintln(w, "  3. launchctl load ~/Library/LaunchAgents/com.maestro.agent.plist")
 	}
 
 	return nil
@@ -211,6 +226,46 @@ func launchdPlist(binPath, configPath string) string {
 </dict>
 </plist>
 `, binPath, configPath)
+}
+
+// checkPrerequisites verifies that required tools are installed and prints
+// warnings for any that are missing. Returns the list of missing tool names.
+// lookPath can be overridden for testing; pass nil to use exec.LookPath.
+func checkPrerequisites(w io.Writer, lookPath func(string) (string, error)) []string {
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	required := []struct {
+		cmd  string
+		desc string
+	}{
+		{"git", "version control"},
+		{"gh", "GitHub CLI — install from https://cli.github.com"},
+		{"tmux", "terminal multiplexer — install with: sudo apt install tmux (or brew install tmux)"},
+	}
+	var missing []string
+	for _, tool := range required {
+		if _, err := lookPath(tool.cmd); err != nil {
+			fmt.Fprintf(w, "  ✗ %s not found (%s)\n", tool.cmd, tool.desc)
+			missing = append(missing, tool.cmd)
+		}
+	}
+	return missing
+}
+
+// checkBackend verifies that the selected AI backend CLI is installed and
+// prints a warning if not. lookPath can be overridden for testing.
+func checkBackend(w io.Writer, backend string, lookPath func(string) (string, error)) {
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	cmd := backend
+	if cmd == "" {
+		cmd = "claude"
+	}
+	if _, err := lookPath(cmd); err != nil {
+		fmt.Fprintf(w, "\n  ⚠ %s not found in PATH — install it before running maestro\n", cmd)
+	}
 }
 
 func promptInit(scanner *bufio.Scanner, w io.Writer, question, defaultVal string) string {
