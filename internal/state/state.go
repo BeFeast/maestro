@@ -19,6 +19,7 @@ const (
 	StatusFailed         SessionStatus = "failed"
 	StatusConflictFailed SessionStatus = "conflict_failed"
 	StatusDead           SessionStatus = "dead"
+	StatusRetryExhausted SessionStatus = "retry_exhausted" // max retries reached, needs manual review
 )
 
 type Session struct {
@@ -132,10 +133,59 @@ func (s *State) IssueInProgress(issueNum int) bool {
 	return false
 }
 
+// FailedAttemptsForIssue counts sessions for the given issue that ended
+// without producing a PR (dead, failed, or retry_exhausted).
+func (s *State) FailedAttemptsForIssue(issueNum int) int {
+	count := 0
+	for _, sess := range s.Sessions {
+		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
+			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) {
+			count++
+		}
+	}
+	return count
+}
+
+// IssueRetryExhausted returns true if any session for the given issue
+// has been marked as retry_exhausted.
+func (s *State) IssueRetryExhausted(issueNum int) bool {
+	for _, sess := range s.Sessions {
+		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted {
+			return true
+		}
+	}
+	return false
+}
+
+// MarkIssueRetryExhausted transitions the most recent dead/failed session
+// for the given issue to StatusRetryExhausted.
+func (s *State) MarkIssueRetryExhausted(issueNum int) {
+	var latest *Session
+	var latestTime time.Time
+	for _, sess := range s.Sessions {
+		if sess.IssueNumber == issueNum &&
+			(sess.Status == StatusDead || sess.Status == StatusFailed) {
+			var t time.Time
+			if sess.FinishedAt != nil {
+				t = *sess.FinishedAt
+			} else {
+				t = sess.StartedAt
+			}
+			if latest == nil || t.After(latestTime) {
+				latest = sess
+				latestTime = t
+			}
+		}
+	}
+	if latest != nil {
+		latest.Status = StatusRetryExhausted
+	}
+}
+
 // IsTerminal returns true if the status represents a completed/dead session.
 func IsTerminal(status SessionStatus) bool {
 	switch status {
-	case StatusDone, StatusFailed, StatusConflictFailed, StatusDead:
+	case StatusDone, StatusFailed, StatusConflictFailed, StatusDead, StatusRetryExhausted:
 		return true
 	}
 	return false

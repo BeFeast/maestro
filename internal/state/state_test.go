@@ -472,6 +472,7 @@ func TestIsTerminal(t *testing.T) {
 		{StatusFailed, true},
 		{StatusConflictFailed, true},
 		{StatusDead, true},
+		{StatusRetryExhausted, true},
 	}
 	for _, tt := range tests {
 		if got := IsTerminal(tt.status); got != tt.want {
@@ -592,4 +593,70 @@ func TestPruneOldSessions_NoFinishedAt(t *testing.T) {
 	if pruned != 1 {
 		t.Errorf("expected 1 pruned, got %d", pruned)
 	}
+}
+
+// --- retry exhaustion tests ---
+
+func TestFailedAttemptsForIssue(t *testing.T) {
+	now := time.Now().UTC()
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 0}
+	s.Sessions["slot-2"] = &Session{IssueNumber: 42, Status: StatusFailed, PRNumber: 0}
+	s.Sessions["slot-3"] = &Session{IssueNumber: 42, Status: StatusDone, PRNumber: 10}                   // success — not counted
+	s.Sessions["slot-4"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 5}                    // has PR — not counted
+	s.Sessions["slot-5"] = &Session{IssueNumber: 42, Status: StatusRetryExhausted, PRNumber: 0}          // counted
+	s.Sessions["slot-6"] = &Session{IssueNumber: 99, Status: StatusDead, PRNumber: 0}                    // different issue
+	s.Sessions["slot-7"] = &Session{IssueNumber: 42, Status: StatusRunning, PRNumber: 0, StartedAt: now} // running — not counted
+	s.Sessions["slot-8"] = &Session{IssueNumber: 42, Status: StatusConflictFailed, PRNumber: 0}          // conflict — not counted
+
+	if got := s.FailedAttemptsForIssue(42); got != 3 {
+		t.Errorf("FailedAttemptsForIssue(42) = %d, want 3", got)
+	}
+	if got := s.FailedAttemptsForIssue(99); got != 1 {
+		t.Errorf("FailedAttemptsForIssue(99) = %d, want 1", got)
+	}
+	if got := s.FailedAttemptsForIssue(100); got != 0 {
+		t.Errorf("FailedAttemptsForIssue(100) = %d, want 0", got)
+	}
+}
+
+func TestIssueRetryExhausted(t *testing.T) {
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 42, Status: StatusDead}
+	s.Sessions["slot-2"] = &Session{IssueNumber: 42, Status: StatusRetryExhausted}
+	s.Sessions["slot-3"] = &Session{IssueNumber: 99, Status: StatusFailed}
+
+	if !s.IssueRetryExhausted(42) {
+		t.Error("IssueRetryExhausted(42) should be true")
+	}
+	if s.IssueRetryExhausted(99) {
+		t.Error("IssueRetryExhausted(99) should be false")
+	}
+}
+
+func TestMarkIssueRetryExhausted(t *testing.T) {
+	now := time.Now().UTC()
+	old := now.Add(-1 * time.Hour)
+
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 42, Status: StatusDead, FinishedAt: &old}
+	s.Sessions["slot-2"] = &Session{IssueNumber: 42, Status: StatusFailed, FinishedAt: &now} // most recent
+	s.Sessions["slot-3"] = &Session{IssueNumber: 42, Status: StatusDone, PRNumber: 10}       // not eligible
+
+	s.MarkIssueRetryExhausted(42)
+
+	// The most recent dead/failed session (slot-2) should be marked
+	if s.Sessions["slot-2"].Status != StatusRetryExhausted {
+		t.Errorf("slot-2 status = %q, want %q", s.Sessions["slot-2"].Status, StatusRetryExhausted)
+	}
+	// slot-1 should remain dead
+	if s.Sessions["slot-1"].Status != StatusDead {
+		t.Errorf("slot-1 status = %q, want %q", s.Sessions["slot-1"].Status, StatusDead)
+	}
+}
+
+func TestMarkIssueRetryExhausted_NoSessions(t *testing.T) {
+	s := NewState()
+	// Should not panic when no matching sessions exist
+	s.MarkIssueRetryExhausted(42)
 }
