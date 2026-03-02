@@ -2624,3 +2624,303 @@ func TestCheckSessions_DeadClosedIssue_SetsFinishedAtIfNil(t *testing.T) {
 		t.Fatal("FinishedAt should be set when transitioning from dead with nil FinishedAt")
 	}
 }
+
+// --- rate-limit detection tests ---
+
+// newRateLimitOrchestrator creates an Orchestrator wired for checkSessions
+// rate-limit testing. tmuxOutput is returned by the capture hook.
+// Returns the orchestrator, a slice of stopped slot names, and a slice of
+// (slotName, backendName) pairs for respawned workers.
+func newRateLimitOrchestrator(cfg *config.Config, tmuxOutput string) (*Orchestrator, *[]string, *[][2]string) {
+	stopped := make([]string, 0)
+	respawned := make([][2]string, 0) // [slotName, backendName]
+	return &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return tmuxOutput, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		workerRespawnFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawned = append(respawned, [2]string{slotName, backendName})
+			sess.Backend = backendName
+			sess.Status = state.StatusRunning
+			return nil
+		},
+	}, &stopped, &respawned
+}
+
+func TestCheckSessions_RateLimitDetected_NoFallback_MarksDead(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	o, stopped, _ := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today.")
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-101-test",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-1"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus != "rate_limit" {
+		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "rate_limit")
+	}
+	if !sess.RateLimitHit {
+		t.Fatal("rate_limit_hit should be true")
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("finished_at should be set")
+	}
+	if len(*stopped) != 1 || (*stopped)[0] != "mae-1" {
+		t.Fatalf("stopped = %v, want [mae-1]", *stopped)
+	}
+}
+
+func TestCheckSessions_RateLimitDetected_WithFallback_Respawns(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Fallback: "gemini",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"gemini": {Cmd: "gemini"},
+			},
+		},
+	}
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "rate limit exceeded — try again later")
+
+	s := state.NewState()
+	s.Sessions["mae-2"] = &state.Session{
+		IssueNumber: 102,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         2345,
+		TmuxSession: "maestro-mae-2",
+		Branch:      "feat/mae-2-102-test",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-2"]
+	// Worker should be stopped (old one killed) then respawned with fallback
+	if len(*stopped) != 1 || (*stopped)[0] != "mae-2" {
+		t.Fatalf("stopped = %v, want [mae-2]", *stopped)
+	}
+	if len(*respawned) != 1 {
+		t.Fatalf("respawned = %v, want 1 entry", *respawned)
+	}
+	if (*respawned)[0][0] != "mae-2" || (*respawned)[0][1] != "gemini" {
+		t.Fatalf("respawned = %v, want [mae-2, gemini]", (*respawned)[0])
+	}
+	// Session should be running with new backend
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (should be running after fallback respawn)", sess.Status, state.StatusRunning)
+	}
+	if sess.Backend != "gemini" {
+		t.Fatalf("backend = %q, want %q", sess.Backend, "gemini")
+	}
+	if !sess.RateLimitHit {
+		t.Fatal("rate_limit_hit should be true")
+	}
+}
+
+func TestCheckSessions_RateLimitDetected_AlreadyOnFallback_MarksDead(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Fallback: "gemini",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"gemini": {Cmd: "gemini"},
+			},
+		},
+	}
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error 429: too many requests")
+
+	s := state.NewState()
+	s.Sessions["mae-3"] = &state.Session{
+		IssueNumber: 103,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         3456,
+		TmuxSession: "maestro-mae-3",
+		Branch:      "feat/mae-3-103-test",
+		Backend:     "gemini", // already on fallback
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-3"]
+	// Should NOT respawn — already on fallback backend
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (already on fallback, should be dead)", sess.Status, state.StatusDead)
+	}
+	if len(*stopped) != 1 {
+		t.Fatalf("stopped = %v, want 1 entry", *stopped)
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want empty (should not respawn when already on fallback)", *respawned)
+	}
+	if sess.LastNotifiedStatus != "rate_limit" {
+		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "rate_limit")
+	}
+}
+
+func TestCheckSessions_RateLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	// Output still contains rate limit text from previous cycle
+	o, stopped, _ := newRateLimitOrchestrator(cfg, "Error: rate limit exceeded")
+
+	s := state.NewState()
+	s.Sessions["mae-4"] = &state.Session{
+		IssueNumber:        104,
+		IssueTitle:         "test issue",
+		Status:             state.StatusRunning,
+		PID:                4567,
+		TmuxSession:        "maestro-mae-4",
+		Branch:             "feat/mae-4-104-test",
+		Backend:            "claude",
+		StartedAt:          time.Now().Add(-10 * time.Minute),
+		RateLimitHit:       true,         // already detected
+		LastNotifiedStatus: "rate_limit", // already notified
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-4"]
+	// Should remain running — rate limit was already handled
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (already notified, should not re-kill)", sess.Status, state.StatusRunning)
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty (should not duplicate kill)", *stopped)
+	}
+}
+
+func TestCheckSessions_NoRateLimit_WorkerSurvives(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Fallback: "gemini",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"gemini": {Cmd: "gemini"},
+			},
+		},
+	}
+	// Normal output, no rate limit patterns
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "tokens 50000 (in 10000 / out 40000)\nTask completed successfully.")
+
+	s := state.NewState()
+	s.Sessions["mae-5"] = &state.Session{
+		IssueNumber: 105,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         5678,
+		TmuxSession: "maestro-mae-5",
+		Branch:      "feat/mae-5-105-test",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-5"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+	if sess.RateLimitHit {
+		t.Fatal("rate_limit_hit should be false")
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want empty", *respawned)
+	}
+}
+
+func TestCheckSessions_RateLimit429Pattern_Detected(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	o, stopped, _ := newRateLimitOrchestrator(cfg, "API returned status 429")
+
+	s := state.NewState()
+	s.Sessions["mae-6"] = &state.Session{
+		IssueNumber: 106,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         6789,
+		TmuxSession: "maestro-mae-6",
+		Branch:      "feat/mae-6-106-test",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-6"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if !sess.RateLimitHit {
+		t.Fatal("rate_limit_hit should be true for 429 pattern")
+	}
+	if len(*stopped) != 1 {
+		t.Fatalf("stopped = %v, want 1 entry", *stopped)
+	}
+}
