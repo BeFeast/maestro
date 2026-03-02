@@ -2360,3 +2360,267 @@ func TestStartNewWorkers_FailedWithPRNotCounted(t *testing.T) {
 		t.Fatalf("started %d workers, want 1 (PR failures don't count)", len(*started))
 	}
 }
+
+// --- zombie session cleanup tests (#187) ---
+
+// TestCheckSessions_ConflictFailedClosedIssue_TransitionsToDone verifies that
+// a conflict_failed session whose issue is closed gets transitioned to done,
+// freeing the slot and preventing zombie sessions.
+func TestCheckSessions_ConflictFailedClosedIssue_TransitionsToDone(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil // issue is closed
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-59"] = &state.Session{
+		IssueNumber:     263,
+		IssueTitle:      "stuck conflict",
+		Status:          state.StatusConflictFailed,
+		Branch:          "feat/pan-59-263-stuck",
+		RebaseAttempted: true,
+		FinishedAt:      &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-59"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+// TestCheckSessions_FailedClosedIssue_TransitionsToDone verifies that
+// a failed session whose issue is closed gets transitioned to done.
+func TestCheckSessions_FailedClosedIssue_TransitionsToDone(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-10"] = &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "failed worker",
+		Status:      state.StatusFailed,
+		Branch:      "feat/pan-10-100-failed",
+		FinishedAt:  &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-10"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+// TestCheckSessions_DeadClosedIssue_TransitionsToDone verifies that
+// a dead session whose issue is closed gets transitioned to done.
+func TestCheckSessions_DeadClosedIssue_TransitionsToDone(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-11"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "dead worker",
+		Status:      state.StatusDead,
+		Branch:      "feat/pan-11-101-dead",
+		FinishedAt:  &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-11"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+// TestCheckSessions_ConflictFailedOpenIssue_StaysConflictFailed verifies that
+// a conflict_failed session whose issue is still open remains conflict_failed.
+func TestCheckSessions_ConflictFailedOpenIssue_StaysConflictFailed(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil // issue is open
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-60"] = &state.Session{
+		IssueNumber:     264,
+		IssueTitle:      "conflict but open",
+		Status:          state.StatusConflictFailed,
+		Branch:          "feat/pan-60-264-conflict",
+		RebaseAttempted: true,
+		FinishedAt:      &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-60"]
+	if sess.Status != state.StatusConflictFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusConflictFailed)
+	}
+}
+
+// TestCheckSessions_PROpenClosedIssue_TransitionsToDone verifies that
+// a pr_open session whose issue is closed gets transitioned to done,
+// freeing the worker slot.
+func TestCheckSessions_PROpenClosedIssue_TransitionsToDone(t *testing.T) {
+	stopped := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 50, HeadRefName: "feat/pan-20-200-pr"}}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-20"] = &state.Session{
+		IssueNumber: 200,
+		IssueTitle:  "pr open but issue closed",
+		Status:      state.StatusPROpen,
+		Branch:      "feat/pan-20-200-pr",
+		PRNumber:    50,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-20"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set")
+	}
+	if len(stopped) != 1 || stopped[0] != "pan-20" {
+		t.Fatalf("stopped = %v, want [pan-20]", stopped)
+	}
+}
+
+// TestCheckSessions_QueuedClosedIssue_TransitionsToDone verifies that
+// a queued session (post-rebase) whose issue is closed gets transitioned to done.
+func TestCheckSessions_QueuedClosedIssue_TransitionsToDone(t *testing.T) {
+	stopped := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-30"] = &state.Session{
+		IssueNumber:     300,
+		IssueTitle:      "queued but issue closed",
+		Status:          state.StatusQueued,
+		Branch:          "feat/pan-30-300-queued",
+		RebaseAttempted: true,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-30"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set")
+	}
+}
+
+// TestCheckSessions_DeadClosedIssue_SetsFinishedAtIfNil verifies that
+// FinishedAt is set when transitioning a dead session with nil FinishedAt.
+func TestCheckSessions_DeadClosedIssue_SetsFinishedAtIfNil(t *testing.T) {
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-12"] = &state.Session{
+		IssueNumber: 102,
+		IssueTitle:  "dead no finished_at",
+		Status:      state.StatusDead,
+		Branch:      "feat/pan-12-102-dead",
+		// FinishedAt intentionally nil
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-12"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set when transitioning from dead with nil FinishedAt")
+	}
+}
