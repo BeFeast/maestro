@@ -462,6 +462,22 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	for slotName, sess := range s.Sessions {
 		switch sess.Status {
 		case state.StatusDone, state.StatusDead, state.StatusConflictFailed, state.StatusFailed:
+			// Zombie cleanup: if the underlying issue is closed, transition to done.
+			// This prevents conflict_failed/failed/dead sessions from lingering
+			// indefinitely when their issues are closed externally (#187).
+			if sess.Status != state.StatusDone {
+				closed, err := o.isIssueClosed(sess.IssueNumber)
+				if err != nil {
+					log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
+				} else if closed {
+					log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+					sess.Status = state.StatusDone
+					if sess.FinishedAt == nil {
+						now := time.Now().UTC()
+						sess.FinishedAt = &now
+					}
+				}
+			}
 			// Terminal states — cleanup old worktrees after 1h
 			if sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour && sess.Worktree != "" {
 				if _, err := os.Stat(sess.Worktree); err == nil {
@@ -471,6 +487,22 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				}
 			}
 			continue
+		}
+
+		// Check if issue is closed for pr_open/queued sessions —
+		// free the worker slot when the issue no longer needs work (#187).
+		if sess.Status == state.StatusPROpen || sess.Status == state.StatusQueued {
+			closed, err := o.isIssueClosed(sess.IssueNumber)
+			if err != nil {
+				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
+			} else if closed {
+				log.Printf("[orch] issue #%d closed, transitioning %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+				o.stopWorker(slotName, sess)
+				sess.Status = state.StatusDone
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
+				continue
+			}
 		}
 
 		// Check if issue is now closed (only for running sessions)
