@@ -353,6 +353,95 @@ func TestBuildWorkerCmd_GenericInvalidPromptMode(t *testing.T) {
 	}
 }
 
+func TestSplitCmd(t *testing.T) {
+	tests := []struct {
+		input      string
+		wantBinary string
+		wantArgs   []string
+	}{
+		{"claude", "claude", nil},
+		{"claude --model claude-opus-4-6", "claude", []string{"--model", "claude-opus-4-6"}},
+		{"/usr/local/bin/codex --flag", "/usr/local/bin/codex", []string{"--flag"}},
+		{"  gemini  --fast  ", "gemini", []string{"--fast"}},
+		{"", "", nil},
+	}
+	for _, tt := range tests {
+		binary, args := splitCmd(tt.input)
+		if binary != tt.wantBinary {
+			t.Errorf("splitCmd(%q) binary = %q, want %q", tt.input, binary, tt.wantBinary)
+		}
+		if len(args) != len(tt.wantArgs) {
+			t.Errorf("splitCmd(%q) args = %v, want %v", tt.input, args, tt.wantArgs)
+			continue
+		}
+		for i := range args {
+			if args[i] != tt.wantArgs[i] {
+				t.Errorf("splitCmd(%q) args[%d] = %q, want %q", tt.input, i, args[i], tt.wantArgs[i])
+			}
+		}
+	}
+}
+
+func TestBuildWorkerCmd_CmdWithArgs(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("do work"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Claude backend: cmd contains arguments
+	cfg := BackendConfig{Cmd: "claude --model claude-opus-4-6"}
+	cmd, _, err := BuildWorkerCmd("claude", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Binary should be just "claude", not the full string
+	if cmd.Args[0] != "claude" {
+		t.Errorf("expected Args[0]=%q, got %q", "claude", cmd.Args[0])
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--model") {
+		t.Errorf("expected --model in args, got: %s", args)
+	}
+	if !strings.Contains(args, "claude-opus-4-6") {
+		t.Errorf("expected claude-opus-4-6 in args, got: %s", args)
+	}
+	if !strings.Contains(args, "--dangerously-skip-permissions") {
+		t.Errorf("expected --dangerously-skip-permissions in args, got: %s", args)
+	}
+
+	// Codex backend: cmd contains arguments
+	cfg = BackendConfig{Cmd: "codex --some-flag"}
+	cmd, _, err = BuildWorkerCmd("codex", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cmd.Args[0] != "codex" {
+		t.Errorf("expected Args[0]=%q, got %q", "codex", cmd.Args[0])
+	}
+	args = strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--some-flag") {
+		t.Errorf("expected --some-flag in args, got: %s", args)
+	}
+
+	// Generic backend: cmd contains arguments
+	cfg = BackendConfig{Cmd: "my-cli --verbose --debug", PromptMode: "arg"}
+	cmd, _, err = BuildWorkerCmd("custom", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cmd.Args[0] != "my-cli" {
+		t.Errorf("expected Args[0]=%q, got %q", "my-cli", cmd.Args[0])
+	}
+	args = strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--verbose") {
+		t.Errorf("expected --verbose in args, got: %s", args)
+	}
+	if !strings.Contains(args, "--debug") {
+		t.Errorf("expected --debug in args, got: %s", args)
+	}
+}
+
 func TestKnownBackends(t *testing.T) {
 	backends := KnownBackends()
 	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false}
