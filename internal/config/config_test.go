@@ -793,3 +793,45 @@ cleanup_worktrees_on_merge: true
 		t.Error("ShouldCleanupWorktrees() should be true when explicitly set to true")
 	}
 }
+
+func TestParse_FallbackBackendsDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.Model.FallbackBackends) != 0 {
+		t.Errorf("FallbackBackends = %v, want empty", cfg.Model.FallbackBackends)
+	}
+}
+
+func TestParse_FallbackBackendsExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: claude
+  fallback_backends:
+    - codex
+    - gemini
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+    gemini:
+      cmd: gemini
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"codex", "gemini"}
+	if len(cfg.Model.FallbackBackends) != len(want) {
+		t.Fatalf("FallbackBackends = %v, want %v", cfg.Model.FallbackBackends, want)
+	}
+	for i, fb := range cfg.Model.FallbackBackends {
+		if fb != want[i] {
+			t.Errorf("FallbackBackends[%d] = %q, want %q", i, fb, want[i])
+		}
+	}
+}

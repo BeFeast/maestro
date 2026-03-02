@@ -41,14 +41,15 @@ type Orchestrator struct {
 	tmuxCaptureFn   func(session string) (string, error)
 	isIssueClosedFn func(issueNumber int) (bool, error)
 	addIssueLabelFn func(number int, label string) error
+	isRateLimitedFn func(logFile string) bool
+	// workerRespawnFn / respawnWorkerFn: used by respawnWorker() for dead-worker fallback (tests set one or the other)
+	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
+	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
+	getIssueFn      func(number int) (github.Issue, error)
 
 	// Testing hooks for startNewWorkers
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
 	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
-
-	// Testing hooks for rate-limit fallback
-	getIssueFn      func(number int) (github.Issue, error)
-	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn         func(prNumber int) (string, error)
@@ -149,6 +150,10 @@ func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
 }
 
 func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	// Support both hook names for test compatibility (respawnWorkerFn = branch, workerRespawnFn = HEAD)
+	if o.respawnWorkerFn != nil {
+		return o.respawnWorkerFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+	}
 	if o.workerRespawnFn != nil {
 		return o.workerRespawnFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
@@ -184,6 +189,39 @@ func (o *Orchestrator) addIssueLabel(number int, label string) error {
 		return o.addIssueLabelFn(number, label)
 	}
 	return o.gh.AddIssueLabel(number, label)
+}
+
+func (o *Orchestrator) isRateLimited(logFile string) bool {
+	if o.isRateLimitedFn != nil {
+		return o.isRateLimitedFn(logFile)
+	}
+	return worker.IsRateLimited(logFile)
+}
+
+// nextFallbackBackend returns the next untried backend from the fallback list.
+// It skips backends that are already in sess.TriedBackends or match the current backend.
+// Returns "" if no fallback is available.
+func (o *Orchestrator) nextFallbackBackend(sess *state.Session) string {
+	fallbacks := o.cfg.Model.FallbackBackends
+	if len(fallbacks) == 0 {
+		return ""
+	}
+
+	tried := make(map[string]bool, len(sess.TriedBackends)+1)
+	tried[sess.Backend] = true
+	for _, b := range sess.TriedBackends {
+		tried[b] = true
+	}
+
+	for _, fb := range fallbacks {
+		if !tried[fb] {
+			// Verify the backend exists in config
+			if _, ok := o.cfg.Model.Backends[fb]; ok {
+				return fb
+			}
+		}
+	}
+	return ""
 }
 
 func readLastLines(path string, limit int) (string, error) {
@@ -546,6 +584,37 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					sess.PRNumber = pr.Number
 					o.notifier.Sendf("🔀 maestro: worker %s completed, PR #%d open for issue #%d (%s)",
 						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
+				} else if o.isRateLimited(sess.LogFile) && o.nextFallbackBackend(sess) != "" {
+					// Rate-limit detected — try next fallback backend
+					nextBackend := o.nextFallbackBackend(sess)
+					log.Printf("[orch] worker %s (backend=%s) hit rate limit, falling back to %s",
+						slotName, sess.Backend, nextBackend)
+
+					issue, err := o.getIssue(sess.IssueNumber)
+					if err != nil {
+						log.Printf("[orch] fetch issue #%d for fallback: %v — marking as failed", sess.IssueNumber, err)
+						sess.Status = state.StatusFailed
+						now := time.Now().UTC()
+						sess.FinishedAt = &now
+						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) rate-limited and fallback failed (could not fetch issue)",
+							slotName, sess.IssueNumber, sess.IssueTitle)
+						continue
+					}
+
+					sess.TriedBackends = append(sess.TriedBackends, sess.Backend)
+					promptBase := o.selectPrompt(issue)
+					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
+						log.Printf("[orch] fallback respawn worker %s with %s: %v — marking as failed", slotName, nextBackend, err)
+						sess.Status = state.StatusFailed
+						now := time.Now().UTC()
+						sess.FinishedAt = &now
+						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) rate-limited and fallback to %s failed: %v",
+							slotName, sess.IssueNumber, sess.IssueTitle, nextBackend, err)
+						continue
+					}
+
+					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
+						slotName, sess.IssueNumber, sess.TriedBackends[len(sess.TriedBackends)-1], nextBackend)
 				} else if sess.RetryCount < 1 {
 					// First failure — retry with fresh worktree
 					log.Printf("[orch] worker %s (pid=%d) died, retrying (attempt %d)", slotName, sess.PID, sess.RetryCount+1)
@@ -563,7 +632,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					promptBase := o.selectPrompt(issue)
-					if err := worker.Respawn(o.cfg, slotName, sess, o.repo, issue, promptBase, sess.Backend); err != nil {
+					if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
 						log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, err)
 						sess.Status = state.StatusFailed
 						now := time.Now().UTC()
@@ -627,40 +696,37 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							}
 							sess.RateLimitHit = true
 
-							// Attempt fallback: respawn with fallback backend if configured
-							fallback := o.cfg.Model.Fallback
-							if fallback != "" && fallback != sess.Backend {
-								if _, ok := o.cfg.Model.Backends[fallback]; ok {
-									issue, fetchErr := o.getIssue(sess.IssueNumber)
-									if fetchErr != nil {
-										log.Printf("[orch] fetch issue #%d for rate-limit fallback: %v — marking dead", sess.IssueNumber, fetchErr)
-										sess.Status = state.StatusDead
-										sess.LastNotifiedStatus = "rate_limit"
-										now := time.Now().UTC()
-										sess.FinishedAt = &now
-										o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback failed (could not fetch issue)",
-											slotName, sess.IssueNumber, pattern)
-										continue
-									}
-
-									promptBase := o.selectPrompt(issue)
-									if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
-										log.Printf("[orch] rate-limit fallback respawn %s: %v — marking dead", slotName, respawnErr)
-										sess.Status = state.StatusDead
-										sess.LastNotifiedStatus = "rate_limit"
-										now := time.Now().UTC()
-										sess.FinishedAt = &now
-										o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback to %s failed: %v",
-											slotName, sess.IssueNumber, pattern, fallback, respawnErr)
-										continue
-									}
-
-									log.Printf("[orch] rate-limit fallback: respawned %s with backend %s", slotName, fallback)
-									o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) hit rate limit — falling back to %s",
-										slotName, sess.IssueNumber, fallback)
+							// Attempt fallback: respawn with next fallback backend if configured
+							if fallback := o.nextFallbackBackend(sess); fallback != "" {
+								issue, fetchErr := o.getIssue(sess.IssueNumber)
+								if fetchErr != nil {
+									log.Printf("[orch] fetch issue #%d for rate-limit fallback: %v — marking dead", sess.IssueNumber, fetchErr)
+									sess.Status = state.StatusDead
+									sess.LastNotifiedStatus = "rate_limit"
+									now := time.Now().UTC()
+									sess.FinishedAt = &now
+									o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback failed (could not fetch issue)",
+										slotName, sess.IssueNumber, pattern)
 									continue
 								}
-								log.Printf("[orch] warn: fallback backend %q not found in config, marking dead", fallback)
+
+								sess.TriedBackends = append(sess.TriedBackends, sess.Backend)
+								promptBase := o.selectPrompt(issue)
+								if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
+									log.Printf("[orch] rate-limit fallback respawn %s: %v — marking dead", slotName, respawnErr)
+									sess.Status = state.StatusDead
+									sess.LastNotifiedStatus = "rate_limit"
+									now := time.Now().UTC()
+									sess.FinishedAt = &now
+									o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback to %s failed: %v",
+										slotName, sess.IssueNumber, pattern, fallback, respawnErr)
+									continue
+								}
+
+								log.Printf("[orch] rate-limit fallback: respawned %s with backend %s", slotName, fallback)
+								o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) hit rate limit — falling back to %s",
+									slotName, sess.IssueNumber, fallback)
+								continue
 							}
 
 							// No fallback available — mark dead
