@@ -74,7 +74,8 @@ type Config struct {
 	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
 	Telegram                   TelegramConfig   `yaml:"telegram"`
 	Versioning                 VersioningConfig `yaml:"versioning"`
-	AutoResolveFiles           []string         `yaml:"auto_resolve_files"` // files to auto-resolve conflicts by keeping both sides
+	AutoResolveFiles           []string         `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
+	CleanupWorktreesOnMerge    *bool            `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 }
 
 // LoadFrom loads config from a specific path.
@@ -216,6 +217,12 @@ func parse(data []byte) (*Config, error) {
 		cfg.Versioning.TagPrefix = "v"
 	}
 
+	// Default cleanup_worktrees_on_merge to true if not set
+	if cfg.CleanupWorktreesOnMerge == nil {
+		t := true
+		cfg.CleanupWorktreesOnMerge = &t
+	}
+
 	// Merge defaults
 	switch strings.ToLower(strings.TrimSpace(cfg.MergeStrategy)) {
 	case "", "sequential":
@@ -257,6 +264,14 @@ func LoadDir(dir string) ([]*Config, error) {
 		return nil, fmt.Errorf("no config files found in %s", dir)
 	}
 	return cfgs, nil
+}
+
+// ShouldCleanupWorktrees returns whether worktrees should be removed after PR merge.
+func (c *Config) ShouldCleanupWorktrees() bool {
+	if c.CleanupWorktreesOnMerge == nil {
+		return true
+	}
+	return *c.CleanupWorktreesOnMerge
 }
 
 func expandHome(path string) string {

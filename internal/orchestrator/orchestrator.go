@@ -842,7 +842,15 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	sess.Status = state.StatusDone
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
-	o.stopWorker(slotName, sess)
+
+	if o.cfg.ShouldCleanupWorktrees() {
+		log.Printf("[orch] cleaning up worktree for %s after merge", slotName)
+		o.stopWorker(slotName, sess)
+		sess.Worktree = "" // Mark as cleaned
+	} else {
+		log.Printf("[orch] skipping worktree cleanup for %s (cleanup_worktrees_on_merge=false)", slotName)
+	}
+
 	o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s)", pr.Number, sess.IssueNumber, sess.IssueTitle)
 
 	// Auto version bump

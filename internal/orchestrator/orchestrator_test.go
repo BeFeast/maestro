@@ -1831,6 +1831,145 @@ func TestCheckSessions_SilentTimeoutSecondKill_LabelsBlocked(t *testing.T) {
 	}
 }
 
+// --- cleanup_worktrees_on_merge tests ---
+
+func TestMergeReadyPR_CleansUpWorktreeOnMerge(t *testing.T) {
+	cleanupTrue := true
+	stopped := false
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:                    "owner/repo",
+			CleanupWorktreesOnMerge: &cleanupTrue,
+		},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR("slot-0", sess, pr)
+
+	if !result {
+		t.Fatal("mergeReadyPR should return true on successful merge")
+	}
+	if !stopped {
+		t.Fatal("worker should be stopped when cleanup_worktrees_on_merge is true")
+	}
+	if sess.Worktree != "" {
+		t.Errorf("Worktree = %q, want empty (should be cleared after cleanup)", sess.Worktree)
+	}
+	if sess.Status != state.StatusDone {
+		t.Errorf("Status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+func TestMergeReadyPR_SkipsCleanupWhenDisabled(t *testing.T) {
+	cleanupFalse := false
+	stopped := false
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:                    "owner/repo",
+			CleanupWorktreesOnMerge: &cleanupFalse,
+		},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR("slot-0", sess, pr)
+
+	if !result {
+		t.Fatal("mergeReadyPR should return true on successful merge")
+	}
+	if stopped {
+		t.Fatal("worker should NOT be stopped when cleanup_worktrees_on_merge is false")
+	}
+	if sess.Worktree != "/tmp/wt" {
+		t.Errorf("Worktree = %q, want %q (should be preserved)", sess.Worktree, "/tmp/wt")
+	}
+	if sess.Status != state.StatusDone {
+		t.Errorf("Status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+func TestMergeReadyPR_DefaultConfigCleansUp(t *testing.T) {
+	// Config with nil CleanupWorktreesOnMerge should default to true
+	stopped := false
+	cfg := &config.Config{Repo: "owner/repo"}
+	// Simulate default: ShouldCleanupWorktrees returns true for nil pointer
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR("slot-0", sess, pr)
+
+	if !result {
+		t.Fatal("mergeReadyPR should return true on successful merge")
+	}
+	if !stopped {
+		t.Fatal("worker should be stopped with default config (nil = true)")
+	}
+	if sess.Worktree != "" {
+		t.Errorf("Worktree = %q, want empty", sess.Worktree)
+	}
+}
+
 func TestCheckSessions_SilentTimeoutFirstObservation_SetsHash(t *testing.T) {
 	output := "initial output\nline 2"
 	o, stopped, _ := newSilentTimeoutOrchestrator(10, output)
