@@ -202,6 +202,50 @@ func TestBuildWorkerCmd_ClineDefaultCmd(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerCmd_GeminiPromptFileError(t *testing.T) {
+	cfg := BackendConfig{Cmd: "gemini"}
+	_, _, err := BuildWorkerCmd("gemini", cfg, "/nonexistent/prompt.md", "/tmp/wt")
+	if err == nil {
+		t.Fatal("expected error for missing prompt file")
+	}
+	if !strings.Contains(err.Error(), "read prompt file") {
+		t.Errorf("expected 'read prompt file' error, got: %v", err)
+	}
+}
+
+func TestBuildWorkerCmd_GeminiArgOrder(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("test prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{Cmd: "gemini", ExtraArgs: []string{"--sandbox", "none"}}
+	cmd, _, err := BuildWorkerCmd("gemini", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify exact argument structure: gemini -p <prompt> <extra_args...>
+	// cmd.Args[0] is the command itself
+	args := cmd.Args[1:] // skip command name
+	if len(args) < 4 {
+		t.Fatalf("expected at least 4 args, got %d: %v", len(args), args)
+	}
+	if args[0] != "-p" {
+		t.Errorf("args[0] = %q, want %q", args[0], "-p")
+	}
+	if args[1] != "test prompt" {
+		t.Errorf("args[1] = %q, want %q", args[1], "test prompt")
+	}
+	if args[2] != "--sandbox" {
+		t.Errorf("args[2] = %q, want %q", args[2], "--sandbox")
+	}
+	if args[3] != "none" {
+		t.Errorf("args[3] = %q, want %q", args[3], "none")
+	}
+}
+
 func TestBuildWorkerCmd_GenericArgMode(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")

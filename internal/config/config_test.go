@@ -446,6 +446,32 @@ model:
 	}
 }
 
+func TestParse_GeminiDefaultBackend(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: gemini
+  backends:
+    gemini:
+      cmd: gemini
+      extra_args: ["--sandbox", "none"]
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Model.Default != "gemini" {
+		t.Errorf("expected default=gemini, got %q", cfg.Model.Default)
+	}
+	gemini := cfg.Model.Backends["gemini"]
+	if gemini.Cmd != "gemini" {
+		t.Errorf("expected gemini cmd=gemini, got %q", gemini.Cmd)
+	}
+	if len(gemini.ExtraArgs) != 2 || gemini.ExtraArgs[0] != "--sandbox" {
+		t.Errorf("expected gemini extra_args=[--sandbox none], got %v", gemini.ExtraArgs)
+	}
+}
+
 func TestParse_ModelConfigPromptMode(t *testing.T) {
 	yaml := `
 repo: owner/repo

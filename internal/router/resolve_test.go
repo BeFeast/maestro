@@ -196,6 +196,53 @@ func TestResolveBackend_LabelTakesPrecedenceOverAutoRouting(t *testing.T) {
 	}
 }
 
+func TestResolveBackend_GeminiAsDefault(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "gemini",
+			Backends: map[string]config.BackendDef{
+				"gemini": {Cmd: "gemini"},
+				"claude": {Cmd: "claude"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "manual"},
+	}
+	r := New(cfg)
+
+	// Issue without model label should use gemini as default
+	issue := makeIssue(50, "Add dark mode", "enhancement")
+	name, reason := r.ResolveBackend(issue)
+	if name != "gemini" {
+		t.Errorf("ResolveBackend() name = %q, want %q", name, "gemini")
+	}
+	if reason != "default" {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "default")
+	}
+}
+
+func TestResolveBackend_GeminiLabelOverridesDefault(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"gemini": {Cmd: "gemini"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "manual"},
+	}
+	r := New(cfg)
+
+	issue := makeIssue(51, "Build API", "model:gemini", "enhancement")
+	name, reason := r.ResolveBackend(issue)
+	if name != "gemini" {
+		t.Errorf("ResolveBackend() name = %q, want %q", name, "gemini")
+	}
+	if reason != "label" {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "label")
+	}
+}
+
 func TestResolveBackend_NoLabelsManualMode(t *testing.T) {
 	cfg := &config.Config{
 		Model: config.ModelConfig{
