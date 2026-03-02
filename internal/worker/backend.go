@@ -4,7 +4,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
+
+// splitCmd splits a command string into binary and extra arguments.
+// e.g. "claude --model opus" → ("claude", ["--model", "opus"])
+func splitCmd(cmd string) (binary string, prefixArgs []string) {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return cmd, nil
+	}
+	return parts[0], parts[1:]
+}
 
 // BackendConfig holds the CLI command and any extra args from config.
 type BackendConfig struct {
@@ -42,9 +53,10 @@ func (claudeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	if claudeCmd == "" {
 		claudeCmd = "claude"
 	}
-	args := []string{"--dangerously-skip-permissions", "-p", string(promptData)}
+	binary, cmdArgs := splitCmd(claudeCmd)
+	args := append(cmdArgs, "--dangerously-skip-permissions", "-p", string(promptData))
 	args = append(args, cfg.ExtraArgs...)
-	cmd := exec.Command(claudeCmd, args...)
+	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	return cmd, "", nil
 }
@@ -58,9 +70,10 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	if codexCmd == "" {
 		codexCmd = "codex"
 	}
-	args := []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "-C", worktree, "-"}
+	binary, cmdArgs := splitCmd(codexCmd)
+	args := append(cmdArgs, "exec", "--dangerously-bypass-approvals-and-sandbox", "-C", worktree, "-")
 	args = append(args, cfg.ExtraArgs...)
-	cmd := exec.Command(codexCmd, args...)
+	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	// Stdin redirection is handled by the runner script — no file opened here
 	return cmd, promptFile, nil
@@ -79,9 +92,10 @@ func (geminiBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	if err != nil {
 		return nil, "", fmt.Errorf("read prompt file: %w", err)
 	}
-	args := []string{"-p", string(promptData)}
+	binary, cmdArgs := splitCmd(geminiCmd)
+	args := append(cmdArgs, "-p", string(promptData))
 	args = append(args, cfg.ExtraArgs...)
-	cmd := exec.Command(geminiCmd, args...)
+	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	return cmd, "", nil
 }
@@ -99,9 +113,10 @@ func (clineBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	if clineCmd == "" {
 		clineCmd = "cline"
 	}
-	args := []string{"-y", string(promptData)}
+	binary, cmdArgs := splitCmd(clineCmd)
+	args := append(cmdArgs, "-y", string(promptData))
 	args = append(args, cfg.ExtraArgs...)
-	cmd := exec.Command(clineCmd, args...)
+	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	return cmd, "", nil
 }
@@ -116,10 +131,10 @@ func (clineBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 type genericBackend struct{}
 
 func (genericBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
-	binary := cfg.Cmd
-	if binary == "" {
+	if cfg.Cmd == "" {
 		return nil, "", fmt.Errorf("generic backend requires cmd to be set")
 	}
+	binary, cmdArgs := splitCmd(cfg.Cmd)
 
 	mode := cfg.PromptMode
 	if mode == "" {
@@ -129,6 +144,7 @@ func (genericBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (
 	var args []string
 	var stdinFile string
 
+	args = append(args, cmdArgs...)
 	args = append(args, cfg.ExtraArgs...)
 
 	switch mode {
