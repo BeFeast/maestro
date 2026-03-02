@@ -2625,7 +2625,7 @@ func TestCheckSessions_DeadClosedIssue_SetsFinishedAtIfNil(t *testing.T) {
 	}
 }
 
-// --- rate-limit detection tests ---
+// --- rate-limit detection tests (running worker, tmux output) ---
 
 // newRateLimitOrchestrator creates an Orchestrator wired for checkSessions
 // rate-limit testing. tmuxOutput is returned by the capture hook.
@@ -2664,6 +2664,46 @@ func newRateLimitOrchestrator(cfg *config.Config, tmuxOutput string) (*Orchestra
 		},
 	}, &stopped, &respawned
 }
+
+// --- model fallback tests (dead worker, log file) ---
+
+// newFallbackTestOrchestrator creates an Orchestrator wired for testing
+// rate-limit fallback in checkSessions. It records respawned backends.
+func newFallbackTestOrchestrator(cfg *config.Config, rateLimited bool) (*Orchestrator, *[]string) {
+	respawnedBackends := make([]string, 0)
+	return &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		router:     router.New(cfg),
+		promptBase: "test prompt",
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return false // worker is dead
+		},
+		isRateLimitedFn: func(logFile string) bool {
+			return rateLimited
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnedBackends = append(respawnedBackends, backendName)
+			sess.Status = state.StatusRunning
+			sess.PID = 9999
+			sess.Backend = backendName
+			sess.StartedAt = time.Now().UTC()
+			sess.FinishedAt = nil
+			return nil
+		},
+	}, &respawnedBackends
+}
+
+// ---- Running-worker rate-limit tests (tmux detection, worker alive) ----
 
 func TestCheckSessions_RateLimitDetected_NoFallback_MarksDead(t *testing.T) {
 	cfg := &config.Config{
@@ -2713,15 +2753,15 @@ func TestCheckSessions_RateLimitDetected_WithFallback_Respawns(t *testing.T) {
 		Repo:              "owner/repo",
 		MaxRuntimeMinutes: 999,
 		Model: config.ModelConfig{
-			Default:  "claude",
-			Fallback: "gemini",
+			Default:          "claude",
+			FallbackBackends: []string{"gemini"},
 			Backends: map[string]config.BackendDef{
 				"claude": {Cmd: "claude"},
 				"gemini": {Cmd: "gemini"},
 			},
 		},
 	}
-	o, stopped, respawned := newRateLimitOrchestrator(cfg, "rate limit exceeded — try again later")
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "rate limit exceeded â try again later")
 
 	s := state.NewState()
 	s.Sessions["mae-2"] = &state.Session{
@@ -2765,8 +2805,8 @@ func TestCheckSessions_RateLimitDetected_AlreadyOnFallback_MarksDead(t *testing.
 		Repo:              "owner/repo",
 		MaxRuntimeMinutes: 999,
 		Model: config.ModelConfig{
-			Default:  "claude",
-			Fallback: "gemini",
+			Default:          "claude",
+			FallbackBackends: []string{"gemini"},
 			Backends: map[string]config.BackendDef{
 				"claude": {Cmd: "claude"},
 				"gemini": {Cmd: "gemini"},
@@ -2790,7 +2830,7 @@ func TestCheckSessions_RateLimitDetected_AlreadyOnFallback_MarksDead(t *testing.
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-3"]
-	// Should NOT respawn — already on fallback backend
+	// Should NOT respawn â already on fallback backend
 	if sess.Status != state.StatusDead {
 		t.Fatalf("status = %q, want %q (already on fallback, should be dead)", sess.Status, state.StatusDead)
 	}
@@ -2834,7 +2874,7 @@ func TestCheckSessions_RateLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-4"]
-	// Should remain running — rate limit was already handled
+	// Should remain running â rate limit was already handled
 	if sess.Status != state.StatusRunning {
 		t.Fatalf("status = %q, want %q (already notified, should not re-kill)", sess.Status, state.StatusRunning)
 	}
@@ -2848,8 +2888,8 @@ func TestCheckSessions_NoRateLimit_WorkerSurvives(t *testing.T) {
 		Repo:              "owner/repo",
 		MaxRuntimeMinutes: 999,
 		Model: config.ModelConfig{
-			Default:  "claude",
-			Fallback: "gemini",
+			Default:          "claude",
+			FallbackBackends: []string{"gemini"},
 			Backends: map[string]config.BackendDef{
 				"claude": {Cmd: "claude"},
 				"gemini": {Cmd: "gemini"},
@@ -2922,5 +2962,275 @@ func TestCheckSessions_RateLimit429Pattern_Detected(t *testing.T) {
 	}
 	if len(*stopped) != 1 {
 		t.Fatalf("stopped = %v, want 1 entry", *stopped)
+	}
+}
+
+// ---- Dead-worker fallback tests (log file detection, worker dead) ----
+
+func TestCheckSessions_RateLimitFallbackToCodex(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+	cfg.MaxRuntimeMinutes = 999
+
+	o, respawned := newFallbackTestOrchestrator(cfg, true)
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-101-test",
+		LogFile:     "/tmp/test.log",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess2 := s.Sessions["mae-1"]
+	if sess2.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (should be respawned with fallback)", sess2.Status, state.StatusRunning)
+	}
+	if len(*respawned) != 1 || (*respawned)[0] != "codex" {
+		t.Fatalf("respawned = %v, want [codex]", *respawned)
+	}
+	if len(sess2.TriedBackends) != 1 || sess2.TriedBackends[0] != "claude" {
+		t.Fatalf("tried_backends = %v, want [claude]", sess2.TriedBackends)
+	}
+}
+
+func TestCheckSessions_RateLimitFallbackSkipsAlreadyTried(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+	cfg.MaxRuntimeMinutes = 999
+
+	o, respawned := newFallbackTestOrchestrator(cfg, true)
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber:   101,
+		IssueTitle:    "test issue",
+		Status:        state.StatusRunning,
+		PID:           1234,
+		TmuxSession:   "maestro-mae-1",
+		Branch:        "feat/mae-1-101-test",
+		LogFile:       "/tmp/test.log",
+		Backend:       "codex",
+		StartedAt:     time.Now().Add(-10 * time.Minute),
+		TriedBackends: []string{"claude"}, // claude already tried
+	}
+
+	o.checkSessions(s)
+
+	sess2 := s.Sessions["mae-1"]
+	if sess2.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess2.Status, state.StatusRunning)
+	}
+	if len(*respawned) != 1 || (*respawned)[0] != "gemini" {
+		t.Fatalf("respawned = %v, want [gemini] (should skip codex since claudeâcodex already tried)", *respawned)
+	}
+	if len(sess2.TriedBackends) != 2 {
+		t.Fatalf("tried_backends = %v, want [claude, codex]", sess2.TriedBackends)
+	}
+}
+
+func TestCheckSessions_RateLimitNoFallbackAvailable_NormalRetry(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+	cfg.MaxRuntimeMinutes = 999
+
+	o, respawned := newFallbackTestOrchestrator(cfg, true)
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber:   101,
+		IssueTitle:    "test issue",
+		Status:        state.StatusRunning,
+		PID:           1234,
+		TmuxSession:   "maestro-mae-1",
+		Branch:        "feat/mae-1-101-test",
+		LogFile:       "/tmp/test.log",
+		Backend:       "gemini",
+		StartedAt:     time.Now().Add(-10 * time.Minute),
+		TriedBackends: []string{"claude", "codex"}, // all fallbacks exhausted
+	}
+
+	o.checkSessions(s)
+
+	sess2 := s.Sessions["mae-1"]
+	// Should fall through to normal retry (RetryCount < 1)
+	if sess2.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (should fall through to normal retry)", sess2.Status, state.StatusRunning)
+	}
+	if len(*respawned) != 1 || (*respawned)[0] != "gemini" {
+		t.Fatalf("respawned = %v, want [gemini] (normal retry with same backend)", *respawned)
+	}
+	if sess2.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
+	}
+}
+
+func TestCheckSessions_NoRateLimit_NormalRetry(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+	cfg.MaxRuntimeMinutes = 999
+
+	o, respawned := newFallbackTestOrchestrator(cfg, false) // NOT rate limited
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-101-test",
+		LogFile:     "/tmp/test.log",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess2 := s.Sessions["mae-1"]
+	if sess2.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess2.Status, state.StatusRunning)
+	}
+	// Should retry with same backend (normal retry), not fallback
+	if len(*respawned) != 1 || (*respawned)[0] != "claude" {
+		t.Fatalf("respawned = %v, want [claude] (normal retry, not fallback)", *respawned)
+	}
+	if sess2.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
+	}
+}
+
+func TestCheckSessions_RateLimitNoFallbackConfigured_NormalRetry(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	// No fallback_backends configured
+	cfg.MaxRuntimeMinutes = 999
+
+	o, respawned := newFallbackTestOrchestrator(cfg, true)
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-101-test",
+		LogFile:     "/tmp/test.log",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess2 := s.Sessions["mae-1"]
+	// No fallback backends configured, so should fall through to normal retry
+	if sess2.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess2.Status, state.StatusRunning)
+	}
+	if len(*respawned) != 1 || (*respawned)[0] != "claude" {
+		t.Fatalf("respawned = %v, want [claude]", *respawned)
+	}
+	if sess2.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
+	}
+}
+
+func TestCheckSessions_RateLimitFallbackDoesNotIncrementRetryCount(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+	cfg.MaxRuntimeMinutes = 999
+
+	o, _ := newFallbackTestOrchestrator(cfg, true)
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-101-test",
+		LogFile:     "/tmp/test.log",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess2 := s.Sessions["mae-1"]
+	// Fallback should NOT increment retry count â fallback is separate from normal retry
+	if sess2.RetryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0 (fallback should not increment retry count)", sess2.RetryCount)
+	}
+}
+
+func TestNextFallbackBackend_Basic(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+
+	o := &Orchestrator{cfg: cfg}
+	sess2 := &state.Session{Backend: "claude"}
+
+	got := o.nextFallbackBackend(sess2)
+	if got != "codex" {
+		t.Errorf("nextFallbackBackend() = %q, want %q", got, "codex")
+	}
+}
+
+func TestNextFallbackBackend_SkipsTried(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+
+	o := &Orchestrator{cfg: cfg}
+	sess2 := &state.Session{Backend: "codex", TriedBackends: []string{"claude"}}
+
+	got := o.nextFallbackBackend(sess2)
+	if got != "gemini" {
+		t.Errorf("nextFallbackBackend() = %q, want %q", got, "gemini")
+	}
+}
+
+func TestNextFallbackBackend_AllExhausted(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
+	cfg.Model.FallbackBackends = []string{"codex", "gemini"}
+
+	o := &Orchestrator{cfg: cfg}
+	sess2 := &state.Session{Backend: "gemini", TriedBackends: []string{"claude", "codex"}}
+
+	got := o.nextFallbackBackend(sess2)
+	if got != "" {
+		t.Errorf("nextFallbackBackend() = %q, want empty (all exhausted)", got)
+	}
+}
+
+func TestNextFallbackBackend_NoFallbacksConfigured(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+
+	o := &Orchestrator{cfg: cfg}
+	sess2 := &state.Session{Backend: "claude"}
+
+	got := o.nextFallbackBackend(sess2)
+	if got != "" {
+		t.Errorf("nextFallbackBackend() = %q, want empty (no fallbacks configured)", got)
+	}
+}
+
+func TestNextFallbackBackend_SkipsUnknownBackend(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Model.FallbackBackends = []string{"unknown_backend", "codex"}
+
+	o := &Orchestrator{cfg: cfg}
+	sess2 := &state.Session{Backend: "claude"}
+
+	got := o.nextFallbackBackend(sess2)
+	if got != "codex" {
+		t.Errorf("nextFallbackBackend() = %q, want %q (should skip unknown backend)", got, "codex")
 	}
 }

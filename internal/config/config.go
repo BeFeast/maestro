@@ -26,9 +26,9 @@ type BackendDef struct {
 
 // ModelConfig holds multi-backend configuration.
 type ModelConfig struct {
-	Default  string                `yaml:"default"`  // "claude", "codex", etc.
-	Fallback string                `yaml:"fallback"` // backend to use when the primary hits a rate limit
-	Backends map[string]BackendDef `yaml:"backends"`
+	Default          string                `yaml:"default"`           // "claude", "codex", etc.
+	Backends         map[string]BackendDef `yaml:"backends"`
+	FallbackBackends []string              `yaml:"fallback_backends"` // ordered list of backends to try when rate-limited
 }
 
 // VersioningConfig controls automatic version bumping on PR merge.

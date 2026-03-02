@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -107,5 +109,103 @@ func TestDetectRateLimit(t *testing.T) {
 				t.Errorf("DetectRateLimit() label = %q, want empty when no hit", gotLabel)
 			}
 		})
+	}
+}
+
+func TestOutputContainsRateLimit_ClaudeMessage(t *testing.T) {
+	output := "Error: You've hit your limit for Claude. Please wait before trying again."
+	if !OutputContainsRateLimit(output) {
+		t.Error("should detect Claude rate limit message")
+	}
+}
+
+func TestOutputContainsRateLimit_CaseInsensitive(t *testing.T) {
+	output := "ERROR: YOU'VE HIT YOUR LIMIT"
+	if !OutputContainsRateLimit(output) {
+		t.Error("should detect rate limit case-insensitively")
+	}
+}
+
+func TestOutputContainsRateLimit_TooManyRequests(t *testing.T) {
+	output := "HTTP 429 Too Many Requests"
+	if !OutputContainsRateLimit(output) {
+		t.Error("should detect 'too many requests'")
+	}
+}
+
+func TestOutputContainsRateLimit_QuotaExceeded(t *testing.T) {
+	output := "API error: quota exceeded for this billing period"
+	if !OutputContainsRateLimit(output) {
+		t.Error("should detect 'quota exceeded'")
+	}
+}
+
+func TestOutputContainsRateLimit_RateLimitUnderscore(t *testing.T) {
+	output := `{"error": {"type": "rate_limit_error", "message": "rate limited"}}`
+	if !OutputContainsRateLimit(output) {
+		t.Error("should detect 'rate_limit'")
+	}
+}
+
+func TestOutputContainsRateLimit_NoMatch(t *testing.T) {
+	output := "Worker completed successfully. All tests passing."
+	if OutputContainsRateLimit(output) {
+		t.Error("should not detect rate limit in normal output")
+	}
+}
+
+func TestOutputContainsRateLimit_EmptyString(t *testing.T) {
+	if OutputContainsRateLimit("") {
+		t.Error("should not detect rate limit in empty string")
+	}
+}
+
+func TestIsRateLimited_FromFile(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	content := "Starting worker...\nProcessing issue #42\nError: You've hit your limit for Claude.\n"
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+	if !IsRateLimited(logFile) {
+		t.Error("should detect rate limit from log file")
+	}
+}
+
+func TestIsRateLimited_NoRateLimit(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	content := "Starting worker...\nDone.\n"
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+	if IsRateLimited(logFile) {
+		t.Error("should not detect rate limit in normal log file")
+	}
+}
+
+func TestIsRateLimited_EmptyPath(t *testing.T) {
+	if IsRateLimited("") {
+		t.Error("should return false for empty path")
+	}
+}
+
+func TestIsRateLimited_NonexistentFile(t *testing.T) {
+	if IsRateLimited("/nonexistent/path/worker.log") {
+		t.Error("should return false for nonexistent file")
+	}
+}
+
+func TestOutputContainsRateLimit_HTTP429(t *testing.T) {
+	output := "Request failed with status 429"
+	if !OutputContainsRateLimit(output) {
+		t.Error("should detect HTTP 429 status code")
+	}
+}
+
+func TestOutputContainsRateLimit_ResourceExhausted(t *testing.T) {
+	output := "gRPC error: RESOURCE_EXHAUSTED: quota exceeded"
+	if !OutputContainsRateLimit(output) {
+		t.Error("should detect 'resource_exhausted'")
 	}
 }
