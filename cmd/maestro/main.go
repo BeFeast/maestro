@@ -375,8 +375,8 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SESSION\tISSUE\tSTATUS\tPR\tCI\tPID\tALIVE\tAGE\tRETRIES\tTOKENS\tTITLE")
-	fmt.Fprintln(w, "-------\t-----\t------\t--\t--\t---\t-----\t---\t-------\t------\t-----")
+	fmt.Fprintln(w, "SESSION\tISSUE\tSTATUS\tBACKEND\tPR\tCI\tPID\tALIVE\tAGE\tRETRIES\tTOKENS\tTITLE")
+	fmt.Fprintln(w, "-------\t-----\t------\t-------\t--\t--\t---\t-----\t---\t-------\t------\t-----")
 	for _, name := range names {
 		sess := s.Sessions[name]
 		alive := "-"
@@ -401,8 +401,12 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 			ci = cs
 		}
 		tokens := worker.FormatTokens(sess.TokensUsed)
-		fmt.Fprintf(w, "%s\t#%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
-			name, sess.IssueNumber, sess.Status, pr, ci, sess.PID, alive, age, retries, tokens, truncate(sess.IssueTitle, 50))
+		backend := sess.Backend
+		if backend == "" {
+			backend = "-"
+		}
+		fmt.Fprintf(w, "%s\t#%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			name, sess.IssueNumber, sess.Status, backend, pr, ci, sess.PID, alive, age, retries, tokens, truncate(sess.IssueTitle, 50))
 	}
 	w.Flush()
 
