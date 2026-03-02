@@ -46,6 +46,10 @@ type Orchestrator struct {
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
 	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
 
+	// Testing hooks for rate-limit fallback
+	getIssueFn      func(number int) (github.Issue, error)
+	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
+
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn         func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
@@ -135,6 +139,20 @@ func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
 		return o.workerStopFn(o.cfg, slotName, sess)
 	}
 	return worker.Stop(o.cfg, slotName, sess)
+}
+
+func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
+	if o.getIssueFn != nil {
+		return o.getIssueFn(number)
+	}
+	return o.gh.GetIssue(number)
+}
+
+func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	if o.workerRespawnFn != nil {
+		return o.workerRespawnFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+	}
+	return worker.Respawn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 }
 
 func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
@@ -533,7 +551,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					log.Printf("[orch] worker %s (pid=%d) died, retrying (attempt %d)", slotName, sess.PID, sess.RetryCount+1)
 					sess.RetryCount++
 
-					issue, err := o.gh.GetIssue(sess.IssueNumber)
+					issue, err := o.getIssue(sess.IssueNumber)
 					if err != nil {
 						log.Printf("[orch] fetch issue #%d for retry: %v — marking as failed", sess.IssueNumber, err)
 						sess.Status = state.StatusFailed
@@ -582,8 +600,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				continue
 			}
 
-			// Capture tmux pane output for silent-timeout detection and token tracking.
-			if o.cfg.WorkerSilentTimeoutMinutes > 0 || o.cfg.WorkerMaxTokens > 0 {
+			// Capture tmux pane output for token tracking, rate-limit detection,
+			// silent-timeout detection, and token-limit enforcement.
+			{
 				tmuxName := sess.TmuxSession
 				if tmuxName == "" {
 					tmuxName = worker.TmuxSessionName(slotName)
@@ -597,6 +616,62 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsed {
 						sess.TokensUsed = tokens
 						log.Printf("[orch] %s tokens_used updated to %d", slotName, tokens)
+					}
+
+					// --- Rate-limit detection ---
+					if !sess.RateLimitHit && sess.LastNotifiedStatus != "rate_limit" {
+						if hit, pattern := worker.DetectRateLimit(output); hit {
+							log.Printf("[orch] worker %s hit rate limit (pattern=%s), stopping", slotName, pattern)
+							if err := o.stopWorker(slotName, sess); err != nil {
+								log.Printf("[orch] warn: could not stop rate-limited worker %s: %v", slotName, err)
+							}
+							sess.RateLimitHit = true
+
+							// Attempt fallback: respawn with fallback backend if configured
+							fallback := o.cfg.Model.Fallback
+							if fallback != "" && fallback != sess.Backend {
+								if _, ok := o.cfg.Model.Backends[fallback]; ok {
+									issue, fetchErr := o.getIssue(sess.IssueNumber)
+									if fetchErr != nil {
+										log.Printf("[orch] fetch issue #%d for rate-limit fallback: %v — marking dead", sess.IssueNumber, fetchErr)
+										sess.Status = state.StatusDead
+										sess.LastNotifiedStatus = "rate_limit"
+										now := time.Now().UTC()
+										sess.FinishedAt = &now
+										o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback failed (could not fetch issue)",
+											slotName, sess.IssueNumber, pattern)
+										continue
+									}
+
+									promptBase := o.selectPrompt(issue)
+									if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
+										log.Printf("[orch] rate-limit fallback respawn %s: %v — marking dead", slotName, respawnErr)
+										sess.Status = state.StatusDead
+										sess.LastNotifiedStatus = "rate_limit"
+										now := time.Now().UTC()
+										sess.FinishedAt = &now
+										o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback to %s failed: %v",
+											slotName, sess.IssueNumber, pattern, fallback, respawnErr)
+										continue
+									}
+
+									log.Printf("[orch] rate-limit fallback: respawned %s with backend %s", slotName, fallback)
+									o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) hit rate limit — falling back to %s",
+										slotName, sess.IssueNumber, fallback)
+									continue
+								}
+								log.Printf("[orch] warn: fallback backend %q not found in config, marking dead", fallback)
+							}
+
+							// No fallback available — mark dead
+							sess.Status = state.StatusDead
+							sess.LastNotifiedStatus = "rate_limit"
+							now := time.Now().UTC()
+							sess.FinishedAt = &now
+							o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); no fallback configured",
+								slotName, sess.IssueNumber, pattern)
+							continue
+						}
 					}
 
 					// --- Token limit enforcement ---
@@ -650,18 +725,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								continue
 							}
 						}
-					}
-				}
-			} else {
-				// Neither silent-timeout nor token-limit is configured, but we still
-				// want to track tokens when possible. Capture pane output cheaply.
-				tmuxName := sess.TmuxSession
-				if tmuxName == "" {
-					tmuxName = worker.TmuxSessionName(slotName)
-				}
-				if output, err := o.captureTmux(tmuxName); err == nil {
-					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsed {
-						sess.TokensUsed = tokens
 					}
 				}
 			}

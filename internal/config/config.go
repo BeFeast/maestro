@@ -26,7 +26,8 @@ type BackendDef struct {
 
 // ModelConfig holds multi-backend configuration.
 type ModelConfig struct {
-	Default  string                `yaml:"default"` // "claude", "codex", etc.
+	Default  string                `yaml:"default"`  // "claude", "codex", etc.
+	Fallback string                `yaml:"fallback"` // backend to use when the primary hits a rate limit
 	Backends map[string]BackendDef `yaml:"backends"`
 }
 

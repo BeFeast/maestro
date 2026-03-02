@@ -42,7 +42,8 @@ type Session struct {
 	RetryCount          int           `json:"retry_count,omitempty"`
 	LastOutputHash      string        `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`
-	TokensUsed          int           `json:"tokens_used,omitempty"` // cumulative tokens consumed by the worker
+	TokensUsed          int           `json:"tokens_used,omitempty"`    // cumulative tokens consumed by the worker
+	RateLimitHit        bool          `json:"rate_limit_hit,omitempty"` // true if worker was killed due to rate limiting
 }
 
 type State struct {
