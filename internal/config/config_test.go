@@ -728,3 +728,42 @@ max_retries_per_issue: 0
 		t.Errorf("MaxRetriesPerIssue = %d, want 0 (unlimited)", cfg.MaxRetriesPerIssue)
 	}
 }
+
+func TestParse_CleanupWorktreesOnMergeDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.ShouldCleanupWorktrees() {
+		t.Error("ShouldCleanupWorktrees() should default to true")
+	}
+}
+
+func TestParse_CleanupWorktreesOnMergeExplicitFalse(t *testing.T) {
+	yaml := `
+repo: owner/repo
+cleanup_worktrees_on_merge: false
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.ShouldCleanupWorktrees() {
+		t.Error("ShouldCleanupWorktrees() should be false when explicitly set to false")
+	}
+}
+
+func TestParse_CleanupWorktreesOnMergeExplicitTrue(t *testing.T) {
+	yaml := `
+repo: owner/repo
+cleanup_worktrees_on_merge: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.ShouldCleanupWorktrees() {
+		t.Error("ShouldCleanupWorktrees() should be true when explicitly set to true")
+	}
+}

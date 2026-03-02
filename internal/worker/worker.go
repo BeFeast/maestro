@@ -293,6 +293,67 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	return nil
 }
 
+// CleanupResult describes the outcome of cleaning up a single session's worktree.
+type CleanupResult struct {
+	SlotName    string
+	IssueNumber int
+	Worktree    string
+	Removed     bool
+	Error       error
+}
+
+// CleanupWorktrees removes worktrees for all terminal sessions that still have
+// a worktree directory on disk. Returns results for each session processed.
+func CleanupWorktrees(cfg *config.Config, s *state.State) []CleanupResult {
+	var results []CleanupResult
+	for slotName, sess := range s.Sessions {
+		if !state.IsTerminal(sess.Status) {
+			continue
+		}
+		if sess.Worktree == "" {
+			continue
+		}
+		if _, err := os.Stat(sess.Worktree); os.IsNotExist(err) {
+			// Worktree dir already gone — just clear the field
+			sess.Worktree = ""
+			continue
+		}
+		err := RemoveWorktree(cfg.LocalPath, sess.Worktree)
+		r := CleanupResult{
+			SlotName:    slotName,
+			IssueNumber: sess.IssueNumber,
+			Worktree:    sess.Worktree,
+		}
+		if err != nil {
+			r.Error = err
+			log.Printf("[worker] cleanup worktree %s for %s: %v", sess.Worktree, slotName, err)
+		} else {
+			r.Removed = true
+			sess.Worktree = ""
+			log.Printf("[worker] cleaned up worktree %s for %s", r.Worktree, slotName)
+		}
+		results = append(results, r)
+	}
+	return results
+}
+
+// RemoveWorktree removes a git worktree directory.
+// Returns nil if the worktree was removed or doesn't exist.
+func RemoveWorktree(localPath, worktreePath string) error {
+	if worktreePath == "" {
+		return nil
+	}
+	if _, err := os.Stat(worktreePath); os.IsNotExist(err) {
+		return nil
+	}
+	out, err := exec.Command("git", "-C", localPath,
+		"worktree", "remove", "--force", worktreePath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git worktree remove %s: %w\n%s", worktreePath, err, out)
+	}
+	return nil
+}
+
 // RebaseWorktree runs git fetch + rebase in the worktree.
 // If rebase hits conflicts in known shared files, it auto-resolves by keeping
 // both sides, continues the rebase, then force-pushes the branch.

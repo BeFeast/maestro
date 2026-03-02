@@ -44,6 +44,7 @@ Commands:
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
   history       Show recently completed sessions
+  cleanup       Remove worktrees for all completed/dead sessions
   version-bump  Bump project version based on merged PR labels
   version       Print version
 
@@ -164,6 +165,8 @@ func main() {
 		importCmd(args)
 	case "history":
 		historyCmd(args)
+	case "cleanup":
+		cleanupCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
 	case "_watch-updater":
@@ -1003,6 +1006,54 @@ func historyCmd(args []string) {
 			pr, sessionDuration(c.Session), finished, truncate(c.IssueTitle, 40))
 	}
 	w.Flush()
+}
+
+func cleanupCmd(args []string) {
+	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	fs.Parse(args)
+
+	cfgs := loadConfigs(configs)
+
+	totalRemoved := 0
+	totalErrors := 0
+
+	for _, cfg := range cfgs {
+		s, err := state.Load(cfg.StateDir)
+		if err != nil {
+			log.Printf("load state for %s: %v", cfg.Repo, err)
+			continue
+		}
+
+		results := worker.CleanupWorktrees(cfg, s)
+		if len(results) == 0 {
+			if len(cfgs) > 1 {
+				fmt.Printf("[%s] No worktrees to clean up.\n", cfg.Repo)
+			}
+			continue
+		}
+
+		for _, r := range results {
+			if r.Removed {
+				fmt.Printf("  removed: %s (issue #%d) — %s\n", r.SlotName, r.IssueNumber, r.Worktree)
+				totalRemoved++
+			} else {
+				fmt.Printf("  error:   %s (issue #%d) — %v\n", r.SlotName, r.IssueNumber, r.Error)
+				totalErrors++
+			}
+		}
+
+		if err := state.Save(cfg.StateDir, s); err != nil {
+			log.Printf("save state for %s: %v", cfg.Repo, err)
+		}
+	}
+
+	fmt.Printf("\nCleaned up %d worktree(s)", totalRemoved)
+	if totalErrors > 0 {
+		fmt.Printf(", %d error(s)", totalErrors)
+	}
+	fmt.Println(".")
 }
 
 func versionBumpCmd(args []string) {
