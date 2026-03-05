@@ -3234,3 +3234,127 @@ func TestNextFallbackBackend_SkipsUnknownBackend(t *testing.T) {
 		t.Errorf("nextFallbackBackend() = %q, want %q (should skip unknown backend)", got, "codex")
 	}
 }
+
+// --- per-state concurrency limit tests ---
+
+func TestAvailableSlots_NoPerStateLimit(t *testing.T) {
+	cfg := &config.Config{MaxParallel: 10}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusPROpen}
+
+	got := availableSlots(cfg, s, 2)
+	if got != 8 {
+		t.Errorf("availableSlots() = %d, want 8", got)
+	}
+}
+
+func TestAvailableSlots_RunningLimitCapsSlots(t *testing.T) {
+	cfg := &config.Config{
+		MaxParallel:          10,
+		MaxConcurrentByState: map[string]int{"running": 3},
+	}
+	s := state.NewState()
+	// 2 running, 2 pr_open = 4 active
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusPROpen}
+	s.Sessions["slot-4"] = &state.Session{Status: state.StatusPROpen}
+
+	// Global: 10 - 4 = 6 slots
+	// Per-state running: 3 - 2 = 1 slot (more restrictive)
+	got := availableSlots(cfg, s, 4)
+	if got != 1 {
+		t.Errorf("availableSlots() = %d, want 1 (running limit should cap)", got)
+	}
+}
+
+func TestAvailableSlots_RunningLimitExceeded(t *testing.T) {
+	cfg := &config.Config{
+		MaxParallel:          10,
+		MaxConcurrentByState: map[string]int{"running": 2},
+	}
+	s := state.NewState()
+	// 3 running, exceeds limit of 2
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusRunning}
+
+	got := availableSlots(cfg, s, 3)
+	if got != 0 {
+		t.Errorf("availableSlots() = %d, want 0 (running limit exceeded)", got)
+	}
+}
+
+func TestAvailableSlots_GlobalLimitMoreRestrictive(t *testing.T) {
+	cfg := &config.Config{
+		MaxParallel:          5,
+		MaxConcurrentByState: map[string]int{"running": 10},
+	}
+	s := state.NewState()
+	// 3 running, 1 pr_open = 4 active
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-4"] = &state.Session{Status: state.StatusPROpen}
+
+	// Global: 5 - 4 = 1 slot
+	// Per-state running: 10 - 3 = 7 (less restrictive)
+	got := availableSlots(cfg, s, 4)
+	if got != 1 {
+		t.Errorf("availableSlots() = %d, want 1 (global limit should cap)", got)
+	}
+}
+
+func TestAvailableSlots_ZeroWhenAtGlobalMax(t *testing.T) {
+	cfg := &config.Config{
+		MaxParallel:          3,
+		MaxConcurrentByState: map[string]int{"running": 5},
+	}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusPROpen}
+
+	got := availableSlots(cfg, s, 3)
+	if got != 0 {
+		t.Errorf("availableSlots() = %d, want 0 (at global max)", got)
+	}
+}
+
+func TestAvailableSlots_TerminalSessionsIgnored(t *testing.T) {
+	cfg := &config.Config{
+		MaxParallel:          10,
+		MaxConcurrentByState: map[string]int{"running": 3},
+	}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusDone}   // terminal
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusFailed} // terminal
+
+	// Only 1 active (running), terminal sessions don't count
+	got := availableSlots(cfg, s, 1)
+	// Global: 10 - 1 = 9, per-state running: 3 - 1 = 2
+	if got != 2 {
+		t.Errorf("availableSlots() = %d, want 2", got)
+	}
+}
+
+func TestAvailableSlots_NonRunningLimitIgnoredForDispatch(t *testing.T) {
+	// pr_open limit shouldn't affect how many new workers can start
+	cfg := &config.Config{
+		MaxParallel:          10,
+		MaxConcurrentByState: map[string]int{"pr_open": 1},
+	}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusPROpen}
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusPROpen}
+
+	// Global: 10 - 3 = 7
+	// No running limit configured, so all 7 available
+	got := availableSlots(cfg, s, 3)
+	if got != 7 {
+		t.Errorf("availableSlots() = %d, want 7 (pr_open limit shouldn't affect dispatch)", got)
+	}
+}

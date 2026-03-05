@@ -124,6 +124,17 @@ func (s *State) ActiveSessions() []*Session {
 	return active
 }
 
+// CountByStatus returns a map of session status → count for all non-terminal sessions.
+func (s *State) CountByStatus() map[SessionStatus]int {
+	counts := make(map[SessionStatus]int)
+	for _, sess := range s.Sessions {
+		if !IsTerminal(sess.Status) {
+			counts[sess.Status]++
+		}
+	}
+	return counts
+}
+
 // IssueInProgress returns true if the given issue is already being handled
 func (s *State) IssueInProgress(issueNum int) bool {
 	for _, sess := range s.Sessions {

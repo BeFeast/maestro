@@ -363,7 +363,23 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	fmt.Printf("Repo:           %s\n", cfg.Repo)
 	fmt.Printf("Session prefix: %s\n", cfg.SessionPrefix)
 	fmt.Printf("State file:     %s\n", state.StatePath(cfg.StateDir))
-	fmt.Printf("Max parallel:   %d\n\n", cfg.MaxParallel)
+	fmt.Printf("Max parallel:   %d\n", cfg.MaxParallel)
+	if len(cfg.MaxConcurrentByState) > 0 {
+		// Sort keys for stable output
+		stateNames := make([]string, 0, len(cfg.MaxConcurrentByState))
+		for k := range cfg.MaxConcurrentByState {
+			stateNames = append(stateNames, k)
+		}
+		sort.Strings(stateNames)
+		statusCounts := s.CountByStatus()
+		fmt.Printf("Per-state limits:\n")
+		for _, name := range stateNames {
+			limit := cfg.MaxConcurrentByState[name]
+			current := statusCounts[state.SessionStatus(name)]
+			fmt.Printf("  %-16s %d/%d\n", name+":", current, limit)
+		}
+	}
+	fmt.Println()
 
 	if len(s.Sessions) == 0 {
 		fmt.Println("No sessions.")

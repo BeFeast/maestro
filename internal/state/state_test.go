@@ -660,3 +660,39 @@ func TestMarkIssueRetryExhausted_NoSessions(t *testing.T) {
 	// Should not panic when no matching sessions exist
 	s.MarkIssueRetryExhausted(42)
 }
+
+func TestCountByStatus(t *testing.T) {
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 1, Status: StatusRunning}
+	s.Sessions["slot-2"] = &Session{IssueNumber: 2, Status: StatusRunning}
+	s.Sessions["slot-3"] = &Session{IssueNumber: 3, Status: StatusPROpen}
+	s.Sessions["slot-4"] = &Session{IssueNumber: 4, Status: StatusQueued}
+	s.Sessions["slot-5"] = &Session{IssueNumber: 5, Status: StatusDone}   // terminal — excluded
+	s.Sessions["slot-6"] = &Session{IssueNumber: 6, Status: StatusFailed} // terminal — excluded
+
+	counts := s.CountByStatus()
+
+	if counts[StatusRunning] != 2 {
+		t.Errorf("running = %d, want 2", counts[StatusRunning])
+	}
+	if counts[StatusPROpen] != 1 {
+		t.Errorf("pr_open = %d, want 1", counts[StatusPROpen])
+	}
+	if counts[StatusQueued] != 1 {
+		t.Errorf("queued = %d, want 1", counts[StatusQueued])
+	}
+	if counts[StatusDone] != 0 {
+		t.Errorf("done = %d, want 0 (terminal states excluded)", counts[StatusDone])
+	}
+	if counts[StatusFailed] != 0 {
+		t.Errorf("failed = %d, want 0 (terminal states excluded)", counts[StatusFailed])
+	}
+}
+
+func TestCountByStatus_Empty(t *testing.T) {
+	s := NewState()
+	counts := s.CountByStatus()
+	if len(counts) != 0 {
+		t.Errorf("expected empty map for empty state, got %v", counts)
+	}
+}
