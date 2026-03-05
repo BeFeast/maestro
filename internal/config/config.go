@@ -40,6 +40,12 @@ type VersioningConfig struct {
 	CreateRelease bool     `yaml:"create_release"` // Create GitHub release on bump
 }
 
+// GitHubProjectsConfig controls syncing issue status to GitHub Projects boards.
+type GitHubProjectsConfig struct {
+	Enabled       bool `yaml:"enabled"`
+	ProjectNumber int  `yaml:"project_number"` // GitHub Project number (auto-detect from repo)
+}
+
 // RoutingConfig controls automatic backend selection via LLM router.
 type RoutingConfig struct {
 	Mode            string `yaml:"mode"`              // "auto", "manual" (labels only)
@@ -54,40 +60,41 @@ type ServerConfig struct {
 }
 
 type Config struct {
-	Server                     ServerConfig     `yaml:"server"`
-	Repo                       string           `yaml:"repo"`
-	LocalPath                  string           `yaml:"local_path"`
-	WorktreeBase               string           `yaml:"worktree_base"`
-	MaxParallel                int              `yaml:"max_parallel"`
-	MaxConcurrentByState       map[string]int   `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
-	MaxRuntimeMinutes          int              `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
-	WorkerSilentTimeoutMinutes int              `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
-	WorkerMaxTokens            int              `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
-	MaxRetriesPerIssue         int              `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
-	AutoRebase                 bool             `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
-	ClaudeCmd                  string           `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
-	IssueLabel                 string           `yaml:"issue_label"`                   // deprecated: use issue_labels
-	IssueLabels                []string         `yaml:"issue_labels"`
-	ExcludeLabels              []string         `yaml:"exclude_labels"`
-	WorkerPrompt               string           `yaml:"worker_prompt"`
-	BugPrompt                  string           `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
-	EnhancementPrompt          string           `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
-	SessionPrefix              string           `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
-	StateDir                   string           `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
-	Model                      ModelConfig      `yaml:"model"`
-	Routing                    RoutingConfig    `yaml:"routing"`
-	DeployCmd                  string           `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
-	DeployTimeoutMinutes       int              `yaml:"deploy_timeout_minutes"` // timeout for deploy command in minutes (default: 15)
-	MergeStrategy              string           `yaml:"merge_strategy"`         // "sequential" | "parallel"
-	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
-	Telegram                   TelegramConfig   `yaml:"telegram"`
-	Versioning                 VersioningConfig `yaml:"versioning"`
-	MaxRetryBackoffMs          int              `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
-	AutoResolveFiles           []string         `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
-	CleanupWorktreesOnMerge    *bool            `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
-	BlockerPatterns            []string         `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
-	PollIntervalSeconds        int              `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
-	SourcePath                 string           `yaml:"-"`                          // path the config was loaded from (not serialized)
+	Server                     ServerConfig         `yaml:"server"`
+	Repo                       string               `yaml:"repo"`
+	LocalPath                  string               `yaml:"local_path"`
+	WorktreeBase               string               `yaml:"worktree_base"`
+	MaxParallel                int                  `yaml:"max_parallel"`
+	MaxConcurrentByState       map[string]int       `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
+	MaxRuntimeMinutes          int                  `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
+	WorkerSilentTimeoutMinutes int                  `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
+	WorkerMaxTokens            int                  `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
+	MaxRetriesPerIssue         int                  `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
+	AutoRebase                 bool                 `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
+	ClaudeCmd                  string               `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
+	IssueLabel                 string               `yaml:"issue_label"`                   // deprecated: use issue_labels
+	IssueLabels                []string             `yaml:"issue_labels"`
+	ExcludeLabels              []string             `yaml:"exclude_labels"`
+	WorkerPrompt               string               `yaml:"worker_prompt"`
+	BugPrompt                  string               `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
+	EnhancementPrompt          string               `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
+	SessionPrefix              string               `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
+	StateDir                   string               `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
+	Model                      ModelConfig          `yaml:"model"`
+	Routing                    RoutingConfig        `yaml:"routing"`
+	DeployCmd                  string               `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
+	DeployTimeoutMinutes       int                  `yaml:"deploy_timeout_minutes"` // timeout for deploy command in minutes (default: 15)
+	MergeStrategy              string               `yaml:"merge_strategy"`         // "sequential" | "parallel"
+	MergeIntervalSeconds       int                  `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
+	Telegram                   TelegramConfig       `yaml:"telegram"`
+	Versioning                 VersioningConfig     `yaml:"versioning"`
+	GitHubProjects             GitHubProjectsConfig `yaml:"github_projects"`
+	MaxRetryBackoffMs          int                  `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
+	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
+	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
+	BlockerPatterns            []string             `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
+	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
+	SourcePath                 string               `yaml:"-"`                          // path the config was loaded from (not serialized)
 }
 
 // LoadFrom loads config from a specific path.

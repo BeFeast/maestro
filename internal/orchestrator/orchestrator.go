@@ -227,6 +227,15 @@ func (o *Orchestrator) nextFallbackBackend(sess *state.Session) string {
 	return ""
 }
 
+// syncProject syncs an issue's status to the configured GitHub Project board.
+// No-op if github_projects is not enabled.
+func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus) {
+	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
+		return
+	}
+	o.gh.SyncIssueToProject(issueNumber, o.cfg.GitHubProjects.ProjectNumber, status)
+}
+
 func readLastLines(path string, limit int) (string, error) {
 	if limit <= 0 {
 		return "", nil
@@ -829,6 +838,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 					}
+					o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
 					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
@@ -996,6 +1006,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 				}
+				o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
 				sess.Status = state.StatusFailed
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
@@ -1176,6 +1187,7 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	}
 
 	log.Printf("[orch] merged PR #%d ✓", pr.Number)
+	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 	if err := o.closeIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
 		log.Printf("[orch] warning: failed to close issue #%d: %v", sess.IssueNumber, err)
 	}
@@ -1411,10 +1423,6 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 	started := 0
 	for _, issue := range issues {
-		if started >= slots {
-			break
-		}
-
 		if s.IssueInProgress(issue.Number) {
 			continue
 		}
@@ -1465,6 +1473,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
+		// No available slots — sync remaining eligible issues as backlog/todo
+		if started >= slots {
+			o.syncProject(issue.Number, github.ProjectStatusTodo)
+			continue
+		}
+
 		// Resolve backend from label / auto-routing / default
 		backendName := o.resolveBackend(issue)
 
@@ -1490,6 +1504,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if longRunning {
 			s.Sessions[slotName].LongRunning = true
 		}
+		o.syncProject(issue.Number, github.ProjectStatusInProgress)
 		o.notifier.Sendf("🚀 maestro: started worker %s for issue #%d: %s", slotName, issue.Number, issue.Title)
 		started++
 	}
