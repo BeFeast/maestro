@@ -85,6 +85,8 @@ type Config struct {
 	AutoResolveFiles           []string         `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	CleanupWorktreesOnMerge    *bool            `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	BlockerPatterns            []string         `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
+	PollIntervalSeconds        int              `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
+	SourcePath                 string           `yaml:"-"`                          // path the config was loaded from (not serialized)
 }
 
 // LoadFrom loads config from a specific path.
@@ -93,7 +95,12 @@ func LoadFrom(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
-	return parse(data)
+	cfg, err := parse(data)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SourcePath = path
+	return cfg, nil
 }
 
 func Load() (*Config, error) {
@@ -115,7 +122,18 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("no config file found (tried maestro.yaml, ~/.maestro/config.yaml): %w", err)
 	}
-	return parse(data)
+	cfg, parseErr := parse(data)
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	// Set SourcePath to the candidate that succeeded
+	for _, p := range candidates {
+		if _, e := os.Stat(p); e == nil {
+			cfg.SourcePath = p
+			break
+		}
+	}
+	return cfg, nil
 }
 
 func parse(data []byte) (*Config, error) {
@@ -290,6 +308,25 @@ func (c *Config) ShouldCleanupWorktrees() bool {
 		return true
 	}
 	return *c.CleanupWorktreesOnMerge
+}
+
+// ResolvePath returns the config file path, using SourcePath if set, otherwise the default candidate.
+func (c *Config) ResolvePath() string {
+	if c.SourcePath != "" {
+		return c.SourcePath
+	}
+	candidates := []string{
+		"maestro.yaml",
+		"maestro.yml",
+		filepath.Join(os.Getenv("HOME"), ".maestro", "config.yaml"),
+		filepath.Join(os.Getenv("HOME"), ".maestro", "config.yml"),
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "maestro.yaml"
 }
 
 func expandHome(path string) string {

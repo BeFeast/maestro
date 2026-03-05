@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/orchestrator"
@@ -256,8 +257,22 @@ func runCmd(args []string) {
 			}()
 		}
 
-		log.Printf("starting maestro — repo=%s prefix=%s interval=%s once=%v", cfg.Repo, cfg.SessionPrefix, *interval, *once)
-		if err := orch.Run(context.Background(), *interval, *once, refreshCh); err != nil {
+		// Start config file watcher for hot-reload
+		ctx := context.Background()
+		cfgPath := cfg.ResolvePath()
+		if cfgPath != "" {
+			reloadCh := configwatch.Watch(ctx, cfgPath, 2*time.Second)
+			orch.SetConfigReloadCh(reloadCh)
+		}
+
+		// Use config-driven poll interval if set
+		runInterval := *interval
+		if cfg.PollIntervalSeconds > 0 {
+			runInterval = time.Duration(cfg.PollIntervalSeconds) * time.Second
+		}
+
+		log.Printf("starting maestro — repo=%s prefix=%s interval=%s once=%v", cfg.Repo, cfg.SessionPrefix, runInterval, *once)
+		if err := orch.Run(ctx, runInterval, *once, refreshCh); err != nil {
 			log.Fatalf("run: %v", err)
 		}
 		return
@@ -299,8 +314,21 @@ func runCmd(args []string) {
 				}()
 			}
 
-			log.Printf("[%s] starting — repo=%s interval=%s once=%v", c.SessionPrefix, c.Repo, *interval, *once)
-			if err := orch.Run(ctx, *interval, *once, refreshCh); err != nil {
+			// Start config file watcher for hot-reload
+			cfgPath := c.ResolvePath()
+			if cfgPath != "" {
+				reloadCh := configwatch.Watch(ctx, cfgPath, 2*time.Second)
+				orch.SetConfigReloadCh(reloadCh)
+			}
+
+			// Use config-driven poll interval if set
+			runInterval := *interval
+			if c.PollIntervalSeconds > 0 {
+				runInterval = time.Duration(c.PollIntervalSeconds) * time.Second
+			}
+
+			log.Printf("[%s] starting — repo=%s interval=%s once=%v", c.SessionPrefix, c.Repo, runInterval, *once)
+			if err := orch.Run(ctx, runInterval, *once, refreshCh); err != nil {
 				log.Printf("[%s] run error: %v", c.SessionPrefix, err)
 			}
 		}(cfg)

@@ -864,6 +864,46 @@ func TestParse_FallbackBackendsDefault(t *testing.T) {
 	}
 }
 
+func TestParse_PollIntervalSecondsDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.PollIntervalSeconds != 0 {
+		t.Errorf("PollIntervalSeconds = %d, want 0", cfg.PollIntervalSeconds)
+	}
+}
+
+func TestParse_PollIntervalSecondsExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+poll_interval_seconds: 300
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.PollIntervalSeconds != 300 {
+		t.Errorf("PollIntervalSeconds = %d, want 300", cfg.PollIntervalSeconds)
+	}
+}
+
+func TestLoadFrom_SetsSourcePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	if err := os.WriteFile(path, []byte("repo: owner/repo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.SourcePath != path {
+		t.Errorf("SourcePath = %q, want %q", cfg.SourcePath, path)
+	}
+}
+
 func TestParse_FallbackBackendsExplicit(t *testing.T) {
 	yaml := `
 repo: owner/repo
