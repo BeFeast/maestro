@@ -82,6 +82,7 @@ type Config struct {
 	MergeIntervalSeconds       int              `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
 	Telegram                   TelegramConfig   `yaml:"telegram"`
 	Versioning                 VersioningConfig `yaml:"versioning"`
+	MaxRetryBackoffMs          int              `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles           []string         `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	CleanupWorktreesOnMerge    *bool            `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	BlockerPatterns            []string         `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
@@ -209,6 +210,11 @@ func parse(data []byte) (*Config, error) {
 	if cfg.StateDir == "" {
 		hash := fmt.Sprintf("%x", md5.Sum([]byte(cfg.Repo)))[:12]
 		cfg.StateDir = filepath.Join(os.Getenv("HOME"), ".maestro", hash)
+	}
+
+	// Default max_retry_backoff_ms: 300000 (5 minutes)
+	if cfg.MaxRetryBackoffMs <= 0 {
+		cfg.MaxRetryBackoffMs = 300000
 	}
 
 	if cfg.Telegram.OpenclawURL == "" {

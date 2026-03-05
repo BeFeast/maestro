@@ -3061,12 +3061,15 @@ func TestCheckSessions_RateLimitNoFallbackAvailable_NormalRetry(t *testing.T) {
 	o.checkSessions(s)
 
 	sess2 := s.Sessions["mae-1"]
-	// Should fall through to normal retry (RetryCount < 1)
-	if sess2.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want %q (should fall through to normal retry)", sess2.Status, state.StatusRunning)
+	// Should schedule retry with backoff (not immediate respawn)
+	if sess2.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (should schedule backoff)", sess2.Status, state.StatusDead)
 	}
-	if len(*respawned) != 1 || (*respawned)[0] != "gemini" {
-		t.Fatalf("respawned = %v, want [gemini] (normal retry with same backend)", *respawned)
+	if sess2.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set for scheduled retry")
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want [] (retry is scheduled, not immediate)", *respawned)
 	}
 	if sess2.RetryCount != 1 {
 		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
@@ -3096,12 +3099,15 @@ func TestCheckSessions_NoRateLimit_NormalRetry(t *testing.T) {
 	o.checkSessions(s)
 
 	sess2 := s.Sessions["mae-1"]
-	if sess2.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want %q", sess2.Status, state.StatusRunning)
+	// Should schedule retry with backoff (not immediate respawn)
+	if sess2.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (should schedule backoff)", sess2.Status, state.StatusDead)
 	}
-	// Should retry with same backend (normal retry), not fallback
-	if len(*respawned) != 1 || (*respawned)[0] != "claude" {
-		t.Fatalf("respawned = %v, want [claude] (normal retry, not fallback)", *respawned)
+	if sess2.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set for scheduled retry")
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want [] (retry is scheduled, not immediate)", *respawned)
 	}
 	if sess2.RetryCount != 1 {
 		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
@@ -3131,12 +3137,15 @@ func TestCheckSessions_RateLimitNoFallbackConfigured_NormalRetry(t *testing.T) {
 	o.checkSessions(s)
 
 	sess2 := s.Sessions["mae-1"]
-	// No fallback backends configured, so should fall through to normal retry
-	if sess2.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want %q", sess2.Status, state.StatusRunning)
+	// No fallback backends configured, so should schedule retry with backoff
+	if sess2.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (should schedule backoff)", sess2.Status, state.StatusDead)
 	}
-	if len(*respawned) != 1 || (*respawned)[0] != "claude" {
-		t.Fatalf("respawned = %v, want [claude]", *respawned)
+	if sess2.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set for scheduled retry")
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want [] (retry is scheduled, not immediate)", *respawned)
 	}
 	if sess2.RetryCount != 1 {
 		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
@@ -3672,5 +3681,320 @@ func TestStrSliceEqual(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("strSliceEqual(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.want)
 		}
+	}
+}
+
+// --- exponential retry backoff tests ---
+
+func TestRetryBackoffMs_FirstAttempt(t *testing.T) {
+	// attempt=1: 10000 * 2^0 = 10000ms
+	got := retryBackoffMs(1, 300000)
+	if got != 10000 {
+		t.Errorf("retryBackoffMs(1, 300000) = %d, want 10000", got)
+	}
+}
+
+func TestRetryBackoffMs_SecondAttempt(t *testing.T) {
+	// attempt=2: 10000 * 2^1 = 20000ms
+	got := retryBackoffMs(2, 300000)
+	if got != 20000 {
+		t.Errorf("retryBackoffMs(2, 300000) = %d, want 20000", got)
+	}
+}
+
+func TestRetryBackoffMs_ThirdAttempt(t *testing.T) {
+	// attempt=3: 10000 * 2^2 = 40000ms
+	got := retryBackoffMs(3, 300000)
+	if got != 40000 {
+		t.Errorf("retryBackoffMs(3, 300000) = %d, want 40000", got)
+	}
+}
+
+func TestRetryBackoffMs_CappedAtMax(t *testing.T) {
+	// attempt=10: 10000 * 2^9 = 5120000 > 300000, should be capped
+	got := retryBackoffMs(10, 300000)
+	if got != 300000 {
+		t.Errorf("retryBackoffMs(10, 300000) = %d, want 300000 (capped)", got)
+	}
+}
+
+func TestRetryBackoffMs_ZeroAttempt(t *testing.T) {
+	// attempt=0 should be treated as 1
+	got := retryBackoffMs(0, 300000)
+	if got != 10000 {
+		t.Errorf("retryBackoffMs(0, 300000) = %d, want 10000", got)
+	}
+}
+
+func TestRetryBackoffMs_SmallCap(t *testing.T) {
+	// cap of 5000ms should limit even the first attempt
+	got := retryBackoffMs(1, 5000)
+	if got != 5000 {
+		t.Errorf("retryBackoffMs(1, 5000) = %d, want 5000 (capped)", got)
+	}
+}
+
+func TestCheckSessions_DeadWorkerSchedulesRetryWithBackoff(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return false // worker is dead
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-10"] = &state.Session{
+		IssueNumber: 110,
+		IssueTitle:  "test backoff",
+		Status:      state.StatusRunning,
+		PID:         9876,
+		TmuxSession: "maestro-mae-10",
+		Branch:      "feat/mae-10-110-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+		RetryCount:  0,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-10"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", sess.RetryCount)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set for scheduled retry")
+	}
+	// NextRetryAt should be ~10s in the future (10000ms for attempt 1)
+	until := time.Until(*sess.NextRetryAt)
+	if until < 5*time.Second || until > 15*time.Second {
+		t.Errorf("NextRetryAt should be ~10s from now, got %s", until)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set")
+	}
+}
+
+func TestCheckSessions_AlreadyRetriedWorkerFails(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	labeled := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return false // worker is dead
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labeled = append(labeled, label)
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-11"] = &state.Session{
+		IssueNumber: 111,
+		IssueTitle:  "already retried",
+		Status:      state.StatusRunning,
+		PID:         8765,
+		TmuxSession: "maestro-mae-11",
+		Branch:      "feat/mae-11-111-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+		RetryCount:  1, // already retried once
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-11"]
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusFailed)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt should be nil for permanently failed session")
+	}
+	found := false
+	for _, label := range labeled {
+		if label == "blocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected 'blocked' label to be added on permanent failure")
+	}
+}
+
+func TestRespawnDueRetries_BackoffElapsed_Respawns(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	respawned := false
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "test prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test issue"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawned = true
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			return nil
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-1 * time.Second) // backoff already elapsed
+	s := state.NewState()
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber: 112,
+		IssueTitle:  "test issue",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		Branch:      "feat/mae-12-112-test",
+	}
+
+	o.respawnDueRetries(s)
+
+	if !respawned {
+		t.Fatal("expected worker to be respawned after backoff elapsed")
+	}
+	sess := s.Sessions["mae-12"]
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt should be nil after respawn")
+	}
+	if sess.Status != state.StatusRunning {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+}
+
+func TestRespawnDueRetries_BackoffNotElapsed_Waits(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+	}
+	respawned := false
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawned = true
+			return nil
+		},
+	}
+
+	futureTime := time.Now().UTC().Add(1 * time.Hour) // backoff not yet elapsed
+	s := state.NewState()
+	s.Sessions["mae-13"] = &state.Session{
+		IssueNumber: 113,
+		IssueTitle:  "waiting",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &futureTime,
+		Branch:      "feat/mae-13-113-test",
+	}
+
+	o.respawnDueRetries(s)
+
+	if respawned {
+		t.Fatal("worker should NOT be respawned while backoff is still pending")
+	}
+	sess := s.Sessions["mae-13"]
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should still be set while waiting")
+	}
+	if sess.Status != state.StatusDead {
+		t.Errorf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+}
+
+func TestRespawnDueRetries_RespawnFails_MarksAsFailed(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			return fmt.Errorf("respawn error")
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-1 * time.Second)
+	s := state.NewState()
+	s.Sessions["mae-14"] = &state.Session{
+		IssueNumber: 114,
+		IssueTitle:  "will fail",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		Branch:      "feat/mae-14-114-test",
+	}
+
+	o.respawnDueRetries(s)
+
+	sess := s.Sessions["mae-14"]
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusFailed)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set on failure")
+	}
+}
+
+func TestIssueInProgress_DeadWithPendingRetry(t *testing.T) {
+	s := state.NewState()
+	futureTime := time.Now().UTC().Add(1 * time.Hour)
+	s.Sessions["mae-15"] = &state.Session{
+		IssueNumber: 115,
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &futureTime,
+	}
+
+	if !s.IssueInProgress(115) {
+		t.Fatal("IssueInProgress should return true for dead session with pending retry")
+	}
+}
+
+func TestIssueInProgress_DeadWithoutRetry(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["mae-16"] = &state.Session{
+		IssueNumber: 116,
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: nil, // no pending retry
+	}
+
+	if s.IssueInProgress(116) {
+		t.Fatal("IssueInProgress should return false for dead session without pending retry")
 	}
 }

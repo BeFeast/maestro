@@ -461,7 +461,12 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 		age := time.Since(sess.StartedAt).Round(time.Minute)
 		retries := "-"
 		if sess.RetryCount > 0 {
-			retries = fmt.Sprintf("%d", sess.RetryCount)
+			if sess.NextRetryAt != nil && time.Now().Before(*sess.NextRetryAt) {
+				remaining := time.Until(*sess.NextRetryAt).Round(time.Second)
+				retries = fmt.Sprintf("%d (in %s)", sess.RetryCount, remaining)
+			} else {
+				retries = fmt.Sprintf("%d", sess.RetryCount)
+			}
 		}
 		pr := "-"
 		if sess.PRNumber > 0 {
