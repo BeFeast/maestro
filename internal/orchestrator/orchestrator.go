@@ -1159,6 +1159,24 @@ func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Ses
 	o.notifier.Sendf("⚠️ Worker %s (issue #%d) has unresolvable conflicts — manual intervention needed", slotName, sess.IssueNumber)
 }
 
+// findOpenBlockers returns the subset of blocker issue numbers that are still open.
+func (o *Orchestrator) findOpenBlockers(blockers []int) []int {
+	var open []int
+	for _, num := range blockers {
+		closed, err := o.isIssueClosed(num)
+		if err != nil {
+			// If we can't determine the state, assume it's open (safe default)
+			log.Printf("[orch] warn: could not check blocker #%d: %v (assuming open)", num, err)
+			open = append(open, num)
+			continue
+		}
+		if !closed {
+			open = append(open, num)
+		}
+	}
+	return open
+}
+
 // resolveBackend determines which backend to use for the given issue.
 // Delegates to router.ResolveBackend which applies 3-tier priority:
 //  1. model:<backend> label on the issue (highest priority)
@@ -1249,6 +1267,18 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				log.Printf("[orch] skipping issue #%d: retry limit exhausted (%d/%d attempts)",
 					issue.Number, failed, o.cfg.MaxRetriesPerIssue)
 				continue
+			}
+		}
+
+		// Check for open blockers: skip if any referenced blocking issues are still open
+		if len(o.cfg.BlockerPatterns) > 0 {
+			blockers := github.FindBlockers(issue.Body, o.cfg.BlockerPatterns)
+			if len(blockers) > 0 {
+				openBlockers := o.findOpenBlockers(blockers)
+				if len(openBlockers) > 0 {
+					log.Printf("[orch] skipping issue #%d: blocked by open issues %v", issue.Number, openBlockers)
+					continue
+				}
 			}
 		}
 

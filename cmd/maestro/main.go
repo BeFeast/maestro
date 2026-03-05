@@ -464,6 +464,40 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 			fmt.Printf("    log:    tail -f %s\n", sess.LogFile)
 		}
 	}
+
+	// Show blocked issues (issues with open blockers)
+	if len(cfg.BlockerPatterns) > 0 {
+		issues, err := gh.ListOpenIssues(cfg.IssueLabels)
+		if err == nil {
+			var blockedLines []string
+			for _, issue := range issues {
+				blockers := github.FindBlockers(issue.Body, cfg.BlockerPatterns)
+				if len(blockers) == 0 {
+					continue
+				}
+				var openBlockers []int
+				for _, b := range blockers {
+					closed, err := gh.IsIssueClosed(b)
+					if err != nil || !closed {
+						openBlockers = append(openBlockers, b)
+					}
+				}
+				if len(openBlockers) > 0 {
+					refs := make([]string, len(openBlockers))
+					for i, b := range openBlockers {
+						refs[i] = fmt.Sprintf("#%d", b)
+					}
+					blockedLines = append(blockedLines, fmt.Sprintf("  #%-6d blocked by %s  (%s)", issue.Number, strings.Join(refs, ", "), truncate(issue.Title, 50)))
+				}
+			}
+			if len(blockedLines) > 0 {
+				fmt.Println("\nBlocked issues:")
+				for _, line := range blockedLines {
+					fmt.Println(line)
+				}
+			}
+		}
+	}
 }
 
 func logsCmd(args []string) {

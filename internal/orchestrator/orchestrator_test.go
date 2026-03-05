@@ -3358,3 +3358,120 @@ func TestAvailableSlots_NonRunningLimitIgnoredForDispatch(t *testing.T) {
 		t.Errorf("availableSlots() = %d, want 7 (pr_open limit shouldn't affect dispatch)", got)
 	}
 }
+
+// --- blocker-aware dispatch tests ---
+
+func TestFindOpenBlockers_AllClosed(t *testing.T) {
+	o := &Orchestrator{
+		isIssueClosedFn: func(number int) (bool, error) {
+			return true, nil // all blockers closed
+		},
+	}
+	got := o.findOpenBlockers([]int{10, 20, 30})
+	if len(got) != 0 {
+		t.Errorf("findOpenBlockers() = %v, want empty (all closed)", got)
+	}
+}
+
+func TestFindOpenBlockers_SomeOpen(t *testing.T) {
+	closedIssues := map[int]bool{10: true, 20: false, 30: true}
+	o := &Orchestrator{
+		isIssueClosedFn: func(number int) (bool, error) {
+			return closedIssues[number], nil
+		},
+	}
+	got := o.findOpenBlockers([]int{10, 20, 30})
+	if len(got) != 1 || got[0] != 20 {
+		t.Errorf("findOpenBlockers() = %v, want [20]", got)
+	}
+}
+
+func TestFindOpenBlockers_ErrorAssumesOpen(t *testing.T) {
+	o := &Orchestrator{
+		isIssueClosedFn: func(number int) (bool, error) {
+			return false, fmt.Errorf("network error")
+		},
+	}
+	got := o.findOpenBlockers([]int{42})
+	if len(got) != 1 || got[0] != 42 {
+		t.Errorf("findOpenBlockers() = %v, want [42] (error should assume open)", got)
+	}
+}
+
+func TestFindOpenBlockers_Empty(t *testing.T) {
+	o := &Orchestrator{}
+	got := o.findOpenBlockers(nil)
+	if len(got) != 0 {
+		t.Errorf("findOpenBlockers() = %v, want empty", got)
+	}
+}
+
+func TestStartNewWorkers_SkipsBlockedIssue(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
+
+	issues := []github.Issue{
+		{Number: 42, Title: "blocked issue", Body: "This is blocked by #10"},
+		{Number: 43, Title: "free issue", Body: "No blockers here"},
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	// Issue #10 is still open (not closed)
+	o.isIssueClosedFn = func(number int) (bool, error) {
+		return false, nil
+	}
+
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1", len(*started))
+	}
+	if (*started)[0] != 43 {
+		t.Errorf("started issue #%d, want #43", (*started)[0])
+	}
+}
+
+func TestStartNewWorkers_DispatchesWhenBlockersClosed(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
+
+	issues := []github.Issue{
+		{Number: 42, Title: "was blocked", Body: "This is blocked by #10"},
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	// Blocker #10 is closed
+	o.isIssueClosedFn = func(number int) (bool, error) {
+		return true, nil
+	}
+
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1 (blocker closed)", len(*started))
+	}
+	if (*started)[0] != 42 {
+		t.Errorf("started issue #%d, want #42", (*started)[0])
+	}
+}
+
+func TestStartNewWorkers_NoPatternsNoBlockerCheck(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	// No blocker_patterns configured
+
+	issues := []github.Issue{
+		{Number: 42, Title: "has blocker text", Body: "blocked by #10"},
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	// Should dispatch because blocker_patterns is empty (feature disabled)
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1 (no patterns = no check)", len(*started))
+	}
+}
