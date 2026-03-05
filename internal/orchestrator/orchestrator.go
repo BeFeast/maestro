@@ -293,6 +293,73 @@ func countSilentTimeoutKillsForIssue(s *state.State, issueNumber int) int {
 	return count
 }
 
+// retryBackoffMs computes the exponential backoff delay for a retry attempt.
+// Formula: min(10000 * 2^(attempt-1), maxRetryBackoffMs).
+// attempt is 1-based (the first retry is attempt 1).
+func retryBackoffMs(attempt, maxRetryBackoffMs int) int {
+	if attempt <= 0 {
+		attempt = 1
+	}
+	delay := 10000 // 10 seconds base
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay > maxRetryBackoffMs {
+			return maxRetryBackoffMs
+		}
+	}
+	if delay > maxRetryBackoffMs {
+		return maxRetryBackoffMs
+	}
+	return delay
+}
+
+// respawnDueRetries checks dead sessions with a scheduled retry time and
+// respawns them when the backoff period has elapsed.
+func (o *Orchestrator) respawnDueRetries(s *state.State) {
+	for slotName, sess := range s.Sessions {
+		if sess.Status != state.StatusDead {
+			continue
+		}
+		if sess.NextRetryAt == nil {
+			continue
+		}
+		if time.Now().UTC().Before(*sess.NextRetryAt) {
+			log.Printf("[orch] worker %s retry %d waiting until %s",
+				slotName, sess.RetryCount, sess.NextRetryAt.Format(time.RFC3339))
+			continue
+		}
+
+		// Backoff elapsed — respawn the worker
+		log.Printf("[orch] worker %s backoff elapsed, respawning (retry %d)", slotName, sess.RetryCount)
+		sess.NextRetryAt = nil
+
+		issue, err := o.getIssue(sess.IssueNumber)
+		if err != nil {
+			log.Printf("[orch] fetch issue #%d for retry: %v — marking as failed", sess.IssueNumber, err)
+			sess.Status = state.StatusFailed
+			now := time.Now().UTC()
+			sess.FinishedAt = &now
+			o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) retry failed (could not fetch issue)",
+				slotName, sess.IssueNumber, sess.IssueTitle)
+			continue
+		}
+
+		promptBase := o.selectPrompt(issue)
+		if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
+			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, err)
+			sess.Status = state.StatusFailed
+			now := time.Now().UTC()
+			sess.FinishedAt = &now
+			o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) respawn failed: %v",
+				slotName, sess.IssueNumber, sess.IssueTitle, err)
+			continue
+		}
+
+		o.notifier.Sendf("🔄 maestro: retrying worker %s for issue #%d: %s (attempt %d)",
+			slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount)
+	}
+}
+
 // LoadPromptBase reads the worker prompt template from config or a provided path.
 // Priority: 1) explicit promptPath arg, 2) cfg.WorkerPrompt, 3) built-in fallback.
 // Also loads optional bug_prompt and enhancement_prompt from config.
@@ -369,6 +436,9 @@ func (o *Orchestrator) RunOnce() error {
 
 	// Step 2: Check running sessions for dead processes / stale / closed issues
 	o.checkSessions(s)
+
+	// Step 2b: Respawn dead sessions whose backoff has elapsed
+	o.respawnDueRetries(s)
 
 	// Step 3: Auto-merge green PRs
 	o.autoMergePRs(s)
@@ -741,34 +811,18 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
 						slotName, sess.IssueNumber, sess.TriedBackends[len(sess.TriedBackends)-1], nextBackend)
 				} else if sess.RetryCount < 1 {
-					// First failure — retry with fresh worktree
-					log.Printf("[orch] worker %s (pid=%d) died, retrying (attempt %d)", slotName, sess.PID, sess.RetryCount+1)
+					// First failure — schedule retry with exponential backoff
 					sess.RetryCount++
-
-					issue, err := o.getIssue(sess.IssueNumber)
-					if err != nil {
-						log.Printf("[orch] fetch issue #%d for retry: %v — marking as failed", sess.IssueNumber, err)
-						sess.Status = state.StatusFailed
-						now := time.Now().UTC()
-						sess.FinishedAt = &now
-						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) died and retry failed (could not fetch issue)",
-							slotName, sess.IssueNumber, sess.IssueTitle)
-						continue
-					}
-
-					promptBase := o.selectPrompt(issue)
-					if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
-						log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, err)
-						sess.Status = state.StatusFailed
-						now := time.Now().UTC()
-						sess.FinishedAt = &now
-						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) died and respawn failed: %v",
-							slotName, sess.IssueNumber, sess.IssueTitle, err)
-						continue
-					}
-
-					o.notifier.Sendf("🔄 maestro: retrying worker %s for issue #%d: %s (attempt %d)",
-						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount)
+					backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
+					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
+					sess.NextRetryAt = &retryAt
+					sess.Status = state.StatusDead
+					now := time.Now().UTC()
+					sess.FinishedAt = &now
+					log.Printf("[orch] worker %s (pid=%d) died, scheduling retry %d in %dms",
+						slotName, sess.PID, sess.RetryCount, backoffMs)
+					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) died, retry %d scheduled in %ds",
+						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
 				} else {
 					// Already retried — mark as permanently failed
 					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)

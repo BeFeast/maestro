@@ -40,6 +40,7 @@ type Session struct {
 	NotifiedCIFail      bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
 	LastNotifiedStatus  string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
 	RetryCount          int           `json:"retry_count,omitempty"`
+	NextRetryAt         *time.Time    `json:"next_retry_at,omitempty"`
 	LastOutputHash      string        `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`
 	TokensUsed          int           `json:"tokens_used,omitempty"`    // cumulative tokens consumed by the worker
@@ -135,11 +136,19 @@ func (s *State) CountByStatus() map[SessionStatus]int {
 	return counts
 }
 
-// IssueInProgress returns true if the given issue is already being handled
+// IssueInProgress returns true if the given issue is already being handled.
+// This includes dead sessions with a pending retry (NextRetryAt set) to prevent
+// duplicate worker spawns during backoff periods.
 func (s *State) IssueInProgress(issueNum int) bool {
 	for _, sess := range s.Sessions {
-		if sess.IssueNumber == issueNum &&
-			(sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued) {
+		if sess.IssueNumber != issueNum {
+			continue
+		}
+		if sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued {
+			return true
+		}
+		// Dead session with pending retry — still in progress
+		if sess.Status == StatusDead && sess.NextRetryAt != nil {
 			return true
 		}
 	}

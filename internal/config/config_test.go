@@ -990,3 +990,28 @@ max_concurrent_by_state:
 		t.Errorf("pr_open = %d, want 2 (key should be normalized to lowercase)", cfg.MaxConcurrentByState["pr_open"])
 	}
 }
+
+func TestParse_MaxRetryBackoffMsDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxRetryBackoffMs != 300000 {
+		t.Errorf("MaxRetryBackoffMs = %d, want 300000", cfg.MaxRetryBackoffMs)
+	}
+}
+
+func TestParse_MaxRetryBackoffMsExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+max_retry_backoff_ms: 60000
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxRetryBackoffMs != 60000 {
+		t.Errorf("MaxRetryBackoffMs = %d, want 60000", cfg.MaxRetryBackoffMs)
+	}
+}
