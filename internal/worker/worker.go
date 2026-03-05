@@ -60,6 +60,16 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		return "", fmt.Errorf("git worktree add: %w\n%s", err, out)
 	}
 
+	// Run after_create hook
+	hookEnv := HookEnv{
+		IssueID:       fmt.Sprintf("%s#%d", cfg.Repo, issue.Number),
+		IssueNumber:   issue.Number,
+		WorkspacePath: worktreePath,
+	}
+	if err := RunHook(cfg, "after_create", cfg.Hooks.AfterCreate, hookEnv); err != nil {
+		log.Printf("[worker] after_create hook failed: %v", err)
+	}
+
 	// Assemble worker prompt
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 
@@ -115,6 +125,11 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
 		return "", fmt.Errorf("write runner script: %w", err)
+	}
+
+	// Run before_run hook (fatal on failure)
+	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
+		return "", fmt.Errorf("before_run hook: %w", err)
 	}
 
 	// Start tmux session
@@ -173,6 +188,16 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		return fmt.Errorf("git worktree add: %w\n%s", err, out)
 	}
 
+	// Run after_create hook
+	hookEnv := HookEnv{
+		IssueID:       fmt.Sprintf("%s#%d", cfg.Repo, issue.Number),
+		IssueNumber:   issue.Number,
+		WorkspacePath: worktreePath,
+	}
+	if err := RunHook(cfg, "after_create", cfg.Hooks.AfterCreate, hookEnv); err != nil {
+		log.Printf("[worker] after_create hook failed: %v", err)
+	}
+
 	// Assemble worker prompt
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 
@@ -227,6 +252,11 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		return fmt.Errorf("write runner script: %w", err)
 	}
 
+	// Run before_run hook (fatal on failure)
+	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
+		return fmt.Errorf("before_run hook: %w", err)
+	}
+
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
 	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
@@ -278,6 +308,18 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 		proc, _ := os.FindProcess(sess.PID)
 		if err := proc.Kill(); err != nil {
 			log.Printf("[worker] kill pid %d: %v", sess.PID, err)
+		}
+	}
+
+	// Run before_remove hook
+	if sess.Worktree != "" {
+		hookEnv := HookEnv{
+			IssueID:       fmt.Sprintf("%s#%d", cfg.Repo, sess.IssueNumber),
+			IssueNumber:   sess.IssueNumber,
+			WorkspacePath: sess.Worktree,
+		}
+		if err := RunHook(cfg, "before_remove", cfg.Hooks.BeforeRemove, hookEnv); err != nil {
+			log.Printf("[worker] before_remove hook failed: %v", err)
 		}
 	}
 

@@ -59,6 +59,15 @@ type ServerConfig struct {
 	Port int `yaml:"port"` // 0 = disabled (default)
 }
 
+// HooksConfig holds lifecycle hook scripts that run at key points.
+type HooksConfig struct {
+	AfterCreate  string `yaml:"after_create"`  // runs once when a new issue workspace is first created
+	BeforeRun    string `yaml:"before_run"`    // runs before each agent attempt (fatal on failure)
+	AfterRun     string `yaml:"after_run"`     // runs after each agent attempt (logged, not fatal)
+	BeforeRemove string `yaml:"before_remove"` // runs before workspace cleanup (logged, not fatal)
+	TimeoutMs    int    `yaml:"timeout_ms"`    // timeout for hook execution in milliseconds (default: 60000)
+}
+
 type Config struct {
 	Server                     ServerConfig         `yaml:"server"`
 	Repo                       string               `yaml:"repo"`
@@ -92,6 +101,7 @@ type Config struct {
 	MaxRetryBackoffMs          int                  `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
+	Hooks                      HooksConfig          `yaml:"hooks"`
 	BlockerPatterns            []string             `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
 	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
 	SourcePath                 string               `yaml:"-"`                          // path the config was loaded from (not serialized)
@@ -283,6 +293,11 @@ func parse(data []byte) (*Config, error) {
 	}
 	if cfg.MergeIntervalSeconds <= 0 {
 		cfg.MergeIntervalSeconds = 30
+	}
+
+	// Default hooks timeout
+	if cfg.Hooks.TimeoutMs <= 0 {
+		cfg.Hooks.TimeoutMs = 60000
 	}
 
 	return cfg, nil
