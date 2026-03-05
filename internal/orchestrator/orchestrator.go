@@ -201,6 +201,21 @@ func (o *Orchestrator) isRateLimited(logFile string) bool {
 	return worker.IsRateLimited(logFile)
 }
 
+// runAfterRunHook executes the after_run hook for a session (best-effort, never fatal).
+func (o *Orchestrator) runAfterRunHook(sess *state.Session) {
+	if o.cfg.Hooks.AfterRun == "" {
+		return
+	}
+	env := worker.HookEnv{
+		IssueID:       fmt.Sprintf("%s#%d", o.cfg.Repo, sess.IssueNumber),
+		IssueNumber:   sess.IssueNumber,
+		WorkspacePath: sess.Worktree,
+	}
+	if err := worker.RunHook(o.cfg, "after_run", o.cfg.Hooks.AfterRun, env); err != nil {
+		log.Printf("[orch] after_run hook failed for issue #%d: %v", sess.IssueNumber, err)
+	}
+}
+
 // nextFallbackBackend returns the next untried backend from the fallback list.
 // It skips backends that are already in sess.TriedBackends or match the current backend.
 // Returns "" if no fallback is available.
@@ -608,6 +623,12 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		(*ticker).Reset(newInterval)
 	}
 
+	// Hot-reload hooks config
+	if newCfg.Hooks != old.Hooks {
+		changed = append(changed, "hooks")
+		o.cfg.Hooks = newCfg.Hooks
+	}
+
 	if len(changed) == 0 {
 		log.Printf("[orch] config reloaded — no effective changes")
 		return
@@ -781,6 +802,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if process is still alive
 			if sess.PID > 0 && !o.pidAlive(sess.PID) {
+				// Worker process died — run after_run hook
+				o.runAfterRunHook(sess)
+
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
@@ -880,6 +904,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if !sess.RateLimitHit && sess.LastNotifiedStatus != "rate_limit" {
 						if hit, pattern := worker.DetectRateLimit(output); hit {
 							log.Printf("[orch] worker %s hit rate limit (pattern=%s), stopping", slotName, pattern)
+							o.runAfterRunHook(sess)
 							if err := o.stopWorker(slotName, sess); err != nil {
 								log.Printf("[orch] warn: could not stop rate-limited worker %s: %v", slotName, err)
 							}
@@ -933,6 +958,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsed > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
 						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
 							slotName, sess.TokensUsed, o.cfg.WorkerMaxTokens)
+						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
 						}
@@ -957,6 +983,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							timeout := time.Duration(o.cfg.WorkerSilentTimeoutMinutes) * time.Minute
 							if time.Since(sess.LastOutputChangedAt) > timeout {
 								log.Printf("[orch] worker %s silent for >%dm, killing", slotName, o.cfg.WorkerSilentTimeoutMinutes)
+								o.runAfterRunHook(sess)
 								if err := o.stopWorker(slotName, sess); err != nil {
 									log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
 								}
@@ -1000,6 +1027,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					logTail = fmt.Sprintf("(could not read log file %s: %v)", sess.LogFile, err)
 				}
 
+				o.runAfterRunHook(sess)
 				if err := o.stopWorker(slotName, sess); err != nil {
 					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
 				}

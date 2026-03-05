@@ -991,6 +991,7 @@ max_concurrent_by_state:
 	}
 }
 
+
 func TestParse_MaxRetryBackoffMsDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
@@ -1013,5 +1014,79 @@ max_retry_backoff_ms: 60000
 	}
 	if cfg.MaxRetryBackoffMs != 60000 {
 		t.Errorf("MaxRetryBackoffMs = %d, want 60000", cfg.MaxRetryBackoffMs)
+	}
+}
+
+func TestParse_HooksDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Hooks.AfterCreate != "" {
+		t.Errorf("Hooks.AfterCreate = %q, want empty", cfg.Hooks.AfterCreate)
+	}
+	if cfg.Hooks.BeforeRun != "" {
+		t.Errorf("Hooks.BeforeRun = %q, want empty", cfg.Hooks.BeforeRun)
+	}
+	if cfg.Hooks.AfterRun != "" {
+		t.Errorf("Hooks.AfterRun = %q, want empty", cfg.Hooks.AfterRun)
+	}
+	if cfg.Hooks.BeforeRemove != "" {
+		t.Errorf("Hooks.BeforeRemove = %q, want empty", cfg.Hooks.BeforeRemove)
+	}
+	if cfg.Hooks.TimeoutMs != 60000 {
+		t.Errorf("Hooks.TimeoutMs = %d, want 60000", cfg.Hooks.TimeoutMs)
+	}
+}
+
+func TestParse_HooksExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+hooks:
+  after_create: |
+    git clone https://github.com/example/repo .
+    bun install
+  before_run: |
+    git fetch origin && git merge origin/main --ff-only || true
+  after_run: |
+    echo "Agent finished for $ISSUE_ID"
+  before_remove: |
+    echo "Cleaning up"
+  timeout_ms: 30000
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Hooks.AfterCreate == "" {
+		t.Error("Hooks.AfterCreate should not be empty")
+	}
+	if cfg.Hooks.BeforeRun == "" {
+		t.Error("Hooks.BeforeRun should not be empty")
+	}
+	if cfg.Hooks.AfterRun == "" {
+		t.Error("Hooks.AfterRun should not be empty")
+	}
+	if cfg.Hooks.BeforeRemove == "" {
+		t.Error("Hooks.BeforeRemove should not be empty")
+	}
+	if cfg.Hooks.TimeoutMs != 30000 {
+		t.Errorf("Hooks.TimeoutMs = %d, want 30000", cfg.Hooks.TimeoutMs)
+	}
+}
+
+func TestParse_HooksTimeoutDefault(t *testing.T) {
+	yaml := `
+repo: owner/repo
+hooks:
+  after_create: "echo hello"
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Hooks.TimeoutMs != 60000 {
+		t.Errorf("Hooks.TimeoutMs = %d, want 60000 (default)", cfg.Hooks.TimeoutMs)
 	}
 }
