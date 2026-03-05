@@ -59,6 +59,7 @@ type Config struct {
 	LocalPath                  string           `yaml:"local_path"`
 	WorktreeBase               string           `yaml:"worktree_base"`
 	MaxParallel                int              `yaml:"max_parallel"`
+	MaxConcurrentByState       map[string]int   `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
 	MaxRuntimeMinutes          int              `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes int              `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
 	WorkerMaxTokens            int              `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
@@ -139,6 +140,15 @@ func parse(data []byte) (*Config, error) {
 
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
+	}
+
+	// Normalize max_concurrent_by_state keys: trim + lowercase
+	if len(cfg.MaxConcurrentByState) > 0 {
+		normalized := make(map[string]int, len(cfg.MaxConcurrentByState))
+		for k, v := range cfg.MaxConcurrentByState {
+			normalized[strings.ToLower(strings.TrimSpace(k))] = v
+		}
+		cfg.MaxConcurrentByState = normalized
 	}
 
 	// Merge deprecated issue_label into issue_labels (OR filter)

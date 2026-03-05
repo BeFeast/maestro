@@ -861,3 +861,59 @@ model:
 		}
 	}
 }
+
+func TestParse_MaxConcurrentByStateDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.MaxConcurrentByState) != 0 {
+		t.Errorf("MaxConcurrentByState = %v, want empty", cfg.MaxConcurrentByState)
+	}
+}
+
+func TestParse_MaxConcurrentByStateExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+max_concurrent_by_state:
+  running: 5
+  pr_open: 2
+  queued: 3
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.MaxConcurrentByState) != 3 {
+		t.Fatalf("MaxConcurrentByState has %d entries, want 3", len(cfg.MaxConcurrentByState))
+	}
+	if cfg.MaxConcurrentByState["running"] != 5 {
+		t.Errorf("running = %d, want 5", cfg.MaxConcurrentByState["running"])
+	}
+	if cfg.MaxConcurrentByState["pr_open"] != 2 {
+		t.Errorf("pr_open = %d, want 2", cfg.MaxConcurrentByState["pr_open"])
+	}
+	if cfg.MaxConcurrentByState["queued"] != 3 {
+		t.Errorf("queued = %d, want 3", cfg.MaxConcurrentByState["queued"])
+	}
+}
+
+func TestParse_MaxConcurrentByStateNormalizesKeys(t *testing.T) {
+	yaml := `
+repo: owner/repo
+max_concurrent_by_state:
+  "  Running  ": 5
+  "PR_OPEN": 2
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MaxConcurrentByState["running"] != 5 {
+		t.Errorf("running = %d, want 5 (key should be normalized to lowercase+trimmed)", cfg.MaxConcurrentByState["running"])
+	}
+	if cfg.MaxConcurrentByState["pr_open"] != 2 {
+		t.Errorf("pr_open = %d, want 2 (key should be normalized to lowercase)", cfg.MaxConcurrentByState["pr_open"])
+	}
+}

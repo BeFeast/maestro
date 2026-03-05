@@ -380,7 +380,7 @@ func (o *Orchestrator) RunOnce() error {
 
 	// Step 5: Start new workers for available slots
 	active := len(s.ActiveSessions())
-	slots := o.cfg.MaxParallel - active
+	slots := availableSlots(o.cfg, s, active)
 	log.Printf("[orch] active=%d max=%d available_slots=%d", active, o.cfg.MaxParallel, slots)
 
 	if slots > 0 {
@@ -1167,6 +1167,33 @@ func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Ses
 func (o *Orchestrator) resolveBackend(issue github.Issue) string {
 	name, _ := o.router.ResolveBackend(issue)
 	return name
+}
+
+// availableSlots calculates how many new workers can be started, considering
+// both the global max_parallel limit and per-state limits from max_concurrent_by_state.
+// New workers enter the "running" state, so the "running" per-state limit is applied.
+func availableSlots(cfg *config.Config, s *state.State, active int) int {
+	slots := cfg.MaxParallel - active
+	if slots <= 0 {
+		return 0
+	}
+
+	// Apply per-state limit for "running" — new workers enter running state
+	if limit, ok := cfg.MaxConcurrentByState["running"]; ok && limit > 0 {
+		statusCounts := s.CountByStatus()
+		runningCount := statusCounts[state.StatusRunning]
+		runningSlots := limit - runningCount
+		if runningSlots < slots {
+			log.Printf("[orch] per-state limit: running=%d max_running=%d (capped from %d to %d slots)",
+				runningCount, limit, slots, runningSlots)
+			slots = runningSlots
+		}
+	}
+
+	if slots < 0 {
+		return 0
+	}
+	return slots
 }
 
 // startNewWorkers picks eligible issues and starts workers for them
