@@ -22,6 +22,7 @@ import (
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/router"
+	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/watch"
@@ -242,8 +243,21 @@ func runCmd(args []string) {
 		if err := orch.LoadPromptBase(*promptPath); err != nil {
 			log.Printf("warn: load prompt: %v", err)
 		}
+
+		refreshCh := make(chan struct{}, 1)
+
+		// Start HTTP server if configured
+		if cfg.Server.Port > 0 {
+			srv := server.New(cfg, refreshCh)
+			go func() {
+				if err := srv.Start(context.Background()); err != nil {
+					log.Printf("[server] error: %v", err)
+				}
+			}()
+		}
+
 		log.Printf("starting maestro — repo=%s prefix=%s interval=%s once=%v", cfg.Repo, cfg.SessionPrefix, *interval, *once)
-		if err := orch.Run(context.Background(), *interval, *once); err != nil {
+		if err := orch.Run(context.Background(), *interval, *once, refreshCh); err != nil {
 			log.Fatalf("run: %v", err)
 		}
 		return
@@ -272,8 +286,21 @@ func runCmd(args []string) {
 			if err := orch.LoadPromptBase(*promptPath); err != nil {
 				log.Printf("[%s] warn: load prompt: %v", c.SessionPrefix, err)
 			}
+
+			refreshCh := make(chan struct{}, 1)
+
+			// Start HTTP server if configured
+			if c.Server.Port > 0 {
+				srv := server.New(c, refreshCh)
+				go func() {
+					if err := srv.Start(ctx); err != nil {
+						log.Printf("[%s][server] error: %v", c.SessionPrefix, err)
+					}
+				}()
+			}
+
 			log.Printf("[%s] starting — repo=%s interval=%s once=%v", c.SessionPrefix, c.Repo, *interval, *once)
-			if err := orch.Run(ctx, *interval, *once); err != nil {
+			if err := orch.Run(ctx, *interval, *once, refreshCh); err != nil {
 				log.Printf("[%s] run error: %v", c.SessionPrefix, err)
 			}
 		}(cfg)

@@ -26,7 +26,7 @@ type BackendDef struct {
 
 // ModelConfig holds multi-backend configuration.
 type ModelConfig struct {
-	Default          string                `yaml:"default"`           // "claude", "codex", etc.
+	Default          string                `yaml:"default"` // "claude", "codex", etc.
 	Backends         map[string]BackendDef `yaml:"backends"`
 	FallbackBackends []string              `yaml:"fallback_backends"` // ordered list of backends to try when rate-limited
 }
@@ -48,7 +48,13 @@ type RoutingConfig struct {
 	RouterPrompt    string `yaml:"router_prompt"`     // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
 }
 
+// ServerConfig controls the optional HTTP API server.
+type ServerConfig struct {
+	Port int `yaml:"port"` // 0 = disabled (default)
+}
+
 type Config struct {
+	Server                     ServerConfig     `yaml:"server"`
 	Repo                       string           `yaml:"repo"`
 	LocalPath                  string           `yaml:"local_path"`
 	WorktreeBase               string           `yaml:"worktree_base"`
