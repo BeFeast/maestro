@@ -698,6 +698,32 @@ merge_interval_seconds: 45
 	}
 }
 
+func TestParse_ServerPortDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Server.Port != 0 {
+		t.Errorf("Server.Port = %d, want 0 (disabled)", cfg.Server.Port)
+	}
+}
+
+func TestParse_ServerPortExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+server:
+  port: 8765
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Server.Port != 8765 {
+		t.Errorf("Server.Port = %d, want 8765", cfg.Server.Port)
+	}
+}
+
 func TestParse_MergeConfigInvalidFallsBack(t *testing.T) {
 	yaml := `
 repo: owner/repo

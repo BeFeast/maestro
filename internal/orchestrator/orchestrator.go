@@ -401,7 +401,8 @@ func (o *Orchestrator) RunOnce() error {
 
 // Run loops with the given interval; if once=true, runs once and returns.
 // The context can be used to stop the loop (e.g. for multi-project shutdown).
-func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once bool) error {
+// An optional refreshCh triggers an immediate poll cycle when a value is received.
+func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once bool, refreshCh <-chan struct{}) error {
 	if err := o.RunOnce(); err != nil {
 		log.Printf("[orch] run error: %v", err)
 	}
@@ -416,6 +417,11 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 			log.Printf("[orch] shutting down (%s)", o.repo)
 			return nil
 		case <-ticker.C:
+			if err := o.RunOnce(); err != nil {
+				log.Printf("[orch] run error: %v", err)
+			}
+		case <-refreshCh:
+			log.Printf("[orch] refresh triggered via API")
 			if err := o.RunOnce(); err != nil {
 				log.Printf("[orch] run error: %v", err)
 			}
