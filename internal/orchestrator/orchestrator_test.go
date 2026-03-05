@@ -3998,3 +3998,30 @@ func TestIssueInProgress_DeadWithoutRetry(t *testing.T) {
 		t.Fatal("IssueInProgress should return false for dead session without pending retry")
 	}
 }
+
+// --- syncProject tests ---
+
+func TestSyncProject_DisabledByDefault(t *testing.T) {
+	// When github_projects is not enabled, syncProject should be a no-op (not panic)
+	o := &Orchestrator{
+		cfg: &config.Config{Repo: "owner/repo"},
+		gh:  github.New("owner/repo"),
+	}
+	// Should not panic or make any API calls
+	o.syncProject(42, github.ProjectStatusInProgress)
+}
+
+func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo: "owner/repo",
+			GitHubProjects: config.GitHubProjectsConfig{
+				Enabled:       true,
+				ProjectNumber: 0, // not set
+			},
+		},
+		gh: github.New("owner/repo"),
+	}
+	// Should not panic or make any API calls
+	o.syncProject(42, github.ProjectStatusInProgress)
+}
