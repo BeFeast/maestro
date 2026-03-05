@@ -51,6 +51,9 @@ type Orchestrator struct {
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
 	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
 
+	// Config hot-reload channel (nil = disabled, safe in select)
+	configReloadCh <-chan *config.Config
+
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn         func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
@@ -399,6 +402,12 @@ func (o *Orchestrator) RunOnce() error {
 	return nil
 }
 
+// SetConfigReloadCh sets the channel used to receive hot-reloaded configs.
+// A nil channel is safe (select case is never chosen).
+func (o *Orchestrator) SetConfigReloadCh(ch <-chan *config.Config) {
+	o.configReloadCh = ch
+}
+
 // Run loops with the given interval; if once=true, runs once and returns.
 // The context can be used to stop the loop (e.g. for multi-project shutdown).
 // An optional refreshCh triggers an immediate poll cycle when a value is received.
@@ -425,8 +434,118 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 			if err := o.RunOnce(); err != nil {
 				log.Printf("[orch] run error: %v", err)
 			}
+		case newCfg := <-o.configReloadCh:
+			o.reloadConfig(newCfg, &ticker)
 		}
 	}
+}
+
+// reloadConfig applies non-destructive config changes at runtime.
+// Fields that require a restart (repo, model.default) are logged as warnings.
+func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker) {
+	old := o.cfg
+	var changed []string
+
+	// Restart-required fields — warn only, do not apply
+	if newCfg.Repo != old.Repo {
+		log.Printf("[orch] config reload: repo changed (%s → %s) — requires restart", old.Repo, newCfg.Repo)
+	}
+	if newCfg.Model.Default != old.Model.Default {
+		log.Printf("[orch] config reload: model.default changed (%s → %s) — requires restart", old.Model.Default, newCfg.Model.Default)
+	}
+
+	// Hot-reloadable fields
+	if newCfg.MaxParallel != old.MaxParallel {
+		changed = append(changed, fmt.Sprintf("max_parallel: %d→%d", old.MaxParallel, newCfg.MaxParallel))
+		o.cfg.MaxParallel = newCfg.MaxParallel
+	}
+	if newCfg.MaxRuntimeMinutes != old.MaxRuntimeMinutes {
+		changed = append(changed, fmt.Sprintf("max_runtime_minutes: %d→%d", old.MaxRuntimeMinutes, newCfg.MaxRuntimeMinutes))
+		o.cfg.MaxRuntimeMinutes = newCfg.MaxRuntimeMinutes
+	}
+	if newCfg.MaxRetriesPerIssue != old.MaxRetriesPerIssue {
+		changed = append(changed, fmt.Sprintf("max_retries_per_issue: %d→%d", old.MaxRetriesPerIssue, newCfg.MaxRetriesPerIssue))
+		o.cfg.MaxRetriesPerIssue = newCfg.MaxRetriesPerIssue
+	}
+	if newCfg.WorkerSilentTimeoutMinutes != old.WorkerSilentTimeoutMinutes {
+		changed = append(changed, fmt.Sprintf("worker_silent_timeout_minutes: %d→%d", old.WorkerSilentTimeoutMinutes, newCfg.WorkerSilentTimeoutMinutes))
+		o.cfg.WorkerSilentTimeoutMinutes = newCfg.WorkerSilentTimeoutMinutes
+	}
+	if newCfg.WorkerMaxTokens != old.WorkerMaxTokens {
+		changed = append(changed, fmt.Sprintf("worker_max_tokens: %d→%d", old.WorkerMaxTokens, newCfg.WorkerMaxTokens))
+		o.cfg.WorkerMaxTokens = newCfg.WorkerMaxTokens
+	}
+	if !strSliceEqual(newCfg.IssueLabels, old.IssueLabels) {
+		changed = append(changed, fmt.Sprintf("issue_labels: %v→%v", old.IssueLabels, newCfg.IssueLabels))
+		o.cfg.IssueLabels = newCfg.IssueLabels
+	}
+	if !strSliceEqual(newCfg.ExcludeLabels, old.ExcludeLabels) {
+		changed = append(changed, fmt.Sprintf("exclude_labels: %v→%v", old.ExcludeLabels, newCfg.ExcludeLabels))
+		o.cfg.ExcludeLabels = newCfg.ExcludeLabels
+	}
+	if newCfg.MergeStrategy != old.MergeStrategy {
+		changed = append(changed, fmt.Sprintf("merge_strategy: %s→%s", old.MergeStrategy, newCfg.MergeStrategy))
+		o.cfg.MergeStrategy = newCfg.MergeStrategy
+	}
+	if newCfg.MergeIntervalSeconds != old.MergeIntervalSeconds {
+		changed = append(changed, fmt.Sprintf("merge_interval_seconds: %d→%d", old.MergeIntervalSeconds, newCfg.MergeIntervalSeconds))
+		o.cfg.MergeIntervalSeconds = newCfg.MergeIntervalSeconds
+	}
+	if newCfg.DeployCmd != old.DeployCmd {
+		changed = append(changed, fmt.Sprintf("deploy_cmd: %q→%q", old.DeployCmd, newCfg.DeployCmd))
+		o.cfg.DeployCmd = newCfg.DeployCmd
+	}
+	if newCfg.DeployTimeoutMinutes != old.DeployTimeoutMinutes {
+		changed = append(changed, fmt.Sprintf("deploy_timeout_minutes: %d→%d", old.DeployTimeoutMinutes, newCfg.DeployTimeoutMinutes))
+		o.cfg.DeployTimeoutMinutes = newCfg.DeployTimeoutMinutes
+	}
+	if newCfg.AutoRebase != old.AutoRebase {
+		changed = append(changed, fmt.Sprintf("auto_rebase: %v→%v", old.AutoRebase, newCfg.AutoRebase))
+		o.cfg.AutoRebase = newCfg.AutoRebase
+	}
+
+	// Reload prompt files if paths changed
+	if newCfg.WorkerPrompt != old.WorkerPrompt {
+		changed = append(changed, fmt.Sprintf("worker_prompt: %q→%q", old.WorkerPrompt, newCfg.WorkerPrompt))
+		o.cfg.WorkerPrompt = newCfg.WorkerPrompt
+		o.LoadPromptBase("")
+	}
+	if newCfg.BugPrompt != old.BugPrompt {
+		changed = append(changed, fmt.Sprintf("bug_prompt: %q→%q", old.BugPrompt, newCfg.BugPrompt))
+		o.cfg.BugPrompt = newCfg.BugPrompt
+		o.LoadPromptBase("")
+	}
+	if newCfg.EnhancementPrompt != old.EnhancementPrompt {
+		changed = append(changed, fmt.Sprintf("enhancement_prompt: %q→%q", old.EnhancementPrompt, newCfg.EnhancementPrompt))
+		o.cfg.EnhancementPrompt = newCfg.EnhancementPrompt
+		o.LoadPromptBase("")
+	}
+
+	// Poll interval change — reset the ticker
+	if newCfg.PollIntervalSeconds != old.PollIntervalSeconds && newCfg.PollIntervalSeconds > 0 {
+		newInterval := time.Duration(newCfg.PollIntervalSeconds) * time.Second
+		changed = append(changed, fmt.Sprintf("poll_interval_seconds: %d→%d", old.PollIntervalSeconds, newCfg.PollIntervalSeconds))
+		o.cfg.PollIntervalSeconds = newCfg.PollIntervalSeconds
+		(*ticker).Reset(newInterval)
+	}
+
+	if len(changed) == 0 {
+		log.Printf("[orch] config reloaded — no effective changes")
+		return
+	}
+	log.Printf("[orch] config reloaded — changed: %s", strings.Join(changed, ", "))
+}
+
+func strSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // reconcileRunningSessions self-heals stale "running" sessions.

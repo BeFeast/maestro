@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -3255,14 +3256,11 @@ func TestAvailableSlots_RunningLimitCapsSlots(t *testing.T) {
 		MaxConcurrentByState: map[string]int{"running": 3},
 	}
 	s := state.NewState()
-	// 2 running, 2 pr_open = 4 active
 	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
 	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
 	s.Sessions["slot-3"] = &state.Session{Status: state.StatusPROpen}
 	s.Sessions["slot-4"] = &state.Session{Status: state.StatusPROpen}
 
-	// Global: 10 - 4 = 6 slots
-	// Per-state running: 3 - 2 = 1 slot (more restrictive)
 	got := availableSlots(cfg, s, 4)
 	if got != 1 {
 		t.Errorf("availableSlots() = %d, want 1 (running limit should cap)", got)
@@ -3275,7 +3273,6 @@ func TestAvailableSlots_RunningLimitExceeded(t *testing.T) {
 		MaxConcurrentByState: map[string]int{"running": 2},
 	}
 	s := state.NewState()
-	// 3 running, exceeds limit of 2
 	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
 	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
 	s.Sessions["slot-3"] = &state.Session{Status: state.StatusRunning}
@@ -3292,14 +3289,11 @@ func TestAvailableSlots_GlobalLimitMoreRestrictive(t *testing.T) {
 		MaxConcurrentByState: map[string]int{"running": 10},
 	}
 	s := state.NewState()
-	// 3 running, 1 pr_open = 4 active
 	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
 	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
 	s.Sessions["slot-3"] = &state.Session{Status: state.StatusRunning}
 	s.Sessions["slot-4"] = &state.Session{Status: state.StatusPROpen}
 
-	// Global: 5 - 4 = 1 slot
-	// Per-state running: 10 - 3 = 7 (less restrictive)
 	got := availableSlots(cfg, s, 4)
 	if got != 1 {
 		t.Errorf("availableSlots() = %d, want 1 (global limit should cap)", got)
@@ -3329,19 +3323,16 @@ func TestAvailableSlots_TerminalSessionsIgnored(t *testing.T) {
 	}
 	s := state.NewState()
 	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
-	s.Sessions["slot-2"] = &state.Session{Status: state.StatusDone}   // terminal
-	s.Sessions["slot-3"] = &state.Session{Status: state.StatusFailed} // terminal
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusDone}
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusFailed}
 
-	// Only 1 active (running), terminal sessions don't count
 	got := availableSlots(cfg, s, 1)
-	// Global: 10 - 1 = 9, per-state running: 3 - 1 = 2
 	if got != 2 {
 		t.Errorf("availableSlots() = %d, want 2", got)
 	}
 }
 
 func TestAvailableSlots_NonRunningLimitIgnoredForDispatch(t *testing.T) {
-	// pr_open limit shouldn't affect how many new workers can start
 	cfg := &config.Config{
 		MaxParallel:          10,
 		MaxConcurrentByState: map[string]int{"pr_open": 1},
@@ -3351,8 +3342,6 @@ func TestAvailableSlots_NonRunningLimitIgnoredForDispatch(t *testing.T) {
 	s.Sessions["slot-2"] = &state.Session{Status: state.StatusPROpen}
 	s.Sessions["slot-3"] = &state.Session{Status: state.StatusPROpen}
 
-	// Global: 10 - 3 = 7
-	// No running limit configured, so all 7 available
 	got := availableSlots(cfg, s, 3)
 	if got != 7 {
 		t.Errorf("availableSlots() = %d, want 7 (pr_open limit shouldn't affect dispatch)", got)
@@ -3473,5 +3462,215 @@ func TestStartNewWorkers_NoPatternsNoBlockerCheck(t *testing.T) {
 	// Should dispatch because blocker_patterns is empty (feature disabled)
 	if len(*started) != 1 {
 		t.Fatalf("started %d workers, want 1 (no patterns = no check)", len(*started))
+	}
+}
+
+func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxParallel:        5,
+		MaxRuntimeMinutes:  120,
+		MaxRetriesPerIssue: 3,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", ""),
+		router:   router.New(cfg),
+	}
+
+	newCfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxParallel:        10,
+		MaxRuntimeMinutes:  60,
+		MaxRetriesPerIssue: 5,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(newCfg, &ticker)
+
+	if o.cfg.MaxParallel != 10 {
+		t.Errorf("MaxParallel = %d, want 10", o.cfg.MaxParallel)
+	}
+	if o.cfg.MaxRuntimeMinutes != 60 {
+		t.Errorf("MaxRuntimeMinutes = %d, want 60", o.cfg.MaxRuntimeMinutes)
+	}
+	if o.cfg.MaxRetriesPerIssue != 5 {
+		t.Errorf("MaxRetriesPerIssue = %d, want 5", o.cfg.MaxRetriesPerIssue)
+	}
+}
+
+func TestReloadConfig_PollIntervalChange(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                "owner/repo",
+		PollIntervalSeconds: 600,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", ""),
+		router:   router.New(cfg),
+	}
+
+	newCfg := &config.Config{
+		Repo:                "owner/repo",
+		PollIntervalSeconds: 300,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(newCfg, &ticker)
+
+	if o.cfg.PollIntervalSeconds != 300 {
+		t.Errorf("PollIntervalSeconds = %d, want 300", o.cfg.PollIntervalSeconds)
+	}
+}
+
+func TestReloadConfig_NoChanges(t *testing.T) {
+	cfg := &config.Config{
+		Repo:        "owner/repo",
+		MaxParallel: 5,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", ""),
+		router:   router.New(cfg),
+	}
+
+	newCfg := &config.Config{
+		Repo:        "owner/repo",
+		MaxParallel: 5,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	// Should not panic or change anything
+	o.reloadConfig(newCfg, &ticker)
+
+	if o.cfg.MaxParallel != 5 {
+		t.Errorf("MaxParallel = %d, want 5 (unchanged)", o.cfg.MaxParallel)
+	}
+}
+
+func TestReloadConfig_IssueLabelsUpdated(t *testing.T) {
+	cfg := &config.Config{
+		Repo:        "owner/repo",
+		IssueLabels: []string{"bug"},
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", ""),
+		router:   router.New(cfg),
+	}
+
+	newCfg := &config.Config{
+		Repo:        "owner/repo",
+		IssueLabels: []string{"bug", "enhancement"},
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(newCfg, &ticker)
+
+	if len(o.cfg.IssueLabels) != 2 || o.cfg.IssueLabels[1] != "enhancement" {
+		t.Errorf("IssueLabels = %v, want [bug enhancement]", o.cfg.IssueLabels)
+	}
+}
+
+func TestReloadConfig_PromptPathReload(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := dir + "/prompt.md"
+	os.WriteFile(promptFile, []byte("new prompt content"), 0644)
+
+	cfg := &config.Config{
+		Repo:         "owner/repo",
+		WorkerPrompt: "/old/path.md",
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+	o := &Orchestrator{
+		cfg:        cfg,
+		repo:       cfg.Repo,
+		promptBase: "old prompt",
+		notifier:   notify.NewWithToken("", "", ""),
+		router:     router.New(cfg),
+	}
+
+	newCfg := &config.Config{
+		Repo:         "owner/repo",
+		WorkerPrompt: promptFile,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(newCfg, &ticker)
+
+	if o.cfg.WorkerPrompt != promptFile {
+		t.Errorf("WorkerPrompt = %q, want %q", o.cfg.WorkerPrompt, promptFile)
+	}
+	if o.promptBase != "new prompt content" {
+		t.Errorf("promptBase = %q, want %q", o.promptBase, "new prompt content")
+	}
+}
+
+func TestStrSliceEqual(t *testing.T) {
+	tests := []struct {
+		a, b []string
+		want bool
+	}{
+		{nil, nil, true},
+		{[]string{}, []string{}, true},
+		{[]string{"a"}, []string{"a"}, true},
+		{[]string{"a", "b"}, []string{"a", "b"}, true},
+		{[]string{"a"}, []string{"b"}, false},
+		{[]string{"a"}, []string{"a", "b"}, false},
+		{nil, []string{"a"}, false},
+	}
+	for _, tt := range tests {
+		got := strSliceEqual(tt.a, tt.b)
+		if got != tt.want {
+			t.Errorf("strSliceEqual(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
 	}
 }
