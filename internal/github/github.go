@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -427,6 +428,34 @@ func (c *Client) HasOpenPRForIssue(issueNumber int) (bool, error) {
 		return false, fmt.Errorf("parse pr search results: %w", err)
 	}
 	return len(prs) > 0, nil
+}
+
+// FindBlockers scans an issue body for blocker references matching the given
+// regex patterns. Each pattern must contain a capture group for the issue number.
+// Returns deduplicated issue numbers referenced as blockers.
+func FindBlockers(body string, patterns []string) []int {
+	seen := make(map[int]struct{})
+	var blockers []int
+	for _, pat := range patterns {
+		re, err := regexp.Compile("(?i)" + pat)
+		if err != nil {
+			continue
+		}
+		for _, match := range re.FindAllStringSubmatch(body, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			n, err := strconv.Atoi(match[1])
+			if err != nil || n <= 0 {
+				continue
+			}
+			if _, ok := seen[n]; !ok {
+				seen[n] = struct{}{}
+				blockers = append(blockers, n)
+			}
+		}
+	}
+	return blockers
 }
 
 // HasLabel returns true if any of the issue's labels match

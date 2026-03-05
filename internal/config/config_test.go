@@ -724,6 +724,39 @@ server:
 	}
 }
 
+func TestParse_BlockerPatternsDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.BlockerPatterns) != 0 {
+		t.Errorf("BlockerPatterns = %v, want empty (disabled by default)", cfg.BlockerPatterns)
+	}
+}
+
+func TestParse_BlockerPatternsExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+blocker_patterns:
+  - "blocked by #(\\d+)"
+  - "depends on #(\\d+)"
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.BlockerPatterns) != 2 {
+		t.Fatalf("BlockerPatterns length = %d, want 2", len(cfg.BlockerPatterns))
+	}
+	if cfg.BlockerPatterns[0] != `blocked by #(\d+)` {
+		t.Errorf("BlockerPatterns[0] = %q, want %q", cfg.BlockerPatterns[0], `blocked by #(\d+)`)
+	}
+	if cfg.BlockerPatterns[1] != `depends on #(\d+)` {
+		t.Errorf("BlockerPatterns[1] = %q, want %q", cfg.BlockerPatterns[1], `depends on #(\d+)`)
+	}
+}
+
 func TestParse_MergeConfigInvalidFallsBack(t *testing.T) {
 	yaml := `
 repo: owner/repo
