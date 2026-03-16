@@ -6,6 +6,82 @@ import (
 	"testing"
 )
 
+func TestGreptileCheckDecision(t *testing.T) {
+	tests := []struct {
+		name        string
+		checks      []greptileCheckRun
+		wantFound   bool
+		wantApprove bool
+		wantPending bool
+	}{
+		{
+			name:        "success approves",
+			checks:      []greptileCheckRun{{Name: "Greptile Review", Conclusion: "success"}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
+			name:        "neutral approves",
+			checks:      []greptileCheckRun{{Name: "greptile", Conclusion: "neutral"}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
+			name:        "in progress is pending",
+			checks:      []greptileCheckRun{{Name: "Greptile Review", Status: "in_progress"}},
+			wantFound:   true,
+			wantPending: true,
+		},
+		{
+			name:      "failure blocks",
+			checks:    []greptileCheckRun{{Name: "Greptile Review", Conclusion: "failure"}},
+			wantFound: true,
+		},
+		{
+			name:   "non-greptile is ignored",
+			checks: []greptileCheckRun{{Name: "CI", Conclusion: "success"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotFound, gotApprove, gotPending := greptileCheckDecision(tt.checks)
+			if gotFound != tt.wantFound || gotApprove != tt.wantApprove || gotPending != tt.wantPending {
+				t.Fatalf("greptileCheckDecision() = (found=%v, approve=%v, pending=%v), want (%v, %v, %v)",
+					gotFound, gotApprove, gotPending, tt.wantFound, tt.wantApprove, tt.wantPending)
+			}
+		})
+	}
+}
+
+func TestHasGreptileInlineCommentOnHead(t *testing.T) {
+	makeComment := func(login, sha string) greptileReviewComment {
+		var c greptileReviewComment
+		c.CommitID = sha
+		c.User.Login = login
+		return c
+	}
+
+	comments := []greptileReviewComment{
+		makeComment("greptile-apps[bot]", "head-sha"),
+		makeComment("chatgpt-codex-connector[bot]", "head-sha"),
+		makeComment("greptile-apps[bot]", "old-sha"),
+	}
+
+	if !hasGreptileInlineCommentOnHead(comments, "head-sha") {
+		t.Fatal("expected greptile inline comment on current head to block")
+	}
+	if hasGreptileInlineCommentOnHead(comments, "different-sha") {
+		t.Fatal("did not expect greptile comment from another head to block")
+	}
+	if !isGreptileLogin("greptile-apps[bot]") {
+		t.Fatal("expected greptile login to be recognized")
+	}
+	if isGreptileLogin("chatgpt-codex-connector[bot]") {
+		t.Fatal("did not expect non-greptile login to be recognized")
+	}
+}
+
 func TestFindBlockers_BasicPattern(t *testing.T) {
 	body := "This issue is blocked by #42 and depends on #99."
 	patterns := []string{`blocked by #(\d+)`, `depends on #(\d+)`}

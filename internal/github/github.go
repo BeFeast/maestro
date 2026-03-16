@@ -9,6 +9,20 @@ import (
 	"strings"
 )
 
+type greptileCheckRun struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}
+
+type greptileReviewComment struct {
+	Body     string `json:"body"`
+	CommitID string `json:"commit_id"`
+	User     struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
 type Issue struct {
 	Number int    `json:"number"`
 	Title  string `json:"title"`
@@ -190,7 +204,8 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 //
 // Primary path: reads GitHub Check Runs for the PR's head SHA.
 //   - Looks for a check whose name contains "greptile" (case-insensitive).
-//   - conclusion == "success" or "neutral" → approved=true
+//   - conclusion == "success" or "neutral" only approves when there are no
+//     Greptile inline review comments on the current head SHA.
 //   - check found, other conclusion → approved=false, pending=false
 //   - check not found → falls through to comment-based fallback
 //
@@ -226,31 +241,29 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 
 	{
 		var checksData struct {
-			CheckRuns []struct {
-				Name       string `json:"name"`
-				Status     string `json:"status"`
-				Conclusion string `json:"conclusion"`
-			} `json:"check_runs"`
+			CheckRuns []greptileCheckRun `json:"check_runs"`
 		}
 		if err := json.Unmarshal(checksOut, &checksData); err != nil {
 			goto commentFallback
 		}
 
-		for _, cr := range checksData.CheckRuns {
-			if !strings.Contains(strings.ToLower(cr.Name), "greptile") {
-				continue
-			}
-			// Found a Greptile check run
-			// neutral = Greptile reviewed but no blocking issues; treat as passing
-			if cr.Conclusion == "success" || cr.Conclusion == "neutral" {
-				return true, false, nil
-			}
-			// Check is still running
-			if cr.Status == "in_progress" || cr.Status == "queued" || cr.Status == "waiting" || cr.Conclusion == "" {
+		found, approved, pending := greptileCheckDecision(checksData.CheckRuns)
+		if found {
+			if pending {
 				return false, true, nil
 			}
-			// Only failure and action_required should block merge
-			return false, false, nil
+			if !approved {
+				return false, false, nil
+			}
+
+			reviewComments, err := c.greptileReviewComments(prNumber)
+			if err != nil {
+				return false, false, fmt.Errorf("gh api pulls/%d/comments: %w", prNumber, err)
+			}
+			if hasGreptileInlineCommentOnHead(reviewComments, sha) {
+				return false, false, nil
+			}
+			return true, false, nil
 		}
 		// No greptile check run found → fall through to comment fallback
 	}
@@ -298,6 +311,53 @@ commentFallback:
 	}
 
 	return false, false, nil
+}
+
+func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved bool, pending bool) {
+	for _, cr := range checkRuns {
+		if !strings.Contains(strings.ToLower(cr.Name), "greptile") {
+			continue
+		}
+		found = true
+		if cr.Conclusion == "success" || cr.Conclusion == "neutral" {
+			return true, true, false
+		}
+		if cr.Status == "in_progress" || cr.Status == "queued" || cr.Status == "waiting" || cr.Conclusion == "" {
+			return true, false, true
+		}
+		return true, false, false
+	}
+	return false, false, false
+}
+
+func isGreptileLogin(login string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(login)), "greptile")
+}
+
+func hasGreptileInlineCommentOnHead(comments []greptileReviewComment, sha string) bool {
+	for _, comment := range comments {
+		if !isGreptileLogin(comment.User.Login) {
+			continue
+		}
+		if strings.TrimSpace(sha) == "" || strings.TrimSpace(comment.CommitID) == strings.TrimSpace(sha) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, error) {
+	out, err := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/pulls/%d/comments", c.Repo, prNumber),
+		"--paginate").Output()
+	if err != nil {
+		return nil, err
+	}
+	var comments []greptileReviewComment
+	if err := json.Unmarshal(out, &comments); err != nil {
+		return nil, err
+	}
+	return comments, nil
 }
 
 // MergePR squash-merges a PR
