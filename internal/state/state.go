@@ -213,6 +213,28 @@ func IsTerminal(status SessionStatus) bool {
 	return false
 }
 
+// StatusPriority returns a numeric priority for sorting sessions by status.
+// Lower values sort first: running (0), then queued/pending (1-2),
+// then terminal states (3+).
+func StatusPriority(status SessionStatus) int {
+	switch status {
+	case StatusRunning:
+		return 0
+	case StatusQueued:
+		return 1
+	case StatusPROpen:
+		return 2
+	case StatusDone:
+		return 3
+	case StatusFailed, StatusConflictFailed:
+		return 4
+	case StatusDead, StatusRetryExhausted:
+		return 5
+	default:
+		return 6
+	}
+}
+
 // CompletedSession is a Session paired with its slot name.
 type CompletedSession struct {
 	SlotName string

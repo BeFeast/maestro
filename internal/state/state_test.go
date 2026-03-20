@@ -696,3 +696,36 @@ func TestCountByStatus_Empty(t *testing.T) {
 		t.Errorf("expected empty map for empty state, got %v", counts)
 	}
 }
+
+func TestStatusPriority_Order(t *testing.T) {
+	// Verify running < queued < pr_open < done < failed < dead
+	if StatusPriority(StatusRunning) >= StatusPriority(StatusQueued) {
+		t.Error("running should sort before queued")
+	}
+	if StatusPriority(StatusQueued) >= StatusPriority(StatusPROpen) {
+		t.Error("queued should sort before pr_open")
+	}
+	if StatusPriority(StatusPROpen) >= StatusPriority(StatusDone) {
+		t.Error("pr_open should sort before done")
+	}
+	if StatusPriority(StatusDone) >= StatusPriority(StatusFailed) {
+		t.Error("done should sort before failed")
+	}
+	if StatusPriority(StatusFailed) >= StatusPriority(StatusDead) {
+		t.Error("failed should sort before dead")
+	}
+	if StatusPriority(StatusConflictFailed) != StatusPriority(StatusFailed) {
+		t.Error("conflict_failed should have same priority as failed")
+	}
+	if StatusPriority(StatusRetryExhausted) != StatusPriority(StatusDead) {
+		t.Error("retry_exhausted should have same priority as dead")
+	}
+}
+
+func TestStatusPriority_UnknownStatus(t *testing.T) {
+	// Unknown statuses should sort last
+	p := StatusPriority(SessionStatus("unknown"))
+	if p <= StatusPriority(StatusDead) {
+		t.Error("unknown status should sort after all known statuses")
+	}
+}
