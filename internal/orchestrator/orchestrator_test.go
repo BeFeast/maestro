@@ -3790,9 +3790,10 @@ func TestCheckSessions_DeadWorkerSchedulesRetryWithBackoff(t *testing.T) {
 
 func TestCheckSessions_AlreadyRetriedWorkerFails(t *testing.T) {
 	cfg := &config.Config{
-		Repo:              "owner/repo",
-		MaxRetryBackoffMs: 300000,
-		MaxRuntimeMinutes: 999,
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 1, // allow only 1 retry
 	}
 	labeled := make([]string, 0)
 	o := &Orchestrator{
@@ -3828,6 +3829,115 @@ func TestCheckSessions_AlreadyRetriedWorkerFails(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-11"]
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusFailed)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt should be nil for permanently failed session")
+	}
+	found := false
+	for _, label := range labeled {
+		if label == "blocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected 'blocked' label to be added on permanent failure")
+	}
+}
+
+func TestCheckSessions_RetryCountRespectsMaxRetriesPerIssue(t *testing.T) {
+	// With max_retries_per_issue=3, a worker that has retried once should
+	// schedule another retry (not permanently fail).
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 3,
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return false // worker is dead
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-retry"] = &state.Session{
+		IssueNumber: 200,
+		IssueTitle:  "multi-retry test",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-retry",
+		Branch:      "feat/mae-retry-200-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+		RetryCount:  1, // retried once, 2 more attempts allowed
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-retry"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (should schedule retry, not permanently fail)", sess.Status, state.StatusDead)
+	}
+	if sess.RetryCount != 2 {
+		t.Fatalf("retry_count = %d, want 2", sess.RetryCount)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set for scheduled retry")
+	}
+}
+
+func TestCheckSessions_RetryExhaustedAtMaxRetries(t *testing.T) {
+	// With max_retries_per_issue=3, a worker that has retried 3 times
+	// should permanently fail.
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 3,
+	}
+	labeled := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return false // worker is dead
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labeled = append(labeled, label)
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-exhausted"] = &state.Session{
+		IssueNumber: 201,
+		IssueTitle:  "exhausted retries",
+		Status:      state.StatusRunning,
+		PID:         5678,
+		TmuxSession: "maestro-mae-exhausted",
+		Branch:      "feat/mae-exhausted-201-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+		RetryCount:  3, // already retried max times
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-exhausted"]
 	if sess.Status != state.StatusFailed {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusFailed)
 	}

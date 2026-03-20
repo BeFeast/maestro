@@ -843,8 +843,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
 						slotName, sess.IssueNumber, sess.TriedBackends[len(sess.TriedBackends)-1], nextBackend)
-				} else if sess.RetryCount < 1 {
-					// First failure — schedule retry with exponential backoff
+				} else if o.cfg.MaxRetriesPerIssue == 0 || sess.RetryCount < o.cfg.MaxRetriesPerIssue {
+					// Retries remaining — schedule retry with exponential backoff
 					sess.RetryCount++
 					backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
@@ -857,8 +857,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) died, retry %d scheduled in %ds",
 						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
 				} else {
-					// Already retried — mark as permanently failed
-					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
+					// Retry budget exhausted — mark as permanently failed
+					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries (max_retries_per_issue=%d)", slotName, sess.PID, sess.RetryCount, o.cfg.MaxRetriesPerIssue)
 					if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 					}
@@ -866,7 +866,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
-					o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) permanently failed after %d retry.\nCheck log: %s",
+					o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) permanently failed after %d retries.\nCheck log: %s",
 						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, sess.LogFile)
 				}
 				continue
