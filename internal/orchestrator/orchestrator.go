@@ -760,9 +760,17 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				}
 			}
 			// Terminal states — cleanup old worktrees after 1h
-			if sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour && sess.Worktree != "" {
+			// Use StartedAt as fallback when FinishedAt is nil (orphaned sessions)
+			// to preserve the grace period for recently-killed workers.
+			nilAndOld := sess.FinishedAt == nil && !sess.StartedAt.IsZero() && time.Since(sess.StartedAt) > 1*time.Hour
+			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
+			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
-					log.Printf("[orch] cleaning up stale worktree for %s (finished %s ago)", slotName, time.Since(*sess.FinishedAt).Round(time.Minute))
+					if sess.FinishedAt != nil {
+						log.Printf("[orch] cleaning up stale worktree for %s (finished %s ago)", slotName, time.Since(*sess.FinishedAt).Round(time.Minute))
+					} else {
+						log.Printf("[orch] cleaning up orphaned worktree for %s (started %s ago, no finishedAt)", slotName, time.Since(sess.StartedAt).Round(time.Minute))
+					}
 					worker.Stop(o.cfg, slotName, sess)
 					sess.Worktree = "" // Mark as cleaned
 				}
