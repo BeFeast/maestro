@@ -43,7 +43,8 @@ type Session struct {
 	NextRetryAt         *time.Time    `json:"next_retry_at,omitempty"`
 	LastOutputHash      string        `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`
-	TokensUsed          int           `json:"tokens_used,omitempty"`    // cumulative tokens consumed by the worker
+	TokensUsed          int           `json:"tokens_used,omitempty"`          // cumulative tokens consumed across all attempts (lifecycle total)
+	TokensUsedAttempt   int           `json:"tokens_used_attempt,omitempty"` // tokens consumed in the current attempt (reset on respawn)
 	RateLimitHit        bool          `json:"rate_limit_hit,omitempty"` // true if worker was rate-limited (tmux detection, running worker)
 	TriedBackends       []string      `json:"tried_backends,omitempty"` // backends already attempted (for rate-limit fallback)
 }

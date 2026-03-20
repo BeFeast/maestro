@@ -99,36 +99,38 @@ type tokenTotalsInfo struct {
 }
 
 type sessionInfo struct {
-	Slot        string `json:"slot"`
-	IssueNumber int    `json:"issue_number"`
-	IssueTitle  string `json:"issue_title"`
-	Status      string `json:"status"`
-	Backend     string `json:"backend,omitempty"`
-	PRNumber    int    `json:"pr_number,omitempty"`
-	TokensUsed  int    `json:"tokens_used"`
-	Runtime     string `json:"runtime"`
-	StartedAt   string `json:"started_at"`
-	FinishedAt  string `json:"finished_at,omitempty"`
-	PID         int    `json:"pid,omitempty"`
-	Alive       *bool  `json:"alive,omitempty"`
-	Worktree    string `json:"worktree,omitempty"`
-	Branch      string `json:"branch,omitempty"`
-	RetryCount  int    `json:"retry_count,omitempty"`
+	Slot              string `json:"slot"`
+	IssueNumber       int    `json:"issue_number"`
+	IssueTitle        string `json:"issue_title"`
+	Status            string `json:"status"`
+	Backend           string `json:"backend,omitempty"`
+	PRNumber          int    `json:"pr_number,omitempty"`
+	TokensUsed        int    `json:"tokens_used"`         // lifecycle total across all attempts
+	TokensUsedAttempt int    `json:"tokens_used_attempt"` // current attempt only
+	Runtime           string `json:"runtime"`
+	StartedAt         string `json:"started_at"`
+	FinishedAt        string `json:"finished_at,omitempty"`
+	PID               int    `json:"pid,omitempty"`
+	Alive             *bool  `json:"alive,omitempty"`
+	Worktree          string `json:"worktree,omitempty"`
+	Branch            string `json:"branch,omitempty"`
+	RetryCount        int    `json:"retry_count,omitempty"`
 }
 
 func makeSessionInfo(slot string, sess *state.Session) sessionInfo {
 	info := sessionInfo{
-		Slot:        slot,
-		IssueNumber: sess.IssueNumber,
-		IssueTitle:  sess.IssueTitle,
-		Status:      string(sess.Status),
-		Backend:     sess.Backend,
-		PRNumber:    sess.PRNumber,
-		TokensUsed:  sess.TokensUsed,
-		StartedAt:   sess.StartedAt.Format(time.RFC3339),
-		Worktree:    sess.Worktree,
-		Branch:      sess.Branch,
-		RetryCount:  sess.RetryCount,
+		Slot:              slot,
+		IssueNumber:       sess.IssueNumber,
+		IssueTitle:        sess.IssueTitle,
+		Status:            string(sess.Status),
+		Backend:           sess.Backend,
+		PRNumber:          sess.PRNumber,
+		TokensUsed:        sess.TokensUsed,
+		TokensUsedAttempt: sess.TokensUsedAttempt,
+		StartedAt:         sess.StartedAt.Format(time.RFC3339),
+		Worktree:          sess.Worktree,
+		Branch:            sess.Branch,
+		RetryCount:        sess.RetryCount,
 	}
 
 	// Calculate runtime
@@ -319,7 +321,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 <h1>maestro — %s</h1>
 <p>Sessions: %d | Max parallel: %d</p>
 <table>
-<tr><th>Slot</th><th>Issue</th><th>Status</th><th>Backend</th><th>PR</th><th>Tokens</th><th>Runtime</th></tr>
+<tr><th>Slot</th><th>Issue</th><th>Status</th><th>Backend</th><th>PR</th><th>Tokens (attempt)</th><th>Tokens (total)</th><th>Runtime</th></tr>
 `, s.cfg.Repo, s.cfg.Repo, len(st.Sessions), s.cfg.MaxParallel)
 
 	for slot, sess := range st.Sessions {
@@ -332,11 +334,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		if sess.PRNumber > 0 {
 			pr = fmt.Sprintf("#%d", sess.PRNumber)
 		}
-		tokens := worker.FormatTokens(sess.TokensUsed)
-		fmt.Fprintf(w, `<tr class="%s"><td>%s</td><td>#%d %s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>
+		tokensAttempt := worker.FormatTokens(sess.TokensUsedAttempt)
+		tokensTotal := worker.FormatTokens(sess.TokensUsed)
+		fmt.Fprintf(w, `<tr class="%s"><td>%s</td><td>#%d %s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>
 `,
 			sess.Status, slot, sess.IssueNumber, escapeHTML(sess.IssueTitle),
-			sess.Status, sess.Backend, pr, tokens, runtime)
+			sess.Status, sess.Backend, pr, tokensAttempt, tokensTotal, runtime)
 	}
 
 	fmt.Fprintf(w, `</table>

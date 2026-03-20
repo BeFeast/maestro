@@ -895,9 +895,11 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					log.Printf("[orch] warn: tmux capture-pane failed for %s (%s): %v", slotName, tmuxName, err)
 				} else {
 					// --- Token tracking ---
-					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsed {
-						sess.TokensUsed = tokens
-						log.Printf("[orch] %s tokens_used updated to %d", slotName, tokens)
+					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsedAttempt {
+						delta := tokens - sess.TokensUsedAttempt
+						sess.TokensUsedAttempt = tokens
+						sess.TokensUsed += delta
+						log.Printf("[orch] %s tokens: attempt=%d lifecycle=%d", slotName, sess.TokensUsedAttempt, sess.TokensUsed)
 					}
 
 					// --- Rate-limit detection ---
@@ -954,10 +956,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						}
 					}
 
-					// --- Token limit enforcement ---
-					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsed > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
+					// --- Token limit enforcement (per-attempt budget) ---
+					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
 						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
-							slotName, sess.TokensUsed, o.cfg.WorkerMaxTokens)
+							slotName, sess.TokensUsedAttempt, o.cfg.WorkerMaxTokens)
 						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
@@ -966,8 +968,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = "token_limit"
 						sess.FinishedAt = &now
-						o.notifier.Sendf("⚠️ Worker %s (issue #%d) exceeded token limit: %s tokens used",
-							slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsed))
+						o.notifier.Sendf("⚠️ Worker %s (issue #%d) exceeded token limit: %s tokens used (attempt), %s total",
+							slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(sess.TokensUsed))
 						continue
 					}
 
