@@ -538,10 +538,11 @@ func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
 	// gh issue create prints the issue URL; extract number from it
 	outStr := strings.TrimSpace(string(out))
 	parts := strings.Split(outStr, "/")
-	if len(parts) == 0 {
+	last := parts[len(parts)-1]
+	if last == "" {
 		return 0, fmt.Errorf("unexpected gh issue create output: %s", outStr)
 	}
-	n, err := strconv.Atoi(parts[len(parts)-1])
+	n, err := strconv.Atoi(last)
 	if err != nil {
 		return 0, fmt.Errorf("parse issue number from %q: %w", outStr, err)
 	}

@@ -132,20 +132,25 @@ func (d *Decomposer) DecomposeMission(s *state.State, issue github.Issue) ([]int
 		}
 	}
 
-	// Collect issue labels from config to add to children so they're picked up by orchestrator
+	// Use parent labels for children. Only add a single config issue label if the
+	// parent has none of the configured labels (so children are picked up by the orchestrator).
 	childLabels := parentLabels
 	if len(d.cfg.IssueLabels) > 0 {
-		for _, il := range d.cfg.IssueLabels {
-			found := false
-			for _, cl := range childLabels {
+		hasConfigLabel := false
+		for _, cl := range childLabels {
+			for _, il := range d.cfg.IssueLabels {
 				if strings.EqualFold(cl, il) {
-					found = true
+					hasConfigLabel = true
 					break
 				}
 			}
-			if !found {
-				childLabels = append(childLabels, il)
+			if hasConfigLabel {
+				break
 			}
+		}
+		if !hasConfigLabel {
+			// Add the first configured label so children appear in orchestrator queries
+			childLabels = append(childLabels, d.cfg.IssueLabels[0])
 		}
 	}
 
@@ -171,6 +176,17 @@ func (d *Decomposer) DecomposeMission(s *state.State, issue github.Issue) ([]int
 
 		childNum, err := d.gh.CreateIssue(spec.Title, body, labels)
 		if err != nil {
+			// Register partial mission to prevent re-decomposition on next poll
+			if len(childNumbers) > 0 {
+				now := time.Now()
+				s.Missions[issue.Number] = &state.Mission{
+					ParentIssue: issue.Number,
+					ParentTitle: issue.Title,
+					ChildIssues: childNumbers,
+					Status:      state.MissionStatusDecomposing,
+					CreatedAt:   now,
+				}
+			}
 			return childNumbers, fmt.Errorf("create child issue %d/%d for mission #%d: %w",
 				i+1, len(specs), issue.Number, err)
 		}
@@ -221,6 +237,10 @@ func SyncMissionProgress(gh *github.Client, s *state.State, parentNumber int) (b
 
 	if m.Status == state.MissionStatusDone {
 		return true, nil
+	}
+
+	if len(m.ChildIssues) == 0 {
+		return false, fmt.Errorf("mission #%d has no child issues", parentNumber)
 	}
 
 	allClosed := true

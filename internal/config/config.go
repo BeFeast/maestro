@@ -315,6 +315,11 @@ func parse(data []byte) (*Config, error) {
 	if len(cfg.Missions.Labels) == 0 {
 		cfg.Missions.Labels = []string{"mission", "epic"}
 	}
+	// When missions are enabled, ensure a default blocker pattern so that
+	// "Blocked by #N" references in child issues are actually enforced.
+	if cfg.Missions.Enabled && len(cfg.BlockerPatterns) == 0 {
+		cfg.BlockerPatterns = []string{`(?i)blocked by #(\d+)`}
+	}
 
 	return cfg, nil
 }
