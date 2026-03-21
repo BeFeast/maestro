@@ -1031,7 +1031,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 
 			// Check if worker exceeded max runtime — hard fail (no retry) with diagnostics
-			maxMinutes := o.cfg.MaxRuntimeMinutes
+			maxMinutes := pipeline.MaxRuntimeForPhase(o.cfg, sess.Phase)
 			if sess.LongRunning {
 				maxMinutes *= 2
 			}

@@ -71,8 +71,12 @@ func (o *Orchestrator) handleResearchComplete(slotName string, sess *state.Sessi
 		return true
 	}
 
-	o.notifier.Sendf("🔍→📋 maestro: %s (issue #%d) research complete, starting %s phase",
-		slotName, sess.IssueNumber, nextPhase)
+	arrow := "📋"
+	if nextPhase == state.PhaseImplement {
+		arrow = "🔨"
+	}
+	o.notifier.Sendf("🔍→%s maestro: %s (issue #%d) research complete, starting %s phase",
+		arrow, slotName, sess.IssueNumber, nextPhase)
 	return true
 }
 

@@ -232,6 +232,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
 	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
+	cfg.Pipeline.Research.Prompt = expandHome(cfg.Pipeline.Research.Prompt)
 	cfg.StateDir = expandHome(cfg.StateDir)
 
 	// Default session_prefix: first 3 chars of repo name

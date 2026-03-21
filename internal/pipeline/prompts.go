@@ -143,6 +143,16 @@ const defaultValidatorPrompt = `You are a **validator** for a coding agent pipel
 7. Do NOT create a PR.
 `
 
+const validatorTestMappingPreamble = `
+
+## Test Mapping Verification
+
+The implementer was required to create ` + "`.maestro/verify.sh`" + `. You MUST:
+1. Check that ` + "`.maestro/verify.sh`" + ` exists and is executable.
+2. Run ` + "`.maestro/verify.sh`" + ` and verify it exits with code 0.
+3. If the script is missing or fails, mark the validation as FAIL with details about what went wrong.
+`
+
 const validatorRetryPreamble = `## Previous Validation Feedback
 
 The previous implementation attempt failed validation. Here is the feedback from the validator:
@@ -168,6 +178,9 @@ func PromptForPhase(cfg *config.Config, phase state.Phase, issue github.Issue, w
 		base = loadPromptOrDefault(cfg.Pipeline.Planner.Prompt, defaultPlannerPrompt)
 	case state.PhaseValidate:
 		base = loadPromptOrDefault(cfg.Pipeline.Validator.Prompt, defaultValidatorPrompt)
+		if cfg.Pipeline.TestMapping {
+			base += validatorTestMappingPreamble
+		}
 	default:
 		return "" // implementer uses existing prompt system
 	}
