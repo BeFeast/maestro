@@ -59,6 +59,13 @@ type ServerConfig struct {
 	Port int `yaml:"port"` // 0 = disabled (default)
 }
 
+// MissionsConfig controls mission mode for decomposing epics into child issues.
+type MissionsConfig struct {
+	Enabled     bool     `yaml:"enabled"`
+	MaxChildren int      `yaml:"max_children"` // maximum child issues per mission (default: 10)
+	Labels      []string `yaml:"labels"`       // labels that trigger mission mode (default: ["mission", "epic"])
+}
+
 // HooksConfig holds lifecycle hook scripts that run at key points.
 type HooksConfig struct {
 	AfterCreate  string `yaml:"after_create"`  // runs once when a new issue workspace is first created
@@ -102,9 +109,10 @@ type Config struct {
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	Hooks                      HooksConfig          `yaml:"hooks"`
-	BlockerPatterns            []string             `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
-	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
-	SourcePath                 string               `yaml:"-"`                          // path the config was loaded from (not serialized)
+	Missions                   MissionsConfig       `yaml:"missions"`
+	BlockerPatterns            []string             `yaml:"blocker_patterns"`      // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
+	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"` // override poll interval from config (0 = use CLI flag)
+	SourcePath                 string               `yaml:"-"`                     // path the config was loaded from (not serialized)
 }
 
 // LoadFrom loads config from a specific path.
@@ -298,6 +306,14 @@ func parse(data []byte) (*Config, error) {
 	// Default hooks timeout
 	if cfg.Hooks.TimeoutMs <= 0 {
 		cfg.Hooks.TimeoutMs = 60000
+	}
+
+	// Mission mode defaults
+	if cfg.Missions.MaxChildren <= 0 {
+		cfg.Missions.MaxChildren = 10
+	}
+	if len(cfg.Missions.Labels) == 0 {
+		cfg.Missions.Labels = []string{"mission", "epic"}
 	}
 
 	return cfg, nil

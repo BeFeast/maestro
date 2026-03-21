@@ -696,3 +696,78 @@ func TestCountByStatus_Empty(t *testing.T) {
 		t.Errorf("expected empty map for empty state, got %v", counts)
 	}
 }
+
+func TestIsMissionParent(t *testing.T) {
+	s := NewState()
+	s.Missions[100] = &Mission{
+		ParentIssue: 100,
+		ChildIssues: []int{101, 102},
+		Status:      MissionStatusActive,
+	}
+
+	if !s.IsMissionParent(100) {
+		t.Error("expected issue 100 to be a mission parent")
+	}
+	if s.IsMissionParent(101) {
+		t.Error("expected issue 101 to not be a mission parent")
+	}
+}
+
+func TestIsMissionChild(t *testing.T) {
+	s := NewState()
+	s.Missions[100] = &Mission{
+		ParentIssue: 100,
+		ChildIssues: []int{101, 102, 103},
+		Status:      MissionStatusActive,
+	}
+
+	if parent := s.IsMissionChild(101); parent != 100 {
+		t.Errorf("expected issue 101 parent to be 100, got %d", parent)
+	}
+	if parent := s.IsMissionChild(102); parent != 100 {
+		t.Errorf("expected issue 102 parent to be 100, got %d", parent)
+	}
+	if parent := s.IsMissionChild(999); parent != 0 {
+		t.Errorf("expected issue 999 to not be a mission child, got parent %d", parent)
+	}
+}
+
+func TestMissionPersistence(t *testing.T) {
+	dir := t.TempDir()
+
+	s := NewState()
+	now := time.Now().UTC()
+	s.Missions[50] = &Mission{
+		ParentIssue: 50,
+		ParentTitle: "Epic: build feature X",
+		ChildIssues: []int{51, 52, 53},
+		Status:      MissionStatusActive,
+		CreatedAt:   now,
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	m, ok := loaded.Missions[50]
+	if !ok {
+		t.Fatal("mission 50 not found after load")
+	}
+	if m.ParentIssue != 50 {
+		t.Errorf("ParentIssue = %d, want 50", m.ParentIssue)
+	}
+	if m.ParentTitle != "Epic: build feature X" {
+		t.Errorf("ParentTitle = %q, want %q", m.ParentTitle, "Epic: build feature X")
+	}
+	if len(m.ChildIssues) != 3 {
+		t.Errorf("ChildIssues len = %d, want 3", len(m.ChildIssues))
+	}
+	if m.Status != MissionStatusActive {
+		t.Errorf("Status = %q, want %q", m.Status, MissionStatusActive)
+	}
+}

@@ -48,8 +48,28 @@ type Session struct {
 	TriedBackends       []string      `json:"tried_backends,omitempty"` // backends already attempted (for rate-limit fallback)
 }
 
+// MissionStatus represents the lifecycle state of a mission.
+type MissionStatus string
+
+const (
+	MissionStatusDecomposing MissionStatus = "decomposing" // creating child issues
+	MissionStatusActive      MissionStatus = "active"      // children being worked on
+	MissionStatusDone        MissionStatus = "done"        // all children completed
+)
+
+// Mission tracks a parent issue decomposed into child issues.
+type Mission struct {
+	ParentIssue int           `json:"parent_issue"`
+	ParentTitle string        `json:"parent_title"`
+	ChildIssues []int         `json:"child_issues"`
+	Status      MissionStatus `json:"status"`
+	CreatedAt   time.Time     `json:"created_at"`
+	CompletedAt *time.Time    `json:"completed_at,omitempty"`
+}
+
 type State struct {
 	Sessions    map[string]*Session `json:"sessions"`
+	Missions    map[int]*Mission    `json:"missions,omitempty"` // parent issue number → mission
 	NextSlot    int                 `json:"next_slot"`
 	LastMergeAt time.Time           `json:"last_merge_at,omitempty"`
 }
@@ -57,6 +77,7 @@ type State struct {
 func NewState() *State {
 	return &State{
 		Sessions: make(map[string]*Session),
+		Missions: make(map[int]*Mission),
 		NextSlot: 1,
 	}
 }
@@ -241,6 +262,25 @@ func (s *State) CompletedSessions() []CompletedSession {
 		return fi.After(*fj)
 	})
 	return result
+}
+
+// IsMissionChild returns the parent issue number if the given issue is a child
+// of any active mission, or 0 if it is not.
+func (s *State) IsMissionChild(issueNum int) int {
+	for parentNum, m := range s.Missions {
+		for _, child := range m.ChildIssues {
+			if child == issueNum {
+				return parentNum
+			}
+		}
+	}
+	return 0
+}
+
+// IsMissionParent returns true if the given issue is tracked as a mission parent.
+func (s *State) IsMissionParent(issueNum int) bool {
+	_, ok := s.Missions[issueNum]
+	return ok
 }
 
 // PruneOldSessions removes completed sessions older than maxAge.
