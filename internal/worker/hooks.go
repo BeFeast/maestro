@@ -32,7 +32,7 @@ func RunHook(cfg *config.Config, hookName, script string, env HookEnv) error {
 	cmd := exec.CommandContext(ctx, "bash", "-c", script)
 	cmd.Dir = env.WorkspacePath
 	cmd.Env = append(cmd.Environ(),
-		fmt.Sprintf("ISSUE_ID=%s#%d", cfg.Repo, env.IssueNumber),
+		fmt.Sprintf("ISSUE_ID=%s", env.IssueID),
 		fmt.Sprintf("ISSUE_NUMBER=%d", env.IssueNumber),
 		fmt.Sprintf("WORKSPACE_PATH=%s", env.WorkspacePath),
 	)
