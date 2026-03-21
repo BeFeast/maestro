@@ -3,6 +3,7 @@ package github
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -395,9 +396,12 @@ func (c *Client) ClosePR(prNumber int, comment string) error {
 
 // PRChecksOutput returns the raw output of `gh pr checks` for a PR
 func (c *Client) PRChecksOutput(prNumber int) string {
-	out, _ := exec.Command("gh", "pr", "checks",
+	out, err := exec.Command("gh", "pr", "checks",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo).CombinedOutput()
+	if err != nil {
+		log.Printf("[github] gh pr checks %d: %v (%s)", prNumber, err, strings.TrimSpace(string(out)))
+	}
 	return string(out)
 }
 

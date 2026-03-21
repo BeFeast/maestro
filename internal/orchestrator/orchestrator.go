@@ -1168,7 +1168,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 
 			// Capture CI check output before closing the PR
+			const maxCIOutputBytes = 4096
 			checksOutput := o.prChecksOutput(pr.Number)
+			if len(checksOutput) > maxCIOutputBytes {
+				checksOutput = checksOutput[:maxCIOutputBytes] + "\n… (truncated)"
+			}
 			sess.CIFailureOutput = checksOutput
 
 			// Close the failed PR with an appropriate comment
@@ -1181,7 +1185,8 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					sess.RetryCount, o.maxSessionRetries(), checksOutput)
 			}
 			if err := o.closePR(pr.Number, comment); err != nil {
-				log.Printf("[orch] warn: could not close PR #%d: %v", pr.Number, err)
+				log.Printf("[orch] warn: could not close PR #%d: %v — will retry on next poll", pr.Number, err)
+				continue
 			}
 
 			// Clean up worktree
