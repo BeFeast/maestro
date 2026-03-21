@@ -94,6 +94,16 @@ func PlanArtifactsExist(worktreePath string) bool {
 	return errPlan == nil && errVal == nil
 }
 
+// VerifyScriptReady checks whether the test mapping verify script exists and is executable.
+func VerifyScriptReady(worktreePath string) bool {
+	scriptPath := filepath.Join(worktreePath, VerifyScript)
+	info, err := os.Stat(scriptPath)
+	if err != nil {
+		return false
+	}
+	return info.Mode()&0111 != 0
+}
+
 // ValidationPassed checks whether the validator wrote a passing result.
 // Returns (passed, feedback, error).
 func ValidationPassed(worktreePath string) (bool, string, error) {

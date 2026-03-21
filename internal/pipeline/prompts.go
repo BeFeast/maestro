@@ -52,6 +52,7 @@ You MUST create a verification script at ` + "`.maestro/verify.sh`" + ` that:
 1. Maps each requirement from the issue to a specific test or check command
 2. Runs all verification commands (build, test, lint, etc.)
 3. Exits with code 0 only if ALL verifications pass
+4. Is marked executable (` + "`chmod +x .maestro/verify.sh`" + `)
 
 Example format:
 ` + "```bash" + `
@@ -219,8 +220,8 @@ func ImplementerPreamble(cfg *config.Config, sess *state.Session) string {
 
 	// Include research context reference if research phase was run
 	if cfg.Pipeline.Research.Enabled {
-		sb.WriteString("A research context file is available at `.maestro/research/RESEARCH_CONTEXT.md`.\n")
-		sb.WriteString("Read it for relevant codebase patterns and findings before implementing.\n\n")
+		sb.WriteString("A research context file may be available at `.maestro/research/RESEARCH_CONTEXT.md`.\n")
+		sb.WriteString("If it exists, read it for relevant codebase patterns and findings before implementing.\n\n")
 	}
 
 	// Include test mapping requirements if enabled

@@ -126,6 +126,17 @@ func (o *Orchestrator) handlePlanComplete(slotName string, sess *state.Session) 
 func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Session) bool {
 	o.runAfterRunHook(sess)
 
+	// When test_mapping is enabled, verify the script exists and is executable before proceeding
+	if o.cfg.Pipeline.TestMapping && !pipeline.VerifyScriptReady(sess.Worktree) {
+		log.Printf("[pipeline] implementer %s did not produce executable verify.sh — marking as failed", slotName)
+		sess.Status = state.StatusFailed
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		o.notifier.Sendf("❌ maestro: %s (issue #%d) failed — missing or non-executable .maestro/verify.sh",
+			slotName, sess.IssueNumber)
+		return true
+	}
+
 	nextPhase := pipeline.NextPhase(o.cfg, state.PhaseImplement)
 	if nextPhase == state.PhaseNone {
 		// No validator — fall through to normal dead-worker handling (PR detection, retry, etc.)
