@@ -1089,3 +1089,76 @@ hooks:
 		t.Errorf("Hooks.TimeoutMs = %d, want 60000 (default)", cfg.Hooks.TimeoutMs)
 	}
 }
+
+func TestParse_PipelineResearch(t *testing.T) {
+	yaml := `
+repo: owner/repo
+pipeline:
+  enabled: true
+  research:
+    enabled: true
+    backend: haiku
+    max_runtime_minutes: 10
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Pipeline.Research.Enabled {
+		t.Error("Research should be enabled")
+	}
+	if cfg.Pipeline.Research.Backend != "haiku" {
+		t.Errorf("Research.Backend = %q, want haiku", cfg.Pipeline.Research.Backend)
+	}
+	if cfg.Pipeline.Research.MaxRuntimeMinutes != 10 {
+		t.Errorf("Research.MaxRuntimeMinutes = %d, want 10", cfg.Pipeline.Research.MaxRuntimeMinutes)
+	}
+}
+
+func TestParse_PipelineMaxValidationRetries(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Pipeline.MaxValidationRetries != 3 {
+		t.Errorf("MaxValidationRetries = %d, want 3 (default)", cfg.Pipeline.MaxValidationRetries)
+	}
+
+	yaml2 := `
+repo: owner/repo
+pipeline:
+  max_validation_retries: 5
+`
+	cfg2, err := parse([]byte(yaml2))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg2.Pipeline.MaxValidationRetries != 5 {
+		t.Errorf("MaxValidationRetries = %d, want 5", cfg2.Pipeline.MaxValidationRetries)
+	}
+}
+
+func TestParse_PipelineTestMapping(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Pipeline.TestMapping {
+		t.Error("TestMapping should default to false")
+	}
+
+	yaml2 := `
+repo: owner/repo
+pipeline:
+  test_mapping: true
+`
+	cfg2, err := parse([]byte(yaml2))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg2.Pipeline.TestMapping {
+		t.Error("TestMapping should be true when explicitly set")
+	}
+}

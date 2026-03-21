@@ -27,6 +27,7 @@ type Phase string
 
 const (
 	PhaseNone      Phase = ""          // legacy single-phase mode (no pipeline)
+	PhaseResearch  Phase = "research"  // research: scans codebase, writes context file
 	PhasePlan      Phase = "plan"      // planner: creates MAESTRO_PLAN.md + VALIDATION.md
 	PhaseImplement Phase = "implement" // implementer: writes code based on plan
 	PhaseValidate  Phase = "validate"  // validator: checks assertions, gates PR creation

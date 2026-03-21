@@ -10,6 +10,72 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
+const defaultResearchPrompt = `You are a **researcher** for a coding agent pipeline. Your job is to analyze a GitHub issue and the surrounding codebase to produce a research context file that will help the implementer work more effectively.
+
+## Issue
+
+**#{{ISSUE_NUMBER}}: {{ISSUE_TITLE}}**
+
+{{ISSUE_BODY}}
+
+## Repository
+
+- Repo: {{REPO}}
+- Worktree: {{WORKTREE}}
+- Branch: {{BRANCH}}
+
+## Instructions
+
+1. Read and understand the issue requirements.
+2. Scan the codebase for patterns relevant to this task:
+   - Find existing code that does similar things
+   - Identify files that will likely need modification
+   - Note architectural patterns and conventions used in the project
+   - Look for related tests that cover similar functionality
+3. Create the directory ` + "`.maestro/research/`" + ` if it doesn't exist.
+4. Write ` + "`.maestro/research/RESEARCH_CONTEXT.md`" + ` with:
+   - **Relevant Files**: list of files relevant to this issue with brief descriptions
+   - **Code Patterns**: conventions and patterns found in the codebase
+   - **Similar Implementations**: existing code that does similar things
+   - **Test Patterns**: how tests are structured in this project
+   - **Potential Risks**: edge cases or architectural conflicts to watch for
+5. Commit the research file with message: "research: add context for #{{ISSUE_NUMBER}}"
+6. Do NOT implement the issue. Only research and document findings.
+7. Do NOT create a PR.
+`
+
+const testMappingPreamble = `## Test Mapping Requirements
+
+**Every change must have automated verification.**
+
+You MUST create a verification script at ` + "`.maestro/verify.sh`" + ` that:
+1. Maps each requirement from the issue to a specific test or check command
+2. Runs all verification commands (build, test, lint, etc.)
+3. Exits with code 0 only if ALL verifications pass
+
+Example format:
+` + "```bash" + `
+#!/bin/bash
+set -e
+# Verification for Issue #{{ISSUE_NUMBER}}: {{ISSUE_TITLE}}
+
+# Build check
+go build ./...
+
+# Test check
+go test ./...
+
+# Lint check
+go vet ./...
+
+echo "All verifications passed"
+` + "```" + `
+
+Run ` + "`.maestro/verify.sh`" + ` after implementation and include results in the PR description.
+If any verification fails, fix the issue before creating the PR.
+
+`
+
 const defaultPlannerPrompt = `You are a **planner** for a coding agent pipeline. Your job is to analyze a GitHub issue and produce two artifacts in the repository root:
 
 1. **MAESTRO_PLAN.md** — a step-by-step implementation plan
@@ -96,6 +162,8 @@ Please address the issues described above in your implementation.
 func PromptForPhase(cfg *config.Config, phase state.Phase, issue github.Issue, worktreePath, branchName string) string {
 	var base string
 	switch phase {
+	case state.PhaseResearch:
+		base = loadPromptOrDefault(cfg.Pipeline.Research.Prompt, defaultResearchPrompt)
 	case state.PhasePlan:
 		base = loadPromptOrDefault(cfg.Pipeline.Planner.Prompt, defaultPlannerPrompt)
 	case state.PhaseValidate:
@@ -111,6 +179,8 @@ func PromptForPhase(cfg *config.Config, phase state.Phase, issue github.Issue, w
 // This is useful when the caller will handle substitution later (e.g. worker.Start → assemblePrompt).
 func PromptTemplateForPhase(cfg *config.Config, phase state.Phase) string {
 	switch phase {
+	case state.PhaseResearch:
+		return loadPromptOrDefault(cfg.Pipeline.Research.Prompt, defaultResearchPrompt)
 	case state.PhasePlan:
 		return loadPromptOrDefault(cfg.Pipeline.Planner.Prompt, defaultPlannerPrompt)
 	case state.PhaseValidate:
@@ -121,14 +191,25 @@ func PromptTemplateForPhase(cfg *config.Config, phase state.Phase) string {
 }
 
 // ImplementerPreamble returns extra context to prepend to the implementer prompt
-// when running in pipeline mode. This includes instructions to read the plan
-// and any validation feedback from previous attempts.
-func ImplementerPreamble(sess *state.Session) string {
+// when running in pipeline mode. This includes instructions to read the plan,
+// research context, test mapping requirements, and any validation feedback.
+func ImplementerPreamble(cfg *config.Config, sess *state.Session) string {
 	var sb strings.Builder
 	sb.WriteString("## Pipeline Mode\n\n")
 	sb.WriteString("This issue is being worked on in pipeline mode. ")
 	sb.WriteString("Read `MAESTRO_PLAN.md` in the worktree root for the implementation plan.\n")
 	sb.WriteString("Follow the plan steps in order.\n\n")
+
+	// Include research context reference if research phase was run
+	if cfg.Pipeline.Research.Enabled {
+		sb.WriteString("A research context file is available at `.maestro/research/RESEARCH_CONTEXT.md`.\n")
+		sb.WriteString("Read it for relevant codebase patterns and findings before implementing.\n\n")
+	}
+
+	// Include test mapping requirements if enabled
+	if cfg.Pipeline.TestMapping {
+		sb.WriteString(testMappingPreamble)
+	}
 
 	if sess.ValidationFeedback != "" {
 		sb.WriteString(fmt.Sprintf(validatorRetryPreamble, sess.ValidationFeedback))

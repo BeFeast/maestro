@@ -20,12 +20,18 @@ import (
 )
 
 const (
+	// ResearchDir is the directory where research context files are written.
+	ResearchDir = ".maestro/research"
+	// ResearchFile is the research context file written by the research phase.
+	ResearchFile = "RESEARCH_CONTEXT.md"
 	// PlanFile is the plan artifact written by the planner phase.
 	PlanFile = "MAESTRO_PLAN.md"
 	// ValidationFile is the validation contract written by the planner phase.
 	ValidationFile = "VALIDATION.md"
 	// ValidationResultFile is written by the validator with pass/fail + feedback.
 	ValidationResultFile = "VALIDATION_RESULT.md"
+	// VerifyScript is the test mapping verification script.
+	VerifyScript = ".maestro/verify.sh"
 )
 
 // IsEnabled returns true if the pipeline is enabled in config.
@@ -34,10 +40,13 @@ func IsEnabled(cfg *config.Config) bool {
 }
 
 // InitialPhase returns the first phase for a new session based on config.
-// If the planner is disabled, starts directly with implement.
+// Phase order: research (optional) → plan (optional) → implement → validate (optional).
 func InitialPhase(cfg *config.Config) state.Phase {
 	if !cfg.Pipeline.Enabled {
 		return state.PhaseNone
+	}
+	if cfg.Pipeline.Research.Enabled {
+		return state.PhaseResearch
 	}
 	if cfg.Pipeline.Planner.Enabled {
 		return state.PhasePlan
@@ -46,10 +55,15 @@ func InitialPhase(cfg *config.Config) state.Phase {
 }
 
 // NextPhase returns the phase that should follow the given completed phase.
-// Returns PhaseNone when the pipeline is complete (after validate or implement
-// if validator is disabled).
+// Phase order: research → plan → implement → validate → none.
+// Returns PhaseNone when the pipeline is complete.
 func NextPhase(cfg *config.Config, completed state.Phase) state.Phase {
 	switch completed {
+	case state.PhaseResearch:
+		if cfg.Pipeline.Planner.Enabled {
+			return state.PhasePlan
+		}
+		return state.PhaseImplement
 	case state.PhasePlan:
 		return state.PhaseImplement
 	case state.PhaseImplement:
@@ -62,6 +76,13 @@ func NextPhase(cfg *config.Config, completed state.Phase) state.Phase {
 	default:
 		return state.PhaseNone
 	}
+}
+
+// ResearchArtifactsExist checks whether the research phase wrote its context file.
+func ResearchArtifactsExist(worktreePath string) bool {
+	researchPath := filepath.Join(worktreePath, ResearchDir, ResearchFile)
+	_, err := os.Stat(researchPath)
+	return err == nil
 }
 
 // PlanArtifactsExist checks whether the planner wrote its required artifacts.
@@ -100,6 +121,10 @@ func ValidationPassed(worktreePath string) (bool, string, error) {
 // Falls back to the default backend if no role-specific backend is configured.
 func BackendForPhase(cfg *config.Config, phase state.Phase) string {
 	switch phase {
+	case state.PhaseResearch:
+		if cfg.Pipeline.Research.Backend != "" {
+			return cfg.Pipeline.Research.Backend
+		}
 	case state.PhasePlan:
 		if cfg.Pipeline.Planner.Backend != "" {
 			return cfg.Pipeline.Planner.Backend
@@ -116,6 +141,10 @@ func BackendForPhase(cfg *config.Config, phase state.Phase) string {
 // Falls back to the global max_runtime_minutes if no role-specific value is set.
 func MaxRuntimeForPhase(cfg *config.Config, phase state.Phase) int {
 	switch phase {
+	case state.PhaseResearch:
+		if cfg.Pipeline.Research.MaxRuntimeMinutes > 0 {
+			return cfg.Pipeline.Research.MaxRuntimeMinutes
+		}
 	case state.PhasePlan:
 		if cfg.Pipeline.Planner.MaxRuntimeMinutes > 0 {
 			return cfg.Pipeline.Planner.MaxRuntimeMinutes
@@ -126,4 +155,12 @@ func MaxRuntimeForPhase(cfg *config.Config, phase state.Phase) int {
 		}
 	}
 	return cfg.MaxRuntimeMinutes
+}
+
+// MaxValidationRetries returns the max number of validation retry loops.
+func MaxValidationRetries(cfg *config.Config) int {
+	if cfg.Pipeline.MaxValidationRetries > 0 {
+		return cfg.Pipeline.MaxValidationRetries
+	}
+	return 3
 }

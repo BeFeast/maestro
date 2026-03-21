@@ -180,9 +180,13 @@ func TestMaxRuntimeForPhase(t *testing.T) {
 		Pipeline: config.PipelineConfig{
 			Planner:   config.RoleConfig{MaxRuntimeMinutes: 30},
 			Validator: config.RoleConfig{MaxRuntimeMinutes: 45},
+			Research:  config.RoleConfig{MaxRuntimeMinutes: 10},
 		},
 	}
 
+	if got := MaxRuntimeForPhase(cfg, state.PhaseResearch); got != 10 {
+		t.Errorf("research runtime: got %d, want 10", got)
+	}
 	if got := MaxRuntimeForPhase(cfg, state.PhasePlan); got != 30 {
 		t.Errorf("plan runtime: got %d, want 30", got)
 	}
@@ -191,5 +195,120 @@ func TestMaxRuntimeForPhase(t *testing.T) {
 	}
 	if got := MaxRuntimeForPhase(cfg, state.PhaseValidate); got != 45 {
 		t.Errorf("validate runtime: got %d, want 45", got)
+	}
+}
+
+func TestInitialPhase_Research(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      config.Config
+		expected state.Phase
+	}{
+		{
+			name: "research enabled takes priority",
+			cfg: config.Config{
+				Pipeline: config.PipelineConfig{
+					Enabled:  true,
+					Research: config.RoleConfig{Enabled: true},
+					Planner:  config.RoleConfig{Enabled: true},
+				},
+			},
+			expected: state.PhaseResearch,
+		},
+		{
+			name: "research only, no planner",
+			cfg: config.Config{
+				Pipeline: config.PipelineConfig{
+					Enabled:  true,
+					Research: config.RoleConfig{Enabled: true},
+				},
+			},
+			expected: state.PhaseResearch,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := InitialPhase(&tt.cfg)
+			if got != tt.expected {
+				t.Errorf("got %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNextPhase_Research(t *testing.T) {
+	tests := []struct {
+		name     string
+		planner  bool
+		expected state.Phase
+	}{
+		{"research → plan (planner enabled)", true, state.PhasePlan},
+		{"research → implement (planner disabled)", false, state.PhaseImplement},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				Pipeline: config.PipelineConfig{
+					Planner: config.RoleConfig{Enabled: tt.planner},
+				},
+			}
+			got := NextPhase(cfg, state.PhaseResearch)
+			if got != tt.expected {
+				t.Errorf("got %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestResearchArtifactsExist(t *testing.T) {
+	dir := t.TempDir()
+
+	if ResearchArtifactsExist(dir) {
+		t.Error("expected false with no artifacts")
+	}
+
+	// Create the research file
+	researchDir := filepath.Join(dir, ResearchDir)
+	os.MkdirAll(researchDir, 0755)
+	os.WriteFile(filepath.Join(researchDir, ResearchFile), []byte("research"), 0644)
+	if !ResearchArtifactsExist(dir) {
+		t.Error("expected true with research file")
+	}
+}
+
+func TestBackendForPhase_Research(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{Default: "claude"},
+		Pipeline: config.PipelineConfig{
+			Research: config.RoleConfig{Backend: "haiku"},
+		},
+	}
+
+	if got := BackendForPhase(cfg, state.PhaseResearch); got != "haiku" {
+		t.Errorf("research backend: got %q, want haiku", got)
+	}
+
+	// Empty research backend → default
+	cfg2 := &config.Config{
+		Model: config.ModelConfig{Default: "claude"},
+	}
+	if got := BackendForPhase(cfg2, state.PhaseResearch); got != "claude" {
+		t.Errorf("empty research backend: got %q, want claude", got)
+	}
+}
+
+func TestMaxValidationRetries(t *testing.T) {
+	// Default
+	cfg := &config.Config{}
+	if got := MaxValidationRetries(cfg); got != 3 {
+		t.Errorf("default: got %d, want 3", got)
+	}
+
+	// Custom
+	cfg2 := &config.Config{
+		Pipeline: config.PipelineConfig{MaxValidationRetries: 5},
+	}
+	if got := MaxValidationRetries(cfg2); got != 5 {
+		t.Errorf("custom: got %d, want 5", got)
 	}
 }

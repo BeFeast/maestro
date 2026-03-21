@@ -1531,7 +1531,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		var backendName string
 		var promptBase string
 		if initialPhase != state.PhaseNone && initialPhase != state.PhaseImplement {
-			// Pipeline mode with planner — use planner backend and raw template
+			// Pipeline mode with research/planner — use phase-specific backend and template
 			// (worker.Start → assemblePrompt will substitute {{WORKTREE}} etc.)
 			backendName = pipeline.BackendForPhase(o.cfg, initialPhase)
 			promptBase = pipeline.PromptTemplateForPhase(o.cfg, initialPhase)
@@ -1541,7 +1541,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			promptBase = o.selectPrompt(issue)
 			if initialPhase == state.PhaseImplement {
 				// Pipeline mode but no planner — add pipeline preamble
-				preamble := pipeline.ImplementerPreamble(&state.Session{})
+				preamble := pipeline.ImplementerPreamble(o.cfg, &state.Session{})
 				promptBase = preamble + "\n" + promptBase
 			}
 		}

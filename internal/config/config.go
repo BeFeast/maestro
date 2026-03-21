@@ -69,9 +69,12 @@ type RoleConfig struct {
 
 // PipelineConfig controls the planner → implementer → validator pipeline.
 type PipelineConfig struct {
-	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline (default: false = legacy single-phase)
-	Planner   RoleConfig `yaml:"planner"`   // planner role settings
-	Validator RoleConfig `yaml:"validator"` // validator role settings
+	Enabled              bool       `yaml:"enabled"`                // enable 3-phase pipeline (default: false = legacy single-phase)
+	Planner              RoleConfig `yaml:"planner"`                // planner role settings
+	Validator            RoleConfig `yaml:"validator"`              // validator role settings
+	Research             RoleConfig `yaml:"research"`               // pre-coding research phase settings
+	MaxValidationRetries int        `yaml:"max_validation_retries"` // max validation retry loops (default: 3)
+	TestMapping          bool       `yaml:"test_mapping"`           // require test mapping / verify.sh per task (default: false)
 	// Implementer uses the existing worker_prompt / bug_prompt / enhancement_prompt settings.
 }
 
@@ -317,6 +320,11 @@ func parse(data []byte) (*Config, error) {
 	// Default hooks timeout
 	if cfg.Hooks.TimeoutMs <= 0 {
 		cfg.Hooks.TimeoutMs = 60000
+	}
+
+	// Pipeline defaults
+	if cfg.Pipeline.MaxValidationRetries <= 0 {
+		cfg.Pipeline.MaxValidationRetries = 3
 	}
 
 	return cfg, nil

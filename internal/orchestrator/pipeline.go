@@ -20,6 +20,8 @@ func (o *Orchestrator) advancePipeline(slotName string, sess *state.Session) boo
 	}
 
 	switch sess.Phase {
+	case state.PhaseResearch:
+		return o.handleResearchComplete(slotName, sess)
 	case state.PhasePlan:
 		return o.handlePlanComplete(slotName, sess)
 	case state.PhaseImplement:
@@ -29,6 +31,49 @@ func (o *Orchestrator) advancePipeline(slotName string, sess *state.Session) boo
 	default:
 		return false
 	}
+}
+
+// handleResearchComplete checks if the researcher produced a context file and advances to the next phase.
+func (o *Orchestrator) handleResearchComplete(slotName string, sess *state.Session) bool {
+	o.runAfterRunHook(sess)
+
+	if !pipeline.ResearchArtifactsExist(sess.Worktree) {
+		log.Printf("[pipeline] researcher %s did not produce research artifacts — advancing anyway", slotName)
+	} else {
+		log.Printf("[pipeline] researcher %s completed — research context available", slotName)
+	}
+
+	nextPhase := pipeline.NextPhase(o.cfg, state.PhaseResearch)
+	sess.Phase = nextPhase
+
+	issue, err := o.getIssue(sess.IssueNumber)
+	if err != nil {
+		log.Printf("[pipeline] fetch issue #%d for %s phase: %v — marking dead", sess.IssueNumber, nextPhase, err)
+		sess.Status = state.StatusDead
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		return true
+	}
+
+	var promptContent string
+	if nextPhase == state.PhaseImplement {
+		promptContent = o.buildImplementerPrompt(sess, issue)
+	} else {
+		promptContent = pipeline.PromptForPhase(o.cfg, nextPhase, issue, sess.Worktree, sess.Branch)
+	}
+	backendName := pipeline.BackendForPhase(o.cfg, nextPhase)
+
+	if err := o.startPhase(slotName, sess, promptContent, backendName); err != nil {
+		log.Printf("[pipeline] start %s phase for %s: %v — marking dead", nextPhase, slotName, err)
+		sess.Status = state.StatusDead
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		return true
+	}
+
+	o.notifier.Sendf("🔍→📋 maestro: %s (issue #%d) research complete, starting %s phase",
+		slotName, sess.IssueNumber, nextPhase)
+	return true
 }
 
 // handlePlanComplete checks if the planner produced artifacts and advances to implement phase.
@@ -136,8 +181,9 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	sess.ValidationFeedback = feedback
 	log.Printf("[pipeline] validator %s FAILED (attempt %d): %s", slotName, sess.ValidationFails, truncateFeedback(feedback))
 
-	// After 3 validation failures, give up
-	if sess.ValidationFails >= 3 {
+	// After configured validation failures, give up
+	maxRetries := pipeline.MaxValidationRetries(o.cfg)
+	if sess.ValidationFails >= maxRetries {
 		log.Printf("[pipeline] validator %s exhausted validation retries — marking as failed", slotName)
 		sess.Status = state.StatusFailed
 		now := time.Now().UTC()
@@ -176,7 +222,7 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 
 // buildImplementerPrompt builds the implementer prompt with pipeline preamble.
 func (o *Orchestrator) buildImplementerPrompt(sess *state.Session, issue github.Issue) string {
-	preamble := pipeline.ImplementerPreamble(sess)
+	preamble := pipeline.ImplementerPreamble(o.cfg, sess)
 	base := o.selectPrompt(issue)
 	return preamble + "\n" + base + fmt.Sprintf(`
 
