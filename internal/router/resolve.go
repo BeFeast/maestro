@@ -32,6 +32,58 @@ func ValidateBackend(name string, cfg *config.Config) (string, bool) {
 	return cfg.Model.Default, false
 }
 
+// Role constants for role-specific backend routing.
+const (
+	RolePlanner     = "planner"
+	RoleImplementer = "implementer"
+	RoleValidator   = "validator"
+)
+
+// ResolveBackendForRole determines the backend for a specific role within the
+// planner → implementer → validator pipeline. Priority:
+//  1. model:<backend> label on the issue (highest, overrides everything)
+//  2. Role-specific backend from routing config (planner_backend, etc.)
+//  3. Issue-level routing (auto or default)
+//
+// If the role-specific backend is not configured or references an unknown
+// backend, falls back to issue-level resolution.
+func (r *Router) ResolveBackendForRole(issue github.Issue, role string) (backendName, reason string) {
+	// 1. Label override always wins (same as ResolveBackend)
+	if name := BackendFromLabels(issue); name != "" {
+		validated, ok := ValidateBackend(name, r.cfg)
+		if !ok {
+			log.Printf("[router] issue #%d: label specifies unknown backend %q, falling back to default %q",
+				issue.Number, name, r.cfg.Model.Default)
+			return validated, "unknown label backend"
+		}
+		log.Printf("[router] issue #%d [%s] → %s (label override)", issue.Number, role, validated)
+		return validated, "label"
+	}
+
+	// 2. Role-specific backend from config
+	var roleBackend string
+	switch role {
+	case RolePlanner:
+		roleBackend = r.cfg.Routing.PlannerBackend
+	case RoleImplementer:
+		roleBackend = r.cfg.Routing.ImplementationBackend
+	case RoleValidator:
+		roleBackend = r.cfg.Routing.ValidatorBackend
+	}
+	if roleBackend != "" {
+		validated, ok := ValidateBackend(roleBackend, r.cfg)
+		if ok {
+			log.Printf("[router] issue #%d [%s] → %s (role config)", issue.Number, role, validated)
+			return validated, "role:" + role
+		}
+		log.Printf("[router] issue #%d [%s]: configured backend %q unknown, falling back to issue-level routing",
+			issue.Number, role, roleBackend)
+	}
+
+	// 3. Fall back to issue-level resolution
+	return r.ResolveBackend(issue)
+}
+
 // ResolveBackend determines the backend for an issue using 3-tier priority:
 //  1. model:<backend> label on the issue (highest priority)
 //  2. Auto-routing via LLM (if routing.mode == "auto")

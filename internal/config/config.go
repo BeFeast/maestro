@@ -52,6 +52,13 @@ type RoutingConfig struct {
 	RouterModel     string `yaml:"router_model"`      // backend name from model.backends (default: "claude")
 	RouterModelName string `yaml:"router_model_name"` // specific model to use (default: "claude-sonnet-4-6")
 	RouterPrompt    string `yaml:"router_prompt"`     // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
+
+	// Role-specific backend overrides. When set, the corresponding role uses
+	// this backend instead of the issue-level resolved backend.
+	// Falls back to issue-level backend if empty or if the named backend is unknown.
+	PlannerBackend        string `yaml:"planner_backend"`        // backend for planning phase
+	ImplementationBackend string `yaml:"implementation_backend"` // backend for implementation phase
+	ValidatorBackend      string `yaml:"validator_backend"`      // backend for validation phase
 }
 
 // ServerConfig controls the optional HTTP API server.
@@ -102,9 +109,9 @@ type Config struct {
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	Hooks                      HooksConfig          `yaml:"hooks"`
-	BlockerPatterns            []string             `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
-	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
-	SourcePath                 string               `yaml:"-"`                          // path the config was loaded from (not serialized)
+	BlockerPatterns            []string             `yaml:"blocker_patterns"`      // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
+	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"` // override poll interval from config (0 = use CLI flag)
+	SourcePath                 string               `yaml:"-"`                     // path the config was loaded from (not serialized)
 }
 
 // LoadFrom loads config from a specific path.

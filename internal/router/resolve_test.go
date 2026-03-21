@@ -316,3 +316,267 @@ func TestResolveBackend_AutoRoutingErrorFallsToDefault(t *testing.T) {
 		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "default")
 	}
 }
+
+// --- ResolveBackendForRole tests ---
+
+func TestResolveBackendForRole_PlannerBackend(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude":       {Cmd: "claude"},
+				"gemini-flash": {Cmd: "gemini"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:           "manual",
+			PlannerBackend: "gemini-flash",
+		},
+	}
+	r := New(cfg)
+	issue := makeIssue(100, "Plan something")
+
+	name, reason := r.ResolveBackendForRole(issue, RolePlanner)
+	if name != "gemini-flash" {
+		t.Errorf("name = %q, want %q", name, "gemini-flash")
+	}
+	if reason != "role:planner" {
+		t.Errorf("reason = %q, want %q", reason, "role:planner")
+	}
+}
+
+func TestResolveBackendForRole_ImplementationBackend(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "gemini",
+			Backends: map[string]config.BackendDef{
+				"gemini": {Cmd: "gemini"},
+				"claude": {Cmd: "claude"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:                  "manual",
+			ImplementationBackend: "claude",
+		},
+	}
+	r := New(cfg)
+	issue := makeIssue(101, "Implement feature")
+
+	name, reason := r.ResolveBackendForRole(issue, RoleImplementer)
+	if name != "claude" {
+		t.Errorf("name = %q, want %q", name, "claude")
+	}
+	if reason != "role:implementer" {
+		t.Errorf("reason = %q, want %q", reason, "role:implementer")
+	}
+}
+
+func TestResolveBackendForRole_ValidatorBackend(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "gemini",
+			Backends: map[string]config.BackendDef{
+				"gemini": {Cmd: "gemini"},
+				"claude": {Cmd: "claude"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:             "manual",
+			ValidatorBackend: "claude",
+		},
+	}
+	r := New(cfg)
+	issue := makeIssue(102, "Validate code")
+
+	name, reason := r.ResolveBackendForRole(issue, RoleValidator)
+	if name != "claude" {
+		t.Errorf("name = %q, want %q", name, "claude")
+	}
+	if reason != "role:validator" {
+		t.Errorf("reason = %q, want %q", reason, "role:validator")
+	}
+}
+
+func TestResolveBackendForRole_FallsBackToIssueLevel(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "manual"},
+	}
+	r := New(cfg)
+	issue := makeIssue(103, "No role config")
+
+	// No role-specific backend configured → falls back to issue-level
+	name, reason := r.ResolveBackendForRole(issue, RolePlanner)
+	if name != "claude" {
+		t.Errorf("name = %q, want %q", name, "claude")
+	}
+	if reason != "default" {
+		t.Errorf("reason = %q, want %q", reason, "default")
+	}
+}
+
+func TestResolveBackendForRole_UnknownRoleBackendFallsBack(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:           "manual",
+			PlannerBackend: "nonexistent",
+		},
+	}
+	r := New(cfg)
+	issue := makeIssue(104, "Bad config")
+
+	// Configured planner backend doesn't exist → falls back to issue-level
+	name, reason := r.ResolveBackendForRole(issue, RolePlanner)
+	if name != "claude" {
+		t.Errorf("name = %q, want %q", name, "claude")
+	}
+	if reason != "default" {
+		t.Errorf("reason = %q, want %q", reason, "default")
+	}
+}
+
+func TestResolveBackendForRole_LabelOverridesRoleConfig(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude":       {Cmd: "claude"},
+				"codex":        {Cmd: "codex"},
+				"gemini-flash": {Cmd: "gemini"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:           "manual",
+			PlannerBackend: "gemini-flash",
+		},
+	}
+	r := New(cfg)
+	issue := makeIssue(105, "Label wins", "model:codex")
+
+	// Label should override role-specific config
+	name, reason := r.ResolveBackendForRole(issue, RolePlanner)
+	if name != "codex" {
+		t.Errorf("name = %q, want %q (label should override role config)", name, "codex")
+	}
+	if reason != "label" {
+		t.Errorf("reason = %q, want %q", reason, "label")
+	}
+}
+
+func TestResolveBackendForRole_UnknownRole(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:           "manual",
+			PlannerBackend: "claude",
+		},
+	}
+	r := New(cfg)
+	issue := makeIssue(106, "Unknown role")
+
+	// Unknown role has no config → falls back to issue-level
+	name, reason := r.ResolveBackendForRole(issue, "unknown")
+	if name != "claude" {
+		t.Errorf("name = %q, want %q", name, "claude")
+	}
+	if reason != "default" {
+		t.Errorf("reason = %q, want %q", reason, "default")
+	}
+}
+
+func TestResolveBackendForRole_WithAutoRouting(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude":       {Cmd: "claude"},
+				"codex":        {Cmd: "codex"},
+				"gemini-flash": {Cmd: "gemini"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:                  "auto",
+			PlannerBackend:        "gemini-flash",
+			ImplementationBackend: "claude",
+		},
+	}
+	r := New(cfg)
+	r.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "codex", "auto-routed", nil
+	}
+	issue := makeIssue(107, "Auto + role")
+
+	// Planner should use role config, not auto-routing
+	name, reason := r.ResolveBackendForRole(issue, RolePlanner)
+	if name != "gemini-flash" {
+		t.Errorf("planner: name = %q, want %q", name, "gemini-flash")
+	}
+	if reason != "role:planner" {
+		t.Errorf("planner: reason = %q, want %q", reason, "role:planner")
+	}
+
+	// Validator has no role config → should fall through to auto-routing
+	name, reason = r.ResolveBackendForRole(issue, RoleValidator)
+	if name != "codex" {
+		t.Errorf("validator: name = %q, want %q (should auto-route)", name, "codex")
+	}
+	if reason != "auto-routed" {
+		t.Errorf("validator: reason = %q, want %q", reason, "auto-routed")
+	}
+}
+
+func TestResolveBackendForRole_AllRolesConfigured(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude":       {Cmd: "claude"},
+				"gemini-flash": {Cmd: "gemini"},
+				"codex":        {Cmd: "codex"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:                  "manual",
+			PlannerBackend:        "gemini-flash",
+			ImplementationBackend: "claude",
+			ValidatorBackend:      "codex",
+		},
+	}
+	r := New(cfg)
+	issue := makeIssue(108, "All roles")
+
+	tests := []struct {
+		role    string
+		want    string
+		wantRsn string
+	}{
+		{RolePlanner, "gemini-flash", "role:planner"},
+		{RoleImplementer, "claude", "role:implementer"},
+		{RoleValidator, "codex", "role:validator"},
+	}
+	for _, tt := range tests {
+		name, reason := r.ResolveBackendForRole(issue, tt.role)
+		if name != tt.want {
+			t.Errorf("[%s] name = %q, want %q", tt.role, name, tt.want)
+		}
+		if reason != tt.wantRsn {
+			t.Errorf("[%s] reason = %q, want %q", tt.role, reason, tt.wantRsn)
+		}
+	}
+}
