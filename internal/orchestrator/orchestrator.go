@@ -1564,12 +1564,29 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 // processMissions handles mission mode: decompose new mission issues and sync progress.
 func (o *Orchestrator) processMissions(s *state.State) {
 	// 1. Sync progress on active missions
+	decomposer := mission.NewDecomposer(o.gh, o.cfg)
 	for parentNum, m := range s.Missions {
 		if m.Status == state.MissionStatusDone {
 			continue
 		}
 
-		done, err := mission.SyncMissionProgress(o.gh, s, parentNum)
+		// Recover missions stuck in decomposing state by resuming child creation
+		if m.Status == state.MissionStatusDecomposing {
+			log.Printf("[mission] resuming decomposition for mission #%d (%d children created so far)",
+				parentNum, len(m.ChildIssues))
+			issue, err := o.gh.GetIssue(parentNum)
+			if err != nil {
+				log.Printf("[mission] could not fetch parent issue #%d for resume: %v", parentNum, err)
+				continue
+			}
+			if _, err := decomposer.DecomposeMission(s, issue); err != nil {
+				log.Printf("[mission] resume decompose #%d: %v", parentNum, err)
+				o.notifier.Sendf("⚠️ Mission #%d decomposition resume failed: %v", parentNum, err)
+			}
+			continue
+		}
+
+		done, childStatuses, err := mission.SyncMissionProgress(o.gh, s, parentNum)
 		if err != nil {
 			log.Printf("[mission] sync progress for #%d: %v", parentNum, err)
 			continue
@@ -1578,7 +1595,7 @@ func (o *Orchestrator) processMissions(s *state.State) {
 		if done {
 			o.notifier.Sendf("🏁 Mission #%d complete — all %d child issues closed", parentNum, len(m.ChildIssues))
 			// Close the parent issue
-			comment := mission.BuildProgressComment(o.gh, m)
+			comment := mission.BuildProgressComment(m, childStatuses)
 			if err := o.closeIssue(parentNum, comment); err != nil {
 				log.Printf("[mission] warn: could not close parent issue #%d: %v", parentNum, err)
 			}
@@ -1593,7 +1610,6 @@ func (o *Orchestrator) processMissions(s *state.State) {
 		return
 	}
 
-	decomposer := mission.NewDecomposer(o.gh, o.cfg)
 	for _, issue := range issues {
 		// Skip if already tracked as a mission
 		if s.IsMissionParent(issue.Number) {

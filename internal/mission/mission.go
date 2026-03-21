@@ -24,10 +24,9 @@ func NewDecomposer(gh *github.Client, cfg *config.Config) *Decomposer {
 
 // ChildSpec describes a child issue to create from a mission decomposition.
 type ChildSpec struct {
-	Title     string
-	Body      string
-	Labels    []string
-	DependsOn []int // indices into the ChildSpec slice (not issue numbers)
+	Title  string
+	Body   string
+	Labels []string
 }
 
 // IsMissionIssue returns true if the issue has any of the configured mission labels.
@@ -103,7 +102,8 @@ func ParseChildSpecs(body string) []ChildSpec {
 }
 
 // DecomposeMission creates child issues for a mission and registers the mission in state.
-// It returns the list of created child issue numbers.
+// If the mission is already in decomposing state (partial failure recovery), it resumes
+// creating only the remaining children. Returns the full list of child issue numbers.
 func (d *Decomposer) DecomposeMission(s *state.State, issue github.Issue) ([]int, error) {
 	specs := ParseChildSpecs(issue.Body)
 	if len(specs) == 0 {
@@ -115,6 +115,21 @@ func (d *Decomposer) DecomposeMission(s *state.State, issue github.Issue) ([]int
 		log.Printf("[mission] issue #%d has %d tasks, capping at %d",
 			issue.Number, len(specs), d.cfg.Missions.MaxChildren)
 		specs = specs[:d.cfg.Missions.MaxChildren]
+	}
+
+	// Check for resume: if mission already exists in decomposing state, pick up where we left off
+	var childNumbers []int
+	startIdx := 0
+	if existing, ok := s.Missions[issue.Number]; ok && existing.Status == state.MissionStatusDecomposing {
+		childNumbers = existing.ChildIssues
+		startIdx = len(childNumbers)
+		if startIdx >= len(specs) {
+			// All children already created; advance to active
+			existing.Status = state.MissionStatusActive
+			return childNumbers, nil
+		}
+		log.Printf("[mission] resuming decomposition for #%d from child %d/%d",
+			issue.Number, startIdx+1, len(specs))
 	}
 
 	// Collect labels from parent (excluding mission labels themselves)
@@ -154,9 +169,9 @@ func (d *Decomposer) DecomposeMission(s *state.State, issue github.Issue) ([]int
 		}
 	}
 
-	// Create child issues
-	var childNumbers []int
-	for i, spec := range specs {
+	// Create child issues (starting from startIdx for resume)
+	for i := startIdx; i < len(specs); i++ {
+		spec := specs[i]
 		body := spec.Body
 
 		// Add blocker reference to parent
@@ -228,22 +243,24 @@ func (d *Decomposer) updateParentChecklist(parent github.Issue, childNumbers []i
 }
 
 // SyncMissionProgress checks child issue statuses and updates mission state.
-// Returns true if the mission is now complete (all children closed).
-func SyncMissionProgress(gh *github.Client, s *state.State, parentNumber int) (bool, error) {
+// Returns true if the mission is now complete (all children closed), along with
+// a map of child issue number to closed status (for use in progress reporting).
+func SyncMissionProgress(gh *github.Client, s *state.State, parentNumber int) (bool, map[int]bool, error) {
 	m, ok := s.Missions[parentNumber]
 	if !ok {
-		return false, fmt.Errorf("no mission found for parent #%d", parentNumber)
+		return false, nil, fmt.Errorf("no mission found for parent #%d", parentNumber)
 	}
 
 	if m.Status == state.MissionStatusDone {
-		return true, nil
+		return true, nil, nil
 	}
 
 	if len(m.ChildIssues) == 0 {
-		return false, fmt.Errorf("mission #%d has no child issues", parentNumber)
+		return false, nil, fmt.Errorf("mission #%d has no child issues", parentNumber)
 	}
 
 	allClosed := true
+	childStatuses := make(map[int]bool, len(m.ChildIssues))
 	for _, childNum := range m.ChildIssues {
 		closed, err := gh.IsIssueClosed(childNum)
 		if err != nil {
@@ -251,6 +268,7 @@ func SyncMissionProgress(gh *github.Client, s *state.State, parentNumber int) (b
 			allClosed = false
 			continue
 		}
+		childStatuses[childNum] = closed
 		if !closed {
 			allClosed = false
 		}
@@ -261,21 +279,23 @@ func SyncMissionProgress(gh *github.Client, s *state.State, parentNumber int) (b
 		m.Status = state.MissionStatusDone
 		m.CompletedAt = &now
 		log.Printf("[mission] mission #%d complete — all %d children closed", parentNumber, len(m.ChildIssues))
-		return true, nil
+		return true, childStatuses, nil
 	}
 
-	return false, nil
+	return false, childStatuses, nil
 }
 
 // BuildProgressComment builds a summary comment for the parent issue.
-func BuildProgressComment(gh *github.Client, m *state.Mission) string {
+// childStatuses maps child issue numbers to their closed status. If nil,
+// all children are assumed closed (used on mission completion).
+func BuildProgressComment(m *state.Mission, childStatuses map[int]bool) string {
 	var sb strings.Builder
 	sb.WriteString("## Mission Progress Update\n\n")
 
 	closed := 0
 	for _, childNum := range m.ChildIssues {
-		isClosed, err := gh.IsIssueClosed(childNum)
-		if err != nil {
+		isClosed, known := childStatuses[childNum]
+		if !known {
 			sb.WriteString(fmt.Sprintf("- ❓ #%d — status unknown\n", childNum))
 			continue
 		}
