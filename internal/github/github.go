@@ -373,6 +373,34 @@ func (c *Client) MergePR(prNumber int) error {
 	return nil
 }
 
+// ClosePR closes a pull request with an optional comment explaining why
+func (c *Client) ClosePR(prNumber int, comment string) error {
+	if comment != "" {
+		out, err := exec.Command("gh", "pr", "comment",
+			fmt.Sprint(prNumber),
+			"--repo", c.Repo,
+			"--body", comment).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("gh pr comment %d: %w\n%s", prNumber, err, out)
+		}
+	}
+	out, err := exec.Command("gh", "pr", "close",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr close %d: %w\n%s", prNumber, err, out)
+	}
+	return nil
+}
+
+// PRChecksOutput returns the raw output of `gh pr checks` for a PR
+func (c *Client) PRChecksOutput(prNumber int) string {
+	out, _ := exec.Command("gh", "pr", "checks",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo).CombinedOutput()
+	return string(out)
+}
+
 // CloseIssue closes a GitHub issue and leaves a comment explaining why
 func (c *Client) CloseIssue(number int, comment string) error {
 	if comment != "" {

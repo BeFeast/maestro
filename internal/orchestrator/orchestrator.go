@@ -58,6 +58,8 @@ type Orchestrator struct {
 	ghPRCIStatusFn         func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
 	ghMergePRFn            func(prNumber int) error
+	ghClosePRFn            func(prNumber int, comment string) error
+	ghPRChecksOutputFn     func(prNumber int) string
 	ghCloseIssueFn         func(number int, comment string) error
 	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
 	rebaseWorktreeFn       func(worktreePath, branch string, autoResolveFiles []string) error
@@ -136,6 +138,20 @@ func (o *Orchestrator) closeIssue(number int, comment string) error {
 		return o.ghCloseIssueFn(number, comment)
 	}
 	return o.gh.CloseIssue(number, comment)
+}
+
+func (o *Orchestrator) closePR(prNumber int, comment string) error {
+	if o.ghClosePRFn != nil {
+		return o.ghClosePRFn(prNumber, comment)
+	}
+	return o.gh.ClosePR(prNumber, comment)
+}
+
+func (o *Orchestrator) prChecksOutput(prNumber int) string {
+	if o.ghPRChecksOutputFn != nil {
+		return o.ghPRChecksOutputFn(prNumber)
+	}
+	return o.gh.PRChecksOutput(prNumber)
 }
 
 func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
@@ -317,6 +333,16 @@ func countSilentTimeoutKillsForIssue(s *state.State, issueNumber int) int {
 	return count
 }
 
+// maxSessionRetries returns the maximum number of retries allowed for a single
+// session. Uses MaxRetriesPerIssue from config (default 3, 0 = unlimited).
+func (o *Orchestrator) maxSessionRetries() int {
+	if o.cfg.MaxRetriesPerIssue > 0 {
+		return o.cfg.MaxRetriesPerIssue
+	}
+	// Default: 1 retry (backward-compatible with old hardcoded limit)
+	return 1
+}
+
 // retryBackoffMs computes the exponential backoff delay for a retry attempt.
 // Formula: min(10000 * 2^(attempt-1), maxRetryBackoffMs).
 // attempt is 1-based (the first retry is attempt 1).
@@ -369,6 +395,9 @@ func (o *Orchestrator) respawnDueRetries(s *state.State) {
 		}
 
 		promptBase := o.selectPrompt(issue)
+		if sess.CIFailureOutput != "" {
+			promptBase += fmt.Sprintf("\n\n---\n\n## Previous Attempt Failed: CI checks did not pass\n\nThe previous worker's PR was closed because CI failed. Here is the CI output:\n\n```\n%s\n```\n\nPlease fix the issues above in your implementation.\n", sess.CIFailureOutput)
+		}
 		if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
 			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, err)
 			sess.Status = state.StatusFailed
@@ -851,8 +880,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
 						slotName, sess.IssueNumber, sess.TriedBackends[len(sess.TriedBackends)-1], nextBackend)
-				} else if sess.RetryCount < 1 {
-					// First failure — schedule retry with exponential backoff
+				} else if sess.RetryCount < o.maxSessionRetries() {
+					// Schedule retry with exponential backoff
 					sess.RetryCount++
 					backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
@@ -1131,11 +1160,56 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}
-			// Only notify CI failure once — dedup via LastNotifiedStatus
-			if sess.LastNotifiedStatus != "ci_failure" {
-				o.notifier.Sendf("❌ maestro: CI failing for PR #%d (%s, issue #%d)", pr.Number, sess.Branch, sess.IssueNumber)
-				sess.LastNotifiedStatus = "ci_failure"
-				sess.NotifiedCIFail = true // backward compat
+			// Only act on CI failure once — dedup via LastNotifiedStatus
+			if sess.LastNotifiedStatus == "ci_failure" {
+				continue
+			}
+
+			// Capture CI check output before closing the PR
+			checksOutput := o.prChecksOutput(pr.Number)
+			sess.CIFailureOutput = checksOutput
+
+			// Close the failed PR with an explanatory comment
+			comment := fmt.Sprintf("🤖 Closing: CI checks failed. Maestro will retry with a fresh worker (attempt %d/%d).\n\n```\n%s\n```",
+				sess.RetryCount+1, o.maxSessionRetries(), checksOutput)
+			if err := o.closePR(pr.Number, comment); err != nil {
+				log.Printf("[orch] warn: could not close PR #%d: %v", pr.Number, err)
+			}
+
+			// Clean up worktree
+			if err := o.stopWorker(slotName, sess); err != nil {
+				log.Printf("[orch] warn: could not stop worker %s: %v", slotName, err)
+			}
+			sess.Worktree = ""
+
+			sess.LastNotifiedStatus = "ci_failure"
+			sess.NotifiedCIFail = true // backward compat
+
+			if sess.RetryCount < o.maxSessionRetries() {
+				// Schedule retry with exponential backoff
+				sess.RetryCount++
+				backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
+				retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
+				sess.NextRetryAt = &retryAt
+				sess.Status = state.StatusDead
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
+				log.Printf("[orch] CI failed on PR #%d, closing and scheduling retry %d in %dms",
+					pr.Number, sess.RetryCount, backoffMs)
+				o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), closed PR and scheduling retry %d in %ds",
+					pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
+			} else {
+				// Retry limit exhausted — mark as permanently failed
+				log.Printf("[orch] CI failed on PR #%d, retry limit exhausted (%d retries)", pr.Number, sess.RetryCount)
+				if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+				}
+				o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+				sess.Status = state.StatusFailed
+				now := time.Now().UTC()
+				sess.FinishedAt = &now
+				o.notifier.Sendf("💀 maestro: CI failed on PR #%d (issue #%d: %s), permanently failed after %d retries",
+					pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount)
 			}
 		case "pending":
 			if sess.Status == state.StatusQueued {
