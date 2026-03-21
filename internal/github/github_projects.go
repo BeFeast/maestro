@@ -47,7 +47,7 @@ var knownProjects = map[int]projectConfig{
 }
 
 // DetectProjectNumber queries GitHub for the first ProjectV2 linked to the repo
-// and returns its number. Returns 0 if no project is found or on error.
+// and returns its number. Returns (0, nil) if no project is found.
 func (c *Client) DetectProjectNumber() (int, error) {
 	parts := strings.SplitN(c.Repo, "/", 2)
 	if len(parts) != 2 {
@@ -102,13 +102,117 @@ func (c *Client) DetectProjectNumber() (int, error) {
 	return nodes[0].Number, nil
 }
 
+// fetchProjectConfig queries GitHub for a project's GraphQL node ID, status field ID,
+// and status option IDs, and caches the result in knownProjects for future calls.
+func (c *Client) fetchProjectConfig(projectNumber int) (projectConfig, error) {
+	parts := strings.SplitN(c.Repo, "/", 2)
+	if len(parts) != 2 {
+		return projectConfig{}, fmt.Errorf("invalid repo format %q, expected owner/name", c.Repo)
+	}
+	owner, name := parts[0], parts[1]
+
+	// Fetch project ID and status field with its options.
+	query := fmt.Sprintf(`query {
+  repository(owner: %q, name: %q) {
+    projectsV2(first: 20) {
+      nodes {
+        number
+        id
+        field(name: "Status") {
+          ... on ProjectV2SingleSelectField {
+            id
+            options { id name }
+          }
+        }
+      }
+    }
+  }
+}`, owner, name)
+
+	out, err := exec.Command("gh", "api", "graphql", "-f", "query="+query).Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return projectConfig{}, fmt.Errorf("graphql fetchProjectConfig: %w\nstderr: %s", err, exitErr.Stderr)
+		}
+		return projectConfig{}, fmt.Errorf("graphql fetchProjectConfig: %w", err)
+	}
+
+	var resp struct {
+		Data struct {
+			Repository struct {
+				ProjectsV2 struct {
+					Nodes []struct {
+						Number int    `json:"number"`
+						ID     string `json:"id"`
+						Field  *struct {
+							ID      string `json:"id"`
+							Options []struct {
+								ID   string `json:"id"`
+								Name string `json:"name"`
+							} `json:"options"`
+						} `json:"field"`
+					} `json:"nodes"`
+				} `json:"projectsV2"`
+			} `json:"repository"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return projectConfig{}, fmt.Errorf("parse fetchProjectConfig response: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		msgs := make([]string, len(resp.Errors))
+		for i, e := range resp.Errors {
+			msgs[i] = e.Message
+		}
+		return projectConfig{}, fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
+	}
+
+	for _, node := range resp.Data.Repository.ProjectsV2.Nodes {
+		if node.Number != projectNumber {
+			continue
+		}
+		if node.Field == nil {
+			return projectConfig{}, fmt.Errorf("project %d has no Status single-select field", projectNumber)
+		}
+
+		statusOpts := make(map[ProjectStatus]string)
+		for _, opt := range node.Field.Options {
+			switch strings.ToLower(opt.Name) {
+			case "todo":
+				statusOpts[ProjectStatusTodo] = opt.ID
+			case "in progress":
+				statusOpts[ProjectStatusInProgress] = opt.ID
+			case "done":
+				statusOpts[ProjectStatusDone] = opt.ID
+			}
+		}
+
+		cfg := projectConfig{
+			ProjectID:     node.ID,
+			StatusFieldID: node.Field.ID,
+			StatusOptions: statusOpts,
+		}
+		knownProjects[projectNumber] = cfg
+		return cfg, nil
+	}
+	return projectConfig{}, fmt.Errorf("project number %d not found in repo %s", projectNumber, c.Repo)
+}
+
 // SyncIssueToProject adds an issue to the GitHub Project and sets its status.
 // It is graceful: errors are logged but not returned, so callers are never blocked.
 func (c *Client) SyncIssueToProject(issueNumber int, projectNumber int, status ProjectStatus) {
 	cfg, ok := knownProjects[projectNumber]
 	if !ok {
-		log.Printf("[projects] unknown project number %d, skipping sync for issue #%d", projectNumber, issueNumber)
-		return
+		var err error
+		cfg, err = c.fetchProjectConfig(projectNumber)
+		if err != nil {
+			log.Printf("[projects] could not fetch config for project %d: %v", projectNumber, err)
+			return
+		}
+		log.Printf("[projects] dynamically fetched config for project %d", projectNumber)
 	}
 
 	optionID, ok := cfg.StatusOptions[status]
