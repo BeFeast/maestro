@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"sort"
@@ -334,13 +335,14 @@ func countSilentTimeoutKillsForIssue(s *state.State, issueNumber int) int {
 }
 
 // maxSessionRetries returns the maximum number of retries allowed for a single
-// session. Uses MaxRetriesPerIssue from config (default 3, 0 = unlimited).
+// session. Uses MaxRetriesPerIssue from config (default 3 via parse(),
+// 0 = unlimited).
 func (o *Orchestrator) maxSessionRetries() int {
-	if o.cfg.MaxRetriesPerIssue > 0 {
-		return o.cfg.MaxRetriesPerIssue
+	if o.cfg.MaxRetriesPerIssue == 0 {
+		// Explicit zero means unlimited; use a large sentinel.
+		return math.MaxInt32
 	}
-	// Default: 1 retry (backward-compatible with old hardcoded limit)
-	return 1
+	return o.cfg.MaxRetriesPerIssue
 }
 
 // retryBackoffMs computes the exponential backoff delay for a retry attempt.
@@ -1169,9 +1171,15 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			checksOutput := o.prChecksOutput(pr.Number)
 			sess.CIFailureOutput = checksOutput
 
-			// Close the failed PR with an explanatory comment
-			comment := fmt.Sprintf("🤖 Closing: CI checks failed. Maestro will retry with a fresh worker (attempt %d/%d).\n\n```\n%s\n```",
-				sess.RetryCount+1, o.maxSessionRetries(), checksOutput)
+			// Close the failed PR with an appropriate comment
+			var comment string
+			if sess.RetryCount < o.maxSessionRetries() {
+				comment = fmt.Sprintf("🤖 Closing: CI checks failed. Maestro will retry with a fresh worker (retry %d/%d).\n\n```\n%s\n```",
+					sess.RetryCount+1, o.maxSessionRetries(), checksOutput)
+			} else {
+				comment = fmt.Sprintf("🤖 Closing: CI checks failed and retry limit reached (%d/%d). Marking issue as blocked.\n\n```\n%s\n```",
+					sess.RetryCount, o.maxSessionRetries(), checksOutput)
+			}
 			if err := o.closePR(pr.Number, comment); err != nil {
 				log.Printf("[orch] warn: could not close PR #%d: %v", pr.Number, err)
 			}
@@ -1180,6 +1188,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			if err := o.stopWorker(slotName, sess); err != nil {
 				log.Printf("[orch] warn: could not stop worker %s: %v", slotName, err)
 			}
+			sess.PRNumber = 0
 			sess.Worktree = ""
 
 			sess.LastNotifiedStatus = "ci_failure"

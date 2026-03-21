@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -3799,9 +3800,10 @@ func TestCheckSessions_DeadWorkerSchedulesRetryWithBackoff(t *testing.T) {
 
 func TestCheckSessions_AlreadyRetriedWorkerFails(t *testing.T) {
 	cfg := &config.Config{
-		Repo:              "owner/repo",
-		MaxRetryBackoffMs: 300000,
-		MaxRuntimeMinutes: 999,
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 1,
 	}
 	labeled := make([]string, 0)
 	o := &Orchestrator{
@@ -4236,10 +4238,10 @@ func TestMaxSessionRetries_UsesConfig(t *testing.T) {
 	}
 }
 
-func TestMaxSessionRetries_DefaultsToOne(t *testing.T) {
+func TestMaxSessionRetries_ZeroMeansUnlimited(t *testing.T) {
 	o := &Orchestrator{cfg: &config.Config{}}
-	if got := o.maxSessionRetries(); got != 1 {
-		t.Fatalf("maxSessionRetries() = %d, want 1", got)
+	if got := o.maxSessionRetries(); got != math.MaxInt32 {
+		t.Fatalf("maxSessionRetries() = %d, want math.MaxInt32", got)
 	}
 }
 
