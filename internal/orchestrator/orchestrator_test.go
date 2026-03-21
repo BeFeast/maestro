@@ -496,7 +496,7 @@ func cfgWithBackends(defaultBackend string, backends ...string) *config.Config {
 func TestResolveBackend_ModelLabelOverride(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
 	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
-	got := o.resolveBackend(makeIssue(1, "Fix bug", "model:codex"))
+	got := o.resolveBackend(makeIssue(1, "Fix bug", "model:codex"), "")
 	if got != "codex" {
 		t.Errorf("resolveBackend() = %q, want %q", got, "codex")
 	}
@@ -505,7 +505,7 @@ func TestResolveBackend_ModelLabelOverride(t *testing.T) {
 func TestResolveBackend_ModelLabelGemini(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
 	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
-	got := o.resolveBackend(makeIssue(2, "Add feature", "enhancement", "model:gemini"))
+	got := o.resolveBackend(makeIssue(2, "Add feature", "enhancement", "model:gemini"), "")
 	if got != "gemini" {
 		t.Errorf("resolveBackend() = %q, want %q", got, "gemini")
 	}
@@ -514,7 +514,7 @@ func TestResolveBackend_ModelLabelGemini(t *testing.T) {
 func TestResolveBackend_UnknownBackendFallsToDefault(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex")
 	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
-	got := o.resolveBackend(makeIssue(3, "Fix bug", "model:nonexistent"))
+	got := o.resolveBackend(makeIssue(3, "Fix bug", "model:nonexistent"), "")
 	if got != "claude" {
 		t.Errorf("resolveBackend() = %q, want %q (unknown backend should fall back to default)", got, "claude")
 	}
@@ -523,7 +523,7 @@ func TestResolveBackend_UnknownBackendFallsToDefault(t *testing.T) {
 func TestResolveBackend_NoLabelReturnsDefault(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex")
 	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
-	got := o.resolveBackend(makeIssue(4, "Fix bug"))
+	got := o.resolveBackend(makeIssue(4, "Fix bug"), "")
 	if got != "claude" {
 		t.Errorf("resolveBackend() = %q, want %q", got, "claude")
 	}
@@ -537,7 +537,7 @@ func TestResolveBackend_NoLabelWithAutoRouting(t *testing.T) {
 		return "codex", "simple fix", nil
 	}
 	o := &Orchestrator{cfg: cfg, router: r}
-	got := o.resolveBackend(makeIssue(5, "Simple fix"))
+	got := o.resolveBackend(makeIssue(5, "Simple fix"), "")
 	if got != "codex" {
 		t.Errorf("resolveBackend() = %q, want %q", got, "codex")
 	}
@@ -553,7 +553,7 @@ func TestResolveBackend_LabelOverridesAutoRouting(t *testing.T) {
 		return "codex", "router pick", nil
 	}
 	o := &Orchestrator{cfg: cfg, router: r}
-	got := o.resolveBackend(makeIssue(6, "Fix bug", "model:gemini"))
+	got := o.resolveBackend(makeIssue(6, "Fix bug", "model:gemini"), "")
 	if got != "gemini" {
 		t.Errorf("resolveBackend() = %q, want %q (label should override auto-routing)", got, "gemini")
 	}
@@ -570,7 +570,7 @@ func TestResolveBackend_AutoRoutingErrorFallsToDefault(t *testing.T) {
 		return "", "", fmt.Errorf("network error")
 	}
 	o := &Orchestrator{cfg: cfg, router: r}
-	got := o.resolveBackend(makeIssue(7, "Fix bug"))
+	got := o.resolveBackend(makeIssue(7, "Fix bug"), "")
 	if got != "claude" {
 		t.Errorf("resolveBackend() = %q, want %q (should fall back on router error)", got, "claude")
 	}
@@ -586,7 +586,7 @@ func TestResolveBackend_AutoRoutingDisabled(t *testing.T) {
 		return "codex", "router pick", nil
 	}
 	o := &Orchestrator{cfg: cfg, router: r}
-	got := o.resolveBackend(makeIssue(8, "Fix bug"))
+	got := o.resolveBackend(makeIssue(8, "Fix bug"), "")
 	if got != "claude" {
 		t.Errorf("resolveBackend() = %q, want %q", got, "claude")
 	}
@@ -599,7 +599,7 @@ func TestResolveBackend_EmptyModelLabelIgnored(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex")
 	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
 	// "model:" with no value after the colon should be ignored
-	got := o.resolveBackend(makeIssue(9, "Fix bug", "model:"))
+	got := o.resolveBackend(makeIssue(9, "Fix bug", "model:"), "")
 	if got != "claude" {
 		t.Errorf("resolveBackend() = %q, want %q (empty model: label should be ignored)", got, "claude")
 	}
@@ -608,7 +608,7 @@ func TestResolveBackend_EmptyModelLabelIgnored(t *testing.T) {
 func TestResolveBackend_MultipleLabelsFirstModelWins(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex", "gemini")
 	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
-	got := o.resolveBackend(makeIssue(10, "Fix bug", "bug", "model:codex", "model:gemini"))
+	got := o.resolveBackend(makeIssue(10, "Fix bug", "bug", "model:codex", "model:gemini"), "")
 	if got != "codex" {
 		t.Errorf("resolveBackend() = %q, want %q (first model: label should win)", got, "codex")
 	}

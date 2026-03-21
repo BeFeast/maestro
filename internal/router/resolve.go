@@ -39,6 +39,22 @@ const (
 	RoleValidator   = "validator"
 )
 
+// resolveFromLabel checks for a model:<backend> label override on the issue.
+// Returns (backend, reason, true) if a label was found, or ("", "", false) otherwise.
+func (r *Router) resolveFromLabel(issue github.Issue) (string, string, bool) {
+	name := BackendFromLabels(issue)
+	if name == "" {
+		return "", "", false
+	}
+	validated, ok := ValidateBackend(name, r.cfg)
+	if !ok {
+		log.Printf("[router] issue #%d: label specifies unknown backend %q, falling back to default %q",
+			issue.Number, name, r.cfg.Model.Default)
+		return validated, "unknown label backend", true
+	}
+	return validated, "label", true
+}
+
 // ResolveBackendForRole determines the backend for a specific role within the
 // planner → implementer → validator pipeline. Priority:
 //  1. model:<backend> label on the issue (highest, overrides everything)
@@ -48,16 +64,12 @@ const (
 // If the role-specific backend is not configured or references an unknown
 // backend, falls back to issue-level resolution.
 func (r *Router) ResolveBackendForRole(issue github.Issue, role string) (backendName, reason string) {
-	// 1. Label override always wins (same as ResolveBackend)
-	if name := BackendFromLabels(issue); name != "" {
-		validated, ok := ValidateBackend(name, r.cfg)
-		if !ok {
-			log.Printf("[router] issue #%d: label specifies unknown backend %q, falling back to default %q",
-				issue.Number, name, r.cfg.Model.Default)
-			return validated, "unknown label backend"
+	// 1. Label override always wins
+	if backend, reason, found := r.resolveFromLabel(issue); found {
+		if reason == "label" {
+			log.Printf("[router] issue #%d [%s] → %s (label override)", issue.Number, role, backend)
 		}
-		log.Printf("[router] issue #%d [%s] → %s (label override)", issue.Number, role, validated)
-		return validated, "label"
+		return backend, reason
 	}
 
 	// 2. Role-specific backend from config
@@ -80,8 +92,8 @@ func (r *Router) ResolveBackendForRole(issue github.Issue, role string) (backend
 			issue.Number, role, roleBackend)
 	}
 
-	// 3. Fall back to issue-level resolution
-	return r.ResolveBackend(issue)
+	// 3. Fall back to issue-level resolution (inline to avoid redundant label check)
+	return r.resolveIssueLevel(issue)
 }
 
 // ResolveBackend determines the backend for an issue using 3-tier priority:
@@ -90,18 +102,22 @@ func (r *Router) ResolveBackendForRole(issue github.Issue, role string) (backend
 //  3. Default backend from config
 func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string) {
 	// 1. Check for model: label (highest priority)
-	if name := BackendFromLabels(issue); name != "" {
-		validated, ok := ValidateBackend(name, r.cfg)
-		if !ok {
-			log.Printf("[router] issue #%d: label specifies unknown backend %q, falling back to default %q",
-				issue.Number, name, r.cfg.Model.Default)
-			return validated, "unknown label backend"
+	if backend, reason, found := r.resolveFromLabel(issue); found {
+		if reason == "label" {
+			log.Printf("[router] issue #%d → %s (label override)", issue.Number, backend)
 		}
-		log.Printf("[router] issue #%d → %s (label override)", issue.Number, validated)
-		return validated, "label"
+		return backend, reason
 	}
 
-	// 2. Auto-routing via LLM (if enabled)
+	// 2. Auto-routing / default
+	return r.resolveIssueLevel(issue)
+}
+
+// resolveIssueLevel handles auto-routing and default backend resolution.
+// Extracted so ResolveBackendForRole can skip the redundant label check
+// when falling back to issue-level routing.
+func (r *Router) resolveIssueLevel(issue github.Issue) (backendName, reason string) {
+	// Auto-routing via LLM (if enabled)
 	if r.cfg.Routing.Mode == "auto" {
 		routeFn := r.Route
 		if r.RouteFn != nil {
@@ -117,6 +133,6 @@ func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string)
 		// Fall through to default on error or empty backend
 	}
 
-	// 3. Default backend
+	// Default backend
 	return r.cfg.Model.Default, "default"
 }

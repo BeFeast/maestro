@@ -1398,13 +1398,16 @@ func (o *Orchestrator) findOpenBlockers(blockers []int) []int {
 	return open
 }
 
-// resolveBackend determines which backend to use for the given issue.
-// Delegates to router.ResolveBackend which applies 3-tier priority:
+// resolveBackend determines which backend to use for the given issue and role.
+// Delegates to router.ResolveBackendForRole which applies priority:
 //  1. model:<backend> label on the issue (highest priority)
-//  2. Auto-routing via LLM (if routing.mode == "auto")
-//  3. Default backend from config
-func (o *Orchestrator) resolveBackend(issue github.Issue) string {
-	name, _ := o.router.ResolveBackend(issue)
+//  2. Role-specific backend from routing config (planner_backend, etc.)
+//  3. Auto-routing via LLM (if routing.mode == "auto")
+//  4. Default backend from config
+//
+// Pass an empty role to skip role-specific routing.
+func (o *Orchestrator) resolveBackend(issue github.Issue, role string) string {
+	name, _ := o.router.ResolveBackendForRole(issue, role)
 	return name
 }
 
@@ -1515,8 +1518,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
-		// Resolve backend from label / auto-routing / default
-		backendName := o.resolveBackend(issue)
+		// Resolve backend from label / role config / auto-routing / default
+		backendName := o.resolveBackend(issue, router.RoleImplementer)
 
 		// Detect long-running label
 		longRunning := false
