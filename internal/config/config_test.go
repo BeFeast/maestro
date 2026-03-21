@@ -991,7 +991,6 @@ max_concurrent_by_state:
 	}
 }
 
-
 func TestParse_MaxRetryBackoffMsDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))

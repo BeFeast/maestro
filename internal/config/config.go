@@ -59,6 +59,22 @@ type ServerConfig struct {
 	Port int `yaml:"port"` // 0 = disabled (default)
 }
 
+// RoleConfig defines settings for a single pipeline role (planner, validator).
+type RoleConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	Backend           string `yaml:"backend"`             // backend name from model.backends (empty = use default)
+	Prompt            string `yaml:"prompt"`              // path to prompt template (empty = built-in default)
+	MaxRuntimeMinutes int    `yaml:"max_runtime_minutes"` // override per-role max runtime (0 = use global)
+}
+
+// PipelineConfig controls the planner → implementer → validator pipeline.
+type PipelineConfig struct {
+	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline (default: false = legacy single-phase)
+	Planner   RoleConfig `yaml:"planner"`   // planner role settings
+	Validator RoleConfig `yaml:"validator"` // validator role settings
+	// Implementer uses the existing worker_prompt / bug_prompt / enhancement_prompt settings.
+}
+
 // HooksConfig holds lifecycle hook scripts that run at key points.
 type HooksConfig struct {
 	AfterCreate  string `yaml:"after_create"`  // runs once when a new issue workspace is first created
@@ -101,10 +117,11 @@ type Config struct {
 	MaxRetryBackoffMs          int                  `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
+	Pipeline                   PipelineConfig       `yaml:"pipeline"`
 	Hooks                      HooksConfig          `yaml:"hooks"`
-	BlockerPatterns            []string             `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
-	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
-	SourcePath                 string               `yaml:"-"`                          // path the config was loaded from (not serialized)
+	BlockerPatterns            []string             `yaml:"blocker_patterns"`      // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
+	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"` // override poll interval from config (0 = use CLI flag)
+	SourcePath                 string               `yaml:"-"`                     // path the config was loaded from (not serialized)
 }
 
 // LoadFrom loads config from a specific path.
@@ -210,6 +227,8 @@ func parse(data []byte) (*Config, error) {
 	cfg.WorkerPrompt = expandHome(cfg.WorkerPrompt)
 	cfg.BugPrompt = expandHome(cfg.BugPrompt)
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
+	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
+	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
 	cfg.StateDir = expandHome(cfg.StateDir)
 
 	// Default session_prefix: first 3 chars of repo name
