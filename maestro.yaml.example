@@ -49,6 +49,11 @@ worker_prompt: /path/to/worker-prompt-template.md
 # deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
 # deploy_timeout_minutes: 15         # timeout for deploy command in minutes (default: 15)
 
+# GitHub Projects integration — sync issue status to project board
+# github_projects:
+#   enabled: true
+#   project_number: 4  # optional: auto-detected from repo if omitted or 0
+
 # Telegram notifications
 telegram:
   target: "YOUR_TELEGRAM_CHAT_ID"

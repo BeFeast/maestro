@@ -74,10 +74,24 @@ func New(cfg *config.Config) *Orchestrator {
 		n.SetDigestMode(true)
 		log.Printf("[orch] digest mode enabled — notifications will be batched per cycle")
 	}
+	gh := github.New(cfg.Repo)
+
+	// Auto-detect project number if github_projects is enabled but no project_number set.
+	if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber == 0 {
+		if num, err := gh.DetectProjectNumber(); err != nil {
+			log.Printf("[orch] could not auto-detect project number: %v", err)
+		} else if num > 0 {
+			cfg.GitHubProjects.ProjectNumber = num
+			log.Printf("[orch] auto-detected project number %d for repo %s", num, cfg.Repo)
+		} else {
+			log.Printf("[orch] no GitHub Project found for repo %s, project sync disabled", cfg.Repo)
+		}
+	}
+
 	return &Orchestrator{
 		cfg:      cfg,
 		notifier: n,
-		gh:       github.New(cfg.Repo),
+		gh:       gh,
 		router:   router.New(cfg),
 		repo:     cfg.Repo,
 	}

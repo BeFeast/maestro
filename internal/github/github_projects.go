@@ -46,6 +46,62 @@ var knownProjects = map[int]projectConfig{
 	},
 }
 
+// DetectProjectNumber queries GitHub for the first ProjectV2 linked to the repo
+// and returns its number. Returns 0 if no project is found or on error.
+func (c *Client) DetectProjectNumber() (int, error) {
+	parts := strings.SplitN(c.Repo, "/", 2)
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid repo format %q, expected owner/name", c.Repo)
+	}
+	owner, name := parts[0], parts[1]
+
+	query := fmt.Sprintf(`query {
+  repository(owner: %q, name: %q) {
+    projectsV2(first: 1) {
+      nodes { number }
+    }
+  }
+}`, owner, name)
+
+	out, err := exec.Command("gh", "api", "graphql", "-f", "query="+query).Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return 0, fmt.Errorf("graphql projectsV2: %w\nstderr: %s", err, exitErr.Stderr)
+		}
+		return 0, fmt.Errorf("graphql projectsV2: %w", err)
+	}
+
+	var resp struct {
+		Data struct {
+			Repository struct {
+				ProjectsV2 struct {
+					Nodes []struct {
+						Number int `json:"number"`
+					} `json:"nodes"`
+				} `json:"projectsV2"`
+			} `json:"repository"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return 0, fmt.Errorf("parse projectsV2 response: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		msgs := make([]string, len(resp.Errors))
+		for i, e := range resp.Errors {
+			msgs[i] = e.Message
+		}
+		return 0, fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
+	}
+	nodes := resp.Data.Repository.ProjectsV2.Nodes
+	if len(nodes) == 0 {
+		return 0, nil
+	}
+	return nodes[0].Number, nil
+}
+
 // SyncIssueToProject adds an issue to the GitHub Project and sets its status.
 // It is graceful: errors are logged but not returned, so callers are never blocked.
 func (c *Client) SyncIssueToProject(issueNumber int, projectNumber int, status ProjectStatus) {

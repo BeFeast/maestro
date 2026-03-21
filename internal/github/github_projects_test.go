@@ -42,3 +42,11 @@ func TestProjectStatusConstants(t *testing.T) {
 		t.Errorf("ProjectStatusDone = %q, want %q", ProjectStatusDone, "done")
 	}
 }
+
+func TestDetectProjectNumber_InvalidRepoFormat(t *testing.T) {
+	c := &Client{Repo: "invalid-no-slash"}
+	_, err := c.DetectProjectNumber()
+	if err == nil {
+		t.Error("expected error for invalid repo format, got nil")
+	}
+}
