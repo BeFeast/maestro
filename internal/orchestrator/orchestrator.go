@@ -14,6 +14,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mission"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
@@ -469,6 +470,11 @@ func (o *Orchestrator) RunOnce() error {
 
 	// Step 4: Rebase conflicting PRs
 	o.rebaseConflicts(s)
+
+	// Step 4b: Process missions — decompose new ones, sync progress on active ones
+	if o.cfg.Missions.Enabled {
+		o.processMissions(s)
+	}
 
 	// Save after all checks/reconciliation
 	if err := state.Save(o.cfg.StateDir, s); err != nil {
@@ -1468,6 +1474,11 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
+		// Skip mission/epic issues — they are handled by processMissions
+		if o.cfg.Missions.Enabled && mission.IsMissionIssue(issue, o.cfg.Missions.Labels) {
+			continue
+		}
+
 		// Check retry limit: skip issues that have exhausted their retry budget
 		if o.cfg.MaxRetriesPerIssue > 0 {
 			failed := s.FailedAttemptsForIssue(issue.Number)
@@ -1547,5 +1558,63 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 	if started == 0 {
 		log.Printf("[orch] no new workers started (%d issues checked)", len(issues))
+	}
+}
+
+// processMissions handles mission mode: decompose new mission issues and sync progress.
+func (o *Orchestrator) processMissions(s *state.State) {
+	// 1. Sync progress on active missions
+	for parentNum, m := range s.Missions {
+		if m.Status == state.MissionStatusDone {
+			continue
+		}
+
+		done, err := mission.SyncMissionProgress(o.gh, s, parentNum)
+		if err != nil {
+			log.Printf("[mission] sync progress for #%d: %v", parentNum, err)
+			continue
+		}
+
+		if done {
+			o.notifier.Sendf("🏁 Mission #%d complete — all %d child issues closed", parentNum, len(m.ChildIssues))
+			// Close the parent issue
+			comment := mission.BuildProgressComment(o.gh, m)
+			if err := o.closeIssue(parentNum, comment); err != nil {
+				log.Printf("[mission] warn: could not close parent issue #%d: %v", parentNum, err)
+			}
+			o.syncProject(parentNum, github.ProjectStatusDone)
+		}
+	}
+
+	// 2. Detect and decompose new mission issues
+	issues, err := o.listOpenIssues(o.cfg.Missions.Labels)
+	if err != nil {
+		log.Printf("[mission] list mission issues: %v", err)
+		return
+	}
+
+	decomposer := mission.NewDecomposer(o.gh, o.cfg)
+	for _, issue := range issues {
+		// Skip if already tracked as a mission
+		if s.IsMissionParent(issue.Number) {
+			continue
+		}
+
+		// Skip if not actually a mission issue (could be fetched via other labels)
+		if !mission.IsMissionIssue(issue, o.cfg.Missions.Labels) {
+			continue
+		}
+
+		log.Printf("[mission] decomposing mission issue #%d: %s", issue.Number, issue.Title)
+		children, err := decomposer.DecomposeMission(s, issue)
+		if err != nil {
+			log.Printf("[mission] decompose #%d: %v", issue.Number, err)
+			o.notifier.Sendf("⚠️ Mission #%d decomposition failed: %v", issue.Number, err)
+			continue
+		}
+
+		o.syncProject(issue.Number, github.ProjectStatusInProgress)
+		o.notifier.Sendf("📋 Mission #%d decomposed into %d child issues: %v",
+			issue.Number, len(children), children)
 	}
 }
