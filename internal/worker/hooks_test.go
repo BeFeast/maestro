@@ -3,6 +3,7 @@ package worker
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/befeast/maestro/internal/config"
@@ -30,7 +31,7 @@ func TestRunHook_Success(t *testing.T) {
 		Repo:  "owner/repo",
 		Hooks: config.HooksConfig{TimeoutMs: 5000},
 	}
-	env := HookEnv{IssueNumber: 42, WorkspacePath: dir}
+	env := HookEnv{IssueID: "owner/repo#42", IssueNumber: 42, WorkspacePath: dir}
 
 	script := "echo hello > " + marker
 	if err := RunHook(cfg, "after_create", script, env); err != nil {
@@ -66,7 +67,7 @@ func TestRunHook_Timeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
-	if got := err.Error(); !contains(got, "timed out") {
+	if got := err.Error(); !strings.Contains(got, "timed out") {
 		t.Fatalf("expected timeout error, got: %v", err)
 	}
 }
@@ -95,13 +96,13 @@ func TestRunHook_EnvVars(t *testing.T) {
 		t.Fatalf("read output: %v", err)
 	}
 	got := string(data)
-	if !contains(got, "ID=owner/repo#42") {
+	if !strings.Contains(got, "ID=owner/repo#42") {
 		t.Errorf("ISSUE_ID not set correctly, got: %s", got)
 	}
-	if !contains(got, "NUM=42") {
+	if !strings.Contains(got, "NUM=42") {
 		t.Errorf("ISSUE_NUMBER not set correctly, got: %s", got)
 	}
-	if !contains(got, "WS="+dir) {
+	if !strings.Contains(got, "WS="+dir) {
 		t.Errorf("WORKSPACE_PATH not set correctly, got: %s", got)
 	}
 }
@@ -126,20 +127,7 @@ func TestRunHook_WorkingDirectory(t *testing.T) {
 		t.Fatalf("read output: %v", err)
 	}
 	got := string(data)
-	if !contains(got, dir) {
+	if !strings.Contains(got, dir) {
 		t.Errorf("expected working dir %s, got: %s", dir, got)
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
-}
-
-func containsStr(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
