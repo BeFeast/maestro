@@ -632,6 +632,8 @@ func slugify(title string) string {
 // If the base template contains {{ISSUE_NUMBER}} placeholders, it performs
 // template substitution. Otherwise it falls back to appending a task block.
 func assemblePrompt(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config) string {
+	var prompt string
+
 	if strings.Contains(base, "{{ISSUE_NUMBER}}") {
 		// Template-style substitution
 		r := strings.NewReplacer(
@@ -642,11 +644,10 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 			"{{WORKTREE}}", worktreePath,
 			"{{REPO}}", cfg.Repo,
 		)
-		return r.Replace(base)
-	}
-
-	// Legacy: append task block after base prompt
-	return fmt.Sprintf(`%s
+		prompt = r.Replace(base)
+	} else {
+		// Legacy: append task block after base prompt
+		prompt = fmt.Sprintf(`%s
 
 ---
 
@@ -675,16 +676,28 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 Important: Always run cargo fmt --all before committing if this is a Rust project.
 Always rebase on origin/main immediately before creating the PR.
 `,
-		base,
-		issue.Number, issue.Title,
-		cfg.Repo,
-		worktreePath,
-		issue.Body,
-		worktreePath,
-		cfg.Repo,
-		issue.Title,
-		issue.Number,
-	)
+			base,
+			issue.Number, issue.Title,
+			cfg.Repo,
+			worktreePath,
+			issue.Body,
+			worktreePath,
+			cfg.Repo,
+			issue.Title,
+			issue.Number,
+		)
+	}
+
+	// Inject test-first guidance and validation contract when enabled
+	if cfg.TestFirst {
+		prompt += testFirstGuidance()
+
+		if vc := readValidationContract(worktreePath); vc != "" {
+			prompt += "\n---\n\n## Validation Contract (from VALIDATION.md)\n\n" + vc
+		}
+	}
+
+	return prompt
 }
 
 // SlotNameFromPID finds a slot name by PID string (for display)

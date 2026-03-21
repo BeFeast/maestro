@@ -260,6 +260,29 @@ worker_prompt: /path/to/default.md
 	}
 }
 
+func TestParse_TestFirst(t *testing.T) {
+	yamlEnabled := `
+repo: owner/repo
+test_first: true
+`
+	cfg, err := parse([]byte(yamlEnabled))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.TestFirst {
+		t.Error("TestFirst should be true when set")
+	}
+
+	yamlDefault := `repo: owner/repo`
+	cfg2, err := parse([]byte(yamlDefault))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg2.TestFirst {
+		t.Error("TestFirst should default to false")
+	}
+}
+
 func TestParse_DifferentReposDifferentStateDirs(t *testing.T) {
 	yaml1 := `repo: BeFeast/panoptikon`
 	yaml2 := `repo: BeFeast/myapp`
@@ -990,7 +1013,6 @@ max_concurrent_by_state:
 		t.Errorf("pr_open = %d, want 2 (key should be normalized to lowercase)", cfg.MaxConcurrentByState["pr_open"])
 	}
 }
-
 
 func TestParse_MaxRetryBackoffMsDefault(t *testing.T) {
 	yaml := `repo: owner/repo`

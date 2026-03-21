@@ -45,6 +45,17 @@ exclude_labels:
 # Worker prompt template (Markdown file with instructions for AI workers)
 worker_prompt: /path/to/worker-prompt-template.md
 
+# Test-first guidance: inject test-first workflow and read VALIDATION.md from worktree
+# test_first: true
+
+# Workspace lifecycle hooks
+# hooks:
+#   after_create: /path/to/scripts/generate-validation.sh   # generates VALIDATION.md in worktree
+#   before_run: ""
+#   after_run: ""
+#   before_remove: ""
+#   timeout_ms: 60000
+
 # Optional: command to run after successful merge (build + deploy)
 # deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
 # deploy_timeout_minutes: 15         # timeout for deploy command in minutes (default: 15)
