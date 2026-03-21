@@ -991,7 +991,6 @@ max_concurrent_by_state:
 	}
 }
 
-
 func TestParse_MaxRetryBackoffMsDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
@@ -1088,5 +1087,70 @@ hooks:
 	}
 	if cfg.Hooks.TimeoutMs != 60000 {
 		t.Errorf("Hooks.TimeoutMs = %d, want 60000 (default)", cfg.Hooks.TimeoutMs)
+	}
+}
+
+func TestParse_SoftTokenThresholdDefault(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_max_tokens: 100000
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSoftTokenThreshold != 0.8 {
+		t.Errorf("WorkerSoftTokenThreshold = %f, want 0.8", cfg.WorkerSoftTokenThreshold)
+	}
+	if cfg.SoftTokenThreshold() != 80000 {
+		t.Errorf("SoftTokenThreshold() = %d, want 80000", cfg.SoftTokenThreshold())
+	}
+}
+
+func TestParse_SoftTokenThresholdExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_max_tokens: 100000
+worker_soft_token_threshold: 0.5
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSoftTokenThreshold != 0.5 {
+		t.Errorf("WorkerSoftTokenThreshold = %f, want 0.5", cfg.WorkerSoftTokenThreshold)
+	}
+	if cfg.SoftTokenThreshold() != 50000 {
+		t.Errorf("SoftTokenThreshold() = %d, want 50000", cfg.SoftTokenThreshold())
+	}
+}
+
+func TestParse_SoftTokenThresholdDisabledWhenNoMaxTokens(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// No max_tokens means soft threshold should be 0 (disabled)
+	if cfg.WorkerSoftTokenThreshold != 0 {
+		t.Errorf("WorkerSoftTokenThreshold = %f, want 0 (disabled)", cfg.WorkerSoftTokenThreshold)
+	}
+	if cfg.SoftTokenThreshold() != 0 {
+		t.Errorf("SoftTokenThreshold() = %d, want 0", cfg.SoftTokenThreshold())
+	}
+}
+
+func TestSoftTokenThreshold_ClampedAbove1(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_max_tokens: 100000
+worker_soft_token_threshold: 1.5
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSoftTokenThreshold != 1.0 {
+		t.Errorf("WorkerSoftTokenThreshold = %f, want 1.0 (clamped)", cfg.WorkerSoftTokenThreshold)
 	}
 }

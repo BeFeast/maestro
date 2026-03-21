@@ -46,6 +46,8 @@ type Orchestrator struct {
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	getIssueFn      func(number int) (github.Issue, error)
+	// checkpointRespawnFn: used by soft token threshold for checkpoint+respawn (tests override)
+	checkpointRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 
 	// Testing hooks for startNewWorkers
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
@@ -161,6 +163,13 @@ func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue
 		return o.workerRespawnFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
 	return worker.Respawn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+}
+
+func (o *Orchestrator) checkpointRespawn(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	if o.checkpointRespawnFn != nil {
+		return o.checkpointRespawnFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+	}
+	return worker.RespawnWithCheckpoint(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 }
 
 func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
@@ -962,7 +971,34 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						}
 					}
 
-					// --- Token limit enforcement ---
+					// --- Soft token threshold: checkpoint + respawn ---
+					if softThreshold := o.cfg.SoftTokenThreshold(); softThreshold > 0 &&
+						sess.TokensUsed >= softThreshold &&
+						!sess.SoftThresholdNotified &&
+						sess.LastNotifiedStatus != "token_limit" {
+
+						log.Printf("[orch] worker %s reached soft token threshold (%d >= %d), triggering checkpoint respawn",
+							slotName, sess.TokensUsed, softThreshold)
+						sess.SoftThresholdNotified = true
+
+						issue, fetchErr := o.getIssue(sess.IssueNumber)
+						if fetchErr != nil {
+							log.Printf("[orch] fetch issue #%d for checkpoint respawn: %v — skipping checkpoint", sess.IssueNumber, fetchErr)
+						} else {
+							o.runAfterRunHook(sess)
+							promptBase := o.selectPrompt(issue)
+							if respawnErr := o.checkpointRespawn(slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
+								log.Printf("[orch] checkpoint respawn %s failed: %v — worker continues with hard limit as safety net", slotName, respawnErr)
+							} else {
+								log.Printf("[orch] checkpoint respawn %s successful, fresh token budget", slotName)
+								o.notifier.Sendf("🔄 Worker %s (issue #%d) checkpointed at %s tokens — respawned with fresh budget",
+									slotName, sess.IssueNumber, worker.FormatTokens(softThreshold))
+								continue
+							}
+						}
+					}
+
+					// --- Token limit enforcement (hard limit / safety net) ---
 					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsed > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
 						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
 							slotName, sess.TokensUsed, o.cfg.WorkerMaxTokens)

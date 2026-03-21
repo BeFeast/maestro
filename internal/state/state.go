@@ -23,29 +23,30 @@ const (
 )
 
 type Session struct {
-	IssueNumber         int           `json:"issue_number"`
-	IssueTitle          string        `json:"issue_title"`
-	Worktree            string        `json:"worktree"`
-	Branch              string        `json:"branch"`
-	PID                 int           `json:"pid"`
-	TmuxSession         string        `json:"tmux_session,omitempty"`
-	LogFile             string        `json:"log_file"`
-	StartedAt           time.Time     `json:"started_at"`
-	FinishedAt          *time.Time    `json:"finished_at,omitempty"`
-	Status              SessionStatus `json:"status"`
-	PRNumber            int           `json:"pr_number,omitempty"`
-	Backend             string        `json:"backend,omitempty"` // "claude", "codex", etc.
-	LongRunning         bool          `json:"long_running,omitempty"`
-	RebaseAttempted     bool          `json:"rebase_attempted,omitempty"`
-	NotifiedCIFail      bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
-	LastNotifiedStatus  string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
-	RetryCount          int           `json:"retry_count,omitempty"`
-	NextRetryAt         *time.Time    `json:"next_retry_at,omitempty"`
-	LastOutputHash      string        `json:"last_output_hash,omitempty"`
-	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`
-	TokensUsed          int           `json:"tokens_used,omitempty"`    // cumulative tokens consumed by the worker
-	RateLimitHit        bool          `json:"rate_limit_hit,omitempty"` // true if worker was rate-limited (tmux detection, running worker)
-	TriedBackends       []string      `json:"tried_backends,omitempty"` // backends already attempted (for rate-limit fallback)
+	IssueNumber           int           `json:"issue_number"`
+	IssueTitle            string        `json:"issue_title"`
+	Worktree              string        `json:"worktree"`
+	Branch                string        `json:"branch"`
+	PID                   int           `json:"pid"`
+	TmuxSession           string        `json:"tmux_session,omitempty"`
+	LogFile               string        `json:"log_file"`
+	StartedAt             time.Time     `json:"started_at"`
+	FinishedAt            *time.Time    `json:"finished_at,omitempty"`
+	Status                SessionStatus `json:"status"`
+	PRNumber              int           `json:"pr_number,omitempty"`
+	Backend               string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	LongRunning           bool          `json:"long_running,omitempty"`
+	RebaseAttempted       bool          `json:"rebase_attempted,omitempty"`
+	NotifiedCIFail        bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
+	LastNotifiedStatus    string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
+	RetryCount            int           `json:"retry_count,omitempty"`
+	NextRetryAt           *time.Time    `json:"next_retry_at,omitempty"`
+	LastOutputHash        string        `json:"last_output_hash,omitempty"`
+	LastOutputChangedAt   time.Time     `json:"last_output_changed_at,omitempty"`
+	TokensUsed            int           `json:"tokens_used,omitempty"`             // cumulative tokens consumed by the worker
+	SoftThresholdNotified bool          `json:"soft_threshold_notified,omitempty"` // true if soft token threshold was reached and checkpoint triggered
+	RateLimitHit          bool          `json:"rate_limit_hit,omitempty"`          // true if worker was rate-limited (tmux detection, running worker)
+	TriedBackends         []string      `json:"tried_backends,omitempty"`          // backends already attempted (for rate-limit fallback)
 }
 
 type State struct {

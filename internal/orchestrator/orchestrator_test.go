@@ -1384,6 +1384,210 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 	}
 }
 
+func TestCheckSessions_SoftThreshold_TriggersCheckpointRespawn(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8, // soft at 80k
+		MaxRuntimeMinutes:        999,
+	}
+	// Worker reports 85,000 tokens — above soft threshold (80k), below hard limit (100k)
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 85000 (in 30000 / out 55000)")
+
+	checkpointCalled := false
+	o.checkpointRespawnFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+		checkpointCalled = true
+		// Simulate successful checkpoint respawn: reset tokens
+		sess.TokensUsed = 0
+		sess.SoftThresholdNotified = false
+		sess.Status = state.StatusRunning
+		return nil
+	}
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		return github.Issue{Number: number, Title: "test issue"}, nil
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 101,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-101-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+		Backend:     "claude",
+	}
+
+	o.checkSessions(s)
+
+	if !checkpointCalled {
+		t.Fatal("checkpoint respawn should have been triggered")
+	}
+
+	sess := s.Sessions["mae-1"]
+	// Worker should still be running (respawned, not killed)
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (should be respawned, not dead)", sess.Status, state.StatusRunning)
+	}
+	// Stop should NOT have been called (checkpoint respawn handles its own cleanup)
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty (checkpoint respawn does its own cleanup)", *stopped)
+	}
+}
+
+func TestCheckSessions_SoftThreshold_NotTriggeredBelowThreshold(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8,
+		MaxRuntimeMinutes:        999,
+	}
+	// 50k tokens — below soft threshold of 80k
+	o, _ := newCheckSessionsOrchestrator(cfg, "tokens 50000")
+
+	checkpointCalled := false
+	o.checkpointRespawnFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+		checkpointCalled = true
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-2"] = &state.Session{
+		IssueNumber: 102,
+		Status:      state.StatusRunning,
+		PID:         2345,
+		TmuxSession: "maestro-mae-2",
+		Branch:      "feat/mae-2-102-test",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	if checkpointCalled {
+		t.Fatal("checkpoint respawn should NOT have been triggered below threshold")
+	}
+	if s.Sessions["mae-2"].SoftThresholdNotified {
+		t.Fatal("SoftThresholdNotified should be false")
+	}
+}
+
+func TestCheckSessions_SoftThreshold_NotTriggeredWhenAlreadyNotified(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8,
+		MaxRuntimeMinutes:        999,
+	}
+	// Above soft threshold
+	o, _ := newCheckSessionsOrchestrator(cfg, "tokens 85000")
+
+	checkpointCalled := false
+	o.checkpointRespawnFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+		checkpointCalled = true
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-3"] = &state.Session{
+		IssueNumber:           103,
+		Status:                state.StatusRunning,
+		PID:                   3456,
+		TmuxSession:           "maestro-mae-3",
+		Branch:                "feat/mae-3-103-test",
+		StartedAt:             time.Now().Add(-5 * time.Minute),
+		SoftThresholdNotified: true, // already triggered
+	}
+
+	o.checkSessions(s)
+
+	if checkpointCalled {
+		t.Fatal("checkpoint respawn should NOT be triggered again when already notified")
+	}
+}
+
+func TestCheckSessions_SoftThreshold_FallsToHardLimit(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8,
+		MaxRuntimeMinutes:        999,
+	}
+	// 110k tokens — above hard limit
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 110000")
+
+	checkpointCalled := false
+	o.checkpointRespawnFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+		checkpointCalled = true
+		return fmt.Errorf("simulated checkpoint failure")
+	}
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		return github.Issue{Number: number, Title: "test issue"}, nil
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-4"] = &state.Session{
+		IssueNumber: 104,
+		Status:      state.StatusRunning,
+		PID:         4567,
+		TmuxSession: "maestro-mae-4",
+		Branch:      "feat/mae-4-104-test",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+		Backend:     "claude",
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-4"]
+	// Checkpoint should have been attempted (above soft threshold)
+	if !checkpointCalled {
+		t.Fatal("checkpoint respawn should have been attempted")
+	}
+	// But since checkpoint failed AND tokens exceed hard limit, worker should be dead
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (hard limit should kick in after failed checkpoint)", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus != "token_limit" {
+		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "token_limit")
+	}
+	if len(*stopped) != 1 {
+		t.Fatalf("stopped = %v, want 1 stop (from hard limit)", *stopped)
+	}
+}
+
+func TestCheckSessions_SoftThreshold_DisabledWhenZero(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0, // disabled
+		MaxRuntimeMinutes:        999,
+	}
+	// Above where soft threshold would be
+	o, _ := newCheckSessionsOrchestrator(cfg, "tokens 85000")
+
+	checkpointCalled := false
+	o.checkpointRespawnFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+		checkpointCalled = true
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-5"] = &state.Session{
+		IssueNumber: 105,
+		Status:      state.StatusRunning,
+		PID:         5678,
+		TmuxSession: "maestro-mae-5",
+		Branch:      "feat/mae-5-105-test",
+		StartedAt:   time.Now().Add(-5 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	if checkpointCalled {
+		t.Fatal("checkpoint respawn should NOT be triggered when soft threshold is disabled")
+	}
+}
+
 func TestAutoMergePRs_ParallelStatePersistence(t *testing.T) {
 	// Verify that state survives a save/load cycle after parallel merges.
 	// This addresses the "race conditions on the state file" concern from issue #159.

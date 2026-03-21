@@ -78,6 +78,7 @@ type Config struct {
 	MaxRuntimeMinutes          int                  `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes int                  `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
 	WorkerMaxTokens            int                  `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
+	WorkerSoftTokenThreshold   float64              `yaml:"worker_soft_token_threshold"`   // fraction of max_tokens to trigger checkpoint+respawn (default: 0.8, 0 = disabled)
 	MaxRetriesPerIssue         int                  `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
 	AutoRebase                 bool                 `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
 	ClaudeCmd                  string               `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
@@ -102,9 +103,9 @@ type Config struct {
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	Hooks                      HooksConfig          `yaml:"hooks"`
-	BlockerPatterns            []string             `yaml:"blocker_patterns"`           // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
-	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"`      // override poll interval from config (0 = use CLI flag)
-	SourcePath                 string               `yaml:"-"`                          // path the config was loaded from (not serialized)
+	BlockerPatterns            []string             `yaml:"blocker_patterns"`      // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
+	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"` // override poll interval from config (0 = use CLI flag)
+	SourcePath                 string               `yaml:"-"`                     // path the config was loaded from (not serialized)
 }
 
 // LoadFrom loads config from a specific path.
@@ -234,6 +235,18 @@ func parse(data []byte) (*Config, error) {
 		cfg.MaxRetryBackoffMs = 300000
 	}
 
+	// Default soft token threshold: 80% of max_tokens
+	if cfg.WorkerSoftTokenThreshold == 0 && cfg.WorkerMaxTokens > 0 {
+		cfg.WorkerSoftTokenThreshold = 0.8
+	}
+	// Clamp to valid range
+	if cfg.WorkerSoftTokenThreshold < 0 {
+		cfg.WorkerSoftTokenThreshold = 0
+	}
+	if cfg.WorkerSoftTokenThreshold > 1 {
+		cfg.WorkerSoftTokenThreshold = 1
+	}
+
 	if cfg.Telegram.OpenclawURL == "" {
 		cfg.Telegram.OpenclawURL = "http://localhost:18789"
 	}
@@ -336,6 +349,15 @@ func (c *Config) ShouldCleanupWorktrees() bool {
 		return true
 	}
 	return *c.CleanupWorktreesOnMerge
+}
+
+// SoftTokenThreshold returns the absolute token count at which a soft checkpoint
+// should be triggered. Returns 0 if soft threshold is disabled.
+func (c *Config) SoftTokenThreshold() int {
+	if c.WorkerMaxTokens <= 0 || c.WorkerSoftTokenThreshold <= 0 {
+		return 0
+	}
+	return int(float64(c.WorkerMaxTokens) * c.WorkerSoftTokenThreshold)
 }
 
 // ResolvePath returns the config file path, using SourcePath if set, otherwise the default candidate.
