@@ -76,13 +76,13 @@ func New(cfg *config.Config) *Orchestrator {
 	}
 	gh := github.New(cfg.Repo)
 
-	// Auto-detect project number if github_projects is enabled but no project_number set.
+	// Auto-detect and eagerly cache project config if github_projects is enabled but no project_number set.
 	if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber == 0 {
-		if num, err := gh.DetectProjectNumber(); err != nil {
-			log.Printf("[orch] could not auto-detect project number: %v", err)
+		if num, err := gh.DetectAndCacheProjectConfig(); err != nil {
+			log.Printf("[orch] could not auto-detect project config: %v", err)
 		} else if num > 0 {
 			cfg.GitHubProjects.ProjectNumber = num
-			log.Printf("[orch] auto-detected project number %d for repo %s", num, cfg.Repo)
+			log.Printf("[orch] auto-detected and cached config for project %d in repo %s", num, cfg.Repo)
 		} else {
 			log.Printf("[orch] no GitHub Project found for repo %s, project sync disabled", cfg.Repo)
 		}

@@ -43,9 +43,9 @@ func TestProjectStatusConstants(t *testing.T) {
 	}
 }
 
-func TestDetectProjectNumber_InvalidRepoFormat(t *testing.T) {
+func TestDetectAndCacheProjectConfig_InvalidRepoFormat(t *testing.T) {
 	c := &Client{Repo: "invalid-no-slash"}
-	_, err := c.DetectProjectNumber()
+	_, err := c.DetectAndCacheProjectConfig()
 	if err == nil {
 		t.Error("expected error for invalid repo format, got nil")
 	}

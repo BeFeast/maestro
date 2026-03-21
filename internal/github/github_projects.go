@@ -46,9 +46,11 @@ var knownProjects = map[int]projectConfig{
 	},
 }
 
-// DetectProjectNumber queries GitHub for the first ProjectV2 linked to the repo
-// and returns its number. Returns (0, nil) if no project is found.
-func (c *Client) DetectProjectNumber() (int, error) {
+// DetectAndCacheProjectConfig queries GitHub for ProjectV2 boards linked to the repo,
+// fetches the full config (node ID, status field, status options), caches it in
+// knownProjects, and returns the project number. Returns (0, nil) if no project is found.
+// Returns an error if multiple projects are linked (user must set project_number in config).
+func (c *Client) DetectAndCacheProjectConfig() (int, error) {
 	parts := strings.SplitN(c.Repo, "/", 2)
 	if len(parts) != 2 {
 		return 0, fmt.Errorf("invalid repo format %q, expected owner/name", c.Repo)
@@ -57,8 +59,17 @@ func (c *Client) DetectProjectNumber() (int, error) {
 
 	query := fmt.Sprintf(`query {
   repository(owner: %q, name: %q) {
-    projectsV2(first: 1) {
-      nodes { number }
+    projectsV2(first: 20) {
+      nodes {
+        number
+        id
+        field(name: "Status") {
+          ... on ProjectV2SingleSelectField {
+            id
+            options { id name }
+          }
+        }
+      }
     }
   }
 }`, owner, name)
@@ -66,9 +77,9 @@ func (c *Client) DetectProjectNumber() (int, error) {
 	out, err := exec.Command("gh", "api", "graphql", "-f", "query="+query).Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return 0, fmt.Errorf("graphql projectsV2: %w\nstderr: %s", err, exitErr.Stderr)
+			return 0, fmt.Errorf("graphql DetectAndCacheProjectConfig: %w\nstderr: %s", err, exitErr.Stderr)
 		}
-		return 0, fmt.Errorf("graphql projectsV2: %w", err)
+		return 0, fmt.Errorf("graphql DetectAndCacheProjectConfig: %w", err)
 	}
 
 	var resp struct {
@@ -76,7 +87,15 @@ func (c *Client) DetectProjectNumber() (int, error) {
 			Repository struct {
 				ProjectsV2 struct {
 					Nodes []struct {
-						Number int `json:"number"`
+						Number int    `json:"number"`
+						ID     string `json:"id"`
+						Field  *struct {
+							ID      string `json:"id"`
+							Options []struct {
+								ID   string `json:"id"`
+								Name string `json:"name"`
+							} `json:"options"`
+						} `json:"field"`
 					} `json:"nodes"`
 				} `json:"projectsV2"`
 			} `json:"repository"`
@@ -86,7 +105,7 @@ func (c *Client) DetectProjectNumber() (int, error) {
 		} `json:"errors"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
-		return 0, fmt.Errorf("parse projectsV2 response: %w", err)
+		return 0, fmt.Errorf("parse DetectAndCacheProjectConfig response: %w", err)
 	}
 	if len(resp.Errors) > 0 {
 		msgs := make([]string, len(resp.Errors))
@@ -95,11 +114,46 @@ func (c *Client) DetectProjectNumber() (int, error) {
 		}
 		return 0, fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
 	}
+
 	nodes := resp.Data.Repository.ProjectsV2.Nodes
 	if len(nodes) == 0 {
 		return 0, nil
 	}
-	return nodes[0].Number, nil
+	if len(nodes) > 1 {
+		numbers := make([]string, len(nodes))
+		for i, n := range nodes {
+			numbers[i] = fmt.Sprint(n.Number)
+		}
+		return 0, fmt.Errorf("repo %s has multiple projects (%s); set project_number in config to disambiguate", c.Repo, strings.Join(numbers, ", "))
+	}
+
+	node := nodes[0]
+	if node.Field == nil {
+		return 0, fmt.Errorf("project %d has no Status single-select field", node.Number)
+	}
+
+	statusOpts := make(map[ProjectStatus]string)
+	for _, opt := range node.Field.Options {
+		switch strings.ToLower(opt.Name) {
+		case "todo":
+			statusOpts[ProjectStatusTodo] = opt.ID
+		case "in progress":
+			statusOpts[ProjectStatusInProgress] = opt.ID
+		case "done":
+			statusOpts[ProjectStatusDone] = opt.ID
+		}
+	}
+
+	cfg := projectConfig{
+		ProjectID:     node.ID,
+		StatusFieldID: node.Field.ID,
+		StatusOptions: statusOpts,
+	}
+	if len(statusOpts) == 0 {
+		log.Printf("[projects] project %d: no Status options matched known names (todo/in progress/done); sync will be a no-op", node.Number)
+	}
+	knownProjects[node.Number] = cfg
+	return node.Number, nil
 }
 
 // fetchProjectConfig queries GitHub for a project's GraphQL node ID, status field ID,
@@ -194,6 +248,9 @@ func (c *Client) fetchProjectConfig(projectNumber int) (projectConfig, error) {
 			ProjectID:     node.ID,
 			StatusFieldID: node.Field.ID,
 			StatusOptions: statusOpts,
+		}
+		if len(statusOpts) == 0 {
+			log.Printf("[projects] project %d: no Status options matched known names (todo/in progress/done); sync will be a no-op", projectNumber)
 		}
 		knownProjects[projectNumber] = cfg
 		return cfg, nil
