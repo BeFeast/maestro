@@ -22,6 +22,16 @@ const (
 	StatusRetryExhausted SessionStatus = "retry_exhausted" // max retries reached, needs manual review
 )
 
+// Phase represents which pipeline phase a session is currently in.
+type Phase string
+
+const (
+	PhaseNone      Phase = ""          // legacy single-phase mode (no pipeline)
+	PhasePlan      Phase = "plan"      // planner: creates MAESTRO_PLAN.md + VALIDATION.md
+	PhaseImplement Phase = "implement" // implementer: writes code based on plan
+	PhaseValidate  Phase = "validate"  // validator: checks assertions, gates PR creation
+)
+
 type Session struct {
 	IssueNumber         int           `json:"issue_number"`
 	IssueTitle          string        `json:"issue_title"`
@@ -43,9 +53,12 @@ type Session struct {
 	NextRetryAt         *time.Time    `json:"next_retry_at,omitempty"`
 	LastOutputHash      string        `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`
-	TokensUsed          int           `json:"tokens_used,omitempty"`    // cumulative tokens consumed by the worker
-	RateLimitHit        bool          `json:"rate_limit_hit,omitempty"` // true if worker was rate-limited (tmux detection, running worker)
-	TriedBackends       []string      `json:"tried_backends,omitempty"` // backends already attempted (for rate-limit fallback)
+	TokensUsed          int           `json:"tokens_used,omitempty"`         // cumulative tokens consumed by the worker
+	RateLimitHit        bool          `json:"rate_limit_hit,omitempty"`      // true if worker was rate-limited (tmux detection, running worker)
+	TriedBackends       []string      `json:"tried_backends,omitempty"`      // backends already attempted (for rate-limit fallback)
+	Phase               Phase         `json:"phase,omitempty"`               // current pipeline phase (empty = legacy single-phase)
+	ValidationFails     int           `json:"validation_fails,omitempty"`    // number of failed validation attempts
+	ValidationFeedback  string        `json:"validation_feedback,omitempty"` // feedback from last failed validation
 }
 
 type State struct {

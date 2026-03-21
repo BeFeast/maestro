@@ -15,6 +15,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/versioning"
@@ -46,6 +47,9 @@ type Orchestrator struct {
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	getIssueFn      func(number int) (github.Issue, error)
+
+	// Testing hooks for pipeline phase transitions
+	workerStartPhaseFn func(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error
 
 	// Testing hooks for startNewWorkers
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
@@ -810,6 +814,13 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if process is still alive
 			if sess.PID > 0 && !o.pidAlive(sess.PID) {
+				// Pipeline phase transition: if this is a pipeline session,
+				// try to advance to the next phase before falling through
+				// to normal dead-worker handling.
+				if pipeline.IsEnabled(o.cfg) && o.advancePipeline(slotName, sess) {
+					continue
+				}
+
 				// Worker process died — run after_run hook
 				o.runAfterRunHook(sess)
 
@@ -1515,8 +1526,25 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			continue
 		}
 
-		// Resolve backend from label / auto-routing / default
-		backendName := o.resolveBackend(issue)
+		// Determine initial phase and backend
+		initialPhase := pipeline.InitialPhase(o.cfg)
+		var backendName string
+		var promptBase string
+		if initialPhase != state.PhaseNone && initialPhase != state.PhaseImplement {
+			// Pipeline mode with planner — use planner backend and raw template
+			// (worker.Start → assemblePrompt will substitute {{WORKTREE}} etc.)
+			backendName = pipeline.BackendForPhase(o.cfg, initialPhase)
+			promptBase = pipeline.PromptTemplateForPhase(o.cfg, initialPhase)
+		} else {
+			// Normal mode or pipeline starting at implement — use standard resolution
+			backendName = o.resolveBackend(issue)
+			promptBase = o.selectPrompt(issue)
+			if initialPhase == state.PhaseImplement {
+				// Pipeline mode but no planner — add pipeline preamble
+				preamble := pipeline.ImplementerPreamble(&state.Session{})
+				promptBase = preamble + "\n" + promptBase
+			}
+		}
 
 		// Detect long-running label
 		longRunning := false
@@ -1527,8 +1555,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 		}
 
-		promptBase := o.selectPrompt(issue)
-		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, long_running=%v)", issue.Number, issue.Title, backendName, longRunning)
+		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, phase=%s, long_running=%v)", issue.Number, issue.Title, backendName, initialPhase, longRunning)
 		slotName, err := o.startWorker(s, issue, promptBase, backendName)
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
@@ -1539,6 +1566,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 		if longRunning {
 			s.Sessions[slotName].LongRunning = true
+		}
+		if initialPhase != state.PhaseNone {
+			s.Sessions[slotName].Phase = initialPhase
 		}
 		o.syncProject(issue.Number, github.ProjectStatusInProgress)
 		o.notifier.Sendf("🚀 maestro: started worker %s for issue #%d: %s", slotName, issue.Number, issue.Title)
