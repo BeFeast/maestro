@@ -57,7 +57,7 @@ Example format:
 ` + "```bash" + `
 #!/bin/bash
 set -e
-# Verification for Issue #{{ISSUE_NUMBER}}: {{ISSUE_TITLE}}
+# Verification for Issue #<issue-number>: <issue-title>
 
 # Build check
 go build ./...
@@ -197,8 +197,12 @@ func ImplementerPreamble(cfg *config.Config, sess *state.Session) string {
 	var sb strings.Builder
 	sb.WriteString("## Pipeline Mode\n\n")
 	sb.WriteString("This issue is being worked on in pipeline mode. ")
-	sb.WriteString("Read `MAESTRO_PLAN.md` in the worktree root for the implementation plan.\n")
-	sb.WriteString("Follow the plan steps in order.\n\n")
+	if cfg.Pipeline.Planner.Enabled {
+		sb.WriteString("Read `MAESTRO_PLAN.md` in the worktree root for the implementation plan.\n")
+		sb.WriteString("Follow the plan steps in order.\n\n")
+	} else {
+		sb.WriteString("\n\n")
+	}
 
 	// Include research context reference if research phase was run
 	if cfg.Pipeline.Research.Enabled {
