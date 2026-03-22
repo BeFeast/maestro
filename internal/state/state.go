@@ -62,6 +62,30 @@ type Session struct {
 	ValidationFeedback  string        `json:"validation_feedback,omitempty"` // feedback from last failed validation
 }
 
+// UnmarshalJSON implements custom unmarshalling to preserve the legacy
+// "tokens_used" field from older state files. Before the split into
+// per-attempt and total counters, a single "tokens_used" field tracked
+// cumulative token usage. When loading old state, map it to both new fields.
+func (s *Session) UnmarshalJSON(data []byte) error {
+	// Use an alias to avoid infinite recursion.
+	type SessionAlias Session
+	aux := &struct {
+		*SessionAlias
+		LegacyTokensUsed int `json:"tokens_used,omitempty"`
+	}{
+		SessionAlias: (*SessionAlias)(s),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	// If legacy field is set and both new fields are zero, migrate.
+	if aux.LegacyTokensUsed > 0 && s.TokensUsedAttempt == 0 && s.TokensUsedTotal == 0 {
+		s.TokensUsedAttempt = aux.LegacyTokensUsed
+		s.TokensUsedTotal = aux.LegacyTokensUsed
+	}
+	return nil
+}
+
 type State struct {
 	Sessions    map[string]*Session `json:"sessions"`
 	NextSlot    int                 `json:"next_slot"`
