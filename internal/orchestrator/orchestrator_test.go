@@ -4501,3 +4501,247 @@ func TestRespawnDueRetries_NoCIContext_NormalPrompt(t *testing.T) {
 		t.Error("prompt should NOT contain CI failure context for non-CI retries")
 	}
 }
+
+func TestCheckSessions_SoftThreshold_CheckpointAndRespawn(t *testing.T) {
+	softThreshold := 0.8
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: &softThreshold,
+		MaxRuntimeMinutes:        999,
+	}
+	// Worker output: 85,000 tokens — above 80% soft threshold (80,000) but below hard limit (100,000)
+	stopped := make([]string, 0)
+	checkpointed := make([]string, 0)
+	respawnedInPlace := make([]string, 0)
+
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return "tokens 85000 (in 25000 / out 60000)", nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+		saveCheckpointFn: func(sess *state.Session) (string, error) {
+			checkpointed = append(checkpointed, fmt.Sprintf("issue-%d", sess.IssueNumber))
+			return "/tmp/CHECKPOINT.md", nil
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		respawnInPlaceFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnedInPlace = append(respawnedInPlace, slotName)
+			sess.Status = state.StatusRunning
+			sess.TokensUsedAttempt = 0
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 42,
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-42-test",
+		StartedAt:   time.Now().Add(-30 * time.Minute),
+		Backend:     "claude",
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-1"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (should still be running after checkpoint respawn)", sess.Status, state.StatusRunning)
+	}
+	if sess.CheckpointFile != "/tmp/CHECKPOINT.md" {
+		t.Fatalf("checkpoint_file = %q, want /tmp/CHECKPOINT.md", sess.CheckpointFile)
+	}
+	if len(checkpointed) != 1 {
+		t.Fatalf("checkpointed = %v, want 1 call", checkpointed)
+	}
+	if len(respawnedInPlace) != 1 || respawnedInPlace[0] != "mae-1" {
+		t.Fatalf("respawnedInPlace = %v, want [mae-1]", respawnedInPlace)
+	}
+	// Worker should NOT be stopped (respawnInPlace handles the stop internally)
+	if len(stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty (respawnInPlace handles stop)", stopped)
+	}
+}
+
+func TestCheckSessions_SoftThreshold_AlreadyCheckpointed_NoRepeat(t *testing.T) {
+	softThreshold := 0.8
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: &softThreshold,
+		MaxRuntimeMinutes:        999,
+	}
+	checkpointed := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return "tokens 90000 (in 30000 / out 60000)", nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+		saveCheckpointFn: func(sess *state.Session) (string, error) {
+			checkpointed = append(checkpointed, "saved")
+			return "/tmp/CHECKPOINT.md", nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-2"] = &state.Session{
+		IssueNumber:    42,
+		Status:         state.StatusRunning,
+		PID:            1234,
+		TmuxSession:    "maestro-mae-2",
+		Branch:         "feat/mae-2-42-test",
+		StartedAt:      time.Now().Add(-30 * time.Minute),
+		Backend:        "claude",
+		CheckpointFile: "/tmp/old-CHECKPOINT.md", // already checkpointed
+	}
+
+	o.checkSessions(s)
+
+	if len(checkpointed) != 0 {
+		t.Fatalf("checkpointed = %v, want empty (already has checkpoint, should not re-checkpoint)", checkpointed)
+	}
+	sess := s.Sessions["mae-2"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+}
+
+func TestCheckSessions_SoftThresholdDisabled_NoCheckpoint(t *testing.T) {
+	zero := 0.0
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: &zero, // disabled
+		MaxRuntimeMinutes:        999,
+	}
+	checkpointed := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return "tokens 85000 (in 25000 / out 60000)", nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+		saveCheckpointFn: func(sess *state.Session) (string, error) {
+			checkpointed = append(checkpointed, "saved")
+			return "/tmp/CHECKPOINT.md", nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-3"] = &state.Session{
+		IssueNumber: 42,
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-3",
+		Branch:      "feat/mae-3-42-test",
+		StartedAt:   time.Now().Add(-30 * time.Minute),
+		Backend:     "claude",
+	}
+
+	o.checkSessions(s)
+
+	if len(checkpointed) != 0 {
+		t.Fatalf("checkpointed = %v, want empty (soft threshold disabled)", checkpointed)
+	}
+}
+
+func TestCheckSessions_BelowSoftThreshold_NoCheckpoint(t *testing.T) {
+	softThreshold := 0.8
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: &softThreshold,
+		MaxRuntimeMinutes:        999,
+	}
+	checkpointed := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return "tokens 50000 (in 10000 / out 40000)", nil // below 80k soft limit
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+		saveCheckpointFn: func(sess *state.Session) (string, error) {
+			checkpointed = append(checkpointed, "saved")
+			return "/tmp/CHECKPOINT.md", nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-4"] = &state.Session{
+		IssueNumber: 42,
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-4",
+		Branch:      "feat/mae-4-42-test",
+		StartedAt:   time.Now().Add(-30 * time.Minute),
+		Backend:     "claude",
+	}
+
+	o.checkSessions(s)
+
+	if len(checkpointed) != 0 {
+		t.Fatalf("checkpointed = %v, want empty (below soft threshold)", checkpointed)
+	}
+	sess := s.Sessions["mae-4"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+	if sess.TokensUsedAttempt != 50000 {
+		t.Fatalf("tokens_used_attempt = %d, want 50000", sess.TokensUsedAttempt)
+	}
+}

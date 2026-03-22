@@ -1190,3 +1190,42 @@ pipeline:
 		t.Error("Pipeline.TestMapping should default to true when not set")
 	}
 }
+
+func TestParse_SoftTokenThresholdDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.SoftTokenThreshold() != 0.8 {
+		t.Errorf("SoftTokenThreshold() = %f, want 0.8 (default)", cfg.SoftTokenThreshold())
+	}
+}
+
+func TestParse_SoftTokenThresholdExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_soft_token_threshold: 0.7
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.SoftTokenThreshold() != 0.7 {
+		t.Errorf("SoftTokenThreshold() = %f, want 0.7", cfg.SoftTokenThreshold())
+	}
+}
+
+func TestParse_SoftTokenThresholdZeroDisabled(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_soft_token_threshold: 0
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.SoftTokenThreshold() != 0 {
+		t.Errorf("SoftTokenThreshold() = %f, want 0 (disabled)", cfg.SoftTokenThreshold())
+	}
+}
