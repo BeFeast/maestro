@@ -52,6 +52,12 @@ type RoutingConfig struct {
 	RouterModel     string `yaml:"router_model"`      // backend name from model.backends (default: "claude")
 	RouterModelName string `yaml:"router_model_name"` // specific model to use (default: "claude-sonnet-4-6")
 	RouterPrompt    string `yaml:"router_prompt"`     // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
+
+	// Role-specific backend overrides for the planner → implementer → validator pipeline.
+	// Each maps to a backend name from model.backends. If empty, falls back to issue-level routing.
+	PlannerBackend        string `yaml:"planner_backend"`        // backend for planning phase (e.g. "gemini-flash")
+	ImplementationBackend string `yaml:"implementation_backend"` // backend for implementation phase (e.g. "claude")
+	ValidatorBackend      string `yaml:"validator_backend"`      // backend for validation phase (e.g. "claude")
 }
 
 // ServerConfig controls the optional HTTP API server.
