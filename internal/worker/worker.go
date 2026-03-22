@@ -334,6 +334,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// CIFailureOutput is normally cleared by respawnDueRetries before this call,
 	// but cleared here defensively in case Respawn is called from other paths.
 	sess.CIFailureOutput = ""
+	sess.CheckpointFile = ""
 
 	return nil
 }

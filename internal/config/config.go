@@ -130,6 +130,7 @@ type Config struct {
 	MaxRuntimeMinutes          int                  `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes int                  `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
 	WorkerMaxTokens            int                  `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
+	WorkerSoftTokenThreshold   *float64             `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens to trigger checkpoint+respawn (default: 0.8, 0 = disabled)
 	MaxRetriesPerIssue         int                  `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
 	AutoRebase                 bool                 `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
 	ClaudeCmd                  string               `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
@@ -361,6 +362,12 @@ func parse(data []byte) (*Config, error) {
 		cfg.Hooks.TimeoutMs = 60000
 	}
 
+	// Default soft token threshold: 0.8 (80% of worker_max_tokens)
+	if cfg.WorkerSoftTokenThreshold == nil {
+		d := 0.8
+		cfg.WorkerSoftTokenThreshold = &d
+	}
+
 	// Missions defaults
 	if cfg.Missions.MaxChildren <= 0 {
 		cfg.Missions.MaxChildren = 10
@@ -400,6 +407,15 @@ func LoadDir(dir string) ([]*Config, error) {
 }
 
 // ShouldCleanupWorktrees returns whether worktrees should be removed after PR merge.
+// SoftTokenThreshold returns the soft token threshold fraction (0–1).
+// Returns 0 if disabled (pointer is nil or value is 0).
+func (c *Config) SoftTokenThreshold() float64 {
+	if c.WorkerSoftTokenThreshold == nil {
+		return 0
+	}
+	return *c.WorkerSoftTokenThreshold
+}
+
 func (c *Config) ShouldCleanupWorktrees() bool {
 	if c.CleanupWorktreesOnMerge == nil {
 		return true

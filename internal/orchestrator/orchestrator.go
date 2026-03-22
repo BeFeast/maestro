@@ -48,6 +48,9 @@ type Orchestrator struct {
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	getIssueFn      func(number int) (github.Issue, error)
+	// saveCheckpointFn / respawnInPlaceFn: used for soft token threshold checkpoint+respawn
+	saveCheckpointFn func(sess *state.Session) (string, error)
+	respawnInPlaceFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 
 	// Testing hooks for pipeline phase transitions
 	workerStartPhaseFn func(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error
@@ -191,6 +194,20 @@ func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue
 		return o.workerRespawnFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
 	return worker.Respawn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+}
+
+func (o *Orchestrator) saveCheckpoint(sess *state.Session) (string, error) {
+	if o.saveCheckpointFn != nil {
+		return o.saveCheckpointFn(sess)
+	}
+	return worker.SaveCheckpoint(sess)
+}
+
+func (o *Orchestrator) respawnInPlace(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	if o.respawnInPlaceFn != nil {
+		return o.respawnInPlaceFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+	}
+	return worker.RespawnInPlace(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 }
 
 func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
@@ -1049,6 +1066,39 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); no fallback configured",
 								slotName, sess.IssueNumber, pattern)
 							continue
+						}
+					}
+
+					// --- Soft token threshold: checkpoint + respawn ---
+					if o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
+						softLimit := int(float64(o.cfg.WorkerMaxTokens) * o.cfg.SoftTokenThreshold())
+						if sess.TokensUsedAttempt >= softLimit {
+							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d), checkpointing",
+								slotName, sess.TokensUsedAttempt, softLimit)
+
+							// Save checkpoint
+							cpFile, cpErr := o.saveCheckpoint(sess)
+							if cpErr != nil {
+								log.Printf("[orch] warn: checkpoint save failed for %s: %v — will hit hard limit", slotName, cpErr)
+							} else {
+								sess.CheckpointFile = cpFile
+
+								// Fetch issue for prompt assembly
+								issue, fetchErr := o.getIssue(sess.IssueNumber)
+								if fetchErr != nil {
+									log.Printf("[orch] fetch issue #%d for checkpoint respawn: %v — will hit hard limit", sess.IssueNumber, fetchErr)
+								} else {
+									promptBase := o.selectPrompt(issue)
+									if respawnErr := o.respawnInPlace(slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
+										log.Printf("[orch] checkpoint respawn %s failed: %v — will hit hard limit", slotName, respawnErr)
+									} else {
+										log.Printf("[orch] checkpoint respawn complete for %s", slotName)
+										o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) hit soft token threshold (%s tokens) — checkpointed and respawned",
+											slotName, sess.IssueNumber, worker.FormatTokens(softLimit))
+										continue
+									}
+								}
+							}
 						}
 					}
 

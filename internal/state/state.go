@@ -61,6 +61,7 @@ type Session struct {
 	ValidationFails     int           `json:"validation_fails,omitempty"`    // number of failed validation attempts
 	ValidationFeedback  string        `json:"validation_feedback,omitempty"` // feedback from last failed validation
 	CIFailureOutput     string        `json:"ci_failure_output,omitempty"`   // CI failure output captured before retry (passed to next worker as context)
+	CheckpointFile      string        `json:"checkpoint_file,omitempty"`     // path to CHECKPOINT.md saved at soft token threshold
 }
 
 // UnmarshalJSON implements custom unmarshalling to preserve the legacy
