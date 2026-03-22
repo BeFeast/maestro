@@ -1169,7 +1169,6 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			// Only handle CI failure once — dedup via LastNotifiedStatus
 			if sess.LastNotifiedStatus != "ci_failure" {
-				sess.LastNotifiedStatus = "ci_failure"
 				sess.NotifiedCIFail = true // backward compat
 
 				// Capture CI failure output for retry context
@@ -1181,11 +1180,13 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				// Check if retries are available
 				maxRetries := o.cfg.MaxRetriesPerIssue
 				if maxRetries == 0 || sess.RetryCount < maxRetries {
-					// Close the failed PR
+					// Close the failed PR — abort retry if close fails so next tick can retry
 					closeComment := fmt.Sprintf("CI failed — closing PR to retry with a fresh worker (attempt %d).\n\n```\n%s\n```", sess.RetryCount+1, ciOutput)
 					if err := o.closePR(pr.Number, closeComment); err != nil {
-						log.Printf("[orch] warn: could not close PR #%d: %v", pr.Number, err)
+						log.Printf("[orch] warn: could not close PR #%d: %v — will retry close next tick", pr.Number, err)
+						continue
 					}
+					sess.LastNotifiedStatus = "ci_failure"
 
 					// Clean up worktree
 					if err := o.stopWorker(slotName, sess); err != nil {
@@ -1198,6 +1199,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 					sess.NextRetryAt = &retryAt
 					sess.Status = state.StatusDead
+					sess.PRNumber = 0 // clear so FailedAttemptsForIssue counts this session
 					sess.CIFailureContext = ciOutput
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
