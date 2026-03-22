@@ -1089,3 +1089,43 @@ hooks:
 		t.Errorf("Hooks.TimeoutMs = %d, want 60000 (default)", cfg.Hooks.TimeoutMs)
 	}
 }
+
+func TestParse_PromptSectionsDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.PromptSections) != 0 {
+		t.Errorf("PromptSections = %v, want empty", cfg.PromptSections)
+	}
+	if cfg.ValidationContract {
+		t.Error("ValidationContract should default to false")
+	}
+}
+
+func TestParse_PromptSectionsExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+prompt_sections:
+  - ./tdd-section.md
+  - ./style-section.md
+validation_contract: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.PromptSections) != 2 {
+		t.Fatalf("PromptSections length = %d, want 2", len(cfg.PromptSections))
+	}
+	if cfg.PromptSections[0] != "./tdd-section.md" {
+		t.Errorf("PromptSections[0] = %q, want ./tdd-section.md", cfg.PromptSections[0])
+	}
+	if cfg.PromptSections[1] != "./style-section.md" {
+		t.Errorf("PromptSections[1] = %q, want ./style-section.md", cfg.PromptSections[1])
+	}
+	if !cfg.ValidationContract {
+		t.Error("ValidationContract should be true")
+	}
+}
