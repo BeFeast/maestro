@@ -1166,6 +1166,9 @@ func TestCheckSessions_TokenLimitExceeded_KillsWorker(t *testing.T) {
 	if sess.TokensUsedAttempt != 75000 {
 		t.Fatalf("tokens_used = %d, want 75000", sess.TokensUsedAttempt)
 	}
+	if sess.TokensUsedTotal != 75000 {
+		t.Fatalf("tokens_used_total = %d, want 75000", sess.TokensUsedTotal)
+	}
 	if sess.FinishedAt == nil {
 		t.Fatal("finished_at should be set")
 	}
@@ -1202,6 +1205,9 @@ func TestCheckSessions_TokensBelowLimit_WorkerSurvives(t *testing.T) {
 	if sess.TokensUsedAttempt != 50000 {
 		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsedAttempt)
 	}
+	if sess.TokensUsedTotal != 50000 {
+		t.Fatalf("tokens_used_total = %d, want 50000", sess.TokensUsedTotal)
+	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
 	}
@@ -1235,6 +1241,9 @@ func TestCheckSessions_TokenLimitZero_NoEnforcement(t *testing.T) {
 	// Tokens should still be tracked even when limit is disabled
 	if sess.TokensUsedAttempt != 999999 {
 		t.Fatalf("tokens_used = %d, want 999999 (should track even when limit=0)", sess.TokensUsedAttempt)
+	}
+	if sess.TokensUsedTotal != 999999 {
+		t.Fatalf("tokens_used_total = %d, want 999999 (should track even when limit=0)", sess.TokensUsedTotal)
 	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
@@ -1300,6 +1309,9 @@ func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
 	}
 	if sess.TokensUsedAttempt != 50000 {
 		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsedAttempt)
+	}
+	if sess.TokensUsedTotal != 50000 {
+		t.Fatalf("tokens_used_total = %d, want 50000", sess.TokensUsedTotal)
 	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
@@ -1370,6 +1382,9 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 	if sess6.TokensUsedAttempt != 75000 {
 		t.Fatalf("mae-6 tokens_used = %d, want 75000", sess6.TokensUsedAttempt)
 	}
+	if sess6.TokensUsedTotal != 75000 {
+		t.Fatalf("mae-6 tokens_used_total = %d, want 75000", sess6.TokensUsedTotal)
+	}
 
 	sess7 := s.Sessions["mae-7"]
 	if sess7.Status != state.StatusRunning {
@@ -1377,6 +1392,9 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 	}
 	if sess7.TokensUsedAttempt != 30000 {
 		t.Fatalf("mae-7 tokens_used = %d, want 30000", sess7.TokensUsedAttempt)
+	}
+	if sess7.TokensUsedTotal != 30000 {
+		t.Fatalf("mae-7 tokens_used_total = %d, want 30000", sess7.TokensUsedTotal)
 	}
 
 	if len(stopped) != 1 || stopped[0] != "mae-6" {
