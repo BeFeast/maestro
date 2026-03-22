@@ -414,12 +414,19 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 		return
 	}
 
-	// Sort session names for stable output
+	// Sort sessions by status priority (running first), then by name
 	names := make([]string, 0, len(s.Sessions))
 	for name := range s.Sessions {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		pi := state.StatusPriority(s.Sessions[names[i]].Status)
+		pj := state.StatusPriority(s.Sessions[names[j]].Status)
+		if pi != pj {
+			return pi < pj
+		}
+		return names[i] < names[j]
+	})
 
 	// Fetch CI status for pr_open sessions
 	gh := github.New(cfg.Repo)

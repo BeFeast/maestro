@@ -689,6 +689,26 @@ func TestCountByStatus(t *testing.T) {
 	}
 }
 
+func TestStatusPriority(t *testing.T) {
+	// running should come first
+	if StatusPriority(StatusRunning) >= StatusPriority(StatusPROpen) {
+		t.Error("running should have lower priority value than pr_open")
+	}
+	// pr_open before queued
+	if StatusPriority(StatusPROpen) >= StatusPriority(StatusQueued) {
+		t.Error("pr_open should have lower priority value than queued")
+	}
+	// queued before terminal states
+	for _, terminal := range []SessionStatus{
+		StatusDead, StatusFailed, StatusConflictFailed,
+		StatusRetryExhausted, StatusDone,
+	} {
+		if StatusPriority(StatusQueued) >= StatusPriority(terminal) {
+			t.Errorf("queued should have lower priority value than %q", terminal)
+		}
+	}
+}
+
 func TestCountByStatus_Empty(t *testing.T) {
 	s := NewState()
 	counts := s.CountByStatus()

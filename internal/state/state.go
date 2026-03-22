@@ -253,6 +253,32 @@ func (s *State) MarkIssueRetryExhausted(issueNum int) {
 }
 
 // IsTerminal returns true if the status represents a completed/dead session.
+// StatusPriority returns a sort key for session statuses.
+// Lower values sort first. Running sessions appear at the top,
+// followed by actionable states, then terminal states.
+func StatusPriority(status SessionStatus) int {
+	switch status {
+	case StatusRunning:
+		return 0
+	case StatusPROpen:
+		return 1
+	case StatusQueued:
+		return 2
+	case StatusDead:
+		return 3
+	case StatusFailed:
+		return 4
+	case StatusConflictFailed:
+		return 5
+	case StatusRetryExhausted:
+		return 6
+	case StatusDone:
+		return 7
+	default:
+		return 8
+	}
+}
+
 func IsTerminal(status SessionStatus) bool {
 	switch status {
 	case StatusDone, StatusFailed, StatusConflictFailed, StatusDead, StatusRetryExhausted:
