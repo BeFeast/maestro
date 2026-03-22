@@ -629,20 +629,43 @@ func slugify(title string) string {
 	return s
 }
 
+// readValidationContract reads VALIDATION.md from the worktree root.
+// Returns the file content or empty string if the file doesn't exist.
+func readValidationContract(worktreePath string) string {
+	data, err := os.ReadFile(filepath.Join(worktreePath, "VALIDATION.md"))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 // assemblePrompt builds the final worker prompt.
 // If the base template contains {{ISSUE_NUMBER}} placeholders, it performs
 // template substitution. Otherwise it falls back to appending a task block.
+// If the template contains {{VALIDATION_CONTRACT}}, it replaces it with
+// the content of VALIDATION.md from the worktree (or a fallback message).
 func assemblePrompt(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config) string {
 	if strings.Contains(base, "{{ISSUE_NUMBER}}") {
 		// Template-style substitution
-		r := strings.NewReplacer(
+		replacements := []string{
 			"{{ISSUE_NUMBER}}", fmt.Sprintf("%d", issue.Number),
 			"{{ISSUE_TITLE}}", issue.Title,
 			"{{ISSUE_BODY}}", issue.Body,
 			"{{BRANCH}}", branchName,
 			"{{WORKTREE}}", worktreePath,
 			"{{REPO}}", cfg.Repo,
-		)
+		}
+
+		// Handle {{VALIDATION_CONTRACT}} placeholder
+		if strings.Contains(base, "{{VALIDATION_CONTRACT}}") {
+			contract := readValidationContract(worktreePath)
+			if contract == "" {
+				contract = "_No VALIDATION.md found in worktree. Define your own acceptance criteria from the issue requirements before implementing._"
+			}
+			replacements = append(replacements, "{{VALIDATION_CONTRACT}}", contract)
+		}
+
+		r := strings.NewReplacer(replacements...)
 		return r.Replace(base)
 	}
 
