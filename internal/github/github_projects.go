@@ -1,12 +1,17 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// ghTimeout is the maximum time allowed for a single gh subprocess call.
+const ghTimeout = 30 * time.Second
 
 // ProjectStatus represents the status to set on a GitHub Project item.
 type ProjectStatus string
@@ -86,7 +91,9 @@ func (c *Client) SyncIssueToProject(issueNumber int, projectNumber int, status P
 
 // getIssueNodeID retrieves the GraphQL node ID for an issue.
 func (c *Client) getIssueNodeID(issueNumber int) (string, error) {
-	out, err := exec.Command("gh", "issue", "view", fmt.Sprint(issueNumber),
+	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "issue", "view", fmt.Sprint(issueNumber),
 		"--repo", c.Repo,
 		"--json", "id").Output()
 	if err != nil {
@@ -112,7 +119,9 @@ func (c *Client) addToProject(projectID, contentID string) (string, error) {
   }
 }`, projectID, contentID)
 
-	out, err := exec.Command("gh", "api", "graphql", "-f", "query="+query).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", "query="+query).Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return "", fmt.Errorf("graphql addProjectV2ItemById: %w\nstderr: %s\nstdout: %s", err, exitErr.Stderr, out)
@@ -160,7 +169,9 @@ func (c *Client) setProjectItemStatus(projectID, itemID, fieldID, optionID strin
   }) { projectV2Item { id } }
 }`, projectID, itemID, fieldID, optionID)
 
-	out, err := exec.Command("gh", "api", "graphql", "-f", "query="+query).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", "query="+query).Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("graphql updateProjectV2ItemFieldValue: %w\nstderr: %s\nstdout: %s", err, exitErr.Stderr, out)

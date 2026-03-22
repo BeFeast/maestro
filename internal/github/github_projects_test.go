@@ -2,6 +2,7 @@ package github
 
 import (
 	"testing"
+	"time"
 )
 
 func TestKnownProjects_ContainsExpectedProjects(t *testing.T) {
@@ -28,6 +29,15 @@ func TestKnownProjects_ContainsExpectedProjects(t *testing.T) {
 func TestKnownProjects_UnknownProjectNumber(t *testing.T) {
 	if _, ok := knownProjects[999]; ok {
 		t.Error("expected project 999 to not exist in knownProjects")
+	}
+}
+
+func TestGhTimeout_IsReasonable(t *testing.T) {
+	if ghTimeout < 5*time.Second {
+		t.Errorf("ghTimeout = %v, want >= 5s", ghTimeout)
+	}
+	if ghTimeout > 2*time.Minute {
+		t.Errorf("ghTimeout = %v, want <= 2m", ghTimeout)
 	}
 }
 

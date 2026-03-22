@@ -1657,6 +1657,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 		}
 
+		// No available slots — sync remaining eligible issues as backlog/todo.
+		// This check is intentionally before hasOpenPRForIssue to avoid making
+		// a GitHub API call per backlogged issue when all slots are full.
+		if started >= slots {
+			o.syncProject(issue.Number, github.ProjectStatusTodo)
+			continue
+		}
+
 		// Safety net: check GitHub directly for any open PR referencing this issue.
 		// This guards against the race where reconcileRunningSessions marked a session
 		// dead before checkSessions could detect its PR and transition it to pr_open.
@@ -1664,12 +1672,6 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			log.Printf("[orch] warn: could not check open PRs for issue #%d: %v", issue.Number, err)
 		} else if hasOpenPR {
 			log.Printf("[orch] skipping issue #%d: open PR already exists", issue.Number)
-			continue
-		}
-
-		// No available slots — sync remaining eligible issues as backlog/todo
-		if started >= slots {
-			o.syncProject(issue.Number, github.ProjectStatusTodo)
 			continue
 		}
 
