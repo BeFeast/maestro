@@ -1008,8 +1008,9 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		{Number: 20, HeadRefName: "feat/b"},
 	}
 
-	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel"}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
 	merged := make([]int, 0)
+	closedPRs := make([]int, 0)
 	o := &Orchestrator{
 		cfg:      cfg,
 		notifier: &notify.Notifier{},
@@ -1029,6 +1030,13 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 			merged = append(merged, prNumber)
 			return nil
 		},
+		ghClosePRFn: func(prNumber int, comment string) error {
+			closedPRs = append(closedPRs, prNumber)
+			return nil
+		},
+		ghPRChecksOutputFn: func(prNumber int) (string, error) {
+			return "build failed: exit code 1", nil
+		},
 		ghCloseIssueFn: func(number int, comment string) error {
 			return nil
 		},
@@ -1045,6 +1053,27 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 	}
 	if merged[0] != 20 {
 		t.Errorf("merged PR #%d, want #20", merged[0])
+	}
+	// PR #10 should have been closed for retry
+	if len(closedPRs) != 1 || closedPRs[0] != 10 {
+		t.Errorf("expected PR #10 to be closed, got %v", closedPRs)
+	}
+	// The session for PR #10 should now be dead with retry scheduled
+	for _, sess := range s.Sessions {
+		if sess.PRNumber == 10 {
+			if sess.Status != state.StatusDead {
+				t.Errorf("session status = %q, want %q", sess.Status, state.StatusDead)
+			}
+			if sess.NextRetryAt == nil {
+				t.Error("NextRetryAt should be set for CI failure retry")
+			}
+			if sess.RetryCount != 1 {
+				t.Errorf("RetryCount = %d, want 1", sess.RetryCount)
+			}
+			if sess.CIFailureContext == "" {
+				t.Error("CIFailureContext should be set")
+			}
+		}
 	}
 }
 
@@ -3808,9 +3837,10 @@ func TestCheckSessions_DeadWorkerSchedulesRetryWithBackoff(t *testing.T) {
 
 func TestCheckSessions_AlreadyRetriedWorkerFails(t *testing.T) {
 	cfg := &config.Config{
-		Repo:              "owner/repo",
-		MaxRetryBackoffMs: 300000,
-		MaxRuntimeMinutes: 999,
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 1, // only 1 retry allowed
 	}
 	labeled := make([]string, 0)
 	o := &Orchestrator{
@@ -4042,4 +4072,335 @@ func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
 	}
 	// Should not panic or make any API calls
 	o.syncProject(42, github.ProjectStatusInProgress)
+}
+
+func TestAutoMergePRs_CIFailure_SchedulesRetry(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MergeStrategy:      "parallel",
+		MaxRetriesPerIssue: 3,
+		MaxRetryBackoffMs:  300000,
+	}
+	closedPRs := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "failure", nil
+		},
+		ghClosePRFn: func(prNumber int, comment string) error {
+			closedPRs = append(closedPRs, prNumber)
+			return nil
+		},
+		ghPRChecksOutputFn: func(prNumber int) (string, error) {
+			return "tests: FAIL\nbuild: exit code 1", nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.RetryCount != 1 {
+		t.Errorf("RetryCount = %d, want 1", sess.RetryCount)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set")
+	}
+	if sess.CIFailureContext != "tests: FAIL\nbuild: exit code 1" {
+		t.Errorf("CIFailureContext = %q, want CI output", sess.CIFailureContext)
+	}
+	if len(closedPRs) != 1 || closedPRs[0] != 10 {
+		t.Errorf("expected PR #10 closed, got %v", closedPRs)
+	}
+	if sess.FinishedAt == nil {
+		t.Error("FinishedAt should be set")
+	}
+}
+
+func TestAutoMergePRs_CIFailure_RetriesExhausted_MarksFailed(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MergeStrategy:      "parallel",
+		MaxRetriesPerIssue: 2,
+		MaxRetryBackoffMs:  300000,
+	}
+	labeled := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "failure", nil
+		},
+		ghPRChecksOutputFn: func(prNumber int) (string, error) {
+			return "build failed", nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labeled = append(labeled, label)
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+	// Simulate already used up retries
+	s.Sessions["slot-0"].RetryCount = 2
+
+	o.autoMergePRs(s)
+
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusFailed)
+	}
+	if sess.NextRetryAt != nil {
+		t.Error("NextRetryAt should be nil when retries exhausted")
+	}
+	found := false
+	for _, l := range labeled {
+		if l == "blocked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected 'blocked' label when retries exhausted")
+	}
+}
+
+func TestAutoMergePRs_CIFailure_OnlyHandledOnce(t *testing.T) {
+	// When LastNotifiedStatus is already "ci_failure", the retry should not fire again
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MergeStrategy:      "parallel",
+		MaxRetriesPerIssue: 3,
+		MaxRetryBackoffMs:  300000,
+	}
+	closedPRs := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "failure", nil
+		},
+		ghClosePRFn: func(prNumber int, comment string) error {
+			closedPRs = append(closedPRs, prNumber)
+			return nil
+		},
+		ghPRChecksOutputFn: func(prNumber int) (string, error) {
+			return "build failed", nil
+		},
+	}
+	s := makeTestState(prs)
+	s.Sessions["slot-0"].LastNotifiedStatus = "ci_failure" // already handled
+
+	o.autoMergePRs(s)
+
+	// Should not close the PR again
+	if len(closedPRs) != 0 {
+		t.Errorf("expected no PR closures (already handled), got %v", closedPRs)
+	}
+}
+
+func TestRespawnDueRetries_IncludesCIFailureContext(t *testing.T) {
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRetriesPerIssue: 3,
+	}
+	var capturedPrompt string
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "base prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			capturedPrompt = promptBase
+			return nil
+		},
+	}
+
+	past := time.Now().UTC().Add(-1 * time.Minute)
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber:      42,
+		IssueTitle:       "test issue",
+		Status:           state.StatusDead,
+		RetryCount:       1,
+		NextRetryAt:      &past,
+		CIFailureContext: "tests: FAIL\nexit code 1",
+	}
+
+	o.respawnDueRetries(s)
+
+	if !strings.Contains(capturedPrompt, "Previous Attempt Failed (CI)") {
+		t.Error("prompt should include CI failure context header")
+	}
+	if !strings.Contains(capturedPrompt, "tests: FAIL") {
+		t.Error("prompt should include CI failure output")
+	}
+	// CIFailureContext should be cleared after use
+	sess := s.Sessions["mae-1"]
+	if sess.CIFailureContext != "" {
+		t.Errorf("CIFailureContext should be cleared after respawn, got %q", sess.CIFailureContext)
+	}
+}
+
+func TestRespawnDueRetries_NoCIContext_PromptUnchanged(t *testing.T) {
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRetriesPerIssue: 3,
+	}
+	var capturedPrompt string
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "base prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			capturedPrompt = promptBase
+			return nil
+		},
+	}
+
+	past := time.Now().UTC().Add(-1 * time.Minute)
+	s := state.NewState()
+	s.Sessions["mae-2"] = &state.Session{
+		IssueNumber: 43,
+		IssueTitle:  "normal retry",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &past,
+		// No CIFailureContext — normal dead worker retry
+	}
+
+	o.respawnDueRetries(s)
+
+	if strings.Contains(capturedPrompt, "Previous Attempt Failed (CI)") {
+		t.Error("prompt should NOT include CI context for normal retries")
+	}
+	if capturedPrompt != "base prompt" {
+		t.Errorf("prompt = %q, want %q", capturedPrompt, "base prompt")
+	}
+}
+
+func TestCheckSessions_DeadWorkerRespectsMaxRetriesConfig(t *testing.T) {
+	// With MaxRetriesPerIssue=3, a worker with RetryCount=2 should still get a retry
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 3,
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return false
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-20"] = &state.Session{
+		IssueNumber: 200,
+		IssueTitle:  "multi-retry",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-20",
+		Branch:      "feat/mae-20-200-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+		RetryCount:  2, // already retried twice, but limit is 3
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-20"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (should schedule retry since 2 < 3)", sess.Status, state.StatusDead)
+	}
+	if sess.RetryCount != 3 {
+		t.Errorf("RetryCount = %d, want 3", sess.RetryCount)
+	}
+	if sess.NextRetryAt == nil {
+		t.Error("NextRetryAt should be set")
+	}
+}
+
+func TestCheckSessions_DeadWorkerUnlimitedRetries(t *testing.T) {
+	// With MaxRetriesPerIssue=0 (unlimited), retries should always be scheduled
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 0, // unlimited
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return false
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-21"] = &state.Session{
+		IssueNumber: 201,
+		IssueTitle:  "unlimited retry",
+		Status:      state.StatusRunning,
+		PID:         5678,
+		TmuxSession: "maestro-mae-21",
+		Branch:      "feat/mae-21-201-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+		RetryCount:  10, // high count, but unlimited
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-21"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (unlimited retries)", sess.Status, state.StatusDead)
+	}
+	if sess.RetryCount != 11 {
+		t.Errorf("RetryCount = %d, want 11", sess.RetryCount)
+	}
+	if sess.NextRetryAt == nil {
+		t.Error("NextRetryAt should be set for unlimited retries")
+	}
 }

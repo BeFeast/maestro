@@ -292,6 +292,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.TokensUsedAttempt = 0
+	sess.CIFailureContext = ""
 
 	return nil
 }
