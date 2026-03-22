@@ -14,6 +14,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mission"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/router"
@@ -55,6 +56,9 @@ type Orchestrator struct {
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
 	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
 
+	// Mission processor (nil when missions disabled)
+	missionProc *mission.Processor
+
 	// Config hot-reload channel (nil = disabled, safe in select)
 	configReloadCh <-chan *config.Config
 
@@ -76,13 +80,19 @@ func New(cfg *config.Config) *Orchestrator {
 		n.SetDigestMode(true)
 		log.Printf("[orch] digest mode enabled — notifications will be batched per cycle")
 	}
-	return &Orchestrator{
+	gh := github.New(cfg.Repo)
+	o := &Orchestrator{
 		cfg:      cfg,
 		notifier: n,
-		gh:       github.New(cfg.Repo),
+		gh:       gh,
 		router:   router.New(cfg),
 		repo:     cfg.Repo,
 	}
+	if cfg.Missions.Enabled {
+		o.missionProc = mission.NewProcessor(cfg, gh)
+		log.Printf("[orch] mission mode enabled (max_children=%d, labels=%v)", cfg.Missions.MaxChildren, cfg.Missions.Labels)
+	}
+	return o
 }
 
 func (o *Orchestrator) pidAlive(pid int) bool {
@@ -496,6 +506,16 @@ func (o *Orchestrator) RunOnce() error {
 
 	// Step 4: Rebase conflicting PRs
 	o.rebaseConflicts(s)
+
+	// Step 4b: Process missions (decompose new epics, update progress)
+	if o.missionProc != nil {
+		issues, err := o.listOpenIssues(o.cfg.IssueLabels)
+		if err != nil {
+			log.Printf("[orch] list issues for missions: %v", err)
+		} else {
+			o.missionProc.ProcessMissions(s, issues)
+		}
+	}
 
 	// Save after all checks/reconciliation
 	if err := state.Save(o.cfg.StateDir, s); err != nil {
@@ -1545,6 +1565,16 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	started := 0
 	for _, issue := range issues {
 		if s.IssueInProgress(issue.Number) {
+			continue
+		}
+
+		// Skip mission parent issues — they are decomposed, not dispatched directly
+		if s.IsMissionParent(issue.Number) {
+			continue
+		}
+
+		// Skip issues that carry a mission/epic label (they should be decomposed first)
+		if o.cfg.Missions.Enabled && mission.IsMissionIssue(issue, o.cfg.Missions.Labels) && !s.IsMissionChild(issue.Number) {
 			continue
 		}
 

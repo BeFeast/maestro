@@ -87,8 +87,16 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Mission tracks a decomposed epic and its child issues.
+type Mission struct {
+	ParentIssue int    `json:"parent_issue"`
+	ChildIssues []int  `json:"child_issues"`
+	Status      string `json:"status"` // "active", "done"
+}
+
 type State struct {
 	Sessions    map[string]*Session `json:"sessions"`
+	Missions    map[int]*Mission    `json:"missions,omitempty"` // parent issue number → mission
 	NextSlot    int                 `json:"next_slot"`
 	LastMergeAt time.Time           `json:"last_merge_at,omitempty"`
 }
@@ -96,6 +104,7 @@ type State struct {
 func NewState() *State {
 	return &State{
 		Sessions: make(map[string]*Session),
+		Missions: make(map[int]*Mission),
 		NextSlot: 1,
 	}
 }
@@ -280,6 +289,30 @@ func (s *State) CompletedSessions() []CompletedSession {
 		return fi.After(*fj)
 	})
 	return result
+}
+
+// IsMissionParent returns true if the given issue number is a mission parent.
+func (s *State) IsMissionParent(issueNum int) bool {
+	if s.Missions == nil {
+		return false
+	}
+	_, ok := s.Missions[issueNum]
+	return ok
+}
+
+// IsMissionChild returns true if the given issue number is a child of any mission.
+func (s *State) IsMissionChild(issueNum int) bool {
+	if s.Missions == nil {
+		return false
+	}
+	for _, m := range s.Missions {
+		for _, child := range m.ChildIssues {
+			if child == issueNum {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PruneOldSessions removes completed sessions older than maxAge.

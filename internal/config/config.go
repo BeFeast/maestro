@@ -75,6 +75,13 @@ type PipelineConfig struct {
 	// Implementer uses the existing worker_prompt / bug_prompt / enhancement_prompt settings.
 }
 
+// MissionsConfig controls mission mode for decomposing epics into child issues.
+type MissionsConfig struct {
+	Enabled     bool     `yaml:"enabled"`
+	MaxChildren int      `yaml:"max_children"` // max child issues per mission (default: 10)
+	Labels      []string `yaml:"labels"`       // labels that identify mission issues (default: ["mission", "epic"])
+}
+
 // HooksConfig holds lifecycle hook scripts that run at key points.
 type HooksConfig struct {
 	AfterCreate  string `yaml:"after_create"`  // runs once when a new issue workspace is first created
@@ -121,6 +128,7 @@ type Config struct {
 	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	Pipeline                   PipelineConfig       `yaml:"pipeline"`
 	Hooks                      HooksConfig          `yaml:"hooks"`
+	Missions                   MissionsConfig       `yaml:"missions"`
 	BlockerPatterns            []string             `yaml:"blocker_patterns"`      // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
 	PollIntervalSeconds        int                  `yaml:"poll_interval_seconds"` // override poll interval from config (0 = use CLI flag)
 	SourcePath                 string               `yaml:"-"`                     // path the config was loaded from (not serialized)
@@ -322,6 +330,14 @@ func parse(data []byte) (*Config, error) {
 	// Default hooks timeout
 	if cfg.Hooks.TimeoutMs <= 0 {
 		cfg.Hooks.TimeoutMs = 60000
+	}
+
+	// Missions defaults
+	if cfg.Missions.MaxChildren <= 0 {
+		cfg.Missions.MaxChildren = 10
+	}
+	if len(cfg.Missions.Labels) == 0 {
+		cfg.Missions.Labels = []string{"mission", "epic"}
 	}
 
 	return cfg, nil
