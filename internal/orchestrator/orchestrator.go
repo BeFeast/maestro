@@ -62,6 +62,8 @@ type Orchestrator struct {
 	ghPRCIStatusFn         func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
 	ghMergePRFn            func(prNumber int) error
+	ghClosePRFn            func(prNumber int, comment string) error
+	ghPRChecksOutputFn     func(prNumber int) (string, error)
 	ghCloseIssueFn         func(number int, comment string) error
 	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
 	rebaseWorktreeFn       func(worktreePath, branch string, autoResolveFiles []string) error
@@ -133,6 +135,20 @@ func (o *Orchestrator) mergePR(prNumber int) error {
 		return o.ghMergePRFn(prNumber)
 	}
 	return o.gh.MergePR(prNumber)
+}
+
+func (o *Orchestrator) closePR(prNumber int, comment string) error {
+	if o.ghClosePRFn != nil {
+		return o.ghClosePRFn(prNumber, comment)
+	}
+	return o.gh.ClosePR(prNumber, comment)
+}
+
+func (o *Orchestrator) prChecksOutput(prNumber int) (string, error) {
+	if o.ghPRChecksOutputFn != nil {
+		return o.ghPRChecksOutputFn(prNumber)
+	}
+	return o.gh.PRChecksOutput(prNumber)
 }
 
 func (o *Orchestrator) closeIssue(number int, comment string) error {
@@ -373,6 +389,13 @@ func (o *Orchestrator) respawnDueRetries(s *state.State) {
 		}
 
 		promptBase := o.selectPrompt(issue)
+
+		// If retrying after CI failure, append context so the new worker knows what failed
+		if sess.CIFailureContext != "" {
+			promptBase += fmt.Sprintf("\n\n---\n\n## Previous Attempt Failed (CI)\n\nThe previous attempt for this issue created a PR but CI checks failed. Here is the CI output:\n\n```\n%s\n```\n\nPlease fix the issues identified above and try again.\n", sess.CIFailureContext)
+			sess.CIFailureContext = "" // Clear after use
+		}
+
 		if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
 			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, err)
 			sess.Status = state.StatusFailed
@@ -862,8 +885,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
 						slotName, sess.IssueNumber, sess.TriedBackends[len(sess.TriedBackends)-1], nextBackend)
-				} else if sess.RetryCount < 1 {
-					// First failure — schedule retry with exponential backoff
+				} else if o.cfg.MaxRetriesPerIssue == 0 || sess.RetryCount < o.cfg.MaxRetriesPerIssue {
+					// Retries available — schedule retry with exponential backoff
 					sess.RetryCount++
 					backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
@@ -1144,11 +1167,60 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}
-			// Only notify CI failure once — dedup via LastNotifiedStatus
+			// Only handle CI failure once — dedup via LastNotifiedStatus
 			if sess.LastNotifiedStatus != "ci_failure" {
-				o.notifier.Sendf("❌ maestro: CI failing for PR #%d (%s, issue #%d)", pr.Number, sess.Branch, sess.IssueNumber)
-				sess.LastNotifiedStatus = "ci_failure"
 				sess.NotifiedCIFail = true // backward compat
+
+				// Capture CI failure output for retry context
+				ciOutput, ciErr := o.prChecksOutput(pr.Number)
+				if ciErr != nil {
+					log.Printf("[orch] warn: could not fetch CI output for PR #%d: %v", pr.Number, ciErr)
+				}
+
+				// Check if retries are available
+				maxRetries := o.cfg.MaxRetriesPerIssue
+				if maxRetries == 0 || sess.RetryCount < maxRetries {
+					// Close the failed PR — abort retry if close fails so next tick can retry
+					closeComment := fmt.Sprintf("CI failed — closing PR to retry with a fresh worker (attempt %d).\n\n```\n%s\n```", sess.RetryCount+1, ciOutput)
+					if err := o.closePR(pr.Number, closeComment); err != nil {
+						log.Printf("[orch] warn: could not close PR #%d: %v — will retry close next tick", pr.Number, err)
+						continue
+					}
+					sess.LastNotifiedStatus = "ci_failure"
+
+					// Clean up worktree
+					if err := o.stopWorker(slotName, sess); err != nil {
+						log.Printf("[orch] warn: could not stop worker %s: %v", slotName, err)
+					}
+
+					// Schedule retry with backoff
+					sess.RetryCount++
+					backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
+					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
+					sess.NextRetryAt = &retryAt
+					sess.Status = state.StatusDead
+					sess.PRNumber = 0 // clear so FailedAttemptsForIssue counts this session
+					sess.CIFailureContext = ciOutput
+					now := time.Now().UTC()
+					sess.FinishedAt = &now
+
+					log.Printf("[orch] CI failed for PR #%d (issue #%d), closing PR and scheduling retry %d in %dms",
+						pr.Number, sess.IssueNumber, sess.RetryCount, backoffMs)
+					o.notifier.Sendf("🔄 maestro: CI failed for PR #%d (issue #%d: %s), closing PR and retrying (attempt %d) in %ds",
+						pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
+				} else {
+					// Retries exhausted — mark as failed
+					log.Printf("[orch] CI failed for PR #%d (issue #%d), retries exhausted (%d/%d)",
+						pr.Number, sess.IssueNumber, sess.RetryCount, maxRetries)
+					if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
+					}
+					sess.Status = state.StatusFailed
+					now := time.Now().UTC()
+					sess.FinishedAt = &now
+					o.notifier.Sendf("❌ maestro: CI failed for PR #%d (issue #%d: %s), retries exhausted (%d/%d) — needs manual review",
+						pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, maxRetries)
+				}
 			}
 		case "pending":
 			if sess.Status == state.StatusQueued {
