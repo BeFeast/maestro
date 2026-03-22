@@ -49,7 +49,7 @@ type Session struct {
 	RebaseAttempted     bool          `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail      bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
 	LastNotifiedStatus  string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
-	RetryCount          int           `json:"retry_count,omitempty"`
+	RetryCount          int           `json:"retry_count,omitempty"`          // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
 	NextRetryAt         *time.Time    `json:"next_retry_at,omitempty"`
 	LastOutputHash      string        `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`

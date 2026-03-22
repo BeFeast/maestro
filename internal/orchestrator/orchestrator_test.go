@@ -3781,9 +3781,10 @@ func TestRetryBackoffMs_SmallCap(t *testing.T) {
 
 func TestCheckSessions_DeadWorkerSchedulesRetryWithBackoff(t *testing.T) {
 	cfg := &config.Config{
-		Repo:              "owner/repo",
-		MaxRetryBackoffMs: 300000,
-		MaxRuntimeMinutes: 999,
+		Repo:               "owner/repo",
+		MaxRetryBackoffMs:  300000,
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 3, // explicit: allow retries (0 would mean unlimited)
 	}
 	o := &Orchestrator{
 		cfg:      cfg,
