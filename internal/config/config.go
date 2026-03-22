@@ -101,10 +101,12 @@ type Config struct {
 	IssueLabels                []string             `yaml:"issue_labels"`
 	ExcludeLabels              []string             `yaml:"exclude_labels"`
 	WorkerPrompt               string               `yaml:"worker_prompt"`
-	BugPrompt                  string               `yaml:"bug_prompt"`         // prompt template for issues with "bug" label
-	EnhancementPrompt          string               `yaml:"enhancement_prompt"` // prompt template for issues with "enhancement" label
-	SessionPrefix              string               `yaml:"session_prefix"`     // worker session name prefix (default: first 3 chars of repo name)
-	StateDir                   string               `yaml:"state_dir"`          // state/log directory (default: ~/.maestro/<repo-hash>)
+	BugPrompt                  string               `yaml:"bug_prompt"`          // prompt template for issues with "bug" label
+	EnhancementPrompt          string               `yaml:"enhancement_prompt"`  // prompt template for issues with "enhancement" label
+	PromptSections             []string             `yaml:"prompt_sections"`     // additional prompt section files appended to the base prompt
+	ValidationContract         bool                 `yaml:"validation_contract"` // generate VALIDATION.md in worktree with test-first guidance
+	SessionPrefix              string               `yaml:"session_prefix"`      // worker session name prefix (default: first 3 chars of repo name)
+	StateDir                   string               `yaml:"state_dir"`           // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model                      ModelConfig          `yaml:"model"`
 	Routing                    RoutingConfig        `yaml:"routing"`
 	DeployCmd                  string               `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
@@ -229,6 +231,9 @@ func parse(data []byte) (*Config, error) {
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
 	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
+	for i, s := range cfg.PromptSections {
+		cfg.PromptSections[i] = expandHome(s)
+	}
 	cfg.StateDir = expandHome(cfg.StateDir)
 
 	// Default session_prefix: first 3 chars of repo name

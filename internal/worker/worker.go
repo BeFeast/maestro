@@ -70,6 +70,19 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		log.Printf("[worker] after_create hook failed: %v", err)
 	}
 
+	// Generate validation contract in worktree (if enabled and not already present from hook)
+	if cfg.ValidationContract {
+		if _, err := os.Stat(filepath.Join(worktreePath, "VALIDATION.md")); os.IsNotExist(err) {
+			if _, err := GenerateValidationContract(issue, worktreePath); err != nil {
+				log.Printf("[worker] validation contract generation failed: %v", err)
+			} else {
+				log.Printf("[worker] generated VALIDATION.md in %s", worktreePath)
+			}
+		} else {
+			log.Printf("[worker] VALIDATION.md already present (from hook), skipping generation")
+		}
+	}
+
 	// Assemble worker prompt
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 
@@ -196,6 +209,19 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 	if err := RunHook(cfg, "after_create", cfg.Hooks.AfterCreate, hookEnv); err != nil {
 		log.Printf("[worker] after_create hook failed: %v", err)
+	}
+
+	// Generate validation contract in worktree (if enabled and not already present from hook)
+	if cfg.ValidationContract {
+		if _, err := os.Stat(filepath.Join(worktreePath, "VALIDATION.md")); os.IsNotExist(err) {
+			if _, err := GenerateValidationContract(issue, worktreePath); err != nil {
+				log.Printf("[worker] validation contract generation failed: %v", err)
+			} else {
+				log.Printf("[worker] generated VALIDATION.md in %s", worktreePath)
+			}
+		} else {
+			log.Printf("[worker] VALIDATION.md already present (from hook), skipping generation")
+		}
 	}
 
 	// Assemble worker prompt
@@ -645,9 +671,16 @@ func readValidationContract(worktreePath string) string {
 // assemblePrompt builds the final worker prompt.
 // If the base template contains {{ISSUE_NUMBER}} placeholders, it performs
 // template substitution. Otherwise it falls back to appending a task block.
-// If the template contains {{VALIDATION_CONTRACT}}, it replaces it with
-// the content of VALIDATION.md from the worktree (or a fallback message).
+//
+// Additional behavior:
+//   - If {{VALIDATION_CONTRACT}} is in the template, replaces it with VALIDATION.md
+//     content (or a fallback message if the file is missing)
+//   - If VALIDATION.md exists but no placeholder is present, appends the contract
+//   - Loads and appends any prompt section files from cfg.PromptSections
 func assemblePrompt(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config) string {
+	// Load validation contract from worktree (if present)
+	validationContract := readValidationContract(worktreePath)
+
 	if strings.Contains(base, "{{ISSUE_NUMBER}}") {
 		// Template-style substitution
 		replacements := []string{
@@ -660,8 +693,10 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		// Handle {{VALIDATION_CONTRACT}} placeholder
+		contractInlined := false
 		if strings.Contains(base, "{{VALIDATION_CONTRACT}}") {
-			contract := readValidationContract(worktreePath)
+			contractInlined = true
+			contract := validationContract
 			if contract == "" {
 				contract = "_No VALIDATION.md found in worktree. Define your own acceptance criteria from the issue requirements before implementing._"
 			}
@@ -669,11 +704,12 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		return r.Replace(base)
+		result := r.Replace(base)
+		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
 	// Legacy: append task block after base prompt
-	return fmt.Sprintf(`%s
+	result := fmt.Sprintf(`%s
 
 ---
 
@@ -712,6 +748,33 @@ Always rebase on origin/main immediately before creating the PR.
 		issue.Title,
 		issue.Number,
 	)
+	return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, false)
+}
+
+// appendSectionsAndValidation appends prompt section files and the validation
+// contract (if not already inlined via placeholder) to the prompt.
+func appendSectionsAndValidation(prompt string, sectionPaths []string, validationContract string, contractAlreadyInlined bool) string {
+	var b strings.Builder
+	b.WriteString(prompt)
+
+	// Append prompt sections
+	for _, path := range sectionPaths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			log.Printf("[worker] warn: could not read prompt section %s: %v", path, err)
+			continue
+		}
+		b.WriteString("\n\n---\n\n")
+		b.WriteString(string(data))
+	}
+
+	// Append validation contract if present and not already inlined
+	if validationContract != "" && !contractAlreadyInlined {
+		b.WriteString("\n\n---\n\n")
+		b.WriteString(validationContract)
+	}
+
+	return b.String()
 }
 
 // SlotNameFromPID finds a slot name by PID string (for display)

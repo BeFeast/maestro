@@ -33,6 +33,8 @@ func TestAssemblePromptIncludesSecretSafetyGuardrails(t *testing.T) {
 	}
 }
 
+// --- Tests from main: validation contract placeholder ---
+
 func TestAssemblePrompt_ValidationContractFromFile(t *testing.T) {
 	worktree := t.TempDir()
 	validationContent := `## Validation Contract
@@ -76,7 +78,7 @@ func TestAssemblePrompt_ValidationContractMissingFile(t *testing.T) {
 }
 
 func TestAssemblePrompt_NoValidationPlaceholder(t *testing.T) {
-	// Templates without {{VALIDATION_CONTRACT}} should work unchanged
+	// Templates without {{VALIDATION_CONTRACT}} and no VALIDATION.md should work unchanged
 	cfg := &config.Config{Repo: "BeFeast/maestro"}
 	issue := github.Issue{Number: 10, Title: "basic", Body: "Simple issue."}
 	base := "Template with {{ISSUE_NUMBER}} only."
@@ -87,7 +89,7 @@ func TestAssemblePrompt_NoValidationPlaceholder(t *testing.T) {
 		t.Fatal("expected issue number in prompt")
 	}
 	if strings.Contains(prompt, "VALIDATION") {
-		t.Fatal("should not inject validation content when placeholder is absent")
+		t.Fatal("should not inject validation content when placeholder is absent and no file exists")
 	}
 }
 
@@ -110,4 +112,85 @@ func TestReadValidationContract(t *testing.T) {
 			t.Fatalf("expected empty string for missing file, got %q", got)
 		}
 	})
+}
+
+// --- Tests for prompt sections ---
+
+func TestAssemblePrompt_IncludesPromptSections(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write two section files
+	section1 := filepath.Join(dir, "tdd.md")
+	section2 := filepath.Join(dir, "style.md")
+	os.WriteFile(section1, []byte("## TDD Section\nWrite tests first."), 0644)
+	os.WriteFile(section2, []byte("## Style Section\nFollow coding standards."), 0644)
+
+	cfg := &config.Config{
+		Repo:           "owner/repo",
+		PromptSections: []string{section1, section2},
+	}
+	issue := github.Issue{Number: 1, Title: "test", Body: "body"}
+
+	base := "Base prompt with {{ISSUE_NUMBER}}"
+	prompt := assemblePrompt(base, issue, "/tmp/wt", "feat/branch", cfg)
+
+	if !strings.Contains(prompt, "## TDD Section") {
+		t.Error("prompt should include TDD section content")
+	}
+	if !strings.Contains(prompt, "## Style Section") {
+		t.Error("prompt should include style section content")
+	}
+}
+
+func TestAssemblePrompt_SkipsMissingSections(t *testing.T) {
+	cfg := &config.Config{
+		Repo:           "owner/repo",
+		PromptSections: []string{"/nonexistent/path.md"},
+	}
+	issue := github.Issue{Number: 1, Title: "test", Body: "body"}
+
+	base := "Base prompt with {{ISSUE_NUMBER}}"
+	prompt := assemblePrompt(base, issue, "/tmp/wt", "feat/branch", cfg)
+
+	// Should still produce a valid prompt without crashing
+	if !strings.Contains(prompt, "Base prompt with 1") {
+		t.Error("prompt should still contain base content when sections are missing")
+	}
+}
+
+func TestAssemblePrompt_IncludesValidationContractAutoAppend(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a VALIDATION.md in the worktree
+	validationContent := "## Validation Contract\n- [ ] Build passes\n- [ ] Tests pass"
+	os.WriteFile(filepath.Join(dir, "VALIDATION.md"), []byte(validationContent), 0644)
+
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 5, Title: "test", Body: "body"}
+
+	// Template WITHOUT {{VALIDATION_CONTRACT}} — contract should be auto-appended
+	base := "Base prompt with {{ISSUE_NUMBER}}"
+	prompt := assemblePrompt(base, issue, dir, "feat/branch", cfg)
+
+	if !strings.Contains(prompt, "Validation Contract") {
+		t.Error("prompt should auto-append VALIDATION.md content when placeholder is absent")
+	}
+	if !strings.Contains(prompt, "Build passes") {
+		t.Error("prompt should include quality gates from VALIDATION.md")
+	}
+}
+
+func TestAssemblePrompt_NoValidationFileIsOK(t *testing.T) {
+	dir := t.TempDir() // empty dir, no VALIDATION.md
+
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 1, Title: "test", Body: "body"}
+
+	base := "Base prompt with {{ISSUE_NUMBER}}"
+	prompt := assemblePrompt(base, issue, dir, "feat/branch", cfg)
+
+	// Should still produce a valid prompt
+	if !strings.Contains(prompt, "Base prompt with 1") {
+		t.Error("prompt should work without VALIDATION.md")
+	}
 }
