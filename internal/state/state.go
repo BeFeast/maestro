@@ -59,6 +59,7 @@ type Session struct {
 	Phase               Phase         `json:"phase,omitempty"`               // current pipeline phase (empty = legacy single-phase)
 	ValidationFails     int           `json:"validation_fails,omitempty"`    // number of failed validation attempts
 	ValidationFeedback  string        `json:"validation_feedback,omitempty"` // feedback from last failed validation
+	CheckpointSaved     bool          `json:"checkpoint_saved,omitempty"`    // true if worker saved a checkpoint before soft-threshold respawn
 }
 
 type State struct {

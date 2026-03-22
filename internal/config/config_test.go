@@ -1089,3 +1089,46 @@ hooks:
 		t.Errorf("Hooks.TimeoutMs = %d, want 60000 (default)", cfg.Hooks.TimeoutMs)
 	}
 }
+
+func TestParse_SoftTokenThresholdDefault(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_max_tokens: 100000
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSoftTokenThreshold != 0.8 {
+		t.Errorf("WorkerSoftTokenThreshold = %f, want 0.8 (default)", cfg.WorkerSoftTokenThreshold)
+	}
+}
+
+func TestParse_SoftTokenThresholdCustom(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_max_tokens: 100000
+worker_soft_token_threshold: 0.7
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSoftTokenThreshold != 0.7 {
+		t.Errorf("WorkerSoftTokenThreshold = %f, want 0.7", cfg.WorkerSoftTokenThreshold)
+	}
+}
+
+func TestParse_SoftTokenThresholdInvalidResetsToDefault(t *testing.T) {
+	yaml := `
+repo: owner/repo
+worker_soft_token_threshold: 1.5
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.WorkerSoftTokenThreshold != 0.8 {
+		t.Errorf("WorkerSoftTokenThreshold = %f, want 0.8 (reset from invalid 1.5)", cfg.WorkerSoftTokenThreshold)
+	}
+}

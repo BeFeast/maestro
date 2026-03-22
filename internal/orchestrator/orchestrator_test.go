@@ -4025,3 +4025,208 @@ func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
 	// Should not panic or make any API calls
 	o.syncProject(42, github.ProjectStatusInProgress)
 }
+
+func TestCheckSessions_SoftTokenThreshold_CheckpointsAndRespawns(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8, // soft limit at 80,000
+		MaxRuntimeMinutes:        999,
+	}
+	// Worker reports 85,000 tokens — above soft (80k) but below hard (100k)
+	stopped := make([]string, 0)
+	checkpointSaved := false
+	respawned := false
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return "tokens 85000 (in 30000 / out 55000)", nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+		saveCheckpointFn: func(worktreePath string, issueNumber int, tokensUsed int) error {
+			checkpointSaved = true
+			return nil
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawned = true
+			sess.Status = state.StatusRunning
+			sess.StartedAt = time.Now().UTC()
+			sess.FinishedAt = nil
+			sess.LastNotifiedStatus = ""
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-10"] = &state.Session{
+		IssueNumber: 201,
+		IssueTitle:  "test soft threshold",
+		Status:      state.StatusRunning,
+		PID:         5001,
+		TmuxSession: "maestro-mae-10",
+		Branch:      "feat/mae-10-201-test",
+		StartedAt:   time.Now().Add(-30 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	if !checkpointSaved {
+		t.Fatal("checkpoint should have been saved")
+	}
+	if !respawned {
+		t.Fatal("worker should have been respawned")
+	}
+	if len(stopped) != 1 || stopped[0] != "mae-10" {
+		t.Fatalf("stopped = %v, want [mae-10]", stopped)
+	}
+
+	sess := s.Sessions["mae-10"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (should be running after respawn)", sess.Status, state.StatusRunning)
+	}
+	if !sess.CheckpointSaved {
+		t.Fatal("CheckpointSaved should be true")
+	}
+}
+
+func TestCheckSessions_BelowSoftThreshold_NoAction(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8, // soft limit at 80,000
+		MaxRuntimeMinutes:        999,
+	}
+	// Worker reports 50,000 tokens — well below soft threshold (80k)
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 50000")
+
+	s := state.NewState()
+	s.Sessions["mae-11"] = &state.Session{
+		IssueNumber: 202,
+		Status:      state.StatusRunning,
+		PID:         5002,
+		TmuxSession: "maestro-mae-11",
+		Branch:      "feat/mae-11-202-test",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-11"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+	if sess.CheckpointSaved {
+		t.Fatal("CheckpointSaved should be false — below soft threshold")
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+}
+
+func TestCheckSessions_SoftTokenThreshold_RespawnFails_MarksDead(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8,
+		MaxRuntimeMinutes:        999,
+	}
+	stopped := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return "tokens 85000", nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			stopped = append(stopped, slotName)
+			return nil
+		},
+		saveCheckpointFn: func(worktreePath string, issueNumber int, tokensUsed int) error {
+			return nil
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			return fmt.Errorf("respawn failed")
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber: 203,
+		IssueTitle:  "test soft threshold fail",
+		Status:      state.StatusRunning,
+		PID:         5003,
+		TmuxSession: "maestro-mae-12",
+		Branch:      "feat/mae-12-203-test",
+		StartedAt:   time.Now().Add(-30 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-12"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("finished_at should be set")
+	}
+}
+
+func TestCheckSessions_SoftTokenAlreadyNotified_SkipsSoftCheck(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: 0.8,
+		MaxRuntimeMinutes:        999,
+	}
+	// Worker reports 85,000 tokens — above soft threshold but already notified
+	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 85000")
+
+	s := state.NewState()
+	s.Sessions["mae-13"] = &state.Session{
+		IssueNumber:        204,
+		Status:             state.StatusRunning,
+		PID:                5004,
+		TmuxSession:        "maestro-mae-13",
+		Branch:             "feat/mae-13-204-test",
+		StartedAt:          time.Now().Add(-10 * time.Minute),
+		LastNotifiedStatus: "soft_token", // already handled
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-13"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (soft_token already notified, should skip)", sess.Status, state.StatusRunning)
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+}

@@ -64,6 +64,7 @@ type Orchestrator struct {
 	ghMergePRFn            func(prNumber int) error
 	ghCloseIssueFn         func(number int, comment string) error
 	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
+	saveCheckpointFn       func(worktreePath string, issueNumber int, tokensUsed int) error
 	rebaseWorktreeFn       func(worktreePath, branch string, autoResolveFiles []string) error
 }
 
@@ -147,6 +148,13 @@ func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
 		return o.workerStopFn(o.cfg, slotName, sess)
 	}
 	return worker.Stop(o.cfg, slotName, sess)
+}
+
+func (o *Orchestrator) saveCheckpoint(worktreePath string, issueNumber int, tokensUsed int) error {
+	if o.saveCheckpointFn != nil {
+		return o.saveCheckpointFn(worktreePath, issueNumber, tokensUsed)
+	}
+	return worker.SaveCheckpoint(worktreePath, issueNumber, tokensUsed)
 }
 
 func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
@@ -973,7 +981,65 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						}
 					}
 
-					// --- Token limit enforcement ---
+					// --- Soft token threshold: checkpoint and respawn ---
+					if o.cfg.WorkerMaxTokens > 0 && o.cfg.WorkerSoftTokenThreshold > 0 && sess.LastNotifiedStatus != "token_limit" && sess.LastNotifiedStatus != "soft_token" {
+						softLimit := int(float64(o.cfg.WorkerMaxTokens) * o.cfg.WorkerSoftTokenThreshold)
+						if sess.TokensUsed > softLimit && sess.TokensUsed <= o.cfg.WorkerMaxTokens {
+							log.Printf("[orch] worker %s hit soft token threshold (%d > %d), checkpointing",
+								slotName, sess.TokensUsed, softLimit)
+
+							// Save checkpoint in current worktree
+							if err := o.saveCheckpoint(sess.Worktree, sess.IssueNumber, sess.TokensUsed); err != nil {
+								log.Printf("[orch] warn: checkpoint save failed for %s: %v", slotName, err)
+							} else {
+								sess.CheckpointSaved = true
+							}
+
+							// Read checkpoint content before stopping (stop removes the worktree)
+							checkpointContent := worker.LoadCheckpoint(sess.Worktree)
+
+							// Stop current worker and respawn with checkpoint context
+							o.runAfterRunHook(sess)
+							if err := o.stopWorker(slotName, sess); err != nil {
+								log.Printf("[orch] warn: could not stop soft-threshold worker %s: %v", slotName, err)
+							}
+
+							sess.LastNotifiedStatus = "soft_token"
+
+							// Attempt respawn with checkpoint carry-forward
+							issue, fetchErr := o.getIssue(sess.IssueNumber)
+							if fetchErr != nil {
+								log.Printf("[orch] fetch issue #%d for soft-token respawn: %v — marking dead", sess.IssueNumber, fetchErr)
+								now := time.Now().UTC()
+								sess.Status = state.StatusDead
+								sess.FinishedAt = &now
+								o.notifier.Sendf("⚠️ Worker %s (issue #%d) hit soft token threshold but respawn failed (could not fetch issue)",
+									slotName, sess.IssueNumber)
+								continue
+							}
+
+							promptBase := o.selectPrompt(issue)
+							if checkpointContent != "" {
+								promptBase = promptBase + "\n\n---\n\n## Previous Worker Checkpoint\n\n" + checkpointContent
+							}
+							if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
+								log.Printf("[orch] soft-token respawn %s: %v — marking dead", slotName, err)
+								now := time.Now().UTC()
+								sess.Status = state.StatusDead
+								sess.FinishedAt = &now
+								o.notifier.Sendf("⚠️ Worker %s (issue #%d) hit soft token threshold but respawn failed: %v",
+									slotName, sess.IssueNumber, err)
+								continue
+							}
+
+							log.Printf("[orch] soft-token respawn: worker %s respawned with checkpoint", slotName)
+							o.notifier.Sendf("🔄 Worker %s (issue #%d) hit soft token threshold (%s tokens) — checkpointed and respawned",
+								slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsed))
+							continue
+						}
+					}
+
+					// --- Token limit enforcement (hard kill, safety net) ---
 					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsed > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
 						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
 							slotName, sess.TokensUsed, o.cfg.WorkerMaxTokens)
