@@ -360,7 +360,7 @@ func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, 
 	return comments, nil
 }
 
-// ClosePR closes a PR with an optional comment explaining why.
+// ClosePR closes a PR without merging and leaves a comment explaining why.
 func (c *Client) ClosePR(prNumber int, comment string) error {
 	if comment != "" {
 		out, err := exec.Command("gh", "pr", "comment",
@@ -380,15 +380,15 @@ func (c *Client) ClosePR(prNumber int, comment string) error {
 	return nil
 }
 
-// PRChecksOutput returns the raw output of `gh pr checks` for a PR.
-// This is used to capture CI failure details for retry context.
+// PRChecksOutput returns the full output of `gh pr checks` for a PR,
+// useful for capturing CI failure details to pass to retry workers.
 func (c *Client) PRChecksOutput(prNumber int) (string, error) {
 	out, err := exec.Command("gh", "pr", "checks",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo).CombinedOutput()
-	// gh pr checks exits non-zero when checks fail, but we still want the output
-	if err != nil && len(out) == 0 {
-		return "", fmt.Errorf("gh pr checks %d: %w", prNumber, err)
+	// gh pr checks exits non-zero when checks fail, but the output is still useful
+	if err != nil {
+		return string(out), nil
 	}
 	return string(out), nil
 }

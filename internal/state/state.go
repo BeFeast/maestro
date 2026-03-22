@@ -60,7 +60,7 @@ type Session struct {
 	Phase               Phase         `json:"phase,omitempty"`               // current pipeline phase (empty = legacy single-phase)
 	ValidationFails     int           `json:"validation_fails,omitempty"`    // number of failed validation attempts
 	ValidationFeedback  string        `json:"validation_feedback,omitempty"` // feedback from last failed validation
-	CIFailureContext    string        `json:"ci_failure_context,omitempty"`  // CI failure output from closed PR, passed to retry worker
+	CIFailureOutput     string        `json:"ci_failure_output,omitempty"`   // CI failure output captured before retry (passed to next worker as context)
 }
 
 // UnmarshalJSON implements custom unmarshalling to preserve the legacy

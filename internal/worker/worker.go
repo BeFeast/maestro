@@ -318,9 +318,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.TokensUsedAttempt = 0
-	// CIFailureContext is normally cleared by respawnDueRetries before this call,
+	// CIFailureOutput is normally cleared by respawnDueRetries before this call,
 	// but cleared here defensively in case Respawn is called from other paths.
-	sess.CIFailureContext = ""
+	sess.CIFailureOutput = ""
 
 	return nil
 }
