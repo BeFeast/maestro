@@ -551,6 +551,49 @@ func FindBlockers(body string, patterns []string) []int {
 	return blockers
 }
 
+// CreateIssue creates a new GitHub issue and returns its number.
+func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
+	args := []string{
+		"issue", "create",
+		"--repo", c.Repo,
+		"--title", title,
+		"--body", body,
+	}
+	for _, l := range labels {
+		args = append(args, "--label", l)
+	}
+
+	out, err := exec.Command("gh", args...).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("gh issue create: %w\n%s", err, out)
+	}
+
+	// gh issue create prints the URL; extract issue number from last path segment
+	url := strings.TrimSpace(string(out))
+	parts := strings.Split(url, "/")
+	if len(parts) == 0 {
+		return 0, fmt.Errorf("unexpected gh issue create output: %s", url)
+	}
+	n, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		return 0, fmt.Errorf("parse issue number from %q: %w", url, err)
+	}
+	return n, nil
+}
+
+// EditIssueBody updates the body of a GitHub issue.
+func (c *Client) EditIssueBody(number int, body string) error {
+	out, err := exec.Command("gh", "issue", "edit",
+		strconv.Itoa(number),
+		"--repo", c.Repo,
+		"--body", body,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh issue edit %d --body: %w\n%s", number, err, out)
+	}
+	return nil
+}
+
 // HasLabel returns true if any of the issue's labels match
 func HasLabel(issue Issue, labels []string) bool {
 	for _, l := range issue.Labels {
