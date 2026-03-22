@@ -73,12 +73,35 @@ type RoleConfig struct {
 	MaxRuntimeMinutes int    `yaml:"max_runtime_minutes"` // override per-role max runtime (0 = use global)
 }
 
-// PipelineConfig controls the planner → implementer → validator pipeline.
+// PipelineConfig controls the planner → implementer → validator pipeline
+// and the GSD-inspired pre-worker context preparation phases.
 type PipelineConfig struct {
+	// Phase-based pipeline (planner → implementer → validator)
 	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline (default: false = legacy single-phase)
 	Planner   RoleConfig `yaml:"planner"`   // planner role settings
 	Validator RoleConfig `yaml:"validator"` // validator role settings
 	// Implementer uses the existing worker_prompt / bug_prompt / enhancement_prompt settings.
+
+	// GSD-inspired pre-worker context preparation phases
+	Research       bool  `yaml:"research"`        // spawn a research subagent before worker starts (default: false)
+	PlanValidation *bool `yaml:"plan_validation"` // validate a plan before coding starts (default: true)
+	TestMapping    *bool `yaml:"test_mapping"`    // map requirements to verify commands (default: true)
+}
+
+// PlanValidationEnabled returns whether plan validation is enabled (default: true).
+func (p PipelineConfig) PlanValidationEnabled() bool {
+	if p.PlanValidation == nil {
+		return true
+	}
+	return *p.PlanValidation
+}
+
+// TestMappingEnabled returns whether test mapping is enabled (default: true).
+func (p PipelineConfig) TestMappingEnabled() bool {
+	if p.TestMapping == nil {
+		return true
+	}
+	return *p.TestMapping
 }
 
 // MissionsConfig controls mission mode for decomposing epics into child issues.

@@ -1129,3 +1129,64 @@ validation_contract: true
 		t.Error("ValidationContract should be true")
 	}
 }
+
+func TestParse_PipelineGSDDefaults(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Pipeline.Research {
+		t.Error("Pipeline.Research should default to false")
+	}
+	if !cfg.Pipeline.PlanValidationEnabled() {
+		t.Error("Pipeline.PlanValidation should default to true")
+	}
+	if !cfg.Pipeline.TestMappingEnabled() {
+		t.Error("Pipeline.TestMapping should default to true")
+	}
+}
+
+func TestParse_PipelineGSDExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+pipeline:
+  research: true
+  plan_validation: false
+  test_mapping: false
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Pipeline.Research {
+		t.Error("Pipeline.Research should be true when set")
+	}
+	if cfg.Pipeline.PlanValidationEnabled() {
+		t.Error("Pipeline.PlanValidation should be false when set")
+	}
+	if cfg.Pipeline.TestMappingEnabled() {
+		t.Error("Pipeline.TestMapping should be false when set")
+	}
+}
+
+func TestParse_PipelineGSDPartial(t *testing.T) {
+	yaml := `
+repo: owner/repo
+pipeline:
+  research: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Pipeline.Research {
+		t.Error("Pipeline.Research should be true when set")
+	}
+	if !cfg.Pipeline.PlanValidationEnabled() {
+		t.Error("Pipeline.PlanValidation should default to true when not set")
+	}
+	if !cfg.Pipeline.TestMappingEnabled() {
+		t.Error("Pipeline.TestMapping should default to true when not set")
+	}
+}
