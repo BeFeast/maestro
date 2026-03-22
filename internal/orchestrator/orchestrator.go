@@ -850,6 +850,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 				} else if closed {
 					log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+					o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 					sess.Status = state.StatusDone
 					if sess.FinishedAt == nil {
 						now := time.Now().UTC()
@@ -884,6 +885,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 			} else if closed {
 				log.Printf("[orch] issue #%d closed, transitioning %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 				o.stopWorker(slotName, sess)
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
@@ -899,6 +901,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 			} else if closed {
 				log.Printf("[orch] issue #%d closed, stopping worker %s", sess.IssueNumber, slotName)
+				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 				o.stopWorker(slotName, sess)
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
