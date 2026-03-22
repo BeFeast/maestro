@@ -13,6 +13,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -81,6 +82,12 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		} else {
 			log.Printf("[worker] VALIDATION.md already present (from hook), skipping generation")
 		}
+	}
+
+	// Run GSD pre-worker pipeline (research, plan validation, test mapping)
+	pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
+	if section := pipelineResult.PromptSection(); section != "" {
+		promptBase = promptBase + section
 	}
 
 	// Assemble worker prompt
@@ -222,6 +229,12 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		} else {
 			log.Printf("[worker] VALIDATION.md already present (from hook), skipping generation")
 		}
+	}
+
+	// Run GSD pre-worker pipeline (research, plan validation, test mapping)
+	pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
+	if section := pipelineResult.PromptSection(); section != "" {
+		promptBase = promptBase + section
 	}
 
 	// Assemble worker prompt

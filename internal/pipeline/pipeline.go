@@ -1,16 +1,24 @@
-// Package pipeline implements the planner → implementer → validator phase pipeline.
+// Package pipeline implements the planner → implementer → validator phase pipeline
+// and the GSD-inspired pre-worker context preparation phases.
 //
-// When pipeline mode is enabled in config, each issue goes through three phases:
+// Phase pipeline (when pipeline.enabled is true):
 //  1. Plan   — creates MAESTRO_PLAN.md + VALIDATION.md in the worktree
 //  2. Implement — writes code based on the plan (current worker behavior)
 //  3. Validate — checks assertions from VALIDATION.md, gates PR creation
 //
-// Each phase runs as a separate worker session in the same worktree.
+// GSD pre-worker phases (configurable independently):
+//   - Research: scans codebase for relevant patterns, writes context file
+//   - Plan Validation: extracts requirements, builds and validates a plan
+//   - Test Mapping: maps requirements to verification commands, generates verify.sh
+//
+// Each phase-pipeline phase runs as a separate worker session in the same worktree.
 // Failed validation retries the implementer with feedback, not a full re-plan.
+// GSD phases run before the worker starts and inject context into the prompt.
 package pipeline
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +26,8 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 )
+
+// ---- Phase-based pipeline (planner → implementer → validator) ----
 
 const (
 	// PlanFile is the plan artifact written by the planner phase.
@@ -126,4 +136,101 @@ func MaxRuntimeForPhase(cfg *config.Config, phase state.Phase) int {
 		}
 	}
 	return cfg.MaxRuntimeMinutes
+}
+
+// ---- GSD-inspired pre-worker context preparation ----
+
+// GSDResult holds the output of the GSD pre-worker pipeline phases.
+// The context fields are appended to the worker prompt.
+type GSDResult struct {
+	// ResearchContext is the markdown context from the research phase.
+	ResearchContext string
+
+	// Plan is the validated plan text.
+	Plan string
+
+	// VerifyScript is the path to the generated verify.sh script.
+	VerifyScript string
+
+	// TestMappingSummary is a markdown summary of test mappings.
+	TestMappingSummary string
+}
+
+// PromptSection returns a formatted string to append to the worker prompt.
+// It includes all pipeline outputs that are non-empty.
+func (r *GSDResult) PromptSection() string {
+	if r == nil {
+		return ""
+	}
+
+	var sections []string
+
+	if r.ResearchContext != "" {
+		sections = append(sections, "## Pre-coding Research\n\n"+r.ResearchContext)
+	}
+	if r.Plan != "" {
+		sections = append(sections, "## Implementation Plan\n\nThe following plan has been validated. Use it as your guide:\n\n"+r.Plan)
+	}
+	if r.TestMappingSummary != "" {
+		sections = append(sections, "## Test Mapping\n\n"+r.TestMappingSummary)
+	}
+
+	if len(sections) == 0 {
+		return ""
+	}
+
+	return "\n\n---\n\n# Pipeline Context\n\n" + strings.Join(sections, "\n\n---\n\n")
+}
+
+// RunGSD executes the GSD-inspired pre-worker pipeline phases before a worker starts.
+// All phases are best-effort — a failure in one phase logs a warning
+// but does not prevent subsequent phases or worker startup.
+func RunGSD(cfg *config.Config, worktreePath string, issueNumber int, issueTitle, issueBody string) *GSDResult {
+	result := &GSDResult{}
+	pipeline := cfg.Pipeline
+
+	anyEnabled := pipeline.Research || pipeline.PlanValidationEnabled() || pipeline.TestMappingEnabled()
+	if !anyEnabled {
+		return result
+	}
+
+	log.Printf("[pipeline] running GSD pre-worker pipeline for issue #%d (research=%v, plan_validation=%v, test_mapping=%v)",
+		issueNumber, pipeline.Research, pipeline.PlanValidationEnabled(), pipeline.TestMappingEnabled())
+
+	// Phase 1: Research
+	if pipeline.Research {
+		log.Printf("[pipeline] GSD phase 1/3: research")
+		ctx, err := runResearch(worktreePath, issueNumber, issueTitle, issueBody)
+		if err != nil {
+			log.Printf("[pipeline] research phase error: %v (continuing)", err)
+		} else {
+			result.ResearchContext = ctx
+		}
+	}
+
+	// Phase 2: Plan Validation
+	if pipeline.PlanValidationEnabled() {
+		log.Printf("[pipeline] GSD phase 2/3: plan validation")
+		plan, err := validatePlan(issueNumber, issueTitle, issueBody, worktreePath, result.ResearchContext)
+		if err != nil {
+			log.Printf("[pipeline] plan validation error: %v (continuing)", err)
+		} else {
+			result.Plan = plan
+		}
+	}
+
+	// Phase 3: Test Mapping
+	if pipeline.TestMappingEnabled() {
+		log.Printf("[pipeline] GSD phase 3/3: test mapping")
+		verifyPath, summary, err := mapTests(issueNumber, issueTitle, issueBody, worktreePath, result.Plan)
+		if err != nil {
+			log.Printf("[pipeline] test mapping error: %v (continuing)", err)
+		} else {
+			result.VerifyScript = verifyPath
+			result.TestMappingSummary = summary
+		}
+	}
+
+	log.Printf("[pipeline] GSD pre-worker pipeline complete for issue #%d", issueNumber)
+	return result
 }
