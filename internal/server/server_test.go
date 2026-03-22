@@ -28,39 +28,39 @@ func setupTestServer(t *testing.T) (*Server, *config.Config) {
 	st := state.NewState()
 	now := time.Now().UTC()
 	st.Sessions["slot-1"] = &state.Session{
-		IssueNumber: 42,
-		IssueTitle:  "Fix bug",
-		Status:      state.StatusRunning,
-		Backend:     "claude",
-		Branch:      "feat/slot-1-42-fix-bug",
-		Worktree:    "/tmp/worktrees/slot-1",
-		StartedAt:   now.Add(-10 * time.Minute),
-		TokensUsed:  5000,
-		PID:         1, // non-zero but won't be alive in tests
+		IssueNumber:     42,
+		IssueTitle:      "Fix bug",
+		Status:          state.StatusRunning,
+		Backend:         "claude",
+		Branch:          "feat/slot-1-42-fix-bug",
+		Worktree:        "/tmp/worktrees/slot-1",
+		StartedAt:       now.Add(-10 * time.Minute),
+		TokensUsedTotal: 5000,
+		PID:             1, // non-zero but won't be alive in tests
 	}
 	finished := now.Add(-5 * time.Minute)
 	st.Sessions["slot-2"] = &state.Session{
-		IssueNumber: 43,
-		IssueTitle:  "Add feature",
-		Status:      state.StatusPROpen,
-		Backend:     "codex",
-		Branch:      "feat/slot-2-43-add-feature",
-		Worktree:    "/tmp/worktrees/slot-2",
-		StartedAt:   now.Add(-30 * time.Minute),
-		FinishedAt:  &finished,
-		PRNumber:    10,
-		TokensUsed:  8000,
+		IssueNumber:     43,
+		IssueTitle:      "Add feature",
+		Status:          state.StatusPROpen,
+		Backend:         "codex",
+		Branch:          "feat/slot-2-43-add-feature",
+		Worktree:        "/tmp/worktrees/slot-2",
+		StartedAt:       now.Add(-30 * time.Minute),
+		FinishedAt:      &finished,
+		PRNumber:        10,
+		TokensUsedTotal: 8000,
 	}
 	st.Sessions["slot-3"] = &state.Session{
-		IssueNumber: 44,
-		IssueTitle:  "Refactor code",
-		Status:      state.StatusDone,
-		Backend:     "claude",
-		Branch:      "feat/slot-3-44-refactor-code",
-		StartedAt:   now.Add(-1 * time.Hour),
-		FinishedAt:  &finished,
-		PRNumber:    11,
-		TokensUsed:  3000,
+		IssueNumber:     44,
+		IssueTitle:      "Refactor code",
+		Status:          state.StatusDone,
+		Backend:         "claude",
+		Branch:          "feat/slot-3-44-refactor-code",
+		StartedAt:       now.Add(-1 * time.Hour),
+		FinishedAt:      &finished,
+		PRNumber:        11,
+		TokensUsedTotal: 3000,
 	}
 
 	if err := state.Save(dir, st); err != nil {

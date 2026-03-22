@@ -99,36 +99,38 @@ type tokenTotalsInfo struct {
 }
 
 type sessionInfo struct {
-	Slot        string `json:"slot"`
-	IssueNumber int    `json:"issue_number"`
-	IssueTitle  string `json:"issue_title"`
-	Status      string `json:"status"`
-	Backend     string `json:"backend,omitempty"`
-	PRNumber    int    `json:"pr_number,omitempty"`
-	TokensUsed  int    `json:"tokens_used"`
-	Runtime     string `json:"runtime"`
-	StartedAt   string `json:"started_at"`
-	FinishedAt  string `json:"finished_at,omitempty"`
-	PID         int    `json:"pid,omitempty"`
-	Alive       *bool  `json:"alive,omitempty"`
-	Worktree    string `json:"worktree,omitempty"`
-	Branch      string `json:"branch,omitempty"`
-	RetryCount  int    `json:"retry_count,omitempty"`
+	Slot              string `json:"slot"`
+	IssueNumber       int    `json:"issue_number"`
+	IssueTitle        string `json:"issue_title"`
+	Status            string `json:"status"`
+	Backend           string `json:"backend,omitempty"`
+	PRNumber          int    `json:"pr_number,omitempty"`
+	TokensUsedAttempt int    `json:"tokens_used_attempt"`
+	TokensUsedTotal   int    `json:"tokens_used_total"`
+	Runtime           string `json:"runtime"`
+	StartedAt         string `json:"started_at"`
+	FinishedAt        string `json:"finished_at,omitempty"`
+	PID               int    `json:"pid,omitempty"`
+	Alive             *bool  `json:"alive,omitempty"`
+	Worktree          string `json:"worktree,omitempty"`
+	Branch            string `json:"branch,omitempty"`
+	RetryCount        int    `json:"retry_count,omitempty"`
 }
 
 func makeSessionInfo(slot string, sess *state.Session) sessionInfo {
 	info := sessionInfo{
-		Slot:        slot,
-		IssueNumber: sess.IssueNumber,
-		IssueTitle:  sess.IssueTitle,
-		Status:      string(sess.Status),
-		Backend:     sess.Backend,
-		PRNumber:    sess.PRNumber,
-		TokensUsed:  sess.TokensUsed,
-		StartedAt:   sess.StartedAt.Format(time.RFC3339),
-		Worktree:    sess.Worktree,
-		Branch:      sess.Branch,
-		RetryCount:  sess.RetryCount,
+		Slot:              slot,
+		IssueNumber:       sess.IssueNumber,
+		IssueTitle:        sess.IssueTitle,
+		Status:            string(sess.Status),
+		Backend:           sess.Backend,
+		PRNumber:          sess.PRNumber,
+		TokensUsedAttempt: sess.TokensUsedAttempt,
+		TokensUsedTotal:   sess.TokensUsedTotal,
+		StartedAt:         sess.StartedAt.Format(time.RFC3339),
+		Worktree:          sess.Worktree,
+		Branch:            sess.Branch,
+		RetryCount:        sess.RetryCount,
 	}
 
 	// Calculate runtime
@@ -173,15 +175,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	for slot, sess := range st.Sessions {
 		info := makeSessionInfo(slot, sess)
 		resp.Summary[string(sess.Status)]++
-		totalTokens += sess.TokensUsed
+		totalTokens += sess.TokensUsedTotal
 
 		switch sess.Status {
 		case state.StatusRunning:
 			resp.Running = append(resp.Running, info)
-			activeTokens += sess.TokensUsed
+			activeTokens += sess.TokensUsedTotal
 		case state.StatusPROpen:
 			resp.PROpen = append(resp.PROpen, info)
-			activeTokens += sess.TokensUsed
+			activeTokens += sess.TokensUsedTotal
 		case state.StatusQueued:
 			resp.Queued = append(resp.Queued, info)
 		}
@@ -332,7 +334,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		if sess.PRNumber > 0 {
 			pr = fmt.Sprintf("#%d", sess.PRNumber)
 		}
-		tokens := worker.FormatTokens(sess.TokensUsed)
+		tokens := worker.FormatTokens(sess.TokensUsedTotal)
 		fmt.Fprintf(w, `<tr class="%s"><td>%s</td><td>#%d %s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>
 `,
 			sess.Status, slot, sess.IssueNumber, escapeHTML(sess.IssueTitle),

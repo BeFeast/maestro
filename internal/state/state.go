@@ -53,12 +53,37 @@ type Session struct {
 	NextRetryAt         *time.Time    `json:"next_retry_at,omitempty"`
 	LastOutputHash      string        `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt time.Time     `json:"last_output_changed_at,omitempty"`
-	TokensUsed          int           `json:"tokens_used,omitempty"`         // cumulative tokens consumed by the worker
+	TokensUsedAttempt   int           `json:"tokens_used_attempt,omitempty"` // tokens consumed in current attempt (reset on respawn)
+	TokensUsedTotal     int           `json:"tokens_used_total,omitempty"`   // cumulative tokens across the issue lifecycle
 	RateLimitHit        bool          `json:"rate_limit_hit,omitempty"`      // true if worker was rate-limited (tmux detection, running worker)
 	TriedBackends       []string      `json:"tried_backends,omitempty"`      // backends already attempted (for rate-limit fallback)
 	Phase               Phase         `json:"phase,omitempty"`               // current pipeline phase (empty = legacy single-phase)
 	ValidationFails     int           `json:"validation_fails,omitempty"`    // number of failed validation attempts
 	ValidationFeedback  string        `json:"validation_feedback,omitempty"` // feedback from last failed validation
+}
+
+// UnmarshalJSON implements custom unmarshalling to preserve the legacy
+// "tokens_used" field from older state files. Before the split into
+// per-attempt and total counters, a single "tokens_used" field tracked
+// cumulative token usage. When loading old state, map it to both new fields.
+func (s *Session) UnmarshalJSON(data []byte) error {
+	// Use an alias to avoid infinite recursion.
+	type SessionAlias Session
+	aux := &struct {
+		*SessionAlias
+		LegacyTokensUsed int `json:"tokens_used,omitempty"`
+	}{
+		SessionAlias: (*SessionAlias)(s),
+	}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	// If legacy field is set and both new fields are zero, migrate.
+	if aux.LegacyTokensUsed > 0 && s.TokensUsedAttempt == 0 && s.TokensUsedTotal == 0 {
+		s.TokensUsedAttempt = aux.LegacyTokensUsed
+		s.TokensUsedTotal = aux.LegacyTokensUsed
+	}
+	return nil
 }
 
 type State struct {

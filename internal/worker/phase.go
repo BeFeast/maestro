@@ -115,6 +115,8 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	sess.Backend = backendName
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
+	sess.TokensUsedAttempt = 0
+	sess.LastNotifiedStatus = ""
 
 	return nil
 }
