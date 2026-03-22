@@ -476,7 +476,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 		if cs, ok := ciStatuses[name]; ok {
 			ci = cs
 		}
-		tokens := worker.FormatTokens(sess.TokensUsed)
+		tokens := worker.FormatTokens(sess.TokensUsedTotal)
 		backend := sess.Backend
 		if backend == "" {
 			backend = "-"

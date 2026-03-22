@@ -1163,8 +1163,8 @@ func TestCheckSessions_TokenLimitExceeded_KillsWorker(t *testing.T) {
 	if sess.LastNotifiedStatus != "token_limit" {
 		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "token_limit")
 	}
-	if sess.TokensUsed != 75000 {
-		t.Fatalf("tokens_used = %d, want 75000", sess.TokensUsed)
+	if sess.TokensUsedAttempt != 75000 {
+		t.Fatalf("tokens_used = %d, want 75000", sess.TokensUsedAttempt)
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("finished_at should be set")
@@ -1199,8 +1199,8 @@ func TestCheckSessions_TokensBelowLimit_WorkerSurvives(t *testing.T) {
 	if sess.Status != state.StatusRunning {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRunning)
 	}
-	if sess.TokensUsed != 50000 {
-		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsed)
+	if sess.TokensUsedAttempt != 50000 {
+		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsedAttempt)
 	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
@@ -1233,8 +1233,8 @@ func TestCheckSessions_TokenLimitZero_NoEnforcement(t *testing.T) {
 		t.Fatalf("status = %q, want %q (limit disabled)", sess.Status, state.StatusRunning)
 	}
 	// Tokens should still be tracked even when limit is disabled
-	if sess.TokensUsed != 999999 {
-		t.Fatalf("tokens_used = %d, want 999999 (should track even when limit=0)", sess.TokensUsed)
+	if sess.TokensUsedAttempt != 999999 {
+		t.Fatalf("tokens_used = %d, want 999999 (should track even when limit=0)", sess.TokensUsedAttempt)
 	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
@@ -1257,7 +1257,7 @@ func TestCheckSessions_TokenLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
 		TmuxSession:        "maestro-mae-4",
 		Branch:             "feat/mae-4-104-test",
 		StartedAt:          time.Now().Add(-10 * time.Minute),
-		TokensUsed:         75000,
+		TokensUsedAttempt:  75000,
 		LastNotifiedStatus: "token_limit", // already notified
 	}
 
@@ -1298,8 +1298,8 @@ func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
 	if sess.Status != state.StatusRunning {
 		t.Fatalf("status = %q, want %q (at exact limit, uses strict >)", sess.Status, state.StatusRunning)
 	}
-	if sess.TokensUsed != 50000 {
-		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsed)
+	if sess.TokensUsedAttempt != 50000 {
+		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsedAttempt)
 	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
@@ -1367,16 +1367,16 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 	if sess6.Status != state.StatusDead {
 		t.Fatalf("mae-6 status = %q, want %q", sess6.Status, state.StatusDead)
 	}
-	if sess6.TokensUsed != 75000 {
-		t.Fatalf("mae-6 tokens_used = %d, want 75000", sess6.TokensUsed)
+	if sess6.TokensUsedAttempt != 75000 {
+		t.Fatalf("mae-6 tokens_used = %d, want 75000", sess6.TokensUsedAttempt)
 	}
 
 	sess7 := s.Sessions["mae-7"]
 	if sess7.Status != state.StatusRunning {
 		t.Fatalf("mae-7 status = %q, want %q", sess7.Status, state.StatusRunning)
 	}
-	if sess7.TokensUsed != 30000 {
-		t.Fatalf("mae-7 tokens_used = %d, want 30000", sess7.TokensUsed)
+	if sess7.TokensUsedAttempt != 30000 {
+		t.Fatalf("mae-7 tokens_used = %d, want 30000", sess7.TokensUsedAttempt)
 	}
 
 	if len(stopped) != 1 || stopped[0] != "mae-6" {
