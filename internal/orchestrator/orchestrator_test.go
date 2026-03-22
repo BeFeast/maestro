@@ -4092,8 +4092,9 @@ func TestCheckSessions_SoftTokenThreshold_CheckpointsAndRespawns(t *testing.T) {
 	if !respawned {
 		t.Fatal("worker should have been respawned")
 	}
-	if len(stopped) != 1 || stopped[0] != "mae-10" {
-		t.Fatalf("stopped = %v, want [mae-10]", stopped)
+	// stopWorker should NOT be called directly — respawnWorker handles stop internally
+	if len(stopped) != 0 {
+		t.Fatalf("stopped = %v, want [] (respawnWorker handles stop internally)", stopped)
 	}
 
 	sess := s.Sessions["mae-10"]

@@ -2,13 +2,45 @@ package worker
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
+// initBareRemoteAndWorktree creates a bare "origin" repo and a clone that
+// acts as the worktree so that git push -u origin HEAD succeeds.
+func initBareRemoteAndWorktree(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	bare := filepath.Join(base, "origin.git")
+	work := filepath.Join(base, "work")
+
+	for _, args := range [][]string{
+		{"git", "init", "--bare", "-b", "main", bare},
+		{"git", "clone", bare, work},
+	} {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	// Create an initial commit on main so origin/main exists
+	for _, args := range [][]string{
+		{"git", "-C", work, "commit", "--allow-empty", "-m", "init"},
+		{"git", "-C", work, "push", "-u", "origin", "main"},
+		{"git", "-C", work, "checkout", "-b", "feat/test"},
+		// Create a tracked change so diff --stat has output
+		{"git", "-C", work, "commit", "--allow-empty", "-m", "work commit"},
+	} {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	return work
+}
+
 func TestSaveAndLoadCheckpoint(t *testing.T) {
-	dir := t.TempDir()
+	dir := initBareRemoteAndWorktree(t)
 
 	err := SaveCheckpoint(dir, 42, 85000)
 	if err != nil {

@@ -19,25 +19,7 @@ func SaveCheckpoint(worktreePath string, issueNumber int, tokensUsed int) error 
 		return fmt.Errorf("empty worktree path")
 	}
 
-	// Gather git diff --stat for a summary of changes
-	diffStat := "(no changes)"
-	if out, err := exec.Command("git", "-C", worktreePath, "diff", "--stat", "origin/main").CombinedOutput(); err == nil {
-		trimmed := strings.TrimSpace(string(out))
-		if trimmed != "" {
-			diffStat = trimmed
-		}
-	}
-
-	// Gather list of commits on this branch not on origin/main
-	commitLog := "(no commits)"
-	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "origin/main..HEAD").CombinedOutput(); err == nil {
-		trimmed := strings.TrimSpace(string(out))
-		if trimmed != "" {
-			commitLog = trimmed
-		}
-	}
-
-	// Stage and commit any uncommitted work before checkpoint
+	// Stage and commit any uncommitted work before capturing stats
 	if out, err := exec.Command("git", "-C", worktreePath, "add", "-A").CombinedOutput(); err != nil {
 		log.Printf("[worker] checkpoint: git add failed: %v\n%s", err, out)
 	}
@@ -51,9 +33,26 @@ func SaveCheckpoint(worktreePath string, issueNumber int, tokensUsed int) error 
 		_ = out
 	}
 
+	// Gather stats after staging/committing so the WIP commit is included
+	diffStat := "(no changes)"
+	if out, err := exec.Command("git", "-C", worktreePath, "diff", "--stat", "origin/main..HEAD").CombinedOutput(); err == nil {
+		trimmed := strings.TrimSpace(string(out))
+		if trimmed != "" {
+			diffStat = trimmed
+		}
+	}
+
+	commitLog := "(no commits)"
+	if out, err := exec.Command("git", "-C", worktreePath, "log", "--oneline", "origin/main..HEAD").CombinedOutput(); err == nil {
+		trimmed := strings.TrimSpace(string(out))
+		if trimmed != "" {
+			commitLog = trimmed
+		}
+	}
+
 	// Push the branch so the new worker can pick it up
 	if out, err := exec.Command("git", "-C", worktreePath, "push", "-u", "origin", "HEAD").CombinedOutput(); err != nil {
-		log.Printf("[worker] checkpoint: git push failed: %v\n%s", err, out)
+		return fmt.Errorf("checkpoint push failed: %w\n%s", err, out)
 	}
 
 	content := fmt.Sprintf(`# Checkpoint — Issue #%d

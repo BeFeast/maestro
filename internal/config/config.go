@@ -94,7 +94,7 @@ type Config struct {
 	MaxRuntimeMinutes          int                  `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes int                  `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
 	WorkerMaxTokens            int                  `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
-	WorkerSoftTokenThreshold   float64              `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens for soft checkpoint (default: 0.8)
+	WorkerSoftTokenThreshold   float64              `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens for soft checkpoint (default: 0.8, 0 = disabled)
 	MaxRetriesPerIssue         int                  `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
 	AutoRebase                 bool                 `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
 	ClaudeCmd                  string               `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
@@ -250,7 +250,8 @@ func parse(data []byte) (*Config, error) {
 	}
 
 	// Default worker_soft_token_threshold: 0.8 (80% of worker_max_tokens)
-	if cfg.WorkerSoftTokenThreshold <= 0 || cfg.WorkerSoftTokenThreshold >= 1.0 {
+	// Treat negative or >= 1.0 as invalid (reset to default); 0 means disabled.
+	if cfg.WorkerSoftTokenThreshold < 0 || cfg.WorkerSoftTokenThreshold >= 1.0 {
 		cfg.WorkerSoftTokenThreshold = 0.8
 	}
 

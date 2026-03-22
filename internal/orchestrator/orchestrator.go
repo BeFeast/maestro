@@ -990,19 +990,15 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 							// Save checkpoint in current worktree
 							if err := o.saveCheckpoint(sess.Worktree, sess.IssueNumber, sess.TokensUsed); err != nil {
-								log.Printf("[orch] warn: checkpoint save failed for %s: %v", slotName, err)
-							} else {
-								sess.CheckpointSaved = true
+								log.Printf("[orch] warn: checkpoint save failed for %s: %v — keeping worker alive", slotName, err)
+								continue
 							}
+							sess.CheckpointSaved = true
 
-							// Read checkpoint content before stopping (stop removes the worktree)
+							// Read checkpoint content before respawn (respawnWorker handles stop internally)
 							checkpointContent := worker.LoadCheckpoint(sess.Worktree)
 
-							// Stop current worker and respawn with checkpoint context
 							o.runAfterRunHook(sess)
-							if err := o.stopWorker(slotName, sess); err != nil {
-								log.Printf("[orch] warn: could not stop soft-threshold worker %s: %v", slotName, err)
-							}
 
 							sess.LastNotifiedStatus = "soft_token"
 

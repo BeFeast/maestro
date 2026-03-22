@@ -188,6 +188,16 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		return fmt.Errorf("git worktree add: %w\n%s", err, out)
 	}
 
+	// If a remote branch with the same name exists (e.g. from a checkpoint push),
+	// reset to it so the respawned worker continues from where it left off.
+	if _, fetchErr := exec.Command("git", "-C", worktreePath, "fetch", "origin", branchName).CombinedOutput(); fetchErr == nil {
+		if resetOut, resetErr := exec.Command("git", "-C", worktreePath, "reset", "--hard", "origin/"+branchName).CombinedOutput(); resetErr != nil {
+			log.Printf("[worker] respawn: could not reset to origin/%s: %v\n%s", branchName, resetErr, resetOut)
+		} else {
+			log.Printf("[worker] respawn: resumed from remote branch origin/%s", branchName)
+		}
+	}
+
 	// Run after_create hook
 	hookEnv := HookEnv{
 		IssueID:       fmt.Sprintf("%s#%d", cfg.Repo, issue.Number),
