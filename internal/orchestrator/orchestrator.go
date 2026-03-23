@@ -298,6 +298,27 @@ func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus)
 	o.gh.SyncIssueToProject(issueNumber, o.cfg.GitHubProjects.ProjectNumber, status)
 }
 
+// reconcileProjectBoard moves closed issues to Done on the project board.
+// This catches issues closed externally (manual merge, GitHub auto-close, manual close).
+func (o *Orchestrator) reconcileProjectBoard() {
+	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
+		return
+	}
+
+	items, err := o.gh.ListNonDoneProjectItems(o.cfg.GitHubProjects.ProjectNumber)
+	if err != nil {
+		log.Printf("[orch] reconcile project board: %v", err)
+		return
+	}
+
+	for _, item := range items {
+		if item.IssueClosed {
+			log.Printf("[orch] reconcile: issue #%d is closed, moving to Done", item.IssueNumber)
+			o.syncProject(item.IssueNumber, github.ProjectStatusDone)
+		}
+	}
+}
+
 func readLastLines(path string, limit int) (string, error) {
 	if limit <= 0 {
 		return "", nil
@@ -584,6 +605,9 @@ func (o *Orchestrator) RunOnce() error {
 			return fmt.Errorf("save state after workers: %w", err)
 		}
 	}
+
+	// Step 6: Reconcile project board — move externally-closed issues to Done
+	o.reconcileProjectBoard()
 
 	// Flush digest buffer (no-op if digest mode is off or buffer is empty)
 	if err := o.notifier.Flush(); err != nil {
