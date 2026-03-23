@@ -1865,15 +1865,11 @@ func TestCheckSessions_SilentTimeoutSecondKill_LabelsBlocked(t *testing.T) {
 	if sess.Status != state.StatusDead {
 		t.Errorf("status = %q, want %q", sess.Status, state.StatusDead)
 	}
-	// Second silent timeout SHOULD add "blocked" label
-	found := false
+	// auto-label blocked is disabled — verify no blocked label was added
 	for _, label := range *labels {
 		if label == "blocked" {
-			found = true
+			t.Error("blocked label should not be added (auto-label blocked is disabled)")
 		}
-	}
-	if !found {
-		t.Error("second silent timeout should add 'blocked' label")
 	}
 }
 
@@ -2248,15 +2244,11 @@ func TestStartNewWorkers_SkipsRetryExhaustedIssue(t *testing.T) {
 		t.Errorf("started issue #%d, want #43", (*started)[0])
 	}
 
-	// Issue #42 should be labeled blocked
-	foundBlocked := false
+	// auto-label blocked is disabled — verify no blocked label was added
 	for _, label := range *labels {
 		if label == "#42:blocked" {
-			foundBlocked = true
+			t.Errorf("blocked label should not be added (auto-label blocked is disabled), labels = %v", *labels)
 		}
-	}
-	if !foundBlocked {
-		t.Errorf("expected issue #42 to be labeled blocked, labels = %v", *labels)
 	}
 
 	// The most recent dead session for issue #42 should be marked retry_exhausted
@@ -2322,17 +2314,20 @@ func TestStartNewWorkers_RetryExhaustedNotifiesOnce(t *testing.T) {
 		}
 	}
 
-	// First cycle: should mark retry_exhausted and label blocked
+	// First cycle: should mark retry_exhausted (but no blocked label — disabled)
 	o.startNewWorkers(s, 5)
 	if !s.IssueRetryExhausted(42) {
 		t.Fatal("issue #42 should be retry_exhausted after first detection")
 	}
-	firstLabelCount := len(*labels)
-	if firstLabelCount == 0 {
-		t.Fatal("expected blocked label on first detection")
+	// auto-label blocked is disabled — no labels should be added
+	for _, label := range *labels {
+		if label == "#42:blocked" {
+			t.Errorf("blocked label should not be added (auto-label blocked is disabled)")
+		}
 	}
+	firstLabelCount := len(*labels)
 
-	// Second cycle: should skip but NOT re-label or re-notify
+	// Second cycle: should skip and not add any labels
 	o.startNewWorkers(s, 5)
 	if len(*labels) != firstLabelCount {
 		t.Errorf("labels added on second cycle: %v (should not duplicate)", *labels)
@@ -3881,14 +3876,11 @@ func TestCheckSessions_AlreadyRetriedWorkerFails(t *testing.T) {
 	if sess.NextRetryAt != nil {
 		t.Fatal("NextRetryAt should be nil for permanently failed session")
 	}
-	found := false
+	// auto-label blocked is disabled — verify no blocked label was added
 	for _, label := range labeled {
 		if label == "blocked" {
-			found = true
+			t.Error("blocked label should not be added (auto-label blocked is disabled)")
 		}
-	}
-	if !found {
-		t.Error("expected 'blocked' label to be added on permanent failure")
 	}
 }
 

@@ -17,6 +17,8 @@ type greptileCheckRun struct {
 
 type greptileReviewComment struct {
 	Body     string `json:"body"`
+	Path     string `json:"path"`
+	Line     int    `json:"line"`
 	CommitID string `json:"commit_id"`
 	User     struct {
 		Login string `json:"login"`
@@ -256,13 +258,8 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 				return false, false, nil
 			}
 
-			reviewComments, err := c.greptileReviewComments(prNumber)
-			if err != nil {
-				return false, false, fmt.Errorf("gh api pulls/%d/comments: %w", prNumber, err)
-			}
-			if hasGreptileInlineCommentOnHead(reviewComments, sha) {
-				return false, false, nil
-			}
+			// Greptile check run passed — trust the verdict.
+			// Inline comments are advisory; the check run is the authority.
 			return true, false, nil
 		}
 		// No greptile check run found → fall through to comment fallback
@@ -339,9 +336,29 @@ func hasGreptileInlineCommentOnHead(comments []greptileReviewComment, sha string
 		if !isGreptileLogin(comment.User.Login) {
 			continue
 		}
-		if strings.TrimSpace(sha) == "" || strings.TrimSpace(comment.CommitID) == strings.TrimSpace(sha) {
+		if strings.TrimSpace(sha) != "" && strings.TrimSpace(comment.CommitID) != strings.TrimSpace(sha) {
+			continue // comment is on an older commit, skip
+		}
+		// Only block on P0 or P1 severity — P2/P3 are non-blocking
+		if isHighSeverity(comment.Body) {
 			return true
 		}
+	}
+	return false
+}
+
+// isHighSeverity checks if a review comment is P0 or P1 severity.
+// P2/P3 comments are informational and should not block merge.
+func isHighSeverity(body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "alt=\"p0\"") || strings.Contains(lower, "alt=\"p1\"") {
+		return true
+	}
+	if strings.Contains(lower, "/p0") || strings.Contains(lower, "/p1") {
+		return true
+	}
+	if strings.Contains(lower, "badge/p0") || strings.Contains(lower, "badge/p1") {
+		return true
 	}
 	return false
 }
@@ -592,6 +609,158 @@ func (c *Client) EditIssueBody(number int, body string) error {
 		return fmt.Errorf("gh issue edit %d --body: %w\n%s", number, err, out)
 	}
 	return nil
+}
+
+// FindOpenPRForIssue returns the first open PR that references the given issue number.
+// Returns pr number, branch name, and whether one was found.
+func (c *Client) FindOpenPRForIssue(issueNumber int) (prNumber int, branch string, found bool, err error) {
+	query := fmt.Sprintf("#%d", issueNumber)
+	out, err := exec.Command("gh", "pr", "list",
+		"--repo", c.Repo,
+		"--state", "open",
+		"--search", query,
+		"--json", "number,headRefName",
+		"--limit", "1").Output()
+	if err != nil {
+		return 0, "", false, fmt.Errorf("gh pr list --search: %w", err)
+	}
+	var prs []struct {
+		Number      int    `json:"number"`
+		HeadRefName string `json:"headRefName"`
+	}
+	if err := json.Unmarshal(out, &prs); err != nil {
+		return 0, "", false, fmt.Errorf("parse pr search: %w", err)
+	}
+	if len(prs) == 0 {
+		return 0, "", false, nil
+	}
+	return prs[0].Number, prs[0].HeadRefName, true, nil
+}
+
+// ReviewComment is an exported review comment (from Greptile, Codex, or any reviewer).
+type ReviewComment struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Body string `json:"body"`
+	User string `json:"user"`
+}
+
+// CollectReviewFeedback collects all inline review comments from Greptile and Codex on a PR.
+func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
+	// Get HEAD SHA — only return comments on the latest commit
+	prOut, _ := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber),
+		"--jq", ".head.sha").Output()
+	headSHA := strings.TrimSpace(string(prOut))
+
+	comments, err := c.greptileReviewComments(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	var result []ReviewComment
+	for _, cm := range comments {
+		login := cm.User.Login
+		if !strings.Contains(login, "greptile") && !strings.Contains(login, "codex") {
+			continue
+		}
+		// Skip comments on older commits — they may already be fixed
+		if headSHA != "" && strings.TrimSpace(cm.CommitID) != "" && strings.TrimSpace(cm.CommitID) != headSHA {
+			continue
+		}
+		result = append(result, ReviewComment{
+			Path: cm.Path,
+			Line: cm.Line,
+			Body: cm.Body,
+			User: login,
+		})
+	}
+	return result, nil
+}
+
+// FormatReviewFeedback formats review comments into a text block for worker prompts.
+func FormatReviewFeedback(comments []ReviewComment) string {
+	if len(comments) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n## Review Feedback (fix these issues)\n\n")
+	sb.WriteString("The following review comments were left on your PR. Fix each one, commit, and push to the same branch.\n\n")
+	for i, c := range comments {
+		sb.WriteString(fmt.Sprintf("### Comment %d", i+1))
+		if c.User != "" {
+			sb.WriteString(fmt.Sprintf(" (from %s)", c.User))
+		}
+		sb.WriteString("\n")
+		if c.Path != "" {
+			sb.WriteString(fmt.Sprintf("File: %s", c.Path))
+			if c.Line > 0 {
+				sb.WriteString(fmt.Sprintf(", Line: %d", c.Line))
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(c.Body)
+		sb.WriteString("\n\n")
+	}
+	return sb.String()
+}
+
+// CIFailureSummary gets the CI check run failure summary for a PR.
+func (c *Client) CIFailureSummary(prNumber int) (string, error) {
+	// 1. Get check overview
+	overview, _ := exec.Command("gh", "pr", "checks", fmt.Sprint(prNumber), "--repo", c.Repo).CombinedOutput()
+
+	// 2. Find failed job IDs and fetch their logs
+	runsOut, _ := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber),
+		"--jq", ".head.sha").Output()
+	sha := strings.TrimSpace(string(runsOut))
+	if sha == "" {
+		return string(overview), nil
+	}
+
+	jqExpr := `.check_runs[] | select(.conclusion == "failure") | "\(.id) \(.name)"`
+	checksOut, err := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/commits/%s/check-runs", c.Repo, sha),
+		"--jq", jqExpr).Output()
+	if err != nil || len(checksOut) == 0 {
+		return string(overview), nil
+	}
+
+	var result strings.Builder
+	result.WriteString("CI Check Overview:\n")
+	result.Write(overview)
+	result.WriteString("\n\n")
+
+	for _, line := range strings.Split(strings.TrimSpace(string(checksOut)), "\n") {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		jobID, jobName := parts[0], parts[1]
+		result.WriteString(fmt.Sprintf("=== Failed job: %s ===\n", jobName))
+		logOut, err := exec.Command("gh", "api",
+			fmt.Sprintf("repos/%s/actions/jobs/%s/logs", c.Repo, jobID)).Output()
+		if err != nil {
+			result.WriteString("(could not fetch logs)\n")
+			continue
+		}
+		lines := strings.Split(string(logOut), "\n")
+		start := len(lines) - 80
+		if start < 0 {
+			start = 0
+		}
+		for _, l := range lines[start:] {
+			result.WriteString(l)
+			result.WriteString("\n")
+		}
+		result.WriteString("\n")
+	}
+
+	s := result.String()
+	if len(s) > 8000 {
+		s = s[:8000] + "\n... (truncated)"
+	}
+	return s, nil
 }
 
 // HasLabel returns true if any of the issue's labels match

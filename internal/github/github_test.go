@@ -55,25 +55,35 @@ func TestGreptileCheckDecision(t *testing.T) {
 }
 
 func TestHasGreptileInlineCommentOnHead(t *testing.T) {
-	makeComment := func(login, sha string) greptileReviewComment {
+	makeComment := func(login, sha, body string) greptileReviewComment {
 		var c greptileReviewComment
 		c.CommitID = sha
 		c.User.Login = login
+		c.Body = body
 		return c
 	}
 
-	comments := []greptileReviewComment{
-		makeComment("greptile-apps[bot]", "head-sha"),
-		makeComment("chatgpt-codex-connector[bot]", "head-sha"),
-		makeComment("greptile-apps[bot]", "old-sha"),
+	// P0/P1 comments should block
+	p0Comments := []greptileReviewComment{
+		makeComment("greptile-apps[bot]", "head-sha", "![alt=\"P0\"] Critical issue"),
+	}
+	if !hasGreptileInlineCommentOnHead(p0Comments, "head-sha") {
+		t.Fatal("expected P0 greptile inline comment on current head to block")
 	}
 
-	if !hasGreptileInlineCommentOnHead(comments, "head-sha") {
-		t.Fatal("expected greptile inline comment on current head to block")
+	// P2/P3 comments should NOT block (severity-based filtering)
+	p2Comments := []greptileReviewComment{
+		makeComment("greptile-apps[bot]", "head-sha", "Minor style issue"),
 	}
-	if hasGreptileInlineCommentOnHead(comments, "different-sha") {
+	if hasGreptileInlineCommentOnHead(p2Comments, "head-sha") {
+		t.Fatal("did not expect low-severity greptile comment to block")
+	}
+
+	// Comments on different SHA should not block
+	if hasGreptileInlineCommentOnHead(p0Comments, "different-sha") {
 		t.Fatal("did not expect greptile comment from another head to block")
 	}
+
 	if !isGreptileLogin("greptile-apps[bot]") {
 		t.Fatal("expected greptile login to be recognized")
 	}

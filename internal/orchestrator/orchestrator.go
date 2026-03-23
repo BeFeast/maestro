@@ -999,9 +999,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					// Retry limit reached — mark as permanently failed
 					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
-					if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
-						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
-					}
+					// auto-label blocked disabled
 					o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
 					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
@@ -1172,9 +1170,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								sess.FinishedAt = &now
 
 								if prevSilentKills > 0 {
-									if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
-										log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
-									}
+									// auto-label blocked disabled
 								}
 
 								o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d) killed — no output for %d minutes",
@@ -1206,9 +1202,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				if err := o.stopWorker(slotName, sess); err != nil {
 					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
 				}
-				if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
-					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
-				}
+				// auto-label blocked disabled
 				o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
 				sess.Status = state.StatusFailed
 				now := time.Now().UTC()
@@ -1286,10 +1280,8 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue // not ready yet
 			}
 			if !greptileOK {
-				log.Printf("[orch] PR #%d not approved by Greptile, labeling blocked", pr.Number)
-				if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
-					log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
-				}
+				log.Printf("[orch] PR #%d not approved by Greptile", pr.Number)
+				// auto-label blocked disabled
 				continue
 			}
 
@@ -1357,9 +1349,7 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	if maxRetries > 0 && totalAttempts >= maxRetries {
 		log.Printf("[orch] CI failure on PR #%d — retry limit reached (%d/%d) for issue #%d",
 			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
-		if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
-			log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
-		}
+		// auto-label blocked disabled
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
 		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
 		o.notifier.Sendf("💀 maestro: CI failing on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
@@ -1710,9 +1700,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				if !s.IssueRetryExhausted(issue.Number) {
 					// First time hitting the limit — mark, label, and notify
 					s.MarkIssueRetryExhausted(issue.Number)
-					if err := o.addIssueLabel(issue.Number, "blocked"); err != nil {
-						log.Printf("[orch] warn: could not label issue #%d as blocked: %v", issue.Number, err)
-					}
+					// auto-label blocked disabled
 					o.notifier.Sendf("⚠️ Issue #%d hit max retries (%d) — needs manual review",
 						issue.Number, o.cfg.MaxRetriesPerIssue)
 				}

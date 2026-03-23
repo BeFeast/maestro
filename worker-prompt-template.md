@@ -146,3 +146,43 @@ After implementing, verify the feature actually works:
 Document your smoke test result in the PR body under "## Smoke Test".
 
 Start implementing now. No need to ask for clarification — make reasonable decisions and document them.
+
+### 9. E2E Tests (CRITICAL — CI will fail without this)
+Panoptikon has Playwright E2E tests in `web/tests/e2e/`. When you change any UI component:
+
+1. Run existing tests to see what breaks:
+   ```bash
+   cd web && bun run test:e2e 2>&1 | tail -30
+   ```
+2. If tests fail because of YOUR changes (new class names, different text, changed layout):
+   - UPDATE the failing test assertions to match your new code
+   - Do NOT delete tests — fix them
+3. If you add a new page or component, add a basic E2E test
+4. Common test patterns:
+   ```typescript
+   // Tests check for specific text, CSS classes, and layout
+   // If you change a heading text, update the test expectation
+   // If you change CSS classes, update the test selector
+   ```
+5. **CI runs E2E tests — if they fail, your PR will NOT merge. Fix tests before opening PR.**
+
+### 10. Design Reference (MUST READ)
+Before making ANY UI changes, read `DESIGN_REFERENCE.md` in the repo root. It defines:
+- Color palette, card styles, typography
+- What NOT to do (no saturated gradients, no bracket borders, etc.)
+- Every UI change must match this reference
+
+### 11. Visual Verification via CDP (REQUIRED for UI changes)
+After implementing UI changes, visually verify using Chrome DevTools Protocol on Prisma (10.10.0.63:18803).
+
+Start the dev server, open the page in CDP browser, check that the UI matches DESIGN_REFERENCE.md.
+If the page looks wrong (broken layout, wrong colors, missing elements), fix BEFORE creating PR.
+
+```bash
+# Quick visual check: start dev server and curl a screenshot
+cd web && PATH="$HOME/.bun/bin:$PATH" bun run dev &
+sleep 5
+curl -s "http://10.10.0.63:18803/json/new?http://localhost:3000" | python3 -c "import json,sys; print('Tab opened:', json.load(sys.stdin).get('id','?'))"
+# Manually verify in CDP or use playwright screenshot
+kill %1 2>/dev/null
+```
