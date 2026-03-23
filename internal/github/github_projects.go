@@ -51,6 +51,105 @@ var knownProjects = map[int]projectConfig{
 	},
 }
 
+// ProjectItem represents an item on a GitHub Project board with its linked issue info.
+type ProjectItem struct {
+	IssueNumber int
+	IssueClosed bool
+}
+
+// ListNonDoneProjectItems fetches all project items not in Done status
+// and returns their linked issue numbers along with whether they are closed.
+// This allows the orchestrator to reconcile stale board statuses.
+func (c *Client) ListNonDoneProjectItems(projectNumber int) ([]ProjectItem, error) {
+	cfg, ok := knownProjects[projectNumber]
+	if !ok {
+		return nil, fmt.Errorf("unknown project number %d", projectNumber)
+	}
+
+	doneOptionID := cfg.StatusOptions[ProjectStatusDone]
+
+	query := fmt.Sprintf(`{
+  node(id: %q) {
+    ... on ProjectV2 {
+      items(first: 100) {
+        nodes {
+          fieldValueByName(name: "Status") {
+            ... on ProjectV2ItemFieldSingleSelectValue {
+              optionId
+            }
+          }
+          content {
+            ... on Issue {
+              number
+              state
+            }
+          }
+        }
+      }
+    }
+  }
+}`, cfg.ProjectID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", "query="+query).Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("graphql project items: %w\nstderr: %s", err, exitErr.Stderr)
+		}
+		return nil, fmt.Errorf("graphql project items: %w", err)
+	}
+
+	var resp struct {
+		Data struct {
+			Node struct {
+				Items struct {
+					Nodes []struct {
+						FieldValueByName *struct {
+							OptionID string `json:"optionId"`
+						} `json:"fieldValueByName"`
+						Content *struct {
+							Number int    `json:"number"`
+							State  string `json:"state"`
+						} `json:"content"`
+					} `json:"nodes"`
+				} `json:"items"`
+			} `json:"node"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, fmt.Errorf("parse project items response: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		msgs := make([]string, len(resp.Errors))
+		for i, e := range resp.Errors {
+			msgs[i] = e.Message
+		}
+		return nil, fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
+	}
+
+	var items []ProjectItem
+	for _, node := range resp.Data.Node.Items.Nodes {
+		// Skip items with no linked issue (drafts, PRs, etc.)
+		if node.Content == nil || node.Content.Number == 0 {
+			continue
+		}
+		// Skip items already in Done status
+		if node.FieldValueByName != nil && node.FieldValueByName.OptionID == doneOptionID {
+			continue
+		}
+		items = append(items, ProjectItem{
+			IssueNumber: node.Content.Number,
+			IssueClosed: node.Content.State == "CLOSED",
+		})
+	}
+
+	return items, nil
+}
+
 // SyncIssueToProject adds an issue to the GitHub Project and sets its status.
 // It is graceful: errors are logged but not returned, so callers are never blocked.
 func (c *Client) SyncIssueToProject(issueNumber int, projectNumber int, status ProjectStatus) {
