@@ -97,6 +97,7 @@ func (c *Client) DiscoverProject(projectNumber int) (*ProjectField, error) {
 type ProjectItem struct {
 	IssueNumber int
 	IssueClosed bool
+	HasStatus   bool // false when the item has no Status field value (shows as "No Status")
 }
 
 // ListNonDoneProjectItems fetches all project items not in Done status
@@ -182,6 +183,7 @@ func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error
 		items = append(items, ProjectItem{
 			IssueNumber: node.Content.Number,
 			IssueClosed: node.Content.State == "CLOSED",
+			HasStatus:   node.FieldValueByName != nil && node.FieldValueByName.OptionID != "",
 		})
 	}
 

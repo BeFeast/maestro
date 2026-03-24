@@ -348,6 +348,9 @@ func (o *Orchestrator) reconcileProjectBoard() {
 		if item.IssueClosed {
 			log.Printf("[orch] reconcile: issue #%d is closed, moving to Done", item.IssueNumber)
 			o.gh.SyncIssueStatus(o.projectField, item.IssueNumber, "Done")
+		} else if !item.HasStatus {
+			log.Printf("[orch] reconcile: issue #%d has no status, setting to Todo", item.IssueNumber)
+			o.gh.SyncIssueStatus(o.projectField, item.IssueNumber, "Todo")
 		}
 	}
 }
