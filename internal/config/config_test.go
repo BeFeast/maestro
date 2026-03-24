@@ -530,6 +530,45 @@ model:
 	}
 }
 
+func TestParse_TelegramModeDefault(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Telegram.Mode != "direct" {
+		t.Errorf("Telegram.Mode = %q, want %q", cfg.Telegram.Mode, "direct")
+	}
+}
+
+func TestParse_TelegramModeExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+telegram:
+  target: "12345"
+  mode: openclaw
+  openclaw_url: "http://oc:1234"
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Telegram.Mode != "openclaw" {
+		t.Errorf("Telegram.Mode = %q, want %q", cfg.Telegram.Mode, "openclaw")
+	}
+}
+
+func TestParse_NoDefaultOpenclawURL(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Telegram.OpenclawURL != "" {
+		t.Errorf("Telegram.OpenclawURL = %q, want empty (no default)", cfg.Telegram.OpenclawURL)
+	}
+}
+
 func TestParse_DigestModeDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))

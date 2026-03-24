@@ -3531,7 +3531,7 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	o := &Orchestrator{
 		cfg:      cfg,
 		repo:     cfg.Repo,
-		notifier: notify.NewWithToken("", "", ""),
+		notifier: notify.NewWithToken("", "", "", ""),
 		router:   router.New(cfg),
 	}
 
@@ -3573,7 +3573,7 @@ func TestReloadConfig_PollIntervalChange(t *testing.T) {
 	o := &Orchestrator{
 		cfg:      cfg,
 		repo:     cfg.Repo,
-		notifier: notify.NewWithToken("", "", ""),
+		notifier: notify.NewWithToken("", "", "", ""),
 		router:   router.New(cfg),
 	}
 
@@ -3607,7 +3607,7 @@ func TestReloadConfig_NoChanges(t *testing.T) {
 	o := &Orchestrator{
 		cfg:      cfg,
 		repo:     cfg.Repo,
-		notifier: notify.NewWithToken("", "", ""),
+		notifier: notify.NewWithToken("", "", "", ""),
 		router:   router.New(cfg),
 	}
 
@@ -3642,7 +3642,7 @@ func TestReloadConfig_IssueLabelsUpdated(t *testing.T) {
 	o := &Orchestrator{
 		cfg:      cfg,
 		repo:     cfg.Repo,
-		notifier: notify.NewWithToken("", "", ""),
+		notifier: notify.NewWithToken("", "", "", ""),
 		router:   router.New(cfg),
 	}
 
@@ -3681,7 +3681,7 @@ func TestReloadConfig_PromptPathReload(t *testing.T) {
 		cfg:        cfg,
 		repo:       cfg.Repo,
 		promptBase: "old prompt",
-		notifier:   notify.NewWithToken("", "", ""),
+		notifier:   notify.NewWithToken("", "", "", ""),
 		router:     router.New(cfg),
 	}
 

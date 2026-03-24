@@ -88,3 +88,38 @@ func TestSend_EmptyTarget_Skips(t *testing.T) {
 		t.Errorf("Send with empty target should return nil, got: %v", err)
 	}
 }
+
+func TestNewWithToken_DefaultsToDirectMode(t *testing.T) {
+	n := NewWithToken("tok", "chat", "", "")
+	if n.Mode != "direct" {
+		t.Errorf("Mode = %q, want %q", n.Mode, "direct")
+	}
+}
+
+func TestNewWithToken_RespectsExplicitMode(t *testing.T) {
+	n := NewWithToken("tok", "chat", "openclaw", "http://oc:1234")
+	if n.Mode != "openclaw" {
+		t.Errorf("Mode = %q, want %q", n.Mode, "openclaw")
+	}
+}
+
+func TestSend_DirectMode_NoToken_NoURL_Skips(t *testing.T) {
+	n := &Notifier{Target: "chat", Mode: "direct"}
+	if err := n.Send("msg"); err != nil {
+		t.Errorf("Send should return nil when no transport available, got: %v", err)
+	}
+}
+
+func TestSend_OpenclawMode_NoURL_Skips(t *testing.T) {
+	n := &Notifier{Target: "chat", Mode: "openclaw"}
+	if err := n.Send("msg"); err != nil {
+		t.Errorf("Send should return nil when openclaw_url not configured, got: %v", err)
+	}
+}
+
+func TestNew_SetsOpenclawMode(t *testing.T) {
+	n := New("http://oc:1234", "chat")
+	if n.Mode != "openclaw" {
+		t.Errorf("Mode = %q, want %q", n.Mode, "openclaw")
+	}
+}
