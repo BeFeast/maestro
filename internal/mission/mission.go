@@ -194,7 +194,9 @@ func (p *Processor) decomposeMission(s *state.State, issue github.Issue) {
 
 		// Sync to GitHub Projects if enabled
 		if p.cfg.GitHubProjects.Enabled && p.cfg.GitHubProjects.ProjectNumber > 0 {
-			p.gh.SyncIssueToProject(childNum, p.cfg.GitHubProjects.ProjectNumber, github.ProjectStatusTodo)
+			if pf, err := p.gh.DiscoverProject(p.cfg.GitHubProjects.ProjectNumber); err == nil {
+				p.gh.SyncIssueStatus(pf, childNum, "Todo")
+			}
 		}
 
 		prevChildNum = childNum
@@ -264,7 +266,9 @@ func (p *Processor) updateMissionProgress(s *state.State, parentNum int, m *stat
 
 		// Sync parent to done in GitHub Projects
 		if p.cfg.GitHubProjects.Enabled && p.cfg.GitHubProjects.ProjectNumber > 0 {
-			p.gh.SyncIssueToProject(parentNum, p.cfg.GitHubProjects.ProjectNumber, github.ProjectStatusDone)
+			if pf, err := p.gh.DiscoverProject(p.cfg.GitHubProjects.ProjectNumber); err == nil {
+				p.gh.SyncIssueStatus(pf, parentNum, "Done")
+			}
 		}
 	}
 }

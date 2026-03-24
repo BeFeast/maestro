@@ -14,6 +14,7 @@ import (
 const ghTimeout = 30 * time.Second
 
 // ProjectStatus represents the status to set on a GitHub Project item.
+// Kept for backward compatibility — callers map these to real column names.
 type ProjectStatus string
 
 const (
@@ -22,33 +23,74 @@ const (
 	ProjectStatusDone       ProjectStatus = "done"
 )
 
-// projectConfig holds the IDs needed to interact with a specific GitHub Project.
-type projectConfig struct {
-	ProjectID     string // GraphQL node ID (e.g. "PVT_kwDODsWD3M4BQ3Zd")
-	StatusFieldID string // Status field ID (e.g. "PVTSSF_lADODsWD3M4BQ3Zdzg-3LbA")
-	StatusOptions map[ProjectStatus]string
+// ProjectField holds the Status field metadata for a GitHub Project, discovered at runtime.
+type ProjectField struct {
+	ProjectID string
+	FieldID   string
+	Options   map[string]string // status name -> option ID (e.g. "In Progress" -> "47fc9ee4")
 }
 
-// knownProjects maps project numbers to their configs.
-var knownProjects = map[int]projectConfig{
-	4: {
-		ProjectID:     "PVT_kwDODsWD3M4BQ3Zd",
-		StatusFieldID: "PVTSSF_lADODsWD3M4BQ3Zdzg-3LbA",
-		StatusOptions: map[ProjectStatus]string{
-			ProjectStatusTodo:       "f75ad846",
-			ProjectStatusInProgress: "47fc9ee4",
-			ProjectStatusDone:       "98236657",
-		},
-	},
-	5: {
-		ProjectID:     "PVT_kwDODsWD3M4BQ3Z7",
-		StatusFieldID: "PVTSSF_lADODsWD3M4BQ3Z7zg-3Lwo",
-		StatusOptions: map[ProjectStatus]string{
-			ProjectStatusTodo:       "f75ad846",
-			ProjectStatusInProgress: "47fc9ee4",
-			ProjectStatusDone:       "98236657",
-		},
-	},
+// DiscoverProject finds the GitHub Project board and returns its Status field options.
+func (c *Client) DiscoverProject(projectNumber int) (*ProjectField, error) {
+	org := strings.Split(c.Repo, "/")[0]
+
+	query := fmt.Sprintf(`query {
+		organization(login: %q) {
+			projectV2(number: %d) {
+				id
+				field(name: "Status") {
+					... on ProjectV2SingleSelectField {
+						id
+						options { id name }
+					}
+				}
+			}
+		}
+	}`, org, projectNumber)
+
+	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", "query="+query).Output()
+	if err != nil {
+		return nil, fmt.Errorf("discover project %d: %w", projectNumber, err)
+	}
+
+	var result struct {
+		Data struct {
+			Organization struct {
+				ProjectV2 struct {
+					ID    string `json:"id"`
+					Field struct {
+						ID      string `json:"id"`
+						Options []struct {
+							ID   string `json:"id"`
+							Name string `json:"name"`
+						} `json:"options"`
+					} `json:"field"`
+				} `json:"projectV2"`
+			} `json:"organization"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, fmt.Errorf("parse project response: %w", err)
+	}
+
+	p := result.Data.Organization.ProjectV2
+	if p.ID == "" {
+		return nil, fmt.Errorf("project %d not found", projectNumber)
+	}
+
+	pf := &ProjectField{
+		ProjectID: p.ID,
+		FieldID:   p.Field.ID,
+		Options:   make(map[string]string),
+	}
+	for _, opt := range p.Field.Options {
+		pf.Options[opt.Name] = opt.ID
+	}
+
+	log.Printf("[projects] discovered project %d: %d status options (%v)", projectNumber, len(pf.Options), keys(pf.Options))
+	return pf, nil
 }
 
 // ProjectItem represents an item on a GitHub Project board with its linked issue info.
@@ -59,14 +101,12 @@ type ProjectItem struct {
 
 // ListNonDoneProjectItems fetches all project items not in Done status
 // and returns their linked issue numbers along with whether they are closed.
-// This allows the orchestrator to reconcile stale board statuses.
-func (c *Client) ListNonDoneProjectItems(projectNumber int) ([]ProjectItem, error) {
-	cfg, ok := knownProjects[projectNumber]
-	if !ok {
-		return nil, fmt.Errorf("unknown project number %d", projectNumber)
+func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error) {
+	if pf == nil {
+		return nil, fmt.Errorf("nil ProjectField")
 	}
 
-	doneOptionID := cfg.StatusOptions[ProjectStatusDone]
+	doneOptionID := pf.Options["Done"]
 
 	query := fmt.Sprintf(`{
   node(id: %q) {
@@ -88,7 +128,7 @@ func (c *Client) ListNonDoneProjectItems(projectNumber int) ([]ProjectItem, erro
       }
     }
   }
-}`, cfg.ProjectID)
+}`, pf.ProjectID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
@@ -133,12 +173,10 @@ func (c *Client) ListNonDoneProjectItems(projectNumber int) ([]ProjectItem, erro
 
 	var items []ProjectItem
 	for _, node := range resp.Data.Node.Items.Nodes {
-		// Skip items with no linked issue (drafts, PRs, etc.)
 		if node.Content == nil || node.Content.Number == 0 {
 			continue
 		}
-		// Skip items already in Done status
-		if node.FieldValueByName != nil && node.FieldValueByName.OptionID == doneOptionID {
+		if doneOptionID != "" && node.FieldValueByName != nil && node.FieldValueByName.OptionID == doneOptionID {
 			continue
 		}
 		items = append(items, ProjectItem{
@@ -150,18 +188,16 @@ func (c *Client) ListNonDoneProjectItems(projectNumber int) ([]ProjectItem, erro
 	return items, nil
 }
 
-// SyncIssueToProject adds an issue to the GitHub Project and sets its status.
-// It is graceful: errors are logged but not returned, so callers are never blocked.
-func (c *Client) SyncIssueToProject(issueNumber int, projectNumber int, status ProjectStatus) {
-	cfg, ok := knownProjects[projectNumber]
-	if !ok {
-		log.Printf("[projects] unknown project number %d, skipping sync for issue #%d", projectNumber, issueNumber)
+// SyncIssueStatus adds an issue to the project (if not already) and sets its Status.
+// Best-effort: errors are logged, never returned.
+func (c *Client) SyncIssueStatus(pf *ProjectField, issueNumber int, statusName string) {
+	if pf == nil {
 		return
 	}
 
-	optionID, ok := cfg.StatusOptions[status]
+	optionID, ok := pf.Options[statusName]
 	if !ok {
-		log.Printf("[projects] unknown status %q for project %d, skipping sync for issue #%d", status, projectNumber, issueNumber)
+		log.Printf("[projects] status %q not found in project (have: %v), skipping issue #%d", statusName, keys(pf.Options), issueNumber)
 		return
 	}
 
@@ -172,20 +208,20 @@ func (c *Client) SyncIssueToProject(issueNumber int, projectNumber int, status P
 		return
 	}
 
-	// Step 2: Add issue to project (idempotent — returns existing item if already added)
-	itemID, err := c.addToProject(cfg.ProjectID, nodeID)
+	// Step 2: Add issue to project (idempotent)
+	itemID, err := c.addToProject(pf.ProjectID, nodeID)
 	if err != nil {
-		log.Printf("[projects] could not add issue #%d to project %d: %v", issueNumber, projectNumber, err)
+		log.Printf("[projects] could not add issue #%d to project: %v", issueNumber, err)
 		return
 	}
 
 	// Step 3: Set status field
-	if err := c.setProjectItemStatus(cfg.ProjectID, itemID, cfg.StatusFieldID, optionID); err != nil {
-		log.Printf("[projects] could not set status for issue #%d in project %d: %v", issueNumber, projectNumber, err)
+	if err := c.setProjectItemStatus(pf.ProjectID, itemID, pf.FieldID, optionID); err != nil {
+		log.Printf("[projects] could not set status for issue #%d: %v", issueNumber, err)
 		return
 	}
 
-	log.Printf("[projects] synced issue #%d to project %d with status %q", issueNumber, projectNumber, status)
+	log.Printf("[projects] synced issue #%d status=%q", issueNumber, statusName)
 }
 
 // getIssueNodeID retrieves the GraphQL node ID for an issue.
@@ -294,4 +330,12 @@ func (c *Client) setProjectItemStatus(projectID, itemID, fieldID, optionID strin
 		return fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
 	}
 	return nil
+}
+
+func keys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
 }

@@ -59,6 +59,9 @@ type Orchestrator struct {
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
 	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
 
+	// Cached project board field (discovered once per run cycle, nil if disabled)
+	projectField *github.ProjectField
+
 	// Mission processor (nil when missions disabled)
 	missionProc *mission.Processor
 
@@ -289,13 +292,39 @@ func (o *Orchestrator) nextFallbackBackend(sess *state.Session) string {
 	return ""
 }
 
+// ensureProjectField discovers the project board field if not cached.
+func (o *Orchestrator) ensureProjectField() {
+	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
+		return
+	}
+	if o.projectField != nil {
+		return
+	}
+	pf, err := o.gh.DiscoverProject(o.cfg.GitHubProjects.ProjectNumber)
+	if err != nil {
+		log.Printf("[orch] discover project: %v", err)
+		return
+	}
+	o.projectField = pf
+}
+
 // syncProject syncs an issue's status to the configured GitHub Project board.
 // No-op if github_projects is not enabled.
 func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus) {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
 		return
 	}
-	o.gh.SyncIssueToProject(issueNumber, o.cfg.GitHubProjects.ProjectNumber, status)
+	o.ensureProjectField()
+	// Map old ProjectStatus constants to real column names
+	statusName := map[github.ProjectStatus]string{
+		github.ProjectStatusTodo:       "Todo",
+		github.ProjectStatusInProgress: "In Progress",
+		github.ProjectStatusDone:       "Done",
+	}[status]
+	if statusName == "" {
+		statusName = string(status)
+	}
+	o.gh.SyncIssueStatus(o.projectField, issueNumber, statusName)
 }
 
 // reconcileProjectBoard moves closed issues to Done on the project board.
@@ -304,8 +333,12 @@ func (o *Orchestrator) reconcileProjectBoard() {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
 		return
 	}
+	o.ensureProjectField()
+	if o.projectField == nil {
+		return
+	}
 
-	items, err := o.gh.ListNonDoneProjectItems(o.cfg.GitHubProjects.ProjectNumber)
+	items, err := o.gh.ListNonDoneProjectItems(o.projectField)
 	if err != nil {
 		log.Printf("[orch] reconcile project board: %v", err)
 		return
@@ -314,7 +347,7 @@ func (o *Orchestrator) reconcileProjectBoard() {
 	for _, item := range items {
 		if item.IssueClosed {
 			log.Printf("[orch] reconcile: issue #%d is closed, moving to Done", item.IssueNumber)
-			o.syncProject(item.IssueNumber, github.ProjectStatusDone)
+			o.gh.SyncIssueStatus(o.projectField, item.IssueNumber, "Done")
 		}
 	}
 }
