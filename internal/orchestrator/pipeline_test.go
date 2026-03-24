@@ -17,7 +17,7 @@ import (
 func pipelineOrchestrator(cfg *config.Config) *Orchestrator {
 	return &Orchestrator{
 		cfg:      cfg,
-		notifier: notify.NewWithToken("", "", "http://localhost:0"),
+		notifier: notify.NewWithToken("", "", "", "http://localhost:0"),
 		gh:       github.New(cfg.Repo),
 		router:   router.New(cfg),
 		repo:     cfg.Repo,

@@ -14,6 +14,7 @@ import (
 type Notifier struct {
 	BotToken    string
 	Target      string
+	Mode        string // "direct" (Telegram Bot API) or "openclaw" (OpenClaw relay)
 	OpenclawURL string
 
 	mu         sync.Mutex
@@ -22,11 +23,14 @@ type Notifier struct {
 }
 
 func New(openclawURL, target string) *Notifier {
-	return &Notifier{OpenclawURL: openclawURL, Target: target}
+	return &Notifier{OpenclawURL: openclawURL, Target: target, Mode: "openclaw"}
 }
 
-func NewWithToken(botToken, target, openclawURL string) *Notifier {
-	return &Notifier{BotToken: botToken, Target: target, OpenclawURL: openclawURL}
+func NewWithToken(botToken, target, mode, openclawURL string) *Notifier {
+	if mode == "" {
+		mode = "direct"
+	}
+	return &Notifier{BotToken: botToken, Target: target, Mode: mode, OpenclawURL: openclawURL}
 }
 
 // SetDigestMode enables or disables digest mode.
@@ -86,14 +90,24 @@ func (n *Notifier) Send(msg string) error {
 }
 
 func (n *Notifier) send(msg string) error {
-	if n.BotToken != "" {
-		return n.sendTelegram(msg)
+	switch n.Mode {
+	case "openclaw":
+		if n.OpenclawURL != "" {
+			return n.sendOpenclaw(msg)
+		}
+		log.Printf("[notify] mode=openclaw but openclaw_url not configured, skipping: %s", msg)
+		return nil
+	default: // "direct" or unset
+		if n.BotToken != "" {
+			return n.sendTelegram(msg)
+		}
+		// Fallback to openclaw if bot_token is not set but openclaw_url is available
+		if n.OpenclawURL != "" {
+			return n.sendOpenclaw(msg)
+		}
+		log.Printf("[notify] no transport configured, skipping: %s", msg)
+		return nil
 	}
-	if n.OpenclawURL != "" {
-		return n.sendOpenclaw(msg)
-	}
-	log.Printf("[notify] no transport configured, skipping: %s", msg)
-	return nil
 }
 
 func (n *Notifier) sendTelegram(msg string) error {

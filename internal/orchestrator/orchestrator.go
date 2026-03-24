@@ -82,7 +82,7 @@ type Orchestrator struct {
 
 // New creates a new Orchestrator
 func New(cfg *config.Config) *Orchestrator {
-	n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.OpenclawURL)
+	n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 	if cfg.Telegram.DigestMode {
 		n.SetDigestMode(true)
 		log.Printf("[orch] digest mode enabled — notifications will be batched per cycle")
