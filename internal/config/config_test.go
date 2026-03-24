@@ -730,8 +730,28 @@ func TestParse_BlockerPatternsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
+	want := []string{
+		`blocked by.*?#(\d+)`,
+		`depends on.*?#(\d+)`,
+	}
+	if len(cfg.BlockerPatterns) != len(want) {
+		t.Fatalf("BlockerPatterns length = %d, want %d", len(cfg.BlockerPatterns), len(want))
+	}
+	for i, w := range want {
+		if cfg.BlockerPatterns[i] != w {
+			t.Errorf("BlockerPatterns[%d] = %q, want %q", i, cfg.BlockerPatterns[i], w)
+		}
+	}
+}
+
+func TestParse_BlockerPatternsExplicitEmpty(t *testing.T) {
+	yaml := "repo: owner/repo\nblocker_patterns: []\n"
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	if len(cfg.BlockerPatterns) != 0 {
-		t.Errorf("BlockerPatterns = %v, want empty (disabled by default)", cfg.BlockerPatterns)
+		t.Errorf("BlockerPatterns = %v, want empty (explicit opt-out)", cfg.BlockerPatterns)
 	}
 }
 

@@ -376,6 +376,15 @@ func parse(data []byte) (*Config, error) {
 		cfg.Missions.Labels = []string{"mission", "epic"}
 	}
 
+	// Default blocker patterns: nil means "not set" → use defaults.
+	// An explicit empty slice (blocker_patterns: []) means "disabled".
+	if cfg.BlockerPatterns == nil {
+		cfg.BlockerPatterns = []string{
+			`blocked by.*?#(\d+)`,
+			`depends on.*?#(\d+)`,
+		}
+	}
+
 	return cfg, nil
 }
 
