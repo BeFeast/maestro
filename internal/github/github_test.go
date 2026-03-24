@@ -3,6 +3,7 @@ package github
 import (
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -215,6 +216,55 @@ func TestFindBlockers_DefaultPatternsMarkdown(t *testing.T) {
 				t.Errorf("FindBlockers(%q) = %v, want %v", tt.body, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFormatReviewFeedback_NonEmpty(t *testing.T) {
+	comments := []ReviewComment{
+		{Path: "bridge.rs", Line: 42, Body: "P2: enabled flag logic inverted", User: "greptile-apps[bot]"},
+		{Path: "pool.go", Line: 10, Body: "P2: null-dereference on pool.interface", User: "greptile-apps[bot]"},
+	}
+	result := FormatReviewFeedback(comments)
+
+	if !strings.Contains(result, "Review Feedback") {
+		t.Error("should contain header")
+	}
+	if !strings.Contains(result, "bridge.rs") {
+		t.Error("should contain file path")
+	}
+	if !strings.Contains(result, "Line: 42") {
+		t.Error("should contain line number")
+	}
+	if !strings.Contains(result, "enabled flag logic inverted") {
+		t.Error("should contain comment body")
+	}
+	if !strings.Contains(result, "null-dereference") {
+		t.Error("should contain second comment body")
+	}
+}
+
+func TestFormatReviewFeedback_Empty(t *testing.T) {
+	result := FormatReviewFeedback(nil)
+	if result != "" {
+		t.Errorf("FormatReviewFeedback(nil) = %q, want empty", result)
+	}
+}
+
+func TestIsGreptileLogin(t *testing.T) {
+	tests := []struct {
+		login string
+		want  bool
+	}{
+		{"greptile-apps[bot]", true},
+		{"greptile", true},
+		{"Greptile", true},
+		{"chatgpt-codex-connector[bot]", false},
+		{"user123", false},
+	}
+	for _, tt := range tests {
+		if got := isGreptileLogin(tt.login); got != tt.want {
+			t.Errorf("isGreptileLogin(%q) = %v, want %v", tt.login, got, tt.want)
+		}
 	}
 }
 

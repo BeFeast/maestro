@@ -1037,6 +1037,9 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		ghPRChecksOutputFn: func(prNumber int) (string, error) {
 			return "Build failed: exit code 1", nil
 		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "", nil
+		},
 		ghCloseIssueFn: func(number int, comment string) error {
 			return nil
 		},
@@ -4107,6 +4110,9 @@ func newCIFailureRetryOrchestrator(cfg *config.Config, prs []github.PR, ciStatus
 		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
 			return nil
 		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "", nil
+		},
 	}, &merged, &closedPRs
 }
 
@@ -4243,6 +4249,9 @@ func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
 		ghPRChecksOutputFn: func(prNumber int) (string, error) {
 			return "some CI output", nil
 		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "", nil
+		},
 		ghCloseIssueFn: func(number int, comment string) error {
 			return nil
 		},
@@ -4291,6 +4300,9 @@ func TestAutoMergePRs_CIFailure_AlreadyNotified_NoDoubleRetry(t *testing.T) {
 		},
 		ghPRChecksOutputFn: func(prNumber int) (string, error) {
 			return "CI output", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "", nil
 		},
 		ghCloseIssueFn: func(number int, comment string) error {
 			return nil
@@ -4735,5 +4747,195 @@ func TestCheckSessions_BelowSoftThreshold_NoCheckpoint(t *testing.T) {
 	}
 	if sess.TokensUsedAttempt != 50000 {
 		t.Fatalf("tokens_used_attempt = %d, want 50000", sess.TokensUsedAttempt)
+	}
+}
+
+func TestAppendReviewFeedbackContext_AddsSection(t *testing.T) {
+	base := "You are a coding agent."
+	feedback := "Confidence Score: 3/5\nP2: enabled flag logic inverted in bridge.rs"
+	result := appendReviewFeedbackContext(base, feedback)
+
+	if !strings.Contains(result, "You are a coding agent.") {
+		t.Error("result should contain original prompt base")
+	}
+	if !strings.Contains(result, "Code Review Findings (from Greptile)") {
+		t.Error("result should contain review feedback header")
+	}
+	if !strings.Contains(result, "enabled flag logic inverted") {
+		t.Error("result should contain actual review feedback")
+	}
+	if !strings.Contains(result, "IMPORTANT: Address ALL code review findings") {
+		t.Error("result should contain instruction to address findings")
+	}
+}
+
+func TestAppendReviewFeedbackContext_EmptyFeedbackNotCalled(t *testing.T) {
+	// This tests that empty feedback doesn't produce output (caller should guard)
+	base := "You are a coding agent."
+	result := appendReviewFeedbackContext(base, "")
+
+	// Even with empty string, the section header would be added —
+	// the caller (respawnDueRetries) guards against empty string
+	if !strings.Contains(result, "Code Review Findings") {
+		t.Error("function always adds header — caller must guard against empty feedback")
+	}
+}
+
+func TestRespawnDueRetries_ReviewFeedback_IncludedInPrompt(t *testing.T) {
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetriesPerIssue: 3,
+		MaxRetryBackoffMs:  300000,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	respawnedPrompt := ""
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "base prompt {{ISSUE_NUMBER}}",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: 42, Title: "test issue", Body: "fix this"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnedPrompt = promptBase
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-1 * time.Minute)
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:             42,
+		IssueTitle:              "test issue",
+		Status:                  state.StatusDead,
+		RetryCount:              1,
+		NextRetryAt:             &retryAt,
+		Backend:                 "claude",
+		CIFailureOutput:         "tests failed: FAIL main_test.go:15",
+		PreviousAttemptFeedback: "Confidence 3/5\nP2: enabled flag inverted in bridge.rs",
+	}
+
+	o.respawnDueRetries(s)
+
+	if respawnedPrompt == "" {
+		t.Fatal("respawnWorkerFn should have been called")
+	}
+	if !strings.Contains(respawnedPrompt, "Previous CI Failure") {
+		t.Error("prompt should contain CI failure context")
+	}
+	if !strings.Contains(respawnedPrompt, "Code Review Findings (from Greptile)") {
+		t.Error("prompt should contain review feedback section")
+	}
+	if !strings.Contains(respawnedPrompt, "enabled flag inverted") {
+		t.Error("prompt should contain actual Greptile feedback")
+	}
+	if !strings.Contains(respawnedPrompt, "IMPORTANT: Address ALL code review findings") {
+		t.Error("prompt should contain instruction to fix review findings")
+	}
+
+	// Both fields should be consumed (cleared)
+	sess := s.Sessions["slot-1"]
+	if sess.CIFailureOutput != "" {
+		t.Errorf("CIFailureOutput should be cleared, got %q", sess.CIFailureOutput)
+	}
+	if sess.PreviousAttemptFeedback != "" {
+		t.Errorf("PreviousAttemptFeedback should be cleared, got %q", sess.PreviousAttemptFeedback)
+	}
+}
+
+func TestRespawnDueRetries_NoReviewFeedback_OmitsSection(t *testing.T) {
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetriesPerIssue: 3,
+		MaxRetryBackoffMs:  300000,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	respawnedPrompt := ""
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "base prompt {{ISSUE_NUMBER}}",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: 42, Title: "test issue", Body: "fix this"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnedPrompt = promptBase
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-1 * time.Minute)
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:             42,
+		IssueTitle:              "test issue",
+		Status:                  state.StatusDead,
+		RetryCount:              1,
+		NextRetryAt:             &retryAt,
+		Backend:                 "claude",
+		CIFailureOutput:         "tests failed",
+		PreviousAttemptFeedback: "", // no Greptile feedback
+	}
+
+	o.respawnDueRetries(s)
+
+	if respawnedPrompt == "" {
+		t.Fatal("respawnWorkerFn should have been called")
+	}
+	if strings.Contains(respawnedPrompt, "Code Review Findings") {
+		t.Error("prompt should NOT contain review feedback section when no feedback exists")
+	}
+}
+
+func TestAutoMergePRs_CIFailure_CollectsReviewFeedback(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, _ := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{10: "failure"})
+
+	// Override with Greptile feedback
+	o.ghCollectPRReviewFeedbackFn = func(prNumber int) (string, error) {
+		return "Confidence 3/5 — Not safe to merge\nP2: null dereference on pool.interface", nil
+	}
+
+	s := makeTestState(prs)
+	o.autoMergePRs(s)
+
+	sess := s.Sessions["slot-0"]
+	if sess.PreviousAttemptFeedback == "" {
+		t.Fatal("PreviousAttemptFeedback should be set after CI failure with Greptile feedback")
+	}
+	if !strings.Contains(sess.PreviousAttemptFeedback, "null dereference") {
+		t.Errorf("PreviousAttemptFeedback should contain Greptile feedback, got %q", sess.PreviousAttemptFeedback)
+	}
+}
+
+func TestAutoMergePRs_CIFailure_NoGreptileFeedback_FeedbackEmpty(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/a"},
+	}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, _ := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{10: "failure"})
+
+	// No Greptile feedback (returns empty)
+	o.ghCollectPRReviewFeedbackFn = func(prNumber int) (string, error) {
+		return "", nil
+	}
+
+	s := makeTestState(prs)
+	o.autoMergePRs(s)
+
+	sess := s.Sessions["slot-0"]
+	if sess.PreviousAttemptFeedback != "" {
+		t.Errorf("PreviousAttemptFeedback should be empty when no Greptile feedback, got %q", sess.PreviousAttemptFeedback)
 	}
 }

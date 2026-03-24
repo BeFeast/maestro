@@ -438,6 +438,76 @@ func TestRebaseAttempted_BackwardCompatibility(t *testing.T) {
 	}
 }
 
+func TestPreviousAttemptFeedback_Persistence(t *testing.T) {
+	dir := t.TempDir()
+
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{
+		IssueNumber:             42,
+		Branch:                  "feat/test",
+		Status:                  StatusDead,
+		StartedAt:               time.Now().UTC(),
+		PreviousAttemptFeedback: "Confidence 3/5\nP2: null dereference",
+	}
+	s.Sessions["slot-2"] = &Session{
+		IssueNumber: 43,
+		Branch:      "feat/other",
+		Status:      StatusRunning,
+		StartedAt:   time.Now().UTC(),
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	sess1 := loaded.Sessions["slot-1"]
+	if sess1 == nil {
+		t.Fatal("slot-1 not found after load")
+	}
+	if sess1.PreviousAttemptFeedback != "Confidence 3/5\nP2: null dereference" {
+		t.Errorf("PreviousAttemptFeedback = %q, want Greptile feedback", sess1.PreviousAttemptFeedback)
+	}
+
+	sess2 := loaded.Sessions["slot-2"]
+	if sess2 == nil {
+		t.Fatal("slot-2 not found after load")
+	}
+	if sess2.PreviousAttemptFeedback != "" {
+		t.Errorf("PreviousAttemptFeedback should be empty, got %q", sess2.PreviousAttemptFeedback)
+	}
+}
+
+func TestPreviousAttemptFeedback_OmittedWhenEmpty(t *testing.T) {
+	dir := t.TempDir()
+
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{
+		IssueNumber: 42,
+		Branch:      "feat/test",
+		Status:      StatusRunning,
+		StartedAt:   time.Now().UTC(),
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+
+	json := string(data)
+	if containsString(json, "previous_attempt_feedback") {
+		t.Error("previous_attempt_feedback should be omitted from JSON when empty")
+	}
+}
+
 func TestIssueInProgress_QueuedCountsAsInProgress(t *testing.T) {
 	s := NewState()
 	s.Sessions["slot-1"] = &Session{IssueNumber: 100, Status: StatusQueued}

@@ -69,14 +69,15 @@ type Orchestrator struct {
 	configReloadCh <-chan *config.Config
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
-	ghPRCIStatusFn         func(prNumber int) (string, error)
-	ghPRGreptileApprovedFn func(prNumber int) (approved bool, pending bool, err error)
-	ghMergePRFn            func(prNumber int) error
-	ghClosePRFn            func(prNumber int, comment string) error
-	ghPRChecksOutputFn     func(prNumber int) (string, error)
-	ghCloseIssueFn         func(number int, comment string) error
-	workerStopFn           func(cfg *config.Config, slotName string, sess *state.Session) error
-	rebaseWorktreeFn       func(worktreePath, branch string, autoResolveFiles []string) error
+	ghPRCIStatusFn              func(prNumber int) (string, error)
+	ghPRGreptileApprovedFn      func(prNumber int) (approved bool, pending bool, err error)
+	ghMergePRFn                 func(prNumber int) error
+	ghClosePRFn                 func(prNumber int, comment string) error
+	ghPRChecksOutputFn          func(prNumber int) (string, error)
+	ghCollectPRReviewFeedbackFn func(prNumber int) (string, error)
+	ghCloseIssueFn              func(number int, comment string) error
+	workerStopFn                func(cfg *config.Config, slotName string, sess *state.Session) error
+	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles []string) error
 }
 
 // New creates a new Orchestrator
@@ -165,6 +166,13 @@ func (o *Orchestrator) prChecksOutput(prNumber int) (string, error) {
 		return o.ghPRChecksOutputFn(prNumber)
 	}
 	return o.gh.PRChecksOutput(prNumber)
+}
+
+func (o *Orchestrator) collectPRReviewFeedback(prNumber int) (string, error) {
+	if o.ghCollectPRReviewFeedbackFn != nil {
+		return o.ghCollectPRReviewFeedbackFn(prNumber)
+	}
+	return o.gh.CollectPRReviewFeedback(prNumber)
 }
 
 func (o *Orchestrator) closeIssue(number int, comment string) error {
@@ -462,6 +470,22 @@ Focus on fixing the CI failures while still implementing the issue requirements.
 `, promptBase, attempt, ciOutput)
 }
 
+// appendReviewFeedbackContext appends a section to the worker prompt with
+// Greptile code review findings from the previous failed attempt.
+func appendReviewFeedbackContext(promptBase, feedback string) string {
+	return fmt.Sprintf(`%s
+
+### Code Review Findings (from Greptile)
+
+The following code review comments were left on the previous PR. Address ALL of these issues:
+
+%s
+
+IMPORTANT: Address ALL code review findings above before creating a new PR.
+Do NOT repeat the same mistakes.
+`, promptBase, feedback)
+}
+
 // canRetryIssue returns true if the session can be retried, considering
 // both the session's retry count and the global max_retries_per_issue config.
 // When max_retries_per_issue is 0 (unlimited), retries are always allowed.
@@ -507,11 +531,15 @@ func (o *Orchestrator) respawnDueRetries(s *state.State) {
 
 		promptBase := o.selectPrompt(issue)
 
-		// If this is a CI failure retry, include CI output in the prompt so the
-		// new worker knows what went wrong in the previous attempt.
+		// If this is a CI failure retry, include CI output and review feedback
+		// in the prompt so the new worker knows what went wrong.
 		if sess.CIFailureOutput != "" {
 			promptBase = appendCIFailureContext(promptBase, sess.CIFailureOutput, sess.RetryCount)
 			sess.CIFailureOutput = "" // consumed — don't persist stale output
+		}
+		if sess.PreviousAttemptFeedback != "" {
+			promptBase = appendReviewFeedbackContext(promptBase, sess.PreviousAttemptFeedback)
+			sess.PreviousAttemptFeedback = "" // consumed — don't persist stale feedback
 		}
 
 		if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
@@ -1400,6 +1428,12 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		ciOutput = "(CI output unavailable)"
 	}
 
+	// Collect Greptile review feedback before closing the PR
+	reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
+	if err != nil {
+		log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
+	}
+
 	// Close the failed PR with an explanation
 	closeComment := fmt.Sprintf("CI failed — maestro is closing this PR and respawning a new worker to retry (attempt %d).\n\nCI output:\n```\n%s\n```",
 		sess.RetryCount+1, ciOutput)
@@ -1413,8 +1447,9 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	o.stopWorker(slotName, sess)
 	sess.Worktree = ""
 
-	// Store CI failure output for the next worker
+	// Store CI failure output and review feedback for the next worker
 	sess.CIFailureOutput = ciOutput
+	sess.PreviousAttemptFeedback = reviewFeedback
 
 	// Schedule retry with exponential backoff
 	sess.RetryCount++

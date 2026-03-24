@@ -763,6 +763,46 @@ func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 	return s, nil
 }
 
+// CollectPRReviewFeedback collects all Greptile review feedback from a PR,
+// including both inline review comments and issue-level summary comments.
+// Returns a formatted string ready to inject into a worker prompt, or empty
+// string if no Greptile feedback exists.
+func (c *Client) CollectPRReviewFeedback(prNumber int) (string, error) {
+	var sections []string
+
+	// 1. Fetch issue-level comments (Greptile summary with confidence score)
+	issueCommentsOut, err := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/issues/%d/comments", c.Repo, prNumber),
+		"--paginate").Output()
+	if err == nil {
+		var comments []struct {
+			Body string `json:"body"`
+			User struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if json.Unmarshal(issueCommentsOut, &comments) == nil {
+			for _, cm := range comments {
+				if isGreptileLogin(cm.User.Login) && strings.TrimSpace(cm.Body) != "" {
+					sections = append(sections, cm.Body)
+				}
+			}
+		}
+	}
+
+	// 2. Fetch inline review comments
+	inlineComments, err := c.CollectReviewFeedback(prNumber)
+	if err == nil && len(inlineComments) > 0 {
+		sections = append(sections, FormatReviewFeedback(inlineComments))
+	}
+
+	if len(sections) == 0 {
+		return "", nil
+	}
+
+	return strings.Join(sections, "\n\n"), nil
+}
+
 // HasLabel returns true if any of the issue's labels match
 func HasLabel(issue Issue, labels []string) bool {
 	for _, l := range issue.Labels {
