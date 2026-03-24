@@ -188,6 +188,36 @@ Nothing else.`
 	}
 }
 
+func TestFindBlockers_DefaultPatternsMarkdown(t *testing.T) {
+	// Default patterns from config should handle markdown formatting
+	defaultPatterns := []string{
+		`blocked by.*?#(\d+)`,
+		`depends on.*?#(\d+)`,
+	}
+	tests := []struct {
+		name string
+		body string
+		want []int
+	}{
+		{"plain", "blocked by #123", []int{123}},
+		{"with colon", "Blocked by: #123", []int{123}},
+		{"markdown bold colon", "**Blocked by:** #123", []int{123}},
+		{"depends on markdown", "**Depends on:** #456", []int{456}},
+		{"multiple refs", "Blocked by #123, #456", []int{123}},
+		{"multiple lines", "**Blocked by:** #673 (palette port must merge first)\n**Depends on:** #100", []int{100, 673}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FindBlockers(tt.body, defaultPatterns)
+			sort.Ints(got)
+			sort.Ints(tt.want)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("FindBlockers(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHasLabel_CaseInsensitive(t *testing.T) {
 	issue := Issue{
 		Labels: []struct {
