@@ -1192,6 +1192,114 @@ func TestAutoMergePRs_ReviewFeedbackRetryLimitMarksTerminal(t *testing.T) {
 	}
 }
 
+func TestAutoMergePRs_RetryExhaustedGreenPRNoFeedbackMerges(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a", Mergeable: "MERGEABLE"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "none",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "", nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "green after retry exhaustion",
+		Branch:             "feat/a",
+		Status:             state.StatusRetryExhausted,
+		PRNumber:           10,
+		RetryCount:         3,
+		LastNotifiedStatus: "review_retry_exhausted",
+	}
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 1 || merged[0] != 10 {
+		t.Fatalf("merged = %v, want [10]", merged)
+	}
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+func TestAutoMergePRs_RetryExhaustedActionableFeedbackStillBlocks(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a", Mergeable: "MERGEABLE"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "none",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "## Review Feedback\n\ninternal/foo.go:42 P1: nil pointer panic", nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "green with current-head comments",
+		Branch:      "feat/a",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    10,
+		RetryCount:  3,
+	}
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 0 {
+		t.Fatalf("actionable review feedback should block merge, got merged=%v", merged)
+	}
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRetryExhausted)
+	}
+	if sess.LastNotifiedStatus != "review_retry_exhausted" {
+		t.Fatalf("LastNotifiedStatus = %q, want review_retry_exhausted", sess.LastNotifiedStatus)
+	}
+}
+
 func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
@@ -2970,6 +3078,76 @@ func TestCheckSessions_DeadClosedIssue_TransitionsToDone(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["pan-11"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+func TestCheckSessions_RetryExhaustedClosedIssue_TransitionsToDone(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-12"] = &state.Session{
+		IssueNumber: 102,
+		IssueTitle:  "retry exhausted but closed",
+		Status:      state.StatusRetryExhausted,
+		Branch:      "feat/pan-12-102-retry",
+		FinishedAt:  &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-12"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+func TestCheckSessions_RetryExhaustedMergedPR_TransitionsToDone(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isPRMergedFn: func(prNumber int) (bool, error) {
+			return prNumber == 77, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-13"] = &state.Session{
+		IssueNumber: 103,
+		IssueTitle:  "retry exhausted but merged",
+		Status:      state.StatusRetryExhausted,
+		Branch:      "feat/pan-13-103-retry",
+		PRNumber:    77,
+		FinishedAt:  &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-13"]
 	if sess.Status != state.StatusDone {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
 	}

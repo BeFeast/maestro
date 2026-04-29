@@ -1027,16 +1027,29 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 	for slotName, sess := range s.Sessions {
 		switch sess.Status {
-		case state.StatusDone, state.StatusDead, state.StatusConflictFailed, state.StatusFailed:
+		case state.StatusDone, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
-			// This prevents conflict_failed/failed/dead sessions from lingering
+			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).
 			if sess.Status != state.StatusDone {
+				done := false
+				if sess.PRNumber > 0 {
+					merged, err := o.isPRMerged(sess.PRNumber)
+					if err != nil {
+						log.Printf("[orch] check PR #%d merged: %v", sess.PRNumber, err)
+					} else if merged {
+						log.Printf("[orch] PR #%d merged, transitioning zombie session %s from %s to done", sess.PRNumber, slotName, sess.Status)
+						done = true
+					}
+				}
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
 					log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 				} else if closed {
 					log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+					done = true
+				}
+				if done {
 					o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 					sess.Status = state.StatusDone
 					if sess.FinishedAt == nil {
@@ -1392,10 +1405,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		return
 	}
 
-	// Build branch → PR map
+	// Build branch/number → PR maps
 	branchToPR := make(map[string]github.PR)
+	numberToPR := make(map[int]github.PR)
 	for _, pr := range prs {
 		branchToPR[pr.HeadRefName] = pr
+		numberToPR[pr.Number] = pr
 	}
 
 	type mergeCandidate struct {
@@ -1407,12 +1422,16 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	ready := make([]mergeCandidate, 0)
 
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusPROpen && sess.Status != state.StatusQueued {
+		if !mergeFlowEligibleStatus(sess) {
 			continue
 		}
 
-		pr, found := branchToPR[sess.Branch]
+		pr, found := mergeFlowPRForSession(sess, branchToPR, numberToPR)
 		if !found {
+			if sess.Status == state.StatusRetryExhausted {
+				log.Printf("[orch] retry_exhausted session %s records PR #%d, but no open PR was found — waiting for reconciliation", slotName, sess.PRNumber)
+				continue
+			}
 			log.Printf("[orch] no open PR found for branch %s (slot %s) — assuming merged/closed", sess.Branch, slotName)
 			sess.Status = state.StatusDone
 			now := time.Now().UTC()
@@ -1523,6 +1542,37 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
+}
+
+func mergeFlowEligibleStatus(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	switch sess.Status {
+	case state.StatusPROpen, state.StatusQueued:
+		return true
+	case state.StatusRetryExhausted:
+		return sess.PRNumber > 0 || strings.TrimSpace(sess.Branch) != ""
+	default:
+		return false
+	}
+}
+
+func mergeFlowPRForSession(sess *state.Session, byBranch map[string]github.PR, byNumber map[int]github.PR) (github.PR, bool) {
+	if sess == nil {
+		return github.PR{}, false
+	}
+	if sess.PRNumber > 0 {
+		if pr, ok := byNumber[sess.PRNumber]; ok {
+			return pr, true
+		}
+	}
+	if strings.TrimSpace(sess.Branch) != "" {
+		if pr, ok := byBranch[sess.Branch]; ok {
+			return pr, true
+		}
+	}
+	return github.PR{}, false
 }
 
 // handleReviewFeedbackRetry schedules a retry worker with review feedback in

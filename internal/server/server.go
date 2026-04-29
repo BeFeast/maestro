@@ -438,7 +438,7 @@ func sessionStatusReason(sess *state.Session, alive *bool) (string, bool) {
 		return "Worker exited and is waiting for retry or reconciliation.", true
 	case state.StatusRetryExhausted:
 		if sess.PRNumber > 0 {
-			return "Retry limit exhausted with a PR still open; inspect review feedback or increase the retry budget.", true
+			return "Retry limit exhausted with a PR still open; Maestro can still merge it when checks and review gates pass, but action is needed if checks fail or actionable review feedback remains.", true
 		}
 		return "Retry limit exhausted before a usable PR was produced.", true
 	case state.StatusFailed:

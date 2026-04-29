@@ -247,8 +247,8 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 //
 // Primary path: reads GitHub Check Runs for the PR's head SHA.
 //   - Looks for a check whose name contains "greptile" (case-insensitive).
-//   - conclusion == "success" or "neutral" only approves when there are no
-//     Greptile inline review comments on the current head SHA.
+//   - conclusion == "success" or "neutral" approves when there are no high
+//     severity Greptile inline review comments on the current head SHA.
 //   - check found, other conclusion → approved=false, pending=false
 //   - check not found → falls through to comment-based fallback
 //
@@ -299,8 +299,12 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 				return false, false, nil
 			}
 
-			// Greptile check run passed — trust the verdict.
-			// Inline comments are advisory; the check run is the authority.
+			// Greptile check run passed, but high-severity inline comments on
+			// the current head are still actionable and should block the gate.
+			comments, err := c.greptileReviewComments(prNumber)
+			if err == nil && hasGreptileInlineCommentOnHead(comments, sha) {
+				return false, false, nil
+			}
 			return true, false, nil
 		}
 		// No greptile check run found → fall through to comment fallback
@@ -334,6 +338,10 @@ commentFallback:
 		}
 
 		foundGreptile = true
+
+		if strings.Contains(bodyLower, "not safe to merge") || strings.Contains(bodyLower, "unsafe to merge") {
+			return false, false, nil
+		}
 
 		if strings.Contains(bodyLower, "safe to merge") {
 			return true, false, nil
@@ -370,6 +378,11 @@ func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved b
 
 func isGreptileLogin(login string) bool {
 	return strings.Contains(strings.ToLower(strings.TrimSpace(login)), "greptile")
+}
+
+func isReviewBotLogin(login string) bool {
+	lower := strings.ToLower(strings.TrimSpace(login))
+	return strings.Contains(lower, "greptile") || strings.Contains(lower, "codex")
 }
 
 func hasGreptileInlineCommentOnHead(comments []greptileReviewComment, sha string) bool {
@@ -728,7 +741,9 @@ type ReviewComment struct {
 	User string `json:"user"`
 }
 
-// CollectReviewFeedback collects all inline review comments from Greptile and Codex on a PR.
+var reviewLocationPattern = regexp.MustCompile(`(?mi)(^|\s)([A-Za-z0-9_./-]+\.[A-Za-z0-9]+:\d+|file:\s*\S+)`)
+
+// CollectReviewFeedback collects actionable inline review comments from Greptile and Codex on a PR.
 func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
 	// Get HEAD SHA — only return comments on the latest commit
 	prOut, _ := exec.Command("gh", "api",
@@ -743,21 +758,134 @@ func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
 	var result []ReviewComment
 	for _, cm := range comments {
 		login := cm.User.Login
-		if !strings.Contains(login, "greptile") && !strings.Contains(login, "codex") {
+		if !isReviewBotLogin(login) {
 			continue
 		}
 		// Skip comments that were originally left on older commits — they may already be fixed.
 		if !reviewCommentTargetsHead(cm, headSHA) {
 			continue
 		}
-		result = append(result, ReviewComment{
+		comment := ReviewComment{
 			Path: cm.Path,
 			Line: cm.Line,
 			Body: cm.Body,
 			User: login,
-		})
+		}
+		if !isActionableReviewComment(comment) {
+			continue
+		}
+		result = append(result, comment)
 	}
 	return result, nil
+}
+
+func isActionableReviewComment(comment ReviewComment) bool {
+	body := strings.TrimSpace(comment.Body)
+	if body == "" || isNonActionableReviewText(body) {
+		return false
+	}
+	if strings.TrimSpace(comment.Path) != "" || comment.Line > 0 {
+		return true
+	}
+	return isActionableReviewSummary(body)
+}
+
+func isActionableReviewSummary(body string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" || isNonActionableReviewText(body) {
+		return false
+	}
+	return hasActionableReviewMarker(body)
+}
+
+func isNonActionableReviewText(body string) bool {
+	lower := normalizedReviewText(body)
+	if lower == "" {
+		return true
+	}
+	if strings.Contains(lower, "not safe to merge") || strings.Contains(lower, "unsafe to merge") {
+		return false
+	}
+
+	nonActionable := []string{
+		"no actionable comments",
+		"no actionable feedback",
+		"no actionable issues",
+		"no blocking issues",
+		"no bugs found",
+		"no changes requested",
+		"no findings",
+		"no issues found",
+		"no issues were found",
+		"no review comments",
+		"nothing to fix",
+		"review complete with no findings",
+		"review passed",
+		"safe to merge",
+		"looks good to me",
+		"looks good",
+		"lgtm",
+		"found 0 issues",
+		"0 issues found",
+	}
+	for _, phrase := range nonActionable {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+
+	if strings.Contains(lower, "codex") && strings.Contains(lower, "reviewed") &&
+		(strings.Contains(lower, "left comments") || strings.Contains(lower, "review comments")) &&
+		!hasActionableReviewMarker(body) {
+		return true
+	}
+
+	return false
+}
+
+func hasActionableReviewMarker(body string) bool {
+	if reviewLocationPattern.MatchString(body) {
+		return true
+	}
+	lower := normalizedReviewText(body)
+	markers := []string{
+		"not safe to merge",
+		"unsafe to merge",
+		"changes requested",
+		"must fix",
+		"please fix",
+		"needs fix",
+		"action required",
+		"blocking",
+		"regression",
+		"bug",
+		"crash",
+		"panic",
+		"nil pointer",
+		"data race",
+		"security",
+		"vulnerability",
+		"incorrect",
+		"broken",
+		"failing",
+		"leak",
+		"deadlock",
+		"p0",
+		"p1",
+		"p2",
+		"p3",
+		"severity:",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedReviewText(body string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(body)), " "))
 }
 
 // FormatReviewFeedback formats review comments into a text block for worker prompts.
@@ -846,10 +974,10 @@ func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 	return s, nil
 }
 
-// CollectPRReviewFeedback collects all Greptile review feedback from a PR,
-// including both inline review comments and issue-level summary comments.
+// CollectPRReviewFeedback collects actionable Greptile/Codex review feedback
+// from a PR, including inline review comments and issue-level summary comments.
 // Returns a formatted string ready to inject into a worker prompt, or empty
-// string if no Greptile feedback exists.
+// string if no actionable review feedback exists.
 func (c *Client) CollectPRReviewFeedback(prNumber int) (string, error) {
 	var sections []string
 
@@ -866,7 +994,7 @@ func (c *Client) CollectPRReviewFeedback(prNumber int) (string, error) {
 		}
 		if json.Unmarshal(issueCommentsOut, &comments) == nil {
 			for _, cm := range comments {
-				if isGreptileLogin(cm.User.Login) && strings.TrimSpace(cm.Body) != "" {
+				if isReviewBotLogin(cm.User.Login) && isActionableReviewSummary(cm.Body) {
 					sections = append(sections, cm.Body)
 				}
 			}
