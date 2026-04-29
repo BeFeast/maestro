@@ -59,18 +59,25 @@ const (
 
 // SupervisorConfig defines local policy for supervisor decisions.
 type SupervisorConfig struct {
-	Enabled          bool                         `yaml:"enabled" json:"enabled"`
-	Mode             string                       `yaml:"mode" json:"mode"`
-	ReadyLabel       string                       `yaml:"ready_label" json:"ready_label,omitempty"`
-	BlockedLabel     string                       `yaml:"blocked_label" json:"blocked_label,omitempty"`
-	QueueComments    bool                         `yaml:"queue_comments" json:"queue_comments,omitempty"`
-	OneAtATime       bool                         `yaml:"one_at_a_time" json:"one_at_a_time,omitempty"`
-	ExcludedLabels   []string                     `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
-	AllowIssueTypes  []string                     `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
-	OrderedQueue     SupervisorOrderedQueueConfig `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
-	SafeActions      []string                     `yaml:"safe_actions" json:"safe_actions,omitempty"`
-	ApprovalRequired []string                     `yaml:"approval_required" json:"approval_required,omitempty"`
-	PolicyPath       string                       `yaml:"-" json:"policy_path,omitempty"`
+	Enabled                 bool                         `yaml:"enabled" json:"enabled"`
+	Backend                 string                       `yaml:"backend" json:"backend,omitempty"`
+	Model                   string                       `yaml:"model" json:"model,omitempty"`
+	Effort                  string                       `yaml:"effort" json:"effort,omitempty"`
+	Prompt                  string                       `yaml:"prompt" json:"prompt,omitempty"`
+	DryRun                  bool                         `yaml:"dry_run" json:"dry_run,omitempty"`
+	Mode                    string                       `yaml:"mode" json:"mode"`
+	ReadyLabel              string                       `yaml:"ready_label" json:"ready_label,omitempty"`
+	BlockedLabel            string                       `yaml:"blocked_label" json:"blocked_label,omitempty"`
+	QueueComments           bool                         `yaml:"queue_comments" json:"queue_comments,omitempty"`
+	OneAtATime              bool                         `yaml:"one_at_a_time" json:"one_at_a_time,omitempty"`
+	ExcludedLabels          []string                     `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
+	AllowIssueTypes         []string                     `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
+	OrderedQueue            SupervisorOrderedQueueConfig `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
+	SafeActions             []string                     `yaml:"safe_actions" json:"safe_actions,omitempty"`
+	ApprovalRequired        []string                     `yaml:"approval_required" json:"approval_required,omitempty"`
+	AllowedActions          []string                     `yaml:"allowed_actions" json:"allowed_actions,omitempty"`
+	ApprovalRequiredActions []string                     `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
+	PolicyPath              string                       `yaml:"-" json:"policy_path,omitempty"`
 
 	excludedLabelsSet bool
 }
@@ -359,6 +366,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
 	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
+	cfg.Supervisor.Prompt = expandHome(cfg.Supervisor.Prompt)
 	for i, s := range cfg.PromptSections {
 		cfg.PromptSections[i] = expandHome(s)
 	}
@@ -410,6 +418,32 @@ func parse(data []byte) (*Config, error) {
 	// Ensure the default backend is always present in the map
 	if _, ok := cfg.Model.Backends[cfg.Model.Default]; !ok {
 		cfg.Model.Backends[cfg.Model.Default] = BackendDef{Cmd: cfg.Model.Default}
+	}
+
+	// Supervisor defaults
+	if cfg.Supervisor.Backend == "" {
+		cfg.Supervisor.Backend = cfg.Model.Default
+	}
+	if cfg.Supervisor.AllowedActions == nil {
+		cfg.Supervisor.AllowedActions = []string{
+			"none",
+			"wait_for_running_worker",
+			"wait_for_capacity",
+			"wait_for_ordered_queue",
+			"monitor_open_pr",
+			"review_retry_exhausted",
+			"spawn_worker",
+			"label_issue_ready",
+			"add_ready_label",
+		}
+	}
+	if cfg.Supervisor.ApprovalRequiredActions == nil {
+		cfg.Supervisor.ApprovalRequiredActions = []string{
+			"review_retry_exhausted",
+			"spawn_worker",
+			"label_issue_ready",
+			"add_ready_label",
+		}
 	}
 
 	// Routing defaults

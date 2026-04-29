@@ -22,6 +22,8 @@ type BackendConfig struct {
 	Cmd        string   // binary name (e.g. "claude", "codex", "gemini")
 	ExtraArgs  []string // additional args from config
 	PromptMode string   // how to deliver prompt: "arg", "stdin", "file"
+	Model      string   // optional model name for role-specific backend calls
+	Effort     string   // optional reasoning effort for role-specific backend calls
 }
 
 // Backend builds the exec.Cmd for a specific model CLI.
@@ -167,6 +169,17 @@ func (genericBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (
 	return cmd, stdinFile, nil
 }
 
+func appendModelOptions(args []string, cfg BackendConfig) []string {
+	args = append(args, cfg.ExtraArgs...)
+	if strings.TrimSpace(cfg.Model) != "" {
+		args = append(args, "--model", strings.TrimSpace(cfg.Model))
+	}
+	if strings.TrimSpace(cfg.Effort) != "" {
+		args = append(args, "--effort", strings.TrimSpace(cfg.Effort))
+	}
+	return args
+}
+
 // BuildWorkerCmd creates the right exec.Cmd based on backend name.
 // Known backends (claude, codex, gemini) use their specific command builders.
 // Unknown backends use the generic builder with prompt_mode from config.
@@ -183,6 +196,106 @@ func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree 
 
 	// Fallback: use generic backend for unknown backends
 	return (genericBackend{}).BuildCmd(cfg, promptFile, worktree)
+}
+
+// BuildSupervisorCmd creates a read-only model command for supervisor decisions.
+// It reuses backend prompt delivery semantics but intentionally avoids worker-only
+// permission bypass flags.
+func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
+	if backendName == "" {
+		backendName = "claude"
+	}
+
+	switch backendName {
+	case "claude":
+		promptData, err := os.ReadFile(promptFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("read prompt file: %w", err)
+		}
+		claudeCmd := cfg.Cmd
+		if claudeCmd == "" {
+			claudeCmd = "claude"
+		}
+		binary, cmdArgs := splitCmd(claudeCmd)
+		args := append(cmdArgs, "-p", string(promptData))
+		args = appendModelOptions(args, cfg)
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, "", nil
+	case "codex":
+		codexCmd := cfg.Cmd
+		if codexCmd == "" {
+			codexCmd = "codex"
+		}
+		binary, cmdArgs := splitCmd(codexCmd)
+		args := append(cmdArgs, "exec", "-C", worktree, "-")
+		args = appendModelOptions(args, cfg)
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, promptFile, nil
+	case "gemini":
+		promptData, err := os.ReadFile(promptFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("read prompt file: %w", err)
+		}
+		geminiCmd := cfg.Cmd
+		if geminiCmd == "" {
+			geminiCmd = "gemini"
+		}
+		binary, cmdArgs := splitCmd(geminiCmd)
+		args := append(cmdArgs, "-p", string(promptData))
+		args = appendModelOptions(args, cfg)
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, "", nil
+	case "cline":
+		promptData, err := os.ReadFile(promptFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("read prompt file: %w", err)
+		}
+		clineCmd := cfg.Cmd
+		if clineCmd == "" {
+			clineCmd = "cline"
+		}
+		binary, cmdArgs := splitCmd(clineCmd)
+		args := append(cmdArgs, "-y", string(promptData))
+		args = appendModelOptions(args, cfg)
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, "", nil
+	default:
+		return buildGenericSupervisorCmd(cfg, promptFile, worktree)
+	}
+}
+
+func buildGenericSupervisorCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	if cfg.Cmd == "" {
+		return nil, "", fmt.Errorf("generic backend requires cmd to be set")
+	}
+	binary, cmdArgs := splitCmd(cfg.Cmd)
+	mode := cfg.PromptMode
+	if mode == "" {
+		mode = "arg"
+	}
+	args := appendModelOptions(append([]string(nil), cmdArgs...), cfg)
+	stdinFile := ""
+	switch mode {
+	case "arg":
+		promptData, err := os.ReadFile(promptFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("read prompt file: %w", err)
+		}
+		args = append(args, string(promptData))
+	case "stdin":
+		stdinFile = promptFile
+	case "file":
+		args = append(args, promptFile)
+	default:
+		return nil, "", fmt.Errorf("unknown prompt_mode %q (supported: arg, stdin, file)", mode)
+	}
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = worktree
+	return cmd, stdinFile, nil
 }
 
 // KnownBackends returns a list of built-in backend names.

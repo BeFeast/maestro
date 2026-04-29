@@ -164,6 +164,7 @@ type SupervisorDecision struct {
 	Confidence        float64                `json:"confidence"`
 	ErrorClass        string                 `json:"error_class,omitempty"`
 	Reasons           []string               `json:"reasons,omitempty"`
+	RequiresApproval  bool                   `json:"requires_approval"`
 	Mutations         []SupervisorMutation   `json:"mutations,omitempty"`
 	StuckStates       []SupervisorStuckState `json:"stuck_states,omitempty"`
 	ProjectState      SupervisorProjectState `json:"project_state"`

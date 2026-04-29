@@ -3,6 +3,8 @@ package supervisor
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +31,22 @@ type fakeReader struct {
 	addLabelErr    error
 	removeLabelErr error
 	commentErr     error
+}
+
+type fakeLLM struct {
+	output string
+	prompt string
+	calls  int
+	err    error
+}
+
+func (f *fakeLLM) Complete(prompt string) (string, error) {
+	f.calls++
+	f.prompt = prompt
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.output, nil
 }
 
 func (f *fakeReader) ListOpenIssues(labels []string) ([]github.Issue, error) {
@@ -122,6 +140,13 @@ func requireStuckState(t *testing.T, decision state.SupervisorDecision, code str
 	}
 	t.Fatalf("stuck state %q not found in %#v", code, decision.StuckStates)
 	return state.SupervisorStuckState{}
+}
+
+func testLLMEngine(cfg *config.Config, reader *fakeReader, llm *fakeLLM) *Engine {
+	cfg.Supervisor.Enabled = true
+	eng := testEngine(cfg, reader)
+	eng.llm = llm
+	return eng
 }
 
 func testIssue(number int, title string, labels ...string) github.Issue {
@@ -1025,5 +1050,181 @@ func TestDecide_OrderedQueueAdvancesAfterPolicyOverride(t *testing.T) {
 	}
 	if decision.Target == nil || decision.Target.Issue != 306 {
 		t.Fatalf("target = %#v, want issue 306", decision.Target)
+	}
+}
+
+func TestRunOnceDryRunDoesNotRecordDecision(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Supervisor.DryRun = true
+	reader := &fakeReader{}
+
+	if _, err := RunOnce(cfg, reader); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if latest := st.LatestSupervisorDecision(); latest != nil {
+		t.Fatalf("latest supervisor decision = %#v, want nil for dry run", latest)
+	}
+}
+
+func TestDecideWithLLM_ValidDecision(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	issue := testIssue(42, "ready work", "maestro-ready")
+	issue.Body = "Implement this. SERVICE_TOKEN=redact-me"
+	reader := &fakeReader{issues: []github.Issue{issue}}
+	llm := &fakeLLM{output: `{
+  "summary": "Issue #42 is ready to feed; no worker is running.",
+  "recommended_action": "spawn_worker",
+  "target": {"issue": 42},
+  "risk": "mutating",
+  "confidence": 0.87,
+  "reasons": ["ordered queue points to #42", "no active worker"],
+  "requires_approval": true
+}`}
+	st := state.NewState()
+	logPath := filepath.Join(t.TempDir(), "worker.log")
+	if err := os.WriteFile(logPath, []byte("Authorization: redact-me\nAPI_KEY=redact-me\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	st.Sessions["slot-dead"] = &state.Session{
+		IssueNumber: 99,
+		IssueTitle:  "previous failure",
+		Status:      state.StatusDead,
+		LogFile:     logPath,
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testLLMEngine(cfg, reader, llm).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if llm.calls != 1 {
+		t.Fatalf("LLM calls = %d, want 1", llm.calls)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Summary != "Issue #42 is ready to feed; no worker is running." {
+		t.Fatalf("summary = %q", decision.Summary)
+	}
+	if !decision.RequiresApproval {
+		t.Fatal("RequiresApproval = false, want true")
+	}
+	if decision.Target == nil || decision.Target.Issue != 42 {
+		t.Fatalf("target = %#v, want issue 42", decision.Target)
+	}
+	for _, secret := range []string{"SERVICE_TOKEN=redact-me", "Authorization: redact-me", "API_KEY=redact-me"} {
+		if strings.Contains(llm.prompt, secret) {
+			t.Fatalf("prompt contained unredacted secret %q", secret)
+		}
+	}
+	if !strings.Contains(llm.prompt, "ordered_queue_state") || !strings.Contains(llm.prompt, "[REDACTED") {
+		t.Fatalf("prompt did not include expected redacted state packet: %s", llm.prompt)
+	}
+}
+
+func TestDecideWithLLM_UnknownActionRejected(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
+	llm := &fakeLLM{output: `{
+  "summary": "Delete the repo.",
+  "recommended_action": "delete_repo",
+  "target": {"issue": 42},
+  "risk": "mutating",
+  "confidence": 0.9,
+  "reasons": ["not allowed"],
+  "requires_approval": true
+}`}
+
+	_, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("Decide error = %v, want not allowed", err)
+	}
+}
+
+func TestDecideWithLLM_ApprovalRequiredActionRejectedWithoutApproval(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
+	llm := &fakeLLM{output: `{
+  "summary": "Issue #42 is ready to feed.",
+  "recommended_action": "spawn_worker",
+  "target": {"issue": 42},
+  "risk": "mutating",
+  "confidence": 0.87,
+  "reasons": ["ordered queue points to #42"],
+  "requires_approval": false
+}`}
+
+	_, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
+	if err == nil || !strings.Contains(err.Error(), "requires approval") {
+		t.Fatalf("Decide error = %v, want requires approval", err)
+	}
+}
+
+func TestDecideWithLLM_MalformedOutputRejected(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
+	llm := &fakeLLM{output: `not json`}
+
+	_, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
+	if err == nil || !strings.Contains(err.Error(), "invalid JSON contract") {
+		t.Fatalf("Decide error = %v, want invalid JSON contract", err)
+	}
+}
+
+func TestDecideWithLLM_DetectorDisagreementRejected(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work")}}
+	llm := &fakeLLM{output: `{
+  "summary": "Start a new worker anyway.",
+  "recommended_action": "spawn_worker",
+  "target": {"issue": 42},
+  "risk": "mutating",
+  "confidence": 0.87,
+  "reasons": ["LLM wants more work"],
+  "requires_approval": true
+}`}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 77,
+		IssueTitle:  "already running",
+		Status:      state.StatusRunning,
+		StartedAt:   time.Now().UTC(),
+	}
+
+	_, err := testLLMEngine(cfg, reader, llm).Decide(st)
+	if err == nil || !strings.Contains(err.Error(), "disagrees with deterministic guardrail") {
+		t.Fatalf("Decide error = %v, want detector disagreement", err)
+	}
+}
+
+func TestDecideWithLLM_AddReadyLabelAliasAccepted(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{testIssue(308, "needs label")}}
+	llm := &fakeLLM{output: `{
+  "summary": "Issue #308 is ready to label.",
+  "recommended_action": "add_ready_label",
+  "target": {"issue": 308},
+  "risk": "mutating",
+  "confidence": 0.82,
+  "reasons": ["no eligible issue has the configured ready label"],
+  "requires_approval": true
+}`}
+
+	decision, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionLabelIssueReady {
+		t.Fatalf("action = %q, want canonical %q", decision.RecommendedAction, ActionLabelIssueReady)
 	}
 }

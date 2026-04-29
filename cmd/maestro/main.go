@@ -370,6 +370,7 @@ func superviseCmd(args []string) {
 	once := fs.Bool("once", false, "Run once and exit")
 	interval := fs.Duration("interval", 5*time.Minute, "Loop interval")
 	jsonOutput := fs.Bool("json", false, "Output decision as JSON")
+	dryRun := fs.Bool("dry-run", false, "Compute decision without recording state")
 	fs.Parse(args)
 	if fs.NArg() > 0 {
 		subcmd := fs.Arg(0)
@@ -387,6 +388,9 @@ func superviseCmd(args []string) {
 	}
 
 	cfg := loadConfig(*configPath)
+	if *dryRun {
+		cfg.Supervisor.DryRun = true
+	}
 	gh := github.New(cfg.Repo)
 	runOnce := func() {
 		decision, err := supervisor.RunOnce(cfg, gh)
