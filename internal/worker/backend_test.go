@@ -202,6 +202,55 @@ func TestBuildWorkerCmd_ClineDefaultCmd(t *testing.T) {
 	}
 }
 
+func TestBuildSupervisorCmd_ClaudeReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("decide safely"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{Cmd: "claude", Model: "sonnet", Effort: "medium"}
+	cmd, stdinFile, err := BuildSupervisorCmd("claude", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != "" {
+		t.Errorf("stdinFile = %q, want empty", stdinFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if strings.Contains(args, "dangerously") || strings.Contains(args, "bypass") {
+		t.Errorf("supervisor command should not include worker permission bypass flags: %s", args)
+	}
+	for _, want := range []string{"-p", "decide safely", "--model", "sonnet", "--effort", "medium"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("expected %q in args, got: %s", want, args)
+		}
+	}
+}
+
+func TestBuildSupervisorCmd_CodexReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("decide safely"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd, stdinFile, err := BuildSupervisorCmd("codex", BackendConfig{Cmd: "codex"}, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "exec") || !strings.Contains(args, "-C") {
+		t.Errorf("expected codex exec args, got: %s", args)
+	}
+	if strings.Contains(args, "dangerously") || strings.Contains(args, "bypass") {
+		t.Errorf("supervisor command should not include worker permission bypass flags: %s", args)
+	}
+}
+
 func TestBuildWorkerCmd_GeminiPromptFileError(t *testing.T) {
 	cfg := BackendConfig{Cmd: "gemini"}
 	_, _, err := BuildWorkerCmd("gemini", cfg, "/nonexistent/prompt.md", "/tmp/wt")

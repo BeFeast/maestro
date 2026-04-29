@@ -92,6 +92,7 @@ type prGreptileReader interface {
 type Engine struct {
 	cfg      *config.Config
 	reader   Reader
+	llm      LLMClient
 	now      func() time.Time
 	pidAlive func(pid int) bool
 	stat     func(name string) (os.FileInfo, error)
@@ -102,7 +103,7 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 	if reader == nil {
 		reader = github.New(cfg.Repo)
 	}
-	return &Engine{
+	eng := &Engine{
 		cfg:      cfg,
 		reader:   reader,
 		now:      func() time.Time { return time.Now().UTC() },
@@ -110,6 +111,10 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 		stat:     os.Stat,
 		lookPath: exec.LookPath,
 	}
+	if cfg != nil && cfg.Supervisor.Enabled {
+		eng.llm = NewBackendLLMClient(cfg)
+	}
+	return eng
 }
 
 // RunOnce records one supervisor decision in Maestro state and applies any safe
@@ -128,27 +133,36 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
-	if decisionRequiresApproval(decision) {
-		approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
-		decision.ApprovalID = approval.ID
-	}
-	if len(decision.Mutations) > 0 && decision.Risk == RiskSafe {
-		mutator, ok := reader.(Mutator)
-		if !ok {
-			markUnsupportedQueueAction(&decision)
-		} else {
-			applyQueueAction(cfg, &decision, mutator)
+	if !cfg.Supervisor.DryRun {
+		if decisionRequiresApproval(decision) {
+			approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
+			decision.ApprovalID = approval.ID
 		}
-	}
-	st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
-	if err := state.Save(cfg.StateDir, st); err != nil {
-		return state.SupervisorDecision{}, fmt.Errorf("save state: %w", err)
+		if len(decision.Mutations) > 0 && decision.Risk == RiskSafe {
+			mutator, ok := reader.(Mutator)
+			if !ok {
+				markUnsupportedQueueAction(&decision)
+			} else {
+				applyQueueAction(cfg, &decision, mutator)
+			}
+		}
+		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
+		if err := state.Save(cfg.StateDir, st); err != nil {
+			return state.SupervisorDecision{}, fmt.Errorf("save state: %w", err)
+		}
 	}
 	return decision, nil
 }
 
 // Decide observes state and GitHub read-only data, then returns the next recommendation.
 func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
+	if e.cfg.Supervisor.Enabled {
+		return e.decideWithLLM(st)
+	}
+	return e.decideDeterministic(st)
+}
+
+func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision, error) {
 	if st == nil {
 		st = state.NewState()
 	}
@@ -356,6 +370,7 @@ func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action
 		Risk:              risk,
 		Confidence:        confidence,
 		Reasons:           compactReasons(reasons),
+		RequiresApproval:  risk == RiskApprovalGated,
 		ProjectState:      ps,
 	}
 }

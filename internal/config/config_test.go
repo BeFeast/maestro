@@ -462,6 +462,15 @@ func TestParse_ModelConfigDefaults(t *testing.T) {
 	if _, ok := cfg.Model.Backends["claude"]; !ok {
 		t.Error("expected claude backend to be present in map")
 	}
+	if cfg.Supervisor.Enabled {
+		t.Error("Supervisor.Enabled should default to false")
+	}
+	if cfg.Supervisor.Backend != "claude" {
+		t.Errorf("Supervisor.Backend = %q, want claude", cfg.Supervisor.Backend)
+	}
+	if len(cfg.Supervisor.AllowedActions) == 0 {
+		t.Error("Supervisor.AllowedActions should have safe defaults")
+	}
 }
 
 func TestParse_ModelConfigExplicit(t *testing.T) {
@@ -525,6 +534,62 @@ model:
 	}
 	if len(gemini.ExtraArgs) != 2 || gemini.ExtraArgs[0] != "--sandbox" {
 		t.Errorf("expected gemini extra_args=[--sandbox none], got %v", gemini.ExtraArgs)
+	}
+	if cfg.Supervisor.Backend != "gemini" {
+		t.Errorf("Supervisor.Backend = %q, want gemini", cfg.Supervisor.Backend)
+	}
+}
+
+func TestParse_SupervisorConfigExplicit(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+    gemini:
+      cmd: gemini
+supervisor:
+  enabled: true
+  backend: gemini
+  model: gemini-2.5-pro
+  effort: high
+  prompt: ~/prompts/supervisor.md
+  dry_run: true
+  allowed_actions:
+    - none
+    - spawn_worker
+  approval_required_actions:
+    - spawn_worker
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Supervisor.Enabled {
+		t.Error("Supervisor.Enabled should be true")
+	}
+	if cfg.Supervisor.Backend != "gemini" {
+		t.Errorf("Supervisor.Backend = %q, want gemini", cfg.Supervisor.Backend)
+	}
+	if cfg.Supervisor.Model != "gemini-2.5-pro" {
+		t.Errorf("Supervisor.Model = %q, want gemini-2.5-pro", cfg.Supervisor.Model)
+	}
+	if cfg.Supervisor.Effort != "high" {
+		t.Errorf("Supervisor.Effort = %q, want high", cfg.Supervisor.Effort)
+	}
+	if cfg.Supervisor.Prompt != filepath.Join(os.Getenv("HOME"), "prompts/supervisor.md") {
+		t.Errorf("Supervisor.Prompt = %q", cfg.Supervisor.Prompt)
+	}
+	if !cfg.Supervisor.DryRun {
+		t.Error("Supervisor.DryRun should be true")
+	}
+	if len(cfg.Supervisor.AllowedActions) != 2 || cfg.Supervisor.AllowedActions[1] != "spawn_worker" {
+		t.Errorf("Supervisor.AllowedActions = %v", cfg.Supervisor.AllowedActions)
+	}
+	if len(cfg.Supervisor.ApprovalRequiredActions) != 1 || cfg.Supervisor.ApprovalRequiredActions[0] != "spawn_worker" {
+		t.Errorf("Supervisor.ApprovalRequiredActions = %v", cfg.Supervisor.ApprovalRequiredActions)
 	}
 }
 
