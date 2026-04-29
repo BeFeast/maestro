@@ -2,8 +2,12 @@ package supervisor
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -51,6 +55,10 @@ const (
 	ErrorClassGitHubNotFound    = "github_not_found"
 	ErrorClassGitHubRateLimited = "github_rate_limited"
 	ErrorClassUnsupportedClient = "unsupported_client"
+
+	SeverityInfo    = "info"
+	SeverityWarning = "warning"
+	SeverityBlocked = "blocked"
 )
 
 // Reader is the read-only GitHub surface used by the supervisor engine.
@@ -68,12 +76,23 @@ type Mutator interface {
 	CommentIssue(issueNumber int, body string) error
 }
 
+type prCIStatusReader interface {
+	PRCIStatus(prNumber int) (string, error)
+}
+
+type prGreptileReader interface {
+	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
+}
+
 // Engine makes deterministic supervisor decisions. It plans safe queue mutations
-// but does not execute them.
+// and emits structured stuck-state explanations.
 type Engine struct {
-	cfg    *config.Config
-	reader Reader
-	now    func() time.Time
+	cfg      *config.Config
+	reader   Reader
+	now      func() time.Time
+	pidAlive func(pid int) bool
+	stat     func(name string) (os.FileInfo, error)
+	lookPath func(file string) (string, error)
 }
 
 func NewEngine(cfg *config.Config, reader Reader) *Engine {
@@ -81,9 +100,12 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 		reader = github.New(cfg.Repo)
 	}
 	return &Engine{
-		cfg:    cfg,
-		reader: reader,
-		now:    func() time.Time { return time.Now().UTC() },
+		cfg:      cfg,
+		reader:   reader,
+		now:      func() time.Time { return time.Now().UTC() },
+		pidAlive: pidAlive,
+		stat:     os.Stat,
+		lookPath: exec.LookPath,
 	}
 }
 
@@ -135,15 +157,18 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		return state.SupervisorDecision{}, fmt.Errorf("list open PRs: %w", err)
 	}
 	projectState.OpenPRs = len(prs)
+	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false)
 
 	if slot, sess, pr, ok := sessionWithOpenPR(st, prs); ok {
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
 			"No GitHub mutation is needed for supervisor mode",
 		)
-		return e.decision(now, projectState, ActionMonitorOpenPR,
+		decision := e.decision(now, projectState, ActionMonitorOpenPR,
 			fmt.Sprintf("Session %s already has open PR #%d; monitor review, CI, or merge readiness.", slot, pr.Number),
-			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons), nil
+			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
 	}
 
 	if slot, sess, ok := runningSession(st); ok && e.shouldWaitForRunningWorker(st) {
@@ -151,9 +176,11 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			fmt.Sprintf("Session %s is running for issue #%d", slot, sess.IssueNumber),
 			"Starting another worker is not recommended while a worker is active",
 		)
-		return e.decision(now, projectState, ActionWaitForRunningWorker,
+		decision := e.decision(now, projectState, ActionWaitForRunningWorker,
 			fmt.Sprintf("Worker %s is still running for issue #%d.", slot, sess.IssueNumber),
-			RiskSafe, 0.88, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons), nil
+			RiskSafe, 0.88, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
 	}
 
 	if slot, sess, ok := retryExhaustedSession(st); ok {
@@ -161,9 +188,11 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
 			"Retry-exhausted work requires a human decision before more automation",
 		)
-		return e.decision(now, projectState, ActionReviewRetryExhausted,
+		decision := e.decision(now, projectState, ActionReviewRetryExhausted,
 			fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
-			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons), nil
+			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
 	}
 
 	issues, err := e.reader.ListOpenIssues(nil)
@@ -181,6 +210,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		return state.SupervisorDecision{}, err
 	}
 	skipped = append(policySkipped, skipped...)
+	stuckStates = e.detectStuckStates(st, now, prs, issues, eligible, skipped, true)
 
 	if len(eligible) > 0 {
 		issue := eligible[0]
@@ -188,9 +218,11 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
 			)
-			return e.decision(now, projectState, ActionWaitForCapacity,
+			decision := e.decision(now, projectState, ActionWaitForCapacity,
 				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
-				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons), nil
+				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
 		}
 
 		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
@@ -202,9 +234,11 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 				fmt.Sprintf("Issue #%d is eligible but GitHub already has an open PR referencing it", issue.Number),
 				"Supervisor mode should not dispatch duplicate work",
 			)
-			return e.decision(now, projectState, ActionMonitorOpenPR,
+			decision := e.decision(now, projectState, ActionMonitorOpenPR,
 				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
-				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons), nil
+				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
 		}
 
 		reasons := appendReasons(baseReasons,
@@ -212,9 +246,11 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
 			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 		)
-		return e.decision(now, projectState, ActionSpawnWorker,
+		decision := e.decision(now, projectState, ActionSpawnWorker,
 			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
-			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons), nil
+			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
 	}
 
 	candidate, err := e.firstQueueActionCandidate(st, candidates)
@@ -236,6 +272,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			fmt.Sprintf("Prepare issue #%d for the queue by %s.", candidate.issue.Number, plannedMutationPhrase(candidate.neededMutations())),
 			risk, 0.82, &state.SupervisorTarget{Issue: candidate.issue.Number}, policyRule, reasons)
 		decision.Mutations = mutations
+		decision.StuckStates = stuckStates
 		return decision, nil
 	}
 
@@ -246,8 +283,10 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 	for _, reason := range firstN(skipped, 3) {
 		reasons = append(reasons, reason)
 	}
-	return e.decision(now, projectState, ActionNone,
-		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons), nil
+	decision := e.decision(now, projectState, ActionNone,
+		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
+	decision.StuckStates = stuckStates
+	return decision, nil
 }
 
 func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
@@ -267,6 +306,334 @@ func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action
 		Reasons:           compactReasons(reasons),
 		ProjectState:      ps,
 	}
+}
+
+func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.PR, issues, eligible []github.Issue, skipped []string, issuesLoaded bool) []state.SupervisorStuckState {
+	var findings []state.SupervisorStuckState
+	findings = append(findings, e.detectWorkerStuckStates(st, now)...)
+	findings = append(findings, e.detectPRStuckStates(st, prs)...)
+	if issuesLoaded {
+		findings = append(findings, e.detectQueueStuckStates(st, prs, issues, eligible, skipped)...)
+		findings = append(findings, detectPolicyStuckStates(skipped)...)
+	}
+	findings = append(findings, e.detectEnvironmentStuckStates(st, eligible)...)
+	return compactStuckStates(findings)
+}
+
+func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state.SupervisorStuckState {
+	var findings []state.SupervisorStuckState
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil {
+			continue
+		}
+		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}
+
+		if sess.Status == state.StatusRunning {
+			if sess.PID <= 0 {
+				findings = append(findings, stuckState("dead_running_pid", SeverityBlocked,
+					fmt.Sprintf("Worker %s is marked running, but no live process is recorded.", slot),
+					"Run a Maestro reconciliation cycle or inspect the worker before dispatching more work.", true, target,
+					fmt.Sprintf("Session %s status=running pid=%d", slot, sess.PID)))
+			} else if !e.pidAlive(sess.PID) {
+				findings = append(findings, stuckState("dead_running_pid", SeverityBlocked,
+					fmt.Sprintf("Worker %s is marked running, but PID %d is not alive.", slot, sess.PID),
+					"Run a Maestro reconciliation cycle so the session can be marked dead and retried if eligible.", true, target,
+					fmt.Sprintf("Session %s status=running pid=%d alive=false", slot, sess.PID)))
+			}
+
+			maxMinutes := e.cfg.MaxRuntimeMinutes
+			if sess.LongRunning {
+				maxMinutes *= 2
+			}
+			if maxMinutes > 0 {
+				maxRuntime := time.Duration(maxMinutes) * time.Minute
+				if age := now.Sub(sess.StartedAt); age > maxRuntime {
+					findings = append(findings, stuckState("worker_timeout", SeverityBlocked,
+						fmt.Sprintf("Worker %s exceeded the configured runtime limit.", slot),
+						"Stop the timed-out worker and decide whether to retry or split the issue.", true, target,
+						fmt.Sprintf("Runtime %s exceeds limit %s", age.Round(time.Second), maxRuntime)))
+				}
+			}
+
+			if e.cfg.WorkerSilentTimeoutMinutes > 0 && !sess.LastOutputChangedAt.IsZero() {
+				timeout := time.Duration(e.cfg.WorkerSilentTimeoutMinutes) * time.Minute
+				if silentFor := now.Sub(sess.LastOutputChangedAt); silentFor > timeout {
+					findings = append(findings, stuckState("stale_worker_logs", SeverityBlocked,
+						fmt.Sprintf("Worker %s has not produced new output within the silent timeout.", slot),
+						"Restart or stop the silent worker so the issue can continue.", true, target,
+						fmt.Sprintf("Last output changed %s ago; timeout is %s", silentFor.Round(time.Second), timeout)))
+				}
+			}
+		}
+
+		if sess.Status == state.StatusRetryExhausted {
+			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
+				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
+				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
+				fmt.Sprintf("Session %s status=retry_exhausted retry_count=%d", slot, sess.RetryCount)))
+		}
+
+		if sess.PreviousAttemptFeedbackKind == "review_feedback" && sess.Status != state.StatusRunning {
+			canAct := sess.Status == state.StatusDead && sess.NextRetryAt != nil
+			findings = append(findings, stuckState("stale_review_feedback", SeverityBlocked,
+				fmt.Sprintf("Issue #%d has review feedback, but no worker is currently fixing it.", sess.IssueNumber),
+				"Respawn a worker with the saved review feedback or resolve the feedback manually.", canAct, target,
+				fmt.Sprintf("Session %s status=%s previous_feedback_kind=review_feedback", slot, sess.Status)))
+		}
+	}
+	return findings
+}
+
+func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR) []state.SupervisorStuckState {
+	byNumber := make(map[int]github.PR, len(prs))
+	byBranch := make(map[string]github.PR, len(prs))
+	for _, pr := range prs {
+		byNumber[pr.Number] = pr
+		if strings.TrimSpace(pr.HeadRefName) != "" {
+			byBranch[pr.HeadRefName] = pr
+		}
+	}
+
+	ciStatuses := make(map[int]string)
+	if ciReader, ok := e.reader.(prCIStatusReader); ok {
+		for _, pr := range prs {
+			status, err := ciReader.PRCIStatus(pr.Number)
+			if err == nil {
+				ciStatuses[pr.Number] = status
+			}
+		}
+	}
+
+	var findings []state.SupervisorStuckState
+	seenPRs := make(map[int]struct{})
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil {
+			continue
+		}
+		pr, found := openPRForSession(sess, byNumber, byBranch)
+		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}
+
+		if sess.PRNumber > 0 && !found && sessionCanStillBlockProgress(sess.Status) {
+			findings = append(findings, stuckState("closed_pr_with_active_session", SeverityBlocked,
+				fmt.Sprintf("Session %s records PR #%d, but that PR is not open.", slot, sess.PRNumber),
+				"Reconcile the session with the closed PR state before starting duplicate work.", true, target,
+				fmt.Sprintf("Session %s status=%s recorded_pr=%d", slot, sess.Status, sess.PRNumber),
+				fmt.Sprintf("Open PRs observed: %d", len(prs))))
+			continue
+		}
+		if !found {
+			continue
+		}
+		if sess.PRNumber == 0 {
+			target.PR = pr.Number
+		}
+		if _, ok := seenPRs[pr.Number]; ok {
+			continue
+		}
+		seenPRs[pr.Number] = struct{}{}
+
+		if pr.IsDraft {
+			findings = append(findings, stuckState("draft_pr", SeverityInfo,
+				fmt.Sprintf("PR #%d is still a draft.", pr.Number),
+				"Mark the PR ready for review when implementation is complete.", false, target,
+				fmt.Sprintf("PR #%d isDraft=true", pr.Number)))
+		}
+
+		switch strings.ToUpper(strings.TrimSpace(pr.Mergeable)) {
+		case "CONFLICTING":
+			findings = append(findings, stuckState("unmergeable_pr", SeverityBlocked,
+				fmt.Sprintf("PR #%d has merge conflicts.", pr.Number),
+				"Rebase or resolve conflicts before the PR can merge.", e.cfg.AutoRebase, target,
+				fmt.Sprintf("PR #%d mergeable=CONFLICTING", pr.Number)))
+		case "UNKNOWN":
+			findings = append(findings, stuckState("unmergeable_pr", SeverityWarning,
+				fmt.Sprintf("PR #%d mergeability is unknown.", pr.Number),
+				"Wait for GitHub to finish computing mergeability or refresh the PR state.", true, target,
+				fmt.Sprintf("PR #%d mergeable=UNKNOWN", pr.Number)))
+		}
+
+		ciStatus := ciStatuses[pr.Number]
+		if ciStatus == "failure" {
+			findings = append(findings, stuckState("failing_checks", SeverityBlocked,
+				fmt.Sprintf("PR #%d has failing checks.", pr.Number),
+				"Capture the failing check output and retry the worker if the retry budget allows.", true, target,
+				fmt.Sprintf("PR #%d checks=failure", pr.Number)))
+		}
+
+		if e.cfg.ReviewGate == "greptile" && (ciStatus == "" || ciStatus == "success") {
+			if greptileReader, ok := e.reader.(prGreptileReader); ok {
+				approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
+				if err == nil {
+					switch {
+					case pending:
+						findings = append(findings, stuckState("greptile_pending", SeverityInfo,
+							fmt.Sprintf("PR #%d is waiting for Greptile review.", pr.Number),
+							"Wait for Greptile to finish before merging.", true, target,
+							fmt.Sprintf("PR #%d greptile=pending", pr.Number)))
+					case !approved:
+						findings = append(findings, stuckState("greptile_not_approved", SeverityBlocked,
+							fmt.Sprintf("PR #%d is not approved by Greptile.", pr.Number),
+							"Address Greptile feedback or disable the Greptile review gate for this project.", e.cfg.AutoRetryReviewFeedback, target,
+							fmt.Sprintf("PR #%d greptile=not_approved", pr.Number)))
+					}
+				}
+			}
+		}
+	}
+	return findings
+}
+
+func (e *Engine) detectQueueStuckStates(st *state.State, prs []github.PR, issues, eligible []github.Issue, skipped []string) []state.SupervisorStuckState {
+	if len(issues) == 0 {
+		if len(st.ActiveSessions()) == 0 && len(prs) == 0 {
+			return []state.SupervisorStuckState{stuckState("no_open_issues", SeverityInfo,
+				"No open issues are available for Maestro.",
+				"Open a GitHub issue or wait for new work to enter the queue.", false, nil,
+				"Open issues observed: 0")}
+		}
+		return nil
+	}
+	if len(eligible) > 0 {
+		return nil
+	}
+
+	missingLabelCount := countSkipped(skipped, "missing configured ready label")
+	excludedCount := countSkipped(skipped, "excluded by configured label")
+	var findings []state.SupervisorStuckState
+
+	if len(e.cfg.IssueLabels) > 0 && missingLabelCount > 0 {
+		evidence := append([]string{
+			fmt.Sprintf("Configured issue_labels: %s", strings.Join(e.cfg.IssueLabels, ", ")),
+			fmt.Sprintf("Open issues observed: %d", len(issues)),
+		}, firstEvidence(skipped)...)
+		findings = append(findings, stuckState("no_eligible_issues", SeverityWarning,
+			"No open issues match the configured ready labels.",
+			"Add one of the configured ready labels to an issue or update issue_labels in config.", true, firstMissingLabelTarget(issues, e.cfg.IssueLabels),
+			evidence...))
+	}
+
+	if excludedCount == len(issues) {
+		findings = append(findings, stuckState("all_eligible_issues_excluded", SeverityWarning,
+			"Every open issue is excluded by policy labels.",
+			"Remove an exclude label from an issue or update exclude_labels in config.", false, nil,
+			fmt.Sprintf("Configured exclude_labels: %s", strings.Join(e.cfg.ExcludeLabels, ", ")),
+			fmt.Sprintf("Open issues observed: %d", len(issues))))
+	}
+
+	if len(skipped) > 0 {
+		findings = append(findings, stuckState("ordered_queue_exhausted", SeverityInfo,
+			"The ordered issue queue was checked, but every issue was skipped.",
+			"Review skipped reasons and make one issue eligible for dispatch.", false, nil,
+			append([]string{fmt.Sprintf("Skipped issues: %d", len(skipped))}, firstEvidence(skipped)...)...))
+	}
+
+	return findings
+}
+
+func detectPolicyStuckStates(skipped []string) []state.SupervisorStuckState {
+	var findings []state.SupervisorStuckState
+	for _, reason := range firstN(skipped, 3) {
+		if !policySkipReason(reason) {
+			continue
+		}
+		findings = append(findings, stuckState("issue_excluded_by_policy", SeverityInfo,
+			"An issue was skipped because of Supervisor policy.",
+			"Change the issue labels/type or adjust Maestro policy config if the issue should run.", false, targetFromSkipReason(reason), reason))
+	}
+	return findings
+}
+
+func (e *Engine) detectEnvironmentStuckStates(st *state.State, eligible []github.Issue) []state.SupervisorStuckState {
+	var findings []state.SupervisorStuckState
+	if shouldCheckRuntimeEnvironment(st, eligible) {
+		findings = append(findings, e.detectPromptStuckStates()...)
+		if missingCLI := e.detectMissingCLI(); missingCLI != nil {
+			findings = append(findings, *missingCLI)
+		}
+	}
+
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil || strings.TrimSpace(sess.Worktree) == "" || strings.TrimSpace(e.cfg.WorktreeBase) == "" {
+			continue
+		}
+		if !pathWithinBase(sess.Worktree, e.cfg.WorktreeBase) {
+			findings = append(findings, stuckState("unexpected_worktree_path", SeverityWarning,
+				fmt.Sprintf("Session %s uses a worktree outside the configured worktree base.", slot),
+				"Move the worktree under worktree_base or update worktree_base to the intended storage location.", false,
+				&state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot},
+				fmt.Sprintf("worktree=%s", sess.Worktree),
+				fmt.Sprintf("worktree_base=%s", e.cfg.WorktreeBase)))
+		}
+	}
+
+	return findings
+}
+
+func (e *Engine) detectPromptStuckStates() []state.SupervisorStuckState {
+	paths := []struct {
+		name string
+		path string
+	}{
+		{name: "worker_prompt", path: e.cfg.WorkerPrompt},
+		{name: "bug_prompt", path: e.cfg.BugPrompt},
+		{name: "enhancement_prompt", path: e.cfg.EnhancementPrompt},
+		{name: "pipeline.planner.prompt", path: e.cfg.Pipeline.Planner.Prompt},
+		{name: "pipeline.validator.prompt", path: e.cfg.Pipeline.Validator.Prompt},
+	}
+	for i, path := range e.cfg.PromptSections {
+		paths = append(paths, struct {
+			name string
+			path string
+		}{name: fmt.Sprintf("prompt_sections[%d]", i), path: path})
+	}
+
+	var findings []state.SupervisorStuckState
+	for _, item := range paths {
+		path := strings.TrimSpace(item.path)
+		if path == "" {
+			continue
+		}
+		if _, err := e.stat(path); err != nil {
+			code := "missing_prompt"
+			severity := SeverityWarning
+			summary := fmt.Sprintf("Configured prompt file for %s is not readable.", item.name)
+			if os.IsPermission(err) {
+				code = "permission_denied"
+				severity = SeverityBlocked
+				summary = fmt.Sprintf("Configured prompt file for %s cannot be read due to permissions.", item.name)
+			} else if os.IsNotExist(err) {
+				summary = fmt.Sprintf("Configured prompt file for %s does not exist.", item.name)
+			}
+			findings = append(findings, stuckState(code, severity, summary,
+				"Fix the prompt path or file permissions in Maestro config before dispatching more workers.", false, nil,
+				fmt.Sprintf("%s=%s", item.name, path)))
+		}
+	}
+	return findings
+}
+
+func (e *Engine) detectMissingCLI() *state.SupervisorStuckState {
+	backendName := strings.TrimSpace(e.cfg.Model.Default)
+	if backendName == "" {
+		backendName = "claude"
+	}
+	backendDef := e.cfg.Model.Backends[backendName]
+	binary := commandBinary(backendDef.Cmd, backendName)
+	if binary == "" {
+		return nil
+	}
+	if _, err := e.lookPath(binary); err != nil {
+		finding := stuckState("missing_cli", SeverityBlocked,
+			fmt.Sprintf("Default backend CLI %q is not available.", binary),
+			"Install the backend CLI or update model.default/model.backends in config.", false, nil,
+			fmt.Sprintf("model.default=%s", backendName),
+			fmt.Sprintf("cmd=%s", binary))
+		return &finding
+	}
+	return nil
 }
 
 func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {
@@ -547,9 +914,6 @@ func sessionWithOpenPR(st *state.State, prs []github.PR) (string, *state.Session
 		if sess.PRNumber > 0 {
 			if pr, ok := numberToPR[sess.PRNumber]; ok {
 				return slot, sess, pr, true
-			}
-			if sess.Status == state.StatusPROpen {
-				return slot, sess, github.PR{Number: sess.PRNumber, HeadRefName: sess.Branch, State: "OPEN", Title: sess.IssueTitle}, true
 			}
 		}
 	}
@@ -917,4 +1281,159 @@ func firstN(values []string, n int) []string {
 		return values
 	}
 	return values[:n]
+}
+
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+func stuckState(code, severity, summary, recommendedAction string, supervisorCanAct bool, target *state.SupervisorTarget, evidence ...string) state.SupervisorStuckState {
+	return state.SupervisorStuckState{
+		Code:              code,
+		Severity:          severity,
+		Summary:           summary,
+		Evidence:          compactReasons(evidence),
+		RecommendedAction: recommendedAction,
+		SupervisorCanAct:  supervisorCanAct,
+		Target:            target,
+	}
+}
+
+func compactStuckStates(findings []state.SupervisorStuckState) []state.SupervisorStuckState {
+	seen := make(map[string]struct{}, len(findings))
+	compact := make([]state.SupervisorStuckState, 0, len(findings))
+	for _, finding := range findings {
+		finding.Code = strings.TrimSpace(finding.Code)
+		finding.Severity = strings.TrimSpace(finding.Severity)
+		finding.Summary = strings.TrimSpace(finding.Summary)
+		finding.RecommendedAction = strings.TrimSpace(finding.RecommendedAction)
+		finding.Evidence = compactReasons(finding.Evidence)
+		if finding.Code == "" || finding.Summary == "" {
+			continue
+		}
+		key := finding.Code + "|" + supervisorTargetKey(finding.Target) + "|" + finding.Summary
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		compact = append(compact, finding)
+	}
+	return compact
+}
+
+func supervisorTargetKey(target *state.SupervisorTarget) string {
+	if target == nil {
+		return ""
+	}
+	return fmt.Sprintf("issue=%d/pr=%d/session=%s", target.Issue, target.PR, target.Session)
+}
+
+func openPRForSession(sess *state.Session, byNumber map[int]github.PR, byBranch map[string]github.PR) (github.PR, bool) {
+	if sess.PRNumber > 0 {
+		if pr, ok := byNumber[sess.PRNumber]; ok {
+			return pr, true
+		}
+	}
+	if strings.TrimSpace(sess.Branch) != "" {
+		if pr, ok := byBranch[sess.Branch]; ok {
+			return pr, true
+		}
+	}
+	return github.PR{}, false
+}
+
+func sessionCanStillBlockProgress(status state.SessionStatus) bool {
+	switch status {
+	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusFailed, state.StatusDead, state.StatusRetryExhausted:
+		return true
+	}
+	return false
+}
+
+func countSkipped(skipped []string, contains string) int {
+	count := 0
+	for _, reason := range skipped {
+		if strings.Contains(reason, contains) {
+			count++
+		}
+	}
+	return count
+}
+
+func firstEvidence(values []string) []string {
+	return firstN(values, 3)
+}
+
+func firstMissingLabelTarget(issues []github.Issue, labels []string) *state.SupervisorTarget {
+	for _, issue := range issues {
+		if !matchesRequiredLabels(issue, labels) {
+			return &state.SupervisorTarget{Issue: issue.Number}
+		}
+	}
+	return nil
+}
+
+func policySkipReason(reason string) bool {
+	return strings.Contains(reason, "excluded by configured label") ||
+		strings.Contains(reason, "mission parent issue") ||
+		strings.Contains(reason, "mission issue awaits decomposition") ||
+		strings.Contains(reason, "blocked by open issue")
+}
+
+func targetFromSkipReason(reason string) *state.SupervisorTarget {
+	var issue int
+	if _, err := fmt.Sscanf(reason, "Issue #%d", &issue); err == nil && issue > 0 {
+		return &state.SupervisorTarget{Issue: issue}
+	}
+	return nil
+}
+
+func shouldCheckRuntimeEnvironment(st *state.State, eligible []github.Issue) bool {
+	if len(eligible) > 0 {
+		return true
+	}
+	for _, sess := range st.Sessions {
+		if sess == nil {
+			continue
+		}
+		if sess.Status == state.StatusQueued || (sess.Status == state.StatusDead && sess.NextRetryAt != nil) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithinBase(path, base string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return true
+	}
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(absBase, absPath)
+	if err != nil {
+		return true
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func commandBinary(cmd, fallback string) string {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		cmd = strings.TrimSpace(fallback)
+	}
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }

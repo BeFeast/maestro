@@ -17,6 +17,9 @@ type fakeReader struct {
 	prs            []github.PR
 	openPRIssues   map[int]bool
 	closedIssues   map[int]bool
+	ciStatuses     map[int]string
+	greptileOK     map[int]bool
+	greptilePend   map[int]bool
 	issueCalls     int
 	addedLabels    []string
 	removedLabels  []string
@@ -67,6 +70,21 @@ func (f *fakeReader) CommentIssue(issueNumber int, body string) error {
 	return nil
 }
 
+func (f *fakeReader) PRCIStatus(prNumber int) (string, error) {
+	return f.ciStatuses[prNumber], nil
+}
+
+func (f *fakeReader) PRGreptileApproved(prNumber int) (bool, bool, error) {
+	if f.greptilePend[prNumber] {
+		return false, true, nil
+	}
+	approved, ok := f.greptileOK[prNumber]
+	if !ok {
+		return true, false, nil
+	}
+	return approved, false, nil
+}
+
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
@@ -80,7 +98,20 @@ func testConfig(t *testing.T) *config.Config {
 func testEngine(cfg *config.Config, reader *fakeReader) *Engine {
 	eng := NewEngine(cfg, reader)
 	eng.now = func() time.Time { return time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC) }
+	eng.pidAlive = func(pid int) bool { return true }
+	eng.lookPath = func(file string) (string, error) { return file, nil }
 	return eng
+}
+
+func requireStuckState(t *testing.T, decision state.SupervisorDecision, code string) state.SupervisorStuckState {
+	t.Helper()
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == code {
+			return stuck
+		}
+	}
+	t.Fatalf("stuck state %q not found in %#v", code, decision.StuckStates)
+	return state.SupervisorStuckState{}
 }
 
 func testIssue(number int, title string, labels ...string) github.Issue {
@@ -115,6 +146,13 @@ func TestDecide_IdleNoEligibleIssueRecommendsLabel(t *testing.T) {
 	if decision.Mode != ModeReadOnly {
 		t.Errorf("mode = %q, want %q", decision.Mode, ModeReadOnly)
 	}
+	stuck := requireStuckState(t, decision, "no_eligible_issues")
+	if stuck.Severity != SeverityWarning {
+		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityWarning)
+	}
+	if !stuck.SupervisorCanAct {
+		t.Error("expected SupervisorCanAct for label recommendation")
+	}
 }
 
 func TestDecide_RunningWorkerWaits(t *testing.T) {
@@ -125,6 +163,7 @@ func TestDecide_RunningWorkerWaits(t *testing.T) {
 		IssueNumber: 42,
 		IssueTitle:  "work in progress",
 		Status:      state.StatusRunning,
+		PID:         12345,
 		StartedAt:   time.Now().UTC(),
 	}
 
@@ -168,6 +207,117 @@ func TestDecide_RetryExhaustedNeedsReview(t *testing.T) {
 	}
 	if decision.Target == nil || decision.Target.Issue != 77 {
 		t.Fatalf("target = %#v, want issue 77", decision.Target)
+	}
+	stuck := requireStuckState(t, decision, "retry_exhausted")
+	if stuck.Severity != SeverityBlocked {
+		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityBlocked)
+	}
+	if stuck.SupervisorCanAct {
+		t.Error("retry_exhausted should require manual action")
+	}
+}
+
+func TestDecide_DeadRunningPIDExplained(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 91,
+		IssueTitle:  "lost worker",
+		Status:      state.StatusRunning,
+		PID:         424242,
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+	eng := testEngine(cfg, reader)
+	eng.pidAlive = func(pid int) bool { return false }
+
+	decision, err := eng.Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	stuck := requireStuckState(t, decision, "dead_running_pid")
+	if stuck.Severity != SeverityBlocked {
+		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityBlocked)
+	}
+	if !stuck.SupervisorCanAct {
+		t.Error("dead running PID should be automatically reconcilable")
+	}
+}
+
+func TestDecide_StaleWorkerLogsExplained(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.WorkerSilentTimeoutMinutes = 10
+	reader := &fakeReader{}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber:         92,
+		IssueTitle:          "silent worker",
+		Status:              state.StatusRunning,
+		PID:                 12345,
+		StartedAt:           time.Date(2026, 4, 29, 10, 0, 0, 0, time.UTC),
+		LastOutputChangedAt: time.Date(2026, 4, 29, 11, 40, 0, 0, time.UTC),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	stuck := requireStuckState(t, decision, "stale_worker_logs")
+	if stuck.Target == nil || stuck.Target.Session != "slot-1" {
+		t.Fatalf("target = %#v, want slot-1", stuck.Target)
+	}
+}
+
+func TestDecide_ClosedPRWithActiveSessionExplained(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 93,
+		IssueTitle:  "closed pr",
+		Status:      state.StatusPROpen,
+		PRNumber:    17,
+		Branch:      "feat/closed-pr",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	stuck := requireStuckState(t, decision, "closed_pr_with_active_session")
+	if stuck.Target == nil || stuck.Target.PR != 17 {
+		t.Fatalf("target = %#v, want PR 17", stuck.Target)
+	}
+}
+
+func TestDecide_FailingChecksExplained(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 31, HeadRefName: "feat/checks", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{31: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 94,
+		IssueTitle:  "failing checks",
+		Status:      state.StatusPROpen,
+		PRNumber:    31,
+		Branch:      "feat/checks",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	stuck := requireStuckState(t, decision, "failing_checks")
+	if stuck.Severity != SeverityBlocked {
+		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityBlocked)
 	}
 }
 

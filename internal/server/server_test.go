@@ -70,6 +70,25 @@ func setupTestServer(t *testing.T) (*Server, *config.Config) {
 		PRNumber:        11,
 		TokensUsedTotal: 3000,
 	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-test",
+		CreatedAt:         now,
+		Project:           "test/repo",
+		Mode:              "read_only",
+		Summary:           "No eligible issues.",
+		RecommendedAction: "none",
+		Risk:              "safe",
+		Confidence:        0.8,
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "no_eligible_issues",
+				Severity:          "warning",
+				Summary:           "No open issues match the configured ready labels.",
+				RecommendedAction: "Add a ready label or update config.",
+				SupervisorCanAct:  true,
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
 
 	if err := state.Save(dir, st); err != nil {
 		t.Fatalf("save test state: %v", err)
@@ -131,6 +150,12 @@ func TestHandleState(t *testing.T) {
 	}
 	if resp.PROpen[0].PRURL != "https://github.com/test/repo/pull/10" {
 		t.Errorf("pr_url = %q", resp.PROpen[0].PRURL)
+	}
+	if len(resp.StuckStates) != 1 || resp.StuckStates[0].Code != "no_eligible_issues" {
+		t.Fatalf("stuck_states = %#v, want latest no_eligible_issues", resp.StuckStates)
+	}
+	if resp.SupervisorLatest == nil || len(resp.SupervisorLatest.StuckStates) != 1 {
+		t.Fatalf("supervisor_latest stuck states missing: %#v", resp.SupervisorLatest)
 	}
 }
 
