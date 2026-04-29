@@ -590,10 +590,7 @@ const dashboardHTML = `<!DOCTYPE html>
   .stats { flex-wrap: wrap; justify-content: flex-end; }
   .stat {
     min-width: 72px;
-    padding: 6px 10px;
-    border: 1px solid var(--line);
-    background: var(--panel-2);
-    border-radius: 6px;
+    padding: 2px 4px;
     text-align: right;
   }
   .stat strong { display: block; font-size: 15px; }
