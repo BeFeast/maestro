@@ -252,6 +252,43 @@ func TestDecide_RetryExhaustedNeedsReview(t *testing.T) {
 	}
 }
 
+func TestDecide_RetryExhaustedOpenGreenPRExplainsMergeEligibility(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 88, HeadRefName: "feat/retry-green", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{88: "success"},
+	}
+	st := state.NewState()
+	st.Sessions["slot-2"] = &state.Session{
+		IssueNumber: 77,
+		IssueTitle:  "green work",
+		Status:      state.StatusRetryExhausted,
+		Branch:      "feat/retry-green",
+		PRNumber:    88,
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionMonitorOpenPR)
+	}
+	if !strings.Contains(strings.ToLower(decision.Summary), "retry exhausted") || !strings.Contains(strings.ToLower(decision.Summary), "merge") {
+		t.Fatalf("summary = %q, want retry exhausted merge eligibility", decision.Summary)
+	}
+	stuck := requireStuckState(t, decision, "retry_exhausted_open_pr")
+	if stuck.Severity != SeverityInfo {
+		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityInfo)
+	}
+	if !strings.Contains(strings.Join(stuck.Evidence, "\n"), "checks=success") {
+		t.Fatalf("evidence = %#v, want checks=success", stuck.Evidence)
+	}
+}
+
 func TestDecide_DeadRunningPIDExplained(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{}

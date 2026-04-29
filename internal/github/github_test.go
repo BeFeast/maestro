@@ -259,6 +259,48 @@ func TestFormatReviewFeedback_Empty(t *testing.T) {
 	}
 }
 
+func TestIsActionableReviewComment_IgnoresCodexWrapper(t *testing.T) {
+	comment := ReviewComment{
+		Path: "internal/foo.go",
+		Line: 42,
+		Body: "Codex reviewed this pull request and left comments for the author to consider.",
+		User: "chatgpt-codex-connector[bot]",
+	}
+	if isActionableReviewComment(comment) {
+		t.Fatal("generic Codex wrapper text should not be actionable review feedback")
+	}
+}
+
+func TestIsActionableReviewSummary_IgnoresEmptyGreptileReview(t *testing.T) {
+	body := `## Greptile Review
+
+No issues found. Safe to merge.
+
+Confidence Score: 5/5`
+	if isActionableReviewSummary(body) {
+		t.Fatal("empty Greptile review summary should not be actionable review feedback")
+	}
+}
+
+func TestIsActionableReviewComment_KeepsCurrentHeadInlineFinding(t *testing.T) {
+	comment := ReviewComment{
+		Path: "internal/foo.go",
+		Line: 42,
+		Body: "P1: nil pointer panic when the worker has no PR number",
+		User: "greptile-apps[bot]",
+	}
+	if !isActionableReviewComment(comment) {
+		t.Fatal("real inline review finding should be actionable")
+	}
+}
+
+func TestIsActionableReviewSummary_KeepsConcreteSummaryFinding(t *testing.T) {
+	body := "Confidence Score: 3/5\nNot safe to merge. P2: internal/foo.go:42 has inverted retry logic."
+	if !isActionableReviewSummary(body) {
+		t.Fatal("concrete review summary finding should be actionable")
+	}
+}
+
 func TestIsGreptileLogin(t *testing.T) {
 	tests := []struct {
 		login string

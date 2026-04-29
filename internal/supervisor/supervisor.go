@@ -182,12 +182,20 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false)
 
 	if slot, sess, pr, ok := sessionWithOpenPR(st, prs); ok {
+		summary := fmt.Sprintf("Session %s already has open PR #%d; monitor review, CI, or merge readiness.", slot, pr.Number)
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
 			"No GitHub mutation is needed for supervisor mode",
 		)
+		if sess.Status == state.StatusRetryExhausted {
+			summary = fmt.Sprintf("Issue #%d is retry exhausted, but PR #%d is still open; monitor checks and review, then merge when eligible.", sess.IssueNumber, pr.Number)
+			reasons = appendReasons(reasons,
+				fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
+				"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+			)
+		}
 		decision := e.decision(now, projectState, ActionMonitorOpenPR,
-			fmt.Sprintf("Session %s already has open PR #%d; monitor review, CI, or merge readiness.", slot, pr.Number),
+			summary,
 			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
 		return decision, nil
@@ -434,7 +442,7 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state
 			}
 		}
 
-		if sess.Status == state.StatusRetryExhausted {
+		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 {
 			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
@@ -522,6 +530,29 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR) []state.S
 		}
 
 		ciStatus := ciStatuses[pr.Number]
+		if sess.Status == state.StatusRetryExhausted {
+			checks := ciStatus
+			if checks == "" {
+				checks = "unknown"
+			}
+			severity := SeverityWarning
+			recommended := "Refresh the PR status; if checks and review gates pass, the PR remains eligible for normal merge flow."
+			switch checks {
+			case "success":
+				severity = SeverityInfo
+				recommended = "No retry is needed if review gates pass; keep the PR in normal merge flow."
+			case "pending":
+				severity = SeverityInfo
+				recommended = "Wait for checks to finish; if they pass and no actionable review feedback remains, merge normally."
+			case "failure":
+				severity = SeverityBlocked
+				recommended = "Fix failing checks or retry intentionally before this PR can merge."
+			}
+			findings = append(findings, stuckState("retry_exhausted_open_pr", severity,
+				fmt.Sprintf("Issue #%d is retry exhausted, but PR #%d is still open; checks=%s.", sess.IssueNumber, pr.Number, checks),
+				recommended, true, target,
+				fmt.Sprintf("Session %s status=retry_exhausted pr=%d checks=%s", slot, pr.Number, checks)))
+		}
 		if ciStatus == "failure" {
 			findings = append(findings, stuckState("failing_checks", SeverityBlocked,
 				fmt.Sprintf("PR #%d has failing checks.", pr.Number),
