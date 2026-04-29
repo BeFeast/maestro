@@ -97,11 +97,48 @@ type Mission struct {
 	Status      string `json:"status"` // "active", "done"
 }
 
+const DefaultSupervisorDecisionLimit = 20
+
+// SupervisorTarget identifies the primary object a supervisor decision refers to.
+type SupervisorTarget struct {
+	Issue   int    `json:"issue,omitempty"`
+	PR      int    `json:"pr,omitempty"`
+	Session string `json:"session,omitempty"`
+}
+
+// SupervisorProjectState captures the read-only state snapshot behind a decision.
+type SupervisorProjectState struct {
+	Sessions       int `json:"sessions"`
+	Running        int `json:"running"`
+	PROpen         int `json:"pr_open"`
+	Queued         int `json:"queued"`
+	RetryExhausted int `json:"retry_exhausted"`
+	OpenIssues     int `json:"open_issues"`
+	OpenPRs        int `json:"open_prs"`
+	AvailableSlots int `json:"available_slots"`
+}
+
+// SupervisorDecision is a stable, machine-readable read-only orchestration record.
+type SupervisorDecision struct {
+	ID                string                 `json:"id"`
+	CreatedAt         time.Time              `json:"created_at"`
+	Project           string                 `json:"project"`
+	Mode              string                 `json:"mode"`
+	Summary           string                 `json:"summary"`
+	RecommendedAction string                 `json:"recommended_action"`
+	Target            *SupervisorTarget      `json:"target,omitempty"`
+	Risk              string                 `json:"risk"`
+	Confidence        float64                `json:"confidence"`
+	Reasons           []string               `json:"reasons,omitempty"`
+	ProjectState      SupervisorProjectState `json:"project_state"`
+}
+
 type State struct {
-	Sessions    map[string]*Session `json:"sessions"`
-	Missions    map[int]*Mission    `json:"missions,omitempty"` // parent issue number → mission
-	NextSlot    int                 `json:"next_slot"`
-	LastMergeAt time.Time           `json:"last_merge_at,omitempty"`
+	Sessions            map[string]*Session  `json:"sessions"`
+	Missions            map[int]*Mission     `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision `json:"supervisor_decisions,omitempty"`
+	NextSlot            int                  `json:"next_slot"`
+	LastMergeAt         time.Time            `json:"last_merge_at,omitempty"`
 }
 
 func NewState() *State {
@@ -163,6 +200,31 @@ func (s *State) NextSlotName(prefix string) string {
 	name := fmt.Sprintf("%s-%d", prefix, s.NextSlot)
 	s.NextSlot++
 	return name
+}
+
+// RecordSupervisorDecision appends a supervisor decision and keeps only recent records.
+func (s *State) RecordSupervisorDecision(decision SupervisorDecision, limit int) {
+	if limit <= 0 {
+		limit = DefaultSupervisorDecisionLimit
+	}
+	s.SupervisorDecisions = append(s.SupervisorDecisions, decision)
+	if len(s.SupervisorDecisions) > limit {
+		s.SupervisorDecisions = append([]SupervisorDecision(nil), s.SupervisorDecisions[len(s.SupervisorDecisions)-limit:]...)
+	}
+}
+
+// LatestSupervisorDecision returns the newest supervisor decision by creation time.
+func (s *State) LatestSupervisorDecision() *SupervisorDecision {
+	if len(s.SupervisorDecisions) == 0 {
+		return nil
+	}
+	latest := 0
+	for i := 1; i < len(s.SupervisorDecisions); i++ {
+		if s.SupervisorDecisions[i].CreatedAt.After(s.SupervisorDecisions[latest].CreatedAt) {
+			latest = i
+		}
+	}
+	return &s.SupervisorDecisions[latest]
 }
 
 // ActiveSessions returns sessions that are currently running

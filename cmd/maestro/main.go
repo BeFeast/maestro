@@ -25,6 +25,7 @@ import (
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/watch"
 	"github.com/befeast/maestro/internal/worker"
@@ -38,6 +39,7 @@ Usage:
 Commands:
   init          Interactive setup wizard for new projects
   run           Run the orchestration loop
+  supervise     Run read-only supervisor decision loop
   serve         Run Mission Control read-only web dashboard/API
   status        Show current state
   logs          Show worker logs (tail -f)
@@ -61,6 +63,11 @@ Run flags:
   --interval duration   Loop interval (default 10m)
   --once                Run once and exit
   --prompt string       Path to worker prompt base file
+
+Supervise flags:
+  --once                Run one read-only decision and exit
+  --interval duration   Loop interval (default 5m)
+  --json                Output decision as JSON
 
 Serve flags:
   --host string         Host/interface to bind (default from config, then 127.0.0.1)
@@ -157,6 +164,8 @@ func main() {
 		initCmd(args)
 	case "run":
 		runCmd(args)
+	case "supervise":
+		superviseCmd(args)
 	case "serve":
 		serveCmd(args)
 	case "status":
@@ -344,6 +353,98 @@ func runCmd(args []string) {
 	wg.Wait()
 }
 
+func superviseCmd(args []string) {
+	fs := flag.NewFlagSet("supervise", flag.ExitOnError)
+	configPath := fs.String("config", "", "Path to config file")
+	once := fs.Bool("once", false, "Run once and exit")
+	interval := fs.Duration("interval", 5*time.Minute, "Loop interval")
+	jsonOutput := fs.Bool("json", false, "Output decision as JSON")
+	fs.Parse(args)
+
+	if !*once && *interval <= 0 {
+		log.Fatalf("supervise: --interval must be positive")
+	}
+
+	cfg := loadConfig(*configPath)
+	gh := github.New(cfg.Repo)
+	runOnce := func() {
+		decision, err := supervisor.RunOnce(cfg, gh)
+		if err != nil {
+			log.Fatalf("supervise: %v", err)
+		}
+		printSupervisorDecision(decision, *jsonOutput)
+	}
+
+	runOnce()
+	if *once {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	ticker := time.NewTicker(*interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
+
+func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool) {
+	if jsonOutput {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(decision)
+		return
+	}
+
+	fmt.Printf("Supervisor decision: %s\n", decision.RecommendedAction)
+	fmt.Printf("Summary: %s\n", decision.Summary)
+	fmt.Printf("Risk: %s\n", decision.Risk)
+	fmt.Printf("Confidence: %.2f\n", decision.Confidence)
+	if decision.Target != nil {
+		parts := supervisorTargetParts(decision.Target)
+		if len(parts) > 0 {
+			fmt.Printf("Target: %s\n", strings.Join(parts, ", "))
+		}
+	}
+	if len(decision.Reasons) > 0 {
+		fmt.Println("Reasons:")
+		for _, reason := range decision.Reasons {
+			fmt.Printf("  - %s\n", reason)
+		}
+	}
+	fmt.Printf("Recorded: %s\n", decision.CreatedAt.Format(time.RFC3339))
+}
+
+func supervisorTargetParts(target *state.SupervisorTarget) []string {
+	if target == nil {
+		return nil
+	}
+	var parts []string
+	if target.Issue > 0 {
+		parts = append(parts, fmt.Sprintf("issue #%d", target.Issue))
+	}
+	if target.PR > 0 {
+		parts = append(parts, fmt.Sprintf("PR #%d", target.PR))
+	}
+	if strings.TrimSpace(target.Session) != "" {
+		parts = append(parts, "session "+target.Session)
+	}
+	return parts
+}
+
 func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	var configs multiFlag
@@ -458,6 +559,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 		}
 	}
 	fmt.Println()
+	showLatestSupervisorDecision(s)
 
 	if len(s.Sessions) == 0 {
 		fmt.Println("No sessions.")
@@ -700,6 +802,26 @@ func logsCmd(args []string) {
 		fmt.Println()
 		fmt.Printf("To watch all logs:\n  tail -f %s/%s-*.log\n", entries[0].logDir, entries[0].prefix)
 	}
+}
+
+func showLatestSupervisorDecision(s *state.State) {
+	decision := s.LatestSupervisorDecision()
+	if decision == nil {
+		return
+	}
+	fmt.Println("Supervisor:")
+	fmt.Printf("  Latest action: %s (%s)\n", decision.RecommendedAction, formatRelativeTime(decision.CreatedAt))
+	if decision.Summary != "" {
+		fmt.Printf("  Summary: %s\n", decision.Summary)
+	}
+	fmt.Printf("  Risk: %s  Confidence: %.2f\n", decision.Risk, decision.Confidence)
+	if decision.Target != nil {
+		parts := supervisorTargetParts(decision.Target)
+		if len(parts) > 0 {
+			fmt.Printf("  Target: %s\n", strings.Join(parts, ", "))
+		}
+	}
+	fmt.Println()
 }
 
 // watchPaneCmd builds a shell command for a watch pane.
