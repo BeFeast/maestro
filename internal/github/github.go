@@ -473,6 +473,32 @@ func (c *Client) AddIssueLabel(issueNumber int, label string) error {
 	return nil
 }
 
+// RemoveIssueLabel removes a label from an issue.
+func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
+	out, err := exec.Command("gh", "issue", "edit",
+		strconv.Itoa(issueNumber),
+		"--repo", c.Repo,
+		"--remove-label", label,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh issue edit --remove-label: %w\n%s", err, out)
+	}
+	return nil
+}
+
+// CommentIssue leaves a comment on an issue.
+func (c *Client) CommentIssue(issueNumber int, body string) error {
+	out, err := exec.Command("gh", "issue", "comment",
+		strconv.Itoa(issueNumber),
+		"--repo", c.Repo,
+		"--body", body,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh issue comment: %w\n%s", err, out)
+	}
+	return nil
+}
+
 // PRLabels returns the labels on a PR.
 func (c *Client) PRLabels(prNumber int) ([]string, error) {
 	out, err := exec.Command("gh", "pr", "view",

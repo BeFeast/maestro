@@ -63,6 +63,8 @@ type SupervisorConfig struct {
 	Mode             string                       `yaml:"mode" json:"mode"`
 	ReadyLabel       string                       `yaml:"ready_label" json:"ready_label,omitempty"`
 	BlockedLabel     string                       `yaml:"blocked_label" json:"blocked_label,omitempty"`
+	QueueComments    bool                         `yaml:"queue_comments" json:"queue_comments,omitempty"`
+	OneAtATime       bool                         `yaml:"one_at_a_time" json:"one_at_a_time,omitempty"`
 	ExcludedLabels   []string                     `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
 	AllowIssueTypes  []string                     `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
 	OrderedQueue     SupervisorOrderedQueueConfig `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
@@ -189,6 +191,7 @@ type HooksConfig struct {
 
 type Config struct {
 	Server                     ServerConfig         `yaml:"server"`
+	Supervisor                 SupervisorConfig     `yaml:"supervisor"`
 	Repo                       string               `yaml:"repo"`
 	LocalPath                  string               `yaml:"local_path"`
 	WorktreeBase               string               `yaml:"worktree_base"`
@@ -222,7 +225,6 @@ type Config struct {
 	Telegram                   TelegramConfig       `yaml:"telegram"`
 	Versioning                 VersioningConfig     `yaml:"versioning"`
 	GitHubProjects             GitHubProjectsConfig `yaml:"github_projects"`
-	Supervisor                 SupervisorConfig     `yaml:"supervisor"`
 	MaxRetryBackoffMs          int                  `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	AutoRestoreFiles           []string             `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase

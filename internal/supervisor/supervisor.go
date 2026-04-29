@@ -13,7 +13,8 @@ import (
 )
 
 const (
-	ModeReadOnly = "read_only"
+	ModeReadOnly    = "read_only"
+	ModeSafeActions = "safe_actions"
 
 	ActionNone                 = "none"
 	ActionWaitForRunningWorker = "wait_for_running_worker"
@@ -32,6 +33,24 @@ const (
 	PolicyRuleIssueLabels    = "issue_labels"
 	PolicyRuleOrderedQueue   = "supervisor.ordered_queue"
 	PolicyRuleExcludedLabels = "supervisor.excluded_labels"
+
+	DecisionStatusRecommended = "recommended"
+	DecisionStatusSucceeded   = "succeeded"
+	DecisionStatusFailed      = "failed"
+
+	MutationAddReadyLabel      = "add_ready_label"
+	MutationRemoveBlockedLabel = "remove_blocked_label"
+	MutationIssueComment       = config.SupervisorActionAddIssueComment
+
+	MutationStatusPlanned   = "planned"
+	MutationStatusSucceeded = "succeeded"
+	MutationStatusFailed    = "failed"
+
+	ErrorClassGitHubAPI         = "github_api"
+	ErrorClassGitHubAuth        = "github_auth"
+	ErrorClassGitHubNotFound    = "github_not_found"
+	ErrorClassGitHubRateLimited = "github_rate_limited"
+	ErrorClassUnsupportedClient = "unsupported_client"
 )
 
 // Reader is the read-only GitHub surface used by the supervisor engine.
@@ -42,7 +61,15 @@ type Reader interface {
 	IsIssueClosed(number int) (bool, error)
 }
 
-// Engine makes deterministic read-only supervisor decisions.
+// Mutator is the safe GitHub write surface used for supervisor queue actions.
+type Mutator interface {
+	AddIssueLabel(issueNumber int, label string) error
+	RemoveIssueLabel(issueNumber int, label string) error
+	CommentIssue(issueNumber int, body string) error
+}
+
+// Engine makes deterministic supervisor decisions. It plans safe queue mutations
+// but does not execute them.
 type Engine struct {
 	cfg    *config.Config
 	reader Reader
@@ -60,16 +87,28 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 	}
 }
 
-// RunOnce records one read-only supervisor decision in Maestro state.
+// RunOnce records one supervisor decision in Maestro state and applies any safe
+// queue mutations selected by the decision.
 func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error) {
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
 		return state.SupervisorDecision{}, fmt.Errorf("load state: %w", err)
 	}
+	if reader == nil {
+		reader = github.New(cfg.Repo)
+	}
 
 	decision, err := NewEngine(cfg, reader).Decide(st)
 	if err != nil {
 		return state.SupervisorDecision{}, err
+	}
+	if len(decision.Mutations) > 0 {
+		mutator, ok := reader.(Mutator)
+		if !ok {
+			markUnsupportedQueueAction(&decision)
+		} else {
+			applyQueueAction(cfg, &decision, mutator)
+		}
 	}
 	st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
 	if err := state.Save(cfg.StateDir, st); err != nil {
@@ -107,7 +146,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons), nil
 	}
 
-	if slot, sess, ok := runningSession(st); ok {
+	if slot, sess, ok := runningSession(st); ok && e.shouldWaitForRunningWorker(st) {
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s is running for issue #%d", slot, sess.IssueNumber),
 			"Starting another worker is not recommended while a worker is active",
@@ -178,24 +217,26 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons), nil
 	}
 
-	if labels := e.requiredIssueLabels(); len(labels) > 0 {
-		unlabeled, err := e.firstIssueMissingRequiredLabel(st, candidates)
-		if err != nil {
-			return state.SupervisorDecision{}, err
+	candidate, err := e.firstQueueActionCandidate(st, candidates)
+	if err != nil {
+		return state.SupervisorDecision{}, err
+	}
+	if candidate != nil {
+		mutations := candidate.plannedMutations(e.cfg)
+		reasons := appendReasons(baseReasons,
+			queueLabelReason(candidate.readyLabel, candidate.blockedLabel),
+			fmt.Sprintf("Issue #%d is the next queue issue eligible for safe label mutation", candidate.issue.Number),
+		)
+		risk := RiskMutating
+		if len(mutations) > 0 {
+			risk = RiskSafe
+			reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
 		}
-		if unlabeled != nil {
-			reasons := appendReasons(baseReasons,
-				issueLabelReason(labels),
-				fmt.Sprintf("Issue #%d is open but does not have a configured ready label", unlabeled.Number),
-			)
-			risk := RiskMutating
-			if e.cfg.Supervisor.AllowsSafeAction(config.SupervisorActionAddReadyLabel) {
-				risk = RiskSafe
-			}
-			return e.decision(now, projectState, ActionLabelIssueReady,
-				fmt.Sprintf("No eligible issues because none have the configured ready label; issue #%d is next in the open queue.", unlabeled.Number),
-				risk, 0.82, &state.SupervisorTarget{Issue: unlabeled.Number}, policyRule, reasons), nil
-		}
+		decision := e.decision(now, projectState, ActionLabelIssueReady,
+			fmt.Sprintf("Prepare issue #%d for the queue by %s.", candidate.issue.Number, plannedMutationPhrase(candidate.neededMutations())),
+			risk, 0.82, &state.SupervisorTarget{Issue: candidate.issue.Number}, policyRule, reasons)
+		decision.Mutations = mutations
+		return decision, nil
 	}
 
 	reasons := appendReasons(baseReasons,
@@ -217,6 +258,7 @@ func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action
 		Project:           e.cfg.Repo,
 		Mode:              ModeReadOnly,
 		PolicyRule:        policyRule,
+		Status:            DecisionStatusRecommended,
 		Summary:           summary,
 		RecommendedAction: action,
 		Target:            target,
@@ -294,6 +336,112 @@ func (e *Engine) defaultPolicyRule() string {
 	return PolicyRuleOpenIssues
 }
 
+func (e *Engine) shouldWaitForRunningWorker(st *state.State) bool {
+	if e.cfg.Supervisor.OneAtATime {
+		return true
+	}
+	return availableSlots(e.cfg, st) <= 0
+}
+
+type queueActionCandidate struct {
+	issue         github.Issue
+	readyLabel    string
+	blockedLabel  string
+	addReady      bool
+	removeBlocked bool
+}
+
+func (c queueActionCandidate) neededMutations() []state.SupervisorMutation {
+	var mutations []state.SupervisorMutation
+	if c.addReady {
+		mutations = append(mutations, state.SupervisorMutation{
+			Type:   MutationAddReadyLabel,
+			Issue:  c.issue.Number,
+			Label:  c.readyLabel,
+			Status: MutationStatusPlanned,
+		})
+	}
+	if c.removeBlocked {
+		mutations = append(mutations, state.SupervisorMutation{
+			Type:   MutationRemoveBlockedLabel,
+			Issue:  c.issue.Number,
+			Label:  c.blockedLabel,
+			Status: MutationStatusPlanned,
+		})
+	}
+	return mutations
+}
+
+func (c queueActionCandidate) plannedMutations(cfg *config.Config) []state.SupervisorMutation {
+	needed := c.neededMutations()
+	mutations := make([]state.SupervisorMutation, 0, len(needed))
+	for _, mutation := range needed {
+		if safeActionAllowed(cfg, mutation.Type) {
+			mutations = append(mutations, mutation)
+		}
+	}
+	return mutations
+}
+
+func safeActionAllowed(cfg *config.Config, action string) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.Supervisor.AllowsSafeAction(action)
+}
+
+func (e *Engine) firstQueueActionCandidate(st *state.State, issues []github.Issue) (*queueActionCandidate, error) {
+	readyLabel := e.readyLabel()
+	blockedLabel := e.blockedLabel()
+	if readyLabel == "" && blockedLabel == "" {
+		return nil, nil
+	}
+
+	for _, issue := range issues {
+		hasReadyLabel := readyLabel == "" || github.HasLabel(issue, []string{readyLabel})
+		hasBlockedLabel := blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel})
+		addReady := readyLabel != "" && !hasReadyLabel && !supervisorMutationSucceeded(st, issue.Number, MutationAddReadyLabel, readyLabel)
+		removeBlocked := hasBlockedLabel && !supervisorMutationSucceeded(st, issue.Number, MutationRemoveBlockedLabel, blockedLabel)
+		candidate := queueActionCandidate{
+			issue:         issue,
+			readyLabel:    readyLabel,
+			blockedLabel:  blockedLabel,
+			addReady:      addReady,
+			removeBlocked: removeBlocked,
+		}
+		if !candidate.addReady && !candidate.removeBlocked {
+			continue
+		}
+
+		reason, err := e.issueQueueSkipReason(st, issue, blockedLabel)
+		if err != nil {
+			return nil, err
+		}
+		if reason != "" {
+			continue
+		}
+		return &candidate, nil
+	}
+	return nil, nil
+}
+
+func supervisorMutationSucceeded(st *state.State, issueNumber int, mutationType, label string) bool {
+	if st == nil {
+		return false
+	}
+	for _, decision := range st.SupervisorDecisions {
+		for _, mutation := range decision.Mutations {
+			if mutation.Status != MutationStatusSucceeded {
+				continue
+			}
+			if mutation.Issue == issueNumber && mutation.Type == mutationType && strings.EqualFold(mutation.Label, label) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (e *Engine) eligibleIssues(st *state.State, issues []github.Issue, requireLabels bool) ([]github.Issue, []string, error) {
 	var eligible []github.Issue
 	var skipped []string
@@ -316,25 +464,15 @@ func (e *Engine) eligibleIssues(st *state.State, issues []github.Issue, requireL
 	return eligible, skipped, nil
 }
 
-func (e *Engine) firstIssueMissingRequiredLabel(st *state.State, issues []github.Issue) (*github.Issue, error) {
-	requiredLabels := e.requiredIssueLabels()
-	for i := range issues {
-		issue := &issues[i]
-		if matchesRequiredLabels(*issue, requiredLabels) {
-			continue
-		}
-		reason, err := e.issueSkipReason(st, *issue)
-		if err != nil {
-			return nil, err
-		}
-		if reason == "" {
-			return issue, nil
-		}
-	}
-	return nil, nil
+func (e *Engine) issueSkipReason(st *state.State, issue github.Issue) (string, error) {
+	return e.issueSkipReasonWithExcludeLabels(st, issue, e.excludeLabels(), "")
 }
 
-func (e *Engine) issueSkipReason(st *state.State, issue github.Issue) (string, error) {
+func (e *Engine) issueQueueSkipReason(st *state.State, issue github.Issue, blockedLabel string) (string, error) {
+	return e.issueSkipReasonWithExcludeLabels(st, issue, excludeLabelsExcept(e.excludeLabels(), blockedLabel), blockedLabel)
+}
+
+func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.Issue, excludeLabels []string, ignoredBlockedLabel string) (string, error) {
 	if st.IssueInProgress(issue.Number) {
 		return "already in progress", nil
 	}
@@ -353,13 +491,13 @@ func (e *Engine) issueSkipReason(st *state.State, issue github.Issue) (string, e
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return "mission issue awaits decomposition", nil
 	}
-	if github.HasLabel(issue, e.cfg.ExcludeLabels) {
+	if github.HasLabel(issue, excludeLabels) {
 		return "excluded by configured label", nil
 	}
-	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel}) {
+	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && !strings.EqualFold(blockedLabel, ignoredBlockedLabel) && github.HasLabel(issue, []string{blockedLabel}) {
 		return "blocked by supervisor policy label", nil
 	}
-	if github.HasLabel(issue, e.policyExcludedLabels()) {
+	if github.HasLabel(issue, excludeLabelsExcept(e.policyExcludedLabels(), ignoredBlockedLabel)) {
 		return "excluded by supervisor policy label", nil
 	}
 	if len(e.cfg.BlockerPatterns) > 0 {
@@ -541,12 +679,214 @@ func issueLabelReason(labels []string) string {
 	return "Config requires one of issue_labels: " + strings.Join(labels, ", ")
 }
 
+func (e *Engine) readyLabel() string {
+	if label := strings.TrimSpace(e.cfg.Supervisor.ReadyLabel); label != "" {
+		return label
+	}
+	for _, label := range e.cfg.IssueLabels {
+		if label = strings.TrimSpace(label); label != "" {
+			return label
+		}
+	}
+	return ""
+}
+
+func (e *Engine) blockedLabel() string {
+	if label := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); label != "" {
+		return label
+	}
+	for _, label := range e.cfg.ExcludeLabels {
+		label = strings.TrimSpace(label)
+		if strings.EqualFold(label, "blocked") {
+			return label
+		}
+	}
+	return ""
+}
+
+func (e *Engine) excludeLabels() []string {
+	labels := append([]string(nil), e.cfg.ExcludeLabels...)
+	blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel)
+	if blockedLabel != "" && !hasLabelName(labels, blockedLabel) {
+		labels = append(labels, blockedLabel)
+	}
+	return labels
+}
+
+func hasLabelName(labels []string, target string) bool {
+	target = strings.TrimSpace(target)
+	for _, label := range labels {
+		if strings.EqualFold(strings.TrimSpace(label), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func queueLabelReason(readyLabel, blockedLabel string) string {
+	var parts []string
+	if readyLabel != "" {
+		parts = append(parts, "ready label: "+readyLabel)
+	}
+	if blockedLabel != "" {
+		parts = append(parts, "blocked label: "+blockedLabel)
+	}
+	if len(parts) == 0 {
+		return "No supervisor queue labels are configured"
+	}
+	return "Supervisor queue labels configured (" + strings.Join(parts, ", ") + ")"
+}
+
+func excludeLabelsExcept(labels []string, except string) []string {
+	except = strings.TrimSpace(except)
+	if except == "" {
+		return labels
+	}
+	filtered := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if strings.EqualFold(strings.TrimSpace(label), except) {
+			continue
+		}
+		filtered = append(filtered, label)
+	}
+	return filtered
+}
+
+func plannedMutationPhrase(mutations []state.SupervisorMutation) string {
+	descriptions := make([]string, 0, len(mutations))
+	for _, mutation := range mutations {
+		descriptions = append(descriptions, mutationDescription(mutation))
+	}
+	return strings.Join(descriptions, " and ")
+}
+
+func mutationDescription(mutation state.SupervisorMutation) string {
+	switch mutation.Type {
+	case MutationAddReadyLabel:
+		return fmt.Sprintf("adding `%s`", mutation.Label)
+	case MutationRemoveBlockedLabel:
+		return fmt.Sprintf("removing `%s`", mutation.Label)
+	case MutationIssueComment:
+		return "adding an issue comment"
+	default:
+		return mutation.Type
+	}
+}
+
 func issueRefs(numbers []int) string {
 	refs := make([]string, len(numbers))
 	for i, n := range numbers {
 		refs[i] = fmt.Sprintf("#%d", n)
 	}
 	return strings.Join(refs, ", ")
+}
+
+func applyQueueAction(cfg *config.Config, decision *state.SupervisorDecision, mutator Mutator) {
+	decision.Mode = ModeSafeActions
+	decision.Status = DecisionStatusSucceeded
+
+	completed := make([]string, 0, len(decision.Mutations))
+	for i := range decision.Mutations {
+		mutation := decision.Mutations[i]
+		if err := applyQueueMutation(mutator, mutation); err != nil {
+			markQueueActionFailed(decision, i, classifyGitHubError(err))
+			return
+		}
+		decision.Mutations[i].Status = MutationStatusSucceeded
+		completed = append(completed, completedMutationPhrase(mutation))
+	}
+
+	if cfg.Supervisor.QueueComments && safeActionAllowed(cfg, config.SupervisorActionAddIssueComment) && len(completed) > 0 && decision.Target != nil && decision.Target.Issue > 0 {
+		comment := state.SupervisorMutation{
+			Type:   MutationIssueComment,
+			Issue:  decision.Target.Issue,
+			Status: MutationStatusPlanned,
+		}
+		decision.Mutations = append(decision.Mutations, comment)
+		commentIndex := len(decision.Mutations) - 1
+		if err := mutator.CommentIssue(decision.Target.Issue, queueActionComment(completed)); err != nil {
+			markQueueActionFailed(decision, commentIndex, classifyGitHubError(err))
+			return
+		}
+		decision.Mutations[commentIndex].Status = MutationStatusSucceeded
+	}
+}
+
+func applyQueueMutation(mutator Mutator, mutation state.SupervisorMutation) error {
+	switch mutation.Type {
+	case MutationAddReadyLabel:
+		return mutator.AddIssueLabel(mutation.Issue, mutation.Label)
+	case MutationRemoveBlockedLabel:
+		return mutator.RemoveIssueLabel(mutation.Issue, mutation.Label)
+	default:
+		return fmt.Errorf("unsupported queue mutation %q", mutation.Type)
+	}
+}
+
+func markUnsupportedQueueAction(decision *state.SupervisorDecision) {
+	decision.Mode = ModeSafeActions
+	decision.Status = DecisionStatusFailed
+	decision.ErrorClass = ErrorClassUnsupportedClient
+	decision.Summary = "Supervisor queue action could not run because the GitHub client does not support safe mutations."
+	for i := range decision.Mutations {
+		if decision.Mutations[i].Status == MutationStatusPlanned {
+			decision.Mutations[i].Status = MutationStatusFailed
+			decision.Mutations[i].ErrorClass = ErrorClassUnsupportedClient
+			break
+		}
+	}
+	decision.Reasons = appendReasons(decision.Reasons, "Supervisor queue mutation failed with error class: "+ErrorClassUnsupportedClient)
+}
+
+func markQueueActionFailed(decision *state.SupervisorDecision, mutationIndex int, errorClass string) {
+	decision.Status = DecisionStatusFailed
+	decision.ErrorClass = errorClass
+	if mutationIndex >= 0 && mutationIndex < len(decision.Mutations) {
+		decision.Mutations[mutationIndex].Status = MutationStatusFailed
+		decision.Mutations[mutationIndex].ErrorClass = errorClass
+	}
+	issue := 0
+	if decision.Target != nil {
+		issue = decision.Target.Issue
+	}
+	if issue > 0 {
+		decision.Summary = fmt.Sprintf("Supervisor queue action failed for issue #%d (%s).", issue, errorClass)
+	} else {
+		decision.Summary = fmt.Sprintf("Supervisor queue action failed (%s).", errorClass)
+	}
+	decision.Reasons = appendReasons(decision.Reasons, "Supervisor queue mutation failed with error class: "+errorClass)
+}
+
+func classifyGitHubError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "rate limit") || strings.Contains(msg, "secondary rate"):
+		return ErrorClassGitHubRateLimited
+	case strings.Contains(msg, "not found") || strings.Contains(msg, "404"):
+		return ErrorClassGitHubNotFound
+	case strings.Contains(msg, "unauthorized") || strings.Contains(msg, "authentication") || strings.Contains(msg, "permission") || strings.Contains(msg, "403") || strings.Contains(msg, "401"):
+		return ErrorClassGitHubAuth
+	default:
+		return ErrorClassGitHubAPI
+	}
+}
+
+func completedMutationPhrase(mutation state.SupervisorMutation) string {
+	switch mutation.Type {
+	case MutationAddReadyLabel:
+		return fmt.Sprintf("added `%s`", mutation.Label)
+	case MutationRemoveBlockedLabel:
+		return fmt.Sprintf("removed `%s`", mutation.Label)
+	default:
+		return mutation.Type
+	}
+}
+
+func queueActionComment(actions []string) string {
+	return "Maestro queue action: " + strings.Join(actions, "; ") + "."
 }
 
 func appendReasons(base []string, extra ...string) []string {
