@@ -123,7 +123,10 @@ maestro run --once
 # 5. Check status
 maestro status
 
-# 6. When ready, run continuously
+# 6. Watch the read-only web dashboard
+maestro serve --port 8787 --read-only
+
+# 7. When ready, run continuously
 maestro run
 ```
 
@@ -133,6 +136,13 @@ To manually spawn a worker for a specific issue:
 ```bash
 maestro spawn --issue 42
 ```
+
+To watch Maestro from a browser, use the read-only Mission Control dashboard:
+```bash
+maestro serve --config ./maestro.yaml --host 127.0.0.1 --port 8787 --read-only
+```
+
+Use `--host 0.0.0.0` only on a trusted network if you want to expose the dashboard to the LAN.
 
 To watch workers live in a tmux dashboard:
 ```bash
@@ -157,6 +167,10 @@ merge_interval_seconds: 30         # minimum seconds between merges in sequentia
 session_prefix: pan                # worker session name prefix (default: first 3 chars of repo name)
 state_dir: ~/.maestro/pan          # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude                 # deprecated: use model.backends.claude.cmd
+server:
+  host: 127.0.0.1                  # bind address for `maestro serve`
+  port: 8787                       # 0 = disabled for `maestro run`
+  read_only: true                  # dashboard mode: block mutating HTTP endpoints
 issue_labels:                      # preferred label filter (OR semantics)
   - enhancement
 exclude_labels:

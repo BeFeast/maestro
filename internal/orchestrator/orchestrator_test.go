@@ -1002,6 +1002,196 @@ func TestAutoMergePRs_QueuedSessionsAreEligible(t *testing.T) {
 	}
 }
 
+func TestAutoMergePRs_ReviewGateNoneSkipsGreptileWait(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
+	merged := make([]int, 0)
+	greptileChecks := 0
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghPRGreptileApprovedFn: func(prNumber int) (bool, bool, error) {
+			greptileChecks++
+			return false, true, nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if greptileChecks != 0 {
+		t.Fatalf("greptile gate should not be checked when review_gate=none, got %d checks", greptileChecks)
+	}
+	if len(merged) != 1 || merged[0] != 10 {
+		t.Fatalf("merged = %v, want [10]", merged)
+	}
+}
+
+func TestAutoMergePRs_ReviewFeedbackKeepsPROpenAndSchedulesInPlaceRetry(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "none",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	merged := make([]int, 0)
+	closedPRs := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
+		},
+		ghClosePRFn: func(prNumber int, comment string) error {
+			closedPRs = append(closedPRs, prNumber)
+			return nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+	s.Sessions["slot-0"].Worktree = "/tmp/maestro-slot-0"
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 0 {
+		t.Fatalf("expected review feedback to block merge, got merged=%v", merged)
+	}
+	if len(closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none", closedPRs)
+	}
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set")
+	}
+	if sess.PreviousAttemptFeedback == "" {
+		t.Fatal("PreviousAttemptFeedback should be set")
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10", sess.PRNumber)
+	}
+	if sess.Worktree == "" {
+		t.Fatal("Worktree should be preserved for in-place retry")
+	}
+}
+
+func TestAutoMergePRs_ReviewFeedbackFallsBackToCloseWhenWorktreeMissing(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "none",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	closedPRs := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
+		},
+		ghClosePRFn: func(prNumber int, comment string) error {
+			closedPRs = append(closedPRs, prNumber)
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(closedPRs) != 1 || closedPRs[0] != 10 {
+		t.Fatalf("closedPRs = %v, want [10]", closedPRs)
+	}
+	if s.Sessions["slot-0"].PRNumber != 0 {
+		t.Fatalf("PRNumber = %d, want 0 after close fallback", s.Sessions["slot-0"].PRNumber)
+	}
+}
+
+func TestAutoMergePRs_ReviewFeedbackRetryLimitMarksTerminal(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "none",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
+		},
+	}
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.Worktree = "/tmp/maestro-slot-0"
+	sess.RetryCount = 3
+
+	o.autoMergePRs(s)
+
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRetryExhausted)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt should be nil after retry exhaustion")
+	}
+	if sess.LastNotifiedStatus != "review_retry_exhausted" {
+		t.Fatalf("LastNotifiedStatus = %q, want review_retry_exhausted", sess.LastNotifiedStatus)
+	}
+}
+
 func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
@@ -1240,6 +1430,50 @@ func TestCheckSessions_TokensBelowLimit_WorkerSurvives(t *testing.T) {
 	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+}
+
+func TestCheckSessions_RunningInPlaceRetryKeepsWorkerRunning(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 10, HeadRefName: "feat/existing"}}, nil
+		},
+		isIssueClosedFn: func(number int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		tmuxCaptureFn: func(session string) (string, error) {
+			return "worker still fixing review comments", nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "review retry",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-slot-0",
+		Branch:      "feat/existing",
+		PRNumber:    10,
+		StartedAt:   time.Now().Add(-1 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10", sess.PRNumber)
 	}
 }
 
@@ -1506,7 +1740,7 @@ func TestMergeReadyPR_BehindMainTriggersRebase(t *testing.T) {
 		ghMergePRFn: func(prNumber int) error {
 			return fmt.Errorf("gh pr merge 10: the head branch is not up to date with the base branch")
 		},
-		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
 			rebased = true
 			return nil
 		},
@@ -1546,7 +1780,7 @@ func TestMergeReadyPR_BehindMainRebaseFailsMarksConflict(t *testing.T) {
 		ghMergePRFn: func(prNumber int) error {
 			return fmt.Errorf("gh pr merge 10: the head branch is not up to date with the base branch")
 		},
-		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
 			return fmt.Errorf("rebase failed: conflict in main.go")
 		},
 	}
@@ -1577,6 +1811,51 @@ func TestMergeReadyPR_BehindMainRebaseFailsMarksConflict(t *testing.T) {
 	}
 }
 
+func TestHandleRebaseConflictRetry_SchedulesInPlaceRetry(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	o := &Orchestrator{cfg: cfg, notifier: &notify.Notifier{}}
+	s := state.NewState()
+	sess := &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "docs refresh",
+		Branch:      "feat/docs",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+		Backend:     "claude",
+	}
+	s.Sessions["slot-0"] = sess
+
+	o.handleRebaseConflictRetry(s, "slot-0", sess, 10, fmt.Errorf("CONFLICT (content): docs/FEATURES.md"))
+
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10", sess.PRNumber)
+	}
+	if sess.RetryCount != 1 {
+		t.Fatalf("RetryCount = %d, want 1", sess.RetryCount)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set")
+	}
+	if !sess.RebaseAttempted {
+		t.Fatal("RebaseAttempted should be true")
+	}
+	if sess.PreviousAttemptFeedbackKind != "rebase_conflict" {
+		t.Fatalf("PreviousAttemptFeedbackKind = %q, want rebase_conflict", sess.PreviousAttemptFeedbackKind)
+	}
+	if !strings.Contains(sess.PreviousAttemptFeedback, "docs/FEATURES.md") {
+		t.Fatalf("PreviousAttemptFeedback should include conflict details, got %q", sess.PreviousAttemptFeedback)
+	}
+}
+
 func TestMergeReadyPR_BehindMainNoAutoRebase(t *testing.T) {
 	rebased := false
 	o := &Orchestrator{
@@ -1585,7 +1864,7 @@ func TestMergeReadyPR_BehindMainNoAutoRebase(t *testing.T) {
 		ghMergePRFn: func(prNumber int) error {
 			return fmt.Errorf("gh pr merge 10: the head branch is not up to date with the base branch")
 		},
-		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
 			rebased = true
 			return nil
 		},
@@ -1622,7 +1901,7 @@ func TestMergeReadyPR_OtherMergeErrorNoRebase(t *testing.T) {
 		ghMergePRFn: func(prNumber int) error {
 			return fmt.Errorf("gh pr merge 10: some other error")
 		},
-		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles []string) error {
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
 			rebased = true
 			return nil
 		},
@@ -2190,6 +2469,9 @@ func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Or
 		hasOpenPRForIssueFn: func(issueNumber int) (bool, error) {
 			return false, nil
 		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		addIssueLabelFn: func(number int, label string) error {
 			labels = append(labels, fmt.Sprintf("#%d:%s", number, label))
 			return nil
@@ -2209,6 +2491,29 @@ func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Or
 			return slotName, nil
 		},
 	}, &started, &labels
+}
+
+func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	issues := []github.Issue{
+		makeIssue(283, "already merged issue"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.isIssueClosedFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 283, nil
+	}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 283,
+		Status:      state.StatusDone,
+	}
+
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started %d workers, want 0 for already closed issue", len(*started))
+	}
 }
 
 func TestStartNewWorkers_SkipsRetryExhaustedIssue(t *testing.T) {
@@ -3400,6 +3705,20 @@ func TestAvailableSlots_NonRunningLimitIgnoredForDispatch(t *testing.T) {
 	}
 }
 
+func TestPendingRetryReservations_CountsOnlyScheduledDeadRetries(t *testing.T) {
+	now := time.Now().UTC()
+	s := state.NewState()
+	s.Sessions["retry-due"] = &state.Session{Status: state.StatusDead, NextRetryAt: &now}
+	s.Sessions["retry-waiting"] = &state.Session{Status: state.StatusDead, NextRetryAt: &now}
+	s.Sessions["plain-dead"] = &state.Session{Status: state.StatusDead}
+	s.Sessions["running-with-retry"] = &state.Session{Status: state.StatusRunning, NextRetryAt: &now}
+
+	got := pendingRetryReservations(s)
+	if got != 2 {
+		t.Fatalf("pendingRetryReservations() = %d, want 2", got)
+	}
+}
+
 // --- blocker-aware dispatch tests ---
 
 func TestFindOpenBlockers_AllClosed(t *testing.T) {
@@ -3920,7 +4239,7 @@ func TestRespawnDueRetries_BackoffElapsed_Respawns(t *testing.T) {
 		Branch:      "feat/mae-12-112-test",
 	}
 
-	o.respawnDueRetries(s)
+	o.respawnDueRetries(s, 10)
 
 	if !respawned {
 		t.Fatal("expected worker to be respawned after backoff elapsed")
@@ -3931,6 +4250,120 @@ func TestRespawnDueRetries_BackoffElapsed_Respawns(t *testing.T) {
 	}
 	if sess.Status != state.StatusRunning {
 		t.Errorf("status = %q, want %q", sess.Status, state.StatusRunning)
+	}
+}
+
+func TestRespawnDueRetries_RespectsAvailableSlots(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	respawned := make([]string, 0)
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "test prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test issue"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawned = append(respawned, slotName)
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			return nil
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-1 * time.Second)
+	s := state.NewState()
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber: 112,
+		IssueTitle:  "first retry",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		Branch:      "feat/mae-12-112-test",
+	}
+	s.Sessions["mae-13"] = &state.Session{
+		IssueNumber: 113,
+		IssueTitle:  "second retry",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		Branch:      "feat/mae-13-113-test",
+	}
+
+	o.respawnDueRetries(s, 1)
+
+	if len(respawned) != 1 {
+		t.Fatalf("respawned %d workers, want 1", len(respawned))
+	}
+	if s.Sessions["mae-12"].Status != state.StatusRunning {
+		t.Fatalf("mae-12 status = %q, want %q", s.Sessions["mae-12"].Status, state.StatusRunning)
+	}
+	if s.Sessions["mae-13"].Status != state.StatusDead {
+		t.Fatalf("mae-13 status = %q, want %q", s.Sessions["mae-13"].Status, state.StatusDead)
+	}
+	if s.Sessions["mae-13"].NextRetryAt == nil {
+		t.Fatal("mae-13 NextRetryAt should remain set when no retry slot is available")
+	}
+}
+
+func TestRespawnDueRetries_WithOpenPRRespawnsInPlace(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	respawnedFresh := false
+	respawnedInPlace := false
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "test prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test issue"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedFresh = true
+			return nil
+		},
+		respawnInPlaceFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedInPlace = true
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			return nil
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-1 * time.Second)
+	s := state.NewState()
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber:             112,
+		IssueTitle:              "review retry",
+		Status:                  state.StatusDead,
+		RetryCount:              1,
+		NextRetryAt:             &pastTime,
+		Branch:                  "feat/mae-12-112-test",
+		Worktree:                "/tmp/maestro-mae-12",
+		PRNumber:                10,
+		PreviousAttemptFeedback: "review feedback",
+	}
+
+	o.respawnDueRetries(s, 1)
+
+	if !respawnedInPlace {
+		t.Fatal("expected in-place respawn for retry with open PR and worktree")
+	}
+	if respawnedFresh {
+		t.Fatal("fresh respawn should not be used for retry with open PR and worktree")
+	}
+	if s.Sessions["mae-12"].PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10", s.Sessions["mae-12"].PRNumber)
+	}
+	if s.Sessions["mae-12"].PreviousAttemptFeedback != "" {
+		t.Fatal("PreviousAttemptFeedback should be consumed before respawn")
 	}
 }
 
@@ -3960,7 +4393,7 @@ func TestRespawnDueRetries_BackoffNotElapsed_Waits(t *testing.T) {
 		Branch:      "feat/mae-13-113-test",
 	}
 
-	o.respawnDueRetries(s)
+	o.respawnDueRetries(s, 10)
 
 	if respawned {
 		t.Fatal("worker should NOT be respawned while backoff is still pending")
@@ -4001,7 +4434,7 @@ func TestRespawnDueRetries_RespawnFails_MarksAsFailed(t *testing.T) {
 		Branch:      "feat/mae-14-114-test",
 	}
 
-	o.respawnDueRetries(s)
+	o.respawnDueRetries(s, 10)
 
 	sess := s.Sessions["mae-14"]
 	if sess.Status != state.StatusFailed {
@@ -4440,7 +4873,7 @@ func TestRespawnDueRetries_CIFailureContext_IncludedInPrompt(t *testing.T) {
 		CIFailureOutput: "tests failed: FAIL main_test.go:15",
 	}
 
-	o.respawnDueRetries(s)
+	o.respawnDueRetries(s, 10)
 
 	if respawnedPrompt == "" {
 		t.Fatal("respawnWorkerFn should have been called")
@@ -4496,7 +4929,7 @@ func TestRespawnDueRetries_NoCIContext_NormalPrompt(t *testing.T) {
 		// No CIFailureOutput — normal dead worker retry
 	}
 
-	o.respawnDueRetries(s)
+	o.respawnDueRetries(s, 10)
 
 	if respawnedPrompt == "" {
 		t.Fatal("respawnWorkerFn should have been called")
@@ -4758,7 +5191,7 @@ func TestAppendReviewFeedbackContext_AddsSection(t *testing.T) {
 	if !strings.Contains(result, "You are a coding agent.") {
 		t.Error("result should contain original prompt base")
 	}
-	if !strings.Contains(result, "Code Review Findings (from Greptile)") {
+	if !strings.Contains(result, "Code Review Findings") {
 		t.Error("result should contain review feedback header")
 	}
 	if !strings.Contains(result, "enabled flag logic inverted") {
@@ -4819,7 +5252,7 @@ func TestRespawnDueRetries_ReviewFeedback_IncludedInPrompt(t *testing.T) {
 		PreviousAttemptFeedback: "Confidence 3/5\nP2: enabled flag inverted in bridge.rs",
 	}
 
-	o.respawnDueRetries(s)
+	o.respawnDueRetries(s, 10)
 
 	if respawnedPrompt == "" {
 		t.Fatal("respawnWorkerFn should have been called")
@@ -4827,11 +5260,11 @@ func TestRespawnDueRetries_ReviewFeedback_IncludedInPrompt(t *testing.T) {
 	if !strings.Contains(respawnedPrompt, "Previous CI Failure") {
 		t.Error("prompt should contain CI failure context")
 	}
-	if !strings.Contains(respawnedPrompt, "Code Review Findings (from Greptile)") {
+	if !strings.Contains(respawnedPrompt, "Code Review Findings") {
 		t.Error("prompt should contain review feedback section")
 	}
 	if !strings.Contains(respawnedPrompt, "enabled flag inverted") {
-		t.Error("prompt should contain actual Greptile feedback")
+		t.Error("prompt should contain actual review feedback")
 	}
 	if !strings.Contains(respawnedPrompt, "IMPORTANT: Address ALL code review findings") {
 		t.Error("prompt should contain instruction to fix review findings")
@@ -4844,6 +5277,69 @@ func TestRespawnDueRetries_ReviewFeedback_IncludedInPrompt(t *testing.T) {
 	}
 	if sess.PreviousAttemptFeedback != "" {
 		t.Errorf("PreviousAttemptFeedback should be cleared, got %q", sess.PreviousAttemptFeedback)
+	}
+}
+
+func TestRespawnDueRetries_RebaseConflict_IncludedInPrompt(t *testing.T) {
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRetriesPerIssue: 3,
+		MaxRetryBackoffMs:  300000,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	respawnedPrompt := ""
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "base prompt {{ISSUE_NUMBER}}",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: 42, Title: "test issue", Body: "fix this"}, nil
+		},
+		respawnInPlaceFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnedPrompt = promptBase
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-1 * time.Minute)
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber:                 42,
+		IssueTitle:                  "test issue",
+		Status:                      state.StatusDead,
+		RetryCount:                  1,
+		NextRetryAt:                 &retryAt,
+		Backend:                     "claude",
+		PRNumber:                    10,
+		Worktree:                    "/tmp/wt",
+		PreviousAttemptFeedback:     "CONFLICT (content): docs/FEATURES.md",
+		PreviousAttemptFeedbackKind: "rebase_conflict",
+	}
+
+	o.respawnDueRetries(s, 10)
+
+	if respawnedPrompt == "" {
+		t.Fatal("respawnInPlaceFn should have been called")
+	}
+	if !strings.Contains(respawnedPrompt, "Rebase Conflict") {
+		t.Error("prompt should contain rebase conflict section")
+	}
+	if !strings.Contains(respawnedPrompt, "docs/FEATURES.md") {
+		t.Error("prompt should contain conflict details")
+	}
+	if strings.Contains(respawnedPrompt, "Code Review Findings") {
+		t.Error("rebase conflict prompt should not be framed as review feedback")
+	}
+	sess := s.Sessions["slot-1"]
+	if sess.PreviousAttemptFeedback != "" {
+		t.Errorf("PreviousAttemptFeedback should be cleared, got %q", sess.PreviousAttemptFeedback)
+	}
+	if sess.PreviousAttemptFeedbackKind != "" {
+		t.Errorf("PreviousAttemptFeedbackKind should be cleared, got %q", sess.PreviousAttemptFeedbackKind)
 	}
 }
 
@@ -4885,7 +5381,7 @@ func TestRespawnDueRetries_NoReviewFeedback_OmitsSection(t *testing.T) {
 		PreviousAttemptFeedback: "", // no Greptile feedback
 	}
 
-	o.respawnDueRetries(s)
+	o.respawnDueRetries(s, 10)
 
 	if respawnedPrompt == "" {
 		t.Fatal("respawnWorkerFn should have been called")
@@ -4902,7 +5398,7 @@ func TestAutoMergePRs_CIFailure_CollectsReviewFeedback(t *testing.T) {
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
 	o, _, _ := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{10: "failure"})
 
-	// Override with Greptile feedback
+	// Override with review feedback
 	o.ghCollectPRReviewFeedbackFn = func(prNumber int) (string, error) {
 		return "Confidence 3/5 — Not safe to merge\nP2: null dereference on pool.interface", nil
 	}
@@ -4912,10 +5408,10 @@ func TestAutoMergePRs_CIFailure_CollectsReviewFeedback(t *testing.T) {
 
 	sess := s.Sessions["slot-0"]
 	if sess.PreviousAttemptFeedback == "" {
-		t.Fatal("PreviousAttemptFeedback should be set after CI failure with Greptile feedback")
+		t.Fatal("PreviousAttemptFeedback should be set after CI failure with review feedback")
 	}
 	if !strings.Contains(sess.PreviousAttemptFeedback, "null dereference") {
-		t.Errorf("PreviousAttemptFeedback should contain Greptile feedback, got %q", sess.PreviousAttemptFeedback)
+		t.Errorf("PreviousAttemptFeedback should contain review feedback, got %q", sess.PreviousAttemptFeedback)
 	}
 }
 
@@ -4926,7 +5422,7 @@ func TestAutoMergePRs_CIFailure_NoGreptileFeedback_FeedbackEmpty(t *testing.T) {
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
 	o, _, _ := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{10: "failure"})
 
-	// No Greptile feedback (returns empty)
+	// No review feedback (returns empty)
 	o.ghCollectPRReviewFeedbackFn = func(prNumber int) (string, error) {
 		return "", nil
 	}

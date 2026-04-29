@@ -16,11 +16,12 @@ type greptileCheckRun struct {
 }
 
 type greptileReviewComment struct {
-	Body     string `json:"body"`
-	Path     string `json:"path"`
-	Line     int    `json:"line"`
-	CommitID string `json:"commit_id"`
-	User     struct {
+	Body             string `json:"body"`
+	Path             string `json:"path"`
+	Line             int    `json:"line"`
+	CommitID         string `json:"commit_id"`
+	OriginalCommitID string `json:"original_commit_id"`
+	User             struct {
 		Login string `json:"login"`
 	} `json:"user"`
 }
@@ -336,8 +337,8 @@ func hasGreptileInlineCommentOnHead(comments []greptileReviewComment, sha string
 		if !isGreptileLogin(comment.User.Login) {
 			continue
 		}
-		if strings.TrimSpace(sha) != "" && strings.TrimSpace(comment.CommitID) != strings.TrimSpace(sha) {
-			continue // comment is on an older commit, skip
+		if !reviewCommentTargetsHead(comment, sha) {
+			continue
 		}
 		// Only block on P0 or P1 severity — P2/P3 are non-blocking
 		if isHighSeverity(comment.Body) {
@@ -345,6 +346,22 @@ func hasGreptileInlineCommentOnHead(comments []greptileReviewComment, sha string
 		}
 	}
 	return false
+}
+
+func reviewCommentTargetsHead(comment greptileReviewComment, sha string) bool {
+	head := strings.TrimSpace(sha)
+	if head == "" {
+		return true
+	}
+	original := strings.TrimSpace(comment.OriginalCommitID)
+	if original != "" {
+		return original == head
+	}
+	commit := strings.TrimSpace(comment.CommitID)
+	if commit == "" {
+		return true
+	}
+	return commit == head
 }
 
 // isHighSeverity checks if a review comment is P0 or P1 severity.
@@ -663,8 +680,8 @@ func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
 		if !strings.Contains(login, "greptile") && !strings.Contains(login, "codex") {
 			continue
 		}
-		// Skip comments on older commits — they may already be fixed
-		if headSHA != "" && strings.TrimSpace(cm.CommitID) != "" && strings.TrimSpace(cm.CommitID) != headSHA {
+		// Skip comments that were originally left on older commits — they may already be fixed.
+		if !reviewCommentTargetsHead(cm, headSHA) {
 			continue
 		}
 		result = append(result, ReviewComment{

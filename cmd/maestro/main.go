@@ -38,6 +38,7 @@ Usage:
 Commands:
   init          Interactive setup wizard for new projects
   run           Run the orchestration loop
+  serve         Run Mission Control read-only web dashboard/API
   status        Show current state
   logs          Show worker logs (tail -f)
   watch         Open tmux dashboard with live worker output
@@ -60,6 +61,11 @@ Run flags:
   --interval duration   Loop interval (default 10m)
   --once                Run once and exit
   --prompt string       Path to worker prompt base file
+
+Serve flags:
+  --host string         Host/interface to bind (default from config, then 127.0.0.1)
+  --port int            Port to bind (overrides server.port)
+  --read-only           Disable mutating HTTP endpoints (default true)
 
 Spawn flags:
   --issue int           Issue number to work on
@@ -151,6 +157,8 @@ func main() {
 		initCmd(args)
 	case "run":
 		runCmd(args)
+	case "serve":
+		serveCmd(args)
 	case "status":
 		statusCmd(args)
 	case "logs":
@@ -334,6 +342,48 @@ func runCmd(args []string) {
 		}(cfg)
 	}
 	wg.Wait()
+}
+
+func serveCmd(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file")
+	host := fs.String("host", "", "Host/interface to bind")
+	port := fs.Int("port", 0, "Port to bind")
+	readOnly := fs.Bool("read-only", true, "Disable mutating HTTP endpoints")
+	fs.Parse(args)
+
+	cfgs := loadConfigs(configs)
+	if len(cfgs) != 1 {
+		log.Fatalf("serve requires exactly one config, got %d", len(cfgs))
+	}
+	cfg := cfgs[0]
+	if strings.TrimSpace(*host) != "" {
+		cfg.Server.Host = *host
+	}
+	if *port > 0 {
+		cfg.Server.Port = *port
+	}
+	cfg.Server.ReadOnly = *readOnly
+	if cfg.Server.Port <= 0 {
+		log.Fatalf("serve requires server.port in config or --port")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	refreshCh := make(chan struct{}, 1)
+	log.Printf("serving dashboard — repo=%s addr=%s:%d read_only=%v", cfg.Repo, cfg.Server.Host, cfg.Server.Port, cfg.Server.ReadOnly)
+	if err := server.New(cfg, refreshCh).Start(ctx); err != nil {
+		log.Fatalf("serve: %v", err)
+	}
 }
 
 func statusCmd(args []string) {

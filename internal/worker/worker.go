@@ -336,6 +336,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// case Respawn is called from other paths.
 	sess.CIFailureOutput = ""
 	sess.PreviousAttemptFeedback = ""
+	sess.PreviousAttemptFeedbackKind = ""
 	sess.CheckpointFile = ""
 
 	return nil
@@ -447,7 +448,9 @@ func RemoveWorktree(localPath, worktreePath string) error {
 // both sides, continues the rebase, then force-pushes the branch.
 // autoResolveFiles is the list of file paths (relative to repo root) that may
 // be auto-resolved by keeping both sides; it comes from cfg.AutoResolveFiles.
-func RebaseWorktree(worktreePath, branch string, autoResolveFiles []string) error {
+// autoRestoreFiles is the list of dirty disposable paths that may be restored
+// before rebasing; it comes from cfg.AutoRestoreFiles.
+func RebaseWorktree(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
 	if strings.TrimSpace(worktreePath) == "" {
 		return fmt.Errorf("empty worktree path")
 	}
@@ -457,6 +460,14 @@ func RebaseWorktree(worktreePath, branch string, autoResolveFiles []string) erro
 
 	if _, err := runGit(worktreePath, "fetch", "origin"); err != nil {
 		return err
+	}
+	if err := restoreAllowedDirtyFiles(worktreePath, autoRestoreFiles); err != nil {
+		return err
+	}
+	if dirty, err := worktreeDirty(worktreePath); err != nil {
+		return err
+	} else if dirty != "" {
+		return fmt.Errorf("worktree has uncommitted changes after auto_restore_files; refusing rebase:\n%s", dirty)
 	}
 
 	if _, rebaseErr := runGit(worktreePath, "rebase", "origin/main"); rebaseErr != nil {
@@ -473,6 +484,82 @@ func RebaseWorktree(worktreePath, branch string, autoResolveFiles []string) erro
 	}
 
 	return nil
+}
+
+func restoreAllowedDirtyFiles(worktreePath string, autoRestoreFiles []string) error {
+	paths := normalizedGitPaths(autoRestoreFiles)
+	if len(paths) == 0 {
+		return nil
+	}
+	args := append([]string{"status", "--porcelain", "--"}, paths...)
+	dirty, err := runGit(worktreePath, args...)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(dirty) == "" {
+		return nil
+	}
+
+	log.Printf("[worker] restoring allowed dirty files before rebase in %s: %s", worktreePath, strings.Join(paths, ", "))
+	trackedPaths, err := trackedGitPaths(worktreePath, paths)
+	if err != nil {
+		return err
+	}
+	if len(trackedPaths) > 0 {
+		args = append([]string{"restore", "--"}, trackedPaths...)
+		if _, err := runGit(worktreePath, args...); err != nil {
+			return err
+		}
+	}
+	args = append([]string{"clean", "-fd", "--"}, paths...)
+	if _, err := runGit(worktreePath, args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func trackedGitPaths(worktreePath string, paths []string) ([]string, error) {
+	args := append([]string{"ls-files", "--"}, paths...)
+	out, err := runGit(worktreePath, args...)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(out, "\n")
+	tracked := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		tracked = append(tracked, toSlash(line))
+	}
+	return tracked, nil
+}
+
+func worktreeDirty(worktreePath string) (string, error) {
+	out, err := runGit(worktreePath, "status", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func normalizedGitPaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	normalized := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		path = toSlash(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		normalized = append(normalized, path)
+	}
+	return normalized
 }
 
 func runGit(worktreePath string, args ...string) (string, error) {

@@ -33,36 +33,37 @@ const (
 )
 
 type Session struct {
-	IssueNumber             int           `json:"issue_number"`
-	IssueTitle              string        `json:"issue_title"`
-	Worktree                string        `json:"worktree"`
-	Branch                  string        `json:"branch"`
-	PID                     int           `json:"pid"`
-	TmuxSession             string        `json:"tmux_session,omitempty"`
-	LogFile                 string        `json:"log_file"`
-	StartedAt               time.Time     `json:"started_at"`
-	FinishedAt              *time.Time    `json:"finished_at,omitempty"`
-	Status                  SessionStatus `json:"status"`
-	PRNumber                int           `json:"pr_number,omitempty"`
-	Backend                 string        `json:"backend,omitempty"` // "claude", "codex", etc.
-	LongRunning             bool          `json:"long_running,omitempty"`
-	RebaseAttempted         bool          `json:"rebase_attempted,omitempty"`
-	NotifiedCIFail          bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
-	LastNotifiedStatus      string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
-	RetryCount              int           `json:"retry_count,omitempty"`          // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
-	NextRetryAt             *time.Time    `json:"next_retry_at,omitempty"`
-	LastOutputHash          string        `json:"last_output_hash,omitempty"`
-	LastOutputChangedAt     time.Time     `json:"last_output_changed_at,omitempty"`
-	TokensUsedAttempt       int           `json:"tokens_used_attempt,omitempty"`       // tokens consumed in current attempt (reset on respawn)
-	TokensUsedTotal         int           `json:"tokens_used_total,omitempty"`         // cumulative tokens across the issue lifecycle
-	RateLimitHit            bool          `json:"rate_limit_hit,omitempty"`            // true if worker was rate-limited (tmux detection, running worker)
-	TriedBackends           []string      `json:"tried_backends,omitempty"`            // backends already attempted (for rate-limit fallback)
-	Phase                   Phase         `json:"phase,omitempty"`                     // current pipeline phase (empty = legacy single-phase)
-	ValidationFails         int           `json:"validation_fails,omitempty"`          // number of failed validation attempts
-	ValidationFeedback      string        `json:"validation_feedback,omitempty"`       // feedback from last failed validation
-	CIFailureOutput         string        `json:"ci_failure_output,omitempty"`         // CI failure output captured before retry (passed to next worker as context)
-	PreviousAttemptFeedback string        `json:"previous_attempt_feedback,omitempty"` // Greptile review feedback from previous failed PR attempt
-	CheckpointFile          string        `json:"checkpoint_file,omitempty"`           // path to CHECKPOINT.md saved at soft token threshold
+	IssueNumber                 int           `json:"issue_number"`
+	IssueTitle                  string        `json:"issue_title"`
+	Worktree                    string        `json:"worktree"`
+	Branch                      string        `json:"branch"`
+	PID                         int           `json:"pid"`
+	TmuxSession                 string        `json:"tmux_session,omitempty"`
+	LogFile                     string        `json:"log_file"`
+	StartedAt                   time.Time     `json:"started_at"`
+	FinishedAt                  *time.Time    `json:"finished_at,omitempty"`
+	Status                      SessionStatus `json:"status"`
+	PRNumber                    int           `json:"pr_number,omitempty"`
+	Backend                     string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	LongRunning                 bool          `json:"long_running,omitempty"`
+	RebaseAttempted             bool          `json:"rebase_attempted,omitempty"`
+	NotifiedCIFail              bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
+	LastNotifiedStatus          string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
+	RetryCount                  int           `json:"retry_count,omitempty"`          // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
+	NextRetryAt                 *time.Time    `json:"next_retry_at,omitempty"`
+	LastOutputHash              string        `json:"last_output_hash,omitempty"`
+	LastOutputChangedAt         time.Time     `json:"last_output_changed_at,omitempty"`
+	TokensUsedAttempt           int           `json:"tokens_used_attempt,omitempty"`            // tokens consumed in current attempt (reset on respawn)
+	TokensUsedTotal             int           `json:"tokens_used_total,omitempty"`              // cumulative tokens across the issue lifecycle
+	RateLimitHit                bool          `json:"rate_limit_hit,omitempty"`                 // true if worker was rate-limited (tmux detection, running worker)
+	TriedBackends               []string      `json:"tried_backends,omitempty"`                 // backends already attempted (for rate-limit fallback)
+	Phase                       Phase         `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
+	ValidationFails             int           `json:"validation_fails,omitempty"`               // number of failed validation attempts
+	ValidationFeedback          string        `json:"validation_feedback,omitempty"`            // feedback from last failed validation
+	CIFailureOutput             string        `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)
+	PreviousAttemptFeedback     string        `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
+	PreviousAttemptFeedbackKind string        `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
+	CheckpointFile              string        `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
 }
 
 // UnmarshalJSON implements custom unmarshalling to preserve the legacy
@@ -199,6 +200,16 @@ func (s *State) IssueInProgress(issueNum int) bool {
 		}
 		// Dead session with pending retry — still in progress
 		if sess.Status == StatusDead && sess.NextRetryAt != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// IssueDone returns true if the given issue already has a completed session.
+func (s *State) IssueDone(issueNum int) bool {
+	for _, sess := range s.Sessions {
+		if sess.IssueNumber == issueNum && sess.Status == StatusDone {
 			return true
 		}
 	}
