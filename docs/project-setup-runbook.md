@@ -141,6 +141,30 @@ exclude_labels:
   - duplicate
   - invalid
 
+# Supervisor policy (optional)
+supervisor:
+  enabled: true
+  mode: cautious
+  ready_label: maestro-ready
+  blocked_label: blocked
+  excluded_labels:
+    - epic
+    - meta
+  ordered_queue:
+    enabled: true
+    issues:
+      - 308
+      - 306
+  safe_actions:
+    - add_ready_label
+    - remove_blocked_label
+    - add_issue_comment
+  approval_required:
+    - merge_pr
+    - close_issue
+    - delete_worktree
+    - change_global_config
+
 # Concurrency
 max_parallel: 5
 max_runtime_minutes: 120
@@ -170,10 +194,13 @@ telegram:
 | `worktree_base` | Directory where maestro creates per-worker worktrees |
 | `issue_labels` | Only pick issues with at least one of these labels (OR semantics) |
 | `exclude_labels` | Skip issues with any of these labels |
+| `supervisor` | Optional local policy for supervisor queue order, safe actions, and issue-type skips |
 | `max_parallel` | Maximum concurrent worker sessions |
 | `deploy_cmd` | Shell command maestro runs after merging a PR |
 | `session_prefix` | Prefix for tmux session names |
 | `worker_prompt` | Path to the worker prompt template file |
+
+Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch.
 
 ### Optional: versioning config
 

@@ -26,6 +26,12 @@ const (
 	RiskSafe          = "safe"
 	RiskMutating      = "mutating"
 	RiskApprovalGated = "approval_gated"
+
+	PolicyRuleRuntimeState   = "runtime_state"
+	PolicyRuleOpenIssues     = "open_issues"
+	PolicyRuleIssueLabels    = "issue_labels"
+	PolicyRuleOrderedQueue   = "supervisor.ordered_queue"
+	PolicyRuleExcludedLabels = "supervisor.excluded_labels"
 )
 
 // Reader is the read-only GitHub surface used by the supervisor engine.
@@ -82,6 +88,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 	baseReasons := []string{
 		fmt.Sprintf("State has %d session(s)", projectState.Sessions),
 		fmt.Sprintf("%d active session(s) count against %d max parallel slot(s)", len(st.ActiveSessions()), e.cfg.MaxParallel),
+		e.policySummaryReason(),
 	}
 
 	prs, err := e.reader.ListOpenPRs()
@@ -97,7 +104,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		)
 		return e.decision(now, projectState, ActionMonitorOpenPR,
 			fmt.Sprintf("Session %s already has open PR #%d; monitor review, CI, or merge readiness.", slot, pr.Number),
-			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, reasons), nil
+			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons), nil
 	}
 
 	if slot, sess, ok := runningSession(st); ok {
@@ -107,7 +114,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		)
 		return e.decision(now, projectState, ActionWaitForRunningWorker,
 			fmt.Sprintf("Worker %s is still running for issue #%d.", slot, sess.IssueNumber),
-			RiskSafe, 0.88, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, reasons), nil
+			RiskSafe, 0.88, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons), nil
 	}
 
 	if slot, sess, ok := retryExhaustedSession(st); ok {
@@ -117,7 +124,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		)
 		return e.decision(now, projectState, ActionReviewRetryExhausted,
 			fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
-			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, reasons), nil
+			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons), nil
 	}
 
 	issues, err := e.reader.ListOpenIssues(nil)
@@ -126,10 +133,15 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 	}
 	projectState.OpenIssues = len(issues)
 
-	eligible, skipped, err := e.eligibleIssues(st, issues, true)
+	candidates, policySkipped, policyRule, err := e.policyCandidateIssues(st, issues)
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
+	eligible, skipped, err := e.eligibleIssues(st, candidates, true)
+	if err != nil {
+		return state.SupervisorDecision{}, err
+	}
+	skipped = append(policySkipped, skipped...)
 
 	if len(eligible) > 0 {
 		issue := eligible[0]
@@ -139,7 +151,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			)
 			return e.decision(now, projectState, ActionWaitForCapacity,
 				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
-				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, reasons), nil
+				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons), nil
 		}
 
 		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
@@ -153,32 +165,36 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 			)
 			return e.decision(now, projectState, ActionMonitorOpenPR,
 				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
-				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, reasons), nil
+				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons), nil
 		}
 
 		reasons := appendReasons(baseReasons,
-			issueLabelReason(e.cfg.IssueLabels),
+			issueLabelReason(e.requiredIssueLabels()),
 			fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
 			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 		)
 		return e.decision(now, projectState, ActionSpawnWorker,
 			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
-			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, reasons), nil
+			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons), nil
 	}
 
-	if len(e.cfg.IssueLabels) > 0 {
-		unlabeled, err := e.firstIssueMissingRequiredLabel(st, issues)
+	if labels := e.requiredIssueLabels(); len(labels) > 0 {
+		unlabeled, err := e.firstIssueMissingRequiredLabel(st, candidates)
 		if err != nil {
 			return state.SupervisorDecision{}, err
 		}
 		if unlabeled != nil {
 			reasons := appendReasons(baseReasons,
-				issueLabelReason(e.cfg.IssueLabels),
+				issueLabelReason(labels),
 				fmt.Sprintf("Issue #%d is open but does not have a configured ready label", unlabeled.Number),
 			)
+			risk := RiskMutating
+			if e.cfg.Supervisor.AllowsSafeAction(config.SupervisorActionAddReadyLabel) {
+				risk = RiskSafe
+			}
 			return e.decision(now, projectState, ActionLabelIssueReady,
 				fmt.Sprintf("No eligible issues because none have the configured ready label; issue #%d is next in the open queue.", unlabeled.Number),
-				RiskMutating, 0.82, &state.SupervisorTarget{Issue: unlabeled.Number}, reasons), nil
+				risk, 0.82, &state.SupervisorTarget{Issue: unlabeled.Number}, policyRule, reasons), nil
 		}
 	}
 
@@ -190,15 +206,17 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		reasons = append(reasons, reason)
 	}
 	return e.decision(now, projectState, ActionNone,
-		"No action is currently recommended.", RiskSafe, 0.8, nil, reasons), nil
+		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons), nil
 }
 
-func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, reasons []string) state.SupervisorDecision {
+func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
+	reasons = appendReasons(reasons, policyRuleReason(policyRule))
 	return state.SupervisorDecision{
 		ID:                "sup-" + now.Format("20060102T150405.000000000Z"),
 		CreatedAt:         now,
 		Project:           e.cfg.Repo,
 		Mode:              ModeReadOnly,
+		PolicyRule:        policyRule,
 		Summary:           summary,
 		RecommendedAction: action,
 		Target:            target,
@@ -221,11 +239,67 @@ func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {
 	}
 }
 
+func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) ([]github.Issue, []string, string, error) {
+	if !e.cfg.Supervisor.OrderedQueueActive() {
+		return issues, nil, e.defaultPolicyRule(), nil
+	}
+	if err := validateOrderedQueueIssues(e.cfg.Supervisor.OrderedQueue.Issues); err != nil {
+		return nil, nil, "", err
+	}
+	issueByNumber := make(map[int]github.Issue, len(issues))
+	for _, issue := range issues {
+		issueByNumber[issue.Number] = issue
+	}
+	var skipped []string
+	for _, issueNumber := range e.cfg.Supervisor.OrderedQueue.Issues {
+		if st.IssueDone(issueNumber) {
+			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by supervisor.ordered_queue: already completed in state", issueNumber))
+			continue
+		}
+		closed, err := e.reader.IsIssueClosed(issueNumber)
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("check ordered queue issue #%d: %w", issueNumber, err)
+		}
+		if closed {
+			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by supervisor.ordered_queue: issue is closed", issueNumber))
+			continue
+		}
+		issue, ok := issueByNumber[issueNumber]
+		if !ok {
+			return nil, append(skipped, fmt.Sprintf("Issue #%d is first unfinished in supervisor.ordered_queue but was not returned by open issue listing", issueNumber)), PolicyRuleOrderedQueue, nil
+		}
+		return []github.Issue{issue}, skipped, PolicyRuleOrderedQueue, nil
+	}
+	return nil, append(skipped, "No unfinished issue remains in supervisor.ordered_queue"), PolicyRuleOrderedQueue, nil
+}
+
+func validateOrderedQueueIssues(issues []int) error {
+	seen := make(map[int]struct{}, len(issues))
+	for i, issueNumber := range issues {
+		if issueNumber <= 0 {
+			return fmt.Errorf("supervisor ordered_queue issue at index %d must be a positive issue number", i)
+		}
+		if _, ok := seen[issueNumber]; ok {
+			return fmt.Errorf("supervisor ordered_queue issue at index %d duplicates issue #%d", i, issueNumber)
+		}
+		seen[issueNumber] = struct{}{}
+	}
+	return nil
+}
+
+func (e *Engine) defaultPolicyRule() string {
+	if len(e.requiredIssueLabels()) > 0 {
+		return PolicyRuleIssueLabels
+	}
+	return PolicyRuleOpenIssues
+}
+
 func (e *Engine) eligibleIssues(st *state.State, issues []github.Issue, requireLabels bool) ([]github.Issue, []string, error) {
 	var eligible []github.Issue
 	var skipped []string
+	requiredLabels := e.requiredIssueLabels()
 	for _, issue := range issues {
-		if requireLabels && !matchesRequiredLabels(issue, e.cfg.IssueLabels) {
+		if requireLabels && !matchesRequiredLabels(issue, requiredLabels) {
 			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped: missing configured ready label", issue.Number))
 			continue
 		}
@@ -243,9 +317,10 @@ func (e *Engine) eligibleIssues(st *state.State, issues []github.Issue, requireL
 }
 
 func (e *Engine) firstIssueMissingRequiredLabel(st *state.State, issues []github.Issue) (*github.Issue, error) {
+	requiredLabels := e.requiredIssueLabels()
 	for i := range issues {
 		issue := &issues[i]
-		if matchesRequiredLabels(*issue, e.cfg.IssueLabels) {
+		if matchesRequiredLabels(*issue, requiredLabels) {
 			continue
 		}
 		reason, err := e.issueSkipReason(st, *issue)
@@ -280,6 +355,12 @@ func (e *Engine) issueSkipReason(st *state.State, issue github.Issue) (string, e
 	}
 	if github.HasLabel(issue, e.cfg.ExcludeLabels) {
 		return "excluded by configured label", nil
+	}
+	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel}) {
+		return "blocked by supervisor policy label", nil
+	}
+	if github.HasLabel(issue, e.policyExcludedLabels()) {
+		return "excluded by supervisor policy label", nil
 	}
 	if len(e.cfg.BlockerPatterns) > 0 {
 		blockers := github.FindBlockers(issue.Body, e.cfg.BlockerPatterns)
@@ -397,6 +478,60 @@ func matchesRequiredLabels(issue github.Issue, labels []string) bool {
 		return true
 	}
 	return github.HasLabel(issue, labels)
+}
+
+func (e *Engine) requiredIssueLabels() []string {
+	labels := append([]string(nil), e.cfg.IssueLabels...)
+	readyLabel := strings.TrimSpace(e.cfg.Supervisor.ReadyLabel)
+	if readyLabel == "" {
+		return labels
+	}
+	for _, label := range labels {
+		if strings.EqualFold(label, readyLabel) {
+			return labels
+		}
+	}
+	return append(labels, readyLabel)
+}
+
+func (e *Engine) policySummaryReason() string {
+	mode := strings.TrimSpace(e.cfg.Supervisor.Mode)
+	if mode == "" {
+		mode = "cautious"
+	}
+	parts := []string{
+		fmt.Sprintf("mode=%s", mode),
+	}
+	if e.cfg.Supervisor.Enabled {
+		parts = append(parts, "enabled=true")
+	}
+	if e.cfg.Supervisor.OrderedQueueActive() {
+		parts = append(parts, fmt.Sprintf("ordered_queue=%d issue(s)", len(e.cfg.Supervisor.OrderedQueue.Issues)))
+	}
+	if excludedLabels := e.policyExcludedLabels(); len(excludedLabels) > 0 {
+		parts = append(parts, "excluded_labels="+strings.Join(excludedLabels, ","))
+	}
+	if len(e.cfg.Supervisor.SafeActions) > 0 {
+		parts = append(parts, "safe_actions="+strings.Join(e.cfg.Supervisor.SafeActions, ","))
+	}
+	if len(e.cfg.Supervisor.ApprovalRequired) > 0 {
+		parts = append(parts, "approval_required="+strings.Join(e.cfg.Supervisor.ApprovalRequired, ","))
+	}
+	return "Supervisor policy: " + strings.Join(parts, "; ")
+}
+
+func (e *Engine) policyExcludedLabels() []string {
+	if e.cfg.Supervisor.ExcludedLabels == nil && len(e.cfg.Supervisor.AllowIssueTypes) == 0 {
+		return []string{"epic", "meta"}
+	}
+	return e.cfg.Supervisor.ExcludedLabels
+}
+
+func policyRuleReason(policyRule string) string {
+	if strings.TrimSpace(policyRule) == "" {
+		return ""
+	}
+	return "Policy rule: " + policyRule
 }
 
 func issueLabelReason(labels []string) string {

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -832,6 +833,10 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	if !strSliceEqual(newCfg.ExcludeLabels, old.ExcludeLabels) {
 		changed = append(changed, fmt.Sprintf("exclude_labels: %v→%v", old.ExcludeLabels, newCfg.ExcludeLabels))
 		o.cfg.ExcludeLabels = newCfg.ExcludeLabels
+	}
+	if !reflect.DeepEqual(newCfg.Supervisor, old.Supervisor) {
+		changed = append(changed, "supervisor policy")
+		o.cfg.Supervisor = newCfg.Supervisor
 	}
 	if newCfg.MergeStrategy != old.MergeStrategy {
 		changed = append(changed, fmt.Sprintf("merge_strategy: %s→%s", old.MergeStrategy, newCfg.MergeStrategy))

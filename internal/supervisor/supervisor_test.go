@@ -231,3 +231,149 @@ func TestRunOnceRecordsDecision(t *testing.T) {
 		t.Fatalf("latest ID = %q, want %q", latest.ID, decision.ID)
 	}
 }
+
+func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(306, "second wave", "maestro-ready"),
+		testIssue(308, "first wave", "maestro-ready"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 308 {
+		t.Fatalf("target = %#v, want issue 308", decision.Target)
+	}
+	if decision.PolicyRule != PolicyRuleOrderedQueue {
+		t.Fatalf("PolicyRule = %q, want %q", decision.PolicyRule, PolicyRuleOrderedQueue)
+	}
+}
+
+func TestDecide_OrderedQueueSkipsCompletedIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(306, "second wave", "maestro-ready"),
+		testIssue(308, "done wave", "maestro-ready"),
+	}}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 308, Status: state.StatusDone, StartedAt: time.Now().UTC()}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 306 {
+		t.Fatalf("target = %#v, want issue 306", decision.Target)
+	}
+}
+
+func TestDecide_OrderedQueueMissingLabelTargetsQueueHead(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(306, "ready later", "maestro-ready"),
+		testIssue(308, "missing label"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionLabelIssueReady {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionLabelIssueReady)
+	}
+	if decision.Target == nil || decision.Target.Issue != 308 {
+		t.Fatalf("target = %#v, want issue 308", decision.Target)
+	}
+}
+
+func TestDecide_SupervisorExcludedLabelsSkipIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.ExcludedLabels = []string{"epic"}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "epic", "maestro-ready", "epic"),
+		testIssue(2, "regular", "maestro-ready"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+}
+
+func TestDecide_SupervisorBlockedLabelSkipsIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.BlockedLabel = "blocked"
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "blocked", "maestro-ready", "blocked"),
+		testIssue(2, "regular", "maestro-ready"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+}
+
+func TestDecide_ConfigExcludeLabelsStillHonored(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "blocked", "maestro-ready", "blocked"),
+		testIssue(2, "regular", "maestro-ready"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+}
+
+func TestDecide_SupervisorReadyLabelActsAsRequiredLabel(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Supervisor.ReadyLabel = "maestro-ready"
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "missing"),
+		testIssue(2, "ready", "maestro-ready"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+	if decision.PolicyRule != PolicyRuleIssueLabels {
+		t.Fatalf("PolicyRule = %q, want %q", decision.PolicyRule, PolicyRuleIssueLabels)
+	}
+}

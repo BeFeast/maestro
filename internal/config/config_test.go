@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -1351,5 +1352,139 @@ worker_soft_token_threshold: 0
 	}
 	if cfg.SoftTokenThreshold() != 0 {
 		t.Errorf("SoftTokenThreshold() = %f, want 0 (disabled)", cfg.SoftTokenThreshold())
+	}
+}
+
+func TestParse_SupervisorPolicySection(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  enabled: true
+  mode: cautious
+  ready_label: maestro-ready
+  blocked_label: blocked
+  excluded_labels:
+    - epic
+    - meta
+  ordered_queue:
+    enabled: true
+    issues:
+      - 308
+      - 306
+  safe_actions:
+    - add_ready_label
+    - remove_blocked_label
+    - add_issue_comment
+  approval_required:
+    - merge_pr
+    - close_issue
+    - delete_worktree
+    - change_global_config
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Supervisor.Enabled {
+		t.Fatal("Supervisor.Enabled should be true")
+	}
+	if cfg.Supervisor.ReadyLabel != "maestro-ready" {
+		t.Errorf("ReadyLabel = %q, want maestro-ready", cfg.Supervisor.ReadyLabel)
+	}
+	if !cfg.Supervisor.OrderedQueueActive() {
+		t.Fatal("OrderedQueueActive() should be true")
+	}
+	if got := cfg.Supervisor.OrderedQueue.Issues; len(got) != 2 || got[0] != 308 || got[1] != 306 {
+		t.Fatalf("OrderedQueue.Issues = %v, want [308 306]", got)
+	}
+	if !cfg.Supervisor.AllowsSafeAction(SupervisorActionAddReadyLabel) {
+		t.Error("safe_actions should include add_ready_label")
+	}
+}
+
+func TestParse_SupervisorDefaultExcludesEpicMeta(t *testing.T) {
+	cfg, err := parse([]byte("repo: owner/repo\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"epic", "meta"}
+	if len(cfg.Supervisor.ExcludedLabels) != len(want) {
+		t.Fatalf("Supervisor.ExcludedLabels = %v, want %v", cfg.Supervisor.ExcludedLabels, want)
+	}
+	for i := range want {
+		if cfg.Supervisor.ExcludedLabels[i] != want[i] {
+			t.Errorf("Supervisor.ExcludedLabels[%d] = %q, want %q", i, cfg.Supervisor.ExcludedLabels[i], want[i])
+		}
+	}
+}
+
+func TestParse_SupervisorExplicitEmptyExcludedLabelsAllowsEpics(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  excluded_labels: []
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(cfg.Supervisor.ExcludedLabels) != 0 {
+		t.Fatalf("Supervisor.ExcludedLabels = %v, want empty", cfg.Supervisor.ExcludedLabels)
+	}
+}
+
+func TestParse_SupervisorInvalidIssueNumber(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ordered_queue:
+    issues:
+      - 308
+      - 0
+`
+	_, err := parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("parse succeeded, want invalid issue number error")
+	}
+	if !strings.Contains(err.Error(), "supervisor.ordered_queue.issues[1]") {
+		t.Fatalf("error = %v, want supervisor ordered queue index", err)
+	}
+}
+
+func TestLoadFrom_LoadsColocatedSupervisorPolicyFile(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "maestro.yaml")
+	policyDir := filepath.Join(dir, ".maestro")
+	if err := os.Mkdir(policyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("repo: owner/repo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	policy := []byte(`
+supervisor:
+  enabled: true
+  ready_label: maestro-ready
+  ordered_queue:
+    issues:
+      - 262
+`)
+	policyPath := filepath.Join(policyDir, "supervisor.yaml")
+	if err := os.WriteFile(policyPath, policy, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.Supervisor.PolicyPath != policyPath {
+		t.Fatalf("Supervisor.PolicyPath = %q, want %q", cfg.Supervisor.PolicyPath, policyPath)
+	}
+	if cfg.Supervisor.ReadyLabel != "maestro-ready" {
+		t.Fatalf("Supervisor.ReadyLabel = %q, want maestro-ready", cfg.Supervisor.ReadyLabel)
+	}
+	if got := cfg.Supervisor.OrderedQueue.Issues; len(got) != 1 || got[0] != 262 {
+		t.Fatalf("OrderedQueue.Issues = %v, want [262]", got)
 	}
 }
