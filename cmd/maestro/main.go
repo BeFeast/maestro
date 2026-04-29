@@ -543,6 +543,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	fmt.Printf("Session prefix: %s\n", cfg.SessionPrefix)
 	fmt.Printf("State file:     %s\n", state.StatePath(cfg.StateDir))
 	fmt.Printf("Max parallel:   %d\n", cfg.MaxParallel)
+	showSupervisorPolicy(cfg)
 	if len(cfg.MaxConcurrentByState) > 0 {
 		// Sort keys for stable output
 		stateNames := make([]string, 0, len(cfg.MaxConcurrentByState))
@@ -690,6 +691,40 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 			}
 		}
 	}
+}
+
+func showSupervisorPolicy(cfg *config.Config) {
+	mode := strings.TrimSpace(cfg.Supervisor.Mode)
+	if mode == "" {
+		mode = "cautious"
+	}
+	fmt.Printf("Supervisor:     mode=%s enabled=%v\n", mode, cfg.Supervisor.Enabled)
+	if cfg.Supervisor.PolicyPath != "" {
+		fmt.Printf("Policy file:    %s\n", cfg.Supervisor.PolicyPath)
+	}
+	if cfg.Supervisor.ReadyLabel != "" || cfg.Supervisor.BlockedLabel != "" {
+		fmt.Printf("Policy labels:  ready=%s blocked=%s\n", valueOrDash(cfg.Supervisor.ReadyLabel), valueOrDash(cfg.Supervisor.BlockedLabel))
+	}
+	if len(cfg.Supervisor.ExcludedLabels) > 0 {
+		fmt.Printf("Policy exclude: %s\n", strings.Join(cfg.Supervisor.ExcludedLabels, ", "))
+	}
+	if cfg.Supervisor.OrderedQueueActive() {
+		fmt.Printf("Policy queue:   ordered (%d issue(s))\n", len(cfg.Supervisor.OrderedQueue.Issues))
+	}
+	if len(cfg.Supervisor.SafeActions) > 0 {
+		fmt.Printf("Safe actions:   %s\n", strings.Join(cfg.Supervisor.SafeActions, ", "))
+	}
+	if len(cfg.Supervisor.ApprovalRequired) > 0 {
+		fmt.Printf("Approval req.:  %s\n", strings.Join(cfg.Supervisor.ApprovalRequired, ", "))
+	}
+}
+
+func valueOrDash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func logsCmd(args []string) {

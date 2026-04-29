@@ -124,6 +124,7 @@ type SupervisorDecision struct {
 	CreatedAt         time.Time              `json:"created_at"`
 	Project           string                 `json:"project"`
 	Mode              string                 `json:"mode"`
+	PolicyRule        string                 `json:"policy_rule,omitempty"`
 	Summary           string                 `json:"summary"`
 	RecommendedAction string                 `json:"recommended_action"`
 	Target            *SupervisorTarget      `json:"target,omitempty"`

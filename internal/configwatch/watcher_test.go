@@ -143,3 +143,38 @@ func TestWatch_MissingConfigOnReload(t *testing.T) {
 		// Expected
 	}
 }
+
+func TestWatch_DetectsSupervisorPolicyChange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "maestro.yaml")
+	policyDir := filepath.Join(dir, ".maestro")
+	if err := os.Mkdir(policyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("repo: owner/repo\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(policyDir, "supervisor.yaml")
+	if err := os.WriteFile(policyPath, []byte("ready_label: old-ready\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := Watch(ctx, path, 100*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+
+	if err := os.WriteFile(policyPath, []byte("ready_label: maestro-ready\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case cfg := <-ch:
+		if cfg.Supervisor.ReadyLabel != "maestro-ready" {
+			t.Errorf("Supervisor.ReadyLabel = %q, want maestro-ready", cfg.Supervisor.ReadyLabel)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for supervisor policy reload")
+	}
+}

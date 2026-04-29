@@ -47,6 +47,70 @@ type GitHubProjectsConfig struct {
 	ProjectNumber int  `yaml:"project_number"` // GitHub Project number (auto-detect from repo)
 }
 
+const (
+	SupervisorActionAddReadyLabel      = "add_ready_label"
+	SupervisorActionRemoveBlockedLabel = "remove_blocked_label"
+	SupervisorActionAddIssueComment    = "add_issue_comment"
+	SupervisorActionMergePR            = "merge_pr"
+	SupervisorActionCloseIssue         = "close_issue"
+	SupervisorActionDeleteWorktree     = "delete_worktree"
+	SupervisorActionChangeGlobalConfig = "change_global_config"
+)
+
+// SupervisorConfig defines local policy for supervisor decisions.
+type SupervisorConfig struct {
+	Enabled          bool                         `yaml:"enabled" json:"enabled"`
+	Mode             string                       `yaml:"mode" json:"mode"`
+	ReadyLabel       string                       `yaml:"ready_label" json:"ready_label,omitempty"`
+	BlockedLabel     string                       `yaml:"blocked_label" json:"blocked_label,omitempty"`
+	ExcludedLabels   []string                     `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
+	AllowIssueTypes  []string                     `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
+	OrderedQueue     SupervisorOrderedQueueConfig `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
+	SafeActions      []string                     `yaml:"safe_actions" json:"safe_actions,omitempty"`
+	ApprovalRequired []string                     `yaml:"approval_required" json:"approval_required,omitempty"`
+	PolicyPath       string                       `yaml:"-" json:"policy_path,omitempty"`
+
+	excludedLabelsSet bool
+}
+
+// SupervisorOrderedQueueConfig pins supervisor selection to a fixed issue order.
+type SupervisorOrderedQueueConfig struct {
+	Enabled bool  `yaml:"enabled" json:"enabled"`
+	Issues  []int `yaml:"issues" json:"issues,omitempty"`
+}
+
+func (s *SupervisorConfig) UnmarshalYAML(value *yaml.Node) error {
+	type rawSupervisorConfig SupervisorConfig
+	var raw rawSupervisorConfig
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*s = SupervisorConfig(raw)
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "excluded_labels" {
+				s.excludedLabelsSet = true
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func (s SupervisorConfig) OrderedQueueActive() bool {
+	return s.OrderedQueue.Enabled || len(s.OrderedQueue.Issues) > 0
+}
+
+func (s SupervisorConfig) AllowsSafeAction(action string) bool {
+	action = normalizePolicyToken(action)
+	for _, configured := range s.SafeActions {
+		if configured == action {
+			return true
+		}
+	}
+	return false
+}
+
 // RoutingConfig controls automatic backend selection via LLM router.
 type RoutingConfig struct {
 	Mode            string `yaml:"mode"`              // "auto", "manual" (labels only)
@@ -158,6 +222,7 @@ type Config struct {
 	Telegram                   TelegramConfig       `yaml:"telegram"`
 	Versioning                 VersioningConfig     `yaml:"versioning"`
 	GitHubProjects             GitHubProjectsConfig `yaml:"github_projects"`
+	Supervisor                 SupervisorConfig     `yaml:"supervisor"`
 	MaxRetryBackoffMs          int                  `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	AutoRestoreFiles           []string             `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase
@@ -181,6 +246,9 @@ func LoadFrom(path string) (*Config, error) {
 		return nil, err
 	}
 	cfg.SourcePath = path
+	if err := loadSupervisorPolicyFile(path, cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -194,9 +262,11 @@ func Load() (*Config, error) {
 
 	var data []byte
 	var err error
+	var loadedPath string
 	for _, path := range candidates {
 		data, err = os.ReadFile(path)
 		if err == nil {
+			loadedPath = path
 			break
 		}
 	}
@@ -207,12 +277,9 @@ func Load() (*Config, error) {
 	if parseErr != nil {
 		return nil, parseErr
 	}
-	// Set SourcePath to the candidate that succeeded
-	for _, p := range candidates {
-		if _, e := os.Stat(p); e == nil {
-			cfg.SourcePath = p
-			break
-		}
+	cfg.SourcePath = loadedPath
+	if err := loadSupervisorPolicyFile(loadedPath, cfg); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -405,7 +472,240 @@ func parse(data []byte) (*Config, error) {
 		}
 	}
 
+	if err := normalizeSupervisorPolicy(&cfg.Supervisor); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// SupervisorPolicyCandidatePaths returns structured policy files that may live
+// beside the config or inside the configured repository checkout.
+func SupervisorPolicyCandidatePaths(configPath string, cfg *Config) []string {
+	var candidates []string
+	if configPath != "" {
+		dir := filepath.Dir(configPath)
+		candidates = appendSupervisorPolicyCandidates(candidates, dir)
+		candidates = appendSupervisorPolicyCandidates(candidates, filepath.Join(dir, ".maestro"))
+	}
+	if cfg != nil && strings.TrimSpace(cfg.LocalPath) != "" {
+		candidates = appendSupervisorPolicyCandidates(candidates, filepath.Join(cfg.LocalPath, ".maestro"))
+	}
+	return uniqueStrings(candidates)
+}
+
+func loadSupervisorPolicyFile(configPath string, cfg *Config) error {
+	for _, path := range SupervisorPolicyCandidatePaths(configPath, cfg) {
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read supervisor policy %s: %w", path, err)
+		}
+		policy, ok, err := parseSupervisorPolicyFile(path, data)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		policy.PolicyPath = path
+		if err := normalizeSupervisorPolicy(&policy); err != nil {
+			return fmt.Errorf("load supervisor policy %s: %w", path, err)
+		}
+		cfg.Supervisor = policy
+		return nil
+	}
+	return nil
+}
+
+func parseSupervisorPolicyFile(path string, data []byte) (SupervisorConfig, bool, error) {
+	data, ok := supervisorPolicyYAML(path, data)
+	if !ok {
+		return SupervisorConfig{}, false, nil
+	}
+	var wrapped struct {
+		Supervisor *SupervisorConfig `yaml:"supervisor"`
+	}
+	if err := yaml.Unmarshal(data, &wrapped); err != nil {
+		return SupervisorConfig{}, false, fmt.Errorf("parse supervisor policy %s: %w", path, err)
+	}
+	if wrapped.Supervisor != nil {
+		return *wrapped.Supervisor, true, nil
+	}
+	var policy SupervisorConfig
+	if err := yaml.Unmarshal(data, &policy); err != nil {
+		return SupervisorConfig{}, false, fmt.Errorf("parse supervisor policy %s: %w", path, err)
+	}
+	return policy, true, nil
+}
+
+func supervisorPolicyYAML(path string, data []byte) ([]byte, bool) {
+	if strings.ToLower(filepath.Ext(path)) != ".md" {
+		return data, true
+	}
+	text := strings.TrimLeft(string(data), "\ufeff\r\n\t ")
+	if !strings.HasPrefix(text, "---") {
+		return nil, false
+	}
+	text = strings.TrimPrefix(text, "---")
+	text = strings.TrimPrefix(text, "\r\n")
+	text = strings.TrimPrefix(text, "\n")
+	end := strings.Index(text, "\n---")
+	if end < 0 {
+		return nil, false
+	}
+	return []byte(text[:end]), true
+}
+
+func appendSupervisorPolicyCandidates(candidates []string, dir string) []string {
+	if strings.TrimSpace(dir) == "" {
+		return candidates
+	}
+	return append(candidates,
+		filepath.Join(dir, "supervisor.yaml"),
+		filepath.Join(dir, "supervisor.yml"),
+		filepath.Join(dir, "supervisor.md"),
+	)
+}
+
+func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
+	policy.Mode = normalizePolicyToken(policy.Mode)
+	if policy.Mode == "" {
+		policy.Mode = "cautious"
+	}
+	policy.ReadyLabel = strings.TrimSpace(policy.ReadyLabel)
+	policy.BlockedLabel = strings.TrimSpace(policy.BlockedLabel)
+	policy.ExcludedLabels = normalizeStringList(policy.ExcludedLabels)
+	policy.AllowIssueTypes = normalizeStringList(policy.AllowIssueTypes)
+	policy.SafeActions = normalizeActionList(policy.SafeActions)
+	policy.ApprovalRequired = normalizeActionList(policy.ApprovalRequired)
+
+	if !policy.excludedLabelsSet && len(policy.ExcludedLabels) == 0 {
+		policy.ExcludedLabels = []string{"epic", "meta"}
+	}
+	if len(policy.AllowIssueTypes) > 0 {
+		policy.ExcludedLabels = removeAllowedIssueTypes(policy.ExcludedLabels, policy.AllowIssueTypes)
+	}
+	return validateSupervisorPolicy(*policy)
+}
+
+func validateSupervisorPolicy(policy SupervisorConfig) error {
+	seenIssues := make(map[int]struct{}, len(policy.OrderedQueue.Issues))
+	for i, issue := range policy.OrderedQueue.Issues {
+		if issue <= 0 {
+			return fmt.Errorf("config: supervisor.ordered_queue.issues[%d] must be a positive issue number", i)
+		}
+		if _, ok := seenIssues[issue]; ok {
+			return fmt.Errorf("config: supervisor.ordered_queue.issues[%d] duplicates issue #%d", i, issue)
+		}
+		seenIssues[issue] = struct{}{}
+	}
+	if err := validateSupervisorActions("safe_actions", policy.SafeActions); err != nil {
+		return err
+	}
+	return validateSupervisorActions("approval_required", policy.ApprovalRequired)
+}
+
+func validateSupervisorActions(field string, actions []string) error {
+	for i, action := range actions {
+		if !knownSupervisorActions()[action] {
+			return fmt.Errorf("config: supervisor.%s[%d] has unknown action %q (allowed: %s)", field, i, action, strings.Join(knownSupervisorActionNames(), ", "))
+		}
+	}
+	return nil
+}
+
+func knownSupervisorActions() map[string]bool {
+	return map[string]bool{
+		SupervisorActionAddReadyLabel:      true,
+		SupervisorActionRemoveBlockedLabel: true,
+		SupervisorActionAddIssueComment:    true,
+		SupervisorActionMergePR:            true,
+		SupervisorActionCloseIssue:         true,
+		SupervisorActionDeleteWorktree:     true,
+		SupervisorActionChangeGlobalConfig: true,
+	}
+}
+
+func knownSupervisorActionNames() []string {
+	return []string{
+		SupervisorActionAddReadyLabel,
+		SupervisorActionRemoveBlockedLabel,
+		SupervisorActionAddIssueComment,
+		SupervisorActionMergePR,
+		SupervisorActionCloseIssue,
+		SupervisorActionDeleteWorktree,
+		SupervisorActionChangeGlobalConfig,
+	}
+}
+
+func normalizeActionList(values []string) []string {
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = normalizePolicyToken(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
+func normalizeStringList(values []string) []string {
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
+func normalizePolicyToken(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func removeAllowedIssueTypes(excluded, allowed []string) []string {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, label := range allowed {
+		allowedSet[strings.ToLower(label)] = struct{}{}
+	}
+	filtered := excluded[:0]
+	for _, label := range excluded {
+		if _, ok := allowedSet[strings.ToLower(label)]; ok {
+			continue
+		}
+		filtered = append(filtered, label)
+	}
+	return filtered
+}
+
+func uniqueStrings(values []string) []string {
+	unique := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	return unique
 }
 
 // LoadDir loads all YAML config files from a directory, sorted by filename.

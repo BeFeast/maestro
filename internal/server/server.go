@@ -97,6 +97,7 @@ type stateResponse struct {
 	Repo                string                     `json:"repo"`
 	MaxParallel         int                        `json:"max_parallel"`
 	ReadOnly            bool                       `json:"read_only"`
+	SupervisorPolicy    config.SupervisorConfig    `json:"supervisor_policy"`
 	All                 []sessionInfo              `json:"all"`
 	Running             []sessionInfo              `json:"running"`
 	PROpen              []sessionInfo              `json:"pr_open"`
@@ -282,6 +283,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		Repo:                s.cfg.Repo,
 		MaxParallel:         s.cfg.MaxParallel,
 		ReadOnly:            s.cfg.Server.ReadOnly,
+		SupervisorPolicy:    s.cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
 		Running:             make([]sessionInfo, 0),
 		PROpen:              make([]sessionInfo, 0),
