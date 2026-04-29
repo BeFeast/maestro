@@ -1087,7 +1087,7 @@ func TestDecideWithLLM_ValidDecision(t *testing.T) {
 }`}
 	st := state.NewState()
 	logPath := filepath.Join(t.TempDir(), "worker.log")
-	if err := os.WriteFile(logPath, []byte("Authorization: Bearer redact-me\nAPI_KEY=redact-me\n"), 0644); err != nil {
+	if err := os.WriteFile(logPath, []byte("Authorization: redact-me\nAPI_KEY=redact-me\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	st.Sessions["slot-dead"] = &state.Session{
@@ -1118,7 +1118,7 @@ func TestDecideWithLLM_ValidDecision(t *testing.T) {
 	if decision.Target == nil || decision.Target.Issue != 42 {
 		t.Fatalf("target = %#v, want issue 42", decision.Target)
 	}
-	for _, secret := range []string{"SERVICE_TOKEN=redact-me", "Bearer redact-me", "API_KEY=redact-me"} {
+	for _, secret := range []string{"SERVICE_TOKEN=redact-me", "Authorization: redact-me", "API_KEY=redact-me"} {
 		if strings.Contains(llm.prompt, secret) {
 			t.Fatalf("prompt contained unredacted secret %q", secret)
 		}
