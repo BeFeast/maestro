@@ -810,7 +810,7 @@ const state = {
   workers: [],
   selected: "",
   filter: "",
-  lastLog: ""
+  lastLog: null
 };
 
 const statusRank = {
@@ -937,10 +937,19 @@ function renderWorkers() {
 
 function selectWorker(slot) {
   state.selected = slot;
-  state.lastLog = "";
+  state.lastLog = null;
   renderWorkers();
   renderSelectedDetails();
   loadLog();
+}
+
+function emptyLogText(worker) {
+  if (!worker) return "No log output yet.";
+  if (worker.status === "running" && worker.backend === "claude") {
+    return "No log output yet. Claude print mode may stay quiet until it finishes.";
+  }
+  if (worker.status === "running") return "No log output yet. Worker is still running.";
+  return "No log output.";
 }
 
 function renderSelectedDetails() {
@@ -971,7 +980,7 @@ async function loadState() {
     if (!state.selected && state.workers.length) state.selected = sortWorkers(state.workers)[0].slot;
     if (state.selected && !state.workers.some(worker => worker.slot === state.selected)) {
       state.selected = state.workers.length ? sortWorkers(state.workers)[0].slot : "";
-      state.lastLog = "";
+      state.lastLog = null;
     }
     renderWorkers();
     renderSelectedDetails();
@@ -998,7 +1007,7 @@ async function loadLog() {
     logMetaEl.textContent = (data.truncated ? "tail " : "") + (data.updated_at || "");
     if (text !== state.lastLog) {
       state.lastLog = text;
-      logEl.textContent = text || "No log output yet.";
+      logEl.textContent = text || emptyLogText(worker);
       logEl.scrollTop = logEl.scrollHeight;
     }
   } catch (err) {
