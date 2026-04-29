@@ -1,7 +1,10 @@
 package state
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -99,6 +102,13 @@ type Mission struct {
 
 const DefaultSupervisorDecisionLimit = 20
 
+var (
+	ErrApprovalNotFound        = errors.New("approval not found")
+	ErrApprovalNotPending      = errors.New("approval is not pending")
+	ErrApprovalStale           = errors.New("approval is stale")
+	ErrApprovalPayloadMismatch = errors.New("approval payload changed")
+)
+
 // SupervisorTarget identifies the primary object a supervisor decision refers to.
 type SupervisorTarget struct {
 	Issue   int    `json:"issue,omitempty"`
@@ -157,12 +167,56 @@ type SupervisorDecision struct {
 	Mutations         []SupervisorMutation   `json:"mutations,omitempty"`
 	StuckStates       []SupervisorStuckState `json:"stuck_states,omitempty"`
 	ProjectState      SupervisorProjectState `json:"project_state"`
+	ApprovalID        string                 `json:"approval_id,omitempty"`
+}
+
+type ApprovalStatus string
+
+const (
+	ApprovalStatusPending  ApprovalStatus = "pending"
+	ApprovalStatusApproved ApprovalStatus = "approved"
+	ApprovalStatusRejected ApprovalStatus = "rejected"
+	ApprovalStatusStale    ApprovalStatus = "stale"
+)
+
+const (
+	ApprovalAuditCreated  = "created"
+	ApprovalAuditApproved = "approved"
+	ApprovalAuditRejected = "rejected"
+	ApprovalAuditStale    = "stale"
+)
+
+// Approval records a risky supervisor decision that needs explicit resolution.
+type Approval struct {
+	ID              string            `json:"id"`
+	DecisionID      string            `json:"decision_id,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at,omitempty"`
+	Action          string            `json:"action"`
+	Target          *SupervisorTarget `json:"target,omitempty"`
+	Summary         string            `json:"summary"`
+	Risk            string            `json:"risk"`
+	Evidence        []string          `json:"evidence,omitempty"`
+	Status          ApprovalStatus    `json:"status"`
+	PayloadHash     string            `json:"payload_hash"`
+	TargetStateHash string            `json:"target_state_hash,omitempty"`
+	Audit           []ApprovalAudit   `json:"audit,omitempty"`
+}
+
+type ApprovalAudit struct {
+	At              time.Time `json:"at"`
+	Event           string    `json:"event"`
+	Actor           string    `json:"actor,omitempty"`
+	Reason          string    `json:"reason,omitempty"`
+	PayloadHash     string    `json:"payload_hash,omitempty"`
+	TargetStateHash string    `json:"target_state_hash,omitempty"`
 }
 
 type State struct {
 	Sessions            map[string]*Session  `json:"sessions"`
 	Missions            map[int]*Mission     `json:"missions,omitempty"` // parent issue number → mission
 	SupervisorDecisions []SupervisorDecision `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval           `json:"approvals,omitempty"`
 	NextSlot            int                  `json:"next_slot"`
 	LastMergeAt         time.Time            `json:"last_merge_at,omitempty"`
 }
@@ -251,6 +305,258 @@ func (s *State) LatestSupervisorDecision() *SupervisorDecision {
 		}
 	}
 	return &s.SupervisorDecisions[latest]
+}
+
+// RecordPendingApprovalForDecision creates a pending approval tied to a decision payload.
+func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, now time.Time) *Approval {
+	if s == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	createdAt := decision.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	approval := Approval{
+		ID:              approvalID(decision, createdAt),
+		DecisionID:      decision.ID,
+		CreatedAt:       createdAt,
+		UpdatedAt:       now,
+		Action:          decision.RecommendedAction,
+		Target:          cloneSupervisorTarget(decision.Target),
+		Summary:         decision.Summary,
+		Risk:            decision.Risk,
+		Evidence:        append([]string(nil), decision.Reasons...),
+		Status:          ApprovalStatusPending,
+		TargetStateHash: s.ApprovalTargetStateHash(decision.Target),
+	}
+	approval.PayloadHash = approval.ComputePayloadHash()
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              now,
+		Event:           ApprovalAuditCreated,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	s.Approvals = append(s.Approvals, approval)
+	return &s.Approvals[len(s.Approvals)-1]
+}
+
+func (s *State) FindApproval(id string) (*Approval, bool) {
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.ID == id || approval.DecisionID == id {
+			return approval, true
+		}
+	}
+	return nil, false
+}
+
+func (s *State) ApproveApproval(id string, now time.Time, actor, reason string) (*Approval, error) {
+	approval, err := s.pendingApproval(id)
+	if err != nil {
+		return approval, err
+	}
+	if err := s.ensureApprovalCurrent(approval, now); err != nil {
+		return approval, err
+	}
+	approval.Status = ApprovalStatusApproved
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditApproved,
+		Actor:           actor,
+		Reason:          reason,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	return approval, nil
+}
+
+func (s *State) RejectApproval(id string, now time.Time, actor, reason string) (*Approval, error) {
+	approval, err := s.pendingApproval(id)
+	if err != nil {
+		return approval, err
+	}
+	approval.Status = ApprovalStatusRejected
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditRejected,
+		Actor:           actor,
+		Reason:          reason,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	return approval, nil
+}
+
+// MarkStaleApprovals marks pending approvals stale when their payload or target snapshot changes.
+func (s *State) MarkStaleApprovals(now time.Time) int {
+	count := 0
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Status != ApprovalStatusPending {
+			continue
+		}
+		if err := s.ensureApprovalCurrent(approval, now); err != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *State) pendingApproval(id string) (*Approval, error) {
+	approval, ok := s.FindApproval(id)
+	if !ok {
+		return nil, ErrApprovalNotFound
+	}
+	if approval.Status == ApprovalStatusStale {
+		return approval, ErrApprovalStale
+	}
+	if approval.Status != ApprovalStatusPending {
+		return approval, ErrApprovalNotPending
+	}
+	return approval, nil
+}
+
+func (s *State) ensureApprovalCurrent(approval *Approval, now time.Time) error {
+	if approval.PayloadHash != "" && approval.ComputePayloadHash() != approval.PayloadHash {
+		s.markApprovalStale(approval, now, "approval payload changed")
+		return ErrApprovalPayloadMismatch
+	}
+	currentTargetStateHash := s.ApprovalTargetStateHash(approval.Target)
+	if approval.TargetStateHash != "" && currentTargetStateHash != approval.TargetStateHash {
+		s.markApprovalStale(approval, now, "approval target state changed")
+		return ErrApprovalStale
+	}
+	return nil
+}
+
+func (s *State) markApprovalStale(approval *Approval, now time.Time, reason string) {
+	if approval.Status == ApprovalStatusStale {
+		return
+	}
+	approval.Status = ApprovalStatusStale
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditStale,
+		Reason:          reason,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: s.ApprovalTargetStateHash(approval.Target),
+	})
+}
+
+func (a Approval) ComputePayloadHash() string {
+	return stableHash(approvalPayload{
+		DecisionID: a.DecisionID,
+		Action:     a.Action,
+		Target:     a.Target,
+		Summary:    a.Summary,
+		Risk:       a.Risk,
+		Evidence:   a.Evidence,
+	})
+}
+
+// ApprovalTargetStateHash returns a stable digest of state relevant to a target.
+func (s *State) ApprovalTargetStateHash(target *SupervisorTarget) string {
+	snapshot := approvalTargetStateSnapshot{Target: cloneSupervisorTarget(target)}
+	if s == nil || target == nil {
+		return stableHash(snapshot)
+	}
+	names := make([]string, 0, len(s.Sessions))
+	for name := range s.Sessions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		sess := s.Sessions[name]
+		if sess == nil || !approvalTargetMatches(target, name, sess) {
+			continue
+		}
+		snapshot.Sessions = append(snapshot.Sessions, approvalSessionSnapshot{
+			Slot:        name,
+			IssueNumber: sess.IssueNumber,
+			Status:      sess.Status,
+			Branch:      sess.Branch,
+			PRNumber:    sess.PRNumber,
+			FinishedAt:  sess.FinishedAt,
+			RetryCount:  sess.RetryCount,
+			NextRetryAt: sess.NextRetryAt,
+		})
+	}
+	return stableHash(snapshot)
+}
+
+type approvalPayload struct {
+	DecisionID string            `json:"decision_id,omitempty"`
+	Action     string            `json:"action"`
+	Target     *SupervisorTarget `json:"target,omitempty"`
+	Summary    string            `json:"summary"`
+	Risk       string            `json:"risk"`
+	Evidence   []string          `json:"evidence,omitempty"`
+}
+
+type approvalTargetStateSnapshot struct {
+	Target   *SupervisorTarget         `json:"target,omitempty"`
+	Sessions []approvalSessionSnapshot `json:"sessions,omitempty"`
+}
+
+type approvalSessionSnapshot struct {
+	Slot        string        `json:"slot"`
+	IssueNumber int           `json:"issue_number"`
+	Status      SessionStatus `json:"status"`
+	Branch      string        `json:"branch,omitempty"`
+	PRNumber    int           `json:"pr_number,omitempty"`
+	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
+	RetryCount  int           `json:"retry_count,omitempty"`
+	NextRetryAt *time.Time    `json:"next_retry_at,omitempty"`
+}
+
+func approvalID(decision SupervisorDecision, createdAt time.Time) string {
+	if decision.ID != "" {
+		return "approval-" + decision.ID
+	}
+	return "approval-" + createdAt.UTC().Format("20060102T150405.000000000Z")
+}
+
+func approvalTargetMatches(target *SupervisorTarget, slot string, sess *Session) bool {
+	if target.Session != "" && target.Session == slot {
+		return true
+	}
+	if target.Issue > 0 && target.Issue == sess.IssueNumber {
+		return true
+	}
+	if target.PR > 0 && target.PR == sess.PRNumber {
+		return true
+	}
+	return false
+}
+
+func cloneSupervisorTarget(target *SupervisorTarget) *SupervisorTarget {
+	if target == nil {
+		return nil
+	}
+	clone := *target
+	return &clone
+}
+
+func stableHash(value interface{}) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func normalizedTime(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Now().UTC()
+	}
+	return t.UTC()
 }
 
 // ActiveSessions returns sessions that are currently running

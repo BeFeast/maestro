@@ -108,6 +108,7 @@ type stateResponse struct {
 	Supervisor          supervisorInfo               `json:"supervisor"`
 	SupervisorLatest    *state.SupervisorDecision    `json:"supervisor_latest,omitempty"`
 	SupervisorDecisions []state.SupervisorDecision   `json:"supervisor_decisions,omitempty"`
+	Approvals           []state.Approval             `json:"approvals,omitempty"`
 }
 
 type supervisorInfo struct {
@@ -138,6 +139,7 @@ type supervisorDecisionInfo struct {
 	StuckReasons      []string                     `json:"stuck_reasons,omitempty"`
 	ProjectState      state.SupervisorProjectState `json:"project_state"`
 	Queue             *supervisorQueueInfo         `json:"queue,omitempty"`
+	ApprovalID        string                       `json:"approval_id,omitempty"`
 }
 
 type supervisorActionInfo struct {
@@ -300,6 +302,7 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 		StuckReasons:      supervisorStuckReasons(decision),
 		ProjectState:      decision.ProjectState,
 		Queue:             supervisorQueueInfoForDecision(cfg, st, decision),
+		ApprovalID:        decision.ApprovalID,
 	}
 }
 
@@ -502,6 +505,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		Supervisor:          buildSupervisorInfo(s.cfg, st),
 		SupervisorLatest:    latestDecision,
 		SupervisorDecisions: st.SupervisorDecisions,
+		Approvals:           st.Approvals,
 	}
 	if latestDecision != nil {
 		resp.StuckStates = latestDecision.StuckStates

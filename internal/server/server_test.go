@@ -273,6 +273,51 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 	}
 }
 
+func TestHandleState_IncludesApprovals(t *testing.T) {
+	srv, cfg := setupTestServer(t)
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	approval := st.RecordPendingApprovalForDecision(state.SupervisorDecision{
+		ID:                "sup-approval",
+		CreatedAt:         now,
+		Project:           "test/repo",
+		Mode:              "read_only",
+		Summary:           "Start a worker for issue #42.",
+		RecommendedAction: "spawn_worker",
+		Target:            &state.SupervisorTarget{Issue: 42},
+		Risk:              "mutating",
+		Confidence:        0.84,
+		Reasons:           []string{"Issue #42 is eligible"},
+	}, now)
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.handleState(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Approvals) != 1 {
+		t.Fatalf("approvals = %d, want 1", len(resp.Approvals))
+	}
+	if resp.Approvals[0].ID != approval.ID {
+		t.Fatalf("approval ID = %q, want %q", resp.Approvals[0].ID, approval.ID)
+	}
+	if resp.Approvals[0].Status != state.ApprovalStatusPending {
+		t.Fatalf("approval status = %q, want %q", resp.Approvals[0].Status, state.ApprovalStatusPending)
+	}
+}
+
 func TestHandleState_MethodNotAllowed(t *testing.T) {
 	srv, _ := setupTestServer(t)
 

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -879,5 +880,159 @@ func TestRecordSupervisorDecisionPrunesOldRecords(t *testing.T) {
 	latest := s.LatestSupervisorDecision()
 	if latest == nil || latest.ID != "sup-4" {
 		t.Fatalf("latest = %#v, want sup-4", latest)
+	}
+}
+
+func TestApprovalPendingPersistence(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	approval := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+
+	if approval.Status != ApprovalStatusPending {
+		t.Fatalf("status = %q, want %q", approval.Status, ApprovalStatusPending)
+	}
+	if approval.Action != "spawn_worker" {
+		t.Fatalf("action = %q, want spawn_worker", approval.Action)
+	}
+	if approval.Target == nil || approval.Target.Issue != 42 {
+		t.Fatalf("target = %#v, want issue 42", approval.Target)
+	}
+	if approval.PayloadHash == "" {
+		t.Fatal("payload hash missing")
+	}
+	if approval.TargetStateHash == "" {
+		t.Fatal("target state hash missing")
+	}
+	if len(approval.Audit) != 1 || approval.Audit[0].Event != ApprovalAuditCreated {
+		t.Fatalf("audit = %#v, want created event", approval.Audit)
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	loadedApproval, ok := loaded.FindApproval(approval.ID)
+	if !ok {
+		t.Fatalf("approval %q missing after load", approval.ID)
+	}
+	if loadedApproval.PayloadHash != approval.PayloadHash {
+		t.Fatalf("payload hash = %q, want %q", loadedApproval.PayloadHash, approval.PayloadHash)
+	}
+}
+
+func TestApproveApprovalAuditsResolution(t *testing.T) {
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	approval := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+
+	approved, err := s.ApproveApproval(approval.DecisionID, now.Add(time.Minute), "cli", "checks green")
+	if err != nil {
+		t.Fatalf("ApproveApproval: %v", err)
+	}
+	if approved.Status != ApprovalStatusApproved {
+		t.Fatalf("status = %q, want %q", approved.Status, ApprovalStatusApproved)
+	}
+	if len(approved.Audit) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(approved.Audit))
+	}
+	last := approved.Audit[len(approved.Audit)-1]
+	if last.Event != ApprovalAuditApproved || last.Actor != "cli" || last.Reason != "checks green" {
+		t.Fatalf("last audit = %#v, want approved by cli", last)
+	}
+}
+
+func TestRejectApprovalAuditsResolution(t *testing.T) {
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	approval := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+
+	rejected, err := s.RejectApproval(approval.ID, now.Add(time.Minute), "cli", "needs review")
+	if err != nil {
+		t.Fatalf("RejectApproval: %v", err)
+	}
+	if rejected.Status != ApprovalStatusRejected {
+		t.Fatalf("status = %q, want %q", rejected.Status, ApprovalStatusRejected)
+	}
+	last := rejected.Audit[len(rejected.Audit)-1]
+	if last.Event != ApprovalAuditRejected || last.Actor != "cli" || last.Reason != "needs review" {
+		t.Fatalf("last audit = %#v, want rejected by cli", last)
+	}
+}
+
+func TestApproveMissingApprovalFailsSafely(t *testing.T) {
+	s := NewState()
+	_, err := s.ApproveApproval("approval-missing", time.Now().UTC(), "cli", "")
+	if !errors.Is(err, ErrApprovalNotFound) {
+		t.Fatalf("ApproveApproval missing err = %v, want %v", err, ErrApprovalNotFound)
+	}
+}
+
+func TestApproveStaleApprovalFailsSafely(t *testing.T) {
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 77, Status: StatusRetryExhausted, PRNumber: 12}
+	decision := SupervisorDecision{
+		ID:                "sup-stale",
+		CreatedAt:         now,
+		Project:           "owner/repo",
+		Mode:              "read_only",
+		Summary:           "Review retry-exhausted issue #77.",
+		RecommendedAction: "review_retry_exhausted",
+		Target:            &SupervisorTarget{Issue: 77, PR: 12, Session: "slot-1"},
+		Risk:              "approval_gated",
+		Confidence:        0.93,
+		Reasons:           []string{"retry budget exhausted"},
+	}
+	approval := s.RecordPendingApprovalForDecision(decision, now)
+	s.Sessions["slot-1"].Status = StatusDone
+
+	_, err := s.ApproveApproval(approval.ID, now.Add(time.Minute), "cli", "")
+	if !errors.Is(err, ErrApprovalStale) {
+		t.Fatalf("ApproveApproval stale err = %v, want %v", err, ErrApprovalStale)
+	}
+	if s.Approvals[0].Status != ApprovalStatusStale {
+		t.Fatalf("status = %q, want %q", s.Approvals[0].Status, ApprovalStatusStale)
+	}
+	last := s.Approvals[0].Audit[len(s.Approvals[0].Audit)-1]
+	if last.Event != ApprovalAuditStale {
+		t.Fatalf("last audit = %#v, want stale event", last)
+	}
+}
+
+func TestApproveChangedApprovalPayloadFailsSafely(t *testing.T) {
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	approval := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	approval.Action = "merge_pr"
+
+	_, err := s.ApproveApproval(approval.ID, now.Add(time.Minute), "cli", "")
+	if !errors.Is(err, ErrApprovalPayloadMismatch) {
+		t.Fatalf("ApproveApproval payload err = %v, want %v", err, ErrApprovalPayloadMismatch)
+	}
+	if s.Approvals[0].Status != ApprovalStatusStale {
+		t.Fatalf("status = %q, want %q", s.Approvals[0].Status, ApprovalStatusStale)
+	}
+}
+
+func testApprovalDecision(now time.Time) SupervisorDecision {
+	return SupervisorDecision{
+		ID:                "sup-approval",
+		CreatedAt:         now,
+		Project:           "owner/repo",
+		Mode:              "read_only",
+		Summary:           "Start a worker for issue #42: ready work",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 42},
+		Risk:              "mutating",
+		Confidence:        0.84,
+		Reasons:           []string{"Issue #42 is eligible", "Starting a worker mutates local worktrees"},
+		ProjectState: SupervisorProjectState{
+			OpenIssues:     1,
+			AvailableSlots: 1,
+		},
 	}
 }
