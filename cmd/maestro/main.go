@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -68,6 +69,8 @@ Supervise flags:
   --once                Run one supervisor decision and exit
   --interval duration   Loop interval (default 5m)
   --json                Output decision as JSON
+  maestro supervise approve <approval-or-decision-id>
+  maestro supervise reject <approval-or-decision-id>
 
 Serve flags:
   --host string         Host/interface to bind (default from config, then 127.0.0.1)
@@ -354,12 +357,30 @@ func runCmd(args []string) {
 }
 
 func superviseCmd(args []string) {
+	if len(args) > 0 {
+		switch args[0] {
+		case "approve", "reject":
+			superviseApprovalCmd(args[0], args[1:], "")
+			return
+		}
+	}
+
 	fs := flag.NewFlagSet("supervise", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to config file")
 	once := fs.Bool("once", false, "Run once and exit")
 	interval := fs.Duration("interval", 5*time.Minute, "Loop interval")
 	jsonOutput := fs.Bool("json", false, "Output decision as JSON")
 	fs.Parse(args)
+	if fs.NArg() > 0 {
+		subcmd := fs.Arg(0)
+		switch subcmd {
+		case "approve", "reject":
+			superviseApprovalCmd(subcmd, fs.Args()[1:], *configPath)
+			return
+		default:
+			log.Fatalf("supervise: unexpected argument %q", subcmd)
+		}
+	}
 
 	if !*once && *interval <= 0 {
 		log.Fatalf("supervise: --interval must be positive")
@@ -401,6 +422,47 @@ func superviseCmd(args []string) {
 	}
 }
 
+func superviseApprovalCmd(action string, args []string, defaultConfigPath string) {
+	fs := flag.NewFlagSet("supervise "+action, flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "Path to config file")
+	actor := fs.String("actor", "cli", "Audit actor")
+	reason := fs.String("reason", "", "Audit reason")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		log.Fatalf("supervise %s: expected approval or decision id", action)
+	}
+
+	cfg := loadConfig(*configPath)
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("supervise %s: load state: %v", action, err)
+	}
+
+	id := fs.Arg(0)
+	now := time.Now().UTC()
+	var approval *state.Approval
+	switch action {
+	case "approve":
+		approval, err = st.ApproveApproval(id, now, *actor, *reason)
+	case "reject":
+		approval, err = st.RejectApproval(id, now, *actor, *reason)
+	default:
+		log.Fatalf("supervise: unknown approval action %q", action)
+	}
+	if err != nil {
+		if errors.Is(err, state.ErrApprovalStale) || errors.Is(err, state.ErrApprovalPayloadMismatch) {
+			if saveErr := state.Save(cfg.StateDir, st); saveErr != nil {
+				log.Fatalf("supervise %s: save stale approval: %v", action, saveErr)
+			}
+		}
+		log.Fatalf("supervise %s: %v", action, err)
+	}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		log.Fatalf("supervise %s: save state: %v", action, err)
+	}
+	fmt.Printf("Approval %s %s. No risky action was executed.\n", approval.ID, approval.Status)
+}
+
 func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool) {
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
@@ -418,6 +480,9 @@ func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool)
 	fmt.Printf("Confidence: %.2f\n", decision.Confidence)
 	if decision.ErrorClass != "" {
 		fmt.Printf("Error class: %s\n", decision.ErrorClass)
+	}
+	if decision.ApprovalID != "" {
+		fmt.Printf("Approval: %s\n", decision.ApprovalID)
 	}
 	if decision.Target != nil {
 		parts := supervisorTargetParts(decision.Target)
@@ -595,6 +660,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	}
 	fmt.Println()
 	showLatestSupervisorDecision(s)
+	showApprovals(s)
 
 	if len(s.Sessions) == 0 {
 		fmt.Println("No sessions.")
@@ -884,6 +950,9 @@ func showLatestSupervisorDecision(s *state.State) {
 		fmt.Printf("  Summary: %s\n", decision.Summary)
 	}
 	fmt.Printf("  Risk: %s  Confidence: %.2f\n", decision.Risk, decision.Confidence)
+	if decision.ApprovalID != "" {
+		fmt.Printf("  Approval: %s\n", decision.ApprovalID)
+	}
 	if decision.Target != nil {
 		parts := supervisorTargetParts(decision.Target)
 		if len(parts) > 0 {
@@ -897,6 +966,26 @@ func showLatestSupervisorDecision(s *state.State) {
 			fmt.Printf(" (top: %s/%s)", first.Code, first.Severity)
 		}
 		fmt.Println()
+	}
+	fmt.Println()
+}
+
+func showApprovals(s *state.State) {
+	if len(s.Approvals) == 0 {
+		return
+	}
+	approvals := append([]state.Approval(nil), s.Approvals...)
+	sort.Slice(approvals, func(i, j int) bool {
+		return approvals[i].CreatedAt.After(approvals[j].CreatedAt)
+	})
+	fmt.Println("Approvals:")
+	for _, approval := range approvals {
+		target := "-"
+		parts := supervisorTargetParts(approval.Target)
+		if len(parts) > 0 {
+			target = strings.Join(parts, ", ")
+		}
+		fmt.Printf("  %s  %s  %s  %s\n", approval.ID, approval.Status, approval.Action, target)
 	}
 	fmt.Println()
 }

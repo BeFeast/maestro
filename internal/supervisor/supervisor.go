@@ -116,6 +116,7 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if err != nil {
 		return state.SupervisorDecision{}, fmt.Errorf("load state: %w", err)
 	}
+	st.MarkStaleApprovals(time.Now().UTC())
 	if reader == nil {
 		reader = github.New(cfg.Repo)
 	}
@@ -124,7 +125,11 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
-	if len(decision.Mutations) > 0 {
+	if decisionRequiresApproval(decision) {
+		approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
+		decision.ApprovalID = approval.ID
+	}
+	if len(decision.Mutations) > 0 && decision.Risk == RiskSafe {
 		mutator, ok := reader.(Mutator)
 		if !ok {
 			markUnsupportedQueueAction(&decision)
@@ -634,6 +639,10 @@ func (e *Engine) detectMissingCLI() *state.SupervisorStuckState {
 		return &finding
 	}
 	return nil
+}
+
+func decisionRequiresApproval(decision state.SupervisorDecision) bool {
+	return decision.RecommendedAction != ActionNone && decision.Risk != RiskSafe
 }
 
 func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {

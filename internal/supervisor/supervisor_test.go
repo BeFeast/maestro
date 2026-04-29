@@ -413,6 +413,50 @@ func TestRunOnceRecordsDecision(t *testing.T) {
 	if latest.ID != decision.ID {
 		t.Fatalf("latest ID = %q, want %q", latest.ID, decision.ID)
 	}
+	if len(st.Approvals) != 0 {
+		t.Fatalf("approvals = %d, want 0 for safe action", len(st.Approvals))
+	}
+}
+
+func TestRunOnceRecordsPendingApprovalForRiskyDecision(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.ApprovalID == "" {
+		t.Fatal("decision approval ID missing")
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(st.Approvals) != 1 {
+		t.Fatalf("approvals = %d, want 1", len(st.Approvals))
+	}
+	approval := st.Approvals[0]
+	if approval.ID != decision.ApprovalID {
+		t.Fatalf("approval ID = %q, want %q", approval.ID, decision.ApprovalID)
+	}
+	if approval.DecisionID != decision.ID {
+		t.Fatalf("decision ID = %q, want %q", approval.DecisionID, decision.ID)
+	}
+	if approval.Status != state.ApprovalStatusPending {
+		t.Fatalf("status = %q, want %q", approval.Status, state.ApprovalStatusPending)
+	}
+	if approval.Action != ActionSpawnWorker {
+		t.Fatalf("approval action = %q, want %q", approval.Action, ActionSpawnWorker)
+	}
+	if approval.Target == nil || approval.Target.Issue != 42 {
+		t.Fatalf("target = %#v, want issue 42", approval.Target)
+	}
 }
 
 func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
