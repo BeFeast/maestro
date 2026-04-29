@@ -2469,6 +2469,12 @@ func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Or
 		hasOpenPRForIssueFn: func(issueNumber int) (bool, error) {
 			return false, nil
 		},
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		isPRMergedFn: func(prNumber int) (bool, error) {
+			return false, nil
+		},
 		isIssueClosedFn: func(issueNumber int) (bool, error) {
 			return false, nil
 		},
@@ -2513,6 +2519,156 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 
 	if len(*started) != 0 {
 		t.Fatalf("started %d workers, want 0 for already closed issue", len(*started))
+	}
+}
+
+func TestStartNewWorkers_OrderedQueueStartsOnlyFirstPendingIssue(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306, 305}}
+	issues := []github.Issue{
+		makeIssue(308, "first"),
+		makeIssue(306, "second"),
+		makeIssue(305, "third"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 {
+		t.Fatalf("started %d workers, want 1", len(*started))
+	}
+	if (*started)[0] != 308 {
+		t.Fatalf("started issue #%d, want #308", (*started)[0])
+	}
+}
+
+func TestStartNewWorkers_OrderedQueueWaitsWhileCurrentRunning(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	issues := []github.Issue{makeIssue(308, "current"), makeIssue(306, "next")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{IssueNumber: 308, Status: state.StatusRunning}
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started %v, want no worker while ordered issue #308 is running", *started)
+	}
+}
+
+func TestStartNewWorkers_OrderedQueueAdvancesAfterClosedIssue(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	issues := []github.Issue{makeIssue(306, "next")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.isIssueClosedFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 308, nil
+	}
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 || (*started)[0] != 306 {
+		t.Fatalf("started = %v, want [306]", *started)
+	}
+}
+
+func TestStartNewWorkers_OrderedQueuePausesOnBlockedCurrentIssue(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	issues := []github.Issue{
+		{Number: 308, Title: "blocked", Body: "blocked by #100"},
+		makeIssue(306, "next"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.isIssueClosedFn = func(issueNumber int) (bool, error) {
+		return false, nil
+	}
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want none while #308 is blocked", *started)
+	}
+}
+
+func TestStartNewWorkers_OrderedQueuePausesOnRetryExhaustedCurrentIssue(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxRetriesPerIssue = 2
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	issues := []github.Issue{makeIssue(308, "flaky"), makeIssue(306, "next")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		finished := now.Add(-time.Duration(i+1) * time.Hour)
+		s.Sessions[fmt.Sprintf("old-%d", i)] = &state.Session{
+			IssueNumber: 308,
+			Status:      state.StatusDead,
+			FinishedAt:  &finished,
+		}
+	}
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want none while #308 is retry-exhausted", *started)
+	}
+	if !s.IssueRetryExhausted(308) {
+		t.Fatal("issue #308 should be marked retry_exhausted")
+	}
+}
+
+func TestStartNewWorkers_OrderedQueueAdvancesAfterLinkedPRMerged(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	issues := []github.Issue{makeIssue(306, "next")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasMergedPRForIssueFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 308, nil
+	}
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 || (*started)[0] != 306 {
+		t.Fatalf("started = %v, want [306]", *started)
+	}
+}
+
+func TestStartNewWorkers_OrderedQueueAdvancesAfterDoneSessionPRMerged(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
+	issues := []github.Issue{makeIssue(306, "next")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.isPRMergedFn = func(prNumber int) (bool, error) {
+		return prNumber == 77, nil
+	}
+	s := state.NewState()
+	s.Sessions["old"] = &state.Session{IssueNumber: 308, Status: state.StatusDone, PRNumber: 77}
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 || (*started)[0] != 306 {
+		t.Fatalf("started = %v, want [306]", *started)
+	}
+}
+
+func TestStartNewWorkers_OrderedQueueAdvancesAfterPolicyDone(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}, DoneIssues: []int{308}}
+	issues := []github.Issue{makeIssue(306, "next")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 || (*started)[0] != 306 {
+		t.Fatalf("started = %v, want [306]", *started)
 	}
 }
 

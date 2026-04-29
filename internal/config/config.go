@@ -77,8 +77,22 @@ type SupervisorConfig struct {
 
 // SupervisorOrderedQueueConfig pins supervisor selection to a fixed issue order.
 type SupervisorOrderedQueueConfig struct {
-	Enabled bool  `yaml:"enabled" json:"enabled"`
-	Issues  []int `yaml:"issues" json:"issues,omitempty"`
+	Enabled    bool  `yaml:"enabled" json:"enabled"`
+	Issues     []int `yaml:"issues" json:"issues,omitempty"`
+	DoneIssues []int `yaml:"done_issues" json:"done_issues,omitempty"`
+}
+
+func (q SupervisorOrderedQueueConfig) Active() bool {
+	return q.Enabled || len(q.Issues) > 0
+}
+
+func (q SupervisorOrderedQueueConfig) IsDone(number int) bool {
+	for _, done := range q.DoneIssues {
+		if done == number {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SupervisorConfig) UnmarshalYAML(value *yaml.Node) error {
@@ -100,7 +114,7 @@ func (s *SupervisorConfig) UnmarshalYAML(value *yaml.Node) error {
 }
 
 func (s SupervisorConfig) OrderedQueueActive() bool {
-	return s.OrderedQueue.Enabled || len(s.OrderedQueue.Issues) > 0
+	return s.OrderedQueue.Active()
 }
 
 func (s SupervisorConfig) AllowsSafeAction(action string) bool {
@@ -603,6 +617,11 @@ func validateSupervisorPolicy(policy SupervisorConfig) error {
 			return fmt.Errorf("config: supervisor.ordered_queue.issues[%d] duplicates issue #%d", i, issue)
 		}
 		seenIssues[issue] = struct{}{}
+	}
+	for i, issue := range policy.OrderedQueue.DoneIssues {
+		if issue <= 0 {
+			return fmt.Errorf("config: supervisor.ordered_queue.done_issues[%d] must be a positive issue number", i)
+		}
 	}
 	if err := validateSupervisorActions("safe_actions", policy.SafeActions); err != nil {
 		return err

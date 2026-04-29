@@ -156,6 +156,45 @@ func (c *Client) ListOpenPRs() ([]PR, error) {
 	return prs, nil
 }
 
+// IsPRMerged returns true if the PR has been merged.
+func (c *Client) IsPRMerged(prNumber int) (bool, error) {
+	out, err := exec.Command("gh", "pr", "view", fmt.Sprint(prNumber),
+		"--repo", c.Repo,
+		"--json", "state,mergedAt").Output()
+	if err != nil {
+		return false, fmt.Errorf("gh pr view %d: %w", prNumber, err)
+	}
+	var result struct {
+		State    string `json:"state"`
+		MergedAt string `json:"mergedAt"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return false, fmt.Errorf("parse pr %d: %w", prNumber, err)
+	}
+	return result.State == "MERGED" || result.MergedAt != "", nil
+}
+
+// HasMergedPRForIssue returns true if a merged PR references the issue.
+func (c *Client) HasMergedPRForIssue(issueNumber int) (bool, error) {
+	query := fmt.Sprintf("#%d", issueNumber)
+	out, err := exec.Command("gh", "pr", "list",
+		"--repo", c.Repo,
+		"--state", "merged",
+		"--search", query,
+		"--json", "number",
+		"--limit", "1").Output()
+	if err != nil {
+		return false, fmt.Errorf("gh pr list --state merged --search: %w", err)
+	}
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(out, &prs); err != nil {
+		return false, fmt.Errorf("parse merged pr search results: %w", err)
+	}
+	return len(prs) > 0, nil
+}
+
 // PRCIStatus returns "success", "failure", "pending", or "unknown"
 func (c *Client) PRCIStatus(prNumber int) (string, error) {
 	out, err := exec.Command("gh", "pr", "checks",

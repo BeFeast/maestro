@@ -38,6 +38,8 @@ type Orchestrator struct {
 	tmuxSessionExistsFn   func(name string) bool
 	listOpenPRsFn         func() ([]github.PR, error)
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
+	hasMergedPRForIssueFn func(issueNumber int) (bool, error)
+	isPRMergedFn          func(prNumber int) (bool, error)
 
 	// Testing hooks for checkSessions
 	captureTmuxFn   func(session string) (string, error)
@@ -132,6 +134,20 @@ func (o *Orchestrator) hasOpenPRForIssue(issueNumber int) (bool, error) {
 		return o.hasOpenPRForIssueFn(issueNumber)
 	}
 	return o.gh.HasOpenPRForIssue(issueNumber)
+}
+
+func (o *Orchestrator) hasMergedPRForIssue(issueNumber int) (bool, error) {
+	if o.hasMergedPRForIssueFn != nil {
+		return o.hasMergedPRForIssueFn(issueNumber)
+	}
+	return o.gh.HasMergedPRForIssue(issueNumber)
+}
+
+func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
+	if o.isPRMergedFn != nil {
+		return o.isPRMergedFn(prNumber)
+	}
+	return o.gh.IsPRMerged(prNumber)
 }
 
 func (o *Orchestrator) prCIStatus(prNumber int) (string, error) {
@@ -1977,11 +1993,158 @@ func (o *Orchestrator) startWorker(s *state.State, issue github.Issue, promptBas
 	return worker.Start(o.cfg, s, o.repo, issue, promptBase, backend)
 }
 
+func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (bool, string, error) {
+	queue := o.cfg.Supervisor.OrderedQueue
+	if queue.IsDone(issueNumber) {
+		return true, "policy done override", nil
+	}
+
+	closed, err := o.isIssueClosed(issueNumber)
+	if err != nil {
+		return false, "", fmt.Errorf("check issue closed: %w", err)
+	}
+	if closed {
+		return true, "issue closed", nil
+	}
+
+	merged, err := o.hasMergedPRForIssue(issueNumber)
+	if err != nil {
+		return false, "", fmt.Errorf("check merged PR for issue: %w", err)
+	}
+	if merged {
+		return true, "linked PR merged", nil
+	}
+
+	for _, slotName := range sortedStateSessionNames(s) {
+		sess := s.Sessions[slotName]
+		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusDone || sess.PRNumber <= 0 {
+			continue
+		}
+		merged, err := o.isPRMerged(sess.PRNumber)
+		if err != nil {
+			return false, "", fmt.Errorf("check PR #%d merged: %w", sess.PRNumber, err)
+		}
+		if merged {
+			return true, fmt.Sprintf("session %s is done with merged PR #%d", slotName, sess.PRNumber), nil
+		}
+	}
+
+	return false, "", nil
+}
+
+func (o *Orchestrator) orderedQueueIssueNumberPauseReason(s *state.State, issueNumber int) string {
+	if s.IssueInProgress(issueNumber) {
+		return fmt.Sprintf("issue #%d already has an active session", issueNumber)
+	}
+
+	if hasOpenPR, err := o.hasOpenPRForIssue(issueNumber); err != nil {
+		return fmt.Sprintf("could not check open PRs for issue #%d: %v", issueNumber, err)
+	} else if hasOpenPR {
+		return fmt.Sprintf("issue #%d already has an open PR", issueNumber)
+	}
+
+	if s.IssueRetryExhausted(issueNumber) {
+		return fmt.Sprintf("issue #%d is retry-exhausted", issueNumber)
+	}
+	if o.cfg.MaxRetriesPerIssue > 0 {
+		failed := s.FailedAttemptsForIssue(issueNumber)
+		if failed >= o.cfg.MaxRetriesPerIssue {
+			if !s.IssueRetryExhausted(issueNumber) {
+				s.MarkIssueRetryExhausted(issueNumber)
+				o.notifier.Sendf("⚠️ Issue #%d hit max retries (%d) — needs manual review",
+					issueNumber, o.cfg.MaxRetriesPerIssue)
+			}
+			return fmt.Sprintf("issue #%d exhausted retries (%d/%d attempts)", issueNumber, failed, o.cfg.MaxRetriesPerIssue)
+		}
+	}
+
+	return ""
+}
+
+func (o *Orchestrator) orderedQueueIssuePauseReason(s *state.State, issue github.Issue) string {
+	if s.IsMissionParent(issue.Number) {
+		return fmt.Sprintf("issue #%d is a mission parent", issue.Number)
+	}
+	if o.cfg.Missions.Enabled && mission.IsMissionIssue(issue, o.cfg.Missions.Labels) && !s.IsMissionChild(issue.Number) {
+		return fmt.Sprintf("issue #%d is a mission issue awaiting decomposition", issue.Number)
+	}
+	if github.HasLabel(issue, o.cfg.ExcludeLabels) {
+		return fmt.Sprintf("issue #%d is excluded by configured label", issue.Number)
+	}
+	if len(o.cfg.BlockerPatterns) > 0 {
+		blockers := github.FindBlockers(issue.Body, o.cfg.BlockerPatterns)
+		if len(blockers) > 0 {
+			openBlockers := o.findOpenBlockers(blockers)
+			if len(openBlockers) > 0 {
+				return fmt.Sprintf("issue #%d is blocked by open issue(s) %v", issue.Number, openBlockers)
+			}
+		}
+	}
+	return ""
+}
+
+func (o *Orchestrator) applyOrderedQueueFilter(s *state.State, issues []github.Issue) ([]github.Issue, bool) {
+	queue := o.cfg.Supervisor.OrderedQueue
+	if !queue.Active() {
+		return issues, false
+	}
+
+	openByNumber := make(map[int]github.Issue, len(issues))
+	for _, issue := range issues {
+		openByNumber[issue.Number] = issue
+	}
+
+	for _, issueNumber := range queue.Issues {
+		done, reason, err := o.orderedQueueIssueDone(s, issueNumber)
+		if err != nil {
+			log.Printf("[orch] ordered queue paused at issue #%d: %v", issueNumber, err)
+			return nil, true
+		}
+		if done {
+			log.Printf("[orch] ordered queue skipping issue #%d: %s", issueNumber, reason)
+			continue
+		}
+
+		if reason := o.orderedQueueIssueNumberPauseReason(s, issueNumber); reason != "" {
+			log.Printf("[orch] ordered queue paused: %s", reason)
+			return nil, true
+		}
+
+		issue, ok := openByNumber[issueNumber]
+		if !ok {
+			log.Printf("[orch] ordered queue paused at issue #%d: issue is not open or does not match issue_labels", issueNumber)
+			return nil, true
+		}
+
+		if reason := o.orderedQueueIssuePauseReason(s, issue); reason != "" {
+			log.Printf("[orch] ordered queue paused: %s", reason)
+			return nil, true
+		}
+
+		return []github.Issue{issue}, true
+	}
+
+	log.Printf("[orch] ordered queue complete: all configured issues are done")
+	return nil, true
+}
+
+func sortedStateSessionNames(s *state.State) []string {
+	names := make([]string, 0, len(s.Sessions))
+	for name := range s.Sessions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
 		return
+	}
+	if filtered, ordered := o.applyOrderedQueueFilter(s, issues); ordered {
+		issues = filtered
 	}
 
 	started := 0

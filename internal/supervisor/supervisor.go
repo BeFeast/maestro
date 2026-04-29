@@ -23,6 +23,7 @@ const (
 	ActionNone                 = "none"
 	ActionWaitForRunningWorker = "wait_for_running_worker"
 	ActionWaitForCapacity      = "wait_for_capacity"
+	ActionWaitForOrderedQueue  = "wait_for_ordered_queue"
 	ActionMonitorOpenPR        = "monitor_open_pr"
 	ActionReviewRetryExhausted = "review_retry_exhausted"
 	ActionSpawnWorker          = "spawn_worker"
@@ -66,7 +67,9 @@ type Reader interface {
 	ListOpenIssues(labels []string) ([]github.Issue, error)
 	ListOpenPRs() ([]github.PR, error)
 	HasOpenPRForIssue(issueNumber int) (bool, error)
+	HasMergedPRForIssue(issueNumber int) (bool, error)
 	IsIssueClosed(number int) (bool, error)
+	IsPRMerged(prNumber int) (bool, error)
 }
 
 // Mutator is the safe GitHub write surface used for supervisor queue actions.
@@ -188,7 +191,7 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		return decision, nil
 	}
 
-	if slot, sess, ok := retryExhaustedSession(st); ok {
+	if slot, sess, ok := retryExhaustedSession(st); ok && !e.cfg.Supervisor.OrderedQueueActive() {
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
 			"Retry-exhausted work requires a human decision before more automation",
@@ -258,6 +261,26 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		return decision, nil
 	}
 
+	if policyRule == PolicyRuleOrderedQueue && len(candidates) == 1 {
+		issue := candidates[0]
+		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
+		if err != nil {
+			return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
+		}
+		if hasOpenPR {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d is the first unfinished ordered issue", issue.Number),
+				fmt.Sprintf("Issue #%d already has an open PR", issue.Number),
+				"Ordered queue will not label or dispatch later issues while this PR is in review",
+			)
+			decision := e.decision(now, projectState, ActionMonitorOpenPR,
+				fmt.Sprintf("Ordered queue is paused at issue #%d because it already has an open PR.", issue.Number),
+				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
+		}
+	}
+
 	candidate, err := e.firstQueueActionCandidate(st, candidates)
 	if err != nil {
 		return state.SupervisorDecision{}, err
@@ -279,6 +302,30 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		decision.Mutations = mutations
 		decision.StuckStates = stuckStates
 		return decision, nil
+	}
+
+	if policyRule == PolicyRuleOrderedQueue && len(candidates) == 1 {
+		issue := candidates[0]
+		if pauseReason := orderedQueuePauseReason(skipped, issue.Number); pauseReason != "" {
+			action := ActionWaitForOrderedQueue
+			risk := RiskSafe
+			confidence := 0.88
+			if strings.Contains(pauseReason, "retry limit exhausted") {
+				action = ActionReviewRetryExhausted
+				risk = RiskApprovalGated
+				confidence = 0.93
+			}
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d is the first unfinished ordered issue", issue.Number),
+				pauseReason,
+				"Ordered queue will not advance until this issue is done or explicitly overridden",
+			)
+			decision := e.decision(now, projectState, action,
+				fmt.Sprintf("Ordered queue is paused at issue #%d: %s.", issue.Number, pauseReason),
+				risk, confidence, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
+		}
 	}
 
 	reasons := appendReasons(baseReasons,
@@ -670,16 +717,12 @@ func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) (
 	}
 	var skipped []string
 	for _, issueNumber := range e.cfg.Supervisor.OrderedQueue.Issues {
-		if st.IssueDone(issueNumber) {
-			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by supervisor.ordered_queue: already completed in state", issueNumber))
-			continue
-		}
-		closed, err := e.reader.IsIssueClosed(issueNumber)
+		done, reason, err := e.orderedQueueIssueDone(st, issueNumber)
 		if err != nil {
 			return nil, nil, "", fmt.Errorf("check ordered queue issue #%d: %w", issueNumber, err)
 		}
-		if closed {
-			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by supervisor.ordered_queue: issue is closed", issueNumber))
+		if done {
+			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by supervisor.ordered_queue: %s", issueNumber, reason))
 			continue
 		}
 		issue, ok := issueByNumber[issueNumber]
@@ -689,6 +732,45 @@ func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) (
 		return []github.Issue{issue}, skipped, PolicyRuleOrderedQueue, nil
 	}
 	return nil, append(skipped, "No unfinished issue remains in supervisor.ordered_queue"), PolicyRuleOrderedQueue, nil
+}
+
+func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, string, error) {
+	queue := e.cfg.Supervisor.OrderedQueue
+	if queue.IsDone(issueNumber) {
+		return true, "policy done override", nil
+	}
+
+	closed, err := e.reader.IsIssueClosed(issueNumber)
+	if err != nil {
+		return false, "", fmt.Errorf("check issue closed: %w", err)
+	}
+	if closed {
+		return true, "issue is closed", nil
+	}
+
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusDone || sess.PRNumber <= 0 {
+			continue
+		}
+		merged, err := e.reader.IsPRMerged(sess.PRNumber)
+		if err != nil {
+			return false, "", fmt.Errorf("check PR #%d merged: %w", sess.PRNumber, err)
+		}
+		if merged {
+			return true, fmt.Sprintf("session %s is done with merged PR #%d", slot, sess.PRNumber), nil
+		}
+	}
+
+	merged, err := e.reader.HasMergedPRForIssue(issueNumber)
+	if err != nil {
+		return false, "", fmt.Errorf("check merged PR for issue: %w", err)
+	}
+	if merged {
+		return true, "linked PR merged", nil
+	}
+
+	return false, "", nil
 }
 
 func validateOrderedQueueIssues(issues []int) error {
@@ -1394,6 +1476,20 @@ func policySkipReason(reason string) bool {
 		strings.Contains(reason, "mission parent issue") ||
 		strings.Contains(reason, "mission issue awaits decomposition") ||
 		strings.Contains(reason, "blocked by open issue")
+}
+
+func orderedQueuePauseReason(skipped []string, issueNumber int) string {
+	prefix := fmt.Sprintf("Issue #%d skipped: ", issueNumber)
+	for _, reason := range skipped {
+		if strings.HasPrefix(reason, prefix) {
+			pauseReason := strings.TrimSpace(strings.TrimPrefix(reason, prefix))
+			if strings.Contains(pauseReason, "missing configured ready label") {
+				return ""
+			}
+			return pauseReason
+		}
+	}
+	return ""
 }
 
 func targetFromSkipReason(reason string) *state.SupervisorTarget {

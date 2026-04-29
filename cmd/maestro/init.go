@@ -258,6 +258,11 @@ func buildInitYAML(cfg initYAMLConfig) string {
 	sb.WriteString("# exclude_labels:\n")
 	sb.WriteString("#   - wontfix\n")
 	sb.WriteString("#   - duplicate\n")
+	sb.WriteString("# supervisor:\n")
+	sb.WriteString("#   ordered_queue:\n")
+	sb.WriteString("#     enabled: true\n")
+	sb.WriteString("#     issues: [123, 124, 125]\n")
+	sb.WriteString("#     done_issues: []\n")
 	return sb.String()
 }
 
