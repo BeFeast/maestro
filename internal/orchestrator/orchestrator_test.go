@@ -2469,6 +2469,9 @@ func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Or
 		hasOpenPRForIssueFn: func(issueNumber int) (bool, error) {
 			return false, nil
 		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		addIssueLabelFn: func(number int, label string) error {
 			labels = append(labels, fmt.Sprintf("#%d:%s", number, label))
 			return nil
@@ -2488,6 +2491,29 @@ func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Or
 			return slotName, nil
 		},
 	}, &started, &labels
+}
+
+func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	issues := []github.Issue{
+		makeIssue(283, "already merged issue"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.isIssueClosedFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 283, nil
+	}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 283,
+		Status:      state.StatusDone,
+	}
+
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started %d workers, want 0 for already closed issue", len(*started))
+	}
 }
 
 func TestStartNewWorkers_SkipsRetryExhaustedIssue(t *testing.T) {

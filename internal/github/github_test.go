@@ -59,6 +59,7 @@ func TestHasGreptileInlineCommentOnHead(t *testing.T) {
 	makeComment := func(login, sha, body string) greptileReviewComment {
 		var c greptileReviewComment
 		c.CommitID = sha
+		c.OriginalCommitID = sha
 		c.User.Login = login
 		c.Body = body
 		return c
@@ -83,6 +84,14 @@ func TestHasGreptileInlineCommentOnHead(t *testing.T) {
 	// Comments on different SHA should not block
 	if hasGreptileInlineCommentOnHead(p0Comments, "different-sha") {
 		t.Fatal("did not expect greptile comment from another head to block")
+	}
+
+	// GitHub may report commit_id as the current head for outdated review
+	// comments, so original_commit_id is the safer source of truth.
+	outdatedComment := makeComment("greptile-apps[bot]", "head-sha", "![alt=\"P1\"] Old issue")
+	outdatedComment.CommitID = "new-head-sha"
+	if hasGreptileInlineCommentOnHead([]greptileReviewComment{outdatedComment}, "new-head-sha") {
+		t.Fatal("did not expect review comment originally left on an older commit to block")
 	}
 
 	if !isGreptileLogin("greptile-apps[bot]") {

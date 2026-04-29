@@ -206,6 +206,16 @@ func (s *State) IssueInProgress(issueNum int) bool {
 	return false
 }
 
+// IssueDone returns true if the given issue already has a completed session.
+func (s *State) IssueDone(issueNum int) bool {
+	for _, sess := range s.Sessions {
+		if sess.IssueNumber == issueNum && sess.Status == StatusDone {
+			return true
+		}
+	}
+	return false
+}
+
 // FailedAttemptsForIssue counts sessions for the given issue that ended
 // without producing a PR (dead, failed, or retry_exhausted).
 func (s *State) FailedAttemptsForIssue(issueNum int) int {

@@ -797,23 +797,34 @@ func TestParse_ServerPortDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Errorf("Server.Host = %q, want 127.0.0.1", cfg.Server.Host)
+	}
 	if cfg.Server.Port != 0 {
 		t.Errorf("Server.Port = %d, want 0 (disabled)", cfg.Server.Port)
 	}
 }
 
-func TestParse_ServerPortExplicit(t *testing.T) {
+func TestParse_ServerExplicit(t *testing.T) {
 	yaml := `
 repo: owner/repo
 server:
+  host: 0.0.0.0
   port: 8765
+  read_only: true
 `
 	cfg, err := parse([]byte(yaml))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
+	if cfg.Server.Host != "0.0.0.0" {
+		t.Errorf("Server.Host = %q, want 0.0.0.0", cfg.Server.Host)
+	}
 	if cfg.Server.Port != 8765 {
 		t.Errorf("Server.Port = %d, want 8765", cfg.Server.Port)
+	}
+	if !cfg.Server.ReadOnly {
+		t.Error("Server.ReadOnly should be true when configured")
 	}
 }
 

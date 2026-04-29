@@ -27,6 +27,13 @@ func setupTestServer(t *testing.T) (*Server, *config.Config) {
 	// Write test state
 	st := state.NewState()
 	now := time.Now().UTC()
+	logFile := filepath.Join(dir, "logs", "slot-1.log")
+	if err := os.MkdirAll(filepath.Dir(logFile), 0755); err != nil {
+		t.Fatalf("create log dir: %v", err)
+	}
+	if err := os.WriteFile(logFile, []byte("line one\nline two\nline three\n"), 0644); err != nil {
+		t.Fatalf("write test log: %v", err)
+	}
 	st.Sessions["slot-1"] = &state.Session{
 		IssueNumber:     42,
 		IssueTitle:      "Fix bug",
@@ -36,7 +43,8 @@ func setupTestServer(t *testing.T) (*Server, *config.Config) {
 		Worktree:        "/tmp/worktrees/slot-1",
 		StartedAt:       now.Add(-10 * time.Minute),
 		TokensUsedTotal: 5000,
-		PID:             1, // non-zero but won't be alive in tests
+		PID:             999999,
+		LogFile:         logFile,
 	}
 	finished := now.Add(-5 * time.Minute)
 	st.Sessions["slot-2"] = &state.Session{
@@ -97,6 +105,9 @@ func TestHandleState(t *testing.T) {
 	if len(resp.Running) != 1 {
 		t.Errorf("running sessions = %d, want 1", len(resp.Running))
 	}
+	if len(resp.All) != 3 {
+		t.Errorf("all sessions = %d, want 3", len(resp.All))
+	}
 	if len(resp.PROpen) != 1 {
 		t.Errorf("pr_open sessions = %d, want 1", len(resp.PROpen))
 	}
@@ -105,6 +116,21 @@ func TestHandleState(t *testing.T) {
 	}
 	if resp.TokenTotals.Active != 13000 {
 		t.Errorf("active tokens = %d, want 13000", resp.TokenTotals.Active)
+	}
+	if resp.Running[0].IssueURL != "https://github.com/test/repo/issues/42" {
+		t.Errorf("issue_url = %q", resp.Running[0].IssueURL)
+	}
+	if resp.Running[0].Alive == nil || *resp.Running[0].Alive {
+		t.Fatalf("running worker should expose alive=false for dead test PID")
+	}
+	if !resp.Running[0].NeedsAttention {
+		t.Error("running worker with alive=false should need attention")
+	}
+	if !contains(resp.Running[0].StatusReason, "PID is not alive") {
+		t.Errorf("status_reason = %q, want dead PID hint", resp.Running[0].StatusReason)
+	}
+	if resp.PROpen[0].PRURL != "https://github.com/test/repo/pull/10" {
+		t.Errorf("pr_url = %q", resp.PROpen[0].PRURL)
 	}
 }
 
@@ -144,6 +170,56 @@ func TestHandleWorkers(t *testing.T) {
 	workers := resp["workers"].([]interface{})
 	if len(workers) != 3 {
 		t.Errorf("workers array len = %d, want 3", len(workers))
+	}
+}
+
+func TestHandleLog(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/logs/slot-1?lines=2", nil)
+	w := httptest.NewRecorder()
+	srv.handleLog(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var resp logResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Slot != "slot-1" {
+		t.Errorf("slot = %q, want slot-1", resp.Slot)
+	}
+	if contains(resp.Text, "line one") {
+		t.Error("tail should not include older lines beyond requested limit")
+	}
+	if !contains(resp.Text, "line two") || !contains(resp.Text, "line three") {
+		t.Errorf("tail text = %q, want last two lines", resp.Text)
+	}
+}
+
+func TestHandleLog_NotFound(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/logs/missing", nil)
+	w := httptest.NewRecorder()
+	srv.handleLog(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleLog_MethodNotAllowed(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/logs/slot-1", nil)
+	w := httptest.NewRecorder()
+	srv.handleLog(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
 	}
 }
 
@@ -273,6 +349,31 @@ func TestHandleRefresh_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandleRefresh_ReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:     "test/repo",
+		StateDir: dir,
+		Server:   config.ServerConfig{Port: 8765, ReadOnly: true},
+	}
+
+	refreshCh := make(chan struct{}, 1)
+	srv := New(cfg, refreshCh)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/refresh", nil)
+	w := httptest.NewRecorder()
+	srv.handleRefresh(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	select {
+	case <-refreshCh:
+		t.Error("refresh channel should not receive signal in read-only mode")
+	default:
+	}
+}
+
 func TestHandleDashboard(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
@@ -291,8 +392,29 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "test/repo") {
 		t.Error("dashboard should contain repo name")
 	}
-	if !contains(body, "Fix bug") {
-		t.Error("dashboard should contain issue titles")
+	if !contains(body, "api/v1/logs") {
+		t.Error("dashboard should include log API polling")
+	}
+	if !contains(body, "Workers") {
+		t.Error("dashboard should render worker table shell")
+	}
+	if !contains(body, "status-note") {
+		t.Error("dashboard should include status explanation block")
+	}
+	if !contains(body, "issue_url") || !contains(body, "pr_url") {
+		t.Error("dashboard should render GitHub issue/PR links from API fields")
+	}
+}
+
+func TestGitHubURLs(t *testing.T) {
+	if got := githubIssueURL("owner/repo", 42); got != "https://github.com/owner/repo/issues/42" {
+		t.Errorf("githubIssueURL() = %q", got)
+	}
+	if got := githubPRURL("owner/repo", 10); got != "https://github.com/owner/repo/pull/10" {
+		t.Errorf("githubPRURL() = %q", got)
+	}
+	if got := githubIssueURL("not-a-repo", 42); got != "" {
+		t.Errorf("githubIssueURL(invalid) = %q, want empty", got)
 	}
 }
 
@@ -370,6 +492,13 @@ func TestEscapeHTML(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("escapeHTML(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestStripANSI(t *testing.T) {
+	got := stripANSI("\x1b[0mhello \x1b[90mgrey\x1b[0m")
+	if got != "hello grey" {
+		t.Errorf("stripANSI() = %q, want hello grey", got)
 	}
 }
 

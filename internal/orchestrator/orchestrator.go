@@ -1984,6 +1984,16 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if s.IssueInProgress(issue.Number) {
 			continue
 		}
+		if s.IssueDone(issue.Number) {
+			closed, err := o.isIssueClosed(issue.Number)
+			if err != nil {
+				log.Printf("[orch] warn: could not verify closed issue #%d before dispatch: %v", issue.Number, err)
+			} else if closed {
+				log.Printf("[orch] skipping issue #%d: already closed with completed session", issue.Number)
+				o.syncProject(issue.Number, github.ProjectStatusDone)
+				continue
+			}
+		}
 
 		// Skip mission parent issues — they are decomposed, not dispatched directly
 		if s.IsMissionParent(issue.Number) {

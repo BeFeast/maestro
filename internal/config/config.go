@@ -63,7 +63,9 @@ type RoutingConfig struct {
 
 // ServerConfig controls the optional HTTP API server.
 type ServerConfig struct {
-	Port int `yaml:"port"` // 0 = disabled (default)
+	Host     string `yaml:"host"`      // host/interface to bind; default: 127.0.0.1
+	Port     int    `yaml:"port"`      // 0 = disabled (default)
+	ReadOnly bool   `yaml:"read_only"` // disable mutating HTTP endpoints when true
 }
 
 // RoleConfig defines settings for a single pipeline role (planner, validator).
@@ -303,6 +305,9 @@ func parse(data []byte) (*Config, error) {
 
 	if cfg.Telegram.Mode == "" {
 		cfg.Telegram.Mode = "direct"
+	}
+	if strings.TrimSpace(cfg.Server.Host) == "" {
+		cfg.Server.Host = "127.0.0.1"
 	}
 
 	// Model backend defaults
