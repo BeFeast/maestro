@@ -70,6 +70,28 @@ issue_labels: []
 	}
 }
 
+func TestParse_AutoRestoreFiles(t *testing.T) {
+	yaml := `
+repo: owner/repo
+auto_restore_files:
+  - ok-gobot
+  - build/output.bin
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"ok-gobot", "build/output.bin"}
+	if len(cfg.AutoRestoreFiles) != len(want) {
+		t.Fatalf("AutoRestoreFiles = %v, want %v", cfg.AutoRestoreFiles, want)
+	}
+	for i, file := range cfg.AutoRestoreFiles {
+		if file != want[i] {
+			t.Errorf("AutoRestoreFiles[%d] = %q, want %q", i, file, want[i])
+		}
+	}
+}
+
 func TestParse_IssueLabelsLegacyMerged(t *testing.T) {
 	yaml := `
 repo: owner/repo
@@ -734,6 +756,38 @@ merge_interval_seconds: 45
 	}
 	if cfg.MergeIntervalSeconds != 45 {
 		t.Errorf("MergeIntervalSeconds = %d, want 45", cfg.MergeIntervalSeconds)
+	}
+}
+
+func TestParse_ReviewGateDefaults(t *testing.T) {
+	yaml := `repo: owner/repo`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.ReviewGate != "greptile" {
+		t.Errorf("ReviewGate = %q, want %q", cfg.ReviewGate, "greptile")
+	}
+	if cfg.AutoRetryReviewFeedback {
+		t.Error("AutoRetryReviewFeedback should default to false")
+	}
+}
+
+func TestParse_ReviewGateExplicitNone(t *testing.T) {
+	yaml := `
+repo: owner/repo
+review_gate: none
+auto_retry_review_feedback: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.ReviewGate != "none" {
+		t.Errorf("ReviewGate = %q, want %q", cfg.ReviewGate, "none")
+	}
+	if !cfg.AutoRetryReviewFeedback {
+		t.Error("AutoRetryReviewFeedback should be true when configured")
 	}
 }
 

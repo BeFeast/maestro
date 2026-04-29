@@ -147,15 +147,18 @@ type Config struct {
 	StateDir                   string               `yaml:"state_dir"`           // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model                      ModelConfig          `yaml:"model"`
 	Routing                    RoutingConfig        `yaml:"routing"`
-	DeployCmd                  string               `yaml:"deploy_cmd"`             // shell command to run after successful PR merge
-	DeployTimeoutMinutes       int                  `yaml:"deploy_timeout_minutes"` // timeout for deploy command in minutes (default: 15)
-	MergeStrategy              string               `yaml:"merge_strategy"`         // "sequential" | "parallel"
-	MergeIntervalSeconds       int                  `yaml:"merge_interval_seconds"` // minimum seconds between merges in sequential mode
+	DeployCmd                  string               `yaml:"deploy_cmd"`                 // shell command to run after successful PR merge
+	DeployTimeoutMinutes       int                  `yaml:"deploy_timeout_minutes"`     // timeout for deploy command in minutes (default: 15)
+	MergeStrategy              string               `yaml:"merge_strategy"`             // "sequential" | "parallel"
+	MergeIntervalSeconds       int                  `yaml:"merge_interval_seconds"`     // minimum seconds between merges in sequential mode
+	ReviewGate                 string               `yaml:"review_gate"`                // "greptile" (default) | "none"
+	AutoRetryReviewFeedback    bool                 `yaml:"auto_retry_review_feedback"` // close PRs with review comments and respawn a fixer
 	Telegram                   TelegramConfig       `yaml:"telegram"`
 	Versioning                 VersioningConfig     `yaml:"versioning"`
 	GitHubProjects             GitHubProjectsConfig `yaml:"github_projects"`
 	MaxRetryBackoffMs          int                  `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles           []string             `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
+	AutoRestoreFiles           []string             `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase
 	CleanupWorktreesOnMerge    *bool                `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	Pipeline                   PipelineConfig       `yaml:"pipeline"`
 	Hooks                      HooksConfig          `yaml:"hooks"`
@@ -223,6 +226,7 @@ func parse(data []byte) (*Config, error) {
 		ClaudeCmd:            "claude",
 		MergeStrategy:        "sequential",
 		MergeIntervalSeconds: 30,
+		ReviewGate:           "greptile",
 		AutoResolveFiles: []string{
 			"server/src/api/mod.rs",
 			"web/src/lib/api.ts",
@@ -356,6 +360,16 @@ func parse(data []byte) (*Config, error) {
 	}
 	if cfg.MergeIntervalSeconds <= 0 {
 		cfg.MergeIntervalSeconds = 30
+	}
+
+	// Review gate defaults
+	switch strings.ToLower(strings.TrimSpace(cfg.ReviewGate)) {
+	case "", "greptile":
+		cfg.ReviewGate = "greptile"
+	case "none", "off", "disabled":
+		cfg.ReviewGate = "none"
+	default:
+		cfg.ReviewGate = "greptile"
 	}
 
 	// Default hooks timeout

@@ -77,7 +77,7 @@ type Orchestrator struct {
 	ghCollectPRReviewFeedbackFn func(prNumber int) (string, error)
 	ghCloseIssueFn              func(number int, comment string) error
 	workerStopFn                func(cfg *config.Config, slotName string, sess *state.Session) error
-	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles []string) error
+	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 }
 
 // New creates a new Orchestrator
@@ -223,9 +223,9 @@ func (o *Orchestrator) respawnInPlace(slotName string, sess *state.Session, issu
 
 func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
 	if o.rebaseWorktreeFn != nil {
-		return o.rebaseWorktreeFn(worktreePath, branch, o.cfg.AutoResolveFiles)
+		return o.rebaseWorktreeFn(worktreePath, branch, o.cfg.AutoResolveFiles, o.cfg.AutoRestoreFiles)
 	}
-	return worker.RebaseWorktree(worktreePath, branch, o.cfg.AutoResolveFiles)
+	return worker.RebaseWorktree(worktreePath, branch, o.cfg.AutoResolveFiles, o.cfg.AutoRestoreFiles)
 }
 
 func (o *Orchestrator) captureTmux(session string) (string, error) {
@@ -471,11 +471,11 @@ Focus on fixing the CI failures while still implementing the issue requirements.
 }
 
 // appendReviewFeedbackContext appends a section to the worker prompt with
-// Greptile code review findings from the previous failed attempt.
+// code review findings from the previous failed attempt.
 func appendReviewFeedbackContext(promptBase, feedback string) string {
 	return fmt.Sprintf(`%s
 
-### Code Review Findings (from Greptile)
+### Code Review Findings
 
 The following code review comments were left on the previous PR. Address ALL of these issues:
 
@@ -483,6 +483,26 @@ The following code review comments were left on the previous PR. Address ALL of 
 
 IMPORTANT: Address ALL code review findings above before creating a new PR.
 Do NOT repeat the same mistakes.
+`, promptBase, feedback)
+}
+
+// appendRebaseConflictContext appends a section to the worker prompt with
+// auto-rebase failure details so the retry worker can update the same PR branch.
+func appendRebaseConflictContext(promptBase, feedback string) string {
+	return fmt.Sprintf(`%s
+
+### Rebase Conflict
+
+Maestro tried to update the existing PR branch against origin/main, but git rebase hit conflicts.
+You are a retry worker running in the same worktree and branch.
+
+Resolve the conflicts, keep the PR focused on the original issue, run validation, commit the fix, and push to the existing PR branch.
+Do NOT open a second PR.
+
+Rebase failure details:
+`+"```"+`
+%s
+`+"```"+`
 `, promptBase, feedback)
 }
 
@@ -498,10 +518,40 @@ func (o *Orchestrator) canRetryIssue(s *state.State, sess *state.Session) bool {
 	return totalAttempts < maxRetries
 }
 
+func pendingRetryReservations(s *state.State) int {
+	count := 0
+	for _, sess := range s.Sessions {
+		if sess.Status == state.StatusDead && sess.NextRetryAt != nil {
+			count++
+		}
+	}
+	return count
+}
+
 // respawnDueRetries checks dead sessions with a scheduled retry time and
 // respawns them when the backoff period has elapsed.
-func (o *Orchestrator) respawnDueRetries(s *state.State) {
-	for slotName, sess := range s.Sessions {
+func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
+	if slots <= 0 {
+		if pending := pendingRetryReservations(s); pending > 0 {
+			log.Printf("[orch] retry queue has %d pending session(s), but no worker slots are available", pending)
+		}
+		return
+	}
+
+	slotNames := make([]string, 0, len(s.Sessions))
+	for slotName := range s.Sessions {
+		slotNames = append(slotNames, slotName)
+	}
+	sort.Strings(slotNames)
+
+	respawned := 0
+	for _, slotName := range slotNames {
+		if respawned >= slots {
+			log.Printf("[orch] retry queue still has pending session(s), but retry slots are exhausted")
+			return
+		}
+
+		sess := s.Sessions[slotName]
 		if sess.Status != state.StatusDead {
 			continue
 		}
@@ -538,22 +588,34 @@ func (o *Orchestrator) respawnDueRetries(s *state.State) {
 			sess.CIFailureOutput = "" // consumed — don't persist stale output
 		}
 		if sess.PreviousAttemptFeedback != "" {
-			promptBase = appendReviewFeedbackContext(promptBase, sess.PreviousAttemptFeedback)
+			if sess.PreviousAttemptFeedbackKind == "rebase_conflict" {
+				promptBase = appendRebaseConflictContext(promptBase, sess.PreviousAttemptFeedback)
+			} else {
+				promptBase = appendReviewFeedbackContext(promptBase, sess.PreviousAttemptFeedback)
+			}
 			sess.PreviousAttemptFeedback = "" // consumed — don't persist stale feedback
+			sess.PreviousAttemptFeedbackKind = ""
 		}
 
-		if err := o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend); err != nil {
-			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, err)
+		var respawnErr error
+		if sess.PRNumber != 0 && sess.Worktree != "" {
+			respawnErr = o.respawnInPlace(slotName, sess, issue, promptBase, sess.Backend)
+		} else {
+			respawnErr = o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend)
+		}
+		if respawnErr != nil {
+			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, respawnErr)
 			sess.Status = state.StatusFailed
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
 			o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) respawn failed: %v",
-				slotName, sess.IssueNumber, sess.IssueTitle, err)
+				slotName, sess.IssueNumber, sess.IssueTitle, respawnErr)
 			continue
 		}
 
 		o.notifier.Sendf("🔄 maestro: retrying worker %s for issue #%d: %s (attempt %d)",
 			slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount)
+		respawned++
 	}
 }
 
@@ -635,7 +697,8 @@ func (o *Orchestrator) RunOnce() error {
 	o.checkSessions(s)
 
 	// Step 2b: Respawn dead sessions whose backoff has elapsed
-	o.respawnDueRetries(s)
+	retrySlots := availableSlots(o.cfg, s, len(s.ActiveSessions()))
+	o.respawnDueRetries(s, retrySlots)
 
 	// Step 3: Auto-merge green PRs
 	o.autoMergePRs(s)
@@ -661,6 +724,13 @@ func (o *Orchestrator) RunOnce() error {
 	// Step 5: Start new workers for available slots
 	active := len(s.ActiveSessions())
 	slots := availableSlots(o.cfg, s, active)
+	if reserved := pendingRetryReservations(s); reserved > 0 && slots > 0 {
+		if reserved > slots {
+			reserved = slots
+		}
+		slots -= reserved
+		log.Printf("[orch] reserving %d worker slot(s) for scheduled retries", reserved)
+	}
 	log.Printf("[orch] active=%d max=%d available_slots=%d", active, o.cfg.MaxParallel, slots)
 
 	if slots > 0 {
@@ -770,6 +840,14 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	if newCfg.MergeIntervalSeconds != old.MergeIntervalSeconds {
 		changed = append(changed, fmt.Sprintf("merge_interval_seconds: %d→%d", old.MergeIntervalSeconds, newCfg.MergeIntervalSeconds))
 		o.cfg.MergeIntervalSeconds = newCfg.MergeIntervalSeconds
+	}
+	if newCfg.ReviewGate != old.ReviewGate {
+		changed = append(changed, fmt.Sprintf("review_gate: %s→%s", old.ReviewGate, newCfg.ReviewGate))
+		o.cfg.ReviewGate = newCfg.ReviewGate
+	}
+	if newCfg.AutoRetryReviewFeedback != old.AutoRetryReviewFeedback {
+		changed = append(changed, fmt.Sprintf("auto_retry_review_feedback: %v→%v", old.AutoRetryReviewFeedback, newCfg.AutoRetryReviewFeedback))
+		o.cfg.AutoRetryReviewFeedback = newCfg.AutoRetryReviewFeedback
 	}
 	if newCfg.DeployCmd != old.DeployCmd {
 		changed = append(changed, fmt.Sprintf("deploy_cmd: %q→%q", old.DeployCmd, newCfg.DeployCmd))
@@ -1076,12 +1154,18 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if running session has opened a PR (worker still alive)
 			if pr, found := branchToPR[sess.Branch]; found {
-				log.Printf("[orch] worker %s opened PR #%d while still running — transitioning to pr_open", slotName, pr.Number)
-				sess.Status = state.StatusPROpen
-				sess.PRNumber = pr.Number
-				o.notifier.Sendf("🔀 maestro: worker %s opened PR #%d for issue #%d (%s)",
-					slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
-				continue
+				if sess.PRNumber == pr.Number {
+					// In-place review/CI retries intentionally keep working on an
+					// already-open PR. Do not transition back to pr_open until the
+					// worker exits, otherwise the fixer is interrupted mid-run.
+				} else {
+					log.Printf("[orch] worker %s opened PR #%d while still running — transitioning to pr_open", slotName, pr.Number)
+					sess.Status = state.StatusPROpen
+					sess.PRNumber = pr.Number
+					o.notifier.Sendf("🔀 maestro: worker %s opened PR #%d for issue #%d (%s)",
+						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
+					continue
+				}
 			}
 
 			// Capture tmux pane output for token tracking, rate-limit detection,
@@ -1334,6 +1418,22 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			sess.LastNotifiedStatus = ""
 			sess.NotifiedCIFail = false // backward compat
 
+			if o.cfg.AutoRetryReviewFeedback {
+				reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
+				if err != nil {
+					log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
+				} else if strings.TrimSpace(reviewFeedback) != "" {
+					log.Printf("[orch] PR #%d has review feedback; scheduling retry", pr.Number)
+					o.handleReviewFeedbackRetry(s, slotName, sess, pr, reviewFeedback)
+					continue
+				}
+			}
+
+			if o.reviewGate() == "none" {
+				ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
+				continue
+			}
+
 			greptileOK, greptilePending, err := o.prGreptileApproved(pr.Number)
 			if err != nil {
 				log.Printf("[orch] greptile check PR #%d: %v", pr.Number, err)
@@ -1404,6 +1504,60 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	}
 }
 
+// handleReviewFeedbackRetry schedules a retry worker with review feedback in
+// its prompt. When the PR worktree is still available, keep the PR open and
+// respawn in place so the fixer pushes updates to the same PR.
+func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string, sess *state.Session, pr github.PR, reviewFeedback string) {
+	maxRetries := o.cfg.MaxRetriesPerIssue
+	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
+
+	if maxRetries > 0 && totalAttempts >= maxRetries {
+		log.Printf("[orch] review feedback on PR #%d — retry limit reached (%d/%d) for issue #%d",
+			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
+		s.MarkIssueRetryExhausted(sess.IssueNumber)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+		sess.Status = state.StatusRetryExhausted
+		sess.NextRetryAt = nil
+		sess.LastNotifiedStatus = "review_retry_exhausted"
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		o.notifier.Sendf("💀 maestro: review feedback on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
+			pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+		return
+	}
+
+	if sess.Worktree == "" {
+		closeComment := fmt.Sprintf("Code review feedback detected, but the PR worktree is unavailable — maestro is closing this PR and respawning a worker to address it (attempt %d).\n\nReview feedback:\n\n%s",
+			sess.RetryCount+1, reviewFeedback)
+		if err := o.closePR(pr.Number, closeComment); err != nil {
+			log.Printf("[orch] warn: could not close PR #%d after review feedback: %v — skipping retry", pr.Number, err)
+			return
+		}
+		log.Printf("[orch] closed PR #%d due to review feedback (worktree unavailable)", pr.Number)
+		sess.PRNumber = 0
+	} else {
+		log.Printf("[orch] keeping PR #%d open and respawning %s in place to address review feedback", pr.Number, slotName)
+		sess.PRNumber = pr.Number
+	}
+
+	sess.CIFailureOutput = ""
+	sess.PreviousAttemptFeedback = reviewFeedback
+	sess.PreviousAttemptFeedbackKind = "review_feedback"
+
+	sess.RetryCount++
+	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
+	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
+	sess.NextRetryAt = &retryAt
+	sess.Status = state.StatusDead
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+
+	log.Printf("[orch] review feedback on PR #%d — scheduling retry %d in %dms for issue #%d",
+		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
+	o.notifier.Sendf("🔄 maestro: review feedback on PR #%d (issue #%d: %s), in-place retry %d scheduled in %ds",
+		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
+}
+
 // handleCIFailureRetry closes the failed PR, captures CI output, cleans up,
 // and schedules a retry for the worker (respecting max_retries_per_issue).
 func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, sess *state.Session, pr github.PR) {
@@ -1450,6 +1604,11 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	// Store CI failure output and review feedback for the next worker
 	sess.CIFailureOutput = ciOutput
 	sess.PreviousAttemptFeedback = reviewFeedback
+	if strings.TrimSpace(reviewFeedback) != "" {
+		sess.PreviousAttemptFeedbackKind = "review_feedback"
+	} else {
+		sess.PreviousAttemptFeedbackKind = ""
+	}
 
 	// Schedule retry with exponential backoff
 	sess.RetryCount++
@@ -1465,6 +1624,15 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
 	o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), retry %d scheduled in %ds",
 		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
+}
+
+func (o *Orchestrator) reviewGate() string {
+	switch strings.ToLower(strings.TrimSpace(o.cfg.ReviewGate)) {
+	case "none", "off", "disabled":
+		return "none"
+	default:
+		return "greptile"
+	}
 }
 
 func (o *Orchestrator) mergeStrategy() string {
@@ -1614,7 +1782,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			log.Printf("[orch] PR #%d has conflicts, auto-rebasing %s", pr.Number, slotName)
 			if err := o.rebaseWorktree(sess.Worktree, sess.Branch); err != nil {
 				log.Printf("[orch] rebase failed for %s: %v", slotName, err)
-				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
+				o.handleRebaseConflictRetry(s, slotName, sess, pr.Number, err)
 				continue
 			}
 			o.markRebaseQueued(slotName, sess, pr.Number)
@@ -1631,7 +1799,7 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			log.Printf("[orch] retrying auto-rebase for conflict_failed session %s (PR #%d)", slotName, pr.Number)
 			if err := o.rebaseWorktree(sess.Worktree, sess.Branch); err != nil {
 				log.Printf("[orch] rebase retry failed for %s: %v", slotName, err)
-				o.markUnresolvableConflict(slotName, sess, pr.Number, err)
+				o.handleRebaseConflictRetry(s, slotName, sess, pr.Number, err)
 				continue
 			}
 			o.markRebaseQueued(slotName, sess, pr.Number)
@@ -1648,6 +1816,74 @@ func (o *Orchestrator) markRebaseQueued(slotName string, sess *state.Session, pr
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	o.notifier.Sendf("🔄 maestro: rebased %s (PR #%d) successfully; session moved to queued", slotName, prNumber)
+}
+
+func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string, sess *state.Session, prNumber int, cause error) {
+	if !o.cfg.AutoRetryReviewFeedback {
+		o.markUnresolvableConflict(slotName, sess, prNumber, cause)
+		return
+	}
+
+	maxRetries := o.cfg.MaxRetriesPerIssue
+	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
+	if maxRetries > 0 && totalAttempts >= maxRetries {
+		log.Printf("[orch] rebase conflict on PR #%d — retry limit reached (%d/%d) for issue #%d",
+			prNumber, totalAttempts, maxRetries, sess.IssueNumber)
+		s.MarkIssueRetryExhausted(sess.IssueNumber)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+		sess.Status = state.StatusRetryExhausted
+		sess.NextRetryAt = nil
+		sess.LastNotifiedStatus = "rebase_conflict_retry_exhausted"
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		o.notifier.Sendf("💀 maestro: rebase conflict on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
+			prNumber, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+		return
+	}
+
+	if sess.Worktree == "" {
+		closeComment := fmt.Sprintf("Auto-rebase hit conflicts, but the PR worktree is unavailable — maestro is closing this PR and respawning a worker to resolve the conflict from a fresh branch (attempt %d).\n\nRebase failure:\n\n```\n%s\n```",
+			sess.RetryCount+1, rebaseConflictFeedback(prNumber, cause))
+		if err := o.closePR(prNumber, closeComment); err != nil {
+			log.Printf("[orch] warn: could not close PR #%d after rebase conflict: %v — marking conflict_failed", prNumber, err)
+			o.markUnresolvableConflict(slotName, sess, prNumber, cause)
+			return
+		}
+		log.Printf("[orch] closed PR #%d due to rebase conflict (worktree unavailable)", prNumber)
+		sess.PRNumber = 0
+	} else {
+		log.Printf("[orch] keeping PR #%d open and respawning %s in place to resolve rebase conflicts", prNumber, slotName)
+		sess.PRNumber = prNumber
+	}
+
+	sess.CIFailureOutput = ""
+	sess.PreviousAttemptFeedback = rebaseConflictFeedback(prNumber, cause)
+	sess.PreviousAttemptFeedbackKind = "rebase_conflict"
+
+	sess.RetryCount++
+	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
+	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
+	sess.NextRetryAt = &retryAt
+	sess.Status = state.StatusDead
+	sess.RebaseAttempted = true
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+
+	log.Printf("[orch] rebase conflict on PR #%d — scheduling retry %d in %dms for issue #%d",
+		prNumber, sess.RetryCount, backoffMs, sess.IssueNumber)
+	o.notifier.Sendf("🔄 maestro: rebase conflict on PR #%d (issue #%d: %s), in-place retry %d scheduled in %ds",
+		prNumber, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
+}
+
+func rebaseConflictFeedback(prNumber int, cause error) string {
+	msg := "(rebase failure unavailable)"
+	if cause != nil {
+		msg = strings.TrimSpace(cause.Error())
+	}
+	if len(msg) > 8000 {
+		msg = msg[:8000] + "\n... (truncated)"
+	}
+	return fmt.Sprintf("PR #%d failed to rebase onto origin/main.\n\n%s", prNumber, msg)
 }
 
 func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Session, prNumber int, cause error) {
