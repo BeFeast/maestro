@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -784,5 +785,72 @@ func TestCountByStatus_Empty(t *testing.T) {
 	counts := s.CountByStatus()
 	if len(counts) != 0 {
 		t.Errorf("expected empty map for empty state, got %v", counts)
+	}
+}
+
+func TestSupervisorDecisionPersistence(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	s := NewState()
+	s.RecordSupervisorDecision(SupervisorDecision{
+		ID:                "sup-test",
+		CreatedAt:         now,
+		Project:           "owner/repo",
+		Mode:              "read_only",
+		Summary:           "Start a worker for issue #42.",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 42},
+		Risk:              "mutating",
+		Confidence:        0.84,
+		Reasons:           []string{"Issue #42 is eligible"},
+		ProjectState: SupervisorProjectState{
+			Sessions:       0,
+			OpenIssues:     1,
+			AvailableSlots: 1,
+		},
+	}, DefaultSupervisorDecisionLimit)
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	latest := loaded.LatestSupervisorDecision()
+	if latest == nil {
+		t.Fatal("latest supervisor decision missing")
+	}
+	if latest.ID != "sup-test" {
+		t.Fatalf("ID = %q, want sup-test", latest.ID)
+	}
+	if latest.Target == nil || latest.Target.Issue != 42 {
+		t.Fatalf("target = %#v, want issue 42", latest.Target)
+	}
+	if latest.ProjectState.OpenIssues != 1 {
+		t.Fatalf("open issues = %d, want 1", latest.ProjectState.OpenIssues)
+	}
+}
+
+func TestRecordSupervisorDecisionPrunesOldRecords(t *testing.T) {
+	s := NewState()
+	now := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		s.RecordSupervisorDecision(SupervisorDecision{
+			ID:        fmt.Sprintf("sup-%d", i),
+			CreatedAt: now.Add(time.Duration(i) * time.Minute),
+		}, 3)
+	}
+
+	if len(s.SupervisorDecisions) != 3 {
+		t.Fatalf("decisions = %d, want 3", len(s.SupervisorDecisions))
+	}
+	if s.SupervisorDecisions[0].ID != "sup-2" {
+		t.Fatalf("first retained ID = %q, want sup-2", s.SupervisorDecisions[0].ID)
+	}
+	latest := s.LatestSupervisorDecision()
+	if latest == nil || latest.ID != "sup-4" {
+		t.Fatalf("latest = %#v, want sup-4", latest)
 	}
 }

@@ -94,15 +94,17 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // stateResponse is the JSON shape for GET /api/v1/state.
 type stateResponse struct {
-	Repo        string          `json:"repo"`
-	MaxParallel int             `json:"max_parallel"`
-	ReadOnly    bool            `json:"read_only"`
-	All         []sessionInfo   `json:"all"`
-	Running     []sessionInfo   `json:"running"`
-	PROpen      []sessionInfo   `json:"pr_open"`
-	Queued      []sessionInfo   `json:"queued"`
-	TokenTotals tokenTotalsInfo `json:"token_totals"`
-	Summary     map[string]int  `json:"summary"`
+	Repo                string                     `json:"repo"`
+	MaxParallel         int                        `json:"max_parallel"`
+	ReadOnly            bool                       `json:"read_only"`
+	All                 []sessionInfo              `json:"all"`
+	Running             []sessionInfo              `json:"running"`
+	PROpen              []sessionInfo              `json:"pr_open"`
+	Queued              []sessionInfo              `json:"queued"`
+	TokenTotals         tokenTotalsInfo            `json:"token_totals"`
+	Summary             map[string]int             `json:"summary"`
+	SupervisorLatest    *state.SupervisorDecision  `json:"supervisor_latest,omitempty"`
+	SupervisorDecisions []state.SupervisorDecision `json:"supervisor_decisions,omitempty"`
 }
 
 type tokenTotalsInfo struct {
@@ -277,14 +279,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := stateResponse{
-		Repo:        s.cfg.Repo,
-		MaxParallel: s.cfg.MaxParallel,
-		ReadOnly:    s.cfg.Server.ReadOnly,
-		All:         make([]sessionInfo, 0, len(st.Sessions)),
-		Running:     make([]sessionInfo, 0),
-		PROpen:      make([]sessionInfo, 0),
-		Queued:      make([]sessionInfo, 0),
-		Summary:     make(map[string]int),
+		Repo:                s.cfg.Repo,
+		MaxParallel:         s.cfg.MaxParallel,
+		ReadOnly:            s.cfg.Server.ReadOnly,
+		All:                 make([]sessionInfo, 0, len(st.Sessions)),
+		Running:             make([]sessionInfo, 0),
+		PROpen:              make([]sessionInfo, 0),
+		Queued:              make([]sessionInfo, 0),
+		Summary:             make(map[string]int),
+		SupervisorLatest:    st.LatestSupervisorDecision(),
+		SupervisorDecisions: st.SupervisorDecisions,
 	}
 
 	var activeTokens, totalTokens int
