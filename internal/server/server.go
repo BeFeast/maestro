@@ -105,8 +105,63 @@ type stateResponse struct {
 	TokenTotals         tokenTotalsInfo              `json:"token_totals"`
 	Summary             map[string]int               `json:"summary"`
 	StuckStates         []state.SupervisorStuckState `json:"stuck_states,omitempty"`
+	Supervisor          supervisorInfo               `json:"supervisor"`
 	SupervisorLatest    *state.SupervisorDecision    `json:"supervisor_latest,omitempty"`
 	SupervisorDecisions []state.SupervisorDecision   `json:"supervisor_decisions,omitempty"`
+}
+
+type supervisorInfo struct {
+	HasRun          bool                    `json:"has_run"`
+	EmptyState      string                  `json:"empty_state,omitempty"`
+	Latest          *supervisorDecisionInfo `json:"latest,omitempty"`
+	LastSafeAction  *supervisorActionInfo   `json:"last_safe_action,omitempty"`
+	ApprovalActions []supervisorActionInfo  `json:"approval_actions,omitempty"`
+}
+
+type supervisorDecisionInfo struct {
+	ID                string                       `json:"id"`
+	CreatedAt         time.Time                    `json:"created_at"`
+	Project           string                       `json:"project"`
+	Mode              string                       `json:"mode"`
+	PolicyRule        string                       `json:"policy_rule,omitempty"`
+	Status            string                       `json:"status,omitempty"`
+	Summary           string                       `json:"summary"`
+	RecommendedAction string                       `json:"recommended_action"`
+	Target            *state.SupervisorTarget      `json:"target,omitempty"`
+	TargetLinks       []targetLinkInfo             `json:"target_links,omitempty"`
+	Risk              string                       `json:"risk"`
+	Confidence        float64                      `json:"confidence"`
+	ErrorClass        string                       `json:"error_class,omitempty"`
+	Reasons           []string                     `json:"reasons,omitempty"`
+	Mutations         []state.SupervisorMutation   `json:"mutations,omitempty"`
+	StuckStates       []state.SupervisorStuckState `json:"stuck_states,omitempty"`
+	StuckReasons      []string                     `json:"stuck_reasons,omitempty"`
+	ProjectState      state.SupervisorProjectState `json:"project_state"`
+	Queue             *supervisorQueueInfo         `json:"queue,omitempty"`
+}
+
+type supervisorActionInfo struct {
+	Action         string                  `json:"action"`
+	Summary        string                  `json:"summary"`
+	Risk           string                  `json:"risk"`
+	CreatedAt      time.Time               `json:"created_at"`
+	Target         *state.SupervisorTarget `json:"target,omitempty"`
+	TargetLinks    []targetLinkInfo        `json:"target_links,omitempty"`
+	Disabled       bool                    `json:"disabled"`
+	DisabledReason string                  `json:"disabled_reason,omitempty"`
+}
+
+type targetLinkInfo struct {
+	Kind  string `json:"kind"`
+	Label string `json:"label"`
+	URL   string `json:"url,omitempty"`
+}
+
+type supervisorQueueInfo struct {
+	Enabled  bool   `json:"enabled"`
+	Label    string `json:"label,omitempty"`
+	Position int    `json:"position,omitempty"`
+	Total    int    `json:"total,omitempty"`
 }
 
 type tokenTotalsInfo struct {
@@ -195,6 +250,159 @@ func githubPRURL(repo string, prNumber int) string {
 		return ""
 	}
 	return fmt.Sprintf("https://github.com/%s/pull/%d", strings.TrimSpace(repo), prNumber)
+}
+
+func buildSupervisorInfo(cfg *config.Config, st *state.State) supervisorInfo {
+	info := supervisorInfo{
+		HasRun:          len(st.SupervisorDecisions) > 0,
+		EmptyState:      "No Supervisor has run yet. Run the supervisor to record orchestration rationale.",
+		ApprovalActions: make([]supervisorActionInfo, 0),
+	}
+	if !info.HasRun {
+		return info
+	}
+
+	latest := st.LatestSupervisorDecision()
+	if latest != nil {
+		info.EmptyState = ""
+		info.Latest = makeSupervisorDecisionInfo(cfg, st, *latest)
+		if latest.Risk != "" && latest.Risk != "safe" && latest.RecommendedAction != "" {
+			info.ApprovalActions = append(info.ApprovalActions, makeSupervisorActionInfo(cfg, *latest, true,
+				"Supervisor controls are not implemented yet; this read-only panel only shows the required action."))
+		}
+	}
+
+	if safe := latestSafeSupervisorDecision(st); safe != nil {
+		action := makeSupervisorActionInfo(cfg, *safe, false, "")
+		info.LastSafeAction = &action
+	}
+	return info
+}
+
+func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision state.SupervisorDecision) *supervisorDecisionInfo {
+	return &supervisorDecisionInfo{
+		ID:                decision.ID,
+		CreatedAt:         decision.CreatedAt,
+		Project:           decision.Project,
+		Mode:              decision.Mode,
+		PolicyRule:        decision.PolicyRule,
+		Status:            decision.Status,
+		Summary:           decision.Summary,
+		RecommendedAction: decision.RecommendedAction,
+		Target:            decision.Target,
+		TargetLinks:       supervisorTargetLinks(cfg.Repo, decision.Target),
+		Risk:              decision.Risk,
+		Confidence:        decision.Confidence,
+		ErrorClass:        decision.ErrorClass,
+		Reasons:           decision.Reasons,
+		Mutations:         decision.Mutations,
+		StuckStates:       decision.StuckStates,
+		StuckReasons:      supervisorStuckReasons(decision),
+		ProjectState:      decision.ProjectState,
+		Queue:             supervisorQueueInfoForDecision(cfg, st, decision),
+	}
+}
+
+func makeSupervisorActionInfo(cfg *config.Config, decision state.SupervisorDecision, disabled bool, disabledReason string) supervisorActionInfo {
+	return supervisorActionInfo{
+		Action:         decision.RecommendedAction,
+		Summary:        decision.Summary,
+		Risk:           decision.Risk,
+		CreatedAt:      decision.CreatedAt,
+		Target:         decision.Target,
+		TargetLinks:    supervisorTargetLinks(cfg.Repo, decision.Target),
+		Disabled:       disabled,
+		DisabledReason: disabledReason,
+	}
+}
+
+func latestSafeSupervisorDecision(st *state.State) *state.SupervisorDecision {
+	var latest *state.SupervisorDecision
+	for i := range st.SupervisorDecisions {
+		decision := &st.SupervisorDecisions[i]
+		if decision.Risk != "safe" {
+			continue
+		}
+		if latest == nil || decision.CreatedAt.After(latest.CreatedAt) {
+			latest = decision
+		}
+	}
+	return latest
+}
+
+func supervisorTargetLinks(repo string, target *state.SupervisorTarget) []targetLinkInfo {
+	if target == nil {
+		return nil
+	}
+	links := make([]targetLinkInfo, 0, 3)
+	if target.Issue > 0 {
+		links = append(links, targetLinkInfo{
+			Kind:  "issue",
+			Label: fmt.Sprintf("Issue #%d", target.Issue),
+			URL:   githubIssueURL(repo, target.Issue),
+		})
+	}
+	if target.PR > 0 {
+		links = append(links, targetLinkInfo{
+			Kind:  "pr",
+			Label: fmt.Sprintf("PR #%d", target.PR),
+			URL:   githubPRURL(repo, target.PR),
+		})
+	}
+	if strings.TrimSpace(target.Session) != "" {
+		links = append(links, targetLinkInfo{
+			Kind:  "session",
+			Label: "Session " + strings.TrimSpace(target.Session),
+		})
+	}
+	return links
+}
+
+func supervisorStuckReasons(decision state.SupervisorDecision) []string {
+	if len(decision.StuckStates) > 0 {
+		reasons := make([]string, 0, len(decision.StuckStates))
+		for _, stuck := range decision.StuckStates {
+			if strings.TrimSpace(stuck.Summary) != "" {
+				reasons = append(reasons, stuck.Summary)
+			}
+		}
+		return reasons
+	}
+
+	action := strings.TrimSpace(decision.RecommendedAction)
+	if action == "none" || strings.HasPrefix(action, "wait_") || decision.Risk == "approval_gated" {
+		return decision.Reasons
+	}
+
+	var reasons []string
+	for _, reason := range decision.Reasons {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "blocked") || strings.Contains(lower, "skipped") || strings.Contains(lower, "exhausted") || strings.Contains(lower, "no eligible") || strings.Contains(lower, "no worker slot") || strings.Contains(lower, "missing") {
+			reasons = append(reasons, reason)
+		}
+	}
+	return reasons
+}
+
+func supervisorQueueInfoForDecision(cfg *config.Config, st *state.State, decision state.SupervisorDecision) *supervisorQueueInfo {
+	if cfg == nil || !cfg.Supervisor.OrderedQueueActive() {
+		return nil
+	}
+	queue := &supervisorQueueInfo{
+		Enabled: true,
+		Label:   "Supervisor ordered issue queue",
+		Total:   len(cfg.Supervisor.OrderedQueue.Issues),
+	}
+	if decision.Target == nil || decision.Target.Issue <= 0 {
+		return queue
+	}
+	for i, issue := range cfg.Supervisor.OrderedQueue.Issues {
+		if issue == decision.Target.Issue {
+			queue.Position = i + 1
+			return queue
+		}
+	}
+	return queue
 }
 
 func validGitHubRepo(repo string) bool {
@@ -291,6 +499,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		PROpen:              make([]sessionInfo, 0),
 		Queued:              make([]sessionInfo, 0),
 		Summary:             make(map[string]int),
+		Supervisor:          buildSupervisorInfo(s.cfg, st),
 		SupervisorLatest:    latestDecision,
 		SupervisorDecisions: st.SupervisorDecisions,
 	}
@@ -705,7 +914,7 @@ const dashboardHTML = `<!DOCTYPE html>
   .log-panel {
     min-width: 0;
     display: grid;
-    grid-template-rows: 48px auto minmax(0, 1fr);
+    grid-template-rows: 48px auto auto minmax(0, 1fr);
     background: #080c11;
   }
   .log-head {
@@ -744,6 +953,45 @@ const dashboardHTML = `<!DOCTYPE html>
     gap: 10px;
     margin-left: 10px;
   }
+  .supervisor-panel {
+    border-bottom: 1px solid var(--line);
+    background: #0b1016;
+    padding: 12px 14px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .supervisor-head, .supervisor-main, .supervisor-meta, .supervisor-links, .supervisor-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .supervisor-head { justify-content: space-between; margin-bottom: 6px; }
+  .supervisor-title { color: var(--text); font-weight: 650; }
+  .supervisor-time { white-space: nowrap; }
+  .supervisor-action {
+    color: var(--text);
+    font-weight: 650;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .supervisor-summary { margin-top: 4px; color: var(--text); }
+  .supervisor-meta, .supervisor-links, .supervisor-actions { flex-wrap: wrap; margin-top: 6px; }
+  .supervisor-reasons {
+    margin: 6px 0 0;
+    padding-left: 16px;
+  }
+  .supervisor-reasons li { margin: 2px 0; }
+  .supervisor-approval {
+    height: 24px;
+    border: 1px solid rgba(210,153,34,.45);
+    border-radius: 6px;
+    background: rgba(210,153,34,.08);
+    color: var(--warn);
+    cursor: not-allowed;
+  }
+  .supervisor-empty { color: var(--muted); }
   pre {
     margin: 0;
     min-height: 0;
@@ -807,6 +1055,7 @@ const dashboardHTML = `<!DOCTYPE html>
       <div class="log-title" id="log-title">Log <span></span></div>
       <div class="log-meta" id="log-meta"></div>
     </div>
+    <div class="supervisor-panel" id="supervisor-panel"></div>
     <div class="status-note" id="status-note"></div>
     <pre id="log"><span class="muted">Select a worker.</span></pre>
   </section>
@@ -816,6 +1065,7 @@ window.MAESTRO_REPO = __REPO_JSON__;
 
 const state = {
   workers: [],
+  supervisor: null,
   selected: "",
   filter: "",
   lastLog: null
@@ -840,6 +1090,7 @@ const logEl = document.getElementById("log");
 const logTitleEl = document.getElementById("log-title");
 const logMetaEl = document.getElementById("log-meta");
 const statusNoteEl = document.getElementById("status-note");
+const supervisorPanelEl = document.getElementById("supervisor-panel");
 
 repoEl.textContent = window.MAESTRO_REPO || "";
 
@@ -869,6 +1120,34 @@ function compactNumber(value) {
 function linkHTML(url, label) {
   if (!url) return escapeText(label);
   return '<a href="' + escapeText(url) + '" target="_blank" rel="noreferrer">' + escapeText(label) + '</a>';
+}
+
+function actionLabel(action) {
+  return String(action || "-").replace(/_/g, " ");
+}
+
+function formatTimestamp(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+  let relative = seconds + "s ago";
+  if (seconds >= 86400) relative = Math.floor(seconds / 86400) + "d ago";
+  else if (seconds >= 3600) relative = Math.floor(seconds / 3600) + "h ago";
+  else if (seconds >= 60) relative = Math.floor(seconds / 60) + "m ago";
+  return date.toLocaleString() + " (" + relative + ")";
+}
+
+function targetLinksHTML(links) {
+  return (links || []).map(link => linkHTML(link.url, link.label)).join("");
+}
+
+function queueText(queue) {
+  if (!queue || !queue.enabled) return "";
+  const label = queue.label || "Queue";
+  if (queue.position && queue.total) return label + ": " + queue.position + " of " + queue.total;
+  if (queue.total) return label + ": " + queue.total + " item" + (queue.total === 1 ? "" : "s");
+  return label + ": empty";
 }
 
 function statusLabel(worker) {
@@ -915,6 +1194,55 @@ function renderStats(summary, total, maxParallel, readOnly) {
   statsEl.innerHTML = items.map(([label, value]) =>
     '<div class="stat"><strong>' + escapeText(value) + '</strong><span>' + escapeText(label) + '</span></div>'
   ).join("");
+}
+
+function renderSupervisor(info) {
+  if (!info || !info.has_run || !info.latest) {
+    const empty = info && info.empty_state ? info.empty_state : "No Supervisor has run yet.";
+    supervisorPanelEl.innerHTML = '<div class="supervisor-head">' +
+      '<span class="supervisor-title">Supervisor</span>' +
+      '<span class="supervisor-time">empty</span>' +
+      '</div>' +
+      '<div class="supervisor-empty">' + escapeText(empty) + '</div>';
+    return;
+  }
+
+  const latest = info.latest;
+  const links = targetLinksHTML(latest.target_links);
+  const queue = queueText(latest.queue);
+  const meta = [
+    latest.risk ? "Risk " + latest.risk : "",
+    latest.confidence ? "Confidence " + Number(latest.confidence).toFixed(2) : "",
+    queue
+  ].filter(Boolean);
+  const reasons = (latest.stuck_reasons && latest.stuck_reasons.length ? latest.stuck_reasons : latest.reasons || []).slice(0, 3);
+  const reasonHTML = reasons.length ? '<ul class="supervisor-reasons">' + reasons.map(reason =>
+    '<li>' + escapeText(reason) + '</li>'
+  ).join("") + '</ul>' : "";
+  const lastSafe = info.last_safe_action ? '<div class="supervisor-meta">' +
+    '<span>Last safe action: ' + escapeText(actionLabel(info.last_safe_action.action)) + '</span>' +
+    '<span>' + escapeText(formatTimestamp(info.last_safe_action.created_at)) + '</span>' +
+    '</div>' : "";
+  const approvals = (info.approval_actions || []).length ? '<div class="supervisor-actions">' +
+    '<span>Requires approval:</span>' +
+    (info.approval_actions || []).map(action =>
+      '<button class="supervisor-approval" disabled title="' + escapeText(action.disabled_reason || "Controls not available yet") + '">' +
+      escapeText(actionLabel(action.action)) +
+      '</button>'
+    ).join("") +
+    '</div>' : "";
+
+  supervisorPanelEl.innerHTML = '<div class="supervisor-head">' +
+    '<span class="supervisor-title">Supervisor</span>' +
+    '<span class="supervisor-time">' + escapeText(formatTimestamp(latest.created_at)) + '</span>' +
+    '</div>' +
+    '<div class="supervisor-main">' +
+    '<span class="supervisor-action">' + escapeText(actionLabel(latest.recommended_action)) + '</span>' +
+    (links ? '<span class="supervisor-links">' + links + '</span>' : "") +
+    '</div>' +
+    (latest.summary ? '<div class="supervisor-summary">' + escapeText(latest.summary) + '</div>' : "") +
+    (meta.length ? '<div class="supervisor-meta">' + meta.map(item => '<span>' + escapeText(item) + '</span>').join("") + '</div>' : "") +
+    reasonHTML + lastSafe + approvals;
 }
 
 function renderWorkers() {
@@ -984,7 +1312,9 @@ async function loadState() {
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
     state.workers = data.all || [];
+    state.supervisor = data.supervisor || null;
     renderStats(data.summary || {}, state.workers.length, data.max_parallel || 0, data.read_only);
+    renderSupervisor(state.supervisor);
     if (!state.selected && state.workers.length) state.selected = sortWorkers(state.workers)[0].slot;
     if (state.selected && !state.workers.some(worker => worker.slot === state.selected)) {
       state.selected = state.workers.length ? sortWorkers(state.workers)[0].slot : "";

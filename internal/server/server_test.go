@@ -157,6 +157,120 @@ func TestHandleState(t *testing.T) {
 	if resp.SupervisorLatest == nil || len(resp.SupervisorLatest.StuckStates) != 1 {
 		t.Fatalf("supervisor_latest stuck states missing: %#v", resp.SupervisorLatest)
 	}
+	if !resp.Supervisor.HasRun {
+		t.Fatal("supervisor.has_run = false, want true")
+	}
+	if resp.Supervisor.Latest == nil || resp.Supervisor.Latest.ID != "sup-test" {
+		t.Fatalf("supervisor.latest = %#v, want sup-test", resp.Supervisor.Latest)
+	}
+	if len(resp.Supervisor.Latest.StuckReasons) != 1 {
+		t.Fatalf("supervisor latest stuck reasons = %#v, want one", resp.Supervisor.Latest.StuckReasons)
+	}
+}
+
+func TestHandleStateSupervisorRationale(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:        "test/repo",
+		MaxParallel: 3,
+		StateDir:    dir,
+		Supervisor: config.SupervisorConfig{
+			OrderedQueue: config.SupervisorOrderedQueueConfig{Issues: []int{42, 43}},
+		},
+		Server: config.ServerConfig{Port: 8765},
+	}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "first PR",
+		Status:      state.StatusPROpen,
+		StartedAt:   now.Add(-2 * time.Hour),
+		PRNumber:    12,
+	}
+	st.Sessions["slot-2"] = &state.Session{
+		IssueNumber: 43,
+		IssueTitle:  "second PR",
+		Status:      state.StatusQueued,
+		StartedAt:   now.Add(-1 * time.Hour),
+		PRNumber:    20,
+	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-safe",
+		CreatedAt:         now.Add(-30 * time.Minute),
+		Project:           "test/repo",
+		Mode:              "read_only",
+		Summary:           "Session slot-1 already has open PR #12.",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &state.SupervisorTarget{Issue: 42, PR: 12, Session: "slot-1"},
+		Risk:              "safe",
+		Confidence:        0.9,
+		Reasons:           []string{"Session slot-1 is associated with open PR #12"},
+		ProjectState:      state.SupervisorProjectState{Sessions: 2, PROpen: 1, Queued: 1, OpenPRs: 2},
+	}, state.DefaultSupervisorDecisionLimit)
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-latest",
+		CreatedAt:         now,
+		Project:           "test/repo",
+		Mode:              "read_only",
+		Summary:           "Issue #43 exhausted its retry budget and needs manual review.",
+		RecommendedAction: "review_retry_exhausted",
+		Target:            &state.SupervisorTarget{Issue: 43, PR: 20, Session: "slot-2"},
+		Risk:              "approval_gated",
+		Confidence:        0.93,
+		Reasons: []string{
+			"Session slot-2 for issue #43 is retry_exhausted",
+			"Retry-exhausted work requires a human decision before more automation",
+		},
+		ProjectState: state.SupervisorProjectState{Sessions: 2, PROpen: 1, Queued: 1, OpenPRs: 2},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	srv := New(cfg, make(chan struct{}, 1))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.handleState(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if !resp.Supervisor.HasRun {
+		t.Fatal("supervisor.has_run = false, want true")
+	}
+	if resp.Supervisor.Latest == nil {
+		t.Fatal("supervisor.latest missing")
+	}
+	if resp.Supervisor.Latest.RecommendedAction != "review_retry_exhausted" {
+		t.Fatalf("latest action = %q", resp.Supervisor.Latest.RecommendedAction)
+	}
+	if len(resp.Supervisor.Latest.StuckReasons) != 2 {
+		t.Fatalf("stuck reasons = %d, want 2", len(resp.Supervisor.Latest.StuckReasons))
+	}
+	if !hasTargetLink(resp.Supervisor.Latest.TargetLinks, "issue", "https://github.com/test/repo/issues/43") {
+		t.Fatalf("latest target links = %#v, want issue link", resp.Supervisor.Latest.TargetLinks)
+	}
+	if !hasTargetLink(resp.Supervisor.Latest.TargetLinks, "pr", "https://github.com/test/repo/pull/20") {
+		t.Fatalf("latest target links = %#v, want PR link", resp.Supervisor.Latest.TargetLinks)
+	}
+	if resp.Supervisor.Latest.Queue == nil || !resp.Supervisor.Latest.Queue.Enabled || resp.Supervisor.Latest.Queue.Position != 2 || resp.Supervisor.Latest.Queue.Total != 2 {
+		t.Fatalf("queue = %#v, want position 2 of 2", resp.Supervisor.Latest.Queue)
+	}
+	if resp.Supervisor.LastSafeAction == nil || resp.Supervisor.LastSafeAction.Action != "monitor_open_pr" {
+		t.Fatalf("last safe action = %#v", resp.Supervisor.LastSafeAction)
+	}
+	if len(resp.Supervisor.ApprovalActions) != 1 || !resp.Supervisor.ApprovalActions[0].Disabled {
+		t.Fatalf("approval actions = %#v, want one disabled action", resp.Supervisor.ApprovalActions)
+	}
+	if resp.SupervisorLatest == nil || resp.SupervisorLatest.ID != "sup-latest" {
+		t.Fatalf("legacy supervisor_latest = %#v, want sup-latest", resp.SupervisorLatest)
+	}
 }
 
 func TestHandleState_MethodNotAllowed(t *testing.T) {
@@ -426,6 +540,12 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "status-note") {
 		t.Error("dashboard should include status explanation block")
 	}
+	if !contains(body, "supervisor-panel") || !contains(body, "renderSupervisor") {
+		t.Error("dashboard should include supervisor rationale panel")
+	}
+	if !contains(body, "No Supervisor has run yet") {
+		t.Error("dashboard should include supervisor empty state text")
+	}
 	if !contains(body, "issue_url") || !contains(body, "pr_url") {
 		t.Error("dashboard should render GitHub issue/PR links from API fields")
 	}
@@ -485,6 +605,15 @@ func TestHandleState_EmptyState(t *testing.T) {
 	}
 	if resp.TokenTotals.Total != 0 {
 		t.Errorf("total tokens = %d, want 0", resp.TokenTotals.Total)
+	}
+	if resp.Supervisor.HasRun {
+		t.Error("supervisor.has_run = true, want false")
+	}
+	if resp.Supervisor.EmptyState == "" {
+		t.Error("supervisor empty state should explain that no supervisor has run")
+	}
+	if resp.Supervisor.Latest != nil {
+		t.Fatalf("supervisor.latest = %#v, want nil", resp.Supervisor.Latest)
 	}
 }
 
@@ -559,6 +688,15 @@ func contains(s, substr string) bool {
 func containsSubstr(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTargetLink(links []targetLinkInfo, kind, url string) bool {
+	for _, link := range links {
+		if link.Kind == kind && link.URL == url {
 			return true
 		}
 	}
