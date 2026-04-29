@@ -71,6 +71,39 @@ issue_labels: []
 	}
 }
 
+func TestParse_SupervisorOrderedQueue(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ordered_queue:
+    enabled: true
+    issues: [308, 306, 305]
+    done_issues: [308]
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Supervisor.OrderedQueue.Active() {
+		t.Fatal("OrderedQueue should be active")
+	}
+	wantIssues := []int{308, 306, 305}
+	if len(cfg.Supervisor.OrderedQueue.Issues) != len(wantIssues) {
+		t.Fatalf("Issues = %v, want %v", cfg.Supervisor.OrderedQueue.Issues, wantIssues)
+	}
+	for i, want := range wantIssues {
+		if cfg.Supervisor.OrderedQueue.Issues[i] != want {
+			t.Errorf("Issues[%d] = %d, want %d", i, cfg.Supervisor.OrderedQueue.Issues[i], want)
+		}
+	}
+	if !cfg.Supervisor.OrderedQueue.IsDone(308) {
+		t.Error("OrderedQueue should mark issue #308 done by policy")
+	}
+	if cfg.Supervisor.OrderedQueue.IsDone(306) {
+		t.Error("OrderedQueue should not mark issue #306 done")
+	}
+}
+
 func TestParse_AutoRestoreFiles(t *testing.T) {
 	yaml := `
 repo: owner/repo

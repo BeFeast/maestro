@@ -16,7 +16,9 @@ type fakeReader struct {
 	issues         []github.Issue
 	prs            []github.PR
 	openPRIssues   map[int]bool
+	mergedPRIssues map[int]bool
 	closedIssues   map[int]bool
+	mergedPRs      map[int]bool
 	ciStatuses     map[int]string
 	greptileOK     map[int]bool
 	greptilePend   map[int]bool
@@ -42,8 +44,16 @@ func (f *fakeReader) HasOpenPRForIssue(issueNumber int) (bool, error) {
 	return f.openPRIssues[issueNumber], nil
 }
 
+func (f *fakeReader) HasMergedPRForIssue(issueNumber int) (bool, error) {
+	return f.mergedPRIssues[issueNumber], nil
+}
+
 func (f *fakeReader) IsIssueClosed(number int) (bool, error) {
 	return f.closedIssues[number], nil
+}
+
+func (f *fakeReader) IsPRMerged(prNumber int) (bool, error) {
+	return f.mergedPRs[prNumber], nil
 }
 
 func (f *fakeReader) AddIssueLabel(issueNumber int, label string) error {
@@ -459,7 +469,7 @@ func TestRunOnceRecordsPendingApprovalForRiskyDecision(t *testing.T) {
 	}
 }
 
-func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
+func TestDecide_OrderedQueueAdvancesAfterClosedIssue(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
 	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
@@ -488,12 +498,15 @@ func TestDecide_OrderedQueueSkipsCompletedIssue(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
 	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{308, 306}}
-	reader := &fakeReader{issues: []github.Issue{
-		testIssue(306, "second wave", "maestro-ready"),
-		testIssue(308, "done wave", "maestro-ready"),
-	}}
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(306, "second wave", "maestro-ready"),
+			testIssue(308, "done wave", "maestro-ready"),
+		},
+		mergedPRs: map[int]bool{77: true},
+	}
 	st := state.NewState()
-	st.Sessions["slot-1"] = &state.Session{IssueNumber: 308, Status: state.StatusDone, StartedAt: time.Now().UTC()}
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 308, Status: state.StatusDone, PRNumber: 77, StartedAt: time.Now().UTC()}
 
 	decision, err := testEngine(cfg, reader).Decide(st)
 	if err != nil {
@@ -819,5 +832,198 @@ func TestRunOnceGitHubFailureRecordsFailedMutation(t *testing.T) {
 	latest := st.LatestSupervisorDecision()
 	if latest == nil || latest.Status != DecisionStatusFailed || latest.ErrorClass != ErrorClassGitHubAPI {
 		t.Fatalf("latest decision = %#v, want failed github_api decision", latest)
+	}
+}
+
+func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled: true,
+		Issues:  []int{308, 306},
+	}
+	reader := &fakeReader{
+		issues:       []github.Issue{testIssue(306, "second", "maestro-ready")},
+		closedIssues: map[int]bool{308: true},
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 306 {
+		t.Fatalf("target = %#v, want issue 306", decision.Target)
+	}
+}
+
+func TestDecide_OrderedQueueDoesNotLabelNextIssueWhileCurrentHasOpenPR(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled: true,
+		Issues:  []int{308, 306},
+	}
+	reader := &fakeReader{
+		issues:       []github.Issue{testIssue(308, "current"), testIssue(306, "next")},
+		openPRIssues: map[int]bool{308: true},
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionMonitorOpenPR)
+	}
+	if decision.Target == nil || decision.Target.Issue != 308 {
+		t.Fatalf("target = %#v, want issue 308", decision.Target)
+	}
+}
+
+func TestDecide_OrderedQueuePausesOnBlockedIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled: true,
+		Issues:  []int{308, 306},
+	}
+	reader := &fakeReader{
+		issues: []github.Issue{
+			{Number: 308, Title: "blocked", Body: "blocked by #100", Labels: []struct {
+				Name string `json:"name"`
+			}{{Name: "maestro-ready"}}},
+			testIssue(306, "next", "maestro-ready"),
+		},
+		closedIssues: map[int]bool{100: false},
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionWaitForOrderedQueue {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionWaitForOrderedQueue)
+	}
+	if decision.Target == nil || decision.Target.Issue != 308 {
+		t.Fatalf("target = %#v, want issue 308", decision.Target)
+	}
+	if !strings.Contains(decision.Summary, "blocked") {
+		t.Fatalf("summary %q should explain blocked queue", decision.Summary)
+	}
+}
+
+func TestDecide_OrderedQueuePausesOnRetryExhaustedIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.MaxRetriesPerIssue = 2
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled: true,
+		Issues:  []int{308, 306},
+	}
+	reader := &fakeReader{
+		issues: []github.Issue{testIssue(308, "flaky", "maestro-ready"), testIssue(306, "next", "maestro-ready")},
+	}
+	st := state.NewState()
+	for i := 0; i < 2; i++ {
+		finished := time.Now().UTC().Add(-time.Duration(i+1) * time.Hour)
+		st.Sessions[time.Duration(i).String()] = &state.Session{
+			IssueNumber: 308,
+			Status:      state.StatusDead,
+			FinishedAt:  &finished,
+		}
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionReviewRetryExhausted {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionReviewRetryExhausted)
+	}
+	if decision.Target == nil || decision.Target.Issue != 308 {
+		t.Fatalf("target = %#v, want issue 308", decision.Target)
+	}
+}
+
+func TestDecide_OrderedQueueAdvancesAfterMergedPR(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled: true,
+		Issues:  []int{308, 306},
+	}
+	reader := &fakeReader{
+		issues:         []github.Issue{testIssue(306, "next", "maestro-ready")},
+		mergedPRIssues: map[int]bool{308: true},
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 306 {
+		t.Fatalf("target = %#v, want issue 306", decision.Target)
+	}
+}
+
+func TestDecide_OrderedQueueAdvancesAfterDoneSessionWithMergedPR(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled: true,
+		Issues:  []int{308, 306},
+	}
+	reader := &fakeReader{
+		issues:    []github.Issue{testIssue(306, "next", "maestro-ready")},
+		mergedPRs: map[int]bool{77: true},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 308, Status: state.StatusDone, PRNumber: 77}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 306 {
+		t.Fatalf("target = %#v, want issue 306", decision.Target)
+	}
+}
+
+func TestDecide_OrderedQueueAdvancesAfterPolicyOverride(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled:    true,
+		Issues:     []int{308, 306},
+		DoneIssues: []int{308},
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(306, "next", "maestro-ready")}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 306 {
+		t.Fatalf("target = %#v, want issue 306", decision.Target)
 	}
 }
