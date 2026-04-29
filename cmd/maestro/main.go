@@ -39,7 +39,7 @@ Usage:
 Commands:
   init          Interactive setup wizard for new projects
   run           Run the orchestration loop
-  supervise     Run read-only supervisor decision loop
+  supervise     Run supervisor decision loop with safe queue actions
   serve         Run Mission Control read-only web dashboard/API
   status        Show current state
   logs          Show worker logs (tail -f)
@@ -65,7 +65,7 @@ Run flags:
   --prompt string       Path to worker prompt base file
 
 Supervise flags:
-  --once                Run one read-only decision and exit
+  --once                Run one supervisor decision and exit
   --interval duration   Loop interval (default 5m)
   --json                Output decision as JSON
 
@@ -410,9 +410,15 @@ func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool)
 	}
 
 	fmt.Printf("Supervisor decision: %s\n", decision.RecommendedAction)
+	if decision.Status != "" {
+		fmt.Printf("Status: %s\n", decision.Status)
+	}
 	fmt.Printf("Summary: %s\n", decision.Summary)
 	fmt.Printf("Risk: %s\n", decision.Risk)
 	fmt.Printf("Confidence: %.2f\n", decision.Confidence)
+	if decision.ErrorClass != "" {
+		fmt.Printf("Error class: %s\n", decision.ErrorClass)
+	}
 	if decision.Target != nil {
 		parts := supervisorTargetParts(decision.Target)
 		if len(parts) > 0 {
@@ -423,6 +429,25 @@ func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool)
 		fmt.Println("Reasons:")
 		for _, reason := range decision.Reasons {
 			fmt.Printf("  - %s\n", reason)
+		}
+	}
+	if len(decision.Mutations) > 0 {
+		fmt.Println("Mutations:")
+		for _, mutation := range decision.Mutations {
+			fmt.Printf("  - %s", mutation.Type)
+			if mutation.Issue > 0 {
+				fmt.Printf(" issue #%d", mutation.Issue)
+			}
+			if mutation.Label != "" {
+				fmt.Printf(" label %q", mutation.Label)
+			}
+			if mutation.Status != "" {
+				fmt.Printf(" status %s", mutation.Status)
+			}
+			if mutation.ErrorClass != "" {
+				fmt.Printf(" error_class %s", mutation.ErrorClass)
+			}
+			fmt.Println()
 		}
 	}
 	fmt.Printf("Recorded: %s\n", decision.CreatedAt.Format(time.RFC3339))

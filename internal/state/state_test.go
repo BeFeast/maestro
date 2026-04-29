@@ -797,12 +797,19 @@ func TestSupervisorDecisionPersistence(t *testing.T) {
 		CreatedAt:         now,
 		Project:           "owner/repo",
 		Mode:              "read_only",
+		Status:            "succeeded",
 		Summary:           "Start a worker for issue #42.",
 		RecommendedAction: "spawn_worker",
 		Target:            &SupervisorTarget{Issue: 42},
 		Risk:              "mutating",
 		Confidence:        0.84,
-		Reasons:           []string{"Issue #42 is eligible"},
+		Mutations: []SupervisorMutation{{
+			Type:   "add_ready_label",
+			Issue:  42,
+			Label:  "maestro-ready",
+			Status: "succeeded",
+		}},
+		Reasons: []string{"Issue #42 is eligible"},
 		ProjectState: SupervisorProjectState{
 			Sessions:       0,
 			OpenIssues:     1,
@@ -830,6 +837,9 @@ func TestSupervisorDecisionPersistence(t *testing.T) {
 	}
 	if latest.ProjectState.OpenIssues != 1 {
 		t.Fatalf("open issues = %d, want 1", latest.ProjectState.OpenIssues)
+	}
+	if latest.Status != "succeeded" || len(latest.Mutations) != 1 || latest.Mutations[0].Label != "maestro-ready" {
+		t.Fatalf("latest audit fields = %#v, want persisted status and mutation", latest)
 	}
 }
 

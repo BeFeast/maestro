@@ -118,19 +118,32 @@ type SupervisorProjectState struct {
 	AvailableSlots int `json:"available_slots"`
 }
 
-// SupervisorDecision is a stable, machine-readable read-only orchestration record.
+// SupervisorMutation records one durable GitHub mutation planned or attempted by
+// the supervisor queue action loop.
+type SupervisorMutation struct {
+	Type       string `json:"type"`
+	Issue      int    `json:"issue,omitempty"`
+	Label      string `json:"label,omitempty"`
+	Status     string `json:"status"`
+	ErrorClass string `json:"error_class,omitempty"`
+}
+
+// SupervisorDecision is a stable, machine-readable supervisor orchestration record.
 type SupervisorDecision struct {
 	ID                string                 `json:"id"`
 	CreatedAt         time.Time              `json:"created_at"`
 	Project           string                 `json:"project"`
 	Mode              string                 `json:"mode"`
 	PolicyRule        string                 `json:"policy_rule,omitempty"`
+	Status            string                 `json:"status,omitempty"`
 	Summary           string                 `json:"summary"`
 	RecommendedAction string                 `json:"recommended_action"`
 	Target            *SupervisorTarget      `json:"target,omitempty"`
 	Risk              string                 `json:"risk"`
 	Confidence        float64                `json:"confidence"`
+	ErrorClass        string                 `json:"error_class,omitempty"`
 	Reasons           []string               `json:"reasons,omitempty"`
+	Mutations         []SupervisorMutation   `json:"mutations,omitempty"`
 	ProjectState      SupervisorProjectState `json:"project_state"`
 }
 

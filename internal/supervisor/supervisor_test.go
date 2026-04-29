@@ -1,6 +1,9 @@
 package supervisor
 
 import (
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,11 +13,17 @@ import (
 )
 
 type fakeReader struct {
-	issues       []github.Issue
-	prs          []github.PR
-	openPRIssues map[int]bool
-	closedIssues map[int]bool
-	issueCalls   int
+	issues         []github.Issue
+	prs            []github.PR
+	openPRIssues   map[int]bool
+	closedIssues   map[int]bool
+	issueCalls     int
+	addedLabels    []string
+	removedLabels  []string
+	comments       []string
+	addLabelErr    error
+	removeLabelErr error
+	commentErr     error
 }
 
 func (f *fakeReader) ListOpenIssues(labels []string) ([]github.Issue, error) {
@@ -32,6 +41,30 @@ func (f *fakeReader) HasOpenPRForIssue(issueNumber int) (bool, error) {
 
 func (f *fakeReader) IsIssueClosed(number int) (bool, error) {
 	return f.closedIssues[number], nil
+}
+
+func (f *fakeReader) AddIssueLabel(issueNumber int, label string) error {
+	if f.addLabelErr != nil {
+		return f.addLabelErr
+	}
+	f.addedLabels = append(f.addedLabels, fmt.Sprintf("#%d:%s", issueNumber, label))
+	return nil
+}
+
+func (f *fakeReader) RemoveIssueLabel(issueNumber int, label string) error {
+	if f.removeLabelErr != nil {
+		return f.removeLabelErr
+	}
+	f.removedLabels = append(f.removedLabels, fmt.Sprintf("#%d:%s", issueNumber, label))
+	return nil
+}
+
+func (f *fakeReader) CommentIssue(issueNumber int, body string) error {
+	if f.commentErr != nil {
+		return f.commentErr
+	}
+	f.comments = append(f.comments, fmt.Sprintf("#%d:%s", issueNumber, body))
+	return nil
 }
 
 func testConfig(t *testing.T) *config.Config {
@@ -375,5 +408,222 @@ func TestDecide_SupervisorReadyLabelActsAsRequiredLabel(t *testing.T) {
 	}
 	if decision.PolicyRule != PolicyRuleIssueLabels {
 		t.Fatalf("PolicyRule = %q, want %q", decision.PolicyRule, PolicyRuleIssueLabels)
+	}
+}
+
+func TestRunOnceLabelsNextIssueReadyAndComments(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel, config.SupervisorActionAddIssueComment}
+	cfg.Supervisor.QueueComments = true
+	reader := &fakeReader{issues: []github.Issue{testIssue(308, "implement supervisor")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionLabelIssueReady {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionLabelIssueReady)
+	}
+	if decision.Status != DecisionStatusSucceeded {
+		t.Fatalf("status = %q, want %q", decision.Status, DecisionStatusSucceeded)
+	}
+	if decision.Mode != ModeSafeActions {
+		t.Fatalf("mode = %q, want %q", decision.Mode, ModeSafeActions)
+	}
+	if got, want := strings.Join(reader.addedLabels, ","), "#308:maestro-ready"; got != want {
+		t.Fatalf("added labels = %q, want %q", got, want)
+	}
+	if len(reader.comments) != 1 || !strings.Contains(reader.comments[0], "maestro-ready") {
+		t.Fatalf("comments = %#v, want one ready-label comment", reader.comments)
+	}
+	if len(decision.Mutations) != 2 {
+		t.Fatalf("mutations = %#v, want label + comment", decision.Mutations)
+	}
+	for _, mutation := range decision.Mutations {
+		if mutation.Status != MutationStatusSucceeded {
+			t.Fatalf("mutation %#v status = %q, want %q", mutation, mutation.Status, MutationStatusSucceeded)
+		}
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	latest := st.LatestSupervisorDecision()
+	if latest == nil || latest.Status != DecisionStatusSucceeded || len(latest.Mutations) != 2 {
+		t.Fatalf("latest decision = %#v, want succeeded decision with mutations", latest)
+	}
+
+	second, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+	if len(second.Mutations) != 0 {
+		t.Fatalf("second mutations = %#v, want none", second.Mutations)
+	}
+	if len(reader.addedLabels) != 1 || len(reader.comments) != 1 {
+		t.Fatalf("added labels = %#v comments = %#v, want no duplicate queue action", reader.addedLabels, reader.comments)
+	}
+}
+
+func TestRunOnceRemovesBlockedLabelWhenPolicyAllows(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionRemoveBlockedLabel}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "was blocked", "maestro-ready", "blocked")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.Status != DecisionStatusSucceeded {
+		t.Fatalf("status = %q, want %q", decision.Status, DecisionStatusSucceeded)
+	}
+	if len(reader.addedLabels) != 0 {
+		t.Fatalf("added labels = %#v, want none", reader.addedLabels)
+	}
+	if got, want := strings.Join(reader.removedLabels, ","), "#42:blocked"; got != want {
+		t.Fatalf("removed labels = %q, want %q", got, want)
+	}
+	if len(decision.Mutations) != 1 || decision.Mutations[0].Type != MutationRemoveBlockedLabel {
+		t.Fatalf("mutations = %#v, want one blocked-label removal", decision.Mutations)
+	}
+}
+
+func TestRunOnceUsesConfiguredSupervisorBlockedLabel(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.BlockedLabel = "waiting"
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionRemoveBlockedLabel}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "waiting work", "maestro-ready", "waiting")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.Status != DecisionStatusSucceeded {
+		t.Fatalf("status = %q, want %q", decision.Status, DecisionStatusSucceeded)
+	}
+	if got, want := strings.Join(reader.removedLabels, ","), "#42:waiting"; got != want {
+		t.Fatalf("removed labels = %q, want %q", got, want)
+	}
+	if len(reader.addedLabels) != 0 {
+		t.Fatalf("added labels = %#v, want none", reader.addedLabels)
+	}
+}
+
+func TestRunOnceDoesNotRemoveBlockedLabelWithOpenBlocker(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionRemoveBlockedLabel}
+	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
+	issue := testIssue(42, "blocked work", "maestro-ready", "blocked")
+	issue.Body = "blocked by #10"
+	reader := &fakeReader{
+		issues:       []github.Issue{issue},
+		closedIssues: map[int]bool{10: false},
+	}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionNone {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionNone)
+	}
+	if len(reader.removedLabels) != 0 || len(decision.Mutations) != 0 {
+		t.Fatalf("removed labels = %#v mutations = %#v, want no mutation", reader.removedLabels, decision.Mutations)
+	}
+}
+
+func TestRunOnceRunningWorkerDoesNotLabelAtCapacity(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "work in progress",
+		Status:      state.StatusRunning,
+		StartedAt:   time.Now().UTC(),
+	}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(308, "next")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionWaitForRunningWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionWaitForRunningWorker)
+	}
+	if len(reader.addedLabels) != 0 || len(decision.Mutations) != 0 {
+		t.Fatalf("added labels = %#v mutations = %#v, want no mutation", reader.addedLabels, decision.Mutations)
+	}
+	if reader.issueCalls != 0 {
+		t.Fatalf("ListOpenIssues called %d time(s), want 0", reader.issueCalls)
+	}
+}
+
+func TestRunOnceAlreadyReadyDoesNotDuplicateQueueAction(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel, config.SupervisorActionAddIssueComment}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if len(reader.addedLabels) != 0 || len(reader.comments) != 0 || len(decision.Mutations) != 0 {
+		t.Fatalf("labels = %#v comments = %#v mutations = %#v, want no queue mutation", reader.addedLabels, reader.comments, decision.Mutations)
+	}
+}
+
+func TestRunOnceGitHubFailureRecordsFailedMutation(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
+	reader := &fakeReader{
+		issues:      []github.Issue{testIssue(308, "implement supervisor")},
+		addLabelErr: errors.New("boom"),
+	}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.Status != DecisionStatusFailed {
+		t.Fatalf("status = %q, want %q", decision.Status, DecisionStatusFailed)
+	}
+	if decision.ErrorClass != ErrorClassGitHubAPI {
+		t.Fatalf("error class = %q, want %q", decision.ErrorClass, ErrorClassGitHubAPI)
+	}
+	if len(decision.Mutations) != 1 || decision.Mutations[0].Status != MutationStatusFailed || decision.Mutations[0].ErrorClass != ErrorClassGitHubAPI {
+		t.Fatalf("mutations = %#v, want failed github_api mutation", decision.Mutations)
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	latest := st.LatestSupervisorDecision()
+	if latest == nil || latest.Status != DecisionStatusFailed || latest.ErrorClass != ErrorClassGitHubAPI {
+		t.Fatalf("latest decision = %#v, want failed github_api decision", latest)
 	}
 }

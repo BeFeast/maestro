@@ -829,6 +829,33 @@ server:
 	}
 }
 
+func TestParse_SupervisorConfig(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: waiting
+  queue_comments: true
+  one_at_a_time: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Supervisor.ReadyLabel != "maestro-ready" {
+		t.Errorf("Supervisor.ReadyLabel = %q, want maestro-ready", cfg.Supervisor.ReadyLabel)
+	}
+	if cfg.Supervisor.BlockedLabel != "waiting" {
+		t.Errorf("Supervisor.BlockedLabel = %q, want waiting", cfg.Supervisor.BlockedLabel)
+	}
+	if !cfg.Supervisor.QueueComments {
+		t.Error("Supervisor.QueueComments should be true")
+	}
+	if !cfg.Supervisor.OneAtATime {
+		t.Error("Supervisor.OneAtATime should be true")
+	}
+}
+
 func TestParse_BlockerPatternsDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
