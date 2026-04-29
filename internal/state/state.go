@@ -128,6 +128,17 @@ type SupervisorMutation struct {
 	ErrorClass string `json:"error_class,omitempty"`
 }
 
+// SupervisorStuckState explains a specific reason Maestro is not progressing.
+type SupervisorStuckState struct {
+	Code              string            `json:"code"`
+	Severity          string            `json:"severity"`
+	Summary           string            `json:"summary"`
+	Evidence          []string          `json:"evidence,omitempty"`
+	RecommendedAction string            `json:"recommended_action"`
+	SupervisorCanAct  bool              `json:"supervisor_can_act"`
+	Target            *SupervisorTarget `json:"target,omitempty"`
+}
+
 // SupervisorDecision is a stable, machine-readable supervisor orchestration record.
 type SupervisorDecision struct {
 	ID                string                 `json:"id"`
@@ -144,6 +155,7 @@ type SupervisorDecision struct {
 	ErrorClass        string                 `json:"error_class,omitempty"`
 	Reasons           []string               `json:"reasons,omitempty"`
 	Mutations         []SupervisorMutation   `json:"mutations,omitempty"`
+	StuckStates       []SupervisorStuckState `json:"stuck_states,omitempty"`
 	ProjectState      SupervisorProjectState `json:"project_state"`
 }
 

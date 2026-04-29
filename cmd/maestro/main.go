@@ -450,6 +450,15 @@ func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool)
 			fmt.Println()
 		}
 	}
+	if len(decision.StuckStates) > 0 {
+		fmt.Println("Stuck states:")
+		for _, stuck := range decision.StuckStates {
+			fmt.Printf("  - %s [%s]: %s\n", stuck.Code, stuck.Severity, stuck.Summary)
+			if stuck.RecommendedAction != "" {
+				fmt.Printf("    next: %s\n", stuck.RecommendedAction)
+			}
+		}
+	}
 	fmt.Printf("Recorded: %s\n", decision.CreatedAt.Format(time.RFC3339))
 }
 
@@ -880,6 +889,14 @@ func showLatestSupervisorDecision(s *state.State) {
 		if len(parts) > 0 {
 			fmt.Printf("  Target: %s\n", strings.Join(parts, ", "))
 		}
+	}
+	if len(decision.StuckStates) > 0 {
+		fmt.Printf("  Stuck states: %d", len(decision.StuckStates))
+		first := decision.StuckStates[0]
+		if first.Code != "" {
+			fmt.Printf(" (top: %s/%s)", first.Code, first.Severity)
+		}
+		fmt.Println()
 	}
 	fmt.Println()
 }

@@ -94,18 +94,19 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // stateResponse is the JSON shape for GET /api/v1/state.
 type stateResponse struct {
-	Repo                string                     `json:"repo"`
-	MaxParallel         int                        `json:"max_parallel"`
-	ReadOnly            bool                       `json:"read_only"`
-	SupervisorPolicy    config.SupervisorConfig    `json:"supervisor_policy"`
-	All                 []sessionInfo              `json:"all"`
-	Running             []sessionInfo              `json:"running"`
-	PROpen              []sessionInfo              `json:"pr_open"`
-	Queued              []sessionInfo              `json:"queued"`
-	TokenTotals         tokenTotalsInfo            `json:"token_totals"`
-	Summary             map[string]int             `json:"summary"`
-	SupervisorLatest    *state.SupervisorDecision  `json:"supervisor_latest,omitempty"`
-	SupervisorDecisions []state.SupervisorDecision `json:"supervisor_decisions,omitempty"`
+	Repo                string                       `json:"repo"`
+	MaxParallel         int                          `json:"max_parallel"`
+	ReadOnly            bool                         `json:"read_only"`
+	SupervisorPolicy    config.SupervisorConfig      `json:"supervisor_policy"`
+	All                 []sessionInfo                `json:"all"`
+	Running             []sessionInfo                `json:"running"`
+	PROpen              []sessionInfo                `json:"pr_open"`
+	Queued              []sessionInfo                `json:"queued"`
+	TokenTotals         tokenTotalsInfo              `json:"token_totals"`
+	Summary             map[string]int               `json:"summary"`
+	StuckStates         []state.SupervisorStuckState `json:"stuck_states,omitempty"`
+	SupervisorLatest    *state.SupervisorDecision    `json:"supervisor_latest,omitempty"`
+	SupervisorDecisions []state.SupervisorDecision   `json:"supervisor_decisions,omitempty"`
 }
 
 type tokenTotalsInfo struct {
@@ -279,6 +280,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	latestDecision := st.LatestSupervisorDecision()
 	resp := stateResponse{
 		Repo:                s.cfg.Repo,
 		MaxParallel:         s.cfg.MaxParallel,
@@ -289,8 +291,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		PROpen:              make([]sessionInfo, 0),
 		Queued:              make([]sessionInfo, 0),
 		Summary:             make(map[string]int),
-		SupervisorLatest:    st.LatestSupervisorDecision(),
+		SupervisorLatest:    latestDecision,
 		SupervisorDecisions: st.SupervisorDecisions,
+	}
+	if latestDecision != nil {
+		resp.StuckStates = latestDecision.StuckStates
 	}
 
 	var activeTokens, totalTokens int

@@ -810,6 +810,17 @@ func TestSupervisorDecisionPersistence(t *testing.T) {
 			Status: "succeeded",
 		}},
 		Reasons: []string{"Issue #42 is eligible"},
+		StuckStates: []SupervisorStuckState{
+			{
+				Code:              "no_eligible_issues",
+				Severity:          "warning",
+				Summary:           "No open issues match the configured ready labels.",
+				Evidence:          []string{"Configured issue_labels: maestro-ready"},
+				RecommendedAction: "Add one of the configured ready labels to an issue.",
+				SupervisorCanAct:  true,
+				Target:            &SupervisorTarget{Issue: 42},
+			},
+		},
 		ProjectState: SupervisorProjectState{
 			Sessions:       0,
 			OpenIssues:     1,
@@ -840,6 +851,12 @@ func TestSupervisorDecisionPersistence(t *testing.T) {
 	}
 	if latest.Status != "succeeded" || len(latest.Mutations) != 1 || latest.Mutations[0].Label != "maestro-ready" {
 		t.Fatalf("latest audit fields = %#v, want persisted status and mutation", latest)
+	}
+	if len(latest.StuckStates) != 1 {
+		t.Fatalf("stuck states = %d, want 1", len(latest.StuckStates))
+	}
+	if latest.StuckStates[0].Code != "no_eligible_issues" {
+		t.Fatalf("stuck state code = %q, want no_eligible_issues", latest.StuckStates[0].Code)
 	}
 }
 

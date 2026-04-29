@@ -41,6 +41,7 @@ type PR struct {
 	State       string `json:"state"`
 	Mergeable   string `json:"mergeable"`
 	Title       string `json:"title"`
+	IsDraft     bool   `json:"isDraft"`
 }
 
 type Client struct {
@@ -142,7 +143,7 @@ func (c *Client) ListOpenPRs() ([]PR, error) {
 	out, err := exec.Command("gh", "pr", "list",
 		"--repo", c.Repo,
 		"--state", "open",
-		"--json", "number,headRefName,state,mergeable,title",
+		"--json", "number,headRefName,state,mergeable,title,isDraft",
 		"--limit", "100").Output()
 	if err != nil {
 		return nil, fmt.Errorf("gh pr list: %w", err)
