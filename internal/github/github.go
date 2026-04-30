@@ -33,6 +33,17 @@ type Issue struct {
 	Labels []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
+	ProjectItems []IssueProjectItem `json:"projectItems,omitempty"`
+}
+
+type IssueProjectItem struct {
+	Title  string                  `json:"title,omitempty"`
+	Status *IssueProjectItemStatus `json:"status,omitempty"`
+}
+
+type IssueProjectItemStatus struct {
+	Name     string `json:"name,omitempty"`
+	OptionID string `json:"optionId,omitempty"`
 }
 
 type PR struct {
@@ -87,7 +98,7 @@ func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 		"issue", "list",
 		"--repo", c.Repo,
 		"--state", "open",
-		"--json", "number,title,body,labels",
+		"--json", "number,title,body,labels,projectItems",
 		"--limit", "100",
 	}
 	if label != "" {
@@ -110,7 +121,7 @@ func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 func (c *Client) GetIssue(number int) (Issue, error) {
 	out, err := exec.Command("gh", "issue", "view", fmt.Sprint(number),
 		"--repo", c.Repo,
-		"--json", "number,title,body,labels").Output()
+		"--json", "number,title,body,labels,projectItems").Output()
 	if err != nil {
 		return Issue{}, fmt.Errorf("gh issue view %d: %w", number, err)
 	}

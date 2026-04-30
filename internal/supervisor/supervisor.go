@@ -37,6 +37,7 @@ const (
 	PolicyRuleOpenIssues     = "open_issues"
 	PolicyRuleIssueLabels    = "issue_labels"
 	PolicyRuleOrderedQueue   = "supervisor.ordered_queue"
+	PolicyRuleDynamicWave    = "supervisor.dynamic_wave"
 	PolicyRuleExcludedLabels = "supervisor.excluded_labels"
 
 	DecisionStatusRecommended = "recommended"
@@ -44,6 +45,7 @@ const (
 	DecisionStatusFailed      = "failed"
 
 	MutationAddReadyLabel      = "add_ready_label"
+	MutationRemoveReadyLabel   = "remove_ready_label"
 	MutationRemoveBlockedLabel = "remove_blocked_label"
 	MutationIssueComment       = config.SupervisorActionAddIssueComment
 
@@ -231,10 +233,16 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 	projectState.OpenIssues = len(issues)
 
-	candidates, policySkipped, policyRule, err := e.policyCandidateIssues(st, issues)
+	policyResult, err := e.policyCandidateIssues(st, issues)
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
+	if policyResult.dynamicWave {
+		return e.decideDynamicWave(st, now, projectState, baseReasons, prs, issues, policyResult)
+	}
+	candidates := policyResult.candidates
+	policySkipped := policyResult.skipped
+	policyRule := policyResult.policyRule
 	eligible, skipped, err := e.eligibleIssues(st, candidates, true)
 	if err != nil {
 		return state.SupervisorDecision{}, err
@@ -361,6 +369,106 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
 	return decision, nil
+}
+
+func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult) (state.SupervisorDecision, error) {
+	candidates := result.candidates
+	analysis := result.analysis
+	if analysis == nil {
+		analysis = &state.SupervisorQueueAnalysis{PolicyRule: PolicyRuleDynamicWave, OpenIssues: len(issues), EligibleCandidates: len(candidates), SkippedReasons: firstN(result.skipped, 5)}
+		if len(candidates) > 0 {
+			analysis.SelectedCandidate = supervisorIssueCandidate(candidates[0])
+		}
+	}
+	stuckStates := e.detectStuckStates(st, now, prs, issues, candidates, result.skipped, true)
+	withAnalysis := func(decision state.SupervisorDecision) state.SupervisorDecision {
+		decision.QueueAnalysis = analysis
+		decision.StuckStates = stuckStates
+		return decision
+	}
+
+	if len(candidates) == 0 {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Dynamic wave checked %d open issue(s)", len(issues)),
+			fmt.Sprintf("Dynamic wave found %d eligible candidate(s), %d excluded issue(s), and %d issue(s) in non-runnable project status", analysis.EligibleCandidates, analysis.ExcludedIssues, analysis.NonRunnableProjectStatusCount),
+		)
+		for _, reason := range firstN(result.skipped, 3) {
+			reasons = append(reasons, reason)
+		}
+		decision := e.decision(now, projectState, ActionNone,
+			"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, reasons)
+		return withAnalysis(decision), nil
+	}
+
+	issue := candidates[0]
+	if projectState.AvailableSlots <= 0 {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+			fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+		)
+		decision := e.decision(now, projectState, ActionWaitForCapacity,
+			fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
+			RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		return withAnalysis(decision), nil
+	}
+
+	hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
+	if err != nil {
+		return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
+	}
+	if hasOpenPR {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+			fmt.Sprintf("Issue #%d already has an open PR", issue.Number),
+			"Supervisor mode should not dispatch duplicate work",
+		)
+		decision := e.decision(now, projectState, ActionMonitorOpenPR,
+			fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
+			RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		return withAnalysis(decision), nil
+	}
+
+	queueCandidate := e.dynamicQueueActionCandidate(st, issue, issues)
+	if queueCandidate != nil {
+		mutations := queueCandidate.plannedMutations(e.cfg)
+		reasons := appendReasons(baseReasons,
+			queueLabelReason(queueCandidate.readyLabel, ""),
+			fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+		)
+		risk := RiskMutating
+		if len(mutations) > 0 {
+			risk = RiskSafe
+			reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
+		}
+		decision := e.decision(now, projectState, ActionLabelIssueReady,
+			fmt.Sprintf("Prepare issue #%d for the dynamic wave by %s.", issue.Number, plannedMutationPhrase(queueCandidate.neededMutations())),
+			risk, 0.82, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		decision.Mutations = mutations
+		return withAnalysis(decision), nil
+	}
+
+	if !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+			"Selected issue is waiting for a ready label mutation to appear in GitHub issue data",
+		)
+		for _, reason := range firstN(result.skipped, 3) {
+			reasons = append(reasons, reason)
+		}
+		decision := e.decision(now, projectState, ActionNone,
+			"No action is currently recommended while the selected issue waits for its ready label.", RiskSafe, 0.8, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		return withAnalysis(decision), nil
+	}
+
+	reasons := appendReasons(baseReasons,
+		issueLabelReason(e.requiredIssueLabels()),
+		fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+		"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
+	)
+	decision := e.decision(now, projectState, ActionSpawnWorker,
+		fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
+		RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+	return withAnalysis(decision), nil
 }
 
 func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
@@ -598,7 +706,7 @@ func (e *Engine) detectQueueStuckStates(st *state.State, prs []github.PR, issues
 	}
 
 	missingLabelCount := countSkipped(skipped, "missing configured ready label")
-	excludedCount := countSkipped(skipped, "excluded by configured label")
+	excludedCount := countSkipped(skipped, "excluded by configured label") + countSkipped(skipped, "skipped by dynamic wave policy: excluded")
 	var findings []state.SupervisorStuckState
 
 	if len(e.cfg.IssueLabels) > 0 && missingLabelCount > 0 {
@@ -750,12 +858,31 @@ func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {
 	}
 }
 
-func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) ([]github.Issue, []string, string, error) {
+type policyCandidateResult struct {
+	candidates  []github.Issue
+	skipped     []string
+	policyRule  string
+	dynamicWave bool
+	analysis    *state.SupervisorQueueAnalysis
+}
+
+type dynamicSkipCategory string
+
+const (
+	dynamicSkipOther         dynamicSkipCategory = "other"
+	dynamicSkipExcluded      dynamicSkipCategory = "excluded"
+	dynamicSkipProjectStatus dynamicSkipCategory = "project_status"
+)
+
+func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) (policyCandidateResult, error) {
 	if !e.cfg.Supervisor.OrderedQueueActive() {
-		return issues, nil, e.defaultPolicyRule(), nil
+		if e.cfg.Supervisor.DynamicWave.Active() {
+			return e.dynamicWaveCandidateIssues(st, issues, nil)
+		}
+		return policyCandidateResult{candidates: issues, policyRule: e.defaultPolicyRule()}, nil
 	}
 	if err := validateOrderedQueueIssues(e.cfg.Supervisor.OrderedQueue.Issues); err != nil {
-		return nil, nil, "", err
+		return policyCandidateResult{}, err
 	}
 	issueByNumber := make(map[int]github.Issue, len(issues))
 	for _, issue := range issues {
@@ -765,7 +892,7 @@ func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) (
 	for _, issueNumber := range e.cfg.Supervisor.OrderedQueue.Issues {
 		done, reason, err := e.orderedQueueIssueDone(st, issueNumber)
 		if err != nil {
-			return nil, nil, "", fmt.Errorf("check ordered queue issue #%d: %w", issueNumber, err)
+			return policyCandidateResult{}, fmt.Errorf("check ordered queue issue #%d: %w", issueNumber, err)
 		}
 		if done {
 			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by supervisor.ordered_queue: %s", issueNumber, reason))
@@ -773,11 +900,98 @@ func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) (
 		}
 		issue, ok := issueByNumber[issueNumber]
 		if !ok {
-			return nil, append(skipped, fmt.Sprintf("Issue #%d is first unfinished in supervisor.ordered_queue but was not returned by open issue listing", issueNumber)), PolicyRuleOrderedQueue, nil
+			return policyCandidateResult{skipped: append(skipped, fmt.Sprintf("Issue #%d is first unfinished in supervisor.ordered_queue but was not returned by open issue listing", issueNumber)), policyRule: PolicyRuleOrderedQueue}, nil
 		}
-		return []github.Issue{issue}, skipped, PolicyRuleOrderedQueue, nil
+		return policyCandidateResult{candidates: []github.Issue{issue}, skipped: skipped, policyRule: PolicyRuleOrderedQueue}, nil
 	}
-	return nil, append(skipped, "No unfinished issue remains in supervisor.ordered_queue"), PolicyRuleOrderedQueue, nil
+	skipped = append(skipped, "No unfinished issue remains in supervisor.ordered_queue")
+	if e.cfg.Supervisor.DynamicWave.Active() {
+		return e.dynamicWaveCandidateIssues(st, issues, skipped)
+	}
+	return policyCandidateResult{skipped: skipped, policyRule: PolicyRuleOrderedQueue}, nil
+}
+
+func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Issue, prefixSkipped []string) (policyCandidateResult, error) {
+	skipped := append([]string(nil), prefixSkipped...)
+	analysis := &state.SupervisorQueueAnalysis{
+		PolicyRule: PolicyRuleDynamicWave,
+		OpenIssues: len(issues),
+	}
+
+	candidates := make([]github.Issue, 0, len(issues))
+	for _, issue := range issues {
+		reason, category, err := e.dynamicWaveSkipReason(st, issue)
+		if err != nil {
+			return policyCandidateResult{}, err
+		}
+		if reason != "" {
+			if category == dynamicSkipExcluded {
+				analysis.ExcludedIssues++
+			}
+			if category == dynamicSkipProjectStatus {
+				analysis.NonRunnableProjectStatusCount++
+			}
+			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by dynamic wave policy: %s", issue.Number, reason))
+			continue
+		}
+		candidates = append(candidates, issue)
+	}
+
+	sortDynamicWaveCandidates(candidates)
+	analysis.EligibleCandidates = len(candidates)
+	if len(candidates) > 0 {
+		analysis.SelectedCandidate = supervisorIssueCandidate(candidates[0])
+	}
+	analysis.SkippedReasons = firstN(skipped, 5)
+
+	return policyCandidateResult{
+		candidates:  candidates,
+		skipped:     skipped,
+		policyRule:  PolicyRuleDynamicWave,
+		dynamicWave: true,
+		analysis:    analysis,
+	}, nil
+}
+
+func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue) (string, dynamicSkipCategory, error) {
+	if st.IssueInProgress(issue.Number) {
+		return "already in progress", dynamicSkipOther, nil
+	}
+	if st.IssueDone(issue.Number) {
+		return "already completed in state", dynamicSkipOther, nil
+	}
+	if st.IssueRetryExhausted(issue.Number) {
+		return "retry limit exhausted", dynamicSkipOther, nil
+	}
+	if e.cfg.MaxRetriesPerIssue > 0 && st.FailedAttemptsForIssue(issue.Number) >= e.cfg.MaxRetriesPerIssue {
+		return "retry limit exhausted", dynamicSkipOther, nil
+	}
+	if st.IsMissionParent(issue.Number) {
+		return "mission parent issue", dynamicSkipOther, nil
+	}
+	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
+		return "mission issue awaits decomposition", dynamicSkipOther, nil
+	}
+	if titleLooksEpic(issue.Title) {
+		return "title indicates epic", dynamicSkipExcluded, nil
+	}
+	if label, ok := firstMatchingIssueLabel(issue, e.dynamicWaveExcludedLabels()); ok {
+		return fmt.Sprintf("excluded by label %q", label), dynamicSkipExcluded, nil
+	}
+	if status, ok := nonRunnableProjectStatus(issue); ok {
+		return fmt.Sprintf("project status %q is not runnable", status), dynamicSkipProjectStatus, nil
+	}
+	if len(e.cfg.BlockerPatterns) > 0 {
+		blockers := github.FindBlockers(issue.Body, e.cfg.BlockerPatterns)
+		openBlockers, err := e.openBlockers(blockers)
+		if err != nil {
+			return "", dynamicSkipOther, err
+		}
+		if len(openBlockers) > 0 {
+			return fmt.Sprintf("blocked by open issue(s) %s", issueRefs(openBlockers)), dynamicSkipOther, nil
+		}
+	}
+	return "", dynamicSkipOther, nil
 }
 
 func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, string, error) {
@@ -848,11 +1062,12 @@ func (e *Engine) shouldWaitForRunningWorker(st *state.State) bool {
 }
 
 type queueActionCandidate struct {
-	issue         github.Issue
-	readyLabel    string
-	blockedLabel  string
-	addReady      bool
-	removeBlocked bool
+	issue           github.Issue
+	readyLabel      string
+	blockedLabel    string
+	addReady        bool
+	removeReadyFrom []github.Issue
+	removeBlocked   bool
 }
 
 func (c queueActionCandidate) neededMutations() []state.SupervisorMutation {
@@ -861,6 +1076,14 @@ func (c queueActionCandidate) neededMutations() []state.SupervisorMutation {
 		mutations = append(mutations, state.SupervisorMutation{
 			Type:   MutationAddReadyLabel,
 			Issue:  c.issue.Number,
+			Label:  c.readyLabel,
+			Status: MutationStatusPlanned,
+		})
+	}
+	for _, issue := range c.removeReadyFrom {
+		mutations = append(mutations, state.SupervisorMutation{
+			Type:   MutationRemoveReadyLabel,
+			Issue:  issue.Number,
 			Label:  c.readyLabel,
 			Status: MutationStatusPlanned,
 		})
@@ -880,11 +1103,21 @@ func (c queueActionCandidate) plannedMutations(cfg *config.Config) []state.Super
 	needed := c.neededMutations()
 	mutations := make([]state.SupervisorMutation, 0, len(needed))
 	for _, mutation := range needed {
-		if safeActionAllowed(cfg, mutation.Type) {
+		if queueMutationAllowed(cfg, mutation) {
 			mutations = append(mutations, mutation)
 		}
 	}
 	return mutations
+}
+
+func queueMutationAllowed(cfg *config.Config, mutation state.SupervisorMutation) bool {
+	if safeActionAllowed(cfg, mutation.Type) {
+		return true
+	}
+	return mutation.Type == MutationRemoveReadyLabel &&
+		cfg != nil &&
+		cfg.Supervisor.DynamicWave.OwnsReadyLabel &&
+		safeActionAllowed(cfg, MutationAddReadyLabel)
 }
 
 func safeActionAllowed(cfg *config.Config, action string) bool {
@@ -927,6 +1160,40 @@ func (e *Engine) firstQueueActionCandidate(st *state.State, issues []github.Issu
 		return &candidate, nil
 	}
 	return nil, nil
+}
+
+func (e *Engine) dynamicQueueActionCandidate(st *state.State, selected github.Issue, openIssues []github.Issue) *queueActionCandidate {
+	readyLabel := e.readyLabel()
+	if readyLabel == "" {
+		return nil
+	}
+
+	hasReadyLabel := github.HasLabel(selected, []string{readyLabel})
+	candidate := queueActionCandidate{
+		issue:      selected,
+		readyLabel: readyLabel,
+		addReady:   !hasReadyLabel && !supervisorMutationSucceeded(st, selected.Number, MutationAddReadyLabel, readyLabel),
+	}
+
+	if e.cfg.Supervisor.DynamicWave.OwnsReadyLabel {
+		for _, issue := range openIssues {
+			if issue.Number == selected.Number || !github.HasLabel(issue, []string{readyLabel}) {
+				continue
+			}
+			if supervisorMutationSucceeded(st, issue.Number, MutationRemoveReadyLabel, readyLabel) {
+				continue
+			}
+			candidate.removeReadyFrom = append(candidate.removeReadyFrom, issue)
+		}
+		sort.Slice(candidate.removeReadyFrom, func(i, j int) bool {
+			return candidate.removeReadyFrom[i].Number < candidate.removeReadyFrom[j].Number
+		})
+	}
+
+	if !candidate.addReady && len(candidate.removeReadyFrom) == 0 {
+		return nil
+	}
+	return &candidate
 }
 
 func supervisorMutationSucceeded(st *state.State, issueNumber int, mutationType, label string) bool {
@@ -1133,6 +1400,124 @@ func (e *Engine) requiredIssueLabels() []string {
 	return append(labels, readyLabel)
 }
 
+func (e *Engine) dynamicWaveExcludedLabels() []string {
+	labels := []string{"blocked", "wontfix", "question", "duplicate", "invalid", "epic", "meta"}
+	labels = append(labels, e.cfg.ExcludeLabels...)
+	labels = append(labels, e.policyExcludedLabels()...)
+	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
+		labels = append(labels, blockedLabel)
+	}
+	return uniqueLabelNames(labels)
+}
+
+func uniqueLabelNames(labels []string) []string {
+	unique := make([]string, 0, len(labels))
+	seen := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		key := strings.ToLower(label)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, label)
+	}
+	return unique
+}
+
+func firstMatchingIssueLabel(issue github.Issue, labels []string) (string, bool) {
+	for _, issueLabel := range issue.Labels {
+		for _, excluded := range labels {
+			if strings.EqualFold(strings.TrimSpace(issueLabel.Name), strings.TrimSpace(excluded)) {
+				return issueLabel.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+func titleLooksEpic(title string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(title)), "epic:")
+}
+
+func nonRunnableProjectStatus(issue github.Issue) (string, bool) {
+	for _, item := range issue.ProjectItems {
+		if item.Status == nil {
+			continue
+		}
+		status := strings.TrimSpace(item.Status.Name)
+		if status == "" || strings.EqualFold(status, "Todo") {
+			continue
+		}
+		return status, true
+	}
+	return "", false
+}
+
+func firstProjectStatus(issue github.Issue) string {
+	for _, item := range issue.ProjectItems {
+		if item.Status == nil {
+			continue
+		}
+		if status := strings.TrimSpace(item.Status.Name); status != "" {
+			return status
+		}
+	}
+	return ""
+}
+
+func sortDynamicWaveCandidates(issues []github.Issue) {
+	sort.SliceStable(issues, func(i, j int) bool {
+		leftPriority, _ := issuePriority(issues[i])
+		rightPriority, _ := issuePriority(issues[j])
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		return issues[i].Number < issues[j].Number
+	})
+}
+
+func issuePriority(issue github.Issue) (int, string) {
+	bestRank := 4
+	bestLabel := ""
+	for _, label := range issue.Labels {
+		switch strings.ToLower(strings.TrimSpace(label.Name)) {
+		case "p0":
+			return 0, label.Name
+		case "p1":
+			if bestRank > 1 {
+				bestRank = 1
+				bestLabel = label.Name
+			}
+		case "p2":
+			if bestRank > 2 {
+				bestRank = 2
+				bestLabel = label.Name
+			}
+		case "p3":
+			if bestRank > 3 {
+				bestRank = 3
+				bestLabel = label.Name
+			}
+		}
+	}
+	return bestRank, bestLabel
+}
+
+func supervisorIssueCandidate(issue github.Issue) *state.SupervisorIssueCandidate {
+	_, priorityLabel := issuePriority(issue)
+	return &state.SupervisorIssueCandidate{
+		Number:        issue.Number,
+		Title:         RedactSensitive(issue.Title),
+		Labels:        issueLabelNames(issue),
+		PriorityLabel: priorityLabel,
+		ProjectStatus: firstProjectStatus(issue),
+	}
+}
+
 func (e *Engine) policySummaryReason() string {
 	mode := strings.TrimSpace(e.cfg.Supervisor.Mode)
 	if mode == "" {
@@ -1146,6 +1531,12 @@ func (e *Engine) policySummaryReason() string {
 	}
 	if e.cfg.Supervisor.OrderedQueueActive() {
 		parts = append(parts, fmt.Sprintf("ordered_queue=%d issue(s)", len(e.cfg.Supervisor.OrderedQueue.Issues)))
+	}
+	if e.cfg.Supervisor.DynamicWave.Active() {
+		parts = append(parts, "dynamic_wave=true")
+		if e.cfg.Supervisor.DynamicWave.OwnsReadyLabel {
+			parts = append(parts, "owns_ready_label=true")
+		}
 	}
 	if excludedLabels := e.policyExcludedLabels(); len(excludedLabels) > 0 {
 		parts = append(parts, "excluded_labels="+strings.Join(excludedLabels, ","))
@@ -1265,6 +1656,11 @@ func mutationDescription(mutation state.SupervisorMutation) string {
 	switch mutation.Type {
 	case MutationAddReadyLabel:
 		return fmt.Sprintf("adding `%s`", mutation.Label)
+	case MutationRemoveReadyLabel:
+		if mutation.Issue > 0 {
+			return fmt.Sprintf("removing stale `%s` from issue #%d", mutation.Label, mutation.Issue)
+		}
+		return fmt.Sprintf("removing stale `%s`", mutation.Label)
 	case MutationRemoveBlockedLabel:
 		return fmt.Sprintf("removing `%s`", mutation.Label)
 	case MutationIssueComment:
@@ -1317,6 +1713,8 @@ func applyQueueMutation(mutator Mutator, mutation state.SupervisorMutation) erro
 	switch mutation.Type {
 	case MutationAddReadyLabel:
 		return mutator.AddIssueLabel(mutation.Issue, mutation.Label)
+	case MutationRemoveReadyLabel:
+		return mutator.RemoveIssueLabel(mutation.Issue, mutation.Label)
 	case MutationRemoveBlockedLabel:
 		return mutator.RemoveIssueLabel(mutation.Issue, mutation.Label)
 	default:
@@ -1379,6 +1777,8 @@ func completedMutationPhrase(mutation state.SupervisorMutation) string {
 	switch mutation.Type {
 	case MutationAddReadyLabel:
 		return fmt.Sprintf("added `%s`", mutation.Label)
+	case MutationRemoveReadyLabel:
+		return fmt.Sprintf("removed stale `%s` from issue #%d", mutation.Label, mutation.Issue)
 	case MutationRemoveBlockedLabel:
 		return fmt.Sprintf("removed `%s`", mutation.Label)
 	default:
@@ -1519,6 +1919,7 @@ func firstMissingLabelTarget(issues []github.Issue, labels []string) *state.Supe
 
 func policySkipReason(reason string) bool {
 	return strings.Contains(reason, "excluded by configured label") ||
+		strings.Contains(reason, "skipped by dynamic wave policy") ||
 		strings.Contains(reason, "mission parent issue") ||
 		strings.Contains(reason, "mission issue awaits decomposition") ||
 		strings.Contains(reason, "blocked by open issue")

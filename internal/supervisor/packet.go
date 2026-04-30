@@ -79,11 +79,12 @@ type supervisorSessionPacket struct {
 }
 
 type supervisorIssuePacket struct {
-	Position    int      `json:"position"`
-	Number      int      `json:"number"`
-	Title       string   `json:"title"`
-	Labels      []string `json:"labels,omitempty"`
-	BodyExcerpt string   `json:"body_excerpt,omitempty"`
+	Position      int      `json:"position"`
+	Number        int      `json:"number"`
+	Title         string   `json:"title"`
+	Labels        []string `json:"labels,omitempty"`
+	ProjectStatus string   `json:"project_status,omitempty"`
+	BodyExcerpt   string   `json:"body_excerpt,omitempty"`
 }
 
 type supervisorGitHubPacket struct {
@@ -223,11 +224,12 @@ func issuePackets(issues []github.Issue) []supervisorIssuePacket {
 	packets := make([]supervisorIssuePacket, 0, len(issues))
 	for i, issue := range issues {
 		packets = append(packets, supervisorIssuePacket{
-			Position:    i + 1,
-			Number:      issue.Number,
-			Title:       RedactSensitive(issue.Title),
-			Labels:      issueLabelNames(issue),
-			BodyExcerpt: truncateText(RedactSensitive(issue.Body), supervisorIssueBodyLimit),
+			Position:      i + 1,
+			Number:        issue.Number,
+			Title:         RedactSensitive(issue.Title),
+			Labels:        issueLabelNames(issue),
+			ProjectStatus: firstProjectStatus(issue),
+			BodyExcerpt:   truncateText(RedactSensitive(issue.Body), supervisorIssueBodyLimit),
 		})
 	}
 	return packets

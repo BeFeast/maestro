@@ -114,7 +114,7 @@ It may still expose issue reads, but tracker-facing selection and workflow state
 
 ## Config Design
 
-Supervisor policy is a separate local safety layer from tracker configuration. It may be set in the top-level `supervisor:` block or in `.maestro/supervisor.yaml`, and covers queue order, ready/blocked labels, excluded issue types, safe actions, and approval-gated actions.
+Supervisor policy is a separate local safety layer from tracker configuration. It may be set in the top-level `supervisor:` block or in `.maestro/supervisor.yaml`, and covers queue order, dynamic wave selection, ready/blocked labels, excluded issue types, safe actions, and approval-gated actions.
 
 Add a new top-level block:
 
