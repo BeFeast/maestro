@@ -94,12 +94,13 @@ type SupervisorOrderedQueueConfig struct {
 // SupervisorDynamicWaveConfig enables policy-driven issue selection without a
 // fixed issue-number list.
 type SupervisorDynamicWaveConfig struct {
-	Enabled        *bool `yaml:"enabled" json:"enabled,omitempty"`
-	OwnsReadyLabel bool  `yaml:"owns_ready_label" json:"owns_ready_label,omitempty"`
+	Enabled                 *bool    `yaml:"enabled" json:"enabled,omitempty"`
+	OwnsReadyLabel          bool     `yaml:"owns_ready_label" json:"owns_ready_label,omitempty"`
+	RunnableProjectStatuses []string `yaml:"runnable_project_statuses" json:"runnable_project_statuses,omitempty"`
 }
 
 func (w SupervisorDynamicWaveConfig) Active() bool {
-	return w.Enabled == nil || *w.Enabled
+	return w.Enabled != nil && *w.Enabled
 }
 
 func (q SupervisorOrderedQueueConfig) Active() bool {
