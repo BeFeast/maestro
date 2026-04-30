@@ -14,6 +14,9 @@ worker_max_tokens: 0               # kill worker when cumulative token usage exc
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 merge_strategy: sequential         # "sequential" (default) or "parallel"
 merge_interval_seconds: 30         # minimum seconds between sequential merges (default: 30)
+review_gate: greptile              # "greptile" (default) or "none"
+auto_retry_review_feedback: false  # retry PRs with actionable review comments
+auto_retry_rebase_conflicts: false # retry PRs whose auto-rebase fails with conflicts
 
 # Files to auto-resolve conflicts by keeping both sides during rebase.
 # Useful for generated/aggregated files that accumulate changes from multiple branches.

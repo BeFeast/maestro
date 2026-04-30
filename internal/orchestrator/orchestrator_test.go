@@ -1921,10 +1921,10 @@ func TestMergeReadyPR_BehindMainRebaseFailsMarksConflict(t *testing.T) {
 
 func TestHandleRebaseConflictRetry_SchedulesInPlaceRetry(t *testing.T) {
 	cfg := &config.Config{
-		Repo:                    "owner/repo",
-		AutoRetryReviewFeedback: true,
-		MaxRetriesPerIssue:      3,
-		MaxRetryBackoffMs:       300000,
+		Repo:                     "owner/repo",
+		AutoRetryRebaseConflicts: true,
+		MaxRetriesPerIssue:       3,
+		MaxRetryBackoffMs:        300000,
 	}
 	o := &Orchestrator{cfg: cfg, notifier: &notify.Notifier{}}
 	s := state.NewState()
@@ -1961,6 +1961,42 @@ func TestHandleRebaseConflictRetry_SchedulesInPlaceRetry(t *testing.T) {
 	}
 	if !strings.Contains(sess.PreviousAttemptFeedback, "docs/FEATURES.md") {
 		t.Fatalf("PreviousAttemptFeedback should include conflict details, got %q", sess.PreviousAttemptFeedback)
+	}
+}
+
+func TestHandleRebaseConflictRetry_IndependentFromReviewFeedbackRetry(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		addIssueLabelFn: func(number int, label string) error {
+			if number != 42 || label != "blocked" {
+				t.Fatalf("AddIssueLabel(%d, %q), want (42, blocked)", number, label)
+			}
+			return nil
+		},
+	}
+	s := state.NewState()
+	sess := &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "docs refresh",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	s.Sessions["slot-0"] = sess
+
+	o.handleRebaseConflictRetry(s, "slot-0", sess, 10, fmt.Errorf("CONFLICT (content): docs/FEATURES.md"))
+
+	if sess.Status != state.StatusConflictFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusConflictFailed)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt should not be set when rebase retry is disabled")
 	}
 }
 
@@ -4041,9 +4077,12 @@ func TestAvailableSlots_NonRunningLimitIgnoredForDispatch(t *testing.T) {
 
 func TestPendingRetryReservations_CountsOnlyScheduledDeadRetries(t *testing.T) {
 	now := time.Now().UTC()
+	past := now.Add(-time.Second)
+	future := now.Add(time.Minute)
 	s := state.NewState()
-	s.Sessions["retry-due"] = &state.Session{Status: state.StatusDead, NextRetryAt: &now}
-	s.Sessions["retry-waiting"] = &state.Session{Status: state.StatusDead, NextRetryAt: &now}
+	s.Sessions["retry-due"] = &state.Session{Status: state.StatusDead, NextRetryAt: &past}
+	s.Sessions["retry-now"] = &state.Session{Status: state.StatusDead, NextRetryAt: &now}
+	s.Sessions["retry-waiting"] = &state.Session{Status: state.StatusDead, NextRetryAt: &future}
 	s.Sessions["plain-dead"] = &state.Session{Status: state.StatusDead}
 	s.Sessions["running-with-retry"] = &state.Session{Status: state.StatusRunning, NextRetryAt: &now}
 

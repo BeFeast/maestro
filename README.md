@@ -164,6 +164,9 @@ worker_max_tokens: 0               # kill worker when cumulative token usage exc
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 merge_strategy: sequential         # "sequential" (default) or "parallel"
 merge_interval_seconds: 30         # minimum seconds between merges in sequential mode
+review_gate: greptile              # "greptile" (default) or "none"
+auto_retry_review_feedback: false  # retry PRs with actionable review comments
+auto_retry_rebase_conflicts: false # retry PRs whose auto-rebase fails with conflicts
 session_prefix: pan                # worker session name prefix (default: first 3 chars of repo name)
 state_dir: ~/.maestro/pan          # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude                 # deprecated: use model.backends.claude.cmd

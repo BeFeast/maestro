@@ -922,6 +922,9 @@ func TestParse_ReviewGateDefaults(t *testing.T) {
 	if cfg.AutoRetryReviewFeedback {
 		t.Error("AutoRetryReviewFeedback should default to false")
 	}
+	if cfg.AutoRetryRebaseConflicts {
+		t.Error("AutoRetryRebaseConflicts should default to false")
+	}
 }
 
 func TestParse_ReviewGateExplicitNone(t *testing.T) {
@@ -929,6 +932,7 @@ func TestParse_ReviewGateExplicitNone(t *testing.T) {
 repo: owner/repo
 review_gate: none
 auto_retry_review_feedback: true
+auto_retry_rebase_conflicts: true
 `
 	cfg, err := parse([]byte(yaml))
 	if err != nil {
@@ -939,6 +943,9 @@ auto_retry_review_feedback: true
 	}
 	if !cfg.AutoRetryReviewFeedback {
 		t.Error("AutoRetryReviewFeedback should be true when configured")
+	}
+	if !cfg.AutoRetryRebaseConflicts {
+		t.Error("AutoRetryRebaseConflicts should be true when configured")
 	}
 }
 
