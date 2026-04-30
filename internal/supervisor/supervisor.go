@@ -978,7 +978,7 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue) (str
 	if label, ok := firstMatchingIssueLabel(issue, e.dynamicWaveExcludedLabels()); ok {
 		return fmt.Sprintf("excluded by label %q", label), dynamicSkipExcluded, nil
 	}
-	if status, ok := nonRunnableProjectStatus(issue); ok {
+	if status, ok := e.nonRunnableProjectStatus(issue); ok {
 		return fmt.Sprintf("project status %q is not runnable", status), dynamicSkipProjectStatus, nil
 	}
 	if len(e.cfg.BlockerPatterns) > 0 {
@@ -1443,18 +1443,58 @@ func titleLooksEpic(title string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(title)), "epic:")
 }
 
-func nonRunnableProjectStatus(issue github.Issue) (string, bool) {
+func (e *Engine) nonRunnableProjectStatus(issue github.Issue) (string, bool) {
 	for _, item := range issue.ProjectItems {
 		if item.Status == nil {
 			continue
 		}
 		status := strings.TrimSpace(item.Status.Name)
-		if status == "" || strings.EqualFold(status, "Todo") {
+		if status == "" || projectStatusIsRunnable(status, e.runnableProjectStatuses()) {
 			continue
 		}
 		return status, true
 	}
 	return "", false
+}
+
+func (e *Engine) runnableProjectStatuses() []string {
+	if e == nil || e.cfg == nil {
+		return defaultRunnableProjectStatuses()
+	}
+	configured := trimNonEmpty(e.cfg.Supervisor.DynamicWave.RunnableProjectStatuses)
+	if len(configured) > 0 {
+		return configured
+	}
+	return defaultRunnableProjectStatuses()
+}
+
+func defaultRunnableProjectStatuses() []string {
+	return []string{"Todo", "To Do", "Ready", "Backlog", "New"}
+}
+
+func projectStatusIsRunnable(status string, runnable []string) bool {
+	normalized := normalizeProjectStatus(status)
+	for _, candidate := range runnable {
+		if normalizeProjectStatus(candidate) == normalized {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeProjectStatus(status string) string {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(status)))
+	return strings.Join(fields, " ")
+}
+
+func trimNonEmpty(values []string) []string {
+	trimmed := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			trimmed = append(trimmed, value)
+		}
+	}
+	return trimmed
 }
 
 func firstProjectStatus(issue github.Issue) string {

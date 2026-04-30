@@ -112,6 +112,10 @@ supervisor:
   dynamic_wave:
     enabled: true
     owns_ready_label: true
+    runnable_project_statuses:
+      - Todo
+      - Ready
+      - Backlog
   safe_actions:
     - add_ready_label
     - remove_ready_label
@@ -129,8 +133,26 @@ supervisor:
 	if !cfg.Supervisor.DynamicWave.OwnsReadyLabel {
 		t.Fatal("DynamicWave should own the ready label")
 	}
+	if got := cfg.Supervisor.DynamicWave.RunnableProjectStatuses; len(got) != 3 || got[1] != "Ready" {
+		t.Fatalf("RunnableProjectStatuses = %#v, want Todo/Ready/Backlog", got)
+	}
 	if cfg.Supervisor.ReadyLabel != "maestro-ready" {
 		t.Fatalf("ReadyLabel = %q, want maestro-ready", cfg.Supervisor.ReadyLabel)
+	}
+}
+
+func TestParse_SupervisorDynamicWaveDefaultInactive(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Supervisor.DynamicWave.Active() {
+		t.Fatal("DynamicWave should require explicit opt-in")
 	}
 }
 

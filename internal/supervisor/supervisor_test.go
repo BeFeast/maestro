@@ -123,6 +123,11 @@ func testConfig(t *testing.T) *config.Config {
 	}
 }
 
+func enableDynamicWave(cfg *config.Config) {
+	enabled := true
+	cfg.Supervisor.DynamicWave.Enabled = &enabled
+}
+
 func testEngine(cfg *config.Config, reader *fakeReader) *Engine {
 	eng := NewEngine(cfg, reader)
 	eng.now = func() time.Time { return time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC) }
@@ -172,6 +177,7 @@ func withProjectStatus(issue github.Issue, status string) github.Issue {
 func TestDecide_IdleNoEligibleIssueRecommendsLabel(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
 	reader := &fakeReader{issues: []github.Issue{testIssue(308, "implement supervisor")}}
 
 	decision, err := testEngine(cfg, reader).Decide(state.NewState())
@@ -697,6 +703,7 @@ func TestDecide_SupervisorReadyLabelActsAsRequiredLabel(t *testing.T) {
 func TestDecide_DynamicWaveSortsByPriorityThenIssueNumber(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
 	reader := &fakeReader{issues: []github.Issue{
 		testIssue(30, "p2 work", "p2"),
 		testIssue(20, "p0 work", "P0"),
@@ -725,6 +732,7 @@ func TestDecide_DynamicWaveSortsByPriorityThenIssueNumber(t *testing.T) {
 func TestRunOnceDynamicWaveAddsReadyOnlyToBestCandidateAndCleansStale(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
 	cfg.Supervisor.DynamicWave.OwnsReadyLabel = true
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
 	reader := &fakeReader{issues: []github.Issue{
@@ -757,6 +765,7 @@ func TestRunOnceDynamicWaveAddsReadyOnlyToBestCandidateAndCleansStale(t *testing
 func TestDecide_DynamicWaveSkipsTitleEpic(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
 	reader := &fakeReader{issues: []github.Issue{
 		testIssue(1, "Epic: parent work", "p0"),
 		testIssue(2, "regular work", "p1"),
@@ -781,9 +790,10 @@ func TestDecide_DynamicWaveSkipsTitleEpic(t *testing.T) {
 func TestDecide_DynamicWaveSkipsNonRunnableProjectStatus(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
 	reader := &fakeReader{issues: []github.Issue{
 		withProjectStatus(testIssue(1, "already started", "p0"), "In Progress"),
-		withProjectStatus(testIssue(2, "todo work", "p1"), "Todo"),
+		withProjectStatus(testIssue(2, "ready work", "p1"), "Ready"),
 	}}
 
 	decision, err := testEngine(cfg, reader).Decide(state.NewState())
@@ -799,6 +809,29 @@ func TestDecide_DynamicWaveSkipsNonRunnableProjectStatus(t *testing.T) {
 	}
 	if len(decision.QueueAnalysis.SkippedReasons) == 0 || !strings.Contains(decision.QueueAnalysis.SkippedReasons[0], "project status") {
 		t.Fatalf("skipped reasons = %#v, want project status reason", decision.QueueAnalysis.SkippedReasons)
+	}
+}
+
+func TestDecide_DynamicWaveSupportsConfiguredRunnableProjectStatus(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
+	cfg.Supervisor.DynamicWave.RunnableProjectStatuses = []string{"Selected"}
+	reader := &fakeReader{issues: []github.Issue{
+		withProjectStatus(testIssue(1, "todo is not configured", "p0"), "Todo"),
+		withProjectStatus(testIssue(2, "selected work", "p1"), "Selected"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.NonRunnableProjectStatusCount != 1 {
+		t.Fatalf("queue analysis = %#v, want one non-runnable project status", decision.QueueAnalysis)
 	}
 }
 
@@ -913,6 +946,7 @@ func TestRunOnceOrderedQueueUsesConfiguredSupervisorBlockedLabel(t *testing.T) {
 func TestRunOnceDynamicWaveNeverRemovesBlockedLabel(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
 	cfg.Supervisor.BlockedLabel = "blocked"
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel, config.SupervisorActionRemoveBlockedLabel}
 	reader := &fakeReader{issues: []github.Issue{
