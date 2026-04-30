@@ -1557,8 +1557,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 
 		switch ciStatus {
 		case "success":
-			// Reset notification status when CI goes green
-			sess.LastNotifiedStatus = ""
+			// Reset CI-failure notification state when CI goes green. Keep
+			// review retry-exhausted markers so actionable feedback does not
+			// re-notify on every orchestration cycle.
+			if sess.LastNotifiedStatus == "ci_failure" || sess.LastNotifiedStatus == "ci_retry_exhausted" {
+				sess.LastNotifiedStatus = ""
+			}
 			sess.NotifiedCIFail = false // backward compat
 
 			if o.cfg.AutoRetryReviewFeedback {
@@ -1598,7 +1602,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				sess.Status = state.StatusPROpen
 			}
 			// Auto-retry on CI failure: close the PR, capture CI output, and schedule retry
-			if sess.LastNotifiedStatus != "ci_failure" {
+			if sess.LastNotifiedStatus != "ci_failure" && sess.LastNotifiedStatus != "ci_retry_exhausted" {
 				sess.NotifiedCIFail = true // backward compat
 
 				o.handleCIFailureRetry(s, slotName, sess, pr)
@@ -1688,6 +1692,7 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 	if maxRetries > 0 && totalAttempts >= maxRetries {
 		log.Printf("[orch] review feedback on PR #%d — retry limit reached (%d/%d) for issue #%d",
 			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
+		alreadyNotified := sess.LastNotifiedStatus == "review_retry_exhausted"
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
 		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
 		sess.Status = state.StatusRetryExhausted
@@ -1695,8 +1700,10 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 		sess.LastNotifiedStatus = "review_retry_exhausted"
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
-		o.notifier.Sendf("💀 maestro: review feedback on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
-			pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+		if !alreadyNotified {
+			o.notifier.Sendf("💀 maestro: review feedback on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
+				pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+		}
 		return
 	}
 
@@ -1741,11 +1748,19 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	if maxRetries > 0 && totalAttempts >= maxRetries {
 		log.Printf("[orch] CI failure on PR #%d — retry limit reached (%d/%d) for issue #%d",
 			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
+		alreadyNotified := sess.LastNotifiedStatus == "ci_retry_exhausted"
 		// auto-label blocked disabled
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
 		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
-		o.notifier.Sendf("💀 maestro: CI failing on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
-			pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+		sess.Status = state.StatusRetryExhausted
+		sess.NextRetryAt = nil
+		sess.LastNotifiedStatus = "ci_retry_exhausted"
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		if !alreadyNotified {
+			o.notifier.Sendf("💀 maestro: CI failing on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
+				pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+		}
 		return
 	}
 

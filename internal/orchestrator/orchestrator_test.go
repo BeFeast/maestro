@@ -1224,9 +1224,11 @@ func TestAutoMergePRs_ReviewFeedbackRetryLimitMarksTerminal(t *testing.T) {
 		MaxRetriesPerIssue:      3,
 		MaxRetryBackoffMs:       300000,
 	}
+	notifier := notify.NewWithToken("", "123", "", "")
+	notifier.SetDigestMode(true)
 	o := &Orchestrator{
 		cfg:      cfg,
-		notifier: &notify.Notifier{},
+		notifier: notifier,
 		listOpenPRsFn: func() ([]github.PR, error) {
 			return prs, nil
 		},
@@ -1252,6 +1254,15 @@ func TestAutoMergePRs_ReviewFeedbackRetryLimitMarksTerminal(t *testing.T) {
 	}
 	if sess.LastNotifiedStatus != "review_retry_exhausted" {
 		t.Fatalf("LastNotifiedStatus = %q, want review_retry_exhausted", sess.LastNotifiedStatus)
+	}
+	if notifier.Buffered() != 1 {
+		t.Fatalf("notifications buffered = %d, want 1", notifier.Buffered())
+	}
+
+	o.autoMergePRs(s)
+
+	if notifier.Buffered() != 1 {
+		t.Fatalf("duplicate terminal notification buffered; got %d, want 1", notifier.Buffered())
 	}
 }
 
@@ -1322,9 +1333,11 @@ func TestAutoMergePRs_RetryExhaustedActionableFeedbackStillBlocks(t *testing.T) 
 		MaxRetryBackoffMs:       300000,
 	}
 	merged := make([]int, 0)
+	notifier := notify.NewWithToken("", "123", "", "")
+	notifier.SetDigestMode(true)
 	o := &Orchestrator{
 		cfg:      cfg,
-		notifier: &notify.Notifier{},
+		notifier: notifier,
 		listOpenPRsFn: func() ([]github.PR, error) {
 			return prs, nil
 		},
@@ -1360,6 +1373,18 @@ func TestAutoMergePRs_RetryExhaustedActionableFeedbackStillBlocks(t *testing.T) 
 	}
 	if sess.LastNotifiedStatus != "review_retry_exhausted" {
 		t.Fatalf("LastNotifiedStatus = %q, want review_retry_exhausted", sess.LastNotifiedStatus)
+	}
+	if notifier.Buffered() != 1 {
+		t.Fatalf("notifications buffered = %d, want 1", notifier.Buffered())
+	}
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 0 {
+		t.Fatalf("actionable review feedback should still block merge, got merged=%v", merged)
+	}
+	if notifier.Buffered() != 1 {
+		t.Fatalf("duplicate terminal notification buffered; got %d, want 1", notifier.Buffered())
 	}
 }
 
@@ -5036,6 +5061,9 @@ func TestAutoMergePRs_CIFailure_RetryLimitExhausted_NoRetry(t *testing.T) {
 	}
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 2, MaxRetryBackoffMs: 300000}
 	o, _, closedPRs := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{10: "failure"})
+	notifier := notify.NewWithToken("", "123", "", "")
+	notifier.SetDigestMode(true)
+	o.notifier = notifier
 	s := makeTestState(prs)
 
 	// Simulate 2 prior failed attempts for this issue
@@ -5059,10 +5087,31 @@ func TestAutoMergePRs_CIFailure_RetryLimitExhausted_NoRetry(t *testing.T) {
 		t.Fatalf("closedPRs = %v, want empty (retry limit exhausted)", *closedPRs)
 	}
 
-	// Session should still be pr_open (no retry scheduled)
+	// Session should be terminal, but keep the PR open for manual review/merge.
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusPROpen {
-		t.Fatalf("status = %q, want %q (retry limit exhausted, PR stays open)", sess.Status, state.StatusPROpen)
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q (retry limit exhausted, PR stays open)", sess.Status, state.StatusRetryExhausted)
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10 (retry-exhausted PR remains open)", sess.PRNumber)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt should be nil after retry exhaustion")
+	}
+	if sess.LastNotifiedStatus != "ci_retry_exhausted" {
+		t.Fatalf("LastNotifiedStatus = %q, want ci_retry_exhausted", sess.LastNotifiedStatus)
+	}
+	if notifier.Buffered() != 1 {
+		t.Fatalf("notifications buffered = %d, want 1", notifier.Buffered())
+	}
+
+	o.autoMergePRs(s)
+
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs after duplicate cycle = %v, want empty", *closedPRs)
+	}
+	if notifier.Buffered() != 1 {
+		t.Fatalf("duplicate terminal notification buffered; got %d, want 1", notifier.Buffered())
 	}
 }
 
