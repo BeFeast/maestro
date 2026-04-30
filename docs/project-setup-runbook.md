@@ -160,6 +160,7 @@ supervisor:
     owns_ready_label: true
     runnable_project_statuses:
       - Todo
+      - To Do
       - Ready
       - Backlog
       - New
