@@ -128,6 +128,28 @@ type SupervisorProjectState struct {
 	AvailableSlots int `json:"available_slots"`
 }
 
+// SupervisorIssueCandidate describes the issue selected by queue policy without
+// exposing issue body content in persisted supervisor state.
+type SupervisorIssueCandidate struct {
+	Number        int      `json:"number"`
+	Title         string   `json:"title,omitempty"`
+	Labels        []string `json:"labels,omitempty"`
+	PriorityLabel string   `json:"priority_label,omitempty"`
+	ProjectStatus string   `json:"project_status,omitempty"`
+}
+
+// SupervisorQueueAnalysis captures explainable issue-selection counts for
+// Mission Control and --json output.
+type SupervisorQueueAnalysis struct {
+	PolicyRule                    string                    `json:"policy_rule,omitempty"`
+	OpenIssues                    int                       `json:"open_issues"`
+	EligibleCandidates            int                       `json:"eligible_candidates"`
+	ExcludedIssues                int                       `json:"excluded_issues"`
+	NonRunnableProjectStatusCount int                       `json:"non_runnable_project_status_count"`
+	SelectedCandidate             *SupervisorIssueCandidate `json:"selected_candidate,omitempty"`
+	SkippedReasons                []string                  `json:"skipped_reasons,omitempty"`
+}
+
 // SupervisorMutation records one durable GitHub mutation planned or attempted by
 // the supervisor queue action loop.
 type SupervisorMutation struct {
@@ -151,24 +173,25 @@ type SupervisorStuckState struct {
 
 // SupervisorDecision is a stable, machine-readable supervisor orchestration record.
 type SupervisorDecision struct {
-	ID                string                 `json:"id"`
-	CreatedAt         time.Time              `json:"created_at"`
-	Project           string                 `json:"project"`
-	Mode              string                 `json:"mode"`
-	PolicyRule        string                 `json:"policy_rule,omitempty"`
-	Status            string                 `json:"status,omitempty"`
-	Summary           string                 `json:"summary"`
-	RecommendedAction string                 `json:"recommended_action"`
-	Target            *SupervisorTarget      `json:"target,omitempty"`
-	Risk              string                 `json:"risk"`
-	Confidence        float64                `json:"confidence"`
-	ErrorClass        string                 `json:"error_class,omitempty"`
-	Reasons           []string               `json:"reasons,omitempty"`
-	RequiresApproval  bool                   `json:"requires_approval"`
-	Mutations         []SupervisorMutation   `json:"mutations,omitempty"`
-	StuckStates       []SupervisorStuckState `json:"stuck_states,omitempty"`
-	ProjectState      SupervisorProjectState `json:"project_state"`
-	ApprovalID        string                 `json:"approval_id,omitempty"`
+	ID                string                   `json:"id"`
+	CreatedAt         time.Time                `json:"created_at"`
+	Project           string                   `json:"project"`
+	Mode              string                   `json:"mode"`
+	PolicyRule        string                   `json:"policy_rule,omitempty"`
+	Status            string                   `json:"status,omitempty"`
+	Summary           string                   `json:"summary"`
+	RecommendedAction string                   `json:"recommended_action"`
+	Target            *SupervisorTarget        `json:"target,omitempty"`
+	Risk              string                   `json:"risk"`
+	Confidence        float64                  `json:"confidence"`
+	ErrorClass        string                   `json:"error_class,omitempty"`
+	Reasons           []string                 `json:"reasons,omitempty"`
+	RequiresApproval  bool                     `json:"requires_approval"`
+	Mutations         []SupervisorMutation     `json:"mutations,omitempty"`
+	StuckStates       []SupervisorStuckState   `json:"stuck_states,omitempty"`
+	ProjectState      SupervisorProjectState   `json:"project_state"`
+	QueueAnalysis     *SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
+	ApprovalID        string                   `json:"approval_id,omitempty"`
 }
 
 type ApprovalStatus string

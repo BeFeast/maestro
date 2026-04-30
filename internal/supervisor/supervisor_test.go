@@ -159,6 +159,16 @@ func testIssue(number int, title string, labels ...string) github.Issue {
 	return issue
 }
 
+func withProjectStatus(issue github.Issue, status string) github.Issue {
+	issue.ProjectItems = []github.IssueProjectItem{{
+		Title: "Maestro",
+		Status: &github.IssueProjectItemStatus{
+			Name: status,
+		},
+	}}
+	return issue
+}
+
 func TestDecide_IdleNoEligibleIssueRecommendsLabel(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
@@ -181,12 +191,14 @@ func TestDecide_IdleNoEligibleIssueRecommendsLabel(t *testing.T) {
 	if decision.Mode != ModeReadOnly {
 		t.Errorf("mode = %q, want %q", decision.Mode, ModeReadOnly)
 	}
-	stuck := requireStuckState(t, decision, "no_eligible_issues")
-	if stuck.Severity != SeverityWarning {
-		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityWarning)
+	if decision.QueueAnalysis == nil {
+		t.Fatal("QueueAnalysis is nil")
 	}
-	if !stuck.SupervisorCanAct {
-		t.Error("expected SupervisorCanAct for label recommendation")
+	if decision.QueueAnalysis.OpenIssues != 1 || decision.QueueAnalysis.EligibleCandidates != 1 {
+		t.Fatalf("queue analysis = %#v, want one open eligible candidate", decision.QueueAnalysis)
+	}
+	if decision.QueueAnalysis.SelectedCandidate == nil || decision.QueueAnalysis.SelectedCandidate.Number != 308 {
+		t.Fatalf("selected candidate = %#v, want issue 308", decision.QueueAnalysis.SelectedCandidate)
 	}
 }
 
@@ -662,6 +674,8 @@ func TestDecide_ConfigExcludeLabelsStillHonored(t *testing.T) {
 func TestDecide_SupervisorReadyLabelActsAsRequiredLabel(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Supervisor.ReadyLabel = "maestro-ready"
+	dynamicEnabled := false
+	cfg.Supervisor.DynamicWave.Enabled = &dynamicEnabled
 	reader := &fakeReader{issues: []github.Issue{
 		testIssue(1, "missing"),
 		testIssue(2, "ready", "maestro-ready"),
@@ -677,6 +691,114 @@ func TestDecide_SupervisorReadyLabelActsAsRequiredLabel(t *testing.T) {
 	}
 	if decision.PolicyRule != PolicyRuleIssueLabels {
 		t.Fatalf("PolicyRule = %q, want %q", decision.PolicyRule, PolicyRuleIssueLabels)
+	}
+}
+
+func TestDecide_DynamicWaveSortsByPriorityThenIssueNumber(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(30, "p2 work", "p2"),
+		testIssue(20, "p0 work", "P0"),
+		testIssue(10, "p0 lower number", "p0"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionLabelIssueReady {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionLabelIssueReady)
+	}
+	if decision.Target == nil || decision.Target.Issue != 10 {
+		t.Fatalf("target = %#v, want issue 10", decision.Target)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.SelectedCandidate == nil {
+		t.Fatalf("queue analysis = %#v, want selected candidate", decision.QueueAnalysis)
+	}
+	if got := decision.QueueAnalysis.SelectedCandidate.PriorityLabel; !strings.EqualFold(got, "p0") {
+		t.Fatalf("priority label = %q, want p0", got)
+	}
+}
+
+func TestRunOnceDynamicWaveAddsReadyOnlyToBestCandidateAndCleansStale(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.DynamicWave.OwnsReadyLabel = true
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(10, "stale ready", "maestro-ready", "p3"),
+		testIssue(20, "best candidate", "p0"),
+	}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.Status != DecisionStatusSucceeded {
+		t.Fatalf("status = %q, want %q", decision.Status, DecisionStatusSucceeded)
+	}
+	if decision.Target == nil || decision.Target.Issue != 20 {
+		t.Fatalf("target = %#v, want issue 20", decision.Target)
+	}
+	if got, want := strings.Join(reader.addedLabels, ","), "#20:maestro-ready"; got != want {
+		t.Fatalf("added labels = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(reader.removedLabels, ","), "#10:maestro-ready"; got != want {
+		t.Fatalf("removed labels = %q, want %q", got, want)
+	}
+	if len(decision.Mutations) != 2 {
+		t.Fatalf("mutations = %#v, want add selected and remove stale", decision.Mutations)
+	}
+}
+
+func TestDecide_DynamicWaveSkipsTitleEpic(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "Epic: parent work", "p0"),
+		testIssue(2, "regular work", "p1"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.ExcludedIssues != 1 {
+		t.Fatalf("queue analysis = %#v, want one excluded issue", decision.QueueAnalysis)
+	}
+	if len(decision.QueueAnalysis.SkippedReasons) == 0 || !strings.Contains(decision.QueueAnalysis.SkippedReasons[0], "title indicates epic") {
+		t.Fatalf("skipped reasons = %#v, want title epic reason", decision.QueueAnalysis.SkippedReasons)
+	}
+}
+
+func TestDecide_DynamicWaveSkipsNonRunnableProjectStatus(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{
+		withProjectStatus(testIssue(1, "already started", "p0"), "In Progress"),
+		withProjectStatus(testIssue(2, "todo work", "p1"), "Todo"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.NonRunnableProjectStatusCount != 1 {
+		t.Fatalf("queue analysis = %#v, want one non-runnable project status", decision.QueueAnalysis)
+	}
+	if len(decision.QueueAnalysis.SkippedReasons) == 0 || !strings.Contains(decision.QueueAnalysis.SkippedReasons[0], "project status") {
+		t.Fatalf("skipped reasons = %#v, want project status reason", decision.QueueAnalysis.SkippedReasons)
 	}
 }
 
@@ -737,10 +859,11 @@ func TestRunOnceLabelsNextIssueReadyAndComments(t *testing.T) {
 	}
 }
 
-func TestRunOnceRemovesBlockedLabelWhenPolicyAllows(t *testing.T) {
+func TestRunOnceOrderedQueueRemovesBlockedLabelWhenPolicyAllows(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
 	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{42}}
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionRemoveBlockedLabel}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "was blocked", "maestro-ready", "blocked")}}
 
@@ -763,10 +886,11 @@ func TestRunOnceRemovesBlockedLabelWhenPolicyAllows(t *testing.T) {
 	}
 }
 
-func TestRunOnceUsesConfiguredSupervisorBlockedLabel(t *testing.T) {
+func TestRunOnceOrderedQueueUsesConfiguredSupervisorBlockedLabel(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
 	cfg.Supervisor.BlockedLabel = "waiting"
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Enabled: true, Issues: []int{42}}
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionRemoveBlockedLabel}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "waiting work", "maestro-ready", "waiting")}}
 
@@ -783,6 +907,32 @@ func TestRunOnceUsesConfiguredSupervisorBlockedLabel(t *testing.T) {
 	}
 	if len(reader.addedLabels) != 0 {
 		t.Fatalf("added labels = %#v, want none", reader.addedLabels)
+	}
+}
+
+func TestRunOnceDynamicWaveNeverRemovesBlockedLabel(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.BlockedLabel = "blocked"
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel, config.SupervisorActionRemoveBlockedLabel}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "blocked high priority", "maestro-ready", "blocked", "p0"),
+		testIssue(2, "regular", "p1"),
+	}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+	if got, want := strings.Join(reader.addedLabels, ","), "#2:maestro-ready"; got != want {
+		t.Fatalf("added labels = %q, want %q", got, want)
+	}
+	if len(reader.removedLabels) != 0 {
+		t.Fatalf("removed labels = %#v, want no blocked removal in dynamic mode", reader.removedLabels)
 	}
 }
 

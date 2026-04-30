@@ -104,6 +104,36 @@ supervisor:
 	}
 }
 
+func TestParse_SupervisorDynamicWaveWithoutOrderedQueue(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+  dynamic_wave:
+    enabled: true
+    owns_ready_label: true
+  safe_actions:
+    - add_ready_label
+    - remove_ready_label
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Supervisor.OrderedQueue.Active() {
+		t.Fatal("OrderedQueue should not be active")
+	}
+	if !cfg.Supervisor.DynamicWave.Active() {
+		t.Fatal("DynamicWave should be active")
+	}
+	if !cfg.Supervisor.DynamicWave.OwnsReadyLabel {
+		t.Fatal("DynamicWave should own the ready label")
+	}
+	if cfg.Supervisor.ReadyLabel != "maestro-ready" {
+		t.Fatalf("ReadyLabel = %q, want maestro-ready", cfg.Supervisor.ReadyLabel)
+	}
+}
+
 func TestParse_AutoRestoreFiles(t *testing.T) {
 	yaml := `
 repo: owner/repo

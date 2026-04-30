@@ -49,6 +49,7 @@ type GitHubProjectsConfig struct {
 
 const (
 	SupervisorActionAddReadyLabel      = "add_ready_label"
+	SupervisorActionRemoveReadyLabel   = "remove_ready_label"
 	SupervisorActionRemoveBlockedLabel = "remove_blocked_label"
 	SupervisorActionAddIssueComment    = "add_issue_comment"
 	SupervisorActionMergePR            = "merge_pr"
@@ -73,6 +74,7 @@ type SupervisorConfig struct {
 	ExcludedLabels          []string                     `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
 	AllowIssueTypes         []string                     `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
 	OrderedQueue            SupervisorOrderedQueueConfig `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
+	DynamicWave             SupervisorDynamicWaveConfig  `yaml:"dynamic_wave" json:"dynamic_wave,omitempty"`
 	SafeActions             []string                     `yaml:"safe_actions" json:"safe_actions,omitempty"`
 	ApprovalRequired        []string                     `yaml:"approval_required" json:"approval_required,omitempty"`
 	AllowedActions          []string                     `yaml:"allowed_actions" json:"allowed_actions,omitempty"`
@@ -87,6 +89,17 @@ type SupervisorOrderedQueueConfig struct {
 	Enabled    bool  `yaml:"enabled" json:"enabled"`
 	Issues     []int `yaml:"issues" json:"issues,omitempty"`
 	DoneIssues []int `yaml:"done_issues" json:"done_issues,omitempty"`
+}
+
+// SupervisorDynamicWaveConfig enables policy-driven issue selection without a
+// fixed issue-number list.
+type SupervisorDynamicWaveConfig struct {
+	Enabled        *bool `yaml:"enabled" json:"enabled,omitempty"`
+	OwnsReadyLabel bool  `yaml:"owns_ready_label" json:"owns_ready_label,omitempty"`
+}
+
+func (w SupervisorDynamicWaveConfig) Active() bool {
+	return w.Enabled == nil || *w.Enabled
 }
 
 func (q SupervisorOrderedQueueConfig) Active() bool {
@@ -675,6 +688,7 @@ func validateSupervisorActions(field string, actions []string) error {
 func knownSupervisorActions() map[string]bool {
 	return map[string]bool{
 		SupervisorActionAddReadyLabel:      true,
+		SupervisorActionRemoveReadyLabel:   true,
 		SupervisorActionRemoveBlockedLabel: true,
 		SupervisorActionAddIssueComment:    true,
 		SupervisorActionMergePR:            true,
@@ -687,6 +701,7 @@ func knownSupervisorActions() map[string]bool {
 func knownSupervisorActionNames() []string {
 	return []string{
 		SupervisorActionAddReadyLabel,
+		SupervisorActionRemoveReadyLabel,
 		SupervisorActionRemoveBlockedLabel,
 		SupervisorActionAddIssueComment,
 		SupervisorActionMergePR,

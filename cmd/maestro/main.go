@@ -500,6 +500,9 @@ func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool)
 			fmt.Printf("  - %s\n", reason)
 		}
 	}
+	if decision.QueueAnalysis != nil {
+		printQueueAnalysis(decision.QueueAnalysis, "")
+	}
 	if len(decision.Mutations) > 0 {
 		fmt.Println("Mutations:")
 		for _, mutation := range decision.Mutations {
@@ -529,6 +532,26 @@ func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool)
 		}
 	}
 	fmt.Printf("Recorded: %s\n", decision.CreatedAt.Format(time.RFC3339))
+}
+
+func printQueueAnalysis(analysis *state.SupervisorQueueAnalysis, indent string) {
+	if analysis == nil {
+		return
+	}
+	fmt.Printf("%sQueue: open=%d eligible=%d excluded=%d non_runnable_project_status=%d\n", indent, analysis.OpenIssues, analysis.EligibleCandidates, analysis.ExcludedIssues, analysis.NonRunnableProjectStatusCount)
+	if analysis.SelectedCandidate != nil {
+		fmt.Printf("%sSelected candidate: issue #%d", indent, analysis.SelectedCandidate.Number)
+		if analysis.SelectedCandidate.PriorityLabel != "" {
+			fmt.Printf(" priority=%s", analysis.SelectedCandidate.PriorityLabel)
+		}
+		if analysis.SelectedCandidate.ProjectStatus != "" {
+			fmt.Printf(" project_status=%q", analysis.SelectedCandidate.ProjectStatus)
+		}
+		fmt.Println()
+	}
+	for _, reason := range analysis.SkippedReasons {
+		fmt.Printf("%sSkipped: %s\n", indent, reason)
+	}
 }
 
 func supervisorTargetParts(target *state.SupervisorTarget) []string {
@@ -962,6 +985,9 @@ func showLatestSupervisorDecision(s *state.State) {
 		if len(parts) > 0 {
 			fmt.Printf("  Target: %s\n", strings.Join(parts, ", "))
 		}
+	}
+	if decision.QueueAnalysis != nil {
+		printQueueAnalysis(decision.QueueAnalysis, "  ")
 	}
 	if len(decision.StuckStates) > 0 {
 		fmt.Printf("  Stuck states: %d", len(decision.StuckStates))

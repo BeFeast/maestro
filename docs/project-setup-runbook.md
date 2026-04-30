@@ -155,8 +155,12 @@ supervisor:
     issues:
       - 308
       - 306
+  dynamic_wave:
+    enabled: true
+    owns_ready_label: true
   safe_actions:
     - add_ready_label
+    - remove_ready_label
     - remove_blocked_label
     - add_issue_comment
   approval_required:
@@ -200,7 +204,7 @@ telegram:
 | `session_prefix` | Prefix for tmux session names |
 | `worker_prompt` | Path to the worker prompt template file |
 
-Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch.
+Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules.
 
 ### Optional: versioning config
 
