@@ -207,6 +207,69 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 	}
 }
 
+func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["mae-8"] = &state.Session{
+		IssueNumber: 108,
+		IssueTitle:  "add branch rescue",
+		Status:      state.StatusRunning,
+		PID:         8080,
+		TmuxSession: "maestro-mae-8",
+		Branch:      "feat/mae-8-108-add-branch-rescue",
+	}
+
+	var gotTitle, gotBody, gotBase, gotHead string
+	o := &Orchestrator{
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		remoteBranchExistsFn: func(branch string) (bool, error) {
+			return branch == "feat/mae-8-108-add-branch-rescue", nil
+		},
+		createPRFn: func(title, body, base, head string) (int, error) {
+			gotTitle, gotBody, gotBase, gotHead = title, body, base, head
+			return 144, nil
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["mae-8"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.PRNumber != 144 {
+		t.Fatalf("pr_number = %d, want 144", sess.PRNumber)
+	}
+	if sess.PID != 0 {
+		t.Fatalf("pid = %d, want 0", sess.PID)
+	}
+	if sess.TmuxSession != "" {
+		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("finished_at should be set")
+	}
+	if gotBase != "main" {
+		t.Fatalf("base = %q, want main", gotBase)
+	}
+	if gotHead != "feat/mae-8-108-add-branch-rescue" {
+		t.Fatalf("head = %q", gotHead)
+	}
+	if !strings.Contains(gotTitle, "add branch rescue") || !strings.Contains(gotTitle, "(#108)") {
+		t.Fatalf("unexpected title %q", gotTitle)
+	}
+	if !strings.Contains(gotBody, "Closes #108") || !strings.Contains(gotBody, "auto-created") {
+		t.Fatalf("unexpected body %q", gotBody)
+	}
+	if !s.IssueInProgress(108) {
+		t.Fatal("IssueInProgress(108) must remain true after auto-created PR")
+	}
+}
+
 // TestReconcileRunningSessions_DeadWorkerNoPR_TransitionsToDead verifies that
 // the existing behaviour is preserved when no PR exists for the dead worker.
 func TestReconcileRunningSessions_DeadWorkerNoPR_TransitionsToDead(t *testing.T) {
