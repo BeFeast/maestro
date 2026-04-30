@@ -251,12 +251,13 @@ type Config struct {
 	StateDir                   string               `yaml:"state_dir"`           // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model                      ModelConfig          `yaml:"model"`
 	Routing                    RoutingConfig        `yaml:"routing"`
-	DeployCmd                  string               `yaml:"deploy_cmd"`                 // shell command to run after successful PR merge
-	DeployTimeoutMinutes       int                  `yaml:"deploy_timeout_minutes"`     // timeout for deploy command in minutes (default: 15)
-	MergeStrategy              string               `yaml:"merge_strategy"`             // "sequential" | "parallel"
-	MergeIntervalSeconds       int                  `yaml:"merge_interval_seconds"`     // minimum seconds between merges in sequential mode
-	ReviewGate                 string               `yaml:"review_gate"`                // "greptile" (default) | "none"
-	AutoRetryReviewFeedback    bool                 `yaml:"auto_retry_review_feedback"` // close PRs with review comments and respawn a fixer
+	DeployCmd                  string               `yaml:"deploy_cmd"`                  // shell command to run after successful PR merge
+	DeployTimeoutMinutes       int                  `yaml:"deploy_timeout_minutes"`      // timeout for deploy command in minutes (default: 15)
+	MergeStrategy              string               `yaml:"merge_strategy"`              // "sequential" | "parallel"
+	MergeIntervalSeconds       int                  `yaml:"merge_interval_seconds"`      // minimum seconds between merges in sequential mode
+	ReviewGate                 string               `yaml:"review_gate"`                 // "greptile" (default) | "none"
+	AutoRetryReviewFeedback    bool                 `yaml:"auto_retry_review_feedback"`  // close PRs with review comments and respawn a fixer
+	AutoRetryRebaseConflicts   bool                 `yaml:"auto_retry_rebase_conflicts"` // retry PRs whose auto-rebase fails with conflicts
 	Telegram                   TelegramConfig       `yaml:"telegram"`
 	Versioning                 VersioningConfig     `yaml:"versioning"`
 	GitHubProjects             GitHubProjectsConfig `yaml:"github_projects"`

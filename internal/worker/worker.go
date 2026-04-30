@@ -491,12 +491,17 @@ func restoreAllowedDirtyFiles(worktreePath string, autoRestoreFiles []string) er
 	if len(paths) == 0 {
 		return nil
 	}
-	args := append([]string{"status", "--porcelain", "--"}, paths...)
+	args := append([]string{"status", "--porcelain", "--untracked-files=all", "--"}, paths...)
 	dirty, err := runGit(worktreePath, args...)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(dirty) == "" {
+	cleanArgs := append([]string{"clean", "-fdxn", "--"}, paths...)
+	cleanPreview, err := runGit(worktreePath, cleanArgs...)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(dirty) == "" && strings.TrimSpace(cleanPreview) == "" {
 		return nil
 	}
 
@@ -511,7 +516,7 @@ func restoreAllowedDirtyFiles(worktreePath string, autoRestoreFiles []string) er
 			return err
 		}
 	}
-	args = append([]string{"clean", "-fd", "--"}, paths...)
+	args = append([]string{"clean", "-fdx", "--"}, paths...)
 	if _, err := runGit(worktreePath, args...); err != nil {
 		return err
 	}

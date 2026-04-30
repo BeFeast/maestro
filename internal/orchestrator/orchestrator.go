@@ -536,9 +536,10 @@ func (o *Orchestrator) canRetryIssue(s *state.State, sess *state.Session) bool {
 }
 
 func pendingRetryReservations(s *state.State) int {
+	now := time.Now().UTC()
 	count := 0
 	for _, sess := range s.Sessions {
-		if sess.Status == state.StatusDead && sess.NextRetryAt != nil {
+		if sess.Status == state.StatusDead && sess.NextRetryAt != nil && !now.Before(*sess.NextRetryAt) {
 			count++
 		}
 	}
@@ -869,6 +870,10 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	if newCfg.AutoRetryReviewFeedback != old.AutoRetryReviewFeedback {
 		changed = append(changed, fmt.Sprintf("auto_retry_review_feedback: %v→%v", old.AutoRetryReviewFeedback, newCfg.AutoRetryReviewFeedback))
 		o.cfg.AutoRetryReviewFeedback = newCfg.AutoRetryReviewFeedback
+	}
+	if newCfg.AutoRetryRebaseConflicts != old.AutoRetryRebaseConflicts {
+		changed = append(changed, fmt.Sprintf("auto_retry_rebase_conflicts: %v→%v", old.AutoRetryRebaseConflicts, newCfg.AutoRetryRebaseConflicts))
+		o.cfg.AutoRetryRebaseConflicts = newCfg.AutoRetryRebaseConflicts
 	}
 	if newCfg.DeployCmd != old.DeployCmd {
 		changed = append(changed, fmt.Sprintf("deploy_cmd: %q→%q", old.DeployCmd, newCfg.DeployCmd))
@@ -1890,7 +1895,7 @@ func (o *Orchestrator) markRebaseQueued(slotName string, sess *state.Session, pr
 }
 
 func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string, sess *state.Session, prNumber int, cause error) {
-	if !o.cfg.AutoRetryReviewFeedback {
+	if !o.cfg.AutoRetryRebaseConflicts {
 		o.markUnresolvableConflict(slotName, sess, prNumber, cause)
 		return
 	}
@@ -1958,7 +1963,7 @@ func rebaseConflictFeedback(prNumber int, cause error) string {
 }
 
 func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Session, prNumber int, cause error) {
-	if err := o.gh.AddIssueLabel(sess.IssueNumber, "blocked"); err != nil {
+	if err := o.addIssueLabel(sess.IssueNumber, "blocked"); err != nil {
 		log.Printf("[orch] warn: could not label issue #%d as blocked: %v", sess.IssueNumber, err)
 	}
 	if cause != nil {

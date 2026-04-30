@@ -40,6 +40,8 @@ type supervisorProjectConfigPacket struct {
 	WorkerMaxTokens            int               `json:"worker_max_tokens,omitempty"`
 	MergeStrategy              string            `json:"merge_strategy"`
 	ReviewGate                 string            `json:"review_gate"`
+	AutoRetryReviewFeedback    bool              `json:"auto_retry_review_feedback"`
+	AutoRetryRebaseConflicts   bool              `json:"auto_retry_rebase_conflicts"`
 	GitHubProjectsEnabled      bool              `json:"github_projects_enabled"`
 	MissionsEnabled            bool              `json:"missions_enabled"`
 	Supervisor                 supervisorRuntime `json:"supervisor"`
@@ -171,6 +173,8 @@ func (e *Engine) projectConfigPacket() supervisorProjectConfigPacket {
 		WorkerMaxTokens:            e.cfg.WorkerMaxTokens,
 		MergeStrategy:              e.cfg.MergeStrategy,
 		ReviewGate:                 e.cfg.ReviewGate,
+		AutoRetryReviewFeedback:    e.cfg.AutoRetryReviewFeedback,
+		AutoRetryRebaseConflicts:   e.cfg.AutoRetryRebaseConflicts,
 		GitHubProjectsEnabled:      e.cfg.GitHubProjects.Enabled,
 		MissionsEnabled:            e.cfg.Missions.Enabled,
 		Supervisor: supervisorRuntime{
