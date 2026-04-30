@@ -37,6 +37,8 @@ type Orchestrator struct {
 	pidAliveFn            func(pid int) bool
 	tmuxSessionExistsFn   func(name string) bool
 	listOpenPRsFn         func() ([]github.PR, error)
+	remoteBranchExistsFn  func(branch string) (bool, error)
+	createPRFn            func(title, body, base, head string) (int, error)
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 	hasMergedPRForIssueFn func(issueNumber int) (bool, error)
 	isPRMergedFn          func(prNumber int) (bool, error)
@@ -127,6 +129,31 @@ func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
 		return o.listOpenPRsFn()
 	}
 	return o.gh.ListOpenPRs()
+}
+
+func (o *Orchestrator) remoteBranchExists(branch string) (bool, error) {
+	if o.remoteBranchExistsFn != nil {
+		return o.remoteBranchExistsFn(branch)
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" || o.cfg == nil || strings.TrimSpace(o.cfg.LocalPath) == "" {
+		return false, nil
+	}
+	out, err := exec.Command("git", "-C", o.cfg.LocalPath, "ls-remote", "--exit-code", "--heads", "origin", branch).CombinedOutput()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 2 {
+			return false, nil
+		}
+		return false, fmt.Errorf("git ls-remote --heads origin %s: %w\n%s", branch, err, out)
+	}
+	return true, nil
+}
+
+func (o *Orchestrator) createPR(title, body, base, head string) (int, error) {
+	if o.createPRFn != nil {
+		return o.createPRFn(title, body, base, head)
+	}
+	return o.gh.CreatePR(title, body, base, head)
 }
 
 func (o *Orchestrator) hasOpenPRForIssue(issueNumber int) (bool, error) {
@@ -1001,6 +1028,14 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			reconciled = true
 			continue
 		}
+		if prErr == nil {
+			if prNumber, ok := o.tryCreatePRForPushedBranch(slotName, sess, reasons); ok {
+				log.Printf("[orch] reconcile: %s running->pr_open (auto-created PR #%d for pushed branch %q; %s)",
+					slotName, prNumber, sess.Branch, strings.Join(reasons, ", "))
+				reconciled = true
+				continue
+			}
+		}
 
 		oldPID := sess.PID
 		oldTmux := tmuxName
@@ -1015,6 +1050,69 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			slotName, strings.Join(reasons, ", "), oldPID, oldTmux)
 	}
 	return reconciled
+}
+
+func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.Session, reasons []string) (int, bool) {
+	branch := strings.TrimSpace(sess.Branch)
+	if branch == "" {
+		return 0, false
+	}
+	exists, err := o.remoteBranchExists(branch)
+	if err != nil {
+		log.Printf("[orch] reconcile: could not check remote branch %q for %s: %v", branch, slotName, err)
+		return 0, false
+	}
+	if !exists {
+		return 0, false
+	}
+
+	title := autoCreatedPRTitle(sess)
+	body := autoCreatedPRBody(sess, branch, reasons)
+	prNumber, err := o.createPR(title, body, "main", branch)
+	if err != nil {
+		log.Printf("[orch] reconcile: could not auto-create PR for %s branch %q: %v", slotName, branch, err)
+		return 0, false
+	}
+
+	sess.Status = state.StatusPROpen
+	sess.PRNumber = prNumber
+	sess.PID = 0
+	sess.TmuxSession = ""
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+	if o.notifier != nil {
+		o.notifier.Sendf("🔀 maestro: worker %s pushed branch %s and exited before opening a PR; auto-created PR #%d for issue #%d (%s)",
+			slotName, branch, prNumber, sess.IssueNumber, sess.IssueTitle)
+	}
+	return prNumber, true
+}
+
+func autoCreatedPRTitle(sess *state.Session) string {
+	title := strings.TrimSpace(sess.IssueTitle)
+	if title == "" {
+		title = "Maestro worker result"
+	}
+	suffix := fmt.Sprintf(" (#%d)", sess.IssueNumber)
+	if !strings.Contains(title, suffix) {
+		title += suffix
+	}
+	if len(title) > 180 {
+		title = strings.TrimSpace(title[:180-len(suffix)]) + suffix
+	}
+	return title
+}
+
+func autoCreatedPRBody(sess *state.Session, branch string, reasons []string) string {
+	reasonText := strings.TrimSpace(strings.Join(reasons, ", "))
+	if reasonText == "" {
+		reasonText = "worker process exited before PR creation was observed"
+	}
+	return fmt.Sprintf(`Closes #%d
+
+Maestro auto-created this PR because the worker pushed branch %s but exited before opening a pull request.
+
+Observed worker state: %s.
+`, sess.IssueNumber, branch, reasonText)
 }
 
 // checkSessions inspects all sessions and updates their status

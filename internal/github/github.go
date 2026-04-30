@@ -167,6 +167,33 @@ func (c *Client) ListOpenPRs() ([]PR, error) {
 	return prs, nil
 }
 
+// CreatePR opens a pull request and returns its number.
+func (c *Client) CreatePR(title, body, base, head string) (int, error) {
+	args := []string{
+		"pr", "create",
+		"--repo", c.Repo,
+		"--title", title,
+		"--body", body,
+		"--base", base,
+		"--head", head,
+	}
+	out, err := exec.Command("gh", args...).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("gh pr create: %w\n%s", err, out)
+	}
+
+	output := strings.TrimSpace(string(out))
+	match := regexp.MustCompile(`/pull/([0-9]+)`).FindStringSubmatch(output)
+	if len(match) != 2 {
+		return 0, fmt.Errorf("unexpected gh pr create output: %s", output)
+	}
+	n, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, fmt.Errorf("parse PR number from %q: %w", output, err)
+	}
+	return n, nil
+}
+
 // IsPRMerged returns true if the PR has been merged.
 func (c *Client) IsPRMerged(prNumber int) (bool, error) {
 	out, err := exec.Command("gh", "pr", "view", fmt.Sprint(prNumber),
