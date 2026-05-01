@@ -713,9 +713,13 @@ func fleetApprovalTarget(st *state.State, target *state.SupervisorTarget) (issue
 			sessionStatus = string(sess.Status)
 			return issue, pr, session, sessionStatus
 		}
+		session = ""
 	}
 
 	matchedSession := ""
+	matchedIssue := issue
+	matchedPR := pr
+	matchedSessionStatus := ""
 	for slot, sess := range st.Sessions {
 		if sess == nil {
 			continue
@@ -723,23 +727,26 @@ func fleetApprovalTarget(st *state.State, target *state.SupervisorTarget) (issue
 		if (issue > 0 && sess.IssueNumber == issue) || (pr > 0 && sess.PRNumber == pr) {
 			if matchedSession != "" {
 				matchedSession = ""
+				matchedSessionStatus = ""
 				break
 			}
 			matchedSession = slot
-			if issue == 0 {
-				issue = sess.IssueNumber
+			matchedIssue = issue
+			if matchedIssue == 0 {
+				matchedIssue = sess.IssueNumber
 			}
-			if pr == 0 {
-				pr = sess.PRNumber
+			matchedPR = pr
+			if matchedPR == 0 {
+				matchedPR = sess.PRNumber
 			}
-			sessionStatus = string(sess.Status)
+			matchedSessionStatus = string(sess.Status)
 		}
 	}
-	if session == "" {
+	if matchedSession != "" {
 		session = matchedSession
-	}
-	if session == "" {
-		sessionStatus = ""
+		issue = matchedIssue
+		pr = matchedPR
+		sessionStatus = matchedSessionStatus
 	}
 	return issue, pr, session, sessionStatus
 }

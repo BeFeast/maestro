@@ -295,6 +295,24 @@ func TestFleetAPIIncludesApprovalInboxMetadata(t *testing.T) {
 	}
 }
 
+func TestFleetApprovalTargetReplacesStaleSessionWithMatchedSession(t *testing.T) {
+	st := state.NewState()
+	st.Sessions["slot-new"] = &state.Session{
+		IssueNumber: 42,
+		PRNumber:    7,
+		Status:      state.StatusRunning,
+	}
+
+	issue, pr, session, sessionStatus := fleetApprovalTarget(st, &state.SupervisorTarget{
+		Issue:   42,
+		Session: "slot-old",
+	})
+
+	if issue != 42 || pr != 7 || session != "slot-new" || sessionStatus != string(state.StatusRunning) {
+		t.Fatalf("target metadata = issue:%d pr:%d session:%q status:%q, want matched current session", issue, pr, session, sessionStatus)
+	}
+}
+
 func TestFleetAttentionInboxOrdersBySeverityAndFreshness(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
