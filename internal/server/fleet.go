@@ -409,10 +409,8 @@ func (s *FleetServer) snapshot() fleetResponse {
 		item, workers := s.projectSnapshot(project)
 		resp.Projects = append(resp.Projects, item)
 		resp.Workers = append(resp.Workers, workers...)
-		for _, worker := range workers {
-			if worker.NeedsAttention {
-				resp.Attention = append(resp.Attention, worker)
-			}
+		for _, worker := range item.Attention {
+			resp.Attention = append(resp.Attention, makeFleetWorkerState(item, worker))
 		}
 		resp.Summary.Projects++
 		resp.Summary.Running += item.Running
@@ -466,7 +464,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 }
 
 func fleetAttentionSeverity(worker fleetWorkerState) int {
-	if text := strings.ToLower(worker.StatusReason + " " + worker.NextAction); strings.Contains(text, "blocked") {
+	if text := strings.ToLower(worker.Status + " " + worker.StatusReason + " " + worker.NextAction); strings.Contains(text, "blocked") {
 		return 0
 	}
 	switch state.SessionStatus(worker.Status) {
@@ -1471,7 +1469,7 @@ function attentionFromData(data) {
   if (Array.isArray(data.attention)) {
     data.attention.forEach(add);
   }
-  if (!items.length && Array.isArray(data.workers)) {
+  if (!Array.isArray(data.attention) && Array.isArray(data.workers)) {
     data.workers.forEach(add);
   }
   for (const project of data.projects || []) {

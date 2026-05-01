@@ -252,6 +252,13 @@ func TestFleetAttentionInboxOrdersBySeverityAndFreshness(t *testing.T) {
 	}
 }
 
+func TestFleetAttentionSeverityChecksStatusText(t *testing.T) {
+	worker := fleetWorkerState{Status: "blocked_waiting"}
+	if got := fleetAttentionSeverity(worker); got != 0 {
+		t.Fatalf("blocked status severity = %d, want 0", got)
+	}
+}
+
 func TestFleetWorkersIncludeAllActiveRows(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -510,6 +517,7 @@ func TestFleetDashboard(t *testing.T) {
 		"renderFleetWorkers",
 		"renderAttentionInbox",
 		"attentionFromData",
+		"if (!Array.isArray(data.attention) && Array.isArray(data.workers))",
 		"No projects need attention right now",
 		"renderWorkerDetail",
 		"renderProject",
