@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/supervisor"
 )
 
 func makeIssue(number int, title string, labels ...string) github.Issue {
@@ -2751,6 +2753,80 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 
 	if len(*started) != 0 {
 		t.Fatalf("started %d workers, want 0 for already closed issue", len(*started))
+	}
+}
+
+func TestStartNewWorkers_SupervisorOwnedReadyLabelStartsOnlySelectedCandidate(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.IssueLabels = []string{"maestro-ready"}
+	dynamicWaveEnabled := true
+	cfg.Supervisor.DynamicWave.Enabled = &dynamicWaveEnabled
+	cfg.Supervisor.DynamicWave.OwnsReadyLabel = true
+	issues := []github.Issue{
+		makeIssue(292, "stale ready", "maestro-ready", "p0"),
+		makeIssue(287, "selected ready", "maestro-ready", "p1"),
+		makeIssue(291, "also stale", "maestro-ready", "p2"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		CreatedAt:  time.Now().UTC(),
+		PolicyRule: supervisor.PolicyRuleDynamicWave,
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			PolicyRule: supervisor.PolicyRuleDynamicWave,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 287,
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	var logs strings.Builder
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
+
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 {
+		t.Fatalf("started = %v, want only selected issue #287", *started)
+	}
+	if (*started)[0] != 287 {
+		t.Fatalf("started issue #%d, want #287", (*started)[0])
+	}
+	if strings.Contains(logs.String(), "starting worker for issue #292") {
+		t.Fatalf("logs show stale issue #292 started:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "skipping issue #292: not supervisor-selected candidate #287") {
+		t.Fatalf("logs = %q, want skip reason for stale ready issue", logs.String())
+	}
+}
+
+func TestStartNewWorkers_ManualIssueLabelsUnchangedWhenSupervisorDoesNotOwnReadyLabel(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.IssueLabels = []string{"maestro-ready"}
+	issues := []github.Issue{
+		makeIssue(292, "first ready", "maestro-ready"),
+		makeIssue(287, "second ready", "maestro-ready"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		CreatedAt:  time.Now().UTC(),
+		PolicyRule: supervisor.PolicyRuleDynamicWave,
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			PolicyRule: supervisor.PolicyRuleDynamicWave,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 287,
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 5)
+
+	if got, want := fmt.Sprint(*started), "[292 287]"; got != want {
+		t.Fatalf("started = %s, want %s", got, want)
 	}
 }
 
