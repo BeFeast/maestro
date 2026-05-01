@@ -537,8 +537,8 @@ func TestFleetAPIIncludesApprovalInboxMetadata(t *testing.T) {
 	if len(resp.Projects) != 1 || len(resp.Projects[0].Approvals) != 4 {
 		t.Fatalf("project approvals = %+v, want 4 approvals", resp.Projects)
 	}
-	if resp.Summary.Approvals != 4 || resp.Summary.ApprovalsPending != 1 || resp.Summary.ApprovalsStale != 1 || resp.Summary.ApprovalsApproved != 1 || resp.Summary.ApprovalsRejected != 1 {
-		t.Fatalf("approval summary = %+v, want one per lifecycle status", resp.Summary)
+	if resp.Summary.Approvals != 1 || resp.Summary.ApprovalsPending != 1 || resp.Summary.ApprovalsHistorical != 3 || resp.Summary.ApprovalsStale != 1 || resp.Summary.ApprovalsApproved != 1 || resp.Summary.ApprovalsRejected != 1 {
+		t.Fatalf("approval summary = %+v, want one active and three historical approvals", resp.Summary)
 	}
 	if resp.Projects[0].ApprovalSummary[string(state.ApprovalStatusPending)] != 1 || resp.Projects[0].ApprovalSummary[string(state.ApprovalStatusStale)] != 1 {
 		t.Fatalf("project approval summary = %+v, want pending and stale counts", resp.Projects[0].ApprovalSummary)
@@ -573,6 +573,26 @@ func TestFleetAPIIncludesApprovalInboxMetadata(t *testing.T) {
 	staleApproval := findFleetApproval(t, resp.Approvals, stale.ID)
 	if staleApproval.Status != string(state.ApprovalStatusStale) {
 		t.Fatalf("stale approval status = %q, want stale", staleApproval.Status)
+	}
+}
+
+func TestFleetApprovalSummaryCountsOnlyActivePendingApprovals(t *testing.T) {
+	var summary fleetSummary
+	for _, status := range []string{
+		string(state.ApprovalStatusPending),
+		string(state.ApprovalStatusSuperseded),
+		string(state.ApprovalStatusStale),
+		string(state.ApprovalStatusApproved),
+		string(state.ApprovalStatusRejected),
+	} {
+		addFleetApprovalSummary(&summary, status)
+	}
+
+	if summary.Approvals != 1 || summary.ApprovalsPending != 1 {
+		t.Fatalf("active approval summary = %+v, want one pending active approval", summary)
+	}
+	if summary.ApprovalsHistorical != 4 || summary.ApprovalsSuperseded != 1 || summary.ApprovalsStale != 1 || summary.ApprovalsApproved != 1 || summary.ApprovalsRejected != 1 {
+		t.Fatalf("historical approval summary = %+v, want one per historical status", summary)
 	}
 }
 
@@ -952,7 +972,10 @@ func TestFleetDashboard(t *testing.T) {
 		"const historyWasOpen = historyDetails ? historyDetails.open : false;",
 		"(historyWasOpen ? ' open' : '')",
 		".approval-card.approval-stale { border-left-color: var(--line);",
+		".approval-card.approval-superseded { border-left-color: var(--line);",
 		".a-stale { color: var(--muted);",
+		".a-superseded { color: var(--muted);",
+		"counts.superseded",
 		"renderAttentionInbox",
 		"attentionFromData",
 		"if (!Array.isArray(data.attention) && Array.isArray(data.workers))",

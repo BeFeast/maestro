@@ -188,19 +188,21 @@ type fleetResponse struct {
 }
 
 type fleetSummary struct {
-	Projects          int `json:"projects"`
-	Stale             int `json:"stale"`
-	Errors            int `json:"errors"`
-	Running           int `json:"running"`
-	PROpen            int `json:"pr_open"`
-	Failed            int `json:"failed"`
-	Sessions          int `json:"sessions"`
-	NeedsAttention    int `json:"needs_attention"`
-	Approvals         int `json:"approvals"`
-	ApprovalsPending  int `json:"approvals_pending"`
-	ApprovalsStale    int `json:"approvals_stale"`
-	ApprovalsApproved int `json:"approvals_approved"`
-	ApprovalsRejected int `json:"approvals_rejected"`
+	Projects            int `json:"projects"`
+	Stale               int `json:"stale"`
+	Errors              int `json:"errors"`
+	Running             int `json:"running"`
+	PROpen              int `json:"pr_open"`
+	Failed              int `json:"failed"`
+	Sessions            int `json:"sessions"`
+	NeedsAttention      int `json:"needs_attention"`
+	Approvals           int `json:"approvals"`
+	ApprovalsPending    int `json:"approvals_pending"`
+	ApprovalsHistorical int `json:"approvals_historical"`
+	ApprovalsStale      int `json:"approvals_stale"`
+	ApprovalsSuperseded int `json:"approvals_superseded"`
+	ApprovalsApproved   int `json:"approvals_approved"`
+	ApprovalsRejected   int `json:"approvals_rejected"`
 }
 
 type fleetProjectFreshness struct {
@@ -636,16 +638,24 @@ func latestTime(left, right time.Time) time.Time {
 }
 
 func addFleetApprovalSummary(summary *fleetSummary, status string) {
-	summary.Approvals++
 	switch state.ApprovalStatus(status) {
 	case state.ApprovalStatusPending:
+		summary.Approvals++
 		summary.ApprovalsPending++
 	case state.ApprovalStatusStale:
+		summary.ApprovalsHistorical++
 		summary.ApprovalsStale++
+	case state.ApprovalStatusSuperseded:
+		summary.ApprovalsHistorical++
+		summary.ApprovalsSuperseded++
 	case state.ApprovalStatusApproved:
+		summary.ApprovalsHistorical++
 		summary.ApprovalsApproved++
 	case state.ApprovalStatusRejected:
+		summary.ApprovalsHistorical++
 		summary.ApprovalsRejected++
+	default:
+		summary.ApprovalsHistorical++
 	}
 }
 
@@ -943,14 +953,16 @@ func fleetApprovalStatusRank(status string) int {
 	switch state.ApprovalStatus(status) {
 	case state.ApprovalStatusPending:
 		return 0
-	case state.ApprovalStatusStale:
+	case state.ApprovalStatusSuperseded:
 		return 1
-	case state.ApprovalStatusApproved:
+	case state.ApprovalStatusStale:
 		return 2
-	case state.ApprovalStatusRejected:
+	case state.ApprovalStatusApproved:
 		return 3
-	default:
+	case state.ApprovalStatusRejected:
 		return 4
+	default:
+		return 5
 	}
 }
 
@@ -1117,6 +1129,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .approval-card.approval-pending { border-left-color: var(--warn); background: rgba(210,153,34,.08); }
   .approval-card.approval-stale { border-left-color: var(--line); background: rgba(139,148,158,.06); }
+  .approval-card.approval-superseded { border-left-color: var(--line); background: rgba(139,148,158,.06); }
   .approval-card.approval-approved { border-left-color: var(--ok); background: rgba(63,185,80,.06); }
   .approval-card.approval-rejected { border-left-color: var(--line); background: rgba(139,148,158,.05); }
   .approval-project,
@@ -1481,6 +1494,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .a-pending { color: var(--warn); border-color: rgba(210,153,34,.55); background: rgba(210,153,34,.08); }
   .a-stale { color: var(--muted); border-color: rgba(139,148,158,.45); background: rgba(139,148,158,.08); }
+  .a-superseded { color: var(--muted); border-color: rgba(139,148,158,.45); background: rgba(139,148,158,.08); }
   .a-approved { color: var(--ok); border-color: rgba(63,185,80,.55); background: rgba(63,185,80,.08); }
   .a-rejected { color: var(--muted); border-color: rgba(139,148,158,.45); background: rgba(139,148,158,.08); }
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
@@ -1797,10 +1811,11 @@ function renderActions(actions, options) {
 function approvalStatusRank(status) {
   switch (status) {
   case "pending": return 0;
-  case "stale": return 1;
-  case "approved": return 2;
-  case "rejected": return 3;
-  default: return 4;
+  case "superseded": return 1;
+  case "stale": return 2;
+  case "approved": return 3;
+  case "rejected": return 4;
+  default: return 5;
   }
 }
 
@@ -1865,8 +1880,9 @@ function approvalInboxSummaryText(activeCount, historicalCount) {
 }
 
 function approvalHistoryCountText(counts, historicalCount) {
-  const known = (counts.stale || 0) + (counts.approved || 0) + (counts.rejected || 0);
+  const known = (counts.superseded || 0) + (counts.stale || 0) + (counts.approved || 0) + (counts.rejected || 0);
   const parts = [
+    [counts.superseded || 0, "superseded"],
     [counts.stale || 0, "stale"],
     [counts.approved || 0, "approved"],
     [counts.rejected || 0, "rejected"],

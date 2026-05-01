@@ -319,6 +319,7 @@ var (
 	ErrApprovalNotFound        = errors.New("approval not found")
 	ErrApprovalNotPending      = errors.New("approval is not pending")
 	ErrApprovalStale           = errors.New("approval is stale")
+	ErrApprovalSuperseded      = errors.New("approval is superseded")
 	ErrApprovalPayloadMismatch = errors.New("approval payload changed")
 	ErrStateConflict           = errors.New("state write conflict")
 )
@@ -454,18 +455,22 @@ type SupervisorDecision struct {
 type ApprovalStatus string
 
 const (
-	ApprovalStatusPending  ApprovalStatus = "pending"
-	ApprovalStatusApproved ApprovalStatus = "approved"
-	ApprovalStatusRejected ApprovalStatus = "rejected"
-	ApprovalStatusStale    ApprovalStatus = "stale"
+	ApprovalStatusPending    ApprovalStatus = "pending"
+	ApprovalStatusApproved   ApprovalStatus = "approved"
+	ApprovalStatusRejected   ApprovalStatus = "rejected"
+	ApprovalStatusStale      ApprovalStatus = "stale"
+	ApprovalStatusSuperseded ApprovalStatus = "superseded"
 )
 
 const (
-	ApprovalAuditCreated  = "created"
-	ApprovalAuditApproved = "approved"
-	ApprovalAuditRejected = "rejected"
-	ApprovalAuditStale    = "stale"
+	ApprovalAuditCreated    = "created"
+	ApprovalAuditApproved   = "approved"
+	ApprovalAuditRejected   = "rejected"
+	ApprovalAuditStale      = "stale"
+	ApprovalAuditSuperseded = "superseded"
 )
+
+const approvalActionSpawnWorker = "spawn_worker"
 
 // Approval records a risky supervisor decision that needs explicit resolution.
 type Approval struct {
@@ -579,6 +584,7 @@ func saveLocked(stateDir string, s *State) error {
 		}
 		desired = merged
 	}
+	desired.ReconcileSpawnWorkerApprovalsForStartedWorkers(time.Now().UTC())
 
 	data, err := json.MarshalIndent(desired, "", "  ")
 	if err != nil {
@@ -1096,6 +1102,42 @@ func (s *State) MarkStaleApprovals(now time.Time) int {
 	return count
 }
 
+// ReconcileSpawnWorkerApprovalsForStartedWorkers marks pending spawn_worker approvals
+// as historical once a matching worker session has started for the same target.
+func (s *State) ReconcileSpawnWorkerApprovalsForStartedWorkers(now time.Time) int {
+	if s == nil || len(s.Approvals) == 0 || len(s.Sessions) == 0 {
+		return 0
+	}
+	count := 0
+	names := make([]string, 0, len(s.Sessions))
+	for name := range s.Sessions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		count += s.ReconcileSpawnWorkerApprovalsForStartedSession(name, s.Sessions[name], now)
+	}
+	return count
+}
+
+// ReconcileSpawnWorkerApprovalsForStartedSession supersedes pending spawn_worker
+// approvals that requested the worker represented by the started session.
+func (s *State) ReconcileSpawnWorkerApprovalsForStartedSession(slot string, sess *Session, now time.Time) int {
+	if s == nil || sess == nil || sess.IssueNumber <= 0 {
+		return 0
+	}
+	count := 0
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if !spawnWorkerApprovalMatchesSession(approval, slot, sess) {
+			continue
+		}
+		s.markApprovalSuperseded(approval, now, fmt.Sprintf("worker %s started for issue #%d", slot, sess.IssueNumber))
+		count++
+	}
+	return count
+}
+
 func (s *State) pendingApproval(id string) (*Approval, error) {
 	approval, ok := s.FindApproval(id)
 	if !ok {
@@ -1103,6 +1145,9 @@ func (s *State) pendingApproval(id string) (*Approval, error) {
 	}
 	if approval.Status == ApprovalStatusStale {
 		return approval, ErrApprovalStale
+	}
+	if approval.Status == ApprovalStatusSuperseded {
+		return approval, ErrApprovalSuperseded
 	}
 	if approval.Status != ApprovalStatusPending {
 		return approval, ErrApprovalNotPending
@@ -1136,6 +1181,60 @@ func (s *State) markApprovalStale(approval *Approval, now time.Time, reason stri
 		PayloadHash:     approval.PayloadHash,
 		TargetStateHash: s.ApprovalTargetStateHash(approval.Target),
 	})
+}
+
+func (s *State) markApprovalSuperseded(approval *Approval, now time.Time, reason string) {
+	if approval.Status != ApprovalStatusPending {
+		return
+	}
+	approval.Status = ApprovalStatusSuperseded
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditSuperseded,
+		Reason:          reason,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: s.ApprovalTargetStateHash(approval.Target),
+	})
+}
+
+func spawnWorkerApprovalMatchesSession(approval *Approval, slot string, sess *Session) bool {
+	if approval == nil || sess == nil || approval.Status != ApprovalStatusPending || approval.Action != approvalActionSpawnWorker {
+		return false
+	}
+	if approval.Target == nil {
+		return false
+	}
+	target := approval.Target
+	matched := false
+	if target.Session != "" {
+		if target.Session != slot {
+			return false
+		}
+		matched = true
+	}
+	if target.Issue > 0 {
+		if target.Issue != sess.IssueNumber {
+			return false
+		}
+		matched = true
+	}
+	if target.PR > 0 {
+		if target.PR != sess.PRNumber {
+			return false
+		}
+		matched = true
+	}
+	if !matched {
+		return false
+	}
+	if sess.StartedAt.IsZero() {
+		return false
+	}
+	if approval.CreatedAt.IsZero() {
+		return true
+	}
+	return !sess.StartedAt.Before(approval.CreatedAt.UTC())
 }
 
 func (a Approval) ComputePayloadHash() string {

@@ -554,12 +554,12 @@ func TestHandleState_IncludesApprovals(t *testing.T) {
 		CreatedAt:         now,
 		Project:           "test/repo",
 		Mode:              "read_only",
-		Summary:           "Start a worker for issue #42.",
+		Summary:           "Start a worker for issue #45.",
 		RecommendedAction: "spawn_worker",
-		Target:            &state.SupervisorTarget{Issue: 42},
+		Target:            &state.SupervisorTarget{Issue: 45},
 		Risk:              "mutating",
 		Confidence:        0.84,
-		Reasons:           []string{"Issue #42 is eligible"},
+		Reasons:           []string{"Issue #45 is eligible"},
 	}, now)
 	if err := state.Save(cfg.StateDir, st); err != nil {
 		t.Fatalf("save state: %v", err)

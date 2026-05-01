@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1177,6 +1178,59 @@ func TestSaveMergesIndependentConcurrentUpdates(t *testing.T) {
 	}
 }
 
+func TestSaveReconcilesConcurrentSpawnApprovalWithStartedWorker(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 5, 1, 13, 46, 2, 0, time.UTC)
+	initial := NewState()
+	if err := Save(dir, initial); err != nil {
+		t.Fatalf("Save initial: %v", err)
+	}
+
+	runSnapshot, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load run snapshot: %v", err)
+	}
+	supervisorSnapshot, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load supervisor snapshot: %v", err)
+	}
+
+	approval := supervisorSnapshot.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	if err := Save(dir, supervisorSnapshot); err != nil {
+		t.Fatalf("Save supervisor snapshot: %v", err)
+	}
+
+	runSnapshot.Sessions["slot-1"] = &Session{
+		IssueNumber: 42,
+		IssueTitle:  "ready work",
+		Status:      StatusRunning,
+		StartedAt:   now.Add(time.Minute),
+		PID:         1234,
+	}
+	if err := Save(dir, runSnapshot); err != nil {
+		t.Fatalf("Save stale run snapshot: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load merged state: %v", err)
+	}
+	loadedApproval, ok := loaded.FindApproval(approval.ID)
+	if !ok {
+		t.Fatalf("approval %q missing after merge", approval.ID)
+	}
+	if loadedApproval.Status != ApprovalStatusSuperseded {
+		t.Fatalf("approval status = %q, want %q", loadedApproval.Status, ApprovalStatusSuperseded)
+	}
+	last := loadedApproval.Audit[len(loadedApproval.Audit)-1]
+	if last.Event != ApprovalAuditSuperseded || !strings.Contains(last.Reason, "worker slot-1 started for issue #42") {
+		t.Fatalf("last audit = %#v, want superseded by started worker", last)
+	}
+	if _, err := loaded.ApproveApproval(approval.ID, now.Add(2*time.Minute), "test", "too late"); !errors.Is(err, ErrApprovalSuperseded) {
+		t.Fatalf("ApproveApproval superseded err = %v, want %v", err, ErrApprovalSuperseded)
+	}
+}
+
 func TestSaveRejectsConcurrentSameSessionConflict(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 5, 1, 13, 46, 2, 0, time.UTC)
@@ -1257,6 +1311,68 @@ func TestApprovalPendingPersistence(t *testing.T) {
 	}
 	if loadedApproval.PayloadHash != approval.PayloadHash {
 		t.Fatalf("payload hash = %q, want %q", loadedApproval.PayloadHash, approval.PayloadHash)
+	}
+}
+
+func TestReconcileSpawnWorkerApprovalsForStartedSession(t *testing.T) {
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	matching := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	matchingID := matching.ID
+	nonMatching := s.RecordPendingApprovalForDecision(SupervisorDecision{
+		ID:                "sup-other-issue",
+		CreatedAt:         now,
+		Project:           "owner/repo",
+		Summary:           "Start a worker for issue #43.",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 43},
+		Risk:              "mutating",
+	}, now)
+	nonMatchingID := nonMatching.ID
+	nonSpawn := s.RecordPendingApprovalForDecision(SupervisorDecision{
+		ID:                "sup-merge",
+		CreatedAt:         now,
+		Project:           "owner/repo",
+		Summary:           "Merge PR #9.",
+		RecommendedAction: "approve_merge",
+		Target:            &SupervisorTarget{Issue: 42, PR: 9},
+		Risk:              "mutating",
+	}, now)
+	nonSpawnID := nonSpawn.ID
+
+	count := s.ReconcileSpawnWorkerApprovalsForStartedSession("slot-1", &Session{
+		IssueNumber: 42,
+		Status:      StatusRunning,
+		StartedAt:   now.Add(time.Minute),
+	}, now.Add(time.Minute))
+
+	if count != 1 {
+		t.Fatalf("reconciled approvals = %d, want 1", count)
+	}
+	matching, ok := s.FindApproval(matchingID)
+	if !ok {
+		t.Fatalf("matching approval %q missing", matchingID)
+	}
+	nonMatching, ok = s.FindApproval(nonMatchingID)
+	if !ok {
+		t.Fatalf("non-matching approval %q missing", nonMatchingID)
+	}
+	nonSpawn, ok = s.FindApproval(nonSpawnID)
+	if !ok {
+		t.Fatalf("non-spawn approval %q missing", nonSpawnID)
+	}
+	if matching.Status != ApprovalStatusSuperseded {
+		t.Fatalf("matching status = %q, want %q", matching.Status, ApprovalStatusSuperseded)
+	}
+	if nonMatching.Status != ApprovalStatusPending {
+		t.Fatalf("non-matching status = %q, want pending", nonMatching.Status)
+	}
+	if nonSpawn.Status != ApprovalStatusPending {
+		t.Fatalf("non-spawn status = %q, want pending", nonSpawn.Status)
+	}
+	last := matching.Audit[len(matching.Audit)-1]
+	if last.Event != ApprovalAuditSuperseded {
+		t.Fatalf("last audit = %#v, want superseded", last)
 	}
 }
 
