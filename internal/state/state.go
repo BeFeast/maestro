@@ -543,12 +543,13 @@ type ApprovalAudit struct {
 }
 
 type State struct {
-	Sessions            map[string]*Session  `json:"sessions"`
-	Missions            map[int]*Mission     `json:"missions,omitempty"` // parent issue number → mission
-	SupervisorDecisions []SupervisorDecision `json:"supervisor_decisions,omitempty"`
-	Approvals           []Approval           `json:"approvals,omitempty"`
-	NextSlot            int                  `json:"next_slot"`
-	LastMergeAt         time.Time            `json:"last_merge_at,omitempty"`
+	Sessions            map[string]*Session        `json:"sessions"`
+	Missions            map[int]*Mission           `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision       `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval                 `json:"approvals,omitempty"`
+	OutcomeHealth       *outcome.HealthCheckResult `json:"outcome_health,omitempty"`
+	NextSlot            int                        `json:"next_slot"`
+	LastMergeAt         time.Time                  `json:"last_merge_at,omitempty"`
 
 	loadedHash  string
 	loadedState *State
@@ -706,6 +707,7 @@ func (s *State) copyFrom(src *State) {
 	s.Missions = src.Missions
 	s.SupervisorDecisions = src.SupervisorDecisions
 	s.Approvals = src.Approvals
+	s.OutcomeHealth = src.OutcomeHealth
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
 }
@@ -744,6 +746,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	if err := mergeSupervisorDecisions(merged, base, current, ours); err != nil {
 		return nil, err
 	}
+	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	return merged, nil
@@ -875,6 +878,35 @@ func mergeLatestTime(base, current, ours time.Time) time.Time {
 		return ours
 	}
 	return current
+}
+
+func mergeOutcomeHealth(base, current, ours *outcome.HealthCheckResult) *outcome.HealthCheckResult {
+	candidate := latestOutcomeHealth(current, ours)
+	if candidate != nil {
+		return candidate
+	}
+	return cloneOutcomeHealth(base)
+}
+
+func latestOutcomeHealth(values ...*outcome.HealthCheckResult) *outcome.HealthCheckResult {
+	var latest *outcome.HealthCheckResult
+	for _, value := range values {
+		if value == nil || value.CheckedAt.IsZero() {
+			continue
+		}
+		if latest == nil || value.CheckedAt.After(latest.CheckedAt) {
+			latest = value
+		}
+	}
+	return cloneOutcomeHealth(latest)
+}
+
+func cloneOutcomeHealth(value *outcome.HealthCheckResult) *outcome.HealthCheckResult {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
 }
 
 func unionKeys(maps ...map[string]*Session) []string {

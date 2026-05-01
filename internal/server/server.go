@@ -633,7 +633,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		Repo:                cfg.Repo,
 		MaxParallel:         cfg.MaxParallel,
 		ReadOnly:            cfg.Server.ReadOnly,
-		Outcome:             outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt),
+		Outcome:             outcomeStatusForState(cfg, st),
 		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions", cfg.Repo),
 		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
@@ -678,6 +678,16 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 	}
 
 	return resp
+}
+
+func outcomeStatusForState(cfg *config.Config, st *state.State) outcome.Status {
+	if cfg == nil || st == nil {
+		return outcome.StatusFor(outcome.Brief{}, 0, time.Time{})
+	}
+	if st.OutcomeHealth != nil {
+		return outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt, *st.OutcomeHealth)
+	}
+	return outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt)
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
@@ -1545,6 +1555,8 @@ function renderOutcome(outcome) {
   const health = o.health_state || (configured ? "unknown" : "not_configured");
   const next = o.next_action || (configured ? "Verify runtime health." : "Add an outcome brief to config.");
   const host = o.runtime_host ? " · " + o.runtime_host : "";
+  const checked = o.health_checked_at ? formatTimestamp(o.health_checked_at) : "-";
+  const summary = o.health_summary || "";
   outcomePanelEl.innerHTML = '<div class="supervisor-head">' +
     '<span class="supervisor-title">Outcome</span>' +
     '<span class="supervisor-time">' + escapeText(health.replace(/_/g, " ")) + '</span>' +
@@ -1554,6 +1566,8 @@ function renderOutcome(outcome) {
       '<div class="outcome-line" title="' + escapeText(target + host) + '"><strong>Runtime</strong> ' + escapeText(target + host) + '</div>' +
       '<div class="outcome-line" title="' + escapeText(next) + '"><strong>Next</strong> ' + escapeText(next) + '</div>' +
       '<div class="outcome-line"><strong>Health</strong> ' + escapeText(health.replace(/_/g, " ")) + '</div>' +
+      '<div class="outcome-line"><strong>Checked</strong> ' + escapeText(checked) + '</div>' +
+      (summary ? '<div class="outcome-line" title="' + escapeText(summary) + '"><strong>Signal</strong> ' + escapeText(summary) + '</div>' : "") +
     '</div>';
 }
 

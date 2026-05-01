@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -132,6 +133,7 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if reader == nil {
 		reader = github.New(cfg.Repo)
 	}
+	recordOutcomeHealth(cfg, st)
 
 	decision, err := NewEngine(cfg, reader).Decide(st)
 	if err != nil {
@@ -156,6 +158,17 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		}
 	}
 	return decision, nil
+}
+
+func recordOutcomeHealth(cfg *config.Config, st *state.State) {
+	if cfg == nil || st == nil {
+		return
+	}
+	if !cfg.Outcome.Configured() || !cfg.Outcome.HasHealthSignal() {
+		return
+	}
+	result := outcome.Checker{}.Check(context.Background(), cfg.Outcome)
+	st.OutcomeHealth = &result
 }
 
 // Decide observes state and GitHub read-only data, then returns the next recommendation.
@@ -559,6 +572,9 @@ func (e *Engine) outcomeStatus(st *state.State) outcome.Status {
 	if st != nil {
 		mergedPRs = st.DonePRCount()
 		lastMergeAt = st.LastMergeAt
+	}
+	if st != nil && st.OutcomeHealth != nil {
+		return outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt, *st.OutcomeHealth)
 	}
 	return outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt)
 }
