@@ -214,6 +214,17 @@ type fleetProjectFreshness struct {
 	StaleAfterSeconds  int64  `json:"stale_after_seconds"`
 }
 
+type fleetQueueSnapshot struct {
+	PolicyRule                    string                          `json:"policy_rule,omitempty"`
+	Open                          int                             `json:"open"`
+	Eligible                      int                             `json:"eligible"`
+	Excluded                      int                             `json:"excluded"`
+	NonRunnableProjectStatusCount int                             `json:"non_runnable_project_status_count"`
+	SelectedCandidate             *state.SupervisorIssueCandidate `json:"selected_candidate,omitempty"`
+	TopSkippedReason              string                          `json:"top_skipped_reason,omitempty"`
+	IdleReason                    string                          `json:"idle_reason,omitempty"`
+}
+
 type fleetProjectState struct {
 	Name            string                `json:"name"`
 	Repo            string                `json:"repo"`
@@ -234,6 +245,7 @@ type fleetProjectState struct {
 	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
 	Actions         []controlAction       `json:"actions,omitempty"`
 	Supervisor      supervisorInfo        `json:"supervisor"`
+	QueueSnapshot   *fleetQueueSnapshot   `json:"queue_snapshot,omitempty"`
 	Freshness       fleetProjectFreshness `json:"freshness"`
 	Error           string                `json:"error,omitempty"`
 }
@@ -564,6 +576,31 @@ func fleetProjectFreshnessForState(stateDir string, st *state.State, now time.Ti
 	return freshness
 }
 
+func fleetQueueSnapshotFromSupervisor(info supervisorInfo) *fleetQueueSnapshot {
+	if info.Latest == nil || info.Latest.QueueAnalysis == nil {
+		return nil
+	}
+	analysis := info.Latest.QueueAnalysis
+	policyRule := strings.TrimSpace(analysis.PolicyRule)
+	if policyRule == "" {
+		policyRule = strings.TrimSpace(info.Latest.PolicyRule)
+	}
+	snapshot := &fleetQueueSnapshot{
+		PolicyRule:                    policyRule,
+		Open:                          analysis.OpenIssues,
+		Eligible:                      analysis.EligibleCandidates,
+		Excluded:                      analysis.ExcludedIssues,
+		NonRunnableProjectStatusCount: analysis.NonRunnableProjectStatusCount,
+		TopSkippedReason:              analysis.TopSkippedReason(),
+		IdleReason:                    analysis.IdleReason(),
+	}
+	if analysis.SelectedCandidate != nil {
+		candidate := *analysis.SelectedCandidate
+		snapshot.SelectedCandidate = &candidate
+	}
+	return snapshot
+}
+
 func latestProjectLogModTime(st *state.State) time.Time {
 	if st == nil {
 		return time.Time{}
@@ -667,6 +704,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Failed = failedCount(projectState.Summary)
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
+	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
 	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
@@ -1446,6 +1484,22 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .why-item { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.4; }
   .why-item strong { color: var(--text); }
+  .queue-snapshot {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(88,166,255,.04);
+  }
+  .queue-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .queue-line strong { color: var(--text); font-weight: 650; }
+  .queue-idle { color: var(--warn); }
   .error { color: var(--bad); border: 1px solid rgba(248,81,73,.35); border-radius: 10px; background: rgba(248,81,73,.08); padding: 12px 14px; }
   @media (max-width: 980px) {
     header { align-items: flex-start; flex-direction: column; }
@@ -2368,6 +2422,35 @@ async function loadWorkerDetail() {
   }
 }
 
+function queueSnapshotHTML(project) {
+  const q = project.queue_snapshot;
+  if (!q) return "";
+  const parts = [
+    "open=" + Number(q.open || 0),
+    "eligible=" + Number(q.eligible || 0),
+    "excluded=" + Number(q.excluded || 0),
+    "non-runnable=" + Number(q.non_runnable_project_status_count || 0)
+  ];
+  const selected = q.selected_candidate && q.selected_candidate.number
+    ? "selected #" + q.selected_candidate.number + (q.selected_candidate.title ? " " + q.selected_candidate.title : "")
+    : "";
+  if (selected) parts.push(selected);
+
+  const lines = ['<div class="queue-line"><strong>Queue</strong><span>' + escapeText(parts.join(" · ")) + '</span></div>'];
+  const isIdle = (project.running || 0) === 0;
+  let idleReason = isIdle ? (q.idle_reason || "") : "";
+  const topSkip = isIdle && q.eligible === 0 && q.top_skipped_reason && !(idleReason || "").includes(q.top_skipped_reason)
+    ? q.top_skipped_reason
+    : "";
+  if (topSkip) {
+    idleReason = idleReason ? idleReason + " Top skip: " + topSkip : "Top skip: " + topSkip;
+  }
+  if (idleReason) {
+    lines.push('<div class="queue-line queue-idle"><strong>Idle</strong><span>' + escapeText(idleReason) + '</span></div>');
+  }
+  return '<div class="queue-snapshot"><div class="label">Queue Snapshot</div>' + lines.join("") + '</div>';
+}
+
 function renderSupervisor(project) {
   const sup = project.supervisor;
   if (!sup || !sup.has_run || !sup.latest) {
@@ -2399,6 +2482,9 @@ function renderProjectWhy(project) {
       attention.map(worker => '<div class="why-item"><strong>' + escapeText(worker.slot || "-") + '</strong> ' +
         escapeText(workerWhyText(worker) || "Needs operator review.") + '</div>').join("") +
       '</div>';
+  }
+  if ((project.running || 0) === 0 && project.queue_snapshot && project.queue_snapshot.idle_reason) {
+    return "";
   }
   const why = supervisorWhyText(project);
   if ((project.running || 0) === 0 && why) {
@@ -2480,6 +2566,7 @@ function renderProject(project) {
       '<div class="metric"><strong>' + escapeText(project.sessions || 0) + '</strong><span>Sessions</span></div>' +
       '<div class="metric"><strong>' + escapeText(project.needs_attention || 0) + '</strong><span>Attention</span></div>' +
     '</div>' +
+    queueSnapshotHTML(project) +
     renderProjectWhy(project) +
     renderProjectActions(project) +
     renderSupervisor(project) +

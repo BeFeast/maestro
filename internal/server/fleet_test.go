@@ -172,6 +172,99 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 }
 
+func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	excludedStateDir := filepath.Join(dir, "excluded")
+	candidateStateDir := filepath.Join(dir, "candidate")
+
+	excludedState := state.NewState()
+	excludedState.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-excluded",
+		CreatedAt:         now,
+		Project:           "owner/excluded",
+		Summary:           "No issue is currently eligible under the dynamic wave policy.",
+		RecommendedAction: "none",
+		Risk:              "safe",
+		PolicyRule:        "supervisor.dynamic_wave",
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			PolicyRule:         "supervisor.dynamic_wave",
+			OpenIssues:         11,
+			EligibleCandidates: 0,
+			ExcludedIssues:     11,
+			SkippedReasons: []string{
+				"Issue #24 skipped by dynamic wave policy: excluded by label \"blocked\"",
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(excludedStateDir, excludedState); err != nil {
+		t.Fatalf("save excluded state: %v", err)
+	}
+
+	candidateState := state.NewState()
+	candidateState.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-candidate",
+		CreatedAt:         now,
+		Project:           "owner/candidate",
+		Summary:           "Start a worker for issue #309.",
+		RecommendedAction: "spawn_worker",
+		Risk:              "mutating",
+		PolicyRule:        "supervisor.dynamic_wave",
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			PolicyRule:         "supervisor.dynamic_wave",
+			OpenIssues:         3,
+			EligibleCandidates: 2,
+			ExcludedIssues:     1,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 309,
+				Title:  "Selected fleet card candidate",
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(candidateStateDir, candidateState); err != nil {
+		t.Fatalf("save candidate state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("Excluded", "/tmp/excluded.yaml", "", &config.Config{
+			Repo:        "owner/excluded",
+			StateDir:    excludedStateDir,
+			MaxParallel: 1,
+		}),
+		NewFleetProject("Candidate", "/tmp/candidate.yaml", "", &config.Config{
+			Repo:        "owner/candidate",
+			StateDir:    candidateStateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	excluded := findFleetProject(t, resp.Projects, "Excluded")
+	if excluded.QueueSnapshot == nil {
+		t.Fatal("excluded project queue snapshot is nil")
+	}
+	if excluded.QueueSnapshot.Open != 11 || excluded.QueueSnapshot.Eligible != 0 || excluded.QueueSnapshot.Excluded != 11 {
+		t.Fatalf("excluded queue snapshot = %+v, want open=11 eligible=0 excluded=11", excluded.QueueSnapshot)
+	}
+	if !contains(excluded.QueueSnapshot.IdleReason, "Policy excluded all 11 open issues") {
+		t.Fatalf("idle reason = %q, want all-excluded explanation", excluded.QueueSnapshot.IdleReason)
+	}
+	if !contains(excluded.QueueSnapshot.TopSkippedReason, "excluded by label") {
+		t.Fatalf("top skipped reason = %q, want excluded label reason", excluded.QueueSnapshot.TopSkippedReason)
+	}
+	if excluded.Supervisor.Latest == nil || excluded.Supervisor.Latest.QueueAnalysis == nil || excluded.Supervisor.Latest.QueueAnalysis.OpenIssues != 11 {
+		t.Fatalf("supervisor latest queue analysis = %#v, want exposed analysis", excluded.Supervisor.Latest)
+	}
+
+	candidate := findFleetProject(t, resp.Projects, "Candidate")
+	if candidate.QueueSnapshot == nil || candidate.QueueSnapshot.SelectedCandidate == nil || candidate.QueueSnapshot.SelectedCandidate.Number != 309 {
+		t.Fatalf("candidate queue snapshot = %+v, want selected issue #309", candidate.QueueSnapshot)
+	}
+	if candidate.QueueSnapshot.IdleReason != "" {
+		t.Fatalf("candidate idle reason = %q, want empty when eligible", candidate.QueueSnapshot.IdleReason)
+	}
+}
+
 func TestFleetAPISurfacesProjectErrorsAndStaleFreshness(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -778,6 +871,9 @@ func TestFleetDashboard(t *testing.T) {
 		"issue-title",
 		"Why Attention",
 		"Why Not Running",
+		"Queue Snapshot",
+		"queueSnapshotHTML",
+		"queue-snapshot",
 		"next_action",
 		"sortWorkers",
 		"filteredWorkers",

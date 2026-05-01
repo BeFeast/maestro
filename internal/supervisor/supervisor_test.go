@@ -835,6 +835,19 @@ func TestDecide_DynamicWaveSkipsTitleEpic(t *testing.T) {
 	}
 }
 
+func TestSupervisorQueueAnalysisCountsBlockedPolicyLabelAsExcluded(t *testing.T) {
+	analysis := supervisorQueueAnalysis("supervisor.default", 1, nil, []string{
+		"Issue #24 skipped: blocked by supervisor policy label",
+	})
+
+	if analysis.ExcludedIssues != 1 {
+		t.Fatalf("excluded issues = %d, want 1", analysis.ExcludedIssues)
+	}
+	if got, want := analysis.IdleReason(), "Policy excluded all 1 open issue."; got != want {
+		t.Fatalf("IdleReason = %q, want %q", got, want)
+	}
+}
+
 func TestDecide_DynamicWaveSkipsNonRunnableProjectStatus(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}

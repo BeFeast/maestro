@@ -122,26 +122,27 @@ type supervisorInfo struct {
 }
 
 type supervisorDecisionInfo struct {
-	ID                string                       `json:"id"`
-	CreatedAt         time.Time                    `json:"created_at"`
-	Project           string                       `json:"project"`
-	Mode              string                       `json:"mode"`
-	PolicyRule        string                       `json:"policy_rule,omitempty"`
-	Status            string                       `json:"status,omitempty"`
-	Summary           string                       `json:"summary"`
-	RecommendedAction string                       `json:"recommended_action"`
-	Target            *state.SupervisorTarget      `json:"target,omitempty"`
-	TargetLinks       []targetLinkInfo             `json:"target_links,omitempty"`
-	Risk              string                       `json:"risk"`
-	Confidence        float64                      `json:"confidence"`
-	ErrorClass        string                       `json:"error_class,omitempty"`
-	Reasons           []string                     `json:"reasons,omitempty"`
-	Mutations         []state.SupervisorMutation   `json:"mutations,omitempty"`
-	StuckStates       []state.SupervisorStuckState `json:"stuck_states,omitempty"`
-	StuckReasons      []string                     `json:"stuck_reasons,omitempty"`
-	ProjectState      state.SupervisorProjectState `json:"project_state"`
-	Queue             *supervisorQueueInfo         `json:"queue,omitempty"`
-	ApprovalID        string                       `json:"approval_id,omitempty"`
+	ID                string                         `json:"id"`
+	CreatedAt         time.Time                      `json:"created_at"`
+	Project           string                         `json:"project"`
+	Mode              string                         `json:"mode"`
+	PolicyRule        string                         `json:"policy_rule,omitempty"`
+	Status            string                         `json:"status,omitempty"`
+	Summary           string                         `json:"summary"`
+	RecommendedAction string                         `json:"recommended_action"`
+	Target            *state.SupervisorTarget        `json:"target,omitempty"`
+	TargetLinks       []targetLinkInfo               `json:"target_links,omitempty"`
+	Risk              string                         `json:"risk"`
+	Confidence        float64                        `json:"confidence"`
+	ErrorClass        string                         `json:"error_class,omitempty"`
+	Reasons           []string                       `json:"reasons,omitempty"`
+	Mutations         []state.SupervisorMutation     `json:"mutations,omitempty"`
+	StuckStates       []state.SupervisorStuckState   `json:"stuck_states,omitempty"`
+	StuckReasons      []string                       `json:"stuck_reasons,omitempty"`
+	ProjectState      state.SupervisorProjectState   `json:"project_state"`
+	QueueAnalysis     *state.SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
+	Queue             *supervisorQueueInfo           `json:"queue,omitempty"`
+	ApprovalID        string                         `json:"approval_id,omitempty"`
 }
 
 type supervisorActionInfo struct {
@@ -335,6 +336,7 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 		StuckStates:       decision.StuckStates,
 		StuckReasons:      supervisorStuckReasons(decision),
 		ProjectState:      decision.ProjectState,
+		QueueAnalysis:     decision.QueueAnalysis,
 		Queue:             supervisorQueueInfoForDecision(cfg, st, decision),
 		ApprovalID:        decision.ApprovalID,
 	}

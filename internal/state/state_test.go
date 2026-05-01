@@ -878,6 +878,11 @@ func TestSupervisorDecisionPersistence(t *testing.T) {
 			OpenIssues:     1,
 			AvailableSlots: 1,
 		},
+		QueueAnalysis: &SupervisorQueueAnalysis{
+			OpenIssues:         1,
+			EligibleCandidates: 1,
+			SelectedCandidate:  &SupervisorIssueCandidate{Number: 42, Title: "Start worker"},
+		},
 	}, DefaultSupervisorDecisionLimit)
 
 	if err := Save(dir, s); err != nil {
@@ -909,6 +914,32 @@ func TestSupervisorDecisionPersistence(t *testing.T) {
 	}
 	if latest.StuckStates[0].Code != "no_eligible_issues" {
 		t.Fatalf("stuck state code = %q, want no_eligible_issues", latest.StuckStates[0].Code)
+	}
+	if latest.QueueAnalysis == nil || latest.QueueAnalysis.SelectedCandidate == nil || latest.QueueAnalysis.SelectedCandidate.Number != 42 {
+		t.Fatalf("queue analysis = %#v, want selected issue 42", latest.QueueAnalysis)
+	}
+}
+
+func TestSupervisorQueueAnalysisIdleReasonExplainsAllExcluded(t *testing.T) {
+	analysis := &SupervisorQueueAnalysis{
+		OpenIssues:         11,
+		EligibleCandidates: 0,
+		ExcludedIssues:     11,
+		SkippedReasons: []string{
+			"Issue #24 skipped by dynamic wave policy: excluded by label \"blocked\"",
+		},
+	}
+
+	if got, want := analysis.IdleReason(), "Policy excluded all 11 open issues."; got != want {
+		t.Fatalf("IdleReason = %q, want %q", got, want)
+	}
+	if got, want := analysis.TopSkippedReason(), "Issue #24 skipped by dynamic wave policy: excluded by label \"blocked\""; got != want {
+		t.Fatalf("TopSkippedReason = %q, want %q", got, want)
+	}
+
+	analysis.EligibleCandidates = 1
+	if got := analysis.IdleReason(); got != "" {
+		t.Fatalf("IdleReason with eligible candidate = %q, want empty", got)
 	}
 }
 
