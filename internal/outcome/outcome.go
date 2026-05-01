@@ -63,9 +63,7 @@ func (b Brief) Normalized() Brief {
 
 func (b Brief) Configured() bool {
 	b = b.Normalized()
-	return b.DesiredOutcome != "" || b.RuntimeTarget != "" || b.DeploymentStatusCommand != "" ||
-		b.HealthcheckCommand != "" || b.HealthcheckURL != "" || b.SourceRepoPath != "" ||
-		b.RuntimeHost != "" || len(b.NonGoals) > 0
+	return b.DesiredOutcome != ""
 }
 
 func (b Brief) Goal() string {

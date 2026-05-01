@@ -613,6 +613,30 @@ func TestDecide_NoOutcomeProgressRecommendsRuntimeCheck(t *testing.T) {
 	}
 }
 
+func TestDecideDeterministic_OutcomeUsesStateMergeHistory(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.LastMergeAt = now
+	st.Sessions["done-1"] = &state.Session{IssueNumber: 1, IssueTitle: "first", Status: state.StatusDone, PRNumber: 10}
+	st.Sessions["done-2"] = &state.Session{IssueNumber: 2, IssueTitle: "second", Status: state.StatusDone, PRNumber: 11}
+
+	decision, err := testEngine(cfg, &fakeReader{}).decideDeterministic(st)
+	if err != nil {
+		t.Fatalf("decideDeterministic: %v", err)
+	}
+	if decision.Outcome == nil {
+		t.Fatal("Outcome = nil, want state-aware outcome")
+	}
+	if decision.Outcome.MergedPRs != 2 || decision.Outcome.LastMergeAt == "" {
+		t.Fatalf("Outcome = %+v, want merge history from state", decision.Outcome)
+	}
+}
+
 func TestDecide_EmptyStateNoAction(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{}

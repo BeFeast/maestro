@@ -18,6 +18,23 @@ func TestStatusForMissingBrief(t *testing.T) {
 	}
 }
 
+func TestStatusForRequiresDesiredOutcome(t *testing.T) {
+	brief := Brief{
+		RuntimeTarget:           "https://app.example.com",
+		DeploymentStatusCommand: "systemctl status app",
+		SourceRepoPath:          "/srv/app",
+		RuntimeHost:             "app-host",
+		NonGoals:                []string{"Rewrite"},
+	}
+	if brief.Configured() {
+		t.Fatal("Configured = true, want false without desired_outcome")
+	}
+	status := StatusFor(brief, 2, time.Time{})
+	if status.Configured || status.HealthState != HealthNotConfigured {
+		t.Fatalf("status = %+v, want unconfigured outcome", status)
+	}
+}
+
 func TestStatusForConfiguredBriefUnknownHealth(t *testing.T) {
 	lastMerge := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	status := StatusFor(Brief{

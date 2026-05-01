@@ -209,7 +209,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
 			)
 		}
-		decision := e.decision(now, projectState, ActionMonitorOpenPR,
+		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
 			summary,
 			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
@@ -221,7 +221,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			fmt.Sprintf("Session %s is running for issue #%d", slot, sess.IssueNumber),
 			"Starting another worker is not recommended while a worker is active",
 		)
-		decision := e.decision(now, projectState, ActionWaitForRunningWorker,
+		decision := e.decision(st, now, projectState, ActionWaitForRunningWorker,
 			fmt.Sprintf("Worker %s is still running for issue #%d.", slot, sess.IssueNumber),
 			RiskSafe, 0.88, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
@@ -233,7 +233,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
 			"Retry-exhausted work requires a human decision before more automation",
 		)
-		decision := e.decision(now, projectState, ActionReviewRetryExhausted,
+		decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
 			fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
 			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
@@ -245,7 +245,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			stuck.Summary,
 			"Supervisor remains read-only; it recommends outcome verification but does not run deploy or runtime commands",
 		)
-		decision := e.decision(now, projectState, ActionCheckOutcomeHealth,
+		decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
 			"Verify outcome health before starting more issue work.",
 			RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
@@ -286,7 +286,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
 			)
-			decision := e.decision(now, projectState, ActionWaitForCapacity,
+			decision := e.decision(st, now, projectState, ActionWaitForCapacity,
 				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
 				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
@@ -302,7 +302,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				fmt.Sprintf("Issue #%d is eligible but GitHub already has an open PR referencing it", issue.Number),
 				"Supervisor mode should not dispatch duplicate work",
 			)
-			decision := e.decision(now, projectState, ActionMonitorOpenPR,
+			decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
 				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
 				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
@@ -315,7 +315,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			outcomeIssueReason(outcomeStatus, issue),
 			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 		)
-		decision := e.decision(now, projectState, ActionSpawnWorker,
+		decision := e.decision(st, now, projectState, ActionSpawnWorker,
 			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
 			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 		decision.StuckStates = stuckStates
@@ -334,7 +334,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				fmt.Sprintf("Issue #%d already has an open PR", issue.Number),
 				"Ordered queue will not label or dispatch later issues while this PR is in review",
 			)
-			decision := e.decision(now, projectState, ActionMonitorOpenPR,
+			decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
 				fmt.Sprintf("Ordered queue is paused at issue #%d because it already has an open PR.", issue.Number),
 				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
@@ -364,7 +364,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			risk = RiskSafe
 			reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
 		}
-		decision := e.decision(now, projectState, ActionLabelIssueReady,
+		decision := e.decision(st, now, projectState, ActionLabelIssueReady,
 			fmt.Sprintf("Prepare issue #%d for the queue by %s.", candidate.issue.Number, plannedMutationPhrase(candidate.neededMutations())),
 			risk, 0.82, &state.SupervisorTarget{Issue: candidate.issue.Number}, policyRule, reasons)
 		decision.Mutations = mutations
@@ -388,7 +388,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				pauseReason,
 				"Ordered queue will not advance until this issue is done or explicitly overridden",
 			)
-			decision := e.decision(now, projectState, action,
+			decision := e.decision(st, now, projectState, action,
 				fmt.Sprintf("Ordered queue is paused at issue #%d: %s.", issue.Number, pauseReason),
 				risk, confidence, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
@@ -406,7 +406,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	for _, reason := range firstN(skipped, 3) {
 		reasons = append(reasons, reason)
 	}
-	decision := e.decision(now, projectState, ActionNone,
+	decision := e.decision(st, now, projectState, ActionNone,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
@@ -437,7 +437,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		for _, reason := range firstN(result.skipped, 3) {
 			reasons = append(reasons, reason)
 		}
-		decision := e.decision(now, projectState, ActionNone,
+		decision := e.decision(st, now, projectState, ActionNone,
 			"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
 	}
@@ -448,7 +448,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
 			fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
 		)
-		decision := e.decision(now, projectState, ActionWaitForCapacity,
+		decision := e.decision(st, now, projectState, ActionWaitForCapacity,
 			fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
 			RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
@@ -464,7 +464,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			fmt.Sprintf("Issue #%d already has an open PR", issue.Number),
 			"Supervisor mode should not dispatch duplicate work",
 		)
-		decision := e.decision(now, projectState, ActionMonitorOpenPR,
+		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
 			fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
 			RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
@@ -483,7 +483,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			risk = RiskSafe
 			reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
 		}
-		decision := e.decision(now, projectState, ActionLabelIssueReady,
+		decision := e.decision(st, now, projectState, ActionLabelIssueReady,
 			fmt.Sprintf("Prepare issue #%d for the dynamic wave by %s.", issue.Number, plannedMutationPhrase(queueCandidate.neededMutations())),
 			risk, 0.82, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 		decision.Mutations = mutations
@@ -498,7 +498,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		for _, reason := range firstN(result.skipped, 3) {
 			reasons = append(reasons, reason)
 		}
-		decision := e.decision(now, projectState, ActionNone,
+		decision := e.decision(st, now, projectState, ActionNone,
 			"No action is currently recommended while the selected issue waits for its ready label.", RiskSafe, 0.8, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
 	}
@@ -509,15 +509,15 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		outcomeIssueReason(outcomeStatus, issue),
 		"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 	)
-	decision := e.decision(now, projectState, ActionSpawnWorker,
+	decision := e.decision(st, now, projectState, ActionSpawnWorker,
 		fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
 		RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 	return withAnalysis(decision), nil
 }
 
-func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
+func (e *Engine) decision(st *state.State, now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
 	reasons = appendReasons(reasons, policyRuleReason(policyRule))
-	outcomeStatus := e.outcomeStatus(nil)
+	outcomeStatus := e.outcomeStatus(st)
 	return state.SupervisorDecision{
 		ID:                "sup-" + now.Format("20060102T150405.000000000Z"),
 		CreatedAt:         now,
