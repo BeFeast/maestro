@@ -186,6 +186,7 @@ type sessionInfo struct {
 	TokensUsedAttempt int    `json:"tokens_used_attempt"`
 	TokensUsedTotal   int    `json:"tokens_used_total"`
 	Runtime           string `json:"runtime"`
+	RuntimeSeconds    int64  `json:"runtime_seconds"`
 	StartedAt         string `json:"started_at"`
 	FinishedAt        string `json:"finished_at,omitempty"`
 	NextRetryAt       string `json:"next_retry_at,omitempty"`
@@ -226,7 +227,9 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		end = *sess.FinishedAt
 		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339)
 	}
-	info.Runtime = end.Sub(sess.StartedAt).Round(time.Second).String()
+	runtime := end.Sub(sess.StartedAt).Round(time.Second)
+	info.Runtime = runtime.String()
+	info.RuntimeSeconds = int64(runtime / time.Second)
 
 	if sess.Status == state.StatusRunning {
 		info.PID = sess.PID
