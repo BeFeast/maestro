@@ -858,12 +858,17 @@ func TestFleetDashboard(t *testing.T) {
 		"renderFleetWorkers",
 		"renderApprovalInbox",
 		"approvalsFromData",
+		"approvalInboxSummaryText",
+		"No active approvals need review.",
+		"historical approval",
+		"approval-list-compact",
+		"Audit history",
+		"approvalHistoryCountText",
+		"<details class=\"approval-history\">",
+		".approval-card.approval-stale { border-left-color: var(--line);",
+		".a-stale { color: var(--muted);",
 		"renderAttentionInbox",
 		"attentionFromData",
-		"pending · ",
-		"stale · ",
-		"approved · ",
-		"rejected",
 		"if (!Array.isArray(data.attention) && Array.isArray(data.workers))",
 		"No projects need attention right now",
 		"renderWorkerDetail",
@@ -897,6 +902,14 @@ func TestFleetDashboard(t *testing.T) {
 	} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard should contain %q", want)
+		}
+	}
+	for _, oldAlarm := range []string{
+		".approval-card.approval-stale { border-left-color: var(--bad);",
+		".a-stale { color: var(--bad);",
+	} {
+		if contains(body, oldAlarm) {
+			t.Fatalf("dashboard should not render stale approval history with alarming styling %q", oldAlarm)
 		}
 	}
 }
