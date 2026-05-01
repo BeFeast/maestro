@@ -2530,19 +2530,25 @@ function scopeLabelText(scope) {
 }
 
 function fleetEmptyText(projectLabel, total) {
-  const historyHint = total ? " Switch Scope to Done/history or All workers to inspect " + total + " historical worker" + (total === 1 ? "" : "s") + "." : "";
-  if (fleetState.filters.scope === "operator") {
-    return "No workers need operator action and no workers are live in " + projectLabel + "." + historyHint;
+	const historyHint = total ? " Switch Scope to Done/history or All workers to inspect " + total + " historical worker" + (total === 1 ? "" : "s") + "." : "";
+	if (fleetState.filters.scope === "operator") {
+		return "No workers need operator action and no workers are live in " + projectLabel + "." + historyHint;
   }
   if (fleetState.filters.scope === "attention") {
     return "No workers currently need attention in " + projectLabel + "." + historyHint;
   }
-  if (fleetState.filters.scope === "live") {
-    return "No workers are currently running or waiting on open PRs in " + projectLabel + "." + historyHint;
-  }
-  if (hasWorkerFilters()) {
-    return "No workers match the current filters.";
-  }
+	if (fleetState.filters.scope === "live") {
+		return "No workers are currently running or waiting on open PRs in " + projectLabel + "." + historyHint;
+	}
+	if (fleetState.filters.scope === "recent" && !total) {
+		return "No completed historical worker sessions are available for " + projectLabel + ".";
+	}
+	if (fleetState.filters.scope === "all" && !total) {
+		return "No worker sessions are available for " + projectLabel + ".";
+	}
+	if (hasWorkerFilters()) {
+		return "No workers match the current filters.";
+	}
   return "No worker sessions are available for " + projectLabel + ".";
 }
 
