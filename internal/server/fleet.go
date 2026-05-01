@@ -1737,7 +1737,7 @@ function actionPolicyText(action) {
 }
 
 function actionDetailHTML(action) {
-  const description = action.description ? '<div><strong>Would</strong> ' + escapeText(action.description) + '</div>' : "";
+  const description = action.description ? '<div><strong>Would</strong> ' + escapeText(action.description.replace(/^Would\s+/i, "")) + '</div>' : "";
   return '<div class="action-detail">' + description +
     '<div><strong>Scope</strong> ' + escapeText(actionLabel(action.scope || "unknown")) + '</div>' +
     '<div><strong>Target</strong> ' + escapeText(actionTargetText(action)) + '</div>' +

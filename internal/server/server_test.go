@@ -847,7 +847,7 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "renderWorkerActions") || !contains(body, "actionDetailHTML") || !contains(body, "manual approval required") {
 		t.Error("dashboard should render disabled approval-gated action affordances")
 	}
-	for _, want := range []string{"Scope", "Target", "Approval", "Disabled"} {
+	for _, want := range []string{"Scope", "Target", "Approval", "Disabled", "replace(/^Would\\s+/i"} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard action guardrails should contain %q", want)
 		}

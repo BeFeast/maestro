@@ -892,6 +892,7 @@ func TestFleetDashboard(t *testing.T) {
 		"Target",
 		"Approval",
 		"Disabled",
+		"replace(/^Would\\s+/i",
 		"Approval-gated controls",
 	} {
 		if !contains(body, want) {
