@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -140,6 +141,18 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 	if worker.RuntimeSeconds <= 0 {
 		t.Fatalf("worker runtime_seconds = %d, want positive runtime", worker.RuntimeSeconds)
+	}
+	if len(worker.Actions) != 5 {
+		t.Fatalf("worker actions = %d, want 5", len(worker.Actions))
+	}
+	for _, action := range worker.Actions {
+		assertFleetReadOnlyAction(t, action)
+	}
+	if len(resp.Projects[0].Actions) != 2 {
+		t.Fatalf("project actions = %d, want 2", len(resp.Projects[0].Actions))
+	}
+	for _, action := range resp.Projects[0].Actions {
+		assertFleetReadOnlyAction(t, action)
 	}
 	attentionWorker := findFleetWorker(t, resp.Workers, "two-1")
 	if !attentionWorker.NeedsAttention {
@@ -417,10 +430,45 @@ func TestFleetDashboard(t *testing.T) {
 		"sortWorkers",
 		"filteredWorkers",
 		"URLSearchParams",
+		"renderActions",
+		"Approval-gated controls",
 	} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard should contain %q", want)
 		}
+	}
+}
+
+func TestFleetActionReadOnlyRejectsMutation(t *testing.T) {
+	srv := NewFleet(nil, "127.0.0.1", 8786, true)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetAction(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if !contains(w.Body.String(), "read-only") {
+		t.Fatalf("response = %q, want read-only explanation", w.Body.String())
+	}
+}
+
+func TestFleetActionProjectReadOnlyRejectsMutation(t *testing.T) {
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:   "owner/one",
+			Server: config.ServerConfig{ReadOnly: true},
+		}),
+	}, "127.0.0.1", 8786, false)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", bytes.NewBufferString(`{"action_id":"restart_worker","project":"One","slot":"one-1"}`))
+	w := httptest.NewRecorder()
+	srv.handleFleetAction(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if !contains(w.Body.String(), "read-only") {
+		t.Fatalf("response = %q, want read-only explanation", w.Body.String())
 	}
 }
 
@@ -443,5 +491,18 @@ func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Ses
 	}
 	if err := state.Save(dir, st); err != nil {
 		t.Fatalf("save state: %v", err)
+	}
+}
+
+func assertFleetReadOnlyAction(t *testing.T, action controlAction) {
+	t.Helper()
+	if !action.Mutating || !action.RequiresApproval || !action.Disabled {
+		t.Fatalf("action %+v should be disabled mutating approval affordance", action)
+	}
+	if !contains(action.DisabledReason, "Read-only mode") {
+		t.Fatalf("disabled reason = %q, want read-only explanation", action.DisabledReason)
+	}
+	if action.Method != http.MethodPost || action.Endpoint != "/api/v1/fleet/actions" {
+		t.Fatalf("action endpoint = %s %s, want POST /api/v1/fleet/actions", action.Method, action.Endpoint)
 	}
 }

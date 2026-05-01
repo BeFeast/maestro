@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -144,6 +146,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
+	mux.HandleFunc("/api/v1/fleet/actions", s.handleFleetAction)
 	mux.HandleFunc("/", s.handleFleetDashboard)
 
 	host := strings.TrimSpace(s.host)
@@ -189,55 +192,57 @@ type fleetSummary struct {
 }
 
 type fleetProjectState struct {
-	Name           string         `json:"name"`
-	Repo           string         `json:"repo"`
-	ConfigPath     string         `json:"config_path"`
-	DashboardURL   string         `json:"dashboard_url,omitempty"`
-	StateDir       string         `json:"state_dir,omitempty"`
-	MaxParallel    int            `json:"max_parallel"`
-	ReadOnly       bool           `json:"read_only"`
-	Summary        map[string]int `json:"summary"`
-	Running        int            `json:"running"`
-	PROpen         int            `json:"pr_open"`
-	Failed         int            `json:"failed"`
-	Sessions       int            `json:"sessions"`
-	NeedsAttention int            `json:"needs_attention"`
-	Active         []sessionInfo  `json:"active,omitempty"`
-	Attention      []sessionInfo  `json:"attention,omitempty"`
-	Supervisor     supervisorInfo `json:"supervisor"`
-	Error          string         `json:"error,omitempty"`
+	Name           string          `json:"name"`
+	Repo           string          `json:"repo"`
+	ConfigPath     string          `json:"config_path"`
+	DashboardURL   string          `json:"dashboard_url,omitempty"`
+	StateDir       string          `json:"state_dir,omitempty"`
+	MaxParallel    int             `json:"max_parallel"`
+	ReadOnly       bool            `json:"read_only"`
+	Summary        map[string]int  `json:"summary"`
+	Running        int             `json:"running"`
+	PROpen         int             `json:"pr_open"`
+	Failed         int             `json:"failed"`
+	Sessions       int             `json:"sessions"`
+	NeedsAttention int             `json:"needs_attention"`
+	Active         []sessionInfo   `json:"active,omitempty"`
+	Attention      []sessionInfo   `json:"attention,omitempty"`
+	Actions        []controlAction `json:"actions,omitempty"`
+	Supervisor     supervisorInfo  `json:"supervisor"`
+	Error          string          `json:"error,omitempty"`
 }
 
 type fleetWorkerState struct {
-	ProjectName       string `json:"project_name"`
-	ProjectRepo       string `json:"project_repo,omitempty"`
-	DashboardURL      string `json:"dashboard_url,omitempty"`
-	Slot              string `json:"slot"`
-	IssueNumber       int    `json:"issue_number"`
-	IssueTitle        string `json:"issue_title"`
-	IssueURL          string `json:"issue_url,omitempty"`
-	Status            string `json:"status"`
-	StatusReason      string `json:"status_reason,omitempty"`
-	NextAction        string `json:"next_action,omitempty"`
-	NeedsAttention    bool   `json:"needs_attention,omitempty"`
-	Backend           string `json:"backend,omitempty"`
-	PRNumber          int    `json:"pr_number,omitempty"`
-	PRURL             string `json:"pr_url,omitempty"`
-	TokensUsedAttempt int    `json:"tokens_used_attempt"`
-	TokensUsedTotal   int    `json:"tokens_used_total"`
-	Runtime           string `json:"runtime"`
-	RuntimeSeconds    int64  `json:"runtime_seconds"`
-	StartedAt         string `json:"started_at"`
-	FinishedAt        string `json:"finished_at,omitempty"`
-	NextRetryAt       string `json:"next_retry_at,omitempty"`
-	PID               int    `json:"pid,omitempty"`
-	Alive             *bool  `json:"alive,omitempty"`
-	Worktree          string `json:"worktree,omitempty"`
-	Branch            string `json:"branch,omitempty"`
-	TmuxSession       string `json:"tmux_session,omitempty"`
-	HasLog            bool   `json:"has_log"`
-	RetryCount        int    `json:"retry_count,omitempty"`
-	LastNotification  string `json:"last_notification,omitempty"`
+	ProjectName       string          `json:"project_name"`
+	ProjectRepo       string          `json:"project_repo,omitempty"`
+	DashboardURL      string          `json:"dashboard_url,omitempty"`
+	Slot              string          `json:"slot"`
+	IssueNumber       int             `json:"issue_number"`
+	IssueTitle        string          `json:"issue_title"`
+	IssueURL          string          `json:"issue_url,omitempty"`
+	Status            string          `json:"status"`
+	StatusReason      string          `json:"status_reason,omitempty"`
+	NextAction        string          `json:"next_action,omitempty"`
+	NeedsAttention    bool            `json:"needs_attention,omitempty"`
+	Backend           string          `json:"backend,omitempty"`
+	PRNumber          int             `json:"pr_number,omitempty"`
+	PRURL             string          `json:"pr_url,omitempty"`
+	TokensUsedAttempt int             `json:"tokens_used_attempt"`
+	TokensUsedTotal   int             `json:"tokens_used_total"`
+	Runtime           string          `json:"runtime"`
+	RuntimeSeconds    int64           `json:"runtime_seconds"`
+	StartedAt         string          `json:"started_at"`
+	FinishedAt        string          `json:"finished_at,omitempty"`
+	NextRetryAt       string          `json:"next_retry_at,omitempty"`
+	PID               int             `json:"pid,omitempty"`
+	Alive             *bool           `json:"alive,omitempty"`
+	Worktree          string          `json:"worktree,omitempty"`
+	Branch            string          `json:"branch,omitempty"`
+	TmuxSession       string          `json:"tmux_session,omitempty"`
+	HasLog            bool            `json:"has_log"`
+	RetryCount        int             `json:"retry_count,omitempty"`
+	LastNotification  string          `json:"last_notification,omitempty"`
+	Actions           []controlAction `json:"actions,omitempty"`
 }
 
 type fleetWorkerDetailResponse struct {
@@ -300,9 +305,11 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 		Name:         project.Name,
 		Repo:         project.cfg.Repo,
 		DashboardURL: project.DashboardURL,
+		ReadOnly:     project.cfg.Server.ReadOnly || s.readOnly,
 	}
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
+	infos[0].Actions = workerActionAffordances(projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
 	worker := makeFleetWorkerState(projectState, infos[0])
 	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)
 	if lines > 1000 {
@@ -365,6 +372,31 @@ func countLines(text string) int {
 	return strings.Count(text, "\n") + 1
 }
 
+func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.readOnly {
+		writeError(w, http.StatusForbidden, "fleet server is read-only; write actions require approval-backed controls to be enabled in configuration")
+		return
+	}
+
+	var req controlActionRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode action request: %v", err))
+			return
+		}
+	}
+	if project, ok := s.findProject(req.Project); ok && project.cfg != nil && project.cfg.Server.ReadOnly {
+		writeError(w, http.StatusForbidden, "fleet project is read-only; write actions require approval-backed controls to be enabled in configuration")
+		return
+	}
+	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
+}
+
 func (s *FleetServer) snapshot() fleetResponse {
 	resp := fleetResponse{
 		ReadOnly: s.readOnly,
@@ -424,6 +456,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, 
 	item.StateDir = cfg.StateDir
 	item.MaxParallel = cfg.MaxParallel
 	item.ReadOnly = cfg.Server.ReadOnly || s.readOnly
+	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions")
 
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
@@ -439,6 +472,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, 
 	item.Supervisor = projectState.Supervisor
 	workers := make([]fleetWorkerState, 0)
 	for _, worker := range projectState.All {
+		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 			item.Attention = append(item.Attention, worker)
@@ -496,6 +530,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		HasLog:            worker.HasLog,
 		RetryCount:        worker.RetryCount,
 		LastNotification:  worker.LastNotification,
+		Actions:           worker.Actions,
 	}
 }
 
@@ -702,7 +737,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .table-scroll { overflow-x: auto; }
   .worker-table {
     width: 100%;
-    min-width: 920px;
+    min-width: 1180px;
     border-collapse: collapse;
     table-layout: fixed;
   }
@@ -736,6 +771,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .pr-col { width: 70px; }
   .runtime-col { width: 90px; }
   .tokens-col { width: 82px; text-align: right; }
+  .action-col { width: 270px; }
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
@@ -772,7 +808,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .metric:last-child { border-right: 0; }
   .metric strong { display: block; font-size: 16px; }
   .metric span { display: block; color: var(--muted); font-size: 11px; }
-  .supervisor, .workers { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .supervisor, .workers, .project-actions { padding: 12px 14px; border-bottom: 1px solid var(--line); }
   .label { color: var(--muted); font-weight: 650; text-transform: uppercase; font-size: 12px; }
   .decision { margin-top: 5px; color: var(--text); }
   .decision small { color: var(--muted); }
@@ -799,6 +835,18 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .s-done { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .action-btn {
+    height: 24px;
+    border: 1px solid rgba(210,153,34,.45);
+    border-radius: 6px;
+    background: rgba(210,153,34,.08);
+    color: var(--warn);
+    font: inherit;
+    font-size: 12px;
+    cursor: not-allowed;
+  }
+  .action-note { margin-top: 6px; color: var(--muted); font-size: 12px; white-space: normal; }
   .empty { color: var(--muted); margin-top: 8px; }
   .worker-table .empty { padding: 18px 14px; margin: 0; text-align: center; }
   .why-line {
@@ -824,7 +872,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     .stats { width: 100%; }
     .worker-controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .worker-controls .search-control { grid-column: 1 / -1; }
-    .worker-table { min-width: 780px; }
+    .worker-table { min-width: 1080px; }
   }
   @media (max-width: 700px) {
     header { align-items: flex-start; flex-direction: column; }
@@ -878,6 +926,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
             <th class="pr-col">PR</th>
             <th class="runtime-col">Runtime</th>
             <th class="tokens-col">Tokens</th>
+            <th class="action-col">Actions</th>
           </tr>
         </thead>
         <tbody id="fleet-workers-body"></tbody>
@@ -930,6 +979,7 @@ const statusOrder = new Map([
 
 const fleetState = {
   selectedProject: "all",
+  readOnly: true,
   selectedWorkerKey: "",
   filters: {
     query: "",
@@ -963,6 +1013,26 @@ function compactNumber(value) {
 function linkHTML(url, label) {
   if (!url) return escapeText(label);
   return '<a href="' + escapeText(url) + '" target="_blank" rel="noreferrer">' + escapeText(label) + '</a>';
+}
+
+function actionLabel(action) {
+  return String(action || "-").replace(/_/g, " ");
+}
+
+function actionDisabledReason(actions) {
+  const action = (actions || []).find(item => item.disabled_reason);
+  return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
+}
+
+function renderActions(actions) {
+  const items = actions || [];
+  if (!items.length) return '<span class="empty">No controls.</span>';
+  return '<div class="actions">' + items.map(action =>
+    '<button type="button" class="action-btn" disabled aria-disabled="true" title="' +
+    escapeText(action.disabled_reason || "Write action unavailable") + '">' +
+    escapeText(action.label || actionLabel(action.id)) + '</button>'
+  ).join("") + '</div>' +
+  '<div class="action-note">' + escapeText(actionDisabledReason(items)) + '</div>';
 }
 
 function formatTimestamp(value) {
@@ -1277,7 +1347,7 @@ function renderFleetWorkers() {
       : fleetState.selectedProject === "all"
       ? "No active, recent, or attention workers across configured projects."
       : "No active, recent, or attention workers for " + fleetState.selectedProject + ".";
-    fleetWorkersEl.innerHTML = '<tr><td colspan="8" class="empty">' + escapeText(empty) + '</td></tr>';
+    fleetWorkersEl.innerHTML = '<tr><td colspan="9" class="empty">' + escapeText(empty) + '</td></tr>';
     return;
   }
 
@@ -1296,6 +1366,7 @@ function renderFleetWorkers() {
       '<td class="pr-col" title="' + escapeText(pr) + '">' + linkHTML(worker.pr_url, pr) + '</td>' +
       '<td class="runtime-col" title="' + escapeText(worker.runtime || "-") + '">' + escapeText(worker.runtime || "-") + '</td>' +
       '<td class="tokens-col">' + compactNumber(worker.tokens_used_total) + '</td>' +
+      '<td class="action-col">' + renderActions(worker.actions || []) + '</td>' +
     '</tr>';
   }).join("");
 
@@ -1396,6 +1467,7 @@ function renderWorkerDetail(data) {
     '<div class="' + noteClass + '"><strong>State</strong> ' + escapeText(reason) +
       (links.length ? '<div class="detail-links">' + links.join("") + '</div>' : "") +
     '</div>' +
+    '<div class="project-actions"><div class="label">Approval-gated controls</div>' + renderActions(worker.actions || []) + '</div>' +
     '<div class="log-tail">' +
       '<div class="log-tail-head"><strong>Recent log tail</strong><span>' + escapeText(logMeta) + '</span></div>' +
       '<pre>' + escapeText(logText) + '</pre>' +
@@ -1479,6 +1551,11 @@ function renderWorkers(project) {
   '</table></div>';
 }
 
+function renderProjectActions(project) {
+  return '<div class="project-actions"><div class="label">Approval-gated controls</div>' +
+    renderActions(project.actions || []) + '</div>';
+}
+
 function renderProject(project) {
   if (project.error) {
     return '<article class="project"><div class="project-head"><div><h2>' + escapeText(project.name) +
@@ -1499,6 +1576,7 @@ function renderProject(project) {
       '<div class="metric"><strong>' + escapeText(project.needs_attention || 0) + '</strong><span>Attention</span></div>' +
     '</div>' +
     renderProjectWhy(project) +
+    renderProjectActions(project) +
     renderSupervisor(project) +
     renderWorkers(project) +
   '</article>';
@@ -1553,13 +1631,15 @@ async function loadFleet() {
     const response = await fetch("/api/v1/fleet", { cache: "no-store" });
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
+    fleetState.readOnly = data.read_only !== false;
     fleetState.projects = data.projects || [];
     fleetState.workers = fleetWorkersFromData(data);
     if (fleetState.selectedWorkerKey && !selectedWorker()) {
       fleetState.selectedWorkerKey = "";
       fleetState.detail = null;
     }
-    subtitleEl.textContent = fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s");
+    const controlMode = fleetState.readOnly ? "read-only controls disabled" : "controls require approval configuration";
+    subtitleEl.textContent = fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s") + " · " + controlMode;
     renderFilterOptions();
     syncFilterControls();
     renderStats(data.summary || {});
@@ -1570,7 +1650,7 @@ async function loadFleet() {
   } catch (err) {
     subtitleEl.textContent = "Fleet API error";
     workerSummaryEl.textContent = "Fleet API error";
-    fleetWorkersEl.innerHTML = '<tr><td colspan="8" class="empty">Unable to load fleet workers.</td></tr>';
+    fleetWorkersEl.innerHTML = '<tr><td colspan="9" class="empty">Unable to load fleet workers.</td></tr>';
     projectsEl.innerHTML = '<div class="error">' + escapeText(err.message) + '</div>';
   }
 }
