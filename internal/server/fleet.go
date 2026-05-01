@@ -175,6 +175,7 @@ type fleetResponse struct {
 	ReadOnly bool                `json:"read_only"`
 	Projects []fleetProjectState `json:"projects"`
 	Summary  fleetSummary        `json:"summary"`
+	Workers  []fleetWorkerState  `json:"workers"`
 }
 
 type fleetSummary struct {
@@ -205,6 +206,27 @@ type fleetProjectState struct {
 	Error          string         `json:"error,omitempty"`
 }
 
+type fleetWorkerState struct {
+	ProjectName       string `json:"project_name"`
+	ProjectRepo       string `json:"project_repo,omitempty"`
+	DashboardURL      string `json:"dashboard_url,omitempty"`
+	Slot              string `json:"slot"`
+	IssueNumber       int    `json:"issue_number"`
+	IssueTitle        string `json:"issue_title"`
+	IssueURL          string `json:"issue_url,omitempty"`
+	Status            string `json:"status"`
+	StatusReason      string `json:"status_reason,omitempty"`
+	NeedsAttention    bool   `json:"needs_attention,omitempty"`
+	Backend           string `json:"backend,omitempty"`
+	PRNumber          int    `json:"pr_number,omitempty"`
+	PRURL             string `json:"pr_url,omitempty"`
+	TokensUsedAttempt int    `json:"tokens_used_attempt"`
+	TokensUsedTotal   int    `json:"tokens_used_total"`
+	Runtime           string `json:"runtime"`
+	StartedAt         string `json:"started_at"`
+	Alive             *bool  `json:"alive,omitempty"`
+}
+
 func (s *FleetServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -217,10 +239,12 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp := fleetResponse{
 		ReadOnly: s.readOnly,
 		Projects: make([]fleetProjectState, 0, len(s.projects)),
+		Workers:  make([]fleetWorkerState, 0),
 	}
 	for _, project := range s.projects {
-		item := s.projectSnapshot(project)
+		item, workers := s.projectSnapshot(project)
 		resp.Projects = append(resp.Projects, item)
+		resp.Workers = append(resp.Workers, workers...)
 		resp.Summary.Projects++
 		resp.Summary.Running += item.Running
 		resp.Summary.PROpen += item.PROpen
@@ -234,10 +258,28 @@ func (s *FleetServer) snapshot() fleetResponse {
 		}
 		return resp.Projects[i].Name < resp.Projects[j].Name
 	})
+	sort.SliceStable(resp.Workers, func(i, j int) bool {
+		left, right := resp.Workers[i], resp.Workers[j]
+		if left.NeedsAttention != right.NeedsAttention {
+			return left.NeedsAttention
+		}
+		li := state.StatusPriority(state.SessionStatus(left.Status))
+		ri := state.StatusPriority(state.SessionStatus(right.Status))
+		if li != ri {
+			return li < ri
+		}
+		if left.StartedAt != right.StartedAt {
+			return left.StartedAt > right.StartedAt
+		}
+		if left.ProjectName != right.ProjectName {
+			return left.ProjectName < right.ProjectName
+		}
+		return left.Slot < right.Slot
+	})
 	return resp
 }
 
-func (s *FleetServer) projectSnapshot(project FleetProject) fleetProjectState {
+func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, []fleetWorkerState) {
 	cfg := project.cfg
 	item := fleetProjectState{
 		Name:         project.Name,
@@ -246,7 +288,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject) fleetProjectState {
 	}
 	if cfg == nil {
 		item.Error = "missing resolved project config"
-		return item
+		return item, nil
 	}
 	item.Repo = cfg.Repo
 	item.StateDir = cfg.StateDir
@@ -256,7 +298,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject) fleetProjectState {
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
 		item.Error = err.Error()
-		return item
+		return item, nil
 	}
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary
@@ -265,18 +307,47 @@ func (s *FleetServer) projectSnapshot(project FleetProject) fleetProjectState {
 	item.Failed = failedCount(projectState.Summary)
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
+	workers := make([]fleetWorkerState, 0)
 	for _, worker := range projectState.All {
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 		}
-		if worker.Status == string(state.StatusRunning) || worker.Status == string(state.StatusPROpen) || worker.NeedsAttention {
+		if isFleetWorkerVisible(worker) {
+			workers = append(workers, makeFleetWorkerState(item, worker))
+			if len(item.Active) >= 6 {
+				continue
+			}
 			item.Active = append(item.Active, worker)
 		}
-		if len(item.Active) >= 6 {
-			break
-		}
 	}
-	return item
+	return item, workers
+}
+
+func isFleetWorkerVisible(worker sessionInfo) bool {
+	return worker.Status == string(state.StatusRunning) || worker.Status == string(state.StatusPROpen) || worker.NeedsAttention
+}
+
+func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
+	return fleetWorkerState{
+		ProjectName:       project.Name,
+		ProjectRepo:       project.Repo,
+		DashboardURL:      project.DashboardURL,
+		Slot:              worker.Slot,
+		IssueNumber:       worker.IssueNumber,
+		IssueTitle:        worker.IssueTitle,
+		IssueURL:          worker.IssueURL,
+		Status:            worker.Status,
+		StatusReason:      worker.StatusReason,
+		NeedsAttention:    worker.NeedsAttention,
+		Backend:           worker.Backend,
+		PRNumber:          worker.PRNumber,
+		PRURL:             worker.PRURL,
+		TokensUsedAttempt: worker.TokensUsedAttempt,
+		TokensUsedTotal:   worker.TokensUsedTotal,
+		Runtime:           worker.Runtime,
+		StartedAt:         worker.StartedAt,
+		Alive:             worker.Alive,
+	}
 }
 
 func failedCount(summary map[string]int) int {
@@ -338,6 +409,79 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .stat strong { display: block; font-size: 18px; }
   .stat span { color: var(--muted); font-size: 12px; }
   main { padding: 18px; }
+  .project-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 14px;
+    padding-bottom: 4px;
+    overflow-x: auto;
+  }
+  .project-tab {
+    flex: 0 0 auto;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--muted);
+    padding: 6px 11px;
+    cursor: pointer;
+    font: inherit;
+    white-space: nowrap;
+  }
+  .project-tab.active {
+    color: var(--text);
+    border-color: rgba(88,166,255,.65);
+    background: rgba(88,166,255,.12);
+  }
+  .project-tab .count { margin-left: 6px; color: var(--muted); font-size: 12px; }
+  .fleet-workers {
+    margin-bottom: 16px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .section-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .section-head h2 { margin: 0; font-size: 17px; }
+  .section-note { color: var(--muted); font-size: 13px; text-align: right; }
+  .table-scroll { overflow-x: auto; }
+  .worker-table {
+    width: 100%;
+    min-width: 920px;
+    border-collapse: collapse;
+    table-layout: fixed;
+  }
+  .worker-table th, .worker-table td {
+    padding: 9px 10px;
+    border-bottom: 1px solid rgba(41,49,61,.8);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+  }
+  .worker-table th {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 650;
+    text-align: left;
+    background: var(--panel-2);
+  }
+  .worker-table tbody tr.row-running { background: rgba(63,185,80,.055); }
+  .worker-table tbody tr.row-pr { background: rgba(88,166,255,.055); }
+  .worker-table tbody tr.row-attention { background: rgba(248,81,73,.1); }
+  .worker-table tbody tr:hover { background: #18212c; }
+  .project-col { width: 140px; font-weight: 650; }
+  .slot-col { width: 92px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .issue-col { width: auto; }
+  .status-col { width: 132px; }
+  .backend-col { width: 108px; }
+  .pr-col { width: 70px; }
+  .runtime-col { width: 90px; }
+  .tokens-col { width: 82px; text-align: right; }
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
@@ -378,17 +522,17 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .label { color: var(--muted); font-weight: 650; text-transform: uppercase; font-size: 12px; }
   .decision { margin-top: 5px; color: var(--text); }
   .decision small { color: var(--muted); }
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; table-layout: fixed; }
-  td {
+  .project table { width: 100%; border-collapse: collapse; margin-top: 8px; table-layout: fixed; }
+  .project td {
     padding: 7px 0;
     border-top: 1px solid rgba(41,49,61,.7);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  td:nth-child(1) { width: 78px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  td:nth-child(2) { width: 74px; }
-  td:nth-child(4) { width: 70px; text-align: right; color: var(--muted); }
+  .project td:nth-child(1) { width: 78px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .project td:nth-child(2) { width: 74px; }
+  .project td:nth-child(4) { width: 70px; text-align: right; color: var(--muted); }
   .pill {
     display: inline-block;
     padding: 1px 8px;
@@ -398,13 +542,17 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .s-running { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-pr_open { color: var(--accent); border-color: rgba(88,166,255,.45); }
+  .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .empty { color: var(--muted); margin-top: 8px; }
+  .worker-table .empty { padding: 18px 14px; margin: 0; text-align: center; }
   .error { color: var(--bad); padding: 12px 14px; }
   @media (max-width: 700px) {
     header { align-items: flex-start; flex-direction: column; }
     .stats { justify-content: flex-start; }
     main { padding: 10px; }
+    .section-head { flex-direction: column; }
+    .section-note { text-align: left; }
     .grid { grid-template-columns: 1fr; }
     .metric-row { grid-template-columns: repeat(2, 1fr); }
   }
@@ -419,12 +567,48 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   <div class="stats" id="stats"></div>
 </header>
 <main>
+  <nav class="project-tabs" id="project-tabs" aria-label="Fleet projects"></nav>
+  <section class="fleet-workers">
+    <div class="section-head">
+      <div>
+        <h2>Fleet Workers</h2>
+        <div class="sub">Unified active and attention queue across projects.</div>
+      </div>
+      <div class="section-note" id="worker-summary">Loading workers...</div>
+    </div>
+    <div class="table-scroll">
+      <table class="worker-table">
+        <thead>
+          <tr>
+            <th class="project-col">Project</th>
+            <th class="slot-col">Slot</th>
+            <th class="issue-col">Issue</th>
+            <th class="status-col">Status</th>
+            <th class="backend-col">Backend</th>
+            <th class="pr-col">PR</th>
+            <th class="runtime-col">Runtime</th>
+            <th class="tokens-col">Tokens</th>
+          </tr>
+        </thead>
+        <tbody id="fleet-workers-body"></tbody>
+      </table>
+    </div>
+  </section>
   <div class="grid" id="projects"></div>
 </main>
 <script>
 const projectsEl = document.getElementById("projects");
 const statsEl = document.getElementById("stats");
 const subtitleEl = document.getElementById("subtitle");
+const tabsEl = document.getElementById("project-tabs");
+const fleetWorkersEl = document.getElementById("fleet-workers-body");
+const workerSummaryEl = document.getElementById("worker-summary");
+
+const fleetState = {
+  selectedProject: "all",
+  projects: [],
+  workers: []
+};
 
 function escapeText(value) {
   return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -432,15 +616,45 @@ function escapeText(value) {
   }[ch]));
 }
 
+function compactNumber(value) {
+  const n = Number(value || 0);
+  if (!n) return "-";
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(n < 10000 ? 1 : 0).replace(/\.0$/, "") + "k";
+  return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+}
+
 function linkHTML(url, label) {
   if (!url) return escapeText(label);
   return '<a href="' + escapeText(url) + '" target="_blank" rel="noreferrer">' + escapeText(label) + '</a>';
+}
+
+function statusLabel(worker) {
+  if (worker.status === "running" && worker.alive === false) return "running stale";
+  return worker.status || "-";
 }
 
 function statusClass(worker) {
   let cls = "pill s-" + escapeText(worker.status || "unknown");
   if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) cls += " attention";
   return cls;
+}
+
+function rowClass(worker) {
+  if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) return "row-attention";
+  if (worker.status === "running") return "row-running";
+  if (worker.status === "pr_open") return "row-pr";
+  return "";
+}
+
+function fleetWorkersFromData(data) {
+  if (Array.isArray(data.workers)) return data.workers;
+  return (data.projects || []).flatMap(project => (project.active || []).map(worker => ({
+    ...worker,
+    project_name: project.name,
+    project_repo: project.repo,
+    dashboard_url: project.dashboard_url
+  })));
 }
 
 function countFailed(project) {
@@ -458,6 +672,75 @@ function renderStats(summary) {
   statsEl.innerHTML = items.map(([label, value]) =>
     '<div class="stat"><strong>' + escapeText(value) + '</strong><span>' + escapeText(label) + '</span></div>'
   ).join("");
+}
+
+function renderProjectTabs() {
+  const projectNames = new Set((fleetState.projects || []).map(project => project.name));
+  if (fleetState.selectedProject !== "all" && !projectNames.has(fleetState.selectedProject)) {
+    fleetState.selectedProject = "all";
+  }
+
+  const counts = new Map();
+  for (const worker of fleetState.workers || []) {
+    const name = worker.project_name || "";
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+
+  const tabs = [{ name: "all", label: "All projects", count: (fleetState.workers || []).length }].concat(
+    (fleetState.projects || []).map(project => ({
+      name: project.name,
+      label: project.name,
+      count: counts.get(project.name) || 0
+    }))
+  );
+
+  tabsEl.innerHTML = tabs.map(tab => {
+    const active = tab.name === fleetState.selectedProject ? " active" : "";
+    return '<button type="button" class="project-tab' + active + '" data-project="' + escapeText(tab.name) + '">' +
+      escapeText(tab.label) + '<span class="count">' + escapeText(tab.count) + '</span></button>';
+  }).join("");
+
+  tabsEl.querySelectorAll("button[data-project]").forEach(button => {
+    button.addEventListener("click", () => {
+      fleetState.selectedProject = button.dataset.project || "all";
+      renderProjectTabs();
+      renderFleetWorkers();
+    });
+  });
+}
+
+function renderFleetWorkers() {
+  const selected = fleetState.selectedProject;
+  const workers = selected === "all"
+    ? (fleetState.workers || [])
+    : (fleetState.workers || []).filter(worker => worker.project_name === selected);
+  // The API response is already sorted with the server's authoritative status order.
+  const visible = workers;
+  const projectLabel = selected === "all" ? "all projects" : selected;
+  workerSummaryEl.textContent = visible.length + " active / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel;
+
+  if (visible.length === 0) {
+    const empty = selected === "all"
+      ? "No active workers or attention states across configured projects."
+      : "No active workers or attention states for " + selected + ".";
+    fleetWorkersEl.innerHTML = '<tr><td colspan="8" class="empty">' + escapeText(empty) + '</td></tr>';
+    return;
+  }
+
+  fleetWorkersEl.innerHTML = visible.map(worker => {
+    const issue = worker.issue_number ? "#" + worker.issue_number : "-";
+    const pr = worker.pr_number ? "#" + worker.pr_number : "-";
+    return '<tr class="' + rowClass(worker) + '">' +
+      '<td class="project-col">' + linkHTML(worker.dashboard_url, worker.project_name || "-") + '</td>' +
+      '<td class="slot-col">' + escapeText(worker.slot || "-") + '</td>' +
+      '<td class="issue-col">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title || "") + '</td>' +
+      '<td class="status-col"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
+      '<td class="backend-col">' + escapeText(worker.backend || "-") + '</td>' +
+      '<td class="pr-col">' + linkHTML(worker.pr_url, pr) + '</td>' +
+      '<td class="runtime-col">' + escapeText(worker.runtime || "-") + '</td>' +
+      '<td class="tokens-col">' + compactNumber(worker.tokens_used_total) + '</td>' +
+    '</tr>';
+  }).join("");
 }
 
 function renderSupervisor(project) {
@@ -484,7 +767,7 @@ function renderWorkers(project) {
   return '<div class="workers"><div class="label">Active / attention</div><table>' +
     workers.map(worker => '<tr>' +
       '<td>' + escapeText(worker.slot) + '</td>' +
-      '<td><span class="' + statusClass(worker) + '">' + escapeText(worker.status || "-") + '</span></td>' +
+      '<td><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
       '<td>' + linkHTML(worker.issue_url, "#" + worker.issue_number) + ' ' + escapeText(worker.issue_title || "") + '</td>' +
       '<td>' + escapeText(worker.runtime || "-") + '</td>' +
     '</tr>').join("") +
@@ -520,11 +803,17 @@ async function loadFleet() {
     const response = await fetch("/api/v1/fleet", { cache: "no-store" });
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
-    subtitleEl.textContent = (data.projects || []).length + " configured project" + ((data.projects || []).length === 1 ? "" : "s");
+    fleetState.projects = data.projects || [];
+    fleetState.workers = fleetWorkersFromData(data);
+    subtitleEl.textContent = fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s");
     renderStats(data.summary || {});
-    projectsEl.innerHTML = (data.projects || []).map(renderProject).join("");
+    renderProjectTabs();
+    renderFleetWorkers();
+    projectsEl.innerHTML = fleetState.projects.map(renderProject).join("");
   } catch (err) {
     subtitleEl.textContent = "Fleet API error";
+    workerSummaryEl.textContent = "Fleet API error";
+    fleetWorkersEl.innerHTML = '<tr><td colspan="8" class="empty">Unable to load fleet workers.</td></tr>';
     projectsEl.innerHTML = '<div class="error">' + escapeText(err.message) + '</div>';
   }
 }

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -50,19 +51,20 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	secondStateDir := filepath.Join(dir, "two")
 	saveFleetTestState(t, firstStateDir, map[string]*state.Session{
 		"one-1": {
-			IssueNumber: 1,
-			IssueTitle:  "Build thing",
-			Status:      state.StatusRunning,
-			StartedAt:   now.Add(-time.Minute),
-			PID:         999999,
-			Backend:     "opencode",
+			IssueNumber:     1,
+			IssueTitle:      "Build thing",
+			Status:          state.StatusRunning,
+			StartedAt:       now.Add(-time.Minute),
+			Backend:         "opencode",
+			TokensUsedTotal: 1234,
 		},
 		"one-2": {
-			IssueNumber: 2,
-			IssueTitle:  "Review thing",
-			Status:      state.StatusPROpen,
-			StartedAt:   now.Add(-2 * time.Minute),
-			PRNumber:    12,
+			IssueNumber:     2,
+			IssueTitle:      "Review thing",
+			Status:          state.StatusPROpen,
+			StartedAt:       now.Add(-2 * time.Minute),
+			PRNumber:        12,
+			TokensUsedTotal: 42000,
 		},
 	})
 	saveFleetTestState(t, secondStateDir, map[string]*state.Session{
@@ -100,7 +102,7 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.Summary.Projects != 2 || resp.Summary.Running != 1 || resp.Summary.PROpen != 1 || resp.Summary.Failed != 1 || resp.Summary.Sessions != 3 {
+	if resp.Summary.Projects != 2 || resp.Summary.Running != 1 || resp.Summary.PROpen != 1 || resp.Summary.Failed != 1 || resp.Summary.Sessions != 3 || resp.Summary.NeedsAttention != 2 {
 		t.Fatalf("unexpected summary: %+v", resp.Summary)
 	}
 	if resp.Projects[0].Name != "One" {
@@ -108,6 +110,65 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 	if len(resp.Projects[0].Active) != 2 {
 		t.Fatalf("project active len = %d, want 2", len(resp.Projects[0].Active))
+	}
+	if len(resp.Workers) != 3 {
+		t.Fatalf("fleet workers len = %d, want 3", len(resp.Workers))
+	}
+	worker := findFleetWorker(t, resp.Workers, "one-2")
+	if worker.ProjectName != "One" || worker.ProjectRepo != "owner/one" {
+		t.Fatalf("worker project = %q/%q, want One/owner/one", worker.ProjectName, worker.ProjectRepo)
+	}
+	if worker.IssueURL != "https://github.com/owner/one/issues/2" {
+		t.Fatalf("worker issue_url = %q", worker.IssueURL)
+	}
+	if worker.PRURL != "https://github.com/owner/one/pull/12" {
+		t.Fatalf("worker pr_url = %q", worker.PRURL)
+	}
+	if worker.TokensUsedTotal != 42000 {
+		t.Fatalf("worker tokens = %d, want 42000", worker.TokensUsedTotal)
+	}
+	attentionWorker := findFleetWorker(t, resp.Workers, "two-1")
+	if !attentionWorker.NeedsAttention {
+		t.Fatal("retry-exhausted worker should need attention")
+	}
+}
+
+func TestFleetWorkersIncludeAllActiveRows(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	sessions := make(map[string]*state.Session)
+	for i := 1; i <= 7; i++ {
+		slot := "one-" + strconv.Itoa(i)
+		sessions[slot] = &state.Session{
+			IssueNumber: i,
+			IssueTitle:  "Worker",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-time.Duration(i) * time.Minute),
+		}
+	}
+	saveFleetTestState(t, stateDir, sessions)
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 7,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	if len(resp.Projects) != 1 {
+		t.Fatalf("projects len = %d, want 1", len(resp.Projects))
+	}
+	if len(resp.Projects[0].Active) != 6 {
+		t.Fatalf("project card active len = %d, want capped 6", len(resp.Projects[0].Active))
+	}
+	if len(resp.Workers) != 7 {
+		t.Fatalf("fleet workers len = %d, want all 7", len(resp.Workers))
+	}
+	if resp.Summary.NeedsAttention != 7 {
+		t.Fatalf("needs attention = %d, want 7", resp.Summary.NeedsAttention)
 	}
 }
 
@@ -124,11 +185,27 @@ func TestFleetDashboard(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
-	for _, want := range []string{"Maestro Fleet", "/api/v1/fleet", "renderProject"} {
+	for _, want := range []string{"Maestro Fleet", "/api/v1/fleet", "project-tabs", "fleet-workers-body", "renderFleetWorkers", "renderProject"} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard should contain %q", want)
 		}
 	}
+	for _, unwanted := range []string{"statusRank", "sortWorkers("} {
+		if contains(body, unwanted) {
+			t.Fatalf("dashboard should not contain duplicate client worker sorting %q", unwanted)
+		}
+	}
+}
+
+func findFleetWorker(t *testing.T, workers []fleetWorkerState, slot string) fleetWorkerState {
+	t.Helper()
+	for _, worker := range workers {
+		if worker.Slot == slot {
+			return worker
+		}
+	}
+	t.Fatalf("worker %q not found in %+v", slot, workers)
+	return fleetWorkerState{}
 }
 
 func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Session) {
