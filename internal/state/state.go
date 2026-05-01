@@ -28,6 +28,17 @@ const (
 	StatusRetryExhausted SessionStatus = "retry_exhausted" // max retries reached, needs manual review
 )
 
+type SessionDisplayStatus string
+
+const (
+	DisplayReviewRetryBackoff SessionDisplayStatus = "review_retry_backoff"
+	DisplayReviewRetryPending SessionDisplayStatus = "review_retry_pending"
+	DisplayReviewRetryRunning SessionDisplayStatus = "review_retry_running"
+	DisplayReviewRetryRecheck SessionDisplayStatus = "review_retry_recheck"
+)
+
+const RetryReasonReviewFeedback = "review_feedback"
+
 // Phase represents which pipeline phase a session is currently in.
 type Phase string
 
@@ -69,6 +80,7 @@ type Session struct {
 	CIFailureOutput             string        `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)
 	PreviousAttemptFeedback     string        `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
 	PreviousAttemptFeedbackKind string        `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
+	RetryReason                 string        `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
 	CheckpointFile              string        `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
 }
 
@@ -84,8 +96,16 @@ type SessionAttention struct {
 // The alive pointer should be provided only when the caller has checked the
 // recorded running process.
 func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
+	return SessionAttentionForAt(sess, alive, time.Now().UTC())
+}
+
+// SessionAttentionForAt is SessionAttentionFor with an explicit clock for tests.
+func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAttention {
 	if sess == nil {
 		return SessionAttention{}
+	}
+	if attention, ok := reviewFeedbackRetryAttention(sess, alive, now); ok {
+		return attention
 	}
 
 	switch sess.Status {
@@ -107,7 +127,10 @@ func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
 		return SessionAttention{Reason: "Worker process is alive and writing to its session log."}
 	case StatusPROpen:
 		if sess.PRNumber > 0 {
-			return SessionAttention{Reason: "PR is open; Maestro is waiting for CI, review gate, merge interval, or conflict handling."}
+			return SessionAttention{
+				Reason:     fmt.Sprintf("PR #%d is open; Maestro is waiting for CI, Greptile review, or the merge gate.", sess.PRNumber),
+				NextAction: "Wait for checks and review gates to pass; Maestro will merge when the merge gate allows it.",
+			}
 		}
 		return SessionAttention{
 			Reason:         "Session is waiting on an open PR, but no PR number is recorded yet.",
@@ -115,7 +138,10 @@ func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
 			NeedsAttention: true,
 		}
 	case StatusQueued:
-		return SessionAttention{Reason: "Worker is queued for follow-up processing before it can be merged."}
+		return SessionAttention{
+			Reason:     "Worker follow-up is queued; Maestro is waiting for CI, Greptile, or the merge gate before merging.",
+			NextAction: "Wait for the queued PR checks and merge gate to clear.",
+		}
 	case StatusDead:
 		if sess.NextRetryAt != nil {
 			return SessionAttention{
@@ -166,6 +192,87 @@ func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
 	default:
 		return SessionAttention{Reason: "Session is waiting for the next Maestro reconciliation cycle."}
 	}
+}
+
+// SessionDisplayStatusFor returns the status token dashboards should display.
+func SessionDisplayStatusFor(sess *Session, alive *bool) string {
+	return SessionDisplayStatusForAt(sess, alive, time.Now().UTC())
+}
+
+// SessionDisplayStatusForAt is SessionDisplayStatusFor with an explicit clock for tests.
+func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string {
+	if sess == nil {
+		return ""
+	}
+	if sess.Status == StatusRunning && alive != nil && !*alive {
+		return string(sess.Status)
+	}
+	if display := reviewFeedbackRetryDisplayStatus(sess, now); display != "" {
+		return string(display)
+	}
+	return string(sess.Status)
+}
+
+func reviewFeedbackRetryAttention(sess *Session, alive *bool, now time.Time) (SessionAttention, bool) {
+	if sess == nil || (sess.Status == StatusRunning && alive != nil && !*alive) {
+		return SessionAttention{}, false
+	}
+	switch reviewFeedbackRetryDisplayStatus(sess, now) {
+	case DisplayReviewRetryBackoff:
+		return SessionAttention{
+			Reason:     "Review feedback retry is scheduled; Maestro is waiting for the retry backoff before starting the in-place retry worker.",
+			NextAction: "Wait for the scheduled retry worker to start, or inspect the review feedback if it should not retry.",
+		}, true
+	case DisplayReviewRetryPending:
+		return SessionAttention{
+			Reason:     "Review feedback retry is ready; Maestro is waiting for an available retry worker slot.",
+			NextAction: "Wait for the retry worker to start in the next orchestration cycle.",
+		}, true
+	case DisplayReviewRetryRunning:
+		return SessionAttention{
+			Reason:     "Review feedback retry worker is running; Maestro is updating the existing PR in place.",
+			NextAction: "Wait for the retry worker to finish and push updates to the PR.",
+		}, true
+	case DisplayReviewRetryRecheck:
+		return SessionAttention{
+			Reason:     "Review feedback retry updated the PR; Maestro is waiting for CI, Greptile, or the merge gate to recheck it.",
+			NextAction: "Wait for checks and review gates to pass; Maestro will merge when the merge gate allows it.",
+		}, true
+	default:
+		return SessionAttention{}, false
+	}
+}
+
+func reviewFeedbackRetryDisplayStatus(sess *Session, now time.Time) SessionDisplayStatus {
+	if !hasReviewFeedbackRetry(sess) {
+		return ""
+	}
+	switch sess.Status {
+	case StatusDead:
+		if sess.NextRetryAt == nil {
+			return ""
+		}
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		if now.Before(*sess.NextRetryAt) {
+			return DisplayReviewRetryBackoff
+		}
+		return DisplayReviewRetryPending
+	case StatusRunning:
+		return DisplayReviewRetryRunning
+	case StatusPROpen, StatusQueued:
+		return DisplayReviewRetryRecheck
+	default:
+		return ""
+	}
+}
+
+func hasReviewFeedbackRetry(sess *Session) bool {
+	if sess == nil {
+		return false
+	}
+	return strings.TrimSpace(sess.RetryReason) == RetryReasonReviewFeedback || strings.TrimSpace(sess.PreviousAttemptFeedbackKind) == RetryReasonReviewFeedback
 }
 
 func sessionHasFailedCheckEvidence(sess *Session) bool {

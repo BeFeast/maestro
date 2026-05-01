@@ -637,6 +637,9 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			if sess.PreviousAttemptFeedbackKind == "rebase_conflict" {
 				promptBase = appendRebaseConflictContext(promptBase, sess.PreviousAttemptFeedback)
 			} else {
+				if sess.PreviousAttemptFeedbackKind == state.RetryReasonReviewFeedback {
+					sess.RetryReason = state.RetryReasonReviewFeedback
+				}
 				promptBase = appendReviewFeedbackContext(promptBase, sess.PreviousAttemptFeedback)
 			}
 			sess.PreviousAttemptFeedback = "" // consumed — don't persist stale feedback
@@ -1724,7 +1727,8 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 
 	sess.CIFailureOutput = ""
 	sess.PreviousAttemptFeedback = reviewFeedback
-	sess.PreviousAttemptFeedbackKind = "review_feedback"
+	sess.PreviousAttemptFeedbackKind = state.RetryReasonReviewFeedback
+	sess.RetryReason = state.RetryReasonReviewFeedback
 
 	sess.RetryCount++
 	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)

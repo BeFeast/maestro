@@ -175,6 +175,71 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 }
 
+func TestFleetAPIReviewRetryLifecycleDisplay(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	retryAt := now.Add(10 * time.Minute)
+	stateDir := filepath.Join(dir, "review-retry")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"retry-backoff": {
+			IssueNumber:                 42,
+			IssueTitle:                  "Address review feedback",
+			Status:                      state.StatusDead,
+			StartedAt:                   now.Add(-20 * time.Minute),
+			FinishedAt:                  &now,
+			PRNumber:                    12,
+			RetryCount:                  1,
+			NextRetryAt:                 &retryAt,
+			PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		},
+		"retry-recheck": {
+			IssueNumber: 43,
+			IssueTitle:  "Wait for recheck",
+			Status:      state.StatusPROpen,
+			StartedAt:   now.Add(-30 * time.Minute),
+			PRNumber:    13,
+			RetryCount:  1,
+			RetryReason: state.RetryReasonReviewFeedback,
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("ReviewRetry", "/tmp/review-retry.yaml", "", &config.Config{
+			Repo:        "owner/review-retry",
+			StateDir:    stateDir,
+			MaxParallel: 2,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	backoff := findFleetWorker(t, resp.Workers, "retry-backoff")
+	if backoff.DisplayStatus != string(state.DisplayReviewRetryBackoff) {
+		t.Fatalf("backoff display_status = %q, want review retry backoff", backoff.DisplayStatus)
+	}
+	if backoff.NeedsAttention {
+		t.Fatal("review retry backoff should not need fleet attention")
+	}
+	if !contains(backoff.StatusReason, "waiting for the retry backoff") || !contains(backoff.NextAction, "scheduled retry worker") {
+		t.Fatalf("backoff why = %q / %q, want retry worker wording", backoff.StatusReason, backoff.NextAction)
+	}
+
+	recheck := findFleetWorker(t, resp.Workers, "retry-recheck")
+	if recheck.DisplayStatus != string(state.DisplayReviewRetryRecheck) {
+		t.Fatalf("recheck display_status = %q, want review retry recheck", recheck.DisplayStatus)
+	}
+	if !contains(recheck.StatusReason, "waiting for CI, Greptile, or the merge gate") {
+		t.Fatalf("recheck status_reason = %q, want CI/Greptile/merge gate wording", recheck.StatusReason)
+	}
+
+	project := findFleetProject(t, resp.Projects, "ReviewRetry")
+	if project.Failed != 0 || resp.Summary.Failed != 0 {
+		t.Fatalf("failed counts = project %d fleet %d, want review retry excluded", project.Failed, resp.Summary.Failed)
+	}
+	if project.NeedsAttention != 0 || resp.Summary.NeedsAttention != 0 {
+		t.Fatalf("attention counts = project %d fleet %d, want none", project.NeedsAttention, resp.Summary.NeedsAttention)
+	}
+}
+
 func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

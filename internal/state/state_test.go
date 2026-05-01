@@ -784,6 +784,136 @@ func TestSessionAttentionFor_RunningWorkerAliveDoesNotNeedAttention(t *testing.T
 	}
 }
 
+func TestSessionDisplayStatusFor_ReviewFeedbackRetryLifecycle(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	future := now.Add(5 * time.Minute)
+	past := now.Add(-time.Minute)
+	alive := true
+
+	tests := []struct {
+		name string
+		sess *Session
+		want string
+	}{
+		{
+			name: "backoff",
+			sess: &Session{
+				Status:                      StatusDead,
+				NextRetryAt:                 &future,
+				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+			},
+			want: string(DisplayReviewRetryBackoff),
+		},
+		{
+			name: "pending retry worker",
+			sess: &Session{
+				Status:                      StatusDead,
+				NextRetryAt:                 &past,
+				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+			},
+			want: string(DisplayReviewRetryPending),
+		},
+		{
+			name: "running retry worker",
+			sess: &Session{
+				Status:      StatusRunning,
+				PID:         1234,
+				RetryReason: RetryReasonReviewFeedback,
+			},
+			want: string(DisplayReviewRetryRunning),
+		},
+		{
+			name: "pending recheck",
+			sess: &Session{
+				Status:      StatusPROpen,
+				PRNumber:    12,
+				RetryReason: RetryReasonReviewFeedback,
+			},
+			want: string(DisplayReviewRetryRecheck),
+		},
+		{
+			name: "genuine dead remains dead",
+			sess: &Session{Status: StatusDead},
+			want: string(StatusDead),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SessionDisplayStatusForAt(tt.sess, &alive, now)
+			if got != tt.want {
+				t.Fatalf("display status = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSessionDisplayStatusFor_StaleReviewRetryWorkerStaysRunning(t *testing.T) {
+	alive := false
+	sess := &Session{
+		Status:      StatusRunning,
+		PID:         999999,
+		RetryReason: RetryReasonReviewFeedback,
+	}
+
+	got := SessionDisplayStatusForAt(sess, &alive, time.Now().UTC())
+	if got != string(StatusRunning) {
+		t.Fatalf("display status = %q, want raw running for stale worker", got)
+	}
+	attention := SessionAttentionForAt(sess, &alive, time.Now().UTC())
+	if !attention.NeedsAttention || !containsString(attention.Reason, "PID is not alive") {
+		t.Fatalf("attention = %+v, want stale PID attention", attention)
+	}
+}
+
+func TestSessionAttentionFor_ReviewFeedbackRetryCopy(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	future := now.Add(5 * time.Minute)
+
+	tests := []struct {
+		name       string
+		sess       *Session
+		wantReason string
+		wantAction string
+	}{
+		{
+			name: "backoff",
+			sess: &Session{
+				Status:                      StatusDead,
+				NextRetryAt:                 &future,
+				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+			},
+			wantReason: "waiting for the retry backoff",
+			wantAction: "scheduled retry worker",
+		},
+		{
+			name: "pending recheck",
+			sess: &Session{
+				Status:      StatusPROpen,
+				PRNumber:    12,
+				RetryReason: RetryReasonReviewFeedback,
+			},
+			wantReason: "waiting for CI, Greptile, or the merge gate",
+			wantAction: "merge gate allows it",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attention := SessionAttentionForAt(tt.sess, nil, now)
+			if attention.NeedsAttention {
+				t.Fatalf("review retry lifecycle should not need attention: %+v", attention)
+			}
+			if !containsString(attention.Reason, tt.wantReason) {
+				t.Fatalf("reason = %q, want %q", attention.Reason, tt.wantReason)
+			}
+			if !containsString(attention.NextAction, tt.wantAction) {
+				t.Fatalf("next action = %q, want %q", attention.NextAction, tt.wantAction)
+			}
+		})
+	}
+}
+
 func TestCountByStatus(t *testing.T) {
 	s := NewState()
 	s.Sessions["slot-1"] = &Session{IssueNumber: 1, Status: StatusRunning}

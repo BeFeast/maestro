@@ -206,6 +206,7 @@ type sessionInfo struct {
 	IssueTitle        string          `json:"issue_title"`
 	IssueURL          string          `json:"issue_url,omitempty"`
 	Status            string          `json:"status"`
+	DisplayStatus     string          `json:"display_status,omitempty"`
 	StatusReason      string          `json:"status_reason,omitempty"`
 	NextAction        string          `json:"next_action,omitempty"`
 	NeedsAttention    bool            `json:"needs_attention,omitempty"`
@@ -270,6 +271,9 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		info.NextRetryAt = sess.NextRetryAt.Format(time.RFC3339)
 	}
 	attention := state.SessionAttentionFor(sess, info.Alive)
+	if displayStatus := state.SessionDisplayStatusFor(sess, info.Alive); displayStatus != "" && displayStatus != info.Status {
+		info.DisplayStatus = displayStatus
+	}
 	info.StatusReason = attention.Reason
 	info.NextAction = attention.NextAction
 	info.NeedsAttention = attention.NeedsAttention
@@ -630,7 +634,11 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 	var activeTokens, totalTokens int
 	for _, info := range sessionInfosWithActions(cfg.Repo, st, cfg.Server.ReadOnly, "/api/v1/actions") {
 		resp.All = append(resp.All, info)
-		resp.Summary[info.Status]++
+		summaryStatus := info.Status
+		if info.DisplayStatus != "" {
+			summaryStatus = info.DisplayStatus
+		}
+		resp.Summary[summaryStatus]++
 		totalTokens += info.TokensUsedTotal
 
 		switch state.SessionStatus(info.Status) {
@@ -1067,9 +1075,11 @@ const dashboardHTML = `<!DOCTYPE html>
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .s-running { color: var(--ok); border-color: rgba(63,185,80,.42); }
+  .s-running, .s-review_retry_running { color: var(--ok); border-color: rgba(63,185,80,.42); }
   .s-pr_open { color: var(--warn); border-color: rgba(210,153,34,.48); }
   .s-queued { color: var(--queued); border-color: rgba(163,113,247,.5); }
+  .s-review_retry_backoff, .s-review_retry_pending { color: var(--queued); border-color: rgba(163,113,247,.5); }
+  .s-review_retry_recheck { color: var(--warn); border-color: rgba(210,153,34,.48); }
   .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.5); }
   .s-done { color: var(--muted); }
   .pill-attention { color: var(--bad); border-color: rgba(248,81,73,.58); }
@@ -1259,8 +1269,12 @@ const state = {
 };
 
 const statusRank = {
+  review_retry_running: 0,
   running: 0,
+  review_retry_recheck: 1,
   pr_open: 1,
+  review_retry_pending: 2,
+  review_retry_backoff: 2,
   queued: 2,
   dead: 3,
   failed: 4,
@@ -1393,13 +1407,17 @@ function queueText(queue) {
   return label + ": empty";
 }
 
+function displayStatus(worker) {
+  return worker.display_status || worker.status || "-";
+}
+
 function statusLabel(worker) {
   if (worker.status === "running" && worker.alive === false) return "running stale";
-  return worker.status || "-";
+  return displayStatus(worker);
 }
 
 function pillClass(worker) {
-  const base = "pill s-" + escapeText(worker.status || "unknown");
+  const base = "pill s-" + escapeText(displayStatus(worker) || "unknown");
   if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) {
     return base + " pill-attention";
   }
@@ -1408,7 +1426,7 @@ function pillClass(worker) {
 
 function workerMatches(worker) {
   if (!state.filter) return true;
-  const text = [worker.slot, worker.issue_number, worker.issue_title, worker.status, worker.backend, worker.pr_number]
+  const text = [worker.slot, worker.issue_number, worker.issue_title, worker.status, displayStatus(worker), worker.backend, worker.pr_number]
     .join(" ")
     .toLowerCase();
   return text.includes(state.filter);
@@ -1416,16 +1434,16 @@ function workerMatches(worker) {
 
 function sortWorkers(workers) {
   return [...workers].sort((a, b) => {
-    const ar = statusRank[a.status] ?? 99;
-    const br = statusRank[b.status] ?? 99;
+    const ar = statusRank[displayStatus(a)] ?? 99;
+    const br = statusRank[displayStatus(b)] ?? 99;
     if (ar !== br) return ar - br;
     return String(b.started_at || "").localeCompare(String(a.started_at || ""));
   });
 }
 
 function renderStats(summary, total, maxParallel, readOnly) {
-  const running = summary.running || 0;
-  const prOpen = summary.pr_open || 0;
+  const running = (summary.running || 0) + (summary.review_retry_running || 0);
+  const prOpen = (summary.pr_open || 0) + (summary.review_retry_recheck || 0);
   const failed = (summary.dead || 0) + (summary.failed || 0) + (summary.retry_exhausted || 0) + (summary.conflict_failed || 0);
   const items = [
     ["Running", running + " / " + maxParallel],
