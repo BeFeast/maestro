@@ -491,18 +491,22 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, buildStateResponse(s.cfg, st))
+}
+
+func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 	latestDecision := st.LatestSupervisorDecision()
 	resp := stateResponse{
-		Repo:                s.cfg.Repo,
-		MaxParallel:         s.cfg.MaxParallel,
-		ReadOnly:            s.cfg.Server.ReadOnly,
-		SupervisorPolicy:    s.cfg.Supervisor,
+		Repo:                cfg.Repo,
+		MaxParallel:         cfg.MaxParallel,
+		ReadOnly:            cfg.Server.ReadOnly,
+		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
 		Running:             make([]sessionInfo, 0),
 		PROpen:              make([]sessionInfo, 0),
 		Queued:              make([]sessionInfo, 0),
 		Summary:             make(map[string]int),
-		Supervisor:          buildSupervisorInfo(s.cfg, st),
+		Supervisor:          buildSupervisorInfo(cfg, st),
 		SupervisorLatest:    latestDecision,
 		SupervisorDecisions: st.SupervisorDecisions,
 		Approvals:           st.Approvals,
@@ -512,7 +516,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var activeTokens, totalTokens int
-	for _, info := range allSessionInfos(s.cfg.Repo, st) {
+	for _, info := range allSessionInfos(cfg.Repo, st) {
 		resp.All = append(resp.All, info)
 		resp.Summary[info.Status]++
 		totalTokens += info.TokensUsedTotal
@@ -534,7 +538,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		Total:  totalTokens,
 	}
 
-	writeJSON(w, http.StatusOK, resp)
+	return resp
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {

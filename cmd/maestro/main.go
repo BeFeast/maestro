@@ -73,6 +73,7 @@ Supervise flags:
   maestro supervise reject <approval-or-decision-id>
 
 Serve flags:
+  --fleet string        Path to fleet YAML file for multi-project dashboard
   --host string         Host/interface to bind (default from config, then 127.0.0.1)
   --port int            Port to bind (overrides server.port)
   --read-only           Disable mutating HTTP endpoints (default true)
@@ -575,12 +576,52 @@ func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file")
+	fleetPath := fs.String("fleet", "", "Path to fleet YAML file")
 	host := fs.String("host", "", "Host/interface to bind")
 	port := fs.Int("port", 0, "Port to bind")
 	readOnly := fs.Bool("read-only", true, "Disable mutating HTTP endpoints")
 	fs.Parse(args)
 
-	cfgs := loadConfigs(configs)
+	var cfgs []*config.Config
+	if strings.TrimSpace(*fleetPath) == "" {
+		cfgs = loadConfigs(configs)
+	}
+	if strings.TrimSpace(*fleetPath) != "" || len(cfgs) > 1 {
+		var projects []server.FleetProject
+		var err error
+		if strings.TrimSpace(*fleetPath) != "" {
+			projects, err = server.LoadFleetProjects(*fleetPath)
+			if err != nil {
+				log.Fatalf("load fleet: %v", err)
+			}
+		} else {
+			projects = fleetProjectsFromConfigs(cfgs)
+		}
+		fleetHost := *host
+		if strings.TrimSpace(fleetHost) == "" {
+			fleetHost = "127.0.0.1"
+		}
+		if *port <= 0 {
+			log.Fatalf("serve fleet requires --port")
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			cancel()
+		}()
+
+		log.Printf("serving fleet dashboard — projects=%d addr=%s:%d read_only=%v", len(projects), fleetHost, *port, *readOnly)
+		if err := server.NewFleet(projects, fleetHost, *port, *readOnly).Start(ctx); err != nil {
+			log.Fatalf("serve fleet: %v", err)
+		}
+		return
+	}
+
 	if len(cfgs) != 1 {
 		log.Fatalf("serve requires exactly one config, got %d", len(cfgs))
 	}
@@ -611,6 +652,23 @@ func serveCmd(args []string) {
 	if err := server.New(cfg, refreshCh).Start(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+func fleetProjectsFromConfigs(cfgs []*config.Config) []server.FleetProject {
+	projects := make([]server.FleetProject, 0, len(cfgs))
+	for _, cfg := range cfgs {
+		projects = append(projects, server.NewFleetProject(defaultFleetProjectName(cfg.Repo), cfg.ResolvePath(), "", cfg))
+	}
+	return projects
+}
+
+func defaultFleetProjectName(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return "project"
+	}
+	parts := strings.Split(repo, "/")
+	return parts[len(parts)-1]
 }
 
 func statusCmd(args []string) {
