@@ -1913,6 +1913,8 @@ function renderApprovalInbox() {
   }, {});
   const pending = approvals.filter(isPendingApproval);
   const historical = approvals.filter(approval => !isPendingApproval(approval));
+  const historyDetails = approvalListEl.querySelector(".approval-history");
+  const historyWasOpen = historyDetails ? historyDetails.open : false;
   approvalListEl.classList.toggle("approval-list-compact", pending.length === 0);
   approvalSummaryEl.textContent = approvalInboxSummaryText(pending.length, historical.length);
 
@@ -1920,7 +1922,7 @@ function renderApprovalInbox() {
     ? '<div class="approval-active-list">' + pending.map(approvalCardHTML).join("") + '</div>'
     : '<div class="empty approval-empty approval-active-empty">No pending approvals need review.</div>';
   const historyHTML = historical.length
-    ? '<details class="approval-history"><summary><strong>Audit history</strong><span>' + escapeText(approvalHistoryCountText(counts, historical.length)) + '</span></summary>' +
+    ? '<details class="approval-history"' + (historyWasOpen ? ' open' : '') + '><summary><strong>Audit history</strong><span>' + escapeText(approvalHistoryCountText(counts, historical.length)) + '</span></summary>' +
       '<div class="approval-history-list">' + historical.map(approvalCardHTML).join("") + '</div></details>'
     : '';
   approvalListEl.innerHTML = activeHTML + historyHTML;
