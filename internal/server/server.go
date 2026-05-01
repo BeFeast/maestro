@@ -177,12 +177,14 @@ type tokenTotalsInfo struct {
 type controlAction struct {
 	ID               string `json:"id"`
 	Label            string `json:"label"`
+	Description      string `json:"description,omitempty"`
 	Scope            string `json:"scope"`
 	Target           string `json:"target,omitempty"`
 	IssueNumber      int    `json:"issue_number,omitempty"`
 	PRNumber         int    `json:"pr_number,omitempty"`
 	Mutating         bool   `json:"mutating"`
 	RequiresApproval bool   `json:"requires_approval"`
+	ApprovalPolicy   string `json:"approval_policy,omitempty"`
 	Disabled         bool   `json:"disabled"`
 	DisabledReason   string `json:"disabled_reason,omitempty"`
 	Method           string `json:"method,omitempty"`
@@ -535,11 +537,13 @@ func sessionInfosWithActions(repo string, st *state.State, readOnly bool, endpoi
 	return infos
 }
 
-func projectActionAffordances(readOnly bool, endpoint string) []controlAction {
+const controlApprovalPolicyManual = "manual_approval_required"
+
+func projectActionAffordances(readOnly bool, endpoint, target string) []controlAction {
 	reason := controlActionDisabledReason(readOnly)
 	return []controlAction{
-		newControlAction("mark_issue_ready", "Mark issue ready", "project", "", 0, 0, endpoint, reason),
-		newControlAction("mark_issue_blocked", "Mark issue blocked", "project", "", 0, 0, endpoint, reason),
+		newControlAction("mark_issue_ready", "Mark ready", "Would mark a selected issue ready for Maestro.", "project", target, 0, 0, endpoint, reason),
+		newControlAction("mark_issue_blocked", "Mark blocked", "Would mark a selected issue blocked for Maestro.", "project", target, 0, 0, endpoint, reason),
 	}
 }
 
@@ -547,27 +551,31 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 	reason := controlActionDisabledReason(readOnly)
 	mergeReason := reason
 	if !readOnly && worker.PRNumber == 0 {
-		mergeReason = "No PR is associated with this worker; merge approval will require approval-backed controls."
+		mergeReason = "No PR is associated with this worker; merge approval will require approval-backed controls after a PR exists."
+	} else if readOnly && worker.PRNumber == 0 {
+		mergeReason = reason + " This worker has no PR to approve."
 	}
 	return []controlAction{
-		newControlAction("restart_worker", "Restart worker", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("stop_worker", "Stop worker", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("mark_issue_ready", "Mark issue ready", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("mark_issue_blocked", "Mark issue blocked", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("approve_merge", "Approve merge", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, mergeReason),
+		newControlAction("restart_worker", "Restart", "Would restart this worker in place.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("stop_worker", "Stop", "Would stop this worker session.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("mark_issue_ready", "Mark ready", "Would mark this issue ready for Maestro.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("mark_issue_blocked", "Mark blocked", "Would mark this issue blocked for Maestro.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("approve_merge", "Approve merge", "Would approve merge for this PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, mergeReason),
 	}
 }
 
-func newControlAction(id, label, scope, target string, issueNumber, prNumber int, endpoint, disabledReason string) controlAction {
+func newControlAction(id, label, description, scope, target string, issueNumber, prNumber int, endpoint, disabledReason string) controlAction {
 	return controlAction{
 		ID:               id,
 		Label:            label,
+		Description:      description,
 		Scope:            scope,
 		Target:           target,
 		IssueNumber:      issueNumber,
 		PRNumber:         prNumber,
 		Mutating:         true,
 		RequiresApproval: true,
+		ApprovalPolicy:   controlApprovalPolicyManual,
 		Disabled:         true,
 		DisabledReason:   disabledReason,
 		Method:           http.MethodPost,
@@ -577,7 +585,7 @@ func newControlAction(id, label, scope, target string, issueNumber, prNumber int
 
 func controlActionDisabledReason(readOnly bool) string {
 	if readOnly {
-		return "Read-only mode: write actions require approval-backed controls to be enabled in configuration."
+		return "Read-only mode keeps write actions disabled until approval-backed controls are configured."
 	}
 	return "Approval-backed controls are not implemented yet."
 }
@@ -603,7 +611,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		Repo:                cfg.Repo,
 		MaxParallel:         cfg.MaxParallel,
 		ReadOnly:            cfg.Server.ReadOnly,
-		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions"),
+		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions", cfg.Repo),
 		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
 		Running:             make([]sessionInfo, 0),
@@ -1139,21 +1147,36 @@ const dashboardHTML = `<!DOCTYPE html>
   .supervisor-reasons li { margin: 2px 0; }
   .supervisor-approval, .action-btn {
     height: 24px;
+    max-width: 150px;
     border: 1px solid rgba(210,153,34,.45);
     border-radius: 6px;
     background: rgba(210,153,34,.08);
     color: var(--warn);
     cursor: not-allowed;
+    overflow: hidden;
+    padding: 0 8px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .worker-actions {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 8px;
     flex-wrap: wrap;
     margin-top: 8px;
   }
   .worker-actions span { color: var(--text); font-weight: 650; }
   .action-list { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+  .action-item { min-width: 134px; max-width: 210px; }
+  .action-detail {
+    display: grid;
+    gap: 2px;
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.3;
+  }
+  .action-detail strong { color: var(--text); font-weight: 650; }
   .action-note { margin-top: 6px; color: var(--muted); }
   .supervisor-empty { color: var(--muted); }
   pre {
@@ -1306,19 +1329,43 @@ function actionDisabledReason(actions) {
   return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
 }
 
-function renderActionButtons(actions) {
+function actionTargetText(action) {
+  const parts = [];
+  if (action.target) parts.push(action.target);
+  if (action.issue_number) parts.push("issue #" + action.issue_number);
+  if (action.pr_number) parts.push("PR #" + action.pr_number);
+  return parts.length ? parts.join(" · ") : "project";
+}
+
+function actionPolicyText(action) {
+  if (action.approval_policy) return actionLabel(action.approval_policy);
+  return action.requires_approval ? "manual approval required" : "none";
+}
+
+function actionDetailHTML(action) {
+  const description = action.description ? '<div><strong>Would</strong> ' + escapeText(action.description) + '</div>' : "";
+  return '<div class="action-detail">' + description +
+    '<div><strong>Scope</strong> ' + escapeText(actionLabel(action.scope || "unknown")) + '</div>' +
+    '<div><strong>Target</strong> ' + escapeText(actionTargetText(action)) + '</div>' +
+    '<div><strong>Approval</strong> ' + escapeText(actionPolicyText(action)) + '</div>' +
+    '<div><strong>Disabled</strong> ' + escapeText(action.disabled_reason || "Write action unavailable") + '</div>' +
+    '</div>';
+}
+
+function renderActionButtons(actions, showDetails) {
   const items = actions || [];
   if (!items.length) return "";
   return '<div class="action-list">' + items.map(action =>
-    '<button type="button" class="action-btn" disabled aria-disabled="true" title="' +
+    '<div class="action-item"><button type="button" class="action-btn" disabled aria-disabled="true" title="' +
     escapeText(action.disabled_reason || "Write action unavailable") + '">' +
-    escapeText(action.label || actionLabel(action.id)) + '</button>'
+    escapeText(action.label || actionLabel(action.id)) + '</button>' +
+    (showDetails ? actionDetailHTML(action) : "") + '</div>'
   ).join("") + '</div>';
 }
 
 function renderWorkerActions(actions) {
   if (!actions || !actions.length) return "";
-  return '<div class="worker-actions"><span>Actions</span>' + renderActionButtons(actions) + '</div>' +
+  return '<div class="worker-actions"><span>Actions</span>' + renderActionButtons(actions, true) + '</div>' +
     '<div class="action-note">' + escapeText(actionDisabledReason(actions)) + '</div>';
 }
 

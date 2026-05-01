@@ -211,6 +211,9 @@ func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
 	workerWithoutPR := findSessionInfo(t, resp.All, "slot-1")
 	approveWithoutPR := findControlAction(t, workerWithoutPR.Actions, "approve_merge")
 	assertReadOnlyAction(t, approveWithoutPR)
+	if !contains(approveWithoutPR.DisabledReason, "no PR") {
+		t.Fatalf("approve_merge without PR reason = %q, want target-specific no-PR explanation", approveWithoutPR.DisabledReason)
+	}
 }
 
 func TestHandleStateSupervisorRationale(t *testing.T) {
@@ -841,8 +844,13 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "issueSummaryHTML") || !contains(body, "issue-main") || !contains(body, "issue-title") {
 		t.Error("dashboard should keep issue links visible while truncating long titles")
 	}
-	if !contains(body, "renderWorkerActions") || !contains(body, "Write actions require approval-backed configuration") {
+	if !contains(body, "renderWorkerActions") || !contains(body, "actionDetailHTML") || !contains(body, "manual approval required") {
 		t.Error("dashboard should render disabled approval-gated action affordances")
+	}
+	for _, want := range []string{"Scope", "Target", "Approval", "Disabled"} {
+		if !contains(body, want) {
+			t.Fatalf("dashboard action guardrails should contain %q", want)
+		}
 	}
 }
 
@@ -1022,8 +1030,30 @@ func findControlAction(t *testing.T, actions []controlAction, id string) control
 
 func assertReadOnlyAction(t *testing.T, action controlAction) {
 	t.Helper()
+	wantLabels := map[string]string{
+		"restart_worker":     "Restart",
+		"stop_worker":        "Stop",
+		"mark_issue_ready":   "Mark ready",
+		"mark_issue_blocked": "Mark blocked",
+		"approve_merge":      "Approve merge",
+	}
+	if want, ok := wantLabels[action.ID]; ok && action.Label != want {
+		t.Fatalf("action %s label = %q, want %q", action.ID, action.Label, want)
+	}
+	if len(action.Label) > len("Approve merge") {
+		t.Fatalf("action %s label = %q, want concise non-wrapping label", action.ID, action.Label)
+	}
+	if action.Description == "" {
+		t.Fatalf("action %+v should describe the disabled operation", action)
+	}
+	if action.Scope == "" || action.Target == "" {
+		t.Fatalf("action %+v should include scope and target metadata", action)
+	}
 	if !action.Mutating || !action.RequiresApproval {
 		t.Fatalf("action %+v should be mutating and approval-required", action)
+	}
+	if action.ApprovalPolicy != controlApprovalPolicyManual {
+		t.Fatalf("approval policy = %q, want %q", action.ApprovalPolicy, controlApprovalPolicyManual)
 	}
 	if !action.Disabled {
 		t.Fatalf("action %+v should be disabled", action)

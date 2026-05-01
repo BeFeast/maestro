@@ -156,6 +156,9 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 	for _, action := range resp.Projects[0].Actions {
 		assertFleetReadOnlyAction(t, action)
+		if action.Target != "One" {
+			t.Fatalf("project action target = %q, want project name One", action.Target)
+		}
 	}
 	attentionWorker := findFleetWorker(t, resp.Workers, "two-1")
 	if !attentionWorker.NeedsAttention {
@@ -883,6 +886,12 @@ func TestFleetDashboard(t *testing.T) {
 		"badge-stale",
 		"State error",
 		"renderActions",
+		"actionDetailHTML",
+		"manual approval required",
+		"Scope",
+		"Target",
+		"Approval",
+		"Disabled",
 		"Approval-gated controls",
 	} {
 		if !contains(body, want) {
@@ -970,8 +979,30 @@ func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Ses
 
 func assertFleetReadOnlyAction(t *testing.T, action controlAction) {
 	t.Helper()
+	wantLabels := map[string]string{
+		"restart_worker":     "Restart",
+		"stop_worker":        "Stop",
+		"mark_issue_ready":   "Mark ready",
+		"mark_issue_blocked": "Mark blocked",
+		"approve_merge":      "Approve merge",
+	}
+	if want, ok := wantLabels[action.ID]; ok && action.Label != want {
+		t.Fatalf("action %s label = %q, want %q", action.ID, action.Label, want)
+	}
+	if len(action.Label) > len("Approve merge") {
+		t.Fatalf("action %s label = %q, want concise non-wrapping label", action.ID, action.Label)
+	}
+	if action.Description == "" {
+		t.Fatalf("action %+v should describe the disabled operation", action)
+	}
+	if action.Scope == "" || action.Target == "" {
+		t.Fatalf("action %+v should include scope and target metadata", action)
+	}
 	if !action.Mutating || !action.RequiresApproval || !action.Disabled {
 		t.Fatalf("action %+v should be disabled mutating approval affordance", action)
+	}
+	if action.ApprovalPolicy != controlApprovalPolicyManual {
+		t.Fatalf("approval policy = %q, want %q", action.ApprovalPolicy, controlApprovalPolicyManual)
 	}
 	if !contains(action.DisabledReason, "Read-only mode") {
 		t.Fatalf("disabled reason = %q, want read-only explanation", action.DisabledReason)
