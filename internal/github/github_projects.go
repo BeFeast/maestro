@@ -32,21 +32,8 @@ type ProjectField struct {
 
 // DiscoverProject finds the GitHub Project board and returns its Status field options.
 func (c *Client) DiscoverProject(projectNumber int) (*ProjectField, error) {
-	org := strings.Split(c.Repo, "/")[0]
-
-	query := fmt.Sprintf(`query {
-		organization(login: %q) {
-			projectV2(number: %d) {
-				id
-				field(name: "Status") {
-					... on ProjectV2SingleSelectField {
-						id
-						options { id name }
-					}
-				}
-			}
-		}
-	}`, org, projectNumber)
+	owner := strings.Split(c.Repo, "/")[0]
+	query := discoverProjectQuery(owner, projectNumber)
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
@@ -55,9 +42,44 @@ func (c *Client) DiscoverProject(projectNumber int) (*ProjectField, error) {
 		return nil, fmt.Errorf("discover project %d: %w", projectNumber, err)
 	}
 
+	pf, err := parseDiscoverProjectResponse(owner, projectNumber, out)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("[projects] discovered project %d for %s: %d status options (%v)", projectNumber, owner, len(pf.Options), keys(pf.Options))
+	return pf, nil
+}
+
+func discoverProjectQuery(owner string, projectNumber int) string {
+	projectFields := `{
+				id
+				field(name: "Status") {
+					... on ProjectV2SingleSelectField {
+						id
+						options { id name }
+					}
+				}
+			}`
+
+	return fmt.Sprintf(`query {
+		repositoryOwner(login: %q) {
+			__typename
+			... on User {
+				projectV2(number: %d) %s
+			}
+			... on Organization {
+				projectV2(number: %d) %s
+			}
+		}
+	}`, owner, projectNumber, projectFields, projectNumber, projectFields)
+}
+
+func parseDiscoverProjectResponse(owner string, projectNumber int, out []byte) (*ProjectField, error) {
 	var result struct {
 		Data struct {
-			Organization struct {
+			RepositoryOwner struct {
+				Typename  string `json:"__typename"`
 				ProjectV2 struct {
 					ID    string `json:"id"`
 					Field struct {
@@ -68,16 +90,16 @@ func (c *Client) DiscoverProject(projectNumber int) (*ProjectField, error) {
 						} `json:"options"`
 					} `json:"field"`
 				} `json:"projectV2"`
-			} `json:"organization"`
+			} `json:"repositoryOwner"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		return nil, fmt.Errorf("parse project response: %w", err)
 	}
 
-	p := result.Data.Organization.ProjectV2
+	p := result.Data.RepositoryOwner.ProjectV2
 	if p.ID == "" {
-		return nil, fmt.Errorf("project %d not found", projectNumber)
+		return nil, fmt.Errorf("project %d not found for owner %q", projectNumber, owner)
 	}
 
 	pf := &ProjectField{
@@ -89,7 +111,6 @@ func (c *Client) DiscoverProject(projectNumber int) (*ProjectField, error) {
 		pf.Options[opt.Name] = opt.ID
 	}
 
-	log.Printf("[projects] discovered project %d: %d status options (%v)", projectNumber, len(pf.Options), keys(pf.Options))
 	return pf, nil
 }
 
