@@ -733,6 +733,57 @@ func TestMarkIssueRetryExhausted_NoSessions(t *testing.T) {
 	s.MarkIssueRetryExhausted(42)
 }
 
+func TestSessionAttentionFor_RetryExhaustedPRWithFailedChecks(t *testing.T) {
+	sess := &Session{
+		Status:          StatusRetryExhausted,
+		PRNumber:        12,
+		CIFailureOutput: "unit tests failed",
+	}
+
+	attention := SessionAttentionFor(sess, nil)
+	if !attention.NeedsAttention {
+		t.Fatal("retry-exhausted PR with failed checks should need attention")
+	}
+	if !containsString(attention.Reason, "checks failed") {
+		t.Fatalf("reason = %q, want failed checks", attention.Reason)
+	}
+	if !containsString(attention.Reason, "PR #12 remains open") {
+		t.Fatalf("reason = %q, want open PR", attention.Reason)
+	}
+	if !containsString(attention.NextAction, "Fix failing checks") {
+		t.Fatalf("next action = %q, want fix checks", attention.NextAction)
+	}
+}
+
+func TestSessionAttentionFor_StaleRunningWorker(t *testing.T) {
+	alive := false
+	sess := &Session{Status: StatusRunning, PID: 999999}
+
+	attention := SessionAttentionFor(sess, &alive)
+	if !attention.NeedsAttention {
+		t.Fatal("running worker with alive=false should need attention")
+	}
+	if !containsString(attention.Reason, "PID is not alive") {
+		t.Fatalf("reason = %q, want dead PID explanation", attention.Reason)
+	}
+	if !containsString(attention.NextAction, "reconciliation cycle") {
+		t.Fatalf("next action = %q, want reconciliation guidance", attention.NextAction)
+	}
+}
+
+func TestSessionAttentionFor_RunningWorkerAliveDoesNotNeedAttention(t *testing.T) {
+	alive := true
+	sess := &Session{Status: StatusRunning, PID: 1234}
+
+	attention := SessionAttentionFor(sess, &alive)
+	if attention.NeedsAttention {
+		t.Fatal("running worker with alive=true should not need attention")
+	}
+	if attention.NextAction != "" {
+		t.Fatalf("next action = %q, want empty for healthy running worker", attention.NextAction)
+	}
+}
+
 func TestCountByStatus(t *testing.T) {
 	s := NewState()
 	s.Sessions["slot-1"] = &Session{IssueNumber: 1, Status: StatusRunning}

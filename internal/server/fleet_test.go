@@ -69,10 +69,12 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	})
 	saveFleetTestState(t, secondStateDir, map[string]*state.Session{
 		"two-1": {
-			IssueNumber: 3,
-			IssueTitle:  "Broken thing",
-			Status:      state.StatusRetryExhausted,
-			StartedAt:   now.Add(-3 * time.Minute),
+			IssueNumber:     3,
+			IssueTitle:      "Broken thing",
+			Status:          state.StatusRetryExhausted,
+			StartedAt:       now.Add(-3 * time.Minute),
+			PRNumber:        31,
+			CIFailureOutput: "tests failed",
 		},
 	})
 
@@ -105,6 +107,15 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if resp.Summary.Projects != 2 || resp.Summary.Running != 1 || resp.Summary.PROpen != 1 || resp.Summary.Failed != 1 || resp.Summary.Sessions != 3 || resp.Summary.NeedsAttention != 2 {
 		t.Fatalf("unexpected summary: %+v", resp.Summary)
 	}
+	visibleAttention := 0
+	for _, worker := range resp.Workers {
+		if worker.NeedsAttention {
+			visibleAttention++
+		}
+	}
+	if resp.Summary.NeedsAttention != visibleAttention {
+		t.Fatalf("summary attention = %d, visible attention rows = %d", resp.Summary.NeedsAttention, visibleAttention)
+	}
 	if resp.Projects[0].Name != "One" {
 		t.Fatalf("first project = %q, want One", resp.Projects[0].Name)
 	}
@@ -130,6 +141,15 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	attentionWorker := findFleetWorker(t, resp.Workers, "two-1")
 	if !attentionWorker.NeedsAttention {
 		t.Fatal("retry-exhausted worker should need attention")
+	}
+	if !contains(attentionWorker.StatusReason, "checks failed") || !contains(attentionWorker.StatusReason, "PR #31 remains open") {
+		t.Fatalf("attention status_reason = %q, want failed checks and open PR", attentionWorker.StatusReason)
+	}
+	if !contains(attentionWorker.NextAction, "Fix failing checks") {
+		t.Fatalf("attention next_action = %q, want fix checks guidance", attentionWorker.NextAction)
+	}
+	if resp.Projects[1].NeedsAttention != len(resp.Projects[1].Attention) {
+		t.Fatalf("project attention count = %d, reasons = %d", resp.Projects[1].NeedsAttention, len(resp.Projects[1].Attention))
 	}
 }
 
@@ -371,7 +391,7 @@ func TestFleetDashboard(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
-	for _, want := range []string{"Maestro Fleet", "/api/v1/fleet", "/api/v1/fleet/worker", "project-tabs", "fleet-workers-body", "worker-detail", "renderFleetWorkers", "renderWorkerDetail", "renderProject"} {
+	for _, want := range []string{"Maestro Fleet", "/api/v1/fleet", "/api/v1/fleet/worker", "project-tabs", "fleet-workers-body", "worker-detail", "renderFleetWorkers", "renderWorkerDetail", "renderProject", "Why Attention", "Why Not Running", "next_action"} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard should contain %q", want)
 		}

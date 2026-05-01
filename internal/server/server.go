@@ -178,6 +178,7 @@ type sessionInfo struct {
 	IssueURL          string `json:"issue_url,omitempty"`
 	Status            string `json:"status"`
 	StatusReason      string `json:"status_reason,omitempty"`
+	NextAction        string `json:"next_action,omitempty"`
 	NeedsAttention    bool   `json:"needs_attention,omitempty"`
 	Backend           string `json:"backend,omitempty"`
 	PRNumber          int    `json:"pr_number,omitempty"`
@@ -235,7 +236,10 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	if sess.NextRetryAt != nil {
 		info.NextRetryAt = sess.NextRetryAt.Format(time.RFC3339)
 	}
-	info.StatusReason, info.NeedsAttention = sessionStatusReason(sess, info.Alive)
+	attention := state.SessionAttentionFor(sess, info.Alive)
+	info.StatusReason = attention.Reason
+	info.NextAction = attention.NextAction
+	info.NeedsAttention = attention.NeedsAttention
 
 	return info
 }
@@ -414,44 +418,6 @@ func validGitHubRepo(repo string) bool {
 	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
 }
 
-func sessionStatusReason(sess *state.Session, alive *bool) (string, bool) {
-	switch sess.Status {
-	case state.StatusRunning:
-		if alive != nil && !*alive {
-			return "State says running, but the worker PID is not alive. Maestro should reconcile it on the next cycle.", true
-		}
-		if sess.PID == 0 {
-			return "Worker is marked running, but no PID is recorded.", true
-		}
-		return "Worker process is alive and writing to its session log.", false
-	case state.StatusPROpen:
-		if sess.PRNumber > 0 {
-			return "PR is open; Maestro is waiting for CI, review gate, merge interval, or conflict handling.", false
-		}
-		return "Session is waiting on an open PR, but no PR number is recorded yet.", true
-	case state.StatusQueued:
-		return "Worker is queued for follow-up processing before it can be merged.", false
-	case state.StatusDead:
-		if sess.NextRetryAt != nil {
-			return "Worker exited; a retry is scheduled after the current backoff.", true
-		}
-		return "Worker exited and is waiting for retry or reconciliation.", true
-	case state.StatusRetryExhausted:
-		if sess.PRNumber > 0 {
-			return "Retry limit exhausted with a PR still open; Maestro can still merge it when checks and review gates pass, but action is needed if checks fail or actionable review feedback remains.", true
-		}
-		return "Retry limit exhausted before a usable PR was produced.", true
-	case state.StatusFailed:
-		return "Worker failed after the configured retry policy.", true
-	case state.StatusConflictFailed:
-		return "Automatic conflict resolution failed; the branch needs manual rebase/conflict handling.", true
-	case state.StatusDone:
-		return "Issue is complete; PR merged or issue was closed and the session is terminal.", false
-	default:
-		return "Session is waiting for the next Maestro reconciliation cycle.", false
-	}
-}
-
 func watchSessionName(slot string, sess *state.Session) string {
 	if strings.TrimSpace(sess.TmuxSession) != "" {
 		return sess.TmuxSession
@@ -464,6 +430,7 @@ func allSessionInfos(repo string, st *state.State) []sessionInfo {
 	for slot, sess := range st.Sessions {
 		infos = append(infos, makeSessionInfo(repo, slot, sess))
 	}
+	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	sort.Slice(infos, func(i, j int) bool {
 		left, right := infos[i], infos[j]
 		li := state.StatusPriority(state.SessionStatus(left.Status))
@@ -477,6 +444,55 @@ func allSessionInfos(repo string, st *state.State) []sessionInfo {
 		return left.Slot < right.Slot
 	})
 	return infos
+}
+
+func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecision) {
+	if latest == nil || len(latest.StuckStates) == 0 {
+		return
+	}
+	for i := range infos {
+		for _, stuck := range latest.StuckStates {
+			if !stuckTargetsSession(stuck, infos[i]) {
+				continue
+			}
+			attention := supervisorStuckNeedsAttention(stuck)
+			if !attention {
+				continue
+			}
+			if strings.TrimSpace(stuck.Summary) != "" {
+				infos[i].StatusReason = stuck.Summary
+			}
+			if strings.TrimSpace(stuck.RecommendedAction) != "" {
+				infos[i].NextAction = stuck.RecommendedAction
+			}
+			if attention {
+				infos[i].NeedsAttention = true
+			}
+			break
+		}
+	}
+}
+
+func stuckTargetsSession(stuck state.SupervisorStuckState, info sessionInfo) bool {
+	target := stuck.Target
+	if target == nil {
+		return false
+	}
+	if session := strings.TrimSpace(target.Session); session != "" {
+		return session == info.Slot
+	}
+	if target.PR > 0 && target.PR == info.PRNumber {
+		return true
+	}
+	return target.Issue > 0 && target.Issue == info.IssueNumber
+}
+
+func supervisorStuckNeedsAttention(stuck state.SupervisorStuckState) bool {
+	switch stuck.Code {
+	case "retry_exhausted", "retry_exhausted_open_pr", "dead_running_pid", "stale_worker_logs", "worker_timeout", "failing_checks", "closed_pr_with_active_session", "unmergeable_pr", "stale_review_feedback", "greptile_not_approved":
+		return true
+	}
+	return stuck.Severity == "blocked"
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -1308,8 +1324,9 @@ function renderSelectedDetails() {
   if (worker.issue_url) links.push(linkHTML(worker.issue_url, "Issue #" + worker.issue_number));
   if (worker.pr_url) links.push(linkHTML(worker.pr_url, "PR #" + worker.pr_number));
   const retry = worker.next_retry_at ? " Next retry: " + worker.next_retry_at + "." : "";
+  const next = worker.next_action ? " Next: " + worker.next_action : "";
   statusNoteEl.innerHTML = '<strong>Why</strong>' +
-    escapeText((worker.status_reason || "Waiting for next reconciliation cycle.") + retry) +
+    escapeText((worker.status_reason || "Waiting for next reconciliation cycle.") + retry + next) +
     (links.length ? '<span class="links">' + links.join("") + '</span>' : "");
   statusNoteEl.classList.add("visible");
 }
