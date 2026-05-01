@@ -549,6 +549,54 @@ func TestRunOnceRecordsPendingApprovalForRiskyDecision(t *testing.T) {
 	}
 }
 
+func TestRunOnceDecisionSurvivesStaleRunLoopSave(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	runSnapshot, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load run snapshot: %v", err)
+	}
+
+	reader := &fakeReader{issues: []github.Issue{testIssue(302, "Prevent state lost-update", "maestro-ready")}}
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker || decision.ApprovalID == "" {
+		t.Fatalf("decision = %#v, want approval-gated spawn_worker", decision)
+	}
+
+	runSnapshot.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 17,
+		IssueTitle:  "run-loop reconciliation",
+		Status:      state.StatusRunning,
+		StartedAt:   time.Now().UTC(),
+		PID:         1234,
+	}
+	if err := state.Save(cfg.StateDir, runSnapshot); err != nil {
+		t.Fatalf("Save stale run snapshot: %v", err)
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load merged state: %v", err)
+	}
+	latest := st.LatestSupervisorDecision()
+	if latest == nil || latest.ID != decision.ID || latest.Target == nil || latest.Target.Issue != 302 {
+		t.Fatalf("latest decision = %#v, want decision for issue #302", latest)
+	}
+	approval, ok := st.FindApproval(decision.ApprovalID)
+	if !ok {
+		t.Fatalf("approval %q missing after stale run-loop save", decision.ApprovalID)
+	}
+	if approval.Status != state.ApprovalStatusPending {
+		t.Fatalf("approval status = %q, want pending", approval.Status)
+	}
+	if _, err := st.ApproveApproval(decision.ApprovalID, time.Now().UTC(), "test", "race preserved"); err != nil {
+		t.Fatalf("ApproveApproval after race: %v", err)
+	}
+}
+
 func TestDecide_OrderedQueueAdvancesAfterClosedIssue(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}

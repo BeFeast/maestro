@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 type SessionStatus string
@@ -211,6 +213,7 @@ var (
 	ErrApprovalNotPending      = errors.New("approval is not pending")
 	ErrApprovalStale           = errors.New("approval is stale")
 	ErrApprovalPayloadMismatch = errors.New("approval payload changed")
+	ErrStateConflict           = errors.New("state write conflict")
 )
 
 // SupervisorTarget identifies the primary object a supervisor decision refers to.
@@ -347,6 +350,9 @@ type State struct {
 	Approvals           []Approval           `json:"approvals,omitempty"`
 	NextSlot            int                  `json:"next_slot"`
 	LastMergeAt         time.Time            `json:"last_merge_at,omitempty"`
+
+	loadedHash  string
+	loadedState *State
 }
 
 func NewState() *State {
@@ -369,7 +375,9 @@ func Load(stateDir string) (*State, error) {
 	path := StatePath(stateDir)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return NewState(), nil
+		s := NewState()
+		s.rememberLoaded(nil)
+		return s, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read state: %w", err)
@@ -379,6 +387,8 @@ func Load(stateDir string) (*State, error) {
 	if err := json.Unmarshal(data, s); err != nil {
 		return nil, fmt.Errorf("parse state: %w", err)
 	}
+	s.normalize()
+	s.rememberLoaded(data)
 	return s, nil
 }
 
@@ -386,13 +396,45 @@ func Save(stateDir string, s *State) error {
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
 	}
+	unlock, err := lockState(stateDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
-	data, err := json.MarshalIndent(s, "", "  ")
+	return saveLocked(stateDir, s)
+}
+
+func saveLocked(stateDir string, s *State) error {
+	if s == nil {
+		s = NewState()
+	}
+	s.normalize()
+
+	path := StatePath(stateDir)
+	current, currentData, err := readStateFile(path)
+	if err != nil {
+		return err
+	}
+	currentHash := hashBytes(currentData)
+	desired := s
+	if currentHash != s.loadedHash {
+		base := s.loadedState
+		if base == nil {
+			base = NewState()
+		}
+		merged, err := mergeStateSnapshots(base, current, s)
+		if err != nil {
+			return err
+		}
+		desired = merged
+	}
+
+	data, err := json.MarshalIndent(desired, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 
-	path := StatePath(stateDir)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return fmt.Errorf("write temp state: %w", err)
@@ -400,7 +442,376 @@ func Save(stateDir string, s *State) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("atomic rename state: %w", err)
 	}
+	if desired != s {
+		s.copyFrom(desired)
+	}
+	s.rememberLoaded(data)
 	return nil
+}
+
+func lockState(stateDir string) (func(), error) {
+	lockPath := filepath.Join(stateDir, ".state.lock")
+	stateLock := flock.New(lockPath)
+	if err := stateLock.Lock(); err != nil {
+		return nil, fmt.Errorf("lock state: %w", err)
+	}
+	return func() {
+		_ = stateLock.Unlock()
+	}, nil
+}
+
+func readStateFile(path string) (*State, []byte, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return NewState(), nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("read state: %w", err)
+	}
+	s := NewState()
+	if err := json.Unmarshal(data, s); err != nil {
+		return nil, nil, fmt.Errorf("parse state: %w", err)
+	}
+	s.normalize()
+	return s, data, nil
+}
+
+func (s *State) rememberLoaded(data []byte) {
+	s.loadedHash = hashBytes(data)
+	s.loadedState = cloneState(s)
+}
+
+func hashBytes(data []byte) string {
+	if data == nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *State) normalize() {
+	if s.Sessions == nil {
+		s.Sessions = make(map[string]*Session)
+	}
+	if s.Missions == nil {
+		s.Missions = make(map[int]*Mission)
+	}
+	if s.NextSlot == 0 {
+		s.NextSlot = 1
+	}
+}
+
+func (s *State) copyFrom(src *State) {
+	s.Sessions = src.Sessions
+	s.Missions = src.Missions
+	s.SupervisorDecisions = src.SupervisorDecisions
+	s.Approvals = src.Approvals
+	s.NextSlot = src.NextSlot
+	s.LastMergeAt = src.LastMergeAt
+}
+
+func cloneState(s *State) *State {
+	if s == nil {
+		return NewState()
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return NewState()
+	}
+	clone := NewState()
+	if err := json.Unmarshal(data, clone); err != nil {
+		return NewState()
+	}
+	clone.normalize()
+	return clone
+}
+
+func mergeStateSnapshots(base, current, ours *State) (*State, error) {
+	base = cloneState(base)
+	current = cloneState(current)
+	ours = cloneState(ours)
+	merged := cloneState(current)
+
+	if err := mergeSessions(merged, base, current, ours); err != nil {
+		return nil, err
+	}
+	if err := mergeMissions(merged, base, current, ours); err != nil {
+		return nil, err
+	}
+	if err := mergeApprovals(merged, base, current, ours); err != nil {
+		return nil, err
+	}
+	if err := mergeSupervisorDecisions(merged, base, current, ours); err != nil {
+		return nil, err
+	}
+	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
+	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
+	return merged, nil
+}
+
+func mergeSessions(merged, base, current, ours *State) error {
+	for _, key := range unionKeys(base.Sessions, current.Sessions, ours.Sessions) {
+		baseValue := base.Sessions[key]
+		currentValue := current.Sessions[key]
+		oursValue := ours.Sessions[key]
+		resolved, keep, err := resolveSnapshotValue("session "+key, baseValue, currentValue, oursValue)
+		if err != nil {
+			return err
+		}
+		if keep {
+			merged.Sessions[key] = resolved.(*Session)
+		} else {
+			delete(merged.Sessions, key)
+		}
+	}
+	return nil
+}
+
+func mergeMissions(merged, base, current, ours *State) error {
+	for _, key := range unionIntKeys(base.Missions, current.Missions, ours.Missions) {
+		baseValue := base.Missions[key]
+		currentValue := current.Missions[key]
+		oursValue := ours.Missions[key]
+		resolved, keep, err := resolveSnapshotValue(fmt.Sprintf("mission %d", key), baseValue, currentValue, oursValue)
+		if err != nil {
+			return err
+		}
+		if keep {
+			merged.Missions[key] = resolved.(*Mission)
+		} else {
+			delete(merged.Missions, key)
+		}
+	}
+	return nil
+}
+
+func mergeApprovals(merged, base, current, ours *State) error {
+	merged.Approvals = cloneState(current).Approvals
+	keys := unionStringSets(approvalKeys(base.Approvals), approvalKeys(current.Approvals), approvalKeys(ours.Approvals))
+	for _, key := range keys {
+		baseValue, baseOK := approvalByKey(base.Approvals, key)
+		currentValue, currentOK := approvalByKey(current.Approvals, key)
+		oursValue, oursOK := approvalByKey(ours.Approvals, key)
+		resolved, keep, err := resolveListValue("approval "+key, baseValue, baseOK, currentValue, currentOK, oursValue, oursOK)
+		if err != nil {
+			return err
+		}
+		if keep {
+			merged.Approvals = upsertApproval(merged.Approvals, resolved.(Approval))
+		} else {
+			merged.Approvals = deleteApproval(merged.Approvals, key)
+		}
+	}
+	return nil
+}
+
+func mergeSupervisorDecisions(merged, base, current, ours *State) error {
+	merged.SupervisorDecisions = cloneState(current).SupervisorDecisions
+	keys := unionStringSets(decisionKeys(base.SupervisorDecisions), decisionKeys(current.SupervisorDecisions), decisionKeys(ours.SupervisorDecisions))
+	for _, key := range keys {
+		baseValue, baseOK := decisionByKey(base.SupervisorDecisions, key)
+		currentValue, currentOK := decisionByKey(current.SupervisorDecisions, key)
+		oursValue, oursOK := decisionByKey(ours.SupervisorDecisions, key)
+		resolved, keep, err := resolveListValue("supervisor decision "+key, baseValue, baseOK, currentValue, currentOK, oursValue, oursOK)
+		if err != nil {
+			return err
+		}
+		if keep {
+			merged.SupervisorDecisions = upsertDecision(merged.SupervisorDecisions, resolved.(SupervisorDecision))
+		} else {
+			merged.SupervisorDecisions = deleteDecision(merged.SupervisorDecisions, key)
+		}
+	}
+	if len(merged.SupervisorDecisions) > DefaultSupervisorDecisionLimit {
+		merged.SupervisorDecisions = append([]SupervisorDecision(nil), merged.SupervisorDecisions[len(merged.SupervisorDecisions)-DefaultSupervisorDecisionLimit:]...)
+	}
+	return nil
+}
+
+func resolveSnapshotValue(name string, baseValue, currentValue, oursValue interface{}) (interface{}, bool, error) {
+	baseOK := !jsonEqual(baseValue, nil)
+	currentOK := !jsonEqual(currentValue, nil)
+	oursOK := !jsonEqual(oursValue, nil)
+	return resolveListValue(name, baseValue, baseOK, currentValue, currentOK, oursValue, oursOK)
+}
+
+func resolveListValue(name string, baseValue interface{}, baseOK bool, currentValue interface{}, currentOK bool, oursValue interface{}, oursOK bool) (interface{}, bool, error) {
+	oursChanged := baseOK != oursOK || !jsonEqual(baseValue, oursValue)
+	currentChanged := baseOK != currentOK || !jsonEqual(baseValue, currentValue)
+	switch {
+	case !oursChanged:
+		return currentValue, currentOK, nil
+	case !currentChanged:
+		return oursValue, oursOK, nil
+	case currentOK == oursOK && jsonEqual(currentValue, oursValue):
+		return currentValue, currentOK, nil
+	default:
+		return nil, false, fmt.Errorf("%w: %s changed concurrently", ErrStateConflict, name)
+	}
+}
+
+func jsonEqual(a, b interface{}) bool {
+	return stableHash(a) == stableHash(b)
+}
+
+func mergeMonotonicInt(base, current, ours int) int {
+	if ours == base {
+		return current
+	}
+	if current == base {
+		return ours
+	}
+	if ours > current {
+		return ours
+	}
+	return current
+}
+
+func mergeLatestTime(base, current, ours time.Time) time.Time {
+	if ours.Equal(base) {
+		return current
+	}
+	if current.Equal(base) || ours.After(current) {
+		return ours
+	}
+	return current
+}
+
+func unionKeys(maps ...map[string]*Session) []string {
+	seen := make(map[string]bool)
+	for _, m := range maps {
+		for key := range m {
+			seen[key] = true
+		}
+	}
+	return sortedStringKeys(seen)
+}
+
+func unionIntKeys(maps ...map[int]*Mission) []int {
+	seen := make(map[int]bool)
+	for _, m := range maps {
+		for key := range m {
+			seen[key] = true
+		}
+	}
+	keys := make([]int, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func unionStringSets(sets ...map[string]bool) []string {
+	seen := make(map[string]bool)
+	for _, set := range sets {
+		for key := range set {
+			seen[key] = true
+		}
+	}
+	return sortedStringKeys(seen)
+}
+
+func sortedStringKeys(seen map[string]bool) []string {
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func approvalKeys(approvals []Approval) map[string]bool {
+	keys := make(map[string]bool)
+	for _, approval := range approvals {
+		keys[approvalKey(approval)] = true
+	}
+	return keys
+}
+
+func approvalByKey(approvals []Approval, key string) (Approval, bool) {
+	for _, approval := range approvals {
+		if approvalKey(approval) == key {
+			return approval, true
+		}
+	}
+	return Approval{}, false
+}
+
+func approvalKey(approval Approval) string {
+	if approval.ID != "" {
+		return approval.ID
+	}
+	if approval.DecisionID != "" {
+		return "decision:" + approval.DecisionID
+	}
+	return stableHash(approval)
+}
+
+func upsertApproval(approvals []Approval, approval Approval) []Approval {
+	key := approvalKey(approval)
+	for i := range approvals {
+		if approvalKey(approvals[i]) == key {
+			approvals[i] = approval
+			return approvals
+		}
+	}
+	return append(approvals, approval)
+}
+
+func deleteApproval(approvals []Approval, key string) []Approval {
+	filtered := approvals[:0]
+	for _, approval := range approvals {
+		if approvalKey(approval) != key {
+			filtered = append(filtered, approval)
+		}
+	}
+	return filtered
+}
+
+func decisionKeys(decisions []SupervisorDecision) map[string]bool {
+	keys := make(map[string]bool)
+	for _, decision := range decisions {
+		keys[decisionKey(decision)] = true
+	}
+	return keys
+}
+
+func decisionByKey(decisions []SupervisorDecision, key string) (SupervisorDecision, bool) {
+	for _, decision := range decisions {
+		if decisionKey(decision) == key {
+			return decision, true
+		}
+	}
+	return SupervisorDecision{}, false
+}
+
+func decisionKey(decision SupervisorDecision) string {
+	if decision.ID != "" {
+		return decision.ID
+	}
+	return stableHash(decision)
+}
+
+func upsertDecision(decisions []SupervisorDecision, decision SupervisorDecision) []SupervisorDecision {
+	key := decisionKey(decision)
+	for i := range decisions {
+		if decisionKey(decisions[i]) == key {
+			decisions[i] = decision
+			return decisions
+		}
+	}
+	return append(decisions, decision)
+}
+
+func deleteDecision(decisions []SupervisorDecision, key string) []SupervisorDecision {
+	filtered := decisions[:0]
+	for _, decision := range decisions {
+		if decisionKey(decision) != key {
+			filtered = append(filtered, decision)
+		}
+	}
+	return filtered
 }
 
 // NextSlotName returns "{prefix}-N" for the next available slot
