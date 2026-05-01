@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -168,6 +169,44 @@ func TestHandleState(t *testing.T) {
 	}
 	if len(resp.Supervisor.Latest.StuckReasons) != 1 {
 		t.Fatalf("supervisor latest stuck reasons = %#v, want one", resp.Supervisor.Latest.StuckReasons)
+	}
+}
+
+func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
+	srv, cfg := setupTestServer(t)
+	cfg.Server.ReadOnly = true
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.handleState(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.ReadOnly {
+		t.Fatal("read_only = false, want true")
+	}
+	if len(resp.Actions) != 2 {
+		t.Fatalf("project actions = %d, want 2", len(resp.Actions))
+	}
+	for _, action := range resp.Actions {
+		assertReadOnlyAction(t, action)
+	}
+
+	worker := findSessionInfo(t, resp.All, "slot-2")
+	if len(worker.Actions) != 5 {
+		t.Fatalf("worker actions = %d, want 5", len(worker.Actions))
+	}
+	for _, action := range worker.Actions {
+		assertReadOnlyAction(t, action)
+	}
+	approve := findControlAction(t, worker.Actions, "approve_merge")
+	if approve.PRNumber != 10 {
+		t.Fatalf("approve_merge pr = %d, want 10", approve.PRNumber)
 	}
 }
 
@@ -703,6 +742,63 @@ func TestHandleRefresh_ReadOnly(t *testing.T) {
 	}
 }
 
+func TestHandleAction_ReadOnlyRejectsMutation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:     "test/repo",
+		StateDir: dir,
+		Server:   config.ServerConfig{Port: 8765, ReadOnly: true},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "Fix bug",
+		Status:      state.StatusRunning,
+		StartedAt:   time.Now().UTC(),
+	}
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	before, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state before: %v", err)
+	}
+
+	srv := New(cfg, make(chan struct{}, 1))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/actions", bytes.NewBufferString(`{"action_id":"restart_worker","slot":"slot-1"}`))
+	w := httptest.NewRecorder()
+	srv.handleAction(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if !contains(w.Body.String(), "read-only") {
+		t.Fatalf("response = %q, want read-only explanation", w.Body.String())
+	}
+	after, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("read-only action endpoint changed state")
+	}
+}
+
+func TestHandleAction_NotImplementedWhenWritable(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/actions", bytes.NewBufferString(`{"action_id":"stop_worker","slot":"slot-1"}`))
+	w := httptest.NewRecorder()
+	srv.handleAction(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotImplemented)
+	}
+	if !contains(w.Body.String(), "approval-backed") {
+		t.Fatalf("response = %q, want approval-backed explanation", w.Body.String())
+	}
+}
+
 func TestHandleDashboard(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
@@ -738,6 +834,9 @@ func TestHandleDashboard(t *testing.T) {
 	}
 	if !contains(body, "issue_url") || !contains(body, "pr_url") {
 		t.Error("dashboard should render GitHub issue/PR links from API fields")
+	}
+	if !contains(body, "renderWorkerActions") || !contains(body, "Write actions require approval-backed configuration") {
+		t.Error("dashboard should render disabled approval-gated action affordances")
 	}
 }
 
@@ -891,4 +990,42 @@ func hasTargetLink(links []targetLinkInfo, kind, url string) bool {
 		}
 	}
 	return false
+}
+
+func findSessionInfo(t *testing.T, sessions []sessionInfo, slot string) sessionInfo {
+	t.Helper()
+	for _, session := range sessions {
+		if session.Slot == slot {
+			return session
+		}
+	}
+	t.Fatalf("session %q not found in %+v", slot, sessions)
+	return sessionInfo{}
+}
+
+func findControlAction(t *testing.T, actions []controlAction, id string) controlAction {
+	t.Helper()
+	for _, action := range actions {
+		if action.ID == id {
+			return action
+		}
+	}
+	t.Fatalf("action %q not found in %+v", id, actions)
+	return controlAction{}
+}
+
+func assertReadOnlyAction(t *testing.T, action controlAction) {
+	t.Helper()
+	if !action.Mutating || !action.RequiresApproval {
+		t.Fatalf("action %+v should be mutating and approval-required", action)
+	}
+	if !action.Disabled {
+		t.Fatalf("action %+v should be disabled", action)
+	}
+	if !contains(action.DisabledReason, "Read-only mode") {
+		t.Fatalf("disabled reason = %q, want read-only explanation", action.DisabledReason)
+	}
+	if action.Method != http.MethodPost || action.Endpoint != "/api/v1/actions" {
+		t.Fatalf("action endpoint = %s %s, want POST /api/v1/actions", action.Method, action.Endpoint)
+	}
 }

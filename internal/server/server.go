@@ -47,6 +47,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/workers", s.handleWorkers)
 	mux.HandleFunc("/api/v1/logs/", s.handleLog)
 	mux.HandleFunc("/api/v1/refresh", s.handleRefresh)
+	mux.HandleFunc("/api/v1/actions", s.handleAction)
 	mux.HandleFunc("/api/v1/", s.handleIssue)
 	mux.HandleFunc("/", s.handleDashboard)
 
@@ -97,6 +98,7 @@ type stateResponse struct {
 	Repo                string                       `json:"repo"`
 	MaxParallel         int                          `json:"max_parallel"`
 	ReadOnly            bool                         `json:"read_only"`
+	Actions             []controlAction              `json:"actions,omitempty"`
 	SupervisorPolicy    config.SupervisorConfig      `json:"supervisor_policy"`
 	All                 []sessionInfo                `json:"all"`
 	Running             []sessionInfo                `json:"running"`
@@ -171,33 +173,58 @@ type tokenTotalsInfo struct {
 	Total  int `json:"total"`
 }
 
+type controlAction struct {
+	ID               string `json:"id"`
+	Label            string `json:"label"`
+	Scope            string `json:"scope"`
+	Target           string `json:"target,omitempty"`
+	IssueNumber      int    `json:"issue_number,omitempty"`
+	PRNumber         int    `json:"pr_number,omitempty"`
+	Mutating         bool   `json:"mutating"`
+	RequiresApproval bool   `json:"requires_approval"`
+	Disabled         bool   `json:"disabled"`
+	DisabledReason   string `json:"disabled_reason,omitempty"`
+	Method           string `json:"method,omitempty"`
+	Endpoint         string `json:"endpoint,omitempty"`
+}
+
+type controlActionRequest struct {
+	ActionID    string `json:"action_id"`
+	Project     string `json:"project,omitempty"`
+	Slot        string `json:"slot,omitempty"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+}
+
 type sessionInfo struct {
-	Slot              string `json:"slot"`
-	IssueNumber       int    `json:"issue_number"`
-	IssueTitle        string `json:"issue_title"`
-	IssueURL          string `json:"issue_url,omitempty"`
-	Status            string `json:"status"`
-	StatusReason      string `json:"status_reason,omitempty"`
-	NextAction        string `json:"next_action,omitempty"`
-	NeedsAttention    bool   `json:"needs_attention,omitempty"`
-	Backend           string `json:"backend,omitempty"`
-	PRNumber          int    `json:"pr_number,omitempty"`
-	PRURL             string `json:"pr_url,omitempty"`
-	TokensUsedAttempt int    `json:"tokens_used_attempt"`
-	TokensUsedTotal   int    `json:"tokens_used_total"`
-	Runtime           string `json:"runtime"`
-	RuntimeSeconds    int64  `json:"runtime_seconds"`
-	StartedAt         string `json:"started_at"`
-	FinishedAt        string `json:"finished_at,omitempty"`
-	NextRetryAt       string `json:"next_retry_at,omitempty"`
-	PID               int    `json:"pid,omitempty"`
-	Alive             *bool  `json:"alive,omitempty"`
-	Worktree          string `json:"worktree,omitempty"`
-	Branch            string `json:"branch,omitempty"`
-	TmuxSession       string `json:"tmux_session,omitempty"`
-	HasLog            bool   `json:"has_log"`
-	RetryCount        int    `json:"retry_count,omitempty"`
-	LastNotification  string `json:"last_notification,omitempty"`
+	Slot              string          `json:"slot"`
+	IssueNumber       int             `json:"issue_number"`
+	IssueTitle        string          `json:"issue_title"`
+	IssueURL          string          `json:"issue_url,omitempty"`
+	Status            string          `json:"status"`
+	StatusReason      string          `json:"status_reason,omitempty"`
+	NextAction        string          `json:"next_action,omitempty"`
+	NeedsAttention    bool            `json:"needs_attention,omitempty"`
+	Backend           string          `json:"backend,omitempty"`
+	PRNumber          int             `json:"pr_number,omitempty"`
+	PRURL             string          `json:"pr_url,omitempty"`
+	TokensUsedAttempt int             `json:"tokens_used_attempt"`
+	TokensUsedTotal   int             `json:"tokens_used_total"`
+	Runtime           string          `json:"runtime"`
+	RuntimeSeconds    int64           `json:"runtime_seconds"`
+	StartedAt         string          `json:"started_at"`
+	FinishedAt        string          `json:"finished_at,omitempty"`
+	NextRetryAt       string          `json:"next_retry_at,omitempty"`
+	PID               int             `json:"pid,omitempty"`
+	Alive             *bool           `json:"alive,omitempty"`
+	Worktree          string          `json:"worktree,omitempty"`
+	Branch            string          `json:"branch,omitempty"`
+	TmuxSession       string          `json:"tmux_session,omitempty"`
+	HasLog            bool            `json:"has_log"`
+	RetryCount        int             `json:"retry_count,omitempty"`
+	LastNotification  string          `json:"last_notification,omitempty"`
+	Actions           []controlAction `json:"actions,omitempty"`
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
@@ -498,6 +525,61 @@ func supervisorStuckNeedsAttention(stuck state.SupervisorStuckState) bool {
 	return stuck.Severity == "blocked"
 }
 
+func sessionInfosWithActions(repo string, st *state.State, readOnly bool, endpoint string) []sessionInfo {
+	infos := allSessionInfos(repo, st)
+	for i := range infos {
+		infos[i].Actions = workerActionAffordances(readOnly, endpoint, infos[i])
+	}
+	return infos
+}
+
+func projectActionAffordances(readOnly bool, endpoint string) []controlAction {
+	reason := controlActionDisabledReason(readOnly)
+	return []controlAction{
+		newControlAction("mark_issue_ready", "Mark issue ready", "project", "", 0, 0, endpoint, reason),
+		newControlAction("mark_issue_blocked", "Mark issue blocked", "project", "", 0, 0, endpoint, reason),
+	}
+}
+
+func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {
+	reason := controlActionDisabledReason(readOnly)
+	mergeReason := reason
+	if worker.PRNumber == 0 {
+		mergeReason = "No PR is associated with this worker; merge approval will require approval-backed controls."
+	}
+	return []controlAction{
+		newControlAction("restart_worker", "Restart worker", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("stop_worker", "Stop worker", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("mark_issue_ready", "Mark issue ready", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("mark_issue_blocked", "Mark issue blocked", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
+		newControlAction("approve_merge", "Approve merge", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, mergeReason),
+	}
+}
+
+func newControlAction(id, label, scope, target string, issueNumber, prNumber int, endpoint, disabledReason string) controlAction {
+	return controlAction{
+		ID:               id,
+		Label:            label,
+		Scope:            scope,
+		Target:           target,
+		IssueNumber:      issueNumber,
+		PRNumber:         prNumber,
+		Mutating:         true,
+		RequiresApproval: true,
+		Disabled:         true,
+		DisabledReason:   disabledReason,
+		Method:           http.MethodPost,
+		Endpoint:         endpoint,
+	}
+}
+
+func controlActionDisabledReason(readOnly bool) string {
+	if readOnly {
+		return "Read-only mode: write actions require approval-backed controls to be enabled in configuration."
+	}
+	return "Approval-backed controls are not implemented yet."
+}
+
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -519,6 +601,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		Repo:                cfg.Repo,
 		MaxParallel:         cfg.MaxParallel,
 		ReadOnly:            cfg.Server.ReadOnly,
+		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions"),
 		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
 		Running:             make([]sessionInfo, 0),
@@ -535,7 +618,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 	}
 
 	var activeTokens, totalTokens int
-	for _, info := range allSessionInfos(cfg.Repo, st) {
+	for _, info := range sessionInfosWithActions(cfg.Repo, st, cfg.Server.ReadOnly, "/api/v1/actions") {
 		resp.All = append(resp.All, info)
 		resp.Summary[info.Status]++
 		totalTokens += info.TokensUsedTotal
@@ -572,7 +655,7 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workers := allSessionInfos(s.cfg.Repo, st)
+	workers := sessionInfosWithActions(s.cfg.Repo, st, s.cfg.Server.ReadOnly, "/api/v1/actions")
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"workers": workers,
@@ -617,9 +700,9 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		Sessions:    make([]sessionInfo, 0),
 	}
 
-	for slot, sess := range st.Sessions {
-		if sess.IssueNumber == issueNum {
-			resp.Sessions = append(resp.Sessions, makeSessionInfo(s.cfg.Repo, slot, sess))
+	for _, info := range sessionInfosWithActions(s.cfg.Repo, st, s.cfg.Server.ReadOnly, "/api/v1/actions") {
+		if info.IssueNumber == issueNum {
+			resp.Sessions = append(resp.Sessions, info)
 		}
 	}
 
@@ -765,6 +848,31 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, map[string]string{"status": "refresh already pending"})
 	}
+}
+
+func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
+	handleControlAction(w, r, s.cfg.Server.ReadOnly, "server")
+}
+
+func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, scope string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if readOnly {
+		writeError(w, http.StatusForbidden, scope+" is read-only; write actions require approval-backed controls to be enabled in configuration")
+		return
+	}
+
+	var req controlActionRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode action request: %v", err))
+			return
+		}
+	}
+	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -1010,7 +1118,7 @@ const dashboardHTML = `<!DOCTYPE html>
     padding-left: 16px;
   }
   .supervisor-reasons li { margin: 2px 0; }
-  .supervisor-approval {
+  .supervisor-approval, .action-btn {
     height: 24px;
     border: 1px solid rgba(210,153,34,.45);
     border-radius: 6px;
@@ -1018,6 +1126,16 @@ const dashboardHTML = `<!DOCTYPE html>
     color: var(--warn);
     cursor: not-allowed;
   }
+  .worker-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+  .worker-actions span { color: var(--text); font-weight: 650; }
+  .action-list { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+  .action-note { margin-top: 6px; color: var(--muted); }
   .supervisor-empty { color: var(--muted); }
   pre {
     margin: 0;
@@ -1151,6 +1269,27 @@ function linkHTML(url, label) {
 
 function actionLabel(action) {
   return String(action || "-").replace(/_/g, " ");
+}
+
+function actionDisabledReason(actions) {
+  const action = (actions || []).find(item => item.disabled_reason);
+  return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
+}
+
+function renderActionButtons(actions) {
+  const items = actions || [];
+  if (!items.length) return "";
+  return '<div class="action-list">' + items.map(action =>
+    '<button type="button" class="action-btn" disabled aria-disabled="true" title="' +
+    escapeText(action.disabled_reason || "Write action unavailable") + '">' +
+    escapeText(action.label || actionLabel(action.id)) + '</button>'
+  ).join("") + '</div>';
+}
+
+function renderWorkerActions(actions) {
+  if (!actions || !actions.length) return "";
+  return '<div class="worker-actions"><span>Actions</span>' + renderActionButtons(actions) + '</div>' +
+    '<div class="action-note">' + escapeText(actionDisabledReason(actions)) + '</div>';
 }
 
 function formatTimestamp(value) {
@@ -1330,7 +1469,8 @@ function renderSelectedDetails() {
   const next = worker.next_action ? " Next: " + worker.next_action : "";
   statusNoteEl.innerHTML = '<strong>Why</strong>' +
     escapeText((worker.status_reason || "Waiting for next reconciliation cycle.") + retry + next) +
-    (links.length ? '<span class="links">' + links.join("") + '</span>' : "");
+    (links.length ? '<span class="links">' + links.join("") + '</span>' : "") +
+    renderWorkerActions(worker.actions || []);
   statusNoteEl.classList.add("visible");
 }
 
