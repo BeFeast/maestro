@@ -154,7 +154,7 @@ PR states to watch:
 | `failing_checks` stuck state | Required checks failed | Inspect the check failure, retry intentionally if budget remains, or fix manually |
 | `unmergeable_pr` stuck state | GitHub reports conflicts or unknown mergeability | Wait for GitHub to compute mergeability, or rebase/resolve conflicts |
 
-Supervisor approvals are stale-sensitive. A pending approval becomes stale if the decision payload changes or the target session/PR state changes. Fleet Mission Control shows pending approvals first; stale, approved, and rejected approvals are audit history collapsed below the active inbox. Do not approve a stale approval. Re-run the supervisor, review the new decision, and approve or reject the new ID if appropriate.
+Supervisor approvals are stale-sensitive. A pending approval becomes stale if the decision payload changes or the target session/PR state changes, and pending `spawn_worker` approvals become superseded when a matching worker has already started. Fleet Mission Control shows pending approvals first; superseded, stale, approved, and rejected approvals are audit history collapsed below the active inbox. Do not approve a stale or superseded approval. Re-run the supervisor, review the new decision, and approve or reject the new ID if appropriate.
 
 ## Safe Commands
 

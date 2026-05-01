@@ -162,6 +162,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	log.Printf("[worker] started %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
 
 	// Save session to state
+	startedAt := time.Now().UTC()
 	s.Sessions[slotName] = &state.Session{
 		IssueNumber: issue.Number,
 		IssueTitle:  issue.Title,
@@ -170,10 +171,11 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		PID:         pid,
 		TmuxSession: tmuxName,
 		LogFile:     logFile,
-		StartedAt:   time.Now().UTC(),
+		StartedAt:   startedAt,
 		Status:      state.StatusRunning,
 		Backend:     backendName,
 	}
+	s.ReconcileSpawnWorkerApprovalsForStartedSession(slotName, s.Sessions[slotName], startedAt)
 
 	return slotName, nil
 }

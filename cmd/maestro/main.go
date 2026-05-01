@@ -1070,8 +1070,25 @@ func showApprovals(s *state.State) {
 	sort.Slice(approvals, func(i, j int) bool {
 		return approvals[i].CreatedAt.After(approvals[j].CreatedAt)
 	})
-	fmt.Println("Approvals:")
+	var pending []state.Approval
+	historyCounts := make(map[state.ApprovalStatus]int)
+	historyTotal := 0
 	for _, approval := range approvals {
+		if approval.Status == state.ApprovalStatusPending {
+			pending = append(pending, approval)
+			continue
+		}
+		historyCounts[approval.Status]++
+		historyTotal++
+	}
+	if len(pending) == 0 {
+		if historyTotal > 0 {
+			fmt.Printf("Approvals: no pending approvals; %s.\n\n", approvalHistorySummary(historyCounts, historyTotal))
+		}
+		return
+	}
+	fmt.Println("Approvals:")
+	for _, approval := range pending {
 		target := "-"
 		parts := supervisorTargetParts(approval.Target)
 		if len(parts) > 0 {
@@ -1079,7 +1096,43 @@ func showApprovals(s *state.State) {
 		}
 		fmt.Printf("  %s  %s  %s  %s\n", approval.ID, approval.Status, approval.Action, target)
 	}
+	if historyTotal > 0 {
+		fmt.Printf("  %s.\n", approvalHistorySummary(historyCounts, historyTotal))
+	}
 	fmt.Println()
+}
+
+func approvalHistorySummary(counts map[state.ApprovalStatus]int, total int) string {
+	if total <= 0 {
+		return "0 historical approvals hidden"
+	}
+	noun := "approval"
+	if total != 1 {
+		noun = "approvals"
+	}
+	known := 0
+	var parts []string
+	for _, status := range []state.ApprovalStatus{
+		state.ApprovalStatusSuperseded,
+		state.ApprovalStatusStale,
+		state.ApprovalStatusApproved,
+		state.ApprovalStatusRejected,
+	} {
+		count := counts[status]
+		if count == 0 {
+			continue
+		}
+		known += count
+		parts = append(parts, fmt.Sprintf("%d %s", count, status))
+	}
+	if other := total - known; other > 0 {
+		parts = append(parts, fmt.Sprintf("%d other", other))
+	}
+	summary := fmt.Sprintf("%d historical %s hidden", total, noun)
+	if len(parts) > 0 {
+		summary += " (" + strings.Join(parts, ", ") + ")"
+	}
+	return summary
 }
 
 // watchPaneCmd builds a shell command for a watch pane.
