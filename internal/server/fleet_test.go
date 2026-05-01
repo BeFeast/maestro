@@ -117,6 +117,9 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if resp.Summary.NeedsAttention != visibleAttention {
 		t.Fatalf("summary attention = %d, visible attention rows = %d", resp.Summary.NeedsAttention, visibleAttention)
 	}
+	if len(resp.Attention) != resp.Summary.NeedsAttention {
+		t.Fatalf("attention inbox len = %d, want %d", len(resp.Attention), resp.Summary.NeedsAttention)
+	}
 	if resp.Projects[0].Name != "One" {
 		t.Fatalf("first project = %q, want One", resp.Projects[0].Name)
 	}
@@ -166,6 +169,86 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 	if resp.Projects[1].NeedsAttention != len(resp.Projects[1].Attention) {
 		t.Fatalf("project attention count = %d, reasons = %d", resp.Projects[1].NeedsAttention, len(resp.Projects[1].Attention))
+	}
+}
+
+func TestFleetAttentionInboxOrdersBySeverityAndFreshness(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "finance")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"fin-running": {
+			IssueNumber: 306,
+			IssueTitle:  "Finance stale-running worker with a title long enough to exercise compact inbox layout",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-12 * time.Minute),
+			Backend:     "opencode",
+		},
+		"fin-pr": {
+			IssueNumber: 307,
+			IssueTitle:  "Waiting PR state missing its pull request number",
+			Status:      state.StatusPROpen,
+			StartedAt:   now.Add(-1 * time.Minute),
+		},
+		"fin-retry": {
+			IssueNumber:     308,
+			IssueTitle:      "Retry exhausted with failed checks",
+			Status:          state.StatusRetryExhausted,
+			StartedAt:       now.Add(-30 * time.Minute),
+			PRNumber:        88,
+			CIFailureOutput: "go test failed",
+		},
+		"fin-dead": {
+			IssueNumber: 309,
+			IssueTitle:  "Dead worker needs reconciliation",
+			Status:      state.StatusDead,
+			StartedAt:   now.Add(-5 * time.Minute),
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("finance", "/tmp/finance.yaml", "http://127.0.0.1:8788", &config.Config{
+			Repo:        "owner/finance",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	if len(resp.Attention) != 4 {
+		t.Fatalf("attention inbox len = %d, want 4", len(resp.Attention))
+	}
+	gotSlots := make([]string, 0, len(resp.Attention))
+	for _, worker := range resp.Attention {
+		gotSlots = append(gotSlots, worker.Slot)
+	}
+	wantSlots := []string{"fin-dead", "fin-retry", "fin-running", "fin-pr"}
+	for i, want := range wantSlots {
+		if gotSlots[i] != want {
+			t.Fatalf("attention order = %v, want %v", gotSlots, wantSlots)
+		}
+	}
+
+	stale := findFleetWorker(t, resp.Attention, "fin-running")
+	if stale.ProjectName != "finance" || stale.DashboardURL == "" {
+		t.Fatalf("stale worker project/link = %+v", stale)
+	}
+	if stale.IssueNumber != 306 || stale.IssueURL != "https://github.com/owner/finance/issues/306" {
+		t.Fatalf("stale worker issue metadata = %+v", stale)
+	}
+	if stale.Status != string(state.StatusRunning) || !stale.NeedsAttention {
+		t.Fatalf("stale worker status/attention = %q/%v", stale.Status, stale.NeedsAttention)
+	}
+	if !contains(stale.StatusReason, "PID is not alive") || !contains(stale.NextAction, "reconciliation cycle") {
+		t.Fatalf("stale worker why/next = %q/%q", stale.StatusReason, stale.NextAction)
+	}
+	if stale.RuntimeSeconds <= 0 || stale.Runtime == "" {
+		t.Fatalf("stale worker age = %q/%d, want populated", stale.Runtime, stale.RuntimeSeconds)
+	}
+
+	retry := findFleetWorker(t, resp.Attention, "fin-retry")
+	if retry.PRNumber != 88 || retry.PRURL != "https://github.com/owner/finance/pull/88" {
+		t.Fatalf("retry PR metadata = %d/%q", retry.PRNumber, retry.PRURL)
 	}
 }
 
@@ -412,6 +495,9 @@ func TestFleetDashboard(t *testing.T) {
 		"/api/v1/fleet",
 		"/api/v1/fleet/worker",
 		"project-tabs",
+		"attention-inbox",
+		"attention-list",
+		"attention-summary",
 		"fleet-workers-body",
 		"worker-detail",
 		"worker-controls",
@@ -422,6 +508,9 @@ func TestFleetDashboard(t *testing.T) {
 		"worker-sort",
 		"sort-direction",
 		"renderFleetWorkers",
+		"renderAttentionInbox",
+		"attentionFromData",
+		"No projects need attention right now",
 		"renderWorkerDetail",
 		"renderProject",
 		"issueSummaryHTML",
