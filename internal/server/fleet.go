@@ -1091,10 +1091,14 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     background: rgba(88,166,255,.12);
   }
   .project-tab .count { margin-left: 6px; color: var(--muted); font-size: 12px; }
+  .project-overview,
   .approval-inbox {
     margin-bottom: 16px;
     border: 1px solid var(--line);
     background: var(--panel);
+  }
+  .project-overview .grid {
+    padding: 14px;
   }
   .approval-list {
     display: grid;
@@ -1319,7 +1323,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .section-note { color: var(--muted); font-size: 13px; text-align: right; }
   .worker-controls {
     display: grid;
-    grid-template-columns: minmax(220px, 2fr) repeat(5, minmax(118px, 1fr));
+    grid-template-columns: minmax(220px, 2fr) repeat(6, minmax(112px, 1fr));
     gap: 10px;
     padding: 12px 14px;
     border-bottom: 1px solid var(--line);
@@ -1346,12 +1350,21 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .worker-controls button { align-self: end; cursor: pointer; color: var(--accent); }
   .worker-controls button:hover { border-color: rgba(88,166,255,.65); }
-  .table-scroll { overflow-x: auto; }
+  .table-scroll {
+    max-height: min(54vh, 640px);
+    overflow: auto;
+  }
   .worker-table {
     width: 100%;
     min-width: 1180px;
     border-collapse: collapse;
     table-layout: fixed;
+  }
+  .worker-table.worker-table-empty {
+    min-width: 0;
+  }
+  .worker-table.worker-table-empty thead {
+    display: none;
   }
   .worker-table th, .worker-table td {
     padding: 9px 10px;
@@ -1383,7 +1396,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .pr-col { width: 70px; }
   .runtime-col { width: 90px; }
   .tokens-col { width: 82px; text-align: right; }
-  .action-col { width: 270px; }
+  .action-col { width: 180px; }
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
@@ -1392,7 +1405,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .project {
     border: 1px solid var(--line);
     background: var(--panel);
-    min-height: 260px;
+    min-height: 220px;
   }
   .project.project-stale { border-color: rgba(210,153,34,.55); }
   .project.project-error { border-color: rgba(248,81,73,.55); }
@@ -1526,7 +1539,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .action-item { min-width: 118px; max-width: 210px; }
+  .action-item { min-width: 0; max-width: 180px; }
   .action-detail {
     display: grid;
     gap: 2px;
@@ -1538,8 +1551,20 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .action-detail strong { color: var(--text); font-weight: 650; }
   .action-note { margin-top: 6px; color: var(--muted); font-size: 12px; white-space: normal; }
+  .more-row {
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 12px;
+  }
   .empty { color: var(--muted); margin-top: 8px; }
-  .worker-table .empty { padding: 18px 14px; margin: 0; text-align: center; }
+  .worker-table .empty {
+    padding: 18px 14px;
+    margin: 0;
+    overflow: visible;
+    text-align: center;
+    text-overflow: clip;
+    white-space: normal;
+  }
   .why-line {
     margin-top: 3px;
     color: var(--muted);
@@ -1612,6 +1637,16 @@ const fleetDashboardHTML = `<!DOCTYPE html>
 </header>
 <main>
   <nav class="project-tabs" id="project-tabs" aria-label="Fleet projects"></nav>
+  <section class="project-overview" aria-live="polite">
+    <div class="section-head">
+      <div>
+        <h2>Project Overview</h2>
+        <div class="sub">Per-project outcome, queue, and current supervisor state.</div>
+      </div>
+      <div class="section-note" id="project-summary">Loading projects...</div>
+    </div>
+    <div class="grid" id="projects"></div>
+  </section>
   <section class="approval-inbox" id="approval-inbox" aria-live="polite">
     <div class="section-head">
       <div>
@@ -1636,12 +1671,13 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     <div class="section-head">
       <div>
         <h2>Fleet Workers</h2>
-        <div class="sub">Unified active, recent, and attention queue across projects.</div>
+        <div class="sub">Operator-focused worker queue. Switch scope when you need history.</div>
       </div>
       <div class="section-note" id="worker-summary">Loading workers...</div>
     </div>
     <div class="worker-controls" id="worker-controls">
       <label class="search-control" for="worker-filter"><span>Search</span><input id="worker-filter" type="search" placeholder="Project, issue, status, backend, or PR"></label>
+      <label for="scope-filter"><span>Scope</span><select id="scope-filter"><option value="operator">Needs action/live</option><option value="attention">Attention only</option><option value="live">Live only</option><option value="recent">Done/history</option><option value="all">All workers</option></select></label>
       <label for="status-filter"><span>Status</span><select id="status-filter"></select></label>
       <label for="backend-filter"><span>Backend</span><select id="backend-filter"></select></label>
       <label for="pr-filter"><span>PR</span><select id="pr-filter"><option value="all">Any PR</option><option value="with">With PR</option><option value="without">No PR</option></select></label>
@@ -1679,10 +1715,10 @@ const fleetDashboardHTML = `<!DOCTYPE html>
       <div class="empty">Select a fleet worker to show metadata and log output.</div>
     </div>
   </section>
-  <div class="grid" id="projects"></div>
 </main>
 <script>
 const projectsEl = document.getElementById("projects");
+const projectSummaryEl = document.getElementById("project-summary");
 const statsEl = document.getElementById("stats");
 const subtitleEl = document.getElementById("subtitle");
 const tabsEl = document.getElementById("project-tabs");
@@ -1695,6 +1731,7 @@ const workerSummaryEl = document.getElementById("worker-summary");
 const workerDetailSummaryEl = document.getElementById("worker-detail-summary");
 const workerDetailBodyEl = document.getElementById("worker-detail-body");
 const workerFilterEl = document.getElementById("worker-filter");
+const scopeFilterEl = document.getElementById("scope-filter");
 const statusFilterEl = document.getElementById("status-filter");
 const backendFilterEl = document.getElementById("backend-filter");
 const prFilterEl = document.getElementById("pr-filter");
@@ -1725,6 +1762,7 @@ const fleetState = {
   selectedWorkerKey: "",
   filters: {
     query: "",
+    scope: "operator",
     status: "all",
     backend: "all",
     pr: "all"
@@ -2007,6 +2045,8 @@ function loadStateFromQuery() {
   const params = new URLSearchParams(window.location.search);
   fleetState.selectedProject = normalizeParam(params.get("project"), "all");
   fleetState.filters.query = normalizeParam(params.get("q"), "");
+  const scope = normalizeParam(params.get("scope"), "operator");
+  fleetState.filters.scope = ["operator", "attention", "live", "recent", "all"].includes(scope) ? scope : "operator";
   fleetState.filters.status = normalizeParam(params.get("status"), "all");
   fleetState.filters.backend = normalizeParam(params.get("backend"), "all");
   const prFilter = normalizeParam(params.get("pr"), "all");
@@ -2021,6 +2061,7 @@ function updateQueryState() {
   const params = new URLSearchParams(window.location.search);
   setQueryParam(params, "project", fleetState.selectedProject, "all");
   setQueryParam(params, "q", fleetState.filters.query, "");
+  setQueryParam(params, "scope", fleetState.filters.scope, "operator");
   setQueryParam(params, "status", fleetState.filters.status, "all");
   setQueryParam(params, "backend", fleetState.filters.backend, "all");
   setQueryParam(params, "pr", fleetState.filters.pr, "all");
@@ -2067,6 +2108,7 @@ function renderFilterOptions() {
 
 function syncFilterControls() {
   workerFilterEl.value = fleetState.filters.query;
+  scopeFilterEl.value = fleetState.filters.scope;
   statusFilterEl.value = fleetState.filters.status;
   backendFilterEl.value = fleetState.filters.backend;
   prFilterEl.value = fleetState.filters.pr;
@@ -2100,6 +2142,7 @@ function workerSearchText(worker) {
 }
 
 function workerMatchesFilters(worker) {
+  if (!workerMatchesScope(worker)) return false;
   if (fleetState.filters.status !== "all" && displayStatus(worker) !== fleetState.filters.status) return false;
   if (fleetState.filters.backend !== "all" && (worker.backend || "") !== fleetState.filters.backend) return false;
   if (fleetState.filters.pr === "with" && !worker.pr_number) return false;
@@ -2108,6 +2151,28 @@ function workerMatchesFilters(worker) {
   if (!terms.length) return true;
   const haystack = workerSearchText(worker);
   return terms.every(term => haystack.includes(term));
+}
+
+function isLiveWorker(worker) {
+  const displayed = displayStatus(worker);
+  return ["running", "pr_open", "queued", "review_retry_running", "review_retry_recheck", "review_retry_pending", "review_retry_backoff"].includes(displayed) ||
+    ["running", "pr_open", "queued"].includes(worker.status || "");
+}
+
+function workerMatchesScope(worker) {
+  switch (fleetState.filters.scope) {
+  case "attention":
+    return workerNeedsAttention(worker);
+  case "live":
+    return isLiveWorker(worker);
+  case "recent":
+    return !isLiveWorker(worker) && !workerNeedsAttention(worker);
+  case "all":
+    return true;
+  case "operator":
+  default:
+    return workerNeedsAttention(worker) || isLiveWorker(worker);
+  }
 }
 
 function filteredWorkers(includeProjectFilter) {
@@ -2123,7 +2188,7 @@ function selectedProjectWorkers() {
 }
 
 function hasWorkerFilters() {
-  return fleetState.filters.query !== "" || fleetState.filters.status !== "all" || fleetState.filters.backend !== "all" || fleetState.filters.pr !== "all";
+  return fleetState.filters.query !== "" || fleetState.filters.scope !== "operator" || fleetState.filters.status !== "all" || fleetState.filters.backend !== "all" || fleetState.filters.pr !== "all";
 }
 
 function workerNeedsAttention(worker) {
@@ -2400,6 +2465,7 @@ function renderProjectTabs() {
       fleetState.selectedProject = button.dataset.project || "all";
       updateQueryState();
       renderProjectTabs();
+      renderProjectOverview();
       renderFleetWorkers();
     });
   });
@@ -2408,18 +2474,17 @@ function renderProjectTabs() {
 function renderFleetWorkers() {
   const base = selectedProjectWorkers();
   const visible = sortWorkers(filteredWorkers(true));
+  const table = fleetWorkersEl.closest("table");
+  if (table) table.classList.toggle("worker-table-empty", visible.length === 0);
   const projectLabel = fleetState.selectedProject === "all" ? "all projects" : fleetState.selectedProject;
-  const filterText = hasWorkerFilters() ? " (" + visible.length + " of " + base.length + " after filters)" : "";
+  const scopeLabel = scopeLabelText(fleetState.filters.scope);
+  const filterText = hasWorkerFilters() ? " · " + visible.length + " shown from " + base.length + " total" : " · " + base.length + " total";
   const attentionCount = visible.filter(worker => worker.needs_attention).length;
-  workerSummaryEl.textContent = visible.length + " active / recent / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel +
+  workerSummaryEl.textContent = scopeLabel + " · " + visible.length + " worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel +
     filterText + (attentionCount ? " · " + attentionCount + " need attention" : "");
 
   if (visible.length === 0) {
-    const empty = hasWorkerFilters()
-      ? "No workers match the current filters."
-      : fleetState.selectedProject === "all"
-      ? "No active, recent, or attention workers across configured projects."
-      : "No active, recent, or attention workers for " + fleetState.selectedProject + ".";
+    const empty = fleetEmptyText(projectLabel, base.length);
     fleetWorkersEl.innerHTML = '<tr><td colspan="9" class="empty">' + escapeText(empty) + '</td></tr>';
     return;
   }
@@ -2451,6 +2516,34 @@ function renderFleetWorkers() {
       }
     });
   });
+}
+
+function scopeLabelText(scope) {
+  switch (scope) {
+  case "attention": return "Attention only";
+  case "live": return "Live only";
+  case "recent": return "Done/history";
+  case "all": return "All workers";
+  case "operator":
+  default: return "Needs action/live";
+  }
+}
+
+function fleetEmptyText(projectLabel, total) {
+  const historyHint = total ? " Switch Scope to Done/history or All workers to inspect " + total + " historical worker" + (total === 1 ? "" : "s") + "." : "";
+  if (fleetState.filters.scope === "operator") {
+    return "No workers need operator action and no workers are live in " + projectLabel + "." + historyHint;
+  }
+  if (fleetState.filters.scope === "attention") {
+    return "No workers currently need attention in " + projectLabel + "." + historyHint;
+  }
+  if (fleetState.filters.scope === "live") {
+    return "No workers are currently running or waiting on open PRs in " + projectLabel + "." + historyHint;
+  }
+  if (hasWorkerFilters()) {
+    return "No workers match the current filters.";
+  }
+  return "No worker sessions are available for " + projectLabel + ".";
 }
 
 function selectWorker(projectName, slot) {
@@ -2540,7 +2633,7 @@ function renderWorkerDetail(data) {
     '<div class="' + noteClass + '"><strong>State</strong> ' + escapeText(reason) +
       (links.length ? '<div class="detail-links">' + links.join("") + '</div>' : "") +
     '</div>' +
-    '<div class="project-actions"><div class="label">Approval-gated controls</div>' + renderActions(worker.actions || []) + '</div>' +
+    '<div class="project-actions"><div class="label">Approval-gated controls</div>' + renderActions(worker.actions || [], { details: false }) + '</div>' +
     '<div class="log-tail">' +
       '<div class="log-tail-head"><strong>Recent log tail</strong><span>' + escapeText(logMeta) + '</span></div>' +
       '<pre>' + escapeText(logText) + '</pre>' +
@@ -2679,21 +2772,23 @@ function renderProjectWhy(project) {
 function renderWorkers(project) {
   const workers = project.active || [];
   if (!workers.length) {
-    return '<div class="workers"><div class="label">Active / recent / attention</div><div class="empty">No active, recent, or attention workers.</div></div>';
+    return '<div class="workers"><div class="label">Latest Sessions</div><div class="empty">No worker sessions in this snapshot.</div></div>';
   }
-  return '<div class="workers"><div class="label">Active / recent / attention</div><table>' +
-    workers.map(worker => '<tr>' +
+  const visible = workers.slice(0, 5);
+  const hidden = Math.max(0, workers.length - visible.length);
+  return '<div class="workers"><div class="label">Latest Sessions</div><table>' +
+    visible.map(worker => '<tr>' +
       '<td class="project-worker-slot">' + escapeText(worker.slot) + '</td>' +
       '<td class="project-worker-status"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
       '<td class="project-worker-issue" title="' + escapeText(issueSummaryText(worker)) + '">' + issueSummaryHTML(worker) + workerWhyHTML(worker) + '</td>' +
       '<td class="project-worker-runtime">' + escapeText(worker.runtime || "-") + '</td>' +
     '</tr>').join("") +
-  '</table></div>';
+  '</table>' + (hidden ? '<div class="more-row">+' + escapeText(hidden) + ' more in Fleet Workers history</div>' : '') + '</div>';
 }
 
 function renderProjectActions(project) {
   return '<div class="project-actions"><div class="label">Approval-gated controls</div>' +
-    renderActions(project.actions || []) + '</div>';
+    renderActions(project.actions || [], { details: false }) + '</div>';
 }
 
 function projectFreshnessHTML(project) {
@@ -2757,6 +2852,19 @@ function renderProject(project) {
   '</article>';
 }
 
+function renderProjectOverview() {
+  const projects = fleetState.selectedProject === "all"
+    ? fleetState.projects
+    : fleetState.projects.filter(project => project.name === fleetState.selectedProject);
+  const attention = projects.reduce((sum, project) => sum + Number(project.needs_attention || 0), 0);
+  const running = projects.reduce((sum, project) => sum + Number(project.running || 0), 0);
+  projectSummaryEl.textContent = projects.length + " project" + (projects.length === 1 ? "" : "s") +
+    " · " + running + " running · " + attention + " attention";
+  projectsEl.innerHTML = projects.length
+    ? projects.map(renderProject).join("")
+    : '<div class="empty">No project cards match the selected filter.</div>';
+}
+
 function refreshWorkersFromControls() {
   updateQueryState();
   renderProjectTabs();
@@ -2765,6 +2873,11 @@ function refreshWorkersFromControls() {
 
 workerFilterEl.addEventListener("input", () => {
   fleetState.filters.query = workerFilterEl.value.trim();
+  refreshWorkersFromControls();
+});
+
+scopeFilterEl.addEventListener("change", () => {
+  fleetState.filters.scope = scopeFilterEl.value || "operator";
   refreshWorkersFromControls();
 });
 
@@ -2828,11 +2941,11 @@ async function loadFleet() {
     syncFilterControls();
     renderStats(summary);
     renderProjectTabs();
+    renderProjectOverview();
     renderApprovalInbox();
     renderAttentionInbox();
     renderFleetWorkers();
     renderWorkerDetail(fleetState.detail);
-    projectsEl.innerHTML = fleetState.projects.map(renderProject).join("");
   } catch (err) {
     subtitleEl.textContent = "Fleet API error" + (fleetState.refreshedAt ? " · Last successful refresh " + formatTimestamp(fleetState.refreshedAt) : "");
     approvalSummaryEl.textContent = "Fleet API error";
@@ -2841,6 +2954,7 @@ async function loadFleet() {
     attentionListEl.innerHTML = '<div class="error">Unable to load attention inbox.</div>';
     workerSummaryEl.textContent = "Fleet API error";
     fleetWorkersEl.innerHTML = '<tr><td colspan="9" class="empty">Unable to load fleet workers.</td></tr>';
+    projectSummaryEl.textContent = "Fleet API error";
     projectsEl.innerHTML = '<div class="error">' + escapeText(err.message) + '</div>';
   }
 }

@@ -1115,7 +1115,8 @@ const dashboardHTML = `<!DOCTYPE html>
   .log-panel {
     min-width: 0;
     display: grid;
-    grid-template-rows: 48px auto auto minmax(0, 1fr);
+    grid-template-rows: 48px auto auto auto minmax(0, 1fr);
+    overflow: hidden;
     background: #080c11;
   }
   .log-head {
@@ -1143,6 +1144,8 @@ const dashboardHTML = `<!DOCTYPE html>
     background: #0b1016;
     color: var(--muted);
     font-size: 12px;
+    max-height: 220px;
+    overflow: auto;
   }
   .status-note.visible { display: block; }
   .status-note strong {
@@ -1153,6 +1156,11 @@ const dashboardHTML = `<!DOCTYPE html>
     display: inline-flex;
     gap: 10px;
     margin-left: 10px;
+  }
+  .why-note {
+    color: var(--muted);
+    line-height: 1.45;
+    overflow-wrap: anywhere;
   }
   .supervisor-panel, .outcome-panel {
 	border-bottom: 1px solid var(--line);
@@ -1207,10 +1215,8 @@ const dashboardHTML = `<!DOCTYPE html>
     white-space: nowrap;
   }
   .worker-actions {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    flex-wrap: wrap;
+    display: grid;
+    gap: 6px;
     margin-top: 8px;
   }
   .worker-actions span { color: var(--text); font-weight: 650; }
@@ -1420,7 +1426,7 @@ function renderActionButtons(actions, showDetails) {
 
 function renderWorkerActions(actions) {
   if (!actions || !actions.length) return "";
-  return '<div class="worker-actions"><span>Actions</span>' + renderActionButtons(actions, true) + '</div>' +
+  return '<div class="worker-actions"><span>Actions</span>' + renderActionButtons(actions, false) + '</div>' +
     '<div class="action-note">' + escapeText(actionDisabledReason(actions)) + '</div>';
 }
 
@@ -1626,9 +1632,9 @@ function renderSelectedDetails() {
   if (worker.pr_url) links.push(linkHTML(worker.pr_url, "PR #" + worker.pr_number));
   const retry = worker.next_retry_at ? " Next retry: " + worker.next_retry_at + "." : "";
   const next = worker.next_action ? " Next: " + worker.next_action : "";
-  statusNoteEl.innerHTML = '<strong>Why</strong>' +
+  statusNoteEl.innerHTML = '<div class="why-note"><strong>Why</strong>' +
     escapeText((worker.status_reason || "Waiting for next reconciliation cycle.") + retry + next) +
-    (links.length ? '<span class="links">' + links.join("") + '</span>' : "") +
+    (links.length ? '<span class="links">' + links.join("") + '</span>' : "") + '</div>' +
     renderWorkerActions(worker.actions || []);
   statusNoteEl.classList.add("visible");
 }
