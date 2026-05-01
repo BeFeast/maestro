@@ -176,10 +176,11 @@ func (s *FleetServer) Start(ctx context.Context) error {
 }
 
 type fleetResponse struct {
-	ReadOnly bool                `json:"read_only"`
-	Projects []fleetProjectState `json:"projects"`
-	Summary  fleetSummary        `json:"summary"`
-	Workers  []fleetWorkerState  `json:"workers"`
+	ReadOnly  bool                `json:"read_only"`
+	Projects  []fleetProjectState `json:"projects"`
+	Summary   fleetSummary        `json:"summary"`
+	Workers   []fleetWorkerState  `json:"workers"`
+	Attention []fleetWorkerState  `json:"attention"`
 }
 
 type fleetSummary struct {
@@ -399,14 +400,18 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 
 func (s *FleetServer) snapshot() fleetResponse {
 	resp := fleetResponse{
-		ReadOnly: s.readOnly,
-		Projects: make([]fleetProjectState, 0, len(s.projects)),
-		Workers:  make([]fleetWorkerState, 0),
+		ReadOnly:  s.readOnly,
+		Projects:  make([]fleetProjectState, 0, len(s.projects)),
+		Workers:   make([]fleetWorkerState, 0),
+		Attention: make([]fleetWorkerState, 0),
 	}
 	for _, project := range s.projects {
 		item, workers := s.projectSnapshot(project)
 		resp.Projects = append(resp.Projects, item)
 		resp.Workers = append(resp.Workers, workers...)
+		for _, worker := range item.Attention {
+			resp.Attention = append(resp.Attention, makeFleetWorkerState(item, worker))
+		}
 		resp.Summary.Projects++
 		resp.Summary.Running += item.Running
 		resp.Summary.PROpen += item.PROpen
@@ -438,7 +443,48 @@ func (s *FleetServer) snapshot() fleetResponse {
 		}
 		return left.Slot < right.Slot
 	})
+	sort.SliceStable(resp.Attention, func(i, j int) bool {
+		left, right := resp.Attention[i], resp.Attention[j]
+		li := fleetAttentionSeverity(left)
+		ri := fleetAttentionSeverity(right)
+		if li != ri {
+			return li < ri
+		}
+		lt := fleetWorkerStartedAt(left)
+		rt := fleetWorkerStartedAt(right)
+		if !lt.Equal(rt) {
+			return lt.After(rt)
+		}
+		if left.ProjectName != right.ProjectName {
+			return left.ProjectName < right.ProjectName
+		}
+		return left.Slot < right.Slot
+	})
 	return resp
+}
+
+func fleetAttentionSeverity(worker fleetWorkerState) int {
+	if text := strings.ToLower(worker.Status + " " + worker.StatusReason + " " + worker.NextAction); strings.Contains(text, "blocked") {
+		return 0
+	}
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return 0
+	case state.StatusRunning:
+		return 1
+	case state.StatusPROpen, state.StatusQueued:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func fleetWorkerStartedAt(worker fleetWorkerState) time.Time {
+	startedAt, err := time.Parse(time.RFC3339, worker.StartedAt)
+	if err != nil {
+		return time.Time{}
+	}
+	return startedAt
 }
 
 func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, []fleetWorkerState) {
@@ -622,6 +668,68 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     background: rgba(88,166,255,.12);
   }
   .project-tab .count { margin-left: 6px; color: var(--muted); font-size: 12px; }
+  .attention-inbox {
+    margin-bottom: 16px;
+    border: 1px solid rgba(248,81,73,.35);
+    background: linear-gradient(180deg, rgba(248,81,73,.08), rgba(21,27,35,.96) 90%);
+  }
+  .attention-list {
+    display: grid;
+    gap: 10px;
+    padding: 12px 14px 14px;
+  }
+  .attention-card {
+    display: grid;
+    grid-template-columns: minmax(150px, .7fr) minmax(0, 2.3fr);
+    gap: 12px;
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid rgba(41,49,61,.9);
+    background: rgba(16,22,29,.86);
+  }
+  .attention-card.selected { outline: 1px solid rgba(88,166,255,.65); outline-offset: -1px; }
+  .attention-card[data-slot] { cursor: pointer; }
+  .attention-card[data-slot]:hover { background: rgba(24,33,44,.92); }
+  .attention-context, .attention-main, .attention-issue { min-width: 0; }
+  .attention-project {
+    display: block;
+    overflow: hidden;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .attention-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px 8px;
+    margin-top: 5px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .attention-top {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .attention-pr {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .attention-lines {
+    display: grid;
+    gap: 3px;
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .attention-lines strong { color: var(--warn); font-weight: 650; }
+  .attention-empty { padding: 12px; }
   .fleet-workers {
     margin-bottom: 16px;
     border: 1px solid var(--line);
@@ -902,6 +1010,9 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     .section-head { flex-direction: column; }
     .section-note { text-align: left; }
     .worker-controls { grid-template-columns: 1fr; }
+    .attention-card { grid-template-columns: 1fr; }
+    .attention-top { grid-template-columns: minmax(0, 1fr) auto; }
+    .attention-pr { grid-column: 1 / -1; }
     .grid { grid-template-columns: 1fr; }
     .metric-row { grid-template-columns: repeat(2, 1fr); }
     .detail-grid { grid-template-columns: 1fr; }
@@ -918,6 +1029,16 @@ const fleetDashboardHTML = `<!DOCTYPE html>
 </header>
 <main>
   <nav class="project-tabs" id="project-tabs" aria-label="Fleet projects"></nav>
+  <section class="attention-inbox" id="attention-inbox" aria-live="polite">
+    <div class="section-head">
+      <div>
+        <h2>Attention Inbox</h2>
+        <div class="sub">One ordered list of the worker/project items that need an operator now.</div>
+      </div>
+      <div class="section-note" id="attention-summary">Loading attention...</div>
+    </div>
+    <div class="attention-list" id="attention-list"></div>
+  </section>
   <section class="fleet-workers">
     <div class="section-head">
       <div>
@@ -972,6 +1093,8 @@ const projectsEl = document.getElementById("projects");
 const statsEl = document.getElementById("stats");
 const subtitleEl = document.getElementById("subtitle");
 const tabsEl = document.getElementById("project-tabs");
+const attentionListEl = document.getElementById("attention-list");
+const attentionSummaryEl = document.getElementById("attention-summary");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
 const workerSummaryEl = document.getElementById("worker-summary");
 const workerDetailSummaryEl = document.getElementById("worker-detail-summary");
@@ -1010,6 +1133,7 @@ const fleetState = {
   sortKey: "status",
   sortDir: "asc",
   projects: [],
+  attention: [],
   workers: [],
   detail: null
 };
@@ -1298,6 +1422,125 @@ function workerWhyHTML(worker) {
   return '<div class="why-line"><strong>Why:</strong> ' + escapeText(why) + '</div>';
 }
 
+function attentionKey(worker) {
+  return [worker.project_name || "", worker.slot || "", worker.issue_number || ""].join("\u001f");
+}
+
+function startedAtMillis(worker) {
+  const startedAt = Date.parse(worker.started_at || "");
+  return Number.isFinite(startedAt) ? startedAt : 0;
+}
+
+function attentionSeverityRank(worker) {
+  const text = [worker.status, worker.status_reason, worker.next_action].map(normalizedSearchText).join(" ");
+  if (text.includes("blocked") || ["dead", "failed", "conflict_failed", "retry_exhausted"].includes(worker.status)) return 0;
+  if (worker.status === "running") return 1;
+  if (worker.status === "pr_open" || worker.status === "queued") return 2;
+  return 3;
+}
+
+function sortAttentionWorkers(workers) {
+  return workers.map((worker, index) => ({ worker, index }))
+    .sort((left, right) => {
+      const severity = compareNumber(attentionSeverityRank(left.worker), attentionSeverityRank(right.worker));
+      if (severity !== 0) return severity;
+      const freshness = compareNumber(startedAtMillis(right.worker), startedAtMillis(left.worker));
+      if (freshness !== 0) return freshness;
+      const project = compareText(left.worker.project_name, right.worker.project_name);
+      if (project !== 0) return project;
+      const slot = compareText(left.worker.slot, right.worker.slot);
+      if (slot !== 0) return slot;
+      return left.index - right.index;
+    })
+    .map(entry => entry.worker);
+}
+
+function attentionFromData(data) {
+  const items = [];
+  const seen = new Set();
+  const add = worker => {
+    if (!worker || !workerNeedsAttention(worker)) return;
+    const key = attentionKey(worker);
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push(worker);
+  };
+
+  if (Array.isArray(data.attention)) {
+    data.attention.forEach(add);
+  }
+  if (!Array.isArray(data.attention) && Array.isArray(data.workers)) {
+    data.workers.forEach(add);
+  }
+  for (const project of data.projects || []) {
+    for (const worker of project.attention || []) {
+      add({
+        ...worker,
+        project_name: worker.project_name || project.name,
+        project_repo: worker.project_repo || project.repo,
+        dashboard_url: worker.dashboard_url || project.dashboard_url
+      });
+    }
+  }
+  return sortAttentionWorkers(items);
+}
+
+function attentionReasonText(worker) {
+  return (worker.status_reason || "").trim() || "Needs operator review.";
+}
+
+function attentionNextActionText(worker) {
+  return (worker.next_action || "").trim() || "Open the worker detail and choose the next safe action.";
+}
+
+function renderAttentionInbox() {
+  const attention = fleetState.attention || [];
+  if (!attention.length) {
+    attentionSummaryEl.textContent = "No projects need attention";
+    attentionListEl.innerHTML = '<div class="empty attention-empty">No projects need attention right now. The fleet is waiting normally.</div>';
+    return;
+  }
+
+  const severe = attention.filter(worker => attentionSeverityRank(worker) === 0).length;
+  attentionSummaryEl.textContent = attention.length + " item" + (attention.length === 1 ? "" : "s") + " need attention" +
+    (severe ? " · " + severe + " blocked/dead/retry" : "");
+  attentionListEl.innerHTML = attention.map(worker => {
+    const project = worker.project_name || "-";
+    const slot = worker.slot || "-";
+    const age = worker.runtime || "-";
+    const pr = worker.pr_number ? linkHTML(worker.pr_url, "PR #" + worker.pr_number) : "No PR";
+    const selected = workerKey(worker) === fleetState.selectedWorkerKey ? " selected" : "";
+    return '<article class="attention-card' + selected + '" data-project="' + escapeText(worker.project_name || "") + '" data-slot="' + escapeText(worker.slot || "") + '" tabindex="0" title="' + escapeText(attentionReasonText(worker)) + '">' +
+      '<div class="attention-context">' +
+        '<span class="attention-project" title="' + escapeText(project) + '">' + linkHTML(worker.dashboard_url, project) + '</span>' +
+        '<div class="attention-meta"><span>Slot ' + escapeText(slot) + '</span><span>Age ' + escapeText(age) + '</span></div>' +
+      '</div>' +
+      '<div class="attention-main">' +
+        '<div class="attention-top">' +
+          '<div class="attention-issue" title="' + escapeText(issueSummaryText(worker)) + '">' + issueSummaryHTML(worker) + '</div>' +
+          '<span class="' + statusClass(worker) + '" title="' + escapeText(statusLabel(worker)) + '">' + escapeText(statusLabel(worker)) + '</span>' +
+          '<span class="attention-pr">' + pr + '</span>' +
+        '</div>' +
+        '<div class="attention-lines"><div><strong>Why:</strong> ' + escapeText(attentionReasonText(worker)) + '</div>' +
+        '<div><strong>Next:</strong> ' + escapeText(attentionNextActionText(worker)) + '</div></div>' +
+      '</div>' +
+    '</article>';
+  }).join("");
+
+  attentionListEl.querySelectorAll(".attention-card[data-slot]").forEach(card => {
+    card.addEventListener("click", () => selectWorker(card.dataset.project || "", card.dataset.slot || ""));
+    card.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectWorker(card.dataset.project || "", card.dataset.slot || "");
+      }
+    });
+  });
+  attentionListEl.querySelectorAll("a").forEach(link => {
+    link.addEventListener("click", event => event.stopPropagation());
+  });
+}
+
 function fleetWorkersFromData(data) {
   if (Array.isArray(data.workers)) return data.workers;
   return (data.projects || []).flatMap(project => (project.active || []).map(worker => ({
@@ -1414,6 +1657,7 @@ function renderFleetWorkers() {
 function selectWorker(projectName, slot) {
   fleetState.selectedWorkerKey = projectName + "\u001f" + slot;
   fleetState.detail = null;
+  renderAttentionInbox();
   renderFleetWorkers();
   renderWorkerDetailLoading(projectName, slot);
   loadWorkerDetail();
@@ -1664,6 +1908,7 @@ async function loadFleet() {
     fleetState.readOnly = data.read_only !== false;
     fleetState.projects = data.projects || [];
     fleetState.workers = fleetWorkersFromData(data);
+    fleetState.attention = attentionFromData(data);
     if (fleetState.selectedWorkerKey && !selectedWorker()) {
       fleetState.selectedWorkerKey = "";
       fleetState.detail = null;
@@ -1674,11 +1919,14 @@ async function loadFleet() {
     syncFilterControls();
     renderStats(data.summary || {});
     renderProjectTabs();
+    renderAttentionInbox();
     renderFleetWorkers();
     renderWorkerDetail(fleetState.detail);
     projectsEl.innerHTML = fleetState.projects.map(renderProject).join("");
   } catch (err) {
     subtitleEl.textContent = "Fleet API error";
+    attentionSummaryEl.textContent = "Fleet API error";
+    attentionListEl.innerHTML = '<div class="error">Unable to load attention inbox.</div>';
     workerSummaryEl.textContent = "Fleet API error";
     fleetWorkersEl.innerHTML = '<tr><td colspan="9" class="empty">Unable to load fleet workers.</td></tr>';
     projectsEl.innerHTML = '<div class="error">' + escapeText(err.message) + '</div>';
