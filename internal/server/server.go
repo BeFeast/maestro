@@ -1033,12 +1033,29 @@ const dashboardHTML = `<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
     max-width: 100%;
+    overflow: hidden;
     height: 22px;
     padding: 0 8px;
     border-radius: 999px;
     border: 1px solid var(--line);
     font-size: 12px;
     font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .issue-main {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .issue-main a { flex: 0 0 auto; }
+  .issue-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .s-running { color: var(--ok); border-color: rgba(63,185,80,.42); }
   .s-pr_open { color: var(--warn); border-color: rgba(210,153,34,.48); }
@@ -1267,6 +1284,17 @@ function linkHTML(url, label) {
   return '<a href="' + escapeText(url) + '" target="_blank" rel="noreferrer">' + escapeText(label) + '</a>';
 }
 
+function issueSummaryHTML(worker) {
+  const issue = worker.issue_number ? "#" + worker.issue_number : "-";
+  return '<span class="issue-main">' + linkHTML(worker.issue_url, issue) +
+    '<span class="issue-title">' + escapeText(worker.issue_title || "") + '</span></span>';
+}
+
+function issueSummaryText(worker) {
+  const issue = worker.issue_number ? "#" + worker.issue_number : "-";
+  return (issue + " " + (worker.issue_title || "")).trim();
+}
+
 function actionLabel(action) {
   return String(action || "-").replace(/_/g, " ");
 }
@@ -1420,11 +1448,10 @@ function renderWorkers() {
   workersEl.innerHTML = visible.map(worker => {
     const selected = worker.slot === state.selected ? " selected" : "";
     const attention = worker.needs_attention ? " row-attention" : "";
-    const issue = "#" + worker.issue_number;
     const pr = worker.pr_number ? "#" + worker.pr_number : "-";
     return '<tr class="' + selected + attention + '" data-slot="' + escapeText(worker.slot) + '">' +
       '<td class="slot">' + escapeText(worker.slot) + '</td>' +
-      '<td class="issue">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title) + '</td>' +
+      '<td class="issue" title="' + escapeText(issueSummaryText(worker)) + '">' + issueSummaryHTML(worker) + '</td>' +
       '<td class="status"><span class="' + pillClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
       '<td class="backend">' + escapeText(worker.backend || "-") + '</td>' +
       '<td class="pr">' + linkHTML(worker.pr_url, pr) + '</td>' +
