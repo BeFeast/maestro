@@ -33,6 +33,24 @@ func TestAssemblePromptIncludesSecretSafetyGuardrails(t *testing.T) {
 	}
 }
 
+func TestAssemblePromptIncludesSearchSafetyGuardrails(t *testing.T) {
+	cfg := &config.Config{Repo: "BeFeast/maestro"}
+	issue := github.Issue{Number: 319, Title: "worker safety", Body: "Constrain broad searches."}
+
+	prompt := assemblePrompt("base prompt", issue, "/tmp/worktree", "feat/safety", cfg)
+
+	for _, want := range []string{
+		"## Worker Search Safety",
+		"The assigned worktree is `/tmp/worktree`",
+		"Do NOT run `rg`, `find`, or `grep` from broad filesystem roots such as `/`, `/mnt`, or `/home`.",
+		"MAESTRO_ALLOW_BROAD_SEARCH=1",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("assemblePrompt() missing %q\nprompt:\n%s", want, prompt)
+		}
+	}
+}
+
 // --- Tests from main: validation contract placeholder ---
 
 func TestAssemblePrompt_ValidationContractFromFile(t *testing.T) {

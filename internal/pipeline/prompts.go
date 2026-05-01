@@ -27,6 +27,12 @@ const defaultPlannerPrompt = `You are a **planner** for a coding agent pipeline.
 - Worktree: {{WORKTREE}}
 - Branch: {{BRANCH}}
 
+## Search Safety
+
+- Use the worktree as the current directory before code search commands: ` + "`cd {{WORKTREE}}`" + `.
+- Do NOT run ` + "`rg`" + `, ` + "`find`" + `, or ` + "`grep`" + ` from broad filesystem roots such as ` + "`/`" + `, ` + "`/mnt`" + `, or ` + "`/home`" + `.
+- If a broad host search is intentional, set ` + "`MAESTRO_ALLOW_BROAD_SEARCH=1`" + ` for that single command.
+
 ## Instructions
 
 1. Read and understand the codebase relevant to this issue.
@@ -59,6 +65,12 @@ const defaultValidatorPrompt = `You are a **validator** for a coding agent pipel
 - Repo: {{REPO}}
 - Worktree: {{WORKTREE}}
 - Branch: {{BRANCH}}
+
+## Search Safety
+
+- Use the worktree as the current directory before code search commands: ` + "`cd {{WORKTREE}}`" + `.
+- Do NOT run ` + "`rg`" + `, ` + "`find`" + `, or ` + "`grep`" + ` from broad filesystem roots such as ` + "`/`" + `, ` + "`/mnt`" + `, or ` + "`/home`" + `.
+- If a broad host search is intentional, set ` + "`MAESTRO_ALLOW_BROAD_SEARCH=1`" + ` for that single command.
 
 ## Instructions
 

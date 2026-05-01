@@ -133,18 +133,8 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	var runnerContent string
-	if stdinFile != "" {
-		// Stdin-based backends (e.g. codex): redirect prompt file to stdin via shell
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s < %q 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), stdinFile, logFile)
-	} else {
-		// Arg-based backends (e.g. claude): prompt is already in args
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), logFile)
-	}
-	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
-		return "", fmt.Errorf("write runner script: %w", err)
+	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath); err != nil {
+		return "", err
 	}
 
 	// Run before_run hook (fatal on failure)
@@ -279,16 +269,8 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	var runnerContent string
-	if stdinFile != "" {
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s < %q 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), stdinFile, logFile)
-	} else {
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), logFile)
-	}
-	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
-		return fmt.Errorf("write runner script: %w", err)
+	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath); err != nil {
+		return err
 	}
 
 	// Run before_run hook (fatal on failure)
@@ -740,11 +722,15 @@ func shellJoin(args []string) string {
 	for i, a := range args {
 		// Simple quoting: wrap in single quotes, escape existing single quotes
 		if strings.ContainsAny(a, " \t\n'\"\\$`!#&|;(){}[]<>?*~") {
-			a = "'" + strings.ReplaceAll(a, "'", "'\\''") + "'"
+			a = shellQuote(a)
 		}
 		quoted[i] = a
 	}
 	return strings.Join(quoted, " ")
+}
+
+func shellQuote(arg string) string {
+	return "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
 }
 
 func slugify(title string) string {
@@ -812,7 +798,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		result := r.Replace(base)
+		result := r.Replace(base) + workerSearchSafetyPromptSection(worktreePath)
 		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
@@ -856,6 +842,7 @@ Always rebase on origin/main immediately before creating the PR.
 		issue.Title,
 		issue.Number,
 	)
+	result += workerSearchSafetyPromptSection(worktreePath)
 	return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, false)
 }
 

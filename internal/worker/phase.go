@@ -65,16 +65,8 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
-	var runnerContent string
-	if stdinFile != "" {
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s < %q 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), stdinFile, logFile)
-	} else {
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), logFile)
-	}
-	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
-		return fmt.Errorf("write runner script: %w", err)
+	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree); err != nil {
+		return err
 	}
 
 	// Run before_run hook
