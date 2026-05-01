@@ -1068,14 +1068,38 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .project-tab .count { margin-left: 6px; color: var(--muted); font-size: 12px; }
   .approval-inbox {
     margin-bottom: 16px;
-    border: 1px solid rgba(210,153,34,.35);
-    background: linear-gradient(180deg, rgba(210,153,34,.08), rgba(21,27,35,.96) 90%);
+    border: 1px solid var(--line);
+    background: var(--panel);
   }
   .approval-list {
     display: grid;
-    gap: 8px;
+    gap: 10px;
     padding: 12px 14px 14px;
   }
+  .approval-list.approval-list-compact { gap: 8px; padding: 8px 14px 10px; }
+  .approval-active-list, .approval-history-list { display: grid; gap: 8px; }
+  .approval-history {
+    border: 1px solid rgba(41,49,61,.85);
+    background: rgba(16,22,29,.62);
+  }
+  .approval-history summary {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 10px;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .approval-history summary strong { color: var(--text); font-weight: 650; }
+  .approval-history-list {
+    padding: 8px;
+    border-top: 1px solid rgba(41,49,61,.8);
+  }
+  .approval-history .approval-card {
+    background: rgba(13,17,23,.58);
+  }
+  .approval-history .approval-summary { color: var(--muted); }
   .approval-card {
     display: grid;
     grid-template-columns: minmax(130px, .7fr) minmax(130px, .75fr) minmax(160px, 1fr) minmax(0, 2fr);
@@ -1087,9 +1111,9 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     background: rgba(16,22,29,.86);
   }
   .approval-card.approval-pending { border-left-color: var(--warn); background: rgba(210,153,34,.08); }
-  .approval-card.approval-stale { border-left-color: var(--bad); background: rgba(248,81,73,.09); }
+  .approval-card.approval-stale { border-left-color: var(--line); background: rgba(139,148,158,.06); }
   .approval-card.approval-approved { border-left-color: var(--ok); background: rgba(63,185,80,.06); }
-  .approval-card.approval-rejected { border-left-color: #ff7b72; background: rgba(255,123,114,.07); }
+  .approval-card.approval-rejected { border-left-color: var(--line); background: rgba(139,148,158,.05); }
   .approval-project,
   .approval-action,
   .approval-target,
@@ -1449,9 +1473,9 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .s-done { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .a-pending { color: var(--warn); border-color: rgba(210,153,34,.55); background: rgba(210,153,34,.08); }
-  .a-stale { color: var(--bad); border-color: rgba(248,81,73,.55); background: rgba(248,81,73,.08); }
+  .a-stale { color: var(--muted); border-color: rgba(139,148,158,.45); background: rgba(139,148,158,.08); }
   .a-approved { color: var(--ok); border-color: rgba(63,185,80,.55); background: rgba(63,185,80,.08); }
-  .a-rejected { color: #ff7b72; border-color: rgba(255,123,114,.55); background: rgba(255,123,114,.08); }
+  .a-rejected { color: var(--muted); border-color: rgba(139,148,158,.45); background: rgba(139,148,158,.08); }
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .action-btn {
@@ -1812,6 +1836,34 @@ function approvalCardClass(approval) {
   return "approval-card approval-" + cssToken(approval.status || "unknown");
 }
 
+function isPendingApproval(approval) {
+  return (approval.status || "") === "pending";
+}
+
+function pluralize(count, singular, plural) {
+  return count + " " + (count === 1 ? singular : (plural || singular + "s"));
+}
+
+function approvalInboxSummaryText(activeCount, historicalCount) {
+  if (!activeCount && !historicalCount) return "No active or historical approvals.";
+  const active = activeCount === 0
+    ? "No active approvals need review."
+    : pluralize(activeCount, "active pending approval") + " " + (activeCount === 1 ? "needs" : "need") + " review.";
+  if (!historicalCount) return active + " No historical approvals are recorded.";
+  return active + " " + pluralize(historicalCount, "historical approval") + " " + (historicalCount === 1 ? "is" : "are") + " collapsed below.";
+}
+
+function approvalHistoryCountText(counts, historicalCount) {
+  const known = (counts.stale || 0) + (counts.approved || 0) + (counts.rejected || 0);
+  const parts = [
+    [counts.stale || 0, "stale"],
+    [counts.approved || 0, "approved"],
+    [counts.rejected || 0, "rejected"],
+    [Math.max(0, historicalCount - known), "other"]
+  ].filter(([count]) => count > 0).map(([count, label]) => count + " " + label);
+  return parts.length ? parts.join(" · ") : "No historical approvals";
+}
+
 function approvalSessionVisible(approval) {
   return (fleetState.workers || []).some(worker =>
     worker.project_name === approval.project_name && worker.slot === approval.session);
@@ -1833,39 +1885,47 @@ function approvalTargetHTML(approval) {
   return links.length ? links.join(" ") : '<span class="empty">No target</span>';
 }
 
+function approvalCardHTML(approval) {
+  const project = approval.project_name || "-";
+  const id = approval.id || "-";
+  const action = actionLabel(approval.action || "-");
+  const createdAge = approval.created_age || "-";
+  const updatedAge = approval.updated_age || "-";
+  const sessionStatus = approval.session_status ? "Status " + approval.session_status : "";
+  return '<article class="' + approvalCardClass(approval) + '" title="' + escapeText(approval.summary || "") + '">' +
+    '<div class="approval-project"><strong title="' + escapeText(project) + '">' + linkHTML(approval.dashboard_url, project) + '</strong>' +
+      '<div class="approval-meta"><span title="' + escapeText(id) + '">' + escapeText(id) + '</span></div></div>' +
+    '<div class="approval-action"><strong title="' + escapeText(action) + '">' + escapeText(action) + '</strong>' +
+      '<div class="approval-meta"><span class="' + approvalStatusClass(approval) + '">' + escapeText(approval.status || "unknown") + '</span></div></div>' +
+    '<div class="approval-target">' + approvalTargetHTML(approval) + (sessionStatus ? '<span>' + escapeText(sessionStatus) + '</span>' : "") + '</div>' +
+    '<div class="approval-main"><div class="approval-age"><span>Created ' + escapeText(createdAge) + ' ago</span><span>Updated ' + escapeText(updatedAge) + ' ago</span></div>' +
+      '<div class="approval-risk"><span>Risk ' + escapeText(approval.risk || "-") + '</span></div>' +
+      '<div class="approval-summary">' + escapeText(approval.summary || "No summary recorded.") + '</div></div>' +
+  '</article>';
+}
+
 function renderApprovalInbox() {
   const approvals = fleetState.approvals || [];
-  if (!approvals.length) {
-    approvalSummaryEl.textContent = "No approvals";
-    approvalListEl.innerHTML = '<div class="empty approval-empty">No supervisor approvals are recorded across the fleet.</div>';
-    return;
-  }
-
   const counts = approvals.reduce((acc, approval) => {
     const status = approval.status || "unknown";
     acc[status] = (acc[status] || 0) + 1;
     return acc;
   }, {});
-  approvalSummaryEl.textContent = (counts.pending || 0) + " pending · " + (counts.stale || 0) + " stale · " +
-    (counts.approved || 0) + " approved · " + (counts.rejected || 0) + " rejected";
-  approvalListEl.innerHTML = approvals.map(approval => {
-    const project = approval.project_name || "-";
-    const id = approval.id || "-";
-    const action = actionLabel(approval.action || "-");
-    const createdAge = approval.created_age || "-";
-    const updatedAge = approval.updated_age || "-";
-    const sessionStatus = approval.session_status ? "Status " + approval.session_status : "";
-    return '<article class="' + approvalCardClass(approval) + '" title="' + escapeText(approval.summary || "") + '">' +
-      '<div class="approval-project"><strong title="' + escapeText(project) + '">' + linkHTML(approval.dashboard_url, project) + '</strong>' +
-        '<div class="approval-meta"><span title="' + escapeText(id) + '">' + escapeText(id) + '</span></div></div>' +
-      '<div class="approval-action"><strong title="' + escapeText(action) + '">' + escapeText(action) + '</strong>' +
-        '<div class="approval-meta"><span class="' + approvalStatusClass(approval) + '">' + escapeText(approval.status || "unknown") + '</span></div></div>' +
-      '<div class="approval-target">' + approvalTargetHTML(approval) + (sessionStatus ? '<span>' + escapeText(sessionStatus) + '</span>' : "") + '</div>' +
-      '<div class="approval-main"><div class="approval-age"><span>Created ' + escapeText(createdAge) + ' ago</span><span>Updated ' + escapeText(updatedAge) + ' ago</span></div>' +
-        '<div class="approval-risk"><span>Risk ' + escapeText(approval.risk || "-") + '</span></div>' +
-        '<div class="approval-summary">' + escapeText(approval.summary || "No summary recorded.") + '</div></div>' +
-    '</article>';
-  }).join("");
+  const pending = approvals.filter(isPendingApproval);
+  const historical = approvals.filter(approval => !isPendingApproval(approval));
+  const historyDetails = approvalListEl.querySelector(".approval-history");
+  const historyWasOpen = historyDetails ? historyDetails.open : false;
+  approvalListEl.classList.toggle("approval-list-compact", pending.length === 0);
+  approvalSummaryEl.textContent = approvalInboxSummaryText(pending.length, historical.length);
+
+  const activeHTML = pending.length
+    ? '<div class="approval-active-list">' + pending.map(approvalCardHTML).join("") + '</div>'
+    : '<div class="empty approval-empty approval-active-empty">No pending approvals need review.</div>';
+  const historyHTML = historical.length
+    ? '<details class="approval-history"' + (historyWasOpen ? ' open' : '') + '><summary><strong>Audit history</strong><span>' + escapeText(approvalHistoryCountText(counts, historical.length)) + '</span></summary>' +
+      '<div class="approval-history-list">' + historical.map(approvalCardHTML).join("") + '</div></details>'
+    : '';
+  approvalListEl.innerHTML = activeHTML + historyHTML;
 
   approvalListEl.querySelectorAll(".approval-session-link[data-slot]").forEach(button => {
     button.addEventListener("click", () => selectWorker(button.dataset.project || "", button.dataset.slot || ""));
