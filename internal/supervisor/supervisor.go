@@ -1593,6 +1593,7 @@ func countQueueExcludedReasons(skipped []string) int {
 		lower := strings.ToLower(reason)
 		if strings.Contains(lower, "excluded by configured label") ||
 			strings.Contains(lower, "excluded by supervisor policy label") ||
+			strings.Contains(lower, "blocked by supervisor policy label") ||
 			strings.Contains(lower, "skipped by dynamic wave policy: excluded") ||
 			strings.Contains(lower, "title indicates epic") {
 			count++
