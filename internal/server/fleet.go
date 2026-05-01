@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -371,7 +373,28 @@ func countLines(text string) int {
 }
 
 func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) {
-	handleControlAction(w, r, s.readOnly, "fleet server")
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.readOnly {
+		writeError(w, http.StatusForbidden, "fleet server is read-only; write actions require approval-backed controls to be enabled in configuration")
+		return
+	}
+
+	var req controlActionRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode action request: %v", err))
+			return
+		}
+	}
+	if project, ok := s.findProject(req.Project); ok && project.cfg != nil && project.cfg.Server.ReadOnly {
+		writeError(w, http.StatusForbidden, "fleet project is read-only; write actions require approval-backed controls to be enabled in configuration")
+		return
+	}
+	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
 }
 
 func (s *FleetServer) snapshot() fleetResponse {

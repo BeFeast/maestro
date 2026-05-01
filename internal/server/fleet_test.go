@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -441,6 +442,25 @@ func TestFleetDashboard(t *testing.T) {
 func TestFleetActionReadOnlyRejectsMutation(t *testing.T) {
 	srv := NewFleet(nil, "127.0.0.1", 8786, true)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetAction(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	if !contains(w.Body.String(), "read-only") {
+		t.Fatalf("response = %q, want read-only explanation", w.Body.String())
+	}
+}
+
+func TestFleetActionProjectReadOnlyRejectsMutation(t *testing.T) {
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:   "owner/one",
+			Server: config.ServerConfig{ReadOnly: true},
+		}),
+	}, "127.0.0.1", 8786, false)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", bytes.NewBufferString(`{"action_id":"restart_worker","project":"One","slot":"one-1"}`))
 	w := httptest.NewRecorder()
 	srv.handleFleetAction(w, req)
 

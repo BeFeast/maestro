@@ -544,7 +544,7 @@ func projectActionAffordances(readOnly bool, endpoint string) []controlAction {
 func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {
 	reason := controlActionDisabledReason(readOnly)
 	mergeReason := reason
-	if worker.PRNumber == 0 {
+	if !readOnly && worker.PRNumber == 0 {
 		mergeReason = "No PR is associated with this worker; merge approval will require approval-backed controls."
 	}
 	return []controlAction{

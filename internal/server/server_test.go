@@ -208,6 +208,9 @@ func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
 	if approve.PRNumber != 10 {
 		t.Fatalf("approve_merge pr = %d, want 10", approve.PRNumber)
 	}
+	workerWithoutPR := findSessionInfo(t, resp.All, "slot-1")
+	approveWithoutPR := findControlAction(t, workerWithoutPR.Actions, "approve_merge")
+	assertReadOnlyAction(t, approveWithoutPR)
 }
 
 func TestHandleStateSupervisorRationale(t *testing.T) {
