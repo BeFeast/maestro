@@ -820,15 +820,35 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .project td:nth-child(1) { width: 78px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  .project td:nth-child(2) { width: 74px; }
-  .project td:nth-child(4) { width: 70px; text-align: right; color: var(--muted); }
+  .project-worker-slot { width: 68px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .project-worker-status { width: 124px; padding-right: 8px; }
+  .project-worker-issue { min-width: 0; padding-right: 8px; }
+  .project-worker-runtime { width: 64px; text-align: right; color: var(--muted); }
+  .issue-main {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .issue-main a { flex: 0 0 auto; }
+  .issue-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .pill {
     display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
     padding: 1px 8px;
     border: 1px solid var(--line);
     border-radius: 999px;
     font-size: 12px;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+    white-space: nowrap;
   }
   .s-running { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-pr_open { color: var(--accent); border-color: rgba(88,166,255,.45); }
@@ -1013,6 +1033,17 @@ function compactNumber(value) {
 function linkHTML(url, label) {
   if (!url) return escapeText(label);
   return '<a href="' + escapeText(url) + '" target="_blank" rel="noreferrer">' + escapeText(label) + '</a>';
+}
+
+function issueSummaryHTML(worker) {
+  const issue = worker.issue_number ? "#" + worker.issue_number : "-";
+  return '<span class="issue-main">' + linkHTML(worker.issue_url, issue) +
+    '<span class="issue-title">' + escapeText(worker.issue_title || "") + '</span></span>';
+}
+
+function issueSummaryText(worker) {
+  const issue = worker.issue_number ? "#" + worker.issue_number : "-";
+  return (issue + " " + (worker.issue_title || "")).trim();
 }
 
 function actionLabel(action) {
@@ -1352,15 +1383,14 @@ function renderFleetWorkers() {
   }
 
   fleetWorkersEl.innerHTML = visible.map(worker => {
-    const issue = worker.issue_number ? "#" + worker.issue_number : "-";
     const pr = worker.pr_number ? "#" + worker.pr_number : "-";
     const project = worker.project_name || "-";
-    const issueText = (issue + " " + (worker.issue_title || "")).trim();
+    const issueText = issueSummaryText(worker);
     const selected = workerKey(worker) === fleetState.selectedWorkerKey ? " selected" : "";
     return '<tr class="' + rowClass(worker) + selected + '" data-project="' + escapeText(worker.project_name || "") + '" data-slot="' + escapeText(worker.slot || "") + '" tabindex="0">' +
       '<td class="project-col" title="' + escapeText(project) + '">' + linkHTML(worker.dashboard_url, project) + '</td>' +
       '<td class="slot-col" title="' + escapeText(worker.slot || "-") + '">' + escapeText(worker.slot || "-") + '</td>' +
-      '<td class="issue-col" title="' + escapeText(issueText) + '">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title || "") + workerWhyHTML(worker) + '</td>' +
+      '<td class="issue-col" title="' + escapeText(issueText) + '">' + issueSummaryHTML(worker) + workerWhyHTML(worker) + '</td>' +
       '<td class="status-col" title="' + escapeText(statusLabel(worker)) + '"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
       '<td class="backend-col" title="' + escapeText(worker.backend || "-") + '">' + escapeText(worker.backend || "-") + '</td>' +
       '<td class="pr-col" title="' + escapeText(pr) + '">' + linkHTML(worker.pr_url, pr) + '</td>' +
@@ -1543,10 +1573,10 @@ function renderWorkers(project) {
   }
   return '<div class="workers"><div class="label">Active / recent / attention</div><table>' +
     workers.map(worker => '<tr>' +
-      '<td>' + escapeText(worker.slot) + '</td>' +
-      '<td><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
-      '<td>' + linkHTML(worker.issue_url, "#" + worker.issue_number) + ' ' + escapeText(worker.issue_title || "") + workerWhyHTML(worker) + '</td>' +
-      '<td>' + escapeText(worker.runtime || "-") + '</td>' +
+      '<td class="project-worker-slot">' + escapeText(worker.slot) + '</td>' +
+      '<td class="project-worker-status"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
+      '<td class="project-worker-issue" title="' + escapeText(issueSummaryText(worker)) + '">' + issueSummaryHTML(worker) + workerWhyHTML(worker) + '</td>' +
+      '<td class="project-worker-runtime">' + escapeText(worker.runtime || "-") + '</td>' +
     '</tr>').join("") +
   '</table></div>';
 }

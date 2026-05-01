@@ -838,6 +838,9 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "issue_url") || !contains(body, "pr_url") {
 		t.Error("dashboard should render GitHub issue/PR links from API fields")
 	}
+	if !contains(body, "issueSummaryHTML") || !contains(body, "issue-main") || !contains(body, "issue-title") {
+		t.Error("dashboard should keep issue links visible while truncating long titles")
+	}
 	if !contains(body, "renderWorkerActions") || !contains(body, "Write actions require approval-backed configuration") {
 		t.Error("dashboard should render disabled approval-gated action affordances")
 	}
