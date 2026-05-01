@@ -191,6 +191,7 @@ func TestFleetAPIReviewRetryLifecycleDisplay(t *testing.T) {
 			RetryCount:                  1,
 			NextRetryAt:                 &retryAt,
 			PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+			RetryReason:                 state.RetryReasonReviewFeedback,
 		},
 		"retry-recheck": {
 			IssueNumber: 43,
@@ -200,6 +201,17 @@ func TestFleetAPIReviewRetryLifecycleDisplay(t *testing.T) {
 			PRNumber:    13,
 			RetryCount:  1,
 			RetryReason: state.RetryReasonReviewFeedback,
+		},
+		"ci-retry": {
+			IssueNumber:                 44,
+			IssueTitle:                  "Retry failing checks",
+			Status:                      state.StatusDead,
+			StartedAt:                   now.Add(-40 * time.Minute),
+			FinishedAt:                  &now,
+			RetryCount:                  1,
+			NextRetryAt:                 &retryAt,
+			PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+			CIFailureOutput:             "checks failed",
 		},
 	})
 
@@ -230,13 +242,20 @@ func TestFleetAPIReviewRetryLifecycleDisplay(t *testing.T) {
 	if !contains(recheck.StatusReason, "waiting for CI, Greptile, or the merge gate") {
 		t.Fatalf("recheck status_reason = %q, want CI/Greptile/merge gate wording", recheck.StatusReason)
 	}
+	ciRetry := findFleetWorker(t, resp.Workers, "ci-retry")
+	if ciRetry.DisplayStatus != "" {
+		t.Fatalf("ci retry display_status = %q, want raw dead state", ciRetry.DisplayStatus)
+	}
+	if !ciRetry.NeedsAttention || !contains(ciRetry.StatusReason, "retry is scheduled") {
+		t.Fatalf("ci retry why = %q / attention %v, want dead retry guidance", ciRetry.StatusReason, ciRetry.NeedsAttention)
+	}
 
 	project := findFleetProject(t, resp.Projects, "ReviewRetry")
-	if project.Failed != 0 || resp.Summary.Failed != 0 {
-		t.Fatalf("failed counts = project %d fleet %d, want review retry excluded", project.Failed, resp.Summary.Failed)
+	if project.Failed != 1 || resp.Summary.Failed != 1 {
+		t.Fatalf("failed counts = project %d fleet %d, want only CI retry counted", project.Failed, resp.Summary.Failed)
 	}
-	if project.NeedsAttention != 0 || resp.Summary.NeedsAttention != 0 {
-		t.Fatalf("attention counts = project %d fleet %d, want none", project.NeedsAttention, resp.Summary.NeedsAttention)
+	if project.NeedsAttention != 1 || resp.Summary.NeedsAttention != 1 {
+		t.Fatalf("attention counts = project %d fleet %d, want only CI retry attention", project.NeedsAttention, resp.Summary.NeedsAttention)
 	}
 }
 

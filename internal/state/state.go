@@ -272,7 +272,7 @@ func hasReviewFeedbackRetry(sess *Session) bool {
 	if sess == nil {
 		return false
 	}
-	return strings.TrimSpace(sess.RetryReason) == RetryReasonReviewFeedback || strings.TrimSpace(sess.PreviousAttemptFeedbackKind) == RetryReasonReviewFeedback
+	return strings.TrimSpace(sess.RetryReason) == RetryReasonReviewFeedback
 }
 
 func sessionHasFailedCheckEvidence(sess *Session) bool {

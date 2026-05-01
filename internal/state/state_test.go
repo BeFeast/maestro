@@ -801,6 +801,7 @@ func TestSessionDisplayStatusFor_ReviewFeedbackRetryLifecycle(t *testing.T) {
 				Status:                      StatusDead,
 				NextRetryAt:                 &future,
 				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+				RetryReason:                 RetryReasonReviewFeedback,
 			},
 			want: string(DisplayReviewRetryBackoff),
 		},
@@ -810,6 +811,7 @@ func TestSessionDisplayStatusFor_ReviewFeedbackRetryLifecycle(t *testing.T) {
 				Status:                      StatusDead,
 				NextRetryAt:                 &past,
 				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+				RetryReason:                 RetryReasonReviewFeedback,
 			},
 			want: string(DisplayReviewRetryPending),
 		},
@@ -834,6 +836,15 @@ func TestSessionDisplayStatusFor_ReviewFeedbackRetryLifecycle(t *testing.T) {
 		{
 			name: "genuine dead remains dead",
 			sess: &Session{Status: StatusDead},
+			want: string(StatusDead),
+		},
+		{
+			name: "ci retry carrying review feedback remains dead",
+			sess: &Session{
+				Status:                      StatusDead,
+				NextRetryAt:                 &future,
+				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+			},
 			want: string(StatusDead),
 		},
 	}
@@ -882,6 +893,7 @@ func TestSessionAttentionFor_ReviewFeedbackRetryCopy(t *testing.T) {
 				Status:                      StatusDead,
 				NextRetryAt:                 &future,
 				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+				RetryReason:                 RetryReasonReviewFeedback,
 			},
 			wantReason: "waiting for the retry backoff",
 			wantAction: "scheduled retry worker",

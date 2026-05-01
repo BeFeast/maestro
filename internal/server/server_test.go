@@ -192,6 +192,7 @@ func TestHandleStateReviewRetryLifecycleDisplay(t *testing.T) {
 		RetryCount:                  1,
 		NextRetryAt:                 &retryAt,
 		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		RetryReason:                 state.RetryReasonReviewFeedback,
 	}
 	st.Sessions["slot-recheck"] = &state.Session{
 		IssueNumber: 43,
@@ -201,6 +202,17 @@ func TestHandleStateReviewRetryLifecycleDisplay(t *testing.T) {
 		PRNumber:    13,
 		RetryCount:  1,
 		RetryReason: state.RetryReasonReviewFeedback,
+	}
+	st.Sessions["slot-ci-retry"] = &state.Session{
+		IssueNumber:                 44,
+		IssueTitle:                  "Retry failing checks",
+		Status:                      state.StatusDead,
+		StartedAt:                   now.Add(-40 * time.Minute),
+		FinishedAt:                  &now,
+		RetryCount:                  1,
+		NextRetryAt:                 &retryAt,
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		CIFailureOutput:             "checks failed",
 	}
 	if err := state.Save(dir, st); err != nil {
 		t.Fatalf("save state: %v", err)
@@ -224,8 +236,15 @@ func TestHandleStateReviewRetryLifecycleDisplay(t *testing.T) {
 	if !contains(recheck.StatusReason, "waiting for CI, Greptile, or the merge gate") {
 		t.Fatalf("recheck status_reason = %q, want CI/Greptile/merge gate wording", recheck.StatusReason)
 	}
-	if resp.Summary[string(state.StatusDead)] != 0 {
-		t.Fatalf("summary dead = %d, want review retry excluded from dead count", resp.Summary[string(state.StatusDead)])
+	ciRetry := findSessionInfo(t, resp.All, "slot-ci-retry")
+	if ciRetry.DisplayStatus != "" {
+		t.Fatalf("ci retry display_status = %q, want raw dead state", ciRetry.DisplayStatus)
+	}
+	if !ciRetry.NeedsAttention || !contains(ciRetry.StatusReason, "retry is scheduled") {
+		t.Fatalf("ci retry why = %q / attention %v, want dead retry guidance", ciRetry.StatusReason, ciRetry.NeedsAttention)
+	}
+	if resp.Summary[string(state.StatusDead)] != 1 {
+		t.Fatalf("summary dead = %d, want CI retry counted as dead", resp.Summary[string(state.StatusDead)])
 	}
 	if resp.Summary[string(state.DisplayReviewRetryBackoff)] != 1 {
 		t.Fatalf("summary review_retry_backoff = %d, want 1", resp.Summary[string(state.DisplayReviewRetryBackoff)])
