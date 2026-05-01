@@ -253,6 +253,26 @@ func TestFleetAPISurfacesProjectErrorsAndStaleFreshness(t *testing.T) {
 	}
 }
 
+func TestFleetProjectFreshnessUsesRawAgeForStaleThreshold(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, nil)
+
+	staleAt := now.Add(-fleetProjectStaleAfter - 100*time.Millisecond)
+	if err := os.Chtimes(state.StatePath(stateDir), staleAt, staleAt); err != nil {
+		t.Fatalf("make state barely stale: %v", err)
+	}
+
+	freshness := fleetProjectFreshnessForState(stateDir, nil, now)
+	if freshness.SnapshotAgeSeconds != int64(fleetProjectStaleAfter/time.Second) {
+		t.Fatalf("snapshot age seconds = %d, want rounded threshold", freshness.SnapshotAgeSeconds)
+	}
+	if !freshness.Stale {
+		t.Fatalf("freshness = %+v, want stale based on raw age", freshness)
+	}
+}
+
 func TestFleetAPIIncludesApprovalInboxMetadata(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

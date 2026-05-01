@@ -557,7 +557,7 @@ func fleetProjectFreshnessForState(stateDir string, st *state.State, now time.Ti
 	freshness.SnapshotAt = formatFleetTime(snapshotAt)
 	freshness.SnapshotAge = formatFleetAge(snapshotAt, now)
 	freshness.SnapshotAgeSeconds = fleetAgeSeconds(snapshotAt, now)
-	if time.Duration(freshness.SnapshotAgeSeconds)*time.Second > fleetProjectStaleAfter {
+	if now.Sub(snapshotAt) > fleetProjectStaleAfter {
 		freshness.Stale = true
 		freshness.Reason = fmt.Sprintf("State/log snapshot has not changed for %s; stale after %s.", freshness.SnapshotAge, fleetProjectStaleAfter)
 	}
