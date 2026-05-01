@@ -150,16 +150,8 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	var runnerContent string
-	if stdinFile != "" {
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s < %q 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), stdinFile, logFile)
-	} else {
-		runnerContent = fmt.Sprintf("#!/bin/bash\nexec %s 2>&1 | tee -a %q\n",
-			shellJoin(workerCmd.Args), logFile)
-	}
-	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
-		return fmt.Errorf("write runner script: %w", err)
+	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree); err != nil {
+		return err
 	}
 
 	// Run before_run hook (fatal on failure)

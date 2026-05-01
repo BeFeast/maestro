@@ -85,6 +85,7 @@ gemini -p "<prompt content>" [extra_args...]
 - Prompt content is read from the prompt file and passed inline as a `-p` argument
 - Extra arguments from config are appended after the prompt
 - The working directory is set to the issue's git worktree
+- Worker runner scripts export `MAESTRO_WORKTREE` and wrap `rg`, `find`, and `grep` so broad-root searches warn and point back to the worktree
 - No stdin redirection is used (unlike the Codex backend)
 
 ## Per-issue routing
