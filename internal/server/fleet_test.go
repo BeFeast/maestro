@@ -172,6 +172,107 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 }
 
+func TestFleetAPISurfacesProjectErrorsAndStaleFreshness(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	healthyStateDir := filepath.Join(dir, "healthy")
+	staleStateDir := filepath.Join(dir, "stale")
+	brokenStateDir := filepath.Join(dir, "broken")
+	finished := now.Add(-2 * time.Minute)
+	saveFleetTestState(t, healthyStateDir, map[string]*state.Session{
+		"healthy-1": {
+			IssueNumber: 1,
+			IssueTitle:  "Healthy done worker",
+			Status:      state.StatusDone,
+			StartedAt:   now.Add(-10 * time.Minute),
+			FinishedAt:  &finished,
+		},
+	})
+	saveFleetTestState(t, staleStateDir, map[string]*state.Session{
+		"stale-1": {
+			IssueNumber: 2,
+			IssueTitle:  "Stale done worker",
+			Status:      state.StatusDone,
+			StartedAt:   now.Add(-20 * time.Minute),
+			FinishedAt:  &finished,
+		},
+	})
+	staleAt := now.Add(-fleetProjectStaleAfter - time.Minute)
+	if err := os.Chtimes(state.StatePath(staleStateDir), staleAt, staleAt); err != nil {
+		t.Fatalf("make state stale: %v", err)
+	}
+	if err := os.MkdirAll(brokenStateDir, 0o755); err != nil {
+		t.Fatalf("create broken state dir: %v", err)
+	}
+	if err := os.WriteFile(state.StatePath(brokenStateDir), []byte("{not-json"), 0o644); err != nil {
+		t.Fatalf("write broken state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("Healthy", "/tmp/healthy.yaml", "", &config.Config{
+			Repo:        "owner/healthy",
+			StateDir:    healthyStateDir,
+			MaxParallel: 1,
+		}),
+		NewFleetProject("Stale", "/tmp/stale.yaml", "", &config.Config{
+			Repo:        "owner/stale",
+			StateDir:    staleStateDir,
+			MaxParallel: 1,
+		}),
+		NewFleetProject("Broken", "/tmp/broken.yaml", "", &config.Config{
+			Repo:        "owner/broken",
+			StateDir:    brokenStateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	if resp.RefreshedAt == "" {
+		t.Fatal("fleet response should include refreshed_at")
+	}
+	if resp.Summary.Projects != 3 || resp.Summary.Stale != 1 || resp.Summary.Errors != 1 {
+		t.Fatalf("summary = %+v, want 3 projects, 1 stale, 1 error", resp.Summary)
+	}
+	healthy := findFleetProject(t, resp.Projects, "Healthy")
+	if healthy.Error != "" || healthy.Sessions != 1 {
+		t.Fatalf("healthy project = %+v, want rendered without error", healthy)
+	}
+	if healthy.Freshness.SnapshotAt == "" || healthy.Freshness.Stale {
+		t.Fatalf("healthy freshness = %+v, want fresh snapshot metadata", healthy.Freshness)
+	}
+	stale := findFleetProject(t, resp.Projects, "Stale")
+	if !stale.Freshness.Stale || stale.Freshness.SnapshotAgeSeconds <= int64(fleetProjectStaleAfter/time.Second) {
+		t.Fatalf("stale freshness = %+v, want stale snapshot metadata", stale.Freshness)
+	}
+	if !contains(stale.Freshness.Reason, "stale after") {
+		t.Fatalf("stale reason = %q, want threshold explanation", stale.Freshness.Reason)
+	}
+	broken := findFleetProject(t, resp.Projects, "Broken")
+	if broken.Error == "" || broken.Freshness.StateUpdatedAt == "" {
+		t.Fatalf("broken project = %+v, want load error with state timestamp", broken)
+	}
+}
+
+func TestFleetProjectFreshnessUsesRawAgeForStaleThreshold(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, nil)
+
+	staleAt := now.Add(-fleetProjectStaleAfter - 100*time.Millisecond)
+	if err := os.Chtimes(state.StatePath(stateDir), staleAt, staleAt); err != nil {
+		t.Fatalf("make state barely stale: %v", err)
+	}
+
+	freshness := fleetProjectFreshnessForState(stateDir, nil, now)
+	if freshness.SnapshotAgeSeconds != int64(fleetProjectStaleAfter/time.Second) {
+		t.Fatalf("snapshot age seconds = %d, want rounded threshold", freshness.SnapshotAgeSeconds)
+	}
+	if !freshness.Stale {
+		t.Fatalf("freshness = %+v, want stale based on raw age", freshness)
+	}
+}
+
 func TestFleetAPIIncludesApprovalInboxMetadata(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -681,6 +782,10 @@ func TestFleetDashboard(t *testing.T) {
 		"sortWorkers",
 		"filteredWorkers",
 		"URLSearchParams",
+		"Last refresh",
+		"projectFreshnessHTML",
+		"badge-stale",
+		"State error",
 		"renderActions",
 		"Approval-gated controls",
 	} {
@@ -732,6 +837,17 @@ func findFleetWorker(t *testing.T, workers []fleetWorkerState, slot string) flee
 	}
 	t.Fatalf("worker %q not found in %+v", slot, workers)
 	return fleetWorkerState{}
+}
+
+func findFleetProject(t *testing.T, projects []fleetProjectState, name string) fleetProjectState {
+	t.Helper()
+	for _, project := range projects {
+		if project.Name == name {
+			return project
+		}
+	}
+	t.Fatalf("project %q not found in %+v", name, projects)
+	return fleetProjectState{}
 }
 
 func findFleetApproval(t *testing.T, approvals []fleetApprovalState, id string) fleetApprovalState {

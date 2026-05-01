@@ -290,6 +290,8 @@ Verify the API:
 curl -fsS http://127.0.0.1:8787/api/v1/fleet
 ```
 
+The fleet response includes `refreshed_at` plus per-project freshness metadata. Project cards show snapshot age and are marked stale when the latest state or log snapshot is older than 15 minutes; one project's load error is shown on that card without hiding the rest of the fleet.
+
 `--fleet` versus repeated `--config`:
 
 | Mode | Use it when | Notes |
