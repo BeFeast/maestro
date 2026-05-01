@@ -20,6 +20,7 @@ import (
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/worker"
 )
@@ -2296,6 +2297,54 @@ func (o *Orchestrator) applyOrderedQueueFilter(s *state.State, issues []github.I
 	return nil, true
 }
 
+func (o *Orchestrator) supervisorOwnsDynamicReadyLabel() bool {
+	return o.cfg != nil && o.cfg.Supervisor.DynamicWave.Active() && o.cfg.Supervisor.DynamicWave.OwnsReadyLabel
+}
+
+func (o *Orchestrator) supervisorOwnedReadySelectedIssue(s *state.State) (int, bool) {
+	if !o.supervisorOwnsDynamicReadyLabel() || s == nil {
+		return 0, false
+	}
+	decision := s.LatestSupervisorDecision()
+	if decision == nil || decision.PolicyRule != supervisor.PolicyRuleDynamicWave {
+		return 0, false
+	}
+	if decision.QueueAnalysis != nil && decision.QueueAnalysis.SelectedCandidate != nil && decision.QueueAnalysis.SelectedCandidate.Number > 0 {
+		return decision.QueueAnalysis.SelectedCandidate.Number, true
+	}
+	if decision.Target != nil && decision.Target.Issue > 0 {
+		return decision.Target.Issue, true
+	}
+	return 0, false
+}
+
+func (o *Orchestrator) applySupervisorOwnedReadyFilter(s *state.State, issues []github.Issue) []github.Issue {
+	if !o.supervisorOwnsDynamicReadyLabel() || len(issues) == 0 {
+		return issues
+	}
+
+	selected, ok := o.supervisorOwnedReadySelectedIssue(s)
+	if !ok {
+		for _, issue := range issues {
+			log.Printf("[orch] skipping issue #%d: supervisor-owned ready label has no selected dynamic-wave candidate yet", issue.Number)
+		}
+		return nil
+	}
+
+	filtered := make([]github.Issue, 0, 1)
+	for _, issue := range issues {
+		if issue.Number == selected {
+			filtered = append(filtered, issue)
+			continue
+		}
+		log.Printf("[orch] skipping issue #%d: not supervisor-selected candidate #%d for supervisor-owned ready label", issue.Number, selected)
+	}
+	if len(filtered) == 0 {
+		log.Printf("[orch] supervisor-owned ready label selected issue #%d, but it is not currently returned by issue_labels", selected)
+	}
+	return filtered
+}
+
 func sortedStateSessionNames(s *state.State) []string {
 	names := make([]string, 0, len(s.Sessions))
 	for name := range s.Sessions {
@@ -2313,6 +2362,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	}
 	if filtered, ordered := o.applyOrderedQueueFilter(s, issues); ordered {
 		issues = filtered
+	} else {
+		issues = o.applySupervisorOwnedReadyFilter(s, issues)
 	}
 
 	started := 0
