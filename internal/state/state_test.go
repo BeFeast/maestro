@@ -934,6 +934,118 @@ func TestRecordSupervisorDecisionPrunesOldRecords(t *testing.T) {
 	}
 }
 
+func TestSaveMergesIndependentConcurrentUpdates(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 5, 1, 13, 46, 2, 0, time.UTC)
+	initial := NewState()
+	if err := Save(dir, initial); err != nil {
+		t.Fatalf("Save initial: %v", err)
+	}
+
+	runSnapshot, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load run snapshot: %v", err)
+	}
+	supervisorSnapshot, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load supervisor snapshot: %v", err)
+	}
+
+	decision := SupervisorDecision{
+		ID:                "sup-20260501T134602.103131758Z",
+		CreatedAt:         now,
+		Project:           "BeFeast/maestro",
+		Mode:              "read_only",
+		Summary:           "Start a worker for issue #302: Prevent state lost-update.",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 302},
+		Risk:              "mutating",
+		Confidence:        0.84,
+		Reasons:           []string{"Issue #302 is eligible"},
+	}
+	approval := supervisorSnapshot.RecordPendingApprovalForDecision(decision, now)
+	decision.ApprovalID = approval.ID
+	supervisorSnapshot.RecordSupervisorDecision(decision, DefaultSupervisorDecisionLimit)
+	if err := Save(dir, supervisorSnapshot); err != nil {
+		t.Fatalf("Save supervisor snapshot: %v", err)
+	}
+
+	runSnapshot.Sessions["slot-1"] = &Session{
+		IssueNumber: 17,
+		IssueTitle:  "existing run-loop work",
+		Status:      StatusRunning,
+		StartedAt:   now,
+		PID:         1234,
+	}
+	if err := Save(dir, runSnapshot); err != nil {
+		t.Fatalf("Save stale run snapshot: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load merged state: %v", err)
+	}
+	if loaded.Sessions["slot-1"] == nil {
+		t.Fatal("run-loop session missing after merge")
+	}
+	latest := loaded.LatestSupervisorDecision()
+	if latest == nil || latest.ID != decision.ID || latest.Target == nil || latest.Target.Issue != 302 {
+		t.Fatalf("latest decision = %#v, want supervisor decision for issue #302", latest)
+	}
+	loadedApproval, ok := loaded.FindApproval(approval.ID)
+	if !ok {
+		t.Fatalf("approval %q missing after stale run-loop save", approval.ID)
+	}
+	if loadedApproval.Status != ApprovalStatusPending {
+		t.Fatalf("approval status = %q, want pending", loadedApproval.Status)
+	}
+	if _, err := loaded.ApproveApproval(approval.ID, now.Add(time.Minute), "test", "race preserved"); err != nil {
+		t.Fatalf("ApproveApproval after merge: %v", err)
+	}
+}
+
+func TestSaveRejectsConcurrentSameSessionConflict(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 5, 1, 13, 46, 2, 0, time.UTC)
+	initial := NewState()
+	initial.Sessions["slot-1"] = &Session{
+		IssueNumber: 42,
+		IssueTitle:  "same session",
+		Status:      StatusRunning,
+		StartedAt:   now,
+		PID:         100,
+	}
+	if err := Save(dir, initial); err != nil {
+		t.Fatalf("Save initial: %v", err)
+	}
+
+	first, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load first: %v", err)
+	}
+	second, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load second: %v", err)
+	}
+
+	first.Sessions["slot-1"].PID = 200
+	if err := Save(dir, first); err != nil {
+		t.Fatalf("Save first: %v", err)
+	}
+	second.Sessions["slot-1"].PID = 300
+	if err := Save(dir, second); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("Save second err = %v, want %v", err, ErrStateConflict)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load after conflict: %v", err)
+	}
+	if got := loaded.Sessions["slot-1"].PID; got != 200 {
+		t.Fatalf("PID = %d, want first writer value 200", got)
+	}
+}
+
 func TestApprovalPendingPersistence(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
