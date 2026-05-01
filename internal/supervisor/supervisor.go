@@ -404,7 +404,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 	if len(candidates) == 0 {
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Dynamic wave checked %d open issue(s)", len(issues)),
-			fmt.Sprintf("Dynamic wave found %d eligible candidate(s), %d excluded issue(s), and %d issue(s) in non-runnable project status", analysis.EligibleCandidates, analysis.ExcludedIssues, analysis.NonRunnableProjectStatusCount),
+			fmt.Sprintf("Dynamic wave found %d eligible candidate(s), %d excluded issue(s), %d held/meta issue(s), %d blocked-by-dependency issue(s), and %d issue(s) in non-runnable project status", analysis.EligibleCandidates, analysis.ExcludedIssues, analysis.HeldIssues, analysis.BlockedByDependencyIssues, analysis.NonRunnableProjectStatusCount),
 		)
 		for _, reason := range firstN(result.skipped, 3) {
 			reasons = append(reasons, reason)
@@ -885,6 +885,8 @@ type dynamicSkipCategory string
 const (
 	dynamicSkipOther         dynamicSkipCategory = "other"
 	dynamicSkipExcluded      dynamicSkipCategory = "excluded"
+	dynamicSkipHeldMeta      dynamicSkipCategory = "held_meta"
+	dynamicSkipBlockedDep    dynamicSkipCategory = "blocked_by_dependency"
 	dynamicSkipProjectStatus dynamicSkipCategory = "project_status"
 )
 
@@ -939,10 +941,14 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 			return policyCandidateResult{}, err
 		}
 		if reason != "" {
-			if category == dynamicSkipExcluded {
+			switch category {
+			case dynamicSkipExcluded:
 				analysis.ExcludedIssues++
-			}
-			if category == dynamicSkipProjectStatus {
+			case dynamicSkipHeldMeta:
+				analysis.HeldIssues++
+			case dynamicSkipBlockedDep:
+				analysis.BlockedByDependencyIssues++
+			case dynamicSkipProjectStatus:
 				analysis.NonRunnableProjectStatusCount++
 			}
 			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by dynamic wave policy: %s", issue.Number, reason))
@@ -981,13 +987,16 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue) (str
 		return "retry limit exhausted", dynamicSkipOther, nil
 	}
 	if st.IsMissionParent(issue.Number) {
-		return "mission parent issue", dynamicSkipOther, nil
+		return heldMetaSkipReason("mission parent issue"), dynamicSkipHeldMeta, nil
 	}
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
-		return "mission issue awaits decomposition", dynamicSkipOther, nil
+		return heldMetaSkipReason("mission issue awaits decomposition"), dynamicSkipHeldMeta, nil
 	}
 	if titleLooksEpic(issue.Title) {
-		return "title indicates epic", dynamicSkipExcluded, nil
+		return heldMetaSkipReason("title indicates epic"), dynamicSkipHeldMeta, nil
+	}
+	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok {
+		return heldMetaSkipReason(fmt.Sprintf("label %q", label)), dynamicSkipHeldMeta, nil
 	}
 	if label, ok := firstMatchingIssueLabel(issue, e.dynamicWaveExcludedLabels()); ok {
 		return fmt.Sprintf("excluded by label %q", label), dynamicSkipExcluded, nil
@@ -1002,7 +1011,7 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue) (str
 			return "", dynamicSkipOther, err
 		}
 		if len(openBlockers) > 0 {
-			return fmt.Sprintf("blocked by open issue(s) %s", issueRefs(openBlockers)), dynamicSkipOther, nil
+			return blockedByDependencySkipReason(openBlockers), dynamicSkipBlockedDep, nil
 		}
 	}
 	return "", dynamicSkipOther, nil
@@ -1271,18 +1280,22 @@ func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.
 		return "retry limit exhausted", nil
 	}
 	if st.IsMissionParent(issue.Number) {
-		return "mission parent issue", nil
+		return heldMetaSkipReason("mission parent issue"), nil
 	}
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
-		return "mission issue awaits decomposition", nil
+		return heldMetaSkipReason("mission issue awaits decomposition"), nil
 	}
-	if github.HasLabel(issue, excludeLabels) {
+	policyExcludedLabels := excludeLabelsExcept(e.policyExcludedLabels(), ignoredBlockedLabel)
+	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(excludeLabels, label) || hasLabelName(policyExcludedLabels, label)) {
+		return heldMetaSkipReason(fmt.Sprintf("label %q", label)), nil
+	}
+	if _, ok := firstMatchingIssueLabel(issue, excludeLabels); ok {
 		return "excluded by configured label", nil
 	}
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && !strings.EqualFold(blockedLabel, ignoredBlockedLabel) && github.HasLabel(issue, []string{blockedLabel}) {
 		return "blocked by supervisor policy label", nil
 	}
-	if github.HasLabel(issue, excludeLabelsExcept(e.policyExcludedLabels(), ignoredBlockedLabel)) {
+	if _, ok := firstMatchingIssueLabel(issue, policyExcludedLabels); ok {
 		return "excluded by supervisor policy label", nil
 	}
 	if len(e.cfg.BlockerPatterns) > 0 {
@@ -1292,7 +1305,7 @@ func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.
 			return "", err
 		}
 		if len(openBlockers) > 0 {
-			return fmt.Sprintf("blocked by open issue(s) %s", issueRefs(openBlockers)), nil
+			return blockedByDependencySkipReason(openBlockers), nil
 		}
 	}
 	return "", nil
@@ -1415,13 +1428,29 @@ func (e *Engine) requiredIssueLabels() []string {
 }
 
 func (e *Engine) dynamicWaveExcludedLabels() []string {
-	labels := []string{"blocked", "wontfix", "question", "duplicate", "invalid", "epic", "meta"}
+	labels := []string{"blocked", "wontfix", "question", "duplicate", "invalid"}
 	labels = append(labels, e.cfg.ExcludeLabels...)
 	labels = append(labels, e.policyExcludedLabels()...)
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
 		labels = append(labels, blockedLabel)
 	}
 	return uniqueLabelNames(labels)
+}
+
+func heldMetaLabels() []string {
+	return []string{"epic", "meta"}
+}
+
+func heldMetaSkipReason(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return "held/meta"
+	}
+	return "held/meta: " + reason
+}
+
+func blockedByDependencySkipReason(openBlockers []int) string {
+	return fmt.Sprintf("blocked by dependency: open issue(s) %s", issueRefs(openBlockers))
 }
 
 func uniqueLabelNames(labels []string) []string {
@@ -1578,6 +1607,8 @@ func supervisorQueueAnalysis(policyRule string, openIssues int, eligible []githu
 		OpenIssues:                    openIssues,
 		EligibleCandidates:            len(eligible),
 		ExcludedIssues:                countQueueExcludedReasons(skipped),
+		HeldIssues:                    countQueueHeldReasons(skipped),
+		BlockedByDependencyIssues:     countQueueBlockedByDependencyReasons(skipped),
 		NonRunnableProjectStatusCount: countQueueNonRunnableReasons(skipped),
 		SkippedReasons:                firstN(skipped, 5),
 	}
@@ -1594,8 +1625,32 @@ func countQueueExcludedReasons(skipped []string) int {
 		if strings.Contains(lower, "excluded by configured label") ||
 			strings.Contains(lower, "excluded by supervisor policy label") ||
 			strings.Contains(lower, "blocked by supervisor policy label") ||
-			strings.Contains(lower, "skipped by dynamic wave policy: excluded") ||
+			strings.Contains(lower, "skipped by dynamic wave policy: excluded") {
+			count++
+		}
+	}
+	return count
+}
+
+func countQueueHeldReasons(skipped []string) int {
+	count := 0
+	for _, reason := range skipped {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "held/meta") ||
+			strings.Contains(lower, "mission parent issue") ||
+			strings.Contains(lower, "mission issue awaits decomposition") ||
 			strings.Contains(lower, "title indicates epic") {
+			count++
+		}
+	}
+	return count
+}
+
+func countQueueBlockedByDependencyReasons(skipped []string) int {
+	count := 0
+	for _, reason := range skipped {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "blocked by dependency") || strings.Contains(lower, "blocked by open issue") {
 			count++
 		}
 	}
@@ -2015,8 +2070,10 @@ func firstMissingLabelTarget(issues []github.Issue, labels []string) *state.Supe
 func policySkipReason(reason string) bool {
 	return strings.Contains(reason, "excluded by configured label") ||
 		strings.Contains(reason, "skipped by dynamic wave policy") ||
+		strings.Contains(reason, "held/meta") ||
 		strings.Contains(reason, "mission parent issue") ||
 		strings.Contains(reason, "mission issue awaits decomposition") ||
+		strings.Contains(reason, "blocked by dependency") ||
 		strings.Contains(reason, "blocked by open issue")
 }
 

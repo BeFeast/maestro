@@ -275,12 +275,18 @@ func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 		Risk:              "safe",
 		PolicyRule:        "supervisor.dynamic_wave",
 		QueueAnalysis: &state.SupervisorQueueAnalysis{
-			PolicyRule:         "supervisor.dynamic_wave",
-			OpenIssues:         11,
-			EligibleCandidates: 0,
-			ExcludedIssues:     11,
+			PolicyRule:                    "supervisor.dynamic_wave",
+			OpenIssues:                    4,
+			EligibleCandidates:            0,
+			ExcludedIssues:                1,
+			HeldIssues:                    1,
+			BlockedByDependencyIssues:     1,
+			NonRunnableProjectStatusCount: 1,
 			SkippedReasons: []string{
 				"Issue #24 skipped by dynamic wave policy: excluded by label \"blocked\"",
+				"Issue #25 skipped by dynamic wave policy: held/meta: mission parent issue",
+				"Issue #26 skipped by dynamic wave policy: blocked by dependency: open issue(s) #12",
+				"Issue #27 skipped by dynamic wave policy: project status \"In Progress\" is not runnable",
 			},
 		},
 	}, state.DefaultSupervisorDecisionLimit)
@@ -330,16 +336,16 @@ func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	if excluded.QueueSnapshot == nil {
 		t.Fatal("excluded project queue snapshot is nil")
 	}
-	if excluded.QueueSnapshot.Open != 11 || excluded.QueueSnapshot.Eligible != 0 || excluded.QueueSnapshot.Excluded != 11 {
-		t.Fatalf("excluded queue snapshot = %+v, want open=11 eligible=0 excluded=11", excluded.QueueSnapshot)
+	if excluded.QueueSnapshot.Open != 4 || excluded.QueueSnapshot.Eligible != 0 || excluded.QueueSnapshot.Excluded != 1 || excluded.QueueSnapshot.Held != 1 || excluded.QueueSnapshot.BlockedByDependency != 1 || excluded.QueueSnapshot.NonRunnableProjectStatusCount != 1 {
+		t.Fatalf("excluded queue snapshot = %+v, want classified skipped counts", excluded.QueueSnapshot)
 	}
-	if !contains(excluded.QueueSnapshot.IdleReason, "Policy excluded all 11 open issues") {
-		t.Fatalf("idle reason = %q, want all-excluded explanation", excluded.QueueSnapshot.IdleReason)
+	if !contains(excluded.QueueSnapshot.IdleReason, "Queue policy classified all 4 open issues") || !contains(excluded.QueueSnapshot.IdleReason, "blocked-by-dependency=1") {
+		t.Fatalf("idle reason = %q, want classified explanation", excluded.QueueSnapshot.IdleReason)
 	}
 	if !contains(excluded.QueueSnapshot.TopSkippedReason, "excluded by label") {
 		t.Fatalf("top skipped reason = %q, want excluded label reason", excluded.QueueSnapshot.TopSkippedReason)
 	}
-	if excluded.Supervisor.Latest == nil || excluded.Supervisor.Latest.QueueAnalysis == nil || excluded.Supervisor.Latest.QueueAnalysis.OpenIssues != 11 {
+	if excluded.Supervisor.Latest == nil || excluded.Supervisor.Latest.QueueAnalysis == nil || excluded.Supervisor.Latest.QueueAnalysis.OpenIssues != 4 || excluded.Supervisor.Latest.QueueAnalysis.HeldIssues != 1 {
 		t.Fatalf("supervisor latest queue analysis = %#v, want exposed analysis", excluded.Supervisor.Latest)
 	}
 
@@ -991,6 +997,9 @@ func TestFleetDashboard(t *testing.T) {
 		"Queue Snapshot",
 		"queueSnapshotHTML",
 		"queue-snapshot",
+		"held/meta",
+		"blocked-deps",
+		"blocked by open dependencies",
 		"next_action",
 		"sortWorkers",
 		"filteredWorkers",

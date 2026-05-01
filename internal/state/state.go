@@ -360,6 +360,8 @@ type SupervisorQueueAnalysis struct {
 	OpenIssues                    int                       `json:"open_issues"`
 	EligibleCandidates            int                       `json:"eligible_candidates"`
 	ExcludedIssues                int                       `json:"excluded_issues"`
+	HeldIssues                    int                       `json:"held_issues"`
+	BlockedByDependencyIssues     int                       `json:"blocked_by_dependency_issues"`
 	NonRunnableProjectStatusCount int                       `json:"non_runnable_project_status_count"`
 	SelectedCandidate             *SupervisorIssueCandidate `json:"selected_candidate,omitempty"`
 	SkippedReasons                []string                  `json:"skipped_reasons,omitempty"`
@@ -389,16 +391,51 @@ func (q *SupervisorQueueAnalysis) IdleReason() string {
 	if q.ExcludedIssues >= q.OpenIssues {
 		return fmt.Sprintf("Policy excluded all %s.", openIssuePhrase(q.OpenIssues))
 	}
+	if q.HeldIssues >= q.OpenIssues {
+		return fmt.Sprintf("Held/meta policy held all %s.", openIssuePhrase(q.OpenIssues))
+	}
+	if q.BlockedByDependencyIssues >= q.OpenIssues {
+		return fmt.Sprintf("Open dependencies blocked all %s.", openIssuePhrase(q.OpenIssues))
+	}
 	if q.NonRunnableProjectStatusCount >= q.OpenIssues {
 		return fmt.Sprintf("All %s are in a non-runnable project status.", openIssuePhrase(q.OpenIssues))
 	}
-	if q.ExcludedIssues+q.NonRunnableProjectStatusCount >= q.OpenIssues {
-		return fmt.Sprintf("Policy excluded or held all %s.", openIssuePhrase(q.OpenIssues))
+	if q.classifiedSkipCount() >= q.OpenIssues {
+		return fmt.Sprintf("Queue policy classified all %s: %s.", openIssuePhrase(q.OpenIssues), strings.Join(q.skipCategorySummaries(), ", "))
 	}
 	if reason := q.TopSkippedReason(); reason != "" {
 		return "No issue is eligible: " + reason
 	}
 	return "No issue is eligible under the current supervisor policy."
+}
+
+func (q *SupervisorQueueAnalysis) classifiedSkipCount() int {
+	if q == nil {
+		return 0
+	}
+	return q.ExcludedIssues + q.HeldIssues + q.BlockedByDependencyIssues + q.NonRunnableProjectStatusCount
+}
+
+func (q *SupervisorQueueAnalysis) skipCategorySummaries() []string {
+	if q == nil {
+		return nil
+	}
+	categories := []struct {
+		label string
+		count int
+	}{
+		{label: "excluded", count: q.ExcludedIssues},
+		{label: "held/meta", count: q.HeldIssues},
+		{label: "blocked-by-dependency", count: q.BlockedByDependencyIssues},
+		{label: "non-runnable project status", count: q.NonRunnableProjectStatusCount},
+	}
+	summaries := make([]string, 0, len(categories))
+	for _, category := range categories {
+		if category.count > 0 {
+			summaries = append(summaries, fmt.Sprintf("%s=%d", category.label, category.count))
+		}
+	}
+	return summaries
 }
 
 func openIssuePhrase(count int) string {

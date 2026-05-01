@@ -221,6 +221,8 @@ type fleetQueueSnapshot struct {
 	Open                          int                             `json:"open"`
 	Eligible                      int                             `json:"eligible"`
 	Excluded                      int                             `json:"excluded"`
+	Held                          int                             `json:"held"`
+	BlockedByDependency           int                             `json:"blocked_by_dependency"`
 	NonRunnableProjectStatusCount int                             `json:"non_runnable_project_status_count"`
 	SelectedCandidate             *state.SupervisorIssueCandidate `json:"selected_candidate,omitempty"`
 	TopSkippedReason              string                          `json:"top_skipped_reason,omitempty"`
@@ -593,6 +595,8 @@ func fleetQueueSnapshotFromSupervisor(info supervisorInfo) *fleetQueueSnapshot {
 		Open:                          analysis.OpenIssues,
 		Eligible:                      analysis.EligibleCandidates,
 		Excluded:                      analysis.ExcludedIssues,
+		Held:                          analysis.HeldIssues,
+		BlockedByDependency:           analysis.BlockedByDependencyIssues,
 		NonRunnableProjectStatusCount: analysis.NonRunnableProjectStatusCount,
 		TopSkippedReason:              analysis.TopSkippedReason(),
 		IdleReason:                    analysis.IdleReason(),
@@ -2560,11 +2564,17 @@ async function loadWorkerDetail() {
 function queueSnapshotHTML(project) {
   const q = project.queue_snapshot;
   if (!q) return "";
+  const excluded = Number(q.excluded || 0);
+  const held = Number(q.held || q.held_issues || 0);
+  const blockedByDependency = Number(q.blocked_by_dependency || q.blocked_by_dependency_issues || 0);
+  const nonRunnable = Number(q.non_runnable_project_status_count || 0);
   const parts = [
     "open=" + Number(q.open || 0),
     "eligible=" + Number(q.eligible || 0),
-    "excluded=" + Number(q.excluded || 0),
-    "non-runnable=" + Number(q.non_runnable_project_status_count || 0)
+    "excluded=" + excluded,
+    "held/meta=" + held,
+    "blocked-deps=" + blockedByDependency,
+    "non-runnable=" + nonRunnable
   ];
   const selected = q.selected_candidate && q.selected_candidate.number
     ? "selected #" + q.selected_candidate.number + (q.selected_candidate.title ? " " + q.selected_candidate.title : "")
@@ -2572,6 +2582,14 @@ function queueSnapshotHTML(project) {
   if (selected) parts.push(selected);
 
   const lines = ['<div class="queue-line"><strong>Queue</strong><span>' + escapeText(parts.join(" · ")) + '</span></div>'];
+  const skipped = [];
+  if (excluded) skipped.push(excluded + " excluded by label/policy");
+  if (held) skipped.push(held + " held parent/meta");
+  if (blockedByDependency) skipped.push(blockedByDependency + " blocked by open dependencies");
+  if (nonRunnable) skipped.push(nonRunnable + " in non-runnable project status");
+  if (skipped.length) {
+    lines.push('<div class="queue-line"><strong>Skipped</strong><span>' + escapeText(skipped.join(" · ")) + '</span></div>');
+  }
   const isIdle = (project.running || 0) === 0;
   let idleReason = isIdle ? (q.idle_reason || "") : "";
   const topSkip = isIdle && q.eligible === 0 && q.top_skipped_reason && !(idleReason || "").includes(q.top_skipped_reason)

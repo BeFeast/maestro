@@ -1086,6 +1086,27 @@ func TestSupervisorQueueAnalysisIdleReasonExplainsAllExcluded(t *testing.T) {
 	}
 }
 
+func TestSupervisorQueueAnalysisIdleReasonExplainsSkipCategories(t *testing.T) {
+	analysis := &SupervisorQueueAnalysis{
+		OpenIssues:                    4,
+		EligibleCandidates:            0,
+		ExcludedIssues:                1,
+		HeldIssues:                    1,
+		BlockedByDependencyIssues:     1,
+		NonRunnableProjectStatusCount: 1,
+	}
+
+	want := "Queue policy classified all 4 open issues: excluded=1, held/meta=1, blocked-by-dependency=1, non-runnable project status=1."
+	if got := analysis.IdleReason(); got != want {
+		t.Fatalf("IdleReason = %q, want %q", got, want)
+	}
+
+	analysis = &SupervisorQueueAnalysis{OpenIssues: 2, BlockedByDependencyIssues: 2}
+	if got, want := analysis.IdleReason(), "Open dependencies blocked all 2 open issues."; got != want {
+		t.Fatalf("IdleReason = %q, want %q", got, want)
+	}
+}
+
 func TestRecordSupervisorDecisionPrunesOldRecords(t *testing.T) {
 	s := NewState()
 	now := time.Now().UTC()

@@ -810,7 +810,7 @@ func TestRunOnceDynamicWaveAddsReadyOnlyToBestCandidateAndCleansStale(t *testing
 	}
 }
 
-func TestDecide_DynamicWaveSkipsTitleEpic(t *testing.T) {
+func TestDecide_DynamicWaveClassifiesTitleEpicAsHeld(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
 	enableDynamicWave(cfg)
@@ -827,11 +827,55 @@ func TestDecide_DynamicWaveSkipsTitleEpic(t *testing.T) {
 	if decision.Target == nil || decision.Target.Issue != 2 {
 		t.Fatalf("target = %#v, want issue 2", decision.Target)
 	}
-	if decision.QueueAnalysis == nil || decision.QueueAnalysis.ExcludedIssues != 1 {
-		t.Fatalf("queue analysis = %#v, want one excluded issue", decision.QueueAnalysis)
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.HeldIssues != 1 || decision.QueueAnalysis.ExcludedIssues != 0 {
+		t.Fatalf("queue analysis = %#v, want one held issue and zero excluded issues", decision.QueueAnalysis)
 	}
 	if len(decision.QueueAnalysis.SkippedReasons) == 0 || !strings.Contains(decision.QueueAnalysis.SkippedReasons[0], "title indicates epic") {
 		t.Fatalf("skipped reasons = %#v, want title epic reason", decision.QueueAnalysis.SkippedReasons)
+	}
+}
+
+func TestDecide_DynamicWaveClassifiesAllSkipCategories(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
+	enableDynamicWave(cfg)
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "excluded", "wontfix"),
+		testIssue(2, "mission parent"),
+		{Number: 3, Title: "blocked by dependency", Body: "blocked by #100"},
+		withProjectStatus(testIssue(4, "already started"), "In Progress"),
+	}}
+	st := state.NewState()
+	st.Missions[2] = &state.Mission{ParentIssue: 2, Status: "active"}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionNone {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionNone)
+	}
+	if decision.QueueAnalysis == nil {
+		t.Fatal("QueueAnalysis is nil")
+	}
+	if got, want := decision.QueueAnalysis.ExcludedIssues, 1; got != want {
+		t.Fatalf("excluded issues = %d, want %d", got, want)
+	}
+	if got, want := decision.QueueAnalysis.HeldIssues, 1; got != want {
+		t.Fatalf("held issues = %d, want %d", got, want)
+	}
+	if got, want := decision.QueueAnalysis.BlockedByDependencyIssues, 1; got != want {
+		t.Fatalf("blocked-by-dependency issues = %d, want %d", got, want)
+	}
+	if got, want := decision.QueueAnalysis.NonRunnableProjectStatusCount, 1; got != want {
+		t.Fatalf("non-runnable issues = %d, want %d", got, want)
+	}
+	rationale := strings.Join(decision.Reasons, "\n")
+	for _, want := range []string{"1 excluded issue", "1 held/meta issue", "1 blocked-by-dependency issue", "1 issue(s) in non-runnable project status"} {
+		if !strings.Contains(rationale, want) {
+			t.Fatalf("rationale = %q, want %q", rationale, want)
+		}
 	}
 }
 
