@@ -571,7 +571,7 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state
 				fmt.Sprintf("Session %s status=retry_exhausted retry_count=%d", slot, sess.RetryCount)))
 		}
 
-		if sess.PreviousAttemptFeedbackKind == "review_feedback" && sess.Status != state.StatusRunning {
+		if sess.PreviousAttemptFeedbackKind == state.RetryReasonReviewFeedback && e.staleReviewFeedbackNeedsAttention(sess) {
 			canAct := sess.Status == state.StatusDead && sess.NextRetryAt != nil
 			findings = append(findings, stuckState("stale_review_feedback", SeverityBlocked,
 				fmt.Sprintf("Issue #%d has review feedback, but no worker is currently fixing it.", sess.IssueNumber),
@@ -580,6 +580,25 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state
 		}
 	}
 	return findings
+}
+
+func (e *Engine) staleReviewFeedbackNeedsAttention(sess *state.Session) bool {
+	if sess == nil || sess.Status == state.StatusRunning || sess.Status == state.StatusDone {
+		return false
+	}
+	if sess.PRNumber > 0 {
+		merged, err := e.reader.IsPRMerged(sess.PRNumber)
+		if err == nil && merged {
+			return false
+		}
+	}
+	if sess.IssueNumber > 0 {
+		closed, err := e.reader.IsIssueClosed(sess.IssueNumber)
+		if err == nil && closed {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR) []state.SupervisorStuckState {

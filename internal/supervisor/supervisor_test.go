@@ -360,6 +360,97 @@ func TestDecide_StaleWorkerLogsExplained(t *testing.T) {
 	}
 }
 
+func TestDetectWorkerStuckStates_SuppressesResolvedReviewFeedback(t *testing.T) {
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		reader *fakeReader
+		sess   *state.Session
+	}{
+		{
+			name:   "done session",
+			reader: &fakeReader{mergedPRs: map[int]bool{375: true}},
+			sess: &state.Session{
+				IssueNumber:                 359,
+				Status:                      state.StatusDone,
+				PRNumber:                    375,
+				PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+			},
+		},
+		{
+			name:   "merged PR",
+			reader: &fakeReader{mergedPRs: map[int]bool{375: true}},
+			sess: &state.Session{
+				IssueNumber:                 359,
+				Status:                      state.StatusDead,
+				PRNumber:                    375,
+				PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+			},
+		},
+		{
+			name:   "retry exhausted merged PR",
+			reader: &fakeReader{mergedPRs: map[int]bool{375: true}},
+			sess: &state.Session{
+				IssueNumber:                 359,
+				Status:                      state.StatusRetryExhausted,
+				PRNumber:                    375,
+				PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+			},
+		},
+		{
+			name:   "closed issue",
+			reader: &fakeReader{closedIssues: map[int]bool{359: true}},
+			sess: &state.Session{
+				IssueNumber:                 359,
+				Status:                      state.StatusDead,
+				PRNumber:                    375,
+				PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := state.NewState()
+			st.Sessions["slot-1"] = tt.sess
+
+			findings := testEngine(testConfig(t), tt.reader).detectWorkerStuckStates(st, now)
+
+			for _, stuck := range findings {
+				if stuck.Code == "stale_review_feedback" {
+					t.Fatalf("resolved review feedback should not create stale_review_feedback: %#v", findings)
+				}
+			}
+		})
+	}
+}
+
+func TestDetectWorkerStuckStates_OpenReviewFeedbackNeedsAttention(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		prs:          []github.PR{{Number: 376, State: "OPEN"}},
+		mergedPRs:    map[int]bool{376: false},
+		closedIssues: map[int]bool{360: false},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber:                 360,
+		Status:                      state.StatusPROpen,
+		PRNumber:                    376,
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	stuck := requireStuckState(t, decision, "stale_review_feedback")
+	if stuck.Severity != SeverityBlocked || stuck.Target == nil || stuck.Target.PR != 376 {
+		t.Fatalf("stale review feedback stuck state = %#v, want blocked PR #376", stuck)
+	}
+}
+
 func TestDecide_ClosedPRWithActiveSessionExplained(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{}

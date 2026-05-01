@@ -493,6 +493,9 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 			if !stuckTargetsSession(stuck, infos[i]) {
 				continue
 			}
+			if staleReviewFeedbackResolved(stuck, infos[i]) {
+				continue
+			}
 			attention := supervisorStuckNeedsAttention(stuck)
 			if !attention {
 				continue
@@ -509,6 +512,17 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 			break
 		}
 	}
+}
+
+func staleReviewFeedbackResolved(stuck state.SupervisorStuckState, info sessionInfo) bool {
+	if stuck.Code != "stale_review_feedback" {
+		return false
+	}
+	status := state.SessionStatus(info.Status)
+	if status == state.StatusDone {
+		return true
+	}
+	return state.IsTerminal(status) && stuck.Target != nil && info.PRNumber > 0 && stuck.Target.PR == info.PRNumber
 }
 
 func stuckTargetsSession(stuck state.SupervisorStuckState, info sessionInfo) bool {

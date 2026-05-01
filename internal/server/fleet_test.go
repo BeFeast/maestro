@@ -259,6 +259,88 @@ func TestFleetAPIReviewRetryLifecycleDisplay(t *testing.T) {
 	}
 }
 
+func TestFleetAPISuppressesResolvedStaleReviewFeedback(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	finished := now.Add(-5 * time.Minute)
+	stateDir := filepath.Join(dir, "resolved-review-feedback")
+	st := state.NewState()
+	st.Sessions["merged-done"] = &state.Session{
+		IssueNumber:                 359,
+		IssueTitle:                  "Merged review feedback",
+		Status:                      state.StatusDone,
+		StartedAt:                   now.Add(-2 * time.Hour),
+		FinishedAt:                  &finished,
+		PRNumber:                    375,
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		RetryReason:                 state.RetryReasonReviewFeedback,
+	}
+	st.Sessions["open-feedback"] = &state.Session{
+		IssueNumber:                 360,
+		IssueTitle:                  "Open review feedback",
+		Status:                      state.StatusPROpen,
+		StartedAt:                   now.Add(-time.Hour),
+		PRNumber:                    376,
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:        "sup-review-feedback",
+		CreatedAt: now,
+		Project:   "owner/resolved-review-feedback",
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "stale_review_feedback",
+				Severity:          "blocked",
+				Summary:           "Issue #359 has review feedback, but no worker is currently fixing it.",
+				RecommendedAction: "Respawn a worker with the saved review feedback or resolve the feedback manually.",
+				Target:            &state.SupervisorTarget{Issue: 359, PR: 375, Session: "merged-done"},
+			},
+			{
+				Code:              "stale_review_feedback",
+				Severity:          "blocked",
+				Summary:           "Issue #360 has review feedback, but no worker is currently fixing it.",
+				RecommendedAction: "Respawn a worker with the saved review feedback or resolve the feedback manually.",
+				Target:            &state.SupervisorTarget{Issue: 360, PR: 376, Session: "open-feedback"},
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	cfg := &config.Config{Repo: "owner/resolved-review-feedback", StateDir: stateDir, MaxParallel: 2}
+
+	single := buildStateResponse(cfg, st)
+	singleDone := findSessionInfo(t, single.All, "merged-done")
+	if singleDone.NeedsAttention || singleDone.DisplayStatus != "" || !contains(singleDone.StatusReason, "Issue is complete") {
+		t.Fatalf("single-project done session = %+v, want neutral historical status", singleDone)
+	}
+	singleOpen := findSessionInfo(t, single.All, "open-feedback")
+	if !singleOpen.NeedsAttention || !contains(singleOpen.StatusReason, "review feedback") {
+		t.Fatalf("single-project open feedback = %+v, want attention", singleOpen)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("ResolvedReviewFeedback", "/tmp/resolved-review-feedback.yaml", "", cfg),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	doneWorker := findFleetWorker(t, resp.Workers, "merged-done")
+	if doneWorker.NeedsAttention || doneWorker.DisplayStatus != "" || !contains(doneWorker.StatusReason, "Issue is complete") {
+		t.Fatalf("fleet done worker = %+v, want neutral historical status", doneWorker)
+	}
+	openWorker := findFleetWorker(t, resp.Workers, "open-feedback")
+	if !openWorker.NeedsAttention || !contains(openWorker.StatusReason, "review feedback") {
+		t.Fatalf("fleet open feedback worker = %+v, want attention", openWorker)
+	}
+	project := findFleetProject(t, resp.Projects, "ResolvedReviewFeedback")
+	if project.NeedsAttention != 1 || resp.Summary.NeedsAttention != 1 || len(resp.Attention) != 1 {
+		t.Fatalf("attention counts = project %d fleet %d inbox %d, want only open feedback", project.NeedsAttention, resp.Summary.NeedsAttention, len(resp.Attention))
+	}
+	if resp.Attention[0].Slot != "open-feedback" {
+		t.Fatalf("attention inbox = %+v, want only open-feedback", resp.Attention)
+	}
+}
+
 func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
