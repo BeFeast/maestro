@@ -249,6 +249,86 @@ systemctl --user enable --now maestro@myproject
 # This reads ~/.maestro/maestro-myproject.yaml
 ```
 
+### Fleet dashboard operating model
+
+Use the fleet dashboard when one operator needs a read-only overview across multiple Maestro-managed repos without SSH spelunking. Each repo still has its own project config, state directory, worker prefix, and optional per-project dashboard; the fleet dashboard loads those configs and aggregates their current state through `/api/v1/fleet`.
+
+Start read-only first, controls later: keep the fleet dashboard in `--read-only` mode while it is used for observation and dogfooding. Add mutating controls only after the auth, audit, and per-project safety model is explicit.
+
+To add a project:
+
+1. Create or update `~/.maestro/maestro-<project>.yaml` using the config shape above.
+2. Use a distinct `state_dir` and `session_prefix` for each project so worker sessions and state files do not overlap.
+3. If you run a per-project Mission Control dashboard, set that project's `server.host`, `server.port`, and `server.read_only: true` in the project config.
+4. Add the project to `~/.maestro/fleet.yaml` with a human name, config path, and optional `dashboard_url`.
+5. Restart the fleet dashboard service and verify `/api/v1/fleet`.
+
+Minimal two-project fleet file:
+
+```yaml
+# ~/.maestro/fleet.yaml
+projects:
+  - name: api
+    config: maestro-api.yaml
+    dashboard_url: http://127.0.0.1:8788
+  - name: web
+    config: maestro-web.yaml
+    dashboard_url: http://127.0.0.1:8789
+```
+
+`config` may be absolute, `~/...`, or relative to the fleet YAML file. `dashboard_url` is only a link target for the fleet UI; omit it when a project does not run its own dashboard. For dogfooding, add Maestro's own project config to the same fleet file so the team can watch Maestro manage Maestro alongside application repos.
+
+Run the fleet dashboard manually:
+
+```bash
+maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only
+```
+
+Verify the API:
+
+```bash
+curl -fsS http://127.0.0.1:8787/api/v1/fleet
+```
+
+`--fleet` versus repeated `--config`:
+
+| Mode | Use it when | Notes |
+|---|---|---|
+| `maestro serve --fleet ~/.maestro/fleet.yaml --port 8787` | You want a stable operating model for a shared dashboard or systemd service | Supports project names, relative config paths, and `dashboard_url` links |
+| `maestro serve --config a.yaml --config b.yaml --port 8787` | You want a quick local aggregate view without writing a fleet file | Project names are derived from `repo`, and there is no place for `dashboard_url` metadata |
+
+For a persistent user service, create a dedicated fleet dashboard unit:
+
+```ini
+# ~/.config/systemd/user/maestro-fleet.service
+[Unit]
+Description=Maestro fleet dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/maestro serve --fleet %h/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Enable it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now maestro-fleet.service
+systemctl --user status maestro-fleet.service
+```
+
+Bind to the LAN only on a trusted network or behind a firewall/reverse proxy:
+
+```bash
+maestro serve --fleet ~/.maestro/fleet.yaml --host 0.0.0.0 --port 8787 --read-only
+```
+
 ---
 
 ## 5. Deploy Script (`scripts/deploy.sh`)
