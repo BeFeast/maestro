@@ -142,6 +142,8 @@ To watch Maestro from a browser, use the read-only Mission Control dashboard:
 maestro serve --config ./maestro.yaml --host 127.0.0.1 --port 8787 --read-only
 ```
 
+For multi-project Fleet Mission Control operations, see [`docs/fleet-mission-control-runbook.md`](docs/fleet-mission-control-runbook.md).
+
 Use `--host 0.0.0.0` only on a trusted network if you want to expose the dashboard to the LAN.
 
 To watch workers live in a tmux dashboard:
@@ -154,9 +156,9 @@ maestro watch
 Create `~/.maestro/config.yaml` or `./maestro.yaml`:
 
 ```yaml
-repo: BeFeast/panoptikon
-local_path: /home/shtrudel/src/panoptikon
-worktree_base: /home/shtrudel/.worktrees/panoptikon
+repo: OWNER/REPO
+local_path: /path/to/local/clone
+worktree_base: /path/to/worktrees/repo
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
 worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N minutes (0 = disabled)
@@ -167,8 +169,8 @@ merge_interval_seconds: 30         # minimum seconds between merges in sequentia
 review_gate: greptile              # "greptile" (default) or "none"
 auto_retry_review_feedback: false  # retry PRs with actionable review comments
 auto_retry_rebase_conflicts: false # retry PRs whose auto-rebase fails with conflicts
-session_prefix: pan                # worker session name prefix (default: first 3 chars of repo name)
-state_dir: ~/.maestro/pan          # state/log directory (default: ~/.maestro/<repo-hash>)
+session_prefix: prj                # worker session name prefix (default: first 3 chars of repo name)
+state_dir: ~/.maestro/<project>    # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude                 # deprecated: use model.backends.claude.cmd
 server:
   host: 127.0.0.1                  # bind address for `maestro serve`
@@ -179,7 +181,7 @@ issue_labels:                      # preferred label filter (OR semantics)
 exclude_labels:
   - blocked
 telegram:
-  target: "79510949"              # Telegram user ID
+  target: "YOUR_TELEGRAM_CHAT_ID" # Telegram user ID
   openclaw_url: "http://localhost:18789"  # OpenClaw gateway
 ```
 
@@ -263,15 +265,15 @@ maestro status --json   # JSON output
 
 Example output:
 ```
-Repo:           BeFeast/panoptikon
-Session prefix: pan
-State file:     /home/shtrudel/.maestro/d581c91d05cc/state.json
+Repo:           OWNER/REPO
+Session prefix: prj
+State file:     ~/.maestro/<repo-hash>/state.json
 Max parallel:   5
 
 SESSION  ISSUE  STATUS   PID    ALIVE  AGE    TITLE
 -------  -----  ------   ---    -----  ---    -----
-pan-1    #154   running  12345  yes    23m    Add asset inventory endpoint
-pan-2    #155   pr_open  12346  no     1h5m   Fix auth token refresh
+prj-1    #154   running  12345  yes    23m    Add asset inventory endpoint
+prj-2    #155   pr_open  12346  no     1h5m   Fix auth refresh
 ```
 
 ### `maestro spawn`
@@ -298,13 +300,13 @@ State is stored in `~/.maestro/<repo-hash>/state.json`:
 ```json
 {
   "sessions": {
-    "pan-1": {
+    "prj-1": {
       "issue_number": 154,
       "issue_title": "Add asset inventory endpoint",
-      "worktree": "/home/shtrudel/.worktrees/panoptikon/pan-1",
-      "branch": "feat/pan-1-154-add-asset-inventory-endpoint",
+      "worktree": "/path/to/worktrees/repo/prj-1",
+      "branch": "feat/prj-1-154-add-asset-inventory-endpoint",
       "pid": 12345,
-      "log_file": "/home/shtrudel/.maestro/.../logs/pan-1.log",
+      "log_file": "~/.maestro/<project>/logs/prj-1.log",
       "started_at": "2026-02-23T00:00:00Z",
       "status": "running"
     }
@@ -363,7 +365,7 @@ For automatic operation, run on a cron schedule:
 
 ```bash
 # ~/.config/cron/maestro.cron
-*/10 * * * * cd /home/shtrudel/src/panoptikon && /usr/local/bin/maestro run --once >> ~/.maestro/maestro.log 2>&1
+*/10 * * * * /usr/local/bin/maestro run --config ~/.maestro/maestro-<project>.yaml --once >> ~/.maestro/maestro-<project>.log 2>&1
 ```
 
 Or run as a daemon:

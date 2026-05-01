@@ -253,6 +253,8 @@ systemctl --user enable --now maestro@myproject
 
 Use the fleet dashboard when one operator needs a read-only overview across multiple Maestro-managed repos without SSH spelunking. Each repo still has its own project config, state directory, `session_prefix`, and optional per-project dashboard; the fleet dashboard loads those configs, keeps them visible in project tabs, and aggregates active workers through `/api/v1/fleet`.
 
+For day-to-day operations, review gates, queue policy, approvals, and safe recovery steps, see the [Fleet Mission Control operating runbook](fleet-mission-control-runbook.md).
+
 Start read-only first, controls later: keep the fleet dashboard in `--read-only` mode while it is used for observation and dogfooding. Add mutating controls only after the auth, audit, and per-project safety model is explicit.
 
 To add a project:
