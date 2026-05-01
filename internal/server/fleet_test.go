@@ -138,6 +138,9 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if worker.TokensUsedTotal != 42000 {
 		t.Fatalf("worker tokens = %d, want 42000", worker.TokensUsedTotal)
 	}
+	if worker.RuntimeSeconds <= 0 {
+		t.Fatalf("worker runtime_seconds = %d, want positive runtime", worker.RuntimeSeconds)
+	}
 	attentionWorker := findFleetWorker(t, resp.Workers, "two-1")
 	if !attentionWorker.NeedsAttention {
 		t.Fatal("retry-exhausted worker should need attention")
@@ -391,14 +394,32 @@ func TestFleetDashboard(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
-	for _, want := range []string{"Maestro Fleet", "/api/v1/fleet", "/api/v1/fleet/worker", "project-tabs", "fleet-workers-body", "worker-detail", "renderFleetWorkers", "renderWorkerDetail", "renderProject", "Why Attention", "Why Not Running", "next_action"} {
+	for _, want := range []string{
+		"Maestro Fleet",
+		"/api/v1/fleet",
+		"/api/v1/fleet/worker",
+		"project-tabs",
+		"fleet-workers-body",
+		"worker-detail",
+		"worker-controls",
+		"worker-filter",
+		"status-filter",
+		"backend-filter",
+		"pr-filter",
+		"worker-sort",
+		"sort-direction",
+		"renderFleetWorkers",
+		"renderWorkerDetail",
+		"renderProject",
+		"Why Attention",
+		"Why Not Running",
+		"next_action",
+		"sortWorkers",
+		"filteredWorkers",
+		"URLSearchParams",
+	} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard should contain %q", want)
-		}
-	}
-	for _, unwanted := range []string{"statusRank", "sortWorkers("} {
-		if contains(body, unwanted) {
-			t.Fatalf("dashboard should not contain duplicate client worker sorting %q", unwanted)
 		}
 	}
 }

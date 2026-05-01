@@ -226,6 +226,7 @@ type fleetWorkerState struct {
 	TokensUsedAttempt int    `json:"tokens_used_attempt"`
 	TokensUsedTotal   int    `json:"tokens_used_total"`
 	Runtime           string `json:"runtime"`
+	RuntimeSeconds    int64  `json:"runtime_seconds"`
 	StartedAt         string `json:"started_at"`
 	FinishedAt        string `json:"finished_at,omitempty"`
 	NextRetryAt       string `json:"next_retry_at,omitempty"`
@@ -483,6 +484,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		TokensUsedAttempt: worker.TokensUsedAttempt,
 		TokensUsedTotal:   worker.TokensUsedTotal,
 		Runtime:           worker.Runtime,
+		RuntimeSeconds:    worker.RuntimeSeconds,
 		StartedAt:         worker.StartedAt,
 		FinishedAt:        worker.FinishedAt,
 		NextRetryAt:       worker.NextRetryAt,
@@ -551,9 +553,14 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
   .sub { color: var(--muted); font-size: 13px; }
-  .stats { display: flex; gap: 18px; flex-wrap: wrap; justify-content: flex-end; }
-  .stat { text-align: right; min-width: 64px; }
-  .stat strong { display: block; font-size: 18px; }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(68px, 1fr));
+    gap: 10px;
+    width: min(520px, 100%);
+  }
+  .stat { text-align: right; min-width: 0; }
+  .stat strong { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
   .stat span { color: var(--muted); font-size: 12px; }
   main { padding: 18px; }
   .project-tabs {
@@ -663,6 +670,35 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .section-head h2 { margin: 0; font-size: 17px; }
   .section-note { color: var(--muted); font-size: 13px; text-align: right; }
+  .worker-controls {
+    display: grid;
+    grid-template-columns: minmax(220px, 2fr) repeat(5, minmax(118px, 1fr));
+    gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(16,22,29,.72);
+  }
+  .worker-controls label { display: grid; gap: 4px; min-width: 0; }
+  .worker-controls span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+    text-transform: uppercase;
+  }
+  .worker-controls input,
+  .worker-controls select,
+  .worker-controls button {
+    min-width: 0;
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text);
+    font: inherit;
+    padding: 7px 9px;
+  }
+  .worker-controls button { align-self: end; cursor: pointer; color: var(--accent); }
+  .worker-controls button:hover { border-color: rgba(88,166,255,.65); }
   .table-scroll { overflow-x: auto; }
   .worker-table {
     width: 100%;
@@ -685,6 +721,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     text-align: left;
     background: var(--panel-2);
   }
+  .worker-table td { max-width: 0; }
   .worker-table tbody tr.row-running { background: rgba(63,185,80,.055); }
   .worker-table tbody tr.row-pr { background: rgba(88,166,255,.055); }
   .worker-table tbody tr.row-attention { background: rgba(248,81,73,.1); }
@@ -782,12 +819,21 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .why-item { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.4; }
   .why-item strong { color: var(--text); }
   .error { color: var(--bad); border: 1px solid rgba(248,81,73,.35); border-radius: 10px; background: rgba(248,81,73,.08); padding: 12px 14px; }
+  @media (max-width: 980px) {
+    header { align-items: flex-start; flex-direction: column; }
+    .stats { width: 100%; }
+    .worker-controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .worker-controls .search-control { grid-column: 1 / -1; }
+    .worker-table { min-width: 780px; }
+  }
   @media (max-width: 700px) {
     header { align-items: flex-start; flex-direction: column; }
-    .stats { justify-content: flex-start; }
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .stat { text-align: left; }
     main { padding: 10px; }
     .section-head { flex-direction: column; }
     .section-note { text-align: left; }
+    .worker-controls { grid-template-columns: 1fr; }
     .grid { grid-template-columns: 1fr; }
     .metric-row { grid-template-columns: repeat(2, 1fr); }
     .detail-grid { grid-template-columns: 1fr; }
@@ -811,6 +857,14 @@ const fleetDashboardHTML = `<!DOCTYPE html>
         <div class="sub">Unified active, recent, and attention queue across projects.</div>
       </div>
       <div class="section-note" id="worker-summary">Loading workers...</div>
+    </div>
+    <div class="worker-controls" id="worker-controls">
+      <label class="search-control" for="worker-filter"><span>Search</span><input id="worker-filter" type="search" placeholder="Project, issue, status, backend, or PR"></label>
+      <label for="status-filter"><span>Status</span><select id="status-filter"></select></label>
+      <label for="backend-filter"><span>Backend</span><select id="backend-filter"></select></label>
+      <label for="pr-filter"><span>PR</span><select id="pr-filter"><option value="all">Any PR</option><option value="with">With PR</option><option value="without">No PR</option></select></label>
+      <label for="worker-sort"><span>Sort</span><select id="worker-sort"><option value="status">Status</option><option value="project">Project</option><option value="issue">Issue</option><option value="runtime">Runtime</option><option value="pr">PR</option></select></label>
+      <button type="button" id="sort-direction" aria-label="Toggle sort direction">Asc</button>
     </div>
     <div class="table-scroll">
       <table class="worker-table">
@@ -853,14 +907,44 @@ const fleetWorkersEl = document.getElementById("fleet-workers-body");
 const workerSummaryEl = document.getElementById("worker-summary");
 const workerDetailSummaryEl = document.getElementById("worker-detail-summary");
 const workerDetailBodyEl = document.getElementById("worker-detail-body");
+const workerFilterEl = document.getElementById("worker-filter");
+const statusFilterEl = document.getElementById("status-filter");
+const backendFilterEl = document.getElementById("backend-filter");
+const prFilterEl = document.getElementById("pr-filter");
+const workerSortEl = document.getElementById("worker-sort");
+const sortDirectionEl = document.getElementById("sort-direction");
+
+const defaultSortDirections = { status: "asc", project: "asc", issue: "asc", runtime: "desc", pr: "asc" };
+const validSortKeys = new Set(["status", "project", "issue", "runtime", "pr"]);
+const validSortDirs = new Set(["asc", "desc"]);
+const statusOrder = new Map([
+  ["running", 0],
+  ["pr_open", 1],
+  ["queued", 2],
+  ["dead", 3],
+  ["failed", 4],
+  ["conflict_failed", 5],
+  ["retry_exhausted", 6],
+  ["done", 7]
+]);
 
 const fleetState = {
   selectedProject: "all",
   selectedWorkerKey: "",
+  filters: {
+    query: "",
+    status: "all",
+    backend: "all",
+    pr: "all"
+  },
+  sortKey: "status",
+  sortDir: "asc",
   projects: [],
   workers: [],
   detail: null
 };
+
+loadStateFromQuery();
 
 function escapeText(value) {
   return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -895,6 +979,188 @@ function workerKey(worker) {
 function selectedWorker() {
   if (!fleetState.selectedWorkerKey) return null;
   return (fleetState.workers || []).find(worker => workerKey(worker) === fleetState.selectedWorkerKey) || null;
+}
+
+function normalizeParam(value, fallback) {
+  const normalized = String(value ?? "").trim();
+  return normalized === "" ? fallback : normalized;
+}
+
+function loadStateFromQuery() {
+  const params = new URLSearchParams(window.location.search);
+  fleetState.selectedProject = normalizeParam(params.get("project"), "all");
+  fleetState.filters.query = normalizeParam(params.get("q"), "");
+  fleetState.filters.status = normalizeParam(params.get("status"), "all");
+  fleetState.filters.backend = normalizeParam(params.get("backend"), "all");
+  const prFilter = normalizeParam(params.get("pr"), "all");
+  fleetState.filters.pr = ["all", "with", "without"].includes(prFilter) ? prFilter : "all";
+  const sortKey = normalizeParam(params.get("sort"), "status");
+  fleetState.sortKey = validSortKeys.has(sortKey) ? sortKey : "status";
+  const sortDir = normalizeParam(params.get("dir"), defaultSortDirections[fleetState.sortKey] || "asc");
+  fleetState.sortDir = validSortDirs.has(sortDir) ? sortDir : (defaultSortDirections[fleetState.sortKey] || "asc");
+}
+
+function updateQueryState() {
+  const params = new URLSearchParams(window.location.search);
+  setQueryParam(params, "project", fleetState.selectedProject, "all");
+  setQueryParam(params, "q", fleetState.filters.query, "");
+  setQueryParam(params, "status", fleetState.filters.status, "all");
+  setQueryParam(params, "backend", fleetState.filters.backend, "all");
+  setQueryParam(params, "pr", fleetState.filters.pr, "all");
+  setQueryParam(params, "sort", fleetState.sortKey, "status");
+  setQueryParam(params, "dir", fleetState.sortDir, defaultSortDirections[fleetState.sortKey] || "asc");
+  const next = params.toString();
+  const url = window.location.pathname + (next ? "?" + next : "");
+  window.history.replaceState(null, "", url);
+}
+
+function setQueryParam(params, key, value, defaultValue) {
+  if (value && value !== defaultValue) {
+    params.set(key, value);
+  } else {
+    params.delete(key);
+  }
+}
+
+function uniqueSorted(values) {
+  return Array.from(new Set(values.map(value => String(value ?? "").trim()).filter(Boolean)))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" }));
+}
+
+function optionHTML(value, label, selectedValue) {
+  const selected = value === selectedValue ? " selected" : "";
+  return '<option value="' + escapeText(value) + '"' + selected + '>' + escapeText(label) + '</option>';
+}
+
+function selectOptionsHTML(allLabel, values, selectedValue) {
+  const options = [optionHTML("all", allLabel, selectedValue)];
+  if (selectedValue !== "all" && !values.includes(selectedValue)) {
+    options.push(optionHTML(selectedValue, selectedValue + " (not present)", selectedValue));
+  }
+  for (const value of values) {
+    options.push(optionHTML(value, value, selectedValue));
+  }
+  return options.join("");
+}
+
+function renderFilterOptions() {
+  statusFilterEl.innerHTML = selectOptionsHTML("All statuses", uniqueSorted((fleetState.workers || []).map(worker => worker.status)), fleetState.filters.status);
+  backendFilterEl.innerHTML = selectOptionsHTML("All backends", uniqueSorted((fleetState.workers || []).map(worker => worker.backend)), fleetState.filters.backend);
+}
+
+function syncFilterControls() {
+  workerFilterEl.value = fleetState.filters.query;
+  statusFilterEl.value = fleetState.filters.status;
+  backendFilterEl.value = fleetState.filters.backend;
+  prFilterEl.value = fleetState.filters.pr;
+  workerSortEl.value = fleetState.sortKey;
+  sortDirectionEl.textContent = fleetState.sortDir === "desc" ? "Desc" : "Asc";
+  sortDirectionEl.setAttribute("aria-label", "Sort " + fleetState.sortDir + "; activate to switch direction");
+}
+
+function normalizedSearchText(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function workerSearchText(worker) {
+  const issueNumber = worker.issue_number ? String(worker.issue_number) : "";
+  const prNumber = worker.pr_number ? String(worker.pr_number) : "";
+  return [
+    worker.project_name,
+    worker.project_repo,
+    worker.slot,
+    issueNumber,
+    issueNumber ? "#" + issueNumber : "",
+    worker.issue_title,
+    worker.status,
+    statusLabel(worker),
+    worker.backend,
+    prNumber,
+    prNumber ? "#" + prNumber : "no pr",
+    worker.runtime
+  ].map(normalizedSearchText).join(" ");
+}
+
+function workerMatchesFilters(worker) {
+  if (fleetState.filters.status !== "all" && worker.status !== fleetState.filters.status) return false;
+  if (fleetState.filters.backend !== "all" && (worker.backend || "") !== fleetState.filters.backend) return false;
+  if (fleetState.filters.pr === "with" && !worker.pr_number) return false;
+  if (fleetState.filters.pr === "without" && worker.pr_number) return false;
+  const terms = normalizedSearchText(fleetState.filters.query).split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const haystack = workerSearchText(worker);
+  return terms.every(term => haystack.includes(term));
+}
+
+function filteredWorkers(includeProjectFilter) {
+  return (fleetState.workers || []).filter(worker => {
+    if (includeProjectFilter && fleetState.selectedProject !== "all" && worker.project_name !== fleetState.selectedProject) return false;
+    return workerMatchesFilters(worker);
+  });
+}
+
+function selectedProjectWorkers() {
+  if (fleetState.selectedProject === "all") return fleetState.workers || [];
+  return (fleetState.workers || []).filter(worker => worker.project_name === fleetState.selectedProject);
+}
+
+function hasWorkerFilters() {
+  return fleetState.filters.query !== "" || fleetState.filters.status !== "all" || fleetState.filters.backend !== "all" || fleetState.filters.pr !== "all";
+}
+
+function workerNeedsAttention(worker) {
+  return worker.needs_attention || (worker.status === "running" && worker.alive === false);
+}
+
+function statusRank(worker) {
+  const attention = workerNeedsAttention(worker) ? 0 : 1;
+  const rank = statusOrder.has(worker.status) ? statusOrder.get(worker.status) : 99;
+  return attention * 100 + rank;
+}
+
+function compareText(left, right) {
+  return String(left || "").localeCompare(String(right || ""), undefined, { numeric: true, sensitivity: "base" });
+}
+
+function compareNumber(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  const leftValue = Number.isFinite(leftNumber) ? leftNumber : Number.MAX_SAFE_INTEGER;
+  const rightValue = Number.isFinite(rightNumber) ? rightNumber : Number.MAX_SAFE_INTEGER;
+  if (leftValue === rightValue) return 0;
+  return leftValue < rightValue ? -1 : 1;
+}
+
+function runtimeSeconds(worker) {
+  const value = Number(worker.runtime_seconds || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function compareWorkers(left, right, key) {
+  switch (key) {
+  case "project":
+    return compareText(left.project_name, right.project_name);
+  case "issue":
+    return compareNumber(left.issue_number || Number.MAX_SAFE_INTEGER, right.issue_number || Number.MAX_SAFE_INTEGER);
+  case "runtime":
+    return compareNumber(runtimeSeconds(left), runtimeSeconds(right));
+  case "pr":
+    return compareNumber(left.pr_number || Number.MAX_SAFE_INTEGER, right.pr_number || Number.MAX_SAFE_INTEGER);
+  case "status":
+  default:
+    return compareNumber(statusRank(left), statusRank(right));
+  }
+}
+
+function sortWorkers(workers) {
+  const direction = fleetState.sortDir === "desc" ? -1 : 1;
+  return workers.map((worker, index) => ({ worker, index }))
+    .sort((left, right) => {
+      const result = compareWorkers(left.worker, right.worker, fleetState.sortKey);
+      if (result !== 0) return result * direction;
+      return left.index - right.index;
+    })
+    .map(entry => entry.worker);
 }
 
 function statusLabel(worker) {
@@ -962,15 +1228,17 @@ function renderProjectTabs() {
   const projectNames = new Set((fleetState.projects || []).map(project => project.name));
   if (fleetState.selectedProject !== "all" && !projectNames.has(fleetState.selectedProject)) {
     fleetState.selectedProject = "all";
+    updateQueryState();
   }
 
+  const filtered = filteredWorkers(false);
   const counts = new Map();
-  for (const worker of fleetState.workers || []) {
+  for (const worker of filtered) {
     const name = worker.project_name || "";
     counts.set(name, (counts.get(name) || 0) + 1);
   }
 
-  const tabs = [{ name: "all", label: "All projects", count: (fleetState.workers || []).length }].concat(
+  const tabs = [{ name: "all", label: "All projects", count: filtered.length }].concat(
     (fleetState.projects || []).map(project => ({
       name: project.name,
       label: project.name,
@@ -987,6 +1255,7 @@ function renderProjectTabs() {
   tabsEl.querySelectorAll("button[data-project]").forEach(button => {
     button.addEventListener("click", () => {
       fleetState.selectedProject = button.dataset.project || "all";
+      updateQueryState();
       renderProjectTabs();
       renderFleetWorkers();
     });
@@ -994,21 +1263,20 @@ function renderProjectTabs() {
 }
 
 function renderFleetWorkers() {
-  const selected = fleetState.selectedProject;
-  const workers = selected === "all"
-    ? (fleetState.workers || [])
-    : (fleetState.workers || []).filter(worker => worker.project_name === selected);
-  // The API response is already sorted with the server's authoritative status order.
-  const visible = workers;
-  const projectLabel = selected === "all" ? "all projects" : selected;
+  const base = selectedProjectWorkers();
+  const visible = sortWorkers(filteredWorkers(true));
+  const projectLabel = fleetState.selectedProject === "all" ? "all projects" : fleetState.selectedProject;
+  const filterText = hasWorkerFilters() ? " (" + visible.length + " of " + base.length + " after filters)" : "";
   const attentionCount = visible.filter(worker => worker.needs_attention).length;
   workerSummaryEl.textContent = visible.length + " active / recent / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel +
-    (attentionCount ? " · " + attentionCount + " need attention" : "");
+    filterText + (attentionCount ? " · " + attentionCount + " need attention" : "");
 
   if (visible.length === 0) {
-    const empty = selected === "all"
+    const empty = hasWorkerFilters()
+      ? "No workers match the current filters."
+      : fleetState.selectedProject === "all"
       ? "No active, recent, or attention workers across configured projects."
-      : "No active, recent, or attention workers for " + selected + ".";
+      : "No active, recent, or attention workers for " + fleetState.selectedProject + ".";
     fleetWorkersEl.innerHTML = '<tr><td colspan="8" class="empty">' + escapeText(empty) + '</td></tr>';
     return;
   }
@@ -1016,15 +1284,17 @@ function renderFleetWorkers() {
   fleetWorkersEl.innerHTML = visible.map(worker => {
     const issue = worker.issue_number ? "#" + worker.issue_number : "-";
     const pr = worker.pr_number ? "#" + worker.pr_number : "-";
+    const project = worker.project_name || "-";
+    const issueText = (issue + " " + (worker.issue_title || "")).trim();
     const selected = workerKey(worker) === fleetState.selectedWorkerKey ? " selected" : "";
     return '<tr class="' + rowClass(worker) + selected + '" data-project="' + escapeText(worker.project_name || "") + '" data-slot="' + escapeText(worker.slot || "") + '" tabindex="0">' +
-      '<td class="project-col">' + linkHTML(worker.dashboard_url, worker.project_name || "-") + '</td>' +
-      '<td class="slot-col">' + escapeText(worker.slot || "-") + '</td>' +
-      '<td class="issue-col">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title || "") + workerWhyHTML(worker) + '</td>' +
-      '<td class="status-col"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
-      '<td class="backend-col">' + escapeText(worker.backend || "-") + '</td>' +
-      '<td class="pr-col">' + linkHTML(worker.pr_url, pr) + '</td>' +
-      '<td class="runtime-col">' + escapeText(worker.runtime || "-") + '</td>' +
+      '<td class="project-col" title="' + escapeText(project) + '">' + linkHTML(worker.dashboard_url, project) + '</td>' +
+      '<td class="slot-col" title="' + escapeText(worker.slot || "-") + '">' + escapeText(worker.slot || "-") + '</td>' +
+      '<td class="issue-col" title="' + escapeText(issueText) + '">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title || "") + workerWhyHTML(worker) + '</td>' +
+      '<td class="status-col" title="' + escapeText(statusLabel(worker)) + '"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
+      '<td class="backend-col" title="' + escapeText(worker.backend || "-") + '">' + escapeText(worker.backend || "-") + '</td>' +
+      '<td class="pr-col" title="' + escapeText(pr) + '">' + linkHTML(worker.pr_url, pr) + '</td>' +
+      '<td class="runtime-col" title="' + escapeText(worker.runtime || "-") + '">' + escapeText(worker.runtime || "-") + '</td>' +
       '<td class="tokens-col">' + compactNumber(worker.tokens_used_total) + '</td>' +
     '</tr>';
   }).join("");
@@ -1234,6 +1504,50 @@ function renderProject(project) {
   '</article>';
 }
 
+function refreshWorkersFromControls() {
+  updateQueryState();
+  renderProjectTabs();
+  renderFleetWorkers();
+}
+
+workerFilterEl.addEventListener("input", () => {
+  fleetState.filters.query = workerFilterEl.value.trim();
+  refreshWorkersFromControls();
+});
+
+statusFilterEl.addEventListener("change", () => {
+  fleetState.filters.status = statusFilterEl.value || "all";
+  refreshWorkersFromControls();
+});
+
+backendFilterEl.addEventListener("change", () => {
+  fleetState.filters.backend = backendFilterEl.value || "all";
+  refreshWorkersFromControls();
+});
+
+prFilterEl.addEventListener("change", () => {
+  fleetState.filters.pr = prFilterEl.value || "all";
+  refreshWorkersFromControls();
+});
+
+workerSortEl.addEventListener("change", () => {
+  const nextSort = validSortKeys.has(workerSortEl.value) ? workerSortEl.value : "status";
+  if (nextSort !== fleetState.sortKey) {
+    fleetState.sortKey = nextSort;
+    fleetState.sortDir = defaultSortDirections[nextSort] || "asc";
+  }
+  syncFilterControls();
+  updateQueryState();
+  renderFleetWorkers();
+});
+
+sortDirectionEl.addEventListener("click", () => {
+  fleetState.sortDir = fleetState.sortDir === "desc" ? "asc" : "desc";
+  syncFilterControls();
+  updateQueryState();
+  renderFleetWorkers();
+});
+
 async function loadFleet() {
   try {
     const response = await fetch("/api/v1/fleet", { cache: "no-store" });
@@ -1246,6 +1560,8 @@ async function loadFleet() {
       fleetState.detail = null;
     }
     subtitleEl.textContent = fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s");
+    renderFilterOptions();
+    syncFilterControls();
     renderStats(data.summary || {});
     renderProjectTabs();
     renderFleetWorkers();
@@ -1259,6 +1575,8 @@ async function loadFleet() {
   }
 }
 
+renderFilterOptions();
+syncFilterControls();
 loadFleet();
 setInterval(loadFleet, 3000);
 setInterval(loadWorkerDetail, 2000);
