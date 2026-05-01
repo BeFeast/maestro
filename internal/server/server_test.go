@@ -487,6 +487,65 @@ func TestApplySupervisorAttentionSessionTargetDoesNotFallback(t *testing.T) {
 	}
 }
 
+func TestApplySupervisorAttentionSuppressesResolvedStaleReviewFeedback(t *testing.T) {
+	infos := []sessionInfo{
+		{
+			Slot:           "slot-1",
+			IssueNumber:    359,
+			PRNumber:       375,
+			Status:         string(state.StatusDone),
+			StatusReason:   "Issue is complete; PR merged or issue was closed and the session is terminal.",
+			NeedsAttention: false,
+		},
+	}
+	decision := &state.SupervisorDecision{
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "stale_review_feedback",
+				Severity:          "blocked",
+				Summary:           "Issue #359 has review feedback, but no worker is currently fixing it.",
+				RecommendedAction: "Respawn a worker with the saved review feedback or resolve the feedback manually.",
+				Target:            &state.SupervisorTarget{Issue: 359, PR: 375, Session: "slot-1"},
+			},
+		},
+	}
+
+	applySupervisorAttention(infos, decision)
+
+	if infos[0].NeedsAttention {
+		t.Fatalf("resolved stale feedback should not need attention: %#v", infos[0])
+	}
+	if !contains(infos[0].StatusReason, "Issue is complete") || infos[0].NextAction != "" {
+		t.Fatalf("resolved reason/action = %q/%q, want neutral historical status", infos[0].StatusReason, infos[0].NextAction)
+	}
+}
+
+func TestApplySupervisorAttentionKeepsOpenReviewFeedbackAttention(t *testing.T) {
+	infos := []sessionInfo{
+		{Slot: "slot-1", IssueNumber: 360, PRNumber: 376, Status: string(state.StatusPROpen)},
+	}
+	decision := &state.SupervisorDecision{
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "stale_review_feedback",
+				Severity:          "blocked",
+				Summary:           "Issue #360 has review feedback, but no worker is currently fixing it.",
+				RecommendedAction: "Respawn a worker with the saved review feedback or resolve the feedback manually.",
+				Target:            &state.SupervisorTarget{Issue: 360, PR: 376, Session: "slot-1"},
+			},
+		},
+	}
+
+	applySupervisorAttention(infos, decision)
+
+	if !infos[0].NeedsAttention {
+		t.Fatalf("open review feedback should still need attention: %#v", infos[0])
+	}
+	if !contains(infos[0].StatusReason, "review feedback") || !contains(infos[0].NextAction, "Respawn a worker") {
+		t.Fatalf("attention reason/action = %q/%q, want review feedback guidance", infos[0].StatusReason, infos[0].NextAction)
+	}
+}
+
 func TestApplySupervisorAttentionSkipsInformationalStuckStates(t *testing.T) {
 	baseReason := "State says running, but the worker PID is not alive."
 	baseAction := "Run a Maestro reconciliation cycle."

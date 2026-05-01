@@ -927,6 +927,27 @@ func TestSessionAttentionFor_ReviewFeedbackRetryCopy(t *testing.T) {
 	}
 }
 
+func TestSessionAttentionFor_DoneReviewFeedbackIsHistorical(t *testing.T) {
+	sess := &Session{
+		IssueNumber:                 359,
+		Status:                      StatusDone,
+		PRNumber:                    375,
+		PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+		RetryReason:                 RetryReasonReviewFeedback,
+	}
+
+	attention := SessionAttentionFor(sess, nil)
+	if attention.NeedsAttention {
+		t.Fatalf("done session with stale review feedback should not need attention: %+v", attention)
+	}
+	if !containsString(attention.Reason, "Issue is complete") {
+		t.Fatalf("reason = %q, want completed historical status", attention.Reason)
+	}
+	if got := SessionDisplayStatusFor(sess, nil); got != string(StatusDone) {
+		t.Fatalf("display status = %q, want done", got)
+	}
+}
+
 func TestCountByStatus(t *testing.T) {
 	s := NewState()
 	s.Sessions["slot-1"] = &Session{IssueNumber: 1, Status: StatusRunning}
