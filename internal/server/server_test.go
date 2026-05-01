@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -19,7 +20,12 @@ func setupTestServer(t *testing.T) (*Server, *config.Config) {
 	dir := t.TempDir()
 
 	cfg := &config.Config{
-		Repo:        "test/repo",
+		Repo: "test/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome: "Test repo is healthy",
+			RuntimeTarget:  "https://test.example.com",
+			HealthcheckURL: "https://test.example.com/healthz",
+		},
 		MaxParallel: 3,
 		StateDir:    dir,
 		Server:      config.ServerConfig{Port: 8765},
@@ -121,6 +127,9 @@ func TestHandleState(t *testing.T) {
 	}
 	if resp.MaxParallel != 3 {
 		t.Errorf("max_parallel = %d, want 3", resp.MaxParallel)
+	}
+	if !resp.Outcome.Configured || resp.Outcome.Goal != "Test repo is healthy" || resp.Outcome.HealthState != outcome.HealthUnknown {
+		t.Fatalf("outcome = %+v, want configured unknown health", resp.Outcome)
 	}
 	if len(resp.Running) != 1 {
 		t.Errorf("running sessions = %d, want 1", len(resp.Running))
@@ -1018,6 +1027,9 @@ func TestHandleDashboard(t *testing.T) {
 	}
 	if !contains(body, "supervisor-panel") || !contains(body, "renderSupervisor") {
 		t.Error("dashboard should include supervisor rationale panel")
+	}
+	if !contains(body, "outcome-panel") || !contains(body, "renderOutcome") || !contains(body, "No outcome brief configured") {
+		t.Error("dashboard should include outcome status panel")
 	}
 	if !contains(body, "No Supervisor has run yet") {
 		t.Error("dashboard should include supervisor empty state text")

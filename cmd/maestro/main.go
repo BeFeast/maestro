@@ -23,6 +23,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/orchestrator"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
@@ -682,18 +683,14 @@ func statusCmd(args []string) {
 
 	// JSON: for multiple projects, emit an array of objects
 	if *jsonOutput && len(cfgs) > 1 {
-		var results []map[string]interface{}
+		var results []projectStatusJSON
 		for _, cfg := range cfgs {
 			s, err := state.Load(cfg.StateDir)
 			if err != nil {
 				log.Printf("load state for %s: %v", cfg.Repo, err)
 				continue
 			}
-			results = append(results, map[string]interface{}{
-				"repo":   cfg.Repo,
-				"prefix": cfg.SessionPrefix,
-				"state":  s,
-			})
+			results = append(results, buildProjectStatusJSON(cfg, s))
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -709,6 +706,22 @@ func statusCmd(args []string) {
 	}
 }
 
+type projectStatusJSON struct {
+	Repo    string         `json:"repo"`
+	Prefix  string         `json:"prefix"`
+	Outcome outcome.Status `json:"outcome"`
+	State   *state.State   `json:"state"`
+}
+
+func buildProjectStatusJSON(cfg *config.Config, s *state.State) projectStatusJSON {
+	return projectStatusJSON{
+		Repo:    cfg.Repo,
+		Prefix:  cfg.SessionPrefix,
+		Outcome: outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt),
+		State:   s,
+	}
+}
+
 func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	s, err := state.Load(cfg.StateDir)
 	if err != nil {
@@ -718,7 +731,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		enc.Encode(s)
+		enc.Encode(buildProjectStatusJSON(cfg, s))
 		return
 	}
 
@@ -727,6 +740,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	fmt.Printf("Session prefix: %s\n", cfg.SessionPrefix)
 	fmt.Printf("State file:     %s\n", state.StatePath(cfg.StateDir))
 	fmt.Printf("Max parallel:   %d\n", cfg.MaxParallel)
+	showOutcomeStatus(cfg, s)
 	showSupervisorPolicy(cfg)
 	if len(cfg.MaxConcurrentByState) > 0 {
 		// Sort keys for stable output
@@ -905,6 +919,26 @@ func showSupervisorPolicy(cfg *config.Config) {
 	}
 	if len(cfg.Supervisor.ApprovalRequired) > 0 {
 		fmt.Printf("Approval req.:  %s\n", strings.Join(cfg.Supervisor.ApprovalRequired, ", "))
+	}
+}
+
+func showOutcomeStatus(cfg *config.Config, s *state.State) {
+	status := outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt)
+	if !status.Configured {
+		fmt.Println("Outcome:        not configured (issue throughput alone is not enough)")
+		fmt.Printf("Outcome next:   %s\n", status.NextAction)
+		return
+	}
+	goal := valueOrDash(status.Goal)
+	runtimeTarget := valueOrDash(status.RuntimeTarget)
+	if strings.TrimSpace(status.RuntimeHost) != "" {
+		runtimeTarget += " (" + status.RuntimeHost + ")"
+	}
+	fmt.Printf("Outcome:        %s\n", goal)
+	fmt.Printf("Runtime target: %s\n", runtimeTarget)
+	fmt.Printf("Outcome health: %s\n", valueOrDash(status.HealthState))
+	if status.NextAction != "" {
+		fmt.Printf("Outcome next:   %s\n", status.NextAction)
 	}
 }
 

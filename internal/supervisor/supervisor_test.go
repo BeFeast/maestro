@@ -11,6 +11,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -548,6 +549,91 @@ func TestDecide_EligibleIssueRecommendsSpawn(t *testing.T) {
 	}
 	if decision.Risk != RiskMutating {
 		t.Errorf("risk = %q, want %q", decision.Risk, RiskMutating)
+	}
+}
+
+func TestDecide_OutcomeRationaleNamesGoalAndIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Maestro dogfood dashboard runs unattended",
+		RuntimeTarget:  "http://127.0.0.1:8786",
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "wire outcome status", "maestro-ready")}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.Outcome == nil || !decision.Outcome.Configured || decision.Outcome.Goal != cfg.Outcome.DesiredOutcome {
+		t.Fatalf("Outcome = %#v, want configured dogfood context", decision.Outcome)
+	}
+	reasons := strings.Join(decision.Reasons, "\n")
+	if !strings.Contains(reasons, "Outcome: Maestro dogfood dashboard runs unattended") {
+		t.Fatalf("reasons = %q, want current outcome", reasons)
+	}
+	if !strings.Contains(reasons, "Issue #42") || !strings.Contains(reasons, "toward Maestro dogfood dashboard runs unattended") {
+		t.Fatalf("reasons = %q, want issue-to-outcome rationale", reasons)
+	}
+}
+
+func TestDecide_NoOutcomeProgressRecommendsRuntimeCheck(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		RuntimeTarget:  "https://app.example.com",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	reader := &fakeReader{}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.LastMergeAt = now.Add(-10 * time.Minute)
+	st.Sessions["done-1"] = &state.Session{IssueNumber: 1, IssueTitle: "first", Status: state.StatusDone, PRNumber: 10, StartedAt: now.Add(-2 * time.Hour)}
+	st.Sessions["done-2"] = &state.Session{IssueNumber: 2, IssueTitle: "second", Status: state.StatusDone, PRNumber: 11, StartedAt: now.Add(-time.Hour)}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionCheckOutcomeHealth {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionCheckOutcomeHealth)
+	}
+	if decision.Risk != RiskSafe {
+		t.Fatalf("risk = %q, want safe read-only recommendation", decision.Risk)
+	}
+	stuck := requireStuckState(t, decision, state.StuckNoOutcomeProgress)
+	if stuck.SupervisorCanAct {
+		t.Fatal("no_outcome_progress should not mutate deploy/runtime state")
+	}
+	if !strings.Contains(stuck.Summary, "Hosted app responds to users") || !strings.Contains(stuck.Summary, "unknown") {
+		t.Fatalf("stuck summary = %q, want outcome and unknown health", stuck.Summary)
+	}
+	if reader.issueCalls != 0 {
+		t.Fatalf("ListOpenIssues called %d time(s), want runtime check before more issue throughput", reader.issueCalls)
+	}
+}
+
+func TestDecideDeterministic_OutcomeUsesStateMergeHistory(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.LastMergeAt = now
+	st.Sessions["done-1"] = &state.Session{IssueNumber: 1, IssueTitle: "first", Status: state.StatusDone, PRNumber: 10}
+	st.Sessions["done-2"] = &state.Session{IssueNumber: 2, IssueTitle: "second", Status: state.StatusDone, PRNumber: 11}
+
+	decision, err := testEngine(cfg, &fakeReader{}).decideDeterministic(st)
+	if err != nil {
+		t.Fatalf("decideDeterministic: %v", err)
+	}
+	if decision.Outcome == nil {
+		t.Fatal("Outcome = nil, want state-aware outcome")
+	}
+	if decision.Outcome.MergedPRs != 2 || decision.Outcome.LastMergeAt == "" {
+		t.Fatalf("Outcome = %+v, want merge history from state", decision.Outcome)
 	}
 }
 

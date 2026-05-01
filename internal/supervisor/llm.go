@@ -23,6 +23,8 @@ Rules:
 - If recommended_action is in supervisor_policy.approval_required_actions, requires_approval must be true.
 - Do not request actions outside the packet policy.
 - Treat deterministic detector output as a guardrail. Do not recommend an action that conflicts with it.
+- Name the current project outcome in the summary or reasons. If you target an issue, explain why it advances that outcome.
+- Runtime/deploy checks are read-only recommendations in v1; do not claim Maestro changed production state.
 - The runtime will validate this JSON against policy before any action is recorded or executed.
 
 Required JSON shape:
@@ -266,9 +268,16 @@ func validateLLMDecision(llm LLMDecision, deterministic state.SupervisorDecision
 	decision.Target = copyTarget(llm.Target)
 	decision.Risk = llm.Risk
 	decision.Confidence = llm.Confidence
-	decision.Reasons = redactReasons(llm.Reasons)
+	decision.Reasons = compactReasons(append(outcomeGuardrailReasons(deterministic), redactReasons(llm.Reasons)...))
 	decision.RequiresApproval = llm.RequiresApproval || requiresApproval
 	return decision, nil
+}
+
+func outcomeGuardrailReasons(deterministic state.SupervisorDecision) []string {
+	if deterministic.Outcome == nil {
+		return nil
+	}
+	return []string{outcomeDecisionReason(*deterministic.Outcome)}
 }
 
 func redactReasons(reasons []string) []string {
@@ -328,6 +337,7 @@ func defaultAllowedActions() []string {
 		ActionWaitForOrderedQueue,
 		ActionMonitorOpenPR,
 		ActionReviewRetryExhausted,
+		ActionCheckOutcomeHealth,
 		ActionSpawnWorker,
 		ActionLabelIssueReady,
 	}
@@ -355,6 +365,8 @@ func canonicalAction(action string) string {
 		return ActionMonitorOpenPR
 	case ActionReviewRetryExhausted:
 		return ActionReviewRetryExhausted
+	case ActionCheckOutcomeHealth:
+		return ActionCheckOutcomeHealth
 	case ActionSpawnWorker:
 		return ActionSpawnWorker
 	case ActionLabelIssueReady, "add_ready_label":

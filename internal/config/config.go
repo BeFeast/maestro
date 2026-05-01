@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/befeast/maestro/internal/outcome"
 	"gopkg.in/yaml.v3"
 )
 
@@ -228,6 +229,7 @@ type Config struct {
 	Server                     ServerConfig         `yaml:"server"`
 	Supervisor                 SupervisorConfig     `yaml:"supervisor"`
 	Repo                       string               `yaml:"repo"`
+	Outcome                    outcome.Brief        `yaml:"outcome"`
 	LocalPath                  string               `yaml:"local_path"`
 	WorktreeBase               string               `yaml:"worktree_base"`
 	MaxParallel                int                  `yaml:"max_parallel"`
@@ -376,6 +378,13 @@ func parse(data []byte) (*Config, error) {
 	// Expand ~ in paths
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
+	cfg.Outcome = cfg.Outcome.Normalized()
+	if cfg.Outcome.Configured() {
+		cfg.Outcome.SourceRepoPath = expandHome(cfg.Outcome.SourceRepoPath)
+		if cfg.Outcome.SourceRepoPath == "" {
+			cfg.Outcome.SourceRepoPath = cfg.LocalPath
+		}
+	}
 	cfg.WorkerPrompt = expandHome(cfg.WorkerPrompt)
 	cfg.BugPrompt = expandHome(cfg.BugPrompt)
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
@@ -447,6 +456,7 @@ func parse(data []byte) (*Config, error) {
 			"wait_for_ordered_queue",
 			"monitor_open_pr",
 			"review_retry_exhausted",
+			"check_outcome_health",
 			"spawn_worker",
 			"label_issue_ready",
 			"add_ready_label",

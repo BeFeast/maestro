@@ -156,6 +156,57 @@ supervisor:
 	}
 }
 
+func TestParse_OutcomeBrief(t *testing.T) {
+	yaml := `
+repo: owner/repo
+local_path: ~/src/repo
+outcome:
+  desired_outcome: Users can run the hosted app end-to-end.
+  runtime_target: https://repo.example.com
+  deployment_status_command: systemctl --user status repo
+  healthcheck_command: curl -fsS http://127.0.0.1:8080/healthz
+  healthcheck_url: https://repo.example.com/healthz
+  source_repo_path: ~/src/repo-runtime
+  runtime_host: fly.io/repo
+  non_goals:
+    - Rewrite the app
+    - Rewrite the app
+    - ""
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Outcome.Configured() {
+		t.Fatal("Outcome should be configured")
+	}
+	if cfg.Outcome.DesiredOutcome != "Users can run the hosted app end-to-end." {
+		t.Fatalf("DesiredOutcome = %q", cfg.Outcome.DesiredOutcome)
+	}
+	if cfg.Outcome.SourceRepoPath != filepath.Join(os.Getenv("HOME"), "src/repo-runtime") {
+		t.Fatalf("SourceRepoPath = %q", cfg.Outcome.SourceRepoPath)
+	}
+	if len(cfg.Outcome.NonGoals) != 1 || cfg.Outcome.NonGoals[0] != "Rewrite the app" {
+		t.Fatalf("NonGoals = %#v, want compact explicit non-goal", cfg.Outcome.NonGoals)
+	}
+}
+
+func TestParse_OutcomeBriefDefaultsSourceRepoPath(t *testing.T) {
+	yaml := `
+repo: owner/repo
+local_path: ~/src/repo
+outcome:
+  desired_outcome: Keep the service running.
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Outcome.SourceRepoPath != filepath.Join(os.Getenv("HOME"), "src/repo") {
+		t.Fatalf("SourceRepoPath = %q, want local_path fallback", cfg.Outcome.SourceRepoPath)
+	}
+}
+
 func TestParse_AutoRestoreFiles(t *testing.T) {
 	yaml := `
 repo: owner/repo

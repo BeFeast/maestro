@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 	"gopkg.in/yaml.v3"
 )
@@ -237,6 +238,7 @@ type fleetProjectState struct {
 	StateDir        string                `json:"state_dir,omitempty"`
 	MaxParallel     int                   `json:"max_parallel"`
 	ReadOnly        bool                  `json:"read_only"`
+	Outcome         outcome.Status        `json:"outcome"`
 	Summary         map[string]int        `json:"summary"`
 	Running         int                   `json:"running"`
 	PROpen          int                   `json:"pr_open"`
@@ -703,6 +705,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.StateDir = cfg.StateDir
 	item.MaxParallel = cfg.MaxParallel
 	item.ReadOnly = cfg.Server.ReadOnly || s.readOnly
+	item.Outcome = outcome.StatusFor(cfg.Outcome, 0, time.Time{})
 	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", item.Name)
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, nil, now)
 
@@ -714,6 +717,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary
+	item.Outcome = projectState.Outcome
 	item.Running = len(projectState.Running)
 	item.PROpen = len(projectState.PROpen)
 	item.Failed = failedCount(projectState.Summary)
@@ -1448,7 +1452,11 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .metric:last-child { border-right: 0; }
   .metric strong { display: block; font-size: 16px; }
   .metric span { display: block; color: var(--muted); font-size: 11px; }
-  .supervisor, .workers, .project-actions { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .supervisor, .workers, .project-actions, .outcome-status { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .outcome-status { background: rgba(88,166,255,.035); }
+  .outcome-lines { display: grid; gap: 6px; margin-top: 7px; }
+  .outcome-line { color: var(--muted); font-size: 12px; line-height: 1.35; white-space: normal; }
+  .outcome-line strong { color: var(--text); font-weight: 650; }
   .label { color: var(--muted); font-weight: 650; text-transform: uppercase; font-size: 12px; }
   .decision { margin-top: 5px; color: var(--text); }
   .decision small { color: var(--muted); }
@@ -2604,6 +2612,23 @@ function queueSnapshotHTML(project) {
   return '<div class="queue-snapshot"><div class="label">Queue Snapshot</div>' + lines.join("") + '</div>';
 }
 
+function outcomeHTML(project) {
+  const o = project.outcome || {};
+  const configured = o.configured === true;
+  const goal = configured ? (o.goal || "Configured outcome") : "No outcome brief configured";
+  const target = o.runtime_target || "-";
+  const host = o.runtime_host ? " · " + o.runtime_host : "";
+  const health = o.health_state || (configured ? "unknown" : "not_configured");
+  const next = o.next_action || (configured ? "Verify runtime health." : "Add an outcome brief to config.");
+  return '<div class="outcome-status"><div class="label">Outcome Status</div>' +
+    '<div class="outcome-lines">' +
+      '<div class="outcome-line"><strong>Goal</strong> ' + escapeText(goal) + '</div>' +
+      '<div class="outcome-line"><strong>Runtime</strong> ' + escapeText(target + host) + '</div>' +
+      '<div class="outcome-line"><strong>Health</strong> ' + escapeText(health.replace(/_/g, " ")) + '</div>' +
+      '<div class="outcome-line"><strong>Next</strong> ' + escapeText(next) + '</div>' +
+    '</div></div>';
+}
+
 function renderSupervisor(project) {
   const sup = project.supervisor;
   if (!sup || !sup.has_run || !sup.latest) {
@@ -2718,8 +2743,9 @@ function renderProject(project) {
       '<div class="metric"><strong>' + escapeText(failed) + '</strong><span>Failed</span></div>' +
       '<div class="metric"><strong>' + escapeText(project.sessions || 0) + '</strong><span>Sessions</span></div>' +
       '<div class="metric"><strong>' + escapeText(project.needs_attention || 0) + '</strong><span>Attention</span></div>' +
-    '</div>' +
-    queueSnapshotHTML(project) +
+	'</div>' +
+	outcomeHTML(project) +
+	queueSnapshotHTML(project) +
     renderProjectWhy(project) +
     renderProjectActions(project) +
     renderSupervisor(project) +
