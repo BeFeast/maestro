@@ -388,6 +388,16 @@ func TestDetectWorkerStuckStates_SuppressesResolvedReviewFeedback(t *testing.T) 
 			},
 		},
 		{
+			name:   "retry exhausted merged PR",
+			reader: &fakeReader{mergedPRs: map[int]bool{375: true}},
+			sess: &state.Session{
+				IssueNumber:                 359,
+				Status:                      state.StatusRetryExhausted,
+				PRNumber:                    375,
+				PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+			},
+		},
+		{
 			name:   "closed issue",
 			reader: &fakeReader{closedIssues: map[int]bool{359: true}},
 			sess: &state.Session{

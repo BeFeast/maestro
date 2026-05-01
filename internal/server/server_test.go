@@ -520,6 +520,52 @@ func TestApplySupervisorAttentionSuppressesResolvedStaleReviewFeedback(t *testin
 	}
 }
 
+func TestApplySupervisorAttentionDoesNotOverwriteTerminalPRTargetedStaleReviewFeedback(t *testing.T) {
+	tests := []struct {
+		name   string
+		status state.SessionStatus
+	}{
+		{name: "dead", status: state.StatusDead},
+		{name: "retry exhausted", status: state.StatusRetryExhausted},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			infos := []sessionInfo{
+				{
+					Slot:           "slot-1",
+					IssueNumber:    359,
+					PRNumber:       375,
+					Status:         string(tt.status),
+					StatusReason:   "Existing terminal session state.",
+					NextAction:     "Handle the terminal session state.",
+					NeedsAttention: true,
+				},
+			}
+			decision := &state.SupervisorDecision{
+				StuckStates: []state.SupervisorStuckState{
+					{
+						Code:              "stale_review_feedback",
+						Severity:          "blocked",
+						Summary:           "Issue #359 has review feedback, but no worker is currently fixing it.",
+						RecommendedAction: "Respawn a worker with the saved review feedback or resolve the feedback manually.",
+						Target:            &state.SupervisorTarget{Issue: 359, PR: 375, Session: "slot-1"},
+					},
+				},
+			}
+
+			applySupervisorAttention(infos, decision)
+
+			if infos[0].StatusReason != "Existing terminal session state." || infos[0].NextAction != "Handle the terminal session state." {
+				t.Fatalf("terminal reason/action = %q/%q, want existing session state", infos[0].StatusReason, infos[0].NextAction)
+			}
+			if !infos[0].NeedsAttention {
+				t.Fatalf("terminal session attention should be preserved: %#v", infos[0])
+			}
+		})
+	}
+}
+
 func TestApplySupervisorAttentionKeepsOpenReviewFeedbackAttention(t *testing.T) {
 	infos := []sessionInfo{
 		{Slot: "slot-1", IssueNumber: 360, PRNumber: 376, Status: string(state.StatusPROpen)},
