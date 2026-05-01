@@ -176,41 +176,78 @@ func (s *FleetServer) Start(ctx context.Context) error {
 }
 
 type fleetResponse struct {
-	ReadOnly  bool                `json:"read_only"`
-	Projects  []fleetProjectState `json:"projects"`
-	Summary   fleetSummary        `json:"summary"`
-	Workers   []fleetWorkerState  `json:"workers"`
-	Attention []fleetWorkerState  `json:"attention"`
+	ReadOnly  bool                 `json:"read_only"`
+	Projects  []fleetProjectState  `json:"projects"`
+	Summary   fleetSummary         `json:"summary"`
+	Workers   []fleetWorkerState   `json:"workers"`
+	Attention []fleetWorkerState   `json:"attention"`
+	Approvals []fleetApprovalState `json:"approvals,omitempty"`
 }
 
 type fleetSummary struct {
-	Projects       int `json:"projects"`
-	Running        int `json:"running"`
-	PROpen         int `json:"pr_open"`
-	Failed         int `json:"failed"`
-	Sessions       int `json:"sessions"`
-	NeedsAttention int `json:"needs_attention"`
+	Projects          int `json:"projects"`
+	Running           int `json:"running"`
+	PROpen            int `json:"pr_open"`
+	Failed            int `json:"failed"`
+	Sessions          int `json:"sessions"`
+	NeedsAttention    int `json:"needs_attention"`
+	Approvals         int `json:"approvals"`
+	ApprovalsPending  int `json:"approvals_pending"`
+	ApprovalsStale    int `json:"approvals_stale"`
+	ApprovalsApproved int `json:"approvals_approved"`
+	ApprovalsRejected int `json:"approvals_rejected"`
 }
 
 type fleetProjectState struct {
-	Name           string          `json:"name"`
-	Repo           string          `json:"repo"`
-	ConfigPath     string          `json:"config_path"`
-	DashboardURL   string          `json:"dashboard_url,omitempty"`
-	StateDir       string          `json:"state_dir,omitempty"`
-	MaxParallel    int             `json:"max_parallel"`
-	ReadOnly       bool            `json:"read_only"`
-	Summary        map[string]int  `json:"summary"`
-	Running        int             `json:"running"`
-	PROpen         int             `json:"pr_open"`
-	Failed         int             `json:"failed"`
-	Sessions       int             `json:"sessions"`
-	NeedsAttention int             `json:"needs_attention"`
-	Active         []sessionInfo   `json:"active,omitempty"`
-	Attention      []sessionInfo   `json:"attention,omitempty"`
-	Actions        []controlAction `json:"actions,omitempty"`
-	Supervisor     supervisorInfo  `json:"supervisor"`
-	Error          string          `json:"error,omitempty"`
+	Name            string               `json:"name"`
+	Repo            string               `json:"repo"`
+	ConfigPath      string               `json:"config_path"`
+	DashboardURL    string               `json:"dashboard_url,omitempty"`
+	StateDir        string               `json:"state_dir,omitempty"`
+	MaxParallel     int                  `json:"max_parallel"`
+	ReadOnly        bool                 `json:"read_only"`
+	Summary         map[string]int       `json:"summary"`
+	Running         int                  `json:"running"`
+	PROpen          int                  `json:"pr_open"`
+	Failed          int                  `json:"failed"`
+	Sessions        int                  `json:"sessions"`
+	NeedsAttention  int                  `json:"needs_attention"`
+	Active          []sessionInfo        `json:"active,omitempty"`
+	Attention       []sessionInfo        `json:"attention,omitempty"`
+	Approvals       []fleetApprovalState `json:"approvals,omitempty"`
+	ApprovalSummary map[string]int       `json:"approval_summary,omitempty"`
+	Actions         []controlAction      `json:"actions,omitempty"`
+	Supervisor      supervisorInfo       `json:"supervisor"`
+	Error           string               `json:"error,omitempty"`
+}
+
+type fleetApprovalState struct {
+	ProjectName       string                  `json:"project_name"`
+	ProjectRepo       string                  `json:"project_repo,omitempty"`
+	DashboardURL      string                  `json:"dashboard_url,omitempty"`
+	ID                string                  `json:"id"`
+	DecisionID        string                  `json:"decision_id,omitempty"`
+	Action            string                  `json:"action"`
+	Target            *state.SupervisorTarget `json:"target,omitempty"`
+	TargetLinks       []targetLinkInfo        `json:"target_links,omitempty"`
+	IssueNumber       int                     `json:"issue_number,omitempty"`
+	IssueURL          string                  `json:"issue_url,omitempty"`
+	PRNumber          int                     `json:"pr_number,omitempty"`
+	PRURL             string                  `json:"pr_url,omitempty"`
+	Session           string                  `json:"session,omitempty"`
+	SessionStatus     string                  `json:"session_status,omitempty"`
+	Status            string                  `json:"status"`
+	CreatedAt         string                  `json:"created_at,omitempty"`
+	UpdatedAt         string                  `json:"updated_at,omitempty"`
+	CreatedAge        string                  `json:"created_age,omitempty"`
+	UpdatedAge        string                  `json:"updated_age,omitempty"`
+	CreatedAgeSeconds int64                   `json:"created_age_seconds,omitempty"`
+	UpdatedAgeSeconds int64                   `json:"updated_age_seconds,omitempty"`
+	Risk              string                  `json:"risk,omitempty"`
+	Summary           string                  `json:"summary,omitempty"`
+
+	createdAt time.Time
+	updatedAt time.Time
 }
 
 type fleetWorkerState struct {
@@ -404,11 +441,13 @@ func (s *FleetServer) snapshot() fleetResponse {
 		Projects:  make([]fleetProjectState, 0, len(s.projects)),
 		Workers:   make([]fleetWorkerState, 0),
 		Attention: make([]fleetWorkerState, 0),
+		Approvals: make([]fleetApprovalState, 0),
 	}
 	for _, project := range s.projects {
 		item, workers := s.projectSnapshot(project)
 		resp.Projects = append(resp.Projects, item)
 		resp.Workers = append(resp.Workers, workers...)
+		resp.Approvals = append(resp.Approvals, item.Approvals...)
 		for _, worker := range item.Attention {
 			resp.Attention = append(resp.Attention, makeFleetWorkerState(item, worker))
 		}
@@ -418,6 +457,9 @@ func (s *FleetServer) snapshot() fleetResponse {
 		resp.Summary.Failed += item.Failed
 		resp.Summary.Sessions += item.Sessions
 		resp.Summary.NeedsAttention += item.NeedsAttention
+		for _, approval := range item.Approvals {
+			addFleetApprovalSummary(&resp.Summary, approval.Status)
+		}
 	}
 	sort.Slice(resp.Projects, func(i, j int) bool {
 		if resp.Projects[i].Running != resp.Projects[j].Running {
@@ -460,7 +502,22 @@ func (s *FleetServer) snapshot() fleetResponse {
 		}
 		return left.Slot < right.Slot
 	})
+	sortFleetApprovals(resp.Approvals)
 	return resp
+}
+
+func addFleetApprovalSummary(summary *fleetSummary, status string) {
+	summary.Approvals++
+	switch state.ApprovalStatus(status) {
+	case state.ApprovalStatusPending:
+		summary.ApprovalsPending++
+	case state.ApprovalStatusStale:
+		summary.ApprovalsStale++
+	case state.ApprovalStatusApproved:
+		summary.ApprovalsApproved++
+	case state.ApprovalStatusRejected:
+		summary.ApprovalsRejected++
+	}
 }
 
 func fleetAttentionSeverity(worker fleetWorkerState) int {
@@ -516,6 +573,13 @@ func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, 
 	item.Failed = failedCount(projectState.Summary)
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
+	item.Approvals = makeFleetApprovalStates(item, st, time.Now().UTC())
+	if len(item.Approvals) > 0 {
+		item.ApprovalSummary = make(map[string]int)
+		for _, approval := range item.Approvals {
+			item.ApprovalSummary[approval.Status]++
+		}
+	}
 	workers := make([]fleetWorkerState, 0)
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
@@ -578,6 +642,201 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		LastNotification:  worker.LastNotification,
 		Actions:           worker.Actions,
 	}
+}
+
+func makeFleetApprovalStates(project fleetProjectState, st *state.State, now time.Time) []fleetApprovalState {
+	if st == nil || len(st.Approvals) == 0 {
+		return nil
+	}
+	items := make([]fleetApprovalState, 0, len(st.Approvals))
+	for _, approval := range st.Approvals {
+		items = append(items, makeFleetApprovalState(project, st, approval, now))
+	}
+	sortFleetApprovals(items)
+	return items
+}
+
+func makeFleetApprovalState(project fleetProjectState, st *state.State, approval state.Approval, now time.Time) fleetApprovalState {
+	issue, pr, session, sessionStatus := fleetApprovalTarget(st, approval.Target)
+	createdAt := approval.CreatedAt.UTC()
+	updatedAt := approval.UpdatedAt.UTC()
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	item := fleetApprovalState{
+		ProjectName:       project.Name,
+		ProjectRepo:       project.Repo,
+		DashboardURL:      project.DashboardURL,
+		ID:                approval.ID,
+		DecisionID:        approval.DecisionID,
+		Action:            approval.Action,
+		Target:            approval.Target,
+		IssueNumber:       issue,
+		IssueURL:          githubIssueURL(project.Repo, issue),
+		PRNumber:          pr,
+		PRURL:             githubPRURL(project.Repo, pr),
+		Session:           session,
+		SessionStatus:     sessionStatus,
+		Status:            string(approval.Status),
+		Risk:              approval.Risk,
+		Summary:           approval.Summary,
+		CreatedAt:         formatFleetTime(createdAt),
+		UpdatedAt:         formatFleetTime(updatedAt),
+		CreatedAge:        formatFleetAge(createdAt, now),
+		UpdatedAge:        formatFleetAge(updatedAt, now),
+		CreatedAgeSeconds: fleetAgeSeconds(createdAt, now),
+		UpdatedAgeSeconds: fleetAgeSeconds(updatedAt, now),
+		createdAt:         createdAt,
+		updatedAt:         updatedAt,
+	}
+	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
+	return item
+}
+
+func fleetApprovalTarget(st *state.State, target *state.SupervisorTarget) (issue int, pr int, session string, sessionStatus string) {
+	if target != nil {
+		issue = target.Issue
+		pr = target.PR
+		session = strings.TrimSpace(target.Session)
+	}
+	if st == nil {
+		return issue, pr, session, sessionStatus
+	}
+	if session != "" {
+		if sess := st.Sessions[session]; sess != nil {
+			if issue == 0 {
+				issue = sess.IssueNumber
+			}
+			if pr == 0 {
+				pr = sess.PRNumber
+			}
+			sessionStatus = string(sess.Status)
+			return issue, pr, session, sessionStatus
+		}
+	}
+
+	matchedSession := ""
+	for slot, sess := range st.Sessions {
+		if sess == nil {
+			continue
+		}
+		if (issue > 0 && sess.IssueNumber == issue) || (pr > 0 && sess.PRNumber == pr) {
+			if matchedSession != "" {
+				matchedSession = ""
+				break
+			}
+			matchedSession = slot
+			if issue == 0 {
+				issue = sess.IssueNumber
+			}
+			if pr == 0 {
+				pr = sess.PRNumber
+			}
+			sessionStatus = string(sess.Status)
+		}
+	}
+	if session == "" {
+		session = matchedSession
+	}
+	if session == "" {
+		sessionStatus = ""
+	}
+	return issue, pr, session, sessionStatus
+}
+
+func fleetApprovalTargetLinks(repo string, approval fleetApprovalState) []targetLinkInfo {
+	links := make([]targetLinkInfo, 0, 3)
+	if approval.IssueNumber > 0 {
+		links = append(links, targetLinkInfo{
+			Kind:  "issue",
+			Label: fmt.Sprintf("Issue #%d", approval.IssueNumber),
+			URL:   githubIssueURL(repo, approval.IssueNumber),
+		})
+	}
+	if approval.PRNumber > 0 {
+		links = append(links, targetLinkInfo{
+			Kind:  "pr",
+			Label: fmt.Sprintf("PR #%d", approval.PRNumber),
+			URL:   githubPRURL(repo, approval.PRNumber),
+		})
+	}
+	if strings.TrimSpace(approval.Session) != "" {
+		links = append(links, targetLinkInfo{
+			Kind:  "session",
+			Label: "Session " + strings.TrimSpace(approval.Session),
+		})
+	}
+	return links
+}
+
+func sortFleetApprovals(items []fleetApprovalState) {
+	sort.SliceStable(items, func(i, j int) bool {
+		left, right := items[i], items[j]
+		li := fleetApprovalStatusRank(left.Status)
+		ri := fleetApprovalStatusRank(right.Status)
+		if li != ri {
+			return li < ri
+		}
+		lt := left.updatedAt
+		if lt.IsZero() {
+			lt = left.createdAt
+		}
+		rt := right.updatedAt
+		if rt.IsZero() {
+			rt = right.createdAt
+		}
+		if !lt.Equal(rt) {
+			return lt.After(rt)
+		}
+		if left.ProjectName != right.ProjectName {
+			return left.ProjectName < right.ProjectName
+		}
+		return left.ID < right.ID
+	})
+}
+
+func fleetApprovalStatusRank(status string) int {
+	switch state.ApprovalStatus(status) {
+	case state.ApprovalStatusPending:
+		return 0
+	case state.ApprovalStatusStale:
+		return 1
+	case state.ApprovalStatusApproved:
+		return 2
+	case state.ApprovalStatusRejected:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func formatFleetTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
+func formatFleetAge(t, now time.Time) string {
+	seconds := fleetAgeSeconds(t, now)
+	if seconds == 0 && t.IsZero() {
+		return ""
+	}
+	return (time.Duration(seconds) * time.Second).String()
+}
+
+func fleetAgeSeconds(t, now time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	d := now.Sub(t).Round(time.Second)
+	if d < 0 {
+		return 0
+	}
+	return int64(d / time.Second)
 }
 
 func failedCount(summary map[string]int) int {
@@ -668,6 +927,62 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     background: rgba(88,166,255,.12);
   }
   .project-tab .count { margin-left: 6px; color: var(--muted); font-size: 12px; }
+  .approval-inbox {
+    margin-bottom: 16px;
+    border: 1px solid rgba(210,153,34,.35);
+    background: linear-gradient(180deg, rgba(210,153,34,.08), rgba(21,27,35,.96) 90%);
+  }
+  .approval-list {
+    display: grid;
+    gap: 8px;
+    padding: 12px 14px 14px;
+  }
+  .approval-card {
+    display: grid;
+    grid-template-columns: minmax(130px, .7fr) minmax(130px, .75fr) minmax(160px, 1fr) minmax(0, 2fr);
+    gap: 10px;
+    min-width: 0;
+    padding: 10px 12px;
+    border: 1px solid rgba(41,49,61,.9);
+    border-left: 3px solid var(--line);
+    background: rgba(16,22,29,.86);
+  }
+  .approval-card.approval-pending { border-left-color: var(--warn); background: rgba(210,153,34,.08); }
+  .approval-card.approval-stale { border-left-color: var(--bad); background: rgba(248,81,73,.09); }
+  .approval-card.approval-approved { border-left-color: var(--ok); background: rgba(63,185,80,.06); }
+  .approval-card.approval-rejected { border-left-color: #ff7b72; background: rgba(255,123,114,.07); }
+  .approval-project,
+  .approval-action,
+  .approval-target,
+  .approval-main { min-width: 0; }
+  .approval-project strong,
+  .approval-action strong {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .approval-meta,
+  .approval-age,
+  .approval-risk {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .approval-target { display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; font-size: 12px; }
+  .approval-summary { margin-top: 5px; color: var(--text); line-height: 1.35; }
+  .link-button {
+    border: 0;
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    padding: 0;
+  }
+  .link-button:hover { text-decoration: underline; }
   .attention-inbox {
     margin-bottom: 16px;
     border: 1px solid rgba(248,81,73,.35);
@@ -962,6 +1277,10 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .s-pr_open { color: var(--accent); border-color: rgba(88,166,255,.45); }
   .s-done { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.45); }
+  .a-pending { color: var(--warn); border-color: rgba(210,153,34,.55); background: rgba(210,153,34,.08); }
+  .a-stale { color: var(--bad); border-color: rgba(248,81,73,.55); background: rgba(248,81,73,.08); }
+  .a-approved { color: var(--ok); border-color: rgba(63,185,80,.55); background: rgba(63,185,80,.08); }
+  .a-rejected { color: #ff7b72; border-color: rgba(255,123,114,.55); background: rgba(255,123,114,.08); }
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .action-btn {
@@ -1010,6 +1329,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     .section-head { flex-direction: column; }
     .section-note { text-align: left; }
     .worker-controls { grid-template-columns: 1fr; }
+    .approval-card { grid-template-columns: 1fr; }
     .attention-card { grid-template-columns: 1fr; }
     .attention-top { grid-template-columns: minmax(0, 1fr) auto; }
     .attention-pr { grid-column: 1 / -1; }
@@ -1029,6 +1349,16 @@ const fleetDashboardHTML = `<!DOCTYPE html>
 </header>
 <main>
   <nav class="project-tabs" id="project-tabs" aria-label="Fleet projects"></nav>
+  <section class="approval-inbox" id="approval-inbox" aria-live="polite">
+    <div class="section-head">
+      <div>
+        <h2>Approval Inbox</h2>
+        <div class="sub">Read-only lifecycle view of supervisor approvals across projects.</div>
+      </div>
+      <div class="section-note" id="approval-summary">Loading approvals...</div>
+    </div>
+    <div class="approval-list" id="approval-list"></div>
+  </section>
   <section class="attention-inbox" id="attention-inbox" aria-live="polite">
     <div class="section-head">
       <div>
@@ -1093,6 +1423,8 @@ const projectsEl = document.getElementById("projects");
 const statsEl = document.getElementById("stats");
 const subtitleEl = document.getElementById("subtitle");
 const tabsEl = document.getElementById("project-tabs");
+const approvalListEl = document.getElementById("approval-list");
+const approvalSummaryEl = document.getElementById("approval-summary");
 const attentionListEl = document.getElementById("attention-list");
 const attentionSummaryEl = document.getElementById("attention-summary");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
@@ -1133,6 +1465,7 @@ const fleetState = {
   sortKey: "status",
   sortDir: "asc",
   projects: [],
+  approvals: [],
   attention: [],
   workers: [],
   detail: null
@@ -1174,6 +1507,10 @@ function actionLabel(action) {
   return String(action || "-").replace(/_/g, " ");
 }
 
+function cssToken(value) {
+  return String(value || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+}
+
 function actionDisabledReason(actions) {
   const action = (actions || []).find(item => item.disabled_reason);
   return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
@@ -1188,6 +1525,119 @@ function renderActions(actions) {
     escapeText(action.label || actionLabel(action.id)) + '</button>'
   ).join("") + '</div>' +
   '<div class="action-note">' + escapeText(actionDisabledReason(items)) + '</div>';
+}
+
+function approvalStatusRank(status) {
+  switch (status) {
+  case "pending": return 0;
+  case "stale": return 1;
+  case "approved": return 2;
+  case "rejected": return 3;
+  default: return 4;
+  }
+}
+
+function approvalTimeMillis(approval) {
+  const updated = Date.parse(approval.updated_at || "");
+  if (Number.isFinite(updated)) return updated;
+  const created = Date.parse(approval.created_at || "");
+  return Number.isFinite(created) ? created : 0;
+}
+
+function sortApprovals(approvals) {
+  return approvals.map((approval, index) => ({ approval, index }))
+    .sort((left, right) => {
+      const status = compareNumber(approvalStatusRank(left.approval.status), approvalStatusRank(right.approval.status));
+      if (status !== 0) return status;
+      const freshness = compareNumber(approvalTimeMillis(right.approval), approvalTimeMillis(left.approval));
+      if (freshness !== 0) return freshness;
+      const project = compareText(left.approval.project_name, right.approval.project_name);
+      if (project !== 0) return project;
+      const id = compareText(left.approval.id, right.approval.id);
+      if (id !== 0) return id;
+      return left.index - right.index;
+    })
+    .map(entry => entry.approval);
+}
+
+function approvalsFromData(data) {
+  const approvals = Array.isArray(data.approvals)
+    ? data.approvals.slice()
+    : (data.projects || []).flatMap(project => (project.approvals || []).map(approval => ({
+      ...approval,
+      project_name: approval.project_name || project.name,
+      project_repo: approval.project_repo || project.repo,
+      dashboard_url: approval.dashboard_url || project.dashboard_url
+    })));
+  return sortApprovals(approvals);
+}
+
+function approvalStatusClass(approval) {
+  return "pill a-" + cssToken(approval.status || "unknown");
+}
+
+function approvalCardClass(approval) {
+  return "approval-card approval-" + cssToken(approval.status || "unknown");
+}
+
+function approvalSessionVisible(approval) {
+  return (fleetState.workers || []).some(worker =>
+    worker.project_name === approval.project_name && worker.slot === approval.session);
+}
+
+function approvalTargetHTML(approval) {
+  const links = [];
+  if (approval.issue_number) links.push(linkHTML(approval.issue_url, "Issue #" + approval.issue_number));
+  if (approval.pr_number) links.push(linkHTML(approval.pr_url, "PR #" + approval.pr_number));
+  if (approval.session) {
+    if (approvalSessionVisible(approval)) {
+      links.push('<button type="button" class="link-button approval-session-link" data-project="' +
+        escapeText(approval.project_name || "") + '" data-slot="' + escapeText(approval.session || "") + '">Session ' +
+        escapeText(approval.session) + '</button>');
+    } else {
+      links.push('<span>Session ' + escapeText(approval.session) + '</span>');
+    }
+  }
+  return links.length ? links.join(" ") : '<span class="empty">No target</span>';
+}
+
+function renderApprovalInbox() {
+  const approvals = fleetState.approvals || [];
+  if (!approvals.length) {
+    approvalSummaryEl.textContent = "No approvals";
+    approvalListEl.innerHTML = '<div class="empty approval-empty">No supervisor approvals are recorded across the fleet.</div>';
+    return;
+  }
+
+  const counts = approvals.reduce((acc, approval) => {
+    const status = approval.status || "unknown";
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  approvalSummaryEl.textContent = (counts.pending || 0) + " pending · " + (counts.stale || 0) + " stale · " +
+    (counts.approved || 0) + " approved · " + (counts.rejected || 0) + " rejected";
+  approvalListEl.innerHTML = approvals.map(approval => {
+    const project = approval.project_name || "-";
+    const id = approval.id || "-";
+    const action = actionLabel(approval.action || "-");
+    const createdAge = approval.created_age || "-";
+    const updatedAge = approval.updated_age || "-";
+    const sessionStatus = approval.session_status ? "Status " + approval.session_status : "";
+    return '<article class="' + approvalCardClass(approval) + '" title="' + escapeText(approval.summary || "") + '">' +
+      '<div class="approval-project"><strong title="' + escapeText(project) + '">' + linkHTML(approval.dashboard_url, project) + '</strong>' +
+        '<div class="approval-meta"><span title="' + escapeText(id) + '">' + escapeText(id) + '</span></div></div>' +
+      '<div class="approval-action"><strong title="' + escapeText(action) + '">' + escapeText(action) + '</strong>' +
+        '<div class="approval-meta"><span class="' + approvalStatusClass(approval) + '">' + escapeText(approval.status || "unknown") + '</span></div></div>' +
+      '<div class="approval-target">' + approvalTargetHTML(approval) + (sessionStatus ? '<span>' + escapeText(sessionStatus) + '</span>' : "") + '</div>' +
+      '<div class="approval-main"><div class="approval-age"><span>Created ' + escapeText(createdAge) + ' ago</span><span>Updated ' + escapeText(updatedAge) + ' ago</span></div>' +
+        '<div class="approval-risk"><span>Risk ' + escapeText(approval.risk || "-") + '</span></div>' +
+        '<div class="approval-summary">' + escapeText(approval.summary || "No summary recorded.") + '</div></div>' +
+    '</article>';
+  }).join("");
+
+  approvalListEl.querySelectorAll(".approval-session-link[data-slot]").forEach(button => {
+    button.addEventListener("click", () => selectWorker(button.dataset.project || "", button.dataset.slot || ""));
+  });
 }
 
 function formatTimestamp(value) {
@@ -1908,6 +2358,7 @@ async function loadFleet() {
     fleetState.readOnly = data.read_only !== false;
     fleetState.projects = data.projects || [];
     fleetState.workers = fleetWorkersFromData(data);
+    fleetState.approvals = approvalsFromData(data);
     fleetState.attention = attentionFromData(data);
     if (fleetState.selectedWorkerKey && !selectedWorker()) {
       fleetState.selectedWorkerKey = "";
@@ -1919,12 +2370,15 @@ async function loadFleet() {
     syncFilterControls();
     renderStats(data.summary || {});
     renderProjectTabs();
+    renderApprovalInbox();
     renderAttentionInbox();
     renderFleetWorkers();
     renderWorkerDetail(fleetState.detail);
     projectsEl.innerHTML = fleetState.projects.map(renderProject).join("");
   } catch (err) {
     subtitleEl.textContent = "Fleet API error";
+    approvalSummaryEl.textContent = "Fleet API error";
+    approvalListEl.innerHTML = '<div class="error">Unable to load approval inbox.</div>';
     attentionSummaryEl.textContent = "Fleet API error";
     attentionListEl.innerHTML = '<div class="error">Unable to load attention inbox.</div>';
     workerSummaryEl.textContent = "Fleet API error";

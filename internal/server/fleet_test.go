@@ -172,6 +172,129 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 }
 
+func TestFleetAPIIncludesApprovalInboxMetadata(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "approvals")
+	st := state.NewState()
+	st.Sessions["slot-pending"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "Pending approval target",
+		Status:      state.StatusRunning,
+		StartedAt:   now.Add(-2 * time.Hour),
+		PRNumber:    7,
+	}
+	st.Sessions["slot-stale"] = &state.Session{
+		IssueNumber: 43,
+		IssueTitle:  "Stale approval target",
+		Status:      state.StatusRunning,
+		StartedAt:   now.Add(-3 * time.Hour),
+	}
+
+	pending := st.RecordPendingApprovalForDecision(state.SupervisorDecision{
+		ID:                "approval-pending",
+		CreatedAt:         now.Add(-15 * time.Minute),
+		Project:           "owner/approvals",
+		Mode:              "active",
+		Summary:           "Spawn a worker for issue #42.",
+		RecommendedAction: "spawn_worker",
+		Target:            &state.SupervisorTarget{Issue: 42, Session: "slot-pending"},
+		Risk:              "approval_gated",
+		Reasons:           []string{"Issue #42 is eligible"},
+	}, now.Add(-15*time.Minute))
+	approved := st.RecordPendingApprovalForDecision(state.SupervisorDecision{
+		ID:                "approval-approved",
+		CreatedAt:         now.Add(-30 * time.Minute),
+		Project:           "owner/approvals",
+		Summary:           "Merge PR #8.",
+		RecommendedAction: "approve_merge",
+		Target:            &state.SupervisorTarget{PR: 8},
+		Risk:              "mutating",
+	}, now.Add(-30*time.Minute))
+	if _, err := st.ApproveApproval(approved.ID, now.Add(-20*time.Minute), "test", "covered by test"); err != nil {
+		t.Fatalf("ApproveApproval: %v", err)
+	}
+	rejected := st.RecordPendingApprovalForDecision(state.SupervisorDecision{
+		ID:                "approval-rejected",
+		CreatedAt:         now.Add(-40 * time.Minute),
+		Project:           "owner/approvals",
+		Summary:           "Mark issue #44 blocked.",
+		RecommendedAction: "mark_issue_blocked",
+		Target:            &state.SupervisorTarget{Issue: 44},
+		Risk:              "mutating",
+	}, now.Add(-40*time.Minute))
+	if _, err := st.RejectApproval(rejected.ID, now.Add(-25*time.Minute), "test", "covered by test"); err != nil {
+		t.Fatalf("RejectApproval: %v", err)
+	}
+	stale := st.RecordPendingApprovalForDecision(state.SupervisorDecision{
+		ID:                "approval-stale",
+		CreatedAt:         now.Add(-50 * time.Minute),
+		Project:           "owner/approvals",
+		Summary:           "Start stale worker.",
+		RecommendedAction: "spawn_worker",
+		Target:            &state.SupervisorTarget{Issue: 43, Session: "slot-stale"},
+		Risk:              "approval_gated",
+	}, now.Add(-50*time.Minute))
+	st.Sessions["slot-stale"].PRNumber = 9
+	st.MarkStaleApprovals(now.Add(-10 * time.Minute))
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("Approvals", "/tmp/approvals.yaml", "http://127.0.0.1:8789", &config.Config{
+			Repo:        "owner/approvals",
+			StateDir:    stateDir,
+			MaxParallel: 2,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	if len(resp.Approvals) != 4 {
+		t.Fatalf("fleet approvals len = %d, want 4", len(resp.Approvals))
+	}
+	if len(resp.Projects) != 1 || len(resp.Projects[0].Approvals) != 4 {
+		t.Fatalf("project approvals = %+v, want 4 approvals", resp.Projects)
+	}
+	if resp.Summary.Approvals != 4 || resp.Summary.ApprovalsPending != 1 || resp.Summary.ApprovalsStale != 1 || resp.Summary.ApprovalsApproved != 1 || resp.Summary.ApprovalsRejected != 1 {
+		t.Fatalf("approval summary = %+v, want one per lifecycle status", resp.Summary)
+	}
+	if resp.Projects[0].ApprovalSummary[string(state.ApprovalStatusPending)] != 1 || resp.Projects[0].ApprovalSummary[string(state.ApprovalStatusStale)] != 1 {
+		t.Fatalf("project approval summary = %+v, want pending and stale counts", resp.Projects[0].ApprovalSummary)
+	}
+	if resp.Approvals[0].ID != pending.ID || resp.Approvals[1].ID != stale.ID {
+		t.Fatalf("approval order = %q, %q; want pending then stale", resp.Approvals[0].ID, resp.Approvals[1].ID)
+	}
+
+	approval := findFleetApproval(t, resp.Approvals, pending.ID)
+	if approval.ProjectName != "Approvals" || approval.ProjectRepo != "owner/approvals" || approval.DashboardURL == "" {
+		t.Fatalf("approval project metadata = %+v", approval)
+	}
+	if approval.IssueNumber != 42 || approval.IssueURL != "https://github.com/owner/approvals/issues/42" {
+		t.Fatalf("approval issue metadata = %+v", approval)
+	}
+	if approval.PRNumber != 7 || approval.PRURL != "https://github.com/owner/approvals/pull/7" {
+		t.Fatalf("approval PR metadata = %+v", approval)
+	}
+	if approval.Session != "slot-pending" || approval.SessionStatus != string(state.StatusRunning) {
+		t.Fatalf("approval session metadata = %+v", approval)
+	}
+	if approval.Status != string(state.ApprovalStatusPending) || approval.Action != "spawn_worker" || approval.Risk != "approval_gated" || approval.Summary == "" {
+		t.Fatalf("approval lifecycle metadata = %+v", approval)
+	}
+	if approval.CreatedAge == "" || approval.UpdatedAge == "" || approval.CreatedAgeSeconds <= 0 || approval.UpdatedAgeSeconds <= 0 {
+		t.Fatalf("approval ages = %+v, want populated age fields", approval)
+	}
+	if len(approval.TargetLinks) != 3 {
+		t.Fatalf("approval target links = %+v, want issue, PR, and session links", approval.TargetLinks)
+	}
+
+	staleApproval := findFleetApproval(t, resp.Approvals, stale.ID)
+	if staleApproval.Status != string(state.ApprovalStatusStale) {
+		t.Fatalf("stale approval status = %q, want stale", staleApproval.Status)
+	}
+}
+
 func TestFleetAttentionInboxOrdersBySeverityAndFreshness(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -502,6 +625,9 @@ func TestFleetDashboard(t *testing.T) {
 		"/api/v1/fleet",
 		"/api/v1/fleet/worker",
 		"project-tabs",
+		"approval-inbox",
+		"approval-list",
+		"approval-summary",
 		"attention-inbox",
 		"attention-list",
 		"attention-summary",
@@ -515,8 +641,14 @@ func TestFleetDashboard(t *testing.T) {
 		"worker-sort",
 		"sort-direction",
 		"renderFleetWorkers",
+		"renderApprovalInbox",
+		"approvalsFromData",
 		"renderAttentionInbox",
 		"attentionFromData",
+		"pending · ",
+		"stale · ",
+		"approved · ",
+		"rejected",
 		"if (!Array.isArray(data.attention) && Array.isArray(data.workers))",
 		"No projects need attention right now",
 		"renderWorkerDetail",
@@ -582,6 +714,17 @@ func findFleetWorker(t *testing.T, workers []fleetWorkerState, slot string) flee
 	}
 	t.Fatalf("worker %q not found in %+v", slot, workers)
 	return fleetWorkerState{}
+}
+
+func findFleetApproval(t *testing.T, approvals []fleetApprovalState, id string) fleetApprovalState {
+	t.Helper()
+	for _, approval := range approvals {
+		if approval.ID == id {
+			return approval
+		}
+	}
+	t.Fatalf("approval %q not found in %+v", id, approvals)
+	return fleetApprovalState{}
 }
 
 func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Session) {
