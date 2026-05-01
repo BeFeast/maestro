@@ -8,6 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/outcome"
+	"github.com/befeast/maestro/internal/state"
 )
 
 func TestPromptInit(t *testing.T) {
@@ -50,6 +54,28 @@ func TestPromptInitOutput(t *testing.T) {
 	promptInit(scanner, &buf, "Name", "")
 	if !strings.Contains(buf.String(), "? Name: ") {
 		t.Errorf("prompt output = %q, want to contain '? Name: '", buf.String())
+	}
+}
+
+func TestBuildProjectStatusJSONIncludesOutcome(t *testing.T) {
+	cfg := &config.Config{
+		Repo:          "org/repo",
+		SessionPrefix: "rep",
+		Outcome: outcome.Brief{
+			DesiredOutcome: "Repo is live",
+			RuntimeTarget:  "https://repo.example.com",
+			HealthcheckURL: "https://repo.example.com/healthz",
+		},
+	}
+	st := state.NewState()
+	st.Sessions["done"] = &state.Session{IssueNumber: 1, Status: state.StatusDone, PRNumber: 10}
+
+	got := buildProjectStatusJSON(cfg, st)
+	if got.Repo != "org/repo" || got.Prefix != "rep" {
+		t.Fatalf("project metadata = %q/%q, want org/repo rep", got.Repo, got.Prefix)
+	}
+	if !got.Outcome.Configured || got.Outcome.Goal != "Repo is live" || got.Outcome.HealthState != outcome.HealthUnknown {
+		t.Fatalf("outcome = %+v, want configured unknown health", got.Outcome)
 	}
 }
 
@@ -369,6 +395,8 @@ func TestRunInitWizardRicherConfig(t *testing.T) {
 		"# auto_rebase: true",
 		"# merge_strategy: sequential",
 		"# worker_prompt:",
+		"# outcome:",
+		"#   desired_outcome:",
 		"# exclude_labels:",
 	}
 	for _, key := range commentedKeys {

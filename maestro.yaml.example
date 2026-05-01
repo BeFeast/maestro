@@ -18,6 +18,20 @@ review_gate: greptile              # "greptile" (default) or "none"
 auto_retry_review_feedback: false  # retry PRs with actionable review comments
 auto_retry_rebase_conflicts: false # retry PRs whose auto-rebase fails with conflicts
 
+# Outcome brief — the supervisor uses this to judge runtime progress instead of
+# raw issue throughput. For Maestro dogfooding, configure the BeFeast/maestro
+# project first and point these values at the local Mission Control runtime.
+# outcome:
+#   desired_outcome: Maestro can supervise its own development and show a live Mission Control dashboard.
+#   runtime_target: http://127.0.0.1:8786
+#   deployment_status_command: systemctl --user status maestro.service
+#   healthcheck_url: http://127.0.0.1:8786/api/v1/state
+#   source_repo_path: /path/to/local/maestro
+#   runtime_host: local developer workstation
+#   non_goals:
+#     - Mutate production deploys without explicit approval controls
+#     - Generate broad issue waves automatically
+
 # Files to auto-resolve conflicts by keeping both sides during rebase.
 # Useful for generated/aggregated files that accumulate changes from multiple branches.
 # auto_resolve_files:

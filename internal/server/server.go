@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/worker"
 )
@@ -98,6 +99,7 @@ type stateResponse struct {
 	Repo                string                       `json:"repo"`
 	MaxParallel         int                          `json:"max_parallel"`
 	ReadOnly            bool                         `json:"read_only"`
+	Outcome             outcome.Status               `json:"outcome"`
 	Actions             []controlAction              `json:"actions,omitempty"`
 	SupervisorPolicy    config.SupervisorConfig      `json:"supervisor_policy"`
 	All                 []sessionInfo                `json:"all"`
@@ -138,6 +140,7 @@ type supervisorDecisionInfo struct {
 	Reasons           []string                       `json:"reasons,omitempty"`
 	Mutations         []state.SupervisorMutation     `json:"mutations,omitempty"`
 	StuckStates       []state.SupervisorStuckState   `json:"stuck_states,omitempty"`
+	Outcome           *outcome.Status                `json:"outcome,omitempty"`
 	StuckReasons      []string                       `json:"stuck_reasons,omitempty"`
 	ProjectState      state.SupervisorProjectState   `json:"project_state"`
 	QueueAnalysis     *state.SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
@@ -340,6 +343,7 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 		Reasons:           decision.Reasons,
 		Mutations:         decision.Mutations,
 		StuckStates:       decision.StuckStates,
+		Outcome:           decision.Outcome,
 		StuckReasons:      supervisorStuckReasons(decision),
 		ProjectState:      decision.ProjectState,
 		QueueAnalysis:     decision.QueueAnalysis,
@@ -629,6 +633,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		Repo:                cfg.Repo,
 		MaxParallel:         cfg.MaxParallel,
 		ReadOnly:            cfg.Server.ReadOnly,
+		Outcome:             outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt),
 		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions", cfg.Repo),
 		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
@@ -1139,13 +1144,22 @@ const dashboardHTML = `<!DOCTYPE html>
     gap: 10px;
     margin-left: 10px;
   }
-  .supervisor-panel {
-    border-bottom: 1px solid var(--line);
-    background: #0b1016;
-    padding: 12px 14px;
-    font-size: 12px;
-    color: var(--muted);
+  .supervisor-panel, .outcome-panel {
+	border-bottom: 1px solid var(--line);
+	background: #0b1016;
+	padding: 12px 14px;
+	font-size: 12px;
+	color: var(--muted);
   }
+  .outcome-panel { background: #0f151c; }
+  .outcome-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 12px;
+    margin-top: 6px;
+  }
+  .outcome-line { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .outcome-line strong { color: var(--text); font-weight: 650; }
   .supervisor-head, .supervisor-main, .supervisor-meta, .supervisor-links, .supervisor-actions {
     display: flex;
     align-items: center;
@@ -1266,8 +1280,9 @@ const dashboardHTML = `<!DOCTYPE html>
       <div class="log-title" id="log-title">Log <span></span></div>
       <div class="log-meta" id="log-meta"></div>
     </div>
-    <div class="supervisor-panel" id="supervisor-panel"></div>
-    <div class="status-note" id="status-note"></div>
+	<div class="supervisor-panel" id="supervisor-panel"></div>
+	<div class="outcome-panel" id="outcome-panel"></div>
+	<div class="status-note" id="status-note"></div>
     <pre id="log"><span class="muted">Select a worker.</span></pre>
   </section>
 </main>
@@ -1277,6 +1292,7 @@ window.MAESTRO_REPO = __REPO_JSON__;
 const state = {
   workers: [],
   supervisor: null,
+  outcome: null,
   selected: "",
   filter: "",
   lastLog: null
@@ -1306,6 +1322,7 @@ const logTitleEl = document.getElementById("log-title");
 const logMetaEl = document.getElementById("log-meta");
 const statusNoteEl = document.getElementById("status-note");
 const supervisorPanelEl = document.getElementById("supervisor-panel");
+const outcomePanelEl = document.getElementById("outcome-panel");
 
 repoEl.textContent = window.MAESTRO_REPO || "";
 
@@ -1520,6 +1537,26 @@ function renderSupervisor(info) {
     reasonHTML + lastSafe + approvals;
 }
 
+function renderOutcome(outcome) {
+  const o = outcome || {};
+  const configured = o.configured === true;
+  const goal = configured ? (o.goal || "Configured outcome") : "No outcome brief configured";
+  const target = o.runtime_target || "-";
+  const health = o.health_state || (configured ? "unknown" : "not_configured");
+  const next = o.next_action || (configured ? "Verify runtime health." : "Add an outcome brief to config.");
+  const host = o.runtime_host ? " · " + o.runtime_host : "";
+  outcomePanelEl.innerHTML = '<div class="supervisor-head">' +
+    '<span class="supervisor-title">Outcome</span>' +
+    '<span class="supervisor-time">' + escapeText(health.replace(/_/g, " ")) + '</span>' +
+    '</div>' +
+    '<div class="outcome-grid">' +
+      '<div class="outcome-line" title="' + escapeText(goal) + '"><strong>Goal</strong> ' + escapeText(goal) + '</div>' +
+      '<div class="outcome-line" title="' + escapeText(target + host) + '"><strong>Runtime</strong> ' + escapeText(target + host) + '</div>' +
+      '<div class="outcome-line" title="' + escapeText(next) + '"><strong>Next</strong> ' + escapeText(next) + '</div>' +
+      '<div class="outcome-line"><strong>Health</strong> ' + escapeText(health.replace(/_/g, " ")) + '</div>' +
+    '</div>';
+}
+
 function renderWorkers() {
   const visible = sortWorkers(state.workers).filter(workerMatches);
   if (visible.length === 0) {
@@ -1587,10 +1624,12 @@ async function loadState() {
     const response = await fetch("/api/v1/state", { cache: "no-store" });
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
-    state.workers = data.all || [];
-    state.supervisor = data.supervisor || null;
-    renderStats(data.summary || {}, state.workers.length, data.max_parallel || 0, data.read_only);
-    renderSupervisor(state.supervisor);
+	state.workers = data.all || [];
+	state.supervisor = data.supervisor || null;
+	state.outcome = data.outcome || null;
+	renderStats(data.summary || {}, state.workers.length, data.max_parallel || 0, data.read_only);
+	renderSupervisor(state.supervisor);
+	renderOutcome(state.outcome);
     if (!state.selected && state.workers.length) state.selected = sortWorkers(state.workers)[0].slot;
     if (state.selected && !state.workers.some(worker => worker.slot === state.selected)) {
       state.selected = state.workers.length ? sortWorkers(state.workers)[0].slot : "";

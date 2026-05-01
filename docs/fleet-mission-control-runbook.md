@@ -47,6 +47,16 @@ exclude_labels:
 
 review_gate: greptile
 
+outcome:
+  desired_outcome: Users can run the product end-to-end.
+  runtime_target: https://app.example.com
+  deployment_status_command: /path/to/repos/<project>/scripts/status.sh
+  healthcheck_url: https://app.example.com/healthz
+  source_repo_path: /path/to/repos/<project>
+  runtime_host: production host or platform
+  non_goals:
+    - Rewrite unrelated subsystems
+
 server:
   host: 127.0.0.1
   port: 8788
@@ -96,7 +106,9 @@ Fleet Mission Control is an observation surface. It loads each project config, r
 
 The project runner remains the execution surface. It starts workers, reconciles dead sessions, opens and monitors PRs, waits for review gates, merges eligible PRs, deploys when configured, and updates local state.
 
-The supervisor is the explainability and policy surface. It records queue analysis, selected candidates, stuck states, safe label mutations, and approval requests. Safe actions are limited to actions explicitly listed in `supervisor.safe_actions`. Risky recommendations are recorded for an operator; approving them with the CLI records the approval but does not execute the risky action by itself.
+The supervisor is the explainability and policy surface. It records queue analysis, selected candidates, stuck states, outcome context, safe label mutations, and approval requests. Safe actions are limited to actions explicitly listed in `supervisor.safe_actions`. Risky recommendations are recorded for an operator; approving them with the CLI records the approval but does not execute the risky action by itself.
+
+Each project card shows an outcome status: goal, runtime target, health state, and next action. If no `outcome` brief is configured, Mission Control says so explicitly because merged PR throughput is not the same as a working runtime. If PRs keep merging while runtime health is unknown or failing, the supervisor records `no_outcome_progress` and recommends a read-only deploy/runtime check instead of mutating production.
 
 Use this order during normal operations:
 

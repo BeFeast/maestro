@@ -100,6 +100,8 @@ The PRD's `WorkflowState` enum (candidate, in_progress, review, blocked, done) i
 
 **Maestro** uses `maestro.yaml` — an external config file, typically per-deployment. The prompt template is a separate file referenced by path. This gives operational flexibility but means config isn't co-located with the codebase being worked on.
 
+Maestro configs can also carry an `outcome` brief. Without that brief, Maestro should say the project has no configured runtime goal instead of treating issue throughput as success.
+
 ### 5. Board/Tracker Writes
 
 **Symphony** follows a "service reads, agent writes" philosophy. The orchestrator polls the tracker for state but never mutates tracker state. State transitions are done by the agent using tools (e.g., the `linear_graphql` tool).

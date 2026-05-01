@@ -60,6 +60,18 @@ func TestNotifiedCIFail_Persistence(t *testing.T) {
 	}
 }
 
+func TestDonePRCount(t *testing.T) {
+	s := NewState()
+	s.Sessions["merged-1"] = &Session{IssueNumber: 1, Status: StatusDone, PRNumber: 10}
+	s.Sessions["merged-2"] = &Session{IssueNumber: 2, Status: StatusDone, PRNumber: 11}
+	s.Sessions["closed-issue"] = &Session{IssueNumber: 3, Status: StatusDone}
+	s.Sessions["open-pr"] = &Session{IssueNumber: 4, Status: StatusPROpen, PRNumber: 12}
+
+	if got := s.DonePRCount(); got != 2 {
+		t.Fatalf("DonePRCount = %d, want 2", got)
+	}
+}
+
 func TestNotifiedCIFail_OmittedWhenFalse(t *testing.T) {
 	dir := t.TempDir()
 

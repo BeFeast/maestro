@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -40,6 +41,7 @@ type supervisorProjectConfigPacket struct {
 	WorkerMaxTokens            int               `json:"worker_max_tokens,omitempty"`
 	MergeStrategy              string            `json:"merge_strategy"`
 	ReviewGate                 string            `json:"review_gate"`
+	Outcome                    outcome.Status    `json:"outcome"`
 	AutoRetryReviewFeedback    bool              `json:"auto_retry_review_feedback"`
 	AutoRetryRebaseConflicts   bool              `json:"auto_retry_rebase_conflicts"`
 	GitHubProjectsEnabled      bool              `json:"github_projects_enabled"`
@@ -129,6 +131,7 @@ type supervisorRecentDecision struct {
 	Target            *state.SupervisorTarget `json:"target,omitempty"`
 	Risk              string                  `json:"risk"`
 	RequiresApproval  bool                    `json:"requires_approval"`
+	Outcome           *outcome.Status         `json:"outcome,omitempty"`
 }
 
 type prChecksReader interface {
@@ -150,7 +153,7 @@ func (e *Engine) buildStatePacket(st *state.State, deterministic state.Superviso
 	}
 
 	return supervisorStatePacket{
-		ProjectConfig:          e.projectConfigPacket(),
+		ProjectConfig:          e.projectConfigPacket(st),
 		Policy:                 policy.packet(),
 		CurrentSessions:        sessionPackets(st),
 		OrderedQueue:           issuePackets(issues),
@@ -161,7 +164,7 @@ func (e *Engine) buildStatePacket(st *state.State, deterministic state.Superviso
 	}, nil
 }
 
-func (e *Engine) projectConfigPacket() supervisorProjectConfigPacket {
+func (e *Engine) projectConfigPacket(st *state.State) supervisorProjectConfigPacket {
 	return supervisorProjectConfigPacket{
 		Repo:                       e.cfg.Repo,
 		MaxParallel:                e.cfg.MaxParallel,
@@ -173,6 +176,7 @@ func (e *Engine) projectConfigPacket() supervisorProjectConfigPacket {
 		WorkerMaxTokens:            e.cfg.WorkerMaxTokens,
 		MergeStrategy:              e.cfg.MergeStrategy,
 		ReviewGate:                 e.cfg.ReviewGate,
+		Outcome:                    e.outcomeStatus(st),
 		AutoRetryReviewFeedback:    e.cfg.AutoRetryReviewFeedback,
 		AutoRetryRebaseConflicts:   e.cfg.AutoRetryRebaseConflicts,
 		GitHubProjectsEnabled:      e.cfg.GitHubProjects.Enabled,
@@ -357,6 +361,7 @@ func recentDecisionPackets(st *state.State) []supervisorRecentDecision {
 			Target:            decision.Target,
 			Risk:              decision.Risk,
 			RequiresApproval:  decision.RequiresApproval,
+			Outcome:           decision.Outcome,
 		})
 	}
 	return packets

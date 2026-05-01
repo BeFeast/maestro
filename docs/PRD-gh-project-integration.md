@@ -497,6 +497,7 @@ New:
 - local session state
 - PR CI state
 - tracker workflow state when available
+- outcome brief status when configured: goal, runtime target, health state, and next action
 
 Example extra column:
 

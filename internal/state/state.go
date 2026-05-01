@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/gofrs/flock"
 )
 
@@ -343,6 +344,11 @@ type SupervisorProjectState struct {
 	AvailableSlots int `json:"available_slots"`
 }
 
+const (
+	StuckMissingOutcomeBrief = "missing_outcome_brief"
+	StuckNoOutcomeProgress   = "no_outcome_progress"
+)
+
 // SupervisorIssueCandidate describes the issue selected by queue policy without
 // exposing issue body content in persisted supervisor state.
 type SupervisorIssueCandidate struct {
@@ -484,6 +490,7 @@ type SupervisorDecision struct {
 	RequiresApproval  bool                     `json:"requires_approval"`
 	Mutations         []SupervisorMutation     `json:"mutations,omitempty"`
 	StuckStates       []SupervisorStuckState   `json:"stuck_states,omitempty"`
+	Outcome           *outcome.Status          `json:"outcome,omitempty"`
 	ProjectState      SupervisorProjectState   `json:"project_state"`
 	QueueAnalysis     *SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
 	ApprovalID        string                   `json:"approval_id,omitempty"`
@@ -1404,6 +1411,21 @@ func (s *State) CountByStatus() map[SessionStatus]int {
 		}
 	}
 	return counts
+}
+
+// DonePRCount counts completed sessions that produced a PR. It is a conservative
+// proxy for issue throughput that may still fail to advance the runtime outcome.
+func (s *State) DonePRCount() int {
+	if s == nil {
+		return 0
+	}
+	count := 0
+	for _, sess := range s.Sessions {
+		if sess != nil && sess.Status == StatusDone && sess.PRNumber > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 // IssueInProgress returns true if the given issue is already being handled.

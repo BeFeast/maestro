@@ -13,6 +13,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mission"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -26,6 +27,7 @@ const (
 	ActionWaitForOrderedQueue  = "wait_for_ordered_queue"
 	ActionMonitorOpenPR        = "monitor_open_pr"
 	ActionReviewRetryExhausted = "review_retry_exhausted"
+	ActionCheckOutcomeHealth   = "check_outcome_health"
 	ActionSpawnWorker          = "spawn_worker"
 	ActionLabelIssueReady      = "label_issue_ready"
 
@@ -158,10 +160,19 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 
 // Decide observes state and GitHub read-only data, then returns the next recommendation.
 func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
+	var decision state.SupervisorDecision
+	var err error
 	if e.cfg.Supervisor.Enabled {
-		return e.decideWithLLM(st)
+		decision, err = e.decideWithLLM(st)
+	} else {
+		decision, err = e.decideDeterministic(st)
 	}
-	return e.decideDeterministic(st)
+	if err != nil {
+		return state.SupervisorDecision{}, err
+	}
+	outcomeStatus := e.outcomeStatus(st)
+	decision.Outcome = &outcomeStatus
+	return decision, nil
 }
 
 func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision, error) {
@@ -170,10 +181,12 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 	now := e.now().UTC()
 	projectState := e.projectState(st)
+	outcomeStatus := e.outcomeStatus(st)
 	baseReasons := []string{
 		fmt.Sprintf("State has %d session(s)", projectState.Sessions),
 		fmt.Sprintf("%d active session(s) count against %d max parallel slot(s)", len(st.ActiveSessions()), e.cfg.MaxParallel),
 		e.policySummaryReason(),
+		outcomeDecisionReason(outcomeStatus),
 	}
 
 	prs, err := e.reader.ListOpenPRs()
@@ -223,6 +236,18 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		decision := e.decision(now, projectState, ActionReviewRetryExhausted,
 			fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
 			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
+	}
+
+	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 && len(prs) == 0 {
+		reasons := appendReasons(baseReasons,
+			stuck.Summary,
+			"Supervisor remains read-only; it recommends outcome verification but does not run deploy or runtime commands",
+		)
+		decision := e.decision(now, projectState, ActionCheckOutcomeHealth,
+			"Verify outcome health before starting more issue work.",
+			RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
 		return decision, nil
 	}
@@ -287,6 +312,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		reasons := appendReasons(baseReasons,
 			issueLabelReason(e.requiredIssueLabels()),
 			fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
+			outcomeIssueReason(outcomeStatus, issue),
 			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 		)
 		decision := e.decision(now, projectState, ActionSpawnWorker,
@@ -331,6 +357,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		reasons := appendReasons(baseReasons,
 			queueLabelReason(candidate.readyLabel, candidate.blockedLabel),
 			fmt.Sprintf("Issue #%d is the next queue issue eligible for safe label mutation", candidate.issue.Number),
+			outcomeIssueReason(outcomeStatus, candidate.issue),
 		)
 		risk := RiskMutating
 		if len(mutations) > 0 {
@@ -388,6 +415,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult) (state.SupervisorDecision, error) {
 	candidates := result.candidates
 	analysis := result.analysis
+	outcomeStatus := e.outcomeStatus(st)
 	if analysis == nil {
 		analysis = &state.SupervisorQueueAnalysis{PolicyRule: PolicyRuleDynamicWave, OpenIssues: len(issues), EligibleCandidates: len(candidates), SkippedReasons: firstN(result.skipped, 5)}
 		if len(candidates) > 0 {
@@ -448,6 +476,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		reasons := appendReasons(baseReasons,
 			queueLabelReason(queueCandidate.readyLabel, ""),
 			fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+			outcomeIssueReason(outcomeStatus, issue),
 		)
 		risk := RiskMutating
 		if len(mutations) > 0 {
@@ -477,6 +506,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 	reasons := appendReasons(baseReasons,
 		issueLabelReason(e.requiredIssueLabels()),
 		fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+		outcomeIssueReason(outcomeStatus, issue),
 		"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 	)
 	decision := e.decision(now, projectState, ActionSpawnWorker,
@@ -487,6 +517,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 
 func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
 	reasons = appendReasons(reasons, policyRuleReason(policyRule))
+	outcomeStatus := e.outcomeStatus(nil)
 	return state.SupervisorDecision{
 		ID:                "sup-" + now.Format("20060102T150405.000000000Z"),
 		CreatedAt:         now,
@@ -501,6 +532,7 @@ func (e *Engine) decision(now time.Time, ps state.SupervisorProjectState, action
 		Confidence:        confidence,
 		Reasons:           compactReasons(reasons),
 		RequiresApproval:  risk == RiskApprovalGated,
+		Outcome:           &outcomeStatus,
 		ProjectState:      ps,
 	}
 }
@@ -514,7 +546,90 @@ func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.
 		findings = append(findings, detectPolicyStuckStates(skipped)...)
 	}
 	findings = append(findings, e.detectEnvironmentStuckStates(st, eligible)...)
+	findings = append(findings, e.detectOutcomeStuckStates(st)...)
 	return compactStuckStates(findings)
+}
+
+func (e *Engine) outcomeStatus(st *state.State) outcome.Status {
+	if e == nil || e.cfg == nil {
+		return outcome.StatusFor(outcome.Brief{}, 0, time.Time{})
+	}
+	mergedPRs := 0
+	lastMergeAt := time.Time{}
+	if st != nil {
+		mergedPRs = st.DonePRCount()
+		lastMergeAt = st.LastMergeAt
+	}
+	return outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt)
+}
+
+func outcomeDecisionReason(status outcome.Status) string {
+	if !status.Configured {
+		return "No outcome brief is configured; issue throughput alone is not enough to prove project progress"
+	}
+	goal := strings.TrimSpace(status.Goal)
+	if goal == "" {
+		goal = "configured runtime outcome"
+	}
+	if strings.TrimSpace(status.RuntimeTarget) != "" {
+		return fmt.Sprintf("Outcome: %s; runtime target: %s", goal, status.RuntimeTarget)
+	}
+	return "Outcome: " + goal
+}
+
+func outcomeIssueReason(status outcome.Status, issue github.Issue) string {
+	if !status.Configured {
+		return "No outcome brief explains why this issue advances a runtime goal"
+	}
+	goal := strings.TrimSpace(status.Goal)
+	if goal == "" {
+		goal = "the configured runtime outcome"
+	}
+	title := strings.TrimSpace(issue.Title)
+	if title == "" {
+		return fmt.Sprintf("Issue #%d is selected because it is the next policy-eligible step toward %s", issue.Number, goal)
+	}
+	return fmt.Sprintf("Issue #%d (%s) is selected because it is the next policy-eligible step toward %s", issue.Number, title, goal)
+}
+
+func (e *Engine) detectOutcomeStuckStates(st *state.State) []state.SupervisorStuckState {
+	status := e.outcomeStatus(st)
+	if !status.Configured {
+		return []state.SupervisorStuckState{stuckState(state.StuckMissingOutcomeBrief, SeverityWarning,
+			"No outcome brief is configured for this project.",
+			"Add an outcome brief with the desired runtime goal, target, health signal, and non-goals before treating issue throughput as success.", false, nil,
+			"Outcome brief configured: false")}
+	}
+	if st == nil || st.DonePRCount() < 2 {
+		return nil
+	}
+	switch status.HealthState {
+	case outcome.HealthUnknown, outcome.HealthUnmonitored, outcome.HealthFailing:
+		goal := strings.TrimSpace(status.Goal)
+		if goal == "" {
+			goal = "the configured outcome"
+		}
+		health := status.HealthState
+		if health == "" {
+			health = outcome.HealthUnknown
+		}
+		return []state.SupervisorStuckState{stuckState(state.StuckNoOutcomeProgress, SeverityBlocked,
+			fmt.Sprintf("Workers have merged PRs, but runtime outcome health is still %s for %s.", health, goal),
+			"Run the configured deployment status or healthcheck, then prioritize deploy/runtime fixes before dispatching more issue work.", false, nil,
+			fmt.Sprintf("done_pr_sessions=%d", st.DonePRCount()),
+			fmt.Sprintf("health_state=%s", health))}
+	default:
+		return nil
+	}
+}
+
+func noOutcomeProgressStuckState(stuckStates []state.SupervisorStuckState) *state.SupervisorStuckState {
+	for i := range stuckStates {
+		if stuckStates[i].Code == state.StuckNoOutcomeProgress {
+			return &stuckStates[i]
+		}
+	}
+	return nil
 }
 
 func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state.SupervisorStuckState {

@@ -185,6 +185,17 @@ session_prefix: proj
 # Worker prompt template
 worker_prompt: /path/to/worker-prompt-template.md
 
+# Outcome brief (read-only supervisor context)
+outcome:
+  desired_outcome: Users can run the product end-to-end.
+  runtime_target: https://app.example.com
+  deployment_status_command: /path/to/repo/scripts/status.sh
+  healthcheck_url: https://app.example.com/healthz
+  source_repo_path: /path/to/local/clone
+  runtime_host: production host or platform
+  non_goals:
+    - Rewrite unrelated subsystems
+
 # Post-merge deploy hook (runs after each successful merge)
 deploy_cmd: "/path/to/repo/scripts/deploy.sh"
 
@@ -204,6 +215,7 @@ telegram:
 | `worktree_base` | Directory where maestro creates per-worker worktrees |
 | `issue_labels` | Only pick issues with at least one of these labels (OR semantics) |
 | `exclude_labels` | Skip issues with any of these labels |
+| `outcome` | Project operating brief used by the supervisor to judge runtime progress |
 | `supervisor` | Optional local policy for supervisor queue order, safe actions, and issue-type skips |
 | `max_parallel` | Maximum concurrent worker sessions |
 | `deploy_cmd` | Shell command maestro runs after merging a PR |
@@ -211,6 +223,8 @@ telegram:
 | `worker_prompt` | Path to the worker prompt template file |
 
 Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules.
+
+For Maestro dogfooding, add the `outcome` block to the `BeFeast/maestro` project config first. Point `runtime_target` and `healthcheck_url` at the local Mission Control dashboard, and keep deploy/runtime actions read-only until approval-backed controls exist.
 
 ### Optional: versioning config
 

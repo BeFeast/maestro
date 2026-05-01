@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -81,7 +82,12 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 
 	projects := []FleetProject{
 		NewFleetProject("One", "/tmp/one.yaml", "http://127.0.0.1:8787", &config.Config{
-			Repo:        "owner/one",
+			Repo: "owner/one",
+			Outcome: outcome.Brief{
+				DesiredOutcome: "One is deployed",
+				RuntimeTarget:  "https://one.example.com",
+				HealthcheckURL: "https://one.example.com/healthz",
+			},
 			StateDir:    firstStateDir,
 			MaxParallel: 2,
 			Server:      config.ServerConfig{ReadOnly: true},
@@ -125,6 +131,9 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 	if len(resp.Projects[0].Active) != 2 {
 		t.Fatalf("project active len = %d, want 2", len(resp.Projects[0].Active))
+	}
+	if !resp.Projects[0].Outcome.Configured || resp.Projects[0].Outcome.Goal != "One is deployed" || resp.Projects[0].Outcome.HealthState != outcome.HealthUnknown {
+		t.Fatalf("project outcome = %+v, want configured unknown health", resp.Projects[0].Outcome)
 	}
 	if len(resp.Workers) != 3 {
 		t.Fatalf("fleet workers len = %d, want 3", len(resp.Workers))
@@ -1077,6 +1086,9 @@ func TestFleetDashboard(t *testing.T) {
 		"Why Attention",
 		"Why Not Running",
 		"Queue Snapshot",
+		"Outcome Status",
+		"outcomeHTML",
+		"No outcome brief configured",
 		"queueSnapshotHTML",
 		"queue-snapshot",
 		"held/meta",
