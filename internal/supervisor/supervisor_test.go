@@ -3,6 +3,8 @@ package supervisor
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -637,6 +639,43 @@ func TestDecideDeterministic_OutcomeUsesStateMergeHistory(t *testing.T) {
 	}
 }
 
+func TestDecide_HealthyOutcomeAllowsIssueWorkAfterMerges(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "next outcome step", "maestro-ready")}}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.LastMergeAt = now.Add(-10 * time.Minute)
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now.Add(-time.Minute),
+		Signal:    "healthcheck_url",
+		State:     outcome.HealthHealthy,
+		Summary:   "GET returned 200 OK",
+	}
+	st.Sessions["done-1"] = &state.Session{IssueNumber: 1, IssueTitle: "first", Status: state.StatusDone, PRNumber: 10}
+	st.Sessions["done-2"] = &state.Session{IssueNumber: 2, IssueTitle: "second", Status: state.StatusDone, PRNumber: 11}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Outcome == nil || decision.Outcome.HealthState != outcome.HealthHealthy {
+		t.Fatalf("Outcome = %+v, want healthy persisted outcome", decision.Outcome)
+	}
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == state.StuckNoOutcomeProgress {
+			t.Fatalf("unexpected no_outcome_progress stuck state: %+v", stuck)
+		}
+	}
+}
+
 func TestDecide_EmptyStateNoAction(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{}
@@ -682,6 +721,36 @@ func TestRunOnceRecordsDecision(t *testing.T) {
 	}
 	if len(st.Approvals) != 0 {
 		t.Fatalf("approvals = %d, want 0 for safe action", len(st.Approvals))
+	}
+}
+
+func TestRunOnceRecordsOutcomeHealth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		HealthcheckURL: server.URL,
+	}
+	reader := &fakeReader{}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if decision.Outcome == nil || decision.Outcome.HealthState != outcome.HealthHealthy {
+		t.Fatalf("decision outcome = %+v, want healthy", decision.Outcome)
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if st.OutcomeHealth == nil || st.OutcomeHealth.State != outcome.HealthHealthy {
+		t.Fatalf("stored outcome health = %+v, want healthy", st.OutcomeHealth)
 	}
 }
 

@@ -717,7 +717,7 @@ func buildProjectStatusJSON(cfg *config.Config, s *state.State) projectStatusJSO
 	return projectStatusJSON{
 		Repo:    cfg.Repo,
 		Prefix:  cfg.SessionPrefix,
-		Outcome: outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt),
+		Outcome: outcomeStatusForState(cfg, s),
 		State:   s,
 	}
 }
@@ -923,7 +923,7 @@ func showSupervisorPolicy(cfg *config.Config) {
 }
 
 func showOutcomeStatus(cfg *config.Config, s *state.State) {
-	status := outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt)
+	status := outcomeStatusForState(cfg, s)
 	if !status.Configured {
 		fmt.Println("Outcome:        not configured (issue throughput alone is not enough)")
 		fmt.Printf("Outcome next:   %s\n", status.NextAction)
@@ -937,9 +937,25 @@ func showOutcomeStatus(cfg *config.Config, s *state.State) {
 	fmt.Printf("Outcome:        %s\n", goal)
 	fmt.Printf("Runtime target: %s\n", runtimeTarget)
 	fmt.Printf("Outcome health: %s\n", valueOrDash(status.HealthState))
+	if status.HealthCheckedAt != "" {
+		fmt.Printf("Outcome checked: %s\n", status.HealthCheckedAt)
+	}
+	if status.HealthSummary != "" {
+		fmt.Printf("Outcome check:  %s\n", status.HealthSummary)
+	}
 	if status.NextAction != "" {
 		fmt.Printf("Outcome next:   %s\n", status.NextAction)
 	}
+}
+
+func outcomeStatusForState(cfg *config.Config, s *state.State) outcome.Status {
+	if cfg == nil || s == nil {
+		return outcome.StatusFor(outcome.Brief{}, 0, time.Time{})
+	}
+	if s.OutcomeHealth != nil {
+		return outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt, *s.OutcomeHealth)
+	}
+	return outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt)
 }
 
 func valueOrDash(value string) string {

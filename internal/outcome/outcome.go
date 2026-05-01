@@ -9,6 +9,7 @@ const (
 	HealthNotConfigured = "not_configured"
 	HealthUnmonitored   = "unmonitored"
 	HealthUnknown       = "unknown"
+	HealthHealthy       = "healthy"
 	HealthFailing       = "failing"
 )
 
@@ -34,6 +35,10 @@ type Status struct {
 	RuntimeTarget           string   `json:"runtime_target,omitempty"`
 	RuntimeHost             string   `json:"runtime_host,omitempty"`
 	HealthState             string   `json:"health_state"`
+	HealthCheckedAt         string   `json:"health_checked_at,omitempty"`
+	HealthSignal            string   `json:"health_signal,omitempty"`
+	HealthSummary           string   `json:"health_summary,omitempty"`
+	HealthDetail            string   `json:"health_detail,omitempty"`
 	NextAction              string   `json:"next_action,omitempty"`
 	SourceRepoPath          string   `json:"source_repo_path,omitempty"`
 	DeploymentStatusCommand string   `json:"deployment_status_command,omitempty"`
@@ -43,6 +48,18 @@ type Status struct {
 	NonGoals                []string `json:"non_goals,omitempty"`
 	MergedPRs               int      `json:"merged_prs,omitempty"`
 	LastMergeAt             string   `json:"last_merge_at,omitempty"`
+}
+
+// HealthCheckResult is the durable result of a read-only runtime/deploy health
+// check. It is intentionally compact because it is stored in Maestro state.
+type HealthCheckResult struct {
+	CheckedAt      time.Time `json:"checked_at,omitempty"`
+	Signal         string    `json:"signal,omitempty"`
+	State          string    `json:"state"`
+	Summary        string    `json:"summary,omitempty"`
+	Detail         string    `json:"detail,omitempty"`
+	ExitCode       int       `json:"exit_code,omitempty"`
+	DurationMillis int64     `json:"duration_ms,omitempty"`
 }
 
 func (b Brief) Normalized() Brief {
@@ -75,10 +92,9 @@ func (b Brief) HasHealthSignal() bool {
 	return b.DeploymentStatusCommand != "" || b.HealthcheckCommand != "" || b.HealthcheckURL != ""
 }
 
-// StatusFor returns the current known outcome status. V1 intentionally does
-// not execute configured commands or URLs; it records whether health is known
-// enough to keep dispatching issue work with confidence.
-func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time) Status {
+// StatusFor returns the current known outcome status. Callers may pass the
+// latest persisted health check result; StatusFor never executes checks itself.
+func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...HealthCheckResult) Status {
 	brief = brief.Normalized()
 	if !brief.Configured() {
 		return Status{
@@ -106,6 +122,26 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time) Status {
 		status.LastMergeAt = lastMergeAt.UTC().Format(time.RFC3339)
 	}
 
+	check, hasCheck := latestCheck(checks)
+	if hasCheck {
+		status.HealthCheckedAt = check.CheckedAt.UTC().Format(time.RFC3339)
+		status.HealthSignal = check.Signal
+		status.HealthSummary = check.Summary
+		status.HealthDetail = check.Detail
+		if lastMergeAt.IsZero() || !check.CheckedAt.Before(lastMergeAt) {
+			status.HealthState = normalizedHealthState(check.State)
+			switch status.HealthState {
+			case HealthHealthy:
+				status.NextAction = "Runtime outcome health is passing; continue normal supervisor policy."
+			case HealthFailing:
+				status.NextAction = "Fix runtime/deploy health before dispatching more issue work."
+			default:
+				status.NextAction = "Re-run the configured runtime healthcheck before dispatching more issue throughput."
+			}
+			return status
+		}
+	}
+
 	if brief.HasHealthSignal() {
 		status.HealthState = HealthUnknown
 		status.NextAction = "Run the configured deployment status or healthcheck and prioritize runtime/deploy fixes until it passes."
@@ -117,6 +153,37 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time) Status {
 		status.NextAction = "Verify the configured runtime outcome before dispatching more issue throughput."
 	}
 	return status
+}
+
+func latestCheck(checks []HealthCheckResult) (HealthCheckResult, bool) {
+	var latest HealthCheckResult
+	for _, check := range checks {
+		if check.CheckedAt.IsZero() {
+			continue
+		}
+		if latest.CheckedAt.IsZero() || check.CheckedAt.After(latest.CheckedAt) {
+			latest = check
+		}
+	}
+	if latest.CheckedAt.IsZero() {
+		return HealthCheckResult{}, false
+	}
+	return latest, true
+}
+
+func normalizedHealthState(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case HealthHealthy:
+		return HealthHealthy
+	case HealthFailing:
+		return HealthFailing
+	case HealthUnknown:
+		return HealthUnknown
+	case HealthUnmonitored:
+		return HealthUnmonitored
+	default:
+		return HealthUnknown
+	}
 }
 
 func compactStrings(values []string) []string {

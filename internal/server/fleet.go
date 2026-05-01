@@ -2620,11 +2620,15 @@ function outcomeHTML(project) {
   const host = o.runtime_host ? " · " + o.runtime_host : "";
   const health = o.health_state || (configured ? "unknown" : "not_configured");
   const next = o.next_action || (configured ? "Verify runtime health." : "Add an outcome brief to config.");
+  const checked = o.health_checked_at ? formatTimestamp(o.health_checked_at) : "-";
+  const summary = o.health_summary || "";
   return '<div class="outcome-status"><div class="label">Outcome Status</div>' +
     '<div class="outcome-lines">' +
       '<div class="outcome-line"><strong>Goal</strong> ' + escapeText(goal) + '</div>' +
       '<div class="outcome-line"><strong>Runtime</strong> ' + escapeText(target + host) + '</div>' +
       '<div class="outcome-line"><strong>Health</strong> ' + escapeText(health.replace(/_/g, " ")) + '</div>' +
+      '<div class="outcome-line"><strong>Checked</strong> ' + escapeText(checked) + '</div>' +
+      (summary ? '<div class="outcome-line"><strong>Signal</strong> ' + escapeText(summary) + '</div>' : "") +
       '<div class="outcome-line"><strong>Next</strong> ' + escapeText(next) + '</div>' +
     '</div></div>';
 }
