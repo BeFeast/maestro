@@ -288,6 +288,7 @@ type fleetWorkerState struct {
 	IssueTitle        string          `json:"issue_title"`
 	IssueURL          string          `json:"issue_url,omitempty"`
 	Status            string          `json:"status"`
+	DisplayStatus     string          `json:"display_status,omitempty"`
 	StatusReason      string          `json:"status_reason,omitempty"`
 	NextAction        string          `json:"next_action,omitempty"`
 	NeedsAttention    bool            `json:"needs_attention,omitempty"`
@@ -731,6 +732,9 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 }
 
 func isFleetWorkerVisible(worker sessionInfo) bool {
+	if worker.DisplayStatus != "" && worker.DisplayStatus != worker.Status {
+		return true
+	}
 	if worker.Status == string(state.StatusRunning) || worker.Status == string(state.StatusPROpen) || worker.NeedsAttention {
 		return true
 	}
@@ -751,6 +755,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		IssueTitle:        worker.IssueTitle,
 		IssueURL:          worker.IssueURL,
 		Status:            worker.Status,
+		DisplayStatus:     worker.DisplayStatus,
 		StatusReason:      worker.StatusReason,
 		NextAction:        worker.NextAction,
 		NeedsAttention:    worker.NeedsAttention,
@@ -1468,9 +1473,11 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     vertical-align: middle;
     white-space: nowrap;
   }
-  .s-running { color: var(--ok); border-color: rgba(63,185,80,.45); }
+  .s-running, .s-review_retry_running { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-pr_open { color: var(--accent); border-color: rgba(88,166,255,.45); }
   .s-done { color: var(--ok); border-color: rgba(63,185,80,.45); }
+  .s-review_retry_backoff, .s-review_retry_pending { color: var(--queued); border-color: rgba(163,113,247,.5); }
+  .s-review_retry_recheck { color: var(--accent); border-color: rgba(88,166,255,.45); }
   .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .a-pending { color: var(--warn); border-color: rgba(210,153,34,.55); background: rgba(210,153,34,.08); }
   .a-stale { color: var(--muted); border-color: rgba(139,148,158,.45); background: rgba(139,148,158,.08); }
@@ -1672,8 +1679,12 @@ const defaultSortDirections = { status: "asc", project: "asc", issue: "asc", run
 const validSortKeys = new Set(["status", "project", "issue", "runtime", "pr"]);
 const validSortDirs = new Set(["asc", "desc"]);
 const statusOrder = new Map([
+  ["review_retry_running", 0],
   ["running", 0],
+  ["review_retry_recheck", 1],
   ["pr_open", 1],
+  ["review_retry_pending", 2],
+  ["review_retry_backoff", 2],
   ["queued", 2],
   ["dead", 3],
   ["failed", 4],
@@ -2022,7 +2033,7 @@ function selectOptionsHTML(allLabel, values, selectedValue) {
 }
 
 function renderFilterOptions() {
-  statusFilterEl.innerHTML = selectOptionsHTML("All statuses", uniqueSorted((fleetState.workers || []).map(worker => worker.status)), fleetState.filters.status);
+  statusFilterEl.innerHTML = selectOptionsHTML("All statuses", uniqueSorted((fleetState.workers || []).map(displayStatus)), fleetState.filters.status);
   backendFilterEl.innerHTML = selectOptionsHTML("All backends", uniqueSorted((fleetState.workers || []).map(worker => worker.backend)), fleetState.filters.backend);
 }
 
@@ -2051,6 +2062,7 @@ function workerSearchText(worker) {
     issueNumber ? "#" + issueNumber : "",
     worker.issue_title,
     worker.status,
+    displayStatus(worker),
     statusLabel(worker),
     worker.backend,
     prNumber,
@@ -2060,7 +2072,7 @@ function workerSearchText(worker) {
 }
 
 function workerMatchesFilters(worker) {
-  if (fleetState.filters.status !== "all" && worker.status !== fleetState.filters.status) return false;
+  if (fleetState.filters.status !== "all" && displayStatus(worker) !== fleetState.filters.status) return false;
   if (fleetState.filters.backend !== "all" && (worker.backend || "") !== fleetState.filters.backend) return false;
   if (fleetState.filters.pr === "with" && !worker.pr_number) return false;
   if (fleetState.filters.pr === "without" && worker.pr_number) return false;
@@ -2092,7 +2104,8 @@ function workerNeedsAttention(worker) {
 
 function statusRank(worker) {
   const attention = workerNeedsAttention(worker) ? 0 : 1;
-  const rank = statusOrder.has(worker.status) ? statusOrder.get(worker.status) : 99;
+  const displayed = displayStatus(worker);
+  const rank = statusOrder.has(displayed) ? statusOrder.get(displayed) : 99;
   return attention * 100 + rank;
 }
 
@@ -2141,21 +2154,26 @@ function sortWorkers(workers) {
     .map(entry => entry.worker);
 }
 
+function displayStatus(worker) {
+  return worker.display_status || worker.status || "-";
+}
+
 function statusLabel(worker) {
   if (worker.status === "running" && worker.alive === false) return "running stale";
-  return worker.status || "-";
+  return displayStatus(worker);
 }
 
 function statusClass(worker) {
-  let cls = "pill s-" + escapeText(worker.status || "unknown");
+  let cls = "pill s-" + cssToken(displayStatus(worker) || "unknown");
   if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) cls += " attention";
   return cls;
 }
 
 function rowClass(worker) {
   if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) return "row-attention";
-  if (worker.status === "running") return "row-running";
-  if (worker.status === "pr_open") return "row-pr";
+  const displayed = displayStatus(worker);
+  if (worker.status === "running" || displayed === "review_retry_running") return "row-running";
+  if (worker.status === "pr_open" || displayed === "review_retry_recheck") return "row-pr";
   return "";
 }
 
@@ -2169,7 +2187,7 @@ function workerWhyText(worker) {
 }
 
 function workerWhyHTML(worker) {
-  if (!worker.needs_attention && worker.status === "running") return "";
+  if (!worker.needs_attention && displayStatus(worker) === "running") return "";
   const why = workerWhyText(worker);
   if (!why) return "";
   return '<div class="why-line"><strong>Why:</strong> ' + escapeText(why) + '</div>';
@@ -2185,7 +2203,7 @@ function startedAtMillis(worker) {
 }
 
 function attentionSeverityRank(worker) {
-  const text = [worker.status, worker.status_reason, worker.next_action].map(normalizedSearchText).join(" ");
+  const text = [displayStatus(worker), worker.status, worker.status_reason, worker.next_action].map(normalizedSearchText).join(" ");
   if (text.includes("blocked") || ["dead", "failed", "conflict_failed", "retry_exhausted"].includes(worker.status)) return 0;
   if (worker.status === "running") return 1;
   if (worker.status === "pr_open" || worker.status === "queued") return 2;

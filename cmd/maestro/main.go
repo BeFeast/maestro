@@ -796,13 +796,17 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	for _, name := range names {
 		sess := s.Sessions[name]
 		alive := "-"
+		var alivePtr *bool
 		if sess.Status == state.StatusRunning {
-			if worker.IsAlive(sess.PID) {
+			isAlive := worker.IsAlive(sess.PID)
+			alivePtr = &isAlive
+			if isAlive {
 				alive = "yes"
 			} else {
 				alive = "no"
 			}
 		}
+		displayStatus := state.SessionDisplayStatusFor(sess, alivePtr)
 		age := time.Since(sess.StartedAt).Round(time.Minute)
 		retries := "-"
 		if sess.RetryCount > 0 {
@@ -827,7 +831,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 			backend = "-"
 		}
 		fmt.Fprintf(w, "%s\t#%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
-			name, sess.IssueNumber, sess.Status, backend, pr, ci, sess.PID, alive, age, retries, tokens, truncate(sess.IssueTitle, 50))
+			name, sess.IssueNumber, displayStatus, backend, pr, ci, sess.PID, alive, age, retries, tokens, truncate(sess.IssueTitle, 50))
 	}
 	w.Flush()
 

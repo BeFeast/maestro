@@ -145,6 +145,10 @@ PR states to watch:
 |---|---|---|
 | `pr_open` | A worker opened a PR and Maestro is waiting for checks, review, mergeability, merge interval, or conflict handling | Monitor, do not spawn duplicate work for the same issue |
 | `queued` | A follow-up step or merge queue path is still pending | Check project dashboard and latest supervisor decision |
+| `review_retry_backoff` | Actionable review feedback scheduled an in-place retry and Maestro is waiting for backoff | Wait for the scheduled retry worker unless the feedback should be handled manually |
+| `review_retry_pending` | Backoff elapsed and Maestro is waiting for an available retry worker slot | Wait for the next orchestration cycle or free a worker slot |
+| `review_retry_running` | The retry worker is updating the existing PR in place | Wait for the worker to finish and push updates |
+| `review_retry_recheck` | The retry updated the PR and Maestro is waiting for CI, Greptile, or the merge gate | Monitor checks/review; Maestro will merge when gates allow it |
 | `greptile_pending` stuck state | Greptile has not finished | Wait or check the GitHub PR/check run if it remains pending unusually long |
 | `greptile_not_approved` stuck state | Greptile review found actionable feedback or no approval | Address feedback, allow the configured retry path, or make a deliberate project policy change |
 | `failing_checks` stuck state | Required checks failed | Inspect the check failure, retry intentionally if budget remains, or fix manually |

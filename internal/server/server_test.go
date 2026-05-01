@@ -172,6 +172,85 @@ func TestHandleState(t *testing.T) {
 	}
 }
 
+func TestHandleStateReviewRetryLifecycleDisplay(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:        "test/repo",
+		MaxParallel: 3,
+		StateDir:    dir,
+	}
+	now := time.Now().UTC()
+	retryAt := now.Add(10 * time.Minute)
+	st := state.NewState()
+	st.Sessions["slot-backoff"] = &state.Session{
+		IssueNumber:                 42,
+		IssueTitle:                  "Address review feedback",
+		Status:                      state.StatusDead,
+		StartedAt:                   now.Add(-20 * time.Minute),
+		FinishedAt:                  &now,
+		PRNumber:                    12,
+		RetryCount:                  1,
+		NextRetryAt:                 &retryAt,
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		RetryReason:                 state.RetryReasonReviewFeedback,
+	}
+	st.Sessions["slot-recheck"] = &state.Session{
+		IssueNumber: 43,
+		IssueTitle:  "Wait for recheck",
+		Status:      state.StatusPROpen,
+		StartedAt:   now.Add(-30 * time.Minute),
+		PRNumber:    13,
+		RetryCount:  1,
+		RetryReason: state.RetryReasonReviewFeedback,
+	}
+	st.Sessions["slot-ci-retry"] = &state.Session{
+		IssueNumber:                 44,
+		IssueTitle:                  "Retry failing checks",
+		Status:                      state.StatusDead,
+		StartedAt:                   now.Add(-40 * time.Minute),
+		FinishedAt:                  &now,
+		RetryCount:                  1,
+		NextRetryAt:                 &retryAt,
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		CIFailureOutput:             "checks failed",
+	}
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	resp := buildStateResponse(cfg, st)
+	backoff := findSessionInfo(t, resp.All, "slot-backoff")
+	if backoff.DisplayStatus != string(state.DisplayReviewRetryBackoff) {
+		t.Fatalf("backoff display_status = %q, want review retry backoff", backoff.DisplayStatus)
+	}
+	if backoff.NeedsAttention {
+		t.Fatal("review retry backoff should not need attention")
+	}
+	if !contains(backoff.StatusReason, "waiting for the retry backoff") || !contains(backoff.NextAction, "scheduled retry worker") {
+		t.Fatalf("backoff why = %q / %q, want retry worker wording", backoff.StatusReason, backoff.NextAction)
+	}
+	recheck := findSessionInfo(t, resp.All, "slot-recheck")
+	if recheck.DisplayStatus != string(state.DisplayReviewRetryRecheck) {
+		t.Fatalf("recheck display_status = %q, want review retry recheck", recheck.DisplayStatus)
+	}
+	if !contains(recheck.StatusReason, "waiting for CI, Greptile, or the merge gate") {
+		t.Fatalf("recheck status_reason = %q, want CI/Greptile/merge gate wording", recheck.StatusReason)
+	}
+	ciRetry := findSessionInfo(t, resp.All, "slot-ci-retry")
+	if ciRetry.DisplayStatus != "" {
+		t.Fatalf("ci retry display_status = %q, want raw dead state", ciRetry.DisplayStatus)
+	}
+	if !ciRetry.NeedsAttention || !contains(ciRetry.StatusReason, "retry is scheduled") {
+		t.Fatalf("ci retry why = %q / attention %v, want dead retry guidance", ciRetry.StatusReason, ciRetry.NeedsAttention)
+	}
+	if resp.Summary[string(state.StatusDead)] != 1 {
+		t.Fatalf("summary dead = %d, want CI retry counted as dead", resp.Summary[string(state.StatusDead)])
+	}
+	if resp.Summary[string(state.DisplayReviewRetryBackoff)] != 1 {
+		t.Fatalf("summary review_retry_backoff = %d, want 1", resp.Summary[string(state.DisplayReviewRetryBackoff)])
+	}
+}
+
 func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
 	srv, cfg := setupTestServer(t)
 	cfg.Server.ReadOnly = true

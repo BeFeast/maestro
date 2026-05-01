@@ -41,7 +41,7 @@ The PRD for Maestro's GitHub Project Integration proposes extracting a `tracker`
 | LLM-based auto-routing for backend selection | `gh` CLI shelling for every GitHub operation (process spawn overhead) |
 | Telegram notifications with digest mode | Sequential orchestration loop — no parallelism within a cycle |
 | Git worktree isolation (real branch per issue) | Config has Rust-specific defaults (`auto_resolve_files`) |
-| Rich session state (tokens, rate limits, silent detection, PID tracking) | No tracker abstraction — adding GitHub Projects requires touching orchestrator directly |
+| Rich session state (tokens, rate limits, silent detection, PID tracking, review retry lifecycle display) | No tracker abstraction — adding GitHub Projects requires touching orchestrator directly |
 | Persistent state across restarts via JSON file | State file grows indefinitely without automatic pruning |
 | Blocker detection via regex patterns in issue body | Workspace hook environment is minimal (no issue metadata beyond number) |
 | Per-state concurrency limits | No multi-turn agent support within a single worker session |
