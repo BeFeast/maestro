@@ -640,31 +640,6 @@ function statusClass(worker) {
   return cls;
 }
 
-const statusRank = {
-  running: 0,
-  pr_open: 1,
-  queued: 2,
-  dead: 3,
-  failed: 4,
-  conflict_failed: 5,
-  retry_exhausted: 6,
-  done: 7
-};
-
-function sortWorkers(workers) {
-  return [...workers].sort((a, b) => {
-    if (Boolean(a.needs_attention) !== Boolean(b.needs_attention)) return a.needs_attention ? -1 : 1;
-    const ar = statusRank[a.status] ?? 99;
-    const br = statusRank[b.status] ?? 99;
-    if (ar !== br) return ar - br;
-    const time = String(b.started_at || "").localeCompare(String(a.started_at || ""));
-    if (time !== 0) return time;
-    const project = String(a.project_name || "").localeCompare(String(b.project_name || ""));
-    if (project !== 0) return project;
-    return String(a.slot || "").localeCompare(String(b.slot || ""));
-  });
-}
-
 function rowClass(worker) {
   if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) return "row-attention";
   if (worker.status === "running") return "row-running";
@@ -739,7 +714,8 @@ function renderFleetWorkers() {
   const workers = selected === "all"
     ? (fleetState.workers || [])
     : (fleetState.workers || []).filter(worker => worker.project_name === selected);
-  const visible = sortWorkers(workers);
+  // The API response is already sorted with the server's authoritative status order.
+  const visible = workers;
   const projectLabel = selected === "all" ? "all projects" : selected;
   workerSummaryEl.textContent = visible.length + " active / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel;
 

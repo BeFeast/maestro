@@ -190,6 +190,11 @@ func TestFleetDashboard(t *testing.T) {
 			t.Fatalf("dashboard should contain %q", want)
 		}
 	}
+	for _, unwanted := range []string{"statusRank", "sortWorkers("} {
+		if contains(body, unwanted) {
+			t.Fatalf("dashboard should not contain duplicate client worker sorting %q", unwanted)
+		}
+	}
 }
 
 func findFleetWorker(t *testing.T, workers []fleetWorkerState, slot string) fleetWorkerState {
