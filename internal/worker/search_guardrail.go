@@ -7,91 +7,7 @@ import (
 	"strings"
 )
 
-type searchGuardrailReason string
-
-const (
-	searchGuardrailNone     searchGuardrailReason = "none"
-	searchGuardrailBroadCWD searchGuardrailReason = "broad_cwd"
-	searchGuardrailBroadArg searchGuardrailReason = "broad_arg"
-	searchGuardrailAllowed  searchGuardrailReason = "allowed"
-)
-
-type searchGuardrailDecision struct {
-	Warn   bool
-	Reason searchGuardrailReason
-}
-
 var searchGuardedCommands = []string{"rg", "find", "grep"}
-
-func classifySearchGuardrail(command, cwd, worktree string, args []string, allowBroad bool) searchGuardrailDecision {
-	if !isGuardedSearchCommand(command) {
-		return searchGuardrailDecision{Reason: searchGuardrailNone}
-	}
-	if allowBroad {
-		return searchGuardrailDecision{Reason: searchGuardrailAllowed}
-	}
-	if isBroadSearchPath(cwd, worktree) {
-		return searchGuardrailDecision{Warn: true, Reason: searchGuardrailBroadCWD}
-	}
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		if isBroadSearchPath(arg, worktree) {
-			return searchGuardrailDecision{Warn: true, Reason: searchGuardrailBroadArg}
-		}
-	}
-	return searchGuardrailDecision{Reason: searchGuardrailNone}
-}
-
-func isGuardedSearchCommand(command string) bool {
-	name := filepath.Base(strings.TrimSpace(command))
-	for _, guarded := range searchGuardedCommands {
-		if name == guarded {
-			return true
-		}
-	}
-	return false
-}
-
-func isBroadSearchPath(path, worktree string) bool {
-	path = strings.TrimSpace(path)
-	if path == "" || !filepath.IsAbs(path) {
-		return false
-	}
-	path = filepath.Clean(path)
-	if isWithinPath(path, worktree) {
-		return false
-	}
-
-	switch path {
-	case "/", "/mnt", "/home", "/Users", "/tmp", "/var", "/opt", "/usr", "/etc", "/proc", "/sys", "/dev":
-		return true
-	}
-	for _, prefix := range []string{"/mnt/", "/home/", "/Users/", "/tmp/", "/var/", "/opt/", "/usr/", "/etc/", "/proc/", "/sys/", "/dev/"} {
-		if strings.HasPrefix(path, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func isWithinPath(path, root string) bool {
-	root = strings.TrimSpace(root)
-	if root == "" {
-		return false
-	}
-	path = filepath.Clean(path)
-	root = filepath.Clean(root)
-	if path == root {
-		return true
-	}
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
-		return false
-	}
-	return true
-}
 
 func ensureSearchGuardrailWrappers(stateDir string) (string, error) {
 	if strings.TrimSpace(stateDir) == "" {
@@ -141,20 +57,194 @@ maestro_broad_path() {
   return 1
 }
 
-if [ -z "${MAESTRO_ALLOW_BROAD_SEARCH:-}" ]; then
+maestro_reject_broad_arg() {
+  if maestro_broad_path "$1" && ! maestro_path_inside_worktree "$1"; then
+    echo "[maestro] search guardrail: $cmd was given a broad filesystem path; search the assigned worktree instead: $MAESTRO_WORKTREE" >&2
+    return 2
+  fi
+  return 0
+}
+
+maestro_check_rg_args() {
+  rg_after_options=0
+  rg_paths_only=0
+  rg_saw_pattern=0
+  rg_skip_next=0
+
   for arg in "$@"; do
-    case "$arg" in
-      -*) continue ;;
-    esac
-    if maestro_broad_path "$arg" && ! maestro_path_inside_worktree "$arg"; then
-      echo "[maestro] search guardrail: $cmd was given a broad filesystem path; search the assigned worktree instead: $MAESTRO_WORKTREE" >&2
-      exit 2
+    if [ "$rg_skip_next" = "1" ]; then
+      rg_skip_next=0
+      continue
     fi
+
+    if [ "$rg_after_options" = "0" ]; then
+      case "$arg" in
+        --)
+          rg_after_options=1
+          continue
+          ;;
+        --files)
+          rg_paths_only=1
+          continue
+          ;;
+        --regexp|--file)
+          rg_saw_pattern=1
+          rg_skip_next=1
+          continue
+          ;;
+        --regexp=*|--file=*)
+          rg_saw_pattern=1
+          continue
+          ;;
+        --after-context|--before-context|--color|--colors|--context|--context-separator|--dfa-size-limit|--encoding|--engine|--field-context-separator|--field-match-separator|--glob|--hostname-bin|--hyperlink-format|--iglob|--ignore-file|--max-columns|--max-count|--max-depth|--max-filesize|--path-separator|--pre|--pre-glob|--regex-size-limit|--replace|--sort|--sortr|--threads|--type|--type-add|--type-clear|--type-not)
+          rg_skip_next=1
+          continue
+          ;;
+        --*=*)
+          continue
+          ;;
+        -e|-f)
+          rg_saw_pattern=1
+          rg_skip_next=1
+          continue
+          ;;
+        -e?*|-f?*)
+          rg_saw_pattern=1
+          continue
+          ;;
+        -A|-B|-C|-E|-g|-j|-m|-M|-r|-t|-T)
+          rg_skip_next=1
+          continue
+          ;;
+        -A?*|-B?*|-C?*|-E?*|-g?*|-j?*|-m?*|-M?*|-r?*|-t?*|-T?*)
+          continue
+          ;;
+        -*)
+          continue
+          ;;
+      esac
+    fi
+
+    if [ "$rg_paths_only" = "1" ]; then
+      maestro_reject_broad_arg "$arg" || return $?
+      continue
+    fi
+    if [ "$rg_saw_pattern" = "0" ]; then
+      rg_saw_pattern=1
+      continue
+    fi
+    maestro_reject_broad_arg "$arg" || return $?
   done
+  return 0
+}
+
+maestro_check_grep_args() {
+  grep_after_options=0
+  grep_saw_pattern=0
+  grep_skip_next=0
+
+  for arg in "$@"; do
+    if [ "$grep_skip_next" = "1" ]; then
+      grep_skip_next=0
+      continue
+    fi
+
+    if [ "$grep_after_options" = "0" ]; then
+      case "$arg" in
+        --)
+          grep_after_options=1
+          continue
+          ;;
+        --regexp|--file)
+          grep_saw_pattern=1
+          grep_skip_next=1
+          continue
+          ;;
+        --regexp=*|--file=*)
+          grep_saw_pattern=1
+          continue
+          ;;
+        --after-context|--before-context|--binary-files|--context|--devices|--directories|--exclude|--exclude-dir|--exclude-from|--group-separator|--include|--label|--max-count)
+          grep_skip_next=1
+          continue
+          ;;
+        --*=*)
+          continue
+          ;;
+        -e|-f)
+          grep_saw_pattern=1
+          grep_skip_next=1
+          continue
+          ;;
+        -e?*|-f?*)
+          grep_saw_pattern=1
+          continue
+          ;;
+        -A|-B|-C|-D|-d|-m)
+          grep_skip_next=1
+          continue
+          ;;
+        -A?*|-B?*|-C?*|-D?*|-d?*|-m?*)
+          continue
+          ;;
+        -*)
+          continue
+          ;;
+      esac
+    fi
+
+    if [ "$grep_saw_pattern" = "0" ]; then
+      grep_saw_pattern=1
+      continue
+    fi
+    maestro_reject_broad_arg "$arg" || return $?
+  done
+  return 0
+}
+
+maestro_check_find_args() {
+  find_skip_next=0
+
+  for arg in "$@"; do
+    if [ "$find_skip_next" = "1" ]; then
+      find_skip_next=0
+      continue
+    fi
+
+    case "$arg" in
+      --|-H|-L|-P)
+        continue
+        ;;
+      -D|-O)
+        find_skip_next=1
+        continue
+        ;;
+      -D?*|-O?*)
+        continue
+        ;;
+      -*)
+        return 0
+        ;;
+      '!'|'('|')'|',')
+        return 0
+        ;;
+    esac
+
+    maestro_reject_broad_arg "$arg" || return $?
+  done
+  return 0
+}
+
+if [ -z "${MAESTRO_ALLOW_BROAD_SEARCH:-}" ]; then
+  case "$cmd" in
+    rg) maestro_check_rg_args "$@" || exit $? ;;
+    grep) maestro_check_grep_args "$@" || exit $? ;;
+    find) maestro_check_find_args "$@" || exit $? ;;
+  esac
 
   if ! maestro_inside_worktree && maestro_broad_path "$PWD"; then
-    echo "[maestro] search guardrail: $cmd was launched from a broad filesystem root; rerunning from worktree: $MAESTRO_WORKTREE" >&2
-    cd "$MAESTRO_WORKTREE" || exit 1
+    echo "[maestro] search guardrail: $cmd was launched from a broad filesystem root; run it from the assigned worktree instead: $MAESTRO_WORKTREE" >&2
+    exit 2
   fi
 fi
 
