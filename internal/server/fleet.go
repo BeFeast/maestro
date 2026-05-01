@@ -142,6 +142,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
 	mux.HandleFunc("/", s.handleFleetDashboard)
 
@@ -224,7 +225,30 @@ type fleetWorkerState struct {
 	TokensUsedTotal   int    `json:"tokens_used_total"`
 	Runtime           string `json:"runtime"`
 	StartedAt         string `json:"started_at"`
+	FinishedAt        string `json:"finished_at,omitempty"`
+	NextRetryAt       string `json:"next_retry_at,omitempty"`
+	PID               int    `json:"pid,omitempty"`
 	Alive             *bool  `json:"alive,omitempty"`
+	Worktree          string `json:"worktree,omitempty"`
+	Branch            string `json:"branch,omitempty"`
+	TmuxSession       string `json:"tmux_session,omitempty"`
+	HasLog            bool   `json:"has_log"`
+	RetryCount        int    `json:"retry_count,omitempty"`
+	LastNotification  string `json:"last_notification,omitempty"`
+}
+
+type fleetWorkerDetailResponse struct {
+	Worker fleetWorkerState `json:"worker"`
+	Log    fleetLogTail     `json:"log"`
+}
+
+type fleetLogTail struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"`
+	Lines     int    `json:"lines"`
+	Truncated bool   `json:"truncated"`
+	Text      string `json:"text,omitempty"`
+	UpdatedAt string `json:"updated_at"`
 }
 
 func (s *FleetServer) handleFleet(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +257,100 @@ func (s *FleetServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.snapshot())
+}
+
+func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	projectName := strings.TrimSpace(r.URL.Query().Get("project"))
+	slot := strings.TrimSpace(r.URL.Query().Get("slot"))
+	if projectName == "" || slot == "" {
+		writeError(w, http.StatusBadRequest, "project and slot are required")
+		return
+	}
+
+	project, ok := s.findProject(projectName)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("project %q not found", projectName))
+		return
+	}
+	if project.cfg == nil {
+		writeError(w, http.StatusInternalServerError, "project config is unavailable")
+		return
+	}
+
+	st, err := state.Load(project.cfg.StateDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load state: %v", err))
+		return
+	}
+	sess, ok := st.Sessions[slot]
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", slot))
+		return
+	}
+
+	projectState := fleetProjectState{
+		Name:         project.Name,
+		Repo:         project.cfg.Repo,
+		DashboardURL: project.DashboardURL,
+	}
+	worker := makeFleetWorkerState(projectState, makeSessionInfo(project.cfg.Repo, slot, sess))
+	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)
+	if lines > 1000 {
+		lines = 1000
+	}
+	writeJSON(w, http.StatusOK, fleetWorkerDetailResponse{
+		Worker: worker,
+		Log:    makeFleetLogTail(sess, lines),
+	})
+}
+
+func (s *FleetServer) findProject(name string) (FleetProject, bool) {
+	for _, project := range s.projects {
+		if project.Name == name {
+			return project, true
+		}
+	}
+	return FleetProject{}, false
+}
+
+func makeFleetLogTail(sess *state.Session, lines int) fleetLogTail {
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	logFile := strings.TrimSpace(sess.LogFile)
+	if logFile == "" {
+		return fleetLogTail{
+			Available: false,
+			Reason:    "No log file is recorded for this session.",
+			Lines:     0,
+			UpdatedAt: updatedAt,
+		}
+	}
+
+	text, truncated, err := tailFile(logFile, lines, 512*1024)
+	if err != nil {
+		reason := "Log file could not be read on this host."
+		if os.IsNotExist(err) {
+			reason = "A log file is recorded for this session, but it is not available on this host."
+		}
+		return fleetLogTail{
+			Available: false,
+			Reason:    reason,
+			Lines:     0,
+			UpdatedAt: updatedAt,
+		}
+	}
+
+	return fleetLogTail{
+		Available: true,
+		Lines:     lines,
+		Truncated: truncated,
+		Text:      stripANSI(text),
+		UpdatedAt: updatedAt,
+	}
 }
 
 func (s *FleetServer) snapshot() fleetResponse {
@@ -324,7 +442,14 @@ func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, 
 }
 
 func isFleetWorkerVisible(worker sessionInfo) bool {
-	return worker.Status == string(state.StatusRunning) || worker.Status == string(state.StatusPROpen) || worker.NeedsAttention
+	if worker.Status == string(state.StatusRunning) || worker.Status == string(state.StatusPROpen) || worker.NeedsAttention {
+		return true
+	}
+	if worker.Status == string(state.StatusDone) {
+		finishedAt, err := time.Parse(time.RFC3339, worker.FinishedAt)
+		return err == nil && time.Since(finishedAt) <= 24*time.Hour
+	}
+	return false
 }
 
 func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
@@ -346,7 +471,16 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		TokensUsedTotal:   worker.TokensUsedTotal,
 		Runtime:           worker.Runtime,
 		StartedAt:         worker.StartedAt,
+		FinishedAt:        worker.FinishedAt,
+		NextRetryAt:       worker.NextRetryAt,
+		PID:               worker.PID,
 		Alive:             worker.Alive,
+		Worktree:          worker.Worktree,
+		Branch:            worker.Branch,
+		TmuxSession:       worker.TmuxSession,
+		HasLog:            worker.HasLog,
+		RetryCount:        worker.RetryCount,
+		LastNotification:  worker.LastNotification,
 	}
 }
 
@@ -438,6 +572,74 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     border: 1px solid var(--line);
     background: var(--panel);
   }
+
+  .worker-detail {
+    margin-bottom: 16px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .worker-detail .section-head { border-bottom-color: rgba(41,49,61,.9); }
+  .detail-body { padding: 14px; }
+  .detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .detail-field {
+    min-width: 0;
+    padding: 9px 10px;
+    border: 1px solid rgba(41,49,61,.85);
+    background: var(--panel-2);
+  }
+  .detail-field span {
+    display: block;
+    margin-bottom: 3px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+    text-transform: uppercase;
+  }
+  .detail-field strong {
+    display: block;
+    overflow: hidden;
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .detail-note {
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    border-left: 3px solid var(--accent);
+    background: rgba(88,166,255,.08);
+    color: var(--text);
+  }
+  .detail-note.attention {
+    border-left-color: var(--bad);
+    background: rgba(248,81,73,.1);
+  }
+  .detail-links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+  .log-tail-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .log-tail pre {
+    max-height: 360px;
+    margin: 0;
+    padding: 12px;
+    overflow: auto;
+    border: 1px solid rgba(41,49,61,.85);
+    background: #05080d;
+    color: #dbe7f3;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+  }
   .section-head {
     display: flex;
     align-items: flex-start;
@@ -473,7 +675,9 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .worker-table tbody tr.row-running { background: rgba(63,185,80,.055); }
   .worker-table tbody tr.row-pr { background: rgba(88,166,255,.055); }
   .worker-table tbody tr.row-attention { background: rgba(248,81,73,.1); }
+  .worker-table tbody tr.selected { outline: 1px solid rgba(88,166,255,.65); outline-offset: -1px; }
   .worker-table tbody tr:hover { background: #18212c; }
+  .worker-table tbody tr[data-slot] { cursor: pointer; }
   .project-col { width: 140px; font-weight: 650; }
   .slot-col { width: 92px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .issue-col { width: auto; }
@@ -542,6 +746,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .s-running { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-pr_open { color: var(--accent); border-color: rgba(88,166,255,.45); }
+  .s-done { color: var(--ok); border-color: rgba(63,185,80,.45); }
   .s-dead, .s-failed, .s-conflict_failed, .s-retry_exhausted { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .empty { color: var(--muted); margin-top: 8px; }
@@ -555,6 +760,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     .section-note { text-align: left; }
     .grid { grid-template-columns: 1fr; }
     .metric-row { grid-template-columns: repeat(2, 1fr); }
+    .detail-grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -572,7 +778,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     <div class="section-head">
       <div>
         <h2>Fleet Workers</h2>
-        <div class="sub">Unified active and attention queue across projects.</div>
+        <div class="sub">Unified active, recent, and attention queue across projects.</div>
       </div>
       <div class="section-note" id="worker-summary">Loading workers...</div>
     </div>
@@ -594,6 +800,18 @@ const fleetDashboardHTML = `<!DOCTYPE html>
       </table>
     </div>
   </section>
+  <section class="worker-detail" id="worker-detail" aria-live="polite">
+    <div class="section-head">
+      <div>
+        <h2>Worker Detail</h2>
+        <div class="sub">Select a worker row to inspect session state and recent log output.</div>
+      </div>
+      <div class="section-note" id="worker-detail-summary">No worker selected</div>
+    </div>
+    <div class="detail-body" id="worker-detail-body">
+      <div class="empty">Select a fleet worker to show metadata and log output.</div>
+    </div>
+  </section>
   <div class="grid" id="projects"></div>
 </main>
 <script>
@@ -603,11 +821,15 @@ const subtitleEl = document.getElementById("subtitle");
 const tabsEl = document.getElementById("project-tabs");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
 const workerSummaryEl = document.getElementById("worker-summary");
+const workerDetailSummaryEl = document.getElementById("worker-detail-summary");
+const workerDetailBodyEl = document.getElementById("worker-detail-body");
 
 const fleetState = {
   selectedProject: "all",
+  selectedWorkerKey: "",
   projects: [],
-  workers: []
+  workers: [],
+  detail: null
 };
 
 function escapeText(value) {
@@ -627,6 +849,22 @@ function compactNumber(value) {
 function linkHTML(url, label) {
   if (!url) return escapeText(label);
   return '<a href="' + escapeText(url) + '" target="_blank" rel="noreferrer">' + escapeText(label) + '</a>';
+}
+
+function formatTimestamp(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString();
+}
+
+function workerKey(worker) {
+  return (worker.project_name || "") + "\u001f" + (worker.slot || "");
+}
+
+function selectedWorker() {
+  if (!fleetState.selectedWorkerKey) return null;
+  return (fleetState.workers || []).find(worker => workerKey(worker) === fleetState.selectedWorkerKey) || null;
 }
 
 function statusLabel(worker) {
@@ -717,12 +955,12 @@ function renderFleetWorkers() {
   // The API response is already sorted with the server's authoritative status order.
   const visible = workers;
   const projectLabel = selected === "all" ? "all projects" : selected;
-  workerSummaryEl.textContent = visible.length + " active / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel;
+  workerSummaryEl.textContent = visible.length + " active / recent / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel;
 
   if (visible.length === 0) {
     const empty = selected === "all"
-      ? "No active workers or attention states across configured projects."
-      : "No active workers or attention states for " + selected + ".";
+      ? "No active, recent, or attention workers across configured projects."
+      : "No active, recent, or attention workers for " + selected + ".";
     fleetWorkersEl.innerHTML = '<tr><td colspan="8" class="empty">' + escapeText(empty) + '</td></tr>';
     return;
   }
@@ -730,7 +968,8 @@ function renderFleetWorkers() {
   fleetWorkersEl.innerHTML = visible.map(worker => {
     const issue = worker.issue_number ? "#" + worker.issue_number : "-";
     const pr = worker.pr_number ? "#" + worker.pr_number : "-";
-    return '<tr class="' + rowClass(worker) + '">' +
+    const selected = workerKey(worker) === fleetState.selectedWorkerKey ? " selected" : "";
+    return '<tr class="' + rowClass(worker) + selected + '" data-project="' + escapeText(worker.project_name || "") + '" data-slot="' + escapeText(worker.slot || "") + '" tabindex="0">' +
       '<td class="project-col">' + linkHTML(worker.dashboard_url, worker.project_name || "-") + '</td>' +
       '<td class="slot-col">' + escapeText(worker.slot || "-") + '</td>' +
       '<td class="issue-col">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title || "") + '</td>' +
@@ -741,6 +980,130 @@ function renderFleetWorkers() {
       '<td class="tokens-col">' + compactNumber(worker.tokens_used_total) + '</td>' +
     '</tr>';
   }).join("");
+
+  fleetWorkersEl.querySelectorAll("tr[data-slot]").forEach(row => {
+    row.addEventListener("click", () => selectWorker(row.dataset.project || "", row.dataset.slot || ""));
+    row.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectWorker(row.dataset.project || "", row.dataset.slot || "");
+      }
+    });
+  });
+}
+
+function selectWorker(projectName, slot) {
+  fleetState.selectedWorkerKey = projectName + "\u001f" + slot;
+  fleetState.detail = null;
+  renderFleetWorkers();
+  renderWorkerDetailLoading(projectName, slot);
+  loadWorkerDetail();
+}
+
+function renderWorkerDetailLoading(projectName, slot) {
+  workerDetailSummaryEl.textContent = projectName && slot ? projectName + " / " + slot : "Loading worker";
+  workerDetailBodyEl.innerHTML = '<div class="empty">Loading worker detail...</div>';
+}
+
+function emptyLogText(worker) {
+  if (!worker) return "No log output available.";
+  if (worker.status === "running" && worker.backend === "claude") {
+    return "Log file is available, but Claude print mode may stay quiet until it finishes.";
+  }
+  if (worker.status === "running") return "Log file is available, but no output has been written yet.";
+  return "Log file is available, but no output was captured.";
+}
+
+function aliveText(worker) {
+  if (!worker || worker.alive === undefined || worker.alive === null) return "-";
+  return worker.alive ? "true" : "false";
+}
+
+function detailField(label, value) {
+  return '<div class="detail-field"><span>' + escapeText(label) + '</span><strong title="' + escapeText(value || "-") + '">' + escapeText(value || "-") + '</strong></div>';
+}
+
+function renderWorkerDetail(data) {
+  if (!fleetState.selectedWorkerKey) {
+    workerDetailSummaryEl.textContent = "No worker selected";
+    workerDetailBodyEl.innerHTML = '<div class="empty">Select a fleet worker to show metadata and log output.</div>';
+    return;
+  }
+  if (!data || !data.worker) {
+    const worker = selectedWorker();
+    if (!worker) {
+      workerDetailSummaryEl.textContent = "Worker unavailable";
+      workerDetailBodyEl.innerHTML = '<div class="empty">Selected worker is no longer visible in the fleet snapshot.</div>';
+      return;
+    }
+    data = { worker: worker, log: { available: false, reason: "Worker detail has not loaded yet." } };
+  }
+
+  const worker = data.worker;
+  const log = data.log || {};
+  const issue = worker.issue_number ? "#" + worker.issue_number : "-";
+  const pr = worker.pr_number ? "#" + worker.pr_number : "-";
+  const links = [];
+  if (worker.issue_url) links.push(linkHTML(worker.issue_url, "Issue " + issue));
+  if (worker.pr_url) links.push(linkHTML(worker.pr_url, "PR " + pr));
+  workerDetailSummaryEl.textContent = (worker.project_name || "-") + " / " + (worker.slot || "-") + " / " + statusLabel(worker);
+
+  const fields = [
+    detailField("Project", worker.project_name || "-"),
+    detailField("Slot", worker.slot || "-"),
+    detailField("Issue", issue + (worker.issue_title ? " " + worker.issue_title : "")),
+    detailField("PR", pr),
+    detailField("Backend", worker.backend || "-"),
+    detailField("Status", statusLabel(worker)),
+    detailField("Alive", aliveText(worker)),
+    detailField("Attention", worker.needs_attention ? "yes" : "no"),
+    detailField("Worktree", worker.worktree || "-"),
+    detailField("Branch", worker.branch || "-"),
+    detailField("Started", formatTimestamp(worker.started_at)),
+    detailField("Finished", formatTimestamp(worker.finished_at)),
+    detailField("Runtime", worker.runtime || "-"),
+    detailField("Next retry", formatTimestamp(worker.next_retry_at)),
+    detailField("Retry count", worker.retry_count ? String(worker.retry_count) : "0"),
+    detailField("Log", worker.has_log ? "recorded" : "not recorded")
+  ].join("");
+
+  const noteClass = worker.needs_attention || (worker.status === "running" && worker.alive === false) ? " detail-note attention" : "detail-note";
+  const reason = worker.status_reason || "Waiting for the next Maestro reconciliation cycle.";
+  const logText = log.available ? (log.text || emptyLogText(worker)) : (log.reason || "Log output is unavailable for this session.");
+  const logMeta = log.available
+    ? (log.truncated ? "tail, " : "") + (log.updated_at || "")
+    : "unavailable";
+
+  workerDetailBodyEl.innerHTML = '<div class="detail-grid">' + fields + '</div>' +
+    '<div class="' + noteClass + '"><strong>State</strong> ' + escapeText(reason) +
+      (links.length ? '<div class="detail-links">' + links.join("") + '</div>' : "") +
+    '</div>' +
+    '<div class="log-tail">' +
+      '<div class="log-tail-head"><strong>Recent log tail</strong><span>' + escapeText(logMeta) + '</span></div>' +
+      '<pre>' + escapeText(logText) + '</pre>' +
+    '</div>';
+}
+
+async function loadWorkerDetail() {
+  const worker = selectedWorker();
+  if (!worker) {
+    fleetState.detail = null;
+    renderWorkerDetail(null);
+    return;
+  }
+  const key = workerKey(worker);
+  try {
+    const url = "/api/v1/fleet/worker?project=" + encodeURIComponent(worker.project_name || "") + "&slot=" + encodeURIComponent(worker.slot || "") + "&lines=260";
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) throw new Error(await response.text());
+    if (key !== fleetState.selectedWorkerKey) return;
+    fleetState.detail = await response.json();
+    renderWorkerDetail(fleetState.detail);
+  } catch (err) {
+    if (key !== fleetState.selectedWorkerKey) return;
+    workerDetailSummaryEl.textContent = "Worker detail error";
+    workerDetailBodyEl.innerHTML = '<div class="error">Unable to load worker detail: ' + escapeText(err.message) + '</div>';
+  }
 }
 
 function renderSupervisor(project) {
@@ -762,9 +1125,9 @@ function renderSupervisor(project) {
 function renderWorkers(project) {
   const workers = project.active || [];
   if (!workers.length) {
-    return '<div class="workers"><div class="label">Active / attention</div><div class="empty">No active workers or attention states.</div></div>';
+    return '<div class="workers"><div class="label">Active / recent / attention</div><div class="empty">No active, recent, or attention workers.</div></div>';
   }
-  return '<div class="workers"><div class="label">Active / attention</div><table>' +
+  return '<div class="workers"><div class="label">Active / recent / attention</div><table>' +
     workers.map(worker => '<tr>' +
       '<td>' + escapeText(worker.slot) + '</td>' +
       '<td><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
@@ -805,10 +1168,15 @@ async function loadFleet() {
     const data = await response.json();
     fleetState.projects = data.projects || [];
     fleetState.workers = fleetWorkersFromData(data);
+    if (fleetState.selectedWorkerKey && !selectedWorker()) {
+      fleetState.selectedWorkerKey = "";
+      fleetState.detail = null;
+    }
     subtitleEl.textContent = fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s");
     renderStats(data.summary || {});
     renderProjectTabs();
     renderFleetWorkers();
+    renderWorkerDetail(fleetState.detail);
     projectsEl.innerHTML = fleetState.projects.map(renderProject).join("");
   } catch (err) {
     subtitleEl.textContent = "Fleet API error";
@@ -820,6 +1188,7 @@ async function loadFleet() {
 
 loadFleet();
 setInterval(loadFleet, 3000);
+setInterval(loadWorkerDetail, 2000);
 </script>
 </body>
 </html>`

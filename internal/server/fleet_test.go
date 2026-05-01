@@ -172,6 +172,145 @@ func TestFleetWorkersIncludeAllActiveRows(t *testing.T) {
 	}
 }
 
+func TestFleetWorkersIncludeRecentlyCompletedDoneRows(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	finished := now.Add(-15 * time.Minute)
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"one-1": {
+			IssueNumber: 1,
+			IssueTitle:  "Done thing",
+			Status:      state.StatusDone,
+			StartedAt:   now.Add(-45 * time.Minute),
+			FinishedAt:  &finished,
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	if len(resp.Workers) != 1 {
+		t.Fatalf("fleet workers len = %d, want recently completed worker", len(resp.Workers))
+	}
+	if resp.Workers[0].Status != string(state.StatusDone) {
+		t.Fatalf("worker status = %q, want done", resp.Workers[0].Status)
+	}
+}
+
+func TestFleetWorkerDetailIncludesMetadataAndLog(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	logFile := filepath.Join(dir, "logs", "one-1.log")
+	if err := os.MkdirAll(filepath.Dir(logFile), 0o755); err != nil {
+		t.Fatalf("create log dir: %v", err)
+	}
+	if err := os.WriteFile(logFile, []byte("line one\n\x1b[31mline two\x1b[0m\nline three\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"one-1": {
+			IssueNumber:     1,
+			IssueTitle:      "Build thing",
+			Status:          state.StatusRunning,
+			StartedAt:       now.Add(-10 * time.Minute),
+			Backend:         "opencode",
+			Worktree:        filepath.Join(dir, "worktree"),
+			Branch:          "maestro/one-1",
+			PID:             999999,
+			LogFile:         logFile,
+			TokensUsedTotal: 1234,
+		},
+	})
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "http://127.0.0.1:8787", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet/worker?project=One&slot=one-1&lines=2", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetWorker(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp fleetWorkerDetailResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	worker := resp.Worker
+	if worker.ProjectName != "One" || worker.ProjectRepo != "owner/one" || worker.DashboardURL == "" {
+		t.Fatalf("worker project metadata = %+v", worker)
+	}
+	if worker.Worktree == "" || worker.Branch != "maestro/one-1" {
+		t.Fatalf("worker worktree/branch = %q/%q", worker.Worktree, worker.Branch)
+	}
+	if worker.Alive == nil || *worker.Alive {
+		t.Fatalf("running worker should distinguish alive=false, got %#v", worker.Alive)
+	}
+	if !worker.NeedsAttention || !contains(worker.StatusReason, "PID is not alive") {
+		t.Fatalf("worker attention reason = %q attention=%v", worker.StatusReason, worker.NeedsAttention)
+	}
+	if !worker.HasLog || !resp.Log.Available {
+		t.Fatalf("log availability worker=%v log=%+v", worker.HasLog, resp.Log)
+	}
+	if contains(resp.Log.Text, "line one") || contains(resp.Log.Text, "\x1b") {
+		t.Fatalf("log text should be tailed and ANSI-stripped: %q", resp.Log.Text)
+	}
+	if !contains(resp.Log.Text, "line two") || !contains(resp.Log.Text, "line three") {
+		t.Fatalf("log text = %q, want recent lines", resp.Log.Text)
+	}
+}
+
+func TestFleetWorkerDetailExplainsUnavailableLog(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"one-1": {
+			IssueNumber: 1,
+			IssueTitle:  "Done thing",
+			Status:      state.StatusDone,
+			StartedAt:   now.Add(-20 * time.Minute),
+		},
+	})
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet/worker?project=One&slot=one-1", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetWorker(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp fleetWorkerDetailResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Worker.Status != string(state.StatusDone) {
+		t.Fatalf("worker status = %q, want done", resp.Worker.Status)
+	}
+	if resp.Log.Available || resp.Log.Reason == "" {
+		t.Fatalf("log should be unavailable with a reason: %+v", resp.Log)
+	}
+}
+
 func TestFleetDashboard(t *testing.T) {
 	srv := NewFleet(nil, "127.0.0.1", 8786, true)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -185,7 +324,7 @@ func TestFleetDashboard(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
-	for _, want := range []string{"Maestro Fleet", "/api/v1/fleet", "project-tabs", "fleet-workers-body", "renderFleetWorkers", "renderProject"} {
+	for _, want := range []string{"Maestro Fleet", "/api/v1/fleet", "/api/v1/fleet/worker", "project-tabs", "fleet-workers-body", "worker-detail", "renderFleetWorkers", "renderWorkerDetail", "renderProject"} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard should contain %q", want)
 		}
