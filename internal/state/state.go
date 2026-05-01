@@ -257,6 +257,49 @@ type SupervisorQueueAnalysis struct {
 	SkippedReasons                []string                  `json:"skipped_reasons,omitempty"`
 }
 
+// TopSkippedReason returns the first concise queue skip reason available for UI cards.
+func (q *SupervisorQueueAnalysis) TopSkippedReason() string {
+	if q == nil {
+		return ""
+	}
+	for _, reason := range q.SkippedReasons {
+		if reason = strings.TrimSpace(reason); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// IdleReason summarizes why a supervisor-controlled project has no eligible work.
+func (q *SupervisorQueueAnalysis) IdleReason() string {
+	if q == nil || q.EligibleCandidates > 0 {
+		return ""
+	}
+	if q.OpenIssues == 0 {
+		return "No open issues are available."
+	}
+	if q.ExcludedIssues >= q.OpenIssues {
+		return fmt.Sprintf("Policy excluded all %s.", openIssuePhrase(q.OpenIssues))
+	}
+	if q.NonRunnableProjectStatusCount >= q.OpenIssues {
+		return fmt.Sprintf("All %s are in a non-runnable project status.", openIssuePhrase(q.OpenIssues))
+	}
+	if q.ExcludedIssues+q.NonRunnableProjectStatusCount >= q.OpenIssues {
+		return fmt.Sprintf("Policy excluded or held all %s.", openIssuePhrase(q.OpenIssues))
+	}
+	if reason := q.TopSkippedReason(); reason != "" {
+		return "No issue is eligible: " + reason
+	}
+	return "No issue is eligible under the current supervisor policy."
+}
+
+func openIssuePhrase(count int) string {
+	if count == 1 {
+		return "1 open issue"
+	}
+	return fmt.Sprintf("%d open issues", count)
+}
+
 // SupervisorMutation records one durable GitHub mutation planned or attempted by
 // the supervisor queue action loop.
 type SupervisorMutation struct {

@@ -249,6 +249,11 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 	skipped = append(policySkipped, skipped...)
 	stuckStates = e.detectStuckStates(st, now, prs, issues, eligible, skipped, true)
+	analysis := supervisorQueueAnalysis(policyRule, len(issues), eligible, skipped)
+	withAnalysis := func(decision state.SupervisorDecision) state.SupervisorDecision {
+		decision.QueueAnalysis = analysis
+		return decision
+	}
 
 	if len(eligible) > 0 {
 		issue := eligible[0]
@@ -260,7 +265,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
 				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
-			return decision, nil
+			return withAnalysis(decision), nil
 		}
 
 		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
@@ -276,7 +281,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
 				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
-			return decision, nil
+			return withAnalysis(decision), nil
 		}
 
 		reasons := appendReasons(baseReasons,
@@ -288,7 +293,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
 			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 		decision.StuckStates = stuckStates
-		return decision, nil
+		return withAnalysis(decision), nil
 	}
 
 	if policyRule == PolicyRuleOrderedQueue && len(candidates) == 1 {
@@ -307,7 +312,10 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				fmt.Sprintf("Ordered queue is paused at issue #%d because it already has an open PR.", issue.Number),
 				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
-			return decision, nil
+			if analysis.SelectedCandidate == nil {
+				analysis.SelectedCandidate = supervisorIssueCandidate(issue)
+			}
+			return withAnalysis(decision), nil
 		}
 	}
 
@@ -316,6 +324,9 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, err
 	}
 	if candidate != nil {
+		if analysis.SelectedCandidate == nil {
+			analysis.SelectedCandidate = supervisorIssueCandidate(candidate.issue)
+		}
 		mutations := candidate.plannedMutations(e.cfg)
 		reasons := appendReasons(baseReasons,
 			queueLabelReason(candidate.readyLabel, candidate.blockedLabel),
@@ -331,7 +342,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			risk, 0.82, &state.SupervisorTarget{Issue: candidate.issue.Number}, policyRule, reasons)
 		decision.Mutations = mutations
 		decision.StuckStates = stuckStates
-		return decision, nil
+		return withAnalysis(decision), nil
 	}
 
 	if policyRule == PolicyRuleOrderedQueue && len(candidates) == 1 {
@@ -354,7 +365,10 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				fmt.Sprintf("Ordered queue is paused at issue #%d: %s.", issue.Number, pauseReason),
 				risk, confidence, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
-			return decision, nil
+			if analysis.SelectedCandidate == nil {
+				analysis.SelectedCandidate = supervisorIssueCandidate(issue)
+			}
+			return withAnalysis(decision), nil
 		}
 	}
 
@@ -368,7 +382,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	decision := e.decision(now, projectState, ActionNone,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
-	return decision, nil
+	return withAnalysis(decision), nil
 }
 
 func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult) (state.SupervisorDecision, error) {
@@ -1556,6 +1570,46 @@ func supervisorIssueCandidate(issue github.Issue) *state.SupervisorIssueCandidat
 		PriorityLabel: priorityLabel,
 		ProjectStatus: firstProjectStatus(issue),
 	}
+}
+
+func supervisorQueueAnalysis(policyRule string, openIssues int, eligible []github.Issue, skipped []string) *state.SupervisorQueueAnalysis {
+	analysis := &state.SupervisorQueueAnalysis{
+		PolicyRule:                    policyRule,
+		OpenIssues:                    openIssues,
+		EligibleCandidates:            len(eligible),
+		ExcludedIssues:                countQueueExcludedReasons(skipped),
+		NonRunnableProjectStatusCount: countQueueNonRunnableReasons(skipped),
+		SkippedReasons:                firstN(skipped, 5),
+	}
+	if len(eligible) > 0 {
+		analysis.SelectedCandidate = supervisorIssueCandidate(eligible[0])
+	}
+	return analysis
+}
+
+func countQueueExcludedReasons(skipped []string) int {
+	count := 0
+	for _, reason := range skipped {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "excluded by configured label") ||
+			strings.Contains(lower, "excluded by supervisor policy label") ||
+			strings.Contains(lower, "skipped by dynamic wave policy: excluded") ||
+			strings.Contains(lower, "title indicates epic") {
+			count++
+		}
+	}
+	return count
+}
+
+func countQueueNonRunnableReasons(skipped []string) int {
+	count := 0
+	for _, reason := range skipped {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "project status") && strings.Contains(lower, "not runnable") {
+			count++
+		}
+	}
+	return count
 }
 
 func (e *Engine) policySummaryReason() string {
