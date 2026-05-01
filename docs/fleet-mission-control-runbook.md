@@ -37,7 +37,7 @@ Minimal project config shape:
 repo: OWNER/REPO
 local_path: /path/to/repos/<project>
 worktree_base: /path/to/worktrees/<project>
-state_dir: ~/.maestro/state/<project>
+state_dir: ~/.maestro/<project>
 session_prefix: prj
 
 issue_labels:
@@ -245,8 +245,8 @@ Safe response:
 4. Resolve the new approval ID if needed:
 
 ```bash
-maestro supervise approve --config ~/.maestro/maestro-<project>.yaml <approval-or-decision-id> --actor <operator> --reason "approved after fresh status check"
-maestro supervise reject --config ~/.maestro/maestro-<project>.yaml <approval-or-decision-id> --actor <operator> --reason "state changed"
+maestro supervise approve --config ~/.maestro/maestro-<project>.yaml --actor <operator> --reason "approved after fresh status check" <approval-or-decision-id>
+maestro supervise reject --config ~/.maestro/maestro-<project>.yaml --actor <operator> --reason "state changed" <approval-or-decision-id>
 ```
 
 ### Project API failure
