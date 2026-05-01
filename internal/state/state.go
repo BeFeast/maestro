@@ -10,8 +10,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 type SessionStatus string
@@ -429,16 +430,9 @@ func saveLocked(stateDir string, s *State) error {
 		desired = merged
 	}
 
-	data, err := json.MarshalIndent(s, "", "  ")
+	data, err := json.MarshalIndent(desired, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
-	}
-
-	if desired != s {
-		data, err = json.MarshalIndent(desired, "", "  ")
-		if err != nil {
-			return fmt.Errorf("marshal state: %w", err)
-		}
 	}
 
 	tmp := path + ".tmp"
@@ -457,17 +451,12 @@ func saveLocked(stateDir string, s *State) error {
 
 func lockState(stateDir string) (func(), error) {
 	lockPath := filepath.Join(stateDir, ".state.lock")
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("open state lock: %w", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
+	stateLock := flock.New(lockPath)
+	if err := stateLock.Lock(); err != nil {
 		return nil, fmt.Errorf("lock state: %w", err)
 	}
 	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
+		_ = stateLock.Unlock()
 	}, nil
 }
 
