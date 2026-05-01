@@ -20,6 +20,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const fleetProjectStaleAfter = 15 * time.Minute
+
 // FleetProject describes one Maestro project exposed in the fleet dashboard.
 type FleetProject struct {
 	Name         string `json:"name" yaml:"name"`
@@ -176,16 +178,19 @@ func (s *FleetServer) Start(ctx context.Context) error {
 }
 
 type fleetResponse struct {
-	ReadOnly  bool                 `json:"read_only"`
-	Projects  []fleetProjectState  `json:"projects"`
-	Summary   fleetSummary         `json:"summary"`
-	Workers   []fleetWorkerState   `json:"workers"`
-	Attention []fleetWorkerState   `json:"attention"`
-	Approvals []fleetApprovalState `json:"approvals,omitempty"`
+	ReadOnly    bool                 `json:"read_only"`
+	RefreshedAt string               `json:"refreshed_at"`
+	Projects    []fleetProjectState  `json:"projects"`
+	Summary     fleetSummary         `json:"summary"`
+	Workers     []fleetWorkerState   `json:"workers"`
+	Attention   []fleetWorkerState   `json:"attention"`
+	Approvals   []fleetApprovalState `json:"approvals,omitempty"`
 }
 
 type fleetSummary struct {
 	Projects          int `json:"projects"`
+	Stale             int `json:"stale"`
+	Errors            int `json:"errors"`
 	Running           int `json:"running"`
 	PROpen            int `json:"pr_open"`
 	Failed            int `json:"failed"`
@@ -198,27 +203,39 @@ type fleetSummary struct {
 	ApprovalsRejected int `json:"approvals_rejected"`
 }
 
+type fleetProjectFreshness struct {
+	StateUpdatedAt     string `json:"state_updated_at,omitempty"`
+	LogUpdatedAt       string `json:"log_updated_at,omitempty"`
+	SnapshotAt         string `json:"snapshot_at,omitempty"`
+	SnapshotAge        string `json:"snapshot_age,omitempty"`
+	SnapshotAgeSeconds int64  `json:"snapshot_age_seconds,omitempty"`
+	Stale              bool   `json:"stale,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+	StaleAfterSeconds  int64  `json:"stale_after_seconds"`
+}
+
 type fleetProjectState struct {
-	Name            string               `json:"name"`
-	Repo            string               `json:"repo"`
-	ConfigPath      string               `json:"config_path"`
-	DashboardURL    string               `json:"dashboard_url,omitempty"`
-	StateDir        string               `json:"state_dir,omitempty"`
-	MaxParallel     int                  `json:"max_parallel"`
-	ReadOnly        bool                 `json:"read_only"`
-	Summary         map[string]int       `json:"summary"`
-	Running         int                  `json:"running"`
-	PROpen          int                  `json:"pr_open"`
-	Failed          int                  `json:"failed"`
-	Sessions        int                  `json:"sessions"`
-	NeedsAttention  int                  `json:"needs_attention"`
-	Active          []sessionInfo        `json:"active,omitempty"`
-	Attention       []sessionInfo        `json:"attention,omitempty"`
-	Approvals       []fleetApprovalState `json:"approvals,omitempty"`
-	ApprovalSummary map[string]int       `json:"approval_summary,omitempty"`
-	Actions         []controlAction      `json:"actions,omitempty"`
-	Supervisor      supervisorInfo       `json:"supervisor"`
-	Error           string               `json:"error,omitempty"`
+	Name            string                `json:"name"`
+	Repo            string                `json:"repo"`
+	ConfigPath      string                `json:"config_path"`
+	DashboardURL    string                `json:"dashboard_url,omitempty"`
+	StateDir        string                `json:"state_dir,omitempty"`
+	MaxParallel     int                   `json:"max_parallel"`
+	ReadOnly        bool                  `json:"read_only"`
+	Summary         map[string]int        `json:"summary"`
+	Running         int                   `json:"running"`
+	PROpen          int                   `json:"pr_open"`
+	Failed          int                   `json:"failed"`
+	Sessions        int                   `json:"sessions"`
+	NeedsAttention  int                   `json:"needs_attention"`
+	Active          []sessionInfo         `json:"active,omitempty"`
+	Attention       []sessionInfo         `json:"attention,omitempty"`
+	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
+	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
+	Actions         []controlAction       `json:"actions,omitempty"`
+	Supervisor      supervisorInfo        `json:"supervisor"`
+	Freshness       fleetProjectFreshness `json:"freshness"`
+	Error           string                `json:"error,omitempty"`
 }
 
 type fleetApprovalState struct {
@@ -436,15 +453,17 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *FleetServer) snapshot() fleetResponse {
+	now := time.Now().UTC()
 	resp := fleetResponse{
-		ReadOnly:  s.readOnly,
-		Projects:  make([]fleetProjectState, 0, len(s.projects)),
-		Workers:   make([]fleetWorkerState, 0),
-		Attention: make([]fleetWorkerState, 0),
-		Approvals: make([]fleetApprovalState, 0),
+		ReadOnly:    s.readOnly,
+		RefreshedAt: formatFleetTime(now),
+		Projects:    make([]fleetProjectState, 0, len(s.projects)),
+		Workers:     make([]fleetWorkerState, 0),
+		Attention:   make([]fleetWorkerState, 0),
+		Approvals:   make([]fleetApprovalState, 0),
 	}
 	for _, project := range s.projects {
-		item, workers := s.projectSnapshot(project)
+		item, workers := s.projectSnapshot(project, now)
 		resp.Projects = append(resp.Projects, item)
 		resp.Workers = append(resp.Workers, workers...)
 		resp.Approvals = append(resp.Approvals, item.Approvals...)
@@ -452,6 +471,12 @@ func (s *FleetServer) snapshot() fleetResponse {
 			resp.Attention = append(resp.Attention, makeFleetWorkerState(item, worker))
 		}
 		resp.Summary.Projects++
+		if item.Freshness.Stale {
+			resp.Summary.Stale++
+		}
+		if item.Error != "" {
+			resp.Summary.Errors++
+		}
 		resp.Summary.Running += item.Running
 		resp.Summary.PROpen += item.PROpen
 		resp.Summary.Failed += item.Failed
@@ -506,6 +531,72 @@ func (s *FleetServer) snapshot() fleetResponse {
 	return resp
 }
 
+func newFleetProjectFreshness() fleetProjectFreshness {
+	return fleetProjectFreshness{
+		StaleAfterSeconds: int64(fleetProjectStaleAfter / time.Second),
+	}
+}
+
+func fleetProjectFreshnessForState(stateDir string, st *state.State, now time.Time) fleetProjectFreshness {
+	freshness := newFleetProjectFreshness()
+	stateUpdatedAt := fileModTime(state.StatePath(stateDir))
+	logUpdatedAt := latestProjectLogModTime(st)
+	snapshotAt := latestTime(stateUpdatedAt, logUpdatedAt)
+
+	if !stateUpdatedAt.IsZero() {
+		freshness.StateUpdatedAt = formatFleetTime(stateUpdatedAt)
+	}
+	if !logUpdatedAt.IsZero() {
+		freshness.LogUpdatedAt = formatFleetTime(logUpdatedAt)
+	}
+	if snapshotAt.IsZero() {
+		freshness.Reason = "No state snapshot has been written yet."
+		return freshness
+	}
+
+	freshness.SnapshotAt = formatFleetTime(snapshotAt)
+	freshness.SnapshotAge = formatFleetAge(snapshotAt, now)
+	freshness.SnapshotAgeSeconds = fleetAgeSeconds(snapshotAt, now)
+	if time.Duration(freshness.SnapshotAgeSeconds)*time.Second > fleetProjectStaleAfter {
+		freshness.Stale = true
+		freshness.Reason = fmt.Sprintf("State/log snapshot has not changed for %s; stale after %s.", freshness.SnapshotAge, fleetProjectStaleAfter)
+	}
+	return freshness
+}
+
+func latestProjectLogModTime(st *state.State) time.Time {
+	if st == nil {
+		return time.Time{}
+	}
+	var latest time.Time
+	for _, sess := range st.Sessions {
+		if sess == nil {
+			continue
+		}
+		updatedAt := fileModTime(strings.TrimSpace(sess.LogFile))
+		latest = latestTime(latest, updatedAt)
+	}
+	return latest
+}
+
+func fileModTime(path string) time.Time {
+	if strings.TrimSpace(path) == "" {
+		return time.Time{}
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return time.Time{}
+	}
+	return info.ModTime().UTC()
+}
+
+func latestTime(left, right time.Time) time.Time {
+	if left.IsZero() || right.After(left) {
+		return right
+	}
+	return left
+}
+
 func addFleetApprovalSummary(summary *fleetSummary, status string) {
 	summary.Approvals++
 	switch state.ApprovalStatus(status) {
@@ -544,12 +635,13 @@ func fleetWorkerStartedAt(worker fleetWorkerState) time.Time {
 	return startedAt
 }
 
-func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, []fleetWorkerState) {
+func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (fleetProjectState, []fleetWorkerState) {
 	cfg := project.cfg
 	item := fleetProjectState{
 		Name:         project.Name,
 		ConfigPath:   project.ConfigPath,
 		DashboardURL: project.DashboardURL,
+		Freshness:    newFleetProjectFreshness(),
 	}
 	if cfg == nil {
 		item.Error = "missing resolved project config"
@@ -560,12 +652,14 @@ func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, 
 	item.MaxParallel = cfg.MaxParallel
 	item.ReadOnly = cfg.Server.ReadOnly || s.readOnly
 	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions")
+	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, nil, now)
 
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
 		item.Error = err.Error()
 		return item, nil
 	}
+	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary
 	item.Running = len(projectState.Running)
@@ -573,7 +667,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, 
 	item.Failed = failedCount(projectState.Summary)
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
-	item.Approvals = makeFleetApprovalStates(item, st, time.Now().UTC())
+	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
 		for _, approval := range item.Approvals {
@@ -1212,6 +1306,8 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     background: var(--panel);
     min-height: 260px;
   }
+  .project.project-stale { border-color: rgba(210,153,34,.55); }
+  .project.project-error { border-color: rgba(248,81,73,.55); }
   .project-head {
     display: flex;
     justify-content: space-between;
@@ -1220,9 +1316,39 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     padding: 14px 14px 10px;
     border-bottom: 1px solid var(--line);
   }
+  .project-head-main { min-width: 0; }
+  .project-head-side {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 7px;
+    min-width: 0;
+  }
   .project h2 { margin: 0; font-size: 17px; }
   .repo { color: var(--muted); margin-top: 2px; font-size: 13px; }
+  .freshness {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px 8px;
+    margin-top: 5px;
+    color: var(--muted);
+    font-size: 12px;
+  }
   .links { display: flex; gap: 10px; white-space: nowrap; font-size: 13px; }
+  .badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .badge {
+    display: inline-block;
+    max-width: 140px;
+    overflow: hidden;
+    padding: 1px 8px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .badge-stale { color: var(--warn); border-color: rgba(210,153,34,.55); background: rgba(210,153,34,.08); }
+  .badge-error { color: var(--bad); border-color: rgba(248,81,73,.55); background: rgba(248,81,73,.08); }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   .metric-row {
@@ -1341,6 +1467,9 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     .attention-top { grid-template-columns: minmax(0, 1fr) auto; }
     .attention-pr { grid-column: 1 / -1; }
     .grid { grid-template-columns: 1fr; }
+    .project-head { flex-direction: column; }
+    .project-head-side { align-items: flex-start; }
+    .badges { justify-content: flex-start; }
     .metric-row { grid-template-columns: repeat(2, 1fr); }
     .detail-grid { grid-template-columns: 1fr; }
   }
@@ -1475,7 +1604,8 @@ const fleetState = {
   approvals: [],
   attention: [],
   workers: [],
-  detail: null
+  detail: null,
+  refreshedAt: ""
 };
 
 loadStateFromQuery();
@@ -1652,6 +1782,17 @@ function formatTimestamp(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString();
+}
+
+function formatDurationSeconds(value) {
+  const seconds = Number(value || 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 60) return Math.round(seconds) + "s";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + "m";
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return hours + "h";
+  return Math.round(hours / 24) + "d";
 }
 
 function workerKey(worker) {
@@ -2287,18 +2428,51 @@ function renderProjectActions(project) {
     renderActions(project.actions || []) + '</div>';
 }
 
+function projectFreshnessHTML(project) {
+  const freshness = project.freshness || {};
+  const age = freshness.snapshot_age ? "Snapshot " + freshness.snapshot_age + " ago" : "No snapshot yet";
+  const details = [];
+  if (freshness.state_updated_at) details.push("State " + formatTimestamp(freshness.state_updated_at));
+  if (freshness.log_updated_at) details.push("Logs " + formatTimestamp(freshness.log_updated_at));
+  const title = freshness.reason || details.join(" · ") || age;
+  return '<div class="freshness" title="' + escapeText(title) + '"><span>' + escapeText(age) + '</span></div>';
+}
+
+function projectBadgesHTML(project) {
+  const badges = [];
+  if (project.error) {
+    badges.push('<span class="badge badge-error">State error</span>');
+  }
+  if (project.freshness && project.freshness.stale) {
+    const threshold = formatDurationSeconds(project.freshness.stale_after_seconds);
+    badges.push('<span class="badge badge-stale">Stale' + (threshold ? ' &gt;' + escapeText(threshold) : '') + '</span>');
+  }
+  return badges.length ? '<div class="badges">' + badges.join("") + '</div>' : '';
+}
+
+function projectClass(project) {
+  let cls = "project";
+  if (project.error) cls += " project-error";
+  if (project.freshness && project.freshness.stale) cls += " project-stale";
+  return cls;
+}
+
+function projectHeaderHTML(project, rightHTML) {
+  return '<div class="project-head"><div class="project-head-main"><h2>' + escapeText(project.name) + '</h2><div class="repo">' +
+    escapeText(project.repo || project.config_path || "") + '</div>' + projectFreshnessHTML(project) + '</div>' +
+    '<div class="project-head-side">' + (rightHTML || "") + projectBadgesHTML(project) + '</div></div>';
+}
+
 function renderProject(project) {
   if (project.error) {
-    return '<article class="project"><div class="project-head"><div><h2>' + escapeText(project.name) +
-      '</h2><div class="repo">' + escapeText(project.config_path || "") + '</div></div></div>' +
+    return '<article class="' + projectClass(project) + '">' + projectHeaderHTML(project, "") +
       '<div class="error">State error: ' + escapeText(project.error) + '</div></article>';
   }
   const failed = countFailed(project);
-  return '<article class="project">' +
-    '<div class="project-head"><div><h2>' + escapeText(project.name) + '</h2><div class="repo">' +
-    escapeText(project.repo || "") + '</div></div><div class="links">' +
-    linkHTML(project.dashboard_url, "Dashboard") + " " + linkHTML(project.repo ? "https://github.com/" + project.repo : "", "GitHub") +
-    '</div></div>' +
+  const links = '<div class="links">' + linkHTML(project.dashboard_url, "Dashboard") + " " +
+    linkHTML(project.repo ? "https://github.com/" + project.repo : "", "GitHub") + '</div>';
+  return '<article class="' + projectClass(project) + '">' +
+    projectHeaderHTML(project, links) +
     '<div class="metric-row">' +
       '<div class="metric"><strong>' + escapeText(project.running || 0) + " / " + escapeText(project.max_parallel || 0) + '</strong><span>Running</span></div>' +
       '<div class="metric"><strong>' + escapeText(project.pr_open || 0) + '</strong><span>PR open</span></div>' +
@@ -2363,6 +2537,7 @@ async function loadFleet() {
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
     fleetState.readOnly = data.read_only !== false;
+    fleetState.refreshedAt = data.refreshed_at || "";
     fleetState.projects = data.projects || [];
     fleetState.workers = fleetWorkersFromData(data);
     fleetState.approvals = approvalsFromData(data);
@@ -2372,10 +2547,16 @@ async function loadFleet() {
       fleetState.detail = null;
     }
     const controlMode = fleetState.readOnly ? "read-only controls disabled" : "controls require approval configuration";
-    subtitleEl.textContent = fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s") + " · " + controlMode;
+    const summary = data.summary || {};
+    const alerts = [];
+    if (summary.stale) alerts.push(summary.stale + " stale");
+    if (summary.errors) alerts.push(summary.errors + " error" + (summary.errors === 1 ? "" : "s"));
+    subtitleEl.textContent = "Last refresh " + formatTimestamp(fleetState.refreshedAt) + " · " +
+      fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s") + " · " + controlMode +
+      (alerts.length ? " · " + alerts.join(" · ") : "");
     renderFilterOptions();
     syncFilterControls();
-    renderStats(data.summary || {});
+    renderStats(summary);
     renderProjectTabs();
     renderApprovalInbox();
     renderAttentionInbox();
@@ -2383,7 +2564,7 @@ async function loadFleet() {
     renderWorkerDetail(fleetState.detail);
     projectsEl.innerHTML = fleetState.projects.map(renderProject).join("");
   } catch (err) {
-    subtitleEl.textContent = "Fleet API error";
+    subtitleEl.textContent = "Fleet API error" + (fleetState.refreshedAt ? " · Last successful refresh " + formatTimestamp(fleetState.refreshedAt) : "");
     approvalSummaryEl.textContent = "Fleet API error";
     approvalListEl.innerHTML = '<div class="error">Unable to load approval inbox.</div>';
     attentionSummaryEl.textContent = "Fleet API error";
