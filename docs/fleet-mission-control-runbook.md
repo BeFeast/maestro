@@ -127,13 +127,15 @@ Dynamic wave policy:
 | Candidate source | Open GitHub issues from the project repo |
 | Priority order | `p0`, `p1`, `p2`, `p3`, then unlabeled, with lower issue number as tie breaker |
 | Runnable project statuses | Defaults to `Todo`, `To Do`, `Ready`, `Backlog`, and `New`, unless `supervisor.dynamic_wave.runnable_project_statuses` is set |
-| Excluded labels | Built-ins include `blocked`, `wontfix`, `question`, `duplicate`, `invalid`, `epic`, and `meta`, plus `exclude_labels`, `supervisor.excluded_labels`, and `supervisor.blocked_label` |
-| Other skips | Already running, done, retry exhausted, mission parent, epic-like title, and open blockers detected by `blocker_patterns` |
+| Excluded labels | Built-ins include `blocked`, `wontfix`, `question`, `duplicate`, and `invalid`, plus `exclude_labels`, `supervisor.excluded_labels`, and `supervisor.blocked_label` |
+| Held/meta skips | Mission parents, mission issues awaiting decomposition, epic-like titles, and `epic`/`meta` labels are counted separately from exclusions |
+| Blocker-dependency skips | Open blockers detected by `blocker_patterns` are counted separately from label-based blocked policy |
+| Other skips | Already running, done, and retry exhausted |
 | Ready label | `supervisor.ready_label` is treated as a queue label and is added to selected work only when `add_ready_label` is allowed |
 | Owned ready label | When `owns_ready_label: true`, dynamic wave keeps the ready label on the selected issue and can remove it from other issues if policy allows |
 | Blocked label | `supervisor.blocked_label` makes an issue ineligible; it can be removed only when `remove_blocked_label` is an allowed safe action |
 
-Fleet cards surface `open`, `eligible`, `excluded`, `non_runnable_project_status`, selected candidate, and top skipped reason so operators can tell whether the queue is empty, held by policy, or waiting on project status.
+Fleet cards surface `open`, `eligible`, `excluded`, `held/meta`, `blocked-deps`, `non_runnable_project_status`, selected candidate, and top skipped reason so operators can tell whether the queue is empty, held by parent/meta policy, blocked by dependencies, or waiting on project status.
 
 ## Review And Approval Gates
 
@@ -190,7 +192,7 @@ Avoid these during incident handling unless you are deliberately debugging crede
 
 ### No eligible issues
 
-Mission Control indicators: queue `eligible=0`, `no_eligible_issues`, `all_eligible_issues_excluded`, `ordered_queue_exhausted`, or a nonzero `non_runnable_project_status` count.
+Mission Control indicators: queue `eligible=0`, `no_eligible_issues`, `all_eligible_issues_excluded`, `ordered_queue_exhausted`, nonzero `held/meta` or `blocked-deps`, or a nonzero `non_runnable_project_status` count.
 
 Safe response:
 
@@ -198,8 +200,10 @@ Safe response:
 2. If there are no open issues, add or wait for work.
 3. If issues are missing the ready label, add the configured `supervisor.ready_label` or let the supervisor add it when `add_ready_label` is allowed.
 4. If issues are excluded, remove the blocking/excluded label only after confirming the issue is actually runnable.
-5. If dynamic wave reports non-runnable project status, move one issue to a configured runnable status or update `supervisor.dynamic_wave.runnable_project_statuses` in the project config.
-6. Restart the project runner only if config changed: `systemctl --user restart maestro@<project>.service`.
+5. If issues are held as parent/meta work, decompose or retitle/relabel only when the issue should become executable work.
+6. If issues are blocked by dependencies, close or resolve the blocker issue before expecting a worker to start.
+7. If dynamic wave reports non-runnable project status, move one issue to a configured runnable status or update `supervisor.dynamic_wave.runnable_project_statuses` in the project config.
+8. Restart the project runner only if config changed: `systemctl --user restart maestro@<project>.service`.
 
 ### Running but dead PID
 

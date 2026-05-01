@@ -292,7 +292,7 @@ Verify the API:
 curl -fsS http://127.0.0.1:8787/api/v1/fleet
 ```
 
-The fleet response includes `refreshed_at` plus per-project freshness metadata. Project cards show snapshot age and are marked stale when the latest state or log snapshot is older than 15 minutes; one project's load error is shown on that card without hiding the rest of the fleet.
+The fleet response includes `refreshed_at` plus per-project freshness metadata. Project cards show snapshot age and are marked stale when the latest state or log snapshot is older than 15 minutes; one project's load error is shown on that card without hiding the rest of the fleet. Queue snapshots split skipped work into `excluded`, `held/meta`, `blocked-deps`, and non-runnable project status counts so an idle project shows why no worker starts.
 
 `--fleet` versus repeated `--config`:
 
