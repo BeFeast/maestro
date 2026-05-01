@@ -336,6 +336,88 @@ func TestHandleStateMapsSupervisorAttentionToWorker(t *testing.T) {
 	}
 }
 
+func TestApplySupervisorAttentionSessionTargetDoesNotFallback(t *testing.T) {
+	infos := []sessionInfo{
+		{Slot: "slot-1", IssueNumber: 77, PRNumber: 31},
+		{Slot: "slot-2", IssueNumber: 77, PRNumber: 31},
+	}
+	decision := &state.SupervisorDecision{
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "failing_checks",
+				Severity:          "blocked",
+				Summary:           "Slot 1 checks failed",
+				RecommendedAction: "Fix slot 1 checks.",
+				Target:            &state.SupervisorTarget{Issue: 77, PR: 31, Session: "slot-1"},
+			},
+		},
+	}
+
+	applySupervisorAttention(infos, decision)
+
+	if !infos[0].NeedsAttention || infos[0].StatusReason != "Slot 1 checks failed" {
+		t.Fatalf("slot-1 attention = %#v, want targeted supervisor reason", infos[0])
+	}
+	if infos[1].NeedsAttention || infos[1].StatusReason != "" || infos[1].NextAction != "" {
+		t.Fatalf("slot-2 attention = %#v, want no session-targeted fallback", infos[1])
+	}
+}
+
+func TestApplySupervisorAttentionSkipsInformationalStuckStates(t *testing.T) {
+	baseReason := "State says running, but the worker PID is not alive."
+	baseAction := "Run a Maestro reconciliation cycle."
+	infos := []sessionInfo{
+		{Slot: "slot-1", IssueNumber: 77, PRNumber: 31, NeedsAttention: true, StatusReason: baseReason, NextAction: baseAction},
+	}
+	decision := &state.SupervisorDecision{
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "draft_pr",
+				Severity:          "info",
+				Summary:           "PR is still a draft.",
+				RecommendedAction: "Wait for the author to mark the PR ready.",
+				Target:            &state.SupervisorTarget{Issue: 77, PR: 31, Session: "slot-1"},
+			},
+		},
+	}
+
+	applySupervisorAttention(infos, decision)
+
+	if infos[0].StatusReason != baseReason || infos[0].NextAction != baseAction {
+		t.Fatalf("attention reason/action = %q/%q, want base dead-PID reason/action", infos[0].StatusReason, infos[0].NextAction)
+	}
+}
+
+func TestApplySupervisorAttentionUsesLaterAttentionStuckState(t *testing.T) {
+	infos := []sessionInfo{
+		{Slot: "slot-1", IssueNumber: 77, PRNumber: 31, NeedsAttention: true, StatusReason: "Base reason.", NextAction: "Base action."},
+	}
+	decision := &state.SupervisorDecision{
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "draft_pr",
+				Severity:          "info",
+				Summary:           "PR is still a draft.",
+				RecommendedAction: "Wait for the author to mark the PR ready.",
+				Target:            &state.SupervisorTarget{Issue: 77, PR: 31, Session: "slot-1"},
+			},
+			{
+				Code:              "failing_checks",
+				Severity:          "blocked",
+				Summary:           "Checks are failing.",
+				RecommendedAction: "Fix failing checks.",
+				Target:            &state.SupervisorTarget{Issue: 77, PR: 31, Session: "slot-1"},
+			},
+		},
+	}
+
+	applySupervisorAttention(infos, decision)
+
+	if infos[0].StatusReason != "Checks are failing." || infos[0].NextAction != "Fix failing checks." {
+		t.Fatalf("attention reason/action = %q/%q, want later blocked stuck state", infos[0].StatusReason, infos[0].NextAction)
+	}
+}
+
 func TestHandleState_IncludesApprovals(t *testing.T) {
 	srv, cfg := setupTestServer(t)
 	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)

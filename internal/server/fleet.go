@@ -916,10 +916,12 @@ function rowClass(worker) {
 }
 
 function workerWhyText(worker) {
-  const reason = worker.status_reason || "";
-  const action = worker.next_action || "";
+  const reason = (worker.status_reason || "").trim();
+  const action = (worker.next_action || "").trim();
   if (!reason && !action) return "";
-  return reason + (action ? " Next: " + action : "");
+  if (!reason) return "Next: " + action;
+  const sep = reason.endsWith(".") || reason.endsWith("!") || reason.endsWith("?") ? " " : ". ";
+  return reason + (action ? sep + "Next: " + action : "");
 }
 
 function workerWhyHTML(worker) {

@@ -456,7 +456,7 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 				continue
 			}
 			attention := supervisorStuckNeedsAttention(stuck)
-			if !infos[i].NeedsAttention && !attention {
+			if !attention {
 				continue
 			}
 			if strings.TrimSpace(stuck.Summary) != "" {
@@ -478,8 +478,8 @@ func stuckTargetsSession(stuck state.SupervisorStuckState, info sessionInfo) boo
 	if target == nil {
 		return false
 	}
-	if strings.TrimSpace(target.Session) != "" && target.Session == info.Slot {
-		return true
+	if session := strings.TrimSpace(target.Session); session != "" {
+		return session == info.Slot
 	}
 	if target.PR > 0 && target.PR == info.PRNumber {
 		return true
