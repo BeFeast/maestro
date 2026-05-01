@@ -688,7 +688,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.StateDir = cfg.StateDir
 	item.MaxParallel = cfg.MaxParallel
 	item.ReadOnly = cfg.Server.ReadOnly || s.readOnly
-	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions")
+	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", item.Name)
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, nil, now)
 
 	st, err := state.Load(cfg.StateDir)
@@ -1456,6 +1456,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .action-btn {
     height: 24px;
+    max-width: 150px;
     border: 1px solid rgba(210,153,34,.45);
     border-radius: 6px;
     background: rgba(210,153,34,.08);
@@ -1463,7 +1464,22 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     font: inherit;
     font-size: 12px;
     cursor: not-allowed;
+    overflow: hidden;
+    padding: 0 8px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
+  .action-item { min-width: 118px; max-width: 210px; }
+  .action-detail {
+    display: grid;
+    gap: 2px;
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.3;
+    white-space: normal;
+  }
+  .action-detail strong { color: var(--text); font-weight: 650; }
   .action-note { margin-top: 6px; color: var(--muted); font-size: 12px; white-space: normal; }
   .empty { color: var(--muted); margin-top: 8px; }
   .worker-table .empty { padding: 18px 14px; margin: 0; text-align: center; }
@@ -1707,13 +1723,38 @@ function actionDisabledReason(actions) {
   return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
 }
 
-function renderActions(actions) {
+function actionTargetText(action) {
+  const parts = [];
+  if (action.target) parts.push(action.target);
+  if (action.issue_number) parts.push("issue #" + action.issue_number);
+  if (action.pr_number) parts.push("PR #" + action.pr_number);
+  return parts.length ? parts.join(" · ") : "project";
+}
+
+function actionPolicyText(action) {
+  if (action.approval_policy) return actionLabel(action.approval_policy);
+  return action.requires_approval ? "manual approval required" : "none";
+}
+
+function actionDetailHTML(action) {
+  const description = action.description ? '<div><strong>Would</strong> ' + escapeText(action.description.replace(/^Would\s+/i, "")) + '</div>' : "";
+  return '<div class="action-detail">' + description +
+    '<div><strong>Scope</strong> ' + escapeText(actionLabel(action.scope || "unknown")) + '</div>' +
+    '<div><strong>Target</strong> ' + escapeText(actionTargetText(action)) + '</div>' +
+    '<div><strong>Approval</strong> ' + escapeText(actionPolicyText(action)) + '</div>' +
+    '<div><strong>Disabled</strong> ' + escapeText(action.disabled_reason || "Write action unavailable") + '</div>' +
+    '</div>';
+}
+
+function renderActions(actions, options) {
   const items = actions || [];
   if (!items.length) return '<span class="empty">No controls.</span>';
+  const showDetails = !options || options.details !== false;
   return '<div class="actions">' + items.map(action =>
-    '<button type="button" class="action-btn" disabled aria-disabled="true" title="' +
+    '<div class="action-item"><button type="button" class="action-btn" disabled aria-disabled="true" title="' +
     escapeText(action.disabled_reason || "Write action unavailable") + '">' +
-    escapeText(action.label || actionLabel(action.id)) + '</button>'
+    escapeText(action.label || actionLabel(action.id)) + '</button>' +
+    (showDetails ? actionDetailHTML(action) : "") + '</div>'
   ).join("") + '</div>' +
   '<div class="action-note">' + escapeText(actionDisabledReason(items)) + '</div>';
 }
@@ -2291,7 +2332,7 @@ function renderFleetWorkers() {
       '<td class="pr-col" title="' + escapeText(pr) + '">' + linkHTML(worker.pr_url, pr) + '</td>' +
       '<td class="runtime-col" title="' + escapeText(worker.runtime || "-") + '">' + escapeText(worker.runtime || "-") + '</td>' +
       '<td class="tokens-col">' + compactNumber(worker.tokens_used_total) + '</td>' +
-      '<td class="action-col">' + renderActions(worker.actions || []) + '</td>' +
+      '<td class="action-col">' + renderActions(worker.actions || [], { details: false }) + '</td>' +
     '</tr>';
   }).join("");
 
