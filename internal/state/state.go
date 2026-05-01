@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -67,6 +68,109 @@ type Session struct {
 	PreviousAttemptFeedback     string        `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
 	PreviousAttemptFeedbackKind string        `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
 	CheckpointFile              string        `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
+}
+
+// SessionAttention explains why a session needs operator attention and the
+// safest next action Maestro can infer from persisted state.
+type SessionAttention struct {
+	Reason         string
+	NextAction     string
+	NeedsAttention bool
+}
+
+// SessionAttentionFor returns a concise, state-backed explanation for a session.
+// The alive pointer should be provided only when the caller has checked the
+// recorded running process.
+func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
+	if sess == nil {
+		return SessionAttention{}
+	}
+
+	switch sess.Status {
+	case StatusRunning:
+		if alive != nil && !*alive {
+			return SessionAttention{
+				Reason:         "State says running, but the worker PID is not alive.",
+				NextAction:     "Run a Maestro reconciliation cycle so the session can be marked dead and retried if eligible.",
+				NeedsAttention: true,
+			}
+		}
+		if sess.PID == 0 {
+			return SessionAttention{
+				Reason:         "Worker is marked running, but no PID is recorded.",
+				NextAction:     "Run a Maestro reconciliation cycle or inspect the worker before dispatching more work.",
+				NeedsAttention: true,
+			}
+		}
+		return SessionAttention{Reason: "Worker process is alive and writing to its session log."}
+	case StatusPROpen:
+		if sess.PRNumber > 0 {
+			return SessionAttention{Reason: "PR is open; Maestro is waiting for CI, review gate, merge interval, or conflict handling."}
+		}
+		return SessionAttention{
+			Reason:         "Session is waiting on an open PR, but no PR number is recorded yet.",
+			NextAction:     "Reconcile the session with the GitHub PR before dispatching duplicate work.",
+			NeedsAttention: true,
+		}
+	case StatusQueued:
+		return SessionAttention{Reason: "Worker is queued for follow-up processing before it can be merged."}
+	case StatusDead:
+		if sess.NextRetryAt != nil {
+			return SessionAttention{
+				Reason:         "Worker exited; a retry is scheduled after the current backoff.",
+				NextAction:     "Wait for the scheduled retry or inspect the failed attempt if it should not retry.",
+				NeedsAttention: true,
+			}
+		}
+		return SessionAttention{
+			Reason:         "Worker exited and is waiting for retry or reconciliation.",
+			NextAction:     "Run a Maestro reconciliation cycle or review the failed attempt.",
+			NeedsAttention: true,
+		}
+	case StatusRetryExhausted:
+		if sess.PRNumber > 0 {
+			if sessionHasFailedCheckEvidence(sess) {
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Retry limit exhausted after checks failed; PR #%d remains open.", sess.PRNumber),
+					NextAction:     "Fix failing checks or retry intentionally before this PR can merge.",
+					NeedsAttention: true,
+				}
+			}
+			return SessionAttention{
+				Reason:         fmt.Sprintf("Retry limit exhausted with PR #%d still open.", sess.PRNumber),
+				NextAction:     "Keep the PR in normal merge flow if checks and review gates pass; otherwise retry intentionally.",
+				NeedsAttention: true,
+			}
+		}
+		return SessionAttention{
+			Reason:         "Retry limit exhausted before a usable PR was produced.",
+			NextAction:     "Review the failed attempts, adjust the issue or retry budget, then restart intentionally.",
+			NeedsAttention: true,
+		}
+	case StatusFailed:
+		return SessionAttention{
+			Reason:         "Worker failed after the configured retry policy.",
+			NextAction:     "Review the failure and restart intentionally when the issue is ready.",
+			NeedsAttention: true,
+		}
+	case StatusConflictFailed:
+		return SessionAttention{
+			Reason:         "Automatic conflict resolution failed; the branch needs manual rebase/conflict handling.",
+			NextAction:     "Rebase or resolve conflicts before retrying or merging.",
+			NeedsAttention: true,
+		}
+	case StatusDone:
+		return SessionAttention{Reason: "Issue is complete; PR merged or issue was closed and the session is terminal."}
+	default:
+		return SessionAttention{Reason: "Session is waiting for the next Maestro reconciliation cycle."}
+	}
+}
+
+func sessionHasFailedCheckEvidence(sess *Session) bool {
+	if strings.TrimSpace(sess.CIFailureOutput) != "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(sess.LastNotifiedStatus), "ci_failure")
 }
 
 // UnmarshalJSON implements custom unmarshalling to preserve the legacy

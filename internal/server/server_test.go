@@ -148,6 +148,9 @@ func TestHandleState(t *testing.T) {
 	if !contains(resp.Running[0].StatusReason, "PID is not alive") {
 		t.Errorf("status_reason = %q, want dead PID hint", resp.Running[0].StatusReason)
 	}
+	if !contains(resp.Running[0].NextAction, "reconciliation cycle") {
+		t.Errorf("next_action = %q, want reconciliation guidance", resp.Running[0].NextAction)
+	}
 	if resp.PROpen[0].PRURL != "https://github.com/test/repo/pull/10" {
 		t.Errorf("pr_url = %q", resp.PROpen[0].PRURL)
 	}
@@ -270,6 +273,66 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 	}
 	if resp.SupervisorLatest == nil || resp.SupervisorLatest.ID != "sup-latest" {
 		t.Fatalf("legacy supervisor_latest = %#v, want sup-latest", resp.SupervisorLatest)
+	}
+}
+
+func TestHandleStateMapsSupervisorAttentionToWorker(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{Repo: "test/repo", MaxParallel: 2, StateDir: dir, Server: config.ServerConfig{Port: 8765}}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber:     77,
+		IssueTitle:      "fix checks",
+		Status:          state.StatusRetryExhausted,
+		StartedAt:       now.Add(-time.Hour),
+		PRNumber:        31,
+		CIFailureOutput: "go test failed",
+	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-checks",
+		CreatedAt:         now,
+		Project:           "test/repo",
+		Mode:              "read_only",
+		Summary:           "Issue #77 is retry exhausted, but PR #31 is still open; checks=failure.",
+		RecommendedAction: "review_retry_exhausted",
+		Target:            &state.SupervisorTarget{Issue: 77, PR: 31, Session: "slot-1"},
+		Risk:              "approval_gated",
+		Confidence:        0.93,
+		StuckStates: []state.SupervisorStuckState{
+			{
+				Code:              "retry_exhausted_open_pr",
+				Severity:          "blocked",
+				Summary:           "Issue #77 is retry exhausted, but PR #31 is still open; checks=failure.",
+				RecommendedAction: "Fix failing checks or retry intentionally before this PR can merge.",
+				Target:            &state.SupervisorTarget{Issue: 77, PR: 31, Session: "slot-1"},
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	srv := New(cfg, make(chan struct{}, 1))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.handleState(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.All) != 1 || !resp.All[0].NeedsAttention {
+		t.Fatalf("worker attention mapping missing: %#v", resp.All)
+	}
+	if !contains(resp.All[0].StatusReason, "PR #31 is still open") || !contains(resp.All[0].StatusReason, "checks=failure") {
+		t.Fatalf("status_reason = %q, want open PR and failing checks", resp.All[0].StatusReason)
+	}
+	if !contains(resp.All[0].NextAction, "Fix failing checks") {
+		t.Fatalf("next_action = %q, want fix checks guidance", resp.All[0].NextAction)
 	}
 }
 

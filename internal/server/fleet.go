@@ -203,6 +203,7 @@ type fleetProjectState struct {
 	Sessions       int            `json:"sessions"`
 	NeedsAttention int            `json:"needs_attention"`
 	Active         []sessionInfo  `json:"active,omitempty"`
+	Attention      []sessionInfo  `json:"attention,omitempty"`
 	Supervisor     supervisorInfo `json:"supervisor"`
 	Error          string         `json:"error,omitempty"`
 }
@@ -217,6 +218,7 @@ type fleetWorkerState struct {
 	IssueURL          string `json:"issue_url,omitempty"`
 	Status            string `json:"status"`
 	StatusReason      string `json:"status_reason,omitempty"`
+	NextAction        string `json:"next_action,omitempty"`
 	NeedsAttention    bool   `json:"needs_attention,omitempty"`
 	Backend           string `json:"backend,omitempty"`
 	PRNumber          int    `json:"pr_number,omitempty"`
@@ -298,7 +300,9 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 		Repo:         project.cfg.Repo,
 		DashboardURL: project.DashboardURL,
 	}
-	worker := makeFleetWorkerState(projectState, makeSessionInfo(project.cfg.Repo, slot, sess))
+	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
+	applySupervisorAttention(infos, st.LatestSupervisorDecision())
+	worker := makeFleetWorkerState(projectState, infos[0])
 	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)
 	if lines > 1000 {
 		lines = 1000
@@ -436,6 +440,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject) (fleetProjectState, 
 	for _, worker := range projectState.All {
 		if worker.NeedsAttention {
 			item.NeedsAttention++
+			item.Attention = append(item.Attention, worker)
 		}
 		if isFleetWorkerVisible(worker) {
 			workers = append(workers, makeFleetWorkerState(item, worker))
@@ -470,6 +475,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		IssueURL:          worker.IssueURL,
 		Status:            worker.Status,
 		StatusReason:      worker.StatusReason,
+		NextAction:        worker.NextAction,
 		NeedsAttention:    worker.NeedsAttention,
 		Backend:           worker.Backend,
 		PRNumber:          worker.PRNumber,
@@ -758,6 +764,23 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .empty { color: var(--muted); margin-top: 8px; }
   .worker-table .empty { padding: 18px 14px; margin: 0; text-align: center; }
+  .why-line {
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
+    white-space: normal;
+    overflow: hidden;
+    text-overflow: clip;
+  }
+  .why-line strong { color: var(--warn); font-weight: 650; }
+  .project-why {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+    background: #0b1016;
+  }
+  .why-item { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+  .why-item strong { color: var(--text); }
   .error { color: var(--bad); border: 1px solid rgba(248,81,73,.35); border-radius: 10px; background: rgba(248,81,73,.08); padding: 12px 14px; }
   @media (max-width: 700px) {
     header { align-items: flex-start; flex-direction: column; }
@@ -892,6 +915,20 @@ function rowClass(worker) {
   return "";
 }
 
+function workerWhyText(worker) {
+  const reason = worker.status_reason || "";
+  const action = worker.next_action || "";
+  if (!reason && !action) return "";
+  return reason + (action ? " Next: " + action : "");
+}
+
+function workerWhyHTML(worker) {
+  if (!worker.needs_attention && worker.status === "running") return "";
+  const why = workerWhyText(worker);
+  if (!why) return "";
+  return '<div class="why-line"><strong>Why:</strong> ' + escapeText(why) + '</div>';
+}
+
 function fleetWorkersFromData(data) {
   if (Array.isArray(data.workers)) return data.workers;
   return (data.projects || []).flatMap(project => (project.active || []).map(worker => ({
@@ -962,7 +999,9 @@ function renderFleetWorkers() {
   // The API response is already sorted with the server's authoritative status order.
   const visible = workers;
   const projectLabel = selected === "all" ? "all projects" : selected;
-  workerSummaryEl.textContent = visible.length + " active / recent / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel;
+  const attentionCount = visible.filter(worker => worker.needs_attention).length;
+  workerSummaryEl.textContent = visible.length + " active / recent / attention worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel +
+    (attentionCount ? " · " + attentionCount + " need attention" : "");
 
   if (visible.length === 0) {
     const empty = selected === "all"
@@ -979,7 +1018,7 @@ function renderFleetWorkers() {
     return '<tr class="' + rowClass(worker) + selected + '" data-project="' + escapeText(worker.project_name || "") + '" data-slot="' + escapeText(worker.slot || "") + '" tabindex="0">' +
       '<td class="project-col">' + linkHTML(worker.dashboard_url, worker.project_name || "-") + '</td>' +
       '<td class="slot-col">' + escapeText(worker.slot || "-") + '</td>' +
-      '<td class="issue-col">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title || "") + '</td>' +
+      '<td class="issue-col">' + linkHTML(worker.issue_url, issue) + ' ' + escapeText(worker.issue_title || "") + workerWhyHTML(worker) + '</td>' +
       '<td class="status-col"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
       '<td class="backend-col">' + escapeText(worker.backend || "-") + '</td>' +
       '<td class="pr-col">' + linkHTML(worker.pr_url, pr) + '</td>' +
@@ -1075,7 +1114,7 @@ function renderWorkerDetail(data) {
   ].join("");
 
   const noteClass = worker.needs_attention || (worker.status === "running" && worker.alive === false) ? " detail-note attention" : "detail-note";
-  const reason = worker.status_reason || "Waiting for the next Maestro reconciliation cycle.";
+  const reason = workerWhyText(worker) || "Waiting for the next Maestro reconciliation cycle.";
   const logText = log.available ? (log.text || emptyLogText(worker)) : (log.reason || "Log output is unavailable for this session.");
   const logMeta = log.available
     ? (log.truncated ? "tail, " : "") + (log.updated_at || "")
@@ -1129,6 +1168,30 @@ function renderSupervisor(project) {
   '</div>';
 }
 
+function supervisorWhyText(project) {
+  const latest = project && project.supervisor && project.supervisor.latest;
+  if (!latest) return "";
+  if (latest.summary) return latest.summary;
+  const reasons = latest.stuck_reasons && latest.stuck_reasons.length ? latest.stuck_reasons : latest.reasons || [];
+  return reasons.length ? reasons[0] : "";
+}
+
+function renderProjectWhy(project) {
+  const attention = project.attention || [];
+  if (attention.length) {
+    return '<div class="project-why"><div class="label">Why Attention</div>' +
+      attention.map(worker => '<div class="why-item"><strong>' + escapeText(worker.slot || "-") + '</strong> ' +
+        escapeText(workerWhyText(worker) || "Needs operator review.") + '</div>').join("") +
+      '</div>';
+  }
+  const why = supervisorWhyText(project);
+  if ((project.running || 0) === 0 && why) {
+    return '<div class="project-why"><div class="label">Why Not Running</div>' +
+      '<div class="why-item">' + escapeText(why) + '</div></div>';
+  }
+  return "";
+}
+
 function renderWorkers(project) {
   const workers = project.active || [];
   if (!workers.length) {
@@ -1138,7 +1201,7 @@ function renderWorkers(project) {
     workers.map(worker => '<tr>' +
       '<td>' + escapeText(worker.slot) + '</td>' +
       '<td><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
-      '<td>' + linkHTML(worker.issue_url, "#" + worker.issue_number) + ' ' + escapeText(worker.issue_title || "") + '</td>' +
+      '<td>' + linkHTML(worker.issue_url, "#" + worker.issue_number) + ' ' + escapeText(worker.issue_title || "") + workerWhyHTML(worker) + '</td>' +
       '<td>' + escapeText(worker.runtime || "-") + '</td>' +
     '</tr>').join("") +
   '</table></div>';
@@ -1163,6 +1226,7 @@ function renderProject(project) {
       '<div class="metric"><strong>' + escapeText(project.sessions || 0) + '</strong><span>Sessions</span></div>' +
       '<div class="metric"><strong>' + escapeText(project.needs_attention || 0) + '</strong><span>Attention</span></div>' +
     '</div>' +
+    renderProjectWhy(project) +
     renderSupervisor(project) +
     renderWorkers(project) +
   '</article>';
