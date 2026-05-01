@@ -270,6 +270,53 @@ func TestFleetWorkerDetailIncludesMetadataAndLog(t *testing.T) {
 	if !contains(resp.Log.Text, "line two") || !contains(resp.Log.Text, "line three") {
 		t.Fatalf("log text = %q, want recent lines", resp.Log.Text)
 	}
+	if resp.Log.Lines != 2 {
+		t.Fatalf("log lines = %d, want actual tailed line count 2", resp.Log.Lines)
+	}
+}
+
+func TestFleetWorkerDetailReportsActualLogLineCount(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	logFile := filepath.Join(dir, "logs", "one-1.log")
+	if err := os.MkdirAll(filepath.Dir(logFile), 0o755); err != nil {
+		t.Fatalf("create log dir: %v", err)
+	}
+	if err := os.WriteFile(logFile, []byte("line one\nline two\nline three\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"one-1": {
+			IssueNumber: 1,
+			IssueTitle:  "Build thing",
+			Status:      state.StatusDone,
+			StartedAt:   now.Add(-10 * time.Minute),
+			LogFile:     logFile,
+		},
+	})
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet/worker?project=One&slot=one-1&lines=260", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetWorker(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp fleetWorkerDetailResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Log.Lines != 3 {
+		t.Fatalf("log lines = %d, want actual returned line count 3", resp.Log.Lines)
+	}
 }
 
 func TestFleetWorkerDetailExplainsUnavailableLog(t *testing.T) {

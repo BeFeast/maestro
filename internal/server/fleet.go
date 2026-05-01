@@ -346,11 +346,18 @@ func makeFleetLogTail(sess *state.Session, lines int) fleetLogTail {
 
 	return fleetLogTail{
 		Available: true,
-		Lines:     lines,
+		Lines:     countLines(text),
 		Truncated: truncated,
 		Text:      stripANSI(text),
 		UpdatedAt: updatedAt,
 	}
+}
+
+func countLines(text string) int {
+	if text == "" {
+		return 0
+	}
+	return strings.Count(text, "\n") + 1
 }
 
 func (s *FleetServer) snapshot() fleetResponse {
@@ -751,7 +758,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .attention { color: var(--bad); border-color: rgba(248,81,73,.45); }
   .empty { color: var(--muted); margin-top: 8px; }
   .worker-table .empty { padding: 18px 14px; margin: 0; text-align: center; }
-  .error { color: var(--bad); padding: 12px 14px; }
+  .error { color: var(--bad); border: 1px solid rgba(248,81,73,.35); border-radius: 10px; background: rgba(248,81,73,.08); padding: 12px 14px; }
   @media (max-width: 700px) {
     header { align-items: flex-start; flex-direction: column; }
     .stats { justify-content: flex-start; }
