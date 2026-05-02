@@ -73,6 +73,7 @@ const fleetState = {
   attention: [],
   workers: [],
   detail: null,
+  operatorBrief: null,
   verdict: null,
   refreshedAt: ""
 };
@@ -803,12 +804,39 @@ function countFailed(project) {
   return project.failed || 0;
 }
 
-function renderFleetVerdict(verdict) {
-  const tones = new Set(["healthy", "busy", "attention", "daemon-down"]);
-  const tone = verdict && tones.has(verdict.tone) ? verdict.tone : "attention";
-  const sentence = verdict && verdict.sentence ? verdict.sentence : "Supervisor status unavailable. No worker state or attention state could be confirmed.";
+function fleetBriefToneClass(tone) {
+  switch (String(tone || "").trim()) {
+  case "healthy":
+  case "busy":
+  case "attention":
+  case "daemon-down":
+    return tone;
+  case "error":
+    return "daemon-down";
+  default:
+    return "attention";
+  }
+}
+
+function fleetBriefTargetHTML(brief) {
+  if (!brief) return "";
+  const parts = [];
+  if (brief.project) parts.push('<span>Project ' + escapeText(brief.project) + '</span>');
+  if (brief.issue_number) parts.push(linkHTML(brief.issue_url, "Issue #" + brief.issue_number));
+  if (brief.pr_number) parts.push(linkHTML(brief.pr_url, "PR #" + brief.pr_number));
+  if (brief.session) parts.push('<span>Session ' + escapeText(brief.session) + '</span>');
+  return parts.length ? '<div class="fleet-brief-meta">' + parts.join(" ") + '</div>' : "";
+}
+
+function renderFleetVerdict(brief, verdict) {
+  const source = brief && brief.sentence ? brief : verdict;
+  const tone = fleetBriefToneClass(source && source.tone);
+  const sentence = source && source.sentence ? source.sentence : "Supervisor status unavailable. No worker state or attention state could be confirmed.";
+  const next = brief && brief.next_action ? '<div class="fleet-brief-next"><strong>Next:</strong> ' + escapeText(brief.next_action) + '</div>' : "";
   fleetVerdictEl.className = "fleet-verdict verdict-" + tone;
-  fleetVerdictEl.textContent = sentence;
+  fleetVerdictEl.innerHTML = '<div class="fleet-brief-label">Global operator brief</div>' +
+    '<div class="fleet-brief-sentence">' + escapeText(sentence) + '</div>' +
+    fleetBriefTargetHTML(brief) + next;
 }
 
 function renderStats(summary) {
@@ -817,7 +845,8 @@ function renderStats(summary) {
   const prOpen = Number(summary.pr_open || 0);
   const monitoring = Number(summary.monitoring_pr || 0);
   const failed = Number(summary.failed || 0);
-  const attention = Number(summary.needs_attention || 0);
+  const attention = Number(summary.needs_attention || 0) + Number(summary.approvals_pending || 0) + Number(summary.errors || 0) +
+    Number(summary.stale || 0) + Number(summary.dispatch_failures || 0) + Number(summary.outcome_drift || 0) + Number(summary.no_eligible_issues || 0);
   const throughputMerged = Number(summary.throughput_merged_7d || 0);
   const throughputDaily = Array.isArray(summary.throughput_daily_7d)
     ? summary.throughput_daily_7d.map(value => Number(value || 0))
@@ -1738,6 +1767,7 @@ function applyFleetData(data) {
   fleetState.workers = fleetWorkersFromData(data);
   fleetState.approvals = approvalsFromData(data);
   fleetState.attention = attentionFromData(data);
+  fleetState.operatorBrief = data.operator_brief || null;
   fleetState.verdict = data.verdict || null;
   if (!fleetState.selectedWorkerKey && fleetState.requestedWorker) {
     const requested = resolveWorkerQuery(fleetState.requestedWorker);
@@ -1760,7 +1790,7 @@ function applyFleetData(data) {
     (alerts.length ? " · " + alerts.join(" · ") : "");
   renderFilterOptions();
   syncFilterControls();
-  renderFleetVerdict(fleetState.verdict);
+  renderFleetVerdict(fleetState.operatorBrief, fleetState.verdict);
   renderStats(summary);
   renderProjectRail();
   renderProjectOverview();

@@ -203,16 +203,18 @@ type fleetVerdict struct {
 }
 
 type fleetOperatorBrief struct {
-	Tone        string `json:"tone"`
-	Sentence    string `json:"sentence"`
-	Project     string `json:"project,omitempty"`
-	Kind        string `json:"kind,omitempty"`
-	NextAction  string `json:"next_action,omitempty"`
-	IssueNumber int    `json:"issue_number,omitempty"`
-	IssueURL    string `json:"issue_url,omitempty"`
-	PRNumber    int    `json:"pr_number,omitempty"`
-	PRURL       string `json:"pr_url,omitempty"`
-	Session     string `json:"session,omitempty"`
+	Tone           string `json:"tone"`
+	Sentence       string `json:"sentence"`
+	Project        string `json:"project,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	NextAction     string `json:"next_action,omitempty"`
+	ActionRequired bool   `json:"action_required,omitempty"`
+	IssueNumber    int    `json:"issue_number,omitempty"`
+	IssueURL       string `json:"issue_url,omitempty"`
+	PRNumber       int    `json:"pr_number,omitempty"`
+	PRURL          string `json:"pr_url,omitempty"`
+	Session        string `json:"session,omitempty"`
 }
 
 type fleetOperatorState struct {
@@ -235,8 +237,12 @@ type fleetSummary struct {
 	Active              int   `json:"active"`
 	MonitoringPR        int   `json:"monitoring_pr"`
 	DispatchPending     int   `json:"dispatch_pending"`
+	DispatchFailures    int   `json:"dispatch_failures"`
 	QueueBlocked        int   `json:"queue_blocked"`
+	NoEligibleIssues    int   `json:"no_eligible_issues"`
 	OutcomeMissing      int   `json:"outcome_missing"`
+	OutcomeDrift        int   `json:"outcome_drift"`
+	StaleWorkers        int   `json:"stale_workers"`
 	Running             int   `json:"running"`
 	PROpen              int   `json:"pr_open"`
 	Failed              int   `json:"failed"`
@@ -606,7 +612,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 		return left.Slot < right.Slot
 	})
 	sortFleetApprovals(resp.Approvals)
-	resp.OperatorBrief = buildFleetOperatorBrief(resp.Projects, now)
+	resp.OperatorBrief = buildFleetOperatorBrief(resp.Projects, resp.Approvals, now)
 	resp.Verdict = buildFleetVerdict(resp, now)
 	return resp
 }
@@ -635,7 +641,7 @@ func fleetVerdictTone(summary fleetSummary, latest *supervisorDecisionInfo, now 
 	if latest == nil || supervisorHeartbeatStale(latest, now) {
 		return "daemon-down"
 	}
-	if summary.Stale > 0 || summary.Errors > 0 || summary.NeedsAttention > 0 || summary.ApprovalsPending > 0 {
+	if summary.Stale > 0 || summary.Errors > 0 || summary.NeedsAttention > 0 || summary.ApprovalsPending > 0 || summary.DispatchFailures > 0 || summary.OutcomeDrift > 0 || summary.NoEligibleIssues > 0 {
 		return "attention"
 	}
 	if summary.Running > 0 {
@@ -726,7 +732,7 @@ func fleetPRSentence(prOpen int) string {
 }
 
 func fleetAttentionSentence(summary fleetSummary) string {
-	items := summary.NeedsAttention + summary.ApprovalsPending + summary.Errors + summary.Stale
+	items := summary.NeedsAttention + summary.ApprovalsPending + summary.Errors + summary.Stale + summary.DispatchFailures + summary.OutcomeDrift + summary.NoEligibleIssues
 	switch items {
 	case 0:
 		return "No item needs attention."
@@ -747,10 +753,17 @@ func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState)
 		summary.MonitoringPR++
 	case "pending_dispatch":
 		summary.DispatchPending++
-	case "queue_blocked":
+	case "dispatch_failure":
+		summary.DispatchFailures++
+	case "queue_blocked", "no_eligible_issues":
 		summary.QueueBlocked++
+		summary.NoEligibleIssues++
 	case "outcome_missing":
 		summary.OutcomeMissing++
+	case "outcome_drift":
+		summary.OutcomeDrift++
+	case "stale_worker":
+		summary.StaleWorkers++
 	}
 }
 
@@ -763,20 +776,55 @@ func fleetOperatorStateIsActive(kind string) bool {
 	}
 }
 
-func buildFleetOperatorBrief(projects []fleetProjectState, now time.Time) fleetOperatorBrief {
+func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetApprovalState, now time.Time) fleetOperatorBrief {
 	_ = now
 	if len(projects) == 0 {
-		return fleetOperatorBrief{Tone: "muted", Sentence: "No projects are configured in this fleet."}
+		return fleetOperatorBrief{Tone: "muted", Sentence: "Global brief: no projects are configured in this fleet."}
 	}
-	var selected *fleetProjectState
+
+	var action *fleetProjectState
 	for i := range projects {
 		project := &projects[i]
-		if selected == nil || fleetOperatorStatePriority(project.OperatorState.Kind) < fleetOperatorStatePriority(selected.OperatorState.Kind) {
-			selected = project
+		if !fleetOperatorKindNeedsAction(project.OperatorState.Kind) {
+			continue
+		}
+		if action == nil || fleetOperatorStatePriority(project.OperatorState.Kind) < fleetOperatorStatePriority(action.OperatorState.Kind) {
+			action = project
 		}
 	}
-	if selected == nil {
-		return fleetOperatorBrief{Tone: "muted", Sentence: "No project state is available."}
+	if action != nil {
+		state := action.OperatorState
+		brief := fleetOperatorBrief{
+			Tone:           fleetActionTone(state.Tone),
+			Project:        action.Name,
+			Kind:           state.Kind,
+			Reason:         state.Summary,
+			NextAction:     state.NextAction,
+			ActionRequired: true,
+			IssueNumber:    state.IssueNumber,
+			IssueURL:       state.IssueURL,
+			PRNumber:       state.PRNumber,
+			PRURL:          state.PRURL,
+			Session:        state.Session,
+		}
+		brief.Sentence = fleetActionRequiredSentence(action.Name, state.Label, state.Summary, state.NextAction, state.IssueNumber, state.PRNumber, state.Session)
+		return brief
+	}
+	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
+		return fleetOperatorBrief{
+			Tone:           "attention",
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval pending", approval.Summary, "Approve or reject the pending supervisor approval after checking the target state.", approval.IssueNumber, approval.PRNumber, approval.Session),
+			Project:        approval.ProjectName,
+			Kind:           "approval_pending",
+			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			NextAction:     "Approve or reject the pending supervisor approval after checking the target state.",
+			ActionRequired: true,
+			IssueNumber:    approval.IssueNumber,
+			IssueURL:       approval.IssueURL,
+			PRNumber:       approval.PRNumber,
+			PRURL:          approval.PRURL,
+			Session:        approval.Session,
+		}
 	}
 
 	working, monitoring, pending, attention := 0, 0, 0, 0
@@ -792,67 +840,118 @@ func buildFleetOperatorBrief(projects []fleetProjectState, now time.Time) fleetO
 			attention++
 		}
 	}
-	state := selected.OperatorState
-	brief := fleetOperatorBrief{
-		Tone:        state.Tone,
-		Project:     selected.Name,
-		Kind:        state.Kind,
-		NextAction:  state.NextAction,
-		IssueNumber: state.IssueNumber,
-		IssueURL:    state.IssueURL,
-		PRNumber:    state.PRNumber,
-		PRURL:       state.PRURL,
-		Session:     state.Session,
-	}
-	if attention > 0 || state.Tone == "attention" || state.Tone == "error" || state.Tone == "warn" {
-		brief.Sentence = fmt.Sprintf("Operator brief: %s: %s — %s", selected.Name, state.Label, state.Summary)
-		if next := strings.TrimSpace(state.NextAction); next != "" {
-			brief.Sentence += "; next: " + next
-		}
-		return brief
-	}
 	parts := make([]string, 0, 3)
 	if working > 0 {
-		parts = append(parts, fleetCountPhrase(working, "working", "working"))
+		parts = append(parts, fleetCountPhrase(working, "project running work", "projects running work"))
 	}
 	if monitoring > 0 {
-		parts = append(parts, fleetCountPhrase(monitoring, "monitoring PR", "monitoring PRs"))
+		parts = append(parts, fleetCountPhrase(monitoring, "project waiting for CI/review", "projects waiting for CI/review"))
 	}
 	if pending > 0 {
-		parts = append(parts, fleetCountPhrase(pending, "dispatch pending", "dispatch pending"))
+		parts = append(parts, fleetCountPhrase(pending, "project dispatch pending", "projects dispatch pending"))
 	}
 	if len(parts) == 0 {
-		brief.Tone = "healthy"
-		brief.Sentence = "Operator brief: all projects are idle by policy; no operator action is pending."
-		return brief
+		return fleetOperatorBrief{Tone: "healthy", Kind: "idle", Sentence: "Global brief: all projects are healthy idle; no operator action is needed right now."}
 	}
-	brief.Tone = "busy"
-	brief.Sentence = "Operator brief: " + strings.Join(parts, " · ") + "; no operator action is pending."
-	return brief
+	if attention > 0 {
+		parts = append(parts, fleetCountPhrase(attention, "project with passive attention", "projects with passive attention"))
+	}
+	return fleetOperatorBrief{Tone: "busy", Kind: "active", Sentence: "Global brief: " + strings.Join(parts, "; ") + "; no operator action is needed right now."}
+}
+
+func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetApprovalState {
+	var selected *fleetApprovalState
+	for i := range approvals {
+		approval := &approvals[i]
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending {
+			continue
+		}
+		if selected == nil || fleetApprovalStatusRank(approval.Status) < fleetApprovalStatusRank(selected.Status) || approval.createdAt.Before(selected.createdAt) {
+			selected = approval
+		}
+	}
+	return selected
+}
+
+func fleetOperatorKindNeedsAction(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "error", "dispatch_failure", "stale_worker", "attention", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
+		return true
+	default:
+		return false
+	}
+}
+
+func fleetActionTone(tone string) string {
+	switch strings.TrimSpace(tone) {
+	case "error", "daemon-down":
+		return "daemon-down"
+	case "busy":
+		return "busy"
+	case "healthy":
+		return "healthy"
+	default:
+		return "attention"
+	}
+}
+
+func fleetActionRequiredSentence(project, label, reason, next string, issueNumber, prNumber int, session string) string {
+	project = firstNonEmpty(project, "project")
+	label = firstNonEmpty(label, "Operator action")
+	reason = firstNonEmpty(reason, "Maestro needs an operator decision.")
+	sentence := fmt.Sprintf("Global brief: action required in %s", project)
+	if target := fleetBriefTargetPhrase(issueNumber, prNumber, session); target != "" {
+		sentence += " on " + target
+	}
+	sentence += fmt.Sprintf(": %s. Reason: %s", label, reason)
+	if next = strings.TrimSpace(next); next != "" {
+		sentence += " Next: " + next
+	}
+	return sentence
+}
+
+func fleetBriefTargetPhrase(issueNumber, prNumber int, session string) string {
+	parts := make([]string, 0, 3)
+	if issueNumber > 0 {
+		parts = append(parts, fmt.Sprintf("issue #%d", issueNumber))
+	}
+	if prNumber > 0 {
+		parts = append(parts, fmt.Sprintf("PR #%d", prNumber))
+	}
+	if session = strings.TrimSpace(session); session != "" {
+		parts = append(parts, "session "+session)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func fleetOperatorStatePriority(kind string) int {
 	switch strings.TrimSpace(kind) {
 	case "error":
 		return 0
-	case "attention":
+	case "dispatch_failure":
 		return 1
-	case "stale":
+	case "stale_worker":
 		return 2
-	case "pending_dispatch":
+	case "attention":
 		return 3
-	case "working":
+	case "outcome_drift":
 		return 4
-	case "monitoring_pr":
+	case "stale":
 		return 5
-	case "outcome_missing":
+	case "pending_dispatch":
 		return 6
-	case "queue_blocked":
+	case "working":
 		return 7
-	case "idle":
+	case "monitoring_pr":
 		return 8
-	default:
+	case "no_eligible_issues", "queue_blocked":
 		return 9
+	case "outcome_missing":
+		return 10
+	case "idle":
+		return 11
+	default:
+		return 12
 	}
 }
 
@@ -1245,6 +1344,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			NextAction: "Fix the project state/config load error before Maestro can supervise it.",
 		}
 	}
+	if state, ok := fleetDispatchFailureOperatorState(project); ok {
+		return state
+	}
 	if project.NeedsAttention > 0 {
 		state := fleetOperatorState{
 			Kind:       "attention",
@@ -1254,7 +1356,11 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			NextAction: "Open the worker detail and resolve the first blocking reason.",
 		}
 		if len(project.Attention) > 0 {
-			worker := project.Attention[0]
+			worker := highestPriorityAttentionSession(project.Attention)
+			if fleetSessionLooksStale(worker) {
+				state.Kind = "stale_worker"
+				state.Label = "Stale worker"
+			}
 			state.Session = worker.Slot
 			state.IssueNumber = worker.IssueNumber
 			state.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
@@ -1281,6 +1387,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			Summary:    summary,
 			NextAction: "Check the project supervisor service and state writer.",
 		}
+	}
+	if state, ok := fleetOutcomeDriftOperatorState(project); ok {
+		return state
 	}
 	if project.Running > 0 {
 		state := fleetOperatorState{
@@ -1339,7 +1448,7 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		return fleetOperatorState{Kind: "idle", Tone: "muted", Label: "Idle", Summary: "No queue snapshot is available yet."}
 	}
 	if q.Open == 0 {
-		return fleetOperatorState{Kind: "idle", Tone: "healthy", Label: "Idle", Summary: "No open issues are available."}
+		return fleetOperatorState{Kind: "idle", Tone: "healthy", Label: "Healthy idle", Summary: "No open issues are available."}
 	}
 	if q.Eligible > 0 {
 		state := fleetOperatorState{
@@ -1361,11 +1470,138 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		summary = "Open issues exist, but none are runnable under the current policy."
 	}
 	return fleetOperatorState{
-		Kind:       "queue_blocked",
-		Tone:       "muted",
-		Label:      "Held by policy",
+		Kind:       "no_eligible_issues",
+		Tone:       "warn",
+		Label:      "No eligible issues",
 		Summary:    summary,
 		NextAction: "Change labels/dependencies/project status if these issues should run now.",
+	}
+}
+
+func highestPriorityAttentionSession(workers []sessionInfo) sessionInfo {
+	if len(workers) == 0 {
+		return sessionInfo{}
+	}
+	selected := workers[0]
+	for _, worker := range workers[1:] {
+		left := fleetSessionAttentionSeverity(worker)
+		right := fleetSessionAttentionSeverity(selected)
+		if left < right {
+			selected = worker
+			continue
+		}
+		if left == right && worker.StartedAt > selected.StartedAt {
+			selected = worker
+		}
+	}
+	return selected
+}
+
+func fleetSessionAttentionSeverity(worker sessionInfo) int {
+	if text := strings.ToLower(worker.Status + " " + worker.StatusReason + " " + worker.NextAction); strings.Contains(text, "blocked") {
+		return 0
+	}
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return 0
+	case state.StatusRunning:
+		return 1
+	case state.StatusPROpen, state.StatusQueued:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func fleetSessionLooksStale(worker sessionInfo) bool {
+	if state.SessionStatus(worker.Status) != state.StatusRunning {
+		return false
+	}
+	text := strings.ToLower(worker.StatusReason + " " + worker.NextAction)
+	return strings.Contains(text, "not alive") || strings.Contains(text, "no pid") || strings.Contains(text, "not produced new output") || strings.Contains(text, "silent worker") || strings.Contains(text, "stale") || strings.Contains(text, "timeout")
+}
+
+func fleetDispatchFailureOperatorState(project fleetProjectState) (fleetOperatorState, bool) {
+	latest := project.Supervisor.Latest
+	if latest == nil {
+		return fleetOperatorState{}, false
+	}
+	if strings.TrimSpace(latest.Status) != "failed" && strings.TrimSpace(latest.ErrorClass) == "" {
+		return fleetOperatorState{}, false
+	}
+	operator := fleetOperatorState{
+		Kind:       "dispatch_failure",
+		Tone:       "error",
+		Label:      "Dispatch failure",
+		Summary:    firstNonEmpty(latest.Summary, "Supervisor dispatch or queue action failed."),
+		NextAction: fleetDispatchFailureNextAction(latest.ErrorClass),
+	}
+	return applyFleetOperatorTarget(project, operator, latest.Target), true
+}
+
+func fleetDispatchFailureNextAction(errorClass string) string {
+	switch strings.TrimSpace(errorClass) {
+	case "github_auth":
+		return "Fix GitHub authentication/permissions, then rerun the project supervisor."
+	case "github_rate_limited":
+		return "Wait for GitHub rate limits to clear, then rerun the project supervisor."
+	case "github_not_found":
+		return "Check the target issue/project exists and is accessible, then rerun the project supervisor."
+	default:
+		return "Fix the failed supervisor queue action, then rerun the project supervisor."
+	}
+}
+
+func fleetOutcomeDriftOperatorState(project fleetProjectState) (fleetOperatorState, bool) {
+	if !project.Outcome.Configured {
+		return fleetOperatorState{}, false
+	}
+	if latest := project.Supervisor.Latest; latest != nil {
+		if strings.TrimSpace(latest.RecommendedAction) == "check_outcome_health" {
+			operator := fleetOperatorState{
+				Kind:       "outcome_drift",
+				Tone:       "attention",
+				Label:      "Outcome drift",
+				Summary:    firstNonEmpty(latest.Summary, "Runtime outcome health needs verification."),
+				NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
+			}
+			return applyFleetOperatorTarget(project, operator, latest.Target), true
+		}
+		for _, stuck := range latest.StuckStates {
+			if stuck.Code != state.StuckNoOutcomeProgress {
+				continue
+			}
+			operator := fleetOperatorState{
+				Kind:       "outcome_drift",
+				Tone:       "attention",
+				Label:      "Outcome drift",
+				Summary:    firstNonEmpty(stuck.Summary, "Runtime outcome health has not caught up with merged PRs."),
+				NextAction: firstNonEmpty(stuck.RecommendedAction, project.Outcome.NextAction),
+			}
+			return applyFleetOperatorTarget(project, operator, stuck.Target), true
+		}
+	}
+
+	health := strings.TrimSpace(project.Outcome.HealthState)
+	switch health {
+	case outcome.HealthFailing:
+		return fleetOutcomeHealthState(project, health), true
+	case outcome.HealthUnknown, outcome.HealthUnmonitored:
+		if project.Outcome.MergedPRs > 0 {
+			return fleetOutcomeHealthState(project, health), true
+		}
+	}
+	return fleetOperatorState{}, false
+}
+
+func fleetOutcomeHealthState(project fleetProjectState, health string) fleetOperatorState {
+	goal := firstNonEmpty(project.Outcome.Goal, project.Outcome.DesiredOutcome, "the configured runtime outcome")
+	return fleetOperatorState{
+		Kind:       "outcome_drift",
+		Tone:       "attention",
+		Label:      "Outcome drift",
+		Summary:    fmt.Sprintf("Runtime outcome health is %s for %s.", strings.ReplaceAll(firstNonEmpty(health, outcome.HealthUnknown), "_", " "), goal),
+		NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
 	}
 }
 
@@ -1379,6 +1615,14 @@ func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorS
 	target := latest.Target
 	operator := fleetOperatorState{}
 	switch action {
+	case "check_outcome_health":
+		operator = fleetOperatorState{
+			Kind:       "outcome_drift",
+			Tone:       "attention",
+			Label:      "Outcome drift",
+			Summary:    firstNonEmpty(summary, "Runtime outcome health needs verification before more issue throughput."),
+			NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
+		}
 	case "monitor_open_pr", "approve_merge":
 		operator = fleetOperatorState{
 			Kind:       "monitoring_pr",
