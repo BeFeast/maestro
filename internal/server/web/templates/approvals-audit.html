@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html data-theme="light">
+<head>
+<title>maestro approval audit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f7fafa">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Maestro">
+<meta property="og:description" content="Supervisor approval audit history across the fleet.">
+<meta property="og:image" content="/static/og-1200x630.png">
+<meta property="og:image:alt" content="Maestro mark and tagline">
+<link rel="icon" href="/static/maestro-mark.svg" type="image/svg+xml">
+<link rel="icon" href="/static/favicon-16.png" type="image/png" sizes="16x16">
+<link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32">
+<link rel="icon" href="/static/favicon-48.png" type="image/png" sizes="48x48">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon-180.png" sizes="180x180">
+<link rel="preload" href="/static/status-icons.svg" as="image" type="image/svg+xml">
+<link rel="stylesheet" href="/static/tokens.css?v=20260502-7">
+<link rel="stylesheet" href="/static/components.css?v=20260502-7">
+<link rel="stylesheet" href="/static/fleet.css?v=20260502-7">
+</head>
+<body data-page="approval-audit">
+<header class="fleet-header">
+  <div class="brand-heading">
+    <img class="brand-mark" src="/static/maestro-mark.svg" alt="" aria-hidden="true">
+    <div>
+      <h1 aria-label="Maestro Approval Audit"><span>Maestro</span><span class="title-slash">/</span><span>Approval Audit</span></h1>
+      <div class="sub">{{APPROVAL_AUDIT_SUBTITLE}}</div>
+    </div>
+  </div>
+  <div class="header-actions">
+    <a class="scope-reset-button" href="/fleet">Back to Fleet</a>
+  </div>
+</header>
+<main>
+  <section class="approval-inbox approval-audit-page" aria-live="polite">
+    <div class="section-head">
+      <div>
+        <h2>Historical Approvals</h2>
+        <div class="sub">Read-only supervisor approval history across all configured projects.</div>
+      </div>
+      <div class="section-note">{{APPROVAL_AUDIT_SUMMARY}}</div>
+    </div>
+    <div class="approval-list approval-audit-list">
+      {{APPROVAL_AUDIT_ROWS}}
+    </div>
+  </section>
+</main>
+</body>
+</html>
