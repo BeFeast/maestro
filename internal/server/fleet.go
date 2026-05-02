@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -1213,12 +1214,313 @@ func failedCount(summary map[string]int) int {
 }
 
 func (s *FleetServer) handleFleetDashboard(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if r.URL.Path != "/" && r.URL.Path != "/fleet" {
 		http.NotFound(w, r)
 		return
 	}
+	body, err := renderFleetDashboardHTML(s.snapshot())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, fleetDashboardHTML)
+	fmt.Fprint(w, body)
+}
+
+func renderFleetDashboardHTML(snapshot fleetResponse) (string, error) {
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", fmt.Errorf("marshal fleet dashboard initial state: %w", err)
+	}
+	body := strings.Replace(fleetDashboardHTML, "{{FLEET_PROJECT_RAIL_ROWS}}", renderFleetProjectRailRows(snapshot.Projects), 1)
+	body = strings.Replace(body, "{{FLEET_PROJECT_RAIL_SUMMARY}}", html.EscapeString(fleetProjectRailSummary(snapshot.Projects)), 1)
+	body = strings.Replace(body, "{{FLEET_INITIAL_STATE}}", string(data), 1)
+	return body, nil
+}
+
+func fleetProjectRailSummary(projects []fleetProjectState) string {
+	if len(projects) == 0 {
+		return "No configured projects."
+	}
+	running := 0
+	attention := 0
+	for _, project := range projects {
+		running += project.Running
+		attention += project.NeedsAttention
+	}
+	return fmt.Sprintf("%d project%s · %d running · %d attention", len(projects), pluralSuffix(len(projects)), running, attention)
+}
+
+func renderFleetProjectRailRows(projects []fleetProjectState) string {
+	if len(projects) == 0 {
+		return `<tr class="project-rail-empty"><td colspan="7" class="empty">No configured projects are available in this fleet.</td></tr>`
+	}
+	var b strings.Builder
+	for _, project := range projects {
+		b.WriteString(renderFleetProjectRailRow(project))
+	}
+	return b.String()
+}
+
+func renderFleetProjectRailRow(project fleetProjectState) string {
+	rowClass := "project-rail-row " + fleetProjectRailStateClass(project)
+	return `<tr class="` + html.EscapeString(rowClass) + `">` +
+		`<td class="project-rail-project">` + renderFleetProjectIdentity(project) + `</td>` +
+		`<td class="project-rail-state-cell">` + renderFleetProjectRailState(project) + `</td>` +
+		`<td class="project-rail-queue-cell">` + renderFleetProjectRailQueue(project) + `</td>` +
+		`<td class="project-rail-pr-cell">` + renderFleetProjectRailPR(project) + `</td>` +
+		`<td class="project-rail-outcome-cell">` + renderFleetProjectRailOutcome(project) + `</td>` +
+		`<td class="project-rail-freshness-cell">` + renderFleetProjectRailFreshness(project) + `</td>` +
+		`<td class="project-rail-links-cell">` + renderFleetProjectRailLinks(project) + `</td>` +
+		`</tr>`
+}
+
+func renderFleetProjectIdentity(project fleetProjectState) string {
+	name := strings.TrimSpace(project.Name)
+	if name == "" {
+		name = "project"
+	}
+	primary := html.EscapeString(name)
+	if strings.TrimSpace(project.DashboardURL) != "" {
+		primary = `<a href="` + html.EscapeString(project.DashboardURL) + `" target="_blank" rel="noreferrer">` + primary + `</a>`
+	}
+	repo := strings.TrimSpace(project.Repo)
+	if repo == "" {
+		repo = strings.TrimSpace(project.ConfigPath)
+	}
+	return `<div class="rail-project-name">` + primary + `</div>` +
+		`<div class="rail-project-repo" title="` + html.EscapeString(repo) + `">` + html.EscapeString(repo) + `</div>`
+}
+
+func renderFleetProjectRailState(project fleetProjectState) string {
+	label := fleetProjectStateLabel(project)
+	parts := []string{
+		`<span class="pill ` + html.EscapeString(fleetProjectStatePillClass(project)) + `">` + html.EscapeString(label) + `</span>`,
+		`<div class="rail-subline">` + html.EscapeString(fmt.Sprintf("%d/%d running", project.Running, project.MaxParallel)) + `</div>`,
+	}
+	if project.NeedsAttention > 0 {
+		parts = append(parts, `<div class="rail-alert">`+html.EscapeString(fmt.Sprintf("%d need attention", project.NeedsAttention))+`</div>`)
+	}
+	if project.Error != "" {
+		parts = append(parts, `<div class="rail-alert" title="`+html.EscapeString(project.Error)+`">State error</div>`)
+	}
+	if project.Freshness.Stale {
+		parts = append(parts, `<div class="rail-warn">Stale snapshot</div>`)
+	}
+	return strings.Join(parts, "")
+}
+
+func renderFleetProjectRailQueue(project fleetProjectState) string {
+	q := project.QueueSnapshot
+	if q == nil {
+		return `<span class="empty">No queue snapshot</span>`
+	}
+	parts := []string{
+		fmt.Sprintf("open=%d", q.Open),
+		fmt.Sprintf("eligible=%d", q.Eligible),
+		fmt.Sprintf("excluded=%d", q.Excluded),
+		fmt.Sprintf("held/meta=%d", q.Held),
+		fmt.Sprintf("blocked-deps=%d", q.BlockedByDependency),
+	}
+	lines := []string{`<div class="rail-mainline">` + html.EscapeString(strings.Join(parts, " · ")) + `</div>`}
+	if q.SelectedCandidate != nil && q.SelectedCandidate.Number > 0 {
+		selected := fmt.Sprintf("selected #%d", q.SelectedCandidate.Number)
+		if title := strings.TrimSpace(q.SelectedCandidate.Title); title != "" {
+			selected += " " + title
+		}
+		lines = append(lines, `<div class="rail-subline">`+html.EscapeString(selected)+`</div>`)
+	}
+	if idleReason := strings.TrimSpace(q.IdleReason); idleReason != "" && project.Running == 0 {
+		lines = append(lines, `<div class="rail-warn" title="`+html.EscapeString(idleReason)+`">`+html.EscapeString(idleReason)+`</div>`)
+	}
+	return strings.Join(lines, "")
+}
+
+func renderFleetProjectRailPR(project fleetProjectState) string {
+	links := fleetProjectPRLinks(project, 3)
+	if project.PROpen == 0 && len(links) == 0 {
+		return `<span class="empty">No open PR</span>`
+	}
+	var b strings.Builder
+	b.WriteString(`<div class="rail-mainline">`)
+	b.WriteString(html.EscapeString(fmt.Sprintf("%d open", project.PROpen)))
+	b.WriteString(`</div>`)
+	if len(links) > 0 {
+		b.WriteString(`<div class="rail-links">`)
+		for i, link := range links {
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(link)
+		}
+		b.WriteString(`</div>`)
+	} else if url := fleetProjectPullsURL(project.Repo); url != "" {
+		b.WriteString(`<div class="rail-links"><a href="` + html.EscapeString(url) + `" target="_blank" rel="noreferrer">Open PRs</a></div>`)
+	}
+	return b.String()
+}
+
+func fleetProjectPRLinks(project fleetProjectState, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	seen := map[int]struct{}{}
+	links := make([]string, 0, limit)
+	add := func(worker sessionInfo) {
+		if worker.PRNumber <= 0 || len(links) >= limit {
+			return
+		}
+		if _, ok := seen[worker.PRNumber]; ok {
+			return
+		}
+		seen[worker.PRNumber] = struct{}{}
+		url := strings.TrimSpace(worker.PRURL)
+		if url == "" {
+			url = githubPRURL(project.Repo, worker.PRNumber)
+		}
+		label := fmt.Sprintf("PR #%d", worker.PRNumber)
+		if url == "" {
+			links = append(links, html.EscapeString(label))
+			return
+		}
+		links = append(links, `<a href="`+html.EscapeString(url)+`" target="_blank" rel="noreferrer">`+html.EscapeString(label)+`</a>`)
+	}
+	for _, worker := range project.Active {
+		add(worker)
+	}
+	for _, worker := range project.Attention {
+		add(worker)
+	}
+	return links
+}
+
+func renderFleetProjectRailOutcome(project fleetProjectState) string {
+	health := strings.TrimSpace(project.Outcome.HealthState)
+	if health == "" {
+		health = outcome.HealthUnknown
+	}
+	goal := strings.TrimSpace(project.Outcome.Goal)
+	if !project.Outcome.Configured || goal == "" {
+		goal = "No outcome brief configured"
+	}
+	parts := []string{
+		`<span class="pill outcome-` + html.EscapeString(fleetCSSClassToken(health)) + `">` + html.EscapeString(strings.ReplaceAll(health, "_", " ")) + `</span>`,
+		`<div class="rail-subline" title="` + html.EscapeString(goal) + `">` + html.EscapeString(goal) + `</div>`,
+	}
+	if next := strings.TrimSpace(project.Outcome.NextAction); next != "" {
+		parts = append(parts, `<div class="rail-note" title="`+html.EscapeString(next)+`">`+html.EscapeString(next)+`</div>`)
+	}
+	return strings.Join(parts, "")
+}
+
+func renderFleetProjectRailFreshness(project fleetProjectState) string {
+	freshness := project.Freshness
+	age := strings.TrimSpace(freshness.SnapshotAge)
+	if age == "" {
+		age = "No snapshot yet"
+	} else {
+		age = "Snapshot " + age + " ago"
+	}
+	details := make([]string, 0, 3)
+	if freshness.StateUpdatedAt != "" {
+		details = append(details, "State "+freshness.StateUpdatedAt)
+	}
+	if freshness.LogUpdatedAt != "" {
+		details = append(details, "Logs "+freshness.LogUpdatedAt)
+	}
+	if freshness.Reason != "" {
+		details = append(details, freshness.Reason)
+	}
+	return `<div class="rail-mainline" title="` + html.EscapeString(strings.Join(details, " · ")) + `">` + html.EscapeString(age) + `</div>`
+}
+
+func renderFleetProjectRailLinks(project fleetProjectState) string {
+	links := make([]string, 0, 3)
+	if strings.TrimSpace(project.DashboardURL) != "" {
+		links = append(links, `<a href="`+html.EscapeString(project.DashboardURL)+`" target="_blank" rel="noreferrer">Dashboard</a>`)
+	}
+	if url := fleetProjectGitHubURL(project.Repo); url != "" {
+		links = append(links, `<a href="`+html.EscapeString(url)+`" target="_blank" rel="noreferrer">GitHub</a>`)
+	}
+	links = append(links, `<button type="button" class="link-button project-workers-link" data-project="`+html.EscapeString(project.Name)+`">Workers</button>`)
+	return `<div class="rail-links">` + strings.Join(links, " ") + `</div>`
+}
+
+func fleetProjectStateLabel(project fleetProjectState) string {
+	switch {
+	case project.Error != "":
+		return "State error"
+	case project.NeedsAttention > 0:
+		return "Attention"
+	case project.Freshness.Stale:
+		return "Stale"
+	case project.Running > 0:
+		return "Running"
+	case project.PROpen > 0:
+		return "PR review"
+	default:
+		return "Idle"
+	}
+}
+
+func fleetProjectStatePillClass(project fleetProjectState) string {
+	return "rail-state-" + strings.TrimPrefix(fleetProjectRailStateClass(project), "project-row-")
+}
+
+func fleetProjectRailStateClass(project fleetProjectState) string {
+	switch {
+	case project.Error != "":
+		return "project-row-error"
+	case project.NeedsAttention > 0:
+		return "project-row-attention"
+	case project.Freshness.Stale:
+		return "project-row-stale"
+	case project.Running > 0:
+		return "project-row-running"
+	case project.PROpen > 0:
+		return "project-row-pr"
+	default:
+		return "project-row-idle"
+	}
+}
+
+func fleetProjectGitHubURL(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if !validGitHubRepo(repo) {
+		return ""
+	}
+	return "https://github.com/" + repo
+}
+
+func fleetProjectPullsURL(repo string) string {
+	base := fleetProjectGitHubURL(repo)
+	if base == "" {
+		return ""
+	}
+	return base + "/pulls?q=is%3Apr+is%3Aopen"
+}
+
+func fleetCSSClassToken(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+func pluralSuffix(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
 }
 
 const fleetDashboardHTML = `<!DOCTYPE html>
@@ -1228,23 +1530,23 @@ const fleetDashboardHTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
-    color-scheme: dark;
-    --bg: #0d1117;
-    --panel: #151b23;
-    --panel-2: #10161d;
-    --line: #29313d;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent: #58a6ff;
-    --ok: #3fb950;
-    --warn: #d29922;
-    --bad: #f85149;
-    --queued: #a371f7;
+    color-scheme: light;
+    --bg: #f6f8fb;
+    --panel: #ffffff;
+    --panel-2: #f8fafc;
+    --line: #d7dee8;
+    --text: #172033;
+    --muted: #64748b;
+    --accent: #2563eb;
+    --ok: #16803c;
+    --warn: #a16207;
+    --bad: #dc2626;
+    --queued: #7c3aed;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    background: var(--bg);
+    background: linear-gradient(180deg, #fbfdff 0, var(--bg) 220px);
     color: var(--text);
     font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }
@@ -1256,7 +1558,8 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     gap: 18px;
     padding: 12px 20px;
     border-bottom: 1px solid var(--line);
-    background: #0b1016;
+    background: rgba(255,255,255,.92);
+    box-shadow: 0 1px 0 rgba(15,23,42,.04);
   }
   h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
   .sub { color: var(--muted); font-size: 13px; }
@@ -1287,30 +1590,124 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .stat strong { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
   .stat span { color: var(--muted); font-size: 12px; }
   main { padding: 18px; }
-  .project-tabs {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 14px;
-    padding-bottom: 4px;
-    overflow-x: auto;
-  }
-  .project-tab {
-    flex: 0 0 auto;
+  .project-rail {
+    margin-bottom: 16px;
     border: 1px solid var(--line);
-    border-radius: 999px;
+    background: var(--panel);
+    box-shadow: 0 8px 24px rgba(15,23,42,.05);
+  }
+  .project-rail-controls {
+    display: grid;
+    grid-template-columns: minmax(220px, 360px) minmax(0, 1fr);
+    gap: 12px;
+    align-items: end;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
     background: var(--panel-2);
+  }
+  .project-rail-controls label { display: grid; gap: 4px; min-width: 0; }
+  .project-rail-controls span {
     color: var(--muted);
-    padding: 6px 11px;
-    cursor: pointer;
+    font-size: 11px;
+    font-weight: 650;
+    text-transform: uppercase;
+  }
+  .project-rail-controls input {
+    min-width: 0;
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #ffffff;
+    color: var(--text);
     font: inherit;
+    padding: 7px 9px;
+  }
+  .project-rail-help { color: var(--muted); font-size: 13px; text-align: right; }
+  .project-rail-scroll {
+    max-height: min(58vh, 720px);
+    overflow: auto;
+  }
+  .project-rail-table {
+    width: 100%;
+    min-width: 1120px;
+    border-collapse: collapse;
+    table-layout: fixed;
+  }
+  .project-rail-table th,
+  .project-rail-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(215,222,232,.85);
+    vertical-align: top;
+  }
+  .project-rail-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    text-align: left;
+    background: #f8fafc;
+  }
+  .project-rail-table tbody tr:hover { background: #f8fafc; }
+  .project-rail-table .empty { padding: 18px 14px; text-align: center; }
+  .project-rail-project { width: 190px; }
+  .project-rail-state-cell { width: 150px; }
+  .project-rail-queue-cell { width: 250px; }
+  .project-rail-pr-cell { width: 130px; }
+  .project-rail-outcome-cell { width: 220px; }
+  .project-rail-freshness-cell { width: 150px; }
+  .project-rail-links-cell { width: 150px; }
+  .project-row-attention { background: rgba(220,38,38,.045); }
+  .project-row-running { background: rgba(22,128,60,.035); }
+  .project-row-pr { background: rgba(37,99,235,.035); }
+  .project-row-stale { background: rgba(161,98,7,.045); }
+  .project-row-error { background: rgba(220,38,38,.075); }
+  .rail-project-name {
+    overflow: hidden;
+    font-weight: 750;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .project-tab.active {
-    color: var(--text);
-    border-color: rgba(88,166,255,.65);
-    background: rgba(88,166,255,.12);
+  .rail-project-repo,
+  .rail-subline,
+  .rail-note,
+  .rail-warn,
+  .rail-alert {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
   }
-  .project-tab .count { margin-left: 6px; color: var(--muted); font-size: 12px; }
+  .rail-project-repo,
+  .rail-note,
+  .rail-warn,
+  .rail-alert {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rail-mainline { color: var(--text); font-size: 13px; line-height: 1.35; }
+  .rail-alert { color: var(--bad); }
+  .rail-warn { color: var(--warn); }
+  .rail-links { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 12px; }
+  .rail-state-running, .outcome-healthy { color: var(--ok); border-color: rgba(22,128,60,.5); background: rgba(22,128,60,.08); }
+  .rail-state-pr, .outcome-unknown { color: var(--accent); border-color: rgba(37,99,235,.45); background: rgba(37,99,235,.07); }
+  .rail-state-attention, .rail-state-error, .outcome-failing { color: var(--bad); border-color: rgba(220,38,38,.45); background: rgba(220,38,38,.07); }
+  .rail-state-stale { color: var(--warn); border-color: rgba(161,98,7,.45); background: rgba(161,98,7,.08); }
+  .rail-state-idle, .outcome-not_configured, .outcome-unmonitored { color: var(--muted); border-color: rgba(100,116,139,.45); background: rgba(100,116,139,.08); }
+  .project-overview {
+    margin-bottom: 16px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .project-diagnostics > summary {
+    padding: 12px 14px;
+    color: var(--muted);
+    cursor: pointer;
+    font-weight: 650;
+  }
+  .project-diagnostics[open] > summary { border-bottom: 1px solid var(--line); }
   .project-overview,
   .approval-inbox {
     margin-bottom: 16px;
@@ -1328,8 +1725,8 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .approval-list.approval-list-compact { gap: 8px; padding: 8px 14px 10px; }
   .approval-active-list, .approval-history-list { display: grid; gap: 8px; }
   .approval-history {
-    border: 1px solid rgba(41,49,61,.85);
-    background: rgba(16,22,29,.62);
+    border: 1px solid rgba(215,222,232,.85);
+    background: rgba(248,250,252,.92);
   }
   .approval-history summary {
     display: flex;
@@ -1343,10 +1740,10 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .approval-history summary strong { color: var(--text); font-weight: 650; }
   .approval-history-list {
     padding: 8px;
-    border-top: 1px solid rgba(41,49,61,.8);
+    border-top: 1px solid rgba(215,222,232,.9);
   }
   .approval-history .approval-card {
-    background: rgba(13,17,23,.58);
+    background: rgba(255,255,255,.78);
   }
   .approval-history .approval-summary { color: var(--muted); }
   .approval-card {
@@ -1355,9 +1752,9 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     gap: 10px;
     min-width: 0;
     padding: 10px 12px;
-    border: 1px solid rgba(41,49,61,.9);
+    border: 1px solid rgba(215,222,232,.95);
     border-left: 3px solid var(--line);
-    background: rgba(16,22,29,.86);
+    background: rgba(255,255,255,.92);
   }
   .approval-card.approval-pending { border-left-color: var(--warn); background: rgba(210,153,34,.08); }
   .approval-card.approval-stale { border-left-color: var(--line); background: rgba(139,148,158,.06); }
@@ -1399,7 +1796,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .attention-inbox {
     margin-bottom: 16px;
     border: 1px solid rgba(248,81,73,.35);
-    background: linear-gradient(180deg, rgba(248,81,73,.08), rgba(21,27,35,.96) 90%);
+    background: linear-gradient(180deg, rgba(220,38,38,.07), rgba(255,255,255,.96) 90%);
   }
   .attention-list {
     display: grid;
@@ -1412,12 +1809,12 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     gap: 12px;
     min-width: 0;
     padding: 12px;
-    border: 1px solid rgba(41,49,61,.9);
-    background: rgba(16,22,29,.86);
+    border: 1px solid rgba(215,222,232,.95);
+    background: rgba(255,255,255,.92);
   }
   .attention-card.selected { outline: 1px solid rgba(88,166,255,.65); outline-offset: -1px; }
   .attention-card[data-slot] { cursor: pointer; }
-  .attention-card[data-slot]:hover { background: rgba(24,33,44,.92); }
+  .attention-card[data-slot]:hover { background: #f8fafc; }
   .attention-context, .attention-main, .attention-issue { min-width: 0; }
   .attention-project {
     display: block;
@@ -1469,7 +1866,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     border: 1px solid var(--line);
     background: var(--panel);
   }
-  .worker-detail .section-head { border-bottom-color: rgba(41,49,61,.9); }
+  .worker-detail .section-head { border-bottom-color: rgba(215,222,232,.9); }
   .detail-body { padding: 14px; }
   .detail-grid {
     display: grid;
@@ -1480,7 +1877,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .detail-field {
     min-width: 0;
     padding: 9px 10px;
-    border: 1px solid rgba(41,49,61,.85);
+    border: 1px solid rgba(215,222,232,.9);
     background: var(--panel-2);
   }
   .detail-field span {
@@ -1525,7 +1922,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     margin: 0;
     padding: 12px;
     overflow: auto;
-    border: 1px solid rgba(41,49,61,.85);
+    border: 1px solid rgba(215,222,232,.9);
     background: #05080d;
     color: #dbe7f3;
     font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1547,7 +1944,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     gap: 10px;
     padding: 12px 14px;
     border-bottom: 1px solid var(--line);
-    background: rgba(16,22,29,.72);
+    background: var(--panel-2);
   }
   .worker-controls label { display: grid; gap: 4px; min-width: 0; }
   .worker-controls span {
@@ -1588,7 +1985,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .worker-table th, .worker-table td {
     padding: 9px 10px;
-    border-bottom: 1px solid rgba(41,49,61,.8);
+    border-bottom: 1px solid rgba(215,222,232,.9);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1608,7 +2005,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .worker-table tbody tr.history-row { background: rgba(139,148,158,.08); }
   .worker-table tbody tr.history-row td { white-space: normal; }
   .worker-table tbody tr.selected { outline: 1px solid rgba(88,166,255,.65); outline-offset: -1px; }
-  .worker-table tbody tr:hover { background: #18212c; }
+  .worker-table tbody tr:hover { background: #f8fafc; }
   .worker-table tbody tr.history-row:hover { background: rgba(139,148,158,.12); }
   .worker-table tbody tr[data-slot] { cursor: pointer; }
   .history-row-content {
@@ -1718,7 +2115,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .project table { width: 100%; border-collapse: collapse; margin-top: 8px; table-layout: fixed; }
   .project td {
     padding: 7px 0;
-    border-top: 1px solid rgba(41,49,61,.7);
+    border-top: 1px solid rgba(215,222,232,.8);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1820,7 +2217,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .project-why {
     padding: 12px 14px;
     border-bottom: 1px solid var(--line);
-    background: #0b1016;
+    background: var(--panel-2);
   }
   .why-item { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.4; }
   .why-item strong { color: var(--text); }
@@ -1879,17 +2276,46 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   <div class="stats" id="stats"></div>
 </header>
 <main>
-  <nav class="project-tabs" id="project-tabs" aria-label="Fleet projects"></nav>
-  <section class="project-overview" aria-live="polite">
+  <section class="project-rail" id="project-rail" aria-live="polite">
     <div class="section-head">
       <div>
-        <h2>Project Overview</h2>
-        <div class="sub">Per-project outcome, queue, and current supervisor state.</div>
+        <h2>Project Rail</h2>
+        <div class="sub">All configured projects in one scan-friendly view: state, queue, PRs, outcome, freshness, and links.</div>
       </div>
-      <div class="section-note" id="project-summary">Loading projects...</div>
+      <div class="section-note" id="project-rail-summary">{{FLEET_PROJECT_RAIL_SUMMARY}}</div>
+    </div>
+    <div class="project-rail-controls">
+      <label for="project-filter"><span>Project Search</span><input id="project-filter" type="search" placeholder="Filter by project, repo, state, queue, or outcome"></label>
+      <div class="project-rail-help">Search narrows the rail only; the rail remains the primary fleet overview.</div>
+    </div>
+    <div class="project-rail-scroll">
+      <table class="project-rail-table" aria-label="Configured project fleet rail">
+        <thead>
+          <tr>
+            <th class="project-rail-project">Project</th>
+            <th class="project-rail-state-cell">State</th>
+            <th class="project-rail-queue-cell">Queue</th>
+            <th class="project-rail-pr-cell">PR</th>
+            <th class="project-rail-outcome-cell">Outcome</th>
+            <th class="project-rail-freshness-cell">Last activity</th>
+            <th class="project-rail-links-cell">Links/actions</th>
+          </tr>
+        </thead>
+        <tbody id="project-rail-body">{{FLEET_PROJECT_RAIL_ROWS}}</tbody>
+      </table>
+    </div>
+  </section>
+  <details class="project-overview project-diagnostics" id="project-diagnostics">
+    <summary>Project diagnostics and raw state drilldown</summary>
+    <div class="section-head">
+      <div>
+        <h2>Project Diagnostics</h2>
+        <div class="sub">Expanded per-project cards retain raw queue, supervisor, approval, and read-only control diagnostics.</div>
+      </div>
+      <div class="section-note" id="project-summary">Loading project diagnostics...</div>
     </div>
     <div class="grid" id="projects"></div>
-  </section>
+  </details>
   <section class="approval-inbox" id="approval-inbox" aria-live="polite">
     <div class="section-head">
       <div>
@@ -1959,13 +2385,16 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     </div>
   </section>
 </main>
+<script type="application/json" id="fleet-initial-state">{{FLEET_INITIAL_STATE}}</script>
 <script>
 const projectsEl = document.getElementById("projects");
 const projectSummaryEl = document.getElementById("project-summary");
+const projectRailBodyEl = document.getElementById("project-rail-body");
+const projectRailSummaryEl = document.getElementById("project-rail-summary");
+const projectFilterEl = document.getElementById("project-filter");
 const statsEl = document.getElementById("stats");
 const subtitleEl = document.getElementById("subtitle");
 const fleetVerdictEl = document.getElementById("fleet-verdict");
-const tabsEl = document.getElementById("project-tabs");
 const approvalListEl = document.getElementById("approval-list");
 const approvalSummaryEl = document.getElementById("approval-summary");
 const attentionListEl = document.getElementById("attention-list");
@@ -1981,6 +2410,7 @@ const backendFilterEl = document.getElementById("backend-filter");
 const prFilterEl = document.getElementById("pr-filter");
 const workerSortEl = document.getElementById("worker-sort");
 const sortDirectionEl = document.getElementById("sort-direction");
+const initialStateEl = document.getElementById("fleet-initial-state");
 
 const defaultSortDirections = { status: "asc", project: "asc", issue: "asc", runtime: "desc", pr: "asc" };
 const validSortKeys = new Set(["status", "project", "issue", "runtime", "pr"]);
@@ -2002,6 +2432,7 @@ const statusOrder = new Map([
 
 const fleetState = {
   selectedProject: "all",
+  projectQuery: "",
   readOnly: true,
   selectedWorkerKey: "",
   filters: {
@@ -2352,6 +2783,7 @@ function renderFilterOptions() {
 }
 
 function syncFilterControls() {
+  projectFilterEl.value = fleetState.projectQuery;
   workerFilterEl.value = fleetState.filters.query;
   scopeFilterEl.value = fleetState.filters.scope;
   statusFilterEl.value = fleetState.filters.status;
@@ -2695,41 +3127,199 @@ function renderStats(summary) {
   ).join("");
 }
 
-function renderProjectTabs() {
+function ensureSelectedProject() {
   const projectNames = new Set((fleetState.projects || []).map(project => project.name));
   if (fleetState.selectedProject !== "all" && !projectNames.has(fleetState.selectedProject)) {
     fleetState.selectedProject = "all";
     updateQueryState();
   }
+}
 
-  const filtered = filteredWorkers(false);
-  const counts = new Map();
-  for (const worker of filtered) {
-    const name = worker.project_name || "";
-    counts.set(name, (counts.get(name) || 0) + 1);
+function projectStateKey(project) {
+  if (project.error) return "error";
+  if ((project.needs_attention || 0) > 0) return "attention";
+  if (project.freshness && project.freshness.stale) return "stale";
+  if ((project.running || 0) > 0) return "running";
+  if ((project.pr_open || 0) > 0) return "pr";
+  return "idle";
+}
+
+function projectStateLabel(project) {
+  switch (projectStateKey(project)) {
+  case "error": return "State error";
+  case "attention": return "Attention";
+  case "stale": return "Stale";
+  case "running": return "Running";
+  case "pr": return "PR review";
+  default: return "Idle";
+  }
+}
+
+function projectSearchText(project) {
+  const q = project.queue_snapshot || {};
+  const o = project.outcome || {};
+  return [
+    project.name,
+    project.repo,
+    project.config_path,
+    projectStateLabel(project),
+    project.error,
+    q.idle_reason,
+    q.top_skipped_reason,
+    q.policy_rule,
+    o.goal,
+    o.health_state,
+    o.next_action,
+    project.freshness && project.freshness.reason
+  ].map(normalizedSearchText).join(" ");
+}
+
+function projectMatchesSearch(project) {
+  const terms = normalizedSearchText(fleetState.projectQuery).split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const haystack = projectSearchText(project);
+  return terms.every(term => haystack.includes(term));
+}
+
+function visibleProjects() {
+  return (fleetState.projects || []).filter(projectMatchesSearch);
+}
+
+function projectRailSummaryText(projects, total) {
+  if (!total) return "No configured projects.";
+  const running = projects.reduce((sum, project) => sum + Number(project.running || 0), 0);
+  const attention = projects.reduce((sum, project) => sum + Number(project.needs_attention || 0), 0);
+  const filtered = projects.length === total ? "" : " shown from " + total;
+  return projects.length + " project" + (projects.length === 1 ? "" : "s") + filtered +
+    " · " + running + " running · " + attention + " attention";
+}
+
+function githubRepoURL(repo) {
+  const value = String(repo || "").trim();
+  if (!/^[^\s/]+\/[^\s/]+$/.test(value)) return "";
+  return "https://github.com/" + value;
+}
+
+function githubPullsURL(repo) {
+  const url = githubRepoURL(repo);
+  return url ? url + "/pulls?q=is%3Apr+is%3Aopen" : "";
+}
+
+function projectIdentityRailHTML(project) {
+  const name = project.name || "project";
+  const repo = project.repo || project.config_path || "";
+  return '<div class="rail-project-name" title="' + escapeText(name) + '">' + linkHTML(project.dashboard_url, name) + '</div>' +
+    '<div class="rail-project-repo" title="' + escapeText(repo) + '">' + escapeText(repo) + '</div>';
+}
+
+function projectStateRailHTML(project) {
+  const key = projectStateKey(project);
+  const parts = [
+    '<span class="pill rail-state-' + cssToken(key) + '">' + escapeText(projectStateLabel(project)) + '</span>',
+    '<div class="rail-subline">' + escapeText((project.running || 0) + '/' + (project.max_parallel || 0) + ' running') + '</div>'
+  ];
+  if ((project.needs_attention || 0) > 0) parts.push('<div class="rail-alert">' + escapeText(project.needs_attention) + ' need attention</div>');
+  if (project.error) parts.push('<div class="rail-alert" title="' + escapeText(project.error) + '">State error</div>');
+  if (project.freshness && project.freshness.stale) parts.push('<div class="rail-warn">Stale snapshot</div>');
+  return parts.join("");
+}
+
+function projectQueueRailHTML(project) {
+  const q = project.queue_snapshot;
+  if (!q) return '<span class="empty">No queue snapshot</span>';
+  const parts = [
+    'open=' + Number(q.open || 0),
+    'eligible=' + Number(q.eligible || 0),
+    'excluded=' + Number(q.excluded || 0),
+    'held/meta=' + Number(q.held || q.held_issues || 0),
+    'blocked-deps=' + Number(q.blocked_by_dependency || q.blocked_by_dependency_issues || 0)
+  ];
+  const lines = ['<div class="rail-mainline">' + escapeText(parts.join(' · ')) + '</div>'];
+  if (q.selected_candidate && q.selected_candidate.number) {
+    const selected = 'selected #' + q.selected_candidate.number + (q.selected_candidate.title ? ' ' + q.selected_candidate.title : '');
+    lines.push('<div class="rail-subline" title="' + escapeText(selected) + '">' + escapeText(selected) + '</div>');
+  }
+  const idleReason = (project.running || 0) === 0 ? String(q.idle_reason || "").trim() : "";
+  if (idleReason) lines.push('<div class="rail-warn" title="' + escapeText(idleReason) + '">' + escapeText(idleReason) + '</div>');
+  return lines.join("");
+}
+
+function projectPRRailHTML(project) {
+  const workers = (fleetState.workers || []).filter(worker => worker.project_name === project.name && worker.pr_number);
+  const seen = new Set();
+  const links = [];
+  for (const worker of workers) {
+    if (seen.has(worker.pr_number)) continue;
+    seen.add(worker.pr_number);
+    links.push(linkHTML(worker.pr_url || (project.repo ? 'https://github.com/' + project.repo + '/pull/' + worker.pr_number : ''), 'PR #' + worker.pr_number));
+    if (links.length >= 3) break;
+  }
+  if ((project.pr_open || 0) === 0 && links.length === 0) return '<span class="empty">No open PR</span>';
+  const fallback = !links.length && githubPullsURL(project.repo) ? [linkHTML(githubPullsURL(project.repo), 'Open PRs')] : [];
+  return '<div class="rail-mainline">' + escapeText(project.pr_open || 0) + ' open</div>' +
+    '<div class="rail-links">' + links.concat(fallback).join(' ') + '</div>';
+}
+
+function projectOutcomeRailHTML(project) {
+  const outcome = project.outcome || {};
+  const health = outcome.health_state || "unknown";
+  const goal = outcome.configured === true && outcome.goal ? outcome.goal : "No outcome brief configured";
+  const next = outcome.next_action || "";
+  return '<span class="pill outcome-' + cssToken(health) + '">' + escapeText(health.replace(/_/g, ' ')) + '</span>' +
+    '<div class="rail-subline" title="' + escapeText(goal) + '">' + escapeText(goal) + '</div>' +
+    (next ? '<div class="rail-note" title="' + escapeText(next) + '">' + escapeText(next) + '</div>' : '');
+}
+
+function projectFreshnessRailHTML(project) {
+  const freshness = project.freshness || {};
+  const age = freshness.snapshot_age ? "Snapshot " + freshness.snapshot_age + " ago" : "No snapshot yet";
+  const details = [];
+  if (freshness.state_updated_at) details.push("State " + formatTimestamp(freshness.state_updated_at));
+  if (freshness.log_updated_at) details.push("Logs " + formatTimestamp(freshness.log_updated_at));
+  if (freshness.reason) details.push(freshness.reason);
+  return '<div class="rail-mainline" title="' + escapeText(details.join(' · ')) + '">' + escapeText(age) + '</div>';
+}
+
+function projectLinksRailHTML(project) {
+  const links = [];
+  if (project.dashboard_url) links.push(linkHTML(project.dashboard_url, "Dashboard"));
+  if (githubRepoURL(project.repo)) links.push(linkHTML(githubRepoURL(project.repo), "GitHub"));
+  links.push('<button type="button" class="link-button project-workers-link" data-project="' + escapeText(project.name || "") + '">Workers</button>');
+  return '<div class="rail-links">' + links.join(' ') + '</div>';
+}
+
+function projectRailRowHTML(project) {
+  const key = projectStateKey(project);
+  return '<tr class="project-rail-row project-row-' + cssToken(key) + '" data-project="' + escapeText(project.name || "") + '">' +
+    '<td class="project-rail-project">' + projectIdentityRailHTML(project) + '</td>' +
+    '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
+    '<td class="project-rail-queue-cell">' + projectQueueRailHTML(project) + '</td>' +
+    '<td class="project-rail-pr-cell">' + projectPRRailHTML(project) + '</td>' +
+    '<td class="project-rail-outcome-cell">' + projectOutcomeRailHTML(project) + '</td>' +
+    '<td class="project-rail-freshness-cell">' + projectFreshnessRailHTML(project) + '</td>' +
+    '<td class="project-rail-links-cell">' + projectLinksRailHTML(project) + '</td>' +
+  '</tr>';
+}
+
+function renderProjectRail() {
+  ensureSelectedProject();
+  const total = (fleetState.projects || []).length;
+  const projects = visibleProjects();
+  projectRailSummaryEl.textContent = projectRailSummaryText(projects, total);
+  if (!projects.length) {
+    const empty = total ? "No configured projects match the project search." : "No configured projects are available in this fleet.";
+    projectRailBodyEl.innerHTML = '<tr class="project-rail-empty"><td colspan="7" class="empty">' + escapeText(empty) + '</td></tr>';
+    return;
   }
 
-  const tabs = [{ name: "all", label: "All projects", count: filtered.length }].concat(
-    (fleetState.projects || []).map(project => ({
-      name: project.name,
-      label: project.name,
-      count: counts.get(project.name) || 0
-    }))
-  );
-
-  tabsEl.innerHTML = tabs.map(tab => {
-    const active = tab.name === fleetState.selectedProject ? " active" : "";
-    return '<button type="button" class="project-tab' + active + '" data-project="' + escapeText(tab.name) + '">' +
-      escapeText(tab.label) + '<span class="count">' + escapeText(tab.count) + '</span></button>';
-  }).join("");
-
-  tabsEl.querySelectorAll("button[data-project]").forEach(button => {
-    button.addEventListener("click", () => {
+  projectRailBodyEl.innerHTML = projects.map(projectRailRowHTML).join("");
+  projectRailBodyEl.querySelectorAll(".project-workers-link[data-project]").forEach(button => {
+    button.addEventListener("click", event => {
+      event.preventDefault();
       fleetState.selectedProject = button.dataset.project || "all";
       updateQueryState();
-      renderProjectTabs();
-      renderProjectOverview();
       renderFleetWorkers();
+      document.querySelector(".fleet-workers")?.scrollIntoView({ block: "start", behavior: "smooth" });
     });
   });
 }
@@ -2806,12 +3396,12 @@ function historySummaryRowHTML(workers) {
 }
 
 function showHistoryScope(scope) {
-  fleetState.filters.scope = scope;
-  syncFilterControls();
-  updateQueryState();
-  renderProjectTabs();
-  renderProjectOverview();
-  renderFleetWorkers();
+	fleetState.filters.scope = scope;
+	syncFilterControls();
+	updateQueryState();
+	renderProjectRail();
+	renderProjectOverview();
+	renderFleetWorkers();
 }
 
 function scopeLabelText(scope) {
@@ -3158,23 +3748,28 @@ function renderProject(project) {
 }
 
 function renderProjectOverview() {
-  const projects = fleetState.selectedProject === "all"
-    ? fleetState.projects
-    : fleetState.projects.filter(project => project.name === fleetState.selectedProject);
+  const projects = visibleProjects();
+  const total = (fleetState.projects || []).length;
   const attention = projects.reduce((sum, project) => sum + Number(project.needs_attention || 0), 0);
   const running = projects.reduce((sum, project) => sum + Number(project.running || 0), 0);
-  projectSummaryEl.textContent = projects.length + " project" + (projects.length === 1 ? "" : "s") +
+  const filtered = projects.length === total ? "" : " shown from " + total;
+  projectSummaryEl.textContent = projects.length + " project" + (projects.length === 1 ? "" : "s") + filtered +
     " · " + running + " running · " + attention + " attention";
   projectsEl.innerHTML = projects.length
     ? projects.map(renderProject).join("")
-    : '<div class="empty">No project cards match the selected filter.</div>';
+    : '<div class="empty">No project diagnostics match the project search.</div>';
 }
 
 function refreshWorkersFromControls() {
   updateQueryState();
-  renderProjectTabs();
   renderFleetWorkers();
 }
+
+projectFilterEl.addEventListener("input", () => {
+  fleetState.projectQuery = projectFilterEl.value.trim();
+  renderProjectRail();
+  renderProjectOverview();
+});
 
 workerFilterEl.addEventListener("input", () => {
   fleetState.filters.query = workerFilterEl.value.trim();
@@ -3219,40 +3814,43 @@ sortDirectionEl.addEventListener("click", () => {
   renderFleetWorkers();
 });
 
+function applyFleetData(data) {
+  fleetState.readOnly = data.read_only !== false;
+  fleetState.refreshedAt = data.refreshed_at || "";
+  fleetState.projects = data.projects || [];
+  fleetState.workers = fleetWorkersFromData(data);
+  fleetState.approvals = approvalsFromData(data);
+  fleetState.attention = attentionFromData(data);
+  fleetState.verdict = data.verdict || null;
+  if (fleetState.selectedWorkerKey && !selectedWorker()) {
+    fleetState.selectedWorkerKey = "";
+    fleetState.detail = null;
+  }
+  const controlMode = fleetState.readOnly ? "read-only controls disabled" : "controls require approval configuration";
+  const summary = data.summary || {};
+  const alerts = [];
+  if (summary.stale) alerts.push(summary.stale + " stale");
+  if (summary.errors) alerts.push(summary.errors + " error" + (summary.errors === 1 ? "" : "s"));
+  subtitleEl.textContent = "Last refresh " + formatTimestamp(fleetState.refreshedAt) + " · " +
+    fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s") + " · " + controlMode +
+    (alerts.length ? " · " + alerts.join(" · ") : "");
+  renderFilterOptions();
+  syncFilterControls();
+  renderFleetVerdict(fleetState.verdict);
+  renderStats(summary);
+  renderProjectRail();
+  renderProjectOverview();
+  renderApprovalInbox();
+  renderAttentionInbox();
+  renderFleetWorkers();
+  renderWorkerDetail(fleetState.detail);
+}
+
 async function loadFleet() {
   try {
     const response = await fetch("/api/v1/fleet", { cache: "no-store" });
     if (!response.ok) throw new Error(await response.text());
-    const data = await response.json();
-    fleetState.readOnly = data.read_only !== false;
-    fleetState.refreshedAt = data.refreshed_at || "";
-    fleetState.projects = data.projects || [];
-    fleetState.workers = fleetWorkersFromData(data);
-    fleetState.approvals = approvalsFromData(data);
-    fleetState.attention = attentionFromData(data);
-    fleetState.verdict = data.verdict || null;
-    if (fleetState.selectedWorkerKey && !selectedWorker()) {
-      fleetState.selectedWorkerKey = "";
-      fleetState.detail = null;
-    }
-    const controlMode = fleetState.readOnly ? "read-only controls disabled" : "controls require approval configuration";
-    const summary = data.summary || {};
-    const alerts = [];
-    if (summary.stale) alerts.push(summary.stale + " stale");
-    if (summary.errors) alerts.push(summary.errors + " error" + (summary.errors === 1 ? "" : "s"));
-    subtitleEl.textContent = "Last refresh " + formatTimestamp(fleetState.refreshedAt) + " · " +
-      fleetState.projects.length + " configured project" + (fleetState.projects.length === 1 ? "" : "s") + " · " + controlMode +
-      (alerts.length ? " · " + alerts.join(" · ") : "");
-    renderFilterOptions();
-    syncFilterControls();
-    renderFleetVerdict(fleetState.verdict);
-    renderStats(summary);
-    renderProjectTabs();
-    renderProjectOverview();
-    renderApprovalInbox();
-    renderAttentionInbox();
-    renderFleetWorkers();
-    renderWorkerDetail(fleetState.detail);
+    applyFleetData(await response.json());
   } catch (err) {
     subtitleEl.textContent = "Fleet API error" + (fleetState.refreshedAt ? " · Last successful refresh " + formatTimestamp(fleetState.refreshedAt) : "");
     renderFleetVerdict({ tone: "daemon-down", sentence: "Fleet API error. Supervisor heartbeat unavailable; worker state and attention state could not be confirmed." });
@@ -3267,8 +3865,22 @@ async function loadFleet() {
   }
 }
 
-renderFilterOptions();
-syncFilterControls();
+function parseInitialFleetData() {
+  if (!initialStateEl || !initialStateEl.textContent.trim()) return null;
+  try {
+    return JSON.parse(initialStateEl.textContent);
+  } catch (_) {
+    return null;
+  }
+}
+
+const initialFleetData = parseInitialFleetData();
+if (initialFleetData) {
+  applyFleetData(initialFleetData);
+} else {
+  renderFilterOptions();
+  syncFilterControls();
+}
 loadFleet();
 setInterval(loadFleet, 3000);
 setInterval(loadWorkerDetail, 2000);
