@@ -1488,9 +1488,9 @@ func TestFleetDashboard(t *testing.T) {
 		"approval-list-compact",
 		"Audit history",
 		"approvalHistoryCountText",
-		"<details class=\"approval-history\"' + (historyWasOpen ? ' open' : '') + '>",
-		"const historyWasOpen = historyDetails ? historyDetails.open : false;",
-		"(historyWasOpen ? ' open' : '')",
+		"approval-audit-link",
+		"approval-history-link-card",
+		"Open full approval audit",
 		".approval-card.approval-stale { border-left-color: var(--line);",
 		".approval-card.approval-superseded { border-left-color: var(--line);",
 		".a-stale { color: var(--muted);",
@@ -1754,6 +1754,20 @@ func TestFleetDashboardServesFleetPath(t *testing.T) {
 	}
 	if !contains(w.Body.String(), "Projects") {
 		t.Fatal("/fleet should serve the fleet dashboard")
+	}
+}
+
+func TestFleetDashboardServesApprovalAuditPath(t *testing.T) {
+	srv := NewFleet(nil, "127.0.0.1", 8786, true)
+	req := httptest.NewRequest(http.MethodGet, "/approvals/audit", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetApprovalAudit(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if !contains(w.Body.String(), "Historical Approvals") || !contains(w.Body.String(), "Back to Fleet") {
+		t.Fatalf("approval audit should render dedicated audit page, got:\n%s", w.Body.String())
 	}
 }
 

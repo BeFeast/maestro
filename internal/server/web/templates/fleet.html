@@ -15,9 +15,9 @@
 <link rel="icon" href="/static/favicon-48.png" type="image/png" sizes="48x48">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon-180.png" sizes="180x180">
 <link rel="preload" href="/static/status-icons.svg" as="image" type="image/svg+xml">
-<link rel="stylesheet" href="/static/tokens.css?v=20260502-6">
-<link rel="stylesheet" href="/static/components.css?v=20260502-6">
-<link rel="stylesheet" href="/static/fleet.css?v=20260502-6">
+<link rel="stylesheet" href="/static/tokens.css?v=20260502-7">
+<link rel="stylesheet" href="/static/components.css?v=20260502-7">
+<link rel="stylesheet" href="/static/fleet.css?v=20260502-7">
 
 </head>
 <body data-page="fleet">
@@ -89,9 +89,12 @@
     <div class="section-head">
       <div>
         <h2>Approval Inbox</h2>
-        <div class="sub">Read-only lifecycle view of supervisor approvals across projects.</div>
+        <div class="sub">Pending supervisor approvals that need review now. Historical approvals live in audit history.</div>
       </div>
-      <div class="section-note" id="approval-summary">Loading approvals...</div>
+      <div class="section-note-group">
+        <a class="scope-reset-button" id="approval-audit-link" href="/approvals/audit" hidden>Open audit history</a>
+        <div class="section-note" id="approval-summary">Loading approvals...</div>
+      </div>
     </div>
     <div class="approval-list" id="approval-list"></div>
   </section>
@@ -162,7 +165,7 @@
   </section>
 </main>
 <script type="application/json" id="fleet-initial-state">{{FLEET_INITIAL_STATE}}</script>
-<script src="/static/fleet.js?v=20260502-6"></script>
+<script src="/static/fleet.js?v=20260502-7"></script>
 
 </body>
 </html>

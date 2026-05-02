@@ -155,6 +155,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
 	mux.HandleFunc("/api/v1/fleet/actions", s.handleFleetAction)
+	mux.HandleFunc("/approvals/audit", s.handleFleetApprovalAudit)
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleFleetDashboard)
 
@@ -1711,6 +1712,7 @@ func (s *FleetServer) handleFleetDashboard(w http.ResponseWriter, r *http.Reques
 }
 
 var fleetDashboardHTML = web.MustReadTemplate("fleet.html")
+var fleetApprovalAuditHTML = web.MustReadTemplate("approvals-audit.html")
 
 func renderFleetDashboardHTML(snapshot fleetResponse) (string, error) {
 	data, err := json.Marshal(snapshot)
@@ -1723,6 +1725,174 @@ func renderFleetDashboardHTML(snapshot fleetResponse) (string, error) {
 		"{{FLEET_INITIAL_STATE}}", string(data),
 	).Replace(fleetDashboardHTML)
 	return body, nil
+}
+
+func (s *FleetServer) handleFleetApprovalAudit(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/approvals/audit" {
+		http.NotFound(w, r)
+		return
+	}
+	body, err := renderFleetApprovalAuditHTML(s.snapshot())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, body)
+}
+
+func renderFleetApprovalAuditHTML(snapshot fleetResponse) (string, error) {
+	historical := historicalFleetApprovals(snapshot.Approvals)
+	body := strings.NewReplacer(
+		"{{APPROVAL_AUDIT_SUBTITLE}}", html.EscapeString(approvalAuditSubtitle(snapshot)),
+		"{{APPROVAL_AUDIT_SUMMARY}}", html.EscapeString(approvalAuditSummary(historical)),
+		"{{APPROVAL_AUDIT_ROWS}}", renderFleetApprovalAuditRows(historical),
+	).Replace(fleetApprovalAuditHTML)
+	return body, nil
+}
+
+func historicalFleetApprovals(items []fleetApprovalState) []fleetApprovalState {
+	out := make([]fleetApprovalState, 0, len(items))
+	for _, item := range items {
+		if state.ApprovalStatus(item.Status) != state.ApprovalStatusPending {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func approvalAuditSubtitle(snapshot fleetResponse) string {
+	return fmt.Sprintf("%d configured projects · %d active pending approvals", snapshot.Summary.Projects, snapshot.Summary.ApprovalsPending)
+}
+
+func approvalAuditSummary(items []fleetApprovalState) string {
+	if len(items) == 0 {
+		return "No historical approvals recorded."
+	}
+	counts := make(map[string]int)
+	for _, item := range items {
+		counts[item.Status]++
+	}
+	return approvalHistoryCountTextForAudit(counts, len(items))
+}
+
+func approvalHistoryCountTextForAudit(counts map[string]int, historicalCount int) string {
+	known := counts[string(state.ApprovalStatusSuperseded)] + counts[string(state.ApprovalStatusStale)] + counts[string(state.ApprovalStatusApproved)] + counts[string(state.ApprovalStatusRejected)]
+	parts := make([]string, 0, 5)
+	appendPart := func(count int, label string) {
+		if count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", count, label))
+		}
+	}
+	appendPart(counts[string(state.ApprovalStatusSuperseded)], "superseded")
+	appendPart(counts[string(state.ApprovalStatusStale)], "stale")
+	appendPart(counts[string(state.ApprovalStatusApproved)], "approved")
+	appendPart(counts[string(state.ApprovalStatusRejected)], "rejected")
+	if other := historicalCount - known; other > 0 {
+		appendPart(other, "other")
+	}
+	if len(parts) == 0 {
+		return "No historical approvals"
+	}
+	return strings.Join(parts, " · ")
+}
+
+func renderFleetApprovalAuditRows(items []fleetApprovalState) string {
+	if len(items) == 0 {
+		return `<div class="empty approval-empty approval-audit-empty">No historical approvals have been recorded yet.</div>`
+	}
+	var b strings.Builder
+	for _, item := range items {
+		b.WriteString(renderFleetApprovalCard(item, true))
+	}
+	return b.String()
+}
+
+func renderFleetApprovalCard(approval fleetApprovalState, muted bool) string {
+	project := html.EscapeString(firstNonEmpty(approval.ProjectName, "-"))
+	id := html.EscapeString(firstNonEmpty(approval.ID, "-"))
+	action := html.EscapeString(actionLabelServer(firstNonEmpty(approval.Action, "-")))
+	createdAge := html.EscapeString(firstNonEmpty(approval.CreatedAge, "-"))
+	updatedAge := html.EscapeString(firstNonEmpty(approval.UpdatedAge, "-"))
+	summary := html.EscapeString(firstNonEmpty(approval.Summary, "No summary recorded."))
+	sessionStatus := ""
+	if strings.TrimSpace(approval.SessionStatus) != "" {
+		sessionStatus = `<span>Status ` + html.EscapeString(approval.SessionStatus) + `</span>`
+	}
+	classes := []string{"approval-card", "approval-" + cssTokenServer(approval.Status)}
+	if muted {
+		classes = append(classes, "approval-card-muted")
+	}
+	return `<article class="` + strings.Join(classes, " ") + `" title="` + summary + `">` +
+		`<div class="approval-project"><strong title="` + project + `">` + linkHTMLServer(approval.DashboardURL, project) + `</strong>` +
+		`<div class="approval-meta"><span title="` + id + `">` + id + `</span></div></div>` +
+		`<div class="approval-action"><strong title="` + action + `">` + action + `</strong>` +
+		`<div class="approval-meta"><span class="` + approvalStatusClassServer(approval.Status) + `">` + html.EscapeString(firstNonEmpty(approval.Status, "unknown")) + `</span></div></div>` +
+		`<div class="approval-target">` + renderFleetApprovalTargetHTML(approval) + sessionStatus + `</div>` +
+		`<div class="approval-main"><div class="approval-age"><span>Created ` + createdAge + ` ago</span><span>Updated ` + updatedAge + ` ago</span></div>` +
+		`<div class="approval-risk"><span>Risk ` + html.EscapeString(firstNonEmpty(approval.Risk, "-")) + `</span></div>` +
+		`<div class="approval-summary">` + summary + `</div></div>` +
+		`</article>`
+}
+
+func renderFleetApprovalTargetHTML(approval fleetApprovalState) string {
+	parts := make([]string, 0, 3)
+	if approval.IssueNumber > 0 {
+		parts = append(parts, linkHTMLServer(approval.IssueURL, fmt.Sprintf("Issue #%d", approval.IssueNumber)))
+	}
+	if approval.PRNumber > 0 {
+		parts = append(parts, linkHTMLServer(approval.PRURL, fmt.Sprintf("PR #%d", approval.PRNumber)))
+	}
+	if strings.TrimSpace(approval.Session) != "" {
+		parts = append(parts, `<span>Session `+html.EscapeString(approval.Session)+`</span>`)
+	}
+	if len(parts) == 0 {
+		return `<span class="empty">No target</span>`
+	}
+	return strings.Join(parts, " ")
+}
+
+func approvalStatusClassServer(status string) string {
+	return "pill a-" + cssTokenServer(status)
+}
+
+func actionLabelServer(action string) string {
+	return strings.ReplaceAll(strings.TrimSpace(firstNonEmpty(action, "-")), "_", " ")
+}
+
+func cssTokenServer(value string) string {
+	value = strings.ToLower(strings.TrimSpace(firstNonEmpty(value, "unknown")))
+	if value == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range value {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_':
+			b.WriteRune(r)
+			lastUnderscore = false
+		default:
+			if !lastUnderscore {
+				b.WriteByte('_')
+				lastUnderscore = true
+			}
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "unknown"
+	}
+	return out
+}
+
+func linkHTMLServer(url, label string) string {
+	text := html.EscapeString(firstNonEmpty(label, "-"))
+	href := strings.TrimSpace(url)
+	if href == "" {
+		return text
+	}
+	return `<a href="` + html.EscapeString(href) + `" target="_blank" rel="noreferrer">` + text + `</a>`
 }
 
 func fleetProjectRailSummary(projects []fleetProjectState) string {

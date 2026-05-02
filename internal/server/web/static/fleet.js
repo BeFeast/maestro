@@ -12,6 +12,7 @@ const subtitleEl = document.getElementById("subtitle");
 const fleetVerdictEl = document.getElementById("fleet-verdict");
 const approvalListEl = document.getElementById("approval-list");
 const approvalSummaryEl = document.getElementById("approval-summary");
+const approvalAuditLinkEl = document.getElementById("approval-audit-link");
 const attentionListEl = document.getElementById("attention-list");
 const attentionSummaryEl = document.getElementById("attention-summary");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
@@ -240,7 +241,7 @@ function approvalInboxSummaryText(activeCount, historicalCount) {
     ? "No active approvals need review."
     : pluralize(activeCount, "active pending approval") + " " + (activeCount === 1 ? "needs" : "need") + " review.";
   if (!historicalCount) return active + " No historical approvals are recorded.";
-  return active + " " + pluralize(historicalCount, "historical approval") + " " + (historicalCount === 1 ? "is" : "are") + " collapsed below.";
+  return active + " " + pluralize(historicalCount, "historical approval") + " moved to audit history.";
 }
 
 function approvalHistoryCountText(counts, historicalCount) {
@@ -304,17 +305,17 @@ function renderApprovalInbox() {
   }, {});
   const pending = approvals.filter(isPendingApproval);
   const historical = approvals.filter(approval => !isPendingApproval(approval));
-  const historyDetails = approvalListEl.querySelector(".approval-history");
-  const historyWasOpen = historyDetails ? historyDetails.open : false;
   approvalListEl.classList.toggle("approval-list-compact", pending.length === 0);
   approvalSummaryEl.textContent = approvalInboxSummaryText(pending.length, historical.length);
+  if (approvalAuditLinkEl) {
+    approvalAuditLinkEl.hidden = historical.length === 0;
+  }
 
   const activeHTML = pending.length
     ? '<div class="approval-active-list">' + pending.map(approvalCardHTML).join("") + '</div>'
     : '<div class="empty approval-empty approval-active-empty">No pending approvals need review.</div>';
   const historyHTML = historical.length
-    ? '<details class="approval-history"' + (historyWasOpen ? ' open' : '') + '><summary><strong>Audit history</strong><span>' + escapeText(approvalHistoryCountText(counts, historical.length)) + '</span></summary>' +
-      '<div class="approval-history-list">' + historical.map(approvalCardHTML).join("") + '</div></details>'
+    ? '<div class="approval-history-link-card"><strong>Audit history</strong><span>' + escapeText(approvalHistoryCountText(counts, historical.length)) + '</span><a href="/approvals/audit">Open full approval audit</a></div>'
     : '';
   approvalListEl.innerHTML = activeHTML + historyHTML;
 

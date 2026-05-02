@@ -412,6 +412,29 @@
   }
   .approval-list.approval-list-compact { gap: 8px; padding: 8px 14px 10px; }
   .approval-active-list, .approval-history-list { display: grid; gap: 8px; }
+  .approval-history-link-card {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 14px;
+    padding: 10px 12px;
+    border: 1px solid rgba(215,222,232,.9);
+    border-radius: 10px;
+    background: rgba(248,250,252,.85);
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .approval-history-link-card strong {
+    color: var(--text);
+    font-weight: 650;
+  }
+  .approval-history-link-card a {
+    color: var(--accent);
+    font-weight: 650;
+    text-decoration: none;
+  }
+  .approval-history-link-card a:hover { text-decoration: underline; }
   .approval-history {
     border: 1px solid rgba(215,222,232,.85);
     background: rgba(248,250,252,.92);
@@ -449,6 +472,7 @@
   .approval-card.approval-superseded { border-left-color: var(--line); background: rgba(139,148,158,.06); }
   .approval-card.approval-approved { border-left-color: var(--ok); background: rgba(63,185,80,.06); }
   .approval-card.approval-rejected { border-left-color: var(--line); background: rgba(139,148,158,.05); }
+  .approval-card.approval-card-muted { background: rgba(255,255,255,.78); }
   .approval-project,
   .approval-action,
   .approval-target,
@@ -472,6 +496,8 @@
   }
   .approval-target { display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; font-size: 12px; }
   .approval-summary { margin-top: 5px; color: var(--text); line-height: 1.35; }
+  .approval-audit-page { margin-top: 0; }
+  .approval-audit-list { padding-top: 14px; }
   .link-button {
     border: 0;
     background: transparent;
@@ -672,6 +698,14 @@
   }
   .section-head h2 { margin: 0; font-size: 17px; }
   .section-note { color: var(--muted); font-size: 13px; text-align: right; }
+  .section-note-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    max-width: min(560px, 100%);
+  }
   .worker-scope-status {
     display: flex;
     flex-wrap: wrap;
