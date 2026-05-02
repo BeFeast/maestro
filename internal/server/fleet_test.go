@@ -665,6 +665,73 @@ func TestFleetOperatorBriefNamesSingleHighestPriorityAction(t *testing.T) {
 	}
 }
 
+func TestFleetOperatorBriefPrioritizesPendingApproval(t *testing.T) {
+	now := time.Now().UTC()
+	brief := buildFleetOperatorBrief([]fleetProjectState{{
+		Name: "BlockedQueue",
+		OperatorState: fleetOperatorState{
+			Kind:        "no_eligible_issues",
+			Tone:        "attention",
+			Label:       "No eligible issues",
+			Summary:     "No issue is eligible under policy.",
+			NextAction:  "Adjust labels or policy so a worker can run.",
+			IssueNumber: 15,
+		},
+	}}, []fleetApprovalState{{
+		ProjectName: "ApprovalProject",
+		Status:      string(state.ApprovalStatusPending),
+		Summary:     "Supervisor approval is waiting for operator review.",
+		PRNumber:    44,
+		Session:     "approval-44",
+		createdAt:   now.Add(-time.Minute),
+		updatedAt:   now,
+	}}, now)
+
+	if !brief.ActionRequired || brief.Kind != "approval_pending" || brief.Project != "ApprovalProject" {
+		t.Fatalf("operator brief = %+v, want pending approval action for ApprovalProject", brief)
+	}
+	if brief.PRNumber != 44 || brief.Session != "approval-44" {
+		t.Fatalf("operator brief target = %+v, want PR #44 and approval-44 session", brief)
+	}
+	if !contains(brief.NextAction, "Approve or reject") {
+		t.Fatalf("operator brief next action = %q, want approval guidance", brief.NextAction)
+	}
+	if contains(brief.Sentence, "Next:") {
+		t.Fatalf("operator brief sentence = %q, should leave next action for structured rendering", brief.Sentence)
+	}
+}
+
+func TestHighestPriorityPendingFleetApprovalSelectsNewestPending(t *testing.T) {
+	now := time.Now().UTC()
+	selected := highestPriorityPendingFleetApproval([]fleetApprovalState{
+		{
+			ProjectName: "OldApproval",
+			ID:          "old",
+			Status:      string(state.ApprovalStatusPending),
+			createdAt:   now.Add(-2 * time.Hour),
+			updatedAt:   now.Add(-2 * time.Hour),
+		},
+		{
+			ProjectName: "ApprovedApproval",
+			ID:          "approved",
+			Status:      string(state.ApprovalStatusApproved),
+			createdAt:   now,
+			updatedAt:   now,
+		},
+		{
+			ProjectName: "NewApproval",
+			ID:          "new",
+			Status:      string(state.ApprovalStatusPending),
+			createdAt:   now.Add(-time.Hour),
+			updatedAt:   now.Add(-5 * time.Minute),
+		},
+	})
+
+	if selected == nil || selected.ProjectName != "NewApproval" {
+		t.Fatalf("selected approval = %+v, want newest pending approval", selected)
+	}
+}
+
 func TestFleetProjectOperatorStateDistinguishesBriefStates(t *testing.T) {
 	now := time.Now().UTC()
 	configuredOutcome := outcome.Status{Configured: true, Goal: "Runtime is healthy", HealthState: outcome.HealthHealthy}

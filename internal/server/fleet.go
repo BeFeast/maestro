@@ -782,6 +782,23 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 		return fleetOperatorBrief{Tone: "muted", Sentence: "Global brief: no projects are configured in this fleet."}
 	}
 
+	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
+		return fleetOperatorBrief{
+			Tone:           "attention",
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval pending", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Project:        approval.ProjectName,
+			Kind:           "approval_pending",
+			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			NextAction:     "Approve or reject the pending supervisor approval after checking the target state.",
+			ActionRequired: true,
+			IssueNumber:    approval.IssueNumber,
+			IssueURL:       approval.IssueURL,
+			PRNumber:       approval.PRNumber,
+			PRURL:          approval.PRURL,
+			Session:        approval.Session,
+		}
+	}
+
 	var action *fleetProjectState
 	for i := range projects {
 		project := &projects[i]
@@ -807,24 +824,8 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 			PRURL:          state.PRURL,
 			Session:        state.Session,
 		}
-		brief.Sentence = fleetActionRequiredSentence(action.Name, state.Label, state.Summary, state.NextAction, state.IssueNumber, state.PRNumber, state.Session)
+		brief.Sentence = fleetActionRequiredSentence(action.Name, state.Label, state.Summary, state.IssueNumber, state.PRNumber, state.Session)
 		return brief
-	}
-	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
-		return fleetOperatorBrief{
-			Tone:           "attention",
-			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval pending", approval.Summary, "Approve or reject the pending supervisor approval after checking the target state.", approval.IssueNumber, approval.PRNumber, approval.Session),
-			Project:        approval.ProjectName,
-			Kind:           "approval_pending",
-			Reason:         truncateFleetOperatorText(approval.Summary, 150),
-			NextAction:     "Approve or reject the pending supervisor approval after checking the target state.",
-			ActionRequired: true,
-			IssueNumber:    approval.IssueNumber,
-			IssueURL:       approval.IssueURL,
-			PRNumber:       approval.PRNumber,
-			PRURL:          approval.PRURL,
-			Session:        approval.Session,
-		}
 	}
 
 	working, monitoring, pending, attention := 0, 0, 0, 0
@@ -866,7 +867,13 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending {
 			continue
 		}
-		if selected == nil || fleetApprovalStatusRank(approval.Status) < fleetApprovalStatusRank(selected.Status) || approval.createdAt.Before(selected.createdAt) {
+		if selected == nil {
+			selected = approval
+			continue
+		}
+		approvalRank := fleetApprovalStatusRank(approval.Status)
+		selectedRank := fleetApprovalStatusRank(selected.Status)
+		if approvalRank < selectedRank || (approvalRank == selectedRank && fleetApprovalRecency(*approval).After(fleetApprovalRecency(*selected))) {
 			selected = approval
 		}
 	}
@@ -895,7 +902,7 @@ func fleetActionTone(tone string) string {
 	}
 }
 
-func fleetActionRequiredSentence(project, label, reason, next string, issueNumber, prNumber int, session string) string {
+func fleetActionRequiredSentence(project, label, reason string, issueNumber, prNumber int, session string) string {
 	project = firstNonEmpty(project, "project")
 	label = firstNonEmpty(label, "Operator action")
 	reason = firstNonEmpty(reason, "Maestro needs an operator decision.")
@@ -904,9 +911,6 @@ func fleetActionRequiredSentence(project, label, reason, next string, issueNumbe
 		sentence += " on " + target
 	}
 	sentence += fmt.Sprintf(": %s. Reason: %s", label, reason)
-	if next = strings.TrimSpace(next); next != "" {
-		sentence += " Next: " + next
-	}
 	return sentence
 }
 
@@ -1870,14 +1874,8 @@ func sortFleetApprovals(items []fleetApprovalState) {
 		if li != ri {
 			return li < ri
 		}
-		lt := left.updatedAt
-		if lt.IsZero() {
-			lt = left.createdAt
-		}
-		rt := right.updatedAt
-		if rt.IsZero() {
-			rt = right.createdAt
-		}
+		lt := fleetApprovalRecency(left)
+		rt := fleetApprovalRecency(right)
 		if !lt.Equal(rt) {
 			return lt.After(rt)
 		}
@@ -1886,6 +1884,13 @@ func sortFleetApprovals(items []fleetApprovalState) {
 		}
 		return left.ID < right.ID
 	})
+}
+
+func fleetApprovalRecency(approval fleetApprovalState) time.Time {
+	if !approval.updatedAt.IsZero() {
+		return approval.updatedAt
+	}
+	return approval.createdAt
 }
 
 func fleetApprovalStatusRank(status string) int {
