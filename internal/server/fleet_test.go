@@ -1286,7 +1286,14 @@ func TestFleetDashboard(t *testing.T) {
 		"Maestro Fleet",
 		"/api/v1/fleet",
 		"/api/v1/fleet/worker",
-		"project-tabs",
+		"color-scheme: light",
+		"fleet-initial-state",
+		"project-rail",
+		"project-rail-body",
+		"project-filter",
+		"Project Rail",
+		"Last activity",
+		"Links/actions",
 		"fleet-verdict",
 		"renderFleetVerdict",
 		"verdict-healthy",
@@ -1327,6 +1334,9 @@ func TestFleetDashboard(t *testing.T) {
 		"attentionFromData",
 		"if (!Array.isArray(data.attention) && Array.isArray(data.workers))",
 		"No projects need attention right now",
+		"renderProjectRail",
+		"projectRailRowHTML",
+		"projectSearchText",
 		"renderWorkerDetail",
 		"renderProject",
 		"issueSummaryHTML",
@@ -1366,6 +1376,11 @@ func TestFleetDashboard(t *testing.T) {
 			t.Fatalf("dashboard should contain %q", want)
 		}
 	}
+	for _, unwanted := range []string{`id="project-tabs"`, `class="project-tabs"`, "renderProjectTabs"} {
+		if contains(body, unwanted) {
+			t.Fatalf("dashboard should not render project tab navigation %q", unwanted)
+		}
+	}
 	for _, oldAlarm := range []string{
 		".approval-card.approval-stale { border-left-color: var(--bad);",
 		".a-stale { color: var(--bad);",
@@ -1390,6 +1405,139 @@ func TestFleetDashboardRendersHistoryCollapseControls(t *testing.T) {
 		if !contains(body, want) {
 			t.Fatalf("dashboard history collapse renderer should contain %q", want)
 		}
+	}
+}
+
+func TestFleetDashboardCanClearProjectWorkerScope(t *testing.T) {
+	body := fleetDashboardBody(t)
+	for _, want := range []string{
+		`id="worker-project-reset"`,
+		"Show all projects",
+		"workerProjectResetEl.hidden = !projectScoped",
+		`workerProjectResetEl.addEventListener("click", clearWorkerProjectScope)`,
+	} {
+		if !contains(body, want) {
+			t.Fatalf("dashboard worker scope reset should contain %q", want)
+		}
+	}
+
+	clearScope := dashboardSnippet(t, body, "function clearWorkerProjectScope()", "projectFilterEl.addEventListener")
+	for _, want := range []string{
+		`fleetState.selectedProject = "all";`,
+		"updateQueryState();",
+		"renderFleetWorkers();",
+	} {
+		if !contains(clearScope, want) {
+			t.Fatalf("clear project scope handler should contain %q in:\n%s", want, clearScope)
+		}
+	}
+}
+
+func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		projects int
+	}{
+		{name: "zero", projects: 0},
+		{name: "one", projects: 1},
+		{name: "three", projects: 3},
+		{name: "twelve", projects: 12},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fleetDashboardBodyWithProjects(t, fleetDashboardFixtureProjects(t, tc.projects))
+			rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
+
+			for _, want := range []string{"Project", "State", "Queue", "PR", "Outcome", "Last activity", "Links/actions"} {
+				if !contains(body, want) {
+					t.Fatalf("dashboard rail should contain column %q", want)
+				}
+			}
+			if !contains(body, `id="fleet-initial-state"`) {
+				t.Fatal("dashboard should embed the initial fleet snapshot for client hydration")
+			}
+
+			rows := strings.Count(rail, `class="project-rail-row`)
+			if rows != tc.projects {
+				t.Fatalf("server-rendered project rail rows = %d, want %d in:\n%s", rows, tc.projects, rail)
+			}
+			if tc.projects == 0 {
+				if !contains(rail, "project-rail-empty") || !contains(rail, "No configured projects") {
+					t.Fatalf("empty rail should render an explicit empty state, got:\n%s", rail)
+				}
+				return
+			}
+
+			for i := 1; i <= tc.projects; i++ {
+				name := "Project " + strconv.Itoa(i)
+				if !contains(rail, name) {
+					t.Fatalf("rail should include %q in:\n%s", name, rail)
+				}
+			}
+			for _, want := range []string{"open=", "eligible=", "Project 1 outcome", "Dashboard", "GitHub", "Workers"} {
+				if !contains(rail, want) {
+					t.Fatalf("rail should communicate %q in:\n%s", want, rail)
+				}
+			}
+			if tc.projects >= 10 && !contains(body, "project-rail-scroll") {
+				t.Fatal("10+ project fixture should render inside the scrollable rail container")
+			}
+		})
+	}
+}
+
+func TestFleetDashboardProjectRailPlaceholdersAreNotReplacedFromProjectData(t *testing.T) {
+	snapshot := fleetResponse{
+		Projects: []fleetProjectState{{
+			Name:         "{{FLEET_INITIAL_STATE}}",
+			Repo:         "{{FLEET_PROJECT_RAIL_SUMMARY}}",
+			ConfigPath:   "{{FLEET_PROJECT_RAIL_ROWS}}",
+			DashboardURL: "http://127.0.0.1:8787",
+			MaxParallel:  1,
+			Outcome: outcome.Status{
+				Configured:  true,
+				Goal:        "{{FLEET_PROJECT_RAIL_SUMMARY}}",
+				HealthState: outcome.HealthUnknown,
+			},
+			QueueSnapshot: &fleetQueueSnapshot{Open: 1, Eligible: 1},
+			Freshness:     fleetProjectFreshness{SnapshotAge: "1m0s"},
+		}},
+	}
+	body, err := renderFleetDashboardHTML(snapshot)
+	if err != nil {
+		t.Fatalf("render dashboard: %v", err)
+	}
+
+	summary := dashboardSnippet(t, body, `<div class="section-note" id="project-rail-summary">`, `</div>`)
+	if !contains(summary, "1 project · 0 running · 0 attention") {
+		t.Fatalf("summary placeholder was not replaced correctly, got:\n%s", summary)
+	}
+	rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
+	if !contains(rail, "{{FLEET_INITIAL_STATE}}") || !contains(rail, "{{FLEET_PROJECT_RAIL_SUMMARY}}") {
+		t.Fatalf("rail should preserve placeholder-like project text as data, got:\n%s", rail)
+	}
+
+	startMarker := `<script type="application/json" id="fleet-initial-state">`
+	script := dashboardSnippet(t, body, startMarker, `</script>`)
+	var decoded fleetResponse
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(script, startMarker)), &decoded); err != nil {
+		t.Fatalf("initial state should remain valid JSON: %v\n%s", err, script)
+	}
+	if len(decoded.Projects) != 1 || decoded.Projects[0].Name != "{{FLEET_INITIAL_STATE}}" {
+		t.Fatalf("initial state project data changed: %+v", decoded.Projects)
+	}
+}
+
+func TestFleetDashboardServesFleetPath(t *testing.T) {
+	srv := NewFleet(nil, "127.0.0.1", 8786, true)
+	req := httptest.NewRequest(http.MethodGet, "/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetDashboard(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if !contains(w.Body.String(), "Project Rail") {
+		t.Fatal("/fleet should serve the fleet dashboard")
 	}
 }
 
@@ -1427,7 +1575,12 @@ func TestFleetDashboardWritableProjectControlsKeepApprovalDiagnostics(t *testing
 
 func fleetDashboardBody(t *testing.T) string {
 	t.Helper()
-	srv := NewFleet(nil, "127.0.0.1", 8786, true)
+	return fleetDashboardBodyWithProjects(t, nil)
+}
+
+func fleetDashboardBodyWithProjects(t *testing.T, projects []FleetProject) string {
+	t.Helper()
+	srv := NewFleet(projects, "127.0.0.1", 8786, true)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 	srv.handleFleetDashboard(w, req)
@@ -1435,6 +1588,70 @@ func fleetDashboardBody(t *testing.T) string {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
 	return w.Body.String()
+}
+
+func fleetDashboardFixtureProjects(t *testing.T, count int) []FleetProject {
+	t.Helper()
+	if count == 0 {
+		return nil
+	}
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	projects := make([]FleetProject, 0, count)
+	for i := 1; i <= count; i++ {
+		idx := strconv.Itoa(i)
+		name := "Project " + idx
+		stateDir := filepath.Join(dir, "project-"+idx)
+		status := state.StatusDone
+		prNumber := 0
+		if i%2 == 0 {
+			status = state.StatusPROpen
+			prNumber = 100 + i
+		}
+		if i%3 == 0 {
+			status = state.StatusRunning
+		}
+		sessions := map[string]*state.Session{
+			"slot-" + idx: {
+				IssueNumber: i,
+				IssueTitle:  "Issue " + idx,
+				Status:      status,
+				StartedAt:   now.Add(-time.Duration(i) * time.Minute),
+				PRNumber:    prNumber,
+			},
+		}
+		decisions := []state.SupervisorDecision{{
+			ID:                "decision-" + idx,
+			CreatedAt:         now.Add(-time.Duration(i) * time.Minute),
+			Summary:           "Queue snapshot for " + name,
+			RecommendedAction: "none",
+			Risk:              "low",
+			QueueAnalysis: &state.SupervisorQueueAnalysis{
+				OpenIssues:                    i + 2,
+				EligibleCandidates:            1,
+				ExcludedIssues:                i % 3,
+				HeldIssues:                    i % 2,
+				BlockedByDependencyIssues:     i % 4,
+				NonRunnableProjectStatusCount: i % 2,
+				SelectedCandidate: &state.SupervisorIssueCandidate{
+					Number: i,
+					Title:  "Issue " + idx,
+				},
+			},
+		}}
+		saveFleetTestSnapshot(t, stateDir, sessions, decisions)
+		projects = append(projects, NewFleetProject(name, "/tmp/project-"+idx+".yaml", "http://127.0.0.1:878"+idx, &config.Config{
+			Repo:        "owner/project-" + idx,
+			StateDir:    stateDir,
+			MaxParallel: 2,
+			Outcome: outcome.Brief{
+				DesiredOutcome: name + " outcome",
+				RuntimeTarget:  "https://project-" + idx + ".example.com",
+			},
+			Server: config.ServerConfig{ReadOnly: true},
+		}))
+	}
+	return projects
 }
 
 func dashboardSnippet(t *testing.T, body, startMarker, endMarker string) string {
