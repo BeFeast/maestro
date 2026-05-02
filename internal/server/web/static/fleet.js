@@ -13,6 +13,9 @@ const attentionSummaryEl = document.getElementById("attention-summary");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
 const workerSummaryEl = document.getElementById("worker-summary");
 const workerProjectResetEl = document.getElementById("worker-project-reset");
+const workerDetailEl = document.getElementById("worker-detail");
+const workerDetailCloseEl = document.getElementById("worker-detail-close");
+const workerDetailBackdropEl = document.getElementById("worker-detail-backdrop");
 const workerDetailSummaryEl = document.getElementById("worker-detail-summary");
 const workerDetailBodyEl = document.getElementById("worker-detail-body");
 const workerFilterEl = document.getElementById("worker-filter");
@@ -46,6 +49,7 @@ const fleetState = {
   selectedProject: "all",
   projectQuery: "",
   readOnly: true,
+  requestedWorker: "",
   selectedWorkerKey: "",
   filters: {
     query: "",
@@ -319,6 +323,36 @@ function workerKey(worker) {
   return (worker.project_name || "") + "\u001f" + (worker.slot || "");
 }
 
+function workerQueryValue(worker) {
+  if (!worker) return "";
+  return (worker.project_name || "") + "/" + (worker.slot || "");
+}
+
+function selectedWorkerQueryValue() {
+  const worker = selectedWorker();
+  return worker ? workerQueryValue(worker) : "";
+}
+
+function resolveWorkerQuery(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const parts = raw.includes("\u001f") ? raw.split("\u001f") : raw.split("/");
+  if (parts.length >= 2) {
+    const projectName = parts.shift();
+    const slot = parts.join("/");
+    const byProjectAndSlot = (fleetState.workers || []).find(worker =>
+      (worker.project_name || "") === projectName && (worker.slot || "") === slot
+    );
+    if (byProjectAndSlot) return byProjectAndSlot;
+  }
+  return (fleetState.workers || []).find(worker => (worker.slot || "") === raw) || null;
+}
+
+function setWorkerDrawerOpen(open) {
+  document.body.classList.toggle("worker-drawer-open", open);
+  workerDetailEl.setAttribute("aria-hidden", open ? "false" : "true");
+  workerDetailBackdropEl.hidden = !open;
+}
 function selectedWorker() {
   if (!fleetState.selectedWorkerKey) return null;
   return (fleetState.workers || []).find(worker => workerKey(worker) === fleetState.selectedWorkerKey) || null;
@@ -332,6 +366,7 @@ function normalizeParam(value, fallback) {
 function loadStateFromQuery() {
   const params = new URLSearchParams(window.location.search);
   fleetState.selectedProject = normalizeParam(params.get("project"), "all");
+  fleetState.requestedWorker = normalizeParam(params.get("worker"), "");
   fleetState.filters.query = normalizeParam(params.get("q"), "");
   const scope = normalizeParam(params.get("scope"), "operator");
   fleetState.filters.scope = ["operator", "attention", "live", "recent", "all"].includes(scope) ? scope : "operator";
@@ -355,6 +390,7 @@ function updateQueryState() {
   setQueryParam(params, "pr", fleetState.filters.pr, "all");
   setQueryParam(params, "sort", fleetState.sortKey, "status");
   setQueryParam(params, "dir", fleetState.sortDir, defaultSortDirections[fleetState.sortKey] || "asc");
+  setQueryParam(params, "worker", selectedWorkerQueryValue(), "");
   const next = params.toString();
   const url = window.location.pathname + (next ? "?" + next : "");
   window.history.replaceState(null, "", url);
@@ -1021,6 +1057,10 @@ function renderFleetWorkers() {
       showHistoryScope(button.dataset.historyScope || "recent");
     });
   });
+  fleetWorkersEl.querySelectorAll("tr[data-slot] a, tr[data-slot] button").forEach(control => {
+    control.addEventListener("click", event => event.stopPropagation());
+    control.addEventListener("keydown", event => event.stopPropagation());
+  });
 }
 
 function historySummaryRowHTML(workers) {
@@ -1078,6 +1118,8 @@ function fleetEmptyText(projectLabel, total) {
 
 function selectWorker(projectName, slot) {
   fleetState.selectedWorkerKey = projectName + "\u001f" + slot;
+  fleetState.requestedWorker = selectedWorkerQueryValue();
+  updateQueryState();
   fleetState.detail = null;
   renderAttentionInbox();
   renderFleetWorkers();
@@ -1085,7 +1127,18 @@ function selectWorker(projectName, slot) {
   loadWorkerDetail();
 }
 
+function closeWorkerDetail() {
+  fleetState.selectedWorkerKey = "";
+  fleetState.requestedWorker = "";
+  fleetState.detail = null;
+  updateQueryState();
+  renderAttentionInbox();
+  renderFleetWorkers();
+  renderWorkerDetail(null);
+}
+
 function renderWorkerDetailLoading(projectName, slot) {
+  setWorkerDrawerOpen(true);
   workerDetailSummaryEl.textContent = projectName && slot ? projectName + " / " + slot : "Loading worker";
   workerDetailBodyEl.innerHTML = '<div class="empty">Loading worker detail...</div>';
 }
@@ -1110,6 +1163,7 @@ function detailField(label, value) {
 
 function renderWorkerDetail(data) {
   if (!fleetState.selectedWorkerKey) {
+    setWorkerDrawerOpen(false);
     workerDetailSummaryEl.textContent = "No worker selected";
     workerDetailBodyEl.innerHTML = '<div class="empty">Select a fleet worker to show metadata and log output.</div>';
     return;
@@ -1118,6 +1172,7 @@ function renderWorkerDetail(data) {
     const worker = selectedWorker();
     if (!worker) {
       workerDetailSummaryEl.textContent = "Worker unavailable";
+      setWorkerDrawerOpen(false);
       workerDetailBodyEl.innerHTML = '<div class="empty">Selected worker is no longer visible in the fleet snapshot.</div>';
       return;
     }
@@ -1125,6 +1180,7 @@ function renderWorkerDetail(data) {
   }
 
   const worker = data.worker;
+  setWorkerDrawerOpen(true);
   const log = data.log || {};
   const issue = worker.issue_number ? "#" + worker.issue_number : "-";
   const pr = worker.pr_number ? "#" + worker.pr_number : "-";
@@ -1480,6 +1536,14 @@ sortDirectionEl.addEventListener("click", () => {
   renderFleetWorkers();
 });
 
+workerDetailCloseEl.addEventListener("click", closeWorkerDetail);
+workerDetailBackdropEl.addEventListener("click", closeWorkerDetail);
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && fleetState.selectedWorkerKey) {
+    closeWorkerDetail();
+  }
+});
+
 function applyFleetData(data) {
   fleetState.readOnly = data.read_only !== false;
   fleetState.refreshedAt = data.refreshed_at || "";
@@ -1488,7 +1552,14 @@ function applyFleetData(data) {
   fleetState.approvals = approvalsFromData(data);
   fleetState.attention = attentionFromData(data);
   fleetState.verdict = data.verdict || null;
+  if (!fleetState.selectedWorkerKey && fleetState.requestedWorker) {
+    const requested = resolveWorkerQuery(fleetState.requestedWorker);
+    if (requested) fleetState.selectedWorkerKey = workerKey(requested);
+    fleetState.requestedWorker = "";
+  }
+
   if (fleetState.selectedWorkerKey && !selectedWorker()) {
+    fleetState.requestedWorker = "";
     fleetState.selectedWorkerKey = "";
     fleetState.detail = null;
   }
@@ -1509,7 +1580,14 @@ function applyFleetData(data) {
   renderApprovalInbox();
   renderAttentionInbox();
   renderFleetWorkers();
-  renderWorkerDetail(fleetState.detail);
+  const needsDetailLoad = fleetState.selectedWorkerKey && (!fleetState.detail || !fleetState.detail.worker || workerKey(fleetState.detail.worker) !== fleetState.selectedWorkerKey);
+  if (needsDetailLoad) {
+    const worker = selectedWorker();
+    renderWorkerDetailLoading(worker && worker.project_name, worker && worker.slot);
+    loadWorkerDetail();
+  } else {
+    renderWorkerDetail(fleetState.detail);
+  }
 }
 
 async function loadFleet() {
