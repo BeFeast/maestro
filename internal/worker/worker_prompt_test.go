@@ -24,7 +24,8 @@ func TestAssemblePromptIncludesSecretSafetyGuardrails(t *testing.T) {
 		"Do NOT commit or mention API keys",
 		"Do NOT commit temp/debug artifacts such as tmp/, _tmp/, *.log, *.logs, *.test, or *.test.json",
 		"Do NOT paste logs, doctor output, env dumps, or secret-bearing snippets into the PR body or comments.",
-		`gh pr create --repo BeFeast/ok-gobot --title "security hardening" --body "Closes #157"`,
+		"Never use closing keywords such as Closes/Fixes/Resolves in PR bodies for Maestro-managed work.",
+		`gh pr create --repo BeFeast/ok-gobot --title "security hardening" --body "Refs #157"`,
 	}
 	for _, want := range required {
 		if !strings.Contains(prompt, want) {

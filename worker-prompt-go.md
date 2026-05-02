@@ -51,7 +51,7 @@ Binary must build successfully before creating PR.
 gh pr create \
   --repo {{REPO}} \
   --title "feat: <short description> (#{{ISSUE_NUMBER}})" \
-  --body "Implements #{{ISSUE_NUMBER}}
+  --body "Refs #{{ISSUE_NUMBER}}
 
 ## Changes
 <describe what changed and why>
@@ -64,6 +64,8 @@ gh pr create \
 
 ### 6. After PR is created — STOP
 Do not wait for CI. Do not merge. Just stop.
+
+Never use closing keywords such as `Closes`, `Fixes`, or `Resolves` in PR bodies for Maestro-managed work.
 
 ---
 
