@@ -15,9 +15,9 @@
 <link rel="icon" href="/static/favicon-48.png" type="image/png" sizes="48x48">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon-180.png" sizes="180x180">
 <link rel="preload" href="/static/status-icons.svg" as="image" type="image/svg+xml">
-<link rel="stylesheet" href="/static/tokens.css?v=20260502-7">
-<link rel="stylesheet" href="/static/components.css?v=20260502-7">
-<link rel="stylesheet" href="/static/fleet.css?v=20260502-7">
+<link rel="stylesheet" href="/static/tokens.css?v=20260503-2">
+<link rel="stylesheet" href="/static/components.css?v=20260503-2">
+<link rel="stylesheet" href="/static/fleet.css?v=20260503-2">
 
 </head>
 <body data-page="fleet">
@@ -74,6 +74,19 @@
       </table>
     </div>
   </section>
+  <section class="needs-you-rail" id="needs-you-rail" aria-live="polite" hidden>
+    <div class="section-head">
+      <div>
+        <h2>Needs You</h2>
+        <div class="sub">Only operator-required items stay here. Quiet fleets do not waste the screen.</div>
+      </div>
+      <div class="section-note-group">
+        <a class="scope-reset-button" id="needs-you-audit-link" href="/approvals/audit" hidden>Approval audit</a>
+        <div class="section-note" id="needs-you-summary">Loading operator items...</div>
+      </div>
+    </div>
+    <div class="needs-you-list" id="needs-you-list"></div>
+  </section>
   <details class="project-overview project-diagnostics" id="project-diagnostics">
     <summary>Project diagnostics and raw state drilldown</summary>
     <div class="section-head">
@@ -85,7 +98,7 @@
     </div>
     <div class="grid" id="projects"></div>
   </details>
-  <section class="approval-inbox" id="approval-inbox" aria-live="polite">
+  <section class="approval-inbox" id="approval-inbox" aria-live="polite" hidden>
     <div class="section-head">
       <div>
         <h2>Approval Inbox</h2>
@@ -98,7 +111,7 @@
     </div>
     <div class="approval-list" id="approval-list"></div>
   </section>
-  <section class="attention-inbox" id="attention-inbox" aria-live="polite">
+  <section class="attention-inbox" id="attention-inbox" aria-live="polite" hidden>
     <div class="section-head">
       <div>
         <h2>Attention Inbox</h2>
@@ -108,45 +121,54 @@
     </div>
     <div class="attention-list" id="attention-list"></div>
   </section>
-  <section class="fleet-workers">
-    <div class="section-head">
-      <div>
-        <h2>Fleet Workers</h2>
-        <div class="sub">Operator-focused worker queue. Switch scope when you need history.</div>
+  <details class="fleet-workers-shell" id="fleet-workers-shell">
+    <summary class="fleet-workers-summary">
+      <span class="fleet-workers-summary-copy">
+        <strong>Fleet Workers</strong>
+        <span>Live queue and worker history stay collapsed until needed.</span>
+      </span>
+      <span class="fleet-workers-summary-meta" id="worker-shell-summary">Loading workers...</span>
+    </summary>
+    <section class="fleet-workers">
+      <div class="section-head">
+        <div>
+          <h2>Fleet Workers</h2>
+          <div class="sub">Live worker list first. Filters only appear when the fleet is large enough to need them.</div>
+        </div>
+        <div class="worker-scope-status">
+          <div class="section-note" id="worker-summary">Loading workers...</div>
+          <button type="button" id="worker-project-reset" class="scope-reset-button" hidden>Show all projects</button>
+        </div>
       </div>
-      <div class="worker-scope-status">
-        <div class="section-note" id="worker-summary">Loading workers...</div>
-        <button type="button" id="worker-project-reset" class="scope-reset-button" hidden>Show all projects</button>
+      <div class="worker-controls" id="worker-controls" hidden>
+        <label class="search-control" for="worker-filter"><span>Search</span><input id="worker-filter" type="search" placeholder="Project, issue, status, backend, or PR"></label>
+        <label for="scope-filter"><span>Scope</span><select id="scope-filter"><option value="operator">Needs action/live</option><option value="attention">Attention only</option><option value="live">Live only</option><option value="recent">Done/history</option><option value="all">All workers</option></select></label>
+        <label for="status-filter"><span>Status</span><select id="status-filter"></select></label>
+        <label for="backend-filter"><span>Backend</span><select id="backend-filter"></select></label>
+        <label for="pr-filter"><span>PR</span><select id="pr-filter"><option value="all">Any PR</option><option value="with">With PR</option><option value="without">No PR</option></select></label>
+        <label for="worker-sort"><span>Sort</span><select id="worker-sort"><option value="status">Status</option><option value="project">Project</option><option value="issue">Issue</option><option value="runtime">Runtime</option><option value="pr">PR</option></select></label>
+        <button type="button" id="sort-direction" aria-label="Toggle sort direction">Asc</button>
       </div>
-    </div>
-    <div class="worker-controls" id="worker-controls">
-      <label class="search-control" for="worker-filter"><span>Search</span><input id="worker-filter" type="search" placeholder="Project, issue, status, backend, or PR"></label>
-      <label for="scope-filter"><span>Scope</span><select id="scope-filter"><option value="operator">Needs action/live</option><option value="attention">Attention only</option><option value="live">Live only</option><option value="recent">Done/history</option><option value="all">All workers</option></select></label>
-      <label for="status-filter"><span>Status</span><select id="status-filter"></select></label>
-      <label for="backend-filter"><span>Backend</span><select id="backend-filter"></select></label>
-      <label for="pr-filter"><span>PR</span><select id="pr-filter"><option value="all">Any PR</option><option value="with">With PR</option><option value="without">No PR</option></select></label>
-      <label for="worker-sort"><span>Sort</span><select id="worker-sort"><option value="status">Status</option><option value="project">Project</option><option value="issue">Issue</option><option value="runtime">Runtime</option><option value="pr">PR</option></select></label>
-      <button type="button" id="sort-direction" aria-label="Toggle sort direction">Asc</button>
-    </div>
-    <div class="table-scroll">
-      <table class="worker-table">
-        <thead>
-          <tr>
-            <th class="project-col">Project</th>
-            <th class="slot-col">Slot</th>
-            <th class="issue-col">Issue</th>
-            <th class="status-col">Status</th>
-            <th class="backend-col">Backend</th>
-            <th class="pr-col">PR</th>
-            <th class="runtime-col">Runtime</th>
-            <th class="tokens-col">Tokens</th>
-            <th class="action-col">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="fleet-workers-body"></tbody>
-      </table>
-    </div>
-  </section>
+      <div class="table-scroll">
+        <table class="worker-table">
+          <thead>
+            <tr>
+              <th class="project-col">Project</th>
+              <th class="slot-col">Slot</th>
+              <th class="issue-col">Issue</th>
+              <th class="status-col">Status</th>
+              <th class="backend-col">Backend</th>
+              <th class="pr-col">PR</th>
+              <th class="runtime-col">Runtime</th>
+              <th class="tokens-col">Tokens</th>
+              <th class="action-col">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="fleet-workers-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </details>
   <div class="worker-detail-backdrop" id="worker-detail-backdrop" hidden></div>
   <section class="worker-detail worker-drawer" id="worker-detail" aria-live="polite" aria-hidden="true">
     <div class="section-head">
@@ -165,7 +187,7 @@
   </section>
 </main>
 <script type="application/json" id="fleet-initial-state">{{FLEET_INITIAL_STATE}}</script>
-<script src="/static/fleet.js?v=20260502-7"></script>
+<script src="/static/fleet.js?v=20260503-2"></script>
 
 </body>
 </html>

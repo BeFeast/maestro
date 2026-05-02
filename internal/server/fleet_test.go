@@ -1685,9 +1685,9 @@ func TestFleetDashboard(t *testing.T) {
 		"fleet-refresh",
 		"stat-label",
 		"Projects",
-		"Merged PRs",
-		"done sessions with PRs",
-		"Counts done Maestro sessions that recorded a PR number",
+		"Workers active",
+		"Issue throughput",
+		"merged · last 7d",
 		"stat-sparkline-empty",
 		"projectIsUnconfigured",
 		"project-row--unconfigured",
@@ -1751,19 +1751,15 @@ func TestFleetDashboard(t *testing.T) {
 		"No projects need attention right now",
 		"renderProjectRail",
 		"projectRailRowHTML",
-		"projectExpandedRailHTML",
 		"projectOpenRailHTML",
-		"projectQueueBarHTML",
-		"queue-bar-segment",
-		"toggleExpandedProject",
-		"expandedProjectStorageKey",
-		"writeStoredExpandedProject",
-		"project-expand-row",
-		"project-expand-panel",
-		"project-expand-grid",
+		"needs-you-rail",
+		"renderNeedsYouRail",
+		"needs-you-item",
+		"fleet-verdict-headline",
+		"stats-hero-card",
+		"workerControlsEl.hidden",
 		"project-diagnostics-note",
-		"aria-expanded",
-		"Full logs, history, and raw diagnostics stay on the project dashboard.",
+		"This is the raw inspector layer.",
 		"projectSearchText",
 		"renderWorkerDetail",
 		"renderProject",
@@ -1825,7 +1821,7 @@ func TestFleetDashboardRendersHistoryCollapseControls(t *testing.T) {
 		"function historySummaryRowHTML(workers)",
 		"class=\"history-row\"",
 		"data-history-scope=\"recent\"",
-		"historical collapsed",
+		"history collapsed",
 		"hasWorkerDrilldownFilters",
 		"worker.live === true",
 		"Search or switch scope to inspect every session.",
@@ -1901,7 +1897,7 @@ func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
 					t.Fatalf("rail should include %q in:\n%s", name, rail)
 				}
 			}
-			for _, want := range []string{"open=", "eligible=", "Project 1 outcome", "Dashboard", "GitHub", "Workers"} {
+			for _, want := range []string{"ready", "Project 1 outcome", "Open", "&rarr;"} {
 				if !contains(rail, want) {
 					t.Fatalf("rail should communicate %q in:\n%s", want, rail)
 				}

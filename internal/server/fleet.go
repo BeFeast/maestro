@@ -2246,7 +2246,6 @@ func renderFleetProjectRailState(project fleetProjectState) string {
 		parts := []string{
 			`<span class="pill rail-state-unconfigured">setup</span>`,
 			`<div class="rail-subline" title="No outcome brief configured">No outcome brief configured</div>`,
-			`<div class="rail-note rail-setup-link">Set up &rarr;</div>`,
 		}
 		if project.Error != "" {
 			parts = append(parts, `<div class="rail-alert" title="`+html.EscapeString(project.Error)+`">State error</div>`)
@@ -2267,9 +2266,6 @@ func renderFleetProjectRailState(project fleetProjectState) string {
 		`<span class="pill ` + html.EscapeString(fleetProjectStatePillClass(project)) + `">` + html.EscapeString(label) + `</span>`,
 		`<div class="rail-subline" title="` + html.EscapeString(summary) + `">` + html.EscapeString(summary) + `</div>`,
 	}
-	if next := strings.TrimSpace(operator.NextAction); next != "" {
-		parts = append(parts, `<div class="rail-note" title="`+html.EscapeString(next)+`">Next: `+html.EscapeString(next)+`</div>`)
-	}
 	if project.Error != "" {
 		parts = append(parts, `<div class="rail-alert" title="`+html.EscapeString(project.Error)+`">State error</div>`)
 	}
@@ -2284,32 +2280,22 @@ func renderFleetProjectRailQueue(project fleetProjectState) string {
 	if q == nil {
 		return `<span class="empty">No queue snapshot</span>`
 	}
-	parts := []string{
-		fmt.Sprintf("open=%d", q.Open),
-		fmt.Sprintf("eligible=%d", q.Eligible),
-		fmt.Sprintf("excluded=%d", q.Excluded),
-		fmt.Sprintf("held/meta=%d", q.Held),
-		fmt.Sprintf("blocked-deps=%d", q.BlockedByDependency),
+	mainline := fmt.Sprintf("%d ready", q.Eligible)
+	subline := fmt.Sprintf("%d open", q.Open)
+	if q.Held > 0 {
+		subline = fmt.Sprintf("%d held · %d open", q.Held, q.Open)
+	} else if q.SelectedCandidate != nil && q.SelectedCandidate.Number > 0 {
+		subline = fmt.Sprintf("selected #%d", q.SelectedCandidate.Number)
 	}
-	lines := []string{`<div class="rail-mainline">` + html.EscapeString(strings.Join(parts, " · ")) + `</div>`}
-	if q.SelectedCandidate != nil && q.SelectedCandidate.Number > 0 {
-		selected := fmt.Sprintf("selected #%d", q.SelectedCandidate.Number)
-		if title := strings.TrimSpace(q.SelectedCandidate.Title); title != "" {
-			selected += " " + title
-		}
-		lines = append(lines, `<div class="rail-subline">`+html.EscapeString(selected)+`</div>`)
-	}
-	if idleReason := strings.TrimSpace(q.IdleReason); idleReason != "" && project.Running == 0 {
-		lines = append(lines, `<div class="rail-warn" title="`+html.EscapeString(idleReason)+`">`+html.EscapeString(idleReason)+`</div>`)
-	}
-	return strings.Join(lines, "")
+	return `<div class="rail-mainline">` + html.EscapeString(mainline) + `</div>` +
+		`<div class="rail-subline" title="` + html.EscapeString(strings.TrimSpace(q.IdleReason)) + `">` + html.EscapeString(subline) + `</div>`
 }
 
 func renderFleetProjectRailPR(project fleetProjectState) string {
-	links := fleetProjectPRLinks(project, 3)
-	if project.PROpen == 0 && len(links) == 0 {
-		return `<span class="empty">No open PR</span>`
+	if project.PROpen == 0 {
+		return `<span class="empty">—</span>`
 	}
+	links := fleetProjectPRLinks(project, 3)
 	var b strings.Builder
 	b.WriteString(`<div class="rail-mainline">`)
 	b.WriteString(html.EscapeString(fmt.Sprintf("%d open", project.PROpen)))
@@ -2339,6 +2325,9 @@ func fleetProjectPRLinks(project fleetProjectState, limit int) []string {
 		if worker.PRNumber <= 0 || len(links) >= limit {
 			return
 		}
+		if !worker.Live || strings.EqualFold(worker.Status, string(state.StatusDone)) {
+			return
+		}
 		if _, ok := seen[worker.PRNumber]; ok {
 			return
 		}
@@ -2365,12 +2354,8 @@ func fleetProjectPRLinks(project fleetProjectState, limit int) []string {
 
 func renderFleetProjectRailOutcome(project fleetProjectState) string {
 	if fleetProjectUnconfigured(project) {
-		next := strings.TrimSpace(project.Outcome.NextAction)
-		if next == "" {
-			next = "Add an outcome brief to this project's Maestro config."
-		}
 		return `<div class="rail-subline rail-setup-copy" title="No outcome brief configured">No outcome brief configured</div>` +
-			`<div class="rail-note rail-setup-link" title="` + html.EscapeString(next) + `">Set up &rarr;</div>`
+			`<div class="rail-note rail-setup-link">Set up &rarr;</div>`
 	}
 
 	health := strings.TrimSpace(project.Outcome.HealthState)
@@ -2384,9 +2369,6 @@ func renderFleetProjectRailOutcome(project fleetProjectState) string {
 	parts := []string{
 		`<span class="pill outcome-` + html.EscapeString(fleetCSSClassToken(health)) + `">` + html.EscapeString(strings.ReplaceAll(health, "_", " ")) + `</span>`,
 		`<div class="rail-subline" title="` + html.EscapeString(goal) + `">` + html.EscapeString(goal) + `</div>`,
-	}
-	if next := strings.TrimSpace(project.Outcome.NextAction); next != "" {
-		parts = append(parts, `<div class="rail-note" title="`+html.EscapeString(next)+`">`+html.EscapeString(next)+`</div>`)
 	}
 	return strings.Join(parts, "")
 }
@@ -2413,22 +2395,18 @@ func renderFleetProjectRailFreshness(project fleetProjectState) string {
 }
 
 func renderFleetProjectRailLinks(project fleetProjectState) string {
-	links := make([]string, 0, 3)
+	url := strings.TrimSpace(project.DashboardURL)
+	if url == "" {
+		url = fleetProjectGitHubURL(project.Repo)
+	}
+	label := "Open"
 	if fleetProjectUnconfigured(project) {
-		if setupURL := strings.TrimSpace(project.DashboardURL); setupURL != "" {
-			links = append(links, `<a class="setup-link" href="`+html.EscapeString(setupURL)+`" target="_blank" rel="noreferrer">Set up &rarr;</a>`)
-		} else if setupURL := fleetProjectGitHubURL(project.Repo); setupURL != "" {
-			links = append(links, `<a class="setup-link" href="`+html.EscapeString(setupURL)+`" target="_blank" rel="noreferrer">Set up &rarr;</a>`)
-		}
+		label = "Set up"
 	}
-	if strings.TrimSpace(project.DashboardURL) != "" {
-		links = append(links, `<a href="`+html.EscapeString(project.DashboardURL)+`" target="_blank" rel="noreferrer">Dashboard</a>`)
+	if url == "" {
+		return `<span class="empty">—</span>`
 	}
-	if url := fleetProjectGitHubURL(project.Repo); url != "" {
-		links = append(links, `<a href="`+html.EscapeString(url)+`" target="_blank" rel="noreferrer">GitHub</a>`)
-	}
-	links = append(links, `<button type="button" class="link-button project-workers-link" data-project="`+html.EscapeString(project.Name)+`">Workers</button>`)
-	return `<div class="rail-links">` + strings.Join(links, " ") + `</div>`
+	return `<div class="rail-open-link"><a href="` + html.EscapeString(url) + `" target="_blank" rel="noreferrer">` + html.EscapeString(label) + ` &rarr;</a></div>`
 }
 
 func fleetProjectStateLabel(project fleetProjectState) string {
