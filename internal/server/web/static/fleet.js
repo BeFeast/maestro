@@ -15,9 +15,14 @@ const approvalSummaryEl = document.getElementById("approval-summary");
 const approvalAuditLinkEl = document.getElementById("approval-audit-link");
 const attentionListEl = document.getElementById("attention-list");
 const attentionSummaryEl = document.getElementById("attention-summary");
+const needsYouRailEl = document.getElementById("needs-you-rail");
+const needsYouListEl = document.getElementById("needs-you-list");
+const needsYouSummaryEl = document.getElementById("needs-you-summary");
+const needsYouAuditLinkEl = document.getElementById("needs-you-audit-link");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
 const workerSummaryEl = document.getElementById("worker-summary");
 const workerProjectResetEl = document.getElementById("worker-project-reset");
+const workerControlsEl = document.getElementById("worker-controls");
 const workerDetailEl = document.getElementById("worker-detail");
 const workerDetailCloseEl = document.getElementById("worker-detail-close");
 const workerDetailBackdropEl = document.getElementById("worker-detail-backdrop");
@@ -32,6 +37,7 @@ const workerSortEl = document.getElementById("worker-sort");
 const sortDirectionEl = document.getElementById("sort-direction");
 const initialStateEl = document.getElementById("fleet-initial-state");
 const fleetRefreshEl = document.getElementById("fleet-refresh");
+const projectDiagnosticsEl = document.getElementById("project-diagnostics");
 const expandedProjectStorageKey = "maestro.fleet.expandedProject";
 
 const defaultSortDirections = { status: "asc", project: "asc", issue: "asc", runtime: "desc", pr: "asc" };
@@ -72,6 +78,7 @@ const fleetState = {
   approvals: [],
   attention: [],
   workers: [],
+  summary: {},
   detail: null,
   operatorBrief: null,
   verdict: null,
@@ -322,6 +329,9 @@ function approvalCardHTML(approval) {
 }
 
 function renderApprovalInbox() {
+  if (approvalListEl && approvalListEl.closest("section")) {
+    approvalListEl.closest("section").hidden = true;
+  }
   const approvals = fleetState.approvals || [];
   const counts = approvals.reduce((acc, approval) => {
     const status = approval.status || "unknown";
@@ -743,6 +753,9 @@ function attentionNextActionText(worker) {
 }
 
 function renderAttentionInbox() {
+  if (attentionListEl && attentionListEl.closest("section")) {
+    attentionListEl.closest("section").hidden = true;
+  }
   const attention = fleetState.attention || [];
   if (!attention.length) {
     attentionSummaryEl.textContent = "No projects need attention";
@@ -790,6 +803,54 @@ function renderAttentionInbox() {
   });
 }
 
+function needsYouItemHTML(item) {
+  if (item.kind === "approval") {
+    const approval = item.approval;
+    return '<article class="needs-you-item needs-you-approval">' +
+      '<div class="needs-you-kicker">' + escapeText(approval.project_name || "-") + ' · approval</div>' +
+      '<div class="needs-you-headline">' + escapeText(actionLabel(approval.action || "-")) + '</div>' +
+      '<div class="needs-you-copy">' + escapeText(approval.summary || "Supervisor approval needs review.") + '</div>' +
+      '<div class="needs-you-meta">' + approvalTargetHTML(approval) + '</div>' +
+    '</article>';
+  }
+  const worker = item.worker;
+  return '<article class="needs-you-item needs-you-worker" data-project="' + escapeText(worker.project_name || "") + '" data-slot="' + escapeText(worker.slot || "") + '" tabindex="0">' +
+    '<div class="needs-you-kicker">' + escapeText(worker.project_name || "-") + ' · slot ' + escapeText(worker.slot || "-") + '</div>' +
+    '<div class="needs-you-headline">' + issueSummaryHTML(worker) + '</div>' +
+    '<div class="needs-you-copy"><strong>Why:</strong> ' + escapeText(attentionReasonText(worker)) + '</div>' +
+    '<div class="needs-you-meta"><strong>Next:</strong> ' + escapeText(attentionNextActionText(worker)) + '</div>' +
+  '</article>';
+}
+
+function renderNeedsYouRail() {
+  const pendingApprovals = (fleetState.approvals || []).filter(isPendingApproval);
+  const attentionWorkers = (fleetState.attention || []).filter(worker => worker.needs_attention);
+  const items = pendingApprovals.map(approval => ({ kind: "approval", approval }))
+    .concat(attentionWorkers.map(worker => ({ kind: "worker", worker })));
+
+  if (!needsYouRailEl || !needsYouListEl || !needsYouSummaryEl) return;
+  if (!items.length) {
+    needsYouRailEl.hidden = true;
+    return;
+  }
+
+  needsYouRailEl.hidden = false;
+  if (needsYouAuditLinkEl) needsYouAuditLinkEl.hidden = pendingApprovals.length === 0;
+  needsYouSummaryEl.textContent = items.length === 1
+    ? "1 operator item is waiting."
+    : items.length + " operator items are waiting.";
+  needsYouListEl.innerHTML = items.map(needsYouItemHTML).join("");
+  needsYouListEl.querySelectorAll(".needs-you-worker[data-slot]").forEach(card => {
+    card.addEventListener("click", () => selectWorker(card.dataset.project || "", card.dataset.slot || ""));
+    card.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectWorker(card.dataset.project || "", card.dataset.slot || "");
+      }
+    });
+  });
+}
+
 function fleetWorkersFromData(data) {
   if (Array.isArray(data.workers)) return data.workers;
   return (data.projects || []).flatMap(project => (project.active || []).map(worker => ({
@@ -818,25 +879,41 @@ function fleetBriefToneClass(tone) {
   }
 }
 
-function fleetBriefTargetHTML(brief) {
-  if (!brief) return "";
-  const parts = [];
-  if (brief.project) parts.push('<span>Project ' + escapeText(brief.project) + '</span>');
-  if (brief.issue_number) parts.push(linkHTML(brief.issue_url, "Issue #" + brief.issue_number));
-  if (brief.pr_number) parts.push(linkHTML(brief.pr_url, "PR #" + brief.pr_number));
-  if (brief.session) parts.push('<span>Session ' + escapeText(brief.session) + '</span>');
-  return parts.length ? '<div class="fleet-brief-meta">' + parts.join(" ") + '</div>' : "";
-}
-
 function renderFleetVerdict(brief, verdict) {
   const source = brief && brief.sentence ? brief : verdict;
   const tone = fleetBriefToneClass(source && source.tone);
-  const sentence = source && source.sentence ? source.sentence : "Supervisor status unavailable. No worker state or attention state could be confirmed.";
-  const next = brief && brief.next_action ? '<div class="fleet-brief-next"><strong>Next:</strong> ' + escapeText(brief.next_action) + '</div>' : "";
+  const summary = fleetState.summary || {};
+  const running = Number(summary.running || 0);
+  const attention = Number(summary.needs_attention || 0);
+  const approvals = Number(summary.approvals_pending || 0);
+  let headline = "Supervisor status unavailable.";
+  if (attention > 0 || approvals > 0) {
+    const parts = [];
+    if (attention > 0) parts.push(pluralize(attention, "item") + " need attention");
+    if (approvals > 0) parts.push(pluralize(approvals, "approval") + " wait for review");
+    headline = parts.join(" · ") + ".";
+  } else if (running > 0) {
+    headline = pluralize(running, "worker") + " " + (running === 1 ? "is" : "are") + " running. No operator action is pending.";
+  } else {
+    headline = "All quiet. No operator action is pending.";
+  }
+  const metaParts = [];
+  if (fleetState.refreshedAt) metaParts.push("Last sync " + formatTimestamp(fleetState.refreshedAt));
+  if (attention > 0 || approvals > 0) {
+    metaParts.push("Review Needs You below");
+  } else if (running > 0) {
+    metaParts.push("Workers are in flight");
+  } else {
+    metaParts.push("Supervisor heartbeat is current");
+  }
+  if (summary.projects) metaParts.push(pluralize(Number(summary.projects || 0), "project") + " monitored");
+  if (brief && brief.project) metaParts.push("Focus: " + brief.project);
   fleetVerdictEl.className = "fleet-verdict verdict-" + tone;
-  fleetVerdictEl.innerHTML = '<div class="fleet-brief-label">Global operator brief</div>' +
-    '<div class="fleet-brief-sentence">' + escapeText(sentence) + '</div>' +
-    fleetBriefTargetHTML(brief) + next;
+  fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
+    '<div class="fleet-verdict-kicker">Fleet status</div>' +
+    '<div class="fleet-verdict-headline">' + escapeText(headline) + '</div>' +
+    '<div class="fleet-verdict-meta">' + escapeText(metaParts.join(" · ")) + '</div>' +
+  '</div>';
 }
 
 function renderStats(summary) {
@@ -851,29 +928,26 @@ function renderStats(summary) {
   const throughputDaily = Array.isArray(summary.throughput_daily_7d)
     ? summary.throughput_daily_7d.map(value => Number(value || 0))
     : [];
-  const throughputTitle = "Counts done Maestro sessions that recorded a PR number, bucketed by finished date over the last 7 days.";
-  const items = [
-    { label: "Running", value: running, suffix: "of " + projects, note: projects ? "worker slots" : "no projects" },
-    { label: "PRs in flight", value: prOpen, suffix: "", note: monitoring + " monitored" },
-    { label: "Failed", value: failed, suffix: "", note: "current fleet" },
-    { label: "Attention", value: attention, suffix: "", note: attention ? "waiting" : "nothing waiting" },
-    {
-      label: "Merged PRs",
-      value: throughputMerged,
-      suffix: "",
-      note: throughputMerged ? "done sessions with PRs · last 7d" : "no done PR sessions · last 7d",
-      sparkline: throughputDaily,
-      title: throughputTitle,
-      neutral: throughputMerged === 0
-    }
+  const heroNote = projects
+    ? running + " of " + projects + " worker slot" + (projects === 1 ? "" : "s") + " in use"
+    : "No configured projects";
+  const compact = [
+    { label: "PRs in flight", value: prOpen, note: monitoring ? monitoring + " monitored" : (prOpen ? pluralize(prOpen, "open PR") : "none") },
+    { label: "Failed", value: failed, note: failed ? "needs review" : "clear" },
+    { label: "Attention", value: attention, note: attention ? "needs you" : "quiet" },
+    { label: "Issue throughput", value: throughputMerged, note: "merged · last 7d", sparkline: throughputDaily }
   ];
-  statsEl.innerHTML = items.map(item =>
-    '<div class="stat' + (item.neutral ? ' stat-neutral' : '') + '"' + (item.title ? ' title="' + escapeText(item.title) + '"' : '') + '><span class="stat-label">' + escapeText(item.label) + '</span>' +
-      '<div class="stat-value"><strong>' + escapeText(item.value) + '</strong>' +
-      (item.suffix ? '<span class="stat-suffix">' + escapeText(item.suffix) + '</span>' : '') + '</div>' +
+  statsEl.innerHTML = '<article class="stats-hero-card">' +
+    '<div class="stats-hero-label">Workers active</div>' +
+    '<div class="stats-hero-value"><strong>' + escapeText(running) + '</strong><span class="stat-suffix">of ' + escapeText(projects) + '</span></div>' +
+    '<div class="stats-hero-note">' + escapeText(heroNote) + '</div>' +
+  '</article>' +
+  '<div class="stats-compact-strip">' + compact.map(item =>
+    '<article class="stat stat-compact"><span class="stat-label">' + escapeText(item.label) + '</span>' +
+      '<div class="stat-value"><strong>' + escapeText(item.value) + '</strong></div>' +
       (item.sparkline ? renderStatSparkline(item.sparkline) : '') +
-      '<span class="stat-note">' + escapeText(item.note) + '</span></div>'
-  ).join("");
+      '<span class="stat-note">' + escapeText(item.note) + '</span></article>'
+  ).join("") + '</div>';
 }
 
 function renderStatSparkline(values) {
@@ -998,60 +1072,44 @@ function projectIdentityRailHTML(project) {
 
 function projectStateRailHTML(project) {
   if (projectIsUnconfigured(project)) {
-    const parts = [
-      '<span class="pill rail-state-unconfigured">setup</span>',
-      '<div class="rail-subline" title="No outcome brief configured">No outcome brief configured</div>',
-      '<div class="rail-note rail-setup-link">Set up &rarr;</div>'
-    ];
-    if (project.error) parts.push('<div class="rail-alert" title="' + escapeText(project.error) + '">State error</div>');
-    if (project.freshness && project.freshness.stale) parts.push('<div class="rail-warn">Stale snapshot</div>');
-    return parts.join("");
+    return '<span class="pill rail-state-unconfigured">setup</span>' +
+      '<div class="rail-subline" title="No outcome brief configured">No outcome brief configured</div>';
   }
 
   const key = projectStateKey(project);
   const operator = project.operator_state || {};
   const summary = String(operator.summary || ((project.running || 0) + '/' + (project.max_parallel || 0) + ' worker process(es) running.'));
-  const parts = [
-    '<span class="pill rail-state-' + cssToken(key) + '">' + escapeText(projectStateLabel(project)) + '</span>',
-    '<div class="rail-subline" title="' + escapeText(summary) + '">' + escapeText(summary) + '</div>'
-  ];
-  if (operator.next_action) parts.push('<div class="rail-note" title="' + escapeText(operator.next_action) + '">Next: ' + escapeText(operator.next_action) + '</div>');
-  if (project.error) parts.push('<div class="rail-alert" title="' + escapeText(project.error) + '">State error</div>');
-  if (project.freshness && project.freshness.stale && key !== "stale") parts.push('<div class="rail-warn">Stale snapshot</div>');
-  return parts.join("");
+  return '<span class="pill rail-state-' + cssToken(key) + '">' + escapeText(projectStateLabel(project)) + '</span>' +
+    '<div class="rail-subline" title="' + escapeText(summary) + '">' + escapeText(summary) + '</div>';
 }
 
 function projectQueueRailHTML(project) {
   const q = project.queue_snapshot;
   if (!q) return '<span class="empty">No queue snapshot</span>';
-  const parts = [
-    'open=' + Number(q.open || 0),
-    'eligible=' + Number(q.eligible || 0),
-    'excluded=' + Number(q.excluded || 0),
-    'held/meta=' + Number(q.held || q.held_issues || 0),
-    'blocked-deps=' + Number(q.blocked_by_dependency || q.blocked_by_dependency_issues || 0)
-  ];
-  const lines = ['<div class="rail-mainline">' + escapeText(parts.join(' · ')) + '</div>'];
-  if (q.selected_candidate && q.selected_candidate.number) {
-    const selected = 'selected #' + q.selected_candidate.number + (q.selected_candidate.title ? ' ' + q.selected_candidate.title : '');
-    lines.push('<div class="rail-subline" title="' + escapeText(selected) + '">' + escapeText(selected) + '</div>');
-  }
-  const idleReason = (project.running || 0) === 0 ? String(q.idle_reason || "").trim() : "";
-  if (idleReason && projectStateKey(project) !== "queue_blocked") lines.push('<div class="rail-warn" title="' + escapeText(idleReason) + '">' + escapeText(idleReason) + '</div>');
-  return lines.join("");
+  const ready = Number(q.eligible || 0);
+  const held = Number(q.held || q.held_issues || 0);
+  const open = Number(q.open || 0);
+  const selected = q.selected_candidate && q.selected_candidate.number
+    ? "selected #" + q.selected_candidate.number
+    : "";
+  return '<div class="rail-mainline">' + escapeText(ready ? ready + " ready" : "0 ready") + '</div>' +
+    '<div class="rail-subline" title="' + escapeText(String(q.idle_reason || selected || "")) + '">' +
+      escapeText(held ? held + " held · " + open + " open" : (selected || open + " open")) +
+    '</div>';
 }
 
 function projectPRRailHTML(project) {
+  if ((project.pr_open || 0) === 0) return '<span class="empty">—</span>';
   const workers = (fleetState.workers || []).filter(worker => worker.project_name === project.name && worker.pr_number);
   const seen = new Set();
   const links = [];
   for (const worker of workers) {
+    if (!worker.live || displayStatus(worker) === "done" || worker.status === "done") continue;
     if (seen.has(worker.pr_number)) continue;
     seen.add(worker.pr_number);
     links.push(linkHTML(worker.pr_url || (project.repo ? 'https://github.com/' + project.repo + '/pull/' + worker.pr_number : ''), 'PR #' + worker.pr_number));
     if (links.length >= 3) break;
   }
-  if ((project.pr_open || 0) === 0 && links.length === 0) return '<span class="empty">No open PR</span>';
   const fallback = !links.length && githubPullsURL(project.repo) ? [linkHTML(githubPullsURL(project.repo), 'Open PRs')] : [];
   return '<div class="rail-mainline">' + escapeText(project.pr_open || 0) + ' open</div>' +
     '<div class="rail-links">' + links.concat(fallback).join(' ') + '</div>';
@@ -1059,28 +1117,21 @@ function projectPRRailHTML(project) {
 
 function projectOutcomeRailHTML(project) {
   if (projectIsUnconfigured(project)) {
-    const next = (project.outcome && project.outcome.next_action) || "Add an outcome brief to this project's Maestro config.";
     return '<div class="rail-subline rail-setup-copy" title="No outcome brief configured">No outcome brief configured</div>' +
-      '<div class="rail-note rail-setup-link" title="' + escapeText(next) + '">Set up &rarr;</div>';
+      '<div class="rail-note rail-setup-link">Set up &rarr;</div>';
   }
 
   const outcome = project.outcome || {};
   const health = outcome.health_state || "unknown";
   const goal = outcome.configured === true && outcome.goal ? outcome.goal : "No outcome brief configured";
-  const next = outcome.next_action || "";
   return '<span class="pill outcome-' + cssToken(health) + '">' + escapeText(health.replace(/_/g, ' ')) + '</span>' +
-    '<div class="rail-subline" title="' + escapeText(goal) + '">' + escapeText(goal) + '</div>' +
-    (next ? '<div class="rail-note" title="' + escapeText(next) + '">' + escapeText(next) + '</div>' : '');
+    '<div class="rail-subline" title="' + escapeText(goal) + '">' + escapeText(goal) + '</div>';
 }
 
 function projectFreshnessRailHTML(project) {
   const freshness = project.freshness || {};
   const age = freshness.snapshot_age ? "Snapshot " + freshness.snapshot_age + " ago" : "No snapshot yet";
-  const details = [];
-  if (freshness.state_updated_at) details.push("State " + formatTimestamp(freshness.state_updated_at));
-  if (freshness.log_updated_at) details.push("Logs " + formatTimestamp(freshness.log_updated_at));
-  if (freshness.reason) details.push(freshness.reason);
-  return '<div class="rail-mainline" title="' + escapeText(details.join(' · ')) + '">' + escapeText(age) + '</div>';
+  return '<div class="rail-mainline" title="' + escapeText(freshness.reason || age) + '">' + escapeText(age) + '</div>';
 }
 
 function projectLinksRailHTML(project) {
@@ -1098,55 +1149,14 @@ function projectLinksRailHTML(project) {
 function projectOpenRailHTML(project) {
   const url = project.dashboard_url || githubRepoURL(project.repo);
   const label = projectIsUnconfigured(project) ? "Set up" : "Open";
-  return '<div class="rail-open-link">' + linkHTML(url, label + " ›") + '</div>';
-}
-
-function projectQueueBarHTML(project) {
-  const q = project.queue_snapshot || {};
-  const segments = [
-    ["eligible", Number(q.eligible || 0), "Eligible"],
-    ["held", Number(q.held || q.held_issues || 0), "Held"],
-    ["blocked", Number(q.blocked_by_dependency || q.blocked_by_dependency_issues || 0), "Blocked"],
-    ["excluded", Number(q.excluded || 0), "Excluded"]
-  ].filter(([, value]) => value > 0);
-  const total = segments.reduce((sum, [, value]) => sum + value, 0);
-  if (!total) return '<div class="queue-bar queue-bar-empty" title="No runnable queue shape yet"></div>';
-  const bars = segments.map(([key, value, label]) =>
-    '<span class="queue-bar-segment queue-bar-' + key + '" style="flex-grow:' + value + '" title="' + escapeText(label + ': ' + value) + '"></span>'
-  ).join("");
-  const legend = segments.map(([key, value, label]) =>
-    '<span class="queue-bar-legend-item queue-bar-legend-' + key + '">' + escapeText(label) + ' ' + escapeText(value) + '</span>'
-  ).join("");
-  return '<div class="queue-bar" aria-hidden="true">' + bars + '</div><div class="queue-bar-legend">' + legend + '</div>';
-}
-
-function projectExpandedRailHTML(project) {
-  const queue = queueSnapshotHTML(project) || '<div class="queue-snapshot"><div class="label">Queue Snapshot</div><div class="empty">No queue snapshot available.</div></div>';
-  const why = renderProjectWhy(project);
-  return '<tr class="project-expand-row" data-project-detail="' + escapeText(project.name || "") + '"><td colspan="7">' +
-    '<div class="project-expand-panel">' +
-      '<div class="project-expand-grid">' +
-        '<div class="project-expand-card project-expand-card-queue">' + projectQueueBarHTML(project) + queue + '</div>' +
-        '<div class="project-expand-card project-expand-card-outcome">' + outcomeHTML(project) + '</div>' +
-        '<div class="project-expand-card project-expand-card-supervisor">' + renderSupervisor(project) + '</div>' +
-        (why ? '<div class="project-expand-card project-expand-card-why">' + why + '</div>' : '') +
-      '</div>' +
-      '<div class="project-expand-footer">' +
-        '<div class="rail-subline">Full logs, history, and raw diagnostics stay on the project dashboard.</div>' +
-        projectLinksRailHTML(project) +
-      '</div>' +
-    '</div>' +
-  '</td></tr>';
+  return '<div class="rail-open-link">' + linkHTML(url, label + " →") + '</div>';
 }
 
 function projectRailRowHTML(project) {
   const key = projectStateKey(project);
   const modifier = projectIsUnconfigured(project) ? ' project-row--unconfigured' : '';
-  const expanded = fleetState.expandedProject === (project.name || "");
-  const symbol = expanded ? "-" : "+";
-  const title = expanded ? "Collapse project summary" : "Expand project summary";
-  const row = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" tabindex="0" aria-expanded="' + (expanded ? "true" : "false") + '" title="' + escapeText(title) + '">' +
-    '<td class="project-rail-project"><div class="project-rail-project-wrap"><span class="project-expand-symbol" aria-hidden="true">' + symbol + '</span><div class="project-rail-project-copy">' + projectIdentityRailHTML(project) + '</div></div></td>' +
+  return '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" tabindex="0">' +
+    '<td class="project-rail-project"><div class="project-rail-project-wrap"><div class="project-rail-project-copy">' + projectIdentityRailHTML(project) + '</div></div></td>' +
     '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
     '<td class="project-rail-queue-cell">' + projectQueueRailHTML(project) + '</td>' +
     '<td class="project-rail-pr-cell">' + projectPRRailHTML(project) + '</td>' +
@@ -1154,14 +1164,6 @@ function projectRailRowHTML(project) {
     '<td class="project-rail-freshness-cell">' + projectFreshnessRailHTML(project) + '</td>' +
     '<td class="project-rail-links-cell">' + projectOpenRailHTML(project) + '</td>' +
   '</tr>';
-  return row + (expanded ? projectExpandedRailHTML(project) : '');
-}
-
-function toggleExpandedProject(projectName) {
-  if (!projectName) return;
-  fleetState.expandedProject = fleetState.expandedProject === projectName ? "" : projectName;
-  writeStoredExpandedProject(fleetState.expandedProject);
-  renderProjectRail();
 }
 
 function renderProjectRail() {
@@ -1181,12 +1183,14 @@ function renderProjectRail() {
   projectRailBodyEl.querySelectorAll(".project-rail-row[data-project]").forEach(row => {
     row.addEventListener("click", event => {
       if (event.target.closest("a, button")) return;
-      toggleExpandedProject(row.dataset.project || "");
+      const url = row.dataset.url || "";
+      if (url) window.open(url, "_blank", "noopener,noreferrer");
     });
     row.addEventListener("keydown", event => {
       if ((event.key === "Enter" || event.key === " ") && !event.target.closest("a, button")) {
         event.preventDefault();
-        toggleExpandedProject(row.dataset.project || "");
+        const url = row.dataset.url || "";
+        if (url) window.open(url, "_blank", "noopener,noreferrer");
       }
     });
   });
@@ -1210,19 +1214,26 @@ function renderFleetWorkers() {
   const visible = sortWorkers(filteredWorkers(true));
   const showingDefaultScope = fleetState.filters.scope === "operator" && !hasWorkerDrilldownFilters();
   const hiddenHistory = showingDefaultScope ? base.filter(worker => !defaultWorkerVisible(worker)) : [];
+  const liveVisibleCount = base.filter(defaultWorkerVisible).length;
   const rowCount = visible.length + (hiddenHistory.length ? 1 : 0);
+  const totalWorkers = base.length;
   const table = fleetWorkersEl.closest("table");
   if (table) table.classList.toggle("worker-table-empty", rowCount === 0);
+  if (workerControlsEl) {
+    const shouldShowControls = liveVisibleCount > 10 || hasWorkerFilters() || fleetState.filters.scope !== "operator";
+    workerControlsEl.hidden = !shouldShowControls;
+  }
   const projectLabel = fleetState.selectedProject === "all" ? "all projects" : fleetState.selectedProject;
   const projectScoped = fleetState.selectedProject !== "all";
   workerProjectResetEl.hidden = !projectScoped;
   workerProjectResetEl.setAttribute("aria-label", projectScoped ? "Clear " + projectLabel + " worker scope and show all projects" : "Workers are showing all projects");
   const scopeLabel = scopeLabelText(fleetState.filters.scope);
-  const filterText = hasWorkerFilters() ? " · " + visible.length + " shown from " + base.length + " total" : " · " + base.length + " total";
+  const filterText = hasWorkerFilters() ? " · " + visible.length + " shown from " + totalWorkers + " total" : " · " + totalWorkers + " total";
   const attentionCount = visible.filter(worker => worker.needs_attention).length;
-  workerSummaryEl.textContent = scopeLabel + " · " + visible.length + " worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel +
-    filterText + (hiddenHistory.length ? " · " + hiddenHistory.length + " historical collapsed" : "") +
-    (attentionCount ? " · " + attentionCount + " need attention" : "");
+  workerSummaryEl.textContent = visible.length + " worker" + (visible.length === 1 ? "" : "s") + " shown in " + projectLabel +
+    filterText + (hiddenHistory.length ? " · " + hiddenHistory.length + " history collapsed" : "") +
+    (attentionCount ? " · " + attentionCount + " need attention" : "") +
+    (workerControlsEl && workerControlsEl.hidden ? " · filters hidden until the live queue is larger" : " · " + scopeLabel);
 
   if (rowCount === 0) {
     const empty = fleetEmptyText(projectLabel, base.length);
@@ -1702,8 +1713,11 @@ function renderProjectOverview() {
   projectSummaryEl.textContent = projects.length + " project" + (projects.length === 1 ? "" : "s") + filtered +
     " · " + running + " running · " + attention + " attention";
   projectsEl.innerHTML = projects.length
-    ? '<div class="project-diagnostics-note">Expand a project row above for queue, outcome, supervisor, and links. Open Dashboard for full logs and history.</div>'
+    ? '<div class="project-diagnostics-note">This is the raw inspector layer. The primary fleet view above stays compact on purpose.</div>'
     : '<div class="empty">No project diagnostics match the project search.</div>';
+  if (projectDiagnosticsEl) {
+    projectDiagnosticsEl.open = false;
+  }
 }
 
 function refreshWorkersFromControls() {
@@ -1781,6 +1795,7 @@ document.addEventListener("keydown", event => {
 function applyFleetData(data) {
   fleetState.readOnly = data.read_only !== false;
   fleetState.refreshedAt = data.refreshed_at || "";
+  fleetState.summary = data.summary || {};
   fleetState.projects = data.projects || [];
   fleetState.workers = fleetWorkersFromData(data);
   fleetState.approvals = approvalsFromData(data);
@@ -1799,7 +1814,7 @@ function applyFleetData(data) {
     fleetState.detail = null;
   }
   const controlMode = fleetState.readOnly ? "read-only controls disabled" : "controls require approval configuration";
-  const summary = data.summary || {};
+  const summary = fleetState.summary || {};
   const alerts = [];
   if (summary.stale) alerts.push(summary.stale + " stale");
   if (summary.errors) alerts.push(summary.errors + " error" + (summary.errors === 1 ? "" : "s"));
@@ -1814,6 +1829,7 @@ function applyFleetData(data) {
   renderProjectOverview();
   renderApprovalInbox();
   renderAttentionInbox();
+  renderNeedsYouRail();
   renderFleetWorkers();
   const needsDetailLoad = fleetState.selectedWorkerKey && (!fleetState.detail || !fleetState.detail.worker || workerKey(fleetState.detail.worker) !== fleetState.selectedWorkerKey);
   if (needsDetailLoad) {
