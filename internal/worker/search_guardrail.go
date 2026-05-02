@@ -4,10 +4,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
 var searchGuardedCommands = []string{"rg", "find", "grep"}
+
+var autoClosingIssueReferencePattern = regexp.MustCompile(`(?i)\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#\d+\b`)
+
+func containsAutoClosingIssueReference(text string) bool {
+	return autoClosingIssueReferencePattern.MatchString(text)
+}
 
 func ensureSearchGuardrailWrappers(stateDir string) (string, error) {
 	if strings.TrimSpace(stateDir) == "" {
@@ -286,4 +293,12 @@ func workerSearchSafetyPromptSection(worktreePath string) string {
 		"- Do NOT run `rg`, `find`, or `grep` from broad filesystem roots such as `/`, `/mnt`, or `/home`.\n"+
 		"- If you intentionally need a broad host search, set `MAESTRO_ALLOW_BROAD_SEARCH=1` for that single command.\n",
 		worktreePath)
+}
+
+func workerPRReferenceSafetyPromptSection(issueNumber int) string {
+	return fmt.Sprintf("\n\n---\n\n## PR Issue Reference Safety\n\n"+
+		"- Use non-closing issue references in PR titles, bodies, comments, and helper commands, such as `Refs #%d`.\n"+
+		"- Do NOT use GitHub auto-closing keywords (`Closes`, `Fixes`, `Resolves`, or variants) for deployment/runtime/operator-verification issues.\n"+
+		"- Code landing is not outcome completion; leave issues open until deployment/runtime/operator verification is complete.\n",
+		issueNumber)
 }

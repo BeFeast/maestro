@@ -1115,6 +1115,8 @@ func autoCreatedPRBody(sess *state.Session, branch string, reasons []string) str
 
 Maestro auto-created this PR because the worker pushed branch %s but exited before opening a pull request.
 
+This intentionally uses a non-closing issue reference; runtime/deployment/operator verification may still be required before the issue is closed.
+
 Observed worker state: %s.
 `, sess.IssueNumber, branch, reasonText)
 }
@@ -1134,34 +1136,33 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 	for slotName, sess := range s.Sessions {
 		switch sess.Status {
-		case state.StatusDone, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
+		case state.StatusDone, state.StatusCodeLanded, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
 			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).
 			if sess.Status != state.StatusDone {
-				done := false
-				if sess.PRNumber > 0 {
-					merged, err := o.isPRMerged(sess.PRNumber)
-					if err != nil {
-						log.Printf("[orch] check PR #%d merged: %v", sess.PRNumber, err)
-					} else if merged {
-						log.Printf("[orch] PR #%d merged, transitioning zombie session %s from %s to done", sess.PRNumber, slotName, sess.Status)
-						done = true
-					}
-				}
+				issueClosed := false
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
 					log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 				} else if closed {
 					log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-					done = true
+					issueClosed = true
 				}
-				if done {
+				if issueClosed {
 					o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 					sess.Status = state.StatusDone
 					if sess.FinishedAt == nil {
 						now := time.Now().UTC()
 						sess.FinishedAt = &now
+					}
+				} else if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
+					merged, err := o.isPRMerged(sess.PRNumber)
+					if err != nil {
+						log.Printf("[orch] check PR #%d merged: %v", sess.PRNumber, err)
+					} else if merged {
+						log.Printf("[orch] PR #%d merged, transitioning zombie session %s from %s to code_landed", sess.PRNumber, slotName, sess.Status)
+						o.markCodeLanded(sess, sess.PRNumber)
 					}
 				}
 			}
@@ -1686,6 +1687,16 @@ func mergeFlowPRForSession(sess *state.Session, byBranch map[string]github.PR, b
 	return github.PR{}, false
 }
 
+func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
+	if prNumber > 0 {
+		sess.PRNumber = prNumber
+	}
+	o.syncProject(sess.IssueNumber, github.ProjectStatusInProgress)
+	sess.Status = state.StatusCodeLanded
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+}
+
 // handleReviewFeedbackRetry schedules a retry worker with review feedback in
 // its prompt. When the PR worktree is still available, keep the PR open and
 // respawn in place so the fixer pushes updates to the same PR.
@@ -1871,13 +1882,7 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	}
 
 	log.Printf("[orch] merged PR #%d ✓", pr.Number)
-	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-	if err := o.closeIssue(sess.IssueNumber, fmt.Sprintf("Implemented by PR #%d (auto-merged by maestro).", pr.Number)); err != nil {
-		log.Printf("[orch] warning: failed to close issue #%d: %v", sess.IssueNumber, err)
-	}
-	sess.Status = state.StatusDone
-	now := time.Now().UTC()
-	sess.FinishedAt = &now
+	o.markCodeLanded(sess, pr.Number)
 
 	if o.cfg.ShouldCleanupWorktrees() {
 		log.Printf("[orch] cleaning up worktree for %s after merge", slotName)
@@ -1887,7 +1892,7 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 		log.Printf("[orch] skipping worktree cleanup for %s (cleanup_worktrees_on_merge=false)", slotName)
 	}
 
-	o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s)", pr.Number, sess.IssueNumber, sess.IssueTitle)
+	o.notifier.Sendf("✅ maestro: merged PR #%d for issue #%d (%s); issue remains open for runtime verification", pr.Number, sess.IssueNumber, sess.IssueTitle)
 
 	// Auto version bump
 	if o.cfg.Versioning.Enabled {
@@ -2190,7 +2195,7 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 
 	for _, slotName := range sortedStateSessionNames(s) {
 		sess := s.Sessions[slotName]
-		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusDone || sess.PRNumber <= 0 {
+		if sess == nil || sess.IssueNumber != issueNumber || (sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded) || sess.PRNumber <= 0 {
 			continue
 		}
 		merged, err := o.isPRMerged(sess.PRNumber)
@@ -2198,7 +2203,7 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 			return false, "", fmt.Errorf("check PR #%d merged: %w", sess.PRNumber, err)
 		}
 		if merged {
-			return true, fmt.Sprintf("session %s is done with merged PR #%d", slotName, sess.PRNumber), nil
+			return true, fmt.Sprintf("session %s is %s with merged PR #%d", slotName, sess.Status, sess.PRNumber), nil
 		}
 	}
 

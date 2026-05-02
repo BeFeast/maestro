@@ -119,6 +119,9 @@ func TestAssemblePromptWithCheckpoint_WithCheckpoint(t *testing.T) {
 	if !strings.Contains(result, "continue where the previous session left off") {
 		t.Error("should contain continuation instructions")
 	}
+	if !strings.Contains(result, "Refs #1") || containsAutoClosingIssueReference(result) {
+		t.Fatalf("checkpoint prompt should preserve non-closing PR reference guidance, got:\n%s", result)
+	}
 }
 
 func TestReadTailLines(t *testing.T) {

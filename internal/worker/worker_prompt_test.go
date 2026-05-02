@@ -24,11 +24,36 @@ func TestAssemblePromptIncludesSecretSafetyGuardrails(t *testing.T) {
 		"Do NOT commit or mention API keys",
 		"Do NOT commit temp/debug artifacts such as tmp/, _tmp/, *.log, *.logs, *.test, or *.test.json",
 		"Do NOT paste logs, doctor output, env dumps, or secret-bearing snippets into the PR body or comments.",
-		`gh pr create --repo BeFeast/ok-gobot --title "security hardening" --body "Closes #157"`,
+		`gh pr create --repo BeFeast/ok-gobot --title "security hardening" --body "Refs #157"`,
+		"Do NOT use GitHub auto-closing keywords",
+		"Code landing is not outcome completion",
 	}
 	for _, want := range required {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("assemblePrompt() missing %q\nprompt:\n%s", want, prompt)
+		}
+	}
+	if containsAutoClosingIssueReference(prompt) {
+		t.Fatalf("assemblePrompt() contains auto-closing issue reference:\n%s", prompt)
+	}
+}
+
+func TestContainsAutoClosingIssueReference(t *testing.T) {
+	tests := []struct {
+		text string
+		want bool
+	}{
+		{`Closes #157`, true},
+		{`fixes #157`, true},
+		{`Resolved #157`, true},
+		{`Refs #157`, false},
+		{`Implements #157`, false},
+		{`Do NOT use Closes, Fixes, or Resolves.`, false},
+	}
+
+	for _, tt := range tests {
+		if got := containsAutoClosingIssueReference(tt.text); got != tt.want {
+			t.Fatalf("containsAutoClosingIssueReference(%q) = %v, want %v", tt.text, got, tt.want)
 		}
 	}
 }

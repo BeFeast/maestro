@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -194,6 +195,28 @@ func TestMaxRuntimeForPhase(t *testing.T) {
 	}
 	if got := MaxRuntimeForPhase(cfg, state.PhaseValidate); got != 45 {
 		t.Errorf("validate runtime: got %d, want 45", got)
+	}
+}
+
+func TestDefaultPipelinePromptsForbidAutoClosingReferences(t *testing.T) {
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 351, Title: "runtime verification", Body: "Keep the issue open until runtime is verified."}
+
+	for _, phase := range []state.Phase{state.PhasePlan, state.PhaseValidate} {
+		prompt := PromptForPhase(cfg, phase, issue, "/tmp/wt", "feat/runtime")
+		if !strings.Contains(prompt, "Refs #351") || !strings.Contains(prompt, "auto-closing keywords") {
+			t.Fatalf("phase %s prompt missing non-closing PR reference guidance:\n%s", phase, prompt)
+		}
+		for _, forbidden := range []string{"Closes #351", "Fixes #351", "Resolves #351"} {
+			if strings.Contains(prompt, forbidden) {
+				t.Fatalf("phase %s prompt contains closing reference %q:\n%s", phase, forbidden, prompt)
+			}
+		}
+	}
+
+	preamble := ImplementerPreamble(&state.Session{})
+	if !strings.Contains(preamble, "non-closing issue references") || !strings.Contains(preamble, "Refs #N") {
+		t.Fatalf("implementer preamble missing non-closing PR guidance:\n%s", preamble)
 	}
 }
 

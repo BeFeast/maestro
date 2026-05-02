@@ -264,8 +264,13 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	if !strings.Contains(gotTitle, "add branch rescue") || !strings.Contains(gotTitle, "(#108)") {
 		t.Fatalf("unexpected title %q", gotTitle)
 	}
-	if !strings.Contains(gotBody, "Refs #108") || strings.Contains(gotBody, "Closes #108") || !strings.Contains(gotBody, "auto-created") {
+	if !strings.Contains(gotBody, "Refs #108") || !strings.Contains(gotBody, "auto-created") {
 		t.Fatalf("unexpected body %q", gotBody)
+	}
+	for _, forbidden := range []string{"Closes #108", "Fixes #108", "Resolves #108", "closes #108", "fixes #108", "resolves #108"} {
+		if strings.Contains(gotBody, forbidden) {
+			t.Fatalf("auto-created PR body contains auto-closing reference %q: %q", forbidden, gotBody)
+		}
 	}
 	if !s.IssueInProgress(108) {
 		t.Fatal("IssueInProgress(108) must remain true after auto-created PR")
@@ -763,10 +768,10 @@ func TestAutoMergePRs_ParallelUpdatesState(t *testing.T) {
 	before := time.Now()
 	o.autoMergePRs(s)
 
-	// All sessions should be marked done
+	// All sessions should be marked code_landed until runtime verification closes the issue
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusDone {
-			t.Errorf("session %s status = %q, want %q", slotName, sess.Status, state.StatusDone)
+		if sess.Status != state.StatusCodeLanded {
+			t.Errorf("session %s status = %q, want %q", slotName, sess.Status, state.StatusCodeLanded)
 		}
 		if sess.FinishedAt == nil {
 			t.Errorf("session %s has nil FinishedAt", slotName)
@@ -871,19 +876,19 @@ func TestAutoMergePRs_ParallelPartialFailure(t *testing.T) {
 		t.Errorf("merged = %v, want [10, 30]", merged)
 	}
 
-	// Verify state: sessions for PR 10 and 30 should be done, PR 20 should still be pr_open
-	doneCount := 0
+	// Verify state: sessions for PR 10 and 30 should be code_landed, PR 20 should still be pr_open
+	landedCount := 0
 	openCount := 0
 	for _, sess := range s.Sessions {
-		if sess.Status == state.StatusDone {
-			doneCount++
+		if sess.Status == state.StatusCodeLanded {
+			landedCount++
 		}
 		if sess.Status == state.StatusPROpen {
 			openCount++
 		}
 	}
-	if doneCount != 2 {
-		t.Errorf("expected 2 done sessions, got %d", doneCount)
+	if landedCount != 2 {
+		t.Errorf("expected 2 code_landed sessions, got %d", landedCount)
 	}
 	if openCount != 1 {
 		t.Errorf("expected 1 still-open session, got %d", openCount)
@@ -892,7 +897,7 @@ func TestAutoMergePRs_ParallelPartialFailure(t *testing.T) {
 
 func TestAutoMergePRs_ParallelStateConsistency(t *testing.T) {
 	// Verify that after parallel merges, the state is consistent:
-	// - All merged sessions are StatusDone with FinishedAt set
+	// - All merged sessions are StatusCodeLanded with FinishedAt set
 	// - LastMergeAt is recent
 	// - No session is in an inconsistent intermediate state
 	prs := []github.PR{
@@ -914,8 +919,8 @@ func TestAutoMergePRs_ParallelStateConsistency(t *testing.T) {
 	}
 
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusDone {
-			t.Errorf("session %s: status = %q, want %q", slotName, sess.Status, state.StatusDone)
+		if sess.Status != state.StatusCodeLanded {
+			t.Errorf("session %s: status = %q, want %q", slotName, sess.Status, state.StatusCodeLanded)
 		}
 		if sess.FinishedAt == nil {
 			t.Errorf("session %s: FinishedAt is nil", slotName)
@@ -1319,8 +1324,8 @@ func TestAutoMergePRs_RetryExhaustedGreenPRNoFeedbackMerges(t *testing.T) {
 		t.Fatalf("merged = %v, want [10]", merged)
 	}
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusDone {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)
 	}
 }
 
@@ -2394,6 +2399,7 @@ func TestCheckSessions_SilentTimeoutSecondKill_LabelsBlocked(t *testing.T) {
 func TestMergeReadyPR_CleansUpWorktreeOnMerge(t *testing.T) {
 	cleanupTrue := true
 	stopped := false
+	closedIssue := false
 	o := &Orchestrator{
 		cfg: &config.Config{
 			Repo:                    "owner/repo",
@@ -2404,6 +2410,7 @@ func TestMergeReadyPR_CleansUpWorktreeOnMerge(t *testing.T) {
 			return nil
 		},
 		ghCloseIssueFn: func(number int, comment string) error {
+			closedIssue = true
 			return nil
 		},
 		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
@@ -2430,11 +2437,14 @@ func TestMergeReadyPR_CleansUpWorktreeOnMerge(t *testing.T) {
 	if !stopped {
 		t.Fatal("worker should be stopped when cleanup_worktrees_on_merge is true")
 	}
+	if closedIssue {
+		t.Fatal("mergeReadyPR must not close the issue before runtime verification")
+	}
 	if sess.Worktree != "" {
 		t.Errorf("Worktree = %q, want empty (should be cleared after cleanup)", sess.Worktree)
 	}
-	if sess.Status != state.StatusDone {
-		t.Errorf("Status = %q, want %q", sess.Status, state.StatusDone)
+	if sess.Status != state.StatusCodeLanded {
+		t.Errorf("Status = %q, want %q", sess.Status, state.StatusCodeLanded)
 	}
 }
 
@@ -2480,8 +2490,8 @@ func TestMergeReadyPR_SkipsCleanupWhenDisabled(t *testing.T) {
 	if sess.Worktree != "/tmp/wt" {
 		t.Errorf("Worktree = %q, want %q (should be preserved)", sess.Worktree, "/tmp/wt")
 	}
-	if sess.Status != state.StatusDone {
-		t.Errorf("Status = %q, want %q", sess.Status, state.StatusDone)
+	if sess.Status != state.StatusCodeLanded {
+		t.Errorf("Status = %q, want %q", sess.Status, state.StatusCodeLanded)
 	}
 }
 
@@ -3316,7 +3326,7 @@ func TestCheckSessions_RetryExhaustedClosedIssue_TransitionsToDone(t *testing.T)
 	}
 }
 
-func TestCheckSessions_RetryExhaustedMergedPR_TransitionsToDone(t *testing.T) {
+func TestCheckSessions_RetryExhaustedMergedPR_TransitionsToCodeLanded(t *testing.T) {
 	now := time.Now().UTC()
 	o := &Orchestrator{
 		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
@@ -3348,6 +3358,40 @@ func TestCheckSessions_RetryExhaustedMergedPR_TransitionsToDone(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["pan-13"]
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)
+	}
+}
+
+func TestCheckSessions_CodeLandedClosedIssue_TransitionsToDone(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-14"] = &state.Session{
+		IssueNumber: 104,
+		IssueTitle:  "runtime verified",
+		Status:      state.StatusCodeLanded,
+		Branch:      "feat/pan-14-104-runtime",
+		PRNumber:    78,
+		FinishedAt:  &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-14"]
 	if sess.Status != state.StatusDone {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
 	}

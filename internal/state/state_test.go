@@ -63,7 +63,7 @@ func TestNotifiedCIFail_Persistence(t *testing.T) {
 func TestDonePRCount(t *testing.T) {
 	s := NewState()
 	s.Sessions["merged-1"] = &Session{IssueNumber: 1, Status: StatusDone, PRNumber: 10}
-	s.Sessions["merged-2"] = &Session{IssueNumber: 2, Status: StatusDone, PRNumber: 11}
+	s.Sessions["merged-2"] = &Session{IssueNumber: 2, Status: StatusCodeLanded, PRNumber: 11}
 	s.Sessions["closed-issue"] = &Session{IssueNumber: 3, Status: StatusDone}
 	s.Sessions["open-pr"] = &Session{IssueNumber: 4, Status: StatusPROpen, PRNumber: 12}
 
@@ -532,6 +532,18 @@ func TestIssueInProgress_QueuedCountsAsInProgress(t *testing.T) {
 	}
 }
 
+func TestIssueInProgress_CodeLandedCountsAsInProgress(t *testing.T) {
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 100, Status: StatusCodeLanded, PRNumber: 10}
+
+	if !s.IssueInProgress(100) {
+		t.Error("IssueInProgress should return true for code_landed session")
+	}
+	if s.IssueDone(100) {
+		t.Error("IssueDone should remain false while runtime verification is pending")
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }
@@ -553,6 +565,7 @@ func TestIsTerminal(t *testing.T) {
 		{StatusQueued, false},
 		{StatusRunning, false},
 		{StatusPROpen, false},
+		{StatusCodeLanded, true},
 		{StatusDone, true},
 		{StatusFailed, true},
 		{StatusConflictFailed, true},
@@ -960,6 +973,21 @@ func TestSessionAttentionFor_DoneReviewFeedbackIsHistorical(t *testing.T) {
 	}
 }
 
+func TestSessionAttentionFor_CodeLandedNeedsRuntimeVerification(t *testing.T) {
+	sess := &Session{IssueNumber: 351, Status: StatusCodeLanded, PRNumber: 99}
+
+	attention := SessionAttentionFor(sess, nil)
+	if !attention.NeedsAttention {
+		t.Fatalf("code_landed session should need runtime verification attention: %+v", attention)
+	}
+	if !containsString(attention.Reason, "code has landed") || !containsString(attention.Reason, "runtime/deployment/operator verification") {
+		t.Fatalf("reason = %q, want code landed runtime verification copy", attention.Reason)
+	}
+	if got := SessionDisplayStatusFor(sess, nil); got != string(StatusCodeLanded) {
+		t.Fatalf("display status = %q, want code_landed", got)
+	}
+}
+
 func TestSessionLiveAt(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	future := now.Add(10 * time.Minute)
@@ -1049,8 +1077,9 @@ func TestCountByStatus(t *testing.T) {
 	s.Sessions["slot-2"] = &Session{IssueNumber: 2, Status: StatusRunning}
 	s.Sessions["slot-3"] = &Session{IssueNumber: 3, Status: StatusPROpen}
 	s.Sessions["slot-4"] = &Session{IssueNumber: 4, Status: StatusQueued}
-	s.Sessions["slot-5"] = &Session{IssueNumber: 5, Status: StatusDone}   // terminal — excluded
-	s.Sessions["slot-6"] = &Session{IssueNumber: 6, Status: StatusFailed} // terminal — excluded
+	s.Sessions["slot-5"] = &Session{IssueNumber: 5, Status: StatusDone}                     // terminal — excluded
+	s.Sessions["slot-6"] = &Session{IssueNumber: 6, Status: StatusFailed}                   // terminal — excluded
+	s.Sessions["slot-7"] = &Session{IssueNumber: 7, Status: StatusCodeLanded, PRNumber: 10} // terminal — excluded
 
 	counts := s.CountByStatus()
 
@@ -1065,6 +1094,9 @@ func TestCountByStatus(t *testing.T) {
 	}
 	if counts[StatusDone] != 0 {
 		t.Errorf("done = %d, want 0 (terminal states excluded)", counts[StatusDone])
+	}
+	if counts[StatusCodeLanded] != 0 {
+		t.Errorf("code_landed = %d, want 0 (terminal states excluded)", counts[StatusCodeLanded])
 	}
 	if counts[StatusFailed] != 0 {
 		t.Errorf("failed = %d, want 0 (terminal states excluded)", counts[StatusFailed])
@@ -1082,7 +1114,7 @@ func TestStatusPriority(t *testing.T) {
 	}
 	// queued before terminal states
 	for _, terminal := range []SessionStatus{
-		StatusDead, StatusFailed, StatusConflictFailed,
+		StatusCodeLanded, StatusDead, StatusFailed, StatusConflictFailed,
 		StatusRetryExhausted, StatusDone,
 	} {
 		if StatusPriority(StatusQueued) >= StatusPriority(terminal) {

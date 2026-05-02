@@ -50,6 +50,7 @@ const defaultPlannerPrompt = `You are a **planner** for a coding agent pipeline.
 4. Commit both files with message: "plan: add implementation plan for #{{ISSUE_NUMBER}}"
 5. Do NOT implement the issue. Only plan and define validation criteria.
 6. Do NOT create a PR.
+7. If your plan mentions PR creation, require non-closing issue references such as ` + "`Refs #{{ISSUE_NUMBER}}`" + `; never recommend GitHub auto-closing keywords (` + "`Closes`, `Fixes`, `Resolves`" + `, or variants), especially for deployment/runtime/operator-verification work.
 `
 
 const defaultValidatorPrompt = `You are a **validator** for a coding agent pipeline. Your job is to verify that an implementation meets the validation contract.
@@ -87,6 +88,7 @@ const defaultValidatorPrompt = `You are a **validator** for a coding agent pipel
 5. Commit the result file.
 6. Do NOT modify implementation code.
 7. Do NOT create a PR.
+8. Treat any generated PR body or instruction that uses GitHub auto-closing keywords (` + "`Closes`, `Fixes`, `Resolves`" + `, or variants) as invalid for deployment/runtime/operator-verification issues; use non-closing references such as ` + "`Refs #{{ISSUE_NUMBER}}`" + ` instead.
 `
 
 const validatorRetryPreamble = `## Previous Validation Feedback
@@ -141,6 +143,7 @@ func ImplementerPreamble(sess *state.Session) string {
 	sb.WriteString("This issue is being worked on in pipeline mode. ")
 	sb.WriteString("Read `MAESTRO_PLAN.md` in the worktree root for the implementation plan.\n")
 	sb.WriteString("Follow the plan steps in order.\n\n")
+	sb.WriteString("Use non-closing issue references in PR bodies, such as `Refs #N`; do not use GitHub auto-closing keywords (`Closes`, `Fixes`, `Resolves`, or variants) for deployment/runtime/operator-verification issues.\n\n")
 
 	if sess.ValidationFeedback != "" {
 		sb.WriteString(fmt.Sprintf(validatorRetryPreamble, sess.ValidationFeedback))

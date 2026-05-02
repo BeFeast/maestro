@@ -220,6 +220,21 @@ func TestBuildWorkerRunnerScriptIncludesSearchGuardrails(t *testing.T) {
 	}
 }
 
+func TestWorkerPRReferenceSafetyPromptSectionUsesNonClosingReference(t *testing.T) {
+	section := workerPRReferenceSafetyPromptSection(351)
+	if !strings.Contains(section, "Refs #351") {
+		t.Fatalf("PR reference safety section missing Refs #351:\n%s", section)
+	}
+	if containsAutoClosingIssueReference(section) {
+		t.Fatalf("PR reference safety section contains auto-closing issue reference:\n%s", section)
+	}
+	for _, want := range []string{"auto-closing keywords", "deployment/runtime/operator-verification", "Code landing is not outcome completion"} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("PR reference safety section missing %q:\n%s", want, section)
+		}
+	}
+}
+
 func TestEnsureSearchGuardrailWrappers(t *testing.T) {
 	guardDir, err := ensureSearchGuardrailWrappers(t.TempDir())
 	if err != nil {
