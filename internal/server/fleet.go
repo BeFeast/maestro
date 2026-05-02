@@ -3032,6 +3032,9 @@ function renderWorkers(project) {
 }
 
 function renderProjectActions(project) {
+  if (project.read_only === true) {
+    return '<div class="project-actions"><div class="action-note">Write controls are disabled in read-only mode.</div></div>';
+  }
   return '<div class="project-actions"><div class="label">Approval-gated controls</div>' +
     renderActions(project.actions || [], { details: false }) + '</div>';
 }

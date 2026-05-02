@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1275,6 +1276,64 @@ func TestFleetDashboard(t *testing.T) {
 			t.Fatalf("dashboard should not render stale approval history with alarming styling %q", oldAlarm)
 		}
 	}
+}
+
+func TestFleetDashboardReadOnlyProjectControlsRenderQuietNote(t *testing.T) {
+	body := fleetDashboardBody(t)
+	readOnlyBranch := dashboardSnippet(t, body,
+		"if (project.read_only === true)",
+		"return '<div class=\"project-actions\"><div class=\"label\">Approval-gated controls</div>'")
+
+	if !contains(readOnlyBranch, "Write controls are disabled in read-only mode.") {
+		t.Fatalf("read-only project controls should render disabled-write explanation, got:\n%s", readOnlyBranch)
+	}
+	for _, unwanted := range []string{"action-btn", "<button", "renderActions("} {
+		if contains(readOnlyBranch, unwanted) {
+			t.Fatalf("read-only project controls should not render button-like controls %q in:\n%s", unwanted, readOnlyBranch)
+		}
+	}
+}
+
+func TestFleetDashboardWritableProjectControlsKeepApprovalDiagnostics(t *testing.T) {
+	body := fleetDashboardBody(t)
+	writableBranch := dashboardSnippet(t, body,
+		"return '<div class=\"project-actions\"><div class=\"label\">Approval-gated controls</div>'",
+		"function projectFreshnessHTML")
+
+	for _, want := range []string{
+		"Approval-gated controls",
+		"renderActions(project.actions || [], { details: false })",
+	} {
+		if !contains(writableBranch, want) {
+			t.Fatalf("writable project controls should preserve %q in:\n%s", want, writableBranch)
+		}
+	}
+}
+
+func fleetDashboardBody(t *testing.T) string {
+	t.Helper()
+	srv := NewFleet(nil, "127.0.0.1", 8786, true)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetDashboard(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	return w.Body.String()
+}
+
+func dashboardSnippet(t *testing.T, body, startMarker, endMarker string) string {
+	t.Helper()
+	start := strings.Index(body, startMarker)
+	if start < 0 {
+		t.Fatalf("dashboard missing start marker %q", startMarker)
+	}
+	rest := body[start:]
+	end := strings.Index(rest, endMarker)
+	if end < 0 {
+		t.Fatalf("dashboard missing end marker %q after %q", endMarker, startMarker)
+	}
+	return rest[:end]
 }
 
 func TestFleetActionReadOnlyRejectsMutation(t *testing.T) {
