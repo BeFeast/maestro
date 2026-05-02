@@ -1044,7 +1044,7 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "renderWorkerActions") || !contains(body, "actionDetailHTML") || !contains(body, "manual approval required") {
 		t.Error("dashboard should render disabled approval-gated action affordances")
 	}
-	for _, want := range []string{"<html data-theme=\"light\">", "/static/tokens.css", "/static/maestro-mark.svg", "/static/favicon-32.png", "/static/apple-touch-icon-180.png", "/static/og-1200x630.png", "Inter Tight", "JetBrains Mono", "#059669", "#0891b2", "color-scheme: light"} {
+	for _, want := range []string{"<html data-theme=\"light\">", "/static/tokens.css", "/static/components.css", "/static/status-icons.svg", "/static/maestro-mark.svg", "/static/favicon-32.png", "/static/apple-touch-icon-180.png", "/static/og-1200x630.png", "Inter Tight", "JetBrains Mono", "#059669", "#0891b2", "color-scheme: light"} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard design tokens should contain %q", want)
 		}
@@ -1065,6 +1065,21 @@ func TestBrandAssetsEmbedded(t *testing.T) {
 		data := []byte(web.MustReadStatic(name))
 		if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
 			t.Fatalf("%s is not an embedded PNG", name)
+		}
+	}
+}
+
+func TestComponentPrimitivesEmbedded(t *testing.T) {
+	components := web.MustReadStatic("components.css")
+	for _, want := range []string{".pill--ok", ".pill--warn", ".pill--bad", ".pill--idle", ".pill--policy", ".card", ".section", ".caption", ".status-icon"} {
+		if !contains(components, want) {
+			t.Fatalf("components.css should contain %q", want)
+		}
+	}
+	sprite := web.MustReadStatic("status-icons.svg")
+	for _, want := range []string{"status-ready", "status-running", "status-waiting", "status-blocked", "status-merged", "status-stale", "status-daemon", "status-queued"} {
+		if !contains(sprite, `id="`+want+`"`) {
+			t.Fatalf("status icon sprite should contain %q", want)
 		}
 	}
 }
