@@ -713,14 +713,14 @@ function scoreFleetSearchResult(result, query) {
 
 function searchFleetResults(query) {
   const index = buildFleetSearchIndex();
-  if (!searchTerms(query).length) return index.slice(0, 10);
+  const limit = searchTerms(query).length ? 12 : 10;
   return index.map(result => ({ result, score: scoreFleetSearchResult(result, query) }))
     .filter(entry => entry.score >= 0)
     .sort((left, right) => {
       if (left.score !== right.score) return right.score - left.score;
       return compareText(left.result.title, right.result.title);
     })
-    .slice(0, 12)
+    .slice(0, limit)
     .map(entry => entry.result);
 }
 
@@ -2107,6 +2107,7 @@ if (searchInputEl) {
       selectFleetSearchResult(fleetState.search.results[fleetState.search.activeIndex]);
     } else if (event.key === "Escape") {
       event.preventDefault();
+      event.stopPropagation();
       closeSearchPalette();
     }
   });

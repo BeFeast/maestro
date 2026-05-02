@@ -1909,6 +1909,24 @@ func TestFleetDashboardSearchIndexUsesLoadedFleetData(t *testing.T) {
 	}
 }
 
+func TestFleetDashboardSearchRanksDefaultResultsBeforeLimit(t *testing.T) {
+	body := fleetDashboardBody(t)
+	searchSnippet := dashboardSnippet(t, body, "function searchFleetResults(query)", "function searchResultID")
+	for _, want := range []string{
+		"const limit = searchTerms(query).length ? 12 : 10;",
+		"scoreFleetSearchResult(result, query)",
+		".sort((left, right) => {",
+		".slice(0, limit)",
+	} {
+		if !contains(searchSnippet, want) {
+			t.Fatalf("search results should contain %q in:\n%s", want, searchSnippet)
+		}
+	}
+	if contains(searchSnippet, "if (!searchTerms(query).length) return index.slice(0, 10);") {
+		t.Fatalf("default search results should be ranked before truncating in:\n%s", searchSnippet)
+	}
+}
+
 func TestFleetDashboardSearchKeyboardAndSelectionAreReadOnly(t *testing.T) {
 	body := fleetDashboardBody(t)
 	for _, want := range []string{
@@ -1924,6 +1942,11 @@ func TestFleetDashboardSearchKeyboardAndSelectionAreReadOnly(t *testing.T) {
 		if !contains(body, want) {
 			t.Fatalf("search keyboard support should contain %q", want)
 		}
+	}
+
+	inputKeydownSnippet := dashboardSnippet(t, body, `searchInputEl.addEventListener("keydown"`, `projectFilterEl.addEventListener`)
+	if !contains(inputKeydownSnippet, "event.stopPropagation();") {
+		t.Fatalf("search input Escape handler should stop propagation in:\n%s", inputKeydownSnippet)
 	}
 
 	selectionSnippet := dashboardSnippet(t, body, "function openSearchURL(url)", "function workerSearchText(worker)")
