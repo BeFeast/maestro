@@ -449,6 +449,153 @@ func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	}
 }
 
+func TestFleetVerdictCoversHeaderStates(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name      string
+		sessions  map[string]*state.Session
+		decisions []state.SupervisorDecision
+		wantTone  string
+		wantText  []string
+	}{
+		{
+			name: "healthy idle by policy",
+			decisions: []state.SupervisorDecision{{
+				ID:                "sup-healthy-idle",
+				CreatedAt:         now,
+				Project:           "owner/healthy-idle",
+				Summary:           "No open issues match the configured ready labels.",
+				RecommendedAction: "none",
+				Risk:              "safe",
+				QueueAnalysis: &state.SupervisorQueueAnalysis{
+					OpenIssues:         1,
+					EligibleCandidates: 0,
+					ExcludedIssues:     1,
+				},
+			}},
+			wantTone: "healthy",
+			wantText: []string{"Supervisor healthy.", "No worker is running by policy.", "No item needs attention."},
+		},
+		{
+			name: "busy running worker",
+			sessions: map[string]*state.Session{
+				"busy-1": {
+					IssueNumber: 11,
+					IssueTitle:  "Build busy thing",
+					Status:      state.StatusRunning,
+					StartedAt:   now.Add(-time.Minute),
+					PID:         os.Getpid(),
+				},
+			},
+			decisions: []state.SupervisorDecision{{
+				ID:                "sup-busy",
+				CreatedAt:         now,
+				Project:           "owner/busy",
+				Summary:           "Worker is already running.",
+				RecommendedAction: "wait_for_worker",
+				Risk:              "safe",
+			}},
+			wantTone: "busy",
+			wantText: []string{"Supervisor healthy.", "1 worker is running.", "No item needs attention."},
+		},
+		{
+			name: "attention required",
+			sessions: map[string]*state.Session{
+				"dead-1": {
+					IssueNumber: 12,
+					IssueTitle:  "Dead worker",
+					Status:      state.StatusDead,
+					StartedAt:   now.Add(-2 * time.Minute),
+				},
+			},
+			decisions: []state.SupervisorDecision{{
+				ID:                "sup-attention",
+				CreatedAt:         now,
+				Project:           "owner/attention",
+				Summary:           "Worker needs reconciliation.",
+				RecommendedAction: "wait_for_reconciliation",
+				Risk:              "safe",
+			}},
+			wantTone: "attention",
+			wantText: []string{"Supervisor healthy.", "No worker is running.", "1 item needs attention."},
+		},
+		{
+			name: "daemon down stale heartbeat",
+			decisions: []state.SupervisorDecision{{
+				ID:                "sup-stale",
+				CreatedAt:         now.Add(-fleetSupervisorHeartbeatStaleAfter - time.Minute),
+				Project:           "owner/stale",
+				Summary:           "No worker slot is available.",
+				RecommendedAction: "none",
+				Risk:              "safe",
+			}},
+			wantTone: "daemon-down",
+			wantText: []string{"Supervisor heartbeat lost", "Last safe action was", "No worker is running.", "No item needs attention."},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			stateDir := filepath.Join(dir, "state")
+			saveFleetTestSnapshot(t, stateDir, tt.sessions, tt.decisions)
+			srv := NewFleet([]FleetProject{
+				NewFleetProject("Project", "/tmp/project.yaml", "", &config.Config{
+					Repo:        "owner/project",
+					StateDir:    stateDir,
+					MaxParallel: 1,
+				}),
+			}, "127.0.0.1", 8786, true)
+
+			resp := srv.snapshot()
+			if resp.Verdict.Tone != tt.wantTone {
+				t.Fatalf("verdict tone = %q, want %q; sentence=%q", resp.Verdict.Tone, tt.wantTone, resp.Verdict.Sentence)
+			}
+			for _, want := range tt.wantText {
+				if !contains(resp.Verdict.Sentence, want) {
+					t.Fatalf("verdict sentence = %q, want %q", resp.Verdict.Sentence, want)
+				}
+			}
+		})
+	}
+}
+
+func TestFleetVerdictDoesNotTreatProjectFreshnessStaleAsHeartbeatStale(t *testing.T) {
+	now := time.Now().UTC()
+	latest := &supervisorDecisionInfo{CreatedAt: now}
+	resp := fleetResponse{
+		Summary: fleetSummary{Projects: 1, Stale: 1},
+		Projects: []fleetProjectState{{
+			Supervisor: supervisorInfo{Latest: latest},
+		}},
+	}
+
+	verdict := buildFleetVerdict(resp, now)
+	if verdict.Tone != "attention" {
+		t.Fatalf("verdict tone = %q, want attention; sentence=%q", verdict.Tone, verdict.Sentence)
+	}
+	if contains(verdict.Sentence, "heartbeat stale") || contains(verdict.Sentence, "heartbeat lost") {
+		t.Fatalf("verdict sentence = %q, should not label stale snapshots as stale heartbeat", verdict.Sentence)
+	}
+	for _, want := range []string{"Supervisor healthy.", "1 project snapshot is stale.", "1 item needs attention."} {
+		if !contains(verdict.Sentence, want) {
+			t.Fatalf("verdict sentence = %q, want %q", verdict.Sentence, want)
+		}
+	}
+}
+
+func TestFleetIdleByPolicyRequiresEveryIdleProjectReason(t *testing.T) {
+	policyIdle := fleetProjectState{QueueSnapshot: &fleetQueueSnapshot{IdleReason: "Policy excluded all 1 open issue."}}
+	alsoPolicyIdle := fleetProjectState{QueueSnapshot: &fleetQueueSnapshot{IdleReason: "No open issues are available."}}
+
+	if !fleetIdleByPolicy([]fleetProjectState{policyIdle, alsoPolicyIdle}) {
+		t.Fatal("fleetIdleByPolicy = false, want true when every idle project has a policy reason")
+	}
+	if fleetIdleByPolicy([]fleetProjectState{policyIdle, {}}) {
+		t.Fatal("fleetIdleByPolicy = true, want false when another idle project lacks a policy reason")
+	}
+}
+
 func TestFleetAPISurfacesProjectErrorsAndStaleFreshness(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -1041,6 +1188,10 @@ func TestFleetDashboard(t *testing.T) {
 		"/api/v1/fleet",
 		"/api/v1/fleet/worker",
 		"project-tabs",
+		"fleet-verdict",
+		"renderFleetVerdict",
+		"verdict-healthy",
+		"verdict-daemon-down",
 		"approval-inbox",
 		"approval-list",
 		"approval-summary",
@@ -1194,9 +1345,17 @@ func findFleetApproval(t *testing.T, approvals []fleetApprovalState, id string) 
 
 func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Session) {
 	t.Helper()
+	saveFleetTestSnapshot(t, dir, sessions, nil)
+}
+
+func saveFleetTestSnapshot(t *testing.T, dir string, sessions map[string]*state.Session, decisions []state.SupervisorDecision) {
+	t.Helper()
 	st := state.NewState()
 	for name, sess := range sessions {
 		st.Sessions[name] = sess
+	}
+	for _, decision := range decisions {
+		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
 	}
 	if err := state.Save(dir, st); err != nil {
 		t.Fatalf("save state: %v", err)
