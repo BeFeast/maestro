@@ -1408,6 +1408,31 @@ func TestFleetDashboardRendersHistoryCollapseControls(t *testing.T) {
 	}
 }
 
+func TestFleetDashboardCanClearProjectWorkerScope(t *testing.T) {
+	body := fleetDashboardBody(t)
+	for _, want := range []string{
+		`id="worker-project-reset"`,
+		"Show all projects",
+		"workerProjectResetEl.hidden = !projectScoped",
+		`workerProjectResetEl.addEventListener("click", clearWorkerProjectScope)`,
+	} {
+		if !contains(body, want) {
+			t.Fatalf("dashboard worker scope reset should contain %q", want)
+		}
+	}
+
+	clearScope := dashboardSnippet(t, body, "function clearWorkerProjectScope()", "projectFilterEl.addEventListener")
+	for _, want := range []string{
+		`fleetState.selectedProject = "all";`,
+		"updateQueryState();",
+		"renderFleetWorkers();",
+	} {
+		if !contains(clearScope, want) {
+			t.Fatalf("clear project scope handler should contain %q in:\n%s", want, clearScope)
+		}
+	}
+}
+
 func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

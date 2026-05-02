@@ -1938,6 +1938,25 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   .section-head h2 { margin: 0; font-size: 17px; }
   .section-note { color: var(--muted); font-size: 13px; text-align: right; }
+  .worker-scope-status {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+    max-width: min(560px, 100%);
+  }
+  .scope-reset-button {
+    flex: 0 0 auto;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: #ffffff;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 10px;
+  }
+  .scope-reset-button:hover { border-color: rgba(88,166,255,.65); }
   .worker-controls {
     display: grid;
     grid-template-columns: minmax(220px, 2fr) repeat(6, minmax(112px, 1fr));
@@ -2342,7 +2361,10 @@ const fleetDashboardHTML = `<!DOCTYPE html>
         <h2>Fleet Workers</h2>
         <div class="sub">Operator-focused worker queue. Switch scope when you need history.</div>
       </div>
-      <div class="section-note" id="worker-summary">Loading workers...</div>
+      <div class="worker-scope-status">
+        <div class="section-note" id="worker-summary">Loading workers...</div>
+        <button type="button" id="worker-project-reset" class="scope-reset-button" hidden>Show all projects</button>
+      </div>
     </div>
     <div class="worker-controls" id="worker-controls">
       <label class="search-control" for="worker-filter"><span>Search</span><input id="worker-filter" type="search" placeholder="Project, issue, status, backend, or PR"></label>
@@ -2401,6 +2423,7 @@ const attentionListEl = document.getElementById("attention-list");
 const attentionSummaryEl = document.getElementById("attention-summary");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
 const workerSummaryEl = document.getElementById("worker-summary");
+const workerProjectResetEl = document.getElementById("worker-project-reset");
 const workerDetailSummaryEl = document.getElementById("worker-detail-summary");
 const workerDetailBodyEl = document.getElementById("worker-detail-body");
 const workerFilterEl = document.getElementById("worker-filter");
@@ -3333,6 +3356,9 @@ function renderFleetWorkers() {
   const table = fleetWorkersEl.closest("table");
   if (table) table.classList.toggle("worker-table-empty", rowCount === 0);
   const projectLabel = fleetState.selectedProject === "all" ? "all projects" : fleetState.selectedProject;
+  const projectScoped = fleetState.selectedProject !== "all";
+  workerProjectResetEl.hidden = !projectScoped;
+  workerProjectResetEl.setAttribute("aria-label", projectScoped ? "Clear " + projectLabel + " worker scope and show all projects" : "Workers are showing all projects");
   const scopeLabel = scopeLabelText(fleetState.filters.scope);
   const filterText = hasWorkerFilters() ? " · " + visible.length + " shown from " + base.length + " total" : " · " + base.length + " total";
   const attentionCount = visible.filter(worker => worker.needs_attention).length;
@@ -3764,6 +3790,15 @@ function refreshWorkersFromControls() {
   updateQueryState();
   renderFleetWorkers();
 }
+
+function clearWorkerProjectScope() {
+  if (fleetState.selectedProject === "all") return;
+  fleetState.selectedProject = "all";
+  updateQueryState();
+  renderFleetWorkers();
+}
+
+workerProjectResetEl.addEventListener("click", clearWorkerProjectScope);
 
 projectFilterEl.addEventListener("input", () => {
   fleetState.projectQuery = projectFilterEl.value.trim();
