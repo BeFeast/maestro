@@ -64,11 +64,12 @@ func TestDonePRCount(t *testing.T) {
 	s := NewState()
 	s.Sessions["merged-1"] = &Session{IssueNumber: 1, Status: StatusDone, PRNumber: 10}
 	s.Sessions["merged-2"] = &Session{IssueNumber: 2, Status: StatusDone, PRNumber: 11}
+	s.Sessions["code-landed"] = &Session{IssueNumber: 5, Status: StatusCodeLanded, PRNumber: 13}
 	s.Sessions["closed-issue"] = &Session{IssueNumber: 3, Status: StatusDone}
 	s.Sessions["open-pr"] = &Session{IssueNumber: 4, Status: StatusPROpen, PRNumber: 12}
 
-	if got := s.DonePRCount(); got != 2 {
-		t.Fatalf("DonePRCount = %d, want 2", got)
+	if got := s.DonePRCount(); got != 3 {
+		t.Fatalf("DonePRCount = %d, want 3", got)
 	}
 }
 
@@ -532,6 +533,15 @@ func TestIssueInProgress_QueuedCountsAsInProgress(t *testing.T) {
 	}
 }
 
+func TestIssueInProgress_CodeLandedCountsAsInProgress(t *testing.T) {
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 101, Status: StatusCodeLanded, PRNumber: 12}
+
+	if !s.IssueInProgress(101) {
+		t.Error("IssueInProgress should return true for code_landed session")
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }
@@ -553,6 +563,7 @@ func TestIsTerminal(t *testing.T) {
 		{StatusQueued, false},
 		{StatusRunning, false},
 		{StatusPROpen, false},
+		{StatusCodeLanded, false},
 		{StatusDone, true},
 		{StatusFailed, true},
 		{StatusConflictFailed, true},
@@ -639,6 +650,12 @@ func TestPruneOldSessions(t *testing.T) {
 		StartedAt:   recent.Add(-time.Hour),
 		FinishedAt:  &recent,
 	}
+	s.Sessions["old-code-landed"] = &Session{
+		IssueNumber: 4,
+		Status:      StatusCodeLanded,
+		StartedAt:   old.Add(-time.Hour),
+		FinishedAt:  &old,
+	}
 	s.Sessions["running"] = &Session{
 		IssueNumber: 3,
 		Status:      StatusRunning,
@@ -656,6 +673,9 @@ func TestPruneOldSessions(t *testing.T) {
 	}
 	if _, ok := s.Sessions["recent-done"]; !ok {
 		t.Error("recent-done should still exist")
+	}
+	if _, ok := s.Sessions["old-code-landed"]; !ok {
+		t.Error("old-code-landed should still exist (not terminal)")
 	}
 	if _, ok := s.Sessions["running"]; !ok {
 		t.Error("running should still exist (not terminal)")
@@ -1036,10 +1056,11 @@ func TestLiveSessionsAt(t *testing.T) {
 	s.Sessions["running"] = &Session{Status: StatusRunning, StartedAt: old}
 	s.Sessions["recent-done"] = &Session{Status: StatusDone, StartedAt: old, FinishedAt: &recent}
 	s.Sessions["old-done"] = &Session{Status: StatusDone, StartedAt: old, FinishedAt: &old}
+	s.Sessions["recent-code-landed"] = &Session{Status: StatusCodeLanded, StartedAt: old, FinishedAt: &recent}
 
 	live := s.LiveSessionsAt(now)
-	if len(live) != 2 {
-		t.Fatalf("LiveSessionsAt len = %d, want 2", len(live))
+	if len(live) != 3 {
+		t.Fatalf("LiveSessionsAt len = %d, want 3", len(live))
 	}
 }
 
@@ -1049,8 +1070,9 @@ func TestCountByStatus(t *testing.T) {
 	s.Sessions["slot-2"] = &Session{IssueNumber: 2, Status: StatusRunning}
 	s.Sessions["slot-3"] = &Session{IssueNumber: 3, Status: StatusPROpen}
 	s.Sessions["slot-4"] = &Session{IssueNumber: 4, Status: StatusQueued}
-	s.Sessions["slot-5"] = &Session{IssueNumber: 5, Status: StatusDone}   // terminal — excluded
-	s.Sessions["slot-6"] = &Session{IssueNumber: 6, Status: StatusFailed} // terminal — excluded
+	s.Sessions["slot-5"] = &Session{IssueNumber: 5, Status: StatusDone}       // terminal — excluded
+	s.Sessions["slot-6"] = &Session{IssueNumber: 6, Status: StatusFailed}     // terminal — excluded
+	s.Sessions["slot-7"] = &Session{IssueNumber: 7, Status: StatusCodeLanded} // non-terminal — included
 
 	counts := s.CountByStatus()
 
@@ -1062,6 +1084,9 @@ func TestCountByStatus(t *testing.T) {
 	}
 	if counts[StatusQueued] != 1 {
 		t.Errorf("queued = %d, want 1", counts[StatusQueued])
+	}
+	if counts[StatusCodeLanded] != 1 {
+		t.Errorf("code_landed = %d, want 1", counts[StatusCodeLanded])
 	}
 	if counts[StatusDone] != 0 {
 		t.Errorf("done = %d, want 0 (terminal states excluded)", counts[StatusDone])
@@ -1079,6 +1104,10 @@ func TestStatusPriority(t *testing.T) {
 	// pr_open before queued
 	if StatusPriority(StatusPROpen) >= StatusPriority(StatusQueued) {
 		t.Error("pr_open should have lower priority value than queued")
+	}
+	// queued before code_landed
+	if StatusPriority(StatusQueued) >= StatusPriority(StatusCodeLanded) {
+		t.Error("queued should have lower priority value than code_landed")
 	}
 	// queued before terminal states
 	for _, terminal := range []SessionStatus{

@@ -1183,7 +1183,7 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusDone || sess.PRNumber <= 0 {
+		if sess == nil || sess.IssueNumber != issueNumber || (sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded) || sess.PRNumber <= 0 {
 			continue
 		}
 		merged, err := e.reader.IsPRMerged(sess.PRNumber)
@@ -1191,7 +1191,7 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 			return false, "", fmt.Errorf("check PR #%d merged: %w", sess.PRNumber, err)
 		}
 		if merged {
-			return true, fmt.Sprintf("session %s is done with merged PR #%d", slot, sess.PRNumber), nil
+			return true, fmt.Sprintf("session %s is %s with merged PR #%d", slot, sess.Status, sess.PRNumber), nil
 		}
 	}
 
