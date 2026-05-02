@@ -9,7 +9,7 @@ import (
 
 // Files contains the embedded dashboard templates and static assets.
 //
-//go:embed templates/*.html static/*.css static/*.js
+//go:embed templates/*.html static/*
 var Files embed.FS
 
 // MustReadTemplate returns an embedded HTML template and panics if the binary was built incorrectly.

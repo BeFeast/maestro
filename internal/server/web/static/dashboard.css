@@ -17,6 +17,7 @@
     background: var(--surface);
     box-shadow: var(--shadow-soft);
   }
+  .brand-mark { width: 26px; height: 26px; flex: 0 0 auto; }
   h1 {
     margin: 0;
     font-size: 18px;
