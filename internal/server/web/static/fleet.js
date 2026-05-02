@@ -26,6 +26,7 @@ const prFilterEl = document.getElementById("pr-filter");
 const workerSortEl = document.getElementById("worker-sort");
 const sortDirectionEl = document.getElementById("sort-direction");
 const initialStateEl = document.getElementById("fleet-initial-state");
+const expandedProjectStorageKey = "maestro.fleet.expandedProject";
 
 const defaultSortDirections = { status: "asc", project: "asc", issue: "asc", runtime: "desc", pr: "asc" };
 const validSortKeys = new Set(["status", "project", "issue", "runtime", "pr"]);
@@ -49,6 +50,7 @@ const fleetState = {
   selectedProject: "all",
   projectQuery: "",
   readOnly: true,
+  expandedProject: readStoredExpandedProject(),
   requestedWorker: "",
   selectedWorkerKey: "",
   filters: {
@@ -70,6 +72,21 @@ const fleetState = {
 };
 
 loadStateFromQuery();
+
+function readStoredExpandedProject() {
+  try {
+    return window.localStorage.getItem(expandedProjectStorageKey) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function writeStoredExpandedProject(projectName) {
+  try {
+    if (projectName) window.localStorage.setItem(expandedProjectStorageKey, projectName);
+    else window.localStorage.removeItem(expandedProjectStorageKey);
+  } catch (_) {}
+}
 
 function escapeText(value) {
   return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -958,11 +975,52 @@ function projectLinksRailHTML(project) {
   return '<div class="rail-links">' + links.join(' ') + '</div>';
 }
 
+function projectQueueBarHTML(project) {
+  const q = project.queue_snapshot || {};
+  const segments = [
+    ["eligible", Number(q.eligible || 0), "Eligible"],
+    ["held", Number(q.held || q.held_issues || 0), "Held"],
+    ["blocked", Number(q.blocked_by_dependency || q.blocked_by_dependency_issues || 0), "Blocked"],
+    ["excluded", Number(q.excluded || 0), "Excluded"]
+  ].filter(([, value]) => value > 0);
+  const total = segments.reduce((sum, [, value]) => sum + value, 0);
+  if (!total) return '<div class="queue-bar queue-bar-empty" title="No runnable queue shape yet"></div>';
+  const bars = segments.map(([key, value, label]) =>
+    '<span class="queue-bar-segment queue-bar-' + key + '" style="flex-grow:' + value + '" title="' + escapeText(label + ': ' + value) + '"></span>'
+  ).join("");
+  const legend = segments.map(([key, value, label]) =>
+    '<span class="queue-bar-legend-item queue-bar-legend-' + key + '">' + escapeText(label) + ' ' + escapeText(value) + '</span>'
+  ).join("");
+  return '<div class="queue-bar" aria-hidden="true">' + bars + '</div><div class="queue-bar-legend">' + legend + '</div>';
+}
+
+function projectExpandedRailHTML(project) {
+  const queue = queueSnapshotHTML(project) || '<div class="queue-snapshot"><div class="label">Queue Snapshot</div><div class="empty">No queue snapshot available.</div></div>';
+  const why = renderProjectWhy(project);
+  return '<tr class="project-expand-row" data-project-detail="' + escapeText(project.name || "") + '"><td colspan="7">' +
+    '<div class="project-expand-panel">' +
+      '<div class="project-expand-grid">' +
+        '<div class="project-expand-card project-expand-card-queue">' + projectQueueBarHTML(project) + queue + '</div>' +
+        '<div class="project-expand-card project-expand-card-outcome">' + outcomeHTML(project) + '</div>' +
+        '<div class="project-expand-card project-expand-card-supervisor">' + renderSupervisor(project) + '</div>' +
+        (why ? '<div class="project-expand-card project-expand-card-why">' + why + '</div>' : '') +
+      '</div>' +
+      '<div class="project-expand-footer">' +
+        '<div class="rail-subline">Full logs, history, and raw diagnostics stay on the project dashboard.</div>' +
+        projectLinksRailHTML(project) +
+      '</div>' +
+    '</div>' +
+  '</td></tr>';
+}
+
 function projectRailRowHTML(project) {
   const key = projectStateKey(project);
   const modifier = projectIsUnconfigured(project) ? ' project-row--unconfigured' : '';
-  return '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + '" data-project="' + escapeText(project.name || "") + '">' +
-    '<td class="project-rail-project">' + projectIdentityRailHTML(project) + '</td>' +
+  const expanded = fleetState.expandedProject === (project.name || "");
+  const symbol = expanded ? "-" : "+";
+  const title = expanded ? "Collapse project summary" : "Expand project summary";
+  const row = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" tabindex="0" aria-expanded="' + (expanded ? "true" : "false") + '" title="' + escapeText(title) + '">' +
+    '<td class="project-rail-project"><div class="project-rail-project-wrap"><span class="project-expand-symbol" aria-hidden="true">' + symbol + '</span><div class="project-rail-project-copy">' + projectIdentityRailHTML(project) + '</div></div></td>' +
     '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
     '<td class="project-rail-queue-cell">' + projectQueueRailHTML(project) + '</td>' +
     '<td class="project-rail-pr-cell">' + projectPRRailHTML(project) + '</td>' +
@@ -970,6 +1028,14 @@ function projectRailRowHTML(project) {
     '<td class="project-rail-freshness-cell">' + projectFreshnessRailHTML(project) + '</td>' +
     '<td class="project-rail-links-cell">' + projectLinksRailHTML(project) + '</td>' +
   '</tr>';
+  return row + (expanded ? projectExpandedRailHTML(project) : '');
+}
+
+function toggleExpandedProject(projectName) {
+  if (!projectName) return;
+  fleetState.expandedProject = fleetState.expandedProject === projectName ? "" : projectName;
+  writeStoredExpandedProject(fleetState.expandedProject);
+  renderProjectRail();
 }
 
 function renderProjectRail() {
@@ -984,6 +1050,22 @@ function renderProjectRail() {
   }
 
   projectRailBodyEl.innerHTML = projects.map(projectRailRowHTML).join("");
+  projectRailBodyEl.querySelectorAll(".project-rail-row[data-project]").forEach(row => {
+    row.addEventListener("click", event => {
+      if (event.target.closest("a, button")) return;
+      toggleExpandedProject(row.dataset.project || "");
+    });
+    row.addEventListener("keydown", event => {
+      if ((event.key === "Enter" || event.key === " ") && !event.target.closest("a, button")) {
+        event.preventDefault();
+        toggleExpandedProject(row.dataset.project || "");
+      }
+    });
+  });
+  projectRailBodyEl.querySelectorAll(".project-rail-row[data-project] a, .project-rail-row[data-project] button").forEach(control => {
+    control.addEventListener("click", event => event.stopPropagation());
+    control.addEventListener("keydown", event => event.stopPropagation());
+  });
   projectRailBodyEl.querySelectorAll(".project-workers-link[data-project]").forEach(button => {
     button.addEventListener("click", event => {
       event.preventDefault();
@@ -1469,7 +1551,7 @@ function renderProjectOverview() {
   projectSummaryEl.textContent = projects.length + " project" + (projects.length === 1 ? "" : "s") + filtered +
     " · " + running + " running · " + attention + " attention";
   projectsEl.innerHTML = projects.length
-    ? projects.map(renderProject).join("")
+    ? '<div class="project-diagnostics-note">Expand a project row above for queue, outcome, supervisor, and links. Open Dashboard for full logs and history.</div>'
     : '<div class="empty">No project diagnostics match the project search.</div>';
 }
 
