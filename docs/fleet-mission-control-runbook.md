@@ -102,7 +102,7 @@ projects:
 
 ## Operating Model
 
-Fleet Mission Control is an observation surface. It loads each project config, reads each project's state/log metadata, and returns one aggregate response from `/api/v1/fleet`. One project load error is shown on that project card without hiding the rest of the fleet.
+Fleet Mission Control is an observation surface. It loads each project config, reads each project's state/log metadata, and returns one aggregate response from `/api/v1/fleet`. The header starts with one global operator brief across every configured project; project cards, supervisor details, queues, and worker logs are drilldown/debug data after that brief. One project load error is shown on that project card without hiding the rest of the fleet.
 
 The project runner remains the execution surface. It starts workers, reconciles dead sessions, opens and monitors PRs, waits for review gates, merges eligible PRs, deploys when configured, and updates local state.
 
@@ -110,13 +110,16 @@ The supervisor is the explainability and policy surface. It records queue analys
 
 Each project card shows an outcome status: goal, runtime target, health state, and next action. If no `outcome` brief is configured, Mission Control says so explicitly because merged PR throughput is not the same as a working runtime. If PRs keep merging while runtime health is unknown or failing, the supervisor records `no_outcome_progress` and recommends a read-only deploy/runtime check instead of mutating production.
 
+The global brief names one state for the whole fleet: healthy idle, running work, waiting for CI/review, no eligible issues, dispatch failure, stale worker, runtime outcome drift, or the single highest-priority action that needs an operator. When no human action is needed, it says so explicitly.
+
 Use this order during normal operations:
 
 1. Open Fleet Mission Control at `http://127.0.0.1:8787/`.
-2. Check fleet summary, stale project cards, attention cards, approvals, queue snapshots, and active workers.
-3. Open a project dashboard link only when the fleet card needs project-level detail.
-4. Use CLI commands with explicit `--config` paths when you need local state, logs, or a supervised decision.
-5. Restart services rather than editing state files by hand.
+2. Read the global operator brief first; if it says no action is needed, treat the rest of the page as supporting detail.
+3. If the brief names an action, follow that project, issue/PR/session, and reason before scanning lower-priority cards.
+4. Open a project dashboard link only when the fleet card needs project-level detail.
+5. Use CLI commands with explicit `--config` paths when you need local state, logs, or a supervised decision.
+6. Restart services rather than editing state files by hand.
 
 ## Queue Policy
 
