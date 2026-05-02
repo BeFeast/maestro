@@ -132,13 +132,17 @@
       </table>
     </div>
   </section>
-  <section class="worker-detail" id="worker-detail" aria-live="polite">
+  <div class="worker-detail-backdrop" id="worker-detail-backdrop" hidden></div>
+  <section class="worker-detail worker-drawer" id="worker-detail" aria-live="polite" aria-hidden="true">
     <div class="section-head">
       <div>
         <h2>Worker Detail</h2>
         <div class="sub">Select a worker row to inspect session state and recent log output.</div>
       </div>
-      <div class="section-note" id="worker-detail-summary">No worker selected</div>
+      <div class="worker-detail-head-actions">
+        <div class="section-note" id="worker-detail-summary">No worker selected</div>
+        <button type="button" id="worker-detail-close" class="drawer-close-button" aria-label="Close worker detail">Close</button>
+      </div>
     </div>
     <div class="detail-body" id="worker-detail-body">
       <div class="empty">Select a fleet worker to show metadata and log output.</div>
