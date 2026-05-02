@@ -21,7 +21,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const fleetProjectStaleAfter = 15 * time.Minute
+const (
+	fleetProjectStaleAfter             = 15 * time.Minute
+	fleetSupervisorHeartbeatStaleAfter = fleetProjectStaleAfter
+)
 
 // FleetProject describes one Maestro project exposed in the fleet dashboard.
 type FleetProject struct {
@@ -181,11 +184,17 @@ func (s *FleetServer) Start(ctx context.Context) error {
 type fleetResponse struct {
 	ReadOnly    bool                 `json:"read_only"`
 	RefreshedAt string               `json:"refreshed_at"`
+	Verdict     fleetVerdict         `json:"verdict"`
 	Projects    []fleetProjectState  `json:"projects"`
 	Summary     fleetSummary         `json:"summary"`
 	Workers     []fleetWorkerState   `json:"workers"`
 	Attention   []fleetWorkerState   `json:"attention"`
 	Approvals   []fleetApprovalState `json:"approvals,omitempty"`
+}
+
+type fleetVerdict struct {
+	Tone     string `json:"tone"`
+	Sentence string `json:"sentence"`
 }
 
 type fleetSummary struct {
@@ -547,7 +556,207 @@ func (s *FleetServer) snapshot() fleetResponse {
 		return left.Slot < right.Slot
 	})
 	sortFleetApprovals(resp.Approvals)
+	resp.Verdict = buildFleetVerdict(resp, now)
 	return resp
+}
+
+func buildFleetVerdict(resp fleetResponse, now time.Time) fleetVerdict {
+	latest := latestFleetSupervisorDecision(resp.Projects)
+	tone := fleetVerdictTone(resp.Summary, latest, now)
+	parts := []string{
+		fleetLivenessSentence(resp.Summary, resp.Projects, latest, now),
+		fleetRunningSentence(resp.Summary.Running, fleetIdleByPolicy(resp.Projects)),
+	}
+	if pr := fleetPRSentence(resp.Summary.PROpen); pr != "" {
+		parts = append(parts, pr)
+	}
+	parts = append(parts, fleetAttentionSentence(resp.Summary))
+	return fleetVerdict{
+		Tone:     tone,
+		Sentence: strings.Join(parts, " "),
+	}
+}
+
+func fleetVerdictTone(summary fleetSummary, latest *supervisorDecisionInfo, now time.Time) string {
+	if summary.Stale > 0 || latest == nil || supervisorHeartbeatStale(latest, now) {
+		return "daemon-down"
+	}
+	if summary.Errors > 0 || summary.NeedsAttention > 0 || summary.ApprovalsPending > 0 {
+		return "attention"
+	}
+	if summary.Running > 0 {
+		return "busy"
+	}
+	return "healthy"
+}
+
+func fleetLivenessSentence(summary fleetSummary, projects []fleetProjectState, latest *supervisorDecisionInfo, now time.Time) string {
+	if latest == nil || latest.CreatedAt.IsZero() {
+		return "Supervisor heartbeat unavailable."
+	}
+	if summary.Stale > 0 {
+		return fmt.Sprintf("Supervisor heartbeat stale for %s.", projectCountPhrase(summary.Stale))
+	}
+	if supervisorHeartbeatStale(latest, now) {
+		sentence := fmt.Sprintf("Supervisor heartbeat lost %s ago.", formatFleetVerdictAge(latest.CreatedAt, now))
+		if lastSafe := latestFleetSafeSupervisorAction(projects); lastSafe != nil {
+			if safe := fleetLastSafeActionSentence(*lastSafe, now); safe != "" {
+				sentence += " " + safe
+			}
+		}
+		return sentence
+	}
+	return "Supervisor healthy."
+}
+
+func supervisorHeartbeatStale(latest *supervisorDecisionInfo, now time.Time) bool {
+	if latest == nil || latest.CreatedAt.IsZero() {
+		return true
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return now.Sub(latest.CreatedAt) > fleetSupervisorHeartbeatStaleAfter
+}
+
+func fleetRunningSentence(running int, idleByPolicy bool) string {
+	switch running {
+	case 0:
+		if idleByPolicy {
+			return "No worker is running by policy."
+		}
+		return "No worker is running."
+	case 1:
+		return "1 worker is running."
+	default:
+		return fmt.Sprintf("%d workers are running.", running)
+	}
+}
+
+func fleetPRSentence(prOpen int) string {
+	switch prOpen {
+	case 0:
+		return ""
+	case 1:
+		return "1 PR is waiting for review."
+	default:
+		return fmt.Sprintf("%d PRs are waiting for review.", prOpen)
+	}
+}
+
+func fleetAttentionSentence(summary fleetSummary) string {
+	items := summary.NeedsAttention + summary.ApprovalsPending + summary.Errors
+	switch items {
+	case 0:
+		return "No item needs attention."
+	case 1:
+		return "1 item needs attention."
+	default:
+		return fmt.Sprintf("%d items need attention.", items)
+	}
+}
+
+func latestFleetSupervisorDecision(projects []fleetProjectState) *supervisorDecisionInfo {
+	var latest *supervisorDecisionInfo
+	for i := range projects {
+		decision := projects[i].Supervisor.Latest
+		if decision == nil || decision.CreatedAt.IsZero() {
+			continue
+		}
+		if latest == nil || decision.CreatedAt.After(latest.CreatedAt) {
+			latest = decision
+		}
+	}
+	return latest
+}
+
+func latestFleetSafeSupervisorAction(projects []fleetProjectState) *supervisorActionInfo {
+	var latest *supervisorActionInfo
+	for i := range projects {
+		action := projects[i].Supervisor.LastSafeAction
+		if action == nil || action.CreatedAt.IsZero() {
+			continue
+		}
+		if latest == nil || action.CreatedAt.After(latest.CreatedAt) {
+			latest = action
+		}
+	}
+	return latest
+}
+
+func fleetLastSafeActionSentence(action supervisorActionInfo, now time.Time) string {
+	summary := strings.TrimSpace(strings.Join(strings.Fields(action.Summary), " "))
+	if summary == "" {
+		summary = strings.TrimSpace(action.Action)
+	}
+	if summary == "" {
+		return ""
+	}
+	if len([]rune(summary)) > 120 {
+		runes := []rune(summary)
+		summary = string(runes[:117]) + "..."
+	}
+	if action.CreatedAt.IsZero() {
+		return fmt.Sprintf("Last safe action was %s.", strconv.Quote(summary))
+	}
+	return fmt.Sprintf("Last safe action was %s %s ago.", strconv.Quote(summary), formatFleetVerdictAge(action.CreatedAt, now))
+}
+
+func fleetIdleByPolicy(projects []fleetProjectState) bool {
+	sawPolicy := false
+	for _, project := range projects {
+		if project.Error != "" {
+			return false
+		}
+		if project.Running > 0 {
+			return false
+		}
+		if project.QueueSnapshot == nil || strings.TrimSpace(project.QueueSnapshot.IdleReason) == "" {
+			continue
+		}
+		sawPolicy = true
+	}
+	return sawPolicy
+}
+
+func projectCountPhrase(count int) string {
+	if count == 1 {
+		return "1 project"
+	}
+	return fmt.Sprintf("%d projects", count)
+}
+
+func formatFleetVerdictAge(t, now time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	d := now.Sub(t).Round(time.Second)
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Minute {
+		seconds := int(d / time.Second)
+		if seconds <= 0 {
+			return "just now"
+		}
+		return fmt.Sprintf("%ds", seconds)
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Round(time.Minute)/time.Minute))
+	}
+	if d < 24*time.Hour {
+		rounded := d.Round(time.Minute)
+		hours := int(rounded / time.Hour)
+		minutes := int((rounded % time.Hour) / time.Minute)
+		if minutes == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dd", int(d.Round(24*time.Hour)/(24*time.Hour)))
 }
 
 func newFleetProjectFreshness() fleetProjectFreshness {
@@ -1037,6 +1246,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
     --ok: #3fb950;
     --warn: #d29922;
     --bad: #f85149;
+    --queued: #a371f7;
   }
   * { box-sizing: border-box; }
   body {
@@ -1057,6 +1267,23 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   }
   h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
   .sub { color: var(--muted); font-size: 13px; }
+  .fleet-verdict {
+    max-width: 780px;
+    margin-top: 8px;
+    padding: 9px 12px;
+    border: 1px solid var(--line);
+    border-left-width: 4px;
+    border-radius: 12px;
+    background: rgba(88,166,255,.08);
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 650;
+    line-height: 1.35;
+  }
+  .fleet-verdict.verdict-healthy { border-left-color: var(--ok); background: rgba(63,185,80,.09); }
+  .fleet-verdict.verdict-busy { border-left-color: var(--accent); background: rgba(88,166,255,.1); }
+  .fleet-verdict.verdict-attention { border-left-color: var(--warn); background: rgba(210,153,34,.11); }
+  .fleet-verdict.verdict-daemon-down { border-left-color: var(--bad); background: rgba(248,81,73,.12); }
   .stats {
     display: grid;
     grid-template-columns: repeat(5, minmax(68px, 1fr));
@@ -1632,6 +1859,7 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   <div>
     <h1>Maestro Fleet</h1>
     <div class="sub" id="subtitle">Loading projects...</div>
+    <div class="fleet-verdict verdict-healthy" id="fleet-verdict">Loading supervisor heartbeat...</div>
   </div>
   <div class="stats" id="stats"></div>
 </header>
@@ -1721,6 +1949,7 @@ const projectsEl = document.getElementById("projects");
 const projectSummaryEl = document.getElementById("project-summary");
 const statsEl = document.getElementById("stats");
 const subtitleEl = document.getElementById("subtitle");
+const fleetVerdictEl = document.getElementById("fleet-verdict");
 const tabsEl = document.getElementById("project-tabs");
 const approvalListEl = document.getElementById("approval-list");
 const approvalSummaryEl = document.getElementById("approval-summary");
@@ -1774,6 +2003,7 @@ const fleetState = {
   attention: [],
   workers: [],
   detail: null,
+  verdict: null,
   refreshedAt: ""
 };
 
@@ -2419,6 +2649,14 @@ function countFailed(project) {
   return project.failed || 0;
 }
 
+function renderFleetVerdict(verdict) {
+  const tones = new Set(["healthy", "busy", "attention", "daemon-down"]);
+  const tone = verdict && tones.has(verdict.tone) ? verdict.tone : "attention";
+  const sentence = verdict && verdict.sentence ? verdict.sentence : "Supervisor status unavailable. No worker state or attention state could be confirmed.";
+  fleetVerdictEl.className = "fleet-verdict verdict-" + tone;
+  fleetVerdictEl.textContent = sentence;
+}
+
 function renderStats(summary) {
   const items = [
     ["Projects", summary.projects || 0],
@@ -2931,6 +3169,7 @@ async function loadFleet() {
     fleetState.workers = fleetWorkersFromData(data);
     fleetState.approvals = approvalsFromData(data);
     fleetState.attention = attentionFromData(data);
+    fleetState.verdict = data.verdict || null;
     if (fleetState.selectedWorkerKey && !selectedWorker()) {
       fleetState.selectedWorkerKey = "";
       fleetState.detail = null;
@@ -2945,6 +3184,7 @@ async function loadFleet() {
       (alerts.length ? " · " + alerts.join(" · ") : "");
     renderFilterOptions();
     syncFilterControls();
+    renderFleetVerdict(fleetState.verdict);
     renderStats(summary);
     renderProjectTabs();
     renderProjectOverview();
@@ -2954,6 +3194,7 @@ async function loadFleet() {
     renderWorkerDetail(fleetState.detail);
   } catch (err) {
     subtitleEl.textContent = "Fleet API error" + (fleetState.refreshedAt ? " · Last successful refresh " + formatTimestamp(fleetState.refreshedAt) : "");
+    renderFleetVerdict({ tone: "daemon-down", sentence: "Fleet API error. Supervisor heartbeat unavailable; worker state and attention state could not be confirmed." });
     approvalSummaryEl.textContent = "Fleet API error";
     approvalListEl.innerHTML = '<div class="error">Unable to load approval inbox.</div>';
     attentionSummaryEl.textContent = "Fleet API error";
