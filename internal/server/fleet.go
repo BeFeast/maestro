@@ -1673,7 +1673,11 @@ func renderFleetProjectRailRows(projects []fleetProjectState) string {
 }
 
 func renderFleetProjectRailRow(project fleetProjectState) string {
-	rowClass := "project-rail-row " + fleetProjectRailStateClass(project)
+	rowClasses := []string{"project-rail-row", fleetProjectRailStateClass(project)}
+	if fleetProjectUnconfigured(project) {
+		rowClasses = append(rowClasses, "project-row--unconfigured")
+	}
+	rowClass := strings.Join(rowClasses, " ")
 	return `<tr class="` + html.EscapeString(rowClass) + `">` +
 		`<td class="project-rail-project">` + renderFleetProjectIdentity(project) + `</td>` +
 		`<td class="project-rail-state-cell">` + renderFleetProjectRailState(project) + `</td>` +
@@ -1703,6 +1707,21 @@ func renderFleetProjectIdentity(project fleetProjectState) string {
 }
 
 func renderFleetProjectRailState(project fleetProjectState) string {
+	if fleetProjectUnconfigured(project) {
+		parts := []string{
+			`<span class="pill rail-state-unconfigured">setup</span>`,
+			`<div class="rail-subline" title="No outcome brief configured">No outcome brief configured</div>`,
+			`<div class="rail-note rail-setup-link">Set up &rarr;</div>`,
+		}
+		if project.Error != "" {
+			parts = append(parts, `<div class="rail-alert" title="`+html.EscapeString(project.Error)+`">State error</div>`)
+		}
+		if project.Freshness.Stale {
+			parts = append(parts, `<div class="rail-warn">Stale snapshot</div>`)
+		}
+		return strings.Join(parts, "")
+	}
+
 	operator := project.OperatorState
 	label := fleetProjectStateLabel(project)
 	summary := strings.TrimSpace(operator.Summary)
@@ -1810,6 +1829,15 @@ func fleetProjectPRLinks(project fleetProjectState, limit int) []string {
 }
 
 func renderFleetProjectRailOutcome(project fleetProjectState) string {
+	if fleetProjectUnconfigured(project) {
+		next := strings.TrimSpace(project.Outcome.NextAction)
+		if next == "" {
+			next = "Add an outcome brief to this project's Maestro config."
+		}
+		return `<div class="rail-subline rail-setup-copy" title="No outcome brief configured">No outcome brief configured</div>` +
+			`<div class="rail-note rail-setup-link" title="` + html.EscapeString(next) + `">Set up &rarr;</div>`
+	}
+
 	health := strings.TrimSpace(project.Outcome.HealthState)
 	if health == "" {
 		health = outcome.HealthUnknown
@@ -1851,6 +1879,13 @@ func renderFleetProjectRailFreshness(project fleetProjectState) string {
 
 func renderFleetProjectRailLinks(project fleetProjectState) string {
 	links := make([]string, 0, 3)
+	if fleetProjectUnconfigured(project) {
+		if setupURL := strings.TrimSpace(project.DashboardURL); setupURL != "" {
+			links = append(links, `<a class="setup-link" href="`+html.EscapeString(setupURL)+`" target="_blank" rel="noreferrer">Set up &rarr;</a>`)
+		} else if setupURL := fleetProjectGitHubURL(project.Repo); setupURL != "" {
+			links = append(links, `<a class="setup-link" href="`+html.EscapeString(setupURL)+`" target="_blank" rel="noreferrer">Set up &rarr;</a>`)
+		}
+	}
 	if strings.TrimSpace(project.DashboardURL) != "" {
 		links = append(links, `<a href="`+html.EscapeString(project.DashboardURL)+`" target="_blank" rel="noreferrer">Dashboard</a>`)
 	}
@@ -1862,6 +1897,9 @@ func renderFleetProjectRailLinks(project fleetProjectState) string {
 }
 
 func fleetProjectStateLabel(project fleetProjectState) string {
+	if fleetProjectUnconfigured(project) {
+		return "setup"
+	}
 	if label := strings.TrimSpace(project.OperatorState.Label); label != "" {
 		return label
 	}
@@ -1869,6 +1907,9 @@ func fleetProjectStateLabel(project fleetProjectState) string {
 }
 
 func fleetProjectStatePillClass(project fleetProjectState) string {
+	if fleetProjectUnconfigured(project) {
+		return "rail-state-unconfigured"
+	}
 	key := strings.TrimSpace(project.OperatorState.Kind)
 	if key == "" {
 		key = "idle"
@@ -1877,11 +1918,18 @@ func fleetProjectStatePillClass(project fleetProjectState) string {
 }
 
 func fleetProjectRailStateClass(project fleetProjectState) string {
+	if fleetProjectUnconfigured(project) {
+		return "project-row-unconfigured"
+	}
 	key := strings.TrimSpace(project.OperatorState.Kind)
 	if key == "" {
 		key = "idle"
 	}
 	return "project-row-" + fleetCSSClassToken(key)
+}
+
+func fleetProjectUnconfigured(project fleetProjectState) bool {
+	return !project.Outcome.Configured
 }
 
 func fleetProjectGitHubURL(repo string) string {
