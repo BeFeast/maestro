@@ -1111,7 +1111,7 @@ func autoCreatedPRBody(sess *state.Session, branch string, reasons []string) str
 	if reasonText == "" {
 		reasonText = "worker process exited before PR creation was observed"
 	}
-	return fmt.Sprintf(`Closes #%d
+	return fmt.Sprintf(`Refs #%d
 
 Maestro auto-created this PR because the worker pushed branch %s but exited before opening a pull request.
 

@@ -1017,6 +1017,104 @@ func TestFleetWorkersIncludeRecentlyCompletedDoneRows(t *testing.T) {
 	}
 }
 
+func TestFleetWorkersKeepHistoricalSessionsSearchableButOutOfDefaultScope(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	old := now.Add(-72 * time.Hour)
+	stateDir := filepath.Join(dir, "state")
+	sessions := make(map[string]*state.Session)
+	for i := 1; i <= 55; i++ {
+		finished := old.Add(-time.Duration(i) * time.Minute)
+		slot := "hist-" + strconv.Itoa(i)
+		sessions[slot] = &state.Session{
+			IssueNumber: 1000 + i,
+			IssueTitle:  "Historical done session",
+			Status:      state.StatusDone,
+			StartedAt:   finished.Add(-30 * time.Minute),
+			FinishedAt:  fleetTimePtr(finished),
+		}
+	}
+	recentFinished := now.Add(-15 * time.Minute)
+	retryAt := now.Add(30 * time.Minute)
+	sessions["live-running"] = &state.Session{
+		IssueNumber: 1,
+		IssueTitle:  "Running worker",
+		Status:      state.StatusRunning,
+		StartedAt:   now.Add(-time.Hour),
+	}
+	sessions["live-pr"] = &state.Session{
+		IssueNumber: 2,
+		IssueTitle:  "Open PR worker",
+		Status:      state.StatusPROpen,
+		StartedAt:   now.Add(-2 * time.Hour),
+		PRNumber:    22,
+	}
+	sessions["live-retry"] = &state.Session{
+		IssueNumber: 3,
+		IssueTitle:  "Retry worker",
+		Status:      state.StatusDead,
+		StartedAt:   old,
+		FinishedAt:  fleetTimePtr(old.Add(time.Hour)),
+		NextRetryAt: &retryAt,
+	}
+	sessions["live-recent"] = &state.Session{
+		IssueNumber: 4,
+		IssueTitle:  "Recently completed worker",
+		Status:      state.StatusDone,
+		StartedAt:   now.Add(-45 * time.Minute),
+		FinishedAt:  &recentFinished,
+	}
+	saveFleetTestState(t, stateDir, sessions)
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	if len(resp.Workers) != 59 {
+		t.Fatalf("fleet workers len = %d, want all 59 searchable sessions", len(resp.Workers))
+	}
+	project := findFleetProject(t, resp.Projects, "One")
+	if project.Sessions != 59 {
+		t.Fatalf("project sessions = %d, want 59", project.Sessions)
+	}
+	if len(project.Active) != 4 {
+		t.Fatalf("project active len = %d, want live default set", len(project.Active))
+	}
+
+	defaultVisible := 0
+	visibleAttention := 0
+	historical := 0
+	for _, worker := range resp.Workers {
+		if worker.Live || worker.NeedsAttention {
+			defaultVisible++
+			if worker.NeedsAttention {
+				visibleAttention++
+			}
+		} else {
+			historical++
+		}
+	}
+	if defaultVisible != 4 || historical != 55 {
+		t.Fatalf("default/history counts = %d/%d, want 4/55", defaultVisible, historical)
+	}
+	if resp.Summary.NeedsAttention != visibleAttention {
+		t.Fatalf("summary attention = %d, visible default attention = %d", resp.Summary.NeedsAttention, visibleAttention)
+	}
+
+	oldWorker := findFleetWorker(t, resp.Workers, "hist-1")
+	if oldWorker.Live || oldWorker.NeedsAttention {
+		t.Fatalf("old historical worker = %+v, want searchable but outside default live scope", oldWorker)
+	}
+	if !findFleetWorker(t, resp.Workers, "live-recent").Live {
+		t.Fatal("recently changed done worker should stay in the default live scope")
+	}
+}
+
 func TestFleetWorkerDetailIncludesMetadataAndLog(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -1278,6 +1376,23 @@ func TestFleetDashboard(t *testing.T) {
 	}
 }
 
+func TestFleetDashboardRendersHistoryCollapseControls(t *testing.T) {
+	body := fleetDashboardBody(t)
+	for _, want := range []string{
+		"function historySummaryRowHTML(workers)",
+		"class=\"history-row\"",
+		"data-history-scope=\"recent\"",
+		"historical collapsed",
+		"hasWorkerDrilldownFilters",
+		"worker.live === true",
+		"Search or switch scope to inspect every session.",
+	} {
+		if !contains(body, want) {
+			t.Fatalf("dashboard history collapse renderer should contain %q", want)
+		}
+	}
+}
+
 func TestFleetDashboardReadOnlyProjectControlsRenderQuietNote(t *testing.T) {
 	body := fleetDashboardBody(t)
 	readOnlyBranch := dashboardSnippet(t, body,
@@ -1419,6 +1534,10 @@ func saveFleetTestSnapshot(t *testing.T, dir string, sessions map[string]*state.
 	if err := state.Save(dir, st); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
+}
+
+func fleetTimePtr(t time.Time) *time.Time {
+	return &t
 }
 
 func assertFleetReadOnlyAction(t *testing.T, action controlAction) {

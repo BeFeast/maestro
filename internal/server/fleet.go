@@ -307,6 +307,7 @@ type fleetWorkerState struct {
 	StatusReason      string          `json:"status_reason,omitempty"`
 	NextAction        string          `json:"next_action,omitempty"`
 	NeedsAttention    bool            `json:"needs_attention,omitempty"`
+	Live              bool            `json:"live"`
 	Backend           string          `json:"backend,omitempty"`
 	PRNumber          int             `json:"pr_number,omitempty"`
 	PRURL             string          `json:"pr_url,omitempty"`
@@ -941,15 +942,15 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.ApprovalSummary[approval.Status]++
 		}
 	}
-	workers := make([]fleetWorkerState, 0)
+	workers := make([]fleetWorkerState, 0, len(projectState.All))
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 			item.Attention = append(item.Attention, worker)
 		}
-		if isFleetWorkerVisible(worker) {
-			workers = append(workers, makeFleetWorkerState(item, worker))
+		workers = append(workers, makeFleetWorkerState(item, worker))
+		if isFleetWorkerDefaultVisible(worker) {
 			if len(item.Active) >= 6 {
 				continue
 			}
@@ -959,18 +960,8 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	return item, workers
 }
 
-func isFleetWorkerVisible(worker sessionInfo) bool {
-	if worker.DisplayStatus != "" && worker.DisplayStatus != worker.Status {
-		return true
-	}
-	if worker.Status == string(state.StatusRunning) || worker.Status == string(state.StatusPROpen) || worker.NeedsAttention {
-		return true
-	}
-	if worker.Status == string(state.StatusDone) {
-		finishedAt, err := time.Parse(time.RFC3339, worker.FinishedAt)
-		return err == nil && time.Since(finishedAt) <= 24*time.Hour
-	}
-	return false
+func isFleetWorkerDefaultVisible(worker sessionInfo) bool {
+	return worker.NeedsAttention || worker.Live
 }
 
 func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
@@ -987,6 +978,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		StatusReason:      worker.StatusReason,
 		NextAction:        worker.NextAction,
 		NeedsAttention:    worker.NeedsAttention,
+		Live:              worker.Live,
 		Backend:           worker.Backend,
 		PRNumber:          worker.PRNumber,
 		PRURL:             worker.PRURL,
@@ -1613,9 +1605,31 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .worker-table tbody tr.row-running { background: rgba(63,185,80,.055); }
   .worker-table tbody tr.row-pr { background: rgba(88,166,255,.055); }
   .worker-table tbody tr.row-attention { background: rgba(248,81,73,.1); }
+  .worker-table tbody tr.history-row { background: rgba(139,148,158,.08); }
+  .worker-table tbody tr.history-row td { white-space: normal; }
   .worker-table tbody tr.selected { outline: 1px solid rgba(88,166,255,.65); outline-offset: -1px; }
   .worker-table tbody tr:hover { background: #18212c; }
+  .worker-table tbody tr.history-row:hover { background: rgba(139,148,158,.12); }
   .worker-table tbody tr[data-slot] { cursor: pointer; }
+  .history-row-content {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .history-row-content strong { color: var(--text); }
+  .history-row-content span { color: var(--muted); font-size: 12px; }
+  .history-row-action {
+    flex: 0 0 auto;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    padding: 5px 10px;
+  }
+  .history-row-action:hover { border-color: rgba(88,166,255,.65); }
   .project-col { width: 140px; font-weight: 650; }
   .slot-col { width: 92px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .issue-col { width: auto; }
@@ -2373,7 +2387,8 @@ function workerSearchText(worker) {
 }
 
 function workerMatchesFilters(worker) {
-  if (!workerMatchesScope(worker)) return false;
+  const drilldown = hasWorkerDrilldownFilters();
+  if (!workerMatchesScope(worker) && !(fleetState.filters.scope === "operator" && drilldown)) return false;
   if (fleetState.filters.status !== "all" && displayStatus(worker) !== fleetState.filters.status) return false;
   if (fleetState.filters.backend !== "all" && (worker.backend || "") !== fleetState.filters.backend) return false;
   if (fleetState.filters.pr === "with" && !worker.pr_number) return false;
@@ -2385,9 +2400,14 @@ function workerMatchesFilters(worker) {
 }
 
 function isLiveWorker(worker) {
+  if (worker.live === true) return true;
   const displayed = displayStatus(worker);
   return ["running", "pr_open", "queued", "review_retry_running", "review_retry_recheck", "review_retry_pending", "review_retry_backoff"].includes(displayed) ||
     ["running", "pr_open", "queued"].includes(worker.status || "");
+}
+
+function defaultWorkerVisible(worker) {
+  return workerNeedsAttention(worker) || isLiveWorker(worker);
 }
 
 function workerMatchesScope(worker) {
@@ -2419,7 +2439,11 @@ function selectedProjectWorkers() {
 }
 
 function hasWorkerFilters() {
-  return fleetState.filters.query !== "" || fleetState.filters.scope !== "operator" || fleetState.filters.status !== "all" || fleetState.filters.backend !== "all" || fleetState.filters.pr !== "all";
+  return fleetState.filters.scope !== "operator" || hasWorkerDrilldownFilters();
+}
+
+function hasWorkerDrilldownFilters() {
+  return fleetState.filters.query !== "" || fleetState.filters.status !== "all" || fleetState.filters.backend !== "all" || fleetState.filters.pr !== "all";
 }
 
 function workerNeedsAttention(worker) {
@@ -2713,22 +2737,26 @@ function renderProjectTabs() {
 function renderFleetWorkers() {
   const base = selectedProjectWorkers();
   const visible = sortWorkers(filteredWorkers(true));
+  const showingDefaultScope = fleetState.filters.scope === "operator" && !hasWorkerDrilldownFilters();
+  const hiddenHistory = showingDefaultScope ? base.filter(worker => !defaultWorkerVisible(worker)) : [];
+  const rowCount = visible.length + (hiddenHistory.length ? 1 : 0);
   const table = fleetWorkersEl.closest("table");
-  if (table) table.classList.toggle("worker-table-empty", visible.length === 0);
+  if (table) table.classList.toggle("worker-table-empty", rowCount === 0);
   const projectLabel = fleetState.selectedProject === "all" ? "all projects" : fleetState.selectedProject;
   const scopeLabel = scopeLabelText(fleetState.filters.scope);
   const filterText = hasWorkerFilters() ? " · " + visible.length + " shown from " + base.length + " total" : " · " + base.length + " total";
   const attentionCount = visible.filter(worker => worker.needs_attention).length;
   workerSummaryEl.textContent = scopeLabel + " · " + visible.length + " worker" + (visible.length === 1 ? "" : "s") + " in " + projectLabel +
-    filterText + (attentionCount ? " · " + attentionCount + " need attention" : "");
+    filterText + (hiddenHistory.length ? " · " + hiddenHistory.length + " historical collapsed" : "") +
+    (attentionCount ? " · " + attentionCount + " need attention" : "");
 
-  if (visible.length === 0) {
+  if (rowCount === 0) {
     const empty = fleetEmptyText(projectLabel, base.length);
     fleetWorkersEl.innerHTML = '<tr><td colspan="9" class="empty">' + escapeText(empty) + '</td></tr>';
     return;
   }
 
-  fleetWorkersEl.innerHTML = visible.map(worker => {
+  const rows = visible.map(worker => {
     const pr = worker.pr_number ? "#" + worker.pr_number : "-";
     const project = worker.project_name || "-";
     const issueText = issueSummaryText(worker);
@@ -2744,7 +2772,11 @@ function renderFleetWorkers() {
       '<td class="tokens-col">' + compactNumber(worker.tokens_used_total) + '</td>' +
       '<td class="action-col">' + renderActions(worker.actions || [], { details: false }) + '</td>' +
     '</tr>';
-  }).join("");
+  });
+  if (hiddenHistory.length) {
+    rows.push(historySummaryRowHTML(hiddenHistory));
+  }
+  fleetWorkersEl.innerHTML = rows.join("");
 
   fleetWorkersEl.querySelectorAll("tr[data-slot]").forEach(row => {
     row.addEventListener("click", () => selectWorker(row.dataset.project || "", row.dataset.slot || ""));
@@ -2755,6 +2787,31 @@ function renderFleetWorkers() {
       }
     });
   });
+  fleetWorkersEl.querySelectorAll("button[data-history-scope]").forEach(button => {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      showHistoryScope(button.dataset.historyScope || "recent");
+    });
+  });
+}
+
+function historySummaryRowHTML(workers) {
+  const count = workers.length;
+  const sample = workers.slice(0, 3).map(worker => (worker.project_name || "-") + " / " + (worker.slot || "-")).join(", ");
+  const note = "Done/stale sessions are collapsed by default." + (sample ? " Examples: " + sample + "." : "") + " Search or switch scope to inspect every session.";
+  return '<tr class="history-row"><td colspan="9"><div class="history-row-content">' +
+    '<div><strong>' + escapeText(count + " historical worker" + (count === 1 ? "" : "s")) + '</strong><span> ' + escapeText(note) + '</span></div>' +
+    '<button type="button" class="history-row-action" data-history-scope="recent">Show history</button>' +
+    '</div></td></tr>';
+}
+
+function showHistoryScope(scope) {
+  fleetState.filters.scope = scope;
+  syncFilterControls();
+  updateQueryState();
+  renderProjectTabs();
+  renderProjectOverview();
+  renderFleetWorkers();
 }
 
 function scopeLabelText(scope) {
