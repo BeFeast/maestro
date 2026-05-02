@@ -1354,6 +1354,79 @@
     margin-top: 22px;
   }
 
+  .fleet-workers-shell {
+    margin-top: 18px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: 0 1px 0 rgba(15, 23, 42, .04);
+  }
+
+  .fleet-workers-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    min-height: 64px;
+    padding: 16px 24px;
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .fleet-workers-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .fleet-workers-summary::after {
+    content: "Open";
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-size: 13px;
+    font-weight: 650;
+  }
+
+  .fleet-workers-shell[open] > .fleet-workers-summary {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .fleet-workers-shell[open] > .fleet-workers-summary::after {
+    content: "Close";
+  }
+
+  .fleet-workers-summary-copy {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .fleet-workers-summary-copy strong {
+    color: #101817;
+    font-size: 20px;
+    font-weight: 720;
+    line-height: 1.15;
+  }
+
+  .fleet-workers-summary-copy span,
+  .fleet-workers-summary-meta {
+    color: #596461;
+    font-size: 14px;
+    line-height: 1.35;
+  }
+
+  .fleet-workers-summary-meta {
+    margin-left: auto;
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .fleet-workers-shell .fleet-workers {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
   .attention-inbox {
     border-color: rgba(220, 38, 38, .24);
     background: linear-gradient(180deg, rgba(220, 38, 38, .045), #fff 180px);
@@ -1680,11 +1753,15 @@
 
   .needs-you-list {
     display: grid;
-    gap: 10px;
-    padding: 0 18px 18px;
+    gap: 8px;
+    padding: 0 18px 16px;
   }
 
   .needs-you-item {
+    display: grid;
+    grid-template-columns: 160px minmax(0, 1.2fr) minmax(0, 1fr);
+    align-items: start;
+    gap: 10px 16px;
     padding: 14px 16px;
     border: 1px solid rgba(215,222,232,.92);
     border-radius: 8px;
@@ -1701,16 +1778,16 @@
   }
 
   .needs-you-headline {
-    margin-top: 6px;
+    margin-top: 0;
     color: var(--text);
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 720;
-    line-height: 1.2;
+    line-height: 1.25;
   }
 
   .needs-you-copy,
   .needs-you-meta {
-    margin-top: 6px;
+    margin-top: 0;
     color: var(--muted);
     font-size: 13px;
     line-height: 1.45;
@@ -1772,5 +1849,20 @@
 
     .stats-compact-strip {
       grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .fleet-workers-summary {
+      align-items: flex-start;
+      flex-direction: column;
+    }
+
+    .fleet-workers-summary-meta {
+      margin-left: 0;
+      text-align: left;
+      white-space: normal;
+    }
+
+    .needs-you-item {
+      grid-template-columns: 1fr;
     }
   }

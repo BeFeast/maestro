@@ -20,6 +20,8 @@ const needsYouListEl = document.getElementById("needs-you-list");
 const needsYouSummaryEl = document.getElementById("needs-you-summary");
 const needsYouAuditLinkEl = document.getElementById("needs-you-audit-link");
 const fleetWorkersEl = document.getElementById("fleet-workers-body");
+const fleetWorkersShellEl = document.getElementById("fleet-workers-shell");
+const workerShellSummaryEl = document.getElementById("worker-shell-summary");
 const workerSummaryEl = document.getElementById("worker-summary");
 const workerProjectResetEl = document.getElementById("worker-project-reset");
 const workerControlsEl = document.getElementById("worker-controls");
@@ -1204,7 +1206,8 @@ function renderProjectRail() {
       fleetState.selectedProject = button.dataset.project || "all";
       updateQueryState();
       renderFleetWorkers();
-      document.querySelector(".fleet-workers")?.scrollIntoView({ block: "start", behavior: "smooth" });
+      if (fleetWorkersShellEl) fleetWorkersShellEl.open = true;
+      fleetWorkersShellEl?.scrollIntoView({ block: "start", behavior: "smooth" });
     });
   });
 }
@@ -1230,6 +1233,12 @@ function renderFleetWorkers() {
   const scopeLabel = scopeLabelText(fleetState.filters.scope);
   const filterText = hasWorkerFilters() ? " · " + visible.length + " shown from " + totalWorkers + " total" : " · " + totalWorkers + " total";
   const attentionCount = visible.filter(worker => worker.needs_attention).length;
+  const shellSummary = liveVisibleCount + " live/operator · " + hiddenHistory.length + " history collapsed" +
+    (attentionCount ? " · " + attentionCount + " attention" : "");
+  if (workerShellSummaryEl) workerShellSummaryEl.textContent = shellSummary;
+  if (fleetWorkersShellEl && (hasWorkerFilters() || fleetState.filters.scope !== "operator" || projectScoped || fleetState.selectedWorkerKey)) {
+    fleetWorkersShellEl.open = true;
+  }
   workerSummaryEl.textContent = visible.length + " worker" + (visible.length === 1 ? "" : "s") + " shown in " + projectLabel +
     filterText + (hiddenHistory.length ? " · " + hiddenHistory.length + " history collapsed" : "") +
     (attentionCount ? " · " + attentionCount + " need attention" : "") +
@@ -1296,6 +1305,7 @@ function historySummaryRowHTML(workers) {
 
 function showHistoryScope(scope) {
 	fleetState.filters.scope = scope;
+	if (fleetWorkersShellEl) fleetWorkersShellEl.open = true;
 	syncFilterControls();
 	updateQueryState();
 	renderProjectRail();
