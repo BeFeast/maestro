@@ -183,14 +183,15 @@ func (s *FleetServer) Start(ctx context.Context) error {
 }
 
 type fleetResponse struct {
-	ReadOnly    bool                 `json:"read_only"`
-	RefreshedAt string               `json:"refreshed_at"`
-	Verdict     fleetVerdict         `json:"verdict"`
-	Projects    []fleetProjectState  `json:"projects"`
-	Summary     fleetSummary         `json:"summary"`
-	Workers     []fleetWorkerState   `json:"workers"`
-	Attention   []fleetWorkerState   `json:"attention"`
-	Approvals   []fleetApprovalState `json:"approvals,omitempty"`
+	ReadOnly      bool                 `json:"read_only"`
+	RefreshedAt   string               `json:"refreshed_at"`
+	Verdict       fleetVerdict         `json:"verdict"`
+	OperatorBrief fleetOperatorBrief   `json:"operator_brief"`
+	Projects      []fleetProjectState  `json:"projects"`
+	Summary       fleetSummary         `json:"summary"`
+	Workers       []fleetWorkerState   `json:"workers"`
+	Attention     []fleetWorkerState   `json:"attention"`
+	Approvals     []fleetApprovalState `json:"approvals,omitempty"`
 }
 
 type fleetVerdict struct {
@@ -198,10 +199,41 @@ type fleetVerdict struct {
 	Sentence string `json:"sentence"`
 }
 
+type fleetOperatorBrief struct {
+	Tone        string `json:"tone"`
+	Sentence    string `json:"sentence"`
+	Project     string `json:"project,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	NextAction  string `json:"next_action,omitempty"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	IssueURL    string `json:"issue_url,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	PRURL       string `json:"pr_url,omitempty"`
+	Session     string `json:"session,omitempty"`
+}
+
+type fleetOperatorState struct {
+	Kind        string `json:"kind"`
+	Tone        string `json:"tone"`
+	Label       string `json:"label"`
+	Summary     string `json:"summary"`
+	NextAction  string `json:"next_action,omitempty"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	IssueURL    string `json:"issue_url,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	PRURL       string `json:"pr_url,omitempty"`
+	Session     string `json:"session,omitempty"`
+}
+
 type fleetSummary struct {
 	Projects            int `json:"projects"`
 	Stale               int `json:"stale"`
 	Errors              int `json:"errors"`
+	Active              int `json:"active"`
+	MonitoringPR        int `json:"monitoring_pr"`
+	DispatchPending     int `json:"dispatch_pending"`
+	QueueBlocked        int `json:"queue_blocked"`
+	OutcomeMissing      int `json:"outcome_missing"`
 	Running             int `json:"running"`
 	PROpen              int `json:"pr_open"`
 	Failed              int `json:"failed"`
@@ -248,6 +280,7 @@ type fleetProjectState struct {
 	StateDir        string                `json:"state_dir,omitempty"`
 	MaxParallel     int                   `json:"max_parallel"`
 	ReadOnly        bool                  `json:"read_only"`
+	OperatorState   fleetOperatorState    `json:"operator_state"`
 	Outcome         outcome.Status        `json:"outcome"`
 	Summary         map[string]int        `json:"summary"`
 	Running         int                   `json:"running"`
@@ -507,6 +540,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 		if item.Error != "" {
 			resp.Summary.Errors++
 		}
+		addFleetOperatorSummary(&resp.Summary, item.OperatorState)
 		resp.Summary.Running += item.Running
 		resp.Summary.PROpen += item.PROpen
 		resp.Summary.Failed += item.Failed
@@ -517,6 +551,11 @@ func (s *FleetServer) snapshot() fleetResponse {
 		}
 	}
 	sort.Slice(resp.Projects, func(i, j int) bool {
+		li := fleetOperatorStatePriority(resp.Projects[i].OperatorState.Kind)
+		ri := fleetOperatorStatePriority(resp.Projects[j].OperatorState.Kind)
+		if li != ri {
+			return li < ri
+		}
 		if resp.Projects[i].Running != resp.Projects[j].Running {
 			return resp.Projects[i].Running > resp.Projects[j].Running
 		}
@@ -558,6 +597,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 		return left.Slot < right.Slot
 	})
 	sortFleetApprovals(resp.Approvals)
+	resp.OperatorBrief = buildFleetOperatorBrief(resp.Projects, now)
 	resp.Verdict = buildFleetVerdict(resp, now)
 	return resp
 }
@@ -567,12 +607,15 @@ func buildFleetVerdict(resp fleetResponse, now time.Time) fleetVerdict {
 	tone := fleetVerdictTone(resp.Summary, latest, now)
 	parts := []string{
 		fleetLivenessSentence(resp.Summary, resp.Projects, latest, now),
-		fleetRunningSentence(resp.Summary.Running, fleetIdleByPolicy(resp.Projects)),
+		fleetActivitySentence(resp.Summary, resp.Projects),
 	}
 	if pr := fleetPRSentence(resp.Summary.PROpen); pr != "" {
 		parts = append(parts, pr)
 	}
 	parts = append(parts, fleetAttentionSentence(resp.Summary))
+	if brief := strings.TrimSpace(resp.OperatorBrief.Sentence); brief != "" && !supervisorHeartbeatStale(latest, now) {
+		parts = append(parts, brief)
+	}
 	return fleetVerdict{
 		Tone:     tone,
 		Sentence: strings.Join(parts, " "),
@@ -635,6 +678,33 @@ func fleetRunningSentence(running int, idleByPolicy bool) string {
 	}
 }
 
+func fleetActivitySentence(summary fleetSummary, projects []fleetProjectState) string {
+	if summary.Running > 0 {
+		return fleetRunningSentence(summary.Running, fleetIdleByPolicy(projects))
+	}
+	if summary.Active > 0 {
+		pieces := make([]string, 0, 2)
+		if summary.MonitoringPR > 0 {
+			pieces = append(pieces, fleetCountPhrase(summary.MonitoringPR, "monitoring PR", "monitoring PRs"))
+		}
+		if summary.DispatchPending > 0 {
+			pieces = append(pieces, fleetCountPhrase(summary.DispatchPending, "dispatch pending", "dispatch pending"))
+		}
+		if len(pieces) == 0 {
+			return "No worker process is running, but the supervisor reports active work."
+		}
+		return "No worker process is running, but " + strings.Join(pieces, " and ") + "."
+	}
+	return fleetRunningSentence(0, fleetIdleByPolicy(projects))
+}
+
+func fleetCountPhrase(count int, singular, plural string) string {
+	if count == 1 {
+		return fmt.Sprintf("1 %s", singular)
+	}
+	return fmt.Sprintf("%d %s", count, plural)
+}
+
 func fleetPRSentence(prOpen int) string {
 	switch prOpen {
 	case 0:
@@ -655,6 +725,125 @@ func fleetAttentionSentence(summary fleetSummary) string {
 		return "1 item needs attention."
 	default:
 		return fmt.Sprintf("%d items need attention.", items)
+	}
+}
+
+func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState) {
+	kind := strings.TrimSpace(operator.Kind)
+	if fleetOperatorStateIsActive(kind) {
+		summary.Active++
+	}
+	switch kind {
+	case "monitoring_pr":
+		summary.MonitoringPR++
+	case "pending_dispatch":
+		summary.DispatchPending++
+	case "queue_blocked":
+		summary.QueueBlocked++
+	case "outcome_missing":
+		summary.OutcomeMissing++
+	}
+}
+
+func fleetOperatorStateIsActive(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "working", "monitoring_pr", "pending_dispatch":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildFleetOperatorBrief(projects []fleetProjectState, now time.Time) fleetOperatorBrief {
+	_ = now
+	if len(projects) == 0 {
+		return fleetOperatorBrief{Tone: "muted", Sentence: "No projects are configured in this fleet."}
+	}
+	var selected *fleetProjectState
+	for i := range projects {
+		project := &projects[i]
+		if selected == nil || fleetOperatorStatePriority(project.OperatorState.Kind) < fleetOperatorStatePriority(selected.OperatorState.Kind) {
+			selected = project
+		}
+	}
+	if selected == nil {
+		return fleetOperatorBrief{Tone: "muted", Sentence: "No project state is available."}
+	}
+
+	working, monitoring, pending, attention := 0, 0, 0, 0
+	for _, project := range projects {
+		switch project.OperatorState.Kind {
+		case "working":
+			working++
+		case "monitoring_pr":
+			monitoring++
+		case "pending_dispatch":
+			pending++
+		case "attention", "error", "stale":
+			attention++
+		}
+	}
+	state := selected.OperatorState
+	brief := fleetOperatorBrief{
+		Tone:        state.Tone,
+		Project:     selected.Name,
+		Kind:        state.Kind,
+		NextAction:  state.NextAction,
+		IssueNumber: state.IssueNumber,
+		IssueURL:    state.IssueURL,
+		PRNumber:    state.PRNumber,
+		PRURL:       state.PRURL,
+		Session:     state.Session,
+	}
+	if attention > 0 || state.Tone == "attention" || state.Tone == "error" || state.Tone == "warn" {
+		brief.Sentence = fmt.Sprintf("Operator brief: %s: %s — %s", selected.Name, state.Label, state.Summary)
+		if next := strings.TrimSpace(state.NextAction); next != "" {
+			brief.Sentence += "; next: " + next
+		}
+		return brief
+	}
+	parts := make([]string, 0, 3)
+	if working > 0 {
+		parts = append(parts, fleetCountPhrase(working, "working", "working"))
+	}
+	if monitoring > 0 {
+		parts = append(parts, fleetCountPhrase(monitoring, "monitoring PR", "monitoring PRs"))
+	}
+	if pending > 0 {
+		parts = append(parts, fleetCountPhrase(pending, "dispatch pending", "dispatch pending"))
+	}
+	if len(parts) == 0 {
+		brief.Tone = "healthy"
+		brief.Sentence = "Operator brief: all projects are idle by policy; no operator action is pending."
+		return brief
+	}
+	brief.Tone = "busy"
+	brief.Sentence = "Operator brief: " + strings.Join(parts, " · ") + "; no operator action is pending."
+	return brief
+}
+
+func fleetOperatorStatePriority(kind string) int {
+	switch strings.TrimSpace(kind) {
+	case "error":
+		return 0
+	case "attention":
+		return 1
+	case "stale":
+		return 2
+	case "pending_dispatch":
+		return 3
+	case "working":
+		return 4
+	case "monitoring_pr":
+		return 5
+	case "outcome_missing":
+		return 6
+	case "queue_blocked":
+		return 7
+	case "idle":
+		return 8
+	default:
+		return 9
 	}
 }
 
@@ -911,6 +1100,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	}
 	if cfg == nil {
 		item.Error = "missing resolved project config"
+		item.OperatorState = buildFleetProjectOperatorState(item)
 		return item, nil
 	}
 	item.Repo = cfg.Repo
@@ -924,6 +1114,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
 		item.Error = err.Error()
+		item.OperatorState = buildFleetProjectOperatorState(item)
 		return item, nil
 	}
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
@@ -958,7 +1149,218 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.Active = append(item.Active, worker)
 		}
 	}
+	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorState {
+	if strings.TrimSpace(project.Error) != "" {
+		return fleetOperatorState{
+			Kind:       "error",
+			Tone:       "error",
+			Label:      "State error",
+			Summary:    truncateFleetOperatorText(project.Error, 120),
+			NextAction: "Fix the project state/config load error before Maestro can supervise it.",
+		}
+	}
+	if project.NeedsAttention > 0 {
+		state := fleetOperatorState{
+			Kind:       "attention",
+			Tone:       "attention",
+			Label:      "Needs attention",
+			Summary:    fmt.Sprintf("%d worker item(s) need operator review.", project.NeedsAttention),
+			NextAction: "Open the worker detail and resolve the first blocking reason.",
+		}
+		if len(project.Attention) > 0 {
+			worker := project.Attention[0]
+			state.Session = worker.Slot
+			state.IssueNumber = worker.IssueNumber
+			state.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+			state.PRNumber = worker.PRNumber
+			state.PRURL = firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber))
+			if reason := strings.TrimSpace(worker.StatusReason); reason != "" {
+				state.Summary = truncateFleetOperatorText(reason, 150)
+			}
+			if next := strings.TrimSpace(worker.NextAction); next != "" {
+				state.NextAction = truncateFleetOperatorText(next, 150)
+			}
+		}
+		return state
+	}
+	if project.Freshness.Stale {
+		summary := strings.TrimSpace(project.Freshness.Reason)
+		if summary == "" {
+			summary = "Project snapshot is stale."
+		}
+		return fleetOperatorState{
+			Kind:       "stale",
+			Tone:       "warn",
+			Label:      "Stale",
+			Summary:    summary,
+			NextAction: "Check the project supervisor service and state writer.",
+		}
+	}
+	if project.Running > 0 {
+		state := fleetOperatorState{
+			Kind:    "working",
+			Tone:    "busy",
+			Label:   "Working",
+			Summary: fmt.Sprintf("%d/%d worker slot(s) active.", project.Running, project.MaxParallel),
+		}
+		if len(project.Active) > 0 {
+			worker := project.Active[0]
+			state.Session = worker.Slot
+			state.IssueNumber = worker.IssueNumber
+			state.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+			state.PRNumber = worker.PRNumber
+			state.PRURL = firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber))
+			if worker.IssueNumber > 0 {
+				state.Summary = fmt.Sprintf("%s is working on issue #%d.", worker.Slot, worker.IssueNumber)
+			}
+		}
+		return state
+	}
+	if state, ok := fleetOperatorStateFromSupervisor(project); ok {
+		return state
+	}
+	if project.PROpen > 0 {
+		state := fleetOperatorState{
+			Kind:       "monitoring_pr",
+			Tone:       "busy",
+			Label:      "Monitoring PR",
+			Summary:    fmt.Sprintf("%d PR(s) in review/merge gate; no code worker is expected right now.", project.PROpen),
+			NextAction: "Wait for checks/review; Maestro should merge or respawn only if gates change.",
+		}
+		for _, worker := range append(append([]sessionInfo{}, project.Active...), project.Attention...) {
+			if worker.PRNumber > 0 {
+				state.Session = worker.Slot
+				state.IssueNumber = worker.IssueNumber
+				state.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+				state.PRNumber = worker.PRNumber
+				state.PRURL = firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber))
+				break
+			}
+		}
+		return state
+	}
+	if !project.Outcome.Configured {
+		return fleetOperatorState{
+			Kind:       "outcome_missing",
+			Tone:       "warn",
+			Label:      "Outcome missing",
+			Summary:    "No outcome brief is configured, so Maestro cannot prove hands-off success.",
+			NextAction: "Add an outcome brief for this project before expecting reliable unattended development.",
+		}
+	}
+	q := project.QueueSnapshot
+	if q == nil {
+		return fleetOperatorState{Kind: "idle", Tone: "muted", Label: "Idle", Summary: "No queue snapshot is available yet."}
+	}
+	if q.Open == 0 {
+		return fleetOperatorState{Kind: "idle", Tone: "healthy", Label: "Idle", Summary: "No open issues are available."}
+	}
+	if q.Eligible > 0 {
+		state := fleetOperatorState{
+			Kind:       "pending_dispatch",
+			Tone:       "busy",
+			Label:      "Dispatch pending",
+			Summary:    fmt.Sprintf("%d eligible issue(s); waiting for the supervisor to start a worker.", q.Eligible),
+			NextAction: "A worker should start on the next supervisor cycle; escalate if this exceeds the dispatch SLA.",
+		}
+		if q.SelectedCandidate != nil && q.SelectedCandidate.Number > 0 {
+			state.IssueNumber = q.SelectedCandidate.Number
+			state.IssueURL = githubIssueURL(project.Repo, q.SelectedCandidate.Number)
+			state.Summary = fmt.Sprintf("Issue #%d is selected for the next worker.", q.SelectedCandidate.Number)
+		}
+		return state
+	}
+	summary := strings.TrimSpace(q.IdleReason)
+	if summary == "" {
+		summary = "Open issues exist, but none are runnable under the current policy."
+	}
+	return fleetOperatorState{
+		Kind:       "queue_blocked",
+		Tone:       "muted",
+		Label:      "Held by policy",
+		Summary:    summary,
+		NextAction: "Change labels/dependencies/project status if these issues should run now.",
+	}
+}
+
+func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorState, bool) {
+	latest := project.Supervisor.Latest
+	if latest == nil {
+		return fleetOperatorState{}, false
+	}
+	action := strings.TrimSpace(latest.RecommendedAction)
+	summary := strings.TrimSpace(latest.Summary)
+	target := latest.Target
+	operator := fleetOperatorState{}
+	switch action {
+	case "monitor_open_pr", "approve_merge":
+		operator = fleetOperatorState{
+			Kind:       "monitoring_pr",
+			Tone:       "busy",
+			Label:      "Monitoring PR",
+			Summary:    firstNonEmpty(summary, "A PR is in checks/review/merge gate; no code worker is expected right now."),
+			NextAction: "Wait for checks and review gates, then merge or respawn from feedback.",
+		}
+	case "spawn_worker":
+		operator = fleetOperatorState{
+			Kind:       "pending_dispatch",
+			Tone:       "busy",
+			Label:      "Dispatch pending",
+			Summary:    firstNonEmpty(summary, "Supervisor selected an issue and should start a worker."),
+			NextAction: "A worker should start on the next supervisor cycle; escalate if this exceeds the dispatch SLA.",
+		}
+	case "wait_for_worker":
+		return fleetOperatorState{Kind: "working", Tone: "busy", Label: "Working", Summary: firstNonEmpty(summary, "Supervisor is waiting for a worker to finish.")}, true
+	default:
+		if project.QueueSnapshot != nil && project.QueueSnapshot.SelectedCandidate != nil && project.QueueSnapshot.SelectedCandidate.Number > 0 && project.QueueSnapshot.Eligible > 0 {
+			operator = fleetOperatorState{
+				Kind:       "pending_dispatch",
+				Tone:       "busy",
+				Label:      "Dispatch pending",
+				Summary:    fmt.Sprintf("Issue #%d is selected for the next worker.", project.QueueSnapshot.SelectedCandidate.Number),
+				NextAction: "A worker should start on the next supervisor cycle; escalate if this exceeds the dispatch SLA.",
+			}
+			target = &state.SupervisorTarget{Issue: project.QueueSnapshot.SelectedCandidate.Number}
+		} else {
+			return fleetOperatorState{}, false
+		}
+	}
+	operator = applyFleetOperatorTarget(project, operator, target)
+	return operator, true
+}
+
+func applyFleetOperatorTarget(project fleetProjectState, operator fleetOperatorState, target *state.SupervisorTarget) fleetOperatorState {
+	if target == nil {
+		return operator
+	}
+	operator.IssueNumber = target.Issue
+	operator.IssueURL = githubIssueURL(project.Repo, target.Issue)
+	operator.PRNumber = target.PR
+	operator.PRURL = githubPRURL(project.Repo, target.PR)
+	operator.Session = target.Session
+	return operator
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func truncateFleetOperatorText(value string, limit int) string {
+	value = strings.TrimSpace(strings.Join(strings.Fields(value), " "))
+	if limit <= 0 || len([]rune(value)) <= limit {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:limit-3]) + "..."
 }
 
 func isFleetWorkerDefaultVisible(worker sessionInfo) bool {
@@ -1244,13 +1646,15 @@ func fleetProjectRailSummary(projects []fleetProjectState) string {
 	if len(projects) == 0 {
 		return "No configured projects."
 	}
-	running := 0
+	active := 0
 	attention := 0
 	for _, project := range projects {
-		running += project.Running
+		if fleetOperatorStateIsActive(project.OperatorState.Kind) {
+			active++
+		}
 		attention += project.NeedsAttention
 	}
-	return fmt.Sprintf("%d project%s · %d running · %d attention", len(projects), pluralSuffix(len(projects)), running, attention)
+	return fmt.Sprintf("%d project%s · %d active · %d attention", len(projects), pluralSuffix(len(projects)), active, attention)
 }
 
 func renderFleetProjectRailRows(projects []fleetProjectState) string {
@@ -1295,18 +1699,23 @@ func renderFleetProjectIdentity(project fleetProjectState) string {
 }
 
 func renderFleetProjectRailState(project fleetProjectState) string {
+	operator := project.OperatorState
 	label := fleetProjectStateLabel(project)
+	summary := strings.TrimSpace(operator.Summary)
+	if summary == "" {
+		summary = fmt.Sprintf("%d/%d worker process(es) running.", project.Running, project.MaxParallel)
+	}
 	parts := []string{
 		`<span class="pill ` + html.EscapeString(fleetProjectStatePillClass(project)) + `">` + html.EscapeString(label) + `</span>`,
-		`<div class="rail-subline">` + html.EscapeString(fmt.Sprintf("%d/%d running", project.Running, project.MaxParallel)) + `</div>`,
+		`<div class="rail-subline" title="` + html.EscapeString(summary) + `">` + html.EscapeString(summary) + `</div>`,
 	}
-	if project.NeedsAttention > 0 {
-		parts = append(parts, `<div class="rail-alert">`+html.EscapeString(fmt.Sprintf("%d need attention", project.NeedsAttention))+`</div>`)
+	if next := strings.TrimSpace(operator.NextAction); next != "" {
+		parts = append(parts, `<div class="rail-note" title="`+html.EscapeString(next)+`">Next: `+html.EscapeString(next)+`</div>`)
 	}
 	if project.Error != "" {
 		parts = append(parts, `<div class="rail-alert" title="`+html.EscapeString(project.Error)+`">State error</div>`)
 	}
-	if project.Freshness.Stale {
+	if project.Freshness.Stale && operator.Kind != "stale" {
 		parts = append(parts, `<div class="rail-warn">Stale snapshot</div>`)
 	}
 	return strings.Join(parts, "")
@@ -1449,41 +1858,26 @@ func renderFleetProjectRailLinks(project fleetProjectState) string {
 }
 
 func fleetProjectStateLabel(project fleetProjectState) string {
-	switch {
-	case project.Error != "":
-		return "State error"
-	case project.NeedsAttention > 0:
-		return "Attention"
-	case project.Freshness.Stale:
-		return "Stale"
-	case project.Running > 0:
-		return "Running"
-	case project.PROpen > 0:
-		return "PR review"
-	default:
-		return "Idle"
+	if label := strings.TrimSpace(project.OperatorState.Label); label != "" {
+		return label
 	}
+	return "Idle"
 }
 
 func fleetProjectStatePillClass(project fleetProjectState) string {
-	return "rail-state-" + strings.TrimPrefix(fleetProjectRailStateClass(project), "project-row-")
+	key := strings.TrimSpace(project.OperatorState.Kind)
+	if key == "" {
+		key = "idle"
+	}
+	return "rail-state-" + fleetCSSClassToken(key)
 }
 
 func fleetProjectRailStateClass(project fleetProjectState) string {
-	switch {
-	case project.Error != "":
-		return "project-row-error"
-	case project.NeedsAttention > 0:
-		return "project-row-attention"
-	case project.Freshness.Stale:
-		return "project-row-stale"
-	case project.Running > 0:
-		return "project-row-running"
-	case project.PROpen > 0:
-		return "project-row-pr"
-	default:
-		return "project-row-idle"
+	key := strings.TrimSpace(project.OperatorState.Kind)
+	if key == "" {
+		key = "idle"
 	}
+	return "project-row-" + fleetCSSClassToken(key)
 }
 
 func fleetProjectGitHubURL(repo string) string {
@@ -1661,9 +2055,9 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .project-rail-freshness-cell { width: 150px; }
   .project-rail-links-cell { width: 150px; }
   .project-row-attention { background: rgba(220,38,38,.045); }
-  .project-row-running { background: rgba(22,128,60,.035); }
-  .project-row-pr { background: rgba(37,99,235,.035); }
-  .project-row-stale { background: rgba(161,98,7,.045); }
+  .project-row-working { background: rgba(22,128,60,.035); }
+  .project-row-monitoring_pr, .project-row-pending_dispatch { background: rgba(37,99,235,.035); }
+  .project-row-queue_blocked, .project-row-outcome_missing, .project-row-stale { background: rgba(161,98,7,.045); }
   .project-row-error { background: rgba(220,38,38,.075); }
   .rail-project-name {
     overflow: hidden;
@@ -1693,10 +2087,10 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .rail-alert { color: var(--bad); }
   .rail-warn { color: var(--warn); }
   .rail-links { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 12px; }
-  .rail-state-running, .outcome-healthy { color: var(--ok); border-color: rgba(22,128,60,.5); background: rgba(22,128,60,.08); }
-  .rail-state-pr, .outcome-unknown { color: var(--accent); border-color: rgba(37,99,235,.45); background: rgba(37,99,235,.07); }
+  .rail-state-working, .outcome-healthy { color: var(--ok); border-color: rgba(22,128,60,.5); background: rgba(22,128,60,.08); }
+  .rail-state-monitoring_pr, .rail-state-pending_dispatch, .outcome-unknown { color: var(--accent); border-color: rgba(37,99,235,.45); background: rgba(37,99,235,.07); }
   .rail-state-attention, .rail-state-error, .outcome-failing { color: var(--bad); border-color: rgba(220,38,38,.45); background: rgba(220,38,38,.07); }
-  .rail-state-stale { color: var(--warn); border-color: rgba(161,98,7,.45); background: rgba(161,98,7,.08); }
+  .rail-state-stale, .rail-state-queue_blocked, .rail-state-outcome_missing { color: var(--warn); border-color: rgba(161,98,7,.45); background: rgba(161,98,7,.08); }
   .rail-state-idle, .outcome-not_configured, .outcome-unmonitored { color: var(--muted); border-color: rgba(100,116,139,.45); background: rgba(100,116,139,.08); }
   .project-overview {
     margin-bottom: 16px;
@@ -3142,7 +3536,7 @@ function renderFleetVerdict(verdict) {
 function renderStats(summary) {
   const items = [
     ["Projects", summary.projects || 0],
-    ["Running", summary.running || 0],
+    ["Active", summary.active || 0],
     ["PR open", summary.pr_open || 0],
     ["Failed", summary.failed || 0],
     ["Attention", summary.needs_attention || 0]
@@ -3161,23 +3555,13 @@ function ensureSelectedProject() {
 }
 
 function projectStateKey(project) {
-  if (project.error) return "error";
-  if ((project.needs_attention || 0) > 0) return "attention";
-  if (project.freshness && project.freshness.stale) return "stale";
-  if ((project.running || 0) > 0) return "running";
-  if ((project.pr_open || 0) > 0) return "pr";
-  return "idle";
+  const operator = project.operator_state || {};
+  return operator.kind || "idle";
 }
 
 function projectStateLabel(project) {
-  switch (projectStateKey(project)) {
-  case "error": return "State error";
-  case "attention": return "Attention";
-  case "stale": return "Stale";
-  case "running": return "Running";
-  case "pr": return "PR review";
-  default: return "Idle";
-  }
+  const operator = project.operator_state || {};
+  return operator.label || "Idle";
 }
 
 function projectSearchText(project) {
@@ -3188,6 +3572,8 @@ function projectSearchText(project) {
     project.repo,
     project.config_path,
     projectStateLabel(project),
+    project.operator_state && project.operator_state.summary,
+    project.operator_state && project.operator_state.next_action,
     project.error,
     q.idle_reason,
     q.top_skipped_reason,
@@ -3212,11 +3598,12 @@ function visibleProjects() {
 
 function projectRailSummaryText(projects, total) {
   if (!total) return "No configured projects.";
-  const running = projects.reduce((sum, project) => sum + Number(project.running || 0), 0);
+  const activeKinds = new Set(["working", "monitoring_pr", "pending_dispatch"]);
+  const active = projects.filter(project => activeKinds.has(projectStateKey(project))).length;
   const attention = projects.reduce((sum, project) => sum + Number(project.needs_attention || 0), 0);
   const filtered = projects.length === total ? "" : " shown from " + total;
   return projects.length + " project" + (projects.length === 1 ? "" : "s") + filtered +
-    " · " + running + " running · " + attention + " attention";
+    " · " + active + " active · " + attention + " attention";
 }
 
 function githubRepoURL(repo) {
@@ -3239,13 +3626,15 @@ function projectIdentityRailHTML(project) {
 
 function projectStateRailHTML(project) {
   const key = projectStateKey(project);
+  const operator = project.operator_state || {};
+  const summary = String(operator.summary || ((project.running || 0) + '/' + (project.max_parallel || 0) + ' worker process(es) running.'));
   const parts = [
     '<span class="pill rail-state-' + cssToken(key) + '">' + escapeText(projectStateLabel(project)) + '</span>',
-    '<div class="rail-subline">' + escapeText((project.running || 0) + '/' + (project.max_parallel || 0) + ' running') + '</div>'
+    '<div class="rail-subline" title="' + escapeText(summary) + '">' + escapeText(summary) + '</div>'
   ];
-  if ((project.needs_attention || 0) > 0) parts.push('<div class="rail-alert">' + escapeText(project.needs_attention) + ' need attention</div>');
+  if (operator.next_action) parts.push('<div class="rail-note" title="' + escapeText(operator.next_action) + '">Next: ' + escapeText(operator.next_action) + '</div>');
   if (project.error) parts.push('<div class="rail-alert" title="' + escapeText(project.error) + '">State error</div>');
-  if (project.freshness && project.freshness.stale) parts.push('<div class="rail-warn">Stale snapshot</div>');
+  if (project.freshness && project.freshness.stale && key !== "stale") parts.push('<div class="rail-warn">Stale snapshot</div>');
   return parts.join("");
 }
 
@@ -3265,7 +3654,7 @@ function projectQueueRailHTML(project) {
     lines.push('<div class="rail-subline" title="' + escapeText(selected) + '">' + escapeText(selected) + '</div>');
   }
   const idleReason = (project.running || 0) === 0 ? String(q.idle_reason || "").trim() : "";
-  if (idleReason) lines.push('<div class="rail-warn" title="' + escapeText(idleReason) + '">' + escapeText(idleReason) + '</div>');
+  if (idleReason && projectStateKey(project) !== "queue_blocked") lines.push('<div class="rail-warn" title="' + escapeText(idleReason) + '">' + escapeText(idleReason) + '</div>');
   return lines.join("");
 }
 

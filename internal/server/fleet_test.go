@@ -450,6 +450,94 @@ func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	}
 }
 
+func TestFleetAPIOperatorStateExplainsZeroRunningActiveWork(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	monitorStateDir := filepath.Join(dir, "monitor")
+	candidateStateDir := filepath.Join(dir, "candidate")
+
+	monitorState := state.NewState()
+	monitorState.Sessions["pr-1"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "Review PR",
+		Status:      state.StatusPROpen,
+		StartedAt:   now.Add(-10 * time.Minute),
+		PRNumber:    12,
+	}
+	monitorState.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-monitor",
+		CreatedAt:         now,
+		Project:           "owner/monitor",
+		Summary:           "Monitor PR #12 until checks and review gates pass.",
+		RecommendedAction: "monitor_open_pr",
+		Risk:              "safe",
+		Target:            &state.SupervisorTarget{Issue: 42, PR: 12, Session: "pr-1"},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(monitorStateDir, monitorState); err != nil {
+		t.Fatalf("save monitor state: %v", err)
+	}
+
+	candidateState := state.NewState()
+	candidateState.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-candidate",
+		CreatedAt:         now,
+		Project:           "owner/candidate",
+		Summary:           "Start a worker for issue #309.",
+		RecommendedAction: "spawn_worker",
+		Risk:              "mutating",
+		Target:            &state.SupervisorTarget{Issue: 309},
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			OpenIssues:         3,
+			EligibleCandidates: 2,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 309,
+				Title:  "Selected fleet candidate",
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(candidateStateDir, candidateState); err != nil {
+		t.Fatalf("save candidate state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("Monitor", "/tmp/monitor.yaml", "", &config.Config{
+			Repo:        "owner/monitor",
+			StateDir:    monitorStateDir,
+			MaxParallel: 1,
+			Outcome:     outcome.Brief{DesiredOutcome: "Monitor outcome"},
+		}),
+		NewFleetProject("Candidate", "/tmp/candidate.yaml", "", &config.Config{
+			Repo:        "owner/candidate",
+			StateDir:    candidateStateDir,
+			MaxParallel: 1,
+			Outcome:     outcome.Brief{DesiredOutcome: "Candidate outcome"},
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	if resp.Summary.Running != 0 || resp.Summary.Active != 2 || resp.Summary.MonitoringPR != 1 || resp.Summary.DispatchPending != 1 {
+		t.Fatalf("summary = %+v, want zero running but two active operator states", resp.Summary)
+	}
+
+	monitor := findFleetProject(t, resp.Projects, "Monitor")
+	if monitor.OperatorState.Kind != "monitoring_pr" || monitor.OperatorState.PRNumber != 12 || monitor.OperatorState.IssueNumber != 42 {
+		t.Fatalf("monitor operator state = %+v, want monitoring PR #12 for issue #42", monitor.OperatorState)
+	}
+	monitorHTML := renderFleetProjectRailState(monitor)
+	if contains(monitorHTML, "0/1 running") || !contains(monitorHTML, "Monitoring PR") {
+		t.Fatalf("monitor rail state should explain PR monitoring without raw running counter, got:\n%s", monitorHTML)
+	}
+
+	candidate := findFleetProject(t, resp.Projects, "Candidate")
+	if candidate.OperatorState.Kind != "pending_dispatch" || candidate.OperatorState.IssueNumber != 309 {
+		t.Fatalf("candidate operator state = %+v, want pending dispatch for issue #309", candidate.OperatorState)
+	}
+	candidateHTML := renderFleetProjectRailState(candidate)
+	if contains(candidateHTML, "0/1 running") || !contains(candidateHTML, "Dispatch pending") {
+		t.Fatalf("candidate rail state should explain pending dispatch without raw running counter, got:\n%s", candidateHTML)
+	}
+}
+
 func TestFleetVerdictCoversHeaderStates(t *testing.T) {
 	now := time.Now().UTC()
 	tests := []struct {
@@ -1508,7 +1596,7 @@ func TestFleetDashboardProjectRailPlaceholdersAreNotReplacedFromProjectData(t *t
 	}
 
 	summary := dashboardSnippet(t, body, `<div class="section-note" id="project-rail-summary">`, `</div>`)
-	if !contains(summary, "1 project · 0 running · 0 attention") {
+	if !contains(summary, "1 project · 0 active · 0 attention") {
 		t.Fatalf("summary placeholder was not replaced correctly, got:\n%s", summary)
 	}
 	rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
