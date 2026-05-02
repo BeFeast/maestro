@@ -1866,3 +1866,205 @@
       grid-template-columns: 1fr;
     }
   }
+
+  body.fleet-search-open { overflow: hidden; }
+
+  .fleet-search-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--border-hi);
+    border-radius: 10px;
+    background: #fff;
+    color: var(--text-mute);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 650;
+  }
+
+  .fleet-search-trigger:hover,
+  .fleet-search-trigger:focus-visible {
+    border-color: var(--brand-b);
+    color: var(--brand-b);
+  }
+
+  .fleet-search-trigger kbd {
+    padding: 2px 6px;
+    border: 1px solid rgba(148,163,184,.55);
+    border-radius: 6px;
+    background: #f8fafc;
+    color: var(--muted);
+    font: 11px/1.2 var(--font-mono);
+  }
+
+  .fleet-search-backdrop[hidden],
+  .fleet-search-dialog[hidden] {
+    display: none !important;
+  }
+
+  .fleet-search-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 70;
+    background: rgba(15, 23, 42, .28);
+    backdrop-filter: blur(2px);
+  }
+
+  .fleet-search-dialog {
+    position: fixed;
+    top: min(72px, 8vh);
+    left: 50%;
+    z-index: 75;
+    width: min(740px, calc(100vw - 32px));
+    transform: translateX(-50%);
+  }
+
+  .fleet-search-shell {
+    overflow: hidden;
+    border: 1px solid rgba(148,163,184,.38);
+    border-radius: 16px;
+    background: rgba(255,255,255,.98);
+    box-shadow: 0 24px 90px rgba(15,23,42,.22);
+  }
+
+  .fleet-search-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 18px 20px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .fleet-search-head h2 {
+    margin: 0;
+    color: var(--text);
+    font-size: 22px;
+    line-height: 1.1;
+  }
+
+  .fleet-search-input-label {
+    display: grid;
+    gap: 6px;
+    padding: 16px 20px 10px;
+  }
+
+  .fleet-search-input-label span {
+    color: var(--text-faint);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 650;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  .fleet-search-input-label input {
+    width: 100%;
+    height: 48px;
+    border: 1px solid var(--border-hi);
+    border-radius: 12px;
+    background: #fff;
+    color: var(--text);
+    font: inherit;
+    font-size: 18px;
+    padding: 10px 14px;
+  }
+
+  .fleet-search-input-label input:focus {
+    outline: 2px solid rgba(5,150,105,.24);
+    border-color: rgba(5,150,105,.55);
+  }
+
+  .fleet-search-summary,
+  .fleet-search-note {
+    padding: 0 20px 10px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .fleet-search-results {
+    display: grid;
+    gap: 6px;
+    max-height: min(56vh, 520px);
+    overflow: auto;
+    padding: 0 12px 12px;
+  }
+
+  .fleet-search-result {
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    padding: 11px 12px;
+    text-align: left;
+  }
+
+  .fleet-search-result:hover,
+  .fleet-search-result.is-active {
+    border-color: rgba(5,150,105,.2);
+    background: rgba(5,150,105,.07);
+  }
+
+  .fleet-search-kind {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 28px;
+    border: 1px solid rgba(148,163,184,.45);
+    border-radius: 999px;
+    background: #fff;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .fleet-search-copy {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .fleet-search-copy strong,
+  .fleet-search-copy span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .fleet-search-copy strong {
+    font-weight: 720;
+  }
+
+  .fleet-search-copy span,
+  .fleet-search-target {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .fleet-search-target {
+    white-space: nowrap;
+  }
+
+  .fleet-search-empty {
+    padding: 22px 14px 26px;
+    color: var(--muted);
+    text-align: center;
+  }
+
+  @media (max-width: 700px) {
+    .fleet-search-trigger { width: 100%; justify-content: space-between; }
+    .fleet-search-dialog { top: 10px; width: calc(100vw - 20px); }
+    .fleet-search-head { align-items: stretch; flex-direction: column; }
+    .fleet-search-result { grid-template-columns: 76px minmax(0, 1fr); }
+    .fleet-search-target { grid-column: 2; }
+  }

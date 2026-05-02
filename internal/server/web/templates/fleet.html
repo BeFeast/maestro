@@ -31,10 +31,30 @@
   </div>
   <div class="header-actions">
     <span class="mode-pill">Read-only</span>
+    <button type="button" class="fleet-search-trigger" id="fleet-search-trigger" aria-haspopup="dialog" aria-controls="fleet-search-dialog"><span>Search</span><kbd>Cmd/Ctrl K</kbd></button>
     <button type="button" class="refresh-button" id="fleet-refresh" aria-label="Refresh fleet data">↻</button>
     <span class="user-chip" aria-label="Operator ko">ko</span>
   </div>
 </header>
+<div class="fleet-search-backdrop" id="fleet-search-backdrop" hidden></div>
+<section class="fleet-search-dialog" id="fleet-search-dialog" role="dialog" aria-modal="true" aria-labelledby="fleet-search-title" hidden>
+  <div class="fleet-search-shell">
+    <div class="fleet-search-head">
+      <div>
+        <h2 id="fleet-search-title">Search Fleet</h2>
+        <div class="sub">Jump to projects, sessions, issues, PRs, and dashboards from loaded data.</div>
+      </div>
+      <button type="button" class="drawer-close-button" id="fleet-search-close" aria-label="Close search palette">Close</button>
+    </div>
+    <label class="fleet-search-input-label" for="fleet-search-input">
+      <span>Search</span>
+      <input id="fleet-search-input" type="search" autocomplete="off" placeholder="Project slug, session slot, issue #, PR #, or dashboard" role="combobox" aria-expanded="true" aria-controls="fleet-search-results">
+    </label>
+    <div class="fleet-search-summary" id="fleet-search-summary">Type to search loaded fleet data.</div>
+    <div class="fleet-search-results" id="fleet-search-results" role="listbox" aria-label="Fleet search results"></div>
+    <div class="fleet-search-note">Read-only search only. No write actions run from search.</div>
+  </div>
+</section>
 <main>
   <section class="fleet-verdict-shell" aria-live="polite" aria-label="Global operator brief">
     <div class="fleet-verdict verdict-healthy" id="fleet-verdict">Loading global operator brief...</div>

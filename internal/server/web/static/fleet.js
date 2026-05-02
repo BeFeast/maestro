@@ -39,6 +39,13 @@ const workerSortEl = document.getElementById("worker-sort");
 const sortDirectionEl = document.getElementById("sort-direction");
 const initialStateEl = document.getElementById("fleet-initial-state");
 const fleetRefreshEl = document.getElementById("fleet-refresh");
+const searchTriggerEl = document.getElementById("fleet-search-trigger");
+const searchDialogEl = document.getElementById("fleet-search-dialog");
+const searchBackdropEl = document.getElementById("fleet-search-backdrop");
+const searchInputEl = document.getElementById("fleet-search-input");
+const searchResultsEl = document.getElementById("fleet-search-results");
+const searchSummaryEl = document.getElementById("fleet-search-summary");
+const searchCloseEl = document.getElementById("fleet-search-close");
 const projectDiagnosticsEl = document.getElementById("project-diagnostics");
 const expandedProjectStorageKey = "maestro.fleet.expandedProject";
 
@@ -84,7 +91,13 @@ const fleetState = {
   detail: null,
   operatorBrief: null,
   verdict: null,
-  refreshedAt: ""
+  refreshedAt: "",
+  search: {
+    open: false,
+    query: "",
+    activeIndex: 0,
+    results: []
+  }
 };
 
 loadStateFromQuery();
@@ -504,6 +517,335 @@ function syncFilterControls() {
 
 function normalizedSearchText(value) {
   return String(value ?? "").trim().toLowerCase();
+}
+
+function compactSearchText(value) {
+  return normalizedSearchText(value).replace(/[^a-z0-9]+/g, "");
+}
+
+function searchTerms(value) {
+  return normalizedSearchText(value).split(/\s+/).filter(Boolean);
+}
+
+function searchTokens(value) {
+  return normalizedSearchText(value).split(/[^a-z0-9#]+/).map(compactSearchText).filter(Boolean);
+}
+
+function searchNumberAliases(label, number) {
+  const value = Number(number || 0);
+  if (!Number.isFinite(value) || value <= 0) return [];
+  const text = String(value);
+  const prefix = String(label || "").trim();
+  return [text, "#" + text, prefix + " " + text, prefix + " #" + text, prefix + text];
+}
+
+function searchMetaText(parts) {
+  return parts.map(value => String(value ?? "").trim()).filter(Boolean).join(" · ");
+}
+
+function makeFleetSearchResult(input) {
+  const terms = input.terms || [];
+  const text = [input.kind, input.title, input.meta, input.project, input.slot, input.url].concat(terms).map(normalizedSearchText).join(" ");
+  return {
+    id: input.id,
+    kind: input.kind,
+    title: input.title,
+    meta: input.meta || "",
+    action: input.action || "url",
+    url: input.url || "",
+    project: input.project || "",
+    slot: input.slot || "",
+    rank: Number(input.rank || 0),
+    searchText: text,
+    searchCompact: compactSearchText(text),
+    tokens: new Set(searchTokens(text))
+  };
+}
+
+function addFleetSearchResult(results, seen, input) {
+  if (!input || !input.id || seen.has(input.id)) return;
+  seen.add(input.id);
+  results.push(makeFleetSearchResult(input));
+}
+
+function searchProjectURL(project) {
+  return (project && project.dashboard_url) || githubRepoURL(project && project.repo) || "";
+}
+
+function buildFleetSearchIndex() {
+  const results = [];
+  const seen = new Set();
+  for (const project of fleetState.projects || []) {
+    const name = project.name || "project";
+    const url = searchProjectURL(project);
+    addFleetSearchResult(results, seen, {
+      id: "project:" + name,
+      kind: "Project",
+      title: name,
+      meta: searchMetaText([project.repo, projectStateLabel(project), project.operator_state && project.operator_state.summary]),
+      action: url ? "url" : "project",
+      url,
+      project: name,
+      rank: 40,
+      terms: ["project", "slug", project.config_path, projectSearchText(project)]
+    });
+    if (project.dashboard_url) {
+      addFleetSearchResult(results, seen, {
+        id: "dashboard:" + name,
+        kind: "Dashboard",
+        title: name + " dashboard",
+        meta: searchMetaText([project.repo, project.dashboard_url]),
+        action: "url",
+        url: project.dashboard_url,
+        project: name,
+        rank: 35,
+        terms: ["dashboard", "project dashboard", name, project.repo]
+      });
+    }
+  }
+
+  for (const worker of fleetState.workers || []) {
+    const project = worker.project_name || "";
+    const slot = worker.slot || "";
+    const issueAliases = searchNumberAliases("issue", worker.issue_number);
+    const prAliases = searchNumberAliases("pr", worker.pr_number);
+    const workerRank = (worker.needs_attention ? 70 : 0) + (worker.live ? 55 : 20);
+    addFleetSearchResult(results, seen, {
+      id: "session:" + project + ":" + slot,
+      kind: "Session",
+      title: searchMetaText([project, slot]) || "Worker session",
+      meta: searchMetaText([
+        worker.issue_number ? "Issue #" + worker.issue_number : "No issue",
+        worker.pr_number ? "PR #" + worker.pr_number : "No PR",
+        statusLabel(worker)
+      ]),
+      action: "worker",
+      project,
+      slot,
+      rank: workerRank,
+      terms: ["worker", "session", workerSearchText(worker)].concat(issueAliases, prAliases)
+    });
+    if (worker.issue_number) {
+      addFleetSearchResult(results, seen, {
+        id: "issue:" + project + ":" + worker.issue_number + ":" + slot,
+        kind: "Issue",
+        title: "Issue #" + worker.issue_number,
+        meta: searchMetaText([project, slot, worker.issue_title]),
+        action: worker.issue_url ? "url" : "worker",
+        url: worker.issue_url || "",
+        project,
+        slot,
+        rank: workerRank - 5,
+        terms: [worker.issue_title, workerSearchText(worker)].concat(issueAliases)
+      });
+    }
+    if (worker.pr_number) {
+      addFleetSearchResult(results, seen, {
+        id: "pr:" + project + ":" + worker.pr_number + ":" + slot,
+        kind: "PR",
+        title: "PR #" + worker.pr_number,
+        meta: searchMetaText([project, slot, worker.issue_number ? "Issue #" + worker.issue_number : ""]),
+        action: worker.pr_url ? "url" : "worker",
+        url: worker.pr_url || "",
+        project,
+        slot,
+        rank: workerRank - 10,
+        terms: [worker.issue_title, workerSearchText(worker)].concat(prAliases)
+      });
+    }
+  }
+
+  for (const approval of fleetState.approvals || []) {
+    const targets = [];
+    if (approval.issue_number) targets.push("Issue #" + approval.issue_number);
+    if (approval.pr_number) targets.push("PR #" + approval.pr_number);
+    if (approval.session) targets.push("Session " + approval.session);
+    const project = approval.project_name || "";
+    addFleetSearchResult(results, seen, {
+      id: "approval:" + (approval.id || targets.join(":")),
+      kind: "Approval",
+      title: targets.length ? "Approval " + targets.join(" / ") : "Approval " + (approval.id || "target"),
+      meta: searchMetaText([project, actionLabel(approval.action), approval.status, approval.summary]),
+      action: approval.pr_url || approval.issue_url ? "url" : (approval.session ? "worker" : "project"),
+      url: approval.pr_url || approval.issue_url || approval.dashboard_url || "",
+      project,
+      slot: approval.session || "",
+      rank: approval.status === "pending" ? 65 : 15,
+      terms: [approval.id, approval.decision_id, approval.summary, approval.action]
+        .concat(searchNumberAliases("issue", approval.issue_number), searchNumberAliases("pr", approval.pr_number))
+    });
+  }
+  return results;
+}
+
+function fuzzySearchMatch(haystack, needle) {
+  if (!needle) return true;
+  let index = 0;
+  for (const ch of haystack) {
+    if (ch === needle[index]) index++;
+    if (index === needle.length) return true;
+  }
+  return false;
+}
+
+function scoreFleetSearchResult(result, query) {
+  const terms = searchTerms(query);
+  if (!terms.length) return result.rank;
+  let score = result.rank;
+  for (const term of terms) {
+    const normalized = normalizedSearchText(term);
+    const compact = compactSearchText(term);
+    if (!compact) continue;
+    if (result.tokens.has(compact)) {
+      score += 100;
+    } else if (result.searchText.includes(normalized)) {
+      score += 75;
+    } else if (result.searchCompact.includes(compact)) {
+      score += 55;
+    } else if (fuzzySearchMatch(result.searchCompact, compact)) {
+      score += 20;
+    } else {
+      return -1;
+    }
+  }
+  return score;
+}
+
+function searchFleetResults(query) {
+  const index = buildFleetSearchIndex();
+  if (!searchTerms(query).length) return index.slice(0, 10);
+  return index.map(result => ({ result, score: scoreFleetSearchResult(result, query) }))
+    .filter(entry => entry.score >= 0)
+    .sort((left, right) => {
+      if (left.score !== right.score) return right.score - left.score;
+      return compareText(left.result.title, right.result.title);
+    })
+    .slice(0, 12)
+    .map(entry => entry.result);
+}
+
+function searchResultID(index) {
+  return "fleet-search-result-" + index;
+}
+
+function searchResultActionText(result) {
+  if (result.action === "worker") return "Opens worker detail";
+  if (result.action === "project") return "Scopes worker table";
+  return "Opens link";
+}
+
+function searchResultHTML(result, index) {
+  const active = index === fleetState.search.activeIndex;
+  const cls = "fleet-search-result" + (active ? " is-active" : "");
+  return '<button type="button" id="' + searchResultID(index) + '" class="' + cls + '" role="option" aria-selected="' + (active ? "true" : "false") + '" data-search-result="' + index + '">' +
+    '<span class="fleet-search-kind">' + escapeText(result.kind) + '</span>' +
+    '<span class="fleet-search-copy"><strong>' + escapeText(result.title) + '</strong>' +
+      '<span>' + escapeText(result.meta || searchResultActionText(result)) + '</span></span>' +
+    '<span class="fleet-search-target">' + escapeText(searchResultActionText(result)) + '</span>' +
+  '</button>';
+}
+
+function renderSearchPalette() {
+  if (!searchDialogEl || !searchBackdropEl || !searchResultsEl || !searchSummaryEl) return;
+  const search = fleetState.search;
+  searchDialogEl.hidden = !search.open;
+  searchBackdropEl.hidden = !search.open;
+  document.body.classList.toggle("fleet-search-open", search.open);
+  if (!search.open) return;
+
+  search.results = searchFleetResults(search.query);
+  if (search.activeIndex >= search.results.length) {
+    search.activeIndex = Math.max(0, search.results.length - 1);
+  }
+  if (searchInputEl && searchInputEl.value !== search.query) {
+    searchInputEl.value = search.query;
+  }
+  const hasQuery = searchTerms(search.query).length > 0;
+  searchSummaryEl.textContent = search.results.length
+    ? (hasQuery ? search.results.length + " result" + (search.results.length === 1 ? "" : "s") : "Top loaded fleet results")
+    : (hasQuery ? "No matching loaded fleet data" : "Type to search projects, sessions, issues, PRs, and dashboards");
+  searchResultsEl.innerHTML = search.results.length
+    ? search.results.map(searchResultHTML).join("")
+    : '<div class="fleet-search-empty" role="status">No matching projects, sessions, issues, or PRs are loaded in this fleet snapshot.</div>';
+
+  if (searchInputEl) {
+    if (search.results.length) searchInputEl.setAttribute("aria-activedescendant", searchResultID(search.activeIndex));
+    else searchInputEl.removeAttribute("aria-activedescendant");
+  }
+  searchResultsEl.querySelectorAll("button[data-search-result]").forEach(button => {
+    button.addEventListener("click", () => {
+      const result = search.results[Number(button.dataset.searchResult || 0)];
+      selectFleetSearchResult(result);
+    });
+  });
+}
+
+function openSearchPalette() {
+  if (!searchDialogEl) return;
+  fleetState.search.open = true;
+  fleetState.search.activeIndex = 0;
+  renderSearchPalette();
+  window.setTimeout(() => {
+    if (searchInputEl) {
+      searchInputEl.focus();
+      searchInputEl.select();
+    }
+  }, 0);
+}
+
+function closeSearchPalette(returnFocus) {
+  fleetState.search.open = false;
+  renderSearchPalette();
+  if (returnFocus !== false && searchTriggerEl) searchTriggerEl.focus();
+}
+
+function isSearchShortcut(event) {
+  return !event.defaultPrevented && (event.metaKey || event.ctrlKey) && !event.altKey && String(event.key || "").toLowerCase() === "k";
+}
+
+function scrollSearchActiveResultIntoView() {
+  const active = document.getElementById(searchResultID(fleetState.search.activeIndex));
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+
+function moveSearchActive(delta) {
+  const count = fleetState.search.results.length;
+  if (!count) return;
+  fleetState.search.activeIndex = (fleetState.search.activeIndex + delta + count) % count;
+  renderSearchPalette();
+  scrollSearchActiveResultIntoView();
+}
+
+function openSearchURL(url) {
+  const target = String(url || "").trim();
+  if (!target) return false;
+  window.open(target, "_blank", "noopener,noreferrer");
+  return true;
+}
+
+function scopeSearchProject(projectName) {
+  if (!projectName) return false;
+  fleetState.selectedProject = projectName;
+  updateQueryState();
+  renderFleetWorkers();
+  document.querySelector(".fleet-workers")?.scrollIntoView({ block: "start", behavior: "smooth" });
+  return true;
+}
+
+function selectFleetSearchResult(result) {
+  if (!result) return;
+  closeSearchPalette(false);
+  if (result.action === "worker" && result.project && result.slot) {
+    selectWorker(result.project, result.slot);
+    return;
+  }
+  if (result.action === "project" && scopeSearchProject(result.project)) return;
+  if (openSearchURL(result.url)) return;
+  if (result.project && result.slot) {
+    selectWorker(result.project, result.slot);
+    return;
+  }
+  scopeSearchProject(result.project);
 }
 
 function workerSearchText(worker) {
@@ -1744,6 +2086,31 @@ function clearWorkerProjectScope() {
 
 workerProjectResetEl.addEventListener("click", clearWorkerProjectScope);
 if (fleetRefreshEl) fleetRefreshEl.addEventListener("click", loadFleet);
+if (searchTriggerEl) searchTriggerEl.addEventListener("click", openSearchPalette);
+if (searchCloseEl) searchCloseEl.addEventListener("click", () => closeSearchPalette());
+if (searchBackdropEl) searchBackdropEl.addEventListener("click", () => closeSearchPalette());
+if (searchInputEl) {
+  searchInputEl.addEventListener("input", () => {
+    fleetState.search.query = searchInputEl.value.trim();
+    fleetState.search.activeIndex = 0;
+    renderSearchPalette();
+  });
+  searchInputEl.addEventListener("keydown", event => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveSearchActive(1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveSearchActive(-1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      selectFleetSearchResult(fleetState.search.results[fleetState.search.activeIndex]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeSearchPalette();
+    }
+  });
+}
 
 projectFilterEl.addEventListener("input", () => {
   fleetState.projectQuery = projectFilterEl.value.trim();
@@ -1797,6 +2164,16 @@ sortDirectionEl.addEventListener("click", () => {
 workerDetailCloseEl.addEventListener("click", closeWorkerDetail);
 workerDetailBackdropEl.addEventListener("click", closeWorkerDetail);
 document.addEventListener("keydown", event => {
+  if (isSearchShortcut(event)) {
+    event.preventDefault();
+    openSearchPalette();
+    return;
+  }
+  if (event.key === "Escape" && fleetState.search.open) {
+    event.preventDefault();
+    closeSearchPalette();
+    return;
+  }
   if (event.key === "Escape" && fleetState.selectedWorkerKey) {
     closeWorkerDetail();
   }
@@ -1841,6 +2218,7 @@ function applyFleetData(data) {
   renderAttentionInbox();
   renderNeedsYouRail();
   renderFleetWorkers();
+  if (fleetState.search.open) renderSearchPalette();
   const needsDetailLoad = fleetState.selectedWorkerKey && (!fleetState.detail || !fleetState.detail.worker || workerKey(fleetState.detail.worker) !== fleetState.selectedWorkerKey);
   if (needsDetailLoad) {
     const worker = selectedWorker();
