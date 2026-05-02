@@ -22,6 +22,7 @@ const (
 	StatusQueued         SessionStatus = "queued"
 	StatusRunning        SessionStatus = "running"
 	StatusPROpen         SessionStatus = "pr_open"
+	StatusCodeLanded     SessionStatus = "code_landed"
 	StatusDone           SessionStatus = "done"
 	StatusFailed         SessionStatus = "failed"
 	StatusConflictFailed SessionStatus = "conflict_failed"
@@ -137,6 +138,19 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 		return SessionAttention{
 			Reason:         "Session is waiting on an open PR, but no PR number is recorded yet.",
 			NextAction:     "Reconcile the session with the GitHub PR before dispatching duplicate work.",
+			NeedsAttention: true,
+		}
+	case StatusCodeLanded:
+		if sess.PRNumber > 0 {
+			return SessionAttention{
+				Reason:         fmt.Sprintf("PR #%d has merged; code landed, but runtime/deployment verification is still required before the issue can be closed.", sess.PRNumber),
+				NextAction:     "Run the required verification or deployment checks, then close the issue only after the outcome is confirmed.",
+				NeedsAttention: true,
+			}
+		}
+		return SessionAttention{
+			Reason:         "Code landed, but runtime/deployment verification is still required before the issue can be closed.",
+			NextAction:     "Run the required verification or deployment checks, then close the issue only after the outcome is confirmed.",
 			NeedsAttention: true,
 		}
 	case StatusQueued:
@@ -1521,7 +1535,7 @@ func (s *State) DonePRCount() int {
 	}
 	count := 0
 	for _, sess := range s.Sessions {
-		if sess != nil && sess.Status == StatusDone && sess.PRNumber > 0 {
+		if sess != nil && (sess.Status == StatusDone || sess.Status == StatusCodeLanded) && sess.PRNumber > 0 {
 			count++
 		}
 	}
@@ -1536,7 +1550,7 @@ func (s *State) IssueInProgress(issueNum int) bool {
 		if sess.IssueNumber != issueNum {
 			continue
 		}
-		if sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued {
+		if sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued || sess.Status == StatusCodeLanded {
 			return true
 		}
 		// Dead session with pending retry — still in progress
@@ -1618,18 +1632,20 @@ func StatusPriority(status SessionStatus) int {
 		return 1
 	case StatusQueued:
 		return 2
-	case StatusDead:
+	case StatusCodeLanded:
 		return 3
-	case StatusFailed:
+	case StatusDead:
 		return 4
-	case StatusConflictFailed:
+	case StatusFailed:
 		return 5
-	case StatusRetryExhausted:
+	case StatusConflictFailed:
 		return 6
-	case StatusDone:
+	case StatusRetryExhausted:
 		return 7
-	default:
+	case StatusDone:
 		return 8
+	default:
+		return 9
 	}
 }
 

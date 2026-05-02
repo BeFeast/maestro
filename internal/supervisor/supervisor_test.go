@@ -1602,6 +1602,33 @@ func TestDecide_OrderedQueueAdvancesAfterDoneSessionWithMergedPR(t *testing.T) {
 	}
 }
 
+func TestDecide_OrderedQueueAdvancesAfterCodeLandedSessionWithMergedPR(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{
+		Enabled: true,
+		Issues:  []int{308, 306},
+	}
+	reader := &fakeReader{
+		issues:    []github.Issue{testIssue(306, "next", "maestro-ready")},
+		mergedPRs: map[int]bool{77: true},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 308, Status: state.StatusCodeLanded, PRNumber: 77}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 306 {
+		t.Fatalf("target = %#v, want issue 306", decision.Target)
+	}
+}
+
 func TestDecide_OrderedQueueAdvancesAfterPolicyOverride(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}

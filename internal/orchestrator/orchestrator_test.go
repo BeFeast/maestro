@@ -763,10 +763,10 @@ func TestAutoMergePRs_ParallelUpdatesState(t *testing.T) {
 	before := time.Now()
 	o.autoMergePRs(s)
 
-	// All sessions should be marked done
+	// All sessions should be marked code_landed
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusDone {
-			t.Errorf("session %s status = %q, want %q", slotName, sess.Status, state.StatusDone)
+		if sess.Status != state.StatusCodeLanded {
+			t.Errorf("session %s status = %q, want %q", slotName, sess.Status, state.StatusCodeLanded)
 		}
 		if sess.FinishedAt == nil {
 			t.Errorf("session %s has nil FinishedAt", slotName)
@@ -871,19 +871,19 @@ func TestAutoMergePRs_ParallelPartialFailure(t *testing.T) {
 		t.Errorf("merged = %v, want [10, 30]", merged)
 	}
 
-	// Verify state: sessions for PR 10 and 30 should be done, PR 20 should still be pr_open
-	doneCount := 0
+	// Verify state: sessions for PR 10 and 30 should be code_landed, PR 20 should still be pr_open
+	codeLandedCount := 0
 	openCount := 0
 	for _, sess := range s.Sessions {
-		if sess.Status == state.StatusDone {
-			doneCount++
+		if sess.Status == state.StatusCodeLanded {
+			codeLandedCount++
 		}
 		if sess.Status == state.StatusPROpen {
 			openCount++
 		}
 	}
-	if doneCount != 2 {
-		t.Errorf("expected 2 done sessions, got %d", doneCount)
+	if codeLandedCount != 2 {
+		t.Errorf("expected 2 code_landed sessions, got %d", codeLandedCount)
 	}
 	if openCount != 1 {
 		t.Errorf("expected 1 still-open session, got %d", openCount)
@@ -892,7 +892,7 @@ func TestAutoMergePRs_ParallelPartialFailure(t *testing.T) {
 
 func TestAutoMergePRs_ParallelStateConsistency(t *testing.T) {
 	// Verify that after parallel merges, the state is consistent:
-	// - All merged sessions are StatusDone with FinishedAt set
+	// - All merged sessions are StatusCodeLanded with FinishedAt set
 	// - LastMergeAt is recent
 	// - No session is in an inconsistent intermediate state
 	prs := []github.PR{
@@ -914,8 +914,8 @@ func TestAutoMergePRs_ParallelStateConsistency(t *testing.T) {
 	}
 
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusDone {
-			t.Errorf("session %s: status = %q, want %q", slotName, sess.Status, state.StatusDone)
+		if sess.Status != state.StatusCodeLanded {
+			t.Errorf("session %s: status = %q, want %q", slotName, sess.Status, state.StatusCodeLanded)
 		}
 		if sess.FinishedAt == nil {
 			t.Errorf("session %s: FinishedAt is nil", slotName)
@@ -1319,8 +1319,8 @@ func TestAutoMergePRs_RetryExhaustedGreenPRNoFeedbackMerges(t *testing.T) {
 		t.Fatalf("merged = %v, want [10]", merged)
 	}
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusDone {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)
 	}
 }
 
@@ -2433,8 +2433,8 @@ func TestMergeReadyPR_CleansUpWorktreeOnMerge(t *testing.T) {
 	if sess.Worktree != "" {
 		t.Errorf("Worktree = %q, want empty (should be cleared after cleanup)", sess.Worktree)
 	}
-	if sess.Status != state.StatusDone {
-		t.Errorf("Status = %q, want %q", sess.Status, state.StatusDone)
+	if sess.Status != state.StatusCodeLanded {
+		t.Errorf("Status = %q, want %q", sess.Status, state.StatusCodeLanded)
 	}
 }
 
@@ -2480,8 +2480,8 @@ func TestMergeReadyPR_SkipsCleanupWhenDisabled(t *testing.T) {
 	if sess.Worktree != "/tmp/wt" {
 		t.Errorf("Worktree = %q, want %q (should be preserved)", sess.Worktree, "/tmp/wt")
 	}
-	if sess.Status != state.StatusDone {
-		t.Errorf("Status = %q, want %q", sess.Status, state.StatusDone)
+	if sess.Status != state.StatusCodeLanded {
+		t.Errorf("Status = %q, want %q", sess.Status, state.StatusCodeLanded)
 	}
 }
 
@@ -3380,7 +3380,7 @@ func TestCheckSessions_RetryExhaustedClosedIssue_TransitionsToDone(t *testing.T)
 	}
 }
 
-func TestCheckSessions_RetryExhaustedMergedPR_TransitionsToDone(t *testing.T) {
+func TestCheckSessions_RetryExhaustedMergedPR_TransitionsToCodeLanded(t *testing.T) {
 	now := time.Now().UTC()
 	o := &Orchestrator{
 		cfg:      &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 120},
@@ -3412,8 +3412,8 @@ func TestCheckSessions_RetryExhaustedMergedPR_TransitionsToDone(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["pan-13"]
-	if sess.Status != state.StatusDone {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)
 	}
 }
 
