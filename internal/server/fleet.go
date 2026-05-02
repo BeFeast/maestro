@@ -1815,6 +1815,7 @@ func renderFleetApprovalCard(approval fleetApprovalState, muted bool) string {
 	createdAge := html.EscapeString(firstNonEmpty(approval.CreatedAge, "-"))
 	updatedAge := html.EscapeString(firstNonEmpty(approval.UpdatedAge, "-"))
 	summary := html.EscapeString(firstNonEmpty(approval.Summary, "No summary recorded."))
+	risk := html.EscapeString(supervisorRiskLabelServer(firstNonEmpty(approval.Risk, "-")))
 	sessionStatus := ""
 	if strings.TrimSpace(approval.SessionStatus) != "" {
 		sessionStatus = `<span>Status ` + html.EscapeString(approval.SessionStatus) + `</span>`
@@ -1830,7 +1831,7 @@ func renderFleetApprovalCard(approval fleetApprovalState, muted bool) string {
 		`<div class="approval-meta"><span class="` + approvalStatusClassServer(approval.Status) + `">` + html.EscapeString(firstNonEmpty(approval.Status, "unknown")) + `</span></div></div>` +
 		`<div class="approval-target">` + renderFleetApprovalTargetHTML(approval) + sessionStatus + `</div>` +
 		`<div class="approval-main"><div class="approval-age"><span>Created ` + createdAge + ` ago</span><span>Updated ` + updatedAge + ` ago</span></div>` +
-		`<div class="approval-risk"><span>Risk ` + html.EscapeString(firstNonEmpty(approval.Risk, "-")) + `</span></div>` +
+		`<div class="approval-risk"><span>` + risk + `</span></div>` +
 		`<div class="approval-summary">` + summary + `</div></div>` +
 		`</article>`
 }
@@ -1857,7 +1858,43 @@ func approvalStatusClassServer(status string) string {
 }
 
 func actionLabelServer(action string) string {
-	return strings.ReplaceAll(strings.TrimSpace(firstNonEmpty(action, "-")), "_", " ")
+	switch strings.TrimSpace(firstNonEmpty(action, "-")) {
+	case "none":
+		return "Skip tick"
+	case "monitor_open_pr":
+		return "Watch PR"
+	case "approve_merge":
+		return "Merge PR"
+	case "spawn_worker":
+		return "Start worker"
+	case "label_issue_ready":
+		return "Mark issue ready"
+	case "review_retry_exhausted":
+		return "Review retry-exhausted work"
+	case "check_outcome_health":
+		return "Check runtime health"
+	case "wait_for_running_worker", "wait_for_worker":
+		return "Wait for worker"
+	case "wait_for_capacity":
+		return "Wait for free slot"
+	case "wait_for_ordered_queue":
+		return "Wait for queue order"
+	default:
+		return strings.ReplaceAll(strings.TrimSpace(firstNonEmpty(action, "-")), "_", " ")
+	}
+}
+
+func supervisorRiskLabelServer(risk string) string {
+	switch strings.TrimSpace(firstNonEmpty(risk, "-")) {
+	case "safe":
+		return "Safe recommendation"
+	case "mutating":
+		return "Mutating action"
+	case "approval_gated":
+		return "Approval required"
+	default:
+		return strings.ReplaceAll(strings.TrimSpace(firstNonEmpty(risk, "-")), "_", " ")
+	}
 }
 
 func cssTokenServer(value string) string {

@@ -427,7 +427,7 @@ func TestSupervisorOperatorSentence(t *testing.T) {
 		{
 			name:   "none",
 			action: "none",
-			want:   "Skipped this tick; no safe action was selected.",
+			want:   "Skipped this tick because no safe action was available.",
 		},
 		{
 			name:   "monitor open pr",
@@ -456,7 +456,7 @@ func TestSupervisorOperatorSentence(t *testing.T) {
 			name:    "unknown keeps raw action",
 			action:  "custom_new_action",
 			summary: "worker paused for external system",
-			want:    "Supervisor reported custom_new_action; worker paused for external system",
+			want:    "Supervisor chose custom_new_action. worker paused for external system",
 		},
 	}
 
@@ -1089,8 +1089,8 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "supervisor-panel") || !contains(body, "renderSupervisor") {
 		t.Error("dashboard should include supervisor rationale panel")
 	}
-	if !contains(body, "supervisorOperatorSentence") || !contains(body, "supervisor-raw-action") || !contains(body, "Skipped this tick") {
-		t.Error("dashboard should render operator-facing supervisor sentences with raw action diagnostics")
+	if !contains(body, "supervisorOperatorSentence") || !contains(body, "supervisorDecisionMetaText") || !contains(body, "Skipped this tick because no safe action was available.") {
+		t.Error("dashboard should render operator-facing supervisor sentences with human decision meta")
 	}
 	if !contains(body, "outcome-panel") || !contains(body, "renderOutcome") || !contains(body, "No outcome brief configured") {
 		t.Error("dashboard should include outcome status panel")

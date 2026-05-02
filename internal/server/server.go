@@ -386,7 +386,7 @@ func supervisorOperatorSentence(action, summary string, target *state.Supervisor
 
 	switch raw {
 	case "none":
-		return "Skipped this tick; no safe action was selected."
+		return "Skipped this tick because no safe action was available."
 	case "monitor_open_pr":
 		return fmt.Sprintf("Watching %s until checks and review pass.", pr)
 	case "approve_merge":
@@ -411,9 +411,9 @@ func supervisorOperatorSentence(action, summary string, target *state.Supervisor
 	}
 
 	if summary != "" {
-		return fmt.Sprintf("Supervisor reported %s; %s", raw, summary)
+		return fmt.Sprintf("Supervisor chose %s. %s", raw, summary)
 	}
-	return fmt.Sprintf("Supervisor reported %s; inspect diagnostics for details.", raw)
+	return fmt.Sprintf("Supervisor chose %s. Inspect diagnostics for details.", raw)
 }
 
 func supervisorIssuePhrase(target *state.SupervisorTarget) string {

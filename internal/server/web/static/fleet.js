@@ -125,7 +125,21 @@ function issueSummaryText(worker) {
 }
 
 function actionLabel(action) {
-  return String(action || "-").replace(/_/g, " ");
+  switch (String(action || "").trim()) {
+  case "none": return "Skip tick";
+  case "monitor_open_pr": return "Watch PR";
+  case "approve_merge": return "Merge PR";
+  case "spawn_worker": return "Start worker";
+  case "label_issue_ready": return "Mark issue ready";
+  case "review_retry_exhausted": return "Review retry-exhausted work";
+  case "check_outcome_health": return "Check runtime health";
+  case "wait_for_running_worker":
+  case "wait_for_worker": return "Wait for worker";
+  case "wait_for_capacity": return "Wait for free slot";
+  case "wait_for_ordered_queue": return "Wait for queue order";
+  default:
+    return String(action || "-").replace(/_/g, " ");
+  }
 }
 
 function cssToken(value) {
@@ -277,6 +291,16 @@ function approvalTargetHTML(approval) {
   return links.length ? links.join(" ") : '<span class="empty">No target</span>';
 }
 
+function supervisorRiskLabel(risk) {
+  switch (String(risk || "").trim()) {
+  case "safe": return "Safe recommendation";
+  case "mutating": return "Mutating action";
+  case "approval_gated": return "Approval required";
+  default:
+    return String(risk || "-").replace(/_/g, " ");
+  }
+}
+
 function approvalCardHTML(approval) {
   const project = approval.project_name || "-";
   const id = approval.id || "-";
@@ -291,7 +315,7 @@ function approvalCardHTML(approval) {
       '<div class="approval-meta"><span class="' + approvalStatusClass(approval) + '">' + escapeText(approval.status || "unknown") + '</span></div></div>' +
     '<div class="approval-target">' + approvalTargetHTML(approval) + (sessionStatus ? '<span>' + escapeText(sessionStatus) + '</span>' : "") + '</div>' +
     '<div class="approval-main"><div class="approval-age"><span>Created ' + escapeText(createdAge) + ' ago</span><span>Updated ' + escapeText(updatedAge) + ' ago</span></div>' +
-      '<div class="approval-risk"><span>Risk ' + escapeText(approval.risk || "-") + '</span></div>' +
+      '<div class="approval-risk"><span>' + escapeText(supervisorRiskLabel(approval.risk || "-")) + '</span></div>' +
       '<div class="approval-summary">' + escapeText(approval.summary || "No summary recorded.") + '</div></div>' +
   '</article>';
 }
@@ -1456,11 +1480,31 @@ function rawSupervisorAction(action) {
   return raw || "none";
 }
 
+function supervisorDecisionMetaText(item) {
+  const risk = rawSupervisorAction(item && item.risk);
+  const confidence = Number(item && item.confidence);
+  const confidencePct = Number.isFinite(confidence) && confidence > 0
+    ? Math.round(confidence * 100) + "%"
+    : "";
+  switch (risk) {
+  case "safe":
+    return confidencePct ? "Maestro is confident this is safe (" + confidencePct + ")." : "Maestro marked this as safe.";
+  case "mutating":
+    return confidencePct ? "Maestro expects a mutating step here (" + confidencePct + " confidence)." : "Maestro expects a mutating step here.";
+  case "approval_gated":
+    return confidencePct ? "Maestro expects an approval-required step here (" + confidencePct + " confidence)." : "Maestro expects an approval-required step here.";
+  default:
+    return confidencePct ? "Confidence " + confidencePct + "." : "";
+  }
+}
+
 function supervisorOperatorSentence(item) {
   if (item && item.operator_sentence) return item.operator_sentence;
   const raw = rawSupervisorAction(item && (item.recommended_action || item.action));
-  if (raw === "none") return "Skipped this tick; no safe action was selected.";
-  return "Supervisor reported " + raw + "; inspect diagnostics for details.";
+  if (raw === "none") return "Skipped this tick because no safe action was available.";
+  const summary = String(item && item.summary || "").trim();
+  if (summary) return "Supervisor chose " + raw + ". " + summary;
+  return "Supervisor chose " + raw + ". Inspect diagnostics for details.";
 }
 
 function renderSupervisor(project) {
@@ -1473,11 +1517,14 @@ function renderSupervisor(project) {
   const rawAction = rawSupervisorAction(latest.recommended_action);
   const operatorSentence = supervisorOperatorSentence(latest);
   const summary = latest.summary ? ' · ' + escapeText(latest.summary) : '';
+  const meta = [
+    supervisorDecisionMetaText(latest),
+    latest.queue && queueText(latest.queue)
+  ].filter(Boolean).map(escapeText).join(' · ');
   return '<div class="supervisor">' +
     '<div class="label">Supervisor</div>' +
     '<div class="decision"><strong title="Raw action: ' + escapeText(rawAction) + '">' + escapeText(operatorSentence) + '</strong>' + summary +
-    '<br><small><span class="raw-action">raw: ' + escapeText(rawAction) + '</span> · Risk ' + escapeText(latest.risk || "-") +
-    (latest.confidence ? " · Confidence " + Number(latest.confidence).toFixed(2) : "") + '</small></div>' +
+    (meta ? '<br><small title="Raw action: ' + escapeText(rawAction) + '">' + meta + '</small>' : '') + '</div>' +
     (reasons.length ? '<div class="empty">' + reasons.map(escapeText).join("<br>") + '</div>' : "") +
   '</div>';
 }
