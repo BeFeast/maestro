@@ -2188,7 +2188,7 @@ func openPRForSession(sess *state.Session, byNumber map[int]github.PR, byBranch 
 
 func sessionCanStillBlockProgress(status state.SessionStatus) bool {
 	switch status {
-	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusCodeLanded, state.StatusFailed, state.StatusDead, state.StatusRetryExhausted:
+	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusFailed, state.StatusDead, state.StatusRetryExhausted:
 		return true
 	}
 	return false

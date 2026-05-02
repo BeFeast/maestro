@@ -478,6 +478,31 @@ func TestDecide_ClosedPRWithActiveSessionExplained(t *testing.T) {
 	}
 }
 
+func TestDecide_ClosedPRWithCodeLandedSessionDoesNotBlock(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 93,
+		IssueTitle:  "merged pr",
+		Status:      state.StatusCodeLanded,
+		PRNumber:    17,
+		Branch:      "feat/merged-pr",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == "closed_pr_with_active_session" {
+			t.Fatalf("code_landed session should not block on a closed PR: %#v", stuck)
+		}
+	}
+}
+
 func TestDecide_FailingChecksExplained(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
