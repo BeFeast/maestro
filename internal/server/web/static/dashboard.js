@@ -75,7 +75,21 @@ function issueSummaryText(worker) {
 }
 
 function actionLabel(action) {
-  return String(action || "-").replace(/_/g, " ");
+  switch (String(action || "").trim()) {
+  case "none": return "Skip tick";
+  case "monitor_open_pr": return "Watch PR";
+  case "approve_merge": return "Merge PR";
+  case "spawn_worker": return "Start worker";
+  case "label_issue_ready": return "Mark issue ready";
+  case "review_retry_exhausted": return "Review retry-exhausted work";
+  case "check_outcome_health": return "Check runtime health";
+  case "wait_for_running_worker":
+  case "wait_for_worker": return "Wait for worker";
+  case "wait_for_capacity": return "Wait for free slot";
+  case "wait_for_ordered_queue": return "Wait for queue order";
+  default:
+    return String(action || "-").replace(/_/g, " ");
+  }
 }
 
 function rawSupervisorAction(action) {
@@ -83,11 +97,31 @@ function rawSupervisorAction(action) {
   return raw || "none";
 }
 
+function supervisorDecisionMetaText(item) {
+  const risk = rawSupervisorAction(item && item.risk);
+  const confidence = Number(item && item.confidence);
+  const confidencePct = Number.isFinite(confidence) && confidence > 0
+    ? Math.round(confidence * 100) + "%"
+    : "";
+  switch (risk) {
+  case "safe":
+    return confidencePct ? "Maestro is confident this is safe (" + confidencePct + ")." : "Maestro marked this as safe.";
+  case "mutating":
+    return confidencePct ? "Maestro expects a mutating step here (" + confidencePct + " confidence)." : "Maestro expects a mutating step here.";
+  case "approval_gated":
+    return confidencePct ? "Maestro expects an approval-required step here (" + confidencePct + " confidence)." : "Maestro expects an approval-required step here.";
+  default:
+    return confidencePct ? "Confidence " + confidencePct + "." : "";
+  }
+}
+
 function supervisorOperatorSentence(item) {
   if (item && item.operator_sentence) return item.operator_sentence;
   const raw = rawSupervisorAction(item && (item.recommended_action || item.action));
-  if (raw === "none") return "Skipped this tick; no safe action was selected.";
-  return "Supervisor reported " + raw + "; inspect diagnostics for details.";
+  if (raw === "none") return "Skipped this tick because no safe action was available.";
+  const summary = String(item && item.summary || "").trim();
+  if (summary) return "Supervisor chose " + raw + ". " + summary;
+  return "Supervisor chose " + raw + ". Inspect diagnostics for details.";
 }
 
 function actionDisabledReason(actions) {
@@ -224,8 +258,7 @@ function renderSupervisor(info) {
   const links = targetLinksHTML(latest.target_links);
   const queue = queueText(latest.queue);
   const meta = [
-    latest.risk ? "Risk " + latest.risk : "",
-    latest.confidence ? "Confidence " + Number(latest.confidence).toFixed(2) : "",
+    supervisorDecisionMetaText(latest),
     queue
   ].filter(Boolean);
   const reasons = (latest.stuck_reasons && latest.stuck_reasons.length ? latest.stuck_reasons : latest.reasons || []).slice(0, 3);
@@ -258,7 +291,6 @@ function renderSupervisor(info) {
     (links ? '<span class="supervisor-links">' + links + '</span>' : "") +
     '</div>' +
     (latest.summary ? '<div class="supervisor-summary">' + escapeText(latest.summary) + '</div>' : "") +
-    '<div class="supervisor-raw-action">raw: ' + escapeText(rawAction) + '</div>' +
     (meta.length ? '<div class="supervisor-meta">' + meta.map(item => '<span>' + escapeText(item) + '</span>').join("") + '</div>' : "") +
     reasonHTML + lastSafe + approvals;
 }
