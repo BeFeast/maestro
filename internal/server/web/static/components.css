@@ -1,0 +1,89 @@
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 24px;
+  padding: 2px 9px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pill--ok { color: var(--ok); border-color: rgba(5, 150, 105, .42); background: var(--ok-bg); }
+.pill--warn { color: var(--warn); border-color: rgba(194, 65, 12, .42); background: var(--warn-bg); }
+.pill--bad { color: var(--bad); border-color: rgba(185, 28, 28, .42); background: var(--bad-bg); }
+.pill--idle { color: var(--text-faint); border-color: var(--line); background: var(--panel-2); }
+.pill--policy { color: var(--queued); border-color: rgba(139, 92, 246, .42); background: rgba(139, 92, 246, .10); }
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  box-shadow: var(--shadow-soft);
+}
+
+.section {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.section__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.caption {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.status-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  color: var(--muted);
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.status-icon--ready,
+.status-icon--merged { color: var(--ok); }
+.status-icon--running { color: var(--brand-a); }
+.status-icon--waiting,
+.status-icon--stale { color: var(--warn); }
+.status-icon--blocked { color: var(--bad); }
+.status-icon--daemon { color: var(--daemon); }
+.status-icon--queued { color: var(--text-mute); }
+
+.status-icon--ready { fill: currentColor; stroke: none; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .status-icon--running {
+    animation: maestro-status-spin 1.2s linear infinite;
+    transform-origin: center;
+  }
+}
+
+@keyframes maestro-status-spin {
+  to { transform: rotate(360deg); }
+}

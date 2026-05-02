@@ -1377,6 +1377,8 @@ func TestFleetDashboard(t *testing.T) {
 		"/api/v1/fleet/worker",
 		"<html data-theme=\"light\">",
 		"/static/tokens.css",
+		"/static/components.css",
+		"/static/status-icons.svg",
 		"/static/maestro-mark.svg",
 		"/static/favicon-32.png",
 		"/static/apple-touch-icon-180.png",
