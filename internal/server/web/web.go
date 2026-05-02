@@ -36,5 +36,9 @@ func StaticHandler() http.Handler {
 	if err != nil {
 		panic(fmt.Sprintf("open embedded static fs: %v", err))
 	}
-	return http.StripPrefix("/static/", http.FileServer(http.FS(static)))
+	server := http.StripPrefix("/static/", http.FileServer(http.FS(static)))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, max-age=0")
+		server.ServeHTTP(w, r)
+	})
 }
