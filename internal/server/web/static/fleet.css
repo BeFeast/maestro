@@ -1,23 +1,9 @@
-  :root {
-    color-scheme: light;
-    --bg: #f6f8fb;
-    --panel: #ffffff;
-    --panel-2: #f8fafc;
-    --line: #d7dee8;
-    --text: #172033;
-    --muted: #64748b;
-    --accent: #2563eb;
-    --ok: #16803c;
-    --warn: #a16207;
-    --bad: #dc2626;
-    --queued: #7c3aed;
-  }
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    background: linear-gradient(180deg, #fbfdff 0, var(--bg) 220px);
+    background: var(--page-gradient);
     color: var(--text);
-    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font: 14px/1.45 var(--font-display);
   }
   header {
     min-height: 64px;
@@ -86,7 +72,7 @@
     width: 100%;
     border: 1px solid var(--line);
     border-radius: 8px;
-    background: #ffffff;
+    background: var(--input-bg);
     color: var(--text);
     font: inherit;
     padding: 7px 9px;
@@ -392,9 +378,9 @@
     padding: 12px;
     overflow: auto;
     border: 1px solid rgba(215,222,232,.9);
-    background: #05080d;
-    color: #dbe7f3;
-    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    color: var(--code-text);
+    font: 12px/1.45 var(--font-mono);
     white-space: pre-wrap;
   }
   .section-head {
@@ -516,7 +502,7 @@
   }
   .history-row-action:hover { border-color: rgba(88,166,255,.65); }
   .project-col { width: 140px; font-weight: 650; }
-  .slot-col { width: 92px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .slot-col { width: 92px; font-family: var(--font-mono); }
   .issue-col { width: auto; }
   .status-col { width: 132px; }
   .backend-col { width: 108px; }
@@ -608,7 +594,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .project-worker-slot { width: 68px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .project-worker-slot { width: 68px; font-family: var(--font-mono); }
   .project-worker-status { width: 124px; padding-right: 8px; }
   .project-worker-issue { min-width: 0; padding-right: 8px; }
   .project-worker-runtime { width: 64px; text-align: right; color: var(--muted); }
