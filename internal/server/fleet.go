@@ -228,26 +228,28 @@ type fleetOperatorState struct {
 }
 
 type fleetSummary struct {
-	Projects            int `json:"projects"`
-	Stale               int `json:"stale"`
-	Errors              int `json:"errors"`
-	Active              int `json:"active"`
-	MonitoringPR        int `json:"monitoring_pr"`
-	DispatchPending     int `json:"dispatch_pending"`
-	QueueBlocked        int `json:"queue_blocked"`
-	OutcomeMissing      int `json:"outcome_missing"`
-	Running             int `json:"running"`
-	PROpen              int `json:"pr_open"`
-	Failed              int `json:"failed"`
-	Sessions            int `json:"sessions"`
-	NeedsAttention      int `json:"needs_attention"`
-	Approvals           int `json:"approvals"`
-	ApprovalsPending    int `json:"approvals_pending"`
-	ApprovalsHistorical int `json:"approvals_historical"`
-	ApprovalsStale      int `json:"approvals_stale"`
-	ApprovalsSuperseded int `json:"approvals_superseded"`
-	ApprovalsApproved   int `json:"approvals_approved"`
-	ApprovalsRejected   int `json:"approvals_rejected"`
+	Projects            int   `json:"projects"`
+	Stale               int   `json:"stale"`
+	Errors              int   `json:"errors"`
+	Active              int   `json:"active"`
+	MonitoringPR        int   `json:"monitoring_pr"`
+	DispatchPending     int   `json:"dispatch_pending"`
+	QueueBlocked        int   `json:"queue_blocked"`
+	OutcomeMissing      int   `json:"outcome_missing"`
+	Running             int   `json:"running"`
+	PROpen              int   `json:"pr_open"`
+	Failed              int   `json:"failed"`
+	Sessions            int   `json:"sessions"`
+	NeedsAttention      int   `json:"needs_attention"`
+	Approvals           int   `json:"approvals"`
+	ApprovalsPending    int   `json:"approvals_pending"`
+	ApprovalsHistorical int   `json:"approvals_historical"`
+	ApprovalsStale      int   `json:"approvals_stale"`
+	ApprovalsSuperseded int   `json:"approvals_superseded"`
+	ApprovalsApproved   int   `json:"approvals_approved"`
+	ApprovalsRejected   int   `json:"approvals_rejected"`
+	ThroughputMerged7D  int   `json:"throughput_merged_7d"`
+	ThroughputDaily7D   []int `json:"throughput_daily_7d,omitempty"`
 }
 
 type fleetProjectFreshness struct {
@@ -527,6 +529,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 		Attention:   make([]fleetWorkerState, 0),
 		Approvals:   make([]fleetApprovalState, 0),
 	}
+	throughputBuckets := newFleetThroughputBuckets(now, 7)
 	for _, project := range s.projects {
 		item, workers := s.projectSnapshot(project, now)
 		resp.Projects = append(resp.Projects, item)
@@ -548,10 +551,13 @@ func (s *FleetServer) snapshot() fleetResponse {
 		resp.Summary.Failed += item.Failed
 		resp.Summary.Sessions += item.Sessions
 		resp.Summary.NeedsAttention += item.NeedsAttention
+		addFleetThroughputSummary(throughputBuckets, workers)
 		for _, approval := range item.Approvals {
 			addFleetApprovalSummary(&resp.Summary, approval.Status)
 		}
 	}
+	resp.Summary.ThroughputDaily7D = throughputBuckets.Counts()
+	resp.Summary.ThroughputMerged7D = throughputBuckets.Total()
 	sort.Slice(resp.Projects, func(i, j int) bool {
 		li := fleetOperatorStatePriority(resp.Projects[i].OperatorState.Kind)
 		ri := fleetOperatorStatePriority(resp.Projects[j].OperatorState.Kind)
@@ -1065,6 +1071,79 @@ func addFleetApprovalSummary(summary *fleetSummary, status string) {
 		summary.ApprovalsRejected++
 	default:
 		summary.ApprovalsHistorical++
+	}
+}
+
+type fleetThroughputBuckets struct {
+	days  int
+	start time.Time
+	end   time.Time
+	total int
+	items []int
+}
+
+func newFleetThroughputBuckets(now time.Time, days int) *fleetThroughputBuckets {
+	if days <= 0 {
+		days = 7
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	end := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	start := end.AddDate(0, 0, -(days - 1))
+	return &fleetThroughputBuckets{
+		days:  days,
+		start: start,
+		end:   end,
+		items: make([]int, days),
+	}
+}
+
+func (b *fleetThroughputBuckets) Add(ts time.Time) {
+	if b == nil || ts.IsZero() {
+		return
+	}
+	day := time.Date(ts.UTC().Year(), ts.UTC().Month(), ts.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	if day.Before(b.start) || day.After(b.end) {
+		return
+	}
+	offset := int(day.Sub(b.start) / (24 * time.Hour))
+	if offset < 0 || offset >= len(b.items) {
+		return
+	}
+	b.items[offset]++
+	b.total++
+}
+
+func (b *fleetThroughputBuckets) Counts() []int {
+	if b == nil {
+		return nil
+	}
+	out := make([]int, len(b.items))
+	copy(out, b.items)
+	return out
+}
+
+func (b *fleetThroughputBuckets) Total() int {
+	if b == nil {
+		return 0
+	}
+	return b.total
+}
+
+func addFleetThroughputSummary(buckets *fleetThroughputBuckets, workers []fleetWorkerState) {
+	if buckets == nil {
+		return
+	}
+	for _, worker := range workers {
+		if worker.Status != string(state.StatusDone) || worker.PRNumber <= 0 || strings.TrimSpace(worker.FinishedAt) == "" {
+			continue
+		}
+		finishedAt, err := time.Parse(time.RFC3339, worker.FinishedAt)
+		if err != nil {
+			continue
+		}
+		buckets.Add(finishedAt)
 	}
 }
 
