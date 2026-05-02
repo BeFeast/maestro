@@ -1,0 +1,100 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;650;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
+:root,
+:root[data-theme="light"],
+html[data-theme="light"],
+body[data-theme="light"] {
+  color-scheme: light;
+
+  --maestro-bg: #f7fafa;
+  --maestro-surface: #ffffff;
+  --maestro-card: #ffffff;
+  --maestro-border: #dde6e3;
+  --maestro-border-hi: #c4d1cc;
+  --maestro-text: #0c1413;
+  --maestro-text-dim: #2c3633;
+  --maestro-text-mute: #4d5957;
+  --maestro-text-faint: #828b89;
+  --maestro-brand-a: #059669;
+  --maestro-brand-b: #0891b2;
+  --maestro-ok: #059669;
+  --maestro-warn: #c2410c;
+  --maestro-bad: #b91c1c;
+  --maestro-daemon: #6b7280;
+
+  --bg: var(--maestro-bg);
+  --surface: var(--maestro-surface);
+  --card: var(--maestro-card);
+  --panel: var(--maestro-surface);
+  --panel-2: #eef5f3;
+  --line: var(--maestro-border);
+  --border: var(--maestro-border);
+  --border-hi: var(--maestro-border-hi);
+  --text: var(--maestro-text);
+  --text-dim: var(--maestro-text-dim);
+  --text-mute: var(--maestro-text-mute);
+  --text-faint: var(--maestro-text-faint);
+  --muted: var(--maestro-text-mute);
+  --accent: var(--maestro-brand-b);
+  --brand-a: var(--maestro-brand-a);
+  --brand-b: var(--maestro-brand-b);
+  --ok: var(--maestro-ok);
+  --warn: var(--maestro-warn);
+  --bad: var(--maestro-bad);
+  --queued: #8b5cf6;
+  --daemon: var(--maestro-daemon);
+
+  --page-gradient: linear-gradient(180deg, #ffffff 0, var(--bg) 240px);
+  --input-bg: #ffffff;
+  --hover-bg: rgba(5, 150, 105, .07);
+  --ok-bg: rgba(5, 150, 105, .10);
+  --accent-bg: rgba(8, 145, 178, .10);
+  --warn-bg: rgba(194, 65, 12, .10);
+  --bad-bg: rgba(185, 28, 28, .08);
+  --bad-bg-strong: rgba(185, 28, 28, .13);
+  --code-bg: #f9fbfa;
+  --code-text: #172033;
+  --shadow-soft: 0 1px 0 rgba(12, 20, 19, .04), 0 8px 24px rgba(12, 20, 19, .05);
+  --focus-ring: 0 0 0 3px rgba(8, 145, 178, .18);
+  --font-display: "Inter Tight", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+:root[data-theme="dark"],
+html[data-theme="dark"],
+body[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0d1117;
+  --surface: #151b23;
+  --card: #080c11;
+  --panel: #151b23;
+  --panel-2: #10161d;
+  --line: #29313d;
+  --border: #29313d;
+  --border-hi: #3b4554;
+  --text: #e6edf3;
+  --text-dim: #c9d1d9;
+  --text-mute: #8b949e;
+  --text-faint: #6e7681;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --brand-a: #3fb950;
+  --brand-b: #58a6ff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+  --queued: #a371f7;
+  --daemon: #8b949e;
+  --page-gradient: var(--bg);
+  --input-bg: #0b1016;
+  --hover-bg: #18212c;
+  --ok-bg: rgba(63, 185, 80, .10);
+  --accent-bg: rgba(88, 166, 255, .10);
+  --warn-bg: rgba(210, 153, 34, .10);
+  --bad-bg: rgba(248, 81, 73, .07);
+  --bad-bg-strong: rgba(248, 81, 73, .13);
+  --code-bg: #05080d;
+  --code-text: #dbe7f3;
+  --shadow-soft: none;
+}

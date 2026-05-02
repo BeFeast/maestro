@@ -1367,7 +1367,7 @@ func TestFleetDashboard(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	body := w.Body.String() + web.MustReadStatic("fleet.js") + web.MustReadStatic("fleet.css")
+	body := w.Body.String() + web.MustReadStatic("tokens.css") + web.MustReadStatic("fleet.js") + web.MustReadStatic("fleet.css")
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
@@ -1375,6 +1375,12 @@ func TestFleetDashboard(t *testing.T) {
 		"Maestro Fleet",
 		"/api/v1/fleet",
 		"/api/v1/fleet/worker",
+		"<html data-theme=\"light\">",
+		"/static/tokens.css",
+		"Inter Tight",
+		"JetBrains Mono",
+		"#059669",
+		"#0891b2",
 		"color-scheme: light",
 		"fleet-initial-state",
 		"project-rail",
@@ -1676,7 +1682,7 @@ func fleetDashboardBodyWithProjects(t *testing.T, projects []FleetProject) strin
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	return w.Body.String() + web.MustReadStatic("fleet.js") + web.MustReadStatic("fleet.css")
+	return w.Body.String() + web.MustReadStatic("tokens.css") + web.MustReadStatic("fleet.js") + web.MustReadStatic("fleet.css")
 }
 
 func fleetDashboardFixtureProjects(t *testing.T, count int) []FleetProject {

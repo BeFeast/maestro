@@ -1010,7 +1010,7 @@ func TestHandleDashboard(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
 
-	body := w.Body.String() + web.MustReadStatic("dashboard.js") + web.MustReadStatic("dashboard.css")
+	body := w.Body.String() + web.MustReadStatic("tokens.css") + web.MustReadStatic("dashboard.js") + web.MustReadStatic("dashboard.css")
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
@@ -1043,6 +1043,11 @@ func TestHandleDashboard(t *testing.T) {
 	}
 	if !contains(body, "renderWorkerActions") || !contains(body, "actionDetailHTML") || !contains(body, "manual approval required") {
 		t.Error("dashboard should render disabled approval-gated action affordances")
+	}
+	for _, want := range []string{"<html data-theme=\"light\">", "/static/tokens.css", "Inter Tight", "JetBrains Mono", "#059669", "#0891b2", "color-scheme: light"} {
+		if !contains(body, want) {
+			t.Fatalf("dashboard design tokens should contain %q", want)
+		}
 	}
 	for _, want := range []string{"Scope", "Target", "Approval", "Disabled", "replace(/^Would\\s+/i"} {
 		if !contains(body, want) {
