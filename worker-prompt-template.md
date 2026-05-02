@@ -59,7 +59,7 @@ git rebase origin/main        # IMMEDIATELY before create, not just at session s
 cargo fmt --all               # in server/ directory
 cargo check -p panoptikon-server 2>&1 | grep "^error" | head -5
 git push --force-with-lease origin {{BRANCH}}
-gh pr create --repo {{REPO}} --title "feat: {{ISSUE_TITLE}} (#{{ISSUE_NUMBER}})" --body "Closes #{{ISSUE_NUMBER}}"
+gh pr create --repo {{REPO}} --title "feat: {{ISSUE_TITLE}} (#{{ISSUE_NUMBER}})" --body "Refs #{{ISSUE_NUMBER}}"
 ```
 
 ### 3. Code quality
@@ -86,6 +86,7 @@ When rebasing conflicts in these files: **keep BOTH sides**. Your additions + wh
 ### 6. When stuck
 - If a dependency is missing → check if there's an open issue for it, comment on yours that it's blocked
 - If the issue is ambiguous → make a reasonable interpretation and document it in the PR body
+- Never use closing keywords such as `Closes`, `Fixes`, or `Resolves` in PR bodies for Maestro-managed work
 - If CI fails → fix it before anything else, don't leave broken builds
 
 ### 7. Done means done
