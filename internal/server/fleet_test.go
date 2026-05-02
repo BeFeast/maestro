@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -205,25 +206,62 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 }
 
-func TestFleetThroughputBucketsCountRecentMergedPRs(t *testing.T) {
+func TestFleetThroughputBucketsAggregateSevenDayWindows(t *testing.T) {
 	now := time.Date(2026, 5, 2, 15, 0, 0, 0, time.UTC)
-	buckets := newFleetThroughputBuckets(now, 7)
-	workers := []fleetWorkerState{
+	donePR := func(pr int, finishedAt time.Time) fleetWorkerState {
+		return fleetWorkerState{Status: string(state.StatusDone), PRNumber: pr, FinishedAt: finishedAt.Format(time.RFC3339)}
+	}
+	fullWindow := make([]fleetWorkerState, 0, 7)
+	for daysAgo := 6; daysAgo >= 0; daysAgo-- {
+		fullWindow = append(fullWindow, donePR(100+daysAgo, now.AddDate(0, 0, -daysAgo)))
+	}
+	partialWindow := []fleetWorkerState{
 		{Status: string(state.StatusDone), PRNumber: 10, FinishedAt: now.Add(-2 * time.Hour).Format(time.RFC3339)},
 		{Status: string(state.StatusDone), PRNumber: 11, FinishedAt: now.Add(-24 * time.Hour).Format(time.RFC3339)},
 		{Status: string(state.StatusDone), PRNumber: 12, FinishedAt: now.Add(-6 * 24 * time.Hour).Format(time.RFC3339)},
 		{Status: string(state.StatusDone), PRNumber: 13, FinishedAt: now.Add(-8 * 24 * time.Hour).Format(time.RFC3339)},
 		{Status: string(state.StatusFailed), PRNumber: 14, FinishedAt: now.Add(-time.Hour).Format(time.RFC3339)},
 		{Status: string(state.StatusDone), PRNumber: 0, FinishedAt: now.Add(-time.Hour).Format(time.RFC3339)},
+		{Status: string(state.StatusDone), PRNumber: 15, FinishedAt: "not-a-time"},
 	}
 
-	addFleetThroughputSummary(buckets, workers)
-
-	if buckets.Total() != 3 {
-		t.Fatalf("total = %d, want 3", buckets.Total())
+	tests := []struct {
+		name    string
+		workers []fleetWorkerState
+		want    []int
+	}{
+		{
+			name: "zero data",
+			want: []int{0, 0, 0, 0, 0, 0, 0},
+		},
+		{
+			name:    "partial window",
+			workers: partialWindow,
+			want:    []int{1, 0, 0, 0, 0, 1, 1},
+		},
+		{
+			name:    "full window",
+			workers: fullWindow,
+			want:    []int{1, 1, 1, 1, 1, 1, 1},
+		},
 	}
-	if got := buckets.Counts(); len(got) != 7 || got[0] != 1 || got[5] != 1 || got[6] != 1 {
-		t.Fatalf("counts = %v, want [1 0 0 0 0 1 1]", got)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buckets := newFleetThroughputBuckets(now, 7)
+			addFleetThroughputSummary(buckets, tc.workers)
+
+			if got := buckets.Counts(); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("counts = %v, want %v", got, tc.want)
+			}
+			wantTotal := 0
+			for _, count := range tc.want {
+				wantTotal += count
+			}
+			if buckets.Total() != wantTotal {
+				t.Fatalf("total = %d, want %d", buckets.Total(), wantTotal)
+			}
+		})
 	}
 }
 
@@ -1647,6 +1685,10 @@ func TestFleetDashboard(t *testing.T) {
 		"fleet-refresh",
 		"stat-label",
 		"Projects",
+		"Merged PRs",
+		"done sessions with PRs",
+		"Counts done Maestro sessions that recorded a PR number",
+		"stat-sparkline-empty",
 		"projectIsUnconfigured",
 		"project-row--unconfigured",
 		"rail-state-unconfigured",
