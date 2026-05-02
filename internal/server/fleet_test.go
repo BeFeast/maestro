@@ -560,6 +560,42 @@ func TestFleetVerdictCoversHeaderStates(t *testing.T) {
 	}
 }
 
+func TestFleetVerdictDoesNotTreatProjectFreshnessStaleAsHeartbeatStale(t *testing.T) {
+	now := time.Now().UTC()
+	latest := &supervisorDecisionInfo{CreatedAt: now}
+	resp := fleetResponse{
+		Summary: fleetSummary{Projects: 1, Stale: 1},
+		Projects: []fleetProjectState{{
+			Supervisor: supervisorInfo{Latest: latest},
+		}},
+	}
+
+	verdict := buildFleetVerdict(resp, now)
+	if verdict.Tone != "attention" {
+		t.Fatalf("verdict tone = %q, want attention; sentence=%q", verdict.Tone, verdict.Sentence)
+	}
+	if contains(verdict.Sentence, "heartbeat stale") || contains(verdict.Sentence, "heartbeat lost") {
+		t.Fatalf("verdict sentence = %q, should not label stale snapshots as stale heartbeat", verdict.Sentence)
+	}
+	for _, want := range []string{"Supervisor healthy.", "1 project snapshot is stale.", "1 item needs attention."} {
+		if !contains(verdict.Sentence, want) {
+			t.Fatalf("verdict sentence = %q, want %q", verdict.Sentence, want)
+		}
+	}
+}
+
+func TestFleetIdleByPolicyRequiresEveryIdleProjectReason(t *testing.T) {
+	policyIdle := fleetProjectState{QueueSnapshot: &fleetQueueSnapshot{IdleReason: "Policy excluded all 1 open issue."}}
+	alsoPolicyIdle := fleetProjectState{QueueSnapshot: &fleetQueueSnapshot{IdleReason: "No open issues are available."}}
+
+	if !fleetIdleByPolicy([]fleetProjectState{policyIdle, alsoPolicyIdle}) {
+		t.Fatal("fleetIdleByPolicy = false, want true when every idle project has a policy reason")
+	}
+	if fleetIdleByPolicy([]fleetProjectState{policyIdle, {}}) {
+		t.Fatal("fleetIdleByPolicy = true, want false when another idle project lacks a policy reason")
+	}
+}
+
 func TestFleetAPISurfacesProjectErrorsAndStaleFreshness(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

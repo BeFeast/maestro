@@ -578,10 +578,10 @@ func buildFleetVerdict(resp fleetResponse, now time.Time) fleetVerdict {
 }
 
 func fleetVerdictTone(summary fleetSummary, latest *supervisorDecisionInfo, now time.Time) string {
-	if summary.Stale > 0 || latest == nil || supervisorHeartbeatStale(latest, now) {
+	if latest == nil || supervisorHeartbeatStale(latest, now) {
 		return "daemon-down"
 	}
-	if summary.Errors > 0 || summary.NeedsAttention > 0 || summary.ApprovalsPending > 0 {
+	if summary.Stale > 0 || summary.Errors > 0 || summary.NeedsAttention > 0 || summary.ApprovalsPending > 0 {
 		return "attention"
 	}
 	if summary.Running > 0 {
@@ -594,9 +594,6 @@ func fleetLivenessSentence(summary fleetSummary, projects []fleetProjectState, l
 	if latest == nil || latest.CreatedAt.IsZero() {
 		return "Supervisor heartbeat unavailable."
 	}
-	if summary.Stale > 0 {
-		return fmt.Sprintf("Supervisor heartbeat stale for %s.", projectCountPhrase(summary.Stale))
-	}
 	if supervisorHeartbeatStale(latest, now) {
 		sentence := fmt.Sprintf("Supervisor heartbeat lost %s ago.", formatFleetVerdictAge(latest.CreatedAt, now))
 		if lastSafe := latestFleetSafeSupervisorAction(projects); lastSafe != nil {
@@ -605,6 +602,9 @@ func fleetLivenessSentence(summary fleetSummary, projects []fleetProjectState, l
 			}
 		}
 		return sentence
+	}
+	if summary.Stale > 0 {
+		return fmt.Sprintf("Supervisor healthy. %s.", staleProjectSnapshotPhrase(summary.Stale))
 	}
 	return "Supervisor healthy."
 }
@@ -645,7 +645,7 @@ func fleetPRSentence(prOpen int) string {
 }
 
 func fleetAttentionSentence(summary fleetSummary) string {
-	items := summary.NeedsAttention + summary.ApprovalsPending + summary.Errors
+	items := summary.NeedsAttention + summary.ApprovalsPending + summary.Errors + summary.Stale
 	switch items {
 	case 0:
 		return "No item needs attention."
@@ -703,7 +703,9 @@ func fleetLastSafeActionSentence(action supervisorActionInfo, now time.Time) str
 }
 
 func fleetIdleByPolicy(projects []fleetProjectState) bool {
-	sawPolicy := false
+	if len(projects) == 0 {
+		return false
+	}
 	for _, project := range projects {
 		if project.Error != "" {
 			return false
@@ -712,18 +714,17 @@ func fleetIdleByPolicy(projects []fleetProjectState) bool {
 			return false
 		}
 		if project.QueueSnapshot == nil || strings.TrimSpace(project.QueueSnapshot.IdleReason) == "" {
-			continue
+			return false
 		}
-		sawPolicy = true
 	}
-	return sawPolicy
+	return true
 }
 
-func projectCountPhrase(count int) string {
+func staleProjectSnapshotPhrase(count int) string {
 	if count == 1 {
-		return "1 project"
+		return "1 project snapshot is stale"
 	}
-	return fmt.Sprintf("%d projects", count)
+	return fmt.Sprintf("%d project snapshots are stale", count)
 }
 
 func formatFleetVerdictAge(t, now time.Time) string {
