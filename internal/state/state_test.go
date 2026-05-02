@@ -960,6 +960,89 @@ func TestSessionAttentionFor_DoneReviewFeedbackIsHistorical(t *testing.T) {
 	}
 }
 
+func TestSessionLiveAt(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	future := now.Add(10 * time.Minute)
+	recent := now.Add(-LiveSessionRecentWindow + time.Minute)
+	old := now.Add(-LiveSessionRecentWindow - time.Minute)
+
+	tests := []struct {
+		name string
+		sess *Session
+		want bool
+	}{
+		{
+			name: "running",
+			sess: &Session{Status: StatusRunning, StartedAt: old},
+			want: true,
+		},
+		{
+			name: "open PR",
+			sess: &Session{Status: StatusPROpen, StartedAt: old, PRNumber: 10},
+			want: true,
+		},
+		{
+			name: "queued",
+			sess: &Session{Status: StatusQueued, StartedAt: old},
+			want: true,
+		},
+		{
+			name: "review retry backoff",
+			sess: &Session{
+				Status:                      StatusDead,
+				StartedAt:                   old,
+				NextRetryAt:                 &future,
+				PreviousAttemptFeedbackKind: RetryReasonReviewFeedback,
+				RetryReason:                 RetryReasonReviewFeedback,
+			},
+			want: true,
+		},
+		{
+			name: "retry needs attention",
+			sess: &Session{Status: StatusDead, StartedAt: old, NextRetryAt: &future},
+			want: true,
+		},
+		{
+			name: "recently finished done",
+			sess: &Session{Status: StatusDone, StartedAt: old, FinishedAt: &recent},
+			want: true,
+		},
+		{
+			name: "recent output on old done",
+			sess: &Session{Status: StatusDone, StartedAt: old, FinishedAt: &old, LastOutputChangedAt: recent},
+			want: true,
+		},
+		{
+			name: "old done",
+			sess: &Session{Status: StatusDone, StartedAt: old, FinishedAt: &old},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SessionLiveAt(tt.sess, now); got != tt.want {
+				t.Fatalf("SessionLiveAt = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLiveSessionsAt(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-LiveSessionRecentWindow - time.Hour)
+	recent := now.Add(-time.Hour)
+	s := NewState()
+	s.Sessions["running"] = &Session{Status: StatusRunning, StartedAt: old}
+	s.Sessions["recent-done"] = &Session{Status: StatusDone, StartedAt: old, FinishedAt: &recent}
+	s.Sessions["old-done"] = &Session{Status: StatusDone, StartedAt: old, FinishedAt: &old}
+
+	live := s.LiveSessionsAt(now)
+	if len(live) != 2 {
+		t.Fatalf("LiveSessionsAt len = %d, want 2", len(live))
+	}
+}
+
 func TestCountByStatus(t *testing.T) {
 	s := NewState()
 	s.Sessions["slot-1"] = &Session{IssueNumber: 1, Status: StatusRunning}

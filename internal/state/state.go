@@ -36,6 +36,7 @@ const (
 	DisplayReviewRetryPending SessionDisplayStatus = "review_retry_pending"
 	DisplayReviewRetryRunning SessionDisplayStatus = "review_retry_running"
 	DisplayReviewRetryRecheck SessionDisplayStatus = "review_retry_recheck"
+	LiveSessionRecentWindow                        = 24 * time.Hour
 )
 
 const RetryReasonReviewFeedback = "review_feedback"
@@ -1432,6 +1433,73 @@ func (s *State) ActiveSessions() []*Session {
 		}
 	}
 	return active
+}
+
+// LiveSessions returns sessions that belong in the default operator view.
+func (s *State) LiveSessions() []*Session {
+	return s.LiveSessionsAt(time.Now().UTC())
+}
+
+// LiveSessionsAt returns sessions that are running, actionable, still in PR or
+// retry review flow, or changed within the recent live window.
+func (s *State) LiveSessionsAt(now time.Time) []*Session {
+	if s == nil {
+		return nil
+	}
+	live := make([]*Session, 0)
+	for _, sess := range s.Sessions {
+		if SessionLiveAt(sess, now) {
+			live = append(live, sess)
+		}
+	}
+	return live
+}
+
+// SessionLive reports whether a session belongs in the default operator view.
+func SessionLive(sess *Session) bool {
+	return SessionLiveAt(sess, time.Now().UTC())
+}
+
+// SessionLiveAt is SessionLive with an explicit clock for tests.
+func SessionLiveAt(sess *Session, now time.Time) bool {
+	if sess == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	switch sess.Status {
+	case StatusRunning, StatusPROpen, StatusQueued:
+		return true
+	}
+
+	switch SessionDisplayStatus(SessionDisplayStatusForAt(sess, nil, now)) {
+	case DisplayReviewRetryBackoff, DisplayReviewRetryPending, DisplayReviewRetryRunning, DisplayReviewRetryRecheck:
+		return true
+	}
+
+	if SessionAttentionForAt(sess, nil, now).NeedsAttention {
+		return true
+	}
+
+	changedAt := SessionChangedAt(sess)
+	return !changedAt.IsZero() && now.Sub(changedAt.UTC()) <= LiveSessionRecentWindow
+}
+
+// SessionChangedAt returns the newest persisted activity timestamp for a session.
+func SessionChangedAt(sess *Session) time.Time {
+	if sess == nil {
+		return time.Time{}
+	}
+	changedAt := sess.StartedAt
+	if sess.FinishedAt != nil && sess.FinishedAt.After(changedAt) {
+		changedAt = *sess.FinishedAt
+	}
+	if !sess.LastOutputChangedAt.IsZero() && sess.LastOutputChangedAt.After(changedAt) {
+		changedAt = sess.LastOutputChangedAt
+	}
+	return changedAt.UTC()
 }
 
 // CountByStatus returns a map of session status → count for all non-terminal sessions.

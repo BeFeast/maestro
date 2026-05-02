@@ -213,6 +213,7 @@ type sessionInfo struct {
 	StatusReason      string          `json:"status_reason,omitempty"`
 	NextAction        string          `json:"next_action,omitempty"`
 	NeedsAttention    bool            `json:"needs_attention,omitempty"`
+	Live              bool            `json:"live"`
 	Backend           string          `json:"backend,omitempty"`
 	PRNumber          int             `json:"pr_number,omitempty"`
 	PRURL             string          `json:"pr_url,omitempty"`
@@ -235,6 +236,7 @@ type sessionInfo struct {
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
+	now := time.Now().UTC()
 	info := sessionInfo{
 		Slot:              slot,
 		IssueNumber:       sess.IssueNumber,
@@ -253,10 +255,11 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		HasLog:            strings.TrimSpace(sess.LogFile) != "",
 		RetryCount:        sess.RetryCount,
 		LastNotification:  sess.LastNotifiedStatus,
+		Live:              state.SessionLiveAt(sess, now),
 	}
 
 	// Calculate runtime
-	end := time.Now()
+	end := now
 	if sess.FinishedAt != nil {
 		end = *sess.FinishedAt
 		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339)
@@ -273,8 +276,8 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	if sess.NextRetryAt != nil {
 		info.NextRetryAt = sess.NextRetryAt.Format(time.RFC3339)
 	}
-	attention := state.SessionAttentionFor(sess, info.Alive)
-	if displayStatus := state.SessionDisplayStatusFor(sess, info.Alive); displayStatus != "" && displayStatus != info.Status {
+	attention := state.SessionAttentionForAt(sess, info.Alive, now)
+	if displayStatus := state.SessionDisplayStatusForAt(sess, info.Alive, now); displayStatus != "" && displayStatus != info.Status {
 		info.DisplayStatus = displayStatus
 	}
 	info.StatusReason = attention.Reason
