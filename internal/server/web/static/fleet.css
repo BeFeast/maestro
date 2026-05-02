@@ -136,7 +136,9 @@
     padding: 18px 22px;
     border-right: 1px solid var(--line);
   }
+  .stat[title] { cursor: help; }
   .stat:last-child { border-right: 0; }
+  .stat-neutral .stat-value strong { color: var(--text-mute); }
   .stat-label {
     display: block;
     color: var(--text-faint);
@@ -163,6 +165,10 @@
     border-radius: 999px 999px 3px 3px;
     background: linear-gradient(180deg, rgba(56,189,248,.9), rgba(37,99,235,.82));
     box-shadow: inset 0 1px 0 rgba(255,255,255,.45);
+  }
+  .stat-sparkline-empty .stat-sparkline-bar {
+    background: rgba(148,163,184,.28);
+    box-shadow: none;
   }
   .project-rail {
     margin-bottom: 20px;

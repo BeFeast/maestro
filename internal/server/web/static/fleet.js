@@ -851,15 +851,24 @@ function renderStats(summary) {
   const throughputDaily = Array.isArray(summary.throughput_daily_7d)
     ? summary.throughput_daily_7d.map(value => Number(value || 0))
     : [];
+  const throughputTitle = "Counts done Maestro sessions that recorded a PR number, bucketed by finished date over the last 7 days.";
   const items = [
     { label: "Running", value: running, suffix: "of " + projects, note: projects ? "worker slots" : "no projects" },
     { label: "PRs in flight", value: prOpen, suffix: "", note: monitoring + " monitored" },
     { label: "Failed", value: failed, suffix: "", note: "current fleet" },
     { label: "Attention", value: attention, suffix: "", note: attention ? "waiting" : "nothing waiting" },
-    { label: "Issue throughput", value: throughputMerged, suffix: "", note: "merged · last 7d", sparkline: throughputDaily }
+    {
+      label: "Merged PRs",
+      value: throughputMerged,
+      suffix: "",
+      note: throughputMerged ? "done sessions with PRs · last 7d" : "no done PR sessions · last 7d",
+      sparkline: throughputDaily,
+      title: throughputTitle,
+      neutral: throughputMerged === 0
+    }
   ];
   statsEl.innerHTML = items.map(item =>
-    '<div class="stat"><span class="stat-label">' + escapeText(item.label) + '</span>' +
+    '<div class="stat' + (item.neutral ? ' stat-neutral' : '') + '"' + (item.title ? ' title="' + escapeText(item.title) + '"' : '') + '><span class="stat-label">' + escapeText(item.label) + '</span>' +
       '<div class="stat-value"><strong>' + escapeText(item.value) + '</strong>' +
       (item.suffix ? '<span class="stat-suffix">' + escapeText(item.suffix) + '</span>' : '') + '</div>' +
       (item.sparkline ? renderStatSparkline(item.sparkline) : '') +
@@ -871,11 +880,20 @@ function renderStatSparkline(values) {
   const bars = Array.isArray(values) ? values.map(value => Number(value || 0)) : [];
   if (!bars.length) return "";
   const max = Math.max(...bars, 1);
+  const empty = bars.every(value => value === 0);
   const columns = bars.map((value, index) => {
     const height = Math.max(6, Math.round((value / max) * 28));
-    return '<span class="stat-sparkline-bar" style="height:' + height + 'px" title="Day ' + String(index + 1) + ': ' + String(value) + ' merged"></span>';
+    return '<span class="stat-sparkline-bar" style="height:' + height + 'px" title="' +
+      escapeText(throughputDayLabel(index, bars.length) + ': ' + pluralize(value, 'merged PR')) + '"></span>';
   }).join("");
-  return '<div class="stat-sparkline" aria-hidden="true">' + columns + '</div>';
+  return '<div class="stat-sparkline' + (empty ? ' stat-sparkline-empty' : '') + '" role="img" aria-label="Merged PR throughput for the last 7 days">' + columns + '</div>';
+}
+
+function throughputDayLabel(index, total) {
+  const daysAgo = Math.max(0, Number(total || 0) - Number(index || 0) - 1);
+  if (daysAgo === 0) return "today";
+  if (daysAgo === 1) return "yesterday";
+  return String(daysAgo) + " days ago";
 }
 
 function ensureSelectedProject() {
