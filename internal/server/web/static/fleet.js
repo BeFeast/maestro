@@ -793,20 +793,35 @@ function renderStats(summary) {
   const monitoring = Number(summary.monitoring_pr || 0);
   const failed = Number(summary.failed || 0);
   const attention = Number(summary.needs_attention || 0);
-  const sessions = Number(summary.sessions || 0);
+  const throughputMerged = Number(summary.throughput_merged_7d || 0);
+  const throughputDaily = Array.isArray(summary.throughput_daily_7d)
+    ? summary.throughput_daily_7d.map(value => Number(value || 0))
+    : [];
   const items = [
     { label: "Running", value: running, suffix: "of " + projects, note: projects ? "worker slots" : "no projects" },
     { label: "PRs in flight", value: prOpen, suffix: "", note: monitoring + " monitored" },
     { label: "Failed", value: failed, suffix: "", note: "current fleet" },
     { label: "Attention", value: attention, suffix: "", note: attention ? "waiting" : "nothing waiting" },
-    { label: "Sessions", value: sessions, suffix: "", note: "active + recent" }
+    { label: "Issue throughput", value: throughputMerged, suffix: "", note: "merged · last 7d", sparkline: throughputDaily }
   ];
   statsEl.innerHTML = items.map(item =>
     '<div class="stat"><span class="stat-label">' + escapeText(item.label) + '</span>' +
       '<div class="stat-value"><strong>' + escapeText(item.value) + '</strong>' +
       (item.suffix ? '<span class="stat-suffix">' + escapeText(item.suffix) + '</span>' : '') + '</div>' +
+      (item.sparkline ? renderStatSparkline(item.sparkline) : '') +
       '<span class="stat-note">' + escapeText(item.note) + '</span></div>'
   ).join("");
+}
+
+function renderStatSparkline(values) {
+  const bars = Array.isArray(values) ? values.map(value => Number(value || 0)) : [];
+  if (!bars.length) return "";
+  const max = Math.max(...bars, 1);
+  const columns = bars.map((value, index) => {
+    const height = Math.max(6, Math.round((value / max) * 28));
+    return '<span class="stat-sparkline-bar" style="height:' + height + 'px" title="Day ' + String(index + 1) + ': ' + String(value) + ' merged"></span>';
+  }).join("");
+  return '<div class="stat-sparkline" aria-hidden="true">' + columns + '</div>';
 }
 
 function ensureSelectedProject() {

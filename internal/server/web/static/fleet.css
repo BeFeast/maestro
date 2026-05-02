@@ -126,6 +126,20 @@
   .stat strong { display: block; color: var(--text); font-size: 36px; font-weight: 650; line-height: 1; font-variant-numeric: tabular-nums; }
   .stat-suffix { color: var(--muted); font-size: 16px; }
   .stat-note { display: block; margin-top: 6px; color: var(--muted); font-family: var(--font-mono); font-size: 12px; }
+  .stat-sparkline {
+    display: flex;
+    align-items: end;
+    gap: 4px;
+    height: 32px;
+    margin-top: 10px;
+  }
+  .stat-sparkline-bar {
+    flex: 1 1 0;
+    min-width: 0;
+    border-radius: 999px 999px 3px 3px;
+    background: linear-gradient(180deg, rgba(56,189,248,.9), rgba(37,99,235,.82));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.45);
+  }
   .project-rail {
     margin-bottom: 20px;
     overflow: hidden;
@@ -1112,6 +1126,11 @@
   .stat strong { font-size: 44px; font-weight: 650; letter-spacing: 0; }
   .stat-suffix { font-size: 18px; }
   .stat-note { margin-top: 8px; font-size: 13px; }
+  .stat-sparkline {
+    height: 36px;
+    margin-top: 12px;
+    gap: 5px;
+  }
 
   .project-rail,
   .approval-inbox,

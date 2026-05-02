@@ -53,6 +53,10 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	now := time.Now().UTC()
 	firstStateDir := filepath.Join(dir, "one")
 	secondStateDir := filepath.Join(dir, "two")
+	finishedOne := now.Add(-20 * time.Hour)
+	startedDoneOne := finishedOne.Add(-2 * time.Hour)
+	finishedTwo := now.Add(-48 * time.Hour)
+	startedDoneTwo := finishedTwo.Add(-3 * time.Hour)
 	saveFleetTestState(t, firstStateDir, map[string]*state.Session{
 		"one-1": {
 			IssueNumber:     1,
@@ -65,8 +69,9 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 		"one-2": {
 			IssueNumber:     2,
 			IssueTitle:      "Review thing",
-			Status:          state.StatusPROpen,
-			StartedAt:       now.Add(-2 * time.Minute),
+			Status:          state.StatusDone,
+			StartedAt:       startedDoneOne,
+			FinishedAt:      &finishedOne,
 			PRNumber:        12,
 			TokensUsedTotal: 42000,
 		},
@@ -79,6 +84,14 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 			StartedAt:       now.Add(-3 * time.Minute),
 			PRNumber:        31,
 			CIFailureOutput: "tests failed",
+		},
+		"two-2": {
+			IssueNumber: 4,
+			IssueTitle:  "Merged thing",
+			Status:      state.StatusDone,
+			StartedAt:   startedDoneTwo,
+			FinishedAt:  &finishedTwo,
+			PRNumber:    44,
 		},
 	})
 
@@ -113,8 +126,14 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.Summary.Projects != 2 || resp.Summary.Running != 1 || resp.Summary.PROpen != 1 || resp.Summary.Failed != 1 || resp.Summary.Sessions != 3 || resp.Summary.NeedsAttention != 2 {
+	if resp.Summary.Projects != 2 || resp.Summary.Running != 1 || resp.Summary.PROpen != 0 || resp.Summary.Failed != 1 || resp.Summary.Sessions != 4 || resp.Summary.NeedsAttention != 2 {
 		t.Fatalf("unexpected summary: %+v", resp.Summary)
+	}
+	if resp.Summary.ThroughputMerged7D != 2 {
+		t.Fatalf("throughput merged 7d = %d, want 2", resp.Summary.ThroughputMerged7D)
+	}
+	if len(resp.Summary.ThroughputDaily7D) != 7 {
+		t.Fatalf("throughput daily len = %d, want 7", len(resp.Summary.ThroughputDaily7D))
 	}
 	visibleAttention := 0
 	for _, worker := range resp.Workers {
@@ -137,8 +156,8 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if !resp.Projects[0].Outcome.Configured || resp.Projects[0].Outcome.Goal != "One is deployed" || resp.Projects[0].Outcome.HealthState != outcome.HealthUnknown {
 		t.Fatalf("project outcome = %+v, want configured unknown health", resp.Projects[0].Outcome)
 	}
-	if len(resp.Workers) != 3 {
-		t.Fatalf("fleet workers len = %d, want 3", len(resp.Workers))
+	if len(resp.Workers) != 4 {
+		t.Fatalf("fleet workers len = %d, want 4", len(resp.Workers))
 	}
 	worker := findFleetWorker(t, resp.Workers, "one-2")
 	if worker.ProjectName != "One" || worker.ProjectRepo != "owner/one" {
@@ -183,6 +202,28 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 	if resp.Projects[1].NeedsAttention != len(resp.Projects[1].Attention) {
 		t.Fatalf("project attention count = %d, reasons = %d", resp.Projects[1].NeedsAttention, len(resp.Projects[1].Attention))
+	}
+}
+
+func TestFleetThroughputBucketsCountRecentMergedPRs(t *testing.T) {
+	now := time.Date(2026, 5, 2, 15, 0, 0, 0, time.UTC)
+	buckets := newFleetThroughputBuckets(now, 7)
+	workers := []fleetWorkerState{
+		{Status: string(state.StatusDone), PRNumber: 10, FinishedAt: now.Add(-2 * time.Hour).Format(time.RFC3339)},
+		{Status: string(state.StatusDone), PRNumber: 11, FinishedAt: now.Add(-24 * time.Hour).Format(time.RFC3339)},
+		{Status: string(state.StatusDone), PRNumber: 12, FinishedAt: now.Add(-6 * 24 * time.Hour).Format(time.RFC3339)},
+		{Status: string(state.StatusDone), PRNumber: 13, FinishedAt: now.Add(-8 * 24 * time.Hour).Format(time.RFC3339)},
+		{Status: string(state.StatusFailed), PRNumber: 14, FinishedAt: now.Add(-time.Hour).Format(time.RFC3339)},
+		{Status: string(state.StatusDone), PRNumber: 0, FinishedAt: now.Add(-time.Hour).Format(time.RFC3339)},
+	}
+
+	addFleetThroughputSummary(buckets, workers)
+
+	if buckets.Total() != 3 {
+		t.Fatalf("total = %d, want 3", buckets.Total())
+	}
+	if got := buckets.Counts(); len(got) != 7 || got[0] != 1 || got[5] != 1 || got[6] != 1 {
+		t.Fatalf("counts = %v, want [1 0 0 0 0 1 1]", got)
 	}
 }
 
