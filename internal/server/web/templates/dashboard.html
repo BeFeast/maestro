@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>maestro</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/dashboard.css">
+
+</head>
+<body data-page="dashboard">
+<header>
+  <div class="topline">
+    <h1>Maestro</h1>
+    <div class="repo" id="repo"></div>
+  </div>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <section>
+    <div class="toolbar workspace">
+      <h2>Workers</h2>
+      <label class="filter"><input id="filter" type="search" placeholder="Filter"></label>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th class="slot">Slot</th>
+            <th class="issue">Issue</th>
+            <th class="status">Status</th>
+            <th class="backend">Backend</th>
+            <th class="pr">PR</th>
+            <th class="runtime">Runtime</th>
+            <th class="tokens">Tokens</th>
+          </tr>
+        </thead>
+        <tbody id="workers"></tbody>
+      </table>
+    </div>
+  </section>
+  <section class="log-panel">
+    <div class="log-head">
+      <div class="log-title" id="log-title">Log <span></span></div>
+      <div class="log-meta" id="log-meta"></div>
+    </div>
+	<div class="supervisor-panel" id="supervisor-panel"></div>
+	<div class="outcome-panel" id="outcome-panel"></div>
+	<div class="status-note" id="status-note"></div>
+    <pre id="log"><span class="muted">Select a worker.</span></pre>
+  </section>
+</main>
+<script>window.MAESTRO_REPO = __REPO_JSON__;</script>
+<script src="/static/dashboard.js"></script>
+
+</body>
+</html>

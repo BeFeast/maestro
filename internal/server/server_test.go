@@ -12,6 +12,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/outcome"
+	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -1009,7 +1010,7 @@ func TestHandleDashboard(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
 
-	body := w.Body.String()
+	body := w.Body.String() + web.MustReadStatic("dashboard.js") + web.MustReadStatic("dashboard.css")
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
