@@ -2349,6 +2349,35 @@ func (o *Orchestrator) applySupervisorOwnedReadyFilter(s *state.State, issues []
 	return filtered
 }
 
+func containsIssueNumber(issues []github.Issue, number int) bool {
+	for _, issue := range issues {
+		if issue.Number == number {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Orchestrator) augmentWithSupervisorSelectedIssue(s *state.State, issues []github.Issue) []github.Issue {
+	if !o.supervisorOwnsDynamicReadyLabel() {
+		return issues
+	}
+
+	selected, ok := o.supervisorOwnedReadySelectedIssue(s)
+	if !ok || selected <= 0 || containsIssueNumber(issues, selected) {
+		return issues
+	}
+
+	issue, err := o.getIssue(selected)
+	if err != nil {
+		log.Printf("[orch] supervisor-selected candidate #%d could not be fetched for immediate dispatch: %v", selected, err)
+		return issues
+	}
+
+	log.Printf("[orch] fetched supervisor-selected candidate #%d directly for immediate dispatch", selected)
+	return append(issues, issue)
+}
+
 func sortedStateSessionNames(s *state.State) []string {
 	names := make([]string, 0, len(s.Sessions))
 	for name := range s.Sessions {
@@ -2364,6 +2393,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		log.Printf("[orch] list issues: %v", err)
 		return
 	}
+	issues = o.augmentWithSupervisorSelectedIssue(s, issues)
 	if filtered, ordered := o.applyOrderedQueueFilter(s, issues); ordered {
 		issues = filtered
 	} else {

@@ -2712,6 +2712,14 @@ func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Or
 		isIssueClosedFn: func(issueNumber int) (bool, error) {
 			return false, nil
 		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			for _, issue := range issues {
+				if issue.Number == number {
+					return issue, nil
+				}
+			}
+			return github.Issue{}, fmt.Errorf("issue #%d not found", number)
+		},
 		addIssueLabelFn: func(number int, label string) error {
 			labels = append(labels, fmt.Sprintf("#%d:%s", number, label))
 			return nil
@@ -2799,6 +2807,62 @@ func TestStartNewWorkers_SupervisorOwnedReadyLabelStartsOnlySelectedCandidate(t 
 	}
 	if !strings.Contains(logs.String(), "skipping issue #292: not supervisor-selected candidate #287") {
 		t.Fatalf("logs = %q, want skip reason for stale ready issue", logs.String())
+	}
+}
+
+func TestStartNewWorkers_SupervisorOwnedReadyLabelFetchesSelectedCandidateOutsideReadyListing(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.IssueLabels = []string{"maestro-ready"}
+	dynamicWaveEnabled := true
+	cfg.Supervisor.DynamicWave.Enabled = &dynamicWaveEnabled
+	cfg.Supervisor.DynamicWave.OwnsReadyLabel = true
+
+	listedIssues := []github.Issue{
+		makeIssue(292, "stale ready", "maestro-ready", "p0"),
+		makeIssue(291, "also stale", "maestro-ready", "p2"),
+	}
+	selectedIssue := makeIssue(287, "selected candidate not yet relisted", "p1")
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, listedIssues)
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		if number == 287 {
+			return selectedIssue, nil
+		}
+		for _, issue := range listedIssues {
+			if issue.Number == number {
+				return issue, nil
+			}
+		}
+		return github.Issue{}, fmt.Errorf("issue #%d not found", number)
+	}
+
+	s := state.NewState()
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		CreatedAt:  time.Now().UTC(),
+		PolicyRule: supervisor.PolicyRuleDynamicWave,
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			PolicyRule: supervisor.PolicyRuleDynamicWave,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 287,
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	var logs strings.Builder
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
+
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 {
+		t.Fatalf("started = %v, want only fetched selected issue #287", *started)
+	}
+	if (*started)[0] != 287 {
+		t.Fatalf("started issue #%d, want #287", (*started)[0])
+	}
+	if !strings.Contains(logs.String(), "fetched supervisor-selected candidate #287 directly for immediate dispatch") {
+		t.Fatalf("logs = %q, want direct-fetch dispatch log", logs.String())
 	}
 }
 
