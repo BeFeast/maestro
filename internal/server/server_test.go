@@ -387,6 +387,9 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 	if resp.Supervisor.Latest.RecommendedAction != "review_retry_exhausted" {
 		t.Fatalf("latest action = %q", resp.Supervisor.Latest.RecommendedAction)
 	}
+	if resp.Supervisor.Latest.OperatorSentence != "Reviewing failed feedback on PR #20 before retrying work." {
+		t.Fatalf("latest operator sentence = %q", resp.Supervisor.Latest.OperatorSentence)
+	}
 	if len(resp.Supervisor.Latest.StuckReasons) != 2 {
 		t.Fatalf("stuck reasons = %d, want 2", len(resp.Supervisor.Latest.StuckReasons))
 	}
@@ -402,11 +405,68 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 	if resp.Supervisor.LastSafeAction == nil || resp.Supervisor.LastSafeAction.Action != "monitor_open_pr" {
 		t.Fatalf("last safe action = %#v", resp.Supervisor.LastSafeAction)
 	}
+	if resp.Supervisor.LastSafeAction.OperatorSentence != "Watching PR #12 until checks and review pass." {
+		t.Fatalf("last safe operator sentence = %q", resp.Supervisor.LastSafeAction.OperatorSentence)
+	}
 	if len(resp.Supervisor.ApprovalActions) != 1 || !resp.Supervisor.ApprovalActions[0].Disabled {
 		t.Fatalf("approval actions = %#v, want one disabled action", resp.Supervisor.ApprovalActions)
 	}
 	if resp.SupervisorLatest == nil || resp.SupervisorLatest.ID != "sup-latest" {
 		t.Fatalf("legacy supervisor_latest = %#v, want sup-latest", resp.SupervisorLatest)
+	}
+}
+
+func TestSupervisorOperatorSentence(t *testing.T) {
+	tests := []struct {
+		name    string
+		action  string
+		summary string
+		target  *state.SupervisorTarget
+		want    string
+	}{
+		{
+			name:   "none",
+			action: "none",
+			want:   "Skipped this tick; no safe action was selected.",
+		},
+		{
+			name:   "monitor open pr",
+			action: "monitor_open_pr",
+			target: &state.SupervisorTarget{Issue: 42, PR: 12},
+			want:   "Watching PR #12 until checks and review pass.",
+		},
+		{
+			name:   "spawn worker",
+			action: "spawn_worker",
+			target: &state.SupervisorTarget{Issue: 42},
+			want:   "Starting a worker for issue #42.",
+		},
+		{
+			name:   "wait for worker",
+			action: "wait_for_running_worker",
+			target: &state.SupervisorTarget{Session: "bot-7"},
+			want:   "Waiting for worker bot-7 to finish.",
+		},
+		{
+			name:   "outcome health",
+			action: "check_outcome_health",
+			want:   "Checking runtime outcome health before sending more work.",
+		},
+		{
+			name:    "unknown keeps raw action",
+			action:  "custom_new_action",
+			summary: "worker paused for external system",
+			want:    "Supervisor reported custom_new_action; worker paused for external system",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := supervisorOperatorSentence(tt.action, tt.summary, tt.target)
+			if got != tt.want {
+				t.Fatalf("sentence = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1028,6 +1088,9 @@ func TestHandleDashboard(t *testing.T) {
 	}
 	if !contains(body, "supervisor-panel") || !contains(body, "renderSupervisor") {
 		t.Error("dashboard should include supervisor rationale panel")
+	}
+	if !contains(body, "supervisorOperatorSentence") || !contains(body, "supervisor-raw-action") || !contains(body, "Skipped this tick") {
+		t.Error("dashboard should render operator-facing supervisor sentences with raw action diagnostics")
 	}
 	if !contains(body, "outcome-panel") || !contains(body, "renderOutcome") || !contains(body, "No outcome brief configured") {
 		t.Error("dashboard should include outcome status panel")
