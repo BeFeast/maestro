@@ -747,12 +747,18 @@ function ensureSelectedProject() {
   }
 }
 
+function projectIsUnconfigured(project) {
+  return !((project.outcome || {}).configured === true);
+}
+
 function projectStateKey(project) {
+  if (projectIsUnconfigured(project)) return "unconfigured";
   const operator = project.operator_state || {};
   return operator.kind || "idle";
 }
 
 function projectStateLabel(project) {
+  if (projectIsUnconfigured(project)) return "setup";
   const operator = project.operator_state || {};
   return operator.label || "Idle";
 }
@@ -818,6 +824,17 @@ function projectIdentityRailHTML(project) {
 }
 
 function projectStateRailHTML(project) {
+  if (projectIsUnconfigured(project)) {
+    const parts = [
+      '<span class="pill rail-state-unconfigured">setup</span>',
+      '<div class="rail-subline" title="No outcome brief configured">No outcome brief configured</div>',
+      '<div class="rail-note rail-setup-link">Set up &rarr;</div>'
+    ];
+    if (project.error) parts.push('<div class="rail-alert" title="' + escapeText(project.error) + '">State error</div>');
+    if (project.freshness && project.freshness.stale) parts.push('<div class="rail-warn">Stale snapshot</div>');
+    return parts.join("");
+  }
+
   const key = projectStateKey(project);
   const operator = project.operator_state || {};
   const summary = String(operator.summary || ((project.running || 0) + '/' + (project.max_parallel || 0) + ' worker process(es) running.'));
@@ -868,6 +885,12 @@ function projectPRRailHTML(project) {
 }
 
 function projectOutcomeRailHTML(project) {
+  if (projectIsUnconfigured(project)) {
+    const next = (project.outcome && project.outcome.next_action) || "Add an outcome brief to this project's Maestro config.";
+    return '<div class="rail-subline rail-setup-copy" title="No outcome brief configured">No outcome brief configured</div>' +
+      '<div class="rail-note rail-setup-link" title="' + escapeText(next) + '">Set up &rarr;</div>';
+  }
+
   const outcome = project.outcome || {};
   const health = outcome.health_state || "unknown";
   const goal = outcome.configured === true && outcome.goal ? outcome.goal : "No outcome brief configured";
@@ -889,6 +912,10 @@ function projectFreshnessRailHTML(project) {
 
 function projectLinksRailHTML(project) {
   const links = [];
+  const setupURL = project.dashboard_url || githubRepoURL(project.repo);
+  if (projectIsUnconfigured(project) && setupURL) {
+    links.push('<a class="setup-link" href="' + escapeText(setupURL) + '" target="_blank" rel="noreferrer">Set up &rarr;</a>');
+  }
   if (project.dashboard_url) links.push(linkHTML(project.dashboard_url, "Dashboard"));
   if (githubRepoURL(project.repo)) links.push(linkHTML(githubRepoURL(project.repo), "GitHub"));
   links.push('<button type="button" class="link-button project-workers-link" data-project="' + escapeText(project.name || "") + '">Workers</button>');
@@ -897,7 +924,8 @@ function projectLinksRailHTML(project) {
 
 function projectRailRowHTML(project) {
   const key = projectStateKey(project);
-  return '<tr class="project-rail-row project-row-' + cssToken(key) + '" data-project="' + escapeText(project.name || "") + '">' +
+  const modifier = projectIsUnconfigured(project) ? ' project-row--unconfigured' : '';
+  return '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + '" data-project="' + escapeText(project.name || "") + '">' +
     '<td class="project-rail-project">' + projectIdentityRailHTML(project) + '</td>' +
     '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
     '<td class="project-rail-queue-cell">' + projectQueueRailHTML(project) + '</td>' +
@@ -1308,6 +1336,9 @@ function projectFreshnessHTML(project) {
 
 function projectBadgesHTML(project) {
   const badges = [];
+  if (projectIsUnconfigured(project)) {
+    badges.push('<span class="badge badge-setup">setup</span>');
+  }
   if (project.error) {
     badges.push('<span class="badge badge-error">State error</span>');
   }
@@ -1320,6 +1351,7 @@ function projectBadgesHTML(project) {
 
 function projectClass(project) {
   let cls = "project";
+  if (projectIsUnconfigured(project)) cls += " project-unconfigured";
   if (project.error) cls += " project-error";
   if (project.freshness && project.freshness.stale) cls += " project-stale";
   return cls;

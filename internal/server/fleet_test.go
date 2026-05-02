@@ -1393,6 +1393,11 @@ func TestFleetDashboard(t *testing.T) {
 		"project-rail-body",
 		"project-filter",
 		"Project Rail",
+		"projectIsUnconfigured",
+		"project-row--unconfigured",
+		"rail-state-unconfigured",
+		"badge-setup",
+		"Set up &rarr;",
 		"Last activity",
 		"Links/actions",
 		"fleet-verdict",
@@ -1583,6 +1588,43 @@ func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
 				t.Fatal("10+ project fixture should render inside the scrollable rail container")
 			}
 		})
+	}
+}
+
+func TestFleetDashboardRendersUnconfiguredProjectAsSetupState(t *testing.T) {
+	stateDir := t.TempDir()
+	saveFleetTestSnapshot(t, stateDir, map[string]*state.Session{}, nil)
+	projectConfig := &config.Config{
+		Repo:        "owner/setup-needed",
+		StateDir:    stateDir,
+		MaxParallel: 1,
+		Server:      config.ServerConfig{ReadOnly: true},
+	}
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("Setup Needed", "/tmp/setup-needed.yaml", "http://127.0.0.1:8787", projectConfig),
+	}, "127.0.0.1", 8786, true)
+	snapshot := srv.snapshot()
+	project := findFleetProject(t, snapshot.Projects, "Setup Needed")
+
+	if !fleetProjectUnconfigured(project) {
+		t.Fatalf("project should be treated as unconfigured: %+v", project.Outcome)
+	}
+	row := renderFleetProjectRailRow(project)
+	for _, want := range []string{
+		"project-row--unconfigured",
+		"project-row-unconfigured",
+		"rail-state-unconfigured",
+		"setup",
+		"No outcome brief configured",
+		"Set up &rarr;",
+		"setup-link",
+	} {
+		if !contains(row, want) {
+			t.Fatalf("unconfigured rail row should contain %q, got:\n%s", want, row)
+		}
+	}
+	if outcomeHTML := renderFleetProjectRailOutcome(project); contains(outcomeHTML, `<span class="pill`) {
+		t.Fatalf("unconfigured outcome rail should not render a health pill, got:\n%s", outcomeHTML)
 	}
 }
 
