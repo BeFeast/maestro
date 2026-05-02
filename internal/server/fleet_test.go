@@ -1485,6 +1485,48 @@ func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
 	}
 }
 
+func TestFleetDashboardProjectRailPlaceholdersAreNotReplacedFromProjectData(t *testing.T) {
+	snapshot := fleetResponse{
+		Projects: []fleetProjectState{{
+			Name:         "{{FLEET_INITIAL_STATE}}",
+			Repo:         "{{FLEET_PROJECT_RAIL_SUMMARY}}",
+			ConfigPath:   "{{FLEET_PROJECT_RAIL_ROWS}}",
+			DashboardURL: "http://127.0.0.1:8787",
+			MaxParallel:  1,
+			Outcome: outcome.Status{
+				Configured:  true,
+				Goal:        "{{FLEET_PROJECT_RAIL_SUMMARY}}",
+				HealthState: outcome.HealthUnknown,
+			},
+			QueueSnapshot: &fleetQueueSnapshot{Open: 1, Eligible: 1},
+			Freshness:     fleetProjectFreshness{SnapshotAge: "1m0s"},
+		}},
+	}
+	body, err := renderFleetDashboardHTML(snapshot)
+	if err != nil {
+		t.Fatalf("render dashboard: %v", err)
+	}
+
+	summary := dashboardSnippet(t, body, `<div class="section-note" id="project-rail-summary">`, `</div>`)
+	if !contains(summary, "1 project · 0 running · 0 attention") {
+		t.Fatalf("summary placeholder was not replaced correctly, got:\n%s", summary)
+	}
+	rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
+	if !contains(rail, "{{FLEET_INITIAL_STATE}}") || !contains(rail, "{{FLEET_PROJECT_RAIL_SUMMARY}}") {
+		t.Fatalf("rail should preserve placeholder-like project text as data, got:\n%s", rail)
+	}
+
+	startMarker := `<script type="application/json" id="fleet-initial-state">`
+	script := dashboardSnippet(t, body, startMarker, `</script>`)
+	var decoded fleetResponse
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(script, startMarker)), &decoded); err != nil {
+		t.Fatalf("initial state should remain valid JSON: %v\n%s", err, script)
+	}
+	if len(decoded.Projects) != 1 || decoded.Projects[0].Name != "{{FLEET_INITIAL_STATE}}" {
+		t.Fatalf("initial state project data changed: %+v", decoded.Projects)
+	}
+}
+
 func TestFleetDashboardServesFleetPath(t *testing.T) {
 	srv := NewFleet(nil, "127.0.0.1", 8786, true)
 	req := httptest.NewRequest(http.MethodGet, "/fleet", nil)

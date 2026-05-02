@@ -1232,9 +1232,11 @@ func renderFleetDashboardHTML(snapshot fleetResponse) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal fleet dashboard initial state: %w", err)
 	}
-	body := strings.Replace(fleetDashboardHTML, "{{FLEET_PROJECT_RAIL_ROWS}}", renderFleetProjectRailRows(snapshot.Projects), 1)
-	body = strings.Replace(body, "{{FLEET_PROJECT_RAIL_SUMMARY}}", html.EscapeString(fleetProjectRailSummary(snapshot.Projects)), 1)
-	body = strings.Replace(body, "{{FLEET_INITIAL_STATE}}", string(data), 1)
+	body := strings.NewReplacer(
+		"{{FLEET_PROJECT_RAIL_ROWS}}", renderFleetProjectRailRows(snapshot.Projects),
+		"{{FLEET_PROJECT_RAIL_SUMMARY}}", html.EscapeString(fleetProjectRailSummary(snapshot.Projects)),
+		"{{FLEET_INITIAL_STATE}}", string(data),
+	).Replace(fleetDashboardHTML)
 	return body, nil
 }
 
