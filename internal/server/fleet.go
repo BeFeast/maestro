@@ -1465,11 +1465,69 @@ const fleetDashboardHTML = `<!DOCTYPE html>
   .metric:last-child { border-right: 0; }
   .metric strong { display: block; font-size: 16px; }
   .metric span { display: block; color: var(--muted); font-size: 11px; }
-  .supervisor, .workers, .project-actions, .outcome-status { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .supervisor, .workers, .project-actions, .outcome-status, .queue-health { padding: 12px 14px; border-bottom: 1px solid var(--line); }
   .outcome-status { background: rgba(88,166,255,.035); }
   .outcome-lines { display: grid; gap: 6px; margin-top: 7px; }
   .outcome-line { color: var(--muted); font-size: 12px; line-height: 1.35; white-space: normal; }
   .outcome-line strong { color: var(--text); font-weight: 650; }
+  .queue-health {
+    background: rgba(210,153,34,.055);
+  }
+  .queue-health.queue-ready { background: rgba(63,185,80,.055); }
+  .queue-health.queue-empty { background: rgba(139,148,158,.045); }
+  .queue-health-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .queue-health-state {
+    color: var(--warn);
+    font-size: 12px;
+    font-weight: 650;
+    text-align: right;
+  }
+  .queue-ready .queue-health-state { color: var(--ok); }
+  .queue-empty .queue-health-state { color: var(--muted); }
+  .queue-health-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 9px;
+  }
+  .queue-count {
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid rgba(41,49,61,.82);
+    background: rgba(8,12,17,.45);
+    text-align: center;
+  }
+  .queue-count strong { display: block; color: var(--text); font-size: 17px; }
+  .queue-count span { color: var(--muted); font-size: 11px; }
+  .queue-next {
+    margin-top: 9px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .queue-next strong { color: var(--text); }
+  .queue-classifiers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .queue-chip {
+    max-width: 100%;
+    overflow: hidden;
+    padding: 1px 7px;
+    border: 1px solid rgba(210,153,34,.35);
+    border-radius: 999px;
+    color: var(--warn);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .label { color: var(--muted); font-weight: 650; text-transform: uppercase; font-size: 12px; }
   .decision { margin-top: 5px; color: var(--text); }
   .decision small { color: var(--muted); }
@@ -2669,20 +2727,21 @@ async function loadWorkerDetail() {
 }
 
 function queueSnapshotHTML(project) {
-  const q = project.queue_snapshot;
-  if (!q) return "";
-  const excluded = Number(q.excluded || 0);
-  const held = Number(q.held || q.held_issues || 0);
-  const blockedByDependency = Number(q.blocked_by_dependency || q.blocked_by_dependency_issues || 0);
-  const nonRunnable = Number(q.non_runnable_project_status_count || 0);
-  const parts = [
-    "open=" + Number(q.open || 0),
-    "eligible=" + Number(q.eligible || 0),
-    "excluded=" + excluded,
-    "held/meta=" + held,
-    "blocked-deps=" + blockedByDependency,
-    "non-runnable=" + nonRunnable
-  ];
+	const q = project.queue_snapshot;
+	if (!q) return "";
+	const stats = queueStats(q);
+	const excluded = stats.excluded;
+	const held = stats.held;
+	const blockedByDependency = stats.blockedByDependency;
+	const nonRunnable = stats.nonRunnable;
+	const parts = [
+		"open=" + stats.open,
+		"eligible=" + stats.eligible,
+		"excluded=" + excluded,
+		"held/meta=" + held,
+		"blocked-deps=" + blockedByDependency,
+		"non-runnable=" + nonRunnable
+	];
   const selected = q.selected_candidate && q.selected_candidate.number
     ? "selected #" + q.selected_candidate.number + (q.selected_candidate.title ? " " + q.selected_candidate.title : "")
     : "";
@@ -2697,18 +2756,132 @@ function queueSnapshotHTML(project) {
   if (skipped.length) {
     lines.push('<div class="queue-line"><strong>Skipped</strong><span>' + escapeText(skipped.join(" · ")) + '</span></div>');
   }
-  const isIdle = (project.running || 0) === 0;
-  let idleReason = isIdle ? (q.idle_reason || "") : "";
-  const topSkip = isIdle && q.eligible === 0 && q.top_skipped_reason && !(idleReason || "").includes(q.top_skipped_reason)
-    ? q.top_skipped_reason
-    : "";
+	const isIdle = (project.running || 0) === 0;
+	let idleReason = isIdle ? (q.idle_reason || "") : "";
+	const topSkip = isIdle && stats.eligible === 0 && q.top_skipped_reason && !(idleReason || "").includes(q.top_skipped_reason)
+		? q.top_skipped_reason
+		: "";
   if (topSkip) {
     idleReason = idleReason ? idleReason + " Top skip: " + topSkip : "Top skip: " + topSkip;
   }
   if (idleReason) {
     lines.push('<div class="queue-line queue-idle"><strong>Idle</strong><span>' + escapeText(idleReason) + '</span></div>');
   }
-  return '<div class="queue-snapshot"><div class="label">Queue Snapshot</div>' + lines.join("") + '</div>';
+	return '<div class="queue-snapshot"><div class="label">Queue Snapshot</div>' + lines.join("") + '</div>';
+}
+
+function queueStats(q) {
+	return {
+		open: Number(q.open || 0),
+		eligible: Number(q.eligible || 0),
+		excluded: Number(q.excluded || 0),
+		held: Number(q.held || q.held_issues || 0),
+		blockedByDependency: Number(q.blocked_by_dependency || q.blocked_by_dependency_issues || 0),
+		nonRunnable: Number(q.non_runnable_project_status_count || 0)
+	};
+}
+
+function queueIdleReason(project, stats) {
+	const q = project.queue_snapshot || {};
+	const isIdle = (project.running || 0) === 0;
+	if (!isIdle) return "";
+	let reason = q.idle_reason || "";
+	const topSkip = stats.eligible === 0 && q.top_skipped_reason && !reason.includes(q.top_skipped_reason)
+		? q.top_skipped_reason
+		: "";
+	if (topSkip) {
+		reason = reason ? reason + " Top skip: " + topSkip : "Top skip: " + topSkip;
+	}
+	return reason;
+}
+
+function queueHealthState(project, stats) {
+	if ((project.running || 0) > 0) return { className: "queue-ready", label: "Running" };
+	if (stats.eligible > 0) return { className: "queue-ready", label: "Ready" };
+	if (stats.open === 0) return { className: "queue-empty", label: "No open issues" };
+	return { className: "queue-idle", label: "Idle: 0 eligible" };
+}
+
+function queueNextText(project, stats) {
+	const q = project.queue_snapshot || {};
+	const reasonText = ((q.idle_reason || "") + " " + (q.top_skipped_reason || "")).toLowerCase();
+	if ((project.running || 0) > 0) {
+		return "Wait for the running worker or inspect it in Fleet Workers.";
+	}
+	if (stats.eligible > 0) {
+		if (q.selected_candidate && q.selected_candidate.number) {
+			return "Next worker should start #" + q.selected_candidate.number + ": " + (q.selected_candidate.title || "selected candidate") + ".";
+		}
+		return "A worker can start on the next reconciliation cycle.";
+	}
+	if (stats.open === 0) {
+		return "Create the next concrete issue or mark an existing project task as ready.";
+	}
+	if (stats.held >= stats.open) {
+		return "Split the epic/meta issue into concrete child issues or remove the hold labels from a runnable issue.";
+	}
+	if (stats.excluded + stats.nonRunnable >= stats.open) {
+		return "Remove excluded labels and/or move at least one issue into a runnable project status.";
+	}
+	if (stats.nonRunnable >= stats.open) {
+		return "Move at least one open issue into a runnable project status.";
+	}
+	if (stats.excluded >= stats.open) {
+		return "Remove excluded labels from a concrete issue or add an explicit ready issue.";
+	}
+	if (reasonText.includes("held/meta") || reasonText.includes("epic") || reasonText.includes("meta")) {
+		return "Split the epic/meta issue into concrete child issues or remove the hold labels from a runnable issue.";
+	}
+	if (reasonText.includes("non-runnable")) {
+		return "Move at least one open issue into a runnable project status.";
+	}
+	if (reasonText.includes("excluded")) {
+		return "Remove excluded labels from a concrete issue or add an explicit ready issue.";
+	}
+	if (stats.blockedByDependency > 0) {
+		return "Resolve blocking dependencies or pick an unblocked child issue.";
+	}
+	if (q.idle_reason) {
+		return "Review queue policy and mark one concrete issue eligible.";
+	}
+	return "Mark one concrete issue ready so Maestro has safe work to start.";
+}
+
+function queueClassifiersHTML(stats) {
+	const chips = [];
+	if (stats.excluded) chips.push(stats.excluded + " excluded");
+	if (stats.held) chips.push(stats.held + " held/meta");
+	if (stats.blockedByDependency) chips.push(stats.blockedByDependency + " blocked");
+	if (stats.nonRunnable) chips.push(stats.nonRunnable + " non-runnable");
+	return chips.length
+		? '<div class="queue-classifiers">' + chips.map(chip => '<span class="queue-chip">' + escapeText(chip) + '</span>').join("") + '</div>'
+		: "";
+}
+
+function queueHealthHTML(project) {
+	const q = project.queue_snapshot;
+	if (!q) {
+		return '<div class="queue-health queue-empty"><div class="queue-health-head"><div class="label">Queue Health</div><div class="queue-health-state">No queue snapshot</div></div>' +
+			'<div class="queue-next"><strong>Next</strong> Wait for supervisor to publish a queue snapshot.</div></div>';
+	}
+	const stats = queueStats(q);
+	const state = queueHealthState(project, stats);
+	const idle = queueIdleReason(project, stats);
+	const next = queueNextText(project, stats);
+	const cells = [
+		["Eligible", stats.eligible],
+		["Open", stats.open],
+		["Blocked", stats.excluded + stats.held + stats.blockedByDependency + stats.nonRunnable]
+	];
+	return '<div class="queue-health ' + state.className + '">' +
+		'<div class="queue-health-head"><div class="label">Queue Health</div><div class="queue-health-state">' + escapeText(state.label) + '</div></div>' +
+		'<div class="queue-health-grid">' + cells.map(([label, value]) =>
+			'<div class="queue-count"><strong>' + escapeText(value) + '</strong><span>' + escapeText(label) + '</span></div>'
+		).join("") + '</div>' +
+		queueClassifiersHTML(stats) +
+		(idle ? '<div class="queue-next"><strong>Idle</strong> ' + escapeText(idle) + '</div>' : "") +
+		'<div class="queue-next"><strong>Next</strong> ' + escapeText(next) + '</div>' +
+	'</div>';
 }
 
 function outcomeHTML(project) {
@@ -2840,18 +3013,19 @@ function renderProject(project) {
   const failed = countFailed(project);
   const links = '<div class="links">' + linkHTML(project.dashboard_url, "Dashboard") + " " +
     linkHTML(project.repo ? "https://github.com/" + project.repo : "", "GitHub") + '</div>';
-  return '<article class="' + projectClass(project) + '">' +
-    projectHeaderHTML(project, links) +
-    '<div class="metric-row">' +
-      '<div class="metric"><strong>' + escapeText(project.running || 0) + " / " + escapeText(project.max_parallel || 0) + '</strong><span>Running</span></div>' +
-      '<div class="metric"><strong>' + escapeText(project.pr_open || 0) + '</strong><span>PR open</span></div>' +
-      '<div class="metric"><strong>' + escapeText(failed) + '</strong><span>Failed</span></div>' +
-      '<div class="metric"><strong>' + escapeText(project.sessions || 0) + '</strong><span>Sessions</span></div>' +
-      '<div class="metric"><strong>' + escapeText(project.needs_attention || 0) + '</strong><span>Attention</span></div>' +
-	'</div>' +
-	outcomeHTML(project) +
-	queueSnapshotHTML(project) +
-    renderProjectWhy(project) +
+	return '<article class="' + projectClass(project) + '">' +
+		projectHeaderHTML(project, links) +
+		'<div class="metric-row">' +
+			'<div class="metric"><strong>' + escapeText(project.running || 0) + " / " + escapeText(project.max_parallel || 0) + '</strong><span>Running</span></div>' +
+			'<div class="metric"><strong>' + escapeText(project.pr_open || 0) + '</strong><span>PR open</span></div>' +
+			'<div class="metric"><strong>' + escapeText(failed) + '</strong><span>Failed</span></div>' +
+			'<div class="metric"><strong>' + escapeText(project.sessions || 0) + '</strong><span>Sessions</span></div>' +
+			'<div class="metric"><strong>' + escapeText(project.needs_attention || 0) + '</strong><span>Attention</span></div>' +
+		'</div>' +
+		queueHealthHTML(project) +
+		outcomeHTML(project) +
+		queueSnapshotHTML(project) +
+		renderProjectWhy(project) +
     renderProjectActions(project) +
     renderSupervisor(project) +
     renderWorkers(project) +
