@@ -3,6 +3,10 @@ const projectSummaryEl = document.getElementById("project-summary");
 const projectRailBodyEl = document.getElementById("project-rail-body");
 const projectRailSummaryEl = document.getElementById("project-rail-summary");
 const projectFilterEl = document.getElementById("project-filter");
+const projectCountAllEl = document.getElementById("project-count-all");
+const projectCountRunningEl = document.getElementById("project-count-running");
+const projectCountAttentionEl = document.getElementById("project-count-attention");
+const projectCountIdleEl = document.getElementById("project-count-idle");
 const statsEl = document.getElementById("stats");
 const subtitleEl = document.getElementById("subtitle");
 const fleetVerdictEl = document.getElementById("fleet-verdict");
@@ -26,6 +30,7 @@ const prFilterEl = document.getElementById("pr-filter");
 const workerSortEl = document.getElementById("worker-sort");
 const sortDirectionEl = document.getElementById("sort-direction");
 const initialStateEl = document.getElementById("fleet-initial-state");
+const fleetRefreshEl = document.getElementById("fleet-refresh");
 const expandedProjectStorageKey = "maestro.fleet.expandedProject";
 
 const defaultSortDirections = { status: "asc", project: "asc", issue: "asc", runtime: "desc", pr: "asc" };
@@ -780,15 +785,25 @@ function renderFleetVerdict(verdict) {
 }
 
 function renderStats(summary) {
+  const projects = Number(summary.projects || 0);
+  const running = Number(summary.running || 0);
+  const prOpen = Number(summary.pr_open || 0);
+  const monitoring = Number(summary.monitoring_pr || 0);
+  const failed = Number(summary.failed || 0);
+  const attention = Number(summary.needs_attention || 0);
+  const sessions = Number(summary.sessions || 0);
   const items = [
-    ["Projects", summary.projects || 0],
-    ["Active", summary.active || 0],
-    ["PR open", summary.pr_open || 0],
-    ["Failed", summary.failed || 0],
-    ["Attention", summary.needs_attention || 0]
+    { label: "Running", value: running, suffix: "of " + projects, note: projects ? "worker slots" : "no projects" },
+    { label: "PRs in flight", value: prOpen, suffix: "", note: monitoring + " monitored" },
+    { label: "Failed", value: failed, suffix: "", note: "current fleet" },
+    { label: "Attention", value: attention, suffix: "", note: attention ? "waiting" : "nothing waiting" },
+    { label: "Sessions", value: sessions, suffix: "", note: "active + recent" }
   ];
-  statsEl.innerHTML = items.map(([label, value]) =>
-    '<div class="stat"><strong>' + escapeText(value) + '</strong><span>' + escapeText(label) + '</span></div>'
+  statsEl.innerHTML = items.map(item =>
+    '<div class="stat"><span class="stat-label">' + escapeText(item.label) + '</span>' +
+      '<div class="stat-value"><strong>' + escapeText(item.value) + '</strong>' +
+      (item.suffix ? '<span class="stat-suffix">' + escapeText(item.suffix) + '</span>' : '') + '</div>' +
+      '<span class="stat-note">' + escapeText(item.note) + '</span></div>'
   ).join("");
 }
 
@@ -856,6 +871,22 @@ function projectRailSummaryText(projects, total) {
   const filtered = projects.length === total ? "" : " shown from " + total;
   return projects.length + " project" + (projects.length === 1 ? "" : "s") + filtered +
     " · " + active + " active · " + attention + " attention";
+}
+
+function setProjectCount(el, value) {
+  if (el) el.textContent = String(value);
+}
+
+function updateProjectSegmentCounts(projects) {
+  const items = projects || [];
+  const activeKinds = new Set(["working", "monitoring_pr", "pending_dispatch"]);
+  const running = items.filter(project => activeKinds.has(projectStateKey(project))).length;
+  const attention = items.reduce((sum, project) => sum + Number(project.needs_attention || 0), 0);
+  const idle = items.filter(project => !activeKinds.has(projectStateKey(project)) && Number(project.needs_attention || 0) === 0).length;
+  setProjectCount(projectCountAllEl, items.length);
+  setProjectCount(projectCountRunningEl, running);
+  setProjectCount(projectCountAttentionEl, attention);
+  setProjectCount(projectCountIdleEl, idle);
 }
 
 function githubRepoURL(repo) {
@@ -975,6 +1006,12 @@ function projectLinksRailHTML(project) {
   return '<div class="rail-links">' + links.join(' ') + '</div>';
 }
 
+function projectOpenRailHTML(project) {
+  const url = project.dashboard_url || githubRepoURL(project.repo);
+  const label = projectIsUnconfigured(project) ? "Set up" : "Open";
+  return '<div class="rail-open-link">' + linkHTML(url, label + " ›") + '</div>';
+}
+
 function projectQueueBarHTML(project) {
   const q = project.queue_snapshot || {};
   const segments = [
@@ -1026,7 +1063,7 @@ function projectRailRowHTML(project) {
     '<td class="project-rail-pr-cell">' + projectPRRailHTML(project) + '</td>' +
     '<td class="project-rail-outcome-cell">' + projectOutcomeRailHTML(project) + '</td>' +
     '<td class="project-rail-freshness-cell">' + projectFreshnessRailHTML(project) + '</td>' +
-    '<td class="project-rail-links-cell">' + projectLinksRailHTML(project) + '</td>' +
+    '<td class="project-rail-links-cell">' + projectOpenRailHTML(project) + '</td>' +
   '</tr>';
   return row + (expanded ? projectExpandedRailHTML(project) : '');
 }
@@ -1040,8 +1077,10 @@ function toggleExpandedProject(projectName) {
 
 function renderProjectRail() {
   ensureSelectedProject();
-  const total = (fleetState.projects || []).length;
+  const allProjects = fleetState.projects || [];
+  const total = allProjects.length;
   const projects = visibleProjects();
+  updateProjectSegmentCounts(allProjects);
   projectRailSummaryEl.textContent = projectRailSummaryText(projects, total);
   if (!projects.length) {
     const empty = total ? "No configured projects match the project search." : "No configured projects are available in this fleet.";
@@ -1568,6 +1607,7 @@ function clearWorkerProjectScope() {
 }
 
 workerProjectResetEl.addEventListener("click", clearWorkerProjectScope);
+if (fleetRefreshEl) fleetRefreshEl.addEventListener("click", loadFleet);
 
 projectFilterEl.addEventListener("input", () => {
   fleetState.projectQuery = projectFilterEl.value.trim();

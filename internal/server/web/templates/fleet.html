@@ -21,29 +21,41 @@
 
 </head>
 <body data-page="fleet">
-<header>
-  <div>
-    <div class="brand-heading">
-      <img class="brand-mark" src="/static/maestro-mark.svg" alt="" aria-hidden="true">
-      <h1>Maestro Fleet</h1>
+<header class="fleet-header">
+  <div class="brand-heading">
+    <img class="brand-mark" src="/static/maestro-mark.svg" alt="" aria-hidden="true">
+    <div>
+      <h1 aria-label="Maestro Fleet"><span>Maestro</span><span class="title-slash">/</span><span>Fleet</span></h1>
+      <div class="sub" id="subtitle">Loading projects...</div>
     </div>
-    <div class="sub" id="subtitle">Loading projects...</div>
-    <div class="fleet-verdict verdict-healthy" id="fleet-verdict">Loading supervisor heartbeat...</div>
   </div>
-  <div class="stats" id="stats"></div>
+  <div class="header-actions">
+    <span class="mode-pill">Read-only</span>
+    <button type="button" class="refresh-button" id="fleet-refresh" aria-label="Refresh fleet data">↻</button>
+    <span class="user-chip" aria-label="Operator ko">ko</span>
+  </div>
 </header>
 <main>
+  <section class="fleet-verdict-shell" aria-live="polite">
+    <div class="fleet-verdict verdict-healthy" id="fleet-verdict">Loading supervisor heartbeat...</div>
+  </section>
+  <section class="stats stats-strip" id="stats" aria-label="Fleet summary"></section>
   <section class="project-rail" id="project-rail" aria-live="polite">
-    <div class="section-head">
+    <div class="section-head project-rail-head">
       <div>
-        <h2>Project Rail</h2>
-        <div class="sub">All configured projects in one scan-friendly view: state, queue, PRs, outcome, freshness, and links.</div>
+        <h2>Projects</h2>
+        <div class="sub">Scan project state, queue, PRs, outcome, and last activity.</div>
       </div>
       <div class="section-note" id="project-rail-summary">{{FLEET_PROJECT_RAIL_SUMMARY}}</div>
     </div>
     <div class="project-rail-controls">
-      <label for="project-filter"><span>Project Search</span><input id="project-filter" type="search" placeholder="Filter by project, repo, state, queue, or outcome"></label>
-      <div class="project-rail-help">Search narrows the rail only; the rail remains the primary fleet overview.</div>
+      <label class="project-search-control" for="project-filter"><span>Project Search</span><input id="project-filter" type="search" placeholder="Filter projects"></label>
+      <div class="project-segments" aria-label="Project state summary">
+        <span class="segment is-active">All <b id="project-count-all">0</b></span>
+        <span class="segment">Running <b id="project-count-running">0</b></span>
+        <span class="segment">Attention <b id="project-count-attention">0</b></span>
+        <span class="segment">Idle <b id="project-count-idle">0</b></span>
+      </div>
     </div>
     <div class="project-rail-scroll">
       <table class="project-rail-table" aria-label="Configured project fleet rail">
@@ -55,7 +67,7 @@
             <th class="project-rail-pr-cell">PR</th>
             <th class="project-rail-outcome-cell">Outcome</th>
             <th class="project-rail-freshness-cell">Last activity</th>
-            <th class="project-rail-links-cell">Links/actions</th>
+            <th class="project-rail-links-cell">Open</th>
           </tr>
         </thead>
         <tbody id="project-rail-body">{{FLEET_PROJECT_RAIL_ROWS}}</tbody>

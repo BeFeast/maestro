@@ -1392,7 +1392,15 @@ func TestFleetDashboard(t *testing.T) {
 		"project-rail",
 		"project-rail-body",
 		"project-filter",
-		"Project Rail",
+		"project-segments",
+		"project-count-all",
+		"project-count-running",
+		"project-count-attention",
+		"project-count-idle",
+		"mode-pill",
+		"fleet-refresh",
+		"stat-label",
+		"Projects",
 		"projectIsUnconfigured",
 		"project-row--unconfigured",
 		"rail-state-unconfigured",
@@ -1402,7 +1410,7 @@ func TestFleetDashboard(t *testing.T) {
 		"supervisorOperatorSentence",
 		"raw-action",
 		"Last activity",
-		"Links/actions",
+		"Open",
 		"fleet-verdict",
 		"renderFleetVerdict",
 		"verdict-healthy",
@@ -1454,6 +1462,7 @@ func TestFleetDashboard(t *testing.T) {
 		"renderProjectRail",
 		"projectRailRowHTML",
 		"projectExpandedRailHTML",
+		"projectOpenRailHTML",
 		"projectQueueBarHTML",
 		"queue-bar-segment",
 		"toggleExpandedProject",
@@ -1576,7 +1585,7 @@ func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
 			body := fleetDashboardBodyWithProjects(t, fleetDashboardFixtureProjects(t, tc.projects))
 			rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
 
-			for _, want := range []string{"Project", "State", "Queue", "PR", "Outcome", "Last activity", "Links/actions"} {
+			for _, want := range []string{"Project", "State", "Queue", "PR", "Outcome", "Last activity", "Open"} {
 				if !contains(body, want) {
 					t.Fatalf("dashboard rail should contain column %q", want)
 				}
@@ -1702,7 +1711,7 @@ func TestFleetDashboardServesFleetPath(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	if !contains(w.Body.String(), "Project Rail") {
+	if !contains(w.Body.String(), "Projects") {
 		t.Fatal("/fleet should serve the fleet dashboard")
 	}
 }
