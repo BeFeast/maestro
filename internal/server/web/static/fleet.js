@@ -502,8 +502,10 @@ function workerMatchesFilters(worker) {
 }
 
 function isLiveWorker(worker) {
-  if (worker.live === true) return true;
   const displayed = displayStatus(worker);
+  const terminal = new Set(["done", "failed", "dead", "conflict_failed", "retry_exhausted"]);
+  if (terminal.has(displayed) || terminal.has(worker.status || "")) return false;
+  if (worker.live === true) return true;
   return ["running", "pr_open", "queued", "review_retry_running", "review_retry_recheck", "review_retry_pending", "review_retry_backoff"].includes(displayed) ||
     ["running", "pr_open", "queued"].includes(worker.status || "");
 }
