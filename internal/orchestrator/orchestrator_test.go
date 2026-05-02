@@ -264,7 +264,7 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	if !strings.Contains(gotTitle, "add branch rescue") || !strings.Contains(gotTitle, "(#108)") {
 		t.Fatalf("unexpected title %q", gotTitle)
 	}
-	if !strings.Contains(gotBody, "Closes #108") || !strings.Contains(gotBody, "auto-created") {
+	if !strings.Contains(gotBody, "Refs #108") || strings.Contains(gotBody, "Closes #108") || !strings.Contains(gotBody, "auto-created") {
 		t.Fatalf("unexpected body %q", gotBody)
 	}
 	if !s.IssueInProgress(108) {
