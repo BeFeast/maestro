@@ -78,6 +78,18 @@ function actionLabel(action) {
   return String(action || "-").replace(/_/g, " ");
 }
 
+function rawSupervisorAction(action) {
+  const raw = String(action || "").trim();
+  return raw || "none";
+}
+
+function supervisorOperatorSentence(item) {
+  if (item && item.operator_sentence) return item.operator_sentence;
+  const raw = rawSupervisorAction(item && (item.recommended_action || item.action));
+  if (raw === "none") return "Skipped this tick; no safe action was selected.";
+  return "Supervisor reported " + raw + "; inspect diagnostics for details.";
+}
+
 function actionDisabledReason(actions) {
   const action = (actions || []).find(item => item.disabled_reason);
   return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
@@ -220,28 +232,33 @@ function renderSupervisor(info) {
   const reasonHTML = reasons.length ? '<ul class="supervisor-reasons">' + reasons.map(reason =>
     '<li>' + escapeText(reason) + '</li>'
   ).join("") + '</ul>' : "";
+  const lastSafeRaw = info.last_safe_action ? rawSupervisorAction(info.last_safe_action.action) : "";
   const lastSafe = info.last_safe_action ? '<div class="supervisor-meta">' +
-    '<span>Last safe action: ' + escapeText(actionLabel(info.last_safe_action.action)) + '</span>' +
+    '<span title="Raw action: ' + escapeText(lastSafeRaw) + '">Last safe action: ' + escapeText(supervisorOperatorSentence(info.last_safe_action)) + '</span>' +
     '<span>' + escapeText(formatTimestamp(info.last_safe_action.created_at)) + '</span>' +
     '</div>' : "";
   const approvals = (info.approval_actions || []).length ? '<div class="supervisor-actions">' +
     '<span>Requires approval:</span>' +
     (info.approval_actions || []).map(action =>
-      '<button class="supervisor-approval" disabled title="' + escapeText(action.disabled_reason || "Controls not available yet") + '">' +
-      escapeText(actionLabel(action.action)) +
+      '<button class="supervisor-approval" disabled title="Raw action: ' + escapeText(rawSupervisorAction(action.action)) + ' · ' + escapeText(action.disabled_reason || "Controls not available yet") + '">' +
+      escapeText(supervisorOperatorSentence(action)) +
       '</button>'
     ).join("") +
     '</div>' : "";
+
+  const rawAction = rawSupervisorAction(latest.recommended_action);
+  const operatorSentence = supervisorOperatorSentence(latest);
 
   supervisorPanelEl.innerHTML = '<div class="supervisor-head">' +
     '<span class="supervisor-title">Supervisor</span>' +
     '<span class="supervisor-time">' + escapeText(formatTimestamp(latest.created_at)) + '</span>' +
     '</div>' +
     '<div class="supervisor-main">' +
-    '<span class="supervisor-action">' + escapeText(actionLabel(latest.recommended_action)) + '</span>' +
+    '<span class="supervisor-action" title="Raw action: ' + escapeText(rawAction) + '">' + escapeText(operatorSentence) + '</span>' +
     (links ? '<span class="supervisor-links">' + links + '</span>' : "") +
     '</div>' +
     (latest.summary ? '<div class="supervisor-summary">' + escapeText(latest.summary) + '</div>' : "") +
+    '<div class="supervisor-raw-action">raw: ' + escapeText(rawAction) + '</div>' +
     (meta.length ? '<div class="supervisor-meta">' + meta.map(item => '<span>' + escapeText(item) + '</span>').join("") + '</div>' : "") +
     reasonHTML + lastSafe + approvals;
 }

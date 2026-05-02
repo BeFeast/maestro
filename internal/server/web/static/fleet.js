@@ -1256,6 +1256,18 @@ function outcomeHTML(project) {
     '</div></div>';
 }
 
+function rawSupervisorAction(action) {
+  const raw = String(action || "").trim();
+  return raw || "none";
+}
+
+function supervisorOperatorSentence(item) {
+  if (item && item.operator_sentence) return item.operator_sentence;
+  const raw = rawSupervisorAction(item && (item.recommended_action || item.action));
+  if (raw === "none") return "Skipped this tick; no safe action was selected.";
+  return "Supervisor reported " + raw + "; inspect diagnostics for details.";
+}
+
 function renderSupervisor(project) {
   const sup = project.supervisor;
   if (!sup || !sup.has_run || !sup.latest) {
@@ -1263,10 +1275,13 @@ function renderSupervisor(project) {
   }
   const latest = sup.latest;
   const reasons = (latest.stuck_reasons && latest.stuck_reasons.length ? latest.stuck_reasons : latest.reasons || []).slice(0, 2);
+  const rawAction = rawSupervisorAction(latest.recommended_action);
+  const operatorSentence = supervisorOperatorSentence(latest);
+  const summary = latest.summary ? ' · ' + escapeText(latest.summary) : '';
   return '<div class="supervisor">' +
     '<div class="label">Supervisor</div>' +
-    '<div class="decision"><strong>' + escapeText(latest.recommended_action || "none") + '</strong> · ' +
-    escapeText(latest.summary || "") + '<br><small>Risk ' + escapeText(latest.risk || "-") +
+    '<div class="decision"><strong title="Raw action: ' + escapeText(rawAction) + '">' + escapeText(operatorSentence) + '</strong>' + summary +
+    '<br><small><span class="raw-action">raw: ' + escapeText(rawAction) + '</span> · Risk ' + escapeText(latest.risk || "-") +
     (latest.confidence ? " · Confidence " + Number(latest.confidence).toFixed(2) : "") + '</small></div>' +
     (reasons.length ? '<div class="empty">' + reasons.map(escapeText).join("<br>") + '</div>' : "") +
   '</div>';

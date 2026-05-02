@@ -134,6 +134,7 @@ type supervisorDecisionInfo struct {
 	Status            string                         `json:"status,omitempty"`
 	Summary           string                         `json:"summary"`
 	RecommendedAction string                         `json:"recommended_action"`
+	OperatorSentence  string                         `json:"operator_sentence"`
 	Target            *state.SupervisorTarget        `json:"target,omitempty"`
 	TargetLinks       []targetLinkInfo               `json:"target_links,omitempty"`
 	Risk              string                         `json:"risk"`
@@ -151,14 +152,15 @@ type supervisorDecisionInfo struct {
 }
 
 type supervisorActionInfo struct {
-	Action         string                  `json:"action"`
-	Summary        string                  `json:"summary"`
-	Risk           string                  `json:"risk"`
-	CreatedAt      time.Time               `json:"created_at"`
-	Target         *state.SupervisorTarget `json:"target,omitempty"`
-	TargetLinks    []targetLinkInfo        `json:"target_links,omitempty"`
-	Disabled       bool                    `json:"disabled"`
-	DisabledReason string                  `json:"disabled_reason,omitempty"`
+	Action           string                  `json:"action"`
+	Summary          string                  `json:"summary"`
+	OperatorSentence string                  `json:"operator_sentence"`
+	Risk             string                  `json:"risk"`
+	CreatedAt        time.Time               `json:"created_at"`
+	Target           *state.SupervisorTarget `json:"target,omitempty"`
+	TargetLinks      []targetLinkInfo        `json:"target_links,omitempty"`
+	Disabled         bool                    `json:"disabled"`
+	DisabledReason   string                  `json:"disabled_reason,omitempty"`
 }
 
 type targetLinkInfo struct {
@@ -340,6 +342,7 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 		Status:            decision.Status,
 		Summary:           decision.Summary,
 		RecommendedAction: decision.RecommendedAction,
+		OperatorSentence:  supervisorOperatorSentence(decision.RecommendedAction, decision.Summary, decision.Target),
 		Target:            decision.Target,
 		TargetLinks:       supervisorTargetLinks(cfg.Repo, decision.Target),
 		Risk:              decision.Risk,
@@ -359,15 +362,79 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 
 func makeSupervisorActionInfo(cfg *config.Config, decision state.SupervisorDecision, disabled bool, disabledReason string) supervisorActionInfo {
 	return supervisorActionInfo{
-		Action:         decision.RecommendedAction,
-		Summary:        decision.Summary,
-		Risk:           decision.Risk,
-		CreatedAt:      decision.CreatedAt,
-		Target:         decision.Target,
-		TargetLinks:    supervisorTargetLinks(cfg.Repo, decision.Target),
-		Disabled:       disabled,
-		DisabledReason: disabledReason,
+		Action:           decision.RecommendedAction,
+		Summary:          decision.Summary,
+		OperatorSentence: supervisorOperatorSentence(decision.RecommendedAction, decision.Summary, decision.Target),
+		Risk:             decision.Risk,
+		CreatedAt:        decision.CreatedAt,
+		Target:           decision.Target,
+		TargetLinks:      supervisorTargetLinks(cfg.Repo, decision.Target),
+		Disabled:         disabled,
+		DisabledReason:   disabledReason,
 	}
+}
+
+func supervisorOperatorSentence(action, summary string, target *state.SupervisorTarget) string {
+	raw := strings.TrimSpace(action)
+	if raw == "" {
+		raw = "none"
+	}
+	summary = strings.TrimSpace(summary)
+	issue := supervisorIssuePhrase(target)
+	pr := supervisorPRPhrase(target)
+	session := supervisorSessionPhrase(target)
+
+	switch raw {
+	case "none":
+		return "Skipped this tick; no safe action was selected."
+	case "monitor_open_pr":
+		return fmt.Sprintf("Watching %s until checks and review pass.", pr)
+	case "approve_merge":
+		return fmt.Sprintf("Ready to merge %s when approval and checks allow it.", pr)
+	case "spawn_worker":
+		return fmt.Sprintf("Starting a worker for %s.", issue)
+	case "label_issue_ready":
+		return fmt.Sprintf("Preparing %s for the worker queue.", issue)
+	case "review_retry_exhausted":
+		if target != nil && target.PR > 0 {
+			return fmt.Sprintf("Reviewing failed feedback on %s before retrying work.", pr)
+		}
+		return fmt.Sprintf("Reviewing retry-exhausted work for %s before dispatching again.", issue)
+	case "check_outcome_health":
+		return "Checking runtime outcome health before sending more work."
+	case "wait_for_running_worker", "wait_for_worker":
+		return fmt.Sprintf("Waiting for %s to finish.", session)
+	case "wait_for_capacity":
+		return "Waiting for an available worker slot."
+	case "wait_for_ordered_queue":
+		return "Waiting for the ordered queue policy to allow the next issue."
+	}
+
+	if summary != "" {
+		return fmt.Sprintf("Supervisor reported %s; %s", raw, summary)
+	}
+	return fmt.Sprintf("Supervisor reported %s; inspect diagnostics for details.", raw)
+}
+
+func supervisorIssuePhrase(target *state.SupervisorTarget) string {
+	if target != nil && target.Issue > 0 {
+		return fmt.Sprintf("issue #%d", target.Issue)
+	}
+	return "the selected issue"
+}
+
+func supervisorPRPhrase(target *state.SupervisorTarget) string {
+	if target != nil && target.PR > 0 {
+		return fmt.Sprintf("PR #%d", target.PR)
+	}
+	return "the open PR"
+}
+
+func supervisorSessionPhrase(target *state.SupervisorTarget) string {
+	if target != nil && strings.TrimSpace(target.Session) != "" {
+		return "worker " + strings.TrimSpace(target.Session)
+	}
+	return "the running worker"
 }
 
 func latestSafeSupervisorDecision(st *state.State) *state.SupervisorDecision {

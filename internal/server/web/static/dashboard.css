@@ -237,6 +237,12 @@
     white-space: nowrap;
   }
   .supervisor-summary { margin-top: 4px; color: var(--text); }
+  .supervisor-raw-action {
+    margin-top: 4px;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
   .supervisor-meta, .supervisor-links, .supervisor-actions { flex-wrap: wrap; margin-top: 6px; }
   .supervisor-reasons {
     margin: 6px 0 0;

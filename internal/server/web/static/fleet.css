@@ -605,6 +605,7 @@
   .label { color: var(--muted); font-weight: 650; text-transform: uppercase; font-size: 12px; }
   .decision { margin-top: 5px; color: var(--text); }
   .decision small { color: var(--muted); }
+  .raw-action { font-family: var(--font-mono); }
   .project table { width: 100%; border-collapse: collapse; margin-top: 8px; table-layout: fixed; }
   .project td {
     padding: 7px 0;
