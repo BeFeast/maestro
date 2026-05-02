@@ -1124,7 +1124,7 @@
   }
 
   .section-head {
-    padding: 22px 26px;
+    padding: 20px 24px;
     align-items: center;
   }
 
@@ -1145,7 +1145,7 @@
   .project-rail-controls {
     grid-template-columns: minmax(260px, 420px) auto;
     gap: 16px;
-    padding: 18px 26px;
+    padding: 16px 24px;
     background: #f7fbfa;
   }
 
@@ -1170,7 +1170,7 @@
   .segment.is-active { background: #e9eef2; }
 
   .project-rail-table th {
-    padding: 18px 26px;
+    padding: 15px 18px;
     background: #f1f5f6;
     color: #7d8784;
     font-size: 13px;
@@ -1178,19 +1178,19 @@
   }
 
   .project-rail-table td {
-    padding: 24px 26px;
+    padding: 18px 18px;
     vertical-align: top;
   }
 
   .project-rail-table tbody tr:hover { background: #fbfdfd; }
 
-  .project-rail-project { width: 19%; }
-  .project-rail-state-cell { width: 17%; }
-  .project-rail-queue-cell { width: 19%; }
-  .project-rail-pr-cell { width: 11%; }
-  .project-rail-outcome-cell { width: 22%; }
+  .project-rail-project { width: 18%; }
+  .project-rail-state-cell { width: 16%; }
+  .project-rail-queue-cell { width: 18%; }
+  .project-rail-pr-cell { width: 12%; }
+  .project-rail-outcome-cell { width: 21%; }
   .project-rail-freshness-cell { width: 8%; }
-  .project-rail-links-cell { width: 4%; }
+  .project-rail-links-cell { width: 7%; min-width: 72px; }
 
   .project-rail-project-wrap {
     grid-template-columns: 22px minmax(0, 1fr);
@@ -1206,7 +1206,7 @@
   }
 
   .rail-project-name {
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 760;
   }
 
@@ -1215,13 +1215,13 @@
   .rail-note,
   .rail-warn,
   .rail-alert {
-    margin-top: 7px;
-    font-size: 13.5px;
+    margin-top: 6px;
+    font-size: 13px;
     line-height: 1.42;
   }
 
   .rail-mainline {
-    font-size: 14.5px;
+    font-size: 13.5px;
     line-height: 1.42;
   }
 
@@ -1242,6 +1242,9 @@
     min-height: 30px;
     color: #0f91a8;
     font-size: 13px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .project-row-attention { background: rgba(220, 38, 38, .038); }
@@ -1339,7 +1342,15 @@
     margin-right: 8px;
   }
 
-  @media (max-width: 1180px) {
+  @media (max-width: 1500px) {
+    .project-rail-table th,
+    .project-rail-table td { padding-inline: 14px; }
+    .project-rail-outcome-cell { width: 18%; }
+    .project-rail-freshness-cell { width: 9%; }
+    .project-rail-links-cell { width: 8%; min-width: 72px; }
+  }
+
+  @media (max-width: 1320px) {
     main { padding-inline: 20px; }
     .fleet-header { padding-inline: 22px; }
     .project-rail-controls { grid-template-columns: 1fr; justify-content: stretch; }
