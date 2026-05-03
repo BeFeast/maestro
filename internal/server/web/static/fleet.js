@@ -1268,7 +1268,7 @@ function fleetSafeTargetURL(value) {
 
 function renderFleetVerdict(nextAction, verdict) {
   if (!fleetVerdictEl) return;
-  if (!nextAction || !nextAction.reason) {
+  if (!nextAction) {
     const fallback = fleetDegradedVerdictFallback(verdict);
     if (fallback) {
       fleetVerdictEl.className = "fleet-verdict verdict-" + fallback.tone;
@@ -1287,7 +1287,7 @@ function renderFleetVerdict(nextAction, verdict) {
   }
   const tone = fleetNextActionToneClass(nextAction.priority);
   const project = String(nextAction.project || "").trim();
-  const reason = String(nextAction.reason || "").trim();
+  const reason = String(nextAction.reason || "").trim() || "Operator action required.";
   const headline = (project ? project + " · " : "") + reason;
   const metaParts = [];
   metaParts.push(String(nextAction.priority || "P1").toUpperCase() + " · " + fleetNextActionKindLabel(nextAction.kind));
