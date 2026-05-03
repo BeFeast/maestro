@@ -2563,3 +2563,12 @@
   body[data-page="fleet"] .project-rail-outcome-cell { width: 23%; }
   body[data-page="fleet"] .project-rail-freshness-cell { width: 9%; }
   body[data-page="fleet"] .project-rail-links-cell { width: 6%; }
+
+  body[data-page="fleet"] .brand-mark {
+    display: block;
+    width: 34px;
+    height: 34px;
+    border-radius: 0;
+    background: transparent;
+    object-fit: contain;
+  }
