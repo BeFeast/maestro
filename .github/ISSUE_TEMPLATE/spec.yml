@@ -1,0 +1,112 @@
+name: Spec
+description: Product Owner spec for a Maestro worker to implement hands-off
+title: "<type>: <short description>"
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Write the spec the way you want a worker to read it. Be specific about acceptance and verification.
+        Apply the `maestro-ready` label only when the spec is reviewed and ready for pickup.
+
+  - type: input
+    id: parent
+    attributes:
+      label: Parent epic / roadmap ID
+      description: Optional. Reference parent epic (e.g., `#350`) and roadmap ID (e.g., `M-013`) if applicable.
+      placeholder: "Parent: #350 — Roadmap ID: M-013"
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One paragraph stating what should change and where.
+      placeholder: |
+        Reconcile dead/stale supervisor sessions in the Fleet API so the attention surface only reflects current operational truth.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this matters
+      description: The operator-facing problem this fixes. If a memory or past incident motivates it, name it.
+      placeholder: |
+        Fleet currently shows 103 workers in state, most of which are historical noise. Operator burden goes up, signal goes down.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and constraints
+      description: Where the change lives, what stays out of scope, hard constraints (light theme, status-board direction, V2 confirmation gate, etc.).
+      placeholder: |
+        Touch internal/server/fleet.go and reconciler. Do NOT change the V2 confirmation scaffold.
+        Light theme only. Must not regress fleet refresh interval (3s).
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete checkboxes a reviewer can verify without asking the author.
+      value: |
+        - [ ] 
+        - [ ] 
+        - [ ] 
+    validations:
+      required: true
+
+  - type: textarea
+    id: test_plan
+    attributes:
+      label: Test plan
+      description: Specific tests to add or run. Worker must run `go test ./...` and frontend bun build before PR.
+      value: |
+        - [ ] Unit tests for the new behavior
+        - [ ] `go test ./...` passes on workshop
+        - [ ] `bun build internal/server/web/static/fleet.js` succeeds (if UI touched)
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Runtime verification
+      description: Commands or visual checks the operator (or worker) runs after deploy to confirm the change works against the live fleet.
+      placeholder: |
+        - `curl -fsS http://127.0.0.1:8786/api/v1/fleet | jq '.workers | length'` is below baseline by N
+        - Fleet dashboard shows zero `Worker exited and is waiting for retry` entries older than 24h
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Things that look related but must NOT be touched in this spec.
+      placeholder: |
+        - Do not change V2 confirmation modal copy.
+        - Do not introduce new dashboard sections.
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority hint
+      description: PO sets desired priority; reviewer applies the actual P-label.
+      options:
+        - P0 — critical, drop other work
+        - P1 — high, schedule next
+        - P2 — medium, queue normally
+        - P3 — low, opportunistic
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: po_checklist
+    attributes:
+      label: PO checklist before applying `maestro-ready`
+      options:
+        - label: Acceptance criteria are testable without re-asking the PO
+        - label: Verification works against live workshop services, not just unit tests
+        - label: Scope and non-goals are explicit enough that the worker won't drift
+        - label: Spec does not require coordination across multiple repos
