@@ -1495,7 +1495,14 @@ function projectOpenRailHTML(project) {
 function projectRailRowHTML(project) {
   const key = projectStateKey(project);
   const modifier = projectIsUnconfigured(project) ? ' project-row--unconfigured' : '';
-  return '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" tabindex="0">' +
+  const detailID = "rail-detail-" + cssToken(project.name || "project");
+  const expanded = fleetState.expandedProject === (project.name || "");
+  const toggleCell = '<td class="project-rail-toggle-cell">' +
+    '<button type="button" class="project-rail-toggle" data-rail-toggle="' + escapeText(detailID) + '" aria-expanded="' + (expanded ? "true" : "false") + '" aria-controls="' + escapeText(detailID) + '" aria-label="' + (expanded ? "Collapse" : "Expand") + ' project detail">' +
+      '<span class="project-rail-toggle-caret" aria-hidden="true">&#9656;</span>' +
+    '</button></td>';
+  const mainRow = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-rail-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" aria-controls="' + escapeText(detailID) + '" tabindex="0">' +
+    toggleCell +
     '<td class="project-rail-project"><div class="project-rail-project-wrap"><div class="project-rail-project-copy">' + projectIdentityRailHTML(project) + '</div></div></td>' +
     '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
     '<td class="project-rail-queue-cell">' + projectQueueRailHTML(project) + '</td>' +
@@ -1504,6 +1511,81 @@ function projectRailRowHTML(project) {
     '<td class="project-rail-freshness-cell">' + projectFreshnessRailHTML(project) + '</td>' +
     '<td class="project-rail-links-cell">' + projectOpenRailHTML(project) + '</td>' +
   '</tr>';
+  const detailRow = '<tr class="project-rail-detail-row" id="' + escapeText(detailID) + '"' + (expanded ? '' : ' hidden') + '><td colspan="8">' + projectRailDetailHTML(project) + '</td></tr>';
+  return mainRow + detailRow;
+}
+
+function projectRailDetailHTML(project) {
+  return '<div class="project-rail-detail">' +
+    '<div class="rail-detail-block rail-detail-queue"><div class="rail-detail-label">Queue</div>' + projectRailQueueDetailHTML(project) + '</div>' +
+    '<div class="rail-detail-block rail-detail-outcome"><div class="rail-detail-label">Outcome</div>' + projectRailOutcomeDetailHTML(project) + '</div>' +
+    '<div class="rail-detail-block rail-detail-decision"><div class="rail-detail-label">Last decision</div>' + projectRailDecisionDetailHTML(project) + '</div>' +
+  '</div>';
+}
+
+function projectRailQueueDetailHTML(project) {
+  const q = project.queue_snapshot;
+  if (!q) return '<div class="rail-detail-empty">No queue snapshot.</div>';
+  const open = Number(q.open || 0);
+  const ready = Number(q.eligible || 0);
+  const held = Number(q.held || q.held_issues || 0);
+  let readyPct = 0;
+  let heldPct = 0;
+  if (open > 0) {
+    readyPct = Math.min(100, Math.round((ready * 100) / open));
+    heldPct = Math.min(100, Math.round((held * 100) / open));
+  }
+  const bar = '<div class="rail-detail-queue-bar" role="img" aria-label="Queue health">' +
+    '<span class="rail-detail-queue-bar-segment ready" style="width:' + readyPct + '%"></span>' +
+    '<span class="rail-detail-queue-bar-segment held" style="width:' + heldPct + '%"></span>' +
+  '</div>';
+  const caption = ready + " ready · " + held + " held · " + open + " open";
+  const idle = String(q.idle_reason || "").trim();
+  return bar +
+    '<div class="rail-detail-queue-caption">' + escapeText(caption) + '</div>' +
+    (idle ? '<div class="rail-detail-queue-idle">' + escapeText(idle) + '</div>' : '');
+}
+
+function projectRailOutcomeDetailHTML(project) {
+  if (projectIsUnconfigured(project)) {
+    return '<div class="rail-detail-empty">No outcome brief configured.</div>';
+  }
+  const outcome = project.outcome || {};
+  const health = outcome.health_state || "unknown";
+  const goal = outcome.configured === true && outcome.goal ? outcome.goal : "No outcome brief configured";
+  return '<span class="pill outcome-' + cssToken(health) + '">' + escapeText(health.replace(/_/g, ' ')) + '</span>' +
+    '<div class="rail-detail-outcome-goal">' + escapeText(goal) + '</div>';
+}
+
+function projectRailDecisionDetailHTML(project) {
+  const sup = project && project.supervisor;
+  if (!sup || !sup.has_run || !sup.latest) {
+    return '<div class="rail-detail-empty">No supervisor decision yet.</div>';
+  }
+  const latest = sup.latest;
+  const sentence = supervisorOperatorSentence(latest);
+  const raw = rawSupervisorAction(latest.recommended_action);
+  return '<div class="rail-detail-decision-sentence" title="Raw action: ' + escapeText(raw) + '">' + escapeText(sentence) + '</div>';
+}
+
+function toggleProjectRailDetail(button) {
+  const targetID = button.dataset.railToggle || "";
+  if (!targetID) return;
+  const target = document.getElementById(targetID);
+  if (!target) return;
+  const expanded = button.getAttribute("aria-expanded") === "true";
+  const next = !expanded;
+  button.setAttribute("aria-expanded", next ? "true" : "false");
+  button.setAttribute("aria-label", (next ? "Collapse" : "Expand") + " project detail");
+  if (next) target.removeAttribute("hidden");
+  else target.setAttribute("hidden", "");
+  const row = button.closest("tr");
+  if (row) {
+    row.classList.toggle("project-rail-row-expanded", next);
+    const projectName = row.dataset.project || "";
+    fleetState.expandedProject = next ? projectName : "";
+    writeStoredExpandedProject(fleetState.expandedProject);
+  }
 }
 
 function renderProjectRail() {
@@ -1515,7 +1597,7 @@ function renderProjectRail() {
   projectRailSummaryEl.textContent = projectRailSummaryText(projects, total);
   if (!projects.length) {
     const empty = total ? "No configured projects match the project search." : "No configured projects are available in this fleet.";
-    projectRailBodyEl.innerHTML = '<tr class="project-rail-empty"><td colspan="7" class="empty">' + escapeText(empty) + '</td></tr>';
+    projectRailBodyEl.innerHTML = '<tr class="project-rail-empty"><td colspan="8" class="empty">' + escapeText(empty) + '</td></tr>';
     return;
   }
 
@@ -1537,6 +1619,13 @@ function renderProjectRail() {
   projectRailBodyEl.querySelectorAll(".project-rail-row[data-project] a, .project-rail-row[data-project] button").forEach(control => {
     control.addEventListener("click", event => event.stopPropagation());
     control.addEventListener("keydown", event => event.stopPropagation());
+  });
+  projectRailBodyEl.querySelectorAll("button[data-rail-toggle]").forEach(button => {
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      event.preventDefault();
+      toggleProjectRailDetail(button);
+    });
   });
   projectRailBodyEl.querySelectorAll(".project-workers-link[data-project]").forEach(button => {
     button.addEventListener("click", event => {
