@@ -1747,7 +1747,23 @@ type StaleSessionPolicy struct {
 	// idle window this prevents a live worker that simply has not written
 	// state recently from being filtered out.
 	RequireWorktreeMissing bool
+	// MergedPRDismisses, when true, treats a dead session whose linked PR is
+	// known to be MERGED as completed regardless of idle time or worktree
+	// presence. PRStateForBranchPR supplies the lookup; when nil, this path
+	// has no effect.
+	MergedPRDismisses bool
+	// PRStateForBranchPR returns the known PR state ("MERGED", "OPEN", ...)
+	// for the given session branch name and the candidate session's own
+	// PRNumber. The PRNumber match guards against false dismissals when an
+	// issue is re-opened: a stale CodeLanded record on the same branch but
+	// with a different PRNumber must not poison a live retry. An empty
+	// return value means unknown.
+	PRStateForBranchPR func(branch string, prNumber int) string
 }
+
+// MergedPRReason is the audit reason emitted when a session is dismissed
+// because its linked PR is known to be merged.
+const MergedPRReason = "linked PR merged"
 
 // StaleSessionAudit records a single stale-session reconciliation event.
 // Callers persist this through a project's audit log; it is not stored in
@@ -1770,9 +1786,6 @@ func SessionStale(sess *Session, now time.Time, policy StaleSessionPolicy, workt
 	if sess == nil || !policy.Enabled {
 		return StaleSessionAudit{}, false
 	}
-	if policy.IdleAfter <= 0 {
-		return StaleSessionAudit{}, false
-	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -1789,10 +1802,44 @@ func SessionStale(sess *Session, now time.Time, policy StaleSessionPolicy, workt
 	}
 
 	changedAt := SessionChangedAt(sess)
+	idle := time.Duration(0)
+	if !changedAt.IsZero() {
+		idle = now.Sub(changedAt)
+	}
+
+	// Linked-PR-merged path: when enabled, a dead session whose own PR is
+	// known to be MERGED is dismissed regardless of idle time or worktree
+	// presence. The lookup must match on (branch, PRNumber) so a stale
+	// CodeLanded record on the same branch but for a different PR (e.g.
+	// after the issue was re-opened) cannot poison a live retry. The audit
+	// carries an explicit "linked PR merged" reason so operators can see
+	// which condition fired.
+	if policy.MergedPRDismisses && policy.PRStateForBranchPR != nil && sess.PRNumber > 0 {
+		branch := strings.TrimSpace(sess.Branch)
+		if branch != "" {
+			if state := strings.ToUpper(strings.TrimSpace(policy.PRStateForBranchPR(branch, sess.PRNumber))); state == "MERGED" {
+				idleSeconds := int64(0)
+				if idle > 0 {
+					idleSeconds = int64(idle.Round(time.Second) / time.Second)
+				}
+				return StaleSessionAudit{
+					IssueNumber: sess.IssueNumber,
+					PRNumber:    sess.PRNumber,
+					Status:      string(sess.Status),
+					Reason:      MergedPRReason,
+					IdleSeconds: idleSeconds,
+					At:          now,
+				}, true
+			}
+		}
+	}
+
+	if policy.IdleAfter <= 0 {
+		return StaleSessionAudit{}, false
+	}
 	if changedAt.IsZero() {
 		return StaleSessionAudit{}, false
 	}
-	idle := now.Sub(changedAt)
 	if idle < policy.IdleAfter {
 		return StaleSessionAudit{}, false
 	}

@@ -1737,11 +1737,64 @@ func reconcileStaleSessions(cfg *config.Config, st *state.State, now time.Time) 
 		Enabled:                cfg.StaleSessionReconciler.IsEnabled(),
 		IdleAfter:              time.Duration(cfg.StaleSessionReconciler.IdleAfter()) * time.Minute,
 		RequireWorktreeMissing: cfg.StaleSessionReconciler.WorktreeMissingRequired(),
+		MergedPRDismisses:      cfg.StaleSessionReconciler.MergedPRDismissesEnabled(),
 	}
 	if !policy.Enabled {
 		return nil
 	}
+	if policy.MergedPRDismisses {
+		policy.PRStateForBranchPR = mergedBranchLookupFromState(st)
+	}
 	return st.ReconcileStaleSessions(now, policy, worktreeExistsOnDisk)
+}
+
+// mergedBranchLookupFromState derives a (branch, PRNumber) -> PR state lookup
+// from the session table already persisted in state. Only StatusCodeLanded
+// sessions contribute to the set: that is the one terminal status the
+// orchestrator sets exclusively after observing the linked PR as merged.
+// StatusDone is intentionally excluded because the orchestrator also reaches
+// it on non-merge paths (issue closed externally) and would otherwise produce
+// false dismissals.
+//
+// The lookup is keyed by (branch, PRNumber) so a stale CodeLanded record on
+// the same branch but with a different PRNumber (e.g. after the original
+// issue was re-opened and a new session retried on the same branch) cannot
+// poison a live retry. The lookup uses no network calls, so the snapshot
+// path stays fast and side-effect free.
+func mergedBranchLookupFromState(st *state.State) func(string, int) string {
+	if st == nil {
+		return nil
+	}
+	type key struct {
+		branch   string
+		prNumber int
+	}
+	merged := make(map[key]struct{})
+	for _, sess := range st.Sessions {
+		if sess == nil {
+			continue
+		}
+		if sess.Status != state.StatusCodeLanded {
+			continue
+		}
+		branch := strings.TrimSpace(sess.Branch)
+		if branch == "" || sess.PRNumber <= 0 {
+			continue
+		}
+		merged[key{branch: branch, prNumber: sess.PRNumber}] = struct{}{}
+	}
+	if len(merged) == 0 {
+		return func(string, int) string { return "" }
+	}
+	return func(branch string, prNumber int) string {
+		if prNumber <= 0 {
+			return ""
+		}
+		if _, ok := merged[key{branch: strings.TrimSpace(branch), prNumber: prNumber}]; ok {
+			return "MERGED"
+		}
+		return ""
+	}
 }
 
 func worktreeExistsOnDisk(path string) bool {
