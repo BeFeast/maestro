@@ -1491,11 +1491,12 @@ function projectRailRowHTML(project) {
   const key = projectStateKey(project);
   const modifier = projectIsUnconfigured(project) ? ' project-row--unconfigured' : '';
   const detailID = "rail-detail-" + cssToken(project.name || "project");
+  const expanded = fleetState.expandedProject === (project.name || "");
   const toggleCell = '<td class="project-rail-toggle-cell">' +
-    '<button type="button" class="project-rail-toggle" data-rail-toggle="' + escapeText(detailID) + '" aria-expanded="false" aria-controls="' + escapeText(detailID) + '" aria-label="Expand project detail">' +
+    '<button type="button" class="project-rail-toggle" data-rail-toggle="' + escapeText(detailID) + '" aria-expanded="' + (expanded ? "true" : "false") + '" aria-controls="' + escapeText(detailID) + '" aria-label="' + (expanded ? "Collapse" : "Expand") + ' project detail">' +
       '<span class="project-rail-toggle-caret" aria-hidden="true">&#9656;</span>' +
     '</button></td>';
-  const mainRow = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" aria-controls="' + escapeText(detailID) + '" tabindex="0">' +
+  const mainRow = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-rail-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" aria-controls="' + escapeText(detailID) + '" tabindex="0">' +
     toggleCell +
     '<td class="project-rail-project"><div class="project-rail-project-wrap"><div class="project-rail-project-copy">' + projectIdentityRailHTML(project) + '</div></div></td>' +
     '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
@@ -1505,7 +1506,7 @@ function projectRailRowHTML(project) {
     '<td class="project-rail-freshness-cell">' + projectFreshnessRailHTML(project) + '</td>' +
     '<td class="project-rail-links-cell">' + projectOpenRailHTML(project) + '</td>' +
   '</tr>';
-  const detailRow = '<tr class="project-rail-detail-row" id="' + escapeText(detailID) + '" hidden><td colspan="8">' + projectRailDetailHTML(project) + '</td></tr>';
+  const detailRow = '<tr class="project-rail-detail-row" id="' + escapeText(detailID) + '"' + (expanded ? '' : ' hidden') + '><td colspan="8">' + projectRailDetailHTML(project) + '</td></tr>';
   return mainRow + detailRow;
 }
 
@@ -1570,10 +1571,16 @@ function toggleProjectRailDetail(button) {
   const expanded = button.getAttribute("aria-expanded") === "true";
   const next = !expanded;
   button.setAttribute("aria-expanded", next ? "true" : "false");
+  button.setAttribute("aria-label", (next ? "Collapse" : "Expand") + " project detail");
   if (next) target.removeAttribute("hidden");
   else target.setAttribute("hidden", "");
   const row = button.closest("tr");
-  if (row) row.classList.toggle("project-rail-row-expanded", next);
+  if (row) {
+    row.classList.toggle("project-rail-row-expanded", next);
+    const projectName = row.dataset.project || "";
+    fleetState.expandedProject = next ? projectName : "";
+    writeStoredExpandedProject(fleetState.expandedProject);
+  }
 }
 
 function renderProjectRail() {
