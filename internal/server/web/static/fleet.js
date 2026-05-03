@@ -1779,11 +1779,14 @@ function renderWorkerDetail(data) {
     ? (log.truncated ? "tail, " : "") + (log.updated_at || "")
     : "unavailable";
 
+  const workerActionsHTML = fleetState.readOnly
+    ? '<div class="project-actions-readonly">Write controls disabled in read-only mode.</div>'
+    : '<div class="project-actions"><div class="label">Approval-gated controls</div>' + renderActions(worker.actions || [], { details: false }) + '</div>';
   workerDetailBodyEl.innerHTML = '<div class="detail-grid">' + fields + '</div>' +
     '<div class="' + noteClass + '"><strong>State</strong> ' + escapeText(reason) +
       (links.length ? '<div class="detail-links">' + links.join("") + '</div>' : "") +
     '</div>' +
-    '<div class="project-actions"><div class="label">Approval-gated controls</div>' + renderActions(worker.actions || [], { details: false }) + '</div>' +
+    workerActionsHTML +
     '<div class="log-tail">' +
       '<div class="log-tail-head"><strong>Recent log tail</strong><span>' + escapeText(logMeta) + '</span></div>' +
       '<pre>' + escapeText(logText) + '</pre>' +
@@ -1975,8 +1978,8 @@ function renderWorkers(project) {
 }
 
 function renderProjectActions(project) {
-  if (project.read_only === true) {
-    return '<div class="project-actions"><div class="action-note">Write controls are disabled in read-only mode.</div></div>';
+  if (project.read_only === true || fleetState.readOnly) {
+    return '<div class="project-actions-readonly">Write controls disabled in read-only mode.</div>';
   }
   return '<div class="project-actions"><div class="label">Approval-gated controls</div>' +
     renderActions(project.actions || [], { details: false }) + '</div>';
@@ -2172,7 +2175,7 @@ document.addEventListener("keydown", event => {
 });
 
 function applyFleetData(data) {
-  fleetState.readOnly = data.read_only !== false;
+  fleetState.readOnly = data.read_only === true;
   fleetState.refreshedAt = data.refreshed_at || "";
   fleetState.summary = data.summary || {};
   fleetState.projects = data.projects || [];

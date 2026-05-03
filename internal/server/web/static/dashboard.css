@@ -280,6 +280,12 @@
   }
   .action-detail strong { color: var(--text); font-weight: 650; }
   .action-note { margin-top: 6px; color: var(--muted); }
+  .project-actions-readonly {
+    margin-top: 8px;
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+  }
   .supervisor-empty { color: var(--muted); }
   pre {
     margin: 0;
