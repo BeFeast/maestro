@@ -393,7 +393,7 @@ async function loadState() {
 	state.workers = data.all || [];
 	state.supervisor = data.supervisor || null;
 	state.outcome = data.outcome || null;
-	state.readOnly = data.read_only !== false;
+	state.readOnly = data.read_only === true;
 	renderStats(data.summary || {}, state.workers.length, data.max_parallel || 0, data.read_only);
 	renderSupervisor(state.supervisor);
 	renderOutcome(state.outcome);

@@ -2175,7 +2175,7 @@ document.addEventListener("keydown", event => {
 });
 
 function applyFleetData(data) {
-  fleetState.readOnly = data.read_only !== false;
+  fleetState.readOnly = data.read_only === true;
   fleetState.refreshedAt = data.refreshed_at || "";
   fleetState.summary = data.summary || {};
   fleetState.projects = data.projects || [];
