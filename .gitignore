@@ -14,4 +14,5 @@
 *.yml
 # But keep CI workflows
 !.github/workflows/*.yml
+!.github/ISSUE_TEMPLATE/*.yml
 .claude/
