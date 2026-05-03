@@ -1751,6 +1751,8 @@ func TestFleetDashboard(t *testing.T) {
 		"No projects need attention right now",
 		"renderProjectRail",
 		"projectRailRowHTML",
+		"projectRailDetailHTML",
+		"toggleProjectRailDetail",
 		"projectOpenRailHTML",
 		"needs-you-rail",
 		"renderNeedsYouRail",
@@ -2015,6 +2017,29 @@ func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
 				t.Fatal("10+ project fixture should render inside the scrollable rail container")
 			}
 		})
+	}
+}
+
+func TestFleetDashboardRailEmitsInlineDetailRow(t *testing.T) {
+	body := fleetDashboardBodyWithProjects(t, fleetDashboardFixtureProjects(t, 1))
+	rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
+
+	for _, want := range []string{
+		"project-rail-toggle-cell",
+		"data-rail-toggle=",
+		"aria-controls=\"rail-detail-",
+		"project-rail-detail-row",
+		"rail-detail-block rail-detail-queue",
+		"rail-detail-block rail-detail-outcome",
+		"rail-detail-block rail-detail-decision",
+		"rail-detail-queue-bar",
+	} {
+		if !contains(rail, want) {
+			t.Fatalf("rail should expose inline detail row markup %q in:\n%s", want, rail)
+		}
+	}
+	if mainCount, detailCount := strings.Count(rail, `class="project-rail-row`), strings.Count(rail, "project-rail-detail-row"); mainCount != detailCount {
+		t.Fatalf("expected one detail row per main row, got main=%d detail=%d in:\n%s", mainCount, detailCount, rail)
 	}
 }
 

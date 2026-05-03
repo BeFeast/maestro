@@ -2198,7 +2198,7 @@ func fleetProjectRailSummary(projects []fleetProjectState) string {
 
 func renderFleetProjectRailRows(projects []fleetProjectState) string {
 	if len(projects) == 0 {
-		return `<tr class="project-rail-empty"><td colspan="7" class="empty">No configured projects are available in this fleet.</td></tr>`
+		return `<tr class="project-rail-empty"><td colspan="8" class="empty">No configured projects are available in this fleet.</td></tr>`
 	}
 	var b strings.Builder
 	for _, project := range projects {
@@ -2213,7 +2213,13 @@ func renderFleetProjectRailRow(project fleetProjectState) string {
 		rowClasses = append(rowClasses, "project-row--unconfigured")
 	}
 	rowClass := strings.Join(rowClasses, " ")
-	return `<tr class="` + html.EscapeString(rowClass) + `">` +
+	detailID := "rail-detail-" + cssTokenServer(project.Name)
+	toggleCell := `<td class="project-rail-toggle-cell">` +
+		`<button type="button" class="project-rail-toggle" data-rail-toggle="` + html.EscapeString(detailID) + `" aria-expanded="false" aria-controls="` + html.EscapeString(detailID) + `" aria-label="Expand project detail">` +
+		`<span class="project-rail-toggle-caret" aria-hidden="true">&#9656;</span>` +
+		`</button></td>`
+	mainRow := `<tr class="` + html.EscapeString(rowClass) + `" aria-controls="` + html.EscapeString(detailID) + `">` +
+		toggleCell +
 		`<td class="project-rail-project">` + renderFleetProjectIdentity(project) + `</td>` +
 		`<td class="project-rail-state-cell">` + renderFleetProjectRailState(project) + `</td>` +
 		`<td class="project-rail-queue-cell">` + renderFleetProjectRailQueue(project) + `</td>` +
@@ -2222,6 +2228,86 @@ func renderFleetProjectRailRow(project fleetProjectState) string {
 		`<td class="project-rail-freshness-cell">` + renderFleetProjectRailFreshness(project) + `</td>` +
 		`<td class="project-rail-links-cell">` + renderFleetProjectRailLinks(project) + `</td>` +
 		`</tr>`
+	detailRow := `<tr class="project-rail-detail-row" id="` + html.EscapeString(detailID) + `" hidden>` +
+		`<td colspan="8">` + renderFleetProjectRailDetail(project) + `</td>` +
+		`</tr>`
+	return mainRow + detailRow
+}
+
+func renderFleetProjectRailDetail(project fleetProjectState) string {
+	parts := []string{
+		`<div class="rail-detail-block rail-detail-queue"><div class="rail-detail-label">Queue</div>` + renderFleetProjectRailQueueDetail(project) + `</div>`,
+		`<div class="rail-detail-block rail-detail-outcome"><div class="rail-detail-label">Outcome</div>` + renderFleetProjectRailOutcomeDetail(project) + `</div>`,
+		`<div class="rail-detail-block rail-detail-decision"><div class="rail-detail-label">Last decision</div>` + renderFleetProjectRailDecisionDetail(project) + `</div>`,
+	}
+	return `<div class="project-rail-detail">` + strings.Join(parts, "") + `</div>`
+}
+
+func renderFleetProjectRailQueueDetail(project fleetProjectState) string {
+	q := project.QueueSnapshot
+	if q == nil {
+		return `<div class="rail-detail-empty">No queue snapshot.</div>`
+	}
+	open := q.Open
+	ready := q.Eligible
+	held := q.Held
+	readyPct := 0
+	heldPct := 0
+	if open > 0 {
+		readyPct = (ready * 100) / open
+		heldPct = (held * 100) / open
+		if readyPct > 100 {
+			readyPct = 100
+		}
+		if heldPct > 100 {
+			heldPct = 100
+		}
+	}
+	bar := `<div class="rail-detail-queue-bar" role="img" aria-label="Queue health">` +
+		`<span class="rail-detail-queue-bar-segment ready" style="width:` + fmt.Sprintf("%d", readyPct) + `%"></span>` +
+		`<span class="rail-detail-queue-bar-segment held" style="width:` + fmt.Sprintf("%d", heldPct) + `%"></span>` +
+		`</div>`
+	caption := fmt.Sprintf("%d ready · %d held · %d open", ready, held, open)
+	idle := strings.TrimSpace(q.IdleReason)
+	captionHTML := `<div class="rail-detail-queue-caption">` + html.EscapeString(caption) + `</div>`
+	if idle != "" {
+		captionHTML += `<div class="rail-detail-queue-idle">` + html.EscapeString(idle) + `</div>`
+	}
+	return bar + captionHTML
+}
+
+func renderFleetProjectRailOutcomeDetail(project fleetProjectState) string {
+	if fleetProjectUnconfigured(project) {
+		return `<div class="rail-detail-empty">No outcome brief configured.</div>`
+	}
+	o := project.Outcome
+	health := strings.TrimSpace(o.HealthState)
+	if health == "" {
+		health = "unknown"
+	}
+	goal := strings.TrimSpace(o.Goal)
+	if goal == "" {
+		goal = "No outcome brief configured"
+	}
+	return `<span class="pill outcome-` + html.EscapeString(cssTokenServer(health)) + `">` + html.EscapeString(strings.ReplaceAll(health, "_", " ")) + `</span>` +
+		`<div class="rail-detail-outcome-goal">` + html.EscapeString(goal) + `</div>`
+}
+
+func renderFleetProjectRailDecisionDetail(project fleetProjectState) string {
+	sup := project.Supervisor
+	if !sup.HasRun || sup.Latest == nil {
+		return `<div class="rail-detail-empty">No supervisor decision yet.</div>`
+	}
+	latest := sup.Latest
+	sentence := strings.TrimSpace(latest.OperatorSentence)
+	if sentence == "" {
+		sentence = supervisorOperatorSentence(latest.RecommendedAction, latest.Summary, latest.Target)
+	}
+	raw := strings.TrimSpace(latest.RecommendedAction)
+	if raw == "" {
+		raw = "none"
+	}
+	return `<div class="rail-detail-decision-sentence" title="Raw action: ` + html.EscapeString(raw) + `">` + html.EscapeString(sentence) + `</div>`
 }
 
 func renderFleetProjectIdentity(project fleetProjectState) string {
