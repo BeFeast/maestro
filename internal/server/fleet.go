@@ -334,6 +334,7 @@ type fleetApprovalState struct {
 	UpdatedAgeSeconds int64                   `json:"updated_age_seconds,omitempty"`
 	Risk              string                  `json:"risk,omitempty"`
 	Summary           string                  `json:"summary,omitempty"`
+	PastSLA           bool                    `json:"past_sla,omitempty"`
 
 	createdAt time.Time
 	updatedAt time.Time
@@ -777,19 +778,26 @@ func fleetOperatorStateIsActive(kind string) bool {
 }
 
 func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetApprovalState, now time.Time) fleetOperatorBrief {
-	_ = now
 	if len(projects) == 0 {
 		return fleetOperatorBrief{Tone: "muted", Sentence: "Global brief: no projects are configured in this fleet."}
 	}
 
 	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
+		tone := "attention"
+		label := "Approval pending"
+		nextAction := "Approve or reject the pending supervisor approval after checking the target state."
+		if approvalPastSLA(approval, now) {
+			tone = "daemon-down"
+			label = "Approval past SLA"
+			nextAction = "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now."
+		}
 		return fleetOperatorBrief{
-			Tone:           "attention",
-			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval pending", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Tone:           tone,
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, label, approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
 			Project:        approval.ProjectName,
 			Kind:           "approval_pending",
 			Reason:         truncateFleetOperatorText(approval.Summary, 150),
-			NextAction:     "Approve or reject the pending supervisor approval after checking the target state.",
+			NextAction:     nextAction,
 			ActionRequired: true,
 			IssueNumber:    approval.IssueNumber,
 			IssueURL:       approval.IssueURL,
@@ -858,6 +866,25 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 		parts = append(parts, fleetCountPhrase(attention, "project with passive attention", "projects with passive attention"))
 	}
 	return fleetOperatorBrief{Tone: "busy", Kind: "active", Sentence: "Global brief: " + strings.Join(parts, "; ") + "; no operator action is needed right now."}
+}
+
+const fleetApprovalSLASeconds int64 = 30 * 60
+
+func fleetApprovalSLAText() string {
+	return "30m"
+}
+
+func approvalPastSLA(approval *fleetApprovalState, now time.Time) bool {
+	if approval == nil {
+		return false
+	}
+	if approval.CreatedAgeSeconds > fleetApprovalSLASeconds {
+		return true
+	}
+	if !approval.createdAt.IsZero() && now.Sub(approval.createdAt) > time.Duration(fleetApprovalSLASeconds)*time.Second {
+		return true
+	}
+	return false
 }
 
 func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetApprovalState {
@@ -1778,6 +1805,9 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		UpdatedAgeSeconds: fleetAgeSeconds(updatedAt, now),
 		createdAt:         createdAt,
 		updatedAt:         updatedAt,
+	}
+	if approval.Status == state.ApprovalStatusPending {
+		item.PastSLA = approvalPastSLA(&item, now)
 	}
 	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
 	return item

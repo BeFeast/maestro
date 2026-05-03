@@ -266,7 +266,9 @@ function approvalStatusClass(approval) {
 }
 
 function approvalCardClass(approval) {
-  return "approval-card approval-" + cssToken(approval.status || "unknown");
+  let cls = "approval-card approval-" + cssToken(approval.status || "unknown");
+  if (approval.past_sla === true) cls += " approval-past-sla";
+  return cls;
 }
 
 function isPendingApproval(approval) {
