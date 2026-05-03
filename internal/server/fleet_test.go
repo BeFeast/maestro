@@ -2128,11 +2128,14 @@ func TestFleetDashboardServesApprovalAuditPath(t *testing.T) {
 func TestFleetDashboardReadOnlyProjectControlsRenderQuietNote(t *testing.T) {
 	body := fleetDashboardBody(t)
 	readOnlyBranch := dashboardSnippet(t, body,
-		"if (project.read_only === true)",
+		"if (project.read_only === true || fleetState.readOnly)",
 		"return '<div class=\"project-actions\"><div class=\"label\">Approval-gated controls</div>'")
 
-	if !contains(readOnlyBranch, "Write controls are disabled in read-only mode.") {
-		t.Fatalf("read-only project controls should render disabled-write explanation, got:\n%s", readOnlyBranch)
+	if !contains(readOnlyBranch, "Write controls disabled in read-only mode.") {
+		t.Fatalf("read-only project controls should render disabled-write footer, got:\n%s", readOnlyBranch)
+	}
+	if !contains(readOnlyBranch, "project-actions-readonly") {
+		t.Fatalf("read-only project controls should use project-actions-readonly class, got:\n%s", readOnlyBranch)
 	}
 	for _, unwanted := range []string{"action-btn", "<button", "renderActions("} {
 		if contains(readOnlyBranch, unwanted) {

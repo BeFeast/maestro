@@ -4,7 +4,8 @@ const state = {
   outcome: null,
   selected: "",
   filter: "",
-  lastLog: null
+  lastLog: null,
+  readOnly: true
 };
 
 const statusRank = {
@@ -164,6 +165,9 @@ function renderActionButtons(actions, showDetails) {
 }
 
 function renderWorkerActions(actions) {
+  if (state.readOnly) {
+    return '<div class="project-actions-readonly">Write controls disabled in read-only mode.</div>';
+  }
   if (!actions || !actions.length) return "";
   return '<div class="worker-actions"><span>Actions</span>' + renderActionButtons(actions, false) + '</div>' +
     '<div class="action-note">' + escapeText(actionDisabledReason(actions)) + '</div>';
@@ -389,6 +393,7 @@ async function loadState() {
 	state.workers = data.all || [];
 	state.supervisor = data.supervisor || null;
 	state.outcome = data.outcome || null;
+	state.readOnly = data.read_only !== false;
 	renderStats(data.summary || {}, state.workers.length, data.max_parallel || 0, data.read_only);
 	renderSupervisor(state.supervisor);
 	renderOutcome(state.outcome);

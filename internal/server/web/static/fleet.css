@@ -1021,6 +1021,13 @@
   }
   .action-detail strong { color: var(--text); font-weight: 650; }
   .action-note { margin-top: 6px; color: var(--muted); font-size: 12px; white-space: normal; }
+  .project-actions-readonly {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--line);
+    color: var(--fg-3, var(--muted));
+    font-style: italic;
+    font-size: 12px;
+  }
   .more-row {
     margin-top: 7px;
     color: var(--muted);
