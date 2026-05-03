@@ -739,6 +739,58 @@ func TestFleetOperatorBriefPrioritizesPendingApproval(t *testing.T) {
 	}
 }
 
+func TestFleetOperatorBriefEscalatesPendingApprovalPastSLA(t *testing.T) {
+	now := time.Now().UTC()
+	brief := buildFleetOperatorBrief([]fleetProjectState{{
+		Name: "ApprovalProject",
+	}}, []fleetApprovalState{{
+		ProjectName: "ApprovalProject",
+		Status:      string(state.ApprovalStatusPending),
+		Summary:     "Supervisor approval is waiting past SLA.",
+		PRNumber:    101,
+		createdAt:   now.Add(-45 * time.Minute),
+		updatedAt:   now.Add(-45 * time.Minute),
+	}}, now)
+
+	if brief.Tone != "daemon-down" {
+		t.Fatalf("brief.Tone = %q, want daemon-down for past-SLA approval", brief.Tone)
+	}
+	if !contains(brief.Sentence, "Approval past SLA") {
+		t.Fatalf("brief.Sentence = %q, want past SLA label", brief.Sentence)
+	}
+	if !contains(brief.NextAction, "30m") {
+		t.Fatalf("brief.NextAction = %q, want 30m SLA mention", brief.NextAction)
+	}
+}
+
+func TestFleetOperatorBriefEscalatesAnyPastSLAPendingApproval(t *testing.T) {
+	now := time.Now().UTC()
+	brief := buildFleetOperatorBrief([]fleetProjectState{{
+		Name: "ApprovalProject",
+	}}, []fleetApprovalState{
+		{
+			ProjectName: "NewApproval",
+			Status:      string(state.ApprovalStatusPending),
+			Summary:     "New approval is still within SLA.",
+			PRNumber:    102,
+			createdAt:   now.Add(-5 * time.Minute),
+			updatedAt:   now.Add(-5 * time.Minute),
+		},
+		{
+			ProjectName: "OldApproval",
+			Status:      string(state.ApprovalStatusPending),
+			Summary:     "Old approval breached SLA.",
+			PRNumber:    101,
+			createdAt:   now.Add(-45 * time.Minute),
+			updatedAt:   now.Add(-45 * time.Minute),
+		},
+	}, now)
+
+	if brief.Tone != "daemon-down" || brief.Project != "OldApproval" {
+		t.Fatalf("brief = %+v, want oldest past-SLA approval escalated", brief)
+	}
+}
+
 func TestHighestPriorityPendingFleetApprovalSelectsNewestPending(t *testing.T) {
 	now := time.Now().UTC()
 	selected := highestPriorityPendingFleetApproval([]fleetApprovalState{
@@ -1738,12 +1790,15 @@ func TestFleetDashboard(t *testing.T) {
 		"approval-audit-link",
 		"approval-history-link-card",
 		"Open full approval audit",
+		"Pending approvals",
 		"Safe recommendation",
 		"Starting worker",
-		".approval-card.approval-stale { border-left-color: var(--line);",
-		".approval-card.approval-superseded { border-left-color: var(--line);",
+		".approval-card.approval-stale,",
+		".approval-card.approval-superseded,",
+		".approval-card.approval-rejected {",
 		".a-stale { color: var(--muted);",
 		".a-superseded { color: var(--muted);",
+		".approval-card.approval-pending.approval-past-sla {",
 		"counts.superseded",
 		"renderAttentionInbox",
 		"attentionFromData",

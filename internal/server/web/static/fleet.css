@@ -572,10 +572,32 @@
     background: rgba(255,255,255,.92);
   }
   .approval-card.approval-pending { border-left-color: var(--warn); background: rgba(210,153,34,.08); }
-  .approval-card.approval-stale { border-left-color: var(--line); background: rgba(139,148,158,.06); }
-  .approval-card.approval-superseded { border-left-color: var(--line); background: rgba(139,148,158,.06); }
+  .approval-card.approval-pending.approval-past-sla {
+    border-left-color: var(--bad, #dc2626);
+    background: rgba(220,38,38,.08);
+  }
+  .approval-card.approval-pending.approval-past-sla .approval-action .approval-meta::after {
+    content: "past " attr(data-sla-label) " SLA";
+    margin-left: 8px;
+    color: var(--bad, #dc2626);
+    font-weight: 650;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: .04em;
+  }
+  .approval-card.approval-stale,
+  .approval-card.approval-superseded,
+  .approval-card.approval-rejected {
+    border-left-color: var(--line);
+    background: rgba(139,148,158,.06);
+    color: var(--muted);
+  }
+  .approval-card.approval-stale .approval-action strong,
+  .approval-card.approval-superseded .approval-action strong,
+  .approval-card.approval-rejected .approval-action strong {
+    text-decoration: line-through;
+  }
   .approval-card.approval-approved { border-left-color: var(--ok); background: rgba(63,185,80,.06); }
-  .approval-card.approval-rejected { border-left-color: var(--line); background: rgba(139,148,158,.05); }
   .approval-card.approval-card-muted { background: rgba(255,255,255,.78); }
   .approval-project,
   .approval-action,

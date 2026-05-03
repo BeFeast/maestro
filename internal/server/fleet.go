@@ -334,6 +334,7 @@ type fleetApprovalState struct {
 	UpdatedAgeSeconds int64                   `json:"updated_age_seconds,omitempty"`
 	Risk              string                  `json:"risk,omitempty"`
 	Summary           string                  `json:"summary,omitempty"`
+	PastSLA           bool                    `json:"past_sla,omitempty"`
 
 	createdAt time.Time
 	updatedAt time.Time
@@ -777,9 +778,25 @@ func fleetOperatorStateIsActive(kind string) bool {
 }
 
 func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetApprovalState, now time.Time) fleetOperatorBrief {
-	_ = now
 	if len(projects) == 0 {
 		return fleetOperatorBrief{Tone: "muted", Sentence: "Global brief: no projects are configured in this fleet."}
+	}
+
+	if approval := oldestPastSLAPendingFleetApproval(approvals, now); approval != nil {
+		return fleetOperatorBrief{
+			Tone:           "daemon-down",
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval past SLA", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Project:        approval.ProjectName,
+			Kind:           "approval_pending",
+			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			NextAction:     "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now.",
+			ActionRequired: true,
+			IssueNumber:    approval.IssueNumber,
+			IssueURL:       approval.IssueURL,
+			PRNumber:       approval.PRNumber,
+			PRURL:          approval.PRURL,
+			Session:        approval.Session,
+		}
 	}
 
 	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
@@ -858,6 +875,39 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 		parts = append(parts, fleetCountPhrase(attention, "project with passive attention", "projects with passive attention"))
 	}
 	return fleetOperatorBrief{Tone: "busy", Kind: "active", Sentence: "Global brief: " + strings.Join(parts, "; ") + "; no operator action is needed right now."}
+}
+
+const fleetApprovalSLASeconds int64 = 30 * 60
+
+func fleetApprovalSLAText() string {
+	return "30m"
+}
+
+func approvalPastSLA(approval *fleetApprovalState, now time.Time) bool {
+	if approval == nil {
+		return false
+	}
+	if approval.CreatedAgeSeconds > fleetApprovalSLASeconds {
+		return true
+	}
+	if !approval.createdAt.IsZero() && now.Sub(approval.createdAt) > time.Duration(fleetApprovalSLASeconds)*time.Second {
+		return true
+	}
+	return false
+}
+
+func oldestPastSLAPendingFleetApproval(approvals []fleetApprovalState, now time.Time) *fleetApprovalState {
+	var selected *fleetApprovalState
+	for i := range approvals {
+		approval := &approvals[i]
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || !approvalPastSLA(approval, now) {
+			continue
+		}
+		if selected == nil || fleetApprovalRecency(*approval).Before(fleetApprovalRecency(*selected)) {
+			selected = approval
+		}
+	}
+	return selected
 }
 
 func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetApprovalState {
@@ -1779,6 +1829,9 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		createdAt:         createdAt,
 		updatedAt:         updatedAt,
 	}
+	if approval.Status == state.ApprovalStatusPending {
+		item.PastSLA = approvalPastSLA(&item, now)
+	}
 	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
 	return item
 }
@@ -2073,11 +2126,18 @@ func renderFleetApprovalCard(approval fleetApprovalState, muted bool) string {
 	if muted {
 		classes = append(classes, "approval-card-muted")
 	}
+	if approval.PastSLA {
+		classes = append(classes, "approval-past-sla")
+	}
+	slaLabelAttr := ""
+	if approval.PastSLA {
+		slaLabelAttr = ` data-sla-label="` + html.EscapeString(fleetApprovalSLAText()) + `"`
+	}
 	return `<article class="` + strings.Join(classes, " ") + `" title="` + summary + `">` +
 		`<div class="approval-project"><strong title="` + project + `">` + linkHTMLServer(approval.DashboardURL, project) + `</strong>` +
 		`<div class="approval-meta"><span title="` + id + `">` + id + `</span></div></div>` +
 		`<div class="approval-action"><strong title="` + action + `">` + action + `</strong>` +
-		`<div class="approval-meta"><span class="` + approvalStatusClassServer(approval.Status) + `">` + html.EscapeString(firstNonEmpty(approval.Status, "unknown")) + `</span></div></div>` +
+		`<div class="approval-meta"` + slaLabelAttr + `><span class="` + approvalStatusClassServer(approval.Status) + `">` + html.EscapeString(firstNonEmpty(approval.Status, "unknown")) + `</span></div></div>` +
 		`<div class="approval-target">` + renderFleetApprovalTargetHTML(approval) + sessionStatus + `</div>` +
 		`<div class="approval-main"><div class="approval-age"><span>Created ` + createdAge + ` ago</span><span>Updated ` + updatedAge + ` ago</span></div>` +
 		`<div class="approval-risk"><span>` + risk + `</span></div>` +
