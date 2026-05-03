@@ -322,16 +322,23 @@ Safe response:
    - `enabled` defaults to `true`.
    - `idle_after_minutes` defaults to `1440` (24 hours).
    - `require_worktree_missing` defaults to `true`.
-2. Sessions that pass all three checks (idle past the window AND a recorded worktree path AND that path is missing on disk) are removed from `attention` and recorded in `audit-log.jsonl` under the project's `state_dir` with action `stale_session_reconciled`. The sessions remain searchable in `workers` for drilldown.
-3. To temporarily disable filtering for a project, set `stale_session_reconciler.enabled: false` and restart the project runner.
-4. To tighten the window during dogfood/recovery, lower `idle_after_minutes` (for example `60` for one hour). Keep `require_worktree_missing: true` so a live worker is never reclaimed.
-5. Per-project `stale_session_reconciler` config example:
+   - `merged_pr_dismisses` defaults to `true`.
+2. A dead session is filtered from `attention` when **either** condition holds:
+   - **Idle/worktree path:** the session is past `idle_after_minutes` AND, when `require_worktree_missing` is true, its recorded worktree path is missing on disk.
+   - **Linked-PR-merged path:** the session's branch (head ref recorded as `branch` in the API, e.g. `feat/sup-44-346-…`) maps to a PR that the project state already classifies as merged. This path fires regardless of idle time, so a freshly retry-exhausted session whose PR has just merged stops haunting `attention` immediately.
+3. Reconciled sessions are recorded in `audit-log.jsonl` under the project's `state_dir` with action `stale_session_reconciled`. The audit `reason` field carries the trigger (`linked PR merged` for the new path, otherwise the legacy idle-window reason). Sessions remain searchable in `workers` for drilldown.
+4. To temporarily disable filtering for a project, set `stale_session_reconciler.enabled: false` and restart the project runner.
+5. To keep only the legacy idle/worktree behaviour from PR #400, set `stale_session_reconciler.merged_pr_dismisses: false`.
+6. To tighten the idle path during dogfood/recovery, lower `idle_after_minutes` (for example `60` for one hour). Keep `require_worktree_missing: true` so a live worker is never reclaimed.
+7. The reconciler reads PR state from the existing project state snapshot (sessions already transitioned to `done`/`code_landed`); it does not issue ad-hoc `gh` calls in the snapshot path.
+8. Per-project `stale_session_reconciler` config example:
 
 ```yaml
 stale_session_reconciler:
   enabled: true
   idle_after_minutes: 1440
   require_worktree_missing: true
+  merged_pr_dismisses: true
 ```
 
 ### Project API failure

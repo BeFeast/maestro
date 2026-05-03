@@ -24,6 +24,9 @@ repo: owner/repo
 	if !cfg.StaleSessionReconciler.WorktreeMissingRequired() {
 		t.Fatalf("default reconciler must require worktree missing")
 	}
+	if !cfg.StaleSessionReconciler.MergedPRDismissesEnabled() {
+		t.Fatalf("default reconciler must enable merged_pr_dismisses")
+	}
 }
 
 func TestParse_StaleSessionReconcilerExplicitOverride(t *testing.T) {
@@ -33,6 +36,7 @@ stale_session_reconciler:
   enabled: false
   idle_after_minutes: 90
   require_worktree_missing: false
+  merged_pr_dismisses: false
 `
 	cfg, err := parse([]byte(yaml))
 	if err != nil {
@@ -46,6 +50,9 @@ stale_session_reconciler:
 	}
 	if cfg.StaleSessionReconciler.WorktreeMissingRequired() {
 		t.Fatalf("explicit require_worktree_missing=false should disable worktree gate")
+	}
+	if cfg.StaleSessionReconciler.MergedPRDismissesEnabled() {
+		t.Fatalf("explicit merged_pr_dismisses=false must disable linked-PR path")
 	}
 }
 

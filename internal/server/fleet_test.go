@@ -2925,6 +2925,144 @@ func TestFleetAPIDisabledReconcilerKeepsAttention(t *testing.T) {
 	}
 }
 
+func TestFleetAPIDismissesDeadSessionWhenLinkedPRMerged(t *testing.T) {
+	resetFleetStaleAuditDedup()
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	presentWorktree := filepath.Join(dir, "present-worktree")
+	if err := os.MkdirAll(presentWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	finishedRecent := now.Add(-15 * time.Minute) // inside idle window
+	branch := "feat/sup-46-347-confirmation-dialog"
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"sup-46": {
+			IssueNumber: 347,
+			IssueTitle:  "Confirmation dialog",
+			PRNumber:    396,
+			Status:      state.StatusRetryExhausted,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-time.Hour),
+			FinishedAt:  &finishedRecent,
+			Worktree:    presentWorktree,
+		},
+		"sup-44": {
+			IssueNumber: 347,
+			IssueTitle:  "Confirmation dialog (merged sibling)",
+			PRNumber:    396,
+			Status:      state.StatusDone,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-2 * time.Hour),
+			FinishedAt:  &finishedRecent,
+		},
+	})
+
+	cfg := &config.Config{
+		Repo:        "owner/finance",
+		StateDir:    stateDir,
+		MaxParallel: 4,
+	}
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("finance", "/tmp/finance.yaml", "http://127.0.0.1:8788", cfg),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, worker := range resp.Attention {
+		if worker.Slot == "sup-46" {
+			t.Fatalf("sup-46 must drop out of attention when its linked PR is merged: %+v", worker)
+		}
+	}
+
+	stale := findFleetWorker(t, resp.Workers, "sup-46")
+	if stale.NeedsAttention {
+		t.Fatalf("sup-46 needs_attention should be cleared; got %+v", stale)
+	}
+	if !contains(stale.StatusReason, state.MergedPRReason) {
+		t.Fatalf("sup-46 status reason = %q, want %q reflected", stale.StatusReason, state.MergedPRReason)
+	}
+
+	auditPath := filepath.Join(stateDir, "audit-log.jsonl")
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	if !contains(string(data), state.MergedPRReason) {
+		t.Fatalf("audit log missing %q reason: %s", state.MergedPRReason, data)
+	}
+
+	// Second snapshot must not duplicate the audit entry.
+	srv.handleFleet(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil))
+	data2, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit log second pass: %v", err)
+	}
+	if !bytes.Equal(data, data2) {
+		t.Fatalf("audit log should be append-once for the same merged-PR reconciliation.\nfirst:\n%s\nsecond:\n%s", data, data2)
+	}
+}
+
+func TestFleetAPIMergedPRDismissesDisabledKeepsAttention(t *testing.T) {
+	resetFleetStaleAuditDedup()
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	presentWorktree := filepath.Join(dir, "present-worktree")
+	if err := os.MkdirAll(presentWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	finishedRecent := now.Add(-15 * time.Minute) // inside idle window
+	branch := "feat/sup-46-347-confirmation-dialog"
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"sup-46": {
+			IssueNumber: 347,
+			PRNumber:    396,
+			Status:      state.StatusRetryExhausted,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-time.Hour),
+			FinishedAt:  &finishedRecent,
+			Worktree:    presentWorktree,
+		},
+		"sup-44": {
+			IssueNumber: 347,
+			PRNumber:    396,
+			Status:      state.StatusDone,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-2 * time.Hour),
+			FinishedAt:  &finishedRecent,
+		},
+	})
+
+	mergedDisabled := false
+	cfg := &config.Config{
+		Repo:        "owner/finance",
+		StateDir:    stateDir,
+		MaxParallel: 4,
+		StaleSessionReconciler: config.StaleSessionReconcilerConfig{
+			MergedPRDismisses: &mergedDisabled,
+		},
+	}
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("finance", "/tmp/finance.yaml", "http://127.0.0.1:8788", cfg),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	stale := findFleetWorker(t, resp.Workers, "sup-46")
+	if !stale.NeedsAttention {
+		t.Fatalf("merged_pr_dismisses=false must preserve PR-#400 behavior; got %+v", stale)
+	}
+}
+
 func resetFleetStaleAuditDedup() {
 	fleetStaleAuditMu.Lock()
 	fleetStaleAuditEmitted = make(map[string]struct{})

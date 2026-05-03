@@ -1789,6 +1789,179 @@ func TestReconcileStaleSessions_IsIdempotent(t *testing.T) {
 	}
 }
 
+func TestSessionStale_LinkedMergedPRDismissesRegardlessOfIdle(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-15 * time.Minute) // well below IdleAfter window
+	sess := &Session{
+		IssueNumber: 347,
+		PRNumber:    396,
+		Status:      StatusRetryExhausted,
+		Branch:      "feat/sup-46-347-confirmation-dialog",
+		StartedAt:   finished.Add(-5 * time.Minute),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/sup-46",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+		MergedPRDismisses:      true,
+		PRStateForBranch: func(b string) string {
+			if b == "feat/sup-46-347-confirmation-dialog" {
+				return "MERGED"
+			}
+			return ""
+		},
+	}
+	worktreeExists := func(string) bool { return true } // worktree present and idle window unmet — old policy would not fire
+
+	audit, stale := SessionStale(sess, now, policy, worktreeExists)
+	if !stale {
+		t.Fatalf("session with MERGED linked PR should be reconciled regardless of idle/worktree")
+	}
+	if audit.Reason != MergedPRReason {
+		t.Fatalf("audit reason = %q, want %q", audit.Reason, MergedPRReason)
+	}
+	if audit.IssueNumber != 347 || audit.PRNumber != 396 {
+		t.Fatalf("audit target = %+v, want issue=347 pr=396", audit)
+	}
+}
+
+func TestSessionStale_NoLinkedPRFollowsLegacyPolicy(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-30 * time.Hour)
+	sess := &Session{
+		IssueNumber: 101,
+		Status:      StatusDead,
+		Branch:      "feat/sup-44-101-no-pr-yet",
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/missing-44",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+		MergedPRDismisses:      true,
+		PRStateForBranch:       func(string) string { return "" }, // no link known
+	}
+	worktreeExists := func(string) bool { return false }
+
+	audit, stale := SessionStale(sess, now, policy, worktreeExists)
+	if !stale {
+		t.Fatalf("session with no linked PR but stale-by-idle should still reconcile via legacy policy")
+	}
+	if audit.Reason == MergedPRReason {
+		t.Fatalf("audit reason should reflect legacy policy, got %q", audit.Reason)
+	}
+
+	// And: a session within the idle window with no linked PR is not dismissed.
+	freshFinished := now.Add(-5 * time.Minute)
+	fresh := &Session{
+		IssueNumber: 102,
+		Status:      StatusDead,
+		Branch:      "feat/sup-44-102",
+		StartedAt:   freshFinished.Add(-time.Hour),
+		FinishedAt:  &freshFinished,
+		Worktree:    "/tmp/missing-fresh",
+	}
+	if _, stale := SessionStale(fresh, now, policy, worktreeExists); stale {
+		t.Fatalf("session within idle window and no linked PR must not be reconciled")
+	}
+}
+
+func TestSessionStale_LinkedOpenPRIsNotDismissed(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-15 * time.Minute)
+	sess := &Session{
+		IssueNumber: 200,
+		PRNumber:    500,
+		Status:      StatusRetryExhausted,
+		Branch:      "feat/sup-1-200-still-open",
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/sup-1",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+		MergedPRDismisses:      true,
+		PRStateForBranch:       func(string) string { return "OPEN" },
+	}
+	if _, stale := SessionStale(sess, now, policy, func(string) bool { return true }); stale {
+		t.Fatalf("session whose linked PR is OPEN must not be dismissed by the merged-PR path")
+	}
+}
+
+func TestSessionStale_MergedPRDismissesDisabledIgnoresLookup(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-15 * time.Minute)
+	sess := &Session{
+		IssueNumber: 347,
+		PRNumber:    396,
+		Status:      StatusRetryExhausted,
+		Branch:      "feat/sup-46-347-confirmation-dialog",
+		StartedAt:   finished.Add(-5 * time.Minute),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/sup-46",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+		MergedPRDismisses:      false, // disabled — must match legacy behavior
+		PRStateForBranch:       func(string) string { return "MERGED" },
+	}
+	if _, stale := SessionStale(sess, now, policy, func(string) bool { return true }); stale {
+		t.Fatalf("merged_pr_dismisses=false must disable the linked-PR path")
+	}
+}
+
+func TestReconcileStaleSessions_LinkedMergedPRIsIdempotent(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-15 * time.Minute)
+	st := NewState()
+	st.Sessions["sup-46"] = &Session{
+		IssueNumber: 347,
+		PRNumber:    396,
+		Status:      StatusRetryExhausted,
+		Branch:      "feat/sup-46-347-confirmation-dialog",
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/sup-46",
+	}
+	st.Sessions["sup-99"] = &Session{
+		IssueNumber: 999,
+		Status:      StatusRunning,
+		StartedAt:   now.Add(-time.Minute),
+	}
+	lookup := func(b string) string {
+		if b == "feat/sup-46-347-confirmation-dialog" {
+			return "MERGED"
+		}
+		return ""
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+		MergedPRDismisses:      true,
+		PRStateForBranch:       lookup,
+	}
+	first := st.ReconcileStaleSessions(now, policy, func(string) bool { return true })
+	second := st.ReconcileStaleSessions(now, policy, func(string) bool { return true })
+	if len(first) != 1 || first[0].Slot != "sup-46" || first[0].Reason != MergedPRReason {
+		t.Fatalf("first pass = %+v, want one sup-46 audit with merged-PR reason", first)
+	}
+	if len(second) != 1 || second[0].Slot != first[0].Slot || second[0].Reason != first[0].Reason {
+		t.Fatalf("second pass = %+v, want identical to first", second)
+	}
+	if len(st.Sessions) != 2 {
+		t.Fatalf("state must not be mutated; sessions = %d", len(st.Sessions))
+	}
+}
+
 func TestReconcileStaleSessions_DisabledReturnsNothing(t *testing.T) {
 	now := time.Now().UTC()
 	finished := now.Add(-30 * time.Hour)

@@ -1737,11 +1737,50 @@ func reconcileStaleSessions(cfg *config.Config, st *state.State, now time.Time) 
 		Enabled:                cfg.StaleSessionReconciler.IsEnabled(),
 		IdleAfter:              time.Duration(cfg.StaleSessionReconciler.IdleAfter()) * time.Minute,
 		RequireWorktreeMissing: cfg.StaleSessionReconciler.WorktreeMissingRequired(),
+		MergedPRDismisses:      cfg.StaleSessionReconciler.MergedPRDismissesEnabled(),
 	}
 	if !policy.Enabled {
 		return nil
 	}
+	if policy.MergedPRDismisses {
+		policy.PRStateForBranch = mergedBranchLookupFromState(st)
+	}
 	return st.ReconcileStaleSessions(now, policy, worktreeExistsOnDisk)
+}
+
+// mergedBranchLookupFromState derives a branch -> PR state lookup from the
+// session table already persisted in state. A branch is reported as "MERGED"
+// when any session in state for that branch has reached StatusDone or
+// StatusCodeLanded — both terminal states are only entered after the
+// orchestrator has observed the linked PR as merged. The lookup uses no
+// network calls, so the snapshot path stays fast and side-effect free.
+func mergedBranchLookupFromState(st *state.State) func(string) string {
+	if st == nil {
+		return nil
+	}
+	merged := make(map[string]struct{})
+	for _, sess := range st.Sessions {
+		if sess == nil {
+			continue
+		}
+		branch := strings.TrimSpace(sess.Branch)
+		if branch == "" {
+			continue
+		}
+		switch sess.Status {
+		case state.StatusDone, state.StatusCodeLanded:
+			merged[branch] = struct{}{}
+		}
+	}
+	if len(merged) == 0 {
+		return func(string) string { return "" }
+	}
+	return func(branch string) string {
+		if _, ok := merged[strings.TrimSpace(branch)]; ok {
+			return "MERGED"
+		}
+		return ""
+	}
 }
 
 func worktreeExistsOnDisk(path string) bool {

@@ -80,14 +80,18 @@ worker_prompt: /path/to/worker-prompt-template.md
 # deploy_timeout_minutes: 15         # timeout for deploy command in minutes (default: 15)
 
 # Stale supervisor sessions are filtered out of the Fleet API attention list
-# only when all three guards agree. Defaults are conservative so live workers
-# are never reclassified: enabled=true, idle_after_minutes=1440 (24h),
-# require_worktree_missing=true. Set enabled=false to keep every dead session
-# in `attention` (legacy behavior).
+# under two independent conditions: (a) idle past idle_after_minutes AND the
+# recorded worktree is missing on disk (when require_worktree_missing=true),
+# or (b) the session's linked PR (matched by branch headRef) is MERGED.
+# Defaults are conservative so live workers are never reclassified:
+# enabled=true, idle_after_minutes=1440 (24h), require_worktree_missing=true,
+# merged_pr_dismisses=true. Set merged_pr_dismisses=false to keep behavior
+# limited to the idle/worktree path.
 # stale_session_reconciler:
 #   enabled: true
 #   idle_after_minutes: 1440
 #   require_worktree_missing: true
+#   merged_pr_dismisses: true
 
 # Telegram notifications
 telegram:

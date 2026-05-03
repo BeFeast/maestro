@@ -237,6 +237,7 @@ type StaleSessionReconcilerConfig struct {
 	Enabled                *bool `yaml:"enabled"`                  // default: true
 	IdleAfterMinutes       int   `yaml:"idle_after_minutes"`       // default: 1440 (24h)
 	RequireWorktreeMissing *bool `yaml:"require_worktree_missing"` // default: true
+	MergedPRDismisses      *bool `yaml:"merged_pr_dismisses"`      // default: true
 }
 
 // IsEnabled returns whether stale-session reconciliation runs.
@@ -264,6 +265,16 @@ func (c StaleSessionReconcilerConfig) IdleAfter() int {
 		return 24 * 60
 	}
 	return c.IdleAfterMinutes
+}
+
+// MergedPRDismissesEnabled reports whether a dead session whose linked PR is
+// merged should be dismissed independently of the idle/worktree window.
+// Default true.
+func (c StaleSessionReconcilerConfig) MergedPRDismissesEnabled() bool {
+	if c.MergedPRDismisses == nil {
+		return true
+	}
+	return *c.MergedPRDismisses
 }
 
 type Config struct {
