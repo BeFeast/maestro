@@ -551,6 +551,11 @@ type fleetAuditLogEntry struct {
 
 var fleetAuditLogMu sync.Mutex
 
+var (
+	fleetStaleAuditMu      sync.Mutex
+	fleetStaleAuditEmitted = make(map[string]struct{})
+)
+
 func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1490,14 +1495,32 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.ApprovalSummary[approval.Status]++
 		}
 	}
+	staleAudits := reconcileStaleSessions(cfg, st, now)
+	staleSlots := make(map[string]state.StaleSessionAudit, len(staleAudits))
+	for _, audit := range staleAudits {
+		staleSlots[audit.Slot] = audit
+	}
+	if len(staleAudits) > 0 {
+		recordStaleSessionAudits(cfg.StateDir, project.Name, staleAudits)
+	}
 	workers := make([]fleetWorkerState, 0, len(projectState.All))
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		if audit, isStale := staleSlots[worker.Slot]; isStale {
+			worker.NeedsAttention = false
+			if reason := strings.TrimSpace(audit.Reason); reason != "" {
+				worker.StatusReason = "stale session reconciled: " + reason
+			}
+			worker.NextAction = "No action required: this session was reconciled as stale by the fleet API."
+		}
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 			item.Attention = append(item.Attention, worker)
 		}
 		workers = append(workers, makeFleetWorkerState(item, worker))
+		if _, isStale := staleSlots[worker.Slot]; isStale {
+			continue
+		}
 		if isFleetWorkerDefaultVisible(worker) {
 			if len(item.Active) >= 6 {
 				continue
@@ -1507,6 +1530,66 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	}
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+func reconcileStaleSessions(cfg *config.Config, st *state.State, now time.Time) []state.StaleSessionAudit {
+	if cfg == nil || st == nil {
+		return nil
+	}
+	policy := state.StaleSessionPolicy{
+		Enabled:                cfg.StaleSessionReconciler.IsEnabled(),
+		IdleAfter:              time.Duration(cfg.StaleSessionReconciler.IdleAfter()) * time.Minute,
+		RequireWorktreeMissing: cfg.StaleSessionReconciler.WorktreeMissingRequired(),
+	}
+	if !policy.Enabled {
+		return nil
+	}
+	return st.ReconcileStaleSessions(now, policy, worktreeExistsOnDisk)
+}
+
+func worktreeExistsOnDisk(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+func recordStaleSessionAudits(stateDir, projectName string, audits []state.StaleSessionAudit) {
+	if strings.TrimSpace(stateDir) == "" || len(audits) == 0 {
+		return
+	}
+	project := strings.TrimSpace(projectName)
+	for _, audit := range audits {
+		key := project + "\x00" + audit.Slot + "\x00" + audit.Reason
+		fleetStaleAuditMu.Lock()
+		_, alreadyEmitted := fleetStaleAuditEmitted[key]
+		if !alreadyEmitted {
+			fleetStaleAuditEmitted[key] = struct{}{}
+		}
+		fleetStaleAuditMu.Unlock()
+		if alreadyEmitted {
+			continue
+		}
+		entry := fleetAuditLogEntry{
+			AuditID:   newFleetAuditID(),
+			Timestamp: audit.At.UTC().Format(time.RFC3339Nano),
+			Actor:     "fleet-reconciler",
+			Action:    "stale_session_reconciled",
+			Target:    audit.Slot,
+			Reason:    audit.Reason,
+			Project:   project,
+		}
+		if err := appendFleetAuditLogEntry(stateDir, entry); err != nil {
+			log.Printf("[fleet] stale-session audit write failed for %s: %v", audit.Slot, err)
+			fleetStaleAuditMu.Lock()
+			delete(fleetStaleAuditEmitted, key)
+			fleetStaleAuditMu.Unlock()
+		}
+	}
 }
 
 func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorState {

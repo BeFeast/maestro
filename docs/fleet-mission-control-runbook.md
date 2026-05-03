@@ -272,6 +272,28 @@ maestro supervise approve --config ~/.maestro/maestro-<project>.yaml --actor <op
 maestro supervise reject --config ~/.maestro/maestro-<project>.yaml --actor <operator> --reason "state changed" <approval-or-decision-id>
 ```
 
+### Stale supervisor sessions
+
+Mission Control indicators: `attention` shows old retry/dead sessions whose worktree has already been cleaned up or whose PR has been closed long ago, and `verdict.sentence` keeps reporting items needing attention even though no operator step is possible.
+
+Safe response:
+
+1. Confirm the project's `stale_session_reconciler` configuration before changing anything:
+   - `enabled` defaults to `true`.
+   - `idle_after_minutes` defaults to `1440` (24 hours).
+   - `require_worktree_missing` defaults to `true`.
+2. Sessions that pass all three checks (idle past the window AND a recorded worktree path AND that path is missing on disk) are removed from `attention` and recorded in `audit-log.jsonl` under the project's `state_dir` with action `stale_session_reconciled`. The sessions remain searchable in `workers` for drilldown.
+3. To temporarily disable filtering for a project, set `stale_session_reconciler.enabled: false` and restart the project runner.
+4. To tighten the window during dogfood/recovery, lower `idle_after_minutes` (for example `60` for one hour). Keep `require_worktree_missing: true` so a live worker is never reclaimed.
+5. Per-project `stale_session_reconciler` config example:
+
+```yaml
+stale_session_reconciler:
+  enabled: true
+  idle_after_minutes: 1440
+  require_worktree_missing: true
+```
+
 ### Project API failure
 
 Mission Control indicators: project card error, failed `maestro supervise`, failed `maestro status`, GraphQL/project item errors, or GitHub CLI authentication errors.

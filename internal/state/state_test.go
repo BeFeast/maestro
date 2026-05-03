@@ -1636,6 +1636,176 @@ func TestApproveChangedApprovalPayloadFailsSafely(t *testing.T) {
 	}
 }
 
+func TestSessionStale_DeadIdleAndClosedPRWithMissingWorktree(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-30 * time.Hour)
+	sess := &Session{
+		IssueNumber: 101,
+		Status:      StatusDead,
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/missing-worktree",
+		PRNumber:    42,
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+	}
+	worktreeExists := func(path string) bool { return false }
+
+	audit, stale := SessionStale(sess, now, policy, worktreeExists)
+	if !stale {
+		t.Fatalf("session should be stale: %+v", audit)
+	}
+	if audit.IssueNumber != 101 || audit.PRNumber != 42 {
+		t.Fatalf("audit target = %+v, want issue=101 pr=42", audit)
+	}
+	if audit.IdleSeconds < int64(24*time.Hour/time.Second) {
+		t.Fatalf("audit idle seconds = %d, want >= 24h", audit.IdleSeconds)
+	}
+	if audit.Reason == "" {
+		t.Fatalf("audit reason should be populated")
+	}
+}
+
+func TestSessionStale_ActiveWorktreeKeepsSessionLive(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-30 * time.Hour)
+	sess := &Session{
+		IssueNumber: 102,
+		Status:      StatusDead,
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/active-worktree",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+	}
+	worktreeExists := func(path string) bool { return true }
+
+	if _, stale := SessionStale(sess, now, policy, worktreeExists); stale {
+		t.Fatalf("session with present worktree must not be marked stale")
+	}
+}
+
+func TestSessionStale_RecentSessionIsNotStaleEvenWithMissingWorktree(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-3 * time.Hour)
+	sess := &Session{
+		IssueNumber: 103,
+		Status:      StatusDead,
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/missing",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+	}
+	worktreeExists := func(path string) bool { return false }
+
+	if _, stale := SessionStale(sess, now, policy, worktreeExists); stale {
+		t.Fatalf("session within idle window must not be reclassified")
+	}
+}
+
+func TestSessionStale_RunningSessionIsNeverStale(t *testing.T) {
+	now := time.Now().UTC()
+	sess := &Session{
+		IssueNumber: 104,
+		Status:      StatusRunning,
+		StartedAt:   now.Add(-72 * time.Hour),
+		Worktree:    "/tmp/missing",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+	}
+	if _, stale := SessionStale(sess, now, policy, func(string) bool { return false }); stale {
+		t.Fatalf("running session must never be marked stale")
+	}
+}
+
+func TestSessionStale_ScheduledRetryIsNotStale(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-30 * time.Hour)
+	retry := now.Add(15 * time.Minute)
+	sess := &Session{
+		IssueNumber: 105,
+		Status:      StatusDead,
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		NextRetryAt: &retry,
+		Worktree:    "/tmp/missing",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+	}
+	if _, stale := SessionStale(sess, now, policy, func(string) bool { return false }); stale {
+		t.Fatalf("session with pending retry must not be reclassified")
+	}
+}
+
+func TestReconcileStaleSessions_IsIdempotent(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-30 * time.Hour)
+	st := NewState()
+	st.Sessions["slot-stale"] = &Session{
+		IssueNumber: 201,
+		Status:      StatusDead,
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/missing-1",
+	}
+	st.Sessions["slot-live"] = &Session{
+		IssueNumber: 202,
+		Status:      StatusRunning,
+		StartedAt:   now.Add(-1 * time.Minute),
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+	}
+	worktreeExists := func(string) bool { return false }
+
+	first := st.ReconcileStaleSessions(now, policy, worktreeExists)
+	second := st.ReconcileStaleSessions(now, policy, worktreeExists)
+	if len(first) != 1 {
+		t.Fatalf("first pass audits = %d, want 1", len(first))
+	}
+	if len(second) != 1 || second[0].Slot != first[0].Slot {
+		t.Fatalf("second pass audits = %v, want identical to first", second)
+	}
+	if len(st.Sessions) != 2 {
+		t.Fatalf("state should not be mutated; sessions = %d", len(st.Sessions))
+	}
+}
+
+func TestReconcileStaleSessions_DisabledReturnsNothing(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-30 * time.Hour)
+	st := NewState()
+	st.Sessions["slot-1"] = &Session{
+		IssueNumber: 1,
+		Status:      StatusDead,
+		FinishedAt:  &finished,
+		StartedAt:   finished.Add(-time.Hour),
+		Worktree:    "/tmp/missing",
+	}
+	policy := StaleSessionPolicy{Enabled: false, IdleAfter: time.Hour, RequireWorktreeMissing: true}
+	if got := st.ReconcileStaleSessions(now, policy, func(string) bool { return false }); len(got) != 0 {
+		t.Fatalf("disabled policy returned %d audits, want 0", len(got))
+	}
+}
+
 func testApprovalDecision(now time.Time) SupervisorDecision {
 	return SupervisorDecision{
 		ID:                "sup-approval",

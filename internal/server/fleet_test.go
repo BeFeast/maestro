@@ -2451,6 +2451,164 @@ func dashboardSnippet(t *testing.T, body, startMarker, endMarker string) string 
 	return rest[:end]
 }
 
+func TestFleetAPIFiltersStaleSessionsFromAttention(t *testing.T) {
+	resetFleetStaleAuditDedup()
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	missingWorktree := filepath.Join(dir, "missing-worktree")
+	presentWorktree := filepath.Join(dir, "present-worktree")
+	if err := os.MkdirAll(presentWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	finishedOld := now.Add(-30 * time.Hour)
+	finishedRecent := now.Add(-2 * time.Hour)
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"stale-1": {
+			IssueNumber: 401,
+			IssueTitle:  "Old retry-exhausted with no worktree",
+			Status:      state.StatusDead,
+			StartedAt:   finishedOld.Add(-time.Hour),
+			FinishedAt:  &finishedOld,
+			Worktree:    missingWorktree,
+		},
+		"live-running": {
+			IssueNumber: 402,
+			IssueTitle:  "Healthy worker",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-2 * time.Minute),
+			Worktree:    presentWorktree,
+		},
+		"present-dead": {
+			IssueNumber: 403,
+			IssueTitle:  "Dead worker but worktree still present",
+			Status:      state.StatusDead,
+			StartedAt:   finishedOld.Add(-time.Hour),
+			FinishedAt:  &finishedOld,
+			Worktree:    presentWorktree,
+		},
+		"recent-dead": {
+			IssueNumber: 404,
+			IssueTitle:  "Recently dead worker, still inside idle window",
+			Status:      state.StatusDead,
+			StartedAt:   finishedRecent.Add(-30 * time.Minute),
+			FinishedAt:  &finishedRecent,
+			Worktree:    missingWorktree,
+		},
+	})
+
+	cfg := &config.Config{
+		Repo:        "owner/finance",
+		StateDir:    stateDir,
+		MaxParallel: 4,
+	}
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("finance", "/tmp/finance.yaml", "http://127.0.0.1:8788", cfg),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, worker := range resp.Attention {
+		if worker.Slot == "stale-1" {
+			t.Fatalf("stale-1 must not appear in attention list: %+v", worker)
+		}
+	}
+
+	stale := findFleetWorker(t, resp.Workers, "stale-1")
+	if stale.NeedsAttention {
+		t.Fatalf("stale-1 should be cleared from needs_attention but kept in workers list: %+v", stale)
+	}
+	if !contains(stale.StatusReason, "stale session reconciled") {
+		t.Fatalf("stale-1 status reason = %q, want reconciliation explanation", stale.StatusReason)
+	}
+
+	if !findFleetWorker(t, resp.Workers, "present-dead").NeedsAttention {
+		t.Fatalf("present-dead has a live worktree, must remain in attention")
+	}
+	if !findFleetWorker(t, resp.Workers, "recent-dead").NeedsAttention {
+		t.Fatalf("recent-dead is inside the idle window, must remain in attention")
+	}
+
+	auditPath := filepath.Join(stateDir, "audit-log.jsonl")
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	if !contains(string(data), "stale_session_reconciled") {
+		t.Fatalf("audit log missing reconciler entry: %s", data)
+	}
+	if !contains(string(data), "stale-1") {
+		t.Fatalf("audit log missing stale slot: %s", data)
+	}
+
+	// Second snapshot must not duplicate the audit entry.
+	w2 := httptest.NewRecorder()
+	srv.handleFleet(w2, httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil))
+	data2, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit log second pass: %v", err)
+	}
+	if !bytes.Equal(data, data2) {
+		t.Fatalf("audit log should be append-once for the same stale session.\nfirst:\n%s\nsecond:\n%s", data, data2)
+	}
+}
+
+func TestFleetAPIDisabledReconcilerKeepsAttention(t *testing.T) {
+	resetFleetStaleAuditDedup()
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	missingWorktree := filepath.Join(dir, "missing-worktree")
+	finishedOld := now.Add(-30 * time.Hour)
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"stale-1": {
+			IssueNumber: 501,
+			Status:      state.StatusDead,
+			StartedAt:   finishedOld.Add(-time.Hour),
+			FinishedAt:  &finishedOld,
+			Worktree:    missingWorktree,
+		},
+	})
+
+	disabled := false
+	cfg := &config.Config{
+		Repo:        "owner/finance",
+		StateDir:    stateDir,
+		MaxParallel: 4,
+		StaleSessionReconciler: config.StaleSessionReconcilerConfig{
+			Enabled: &disabled,
+		},
+	}
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("finance", "/tmp/finance.yaml", "http://127.0.0.1:8788", cfg),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	stale := findFleetWorker(t, resp.Workers, "stale-1")
+	if !stale.NeedsAttention {
+		t.Fatalf("disabled reconciler must not filter attention; got %+v", stale)
+	}
+
+	if _, err := os.Stat(filepath.Join(stateDir, "audit-log.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("disabled reconciler must not write audit entries; err = %v", err)
+	}
+}
+
+func resetFleetStaleAuditDedup() {
+	fleetStaleAuditMu.Lock()
+	fleetStaleAuditEmitted = make(map[string]struct{})
+	fleetStaleAuditMu.Unlock()
+}
+
 func TestFleetActionReadOnlyRejectsMutation(t *testing.T) {
 	srv := NewFleet(nil, "127.0.0.1", 8786, true)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", nil)

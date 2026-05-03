@@ -7,6 +7,48 @@ import (
 	"testing"
 )
 
+func TestParse_StaleSessionReconcilerDefaults(t *testing.T) {
+	yaml := `
+repo: owner/repo
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.StaleSessionReconciler.IsEnabled() {
+		t.Fatalf("default reconciler must be enabled")
+	}
+	if got := cfg.StaleSessionReconciler.IdleAfter(); got != 24*60 {
+		t.Fatalf("default idle after = %d minutes, want 1440", got)
+	}
+	if !cfg.StaleSessionReconciler.WorktreeMissingRequired() {
+		t.Fatalf("default reconciler must require worktree missing")
+	}
+}
+
+func TestParse_StaleSessionReconcilerExplicitOverride(t *testing.T) {
+	yaml := `
+repo: owner/repo
+stale_session_reconciler:
+  enabled: false
+  idle_after_minutes: 90
+  require_worktree_missing: false
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.StaleSessionReconciler.IsEnabled() {
+		t.Fatalf("explicit enabled=false must disable reconciler")
+	}
+	if got := cfg.StaleSessionReconciler.IdleAfter(); got != 90 {
+		t.Fatalf("idle after = %d minutes, want 90", got)
+	}
+	if cfg.StaleSessionReconciler.WorktreeMissingRequired() {
+		t.Fatalf("explicit require_worktree_missing=false should disable worktree gate")
+	}
+}
+
 func TestParse_IssueLabelsNew(t *testing.T) {
 	yaml := `
 repo: owner/repo
