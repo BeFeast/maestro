@@ -453,6 +453,29 @@ func TestSupervisorOperatorSentence(t *testing.T) {
 			want:   "Checking runtime outcome health before sending more work.",
 		},
 		{
+			name:   "merge pr",
+			action: "merge_pr",
+			target: &state.SupervisorTarget{PR: 12},
+			want:   "Merging PR #12 now that checks and review allow it.",
+		},
+		{
+			name:   "skip wave",
+			action: "skip_wave",
+			want:   "Skipped this tick because the wave policy held the next worker.",
+		},
+		{
+			name:   "wait for review",
+			action: "wait_for_review",
+			target: &state.SupervisorTarget{PR: 12},
+			want:   "Waiting on review for PR #12.",
+		},
+		{
+			name:   "wait for ci",
+			action: "wait_for_ci",
+			target: &state.SupervisorTarget{PR: 12},
+			want:   "Waiting on CI for PR #12.",
+		},
+		{
 			name:    "unknown keeps raw action",
 			action:  "custom_new_action",
 			summary: "worker paused for external system",

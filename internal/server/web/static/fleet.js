@@ -150,17 +150,21 @@ function issueSummaryText(worker) {
 
 function actionLabel(action) {
   switch (String(action || "").trim()) {
-  case "none": return "Skip tick";
-  case "monitor_open_pr": return "Watch PR";
-  case "approve_merge": return "Merge PR";
-  case "spawn_worker": return "Start worker";
+  case "none": return "Skipped tick";
+  case "monitor_open_pr": return "Watching PR";
+  case "merge_pr": return "Merging PR";
+  case "approve_merge": return "Ready to merge PR";
+  case "skip_wave": return "Skipped tick";
+  case "spawn_worker": return "Starting worker";
   case "label_issue_ready": return "Mark issue ready";
   case "review_retry_exhausted": return "Review retry-exhausted work";
   case "check_outcome_health": return "Check runtime health";
+  case "wait_for_review": return "Waiting on review";
+  case "wait_for_ci": return "Waiting on CI";
   case "wait_for_running_worker":
-  case "wait_for_worker": return "Wait for worker";
-  case "wait_for_capacity": return "Wait for free slot";
-  case "wait_for_ordered_queue": return "Wait for queue order";
+  case "wait_for_worker": return "Waiting for worker";
+  case "wait_for_capacity": return "Waiting for free slot";
+  case "wait_for_ordered_queue": return "Waiting for queue order";
   default:
     return String(action || "-").replace(/_/g, " ");
   }
@@ -1940,7 +1944,16 @@ function supervisorDecisionMetaText(item) {
 function supervisorOperatorSentence(item) {
   if (item && item.operator_sentence) return item.operator_sentence;
   const raw = rawSupervisorAction(item && (item.recommended_action || item.action));
-  if (raw === "none") return "Skipped this tick because no safe action was available.";
+  switch (raw) {
+  case "none": return "Skipped this tick because no safe action was available.";
+  case "monitor_open_pr": return "Watching the open PR until checks and review pass.";
+  case "merge_pr": return "Merging the PR now that checks and review allow it.";
+  case "approve_merge": return "Ready to merge the PR when approval and checks allow it.";
+  case "skip_wave": return "Skipped this tick because the wave policy held the next worker.";
+  case "spawn_worker": return "Starting a worker for the selected issue.";
+  case "wait_for_review": return "Waiting on review for the open PR.";
+  case "wait_for_ci": return "Waiting on CI for the open PR.";
+  }
   const summary = String(item && item.summary || "").trim();
   if (summary) return "Supervisor chose " + raw + ". " + summary;
   return "Supervisor chose " + raw + ". Inspect diagnostics for details.";
