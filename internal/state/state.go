@@ -1731,3 +1731,128 @@ func (s *State) PruneOldSessions(maxAge time.Duration) int {
 	}
 	return pruned
 }
+
+// StaleSessionPolicy controls reconciliation of sessions that have been idle
+// past their useful lifetime. The policy is intentionally conservative so a
+// live worker is never reclassified as stale.
+type StaleSessionPolicy struct {
+	// Enabled turns on stale-session reconciliation. When false, the helpers
+	// in this file always report sessions as live.
+	Enabled bool
+	// IdleAfter is the minimum time a session must be idle (no state writes,
+	// finished/started in the past) before it can be considered stale.
+	IdleAfter time.Duration
+	// RequireWorktreeMissing demands that the recorded worktree path does not
+	// exist on disk before a session is considered stale. Together with the
+	// idle window this prevents a live worker that simply has not written
+	// state recently from being filtered out.
+	RequireWorktreeMissing bool
+}
+
+// StaleSessionAudit records a single stale-session reconciliation event.
+// Callers persist this through a project's audit log; it is not stored in
+// state.json so historical records remain even if state is rewritten.
+type StaleSessionAudit struct {
+	Slot        string    `json:"slot"`
+	IssueNumber int       `json:"issue_number,omitempty"`
+	PRNumber    int       `json:"pr_number,omitempty"`
+	Status      string    `json:"status,omitempty"`
+	Reason      string    `json:"reason"`
+	IdleSeconds int64     `json:"idle_seconds"`
+	At          time.Time `json:"at"`
+}
+
+// SessionStale reports whether a session should be filtered from operator
+// attention because the recorded worker has clearly stopped progressing.
+// The optional worktreeExists callback lets callers inject filesystem checks
+// without leaking os.Stat into the state package boundary.
+func SessionStale(sess *Session, now time.Time, policy StaleSessionPolicy, worktreeExists func(string) bool) (StaleSessionAudit, bool) {
+	if sess == nil || !policy.Enabled {
+		return StaleSessionAudit{}, false
+	}
+	if policy.IdleAfter <= 0 {
+		return StaleSessionAudit{}, false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	// Live workers and waiting-for-CI sessions are never stale: they are
+	// actively progressing or expected to progress without operator help.
+	switch sess.Status {
+	case StatusRunning, StatusPROpen, StatusQueued, StatusCodeLanded, StatusDone:
+		return StaleSessionAudit{}, false
+	}
+	// Sessions with a scheduled retry are still "in flight" by policy.
+	if sess.NextRetryAt != nil && now.Before(sess.NextRetryAt.UTC()) {
+		return StaleSessionAudit{}, false
+	}
+
+	changedAt := SessionChangedAt(sess)
+	if changedAt.IsZero() {
+		return StaleSessionAudit{}, false
+	}
+	idle := now.Sub(changedAt)
+	if idle < policy.IdleAfter {
+		return StaleSessionAudit{}, false
+	}
+
+	if policy.RequireWorktreeMissing {
+		// We must have positive evidence (a recorded worktree path that no
+		// longer exists on disk) before reclassifying a session as stale.
+		// Without that evidence, the session is left alone so a live worker
+		// is never reclaimed by the reconciler.
+		worktreePath := strings.TrimSpace(sess.Worktree)
+		if worktreePath == "" || worktreeExists == nil || worktreeExists(worktreePath) {
+			return StaleSessionAudit{}, false
+		}
+	}
+
+	reason := stalenessReason(sess, idle, policy)
+	return StaleSessionAudit{
+		Slot:        "",
+		IssueNumber: sess.IssueNumber,
+		PRNumber:    sess.PRNumber,
+		Status:      string(sess.Status),
+		Reason:      reason,
+		IdleSeconds: int64(idle.Round(time.Second) / time.Second),
+		At:          now,
+	}, true
+}
+
+func stalenessReason(sess *Session, idle time.Duration, policy StaleSessionPolicy) string {
+	idleHours := int(idle.Round(time.Hour) / time.Hour)
+	if policy.RequireWorktreeMissing {
+		return fmt.Sprintf("idle %dh and worktree no longer present", idleHours)
+	}
+	return fmt.Sprintf("idle %dh past reconciliation window", idleHours)
+}
+
+// ReconcileStaleSessions returns audit records for every session in the state
+// that the policy classifies as stale. The state is not mutated: callers use
+// the audit list to decide what to filter from operator-facing surfaces and to
+// emit audit-log entries.
+func (s *State) ReconcileStaleSessions(now time.Time, policy StaleSessionPolicy, worktreeExists func(string) bool) []StaleSessionAudit {
+	if s == nil || !policy.Enabled {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	slots := make([]string, 0, len(s.Sessions))
+	for slot := range s.Sessions {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+	audits := make([]StaleSessionAudit, 0)
+	for _, slot := range slots {
+		sess := s.Sessions[slot]
+		audit, stale := SessionStale(sess, now, policy, worktreeExists)
+		if !stale {
+			continue
+		}
+		audit.Slot = slot
+		audits = append(audits, audit)
+	}
+	return audits
+}
