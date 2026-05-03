@@ -1252,7 +1252,6 @@ function renderFleetVerdict(brief, verdict) {
   if (brief && brief.project) metaParts.push("Focus: " + brief.project);
   fleetVerdictEl.className = "fleet-verdict verdict-" + tone;
   fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
-    '<div class="fleet-verdict-kicker">Fleet status</div>' +
     '<div class="fleet-verdict-headline">' + escapeText(headline) + '</div>' +
     '<div class="fleet-verdict-meta">' + escapeText(metaParts.join(" · ")) + '</div>' +
   '</div>';

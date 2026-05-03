@@ -107,11 +107,13 @@
     content: "";
     position: absolute;
     left: 34px;
+    top: 50%;
     width: 14px;
     height: 14px;
     border-radius: 50%;
     background: var(--brand-a);
     box-shadow: 0 0 18px rgba(5,150,105,.45);
+    transform: translateY(-50%);
   }
   .fleet-verdict.verdict-healthy { border-left-color: var(--ok); background: #fff; }
   .fleet-verdict.verdict-healthy::before { background: var(--ok); }
@@ -1548,31 +1550,22 @@
   }
 
   .fleet-verdict {
-    min-height: 108px;
-    align-items: flex-start;
+    min-height: 86px;
+    align-items: center;
     padding-top: 18px;
     padding-bottom: 18px;
   }
 
   .fleet-verdict-copy {
     display: grid;
-    gap: 6px;
-  }
-
-  .fleet-verdict-kicker {
-    color: var(--text-faint);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    font-weight: 650;
-    letter-spacing: .08em;
-    text-transform: uppercase;
+    gap: 4px;
   }
 
   .fleet-verdict-headline {
-    font-size: clamp(24px, 2.8vw, 38px);
-    line-height: 1.05;
-    font-weight: 760;
-    max-width: 18ch;
+    font-size: clamp(18px, 1.45vw, 24px);
+    line-height: 1.2;
+    font-weight: 720;
+    max-width: none;
   }
 
   .fleet-verdict-meta {
@@ -2030,3 +2023,543 @@
     .fleet-search-result { grid-template-columns: 76px minmax(0, 1fr); }
     .fleet-search-target { grid-column: 2; }
   }
+
+  /* Reference light-theme pass: match Mock A's calmer status-board hierarchy. */
+  body[data-page="fleet"] {
+    background: #f7f8fa;
+    color: #2f3339;
+  }
+
+  body[data-page="fleet"] .fleet-header,
+  body[data-page="fleet"] main {
+    padding-left: clamp(64px, 4.7vw, 100px);
+    padding-right: clamp(64px, 4.7vw, 100px);
+  }
+
+  body[data-page="fleet"] .fleet-header {
+    min-height: 118px;
+    padding-top: 30px;
+    padding-bottom: 30px;
+    border-bottom-color: #d2d6de;
+    background: #fff;
+    box-shadow: none;
+  }
+
+  body[data-page="fleet"] main {
+    padding-top: 34px;
+    background: #f7f8fa;
+  }
+
+  body[data-page="fleet"] .brand-heading {
+    gap: 18px;
+  }
+
+  body[data-page="fleet"] .brand-mark-letter {
+    display: grid;
+    place-items: center;
+    width: 56px;
+    height: 56px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, #685cf6, #a985f3);
+    color: #111318;
+    font-family: var(--font-mono);
+    font-size: 26px;
+    font-weight: 760;
+  }
+
+  body[data-page="fleet"] h1 {
+    font-size: 30px;
+    line-height: 1.08;
+    font-weight: 720;
+  }
+
+  body[data-page="fleet"] .sub {
+    color: #7a7f88;
+    font-size: 24px;
+    line-height: 1.35;
+  }
+
+  body[data-page="fleet"] #subtitle {
+    font-family: var(--font-mono);
+    font-size: 22px;
+  }
+
+  body[data-page="fleet"] .header-actions {
+    gap: 18px;
+  }
+
+  body[data-page="fleet"] .mode-pill {
+    min-height: 44px;
+    padding: 0 18px;
+    border-color: #b7bcc7;
+    border-radius: 999px;
+    color: #5c6068;
+    font-size: 20px;
+    font-weight: 650;
+    letter-spacing: .04em;
+  }
+
+  body[data-page="fleet"] .fleet-search-trigger {
+    min-height: 44px;
+    border-color: #d2d6de;
+    color: #5c6068;
+    font-size: 15px;
+  }
+
+  body[data-page="fleet"] .refresh-button,
+  body[data-page="fleet"] .user-chip {
+    width: 54px;
+    height: 54px;
+    border-color: #d2d6de;
+    color: #5c6068;
+    font-size: 24px;
+  }
+
+  body[data-page="fleet"] .user-chip {
+    background: #e8ebf0;
+    font-size: 20px;
+  }
+
+  body[data-page="fleet"] .fleet-verdict-shell {
+    margin-bottom: 30px;
+  }
+
+  body[data-page="fleet"] .fleet-verdict {
+    min-height: 116px;
+    padding: 24px 32px 24px 118px;
+    border-color: #d2d6de;
+    border-left-width: 5px;
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: none;
+  }
+
+  body[data-page="fleet"] .fleet-verdict::before {
+    left: 58px;
+    width: 18px;
+    height: 18px;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+
+  body[data-page="fleet"] .fleet-verdict-headline {
+    max-width: none;
+    color: #0d0f12;
+    font-size: clamp(26px, 1.65vw, 32px);
+    font-weight: 560;
+    line-height: 1.28;
+    letter-spacing: -.01em;
+  }
+
+  body[data-page="fleet"] .fleet-verdict-meta {
+    color: #7a7f88;
+    font-family: var(--font-mono);
+    font-size: 22px;
+    line-height: 1.35;
+  }
+
+  body[data-page="fleet"] .fleet-verdict.verdict-healthy {
+    border-left-color: #3dd68c;
+  }
+
+  body[data-page="fleet"] .fleet-verdict.verdict-attention {
+    border-left-color: #d14c11;
+    background: #fffaf1;
+  }
+
+  body[data-page="fleet"] .stats {
+    min-height: 210px;
+    margin-bottom: 44px;
+    border-color: #d2d6de;
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: none;
+  }
+
+  body[data-page="fleet"] .stat {
+    padding: 30px;
+    border-right-color: #d2d6de;
+  }
+
+  body[data-page="fleet"] .stat-label {
+    color: #7a7f88;
+    font-size: 22px;
+    letter-spacing: .12em;
+  }
+
+  body[data-page="fleet"] .stat strong {
+    color: #0d0f12;
+    font-size: clamp(52px, 3.7vw, 64px);
+    font-weight: 520;
+  }
+
+  body[data-page="fleet"] .stat-suffix,
+  body[data-page="fleet"] .stat-note {
+    color: #7a7f88;
+    font-family: var(--font-mono);
+    font-size: 22px;
+  }
+
+  body[data-page="fleet"] .stat-sparkline {
+    height: 42px;
+  }
+
+  body[data-page="fleet"] .project-rail {
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  body[data-page="fleet"] .project-rail-head {
+    padding: 0 0 24px;
+    background: transparent;
+  }
+
+  body[data-page="fleet"] .project-rail-head h2 {
+    color: #0d0f12;
+    font-size: 28px;
+    font-weight: 720;
+  }
+
+  body[data-page="fleet"] .project-rail-head .sub,
+  body[data-page="fleet"] .project-rail-head .section-note {
+    display: none;
+  }
+
+  body[data-page="fleet"] .project-rail-controls {
+    grid-template-columns: minmax(320px, 420px) auto;
+    padding: 0 0 20px;
+    border-bottom: 0;
+    background: transparent;
+  }
+
+  body[data-page="fleet"] .project-rail-controls input {
+    height: 54px;
+    border-color: #d2d6de;
+    border-radius: 10px;
+    color: #2f3339;
+    font-size: 24px;
+  }
+
+  body[data-page="fleet"] .project-segments {
+    min-height: 54px;
+    border-color: #d2d6de;
+    border-radius: 10px;
+    background: #fff;
+  }
+
+  body[data-page="fleet"] .segment {
+    height: 42px;
+    padding: 0 18px;
+    color: #5c6068;
+    font-size: 20px;
+  }
+
+  body[data-page="fleet"] .segment b {
+    min-width: 24px;
+    color: #5c6068;
+    font-size: 16px;
+  }
+
+  body[data-page="fleet"] .project-rail-scroll {
+    overflow: hidden;
+    border: 1px solid #d2d6de;
+    border-radius: 12px;
+    background: #fff;
+  }
+
+  body[data-page="fleet"] .project-rail-table th {
+    padding: 24px 34px;
+    background: #f1f3f6;
+    color: #7a7f88;
+    font-size: 20px;
+    letter-spacing: .12em;
+  }
+
+  body[data-page="fleet"] .project-rail-table td {
+    padding: 26px 34px;
+    border-bottom-color: #e4e7ec;
+  }
+
+  body[data-page="fleet"] .rail-project-name {
+    color: #0d0f12;
+    font-size: 26px;
+    font-weight: 720;
+  }
+
+  body[data-page="fleet"] .rail-project-repo,
+  body[data-page="fleet"] .rail-subline,
+  body[data-page="fleet"] .rail-note,
+  body[data-page="fleet"] .rail-warn,
+  body[data-page="fleet"] .rail-alert,
+  body[data-page="fleet"] .rail-mainline,
+  body[data-page="fleet"] .rail-links,
+  body[data-page="fleet"] .rail-open-link {
+    font-family: var(--font-mono);
+    font-size: 20px;
+    line-height: 1.35;
+  }
+
+  body[data-page="fleet"] .project-rail .pill,
+  body[data-page="fleet"] .outcome-pill {
+    min-height: 40px;
+    padding: 0 18px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 20px;
+  }
+
+  body[data-page="fleet"] .project-row-attention,
+  body[data-page="fleet"] .project-row-stale_worker,
+  body[data-page="fleet"] .project-row-dispatch_failure,
+  body[data-page="fleet"] .project-row-outcome_drift {
+    background: #fff5f5;
+  }
+
+  body[data-page="fleet"] .project-row-queue_blocked,
+  body[data-page="fleet"] .project-row-no_eligible_issues,
+  body[data-page="fleet"] .project-row-outcome_missing,
+  body[data-page="fleet"] .project-row-stale,
+  body[data-page="fleet"] .project-row-unconfigured,
+  body[data-page="fleet"] .project-row--unconfigured {
+    background: #fffaf1;
+  }
+
+  @media (max-width: 1100px) {
+    body[data-page="fleet"] .fleet-header,
+    body[data-page="fleet"] main {
+      padding-left: 24px;
+      padding-right: 24px;
+    }
+
+    body[data-page="fleet"] .stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    body[data-page="fleet"] .project-rail-table th,
+    body[data-page="fleet"] .project-rail-table td {
+      padding-inline: 18px;
+    }
+  }
+
+  /* Mock A sizing pass: use the design CSS scale, not @2x screenshot pixels. */
+  body[data-page="fleet"] {
+    background: #f7f8fa;
+    color: #2f3339;
+    font-size: 13px;
+  }
+
+  body[data-page="fleet"] .fleet-header,
+  body[data-page="fleet"] main {
+    padding-left: clamp(28px, 4.6vw, 80px);
+    padding-right: clamp(28px, 4.6vw, 80px);
+  }
+
+  body[data-page="fleet"] .fleet-header {
+    min-height: 78px;
+    padding-top: 18px;
+    padding-bottom: 18px;
+  }
+
+  body[data-page="fleet"] main {
+    padding-top: 24px;
+  }
+
+  body[data-page="fleet"] .brand-heading {
+    gap: 12px;
+  }
+
+  body[data-page="fleet"] .brand-mark-letter {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    font-size: 16px;
+  }
+
+  body[data-page="fleet"] h1 {
+    font-size: 22px;
+    font-weight: 680;
+  }
+
+  body[data-page="fleet"] #subtitle,
+  body[data-page="fleet"] .sub {
+    font-size: 14px;
+  }
+
+  body[data-page="fleet"] .header-actions {
+    gap: 10px;
+  }
+
+  body[data-page="fleet"] .mode-pill {
+    min-height: 32px;
+    padding: 0 14px;
+    font-size: 13px;
+  }
+
+  body[data-page="fleet"] .fleet-search-trigger {
+    min-height: 32px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  body[data-page="fleet"] .fleet-search-trigger kbd {
+    font-size: 10px;
+  }
+
+  body[data-page="fleet"] .refresh-button,
+  body[data-page="fleet"] .user-chip {
+    width: 34px;
+    height: 34px;
+    font-size: 16px;
+  }
+
+  body[data-page="fleet"] .user-chip {
+    font-size: 13px;
+  }
+
+  body[data-page="fleet"] .fleet-verdict-shell {
+    margin-bottom: 16px;
+  }
+
+  body[data-page="fleet"] .fleet-verdict {
+    min-height: 84px;
+    padding: 16px 18px 16px 64px;
+    border-left-width: 4px;
+    border-radius: 8px;
+  }
+
+  body[data-page="fleet"] .fleet-verdict::before {
+    left: 34px;
+    width: 10px;
+    height: 10px;
+  }
+
+  body[data-page="fleet"] .fleet-verdict-headline {
+    font-size: 15px;
+    font-weight: 560;
+    line-height: 1.4;
+  }
+
+  body[data-page="fleet"] .fleet-verdict-meta {
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  body[data-page="fleet"] .stats {
+    min-height: 106px;
+    margin-bottom: 28px;
+    border-radius: 8px;
+  }
+
+  body[data-page="fleet"] .stat {
+    padding: 14px 16px;
+  }
+
+  body[data-page="fleet"] .stat-label {
+    font-size: 11px;
+    letter-spacing: .08em;
+  }
+
+  body[data-page="fleet"] .stat strong {
+    font-size: 30px;
+    font-weight: 540;
+  }
+
+  body[data-page="fleet"] .stat-suffix {
+    font-size: 14px;
+  }
+
+  body[data-page="fleet"] .stat-note {
+    font-size: 12px;
+  }
+
+  body[data-page="fleet"] .stat-sparkline {
+    height: 24px;
+    margin-top: 6px;
+    gap: 2px;
+  }
+
+  body[data-page="fleet"] .project-rail-head {
+    padding-bottom: 14px;
+  }
+
+  body[data-page="fleet"] .project-rail-head h2 {
+    font-size: 20px;
+  }
+
+  body[data-page="fleet"] .project-rail-controls {
+    grid-template-columns: minmax(260px, 360px) auto;
+    padding-bottom: 12px;
+  }
+
+  body[data-page="fleet"] .project-rail-controls input {
+    height: 36px;
+    border-radius: 8px;
+    font-size: 14px;
+    padding: 7px 12px;
+  }
+
+  body[data-page="fleet"] .project-segments {
+    min-height: 36px;
+    border-radius: 8px;
+  }
+
+  body[data-page="fleet"] .segment {
+    height: 28px;
+    padding: 0 10px;
+    font-size: 13px;
+  }
+
+  body[data-page="fleet"] .segment b {
+    min-width: 18px;
+    font-size: 12px;
+  }
+
+  body[data-page="fleet"] .project-rail-scroll {
+    border-radius: 8px;
+  }
+
+  body[data-page="fleet"] .project-rail-table th {
+    padding: 14px 18px;
+    font-size: 12px;
+    letter-spacing: .08em;
+  }
+
+  body[data-page="fleet"] .project-rail-table td {
+    padding: 18px;
+  }
+
+  body[data-page="fleet"] .rail-project-name {
+    font-size: 16px;
+  }
+
+  body[data-page="fleet"] .rail-project-repo,
+  body[data-page="fleet"] .rail-subline,
+  body[data-page="fleet"] .rail-note,
+  body[data-page="fleet"] .rail-warn,
+  body[data-page="fleet"] .rail-alert,
+  body[data-page="fleet"] .rail-mainline,
+  body[data-page="fleet"] .rail-links,
+  body[data-page="fleet"] .rail-open-link {
+    font-size: 12px;
+  }
+
+  body[data-page="fleet"] .project-rail .pill,
+  body[data-page="fleet"] .outcome-pill {
+    min-height: 28px;
+    padding: 0 12px;
+    font-size: 12px;
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
+  body[data-page="fleet"] .project-rail-project { width: 18%; }
+  body[data-page="fleet"] .project-rail-state-cell { width: 17%; }
+  body[data-page="fleet"] .project-rail-queue-cell { width: 17%; }
+  body[data-page="fleet"] .project-rail-pr-cell { width: 10%; }
+  body[data-page="fleet"] .project-rail-outcome-cell { width: 23%; }
+  body[data-page="fleet"] .project-rail-freshness-cell { width: 9%; }
+  body[data-page="fleet"] .project-rail-links-cell { width: 6%; }
