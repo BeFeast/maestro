@@ -152,7 +152,7 @@ function actionLabel(action) {
   case "none": return "Skipped tick";
   case "monitor_open_pr": return "Watching PR";
   case "merge_pr": return "Merging PR";
-  case "approve_merge": return "Merging PR";
+  case "approve_merge": return "Ready to merge PR";
   case "skip_wave": return "Skipped tick";
   case "spawn_worker": return "Starting worker";
   case "label_issue_ready": return "Mark issue ready";
