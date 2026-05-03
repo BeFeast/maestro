@@ -1739,7 +1739,7 @@ func TestFleetDashboard(t *testing.T) {
 		"approval-history-link-card",
 		"Open full approval audit",
 		"Safe recommendation",
-		"Start worker",
+		"Starting worker",
 		".approval-card.approval-stale { border-left-color: var(--line);",
 		".approval-card.approval-superseded { border-left-color: var(--line);",
 		".a-stale { color: var(--muted);",

@@ -389,8 +389,12 @@ func supervisorOperatorSentence(action, summary string, target *state.Supervisor
 		return "Skipped this tick because no safe action was available."
 	case "monitor_open_pr":
 		return fmt.Sprintf("Watching %s until checks and review pass.", pr)
+	case "merge_pr":
+		return fmt.Sprintf("Merging %s now that checks and review allow it.", pr)
 	case "approve_merge":
 		return fmt.Sprintf("Ready to merge %s when approval and checks allow it.", pr)
+	case "skip_wave":
+		return "Skipped this tick because the wave policy held the next worker."
 	case "spawn_worker":
 		return fmt.Sprintf("Starting a worker for %s.", issue)
 	case "label_issue_ready":
@@ -402,6 +406,10 @@ func supervisorOperatorSentence(action, summary string, target *state.Supervisor
 		return fmt.Sprintf("Reviewing retry-exhausted work for %s before dispatching again.", issue)
 	case "check_outcome_health":
 		return "Checking runtime outcome health before sending more work."
+	case "wait_for_review":
+		return fmt.Sprintf("Waiting on review for %s.", pr)
+	case "wait_for_ci":
+		return fmt.Sprintf("Waiting on CI for %s.", pr)
 	case "wait_for_running_worker", "wait_for_worker":
 		return fmt.Sprintf("Waiting for %s to finish.", session)
 	case "wait_for_capacity":
