@@ -1857,6 +1857,115 @@ func TestFleetDashboardCanClearProjectWorkerScope(t *testing.T) {
 	}
 }
 
+func TestFleetDashboardRendersReadOnlySearchPalette(t *testing.T) {
+	body := fleetDashboardBody(t)
+	for _, want := range []string{
+		`id="fleet-search-trigger"`,
+		`aria-controls="fleet-search-dialog"`,
+		`id="fleet-search-dialog"`,
+		`role="dialog"`,
+		`id="fleet-search-input"`,
+		`id="fleet-search-results"`,
+		`role="listbox"`,
+		"Cmd/Ctrl K",
+		"Project slug, session slot, issue #, PR #, or dashboard",
+		"No write actions run from search.",
+		"buildFleetSearchIndex",
+		"scoreFleetSearchResult",
+		"selectFleetSearchResult",
+		"fleet-search-open",
+	} {
+		if !contains(body, want) {
+			t.Fatalf("dashboard search palette should contain %q", want)
+		}
+	}
+}
+
+func TestFleetDashboardSearchIndexUsesLoadedFleetData(t *testing.T) {
+	body := fleetDashboardBody(t)
+	indexSnippet := dashboardSnippet(t, body, "function buildFleetSearchIndex()", "function fuzzySearchMatch")
+	for _, want := range []string{
+		"for (const project of fleetState.projects || [])",
+		"for (const worker of fleetState.workers || [])",
+		"for (const approval of fleetState.approvals || [])",
+		`kind: "Project"`,
+		`kind: "Dashboard"`,
+		`kind: "Session"`,
+		`kind: "Issue"`,
+		`kind: "PR"`,
+		"project.dashboard_url",
+		"const url = searchProjectURL(project);",
+		"worker.slot",
+		"worker.issue_number",
+		"worker.pr_number",
+		`searchNumberAliases("issue", worker.issue_number)`,
+		`searchNumberAliases("pr", worker.pr_number)`,
+		"approval.issue_number",
+		"approval.pr_number",
+	} {
+		if !contains(indexSnippet, want) {
+			t.Fatalf("search index should contain %q in:\n%s", want, indexSnippet)
+		}
+	}
+}
+
+func TestFleetDashboardSearchRanksDefaultResultsBeforeLimit(t *testing.T) {
+	body := fleetDashboardBody(t)
+	searchSnippet := dashboardSnippet(t, body, "function searchFleetResults(query)", "function searchResultID")
+	for _, want := range []string{
+		"const limit = searchTerms(query).length ? 12 : 10;",
+		"scoreFleetSearchResult(result, query)",
+		".sort((left, right) => {",
+		".slice(0, limit)",
+	} {
+		if !contains(searchSnippet, want) {
+			t.Fatalf("search results should contain %q in:\n%s", want, searchSnippet)
+		}
+	}
+	if contains(searchSnippet, "if (!searchTerms(query).length) return index.slice(0, 10);") {
+		t.Fatalf("default search results should be ranked before truncating in:\n%s", searchSnippet)
+	}
+}
+
+func TestFleetDashboardSearchKeyboardAndSelectionAreReadOnly(t *testing.T) {
+	body := fleetDashboardBody(t)
+	for _, want := range []string{
+		"function isSearchShortcut(event)",
+		"(event.metaKey || event.ctrlKey)",
+		`toLowerCase() === "k"`,
+		"openSearchPalette();",
+		`event.key === "ArrowDown"`,
+		`event.key === "ArrowUp"`,
+		`event.key === "Enter"`,
+		`event.key === "Escape"`,
+	} {
+		if !contains(body, want) {
+			t.Fatalf("search keyboard support should contain %q", want)
+		}
+	}
+
+	inputKeydownSnippet := dashboardSnippet(t, body, `searchInputEl.addEventListener("keydown"`, `projectFilterEl.addEventListener`)
+	if !contains(inputKeydownSnippet, "event.stopPropagation();") {
+		t.Fatalf("search input Escape handler should stop propagation in:\n%s", inputKeydownSnippet)
+	}
+
+	selectionSnippet := dashboardSnippet(t, body, "function openSearchURL(url)", "function workerSearchText(worker)")
+	for _, want := range []string{
+		`window.open(target, "_blank", "noopener,noreferrer")`,
+		"selectWorker(result.project, result.slot)",
+		"scopeSearchProject(result.project)",
+	} {
+		if !contains(selectionSnippet, want) {
+			t.Fatalf("search selection should contain %q in:\n%s", want, selectionSnippet)
+		}
+	}
+	for _, unwanted := range []string{"fetch(", "/api/v1/fleet/actions", "renderActions", "action-btn", http.MethodPost} {
+		if contains(selectionSnippet, unwanted) {
+			t.Fatalf("search selection should not expose write behavior %q in:\n%s", unwanted, selectionSnippet)
+		}
+	}
+}
+
 func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
