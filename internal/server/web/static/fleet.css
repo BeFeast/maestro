@@ -576,7 +576,7 @@
     border-left-color: var(--bad, #dc2626);
     background: rgba(220,38,38,.08);
   }
-  .approval-card.approval-pending.approval-past-sla .approval-meta::after {
+  .approval-card.approval-pending.approval-past-sla .approval-action .approval-meta::after {
     content: "past " attr(data-sla-label) " SLA";
     margin-left: 8px;
     color: var(--bad, #dc2626);

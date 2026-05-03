@@ -782,22 +782,31 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 		return fleetOperatorBrief{Tone: "muted", Sentence: "Global brief: no projects are configured in this fleet."}
 	}
 
-	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
-		tone := "attention"
-		label := "Approval pending"
-		nextAction := "Approve or reject the pending supervisor approval after checking the target state."
-		if approvalPastSLA(approval, now) {
-			tone = "daemon-down"
-			label = "Approval past SLA"
-			nextAction = "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now."
-		}
+	if approval := oldestPastSLAPendingFleetApproval(approvals, now); approval != nil {
 		return fleetOperatorBrief{
-			Tone:           tone,
-			Sentence:       fleetActionRequiredSentence(approval.ProjectName, label, approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Tone:           "daemon-down",
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval past SLA", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
 			Project:        approval.ProjectName,
 			Kind:           "approval_pending",
 			Reason:         truncateFleetOperatorText(approval.Summary, 150),
-			NextAction:     nextAction,
+			NextAction:     "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now.",
+			ActionRequired: true,
+			IssueNumber:    approval.IssueNumber,
+			IssueURL:       approval.IssueURL,
+			PRNumber:       approval.PRNumber,
+			PRURL:          approval.PRURL,
+			Session:        approval.Session,
+		}
+	}
+
+	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
+		return fleetOperatorBrief{
+			Tone:           "attention",
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval pending", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Project:        approval.ProjectName,
+			Kind:           "approval_pending",
+			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			NextAction:     "Approve or reject the pending supervisor approval after checking the target state.",
 			ActionRequired: true,
 			IssueNumber:    approval.IssueNumber,
 			IssueURL:       approval.IssueURL,
@@ -885,6 +894,20 @@ func approvalPastSLA(approval *fleetApprovalState, now time.Time) bool {
 		return true
 	}
 	return false
+}
+
+func oldestPastSLAPendingFleetApproval(approvals []fleetApprovalState, now time.Time) *fleetApprovalState {
+	var selected *fleetApprovalState
+	for i := range approvals {
+		approval := &approvals[i]
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || !approvalPastSLA(approval, now) {
+			continue
+		}
+		if selected == nil || fleetApprovalRecency(*approval).Before(fleetApprovalRecency(*selected)) {
+			selected = approval
+		}
+	}
+	return selected
 }
 
 func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetApprovalState {
@@ -2103,11 +2126,18 @@ func renderFleetApprovalCard(approval fleetApprovalState, muted bool) string {
 	if muted {
 		classes = append(classes, "approval-card-muted")
 	}
+	if approval.PastSLA {
+		classes = append(classes, "approval-past-sla")
+	}
+	slaLabelAttr := ""
+	if approval.PastSLA {
+		slaLabelAttr = ` data-sla-label="` + html.EscapeString(fleetApprovalSLAText()) + `"`
+	}
 	return `<article class="` + strings.Join(classes, " ") + `" title="` + summary + `">` +
 		`<div class="approval-project"><strong title="` + project + `">` + linkHTMLServer(approval.DashboardURL, project) + `</strong>` +
 		`<div class="approval-meta"><span title="` + id + `">` + id + `</span></div></div>` +
 		`<div class="approval-action"><strong title="` + action + `">` + action + `</strong>` +
-		`<div class="approval-meta"><span class="` + approvalStatusClassServer(approval.Status) + `">` + html.EscapeString(firstNonEmpty(approval.Status, "unknown")) + `</span></div></div>` +
+		`<div class="approval-meta"` + slaLabelAttr + `><span class="` + approvalStatusClassServer(approval.Status) + `">` + html.EscapeString(firstNonEmpty(approval.Status, "unknown")) + `</span></div></div>` +
 		`<div class="approval-target">` + renderFleetApprovalTargetHTML(approval) + sessionStatus + `</div>` +
 		`<div class="approval-main"><div class="approval-age"><span>Created ` + createdAge + ` ago</span><span>Updated ` + updatedAge + ` ago</span></div>` +
 		`<div class="approval-risk"><span>` + risk + `</span></div>` +

@@ -338,11 +338,12 @@ function approvalCardHTML(approval) {
   const createdAge = approval.created_age || "-";
   const updatedAge = approval.updated_age || "-";
   const sessionStatus = approval.session_status ? "Status " + approval.session_status : "";
+  const slaLabelAttr = approval.past_sla === true ? ' data-sla-label="30m"' : "";
   return '<article class="' + approvalCardClass(approval) + '" title="' + escapeText(approval.summary || "") + '">' +
     '<div class="approval-project"><strong title="' + escapeText(project) + '">' + linkHTML(approval.dashboard_url, project) + '</strong>' +
       '<div class="approval-meta"><span title="' + escapeText(id) + '">' + escapeText(id) + '</span></div></div>' +
     '<div class="approval-action"><strong title="' + escapeText(action) + '">' + escapeText(action) + '</strong>' +
-      '<div class="approval-meta"><span class="' + approvalStatusClass(approval) + '">' + escapeText(approval.status || "unknown") + '</span></div></div>' +
+      '<div class="approval-meta"' + slaLabelAttr + '><span class="' + approvalStatusClass(approval) + '">' + escapeText(approval.status || "unknown") + '</span></div></div>' +
     '<div class="approval-target">' + approvalTargetHTML(approval) + (sessionStatus ? '<span>' + escapeText(sessionStatus) + '</span>' : "") + '</div>' +
     '<div class="approval-main"><div class="approval-age"><span>Created ' + escapeText(createdAge) + ' ago</span><span>Updated ' + escapeText(updatedAge) + ' ago</span></div>' +
       '<div class="approval-risk"><span>' + escapeText(supervisorRiskLabel(approval.risk || "-")) + '</span></div>' +

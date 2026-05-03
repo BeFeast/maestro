@@ -763,6 +763,34 @@ func TestFleetOperatorBriefEscalatesPendingApprovalPastSLA(t *testing.T) {
 	}
 }
 
+func TestFleetOperatorBriefEscalatesAnyPastSLAPendingApproval(t *testing.T) {
+	now := time.Now().UTC()
+	brief := buildFleetOperatorBrief([]fleetProjectState{{
+		Name: "ApprovalProject",
+	}}, []fleetApprovalState{
+		{
+			ProjectName: "NewApproval",
+			Status:      string(state.ApprovalStatusPending),
+			Summary:     "New approval is still within SLA.",
+			PRNumber:    102,
+			createdAt:   now.Add(-5 * time.Minute),
+			updatedAt:   now.Add(-5 * time.Minute),
+		},
+		{
+			ProjectName: "OldApproval",
+			Status:      string(state.ApprovalStatusPending),
+			Summary:     "Old approval breached SLA.",
+			PRNumber:    101,
+			createdAt:   now.Add(-45 * time.Minute),
+			updatedAt:   now.Add(-45 * time.Minute),
+		},
+	}, now)
+
+	if brief.Tone != "daemon-down" || brief.Project != "OldApproval" {
+		t.Fatalf("brief = %+v, want oldest past-SLA approval escalated", brief)
+	}
+}
+
 func TestHighestPriorityPendingFleetApprovalSelectsNewestPending(t *testing.T) {
 	now := time.Now().UTC()
 	selected := highestPriorityPendingFleetApproval([]fleetApprovalState{
