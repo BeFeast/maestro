@@ -2402,3 +2402,118 @@ if (initialFleetData) {
 loadFleet();
 setInterval(loadFleet, 3000);
 setInterval(loadWorkerDetail, 2000);
+
+const confirmDialogEl = document.getElementById("confirm-dialog");
+const confirmDialogTitleEl = document.getElementById("confirm-dialog-title");
+const confirmDialogBodyEl = document.getElementById("confirm-dialog-body");
+const confirmDialogReasonWrapEl = document.getElementById("confirm-dialog-reason-wrap");
+const confirmDialogReasonEl = document.getElementById("confirm-dialog-reason");
+const confirmDialogConfirmEl = document.getElementById("confirm-dialog-confirm");
+const confirmDialogCancelEl = document.getElementById("confirm-dialog-cancel");
+const confirmDialogTriggerEl = document.getElementById("confirm-dialog-trigger");
+
+let confirmDialogResolver = null;
+
+function openConfirmDialog(options) {
+  if (!confirmDialogEl || typeof confirmDialogEl.showModal !== "function") {
+    return Promise.resolve({ confirmed: false, reason: "" });
+  }
+  const opts = options || {};
+  confirmDialogTitleEl.textContent = opts.title || "Confirm";
+  confirmDialogBodyEl.innerHTML = opts.bodyHTML || "";
+  confirmDialogConfirmEl.textContent = opts.confirmLabel || "Confirm";
+  const requireReason = opts.requireReason === true;
+  if (requireReason) {
+    confirmDialogReasonWrapEl.hidden = false;
+    confirmDialogReasonEl.value = "";
+    confirmDialogReasonEl.required = true;
+  } else {
+    confirmDialogReasonWrapEl.hidden = true;
+    confirmDialogReasonEl.value = "";
+    confirmDialogReasonEl.required = false;
+  }
+  confirmDialogConfirmEl.dataset.requireReason = requireReason ? "1" : "0";
+  confirmDialogEl.showModal();
+  return new Promise(resolve => {
+    confirmDialogResolver = resolve;
+  });
+}
+
+function closeConfirmDialog(payload) {
+  if (confirmDialogEl && confirmDialogEl.open) confirmDialogEl.close();
+  if (confirmDialogResolver) {
+    const resolver = confirmDialogResolver;
+    confirmDialogResolver = null;
+    resolver(payload || { confirmed: false, reason: "" });
+  }
+}
+
+if (confirmDialogConfirmEl) {
+  confirmDialogConfirmEl.addEventListener("click", event => {
+    event.preventDefault();
+    const requireReason = confirmDialogConfirmEl.dataset.requireReason === "1";
+    const reason = (confirmDialogReasonEl && confirmDialogReasonEl.value || "").trim();
+    if (requireReason && reason.length < 10) {
+      confirmDialogReasonEl.setCustomValidity("Reason must be at least 10 characters.");
+      confirmDialogReasonEl.reportValidity();
+      return;
+    }
+    if (confirmDialogReasonEl) confirmDialogReasonEl.setCustomValidity("");
+    closeConfirmDialog({ confirmed: true, reason });
+  });
+}
+if (confirmDialogCancelEl) {
+  confirmDialogCancelEl.addEventListener("click", event => {
+    event.preventDefault();
+    closeConfirmDialog({ confirmed: false, reason: "" });
+  });
+}
+if (confirmDialogEl) {
+  confirmDialogEl.addEventListener("cancel", event => {
+    event.preventDefault();
+    closeConfirmDialog({ confirmed: false, reason: "" });
+  });
+  confirmDialogEl.addEventListener("close", () => {
+    if (confirmDialogResolver) {
+      const resolver = confirmDialogResolver;
+      confirmDialogResolver = null;
+      resolver({ confirmed: false, reason: "" });
+    }
+  });
+}
+
+async function postAuditLog(payload) {
+  const response = await fetch("/api/v1/audit/log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error("audit log post failed: " + text);
+  }
+  return response.json();
+}
+
+if (confirmDialogTriggerEl) {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("v2") === "1") {
+    confirmDialogTriggerEl.hidden = false;
+    confirmDialogTriggerEl.addEventListener("click", async () => {
+      const result = await openConfirmDialog({
+        title: "V2 confirmation scaffold",
+        bodyHTML: '<p>This is a smoke test of the V2 confirmation modal. No live action will run. ' +
+          'Provide a reason below to exercise the audit-log endpoint.</p>',
+        confirmLabel: "Record audit entry",
+        requireReason: true
+      });
+      if (!result.confirmed) return;
+      try {
+        const audit = await postAuditLog({ actor: "operator", action: "v2_smoke_test", reason: result.reason });
+        confirmDialogTriggerEl.title = "Recorded audit " + (audit.audit_id || "");
+      } catch (err) {
+        confirmDialogTriggerEl.title = "Audit log failed: " + err.message;
+      }
+    });
+  }
+}

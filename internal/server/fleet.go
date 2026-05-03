@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -155,6 +158,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
 	mux.HandleFunc("/api/v1/fleet/actions", s.handleFleetAction)
+	mux.HandleFunc("/api/v1/audit/log", s.handleFleetAuditLog)
 	mux.HandleFunc("/approvals/audit", s.handleFleetApprovalAudit)
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleFleetDashboard)
@@ -525,6 +529,114 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
+}
+
+type fleetAuditLogRequest struct {
+	Actor   string `json:"actor"`
+	Action  string `json:"action"`
+	Target  string `json:"target,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Project string `json:"project,omitempty"`
+}
+
+type fleetAuditLogEntry struct {
+	AuditID   string `json:"audit_id"`
+	Timestamp string `json:"timestamp"`
+	Actor     string `json:"actor"`
+	Action    string `json:"action"`
+	Target    string `json:"target,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Project   string `json:"project,omitempty"`
+}
+
+var fleetAuditLogMu sync.Mutex
+
+func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req fleetAuditLogRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode audit log request: %v", err))
+			return
+		}
+	}
+	actor := strings.TrimSpace(req.Actor)
+	action := strings.TrimSpace(req.Action)
+	if actor == "" || action == "" {
+		writeError(w, http.StatusBadRequest, "actor and action are required")
+		return
+	}
+	stateDir := s.fleetAuditLogStateDir(req.Project)
+	if stateDir == "" {
+		writeError(w, http.StatusInternalServerError, "no state dir is available to record the audit entry")
+		return
+	}
+	entry := fleetAuditLogEntry{
+		AuditID:   newFleetAuditID(),
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Actor:     actor,
+		Action:    action,
+		Target:    strings.TrimSpace(req.Target),
+		Reason:    strings.TrimSpace(req.Reason),
+		Project:   strings.TrimSpace(req.Project),
+	}
+	if err := appendFleetAuditLogEntry(stateDir, entry); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write audit log: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"audit_id": entry.AuditID})
+}
+
+func (s *FleetServer) fleetAuditLogStateDir(projectName string) string {
+	projectName = strings.TrimSpace(projectName)
+	if projectName != "" {
+		if project, ok := s.findProject(projectName); ok && project.cfg != nil && strings.TrimSpace(project.cfg.StateDir) != "" {
+			return project.cfg.StateDir
+		}
+	}
+	for _, project := range s.projects {
+		if project.cfg != nil && strings.TrimSpace(project.cfg.StateDir) != "" {
+			return project.cfg.StateDir
+		}
+	}
+	return ""
+}
+
+func appendFleetAuditLogEntry(stateDir string, entry fleetAuditLogEntry) error {
+	if strings.TrimSpace(stateDir) == "" {
+		return fmt.Errorf("audit log state dir is empty")
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(stateDir, "audit-log.jsonl")
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	fleetAuditLogMu.Lock()
+	defer fleetAuditLogMu.Unlock()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(append(encoded, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func newFleetAuditID() string {
+	var buf [12]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("audit-%d", time.Now().UnixNano())
+	}
+	return "audit-" + hex.EncodeToString(buf[:])
 }
 
 func (s *FleetServer) snapshot() fleetResponse {

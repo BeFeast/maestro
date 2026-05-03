@@ -2195,6 +2195,90 @@ func TestFleetDashboardServesFleetPath(t *testing.T) {
 	}
 }
 
+func TestFleetDashboardEmbedsConfirmDialogScaffold(t *testing.T) {
+	body := fleetDashboardBody(t)
+	for _, want := range []string{
+		`id="confirm-dialog"`,
+		`id="confirm-dialog-title"`,
+		`id="confirm-dialog-body"`,
+		`id="confirm-dialog-reason"`,
+		`id="confirm-dialog-trigger"`,
+		"function openConfirmDialog",
+		"function postAuditLog",
+		"/api/v1/audit/log",
+		`params.get("v2") === "1"`,
+	} {
+		if !contains(body, want) {
+			t.Fatalf("dashboard should embed confirm dialog scaffold token %q", want)
+		}
+	}
+}
+
+func TestFleetAuditLogAppendsJSONLine(t *testing.T) {
+	stateDir := t.TempDir()
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("AuditTarget", "/tmp/audit-target.yaml", "", &config.Config{
+			Repo: "owner/audit", StateDir: stateDir, MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	body := strings.NewReader(`{"actor":"operator","action":"v2_smoke_test","target":"project-x","reason":"smoke test entry","project":"AuditTarget"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/audit/log", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handleFleetAuditLog(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["audit_id"] == "" {
+		t.Fatalf("response missing audit_id: %s", w.Body.String())
+	}
+
+	logPath := filepath.Join(stateDir, "audit-log.jsonl")
+	contents, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	line := strings.TrimSpace(string(contents))
+	if line == "" {
+		t.Fatalf("audit log is empty")
+	}
+	var entry fleetAuditLogEntry
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		t.Fatalf("unmarshal audit line: %v\nline=%s", err, line)
+	}
+	if entry.Actor != "operator" || entry.Action != "v2_smoke_test" || entry.Reason != "smoke test entry" {
+		t.Fatalf("audit entry = %+v, want operator/v2_smoke_test/smoke test entry", entry)
+	}
+	if entry.AuditID != resp["audit_id"] {
+		t.Fatalf("audit_id mismatch: response=%q line=%q", resp["audit_id"], entry.AuditID)
+	}
+	if entry.Timestamp == "" {
+		t.Fatalf("audit entry missing timestamp")
+	}
+}
+
+func TestFleetAuditLogRequiresActorAndAction(t *testing.T) {
+	stateDir := t.TempDir()
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("AuditTarget", "/tmp/audit-target.yaml", "", &config.Config{
+			Repo: "owner/audit", StateDir: stateDir, MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/audit/log", strings.NewReader(`{"action":"only_action"}`))
+	w := httptest.NewRecorder()
+	srv.handleFleetAuditLog(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing actor: status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestFleetDashboardServesApprovalAuditPath(t *testing.T) {
 	srv := NewFleet(nil, "127.0.0.1", 8786, true)
 	req := httptest.NewRequest(http.MethodGet, "/approvals/audit", nil)

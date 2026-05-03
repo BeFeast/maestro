@@ -32,6 +32,7 @@
   <div class="header-actions">
     <span class="mode-pill">Read-only</span>
     <button type="button" class="fleet-search-trigger" id="fleet-search-trigger" aria-haspopup="dialog" aria-controls="fleet-search-dialog"><span>Search</span><kbd>Cmd/Ctrl K</kbd></button>
+    <button type="button" class="confirm-dialog-trigger" id="confirm-dialog-trigger" aria-haspopup="dialog" aria-controls="confirm-dialog" hidden>Test confirm</button>
     <button type="button" class="refresh-button" id="fleet-refresh" aria-label="Refresh fleet data">↻</button>
     <span class="user-chip" aria-label="Operator ko">ko</span>
   </div>
@@ -206,6 +207,20 @@
       <div class="empty">Select a fleet worker to show metadata and log output.</div>
     </div>
   </section>
+  <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-dialog-title">
+    <form method="dialog" class="confirm-dialog-form">
+      <h2 class="confirm-dialog-title" id="confirm-dialog-title">Confirm</h2>
+      <div class="confirm-dialog-body" id="confirm-dialog-body"></div>
+      <label class="confirm-dialog-reason" id="confirm-dialog-reason-wrap" hidden>
+        <span>Reason for stopping (visible to your team)</span>
+        <textarea id="confirm-dialog-reason" rows="3" minlength="10" placeholder="At least 10 characters explaining why."></textarea>
+      </label>
+      <div class="confirm-dialog-actions">
+        <button type="button" class="confirm-dialog-cancel" id="confirm-dialog-cancel" value="cancel">Cancel</button>
+        <button type="button" class="confirm-dialog-confirm" id="confirm-dialog-confirm" value="confirm">Confirm</button>
+      </div>
+    </form>
+  </dialog>
 </main>
 <script type="application/json" id="fleet-initial-state">{{FLEET_INITIAL_STATE}}</script>
 <script src="/static/fleet.js?v=20260503-5"></script>
