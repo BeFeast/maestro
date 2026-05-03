@@ -1818,13 +1818,17 @@ func TestFleetDashboard(t *testing.T) {
 func TestFleetDashboardRendersHistoryCollapseControls(t *testing.T) {
 	body := fleetDashboardBody(t)
 	for _, want := range []string{
-		"function historySummaryRowHTML(workers)",
-		"class=\"history-row\"",
-		"data-history-scope=\"recent\"",
+		"function historySummaryRowHTML(workers, expanded)",
+		"function historySummaryText(count, expanded)",
+		"function toggleWorkerHistoryRows(button)",
+		"worker-history-summary-row",
+		"worker-history-row",
+		"data-history-toggle",
+		"aria-expanded=\"",
+		"click to \" + (expanded ? \"collapse\" : \"expand\")",
 		"history collapsed",
 		"hasWorkerDrilldownFilters",
 		"worker.live === true",
-		"Search or switch scope to inspect every session.",
 	} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard history collapse renderer should contain %q", want)

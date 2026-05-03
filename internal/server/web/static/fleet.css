@@ -846,6 +846,35 @@
     padding: 5px 10px;
   }
   .history-row-action:hover { border-color: rgba(88,166,255,.65); }
+  .history-row-toggle {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .history-row-toggle:hover { color: var(--accent); }
+  .history-row-toggle .history-row-toggle-caret {
+    display: inline-block;
+    transition: transform 120ms ease;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .history-row-toggle[aria-expanded="true"] .history-row-toggle-caret {
+    transform: rotate(90deg);
+  }
+  .worker-table tbody tr.worker-history-row {
+    background: var(--bg-2, rgba(139,148,158,.04));
+    color: var(--muted);
+  }
+  .worker-table tbody tr.worker-history-summary-row td {
+    border-top: 1px solid var(--line);
+  }
   .project-col { width: 140px; font-weight: 650; }
   .slot-col { width: 92px; font-family: var(--font-mono); }
   .issue-col { width: auto; }
