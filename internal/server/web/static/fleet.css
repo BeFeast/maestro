@@ -123,6 +123,22 @@
   .fleet-verdict.verdict-attention::before { background: var(--warn); box-shadow: 0 0 18px rgba(194,65,12,.32); }
   .fleet-verdict.verdict-daemon-down { border-left-color: var(--bad); background: #fff5f5; }
   .fleet-verdict.verdict-daemon-down::before { background: var(--bad); box-shadow: 0 0 18px rgba(185,28,28,.32); }
+  .fleet-verdict { grid-template-columns: 1fr auto; align-items: center; }
+  .fleet-verdict-copy { min-width: 0; }
+  .fleet-next-action-cta {
+    align-self: center;
+    justify-self: end;
+    padding: 8px 14px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .fleet-next-action-cta:hover { border-color: var(--text-dim); background: #f8fafc; }
   .stats {
     display: grid;
     grid-template-columns: repeat(5, minmax(0, 1fr));

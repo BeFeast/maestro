@@ -112,6 +112,46 @@ Each project card shows an outcome status: goal, runtime target, health state, a
 
 The global brief names one state for the whole fleet: healthy idle, running work, waiting for CI/review, no eligible issues, dispatch failure, stale worker, runtime outcome drift, or the single highest-priority action that needs an operator. When no human action is needed, it says so explicitly.
 
+## Global Next Action Selection
+
+Fleet Mission Control collapses the global brief into one canonical next operator action. `/api/v1/fleet` exposes it as the structured `next_action` field, or `null` when no action is needed. The legacy `verdict.sentence` and `operator_brief` fields stay populated for backward compatibility within this release.
+
+`next_action` shape:
+
+```json
+{
+  "project": "<project name>",
+  "kind": "<operator state kind>",
+  "target_url": "<PR or issue or dashboard URL>",
+  "reason": "<one-sentence reason>",
+  "priority": "P0",
+  "picked_at": "<RFC3339 timestamp>"
+}
+```
+
+Selection algorithm (deterministic, code-readable in `internal/server/fleet.go: buildFleetNextAction`):
+
+1. Build a candidate list from approvals and per-project operator state.
+2. Bucket each candidate into a priority tier:
+
+   | Tier | Sources |
+   |---|---|
+   | P0 | project `error`, `dispatch_failure`, `stale_worker`; pending approval past the 30m SLA |
+   | P1 | project `attention`; pending approval inside SLA |
+   | P2 | project `outcome_drift`, `stale`, `no_eligible_issues`, `queue_blocked` |
+   | P3 | project `outcome_missing` |
+
+   Non-actionable kinds (`working`, `monitoring_pr`, `pending_dispatch`, `idle`, ...) are excluded.
+
+3. Sort by priority ascending (P0 first).
+4. Within the highest-occupied tier the **oldest by `updated_at`** wins. The "updated_at" comes from the underlying input — the worker session `started_at` for worker-driven kinds, the supervisor decision `created_at` for queue/dispatch/drift kinds, the approval `updated_at` for approvals — never from the snapshot timestamp. That keeps the choice stable across consecutive snapshots while the input is unchanged.
+5. The remaining ties are broken by a deterministic key (`approval|project|id` or `project|name|kind`).
+6. `picked_at` echoes the winner's `updated_at`, so reloading the dashboard while nothing changes returns the same `picked_at` and the UI text does not flicker.
+
+The frontend (`internal/server/web/static/fleet.js: renderFleetVerdict`) renders one "What needs me now" line plus one CTA link to `target_url`. When `next_action` is `null` the dashboard shows a single `Quiet. Nothing needs you.` message — there are no expanding sections in the brief.
+
+This algorithm is intentionally explicit and explainable. There is no ML priority picker; if the order changes you can read the tier mapping above and the candidate list in the Project Rail to see why.
+
 Use this order during normal operations:
 
 1. Open Fleet Mission Control at `http://127.0.0.1:8787/`.
