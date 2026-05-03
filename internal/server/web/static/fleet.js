@@ -2440,12 +2440,12 @@ function openConfirmDialog(options) {
 }
 
 function closeConfirmDialog(payload) {
-  if (confirmDialogEl && confirmDialogEl.open) confirmDialogEl.close();
   if (confirmDialogResolver) {
     const resolver = confirmDialogResolver;
     confirmDialogResolver = null;
     resolver(payload || { confirmed: false, reason: "" });
   }
+  if (confirmDialogEl && confirmDialogEl.open) confirmDialogEl.close();
 }
 
 if (confirmDialogConfirmEl) {

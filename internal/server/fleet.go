@@ -570,7 +570,11 @@ func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "actor and action are required")
 		return
 	}
-	stateDir := s.fleetAuditLogStateDir(req.Project)
+	stateDir, err := s.fleetAuditLogStateDir(req.Project)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if stateDir == "" {
 		writeError(w, http.StatusInternalServerError, "no state dir is available to record the audit entry")
 		return
@@ -591,19 +595,24 @@ func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{"audit_id": entry.AuditID})
 }
 
-func (s *FleetServer) fleetAuditLogStateDir(projectName string) string {
+func (s *FleetServer) fleetAuditLogStateDir(projectName string) (string, error) {
 	projectName = strings.TrimSpace(projectName)
 	if projectName != "" {
-		if project, ok := s.findProject(projectName); ok && project.cfg != nil && strings.TrimSpace(project.cfg.StateDir) != "" {
-			return project.cfg.StateDir
+		project, ok := s.findProject(projectName)
+		if !ok {
+			return "", fmt.Errorf("unknown project %q", projectName)
 		}
+		if project.cfg != nil && strings.TrimSpace(project.cfg.StateDir) != "" {
+			return project.cfg.StateDir, nil
+		}
+		return "", nil
 	}
 	for _, project := range s.projects {
 		if project.cfg != nil && strings.TrimSpace(project.cfg.StateDir) != "" {
-			return project.cfg.StateDir
+			return project.cfg.StateDir, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 func appendFleetAuditLogEntry(stateDir string, entry fleetAuditLogEntry) error {

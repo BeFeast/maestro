@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2212,6 +2213,11 @@ func TestFleetDashboardEmbedsConfirmDialogScaffold(t *testing.T) {
 			t.Fatalf("dashboard should embed confirm dialog scaffold token %q", want)
 		}
 	}
+	resolverIndex := strings.Index(body, "resolver(payload || { confirmed: false")
+	closeIndex := strings.Index(body, "confirmDialogEl.close()")
+	if resolverIndex < 0 || closeIndex < 0 || resolverIndex > closeIndex {
+		t.Fatalf("confirm dialog should resolve before close event can cancel it")
+	}
 }
 
 func TestFleetAuditLogAppendsJSONLine(t *testing.T) {
@@ -2276,6 +2282,28 @@ func TestFleetAuditLogRequiresActorAndAction(t *testing.T) {
 	srv.handleFleetAuditLog(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("missing actor: status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestFleetAuditLogRejectsUnknownProject(t *testing.T) {
+	stateDir := t.TempDir()
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("AuditTarget", "/tmp/audit-target.yaml", "", &config.Config{
+			Repo: "owner/audit", StateDir: stateDir, MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	body := strings.NewReader(`{"actor":"operator","action":"v2_smoke_test","target":"project-x","reason":"smoke test entry","project":"MissingProject"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/audit/log", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handleFleetAuditLog(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown project: status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "audit-log.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unknown project should not write fallback audit log, stat err=%v", err)
 	}
 }
 
