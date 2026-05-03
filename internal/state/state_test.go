@@ -1806,8 +1806,8 @@ func TestSessionStale_LinkedMergedPRDismissesRegardlessOfIdle(t *testing.T) {
 		IdleAfter:              24 * time.Hour,
 		RequireWorktreeMissing: true,
 		MergedPRDismisses:      true,
-		PRStateForBranch: func(b string) string {
-			if b == "feat/sup-46-347-confirmation-dialog" {
+		PRStateForBranchPR: func(b string, pr int) string {
+			if b == "feat/sup-46-347-confirmation-dialog" && pr == 396 {
 				return "MERGED"
 			}
 			return ""
@@ -1843,7 +1843,7 @@ func TestSessionStale_NoLinkedPRFollowsLegacyPolicy(t *testing.T) {
 		IdleAfter:              24 * time.Hour,
 		RequireWorktreeMissing: true,
 		MergedPRDismisses:      true,
-		PRStateForBranch:       func(string) string { return "" }, // no link known
+		PRStateForBranchPR:     func(string, int) string { return "" }, // no link known
 	}
 	worktreeExists := func(string) bool { return false }
 
@@ -1887,10 +1887,79 @@ func TestSessionStale_LinkedOpenPRIsNotDismissed(t *testing.T) {
 		IdleAfter:              24 * time.Hour,
 		RequireWorktreeMissing: true,
 		MergedPRDismisses:      true,
-		PRStateForBranch:       func(string) string { return "OPEN" },
+		PRStateForBranchPR:     func(string, int) string { return "OPEN" },
 	}
 	if _, stale := SessionStale(sess, now, policy, func(string) bool { return true }); stale {
 		t.Fatalf("session whose linked PR is OPEN must not be dismissed by the merged-PR path")
+	}
+}
+
+// TestSessionStale_MergedPRRequiresPRNumberMatch guards against false
+// dismissals after issue re-open: a session on the same branch as a
+// previously-merged PR but with its own (different) PRNumber must not be
+// dismissed by the merged-PR path. Lookup is keyed by (branch, PRNumber).
+func TestSessionStale_MergedPRRequiresPRNumberMatch(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-15 * time.Minute)
+	sess := &Session{
+		IssueNumber: 347,
+		PRNumber:    200, // new PR after issue re-opened
+		Status:      StatusRetryExhausted,
+		Branch:      "feat/sup-46-347-confirmation-dialog",
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/sup-46",
+	}
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+		MergedPRDismisses:      true,
+		// Branch matches but only the OLD PR (100) is merged.
+		PRStateForBranchPR: func(b string, pr int) string {
+			if b == "feat/sup-46-347-confirmation-dialog" && pr == 100 {
+				return "MERGED"
+			}
+			return ""
+		},
+	}
+	if _, stale := SessionStale(sess, now, policy, func(string) bool { return true }); stale {
+		t.Fatalf("session whose own PR (200) is not merged must not be dismissed by branch reuse")
+	}
+}
+
+// TestSessionStale_MergedPRSkippedWhenPRNumberZero ensures sessions
+// without a recorded PRNumber are never dismissed via the merged-PR
+// path. Without a PRNumber there is no way to distinguish a stale match
+// from a live retry on the same branch.
+func TestSessionStale_MergedPRSkippedWhenPRNumberZero(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-15 * time.Minute)
+	sess := &Session{
+		IssueNumber: 347,
+		PRNumber:    0, // unknown
+		Status:      StatusRetryExhausted,
+		Branch:      "feat/sup-46-347-confirmation-dialog",
+		StartedAt:   finished.Add(-time.Hour),
+		FinishedAt:  &finished,
+		Worktree:    "/tmp/sup-46",
+	}
+	called := false
+	policy := StaleSessionPolicy{
+		Enabled:                true,
+		IdleAfter:              24 * time.Hour,
+		RequireWorktreeMissing: true,
+		MergedPRDismisses:      true,
+		PRStateForBranchPR: func(string, int) string {
+			called = true
+			return "MERGED"
+		},
+	}
+	if _, stale := SessionStale(sess, now, policy, func(string) bool { return true }); stale {
+		t.Fatalf("session with PRNumber=0 must not be dismissed by merged-PR path")
+	}
+	if called {
+		t.Fatalf("lookup must not be called when PRNumber=0 — there is nothing to match")
 	}
 }
 
@@ -1911,7 +1980,7 @@ func TestSessionStale_MergedPRDismissesDisabledIgnoresLookup(t *testing.T) {
 		IdleAfter:              24 * time.Hour,
 		RequireWorktreeMissing: true,
 		MergedPRDismisses:      false, // disabled — must match legacy behavior
-		PRStateForBranch:       func(string) string { return "MERGED" },
+		PRStateForBranchPR:     func(string, int) string { return "MERGED" },
 	}
 	if _, stale := SessionStale(sess, now, policy, func(string) bool { return true }); stale {
 		t.Fatalf("merged_pr_dismisses=false must disable the linked-PR path")
@@ -1936,8 +2005,8 @@ func TestReconcileStaleSessions_LinkedMergedPRIsIdempotent(t *testing.T) {
 		Status:      StatusRunning,
 		StartedAt:   now.Add(-time.Minute),
 	}
-	lookup := func(b string) string {
-		if b == "feat/sup-46-347-confirmation-dialog" {
+	lookup := func(b string, pr int) string {
+		if b == "feat/sup-46-347-confirmation-dialog" && pr == 396 {
 			return "MERGED"
 		}
 		return ""
@@ -1947,7 +2016,7 @@ func TestReconcileStaleSessions_LinkedMergedPRIsIdempotent(t *testing.T) {
 		IdleAfter:              24 * time.Hour,
 		RequireWorktreeMissing: true,
 		MergedPRDismisses:      true,
-		PRStateForBranch:       lookup,
+		PRStateForBranchPR:     lookup,
 	}
 	first := st.ReconcileStaleSessions(now, policy, func(string) bool { return true })
 	second := st.ReconcileStaleSessions(now, policy, func(string) bool { return true })

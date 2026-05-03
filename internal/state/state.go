@@ -1749,12 +1749,16 @@ type StaleSessionPolicy struct {
 	RequireWorktreeMissing bool
 	// MergedPRDismisses, when true, treats a dead session whose linked PR is
 	// known to be MERGED as completed regardless of idle time or worktree
-	// presence. PRStateForBranch supplies the lookup; when nil, this path
+	// presence. PRStateForBranchPR supplies the lookup; when nil, this path
 	// has no effect.
 	MergedPRDismisses bool
-	// PRStateForBranch returns the known PR state ("MERGED", "OPEN", ...) for
-	// the given session branch name. An empty string means unknown.
-	PRStateForBranch func(branch string) string
+	// PRStateForBranchPR returns the known PR state ("MERGED", "OPEN", ...)
+	// for the given session branch name and the candidate session's own
+	// PRNumber. The PRNumber match guards against false dismissals when an
+	// issue is re-opened: a stale CodeLanded record on the same branch but
+	// with a different PRNumber must not poison a live retry. An empty
+	// return value means unknown.
+	PRStateForBranchPR func(branch string, prNumber int) string
 }
 
 // MergedPRReason is the audit reason emitted when a session is dismissed
@@ -1803,14 +1807,17 @@ func SessionStale(sess *Session, now time.Time, policy StaleSessionPolicy, workt
 		idle = now.Sub(changedAt)
 	}
 
-	// Linked-PR-merged path: when enabled, a dead session whose branch maps
-	// to a MERGED PR is dismissed regardless of idle time or worktree
-	// presence. The audit carries an explicit "linked PR merged" reason so
-	// operators can see which condition fired.
-	if policy.MergedPRDismisses && policy.PRStateForBranch != nil {
+	// Linked-PR-merged path: when enabled, a dead session whose own PR is
+	// known to be MERGED is dismissed regardless of idle time or worktree
+	// presence. The lookup must match on (branch, PRNumber) so a stale
+	// CodeLanded record on the same branch but for a different PR (e.g.
+	// after the issue was re-opened) cannot poison a live retry. The audit
+	// carries an explicit "linked PR merged" reason so operators can see
+	// which condition fired.
+	if policy.MergedPRDismisses && policy.PRStateForBranchPR != nil && sess.PRNumber > 0 {
 		branch := strings.TrimSpace(sess.Branch)
 		if branch != "" {
-			if state := strings.ToUpper(strings.TrimSpace(policy.PRStateForBranch(branch))); state == "MERGED" {
+			if state := strings.ToUpper(strings.TrimSpace(policy.PRStateForBranchPR(branch, sess.PRNumber))); state == "MERGED" {
 				idleSeconds := int64(0)
 				if idle > 0 {
 					idleSeconds = int64(idle.Round(time.Second) / time.Second)

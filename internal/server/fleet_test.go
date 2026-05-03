@@ -2951,7 +2951,7 @@ func TestFleetAPIDismissesDeadSessionWhenLinkedPRMerged(t *testing.T) {
 			IssueNumber: 347,
 			IssueTitle:  "Confirmation dialog (merged sibling)",
 			PRNumber:    396,
-			Status:      state.StatusDone,
+			Status:      state.StatusCodeLanded,
 			Branch:      branch,
 			StartedAt:   finishedRecent.Add(-2 * time.Hour),
 			FinishedAt:  &finishedRecent,
@@ -3036,7 +3036,7 @@ func TestFleetAPIMergedPRDismissesDisabledKeepsAttention(t *testing.T) {
 		"sup-44": {
 			IssueNumber: 347,
 			PRNumber:    396,
-			Status:      state.StatusDone,
+			Status:      state.StatusCodeLanded,
 			Branch:      branch,
 			StartedAt:   finishedRecent.Add(-2 * time.Hour),
 			FinishedAt:  &finishedRecent,
@@ -3060,6 +3060,118 @@ func TestFleetAPIMergedPRDismissesDisabledKeepsAttention(t *testing.T) {
 	stale := findFleetWorker(t, resp.Workers, "sup-46")
 	if !stale.NeedsAttention {
 		t.Fatalf("merged_pr_dismisses=false must preserve PR-#400 behavior; got %+v", stale)
+	}
+}
+
+// TestFleetAPIDoesNotDismissOnStaleDoneSibling guards against the
+// non-merge StatusDone path (issue closed externally) being misread as
+// "linked PR merged" by the reconciler. A sibling session on the same
+// branch in StatusDone — with no StatusCodeLanded record anywhere — must
+// not contribute to the merged-branch set.
+func TestFleetAPIDoesNotDismissOnStaleDoneSibling(t *testing.T) {
+	resetFleetStaleAuditDedup()
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	presentWorktree := filepath.Join(dir, "present-worktree")
+	if err := os.MkdirAll(presentWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	finishedRecent := now.Add(-15 * time.Minute) // inside idle window
+	branch := "feat/sup-46-347-confirmation-dialog"
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"sup-46": {
+			IssueNumber: 347,
+			PRNumber:    396,
+			Status:      state.StatusRetryExhausted,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-time.Hour),
+			FinishedAt:  &finishedRecent,
+			Worktree:    presentWorktree,
+		},
+		// Sibling reached StatusDone via a non-merge transition (issue
+		// closed externally). It must not be treated as evidence that
+		// PR #396 actually merged.
+		"sup-44": {
+			IssueNumber: 347,
+			PRNumber:    396,
+			Status:      state.StatusDone,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-2 * time.Hour),
+			FinishedAt:  &finishedRecent,
+		},
+	})
+
+	cfg := &config.Config{
+		Repo:        "owner/finance",
+		StateDir:    stateDir,
+		MaxParallel: 4,
+	}
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("finance", "/tmp/finance.yaml", "http://127.0.0.1:8788", cfg),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	stale := findFleetWorker(t, resp.Workers, "sup-46")
+	if !stale.NeedsAttention {
+		t.Fatalf("sup-46 must remain in attention when no StatusCodeLanded sibling proves PR-merge; got %+v", stale)
+	}
+}
+
+// TestFleetAPIDoesNotDismissWhenBranchReusedForDifferentPR guards
+// against the issue-reopen scenario: an old session on branch X with PR
+// 100 reached StatusCodeLanded; the issue was re-opened and a new
+// session on the SAME branch but a DIFFERENT PR (200, still open)
+// reached StatusRetryExhausted. The new session must not be dismissed
+// just because the old PR on the same branch was merged.
+func TestFleetAPIDoesNotDismissWhenBranchReusedForDifferentPR(t *testing.T) {
+	resetFleetStaleAuditDedup()
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	presentWorktree := filepath.Join(dir, "present-worktree")
+	if err := os.MkdirAll(presentWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	finishedRecent := now.Add(-15 * time.Minute)
+	branch := "feat/sup-46-347-confirmation-dialog"
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		// Old, properly-merged session on this branch.
+		"sup-44": {
+			IssueNumber: 347,
+			PRNumber:    100,
+			Status:      state.StatusCodeLanded,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-3 * time.Hour),
+			FinishedAt:  &finishedRecent,
+		},
+		// Issue re-opened, new retry on the same branch with a NEW PR
+		// that is still open; the retry exhausted. Must remain in
+		// attention.
+		"sup-46": {
+			IssueNumber: 347,
+			PRNumber:    200,
+			Status:      state.StatusRetryExhausted,
+			Branch:      branch,
+			StartedAt:   finishedRecent.Add(-time.Hour),
+			FinishedAt:  &finishedRecent,
+			Worktree:    presentWorktree,
+		},
+	})
+
+	cfg := &config.Config{
+		Repo:        "owner/finance",
+		StateDir:    stateDir,
+		MaxParallel: 4,
+	}
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("finance", "/tmp/finance.yaml", "http://127.0.0.1:8788", cfg),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	stale := findFleetWorker(t, resp.Workers, "sup-46")
+	if !stale.NeedsAttention {
+		t.Fatalf("sup-46 must keep needs_attention when its own PR (200) is not the merged one (100); got %+v", stale)
 	}
 }
 
