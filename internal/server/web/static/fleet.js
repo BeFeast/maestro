@@ -1154,7 +1154,6 @@ function needsYouItemHTML(item) {
       '<div class="needs-you-kicker">' + escapeText(approval.project_name || "-") + ' · approval</div>' +
       '<div class="needs-you-headline">' + escapeText(actionLabel(approval.action || "-")) + '</div>' +
       '<div class="needs-you-copy">' + escapeText(approval.summary || "Supervisor approval needs review.") + '</div>' +
-      '<div class="needs-you-meta">' + approvalTargetHTML(approval) + '</div>' +
     '</article>';
   }
   const worker = item.worker;
@@ -1162,7 +1161,6 @@ function needsYouItemHTML(item) {
     '<div class="needs-you-kicker">' + escapeText(worker.project_name || "-") + ' · slot ' + escapeText(worker.slot || "-") + '</div>' +
     '<div class="needs-you-headline">' + issueSummaryHTML(worker) + '</div>' +
     '<div class="needs-you-copy"><strong>Why:</strong> ' + escapeText(attentionReasonText(worker)) + '</div>' +
-    '<div class="needs-you-meta"><strong>Next:</strong> ' + escapeText(attentionNextActionText(worker)) + '</div>' +
   '</article>';
 }
 
@@ -1272,26 +1270,20 @@ function renderStats(summary) {
   const throughputDaily = Array.isArray(summary.throughput_daily_7d)
     ? summary.throughput_daily_7d.map(value => Number(value || 0))
     : [];
-  const heroNote = projects
-    ? running + " of " + projects + " worker slot" + (projects === 1 ? "" : "s") + " in use"
-    : "No configured projects";
-  const compact = [
+  const items = [
+    { label: "Running", value: running, suffix: projects ? "of " + projects : "", note: projects ? "worker slots" : "No configured projects" },
     { label: "PRs in flight", value: prOpen, note: monitoring ? monitoring + " monitored" : (prOpen ? pluralize(prOpen, "open PR") : "none") },
     { label: "Failed", value: failed, note: failed ? "needs review" : "clear" },
     { label: "Attention", value: attention, note: attention ? "needs you" : "quiet" },
     { label: "Issue throughput", value: throughputMerged, note: "merged · last 7d", sparkline: throughputDaily }
   ];
-  statsEl.innerHTML = '<article class="stats-hero-card">' +
-    '<div class="stats-hero-label">Workers active</div>' +
-    '<div class="stats-hero-value"><strong>' + escapeText(running) + '</strong><span class="stat-suffix">of ' + escapeText(projects) + '</span></div>' +
-    '<div class="stats-hero-note">' + escapeText(heroNote) + '</div>' +
-  '</article>' +
-  '<div class="stats-compact-strip">' + compact.map(item =>
-    '<article class="stat stat-compact"><span class="stat-label">' + escapeText(item.label) + '</span>' +
-      '<div class="stat-value"><strong>' + escapeText(item.value) + '</strong></div>' +
+  statsEl.innerHTML = items.map(item =>
+    '<article class="stat"><span class="stat-label">' + escapeText(item.label) + '</span>' +
+      '<div class="stat-value"><strong>' + escapeText(item.value) + '</strong>' +
+      (item.suffix ? '<span class="stat-suffix">' + escapeText(item.suffix) + '</span>' : '') + '</div>' +
       (item.sparkline ? renderStatSparkline(item.sparkline) : '') +
       '<span class="stat-note">' + escapeText(item.note) + '</span></article>'
-  ).join("") + '</div>';
+  ).join("");
 }
 
 function renderStatSparkline(values) {
