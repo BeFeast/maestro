@@ -87,6 +87,7 @@ const fleetState = {
   approvals: [],
   attention: [],
   workers: [],
+  historyExpanded: false,
   summary: {},
   detail: null,
   operatorBrief: null,
@@ -1589,7 +1590,7 @@ function renderFleetWorkers() {
     const issueText = issueSummaryText(worker);
     const selected = workerKey(worker) === fleetState.selectedWorkerKey ? " selected" : "";
     const cls = rowClass(worker) + selected + (extraClass ? " " + extraClass : "");
-    const hiddenAttr = extraClass === "worker-history-row" ? ' hidden' : '';
+    const hiddenAttr = extraClass === "worker-history-row" && !fleetState.historyExpanded ? ' hidden' : '';
     return '<tr class="' + cls + '" data-project="' + escapeText(worker.project_name || "") + '" data-slot="' + escapeText(worker.slot || "") + '" tabindex="0"' + hiddenAttr + '>' +
       '<td class="project-col" title="' + escapeText(project) + '">' + linkHTML(worker.dashboard_url, project) + '</td>' +
       '<td class="slot-col" title="' + escapeText(worker.slot || "-") + '">' + escapeText(worker.slot || "-") + '</td>' +
@@ -1604,7 +1605,7 @@ function renderFleetWorkers() {
   };
   const rows = visible.map(worker => renderRow(worker, ""));
   if (hiddenHistory.length) {
-    rows.push(historySummaryRowHTML(hiddenHistory));
+    rows.push(historySummaryRowHTML(hiddenHistory, fleetState.historyExpanded));
     hiddenHistory.forEach(worker => rows.push(renderRow(worker, "worker-history-row")));
   }
   fleetWorkersEl.innerHTML = rows.join("");
@@ -1636,25 +1637,32 @@ function renderFleetWorkers() {
   });
 }
 
-function historySummaryRowHTML(workers) {
+function historySummaryRowHTML(workers, expanded) {
   const count = workers.length;
   const sample = workers.slice(0, 3).map(worker => (worker.project_name || "-") + " / " + (worker.slot || "-")).join(", ");
   const note = "Done/stale sessions are collapsed by default." + (sample ? " Examples: " + sample + "." : "");
-  const summaryText = count + " done/historical worker" + (count === 1 ? "" : "s") + " · click to expand";
+  const summaryText = historySummaryText(count, expanded);
   return '<tr class="history-row worker-history-summary-row"><td colspan="9"><div class="history-row-content">' +
-    '<button type="button" class="history-row-toggle" data-history-toggle aria-expanded="false">' +
+    '<button type="button" class="history-row-toggle" data-history-toggle data-history-count="' + count + '" aria-expanded="' + (expanded ? "true" : "false") + '">' +
       '<span class="history-row-toggle-caret" aria-hidden="true">&#9656;</span>' +
-      '<strong>' + escapeText(summaryText) + '</strong>' +
+      '<strong data-history-toggle-label>' + escapeText(summaryText) + '</strong>' +
       '<span> ' + escapeText(note) + '</span>' +
     '</button>' +
     '<button type="button" class="history-row-action" data-history-scope="recent">Open in history scope</button>' +
     '</div></td></tr>';
 }
 
+function historySummaryText(count, expanded) {
+  return count + " done/historical worker" + (count === 1 ? "" : "s") + " · click to " + (expanded ? "collapse" : "expand");
+}
+
 function toggleWorkerHistoryRows(button) {
   const expanded = button.getAttribute("aria-expanded") === "true";
   const next = !expanded;
+  fleetState.historyExpanded = next;
   button.setAttribute("aria-expanded", next ? "true" : "false");
+  const label = button.querySelector("[data-history-toggle-label]");
+  if (label) label.textContent = historySummaryText(Number(button.dataset.historyCount || 0), next);
   const tbody = button.closest("tbody");
   if (!tbody) return;
   tbody.querySelectorAll("tr.worker-history-row").forEach(row => {
