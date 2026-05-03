@@ -757,7 +757,7 @@ function renderSearchPalette() {
   if (search.activeIndex >= search.results.length) {
     search.activeIndex = Math.max(0, search.results.length - 1);
   }
-  if (searchInputEl && searchInputEl.value !== search.query) {
+  if (searchInputEl && searchInputEl.value.trim() !== search.query) {
     searchInputEl.value = search.query;
   }
   const hasQuery = searchTerms(search.query).length > 0;
