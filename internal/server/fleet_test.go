@@ -823,6 +823,328 @@ func TestHighestPriorityPendingFleetApprovalSelectsNewestPending(t *testing.T) {
 	}
 }
 
+func TestBuildFleetNextActionEmptyFleetReturnsNil(t *testing.T) {
+	now := time.Now().UTC()
+	if got := buildFleetNextAction(nil, nil, now); got != nil {
+		t.Fatalf("buildFleetNextAction empty fleet = %+v, want nil", got)
+	}
+	idleProjects := []fleetProjectState{
+		{Name: "Idle", OperatorState: fleetOperatorState{Kind: "idle"}},
+		{Name: "Running", OperatorState: fleetOperatorState{Kind: "working"}},
+		{Name: "Monitoring", OperatorState: fleetOperatorState{Kind: "monitoring_pr"}},
+	}
+	if got := buildFleetNextAction(idleProjects, nil, now); got != nil {
+		t.Fatalf("buildFleetNextAction idle fleet = %+v, want nil", got)
+	}
+}
+
+func TestBuildFleetNextActionPrefersP0OverOlderLowerTier(t *testing.T) {
+	now := time.Now().UTC()
+	startedRecent := now.Add(-2 * time.Minute).Format(time.RFC3339)
+	startedAncient := now.Add(-6 * time.Hour).Format(time.RFC3339)
+
+	projects := []fleetProjectState{
+		{
+			Name: "OldP2",
+			OperatorState: fleetOperatorState{
+				Kind:       "no_eligible_issues",
+				Summary:    "All open issues are excluded by policy.",
+				NextAction: "Adjust labels or policy so a worker can run.",
+			},
+			Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{CreatedAt: now.Add(-6 * time.Hour)}},
+		},
+		{
+			Name: "RecentP0",
+			OperatorState: fleetOperatorState{
+				Kind:       "stale_worker",
+				Summary:    "Worker PID is not alive.",
+				NextAction: "Restart the worker.",
+			},
+			Attention: []sessionInfo{{Slot: "stale-1", Status: string(state.StatusRunning), StartedAt: startedRecent}},
+		},
+		{
+			Name: "DispatchP0",
+			OperatorState: fleetOperatorState{
+				Kind:       "dispatch_failure",
+				Summary:    "Supervisor dispatch failed.",
+				NextAction: "Check supervisor logs.",
+			},
+			Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{CreatedAt: now.Add(-30 * time.Minute)}},
+		},
+		{
+			Name: "AncientAttention",
+			OperatorState: fleetOperatorState{
+				Kind:       "attention",
+				Summary:    "Worker needs review.",
+				NextAction: "Open the worker detail.",
+			},
+			Attention: []sessionInfo{{Slot: "old-1", Status: string(state.StatusRunning), StartedAt: startedAncient}},
+		},
+	}
+
+	got := buildFleetNextAction(projects, nil, now)
+	if got == nil {
+		t.Fatalf("buildFleetNextAction = nil, want a P0 candidate")
+	}
+	if got.Priority != "P0" {
+		t.Fatalf("priority = %q, want P0 (a P0 must beat any older P1/P2)", got.Priority)
+	}
+	if got.Project != "DispatchP0" {
+		t.Fatalf("project = %q, want DispatchP0 (the older of the two P0 candidates)", got.Project)
+	}
+	if got.Kind != "dispatch_failure" {
+		t.Fatalf("kind = %q, want dispatch_failure", got.Kind)
+	}
+}
+
+func TestBuildFleetNextActionWithinTierOldestUpdatedAtWins(t *testing.T) {
+	now := time.Now().UTC()
+	older := now.Add(-3 * time.Hour).Format(time.RFC3339)
+	newer := now.Add(-30 * time.Minute).Format(time.RFC3339)
+
+	projects := []fleetProjectState{
+		{
+			Name: "NewerP1",
+			OperatorState: fleetOperatorState{
+				Kind:       "attention",
+				Summary:    "Worker needs review.",
+				NextAction: "Open the worker detail.",
+			},
+			Attention: []sessionInfo{{Slot: "newer-1", Status: string(state.StatusRunning), StartedAt: newer}},
+		},
+		{
+			Name: "OlderP1",
+			OperatorState: fleetOperatorState{
+				Kind:       "attention",
+				Summary:    "Older worker needs review.",
+				NextAction: "Open the older worker detail.",
+			},
+			Attention: []sessionInfo{{Slot: "older-1", Status: string(state.StatusRunning), StartedAt: older}},
+		},
+	}
+	got := buildFleetNextAction(projects, nil, now)
+	if got == nil {
+		t.Fatalf("buildFleetNextAction = nil, want a P1 candidate")
+	}
+	if got.Priority != "P1" {
+		t.Fatalf("priority = %q, want P1", got.Priority)
+	}
+	if got.Project != "OlderP1" {
+		t.Fatalf("project = %q, want OlderP1 (the oldest by updated_at within P1)", got.Project)
+	}
+}
+
+func TestBuildFleetNextActionApprovalPastSLABeatsRegularPending(t *testing.T) {
+	now := time.Now().UTC()
+	approvals := []fleetApprovalState{
+		{
+			ProjectName: "Fresh",
+			ID:          "fresh",
+			Status:      string(state.ApprovalStatusPending),
+			Summary:     "Fresh approval is waiting.",
+			PRURL:       "https://github.com/owner/fresh/pull/9",
+			createdAt:   now.Add(-5 * time.Minute),
+			updatedAt:   now.Add(-5 * time.Minute),
+		},
+		{
+			ProjectName: "PastSLA",
+			ID:          "past-sla",
+			Status:      string(state.ApprovalStatusPending),
+			Summary:     "Approval breached the SLA.",
+			PRURL:       "https://github.com/owner/past-sla/pull/12",
+			createdAt:   now.Add(-45 * time.Minute),
+			updatedAt:   now.Add(-45 * time.Minute),
+		},
+	}
+	got := buildFleetNextAction(nil, approvals, now)
+	if got == nil {
+		t.Fatalf("buildFleetNextAction = nil, want a past-SLA approval winner")
+	}
+	if got.Priority != "P0" || got.Project != "PastSLA" {
+		t.Fatalf("got = %+v, want P0 PastSLA", got)
+	}
+	if got.Kind != "approval_pending" {
+		t.Fatalf("kind = %q, want approval_pending", got.Kind)
+	}
+	if got.TargetURL != "https://github.com/owner/past-sla/pull/12" {
+		t.Fatalf("target_url = %q, want PR URL", got.TargetURL)
+	}
+}
+
+func TestBuildFleetNextActionDispatchFailureUsesSupervisorTimestamp(t *testing.T) {
+	now := time.Now().UTC()
+	ancientAttention := now.Add(-12 * time.Hour).Format(time.RFC3339)
+	recentDecision := now.Add(-5 * time.Minute)
+	olderDecision := now.Add(-2 * time.Hour)
+
+	projects := []fleetProjectState{
+		{
+			Name: "RecentDispatchFailure",
+			OperatorState: fleetOperatorState{
+				Kind:       "dispatch_failure",
+				Summary:    "Supervisor dispatch failed.",
+				NextAction: "Check supervisor logs.",
+			},
+			// An old attention session must NOT artificially backdate the
+			// dispatch failure: buildFleetProjectOperatorState already returned
+			// dispatch_failure ahead of attention, so the picked_at should
+			// follow the supervisor decision that produced the failure.
+			Attention:  []sessionInfo{{Slot: "ghost", Status: string(state.StatusRunning), StartedAt: ancientAttention}},
+			Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{CreatedAt: recentDecision}},
+		},
+		{
+			Name: "OlderDispatchFailure",
+			OperatorState: fleetOperatorState{
+				Kind:       "dispatch_failure",
+				Summary:    "Supervisor dispatch failed earlier.",
+				NextAction: "Check supervisor logs.",
+			},
+			Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{CreatedAt: olderDecision}},
+		},
+	}
+
+	got := buildFleetNextAction(projects, nil, now)
+	if got == nil {
+		t.Fatalf("buildFleetNextAction = nil, want a P0 candidate")
+	}
+	if got.Priority != "P0" || got.Kind != "dispatch_failure" {
+		t.Fatalf("got = %+v, want P0 dispatch_failure", got)
+	}
+	if got.Project != "OlderDispatchFailure" {
+		t.Fatalf("project = %q, want OlderDispatchFailure (older supervisor decision wins, ancient attention session must not pull RecentDispatchFailure backwards)", got.Project)
+	}
+}
+
+func TestBuildFleetNextActionPickedAtIsStableAcrossSnapshots(t *testing.T) {
+	now := time.Now().UTC()
+	startedAt := now.Add(-10 * time.Minute).Format(time.RFC3339)
+	projects := []fleetProjectState{
+		{
+			Name: "AttentionProject",
+			OperatorState: fleetOperatorState{
+				Kind:       "attention",
+				Summary:    "Worker needs review.",
+				NextAction: "Open the worker detail.",
+			},
+			Attention: []sessionInfo{{Slot: "att-1", Status: string(state.StatusRunning), StartedAt: startedAt}},
+		},
+	}
+	first := buildFleetNextAction(projects, nil, now)
+	second := buildFleetNextAction(projects, nil, now.Add(2*time.Minute))
+	if first == nil || second == nil {
+		t.Fatalf("snapshots returned nil: first=%v second=%v", first, second)
+	}
+	if first.PickedAt == "" {
+		t.Fatalf("picked_at is empty; want a stable timestamp derived from the input")
+	}
+	if first.PickedAt != second.PickedAt {
+		t.Fatalf("picked_at = %q vs %q across snapshots; want stability when input is unchanged", first.PickedAt, second.PickedAt)
+	}
+	if first.Project != second.Project || first.Kind != second.Kind {
+		t.Fatalf("selection drifted between snapshots: %+v vs %+v", first, second)
+	}
+}
+
+func TestFleetAPISnapshotIncludesNextAction(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "needs-attention")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"stuck-1": {
+			IssueNumber: 7,
+			IssueTitle:  "Stuck",
+			Status:      state.StatusRetryExhausted,
+			StartedAt:   now.Add(-30 * time.Minute),
+			PRNumber:    71,
+		},
+	})
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("StuckProject", "/tmp/stuck.yaml", "http://127.0.0.1:8787", &config.Config{
+			Repo:        "owner/stuck",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+			Outcome:     outcome.Brief{DesiredOutcome: "Stuck outcome"},
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.NextAction == nil {
+		t.Fatalf("next_action = nil, want a structured object")
+	}
+	if resp.NextAction.Project != "StuckProject" {
+		t.Fatalf("next_action.project = %q, want StuckProject", resp.NextAction.Project)
+	}
+	if resp.NextAction.Priority == "" || resp.NextAction.Kind == "" || resp.NextAction.Reason == "" {
+		t.Fatalf("next_action missing required fields: %+v", resp.NextAction)
+	}
+	// The verdict.sentence stays for backward compatibility.
+	if strings.TrimSpace(resp.Verdict.Sentence) == "" {
+		t.Fatalf("verdict.sentence is empty; expected backward-compatible sentence to remain populated")
+	}
+
+	// Snapshot the JSON top-level keys to lock the shape.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	if _, ok := raw["next_action"]; !ok {
+		t.Fatalf("/api/v1/fleet body missing top-level next_action key")
+	}
+	if _, ok := raw["verdict"]; !ok {
+		t.Fatalf("/api/v1/fleet body missing top-level verdict key (backward-compat regression)")
+	}
+}
+
+func TestFleetAPISnapshotNextActionIsNullWhenQuiet(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "quiet")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"runner-1": {
+			IssueNumber: 1,
+			IssueTitle:  "Quiet runner",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-time.Minute),
+			PID:         os.Getpid(),
+		},
+	})
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("Quiet", "/tmp/quiet.yaml", "", &config.Config{
+			Repo:        "owner/quiet",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+			Outcome:     outcome.Brief{DesiredOutcome: "Quiet outcome"},
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	body, ok := raw["next_action"]
+	if !ok {
+		t.Fatalf("next_action key missing from response")
+	}
+	if string(body) != "null" {
+		t.Fatalf("next_action = %s, want null when no operator action is needed", string(body))
+	}
+}
+
 func TestFleetProjectOperatorStateDistinguishesBriefStates(t *testing.T) {
 	now := time.Now().UTC()
 	configuredOutcome := outcome.Status{Configured: true, Goal: "Runtime is healthy", HealthState: outcome.HealthHealthy}

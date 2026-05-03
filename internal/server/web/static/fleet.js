@@ -92,6 +92,7 @@ const fleetState = {
   detail: null,
   operatorBrief: null,
   verdict: null,
+  nextAction: null,
   refreshedAt: "",
   search: {
     open: false,
@@ -1229,40 +1230,90 @@ function fleetBriefToneClass(tone) {
   }
 }
 
-function renderFleetVerdict(brief, verdict) {
-  const source = brief && brief.sentence ? brief : verdict;
-  const tone = fleetBriefToneClass(source && source.tone);
-  const summary = fleetState.summary || {};
-  const running = Number(summary.running || 0);
-  const attention = Number(summary.needs_attention || 0);
-  const approvals = Number(summary.approvals_pending || 0);
-  let headline = "Supervisor status unavailable.";
-  if (attention > 0 || approvals > 0) {
-    const parts = [];
-    if (attention > 0) parts.push(pluralize(attention, "item") + " need attention");
-    if (approvals > 0) parts.push(pluralize(approvals, "approval") + " wait for review");
-    headline = parts.join(" · ") + ".";
-  } else if (running > 0) {
-    headline = pluralize(running, "worker") + " " + (running === 1 ? "is" : "are") + " running. No operator action is pending.";
-  } else {
-    headline = "All quiet. No operator action is pending.";
+function fleetNextActionToneClass(priority) {
+  switch (String(priority || "").trim().toUpperCase()) {
+  case "P0":
+    return "daemon-down";
+  case "P1":
+    return "attention";
+  case "P2":
+  case "P3":
+    return "attention";
+  default:
+    return "attention";
   }
+}
+
+function fleetNextActionKindLabel(kind) {
+  switch (String(kind || "").trim()) {
+  case "approval_pending": return "Approval pending";
+  case "error": return "Project error";
+  case "dispatch_failure": return "Dispatch failure";
+  case "stale_worker": return "Stale worker";
+  case "attention": return "Worker needs attention";
+  case "outcome_drift": return "Outcome drift";
+  case "stale": return "Stale snapshot";
+  case "no_eligible_issues": return "No eligible issues";
+  case "queue_blocked": return "Queue blocked";
+  case "outcome_missing": return "Outcome brief missing";
+  default: return kind ? String(kind) : "Operator action";
+  }
+}
+
+function fleetSafeTargetURL(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : "";
+}
+
+function renderFleetVerdict(nextAction, verdict) {
+  if (!fleetVerdictEl) return;
+  if (!nextAction) {
+    const fallback = fleetDegradedVerdictFallback(verdict);
+    if (fallback) {
+      fleetVerdictEl.className = "fleet-verdict verdict-" + fallback.tone;
+      fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
+        '<div class="fleet-verdict-headline">' + escapeText(fallback.headline) + '</div>' +
+        '<div class="fleet-verdict-meta">' + escapeText(fallback.meta) + '</div>' +
+      '</div>';
+      return;
+    }
+    fleetVerdictEl.className = "fleet-verdict verdict-healthy";
+    fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
+      '<div class="fleet-verdict-headline">Quiet. Nothing needs you.</div>' +
+      '<div class="fleet-verdict-meta">' + escapeText(fleetState.refreshedAt ? "Last sync " + formatTimestamp(fleetState.refreshedAt) : "No data yet") + '</div>' +
+    '</div>';
+    return;
+  }
+  const tone = fleetNextActionToneClass(nextAction.priority);
+  const project = String(nextAction.project || "").trim();
+  const reason = String(nextAction.reason || "").trim() || "Operator action required.";
+  const headline = (project ? project + " · " : "") + reason;
   const metaParts = [];
+  metaParts.push(String(nextAction.priority || "P1").toUpperCase() + " · " + fleetNextActionKindLabel(nextAction.kind));
   if (fleetState.refreshedAt) metaParts.push("Last sync " + formatTimestamp(fleetState.refreshedAt));
-  if (attention > 0 || approvals > 0) {
-    metaParts.push("Review Needs You below");
-  } else if (running > 0) {
-    metaParts.push("Workers are in flight");
-  } else {
-    metaParts.push("Supervisor heartbeat is current");
-  }
-  if (summary.projects) metaParts.push(pluralize(Number(summary.projects || 0), "project") + " monitored");
-  if (brief && brief.project) metaParts.push("Focus: " + brief.project);
+  if (nextAction.picked_at) metaParts.push("Since " + formatTimestamp(nextAction.picked_at));
+  const safeTarget = fleetSafeTargetURL(nextAction.target_url);
+  const cta = safeTarget
+    ? '<a class="fleet-next-action-cta" href="' + escapeText(safeTarget) + '" target="_blank" rel="noopener">Open ' + escapeText(fleetNextActionKindLabel(nextAction.kind)) + '</a>'
+    : '';
   fleetVerdictEl.className = "fleet-verdict verdict-" + tone;
   fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
-    '<div class="fleet-verdict-headline">' + escapeText(headline) + '</div>' +
+    '<div class="fleet-verdict-headline">What needs me now: ' + escapeText(headline) + '</div>' +
     '<div class="fleet-verdict-meta">' + escapeText(metaParts.join(" · ")) + '</div>' +
-  '</div>';
+  '</div>' + cta;
+}
+
+function fleetDegradedVerdictFallback(verdict) {
+  if (!verdict) return null;
+  const tone = String(verdict.tone || "").trim();
+  const sentence = String(verdict.sentence || "").trim();
+  if (tone !== "daemon-down" && tone !== "error") return null;
+  return {
+    tone: fleetBriefToneClass(tone),
+    headline: sentence || "Supervisor heartbeat unavailable.",
+    meta: fleetState.refreshedAt ? "Last sync " + formatTimestamp(fleetState.refreshedAt) : "No data yet"
+  };
 }
 
 function renderStats(summary) {
@@ -2324,6 +2375,7 @@ function applyFleetData(data) {
   fleetState.attention = attentionFromData(data);
   fleetState.operatorBrief = data.operator_brief || null;
   fleetState.verdict = data.verdict || null;
+  fleetState.nextAction = data.next_action || null;
   if (!fleetState.selectedWorkerKey && fleetState.requestedWorker) {
     const requested = resolveWorkerQuery(fleetState.requestedWorker);
     if (requested) fleetState.selectedWorkerKey = workerKey(requested);
@@ -2345,7 +2397,7 @@ function applyFleetData(data) {
     (alerts.length ? " · " + alerts.join(" · ") : "");
   renderFilterOptions();
   syncFilterControls();
-  renderFleetVerdict(fleetState.operatorBrief, fleetState.verdict);
+  renderFleetVerdict(fleetState.nextAction, fleetState.verdict);
   renderStats(summary);
   renderProjectRail();
   renderProjectOverview();
@@ -2371,7 +2423,7 @@ async function loadFleet() {
     applyFleetData(await response.json());
   } catch (err) {
     subtitleEl.textContent = "Fleet API error" + (fleetState.refreshedAt ? " · Last successful refresh " + formatTimestamp(fleetState.refreshedAt) : "");
-    renderFleetVerdict({ tone: "daemon-down", sentence: "Fleet API error. Supervisor heartbeat unavailable; worker state and attention state could not be confirmed." });
+    renderFleetVerdict({ priority: "P0", kind: "error", project: "Fleet API", reason: "Fleet API error. Supervisor heartbeat unavailable; worker state and attention state could not be confirmed." }, null);
     approvalSummaryEl.textContent = "Fleet API error";
     approvalListEl.innerHTML = '<div class="error">Unable to load approval inbox.</div>';
     attentionSummaryEl.textContent = "Fleet API error";

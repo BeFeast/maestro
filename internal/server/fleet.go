@@ -192,6 +192,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 type fleetResponse struct {
 	ReadOnly      bool                 `json:"read_only"`
 	RefreshedAt   string               `json:"refreshed_at"`
+	NextAction    *fleetNextAction     `json:"next_action"`
 	Verdict       fleetVerdict         `json:"verdict"`
 	OperatorBrief fleetOperatorBrief   `json:"operator_brief"`
 	Projects      []fleetProjectState  `json:"projects"`
@@ -199,6 +200,20 @@ type fleetResponse struct {
 	Workers       []fleetWorkerState   `json:"workers"`
 	Attention     []fleetWorkerState   `json:"attention"`
 	Approvals     []fleetApprovalState `json:"approvals,omitempty"`
+}
+
+// fleetNextAction names the single canonical operator action across the fleet.
+// The selection algorithm is deterministic: items are bucketed into priority
+// tiers P0..P3 and the oldest item by updated_at within the highest-occupied
+// tier wins. picked_at echoes that underlying timestamp so the choice is
+// stable across snapshots while the input is unchanged.
+type fleetNextAction struct {
+	Project   string `json:"project"`
+	Kind      string `json:"kind"`
+	TargetURL string `json:"target_url,omitempty"`
+	Reason    string `json:"reason"`
+	Priority  string `json:"priority"`
+	PickedAt  string `json:"picked_at,omitempty"`
 }
 
 type fleetVerdict struct {
@@ -740,6 +755,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	})
 	sortFleetApprovals(resp.Approvals)
 	resp.OperatorBrief = buildFleetOperatorBrief(resp.Projects, resp.Approvals, now)
+	resp.NextAction = buildFleetNextAction(resp.Projects, resp.Approvals, now)
 	resp.Verdict = buildFleetVerdict(resp, now)
 	return resp
 }
@@ -1001,6 +1017,187 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 		parts = append(parts, fleetCountPhrase(attention, "project with passive attention", "projects with passive attention"))
 	}
 	return fleetOperatorBrief{Tone: "busy", Kind: "active", Sentence: "Global brief: " + strings.Join(parts, "; ") + "; no operator action is needed right now."}
+}
+
+// fleetNextActionCandidate is one possible "what needs me now" item before
+// priority/age sorting picks the canonical winner.
+type fleetNextActionCandidate struct {
+	Project   string
+	Kind      string
+	TargetURL string
+	Reason    string
+	Priority  int
+	UpdatedAt time.Time
+	tieKey    string
+}
+
+// fleetNextActionPriorityForKind maps an operator-state kind onto a priority
+// tier (lower number = higher priority). The second return value reports
+// whether the kind is a "needs operator" candidate at all; non-actionable
+// kinds (working, monitoring_pr, idle, ...) are excluded from the brief.
+func fleetNextActionPriorityForKind(kind string) (int, bool) {
+	switch strings.TrimSpace(kind) {
+	case "error", "dispatch_failure", "stale_worker":
+		return 0, true
+	case "attention":
+		return 1, true
+	case "outcome_drift", "stale", "no_eligible_issues", "queue_blocked":
+		return 2, true
+	case "outcome_missing":
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+// fleetProjectOperatorUpdatedAt returns a stable timestamp for a project's
+// current operator state. The source is chosen from the operator-state kind
+// so that the timestamp matches the signal that drove the state — e.g. a
+// dispatch_failure should age from the supervisor decision, not from an
+// older attention session that the dispatch failure already preempted in
+// buildFleetProjectOperatorState. The choice is "stable" in the sense that
+// it does not depend on `now`, so a snapshot computed twice over the same
+// input returns the same picked_at.
+func fleetProjectOperatorUpdatedAt(project fleetProjectState) time.Time {
+	kind := strings.TrimSpace(project.OperatorState.Kind)
+	switch kind {
+	case "attention", "stale_worker":
+		if len(project.Attention) > 0 {
+			worker := highestPriorityAttentionSession(project.Attention)
+			if t := parseFleetWorkerTime(worker.StartedAt); !t.IsZero() {
+				return t
+			}
+		}
+	case "dispatch_failure", "outcome_drift", "queue_blocked", "no_eligible_issues":
+		if project.Supervisor.Latest != nil && !project.Supervisor.Latest.CreatedAt.IsZero() {
+			return project.Supervisor.Latest.CreatedAt.UTC()
+		}
+	case "stale":
+		if t := parseFleetWorkerTime(project.Freshness.SnapshotAt); !t.IsZero() {
+			return t
+		}
+	}
+	// Fallbacks for kinds without a primary source, or when the primary
+	// source is empty: prefer the most recent supervisor decision, then the
+	// snapshot freshness timestamp.
+	if project.Supervisor.Latest != nil && !project.Supervisor.Latest.CreatedAt.IsZero() {
+		return project.Supervisor.Latest.CreatedAt.UTC()
+	}
+	if t := parseFleetWorkerTime(project.Freshness.SnapshotAt); !t.IsZero() {
+		return t
+	}
+	return time.Time{}
+}
+
+func parseFleetWorkerTime(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t.UTC()
+	}
+	return time.Time{}
+}
+
+// buildFleetNextAction picks the single canonical next operator action across
+// the fleet using the priority + age algorithm documented in
+// docs/fleet-mission-control-runbook.md. Returns nil when nothing needs the
+// operator right now.
+func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprovalState, now time.Time) *fleetNextAction {
+	candidates := make([]fleetNextActionCandidate, 0, len(projects)+len(approvals))
+
+	for i := range approvals {
+		approval := &approvals[i]
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending {
+			continue
+		}
+		priority := 1
+		reason := "Approve or reject the pending supervisor approval after checking the target state."
+		if approvalPastSLA(approval, now) {
+			priority = 0
+			reason = "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now."
+		}
+		if summary := strings.TrimSpace(approval.Summary); summary != "" {
+			reason = summary + " " + reason
+		}
+		target := firstNonEmpty(approval.PRURL, approval.IssueURL, approval.DashboardURL)
+		candidates = append(candidates, fleetNextActionCandidate{
+			Project:   approval.ProjectName,
+			Kind:      "approval_pending",
+			TargetURL: target,
+			Reason:    truncateFleetOperatorText(reason, 200),
+			Priority:  priority,
+			UpdatedAt: fleetApprovalRecency(*approval),
+			tieKey:    "approval|" + approval.ProjectName + "|" + approval.ID,
+		})
+	}
+
+	for i := range projects {
+		project := &projects[i]
+		kind := strings.TrimSpace(project.OperatorState.Kind)
+		priority, ok := fleetNextActionPriorityForKind(kind)
+		if !ok {
+			continue
+		}
+		reason := strings.TrimSpace(project.OperatorState.NextAction)
+		if reason == "" {
+			reason = strings.TrimSpace(project.OperatorState.Summary)
+		}
+		if reason == "" {
+			reason = strings.TrimSpace(project.OperatorState.Label)
+		}
+		target := firstNonEmpty(
+			project.OperatorState.PRURL,
+			project.OperatorState.IssueURL,
+			project.DashboardURL,
+		)
+		candidates = append(candidates, fleetNextActionCandidate{
+			Project:   project.Name,
+			Kind:      kind,
+			TargetURL: target,
+			Reason:    truncateFleetOperatorText(reason, 200),
+			Priority:  priority,
+			UpdatedAt: fleetProjectOperatorUpdatedAt(*project),
+			tieKey:    "project|" + project.Name + "|" + kind,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		l, r := candidates[i], candidates[j]
+		if l.Priority != r.Priority {
+			return l.Priority < r.Priority
+		}
+		// Within a tier the oldest known timestamp wins. A zero/unknown
+		// timestamp is treated as "newer than any known time" so a candidate
+		// with no updated_at loses to a candidate that has one — otherwise a
+		// project missing input data would always grab the brief.
+		switch {
+		case l.UpdatedAt.IsZero() && r.UpdatedAt.IsZero():
+			// fall through to the deterministic tie breaker
+		case l.UpdatedAt.IsZero():
+			return false
+		case r.UpdatedAt.IsZero():
+			return true
+		case !l.UpdatedAt.Equal(r.UpdatedAt):
+			return l.UpdatedAt.Before(r.UpdatedAt)
+		}
+		return l.tieKey < r.tieKey
+	})
+
+	winner := candidates[0]
+	return &fleetNextAction{
+		Project:   winner.Project,
+		Kind:      winner.Kind,
+		TargetURL: winner.TargetURL,
+		Reason:    winner.Reason,
+		Priority:  fmt.Sprintf("P%d", winner.Priority),
+		PickedAt:  formatFleetTime(winner.UpdatedAt),
+	}
 }
 
 const fleetApprovalSLASeconds int64 = 30 * 60
