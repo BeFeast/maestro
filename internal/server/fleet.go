@@ -1051,16 +1051,35 @@ func fleetNextActionPriorityForKind(kind string) (int, bool) {
 }
 
 // fleetProjectOperatorUpdatedAt returns a stable timestamp for a project's
-// current operator state. The choice is "stable" in the sense that it does
-// not depend on `now`, so a snapshot computed twice over the same input
-// returns the same picked_at.
+// current operator state. The source is chosen from the operator-state kind
+// so that the timestamp matches the signal that drove the state — e.g. a
+// dispatch_failure should age from the supervisor decision, not from an
+// older attention session that the dispatch failure already preempted in
+// buildFleetProjectOperatorState. The choice is "stable" in the sense that
+// it does not depend on `now`, so a snapshot computed twice over the same
+// input returns the same picked_at.
 func fleetProjectOperatorUpdatedAt(project fleetProjectState) time.Time {
-	if len(project.Attention) > 0 {
-		worker := highestPriorityAttentionSession(project.Attention)
-		if t := parseFleetWorkerTime(worker.StartedAt); !t.IsZero() {
+	kind := strings.TrimSpace(project.OperatorState.Kind)
+	switch kind {
+	case "attention", "stale_worker":
+		if len(project.Attention) > 0 {
+			worker := highestPriorityAttentionSession(project.Attention)
+			if t := parseFleetWorkerTime(worker.StartedAt); !t.IsZero() {
+				return t
+			}
+		}
+	case "dispatch_failure", "outcome_drift", "queue_blocked", "no_eligible_issues":
+		if project.Supervisor.Latest != nil && !project.Supervisor.Latest.CreatedAt.IsZero() {
+			return project.Supervisor.Latest.CreatedAt.UTC()
+		}
+	case "stale":
+		if t := parseFleetWorkerTime(project.Freshness.SnapshotAt); !t.IsZero() {
 			return t
 		}
 	}
+	// Fallbacks for kinds without a primary source, or when the primary
+	// source is empty: prefer the most recent supervisor decision, then the
+	// snapshot freshness timestamp.
 	if project.Supervisor.Latest != nil && !project.Supervisor.Latest.CreatedAt.IsZero() {
 		return project.Supervisor.Latest.CreatedAt.UTC()
 	}
@@ -1153,9 +1172,10 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 		if l.Priority != r.Priority {
 			return l.Priority < r.Priority
 		}
-		// Within a tier the oldest item wins. Treat zero timestamps as
-		// "older than any known time" so a candidate without an updated_at
-		// loses to a candidate with one.
+		// Within a tier the oldest known timestamp wins. A zero/unknown
+		// timestamp is treated as "newer than any known time" so a candidate
+		// with no updated_at loses to a candidate that has one — otherwise a
+		// project missing input data would always grab the brief.
 		switch {
 		case l.UpdatedAt.IsZero() && r.UpdatedAt.IsZero():
 			// fall through to the deterministic tie breaker

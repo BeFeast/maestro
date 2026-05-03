@@ -1260,9 +1260,24 @@ function fleetNextActionKindLabel(kind) {
   }
 }
 
-function renderFleetVerdict(nextAction) {
+function fleetSafeTargetURL(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : "";
+}
+
+function renderFleetVerdict(nextAction, verdict) {
   if (!fleetVerdictEl) return;
   if (!nextAction || !nextAction.reason) {
+    const fallback = fleetDegradedVerdictFallback(verdict);
+    if (fallback) {
+      fleetVerdictEl.className = "fleet-verdict verdict-" + fallback.tone;
+      fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
+        '<div class="fleet-verdict-headline">' + escapeText(fallback.headline) + '</div>' +
+        '<div class="fleet-verdict-meta">' + escapeText(fallback.meta) + '</div>' +
+      '</div>';
+      return;
+    }
     fleetVerdictEl.className = "fleet-verdict verdict-healthy";
     fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
       '<div class="fleet-verdict-headline">Quiet. Nothing needs you.</div>' +
@@ -1278,15 +1293,27 @@ function renderFleetVerdict(nextAction) {
   metaParts.push(String(nextAction.priority || "P1").toUpperCase() + " · " + fleetNextActionKindLabel(nextAction.kind));
   if (fleetState.refreshedAt) metaParts.push("Last sync " + formatTimestamp(fleetState.refreshedAt));
   if (nextAction.picked_at) metaParts.push("Since " + formatTimestamp(nextAction.picked_at));
-  const target = String(nextAction.target_url || "").trim();
-  const cta = target
-    ? '<a class="fleet-next-action-cta" href="' + escapeText(target) + '" target="_blank" rel="noopener">Open ' + escapeText(fleetNextActionKindLabel(nextAction.kind)) + '</a>'
+  const safeTarget = fleetSafeTargetURL(nextAction.target_url);
+  const cta = safeTarget
+    ? '<a class="fleet-next-action-cta" href="' + escapeText(safeTarget) + '" target="_blank" rel="noopener">Open ' + escapeText(fleetNextActionKindLabel(nextAction.kind)) + '</a>'
     : '';
   fleetVerdictEl.className = "fleet-verdict verdict-" + tone;
   fleetVerdictEl.innerHTML = '<div class="fleet-verdict-copy">' +
     '<div class="fleet-verdict-headline">What needs me now: ' + escapeText(headline) + '</div>' +
     '<div class="fleet-verdict-meta">' + escapeText(metaParts.join(" · ")) + '</div>' +
   '</div>' + cta;
+}
+
+function fleetDegradedVerdictFallback(verdict) {
+  if (!verdict) return null;
+  const tone = String(verdict.tone || "").trim();
+  const sentence = String(verdict.sentence || "").trim();
+  if (tone !== "daemon-down" && tone !== "error") return null;
+  return {
+    tone: fleetBriefToneClass(tone),
+    headline: sentence || "Supervisor heartbeat unavailable.",
+    meta: fleetState.refreshedAt ? "Last sync " + formatTimestamp(fleetState.refreshedAt) : "No data yet"
+  };
 }
 
 function renderStats(summary) {
@@ -2370,7 +2397,7 @@ function applyFleetData(data) {
     (alerts.length ? " · " + alerts.join(" · ") : "");
   renderFilterOptions();
   syncFilterControls();
-  renderFleetVerdict(fleetState.nextAction);
+  renderFleetVerdict(fleetState.nextAction, fleetState.verdict);
   renderStats(summary);
   renderProjectRail();
   renderProjectOverview();
@@ -2396,7 +2423,7 @@ async function loadFleet() {
     applyFleetData(await response.json());
   } catch (err) {
     subtitleEl.textContent = "Fleet API error" + (fleetState.refreshedAt ? " · Last successful refresh " + formatTimestamp(fleetState.refreshedAt) : "");
-    renderFleetVerdict({ priority: "P0", kind: "error", project: "Fleet API", reason: "Fleet API error. Supervisor heartbeat unavailable; worker state and attention state could not be confirmed." });
+    renderFleetVerdict({ priority: "P0", kind: "error", project: "Fleet API", reason: "Fleet API error. Supervisor heartbeat unavailable; worker state and attention state could not be confirmed." }, null);
     approvalSummaryEl.textContent = "Fleet API error";
     approvalListEl.innerHTML = '<div class="error">Unable to load approval inbox.</div>';
     attentionSummaryEl.textContent = "Fleet API error";

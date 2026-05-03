@@ -971,6 +971,50 @@ func TestBuildFleetNextActionApprovalPastSLABeatsRegularPending(t *testing.T) {
 	}
 }
 
+func TestBuildFleetNextActionDispatchFailureUsesSupervisorTimestamp(t *testing.T) {
+	now := time.Now().UTC()
+	ancientAttention := now.Add(-12 * time.Hour).Format(time.RFC3339)
+	recentDecision := now.Add(-5 * time.Minute)
+	olderDecision := now.Add(-2 * time.Hour)
+
+	projects := []fleetProjectState{
+		{
+			Name: "RecentDispatchFailure",
+			OperatorState: fleetOperatorState{
+				Kind:       "dispatch_failure",
+				Summary:    "Supervisor dispatch failed.",
+				NextAction: "Check supervisor logs.",
+			},
+			// An old attention session must NOT artificially backdate the
+			// dispatch failure: buildFleetProjectOperatorState already returned
+			// dispatch_failure ahead of attention, so the picked_at should
+			// follow the supervisor decision that produced the failure.
+			Attention:  []sessionInfo{{Slot: "ghost", Status: string(state.StatusRunning), StartedAt: ancientAttention}},
+			Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{CreatedAt: recentDecision}},
+		},
+		{
+			Name: "OlderDispatchFailure",
+			OperatorState: fleetOperatorState{
+				Kind:       "dispatch_failure",
+				Summary:    "Supervisor dispatch failed earlier.",
+				NextAction: "Check supervisor logs.",
+			},
+			Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{CreatedAt: olderDecision}},
+		},
+	}
+
+	got := buildFleetNextAction(projects, nil, now)
+	if got == nil {
+		t.Fatalf("buildFleetNextAction = nil, want a P0 candidate")
+	}
+	if got.Priority != "P0" || got.Kind != "dispatch_failure" {
+		t.Fatalf("got = %+v, want P0 dispatch_failure", got)
+	}
+	if got.Project != "OlderDispatchFailure" {
+		t.Fatalf("project = %q, want OlderDispatchFailure (older supervisor decision wins, ancient attention session must not pull RecentDispatchFailure backwards)", got.Project)
+	}
+}
+
 func TestBuildFleetNextActionPickedAtIsStableAcrossSnapshots(t *testing.T) {
 	now := time.Now().UTC()
 	startedAt := now.Add(-10 * time.Minute).Format(time.RFC3339)
