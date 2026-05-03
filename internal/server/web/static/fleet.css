@@ -1583,58 +1583,23 @@
   }
 
   .stats {
-    grid-template-columns: minmax(280px, 1.4fr) minmax(0, 2.6fr);
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 0;
     align-items: stretch;
   }
 
-  .stats-hero-card {
-    display: grid;
-    align-content: end;
-    gap: 10px;
-    padding: 24px 26px;
-    border-right: 1px solid var(--line);
-    background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(243,250,249,.98));
+  .stat {
+    min-height: 132px;
+    padding: 22px 26px;
   }
 
-  .stats-hero-label {
-    color: var(--text-faint);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    font-weight: 650;
-    letter-spacing: .08em;
-    text-transform: uppercase;
+  .stat strong {
+    font-size: clamp(34px, 3.1vw, 48px);
+    line-height: .95;
   }
 
-  .stats-hero-value {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-  }
-
-  .stats-hero-value strong {
-    font-size: clamp(56px, 7vw, 84px);
-    line-height: .92;
-    font-weight: 780;
-  }
-
-  .stats-hero-note {
-    color: var(--muted);
-    font-size: 14px;
-  }
-
-  .stats-compact-strip {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  .stat-compact {
-    padding: 18px 18px 16px;
-  }
-
-  .stat-compact strong {
-    font-size: 32px;
-    font-weight: 720;
+  .stat-suffix {
+    font-size: 18px;
   }
 
   .project-rail-head {
@@ -1753,25 +1718,24 @@
 
   .needs-you-list {
     display: grid;
-    gap: 8px;
-    padding: 0 18px 16px;
+    gap: 0;
+    padding: 0;
   }
 
   .needs-you-item {
     display: grid;
-    grid-template-columns: 160px minmax(0, 1.2fr) minmax(0, 1fr);
+    grid-template-columns: 170px minmax(0, 1.1fr) minmax(0, 1.2fr);
     align-items: start;
-    gap: 10px 16px;
-    padding: 14px 16px;
-    border: 1px solid rgba(215,222,232,.92);
-    border-radius: 8px;
-    background: #fff;
+    gap: 8px 16px;
+    padding: 10px 18px;
+    border-top: 1px solid rgba(215,222,232,.92);
+    background: rgba(255,255,255,.74);
   }
 
   .needs-you-kicker {
     color: var(--text-faint);
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 650;
     letter-spacing: .08em;
     text-transform: uppercase;
@@ -1780,17 +1744,20 @@
   .needs-you-headline {
     margin-top: 0;
     color: var(--text);
-    font-size: 16px;
+    font-size: 14px;
     font-weight: 720;
     line-height: 1.25;
   }
 
-  .needs-you-copy,
-  .needs-you-meta {
+  .needs-you-copy {
     margin-top: 0;
     color: var(--muted);
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+
+  .needs-you-meta {
+    display: none;
   }
 
   .needs-you-worker {
@@ -1827,12 +1794,7 @@
 
   @media (max-width: 1320px) {
     .stats {
-      grid-template-columns: 1fr;
-    }
-
-    .stats-hero-card {
-      border-right: 0;
-      border-bottom: 1px solid var(--line);
+      grid-template-columns: repeat(5, minmax(0, 1fr));
     }
   }
 
@@ -1847,7 +1809,7 @@
       max-width: none;
     }
 
-    .stats-compact-strip {
+    .stats {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
