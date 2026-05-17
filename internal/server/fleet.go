@@ -2147,6 +2147,14 @@ func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorS
 			Summary:    firstNonEmpty(summary, "Supervisor selected an issue and should start a worker."),
 			NextAction: "A worker should start on the next supervisor cycle; escalate if this exceeds the dispatch SLA.",
 		}
+	case "spawn_repair_worker":
+		operator = fleetOperatorState{
+			Kind:       "pending_dispatch",
+			Tone:       "attention",
+			Label:      "Repair pending",
+			Summary:    firstNonEmpty(summary, "Supervisor selected repair work for a failing PR or outcome."),
+			NextAction: "Start or approve the repair worker; the existing PR/outcome is not sufficient for completion.",
+		}
 	case "wait_for_worker":
 		return fleetOperatorState{Kind: "working", Tone: "busy", Label: "Working", Summary: firstNonEmpty(summary, "Supervisor is waiting for a worker to finish.")}, true
 	default:

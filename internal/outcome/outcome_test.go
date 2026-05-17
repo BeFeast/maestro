@@ -63,6 +63,42 @@ func TestStatusForConfiguredBriefUnknownHealth(t *testing.T) {
 	}
 }
 
+func TestBriefSupportsOutcomeControlledDeliveryAliases(t *testing.T) {
+	passRequired := true
+	failRequiresWork := true
+	brief := Brief{
+		DesiredOutcome:          "Accepted runtime route matches the design artifact",
+		RuntimeURL:              "https://app.example.com",
+		VerifierCommand:         "./verify-live.sh",
+		RequiredRoutes:          []string{"/", "/", " /settings "},
+		RequiresDeploy:          true,
+		PassRequiredForDone:     &passRequired,
+		FailRequiresVisibleWork: &failRequiresWork,
+	}
+
+	normalized := brief.Normalized()
+	if normalized.RuntimeTarget != "https://app.example.com" || normalized.RuntimeURL != "https://app.example.com" {
+		t.Fatalf("runtime aliases = %q/%q, want both populated", normalized.RuntimeTarget, normalized.RuntimeURL)
+	}
+	if normalized.HealthcheckCommand != "./verify-live.sh" || normalized.VerifierCommand != "./verify-live.sh" {
+		t.Fatalf("verifier aliases = %q/%q, want both populated", normalized.HealthcheckCommand, normalized.VerifierCommand)
+	}
+
+	status := StatusFor(brief, 0, time.Time{})
+	if status.RuntimeTarget != "https://app.example.com" || status.RuntimeURL != "https://app.example.com" {
+		t.Fatalf("status runtime aliases = %+v, want runtime target/url", status)
+	}
+	if status.HealthcheckCommand != "./verify-live.sh" || status.VerifierCommand != "./verify-live.sh" {
+		t.Fatalf("status verifier aliases = %+v, want command aliases", status)
+	}
+	if !status.RequiresDeploy || !status.PassRequiredForDone || !status.FailRequiresVisibleWork {
+		t.Fatalf("status policy flags = %+v, want enabled", status)
+	}
+	if len(status.RequiredRoutes) != 2 || status.RequiredRoutes[0] != "/" || status.RequiredRoutes[1] != "/settings" {
+		t.Fatalf("RequiredRoutes = %#v, want compacted routes", status.RequiredRoutes)
+	}
+}
+
 func TestStatusForUsesFreshHealthCheck(t *testing.T) {
 	lastMerge := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	status := StatusFor(Brief{

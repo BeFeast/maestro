@@ -383,15 +383,15 @@ func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus)
 // Mapping:
 //   - running               => In Progress
 //   - queued / pr_open      => In Review
-//   - code_landed           => In Progress (issue remains open until runtime
-//     verification closes it; only then does it move to Done)
+//   - code_landed           => Deploying or Live Verification (depending on
+//     whether the outcome contract requires deploy)
 //   - done                  => Done
 //   - retry_exhausted /
 //     conflict_failed /
 //     failed                => Blocked
 //   - dead with no retry    => Blocked
 //   - dead awaiting retry   => In Progress (work is still active)
-func projectStatusForSession(sess *state.Session) (github.ProjectStatus, bool) {
+func projectStatusForSession(sess *state.Session, requiresDeploy bool) (github.ProjectStatus, bool) {
 	if sess == nil {
 		return "", false
 	}
@@ -401,7 +401,7 @@ func projectStatusForSession(sess *state.Session) (github.ProjectStatus, bool) {
 	case state.StatusQueued, state.StatusPROpen:
 		return github.ProjectStatusInReview, true
 	case state.StatusCodeLanded:
-		return github.ProjectStatusInProgress, true
+		return codeLandedProjectStatus(requiresDeploy), true
 	case state.StatusDone:
 		return github.ProjectStatusDone, true
 	case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed:
@@ -480,7 +480,7 @@ func (o *Orchestrator) reconcileSessionsToProjectBoard(s *state.State) {
 		}
 	}
 	for issue, sess := range freshest {
-		status, ok := projectStatusForSession(sess)
+		status, ok := projectStatusForSession(sess, o.cfg.Outcome.RequiresDeploy)
 		if !ok {
 			continue
 		}
@@ -492,6 +492,13 @@ func (o *Orchestrator) reconcileSessionsToProjectBoard(s *state.State) {
 		}
 		o.syncProject(issue, status)
 	}
+}
+
+func codeLandedProjectStatus(requiresDeploy bool) github.ProjectStatus {
+	if requiresDeploy {
+		return github.ProjectStatusDeploying
+	}
+	return github.ProjectStatusLiveVerify
 }
 
 func sessionRecency(sess *state.Session) time.Time {
@@ -1953,7 +1960,7 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
-	o.syncProject(sess.IssueNumber, github.ProjectStatusInProgress)
+	o.syncProject(sess.IssueNumber, codeLandedProjectStatus(o.cfg.Outcome.RequiresDeploy))
 	sess.Status = state.StatusCodeLanded
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
@@ -2413,6 +2420,23 @@ func (o *Orchestrator) supervisorOwnsDynamicReadyLabel() bool {
 	return o.cfg != nil && o.cfg.Supervisor.DynamicWave.Active() && o.cfg.Supervisor.DynamicWave.OwnsReadyLabel
 }
 
+func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber int) bool {
+	if s == nil || issueNumber <= 0 {
+		return false
+	}
+	decision := s.LatestSupervisorDecision()
+	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker {
+		return false
+	}
+	if decision.RequiresApproval || decision.Risk == supervisor.RiskApprovalGated {
+		return false
+	}
+	if decision.Target == nil || decision.Target.Issue != issueNumber {
+		return false
+	}
+	return true
+}
+
 func (o *Orchestrator) supervisorOwnedReadySelectedIssue(s *state.State) (int, bool) {
 	if !o.supervisorOwnsDynamicReadyLabel() || s == nil {
 		return 0, false
@@ -2475,6 +2499,13 @@ func (o *Orchestrator) augmentWithSupervisorSelectedIssue(s *state.State, issues
 	if !ok || selected <= 0 || containsIssueNumber(issues, selected) {
 		return issues
 	}
+	return o.appendFetchedSupervisorIssue(issues, selected)
+}
+
+func (o *Orchestrator) appendFetchedSupervisorIssue(issues []github.Issue, selected int) []github.Issue {
+	if selected <= 0 || containsIssueNumber(issues, selected) {
+		return issues
+	}
 
 	issue, err := o.getIssue(selected)
 	if err != nil {
@@ -2500,6 +2531,11 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
 		return
+	}
+	if decision := s.LatestSupervisorDecision(); decision != nil && decision.RecommendedAction == supervisor.ActionSpawnRepairWorker && decision.Target != nil {
+		if !decision.RequiresApproval && decision.Risk != supervisor.RiskApprovalGated {
+			issues = o.appendFetchedSupervisorIssue(issues, decision.Target.Issue)
+		}
 	}
 	issues = o.augmentWithSupervisorSelectedIssue(s, issues)
 	if filtered, ordered := o.applyOrderedQueueFilter(s, issues); ordered {
@@ -2543,16 +2579,20 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if o.cfg.MaxRetriesPerIssue > 0 {
 			failed := s.FailedAttemptsForIssue(issue.Number)
 			if failed >= o.cfg.MaxRetriesPerIssue {
-				if !s.IssueRetryExhausted(issue.Number) {
-					// First time hitting the limit — mark, label, and notify
-					s.MarkIssueRetryExhausted(issue.Number)
-					// auto-label blocked disabled
-					o.notifier.Sendf("⚠️ Issue #%d hit max retries (%d) — needs manual review",
-						issue.Number, o.cfg.MaxRetriesPerIssue)
+				if o.supervisorSelectedRepairSpawn(s, issue.Number) {
+					log.Printf("[orch] allowing repair worker for issue #%d despite retry limit because supervisor selected spawn_repair_worker", issue.Number)
+				} else {
+					if !s.IssueRetryExhausted(issue.Number) {
+						// First time hitting the limit — mark, label, and notify
+						s.MarkIssueRetryExhausted(issue.Number)
+						// auto-label blocked disabled
+						o.notifier.Sendf("⚠️ Issue #%d hit max retries (%d) — needs manual review",
+							issue.Number, o.cfg.MaxRetriesPerIssue)
+					}
+					log.Printf("[orch] skipping issue #%d: retry limit exhausted (%d/%d attempts)",
+						issue.Number, failed, o.cfg.MaxRetriesPerIssue)
+					continue
 				}
-				log.Printf("[orch] skipping issue #%d: retry limit exhausted (%d/%d attempts)",
-					issue.Number, failed, o.cfg.MaxRetriesPerIssue)
-				continue
 			}
 		}
 
@@ -2582,8 +2622,11 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if hasOpenPR, err := o.hasOpenPRForIssue(issue.Number); err != nil {
 			log.Printf("[orch] warn: could not check open PRs for issue #%d: %v", issue.Number, err)
 		} else if hasOpenPR {
-			log.Printf("[orch] skipping issue #%d: open PR already exists", issue.Number)
-			continue
+			if !o.supervisorSelectedRepairSpawn(s, issue.Number) {
+				log.Printf("[orch] skipping issue #%d: open PR already exists", issue.Number)
+				continue
+			}
+			log.Printf("[orch] allowing repair worker for issue #%d despite open PR because supervisor selected spawn_repair_worker", issue.Number)
 		}
 
 		// Determine initial phase and backend

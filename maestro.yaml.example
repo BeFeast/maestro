@@ -24,10 +24,17 @@ auto_retry_rebase_conflicts: false # retry PRs whose auto-rebase fails with conf
 # outcome:
 #   desired_outcome: Maestro can supervise its own development and show a live Mission Control dashboard.
 #   runtime_target: http://127.0.0.1:8786
+#   runtime_url: http://127.0.0.1:8786          # alias for runtime_target
 #   deployment_status_command: systemctl --user status maestro.service
 #   healthcheck_url: http://127.0.0.1:8786/api/v1/state
+#   verifier_command: ./scripts/verify-live-outcome.sh  # alias for healthcheck_command
 #   source_repo_path: /path/to/local/maestro
 #   runtime_host: local developer workstation
+#   required_routes:
+#     - /
+#   requires_deploy: true
+#   pass_required_for_done: true
+#   fail_requires_visible_work: true
 #   non_goals:
 #     - Mutate production deploys without explicit approval controls
 #     - Generate broad issue waves automatically
