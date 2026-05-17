@@ -5410,6 +5410,36 @@ func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
 	o.syncProject(42, github.ProjectStatusInProgress)
 }
 
+func TestSyncProject_SkipsWhenGraphQLBudgetLow(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 3,
+		},
+	}
+	calls := 0
+	o := &Orchestrator{
+		cfg: cfg,
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 0, Used: 5000},
+			}, nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			calls++
+			return true
+		},
+	}
+
+	if o.syncProject(42, github.ProjectStatusInProgress) {
+		t.Fatal("syncProject returned true, want false when GraphQL budget is depleted")
+	}
+	if calls != 0 {
+		t.Fatalf("syncProjectFn calls = %d, want 0 when budget is depleted", calls)
+	}
+}
+
 func TestReconcileSessionsToProjectBoard_SkipsAlreadySyncedStatus(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
@@ -5422,6 +5452,11 @@ func TestReconcileSessionsToProjectBoard_SkipsAlreadySyncedStatus(t *testing.T) 
 	var lastStatus github.ProjectStatus
 	o := &Orchestrator{
 		cfg: cfg,
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+			}, nil
+		},
 		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
 			calls++
 			lastStatus = status
