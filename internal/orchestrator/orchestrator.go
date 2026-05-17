@@ -368,21 +368,67 @@ func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus)
 		return
 	}
 	o.ensureProjectField()
-	// Map old ProjectStatus constants to real column names
-	statusName := map[github.ProjectStatus]string{
-		github.ProjectStatusTodo:       "Todo",
-		github.ProjectStatusInProgress: "In Progress",
-		github.ProjectStatusDone:       "Done",
-	}[status]
-	if statusName == "" {
-		statusName = string(status)
+	candidates := github.ProjectStatusCandidates(status)
+	if len(candidates) == 0 {
+		candidates = []string{string(status)}
 	}
-	o.gh.SyncIssueStatus(o.projectField, issueNumber, statusName)
+	o.gh.SyncIssueStatusOneOf(o.projectField, issueNumber, candidates...)
 }
 
-// reconcileProjectBoard moves closed issues to Done on the project board.
-// This catches issues closed externally (manual merge, GitHub auto-close, manual close).
-func (o *Orchestrator) reconcileProjectBoard() {
+// projectStatusForSession returns the ProjectStatus that should mirror this
+// session on the GitHub Project board, plus whether a sync should happen.
+// Sessions that have no clear board-level status (transient/unknown) return
+// false so the existing board state is left alone.
+//
+// Mapping:
+//   - running               => In Progress
+//   - queued / pr_open      => In Review
+//   - code_landed           => In Progress (issue remains open until runtime
+//     verification closes it; only then does it move to Done)
+//   - done                  => Done
+//   - retry_exhausted /
+//     conflict_failed /
+//     failed                => Blocked
+//   - dead with no retry    => Blocked
+//   - dead awaiting retry   => In Progress (work is still active)
+func projectStatusForSession(sess *state.Session) (github.ProjectStatus, bool) {
+	if sess == nil {
+		return "", false
+	}
+	switch sess.Status {
+	case state.StatusRunning:
+		return github.ProjectStatusInProgress, true
+	case state.StatusQueued, state.StatusPROpen:
+		return github.ProjectStatusInReview, true
+	case state.StatusCodeLanded:
+		return github.ProjectStatusInProgress, true
+	case state.StatusDone:
+		return github.ProjectStatusDone, true
+	case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed:
+		return github.ProjectStatusBlocked, true
+	case state.StatusDead:
+		if sess.NextRetryAt != nil {
+			return github.ProjectStatusInProgress, true
+		}
+		return github.ProjectStatusBlocked, true
+	default:
+		return "", false
+	}
+}
+
+// reconcileProjectBoard reconciles the GitHub Project board against Maestro
+// state so the board never contradicts the runtime:
+//   - every active session (running/queued/pr_open/code_landed/blocked) has its
+//     status mirrored on the board so a live worker is always visible as
+//     active work (no manual "panoptikon-project-sync" timer needed);
+//   - items whose underlying issue is closed move to Done;
+//   - items with no Status fall back to Todo so they show up in the backlog.
+//
+// "Done" is only set on the board when the underlying GitHub issue is closed —
+// merging a PR alone keeps the item in In Progress until runtime/deploy
+// verification closes the issue (see markCodeLanded). This preserves the
+// merge-then-verify policy required by ops.
+func (o *Orchestrator) reconcileProjectBoard(s *state.State) {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
 		return
 	}
@@ -390,6 +436,8 @@ func (o *Orchestrator) reconcileProjectBoard() {
 	if o.projectField == nil {
 		return
 	}
+
+	o.reconcileSessionsToProjectBoard(s)
 
 	items, err := o.gh.ListNonDoneProjectItems(o.projectField)
 	if err != nil {
@@ -400,12 +448,67 @@ func (o *Orchestrator) reconcileProjectBoard() {
 	for _, item := range items {
 		if item.IssueClosed {
 			log.Printf("[orch] reconcile: issue #%d is closed, moving to Done", item.IssueNumber)
-			o.gh.SyncIssueStatus(o.projectField, item.IssueNumber, "Done")
+			o.syncProject(item.IssueNumber, github.ProjectStatusDone)
 		} else if !item.HasStatus {
 			log.Printf("[orch] reconcile: issue #%d has no status, setting to Todo", item.IssueNumber)
-			o.gh.SyncIssueStatus(o.projectField, item.IssueNumber, "Todo")
+			o.syncProject(item.IssueNumber, github.ProjectStatusTodo)
 		}
 	}
+}
+
+// reconcileSessionsToProjectBoard pushes each Maestro session's status onto the
+// project board so the board mirrors the runtime even when an earlier sync was
+// missed (project discovery failed, network blip, board reset, …).
+func (o *Orchestrator) reconcileSessionsToProjectBoard(s *state.State) {
+	if s == nil {
+		return
+	}
+	// Pick the freshest session per issue so a running worker always wins over
+	// an older terminal record for the same issue.
+	freshest := make(map[int]*state.Session, len(s.Sessions))
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber <= 0 {
+			continue
+		}
+		current, ok := freshest[sess.IssueNumber]
+		if !ok {
+			freshest[sess.IssueNumber] = sess
+			continue
+		}
+		if sessionRecency(sess).After(sessionRecency(current)) {
+			freshest[sess.IssueNumber] = sess
+		}
+	}
+	for issue, sess := range freshest {
+		status, ok := projectStatusForSession(sess)
+		if !ok {
+			continue
+		}
+		// Done is only set elsewhere (closed issue or merge-then-close
+		// reconciliation), so skip Done here even if the session is marked
+		// done — the closed-issue pass below will confirm it.
+		if status == github.ProjectStatusDone {
+			continue
+		}
+		o.syncProject(issue, status)
+	}
+}
+
+func sessionRecency(sess *state.Session) time.Time {
+	if sess == nil {
+		return time.Time{}
+	}
+	candidates := []time.Time{sess.LastOutputChangedAt, sess.StartedAt}
+	if sess.FinishedAt != nil {
+		candidates = append(candidates, *sess.FinishedAt)
+	}
+	var latest time.Time
+	for _, t := range candidates {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	return latest
 }
 
 func readLastLines(path string, limit int) (string, error) {
@@ -789,8 +892,10 @@ func (o *Orchestrator) RunOnce() error {
 		}
 	}
 
-	// Step 6: Reconcile project board — move externally-closed issues to Done
-	o.reconcileProjectBoard()
+	// Step 6: Reconcile project board — mirror Maestro session state onto the
+	// board (active workers visible as In Progress, open PRs as In Review,
+	// blocked sessions as Blocked) and move externally-closed issues to Done.
+	o.reconcileProjectBoard(s)
 
 	// Flush digest buffer (no-op if digest mode is off or buffer is empty)
 	if err := o.notifier.Flush(); err != nil {
@@ -1282,7 +1387,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					// Retry limit reached — mark as permanently failed
 					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
 					// auto-label blocked disabled
-					o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+					o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
 					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
@@ -1491,7 +1596,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
 				}
 				// auto-label blocked disabled
-				o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+				o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
 				sess.Status = state.StatusFailed
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
@@ -1697,7 +1802,7 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
 		alreadyNotified := sess.LastNotifiedStatus == "review_retry_exhausted"
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
-		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
 		sess.Status = state.StatusRetryExhausted
 		sess.NextRetryAt = nil
 		sess.LastNotifiedStatus = "review_retry_exhausted"
@@ -1755,7 +1860,7 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		alreadyNotified := sess.LastNotifiedStatus == "ci_retry_exhausted"
 		// auto-label blocked disabled
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
-		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
 		sess.Status = state.StatusRetryExhausted
 		sess.NextRetryAt = nil
 		sess.LastNotifiedStatus = "ci_retry_exhausted"
@@ -2027,7 +2132,7 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 		log.Printf("[orch] rebase conflict on PR #%d — retry limit reached (%d/%d) for issue #%d",
 			prNumber, totalAttempts, maxRetries, sess.IssueNumber)
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
-		o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
 		sess.Status = state.StatusRetryExhausted
 		sess.NextRetryAt = nil
 		sess.LastNotifiedStatus = "rebase_conflict_retry_exhausted"

@@ -20,8 +20,31 @@ type ProjectStatus string
 const (
 	ProjectStatusTodo       ProjectStatus = "todo"
 	ProjectStatusInProgress ProjectStatus = "in_progress"
+	ProjectStatusInReview   ProjectStatus = "in_review"
+	ProjectStatusBlocked    ProjectStatus = "blocked"
 	ProjectStatusDone       ProjectStatus = "done"
 )
+
+// ProjectStatusCandidates returns the ordered list of column names to try when
+// applying a high-level ProjectStatus to a real GitHub Project board. Boards
+// often customize column names (e.g. "Review" vs "In Review", "On Hold" vs
+// "Blocked"); the first option present in the board's Status field wins.
+func ProjectStatusCandidates(status ProjectStatus) []string {
+	switch status {
+	case ProjectStatusTodo:
+		return []string{"Todo", "To do", "To Do", "Backlog"}
+	case ProjectStatusInProgress:
+		return []string{"In Progress", "In progress", "Doing"}
+	case ProjectStatusInReview:
+		return []string{"In Review", "In review", "Review", "Reviewing", "Code Review", "In Progress", "In progress"}
+	case ProjectStatusBlocked:
+		return []string{"Blocked", "On Hold", "On hold", "Stuck", "Needs Attention", "Needs attention"}
+	case ProjectStatusDone:
+		return []string{"Done", "Completed", "Closed"}
+	default:
+		return nil
+	}
+}
 
 // ProjectField holds the Status field metadata for a GitHub Project, discovered at runtime.
 type ProjectField struct {
@@ -214,13 +237,22 @@ func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error
 // SyncIssueStatus adds an issue to the project (if not already) and sets its Status.
 // Best-effort: errors are logged, never returned.
 func (c *Client) SyncIssueStatus(pf *ProjectField, issueNumber int, statusName string) {
+	c.SyncIssueStatusOneOf(pf, issueNumber, statusName)
+}
+
+// SyncIssueStatusOneOf is SyncIssueStatus that tries each candidate column name
+// in order and uses the first that exists on the project board. This lets
+// callers express logical intent (e.g. "In Review") while tolerating boards
+// that use a different label ("Review", "Code Review"). When no candidate
+// matches, the call is a no-op so the worker runtime keeps making progress.
+func (c *Client) SyncIssueStatusOneOf(pf *ProjectField, issueNumber int, candidates ...string) {
 	if pf == nil {
 		return
 	}
 
-	optionID, ok := pf.Options[statusName]
+	statusName, optionID, ok := resolveProjectStatusOption(pf, candidates)
 	if !ok {
-		log.Printf("[projects] status %q not found in project (have: %v), skipping issue #%d", statusName, keys(pf.Options), issueNumber)
+		log.Printf("[projects] none of statuses %v found in project (have: %v), skipping issue #%d", candidates, keys(pf.Options), issueNumber)
 		return
 	}
 
@@ -361,4 +393,43 @@ func keys(m map[string]string) []string {
 		ks = append(ks, k)
 	}
 	return ks
+}
+
+// resolveProjectStatusOption finds the first candidate status name that exists
+// on the project's Status field, comparing case-insensitively and ignoring
+// surrounding whitespace. Returns the canonical (board) name and its option ID.
+func resolveProjectStatusOption(pf *ProjectField, candidates []string) (string, string, bool) {
+	if pf == nil || len(pf.Options) == 0 {
+		return "", "", false
+	}
+
+	normalized := make(map[string]string, len(pf.Options))
+	for name := range pf.Options {
+		normalized[normalizeProjectStatusKey(name)] = name
+	}
+
+	for _, candidate := range candidates {
+		key := normalizeProjectStatusKey(candidate)
+		if key == "" {
+			continue
+		}
+		// Exact match (case sensitive) first to preserve historical behavior.
+		if id, ok := pf.Options[candidate]; ok {
+			return candidate, id, true
+		}
+		if name, ok := normalized[key]; ok {
+			return name, pf.Options[name], true
+		}
+	}
+	return "", "", false
+}
+
+func normalizeProjectStatusKey(name string) string {
+	out := strings.ToLower(strings.TrimSpace(name))
+	out = strings.ReplaceAll(out, "_", " ")
+	out = strings.ReplaceAll(out, "-", " ")
+	for strings.Contains(out, "  ") {
+		out = strings.ReplaceAll(out, "  ", " ")
+	}
+	return out
 }
