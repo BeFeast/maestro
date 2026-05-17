@@ -416,19 +416,6 @@ func projectStatusForSession(sess *state.Session) (github.ProjectStatus, bool) {
 	}
 }
 
-// syncProjectForSession mirrors session runtime state to the Project board.
-// Best-effort; logs and continues so worker scheduling is never blocked.
-func (o *Orchestrator) syncProjectForSession(sess *state.Session) {
-	if sess == nil || sess.IssueNumber <= 0 {
-		return
-	}
-	status, ok := projectStatusForSession(sess)
-	if !ok {
-		return
-	}
-	o.syncProject(sess.IssueNumber, status)
-}
-
 // reconcileProjectBoard reconciles the GitHub Project board against Maestro
 // state so the board never contradicts the runtime:
 //   - every active session (running/queued/pr_open/code_landed/blocked) has its

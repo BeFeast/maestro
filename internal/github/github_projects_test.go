@@ -152,7 +152,7 @@ func TestResolveProjectStatusOption(t *testing.T) {
 			wantOK:     true,
 		},
 		{
-			name:       "first candidate wins when present",
+			name:       "falls through to next candidate when first is absent",
 			candidates: []string{"In Review", "Review"},
 			wantName:   "Review",
 			wantID:     "id-review",
