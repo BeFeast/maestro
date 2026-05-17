@@ -510,6 +510,7 @@ func parse(data []byte) (*Config, error) {
 			"monitor_open_pr",
 			"review_retry_exhausted",
 			"check_outcome_health",
+			"notify_red",
 			"spawn_worker",
 			"spawn_repair_worker",
 			"label_issue_ready",

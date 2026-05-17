@@ -62,6 +62,18 @@ type Client struct {
 	Repo string
 }
 
+type RateLimitBucket struct {
+	Limit     int `json:"limit"`
+	Remaining int `json:"remaining"`
+	Reset     int `json:"reset"`
+	Used      int `json:"used"`
+}
+
+type RateLimitStatus struct {
+	Core    RateLimitBucket `json:"core"`
+	GraphQL RateLimitBucket `json:"graphql"`
+}
+
 type restIssue struct {
 	Number int     `json:"number"`
 	Title  string  `json:"title"`
@@ -127,6 +139,34 @@ func ghAPI(endpoint string) ([]byte, error) {
 		return nil, fmt.Errorf("gh api %s: %w", endpoint, err)
 	}
 	return out, nil
+}
+
+func parseRateLimitStatus(out []byte) (RateLimitStatus, error) {
+	var payload struct {
+		Resources struct {
+			Core    RateLimitBucket `json:"core"`
+			GraphQL RateLimitBucket `json:"graphql"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return RateLimitStatus{}, err
+	}
+	return RateLimitStatus{
+		Core:    payload.Resources.Core,
+		GraphQL: payload.Resources.GraphQL,
+	}, nil
+}
+
+func (c *Client) RateLimit() (RateLimitStatus, error) {
+	out, err := ghAPI("rate_limit")
+	if err != nil {
+		return RateLimitStatus{}, err
+	}
+	status, err := parseRateLimitStatus(out)
+	if err != nil {
+		return RateLimitStatus{}, fmt.Errorf("parse rate limit: %w", err)
+	}
+	return status, nil
 }
 
 func parseRESTIssues(out []byte) ([]Issue, error) {

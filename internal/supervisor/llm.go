@@ -338,6 +338,7 @@ func defaultAllowedActions() []string {
 		ActionMonitorOpenPR,
 		ActionReviewRetryExhausted,
 		ActionCheckOutcomeHealth,
+		ActionNotifyRed,
 		ActionSpawnWorker,
 		ActionSpawnRepairWorker,
 		ActionLabelIssueReady,
@@ -369,6 +370,8 @@ func canonicalAction(action string) string {
 		return ActionReviewRetryExhausted
 	case ActionCheckOutcomeHealth:
 		return ActionCheckOutcomeHealth
+	case ActionNotifyRed:
+		return ActionNotifyRed
 	case ActionSpawnWorker:
 		return ActionSpawnWorker
 	case ActionSpawnRepairWorker:

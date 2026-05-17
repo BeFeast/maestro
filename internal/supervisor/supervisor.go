@@ -29,6 +29,7 @@ const (
 	ActionMonitorOpenPR        = "monitor_open_pr"
 	ActionReviewRetryExhausted = "review_retry_exhausted"
 	ActionCheckOutcomeHealth   = "check_outcome_health"
+	ActionNotifyRed            = "notify_red"
 	ActionSpawnWorker          = "spawn_worker"
 	ActionSpawnRepairWorker    = "spawn_repair_worker"
 	ActionLabelIssueReady      = "label_issue_ready"
@@ -93,16 +94,22 @@ type prGreptileReader interface {
 	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
 }
 
+type rateLimitReader interface {
+	RateLimit() (github.RateLimitStatus, error)
+}
+
 // Engine makes deterministic supervisor decisions. It plans safe queue mutations
 // and emits structured stuck-state explanations.
 type Engine struct {
-	cfg      *config.Config
-	reader   Reader
-	llm      LLMClient
-	now      func() time.Time
-	pidAlive func(pid int) bool
-	stat     func(name string) (os.FileInfo, error)
-	lookPath func(file string) (string, error)
+	cfg                       *config.Config
+	reader                    Reader
+	llm                       LLMClient
+	now                       func() time.Time
+	pidAlive                  func(pid int) bool
+	stat                      func(name string) (os.FileInfo, error)
+	lookPath                  func(file string) (string, error)
+	rateBudgetChecked         bool
+	rateBudgetStuckStateCache []state.SupervisorStuckState
 }
 
 func NewEngine(cfg *config.Config, reader Reader) *Engine {
@@ -209,6 +216,19 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 	projectState.OpenPRs = len(prs)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false)
+
+	if stuck := githubProjectRateLimitStuckState(stuckStates); stuck != nil {
+		reasons := appendReasons(baseReasons,
+			stuck.Summary,
+			"GitHub Project sync is enabled, but ProjectV2 truth cannot be reconciled while the GraphQL bucket is exhausted",
+			"Supervisor must not report idle/no-work as healthy when an enabled source of truth is unavailable",
+		)
+		decision := e.decision(st, now, projectState, ActionNotifyRed,
+			"GitHub Project sync is blocked by API rate budget; do not treat the queue as healthy until it recovers.",
+			RiskSafe, 0.94, nil, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
+	}
 
 	if slot, sess, pr, ok := sessionWithOpenPR(st, prs); ok {
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
@@ -566,6 +586,7 @@ func (e *Engine) decision(st *state.State, now time.Time, ps state.SupervisorPro
 
 func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.PR, issues, eligible []github.Issue, skipped []string, issuesLoaded bool) []state.SupervisorStuckState {
 	var findings []state.SupervisorStuckState
+	findings = append(findings, e.detectRateBudgetStuckStates()...)
 	findings = append(findings, e.detectWorkerStuckStates(st, now)...)
 	findings = append(findings, e.detectPRStuckStates(st, prs)...)
 	if issuesLoaded {
@@ -575,6 +596,51 @@ func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.
 	findings = append(findings, e.detectEnvironmentStuckStates(st, eligible)...)
 	findings = append(findings, e.detectOutcomeStuckStates(st)...)
 	return compactStuckStates(findings)
+}
+
+func (e *Engine) detectRateBudgetStuckStates() []state.SupervisorStuckState {
+	if e.rateBudgetChecked {
+		return e.rateBudgetStuckStateCache
+	}
+	e.rateBudgetChecked = true
+	e.rateBudgetStuckStateCache = e.readRateBudgetStuckStates()
+	return e.rateBudgetStuckStateCache
+}
+
+func (e *Engine) readRateBudgetStuckStates() []state.SupervisorStuckState {
+	if e == nil || e.cfg == nil || !e.cfg.GitHubProjects.Enabled || e.cfg.GitHubProjects.ProjectNumber == 0 {
+		return nil
+	}
+	reader, ok := e.reader.(rateLimitReader)
+	if !ok {
+		return nil
+	}
+	rate, err := reader.RateLimit()
+	if err != nil {
+		return []state.SupervisorStuckState{stuckState("github_rate_budget_unknown", SeverityWarning,
+			"GitHub API rate budget could not be read.",
+			"Verify GitHub auth and rate-limit access before trusting Project reconciliation.", false, nil,
+			fmt.Sprintf("rate_limit_error=%v", err))}
+	}
+	if rate.GraphQL.Remaining > 0 {
+		return nil
+	}
+	return []state.SupervisorStuckState{stuckState("github_graphql_rate_exhausted", SeverityBlocked,
+		"GitHub GraphQL rate limit is exhausted, so Project truth cannot be reconciled.",
+		"Wait for the GraphQL reset or reduce ProjectV2 polling before treating Project state as healthy.", false, nil,
+		fmt.Sprintf("graphql_remaining=%d", rate.GraphQL.Remaining),
+		fmt.Sprintf("graphql_used=%d/%d", rate.GraphQL.Used, rate.GraphQL.Limit),
+		fmt.Sprintf("graphql_reset=%d", rate.GraphQL.Reset),
+		fmt.Sprintf("core_remaining=%d", rate.Core.Remaining))}
+}
+
+func githubProjectRateLimitStuckState(stuckStates []state.SupervisorStuckState) *state.SupervisorStuckState {
+	for i := range stuckStates {
+		if stuckStates[i].Code == "github_graphql_rate_exhausted" {
+			return &stuckStates[i]
+		}
+	}
+	return nil
 }
 
 func (e *Engine) outcomeStatus(st *state.State) outcome.Status {
