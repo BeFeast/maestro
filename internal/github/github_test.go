@@ -7,6 +7,62 @@ import (
 	"testing"
 )
 
+func TestParseRESTIssuesSkipsPullRequests(t *testing.T) {
+	body := `[
+		{"number": 10, "title": "real issue", "body": null, "labels": [{"name": "maestro-ready"}]},
+		{"number": 11, "title": "pr issue", "body": "ignored", "labels": [], "pull_request": {}}
+	]`
+
+	got, err := parseRESTIssues([]byte(body))
+	if err != nil {
+		t.Fatalf("parseRESTIssues() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("parseRESTIssues() returned %d issues, want 1", len(got))
+	}
+	if got[0].Number != 10 || got[0].Title != "real issue" {
+		t.Fatalf("parseRESTIssues()[0] = %#v", got[0])
+	}
+	if len(got[0].Labels) != 1 || got[0].Labels[0].Name != "maestro-ready" {
+		t.Fatalf("labels = %#v, want maestro-ready", got[0].Labels)
+	}
+	if got[0].Body != "" {
+		t.Fatalf("null body should parse as empty string, got %q", got[0].Body)
+	}
+}
+
+func TestParseRESTPullsMapsFields(t *testing.T) {
+	body := `[
+		{
+			"number": 42,
+			"title": "Fixes #7",
+			"body": "Closes #7",
+			"state": "open",
+			"draft": true,
+			"head": {"ref": "feat/example"},
+			"merged_at": null
+		}
+	]`
+
+	got, err := parseRESTPulls([]byte(body))
+	if err != nil {
+		t.Fatalf("parseRESTPulls() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("parseRESTPulls() returned %d PRs, want 1", len(got))
+	}
+	pr := got[0]
+	if pr.Number != 42 || pr.HeadRefName != "feat/example" || pr.State != "OPEN" || !pr.IsDraft {
+		t.Fatalf("parsed PR = %#v", pr)
+	}
+	if !prReferencesIssue(pr, 7) {
+		t.Fatalf("expected PR to reference issue #7")
+	}
+	if prReferencesIssue(pr, 70) {
+		t.Fatalf("did not expect #7 to match issue #70")
+	}
+}
+
 func TestGreptileCheckDecision(t *testing.T) {
 	tests := []struct {
 		name        string
