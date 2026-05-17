@@ -26,6 +26,8 @@ import (
 	"github.com/befeast/maestro/internal/worker"
 )
 
+const minProjectGraphQLRemaining = 100
+
 // Orchestrator coordinates all agent sessions
 type Orchestrator struct {
 	cfg                   *config.Config
@@ -69,6 +71,9 @@ type Orchestrator struct {
 	// Cached project board field (discovered once per run cycle, nil if disabled)
 	projectField           *github.ProjectField
 	projectDiscoverRetryAt time.Time
+	projectRateCheckedAt   time.Time
+	projectRateAllowed     bool
+	projectRateRetryAt     time.Time
 
 	// Mission processor (nil when missions disabled)
 	missionProc *mission.Processor
@@ -88,6 +93,7 @@ type Orchestrator struct {
 	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 	outcomeCheckFn              func(context.Context, outcome.Brief) outcome.HealthCheckResult
 	syncProjectFn               func(issueNumber int, status github.ProjectStatus) bool
+	rateLimitFn                 func() (github.RateLimitStatus, error)
 }
 
 // New creates a new Orchestrator
@@ -270,6 +276,13 @@ func (o *Orchestrator) checkOutcome(ctx context.Context) outcome.HealthCheckResu
 	return outcome.Checker{}.Check(ctx, o.cfg.Outcome)
 }
 
+func (o *Orchestrator) rateLimit() (github.RateLimitStatus, error) {
+	if o.rateLimitFn != nil {
+		return o.rateLimitFn()
+	}
+	return o.gh.RateLimit()
+}
+
 func (o *Orchestrator) respawnInPlace(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	if o.respawnInPlaceFn != nil {
 		return o.respawnInPlaceFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
@@ -364,6 +377,9 @@ func (o *Orchestrator) ensureProjectField() {
 	if o.projectField != nil {
 		return
 	}
+	if !o.projectGraphQLBudgetAvailable() {
+		return
+	}
 	if !o.projectDiscoverRetryAt.IsZero() && time.Now().Before(o.projectDiscoverRetryAt) {
 		return
 	}
@@ -377,10 +393,50 @@ func (o *Orchestrator) ensureProjectField() {
 	o.projectDiscoverRetryAt = time.Time{}
 }
 
+func (o *Orchestrator) projectGraphQLBudgetAvailable() bool {
+	now := time.Now()
+	if !o.projectRateCheckedAt.IsZero() && now.Sub(o.projectRateCheckedAt) < time.Minute {
+		return o.projectRateAllowed
+	}
+	if !o.projectRateRetryAt.IsZero() && now.Before(o.projectRateRetryAt) {
+		o.projectRateCheckedAt = now
+		o.projectRateAllowed = false
+		return false
+	}
+	rate, err := o.rateLimit()
+	o.projectRateCheckedAt = now
+	if err != nil {
+		o.projectRateAllowed = false
+		o.projectRateRetryAt = now.Add(time.Minute)
+		log.Printf("[projects] could not read GitHub rate budget; skipping ProjectV2 sync until %s: %v", o.projectRateRetryAt.Format(time.RFC3339), err)
+		return false
+	}
+	if rate.GraphQL.Remaining <= minProjectGraphQLRemaining {
+		retryAt := now.Add(10 * time.Minute)
+		if rate.GraphQL.Reset > 0 {
+			resetAt := time.Unix(int64(rate.GraphQL.Reset), 0)
+			if resetAt.After(now) {
+				retryAt = resetAt
+			}
+		}
+		o.projectRateAllowed = false
+		o.projectRateRetryAt = retryAt
+		log.Printf("[projects] GraphQL budget too low for ProjectV2 sync (remaining=%d <= %d, used=%d/%d); backing off until %s",
+			rate.GraphQL.Remaining, minProjectGraphQLRemaining, rate.GraphQL.Used, rate.GraphQL.Limit, retryAt.Format(time.RFC3339))
+		return false
+	}
+	o.projectRateAllowed = true
+	o.projectRateRetryAt = time.Time{}
+	return true
+}
+
 // syncProject syncs an issue's status to the configured GitHub Project board.
 // No-op if github_projects is not enabled.
 func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus) bool {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
+		return false
+	}
+	if !o.projectGraphQLBudgetAvailable() {
 		return false
 	}
 	if o.syncProjectFn != nil {
@@ -449,6 +505,9 @@ func projectStatusForSession(sess *state.Session, requiresDeploy bool) (github.P
 // merge-then-verify policy required by ops.
 func (o *Orchestrator) reconcileProjectBoard(s *state.State) {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
+		return
+	}
+	if !o.projectGraphQLBudgetAvailable() {
 		return
 	}
 	o.ensureProjectField()
