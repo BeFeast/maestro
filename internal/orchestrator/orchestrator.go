@@ -26,7 +26,11 @@ import (
 	"github.com/befeast/maestro/internal/worker"
 )
 
-const minProjectGraphQLRemaining = 100
+const (
+	minProjectGraphQLRemaining = 100
+	projectBoardSweepInterval  = 30 * time.Minute
+	projectBoardSweepRetry     = 10 * time.Minute
+)
 
 // Orchestrator coordinates all agent sessions
 type Orchestrator struct {
@@ -68,12 +72,14 @@ type Orchestrator struct {
 	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
 	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
 
-	// Cached project board field (discovered once per run cycle, nil if disabled)
+	// Cached project board metadata and sweep cadence.
 	projectField           *github.ProjectField
 	projectDiscoverRetryAt time.Time
 	projectRateCheckedAt   time.Time
 	projectRateAllowed     bool
 	projectRateRetryAt     time.Time
+	projectItemsSweepAt    time.Time
+	projectItemsSweepRetry time.Time
 
 	// Mission processor (nil when missions disabled)
 	missionProc *mission.Processor
@@ -458,6 +464,16 @@ func (o *Orchestrator) listNonDoneProjectItems(pf *github.ProjectField) ([]githu
 	return o.gh.ListNonDoneProjectItems(pf)
 }
 
+func (o *Orchestrator) projectBoardSweepDue(now time.Time) bool {
+	if !o.projectItemsSweepRetry.IsZero() && now.Before(o.projectItemsSweepRetry) {
+		return false
+	}
+	if !o.projectItemsSweepAt.IsZero() && now.Sub(o.projectItemsSweepAt) < projectBoardSweepInterval {
+		return false
+	}
+	return true
+}
+
 // projectStatusForSession returns the ProjectStatus that should mirror this
 // session on the GitHub Project board, plus whether a sync should happen.
 // Sessions that have no clear board-level status (transient/unknown) return
@@ -525,11 +541,19 @@ func (o *Orchestrator) reconcileProjectBoard(s *state.State) bool {
 
 	changed := o.reconcileSessionsToProjectBoard(s)
 
+	now := time.Now().UTC()
+	if !o.projectBoardSweepDue(now) {
+		return changed
+	}
+
 	items, err := o.listNonDoneProjectItems(o.projectField)
 	if err != nil {
+		o.projectItemsSweepRetry = now.Add(projectBoardSweepRetry)
 		log.Printf("[orch] reconcile project board: %v", err)
 		return changed
 	}
+	o.projectItemsSweepAt = now
+	o.projectItemsSweepRetry = time.Time{}
 
 	for _, item := range items {
 		if item.IssueClosed {

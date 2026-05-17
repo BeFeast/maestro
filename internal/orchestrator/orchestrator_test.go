@@ -5580,6 +5580,69 @@ func TestRunOncePersistsProjectStatusSyncAfterReconcile(t *testing.T) {
 	}
 }
 
+func TestReconcileProjectBoard_ThrottlesNonDoneItemSweep(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 3,
+		},
+	}
+
+	sweeps := 0
+	synced := make(map[int]github.ProjectStatus)
+	o := &Orchestrator{
+		cfg: cfg,
+		projectField: &github.ProjectField{
+			ProjectID: "PVT_test",
+			FieldID:   "FIELD_test",
+			Options:   map[string]string{"Todo": "opt-todo", "In Progress": "opt-progress"},
+		},
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+			}, nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			synced[issueNumber] = status
+			return true
+		},
+		listNonDoneProjectItemsFn: func(pf *github.ProjectField) ([]github.ProjectItem, error) {
+			sweeps++
+			return []github.ProjectItem{{IssueNumber: 99, HasStatus: false}}, nil
+		},
+	}
+
+	s := state.NewState()
+	if !o.reconcileProjectBoard(s) {
+		t.Fatal("first reconcile should record no-status project item sync")
+	}
+	if sweeps != 1 {
+		t.Fatalf("sweeps = %d, want 1", sweeps)
+	}
+	if synced[99] != github.ProjectStatusTodo {
+		t.Fatalf("issue #99 status = %q, want %q", synced[99], github.ProjectStatusTodo)
+	}
+
+	if o.reconcileProjectBoard(s) {
+		t.Fatal("second reconcile should be a no-op while project item sweep is throttled")
+	}
+	if sweeps != 1 {
+		t.Fatalf("sweeps = %d, want 1 while throttled", sweeps)
+	}
+
+	s.Sessions["slot-1"] = &state.Session{IssueNumber: 42, Status: state.StatusRunning}
+	if !o.reconcileProjectBoard(s) {
+		t.Fatal("session transition sync should still run while item sweep is throttled")
+	}
+	if sweeps != 1 {
+		t.Fatalf("sweeps = %d, want 1 after transition-only sync", sweeps)
+	}
+	if synced[42] != github.ProjectStatusInProgress {
+		t.Fatalf("issue #42 status = %q, want %q", synced[42], github.ProjectStatusInProgress)
+	}
+}
+
 func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
 	deployed := time.Now().UTC()
