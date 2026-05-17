@@ -3,6 +3,7 @@ package github
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -52,15 +53,126 @@ type PR struct {
 	State       string `json:"state"`
 	Mergeable   string `json:"mergeable"`
 	Title       string `json:"title"`
+	Body        string `json:"body,omitempty"`
 	IsDraft     bool   `json:"isDraft"`
+	MergedAt    string `json:"mergedAt,omitempty"`
 }
 
 type Client struct {
 	Repo string
 }
 
+type restIssue struct {
+	Number int     `json:"number"`
+	Title  string  `json:"title"`
+	Body   *string `json:"body"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
+	PullRequest *struct{} `json:"pull_request,omitempty"`
+}
+
+type restPull struct {
+	Number int     `json:"number"`
+	Title  string  `json:"title"`
+	Body   *string `json:"body"`
+	State  string  `json:"state"`
+	Draft  bool    `json:"draft"`
+	Head   struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
+	MergedAt *string `json:"merged_at"`
+}
+
+func (ri restIssue) issue() Issue {
+	body := ""
+	if ri.Body != nil {
+		body = *ri.Body
+	}
+	return Issue{
+		Number: ri.Number,
+		Title:  ri.Title,
+		Body:   body,
+		Labels: ri.Labels,
+	}
+}
+
+func (rp restPull) pr() PR {
+	body := ""
+	if rp.Body != nil {
+		body = *rp.Body
+	}
+	mergedAt := ""
+	if rp.MergedAt != nil {
+		mergedAt = *rp.MergedAt
+	}
+	return PR{
+		Number:      rp.Number,
+		HeadRefName: rp.Head.Ref,
+		State:       strings.ToUpper(rp.State),
+		Title:       rp.Title,
+		Body:        body,
+		IsDraft:     rp.Draft,
+		MergedAt:    mergedAt,
+	}
+}
+
 func New(repo string) *Client {
 	return &Client{Repo: repo}
+}
+
+func ghAPI(endpoint string) ([]byte, error) {
+	out, err := exec.Command("gh", "api", endpoint).Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh api %s: %w", endpoint, err)
+	}
+	return out, nil
+}
+
+func parseRESTIssues(out []byte) ([]Issue, error) {
+	var restIssues []restIssue
+	if err := json.Unmarshal(out, &restIssues); err != nil {
+		return nil, err
+	}
+	issues := make([]Issue, 0, len(restIssues))
+	for _, issue := range restIssues {
+		if issue.PullRequest != nil {
+			continue
+		}
+		issues = append(issues, issue.issue())
+	}
+	return issues, nil
+}
+
+func parseRESTIssue(out []byte) (Issue, error) {
+	var issue restIssue
+	if err := json.Unmarshal(out, &issue); err != nil {
+		return Issue{}, err
+	}
+	return issue.issue(), nil
+}
+
+func parseRESTPulls(out []byte) ([]PR, error) {
+	var restPulls []restPull
+	if err := json.Unmarshal(out, &restPulls); err != nil {
+		return nil, err
+	}
+	prs := make([]PR, 0, len(restPulls))
+	for _, pr := range restPulls {
+		prs = append(prs, pr.pr())
+	}
+	return prs, nil
+}
+
+func issueRefRegexp(issueNumber int) *regexp.Regexp {
+	return regexp.MustCompile(fmt.Sprintf(`(?i)(^|[^0-9])#%d([^0-9]|$)`, issueNumber))
+}
+
+func prReferencesIssue(pr PR, issueNumber int) bool {
+	if issueNumber <= 0 {
+		return false
+	}
+	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + pr.Body)
 }
 
 // ListOpenIssues returns open issues matching any of the given labels (OR filter).
@@ -94,24 +206,18 @@ func (c *Client) ListOpenIssues(labels []string) ([]Issue, error) {
 }
 
 func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
-	args := []string{
-		"issue", "list",
-		"--repo", c.Repo,
-		"--state", "open",
-		"--json", "number,title,body,labels,projectItems",
-		"--limit", "100",
-	}
+	endpoint := fmt.Sprintf("repos/%s/issues?state=open&per_page=100", c.Repo)
 	if label != "" {
-		args = append(args, "--label", label)
+		endpoint += "&labels=" + url.QueryEscape(label)
 	}
 
-	out, err := exec.Command("gh", args...).Output()
+	out, err := ghAPI(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("gh issue list: %w", err)
+		return nil, fmt.Errorf("list open issues: %w", err)
 	}
 
-	var issues []Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
+	issues, err := parseRESTIssues(out)
+	if err != nil {
 		return nil, fmt.Errorf("parse issues: %w", err)
 	}
 	return issues, nil
@@ -119,14 +225,12 @@ func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 
 // GetIssue fetches a single issue by number
 func (c *Client) GetIssue(number int) (Issue, error) {
-	out, err := exec.Command("gh", "issue", "view", fmt.Sprint(number),
-		"--repo", c.Repo,
-		"--json", "number,title,body,labels,projectItems").Output()
+	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
 	if err != nil {
-		return Issue{}, fmt.Errorf("gh issue view %d: %w", number, err)
+		return Issue{}, fmt.Errorf("get issue %d: %w", number, err)
 	}
-	var issue Issue
-	if err := json.Unmarshal(out, &issue); err != nil {
+	issue, err := parseRESTIssue(out)
+	if err != nil {
 		return Issue{}, fmt.Errorf("parse issue %d: %w", number, err)
 	}
 	return issue, nil
@@ -134,11 +238,9 @@ func (c *Client) GetIssue(number int) (Issue, error) {
 
 // IsIssueClosed returns true if the issue is closed
 func (c *Client) IsIssueClosed(number int) (bool, error) {
-	out, err := exec.Command("gh", "issue", "view", fmt.Sprint(number),
-		"--repo", c.Repo,
-		"--json", "state").Output()
+	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
 	if err != nil {
-		return false, fmt.Errorf("gh issue view %d: %w", number, err)
+		return false, fmt.Errorf("get issue %d: %w", number, err)
 	}
 	var result struct {
 		State string `json:"state"`
@@ -151,18 +253,26 @@ func (c *Client) IsIssueClosed(number int) (bool, error) {
 
 // ListOpenPRs returns all open PRs
 func (c *Client) ListOpenPRs() ([]PR, error) {
-	out, err := exec.Command("gh", "pr", "list",
-		"--repo", c.Repo,
-		"--state", "open",
-		"--json", "number,headRefName,state,mergeable,title,isDraft",
-		"--limit", "100").Output()
+	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo))
 	if err != nil {
-		return nil, fmt.Errorf("gh pr list: %w", err)
+		return nil, fmt.Errorf("list open PRs: %w", err)
 	}
 
-	var prs []PR
-	if err := json.Unmarshal(out, &prs); err != nil {
+	prs, err := parseRESTPulls(out)
+	if err != nil {
 		return nil, fmt.Errorf("parse prs: %w", err)
+	}
+	return prs, nil
+}
+
+func (c *Client) listClosedPRs() ([]PR, error) {
+	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls?state=closed&per_page=100&sort=updated&direction=desc", c.Repo))
+	if err != nil {
+		return nil, fmt.Errorf("list closed PRs: %w", err)
+	}
+	prs, err := parseRESTPulls(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse closed prs: %w", err)
 	}
 	return prs, nil
 }
@@ -214,23 +324,16 @@ func (c *Client) IsPRMerged(prNumber int) (bool, error) {
 
 // HasMergedPRForIssue returns true if a merged PR references the issue.
 func (c *Client) HasMergedPRForIssue(issueNumber int) (bool, error) {
-	query := fmt.Sprintf("#%d", issueNumber)
-	out, err := exec.Command("gh", "pr", "list",
-		"--repo", c.Repo,
-		"--state", "merged",
-		"--search", query,
-		"--json", "number",
-		"--limit", "1").Output()
+	prs, err := c.listClosedPRs()
 	if err != nil {
-		return false, fmt.Errorf("gh pr list --state merged --search: %w", err)
+		return false, err
 	}
-	var prs []struct {
-		Number int `json:"number"`
+	for _, pr := range prs {
+		if pr.MergedAt != "" && prReferencesIssue(pr, issueNumber) {
+			return true, nil
+		}
 	}
-	if err := json.Unmarshal(out, &prs); err != nil {
-		return false, fmt.Errorf("parse merged pr search results: %w", err)
-	}
-	return len(prs) > 0, nil
+	return false, nil
 }
 
 // PRCIStatus returns "success", "failure", "pending", or "unknown"
@@ -653,25 +756,17 @@ func (c *Client) CreateRelease(tag, title string) error {
 
 // HasOpenPRForIssue returns true if there is at least one open PR that
 // references the given issue number (e.g. "closes #N") in its body or title.
-// Uses GitHub search so it works regardless of branch naming.
 func (c *Client) HasOpenPRForIssue(issueNumber int) (bool, error) {
-	query := fmt.Sprintf("#%d", issueNumber)
-	out, err := exec.Command("gh", "pr", "list",
-		"--repo", c.Repo,
-		"--state", "open",
-		"--search", query,
-		"--json", "number",
-		"--limit", "1").Output()
+	prs, err := c.ListOpenPRs()
 	if err != nil {
-		return false, fmt.Errorf("gh pr list --search: %w", err)
+		return false, err
 	}
-	var prs []struct {
-		Number int `json:"number"`
+	for _, pr := range prs {
+		if prReferencesIssue(pr, issueNumber) {
+			return true, nil
+		}
 	}
-	if err := json.Unmarshal(out, &prs); err != nil {
-		return false, fmt.Errorf("parse pr search results: %w", err)
-	}
-	return len(prs) > 0, nil
+	return false, nil
 }
 
 // FindBlockers scans an issue body for blocker references matching the given
@@ -748,27 +843,16 @@ func (c *Client) EditIssueBody(number int, body string) error {
 // FindOpenPRForIssue returns the first open PR that references the given issue number.
 // Returns pr number, branch name, and whether one was found.
 func (c *Client) FindOpenPRForIssue(issueNumber int) (prNumber int, branch string, found bool, err error) {
-	query := fmt.Sprintf("#%d", issueNumber)
-	out, err := exec.Command("gh", "pr", "list",
-		"--repo", c.Repo,
-		"--state", "open",
-		"--search", query,
-		"--json", "number,headRefName",
-		"--limit", "1").Output()
+	prs, err := c.ListOpenPRs()
 	if err != nil {
-		return 0, "", false, fmt.Errorf("gh pr list --search: %w", err)
+		return 0, "", false, err
 	}
-	var prs []struct {
-		Number      int    `json:"number"`
-		HeadRefName string `json:"headRefName"`
+	for _, pr := range prs {
+		if prReferencesIssue(pr, issueNumber) {
+			return pr.Number, pr.HeadRefName, true, nil
+		}
 	}
-	if err := json.Unmarshal(out, &prs); err != nil {
-		return 0, "", false, fmt.Errorf("parse pr search: %w", err)
-	}
-	if len(prs) == 0 {
-		return 0, "", false, nil
-	}
-	return prs[0].Number, prs[0].HeadRefName, true, nil
+	return 0, "", false, nil
 }
 
 // ReviewComment is an exported review comment (from Greptile, Codex, or any reviewer).
