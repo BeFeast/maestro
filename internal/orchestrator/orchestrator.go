@@ -86,6 +86,7 @@ type Orchestrator struct {
 	ghCloseIssueFn              func(number int, comment string) error
 	workerStopFn                func(cfg *config.Config, slotName string, sess *state.Session) error
 	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
+	outcomeCheckFn              func(context.Context, outcome.Brief) outcome.HealthCheckResult
 }
 
 // New creates a new Orchestrator
@@ -261,6 +262,13 @@ func (o *Orchestrator) saveCheckpoint(sess *state.Session) (string, error) {
 	return worker.SaveCheckpoint(sess)
 }
 
+func (o *Orchestrator) checkOutcome(ctx context.Context) outcome.HealthCheckResult {
+	if o.outcomeCheckFn != nil {
+		return o.outcomeCheckFn(ctx, o.cfg.Outcome)
+	}
+	return outcome.Checker{}.Check(ctx, o.cfg.Outcome)
+}
+
 func (o *Orchestrator) respawnInPlace(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	if o.respawnInPlaceFn != nil {
 		return o.respawnInPlaceFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
@@ -408,7 +416,7 @@ func projectStatusForSession(sess *state.Session, requiresDeploy bool) (github.P
 	case state.StatusQueued, state.StatusPROpen:
 		return github.ProjectStatusInReview, true
 	case state.StatusCodeLanded:
-		return codeLandedProjectStatus(requiresDeploy), true
+		return codeLandedProjectStatusForSession(sess, requiresDeploy), true
 	case state.StatusDone:
 		return github.ProjectStatusDone, true
 	case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed:
@@ -506,6 +514,13 @@ func codeLandedProjectStatus(requiresDeploy bool) github.ProjectStatus {
 		return github.ProjectStatusDeploying
 	}
 	return github.ProjectStatusLiveVerify
+}
+
+func codeLandedProjectStatusForSession(sess *state.Session, requiresDeploy bool) github.ProjectStatus {
+	if requiresDeploy && sess != nil && sess.DeploymentFinishedAt != nil {
+		return github.ProjectStatusLiveVerify
+	}
+	return codeLandedProjectStatus(requiresDeploy)
 }
 
 func sessionRecency(sess *state.Session) time.Time {
@@ -1761,9 +1776,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	strategy := o.mergeStrategy()
 	if strategy == "parallel" {
 		for _, candidate := range ready {
-			if o.mergeReadyPR(candidate.slotName, candidate.sess, candidate.pr) {
-				s.LastMergeAt = time.Now().UTC()
-			}
+			o.mergeReadyPR(s, candidate.slotName, candidate.sess, candidate.pr)
 		}
 		return
 	}
@@ -1778,10 +1791,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	}
 
 	candidate := ready[0]
-	merged := o.mergeReadyPR(candidate.slotName, candidate.sess, candidate.pr)
-	if merged {
-		s.LastMergeAt = time.Now().UTC()
-	}
+	o.mergeReadyPR(s, candidate.slotName, candidate.sess, candidate.pr)
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
@@ -1981,17 +1991,48 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	sess.DeploymentFinishedAt = nil
 	o.syncProject(sess.IssueNumber, codeLandedProjectStatus(o.cfg.Outcome.RequiresDeploy))
 	sess.Status = state.StatusCodeLanded
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
 }
 
+func (o *Orchestrator) markDeploymentFinished(sess *state.Session) {
+	if sess == nil {
+		return
+	}
+	now := time.Now().UTC()
+	sess.DeploymentFinishedAt = &now
+	if sess.Status == state.StatusCodeLanded {
+		o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
+	}
+}
+
+func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber int) {
+	if sess == nil {
+		return
+	}
+	if prNumber > 0 {
+		sess.PRNumber = prNumber
+	}
+	sess.Status = state.StatusDone
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+}
+
 func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session, trigger string) bool {
 	if o == nil || o.cfg == nil || !o.cfg.Outcome.PassRequiredForDoneEnabled() {
 		return true
 	}
-	status := outcome.StatusFor(o.cfg.Outcome, s.DonePRCount(), s.LastMergeAt, outcomeHealthChecks(s)...)
+	donePRs := 0
+	var lastMergeAt time.Time
+	if s != nil {
+		donePRs = s.DonePRCount()
+		lastMergeAt = s.LastMergeAt
+	}
+	status := outcome.StatusFor(o.cfg.Outcome, donePRs, lastMergeAt, outcomeHealthChecks(s)...)
 	if status.HealthState == outcome.HealthHealthy {
 		return true
 	}
@@ -2010,6 +2051,14 @@ func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session
 	return false
 }
 
+func (o *Orchestrator) canTreatIssueDoneForQueue(s *state.State, issueNumber int, reason string) bool {
+	if o.canMarkDoneForOutcome(s, nil, fmt.Sprintf("ordered queue saw issue #%d as done via %s", issueNumber, reason)) {
+		return true
+	}
+	log.Printf("[orch] ordered queue will not advance past issue #%d: %s is not enough until outcome verification passes", issueNumber, reason)
+	return false
+}
+
 func outcomeHealthChecks(s *state.State) []outcome.HealthCheckResult {
 	if s == nil || s.OutcomeHealth == nil {
 		return nil
@@ -2017,7 +2066,7 @@ func outcomeHealthChecks(s *state.State) []outcome.HealthCheckResult {
 	return []outcome.HealthCheckResult{*s.OutcomeHealth}
 }
 
-func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr github.PR) bool {
+func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state.Session, pr github.PR) bool {
 	log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 	if err := o.mergePR(pr.Number); err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
@@ -2043,6 +2092,9 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	}
 
 	log.Printf("[orch] merged PR #%d ✓", pr.Number)
+	if s != nil {
+		s.LastMergeAt = time.Now().UTC()
+	}
 	o.markCodeLanded(sess, pr.Number)
 
 	if o.cfg.ShouldCleanupWorktrees() {
@@ -2066,16 +2118,59 @@ func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr git
 	}
 
 	// Deploy hook
+	deploySucceeded := false
 	if o.cfg.DeployCmd != "" {
 		if err := o.runDeployCmd(pr.Number); err != nil {
 			log.Printf("[orch] deploy command failed for PR #%d: %v", pr.Number, err)
 			o.notifier.Sendf("⚠️ maestro: deploy failed after PR #%d merge: %v", pr.Number, err)
 		} else {
+			deploySucceeded = true
+			o.markDeploymentFinished(sess)
 			o.notifier.Sendf("🚀 maestro: deploy succeeded after PR #%d merge", pr.Number)
 		}
+	} else if !o.cfg.Outcome.RequiresDeploy {
+		deploySucceeded = true
+	}
+
+	if o.shouldVerifyOutcomeAfterMerge(deploySucceeded) {
+		o.verifyOutcomeAfterMerge(s, sess, pr.Number)
 	}
 
 	return true
+}
+
+func (o *Orchestrator) shouldVerifyOutcomeAfterMerge(deploySucceeded bool) bool {
+	if o == nil || o.cfg == nil {
+		return false
+	}
+	if !o.cfg.Outcome.PassRequiredForDoneEnabled() || !o.cfg.Outcome.HasHealthSignal() {
+		return false
+	}
+	if o.cfg.Outcome.RequiresDeploy && !deploySucceeded {
+		log.Printf("[orch] skipping immediate outcome verification after merge: deploy is required and has not succeeded yet")
+		return false
+	}
+	return true
+}
+
+func (o *Orchestrator) verifyOutcomeAfterMerge(s *state.State, sess *state.Session, prNumber int) {
+	if s == nil || sess == nil {
+		return
+	}
+	log.Printf("[orch] running outcome verifier after PR #%d merge", prNumber)
+	result := o.checkOutcome(context.Background())
+	s.OutcomeHealth = &result
+	if result.State == outcome.HealthHealthy {
+		log.Printf("[orch] outcome verifier passed after PR #%d; marking issue #%d done", prNumber, sess.IssueNumber)
+		o.markDoneAfterOutcomePass(sess, prNumber)
+		o.notifier.Sendf("✅ maestro: outcome verifier passed after PR #%d; issue #%d can be treated as done", prNumber, sess.IssueNumber)
+		return
+	}
+	if sess.Status == state.StatusCodeLanded {
+		o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
+	}
+	log.Printf("[orch] outcome verifier after PR #%d is %s: %s", prNumber, result.State, result.Summary)
+	o.notifier.Sendf("⚠️ maestro: outcome verifier after PR #%d is %s: %s", prNumber, result.State, result.Summary)
 }
 
 // runDeployCmd executes the configured deploy command with a configurable timeout.
@@ -2343,6 +2438,9 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
+		if !o.canTreatIssueDoneForQueue(s, issueNumber, "closed issue") {
+			return false, "issue closed but outcome health is not verified", nil
+		}
 		return true, "issue closed", nil
 	}
 
@@ -2351,6 +2449,9 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 		return false, "", fmt.Errorf("check merged PR for issue: %w", err)
 	}
 	if merged {
+		if !o.canTreatIssueDoneForQueue(s, issueNumber, "linked PR merged") {
+			return false, "linked PR merged but outcome health is not verified", nil
+		}
 		return true, "linked PR merged", nil
 	}
 
@@ -2364,7 +2465,11 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 			return false, "", fmt.Errorf("check PR #%d merged: %w", sess.PRNumber, err)
 		}
 		if merged {
-			return true, fmt.Sprintf("session %s is %s with merged PR #%d", slotName, sess.Status, sess.PRNumber), nil
+			reason := fmt.Sprintf("session %s is %s with merged PR #%d", slotName, sess.Status, sess.PRNumber)
+			if !o.canTreatIssueDoneForQueue(s, issueNumber, reason) {
+				return false, reason + " but outcome health is not verified", nil
+			}
+			return true, reason, nil
 		}
 	}
 

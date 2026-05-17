@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -758,6 +759,230 @@ func TestAutoMergePRs_MissingOpenPRDoesNotBecomeDoneWhenOutcomePassRequiredFails
 	sess := s.Sessions["slot-0"]
 	if sess.Status != state.StatusCodeLanded {
 		t.Fatalf("status = %q, want %q until live verification passes", sess.Status, state.StatusCodeLanded)
+	}
+}
+
+func TestMergeReadyPR_RunsOutcomeVerifierAndMarksDoneOnPass(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o, merged := newMergeTestOrchestrator(cfg, []github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	checked := false
+	o.outcomeCheckFn = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		checked = true
+		return outcome.HealthCheckResult{
+			CheckedAt: time.Now().UTC(),
+			State:     outcome.HealthHealthy,
+			Signal:    "healthcheck_command",
+			Summary:   "live verifier passed",
+		}
+	}
+	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	sess := s.Sessions["slot-0"]
+
+	if !o.mergeReadyPR(s, "slot-0", sess, github.PR{Number: 10, HeadRefName: "feat/a"}) {
+		t.Fatal("mergeReadyPR should return true on successful merge")
+	}
+	if len(*merged) != 1 || (*merged)[0] != 10 {
+		t.Fatalf("merged = %v, want [10]", *merged)
+	}
+	if !checked {
+		t.Fatal("outcome verifier was not run after merge")
+	}
+	if s.OutcomeHealth == nil || s.OutcomeHealth.State != outcome.HealthHealthy {
+		t.Fatalf("OutcomeHealth = %+v, want healthy", s.OutcomeHealth)
+	}
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q after verifier pass", sess.Status, state.StatusDone)
+	}
+}
+
+func TestMergeReadyPR_KeepsCodeLandedWhenOutcomeVerifierFails(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	o.outcomeCheckFn = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		return outcome.HealthCheckResult{
+			CheckedAt: time.Now().UTC(),
+			State:     outcome.HealthFailing,
+			Signal:    "healthcheck_command",
+			Summary:   "live verifier failed",
+		}
+	}
+	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	sess := s.Sessions["slot-0"]
+
+	if !o.mergeReadyPR(s, "slot-0", sess, github.PR{Number: 10, HeadRefName: "feat/a"}) {
+		t.Fatal("mergeReadyPR should return true on successful merge")
+	}
+	if s.OutcomeHealth == nil || s.OutcomeHealth.State != outcome.HealthFailing {
+		t.Fatalf("OutcomeHealth = %+v, want failing", s.OutcomeHealth)
+	}
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q until verifier passes", sess.Status, state.StatusCodeLanded)
+	}
+}
+
+func TestMergeReadyPR_SkipsImmediateOutcomeVerifierWhenDeployRequiredButNotDone(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			RequiresDeploy:      true,
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	o.outcomeCheckFn = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		t.Fatal("outcome verifier should wait until deploy succeeds")
+		return outcome.HealthCheckResult{}
+	}
+	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	sess := s.Sessions["slot-0"]
+
+	if !o.mergeReadyPR(s, "slot-0", sess, github.PR{Number: 10, HeadRefName: "feat/a"}) {
+		t.Fatal("mergeReadyPR should return true on successful merge")
+	}
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q while deploy is pending", sess.Status, state.StatusCodeLanded)
+	}
+	if sess.DeploymentFinishedAt != nil {
+		t.Fatalf("DeploymentFinishedAt = %v, want nil before deploy succeeds", sess.DeploymentFinishedAt)
+	}
+	if s.OutcomeHealth != nil {
+		t.Fatalf("OutcomeHealth = %+v, want nil before deploy succeeds", s.OutcomeHealth)
+	}
+}
+
+func TestMergeReadyPR_RunsOutcomeVerifierAfterDeploySucceeds(t *testing.T) {
+	cfg := &config.Config{
+		Repo:                 "owner/repo",
+		DeployCmd:            "true",
+		DeployTimeoutMinutes: 1,
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			RequiresDeploy:      true,
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	checked := false
+	o.outcomeCheckFn = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		checked = true
+		return outcome.HealthCheckResult{
+			CheckedAt: time.Now().UTC(),
+			State:     outcome.HealthHealthy,
+			Signal:    "healthcheck_command",
+			Summary:   "live verifier passed",
+		}
+	}
+	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	sess := s.Sessions["slot-0"]
+
+	if !o.mergeReadyPR(s, "slot-0", sess, github.PR{Number: 10, HeadRefName: "feat/a"}) {
+		t.Fatal("mergeReadyPR should return true on successful merge")
+	}
+	if !checked {
+		t.Fatal("outcome verifier was not run after deploy succeeded")
+	}
+	if sess.DeploymentFinishedAt == nil {
+		t.Fatal("DeploymentFinishedAt should be recorded after deploy succeeds")
+	}
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q after deploy and verifier pass", sess.Status, state.StatusDone)
+	}
+}
+
+func TestOrderedQueueIssueDone_MergedPRWaitsForOutcomeWhenPassRequired(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o := &Orchestrator{
+		cfg: cfg,
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+	}
+	mergedAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.LastMergeAt = mergedAt
+	s.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		State:     outcome.HealthFailing,
+		Signal:    "healthcheck_command",
+		Summary:   "live verifier failed",
+	}
+
+	done, reason, err := o.orderedQueueIssueDone(s, 42)
+	if err != nil {
+		t.Fatalf("orderedQueueIssueDone error: %v", err)
+	}
+	if done {
+		t.Fatalf("done = true, want false while outcome is failing")
+	}
+	if !strings.Contains(reason, "outcome health is not verified") {
+		t.Fatalf("reason = %q, want outcome gate reason", reason)
+	}
+}
+
+func TestOrderedQueueIssueDone_MergedPRAllowedAfterOutcomePass(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o := &Orchestrator{
+		cfg: cfg,
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+	}
+	mergedAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.LastMergeAt = mergedAt
+	s.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		State:     outcome.HealthHealthy,
+		Signal:    "healthcheck_command",
+		Summary:   "live verifier passed",
+	}
+
+	done, reason, err := o.orderedQueueIssueDone(s, 42)
+	if err != nil {
+		t.Fatalf("orderedQueueIssueDone error: %v", err)
+	}
+	if !done {
+		t.Fatalf("done = false, want true after outcome pass")
+	}
+	if reason != "linked PR merged" {
+		t.Fatalf("reason = %q, want linked PR merged", reason)
 	}
 }
 
@@ -1989,7 +2214,7 @@ func TestMergeReadyPR_BehindMainTriggersRebase(t *testing.T) {
 	}
 	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
 
-	result := o.mergeReadyPR("slot-0", sess, pr)
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
 
 	if result {
 		t.Fatal("mergeReadyPR should return false when merge fails")
@@ -2028,7 +2253,7 @@ func TestMergeReadyPR_BehindMainRebaseFailsMarksConflict(t *testing.T) {
 	}
 	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
 
-	result := o.mergeReadyPR("slot-0", sess, pr)
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
 
 	if result {
 		t.Fatal("mergeReadyPR should return false when rebase fails")
@@ -2149,7 +2374,7 @@ func TestMergeReadyPR_BehindMainNoAutoRebase(t *testing.T) {
 	}
 	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
 
-	result := o.mergeReadyPR("slot-0", sess, pr)
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
 
 	if result {
 		t.Fatal("mergeReadyPR should return false")
@@ -2186,7 +2411,7 @@ func TestMergeReadyPR_OtherMergeErrorNoRebase(t *testing.T) {
 	}
 	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
 
-	result := o.mergeReadyPR("slot-0", sess, pr)
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
 
 	if result {
 		t.Fatal("mergeReadyPR should return false")
@@ -2457,7 +2682,7 @@ func TestMergeReadyPR_CleansUpWorktreeOnMerge(t *testing.T) {
 	}
 	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
 
-	result := o.mergeReadyPR("slot-0", sess, pr)
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
 
 	if !result {
 		t.Fatal("mergeReadyPR should return true on successful merge")
@@ -2504,7 +2729,7 @@ func TestMergeReadyPR_SkipsCleanupWhenDisabled(t *testing.T) {
 	}
 	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
 
-	result := o.mergeReadyPR("slot-0", sess, pr)
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
 
 	if !result {
 		t.Fatal("mergeReadyPR should return true on successful merge")
@@ -2550,7 +2775,7 @@ func TestMergeReadyPR_DefaultConfigCleansUp(t *testing.T) {
 	}
 	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
 
-	result := o.mergeReadyPR("slot-0", sess, pr)
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
 
 	if !result {
 		t.Fatal("mergeReadyPR should return true on successful merge")
@@ -5187,6 +5412,7 @@ func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
 
 func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
+	deployed := time.Now().UTC()
 
 	tests := []struct {
 		name           string
@@ -5201,6 +5427,7 @@ func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 		{name: "pr_open -> in_review", sess: &state.Session{IssueNumber: 3, Status: state.StatusPROpen, PRNumber: 9}, want: github.ProjectStatusInReview, wantOK: true},
 		{name: "code_landed -> live_verification without deploy", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, want: github.ProjectStatusLiveVerify, wantOK: true},
 		{name: "code_landed -> deploying when deploy required", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, requiresDeploy: true, want: github.ProjectStatusDeploying, wantOK: true},
+		{name: "code_landed -> live_verification after deploy succeeds", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10, DeploymentFinishedAt: &deployed}, requiresDeploy: true, want: github.ProjectStatusLiveVerify, wantOK: true},
 		{name: "done -> done", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone}, want: github.ProjectStatusDone, wantOK: true},
 		{name: "retry_exhausted -> blocked", sess: &state.Session{IssueNumber: 6, Status: state.StatusRetryExhausted}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "conflict_failed -> blocked", sess: &state.Session{IssueNumber: 7, Status: state.StatusConflictFailed}, want: github.ProjectStatusBlocked, wantOK: true},

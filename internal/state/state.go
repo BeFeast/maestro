@@ -85,6 +85,7 @@ type Session struct {
 	PreviousAttemptFeedbackKind string        `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
 	RetryReason                 string        `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
 	CheckpointFile              string        `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
+	DeploymentFinishedAt        *time.Time    `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
 }
 
 // SessionAttention explains why a session needs operator attention and the
