@@ -5102,6 +5102,61 @@ func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
 	o.syncProject(42, github.ProjectStatusInProgress)
 }
 
+func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
+	soon := time.Now().UTC().Add(30 * time.Second)
+
+	tests := []struct {
+		name   string
+		sess   *state.Session
+		want   github.ProjectStatus
+		wantOK bool
+	}{
+		{"nil session is no-op", nil, "", false},
+		{"running -> in_progress", &state.Session{IssueNumber: 1, Status: state.StatusRunning}, github.ProjectStatusInProgress, true},
+		{"queued -> in_review", &state.Session{IssueNumber: 2, Status: state.StatusQueued}, github.ProjectStatusInReview, true},
+		{"pr_open -> in_review", &state.Session{IssueNumber: 3, Status: state.StatusPROpen, PRNumber: 9}, github.ProjectStatusInReview, true},
+		{"code_landed keeps in_progress (issue stays open)", &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, github.ProjectStatusInProgress, true},
+		{"done -> done", &state.Session{IssueNumber: 5, Status: state.StatusDone}, github.ProjectStatusDone, true},
+		{"retry_exhausted -> blocked", &state.Session{IssueNumber: 6, Status: state.StatusRetryExhausted}, github.ProjectStatusBlocked, true},
+		{"conflict_failed -> blocked", &state.Session{IssueNumber: 7, Status: state.StatusConflictFailed}, github.ProjectStatusBlocked, true},
+		{"failed -> blocked", &state.Session{IssueNumber: 8, Status: state.StatusFailed}, github.ProjectStatusBlocked, true},
+		{"dead awaiting retry stays in_progress", &state.Session{IssueNumber: 9, Status: state.StatusDead, NextRetryAt: &soon}, github.ProjectStatusInProgress, true},
+		{"dead without retry -> blocked", &state.Session{IssueNumber: 10, Status: state.StatusDead}, github.ProjectStatusBlocked, true},
+		{"unknown status returns no mapping", &state.Session{IssueNumber: 11, Status: state.SessionStatus("weird")}, "", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := projectStatusForSession(tc.sess)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if got != tc.want {
+				t.Errorf("status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSessionRecency_PicksFreshestSignal(t *testing.T) {
+	now := time.Now().UTC()
+	finished := now.Add(-time.Minute)
+	older := now.Add(-time.Hour)
+
+	sess := &state.Session{
+		StartedAt:           older,
+		LastOutputChangedAt: now,
+		FinishedAt:          &finished,
+	}
+
+	if got := sessionRecency(sess); !got.Equal(now) {
+		t.Fatalf("sessionRecency = %v, want freshest signal %v", got, now)
+	}
+	if got := sessionRecency(nil); !got.IsZero() {
+		t.Fatalf("sessionRecency(nil) = %v, want zero", got)
+	}
+}
+
 // --- CI failure retry tests (#226) ---
 
 // newCIFailureRetryOrchestrator creates an Orchestrator wired with test fakes
