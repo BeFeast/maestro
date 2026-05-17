@@ -192,6 +192,10 @@ func parseRESTIssue(out []byte) (Issue, error) {
 	return issue.issue(), nil
 }
 
+func restIssueStateClosed(state string) bool {
+	return strings.EqualFold(strings.TrimSpace(state), "closed")
+}
+
 func parseRESTPulls(out []byte) ([]PR, error) {
 	var restPulls []restPull
 	if err := json.Unmarshal(out, &restPulls); err != nil {
@@ -288,7 +292,7 @@ func (c *Client) IsIssueClosed(number int) (bool, error) {
 	if err := json.Unmarshal(out, &result); err != nil {
 		return false, err
 	}
-	return result.State == "CLOSED", nil
+	return restIssueStateClosed(result.State), nil
 }
 
 // ListOpenPRs returns all open PRs
