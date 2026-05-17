@@ -1235,6 +1235,9 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue) (str
 		return "already in progress", dynamicSkipOther, nil
 	}
 	if st.IssueDone(issue.Number) {
+		if !e.canTreatIssueDoneForOutcome(st) {
+			return "", dynamicSkipOther, nil
+		}
 		return "already completed in state", dynamicSkipOther, nil
 	}
 	if st.IssueRetryExhausted(issue.Number) {
@@ -1285,6 +1288,9 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
+		if !e.canTreatIssueDoneForOutcome(st) {
+			return false, "issue is closed but outcome health is not verified", nil
+		}
 		return true, "issue is closed", nil
 	}
 
@@ -1298,7 +1304,11 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 			return false, "", fmt.Errorf("check PR #%d merged: %w", sess.PRNumber, err)
 		}
 		if merged {
-			return true, fmt.Sprintf("session %s is %s with merged PR #%d", slot, sess.Status, sess.PRNumber), nil
+			reason := fmt.Sprintf("session %s is %s with merged PR #%d", slot, sess.Status, sess.PRNumber)
+			if !e.canTreatIssueDoneForOutcome(st) {
+				return false, reason + " but outcome health is not verified", nil
+			}
+			return true, reason, nil
 		}
 	}
 
@@ -1307,10 +1317,20 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 		return false, "", fmt.Errorf("check merged PR for issue: %w", err)
 	}
 	if merged {
+		if !e.canTreatIssueDoneForOutcome(st) {
+			return false, "linked PR merged but outcome health is not verified", nil
+		}
 		return true, "linked PR merged", nil
 	}
 
 	return false, "", nil
+}
+
+func (e *Engine) canTreatIssueDoneForOutcome(st *state.State) bool {
+	if e == nil || e.cfg == nil || !e.cfg.Outcome.PassRequiredForDoneEnabled() {
+		return true
+	}
+	return e.outcomeStatus(st).HealthState == outcome.HealthHealthy
 }
 
 func validateOrderedQueueIssues(issues []int) error {

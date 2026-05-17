@@ -214,6 +214,10 @@ func testIssue(number int, title string, labels ...string) github.Issue {
 	return issue
 }
 
+func boolPtr(v bool) *bool {
+	return &v
+}
+
 func withProjectStatus(issue github.Issue, status string) github.Issue {
 	issue.ProjectItems = []github.IssueProjectItem{{
 		Title: "Maestro",
@@ -1583,6 +1587,117 @@ func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
 	}
 	if decision.Target == nil || decision.Target.Issue != 306 {
 		t.Fatalf("target = %#v, want issue 306", decision.Target)
+	}
+}
+
+func TestOrderedQueueIssueDone_ClosedIssueWaitsForOutcomeWhenRequired(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:      "Live app works",
+		VerifierCommand:     "check-live",
+		PassRequiredForDone: boolPtr(true),
+	}
+	reader := &fakeReader{closedIssues: map[int]bool{308: true}}
+	st := state.NewState()
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		State:     outcome.HealthFailing,
+		Signal:    "healthcheck_command",
+		Summary:   "live verifier failed",
+	}
+
+	done, reason, err := testEngine(cfg, reader).orderedQueueIssueDone(st, 308)
+	if err != nil {
+		t.Fatalf("orderedQueueIssueDone: %v", err)
+	}
+	if done {
+		t.Fatalf("done = true, want false while outcome is failing")
+	}
+	if !strings.Contains(reason, "outcome health is not verified") {
+		t.Fatalf("reason = %q, want outcome gate reason", reason)
+	}
+}
+
+func TestOrderedQueueIssueDone_MergedPRWaitsForOutcomeWhenRequired(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:      "Live app works",
+		VerifierCommand:     "check-live",
+		PassRequiredForDone: boolPtr(true),
+	}
+	reader := &fakeReader{mergedPRIssues: map[int]bool{308: true}}
+	st := state.NewState()
+	st.LastMergeAt = time.Now().UTC().Add(-time.Minute)
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		State:     outcome.HealthFailing,
+		Signal:    "healthcheck_command",
+		Summary:   "live verifier failed",
+	}
+
+	done, reason, err := testEngine(cfg, reader).orderedQueueIssueDone(st, 308)
+	if err != nil {
+		t.Fatalf("orderedQueueIssueDone: %v", err)
+	}
+	if done {
+		t.Fatalf("done = true, want false while outcome is failing")
+	}
+	if !strings.Contains(reason, "outcome health is not verified") {
+		t.Fatalf("reason = %q, want outcome gate reason", reason)
+	}
+}
+
+func TestOrderedQueueIssueDone_MergedPRAllowedAfterOutcomePass(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:      "Live app works",
+		VerifierCommand:     "check-live",
+		PassRequiredForDone: boolPtr(true),
+	}
+	reader := &fakeReader{mergedPRIssues: map[int]bool{308: true}}
+	st := state.NewState()
+	st.LastMergeAt = time.Now().UTC().Add(-time.Minute)
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		State:     outcome.HealthHealthy,
+		Signal:    "healthcheck_command",
+		Summary:   "live verifier passed",
+	}
+
+	done, reason, err := testEngine(cfg, reader).orderedQueueIssueDone(st, 308)
+	if err != nil {
+		t.Fatalf("orderedQueueIssueDone: %v", err)
+	}
+	if !done {
+		t.Fatalf("done = false, want true after outcome pass")
+	}
+	if reason != "linked PR merged" {
+		t.Fatalf("reason = %q, want linked PR merged", reason)
+	}
+}
+
+func TestDynamicWaveDoneStateDoesNotSkipWhenOutcomeNotVerified(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:      "Live app works",
+		VerifierCommand:     "check-live",
+		PassRequiredForDone: boolPtr(true),
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 42, Status: state.StatusDone, PRNumber: 12}
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		State:     outcome.HealthFailing,
+		Signal:    "healthcheck_command",
+		Summary:   "live verifier failed",
+	}
+
+	reason, _, err := testEngine(cfg, &fakeReader{}).dynamicWaveSkipReason(st, testIssue(42, "done issue", "maestro-ready"))
+	if err != nil {
+		t.Fatalf("dynamicWaveSkipReason: %v", err)
+	}
+	if reason != "" {
+		t.Fatalf("reason = %q, want no done-state skip until outcome passes", reason)
 	}
 }
 
