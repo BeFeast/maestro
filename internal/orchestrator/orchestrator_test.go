@@ -5499,6 +5499,38 @@ func TestSyncProject_MissingLifecycleStatusIsHandled(t *testing.T) {
 	}
 }
 
+func TestSyncProject_MissingLifecycleStatusDoesNotCheckRateBudgetWhenFieldKnown(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 3,
+		},
+	}
+	rateCalls := 0
+	o := &Orchestrator{
+		cfg: cfg,
+		projectField: &github.ProjectField{
+			ProjectID: "PVT_test",
+			FieldID:   "FIELD_test",
+			Options:   map[string]string{"Todo": "opt-todo", "In Progress": "opt-progress", "Done": "opt-done"},
+		},
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			rateCalls++
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 0, Used: 5000},
+			}, nil
+		},
+	}
+
+	if !o.syncProject(42, github.ProjectStatusLiveVerify) {
+		t.Fatal("syncProject should report handled when board lacks lifecycle status candidates")
+	}
+	if rateCalls != 0 {
+		t.Fatalf("rateLimit calls = %d, want 0 for unsupported status with known project field", rateCalls)
+	}
+}
+
 func TestReconcileSessionsToProjectBoard_SkipsAlreadySyncedStatus(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
@@ -5636,6 +5668,44 @@ func TestRunOncePersistsProjectStatusSyncAfterReconcile(t *testing.T) {
 	}
 	if syncCalls != 1 {
 		t.Fatalf("sync calls = %d, want 1 after cached second pass", syncCalls)
+	}
+}
+
+func TestReconcileProjectBoard_DoesNotCheckRateLimitWhenSweepThrottled(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 3,
+		},
+	}
+
+	rateCalls := 0
+	o := &Orchestrator{
+		cfg: cfg,
+		projectField: &github.ProjectField{
+			ProjectID: "PVT_test",
+			FieldID:   "FIELD_test",
+			Options:   map[string]string{"Todo": "opt-todo", "In Progress": "opt-progress", "Done": "opt-done"},
+		},
+		projectItemsSweepAt: time.Now().UTC(),
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			rateCalls++
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+			}, nil
+		},
+		listNonDoneProjectItemsFn: func(pf *github.ProjectField) ([]github.ProjectItem, error) {
+			t.Fatal("throttled reconcile should not sweep project items")
+			return nil, nil
+		},
+	}
+
+	if o.reconcileProjectBoard(state.NewState()) {
+		t.Fatal("throttled reconcile without session transitions should be unchanged")
+	}
+	if rateCalls != 0 {
+		t.Fatalf("rateLimit calls = %d, want 0 while sweep is throttled", rateCalls)
 	}
 }
 
