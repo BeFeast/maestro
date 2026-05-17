@@ -254,7 +254,7 @@ type TransitionOptions struct {
 ### Why this shape
 
 - `ListCandidates` replaces label-based selection inside `orchestrator`.
-- `GetByIssueNumber` replaces direct `gh issue view/list` usage in `spawn`, retries, and fallback flows.
+- `GetByIssueNumber` replaces direct issue-subcommand usage in `spawn`, retries, and fallback flows.
 - `IsClosed` keeps the zombie-cleanup behavior without exposing raw GitHub issue APIs.
 - `Transition` centralizes status sync and optional side effects.
 

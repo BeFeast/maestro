@@ -222,6 +222,20 @@ func TestTrySyncIssueStatusOneOf_NilProjectField(t *testing.T) {
 	}
 }
 
+func TestParseIssueNodeIDUsesRESTNodeID(t *testing.T) {
+	got, err := parseIssueNodeID(42, []byte(`{"node_id":"I_kwDOExample"}`))
+	if err != nil {
+		t.Fatalf("parseIssueNodeID() error = %v", err)
+	}
+	if got != "I_kwDOExample" {
+		t.Fatalf("node id = %q, want I_kwDOExample", got)
+	}
+
+	if _, err := parseIssueNodeID(42, []byte(`{"id":123}`)); err == nil {
+		t.Fatal("parseIssueNodeID() should reject missing REST node_id")
+	}
+}
+
 func TestNormalizeProjectStatusKey(t *testing.T) {
 	tests := []struct {
 		in, want string

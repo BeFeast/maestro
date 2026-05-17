@@ -30,9 +30,9 @@ fi
 
 echo "[generate-validation] Generating VALIDATION.md for ${REPO}#${ISSUE_NUMBER}"
 
-# Fetch issue title and body
-ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title --jq '.title' 2>/dev/null || echo "")
-ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
+# Fetch issue title and body via REST. Avoid issue subcommands; they may use GraphQL.
+ISSUE_TITLE=$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.title // ""' 2>/dev/null || echo "")
+ISSUE_BODY=$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.body // ""' 2>/dev/null || echo "")
 
 if [ -z "$ISSUE_TITLE" ]; then
   echo "[generate-validation] WARN: could not fetch issue #${ISSUE_NUMBER}, skipping" >&2

@@ -454,6 +454,10 @@ func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus)
 	if len(candidates) == 0 {
 		candidates = []string{string(status)}
 	}
+	if !github.HasProjectStatusCandidate(o.projectField, candidates) {
+		log.Printf("[projects] none of statuses %v found in project; treating issue #%d status=%q as handled", candidates, issueNumber, status)
+		return true
+	}
 	return o.gh.TrySyncIssueStatusOneOf(o.projectField, issueNumber, candidates...)
 }
 
