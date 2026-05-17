@@ -66,7 +66,8 @@ type Orchestrator struct {
 	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
 
 	// Cached project board field (discovered once per run cycle, nil if disabled)
-	projectField *github.ProjectField
+	projectField           *github.ProjectField
+	projectDiscoverRetryAt time.Time
 
 	// Mission processor (nil when missions disabled)
 	missionProc *mission.Processor
@@ -353,12 +354,17 @@ func (o *Orchestrator) ensureProjectField() {
 	if o.projectField != nil {
 		return
 	}
+	if !o.projectDiscoverRetryAt.IsZero() && time.Now().Before(o.projectDiscoverRetryAt) {
+		return
+	}
 	pf, err := o.gh.DiscoverProject(o.cfg.GitHubProjects.ProjectNumber)
 	if err != nil {
-		log.Printf("[orch] discover project: %v", err)
+		o.projectDiscoverRetryAt = time.Now().Add(10 * time.Minute)
+		log.Printf("[orch] discover project: %v (backing off until %s)", err, o.projectDiscoverRetryAt.Format(time.RFC3339))
 		return
 	}
 	o.projectField = pf
+	o.projectDiscoverRetryAt = time.Time{}
 }
 
 // syncProject syncs an issue's status to the configured GitHub Project board.
