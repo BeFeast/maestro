@@ -443,13 +443,16 @@ func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus)
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
 		return false
 	}
-	if !o.projectGraphQLBudgetAvailable() {
-		return false
-	}
 	if o.syncProjectFn != nil {
+		if !o.projectGraphQLBudgetAvailable() {
+			return false
+		}
 		return o.syncProjectFn(issueNumber, status)
 	}
 	o.ensureProjectField()
+	if o.projectField == nil {
+		return false
+	}
 	candidates := github.ProjectStatusCandidates(status)
 	if len(candidates) == 0 {
 		candidates = []string{string(status)}
@@ -457,6 +460,9 @@ func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus)
 	if !github.HasProjectStatusCandidate(o.projectField, candidates) {
 		log.Printf("[projects] none of statuses %v found in project; treating issue #%d status=%q as handled", candidates, issueNumber, status)
 		return true
+	}
+	if !o.projectGraphQLBudgetAvailable() {
+		return false
 	}
 	return o.gh.TrySyncIssueStatusOneOf(o.projectField, issueNumber, candidates...)
 }
@@ -535,9 +541,6 @@ func (o *Orchestrator) reconcileProjectBoard(s *state.State) bool {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
 		return false
 	}
-	if !o.projectGraphQLBudgetAvailable() {
-		return false
-	}
 	o.ensureProjectField()
 	if o.projectField == nil {
 		return false
@@ -547,6 +550,9 @@ func (o *Orchestrator) reconcileProjectBoard(s *state.State) bool {
 
 	now := time.Now().UTC()
 	if !o.projectBoardSweepDue(now) {
+		return changed
+	}
+	if !o.projectGraphQLBudgetAvailable() {
 		return changed
 	}
 
