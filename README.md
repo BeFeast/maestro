@@ -482,7 +482,7 @@ maestro run --config ~/.maestro/maestro-myapp.yaml
 
 - Verify your `issue_labels` config (or deprecated `issue_label`) matches existing issue labels on GitHub
 - Check that issues aren't already assigned or have `exclude_labels`
-- Run `gh issue list --label enhancement` to confirm matching issues exist
+- Run `gh api 'repos/OWNER/REPO/issues?state=open&labels=enhancement' --jq '.[].number'` to confirm matching issues exist
 
 ### tmux errors
 

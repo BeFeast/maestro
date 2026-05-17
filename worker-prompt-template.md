@@ -91,7 +91,8 @@ When rebasing conflicts in these files: **keep BOTH sides**. Your additions + wh
 
 ### 7. Done means done
 Once you've opened a PR:
-- Verify CI started (gh pr checks)
+- Verify CI started with REST only:
+  `sha=$(gh api repos/OWNER/REPO/pulls/PR_NUMBER --jq .head.sha) && gh api repos/OWNER/REPO/commits/$sha/check-runs --jq '.check_runs[] | {name,status,conclusion}'`
 - Write a brief summary of what you did
 - Stop. Don't keep adding things.
 

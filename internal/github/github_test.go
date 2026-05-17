@@ -93,6 +93,78 @@ func TestParseRateLimitStatus(t *testing.T) {
 	}
 }
 
+func TestCIStatusFromREST(t *testing.T) {
+	tests := []struct {
+		name     string
+		checks   []greptileCheckRun
+		combined combinedStatusResponse
+		want     string
+	}{
+		{name: "no checks means success", want: "success"},
+		{name: "queued check pending", checks: []greptileCheckRun{{Name: "test", Status: "queued"}}, want: "pending"},
+		{name: "in progress check pending", checks: []greptileCheckRun{{Name: "test", Status: "in_progress"}}, want: "pending"},
+		{name: "failed check fails", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "failure"}}, want: "failure"},
+		{name: "cancelled check fails", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "cancelled"}}, want: "failure"},
+		{name: "success checks pass", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, want: "success"},
+		{name: "combined pending wins", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, combined: combinedStatusResponse{State: "pending"}, want: "pending"},
+		{name: "combined failure wins", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, combined: combinedStatusResponse{State: "failure"}, want: "failure"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ciStatusFromREST(tt.checks, tt.combined); got != tt.want {
+				t.Fatalf("ciStatusFromREST() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeableFromRESTPull(t *testing.T) {
+	yes := true
+	no := false
+	tests := []struct {
+		name string
+		pr   restPull
+		want string
+	}{
+		{name: "mergeable bool true", pr: restPull{Mergeable: &yes}, want: "MERGEABLE"},
+		{name: "mergeable bool false", pr: restPull{Mergeable: &no}, want: "CONFLICTING"},
+		{name: "dirty state conflicts", pr: restPull{MergeableState: "dirty"}, want: "CONFLICTING"},
+		{name: "unknown state unknown", pr: restPull{MergeableState: "unknown"}, want: "UNKNOWN"},
+		{name: "unstable still mergeable", pr: restPull{MergeableState: "unstable"}, want: "MERGEABLE"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := mergeableFromRESTPull(tt.pr); got != tt.want {
+				t.Fatalf("mergeableFromRESTPull() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParsePRLabelsAndCommits(t *testing.T) {
+	labels, err := parsePRLabels([]byte(`[{"name":"ready"},{"name":"bug"}]`))
+	if err != nil {
+		t.Fatalf("parsePRLabels() error = %v", err)
+	}
+	if !reflect.DeepEqual(labels, []string{"ready", "bug"}) {
+		t.Fatalf("labels = %#v", labels)
+	}
+
+	commits, err := parsePRCommits([]byte(`[
+		{"commit":{"message":"first line\n\nbody"}},
+		{"commit":{"message":"single line"}},
+		{"commit":{"message":""}}
+	]`))
+	if err != nil {
+		t.Fatalf("parsePRCommits() error = %v", err)
+	}
+	if !reflect.DeepEqual(commits, []string{"first line", "single line"}) {
+		t.Fatalf("commits = %#v", commits)
+	}
+}
+
 func TestGreptileCheckDecision(t *testing.T) {
 	tests := []struct {
 		name        string

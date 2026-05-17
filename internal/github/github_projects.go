@@ -294,22 +294,28 @@ func (c *Client) TrySyncIssueStatusOneOf(pf *ProjectField, issueNumber int, cand
 func (c *Client) getIssueNodeID(issueNumber int) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "gh", "issue", "view", fmt.Sprint(issueNumber),
-		"--repo", c.Repo,
-		"--json", "id").Output()
+	out, err := exec.CommandContext(ctx, "gh", "api", fmt.Sprintf("repos/%s/issues/%d", c.Repo, issueNumber)).Output()
 	if err != nil {
-		return "", fmt.Errorf("gh issue view %d --json id: %w", issueNumber, err)
+		return "", fmt.Errorf("gh api issue %d: %w", issueNumber, err)
 	}
+	nodeID, err := parseIssueNodeID(issueNumber, out)
+	if err != nil {
+		return "", err
+	}
+	return nodeID, nil
+}
+
+func parseIssueNodeID(issueNumber int, out []byte) (string, error) {
 	var result struct {
-		ID string `json:"id"`
+		NodeID string `json:"node_id"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
 		return "", fmt.Errorf("parse issue %d node id: %w", issueNumber, err)
 	}
-	if result.ID == "" {
+	if result.NodeID == "" {
 		return "", fmt.Errorf("empty node ID for issue #%d", issueNumber)
 	}
-	return result.ID, nil
+	return result.NodeID, nil
 }
 
 // addToProject adds an issue to a GitHub Project and returns the project item ID.
@@ -433,6 +439,14 @@ func resolveProjectStatusOption(pf *ProjectField, candidates []string) (string, 
 		}
 	}
 	return "", "", false
+}
+
+// HasProjectStatusCandidate reports whether any candidate can be represented by
+// the board's Status field. Callers use this to avoid repeated ProjectV2 item
+// lookups for lifecycle states the board does not support.
+func HasProjectStatusCandidate(pf *ProjectField, candidates []string) bool {
+	_, _, ok := resolveProjectStatusOption(pf, candidates)
+	return ok
 }
 
 func normalizeProjectStatusKey(name string) string {

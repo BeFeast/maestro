@@ -11,9 +11,31 @@ import (
 )
 
 type greptileCheckRun struct {
+	ID         int64  `json:"id"`
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
+	HTMLURL    string `json:"html_url"`
+	DetailsURL string `json:"details_url"`
+	Output     struct {
+		Title   string `json:"title"`
+		Summary string `json:"summary"`
+		Text    string `json:"text"`
+	} `json:"output"`
+}
+
+type checkRunsResponse struct {
+	CheckRuns []greptileCheckRun `json:"check_runs"`
+}
+
+type combinedStatusResponse struct {
+	State    string `json:"state"`
+	Statuses []struct {
+		Context     string `json:"context"`
+		State       string `json:"state"`
+		Description string `json:"description"`
+		TargetURL   string `json:"target_url"`
+	} `json:"statuses"`
 }
 
 type greptileReviewComment struct {
@@ -23,6 +45,13 @@ type greptileReviewComment struct {
 	CommitID         string `json:"commit_id"`
 	OriginalCommitID string `json:"original_commit_id"`
 	User             struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+type issueComment struct {
+	Body string `json:"body"`
+	User struct {
 		Login string `json:"login"`
 	} `json:"user"`
 }
@@ -85,15 +114,28 @@ type restIssue struct {
 }
 
 type restPull struct {
-	Number int     `json:"number"`
-	Title  string  `json:"title"`
-	Body   *string `json:"body"`
-	State  string  `json:"state"`
-	Draft  bool    `json:"draft"`
-	Head   struct {
+	Number         int     `json:"number"`
+	Title          string  `json:"title"`
+	Body           *string `json:"body"`
+	State          string  `json:"state"`
+	Draft          bool    `json:"draft"`
+	Mergeable      *bool   `json:"mergeable"`
+	MergeableState string  `json:"mergeable_state"`
+	Head           struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"head"`
 	MergedAt *string `json:"merged_at"`
+}
+
+type prLabel struct {
+	Name string `json:"name"`
+}
+
+type prCommit struct {
+	Commit struct {
+		Message string `json:"message"`
+	} `json:"commit"`
 }
 
 func (ri restIssue) issue() Issue {
@@ -134,7 +176,12 @@ func New(repo string) *Client {
 }
 
 func ghAPI(endpoint string) ([]byte, error) {
-	out, err := exec.Command("gh", "api", endpoint).Output()
+	return ghAPIWithArgs(endpoint)
+}
+
+func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
+	cmdArgs := append([]string{"api", endpoint}, args...)
+	out, err := exec.Command("gh", cmdArgs...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("gh api %s: %w", endpoint, err)
 	}
@@ -217,6 +264,135 @@ func prReferencesIssue(pr PR, issueNumber int) bool {
 		return false
 	}
 	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + pr.Body)
+}
+
+func parseCheckRuns(out []byte) ([]greptileCheckRun, error) {
+	var payload checkRunsResponse
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return nil, err
+	}
+	return payload.CheckRuns, nil
+}
+
+func parseCombinedStatus(out []byte) (combinedStatusResponse, error) {
+	var payload combinedStatusResponse
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return combinedStatusResponse{}, err
+	}
+	return payload, nil
+}
+
+func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	if strings.EqualFold(combined.State, "pending") {
+		return "pending"
+	}
+	if strings.EqualFold(combined.State, "failure") || strings.EqualFold(combined.State, "error") {
+		return "failure"
+	}
+
+	hasSignal := len(checks) > 0 || len(combined.Statuses) > 0
+	for _, check := range checks {
+		status := strings.ToLower(strings.TrimSpace(check.Status))
+		conclusion := strings.ToLower(strings.TrimSpace(check.Conclusion))
+		if status == "queued" || status == "in_progress" || status == "waiting" || status == "requested" || (status != "completed" && conclusion == "") {
+			return "pending"
+		}
+		switch conclusion {
+		case "failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale":
+			return "failure"
+		}
+	}
+	if !hasSignal {
+		return "success"
+	}
+	return "success"
+}
+
+func formatChecksOverview(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	var lines []string
+	for _, check := range checks {
+		state := strings.TrimSpace(check.Conclusion)
+		if state == "" {
+			state = strings.TrimSpace(check.Status)
+		}
+		if state == "" {
+			state = "unknown"
+		}
+		lines = append(lines, fmt.Sprintf("%s\t%s", check.Name, state))
+	}
+	for _, status := range combined.Statuses {
+		name := status.Context
+		if name == "" {
+			name = "commit-status"
+		}
+		state := status.State
+		if state == "" {
+			state = "unknown"
+		}
+		if status.Description != "" {
+			lines = append(lines, fmt.Sprintf("%s\t%s\t%s", name, state, status.Description))
+		} else {
+			lines = append(lines, fmt.Sprintf("%s\t%s", name, state))
+		}
+	}
+	if len(lines) == 0 {
+		return "no checks\n"
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func mergeableFromRESTPull(pr restPull) string {
+	if pr.Mergeable != nil {
+		if *pr.Mergeable {
+			return "MERGEABLE"
+		}
+		return "CONFLICTING"
+	}
+	switch strings.ToLower(strings.TrimSpace(pr.MergeableState)) {
+	case "dirty":
+		return "CONFLICTING"
+	case "", "unknown":
+		return "UNKNOWN"
+	default:
+		return "MERGEABLE"
+	}
+}
+
+func parseIssueComments(out []byte) ([]issueComment, error) {
+	var comments []issueComment
+	if err := json.Unmarshal(out, &comments); err != nil {
+		return nil, err
+	}
+	return comments, nil
+}
+
+func parsePRLabels(out []byte) ([]string, error) {
+	var labels []prLabel
+	if err := json.Unmarshal(out, &labels); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(labels))
+	for _, label := range labels {
+		names = append(names, label.Name)
+	}
+	return names, nil
+}
+
+func parsePRCommits(out []byte) ([]string, error) {
+	var commits []prCommit
+	if err := json.Unmarshal(out, &commits); err != nil {
+		return nil, err
+	}
+	msgs := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		message := strings.TrimSpace(commit.Commit.Message)
+		if message == "" {
+			continue
+		}
+		headline := strings.SplitN(message, "\n", 2)[0]
+		msgs = append(msgs, headline)
+	}
+	return msgs, nil
 }
 
 // ListOpenIssues returns open issues matching any of the given labels (OR filter).
@@ -321,6 +497,54 @@ func (c *Client) listClosedPRs() ([]PR, error) {
 	return prs, nil
 }
 
+func (c *Client) getRESTPull(prNumber int) (restPull, error) {
+	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber))
+	if err != nil {
+		return restPull{}, err
+	}
+	var pr restPull
+	if err := json.Unmarshal(out, &pr); err != nil {
+		return restPull{}, err
+	}
+	return pr, nil
+}
+
+func (c *Client) pullHeadSHA(prNumber int) (string, error) {
+	pr, err := c.getRESTPull(prNumber)
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(pr.Head.SHA)
+	if sha == "" {
+		return "", fmt.Errorf("empty head sha for PR %d", prNumber)
+	}
+	return sha, nil
+}
+
+func (c *Client) checkRunsForSHA(sha string) ([]greptileCheckRun, error) {
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/commits/%s/check-runs?per_page=100", c.Repo, sha), "--paginate")
+	if err != nil {
+		return nil, err
+	}
+	checks, err := parseCheckRuns(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse check runs for %s: %w", sha, err)
+	}
+	return checks, nil
+}
+
+func (c *Client) combinedStatusForSHA(sha string) (combinedStatusResponse, error) {
+	out, err := ghAPI(fmt.Sprintf("repos/%s/commits/%s/status", c.Repo, sha))
+	if err != nil {
+		return combinedStatusResponse{}, err
+	}
+	status, err := parseCombinedStatus(out)
+	if err != nil {
+		return combinedStatusResponse{}, fmt.Errorf("parse combined status for %s: %w", sha, err)
+	}
+	return status, nil
+}
+
 // CreatePR opens a pull request and returns its number.
 func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 	args := []string{
@@ -350,20 +574,11 @@ func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 
 // IsPRMerged returns true if the PR has been merged.
 func (c *Client) IsPRMerged(prNumber int) (bool, error) {
-	out, err := exec.Command("gh", "pr", "view", fmt.Sprint(prNumber),
-		"--repo", c.Repo,
-		"--json", "state,mergedAt").Output()
+	pr, err := c.getRESTPull(prNumber)
 	if err != nil {
-		return false, fmt.Errorf("gh pr view %d: %w", prNumber, err)
+		return false, fmt.Errorf("get pull %d: %w", prNumber, err)
 	}
-	var result struct {
-		State    string `json:"state"`
-		MergedAt string `json:"mergedAt"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return false, fmt.Errorf("parse pr %d: %w", prNumber, err)
-	}
-	return result.State == "MERGED" || result.MergedAt != "", nil
+	return strings.EqualFold(pr.State, "closed") && pr.MergedAt != nil, nil
 }
 
 // HasMergedPRForIssue returns true if a merged PR references the issue.
@@ -382,50 +597,25 @@ func (c *Client) HasMergedPRForIssue(issueNumber int) (bool, error) {
 
 // PRCIStatus returns "success", "failure", "pending", or "unknown"
 func (c *Client) PRCIStatus(prNumber int) (string, error) {
-	out, err := exec.Command("gh", "pr", "checks",
-		fmt.Sprint(prNumber),
-		"--repo", c.Repo).CombinedOutput()
+	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
-		// gh pr checks exits non-zero when checks fail
-		outStr := string(out)
-		if strings.Contains(outStr, "fail") || strings.Contains(outStr, "✗") {
-			return "failure", nil
-		}
-		if strings.Contains(outStr, "pending") || strings.Contains(outStr, "in_progress") {
-			return "pending", nil
-		}
-		// No checks configured
-		if strings.Contains(outStr, "no checks") {
-			return "success", nil
-		}
-		return "unknown", nil
+		return "unknown", fmt.Errorf("get pull %d head sha: %w", prNumber, err)
 	}
-	outStr := string(out)
-	if strings.Contains(outStr, "fail") || strings.Contains(outStr, "✗") {
-		return "failure", nil
+	checks, checksErr := c.checkRunsForSHA(sha)
+	combined, statusErr := c.combinedStatusForSHA(sha)
+	if checksErr != nil && statusErr != nil {
+		return "unknown", fmt.Errorf("get checks for PR %d: check-runs: %v; statuses: %v", prNumber, checksErr, statusErr)
 	}
-	if strings.Contains(outStr, "pending") || strings.Contains(outStr, "in_progress") {
-		return "pending", nil
-	}
-	return "success", nil
+	return ciStatusFromREST(checks, combined), nil
 }
 
 // PRMergeable returns the mergeable state: "MERGEABLE", "CONFLICTING", "UNKNOWN"
 func (c *Client) PRMergeable(prNumber int) (string, error) {
-	out, err := exec.Command("gh", "pr", "view",
-		fmt.Sprint(prNumber),
-		"--repo", c.Repo,
-		"--json", "mergeable").Output()
+	pr, err := c.getRESTPull(prNumber)
 	if err != nil {
-		return "", fmt.Errorf("gh pr view %d: %w", prNumber, err)
+		return "", fmt.Errorf("get pull %d: %w", prNumber, err)
 	}
-	var result struct {
-		Mergeable string `json:"mergeable"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return "", err
-	}
-	return result.Mergeable, nil
+	return mergeableFromRESTPull(pr), nil
 }
 
 // PRGreptileApproved checks whether Greptile has approved the PR.
@@ -443,39 +633,20 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 //   - no greptile signal at all → pending=true
 func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, err error) {
 	// --- 1. Get head SHA of the PR ---
-	prOut, err := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber)).Output()
+	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
-		return false, false, fmt.Errorf("gh api pulls/%d: %w", prNumber, err)
+		return false, false, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
 	}
-	var prData struct {
-		Head struct {
-			SHA string `json:"sha"`
-		} `json:"head"`
-	}
-	if err := json.Unmarshal(prOut, &prData); err != nil {
-		return false, false, fmt.Errorf("parse pr %d head sha: %w", prNumber, err)
-	}
-	sha := prData.Head.SHA
 
 	// --- 2. Get check runs for the head SHA ---
-	checksOut, err := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/commits/%s/check-runs", c.Repo, sha),
-		"--paginate").Output()
+	checkRuns, err := c.checkRunsForSHA(sha)
 	if err != nil {
 		// Non-fatal: fall through to comment fallback
 		goto commentFallback
 	}
 
 	{
-		var checksData struct {
-			CheckRuns []greptileCheckRun `json:"check_runs"`
-		}
-		if err := json.Unmarshal(checksOut, &checksData); err != nil {
-			goto commentFallback
-		}
-
-		found, approved, pending := greptileCheckDecision(checksData.CheckRuns)
+		found, approved, pending := greptileCheckDecision(checkRuns)
 		if found {
 			if pending {
 				return false, true, nil
@@ -497,26 +668,18 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 
 commentFallback:
 	// --- 3. Fallback: check PR comments (legacy Greptile comment-mode) ---
-	commentsOut, err := exec.Command("gh", "pr", "view",
-		fmt.Sprint(prNumber),
-		"--repo", c.Repo,
-		"--comments",
-		"--json", "comments").Output()
+	commentsOut, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
-		return false, false, fmt.Errorf("gh pr view %d comments: %w", prNumber, err)
+		return false, false, fmt.Errorf("list issue comments for PR %d: %w", prNumber, err)
 	}
 
-	var commentsResult struct {
-		Comments []struct {
-			Body string `json:"body"`
-		} `json:"comments"`
-	}
-	if err := json.Unmarshal(commentsOut, &commentsResult); err != nil {
+	comments, err := parseIssueComments(commentsOut)
+	if err != nil {
 		return false, false, fmt.Errorf("parse pr %d comments: %w", prNumber, err)
 	}
 
 	foundGreptile := false
-	for _, comment := range commentsResult.Comments {
+	for _, comment := range comments {
 		bodyLower := strings.ToLower(comment.Body)
 		if !strings.Contains(bodyLower, "greptile") {
 			continue
@@ -652,17 +815,19 @@ func (c *Client) ClosePR(prNumber int, comment string) error {
 	return nil
 }
 
-// PRChecksOutput returns the full output of `gh pr checks` for a PR,
-// useful for capturing CI failure details to pass to retry workers.
+// PRChecksOutput returns a REST-derived check overview for a PR, useful for
+// capturing CI failure details to pass to retry workers.
 func (c *Client) PRChecksOutput(prNumber int) (string, error) {
-	out, err := exec.Command("gh", "pr", "checks",
-		fmt.Sprint(prNumber),
-		"--repo", c.Repo).CombinedOutput()
-	// gh pr checks exits non-zero when checks fail, but the output is still useful
+	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
-		return string(out), nil
+		return "", fmt.Errorf("get pull %d head sha: %w", prNumber, err)
 	}
-	return string(out), nil
+	checks, checksErr := c.checkRunsForSHA(sha)
+	combined, statusErr := c.combinedStatusForSHA(sha)
+	if checksErr != nil && statusErr != nil {
+		return "", fmt.Errorf("get checks for PR %d: check-runs: %v; statuses: %v", prNumber, checksErr, statusErr)
+	}
+	return formatChecksOverview(checks, combined), nil
 }
 
 // MergePR squash-merges a PR
@@ -739,48 +904,26 @@ func (c *Client) CommentIssue(issueNumber int, body string) error {
 
 // PRLabels returns the labels on a PR.
 func (c *Client) PRLabels(prNumber int) ([]string, error) {
-	out, err := exec.Command("gh", "pr", "view",
-		fmt.Sprint(prNumber),
-		"--repo", c.Repo,
-		"--json", "labels").Output()
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/labels?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
-		return nil, fmt.Errorf("gh pr view %d labels: %w", prNumber, err)
+		return nil, fmt.Errorf("list PR %d labels: %w", prNumber, err)
 	}
-	var result struct {
-		Labels []struct {
-			Name string `json:"name"`
-		} `json:"labels"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
+	names, err := parsePRLabels(out)
+	if err != nil {
 		return nil, err
-	}
-	names := make([]string, len(result.Labels))
-	for i, l := range result.Labels {
-		names[i] = l.Name
 	}
 	return names, nil
 }
 
 // PRCommits returns commit messages for a PR.
 func (c *Client) PRCommits(prNumber int) ([]string, error) {
-	out, err := exec.Command("gh", "pr", "view",
-		fmt.Sprint(prNumber),
-		"--repo", c.Repo,
-		"--json", "commits").Output()
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
-		return nil, fmt.Errorf("gh pr view %d commits: %w", prNumber, err)
+		return nil, fmt.Errorf("list PR %d commits: %w", prNumber, err)
 	}
-	var result struct {
-		Commits []struct {
-			MessageHeadline string `json:"messageHeadline"`
-		} `json:"commits"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
+	msgs, err := parsePRCommits(out)
+	if err != nil {
 		return nil, err
-	}
-	msgs := make([]string, len(result.Commits))
-	for i, c := range result.Commits {
-		msgs[i] = c.MessageHeadline
 	}
 	return msgs, nil
 }
@@ -1084,50 +1227,54 @@ func FormatReviewFeedback(comments []ReviewComment) string {
 // CIFailureSummary gets the CI check run failure summary for a PR.
 func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 	// 1. Get check overview
-	overview, _ := exec.Command("gh", "pr", "checks", fmt.Sprint(prNumber), "--repo", c.Repo).CombinedOutput()
-
-	// 2. Find failed job IDs and fetch their logs
-	runsOut, _ := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber),
-		"--jq", ".head.sha").Output()
-	sha := strings.TrimSpace(string(runsOut))
-	if sha == "" {
-		return string(overview), nil
+	overview, err := c.PRChecksOutput(prNumber)
+	if err != nil {
+		overview = err.Error()
 	}
 
-	jqExpr := `.check_runs[] | select(.conclusion == "failure") | "\(.id) \(.name)"`
-	checksOut, err := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/commits/%s/check-runs", c.Repo, sha),
-		"--jq", jqExpr).Output()
-	if err != nil || len(checksOut) == 0 {
-		return string(overview), nil
+	// 2. Find failed job IDs and fetch their logs
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil || sha == "" {
+		return overview, nil
+	}
+
+	checks, err := c.checkRunsForSHA(sha)
+	if err != nil {
+		return overview, nil
+	}
+	var failed []greptileCheckRun
+	for _, check := range checks {
+		switch strings.ToLower(strings.TrimSpace(check.Conclusion)) {
+		case "failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale":
+			failed = append(failed, check)
+		}
+	}
+	if len(failed) == 0 {
+		return overview, nil
 	}
 
 	var result strings.Builder
 	result.WriteString("CI Check Overview:\n")
-	result.Write(overview)
+	result.WriteString(overview)
 	result.WriteString("\n\n")
 
-	for _, line := range strings.Split(strings.TrimSpace(string(checksOut)), "\n") {
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) < 2 {
-			continue
+	for _, check := range failed {
+		result.WriteString(fmt.Sprintf("=== Failed check: %s ===\n", check.Name))
+		if check.Output.Summary != "" {
+			result.WriteString(check.Output.Summary)
+			result.WriteString("\n")
 		}
-		jobID, jobName := parts[0], parts[1]
-		result.WriteString(fmt.Sprintf("=== Failed job: %s ===\n", jobName))
-		logOut, err := exec.Command("gh", "api",
-			fmt.Sprintf("repos/%s/actions/jobs/%s/logs", c.Repo, jobID)).Output()
-		if err != nil {
-			result.WriteString("(could not fetch logs)\n")
-			continue
+		if check.Output.Text != "" {
+			result.WriteString(check.Output.Text)
+			result.WriteString("\n")
 		}
-		lines := strings.Split(string(logOut), "\n")
-		start := len(lines) - 80
-		if start < 0 {
-			start = 0
-		}
-		for _, l := range lines[start:] {
-			result.WriteString(l)
+		if check.DetailsURL != "" {
+			result.WriteString("Details: ")
+			result.WriteString(check.DetailsURL)
+			result.WriteString("\n")
+		} else if check.HTMLURL != "" {
+			result.WriteString("Details: ")
+			result.WriteString(check.HTMLURL)
 			result.WriteString("\n")
 		}
 		result.WriteString("\n")

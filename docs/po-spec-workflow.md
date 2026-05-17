@@ -61,7 +61,7 @@ audit trail.
 Inspect the queue:
 
 ```bash
-ssh workshop 'cd /mnt/storage/src/maestro && gh issue list --repo BeFeast/maestro --state open --label maestro-ready --limit 50'
+ssh workshop 'cd /mnt/storage/src/maestro && gh api "repos/BeFeast/maestro/issues?state=open&labels=maestro-ready&per_page=50" --jq ".[].number"'
 ```
 
 Watch the live brief:

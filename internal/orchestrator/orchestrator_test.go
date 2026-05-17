@@ -5472,6 +5472,33 @@ func TestSyncProject_SkipsWhenGraphQLBudgetLow(t *testing.T) {
 	}
 }
 
+func TestSyncProject_MissingLifecycleStatusIsHandled(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 3,
+		},
+	}
+	o := &Orchestrator{
+		cfg: cfg,
+		projectField: &github.ProjectField{
+			ProjectID: "PVT_test",
+			FieldID:   "FIELD_test",
+			Options:   map[string]string{"Todo": "opt-todo", "In Progress": "opt-progress", "Done": "opt-done"},
+		},
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+			}, nil
+		},
+	}
+
+	if !o.syncProject(42, github.ProjectStatusLiveVerify) {
+		t.Fatal("syncProject should report handled when board lacks lifecycle status candidates")
+	}
+}
+
 func TestReconcileSessionsToProjectBoard_SkipsAlreadySyncedStatus(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
