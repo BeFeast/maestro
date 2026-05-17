@@ -2943,7 +2943,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if initialPhase != state.PhaseNone {
 			s.Sessions[slotName].Phase = initialPhase
 		}
-		o.syncProject(issue.Number, github.ProjectStatusInProgress)
+		if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
+			s.MarkProjectStatusSynced(issue.Number, string(github.ProjectStatusInProgress), time.Now().UTC())
+		}
 		o.notifier.Sendf("🚀 maestro: started worker %s for issue #%d: %s", slotName, issue.Number, issue.Title)
 		started++
 	}

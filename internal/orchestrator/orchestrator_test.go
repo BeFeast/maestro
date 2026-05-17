@@ -3024,6 +3024,38 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 	}
 }
 
+func TestStartNewWorkers_RecordsProjectStatusSyncOnStart(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.GitHubProjects = config.GitHubProjectsConfig{Enabled: true, ProjectNumber: 3}
+	issues := []github.Issue{makeIssue(347, "ready issue")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.rateLimitFn = func() (github.RateLimitStatus, error) {
+		return github.RateLimitStatus{
+			GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+		}, nil
+	}
+	o.syncProjectFn = func(issueNumber int, status github.ProjectStatus) bool {
+		if issueNumber != 347 {
+			t.Fatalf("sync issue = %d, want 347", issueNumber)
+		}
+		if status != github.ProjectStatusInProgress {
+			t.Fatalf("sync status = %q, want %q", status, github.ProjectStatusInProgress)
+		}
+		return true
+	}
+
+	s := state.NewState()
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 || (*started)[0] != 347 {
+		t.Fatalf("started = %v, want [347]", *started)
+	}
+	if !s.ProjectStatusSynced(347, string(github.ProjectStatusInProgress)) {
+		t.Fatal("startNewWorkers did not record project status sync")
+	}
+}
+
 func TestStartNewWorkers_SupervisorOwnedReadyLabelStartsOnlySelectedCandidate(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
 	cfg.IssueLabels = []string{"maestro-ready"}
