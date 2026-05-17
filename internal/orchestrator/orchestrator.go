@@ -17,6 +17,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mission"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
@@ -1262,8 +1263,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				if err != nil {
 					log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 				} else if closed {
-					log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-					done = true
+					if o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
+						log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+						done = true
+					}
 				}
 				if done {
 					o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
@@ -1308,6 +1311,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			if err != nil {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 			} else if closed {
+				if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
+					continue
+				}
 				log.Printf("[orch] issue #%d closed, transitioning %s from %s to done", sess.IssueNumber, slotName, sess.Status)
 				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 				o.stopWorker(slotName, sess)
@@ -1324,6 +1330,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			if err != nil {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
 			} else if closed {
+				if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
+					continue
+				}
 				log.Printf("[orch] issue #%d closed, stopping worker %s", sess.IssueNumber, slotName)
 				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 				o.stopWorker(slotName, sess)
@@ -1657,6 +1666,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue
 			}
 			log.Printf("[orch] no open PR found for branch %s (slot %s) — assuming merged/closed", sess.Branch, slotName)
+			if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("PR for branch %s is no longer open", sess.Branch)) {
+				if sess.PRNumber > 0 {
+					o.markCodeLanded(sess, sess.PRNumber)
+				}
+				continue
+			}
 			sess.Status = state.StatusDone
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
@@ -1970,6 +1985,36 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 	sess.Status = state.StatusCodeLanded
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+}
+
+func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session, trigger string) bool {
+	if o == nil || o.cfg == nil || !o.cfg.Outcome.PassRequiredForDoneEnabled() {
+		return true
+	}
+	status := outcome.StatusFor(o.cfg.Outcome, s.DonePRCount(), s.LastMergeAt, outcomeHealthChecks(s)...)
+	if status.HealthState == outcome.HealthHealthy {
+		return true
+	}
+	issue := 0
+	if sess != nil {
+		issue = sess.IssueNumber
+	}
+	trigger = strings.TrimSpace(trigger)
+	if trigger == "" {
+		trigger = fmt.Sprintf("issue #%d reached a done-like state", issue)
+	}
+	log.Printf("[orch] %s, but outcome health is %s; keeping session out of done until live verification passes", trigger, status.HealthState)
+	if sess != nil && sess.Status == state.StatusCodeLanded {
+		o.syncProject(sess.IssueNumber, codeLandedProjectStatus(o.cfg.Outcome.RequiresDeploy))
+	}
+	return false
+}
+
+func outcomeHealthChecks(s *state.State) []outcome.HealthCheckResult {
+	if s == nil || s.OutcomeHealth == nil {
+		return nil
+	}
+	return []outcome.HealthCheckResult{*s.OutcomeHealth}
 }
 
 func (o *Orchestrator) mergeReadyPR(slotName string, sess *state.Session, pr github.PR) bool {

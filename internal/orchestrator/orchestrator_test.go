@@ -11,6 +11,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
@@ -24,6 +25,10 @@ func makeIssue(number int, title string, labels ...string) github.Issue {
 		}{Name: l})
 	}
 	return issue
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func TestHashOutput_UsesLast50LinesOnly(t *testing.T) {
@@ -724,6 +729,36 @@ func makeTestState(prs []github.PR) *state.State {
 		}
 	}
 	return s
+}
+
+func TestAutoMergePRs_MissingOpenPRDoesNotBecomeDoneWhenOutcomePassRequiredFails(t *testing.T) {
+	cfg := &config.Config{
+		Repo:          "owner/repo",
+		MergeStrategy: "parallel",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o, merged := newMergeTestOrchestrator(cfg, nil)
+	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
+	s.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		State:     outcome.HealthFailing,
+		Signal:    "verifier_command",
+		Summary:   "live verifier failed",
+	}
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 0 {
+		t.Fatalf("merged = %v, want no merge when PR is already missing", *merged)
+	}
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q until live verification passes", sess.Status, state.StatusCodeLanded)
+	}
 }
 
 func TestAutoMergePRs_ParallelMergesAllReady(t *testing.T) {
@@ -3309,6 +3344,54 @@ func TestCheckSessions_FailedClosedIssue_TransitionsToDone(t *testing.T) {
 	sess := s.Sessions["pan-10"]
 	if sess.Status != state.StatusDone {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+}
+
+func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:              "owner/repo",
+			MaxRuntimeMinutes: 120,
+			Outcome: outcome.Brief{
+				DesiredOutcome:      "Live app works",
+				VerifierCommand:     "check-live",
+				PassRequiredForDone: boolPtr(true),
+			},
+		},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			t.Fatalf("workerStopFn should not run before outcome verification passes")
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now,
+		State:     outcome.HealthFailing,
+		Signal:    "verifier_command",
+		Summary:   "live verifier failed",
+	}
+	s.Sessions["pan-10"] = &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "failed worker",
+		Status:      state.StatusFailed,
+		Branch:      "feat/pan-10-100-failed",
+		FinishedAt:  &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-10"]
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q until live verification passes", sess.Status, state.StatusFailed)
 	}
 }
 
