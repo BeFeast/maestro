@@ -5485,6 +5485,101 @@ func TestReconcileSessionsToProjectBoard_SkipsAlreadySyncedStatus(t *testing.T) 
 	}
 }
 
+func TestRunOncePersistsProjectStatusSyncAfterReconcile(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		StateDir:          t.TempDir(),
+		MaxParallel:       1,
+		MaxRuntimeMinutes: 60,
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 3,
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "Persist project sync",
+		Status:      state.StatusRunning,
+		PID:         1234,
+		Branch:      "codex/persist-project-sync",
+		TmuxSession: "maestro-slot-1",
+		StartedAt:   time.Now().UTC(),
+	}
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	syncCalls := 0
+	o := &Orchestrator{
+		cfg:      cfg,
+		gh:       github.New(cfg.Repo),
+		notifier: &notify.Notifier{},
+		router:   router.New(cfg),
+		repo:     cfg.Repo,
+		projectField: &github.ProjectField{
+			ProjectID: "PVT_test",
+			FieldID:   "FIELD_test",
+			Options:   map[string]string{"In Progress": "opt-progress"},
+		},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return nil, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		pidAliveFn: func(pid int) bool {
+			return true
+		},
+		tmuxSessionExistsFn: func(name string) bool {
+			return true
+		},
+		captureTmuxFn: func(session string) (string, error) {
+			return "", nil
+		},
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+			}, nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			if issueNumber != 42 {
+				t.Fatalf("sync issue = %d, want 42", issueNumber)
+			}
+			if status != github.ProjectStatusInProgress {
+				t.Fatalf("sync status = %q, want %q", status, github.ProjectStatusInProgress)
+			}
+			syncCalls++
+			return true
+		},
+		listNonDoneProjectItemsFn: func(pf *github.ProjectField) ([]github.ProjectItem, error) {
+			return nil, nil
+		},
+	}
+
+	if err := o.RunOnce(); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("sync calls = %d, want 1", syncCalls)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if !loaded.ProjectStatusSynced(42, string(github.ProjectStatusInProgress)) {
+		t.Fatal("RunOnce did not persist reconciled project status sync")
+	}
+
+	if err := o.RunOnce(); err != nil {
+		t.Fatalf("RunOnce second pass: %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("sync calls = %d, want 1 after cached second pass", syncCalls)
+	}
+}
+
 func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
 	deployed := time.Now().UTC()
