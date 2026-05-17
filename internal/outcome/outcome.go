@@ -18,12 +18,18 @@ const (
 type Brief struct {
 	DesiredOutcome          string   `yaml:"desired_outcome" json:"desired_outcome,omitempty"`
 	RuntimeTarget           string   `yaml:"runtime_target" json:"runtime_target,omitempty"`
+	RuntimeURL              string   `yaml:"runtime_url" json:"runtime_url,omitempty"`
 	DeploymentStatusCommand string   `yaml:"deployment_status_command" json:"deployment_status_command,omitempty"`
 	DeployStatusCommand     string   `yaml:"deploy_status_command" json:"-"`
 	HealthcheckCommand      string   `yaml:"healthcheck_command" json:"healthcheck_command,omitempty"`
+	VerifierCommand         string   `yaml:"verifier_command" json:"verifier_command,omitempty"`
 	HealthcheckURL          string   `yaml:"healthcheck_url" json:"healthcheck_url,omitempty"`
 	SourceRepoPath          string   `yaml:"source_repo_path" json:"source_repo_path,omitempty"`
 	RuntimeHost             string   `yaml:"runtime_host" json:"runtime_host,omitempty"`
+	RequiredRoutes          []string `yaml:"required_routes" json:"required_routes,omitempty"`
+	RequiresDeploy          bool     `yaml:"requires_deploy" json:"requires_deploy,omitempty"`
+	PassRequiredForDone     *bool    `yaml:"pass_required_for_done" json:"-"`
+	FailRequiresVisibleWork *bool    `yaml:"fail_requires_visible_work" json:"-"`
 	NonGoals                []string `yaml:"non_goals" json:"non_goals,omitempty"`
 }
 
@@ -33,6 +39,7 @@ type Status struct {
 	Goal                    string   `json:"goal,omitempty"`
 	DesiredOutcome          string   `json:"desired_outcome,omitempty"`
 	RuntimeTarget           string   `json:"runtime_target,omitempty"`
+	RuntimeURL              string   `json:"runtime_url,omitempty"`
 	RuntimeHost             string   `json:"runtime_host,omitempty"`
 	HealthState             string   `json:"health_state"`
 	HealthCheckedAt         string   `json:"health_checked_at,omitempty"`
@@ -44,8 +51,13 @@ type Status struct {
 	DeploymentStatusCommand string   `json:"deployment_status_command,omitempty"`
 	DeployStatusCommand     string   `json:"deploy_status_command,omitempty"`
 	HealthcheckCommand      string   `json:"healthcheck_command,omitempty"`
+	VerifierCommand         string   `json:"verifier_command,omitempty"`
 	HealthcheckURL          string   `json:"healthcheck_url,omitempty"`
+	RequiredRoutes          []string `json:"required_routes,omitempty"`
+	RequiresDeploy          bool     `json:"requires_deploy,omitempty"`
 	NonGoals                []string `json:"non_goals,omitempty"`
+	PassRequiredForDone     bool     `json:"pass_required_for_done,omitempty"`
+	FailRequiresVisibleWork bool     `json:"fail_requires_visible_work,omitempty"`
 	MergedPRs               int      `json:"merged_prs,omitempty"`
 	LastMergeAt             string   `json:"last_merge_at,omitempty"`
 }
@@ -65,15 +77,30 @@ type HealthCheckResult struct {
 func (b Brief) Normalized() Brief {
 	b.DesiredOutcome = strings.TrimSpace(b.DesiredOutcome)
 	b.RuntimeTarget = strings.TrimSpace(b.RuntimeTarget)
+	b.RuntimeURL = strings.TrimSpace(b.RuntimeURL)
+	if b.RuntimeTarget == "" {
+		b.RuntimeTarget = b.RuntimeURL
+	}
+	if b.RuntimeURL == "" {
+		b.RuntimeURL = b.RuntimeTarget
+	}
 	b.DeploymentStatusCommand = strings.TrimSpace(b.DeploymentStatusCommand)
 	b.DeployStatusCommand = strings.TrimSpace(b.DeployStatusCommand)
 	if b.DeploymentStatusCommand == "" {
 		b.DeploymentStatusCommand = b.DeployStatusCommand
 	}
 	b.HealthcheckCommand = strings.TrimSpace(b.HealthcheckCommand)
+	b.VerifierCommand = strings.TrimSpace(b.VerifierCommand)
+	if b.HealthcheckCommand == "" {
+		b.HealthcheckCommand = b.VerifierCommand
+	}
+	if b.VerifierCommand == "" {
+		b.VerifierCommand = b.HealthcheckCommand
+	}
 	b.HealthcheckURL = strings.TrimSpace(b.HealthcheckURL)
 	b.SourceRepoPath = strings.TrimSpace(b.SourceRepoPath)
 	b.RuntimeHost = strings.TrimSpace(b.RuntimeHost)
+	b.RequiredRoutes = compactStrings(b.RequiredRoutes)
 	b.NonGoals = compactStrings(b.NonGoals)
 	return b
 }
@@ -90,6 +117,22 @@ func (b Brief) Goal() string {
 func (b Brief) HasHealthSignal() bool {
 	b = b.Normalized()
 	return b.DeploymentStatusCommand != "" || b.HealthcheckCommand != "" || b.HealthcheckURL != ""
+}
+
+func (b Brief) PassRequiredForDoneEnabled() bool {
+	b = b.Normalized()
+	if b.PassRequiredForDone != nil {
+		return *b.PassRequiredForDone
+	}
+	return b.Configured()
+}
+
+func (b Brief) FailRequiresVisibleWorkEnabled() bool {
+	b = b.Normalized()
+	if b.FailRequiresVisibleWork != nil {
+		return *b.FailRequiresVisibleWork
+	}
+	return b.Configured()
 }
 
 // StatusFor returns the current known outcome status. Callers may pass the
@@ -109,13 +152,19 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...Heal
 		Goal:                    brief.Goal(),
 		DesiredOutcome:          brief.Goal(),
 		RuntimeTarget:           brief.RuntimeTarget,
+		RuntimeURL:              brief.RuntimeURL,
 		RuntimeHost:             brief.RuntimeHost,
 		SourceRepoPath:          brief.SourceRepoPath,
 		DeploymentStatusCommand: brief.DeploymentStatusCommand,
 		DeployStatusCommand:     brief.DeploymentStatusCommand,
 		HealthcheckCommand:      brief.HealthcheckCommand,
+		VerifierCommand:         brief.VerifierCommand,
 		HealthcheckURL:          brief.HealthcheckURL,
+		RequiredRoutes:          append([]string(nil), brief.RequiredRoutes...),
+		RequiresDeploy:          brief.RequiresDeploy,
 		NonGoals:                append([]string(nil), brief.NonGoals...),
+		PassRequiredForDone:     brief.PassRequiredForDoneEnabled(),
+		FailRequiresVisibleWork: brief.FailRequiresVisibleWorkEnabled(),
 		MergedPRs:               mergedPRs,
 	}
 	if !lastMergeAt.IsZero() {

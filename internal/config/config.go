@@ -511,6 +511,7 @@ func parse(data []byte) (*Config, error) {
 			"review_retry_exhausted",
 			"check_outcome_health",
 			"spawn_worker",
+			"spawn_repair_worker",
 			"label_issue_ready",
 			"add_ready_label",
 		}
@@ -519,6 +520,7 @@ func parse(data []byte) (*Config, error) {
 		cfg.Supervisor.ApprovalRequiredActions = []string{
 			"review_retry_exhausted",
 			"spawn_worker",
+			"spawn_repair_worker",
 			"label_issue_ready",
 			"add_ready_label",
 		}

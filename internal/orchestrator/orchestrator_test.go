@@ -5106,28 +5106,30 @@ func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
 
 	tests := []struct {
-		name   string
-		sess   *state.Session
-		want   github.ProjectStatus
-		wantOK bool
+		name           string
+		sess           *state.Session
+		requiresDeploy bool
+		want           github.ProjectStatus
+		wantOK         bool
 	}{
-		{"nil session is no-op", nil, "", false},
-		{"running -> in_progress", &state.Session{IssueNumber: 1, Status: state.StatusRunning}, github.ProjectStatusInProgress, true},
-		{"queued -> in_review", &state.Session{IssueNumber: 2, Status: state.StatusQueued}, github.ProjectStatusInReview, true},
-		{"pr_open -> in_review", &state.Session{IssueNumber: 3, Status: state.StatusPROpen, PRNumber: 9}, github.ProjectStatusInReview, true},
-		{"code_landed keeps in_progress (issue stays open)", &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, github.ProjectStatusInProgress, true},
-		{"done -> done", &state.Session{IssueNumber: 5, Status: state.StatusDone}, github.ProjectStatusDone, true},
-		{"retry_exhausted -> blocked", &state.Session{IssueNumber: 6, Status: state.StatusRetryExhausted}, github.ProjectStatusBlocked, true},
-		{"conflict_failed -> blocked", &state.Session{IssueNumber: 7, Status: state.StatusConflictFailed}, github.ProjectStatusBlocked, true},
-		{"failed -> blocked", &state.Session{IssueNumber: 8, Status: state.StatusFailed}, github.ProjectStatusBlocked, true},
-		{"dead awaiting retry stays in_progress", &state.Session{IssueNumber: 9, Status: state.StatusDead, NextRetryAt: &soon}, github.ProjectStatusInProgress, true},
-		{"dead without retry -> blocked", &state.Session{IssueNumber: 10, Status: state.StatusDead}, github.ProjectStatusBlocked, true},
-		{"unknown status returns no mapping", &state.Session{IssueNumber: 11, Status: state.SessionStatus("weird")}, "", false},
+		{name: "nil session is no-op", want: "", wantOK: false},
+		{name: "running -> in_progress", sess: &state.Session{IssueNumber: 1, Status: state.StatusRunning}, want: github.ProjectStatusInProgress, wantOK: true},
+		{name: "queued -> in_review", sess: &state.Session{IssueNumber: 2, Status: state.StatusQueued}, want: github.ProjectStatusInReview, wantOK: true},
+		{name: "pr_open -> in_review", sess: &state.Session{IssueNumber: 3, Status: state.StatusPROpen, PRNumber: 9}, want: github.ProjectStatusInReview, wantOK: true},
+		{name: "code_landed -> live_verification without deploy", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, want: github.ProjectStatusLiveVerify, wantOK: true},
+		{name: "code_landed -> deploying when deploy required", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, requiresDeploy: true, want: github.ProjectStatusDeploying, wantOK: true},
+		{name: "done -> done", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone}, want: github.ProjectStatusDone, wantOK: true},
+		{name: "retry_exhausted -> blocked", sess: &state.Session{IssueNumber: 6, Status: state.StatusRetryExhausted}, want: github.ProjectStatusBlocked, wantOK: true},
+		{name: "conflict_failed -> blocked", sess: &state.Session{IssueNumber: 7, Status: state.StatusConflictFailed}, want: github.ProjectStatusBlocked, wantOK: true},
+		{name: "failed -> blocked", sess: &state.Session{IssueNumber: 8, Status: state.StatusFailed}, want: github.ProjectStatusBlocked, wantOK: true},
+		{name: "dead awaiting retry stays in_progress", sess: &state.Session{IssueNumber: 9, Status: state.StatusDead, NextRetryAt: &soon}, want: github.ProjectStatusInProgress, wantOK: true},
+		{name: "dead without retry -> blocked", sess: &state.Session{IssueNumber: 10, Status: state.StatusDead}, want: github.ProjectStatusBlocked, wantOK: true},
+		{name: "unknown status returns no mapping", sess: &state.Session{IssueNumber: 11, Status: state.SessionStatus("weird")}, want: "", wantOK: false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := projectStatusForSession(tc.sess)
+			got, ok := projectStatusForSession(tc.sess, tc.requiresDeploy)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}

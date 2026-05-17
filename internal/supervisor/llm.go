@@ -339,6 +339,7 @@ func defaultAllowedActions() []string {
 		ActionReviewRetryExhausted,
 		ActionCheckOutcomeHealth,
 		ActionSpawnWorker,
+		ActionSpawnRepairWorker,
 		ActionLabelIssueReady,
 	}
 }
@@ -347,6 +348,7 @@ func defaultApprovalRequiredActions() []string {
 	return []string{
 		ActionReviewRetryExhausted,
 		ActionSpawnWorker,
+		ActionSpawnRepairWorker,
 		ActionLabelIssueReady,
 	}
 }
@@ -369,6 +371,8 @@ func canonicalAction(action string) string {
 		return ActionCheckOutcomeHealth
 	case ActionSpawnWorker:
 		return ActionSpawnWorker
+	case ActionSpawnRepairWorker:
+		return ActionSpawnRepairWorker
 	case ActionLabelIssueReady, "add_ready_label":
 		return ActionLabelIssueReady
 	default:

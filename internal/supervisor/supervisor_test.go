@@ -213,7 +213,7 @@ func TestDecide_IdleNoEligibleIssueRecommendsLabel(t *testing.T) {
 
 func TestDecide_RunningWorkerWaits(t *testing.T) {
 	cfg := testConfig(t)
-	reader := &fakeReader{}
+	reader := &fakeReader{prs: []github.PR{{Number: 55, HeadRefName: "untracked-open-pr", State: "OPEN"}}}
 	st := state.NewState()
 	st.Sessions["slot-1"] = &state.Session{
 		IssueNumber: 42,
@@ -241,7 +241,7 @@ func TestDecide_RunningWorkerWaits(t *testing.T) {
 
 func TestDecide_RetryExhaustedNeedsReview(t *testing.T) {
 	cfg := testConfig(t)
-	reader := &fakeReader{}
+	reader := &fakeReader{prs: []github.PR{{Number: 55, HeadRefName: "untracked-open-pr", State: "OPEN"}}}
 	st := state.NewState()
 	st.Sessions["slot-2"] = &state.Session{
 		IssueNumber: 77,
@@ -505,6 +505,47 @@ func TestDecide_FailingChecksExplained(t *testing.T) {
 	}
 }
 
+func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		prs: []github.PR{{
+			Number:      31,
+			HeadRefName: "feat/checks",
+			State:       "OPEN",
+			Mergeable:   "MERGEABLE",
+			IsDraft:     true,
+		}},
+		ciStatuses: map[int]string{31: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 94,
+		IssueTitle:  "failing checks",
+		Status:      state.StatusDead,
+		PRNumber:    31,
+		Branch:      "feat/checks",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnRepairWorker)
+	}
+	if decision.Risk != RiskMutating {
+		t.Fatalf("risk = %q, want %q", decision.Risk, RiskMutating)
+	}
+	if decision.Target == nil || decision.Target.Issue != 94 || decision.Target.PR != 31 || decision.Target.Session != "slot-1" {
+		t.Fatalf("target = %#v, want issue 94 PR 31 slot-1", decision.Target)
+	}
+	if !strings.Contains(strings.ToLower(decision.Summary), "repair worker") {
+		t.Fatalf("summary = %q, want repair worker", decision.Summary)
+	}
+}
+
 func TestDecide_PRExistsForSessionMonitorsPR(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{prs: []github.PR{{Number: 12, HeadRefName: "mae-1-42-fix", State: "OPEN"}}}
@@ -612,6 +653,47 @@ func TestDecide_NoOutcomeProgressRecommendsRuntimeCheck(t *testing.T) {
 	}
 	if reader.issueCalls != 0 {
 		t.Fatalf("ListOpenIssues called %d time(s), want runtime check before more issue throughput", reader.issueCalls)
+	}
+}
+
+func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		RuntimeTarget:  "https://app.example.com",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	reader := &fakeReader{prs: []github.PR{{Number: 55, HeadRefName: "untracked-open-pr", State: "OPEN"}}}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now.Add(-time.Minute),
+		Signal:    "healthcheck_url",
+		State:     outcome.HealthFailing,
+		Summary:   "GET returned 500",
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionCheckOutcomeHealth {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionCheckOutcomeHealth)
+	}
+	stuck := requireStuckState(t, decision, state.StuckNoOutcomeProgress)
+	if stuck.Severity != SeverityBlocked {
+		t.Fatalf("severity = %q, want %q", stuck.Severity, SeverityBlocked)
+	}
+	if !strings.Contains(stuck.Summary, "failing") {
+		t.Fatalf("stuck summary = %q, want failing outcome", stuck.Summary)
+	}
+	if reader.issueCalls != 0 {
+		t.Fatalf("ListOpenIssues called %d time(s), want failing outcome gate before issue throughput", reader.issueCalls)
+	}
+	reasons := strings.Join(decision.Reasons, "\n")
+	if !strings.Contains(reasons, "Open PRs observed: 1") {
+		t.Fatalf("reasons = %q, want open PRs to be treated as insufficient proof", reasons)
 	}
 }
 

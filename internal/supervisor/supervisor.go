@@ -30,6 +30,7 @@ const (
 	ActionReviewRetryExhausted = "review_retry_exhausted"
 	ActionCheckOutcomeHealth   = "check_outcome_health"
 	ActionSpawnWorker          = "spawn_worker"
+	ActionSpawnRepairWorker    = "spawn_repair_worker"
 	ActionLabelIssueReady      = "label_issue_ready"
 
 	RiskSafe          = "safe"
@@ -140,7 +141,7 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		return state.SupervisorDecision{}, err
 	}
 	if !cfg.Supervisor.DryRun {
-		if decisionRequiresApproval(decision) {
+		if decisionRequiresApproval(cfg, decision) {
 			approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
 			decision.ApprovalID = approval.ID
 		}
@@ -210,6 +211,18 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false)
 
 	if slot, sess, pr, ok := sessionWithOpenPR(st, prs); ok {
+		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
+				"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
+				"Starting a repair worker would mutate local worktrees, so supervisor records an explicit repair recommendation",
+			)
+			decision := e.decision(st, now, projectState, ActionSpawnRepairWorker,
+				fmt.Sprintf("Start a repair worker for issue #%d; PR #%d is not enough to prove the live outcome.", sess.IssueNumber, pr.Number),
+				RiskMutating, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
+		}
 		summary := fmt.Sprintf("Session %s already has open PR #%d; monitor review, CI, or merge readiness.", slot, pr.Number)
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
@@ -253,9 +266,10 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return decision, nil
 	}
 
-	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 && len(prs) == 0 {
+	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 {
 		reasons := appendReasons(baseReasons,
 			stuck.Summary,
+			fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
 			"Supervisor remains read-only; it recommends outcome verification but does not run deploy or runtime commands",
 		)
 		decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
@@ -616,27 +630,43 @@ func (e *Engine) detectOutcomeStuckStates(st *state.State) []state.SupervisorStu
 			"Add an outcome brief with the desired runtime goal, target, health signal, and non-goals before treating issue throughput as success.", false, nil,
 			"Outcome brief configured: false")}
 	}
-	if st == nil || st.DonePRCount() < 2 {
-		return nil
-	}
 	switch status.HealthState {
-	case outcome.HealthUnknown, outcome.HealthUnmonitored, outcome.HealthFailing:
-		goal := strings.TrimSpace(status.Goal)
-		if goal == "" {
-			goal = "the configured outcome"
+	case outcome.HealthFailing:
+		if !status.FailRequiresVisibleWork {
+			return nil
 		}
-		health := status.HealthState
-		if health == "" {
-			health = outcome.HealthUnknown
+		return []state.SupervisorStuckState{e.outcomeProgressStuckState(st, status, false)}
+	case outcome.HealthUnknown, outcome.HealthUnmonitored:
+		if st == nil || st.DonePRCount() < 2 {
+			return nil
 		}
-		return []state.SupervisorStuckState{stuckState(state.StuckNoOutcomeProgress, SeverityBlocked,
-			fmt.Sprintf("Workers have merged PRs, but runtime outcome health is still %s for %s.", health, goal),
-			"Run the configured deployment status or healthcheck, then prioritize deploy/runtime fixes before dispatching more issue work.", false, nil,
-			fmt.Sprintf("done_pr_sessions=%d", st.DonePRCount()),
-			fmt.Sprintf("health_state=%s", health))}
+		return []state.SupervisorStuckState{e.outcomeProgressStuckState(st, status, false)}
 	default:
 		return nil
 	}
+}
+
+func (e *Engine) outcomeProgressStuckState(st *state.State, status outcome.Status, canAct bool) state.SupervisorStuckState {
+	goal := strings.TrimSpace(status.Goal)
+	if goal == "" {
+		goal = "the configured outcome"
+	}
+	health := status.HealthState
+	if health == "" {
+		health = outcome.HealthUnknown
+	}
+	donePRs := 0
+	if st != nil {
+		donePRs = st.DonePRCount()
+	}
+	summary := fmt.Sprintf("Runtime outcome health is %s for %s.", health, goal)
+	if health != outcome.HealthFailing {
+		summary = fmt.Sprintf("Workers have merged PRs, but runtime outcome health is still %s for %s.", health, goal)
+	}
+	return stuckState(state.StuckNoOutcomeProgress, SeverityBlocked, summary,
+		"Run the configured deployment status or healthcheck, then prioritize deploy/runtime fixes before dispatching more issue work.", canAct, nil,
+		fmt.Sprintf("done_pr_sessions=%d", donePRs),
+		fmt.Sprintf("health_state=%s", health))
 }
 
 func noOutcomeProgressStuckState(stuckStates []state.SupervisorStuckState) *state.SupervisorStuckState {
@@ -1006,8 +1036,19 @@ func (e *Engine) detectMissingCLI() *state.SupervisorStuckState {
 	return nil
 }
 
-func decisionRequiresApproval(decision state.SupervisorDecision) bool {
-	return decision.RecommendedAction != ActionNone && decision.Risk != RiskSafe
+func decisionRequiresApproval(cfg *config.Config, decision state.SupervisorDecision) bool {
+	if decision.RecommendedAction == ActionNone || decision.Risk == RiskSafe {
+		return false
+	}
+	if cfg == nil || cfg.Supervisor.ApprovalRequiredActions == nil {
+		return true
+	}
+	for _, action := range cfg.Supervisor.ApprovalRequiredActions {
+		if canonicalAction(action) == decision.RecommendedAction {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {
@@ -1509,6 +1550,55 @@ func runningSession(st *state.State) (string, *state.Session, bool) {
 		}
 	}
 	return "", nil, false
+}
+
+func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.SupervisorStuckState, slot string, sess *state.Session, pr github.PR) bool {
+	if sess == nil {
+		return false
+	}
+	if e.hasLiveRunningSessionForIssue(st, sess.IssueNumber) {
+		return false
+	}
+	if availableSlots(e.cfg, st) <= 0 {
+		return false
+	}
+	if pr.IsDraft {
+		return true
+	}
+	for _, stuck := range stuckStates {
+		if stuck.Target != nil {
+			if stuck.Target.Session != "" && stuck.Target.Session != slot {
+				continue
+			}
+			if stuck.Target.PR != 0 && stuck.Target.PR != pr.Number {
+				continue
+			}
+		}
+		switch stuck.Code {
+		case "failing_checks", "greptile_not_approved", "stale_review_feedback":
+			return true
+		case "retry_exhausted_open_pr":
+			return stuck.Severity == SeverityBlocked
+		case state.StuckNoOutcomeProgress:
+			return e.outcomeStatus(st).HealthState == outcome.HealthFailing
+		}
+	}
+	return false
+}
+
+func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int) bool {
+	if st == nil || issueNumber <= 0 {
+		return false
+	}
+	for _, sess := range st.Sessions {
+		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusRunning {
+			continue
+		}
+		if sess.PID == 0 || e.pidAlive(sess.PID) {
+			return true
+		}
+	}
+	return false
 }
 
 func retryExhaustedSession(st *state.State) (string, *state.Session, bool) {
