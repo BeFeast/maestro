@@ -5702,6 +5702,29 @@ func TestReconcileProjectBoard_ThrottlesNonDoneItemSweep(t *testing.T) {
 	}
 }
 
+func TestDeferProjectBoardSweepDelaysOnlyBroadSweep(t *testing.T) {
+	o := &Orchestrator{}
+	now := time.Now().UTC()
+
+	if !o.projectBoardSweepDue(now) {
+		t.Fatal("zero-value orchestrator should allow initial sweep")
+	}
+
+	o.deferProjectBoardSweep(now)
+	if o.projectBoardSweepDue(now.Add(projectBoardSweepInterval - time.Second)) {
+		t.Fatal("deferred startup sweep should wait for throttle interval")
+	}
+	if !o.projectBoardSweepDue(now.Add(projectBoardSweepInterval + time.Second)) {
+		t.Fatal("deferred startup sweep should become due after throttle interval")
+	}
+
+	first := o.projectItemsSweepAt
+	o.deferProjectBoardSweep(now.Add(time.Hour))
+	if !o.projectItemsSweepAt.Equal(first) {
+		t.Fatal("deferProjectBoardSweep should not overwrite an existing sweep timestamp")
+	}
+}
+
 func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
 	deployed := time.Now().UTC()

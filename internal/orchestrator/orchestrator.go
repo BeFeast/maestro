@@ -1063,6 +1063,13 @@ func (o *Orchestrator) SetConfigReloadCh(ch <-chan *config.Config) {
 // The context can be used to stop the loop (e.g. for multi-project shutdown).
 // An optional refreshCh triggers an immediate poll cycle when a value is received.
 func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once bool, refreshCh <-chan struct{}) error {
+	if !once {
+		// Full ProjectV2 item sweeps are expensive and only repair board drift.
+		// Do not run one immediately after every daemon restart; session-state
+		// mirroring still runs, and the broad sweep can wait for the normal
+		// throttle window.
+		o.deferProjectBoardSweep(time.Now().UTC())
+	}
 	if err := o.RunOnce(); err != nil {
 		log.Printf("[orch] run error: %v", err)
 	}
@@ -1089,6 +1096,13 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 			o.reloadConfig(newCfg, &ticker)
 		}
 	}
+}
+
+func (o *Orchestrator) deferProjectBoardSweep(now time.Time) {
+	if o == nil || !o.projectItemsSweepAt.IsZero() {
+		return
+	}
+	o.projectItemsSweepAt = now.UTC()
 }
 
 // reloadConfig applies non-destructive config changes at runtime.
