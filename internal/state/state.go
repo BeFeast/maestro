@@ -564,6 +564,7 @@ type State struct {
 	SupervisorDecisions []SupervisorDecision       `json:"supervisor_decisions,omitempty"`
 	Approvals           []Approval                 `json:"approvals,omitempty"`
 	OutcomeHealth       *outcome.HealthCheckResult `json:"outcome_health,omitempty"`
+	ProjectStatusSync   map[int]ProjectStatusSync  `json:"project_status_sync,omitempty"`
 	NextSlot            int                        `json:"next_slot"`
 	LastMergeAt         time.Time                  `json:"last_merge_at,omitempty"`
 
@@ -571,11 +572,38 @@ type State struct {
 	loadedState *State
 }
 
+type ProjectStatusSync struct {
+	Status   string    `json:"status"`
+	SyncedAt time.Time `json:"synced_at,omitempty"`
+}
+
 func NewState() *State {
 	return &State{
-		Sessions: make(map[string]*Session),
-		Missions: make(map[int]*Mission),
-		NextSlot: 1,
+		Sessions:          make(map[string]*Session),
+		Missions:          make(map[int]*Mission),
+		ProjectStatusSync: make(map[int]ProjectStatusSync),
+		NextSlot:          1,
+	}
+}
+
+func (s *State) ProjectStatusSynced(issueNumber int, status string) bool {
+	if s == nil || issueNumber <= 0 || strings.TrimSpace(status) == "" {
+		return false
+	}
+	record, ok := s.ProjectStatusSync[issueNumber]
+	return ok && record.Status == status
+}
+
+func (s *State) MarkProjectStatusSynced(issueNumber int, status string, syncedAt time.Time) {
+	if s == nil || issueNumber <= 0 || strings.TrimSpace(status) == "" {
+		return
+	}
+	if s.ProjectStatusSync == nil {
+		s.ProjectStatusSync = make(map[int]ProjectStatusSync)
+	}
+	s.ProjectStatusSync[issueNumber] = ProjectStatusSync{
+		Status:   status,
+		SyncedAt: syncedAt.UTC(),
 	}
 }
 
@@ -713,6 +741,9 @@ func (s *State) normalize() {
 	if s.Missions == nil {
 		s.Missions = make(map[int]*Mission)
 	}
+	if s.ProjectStatusSync == nil {
+		s.ProjectStatusSync = make(map[int]ProjectStatusSync)
+	}
 	if s.NextSlot == 0 {
 		s.NextSlot = 1
 	}
@@ -724,6 +755,7 @@ func (s *State) copyFrom(src *State) {
 	s.SupervisorDecisions = src.SupervisorDecisions
 	s.Approvals = src.Approvals
 	s.OutcomeHealth = src.OutcomeHealth
+	s.ProjectStatusSync = src.ProjectStatusSync
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
 }
@@ -763,9 +795,46 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 		return nil, err
 	}
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
+	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	return merged, nil
+}
+
+func mergeProjectStatusSync(current, ours map[int]ProjectStatusSync) map[int]ProjectStatusSync {
+	merged := make(map[int]ProjectStatusSync)
+	for _, key := range unionProjectStatusSyncKeys(current, ours) {
+		currentValue, currentOK := current[key]
+		oursValue, oursOK := ours[key]
+		switch {
+		case currentOK && oursOK:
+			if oursValue.SyncedAt.After(currentValue.SyncedAt) {
+				merged[key] = oursValue
+			} else {
+				merged[key] = currentValue
+			}
+		case currentOK:
+			merged[key] = currentValue
+		case oursOK:
+			merged[key] = oursValue
+		}
+	}
+	return merged
+}
+
+func unionProjectStatusSyncKeys(maps ...map[int]ProjectStatusSync) []int {
+	seen := make(map[int]struct{})
+	for _, m := range maps {
+		for k := range m {
+			seen[k] = struct{}{}
+		}
+	}
+	keys := make([]int, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 func mergeSessions(merged, base, current, ours *State) error {

@@ -73,6 +73,24 @@ func TestDonePRCount(t *testing.T) {
 	}
 }
 
+func TestProjectStatusSynced(t *testing.T) {
+	s := NewState()
+	if s.ProjectStatusSynced(42, "in_progress") {
+		t.Fatal("ProjectStatusSynced should be false before mark")
+	}
+	syncedAt := time.Now().UTC()
+	s.MarkProjectStatusSynced(42, "in_progress", syncedAt)
+	if !s.ProjectStatusSynced(42, "in_progress") {
+		t.Fatal("ProjectStatusSynced should be true for recorded status")
+	}
+	if s.ProjectStatusSynced(42, "in_review") {
+		t.Fatal("ProjectStatusSynced should be false for a different status")
+	}
+	if got := s.ProjectStatusSync[42].SyncedAt; !got.Equal(syncedAt) {
+		t.Fatalf("SyncedAt = %s, want %s", got, syncedAt)
+	}
+}
+
 func TestNotifiedCIFail_OmittedWhenFalse(t *testing.T) {
 	dir := t.TempDir()
 

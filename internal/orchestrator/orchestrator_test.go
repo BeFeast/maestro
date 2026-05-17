@@ -5410,6 +5410,46 @@ func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
 	o.syncProject(42, github.ProjectStatusInProgress)
 }
 
+func TestReconcileSessionsToProjectBoard_SkipsAlreadySyncedStatus(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 3,
+		},
+	}
+	calls := 0
+	var lastStatus github.ProjectStatus
+	o := &Orchestrator{
+		cfg: cfg,
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			calls++
+			lastStatus = status
+			return true
+		},
+	}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{IssueNumber: 42, Status: state.StatusRunning}
+	s.MarkProjectStatusSynced(42, string(github.ProjectStatusInProgress), time.Now().UTC())
+
+	o.reconcileSessionsToProjectBoard(s)
+	if calls != 0 {
+		t.Fatalf("sync calls = %d, want 0 for already-synced status", calls)
+	}
+
+	s.Sessions["slot-1"].Status = state.StatusPROpen
+	o.reconcileSessionsToProjectBoard(s)
+	if calls != 1 {
+		t.Fatalf("sync calls = %d, want 1 after status transition", calls)
+	}
+	if lastStatus != github.ProjectStatusInReview {
+		t.Fatalf("last status = %q, want %q", lastStatus, github.ProjectStatusInReview)
+	}
+	if !s.ProjectStatusSynced(42, string(github.ProjectStatusInReview)) {
+		t.Fatal("state did not record synced in_review status")
+	}
+}
+
 func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
 	deployed := time.Now().UTC()
