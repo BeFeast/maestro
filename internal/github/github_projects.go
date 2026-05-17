@@ -42,9 +42,9 @@ func ProjectStatusCandidates(status ProjectStatus) []string {
 	case ProjectStatusBlocked:
 		return []string{"Blocked", "On Hold", "On hold", "Stuck", "Needs Attention", "Needs attention"}
 	case ProjectStatusDeploying:
-		return []string{"Deploying", "Deploy", "Deployment", "In Progress", "In progress"}
+		return []string{"Deploying", "Deploy", "Deployment"}
 	case ProjectStatusLiveVerify:
-		return []string{"Live Verification", "Live verification", "Verification", "Verifying", "QA", "In Progress", "In progress"}
+		return []string{"Live Verification", "Live verification", "Verification", "Verifying", "QA"}
 	case ProjectStatusDone:
 		return []string{"Done", "Completed", "Closed"}
 	default:

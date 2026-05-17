@@ -104,6 +104,8 @@ func TestProjectStatusCandidates(t *testing.T) {
 		{ProjectStatusInProgress, "In Progress"},
 		{ProjectStatusInReview, "In Review"},
 		{ProjectStatusBlocked, "Blocked"},
+		{ProjectStatusDeploying, "Deploying"},
+		{ProjectStatusLiveVerify, "Live Verification"},
 		{ProjectStatusDone, "Done"},
 	}
 	for _, tc := range tests {
@@ -113,6 +115,16 @@ func TestProjectStatusCandidates(t *testing.T) {
 		}
 		if got[0] != tc.wantFirst {
 			t.Errorf("ProjectStatusCandidates(%q) first = %q, want %q", tc.status, got[0], tc.wantFirst)
+		}
+	}
+}
+
+func TestProjectStatusCandidates_LifecycleStatusesDoNotCollapseToInProgress(t *testing.T) {
+	for _, status := range []ProjectStatus{ProjectStatusDeploying, ProjectStatusLiveVerify} {
+		for _, candidate := range ProjectStatusCandidates(status) {
+			if strings.EqualFold(strings.TrimSpace(candidate), "In Progress") {
+				t.Fatalf("ProjectStatusCandidates(%q) includes %q; lifecycle status must not silently collapse to In Progress", status, candidate)
+			}
 		}
 	}
 }
