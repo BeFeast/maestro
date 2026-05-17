@@ -63,6 +63,19 @@ func TestParseRESTPullsMapsFields(t *testing.T) {
 	}
 }
 
+func TestRESTIssueStateClosedAcceptsRESTLowercase(t *testing.T) {
+	for _, state := range []string{"closed", "CLOSED", " Closed "} {
+		if !restIssueStateClosed(state) {
+			t.Fatalf("restIssueStateClosed(%q) = false, want true", state)
+		}
+	}
+	for _, state := range []string{"open", "", "merged"} {
+		if restIssueStateClosed(state) {
+			t.Fatalf("restIssueStateClosed(%q) = true, want false", state)
+		}
+	}
+}
+
 func TestParseRateLimitStatus(t *testing.T) {
 	body := `{
 		"resources": {

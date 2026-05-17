@@ -232,7 +232,7 @@ func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error
 		}
 		items = append(items, ProjectItem{
 			IssueNumber: node.Content.Number,
-			IssueClosed: node.Content.State == "CLOSED",
+			IssueClosed: strings.EqualFold(strings.TrimSpace(node.Content.State), "closed"),
 			HasStatus:   node.FieldValueByName != nil && node.FieldValueByName.OptionID != "",
 		})
 	}
