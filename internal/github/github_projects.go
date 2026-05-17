@@ -252,37 +252,42 @@ func (c *Client) SyncIssueStatus(pf *ProjectField, issueNumber int, statusName s
 // that use a different label ("Review", "Code Review"). When no candidate
 // matches, the call is a no-op so the worker runtime keeps making progress.
 func (c *Client) SyncIssueStatusOneOf(pf *ProjectField, issueNumber int, candidates ...string) {
+	_ = c.TrySyncIssueStatusOneOf(pf, issueNumber, candidates...)
+}
+
+func (c *Client) TrySyncIssueStatusOneOf(pf *ProjectField, issueNumber int, candidates ...string) bool {
 	if pf == nil {
-		return
+		return false
 	}
 
 	statusName, optionID, ok := resolveProjectStatusOption(pf, candidates)
 	if !ok {
 		log.Printf("[projects] none of statuses %v found in project (have: %v), skipping issue #%d", candidates, keys(pf.Options), issueNumber)
-		return
+		return false
 	}
 
 	// Step 1: Get issue node ID
 	nodeID, err := c.getIssueNodeID(issueNumber)
 	if err != nil {
 		log.Printf("[projects] could not get node ID for issue #%d: %v", issueNumber, err)
-		return
+		return false
 	}
 
 	// Step 2: Add issue to project (idempotent)
 	itemID, err := c.addToProject(pf.ProjectID, nodeID)
 	if err != nil {
 		log.Printf("[projects] could not add issue #%d to project: %v", issueNumber, err)
-		return
+		return false
 	}
 
 	// Step 3: Set status field
 	if err := c.setProjectItemStatus(pf.ProjectID, itemID, pf.FieldID, optionID); err != nil {
 		log.Printf("[projects] could not set status for issue #%d: %v", issueNumber, err)
-		return
+		return false
 	}
 
 	log.Printf("[projects] synced issue #%d status=%q", issueNumber, statusName)
+	return true
 }
 
 // getIssueNodeID retrieves the GraphQL node ID for an issue.

@@ -215,6 +215,13 @@ func TestSyncIssueStatusOneOf_NilProjectField(t *testing.T) {
 	c.SyncIssueStatusOneOf(nil, 1, "In Review", "Review", "In Progress")
 }
 
+func TestTrySyncIssueStatusOneOf_NilProjectField(t *testing.T) {
+	c := New("owner/repo")
+	if c.TrySyncIssueStatusOneOf(nil, 1, "In Review") {
+		t.Fatal("TrySyncIssueStatusOneOf should report false for nil project field")
+	}
+}
+
 func TestNormalizeProjectStatusKey(t *testing.T) {
 	tests := []struct {
 		in, want string

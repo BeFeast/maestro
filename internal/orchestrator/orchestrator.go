@@ -87,6 +87,7 @@ type Orchestrator struct {
 	workerStopFn                func(cfg *config.Config, slotName string, sess *state.Session) error
 	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 	outcomeCheckFn              func(context.Context, outcome.Brief) outcome.HealthCheckResult
+	syncProjectFn               func(issueNumber int, status github.ProjectStatus) bool
 }
 
 // New creates a new Orchestrator
@@ -378,16 +379,19 @@ func (o *Orchestrator) ensureProjectField() {
 
 // syncProject syncs an issue's status to the configured GitHub Project board.
 // No-op if github_projects is not enabled.
-func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus) {
+func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus) bool {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
-		return
+		return false
+	}
+	if o.syncProjectFn != nil {
+		return o.syncProjectFn(issueNumber, status)
 	}
 	o.ensureProjectField()
 	candidates := github.ProjectStatusCandidates(status)
 	if len(candidates) == 0 {
 		candidates = []string{string(status)}
 	}
-	o.gh.SyncIssueStatusOneOf(o.projectField, issueNumber, candidates...)
+	return o.gh.TrySyncIssueStatusOneOf(o.projectField, issueNumber, candidates...)
 }
 
 // projectStatusForSession returns the ProjectStatus that should mirror this
@@ -505,7 +509,12 @@ func (o *Orchestrator) reconcileSessionsToProjectBoard(s *state.State) {
 		if status == github.ProjectStatusDone {
 			continue
 		}
-		o.syncProject(issue, status)
+		if s.ProjectStatusSynced(issue, string(status)) {
+			continue
+		}
+		if o.syncProject(issue, status) {
+			s.MarkProjectStatusSynced(issue, string(status), time.Now().UTC())
+		}
 	}
 }
 
