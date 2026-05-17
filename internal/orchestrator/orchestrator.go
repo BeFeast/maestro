@@ -93,6 +93,7 @@ type Orchestrator struct {
 	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 	outcomeCheckFn              func(context.Context, outcome.Brief) outcome.HealthCheckResult
 	syncProjectFn               func(issueNumber int, status github.ProjectStatus) bool
+	listNonDoneProjectItemsFn   func(pf *github.ProjectField) ([]github.ProjectItem, error)
 	rateLimitFn                 func() (github.RateLimitStatus, error)
 }
 
@@ -450,6 +451,13 @@ func (o *Orchestrator) syncProject(issueNumber int, status github.ProjectStatus)
 	return o.gh.TrySyncIssueStatusOneOf(o.projectField, issueNumber, candidates...)
 }
 
+func (o *Orchestrator) listNonDoneProjectItems(pf *github.ProjectField) ([]github.ProjectItem, error) {
+	if o.listNonDoneProjectItemsFn != nil {
+		return o.listNonDoneProjectItemsFn(pf)
+	}
+	return o.gh.ListNonDoneProjectItems(pf)
+}
+
 // projectStatusForSession returns the ProjectStatus that should mirror this
 // session on the GitHub Project board, plus whether a sync should happen.
 // Sessions that have no clear board-level status (transient/unknown) return
@@ -503,44 +511,52 @@ func projectStatusForSession(sess *state.Session, requiresDeploy bool) (github.P
 // merging a PR alone keeps the item in In Progress until runtime/deploy
 // verification closes the issue (see markCodeLanded). This preserves the
 // merge-then-verify policy required by ops.
-func (o *Orchestrator) reconcileProjectBoard(s *state.State) {
+func (o *Orchestrator) reconcileProjectBoard(s *state.State) bool {
 	if !o.cfg.GitHubProjects.Enabled || o.cfg.GitHubProjects.ProjectNumber == 0 {
-		return
+		return false
 	}
 	if !o.projectGraphQLBudgetAvailable() {
-		return
+		return false
 	}
 	o.ensureProjectField()
 	if o.projectField == nil {
-		return
+		return false
 	}
 
-	o.reconcileSessionsToProjectBoard(s)
+	changed := o.reconcileSessionsToProjectBoard(s)
 
-	items, err := o.gh.ListNonDoneProjectItems(o.projectField)
+	items, err := o.listNonDoneProjectItems(o.projectField)
 	if err != nil {
 		log.Printf("[orch] reconcile project board: %v", err)
-		return
+		return changed
 	}
 
 	for _, item := range items {
 		if item.IssueClosed {
 			log.Printf("[orch] reconcile: issue #%d is closed, moving to Done", item.IssueNumber)
-			o.syncProject(item.IssueNumber, github.ProjectStatusDone)
+			if o.syncProject(item.IssueNumber, github.ProjectStatusDone) {
+				s.MarkProjectStatusSynced(item.IssueNumber, string(github.ProjectStatusDone), time.Now().UTC())
+				changed = true
+			}
 		} else if !item.HasStatus {
 			log.Printf("[orch] reconcile: issue #%d has no status, setting to Todo", item.IssueNumber)
-			o.syncProject(item.IssueNumber, github.ProjectStatusTodo)
+			if o.syncProject(item.IssueNumber, github.ProjectStatusTodo) {
+				s.MarkProjectStatusSynced(item.IssueNumber, string(github.ProjectStatusTodo), time.Now().UTC())
+				changed = true
+			}
 		}
 	}
+	return changed
 }
 
 // reconcileSessionsToProjectBoard pushes each Maestro session's status onto the
 // project board so the board mirrors the runtime even when an earlier sync was
 // missed (project discovery failed, network blip, board reset, …).
-func (o *Orchestrator) reconcileSessionsToProjectBoard(s *state.State) {
+func (o *Orchestrator) reconcileSessionsToProjectBoard(s *state.State) bool {
 	if s == nil {
-		return
+		return false
 	}
+	changed := false
 	// Pick the freshest session per issue so a running worker always wins over
 	// an older terminal record for the same issue.
 	freshest := make(map[int]*state.Session, len(s.Sessions))
@@ -573,8 +589,10 @@ func (o *Orchestrator) reconcileSessionsToProjectBoard(s *state.State) {
 		}
 		if o.syncProject(issue, status) {
 			s.MarkProjectStatusSynced(issue, string(status), time.Now().UTC())
+			changed = true
 		}
 	}
+	return changed
 }
 
 func codeLandedProjectStatus(requiresDeploy bool) github.ProjectStatus {
@@ -992,7 +1010,11 @@ func (o *Orchestrator) RunOnce() error {
 	// Step 6: Reconcile project board — mirror Maestro session state onto the
 	// board (active workers visible as In Progress, open PRs as In Review,
 	// blocked sessions as Blocked) and move externally-closed issues to Done.
-	o.reconcileProjectBoard(s)
+	if o.reconcileProjectBoard(s) {
+		if err := state.Save(o.cfg.StateDir, s); err != nil {
+			return fmt.Errorf("save state after project reconcile: %w", err)
+		}
+	}
 
 	// Flush digest buffer (no-op if digest mode is off or buffer is empty)
 	if err := o.notifier.Flush(); err != nil {
@@ -2268,7 +2290,7 @@ func (o *Orchestrator) runDeployCmd(prNumber int) error {
 //  1. Auto-rebase (if enabled)
 //  2. Label issue as blocked + keep session in conflict_failed permanently
 func (o *Orchestrator) rebaseConflicts(s *state.State) {
-	prs, err := o.gh.ListOpenPRs()
+	prs, err := o.listOpenPRs()
 	if err != nil {
 		log.Printf("[orch] list PRs (rebase): %v", err)
 		return
