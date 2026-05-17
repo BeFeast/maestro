@@ -27,6 +27,8 @@ type fakeReader struct {
 	ciStatuses     map[int]string
 	greptileOK     map[int]bool
 	greptilePend   map[int]bool
+	rateLimit      *github.RateLimitStatus
+	rateLimitErr   error
 	issueCalls     int
 	addedLabels    []string
 	removedLabels  []string
@@ -116,6 +118,19 @@ func (f *fakeReader) PRGreptileApproved(prNumber int) (bool, bool, error) {
 	return approved, false, nil
 }
 
+func (f *fakeReader) RateLimit() (github.RateLimitStatus, error) {
+	if f.rateLimitErr != nil {
+		return github.RateLimitStatus{}, f.rateLimitErr
+	}
+	if f.rateLimit != nil {
+		return *f.rateLimit, nil
+	}
+	return github.RateLimitStatus{
+		Core:    github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+		GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+	}, nil
+}
+
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
@@ -148,6 +163,38 @@ func requireStuckState(t *testing.T, decision state.SupervisorDecision, code str
 	}
 	t.Fatalf("stuck state %q not found in %#v", code, decision.StuckStates)
 	return state.SupervisorStuckState{}
+}
+
+func TestDecide_ProjectGraphQLRateExhaustedDoesNotReportIdle(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.GitHubProjects.Enabled = true
+	cfg.GitHubProjects.ProjectNumber = 3
+	reader := &fakeReader{
+		rateLimit: &github.RateLimitStatus{
+			Core:    github.RateLimitBucket{Limit: 5000, Remaining: 4990, Used: 10},
+			GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 0, Used: 5000, Reset: 1779052352},
+		},
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionNotifyRed {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionNotifyRed)
+	}
+	stuck := requireStuckState(t, decision, "github_graphql_rate_exhausted")
+	if stuck.Severity != SeverityBlocked {
+		t.Fatalf("severity = %q, want %q", stuck.Severity, SeverityBlocked)
+	}
+	if reader.issueCalls != 0 {
+		t.Fatalf("ListOpenIssues called %d time(s), want rate-budget gate before queue throughput", reader.issueCalls)
+	}
+	reasons := strings.Join(decision.Reasons, "\n")
+	if !strings.Contains(reasons, "must not report idle/no-work as healthy") {
+		t.Fatalf("reasons = %q, want explicit false-idle guardrail", reasons)
+	}
 }
 
 func testLLMEngine(cfg *config.Config, reader *fakeReader, llm *fakeLLM) *Engine {

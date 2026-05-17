@@ -63,6 +63,23 @@ func TestParseRESTPullsMapsFields(t *testing.T) {
 	}
 }
 
+func TestParseRateLimitStatus(t *testing.T) {
+	body := `{
+		"resources": {
+			"core": {"limit": 5000, "remaining": 4990, "reset": 1779053364, "used": 10},
+			"graphql": {"limit": 5000, "remaining": 0, "reset": 1779052352, "used": 5000}
+		}
+	}`
+
+	got, err := parseRateLimitStatus([]byte(body))
+	if err != nil {
+		t.Fatalf("parseRateLimitStatus() error = %v", err)
+	}
+	if got.Core.Remaining != 4990 || got.GraphQL.Remaining != 0 || got.GraphQL.Used != 5000 {
+		t.Fatalf("parseRateLimitStatus() = %#v", got)
+	}
+}
+
 func TestGreptileCheckDecision(t *testing.T) {
 	tests := []struct {
 		name        string

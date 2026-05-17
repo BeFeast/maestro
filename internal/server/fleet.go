@@ -2123,6 +2123,14 @@ func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorS
 	target := latest.Target
 	operator := fleetOperatorState{}
 	switch action {
+	case "notify_red":
+		operator = fleetOperatorState{
+			Kind:       "infra_blocker",
+			Tone:       "attention",
+			Label:      "Infra blocker",
+			Summary:    firstNonEmpty(summary, "A required source of truth is unavailable; Maestro must not report the project as healthy or idle."),
+			NextAction: "Restore the blocked dependency or wait for the documented reset before trusting queue/project reconciliation.",
+		}
 	case "check_outcome_health":
 		operator = fleetOperatorState{
 			Kind:       "outcome_drift",
@@ -2644,6 +2652,8 @@ func actionLabelServer(action string) string {
 		return "Review retry-exhausted work"
 	case "check_outcome_health":
 		return "Check runtime health"
+	case "notify_red":
+		return "Notify red"
 	case "wait_for_running_worker", "wait_for_worker":
 		return "Wait for worker"
 	case "wait_for_capacity":
