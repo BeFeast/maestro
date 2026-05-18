@@ -29,6 +29,7 @@ type fakeReader struct {
 	greptilePend   map[int]bool
 	rateLimit      *github.RateLimitStatus
 	rateLimitErr   error
+	rateLimitCalls int
 	issueCalls     int
 	addedLabels    []string
 	removedLabels  []string
@@ -119,6 +120,7 @@ func (f *fakeReader) PRGreptileApproved(prNumber int) (bool, bool, error) {
 }
 
 func (f *fakeReader) RateLimit() (github.RateLimitStatus, error) {
+	f.rateLimitCalls++
 	if f.rateLimitErr != nil {
 		return github.RateLimitStatus{}, f.rateLimitErr
 	}
@@ -165,7 +167,7 @@ func requireStuckState(t *testing.T, decision state.SupervisorDecision, code str
 	return state.SupervisorStuckState{}
 }
 
-func TestDecide_ProjectGraphQLRateExhaustedDoesNotReportIdle(t *testing.T) {
+func TestDecide_DoesNotPollRateLimitEndpointForIdleDecision(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.GitHubProjects.Enabled = true
 	cfg.GitHubProjects.ProjectNumber = 3
@@ -181,19 +183,13 @@ func TestDecide_ProjectGraphQLRateExhaustedDoesNotReportIdle(t *testing.T) {
 		t.Fatalf("Decide: %v", err)
 	}
 
-	if decision.RecommendedAction != ActionNotifyRed {
-		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionNotifyRed)
+	if reader.rateLimitCalls != 0 {
+		t.Fatalf("RateLimit calls = %d, want 0; supervisor must not burn API budget to measure API budget", reader.rateLimitCalls)
 	}
-	stuck := requireStuckState(t, decision, "github_graphql_rate_exhausted")
-	if stuck.Severity != SeverityBlocked {
-		t.Fatalf("severity = %q, want %q", stuck.Severity, SeverityBlocked)
-	}
-	if reader.issueCalls != 0 {
-		t.Fatalf("ListOpenIssues called %d time(s), want rate-budget gate before queue throughput", reader.issueCalls)
-	}
-	reasons := strings.Join(decision.Reasons, "\n")
-	if !strings.Contains(reasons, "must not report idle/no-work as healthy") {
-		t.Fatalf("reasons = %q, want explicit false-idle guardrail", reasons)
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == "github_graphql_rate_exhausted" || stuck.Code == "github_rate_budget_unknown" {
+			t.Fatalf("unexpected proactive rate-budget stuck state: %+v", stuck)
+		}
 	}
 }
 
