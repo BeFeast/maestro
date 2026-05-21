@@ -744,6 +744,85 @@ func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
 	}
 }
 
+func TestDecide_SingleMergeWithFailingOutcomeRecordsDriftTarget(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	finished := now.Add(-15 * time.Minute)
+	st := state.NewState()
+	st.LastMergeAt = finished
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: finished.Add(-time.Hour),
+		Signal:    "healthcheck_url",
+		State:     outcome.HealthFailing,
+		Summary:   "GET returned 503",
+	}
+	st.Sessions["done-1"] = &state.Session{
+		IssueNumber: 7,
+		IssueTitle:  "first",
+		Status:      state.StatusDone,
+		PRNumber:    42,
+		StartedAt:   finished.Add(-2 * time.Hour),
+		FinishedAt:  &finished,
+	}
+
+	decision, err := testEngine(cfg, &fakeReader{}).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionCheckOutcomeHealth {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionCheckOutcomeHealth)
+	}
+	stuck := requireStuckState(t, decision, state.StuckNoOutcomeProgress)
+	if stuck.Target == nil || stuck.Target.PR != 42 || stuck.Target.Issue != 7 {
+		t.Fatalf("stuck target = %#v, want PR 42 / issue 7", stuck.Target)
+	}
+	evidenceJoined := strings.Join(stuck.Evidence, " ")
+	if !strings.Contains(evidenceJoined, "merged_pr=42") || !strings.Contains(evidenceJoined, "closed_issue=7") {
+		t.Fatalf("stuck evidence = %v, want merged_pr and closed_issue", stuck.Evidence)
+	}
+	if !strings.Contains(evidenceJoined, "signal=healthcheck_url") {
+		t.Fatalf("stuck evidence = %v, want healthcheck_url signal", stuck.Evidence)
+	}
+}
+
+func TestDecide_ClosedIssueWithoutPRDriftsOnFailingRuntime(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:     "Hosted app responds to users",
+		HealthcheckCommand: "status.sh",
+	}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	finished := now.Add(-time.Hour)
+	st := state.NewState()
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: finished.Add(time.Minute),
+		Signal:    "healthcheck_command",
+		State:     outcome.HealthFailing,
+	}
+	st.Sessions["done-closed"] = &state.Session{
+		IssueNumber: 8,
+		IssueTitle:  "closed without PR",
+		Status:      state.StatusDone,
+		FinishedAt:  &finished,
+	}
+
+	decision, err := testEngine(cfg, &fakeReader{}).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	stuck := requireStuckState(t, decision, state.StuckNoOutcomeProgress)
+	if stuck.Target == nil || stuck.Target.Issue != 8 || stuck.Target.PR != 0 {
+		t.Fatalf("stuck target = %#v, want issue 8 only", stuck.Target)
+	}
+	if !strings.Contains(stuck.Summary, "Issue #8") {
+		t.Fatalf("stuck summary = %q, want Issue #8 reference", stuck.Summary)
+	}
+}
+
 func TestDecideDeterministic_OutcomeUsesStateMergeHistory(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Outcome = outcome.Brief{

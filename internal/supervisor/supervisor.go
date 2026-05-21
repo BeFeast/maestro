@@ -624,12 +624,19 @@ func outcomeIssueReason(status outcome.Status, issue github.Issue) string {
 }
 
 func (e *Engine) detectOutcomeStuckStates(st *state.State) []state.SupervisorStuckState {
-	status := e.outcomeStatus(st)
-	if !status.Configured {
+	if e == nil || e.cfg == nil {
+		return nil
+	}
+	if !e.cfg.Outcome.Configured() {
 		return []state.SupervisorStuckState{stuckState(state.StuckMissingOutcomeBrief, SeverityWarning,
 			"No outcome brief is configured for this project.",
 			"Add an outcome brief with the desired runtime goal, target, health signal, and non-goals before treating issue throughput as success.", false, nil,
 			"Outcome brief configured: false")}
+	}
+	status := e.outcomeStatus(st)
+	findings := e.outcomeDriftStuckStates(st)
+	if len(findings) > 0 {
+		return findings
 	}
 	switch status.HealthState {
 	case outcome.HealthFailing:
@@ -645,6 +652,70 @@ func (e *Engine) detectOutcomeStuckStates(st *state.State) []state.SupervisorStu
 	default:
 		return nil
 	}
+}
+
+func (e *Engine) outcomeDriftStuckStates(st *state.State) []state.SupervisorStuckState {
+	if st == nil {
+		return nil
+	}
+	completed := completedWorkFromSessions(st)
+	if len(completed) == 0 {
+		return nil
+	}
+	drifts := outcome.DetectDrift(e.cfg.Outcome, completed, st.OutcomeHealth)
+	if len(drifts) == 0 {
+		return nil
+	}
+	findings := make([]state.SupervisorStuckState, 0, len(drifts))
+	for _, drift := range drifts {
+		target := &state.SupervisorTarget{
+			Issue:   drift.ClosedIssue,
+			PR:      drift.MergedPR,
+			Session: drift.Session,
+		}
+		evidence := []string{fmt.Sprintf("health_state=%s", drift.HealthState)}
+		if drift.Signal != "" {
+			evidence = append(evidence, "signal="+drift.Signal)
+		}
+		if drift.MergedPR > 0 {
+			evidence = append(evidence, fmt.Sprintf("merged_pr=%d", drift.MergedPR))
+		}
+		if drift.ClosedIssue > 0 {
+			evidence = append(evidence, fmt.Sprintf("closed_issue=%d", drift.ClosedIssue))
+		}
+		findings = append(findings, stuckState(state.StuckNoOutcomeProgress, SeverityBlocked,
+			drift.Summary, drift.NextAction, false, target, evidence...))
+	}
+	return findings
+}
+
+func completedWorkFromSessions(st *state.State) []outcome.CompletedWork {
+	if st == nil {
+		return nil
+	}
+	work := make([]outcome.CompletedWork, 0, len(st.Sessions))
+	for slot, sess := range st.Sessions {
+		if sess == nil {
+			continue
+		}
+		if sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded {
+			continue
+		}
+		if sess.PRNumber == 0 && sess.IssueNumber == 0 {
+			continue
+		}
+		finishedAt := time.Time{}
+		if sess.FinishedAt != nil {
+			finishedAt = sess.FinishedAt.UTC()
+		}
+		work = append(work, outcome.CompletedWork{
+			Session:     slot,
+			MergedPR:    sess.PRNumber,
+			ClosedIssue: sess.IssueNumber,
+			FinishedAt:  finishedAt,
+		})
+	}
+	return work
 }
 
 func (e *Engine) outcomeProgressStuckState(st *state.State, status outcome.Status, canAct bool) state.SupervisorStuckState {
