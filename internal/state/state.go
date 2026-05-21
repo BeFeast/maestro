@@ -1612,6 +1612,57 @@ func (s *State) DonePRCount() int {
 	return count
 }
 
+// DriftSessions returns the list of sessions that count as "GitHub-side done"
+// for outcome drift detection: PRs that landed (code_landed/done with a PR
+// number) and issues that closed without producing a PR. Each entry carries
+// the minimum fields the outcome package needs to render an active drift item.
+func (s *State) DriftSessions() []outcome.DriftSession {
+	if s == nil {
+		return nil
+	}
+	slots := make([]string, 0, len(s.Sessions))
+	for slot := range s.Sessions {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+	drifts := make([]outcome.DriftSession, 0, len(s.Sessions))
+	for _, slot := range slots {
+		sess := s.Sessions[slot]
+		if sess == nil {
+			continue
+		}
+		landed := sess.StartedAt
+		if sess.FinishedAt != nil && sess.FinishedAt.After(landed) {
+			landed = *sess.FinishedAt
+		}
+		switch sess.Status {
+		case StatusCodeLanded:
+			if sess.PRNumber <= 0 {
+				continue
+			}
+			drifts = append(drifts, outcome.DriftSession{
+				Slot:        slot,
+				IssueNumber: sess.IssueNumber,
+				IssueTitle:  sess.IssueTitle,
+				PRNumber:    sess.PRNumber,
+				PRMerged:    true,
+				LandedAt:    landed.UTC(),
+			})
+		case StatusDone:
+			drifts = append(drifts, outcome.DriftSession{
+				Slot:        slot,
+				IssueNumber: sess.IssueNumber,
+				IssueTitle:  sess.IssueTitle,
+				PRNumber:    sess.PRNumber,
+				PRMerged:    sess.PRNumber > 0,
+				IssueClosed: true,
+				LandedAt:    landed.UTC(),
+			})
+		}
+	}
+	return drifts
+}
+
 // IssueInProgress returns true if the given issue is already being handled.
 // This includes dead sessions with a pending retry (NextRetryAt set) to prevent
 // duplicate worker spawns during backoff periods.

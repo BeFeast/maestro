@@ -91,6 +91,42 @@ func TestProjectStatusSynced(t *testing.T) {
 	}
 }
 
+func TestDriftSessionsIncludesLandedAndClosed(t *testing.T) {
+	s := NewState()
+	finished := time.Date(2026, 5, 10, 9, 0, 0, 0, time.UTC)
+	s.Sessions["code-landed"] = &Session{IssueNumber: 5, IssueTitle: "Ship feature", Status: StatusCodeLanded, PRNumber: 13, FinishedAt: &finished}
+	s.Sessions["merged-done"] = &Session{IssueNumber: 2, Status: StatusDone, PRNumber: 11, FinishedAt: &finished}
+	s.Sessions["closed-issue"] = &Session{IssueNumber: 3, Status: StatusDone, FinishedAt: &finished}
+	s.Sessions["running"] = &Session{IssueNumber: 4, Status: StatusRunning, PRNumber: 12, StartedAt: finished}
+
+	drifts := s.DriftSessions()
+	if len(drifts) != 3 {
+		t.Fatalf("len(drifts) = %d, want 3: %+v", len(drifts), drifts)
+	}
+	bySlot := make(map[string]struct {
+		merged, closed bool
+		pr             int
+	}, len(drifts))
+	for _, d := range drifts {
+		bySlot[d.Slot] = struct {
+			merged, closed bool
+			pr             int
+		}{d.PRMerged, d.IssueClosed, d.PRNumber}
+	}
+	if got := bySlot["code-landed"]; !got.merged || got.closed || got.pr != 13 {
+		t.Fatalf("code-landed drift = %+v, want merged PR only", got)
+	}
+	if got := bySlot["merged-done"]; !got.merged || !got.closed || got.pr != 11 {
+		t.Fatalf("merged-done drift = %+v, want merged PR and closed issue", got)
+	}
+	if got := bySlot["closed-issue"]; got.merged || !got.closed || got.pr != 0 {
+		t.Fatalf("closed-issue drift = %+v, want closed issue only", got)
+	}
+	if _, ok := bySlot["running"]; ok {
+		t.Fatalf("running session should not appear in drift sessions: %+v", drifts)
+	}
+}
+
 func TestNotifiedCIFail_OmittedWhenFalse(t *testing.T) {
 	dir := t.TempDir()
 

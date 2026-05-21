@@ -1179,6 +1179,36 @@ func TestFleetProjectOperatorStateDistinguishesBriefStates(t *testing.T) {
 		t.Fatalf("drift operator state = %+v, want runtime outcome drift", drift)
 	}
 
+	driftItem := buildFleetProjectOperatorState(fleetProjectState{
+		Name: "DriftItem",
+		Repo: "owner/drift",
+		Outcome: outcome.Status{
+			Configured:  true,
+			Goal:        "Runtime is healthy",
+			HealthState: outcome.HealthHealthy,
+			Drifts: []outcome.DriftItem{{
+				Slot:              "slot-1",
+				IssueNumber:       99,
+				PRNumber:          42,
+				PRMerged:          true,
+				HealthState:       outcome.HealthFailing,
+				HealthSignal:      "healthcheck_url",
+				Reason:            "PR #42 for issue #99 merged but runtime outcome health is failing for Runtime is healthy: status.sh exited 1.",
+				RecommendedAction: "Run the configured runtime healthcheck; if it stays unhealthy, request approval to comment on PR #42, reopen issue #99, or relabel it for follow-up.",
+				ActionPolicy:      outcome.DriftActionPolicyApprovalRequired,
+			}},
+		},
+	})
+	if driftItem.Kind != "outcome_drift" {
+		t.Fatalf("drift item operator state kind = %q, want outcome_drift", driftItem.Kind)
+	}
+	if driftItem.PRNumber != 42 || driftItem.IssueNumber != 99 {
+		t.Fatalf("drift item operator state = %+v, want PR #42/issue #99 target", driftItem)
+	}
+	if !contains(driftItem.NextAction, "approval") {
+		t.Fatalf("drift item next action = %q, want approval-gated follow-up", driftItem.NextAction)
+	}
+
 	blocked := buildFleetProjectOperatorState(fleetProjectState{
 		Name:          "BlockedQueue",
 		Outcome:       configuredOutcome,

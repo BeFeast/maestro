@@ -2064,6 +2064,21 @@ func fleetOutcomeDriftOperatorState(project fleetProjectState) (fleetOperatorSta
 	if !project.Outcome.Configured {
 		return fleetOperatorState{}, false
 	}
+	if drift, ok := topOutcomeDrift(project.Outcome.Drifts); ok {
+		operator := fleetOperatorState{
+			Kind:       "outcome_drift",
+			Tone:       "attention",
+			Label:      "Outcome drift",
+			Summary:    firstNonEmpty(drift.Reason, "Runtime outcome health has not caught up with landed work."),
+			NextAction: firstNonEmpty(drift.RecommendedAction, project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before treating the work as fully complete."),
+		}
+		target := &state.SupervisorTarget{
+			Issue:   drift.IssueNumber,
+			PR:      drift.PRNumber,
+			Session: drift.Slot,
+		}
+		return applyFleetOperatorTarget(project, operator, target), true
+	}
 	if latest := project.Supervisor.Latest; latest != nil {
 		if strings.TrimSpace(latest.RecommendedAction) == "check_outcome_health" {
 			operator := fleetOperatorState{
@@ -2100,6 +2115,16 @@ func fleetOutcomeDriftOperatorState(project fleetProjectState) (fleetOperatorSta
 		}
 	}
 	return fleetOperatorState{}, false
+}
+
+// topOutcomeDrift returns the highest-severity drift item from the project's
+// outcome status. DetectDrifts already sorts by severity (failing first), so
+// callers can take the first item without re-scanning.
+func topOutcomeDrift(drifts []outcome.DriftItem) (outcome.DriftItem, bool) {
+	if len(drifts) == 0 {
+		return outcome.DriftItem{}, false
+	}
+	return drifts[0], true
 }
 
 func fleetOutcomeHealthState(project fleetProjectState, health string) fleetOperatorState {

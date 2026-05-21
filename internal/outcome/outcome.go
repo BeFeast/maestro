@@ -35,31 +35,32 @@ type Brief struct {
 
 // Status is the concise outcome state exposed by CLI/API/dashboard surfaces.
 type Status struct {
-	Configured              bool     `json:"configured"`
-	Goal                    string   `json:"goal,omitempty"`
-	DesiredOutcome          string   `json:"desired_outcome,omitempty"`
-	RuntimeTarget           string   `json:"runtime_target,omitempty"`
-	RuntimeURL              string   `json:"runtime_url,omitempty"`
-	RuntimeHost             string   `json:"runtime_host,omitempty"`
-	HealthState             string   `json:"health_state"`
-	HealthCheckedAt         string   `json:"health_checked_at,omitempty"`
-	HealthSignal            string   `json:"health_signal,omitempty"`
-	HealthSummary           string   `json:"health_summary,omitempty"`
-	HealthDetail            string   `json:"health_detail,omitempty"`
-	NextAction              string   `json:"next_action,omitempty"`
-	SourceRepoPath          string   `json:"source_repo_path,omitempty"`
-	DeploymentStatusCommand string   `json:"deployment_status_command,omitempty"`
-	DeployStatusCommand     string   `json:"deploy_status_command,omitempty"`
-	HealthcheckCommand      string   `json:"healthcheck_command,omitempty"`
-	VerifierCommand         string   `json:"verifier_command,omitempty"`
-	HealthcheckURL          string   `json:"healthcheck_url,omitempty"`
-	RequiredRoutes          []string `json:"required_routes,omitempty"`
-	RequiresDeploy          bool     `json:"requires_deploy,omitempty"`
-	NonGoals                []string `json:"non_goals,omitempty"`
-	PassRequiredForDone     bool     `json:"pass_required_for_done,omitempty"`
-	FailRequiresVisibleWork bool     `json:"fail_requires_visible_work,omitempty"`
-	MergedPRs               int      `json:"merged_prs,omitempty"`
-	LastMergeAt             string   `json:"last_merge_at,omitempty"`
+	Configured              bool        `json:"configured"`
+	Goal                    string      `json:"goal,omitempty"`
+	DesiredOutcome          string      `json:"desired_outcome,omitempty"`
+	RuntimeTarget           string      `json:"runtime_target,omitempty"`
+	RuntimeURL              string      `json:"runtime_url,omitempty"`
+	RuntimeHost             string      `json:"runtime_host,omitempty"`
+	HealthState             string      `json:"health_state"`
+	HealthCheckedAt         string      `json:"health_checked_at,omitempty"`
+	HealthSignal            string      `json:"health_signal,omitempty"`
+	HealthSummary           string      `json:"health_summary,omitempty"`
+	HealthDetail            string      `json:"health_detail,omitempty"`
+	NextAction              string      `json:"next_action,omitempty"`
+	SourceRepoPath          string      `json:"source_repo_path,omitempty"`
+	DeploymentStatusCommand string      `json:"deployment_status_command,omitempty"`
+	DeployStatusCommand     string      `json:"deploy_status_command,omitempty"`
+	HealthcheckCommand      string      `json:"healthcheck_command,omitempty"`
+	VerifierCommand         string      `json:"verifier_command,omitempty"`
+	HealthcheckURL          string      `json:"healthcheck_url,omitempty"`
+	RequiredRoutes          []string    `json:"required_routes,omitempty"`
+	RequiresDeploy          bool        `json:"requires_deploy,omitempty"`
+	NonGoals                []string    `json:"non_goals,omitempty"`
+	PassRequiredForDone     bool        `json:"pass_required_for_done,omitempty"`
+	FailRequiresVisibleWork bool        `json:"fail_requires_visible_work,omitempty"`
+	MergedPRs               int         `json:"merged_prs,omitempty"`
+	LastMergeAt             string      `json:"last_merge_at,omitempty"`
+	Drifts                  []DriftItem `json:"drifts,omitempty"`
 }
 
 // HealthCheckResult is the durable result of a read-only runtime/deploy health

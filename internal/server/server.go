@@ -764,10 +764,14 @@ func outcomeStatusForState(cfg *config.Config, st *state.State) outcome.Status {
 	if cfg == nil || st == nil {
 		return outcome.StatusFor(outcome.Brief{}, 0, time.Time{})
 	}
+	var status outcome.Status
 	if st.OutcomeHealth != nil {
-		return outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt, *st.OutcomeHealth)
+		status = outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt, *st.OutcomeHealth)
+	} else {
+		status = outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt)
 	}
-	return outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt)
+	status.Drifts = outcome.DetectDrifts(cfg.Outcome, st.DriftSessions(), st.OutcomeHealth, time.Now().UTC())
+	return status
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
