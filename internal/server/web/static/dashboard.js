@@ -219,8 +219,13 @@ function statusLabel(worker) {
   return displayStatus(worker);
 }
 
+function isVerificationAttention(worker) {
+  return displayStatus(worker) === "code_landed" && worker.needs_attention;
+}
+
 function pillClass(worker) {
   const base = "pill s-" + escapeText(displayStatus(worker) || "unknown");
+  if (isVerificationAttention(worker)) return base + " pill-verification";
   if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) {
     return base + " pill-attention";
   }
@@ -344,7 +349,7 @@ function renderWorkers() {
   }
   workersEl.innerHTML = visible.map(worker => {
     const selected = worker.slot === state.selected ? " selected" : "";
-    const attention = worker.needs_attention ? " row-attention" : "";
+    const attention = isVerificationAttention(worker) ? " row-verification" : (worker.needs_attention ? " row-attention" : "");
     const pr = worker.pr_number ? "#" + worker.pr_number : "-";
     return '<tr class="' + selected + attention + '" data-slot="' + escapeText(worker.slot) + '">' +
       '<td class="slot">' + escapeText(worker.slot) + '</td>' +
