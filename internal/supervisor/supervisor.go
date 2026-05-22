@@ -256,7 +256,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return decision, nil
 	}
 
-	if !e.cfg.Supervisor.OrderedQueueActive() {
+	if !e.cfg.Supervisor.OrderedQueueActive() && !e.cfg.Supervisor.DynamicWave.Active() {
 		if slot, sess, ok := e.retryExhaustedSession(st, cache); ok {
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
@@ -288,6 +288,22 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, fmt.Errorf("list open issues: %w", err)
 	}
 	projectState.OpenIssues = len(issues)
+
+	if slot, sess, issue, ok, err := e.retryExhaustedRepairCandidate(st, issues, cache); err != nil {
+		return state.SupervisorDecision{}, err
+	} else if ok {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Session %s for issue #%d is retry_exhausted with no usable PR", slot, sess.IssueNumber),
+			"Ready-labeled issue is still open and has no dependency/blocking label reason",
+			"Retry exhaustion may have moved the project item to Blocked, but supervisor can start one intentional repair worker instead of dead-ending the queue",
+			"Starting a repair worker would mutate local worktrees, so supervisor records an explicit repair recommendation",
+		)
+		decision := e.decision(st, now, projectState, ActionSpawnRepairWorker,
+			fmt.Sprintf("Start a repair worker for retry-exhausted issue #%d: %s", issue.Number, issue.Title),
+			RiskMutating, 0.88, &state.SupervisorTarget{Issue: issue.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
+	}
 
 	policyResult, err := e.policyCandidateIssues(st, issues)
 	if err != nil {
@@ -1484,6 +1500,45 @@ func (e *Engine) issueQueueSkipReason(st *state.State, issue github.Issue, block
 	return e.issueSkipReasonWithExcludeLabels(st, issue, excludeLabelsExcept(e.excludeLabels(), blockedLabel), blockedLabel)
 }
 
+func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (string, error) {
+	if st.IssueInProgress(issue.Number) {
+		return "already in progress", nil
+	}
+	if st.IssueDone(issue.Number) {
+		return "already completed in state", nil
+	}
+	if st.IsMissionParent(issue.Number) {
+		return heldMetaSkipReason("mission parent issue"), nil
+	}
+	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
+		return heldMetaSkipReason("mission issue awaits decomposition"), nil
+	}
+	policyExcludedLabels := e.policyExcludedLabels()
+	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(e.excludeLabels(), label) || hasLabelName(policyExcludedLabels, label)) {
+		return heldMetaSkipReason(fmt.Sprintf("label %q", label)), nil
+	}
+	if _, ok := firstMatchingIssueLabel(issue, e.excludeLabels()); ok {
+		return "excluded by configured label", nil
+	}
+	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel}) {
+		return "blocked by supervisor policy label", nil
+	}
+	if _, ok := firstMatchingIssueLabel(issue, policyExcludedLabels); ok {
+		return "excluded by supervisor policy label", nil
+	}
+	if len(e.cfg.BlockerPatterns) > 0 {
+		blockers := github.FindBlockers(issue.Body, e.cfg.BlockerPatterns)
+		openBlockers, err := e.openBlockers(blockers)
+		if err != nil {
+			return "", err
+		}
+		if len(openBlockers) > 0 {
+			return blockedByDependencySkipReason(openBlockers), nil
+		}
+	}
+	return "", nil
+}
+
 func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.Issue, excludeLabels []string, ignoredBlockedLabel string) (string, error) {
 	if st.IssueInProgress(issue.Number) {
 		return "already in progress", nil
@@ -1666,6 +1721,41 @@ func (e *Engine) retryExhaustedSession(st *state.State, cache *resolutionCache) 
 		return slot, sess, true
 	}
 	return "", nil, false
+}
+
+func (e *Engine) retryExhaustedRepairCandidate(st *state.State, issues []github.Issue, cache *resolutionCache) (string, *state.Session, github.Issue, bool, error) {
+	if availableSlots(e.cfg, st) <= 0 {
+		return "", nil, github.Issue{}, false, nil
+	}
+	issueByNumber := make(map[int]github.Issue, len(issues))
+	for _, issue := range issues {
+		issueByNumber[issue.Number] = issue
+	}
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 {
+			continue
+		}
+		if e.hasLiveRunningSessionForIssue(st, sess.IssueNumber) || e.retryExhaustedSessionResolvedOnGitHub(sess, cache) {
+			continue
+		}
+		issue, ok := issueByNumber[sess.IssueNumber]
+		if !ok || !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
+			continue
+		}
+		if hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number); err != nil {
+			return "", nil, github.Issue{}, false, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
+		} else if hasOpenPR {
+			continue
+		}
+		if reason, err := e.issueRepairSkipReason(st, issue); err != nil {
+			return "", nil, github.Issue{}, false, err
+		} else if reason != "" {
+			continue
+		}
+		return slot, sess, issue, true, nil
+	}
+	return "", nil, github.Issue{}, false, nil
 }
 
 // retryExhaustedSessionResolvedOnGitHub returns true when the underlying issue
