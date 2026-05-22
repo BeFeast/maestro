@@ -255,7 +255,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return decision, nil
 	}
 
-	if slot, sess, ok := retryExhaustedSession(st); ok && !e.cfg.Supervisor.OrderedQueueActive() {
+	if slot, sess, ok := e.retryExhaustedSession(st); ok && !e.cfg.Supervisor.OrderedQueueActive() {
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
 			"Retry-exhausted work requires a human decision before more automation",
@@ -726,7 +726,7 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state
 			}
 		}
 
-		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 {
+		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 && !e.retryExhaustedSessionResolvedOnGitHub(sess) {
 			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
@@ -1622,14 +1622,43 @@ func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int)
 	return false
 }
 
-func retryExhaustedSession(st *state.State) (string, *state.Session, bool) {
+func (e *Engine) retryExhaustedSession(st *state.State) (string, *state.Session, bool) {
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess != nil && sess.Status == state.StatusRetryExhausted {
-			return slot, sess, true
+		if sess == nil || sess.Status != state.StatusRetryExhausted {
+			continue
 		}
+		if e.retryExhaustedSessionResolvedOnGitHub(sess) {
+			continue
+		}
+		return slot, sess, true
 	}
 	return "", nil, false
+}
+
+// retryExhaustedSessionResolvedOnGitHub returns true when the underlying issue
+// is closed or has been resolved by a merged PR, so the supervisor should
+// ignore the stale retry-exhausted session record instead of recommending
+// review or worker spawning for the already-resolved issue.
+func (e *Engine) retryExhaustedSessionResolvedOnGitHub(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	if sess.PRNumber > 0 {
+		if merged, err := e.reader.IsPRMerged(sess.PRNumber); err == nil && merged {
+			return true
+		}
+	}
+	if sess.IssueNumber <= 0 {
+		return false
+	}
+	if closed, err := e.reader.IsIssueClosed(sess.IssueNumber); err == nil && closed {
+		return true
+	}
+	if merged, err := e.reader.HasMergedPRForIssue(sess.IssueNumber); err == nil && merged {
+		return true
+	}
+	return false
 }
 
 func sortedSessionNames(st *state.State) []string {

@@ -320,6 +320,95 @@ func TestDecide_RetryExhaustedNeedsReview(t *testing.T) {
 	}
 }
 
+func TestDecide_RetryExhaustedSkippedWhenIssueClosed(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		closedIssues: map[int]bool{768: true},
+	}
+	st := state.NewState()
+	st.Sessions["pan-56"] = &state.Session{
+		IssueNumber: 768,
+		IssueTitle:  "stale exhausted work",
+		Status:      state.StatusRetryExhausted,
+		StartedAt:   time.Now().UTC().Add(-2 * time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction == ActionReviewRetryExhausted {
+		t.Fatalf("action = %q, must not recommend reviewing a stale retry-exhausted session for a closed issue", decision.RecommendedAction)
+	}
+	if decision.Target != nil && decision.Target.Session == "pan-56" {
+		t.Fatalf("target = %#v, must not target stale session pan-56 once issue #768 is closed", decision.Target)
+	}
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == "retry_exhausted" {
+			t.Fatalf("stuck state retry_exhausted should not be reported for closed issue: %#v", stuck)
+		}
+	}
+}
+
+func TestDecide_RetryExhaustedSkippedWhenIssueHasMergedWinningPR(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		mergedPRIssues: map[int]bool{768: true},
+	}
+	st := state.NewState()
+	st.Sessions["pan-56"] = &state.Session{
+		IssueNumber: 768,
+		IssueTitle:  "stale exhausted work, winner merged",
+		Status:      state.StatusRetryExhausted,
+		StartedAt:   time.Now().UTC().Add(-2 * time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction == ActionReviewRetryExhausted {
+		t.Fatalf("action = %q, must not recommend reviewing a stale retry-exhausted session once a winning PR is merged", decision.RecommendedAction)
+	}
+	if decision.Target != nil && decision.Target.Session == "pan-56" {
+		t.Fatalf("target = %#v, must not target stale session pan-56 once issue #768 has a merged winner", decision.Target)
+	}
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == "retry_exhausted" {
+			t.Fatalf("stuck state retry_exhausted should not be reported for issue resolved by merged PR: %#v", stuck)
+		}
+	}
+}
+
+func TestDecide_RetryExhaustedSkippedWhenSessionPRIsMerged(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		mergedPRs: map[int]bool{820: true},
+	}
+	st := state.NewState()
+	st.Sessions["pan-56"] = &state.Session{
+		IssueNumber: 768,
+		IssueTitle:  "merged work tagged retry_exhausted",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    820,
+		StartedAt:   time.Now().UTC().Add(-2 * time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction == ActionReviewRetryExhausted {
+		t.Fatalf("action = %q, must not recommend reviewing a retry-exhausted session whose own PR has merged", decision.RecommendedAction)
+	}
+	if decision.Target != nil && decision.Target.Session == "pan-56" {
+		t.Fatalf("target = %#v, must not target session pan-56 once its PR #820 is merged", decision.Target)
+	}
+}
+
 func TestDecide_RetryExhaustedOpenGreenPRExplainsMergeEligibility(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ReviewGate = "none"
