@@ -2877,6 +2877,21 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 	return true
 }
 
+func (o *Orchestrator) issueHasLiveRunningSession(s *state.State, issueNumber int) bool {
+	if s == nil || issueNumber <= 0 {
+		return false
+	}
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusRunning {
+			continue
+		}
+		if sess.PID <= 0 || o.pidAlive(sess.PID) {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *Orchestrator) supervisorOwnedReadySelectedIssue(s *state.State) (int, bool) {
 	if !o.supervisorOwnsDynamicReadyLabel() || s == nil {
 		return 0, false
@@ -2987,8 +3002,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	started := 0
 	for _, issue := range issues {
 		repairSpawn := o.supervisorSelectedRepairSpawn(s, issue.Number)
-		if s.IssueInProgress(issue.Number) && !repairSpawn {
-			continue
+		if s.IssueInProgress(issue.Number) {
+			if !repairSpawn {
+				continue
+			}
+			if o.issueHasLiveRunningSession(s, issue.Number) {
+				log.Printf("[orch] skipping issue #%d: supervisor selected repair, but a worker is already running for this issue", issue.Number)
+				continue
+			}
 		}
 		if s.IssueDone(issue.Number) {
 			closed, err := o.isIssueClosed(issue.Number)
