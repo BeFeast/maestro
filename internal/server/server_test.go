@@ -182,6 +182,56 @@ func TestHandleState(t *testing.T) {
 	}
 }
 
+func TestHandleStateProjectBlockedDisplaysDeadWorkerAsBlocked(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{Repo: "test/repo", MaxParallel: 1, StateDir: dir}
+	now := time.Now().UTC()
+	finished := now.Add(-2 * time.Minute)
+
+	st := state.NewState()
+	st.Sessions["slot-blocked"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "Blocked issue",
+		Status:      state.StatusDead,
+		Backend:     "claude",
+		StartedAt:   now.Add(-5 * time.Minute),
+		FinishedAt:  &finished,
+	}
+	st.MarkProjectStatusSynced(42, "blocked", now)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save test state: %v", err)
+	}
+
+	srv := New(cfg, make(chan struct{}, 1))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.handleState(w, req)
+
+	var resp stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := resp.Summary["blocked"]; got != 1 {
+		t.Fatalf("blocked summary = %d, want 1; summary=%v", got, resp.Summary)
+	}
+	if got := resp.Summary["dead"]; got != 0 {
+		t.Fatalf("dead summary = %d, want 0; summary=%v", got, resp.Summary)
+	}
+	if len(resp.All) != 1 {
+		t.Fatalf("all sessions = %d, want 1", len(resp.All))
+	}
+	worker := resp.All[0]
+	if worker.Status != string(state.StatusDead) || worker.DisplayStatus != "blocked" {
+		t.Fatalf("status/display = %q/%q, want dead/blocked", worker.Status, worker.DisplayStatus)
+	}
+	if worker.NeedsAttention || worker.Live {
+		t.Fatalf("blocked worker attention/live = %v/%v, want false/false", worker.NeedsAttention, worker.Live)
+	}
+	if !contains(worker.StatusReason, "blocked in GitHub Project") {
+		t.Fatalf("status_reason = %q, want project blocked explanation", worker.StatusReason)
+	}
+}
+
 func TestHandleStateReviewRetryLifecycleDisplay(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
@@ -1109,8 +1159,8 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "status-note") {
 		t.Error("dashboard should include status explanation block")
 	}
-	if !contains(body, "isVerificationAttention") || !contains(body, "pill-verification") || !contains(body, "row-verification") {
-		t.Error("dashboard should render code_landed attention as verification-needed instead of failure-red")
+	if !contains(body, "isVerificationAttention") || !contains(body, "pill-verification") || !contains(body, "s-code_landed.pill-attention") || !contains(body, "row-verification") || !contains(body, "s-blocked") {
+		t.Error("dashboard should render code_landed attention as verification-needed and blocked project issues away from failure-red")
 	}
 	if !contains(body, "supervisor-panel") || !contains(body, "renderSupervisor") {
 		t.Error("dashboard should include supervisor rationale panel")

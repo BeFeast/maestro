@@ -60,11 +60,13 @@ const statusOrder = new Map([
   ["review_retry_pending", 2],
   ["review_retry_backoff", 2],
   ["queued", 2],
-  ["dead", 3],
-  ["failed", 4],
-  ["conflict_failed", 5],
-  ["retry_exhausted", 6],
-  ["done", 7]
+  ["code_landed", 3],
+  ["dead", 4],
+  ["failed", 5],
+  ["conflict_failed", 6],
+  ["retry_exhausted", 7],
+  ["done", 8],
+  ["blocked", 9]
 ]);
 
 const fleetState = {
