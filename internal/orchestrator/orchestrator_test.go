@@ -1941,6 +1941,50 @@ func newCheckSessionsOrchestrator(cfg *config.Config, tmuxOutput string) (*Orche
 	}, &stopped
 }
 
+func TestCheckSessions_TerminalSessionWithOpenBranchPRTransitionsToPROpen(t *testing.T) {
+	cfg := &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 999}
+	cfg.GitHubProjects.Enabled = true
+	cfg.GitHubProjects.ProjectNumber = 4
+	synced := make([]string, 0)
+	o, _ := newCheckSessionsOrchestrator(cfg, "")
+	o.listOpenPRsFn = func() ([]github.PR, error) {
+		return []github.PR{{
+			Number:      832,
+			HeadRefName: "feat/pan-74-808-remove-or-justify-duplicate-settings-ent",
+			State:       "OPEN",
+		}}, nil
+	}
+	o.rateLimitFn = func() (github.RateLimitStatus, error) {
+		return github.RateLimitStatus{GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000}}, nil
+	}
+	o.syncProjectFn = func(issueNumber int, status github.ProjectStatus) bool {
+		synced = append(synced, fmt.Sprintf("#%d:%s", issueNumber, status))
+		return true
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-74"] = &state.Session{
+		IssueNumber: 808,
+		IssueTitle:  "dedupe settings",
+		Status:      state.StatusDead,
+		Branch:      "feat/pan-74-808-remove-or-justify-duplicate-settings-ent",
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-74"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.PRNumber != 832 {
+		t.Fatalf("PRNumber = %d, want 832", sess.PRNumber)
+	}
+	if len(synced) != 1 || synced[0] != "#808:in_review" {
+		t.Fatalf("synced = %v, want #808:in_review", synced)
+	}
+}
+
 func TestCheckSessions_TokenLimitExceeded_KillsWorker(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",
