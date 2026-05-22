@@ -212,7 +212,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
-	if slot, sess, pr, ok := sessionWithOpenPR(st, prs); ok {
+	if slot, sess, pr, ok := e.sessionWithOpenPR(st, prs, cache); ok {
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
@@ -571,7 +571,7 @@ func (e *Engine) decision(st *state.State, now time.Time, ps state.SupervisorPro
 func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.PR, issues, eligible []github.Issue, skipped []string, issuesLoaded bool, cache *resolutionCache) []state.SupervisorStuckState {
 	var findings []state.SupervisorStuckState
 	findings = append(findings, e.detectWorkerStuckStates(st, now, cache)...)
-	findings = append(findings, e.detectPRStuckStates(st, prs)...)
+	findings = append(findings, e.detectPRStuckStates(st, prs, cache)...)
 	if issuesLoaded {
 		findings = append(findings, e.detectQueueStuckStates(st, prs, issues, eligible, skipped)...)
 		findings = append(findings, detectPolicyStuckStates(skipped)...)
@@ -766,7 +766,7 @@ func (e *Engine) staleReviewFeedbackNeedsAttention(sess *state.Session) bool {
 	return true
 }
 
-func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR) []state.SupervisorStuckState {
+func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *resolutionCache) []state.SupervisorStuckState {
 	byNumber := make(map[int]github.PR, len(prs))
 	byBranch := make(map[string]github.PR, len(prs))
 	for _, pr := range prs {
@@ -791,6 +791,9 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR) []state.S
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil {
+			continue
+		}
+		if e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
 		pr, found := openPRForSession(sess, byNumber, byBranch)
@@ -1566,6 +1569,32 @@ func sessionWithOpenPR(st *state.State, prs []github.PR) (string, *state.Session
 	return "", nil, github.PR{}, false
 }
 
+func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool) {
+	branchToPR := make(map[string]github.PR, len(prs))
+	numberToPR := make(map[int]github.PR, len(prs))
+	for _, pr := range prs {
+		branchToPR[pr.HeadRefName] = pr
+		numberToPR[pr.Number] = pr
+	}
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil || e.sessionResolvedOnGitHub(sess, cache) {
+			continue
+		}
+		if sess.Branch != "" {
+			if pr, ok := branchToPR[sess.Branch]; ok {
+				return slot, sess, pr, true
+			}
+		}
+		if sess.PRNumber > 0 {
+			if pr, ok := numberToPR[sess.PRNumber]; ok {
+				return slot, sess, pr, true
+			}
+		}
+	}
+	return "", nil, github.PR{}, false
+}
+
 func runningSession(st *state.State) (string, *state.Session, bool) {
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
@@ -1644,8 +1673,15 @@ func (e *Engine) retryExhaustedSession(st *state.State, cache *resolutionCache) 
 // ignore the stale retry-exhausted session record instead of recommending
 // review or worker spawning for the already-resolved issue.
 func (e *Engine) retryExhaustedSessionResolvedOnGitHub(sess *state.Session, cache *resolutionCache) bool {
+	return e.sessionResolvedOnGitHub(sess, cache)
+}
+
+func (e *Engine) sessionResolvedOnGitHub(sess *state.Session, cache *resolutionCache) bool {
 	if sess == nil {
 		return false
+	}
+	if cache == nil {
+		cache = newResolutionCache(e.reader)
 	}
 	if sess.PRNumber > 0 && cache.isPRMerged(sess.PRNumber) {
 		return true
