@@ -802,6 +802,135 @@ func TestMergeReadyPR_RunsOutcomeVerifierAndMarksDoneOnPass(t *testing.T) {
 	}
 }
 
+func TestReconcileCodeLandedSessionsMarksDoneAfterOutcomePass(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	checked := false
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		outcomeCheckFn: func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+			checked = true
+			return outcome.HealthCheckResult{
+				CheckedAt: time.Now().UTC(),
+				State:     outcome.HealthHealthy,
+				Signal:    "healthcheck_command",
+				Summary:   "live verifier passed",
+			}
+		},
+		isPRMergedFn: func(prNumber int) (bool, error) {
+			return prNumber == 10, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "landed issue",
+		Status:      state.StatusCodeLanded,
+		PRNumber:    10,
+	}
+
+	o.reconcileCodeLandedSessions(s)
+
+	if !checked {
+		t.Fatal("outcome verifier was not run")
+	}
+	if s.OutcomeHealth == nil || s.OutcomeHealth.State != outcome.HealthHealthy {
+		t.Fatalf("OutcomeHealth = %+v, want healthy", s.OutcomeHealth)
+	}
+	if s.Sessions["slot-0"].Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", s.Sessions["slot-0"].Status, state.StatusDone)
+	}
+}
+
+func TestReconcileCodeLandedSessionsKeepsCodeLandedWhenOutcomeFails(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		outcomeCheckFn: func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+			return outcome.HealthCheckResult{
+				CheckedAt: time.Now().UTC(),
+				State:     outcome.HealthFailing,
+				Signal:    "healthcheck_command",
+				Summary:   "live verifier failed",
+			}
+		},
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "landed issue",
+		Status:      state.StatusCodeLanded,
+		PRNumber:    10,
+	}
+
+	o.reconcileCodeLandedSessions(s)
+
+	if s.Sessions["slot-0"].Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q", s.Sessions["slot-0"].Status, state.StatusCodeLanded)
+	}
+}
+
+func TestReconcileCodeLandedSessionsClosesIssueWhenPolicyAllows(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Supervisor: config.SupervisorConfig{
+			SafeActions: []string{config.SupervisorActionCloseIssue},
+		},
+	}
+	closedIssue := 0
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		isPRMergedFn: func(prNumber int) (bool, error) {
+			return prNumber == 10, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			closedIssue = number
+			if !strings.Contains(comment, "PR #10") {
+				t.Fatalf("close comment = %q, want PR reference", comment)
+			}
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "landed issue",
+		Status:      state.StatusCodeLanded,
+		PRNumber:    10,
+	}
+
+	o.reconcileCodeLandedSessions(s)
+
+	if s.Sessions["slot-0"].Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", s.Sessions["slot-0"].Status, state.StatusDone)
+	}
+	if closedIssue != 42 {
+		t.Fatalf("closed issue = %d, want 42", closedIssue)
+	}
+}
+
 func TestMergeReadyPR_KeepsCodeLandedWhenOutcomeVerifierFails(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
@@ -3053,6 +3182,38 @@ func TestStartNewWorkers_RecordsProjectStatusSyncOnStart(t *testing.T) {
 	}
 	if !s.ProjectStatusSynced(347, string(github.ProjectStatusInProgress)) {
 		t.Fatal("startNewWorkers did not record project status sync")
+	}
+}
+
+func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	issues := []github.Issue{makeIssue(767, "repair stale PR")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 767, nil
+	}
+
+	s := state.NewState()
+	s.Sessions["pan-12"] = &state.Session{
+		IssueNumber: 767,
+		IssueTitle:  "repair stale PR",
+		Status:      state.StatusPROpen,
+		PRNumber:    769,
+		Branch:      "codex/old-pr",
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 767, PR: 769, Session: "pan-12"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 || (*started)[0] != 767 {
+		t.Fatalf("started = %v, want [767] for supervisor-selected repair", *started)
 	}
 }
 

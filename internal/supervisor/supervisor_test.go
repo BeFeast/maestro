@@ -872,6 +872,35 @@ func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
 	}
 }
 
+func TestDecide_IgnoresOpenPRWhenIssueAlreadyClosed(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		prs:          []github.PR{{Number: 769, HeadRefName: "codex/old-pr", IsDraft: true, State: "OPEN"}},
+		closedIssues: map[int]bool{767: true},
+	}
+	st := state.NewState()
+	st.Sessions["pan-12"] = &state.Session{
+		IssueNumber: 767,
+		IssueTitle:  "already closed",
+		Status:      state.StatusPROpen,
+		PRNumber:    769,
+		Branch:      "codex/old-pr",
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction == ActionSpawnRepairWorker || decision.RecommendedAction == ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want no open-PR work for closed issue", decision.RecommendedAction)
+	}
+	for _, stuck := range decision.StuckStates {
+		if stuck.Target != nil && stuck.Target.Issue == 767 {
+			t.Fatalf("stuck state targets closed issue: %+v", stuck)
+		}
+	}
+}
+
 func TestDecideDeterministic_OutcomeUsesStateMergeHistory(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Outcome = outcome.Brief{

@@ -1004,6 +1004,11 @@ func (o *Orchestrator) RunOnce() error {
 	// Step 3: Auto-merge green PRs
 	o.autoMergePRs(s)
 
+	// Step 3b: Reconcile already-landed code with the live outcome gate. This
+	// covers sessions that reached code_landed before the verifier was available
+	// or where the verifier passed on a later cycle.
+	o.reconcileCodeLandedSessions(s)
+
 	// Step 4: Rebase conflicting PRs
 	o.rebaseConflicts(s)
 
@@ -2180,6 +2185,125 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
 	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+	o.closeVerifiedIssueIfAllowed(sess, prNumber)
+}
+
+func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
+	if o == nil || o.cfg == nil || s == nil {
+		return
+	}
+
+	codeLanded := make([]*state.Session, 0)
+	for _, slotName := range sortedStateSessionNames(s) {
+		sess := s.Sessions[slotName]
+		if sess != nil && sess.Status == state.StatusCodeLanded {
+			codeLanded = append(codeLanded, sess)
+		}
+	}
+	if len(codeLanded) == 0 {
+		return
+	}
+
+	if o.cfg.Outcome.PassRequiredForDoneEnabled() {
+		if !o.cfg.Outcome.HasHealthSignal() {
+			log.Printf("[orch] %d code_landed session(s) need outcome verification, but no health signal is configured", len(codeLanded))
+			return
+		}
+		result := o.checkOutcome(context.Background())
+		s.OutcomeHealth = &result
+		if result.State != outcome.HealthHealthy {
+			log.Printf("[orch] code_landed reconcile held: outcome verifier is %s: %s", result.State, result.Summary)
+			for _, sess := range codeLanded {
+				o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
+			}
+			return
+		}
+	}
+
+	for _, sess := range codeLanded {
+		if !o.codeLandedPRMerged(sess) {
+			continue
+		}
+		log.Printf("[orch] code_landed session for issue #%d passed outcome reconciliation; marking done", sess.IssueNumber)
+		o.markDoneAfterOutcomePass(sess, sess.PRNumber)
+	}
+}
+
+func (o *Orchestrator) codeLandedPRMerged(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	if sess.PRNumber > 0 {
+		merged, err := o.isPRMerged(sess.PRNumber)
+		if err != nil {
+			log.Printf("[orch] code_landed reconcile could not check PR #%d: %v", sess.PRNumber, err)
+			return false
+		}
+		if !merged {
+			log.Printf("[orch] code_landed session for issue #%d records PR #%d, but GitHub does not report it merged", sess.IssueNumber, sess.PRNumber)
+			return false
+		}
+		return true
+	}
+	merged, err := o.hasMergedPRForIssue(sess.IssueNumber)
+	if err != nil {
+		log.Printf("[orch] code_landed reconcile could not check merged PR for issue #%d: %v", sess.IssueNumber, err)
+		return false
+	}
+	return merged
+}
+
+func (o *Orchestrator) closeVerifiedIssueIfAllowed(sess *state.Session, prNumber int) {
+	if o == nil || o.cfg == nil || sess == nil || sess.IssueNumber <= 0 {
+		return
+	}
+	if !o.supervisorActionAllowed(config.SupervisorActionCloseIssue) || o.supervisorActionRequiresApproval(config.SupervisorActionCloseIssue) {
+		return
+	}
+	closed, err := o.isIssueClosed(sess.IssueNumber)
+	if err != nil {
+		log.Printf("[orch] verified issue #%d was not auto-closed because issue state could not be checked: %v", sess.IssueNumber, err)
+		return
+	}
+	if closed {
+		return
+	}
+	comment := "Maestro verified the configured runtime outcome after code landed; closing this issue as done."
+	if prNumber > 0 {
+		comment = fmt.Sprintf("Maestro verified the configured runtime outcome after PR #%d landed; closing this issue as done.", prNumber)
+	}
+	if err := o.closeIssue(sess.IssueNumber, comment); err != nil {
+		log.Printf("[orch] verified issue #%d was not auto-closed: %v", sess.IssueNumber, err)
+		if o.notifier != nil {
+			o.notifier.Sendf("⚠️ maestro: verified issue #%d is done but auto-close failed: %v", sess.IssueNumber, err)
+		}
+		return
+	}
+	if o.notifier != nil {
+		o.notifier.Sendf("✅ maestro: closed verified issue #%d after code_landed outcome pass", sess.IssueNumber)
+	}
+}
+
+func (o *Orchestrator) supervisorActionAllowed(action string) bool {
+	return o != nil && o.cfg != nil && o.cfg.Supervisor.AllowsSafeAction(action)
+}
+
+func (o *Orchestrator) supervisorActionRequiresApproval(action string) bool {
+	if o == nil || o.cfg == nil {
+		return true
+	}
+	action = strings.TrimSpace(action)
+	for _, configured := range o.cfg.Supervisor.ApprovalRequired {
+		if strings.TrimSpace(configured) == action {
+			return true
+		}
+	}
+	for _, configured := range o.cfg.Supervisor.ApprovalRequiredActions {
+		if strings.TrimSpace(configured) == action {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session, trigger string) bool {
@@ -2862,7 +2986,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 	started := 0
 	for _, issue := range issues {
-		if s.IssueInProgress(issue.Number) {
+		repairSpawn := o.supervisorSelectedRepairSpawn(s, issue.Number)
+		if s.IssueInProgress(issue.Number) && !repairSpawn {
 			continue
 		}
 		if s.IssueDone(issue.Number) {
@@ -2895,7 +3020,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if o.cfg.MaxRetriesPerIssue > 0 {
 			failed := s.FailedAttemptsForIssue(issue.Number)
 			if failed >= o.cfg.MaxRetriesPerIssue {
-				if o.supervisorSelectedRepairSpawn(s, issue.Number) {
+				if repairSpawn {
 					log.Printf("[orch] allowing repair worker for issue #%d despite retry limit because supervisor selected spawn_repair_worker", issue.Number)
 				} else {
 					if !s.IssueRetryExhausted(issue.Number) {
@@ -2938,7 +3063,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if hasOpenPR, err := o.hasOpenPRForIssue(issue.Number); err != nil {
 			log.Printf("[orch] warn: could not check open PRs for issue #%d: %v", issue.Number, err)
 		} else if hasOpenPR {
-			if !o.supervisorSelectedRepairSpawn(s, issue.Number) {
+			if !repairSpawn {
 				log.Printf("[orch] skipping issue #%d: open PR already exists", issue.Number)
 				continue
 			}
