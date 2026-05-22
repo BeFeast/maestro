@@ -3217,6 +3217,40 @@ func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testi
 	}
 }
 
+func TestStartNewWorkers_SupervisorRepairSpawnDoesNotDuplicateRunningWorker(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	issues := []github.Issue{makeIssue(808, "repair retry exhausted")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.pidAliveFn = func(pid int) bool { return pid == 5555 }
+
+	s := state.NewState()
+	s.Sessions["pan-74"] = &state.Session{
+		IssueNumber: 808,
+		IssueTitle:  "repair retry exhausted",
+		Status:      state.StatusRunning,
+		PID:         5555,
+	}
+	s.Sessions["pan-72"] = &state.Session{
+		IssueNumber: 808,
+		IssueTitle:  "repair retry exhausted",
+		Status:      state.StatusRetryExhausted,
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 808, Session: "pan-72"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want no duplicate worker while pan-74 is running", *started)
+	}
+}
+
 func TestStartNewWorkers_SupervisorOwnedReadyLabelStartsOnlySelectedCandidate(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
 	cfg.IssueLabels = []string{"maestro-ready"}
