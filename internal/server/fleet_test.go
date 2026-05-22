@@ -2128,6 +2128,8 @@ func TestFleetDashboard(t *testing.T) {
 		"isVerificationAttention",
 		"verification-attention",
 		"row-verification",
+		"s-code_landed.attention",
+		"s-blocked",
 		"if (!Array.isArray(data.attention) && Array.isArray(data.workers))",
 		"No projects need attention right now",
 		"renderProjectRail",

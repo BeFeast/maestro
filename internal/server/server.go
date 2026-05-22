@@ -556,6 +556,7 @@ func allSessionInfos(repo string, st *state.State) []sessionInfo {
 		infos = append(infos, makeSessionInfo(repo, slot, sess))
 	}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
+	applyProjectStatusDisplay(infos, st)
 	sort.Slice(infos, func(i, j int) bool {
 		left, right := infos[i], infos[j]
 		li := state.StatusPriority(state.SessionStatus(left.Status))
@@ -569,6 +570,35 @@ func allSessionInfos(repo string, st *state.State) []sessionInfo {
 		return left.Slot < right.Slot
 	})
 	return infos
+}
+
+func applyProjectStatusDisplay(infos []sessionInfo, st *state.State) {
+	if st == nil || len(st.ProjectStatusSync) == 0 {
+		return
+	}
+	for i := range infos {
+		record, ok := st.ProjectStatusSync[infos[i].IssueNumber]
+		if !ok || strings.TrimSpace(record.Status) != "blocked" {
+			continue
+		}
+		if !projectBlockedOverridesWorkerStatus(infos[i].Status) {
+			continue
+		}
+		infos[i].DisplayStatus = "blocked"
+		infos[i].NeedsAttention = false
+		infos[i].Live = false
+		infos[i].StatusReason = "Issue is blocked in GitHub Project; this previous worker attempt is not active work."
+		infos[i].NextAction = "Unblock the issue or move it to a runnable project status before starting new work."
+	}
+}
+
+func projectBlockedOverridesWorkerStatus(status string) bool {
+	switch state.SessionStatus(status) {
+	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return true
+	default:
+		return false
+	}
 }
 
 func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecision) {
