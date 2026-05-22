@@ -1412,6 +1412,19 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	for slotName, sess := range s.Sessions {
 		switch sess.Status {
 		case state.StatusDone, state.StatusCodeLanded, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
+			if sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded && prErr == nil {
+				if pr, found := branchToPR[sess.Branch]; found {
+					log.Printf("[orch] session %s %s->pr_open (PR #%d now open for branch %q)", slotName, sess.Status, pr.Number, sess.Branch)
+					sess.Status = state.StatusPROpen
+					sess.PRNumber = pr.Number
+					sess.PID = 0
+					sess.TmuxSession = ""
+					now := time.Now().UTC()
+					sess.FinishedAt = &now
+					o.syncProject(sess.IssueNumber, github.ProjectStatusInReview)
+					continue
+				}
+			}
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
 			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).
