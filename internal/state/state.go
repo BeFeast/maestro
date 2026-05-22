@@ -42,6 +42,47 @@ const (
 
 const RetryReasonReviewFeedback = "review_feedback"
 
+const (
+	BackendHealthAvailable = "available"
+	BackendHealthCooldown  = "cooldown"
+
+	BackendBlockProviderLimit = "provider_limit"
+	BackendBlockDisabled      = "disabled"
+	BackendBlockAlreadyTried  = "already_tried"
+	BackendBlockCurrent       = "current_backend"
+	BackendBlockUnknown       = "unknown_backend"
+)
+
+// BackendHealth records cross-session availability for a configured backend.
+type BackendHealth struct {
+	State       string     `json:"state"`
+	Reason      string     `json:"reason,omitempty"`
+	Pattern     string     `json:"pattern,omitempty"`
+	Since       time.Time  `json:"since,omitempty"`
+	RetryAfter  *time.Time `json:"retry_after,omitempty"`
+	LastSession string     `json:"last_session,omitempty"`
+}
+
+// BackendCandidate explains why one backend was or was not selectable.
+type BackendCandidate struct {
+	Backend    string  `json:"backend"`
+	Available  bool    `json:"available"`
+	BlockedBy  string  `json:"blocked_by,omitempty"`
+	RetryAfter string  `json:"retry_after,omitempty"`
+	Fit        float64 `json:"fit,omitempty"`
+	Policy     float64 `json:"policy,omitempty"`
+	Final      float64 `json:"final,omitempty"`
+}
+
+// BackendSelection is an audit record for worker backend choice.
+type BackendSelection struct {
+	SelectedBackend string             `json:"selected_backend,omitempty"`
+	SelectionReason string             `json:"selection_reason"`
+	CandidateScores []BackendCandidate `json:"candidate_scores,omitempty"`
+	HardPin         bool               `json:"hard_pin,omitempty"`
+	PreviousBackend string             `json:"previous_backend,omitempty"`
+}
+
 // Phase represents which pipeline phase a session is currently in.
 type Phase string
 
@@ -53,39 +94,42 @@ const (
 )
 
 type Session struct {
-	IssueNumber                 int           `json:"issue_number"`
-	IssueTitle                  string        `json:"issue_title"`
-	Worktree                    string        `json:"worktree"`
-	Branch                      string        `json:"branch"`
-	PID                         int           `json:"pid"`
-	TmuxSession                 string        `json:"tmux_session,omitempty"`
-	LogFile                     string        `json:"log_file"`
-	StartedAt                   time.Time     `json:"started_at"`
-	FinishedAt                  *time.Time    `json:"finished_at,omitempty"`
-	Status                      SessionStatus `json:"status"`
-	PRNumber                    int           `json:"pr_number,omitempty"`
-	Backend                     string        `json:"backend,omitempty"` // "claude", "codex", etc.
-	LongRunning                 bool          `json:"long_running,omitempty"`
-	RebaseAttempted             bool          `json:"rebase_attempted,omitempty"`
-	NotifiedCIFail              bool          `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
-	LastNotifiedStatus          string        `json:"last_notified_status,omitempty"` // dedup: last notification type sent
-	RetryCount                  int           `json:"retry_count,omitempty"`          // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
-	NextRetryAt                 *time.Time    `json:"next_retry_at,omitempty"`
-	LastOutputHash              string        `json:"last_output_hash,omitempty"`
-	LastOutputChangedAt         time.Time     `json:"last_output_changed_at,omitempty"`
-	TokensUsedAttempt           int           `json:"tokens_used_attempt,omitempty"`            // tokens consumed in current attempt (reset on respawn)
-	TokensUsedTotal             int           `json:"tokens_used_total,omitempty"`              // cumulative tokens across the issue lifecycle
-	RateLimitHit                bool          `json:"rate_limit_hit,omitempty"`                 // true if worker was rate-limited (tmux detection, running worker)
-	TriedBackends               []string      `json:"tried_backends,omitempty"`                 // backends already attempted (for rate-limit fallback)
-	Phase                       Phase         `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
-	ValidationFails             int           `json:"validation_fails,omitempty"`               // number of failed validation attempts
-	ValidationFeedback          string        `json:"validation_feedback,omitempty"`            // feedback from last failed validation
-	CIFailureOutput             string        `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)
-	PreviousAttemptFeedback     string        `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
-	PreviousAttemptFeedbackKind string        `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
-	RetryReason                 string        `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
-	CheckpointFile              string        `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
-	DeploymentFinishedAt        *time.Time    `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
+	IssueNumber                 int               `json:"issue_number"`
+	IssueTitle                  string            `json:"issue_title"`
+	Worktree                    string            `json:"worktree"`
+	Branch                      string            `json:"branch"`
+	PID                         int               `json:"pid"`
+	TmuxSession                 string            `json:"tmux_session,omitempty"`
+	LogFile                     string            `json:"log_file"`
+	StartedAt                   time.Time         `json:"started_at"`
+	FinishedAt                  *time.Time        `json:"finished_at,omitempty"`
+	Status                      SessionStatus     `json:"status"`
+	PRNumber                    int               `json:"pr_number,omitempty"`
+	Backend                     string            `json:"backend,omitempty"` // "claude", "codex", etc.
+	LongRunning                 bool              `json:"long_running,omitempty"`
+	RebaseAttempted             bool              `json:"rebase_attempted,omitempty"`
+	NotifiedCIFail              bool              `json:"notified_ci_fail,omitempty"`     // deprecated: use LastNotifiedStatus
+	LastNotifiedStatus          string            `json:"last_notified_status,omitempty"` // dedup: last notification type sent
+	RetryCount                  int               `json:"retry_count,omitempty"`          // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
+	NextRetryAt                 *time.Time        `json:"next_retry_at,omitempty"`
+	LastOutputHash              string            `json:"last_output_hash,omitempty"`
+	LastOutputChangedAt         time.Time         `json:"last_output_changed_at,omitempty"`
+	TokensUsedAttempt           int               `json:"tokens_used_attempt,omitempty"`            // tokens consumed in current attempt (reset on respawn)
+	TokensUsedTotal             int               `json:"tokens_used_total,omitempty"`              // cumulative tokens across the issue lifecycle
+	RateLimitHit                bool              `json:"rate_limit_hit,omitempty"`                 // true if worker was rate-limited (tmux detection, running worker)
+	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for rate-limit fallback)
+	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit
+	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // provider limit signature or class
+	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
+	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
+	ValidationFails             int               `json:"validation_fails,omitempty"`               // number of failed validation attempts
+	ValidationFeedback          string            `json:"validation_feedback,omitempty"`            // feedback from last failed validation
+	CIFailureOutput             string            `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)
+	PreviousAttemptFeedback     string            `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
+	PreviousAttemptFeedbackKind string            `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
+	RetryReason                 string            `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
+	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
+	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
 }
 
 // SessionAttention explains why a session needs operator attention and the
@@ -164,6 +208,17 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 			return SessionAttention{
 				Reason:         "Worker exited; a retry is scheduled after the current backoff.",
 				NextAction:     "Wait for the scheduled retry or inspect the failed attempt if it should not retry.",
+				NeedsAttention: true,
+			}
+		}
+		if sess.RateLimitHit {
+			backend := sess.ProviderLimitBackend
+			if backend == "" {
+				backend = sess.Backend
+			}
+			return SessionAttention{
+				Reason:         fmt.Sprintf("Backend %s hit a provider capacity limit; no fallback backend is currently available or allowed.", backend),
+				NextAction:     "Wait for provider capacity to recover, enable another backend, or change routing policy before retrying.",
 				NeedsAttention: true,
 			}
 		}
@@ -564,6 +619,7 @@ type State struct {
 	SupervisorDecisions []SupervisorDecision       `json:"supervisor_decisions,omitempty"`
 	Approvals           []Approval                 `json:"approvals,omitempty"`
 	OutcomeHealth       *outcome.HealthCheckResult `json:"outcome_health,omitempty"`
+	BackendHealth       map[string]BackendHealth   `json:"backend_health,omitempty"`
 	ProjectStatusSync   map[int]ProjectStatusSync  `json:"project_status_sync,omitempty"`
 	NextSlot            int                        `json:"next_slot"`
 	LastMergeAt         time.Time                  `json:"last_merge_at,omitempty"`
@@ -582,6 +638,7 @@ func NewState() *State {
 		Sessions:          make(map[string]*Session),
 		Missions:          make(map[int]*Mission),
 		ProjectStatusSync: make(map[int]ProjectStatusSync),
+		BackendHealth:     make(map[string]BackendHealth),
 		NextSlot:          1,
 	}
 }
@@ -744,6 +801,9 @@ func (s *State) normalize() {
 	if s.ProjectStatusSync == nil {
 		s.ProjectStatusSync = make(map[int]ProjectStatusSync)
 	}
+	if s.BackendHealth == nil {
+		s.BackendHealth = make(map[string]BackendHealth)
+	}
 	if s.NextSlot == 0 {
 		s.NextSlot = 1
 	}
@@ -756,6 +816,7 @@ func (s *State) copyFrom(src *State) {
 	s.Approvals = src.Approvals
 	s.OutcomeHealth = src.OutcomeHealth
 	s.ProjectStatusSync = src.ProjectStatusSync
+	s.BackendHealth = src.BackendHealth
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
 }
@@ -796,6 +857,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	}
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
+	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	return merged, nil
@@ -820,6 +882,42 @@ func mergeProjectStatusSync(current, ours map[int]ProjectStatusSync) map[int]Pro
 		}
 	}
 	return merged
+}
+
+func mergeBackendHealth(current, ours map[string]BackendHealth) map[string]BackendHealth {
+	merged := make(map[string]BackendHealth)
+	for _, key := range unionBackendHealthKeys(current, ours) {
+		currentValue, currentOK := current[key]
+		oursValue, oursOK := ours[key]
+		switch {
+		case currentOK && oursOK:
+			if oursValue.Since.After(currentValue.Since) {
+				merged[key] = oursValue
+			} else {
+				merged[key] = currentValue
+			}
+		case currentOK:
+			merged[key] = currentValue
+		case oursOK:
+			merged[key] = oursValue
+		}
+	}
+	return merged
+}
+
+func unionBackendHealthKeys(maps ...map[string]BackendHealth) []string {
+	seen := make(map[string]struct{})
+	for _, m := range maps {
+		for k := range m {
+			seen[k] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func unionProjectStatusSyncKeys(maps ...map[int]ProjectStatusSync) []int {

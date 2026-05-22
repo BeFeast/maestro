@@ -4087,6 +4087,104 @@ func TestCheckSessions_RateLimitDetected_WithFallback_Respawns(t *testing.T) {
 	}
 }
 
+func TestCheckSessions_RateLimitDetected_DefaultBackendFallback_Respawns(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default: "codex",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+	}
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today.")
+
+	s := state.NewState()
+	s.Sessions["mae-default"] = &state.Session{
+		IssueNumber: 142,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         4242,
+		TmuxSession: "maestro-mae-default",
+		Branch:      "feat/mae-default-142-test",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-default"]
+	if len(*stopped) != 1 || (*stopped)[0] != "mae-default" {
+		t.Fatalf("stopped = %v, want [mae-default]", *stopped)
+	}
+	if len(*respawned) != 1 || (*respawned)[0][1] != "codex" {
+		t.Fatalf("respawned = %v, want fallback to codex", *respawned)
+	}
+	if sess.Backend != "codex" || sess.Status != state.StatusRunning {
+		t.Fatalf("session backend/status = %q/%q, want codex/running", sess.Backend, sess.Status)
+	}
+	if sess.ProviderLimitBackend != "claude" || sess.ProviderLimitReason == "" {
+		t.Fatalf("provider limit = %q/%q, want claude with reason", sess.ProviderLimitBackend, sess.ProviderLimitReason)
+	}
+	if health := s.BackendHealth["claude"]; health.State != state.BackendHealthCooldown || health.Reason != state.BackendBlockProviderLimit {
+		t.Fatalf("claude health = %+v, want provider-limit cooldown", health)
+	}
+	if sess.BackendSelection == nil {
+		t.Fatal("backend selection should be recorded")
+	}
+	if sess.BackendSelection.SelectedBackend != "codex" || sess.BackendSelection.SelectionReason != selectionReasonProviderLimitFallback {
+		t.Fatalf("selection = %+v, want codex provider-limit fallback", sess.BackendSelection)
+	}
+}
+
+func TestCheckSessions_RateLimitDetected_NoAvailableFallback_RecordsSelection(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+			},
+		},
+	}
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today.")
+
+	s := state.NewState()
+	s.Sessions["mae-none"] = &state.Session{
+		IssueNumber: 143,
+		IssueTitle:  "test issue",
+		Status:      state.StatusRunning,
+		PID:         4343,
+		TmuxSession: "maestro-mae-none",
+		Branch:      "feat/mae-none-143-test",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-none"]
+	if len(*stopped) != 1 || (*stopped)[0] != "mae-none" {
+		t.Fatalf("stopped = %v, want [mae-none]", *stopped)
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want no fallback", *respawned)
+	}
+	if sess.Status != state.StatusDead || sess.LastNotifiedStatus != "rate_limit" {
+		t.Fatalf("session status/notification = %q/%q, want dead/rate_limit", sess.Status, sess.LastNotifiedStatus)
+	}
+	if sess.BackendSelection == nil || sess.BackendSelection.SelectedBackend != "" {
+		t.Fatalf("selection = %+v, want no selected backend", sess.BackendSelection)
+	}
+	attention := state.SessionAttentionFor(sess, nil)
+	if !attention.NeedsAttention || !strings.Contains(attention.Reason, "provider capacity limit") {
+		t.Fatalf("attention = %+v, want provider capacity attention", attention)
+	}
+}
+
 func TestCheckSessions_RateLimitDetected_AlreadyOnFallback_MarksDead(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",
@@ -4347,18 +4445,21 @@ func TestCheckSessions_RateLimitNoFallbackAvailable_NormalRetry(t *testing.T) {
 	o.checkSessions(s)
 
 	sess2 := s.Sessions["mae-1"]
-	// Should schedule retry with backoff (not immediate respawn)
+	// Provider capacity is not a code failure; it should not consume normal retry budget.
 	if sess2.Status != state.StatusDead {
-		t.Fatalf("status = %q, want %q (should schedule backoff)", sess2.Status, state.StatusDead)
+		t.Fatalf("status = %q, want %q", sess2.Status, state.StatusDead)
 	}
-	if sess2.NextRetryAt == nil {
-		t.Fatal("NextRetryAt should be set for scheduled retry")
+	if sess2.NextRetryAt != nil {
+		t.Fatal("NextRetryAt should not be set for provider-capacity exhaustion")
 	}
 	if len(*respawned) != 0 {
-		t.Fatalf("respawned = %v, want [] (retry is scheduled, not immediate)", *respawned)
+		t.Fatalf("respawned = %v, want []", *respawned)
 	}
-	if sess2.RetryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
+	if sess2.RetryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0", sess2.RetryCount)
+	}
+	if sess2.LastNotifiedStatus != "rate_limit" {
+		t.Fatalf("last_notified_status = %q, want rate_limit", sess2.LastNotifiedStatus)
 	}
 }
 
@@ -4400,7 +4501,7 @@ func TestCheckSessions_NoRateLimit_NormalRetry(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_RateLimitNoFallbackConfigured_NormalRetry(t *testing.T) {
+func TestCheckSessions_RateLimitNoFallbackConfigured_UsesDefaultFallback(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex")
 	// No fallback_backends configured
 	cfg.MaxRuntimeMinutes = 999
@@ -4423,18 +4524,17 @@ func TestCheckSessions_RateLimitNoFallbackConfigured_NormalRetry(t *testing.T) {
 	o.checkSessions(s)
 
 	sess2 := s.Sessions["mae-1"]
-	// No fallback backends configured, so should schedule retry with backoff
-	if sess2.Status != state.StatusDead {
-		t.Fatalf("status = %q, want %q (should schedule backoff)", sess2.Status, state.StatusDead)
+	if sess2.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want running after default fallback", sess2.Status)
 	}
-	if sess2.NextRetryAt == nil {
-		t.Fatal("NextRetryAt should be set for scheduled retry")
+	if sess2.Backend != "codex" {
+		t.Fatalf("backend = %q, want codex", sess2.Backend)
 	}
-	if len(*respawned) != 0 {
-		t.Fatalf("respawned = %v, want [] (retry is scheduled, not immediate)", *respawned)
+	if len(*respawned) != 1 || (*respawned)[0] != "codex" {
+		t.Fatalf("respawned = %v, want [codex]", *respawned)
 	}
-	if sess2.RetryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", sess2.RetryCount)
+	if sess2.RetryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0", sess2.RetryCount)
 	}
 }
 
