@@ -1004,13 +1004,19 @@ function statusLabel(worker) {
   return displayStatus(worker);
 }
 
+function isVerificationAttention(worker) {
+  return displayStatus(worker) === "code_landed" && worker.needs_attention;
+}
+
 function statusClass(worker) {
   let cls = "pill s-" + cssToken(displayStatus(worker) || "unknown");
-  if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) cls += " attention";
+  if (isVerificationAttention(worker)) cls += " verification-attention";
+  else if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) cls += " attention";
   return cls;
 }
 
 function rowClass(worker) {
+  if (isVerificationAttention(worker)) return "row-verification";
   if (worker.needs_attention || (worker.status === "running" && worker.alive === false)) return "row-attention";
   const displayed = displayStatus(worker);
   if (worker.status === "running" || displayed === "review_retry_running") return "row-running";
@@ -1954,7 +1960,7 @@ function renderWorkerDetail(data) {
     detailField("Log", worker.has_log ? "recorded" : "not recorded")
   ].join("");
 
-  const noteClass = worker.needs_attention || (worker.status === "running" && worker.alive === false) ? " detail-note attention" : "detail-note";
+  const noteClass = isVerificationAttention(worker) ? " detail-note verification-attention" : (worker.needs_attention || (worker.status === "running" && worker.alive === false) ? " detail-note attention" : "detail-note");
   const reason = workerWhyText(worker) || "Waiting for the next Maestro reconciliation cycle.";
   const logText = log.available ? (log.text || emptyLogText(worker)) : (log.reason || "Log output is unavailable for this session.");
   const logMeta = log.available

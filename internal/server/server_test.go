@@ -1109,6 +1109,9 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "status-note") {
 		t.Error("dashboard should include status explanation block")
 	}
+	if !contains(body, "isVerificationAttention") || !contains(body, "pill-verification") || !contains(body, "row-verification") {
+		t.Error("dashboard should render code_landed attention as verification-needed instead of failure-red")
+	}
 	if !contains(body, "supervisor-panel") || !contains(body, "renderSupervisor") {
 		t.Error("dashboard should include supervisor rationale panel")
 	}
