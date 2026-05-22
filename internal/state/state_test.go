@@ -91,6 +91,54 @@ func TestProjectStatusSynced(t *testing.T) {
 	}
 }
 
+func TestBackendHealthPersistence(t *testing.T) {
+	dir := t.TempDir()
+	since := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+	retryAfter := since.Add(2 * time.Hour)
+
+	s := NewState()
+	s.BackendHealth["claude"] = BackendHealth{
+		State:       BackendHealthCooldown,
+		Reason:      BackendBlockProviderLimit,
+		Pattern:     "limit for today",
+		Since:       since,
+		RetryAfter:  &retryAfter,
+		LastSession: "scr-54",
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	health := loaded.BackendHealth["claude"]
+	if health.State != BackendHealthCooldown || health.Reason != BackendBlockProviderLimit {
+		t.Fatalf("health = %+v, want provider-limit cooldown", health)
+	}
+	if health.RetryAfter == nil || !health.RetryAfter.Equal(retryAfter) {
+		t.Fatalf("retry_after = %v, want %s", health.RetryAfter, retryAfter)
+	}
+}
+
+func TestBackendHealthMergeKeepsLatest(t *testing.T) {
+	base := NewState()
+	current := NewState()
+	ours := NewState()
+	current.BackendHealth["claude"] = BackendHealth{State: BackendHealthCooldown, Reason: BackendBlockProviderLimit, Since: time.Date(2026, 5, 22, 10, 0, 0, 0, time.UTC)}
+	ours.BackendHealth["claude"] = BackendHealth{State: BackendHealthAvailable, Reason: "manual_clear", Since: time.Date(2026, 5, 22, 11, 0, 0, 0, time.UTC)}
+
+	merged, err := mergeStateSnapshots(base, current, ours)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if got := merged.BackendHealth["claude"]; got.State != BackendHealthAvailable || got.Reason != "manual_clear" {
+		t.Fatalf("merged claude health = %+v, want latest ours value", got)
+	}
+}
+
 func TestNotifiedCIFail_OmittedWhenFalse(t *testing.T) {
 	dir := t.TempDir()
 

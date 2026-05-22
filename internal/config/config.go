@@ -24,6 +24,11 @@ type BackendDef struct {
 	Cmd        string   `yaml:"cmd"`
 	ExtraArgs  []string `yaml:"extra_args"`
 	PromptMode string   `yaml:"prompt_mode"` // how to deliver prompt: "arg" (last argument), "stdin" (via stdin), "file" (file path as argument)
+	Enabled    *bool    `yaml:"enabled"`     // nil means enabled for backward compatibility
+}
+
+func (b BackendDef) IsEnabled() bool {
+	return b.Enabled == nil || *b.Enabled
 }
 
 // ModelConfig holds multi-backend configuration.

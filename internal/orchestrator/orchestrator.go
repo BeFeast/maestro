@@ -1514,9 +1514,22 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					sess.PRNumber = pr.Number
 					o.notifier.Sendf("🔀 maestro: worker %s completed, PR #%d open for issue #%d (%s)",
 						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
-				} else if o.isRateLimited(sess.LogFile) && o.nextFallbackBackend(sess) != "" {
-					// Rate-limit detected — try next fallback backend
-					nextBackend := o.nextFallbackBackend(sess)
+				} else if o.isRateLimited(sess.LogFile) {
+					// Provider capacity limit detected — gate this backend and select a fallback.
+					now := time.Now().UTC()
+					o.recordProviderLimit(s, slotName, sess, "log_rate_limit", now)
+					selection := o.selectProviderLimitFallback(s, sess, now)
+					sess.BackendSelection = &selection
+					nextBackend := selection.SelectedBackend
+					if nextBackend == "" {
+						log.Printf("[orch] worker %s (backend=%s) hit provider limit; no fallback backend available", slotName, sess.Backend)
+						sess.Status = state.StatusDead
+						sess.LastNotifiedStatus = "rate_limit"
+						sess.FinishedAt = &now
+						o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit; no fallback backend available",
+							slotName, sess.IssueNumber, sess.IssueTitle)
+						continue
+					}
 					log.Printf("[orch] worker %s (backend=%s) hit rate limit, falling back to %s",
 						slotName, sess.Backend, nextBackend)
 
@@ -1531,7 +1544,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						continue
 					}
 
-					sess.TriedBackends = append(sess.TriedBackends, sess.Backend)
+					previousBackend := sess.Backend
+					if previousBackend != "" {
+						sess.TriedBackends = append(sess.TriedBackends, previousBackend)
+					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
 						log.Printf("[orch] fallback respawn worker %s with %s: %v — marking as failed", slotName, nextBackend, err)
@@ -1544,7 +1560,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
-						slotName, sess.IssueNumber, sess.TriedBackends[len(sess.TriedBackends)-1], nextBackend)
+						slotName, sess.IssueNumber, previousBackend, nextBackend)
 				} else if o.canRetryIssue(s, sess) {
 					// Schedule retry with exponential backoff (respects max_retries_per_issue)
 					sess.RetryCount++
@@ -1616,10 +1632,13 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							if err := o.stopWorker(slotName, sess); err != nil {
 								log.Printf("[orch] warn: could not stop rate-limited worker %s: %v", slotName, err)
 							}
-							sess.RateLimitHit = true
+							now := time.Now().UTC()
+							o.recordProviderLimit(s, slotName, sess, pattern, now)
+							selection := o.selectProviderLimitFallback(s, sess, now)
+							sess.BackendSelection = &selection
 
-							// Attempt fallback: respawn with next fallback backend if configured
-							if fallback := o.nextFallbackBackend(sess); fallback != "" {
+							// Attempt fallback: respawn with the best currently available backend.
+							if fallback := selection.SelectedBackend; fallback != "" {
 								issue, fetchErr := o.getIssue(sess.IssueNumber)
 								if fetchErr != nil {
 									log.Printf("[orch] fetch issue #%d for rate-limit fallback: %v — marking dead", sess.IssueNumber, fetchErr)
@@ -1632,7 +1651,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									continue
 								}
 
-								sess.TriedBackends = append(sess.TriedBackends, sess.Backend)
+								previousBackend := sess.Backend
+								if previousBackend != "" {
+									sess.TriedBackends = append(sess.TriedBackends, previousBackend)
+								}
 								promptBase := o.selectPrompt(issue)
 								if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
 									log.Printf("[orch] rate-limit fallback respawn %s: %v — marking dead", slotName, respawnErr)
@@ -1654,7 +1676,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							// No fallback available — mark dead
 							sess.Status = state.StatusDead
 							sess.LastNotifiedStatus = "rate_limit"
-							now := time.Now().UTC()
+							now = time.Now().UTC()
 							sess.FinishedAt = &now
 							o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); no fallback configured",
 								slotName, sess.IssueNumber, pattern)

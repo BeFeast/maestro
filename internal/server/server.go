@@ -98,23 +98,24 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // stateResponse is the JSON shape for GET /api/v1/state.
 type stateResponse struct {
-	Repo                string                       `json:"repo"`
-	MaxParallel         int                          `json:"max_parallel"`
-	ReadOnly            bool                         `json:"read_only"`
-	Outcome             outcome.Status               `json:"outcome"`
-	Actions             []controlAction              `json:"actions,omitempty"`
-	SupervisorPolicy    config.SupervisorConfig      `json:"supervisor_policy"`
-	All                 []sessionInfo                `json:"all"`
-	Running             []sessionInfo                `json:"running"`
-	PROpen              []sessionInfo                `json:"pr_open"`
-	Queued              []sessionInfo                `json:"queued"`
-	TokenTotals         tokenTotalsInfo              `json:"token_totals"`
-	Summary             map[string]int               `json:"summary"`
-	StuckStates         []state.SupervisorStuckState `json:"stuck_states,omitempty"`
-	Supervisor          supervisorInfo               `json:"supervisor"`
-	SupervisorLatest    *state.SupervisorDecision    `json:"supervisor_latest,omitempty"`
-	SupervisorDecisions []state.SupervisorDecision   `json:"supervisor_decisions,omitempty"`
-	Approvals           []state.Approval             `json:"approvals,omitempty"`
+	Repo                string                         `json:"repo"`
+	MaxParallel         int                            `json:"max_parallel"`
+	ReadOnly            bool                           `json:"read_only"`
+	Outcome             outcome.Status                 `json:"outcome"`
+	Actions             []controlAction                `json:"actions,omitempty"`
+	SupervisorPolicy    config.SupervisorConfig        `json:"supervisor_policy"`
+	All                 []sessionInfo                  `json:"all"`
+	Running             []sessionInfo                  `json:"running"`
+	PROpen              []sessionInfo                  `json:"pr_open"`
+	Queued              []sessionInfo                  `json:"queued"`
+	TokenTotals         tokenTotalsInfo                `json:"token_totals"`
+	Summary             map[string]int                 `json:"summary"`
+	StuckStates         []state.SupervisorStuckState   `json:"stuck_states,omitempty"`
+	Supervisor          supervisorInfo                 `json:"supervisor"`
+	SupervisorLatest    *state.SupervisorDecision      `json:"supervisor_latest,omitempty"`
+	SupervisorDecisions []state.SupervisorDecision     `json:"supervisor_decisions,omitempty"`
+	Approvals           []state.Approval               `json:"approvals,omitempty"`
+	BackendHealth       map[string]state.BackendHealth `json:"backend_health,omitempty"`
 }
 
 type supervisorInfo struct {
@@ -208,35 +209,36 @@ type controlActionRequest struct {
 }
 
 type sessionInfo struct {
-	Slot              string          `json:"slot"`
-	IssueNumber       int             `json:"issue_number"`
-	IssueTitle        string          `json:"issue_title"`
-	IssueURL          string          `json:"issue_url,omitempty"`
-	Status            string          `json:"status"`
-	DisplayStatus     string          `json:"display_status,omitempty"`
-	StatusReason      string          `json:"status_reason,omitempty"`
-	NextAction        string          `json:"next_action,omitempty"`
-	NeedsAttention    bool            `json:"needs_attention,omitempty"`
-	Live              bool            `json:"live"`
-	Backend           string          `json:"backend,omitempty"`
-	PRNumber          int             `json:"pr_number,omitempty"`
-	PRURL             string          `json:"pr_url,omitempty"`
-	TokensUsedAttempt int             `json:"tokens_used_attempt"`
-	TokensUsedTotal   int             `json:"tokens_used_total"`
-	Runtime           string          `json:"runtime"`
-	RuntimeSeconds    int64           `json:"runtime_seconds"`
-	StartedAt         string          `json:"started_at"`
-	FinishedAt        string          `json:"finished_at,omitempty"`
-	NextRetryAt       string          `json:"next_retry_at,omitempty"`
-	PID               int             `json:"pid,omitempty"`
-	Alive             *bool           `json:"alive,omitempty"`
-	Worktree          string          `json:"worktree,omitempty"`
-	Branch            string          `json:"branch,omitempty"`
-	TmuxSession       string          `json:"tmux_session,omitempty"`
-	HasLog            bool            `json:"has_log"`
-	RetryCount        int             `json:"retry_count,omitempty"`
-	LastNotification  string          `json:"last_notification,omitempty"`
-	Actions           []controlAction `json:"actions,omitempty"`
+	Slot              string                  `json:"slot"`
+	IssueNumber       int                     `json:"issue_number"`
+	IssueTitle        string                  `json:"issue_title"`
+	IssueURL          string                  `json:"issue_url,omitempty"`
+	Status            string                  `json:"status"`
+	DisplayStatus     string                  `json:"display_status,omitempty"`
+	StatusReason      string                  `json:"status_reason,omitempty"`
+	NextAction        string                  `json:"next_action,omitempty"`
+	NeedsAttention    bool                    `json:"needs_attention,omitempty"`
+	Live              bool                    `json:"live"`
+	Backend           string                  `json:"backend,omitempty"`
+	PRNumber          int                     `json:"pr_number,omitempty"`
+	PRURL             string                  `json:"pr_url,omitempty"`
+	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
+	TokensUsedTotal   int                     `json:"tokens_used_total"`
+	Runtime           string                  `json:"runtime"`
+	RuntimeSeconds    int64                   `json:"runtime_seconds"`
+	StartedAt         string                  `json:"started_at"`
+	FinishedAt        string                  `json:"finished_at,omitempty"`
+	NextRetryAt       string                  `json:"next_retry_at,omitempty"`
+	PID               int                     `json:"pid,omitempty"`
+	Alive             *bool                   `json:"alive,omitempty"`
+	Worktree          string                  `json:"worktree,omitempty"`
+	Branch            string                  `json:"branch,omitempty"`
+	TmuxSession       string                  `json:"tmux_session,omitempty"`
+	HasLog            bool                    `json:"has_log"`
+	RetryCount        int                     `json:"retry_count,omitempty"`
+	LastNotification  string                  `json:"last_notification,omitempty"`
+	BackendSelection  *state.BackendSelection `json:"backend_selection,omitempty"`
+	Actions           []controlAction         `json:"actions,omitempty"`
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
@@ -259,6 +261,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		HasLog:            strings.TrimSpace(sess.LogFile) != "",
 		RetryCount:        sess.RetryCount,
 		LastNotification:  sess.LastNotifiedStatus,
+		BackendSelection:  sess.BackendSelection,
 		Live:              state.SessionLiveAt(sess, now),
 	}
 
@@ -715,6 +718,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		ReadOnly:            cfg.Server.ReadOnly,
 		Outcome:             outcomeStatusForState(cfg, st),
 		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions", cfg.Repo),
+		BackendHealth:       st.BackendHealth,
 		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
 		Running:             make([]sessionInfo, 0),
