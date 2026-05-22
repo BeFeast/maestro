@@ -209,7 +209,8 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, fmt.Errorf("list open PRs: %w", err)
 	}
 	projectState.OpenPRs = len(prs)
-	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false)
+	cache := newResolutionCache(e.reader)
+	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
 	if slot, sess, pr, ok := sessionWithOpenPR(st, prs); ok {
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
@@ -255,16 +256,18 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return decision, nil
 	}
 
-	if slot, sess, ok := retryExhaustedSession(st); ok && !e.cfg.Supervisor.OrderedQueueActive() {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
-			"Retry-exhausted work requires a human decision before more automation",
-		)
-		decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
-			fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
-			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = stuckStates
-		return decision, nil
+	if !e.cfg.Supervisor.OrderedQueueActive() {
+		if slot, sess, ok := e.retryExhaustedSession(st, cache); ok {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
+				"Retry-exhausted work requires a human decision before more automation",
+			)
+			decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
+				fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
+				RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
+		}
 	}
 
 	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 {
@@ -291,7 +294,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, err
 	}
 	if policyResult.dynamicWave {
-		return e.decideDynamicWave(st, now, projectState, baseReasons, prs, issues, policyResult)
+		return e.decideDynamicWave(st, now, projectState, baseReasons, prs, issues, policyResult, cache)
 	}
 	candidates := policyResult.candidates
 	policySkipped := policyResult.skipped
@@ -301,7 +304,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, err
 	}
 	skipped = append(policySkipped, skipped...)
-	stuckStates = e.detectStuckStates(st, now, prs, issues, eligible, skipped, true)
+	stuckStates = e.detectStuckStates(st, now, prs, issues, eligible, skipped, true, cache)
 	analysis := supervisorQueueAnalysis(policyRule, len(issues), eligible, skipped)
 	withAnalysis := func(decision state.SupervisorDecision) state.SupervisorDecision {
 		decision.QueueAnalysis = analysis
@@ -440,7 +443,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	return withAnalysis(decision), nil
 }
 
-func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult) (state.SupervisorDecision, error) {
+func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult, cache *resolutionCache) (state.SupervisorDecision, error) {
 	candidates := result.candidates
 	analysis := result.analysis
 	outcomeStatus := e.outcomeStatus(st)
@@ -450,7 +453,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			analysis.SelectedCandidate = supervisorIssueCandidate(candidates[0])
 		}
 	}
-	stuckStates := e.detectStuckStates(st, now, prs, issues, candidates, result.skipped, true)
+	stuckStates := e.detectStuckStates(st, now, prs, issues, candidates, result.skipped, true, cache)
 	withAnalysis := func(decision state.SupervisorDecision) state.SupervisorDecision {
 		decision.QueueAnalysis = analysis
 		decision.StuckStates = stuckStates
@@ -565,9 +568,9 @@ func (e *Engine) decision(st *state.State, now time.Time, ps state.SupervisorPro
 	}
 }
 
-func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.PR, issues, eligible []github.Issue, skipped []string, issuesLoaded bool) []state.SupervisorStuckState {
+func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.PR, issues, eligible []github.Issue, skipped []string, issuesLoaded bool, cache *resolutionCache) []state.SupervisorStuckState {
 	var findings []state.SupervisorStuckState
-	findings = append(findings, e.detectWorkerStuckStates(st, now)...)
+	findings = append(findings, e.detectWorkerStuckStates(st, now, cache)...)
 	findings = append(findings, e.detectPRStuckStates(st, prs)...)
 	if issuesLoaded {
 		findings = append(findings, e.detectQueueStuckStates(st, prs, issues, eligible, skipped)...)
@@ -679,7 +682,7 @@ func noOutcomeProgressStuckState(stuckStates []state.SupervisorStuckState) *stat
 	return nil
 }
 
-func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state.SupervisorStuckState {
+func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *resolutionCache) []state.SupervisorStuckState {
 	var findings []state.SupervisorStuckState
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
@@ -726,7 +729,7 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time) []state
 			}
 		}
 
-		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 {
+		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 && !e.retryExhaustedSessionResolvedOnGitHub(sess, cache) {
 			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
@@ -1622,14 +1625,107 @@ func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int)
 	return false
 }
 
-func retryExhaustedSession(st *state.State) (string, *state.Session, bool) {
+func (e *Engine) retryExhaustedSession(st *state.State, cache *resolutionCache) (string, *state.Session, bool) {
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess != nil && sess.Status == state.StatusRetryExhausted {
-			return slot, sess, true
+		if sess == nil || sess.Status != state.StatusRetryExhausted {
+			continue
 		}
+		if e.retryExhaustedSessionResolvedOnGitHub(sess, cache) {
+			continue
+		}
+		return slot, sess, true
 	}
 	return "", nil, false
+}
+
+// retryExhaustedSessionResolvedOnGitHub returns true when the underlying issue
+// is closed or has been resolved by a merged PR, so the supervisor should
+// ignore the stale retry-exhausted session record instead of recommending
+// review or worker spawning for the already-resolved issue.
+func (e *Engine) retryExhaustedSessionResolvedOnGitHub(sess *state.Session, cache *resolutionCache) bool {
+	if sess == nil {
+		return false
+	}
+	if sess.PRNumber > 0 && cache.isPRMerged(sess.PRNumber) {
+		return true
+	}
+	if sess.IssueNumber <= 0 {
+		return false
+	}
+	if cache.isIssueClosed(sess.IssueNumber) {
+		return true
+	}
+	if cache.hasMergedPRForIssue(sess.IssueNumber) {
+		return true
+	}
+	return false
+}
+
+// resolutionCache memoizes the read-only GitHub lookups used to detect that a
+// retry-exhausted session has already been resolved upstream. Within a single
+// supervisor decision cycle the same issue or PR may be inspected from
+// multiple call sites (e.g. detectWorkerStuckStates and retryExhaustedSession);
+// the cache ensures each underlying API call is issued at most once.
+type resolutionCache struct {
+	reader           Reader
+	issueClosed      map[int]bool
+	mergedPRForIssue map[int]bool
+	prMerged         map[int]bool
+}
+
+func newResolutionCache(reader Reader) *resolutionCache {
+	return &resolutionCache{
+		reader:           reader,
+		issueClosed:      make(map[int]bool),
+		mergedPRForIssue: make(map[int]bool),
+		prMerged:         make(map[int]bool),
+	}
+}
+
+func (c *resolutionCache) isIssueClosed(number int) bool {
+	if c == nil || c.reader == nil || number <= 0 {
+		return false
+	}
+	if v, ok := c.issueClosed[number]; ok {
+		return v
+	}
+	closed, err := c.reader.IsIssueClosed(number)
+	if err != nil {
+		return false
+	}
+	c.issueClosed[number] = closed
+	return closed
+}
+
+func (c *resolutionCache) hasMergedPRForIssue(number int) bool {
+	if c == nil || c.reader == nil || number <= 0 {
+		return false
+	}
+	if v, ok := c.mergedPRForIssue[number]; ok {
+		return v
+	}
+	merged, err := c.reader.HasMergedPRForIssue(number)
+	if err != nil {
+		return false
+	}
+	c.mergedPRForIssue[number] = merged
+	return merged
+}
+
+func (c *resolutionCache) isPRMerged(prNumber int) bool {
+	if c == nil || c.reader == nil || prNumber <= 0 {
+		return false
+	}
+	if v, ok := c.prMerged[prNumber]; ok {
+		return v
+	}
+	merged, err := c.reader.IsPRMerged(prNumber)
+	if err != nil {
+		return false
+	}
+	c.prMerged[prNumber] = merged
+	return merged
 }
 
 func sortedSessionNames(st *state.State) []string {
