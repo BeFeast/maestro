@@ -721,6 +721,41 @@ func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T
 	}
 }
 
+func TestDecide_RetryExhaustedReadyIssueSpawnsRepairWorkerEvenWhenProjectBlocked(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
+	reader := &fakeReader{issues: []github.Issue{
+		withProjectStatus(testIssue(808, "duplicate settings entry", "maestro-ready"), "Blocked"),
+	}}
+	st := state.NewState()
+	st.Sessions["pan-72"] = &state.Session{
+		IssueNumber: 808,
+		IssueTitle:  "duplicate settings entry",
+		Status:      state.StatusRetryExhausted,
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnRepairWorker)
+	}
+	if decision.RequiresApproval {
+		t.Fatalf("RequiresApproval = true, want false for policy-allowed repair spawn")
+	}
+	if decision.Target == nil || decision.Target.Issue != 808 || decision.Target.Session != "pan-72" {
+		t.Fatalf("target = %#v, want issue 808 pan-72", decision.Target)
+	}
+	rationale := strings.Join(decision.Reasons, "\n")
+	if !strings.Contains(rationale, "retry_exhausted") || !strings.Contains(rationale, "Blocked") {
+		t.Fatalf("reasons = %q, want retry_exhausted and Blocked rationale", rationale)
+	}
+}
+
 func TestDecide_PRExistsForSessionMonitorsPR(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{prs: []github.PR{{Number: 12, HeadRefName: "mae-1-42-fix", State: "OPEN"}}}
