@@ -283,10 +283,10 @@ func parseCombinedStatus(out []byte) (combinedStatusResponse, error) {
 }
 
 func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse) string {
-	if strings.EqualFold(combined.State, "pending") {
+	if len(combined.Statuses) > 0 && strings.EqualFold(combined.State, "pending") {
 		return "pending"
 	}
-	if strings.EqualFold(combined.State, "failure") || strings.EqualFold(combined.State, "error") {
+	if len(combined.Statuses) > 0 && (strings.EqualFold(combined.State, "failure") || strings.EqualFold(combined.State, "error")) {
 		return "failure"
 	}
 
