@@ -95,23 +95,45 @@ func (r *Router) callModel(prompt string) (string, error) {
 		return "", fmt.Errorf("router backend %q not found in model.backends", backendName)
 	}
 
-	cmdPath := backend.Cmd
-	if cmdPath == "" {
-		cmdPath = backendName
+	cmdSpec := strings.TrimSpace(backend.Cmd)
+	if cmdSpec == "" {
+		cmdSpec = backendName
 	}
 
-	args := []string{"-p", prompt}
-	if r.cfg.Routing.RouterModelName != "" {
+	cmdPath, args := splitRouterCmd(cmdSpec)
+	if cmdPath == "" {
+		return "", fmt.Errorf("router backend %q has empty command", backendName)
+	}
+	args = append(args, backend.ExtraArgs...)
+	args = append(args, "-p", prompt)
+	if r.cfg.Routing.RouterModelName != "" && !hasModelArg(args) {
 		args = append(args, "--model", r.cfg.Routing.RouterModelName)
 	}
 
-	log.Printf("[router] calling %s --model %s", cmdPath, r.cfg.Routing.RouterModelName)
-	out, err := exec.Command(cmdPath, args...).Output()
+	log.Printf("[router] calling %s for backend %s", cmdPath, backendName)
+	out, err := exec.Command(cmdPath, args...).CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("exec %s: %w", cmdPath, err)
+		return "", fmt.Errorf("exec %s: %w\n%s", cmdPath, err, out)
 	}
 
 	return strings.TrimSpace(string(out)), nil
+}
+
+func splitRouterCmd(cmd string) (binary string, prefixArgs []string) {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return "", nil
+	}
+	return parts[0], parts[1:]
+}
+
+func hasModelArg(args []string) bool {
+	for _, arg := range args {
+		if arg == "--model" || arg == "-m" || strings.HasPrefix(arg, "--model=") {
+			return true
+		}
+	}
+	return false
 }
 
 // parseResponse extracts a JSON object from the model output.

@@ -2,6 +2,9 @@ package router
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/befeast/maestro/internal/config"
@@ -289,6 +292,126 @@ func TestResolveBackend_AutoRoutingViaRouteFn(t *testing.T) {
 	if reason != "simple fix" {
 		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "simple fix")
 	}
+}
+
+func TestRoute_UsesBackendCommandPrefixArgs(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args.txt")
+	cliPath := filepath.Join(dir, "router-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\nprintf '{\"backend\":\"gemini\",\"reason\":\"docs task\"}'\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake router cli: %v", err)
+	}
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: cliPath + " --temperature 0"},
+				"gemini": {Cmd: "gemini"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:            "auto",
+			RouterModel:     "claude",
+			RouterModelName: "router-model",
+		},
+	}
+
+	name, reason, err := New(cfg).Route(github.Issue{Number: 47, Title: "Update docs", Body: "Small docs cleanup"})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if name != "gemini" || reason != "docs task" {
+		t.Fatalf("Route() = (%q, %q), want (gemini, docs task)", name, reason)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	args := strings.Split(strings.TrimSpace(string(argsData)), "\n")
+	want := []string{"--temperature", "0", "-p"}
+	if len(args) < len(want) {
+		t.Fatalf("args = %v, want prefix %v", args, want)
+	}
+	for i, arg := range want {
+		if args[i] != arg {
+			t.Fatalf("args[%d] = %q, want %q; all args=%v", i, args[i], arg, args)
+		}
+	}
+	if !containsArgPair(args, "--model", "router-model") {
+		t.Fatalf("args = %v, want router model argument", args)
+	}
+}
+
+func TestRoute_DoesNotAppendRouterModelWhenCommandPinsModel(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args.txt")
+	cliPath := filepath.Join(dir, "router-cli")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellQuote(argsPath) + "\nprintf '{\"backend\":\"codex\",\"reason\":\"implementation\"}'\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake router cli: %v", err)
+	}
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: cliPath + " --model pinned-router --effort high"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:            "auto",
+			RouterModel:     "claude",
+			RouterModelName: "default-router-model",
+		},
+	}
+
+	if _, _, err := New(cfg).Route(github.Issue{Number: 48, Title: "Implement feature"}); err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	args := strings.Split(strings.TrimSpace(string(argsData)), "\n")
+	if countArg(args, "--model") != 1 {
+		t.Fatalf("args = %v, want exactly one --model from backend command", args)
+	}
+	if containsArg(args, "default-router-model") {
+		t.Fatalf("args = %v, router_model_name should not be appended when cmd pins --model", args)
+	}
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsArgPair(args []string, key string, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == key && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func countArg(args []string, want string) int {
+	count := 0
+	for _, arg := range args {
+		if arg == want {
+			count++
+		}
+	}
+	return count
 }
 
 // --- ResolveBackendForRole tests ---
