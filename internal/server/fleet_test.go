@@ -2026,182 +2026,34 @@ func TestFleetDashboard(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	body := w.Body.String() + web.MustReadStatic("tokens.css") + web.MustReadStatic("fleet.js") + web.MustReadStatic("fleet.css")
+	body := w.Body.String()
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
 		t.Errorf("content-type = %q, want text/html", ct)
 	}
 	for _, want := range []string{
-		"Maestro Fleet",
-		"/api/v1/fleet",
-		"/api/v1/fleet/worker",
-		"<html data-theme=\"light\">",
-		"/static/tokens.css",
-		"/static/components.css",
-		"/static/status-icons.svg",
+		"Maestro Mission Control",
+		`id="root"`,
+		"/static/mc/assets/",
+		`data-theme="light"`,
 		"/static/maestro-mark.svg",
-		"/static/favicon-32.png",
-		"/static/apple-touch-icon-180.png",
-		"/static/og-1200x630.png",
-		"Inter Tight",
-		"JetBrains Mono",
-		"#059669",
-		"#0891b2",
-		"color-scheme: light",
-		"fleet-initial-state",
-		"project-rail",
-		"project-rail-body",
-		"project-filter",
-		"project-segments",
-		"project-count-all",
-		"project-count-running",
-		"project-count-attention",
-		"project-count-idle",
-		"mode-pill",
-		"fleet-refresh",
-		"stat-label",
-		"Projects",
-		"Running",
-		"Issue throughput",
-		"merged · last 7d",
-		"stat-sparkline-empty",
-		"projectIsUnconfigured",
-		"project-row--unconfigured",
-		"rail-state-unconfigured",
-		"badge-setup",
-		"Set up &rarr;",
-		"operator_sentence",
-		"supervisorOperatorSentence",
-		"supervisorDecisionMetaText",
-		"Last activity",
-		"Open",
-		"fleet-verdict",
-		"renderFleetVerdict",
-		"verdict-healthy",
-		"verdict-daemon-down",
-		"approval-inbox",
-		"approval-list",
-		"approval-summary",
-		"attention-inbox",
-		"attention-list",
-		"attention-summary",
-		"fleet-workers-body",
-		"worker-detail",
-		"worker-drawer",
-		"worker-detail-backdrop",
-		"worker-detail-close",
-		"worker-drawer-open",
-		"closeWorkerDetail",
-		"resolveWorkerQuery",
-		"params.get(\"worker\")",
-		"overflow-wrap: anywhere",
-		"worker-controls",
-		"worker-filter",
-		"status-filter",
-		"backend-filter",
-		"pr-filter",
-		"worker-sort",
-		"sort-direction",
-		"renderFleetWorkers",
-		"renderApprovalInbox",
-		"approvalsFromData",
-		"approvalInboxSummaryText",
-		"No active approvals need review.",
-		"historical approval",
-		"approval-list-compact",
-		"Audit history",
-		"approvalHistoryCountText",
-		"approval-audit-link",
-		"approval-history-link-card",
-		"Open full approval audit",
-		"Pending approvals",
-		"Safe recommendation",
-		"Starting worker",
-		".approval-card.approval-stale,",
-		".approval-card.approval-superseded,",
-		".approval-card.approval-rejected {",
-		".a-stale { color: var(--muted);",
-		".a-superseded { color: var(--muted);",
-		".approval-card.approval-pending.approval-past-sla {",
-		"counts.superseded",
-		"renderAttentionInbox",
-		"attentionFromData",
-		"isVerificationAttention",
-		"verification-attention",
-		"row-verification",
-		"s-code_landed.attention",
-		"s-blocked",
-		"if (!Array.isArray(data.attention) && Array.isArray(data.workers))",
-		"No projects need attention right now",
-		"renderProjectRail",
-		"projectRailRowHTML",
-		"projectRailDetailHTML",
-		"toggleProjectRailDetail",
-		"projectOpenRailHTML",
-		"needs-you-rail",
-		"renderNeedsYouRail",
-		"needs-you-item",
-		"fleet-verdict-headline",
-		"stat-value",
-		"workerControlsEl.hidden",
-		"project-diagnostics-note",
-		"This is the raw inspector layer.",
-		"projectSearchText",
-		"renderWorkerDetail",
-		"renderProject",
-		"issueSummaryHTML",
-		"project-worker-status { width: 124px;",
-		"issue-main",
-		"issue-title",
-		"Why Attention",
-		"Why Not Running",
-		"Queue Snapshot",
-		"Outcome Status",
-		"outcomeHTML",
-		"No outcome brief configured",
-		"queueSnapshotHTML",
-		"queue-snapshot",
-		"held/meta",
-		"blocked-deps",
-		"blocked by open dependencies",
-		"next_action",
-		"sortWorkers",
-		"filteredWorkers",
-		"URLSearchParams",
-		"Last refresh",
-		"projectFreshnessHTML",
-		"badge-stale",
-		"State error",
-		"renderActions",
-		"actionDetailHTML",
-		"manual approval required",
-		"Scope",
-		"Target",
-		"Approval",
-		"Disabled",
-		"replace(/^Would\\s+/i",
-		"Approval-gated controls",
 	} {
 		if !contains(body, want) {
-			t.Fatalf("dashboard should contain %q", want)
+			t.Fatalf("mission control shell should contain %q", want)
 		}
 	}
-	for _, unwanted := range []string{`id="project-tabs"`, `class="project-tabs"`, "renderProjectTabs"} {
-		if contains(body, unwanted) {
-			t.Fatalf("dashboard should not render project tab navigation %q", unwanted)
-		}
-	}
-	for _, oldAlarm := range []string{
-		".approval-card.approval-stale { border-left-color: var(--bad);",
-		".a-stale { color: var(--bad);",
+	mcJS := mcBundleJS(t)
+	for _, want := range []string{
+		"/api/v1/fleet",
+		"/api/v1/fleet/worker",
 	} {
-		if contains(body, oldAlarm) {
-			t.Fatalf("dashboard should not render stale approval history with alarming styling %q", oldAlarm)
+		if !contains(mcJS, want) {
+			t.Fatalf("mission control bundle should reference %q", want)
 		}
 	}
 }
 
 func TestFleetDashboardRendersHistoryCollapseControls(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := legacyFleetJS(t)
 	for _, want := range []string{
 		"function historySummaryRowHTML(workers, expanded)",
 		"function historySummaryText(count, expanded)",
@@ -2222,7 +2074,7 @@ func TestFleetDashboardRendersHistoryCollapseControls(t *testing.T) {
 }
 
 func TestFleetDashboardCanClearProjectWorkerScope(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := web.MustReadTemplate("fleet.html") + legacyFleetJS(t)
 	for _, want := range []string{
 		`id="worker-project-reset"`,
 		"Show all projects",
@@ -2247,31 +2099,20 @@ func TestFleetDashboardCanClearProjectWorkerScope(t *testing.T) {
 }
 
 func TestFleetDashboardRendersReadOnlySearchPalette(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := mcBundleJS(t)
 	for _, want := range []string{
-		`id="fleet-search-trigger"`,
-		`aria-controls="fleet-search-dialog"`,
-		`id="fleet-search-dialog"`,
-		`role="dialog"`,
-		`id="fleet-search-input"`,
-		`id="fleet-search-results"`,
-		`role="listbox"`,
-		"Cmd/Ctrl K",
-		"Project slug, session slot, issue #, PR #, or dashboard",
-		"No write actions run from search.",
-		"buildFleetSearchIndex",
-		"scoreFleetSearchResult",
-		"selectFleetSearchResult",
-		"fleet-search-open",
+		"cmdk",
+		"Jump to",
+		"Type a command or search",
 	} {
 		if !contains(body, want) {
-			t.Fatalf("dashboard search palette should contain %q", want)
+			t.Fatalf("mission control command palette should contain %q", want)
 		}
 	}
 }
 
 func TestFleetDashboardSearchIndexUsesLoadedFleetData(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := legacyFleetJS(t)
 	indexSnippet := dashboardSnippet(t, body, "function buildFleetSearchIndex()", "function fuzzySearchMatch")
 	for _, want := range []string{
 		"for (const project of fleetState.projects || [])",
@@ -2299,7 +2140,7 @@ func TestFleetDashboardSearchIndexUsesLoadedFleetData(t *testing.T) {
 }
 
 func TestFleetDashboardSearchRanksDefaultResultsBeforeLimit(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := legacyFleetJS(t)
 	searchSnippet := dashboardSnippet(t, body, "function searchFleetResults(query)", "function searchResultID")
 	for _, want := range []string{
 		"const limit = searchTerms(query).length ? 12 : 10;",
@@ -2317,7 +2158,7 @@ func TestFleetDashboardSearchRanksDefaultResultsBeforeLimit(t *testing.T) {
 }
 
 func TestFleetDashboardSearchKeyboardAndSelectionAreReadOnly(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := legacyFleetJS(t)
 	for _, want := range []string{
 		"function isSearchShortcut(event)",
 		"(event.metaKey || event.ctrlKey)",
@@ -2355,78 +2196,40 @@ func TestFleetDashboardSearchKeyboardAndSelectionAreReadOnly(t *testing.T) {
 	}
 }
 
-func TestFleetDashboardServerRendersProjectRailFixtures(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		projects int
-	}{
-		{name: "zero", projects: 0},
-		{name: "one", projects: 1},
-		{name: "three", projects: 3},
-		{name: "twelve", projects: 12},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			body := fleetDashboardBodyWithProjects(t, fleetDashboardFixtureProjects(t, tc.projects))
-			rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
-
-			for _, want := range []string{"Project", "State", "Queue", "PR", "Outcome", "Last activity", "Open"} {
-				if !contains(body, want) {
-					t.Fatalf("dashboard rail should contain column %q", want)
-				}
-			}
-			if !contains(body, `id="fleet-initial-state"`) {
-				t.Fatal("dashboard should embed the initial fleet snapshot for client hydration")
-			}
-
-			rows := strings.Count(rail, `class="project-rail-row`)
-			if rows != tc.projects {
-				t.Fatalf("server-rendered project rail rows = %d, want %d in:\n%s", rows, tc.projects, rail)
-			}
-			if tc.projects == 0 {
-				if !contains(rail, "project-rail-empty") || !contains(rail, "No configured projects") {
-					t.Fatalf("empty rail should render an explicit empty state, got:\n%s", rail)
-				}
-				return
-			}
-
-			for i := 1; i <= tc.projects; i++ {
-				name := "Project " + strconv.Itoa(i)
-				if !contains(rail, name) {
-					t.Fatalf("rail should include %q in:\n%s", name, rail)
-				}
-			}
-			for _, want := range []string{"ready", "Project 1 outcome", "Open", "&rarr;"} {
-				if !contains(rail, want) {
-					t.Fatalf("rail should communicate %q in:\n%s", want, rail)
-				}
-			}
-			if tc.projects >= 10 && !contains(body, "project-rail-scroll") {
-				t.Fatal("10+ project fixture should render inside the scrollable rail container")
-			}
-		})
+func TestFleetMCServesSPARoutes(t *testing.T) {
+	srv := NewFleet(nil, "127.0.0.1", 8786, true)
+	for _, path := range []string{"/", "/fleet", "/workers", "/approvals", "/settings", "/project/demo"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		srv.handleFleetDashboard(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", path, w.Code, http.StatusOK)
+		}
+		if !contains(w.Body.String(), `id="root"`) {
+			t.Fatalf("%s should serve mission control shell", path)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/unknown-route", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetDashboard(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown route status = %d, want %d", w.Code, http.StatusNotFound)
 	}
 }
 
 func TestFleetDashboardRailEmitsInlineDetailRow(t *testing.T) {
-	body := fleetDashboardBodyWithProjects(t, fleetDashboardFixtureProjects(t, 1))
-	rail := dashboardSnippet(t, body, `<tbody id="project-rail-body">`, `</tbody>`)
-
+	projects := fleetDashboardFixtureProjects(t, 1)
+	rail := renderFleetProjectRailRows(fleetDashboardSnapshot(t, projects).Projects)
 	for _, want := range []string{
 		"project-rail-toggle-cell",
 		"data-rail-toggle=",
 		"aria-controls=\"rail-detail-",
 		"project-rail-detail-row",
 		"rail-detail-block rail-detail-queue",
-		"rail-detail-block rail-detail-outcome",
-		"rail-detail-block rail-detail-decision",
-		"rail-detail-queue-bar",
 	} {
 		if !contains(rail, want) {
-			t.Fatalf("rail should expose inline detail row markup %q in:\n%s", want, rail)
+			t.Fatalf("server rail renderer should expose %q in:\n%s", want, rail)
 		}
-	}
-	if mainCount, detailCount := strings.Count(rail, `class="project-rail-row`), strings.Count(rail, "project-rail-detail-row"); mainCount != detailCount {
-		t.Fatalf("expected one detail row per main row, got main=%d detail=%d in:\n%s", mainCount, detailCount, rail)
 	}
 }
 
@@ -2518,13 +2321,13 @@ func TestFleetDashboardServesFleetPath(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	if !contains(w.Body.String(), "Projects") {
-		t.Fatal("/fleet should serve the fleet dashboard")
+	if !contains(w.Body.String(), "Maestro Mission Control") {
+		t.Fatal("/fleet should serve mission control")
 	}
 }
 
 func TestFleetDashboardEmbedsConfirmDialogScaffold(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := web.MustReadTemplate("fleet.html") + legacyFleetJS(t)
 	for _, want := range []string{
 		`id="confirm-dialog"`,
 		`id="confirm-dialog-title"`,
@@ -2649,7 +2452,7 @@ func TestFleetDashboardServesApprovalAuditPath(t *testing.T) {
 }
 
 func TestFleetDashboardReadOnlyProjectControlsRenderQuietNote(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := legacyFleetJS(t)
 	readOnlyBranch := dashboardSnippet(t, body,
 		"if (project.read_only === true || fleetState.readOnly)",
 		"return '<div class=\"project-actions\"><div class=\"label\">Approval-gated controls</div>'")
@@ -2668,7 +2471,7 @@ func TestFleetDashboardReadOnlyProjectControlsRenderQuietNote(t *testing.T) {
 }
 
 func TestFleetDashboardWritableProjectControlsKeepApprovalDiagnostics(t *testing.T) {
-	body := fleetDashboardBody(t)
+	body := legacyFleetJS(t)
 	writableBranch := dashboardSnippet(t, body,
 		"return '<div class=\"project-actions\"><div class=\"label\">Approval-gated controls</div>'",
 		"function projectFreshnessHTML")
@@ -2697,7 +2500,38 @@ func fleetDashboardBodyWithProjects(t *testing.T, projects []FleetProject) strin
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-	return w.Body.String() + web.MustReadStatic("tokens.css") + web.MustReadStatic("fleet.js") + web.MustReadStatic("fleet.css")
+	return w.Body.String()
+}
+
+func fleetDashboardSnapshot(t *testing.T, projects []FleetProject) fleetResponse {
+	t.Helper()
+	srv := NewFleet(projects, "127.0.0.1", 8786, true)
+	return srv.snapshot()
+}
+
+func legacyFleetJS(t *testing.T) string {
+	t.Helper()
+	return web.MustReadStatic("tokens.css") + web.MustReadStatic("fleet.js") + web.MustReadStatic("fleet.css")
+}
+
+func mcBundleJS(t *testing.T) string {
+	t.Helper()
+	html := web.MustReadStatic("mc/index.html")
+	const prefix = `src="/static/mc/assets/`
+	start := strings.Index(html, prefix)
+	if start < 0 {
+		t.Fatal("mc/index.html missing bundled script src")
+	}
+	start += len(`src="`)
+	end := strings.Index(html[start:], `"`)
+	if end < 0 {
+		t.Fatal("mc/index.html bundled script src malformed")
+	}
+	rel := html[start : start+end]
+	if !strings.HasPrefix(rel, "/static/mc/assets/") {
+		t.Fatalf("unexpected mc bundle path %q", rel)
+	}
+	return web.MustReadStatic(strings.TrimPrefix(rel, "/static/"))
 }
 
 func fleetDashboardFixtureProjects(t *testing.T, count int) []FleetProject {

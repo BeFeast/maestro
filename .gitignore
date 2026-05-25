@@ -16,3 +16,6 @@
 !.github/workflows/*.yml
 !.github/ISSUE_TEMPLATE/*.yml
 .claude/
+
+# Frontend build
+internal/server/web/mc/node_modules/

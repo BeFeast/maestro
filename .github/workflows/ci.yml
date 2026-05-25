@@ -7,8 +7,34 @@ on:
     branches: [main]
 
 jobs:
+  frontend-build:
+    name: frontend-build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install MC frontend deps
+        working-directory: internal/server/web/mc
+        run: npm install
+
+      - name: Design token guard
+        run: bash scripts/check-design-tokens.sh
+
+      - name: Design recipe guard
+        run: bash scripts/check-design-recipes.sh
+
+      - name: Build Mission Control frontend
+        working-directory: internal/server/web/mc
+        run: npm run build
+
   build:
     name: build
+    needs: frontend-build
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
