@@ -47,20 +47,24 @@ var knownBackends = map[string]Backend{
 type claudeBackend struct{}
 
 func (claudeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
-	promptData, err := os.ReadFile(promptFile)
-	if err != nil {
-		return nil, "", fmt.Errorf("read prompt file: %w", err)
-	}
 	claudeCmd := cfg.Cmd
 	if claudeCmd == "" {
 		claudeCmd = "claude"
 	}
 	binary, cmdArgs := splitCmd(claudeCmd)
-	args := append(cmdArgs, "--dangerously-skip-permissions", "-p", string(promptData))
+	// Deliver the prompt via stdin, not as a CLI argument. Worker prompts are
+	// usually bounded but grow on retries (CI-failure context + Greptile review
+	// comments are appended), so a large PR can push a single argv past the
+	// Linux MAX_ARG_STRLEN limit (128 KiB) and fail fork/exec with "argument
+	// list too long". `claude -p` reads the prompt from stdin when no prompt
+	// argument is given; the runner script wires promptFile to stdin (mirrors
+	// the codex `-` path and the supervisor claude branch from #453).
+	args := append(cmdArgs, "--dangerously-skip-permissions", "-p")
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
-	return cmd, "", nil
+	// Stdin redirection is handled by the runner script — no file opened here.
+	return cmd, promptFile, nil
 }
 
 // --- Codex Backend ---
@@ -244,6 +248,12 @@ func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, workt
 			geminiCmd = "gemini"
 		}
 		binary, cmdArgs := splitCmd(geminiCmd)
+		// NOTE: latent E2BIG ceiling. The gemini CLI takes its prompt via the
+		// `-p` argument, so a prompt approaching the Linux MAX_ARG_STRLEN limit
+		// (128 KiB) would fail fork/exec. Supervisor prompts are read-only and
+		// bounded, and the gemini CLI has no stable stdin-prompt contract to
+		// mirror the codex/claude `-`/`-p`-with-stdin paths, so this is left on
+		// argv delivery. Revisit if gemini gains stdin prompt support.
 		args := append(cmdArgs, "-p", string(promptData))
 		args = appendModelOptions(args, cfg)
 		cmd := exec.Command(binary, args...)
@@ -259,6 +269,10 @@ func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, workt
 			clineCmd = "cline"
 		}
 		binary, cmdArgs := splitCmd(clineCmd)
+		// NOTE: latent E2BIG ceiling, same as the gemini case above. cline takes
+		// the task as a positional argument after `-y` with no stable
+		// stdin-prompt contract, so it is left on argv delivery. Supervisor
+		// prompts are read-only and bounded; revisit if cline gains stdin support.
 		args := append(cmdArgs, "-y", string(promptData))
 		args = appendModelOptions(args, cfg)
 		cmd := exec.Command(binary, args...)
