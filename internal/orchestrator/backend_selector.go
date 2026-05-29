@@ -10,7 +10,12 @@ import (
 
 const selectionReasonProviderLimitFallback = "fallback_after_provider_limit"
 
-func (o *Orchestrator) recordProviderLimit(st *state.State, slotName string, sess *state.Session, pattern string, now time.Time) {
+// recordProviderLimit marks the session's backend as rate-limited and puts it
+// into cooldown. resetAt, when non-nil, is the provider-stated reset time
+// parsed from the limit message ("try again at ..."); it is surfaced on the
+// session and used as the backend's RetryAfter so the fallback selector treats
+// the backend as available again once the reset time passes (auto-resume).
+func (o *Orchestrator) recordProviderLimit(st *state.State, slotName string, sess *state.Session, pattern string, resetAt *time.Time, now time.Time) {
 	if st == nil || sess == nil || sess.Backend == "" {
 		return
 	}
@@ -23,13 +28,19 @@ func (o *Orchestrator) recordProviderLimit(st *state.State, slotName string, ses
 	sess.RateLimitHit = true
 	sess.ProviderLimitBackend = sess.Backend
 	sess.ProviderLimitReason = pattern
-	st.BackendHealth[sess.Backend] = state.BackendHealth{
+	sess.ProviderLimitResetAt = resetAt
+	health := state.BackendHealth{
 		State:       state.BackendHealthCooldown,
 		Reason:      state.BackendBlockProviderLimit,
 		Pattern:     pattern,
 		Since:       now.UTC(),
 		LastSession: slotName,
 	}
+	if resetAt != nil {
+		retryAfter := resetAt.UTC()
+		health.RetryAfter = &retryAfter
+	}
+	st.BackendHealth[sess.Backend] = health
 }
 
 func (o *Orchestrator) selectProviderLimitFallback(st *state.State, sess *state.Session, now time.Time) state.BackendSelection {

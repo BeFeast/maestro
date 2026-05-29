@@ -335,6 +335,24 @@ func (o *Orchestrator) isRateLimited(logFile string) bool {
 	return worker.IsRateLimited(logFile)
 }
 
+// rateLimitResetFromLog reads a dead worker's log file and parses the
+// provider-stated reset time ("try again at ...") if present. It returns nil
+// when the log is unreadable or carries no parseable reset hint, so callers can
+// fall back to a reasonable default cooldown.
+func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
+	if logFile == "" {
+		return nil
+	}
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		return nil
+	}
+	if reset, ok := worker.ParseRateLimitReset(string(data)); ok {
+		return &reset
+	}
+	return nil
+}
+
 // runAfterRunHook executes the after_run hook for a session (best-effort, never fatal).
 func (o *Orchestrator) runAfterRunHook(sess *state.Session) {
 	if o.cfg.Hooks.AfterRun == "" {
@@ -1535,7 +1553,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else if o.isRateLimited(sess.LogFile) {
 					// Provider capacity limit detected — gate this backend and select a fallback.
 					now := time.Now().UTC()
-					o.recordProviderLimit(s, slotName, sess, "log_rate_limit", now)
+					resetAt := o.rateLimitResetFromLog(sess.LogFile)
+					o.recordProviderLimit(s, slotName, sess, "log_rate_limit", resetAt, now)
 					selection := o.selectProviderLimitFallback(s, sess, now)
 					sess.BackendSelection = &selection
 					nextBackend := selection.SelectedBackend
@@ -1651,7 +1670,11 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								log.Printf("[orch] warn: could not stop rate-limited worker %s: %v", slotName, err)
 							}
 							now := time.Now().UTC()
-							o.recordProviderLimit(s, slotName, sess, pattern, now)
+							var resetAt *time.Time
+							if reset, ok := worker.ParseRateLimitReset(output); ok {
+								resetAt = &reset
+							}
+							o.recordProviderLimit(s, slotName, sess, pattern, resetAt, now)
 							selection := o.selectProviderLimitFallback(s, sess, now)
 							sess.BackendSelection = &selection
 
