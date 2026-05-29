@@ -334,12 +334,12 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
 	}
 
-	// Kill process if alive (fallback for pre-tmux workers)
+	// Reap the worker's whole process subtree. tmux kill-session only reaps
+	// processes still parented to the pane shell; worker grandchildren that
+	// reparent away (notably headless Chrome + its crashpad handler) survive a
+	// plain pane-PID kill, so signal the recorded PID's full descendant tree.
 	if sess.PID > 0 && IsAlive(sess.PID) {
-		proc, _ := os.FindProcess(sess.PID)
-		if err := proc.Kill(); err != nil {
-			log.Printf("[worker] kill pid %d: %v", sess.PID, err)
-		}
+		KillProcessTree(sess.PID)
 	}
 
 	// Run before_remove hook

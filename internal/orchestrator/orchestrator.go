@@ -1100,6 +1100,12 @@ func (o *Orchestrator) SetConfigReloadCh(ch <-chan *config.Config) {
 // The context can be used to stop the loop (e.g. for multi-project shutdown).
 // An optional refreshCh triggers an immediate poll cycle when a value is received.
 func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once bool, refreshCh <-chan struct{}) error {
+	// Sweep visual-QA Chrome leftovers from a previous run before doing any
+	// work. Workers run inside a shared, detached tmux server that survives a
+	// unit restart, so a `systemctl restart` can leave orphaned headless Chrome
+	// (+ crashpad) processes and their temp dirs behind; clean them on startup.
+	worker.SweepStaleVisualQA()
+
 	if !once {
 		// Full ProjectV2 item sweeps are expensive and only repair board drift.
 		// Do not run one immediately after every daemon restart; session-state
