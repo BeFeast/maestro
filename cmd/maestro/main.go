@@ -152,6 +152,85 @@ func (f *multiFlag) Set(value string) error {
 	return nil
 }
 
+// reorderArgs moves flag tokens ahead of positional arguments so that flags
+// can be supplied in any position on the command line. Go's stdlib flag
+// package stops parsing at the first non-flag argument, which makes the
+// intuitive `maestro kill <slot> --config <path>` order fail. Reordering args
+// before handing them to a FlagSet lets flags follow positionals.
+//
+// fs is used only to inspect which flags are registered and which are
+// boolean (value-less); it is not parsed here. A literal `--` terminates
+// reordering: it and everything after it is treated as positional and kept in
+// place. Bare tokens that do not name a registered flag stay positional, so an
+// unknown `--foo` is left untouched for the FlagSet to report.
+func reorderArgs(fs *flag.FlagSet, args []string) []string {
+	flags := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// A literal `--` ends flag processing; keep the rest verbatim.
+		if arg == "--" {
+			positionals = append(positionals, args[i:]...)
+			break
+		}
+
+		name, hasValue := flagToken(arg)
+		if name == "" {
+			// Not a flag-looking token (e.g. a positional, "-", or "").
+			positionals = append(positionals, arg)
+			continue
+		}
+
+		f := fs.Lookup(name)
+		if f == nil {
+			// Unknown flag: leave it in place so the FlagSet can report it.
+			positionals = append(positionals, arg)
+			continue
+		}
+
+		flags = append(flags, arg)
+
+		// A non-boolean flag in `--flag value` form consumes the next token as
+		// its value; pull it along so it is not stranded as a positional.
+		if !hasValue && i+1 < len(args) && !isBoolFlag(f) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+
+	return append(flags, positionals...)
+}
+
+// flagToken reports the flag name for a `-flag`, `--flag`, `-flag=value`, or
+// `--flag=value` token. It returns an empty name for non-flag tokens. hasValue
+// is true when the token carries an inline `=value`.
+func flagToken(arg string) (name string, hasValue bool) {
+	if len(arg) < 2 || arg[0] != '-' {
+		return "", false
+	}
+	body := arg[1:]
+	if body[0] == '-' {
+		body = body[1:]
+	}
+	// "--" (now empty body) or "-" are not flags.
+	if body == "" || body[0] == '-' {
+		return "", false
+	}
+	if eq := strings.IndexByte(body, '='); eq >= 0 {
+		return body[:eq], true
+	}
+	return body, false
+}
+
+// isBoolFlag reports whether a registered flag is boolean, i.e. it does not
+// consume a following argument as its value.
+func isBoolFlag(f *flag.Flag) bool {
+	bf, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && bf.IsBoolFlag()
+}
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[maestro] ")
@@ -433,7 +512,7 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 	configPath := fs.String("config", defaultConfigPath, "Path to config file")
 	actor := fs.String("actor", "cli", "Audit actor")
 	reason := fs.String("reason", "", "Audit reason")
-	fs.Parse(args)
+	fs.Parse(reorderArgs(fs, args))
 	if fs.NArg() != 1 {
 		log.Fatalf("supervise %s: expected approval or decision id", action)
 	}
@@ -1357,7 +1436,7 @@ func spawnCmd(args []string) {
 	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	issueNum := fs.Int("issue", 0, "Issue number")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
-	fs.Parse(args)
+	fs.Parse(reorderArgs(fs, args))
 
 	if *issueNum == 0 {
 		fmt.Fprintln(os.Stderr, "error: --issue is required")
@@ -1430,7 +1509,7 @@ func stopCmd(args []string) {
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file (can be repeated)")
 	sessionName := fs.String("session", "", "Session name to stop")
-	fs.Parse(args)
+	fs.Parse(reorderArgs(fs, args))
 
 	if *sessionName == "" {
 		fmt.Fprintln(os.Stderr, "error: --session is required")
@@ -1470,7 +1549,7 @@ func killCmd(args []string) {
 	fs := flag.NewFlagSet("kill", flag.ExitOnError)
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file (can be repeated)")
-	fs.Parse(args)
+	fs.Parse(reorderArgs(fs, args))
 	args = fs.Args()
 
 	if len(args) == 0 || args[0] == "" {
