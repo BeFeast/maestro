@@ -779,6 +779,7 @@ func TestFailedAttemptsForIssue(t *testing.T) {
 	s.Sessions["slot-6"] = &Session{IssueNumber: 99, Status: StatusDead, PRNumber: 0}                    // different issue
 	s.Sessions["slot-7"] = &Session{IssueNumber: 42, Status: StatusRunning, PRNumber: 0, StartedAt: now} // running — not counted
 	s.Sessions["slot-8"] = &Session{IssueNumber: 42, Status: StatusConflictFailed, PRNumber: 0}          // conflict — not counted
+	s.Sessions["slot-9"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 0, RateLimitHit: true}    // rate-limited — not counted (#466)
 
 	if got := s.FailedAttemptsForIssue(42); got != 3 {
 		t.Errorf("FailedAttemptsForIssue(42) = %d, want 3", got)

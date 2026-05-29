@@ -1777,11 +1777,16 @@ func (s *State) IssueDone(issueNum int) bool {
 
 // FailedAttemptsForIssue counts sessions for the given issue that ended
 // without producing a PR (dead, failed, or retry_exhausted).
+//
+// Sessions marked as rate-limited (RateLimitHit) are NOT counted as failed
+// attempts: a transient backend block must not consume the per-issue retry
+// budget. See #432 / #458 / #466.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
-			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) {
+			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) &&
+			!sess.RateLimitHit {
 			count++
 		}
 	}
