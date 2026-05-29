@@ -25,21 +25,61 @@ func TestBuildWorkerCmd_Claude(t *testing.T) {
 	if cmd.Path == "" {
 		t.Fatal("cmd.Path is empty")
 	}
-	if stdinFile != "" {
-		t.Errorf("expected empty stdinFile for claude, got: %s", stdinFile)
+	// Prompt is delivered via stdin (not argv) to stay under the Linux
+	// single-argument size limit; the prompt file is returned as stdinFile.
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
 	}
 	args := strings.Join(cmd.Args, " ")
 	if !strings.Contains(args, "--dangerously-skip-permissions") {
 		t.Errorf("expected --dangerously-skip-permissions in args, got: %s", args)
 	}
-	if !strings.Contains(args, "do the thing") {
-		t.Errorf("expected prompt content in args, got: %s", args)
+	if strings.Contains(args, "do the thing") {
+		t.Errorf("prompt content must not appear in argv (stdin delivery): %s", args)
 	}
 	if !strings.Contains(args, "--model") {
 		t.Errorf("expected extra args in command, got: %s", args)
 	}
 	if cmd.Dir != worktree {
 		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+// TestBuildWorkerCmd_ClaudeLargePromptViaStdin guards against the latent E2BIG
+// regression from #454: a worker claude prompt larger than the Linux
+// MAX_ARG_STRLEN single-argument limit (128 KiB) must be delivered via stdin,
+// never as a CLI argument, so fork/exec never sees "argument list too long".
+func TestBuildWorkerCmd_ClaudeLargePromptViaStdin(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	// 1 MiB + a little, far beyond the 128 KiB single-argument ceiling.
+	largePrompt := strings.Repeat("WORKER_PROMPT_PAYLOAD\n", (1<<20)/21+16)
+	if len(largePrompt) <= 1<<20 {
+		t.Fatalf("prompt should exceed 1 MiB, got %d bytes", len(largePrompt))
+	}
+	if err := os.WriteFile(promptFile, []byte(largePrompt), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/large-prompt-worktree"
+
+	cfg := BackendConfig{Cmd: "claude", ExtraArgs: []string{"--model", "opus"}}
+	cmd, stdinFile, err := BuildWorkerCmd("claude", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error building worker claude cmd with large prompt: %v", err)
+	}
+	// (a) prompt content must not appear anywhere in argv.
+	for i, a := range cmd.Args {
+		if strings.Contains(a, "WORKER_PROMPT_PAYLOAD") {
+			t.Fatalf("prompt content leaked into argv at index %d (E2BIG risk)", i)
+		}
+	}
+	// (b) the prompt file is returned as the stdin source.
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	// (c) cmd.Stdin stays nil — stdin redirection is handled by the runner script.
+	if cmd.Stdin != nil {
+		t.Error("expected cmd.Stdin to be nil (stdin handled by runner script)")
 	}
 }
 
@@ -60,8 +100,9 @@ func TestBuildWorkerCmd_ClaudeDefault(t *testing.T) {
 	if !strings.HasSuffix(cmd.Path, "claude") && !strings.Contains(cmd.Args[0], "claude") {
 		t.Errorf("expected claude command, got: %v", cmd.Args)
 	}
-	if stdinFile != "" {
-		t.Errorf("expected empty stdinFile for default claude, got: %s", stdinFile)
+	// claude delivers the prompt via stdin, so the prompt file is returned.
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
 	}
 }
 
