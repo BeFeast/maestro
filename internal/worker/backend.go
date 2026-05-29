@@ -208,20 +208,21 @@ func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, workt
 
 	switch backendName {
 	case "claude":
-		promptData, err := os.ReadFile(promptFile)
-		if err != nil {
-			return nil, "", fmt.Errorf("read prompt file: %w", err)
-		}
 		claudeCmd := cfg.Cmd
 		if claudeCmd == "" {
 			claudeCmd = "claude"
 		}
 		binary, cmdArgs := splitCmd(claudeCmd)
-		args := append(cmdArgs, "-p", string(promptData))
+		// Deliver the prompt via stdin, not as a CLI argument. Supervisor
+		// prompts embed live PR/issue/review context and routinely exceed the
+		// Linux MAX_ARG_STRLEN single-argument limit (128 KiB), which fails
+		// fork/exec with "argument list too long". `claude -p` reads the prompt
+		// from stdin when no prompt argument is given (mirrors the codex `-` path).
+		args := append(cmdArgs, "-p")
 		args = appendModelOptions(args, cfg)
 		cmd := exec.Command(binary, args...)
 		cmd.Dir = worktree
-		return cmd, "", nil
+		return cmd, promptFile, nil
 	case "codex":
 		codexCmd := cfg.Cmd
 		if codexCmd == "" {
