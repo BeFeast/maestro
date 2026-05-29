@@ -4,7 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// codexUsageLimitSignature is the exact OpenAI/Codex usage-limit message that
+// issue #458 reported slipping past detection. The inserted word "usage" breaks
+// the contiguous "you've hit your limit" match, so it must be caught by the
+// "(usage )?" group and/or the codex/settings/usage marker.
+const codexUsageLimitSignature = "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to see your usage. You can try again at May 30th, 2026 8:13 PM."
 
 func TestDetectRateLimit(t *testing.T) {
 	tests := []struct {
@@ -22,6 +29,18 @@ func TestDetectRateLimit(t *testing.T) {
 		{
 			name:      "hit your limit without apostrophe",
 			input:     "Youve hit your limit",
+			wantHit:   true,
+			wantLabel: "hit_limit",
+		},
+		{
+			name:      "codex usage limit signature (issue #458)",
+			input:     codexUsageLimitSignature,
+			wantHit:   true,
+			wantLabel: "hit_limit",
+		},
+		{
+			name:      "hit your usage limit standalone",
+			input:     "You've hit your usage limit.",
 			wantHit:   true,
 			wantLabel: "hit_limit",
 		},
@@ -207,5 +226,130 @@ func TestOutputContainsRateLimit_ResourceExhausted(t *testing.T) {
 	output := "gRPC error: RESOURCE_EXHAUSTED: quota exceeded"
 	if !OutputContainsRateLimit(output) {
 		t.Error("should detect 'resource_exhausted'")
+	}
+}
+
+// TestRateLimit_CodexSignature exercises every detection entry point against
+// the exact Codex/OpenAI usage-limit string from issue #458, ensuring the
+// "usage" variant is recognised end to end.
+func TestRateLimit_CodexSignature(t *testing.T) {
+	if hit, label := DetectRateLimit(codexUsageLimitSignature); !hit {
+		t.Errorf("DetectRateLimit should recognise the codex usage-limit signature, got hit=false")
+	} else if label != "hit_limit" {
+		t.Errorf("DetectRateLimit label = %q, want %q", label, "hit_limit")
+	}
+
+	if !OutputContainsRateLimit(codexUsageLimitSignature) {
+		t.Error("OutputContainsRateLimit should recognise the codex usage-limit signature")
+	}
+
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "codex.log")
+	content := "Starting worker...\nProcessing issue #247\n" + codexUsageLimitSignature + "\n"
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+	if !IsRateLimited(logFile) {
+		t.Error("IsRateLimited should recognise the codex usage-limit signature from a log file")
+	}
+}
+
+// TestRateLimit_CodexUsageURLOnly verifies the codex/settings/usage marker is
+// detected even when the "you've hit your ... limit" phrasing is absent (e.g.
+// only the help URL is logged).
+func TestRateLimit_CodexUsageURLOnly(t *testing.T) {
+	output := "See https://chatgpt.com/codex/settings/usage for details."
+	if hit, label := DetectRateLimit(output); !hit {
+		t.Error("DetectRateLimit should match the codex/settings/usage marker")
+	} else if label != "codex_usage_limit" {
+		t.Errorf("DetectRateLimit label = %q, want %q", label, "codex_usage_limit")
+	}
+	if !OutputContainsRateLimit(output) {
+		t.Error("OutputContainsRateLimit should match the codex/settings/usage marker")
+	}
+}
+
+// TestRateLimit_ClaudeStillMatches guards against regression: the original
+// Claude "You've hit your limit" phrasing (no "usage" word) must still match.
+func TestRateLimit_ClaudeStillMatches(t *testing.T) {
+	output := "You've hit your limit"
+	if hit, label := DetectRateLimit(output); !hit {
+		t.Error("DetectRateLimit should still match the Claude 'You've hit your limit' phrasing")
+	} else if label != "hit_limit" {
+		t.Errorf("DetectRateLimit label = %q, want %q", label, "hit_limit")
+	}
+	if !OutputContainsRateLimit(output) {
+		t.Error("OutputContainsRateLimit should still match the Claude phrasing")
+	}
+}
+
+func TestParseRateLimitReset_CodexSignature(t *testing.T) {
+	got, ok := ParseRateLimitReset(codexUsageLimitSignature)
+	if !ok {
+		t.Fatal("ParseRateLimitReset should parse the reset hint from the codex signature")
+	}
+	want := time.Date(2026, time.May, 30, 20, 13, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("ParseRateLimitReset = %v, want %v", got, want)
+	}
+}
+
+func TestParseRateLimitReset_Variants(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  time.Time
+		ok    bool
+	}{
+		{
+			name:  "ordinal with PM",
+			input: "try again at May 30th, 2026 8:13 PM.",
+			want:  time.Date(2026, time.May, 30, 20, 13, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "ordinal AM",
+			input: "Please try again at January 1st, 2027 9:05 AM",
+			want:  time.Date(2027, time.January, 1, 9, 5, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "try again after wording",
+			input: "Rate limited; try again after June 3rd, 2026 12:00 PM.",
+			want:  time.Date(2026, time.June, 3, 12, 0, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "iso 8601",
+			input: "you've hit your limit; try again at 2026-05-30T20:13:00Z",
+			want:  time.Date(2026, time.May, 30, 20, 13, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "no reset hint",
+			input: "You've hit your usage limit.",
+			ok:    false,
+		},
+		{
+			name:  "unparseable timestamp",
+			input: "try again at some point soon.",
+			ok:    false,
+		},
+		{
+			name:  "empty",
+			input: "",
+			ok:    false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseRateLimitReset(tc.input)
+			if ok != tc.ok {
+				t.Fatalf("ParseRateLimitReset ok = %v, want %v (got %v)", ok, tc.ok, got)
+			}
+			if tc.ok && !got.Equal(tc.want) {
+				t.Errorf("ParseRateLimitReset = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

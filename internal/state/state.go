@@ -37,6 +37,11 @@ const (
 	DisplayReviewRetryPending SessionDisplayStatus = "review_retry_pending"
 	DisplayReviewRetryRunning SessionDisplayStatus = "review_retry_running"
 	DisplayReviewRetryRecheck SessionDisplayStatus = "review_retry_recheck"
+	// DisplayBackendRateLimited marks a session whose worker exited because its
+	// backend hit a provider usage limit with no fallback available. It is a
+	// distinct, non-failure display token so operators do not confuse a
+	// rate-limited backend with a genuine retry_exhausted code failure.
+	DisplayBackendRateLimited SessionDisplayStatus = "backend_rate_limited"
 	LiveSessionRecentWindow                        = 24 * time.Hour
 )
 
@@ -120,6 +125,7 @@ type Session struct {
 	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for rate-limit fallback)
 	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit
 	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // provider limit signature or class
+	ProviderLimitResetAt        *time.Time        `json:"provider_limit_reset_at,omitempty"`        // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
 	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
 	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
 	ValidationFails             int               `json:"validation_fails,omitempty"`               // number of failed validation attempts
@@ -282,7 +288,30 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 	if display := reviewFeedbackRetryDisplayStatus(sess, now); display != "" {
 		return string(display)
 	}
+	if backendRateLimitedDisplayStatus(sess) {
+		return string(DisplayBackendRateLimited)
+	}
 	return string(sess.Status)
+}
+
+// backendRateLimitedDisplayStatus reports whether a session represents a worker
+// that exited because its backend hit a provider usage limit with no fallback
+// available. Such a session is marked Dead but, unlike a real failure, did not
+// burn the per-issue retry budget; it must be shown distinctly so operators do
+// not mistake it for retry_exhausted.
+func backendRateLimitedDisplayStatus(sess *Session) bool {
+	if sess == nil {
+		return false
+	}
+	if sess.Status != StatusDead && sess.Status != StatusRetryExhausted {
+		return false
+	}
+	// A scheduled retry takes precedence: the worker is going to respawn, so it
+	// is not blocked on a provider limit even if an earlier attempt was.
+	if sess.NextRetryAt != nil {
+		return false
+	}
+	return sess.RateLimitHit && strings.TrimSpace(sess.ProviderLimitBackend) != ""
 }
 
 func reviewFeedbackRetryAttention(sess *Session, alive *bool, now time.Time) (SessionAttention, bool) {

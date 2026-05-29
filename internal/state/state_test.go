@@ -976,6 +976,71 @@ func TestSessionDisplayStatusFor_StaleReviewRetryWorkerStaysRunning(t *testing.T
 	}
 }
 
+func TestSessionDisplayStatusFor_BackendRateLimited(t *testing.T) {
+	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
+	reset := time.Date(2026, 5, 30, 20, 13, 0, 0, time.UTC)
+	future := now.Add(5 * time.Minute)
+
+	tests := []struct {
+		name string
+		sess *Session
+		want string
+	}{
+		{
+			name: "dead with provider limit and no retry scheduled",
+			sess: &Session{
+				Status:               StatusDead,
+				RateLimitHit:         true,
+				ProviderLimitBackend: "codex",
+				ProviderLimitResetAt: &reset,
+			},
+			want: string(DisplayBackendRateLimited),
+		},
+		{
+			name: "retry_exhausted purely from provider limit",
+			sess: &Session{
+				Status:               StatusRetryExhausted,
+				RateLimitHit:         true,
+				ProviderLimitBackend: "codex",
+			},
+			want: string(DisplayBackendRateLimited),
+		},
+		{
+			name: "scheduled retry takes precedence over provider limit",
+			sess: &Session{
+				Status:               StatusDead,
+				RateLimitHit:         true,
+				ProviderLimitBackend: "codex",
+				NextRetryAt:          &future,
+			},
+			want: string(StatusDead),
+		},
+		{
+			name: "rate-limit flag without backend is not surfaced",
+			sess: &Session{
+				Status:       StatusDead,
+				RateLimitHit: true,
+			},
+			want: string(StatusDead),
+		},
+		{
+			name: "generic dead session is unaffected",
+			sess: &Session{
+				Status: StatusDead,
+			},
+			want: string(StatusDead),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SessionDisplayStatusForAt(tt.sess, nil, now); got != tt.want {
+				t.Fatalf("display status = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSessionAttentionFor_ReviewFeedbackRetryCopy(t *testing.T) {
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	future := now.Add(5 * time.Minute)
