@@ -214,14 +214,19 @@ func TestBuildSupervisorCmd_ClaudeReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if stdinFile != "" {
-		t.Errorf("stdinFile = %q, want empty", stdinFile)
+	// Prompt is delivered via stdin (not argv) to stay under the Linux
+	// single-argument size limit; the prompt file is returned as stdinFile.
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
 	}
 	args := strings.Join(cmd.Args, " ")
 	if strings.Contains(args, "dangerously") || strings.Contains(args, "bypass") {
 		t.Errorf("supervisor command should not include worker permission bypass flags: %s", args)
 	}
-	for _, want := range []string{"-p", "decide safely", "--model", "sonnet", "--effort", "medium"} {
+	if strings.Contains(args, "decide safely") {
+		t.Errorf("prompt content must not appear in argv (stdin delivery): %s", args)
+	}
+	for _, want := range []string{"-p", "--model", "sonnet", "--effort", "medium"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("expected %q in args, got: %s", want, args)
 		}
