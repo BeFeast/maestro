@@ -5081,9 +5081,10 @@ func TestStartNewWorkers_DispatchesWhenBlockersClosed(t *testing.T) {
 	}
 
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
-	// Blocker #10 is closed
+	// Blocker #10 is closed; the dispatched issue #42 is open (the pre-spawn guard
+	// from issue #456 also calls isIssueClosed on the candidate itself).
 	o.isIssueClosedFn = func(number int) (bool, error) {
-		return true, nil
+		return number == 10, nil
 	}
 
 	s := state.NewState()
@@ -7149,5 +7150,220 @@ func TestAutoMergePRs_CIFailure_NoGreptileFeedback_FeedbackEmpty(t *testing.T) {
 	sess := s.Sessions["slot-0"]
 	if sess.PreviousAttemptFeedback != "" {
 		t.Errorf("PreviousAttemptFeedback should be empty when no Greptile feedback, got %q", sess.PreviousAttemptFeedback)
+	}
+}
+
+// --- issue #455: restart-required signal for model.default / routing.* reloads ---
+
+// TestReloadConfig_ModelDefaultChangeSetsRestartRequired verifies that changing
+// model.default during a reload does NOT hot-apply (the backend router is built at
+// startup) but instead raises a persistent restart-required signal that is mirrored
+// into the state file so `maestro status` / Fleet API can surface it.
+func TestReloadConfig_ModelDefaultChangeSetsRestartRequired(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:     "owner/repo",
+		StateDir: dir,
+		Model: config.ModelConfig{
+			Default:  "codex",
+			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
+		},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", "", ""),
+		router:   router.New(cfg),
+	}
+
+	newCfg := &config.Config{
+		Repo:     "owner/repo",
+		StateDir: dir,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
+		},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(newCfg, &ticker)
+
+	if !o.restartRequired {
+		t.Fatal("restartRequired not set after model.default change")
+	}
+	if !strings.Contains(o.restartRequiredReason, "model.default") {
+		t.Fatalf("restartRequiredReason = %q, want it to mention model.default", o.restartRequiredReason)
+	}
+	// model.default must NOT be hot-applied (restart-required, not live-applied)
+	if o.cfg.Model.Default != "codex" {
+		t.Fatalf("model.default = %q, want unchanged %q (restart required, not applied)", o.cfg.Model.Default, "codex")
+	}
+
+	// The signal must be persisted to the state file so a separate `maestro status`
+	// process observes it.
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if !st.RestartRequired {
+		t.Fatal("state.RestartRequired not persisted after model.default change")
+	}
+	if !strings.Contains(st.RestartRequiredReason, "model.default") {
+		t.Fatalf("state.RestartRequiredReason = %q, want it to mention model.default", st.RestartRequiredReason)
+	}
+
+	// A subsequent reload that still differs must keep the signal set (not a one-time log).
+	o.reloadConfig(newCfg, &ticker)
+	if !o.restartRequired {
+		t.Fatal("restartRequired cleared on a second reload while config still differs")
+	}
+}
+
+// TestReloadConfig_RoutingChangeSetsRestartRequired verifies that routing.* changes
+// (previously a fully silent no-op) now raise the restart-required signal too.
+func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:     "owner/repo",
+		StateDir: dir,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}, "codex": {Cmd: "codex"}},
+		},
+		Routing: config.RoutingConfig{Mode: "manual", RouterModel: "codex", RouterModelName: "x"},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", "", ""),
+		router:   router.New(cfg),
+	}
+
+	newCfg := &config.Config{
+		Repo:     "owner/repo",
+		StateDir: dir,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}, "codex": {Cmd: "codex"}},
+		},
+		Routing: config.RoutingConfig{Mode: "manual", RouterModel: "claude", RouterModelName: "x"},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(newCfg, &ticker)
+
+	if !o.restartRequired {
+		t.Fatal("restartRequired not set after routing.router_model change")
+	}
+	if !strings.Contains(o.restartRequiredReason, "routing") {
+		t.Fatalf("restartRequiredReason = %q, want it to mention routing", o.restartRequiredReason)
+	}
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if !st.RestartRequired || !strings.Contains(st.RestartRequiredReason, "routing") {
+		t.Fatalf("state restart-required not persisted for routing change: %+v", st)
+	}
+}
+
+// --- issue #456: pre-spawn guard for already-merged / closed issues ---
+
+// TestStartNewWorkers_SkipsIssueWithMergedPRDespiteStaleReadyLabel verifies that an
+// issue whose linked PR already merged is NOT dispatched even when it still carries a
+// stale maestro-ready label and the supervisor (which normally strips the label) is down.
+func TestStartNewWorkers_SkipsIssueWithMergedPRDespiteStaleReadyLabel(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.IssueLabels = []string{"maestro-ready"}
+	issues := []github.Issue{
+		makeIssue(248, "already merged, stale ready", "maestro-ready"),
+		makeIssue(247, "genuinely ready", "maestro-ready"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasMergedPRForIssueFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 248, nil
+	}
+
+	var logs strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(prev)
+
+	s := state.NewState()
+	o.startNewWorkers(s, 5)
+
+	for _, n := range *started {
+		if n == 248 {
+			t.Fatalf("started worker for already-merged issue #248; started=%v", *started)
+		}
+	}
+	if len(*started) != 1 || (*started)[0] != 247 {
+		t.Fatalf("started = %v, want only [247]", *started)
+	}
+	if !strings.Contains(logs.String(), "skipping issue #248: has merged PR") {
+		t.Fatalf("logs missing merged-PR skip reason:\n%s", logs.String())
+	}
+}
+
+// TestStartNewWorkers_SkipsClosedIssueDespiteStaleReadyLabel verifies the same guard
+// for a closed issue that still carries a stale ready label and has no session at all.
+func TestStartNewWorkers_SkipsClosedIssueDespiteStaleReadyLabel(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.IssueLabels = []string{"maestro-ready"}
+	issues := []github.Issue{
+		makeIssue(249, "closed, stale ready", "maestro-ready"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.isIssueClosedFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 249, nil
+	}
+
+	s := state.NewState() // no session for #249 — guard must not depend on session state
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want none for closed issue with stale ready label", *started)
+	}
+}
+
+// --- issue #457: --once dispatch must respect max_parallel ---
+
+// TestStartNewWorkers_RespectsMaxParallelHardCap verifies a single dispatch pass never
+// starts more workers than max_parallel even when more ready issues than slots exist.
+func TestStartNewWorkers_RespectsMaxParallelHardCap(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.MaxParallel = 3
+	issues := []github.Issue{
+		makeIssue(255, "ready a"),
+		makeIssue(254, "ready b"),
+		makeIssue(250, "ready c"),
+		makeIssue(249, "ready d"),
+		makeIssue(248, "ready e"),
+		makeIssue(247, "ready f"),
+	}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+
+	// availableSlots(cfg, s, active=0) == 3
+	slots := availableSlots(cfg, s, len(s.ActiveSessions()))
+	if slots != 3 {
+		t.Fatalf("precondition: availableSlots = %d, want 3", slots)
+	}
+
+	o.startNewWorkers(s, slots)
+
+	if len(*started) > cfg.MaxParallel {
+		t.Fatalf("started %d workers (%v), want at most max_parallel=%d", len(*started), *started, cfg.MaxParallel)
+	}
+	if len(*started) != 3 {
+		t.Fatalf("started %d workers (%v), want exactly 3", len(*started), *started)
+	}
+	if len(s.ActiveSessions()) > cfg.MaxParallel {
+		t.Fatalf("active sessions = %d, want at most max_parallel=%d", len(s.ActiveSessions()), cfg.MaxParallel)
 	}
 }

@@ -310,6 +310,12 @@ type fleetProjectState struct {
 	StateDir        string                `json:"state_dir,omitempty"`
 	MaxParallel     int                   `json:"max_parallel"`
 	ReadOnly        bool                  `json:"read_only"`
+
+	// RestartRequired/RestartRequiredReason mirror the orchestrator's restart-required
+	// signal (set when model.default / routing.* changed but cannot be hot-applied).
+	RestartRequired       bool   `json:"restart_required,omitempty"`
+	RestartRequiredReason string `json:"restart_required_reason,omitempty"`
+
 	OperatorState   fleetOperatorState    `json:"operator_state"`
 	Outcome         outcome.Status        `json:"outcome"`
 	Summary         map[string]int        `json:"summary"`
@@ -1676,6 +1682,8 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		return item, nil
 	}
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
+	item.RestartRequired = st.RestartRequired
+	item.RestartRequiredReason = st.RestartRequiredReason
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary
 	item.Outcome = projectState.Outcome
