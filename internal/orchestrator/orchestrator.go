@@ -87,6 +87,14 @@ type Orchestrator struct {
 	// Config hot-reload channel (nil = disabled, safe in select)
 	configReloadCh <-chan *config.Config
 
+	// Restart-required signal. Some config fields (model.default, routing.*) cannot
+	// be hot-applied because the backend router is built once at startup. When such a
+	// field changes during a config reload we do not apply it; instead we raise this
+	// persistent flag so a long-running daemon surfaces "restart required" in
+	// `maestro status` and the Fleet API instead of silently ignoring the change.
+	restartRequired       bool
+	restartRequiredReason string
+
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn              func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn      func(prNumber int) (approved bool, pending bool, err error)
@@ -1126,8 +1134,22 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	if newCfg.Repo != old.Repo {
 		log.Printf("[orch] config reload: repo changed (%s → %s) — requires restart", old.Repo, newCfg.Repo)
 	}
+
+	// model.default and routing.* select the backend router, which is constructed
+	// once at startup and is not safe to re-init mid-flight. Detect a change against
+	// the live (startup) config, do NOT apply it, and raise a persistent
+	// restart-required signal so the operator sees it in `maestro status` / Fleet API
+	// rather than only a one-time log line. Keep o.cfg.Model/Routing unchanged so the
+	// warning keeps firing on every subsequent reload while the config still differs.
 	if newCfg.Model.Default != old.Model.Default {
-		log.Printf("[orch] config reload: model.default changed (%s → %s) — requires restart", old.Model.Default, newCfg.Model.Default)
+		o.markRestartRequired(fmt.Sprintf("model.default changed (%s → %s)", old.Model.Default, newCfg.Model.Default))
+		log.Printf("[orch] config reload: model.default changed (%s → %s) — requires restart (not applied)", old.Model.Default, newCfg.Model.Default)
+	}
+	if newCfg.Routing != old.Routing {
+		o.markRestartRequired(fmt.Sprintf("routing.* changed (router_model %s → %s, mode %s → %s)",
+			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode))
+		log.Printf("[orch] config reload: routing.* changed (router_model %s → %s, mode %s → %s) — requires restart (not applied)",
+			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode)
 	}
 
 	// Hot-reloadable fields
@@ -1232,6 +1254,39 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		return
 	}
 	log.Printf("[orch] config reloaded — changed: %s", strings.Join(changed, ", "))
+}
+
+// markRestartRequired records a persistent restart-required signal both in memory
+// (so the running daemon keeps emitting the warning) and in the on-disk state file
+// (so a separate `maestro status` / Fleet API process can surface it without
+// grepping journals). Multiple reasons in a single reload are joined.
+func (o *Orchestrator) markRestartRequired(reason string) {
+	o.restartRequired = true
+	if o.restartRequiredReason == "" {
+		o.restartRequiredReason = reason
+	} else if !strings.Contains(o.restartRequiredReason, reason) {
+		o.restartRequiredReason = o.restartRequiredReason + "; " + reason
+	}
+	o.persistRestartRequired()
+}
+
+// persistRestartRequired mirrors the in-memory restart-required signal into the
+// state file. It is best-effort: a load/save failure is logged but never aborts the
+// reload (the in-memory warning still fires every cycle).
+func (o *Orchestrator) persistRestartRequired() {
+	s, err := state.Load(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] warn: could not load state to persist restart-required signal: %v", err)
+		return
+	}
+	if s.RestartRequired == o.restartRequired && s.RestartRequiredReason == o.restartRequiredReason {
+		return
+	}
+	s.RestartRequired = o.restartRequired
+	s.RestartRequiredReason = o.restartRequiredReason
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		log.Printf("[orch] warn: could not save restart-required signal to state: %v", err)
+	}
 }
 
 func strSliceEqual(a, b []string) bool {
@@ -3024,16 +3079,32 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				continue
 			}
 		}
-		if s.IssueDone(issue.Number) {
-			closed, err := o.isIssueClosed(issue.Number)
-			if err != nil {
-				log.Printf("[orch] warn: could not verify closed issue #%d before dispatch: %v", issue.Number, err)
-			} else if closed {
-				log.Printf("[orch] skipping issue #%d: already closed with completed session", issue.Number)
-				o.syncProject(issue.Number, github.ProjectStatusDone)
-				continue
-			}
+
+		// Pre-spawn guard (issue #456): never start a new worker for an issue that is
+		// already closed or whose linked PR already merged, even when a stale
+		// maestro-ready label is still present and even for supervisor-selected repair
+		// spawns. This is an independent safety check on top of the supervisor's ready-
+		// label management: with the supervisor down, nothing strips the label, so the
+		// run loop must refuse already-finished work on its own. Errors are logged and
+		// treated as "not finished" so a transient GitHub failure cannot block dispatch.
+		if closed, err := o.isIssueClosed(issue.Number); err != nil {
+			log.Printf("[orch] warn: could not verify closed state for issue #%d before dispatch: %v", issue.Number, err)
+		} else if closed {
+			log.Printf("[orch] skipping issue #%d: already closed (stale ready label)", issue.Number)
+			o.syncProject(issue.Number, github.ProjectStatusDone)
+			continue
 		}
+		if merged, err := o.hasMergedPRForIssue(issue.Number); err != nil {
+			log.Printf("[orch] warn: could not verify merged PR for issue #%d before dispatch: %v", issue.Number, err)
+		} else if merged {
+			log.Printf("[orch] skipping issue #%d: has merged PR (stale ready label)", issue.Number)
+			o.syncProject(issue.Number, github.ProjectStatusDone)
+			continue
+		}
+
+		// NOTE: the closed/merged checks above (issue #456 pre-spawn guard) already
+		// cover the previous s.IssueDone() closed-issue case for every candidate, so a
+		// separate done-session closed-check here would be a redundant GitHub call.
 
 		// Skip mission parent issues — they are decomposed, not dispatched directly
 		if s.IsMissionParent(issue.Number) {
@@ -3086,7 +3157,20 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// No available slots — sync remaining eligible issues as backlog/todo.
 		// This check is intentionally before hasOpenPRForIssue to avoid making
 		// a GitHub API call per backlogged issue when all slots are full.
+		//
+		// Two independent caps (issue #457):
+		//  1. `started >= slots` — never start more than the budget computed for this
+		//     dispatch pass (after retry reservations were subtracted).
+		//  2. `liveActive >= MaxParallel` — a hard backstop recomputed from live state
+		//     each iteration so that retry respawns (which already turned dead sessions
+		//     into running ones earlier in the cycle) plus fresh dispatch can never
+		//     exceed max_parallel, even if the precomputed `slots` budget was stale.
 		if started >= slots {
+			o.syncProject(issue.Number, github.ProjectStatusTodo)
+			continue
+		}
+		if liveActive := len(s.ActiveSessions()); o.cfg.MaxParallel > 0 && liveActive >= o.cfg.MaxParallel {
+			log.Printf("[orch] dispatch cap: %d active >= max_parallel %d — queueing issue #%d", liveActive, o.cfg.MaxParallel, issue.Number)
 			o.syncProject(issue.Number, github.ProjectStatusTodo)
 			continue
 		}

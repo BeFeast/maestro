@@ -819,6 +819,13 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	fmt.Printf("Session prefix: %s\n", cfg.SessionPrefix)
 	fmt.Printf("State file:     %s\n", state.StatePath(cfg.StateDir))
 	fmt.Printf("Max parallel:   %d\n", cfg.MaxParallel)
+	if s.RestartRequired {
+		reason := s.RestartRequiredReason
+		if reason == "" {
+			reason = "model/routing config changed"
+		}
+		fmt.Printf("Restart req.:   yes — %s (run `systemctl --user restart` to apply)\n", reason)
+	}
 	showOutcomeStatus(cfg, s)
 	showSupervisorPolicy(cfg)
 	if len(cfg.MaxConcurrentByState) > 0 {

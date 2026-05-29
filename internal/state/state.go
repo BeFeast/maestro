@@ -624,6 +624,13 @@ type State struct {
 	NextSlot            int                        `json:"next_slot"`
 	LastMergeAt         time.Time                  `json:"last_merge_at,omitempty"`
 
+	// RestartRequired is set by the running orchestrator when a config field that
+	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
+	// surfaced by `maestro status` and the Fleet API so an operator sees the pending
+	// restart without grepping the daemon journal. RestartRequiredReason explains why.
+	RestartRequired       bool   `json:"restart_required,omitempty"`
+	RestartRequiredReason string `json:"restart_required_reason,omitempty"`
+
 	loadedHash  string
 	loadedState *State
 }
