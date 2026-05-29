@@ -384,6 +384,70 @@ func TestReconcileRunningSessions_DeadPIDGetsMarkedDead(t *testing.T) {
 	}
 }
 
+// TestReconcileRunningSessions_RateLimitedDeadWorker_DoesNotBurnRetryBudget
+// guards #466: when reconcile observes a dead worker whose log carries a
+// provider rate-limit signature, it must record the provider limit and skip
+// counting the session as a failed attempt for the issue, so the per-issue
+// retry budget is preserved through transient backend blocks.
+func TestReconcileRunningSessions_RateLimitedDeadWorker_DoesNotBurnRetryBudget(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["sup-77"] = &state.Session{
+		IssueNumber: 353,
+		IssueTitle:  "P0: detect outcome drift",
+		Status:      state.StatusRunning,
+		PID:         424242,
+		TmuxSession: "maestro-sup-77",
+		Branch:      "feat/sup-77-353-detect-outcome-drift",
+		Backend:     "codex",
+		StartedAt:   time.Now().Add(-2 * time.Minute),
+		LogFile:     "/tmp/sup-77-rl.log",
+	}
+
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo: "owner/repo",
+			Model: config.ModelConfig{
+				Default:  "codex",
+				Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}},
+			},
+		},
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:     func(logFile string) bool { return true },
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["sup-77"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if !sess.RateLimitHit {
+		t.Fatal("RateLimitHit should be true so retry budget is preserved")
+	}
+	if sess.LastNotifiedStatus != "rate_limit" {
+		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "rate_limit")
+	}
+	if sess.ProviderLimitBackend != "codex" {
+		t.Fatalf("provider_limit_backend = %q, want codex", sess.ProviderLimitBackend)
+	}
+	if failed := s.FailedAttemptsForIssue(353); failed != 0 {
+		t.Fatalf("FailedAttemptsForIssue(353) = %d, want 0 — rate-limited dead session must not burn retry budget", failed)
+	}
+	health, ok := s.BackendHealth["codex"]
+	if !ok {
+		t.Fatal("BackendHealth[codex] should be recorded by recordProviderLimit")
+	}
+	if health.State != state.BackendHealthCooldown {
+		t.Fatalf("BackendHealth[codex].State = %q, want cooldown", health.State)
+	}
+}
+
 func TestReconcileRunningSessions_MissingTmuxGetsMarkedDead(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["pan-2"] = &state.Session{

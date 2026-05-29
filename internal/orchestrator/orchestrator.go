@@ -1397,6 +1397,33 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 		}
 
+		// Before marking the session dead, check whether the worker died because
+		// the provider hit a rate / usage limit. Without this, the reconcile path
+		// races the main exit handler at the start of every cycle and burns the
+		// per-issue retry budget on what is really a transient backend block (#466).
+		if o.isRateLimited(sess.LogFile) {
+			now := time.Now().UTC()
+			resetAt := o.rateLimitResetFromLog(sess.LogFile)
+			o.recordProviderLimit(s, slotName, sess, "log_rate_limit_reconcile", resetAt, now)
+			oldPID := sess.PID
+			oldTmux := tmuxName
+			sess.PID = 0
+			sess.TmuxSession = ""
+			sess.FinishedAt = &now
+			sess.LastNotifiedStatus = "rate_limit"
+			sess.Status = state.StatusDead
+			reconciled = true
+			resetStr := "unknown"
+			if resetAt != nil {
+				resetStr = resetAt.Format(time.RFC3339)
+			}
+			log.Printf("[orch] reconcile: %s running->dead via provider rate limit on backend=%s reset=%s (%s); pid=%d tmux=%q",
+				slotName, sess.Backend, resetStr, strings.Join(reasons, ", "), oldPID, oldTmux)
+			o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit on %s; reset=%s",
+				slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, resetStr)
+			continue
+		}
+
 		oldPID := sess.PID
 		oldTmux := tmuxName
 		sess.Status = state.StatusDead
