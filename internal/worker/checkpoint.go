@@ -76,16 +76,16 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 // with checkpoint context included in the prompt. Unlike Respawn, this preserves
 // the existing worktree with all committed and staged code.
 func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
-	// Kill tmux session + PID (but do NOT remove worktree)
+	// Kill tmux session + process subtree (but do NOT remove worktree). Reaping
+	// the whole descendant tree — not just the recorded pane PID — ensures
+	// worker grandchildren that reparented away (e.g. headless Chrome) do not
+	// leak across a respawn.
 	tmuxName := TmuxSessionName(slotName)
 	if out, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
 		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
 	}
 	if sess.PID > 0 && IsAlive(sess.PID) {
-		proc, _ := os.FindProcess(sess.PID)
-		if err := proc.Kill(); err != nil {
-			log.Printf("[worker] kill pid %d: %v", sess.PID, err)
-		}
+		KillProcessTree(sess.PID)
 	}
 
 	// Run after_run hook (non-fatal)
