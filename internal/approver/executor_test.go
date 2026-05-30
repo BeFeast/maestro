@@ -12,10 +12,10 @@ import (
 
 // fakeGH lets tests stub MergePR and CloseIssue.
 type fakeGH struct {
-	mergeCalls  []int
-	closeCalls  []closeCall
-	mergeErr    error
-	closeErr    error
+	mergeCalls []int
+	closeCalls []closeCall
+	mergeErr   error
+	closeErr   error
 }
 
 type closeCall struct {
@@ -72,6 +72,48 @@ func mkApproval(action string, target *state.SupervisorTarget, summary, approveR
 		a.Audit = append(a.Audit, state.ApprovalAudit{At: now, Event: state.ApprovalAuditApproved, Actor: "cli", Reason: approveReason})
 	}
 	return a
+}
+
+// --- spawn_worker / open_child_issue approval semantics --------------------
+
+// TestExecute_SpawnWorker_ReturnsExecutionSkippedWithActionableSummary verifies
+// the fix for issue #443: approving a spawn_worker approval used to print
+// "No risky action was executed". The executor now records the approval as
+// execution_skipped with a clear summary so the operator knows the next
+// dispatcher loop will start the worker.
+func TestExecute_SpawnWorker_ReturnsExecutionSkippedWithActionableSummary(t *testing.T) {
+	ex := &Executor{Cfg: newCfg()}
+	a := mkApproval("spawn_worker", &state.SupervisorTarget{Issue: 170}, "spawn me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want %q", res.Status, state.ApprovalStatusExecutionSkipped)
+	}
+	if !strings.Contains(res.Summary, "#170") {
+		t.Fatalf("summary = %q, want issue ref", res.Summary)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "next dispatcher loop") {
+		t.Fatalf("summary = %q, want operator-facing hint about dispatcher loop", res.Summary)
+	}
+	if res.Err != nil {
+		t.Fatalf("err = %v, want nil for skipped-status", res.Err)
+	}
+}
+
+func TestExecute_OpenChildIssue_ReturnsExecutionSkippedWithActionableSummary(t *testing.T) {
+	ex := &Executor{Cfg: newCfg()}
+	a := mkApproval("open_child_issue", &state.SupervisorTarget{Issue: 146}, "create child", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want %q", res.Status, state.ApprovalStatusExecutionSkipped)
+	}
+	if !strings.Contains(res.Summary, "#146") {
+		t.Fatalf("summary = %q, want epic ref", res.Summary)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "manually") {
+		t.Fatalf("summary = %q, want manual-create hint for v1", res.Summary)
+	}
 }
 
 // --- merge_pr ---------------------------------------------------------------

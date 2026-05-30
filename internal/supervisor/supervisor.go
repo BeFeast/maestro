@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mission"
 	"github.com/befeast/maestro/internal/outcome"
-	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/worker"
 )
@@ -35,6 +35,15 @@ const (
 	ActionSpawnWorker          = "spawn_worker"
 	ActionSpawnRepairWorker    = "spawn_repair_worker"
 	ActionLabelIssueReady      = "label_issue_ready"
+	// ActionOpenChildIssue asks the supervisor (or operator) to create the
+	// next concrete child issue from an open handoff/epic when no runnable
+	// issue remains. Approval-gated in v1; the safe-action executor for
+	// `open_child_issue` is wired up by a follow-up PR.
+	ActionOpenChildIssue = "open_child_issue"
+	// ActionPreflightFailed is emitted when a configured preflight gate
+	// fails. The supervisor refuses to recommend spawn/open-child until the
+	// operator clears the failure.
+	ActionPreflightFailed = "preflight_failed"
 
 	RiskSafe          = "safe"
 	RiskMutating      = "mutating"
@@ -96,16 +105,34 @@ type prGreptileReader interface {
 	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
 }
 
+// PreflightResult is the outcome of running a configured preflight command.
+// Ok=true means the gate passed and the supervisor may continue dispatching
+// spawn/open-child actions. Ok=false carries a human-readable Reason that is
+// surfaced in the stuck-state evidence and CLI output. Output is the
+// trimmed combined output of the configured command (optional, for audit).
+type PreflightResult struct {
+	Ok       bool
+	Reason   string
+	ExitCode int
+	Output   string
+}
+
+// PreflightRunner runs the configured supervisor preflight command. Tests
+// inject a fake runner; production wires a shell executor via the default
+// engine factory.
+type PreflightRunner func(command string) PreflightResult
+
 // Engine makes deterministic supervisor decisions. It plans safe queue mutations
 // and emits structured stuck-state explanations.
 type Engine struct {
-	cfg      *config.Config
-	reader   Reader
-	llm      LLMClient
-	now      func() time.Time
-	pidAlive func(pid int) bool
-	stat     func(name string) (os.FileInfo, error)
-	lookPath func(file string) (string, error)
+	cfg       *config.Config
+	reader    Reader
+	llm       LLMClient
+	now       func() time.Time
+	pidAlive  func(pid int) bool
+	stat      func(name string) (os.FileInfo, error)
+	lookPath  func(file string) (string, error)
+	preflight PreflightRunner
 }
 
 func NewEngine(cfg *config.Config, reader Reader) *Engine {
@@ -113,17 +140,53 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 		reader = github.New(cfg.Repo)
 	}
 	eng := &Engine{
-		cfg:      cfg,
-		reader:   reader,
-		now:      func() time.Time { return time.Now().UTC() },
-		pidAlive: pidAlive,
-		stat:     os.Stat,
-		lookPath: exec.LookPath,
+		cfg:       cfg,
+		reader:    reader,
+		now:       func() time.Time { return time.Now().UTC() },
+		pidAlive:  pidAlive,
+		stat:      os.Stat,
+		lookPath:  exec.LookPath,
+		preflight: defaultPreflightRunner,
 	}
 	if cfg != nil && cfg.Supervisor.Enabled {
 		eng.llm = NewBackendLLMClient(cfg)
 	}
 	return eng
+}
+
+// defaultPreflightRunner shells out to `bash -c <command>` and returns
+// Ok=true when the command exits 0. Empty command is treated as
+// "no gate configured" → Ok=true.
+func defaultPreflightRunner(command string) PreflightResult {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return PreflightResult{Ok: true}
+	}
+	cmd := exec.Command("bash", "-lc", command)
+	out, err := cmd.CombinedOutput()
+	exit := 0
+	if err != nil {
+		exit = -1
+		if ee, ok := err.(*exec.ExitError); ok {
+			exit = ee.ExitCode()
+		}
+	}
+	trimmed := strings.TrimSpace(string(out))
+	if err != nil {
+		reason := fmt.Sprintf("preflight command exited with %d", exit)
+		if trimmed != "" {
+			reason = fmt.Sprintf("%s: %s", reason, firstLine(trimmed))
+		}
+		return PreflightResult{Ok: false, Reason: reason, ExitCode: exit, Output: trimmed}
+	}
+	return PreflightResult{Ok: true, ExitCode: exit, Output: trimmed}
+}
+
+func firstLine(s string) string {
+	if idx := strings.IndexAny(s, "\r\n"); idx >= 0 {
+		return strings.TrimSpace(s[:idx])
+	}
+	return strings.TrimSpace(s)
 }
 
 // RunOnce records one supervisor decision in Maestro state and applies any safe
@@ -375,12 +438,48 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			return withAnalysis(decision), nil
 		}
 
+		// Race protection: refuse to recommend a spawn for an issue that
+		// has already been closed since the listing snapshot (post-merge
+		// race) or whose session is already Done/code_landed.
+		if cache.isIssueClosed(issue.Number) {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d closed between listing and dispatch; refusing to spawn a duplicate worker", issue.Number),
+			)
+			decision := e.decision(st, now, projectState, ActionNone,
+				fmt.Sprintf("Issue #%d closed after listing; supervisor will re-evaluate on the next cycle.", issue.Number),
+				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			decision.StuckStates = stuckStates
+			return withAnalysis(decision), nil
+		}
+		if e.sessionRecentlyDoneForIssue(st, issue.Number) {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d already has a Done/code-landed session in state; refusing to spawn another worker", issue.Number),
+			)
+			decision := e.decision(st, now, projectState, ActionNone,
+				fmt.Sprintf("Issue #%d already reached Done in state; supervisor refuses to dispatch a duplicate worker.", issue.Number),
+				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			decision.StuckStates = stuckStates
+			return withAnalysis(decision), nil
+		}
+
 		reasons := appendReasons(baseReasons,
 			issueLabelReason(e.requiredIssueLabels()),
 			fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
 			outcomeIssueReason(outcomeStatus, issue),
 			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 		)
+		if preflight, ok := e.evaluatePreflight(false, true); !ok {
+			stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
+			blockedReasons := appendReasons(reasons,
+				"Preflight gate failed; refusing to recommend a worker spawn",
+				"Preflight: "+preflight.Reason,
+			)
+			decision := e.decision(st, now, projectState, ActionPreflightFailed,
+				fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
+				RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, blockedReasons)
+			decision.StuckStates = stuckStates
+			return withAnalysis(decision), nil
+		}
 		decision := e.decision(st, now, projectState, ActionSpawnWorker,
 			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
 			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
@@ -503,6 +602,35 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		for _, reason := range firstN(result.skipped, 3) {
 			reasons = append(reasons, reason)
 		}
+
+		// Handoff planner v1: when an open handoff/epic remains but no
+		// runnable issue is eligible, the supervisor must not return
+		// `none` and silently idle overnight. Promote the queue-
+		// exhausted finding to an actionable warning and recommend
+		// opening the next concrete child issue (approval-gated).
+		if planner := e.handoffPlannerCandidate(issues); planner != nil {
+			stuckStates = append(stuckStates, handoffEpicNeedsChildStuckState(planner))
+			plannerReasons := appendReasons(reasons,
+				fmt.Sprintf("Open handoff/epic #%d (%s) has no runnable child issue", planner.Number, strings.TrimSpace(planner.Title)),
+				"Supervisor must own continuation: recommend opening the next child issue instead of idling on `none`",
+			)
+			if preflight, ok := e.evaluatePreflight(true, false); !ok {
+				stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "open_child_issue"))
+				blockedReasons := appendReasons(plannerReasons,
+					"Preflight gate failed; refusing to recommend opening a new child issue",
+					"Preflight: "+preflight.Reason,
+				)
+				decision := e.decision(st, now, projectState, ActionPreflightFailed,
+					fmt.Sprintf("Preflight blocked handoff continuation for epic #%d: %s", planner.Number, preflight.Reason),
+					RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: planner.Number}, PolicyRuleDynamicWave, blockedReasons)
+				return withAnalysis(decision), nil
+			}
+			decision := e.decision(st, now, projectState, ActionOpenChildIssue,
+				fmt.Sprintf("Open the next child issue from handoff epic #%d: %s", planner.Number, strings.TrimSpace(planner.Title)),
+				RiskApprovalGated, 0.85, &state.SupervisorTarget{Issue: planner.Number}, PolicyRuleDynamicWave, plannerReasons)
+			return withAnalysis(decision), nil
+		}
+
 		decision := e.decision(st, now, projectState, ActionNone,
 			"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
@@ -569,12 +697,48 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		return withAnalysis(decision), nil
 	}
 
+	// Race protection: refuse to recommend spawn for an issue that has
+	// already been closed since the issue listing snapshot was taken
+	// (post-merge close race). Cache hits are cheap because the broader
+	// supervisor cycle reuses the same resolutionCache.
+	if cache != nil && cache.isIssueClosed(issue.Number) {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+			fmt.Sprintf("Issue #%d closed between listing and dispatch; refusing to spawn a duplicate worker", issue.Number),
+		)
+		decision := e.decision(st, now, projectState, ActionNone,
+			fmt.Sprintf("Issue #%d closed after listing; supervisor will re-evaluate on the next cycle.", issue.Number),
+			RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		return withAnalysis(decision), nil
+	}
+	if e.sessionRecentlyDoneForIssue(st, issue.Number) {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+			fmt.Sprintf("Issue #%d already has a Done/code-landed session in state; refusing to spawn another worker", issue.Number),
+		)
+		decision := e.decision(st, now, projectState, ActionNone,
+			fmt.Sprintf("Issue #%d already reached Done in state; supervisor refuses to dispatch a duplicate worker.", issue.Number),
+			RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		return withAnalysis(decision), nil
+	}
+
 	reasons := appendReasons(baseReasons,
 		issueLabelReason(e.requiredIssueLabels()),
 		fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
 		outcomeIssueReason(outcomeStatus, issue),
 		"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 	)
+	if preflight, ok := e.evaluatePreflight(false, true); !ok {
+		stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
+		blockedReasons := appendReasons(reasons,
+			"Preflight gate failed; refusing to recommend a worker spawn",
+			"Preflight: "+preflight.Reason,
+		)
+		decision := e.decision(st, now, projectState, ActionPreflightFailed,
+			fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
+			RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, blockedReasons)
+		return withAnalysis(decision), nil
+	}
 	decision := e.decision(st, now, projectState, ActionSpawnWorker,
 		fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
 		RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
@@ -965,13 +1129,39 @@ func (e *Engine) detectQueueStuckStates(st *state.State, prs []github.PR, issues
 	}
 
 	if len(skipped) > 0 {
-		findings = append(findings, stuckState("ordered_queue_exhausted", SeverityInfo,
-			"The ordered issue queue was checked, but every issue was skipped.",
-			"Review skipped reasons and make one issue eligible for dispatch.", false, nil,
+		severity := SeverityInfo
+		summary := "The ordered issue queue was checked, but every issue was skipped."
+		recommended := "Review skipped reasons and make one issue eligible for dispatch."
+		canAct := false
+		if e.openHandoffEpicPresent(issues) {
+			severity = SeverityWarning
+			summary = "The ordered/dynamic queue is exhausted but an open handoff epic remains."
+			recommended = "Open the next concrete child issue from the handoff epic, or unblock the held one, so the supervisor can dispatch work."
+			canAct = true
+		}
+		findings = append(findings, stuckState("ordered_queue_exhausted", severity,
+			summary, recommended, canAct, nil,
 			append([]string{fmt.Sprintf("Skipped issues: %d", len(skipped))}, firstEvidence(skipped)...)...))
 	}
 
 	return findings
+}
+
+// openHandoffEpicPresent reports whether the supervisor sees at least one
+// open issue that looks like a handoff epic or carries one of the
+// configured handoff source labels. Always false when the planner is
+// disabled, so existing projects keep the original info-level behaviour.
+func (e *Engine) openHandoffEpicPresent(issues []github.Issue) bool {
+	if e == nil || e.cfg == nil || !e.cfg.Supervisor.HandoffPlanner.Active() {
+		return false
+	}
+	labels := e.cfg.Supervisor.HandoffPlanner.EffectiveSourceLabels()
+	for _, issue := range issues {
+		if isHandoffSource(issue, labels) {
+			return true
+		}
+	}
+	return false
 }
 
 func detectPolicyStuckStates(skipped []string) []state.SupervisorStuckState {
@@ -1986,6 +2176,128 @@ func firstMatchingIssueLabel(issue github.Issue, labels []string) (string, bool)
 
 func titleLooksEpic(title string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(title)), "epic:")
+}
+
+// handoffPlannerCandidate returns the open issue that should be treated as
+// the parent handoff epic for the next supervisor-owned child issue. v1
+// picks the lowest-numbered open issue that is either title-prefixed
+// "epic:" or labeled with one of the configured source labels. Returns nil
+// when the planner is disabled or no candidate exists.
+func (e *Engine) handoffPlannerCandidate(issues []github.Issue) *github.Issue {
+	if e == nil || e.cfg == nil || !e.cfg.Supervisor.HandoffPlanner.Active() {
+		return nil
+	}
+	labels := e.cfg.Supervisor.HandoffPlanner.EffectiveSourceLabels()
+	openChildren := e.cfg.Supervisor.HandoffPlanner.MaxOpenChildren
+	if openChildren > 0 {
+		nonHandoff := 0
+		for _, issue := range issues {
+			if !isHandoffSource(issue, labels) {
+				nonHandoff++
+			}
+		}
+		if nonHandoff >= openChildren {
+			return nil
+		}
+	}
+
+	sorted := append([]github.Issue(nil), issues...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Number < sorted[j].Number })
+	for i := range sorted {
+		issue := sorted[i]
+		if isHandoffSource(issue, labels) {
+			return &issue
+		}
+	}
+	return nil
+}
+
+// isHandoffSource reports whether the issue is a handoff/epic parent under
+// the configured source labels OR by an `epic:` title prefix.
+func isHandoffSource(issue github.Issue, labels []string) bool {
+	if titleLooksEpic(issue.Title) {
+		return true
+	}
+	if _, ok := firstMatchingIssueLabel(issue, labels); ok {
+		return true
+	}
+	return false
+}
+
+// evaluatePreflight runs the configured preflight command, if any, and
+// returns the result. requireForCreate/requireForSpawn control which
+// per-context gate applies. When no command is configured (or the relevant
+// require_* flag is false), this returns Ok=true with no work.
+func (e *Engine) evaluatePreflight(requireForCreate, requireForSpawn bool) (PreflightResult, bool) {
+	if e == nil || e.cfg == nil {
+		return PreflightResult{Ok: true}, true
+	}
+	handoff := e.cfg.Supervisor.HandoffPlanner
+	// Pick the most specific preflight command available: planner-scoped
+	// first (when the caller is the planner), then the supervisor-wide
+	// fallback.
+	cmd := ""
+	if requireForCreate && strings.TrimSpace(handoff.PreflightCommand) != "" && handoff.RequirePreflightBeforeCreate {
+		cmd = handoff.PreflightCommand
+	} else if requireForSpawn && strings.TrimSpace(handoff.PreflightCommand) != "" && handoff.RequirePreflightBeforeSpawn {
+		cmd = handoff.PreflightCommand
+	}
+	if cmd == "" && strings.TrimSpace(e.cfg.Supervisor.PreflightCommand) != "" {
+		// Top-level preflight always applies to both gates.
+		cmd = e.cfg.Supervisor.PreflightCommand
+	}
+	if cmd == "" {
+		return PreflightResult{Ok: true}, true
+	}
+	runner := e.preflight
+	if runner == nil {
+		runner = defaultPreflightRunner
+	}
+	res := runner(cmd)
+	return res, res.Ok
+}
+
+func handoffEpicNeedsChildStuckState(epic *github.Issue) state.SupervisorStuckState {
+	target := &state.SupervisorTarget{}
+	if epic != nil {
+		target.Issue = epic.Number
+	}
+	summary := "An open handoff/epic remains but no runnable child issue is eligible."
+	if epic != nil {
+		summary = fmt.Sprintf("Open handoff/epic #%d (%s) has no runnable child issue.", epic.Number, strings.TrimSpace(epic.Title))
+	}
+	return stuckState(state.StuckHandoffEpicNeedsChild, SeverityWarning, summary,
+		"Open the next concrete child issue from the handoff epic so the supervisor can dispatch work.", true, target,
+		"queue_eligible=0",
+		"handoff_epic_open=true")
+}
+
+func preflightFailedStuckState(result PreflightResult, action string) state.SupervisorStuckState {
+	return stuckState(state.StuckPreflightFailed, SeverityBlocked,
+		fmt.Sprintf("Preflight gate failed; refusing to recommend %s.", action),
+		"Fix the failing preflight check (toolchain, auth, asset checksum, runtime reachability) before the supervisor can dispatch.", false, nil,
+		"preflight_ok=false",
+		fmt.Sprintf("preflight_reason=%s", strings.TrimSpace(result.Reason)),
+		fmt.Sprintf("preflight_exit=%d", result.ExitCode))
+}
+
+// sessionRecentlyDoneForIssue reports whether the in-memory state already
+// records a Done or code_landed session for the given issue. Used as a race
+// guard between marking an issue Done and the dispatch loop picking the same
+// issue up again before the GitHub closure is observed.
+func (e *Engine) sessionRecentlyDoneForIssue(st *state.State, issueNumber int) bool {
+	if st == nil || issueNumber <= 0 {
+		return false
+	}
+	for _, sess := range st.Sessions {
+		if sess == nil || sess.IssueNumber != issueNumber {
+			continue
+		}
+		if sess.Status == state.StatusDone || sess.Status == state.StatusCodeLanded {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) nonRunnableProjectStatus(issue github.Issue) (string, bool) {

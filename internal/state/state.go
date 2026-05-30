@@ -445,8 +445,11 @@ type SupervisorProjectState struct {
 }
 
 const (
-	StuckMissingOutcomeBrief = "missing_outcome_brief"
-	StuckNoOutcomeProgress   = "no_outcome_progress"
+	StuckMissingOutcomeBrief    = "missing_outcome_brief"
+	StuckNoOutcomeProgress      = "no_outcome_progress"
+	StuckHandoffEpicNeedsChild  = "handoff_epic_needs_child"
+	StuckPreflightFailed        = "preflight_failed"
+	StuckIssueNeedsVerification = "issue_needs_verification"
 )
 
 // SupervisorIssueCandidate describes the issue selected by queue policy without
@@ -2155,6 +2158,31 @@ func (s *State) ReconcileStaleSessions(now time.Time, policy StaleSessionPolicy,
 		audits = append(audits, audit)
 	}
 	return audits
+}
+
+// HasApprovedSpawnForIssue reports whether a spawn_worker approval for the
+// given issue number is currently in status=approved or status=execution_skipped.
+// The dispatcher uses this to recognize that an operator has already given
+// the go-ahead to spawn a worker for this issue, so a second approval
+// prompt is not required when the next dispatch cycle reaches the issue.
+func (s *State) HasApprovedSpawnForIssue(issueNumber int) bool {
+	if s == nil || issueNumber <= 0 {
+		return false
+	}
+	for i := range s.Approvals {
+		a := &s.Approvals[i]
+		if a.Action != approvalActionSpawnWorker {
+			continue
+		}
+		if a.Target == nil || a.Target.Issue != issueNumber {
+			continue
+		}
+		switch a.Status {
+		case ApprovalStatusApproved, ApprovalStatusExecutionSkipped:
+			return true
+		}
+	}
+	return false
 }
 
 // ListApprovedApprovals returns approvals in status=approved (i.e. ready

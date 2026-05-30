@@ -66,28 +66,136 @@ const (
 
 // SupervisorConfig defines local policy for supervisor decisions.
 type SupervisorConfig struct {
-	Enabled                 bool                         `yaml:"enabled" json:"enabled"`
-	Backend                 string                       `yaml:"backend" json:"backend,omitempty"`
-	Model                   string                       `yaml:"model" json:"model,omitempty"`
-	Effort                  string                       `yaml:"effort" json:"effort,omitempty"`
-	Prompt                  string                       `yaml:"prompt" json:"prompt,omitempty"`
-	DryRun                  bool                         `yaml:"dry_run" json:"dry_run,omitempty"`
-	Mode                    string                       `yaml:"mode" json:"mode"`
-	ReadyLabel              string                       `yaml:"ready_label" json:"ready_label,omitempty"`
-	BlockedLabel            string                       `yaml:"blocked_label" json:"blocked_label,omitempty"`
-	QueueComments           bool                         `yaml:"queue_comments" json:"queue_comments,omitempty"`
-	OneAtATime              bool                         `yaml:"one_at_a_time" json:"one_at_a_time,omitempty"`
-	ExcludedLabels          []string                     `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
-	AllowIssueTypes         []string                     `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
-	OrderedQueue            SupervisorOrderedQueueConfig `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
-	DynamicWave             SupervisorDynamicWaveConfig  `yaml:"dynamic_wave" json:"dynamic_wave,omitempty"`
-	SafeActions             []string                     `yaml:"safe_actions" json:"safe_actions,omitempty"`
-	ApprovalRequired        []string                     `yaml:"approval_required" json:"approval_required,omitempty"`
-	AllowedActions          []string                     `yaml:"allowed_actions" json:"allowed_actions,omitempty"`
-	ApprovalRequiredActions []string                     `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
-	PolicyPath              string                       `yaml:"-" json:"policy_path,omitempty"`
+	Enabled                 bool                            `yaml:"enabled" json:"enabled"`
+	Backend                 string                          `yaml:"backend" json:"backend,omitempty"`
+	Model                   string                          `yaml:"model" json:"model,omitempty"`
+	Effort                  string                          `yaml:"effort" json:"effort,omitempty"`
+	Prompt                  string                          `yaml:"prompt" json:"prompt,omitempty"`
+	DryRun                  bool                            `yaml:"dry_run" json:"dry_run,omitempty"`
+	Mode                    string                          `yaml:"mode" json:"mode"`
+	ReadyLabel              string                          `yaml:"ready_label" json:"ready_label,omitempty"`
+	BlockedLabel            string                          `yaml:"blocked_label" json:"blocked_label,omitempty"`
+	QueueComments           bool                            `yaml:"queue_comments" json:"queue_comments,omitempty"`
+	OneAtATime              bool                            `yaml:"one_at_a_time" json:"one_at_a_time,omitempty"`
+	ExcludedLabels          []string                        `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
+	AllowIssueTypes         []string                        `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
+	OrderedQueue            SupervisorOrderedQueueConfig    `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
+	DynamicWave             SupervisorDynamicWaveConfig     `yaml:"dynamic_wave" json:"dynamic_wave,omitempty"`
+	HandoffPlanner          SupervisorHandoffPlannerConfig  `yaml:"handoff_planner" json:"handoff_planner,omitempty"`
+	PreflightCommand        string                          `yaml:"preflight_command" json:"preflight_command,omitempty"`
+	CompletionGates         SupervisorCompletionGatesConfig `yaml:"completion_gates" json:"completion_gates,omitempty"`
+	SafeActions             []string                        `yaml:"safe_actions" json:"safe_actions,omitempty"`
+	ApprovalRequired        []string                        `yaml:"approval_required" json:"approval_required,omitempty"`
+	AllowedActions          []string                        `yaml:"allowed_actions" json:"allowed_actions,omitempty"`
+	ApprovalRequiredActions []string                        `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
+	PolicyPath              string                          `yaml:"-" json:"policy_path,omitempty"`
 
 	excludedLabelsSet bool
+}
+
+// SupervisorHandoffPlannerConfig describes the supervisor-owned continuation
+// from an open handoff/epic issue to the next runnable child issue. When the
+// dynamic-wave queue has no eligible runnable issues but an open handoff epic
+// remains, the supervisor uses this config to recommend (and, in a future
+// PR, execute) the creation of the next concrete child issue instead of
+// silently idling on "none".
+//
+// v1 is intentionally narrow: it owns the deterministic detection +
+// recommendation path. The actual child-issue creation is approval-gated
+// until the safe-action `open_child_issue` lands.
+type SupervisorHandoffPlannerConfig struct {
+	Enabled                      *bool    `yaml:"enabled" json:"enabled,omitempty"`
+	SourceIssueLabels            []string `yaml:"source_issue_labels" json:"source_issue_labels,omitempty"`
+	ChildReadyLabel              string   `yaml:"child_ready_label" json:"child_ready_label,omitempty"`
+	ChildBlockedLabel            string   `yaml:"child_blocked_label" json:"child_blocked_label,omitempty"`
+	MaxChildrenPerCycle          int      `yaml:"max_children_per_cycle" json:"max_children_per_cycle,omitempty"`
+	MaxOpenChildren              int      `yaml:"max_open_children" json:"max_open_children,omitempty"`
+	IssueTemplate                string   `yaml:"issue_template" json:"issue_template,omitempty"`
+	ParseSections                []string `yaml:"parse_sections" json:"parse_sections,omitempty"`
+	PreflightCommand             string   `yaml:"preflight_command" json:"preflight_command,omitempty"`
+	RequirePreflightBeforeCreate bool     `yaml:"require_preflight_before_create" json:"require_preflight_before_create,omitempty"`
+	RequirePreflightBeforeSpawn  bool     `yaml:"require_preflight_before_spawn" json:"require_preflight_before_spawn,omitempty"`
+}
+
+// Active reports whether the handoff planner path should be considered.
+// Default is disabled (planner only runs when explicitly enabled per project).
+func (h SupervisorHandoffPlannerConfig) Active() bool {
+	return h.Enabled != nil && *h.Enabled
+}
+
+// EffectiveSourceLabels returns the configured source labels with sensible
+// defaults ("epic", "design-handoff") when none are set explicitly.
+func (h SupervisorHandoffPlannerConfig) EffectiveSourceLabels() []string {
+	if len(h.SourceIssueLabels) > 0 {
+		return h.SourceIssueLabels
+	}
+	return []string{"epic", "design-handoff"}
+}
+
+// SupervisorCompletionGatesConfig configures the issue-specific completion
+// gates that apply after a PR merges. Runtime health alone is not enough to
+// close issues that require live visual or deployment verification — when
+// any gate label or body marker is present, the supervisor must not collapse
+// the Done check to healthz.
+type SupervisorCompletionGatesConfig struct {
+	RequiredLabels      []string `yaml:"required_labels" json:"required_labels,omitempty"`
+	BodyMarkers         []string `yaml:"body_markers" json:"body_markers,omitempty"`
+	LiveVisualCommand   string   `yaml:"live_visual_command" json:"live_visual_command,omitempty"`
+	DeploymentStatusCmd string   `yaml:"deployment_status_command" json:"deployment_status_command,omitempty"`
+	VerificationLabel   string   `yaml:"verification_label" json:"verification_label,omitempty"`
+}
+
+// Active reports whether any issue-specific completion gate is configured.
+// A nil/zero CompletionGates means callers should keep the legacy
+// healthz-only behaviour, so existing projects are unaffected.
+func (g SupervisorCompletionGatesConfig) Active() bool {
+	return len(g.RequiredLabels) > 0 ||
+		len(g.BodyMarkers) > 0 ||
+		strings.TrimSpace(g.LiveVisualCommand) != "" ||
+		strings.TrimSpace(g.DeploymentStatusCmd) != "" ||
+		strings.TrimSpace(g.VerificationLabel) != ""
+}
+
+// IssueRequiresLiveVerification reports whether the issue (identified by its
+// labels and body) requires live/visual verification before it can be
+// treated as Done. Callers use this in two places:
+//
+//   - the post-merge close pipeline: refuse to close the issue on healthz
+//     alone when this returns true;
+//   - the supervisor handoff/dispatch: surface a "needs verification"
+//     stuck-state so an operator can see what is still open.
+//
+// The match is case-insensitive on labels and a plain substring scan on
+// body markers — small, predictable, no regex.
+func (g SupervisorCompletionGatesConfig) IssueRequiresLiveVerification(labels []string, body string) bool {
+	if !g.Active() {
+		return false
+	}
+	lowerBody := strings.ToLower(body)
+	for _, label := range labels {
+		l := strings.ToLower(strings.TrimSpace(label))
+		if l == "" {
+			continue
+		}
+		for _, required := range g.RequiredLabels {
+			if strings.EqualFold(strings.TrimSpace(required), l) {
+				return true
+			}
+		}
+		if v := strings.TrimSpace(g.VerificationLabel); v != "" && strings.EqualFold(v, l) {
+			return true
+		}
+	}
+	for _, marker := range g.BodyMarkers {
+		m := strings.ToLower(strings.TrimSpace(marker))
+		if m == "" {
+			continue
+		}
+		if strings.Contains(lowerBody, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // SupervisorOrderedQueueConfig pins supervisor selection to a fixed issue order.
@@ -520,6 +628,8 @@ func parse(data []byte) (*Config, error) {
 			"spawn_repair_worker",
 			"label_issue_ready",
 			"add_ready_label",
+			"open_child_issue",
+			"preflight_failed",
 		}
 	}
 	if cfg.Supervisor.ApprovalRequiredActions == nil {
@@ -529,6 +639,7 @@ func parse(data []byte) (*Config, error) {
 			"spawn_repair_worker",
 			"label_issue_ready",
 			"add_ready_label",
+			"open_child_issue",
 		}
 	}
 
@@ -713,16 +824,34 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	}
 	policy.ReadyLabel = strings.TrimSpace(policy.ReadyLabel)
 	policy.BlockedLabel = strings.TrimSpace(policy.BlockedLabel)
+	policy.PreflightCommand = strings.TrimSpace(policy.PreflightCommand)
 	policy.ExcludedLabels = normalizeStringList(policy.ExcludedLabels)
 	policy.AllowIssueTypes = normalizeStringList(policy.AllowIssueTypes)
 	policy.SafeActions = normalizeActionList(policy.SafeActions)
 	policy.ApprovalRequired = normalizeActionList(policy.ApprovalRequired)
+	policy.HandoffPlanner.SourceIssueLabels = normalizeStringList(policy.HandoffPlanner.SourceIssueLabels)
+	policy.HandoffPlanner.ChildReadyLabel = strings.TrimSpace(policy.HandoffPlanner.ChildReadyLabel)
+	policy.HandoffPlanner.ChildBlockedLabel = strings.TrimSpace(policy.HandoffPlanner.ChildBlockedLabel)
+	policy.HandoffPlanner.IssueTemplate = strings.TrimSpace(policy.HandoffPlanner.IssueTemplate)
+	policy.HandoffPlanner.PreflightCommand = strings.TrimSpace(policy.HandoffPlanner.PreflightCommand)
+	policy.HandoffPlanner.ParseSections = normalizeStringList(policy.HandoffPlanner.ParseSections)
+	policy.CompletionGates.RequiredLabels = normalizeStringList(policy.CompletionGates.RequiredLabels)
+	policy.CompletionGates.BodyMarkers = normalizeStringList(policy.CompletionGates.BodyMarkers)
+	policy.CompletionGates.LiveVisualCommand = strings.TrimSpace(policy.CompletionGates.LiveVisualCommand)
+	policy.CompletionGates.DeploymentStatusCmd = strings.TrimSpace(policy.CompletionGates.DeploymentStatusCmd)
+	policy.CompletionGates.VerificationLabel = strings.TrimSpace(policy.CompletionGates.VerificationLabel)
 
 	if !policy.excludedLabelsSet && len(policy.ExcludedLabels) == 0 {
 		policy.ExcludedLabels = []string{"epic", "meta"}
 	}
 	if len(policy.AllowIssueTypes) > 0 {
 		policy.ExcludedLabels = removeAllowedIssueTypes(policy.ExcludedLabels, policy.AllowIssueTypes)
+	}
+	if policy.HandoffPlanner.MaxChildrenPerCycle < 0 {
+		policy.HandoffPlanner.MaxChildrenPerCycle = 0
+	}
+	if policy.HandoffPlanner.MaxOpenChildren < 0 {
+		policy.HandoffPlanner.MaxOpenChildren = 0
 	}
 	return validateSupervisorPolicy(*policy)
 }
