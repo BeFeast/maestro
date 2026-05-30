@@ -168,7 +168,7 @@ Object.assign(window, { Icon, Heartbeat, Sparkline, Stat, Pill, Segmented, Panel
 // approve/reject flows. open=true mounts and shows the dialog; onClose
 // fires for both confirm and cancel paths (the caller distinguishes via
 // onConfirm). Body content is passed as children.
-export function ConfirmDialog({ open, title, children, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false, onConfirm, onClose }) {
+export function ConfirmDialog({ open, title, children, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false, busy = false, onConfirm, onClose }) {
   const ref = React.useRef(null);
   React.useEffect(() => {
     const el = ref.current;
@@ -187,8 +187,8 @@ export function ConfirmDialog({ open, title, children, confirmLabel = "Confirm",
         <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>{title}</h3>
         <div style={{ marginTop: 12, fontSize: 13, lineHeight: 1.4 }}>{children}</div>
         <div style={{ marginTop: 16, display: "flex", gap: 8, justifyContent: "flex-end" }}>
-          <button type="button" className="tb-btn" onClick={onClose}>{cancelLabel}</button>
-          <button type="button" className={"tb-btn " + (danger ? "danger" : "primary")} onClick={onConfirm}>{confirmLabel}</button>
+          <button type="button" className="tb-btn" disabled={busy} onClick={onClose}>{cancelLabel}</button>
+          <button type="button" className={"tb-btn " + (danger ? "danger" : "primary")} disabled={busy} onClick={onConfirm}>{busy ? "…" : confirmLabel}</button>
         </div>
       </form>
     </dialog>
