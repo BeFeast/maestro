@@ -2663,6 +2663,7 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		GH:        gh,
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
+		Sessions:  approver.SessionLookupFunc(st.SessionAt),
 	}
 	for _, a := range approvals {
 		res := ex.Execute(a)
