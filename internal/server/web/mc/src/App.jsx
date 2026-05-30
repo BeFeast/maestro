@@ -21,7 +21,16 @@ function parseRoute(pathname, search) {
   if (path === "/settings") return { screen: "settings" };
   const projectMatch = path.match(/^\/project\/(.+)$/);
   if (projectMatch) {
-    return { screen: "project", slug: decodeURIComponent(projectMatch[1]) };
+    let slug;
+    try {
+      slug = decodeURIComponent(projectMatch[1]);
+    } catch (e) {
+      // Malformed percent-encoding (e.g. /project/%E0%A4%A) — degrade
+      // to the fleet screen instead of white-screening the dashboard.
+      // See issue #473.
+      return { screen: "fleet" };
+    }
+    return { screen: "project", slug };
   }
   return { screen: "fleet" };
 }

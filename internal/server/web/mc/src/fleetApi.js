@@ -351,6 +351,12 @@ export function workerSessionsFromFleet(fleet, now) {
   const startOfDay = new Date(now);
   startOfDay.setHours(0, 0, 0, 0);
   const dayStart = startOfDay.getTime();
+  // Real 7-day cutoff: today + the previous 6 days. olderCount counts
+  // only sessions finished within that window but before today, so the
+  // "7d" view label matches what the number actually represents. See
+  // issue #473.
+  const sevenDayCutoff = dayStart - 6 * 24 * 60 * 60 * 1000;
+  let olderCount = 0;
 
   for (const worker of fleet.workers || []) {
     if (worker.live) {
@@ -358,10 +364,14 @@ export function workerSessionsFromFleet(fleet, now) {
       continue;
     }
     const finished = parseTimestamp(worker.finished_at) || worker.age;
-    if (finished && finished >= dayStart) today.push(worker);
+    if (!finished) continue;
+    if (finished >= dayStart) {
+      today.push(worker);
+    } else if (finished >= sevenDayCutoff) {
+      olderCount += 1;
+    }
   }
 
-  const olderCount = Math.max(0, (fleet.workers || []).filter(w => !w.live).length - today.length);
   return {
     live,
     today,
