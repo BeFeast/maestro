@@ -52,12 +52,12 @@ type Executor struct {
 // Result describes the outcome of executing one approval.
 //
 //   - Status         — terminal state to transition the approval to:
-//                      executed | execution_failed | execution_skipped.
+//     executed | execution_failed | execution_skipped.
 //   - Summary        — short human-facing line for the audit entry and
-//                      CLI output.
+//     CLI output.
 //   - Err            — non-nil only when Status == execution_failed; the
-//                      caller marks failure and surfaces err to its
-//                      operator (CLI exit code, supervisor log).
+//     caller marks failure and surfaces err to its
+//     operator (CLI exit code, supervisor log).
 type Result struct {
 	Status  state.ApprovalStatus
 	Summary string
@@ -100,6 +100,43 @@ func (e *Executor) Execute(approval *state.Approval) Result {
 		return Result{
 			Status:  state.ApprovalStatusExecutionSkipped,
 			Summary: "change_global_config requires a manual edit + systemctl restart (executor not implemented)",
+		}
+	case "spawn_worker":
+		// The approver runs in the supervisor cycle; it does not own the
+		// dispatch loop that actually spawns workers. Mark the approval
+		// as execution_skipped with a clear, actionable summary so the
+		// CLI / dashboard stops printing "No risky action was executed"
+		// and the operator knows the next supervisor/dispatch loop will
+		// pick the issue up automatically. ReconcileSpawnWorkerApprovals*
+		// then supersedes this approval once the matching worker starts.
+		issue := 0
+		if approval.Target != nil {
+			issue = approval.Target.Issue
+		}
+		summary := "spawn_worker approval recorded; next dispatcher loop will start the worker"
+		if issue > 0 {
+			summary = fmt.Sprintf("spawn_worker for issue #%d approved; next dispatcher loop will start the worker (no extra command required)", issue)
+		}
+		return Result{
+			Status:  state.ApprovalStatusExecutionSkipped,
+			Summary: summary,
+		}
+	case "open_child_issue":
+		// Same shape as spawn_worker: the v1 supervisor records the
+		// intent, but the safe-action executor for create_issue lands
+		// in a follow-up PR. Skipped, not failed, so the operator sees
+		// an actionable summary instead of a noisy execution_failed.
+		issue := 0
+		if approval.Target != nil {
+			issue = approval.Target.Issue
+		}
+		summary := "open_child_issue approval recorded; safe-action executor not yet wired (operator must create the next child issue manually for now)"
+		if issue > 0 {
+			summary = fmt.Sprintf("open_child_issue for handoff epic #%d approved; operator must create the next child issue manually until the safe-action executor lands", issue)
+		}
+		return Result{
+			Status:  state.ApprovalStatusExecutionSkipped,
+			Summary: summary,
 		}
 	}
 	return Result{

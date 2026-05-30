@@ -342,6 +342,8 @@ func defaultAllowedActions() []string {
 		ActionSpawnWorker,
 		ActionSpawnRepairWorker,
 		ActionLabelIssueReady,
+		ActionOpenChildIssue,
+		ActionPreflightFailed,
 	}
 }
 
@@ -351,6 +353,7 @@ func defaultApprovalRequiredActions() []string {
 		ActionSpawnWorker,
 		ActionSpawnRepairWorker,
 		ActionLabelIssueReady,
+		ActionOpenChildIssue,
 	}
 }
 
@@ -378,6 +381,10 @@ func canonicalAction(action string) string {
 		return ActionSpawnRepairWorker
 	case ActionLabelIssueReady, "add_ready_label":
 		return ActionLabelIssueReady
+	case ActionOpenChildIssue, "create_issue", "create_child_issue":
+		return ActionOpenChildIssue
+	case ActionPreflightFailed:
+		return ActionPreflightFailed
 	default:
 		return ""
 	}
