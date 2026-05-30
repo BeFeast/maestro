@@ -23,6 +23,8 @@ jobs:
         run: bash scripts/check-design-tokens.sh
       - name: Design recipe guard
         run: bash scripts/check-design-recipes.sh
+      - name: Design recipe nesting guard
+        run: bash scripts/check-design-recipe-nesting.sh
       - name: Build MC bundle
         working-directory: internal/server/web/mc
         run: bun run build
@@ -35,6 +37,7 @@ jobs:
           fi
 
   build:
+    needs: frontend-build
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
