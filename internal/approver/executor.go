@@ -311,11 +311,8 @@ func WorktreePathForSlot(cfg *config.Config, slot string) (string, error) {
 		return "", errors.New("cfg.worktree_base is not set")
 	}
 	clean := strings.TrimSpace(slot)
-	if clean == "" {
-		return "", errors.New("slot is empty")
-	}
-	if strings.ContainsAny(clean, "/\\") || clean == "." || clean == ".." {
-		return "", fmt.Errorf("slot %q contains a path separator or traversal segment; refusing", slot)
+	if err := state.ValidateSlotID(clean); err != nil {
+		return "", err
 	}
 	// filepath.Join intentionally not imported here — concatenate via "/"
 	// to keep the boundary explicit and predictable on the path.
