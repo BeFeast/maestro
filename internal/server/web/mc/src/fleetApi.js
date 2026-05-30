@@ -346,21 +346,34 @@ export function deriveTapeEvents(project, workers, now) {
 }
 
 export function workerSessionsFromFleet(fleet, now) {
-  const live = [];
+  // Three distinct concepts (issue #496):
+  //   - running  = `worker.status === "running"` — actually executing right now.
+  //   - recent   = `worker.live` (24-h activity window from the server).
+  //                Includes terminal sessions that finished in the last 24 h.
+  //   - today    = terminal worker that finished today.
+  //   - older    = terminal worker finished within the last 7 days but not today.
+  //
+  // The "N workers in flight" hero MUST read `running`, not `recent`.
+  // `live` is kept as an alias of `recent` for backward compatibility
+  // with older callers / future-removed; new code should use `running`
+  // or `recent` explicitly.
+  const running = [];
+  const recent = [];
   const today = [];
   const startOfDay = new Date(now);
   startOfDay.setHours(0, 0, 0, 0);
   const dayStart = startOfDay.getTime();
   // Real 7-day cutoff: today + the previous 6 days. olderCount counts
-  // only sessions finished within that window but before today, so the
-  // "7d" view label matches what the number actually represents. See
-  // issue #473.
+  // only sessions finished within that window but before today (#473).
   const sevenDayCutoff = dayStart - 6 * 24 * 60 * 60 * 1000;
   let olderCount = 0;
 
   for (const worker of fleet.workers || []) {
+    if (worker.status === "running") {
+      running.push(worker);
+    }
     if (worker.live) {
-      live.push(worker);
+      recent.push(worker);
       continue;
     }
     const finished = parseTimestamp(worker.finished_at) || worker.age;
@@ -373,7 +386,12 @@ export function workerSessionsFromFleet(fleet, now) {
   }
 
   return {
-    live,
+    running,
+    runningCount: running.length,
+    recent,
+    recentCount: recent.length,
+    // Backward-compat alias: `live` === `recent`.
+    live: recent,
     today,
     todayCount: today.length,
     olderCount,
