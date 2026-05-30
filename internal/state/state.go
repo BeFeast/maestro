@@ -599,19 +599,25 @@ type SupervisorDecision struct {
 type ApprovalStatus string
 
 const (
-	ApprovalStatusPending    ApprovalStatus = "pending"
-	ApprovalStatusApproved   ApprovalStatus = "approved"
-	ApprovalStatusRejected   ApprovalStatus = "rejected"
-	ApprovalStatusStale      ApprovalStatus = "stale"
-	ApprovalStatusSuperseded ApprovalStatus = "superseded"
+	ApprovalStatusPending          ApprovalStatus = "pending"
+	ApprovalStatusApproved         ApprovalStatus = "approved"
+	ApprovalStatusRejected         ApprovalStatus = "rejected"
+	ApprovalStatusStale            ApprovalStatus = "stale"
+	ApprovalStatusSuperseded       ApprovalStatus = "superseded"
+	ApprovalStatusExecuted         ApprovalStatus = "executed"
+	ApprovalStatusExecutionFailed  ApprovalStatus = "execution_failed"
+	ApprovalStatusExecutionSkipped ApprovalStatus = "execution_skipped"
 )
 
 const (
-	ApprovalAuditCreated    = "created"
-	ApprovalAuditApproved   = "approved"
-	ApprovalAuditRejected   = "rejected"
-	ApprovalAuditStale      = "stale"
-	ApprovalAuditSuperseded = "superseded"
+	ApprovalAuditCreated          = "created"
+	ApprovalAuditApproved         = "approved"
+	ApprovalAuditRejected         = "rejected"
+	ApprovalAuditStale            = "stale"
+	ApprovalAuditSuperseded       = "superseded"
+	ApprovalAuditExecuted         = "executed"
+	ApprovalAuditExecutionFailed  = "execution_failed"
+	ApprovalAuditExecutionSkipped = "execution_skipped"
 )
 
 const approvalActionSpawnWorker = "spawn_worker"
@@ -2111,4 +2117,99 @@ func (s *State) ReconcileStaleSessions(now time.Time, policy StaleSessionPolicy,
 		audits = append(audits, audit)
 	}
 	return audits
+}
+
+// ListApprovedApprovals returns approvals in status=approved (i.e. ready
+// to be executed by the approver pipeline). Order: oldest first by
+// CreatedAt, so the executor picks them up FIFO.
+func (s *State) ListApprovedApprovals() []*Approval {
+	if s == nil {
+		return nil
+	}
+	out := make([]*Approval, 0)
+	for i := range s.Approvals {
+		if s.Approvals[i].Status == ApprovalStatusApproved {
+			out = append(out, &s.Approvals[i])
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// ErrApprovalNotApproved is returned when MarkApprovalExecuted /
+// MarkApprovalExecutionFailed / MarkApprovalExecutionSkipped is called on
+// an approval that is not in status=approved (e.g. already executed).
+var ErrApprovalNotApproved = errors.New("approval is not in status=approved")
+
+// MarkApprovalExecuted transitions an approval from approved → executed
+// and appends an audit entry. Idempotent at the caller boundary: if the
+// approval has already been executed (or moved to any non-approved
+// state), returns ErrApprovalNotApproved without mutating state — so a
+// concurrent executor cannot double-execute.
+func (s *State) MarkApprovalExecuted(id string, now time.Time, actor, summary string) (*Approval, error) {
+	approval, ok := s.FindApproval(id)
+	if !ok {
+		return nil, ErrApprovalNotFound
+	}
+	if approval.Status != ApprovalStatusApproved {
+		return approval, ErrApprovalNotApproved
+	}
+	approval.Status = ApprovalStatusExecuted
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditExecuted,
+		Actor:           actor,
+		Reason:          summary,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	return approval, nil
+}
+
+// MarkApprovalExecutionFailed transitions approved → execution_failed.
+// Same idempotency guarantee as MarkApprovalExecuted.
+func (s *State) MarkApprovalExecutionFailed(id string, now time.Time, actor, errMsg string) (*Approval, error) {
+	approval, ok := s.FindApproval(id)
+	if !ok {
+		return nil, ErrApprovalNotFound
+	}
+	if approval.Status != ApprovalStatusApproved {
+		return approval, ErrApprovalNotApproved
+	}
+	approval.Status = ApprovalStatusExecutionFailed
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditExecutionFailed,
+		Actor:           actor,
+		Reason:          errMsg,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	return approval, nil
+}
+
+// MarkApprovalExecutionSkipped transitions approved → execution_skipped
+// with an audit reason. Used for verbs the executor intentionally does
+// not run yet (e.g. change_global_config until the YAML pipeline lands).
+func (s *State) MarkApprovalExecutionSkipped(id string, now time.Time, actor, reason string) (*Approval, error) {
+	approval, ok := s.FindApproval(id)
+	if !ok {
+		return nil, ErrApprovalNotFound
+	}
+	if approval.Status != ApprovalStatusApproved {
+		return approval, ErrApprovalNotApproved
+	}
+	approval.Status = ApprovalStatusExecutionSkipped
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditExecutionSkipped,
+		Actor:           actor,
+		Reason:          reason,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	return approval, nil
 }
