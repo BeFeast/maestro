@@ -523,25 +523,30 @@ function ApprovalRow({ a }) {
   const canMutate = !!a.id && fleet && fleet.readOnly === false;
   const [busy, setBusy] = React.useState(false);
   const [pendingVerb, setPendingVerb] = React.useState(null); // "approve" | "reject" | null
+  const [pendingReason, setPendingReason] = React.useState("");
   const [errMsg, setErrMsg] = React.useState(null);
+  const closeDialog = React.useCallback(() => {
+    setPendingVerb(null);
+    setPendingReason("");
+  }, []);
   const send = React.useCallback(async (verb) => {
     setBusy(true);
     setErrMsg(null);
+    const reason = pendingReason.trim();
     try {
-      const reason = (window.prompt(`Optional reason for ${verb}:`, "") || "").trim();
       if (a.project) {
         await postFleetApproval({ approvalId: a.id, project: a.project, verb, reason });
       } else {
         await postProjectApproval({ approvalId: a.id, verb, reason });
       }
-      setPendingVerb(null);
+      closeDialog();
       await refresh();
     } catch (err) {
       setErrMsg(err && err.message ? err.message : String(err));
     } finally {
       setBusy(false);
     }
-  }, [a.id, a.project, refresh]);
+  }, [a.id, a.project, pendingReason, refresh, closeDialog]);
   return (
     <div className={`app-row ${a.state}`}>
       <div className="app-row-stage">
@@ -568,14 +573,50 @@ function ApprovalRow({ a }) {
               title={pendingVerb === "approve" ? `Approve ${a.id}?` : `Reject ${a.id}?`}
               danger={pendingVerb === "reject"}
               confirmLabel={pendingVerb === "approve" ? "Approve" : "Reject"}
-              onClose={() => setPendingVerb(null)}
+              busy={busy}
+              onClose={closeDialog}
               onConfirm={() => send(pendingVerb)}
             >
               <div className="mono dim" style={{ fontSize: 11, marginBottom: 8 }}>
                 action: {actionLabel(a.action)} · project: {a.project || "—"}
                 {a.pr ? ` · PR #${a.pr}` : ""}
               </div>
-              <div>You will be prompted for an optional reason. The approval moves to <strong>{pendingVerb}d</strong> immediately; for approved {actionLabel(a.action)}, the maestro supervisor (or the CLI) will execute the side effect.</div>
+              <div style={{ marginBottom: 12, fontSize: 12, color: "var(--fg-2)" }}>
+                The approval moves to <strong>{pendingVerb === "approve" ? "approved" : "rejected"}</strong> immediately; for approved <strong>{actionLabel(a.action)}</strong>, the maestro supervisor (or the CLI) executes the side effect.
+              </div>
+              <label htmlFor={`reason-${a.id}`} style={{ display: "block", fontSize: 11, color: "var(--fg-2)", marginBottom: 4 }}>
+                Reason <span className="dim">(optional, recorded in the approval audit)</span>
+              </label>
+              <textarea
+                id={`reason-${a.id}`}
+                value={pendingReason}
+                onChange={e => setPendingReason(e.target.value)}
+                placeholder={pendingVerb === "approve" ? "e.g. CI green, manual smoke ok" : "e.g. failing on review item X"}
+                autoFocus
+                rows={3}
+                disabled={busy}
+                style={{
+                  width: "100%",
+                  fontFamily: "inherit",
+                  fontSize: 13,
+                  padding: 8,
+                  border: "1px solid var(--border-1)",
+                  borderRadius: "var(--r-2)",
+                  background: "var(--bg-0)",
+                  color: "var(--fg-0)",
+                  resize: "vertical",
+                  boxSizing: "border-box",
+                }}
+                onKeyDown={e => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                    e.preventDefault();
+                    if (!busy) send(pendingVerb);
+                  }
+                }}
+              />
+              <div className="mono dim" style={{ fontSize: 10, marginTop: 4 }}>
+                ⌘/Ctrl+Enter to {pendingVerb}, Esc to cancel.
+              </div>
             </ConfirmDialog>
           </>
         )}
