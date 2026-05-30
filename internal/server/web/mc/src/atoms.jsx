@@ -134,3 +134,34 @@ export function QueueBar({ ready = 0, held = 0, blocked = 0, height = 6 }) {
     </div>
   );
 }
+
+// ConfirmDialog is a minimal, dependency-free <dialog> wrapper used by
+// approve/reject flows. open=true mounts and shows the dialog; onClose
+// fires for both confirm and cancel paths (the caller distinguishes via
+// onConfirm). Body content is passed as children.
+export function ConfirmDialog({ open, title, children, confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false, onConfirm, onClose }) {
+  const ref = React.useRef(null);
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (open && !el.open) {
+      try { el.showModal(); } catch (_) { el.show(); }
+    }
+    if (!open && el.open) {
+      el.close();
+    }
+  }, [open]);
+  if (!open) return null;
+  return (
+    <dialog ref={ref} className="mc-confirm-dialog" onClose={onClose}>
+      <form method="dialog" onSubmit={e => { e.preventDefault(); }}>
+        <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>{title}</h3>
+        <div style={{ marginTop: 12, fontSize: 13, lineHeight: 1.4 }}>{children}</div>
+        <div style={{ marginTop: 16, display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button type="button" className="tb-btn" onClick={onClose}>{cancelLabel}</button>
+          <button type="button" className={"tb-btn " + (danger ? "danger" : "primary")} onClick={onConfirm}>{confirmLabel}</button>
+        </div>
+      </form>
+    </dialog>
+  );
+}

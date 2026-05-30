@@ -42,6 +42,7 @@ export async function fetchWorkerDetail(project, slot, lines = 260) {
 export function mapFleetResponse(raw, now = Date.now()) {
   const workers = collectWorkers(raw);
   const approvals = collectApprovals(raw);
+  // (postApproval / postFleetApproval helpers are exported below.)
   const projects = (raw.projects || []).map(p => mapProject(p, workers, now));
   const summary = raw.summary || {};
   const verdictTone = mapVerdictUiTone(raw.verdict?.tone);
@@ -416,4 +417,51 @@ export function refreshFleetTapeEvents(fleet, now) {
       tapeEvents: deriveTapeEvents(project.raw || project, fleet.workers || [], now),
     })),
   };
+}
+
+// postFleetApproval / postProjectApproval drive the new HTTP approve/reject
+// endpoints (#476A). They return the updated approval JSON on success and
+// throw an Error with the server-supplied message on any non-2xx, so the
+// caller can show it inline in the dashboard.
+export async function postFleetApproval({ approvalId, project, verb, actor, reason }) {
+  if (!approvalId) throw new Error("approvalId is required");
+  if (!project) throw new Error("project is required");
+  if (verb !== "approve" && verb !== "reject") throw new Error("verb must be approve|reject");
+  const url = `/api/v1/fleet/approvals/${encodeURIComponent(approvalId)}/${verb}?project=${encodeURIComponent(project)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ actor: actor || "dashboard", reason: reason || "" }),
+  });
+  return parseApprovalResponse(res, verb);
+}
+
+export async function postProjectApproval({ approvalId, verb, actor, reason }) {
+  if (!approvalId) throw new Error("approvalId is required");
+  if (verb !== "approve" && verb !== "reject") throw new Error("verb must be approve|reject");
+  const url = `/api/v1/approvals/${encodeURIComponent(approvalId)}/${verb}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ actor: actor || "dashboard", reason: reason || "" }),
+  });
+  return parseApprovalResponse(res, verb);
+}
+
+async function parseApprovalResponse(res, verb) {
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch (_) {
+    // non-JSON body; fall through with payload=null
+  }
+  if (!res.ok) {
+    const msg =
+      (payload && (payload.error || payload.message)) ||
+      `${verb} request failed with status ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return payload;
 }
