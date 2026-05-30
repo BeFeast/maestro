@@ -1,9 +1,11 @@
 import React from "react";
-import { Icon, Panel, Pill, QueueBar, Segmented } from "./atoms.jsx";
+import { Icon, Panel, Pill, QueueBar, Segmented, ConfirmDialog } from "./atoms.jsx";
 import { useFleet } from "./fleetContext.jsx";
 import {
   actionLabel,
   fetchWorkerDetail,
+  postFleetApproval,
+  postProjectApproval,
   projectBySlug,
   supervisorDecisionsFromProject,
   workerSessionsFromFleet,
@@ -517,6 +519,29 @@ export function ApprovalsScreen({ navigate }) {
 
 function ApprovalRow({ a }) {
   const overdue = a.past_sla || a.ageMin > a.sla;
+  const { fleet, refresh } = useFleet();
+  const canMutate = !!a.id && fleet && fleet.readOnly === false;
+  const [busy, setBusy] = React.useState(false);
+  const [pendingVerb, setPendingVerb] = React.useState(null); // "approve" | "reject" | null
+  const [errMsg, setErrMsg] = React.useState(null);
+  const send = React.useCallback(async (verb) => {
+    setBusy(true);
+    setErrMsg(null);
+    try {
+      const reason = (window.prompt(`Optional reason for ${verb}:`, "") || "").trim();
+      if (a.project) {
+        await postFleetApproval({ approvalId: a.id, project: a.project, verb, reason });
+      } else {
+        await postProjectApproval({ approvalId: a.id, verb, reason });
+      }
+      setPendingVerb(null);
+      await refresh();
+    } catch (err) {
+      setErrMsg(err && err.message ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }, [a.id, a.project, refresh]);
   return (
     <div className={`app-row ${a.state}`}>
       <div className="app-row-stage">
@@ -534,6 +559,29 @@ function ApprovalRow({ a }) {
         <span className={`age ${overdue ? "bad" : ""}`}>{a.ageMin}m {overdue && `· SLA ${a.sla}m`}</span>
         <Pill tone={a.state} noDot>{overdue ? "past SLA" : "waiting"}</Pill>
         {a.pr_url && <a className="tb-btn primary" style={{ fontSize: 11 }} href={a.pr_url} target="_blank" rel="noreferrer">Open PR →</a>}
+        {canMutate && (
+          <>
+            <button className="tb-btn" disabled={busy} style={{ fontSize: 11 }} onClick={() => setPendingVerb("approve")} title="Approve this approval">Approve</button>
+            <button className="tb-btn danger" disabled={busy} style={{ fontSize: 11 }} onClick={() => setPendingVerb("reject")} title="Reject this approval">Reject</button>
+            <ConfirmDialog
+              open={pendingVerb !== null}
+              title={pendingVerb === "approve" ? `Approve ${a.id}?` : `Reject ${a.id}?`}
+              danger={pendingVerb === "reject"}
+              confirmLabel={pendingVerb === "approve" ? "Approve" : "Reject"}
+              onClose={() => setPendingVerb(null)}
+              onConfirm={() => send(pendingVerb)}
+            >
+              <div className="mono dim" style={{ fontSize: 11, marginBottom: 8 }}>
+                action: {actionLabel(a.action)} · project: {a.project || "—"}
+                {a.pr ? ` · PR #${a.pr}` : ""}
+              </div>
+              <div>You will be prompted for an optional reason. The approval moves to <strong>{pendingVerb}d</strong> immediately; for approved {actionLabel(a.action)}, the maestro supervisor (or the CLI) will execute the side effect.</div>
+            </ConfirmDialog>
+          </>
+        )}
+        {errMsg && (
+          <div className="mono dim" style={{ color: "var(--bad, #c33)", fontSize: 11 }}>{errMsg}</div>
+        )}
       </div>
     </div>
   );
