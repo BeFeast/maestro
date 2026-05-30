@@ -63,6 +63,46 @@ func TestParseRESTPullsMapsFields(t *testing.T) {
 	}
 }
 
+func TestPRReferencesIssue_IgnoresCodeAndLogs(t *testing.T) {
+	// #468: a #N mention that lives only inside a fenced code block or inline
+	// code span (pasted logs/output) must NOT link the PR to issue N, while a
+	// prose reference (the Maestro "Refs #N" convention) still must.
+	fencedBody := "Refs #466\n\n" +
+		"Live evidence:\n" +
+		"```\n" +
+		"[orch] starting worker for issue #353 ... (backend=codex ...)\n" +
+		"```\n"
+	inlineBody := "Refs #466. Unrelated log token `#353` pasted inline.\n"
+	proseBody := "This PR addresses the drift detector. Refs #353.\n"
+	longFenceBody := "Refs #466\n\n`````markdown\n" +
+		"see issue #353 in the log\n" +
+		"```\n" + // a shorter fence inside the longer fence is content, not a closer
+		"still #353 inside\n" +
+		"`````\n"
+
+	tests := []struct {
+		name  string
+		pr    PR
+		issue int
+		want  bool
+	}{
+		{"fenced #353 does not match", PR{Title: "fix: reconcile rate limit", Body: fencedBody}, 353, false},
+		{"fenced PR still matches its real issue 466", PR{Title: "fix: reconcile rate limit", Body: fencedBody}, 466, true},
+		{"inline-code #353 does not match", PR{Title: "fix", Body: inlineBody}, 353, false},
+		{"prose Refs #353 matches", PR{Title: "fix", Body: proseBody}, 353, true},
+		{"#353 inside a long ````` fence does not match", PR{Title: "fix", Body: longFenceBody}, 353, false},
+		{"title reference still matches", PR{Title: "Fixes #7", Body: ""}, 7, true},
+		{"word-boundary: #7 does not match #70", PR{Title: "Fixes #7", Body: ""}, 70, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := prReferencesIssue(tc.pr, tc.issue); got != tc.want {
+				t.Fatalf("prReferencesIssue(issue=%d) = %v, want %v", tc.issue, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRESTIssueStateClosedAcceptsRESTLowercase(t *testing.T) {
 	for _, state := range []string{"closed", "CLOSED", " Closed "} {
 		if !restIssueStateClosed(state) {
