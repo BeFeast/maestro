@@ -246,6 +246,12 @@ type fleetNextAction struct {
 type fleetVerdict struct {
 	Tone     string `json:"tone"`
 	Sentence string `json:"sentence"`
+	// Headline + Detail are the short, structured form the SPA hero
+	// renders (issue #474). The legacy Sentence is preserved for
+	// backward compatibility and as a tooltip / fallback. The SPA
+	// prefers Headline+Detail when present.
+	Headline string `json:"headline,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 type fleetOperatorBrief struct {
@@ -841,10 +847,100 @@ func buildFleetVerdict(resp fleetResponse, now time.Time) fleetVerdict {
 	if brief := strings.TrimSpace(resp.OperatorBrief.Sentence); brief != "" && !supervisorHeartbeatStale(latest, now) {
 		parts = append(parts, brief)
 	}
+	headline, detail := buildFleetVerdictShort(resp, latest, tone, now)
 	return fleetVerdict{
 		Tone:     tone,
 		Sentence: strings.Join(parts, " "),
+		Headline: headline,
+		Detail:   detail,
 	}
+}
+
+// buildFleetVerdictShort produces the short, structured form of the
+// verdict for the SPA hero (issue #474). Headline is a 2–4 word status
+// like "Supervisor healthy." or "Daemon offline."; Detail is ONE
+// concise qualifier sentence derived from next_action / operator_brief
+// rather than the full attention/PR/activity recap (which is already
+// surfaced via the hb-meta chips and stat cards).
+func buildFleetVerdictShort(resp fleetResponse, latest *supervisorDecisionInfo, tone string, now time.Time) (string, string) {
+	headline := fleetVerdictHeadline(resp.Summary, latest, tone, now)
+	detail := fleetVerdictDetail(resp, latest, now)
+	return headline, detail
+}
+
+func fleetVerdictHeadline(summary fleetSummary, latest *supervisorDecisionInfo, tone string, now time.Time) string {
+	if supervisorHeartbeatStale(latest, now) {
+		return "Daemon offline."
+	}
+	switch tone {
+	case "attention":
+		return "Action required."
+	case "busy":
+		if summary.Running > 0 {
+			return fmt.Sprintf("%d worker%s in flight.", summary.Running, fleetVerdictPlural(summary.Running))
+		}
+		return "Working."
+	case "healthy":
+		if summary.Running == 0 && summary.PROpen == 0 && summary.NeedsAttention == 0 {
+			return "Idle, healthy."
+		}
+		return "Supervisor healthy."
+	default:
+		return "Supervisor healthy."
+	}
+}
+
+func fleetVerdictPlural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// fleetVerdictDetail returns the single most operator-relevant
+// qualifier sentence: prefer next_action (kind + project), fall back to
+// operator_brief, else a one-line activity summary. NEVER returns the
+// chained metric recap that hb-meta already shows.
+func fleetVerdictDetail(resp fleetResponse, latest *supervisorDecisionInfo, now time.Time) string {
+	if supervisorHeartbeatStale(latest, now) {
+		if latest != nil && !latest.CreatedAt.IsZero() {
+			return fmt.Sprintf("Last seen %s ago.", formatFleetVerdictAge(latest.CreatedAt, now))
+		}
+		return "No supervisor heartbeat."
+	}
+	na := resp.NextAction
+	if na != nil && strings.TrimSpace(na.Project) != "" && strings.TrimSpace(na.Kind) != "" {
+		project := strings.TrimSpace(na.Project)
+		kind := strings.ReplaceAll(strings.TrimSpace(na.Kind), "_", " ")
+		if pr := strings.TrimSpace(na.Priority); pr != "" {
+			return fmt.Sprintf("%s in %s — %s.", titleCaseFleetVerdict(kind), project, strings.ToLower(pr))
+		}
+		return fmt.Sprintf("%s in %s.", titleCaseFleetVerdict(kind), project)
+	}
+	if resp.Summary.Running == 0 && resp.Summary.PROpen == 0 && resp.Summary.NeedsAttention == 0 && resp.Summary.DispatchPending == 0 {
+		return "Nothing needs you right now."
+	}
+	if resp.Summary.PROpen > 0 {
+		return fmt.Sprintf("%d PR%s waiting for review.", resp.Summary.PROpen, fleetVerdictPlural(resp.Summary.PROpen))
+	}
+	if resp.Summary.Running > 0 {
+		return "Workers in flight; CI watching."
+	}
+	if resp.Summary.NeedsAttention > 0 {
+		return fmt.Sprintf("%d item%s need attention.", resp.Summary.NeedsAttention, fleetVerdictPlural(resp.Summary.NeedsAttention))
+	}
+	return ""
+}
+
+// titleCaseFleetVerdict capitalises the first letter of a verb phrase
+// like "approval pending" → "Approval pending" without mangling the
+// rest. Avoids importing "golang.org/x/text/cases" for one verb.
+func titleCaseFleetVerdict(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func fleetVerdictTone(summary fleetSummary, latest *supervisorDecisionInfo, now time.Time) string {

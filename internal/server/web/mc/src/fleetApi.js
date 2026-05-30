@@ -60,7 +60,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
     readOnly: raw.read_only === true,
     refreshedAt: raw.refreshed_at || "",
     nextAction: raw.next_action || null,
-    verdict: splitVerdict(raw.verdict?.sentence || raw.operator_brief?.sentence || ""),
+    verdict: pickVerdictTuple(raw.verdict, raw.operator_brief),
     verdictTone,
     operatorBrief: raw.operator_brief || null,
     summary,
@@ -474,4 +474,17 @@ async function parseApprovalResponse(res, verb) {
     throw err;
   }
   return payload;
+}
+
+// pickVerdictTuple returns the [headline, detail] pair the SPA hero
+// renders. Prefers the server-built short form (verdict.headline +
+// verdict.detail, issue #474); falls back to splitting the legacy
+// run-on sentence so older servers keep working unchanged.
+export function pickVerdictTuple(verdict, brief) {
+  const h = verdict && typeof verdict.headline === "string" ? verdict.headline.trim() : "";
+  const d = verdict && typeof verdict.detail === "string" ? verdict.detail.trim() : "";
+  if (h) {
+    return [h, d ? " " + d : ""];
+  }
+  return splitVerdict((verdict && verdict.sentence) || (brief && brief.sentence) || "");
 }
