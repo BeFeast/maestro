@@ -586,6 +586,18 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	stateDir := ""
+	if cfg != nil {
+		stateDir = cfg.StateDir
+	}
+	if res := dispatchApprovalAction(req, cfg, stateDir, audit); res.handled {
+		if res.err != nil {
+			log.Printf("[fleet] approval enqueue %q for project %q failed: %v", req.ActionID, req.Project, res.err)
+		}
+		writeJSON(w, res.status, res.body)
+		return
+	}
+
 	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
 }
 

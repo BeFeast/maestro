@@ -170,15 +170,16 @@ func TestSafeAction_RequiresIssueNumber(t *testing.T) {
 	}
 }
 
-func TestSafeAction_ApprovalRequiredFallsThroughTo501(t *testing.T) {
-	// merge_pr is approval-required (#475 part 2 territory). It must NOT be
-	// executed by this dispatcher; the handler must still respond with 501.
+func TestSafeAction_UIOnlyAffordancesStill501(t *testing.T) {
+	// The 5 legacy UI-affordance verbs are still 501. They are not in the
+	// "safe" set (no GH call) and not yet wired into the cautious-gate
+	// dispatcher; we surface the same response the dashboard shipped before.
 	gh := &fakeActionGH{}
 	srv := New(newSafeActionTestCfg(), nil)
 	srv.SetActionDeps(gh, nil)
 
-	for _, id := range []string{"merge_pr", "close_issue", "delete_worktree", "change_global_config",
-		"approve_merge", "restart_worker", "stop_worker", "mark_issue_ready", "mark_issue_blocked"} {
+	for _, id := range []string{"approve_merge", "restart_worker", "stop_worker",
+		"mark_issue_ready", "mark_issue_blocked"} {
 		w := postAction(t, srv, fmt.Sprintf(`{"action_id":%q,"issue_number":1}`, id))
 		if w.Code != http.StatusNotImplemented {
 			t.Fatalf("action %q: status = %d, want 501; body=%s", id, w.Code, w.Body.String())

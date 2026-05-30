@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/state"
 )
 
 // actionGitHubClient is the narrow surface the safe-action dispatcher needs
@@ -60,8 +62,9 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 	if id == "" {
 		return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": "action_id is required"}, err: errors.New("missing action_id")}
 	}
-	if isApprovalRequiredAction(id) {
-		// Not our responsibility — caller falls back to its 501 / approval path.
+	if isApprovalRequiredAction(id) || isUIOnlyAffordance(id) {
+		// Not our responsibility — caller dispatches to dispatchApprovalAction
+		// for the cautious-gate verbs, or falls back to 501 for UI-only.
 		return safeActionResult{handled: false}
 	}
 	if !isSafeAction(id) {
@@ -131,15 +134,27 @@ func isSafeAction(id string) bool {
 	return false
 }
 
-// isApprovalRequiredAction reports whether the action_id must go through the
-// cautious approval gate. These return handled=false from this dispatcher so
-// the existing 501 response is preserved (until the approval enqueue path
-// lands as part 2 of the dashboard write-path).
+// isApprovalRequiredAction reports whether the action_id is one of the four
+// cautious-gate verbs that must be enqueued as a pending Approval rather
+// than executed synchronously. dispatchApprovalAction handles these.
 func isApprovalRequiredAction(id string) bool {
 	switch id {
-	case "merge_pr", "close_issue", "delete_worktree", "change_global_config",
-		// Existing UI affordances that are mutating but not in our safe set:
-		"approve_merge", "restart_worker", "stop_worker",
+	case config.SupervisorActionMergePR,
+		config.SupervisorActionCloseIssue,
+		config.SupervisorActionDeleteWorktree,
+		config.SupervisorActionChangeGlobalConfig:
+		return true
+	}
+	return false
+}
+
+// isUIOnlyAffordance reports whether the action_id is a legacy UI-affordance
+// verb that is mutating but not yet wired into either dispatcher. These keep
+// returning 501 until they are migrated to safe or approval-required
+// semantics.
+func isUIOnlyAffordance(id string) bool {
+	switch id {
+	case "approve_merge", "restart_worker", "stop_worker",
 		"mark_issue_ready", "mark_issue_blocked":
 		return true
 	}
@@ -183,4 +198,171 @@ func makeSafeOK(id, target string, audit actionAuditRecorder, req controlActionR
 		_ = audit(actor, id, target, reason)
 	}
 	return resp
+}
+
+// approvalEnqueueResponse is the JSON body returned on a successful enqueue.
+type approvalEnqueueResponse struct {
+	OK         bool   `json:"ok"`
+	ActionID   string `json:"action_id"`
+	ApprovalID string `json:"approval_id"`
+	Status     string `json:"status"`
+	Target     string `json:"target,omitempty"`
+}
+
+// dispatchApprovalAction enqueues a pending Approval for one of the four
+// cautious-gate verbs (merge_pr, close_issue, delete_worktree,
+// change_global_config). It does NOT execute the action — that is the
+// approver/executor pipeline (#475 part 2 PR B).
+//
+// The HTTP caller must have cleared the read-only gate before this is
+// invoked.
+//
+// Returns 202 Accepted on success with the approval id, so callers can
+// distinguish enqueued-pending (202) from executed (200, safe actions).
+//
+// stateDir is the per-project state directory. nil cfg or empty stateDir
+// produce a 500 — the dashboard cannot enqueue without persistence.
+func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateDir string, audit actionAuditRecorder) safeActionResult {
+	id := strings.TrimSpace(req.ActionID)
+	if !isApprovalRequiredAction(id) {
+		return safeActionResult{handled: false}
+	}
+	if cfg == nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no project config bound to this server"}, err: errors.New("nil cfg")}
+	}
+	if strings.TrimSpace(stateDir) == "" {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no state dir is available to record the approval"}, err: errors.New("empty state dir")}
+	}
+
+	// Per-verb argument validation — fail fast if the request is malformed.
+	if err := validateApprovalRequest(id, req); err != nil {
+		return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": err.Error()}, err: err}
+	}
+
+	st, err := state.Load(stateDir)
+	if err != nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("load state: %v", err)}, err: err}
+	}
+
+	now := time.Now().UTC()
+	decision := buildApprovalDecision(id, req, cfg, now)
+	approval := st.RecordPendingApprovalForDecision(decision, now)
+	if approval == nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "failed to record approval"}, err: errors.New("RecordPendingApprovalForDecision returned nil")}
+	}
+
+	if err := state.Save(stateDir, st); err != nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("save state: %v", err)}, err: err}
+	}
+
+	target := approvalTargetSummary(decision.Target)
+	if audit != nil {
+		actor := strings.TrimSpace(req.Actor)
+		if actor == "" {
+			actor = "dashboard"
+		}
+		reason := strings.TrimSpace(req.Reason)
+		if reason == "" {
+			reason = "enqueued by dashboard"
+		}
+		// Best-effort.
+		_ = audit(actor, "enqueue:"+id, target, reason)
+	}
+
+	return safeActionResult{
+		handled: true,
+		status:  http.StatusAccepted,
+		body: approvalEnqueueResponse{
+			OK:         true,
+			ActionID:   id,
+			ApprovalID: approval.ID,
+			Status:     string(approval.Status),
+			Target:     target,
+		},
+	}
+}
+
+// validateApprovalRequest enforces the per-verb required fields BEFORE we
+// touch state, so a 400 cannot leave a half-written approval.
+func validateApprovalRequest(id string, req controlActionRequest) error {
+	switch id {
+	case config.SupervisorActionMergePR:
+		if req.PRNumber <= 0 {
+			return errors.New("pr_number is required for merge_pr")
+		}
+	case config.SupervisorActionCloseIssue:
+		if req.IssueNumber <= 0 {
+			return errors.New("issue_number is required for close_issue")
+		}
+	case config.SupervisorActionDeleteWorktree:
+		if strings.TrimSpace(req.Slot) == "" {
+			return errors.New("slot is required for delete_worktree")
+		}
+	case config.SupervisorActionChangeGlobalConfig:
+		if strings.TrimSpace(req.Reason) == "" {
+			return errors.New("reason is required for change_global_config")
+		}
+	}
+	return nil
+}
+
+// buildApprovalDecision constructs a synthetic SupervisorDecision so the
+// HTTP enqueue path uses the same approval pipeline as the LLM supervisor.
+// The decision is recorded in state as the approval source.
+func buildApprovalDecision(id string, req controlActionRequest, cfg *config.Config, now time.Time) state.SupervisorDecision {
+	actor := strings.TrimSpace(req.Actor)
+	if actor == "" {
+		actor = "dashboard"
+	}
+	summary := strings.TrimSpace(req.Reason)
+	if summary == "" {
+		summary = fmt.Sprintf("HTTP enqueue of %s", id)
+	}
+
+	target := &state.SupervisorTarget{
+		Issue:   req.IssueNumber,
+		PR:      req.PRNumber,
+		Session: strings.TrimSpace(req.Slot),
+	}
+	if target.Issue == 0 && target.PR == 0 && target.Session == "" {
+		target = nil
+	}
+
+	projectName := strings.TrimSpace(req.Project)
+	if projectName == "" && cfg != nil {
+		projectName = cfg.Repo
+	}
+
+	decision := state.SupervisorDecision{
+		ID:                fmt.Sprintf("http-%s-%s", id, now.UTC().Format("20060102T150405.000000000Z")),
+		CreatedAt:         now,
+		Project:           projectName,
+		Mode:              "http_enqueue",
+		Status:            "pending_approval",
+		Summary:           summary,
+		RecommendedAction: id,
+		Target:            target,
+		Risk:              "high",
+		Confidence:        1.0,
+		Reasons:           []string{fmt.Sprintf("enqueued by %s via /api/v1/.../actions", actor)},
+		RequiresApproval:  true,
+	}
+	return decision
+}
+
+func approvalTargetSummary(target *state.SupervisorTarget) string {
+	if target == nil {
+		return ""
+	}
+	parts := []string{}
+	if target.Issue > 0 {
+		parts = append(parts, fmt.Sprintf("issue #%d", target.Issue))
+	}
+	if target.PR > 0 {
+		parts = append(parts, fmt.Sprintf("PR #%d", target.PR))
+	}
+	if target.Session != "" {
+		parts = append(parts, "session "+target.Session)
+	}
+	return strings.Join(parts, " ")
 }

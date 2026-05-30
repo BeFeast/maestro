@@ -1034,10 +1034,14 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
-	handleControlAction(w, r, s.cfg.Server.ReadOnly, "server", s.cfg, s.gh, s.audit)
+	stateDir := ""
+	if s.cfg != nil {
+		stateDir = s.cfg.StateDir
+	}
+	handleControlAction(w, r, s.cfg.Server.ReadOnly, "server", s.cfg, stateDir, s.gh, s.audit)
 }
 
-func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, cfg *config.Config, gh actionGitHubClient, audit actionAuditRecorder) {
+func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, cfg *config.Config, stateDir string, gh actionGitHubClient, audit actionAuditRecorder) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -1059,6 +1063,14 @@ func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, 
 	if res := dispatchSafeAction(req, cfg, gh, audit); res.handled {
 		if res.err != nil {
 			log.Printf("[server] safe action %q failed: %v", req.ActionID, res.err)
+		}
+		writeJSON(w, res.status, res.body)
+		return
+	}
+
+	if res := dispatchApprovalAction(req, cfg, stateDir, audit); res.handled {
+		if res.err != nil {
+			log.Printf("[server] approval enqueue %q failed: %v", req.ActionID, res.err)
 		}
 		writeJSON(w, res.status, res.body)
 		return
