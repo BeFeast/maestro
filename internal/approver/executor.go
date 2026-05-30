@@ -147,6 +147,27 @@ func (e *Executor) Execute(approval *state.Approval) Result {
 		defer e.locks.Delete(id)
 	}
 
+	// Repo guard (#489 / premortem #3): refuse any approval whose
+	// stamped Repo does not match the executor's cfg.Repo. Defends
+	// against a refactor that pools Executors across projects and
+	// silently fires merge_pr against the wrong owner/repo. Empty
+	// approval.Repo is back-compat — approvals created before #489 had
+	// no stamp; we fall through to the existing behaviour to avoid
+	// breaking already-pending approvals on upgrade.
+	if strings.TrimSpace(approval.Repo) != "" && e.Cfg != nil {
+		cfgRepo := strings.TrimSpace(e.Cfg.Repo)
+		if cfgRepo != "" && approval.Repo != cfgRepo {
+			return Result{
+				Status: state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf(
+					"approval %s is bound to repo %q but executor cfg.Repo is %q — refusing cross-project mutation",
+					approval.ID, approval.Repo, cfgRepo,
+				),
+				Err: fmt.Errorf("approval %s repo mismatch: approval=%s cfg=%s", approval.ID, approval.Repo, cfgRepo),
+			}
+		}
+	}
+
 	switch approval.Action {
 	case config.SupervisorActionMergePR:
 		return e.executeMergePR(approval)

@@ -337,6 +337,7 @@ func buildApprovalDecision(id string, req controlActionRequest, cfg *config.Conf
 		ID:                fmt.Sprintf("http-%s-%s-%s", id, now.UTC().Format("20060102T150405.000000000Z"), randomDecisionSuffix()),
 		CreatedAt:         now,
 		Project:           projectName,
+		Repo:              repoFromConfig(cfg),
 		Mode:              "http_enqueue",
 		Status:            "pending_approval",
 		Summary:           summary,
@@ -379,4 +380,14 @@ func randomDecisionSuffix() string {
 		return "x"
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// repoFromConfig returns the trimmed cfg.Repo or "" if cfg is nil.
+// Used by buildApprovalDecision to stamp the project repo onto every
+// HTTP-enqueued approval (#489).
+func repoFromConfig(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Repo)
 }
