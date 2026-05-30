@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -165,15 +167,13 @@ func safeActionReadyLabel(cfg *config.Config) string {
 	if cfg == nil {
 		return ""
 	}
-	if l := strings.TrimSpace(cfg.Supervisor.ReadyLabel); l != "" {
-		return l
-	}
-	for _, l := range cfg.IssueLabels {
-		if t := strings.TrimSpace(l); t != "" {
-			return t
-		}
-	}
-	return ""
+	// Only honour cfg.Supervisor.ReadyLabel — NEVER fall back to
+	// cfg.IssueLabels, which is the FILTER set ("bug", "feature", etc.)
+	// used to decide which issues maestro tracks. Falling back to the
+	// first IssueLabels entry would let `remove_ready_label` strip a
+	// tracking label off an issue, silently de-listing it. Greptile P1
+	// on #478.
+	return strings.TrimSpace(cfg.Supervisor.ReadyLabel)
 }
 
 func safeActionBlockedLabel(cfg *config.Config) string {
@@ -334,7 +334,7 @@ func buildApprovalDecision(id string, req controlActionRequest, cfg *config.Conf
 	}
 
 	decision := state.SupervisorDecision{
-		ID:                fmt.Sprintf("http-%s-%s", id, now.UTC().Format("20060102T150405.000000000Z")),
+		ID:                fmt.Sprintf("http-%s-%s-%s", id, now.UTC().Format("20060102T150405.000000000Z"), randomDecisionSuffix()),
 		CreatedAt:         now,
 		Project:           projectName,
 		Mode:              "http_enqueue",
@@ -365,4 +365,18 @@ func approvalTargetSummary(target *state.SupervisorTarget) string {
 		parts = append(parts, "session "+target.Session)
 	}
 	return strings.Join(parts, " ")
+}
+
+// randomDecisionSuffix returns a short random hex token used to
+// disambiguate decision IDs minted in the same nanosecond. Greptile P1
+// on #479: two concurrent enqueues at the same OS clock tick would
+// otherwise produce identical Approval IDs. Falling back to a
+// timestamp-only string on read failure keeps the path deterministic
+// in the (effectively impossible) case crypto/rand returns an error.
+func randomDecisionSuffix() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "x"
+	}
+	return hex.EncodeToString(b[:])
 }

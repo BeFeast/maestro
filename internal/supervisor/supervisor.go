@@ -137,11 +137,11 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if reader == nil {
 		reader = github.New(cfg.Repo)
 	}
-
-	// Execute any approvals that were transitioned to status=approved
-	// outside this loop (CLI approve already executes inline; this pass
-	// catches web-driven approves and replays after a daemon restart).
-	executeApprovedApprovals(cfg, st, reader)
+	// NOTE: approval execution must NOT run in dry-run mode (greptile
+	// P1 on #480) — the side effects are real GH/fs operations and the
+	// state.Save that records the executed/failed transition lives
+	// inside the !DryRun guard below, so dry-run would also re-execute
+	// the same approvals on every cycle. We move the call there.
 	recordOutcomeHealth(cfg, st)
 
 	decision, err := NewEngine(cfg, reader).Decide(st)
@@ -149,6 +149,12 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		return state.SupervisorDecision{}, err
 	}
 	if !cfg.Supervisor.DryRun {
+		// Execute any approvals that were transitioned to status=approved
+		// outside this loop (CLI approve already executes inline; this
+		// pass catches web-driven approves and replays after a daemon
+		// restart). Lives inside the dry-run guard so the resulting
+		// state transitions are persisted by the state.Save below.
+		executeApprovedApprovals(cfg, st, reader)
 		if decisionRequiresApproval(cfg, decision) {
 			approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
 			decision.ApprovalID = approval.ID
@@ -2658,9 +2664,9 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
 	}
-	now := time.Now().UTC()
 	for _, a := range approvals {
 		res := ex.Execute(a)
+		now := time.Now().UTC()
 		switch res.Status {
 		case state.ApprovalStatusExecuted:
 			if _, err := st.MarkApprovalExecuted(a.ID, now, "supervisor", res.Summary); err != nil {
