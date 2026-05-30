@@ -448,6 +448,211 @@ func TestReconcileRunningSessions_RateLimitedDeadWorker_DoesNotBurnRetryBudget(t
 	}
 }
 
+// #506: when reconcile detects a rate-limited dead worker AND fallback_backends
+// is configured with a viable candidate, the session must be respawned on the
+// next backend (mirroring the main-loop fallover at orchestrator.go:1648),
+// not marked Dead.
+func TestReconcileRunningSessions_RateLimitedDeadWorker_FallsOverToNextBackend(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["sup-90"] = &state.Session{
+		IssueNumber: 471,
+		IssueTitle:  "P0: ciStatusFromREST returns pending forever",
+		Status:      state.StatusRunning,
+		PID:         424243,
+		TmuxSession: "maestro-sup-90",
+		Branch:      "feat/sup-90-471-ci",
+		Backend:     "claude",
+		StartedAt:   time.Now().Add(-2 * time.Minute),
+		LogFile:     "/tmp/sup-90-rl.log",
+	}
+
+	respawnedBackends := []string{}
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo: "owner/repo",
+			Model: config.ModelConfig{
+				Default:          "claude",
+				FallbackBackends: []string{"codex", "freellm"},
+				Backends: map[string]config.BackendDef{
+					"claude":  {Cmd: "claude"},
+					"codex":   {Cmd: "codex"},
+					"freellm": {Cmd: "freellm"},
+				},
+			},
+		},
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:     func(logFile string) bool { return true },
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "ciStatusFromREST returns pending forever"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnedBackends = append(respawnedBackends, backendName)
+			sess.Status = state.StatusRunning
+			sess.PID = 9001
+			sess.Backend = backendName
+			sess.StartedAt = time.Now().UTC()
+			sess.FinishedAt = nil
+			return nil
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["sup-90"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q (fallover should respawn the worker)", sess.Status, state.StatusRunning)
+	}
+	if got := len(respawnedBackends); got != 1 {
+		t.Fatalf("respawnWorkerFn called %d times, want 1; backends=%v", got, respawnedBackends)
+	}
+	if respawnedBackends[0] != "codex" {
+		t.Fatalf("fallback respawn used backend=%q, want %q (first in fallback_backends)", respawnedBackends[0], "codex")
+	}
+	if sess.Backend != "codex" {
+		t.Fatalf("session.Backend = %q after fallover, want %q", sess.Backend, "codex")
+	}
+	if len(sess.TriedBackends) != 1 || sess.TriedBackends[0] != "claude" {
+		t.Fatalf("TriedBackends = %v, want [claude] (the rate-limited backend)", sess.TriedBackends)
+	}
+	if !sess.RateLimitHit {
+		t.Fatal("RateLimitHit should be true after recordProviderLimit")
+	}
+	if sess.ProviderLimitBackend != "claude" {
+		t.Fatalf("ProviderLimitBackend = %q, want claude (the original)", sess.ProviderLimitBackend)
+	}
+	if sess.BackendSelection == nil || sess.BackendSelection.SelectedBackend != "codex" || sess.BackendSelection.SelectionReason != selectionReasonProviderLimitFallback {
+		t.Fatalf("BackendSelection = %+v, want SelectedBackend=codex SelectionReason=%s", sess.BackendSelection, selectionReasonProviderLimitFallback)
+	}
+	health, ok := s.BackendHealth["claude"]
+	if !ok || health.State != state.BackendHealthCooldown {
+		t.Fatalf("BackendHealth[claude] = %+v, want cooldown", health)
+	}
+}
+
+// #506: when fallback respawn itself fails (worktree busy, network, etc.),
+// the session must be marked Dead with rate_limit notification rather than
+// silently looping in StatusRunning.
+func TestReconcileRunningSessions_RateLimitedDeadWorker_FallbackRespawnFails_MarksDead(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["sup-91"] = &state.Session{
+		IssueNumber: 471,
+		Status:      state.StatusRunning,
+		PID:         424244,
+		TmuxSession: "maestro-sup-91",
+		Branch:      "feat/sup-91-471-ci",
+		Backend:     "claude",
+		LogFile:     "/tmp/sup-91-rl.log",
+	}
+
+	respawnAttempts := []string{}
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo: "owner/repo",
+			Model: config.ModelConfig{
+				Default:          "claude",
+				FallbackBackends: []string{"codex"},
+				Backends: map[string]config.BackendDef{
+					"claude": {Cmd: "claude"},
+					"codex":  {Cmd: "codex"},
+				},
+			},
+		},
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:     func(logFile string) bool { return true },
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "ci"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnAttempts = append(respawnAttempts, backendName)
+			return fmt.Errorf("worktree busy")
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["sup-91"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (failed respawn must terminate the session)", sess.Status, state.StatusDead)
+	}
+	if got := len(respawnAttempts); got != 1 {
+		t.Fatalf("respawnWorkerFn called %d times, want 1; attempts=%v", got, respawnAttempts)
+	}
+	if sess.LastNotifiedStatus != "rate_limit" {
+		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "rate_limit")
+	}
+}
+
+// #506: when the issue can't be fetched at fallover time (transient gh outage,
+// etc.), reconcile must not skip the dead-marking — otherwise the session
+// would be stuck in StatusRunning with no live process.
+func TestReconcileRunningSessions_RateLimitedDeadWorker_FetchIssueFails_MarksDead(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["sup-92"] = &state.Session{
+		IssueNumber: 471,
+		Status:      state.StatusRunning,
+		PID:         424245,
+		TmuxSession: "maestro-sup-92",
+		Branch:      "feat/sup-92-471-ci",
+		Backend:     "claude",
+		LogFile:     "/tmp/sup-92-rl.log",
+	}
+
+	respawned := false
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo: "owner/repo",
+			Model: config.ModelConfig{
+				Default:          "claude",
+				FallbackBackends: []string{"codex"},
+				Backends: map[string]config.BackendDef{
+					"claude": {Cmd: "claude"},
+					"codex":  {Cmd: "codex"},
+				},
+			},
+		},
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:     func(logFile string) bool { return true },
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{}, fmt.Errorf("gh transient: rate limit")
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawned = true
+			return nil
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["sup-92"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (fetch-issue error must terminate the session)", sess.Status, state.StatusDead)
+	}
+	if respawned {
+		t.Fatal("respawnWorkerFn must NOT be called when getIssueFn fails")
+	}
+	if sess.LastNotifiedStatus != "rate_limit" {
+		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "rate_limit")
+	}
+}
+
 func TestReconcileRunningSessions_MissingTmuxGetsMarkedDead(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["pan-2"] = &state.Session{
