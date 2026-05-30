@@ -117,7 +117,13 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 			writeError(w, http.StatusNotFound, err.Error())
 		case errors.Is(err, state.ErrApprovalStale),
 			errors.Is(err, state.ErrApprovalSuperseded),
-			errors.Is(err, state.ErrApprovalNotPending):
+			errors.Is(err, state.ErrApprovalNotPending),
+			errors.Is(err, state.ErrApprovalPayloadMismatch):
+			// Greptile P1 on #481: PayloadMismatch is also a stale-
+			// conflict condition (the approval payload changed under
+			// the client). Map to 409 so dashboards can detect it
+			// uniformly with the other conflict cases instead of
+			// receiving a misleading 400 Bad Request.
 			writeError(w, http.StatusConflict, err.Error())
 		default:
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -157,6 +163,12 @@ func cfgServerReadOnly(cfg *config.Config) bool {
 // --- fleet server hookup ----------------------------------------------------
 
 func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request) {
+	// Greptile P2 on #481: enforce 405 BEFORE the project lookup so a
+	// GET against an unknown project returns 405, not 404.
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	route, ok := parseApprovalPath("/api/v1/fleet/approvals/", r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusNotFound, "expected /api/v1/fleet/approvals/{id}/{approve|reject}?project=...")
