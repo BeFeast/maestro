@@ -173,6 +173,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
 	mux.HandleFunc("/api/v1/fleet/actions", s.handleFleetAction)
+	mux.HandleFunc("/api/v1/fleet/approvals/", s.handleFleetApproval)
 	mux.HandleFunc("/api/v1/audit/log", s.handleFleetAuditLog)
 	mux.HandleFunc("/approvals/audit", s.handleFleetApprovalAudit)
 	mux.Handle("/static/", web.StaticHandler())
