@@ -66,6 +66,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/logs/", s.handleLog)
 	mux.HandleFunc("/api/v1/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/v1/actions", s.handleAction)
+	mux.HandleFunc("/api/v1/approvals/", s.handleApproval)
 	mux.HandleFunc("/api/v1/", s.handleIssue)
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleDashboard)
