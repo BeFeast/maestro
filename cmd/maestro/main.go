@@ -726,6 +726,13 @@ func serveCmd(args []string) {
 			if err != nil {
 				log.Fatalf("load fleet: %v", err)
 			}
+			// LoadFleetProjects can't import github (cycle); wire the
+			// per-project safe-action GH client here at the boundary.
+			for i := range projects {
+				if cfg := projects[i].Cfg(); cfg != nil {
+					projects[i].SetActionGH(github.New(cfg.Repo))
+				}
+			}
 		} else {
 			projects = fleetProjectsFromConfigs(cfgs)
 		}

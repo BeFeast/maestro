@@ -55,6 +55,17 @@ func (p *FleetProject) SetActionGH(gh actionGitHubClient) {
 	p.actionGH = gh
 }
 
+// Cfg exposes the loaded *config.Config so callers (cmd/maestro) that need
+// per-project values (e.g. repo) without importing internal/server's
+// internals can reach them. Returns nil if the project was created without
+// a config (tests).
+func (p *FleetProject) Cfg() *config.Config {
+	if p == nil {
+		return nil
+	}
+	return p.cfg
+}
+
 // NewFleetProject wraps an already-loaded config for in-process fleet serving.
 func NewFleetProject(name, configPath, dashboardURL string, cfg *config.Config) FleetProject {
 	if strings.TrimSpace(name) == "" && cfg != nil {
