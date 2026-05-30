@@ -1316,6 +1316,18 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	if s == nil {
 		return nil
 	}
+	// #490: refuse malformed Target.Session at the state-write boundary.
+	// Otherwise a malformed slot from the supervisor LLM lands in state,
+	// is approved by an unsuspecting operator, and only the executor's
+	// WorktreePathForSlot catches it — too late for forensics. Validators
+	// live at every ingress.
+	if decision.Target != nil {
+		if sess := strings.TrimSpace(decision.Target.Session); sess != "" {
+			if err := ValidateSlotID(sess); err != nil {
+				return nil
+			}
+		}
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -2238,4 +2250,47 @@ func (s *State) MarkApprovalExecutionSkipped(id string, now time.Time, actor, re
 		TargetStateHash: approval.TargetStateHash,
 	})
 	return approval, nil
+}
+
+// ValidateSlotID is the canonical slot-id validator used at EVERY
+// state-write ingress (#490 / premortem #5). A slot id names a session
+// in `state.Sessions` and is later concatenated into a worktree path
+// under `cfg.WorktreeBase`; a malformed slot ("../etc/passwd", a NUL
+// byte, a backslash) would let an attacker (or a hallucinating
+// supervisor LLM) escape the worktree base and steer subsequent
+// `worker.RemoveWorktree` calls at unrelated paths.
+//
+// Validators live HERE, not at the executor-only boundary, so any
+// future refactor that adds a new write-path (HTTP, CLI, supervisor
+// LLM, replay tool) gets the check for free as long as it routes
+// through state.RecordPendingApprovalForDecision or another helper
+// that calls ValidateSlotID.
+//
+// Empty input is rejected. The shape is intentionally narrow: ASCII
+// letters / digits / `-` / `_`, length 1..96. We do NOT accept `/`,
+// `\`, `.`, `..`, NUL, or anything outside that ASCII set. Tests
+// in state_test.go enforce the negative cases.
+func ValidateSlotID(slot string) error {
+	s := strings.TrimSpace(slot)
+	if s == "" {
+		return errors.New("slot is empty")
+	}
+	if s == "." || s == ".." {
+		return errors.New("slot is a traversal segment")
+	}
+	if len(s) > 96 {
+		return errors.New("slot exceeds 96 bytes")
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_':
+		default:
+			return fmt.Errorf("slot %q contains disallowed byte %q at index %d", slot, c, i)
+		}
+	}
+	return nil
 }

@@ -295,8 +295,8 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 			return errors.New("issue_number is required for close_issue")
 		}
 	case config.SupervisorActionDeleteWorktree:
-		if strings.TrimSpace(req.Slot) == "" {
-			return errors.New("slot is required for delete_worktree")
+		if err := state.ValidateSlotID(req.Slot); err != nil {
+			return fmt.Errorf("delete_worktree: %w", err)
 		}
 	case config.SupervisorActionChangeGlobalConfig:
 		if strings.TrimSpace(req.Reason) == "" {
