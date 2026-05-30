@@ -200,6 +200,12 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 	}
 	outcomeStatus := e.outcomeStatus(st)
 	decision.Outcome = &outcomeStatus
+	// Stamp the project repo on every decision so RecordPendingApprovalForDecision
+	// carries it onto the Approval (#489). Defends against cross-project
+	// mutation if Executor wiring ever drifts.
+	if decision.Repo == "" {
+		decision.Repo = strings.TrimSpace(e.cfg.Repo)
+	}
 	return decision, nil
 }
 

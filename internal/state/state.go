@@ -577,6 +577,7 @@ type SupervisorDecision struct {
 	ID                string                   `json:"id"`
 	CreatedAt         time.Time                `json:"created_at"`
 	Project           string                   `json:"project"`
+	Repo              string                   `json:"repo,omitempty"`
 	Mode              string                   `json:"mode"`
 	PolicyRule        string                   `json:"policy_rule,omitempty"`
 	Status            string                   `json:"status,omitempty"`
@@ -637,6 +638,13 @@ type Approval struct {
 	PayloadHash     string            `json:"payload_hash"`
 	TargetStateHash string            `json:"target_state_hash,omitempty"`
 	Audit           []ApprovalAudit   `json:"audit,omitempty"`
+	// Repo + Project bind the approval to a specific project context at
+	// write-time (#489). The executor refuses any approval whose Repo
+	// does not match the executor's cfg.Repo, defending against
+	// cross-project mutation if Executor wiring drifts in the future.
+	// Both omitempty for back-compat with approvals created before #489.
+	Repo    string `json:"repo,omitempty"`
+	Project string `json:"project,omitempty"`
 }
 
 type ApprovalAudit struct {
@@ -1327,6 +1335,8 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 		Evidence:        append([]string(nil), decision.Reasons...),
 		Status:          ApprovalStatusPending,
 		TargetStateHash: s.ApprovalTargetStateHash(decision.Target),
+		Repo:            decision.Repo,
+		Project:         decision.Project,
 	}
 	approval.PayloadHash = approval.ComputePayloadHash()
 	approval.Audit = append(approval.Audit, ApprovalAudit{
