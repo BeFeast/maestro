@@ -351,6 +351,7 @@ func runCmd(args []string) {
 		// Start HTTP server if configured
 		if cfg.Server.Port > 0 {
 			srv := server.New(cfg, refreshCh)
+			srv.SetActionDeps(github.New(cfg.Repo), nil)
 			go func() {
 				if err := srv.Start(context.Background()); err != nil {
 					log.Printf("[server] error: %v", err)
@@ -408,6 +409,7 @@ func runCmd(args []string) {
 			// Start HTTP server if configured
 			if c.Server.Port > 0 {
 				srv := server.New(c, refreshCh)
+				srv.SetActionDeps(github.New(c.Repo), nil)
 				go func() {
 					if err := srv.Start(ctx); err != nil {
 						log.Printf("[%s][server] error: %v", c.SessionPrefix, err)
@@ -729,7 +731,9 @@ func serveCmd(args []string) {
 
 	refreshCh := make(chan struct{}, 1)
 	log.Printf("serving dashboard — repo=%s addr=%s:%d read_only=%v", cfg.Repo, cfg.Server.Host, cfg.Server.Port, cfg.Server.ReadOnly)
-	if err := server.New(cfg, refreshCh).Start(ctx); err != nil {
+	srv := server.New(cfg, refreshCh)
+	srv.SetActionDeps(github.New(cfg.Repo), nil)
+	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }
@@ -737,7 +741,9 @@ func serveCmd(args []string) {
 func fleetProjectsFromConfigs(cfgs []*config.Config) []server.FleetProject {
 	projects := make([]server.FleetProject, 0, len(cfgs))
 	for _, cfg := range cfgs {
-		projects = append(projects, server.NewFleetProject(defaultFleetProjectName(cfg.Repo), cfg.ResolvePath(), "", cfg))
+		proj := server.NewFleetProject(defaultFleetProjectName(cfg.Repo), cfg.ResolvePath(), "", cfg)
+		proj.SetActionGH(github.New(cfg.Repo))
+		projects = append(projects, proj)
 	}
 	return projects
 }
