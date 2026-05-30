@@ -26,6 +26,7 @@ import (
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/server"
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/befeast/maestro/internal/versioning"
@@ -547,7 +548,56 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 	if err := state.Save(cfg.StateDir, st); err != nil {
 		log.Fatalf("supervise %s: save state: %v", action, err)
 	}
-	fmt.Printf("Approval %s %s. No risky action was executed.\n", approval.ID, approval.Status)
+
+	if action != "approve" {
+		fmt.Printf("Approval %s %s.\n", approval.ID, approval.Status)
+		return
+	}
+
+	// Execute the now-approved approval. Synchronous and blocking; the
+	// caller (operator) sees the result on stdout and via exit code.
+	ex := &approver.Executor{
+		GH:        github.New(cfg.Repo),
+		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
+		Cfg:       cfg,
+	}
+	res := ex.Execute(approval)
+
+	now = time.Now().UTC()
+	switch res.Status {
+	case state.ApprovalStatusExecuted:
+		if _, mErr := st.MarkApprovalExecuted(approval.ID, now, *actor, res.Summary); mErr != nil {
+			log.Fatalf("supervise approve: mark executed: %v", mErr)
+		}
+	case state.ApprovalStatusExecutionSkipped:
+		if _, mErr := st.MarkApprovalExecutionSkipped(approval.ID, now, *actor, res.Summary); mErr != nil {
+			log.Fatalf("supervise approve: mark skipped: %v", mErr)
+		}
+	default: // execution_failed
+		msg := res.Summary
+		if msg == "" && res.Err != nil {
+			msg = res.Err.Error()
+		}
+		if _, mErr := st.MarkApprovalExecutionFailed(approval.ID, now, *actor, msg); mErr != nil {
+			log.Fatalf("supervise approve: mark failed: %v", mErr)
+		}
+	}
+
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		log.Fatalf("supervise approve: save state after execution: %v", err)
+	}
+
+	switch res.Status {
+	case state.ApprovalStatusExecuted:
+		fmt.Printf("Approval %s executed: %s\n", approval.ID, res.Summary)
+	case state.ApprovalStatusExecutionSkipped:
+		fmt.Printf("Approval %s skipped: %s\n", approval.ID, res.Summary)
+	default:
+		if res.Err != nil {
+			log.Fatalf("Approval %s execution failed: %v", approval.ID, res.Err)
+		}
+		log.Fatalf("Approval %s execution failed: %s", approval.ID, res.Summary)
+	}
 }
 
 func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool) {

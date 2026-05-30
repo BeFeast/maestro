@@ -15,7 +15,9 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mission"
 	"github.com/befeast/maestro/internal/outcome"
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 const (
@@ -135,6 +137,11 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if reader == nil {
 		reader = github.New(cfg.Repo)
 	}
+
+	// Execute any approvals that were transitioned to status=approved
+	// outside this loop (CLI approve already executes inline; this pass
+	// catches web-driven approves and replays after a daemon restart).
+	executeApprovedApprovals(cfg, st, reader)
 	recordOutcomeHealth(cfg, st)
 
 	decision, err := NewEngine(cfg, reader).Decide(st)
@@ -2623,4 +2630,54 @@ func commandBinary(cmd, fallback string) string {
 		return ""
 	}
 	return fields[0]
+}
+
+// executeApprovedApprovals runs any approvals currently in status=approved
+// through the approver.Executor and persists the resulting state
+// transitions. Failures are logged but do not abort the supervisor cycle —
+// each approval gets its own audit entry so an operator can see what
+// happened.
+func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader) {
+	approvals := st.ListApprovedApprovals()
+	if len(approvals) == 0 {
+		return
+	}
+	// approver.Executor only needs MergePR/CloseIssue from the GH client.
+	// Reader (the broader supervisor surface) is satisfied by *github.Client,
+	// which also satisfies approver.GitHubClient. We assert the narrower
+	// interface — when it fails (mocks/tests/Mutator-only), we still try to
+	// fall back to a fresh github.New(cfg.Repo).
+	var gh approver.GitHubClient
+	if candidate, ok := reader.(approver.GitHubClient); ok {
+		gh = candidate
+	} else {
+		gh = github.New(cfg.Repo)
+	}
+	ex := &approver.Executor{
+		GH:        gh,
+		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
+		Cfg:       cfg,
+	}
+	now := time.Now().UTC()
+	for _, a := range approvals {
+		res := ex.Execute(a)
+		switch res.Status {
+		case state.ApprovalStatusExecuted:
+			if _, err := st.MarkApprovalExecuted(a.ID, now, "supervisor", res.Summary); err != nil {
+				fmt.Fprintf(os.Stderr, "[supervisor] mark approval %s executed: %v\n", a.ID, err)
+			}
+		case state.ApprovalStatusExecutionSkipped:
+			if _, err := st.MarkApprovalExecutionSkipped(a.ID, now, "supervisor", res.Summary); err != nil {
+				fmt.Fprintf(os.Stderr, "[supervisor] mark approval %s skipped: %v\n", a.ID, err)
+			}
+		default:
+			msg := res.Summary
+			if msg == "" && res.Err != nil {
+				msg = res.Err.Error()
+			}
+			if _, err := st.MarkApprovalExecutionFailed(a.ID, now, "supervisor", msg); err != nil {
+				fmt.Fprintf(os.Stderr, "[supervisor] mark approval %s failed: %v\n", a.ID, err)
+			}
+		}
+	}
 }
