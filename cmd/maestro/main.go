@@ -560,6 +560,7 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 		GH:        github.New(cfg.Repo),
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
+		Sessions:  approver.SessionLookupFunc(st.SessionAt),
 	}
 	res := ex.Execute(approval)
 

@@ -1679,6 +1679,22 @@ func (s *State) LiveSessionsAt(now time.Time) []*Session {
 	return live
 }
 
+
+// SessionAt returns the live session bound to slot, if any. Used by the
+// approver executor (#488 slot-reuse fence) to verify a delete_worktree
+// approval still targets the worker that was running when the approval
+// was queued.
+func (s *State) SessionAt(slot string) (*Session, bool) {
+	if s == nil || s.Sessions == nil {
+		return nil, false
+	}
+	sess, ok := s.Sessions[slot]
+	if !ok || sess == nil {
+		return nil, false
+	}
+	return sess, true
+}
+
 // SessionLive reports whether a session belongs in the default operator view.
 func SessionLive(sess *Session) bool {
 	return SessionLiveAt(sess, time.Now().UTC())
