@@ -38,6 +38,21 @@ type FleetProject struct {
 	DashboardURL string `json:"dashboard_url,omitempty" yaml:"dashboard_url"`
 
 	cfg *config.Config
+
+	// actionGH is the GitHub client used by handleFleetAction's safe-action
+	// dispatcher when the project is not in read-only mode. nil disables
+	// safe actions for this project. Tests inject a fake via SetActionGH.
+	actionGH actionGitHubClient
+}
+
+// SetActionGH wires the per-project GitHub client used by the safe-action
+// dispatcher. Call this on startup; nil leaves safe actions disabled for the
+// project (handler falls through to 501).
+func (p *FleetProject) SetActionGH(gh actionGitHubClient) {
+	if p == nil {
+		return
+	}
+	p.actionGH = gh
 }
 
 // NewFleetProject wraps an already-loaded config for in-process fleet serving.
@@ -545,10 +560,32 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	if project, ok := s.findProject(req.Project); ok && project.cfg != nil && project.cfg.Server.ReadOnly {
+
+	project, projectOK := s.findProject(req.Project)
+	if projectOK && project.cfg != nil && project.cfg.Server.ReadOnly {
 		writeError(w, http.StatusForbidden, "fleet project is read-only; write actions require approval-backed controls to be enabled in configuration")
 		return
 	}
+
+	var (
+		gh    actionGitHubClient
+		audit actionAuditRecorder
+		cfg   *config.Config
+	)
+	if projectOK {
+		cfg = project.cfg
+		gh = project.actionGH
+		audit = s.fleetActionAudit(project)
+	}
+
+	if res := dispatchSafeAction(req, cfg, gh, audit); res.handled {
+		if res.err != nil {
+			log.Printf("[fleet] safe action %q for project %q failed: %v", req.ActionID, req.Project, res.err)
+		}
+		writeJSON(w, res.status, res.body)
+		return
+	}
+
 	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
 }
 
@@ -3114,4 +3151,27 @@ func pluralSuffix(count int) string {
 		return ""
 	}
 	return "s"
+}
+
+// fleetActionAudit returns an audit recorder closure for the given project,
+// or nil if the project has no usable state dir. The closure writes to the
+// project's audit log via the same mechanism as handleFleetAuditLog.
+func (s *FleetServer) fleetActionAudit(project FleetProject) actionAuditRecorder {
+	stateDir, err := s.fleetAuditLogStateDir(project.Name)
+	if err != nil || strings.TrimSpace(stateDir) == "" {
+		return nil
+	}
+	projectName := project.Name
+	return func(actor, action, target, reason string) error {
+		entry := fleetAuditLogEntry{
+			AuditID:   newFleetAuditID(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Actor:     actor,
+			Action:    action,
+			Target:    target,
+			Reason:    reason,
+			Project:   projectName,
+		}
+		return appendFleetAuditLogEntry(stateDir, entry)
+	}
 }

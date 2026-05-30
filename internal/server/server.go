@@ -27,6 +27,22 @@ type Server struct {
 	cfg       *config.Config
 	refreshCh chan<- struct{}
 	srv       *http.Server
+
+	// gh is the GitHub client used by the safe-action dispatcher when the
+	// server is not in read-only mode. nil disables safe actions (handlers
+	// fall through to 501). Tests inject a fake via SetActionDeps.
+	gh actionGitHubClient
+	// audit, when non-nil, records executed safe actions. nil disables
+	// auditing without disabling the action.
+	audit actionAuditRecorder
+}
+
+// SetActionDeps wires the GitHub client and (optional) audit recorder used
+// by the safe-action dispatcher. Call this on startup before Serve, or in
+// tests to inject a fake gh client.
+func (s *Server) SetActionDeps(gh actionGitHubClient, audit actionAuditRecorder) {
+	s.gh = gh
+	s.audit = audit
 }
 
 // New creates a new Server. refreshCh is used to trigger immediate poll cycles.
@@ -206,6 +222,12 @@ type controlActionRequest struct {
 	IssueNumber int    `json:"issue_number,omitempty"`
 	PRNumber    int    `json:"pr_number,omitempty"`
 	ApprovalID  string `json:"approval_id,omitempty"`
+
+	// Body is the comment text for add_issue_comment safe actions.
+	Body string `json:"body,omitempty"`
+	// Actor / Reason are recorded in the audit log for executed actions.
+	Actor  string `json:"actor,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type sessionInfo struct {
@@ -1012,10 +1034,10 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
-	handleControlAction(w, r, s.cfg.Server.ReadOnly, "server")
+	handleControlAction(w, r, s.cfg.Server.ReadOnly, "server", s.cfg, s.gh, s.audit)
 }
 
-func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, scope string) {
+func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, cfg *config.Config, gh actionGitHubClient, audit actionAuditRecorder) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -1033,6 +1055,15 @@ func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, 
 			return
 		}
 	}
+
+	if res := dispatchSafeAction(req, cfg, gh, audit); res.handled {
+		if res.err != nil {
+			log.Printf("[server] safe action %q failed: %v", req.ActionID, res.err)
+		}
+		writeJSON(w, res.status, res.body)
+		return
+	}
+
 	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
 }
 
