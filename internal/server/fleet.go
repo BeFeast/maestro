@@ -2478,17 +2478,23 @@ func failedCount(summary map[string]int) int {
 }
 
 func (s *FleetServer) handleFleetDashboard(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && r.URL.Path != "/fleet" {
+	if !isFleetMCRoute(r.URL.Path) {
 		http.NotFound(w, r)
 		return
 	}
-	body, err := renderFleetDashboardHTML(s.snapshot())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, body)
+	fmt.Fprint(w, web.MustReadStatic("mc/index.html"))
+}
+
+func isFleetMCRoute(path string) bool {
+	switch path {
+	case "/", "/fleet", "/workers", "/approvals", "/settings":
+		return true
+	}
+	if strings.HasPrefix(path, "/project/") && len(path) > len("/project/") {
+		return true
+	}
+	return false
 }
 
 var fleetDashboardHTML = web.MustReadTemplate("fleet.html")

@@ -4,26 +4,46 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    name: build
+  frontend-build:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install MC deps
+        working-directory: internal/server/web/mc
+        run: bun install --frozen-lockfile
+      - name: Design token guard
+        run: bash scripts/check-design-tokens.sh
+      - name: Design recipe guard
+        run: bash scripts/check-design-recipes.sh
+      - name: Build MC bundle
+        working-directory: internal/server/web/mc
+        run: bun run build
+      - name: Verify committed bundle matches build
+        run: |
+          if ! git diff --quiet -- internal/server/web/static/mc; then
+            echo "::error::Committed MC bundle is stale. Run 'bun run build' in internal/server/web/mc and commit the result."
+            git diff --stat -- internal/server/web/static/mc
+            exit 1
+          fi
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
-
       - name: Build
-        run: go build ./cmd/maestro/
-
+        run: go build ./...
       - name: Vet
         run: go vet ./...
-
       - name: Test
         run: go test ./...
