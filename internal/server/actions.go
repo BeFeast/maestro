@@ -88,35 +88,50 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 		if readyLabel == "" {
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no ready label configured (cfg.Supervisor.ReadyLabel / cfg.IssueLabels)"}, err: errors.New("no ready label")}
 		}
+		summary := fmt.Sprintf("+label %s", readyLabel)
+		if err := auditOrAbort(audit, req, id, target, summary); err != nil {
+			return auditFailureResult(id, target, err)
+		}
 		if err := gh.AddIssueLabel(req.IssueNumber, readyLabel); err != nil {
 			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("add ready label: %v", err)}, err: err}
 		}
-		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target, audit, req, fmt.Sprintf("+label %s", readyLabel))}
+		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target)}
 	case config.SupervisorActionRemoveReadyLabel:
 		if readyLabel == "" {
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no ready label configured"}, err: errors.New("no ready label")}
 		}
+		summary := fmt.Sprintf("-label %s", readyLabel)
+		if err := auditOrAbort(audit, req, id, target, summary); err != nil {
+			return auditFailureResult(id, target, err)
+		}
 		if err := gh.RemoveIssueLabel(req.IssueNumber, readyLabel); err != nil {
 			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("remove ready label: %v", err)}, err: err}
 		}
-		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target, audit, req, fmt.Sprintf("-label %s", readyLabel))}
+		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target)}
 	case config.SupervisorActionRemoveBlockedLabel:
 		if blockedLabel == "" {
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no blocked label configured (cfg.Supervisor.BlockedLabel)"}, err: errors.New("no blocked label")}
 		}
+		summary := fmt.Sprintf("-label %s", blockedLabel)
+		if err := auditOrAbort(audit, req, id, target, summary); err != nil {
+			return auditFailureResult(id, target, err)
+		}
 		if err := gh.RemoveIssueLabel(req.IssueNumber, blockedLabel); err != nil {
 			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("remove blocked label: %v", err)}, err: err}
 		}
-		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target, audit, req, fmt.Sprintf("-label %s", blockedLabel))}
+		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target)}
 	case config.SupervisorActionAddIssueComment:
 		body := strings.TrimSpace(req.Body)
 		if body == "" {
 			return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": "body is required for add_issue_comment"}, err: errors.New("missing body")}
 		}
+		if err := auditOrAbort(audit, req, id, target, "+comment"); err != nil {
+			return auditFailureResult(id, target, err)
+		}
 		if err := gh.CommentIssue(req.IssueNumber, body); err != nil {
 			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("comment issue: %v", err)}, err: err}
 		}
-		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target, audit, req, "+comment")}
+		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target)}
 	}
 
 	// Defensive: should be unreachable given isSafeAction filter above.
@@ -183,21 +198,47 @@ func safeActionBlockedLabel(cfg *config.Config) string {
 	return strings.TrimSpace(cfg.Supervisor.BlockedLabel)
 }
 
-func makeSafeOK(id, target string, audit actionAuditRecorder, req controlActionRequest, summary string) safeActionResponse {
-	resp := safeActionResponse{OK: true, ActionID: id, Target: target}
-	if audit != nil {
-		actor := strings.TrimSpace(req.Actor)
-		if actor == "" {
-			actor = "dashboard"
-		}
-		reason := strings.TrimSpace(req.Reason)
-		if reason == "" {
-			reason = summary
-		}
-		// Best-effort: audit failures must not poison a successful action.
-		_ = audit(actor, id, target, reason)
+// auditOrAbort writes the "attempted" audit entry for a write-path
+// action. Audit BEFORE the side effect: if audit fails, the caller
+// MUST NOT proceed with the gh / state mutation. Returns nil on
+// success or when the recorder is nil (no auditing configured).
+//
+// #491: closes premortem failure mode #9. Previously the audit call was
+// fire-and-forget after the side effect; a filesystem hiccup or wrong
+// permissions silently dropped the audit record while the gh mutation
+// went through, leaving forensics with no way to distinguish a
+// filesystem error from an attacker covering tracks.
+func auditOrAbort(audit actionAuditRecorder, req controlActionRequest, action, target, summary string) error {
+	if audit == nil {
+		return nil
 	}
-	return resp
+	actor := strings.TrimSpace(req.Actor)
+	if actor == "" {
+		actor = "dashboard"
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = summary
+	}
+	return audit(actor, action, target, reason)
+}
+
+// auditFailureResult turns an audit-write error into a 500 result the
+// HTTP handler can return as-is. Used by both dispatchSafeAction and
+// dispatchApprovalAction so the audit-fail-closed contract is uniform.
+func auditFailureResult(action, target string, err error) safeActionResult {
+	return safeActionResult{
+		handled: true,
+		status:  http.StatusInternalServerError,
+		body: map[string]string{
+			"error": fmt.Sprintf("audit write failed for %s on %s: %v — refusing to proceed without an audit record", action, target, err),
+		},
+		err: fmt.Errorf("audit write failed for %s: %w", action, err),
+	}
+}
+
+func makeSafeOK(id, target string) safeActionResponse {
+	return safeActionResponse{OK: true, ActionID: id, Target: target}
 }
 
 // approvalEnqueueResponse is the JSON body returned on a successful enqueue.
@@ -251,22 +292,17 @@ func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateD
 		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "failed to record approval"}, err: errors.New("RecordPendingApprovalForDecision returned nil")}
 	}
 
+	target := approvalTargetSummary(decision.Target)
+	// #491 audit-fail-closed: record the audit BEFORE persisting to disk.
+	// If the audit append fails, on-disk state stays unchanged (no orphan
+	// pending approval that has no audit record). The in-memory state was
+	// already mutated by RecordPendingApprovalForDecision but it is not
+	// observable until state.Save below; the next Load discards it.
+	if err := auditOrAbort(audit, req, "enqueue:"+id, target, "enqueued by dashboard"); err != nil {
+		return auditFailureResult("enqueue:"+id, target, err)
+	}
 	if err := state.Save(stateDir, st); err != nil {
 		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("save state: %v", err)}, err: err}
-	}
-
-	target := approvalTargetSummary(decision.Target)
-	if audit != nil {
-		actor := strings.TrimSpace(req.Actor)
-		if actor == "" {
-			actor = "dashboard"
-		}
-		reason := strings.TrimSpace(req.Reason)
-		if reason == "" {
-			reason = "enqueued by dashboard"
-		}
-		// Best-effort.
-		_ = audit(actor, "enqueue:"+id, target, reason)
 	}
 
 	return safeActionResult{
@@ -295,8 +331,8 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 			return errors.New("issue_number is required for close_issue")
 		}
 	case config.SupervisorActionDeleteWorktree:
-		if strings.TrimSpace(req.Slot) == "" {
-			return errors.New("slot is required for delete_worktree")
+		if err := state.ValidateSlotID(req.Slot); err != nil {
+			return fmt.Errorf("delete_worktree: %w", err)
 		}
 	case config.SupervisorActionChangeGlobalConfig:
 		if strings.TrimSpace(req.Reason) == "" {
@@ -337,6 +373,7 @@ func buildApprovalDecision(id string, req controlActionRequest, cfg *config.Conf
 		ID:                fmt.Sprintf("http-%s-%s-%s", id, now.UTC().Format("20060102T150405.000000000Z"), randomDecisionSuffix()),
 		CreatedAt:         now,
 		Project:           projectName,
+		Repo:              repoFromConfig(cfg),
 		Mode:              "http_enqueue",
 		Status:            "pending_approval",
 		Summary:           summary,
@@ -379,4 +416,14 @@ func randomDecisionSuffix() string {
 		return "x"
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// repoFromConfig returns the trimmed cfg.Repo or "" if cfg is nil.
+// Used by buildApprovalDecision to stamp the project repo onto every
+// HTTP-enqueued approval (#489).
+func repoFromConfig(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Repo)
 }

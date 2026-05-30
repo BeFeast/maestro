@@ -580,6 +580,7 @@ type SupervisorDecision struct {
 	ID                string                   `json:"id"`
 	CreatedAt         time.Time                `json:"created_at"`
 	Project           string                   `json:"project"`
+	Repo              string                   `json:"repo,omitempty"`
 	Mode              string                   `json:"mode"`
 	PolicyRule        string                   `json:"policy_rule,omitempty"`
 	Status            string                   `json:"status,omitempty"`
@@ -640,6 +641,13 @@ type Approval struct {
 	PayloadHash     string            `json:"payload_hash"`
 	TargetStateHash string            `json:"target_state_hash,omitempty"`
 	Audit           []ApprovalAudit   `json:"audit,omitempty"`
+	// Repo + Project bind the approval to a specific project context at
+	// write-time (#489). The executor refuses any approval whose Repo
+	// does not match the executor's cfg.Repo, defending against
+	// cross-project mutation if Executor wiring drifts in the future.
+	// Both omitempty for back-compat with approvals created before #489.
+	Repo    string `json:"repo,omitempty"`
+	Project string `json:"project,omitempty"`
 }
 
 type ApprovalAudit struct {
@@ -1311,6 +1319,18 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	if s == nil {
 		return nil
 	}
+	// #490: refuse malformed Target.Session at the state-write boundary.
+	// Otherwise a malformed slot from the supervisor LLM lands in state,
+	// is approved by an unsuspecting operator, and only the executor's
+	// WorktreePathForSlot catches it — too late for forensics. Validators
+	// live at every ingress.
+	if decision.Target != nil {
+		if sess := strings.TrimSpace(decision.Target.Session); sess != "" {
+			if err := ValidateSlotID(sess); err != nil {
+				return nil
+			}
+		}
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -1330,6 +1350,8 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 		Evidence:        append([]string(nil), decision.Reasons...),
 		Status:          ApprovalStatusPending,
 		TargetStateHash: s.ApprovalTargetStateHash(decision.Target),
+		Repo:            decision.Repo,
+		Project:         decision.Project,
 	}
 	approval.PayloadHash = approval.ComputePayloadHash()
 	approval.Audit = append(approval.Audit, ApprovalAudit{
@@ -1680,6 +1702,22 @@ func (s *State) LiveSessionsAt(now time.Time) []*Session {
 		}
 	}
 	return live
+}
+
+
+// SessionAt returns the live session bound to slot, if any. Used by the
+// approver executor (#488 slot-reuse fence) to verify a delete_worktree
+// approval still targets the worker that was running when the approval
+// was queued.
+func (s *State) SessionAt(slot string) (*Session, bool) {
+	if s == nil || s.Sessions == nil {
+		return nil, false
+	}
+	sess, ok := s.Sessions[slot]
+	if !ok || sess == nil {
+		return nil, false
+	}
+	return sess, true
 }
 
 // SessionLive reports whether a session belongs in the default operator view.
@@ -2240,4 +2278,47 @@ func (s *State) MarkApprovalExecutionSkipped(id string, now time.Time, actor, re
 		TargetStateHash: approval.TargetStateHash,
 	})
 	return approval, nil
+}
+
+// ValidateSlotID is the canonical slot-id validator used at EVERY
+// state-write ingress (#490 / premortem #5). A slot id names a session
+// in `state.Sessions` and is later concatenated into a worktree path
+// under `cfg.WorktreeBase`; a malformed slot ("../etc/passwd", a NUL
+// byte, a backslash) would let an attacker (or a hallucinating
+// supervisor LLM) escape the worktree base and steer subsequent
+// `worker.RemoveWorktree` calls at unrelated paths.
+//
+// Validators live HERE, not at the executor-only boundary, so any
+// future refactor that adds a new write-path (HTTP, CLI, supervisor
+// LLM, replay tool) gets the check for free as long as it routes
+// through state.RecordPendingApprovalForDecision or another helper
+// that calls ValidateSlotID.
+//
+// Empty input is rejected. The shape is intentionally narrow: ASCII
+// letters / digits / `-` / `_`, length 1..96. We do NOT accept `/`,
+// `\`, `.`, `..`, NUL, or anything outside that ASCII set. Tests
+// in state_test.go enforce the negative cases.
+func ValidateSlotID(slot string) error {
+	s := strings.TrimSpace(slot)
+	if s == "" {
+		return errors.New("slot is empty")
+	}
+	if s == "." || s == ".." {
+		return errors.New("slot is a traversal segment")
+	}
+	if len(s) > 96 {
+		return errors.New("slot exceeds 96 bytes")
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_':
+		default:
+			return fmt.Errorf("slot %q contains disallowed byte %q at index %d", slot, c, i)
+		}
+	}
+	return nil
 }

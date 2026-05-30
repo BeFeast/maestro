@@ -263,6 +263,12 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 	}
 	outcomeStatus := e.outcomeStatus(st)
 	decision.Outcome = &outcomeStatus
+	// Stamp the project repo on every decision so RecordPendingApprovalForDecision
+	// carries it onto the Approval (#489). Defends against cross-project
+	// mutation if Executor wiring ever drifts.
+	if decision.Repo == "" {
+		decision.Repo = strings.TrimSpace(e.cfg.Repo)
+	}
 	return decision, nil
 }
 
@@ -2975,6 +2981,7 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		GH:        gh,
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
+		Sessions:  approver.SessionLookupFunc(st.SessionAt),
 	}
 	for _, a := range approvals {
 		res := ex.Execute(a)

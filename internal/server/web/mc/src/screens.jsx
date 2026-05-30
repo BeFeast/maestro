@@ -218,9 +218,14 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
   const [scope, setScope] = React.useState("live");
   const [showOlder, setShowOlder] = React.useState(false);
   const ws = workerSessionsFromFleet(fleet || { workers: [] }, now);
-  const allLive = filterProject
-    ? ws.live.filter(w => w.project === filterProject || w.project_name === filterProject)
-    : ws.live;
+  const allRunning = filterProject
+    ? ws.running.filter(w => w.project === filterProject || w.project_name === filterProject)
+    : ws.running;
+  const allRecent = filterProject
+    ? ws.recent.filter(w => w.project === filterProject || w.project_name === filterProject)
+    : ws.recent;
+  // backward-compat alias for code below that still reads allLive
+  const allLive = allRecent;
   const allToday = filterProject
     ? ws.today.filter(w => w.project === filterProject || w.project_name === filterProject)
     : ws.today;
@@ -232,7 +237,8 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
           <h1 style={{ fontSize: 28, fontWeight: 600, letterSpacing: "-0.02em", color: "var(--fg-0)", margin: 0 }}>Workers</h1>
           <div className="mono dim mt-2" style={{ fontSize: 12 }}>
             {filterProject ? <>filtered by <strong style={{ color: "var(--fg-1)" }}>{filterProject}</strong> · </> : null}
-            {allLive.length} live · {ws.todayCount} today · {ws.olderCount} older
+            <strong style={{ color: "var(--fg-0)" }}>{allRunning.length} running</strong>
+            {" · "}{allRecent.length} recent 24h · {ws.todayCount} today · {ws.olderCount} older
             {filterProject && <a onClick={() => navigate("workers")} style={{ marginLeft: 8 }}>clear</a>}
           </div>
         </div>
@@ -241,7 +247,7 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
             value={scope}
             onChange={setScope}
             options={[
-              { value: "live", label: "Live", count: allLive.length },
+              { value: "live", label: "Recent", count: allRecent.length },
               { value: "today", label: "Today", count: ws.todayCount },
               { value: "7d", label: "7d", count: ws.olderCount + ws.todayCount },
               { value: "all", label: "All" },
@@ -263,16 +269,17 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
         {(scope === "live" || scope === "today" || scope === "all") && (
           <>
             <div className="wt-group">
-              <span className="pill live no-dot" style={{ background: "transparent", border: "none", padding: 0, color: "var(--ok)" }}>● live</span>
-              <strong>{allLive.length} workers in flight</strong>
+              <span className="pill live no-dot" style={{ background: "transparent", border: "none", padding: 0, color: "var(--ok)" }}>● running</span>
+              <strong>{allRunning.length} {allRunning.length === 1 ? "worker" : "workers"} in flight</strong>
+              <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>· {allRecent.length} active in last 24 h</span>
               <span className="dim mono" style={{ fontSize: 10.5, marginLeft: "auto" }}>refresh 12s · auto</span>
             </div>
-            {allLive.length === 0 ? (
+            {allRecent.length === 0 ? (
               <div style={{ padding: "var(--s-8) var(--s-4)", textAlign: "center", color: "var(--fg-2)", background: "var(--bg-1)", borderBottom: "1px solid var(--border-1)" }}>
                 <div style={{ fontSize: 13 }}>No workers running.</div>
                 <div className="mono dim mt-2" style={{ fontSize: 11 }}>{fleet?.daemonAlive ? "Supervisor checking for eligible issues." : "Daemon offline."}</div>
               </div>
-            ) : allLive.map(w => (
+            ) : allRecent.map(w => (
               <div key={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
                 <div className="wt-slot">{w.slot}</div>
                 <div>
