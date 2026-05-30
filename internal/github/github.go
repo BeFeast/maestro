@@ -263,7 +263,63 @@ func prReferencesIssue(pr PR, issueNumber int) bool {
 	if issueNumber <= 0 {
 		return false
 	}
-	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + pr.Body)
+	// Match the title verbatim, but strip Markdown code (fenced blocks and
+	// inline spans) from the body first. PR bodies routinely paste log lines,
+	// command output, and tracebacks that mention OTHER issue numbers
+	// (e.g. "[orch] starting worker for issue #353"); those incidental
+	// mentions must not link the PR to that issue. See #468.
+	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + stripCodeForRefMatch(pr.Body))
+}
+
+var (
+	// A fence line is 3+ backticks or 3+ tildes, optionally indented, with an
+	// optional info string (only valid on the OPENING fence).
+	fenceLineRegexp = regexp.MustCompile("^\\s*(`{3,}|~{3,})\\s*(\\S.*)?$")
+	// Inline code spans: one or more backticks, content without a backtick or
+	// newline, then the same-or-more backticks. Approximate but sufficient for
+	// stripping `#123`-style mentions out of prose.
+	inlineCodeRegexp = regexp.MustCompile("`+[^`\\n]*`+")
+)
+
+// stripCodeForRefMatch removes fenced code blocks and inline code spans from
+// Markdown text so issue references buried in pasted logs/output do not produce
+// false positives in prReferencesIssue. Prose references such as "Refs #123"
+// or "Closes #123" (the Maestro worker convention) are preserved.
+func stripCodeForRefMatch(body string) string {
+	lines := strings.Split(body, "\n")
+	out := make([]string, 0, len(lines))
+	inFence := false
+	var fenceChar byte
+	var fenceLen int
+	for _, line := range lines {
+		if m := fenceLineRegexp.FindStringSubmatch(line); m != nil {
+			marker := m[1]
+			info := strings.TrimSpace(m[2])
+			ch := marker[0]
+			n := len(marker)
+			if !inFence {
+				// Opening fence — drop it and start skipping content.
+				inFence = true
+				fenceChar = ch
+				fenceLen = n
+				continue
+			}
+			// Inside a fence: a valid closing fence uses the same character,
+			// is at least as long as the opener, and carries no info string.
+			if ch == fenceChar && n >= fenceLen && info == "" {
+				inFence = false
+				continue
+			}
+			// A fence-looking line that is not a valid closer is fence content.
+			continue
+		}
+		if inFence {
+			continue
+		}
+		out = append(out, line)
+	}
+	cleaned := strings.Join(out, "\n")
+	return inlineCodeRegexp.ReplaceAllString(cleaned, " ")
 }
 
 func parseCheckRuns(out []byte) ([]greptileCheckRun, error) {
