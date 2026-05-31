@@ -59,7 +59,12 @@ type safeActionResponse struct {
 //
 // readOnly is checked by the caller before this is invoked; we assume here
 // that the request has already cleared the read-only gate.
-func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionGitHubClient, audit actionAuditRecorder) safeActionResult {
+//
+// authenticatedActor, when non-empty, is the identity resolved from the
+// Authorization header (#487). It overrides the request body's actor field
+// when the audit entry is written — closing the forensic hole where a body
+// could claim actor="oleg" without any credential.
+func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionGitHubClient, audit actionAuditRecorder, authenticatedActor string) safeActionResult {
 	id := strings.TrimSpace(req.ActionID)
 	if id == "" {
 		return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": "action_id is required"}, err: errors.New("missing action_id")}
@@ -89,7 +94,7 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no ready label configured (cfg.Supervisor.ReadyLabel / cfg.IssueLabels)"}, err: errors.New("no ready label")}
 		}
 		summary := fmt.Sprintf("+label %s", readyLabel)
-		if err := auditOrAbort(audit, req, id, target, summary); err != nil {
+		if err := auditOrAbort(audit, req, authenticatedActor, id, target, summary); err != nil {
 			return auditFailureResult(id, target, err)
 		}
 		if err := gh.AddIssueLabel(req.IssueNumber, readyLabel); err != nil {
@@ -101,7 +106,7 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no ready label configured"}, err: errors.New("no ready label")}
 		}
 		summary := fmt.Sprintf("-label %s", readyLabel)
-		if err := auditOrAbort(audit, req, id, target, summary); err != nil {
+		if err := auditOrAbort(audit, req, authenticatedActor, id, target, summary); err != nil {
 			return auditFailureResult(id, target, err)
 		}
 		if err := gh.RemoveIssueLabel(req.IssueNumber, readyLabel); err != nil {
@@ -113,7 +118,7 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no blocked label configured (cfg.Supervisor.BlockedLabel)"}, err: errors.New("no blocked label")}
 		}
 		summary := fmt.Sprintf("-label %s", blockedLabel)
-		if err := auditOrAbort(audit, req, id, target, summary); err != nil {
+		if err := auditOrAbort(audit, req, authenticatedActor, id, target, summary); err != nil {
 			return auditFailureResult(id, target, err)
 		}
 		if err := gh.RemoveIssueLabel(req.IssueNumber, blockedLabel); err != nil {
@@ -125,7 +130,7 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 		if body == "" {
 			return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": "body is required for add_issue_comment"}, err: errors.New("missing body")}
 		}
-		if err := auditOrAbort(audit, req, id, target, "+comment"); err != nil {
+		if err := auditOrAbort(audit, req, authenticatedActor, id, target, "+comment"); err != nil {
 			return auditFailureResult(id, target, err)
 		}
 		if err := gh.CommentIssue(req.IssueNumber, body); err != nil {
@@ -208,14 +213,16 @@ func safeActionBlockedLabel(cfg *config.Config) string {
 // permissions silently dropped the audit record while the gh mutation
 // went through, leaving forensics with no way to distinguish a
 // filesystem error from an attacker covering tracks.
-func auditOrAbort(audit actionAuditRecorder, req controlActionRequest, action, target, summary string) error {
+//
+// #487: authenticatedActor (when non-empty) overrides any actor in the
+// request body — the body's actor field is attacker-controlled and MUST
+// NOT be trusted to identify who did what (write-path premortem #4 +
+// failure mode #9 audit drift).
+func auditOrAbort(audit actionAuditRecorder, req controlActionRequest, authenticatedActor, action, target, summary string) error {
 	if audit == nil {
 		return nil
 	}
-	actor := strings.TrimSpace(req.Actor)
-	if actor == "" {
-		actor = "dashboard"
-	}
+	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
 	reason := strings.TrimSpace(req.Reason)
 	if reason == "" {
 		reason = summary
@@ -263,7 +270,12 @@ type approvalEnqueueResponse struct {
 //
 // stateDir is the per-project state directory. nil cfg or empty stateDir
 // produce a 500 — the dashboard cannot enqueue without persistence.
-func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateDir string, audit actionAuditRecorder) safeActionResult {
+//
+// authenticatedActor (#487), when non-empty, overrides any actor in the
+// request body — this is the cautious-gate defense-in-depth contract: even
+// for an authenticated caller the verb is enqueued (not executed) AND the
+// audit + decision identity comes from the credential, not the body.
+func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateDir string, audit actionAuditRecorder, authenticatedActor string) safeActionResult {
 	id := strings.TrimSpace(req.ActionID)
 	if !isApprovalRequiredAction(id) {
 		return safeActionResult{handled: false}
@@ -286,7 +298,7 @@ func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateD
 	}
 
 	now := time.Now().UTC()
-	decision := buildApprovalDecision(id, req, cfg, now)
+	decision := buildApprovalDecision(id, req, cfg, authenticatedActor, now)
 	approval := st.RecordPendingApprovalForDecision(decision, now)
 	if approval == nil {
 		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "failed to record approval"}, err: errors.New("RecordPendingApprovalForDecision returned nil")}
@@ -298,7 +310,7 @@ func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateD
 	// pending approval that has no audit record). The in-memory state was
 	// already mutated by RecordPendingApprovalForDecision but it is not
 	// observable until state.Save below; the next Load discards it.
-	if err := auditOrAbort(audit, req, "enqueue:"+id, target, "enqueued by dashboard"); err != nil {
+	if err := auditOrAbort(audit, req, authenticatedActor, "enqueue:"+id, target, "enqueued by dashboard"); err != nil {
 		return auditFailureResult("enqueue:"+id, target, err)
 	}
 	if err := state.Save(stateDir, st); err != nil {
@@ -345,11 +357,12 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 // buildApprovalDecision constructs a synthetic SupervisorDecision so the
 // HTTP enqueue path uses the same approval pipeline as the LLM supervisor.
 // The decision is recorded in state as the approval source.
-func buildApprovalDecision(id string, req controlActionRequest, cfg *config.Config, now time.Time) state.SupervisorDecision {
-	actor := strings.TrimSpace(req.Actor)
-	if actor == "" {
-		actor = "dashboard"
-	}
+//
+// #487: authenticatedActor (when non-empty) replaces req.Actor in the
+// decision's Reasons field — the audit-of-record for who enqueued the
+// approval cannot be set from an attacker-controlled body field.
+func buildApprovalDecision(id string, req controlActionRequest, cfg *config.Config, authenticatedActor string, now time.Time) state.SupervisorDecision {
+	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
 	summary := strings.TrimSpace(req.Reason)
 	if summary == "" {
 		summary = fmt.Sprintf("HTTP enqueue of %s", id)

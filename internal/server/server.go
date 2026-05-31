@@ -35,6 +35,11 @@ type Server struct {
 	// audit, when non-nil, records executed safe actions. nil disables
 	// auditing without disabling the action.
 	audit actionAuditRecorder
+	// auth gates every mutating endpoint (#487). When the configured token
+	// is empty (default), behaviour is unchanged; when it is non-empty,
+	// /actions, /approvals/.../{approve|reject}, and /refresh require
+	// Authorization: Bearer <token>.
+	auth authChecker
 }
 
 // SetActionDeps wires the GitHub client and (optional) audit recorder used
@@ -47,10 +52,21 @@ func (s *Server) SetActionDeps(gh actionGitHubClient, audit actionAuditRecorder)
 
 // New creates a new Server. refreshCh is used to trigger immediate poll cycles.
 func New(cfg *config.Config, refreshCh chan<- struct{}) *Server {
+	auth := authChecker{}
+	if cfg != nil {
+		auth = newAuthChecker(cfg.Server.Auth)
+	}
 	return &Server{
 		cfg:       cfg,
 		refreshCh: refreshCh,
+		auth:      auth,
 	}
+}
+
+// SetAuthForTest replaces the auth checker. Test-only helper — production
+// code wires auth via cfg.Server.Auth at New().
+func (s *Server) SetAuthForTest(token, actorName string) {
+	s.auth = newAuthCheckerForTest(token, actorName)
 }
 
 // Start begins serving HTTP on the configured port. It blocks until the server
@@ -1021,6 +1037,12 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// #487: auth BEFORE the read-only check. The acceptance criterion is
+	// "every mutating POST without a valid credential returns 401 (not 200,
+	// not 403, not 405)".
+	if _, ok := requireAuth(w, r, s.auth); !ok {
+		return
+	}
 	if s.cfg.Server.ReadOnly {
 		writeError(w, http.StatusForbidden, "server is read-only")
 		return
@@ -1039,12 +1061,19 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	if s.cfg != nil {
 		stateDir = s.cfg.StateDir
 	}
-	handleControlAction(w, r, s.cfg.Server.ReadOnly, "server", s.cfg, stateDir, s.gh, s.audit)
+	handleControlAction(w, r, s.cfg.Server.ReadOnly, "server", s.cfg, stateDir, s.gh, s.audit, s.auth)
 }
 
-func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, cfg *config.Config, stateDir string, gh actionGitHubClient, audit actionAuditRecorder) {
+func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, cfg *config.Config, stateDir string, gh actionGitHubClient, audit actionAuditRecorder, auth authChecker) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// #487: auth check fires BEFORE the read-only gate so an unauthenticated
+	// attacker on a read-only deployment cannot probe verb existence via
+	// 403 vs 401 mapping (acceptance: "always 401, never 200/403/405").
+	authenticatedActor, ok := requireAuth(w, r, auth)
+	if !ok {
 		return
 	}
 	if readOnly {
@@ -1061,7 +1090,7 @@ func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, 
 		}
 	}
 
-	if res := dispatchSafeAction(req, cfg, gh, audit); res.handled {
+	if res := dispatchSafeAction(req, cfg, gh, audit, authenticatedActor); res.handled {
 		if res.err != nil {
 			log.Printf("[server] safe action %q failed: %v", req.ActionID, res.err)
 		}
@@ -1069,7 +1098,7 @@ func handleControlAction(w http.ResponseWriter, r *http.Request, readOnly bool, 
 		return
 	}
 
-	if res := dispatchApprovalAction(req, cfg, stateDir, audit); res.handled {
+	if res := dispatchApprovalAction(req, cfg, stateDir, audit, authenticatedActor); res.handled {
 		if res.err != nil {
 			log.Printf("[server] approval enqueue %q failed: %v", req.ActionID, res.err)
 		}

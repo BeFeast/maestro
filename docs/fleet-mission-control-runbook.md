@@ -17,7 +17,7 @@ Reserve these services and ports on the workshop host:
 | Worker sessions | none | none | tmux sessions and log files created under each project's `state_dir` | Inspect through Mission Control, `maestro status`, or `maestro logs` |
 | OpenClaw relay | `127.0.0.1` | `18789` | Optional Telegram relay endpoint when `telegram.mode: openclaw` is used | Not required for Mission Control |
 
-Keep Fleet Mission Control read-only until there is an explicit auth and audit model for mutating controls. Bind `0.0.0.0` only behind a trusted firewall or reverse proxy.
+Mutating endpoints require app-level HTTP auth (#487). Configure `server.auth.token_env` in each project config (the fleet picks up the first project that sets it) and populate the named environment variable from your secret manager (Infisical, 1Password CLI, etc.) — never inline the token in YAML. When auth is configured, every `POST /api/v1/...` (`/actions`, `/approvals/.../{approve|reject}`, `/audit/log`, `/fleet/actions`) requires `Authorization: Bearer <token>` and returns `401` without it. Read-only GETs stay open. The LAN is no longer treated as trusted: do not skip the token, even on `127.0.0.1`, when other devices share the network.
 
 ## Config Boundaries
 

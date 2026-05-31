@@ -301,9 +301,49 @@ type RoutingConfig struct {
 
 // ServerConfig controls the optional HTTP API server.
 type ServerConfig struct {
-	Host     string `yaml:"host"`      // host/interface to bind; default: 127.0.0.1
-	Port     int    `yaml:"port"`      // 0 = disabled (default)
-	ReadOnly bool   `yaml:"read_only"` // disable mutating HTTP endpoints when true
+	Host     string           `yaml:"host"`      // host/interface to bind; default: 127.0.0.1
+	Port     int              `yaml:"port"`      // 0 = disabled (default)
+	ReadOnly bool             `yaml:"read_only"` // disable mutating HTTP endpoints when true
+	Auth     ServerAuthConfig `yaml:"auth"`      // HTTP auth on mutating endpoints (#487)
+}
+
+// ServerAuthConfig configures app-level auth on every mutating dashboard
+// endpoint (#487 / write-path premortem #4). The token itself MUST NOT be
+// stored in YAML — set TokenEnv to the name of an environment variable the
+// operator populates from a secret manager (Infisical, 1Password, etc.).
+//
+// When the resolved token is non-empty, every POST to /api/v1/.../actions,
+// /api/v1/.../approvals/{id}/{approve|reject}, /api/v1/audit/log, and
+// /api/v1/refresh requires Authorization: Bearer <token> (or Basic auth
+// where the password equals the token). Read-only GETs stay open.
+//
+// When TokenEnv is unset OR the env var is empty, mutating endpoints behave
+// as before — useful for unit tests and the initial rollout. Operators
+// running maestro on a shared network MUST set TokenEnv.
+type ServerAuthConfig struct {
+	TokenEnv  string `yaml:"token_env"`  // env var name to read the bearer token from
+	ActorName string `yaml:"actor_name"` // audit actor recorded for authenticated requests
+}
+
+// Token resolves the bearer token from the configured env var. Returns ""
+// when TokenEnv is unset, when the env var is unset, or when the env var
+// is empty/whitespace. Callers treat "" as "auth not configured".
+func (a ServerAuthConfig) Token() string {
+	env := strings.TrimSpace(a.TokenEnv)
+	if env == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv(env))
+}
+
+// ResolvedActorName returns the actor recorded in audit for authenticated
+// requests. Defaults to "dashboard-authenticated" when ActorName is empty.
+func (a ServerAuthConfig) ResolvedActorName() string {
+	name := strings.TrimSpace(a.ActorName)
+	if name == "" {
+		return "dashboard-authenticated"
+	}
+	return name
 }
 
 // RoleConfig defines settings for a single pipeline role (planner, validator).

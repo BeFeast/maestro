@@ -23,14 +23,14 @@ type approvalDecisionRequest struct {
 
 // approvalDecisionResponse mirrors what handlers return on success.
 type approvalDecisionResponse struct {
-	OK       bool             `json:"ok"`
+	OK       bool            `json:"ok"`
 	Approval *state.Approval `json:"approval"`
 }
 
 // approvalRoute is "approve" or "reject" parsed from the URL.
 type approvalRoute struct {
-	id     string
-	verb   string // "approve" | "reject"
+	id   string
+	verb string // "approve" | "reject"
 }
 
 // parseApprovalPath splits /<prefix>/{id}/{verb} into (id, verb). Returns
@@ -59,9 +59,19 @@ func parseApprovalPath(prefix, urlPath string) (approvalRoute, bool) {
 // handler. It loads state from stateDir, calls the matching state
 // transition, persists, and writes the JSON response. Returns nil on a
 // path the handler must continue (none today; the body always responds).
-func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, stateDir string, route approvalRoute) {
+//
+// #487: auth check fires BEFORE the read-only gate so an unauthenticated
+// request always sees 401 (never 403/405). The authenticated identity
+// overrides any actor field in the request body — closing the bypass where
+// "approve IS the human-authorization step, and approve has no auth"
+// (write-path premortem failure mode #4).
+func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, stateDir string, route approvalRoute, auth authChecker) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	authenticatedActor, ok := requireAuth(w, r, auth)
+	if !ok {
 		return
 	}
 	if readOnly {
@@ -81,10 +91,7 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 			return
 		}
 	}
-	actor := strings.TrimSpace(req.Actor)
-	if actor == "" {
-		actor = "dashboard"
-	}
+	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
 	reason := strings.TrimSpace(req.Reason)
 
 	st, err := state.Load(stateDir)
@@ -150,7 +157,7 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	if cfg != nil {
 		stateDir = cfg.StateDir
 	}
-	applyApprovalDecision(w, r, cfgServerReadOnly(cfg), "server", stateDir, route)
+	applyApprovalDecision(w, r, cfgServerReadOnly(cfg), "server", stateDir, route, s.auth)
 }
 
 func cfgServerReadOnly(cfg *config.Config) bool {
@@ -167,6 +174,12 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	// GET against an unknown project returns 405, not 404.
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// #487: auth fires BEFORE path / project parsing so an unauthenticated
+	// probe cannot enumerate fleet topology via 404/400 differences. Spec:
+	// "every mutating POST without a valid credential returns 401".
+	if _, ok := requireAuth(w, r, s.auth); !ok {
 		return
 	}
 	route, ok := parseApprovalPath("/api/v1/fleet/approvals/", r.URL.Path)
@@ -194,5 +207,5 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	if project.cfg != nil {
 		stateDir = project.cfg.StateDir
 	}
-	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route)
+	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route, s.auth)
 }
