@@ -19,3 +19,6 @@
 
 # Frontend build
 internal/server/web/mc/node_modules/
+
+# Generated test/verify artifacts
+.maestro/
