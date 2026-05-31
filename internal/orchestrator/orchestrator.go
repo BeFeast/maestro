@@ -1401,26 +1401,77 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// the provider hit a rate / usage limit. Without this, the reconcile path
 		// races the main exit handler at the start of every cycle and burns the
 		// per-issue retry budget on what is really a transient backend block (#466).
+		// On rate-limit, attempt the same provider-limit fallover the main loop does
+		// (see :worker-died and :log-scanner paths) — select an available fallback
+		// backend and respawn the session there. Mark the session Dead only when no
+		// fallback is configured / available, or when the respawn itself fails (#506).
 		if o.isRateLimited(sess.LogFile) {
 			now := time.Now().UTC()
 			resetAt := o.rateLimitResetFromLog(sess.LogFile)
 			o.recordProviderLimit(s, slotName, sess, "log_rate_limit_reconcile", resetAt, now)
+			selection := o.selectProviderLimitFallback(s, sess, now)
+			sess.BackendSelection = &selection
 			oldPID := sess.PID
 			oldTmux := tmuxName
-			sess.PID = 0
-			sess.TmuxSession = ""
-			sess.FinishedAt = &now
-			sess.LastNotifiedStatus = "rate_limit"
-			sess.Status = state.StatusDead
-			reconciled = true
 			resetStr := "unknown"
 			if resetAt != nil {
 				resetStr = resetAt.Format(time.RFC3339)
 			}
-			log.Printf("[orch] reconcile: %s running->dead via provider rate limit on backend=%s reset=%s (%s); pid=%d tmux=%q",
-				slotName, sess.Backend, resetStr, strings.Join(reasons, ", "), oldPID, oldTmux)
-			o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit on %s; reset=%s",
-				slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, resetStr)
+			previousBackend := sess.Backend
+			nextBackend := selection.SelectedBackend
+
+			if nextBackend == "" {
+				sess.PID = 0
+				sess.TmuxSession = ""
+				sess.FinishedAt = &now
+				sess.LastNotifiedStatus = "rate_limit"
+				sess.Status = state.StatusDead
+				reconciled = true
+				log.Printf("[orch] reconcile: %s running->dead via provider rate limit on backend=%s reset=%s (no fallback available; %s); pid=%d tmux=%q",
+					slotName, previousBackend, resetStr, strings.Join(reasons, ", "), oldPID, oldTmux)
+				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit on %s; reset=%s; no fallback available",
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, resetStr)
+				continue
+			}
+
+			issue, fetchErr := o.getIssue(sess.IssueNumber)
+			if fetchErr != nil {
+				sess.PID = 0
+				sess.TmuxSession = ""
+				sess.FinishedAt = &now
+				sess.LastNotifiedStatus = "rate_limit"
+				sess.Status = state.StatusDead
+				reconciled = true
+				log.Printf("[orch] reconcile: %s running->dead via provider rate limit on backend=%s reset=%s (fallback to %s aborted: could not fetch issue #%d: %v; %s); pid=%d tmux=%q",
+					slotName, previousBackend, resetStr, nextBackend, sess.IssueNumber, fetchErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit on %s; fallback to %s failed (could not fetch issue): %v",
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, nextBackend, fetchErr)
+				continue
+			}
+
+			if previousBackend != "" {
+				sess.TriedBackends = append(sess.TriedBackends, previousBackend)
+			}
+			promptBase := o.selectPrompt(issue)
+			if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
+				sess.PID = 0
+				sess.TmuxSession = ""
+				sess.FinishedAt = &now
+				sess.LastNotifiedStatus = "rate_limit"
+				sess.Status = state.StatusDead
+				reconciled = true
+				log.Printf("[orch] reconcile: %s running->dead via provider rate limit on backend=%s reset=%s (fallback respawn on %s failed: %v; %s); pid=%d tmux=%q",
+					slotName, previousBackend, resetStr, nextBackend, respawnErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit on %s; fallback to %s failed: %v",
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, nextBackend, respawnErr)
+				continue
+			}
+
+			reconciled = true
+			log.Printf("[orch] reconcile: %s rate-limited on backend=%s reset=%s — respawned with backend=%s (%s); old pid=%d tmux=%q",
+				slotName, previousBackend, resetStr, nextBackend, strings.Join(reasons, ", "), oldPID, oldTmux)
+			o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) hit provider limit on %s; reset=%s — respawned on %s",
+				slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, resetStr, nextBackend)
 			continue
 		}
 
