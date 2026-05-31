@@ -1344,6 +1344,93 @@ model:
 	}
 }
 
+// #507: a backend marked non_agentic must not appear as model.default.
+// Parse-time validation rejects the config so the daemon never starts
+// with a fake-PR generator wired as the worker entry point.
+func TestParse_RejectsNonAgenticAsDefault(t *testing.T) {
+	yaml := []byte(`
+repo: owner/repo
+local_path: /tmp/repo
+worktree_base: /tmp/worktrees
+session_prefix: x
+model:
+  default: freellm
+  backends:
+    freellm:
+      cmd: /bin/echo
+      non_agentic: true
+    claude:
+      cmd: claude
+`)
+	if _, err := parse(yaml); err == nil {
+		t.Fatal("expected parse to refuse default=freellm with non_agentic=true")
+	} else if !strings.Contains(err.Error(), "non_agentic") {
+		t.Fatalf("error = %v, want substring \"non_agentic\"", err)
+	}
+}
+
+// #507: a non-agentic backend in fallback_backends is also rejected —
+// the fallback chain IS the worker chain.
+func TestParse_RejectsNonAgenticInFallback(t *testing.T) {
+	yaml := []byte(`
+repo: owner/repo
+local_path: /tmp/repo
+worktree_base: /tmp/worktrees
+session_prefix: x
+model:
+  default: claude
+  fallback_backends: [codex, freellm]
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+    freellm:
+      cmd: /bin/echo
+      non_agentic: true
+`)
+	if _, err := parse(yaml); err == nil {
+		t.Fatal("expected parse to refuse freellm in fallback_backends when non_agentic=true")
+	} else if !strings.Contains(err.Error(), "non_agentic") {
+		t.Fatalf("error = %v, want substring \"non_agentic\"", err)
+	} else if !strings.Contains(err.Error(), "freellm") {
+		t.Fatalf("error = %v, want substring \"freellm\"", err)
+	}
+}
+
+// #507: a non-agentic backend that is NOT in the worker chain (only
+// declared in backends, neither default nor fallback) is allowed —
+// supervisor sub-tasks (label classify, summary) can still call it.
+func TestParse_AllowsNonAgenticOutsideWorkerChain(t *testing.T) {
+	yaml := []byte(`
+repo: owner/repo
+local_path: /tmp/repo
+worktree_base: /tmp/worktrees
+session_prefix: x
+model:
+  default: claude
+  fallback_backends: [codex]
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+    freellm:
+      cmd: /bin/echo
+      non_agentic: true
+`)
+	cfg, err := parse(yaml)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Model.Backends["freellm"].NonAgentic != true {
+		t.Fatal("freellm NonAgentic flag was lost")
+	}
+	if cfg.Model.Default != "claude" {
+		t.Fatalf("Default = %q, want claude", cfg.Model.Default)
+	}
+}
+
 func TestParse_MaxConcurrentByStateDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
