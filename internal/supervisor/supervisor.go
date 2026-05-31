@@ -3138,6 +3138,17 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 			if _, err := st.MarkApprovalExecutionSkipped(a.ID, now, "supervisor", res.Summary); err != nil {
 				fmt.Fprintf(os.Stderr, "[supervisor] mark approval %s skipped: %v\n", a.ID, err)
 			}
+		case state.ApprovalStatusAwaitingDispatch:
+			// #515 follow-up: spawn_worker / open_child_issue executor
+			// returns AwaitingDispatch so dedup keeps treating the
+			// approval as effective until the dispatcher loop resolves
+			// it. Without this case the default branch flipped these
+			// to execution_failed and the next supervisor cycle minted
+			// a duplicate pending — exact zombie loop seen on dogfood
+			// 2026-05-31 17:45–17:55 UTC for issue #487.
+			if _, err := st.MarkApprovalAwaitingDispatch(a.ID, now, "supervisor", res.Summary); err != nil {
+				fmt.Fprintf(os.Stderr, "[supervisor] mark approval %s awaiting_dispatch: %v\n", a.ID, err)
+			}
 		default:
 			msg := res.Summary
 			if msg == "" && res.Err != nil {

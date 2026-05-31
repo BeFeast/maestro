@@ -2390,6 +2390,34 @@ func (s *State) MarkApprovalExecutionSkipped(id string, now time.Time, actor, re
 	return approval, nil
 }
 
+// MarkApprovalAwaitingDispatch transitions approved → awaiting_dispatch
+// with an audit reason. Used for verbs whose side effect lives on a
+// separate loop (spawn_worker — the dispatcher tick allocates the slot;
+// open_child_issue — the operator creates the child until the
+// safe-action executor lands). Distinct from ExecutionSkipped: a
+// dispatcher loop will resolve this approval, dedup must keep treating
+// it as effective until then.
+func (s *State) MarkApprovalAwaitingDispatch(id string, now time.Time, actor, reason string) (*Approval, error) {
+	approval, ok := s.FindApproval(id)
+	if !ok {
+		return nil, ErrApprovalNotFound
+	}
+	if approval.Status != ApprovalStatusApproved {
+		return approval, ErrApprovalNotApproved
+	}
+	approval.Status = ApprovalStatusAwaitingDispatch
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditAwaitingDispatch,
+		Actor:           actor,
+		Reason:          reason,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	return approval, nil
+}
+
 // ValidateSlotID is the canonical slot-id validator used at EVERY
 // state-write ingress (#490 / premortem #5). A slot id names a session
 // in `state.Sessions` and is later concatenated into a worktree path

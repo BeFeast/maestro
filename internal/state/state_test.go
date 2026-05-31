@@ -1849,6 +1849,45 @@ func TestReconcileSpawnWorkerApprovalsSupersedesAwaitingDispatch(t *testing.T) {
 	}
 }
 
+// #515 follow-up: MarkApprovalAwaitingDispatch transitions an approved
+// approval to awaiting_dispatch with an audit entry, mirroring the
+// existing MarkApprovalExecuted/Failed/Skipped helpers. Idempotency
+// guarantee: not-approved input returns ErrApprovalNotApproved.
+func TestMarkApprovalAwaitingDispatch_TransitionsApprovedToAwaiting(t *testing.T) {
+	now := time.Date(2026, 5, 31, 17, 0, 0, 0, time.UTC)
+	s := NewState()
+	a := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	if a == nil {
+		t.Fatal("approval was nil")
+	}
+	a.Status = ApprovalStatusApproved
+
+	updated, err := s.MarkApprovalAwaitingDispatch(a.ID, now.Add(time.Minute), "supervisor", "test reason")
+	if err != nil {
+		t.Fatalf("MarkApprovalAwaitingDispatch: %v", err)
+	}
+	if updated.Status != ApprovalStatusAwaitingDispatch {
+		t.Fatalf("status = %q, want awaiting_dispatch", updated.Status)
+	}
+	if got := updated.Audit[len(updated.Audit)-1].Event; got != ApprovalAuditAwaitingDispatch {
+		t.Fatalf("last audit event = %q, want awaiting_dispatch", got)
+	}
+	if got := updated.Audit[len(updated.Audit)-1].Reason; got != "test reason" {
+		t.Fatalf("audit reason = %q, want %q", got, "test reason")
+	}
+}
+
+func TestMarkApprovalAwaitingDispatch_RefusesNonApproved(t *testing.T) {
+	now := time.Date(2026, 5, 31, 17, 0, 0, 0, time.UTC)
+	s := NewState()
+	a := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	// Status stays Pending; helper must refuse.
+	_, err := s.MarkApprovalAwaitingDispatch(a.ID, now, "supervisor", "x")
+	if err != ErrApprovalNotApproved {
+		t.Fatalf("err = %v, want ErrApprovalNotApproved", err)
+	}
+}
+
 func TestReconcileSpawnWorkerApprovalsForStartedSession(t *testing.T) {
 	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
 	s := NewState()
