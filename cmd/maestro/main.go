@@ -251,6 +251,8 @@ func main() {
 		runCmd(args)
 	case "supervise":
 		superviseCmd(args)
+	case "night-start":
+		nightStartCmd(args)
 	case "serve":
 		serveCmd(args)
 	case "status":
