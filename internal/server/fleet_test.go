@@ -266,6 +266,38 @@ func TestFleetThroughputBucketsAggregateSevenDayWindows(t *testing.T) {
 	}
 }
 
+// Throughput is summed across projects: addFleetThroughputSummary is invoked
+// once per project in snapshot(), so the bucket counts must accumulate rather
+// than reset between calls.
+func TestFleetThroughputBucketsAggregateAcrossProjects(t *testing.T) {
+	now := time.Date(2026, 5, 2, 15, 0, 0, 0, time.UTC)
+	donePR := func(pr int, finishedAt time.Time) fleetWorkerState {
+		return fleetWorkerState{Status: string(state.StatusDone), PRNumber: pr, FinishedAt: finishedAt.Format(time.RFC3339)}
+	}
+	projectOne := []fleetWorkerState{
+		donePR(101, now.Add(-2*time.Hour)),
+		donePR(102, now.Add(-24*time.Hour)),
+	}
+	projectTwo := []fleetWorkerState{
+		donePR(201, now.Add(-2*time.Hour)),
+		donePR(202, now.Add(-6*24*time.Hour)),
+	}
+	projectThree := []fleetWorkerState(nil)
+
+	buckets := newFleetThroughputBuckets(now, 7)
+	addFleetThroughputSummary(buckets, projectOne)
+	addFleetThroughputSummary(buckets, projectTwo)
+	addFleetThroughputSummary(buckets, projectThree)
+
+	wantCounts := []int{1, 0, 0, 0, 0, 1, 2}
+	if got := buckets.Counts(); !reflect.DeepEqual(got, wantCounts) {
+		t.Fatalf("counts = %v, want %v", got, wantCounts)
+	}
+	if buckets.Total() != 4 {
+		t.Fatalf("total = %d, want 4", buckets.Total())
+	}
+}
+
 func TestFleetAPIReviewRetryLifecycleDisplay(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
