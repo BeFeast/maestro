@@ -103,6 +103,73 @@ func TestPRReferencesIssue_IgnoresCodeAndLogs(t *testing.T) {
 	}
 }
 
+// #520: prClosesIssue must require an explicit closing keyword
+// directly in front of `#N`. Bare mentions of `#N` (e.g. "P0 #487"
+// in a commit-message context line) must NOT trigger it.
+func TestPRClosesIssue_StrictClosingKeyword(t *testing.T) {
+	cases := []struct {
+		name  string
+		pr    PR
+		issue int
+		want  bool
+	}{
+		// Positive — recognised closing keywords.
+		{"Closes capital", PR{Title: "fix bug", Body: "Closes #487"}, 487, true},
+		{"closes lowercase", PR{Title: "fix", Body: "closes #487"}, 487, true},
+		{"closed past", PR{Title: "fix", Body: "closed #487"}, 487, true},
+		{"fixes", PR{Title: "fix", Body: "fixes #487"}, 487, true},
+		{"fix bare", PR{Title: "fix", Body: "fix #487"}, 487, true},
+		{"resolves", PR{Title: "fix", Body: "Resolves #487"}, 487, true},
+		{"resolved past", PR{Title: "fix", Body: "resolved #487"}, 487, true},
+		{"colon between", PR{Title: "fix", Body: "Fixes: #487"}, 487, true},
+		{"newline before", PR{Title: "x", Body: "did things\ncloses #487\n"}, 487, true},
+		{"in title", PR{Title: "Closes #487 — auth", Body: ""}, 487, true},
+
+		// Negative — bare references / non-closing keywords.
+		{"bare mention", PR{Title: "P0 #487: add HTTP auth", Body: ""}, 487, false},
+		{"refs prefix", PR{Title: "fix", Body: "Refs #487"}, 487, false},
+		{"see prefix", PR{Title: "fix", Body: "see #487 for context"}, 487, false},
+		{"naked hash", PR{Title: "fix", Body: "context: #487 was the original P0"}, 487, false},
+		{"different number", PR{Title: "fix", Body: "Closes #488"}, 487, false},
+		{"prefix-bound number", PR{Title: "fix", Body: "Closes #4879"}, 487, false},
+		{"keyword inside word", PR{Title: "fix", Body: "encloses #487"}, 487, false}, // "encloses" not a closing keyword
+		// Code-fenced closing keyword: prClosesIssue uses
+		// stripCodeForRefMatch on the body, so a fenced "closes #N"
+		// must NOT count.
+		{"fenced closes", PR{Title: "fix", Body: "Live log:\n```\ncloses #487\n```"}, 487, false},
+
+		// Empty / invalid.
+		{"zero issue", PR{Title: "Closes #1", Body: ""}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := prClosesIssue(tc.pr, tc.issue); got != tc.want {
+				t.Fatalf("prClosesIssue(issue=%d) = %v, want %v\nbody=%q", tc.issue, got, tc.want, tc.pr.Body)
+			}
+		})
+	}
+}
+
+// #520: HasMergedPRForIssue must return false for merged PRs that only
+// reference (not close) the issue. Direct integration test for the
+// matcher swap; uses a fake closed-PR list via the same test pattern
+// as the existing #468 test.
+func TestPRClosesIssue_PR487RegressionScenario(t *testing.T) {
+	// Real shape from today's freeze (2026-05-31): PR #514 commit body
+	// has «P0 #487» as project context. Must not be flagged as closing
+	// #487.
+	pr514 := PR{
+		Title: "feat(supervisor): merge_pr planner rule (#512, Phase 1.6) — closes hands-off blocker",
+		Body:  "Closes #512. Until now the supervisor planner had only ActionMonitorOpenPR\nfor sessions with an open PR ... Refs #487 (HTTP auth).",
+	}
+	if prClosesIssue(pr514, 487) {
+		t.Fatal("PR #514 must NOT be considered as closing #487 (it only Refs the issue)")
+	}
+	if !prClosesIssue(pr514, 512) {
+		t.Fatal("PR #514 MUST be considered as closing #512 (its actual target)")
+	}
+}
+
 func TestRESTIssueStateClosedAcceptsRESTLowercase(t *testing.T) {
 	for _, state := range []string{"closed", "CLOSED", " Closed "} {
 		if !restIssueStateClosed(state) {

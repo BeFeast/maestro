@@ -271,6 +271,50 @@ func prReferencesIssue(pr PR, issueNumber int) bool {
 	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + stripCodeForRefMatch(pr.Body))
 }
 
+// prClosesIssue is the STRICT variant for "this merged PR closed issue N".
+// Unlike prReferencesIssue, it requires one of GitHub's recognised closing
+// keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved)
+// directly in front of `#N`. A bare mention of `#N` somewhere in the title
+// or body — pasted from a context-style commit message such as
+// "P0 #487: add HTTP auth" — does NOT count.
+//
+// This matches GitHub's own "Linked pull requests" semantics. We can't ask
+// GitHub the question via REST (the GraphQL `closedByPullRequestsReferences`
+// connection is the canonical source but we don't have a typed wrapper for
+// it yet); the keyword scan is a faithful local approximation, identical
+// to what GitHub's web UI uses to populate the "Linked issues" panel.
+//
+// Background: #520. Caller HasMergedPRForIssue used prReferencesIssue
+// before this helper existed and false-positively linked four merged PRs
+// to issue #487 — none of which actually closed it.
+func prClosesIssue(pr PR, issueNumber int) bool {
+	if issueNumber <= 0 {
+		return false
+	}
+	corpus := pr.Title + "\n" + stripCodeForRefMatch(pr.Body)
+	return closingKeywordRegexp(issueNumber).MatchString(corpus)
+}
+
+// closingKeywordRegexp returns a compiled regex that matches any of the
+// recognised GitHub closing keywords directly preceding `#N`, with optional
+// whitespace and an optional `:` between the keyword and the hash.
+//
+// Examples that match (issueNumber = 487):
+//   "Closes #487"        "fixes: #487"        "Resolved #487."
+//   "...closes #487\nThis PR ..."             "RESOLVES #487"
+//
+// Examples that do NOT match:
+//   "P0 #487: add HTTP auth ..."     (bare mention)
+//   "Refs #487"                      (Refs is not a closing keyword)
+//   "see #487 for context"
+//   "ticket-487"                     (no `#`, also no closing keyword)
+func closingKeywordRegexp(issueNumber int) *regexp.Regexp {
+	return regexp.MustCompile(fmt.Sprintf(
+		`(?i)(?:^|[^a-z])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#%d(?:[^0-9]|$)`,
+		issueNumber,
+	))
+}
+
 var (
 	// A fence line is 3+ backticks or 3+ tildes, optionally indented, with an
 	// optional info string (only valid on the OPENING fence).
@@ -644,14 +688,18 @@ func (c *Client) IsPRMerged(prNumber int) (bool, error) {
 	return strings.EqualFold(pr.State, "closed") && pr.MergedAt != nil, nil
 }
 
-// HasMergedPRForIssue returns true if a merged PR references the issue.
+// HasMergedPRForIssue returns true if a merged PR EXPLICITLY CLOSED the
+// given issue (per GitHub closing-keyword convention: `closes/fixes/
+// resolves #N`). #520: a bare `#N` mention in commit body / title does
+// NOT count — that is a reference, not a closure. Matches GitHub's own
+// "Linked pull requests" semantics.
 func (c *Client) HasMergedPRForIssue(issueNumber int) (bool, error) {
 	prs, err := c.listClosedPRs()
 	if err != nil {
 		return false, err
 	}
 	for _, pr := range prs {
-		if pr.MergedAt != "" && prReferencesIssue(pr, issueNumber) {
+		if pr.MergedAt != "" && prClosesIssue(pr, issueNumber) {
 			return true, nil
 		}
 	}
