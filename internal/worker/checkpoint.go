@@ -190,6 +190,10 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	sess.FinishedAt = nil
 	sess.Status = state.StatusRunning
 	sess.Backend = backendName
+	// #513: in-place respawn (post-checkpoint resume) — record a new
+	// segment so the timeline shows where the previous segment ended
+	// and the new one began.
+	recordBackendAttribution(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
 	sess.TokensUsedAttempt = 0
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""

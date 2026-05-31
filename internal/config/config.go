@@ -25,6 +25,17 @@ type BackendDef struct {
 	ExtraArgs  []string `yaml:"extra_args"`
 	PromptMode string   `yaml:"prompt_mode"` // how to deliver prompt: "arg" (last argument), "stdin" (via stdin), "file" (file path as argument)
 	Enabled    *bool    `yaml:"enabled"`     // nil means enabled for backward compatibility
+
+	// #513: optional per-backend attribution metadata. Lets the
+	// dashboard / commit trailer record which provider+model actually
+	// produced the work, beyond the shim name. All four are optional;
+	// absent fields render as "—" in UI and are omitted from commit
+	// trailers. Backends that don't set them keep working unchanged
+	// (legacy behaviour preserved).
+	Provider string `yaml:"provider,omitempty"` // e.g. "anthropic", "openai", "groq"
+	Model    string `yaml:"model,omitempty"`    // e.g. "opus-4.8", "gpt-5.5", "llama-3.3-70b-versatile"
+	Variant  string `yaml:"variant,omitempty"`  // e.g. "opus[1m]", "fast", "sonnet"
+	Effort   string `yaml:"effort,omitempty"`   // e.g. "xhigh", "medium", "low"
 }
 
 func (b BackendDef) IsEnabled() bool {

@@ -175,6 +175,8 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		Status:      state.StatusRunning,
 		Backend:     backendName,
 	}
+	// #513: stamp the first attribution segment for this session.
+	recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn", "", startedAt)
 	s.ReconcileSpawnWorkerApprovalsForStartedSession(slotName, s.Sessions[slotName], startedAt)
 
 	return slotName, nil
@@ -310,6 +312,8 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.Status = state.StatusRunning
 	sess.PRNumber = 0
 	sess.Backend = backendName
+	// #513: stamp the fallover attribution segment.
+	recordBackendAttribution(cfg, sess, backendName, "fallover", "fallover", time.Now())
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
