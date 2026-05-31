@@ -107,6 +107,15 @@ type prGreptileReader interface {
 	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
 }
 
+// prMergeableReader fetches the per-PR mergeable state via the
+// SINGLE-PR endpoint (`gh api repos/.../pulls/{N}`) which triggers
+// GitHub's mergeability computation. The LIST endpoint (used by
+// ListOpenPRs) always returns mergeable=null, so reading
+// `pr.Mergeable` from a list result is always UNKNOWN. #543.
+type prMergeableReader interface {
+	PRMergeable(prNumber int) (string, error)
+}
+
 // PreflightResult is the outcome of running a configured preflight command.
 // Ok=true means the gate passed and the supervisor may continue dispatching
 // spawn/open-child actions. Ok=false carries a human-readable Reason that is
@@ -1960,7 +1969,16 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	if pr.IsDraft {
 		return false, nil
 	}
+	// #543: GitHub LIST endpoint never populates `mergeable`; fetch via
+	// single-PR endpoint when reader supports it. Without this every
+	// PR.Mergeable read here was "" → "UNKNOWN" → merge_pr never
+	// recommended.
 	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
+	if mr, ok := e.reader.(prMergeableReader); ok {
+		if fresh, err := mr.PRMergeable(pr.Number); err == nil {
+			mergeable = strings.ToUpper(strings.TrimSpace(fresh))
+		}
+	}
 	if mergeable != "MERGEABLE" {
 		return false, nil
 	}
@@ -2016,7 +2034,14 @@ func (e *Engine) monitorOpenPRReasons(slot string, sess *state.Session, pr githu
 	if pr.IsDraft {
 		reasons = append(reasons, "PR is still a draft")
 	}
+	// #543: refetch via single-PR endpoint; LIST endpoint always
+	// returns mergeable=null so the diagnostic was always "unknown".
 	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
+	if mr, ok := e.reader.(prMergeableReader); ok {
+		if fresh, err := mr.PRMergeable(pr.Number); err == nil {
+			mergeable = strings.ToUpper(strings.TrimSpace(fresh))
+		}
+	}
 	if mergeable != "MERGEABLE" {
 		if mergeable == "" {
 			reasons = append(reasons, "PR mergeable state is unknown")
