@@ -103,9 +103,10 @@ export function FleetScreen({ navigate }) {
           label="Throughput"
           value={String(fleet.throughputMerged7d)}
           tone="ok"
-          sub="merged / 7d"
+          sub="merged PRs · 7d"
           sparkline={fleet.throughputDaily7d.length ? fleet.throughputDaily7d : [0, 0, 0, 0, 0, 0, 0]}
           sparkWarm={tone === "watch"}
+          tooltip="Merged PRs across all projects in the last 7 days (UTC). Bars show per-day counts, oldest on the left."
         />
       </div>
 
