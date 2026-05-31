@@ -447,7 +447,11 @@ func TestDecide_RetryExhaustedResolutionCachedPerDecisionCycle(t *testing.T) {
 	}
 }
 
-func TestDecide_RetryExhaustedOpenGreenPRExplainsMergeEligibility(t *testing.T) {
+// #512 (Phase 1.6): a retry-exhausted session whose PR is fully ready
+// (mergeable, CI green, review gate off) should now get an actionable
+// merge_pr decision rather than the old monitor_open_pr loop. The
+// retry-exhausted stuck-state info is still attached.
+func TestDecide_RetryExhaustedOpenGreenPRRecommendsMerge(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ReviewGate = "none"
 	reader := &fakeReader{
@@ -469,18 +473,111 @@ func TestDecide_RetryExhaustedOpenGreenPRExplainsMergeEligibility(t *testing.T) 
 		t.Fatalf("Decide: %v", err)
 	}
 
-	if decision.RecommendedAction != ActionMonitorOpenPR {
-		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionMonitorOpenPR)
+	if decision.RecommendedAction != ActionMergePR {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionMergePR)
 	}
-	if !strings.Contains(strings.ToLower(decision.Summary), "retry exhausted") || !strings.Contains(strings.ToLower(decision.Summary), "merge") {
-		t.Fatalf("summary = %q, want retry exhausted merge eligibility", decision.Summary)
+	if decision.Risk != RiskMutating {
+		t.Fatalf("risk = %q, want %q (cautious gate must require approval for merge_pr)", decision.Risk, RiskMutating)
+	}
+	if decision.Target == nil || decision.Target.PR != 88 {
+		t.Fatalf("target = %#v, want PR=88", decision.Target)
 	}
 	stuck := requireStuckState(t, decision, "retry_exhausted_open_pr")
 	if stuck.Severity != SeverityInfo {
 		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityInfo)
 	}
-	if !strings.Contains(strings.Join(stuck.Evidence, "\n"), "checks=success") {
-		t.Fatalf("evidence = %#v, want checks=success", stuck.Evidence)
+}
+
+// #512: PR has all gates green and a normal (non-retry-exhausted) session
+// → planner recommends merge_pr with mutating risk (cautious gate gates
+// the actual merge, but the recommendation surfaces a real button).
+func TestDecide_OpenPR_AllGreen_RecommendsMerge(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 99, HeadRefName: "feat/all-green", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{99: "success"},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 200,
+		IssueTitle:  "ready PR",
+		Status:      state.StatusPROpen,
+		Branch:      "feat/all-green",
+		PRNumber:    99,
+		StartedAt:   time.Now().UTC().Add(-30 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMergePR {
+		t.Fatalf("action = %q, want merge_pr", decision.RecommendedAction)
+	}
+	if decision.Risk != RiskMutating {
+		t.Fatalf("risk = %q, want mutating", decision.Risk)
+	}
+}
+
+// #512: CI is still pending → planner stays on monitor_open_pr with a
+// summary that names the actual blocker, not the old aspirational text.
+func TestDecide_OpenPR_CIPending_StaysMonitor(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 100, HeadRefName: "feat/ci-pending", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{100: "pending"},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 201,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/ci-pending",
+		PRNumber:    100,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr (CI pending must NOT trigger merge_pr)", decision.RecommendedAction)
+	}
+	if !strings.Contains(strings.ToLower(decision.Summary), "ci status=pending") {
+		t.Fatalf("summary = %q, want a substring naming CI status pending", decision.Summary)
+	}
+}
+
+// #512: PR is conflicting / dirty → planner stays on monitor_open_pr.
+// (The repair branch above already catches drafts, so we exercise
+// the post-repair-check fall-through here.)
+func TestDecide_OpenPR_Conflicting_StaysMonitor(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 101, HeadRefName: "feat/dirty", Mergeable: "CONFLICTING"}},
+		ciStatuses: map[int]string{101: "success"},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 202,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/dirty",
+		PRNumber:    101,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr (CONFLICTING must NOT merge)", decision.RecommendedAction)
+	}
+	if !strings.Contains(decision.Summary, "CONFLICTING") {
+		t.Fatalf("summary = %q, want a substring naming CONFLICTING", decision.Summary)
 	}
 }
 

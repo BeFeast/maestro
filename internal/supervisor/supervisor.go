@@ -35,6 +35,7 @@ const (
 	ActionSpawnWorker          = "spawn_worker"
 	ActionSpawnRepairWorker    = "spawn_repair_worker"
 	ActionLabelIssueReady      = "label_issue_ready"
+	ActionMergePR              = "merge_pr"
 	// ActionOpenChildIssue asks the supervisor (or operator) to create the
 	// next concrete child issue from an open handoff/epic when no runnable
 	// issue remains. Approval-gated in v1; the safe-action executor for
@@ -315,13 +316,33 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			decision.StuckStates = stuckStates
 			return decision, nil
 		}
-		summary := fmt.Sprintf("Session %s already has open PR #%d; monitor review, CI, or merge readiness.", slot, pr.Number)
+		// #512 (Phase 1.6): if the PR is actually ready to merge — not draft,
+		// mergeable, CI green, Greptile approved (when configured) — recommend
+		// merge_pr (risk=mutating, cautious-gate gates approval). Without this
+		// rule, every CLEAN/SUCCESS PR sat in pr_open forever while supervisor
+		// emitted monitor_open_pr loops; the reasoning even claimed "Maestro will
+		// merge when the merge gate allows it" — aspirational, never implemented.
+		if ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr); ready {
+			summary := fmt.Sprintf("Merge PR #%d for issue #%d — checks green, mergeable, review gates passed.", pr.Number, sess.IssueNumber)
+			reasons := appendReasons(baseReasons, mergeReasons...)
+			decision := e.decision(st, now, projectState, ActionMergePR,
+				summary,
+				RiskMutating, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
+		}
+
+		// PR exists but is not yet merge-ready. Stay on monitor_open_pr but
+		// surface the actual blocker (CI pending, review missing, draft, etc.)
+		// in the summary instead of claiming auto-merge will happen.
+		monitorReasons := e.monitorOpenPRReasons(slot, sess, pr)
+		summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", pr.Number, sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
 			"No GitHub mutation is needed for supervisor mode",
 		)
+		reasons = appendReasons(reasons, monitorReasons...)
 		if sess.Status == state.StatusRetryExhausted {
-			summary = fmt.Sprintf("Issue #%d is retry exhausted, but PR #%d is still open; monitor checks and review, then merge when eligible.", sess.IssueNumber, pr.Number)
 			reasons = appendReasons(reasons,
 				fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
 				"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
@@ -1909,6 +1930,120 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 		}
 	}
 	return false
+}
+
+// openPRReadyToMerge returns (true, reasons[]) when a session's open PR can
+// be safely merged: not a draft, mergeable, CI status success, Greptile
+// approved (when the reader exposes that signal). The bool is false on
+// any blocker; reasons is nil in that case (the caller falls through to
+// monitor_open_pr with a different reason set).
+//
+// Strict: an UNKNOWN mergeable, "pending" CI, or "unknown" review state
+// blocks the merge. We never speculate — a missing signal is treated as
+// "not ready" so we don't merge a PR whose state we couldn't read.
+func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.PR) (bool, []string) {
+	if sess == nil {
+		return false, nil
+	}
+	if pr.IsDraft {
+		return false, nil
+	}
+	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
+	if mergeable != "MERGEABLE" {
+		return false, nil
+	}
+
+	// CI must be green. PRCIStatus is an optional reader interface; when
+	// the reader does not implement it we conservatively refuse to merge.
+	ciReader, ok := e.reader.(prCIStatusReader)
+	if !ok {
+		return false, nil
+	}
+	ciStatus, err := ciReader.PRCIStatus(pr.Number)
+	if err != nil {
+		return false, nil
+	}
+	if strings.ToLower(strings.TrimSpace(ciStatus)) != "success" {
+		return false, nil
+	}
+
+	// Greptile gate — when the reader exposes Greptile signal, require
+	// approved=true and pending=false. Missing reader -> proceed (some
+	// projects don't use Greptile and the cautious gate still requires
+	// human approval before merge_pr executes).
+	if greptileReader, ok := e.reader.(prGreptileReader); ok {
+		approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
+		if err != nil {
+			return false, nil
+		}
+		if pending {
+			return false, nil
+		}
+		if !approved {
+			return false, nil
+		}
+	}
+
+	reasons := []string{
+		fmt.Sprintf("PR #%d is not draft", pr.Number),
+		fmt.Sprintf("PR #%d mergeable=%s", pr.Number, mergeable),
+		fmt.Sprintf("PR #%d CI status=success", pr.Number),
+	}
+	if _, ok := e.reader.(prGreptileReader); ok {
+		reasons = append(reasons, fmt.Sprintf("PR #%d Greptile review approved", pr.Number))
+	}
+	return true, reasons
+}
+
+// monitorOpenPRReasons returns a short list of human-readable reasons
+// describing WHY a PR is not yet merge-ready, used in the monitor_open_pr
+// summary. Mirrors the gates checked by openPRReadyToMerge but produces
+// honest text instead of a single "monitor" word.
+func (e *Engine) monitorOpenPRReasons(slot string, sess *state.Session, pr github.PR) []string {
+	var reasons []string
+	if pr.IsDraft {
+		reasons = append(reasons, "PR is still a draft")
+	}
+	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
+	if mergeable != "MERGEABLE" {
+		if mergeable == "" {
+			reasons = append(reasons, "PR mergeable state is unknown")
+		} else {
+			reasons = append(reasons, fmt.Sprintf("PR mergeable=%s", mergeable))
+		}
+	}
+	if ciReader, ok := e.reader.(prCIStatusReader); ok {
+		if status, err := ciReader.PRCIStatus(pr.Number); err == nil {
+			lc := strings.ToLower(strings.TrimSpace(status))
+			if lc != "success" {
+				reasons = append(reasons, fmt.Sprintf("CI status=%s", status))
+			}
+		} else {
+			reasons = append(reasons, "CI status could not be read")
+		}
+	}
+	if greptileReader, ok := e.reader.(prGreptileReader); ok {
+		if approved, pending, err := greptileReader.PRGreptileApproved(pr.Number); err == nil {
+			if pending {
+				reasons = append(reasons, "Greptile review pending")
+			} else if !approved {
+				reasons = append(reasons, "Greptile review not approved")
+			}
+		}
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "merge gate not yet evaluated this cycle")
+	}
+	return reasons
+}
+
+// summarizeMonitorReasons joins reasons into a single short phrase for the
+// SupervisorDecision.Summary field. Keeps the dashboard readable.
+func summarizeMonitorReasons(reasons []string) string {
+	if len(reasons) == 0 {
+		return "waiting"
+	}
+	return strings.Join(reasons, "; ")
 }
 
 func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int) bool {
