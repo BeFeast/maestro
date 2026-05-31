@@ -136,6 +136,30 @@ type Session struct {
 	RetryReason                 string            `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
 	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
 	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
+
+	// #513: per-segment attribution timeline. Every spawn / respawn /
+	// fallover appends a new entry; the previous entry's EndedAt is
+	// closed at the same moment. Records who actually produced the
+	// commits (provider/model/variant/effort) so the dashboard +
+	// commit trailer can show "first 12m on claude opus-4.8 xhigh,
+	// then 4m on codex gpt-5.5 medium after rate-limit fallover".
+	Attribution []BackendAttribution `json:"attribution,omitempty"`
+}
+
+// BackendAttribution is one segment of a session's backend timeline.
+// A session has at least one (the initial spawn) and gains more if the
+// rate-limit fallover or pipeline-phase machinery respawns it on a
+// different backend.
+type BackendAttribution struct {
+	Backend   string     `json:"backend"`              // shim name (claude, codex, freellm, opencode, …)
+	Provider  string     `json:"provider,omitempty"`   // anthropic, openai, groq, …
+	Model     string     `json:"model,omitempty"`      // opus-4.8, gpt-5.5, llama-3.3-70b-versatile, …
+	Variant   string     `json:"variant,omitempty"`    // opus[1m], fast, sonnet, …
+	Effort    string     `json:"effort,omitempty"`     // xhigh, medium, low, …
+	StartedAt time.Time  `json:"started_at"`           // when this segment became active
+	EndedAt   *time.Time `json:"ended_at,omitempty"`   // when the segment was closed; nil if still active
+	EndReason string     `json:"end_reason,omitempty"` // why the segment closed: "completed", "provider_limit", "fallover", "in_place_respawn", "killed"
+	Reason    string     `json:"reason,omitempty"`     // why this segment was started: "initial_spawn", "fallover", "in_place_respawn", "phase_transition"
 }
 
 // SessionAttention explains why a session needs operator attention and the
