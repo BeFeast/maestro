@@ -677,6 +677,22 @@ type State struct {
 	RestartRequired       bool   `json:"restart_required,omitempty"`
 	RestartRequiredReason string `json:"restart_required_reason,omitempty"`
 
+	// LastRunOnceAt is stamped by supervisor.RunOnce on every successful
+	// cycle (just before state.Save). The supervise daemon's watchdog
+	// reads this from state on its own ticker and emits a loud warning
+	// + sets SupervisorStuck=true if the gap is older than 3*interval.
+	// Used by Fleet API and by the systemd journal watcher to detect
+	// silent supervise-loop wedges (#499). Zero value means "no cycle
+	// has run since the daemon started" — handled by the watchdog's
+	// startup grace.
+	LastRunOnceAt time.Time `json:"last_run_once_at,omitempty"`
+
+	// SupervisorStuck is set by the watchdog when LastRunOnceAt is
+	// older than 3*interval. Cleared on any successful RunOnce that
+	// stamps LastRunOnceAt fresh.
+	SupervisorStuck       bool   `json:"supervisor_stuck,omitempty"`
+	SupervisorStuckReason string `json:"supervisor_stuck_reason,omitempty"`
+
 	loadedHash  string
 	loadedState *State
 }

@@ -1045,6 +1045,65 @@ func TestRunOnceRecordsDecision(t *testing.T) {
 	}
 }
 
+// Phase 1.2 (#499): a successful RunOnce stamps state.LastRunOnceAt
+// (used by the supervise watchdog goroutine to detect silent loop wedges).
+func TestRunOnce_StampsLastRunOnceAt(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{}
+
+	before := time.Now().UTC()
+	if _, err := RunOnce(cfg, reader); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	after := time.Now().UTC()
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if st.LastRunOnceAt.IsZero() {
+		t.Fatal("LastRunOnceAt is zero after a successful RunOnce — watchdog will fire on a healthy daemon")
+	}
+	if st.LastRunOnceAt.Before(before) || st.LastRunOnceAt.After(after.Add(time.Second)) {
+		t.Fatalf("LastRunOnceAt=%s is outside the call window [%s, %s]",
+			st.LastRunOnceAt, before, after)
+	}
+}
+
+// Phase 1.2 (#499): a successful RunOnce clears any prior SupervisorStuck
+// flag set by the watchdog. This is the only signal that unwedges the
+// daemon — a healthy cycle is recovery.
+func TestRunOnce_ClearsSupervisorStuckFlag(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{}
+
+	// Pre-seed state with SupervisorStuck = true (as the watchdog would).
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	st.SupervisorStuck = true
+	st.SupervisorStuckReason = "synthetic stuck for test"
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if _, err := RunOnce(cfg, reader); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	st, err = state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load 2: %v", err)
+	}
+	if st.SupervisorStuck {
+		t.Fatal("SupervisorStuck=true after a successful RunOnce; healthy cycle must clear the flag")
+	}
+	if st.SupervisorStuckReason != "" {
+		t.Fatalf("SupervisorStuckReason=%q; should be cleared", st.SupervisorStuckReason)
+	}
+}
+
 func TestRunOnceRecordsOutcomeHealth(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)

@@ -231,6 +231,14 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 			}
 		}
 		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
+		// Phase 1.2 (#499): stamp the last-run heartbeat just before save
+		// so the watchdog goroutine in cmd/maestro can see this cycle
+		// completed. Also clear any stale SupervisorStuck flag set by a
+		// previous watchdog tick — a successful RunOnce is the only
+		// signal that unwedges the daemon.
+		st.LastRunOnceAt = time.Now().UTC()
+		st.SupervisorStuck = false
+		st.SupervisorStuckReason = ""
 		if err := state.Save(cfg.StateDir, st); err != nil {
 			return state.SupervisorDecision{}, fmt.Errorf("save state: %w", err)
 		}
