@@ -89,9 +89,10 @@ function FleetScreen({ scenarioKey, layout, now, navigate, setLayout }) {
           label="Throughput"
           value="49"
           tone="ok"
-          sub="merged / 7d"
+          sub="merged PRs · 7d"
           sparkline={genSpark(scenarioKey, 1)}
           sparkWarm={scenarioKey === "attention"}
+          tooltip="Merged PRs across all projects in the last 7 days (UTC). Bars show per-day counts, oldest on the left."
         />
       </div>
 
