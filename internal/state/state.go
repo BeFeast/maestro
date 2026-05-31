@@ -611,6 +611,12 @@ const (
 	ApprovalStatusExecuted         ApprovalStatus = "executed"
 	ApprovalStatusExecutionFailed  ApprovalStatus = "execution_failed"
 	ApprovalStatusExecutionSkipped ApprovalStatus = "execution_skipped"
+	// ApprovalStatusAwaitingDispatch marks an approval that the operator
+	// has approved but whose side effect lives on a separate loop
+	// (e.g. spawn_worker — the dispatcher tick allocates the slot).
+	// Distinct from execution_skipped (which means "no action will
+	// happen") so dedup can keep it as a still-effective record.
+	ApprovalStatusAwaitingDispatch ApprovalStatus = "awaiting_dispatch"
 )
 
 const (
@@ -622,6 +628,7 @@ const (
 	ApprovalAuditExecuted         = "executed"
 	ApprovalAuditExecutionFailed  = "execution_failed"
 	ApprovalAuditExecutionSkipped = "execution_skipped"
+	ApprovalAuditAwaitingDispatch = "awaiting_dispatch"
 )
 
 const approvalActionSpawnWorker = "spawn_worker"
@@ -1381,7 +1388,11 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	var existingMatch *Approval
 	for i := range s.Approvals {
 		candidate := &s.Approvals[i]
-		if candidate.Status != ApprovalStatusPending {
+		// #515: also coalesce against awaiting_dispatch — operator
+		// approved an earlier mint, the side-effect (spawn) is still
+		// in flight on the dispatcher loop, supervisor must not mint
+		// a fresh pending for the same target in this race window.
+		if candidate.Status != ApprovalStatusPending && candidate.Status != ApprovalStatusAwaitingDispatch {
 			continue
 		}
 		if candidate.Action != decision.RecommendedAction {
@@ -1600,7 +1611,10 @@ func (s *State) markApprovalStale(approval *Approval, now time.Time, reason stri
 }
 
 func (s *State) markApprovalSuperseded(approval *Approval, now time.Time, reason string) {
-	if approval.Status != ApprovalStatusPending {
+	// #515: AwaitingDispatch is "still in flight on a separate loop";
+	// reconcile must be allowed to supersede it once the side effect
+	// it's awaiting actually lands (e.g. spawn_worker -> worker started).
+	if approval.Status != ApprovalStatusPending && approval.Status != ApprovalStatusAwaitingDispatch {
 		return
 	}
 	approval.Status = ApprovalStatusSuperseded
@@ -1615,7 +1629,13 @@ func (s *State) markApprovalSuperseded(approval *Approval, now time.Time, reason
 }
 
 func spawnWorkerApprovalMatchesSession(approval *Approval, slot string, sess *Session) bool {
-	if approval == nil || sess == nil || approval.Status != ApprovalStatusPending || approval.Action != approvalActionSpawnWorker {
+	if approval == nil || sess == nil || approval.Action != approvalActionSpawnWorker {
+		return false
+	}
+	// #515: both pending (not yet approved) and awaiting_dispatch (approved
+	// but dispatcher hasn't ticked yet) records are still effective; both
+	// must be superseded once the worker really starts.
+	if approval.Status != ApprovalStatusPending && approval.Status != ApprovalStatusAwaitingDispatch {
 		return false
 	}
 	if approval.Target == nil {

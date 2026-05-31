@@ -201,8 +201,14 @@ func (e *Executor) Execute(approval *state.Approval) Result {
 		if issue > 0 {
 			summary = fmt.Sprintf("spawn_worker for issue #%d approved; next dispatcher loop will start the worker (no extra command required)", issue)
 		}
+		// #515: AwaitingDispatch (not ExecutionSkipped). The dispatcher
+		// loop owns the actual worker.Start; until it runs we keep this
+		// approval as "still effective" so the at-mint dedup in
+		// RecordPendingApprovalForDecision coalesces fresh supervisor
+		// recommendations on the same (action, target) instead of
+		// minting a duplicate pending in the race window.
 		return Result{
-			Status:  state.ApprovalStatusExecutionSkipped,
+			Status:  state.ApprovalStatusAwaitingDispatch,
 			Summary: summary,
 		}
 	case "open_child_issue":
@@ -218,8 +224,12 @@ func (e *Executor) Execute(approval *state.Approval) Result {
 		if issue > 0 {
 			summary = fmt.Sprintf("open_child_issue for handoff epic #%d approved; operator must create the next child issue manually until the safe-action executor lands", issue)
 		}
+		// #515: AwaitingDispatch — the side effect is "operator must
+		// create the next child issue manually". Until it lands as a
+		// real GitHub issue, we keep this record effective so dedup
+		// suppresses fresh duplicates on the same handoff target.
 		return Result{
-			Status:  state.ApprovalStatusExecutionSkipped,
+			Status:  state.ApprovalStatusAwaitingDispatch,
 			Summary: summary,
 		}
 	}
