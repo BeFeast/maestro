@@ -1387,12 +1387,15 @@ function projectIsUnconfigured(project) {
 function projectStateKey(project) {
   if (projectIsUnconfigured(project)) return "unconfigured";
   const operator = project.operator_state || {};
-  return operator.kind || "idle";
+  const kind = operator.kind || "idle";
+  if (kind === "idle" && operator.tone === "healthy") return "healthy_idle";
+  return kind;
 }
 
 function projectStateLabel(project) {
   if (projectIsUnconfigured(project)) return "setup";
   const operator = project.operator_state || {};
+  if ((operator.kind || "idle") === "idle" && operator.tone === "healthy") return "Idle · healthy";
   return operator.label || "Idle";
 }
 
@@ -1481,8 +1484,37 @@ function projectStateRailHTML(project) {
   const key = projectStateKey(project);
   const operator = project.operator_state || {};
   const summary = String(operator.summary || ((project.running || 0) + '/' + (project.max_parallel || 0) + ' worker process(es) running.'));
-  return '<span class="pill rail-state-' + cssToken(key) + '">' + escapeText(projectStateLabel(project)) + '</span>' +
-    '<div class="rail-subline" title="' + escapeText(summary) + '">' + escapeText(summary) + '</div>';
+  const pill = '<span class="pill rail-state-' + cssToken(key) + '">' + escapeText(projectStateLabel(project)) + '</span>';
+  const structured = projectStateStructuredHTML(project, operator, summary);
+  if (structured) return pill + structured;
+  return pill + '<div class="rail-subline" title="' + escapeText(summary) + '">' + escapeText(summary) + '</div>';
+}
+
+function projectStateStructuredHTML(project, operator, summary) {
+  const issueNumber = Number(operator.issue_number || 0);
+  const session = String(operator.session || "").trim();
+  const issueURL = String(operator.issue_url || "").trim();
+  const nextAction = String(operator.next_action || "").trim();
+  if (!issueNumber && !session && !nextAction) return "";
+  const parts = [];
+  if (issueNumber) {
+    const issueLabel = "issue #" + issueNumber;
+    parts.push(issueURL
+      ? '<a class="rail-structured-issue" href="' + escapeText(issueURL) + '" target="_blank" rel="noreferrer">' + escapeText(issueLabel) + '</a>'
+      : '<span class="rail-structured-issue">' + escapeText(issueLabel) + '</span>');
+  }
+  if (session) {
+    parts.push('<button type="button" class="link-button rail-structured-session" data-project="' +
+      escapeText(project.name || "") + '" data-slot="' + escapeText(session) + '" title="Open session ' +
+      escapeText(session) + '">' + escapeText("(" + session + ")") + '</button>');
+  }
+  if (parts.length === 0) return "";
+  const lead = parts.join(' ');
+  const reason = nextAction || summary;
+  const reasonHTML = reason
+    ? ' · <span class="rail-structured-reason" title="' + escapeText(reason) + '">' + escapeText(reason) + '</span>'
+    : '';
+  return '<div class="rail-subline rail-structured" title="' + escapeText(summary) + '">' + lead + reasonHTML + '</div>';
 }
 
 function projectQueueRailHTML(project) {
@@ -1532,8 +1564,31 @@ function projectOutcomeRailHTML(project) {
 
 function projectFreshnessRailHTML(project) {
   const freshness = project.freshness || {};
-  const age = freshness.snapshot_age ? "Snapshot " + freshness.snapshot_age + " ago" : "No snapshot yet";
-  return '<div class="rail-mainline" title="' + escapeText(freshness.reason || age) + '">' + escapeText(age) + '</div>';
+  const ageSeconds = Number(freshness.snapshot_age_seconds || 0);
+  const ageLabel = formatFreshnessAge(freshness.snapshot_age, ageSeconds);
+  const text = ageLabel ? "Snapshot " + ageLabel + " ago" : "No snapshot yet";
+  const tooltipParts = [];
+  if (freshness.snapshot_at) tooltipParts.push("Snapshot at " + formatTimestamp(freshness.snapshot_at));
+  if (freshness.reason) tooltipParts.push(freshness.reason);
+  const tooltip = tooltipParts.length ? tooltipParts.join(" · ") : text;
+  return '<div class="rail-mainline" title="' + escapeText(tooltip) + '">' + escapeText(text) + '</div>';
+}
+
+function formatFreshnessAge(rawAge, ageSeconds) {
+  if (ageSeconds >= 3600) return formatClockDuration(ageSeconds);
+  const trimmed = String(rawAge || "").trim();
+  if (trimmed) return trimmed;
+  if (ageSeconds > 0) return Math.round(ageSeconds) + "s";
+  return "";
+}
+
+function formatClockDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const pad = n => (n < 10 ? "0" + n : String(n));
+  return h + ":" + pad(m) + ":" + pad(s);
 }
 
 function projectLinksRailHTML(project) {
@@ -1549,9 +1604,52 @@ function projectLinksRailHTML(project) {
 }
 
 function projectOpenRailHTML(project) {
+  const cta = projectNextActionCTAHTML(project);
+  if (cta) return cta;
   const url = project.dashboard_url || githubRepoURL(project.repo);
   const label = projectIsUnconfigured(project) ? "Set up" : "Open";
   return '<div class="rail-open-link">' + linkHTML(url, label + " →") + '</div>';
+}
+
+function projectNextActionCTAHTML(project) {
+  if (!projectHasAttentionCTA(project)) return "";
+  const operator = project.operator_state || {};
+  const kind = String(operator.kind || "").trim();
+  const reason = String(operator.next_action || operator.summary || "Open the attention tab for this project.").trim();
+  const label = ctaLabelForOperatorKind(kind, operator.label);
+  return '<button type="button" class="rail-cta rail-cta-attention project-attention-cta" data-project="' +
+    escapeText(project.name || "") + '" title="' + escapeText(reason) + '">' +
+    escapeText(label) + ' →</button>';
+}
+
+function projectHasAttentionCTA(project) {
+  if (projectIsUnconfigured(project)) return false;
+  const operator = project.operator_state || {};
+  const attention = Number(project.needs_attention || 0);
+  const kind = String(operator.kind || "").trim();
+  if (attention > 0) return true;
+  return kind === "attention" || kind === "stale_worker" || kind === "dispatch_failure" || kind === "error";
+}
+
+function openProjectAttentionDrawer(projectName) {
+  if (!projectName) return;
+  fleetState.selectedProject = projectName;
+  fleetState.filters.scope = "attention";
+  syncFilterControls();
+  updateQueryState();
+  renderFleetWorkers();
+  if (fleetWorkersShellEl) fleetWorkersShellEl.open = true;
+  fleetWorkersShellEl?.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
+function ctaLabelForOperatorKind(kind, label) {
+  switch (String(kind || "").trim()) {
+  case "attention": return "Open attention";
+  case "stale_worker": return "Review stale worker";
+  case "dispatch_failure": return "Resolve dispatch";
+  case "error": return "Fix project error";
+  default: return label ? "Open " + label : "Open attention";
+  }
 }
 
 function projectRailRowHTML(project) {
@@ -1563,7 +1661,8 @@ function projectRailRowHTML(project) {
     '<button type="button" class="project-rail-toggle" data-rail-toggle="' + escapeText(detailID) + '" aria-expanded="' + (expanded ? "true" : "false") + '" aria-controls="' + escapeText(detailID) + '" aria-label="' + (expanded ? "Collapse" : "Expand") + ' project detail">' +
       '<span class="project-rail-toggle-caret" aria-hidden="true">&#9656;</span>' +
     '</button></td>';
-  const mainRow = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-rail-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" aria-controls="' + escapeText(detailID) + '" tabindex="0">' +
+  const needsAttention = projectHasAttentionCTA(project) ? "1" : "0";
+  const mainRow = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-rail-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" data-needs-attention="' + needsAttention + '" aria-controls="' + escapeText(detailID) + '" tabindex="0">' +
     toggleCell +
     '<td class="project-rail-project"><div class="project-rail-project-wrap"><div class="project-rail-project-copy">' + projectIdentityRailHTML(project) + '</div></div></td>' +
     '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
@@ -1665,16 +1764,23 @@ function renderProjectRail() {
 
   projectRailBodyEl.innerHTML = projects.map(projectRailRowHTML).join("");
   projectRailBodyEl.querySelectorAll(".project-rail-row[data-project]").forEach(row => {
-    row.addEventListener("click", event => {
+    const handleActivate = event => {
       if (event.target.closest("a, button")) return;
+      const projectName = row.dataset.project || "";
+      const needsAttention = row.dataset.needsAttention === "1";
+      if (needsAttention && projectName) {
+        event.preventDefault();
+        openProjectAttentionDrawer(projectName);
+        return;
+      }
       const url = row.dataset.url || "";
       if (url) window.open(url, "_blank", "noopener,noreferrer");
-    });
+    };
+    row.addEventListener("click", handleActivate);
     row.addEventListener("keydown", event => {
       if ((event.key === "Enter" || event.key === " ") && !event.target.closest("a, button")) {
         event.preventDefault();
-        const url = row.dataset.url || "";
-        if (url) window.open(url, "_blank", "noopener,noreferrer");
+        handleActivate(event);
       }
     });
   });
@@ -1697,6 +1803,23 @@ function renderProjectRail() {
       renderFleetWorkers();
       if (fleetWorkersShellEl) fleetWorkersShellEl.open = true;
       fleetWorkersShellEl?.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
+  });
+  projectRailBodyEl.querySelectorAll(".project-attention-cta[data-project]").forEach(button => {
+    button.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openProjectAttentionDrawer(button.dataset.project || "");
+    });
+  });
+  projectRailBodyEl.querySelectorAll(".rail-structured-session[data-project][data-slot]").forEach(button => {
+    button.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const projectName = button.dataset.project || "";
+      const slot = button.dataset.slot || "";
+      if (projectName) openProjectAttentionDrawer(projectName);
+      if (projectName && slot) selectWorker(projectName, slot);
     });
   });
 }
