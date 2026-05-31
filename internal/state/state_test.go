@@ -1774,6 +1774,81 @@ func TestRecordPendingApprovalDifferentActionsCoexist(t *testing.T) {
 	}
 }
 
+// #515: dedup must coalesce against an awaiting_dispatch record too.
+// Scenario: supervisor mints a pending; operator approves it; executor
+// transitions it to awaiting_dispatch (spawn_worker side-effect on the
+// dispatcher loop). Before the dispatcher ticks, supervisor cycles and
+// would re-recommend spawn_worker for the same issue. Without #515,
+// dedup only scanned pending and a fresh duplicate was minted. With
+// #515, the dedup loop also checks awaiting_dispatch and returns the
+// existing record, suppressing the duplicate.
+func TestRecordPendingApprovalDedupsAgainstAwaitingDispatch(t *testing.T) {
+	now := time.Date(2026, 5, 31, 16, 18, 0, 0, time.UTC)
+	s := NewState()
+
+	first := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	if first == nil {
+		t.Fatal("first approval was nil")
+	}
+	firstID := first.ID
+
+	// Simulate the executor transition to awaiting_dispatch.
+	first.Status = ApprovalStatusAwaitingDispatch
+
+	// Supervisor cycles 30s later, would re-recommend the same target
+	// (different decision ID — like supervisor mints fresh decisions
+	// per cycle).
+	later := now.Add(30 * time.Second)
+	freshDecision := testApprovalDecision(later)
+	freshDecision.ID = "sup-approval-2"
+	dup := s.RecordPendingApprovalForDecision(freshDecision, later)
+	if dup == nil {
+		t.Fatal("dedup return must not be nil — should be the awaiting_dispatch existing approval")
+	}
+	if dup.ID != firstID {
+		t.Fatalf("dedup ID = %q, want %q (race window: fresh duplicate minted while awaiting_dispatch was effective)", dup.ID, firstID)
+	}
+	if got := len(s.Approvals); got != 1 {
+		t.Fatalf("len(s.Approvals) = %d, want 1 (no fresh pending duplicate)", got)
+	}
+	if dup.Status != ApprovalStatusAwaitingDispatch {
+		t.Fatalf("returned approval status = %q, want %q (must keep awaiting_dispatch unchanged)", dup.Status, ApprovalStatusAwaitingDispatch)
+	}
+}
+
+// #515: ReconcileSpawnWorkerApprovalsForStartedSession must supersede
+// awaiting_dispatch records too, not just pending ones — once the
+// worker actually starts, the awaiting record has done its job.
+func TestReconcileSpawnWorkerApprovalsSupersedesAwaitingDispatch(t *testing.T) {
+	now := time.Date(2026, 5, 31, 16, 18, 0, 0, time.UTC)
+	s := NewState()
+	a := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	if a == nil {
+		t.Fatal("approval was nil")
+	}
+	a.Status = ApprovalStatusAwaitingDispatch
+
+	sess := &Session{
+		IssueNumber: 42,
+		Status:      StatusRunning,
+		PRNumber:    0,
+		Branch:      "feat/sup-1-42-x",
+		// StartedAt > approval.CreatedAt — matches the gate inside
+		// spawnWorkerApprovalMatchesSession (only sessions started
+		// AFTER the approval are considered "spawned by it").
+		StartedAt: now.Add(30 * time.Second),
+	}
+	s.Sessions = map[string]*Session{"sup-1": sess}
+
+	count := s.ReconcileSpawnWorkerApprovalsForStartedSession("sup-1", sess, now.Add(time.Minute))
+	if count != 1 {
+		t.Fatalf("reconciled count = %d, want 1 (must supersede awaiting_dispatch)", count)
+	}
+	if got := s.Approvals[0].Status; got != ApprovalStatusSuperseded {
+		t.Fatalf("approval status = %q, want %q", got, ApprovalStatusSuperseded)
+	}
+}
+
 func TestReconcileSpawnWorkerApprovalsForStartedSession(t *testing.T) {
 	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
 	s := NewState()

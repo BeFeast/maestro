@@ -76,18 +76,21 @@ func mkApproval(action string, target *state.SupervisorTarget, summary, approveR
 
 // --- spawn_worker / open_child_issue approval semantics --------------------
 
-// TestExecute_SpawnWorker_ReturnsExecutionSkippedWithActionableSummary verifies
-// the fix for issue #443: approving a spawn_worker approval used to print
-// "No risky action was executed". The executor now records the approval as
-// execution_skipped with a clear summary so the operator knows the next
-// dispatcher loop will start the worker.
-func TestExecute_SpawnWorker_ReturnsExecutionSkippedWithActionableSummary(t *testing.T) {
+// TestExecute_SpawnWorker_ReturnsAwaitingDispatchWithActionableSummary verifies
+// the post-#515 contract: approving a spawn_worker approval moves it to
+// status=awaiting_dispatch (not execution_skipped) so the at-mint dedup in
+// state.RecordPendingApprovalForDecision still treats it as effective and
+// supervisor does not mint a fresh pending duplicate while the dispatcher
+// loop has not yet ticked. (Original #443 fix preserved: the operator
+// still sees an actionable summary, never the old "No risky action was
+// executed" line.)
+func TestExecute_SpawnWorker_ReturnsAwaitingDispatchWithActionableSummary(t *testing.T) {
 	ex := &Executor{Cfg: newCfg()}
 	a := mkApproval("spawn_worker", &state.SupervisorTarget{Issue: 170}, "spawn me", "")
 
 	res := ex.Execute(a)
-	if res.Status != state.ApprovalStatusExecutionSkipped {
-		t.Fatalf("status = %q, want %q", res.Status, state.ApprovalStatusExecutionSkipped)
+	if res.Status != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("status = %q, want %q (#515)", res.Status, state.ApprovalStatusAwaitingDispatch)
 	}
 	if !strings.Contains(res.Summary, "#170") {
 		t.Fatalf("summary = %q, want issue ref", res.Summary)
@@ -96,17 +99,17 @@ func TestExecute_SpawnWorker_ReturnsExecutionSkippedWithActionableSummary(t *tes
 		t.Fatalf("summary = %q, want operator-facing hint about dispatcher loop", res.Summary)
 	}
 	if res.Err != nil {
-		t.Fatalf("err = %v, want nil for skipped-status", res.Err)
+		t.Fatalf("err = %v, want nil for awaiting-dispatch", res.Err)
 	}
 }
 
-func TestExecute_OpenChildIssue_ReturnsExecutionSkippedWithActionableSummary(t *testing.T) {
+func TestExecute_OpenChildIssue_ReturnsAwaitingDispatchWithActionableSummary(t *testing.T) {
 	ex := &Executor{Cfg: newCfg()}
 	a := mkApproval("open_child_issue", &state.SupervisorTarget{Issue: 146}, "create child", "")
 
 	res := ex.Execute(a)
-	if res.Status != state.ApprovalStatusExecutionSkipped {
-		t.Fatalf("status = %q, want %q", res.Status, state.ApprovalStatusExecutionSkipped)
+	if res.Status != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("status = %q, want %q (#515)", res.Status, state.ApprovalStatusAwaitingDispatch)
 	}
 	if !strings.Contains(res.Summary, "#146") {
 		t.Fatalf("summary = %q, want epic ref", res.Summary)
