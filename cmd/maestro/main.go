@@ -48,6 +48,7 @@ Commands:
   logs          Show worker logs (tail -f)
   watch         Open tmux dashboard with live worker output
   spawn         Spawn a worker for a specific issue number
+  drain         Stop spawning new workers and wait for in-flight workers to finish
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
@@ -83,6 +84,16 @@ Serve flags:
 Spawn flags:
   --issue int           Issue number to work on
   --prompt string       Path to worker prompt base file
+
+Drain flags:
+  --timeout duration    Max wait for in-flight workers to finish (default 30m)
+
+  Graceful drain (#541): sets a state flag so the running supervisor stops
+  spawning new workers, then waits for in-flight workers to finish. Exit 0 once
+  drained, exit 1 on timeout (the flag is left set so you can investigate). Wire
+  it as the systemd ExecStop so "systemctl --user restart" drains first:
+    ExecStop=/usr/local/bin/maestro drain --config <cfg> --timeout 30m
+  The drain flag clears automatically when the supervisor next starts.
 
 Stop flags:
   --session string      Session name to stop (e.g. pan-1)
@@ -263,6 +274,8 @@ func main() {
 		watchCmd(args)
 	case "spawn":
 		spawnCmd(args)
+	case "drain":
+		drainCmd(args)
 	case "stop":
 		stopCmd(args)
 	case "kill":
@@ -1681,6 +1694,111 @@ func spawnCmd(args []string) {
 	}
 
 	fmt.Printf("Started worker %s for issue #%d: %s\n", slotName, *issueNum, targetIssue.Title)
+}
+
+// drainDefaultTimeout is the default ceiling drain waits for in-flight workers.
+const drainDefaultTimeout = 30 * time.Minute
+
+// drainPollInterval is how often drain re-reads state to see if running
+// workers have finished.
+var drainPollInterval = 5 * time.Second
+
+// errDrainTimeout is returned by drainWait when the timeout elapses before all
+// in-flight workers finish.
+var errDrainTimeout = errors.New("drain timed out with workers still running")
+
+// drainWait blocks until runningCount() reports zero in-flight workers or the
+// timeout elapses, polling on the given interval. It is the testable core of
+// `maestro drain`: the CLI injects a state-backed runningCount and the real
+// clock, tests inject a deterministic counter and a fake clock. progress is
+// called once per observation (after the initial check and after each poll) so
+// the CLI can log progress; it may be nil. Returns errDrainTimeout on timeout.
+func drainWait(runningCount func() (int, error), timeout, interval time.Duration, now func() time.Time, sleep func(time.Duration), progress func(running int)) error {
+	if interval <= 0 {
+		interval = drainPollInterval
+	}
+	deadline := now().Add(timeout)
+	for {
+		running, err := runningCount()
+		if err != nil {
+			return err
+		}
+		if progress != nil {
+			progress(running)
+		}
+		if running == 0 {
+			return nil
+		}
+		if !now().Before(deadline) {
+			return errDrainTimeout
+		}
+		// Do not overshoot the deadline on the final sleep.
+		wait := interval
+		if remaining := deadline.Sub(now()); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			return errDrainTimeout
+		}
+		sleep(wait)
+	}
+}
+
+func drainCmd(args []string) {
+	fs := flag.NewFlagSet("drain", flag.ExitOnError)
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	timeout := fs.Duration("timeout", drainDefaultTimeout, "Max time to wait for in-flight workers to finish")
+	fs.Parse(reorderArgs(fs, args))
+
+	cfgs := loadConfigs(configs)
+	if len(cfgs) > 1 {
+		fmt.Fprintln(os.Stderr, "error: drain requires a single --config (one project at a time; see #541 out-of-scope)")
+		os.Exit(1)
+	}
+	cfg := cfgs[0]
+
+	// Set the drain flag so the running orchestrator stops spawning new
+	// workers on its next cycle. This is a load-then-save under the state
+	// lock; a concurrent orchestrator save resolves latest-write-wins.
+	s, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+	s.SetSpawnDrain(time.Now().UTC())
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		log.Fatalf("save state (set drain): %v", err)
+	}
+
+	initialRunning := s.RunningSessionCount()
+	fmt.Printf("Drain requested for %s — no new workers will be spawned. Waiting up to %s for %d in-flight worker(s) to finish...\n",
+		cfg.Repo, timeout.String(), initialRunning)
+
+	runningCount := func() (int, error) {
+		cur, err := state.Load(cfg.StateDir)
+		if err != nil {
+			return 0, fmt.Errorf("load state: %w", err)
+		}
+		return cur.RunningSessionCount(), nil
+	}
+	lastReported := -1
+	progress := func(running int) {
+		if running != lastReported {
+			fmt.Printf("  in-flight workers running: %d\n", running)
+			lastReported = running
+		}
+	}
+
+	err = drainWait(runningCount, *timeout, drainPollInterval, time.Now, time.Sleep, progress)
+	if errors.Is(err, errDrainTimeout) {
+		fmt.Fprintf(os.Stderr, "drain: timed out after %s with workers still running; drain flag left set so you can investigate (maestro status) or kill the stuck worker\n", timeout.String())
+		os.Exit(1)
+	}
+	if err != nil {
+		log.Fatalf("drain: %v", err)
+	}
+
+	fmt.Printf("Drained: no in-flight workers remain. Safe to restart the supervisor (the drain flag clears automatically on startup).\n")
 }
 
 func stopCmd(args []string) {
