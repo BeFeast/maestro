@@ -70,9 +70,9 @@ export function Sparkline({ data, warm = false }) {
   );
 }
 
-export function Stat({ label, value, of, sub, tone = "info", live, sparkline, sparkWarm, onClick }) {
+export function Stat({ label, value, of, sub, tone = "info", live, sparkline, sparkWarm, tooltip, onClick }) {
   return (
-    <div className={`stat ${tone}`} onClick={onClick} style={{ cursor: onClick ? "pointer" : "default" }}>
+    <div className={`stat ${tone}`} onClick={onClick} title={tooltip || undefined} style={{ cursor: onClick ? "pointer" : "default" }}>
       <div className="stat-label">
         {label}
         {live && <span className="stat-live" />}
