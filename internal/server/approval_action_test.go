@@ -217,10 +217,15 @@ func TestApprovalAction_ReadOnlyShortCircuits(t *testing.T) {
 	}
 }
 
-// Two enqueues for the same payload create two distinct approvals (the
-// supervisor's superseded/payload-hash logic handles dedup elsewhere; HTTP
-// callers that need idempotency can read the returned approval_id and stop).
-func TestApprovalAction_SecondEnqueueIsDistinctApproval(t *testing.T) {
+// Two enqueues for the same (action, target) coalesce into ONE pending
+// approval (Phase 1.1 at-mint dedup, 2026-05-31). HTTP callers can re-POST
+// safely; idempotency is enforced at the state-write boundary, not by
+// callers reading the returned approval_id and stopping.
+//
+// This was the dogfood "approvals storm" root cause — the same
+// (action=spawn_worker, target.issue=471) was minted 56 times in 12h
+// because RecordPendingApprovalForDecision had no dedup at all.
+func TestApprovalAction_SecondEnqueueDedupsToSameApproval(t *testing.T) {
 	cfg, dir := approvalEnqueueCfg(t)
 	srv := New(cfg, nil)
 	srv.SetActionDeps(&fakeActionGH{}, nil)
@@ -231,8 +236,26 @@ func TestApprovalAction_SecondEnqueueIsDistinctApproval(t *testing.T) {
 		t.Fatalf("statuses = %d, %d", w1.Code, w2.Code)
 	}
 	st := loadStateAt(t, dir)
+	if len(st.Approvals) != 1 {
+		t.Fatalf("approvals = %d, want 1 (dedup must coalesce identical re-enqueue)", len(st.Approvals))
+	}
+}
+
+// Different targets (different PR numbers) for the same action MUST stay
+// distinct. Dedup is keyed on (Action, Target), not Action alone.
+func TestApprovalAction_DifferentTargetsCoexist(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w1 := postApprovalAction(t, srv, `{"action_id":"merge_pr","pr_number":1}`)
+	w2 := postApprovalAction(t, srv, `{"action_id":"merge_pr","pr_number":2}`)
+	if w1.Code != http.StatusAccepted || w2.Code != http.StatusAccepted {
+		t.Fatalf("statuses = %d, %d", w1.Code, w2.Code)
+	}
+	st := loadStateAt(t, dir)
 	if len(st.Approvals) != 2 {
-		t.Fatalf("approvals = %d, want 2", len(st.Approvals))
+		t.Fatalf("approvals = %d, want 2 (different targets must NOT dedup)", len(st.Approvals))
 	}
 	if st.Approvals[0].ID == st.Approvals[1].ID {
 		t.Fatalf("approvals share the same ID: %s", st.Approvals[0].ID)
