@@ -1322,7 +1322,20 @@ func decisionRequiresApproval(cfg *config.Config, decision state.SupervisorDecis
 	if decision.RecommendedAction == ActionNone || decision.Risk == RiskSafe {
 		return false
 	}
-	if cfg == nil || cfg.Supervisor.ApprovalRequiredActions == nil {
+	if cfg == nil {
+		return true
+	}
+	// #545: operator-configured approval-gated mutating verbs (merge_pr,
+	// close_issue, delete_worktree, change_global_config) live in
+	// ApprovalRequired (yaml approval_required), NOT ApprovalRequiredActions.
+	// They are canonical verbs and must gate minting of the matching decision;
+	// without this loop the cautious gate silently dropped every merge_pr.
+	for _, action := range cfg.Supervisor.ApprovalRequired {
+		if canonicalAction(action) == decision.RecommendedAction {
+			return true
+		}
+	}
+	if cfg.Supervisor.ApprovalRequiredActions == nil {
 		return true
 	}
 	for _, action := range cfg.Supervisor.ApprovalRequiredActions {

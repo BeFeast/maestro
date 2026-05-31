@@ -316,6 +316,17 @@ func newSupervisorPolicy(cfg *config.Config) supervisorPolicy {
 			policy.approvalRequired[canonical] = struct{}{}
 		}
 	}
+	// #545: operator-configured approval-gated mutating verbs (merge_pr,
+	// close_issue, delete_worktree, change_global_config) live in
+	// ApprovalRequired, not ApprovalRequiredActions. Without folding them in
+	// here the LLM policy never marks them approval-required and the mint is
+	// skipped — the same class of gap that left the deterministic path unable
+	// to gate merge_pr.
+	for _, action := range cfg.Supervisor.ApprovalRequired {
+		if canonical := canonicalAction(action); canonical != "" {
+			policy.approvalRequired[canonical] = struct{}{}
+		}
+	}
 	return policy
 }
 
@@ -385,6 +396,14 @@ func canonicalAction(action string) string {
 		return ActionOpenChildIssue
 	case ActionPreflightFailed:
 		return ActionPreflightFailed
+	case ActionMergePR:
+		return ActionMergePR
+	case config.SupervisorActionCloseIssue:
+		return config.SupervisorActionCloseIssue
+	case config.SupervisorActionDeleteWorktree:
+		return config.SupervisorActionDeleteWorktree
+	case config.SupervisorActionChangeGlobalConfig:
+		return config.SupervisorActionChangeGlobalConfig
 	default:
 		return ""
 	}
