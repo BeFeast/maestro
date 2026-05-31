@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,8 +221,19 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		// state transitions are persisted by the state.Save below.
 		executeApprovedApprovals(cfg, st, reader)
 		if decisionRequiresApproval(cfg, decision) {
-			approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
-			decision.ApprovalID = approval.ID
+			// #505: gate the mint on the executor registry. A verb the
+			// executor cannot handle would otherwise pile up
+			// execution_failed records every cycle (live evidence:
+			// spawn_repair_worker on dogfood 2026-05-30, 4 stuck records
+			// before the operator noticed). Refuse at mint time so the
+			// failure surfaces loudly in the journal instead of silently
+			// in state.json.
+			if !approver.IsKnownApprovalAction(decision.RecommendedAction) {
+				log.Printf("[supervisor] refusing to mint approval: action %q is not in the executor registry; supported actions = %v", decision.RecommendedAction, approver.KnownApprovalActionList())
+			} else {
+				approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
+				decision.ApprovalID = approval.ID
+			}
 		}
 		if len(decision.Mutations) > 0 && decision.Risk == RiskSafe {
 			mutator, ok := reader.(Mutator)
