@@ -1107,6 +1107,14 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 	worker.SweepStaleVisualQA()
 
 	if !once {
+		// The long-running daemon just (re)started — that is the "restart" the
+		// restart-required banner asks for. Reconcile any stale restart_required
+		// flag persisted by a previous process into this process's reality (the
+		// in-memory signal is false on a clean start) so the banner does not
+		// survive the very restart it requested. A genuine post-start config
+		// change still re-raises the signal via reloadConfig.
+		o.clearStaleRestartRequired()
+
 		// Full ProjectV2 item sweeps are expensive and only repair board drift.
 		// Do not run one immediately after every daemon restart; session-state
 		// mirroring still runs, and the broad sweep can wait for the normal
@@ -1310,6 +1318,39 @@ func (o *Orchestrator) persistRestartRequired() {
 	s.RestartRequiredReason = o.restartRequiredReason
 	if err := state.Save(o.cfg.StateDir, s); err != nil {
 		log.Printf("[orch] warn: could not save restart-required signal to state: %v", err)
+	}
+}
+
+// clearStaleRestartRequired reconciles a stale restart-required flag from a
+// previous process into the freshly-started daemon's reality. The restart-required
+// signal asks the operator to restart the daemon; once the daemon actually (re)starts
+// it is loaded from whatever config is now on disk, so the in-memory restartRequired
+// is the truth (false on a clean start). Nothing else clears the persisted flag — not
+// a fresh start and not a config revert — so without this it survives the very restart
+// it requested and produces a false banner in `maestro status` / the Fleet dashboard.
+//
+// This is only safe to call from the long-running daemon startup (Run with once=false),
+// which is the actual "restart" the banner refers to. A genuine post-start config change
+// still re-raises the signal through markRestartRequired in reloadConfig, so the real
+// signal is preserved. Best-effort: a load/save failure is logged but never aborts start.
+func (o *Orchestrator) clearStaleRestartRequired() {
+	if o.restartRequired {
+		// A real signal was already raised in-process before start completed; keep it.
+		return
+	}
+	s, err := state.Load(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] warn: could not load state to clear stale restart-required signal: %v", err)
+		return
+	}
+	if !s.RestartRequired && s.RestartRequiredReason == "" {
+		return
+	}
+	log.Printf("[orch] clearing stale restart-required signal from previous process (was: %q)", s.RestartRequiredReason)
+	s.RestartRequired = false
+	s.RestartRequiredReason = ""
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		log.Printf("[orch] warn: could not save cleared restart-required signal to state: %v", err)
 	}
 }
 
