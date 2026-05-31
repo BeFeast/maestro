@@ -40,8 +40,8 @@ func TestBuildApprovalDecision_IDsDistinctOnSameTimestamp(t *testing.T) {
 	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
 	req := controlActionRequest{ActionID: "merge_pr", PRNumber: 1, Project: "p"}
 
-	a := buildApprovalDecision("merge_pr", req, cfg, now)
-	b := buildApprovalDecision("merge_pr", req, cfg, now)
+	a := buildApprovalDecision("merge_pr", req, cfg, "", now)
+	b := buildApprovalDecision("merge_pr", req, cfg, "", now)
 	if a.ID == b.ID {
 		t.Fatalf("two decisions at the same `now` produced identical ID %q (greptile P1 #479)", a.ID)
 	}

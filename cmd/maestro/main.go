@@ -18,6 +18,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/github"
@@ -26,7 +27,6 @@ import (
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/server"
-	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/befeast/maestro/internal/versioning"
@@ -843,7 +843,12 @@ func serveCmd(args []string) {
 		}()
 
 		log.Printf("serving fleet dashboard — projects=%d addr=%s:%d read_only=%v", len(projects), fleetHost, *port, *readOnly)
-		if err := server.NewFleet(projects, fleetHost, *port, *readOnly).Start(ctx); err != nil {
+		fleetSrv := server.NewFleet(projects, fleetHost, *port, *readOnly)
+		// #487: fleet auth uses the first project that configures a token
+		// env. A single shared token across the fleet is the deployment
+		// expectation; per-project tokens are out of scope.
+		fleetSrv.SetAuth(fleetAuthFromProjects(projects))
+		if err := fleetSrv.Start(ctx); err != nil {
 			log.Fatalf("serve fleet: %v", err)
 		}
 		return
@@ -891,6 +896,22 @@ func fleetProjectsFromConfigs(cfgs []*config.Config) []server.FleetProject {
 		projects = append(projects, proj)
 	}
 	return projects
+}
+
+// fleetAuthFromProjects returns the first non-empty Server.Auth config across
+// the fleet. The fleet uses a single shared token (#487); per-project
+// distinct tokens are intentionally out of scope.
+func fleetAuthFromProjects(projects []server.FleetProject) config.ServerAuthConfig {
+	for i := range projects {
+		cfg := projects[i].Cfg()
+		if cfg == nil {
+			continue
+		}
+		if strings.TrimSpace(cfg.Server.Auth.TokenEnv) != "" {
+			return cfg.Server.Auth
+		}
+	}
+	return config.ServerAuthConfig{}
 }
 
 func defaultFleetProjectName(repo string) string {

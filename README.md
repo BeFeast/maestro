@@ -144,7 +144,19 @@ maestro serve --config ./maestro.yaml --host 127.0.0.1 --port 8787 --read-only
 
 For multi-project Fleet Mission Control operations, see [`docs/fleet-mission-control-runbook.md`](docs/fleet-mission-control-runbook.md).
 
-Use `--host 0.0.0.0` only on a trusted network if you want to expose the dashboard to the LAN.
+When the dashboard runs anywhere other than `127.0.0.1`, configure HTTP auth on every mutating endpoint (#487). The token is loaded at runtime from an environment variable populated by your secret manager (Infisical, 1Password CLI, etc.) — never hardcoded in YAML:
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8788
+  read_only: false
+  auth:
+    token_env: MAESTRO_DASHBOARD_TOKEN   # env var name; populate from your secret manager
+    actor_name: dashboard-operator       # optional; audit actor recorded for authed requests
+```
+
+When `auth.token_env` resolves to a non-empty value, every `POST /api/v1/...` (`/actions`, `/approvals/{id}/{approve|reject}`, `/audit/log`, `/refresh`) requires `Authorization: Bearer <token>` and returns `401` otherwise. The authenticated identity replaces any `actor` field in the request body. Read-only GETs stay open.
 
 To watch workers live in a tmux dashboard:
 ```bash

@@ -162,6 +162,12 @@ type FleetServer struct {
 	port     int
 	readOnly bool
 	srv      *http.Server
+	// auth gates every mutating fleet endpoint (#487, write-path premortem
+	// #4). When the resolved token is empty the checker is disabled and
+	// behaviour is unchanged; when non-empty, /api/v1/fleet/actions,
+	// /api/v1/fleet/approvals/{id}/{approve|reject}, and /api/v1/audit/log
+	// require Authorization: Bearer <token>.
+	auth authChecker
 }
 
 // NewFleet creates a FleetServer.
@@ -172,6 +178,24 @@ func NewFleet(projects []FleetProject, host string, port int, readOnly bool) *Fl
 		port:     port,
 		readOnly: readOnly,
 	}
+}
+
+// SetAuth configures fleet-level auth from the operator's resolved
+// ServerAuthConfig. Empty token leaves auth disabled (backward-compat).
+// Call this BEFORE Start.
+func (s *FleetServer) SetAuth(cfg config.ServerAuthConfig) {
+	if s == nil {
+		return
+	}
+	s.auth = newAuthChecker(cfg)
+}
+
+// SetAuthForTest replaces the auth checker. Test-only helper.
+func (s *FleetServer) SetAuthForTest(token, actorName string) {
+	if s == nil {
+		return
+	}
+	s.auth = newAuthCheckerForTest(token, actorName)
 }
 
 // Start begins serving the fleet dashboard. It blocks until shutdown.
@@ -336,13 +360,13 @@ type fleetQueueSnapshot struct {
 }
 
 type fleetProjectState struct {
-	Name            string                `json:"name"`
-	Repo            string                `json:"repo"`
-	ConfigPath      string                `json:"config_path"`
-	DashboardURL    string                `json:"dashboard_url,omitempty"`
-	StateDir        string                `json:"state_dir,omitempty"`
-	MaxParallel     int                   `json:"max_parallel"`
-	ReadOnly        bool                  `json:"read_only"`
+	Name         string `json:"name"`
+	Repo         string `json:"repo"`
+	ConfigPath   string `json:"config_path"`
+	DashboardURL string `json:"dashboard_url,omitempty"`
+	StateDir     string `json:"state_dir,omitempty"`
+	MaxParallel  int    `json:"max_parallel"`
+	ReadOnly     bool   `json:"read_only"`
 
 	// RestartRequired/RestartRequiredReason mirror the orchestrator's restart-required
 	// signal (set when model.default / routing.* changed but cannot be hot-applied).
@@ -565,6 +589,13 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// #487: auth fires BEFORE the read-only gate so an unauthenticated POST
+	// always sees 401 (never 403/405). Spec: "every mutating POST without a
+	// valid credential returns 401".
+	authenticatedActor, ok := requireAuth(w, r, s.auth)
+	if !ok {
+		return
+	}
 	if s.readOnly {
 		writeError(w, http.StatusForbidden, "fleet server is read-only; write actions require approval-backed controls to be enabled in configuration")
 		return
@@ -596,7 +627,7 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		audit = s.fleetActionAudit(project)
 	}
 
-	if res := dispatchSafeAction(req, cfg, gh, audit); res.handled {
+	if res := dispatchSafeAction(req, cfg, gh, audit, authenticatedActor); res.handled {
 		if res.err != nil {
 			log.Printf("[fleet] safe action %q for project %q failed: %v", req.ActionID, req.Project, res.err)
 		}
@@ -608,7 +639,7 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 	if cfg != nil {
 		stateDir = cfg.StateDir
 	}
-	if res := dispatchApprovalAction(req, cfg, stateDir, audit); res.handled {
+	if res := dispatchApprovalAction(req, cfg, stateDir, audit, authenticatedActor); res.handled {
 		if res.err != nil {
 			log.Printf("[fleet] approval enqueue %q for project %q failed: %v", req.ActionID, req.Project, res.err)
 		}
@@ -649,6 +680,15 @@ func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// #487: audit log writes are forensic-integrity-critical. An
+	// unauthenticated attacker on the LAN must not be able to write
+	// arbitrary entries that bury the real attack signal under noise. Auth
+	// fires BEFORE payload parsing so probes cannot enumerate the project
+	// list via 400 differences.
+	authenticatedActor, ok := requireAuth(w, r, s.auth)
+	if !ok {
+		return
+	}
 	var req fleetAuditLogRequest
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -657,7 +697,7 @@ func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	actor := strings.TrimSpace(req.Actor)
+	actor := resolveActor(authenticatedActor, req.Actor, "")
 	action := strings.TrimSpace(req.Action)
 	if actor == "" || action == "" {
 		writeError(w, http.StatusBadRequest, "actor and action are required")
