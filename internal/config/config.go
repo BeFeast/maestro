@@ -36,6 +36,18 @@ type BackendDef struct {
 	Model    string `yaml:"model,omitempty"`    // e.g. "opus-4.8", "gpt-5.5", "llama-3.3-70b-versatile"
 	Variant  string `yaml:"variant,omitempty"`  // e.g. "opus[1m]", "fast", "sonnet"
 	Effort   string `yaml:"effort,omitempty"`   // e.g. "xhigh", "medium", "low"
+
+	// #507: NonAgentic marks a backend that is a TEXT-COMPLETION helper,
+	// not an agentic CLI capable of producing a real PR. Such a backend
+	// MUST NOT be used as model.default or in model.fallback_backends —
+	// the worker prompt assumes file reads/writes, bash exec, git/gh
+	// operations. A non-agentic backend running as a worker emits the
+	// steps as TEXT into its log, never executes them, and the
+	// supervisor reconciles to dead with no PR. Found live 2026-05-30
+	// (sup-84 wrote a plausible Go test scaffold + git/gh commands as
+	// strings, no commits or PR materialised). config.parse rejects
+	// any config that wires a NonAgentic backend into the worker chain.
+	NonAgentic bool `yaml:"non_agentic,omitempty"`
 }
 
 func (b BackendDef) IsEnabled() bool {
@@ -619,6 +631,25 @@ func parse(data []byte) (*Config, error) {
 	// Ensure the default backend is always present in the map
 	if _, ok := cfg.Model.Backends[cfg.Model.Default]; !ok {
 		cfg.Model.Backends[cfg.Model.Default] = BackendDef{Cmd: cfg.Model.Default}
+	}
+
+	// #507: refuse to start when a non-agentic backend is wired into the
+	// worker chain. A non-agentic backend (e.g. the maestro-freellm
+	// text-completion shim) must be available for supervisor sub-tasks,
+	// but spawning a worker against it produces fake-PR sessions —
+	// instructions emitted as text, never executed. Fail fast at config
+	// parse so the daemon never even tries.
+	if def, ok := cfg.Model.Backends[cfg.Model.Default]; ok && def.NonAgentic {
+		return nil, fmt.Errorf("config: model.default = %q which is marked non_agentic; non-agentic backends cannot drive workers (they emit instructions as text, never execute git/gh). Pick an agentic backend (claude, codex, opencode, ...) and keep the non-agentic helper available for supervisor sub-tasks only", cfg.Model.Default)
+	}
+	for _, fb := range cfg.Model.FallbackBackends {
+		def, ok := cfg.Model.Backends[fb]
+		if !ok {
+			continue // unknown backend names are caught elsewhere; we only gate non-agentic here.
+		}
+		if def.NonAgentic {
+			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
+		}
 	}
 
 	// Supervisor defaults
