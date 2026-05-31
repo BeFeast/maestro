@@ -146,8 +146,34 @@ func TestCIStatusFromREST(t *testing.T) {
 		{name: "failed check fails", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "failure"}}, want: "failure"},
 		{name: "cancelled check fails", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "cancelled"}}, want: "failure"},
 		{name: "success checks pass", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, want: "success"},
-		{name: "combined pending wins", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, combined: combinedStatusResponse{State: "pending"}, want: "pending"},
-		{name: "combined failure wins", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, combined: combinedStatusResponse{State: "failure"}, want: "failure"},
+		{
+			name:     "green checks with empty combined pending succeed",
+			checks:   []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
+			combined: combinedStatusResponse{State: "pending", Statuses: nil},
+			want:     "success",
+		},
+		{
+			name:   "combined pending wins when a status entry is pending",
+			checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
+			combined: combinedStatusResponse{State: "pending", Statuses: []struct {
+				Context     string `json:"context"`
+				State       string `json:"state"`
+				Description string `json:"description"`
+				TargetURL   string `json:"target_url"`
+			}{{Context: "ci/build", State: "pending"}}},
+			want: "pending",
+		},
+		{
+			name:   "combined failure wins when a status entry failed",
+			checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
+			combined: combinedStatusResponse{State: "failure", Statuses: []struct {
+				Context     string `json:"context"`
+				State       string `json:"state"`
+				Description string `json:"description"`
+				TargetURL   string `json:"target_url"`
+			}{{Context: "ci/build", State: "failure"}}},
+			want: "failure",
+		},
 	}
 
 	for _, tt := range tests {

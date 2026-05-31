@@ -339,11 +339,18 @@ func parseCombinedStatus(out []byte) (combinedStatusResponse, error) {
 }
 
 func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse) string {
-	if strings.EqualFold(combined.State, "pending") {
-		return "pending"
-	}
-	if strings.EqualFold(combined.State, "failure") || strings.EqualFold(combined.State, "error") {
-		return "failure"
+	// GitHub's combined commit-status API returns state:"pending" with
+	// statuses:[] for any commit that has zero legacy commit statuses — the
+	// normal case for repos that report CI exclusively via check-runs.
+	// An empty combined status carries no signal and must not override the
+	// check-runs verdict; only honor pending/failure when statuses exist.
+	if len(combined.Statuses) > 0 {
+		if strings.EqualFold(combined.State, "pending") {
+			return "pending"
+		}
+		if strings.EqualFold(combined.State, "failure") || strings.EqualFold(combined.State, "error") {
+			return "failure"
+		}
 	}
 
 	hasSignal := len(checks) > 0 || len(combined.Statuses) > 0
