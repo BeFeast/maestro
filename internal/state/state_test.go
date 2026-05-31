@@ -1612,6 +1612,168 @@ func TestApprovalPendingPersistence(t *testing.T) {
 	}
 }
 
+// 2026-05-31: at-mint dedup tests. The dogfood "approvals storm" was 56
+// duplicate spawn_worker pending approvals on issue #471 over 12h because
+// RecordPendingApprovalForDecision had no dedup at all and just appended.
+// These three tests pin the new contract.
+
+func TestRecordPendingApprovalDedupsIdenticalReEmit(t *testing.T) {
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+
+	first := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	if first == nil {
+		t.Fatal("first approval was nil")
+	}
+	firstID := first.ID
+
+	// Identical re-emit one minute later (same action+target, target state
+	// snapshot unchanged): supervisor recommended spawn_worker for #42 again
+	// because nothing has changed downstream. Should NOT create a duplicate.
+	later := now.Add(1 * time.Minute)
+	dup := s.RecordPendingApprovalForDecision(testApprovalDecision(later), later)
+	if dup == nil {
+		t.Fatal("dedup return must not be nil — should be the existing approval")
+	}
+	if dup.ID != firstID {
+		t.Fatalf("dedup ID = %q, want %q (returned a fresh approval — duplicate created)", dup.ID, firstID)
+	}
+
+	pending := 0
+	for _, a := range s.Approvals {
+		if a.Status == ApprovalStatusPending {
+			pending++
+		}
+	}
+	if pending != 1 {
+		t.Fatalf("pending count = %d, want 1 (storm prevention failed)", pending)
+	}
+	if got := len(s.Approvals); got != 1 {
+		t.Fatalf("len(s.Approvals) = %d, want 1 (no duplicate appended)", got)
+	}
+	if got := len(dup.Audit); got != 1 || dup.Audit[0].Event != ApprovalAuditCreated {
+		t.Fatalf("audit on existing approval mutated: %+v", dup.Audit)
+	}
+}
+
+func TestRecordPendingApprovalSupersedesOnTargetStateChange(t *testing.T) {
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+
+	first := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	if first == nil {
+		t.Fatal("first approval was nil")
+	}
+	firstID := first.ID
+	firstTargetHash := first.TargetStateHash
+
+	// Add a session for the same issue — this changes the target snapshot
+	// (ApprovalTargetStateHash includes session state for matching slots).
+	s.Sessions = map[string]*Session{
+		"sup-1": {
+			IssueNumber: 42,
+			Status:      StatusRunning,
+			Branch:      "feat/sup-1-42-x",
+			PRNumber:    0,
+		},
+	}
+
+	// Sanity: TargetStateHash for the same target must now differ.
+	freshHash := s.ApprovalTargetStateHash(testApprovalDecision(now).Target)
+	if freshHash == firstTargetHash {
+		t.Fatalf("ApprovalTargetStateHash should differ after session add: both were %q", freshHash)
+	}
+
+	later := now.Add(2 * time.Minute)
+	// Use a fresh decision ID — supervisor mints decisions with unique
+	// per-cycle IDs in production; testApprovalDecision reuses the same
+	// ID literal, so we'd otherwise collide on approvalID() output.
+	freshDecision := testApprovalDecision(later)
+	freshDecision.ID = "sup-approval-2"
+	second := s.RecordPendingApprovalForDecision(freshDecision, later)
+	if second == nil {
+		t.Fatal("second approval was nil")
+	}
+	if second.ID == firstID {
+		t.Fatalf("expected a fresh approval after target-state change; got the original ID %q", firstID)
+	}
+
+	// Old one must be superseded.
+	old, ok := s.FindApproval(firstID)
+	if !ok {
+		t.Fatalf("original approval %q missing", firstID)
+	}
+	if old.Status != ApprovalStatusSuperseded {
+		t.Fatalf("original status = %q, want superseded", old.Status)
+	}
+	gotSupersededAudit := false
+	for _, a := range old.Audit {
+		if a.Event == ApprovalAuditSuperseded {
+			gotSupersededAudit = true
+			break
+		}
+	}
+	if !gotSupersededAudit {
+		t.Fatalf("expected superseded audit entry on original; got %+v", old.Audit)
+	}
+
+	// New one must be pending and tied to the new target hash.
+	if second.Status != ApprovalStatusPending {
+		t.Fatalf("new approval status = %q, want pending", second.Status)
+	}
+	if second.TargetStateHash == firstTargetHash {
+		t.Fatalf("new TargetStateHash equal to old; expected fresh hash")
+	}
+
+	// Exactly one pending, one superseded.
+	var pending, superseded int
+	for _, a := range s.Approvals {
+		switch a.Status {
+		case ApprovalStatusPending:
+			pending++
+		case ApprovalStatusSuperseded:
+			superseded++
+		}
+	}
+	if pending != 1 || superseded != 1 {
+		t.Fatalf("counts = pending %d / superseded %d, want 1 / 1", pending, superseded)
+	}
+}
+
+func TestRecordPendingApprovalDifferentActionsCoexist(t *testing.T) {
+	// Two pending approvals with the SAME target but DIFFERENT actions
+	// must coexist — the dedup is keyed on (Action, Target), not Target alone.
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+
+	spawn := s.RecordPendingApprovalForDecision(testApprovalDecision(now), now)
+	if spawn == nil {
+		t.Fatal("spawn approval was nil")
+	}
+
+	closeDecision := SupervisorDecision{
+		ID:                "sup-close-42",
+		CreatedAt:         now,
+		Project:           "owner/repo",
+		Mode:              "read_only",
+		Summary:           "Close issue #42 (resolved)",
+		RecommendedAction: "close_issue",
+		Target:            &SupervisorTarget{Issue: 42},
+		Risk:              "high",
+	}
+	closeApp := s.RecordPendingApprovalForDecision(closeDecision, now)
+	if closeApp == nil {
+		t.Fatal("close approval was nil")
+	}
+	if closeApp.ID == spawn.ID {
+		t.Fatal("close action wrongly deduped against spawn action; they share Target but Action differs")
+	}
+
+	if got := len(s.Approvals); got != 2 {
+		t.Fatalf("len(s.Approvals) = %d, want 2 (different actions must coexist)", got)
+	}
+}
+
 func TestReconcileSpawnWorkerApprovalsForStartedSession(t *testing.T) {
 	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
 	s := NewState()

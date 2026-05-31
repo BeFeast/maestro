@@ -1315,6 +1315,24 @@ func (s *State) LatestSupervisorDecision() *SupervisorDecision {
 }
 
 // RecordPendingApprovalForDecision creates a pending approval tied to a decision payload.
+//
+// Dedup contract (added 2026-05-31, fixes the #471 approvals storm where the
+// same (action, target) was minted 56 times in 12 hours):
+//
+//   - If an existing PENDING approval matches the same (Action, Target) AND
+//     the target snapshot (TargetStateHash) is unchanged, return the
+//     existing approval and do NOT append a new one. This is the storm
+//     case: supervisor recommended the same action again, but nothing
+//     downstream changed, so a duplicate would only add noise.
+//
+//   - If an existing PENDING approval matches the same (Action, Target) but
+//     the TargetStateHash has changed (e.g. session moved from running to
+//     dead, PR opened, retry count bumped), the existing approval is marked
+//     superseded and a new one is created. This is a legitimate re-emit
+//     against fresh state.
+//
+//   - If no existing PENDING approval matches, create new (legacy
+//     behaviour preserved).
 func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, now time.Time) *Approval {
 	if s == nil {
 		return nil
@@ -1338,6 +1356,40 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	if createdAt.IsZero() {
 		createdAt = now
 	}
+
+	freshTargetStateHash := s.ApprovalTargetStateHash(decision.Target)
+
+	// Dedup: scan existing pending approvals for the same (Action, Target).
+	// Only PENDING records are considered — terminal-state approvals are
+	// out of scope and never block a re-emit.
+	var existingMatch *Approval
+	for i := range s.Approvals {
+		candidate := &s.Approvals[i]
+		if candidate.Status != ApprovalStatusPending {
+			continue
+		}
+		if candidate.Action != decision.RecommendedAction {
+			continue
+		}
+		if !approvalTargetsEqual(candidate.Target, decision.Target) {
+			continue
+		}
+		existingMatch = candidate
+		break
+	}
+
+	if existingMatch != nil {
+		if existingMatch.TargetStateHash == freshTargetStateHash {
+			// Same (action, target, target-state) — the storm case.
+			// Return the existing approval untouched.
+			return existingMatch
+		}
+		// Same (action, target) but state has moved on — supersede the
+		// stale record and fall through to create a fresh one.
+		s.markApprovalSuperseded(existingMatch, now,
+			"superseded by fresh re-emit: target state changed before approval")
+	}
+
 	approval := Approval{
 		ID:              approvalID(decision, createdAt),
 		DecisionID:      decision.ID,
@@ -1349,7 +1401,7 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 		Risk:            decision.Risk,
 		Evidence:        append([]string(nil), decision.Reasons...),
 		Status:          ApprovalStatusPending,
-		TargetStateHash: s.ApprovalTargetStateHash(decision.Target),
+		TargetStateHash: freshTargetStateHash,
 		Repo:            decision.Repo,
 		Project:         decision.Project,
 	}
@@ -1362,6 +1414,28 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	})
 	s.Approvals = append(s.Approvals, approval)
 	return &s.Approvals[len(s.Approvals)-1]
+}
+
+// approvalTargetsEqual returns true if two SupervisorTarget pointers refer
+// to the same target identity (issue/pr/session). Used by the at-mint
+// dedup check in RecordPendingApprovalForDecision.
+func approvalTargetsEqual(a, b *SupervisorTarget) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.Issue != b.Issue {
+		return false
+	}
+	if a.PR != b.PR {
+		return false
+	}
+	if strings.TrimSpace(a.Session) != strings.TrimSpace(b.Session) {
+		return false
+	}
+	return true
 }
 
 func (s *State) FindApproval(id string) (*Approval, bool) {
