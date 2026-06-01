@@ -10,12 +10,26 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
-// fakeGH lets tests stub MergePR and CloseIssue.
+// fakeGH lets tests stub MergePR, CloseIssue, PRMergeStatus and
+// UpdateBranch.
+//
+// By default PRMergeStatus returns ("", "", nil) which executeMergePR
+// treats as "don't know, proceed to merge" — so the pre-#547 happy-path
+// tests keep merging without any extra setup. Tests that exercise the
+// #547 paths set mergeable/mergeState explicitly.
 type fakeGH struct {
-	mergeCalls []int
-	closeCalls []closeCall
-	mergeErr   error
-	closeErr   error
+	mergeCalls  []int
+	closeCalls  []closeCall
+	updateCalls []int
+	mergeErr    error
+	closeErr    error
+
+	// #547 stubs for PRMergeStatus.
+	mergeable      string
+	mergeState     string
+	mergeStatusErr error
+	// updateErr is returned by UpdateBranch.
+	updateErr error
 }
 
 type closeCall struct {
@@ -30,6 +44,13 @@ func (f *fakeGH) MergePR(pr int) error {
 func (f *fakeGH) CloseIssue(issue int, comment string) error {
 	f.closeCalls = append(f.closeCalls, closeCall{issue: issue, comment: comment})
 	return f.closeErr
+}
+func (f *fakeGH) PRMergeStatus(pr int) (string, string, error) {
+	return f.mergeable, f.mergeState, f.mergeStatusErr
+}
+func (f *fakeGH) UpdateBranch(pr int) error {
+	f.updateCalls = append(f.updateCalls, pr)
+	return f.updateErr
 }
 
 type fakeWT struct {
@@ -135,6 +156,139 @@ func TestExecute_MergePR_HappyPath(t *testing.T) {
 	}
 	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != 99 {
 		t.Fatalf("mergeCalls = %v", gh.mergeCalls)
+	}
+}
+
+// --- #547: BEHIND-but-mergeable PR -> update-branch, do not fail --------------
+
+// TestExecute_MergePR_Behind_UpdatesBranchAndSkips verifies the core #547
+// fix: a green PR that has fallen behind main is brought up to date via
+// UpdateBranch and returns a NON-failure status (execution_skipped) with a
+// re-validate summary, WITHOUT calling MergePR. The next supervisor cycle
+// re-mints against the new head.
+func TestExecute_MergePR_Behind_UpdatesBranchAndSkips(t *testing.T) {
+	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "behind"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 542}, "merge", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped; res=%+v", res.Status, res)
+	}
+	if len(gh.updateCalls) != 1 || gh.updateCalls[0] != 542 {
+		t.Fatalf("updateCalls = %v, want [542]", gh.updateCalls)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Fatalf("MergePR must NOT be called when behind; got %v", gh.mergeCalls)
+	}
+	if res.Err != nil {
+		t.Fatalf("err = %v, want nil (behind is recoverable, not a failure)", res.Err)
+	}
+	if !strings.Contains(res.Summary, "#542") || !strings.Contains(strings.ToLower(res.Summary), "behind") {
+		t.Fatalf("summary = %q, want PR ref + behind explanation", res.Summary)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "re-validate") && !strings.Contains(strings.ToLower(res.Summary), "next supervisor cycle") {
+		t.Fatalf("summary = %q, want hint about re-validation on next cycle", res.Summary)
+	}
+}
+
+// TestExecute_MergePR_Clean_Merges verifies a CLEAN+mergeable PR still
+// merges normally (no update-branch detour).
+func TestExecute_MergePR_Clean_Merges(t *testing.T) {
+	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "clean"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 100}, "merge", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("status = %q, want executed; res=%+v", res.Status, res)
+	}
+	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != 100 {
+		t.Fatalf("mergeCalls = %v, want [100]", gh.mergeCalls)
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Fatalf("UpdateBranch must NOT be called for a clean PR; got %v", gh.updateCalls)
+	}
+}
+
+// TestExecute_MergePR_Conflicting_Fails verifies a genuinely unmergeable PR
+// (real conflict) returns execution_failed and never touches MergePR or
+// UpdateBranch — execution_failed is reserved for this case.
+func TestExecute_MergePR_Conflicting_Fails(t *testing.T) {
+	gh := &fakeGH{mergeable: "CONFLICTING", mergeState: "dirty"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("res = %+v, want execution_failed with non-nil Err", res)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Fatalf("MergePR must NOT be called for a conflicting PR; got %v", gh.mergeCalls)
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Fatalf("UpdateBranch must NOT be called for a conflicting PR; got %v", gh.updateCalls)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "conflict") {
+		t.Fatalf("summary = %q, want conflict explanation", res.Summary)
+	}
+}
+
+// TestExecute_MergePR_BehindButConflicting_DoesNotUpdate guards the AND in
+// the BEHIND branch: a PR reported behind but also CONFLICTING must fall to
+// the conflict failure, not silently update-branch.
+func TestExecute_MergePR_BehindButConflicting_DoesNotUpdate(t *testing.T) {
+	gh := &fakeGH{mergeable: "CONFLICTING", mergeState: "behind"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 8}, "merge", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("res = %+v, want execution_failed", res)
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Fatalf("UpdateBranch must NOT run for a conflicting PR; got %v", gh.updateCalls)
+	}
+}
+
+// TestExecute_MergePR_Behind_UpdateBranchError_Fails verifies that if the
+// update-branch call itself errors, that surfaces as execution_failed (so
+// the operator sees the real blocker) and MergePR is not attempted.
+func TestExecute_MergePR_Behind_UpdateBranchError_Fails(t *testing.T) {
+	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "behind", updateErr: errors.New("update boom")}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 9}, "merge", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("res = %+v, want execution_failed", res)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Fatalf("MergePR must NOT be called after a failed update-branch; got %v", gh.mergeCalls)
+	}
+	if !strings.Contains(res.Err.Error(), "update branch for PR #9") {
+		t.Fatalf("err = %v, want update-branch context", res.Err)
+	}
+}
+
+// TestExecute_MergePR_StatusFetchError_StillMerges verifies that a failure
+// to fetch the merge status does NOT block the merge — we fall through to
+// the original MergePR path (gh pr merge does its own gating). This keeps
+// the change additive and avoids a status-endpoint flake stalling merges.
+func TestExecute_MergePR_StatusFetchError_StillMerges(t *testing.T) {
+	gh := &fakeGH{mergeStatusErr: errors.New("rate limited")}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 11}, "merge", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("res = %+v, want executed (fall through on status error)", res)
+	}
+	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != 11 {
+		t.Fatalf("mergeCalls = %v, want [11]", gh.mergeCalls)
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Fatalf("UpdateBranch must NOT run on a status-fetch error; got %v", gh.updateCalls)
 	}
 }
 

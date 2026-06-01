@@ -43,6 +43,17 @@ func (b *blockingGH) CloseIssue(issue int, comment string) error {
 	return nil
 }
 
+// PRMergeStatus returns the zero verdict so executeMergePR falls straight
+// through to MergePR — this test only exercises the per-approval lock, not
+// the #547 behind-branch path.
+func (b *blockingGH) PRMergeStatus(pr int) (string, string, error) {
+	return "", "", nil
+}
+func (b *blockingGH) UpdateBranch(pr int) error {
+	atomic.AddInt32(&b.calls, 1)
+	return nil
+}
+
 // --- #488: per-approval-ID lock (concurrent Execute) -----------------------
 
 func TestExecute_ConcurrentSameApproval_OnlyOneSideEffect(t *testing.T) {

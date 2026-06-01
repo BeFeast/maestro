@@ -26,6 +26,18 @@ import (
 type GitHubClient interface {
 	MergePR(prNumber int) error
 	CloseIssue(number int, comment string) error
+
+	// PRMergeStatus returns the normalized mergeable verdict
+	// ("MERGEABLE"/"CONFLICTING"/"UNKNOWN") and the raw GitHub
+	// mergeable_state ("clean", "behind", "dirty", ...). executeMergePR
+	// uses it to tell a recoverable BEHIND PR apart from a real
+	// conflict before deciding whether to merge, update-branch, or fail
+	// (#547).
+	PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus string, err error)
+
+	// UpdateBranch brings a BEHIND PR head up to date with its base
+	// branch (no --admin bypass). Used by executeMergePR (#547).
+	UpdateBranch(prNumber int) error
 }
 
 // WorktreeRemover removes a git worktree. *worker.RemoveWorktree-shaped
@@ -248,6 +260,52 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
 	}
 	pr := approval.Target.PR
+
+	// #547: a green PR that has fallen BEHIND main cannot merge under
+	// "branches must be up to date" protection — `gh pr merge` fails with
+	// "the head branch is not up to date". That is a recoverable state,
+	// not a genuine failure: bring the branch up to date (no --admin
+	// bypass) and let the next supervisor cycle re-validate and re-mint
+	// against the new head. Reserve execution_failed for PRs that are
+	// truly unmergeable (real conflicts).
+	//
+	// We inspect the fresh single-PR mergeable_state first. Only two
+	// states change behaviour here:
+	//   - "behind" + mergeable  -> UpdateBranch, return non-failure
+	//   - genuine conflict       -> execution_failed without touching GH
+	// Everything else (clean / blocked / unstable / unknown, or a status
+	// fetch error) falls through to the original MergePR path, so the
+	// happy path and `gh pr merge`'s own gating are preserved unchanged.
+	mergeable, mergeState, statusErr := e.GH.PRMergeStatus(pr)
+	if statusErr == nil {
+		switch {
+		case mergeState == "behind" && mergeable != "CONFLICTING":
+			if err := e.GH.UpdateBranch(pr); err != nil {
+				return Result{
+					Status:  state.ApprovalStatusExecutionFailed,
+					Summary: fmt.Sprintf("update branch for PR #%d (was behind main): %v", pr, err),
+					Err:     fmt.Errorf("update branch for PR #%d: %w", pr, err),
+				}
+			}
+			// Non-failure terminal status: the branch was updated, the
+			// head SHA moved, and this approval's target_state_hash is now
+			// stale. We deliberately do NOT poll CI or merge here. The next
+			// supervisor cycle re-evaluates against the new head and mints
+			// a fresh merge_pr (the at-mint dedup in
+			// RecordPendingApprovalForDecision supersedes this stale one).
+			return Result{
+				Status:  state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf("PR #%d was behind main; branch updated, will re-validate and merge on the next supervisor cycle", pr),
+			}
+		case mergeable == "CONFLICTING":
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("PR #%d is not mergeable (conflicts with base) — resolve conflicts before merging", pr),
+				Err:     fmt.Errorf("PR #%d unmergeable: mergeable_state=%q", pr, mergeState),
+			}
+		}
+	}
+
 	if err := e.GH.MergePR(pr); err != nil {
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
