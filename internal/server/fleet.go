@@ -304,6 +304,14 @@ type fleetNextAction struct {
 	Reason    string `json:"reason"`
 	Priority  string `json:"priority"`
 	PickedAt  string `json:"picked_at,omitempty"`
+
+	// CTALabel is the verb-shaped button label the SPA header card
+	// renders in place of the passive «Action required» text (#531).
+	// Examples: "Approve PR #123", "Resolve stuck dispatch",
+	// "Refresh stale snapshot". Empty when no action is required.
+	CTALabel    string `json:"cta_label,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	IssueNumber int    `json:"issue_number,omitempty"`
 }
 
 type fleetVerdict struct {
@@ -433,6 +441,27 @@ type fleetProjectState struct {
 	// background refresher has not yet produced its first result.
 	ProjectBoard *fleetProjectBoard `json:"project_board,omitempty"`
 	Error        string             `json:"error,omitempty"`
+
+	// SupervisorPulse exposes the data the header verdict card uses to
+	// render a positive liveness signal (issue #531): the last-cycle
+	// timestamp (state.LastRunOnceAt), the configured poll interval,
+	// the policy mode (cautious / read_only / …), and the last N
+	// recommended_action verbs for the decision sparkline.
+	SupervisorPulse fleetSupervisorPulse `json:"supervisor_pulse"`
+}
+
+// fleetSupervisorPulse describes the supervisor's liveness, cadence and
+// recent decision verbs at the project level. The SPA aggregates these
+// across the fleet to render the header card. Zero values render as
+// "unknown" so older servers / unconfigured projects degrade gracefully.
+type fleetSupervisorPulse struct {
+	LastRunOnceAt         string   `json:"last_run_once_at,omitempty"`
+	LastRunOnceAgeSeconds int64    `json:"last_run_once_age_seconds,omitempty"`
+	PollIntervalSeconds   int      `json:"poll_interval_seconds,omitempty"`
+	Mode                  string   `json:"mode,omitempty"`
+	RecentActions         []string `json:"recent_actions,omitempty"`
+	Stuck                 bool     `json:"stuck,omitempty"`
+	StuckReason           string   `json:"stuck_reason,omitempty"`
 }
 
 type fleetApprovalState struct {
@@ -1268,13 +1297,16 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 // fleetNextActionCandidate is one possible "what needs me now" item before
 // priority/age sorting picks the canonical winner.
 type fleetNextActionCandidate struct {
-	Project   string
-	Kind      string
-	TargetURL string
-	Reason    string
-	Priority  int
-	UpdatedAt time.Time
-	tieKey    string
+	Project     string
+	Kind        string
+	TargetURL   string
+	Reason      string
+	Priority    int
+	UpdatedAt   time.Time
+	tieKey      string
+	CTALabel    string
+	PRNumber    int
+	IssueNumber int
 }
 
 // fleetNextActionPriorityForKind maps an operator-state kind onto a priority
@@ -1369,13 +1401,16 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 		}
 		target := firstNonEmpty(approval.PRURL, approval.IssueURL, approval.DashboardURL)
 		candidates = append(candidates, fleetNextActionCandidate{
-			Project:   approval.ProjectName,
-			Kind:      "approval_pending",
-			TargetURL: target,
-			Reason:    truncateFleetOperatorText(reason, 200),
-			Priority:  priority,
-			UpdatedAt: fleetApprovalRecency(*approval),
-			tieKey:    "approval|" + approval.ProjectName + "|" + approval.ID,
+			Project:     approval.ProjectName,
+			Kind:        "approval_pending",
+			TargetURL:   target,
+			Reason:      truncateFleetOperatorText(reason, 200),
+			Priority:    priority,
+			UpdatedAt:   fleetApprovalRecency(*approval),
+			tieKey:      "approval|" + approval.ProjectName + "|" + approval.ID,
+			CTALabel:    fleetNextActionCTAForApproval(approval),
+			PRNumber:    approval.PRNumber,
+			IssueNumber: approval.IssueNumber,
 		})
 	}
 
@@ -1399,13 +1434,16 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 			project.DashboardURL,
 		)
 		candidates = append(candidates, fleetNextActionCandidate{
-			Project:   project.Name,
-			Kind:      kind,
-			TargetURL: target,
-			Reason:    truncateFleetOperatorText(reason, 200),
-			Priority:  priority,
-			UpdatedAt: fleetProjectOperatorUpdatedAt(*project),
-			tieKey:    "project|" + project.Name + "|" + kind,
+			Project:     project.Name,
+			Kind:        kind,
+			TargetURL:   target,
+			Reason:      truncateFleetOperatorText(reason, 200),
+			Priority:    priority,
+			UpdatedAt:   fleetProjectOperatorUpdatedAt(*project),
+			tieKey:      "project|" + project.Name + "|" + kind,
+			CTALabel:    fleetNextActionCTAForProject(kind, project.OperatorState),
+			PRNumber:    project.OperatorState.PRNumber,
+			IssueNumber: project.OperatorState.IssueNumber,
 		})
 	}
 
@@ -1437,13 +1475,96 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 
 	winner := candidates[0]
 	return &fleetNextAction{
-		Project:   winner.Project,
-		Kind:      winner.Kind,
-		TargetURL: winner.TargetURL,
-		Reason:    winner.Reason,
-		Priority:  fmt.Sprintf("P%d", winner.Priority),
-		PickedAt:  formatFleetTime(winner.UpdatedAt),
+		Project:     winner.Project,
+		Kind:        winner.Kind,
+		TargetURL:   winner.TargetURL,
+		Reason:      winner.Reason,
+		Priority:    fmt.Sprintf("P%d", winner.Priority),
+		PickedAt:    formatFleetTime(winner.UpdatedAt),
+		CTALabel:    winner.CTALabel,
+		PRNumber:    winner.PRNumber,
+		IssueNumber: winner.IssueNumber,
 	}
+}
+
+// fleetNextActionCTAForApproval returns the verb-shaped button label the
+// header card uses for a pending approval (issue #531). The label names
+// the *effect* the operator confirms when they click — "Approve PR #123"
+// rather than a generic "Action required".
+func fleetNextActionCTAForApproval(approval *fleetApprovalState) string {
+	if approval == nil {
+		return ""
+	}
+	switch strings.TrimSpace(approval.Action) {
+	case "merge_pr":
+		if approval.PRNumber > 0 {
+			return fmt.Sprintf("Approve PR #%d", approval.PRNumber)
+		}
+		return "Approve merge"
+	case "close_issue":
+		if approval.IssueNumber > 0 {
+			return fmt.Sprintf("Close issue #%d", approval.IssueNumber)
+		}
+		return "Close issue"
+	case "delete_worktree":
+		return "Delete worktree"
+	case "change_global_config":
+		return "Apply config change"
+	case "spawn_worker":
+		if approval.IssueNumber > 0 {
+			return fmt.Sprintf("Start worker on #%d", approval.IssueNumber)
+		}
+		return "Start worker"
+	case "label_issue_ready":
+		if approval.IssueNumber > 0 {
+			return fmt.Sprintf("Mark issue #%d ready", approval.IssueNumber)
+		}
+		return "Mark issue ready"
+	}
+	if approval.PRNumber > 0 {
+		return fmt.Sprintf("Review PR #%d", approval.PRNumber)
+	}
+	if approval.IssueNumber > 0 {
+		return fmt.Sprintf("Review issue #%d", approval.IssueNumber)
+	}
+	return "Review approval"
+}
+
+// fleetNextActionCTAForProject returns the header CTA for a project-level
+// operator state kind (dispatch_failure, outcome_drift, stale_worker, …).
+// Each branch names a concrete next step so the button replaces the
+// passive «Action required» text with a verb the operator can act on.
+func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
+	switch strings.TrimSpace(kind) {
+	case "error":
+		return "Investigate project error"
+	case "dispatch_failure":
+		return "Resolve stuck dispatch"
+	case "stale_worker":
+		if op.Session != "" {
+			return "Resolve stuck session " + op.Session
+		}
+		return "Resolve stuck session"
+	case "attention":
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Review PR #%d", op.PRNumber)
+		}
+		if op.IssueNumber > 0 {
+			return fmt.Sprintf("Review issue #%d", op.IssueNumber)
+		}
+		return "Review attention"
+	case "outcome_drift":
+		return "Reconcile outcome drift"
+	case "outcome_missing":
+		return "Configure outcome"
+	case "no_eligible_issues":
+		return "Queue more work"
+	case "queue_blocked":
+		return "Unblock queue"
+	case "stale":
+		return "Refresh stale snapshot"
+	}
+	return ""
 }
 
 const fleetApprovalSLASeconds int64 = 30 * 60
@@ -1934,6 +2055,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
+	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
 	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
@@ -2722,6 +2844,61 @@ func formatFleetTime(t time.Time) string {
 		return ""
 	}
 	return t.Format(time.RFC3339)
+}
+
+// fleetSupervisorPulseRecentLimit caps the number of recommended_action
+// verbs we forward to the SPA header sparkline (issue #531). Ten is enough
+// to read "idle is positive" at a glance without flooding the JSON.
+const fleetSupervisorPulseRecentLimit = 10
+
+// buildFleetSupervisorPulse extracts the liveness/cadence data the header
+// verdict card needs: when the last run_once landed, the configured poll
+// interval, the policy mode, and the last N recommended_action verbs for
+// the decision sparkline. Returns a zero pulse when cfg/st are nil so the
+// hero degrades to "unknown" instead of panicking.
+func buildFleetSupervisorPulse(cfg *config.Config, st *state.State, now time.Time) fleetSupervisorPulse {
+	pulse := fleetSupervisorPulse{}
+	if cfg != nil {
+		pulse.PollIntervalSeconds = cfg.PollIntervalSeconds
+		pulse.Mode = strings.TrimSpace(cfg.Supervisor.Mode)
+	}
+	if st == nil {
+		return pulse
+	}
+	if !st.LastRunOnceAt.IsZero() {
+		pulse.LastRunOnceAt = formatFleetTime(st.LastRunOnceAt)
+		pulse.LastRunOnceAgeSeconds = fleetAgeSeconds(st.LastRunOnceAt, now)
+	}
+	pulse.Stuck = st.SupervisorStuck
+	pulse.StuckReason = strings.TrimSpace(st.SupervisorStuckReason)
+	pulse.RecentActions = recentSupervisorActions(st.SupervisorDecisions, fleetSupervisorPulseRecentLimit)
+	return pulse
+}
+
+// recentSupervisorActions returns the last `limit` recommended_action
+// verbs from the decision log in chronological order (oldest → newest).
+// Empty verbs are skipped so callers can render a clean sparkline
+// without `"-"` placeholders.
+func recentSupervisorActions(decisions []state.SupervisorDecision, limit int) []string {
+	if limit <= 0 || len(decisions) == 0 {
+		return nil
+	}
+	verbs := make([]string, 0, limit)
+	start := 0
+	if len(decisions) > limit {
+		start = len(decisions) - limit
+	}
+	for _, d := range decisions[start:] {
+		verb := strings.TrimSpace(d.RecommendedAction)
+		if verb == "" {
+			continue
+		}
+		verbs = append(verbs, verb)
+	}
+	if len(verbs) == 0 {
+		return nil
+	}
+	return verbs
 }
 
 func formatFleetAge(t, now time.Time) string {

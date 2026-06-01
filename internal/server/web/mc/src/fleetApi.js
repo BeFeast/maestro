@@ -81,7 +81,141 @@ export function mapFleetResponse(raw, now = Date.now()) {
       ? summary.throughput_daily_7d.map(v => Number(v || 0))
       : [],
     lastDecisionAge: latestSupervisorAge(raw.projects || []),
+    supervisorPulse: aggregateSupervisorPulse(raw.projects || []),
   };
+}
+
+// aggregateSupervisorPulse rolls the per-project `supervisor_pulse` blocks
+// (issue #531) up to a single fleet-level pulse the header verdict card
+// can render. The "freshest" run_once timestamp wins (so the countdown
+// matches the project that just ticked); the poll interval and mode are
+// taken from that same project so the cadence story is consistent; the
+// decision sparkline is the merged-then-sliced last 10 verbs across all
+// projects, oldest → newest, so idle is visible as a positive signal.
+export function aggregateSupervisorPulse(rawProjects) {
+  let freshest = null;
+  let freshestMs = null;
+  let anyStuck = false;
+  let stuckReason = "";
+  const decisions = [];
+  for (const project of rawProjects) {
+    const pulse = project?.supervisor_pulse || null;
+    if (!pulse) continue;
+    if (pulse.stuck) {
+      anyStuck = true;
+      if (!stuckReason && pulse.stuck_reason) stuckReason = pulse.stuck_reason;
+    }
+    const latestDecisionAt = parseTimestamp(project?.supervisor?.latest?.created_at);
+    for (const verb of pulse.recent_actions || []) {
+      if (!verb) continue;
+      decisions.push({ verb, t: latestDecisionAt || 0 });
+    }
+    const ms = parseTimestamp(pulse.last_run_once_at);
+    if (ms != null && (freshestMs == null || ms > freshestMs)) {
+      freshestMs = ms;
+      freshest = { pulse, project };
+    }
+  }
+  // Newest verb-per-project is approximated by the project's latest decision
+  // timestamp; stable sort keeps order within a project. Slice to last 10.
+  decisions.sort((a, b) => a.t - b.t);
+  const recentActions = decisions.slice(-10).map(d => d.verb);
+  if (!freshest) {
+    return {
+      lastRunOnceAt: null,
+      lastRunOnceMs: null,
+      pollIntervalSeconds: 0,
+      mode: "",
+      recentActions,
+      stuck: anyStuck,
+      stuckReason,
+    };
+  }
+  return {
+    lastRunOnceAt: freshest.pulse.last_run_once_at || null,
+    lastRunOnceMs: freshestMs,
+    pollIntervalSeconds: Number(freshest.pulse.poll_interval_seconds || 0),
+    mode: String(freshest.pulse.mode || ""),
+    recentActions,
+    stuck: anyStuck,
+    stuckReason,
+  };
+}
+
+// nextDecisionCountdown returns the seconds remaining until the next
+// supervisor cycle is expected to land (issue #531). Negative values
+// mean the cycle is overdue. Returns null when the pulse has no
+// last_run_once_at or no positive interval so the SPA can fall back
+// to the legacy "—" placeholder.
+export function nextDecisionCountdown(pulse, now = Date.now()) {
+  if (!pulse) return null;
+  const lastMs = pulse.lastRunOnceMs != null ? pulse.lastRunOnceMs : parseTimestamp(pulse.lastRunOnceAt);
+  if (lastMs == null) return null;
+  const interval = Number(pulse.pollIntervalSeconds || 0);
+  if (interval <= 0) return null;
+  const dueMs = lastMs + interval * 1000;
+  return Math.round((dueMs - now) / 1000);
+}
+
+// formatCountdown renders a seconds value as "1m 47s" / "12s" / "OVERDUE"
+// for the header card. Long durations switch to "Hh Mm" so the header
+// doesn't grow when the daemon is wedged on a long interval.
+export function formatCountdown(seconds) {
+  if (seconds == null || Number.isNaN(seconds)) return "—";
+  if (seconds <= 0) return "now";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+// pulseFreshnessTone maps an age (now - lastRunOnceAt) against the configured
+// interval onto the three tones the header pulse-dot uses: "ok" while the
+// cycle is on time, "watch" past 2× interval, "stuck" past 3× interval (mirrors
+// the watchdog rule in state.SupervisorStuck, see #499).
+export function pulseFreshnessTone(pulse, now = Date.now()) {
+  if (!pulse) return "idle";
+  if (pulse.stuck) return "stuck";
+  const lastMs = pulse.lastRunOnceMs != null ? pulse.lastRunOnceMs : parseTimestamp(pulse.lastRunOnceAt);
+  if (lastMs == null) return "idle";
+  const interval = Number(pulse.pollIntervalSeconds || 0);
+  if (interval <= 0) return "ok";
+  const ageMs = now - lastMs;
+  if (ageMs > interval * 1000 * 3) return "stuck";
+  if (ageMs > interval * 1000 * 2) return "watch";
+  return "ok";
+}
+
+// formatAbsoluteTimestamp renders an ISO timestamp for the tooltip shown on
+// hover (issue #531, point 10). Returns "" when the value is missing so
+// callers can drop the title attribute entirely.
+export function formatAbsoluteTimestamp(value) {
+  const ms = parseTimestamp(value);
+  if (ms == null) return "";
+  try {
+    return new Date(ms).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  } catch (_) {
+    return "";
+  }
+}
+
+// relTimePrecise renders an age in `hh:mm:ss` once it exceeds an hour
+// (issue #531, point 10). Below that it falls back to `relTime`.
+export function relTimePrecise(date, now) {
+  const ms = now - (date instanceof Date ? date.getTime() : date);
+  if (!Number.isFinite(ms) || ms < 0) return relTime(date, now);
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 3600) return relTime(date, now);
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const pad = n => (n < 10 ? "0" + n : "" + n);
+  return `${pad(h)}:${pad(m)}:${pad(s)} ago`;
 }
 
 function collectWorkers(raw) {

@@ -486,6 +486,35 @@ input, textarea { font: inherit; color: inherit; }
 
 .hb-actions { display: flex; gap: var(--s-2); margin-top: var(--s-2); }
 
+/* --- Last-10 decisions sparkline (#531 gap 15) ---
+   A compact, fixed-width chip strip below the header meta row. Idle reads as
+   a row of dim · chips so "RUNNING 0 / PRS OPEN 0" is no longer a wedge. */
+.hb-spark {
+  display: flex; align-items: center; gap: var(--s-3);
+  margin-top: var(--s-2);
+}
+.hb-spark-chips {
+  display: inline-flex; gap: 3px;
+}
+.hb-spark-chip {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1;
+  color: var(--fg-0);
+  background: var(--bg-2);
+  border: 1px solid var(--border-1);
+}
+.hb-spark-chip.ok { background: var(--ok); color: var(--bg-0); border-color: transparent; }
+.hb-spark-chip.info { background: var(--info); color: var(--bg-0); border-color: transparent; }
+.hb-spark-chip.watch { background: var(--watch); color: var(--bg-0); border-color: transparent; }
+.hb-spark-chip.idle { color: var(--fg-3); }
+.hb-spark-chip.muted { color: var(--fg-4); background: transparent; }
+
 /* --- ECG canvas --- */
 .ecg {
   position: relative;

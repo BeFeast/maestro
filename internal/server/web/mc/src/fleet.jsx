@@ -2,6 +2,14 @@ import React from "react";
 import { Heartbeat, Icon, Panel, Pill, Stat } from "./atoms.jsx";
 import { useFleet } from "./fleetContext.jsx";
 import { parseTimestamp, relTime } from "./utils.js";
+import {
+  actionLabel,
+  formatAbsoluteTimestamp,
+  formatCountdown,
+  nextDecisionCountdown,
+  pulseFreshnessTone,
+  relTimePrecise,
+} from "./fleetApi.js";
 
 export function FleetScreen({ navigate }) {
   const { fleet, now } = useFleet();
@@ -18,11 +26,21 @@ export function FleetScreen({ navigate }) {
   const liveCount = projects.filter(p => p.state?.state === "live").length;
   const attCount = projects.filter(p => p.state?.state === "stuck" || p.state?.state === "watch").length;
   const idleCount = projects.length - liveCount - attCount;
-  const lastDecision = fleet.lastDecisionAge
-    ? relTime(fleet.lastDecisionAge, now)
-    : fleet.refreshedAt
-      ? relTime(parseTimestamp(fleet.refreshedAt) || now, now)
-      : "—";
+  const pulse = fleet.supervisorPulse || null;
+  const lastDecisionMs = pulse?.lastRunOnceMs != null
+    ? pulse.lastRunOnceMs
+    : (fleet.lastDecisionAge || (fleet.refreshedAt ? parseTimestamp(fleet.refreshedAt) : null));
+  const lastDecision = lastDecisionMs != null ? relTimePrecise(lastDecisionMs, now) : "—";
+  const lastDecisionTitle = pulse?.lastRunOnceAt
+    ? formatAbsoluteTimestamp(pulse.lastRunOnceAt)
+    : (fleet.refreshedAt ? formatAbsoluteTimestamp(fleet.refreshedAt) : "");
+  const countdownSec = nextDecisionCountdown(pulse, now);
+  const pulseTone = pulseFreshnessTone(pulse, now);
+  const headerTone = pulseTone !== "idle" ? pulseTone : tone;
+
+  const modeLabel = fleet.readOnly
+    ? "read-only"
+    : (pulse?.mode ? pulse.mode.replace(/_/g, " ") : "—");
 
   const workerSub = fleet.workerCount > 0 ? "running now" : "max parallel";
   const prSub = fleet.prCount > 0
@@ -31,29 +49,40 @@ export function FleetScreen({ navigate }) {
   const attSub = fleet.attentionCount > 0 ? "items need you" : "nothing waiting";
   const approvalSub = fleet.activeApprovals > 0 ? "pending review" : "queue empty";
 
+  const ctaLabel = fleet.nextAction?.cta_label || "";
+  const ctaTone = ctaToneForKind(fleet.nextAction?.kind);
+  const onCTA = ctaHandlerForNextAction(fleet.nextAction, navigate);
+
   return (
     <div>
       <div className={`hb tone-${tone}`}>
         <div className="hb-left">
-          <div className={`hb-line ${tone}`}>
+          <div className={`hb-line ${headerTone}`}>
             <span className="pulse-dot" />
-            <span>System status</span>
+            <strong>{fleet.daemonAlive ? "supervisor alive" : "supervisor offline"}</strong>
             <span style={{ color: "var(--fg-4)" }}>·</span>
-            <strong>{fleet.daemonAlive ? "supervisor online" : "supervisor offline"}</strong>
+            <span title={lastDecisionTitle || undefined}>last decision <strong>{lastDecision}</strong></span>
             <span style={{ color: "var(--fg-4)" }}>·</span>
-            <span>last decision <strong>{lastDecision}</strong></span>
+            <span>next in <strong>{formatCountdown(countdownSec)}</strong></span>
           </div>
           <h1 className={`hb-verdict tone-${tone}`}>
             <em>{fleet.verdict[0]}</em>{fleet.verdict[1]}
           </h1>
           <div className="hb-meta">
             <div><span>Projects</span><strong>{fleet.summary?.projects || projects.length}</strong></div>
-            <div><span>Running</span><strong>{fleet.workerCount}</strong></div>
+            <div><span>Workers running</span><strong>{fleet.workerCount}</strong></div>
+            <div><span>Approvals pending</span><strong>{fleet.activeApprovals}</strong></div>
             <div><span>PRs open</span><strong>{fleet.prCount}</strong></div>
-            <div><span>Mode</span><strong>{fleet.readOnly ? "read-only" : "controls"}</strong></div>
+            <div><span>Mode</span><strong>{modeLabel}</strong></div>
           </div>
+          <DecisionSparkline actions={pulse?.recentActions || []} />
           <div className="hb-actions">
-            {fleet.nextAction?.project && (
+            {ctaLabel && (
+              <button className={`tb-btn ${ctaTone}`} onClick={onCTA}>
+                {ctaLabel} →
+              </button>
+            )}
+            {!ctaLabel && fleet.nextAction?.project && (
               <button className="tb-btn primary" onClick={() => navigate(`project/${fleet.nextAction.project}`)}>
                 Open {fleet.nextAction.project} →
               </button>
@@ -271,4 +300,129 @@ function ApprovalsPreview() {
       ))}
     </div>
   );
+}
+
+// DecisionSparkline renders the last 10 supervisor `recommended_action`
+// verbs as a compact chip strip so an operator can read "two monitor
+// ticks, then a spawn, then a label" at a glance (#531 gap 15). Idle
+// reads as a positive signal — a row of dim monitor chips — instead of
+// the wedged "RUNNING 0 / PRS OPEN 0" the old hero produced.
+function DecisionSparkline({ actions }) {
+  if (!actions || actions.length === 0) {
+    return (
+      <div className="hb-spark dim mono" title="No supervisor decisions recorded yet.">
+        <span style={{ color: "var(--fg-3)", fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          last 10 decisions
+        </span>
+        <span style={{ color: "var(--fg-3)", fontSize: 11 }}>— no cycles yet —</span>
+      </div>
+    );
+  }
+  return (
+    <div className="hb-spark mono">
+      <span style={{ color: "var(--fg-3)", fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        last {actions.length} decisions
+      </span>
+      <div className="hb-spark-chips">
+        {actions.map((verb, i) => (
+          <span key={i} className={`hb-spark-chip ${decisionChipTone(verb)}`} title={actionLabel(verb)}>
+            {decisionChipGlyph(verb)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function decisionChipTone(verb) {
+  switch (String(verb || "").trim()) {
+  case "merge_pr":
+  case "approve_merge":
+    return "ok";
+  case "spawn_worker":
+  case "label_issue_ready":
+    return "info";
+  case "monitor_open_pr":
+  case "wait_for_review":
+  case "wait_for_ci":
+  case "wait_for_running_worker":
+  case "wait_for_worker":
+  case "wait_for_capacity":
+  case "wait_for_ordered_queue":
+    return "idle";
+  case "check_outcome_health":
+    return "watch";
+  case "review_retry_exhausted":
+  case "none":
+  case "skip_wave":
+    return "muted";
+  default:
+    return "idle";
+  }
+}
+
+function decisionChipGlyph(verb) {
+  switch (String(verb || "").trim()) {
+  case "merge_pr": return "M";
+  case "approve_merge": return "A";
+  case "spawn_worker": return "S";
+  case "label_issue_ready": return "L";
+  case "monitor_open_pr": return "·";
+  case "wait_for_review":
+  case "wait_for_ci":
+  case "wait_for_running_worker":
+  case "wait_for_worker":
+  case "wait_for_capacity":
+  case "wait_for_ordered_queue":
+    return "w";
+  case "check_outcome_health": return "H";
+  case "review_retry_exhausted": return "R";
+  case "none":
+  case "skip_wave":
+    return "—";
+  default:
+    return String(verb || "·").charAt(0).toLowerCase();
+  }
+}
+
+// ctaToneForKind picks the button class for the header CTA. Approvals
+// read "primary" (the operator's main job is approving); stuck/error
+// kinds read "danger" so the wedge is loud.
+function ctaToneForKind(kind) {
+  switch (String(kind || "").trim()) {
+  case "approval_pending":
+    return "primary";
+  case "error":
+  case "dispatch_failure":
+  case "stale_worker":
+  case "attention":
+    return "danger";
+  default:
+    return "primary";
+  }
+}
+
+// ctaHandlerForNextAction routes the header button to the right SPA
+// screen for the chosen `next_action.kind`. Approvals jump to the inbox,
+// stuck/dispatch failures jump to the workers screen, everything else
+// zooms into the project.
+function ctaHandlerForNextAction(action, navigate) {
+  if (!action) return () => {};
+  const kind = String(action.kind || "").trim();
+  const project = action.project || "";
+  return () => {
+    if (kind === "approval_pending") {
+      navigate("approvals");
+      return;
+    }
+    if (kind === "stale_worker" || kind === "dispatch_failure" || kind === "attention") {
+      navigate("workers");
+      return;
+    }
+    if (project) {
+      navigate(`project/${project}`);
+      return;
+    }
+    navigate("approvals");
+  };
 }
