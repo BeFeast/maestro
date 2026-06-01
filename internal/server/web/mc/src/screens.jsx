@@ -13,6 +13,7 @@ import {
   postProjectApproval,
   projectBySlug,
   supervisorDecisionsFromProject,
+  workerNextAction,
   workerSessionsFromFleet,
 } from "./fleetApi.js";
 import { parseTimestamp, relTime } from "./utils.js";
@@ -223,17 +224,17 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
   const [scope, setScope] = React.useState("live");
   const [showOlder, setShowOlder] = React.useState(false);
   const ws = workerSessionsFromFleet(fleet || { workers: [] }, now);
-  const allRunning = filterProject
-    ? ws.running.filter(w => w.project === filterProject || w.project_name === filterProject)
-    : ws.running;
-  const allRecent = filterProject
-    ? ws.recent.filter(w => w.project === filterProject || w.project_name === filterProject)
-    : ws.recent;
-  // backward-compat alias for code below that still reads allLive
-  const allLive = allRecent;
-  const allToday = filterProject
-    ? ws.today.filter(w => w.project === filterProject || w.project_name === filterProject)
-    : ws.today;
+  const matchProject = w => !filterProject || w.project === filterProject || w.project_name === filterProject;
+  const allRunning = ws.running.filter(matchProject);
+  const allRecent = ws.recent.filter(matchProject);
+  const allStuck = ws.stuck.filter(matchProject);
+  const allToday = ws.today.filter(matchProject);
+  const stuckTodayCount = allStuck.filter(w => {
+    const finished = parseTimestamp(w.finished_at) || w.age;
+    if (!finished) return false;
+    const start = new Date(now); start.setHours(0, 0, 0, 0);
+    return finished >= start.getTime();
+  }).length;
 
   return (
     <div>
@@ -243,7 +244,10 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
           <div className="mono dim mt-2" style={{ fontSize: 12 }}>
             {filterProject ? <>filtered by <strong style={{ color: "var(--fg-1)" }}>{filterProject}</strong> · </> : null}
             <strong style={{ color: "var(--fg-0)" }}>{allRunning.length} running</strong>
-            {" · "}{allRecent.length} recent 24h · {ws.todayCount} today · {ws.olderCount} older
+            {" · "}{allRecent.length} recent 24h
+            {" · "}<strong style={{ color: allStuck.length > 0 ? "var(--stuck)" : "var(--fg-3)" }}>{stuckTodayCount} stuck today</strong>
+            {" · "}{allToday.length} done today
+            {" · "}{ws.olderCount} older
             {filterProject && <a onClick={() => navigate("workers")} style={{ marginLeft: 8 }}>clear</a>}
           </div>
         </div>
@@ -253,8 +257,8 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
             onChange={setScope}
             options={[
               { value: "live", label: "Recent", count: allRecent.length },
-              { value: "today", label: "Today", count: ws.todayCount },
-              { value: "7d", label: "7d", count: ws.olderCount + ws.todayCount },
+              { value: "today", label: "Today", count: allToday.length },
+              { value: "7d", label: "7d", count: ws.olderCount + allToday.length },
               { value: "all", label: "All" },
             ]}
           />
@@ -303,6 +307,32 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
           </>
         )}
 
+        {(scope === "live" || scope === "today" || scope === "all") && allStuck.length > 0 && (
+          <>
+            <div className="wt-group">
+              <span className="pill stuck no-dot" style={{ background: "transparent", border: "none", padding: 0, color: "var(--stuck)" }}>● stuck</span>
+              <strong>{allStuck.length} needs attention</strong>
+              {stuckTodayCount > 0 && <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>· {stuckTodayCount} stuck today</span>}
+            </div>
+            {allStuck.map(w => (
+              <div key={`${w.slot}-stuck`} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
+                <div className="wt-slot">{w.slot}</div>
+                <div>
+                  <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
+                  <div className="wt-project">{w.project}</div>
+                </div>
+                <div><Pill tone={w.tone} noDot>{w.status}</Pill></div>
+                <div className="mono" style={{ fontSize: 11, color: "var(--fg-1)" }}>
+                  {w.pr ? <>PR #{w.pr}</> : <span className="dim">no PR</span>}
+                  <div className="dim" style={{ fontSize: 10, marginTop: 2 }}>{w.branch || ""}</div>
+                </div>
+                <div className="wt-next">{workerNextAction(w).text || w.summary}</div>
+                <div className="wt-age">{relTime(w.age, now)}</div>
+              </div>
+            ))}
+          </>
+        )}
+
         {(scope === "today" || scope === "all") && allToday.length > 0 && (
           <>
             <div className="wt-group">
@@ -316,7 +346,7 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
                   <div className="wt-issue dim2">#{w.issue.num} {w.issue.title}</div>
                   <div className="wt-project">{w.project}</div>
                 </div>
-                <div><Pill tone="ok" noDot>{w.status || "done"}</Pill></div>
+                <div><Pill tone="ok" noDot>done</Pill></div>
                 <div className="mono dim" style={{ fontSize: 11 }}>{w.pr ? `PR #${w.pr}` : "—"}</div>
                 <div className="dim" style={{ fontSize: 11.5 }}>{w.summary}</div>
                 <div className="wt-age">{relTime(w.age, now)}</div>
@@ -349,6 +379,7 @@ export function WorkerDrawer({ worker, onClose, now }) {
   const { fleet } = useFleet();
   const [detail, setDetail] = React.useState(null);
   const [error, setError] = React.useState(null);
+  const logRef = React.useRef(null);
 
   React.useEffect(() => {
     if (!worker) {
@@ -385,6 +416,17 @@ export function WorkerDrawer({ worker, onClose, now }) {
     ? detail.log.text.split("\n").filter(Boolean)
     : [];
 
+  const next = workerNextAction(worker);
+  const handleAction = (action) => {
+    if (action === "openLog" && logRef.current) {
+      logRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    // retry / resetBudget / markBlocked / openBackendHealth are
+    // intentionally not wired here yet: backend handlers are tracked
+    // separately (see issue #540 "out of scope" — buttons render with
+    // an action key so future endpoints can attach without UI churn).
+  };
+
   return (
     <>
       <div className="drawer-scrim" onClick={onClose} />
@@ -409,14 +451,26 @@ export function WorkerDrawer({ worker, onClose, now }) {
           </div>
 
           <div className="drawer-sec">
-            <div className="drawer-sec-title">Supervisor reasoning</div>
+            <div className="drawer-sec-title">Next action</div>
             <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", fontSize: 12.5, color: "var(--fg-1)", borderLeft: "2px solid var(--accent)" }}>
-              <strong style={{ color: "var(--accent)" }}>{worker.next_action || worker.status || "monitor"}</strong>
-              <div className="mt-2">{worker.status_reason || worker.summary}</div>
+              <strong style={{ color: "var(--accent)" }}>{worker.status || "monitor"}</strong>
+              <div className="mt-2">{next.text || worker.status_reason || worker.summary}</div>
+              {next.buttons.length > 0 && (
+                <div className="row gap-2 mt-2">
+                  {next.buttons.map((b, i) => b.href ? (
+                    <a key={i} className="tb-btn" href={b.href} target="_blank" rel="noreferrer">{b.label}</a>
+                  ) : (
+                    <button key={i} className="tb-btn" onClick={() => handleAction(b.action)}>{b.label}</button>
+                  ))}
+                </div>
+              )}
             </div>
+            {worker.status_reason && worker.status_reason !== next.text && (
+              <div className="mono dim mt-2" style={{ fontSize: 11 }}>{worker.status_reason}</div>
+            )}
           </div>
 
-          <div className="drawer-sec">
+          <div className="drawer-sec" ref={logRef}>
             <div className="drawer-sec-title row" style={{ justifyContent: "space-between" }}>
               <span>Live log</span>
               <span className="dim">{detail?.log?.available ? "tailing · 5s" : "unavailable"}</span>
@@ -434,9 +488,10 @@ export function WorkerDrawer({ worker, onClose, now }) {
           </div>
 
           <div className="drawer-sec">
-            <div className="drawer-sec-title">Actions</div>
+            <div className="drawer-sec-title">Links</div>
             <div className="row gap-2">
               {worker.pr_url && <a className="tb-btn" href={worker.pr_url} target="_blank" rel="noreferrer">Open PR in GitHub →</a>}
+              {worker.issue_url && <a className="tb-btn ghost" href={worker.issue_url} target="_blank" rel="noreferrer">Open issue →</a>}
             </div>
             {fleet?.readOnly && (
               <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>Write actions disabled in read-only mode.</div>
