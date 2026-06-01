@@ -3,7 +3,12 @@ import { Icon, Panel, Pill, QueueBar, Segmented, ConfirmDialog } from "./atoms.j
 import { useFleet } from "./fleetContext.jsx";
 import {
   actionLabel,
+  approvalCTA,
+  approvalRejectLabel,
+  approvalReasonPlaceholder,
   fetchWorkerDetail,
+  isApprovalActionCloseIssue,
+  isApprovalActionMergePR,
   postFleetApproval,
   postProjectApproval,
   projectBySlug,
@@ -554,32 +559,51 @@ function ApprovalRow({ a }) {
       setBusy(false);
     }
   }, [a.id, a.project, pendingReason, refresh, closeDialog]);
+  const isMergePR = isApprovalActionMergePR(a.action);
+  const isCloseIssue = isApprovalActionCloseIssue(a.action);
+  const primaryCTA = approvalCTA(a.action, a.pr, a.issue_number);
+  const rejectCTA = approvalRejectLabel(a.action);
+  // For merge_pr the supervisor's planner rule only emits the approval once
+  // CI is CLEAN and mergeable is true (#514), so a pending merge_pr approval
+  // implicitly means those gates already passed — surface them as badges so
+  // the operator sees what was checked, not just "approve a generic action".
+  const gateBadges = isMergePR
+    ? [
+      { tone: "ok", label: "CI green" },
+      { tone: "ok", label: "mergeable" },
+      { tone: "ok", label: "review ok" },
+    ]
+    : [];
   return (
     <div className={`app-row ${a.state}`}>
       <div className="app-row-stage">
-        <strong>#{a.pr || "—"}</strong>
+        <strong>#{a.pr || a.issue_number || "—"}</strong>
         <small>{a.stage}</small>
       </div>
       <div className="app-row-body">
-        <h4>{a.title}</h4>
-        <div className="meta">
-          <span>{a.project}</span> · action <strong className="mono" style={{ color: "var(--fg-1)" }}>{actionLabel(a.action)}</strong>
+        <h4 style={isMergePR ? { fontSize: 16 } : undefined}>{a.title}</h4>
+        <div className="meta" style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+          <span>{a.project}</span>
+          <span>· action <strong className="mono" style={{ color: "var(--fg-1)" }}>{actionLabel(a.action)}</strong></span>
+          {gateBadges.map(b => (
+            <Pill key={b.label} tone={b.tone} noDot>{b.label}</Pill>
+          ))}
         </div>
-        <p>{a.body}</p>
+        {a.body && a.body !== a.title && <p>{a.body}</p>}
       </div>
       <div className="app-row-actions">
         <span className={`age ${overdue ? "bad" : ""}`}>{a.ageMin}m {overdue && `· SLA ${a.sla}m`}</span>
         <Pill tone={a.state} noDot>{overdue ? "past SLA" : "waiting"}</Pill>
-        {a.pr_url && <a className="tb-btn primary" style={{ fontSize: 11 }} href={a.pr_url} target="_blank" rel="noreferrer">Open PR →</a>}
+        {a.pr_url && <a className="tb-btn" style={{ fontSize: 11 }} href={a.pr_url} target="_blank" rel="noreferrer">Open PR →</a>}
         {canMutate && (
           <>
-            <button className="tb-btn" disabled={busy} style={{ fontSize: 11 }} onClick={() => setPendingVerb("approve")} title="Approve this approval">Approve</button>
-            <button className="tb-btn danger" disabled={busy} style={{ fontSize: 11 }} onClick={() => setPendingVerb("reject")} title="Reject this approval">Reject</button>
+            <button className="tb-btn primary" disabled={busy} style={{ fontSize: 11 }} onClick={() => setPendingVerb("approve")} title={`${primaryCTA} (approve)`}>{primaryCTA}</button>
+            <button className="tb-btn danger" disabled={busy} style={{ fontSize: 11 }} onClick={() => setPendingVerb("reject")} title={`${rejectCTA} (reject)`}>{rejectCTA}</button>
             <ConfirmDialog
               open={pendingVerb !== null}
-              title={pendingVerb === "approve" ? `Approve ${a.id}?` : `Reject ${a.id}?`}
-              danger={pendingVerb === "reject"}
-              confirmLabel={pendingVerb === "approve" ? "Approve" : "Reject"}
+              title={pendingVerb === "approve" ? `${primaryCTA}?` : `${rejectCTA}?`}
+              danger={pendingVerb === "reject" || (pendingVerb === "approve" && (isMergePR || isCloseIssue))}
+              confirmLabel={pendingVerb === "approve" ? primaryCTA : rejectCTA}
               busy={busy}
               onClose={closeDialog}
               onConfirm={() => send(pendingVerb)}
@@ -587,9 +611,14 @@ function ApprovalRow({ a }) {
               <div className="mono dim" style={{ fontSize: 11, marginBottom: 8 }}>
                 action: {actionLabel(a.action)} · project: {a.project || "—"}
                 {a.pr ? ` · PR #${a.pr}` : ""}
+                {!a.pr && a.issue_number ? ` · issue #${a.issue_number}` : ""}
               </div>
               <div style={{ marginBottom: 12, fontSize: 12, color: "var(--fg-2)" }}>
-                The approval moves to <strong>{pendingVerb === "approve" ? "approved" : "rejected"}</strong> immediately; for approved <strong>{actionLabel(a.action)}</strong>, the maestro supervisor (or the CLI) executes the side effect.
+                {pendingVerb === "approve" ? (
+                  <>The approval moves to <strong>approved</strong> immediately, and the maestro supervisor (or the CLI) will <strong>{actionLabel(a.action).toLowerCase()}</strong>.</>
+                ) : (
+                  <>The approval moves to <strong>rejected</strong> immediately; the supervisor will <strong>not</strong> {actionLabel(a.action).toLowerCase()}.</>
+                )}
               </div>
               <label htmlFor={`reason-${a.id}`} style={{ display: "block", fontSize: 11, color: "var(--fg-2)", marginBottom: 4 }}>
                 Reason <span className="dim">(optional, recorded in the approval audit)</span>
@@ -598,7 +627,7 @@ function ApprovalRow({ a }) {
                 id={`reason-${a.id}`}
                 value={pendingReason}
                 onChange={e => setPendingReason(e.target.value)}
-                placeholder={pendingVerb === "approve" ? "e.g. CI green, manual smoke ok" : "e.g. failing on review item X"}
+                placeholder={approvalReasonPlaceholder(a.action, pendingVerb)}
                 autoFocus
                 rows={3}
                 disabled={busy}
@@ -622,7 +651,7 @@ function ApprovalRow({ a }) {
                 }}
               />
               <div className="mono dim" style={{ fontSize: 10, marginTop: 4 }}>
-                ⌘/Ctrl+Enter to {pendingVerb}, Esc to cancel.
+                ⌘/Ctrl+Enter to confirm, Esc to cancel.
               </div>
             </ConfirmDialog>
           </>

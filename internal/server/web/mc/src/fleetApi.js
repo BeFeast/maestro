@@ -426,6 +426,93 @@ export function actionLabel(action) {
   }
 }
 
+// approvalCTA returns the primary-button label for an approval card. The
+// label names the *effect* that will run when the operator approves, not a
+// generic "Approve" — so for a merge_pr approval on PR #123 it reads
+// "Merge PR #123", not "Approve". Issue #535 / spec gap 4.
+export function approvalCTA(action, prNumber, issueNumber) {
+  switch (String(action || "").trim()) {
+  case "merge_pr":
+    return prNumber ? `Merge PR #${prNumber}` : "Merge PR";
+  case "close_issue":
+    return issueNumber ? `Close issue #${issueNumber}` : "Close issue";
+  case "delete_worktree":
+    return "Delete worktree";
+  case "change_global_config":
+    return "Apply config change";
+  case "spawn_worker":
+    return "Start worker";
+  case "label_issue_ready":
+    return "Mark ready";
+  default:
+    return "Approve";
+  }
+}
+
+// approvalRejectLabel returns the secondary-button label for an approval
+// card. Mirrors approvalCTA — "Don't merge" / "Don't close" reads more
+// honestly than a generic "Reject" once the primary CTA is verb-specific.
+export function approvalRejectLabel(action) {
+  switch (String(action || "").trim()) {
+  case "merge_pr":
+    return "Don't merge";
+  case "close_issue":
+    return "Don't close";
+  case "delete_worktree":
+    return "Keep worktree";
+  case "change_global_config":
+    return "Reject change";
+  default:
+    return "Reject";
+  }
+}
+
+// approvalReasonPlaceholder returns the textarea placeholder shown in the
+// approve/reject confirmation modal. The hint differs by verb so the
+// operator has a sensible example for the action they are about to take.
+export function approvalReasonPlaceholder(action, verb) {
+  const v = String(verb || "approve");
+  const a = String(action || "").trim();
+  if (v === "approve") {
+    switch (a) {
+    case "merge_pr":
+      return "e.g. CI green, manual smoke ok";
+    case "close_issue":
+      return "e.g. duplicate / not reproducible";
+    case "delete_worktree":
+      return "e.g. worker abandoned, cleaning up";
+    case "change_global_config":
+      return "e.g. rolling out new policy";
+    default:
+      return "e.g. CI green, manual smoke ok";
+    }
+  }
+  switch (a) {
+  case "merge_pr":
+    return "e.g. failing test on review, needs another pass";
+  case "close_issue":
+    return "e.g. still reproducible, keep open";
+  case "delete_worktree":
+    return "e.g. still investigating, keep state";
+  case "change_global_config":
+    return "e.g. needs more eyes before rollout";
+  default:
+    return "e.g. failing on review item X";
+  }
+}
+
+// isApprovalActionMergePR / isApprovalActionCloseIssue are tiny predicates
+// used by the dashboard to pick the right card variant. Keeping them here
+// (rather than inlining strings in JSX) makes the verb→label mapping easy
+// to keep in sync with the supervisor's approval-required action set.
+export function isApprovalActionMergePR(action) {
+  return String(action || "").trim() === "merge_pr";
+}
+
+export function isApprovalActionCloseIssue(action) {
+  return String(action || "").trim() === "close_issue";
+}
+
 export function formatRefreshAge(refreshedAt, now) {
   const ms = parseTimestamp(refreshedAt);
   if (!ms) return "—";
