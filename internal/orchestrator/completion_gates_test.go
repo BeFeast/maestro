@@ -223,3 +223,72 @@ func TestMarkDoneAfterOutcomePass_BodyMarkerHoldsClose(t *testing.T) {
 		t.Fatalf("CloseIssue called %d times; body marker must hold close", closeCalled)
 	}
 }
+
+// TestReconcile_LiveVerificationNotifiesOnce verifies #570: holding a
+// code_landed session for live verification fires the board sync + operator
+// notification only once, even though reconcileCodeLandedSessions re-enters
+// the hold path on every tick while the gate holds.
+func TestReconcile_LiveVerificationNotifiesOnce(t *testing.T) {
+	cfg := &config.Config{
+		Repo:           "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{Enabled: true, ProjectNumber: 5},
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+		Supervisor: config.SupervisorConfig{
+			SafeActions: []string{config.SupervisorActionCloseIssue},
+			CompletionGates: config.SupervisorCompletionGatesConfig{
+				RequiredLabels: []string{"design-handoff"},
+				BodyMarkers:    []string{"live visual"},
+			},
+		},
+	}
+	syncCalls := 0
+	o := &Orchestrator{
+		cfg:            cfg,
+		notifier:       &notify.Notifier{},
+		outcomeCheckFn: healthyOutcome(),
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000}}, nil
+		},
+		syncProjectFn: func(_ int, status github.ProjectStatus) bool {
+			if status == github.ProjectStatusLiveVerify {
+				syncCalls++
+			}
+			return true
+		},
+		isPRMergedFn: func(prNumber int) (bool, error) {
+			return prNumber == 10, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "Redesign nav", "design-handoff"), nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 168,
+		IssueTitle:  "Redesign nav",
+		Status:      state.StatusCodeLanded,
+		PRNumber:    10,
+	}
+
+	for i := 0; i < 3; i++ {
+		o.reconcileCodeLandedSessions(s)
+	}
+
+	if syncCalls != 1 {
+		t.Fatalf("live-verification board sync fired %d times across 3 reconciles, want 1 (#570 one-shot)", syncCalls)
+	}
+	if !s.Sessions["slot-0"].LiveVerificationNotified {
+		t.Fatalf("LiveVerificationNotified flag not set after hold")
+	}
+	if got := s.Sessions["slot-0"].Status; got != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want code_landed", got)
+	}
+}

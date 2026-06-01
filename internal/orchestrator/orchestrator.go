@@ -2532,6 +2532,15 @@ func (o *Orchestrator) holdForLiveVerification(sess *state.Session, prNumber int
 	if sess.Status != state.StatusCodeLanded {
 		sess.Status = state.StatusCodeLanded
 	}
+	// Idempotent (#570): reconcileCodeLandedSessions re-enters this on every
+	// tick while the gate holds, so the board sync + operator notification
+	// must fire only once. Without this guard an issue held for an hour at a
+	// 30s reconcile interval emits ~120 duplicate notifications. The status
+	// correction above stays unconditional (drift repair); the side effects
+	// below are one-shot.
+	if sess.LiveVerificationNotified {
+		return
+	}
 	o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
 	log.Printf("[orch] issue #%d passed healthz but completion gates require live verification; holding in code_landed", sess.IssueNumber)
 	if o.notifier != nil {
@@ -2541,6 +2550,7 @@ func (o *Orchestrator) holdForLiveVerification(sess *state.Session, prNumber int
 			o.notifier.Sendf("⏸ maestro: issue #%d completion gates require live verification; not closing on healthz alone", sess.IssueNumber)
 		}
 	}
+	sess.LiveVerificationNotified = true
 }
 
 func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
