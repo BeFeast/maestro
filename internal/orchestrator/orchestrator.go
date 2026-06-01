@@ -1120,6 +1120,13 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 		// mirroring still runs, and the broad sweep can wait for the normal
 		// throttle window.
 		o.deferProjectBoardSweep(time.Now().UTC())
+
+		// Graceful drain (#541) is a one-shot "drain then restart" request. A
+		// fresh daemon must start in normal (non-drained) mode, so clear any
+		// leftover drain flag before the first cycle. Only the long-running
+		// daemon clears it — a `run --once` reconcile tick must not lift a
+		// drain that an operator is mid-way through.
+		o.clearSpawnDrainOnStartup()
 	}
 	if err := o.RunOnce(); err != nil {
 		log.Printf("[orch] run error: %v", err)
@@ -1154,6 +1161,25 @@ func (o *Orchestrator) deferProjectBoardSweep(now time.Time) {
 		return
 	}
 	o.projectItemsSweepAt = now.UTC()
+}
+
+// clearSpawnDrainOnStartup lifts any leftover graceful-drain flag (#541) so a
+// freshly started daemon begins in normal mode. A no-op when no drain is set.
+func (o *Orchestrator) clearSpawnDrainOnStartup() {
+	s, err := state.Load(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] drain: load state to clear drain flag: %v", err)
+		return
+	}
+	if !s.DrainActive() {
+		return
+	}
+	s.ClearSpawnDrain(time.Now().UTC())
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		log.Printf("[orch] drain: clear drain flag on startup: %v", err)
+		return
+	}
+	log.Printf("[orch] drain flag cleared on startup — resuming normal spawns")
 }
 
 // reloadConfig applies non-destructive config changes at runtime.
@@ -3198,6 +3224,17 @@ func sortedStateSessionNames(s *state.State) []string {
 }
 
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
+	// Graceful drain (#541): while a drain is requested, refuse to claim new
+	// issues or spawn new workers. In-flight workers keep running; the
+	// operator runs `maestro drain` before a restart so a `systemctl restart`
+	// no longer kills mid-flight workers. The flag is cleared automatically on
+	// the next orchestrator startup. Return before listing issues so drain is
+	// a true "stop accepting new work" gate, not just a per-issue skip.
+	if s.DrainActive() {
+		log.Printf("[orch] drain active (since %s): not spawning new workers (running=%d)",
+			s.SpawnDrainAt.Format(time.RFC3339), s.RunningSessionCount())
+		return
+	}
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
