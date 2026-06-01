@@ -32,7 +32,7 @@ The design export source files (`mc/*.jsx`, `mc/mc.css`) **are the implementatio
 - Do not enable write actions in V1 (settings toggles render read-only/disabled).
 - Do not rewrite supervisor or backend behavior.
 - Brand exploration, UI audit, and mock HTML files in the zip are reference only — not production routes.
-- Single-project `dashboard.html` unification is **deferred** to Wave 4; per-project `dashboard_url` ports remain until ProjectScreen proves parity.
+- Single-project `dashboard.html` unification is **deferred** to Wave 4; per-project `dashboard_url` ports were retired in #516 — every project is now reachable through the aggregator at `/project/<name>`.
 
 ## Route Replacement Map
 
@@ -40,11 +40,11 @@ The design export source files (`mc/*.jsx`, `mc/mc.css`) **are the implementatio
 |---|---|---|---|
 | `/`, `/fleet` | `mc/mc-fleet.jsx` → `FleetScreen` (tape layout only) | `GET /api/v1/fleet` | Same URLs; MC shell replaces inline layout |
 | (none) | `mc/mc-screens.jsx` → `WorkersScreen` | `GET /api/v1/fleet` (workers, attention) | New first-class route `/workers` |
-| (none) | `mc/mc-screens.jsx` → `ProjectScreen` | Per-project slice from fleet API | New route `/project/{slug}`; defers replacing `dashboard_url` |
+| (none) | `mc/mc-screens.jsx` → `ProjectScreen` | Per-project slice from fleet API | New route `/project/{slug}`; replaces the legacy `dashboard_url` redirect (#516) |
 | needs-you rail + `/approvals/audit` | `mc/mc-screens.jsx` → `ApprovalsScreen` | `GET /api/v1/fleet` (approvals) | Preserve audit access; integrate active vs history |
 | (none) | `mc/mc-screens.jsx` → `SettingsScreen` | New read-only config summary API (small) | Display-only in V1 |
 | Partial Cmd-K (`fleet.js`) | `mc/mc-shell.jsx` → `CommandPalette` | Loaded fleet data | Strip scenario/theme demo items; keep topbar theme toggle |
-| Per-project `dashboard_url` | Legacy `dashboard.html` | `/api/v1/state` | **Deferred** — unchanged until Wave 4 |
+| Per-project `dashboard_url` | Aggregator route `/project/<name>` | `/api/v1/fleet` (filtered slice) | Retired in #516; legacy `dashboard.html` is no longer the operator surface |
 
 ## Implementation Waves
 

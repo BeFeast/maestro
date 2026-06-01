@@ -45,8 +45,32 @@ func TestLoadFleetProjects(t *testing.T) {
 	if projects[0].cfg == nil || projects[0].cfg.Repo != "owner/project" {
 		t.Fatalf("resolved config = %+v", projects[0].cfg)
 	}
-	if projects[0].DashboardURL != "http://127.0.0.1:8787" {
-		t.Fatalf("dashboard url = %q", projects[0].DashboardURL)
+	// Per-project dashboard ports were retired in #516. The legacy
+	// dashboard_url in fleet.yaml is silently overridden with the scoped
+	// MC route on load, regardless of what value the YAML supplied.
+	if projects[0].DashboardURL != "/project/Project" {
+		t.Fatalf("dashboard url = %q, want unified MC scoped route", projects[0].DashboardURL)
+	}
+}
+
+func TestLoadFleetProjectsScopesDashboardURLToMC(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	configPath := filepath.Join(dir, "project.yaml")
+	if err := os.WriteFile(configPath, []byte("repo: owner/project\nstate_dir: "+stateDir+"\nsession_prefix: prj\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	fleetPath := filepath.Join(dir, "fleet.yaml")
+	// Project name contains a space to verify path-escaping on the scoped MC route.
+	if err := os.WriteFile(fleetPath, []byte("projects:\n  - name: Has Space\n    config: project.yaml\n"), 0o644); err != nil {
+		t.Fatalf("write fleet: %v", err)
+	}
+	projects, err := LoadFleetProjects(fleetPath)
+	if err != nil {
+		t.Fatalf("LoadFleetProjects failed: %v", err)
+	}
+	if got, want := projects[0].DashboardURL, "/project/Has%20Space"; got != want {
+		t.Fatalf("scoped MC URL = %q, want %q", got, want)
 	}
 }
 

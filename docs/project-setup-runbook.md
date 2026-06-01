@@ -275,9 +275,8 @@ To add a project:
 
 1. Create or update `~/.maestro/maestro-<project>.yaml` using the config shape above.
 2. Use a distinct `state_dir` and `session_prefix` for each project so worker sessions and state files do not overlap.
-3. If you run a per-project Mission Control dashboard, set that project's `server.host`, `server.port`, and `server.read_only: true` in the project config.
-4. Add the project to `~/.maestro/fleet.yaml` with a human name, config path, and optional `dashboard_url`.
-5. Restart the fleet dashboard service and verify `/api/v1/fleet`.
+3. Add the project to `~/.maestro/fleet.yaml` with a human name and config path. Every project is reachable through the unified Mission Control aggregator at `/project/<name>` (#516); per-project dashboard ports are retired and no longer need a separate user unit.
+4. Restart the fleet dashboard service and verify `/api/v1/fleet`.
 
 Minimal two-project fleet file:
 
@@ -286,13 +285,11 @@ Minimal two-project fleet file:
 projects:
   - name: api
     config: maestro-api.yaml
-    dashboard_url: http://127.0.0.1:8788
   - name: web
     config: maestro-web.yaml
-    dashboard_url: http://127.0.0.1:8789
 ```
 
-`config` may be absolute, `~/...`, or relative to the fleet YAML file. `dashboard_url` is only a link target for the fleet UI; omit it when a project does not run its own dashboard. For dogfooding, add Maestro's own project config to the same fleet file so the team can watch Maestro manage Maestro alongside application repos.
+`config` may be absolute, `~/...`, or relative to the fleet YAML file. `dashboard_url` is deprecated (#516); any value still present is silently overridden with the project-scoped MC route on load. For dogfooding, add Maestro's own project config to the same fleet file so the team can watch Maestro manage Maestro alongside application repos.
 
 Run the fleet dashboard manually:
 
@@ -312,8 +309,8 @@ The fleet response includes `refreshed_at` plus per-project freshness metadata. 
 
 | Mode | Use it when | Notes |
 |---|---|---|
-| `maestro serve --fleet ~/.maestro/fleet.yaml --port 8787` | You want a stable operating model for a shared dashboard or systemd service | Supports project names, relative config paths, and `dashboard_url` links |
-| `maestro serve --config a.yaml --config b.yaml --port 8787` | You want a quick local aggregate view without writing a fleet file | Project names are derived from `repo`, and there is no place for `dashboard_url` metadata |
+| `maestro serve --fleet ~/.maestro/fleet.yaml --port 8787` | You want a stable operating model for a shared dashboard or systemd service | Supports human project names and relative config paths; project-scoped routes (`/project/<name>`) are served from the same port |
+| `maestro serve --config a.yaml --config b.yaml --port 8787` | You want a quick local aggregate view without writing a fleet file | Project names are derived from `repo` |
 
 For a persistent user service, create a dedicated fleet dashboard unit:
 
