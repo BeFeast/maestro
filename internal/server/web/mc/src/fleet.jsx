@@ -64,7 +64,7 @@ export function FleetScreen({ navigate }) {
             {fleet.attentionCount > 0 && (
               <button className="tb-btn danger" onClick={() => navigate("workers")}>Review attention →</button>
             )}
-            <a className="tb-btn ghost" href="/docs/fleet-mission-control-runbook.md" target="_blank" rel="noreferrer">View runbook →</a>
+            <a className="tb-btn ghost" href="https://github.com/BeFeast/maestro/blob/main/docs/fleet-mission-control-runbook.md" target="_blank" rel="noreferrer">View runbook →</a>
           </div>
         </div>
         <Heartbeat tone={tone} bpm={fleet.heartbeatBpm} daemonAlive={fleet.daemonAlive} />
