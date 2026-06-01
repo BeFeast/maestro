@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,6 +33,12 @@ const (
 )
 
 // FleetProject describes one Maestro project exposed in the fleet dashboard.
+//
+// DashboardURL is auto-derived from Name as the project-scoped MC route
+// (`/project/<name>`). Per-project legacy dashboard ports were retired in #516,
+// so any `dashboard_url` value supplied by a fleet.yaml is overwritten on
+// load. The field is retained on the snapshot for backward-compatibility with
+// external JSON consumers.
 type FleetProject struct {
 	Name         string `json:"name" yaml:"name"`
 	ConfigPath   string `json:"config_path" yaml:"config"`
@@ -67,16 +74,33 @@ func (p *FleetProject) Cfg() *config.Config {
 }
 
 // NewFleetProject wraps an already-loaded config for in-process fleet serving.
+//
+// The dashboardURL parameter is retained for source-compat with callers and
+// older fleet.yaml files but its value is ignored: every project is now
+// reachable at the project-scoped MC route on the aggregator port (#516).
+// DashboardURL on the returned FleetProject is auto-derived from name.
 func NewFleetProject(name, configPath, dashboardURL string, cfg *config.Config) FleetProject {
 	if strings.TrimSpace(name) == "" && cfg != nil {
 		name = defaultFleetProjectName(cfg.Repo)
 	}
+	trimmedName := strings.TrimSpace(name)
 	return FleetProject{
-		Name:         strings.TrimSpace(name),
+		Name:         trimmedName,
 		ConfigPath:   strings.TrimSpace(configPath),
-		DashboardURL: strings.TrimSpace(dashboardURL),
+		DashboardURL: fleetProjectScopedPath(trimmedName),
 		cfg:          cfg,
 	}
+}
+
+// fleetProjectScopedPath returns the SPA route that zooms in on a project on
+// the unified Mission Control aggregator (`/project/<name>`). Per-project
+// dashboard ports were retired in #516; this is the canonical address.
+func fleetProjectScopedPath(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return "/project/" + url.PathEscape(name)
 }
 
 // FleetFile is the YAML shape accepted by maestro serve --fleet.
@@ -120,6 +144,11 @@ func LoadFleetProjects(path string) ([]FleetProject, error) {
 			project.Name = defaultFleetProjectName(cfg.Repo)
 		}
 		project.Name = strings.TrimSpace(project.Name)
+		if legacy := strings.TrimSpace(project.DashboardURL); legacy != "" {
+			log.Printf("[fleet] project %q: dashboard_url %q in %s is deprecated and ignored — the project is reachable at the unified MC route %s (#516)",
+				project.Name, legacy, path, fleetProjectScopedPath(project.Name))
+		}
+		project.DashboardURL = fleetProjectScopedPath(project.Name)
 		key := strings.ToLower(project.Name)
 		if _, exists := seen[key]; exists {
 			return nil, fmt.Errorf("duplicate fleet project name %q", project.Name)

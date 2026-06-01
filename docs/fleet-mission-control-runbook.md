@@ -10,12 +10,13 @@ Reserve these services and ports on the workshop host:
 
 | Service | Default bind | Port | Purpose | Notes |
 |---|---:|---:|---|---|
-| Fleet Mission Control | `127.0.0.1` | `8787` | Primary dashboard and `/api/v1/fleet` aggregate API | Start with `maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only` |
-| Project Mission Control | `127.0.0.1` | `8788+` | Optional per-project dashboard and `/api/v1/state` API | Configure each project with a unique `server.port`; link it from `dashboard_url` in the fleet file |
+| Fleet Mission Control | `127.0.0.1` | `8787` | The single dashboard for the whole fleet, plus the `/api/v1/fleet` aggregate API and project-scoped routes (`/project/<name>`) | Start with `maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only` |
 | Project runner | none by default | none | Runs `maestro run --config ...` and owns workers, worktrees, PR handling, and merge/deploy loops | It only serves HTTP when that project config has `server.port` set |
 | Supervisor loop | none | none | Runs `maestro supervise --config ...` to record decisions, safe queue label mutations, and approval requests | Can be manual, timer-driven, or a user service |
 | Worker sessions | none | none | tmux sessions and log files created under each project's `state_dir` | Inspect through Mission Control, `maestro status`, or `maestro logs` |
 | OpenClaw relay | `127.0.0.1` | `18789` | Optional Telegram relay endpoint when `telegram.mode: openclaw` is used | Not required for Mission Control |
+
+> Per-project Mission Control ports (`8788+`) were retired in #516. Every project is now reachable through the fleet aggregator at `/project/<name>`. Old `maestro-<project>-web.service` user units can be stopped and disabled; their `server.port` settings in project YAMLs are honored only when a project runs its own single-tenant `maestro serve --config ...` outside the fleet.
 
 Mutating endpoints require app-level HTTP auth (#487). Configure `server.auth.token_env` in each project config (the fleet picks up the first project that sets it) and populate the named environment variable from your secret manager (Infisical, 1Password CLI, etc.) — never inline the token in YAML. When auth is configured, every `POST /api/v1/...` (`/actions`, `/approvals/.../{approve|reject}`, `/audit/log`, `/fleet/actions`) requires `Authorization: Bearer <token>` and returns `401` without it. Read-only GETs stay open. The LAN is no longer treated as trusted: do not skip the token, even on `127.0.0.1`, when other devices share the network.
 
@@ -25,11 +26,13 @@ Project config and fleet config have different jobs.
 
 | File | Loaded by | Owns | Does not own |
 |---|---|---|---|
-| `~/.maestro/maestro-<project>.yaml` | `maestro run`, `maestro supervise`, `maestro status`, `maestro logs`, single-project `maestro serve` | Repo, clone path, worktree path, state directory, session prefix, labels, supervisor policy, review gate, merge/deploy policy, optional project dashboard port | Other projects |
-| `~/.maestro/fleet.yaml` | `maestro serve --fleet` | Project display names, project config paths, optional dashboard links | Queue policy, labels, state directories, review gates, merge behavior |
+| `~/.maestro/maestro-<project>.yaml` | `maestro run`, `maestro supervise`, `maestro status`, `maestro logs`, single-project `maestro serve` | Repo, clone path, worktree path, state directory, session prefix, labels, supervisor policy, review gate, merge/deploy policy | Other projects |
+| `~/.maestro/fleet.yaml` | `maestro serve --fleet` | Project display names and project config paths | Queue policy, labels, state directories, review gates, merge behavior |
 | `.maestro/supervisor.yaml`, `.maestro/supervisor.yml`, or `.maestro/supervisor.md` | Loaded beside the project config or inside `local_path/.maestro` | Supervisor policy when the team wants policy beside the repo | Fleet membership |
 
-Fleet config paths may be absolute, `~/...`, or relative to the fleet YAML file. A fleet file should not duplicate project settings. If a project needs a different label, review gate, state directory, runner interval, or dashboard port, change that project's config and restart that project's runner.
+Fleet config paths may be absolute, `~/...`, or relative to the fleet YAML file. A fleet file should not duplicate project settings. If a project needs a different label, review gate, state directory, or runner interval, change that project's config and restart that project's runner.
+
+`dashboard_url` was historically used to link from the fleet card to a per-project dashboard on its own port. Those ports are retired (#516); the aggregator routes operators to `/project/<name>` instead. Any `dashboard_url` value still present in a fleet.yaml file is ignored and logged as deprecated on load.
 
 Minimal project config shape:
 
@@ -94,11 +97,11 @@ Minimal fleet config shape:
 projects:
   - name: project-a
     config: maestro-project-a.yaml
-    dashboard_url: http://127.0.0.1:8788
   - name: project-b
     config: maestro-project-b.yaml
-    dashboard_url: http://127.0.0.1:8789
 ```
+
+`dashboard_url:` is deprecated and silently ignored on load (#516). Every project is reachable at `/project/<name>` on the aggregator port.
 
 ## Operating Model
 
