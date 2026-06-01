@@ -78,6 +78,91 @@ func TestListNonDoneProjectItems_NilProjectField(t *testing.T) {
 	}
 }
 
+// parseNonDoneProjectItemsResponse must drop already-terminal items even when
+// the board's terminal column is "Completed" or "Closed" rather than "Done".
+// Without this, every finished item leaks back into reconcileProjectBoard and
+// generates one redundant Done sync per RunOnce cycle (regression from #405
+// review).
+func TestParseNonDoneProjectItemsResponse_FiltersTerminalOptionID(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"node": {
+				"items": {
+					"nodes": [
+						{"fieldValueByName": {"optionId": "opt-progress"}, "content": {"number": 10, "state": "OPEN"}},
+						{"fieldValueByName": {"optionId": "opt-completed"}, "content": {"number": 11, "state": "CLOSED"}},
+						{"fieldValueByName": null, "content": {"number": 12, "state": "OPEN"}},
+						{"fieldValueByName": {"optionId": "opt-progress"}, "content": null}
+					]
+				}
+			}
+		}
+	}`)
+
+	items, err := parseNonDoneProjectItemsResponse(body, "opt-completed")
+	if err != nil {
+		t.Fatalf("parseNonDoneProjectItemsResponse: %v", err)
+	}
+
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2 (terminal-column item must be filtered, dangling node skipped); got %+v", len(items), items)
+	}
+	if items[0].IssueNumber != 10 || !items[0].HasStatus || items[0].IssueClosed {
+		t.Fatalf("items[0] = %+v, want issue 10 open with status", items[0])
+	}
+	if items[1].IssueNumber != 12 || items[1].HasStatus || items[1].IssueClosed {
+		t.Fatalf("items[1] = %+v, want issue 12 open without status", items[1])
+	}
+}
+
+func TestParseNonDoneProjectItemsResponse_NoDoneOptionKeepsTerminalItems(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"node": {
+				"items": {
+					"nodes": [
+						{"fieldValueByName": {"optionId": "opt-closed"}, "content": {"number": 7, "state": "CLOSED"}}
+					]
+				}
+			}
+		}
+	}`)
+
+	items, err := parseNonDoneProjectItemsResponse(body, "")
+	if err != nil {
+		t.Fatalf("parseNonDoneProjectItemsResponse: %v", err)
+	}
+	if len(items) != 1 || items[0].IssueNumber != 7 || !items[0].IssueClosed {
+		t.Fatalf("items = %+v, want one closed item when terminal optionID is empty", items)
+	}
+}
+
+func TestParseNonDoneProjectItemsResponse_GraphQLErrors(t *testing.T) {
+	body := []byte(`{"errors":[{"message":"boom"}]}`)
+	if _, err := parseNonDoneProjectItemsResponse(body, ""); err == nil {
+		t.Fatal("parseNonDoneProjectItemsResponse should surface graphql errors")
+	}
+}
+
+// ListNonDoneProjectItems must resolve the terminal-column option ID through
+// ProjectStatusCandidates so a board whose Done column is named "Completed"
+// or "Closed" still filters out finished items. The unit-test angle: ensure
+// every Done candidate normalizes to a recognized board column name in
+// resolveProjectStatusOption.
+func TestProjectStatusCandidatesDoneResolvesCommonTerminalColumns(t *testing.T) {
+	for _, columnName := range []string{"Done", "Completed", "Closed", "completed", "DONE"} {
+		pf := &ProjectField{
+			ProjectID: "p",
+			FieldID:   "f",
+			Options:   map[string]string{columnName: "opt-terminal"},
+		}
+		_, id, ok := resolveProjectStatusOption(pf, ProjectStatusCandidates(ProjectStatusDone))
+		if !ok || id != "opt-terminal" {
+			t.Fatalf("Done candidates failed to resolve board column %q (ok=%v, id=%q)", columnName, ok, id)
+		}
+	}
+}
+
 func TestGhTimeout_IsReasonable(t *testing.T) {
 	if ghTimeout < 5*time.Second {
 		t.Errorf("ghTimeout = %v, want >= 5s", ghTimeout)

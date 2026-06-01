@@ -31,20 +31,23 @@ const (
 // applying a high-level ProjectStatus to a real GitHub Project board. Boards
 // often customize column names (e.g. "Review" vs "In Review", "On Hold" vs
 // "Blocked"); the first option present in the board's Status field wins.
+// Comparison is case-insensitive and whitespace-tolerant inside
+// resolveProjectStatusOption, so this list only needs one entry per logical
+// column name.
 func ProjectStatusCandidates(status ProjectStatus) []string {
 	switch status {
 	case ProjectStatusTodo:
-		return []string{"Todo", "To do", "To Do", "Backlog"}
+		return []string{"Todo", "To do", "Backlog"}
 	case ProjectStatusInProgress:
-		return []string{"In Progress", "In progress", "Doing"}
+		return []string{"In Progress", "Doing"}
 	case ProjectStatusInReview:
-		return []string{"In Review", "In review", "Review", "Reviewing", "Code Review", "In Progress", "In progress"}
+		return []string{"In Review", "Review", "Reviewing", "Code Review", "In Progress"}
 	case ProjectStatusBlocked:
-		return []string{"Blocked", "On Hold", "On hold", "Stuck", "Needs Attention", "Needs attention"}
+		return []string{"Blocked", "On Hold", "Stuck", "Needs Attention"}
 	case ProjectStatusDeploying:
 		return []string{"Deploying", "Deploy", "Deployment"}
 	case ProjectStatusLiveVerify:
-		return []string{"Live Verification", "Live verification", "Verification", "Verifying", "QA"}
+		return []string{"Live Verification", "Verification", "Verifying", "QA"}
 	case ProjectStatusDone:
 		return []string{"Done", "Completed", "Closed"}
 	default:
@@ -152,12 +155,15 @@ type ProjectItem struct {
 
 // ListNonDoneProjectItems fetches all project items not in Done status
 // and returns their linked issue numbers along with whether they are closed.
+// "Done" is resolved against every candidate column name (Done/Completed/Closed)
+// so boards that label their terminal column differently still filter out
+// already-finished items instead of leaking them back into the reconciler.
 func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error) {
 	if pf == nil {
 		return nil, fmt.Errorf("nil ProjectField")
 	}
 
-	doneOptionID := pf.Options["Done"]
+	_, doneOptionID, _ := resolveProjectStatusOption(pf, ProjectStatusCandidates(ProjectStatusDone))
 
 	query := fmt.Sprintf(`{
   node(id: %q) {
@@ -190,7 +196,10 @@ func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error
 		}
 		return nil, fmt.Errorf("graphql project items: %w", err)
 	}
+	return parseNonDoneProjectItemsResponse(out, doneOptionID)
+}
 
+func parseNonDoneProjectItemsResponse(out []byte, doneOptionID string) ([]ProjectItem, error) {
 	var resp struct {
 		Data struct {
 			Node struct {
