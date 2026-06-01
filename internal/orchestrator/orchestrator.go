@@ -2471,11 +2471,86 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	// #443: issue-specific completion gates. Healthz alone is not enough to
+	// close UI/design work that requires live visual or deployment-status
+	// verification. When the configured gates match this issue (by label
+	// or body marker), hold the session in code_landed and move the
+	// Project item to Live Verification so an operator can drive the
+	// last-mile check instead of Maestro silently closing.
+	if o.completionGatesRequireLiveVerification(sess) {
+		o.holdForLiveVerification(sess, prNumber)
+		return
+	}
 	sess.Status = state.StatusDone
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
 	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 	o.closeVerifiedIssueIfAllowed(sess, prNumber)
+}
+
+// completionGatesRequireLiveVerification returns true when the supervisor
+// completion-gates config marks this issue as needing live verification
+// (by label or body marker). Falls back to false when no gates are
+// configured (legacy behaviour), or when the issue lookup fails — gate
+// failure must not silently force-close an issue, but a transient
+// GitHub read error should also not strand a session in code_landed
+// forever, so we surface the read error in the log and proceed with the
+// pre-#443 close path.
+func (o *Orchestrator) completionGatesRequireLiveVerification(sess *state.Session) bool {
+	if o == nil || o.cfg == nil || sess == nil || sess.IssueNumber <= 0 {
+		return false
+	}
+	gates := o.cfg.Supervisor.CompletionGates
+	if !gates.Active() {
+		return false
+	}
+	issue, err := o.getIssue(sess.IssueNumber)
+	if err != nil {
+		log.Printf("[orch] completion-gates lookup for issue #%d failed; falling back to legacy close path: %v", sess.IssueNumber, err)
+		return false
+	}
+	labels := make([]string, 0, len(issue.Labels))
+	for _, l := range issue.Labels {
+		labels = append(labels, l.Name)
+	}
+	return gates.IssueRequiresLiveVerification(labels, issue.Body)
+}
+
+// holdForLiveVerification keeps sess in code_landed when the completion
+// gates require live verification, syncs the Project board to the live-
+// verification column, and emits an operator-visible notification so the
+// last-mile check is not invisible. Idempotent: repeated calls do not
+// re-notify (we only sync the board if the session is still in
+// code_landed; the operator can flip to done manually once verified).
+func (o *Orchestrator) holdForLiveVerification(sess *state.Session, prNumber int) {
+	if sess == nil {
+		return
+	}
+	if prNumber > 0 {
+		sess.PRNumber = prNumber
+	}
+	if sess.Status != state.StatusCodeLanded {
+		sess.Status = state.StatusCodeLanded
+	}
+	// Idempotent (#570): reconcileCodeLandedSessions re-enters this on every
+	// tick while the gate holds, so the board sync + operator notification
+	// must fire only once. Without this guard an issue held for an hour at a
+	// 30s reconcile interval emits ~120 duplicate notifications. The status
+	// correction above stays unconditional (drift repair); the side effects
+	// below are one-shot.
+	if sess.LiveVerificationNotified {
+		return
+	}
+	o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
+	log.Printf("[orch] issue #%d passed healthz but completion gates require live verification; holding in code_landed", sess.IssueNumber)
+	if o.notifier != nil {
+		if prNumber > 0 {
+			o.notifier.Sendf("⏸ maestro: PR #%d merged for issue #%d, but completion gates require live verification; issue not closed", prNumber, sess.IssueNumber)
+		} else {
+			o.notifier.Sendf("⏸ maestro: issue #%d completion gates require live verification; not closing on healthz alone", sess.IssueNumber)
+		}
+	}
+	sess.LiveVerificationNotified = true
 }
 
 func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
