@@ -73,9 +73,6 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
             {p.repo && (
               <a className="tb-btn ghost" href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer">Open in GitHub →</a>
             )}
-            {p.dashboardUrl && (
-              <a className="tb-btn ghost" href={p.dashboardUrl} target="_blank" rel="noreferrer">Project dashboard →</a>
-            )}
           </div>
         </div>
         <ProjectMiniHeartbeat tone={vtone} events={p.tapeEvents || []} />
@@ -804,11 +801,7 @@ export function SettingsScreen() {
                     <div className="dim mono" style={{ fontSize: 11 }}>{project.repo} · max {project.maxParallel || "—"} parallel</div>
                   </div>
                   <Pill tone={project.goal ? "ok" : "idle"} noDot>{project.goal ? "configured" : "unconfigured"}</Pill>
-                  {project.dashboardUrl ? (
-                    <a className="tb-btn ghost" href={project.dashboardUrl} target="_blank" rel="noreferrer">Open</a>
-                  ) : (
-                    <button className="tb-btn ghost" disabled>Edit</button>
-                  )}
+                  <button className="tb-btn ghost" disabled>Edit</button>
                 </div>
               ))}
             </div>

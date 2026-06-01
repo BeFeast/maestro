@@ -1434,3 +1434,47 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 		t.Fatalf("action endpoint = %s %s, want POST /api/v1/actions", action.Method, action.Endpoint)
 	}
 }
+
+func TestHandleStateProjectBlockedKeepsAttentionForOpenPR(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{Repo: "test/repo", MaxParallel: 1, StateDir: dir}
+	now := time.Now().UTC()
+	finished := now.Add(-2 * time.Minute)
+
+	st := state.NewState()
+	st.Sessions["slot-stuck"] = &state.Session{
+		IssueNumber: 77,
+		IssueTitle:  "Stuck PR issue",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    777,
+		Backend:     "claude",
+		StartedAt:   now.Add(-5 * time.Minute),
+		FinishedAt:  &finished,
+	}
+	// run-loop syncs the Project item to "Blocked" on retry exhaustion; the
+	// dashboard must NOT treat that as a dependency-block while a PR is open.
+	st.MarkProjectStatusSynced(77, "blocked", now)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save test state: %v", err)
+	}
+
+	srv := New(cfg, make(chan struct{}, 1))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.handleState(w, req)
+
+	var resp stateResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.All) != 1 {
+		t.Fatalf("all sessions = %d, want 1", len(resp.All))
+	}
+	worker := resp.All[0]
+	if !worker.NeedsAttention {
+		t.Fatalf("retry_exhausted session with open PR must keep NeedsAttention even when Project status is blocked (#566)")
+	}
+	if worker.DisplayStatus == "blocked" {
+		t.Fatalf("open-PR stuck session should not be displayed as dependency-blocked")
+	}
+}
