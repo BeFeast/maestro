@@ -91,6 +91,17 @@ func TestApprovalAction_MergePR_Enqueues202(t *testing.T) {
 	if got.Target == nil || got.Target.PR != 42 {
 		t.Fatalf("approval target = %+v, want PR=42", got.Target)
 	}
+	// #489: enqueued approvals must be stamped with cfg.Repo so the
+	// executor's cross-project guard can fence against future Executor
+	// pooling regressions (premortem failure mode #3).
+	if got.Repo != cfg.Repo {
+		t.Fatalf("approval.Repo = %q, want %q (HTTP enqueue must stamp cfg.Repo)", got.Repo, cfg.Repo)
+	}
+	// HTTP request omitted "project"; the dispatcher defaults Project to
+	// cfg.Repo so the stamp is never blank.
+	if got.Project == "" {
+		t.Fatalf("approval.Project = %q, want non-empty fallback", got.Project)
+	}
 	// state file should exist.
 	if _, err := filepath.Abs(filepath.Join(dir, "state.json")); err != nil {
 		t.Fatalf("state path: %v", err)
