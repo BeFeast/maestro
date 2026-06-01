@@ -355,6 +355,7 @@ func defaultAllowedActions() []string {
 		ActionLabelIssueReady,
 		ActionOpenChildIssue,
 		ActionPreflightFailed,
+		ActionUnblockIssue,
 	}
 }
 
@@ -396,6 +397,8 @@ func canonicalAction(action string) string {
 		return ActionOpenChildIssue
 	case ActionPreflightFailed:
 		return ActionPreflightFailed
+	case ActionUnblockIssue, "unblock", "remove_blocked_label_and_label_ready":
+		return ActionUnblockIssue
 	case ActionMergePR:
 		return ActionMergePR
 	case config.SupervisorActionCloseIssue:

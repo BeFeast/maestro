@@ -195,3 +195,112 @@ supervisor:
 
 See also: [`ux-redesign-addendum-2026-05-25.md`](./ux-redesign-addendum-2026-05-25.md)
 for the Scribe redesign incident timeline that motivated this design.
+
+## Dependency-based dynamic waves (#442)
+
+A handoff epic that opens its wave of child issues up front (rather than
+one-at-a-time via the planner) needs a way for the supervisor to keep the
+board moving without an external cron. The dependency-unblock controller
+solves this:
+
+1. Every child issue in the wave is created with the configured `blocked`
+   label and a parseable dependency reference in its body.
+2. The supervisor scans blocked wave members each cycle, parses the
+   dependency references, and unblocks issues whose dependencies are all
+   complete (issue closed or linked PR merged).
+3. When `github_projects.enabled` is true, the supervisor enrolls every
+   blocked wave member onto the configured GitHub Project so operators can
+   see the upcoming wave before any item goes runnable.
+
+### Dependency reference shapes the supervisor understands
+
+```markdown
+Depends on: #147
+```
+
+```markdown
+Depends on: #148, #149
+```
+
+```markdown
+## Dependencies
+
+- #147 — design export landed
+- #148 — UX wave 1 issues filed
+```
+
+All three are recognised by `github.FindDependencies`. The structured
+section variant is preferred for wave epics because it survives template
+edits cleanly.
+
+### Config
+
+```yaml
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: blocked
+  safe_actions:
+    - add_ready_label
+    - remove_ready_label
+    - remove_blocked_label
+    - add_issue_comment
+    - merge_pr
+    - close_issue
+  dynamic_wave:
+    enabled: true
+    owns_ready_label: false
+    runnable_project_statuses: [Todo, To Do, Ready, Backlog, New]
+    dependency_unblock:
+      enabled: true             # opt-in; default false
+      max_runnable: 5           # cap concurrent runnable wave members
+      enroll_in_project: true   # default true when projects are configured
+      announce_with_comment: true  # default true; comment lists dep evidence
+
+github_projects:
+  enabled: true
+  project_number: 6
+```
+
+### What the supervisor does each cycle
+
+1. List open issues.
+2. Pick out the ones carrying the configured `blocked_label` — those are
+   the blocked wave members. They are evaluated separately from runnable
+   pickup, so they never appear as worker candidates.
+3. If GitHub Projects is enabled, ensure every blocked wave member is on
+   the configured Project board (best-effort; subprocess errors are
+   logged, not raised).
+4. For each blocked member, parse its body for dependencies. Skip the
+   member if no parseable dependency reference exists.
+5. Resolve dependencies: every dependency must either be closed or have a
+   merged linked PR. If any dependency is still open, the member stays
+   blocked this cycle.
+6. When the runnable cap (`max_runnable`) is already met, skip further
+   unblocks for this cycle.
+7. When a member is ready to unblock, recommend `unblock_issue` with three
+   mutations: `remove_blocked_label`, `add_ready_label`, and an
+   `add_issue_comment` whose body lists the dependency evidence (e.g.
+   `- #147 closed`, `- #149 PR merged`).
+8. Mutations are idempotent: if supervisor state already records a
+   succeeded mutation for the same issue/label, no duplicate is planned.
+
+### Why the supervisor (and not the worker)
+
+The implementing worker prompt stops after PR creation by design — the
+worker is scoped to a single slice. Continuation across the wave belongs
+to the supervisor:
+
+- The supervisor sees every issue and PR in the repo, including the
+  blocked wave's dependency PRs.
+- Cron-based unblockers (the temporary `scribe-redesign-handoff-unblocker`
+  used during the Scribe redesign) duplicate this loop with weaker
+  guarantees: no idempotency against supervisor state, no project
+  enrollment, no max-runnable cap.
+- The supervisor's safe-actions policy is the single audit trail for
+  label changes; routing the same change through an external cron splits
+  the evidence between two systems.
+
+If your repo previously ran an external cron for this purpose, you can
+retire it once `supervisor.dynamic_wave.dependency_unblock.enabled` is
+true and `safe_actions` grants `remove_blocked_label`, `add_ready_label`,
+and `add_issue_comment`.

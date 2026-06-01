@@ -156,6 +156,7 @@ type Engine struct {
 	stat      func(name string) (os.FileInfo, error)
 	lookPath  func(file string) (string, error)
 	preflight PreflightRunner
+	enroller  ProjectEnroller
 }
 
 func NewEngine(cfg *config.Config, reader Reader) *Engine {
@@ -171,10 +172,23 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 		lookPath:  exec.LookPath,
 		preflight: defaultPreflightRunner,
 	}
+	if enroller, ok := reader.(ProjectEnroller); ok {
+		eng.enroller = enroller
+	}
 	if cfg != nil && cfg.Supervisor.Enabled {
 		eng.llm = NewBackendLLMClient(cfg)
 	}
 	return eng
+}
+
+// SetProjectEnroller injects a custom ProjectEnroller (e.g. wired against a
+// real github.Client + ProjectField). Production callers use this; tests use
+// the fakeReader directly.
+func (e *Engine) SetProjectEnroller(enroller ProjectEnroller) {
+	if e == nil {
+		return
+	}
+	e.enroller = enroller
 }
 
 // defaultPreflightRunner shells out to `bash -c <command>` and returns
@@ -656,6 +670,16 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		decision.QueueAnalysis = analysis
 		decision.StuckStates = stuckStates
 		return decision
+	}
+
+	// Dependency-unblock controller (#442): when an issue carries the blocked
+	// label, parse its dependency references and (when every dependency has
+	// closed or its linked PR merged) recommend removing the blocked label
+	// and adding the ready label so the next wave can pick it up. This runs
+	// BEFORE the candidate dispatch so an issue that just became ready does
+	// not have to wait an extra cycle.
+	if unblock := e.evaluateDependencyUnblock(st, issues, baseReasons, projectState, now, cache); unblock != nil {
+		return withAnalysis(*unblock), nil
 	}
 
 	if len(candidates) == 0 {
@@ -3022,7 +3046,7 @@ func applyQueueAction(cfg *config.Config, decision *state.SupervisorDecision, mu
 		completed = append(completed, completedMutationPhrase(mutation))
 	}
 
-	if cfg.Supervisor.QueueComments && safeActionAllowed(cfg, config.SupervisorActionAddIssueComment) && len(completed) > 0 && decision.Target != nil && decision.Target.Issue > 0 {
+	if cfg.Supervisor.QueueComments && safeActionAllowed(cfg, config.SupervisorActionAddIssueComment) && len(completed) > 0 && decision.Target != nil && decision.Target.Issue > 0 && !decisionAlreadyComments(decision, decision.Target.Issue) {
 		comment := state.SupervisorMutation{
 			Type:   MutationIssueComment,
 			Issue:  decision.Target.Issue,
@@ -3038,6 +3062,22 @@ func applyQueueAction(cfg *config.Config, decision *state.SupervisorDecision, mu
 	}
 }
 
+// decisionAlreadyComments reports whether the decision's mutations already
+// include an issue comment for the given issue. Used so applyQueueAction does
+// not stamp an extra "Maestro queue action" comment when the original
+// decision (e.g. dependency-unblock) carried its own evidence comment.
+func decisionAlreadyComments(decision *state.SupervisorDecision, issueNumber int) bool {
+	if decision == nil {
+		return false
+	}
+	for _, m := range decision.Mutations {
+		if m.Type == MutationIssueComment && m.Issue == issueNumber {
+			return true
+		}
+	}
+	return false
+}
+
 func applyQueueMutation(mutator Mutator, mutation state.SupervisorMutation) error {
 	switch mutation.Type {
 	case MutationAddReadyLabel:
@@ -3046,6 +3086,12 @@ func applyQueueMutation(mutator Mutator, mutation state.SupervisorMutation) erro
 		return mutator.RemoveIssueLabel(mutation.Issue, mutation.Label)
 	case MutationRemoveBlockedLabel:
 		return mutator.RemoveIssueLabel(mutation.Issue, mutation.Label)
+	case MutationIssueComment:
+		body := strings.TrimSpace(mutation.Body)
+		if body == "" {
+			return fmt.Errorf("issue comment mutation requires a non-empty body")
+		}
+		return mutator.CommentIssue(mutation.Issue, body)
 	default:
 		return fmt.Errorf("unsupported queue mutation %q", mutation.Type)
 	}
