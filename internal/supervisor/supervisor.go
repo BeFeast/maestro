@@ -1955,7 +1955,19 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			}
 		}
 		switch stuck.Code {
-		case "failing_checks", "greptile_not_approved", "stale_review_feedback":
+		case "failing_checks", "greptile_not_approved":
+			return true
+		case "stale_review_feedback":
+			// Review feedback from a PREVIOUS attempt does not mean the
+			// current PR is broken. If the PR is now merge-ready (not draft,
+			// mergeable, CI green, review gate passed), the feedback was
+			// already addressed — fall through to the merge_pr rule (#512)
+			// instead of looping on spawn_repair_worker, which the executor
+			// refuses (not in the action registry) and wedges a green PR
+			// forever.
+			if ready, _ := e.openPRReadyToMerge(slot, sess, pr); ready {
+				return false
+			}
 			return true
 		case "retry_exhausted_open_pr":
 			return stuck.Severity == SeverityBlocked
