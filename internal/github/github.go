@@ -1108,6 +1108,130 @@ func (c *Client) HasOpenPRForIssue(issueNumber int) (bool, error) {
 	return false, nil
 }
 
+// dependencyInlinePattern matches `Depends on: #147` or
+// `Depends on: #148, #149` (case-insensitive, tolerant of leading/trailing
+// whitespace and trailing punctuation). Used by FindDependencies alongside a
+// scan of a structured `## Dependencies` section to extract every issue the
+// blocked wave member is waiting on.
+//
+// Kept narrow on purpose: handoff issue templates write "Depends on:" and
+// occasionally "Depends:". We don't pretend to understand free-form English.
+var dependencyInlinePattern = regexp.MustCompile(`(?im)^\s*depends(?:\s+on)?\s*[:\-]\s*([^\r\n]+)$`)
+
+// dependencyIssueNumber matches a `#147` reference inside a parsed dependency
+// line or section. Reused for both inline and structured forms.
+var dependencyIssueNumber = regexp.MustCompile(`#(\d+)`)
+
+// FindDependencies scans an issue body for dependency references in two
+// supported shapes (see issue #442):
+//
+//   - inline: `Depends on: #147` or `Depends on: #148, #149`
+//   - structured section: a `## Dependencies` (or `### Dependencies`) heading
+//     followed by lines containing `#NNN` issue references.
+//
+// Returns deduplicated issue numbers in the order they first appear. Returns
+// nil for the zero body. The function is intentionally tolerant of common
+// shapes (`Depends:` without `on`, mixed case, trailing punctuation) but does
+// not invent dependencies — only explicit `#N` references count.
+func FindDependencies(body string) []int {
+	if strings.TrimSpace(body) == "" {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	var deps []int
+	add := func(n int) {
+		if n <= 0 {
+			return
+		}
+		if _, ok := seen[n]; ok {
+			return
+		}
+		seen[n] = struct{}{}
+		deps = append(deps, n)
+	}
+
+	// Inline `Depends on:` lines.
+	for _, match := range dependencyInlinePattern.FindAllStringSubmatch(body, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		for _, ref := range dependencyIssueNumber.FindAllStringSubmatch(match[1], -1) {
+			if len(ref) < 2 {
+				continue
+			}
+			n, err := strconv.Atoi(ref[1])
+			if err != nil {
+				continue
+			}
+			add(n)
+		}
+	}
+
+	// Structured `## Dependencies` / `### Dependencies` section. A section ends
+	// at the next markdown heading at the same-or-shallower level, or EOF.
+	for _, section := range extractDependenciesSections(body) {
+		for _, ref := range dependencyIssueNumber.FindAllStringSubmatch(section, -1) {
+			if len(ref) < 2 {
+				continue
+			}
+			n, err := strconv.Atoi(ref[1])
+			if err != nil {
+				continue
+			}
+			add(n)
+		}
+	}
+
+	return deps
+}
+
+// extractDependenciesSections returns the markdown body of every
+// "Dependencies" section in the given body. A section spans from a heading
+// line whose text equals "Dependencies" (case-insensitive, ignoring trailing
+// punctuation) until the next heading of equal-or-shallower depth, or end of
+// file.
+func extractDependenciesSections(body string) []string {
+	lines := strings.Split(body, "\n")
+	var sections []string
+	for i := 0; i < len(lines); i++ {
+		level, heading, ok := headingLevelAndText(lines[i])
+		if !ok || !strings.EqualFold(heading, "dependencies") {
+			continue
+		}
+		end := len(lines)
+		for j := i + 1; j < len(lines); j++ {
+			otherLevel, _, otherOK := headingLevelAndText(lines[j])
+			if otherOK && otherLevel <= level {
+				end = j
+				break
+			}
+		}
+		sections = append(sections, strings.Join(lines[i+1:end], "\n"))
+		i = end - 1
+	}
+	return sections
+}
+
+// headingLevelAndText returns the heading depth (1 for `#`, 2 for `##`, ...)
+// and trimmed text when line is a markdown ATX heading. Trailing colons and
+// whitespace are removed so "## Dependencies:" matches "Dependencies".
+func headingLevelAndText(line string) (int, string, bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(trimmed, "#") {
+		return 0, "", false
+	}
+	level := 0
+	for level < len(trimmed) && trimmed[level] == '#' {
+		level++
+	}
+	if level == 0 || level >= len(trimmed) || (trimmed[level] != ' ' && trimmed[level] != '\t') {
+		return 0, "", false
+	}
+	text := strings.TrimSpace(trimmed[level:])
+	text = strings.TrimRight(text, " \t:")
+	return level, text, true
+}
+
 // FindBlockers scans an issue body for blocker references matching the given
 // regex patterns. Each pattern must contain a capture group for the issue number.
 // Returns deduplicated issue numbers referenced as blockers.

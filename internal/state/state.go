@@ -596,6 +596,7 @@ type SupervisorMutation struct {
 	Type       string `json:"type"`
 	Issue      int    `json:"issue,omitempty"`
 	Label      string `json:"label,omitempty"`
+	Body       string `json:"body,omitempty"`
 	Status     string `json:"status"`
 	ErrorClass string `json:"error_class,omitempty"`
 }

@@ -205,6 +205,84 @@ supervisor:
 	}
 }
 
+func TestParse_SupervisorDependencyUnblock(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: blocked
+  dynamic_wave:
+    enabled: true
+    dependency_unblock:
+      enabled: true
+      max_runnable: 4
+      enroll_in_project: false
+      announce_with_comment: false
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	u := cfg.Supervisor.DynamicWave.DependencyUnblock
+	if !u.Active() {
+		t.Fatal("DependencyUnblock should be active")
+	}
+	if u.MaxRunnable != 4 {
+		t.Fatalf("MaxRunnable = %d, want 4", u.MaxRunnable)
+	}
+	if u.EnrollInProjectEnabled() {
+		t.Fatal("EnrollInProjectEnabled() should be false when explicitly disabled")
+	}
+	if u.AnnounceWithCommentEnabled() {
+		t.Fatal("AnnounceWithCommentEnabled() should be false when explicitly disabled")
+	}
+}
+
+func TestParse_SupervisorDependencyUnblockDefaults(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: blocked
+  dynamic_wave:
+    enabled: true
+    dependency_unblock:
+      enabled: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	u := cfg.Supervisor.DynamicWave.DependencyUnblock
+	if !u.Active() {
+		t.Fatal("DependencyUnblock should be active")
+	}
+	if !u.EnrollInProjectEnabled() {
+		t.Fatal("EnrollInProjectEnabled() should default to true")
+	}
+	if !u.AnnounceWithCommentEnabled() {
+		t.Fatal("AnnounceWithCommentEnabled() should default to true")
+	}
+}
+
+func TestParse_SupervisorDependencyUnblockDisabledByDefault(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: blocked
+  dynamic_wave:
+    enabled: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Supervisor.DynamicWave.DependencyUnblock.Active() {
+		t.Fatal("DependencyUnblock should require explicit opt-in")
+	}
+}
+
 func TestParse_OutcomeBrief(t *testing.T) {
 	yaml := `
 repo: owner/repo

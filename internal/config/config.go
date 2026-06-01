@@ -231,13 +231,60 @@ type SupervisorOrderedQueueConfig struct {
 // SupervisorDynamicWaveConfig enables policy-driven issue selection without a
 // fixed issue-number list.
 type SupervisorDynamicWaveConfig struct {
-	Enabled                 *bool    `yaml:"enabled" json:"enabled,omitempty"`
-	OwnsReadyLabel          bool     `yaml:"owns_ready_label" json:"owns_ready_label,omitempty"`
-	RunnableProjectStatuses []string `yaml:"runnable_project_statuses" json:"runnable_project_statuses,omitempty"`
+	Enabled                 *bool                             `yaml:"enabled" json:"enabled,omitempty"`
+	OwnsReadyLabel          bool                              `yaml:"owns_ready_label" json:"owns_ready_label,omitempty"`
+	RunnableProjectStatuses []string                          `yaml:"runnable_project_statuses" json:"runnable_project_statuses,omitempty"`
+	DependencyUnblock       SupervisorDependencyUnblockConfig `yaml:"dependency_unblock" json:"dependency_unblock,omitempty"`
 }
 
 func (w SupervisorDynamicWaveConfig) Active() bool {
 	return w.Enabled != nil && *w.Enabled
+}
+
+// SupervisorDependencyUnblockConfig configures the dependency-based dynamic
+// wave controller. When enabled, the supervisor evaluates issues carrying the
+// configured blocked label, parses dependency references from their body, and
+// unblocks them (remove blocked label, add ready label, leave evidence
+// comment) once every dependency is closed/merged. It also enrolls those
+// blocked issues into the configured GitHub Project so wave members are
+// visible before they go runnable.
+//
+// Default is disabled. The Scribe redesign handoff used an external cron
+// (`scribe-redesign-handoff-unblocker`) as a workaround; this config lets
+// supervisor own that handoff dev role directly. See issue #442.
+type SupervisorDependencyUnblockConfig struct {
+	Enabled             *bool `yaml:"enabled" json:"enabled,omitempty"`
+	MaxRunnable         int   `yaml:"max_runnable" json:"max_runnable,omitempty"`
+	EnrollInProject     *bool `yaml:"enroll_in_project" json:"enroll_in_project,omitempty"`
+	AnnounceWithComment *bool `yaml:"announce_with_comment" json:"announce_with_comment,omitempty"`
+}
+
+// Active reports whether the dependency-unblock controller should run. Disabled
+// by default so existing projects without the explicit opt-in stay unchanged.
+func (d SupervisorDependencyUnblockConfig) Active() bool {
+	return d.Enabled != nil && *d.Enabled
+}
+
+// EnrollInProjectEnabled reports whether blocked wave members should be
+// enrolled into the configured GitHub Project. Default true when the
+// dependency-unblock controller is active.
+func (d SupervisorDependencyUnblockConfig) EnrollInProjectEnabled() bool {
+	if d.EnrollInProject == nil {
+		return true
+	}
+	return *d.EnrollInProject
+}
+
+// AnnounceWithCommentEnabled reports whether every automatic unblock should
+// leave an issue comment with dependency evidence. Default true so operators
+// always have an audit trail of why a wave opened. See acceptance criterion
+// "Every automatic unblock leaves a GitHub comment describing dependency
+// evidence."
+func (d SupervisorDependencyUnblockConfig) AnnounceWithCommentEnabled() bool {
+	if d.AnnounceWithComment == nil {
+		return true
+	}
+	return *d.AnnounceWithComment
 }
 
 func (q SupervisorOrderedQueueConfig) Active() bool {
