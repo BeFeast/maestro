@@ -623,6 +623,14 @@ func applyProjectStatusDisplay(infos []sessionInfo, st *state.State) {
 		if !projectBlockedOverridesWorkerStatus(infos[i].Status) {
 			continue
 		}
+		// #566: a terminal session that still has an open PR is a stuck PR
+		// needing operator attention, not an issue parked on a dependency.
+		// The run-loop syncs the Project item to "Blocked" on retry
+		// exhaustion, so without this guard a green-but-gate-blocked PR is
+		// hidden and the fleet verdict falsely reads "idle, healthy".
+		if infos[i].PRNumber > 0 {
+			continue
+		}
 		infos[i].DisplayStatus = "blocked"
 		infos[i].NeedsAttention = false
 		infos[i].Live = false
