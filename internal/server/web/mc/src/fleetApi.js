@@ -206,7 +206,8 @@ function projectSummaryLine(project) {
 }
 
 function mapWorker(worker) {
-  const status = worker.display_status || worker.status || "";
+  const taxonomy = workerStatusTaxonomy(worker);
+  const status = taxonomy.label;
   return {
     ...worker,
     project: worker.project_name || "",
@@ -215,16 +216,161 @@ function mapWorker(worker) {
       title: worker.issue_title || "",
       url: worker.issue_url || "",
     },
+    rawStatus: worker.status || "",
+    displayStatus: worker.display_status || "",
     status,
-    tone: workerTone(worker),
+    tone: taxonomy.tone,
+    section: taxonomy.section,
     age: parseTimestamp(worker.started_at) || Date.now(),
     summary: worker.next_action || worker.status_reason || status.replace(/_/g, " "),
     pr: worker.pr_number || null,
     branch: worker.branch || "",
     live: worker.live === true,
-    done: status === "done" || worker.status === "done",
-    stuckReason: worker.needs_attention ? worker.status_reason || worker.status : "",
+    done: worker.status === "done",
+    stuck: taxonomy.section === "stuck",
+    stuckReason: taxonomy.section === "stuck" ? worker.status_reason || status : "",
   };
+}
+
+// workerStatusTaxonomy is the single source of truth for how a worker's raw
+// `status` (and optional `display_status`) maps to a pill label, pill tone,
+// and the section it should render under in the Workers screen.
+//
+// Sections:
+//   - "running": actively in flight (running, queued, review_retry_*)
+//   - "recent":  not running but live in the last 24h (pr_open, code_landed,
+//                blocked-by-project, idle awaiting reconciliation)
+//   - "stuck":   needs operator attention (dead, failed, conflict_failed,
+//                retry_exhausted, backend_rate_limited)
+//   - "done":    `status === "done"` only — true completion
+//
+// Pill tones map to CSS classes in mc.css:
+//   ok=green, watch=amber, stuck=red, info=blue, policy=purple, idle=grey.
+//
+// Rules of thumb:
+//   - The pill colour follows the *real* SessionStatus, not the server-side
+//     project-blocked override. A `dead` worker must render red, never green.
+//   - "blocked" (grey) only applies when the underlying session is not stuck,
+//     i.e. the issue is genuinely waiting on a project-status block.
+//   - Tests should pin: a `dead` session never ends up in section "done".
+export function workerStatusTaxonomy(worker) {
+  const status = String(worker.status || "");
+  const display = String(worker.display_status || "");
+
+  if (display.startsWith("review_retry_")) {
+    return {
+      label: display.replace(/_/g, " "),
+      tone: display === "review_retry_recheck" ? "watch" : "info",
+      section: "running",
+    };
+  }
+
+  if (display === "backend_rate_limited") {
+    return { label: "rate limited", tone: "watch", section: "stuck" };
+  }
+
+  if (display === "blocked" && !isStuckStatus(status)) {
+    return { label: "blocked", tone: "idle", section: "recent" };
+  }
+
+  switch (status) {
+  case "running":
+    return { label: "running", tone: "info", section: "running" };
+  case "queued":
+    return { label: "queued", tone: "info", section: "running" };
+  case "pr_open":
+    return { label: "pr_open", tone: "policy", section: "recent" };
+  case "code_landed":
+    return { label: "code_landed", tone: "ok", section: "recent" };
+  case "done":
+    return { label: "done", tone: "ok", section: "done" };
+  case "failed":
+  case "conflict_failed":
+    return { label: status, tone: "stuck", section: "stuck" };
+  case "dead":
+    return { label: "dead", tone: "stuck", section: "stuck" };
+  case "retry_exhausted":
+    return { label: "retry_exhausted", tone: "watch", section: "stuck" };
+  default:
+    return { label: status || "—", tone: "idle", section: "recent" };
+  }
+}
+
+function isStuckStatus(status) {
+  return status === "dead"
+    || status === "failed"
+    || status === "conflict_failed"
+    || status === "retry_exhausted";
+}
+
+// workerNextAction returns the operator-facing copy and the buttons the SPA
+// should offer for a given worker, keyed off the real session status. This is
+// the UI side of issue #540: the «open log» / «retry» / «reset budget» /
+// «mark blocked» backend handlers may not all exist yet — buttons render with
+// an action key so the drawer can wire them up as endpoints land.
+export function workerNextAction(worker) {
+  const status = String(worker.rawStatus || worker.status || "");
+  const display = String(worker.displayStatus || worker.display_status || "");
+  const fallback = worker.next_action || worker.status_reason || "";
+
+  if (display === "backend_rate_limited") {
+    const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
+    const resetAt = worker.next_retry_at || worker.rate_limit_reset_at || "";
+    const tail = resetAt ? ` Auto-recovery at ${resetAt}.` : "";
+    return {
+      text: `Worker hit provider limit on ${backend}.${tail}`,
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    };
+  }
+
+  if (display === "blocked" && !isStuckStatus(status)) {
+    return {
+      text: fallback || "Issue is blocked in GitHub Project. Resolve the project-status block before starting new work.",
+      buttons: worker.issue_url ? [{ label: "Open issue →", href: worker.issue_url }] : [],
+    };
+  }
+
+  switch (status) {
+  case "dead":
+    return {
+      text: "Worker exited unexpectedly. Open log to see why.",
+      buttons: [{ label: "Open log →", action: "openLog" }],
+    };
+  case "failed":
+  case "conflict_failed":
+    return {
+      text: "Worker terminated with error. Retry or open log.",
+      buttons: [
+        { label: "Retry", action: "retry" },
+        { label: "Open log →", action: "openLog" },
+      ],
+    };
+  case "retry_exhausted":
+    return {
+      text: "Retry budget exhausted. Manual triage required.",
+      buttons: [
+        { label: "Reset budget", action: "resetBudget" },
+        { label: "Mark issue blocked", action: "markBlocked" },
+      ],
+    };
+  case "pr_open":
+    return {
+      text: fallback || "Waiting for CI, review, or the merge gate.",
+      buttons: worker.pr_url ? [{ label: "Open PR →", href: worker.pr_url }] : [],
+    };
+  case "code_landed":
+    return {
+      text: fallback || "PR merged. Runtime verification still required before closing the issue.",
+      buttons: worker.pr_url ? [{ label: "Open PR →", href: worker.pr_url }] : [],
+    };
+  case "done":
+    return {
+      text: fallback || worker.status_reason || "Issue complete.",
+      buttons: worker.pr_url ? [{ label: "Open PR →", href: worker.pr_url }] : [],
+    };
+  default:
+    return { text: fallback, buttons: [] };
+  }
 }
 
 function mapApproval(approval) {
@@ -257,14 +403,6 @@ function approvalTone(approval) {
   return "idle";
 }
 
-function workerTone(worker) {
-  if (worker.needs_attention || worker.status === "retry_exhausted" || worker.status === "failed") {
-    return "stuck";
-  }
-  if (worker.status === "pr_open" || worker.display_status === "pr_open") return "watch";
-  if (worker.live) return "ok";
-  return "idle";
-}
 
 export function mapVerdictUiTone(apiTone) {
   switch (String(apiTone || "").trim()) {
@@ -346,40 +484,54 @@ export function deriveTapeEvents(project, workers, now) {
 }
 
 export function workerSessionsFromFleet(fleet, now) {
-  // Three distinct concepts (issue #496):
-  //   - running  = `worker.status === "running"` — actually executing right now.
-  //   - recent   = `worker.live` (24-h activity window from the server).
-  //                Includes terminal sessions that finished in the last 24 h.
-  //   - today    = terminal worker that finished today.
-  //   - older    = terminal worker finished within the last 7 days but not today.
+  // Session-status taxonomy (issue #540):
+  //   - running = `rawStatus === "running"` — actually executing right now.
+  //   - recent  = live (24-h window from the server) AND not stuck. Includes
+  //               pr_open, code_landed, blocked-by-project, etc. so the
+  //               "in flight" group reflects active flow only.
+  //   - stuck   = any session whose taxonomy section is "stuck" (dead, failed,
+  //               conflict_failed, retry_exhausted, backend_rate_limited). Both
+  //               live and terminal stuck sessions land here — they never
+  //               hide under DONE.
+  //   - today   = `rawStatus === "done"` finished today (true completion).
+  //   - older   = terminal finished within the 7-day audit window but not today.
   //
-  // The "N workers in flight" hero MUST read `running`, not `recent`.
-  // `live` is kept as an alias of `recent` for backward compatibility
-  // with older callers / future-removed; new code should use `running`
-  // or `recent` explicitly.
+  // stuckToday / doneToday counters surface in the rollups so an operator can
+  // tell "2 completed today" apart from "2 stuck today".
   const running = [];
   const recent = [];
-  const today = [];
+  const stuck = [];
+  const done = [];
   const startOfDay = new Date(now);
   startOfDay.setHours(0, 0, 0, 0);
   const dayStart = startOfDay.getTime();
-  // Real 7-day cutoff: today + the previous 6 days. olderCount counts
-  // only sessions finished within that window but before today (#473).
   const sevenDayCutoff = dayStart - 6 * 24 * 60 * 60 * 1000;
   let olderCount = 0;
+  let stuckToday = 0;
 
   for (const worker of fleet.workers || []) {
-    if (worker.status === "running") {
+    const section = worker.section || workerStatusTaxonomy(worker).section;
+    const finished = parseTimestamp(worker.finished_at) || worker.age;
+    const rawStatus = worker.rawStatus || worker.status || "";
+
+    if (rawStatus === "running") {
       running.push(worker);
     }
+
+    if (section === "stuck") {
+      stuck.push(worker);
+      if (finished && finished >= dayStart) stuckToday += 1;
+      continue;
+    }
+
     if (worker.live) {
       recent.push(worker);
       continue;
     }
-    const finished = parseTimestamp(worker.finished_at) || worker.age;
+
     if (!finished) continue;
-    if (finished >= dayStart) {
-      today.push(worker);
+    if (rawStatus === "done" && finished >= dayStart) {
+      done.push(worker);
     } else if (finished >= sevenDayCutoff) {
       olderCount += 1;
     }
@@ -392,8 +544,11 @@ export function workerSessionsFromFleet(fleet, now) {
     recentCount: recent.length,
     // Backward-compat alias: `live` === `recent`.
     live: recent,
-    today,
-    todayCount: today.length,
+    today: done,
+    todayCount: done.length,
+    stuck,
+    stuckCount: stuck.length,
+    stuckToday,
     olderCount,
   };
 }
