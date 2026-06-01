@@ -147,8 +147,44 @@ function mapProject(project, workers, now) {
     state: mapProjectState(project),
     summaryLine: projectSummaryLine(project),
     tapeEvents: deriveTapeEvents(project, workers, now),
+    projectBoard: mapProjectBoard(project.project_board),
     raw: project,
   };
+}
+
+// mapProjectBoard normalizes the optional /api/v1/fleet `project_board` payload
+// for the SPA. Returns null when the project has no GitHub Project board
+// surfaced — callers use that as a "hide widget" signal.
+export function mapProjectBoard(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const columns = Array.isArray(raw.columns)
+    ? raw.columns.map(c => ({
+      name: String(c?.name || ""),
+      optionId: String(c?.option_id || ""),
+      count: Number(c?.count || 0),
+    }))
+    : [];
+  return {
+    number: Number(raw.number || 0),
+    url: raw.url || "",
+    owner: raw.owner || "",
+    ownerType: raw.owner_type || "",
+    columns,
+    totalItems: Number(raw.total_items || 0),
+    fetchedAt: raw.fetched_at || "",
+    error: raw.error || "",
+  };
+}
+
+// projectBoardIssueURL deep-links to the project board with a #N filter so
+// the corresponding card surfaces on click-through from a session card.
+// Returns "" when the board is not surfaced or the issue number is missing.
+export function projectBoardIssueURL(board, issueNumber) {
+  if (!board || !board.url) return "";
+  const n = Number(issueNumber || 0);
+  if (n <= 0) return board.url;
+  const sep = board.url.includes("?") ? "&" : "?";
+  return `${board.url}${sep}pane=info&filterQuery=${encodeURIComponent("#" + n)}`;
 }
 
 export function mapProjectState(project) {

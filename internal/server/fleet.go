@@ -50,6 +50,12 @@ type FleetProject struct {
 	// dispatcher when the project is not in read-only mode. nil disables
 	// safe actions for this project. Tests inject a fake via SetActionGH.
 	actionGH actionGitHubClient
+
+	// board is the GitHub Project board refresher state used by the
+	// /api/v1/fleet snapshot to surface the operator-glance WIP rollup
+	// (#529). nil disables board surfacing for the project. Wired by
+	// cmd/maestro via SetBoardClient when github_projects is enabled.
+	board *boardState
 }
 
 // SetActionGH wires the per-project GitHub client used by the safe-action
@@ -262,6 +268,10 @@ func (s *FleetServer) Start(ctx context.Context) error {
 		s.srv.Shutdown(shutdownCtx)
 	}()
 
+	// #529: kick the per-project GitHub Project board refreshers; they exit
+	// on ctx.Done(). No-op for projects without a configured board client.
+	s.startBoardRefreshers(ctx)
+
 	log.Printf("[fleet] listening on %s", addr)
 	if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("fleet server: %w", err)
@@ -418,7 +428,11 @@ type fleetProjectState struct {
 	Supervisor      supervisorInfo        `json:"supervisor"`
 	QueueSnapshot   *fleetQueueSnapshot   `json:"queue_snapshot,omitempty"`
 	Freshness       fleetProjectFreshness `json:"freshness"`
-	Error           string                `json:"error,omitempty"`
+	// ProjectBoard is the cached GitHub Project board snapshot (#529). nil
+	// when the project has no github_projects configuration, or while the
+	// background refresher has not yet produced its first result.
+	ProjectBoard *fleetProjectBoard `json:"project_board,omitempty"`
+	Error        string             `json:"error,omitempty"`
 }
 
 type fleetApprovalState struct {
@@ -1900,6 +1914,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Outcome = outcome.StatusFor(cfg.Outcome, 0, time.Time{})
 	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", item.Name)
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, nil, now)
+	item.ProjectBoard = project.snapshotBoard()
 
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {

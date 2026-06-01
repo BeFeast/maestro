@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	ghProjects "github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
@@ -3267,6 +3268,119 @@ func findFleetApproval(t *testing.T, approvals []fleetApprovalState, id string) 
 func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Session) {
 	t.Helper()
 	saveFleetTestSnapshot(t, dir, sessions, nil)
+}
+
+// TestFleetAPIIncludesProjectBoardSnapshot pins #529: when a fleet project
+// has its GitHub Project board client wired, the snapshot exposes a
+// project_board with the canonical URL and the per-column WIP counts the
+// MC SPA renders on the project drawer.
+func TestFleetAPIIncludesProjectBoardSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "one")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{})
+
+	project := NewFleetProject("Maestro", "/tmp/one.yaml", "", &config.Config{
+		Repo:        "befeast/maestro",
+		StateDir:    stateDir,
+		MaxParallel: 1,
+	})
+	// Pre-seed the board snapshot so the snapshot path does not need to
+	// touch the network; the refresher goroutine is started by
+	// FleetServer.Start in production.
+	project.board = &boardState{
+		client:        fakeFleetBoardClient{},
+		projectNumber: 5,
+		snapshot: &fleetProjectBoard{
+			Number:    5,
+			URL:       "https://github.com/orgs/befeast/projects/5",
+			Owner:     "befeast",
+			OwnerType: "Organization",
+			Columns: []ghProjects.ProjectBoardColumn{
+				{Name: "Todo", OptionID: "opt-todo", Count: 4},
+				{Name: "In Progress", OptionID: "opt-progress", Count: 2},
+				{Name: "Done", OptionID: "opt-done", Count: 11},
+			},
+			TotalItems: 17,
+			FetchedAt:  time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	projects := []FleetProject{project}
+	srv := NewFleet(projects, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Projects) != 1 {
+		t.Fatalf("projects len = %d, want 1", len(resp.Projects))
+	}
+	board := resp.Projects[0].ProjectBoard
+	if board == nil {
+		t.Fatalf("expected project_board on snapshot, got nil")
+	}
+	if board.URL != "https://github.com/orgs/befeast/projects/5" {
+		t.Errorf("board URL = %q", board.URL)
+	}
+	if board.Number != 5 {
+		t.Errorf("board number = %d, want 5", board.Number)
+	}
+	if board.TotalItems != 17 {
+		t.Errorf("board total = %d, want 17", board.TotalItems)
+	}
+	if len(board.Columns) != 3 {
+		t.Fatalf("board columns = %d, want 3", len(board.Columns))
+	}
+	if board.Columns[0].Name != "Todo" || board.Columns[0].Count != 4 {
+		t.Errorf("Todo column = %+v", board.Columns[0])
+	}
+	if board.Columns[1].Name != "In Progress" || board.Columns[1].Count != 2 {
+		t.Errorf("InProgress column = %+v", board.Columns[1])
+	}
+}
+
+// TestFleetAPIOmitsProjectBoardWhenUnconfigured pins that projects without
+// github_projects wiring keep the snapshot minimal — no empty board
+// placeholders that would mislead the SPA into rendering a widget.
+func TestFleetAPIOmitsProjectBoardWhenUnconfigured(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "one")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{})
+	projects := []FleetProject{
+		NewFleetProject("Maestro", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "befeast/maestro",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}
+	srv := NewFleet(projects, "127.0.0.1", 8786, true)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Projects[0].ProjectBoard != nil {
+		t.Fatalf("project_board should be nil when github_projects is unconfigured, got %+v", resp.Projects[0].ProjectBoard)
+	}
+}
+
+// fakeFleetBoardClient is a no-op stand-in for the GitHub board client used
+// when seeding cached snapshots directly in tests.
+type fakeFleetBoardClient struct{}
+
+func (fakeFleetBoardClient) DiscoverProject(int) (*ghProjects.ProjectField, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (fakeFleetBoardClient) ListProjectItemStatusCounts(*ghProjects.ProjectField) ([]ghProjects.ProjectBoardColumn, int, error) {
+	return nil, 0, errors.New("not implemented")
 }
 
 func saveFleetTestSnapshot(t *testing.T, dir string, sessions map[string]*state.Session, decisions []state.SupervisorDecision) {

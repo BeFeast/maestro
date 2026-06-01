@@ -845,7 +845,14 @@ func serveCmd(args []string) {
 			// per-project safe-action GH client here at the boundary.
 			for i := range projects {
 				if cfg := projects[i].Cfg(); cfg != nil {
-					projects[i].SetActionGH(github.New(cfg.Repo))
+					gh := github.New(cfg.Repo)
+					projects[i].SetActionGH(gh)
+					// #529: surface the GitHub Project board (WIP
+					// rollup + URL) in the fleet snapshot when the
+					// project enables github_projects.
+					if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber > 0 {
+						projects[i].SetBoardClient(gh, cfg.GitHubProjects.ProjectNumber)
+					}
 				}
 			}
 		} else {
@@ -919,7 +926,11 @@ func fleetProjectsFromConfigs(cfgs []*config.Config) []server.FleetProject {
 	projects := make([]server.FleetProject, 0, len(cfgs))
 	for _, cfg := range cfgs {
 		proj := server.NewFleetProject(defaultFleetProjectName(cfg.Repo), cfg.ResolvePath(), "", cfg)
-		proj.SetActionGH(github.New(cfg.Repo))
+		gh := github.New(cfg.Repo)
+		proj.SetActionGH(gh)
+		if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber > 0 {
+			proj.SetBoardClient(gh, cfg.GitHubProjects.ProjectNumber)
+		}
 		projects = append(projects, proj)
 	}
 	return projects
