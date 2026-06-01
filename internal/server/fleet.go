@@ -2961,7 +2961,11 @@ func renderFleetProjectRailRow(project fleetProjectState) string {
 		`<button type="button" class="project-rail-toggle" data-rail-toggle="` + html.EscapeString(detailID) + `" aria-expanded="false" aria-controls="` + html.EscapeString(detailID) + `" aria-label="Expand project detail">` +
 		`<span class="project-rail-toggle-caret" aria-hidden="true">&#9656;</span>` +
 		`</button></td>`
-	mainRow := `<tr class="` + html.EscapeString(rowClass) + `" aria-controls="` + html.EscapeString(detailID) + `">` +
+	needsAttention := "0"
+	if fleetProjectHasAttentionCTA(project) {
+		needsAttention = "1"
+	}
+	mainRow := `<tr class="` + html.EscapeString(rowClass) + `" data-project="` + html.EscapeString(project.Name) + `" data-needs-attention="` + needsAttention + `" aria-controls="` + html.EscapeString(detailID) + `">` +
 		toggleCell +
 		`<td class="project-rail-project">` + renderFleetProjectIdentity(project) + `</td>` +
 		`<td class="project-rail-state-cell">` + renderFleetProjectRailState(project) + `</td>` +
@@ -3093,7 +3097,11 @@ func renderFleetProjectRailState(project fleetProjectState) string {
 	}
 	parts := []string{
 		`<span class="pill ` + html.EscapeString(fleetProjectStatePillClass(project)) + `">` + html.EscapeString(label) + `</span>`,
-		`<div class="rail-subline" title="` + html.EscapeString(summary) + `">` + html.EscapeString(summary) + `</div>`,
+	}
+	if structured := renderFleetProjectRailStructured(project, summary); structured != "" {
+		parts = append(parts, structured)
+	} else {
+		parts = append(parts, `<div class="rail-subline" title="`+html.EscapeString(summary)+`">`+html.EscapeString(summary)+`</div>`)
 	}
 	if project.Error != "" {
 		parts = append(parts, `<div class="rail-alert" title="`+html.EscapeString(project.Error)+`">State error</div>`)
@@ -3102,6 +3110,42 @@ func renderFleetProjectRailState(project fleetProjectState) string {
 		parts = append(parts, `<div class="rail-warn">Stale snapshot</div>`)
 	}
 	return strings.Join(parts, "")
+}
+
+func renderFleetProjectRailStructured(project fleetProjectState, summary string) string {
+	op := project.OperatorState
+	issueNumber := op.IssueNumber
+	session := strings.TrimSpace(op.Session)
+	issueURL := strings.TrimSpace(op.IssueURL)
+	nextAction := strings.TrimSpace(op.NextAction)
+	if issueNumber == 0 && session == "" && nextAction == "" {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if issueNumber > 0 {
+		issueLabel := fmt.Sprintf("issue #%d", issueNumber)
+		if issueURL != "" {
+			parts = append(parts, `<a class="rail-structured-issue" href="`+html.EscapeString(issueURL)+`" target="_blank" rel="noreferrer">`+html.EscapeString(issueLabel)+`</a>`)
+		} else {
+			parts = append(parts, `<span class="rail-structured-issue">`+html.EscapeString(issueLabel)+`</span>`)
+		}
+	}
+	if session != "" {
+		parts = append(parts, `<button type="button" class="link-button rail-structured-session" data-project="`+html.EscapeString(project.Name)+`" data-slot="`+html.EscapeString(session)+`" title="Open session `+html.EscapeString(session)+`">`+html.EscapeString("("+session+")")+`</button>`)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	lead := strings.Join(parts, " ")
+	reason := nextAction
+	if reason == "" {
+		reason = summary
+	}
+	reasonHTML := ""
+	if reason != "" {
+		reasonHTML = ` · <span class="rail-structured-reason" title="` + html.EscapeString(reason) + `">` + html.EscapeString(reason) + `</span>`
+	}
+	return `<div class="rail-subline rail-structured" title="` + html.EscapeString(summary) + `">` + lead + reasonHTML + `</div>`
 }
 
 func renderFleetProjectRailQueue(project fleetProjectState) string {
@@ -3204,26 +3248,61 @@ func renderFleetProjectRailOutcome(project fleetProjectState) string {
 
 func renderFleetProjectRailFreshness(project fleetProjectState) string {
 	freshness := project.Freshness
-	age := strings.TrimSpace(freshness.SnapshotAge)
-	if age == "" {
-		age = "No snapshot yet"
-	} else {
-		age = "Snapshot " + age + " ago"
+	ageLabel := formatFleetFreshnessAge(freshness.SnapshotAge, freshness.SnapshotAgeSeconds)
+	text := "No snapshot yet"
+	if ageLabel != "" {
+		text = "Snapshot " + ageLabel + " ago"
 	}
-	details := make([]string, 0, 3)
-	if freshness.StateUpdatedAt != "" {
-		details = append(details, "State "+freshness.StateUpdatedAt)
+	tooltipParts := make([]string, 0, 3)
+	if strings.TrimSpace(freshness.SnapshotAt) != "" {
+		tooltipParts = append(tooltipParts, "Snapshot at "+freshness.SnapshotAt)
 	}
-	if freshness.LogUpdatedAt != "" {
-		details = append(details, "Logs "+freshness.LogUpdatedAt)
+	if strings.TrimSpace(freshness.Reason) != "" {
+		tooltipParts = append(tooltipParts, freshness.Reason)
 	}
-	if freshness.Reason != "" {
-		details = append(details, freshness.Reason)
+	tooltip := strings.Join(tooltipParts, " · ")
+	if tooltip == "" {
+		tooltip = text
 	}
-	return `<div class="rail-mainline" title="` + html.EscapeString(strings.Join(details, " · ")) + `">` + html.EscapeString(age) + `</div>`
+	return `<div class="rail-mainline" title="` + html.EscapeString(tooltip) + `">` + html.EscapeString(text) + `</div>`
+}
+
+func formatFleetFreshnessAge(rawAge string, ageSeconds int64) string {
+	if ageSeconds >= 3600 {
+		return formatClockDuration(ageSeconds)
+	}
+	if trimmed := strings.TrimSpace(rawAge); trimmed != "" {
+		return trimmed
+	}
+	if ageSeconds > 0 {
+		return fmt.Sprintf("%ds", ageSeconds)
+	}
+	return ""
+}
+
+func formatClockDuration(totalSeconds int64) string {
+	if totalSeconds < 0 {
+		totalSeconds = 0
+	}
+	h := totalSeconds / 3600
+	m := (totalSeconds % 3600) / 60
+	s := totalSeconds % 60
+	return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 }
 
 func renderFleetProjectRailLinks(project fleetProjectState) string {
+	if fleetProjectHasAttentionCTA(project) {
+		op := project.OperatorState
+		reason := strings.TrimSpace(op.NextAction)
+		if reason == "" {
+			reason = strings.TrimSpace(op.Summary)
+		}
+		if reason == "" {
+			reason = "Open the attention tab for this project."
+		}
+		label := fleetProjectAttentionCTALabel(project)
+		return `<button type="button" class="rail-cta rail-cta-attention project-attention-cta" data-project="` + html.EscapeString(project.Name) + `" title="` + html.EscapeString(reason) + `">` + html.EscapeString(label) + ` &rarr;</button>`
+	}
 	url := strings.TrimSpace(project.DashboardURL)
 	if url == "" {
 		url = fleetProjectGitHubURL(project.Repo)
@@ -3242,32 +3321,72 @@ func fleetProjectStateLabel(project fleetProjectState) string {
 	if fleetProjectUnconfigured(project) {
 		return "setup"
 	}
-	if label := strings.TrimSpace(project.OperatorState.Label); label != "" {
+	op := project.OperatorState
+	if (strings.TrimSpace(op.Kind) == "" || op.Kind == "idle") && op.Tone == "healthy" {
+		return "Idle · healthy"
+	}
+	if label := strings.TrimSpace(op.Label); label != "" {
 		return label
 	}
 	return "Idle"
+}
+
+func fleetProjectStateKindKey(project fleetProjectState) string {
+	op := project.OperatorState
+	key := strings.TrimSpace(op.Kind)
+	if key == "" {
+		key = "idle"
+	}
+	if key == "idle" && op.Tone == "healthy" {
+		key = "healthy_idle"
+	}
+	return key
 }
 
 func fleetProjectStatePillClass(project fleetProjectState) string {
 	if fleetProjectUnconfigured(project) {
 		return "rail-state-unconfigured"
 	}
-	key := strings.TrimSpace(project.OperatorState.Kind)
-	if key == "" {
-		key = "idle"
-	}
-	return "rail-state-" + fleetCSSClassToken(key)
+	return "rail-state-" + fleetCSSClassToken(fleetProjectStateKindKey(project))
 }
 
 func fleetProjectRailStateClass(project fleetProjectState) string {
 	if fleetProjectUnconfigured(project) {
 		return "project-row-unconfigured"
 	}
-	key := strings.TrimSpace(project.OperatorState.Kind)
-	if key == "" {
-		key = "idle"
+	return "project-row-" + fleetCSSClassToken(fleetProjectStateKindKey(project))
+}
+
+func fleetProjectHasAttentionCTA(project fleetProjectState) bool {
+	if fleetProjectUnconfigured(project) {
+		return false
 	}
-	return "project-row-" + fleetCSSClassToken(key)
+	if project.NeedsAttention > 0 {
+		return true
+	}
+	switch strings.TrimSpace(project.OperatorState.Kind) {
+	case "attention", "stale_worker", "dispatch_failure", "error":
+		return true
+	}
+	return false
+}
+
+func fleetProjectAttentionCTALabel(project fleetProjectState) string {
+	op := project.OperatorState
+	switch strings.TrimSpace(op.Kind) {
+	case "attention":
+		return "Open attention"
+	case "stale_worker":
+		return "Review stale worker"
+	case "dispatch_failure":
+		return "Resolve dispatch"
+	case "error":
+		return "Fix project error"
+	}
+	if label := strings.TrimSpace(op.Label); label != "" {
+		return "Open " + label
+	}
+	return "Open attention"
 }
 
 func fleetProjectUnconfigured(project fleetProjectState) bool {

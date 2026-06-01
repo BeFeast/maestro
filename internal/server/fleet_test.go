@@ -2302,6 +2302,128 @@ func TestFleetDashboardRendersUnconfiguredProjectAsSetupState(t *testing.T) {
 	}
 }
 
+func TestFleetDashboardProjectCardRendersStructuredAttentionBody(t *testing.T) {
+	project := fleetProjectState{
+		Name:           "maestro",
+		Repo:           "BeFeast/maestro",
+		DashboardURL:   "http://127.0.0.1:8787",
+		MaxParallel:    2,
+		NeedsAttention: 1,
+		OperatorState: fleetOperatorState{
+			Kind:        "attention",
+			Tone:        "attention",
+			Label:       "Needs attention",
+			Summary:     "Worker exited and is waiting for retry.",
+			NextAction:  "Run a Maestro reconciliation cycle or review the failed attempt.",
+			IssueNumber: 471,
+			IssueURL:    "https://github.com/BeFeast/maestro/issues/471",
+			Session:     "sup-84",
+		},
+		Outcome: outcome.Status{Configured: true, Goal: "Healthy", HealthState: outcome.HealthHealthy},
+	}
+	row := renderFleetProjectRailRow(project)
+	for _, want := range []string{
+		`data-needs-attention="1"`,
+		`rail-structured`,
+		`href="https://github.com/BeFeast/maestro/issues/471"`,
+		`issue #471`,
+		`rail-structured-session`,
+		`data-project="maestro"`,
+		`data-slot="sup-84"`,
+		`(sup-84)`,
+		`Run a Maestro reconciliation cycle`,
+		`rail-cta rail-cta-attention project-attention-cta`,
+		`Open attention &rarr;`,
+	} {
+		if !contains(row, want) {
+			t.Fatalf("attention rail row should contain %q, got:\n%s", want, row)
+		}
+	}
+}
+
+func TestFleetDashboardProjectCardRendersHealthyIdlePill(t *testing.T) {
+	project := fleetProjectState{
+		Name:          "healthy",
+		Repo:          "owner/healthy",
+		DashboardURL:  "http://127.0.0.1:8787",
+		MaxParallel:   1,
+		OperatorState: fleetOperatorState{Kind: "idle", Tone: "healthy", Label: "Healthy idle", Summary: "No open issues."},
+		Outcome:       outcome.Status{Configured: true, Goal: "Healthy", HealthState: outcome.HealthHealthy},
+	}
+	row := renderFleetProjectRailRow(project)
+	if !contains(row, `rail-state-healthy_idle`) {
+		t.Fatalf("healthy idle row should use rail-state-healthy_idle pill, got:\n%s", row)
+	}
+	if !contains(row, "Idle · healthy") {
+		t.Fatalf("healthy idle row should display 'Idle · healthy' label, got:\n%s", row)
+	}
+	if contains(row, "project-attention-cta") {
+		t.Fatalf("healthy idle row must not render attention CTA, got:\n%s", row)
+	}
+}
+
+func TestFleetDashboardProjectCardFreshnessShowsAbsoluteTooltipAndClockForLongAges(t *testing.T) {
+	project := fleetProjectState{
+		Name:          "longidle",
+		Repo:          "owner/longidle",
+		DashboardURL:  "http://127.0.0.1:8787",
+		MaxParallel:   1,
+		OperatorState: fleetOperatorState{Kind: "idle", Tone: "healthy", Label: "Healthy idle"},
+		Outcome:       outcome.Status{Configured: true, Goal: "Healthy", HealthState: outcome.HealthHealthy},
+		Freshness: fleetProjectFreshness{
+			SnapshotAt:         "2026-05-31T12:00:00Z",
+			SnapshotAge:        "2h0m0s",
+			SnapshotAgeSeconds: 7325,
+		},
+	}
+	row := renderFleetProjectRailFreshness(project)
+	if !contains(row, "2:02:05") {
+		t.Fatalf("freshness > 1h should render hh:mm:ss, got:\n%s", row)
+	}
+	if !contains(row, "Snapshot at 2026-05-31T12:00:00Z") {
+		t.Fatalf("freshness tooltip should include absolute snapshot timestamp, got:\n%s", row)
+	}
+
+	short := fleetProjectState{
+		Name:    "shortidle",
+		Outcome: outcome.Status{Configured: true},
+		Freshness: fleetProjectFreshness{
+			SnapshotAt:         "2026-05-31T12:00:00Z",
+			SnapshotAge:        "50s",
+			SnapshotAgeSeconds: 50,
+		},
+	}
+	shortRow := renderFleetProjectRailFreshness(short)
+	if !contains(shortRow, "50s") {
+		t.Fatalf("freshness < 1h should keep humanized age, got:\n%s", shortRow)
+	}
+	if contains(shortRow, ":50") {
+		t.Fatalf("freshness < 1h should not render hh:mm:ss form, got:\n%s", shortRow)
+	}
+	if !contains(shortRow, "Snapshot at 2026-05-31T12:00:00Z") {
+		t.Fatalf("short freshness tooltip should still include absolute snapshot timestamp, got:\n%s", shortRow)
+	}
+}
+
+func TestFleetDashboardProjectCardClickHandlerOpensAttentionScope(t *testing.T) {
+	js := legacyFleetJS(t)
+	for _, want := range []string{
+		`function openProjectAttentionDrawer(projectName)`,
+		`fleetState.filters.scope = "attention"`,
+		`row.dataset.needsAttention === "1"`,
+		`projectHasAttentionCTA`,
+		`projectStateStructuredHTML`,
+		`rail-structured-session`,
+		`function formatClockDuration(totalSeconds)`,
+		`"Snapshot at "`,
+		`Idle · healthy`,
+	} {
+		if !contains(js, want) {
+			t.Fatalf("fleet.js should expose %q for project card behavior", want)
+		}
+	}
+}
+
 func TestFleetDashboardProjectRailPlaceholdersAreNotReplacedFromProjectData(t *testing.T) {
 	snapshot := fleetResponse{
 		Projects: []fleetProjectState{{

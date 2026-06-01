@@ -495,12 +495,34 @@
     font-size: 13px;
     line-height: 1.45;
   }
-  .rail-state-working, .outcome-healthy { color: var(--ok); border-color: rgba(22,128,60,.5); background: rgba(22,128,60,.08); }
+  .rail-state-working, .outcome-healthy, .rail-state-healthy_idle { color: var(--ok); border-color: rgba(22,128,60,.5); background: rgba(22,128,60,.08); }
   .rail-state-monitoring_pr, .rail-state-pending_dispatch, .outcome-unknown { color: var(--accent); border-color: rgba(37,99,235,.45); background: rgba(37,99,235,.07); }
   .rail-state-attention, .rail-state-error, .rail-state-stale_worker, .rail-state-dispatch_failure, .rail-state-outcome_drift, .outcome-failing { color: var(--bad); border-color: rgba(220,38,38,.45); background: rgba(220,38,38,.07); }
   .rail-state-stale, .rail-state-queue_blocked, .rail-state-no_eligible_issues, .rail-state-outcome_missing { color: var(--warn); border-color: rgba(161,98,7,.45); background: rgba(161,98,7,.08); }
   .rail-state-unconfigured { color: var(--muted); border-color: rgba(100,116,139,.45); background: rgba(100,116,139,.08); }
   .rail-state-idle, .outcome-not_configured, .outcome-unmonitored { color: var(--muted); border-color: rgba(100,116,139,.45); background: rgba(100,116,139,.08); }
+  .rail-structured { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
+  .rail-structured-issue { font-weight: 650; color: var(--accent); text-decoration: none; }
+  .rail-structured-issue:hover { text-decoration: underline; }
+  .rail-structured-session { padding: 0; margin: 0; border: 0; background: none; color: var(--text-dim); font-weight: 600; font-size: inherit; cursor: pointer; }
+  .rail-structured-session:hover { color: var(--accent); text-decoration: underline; }
+  .rail-structured-reason { color: var(--text-dim); }
+  .rail-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 10px;
+    border: 1px solid var(--bad);
+    border-radius: 6px;
+    background: rgba(220,38,38,.06);
+    color: var(--bad);
+    font-size: 12px;
+    font-weight: 650;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .rail-cta:hover { background: rgba(220,38,38,.12); }
+  .rail-cta-attention:focus-visible { outline: 2px solid var(--bad); outline-offset: 2px; }
   .rail-setup-copy,
   .rail-setup-link,
   .setup-link { color: var(--muted); font-weight: 650; }
