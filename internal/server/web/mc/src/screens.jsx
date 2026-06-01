@@ -81,6 +81,43 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
         <ProjectMiniHeartbeat tone={vtone} events={p.tapeEvents || []} />
       </div>
 
+      {p.operatorState?.kind === "attention" && (p.operatorState.summary || p.operatorState.next_action) && (
+        <Panel title="Needs attention" sub={p.operatorState.session || undefined}>
+          <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+            <div style={{ fontSize: 14, color: "var(--fg-0)" }}>
+              {p.operatorState.issue_number ? (
+                <a href={p.operatorState.issue_url} target="_blank" rel="noreferrer">#{p.operatorState.issue_number}</a>
+              ) : null}
+              {p.operatorState.session ? (
+                <span className="mono dim">{p.operatorState.issue_number ? " · " : ""}{p.operatorState.session}</span>
+              ) : null}
+              {(p.operatorState.issue_number || p.operatorState.session) ? " — " : ""}
+              {p.operatorState.summary}
+            </div>
+            {p.operatorState.next_action && (
+              <div style={{ marginTop: 8, fontSize: 13, color: "var(--watch)" }}>
+                <strong style={{ color: "var(--fg-1)" }}>Next:</strong> {p.operatorState.next_action}
+              </div>
+            )}
+            <div className="hb-actions" style={{ marginTop: 12 }}>
+              {p.operatorState.session && (
+                <button
+                  className="tb-btn primary"
+                  onClick={() => navigate(`workers?project=${encodeURIComponent(p.slug)}&slot=${encodeURIComponent(p.operatorState.session)}`)}
+                >
+                  Open worker {p.operatorState.session} →
+                </button>
+              )}
+              {p.operatorState.issue_url && (
+                <a className="tb-btn ghost" href={p.operatorState.issue_url} target="_blank" rel="noreferrer">
+                  Open issue{p.operatorState.issue_number ? ` #${p.operatorState.issue_number}` : ""} →
+                </a>
+              )}
+            </div>
+          </div>
+        </Panel>
+      )}
+
       <div className="dash-grid mt-6">
         <Panel
           title="Workers"
