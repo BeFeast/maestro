@@ -520,6 +520,48 @@ func TestDecide_OpenPR_AllGreen_RecommendsMerge(t *testing.T) {
 	}
 }
 
+// Regression: a session whose PREVIOUS attempt was retried on review
+// feedback (PreviousAttemptFeedbackKind=review_feedback) used to wedge a
+// now-green PR forever — detectWorkerStuckStates raised
+// stale_review_feedback[blocked], openPRNeedsRepair short-circuited to
+// spawn_repair_worker, and the executor refuses that verb (not in the
+// registry). Once the feedback is addressed (PR green + mergeable), the
+// merge_pr rule (#512) must win.
+func TestDecide_StaleReviewFeedbackButGreenPRRecommendsMerge(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:          []github.PR{{Number: 548, HeadRefName: "feat/stale-review-green", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses:   map[int]string{548: "success"},
+		mergedPRs:    map[int]bool{548: false},
+		closedIssues: map[int]bool{532: false},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber:                 532,
+		IssueTitle:                  "project card actionable",
+		Status:                      state.StatusRetryExhausted,
+		Branch:                      "feat/stale-review-green",
+		PRNumber:                    548,
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		StartedAt:                   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMergePR {
+		t.Fatalf("action = %q, want %q (green mergeable PR with addressed review feedback must merge, not loop on spawn_repair_worker)", decision.RecommendedAction, ActionMergePR)
+	}
+	if decision.Risk != RiskMutating {
+		t.Fatalf("risk = %q, want %q", decision.Risk, RiskMutating)
+	}
+	if decision.Target == nil || decision.Target.PR != 548 {
+		t.Fatalf("target = %#v, want PR=548", decision.Target)
+	}
+}
+
 // #512: CI is still pending → planner stays on monitor_open_pr with a
 // summary that names the actual blocker, not the old aspirational text.
 func TestDecide_OpenPR_CIPending_StaysMonitor(t *testing.T) {
