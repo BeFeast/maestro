@@ -474,6 +474,18 @@ const (
 	StuckHandoffEpicNeedsChild  = "handoff_epic_needs_child"
 	StuckPreflightFailed        = "preflight_failed"
 	StuckIssueNeedsVerification = "issue_needs_verification"
+	// StuckPolicyBlocksMerge is emitted when an open PR is fully ready to
+	// merge (not draft, mergeable, CI green, review gate passed) but the
+	// project policy lists merge_pr (or close_issue) in approval_required.
+	// The supervisor still emits the merge_pr recommendation (which mints
+	// the approval), but the dashboard/CLI needs to see this code so it can
+	// show "operator approval required" instead of a passive "monitoring".
+	StuckPolicyBlocksMerge = "policy_blocks_merge"
+	// StuckPendingChecks is emitted when an open PR is being monitored
+	// because at least one gate (draft / mergeable / CI / review) has not
+	// yet cleared. Lets the dashboard render a specific "waiting on checks"
+	// state instead of conflating it with policy or repair gating.
+	StuckPendingChecks = "pending_checks"
 )
 
 // SupervisorIssueCandidate describes the issue selected by queue policy without

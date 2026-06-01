@@ -27,6 +27,7 @@ type fakeReader struct {
 	ciStatuses         map[int]string
 	greptileOK         map[int]bool
 	greptilePend       map[int]bool
+	mergeStates        map[int]string
 	rateLimit          *github.RateLimitStatus
 	rateLimitErr       error
 	rateLimitCalls     int
@@ -121,6 +122,17 @@ func (f *fakeReader) CommentIssue(issueNumber int, body string) error {
 
 func (f *fakeReader) PRCIStatus(prNumber int) (string, error) {
 	return f.ciStatuses[prNumber], nil
+}
+
+func (f *fakeReader) PRMergeStatus(prNumber int) (string, string, error) {
+	mergeable := ""
+	for _, pr := range f.prs {
+		if pr.Number == prNumber {
+			mergeable = pr.Mergeable
+			break
+		}
+	}
+	return mergeable, f.mergeStates[prNumber], nil
 }
 
 func (f *fakeReader) PRGreptileApproved(prNumber int) (bool, bool, error) {

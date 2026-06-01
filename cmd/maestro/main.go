@@ -314,7 +314,17 @@ func loadConfig(configPath string) *config.Config {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	logConfigWarnings(cfg)
 	return cfg
+}
+
+// logConfigWarnings emits any non-fatal configuration issues at WARN
+// level so an operator notices a hands-off project that has merge_pr in
+// approval_required (etc.) without grepping the daemon journal. #425.
+func logConfigWarnings(cfg *config.Config) {
+	for _, msg := range cfg.Warnings() {
+		log.Printf("warn: %s", msg)
+	}
 }
 
 // loadConfigs resolves multiple config paths, maestro.d/ directory, or default discovery.
@@ -326,6 +336,7 @@ func loadConfigs(paths []string) []*config.Config {
 			if err != nil {
 				log.Fatalf("load config %s: %v", p, err)
 			}
+			logConfigWarnings(cfg)
 			cfgs = append(cfgs, cfg)
 		}
 		return cfgs
@@ -336,6 +347,9 @@ func loadConfigs(paths []string) []*config.Config {
 		cfgs, err := config.LoadDir("maestro.d")
 		if err != nil {
 			log.Fatalf("load configs from maestro.d/: %v", err)
+		}
+		for _, cfg := range cfgs {
+			logConfigWarnings(cfg)
 		}
 		return cfgs
 	}

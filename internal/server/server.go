@@ -697,7 +697,7 @@ func stuckTargetsSession(stuck state.SupervisorStuckState, info sessionInfo) boo
 
 func supervisorStuckNeedsAttention(stuck state.SupervisorStuckState) bool {
 	switch stuck.Code {
-	case "retry_exhausted", "retry_exhausted_open_pr", "dead_running_pid", "stale_worker_logs", "worker_timeout", "failing_checks", "closed_pr_with_active_session", "unmergeable_pr", "stale_review_feedback", "greptile_not_approved":
+	case "retry_exhausted", "retry_exhausted_open_pr", "dead_running_pid", "stale_worker_logs", "worker_timeout", "failing_checks", "closed_pr_with_active_session", "unmergeable_pr", "stale_review_feedback", "greptile_not_approved", state.StuckPolicyBlocksMerge:
 		return true
 	}
 	return stuck.Severity == "blocked"

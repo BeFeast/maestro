@@ -116,6 +116,18 @@ type prMergeableReader interface {
 	PRMergeable(prNumber int) (string, error)
 }
 
+// prMergeStateReader is the optional reader interface for GitHub's raw
+// per-PR mergeable_state ("clean" / "unstable" / "blocked" / "behind" /
+// "dirty" / "unknown" / "draft" / "has_hooks"). Used as a tie-breaker
+// when PRCIStatus returns "pending" — the aggregate CI signal can be
+// stale (e.g. a long-lived legacy commit-status hangs in pending while
+// every check-run completes successfully), but GitHub's own
+// mergeable_state "clean" / "unstable" already encodes the per-required-
+// check verdict and is therefore authoritative. #425 (sup-98).
+type prMergeStateReader interface {
+	PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus string, err error)
+}
+
 // PreflightResult is the outcome of running a configured preflight command.
 // Ok=true means the gate passed and the supervisor may continue dispatching
 // spawn/open-child actions. Ok=false carries a human-readable Reason that is
@@ -346,10 +358,11 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		if ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr); ready {
 			summary := fmt.Sprintf("Merge PR #%d for issue #%d — checks green, mergeable, review gates passed.", pr.Number, sess.IssueNumber)
 			reasons := appendReasons(baseReasons, mergeReasons...)
+			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
 			decision := e.decision(st, now, projectState, ActionMergePR,
 				summary,
-				RiskMutating, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = stuckStates
+				RiskMutating, 0.9, target, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = appendStuck(stuckStates, e.policyBlockerStuckStates(target, sess, pr)...)
 			return decision, nil
 		}
 
@@ -369,10 +382,11 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
 			)
 		}
+		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
 		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
 			summary,
-			RiskSafe, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = stuckStates
+			RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, pr, monitorReasons))
 		return decision, nil
 	}
 
@@ -2027,8 +2041,19 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	if err != nil {
 		return false, nil
 	}
-	if strings.ToLower(strings.TrimSpace(ciStatus)) != "success" {
-		return false, nil
+	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
+	if ciLower != "success" {
+		// #425 (sup-98): the aggregate PRCIStatus can stick at "pending"
+		// long after every required check has gone green — the most common
+		// cause is a legacy commit-status (used by some review bots) that
+		// never resolves. GitHub's own mergeable_state already encodes the
+		// required-check verdict, so treat "clean" / "unstable" as the
+		// authoritative override before recommending passive monitoring.
+		// "blocked" / "behind" / "dirty" / "" / "unknown" all stay
+		// not-ready.
+		if !mergeStateAllowsMerge(e.reader, pr.Number) {
+			return false, nil
+		}
 	}
 
 	// Greptile gate — when the reader exposes Greptile signal, require
@@ -2051,7 +2076,15 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	reasons := []string{
 		fmt.Sprintf("PR #%d is not draft", pr.Number),
 		fmt.Sprintf("PR #%d mergeable=%s", pr.Number, mergeable),
-		fmt.Sprintf("PR #%d CI status=success", pr.Number),
+	}
+	if ciLower == "success" {
+		reasons = append(reasons, fmt.Sprintf("PR #%d CI status=success", pr.Number))
+	} else {
+		// CI status was stale but mergeable_state confirmed all required
+		// checks passed. Record both so the journal explains the override.
+		reasons = append(reasons,
+			fmt.Sprintf("PR #%d aggregate CI status=%s; mergeable_state confirms required checks passed", pr.Number, ciStatus),
+		)
 	}
 	if _, ok := e.reader.(prGreptileReader); ok {
 		reasons = append(reasons, fmt.Sprintf("PR #%d Greptile review approved", pr.Number))
@@ -2108,6 +2141,28 @@ func (e *Engine) monitorOpenPRReasons(slot string, sess *state.Session, pr githu
 	return reasons
 }
 
+// mergeStateAllowsMerge consults the optional prMergeStateReader for the
+// raw GitHub mergeable_state. Returns true when GitHub itself reports
+// the PR as "clean" (every required check passed) or "unstable" (only
+// non-required checks failing) — both are safe to merge. Any other
+// state, or a reader that does not expose the signal, returns false so
+// the caller stays conservative. #425.
+func mergeStateAllowsMerge(reader Reader, prNumber int) bool {
+	r, ok := reader.(prMergeStateReader)
+	if !ok {
+		return false
+	}
+	_, mergeState, err := r.PRMergeStatus(prNumber)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(mergeState)) {
+	case "clean", "unstable":
+		return true
+	}
+	return false
+}
+
 // summarizeMonitorReasons joins reasons into a single short phrase for the
 // SupervisorDecision.Summary field. Keeps the dashboard readable.
 func summarizeMonitorReasons(reasons []string) string {
@@ -2115,6 +2170,102 @@ func summarizeMonitorReasons(reasons []string) string {
 		return "waiting"
 	}
 	return strings.Join(reasons, "; ")
+}
+
+// policyBlockerStuckStates returns a slice of policy_blocks_merge stuck
+// states for each operator-gated verb (merge_pr, close_issue) the project
+// policy lists in approval_required, given a green/merge-ready PR. #425
+// (sup-98): without this signal a hands-off project where merge_pr is
+// approval-required surfaced only "monitor_open_pr / no mutation needed"
+// in the dashboard, and the operator had no idea their approval was the
+// missing link. The decision still recommends merge_pr — the cautious gate
+// mints the approval; this stuck state is the operator-visible "why am I
+// blocked" alongside it.
+func (e *Engine) policyBlockerStuckStates(target *state.SupervisorTarget, sess *state.Session, pr github.PR) []state.SupervisorStuckState {
+	if e == nil || e.cfg == nil {
+		return nil
+	}
+	gated := mergeGatedApprovalVerbs(e.cfg.Supervisor.ApprovalRequired)
+	if len(gated) == 0 {
+		return nil
+	}
+	verbList := strings.Join(gated, ", ")
+	summary := fmt.Sprintf("PR #%d is ready to merge but project policy requires operator approval for %s.", pr.Number, verbList)
+	evidence := []string{
+		fmt.Sprintf("approval_required=%s", verbList),
+		fmt.Sprintf("PR #%d mergeable + checks green", pr.Number),
+	}
+	if sess != nil && sess.IssueNumber > 0 {
+		evidence = append(evidence, fmt.Sprintf("issue=#%d", sess.IssueNumber))
+	}
+	return []state.SupervisorStuckState{{
+		Code:              state.StuckPolicyBlocksMerge,
+		Severity:          SeverityWarning,
+		Summary:           summary,
+		Evidence:          evidence,
+		RecommendedAction: ActionMergePR,
+		SupervisorCanAct:  false,
+		Target:            target,
+	}}
+}
+
+// pendingChecksStuckState returns the pending_checks stuck state attached
+// to a monitor_open_pr decision so the dashboard can render the exact gate
+// that is still red (CI pending, mergeable unknown, etc.) instead of the
+// generic "monitoring PR" string. #425.
+func pendingChecksStuckState(target *state.SupervisorTarget, pr github.PR, reasons []string) state.SupervisorStuckState {
+	return state.SupervisorStuckState{
+		Code:              state.StuckPendingChecks,
+		Severity:          SeverityInfo,
+		Summary:           fmt.Sprintf("PR #%d is not yet merge-ready: %s", pr.Number, summarizeMonitorReasons(reasons)),
+		Evidence:          append([]string(nil), reasons...),
+		RecommendedAction: ActionMonitorOpenPR,
+		SupervisorCanAct:  true,
+		Target:            target,
+	}
+}
+
+// mergeGatedApprovalVerbs returns the subset of operator-configured
+// approval_required verbs that gate the green-PR completion path
+// (merge_pr, close_issue). Other verbs (delete_worktree,
+// change_global_config) do not block a ready-to-merge PR and are not
+// surfaced as policy blockers for it.
+func mergeGatedApprovalVerbs(approvalRequired []string) []string {
+	if len(approvalRequired) == 0 {
+		return nil
+	}
+	wanted := map[string]struct{}{
+		config.SupervisorActionMergePR:    {},
+		config.SupervisorActionCloseIssue: {},
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, raw := range approvalRequired {
+		canonical := canonicalAction(raw)
+		if _, ok := wanted[canonical]; !ok {
+			continue
+		}
+		if _, dup := seen[canonical]; dup {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		out = append(out, canonical)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// appendStuck appends one or more stuck states to a base slice, skipping
+// zero-value entries. Returns a fresh slice so callers can safely chain.
+func appendStuck(base []state.SupervisorStuckState, more ...state.SupervisorStuckState) []state.SupervisorStuckState {
+	out := append([]state.SupervisorStuckState(nil), base...)
+	for _, item := range more {
+		if strings.TrimSpace(item.Code) == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int) bool {
