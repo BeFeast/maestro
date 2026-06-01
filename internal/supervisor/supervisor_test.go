@@ -562,6 +562,46 @@ func TestDecide_StaleReviewFeedbackButGreenPRRecommendsMerge(t *testing.T) {
 	}
 }
 
+// #556: a retry-exhausted session with an open PR and unaddressed review
+// feedback must NOT recommend `spawn_repair_worker`. That verb is not in
+// the executor's action registry, so the supervisor's at-mint guard
+// refuses it every cycle (logged as "refusing to mint approval"), which
+// is the dogfood loop the issue calls out. The decision must fall
+// through to a registry-supported / non-mutating recommendation such as
+// `monitor_open_pr`.
+func TestDecide_RetryExhaustedUnaddressedFeedback_DoesNotRecommendSpawnRepairWorker(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:          []github.PR{{Number: 555, HeadRefName: "feat/sup-92", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses:   map[int]string{555: "success"},
+		mergedPRs:    map[int]bool{555: false},
+		closedIssues: map[int]bool{535: false},
+	}
+	st := state.NewState()
+	st.Sessions["sup-92"] = &state.Session{
+		IssueNumber:                 535,
+		IssueTitle:                  "unaddressed P1 review",
+		Status:                      state.StatusRetryExhausted,
+		Branch:                      "feat/sup-92",
+		PRNumber:                    555,
+		RetryCount:                  2,
+		LastNotifiedStatus:          "review_retry_exhausted",
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		PreviousAttemptFeedback:     "## Review Feedback\n\ninternal/foo.go:42 P1: nil pointer panic",
+		StartedAt:                   time.Now().UTC().Add(-2 * time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction == ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, must NOT recommend spawn_repair_worker for retry_exhausted (verb is refused at mint, leads to dogfood loop)", decision.RecommendedAction)
+	}
+}
+
 // #512: CI is still pending → planner stays on monitor_open_pr with a
 // summary that names the actual blocker, not the old aspirational text.
 func TestDecide_OpenPR_CIPending_StaysMonitor(t *testing.T) {

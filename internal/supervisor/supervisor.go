@@ -1942,6 +1942,15 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	if availableSlots(e.cfg, st) <= 0 {
 		return false
 	}
+	// #556: a retry-exhausted session has spent its retry budget — spawning
+	// another repair worker would not be effective, and the executor refuses
+	// `spawn_repair_worker` because the verb is not in the action registry.
+	// Falling through here lets the deterministic path land on
+	// monitor_open_pr (or merge_pr when the feedback was addressed and the
+	// PR is now green) instead of looping on the refused verb each cycle.
+	if sess.Status == state.StatusRetryExhausted {
+		return false
+	}
 	if pr.IsDraft {
 		return true
 	}
