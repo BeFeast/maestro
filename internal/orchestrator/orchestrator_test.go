@@ -2048,6 +2048,160 @@ func TestAutoMergePRs_RetryExhaustedActionableFeedbackStillBlocks(t *testing.T) 
 	}
 }
 
+// #556: once a session is settled in retry_exhausted for a specific PR
+// with unaddressed review feedback, subsequent autoMergePRs cycles must
+// NOT re-emit "scheduling retry", re-sync the project board, or churn
+// FinishedAt. Live dogfood (2026-06-01, issue #535 / PR #555) showed the
+// pre-fix loop syncing Blocked → InReview → Blocked every poll.
+func TestAutoMergePRs_RetryExhaustedFeedback_NoReSyncAfterSettled(t *testing.T) {
+	prs := []github.PR{{Number: 555, HeadRefName: "feat/sup-92", Mergeable: "MERGEABLE"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "none",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      2,
+		MaxRetryBackoffMs:       300000,
+	}
+	cfg.GitHubProjects.Enabled = true
+	cfg.GitHubProjects.ProjectNumber = 4
+	notifier := notify.NewWithToken("", "123", "", "")
+	notifier.SetDigestMode(true)
+	syncs := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: notifier,
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "## Review Feedback\n\ninternal/foo.go:42 P1: unaddressed nil pointer", nil
+		},
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000}}, nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			syncs = append(syncs, fmt.Sprintf("#%d:%s", issueNumber, status))
+			return true
+		},
+	}
+	s := state.NewState()
+	s.Sessions["sup-92"] = &state.Session{
+		IssueNumber: 535,
+		IssueTitle:  "review feedback PR",
+		Branch:      "feat/sup-92",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    555,
+		RetryCount:  2,
+	}
+
+	// First cycle marks the session retry-exhausted (one project sync).
+	o.autoMergePRs(s)
+
+	sess := s.Sessions["sup-92"]
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRetryExhausted)
+	}
+	if sess.LastNotifiedStatus != "review_retry_exhausted" {
+		t.Fatalf("LastNotifiedStatus = %q, want review_retry_exhausted", sess.LastNotifiedStatus)
+	}
+	if len(syncs) != 1 || syncs[0] != "#535:blocked" {
+		t.Fatalf("syncs after first cycle = %v, want [#535:blocked]", syncs)
+	}
+	settledFinishedAt := sess.FinishedAt
+	if settledFinishedAt == nil {
+		t.Fatalf("FinishedAt must be set after first cycle")
+	}
+
+	// Second cycle: same conditions. No additional project sync, no extra
+	// notification, FinishedAt does not churn.
+	o.autoMergePRs(s)
+
+	if len(syncs) != 1 {
+		t.Fatalf("project syncs after second cycle = %d (%v), want 1 (idempotent)", len(syncs), syncs)
+	}
+	if notifier.Buffered() != 1 {
+		t.Fatalf("notifications buffered = %d, want 1 (no duplicate terminal notification)", notifier.Buffered())
+	}
+	if sess.FinishedAt != settledFinishedAt {
+		t.Fatalf("FinishedAt churned across cycles: was %v, now %v", settledFinishedAt, sess.FinishedAt)
+	}
+
+	// Third cycle to be sure the loop has truly stabilised.
+	o.autoMergePRs(s)
+	if len(syncs) != 1 {
+		t.Fatalf("project syncs after third cycle = %d (%v), want 1", len(syncs), syncs)
+	}
+}
+
+// #556: checkSessions must not flip a settled retry_exhausted session
+// back to pr_open every cycle. Doing so syncs the project to InReview,
+// which in combination with autoMergePRs' Blocked sync produces the
+// observed In Review ↔ Blocked flip-flop.
+func TestCheckSessions_SettledRetryExhausted_NoFlipFlop(t *testing.T) {
+	cfg := &config.Config{Repo: "owner/repo", MaxRuntimeMinutes: 999}
+	cfg.GitHubProjects.Enabled = true
+	cfg.GitHubProjects.ProjectNumber = 4
+	synced := make([]string, 0)
+	o, _ := newCheckSessionsOrchestrator(cfg, "")
+	o.listOpenPRsFn = func() ([]github.PR, error) {
+		return []github.PR{{
+			Number:      555,
+			HeadRefName: "feat/sup-92",
+			State:       "OPEN",
+		}}, nil
+	}
+	o.rateLimitFn = func() (github.RateLimitStatus, error) {
+		return github.RateLimitStatus{GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000}}, nil
+	}
+	o.syncProjectFn = func(issueNumber int, status github.ProjectStatus) bool {
+		synced = append(synced, fmt.Sprintf("#%d:%s", issueNumber, status))
+		return true
+	}
+
+	s := state.NewState()
+	finishedAt := time.Now().UTC().Add(-5 * time.Minute)
+	s.Sessions["sup-92"] = &state.Session{
+		IssueNumber:        535,
+		IssueTitle:         "review feedback PR",
+		Status:             state.StatusRetryExhausted,
+		Branch:             "feat/sup-92",
+		PRNumber:           555,
+		RetryCount:         2,
+		LastNotifiedStatus: "review_retry_exhausted",
+		FinishedAt:         &finishedAt,
+		StartedAt:          time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["sup-92"]
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q (settled session must NOT be flipped to pr_open)", sess.Status, state.StatusRetryExhausted)
+	}
+	if sess.PRNumber != 555 {
+		t.Fatalf("PRNumber = %d, want 555", sess.PRNumber)
+	}
+	if len(synced) != 0 {
+		t.Fatalf("syncProject calls = %v, want none (settled state must not re-sync InReview)", synced)
+	}
+	if sess.FinishedAt == nil || !sess.FinishedAt.Equal(finishedAt) {
+		t.Fatalf("FinishedAt churned: was %v, now %v", finishedAt, sess.FinishedAt)
+	}
+
+	// Second cycle: still settled. Still no flip, no sync.
+	o.checkSessions(s)
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status after second cycle = %q, want %q", sess.Status, state.StatusRetryExhausted)
+	}
+	if len(synced) != 0 {
+		t.Fatalf("syncProject calls after second cycle = %v, want none", synced)
+	}
+}
+
 func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},

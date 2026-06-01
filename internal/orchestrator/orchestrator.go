@@ -1638,6 +1638,19 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 		case state.StatusDone, state.StatusCodeLanded, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
 			if sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded && prErr == nil {
 				if pr, found := branchToPR[sess.Branch]; found {
+					// #556: when a retry-exhausted session has already been
+					// settled on this exact PR (status+PRNumber+notified),
+					// do NOT flip it back to pr_open every cycle. The merge
+					// flow already processes retry_exhausted sessions
+					// directly (mergeFlowEligibleStatus), so the flip is
+					// redundant — and it produces the board flip-flop
+					// (`In Review` ↔ `Blocked`) the dogfood log captured,
+					// plus a log line per cycle.
+					if isSettledRetryExhausted(sess, pr.Number) {
+						// Stay in the terminal retry_exhausted state. No
+						// log, no project sync, no FinishedAt churn.
+						continue
+					}
 					log.Printf("[orch] session %s %s->pr_open (PR #%d now open for branch %q)", slotName, sess.Status, pr.Number, sess.Branch)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -2128,6 +2141,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				if err != nil {
 					log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
 				} else if strings.TrimSpace(reviewFeedback) != "" {
+					// #556: once we've already marked this PR retry-exhausted
+					// for review feedback, do NOT re-emit "scheduling retry"
+					// or re-sync the project board every poll. The session
+					// has reached a stable terminal state that needs an
+					// operator decision, not another refused retry cycle.
+					if isSettledRetryExhausted(sess, pr.Number) {
+						continue
+					}
 					log.Printf("[orch] PR #%d has review feedback; scheduling retry", pr.Number)
 					o.handleReviewFeedbackRetry(s, slotName, sess, pr, reviewFeedback)
 					continue
@@ -2218,6 +2239,24 @@ func mergeFlowEligibleStatus(sess *state.Session) bool {
 	}
 }
 
+// isSettledRetryExhausted reports whether a session has already been marked
+// retry_exhausted for this exact PR and notified. Used to suppress the
+// retry_exhausted ↔ pr_open flip-flop (#556) and idempotent re-emission of
+// "scheduling retry" / project board sync calls.
+func isSettledRetryExhausted(sess *state.Session, prNumber int) bool {
+	if sess == nil || sess.Status != state.StatusRetryExhausted {
+		return false
+	}
+	if prNumber <= 0 || sess.PRNumber != prNumber {
+		return false
+	}
+	switch sess.LastNotifiedStatus {
+	case "review_retry_exhausted", "ci_retry_exhausted", "rebase_conflict_retry_exhausted":
+		return true
+	}
+	return false
+}
+
 func mergeFlowPRForSession(sess *state.Session, byBranch map[string]github.PR, byNumber map[int]github.PR) (github.PR, bool) {
 	if sess == nil {
 		return github.PR{}, false
@@ -2243,6 +2282,15 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
 
 	if maxRetries > 0 && totalAttempts >= maxRetries {
+		// #556: when the session is already settled retry-exhausted on
+		// this PR, short-circuit so the orchestrator does not re-emit
+		// the retry-limit log, re-sync the project board, or churn
+		// FinishedAt on every poll. The caller in mergeFlow already
+		// guards this path; we re-check here so any direct callers stay
+		// idempotent too.
+		if isSettledRetryExhausted(sess, pr.Number) {
+			return
+		}
 		log.Printf("[orch] review feedback on PR #%d — retry limit reached (%d/%d) for issue #%d",
 			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
 		alreadyNotified := sess.LastNotifiedStatus == "review_retry_exhausted"
