@@ -724,6 +724,15 @@ type State struct {
 	SupervisorStuck       bool   `json:"supervisor_stuck,omitempty"`
 	SupervisorStuckReason string `json:"supervisor_stuck_reason,omitempty"`
 
+	// SpawnDrain requests a graceful drain of the run loop (#541): while it
+	// is set, the orchestrator refuses to claim new issues or spawn new
+	// workers but lets in-flight workers finish. It is set by `maestro
+	// drain` and cleared automatically when the orchestrator starts, so a
+	// drain never persists across a legitimate restart. SpawnDrainAt records
+	// when the drain was requested (UTC).
+	SpawnDrain   bool      `json:"spawn_drain,omitempty"`
+	SpawnDrainAt time.Time `json:"spawn_drain_at,omitempty"`
+
 	loadedHash  string
 	loadedState *State
 }
@@ -919,6 +928,8 @@ func (s *State) copyFrom(src *State) {
 	s.BackendHealth = src.BackendHealth
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
+	s.SpawnDrain = src.SpawnDrain
+	s.SpawnDrainAt = src.SpawnDrainAt
 }
 
 func cloneState(s *State) *State {
@@ -960,7 +971,23 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
+	mergeSpawnDrain(merged, current, ours)
 	return merged, nil
+}
+
+// mergeSpawnDrain resolves the drain flag (#541) latest-write-wins by
+// SpawnDrainAt. The drain CLI sets SpawnDrain=true and the orchestrator clears
+// it (SpawnDrain=false) — both stamp SpawnDrainAt — so picking the snapshot
+// with the newer timestamp keeps a concurrent orchestrator save from clobbering
+// a fresh drain request, and a fresh clear from being undone by a stale set.
+func mergeSpawnDrain(merged, current, ours *State) {
+	if ours.SpawnDrainAt.After(current.SpawnDrainAt) {
+		merged.SpawnDrain = ours.SpawnDrain
+		merged.SpawnDrainAt = ours.SpawnDrainAt
+		return
+	}
+	merged.SpawnDrain = current.SpawnDrain
+	merged.SpawnDrainAt = current.SpawnDrainAt
 }
 
 func mergeProjectStatusSync(current, ours map[int]ProjectStatusSync) map[int]ProjectStatusSync {
@@ -1818,6 +1845,56 @@ func (s *State) ActiveSessions() []*Session {
 	return active
 }
 
+// RunningSessions returns the in-flight worker sessions — those whose tmux
+// worker process is actively executing (StatusRunning). Drain (#541) waits for
+// this set to empty; pr_open sessions are intentionally excluded because they
+// have no live worker and are re-attached by the next supervisor's reconcile
+// path after a restart.
+func (s *State) RunningSessions() []*Session {
+	if s == nil {
+		return nil
+	}
+	var running []*Session
+	for _, sess := range s.Sessions {
+		if sess != nil && sess.Status == StatusRunning {
+			running = append(running, sess)
+		}
+	}
+	return running
+}
+
+// RunningSessionCount returns the number of in-flight worker sessions.
+func (s *State) RunningSessionCount() int {
+	return len(s.RunningSessions())
+}
+
+// SetSpawnDrain requests a graceful drain (#541): the run loop stops claiming
+// new issues and spawning new workers but lets in-flight workers finish. The
+// timestamp is stamped so concurrent state writers resolve drain on/off by
+// latest-write-wins.
+func (s *State) SetSpawnDrain(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.SpawnDrain = true
+	s.SpawnDrainAt = normalizedTime(at)
+}
+
+// ClearSpawnDrain lifts a graceful drain. The orchestrator calls this on
+// startup so a drain never persists across a legitimate restart.
+func (s *State) ClearSpawnDrain(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.SpawnDrain = false
+	s.SpawnDrainAt = normalizedTime(at)
+}
+
+// DrainActive reports whether a graceful drain is currently requested.
+func (s *State) DrainActive() bool {
+	return s != nil && s.SpawnDrain
+}
+
 // LiveSessions returns sessions that belong in the default operator view.
 func (s *State) LiveSessions() []*Session {
 	return s.LiveSessionsAt(time.Now().UTC())
@@ -1837,7 +1914,6 @@ func (s *State) LiveSessionsAt(now time.Time) []*Session {
 	}
 	return live
 }
-
 
 // SessionAt returns the live session bound to slot, if any. Used by the
 // approver executor (#488 slot-reuse fence) to verify a delete_worktree

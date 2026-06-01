@@ -300,14 +300,16 @@ func prClosesIssue(pr PR, issueNumber int) bool {
 // whitespace and an optional `:` between the keyword and the hash.
 //
 // Examples that match (issueNumber = 487):
-//   "Closes #487"        "fixes: #487"        "Resolved #487."
-//   "...closes #487\nThis PR ..."             "RESOLVES #487"
+//
+//	"Closes #487"        "fixes: #487"        "Resolved #487."
+//	"...closes #487\nThis PR ..."             "RESOLVES #487"
 //
 // Examples that do NOT match:
-//   "P0 #487: add HTTP auth ..."     (bare mention)
-//   "Refs #487"                      (Refs is not a closing keyword)
-//   "see #487 for context"
-//   "ticket-487"                     (no `#`, also no closing keyword)
+//
+//	"P0 #487: add HTTP auth ..."     (bare mention)
+//	"Refs #487"                      (Refs is not a closing keyword)
+//	"see #487 for context"
+//	"ticket-487"                     (no `#`, also no closing keyword)
 func closingKeywordRegexp(issueNumber int) *regexp.Regexp {
 	return regexp.MustCompile(fmt.Sprintf(
 		`(?i)(?:^|[^a-z])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#%d(?:[^0-9]|$)`,
@@ -729,6 +731,25 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 	return mergeableFromRESTPull(pr), nil
 }
 
+// PRMergeStatus returns both the normalized mergeable verdict
+// ("MERGEABLE" / "CONFLICTING" / "UNKNOWN") AND the raw GitHub
+// mergeable_state ("clean", "behind", "blocked", "dirty", "unstable",
+// "unknown", "draft", "has_hooks") for a single PR, fetched from the
+// REST single-PR endpoint (reused by #543/#544 for a fresh mergeable
+// signal). The executor needs the raw state to distinguish a green PR
+// that has merely fallen BEHIND main (recoverable via update-branch)
+// from one with a real conflict (#547).
+//
+// mergeStateStatus is lower-cased and trimmed; "" means GitHub has not
+// computed it yet (caller should treat that as "don't know, proceed").
+func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus string, err error) {
+	pr, err := c.getRESTPull(prNumber)
+	if err != nil {
+		return "", "", fmt.Errorf("get pull %d: %w", prNumber, err)
+	}
+	return mergeableFromRESTPull(pr), strings.ToLower(strings.TrimSpace(pr.MergeableState)), nil
+}
+
 // PRGreptileApproved checks whether Greptile has approved the PR.
 //
 // Primary path: reads GitHub Check Runs for the PR's head SHA.
@@ -950,6 +971,26 @@ func (c *Client) MergePR(prNumber int) error {
 		"--delete-branch").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("gh pr merge %d: %w\n%s", prNumber, err, out)
+	}
+	return nil
+}
+
+// UpdateBranch merges the base branch into the PR's head branch so a
+// green-but-BEHIND PR becomes up to date with main, satisfying the
+// "branches must be up to date before merging" branch-protection rule.
+// It is the non-bypass alternative to `gh pr merge --admin`: the updated
+// head re-runs required checks and only merges once they pass.
+//
+// Updating the branch changes the PR head SHA, so any approval minted
+// against the old head becomes stale — callers must NOT merge in the
+// same pass; they should let the next supervisor cycle re-validate and
+// re-mint against the new state (#547).
+func (c *Client) UpdateBranch(prNumber int) error {
+	out, err := exec.Command("gh", "pr", "update-branch",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr update-branch %d: %w\n%s", prNumber, err, out)
 	}
 	return nil
 }

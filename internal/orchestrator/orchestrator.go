@@ -1107,11 +1107,26 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 	worker.SweepStaleVisualQA()
 
 	if !once {
+		// The long-running daemon just (re)started — that is the "restart" the
+		// restart-required banner asks for. Reconcile any stale restart_required
+		// flag persisted by a previous process into this process's reality (the
+		// in-memory signal is false on a clean start) so the banner does not
+		// survive the very restart it requested. A genuine post-start config
+		// change still re-raises the signal via reloadConfig.
+		o.clearStaleRestartRequired()
+
 		// Full ProjectV2 item sweeps are expensive and only repair board drift.
 		// Do not run one immediately after every daemon restart; session-state
 		// mirroring still runs, and the broad sweep can wait for the normal
 		// throttle window.
 		o.deferProjectBoardSweep(time.Now().UTC())
+
+		// Graceful drain (#541) is a one-shot "drain then restart" request. A
+		// fresh daemon must start in normal (non-drained) mode, so clear any
+		// leftover drain flag before the first cycle. Only the long-running
+		// daemon clears it — a `run --once` reconcile tick must not lift a
+		// drain that an operator is mid-way through.
+		o.clearSpawnDrainOnStartup()
 	}
 	if err := o.RunOnce(); err != nil {
 		log.Printf("[orch] run error: %v", err)
@@ -1146,6 +1161,25 @@ func (o *Orchestrator) deferProjectBoardSweep(now time.Time) {
 		return
 	}
 	o.projectItemsSweepAt = now.UTC()
+}
+
+// clearSpawnDrainOnStartup lifts any leftover graceful-drain flag (#541) so a
+// freshly started daemon begins in normal mode. A no-op when no drain is set.
+func (o *Orchestrator) clearSpawnDrainOnStartup() {
+	s, err := state.Load(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] drain: load state to clear drain flag: %v", err)
+		return
+	}
+	if !s.DrainActive() {
+		return
+	}
+	s.ClearSpawnDrain(time.Now().UTC())
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		log.Printf("[orch] drain: clear drain flag on startup: %v", err)
+		return
+	}
+	log.Printf("[orch] drain flag cleared on startup — resuming normal spawns")
 }
 
 // reloadConfig applies non-destructive config changes at runtime.
@@ -1310,6 +1344,39 @@ func (o *Orchestrator) persistRestartRequired() {
 	s.RestartRequiredReason = o.restartRequiredReason
 	if err := state.Save(o.cfg.StateDir, s); err != nil {
 		log.Printf("[orch] warn: could not save restart-required signal to state: %v", err)
+	}
+}
+
+// clearStaleRestartRequired reconciles a stale restart-required flag from a
+// previous process into the freshly-started daemon's reality. The restart-required
+// signal asks the operator to restart the daemon; once the daemon actually (re)starts
+// it is loaded from whatever config is now on disk, so the in-memory restartRequired
+// is the truth (false on a clean start). Nothing else clears the persisted flag — not
+// a fresh start and not a config revert — so without this it survives the very restart
+// it requested and produces a false banner in `maestro status` / the Fleet dashboard.
+//
+// This is only safe to call from the long-running daemon startup (Run with once=false),
+// which is the actual "restart" the banner refers to. A genuine post-start config change
+// still re-raises the signal through markRestartRequired in reloadConfig, so the real
+// signal is preserved. Best-effort: a load/save failure is logged but never aborts start.
+func (o *Orchestrator) clearStaleRestartRequired() {
+	if o.restartRequired {
+		// A real signal was already raised in-process before start completed; keep it.
+		return
+	}
+	s, err := state.Load(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] warn: could not load state to clear stale restart-required signal: %v", err)
+		return
+	}
+	if !s.RestartRequired && s.RestartRequiredReason == "" {
+		return
+	}
+	log.Printf("[orch] clearing stale restart-required signal from previous process (was: %q)", s.RestartRequiredReason)
+	s.RestartRequired = false
+	s.RestartRequiredReason = ""
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		log.Printf("[orch] warn: could not save cleared restart-required signal to state: %v", err)
 	}
 }
 
@@ -3157,6 +3224,17 @@ func sortedStateSessionNames(s *state.State) []string {
 }
 
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
+	// Graceful drain (#541): while a drain is requested, refuse to claim new
+	// issues or spawn new workers. In-flight workers keep running; the
+	// operator runs `maestro drain` before a restart so a `systemctl restart`
+	// no longer kills mid-flight workers. The flag is cleared automatically on
+	// the next orchestrator startup. Return before listing issues so drain is
+	// a true "stop accepting new work" gate, not just a per-issue skip.
+	if s.DrainActive() {
+		log.Printf("[orch] drain active (since %s): not spawning new workers (running=%d)",
+			s.SpawnDrainAt.Format(time.RFC3339), s.RunningSessionCount())
+		return
+	}
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
