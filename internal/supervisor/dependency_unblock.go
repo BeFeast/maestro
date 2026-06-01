@@ -116,13 +116,11 @@ func (e *Engine) evaluateDependencyUnblock(st *state.State, issues []github.Issu
 			// supervisor work.
 			continue
 		}
-		resolved, unresolved, evidence, err := e.resolveDependencies(deps, cache)
-		if err != nil {
-			// Read errors should not crash the whole supervisor cycle —
-			// just skip this candidate this cycle.
-			continue
-		}
+		resolved, unresolved, evidence := e.resolveDependencies(deps, cache)
 		if len(unresolved) > 0 {
+			// unresolved includes deps whose lookup failed this cycle (the
+			// cache reports read errors as "not resolved"), so a transient
+			// GitHub error simply defers the unblock to the next cycle.
 			continue
 		}
 
@@ -178,25 +176,19 @@ func (e *Engine) evaluateDependencyUnblock(st *state.State, issues []github.Issu
 // linked PR is merged (resolved) and those that are still open (unresolved).
 // Evidence is a human-readable list of "#N closed" / "#N PR merged" lines
 // used in the unblock comment.
-func (e *Engine) resolveDependencies(deps []int, cache *resolutionCache) (resolved []int, unresolved []int, evidence []string, err error) {
+func (e *Engine) resolveDependencies(deps []int, cache *resolutionCache) (resolved []int, unresolved []int, evidence []string) {
 	if cache == nil {
 		cache = newResolutionCache(e.reader)
 	}
 	for _, dep := range deps {
-		closed, lookupErr := e.reader.IsIssueClosed(dep)
-		if lookupErr != nil {
-			return nil, nil, nil, fmt.Errorf("check dependency #%d closed: %w", dep, lookupErr)
-		}
-		if closed {
+		// Route reads through the shared cache so a dependency common to N
+		// blocked wave members is fetched at most once per cycle (#564 P1).
+		if cache.isIssueClosed(dep) {
 			resolved = append(resolved, dep)
 			evidence = append(evidence, fmt.Sprintf("#%d closed", dep))
 			continue
 		}
-		merged, lookupErr := e.reader.HasMergedPRForIssue(dep)
-		if lookupErr != nil {
-			return nil, nil, nil, fmt.Errorf("check dependency #%d merged PR: %w", dep, lookupErr)
-		}
-		if merged {
+		if cache.hasMergedPRForIssue(dep) {
 			resolved = append(resolved, dep)
 			evidence = append(evidence, fmt.Sprintf("#%d PR merged", dep))
 			continue
@@ -204,7 +196,7 @@ func (e *Engine) resolveDependencies(deps []int, cache *resolutionCache) (resolv
 		unresolved = append(unresolved, dep)
 		evidence = append(evidence, fmt.Sprintf("#%d still open", dep))
 	}
-	return resolved, unresolved, evidence, nil
+	return resolved, unresolved, evidence
 }
 
 func blockedWaveMembers(issues []github.Issue, blockedLabel string) []github.Issue {
