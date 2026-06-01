@@ -11,6 +11,7 @@ import {
   isApprovalActionMergePR,
   postFleetApproval,
   postProjectApproval,
+  projectBoardIssueURL,
   projectBySlug,
   supervisorDecisionsFromProject,
   workerNextAction,
@@ -73,6 +74,17 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
             {p.repo && (
               <a className="tb-btn ghost" href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer">Open in GitHub →</a>
             )}
+            {p.projectBoard?.url && (
+              <a
+                className="tb-btn ghost"
+                href={p.projectBoard.url}
+                target="_blank"
+                rel="noreferrer"
+                title={p.projectBoard.error ? `Board fetch error: ${p.projectBoard.error}` : "Open GitHub Project board"}
+              >
+                Open GH Project board{p.projectBoard.number ? ` #${p.projectBoard.number}` : ""} →
+              </a>
+            )}
           </div>
         </div>
         <ProjectMiniHeartbeat tone={vtone} events={p.tapeEvents || []} />
@@ -123,19 +135,36 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
         >
           {projectLive.length > 0 ? (
             <div style={{ padding: "var(--s-2)" }}>
-              {projectLive.map(w => (
-                <div key={w.slot} className="dec" style={{ gridTemplateColumns: "80px 1fr auto" }} onClick={() => openDrawer(w)}>
-                  <div className="dec-t mono">{w.slot}</div>
-                  <div className="dec-body">
-                    <div style={{ color: "var(--fg-0)", fontSize: 13 }}>#{w.issue.num} {w.issue.title}</div>
-                    <div className="dim" style={{ fontSize: 11.5, marginTop: 2 }}>{w.summary}</div>
+              {projectLive.map(w => {
+                const cardURL = projectBoardIssueURL(p.projectBoard, w.issue.num);
+                return (
+                  <div key={w.slot} className="dec" style={{ gridTemplateColumns: "80px 1fr auto" }} onClick={() => openDrawer(w)}>
+                    <div className="dec-t mono">{w.slot}</div>
+                    <div className="dec-body">
+                      <div style={{ color: "var(--fg-0)", fontSize: 13 }}>
+                        #{w.issue.num} {w.issue.title}
+                        {cardURL && (
+                          <a
+                            href={cardURL}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={e => e.stopPropagation()}
+                            title="Open this issue's card on the GitHub Project board"
+                            style={{ marginLeft: 6, fontSize: 11 }}
+                          >
+                            ↗ board
+                          </a>
+                        )}
+                      </div>
+                      <div className="dim" style={{ fontSize: 11.5, marginTop: 2 }}>{w.summary}</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <Pill tone={w.tone} noDot>{w.status}</Pill>
+                      <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{relTime(w.age, now)}</div>
+                    </div>
                   </div>
-                  <div style={{ textAlign: "right" }}>
-                    <Pill tone={w.tone} noDot>{w.status}</Pill>
-                    <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{relTime(w.age, now)}</div>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : (
             <div style={{ padding: "var(--s-5)", textAlign: "center" }}>
@@ -162,6 +191,8 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
             )}
           </div>
         </Panel>
+
+        {p.projectBoard && <ProjectBoardPanel board={p.projectBoard} />}
 
         <Panel title="Queue" sub={`${p.open} open · ${p.eligible} eligible`}>
           <div style={{ padding: "var(--s-4) var(--s-5)" }}>
@@ -210,6 +241,50 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
         </div>
       </div>
     </div>
+  );
+}
+
+function ProjectBoardPanel({ board }) {
+  const columns = board?.columns || [];
+  const total = Number(board?.totalItems || 0);
+  const subtitle = board?.error
+    ? "fetch error"
+    : columns.length === 0
+      ? "no columns"
+      : `${total} item${total === 1 ? "" : "s"}`;
+  return (
+    <Panel
+      title={`Project board #${board.number || ""}`.trim()}
+      sub={subtitle}
+      right={board?.url
+        ? <a href={board.url} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>Open board →</a>
+        : null}
+    >
+      <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+        {board?.error && (
+          <div className="mono dim" style={{ fontSize: 11, marginBottom: 8 }}>
+            {board.error}
+          </div>
+        )}
+        {columns.length === 0 ? (
+          <div className="dim" style={{ textAlign: "center", padding: "var(--s-4)" }}>
+            No board data yet. Refresher runs every couple of minutes.
+          </div>
+        ) : (
+          columns.map(c => (
+            <div key={c.optionId || c.name} className="kv">
+              <span>{c.name}</span>
+              <strong className="mono">{c.count}</strong>
+            </div>
+          ))
+        )}
+        {board?.fetchedAt && (
+          <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>
+            fetched {board.fetchedAt.replace("T", " ").replace("Z", "Z")}
+          </div>
+        )}
+      </div>
+    </Panel>
   );
 }
 
@@ -526,6 +601,18 @@ export function WorkerDrawer({ worker, onClose, now }) {
             <div className="row gap-2">
               {worker.pr_url && <a className="tb-btn" href={worker.pr_url} target="_blank" rel="noreferrer">Open PR in GitHub →</a>}
               {worker.issue_url && <a className="tb-btn ghost" href={worker.issue_url} target="_blank" rel="noreferrer">Open issue →</a>}
+              {(() => {
+                const board = (fleet?.projects || []).find(
+                  pr => pr.name === (worker.project_name || worker.project) || pr.slug === (worker.project_name || worker.project)
+                )?.projectBoard;
+                const href = projectBoardIssueURL(board, worker.issue_number || worker.issue?.num);
+                if (!href) return null;
+                return (
+                  <a className="tb-btn ghost" href={href} target="_blank" rel="noreferrer">
+                    Open on project board →
+                  </a>
+                );
+              })()}
             </div>
             {fleet?.readOnly && (
               <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>Write actions disabled in read-only mode.</div>

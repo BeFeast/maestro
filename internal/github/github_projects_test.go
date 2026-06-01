@@ -1,6 +1,7 @@
 package github
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -318,6 +319,126 @@ func TestParseIssueNodeIDUsesRESTNodeID(t *testing.T) {
 
 	if _, err := parseIssueNodeID(42, []byte(`{"id":123}`)); err == nil {
 		t.Fatal("parseIssueNodeID() should reject missing REST node_id")
+	}
+}
+
+func TestParseDiscoverProjectResponse_PreservesOwnerAndOptionOrder(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"repositoryOwner": {
+				"__typename": "Organization",
+				"projectV2": {
+					"id": "project-id",
+					"field": {
+						"id": "field-id",
+						"options": [
+							{"id": "todo-id", "name": "Todo"},
+							{"id": "progress-id", "name": "In Progress"},
+							{"id": "done-id", "name": "Done"}
+						]
+					}
+				}
+			}
+		}
+	}`)
+	pf, err := parseDiscoverProjectResponse("befeast", 5, body)
+	if err != nil {
+		t.Fatalf("parseDiscoverProjectResponse: %v", err)
+	}
+	if pf.Owner != "befeast" || pf.OwnerType != "Organization" || pf.Number != 5 {
+		t.Fatalf("owner metadata = %q/%q/%d, want befeast/Organization/5", pf.Owner, pf.OwnerType, pf.Number)
+	}
+	want := []string{"Todo", "In Progress", "Done"}
+	if !reflect.DeepEqual(pf.OptionOrder, want) {
+		t.Fatalf("OptionOrder = %v, want %v", pf.OptionOrder, want)
+	}
+}
+
+func TestProjectBoardURL_OrgVsUser(t *testing.T) {
+	org := &ProjectField{Owner: "befeast", OwnerType: "Organization", Number: 5}
+	if got, want := ProjectBoardURL(org), "https://github.com/orgs/befeast/projects/5"; got != want {
+		t.Errorf("org URL = %q, want %q", got, want)
+	}
+	user := &ProjectField{Owner: "kossoy", OwnerType: "User", Number: 2}
+	if got, want := ProjectBoardURL(user), "https://github.com/users/kossoy/projects/2"; got != want {
+		t.Errorf("user URL = %q, want %q", got, want)
+	}
+	missing := &ProjectField{Owner: "", OwnerType: "Organization", Number: 5}
+	if got := ProjectBoardURL(missing); got != "" {
+		t.Errorf("missing owner URL = %q, want empty", got)
+	}
+	if got := ProjectBoardURL(nil); got != "" {
+		t.Errorf("nil URL = %q, want empty", got)
+	}
+}
+
+func TestProjectBoardIssueFilterURL_AppendsFilterQuery(t *testing.T) {
+	pf := &ProjectField{Owner: "befeast", OwnerType: "Organization", Number: 5}
+	got := ProjectBoardIssueFilterURL(pf, 529)
+	want := "https://github.com/orgs/befeast/projects/5?pane=info&filterQuery=%23529"
+	if got != want {
+		t.Errorf("ProjectBoardIssueFilterURL = %q, want %q", got, want)
+	}
+	if got := ProjectBoardIssueFilterURL(pf, 0); got != "https://github.com/orgs/befeast/projects/5" {
+		t.Errorf("issue=0 URL = %q, want bare board URL", got)
+	}
+}
+
+func TestParseProjectItemStatusCountsResponse_PreservesBoardOrder(t *testing.T) {
+	pf := &ProjectField{
+		Options: map[string]string{
+			"Todo":        "opt-todo",
+			"In Progress": "opt-progress",
+			"Done":        "opt-done",
+		},
+		OptionOrder: []string{"Todo", "In Progress", "Done"},
+	}
+	body := []byte(`{
+		"data": {
+			"node": {
+				"items": {
+					"totalCount": 6,
+					"nodes": [
+						{"fieldValueByName": {"optionId": "opt-todo", "name": "Todo"}},
+						{"fieldValueByName": {"optionId": "opt-todo", "name": "Todo"}},
+						{"fieldValueByName": {"optionId": "opt-progress", "name": "In Progress"}},
+						{"fieldValueByName": {"optionId": "opt-done", "name": "Done"}},
+						{"fieldValueByName": null},
+						{"fieldValueByName": {"optionId": "", "name": ""}}
+					]
+				}
+			}
+		}
+	}`)
+	columns, total, err := parseProjectItemStatusCountsResponse(body, pf)
+	if err != nil {
+		t.Fatalf("parseProjectItemStatusCountsResponse: %v", err)
+	}
+	if total != 6 {
+		t.Errorf("total = %d, want 6", total)
+	}
+	want := []ProjectBoardColumn{
+		{Name: "Todo", OptionID: "opt-todo", Count: 2},
+		{Name: "In Progress", OptionID: "opt-progress", Count: 1},
+		{Name: "Done", OptionID: "opt-done", Count: 1},
+		{Name: "No Status", Count: 2},
+	}
+	if !reflect.DeepEqual(columns, want) {
+		t.Fatalf("columns = %#v, want %#v", columns, want)
+	}
+}
+
+func TestParseProjectItemStatusCountsResponse_SurfacesGraphQLErrors(t *testing.T) {
+	body := []byte(`{"errors":[{"message":"forbidden"}]}`)
+	if _, _, err := parseProjectItemStatusCountsResponse(body, &ProjectField{}); err == nil {
+		t.Fatal("expected graphql error")
+	}
+}
+
+func TestListProjectItemStatusCounts_NilProjectField(t *testing.T) {
+	c := New("owner/repo")
+	if _, _, err := c.ListProjectItemStatusCounts(nil); err == nil {
+		t.Fatal("expected error for nil ProjectField")
 	}
 }
 

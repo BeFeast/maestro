@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os/exec"
 	"strings"
 	"time"
@@ -60,6 +61,22 @@ type ProjectField struct {
 	ProjectID string
 	FieldID   string
 	Options   map[string]string // status name -> option ID (e.g. "In Progress" -> "47fc9ee4")
+
+	// OptionOrder preserves the Status options in the order returned by the
+	// project board so callers (e.g. the fleet API) can render columns in
+	// the same order an operator sees them on github.com. New in #529 —
+	// kept alongside Options for backward compatibility.
+	OptionOrder []string
+
+	// Owner is the login of the project's owner (org or user). OwnerType is
+	// the GraphQL __typename ("Organization" or "User") and is required to
+	// build the canonical board URL (`/orgs/<o>/projects/N` vs
+	// `/users/<o>/projects/N`).
+	Owner     string
+	OwnerType string
+	// Number echoes the project number the field was discovered with so
+	// callers don't have to thread it separately.
+	Number int
 }
 
 // DiscoverProject finds the GitHub Project board and returns its Status field options.
@@ -135,15 +152,53 @@ func parseDiscoverProjectResponse(owner string, projectNumber int, out []byte) (
 	}
 
 	pf := &ProjectField{
-		ProjectID: p.ID,
-		FieldID:   p.Field.ID,
-		Options:   make(map[string]string),
+		ProjectID:   p.ID,
+		FieldID:     p.Field.ID,
+		Options:     make(map[string]string),
+		OptionOrder: make([]string, 0, len(p.Field.Options)),
+		Owner:       owner,
+		OwnerType:   result.Data.RepositoryOwner.Typename,
+		Number:      projectNumber,
 	}
 	for _, opt := range p.Field.Options {
 		pf.Options[opt.Name] = opt.ID
+		pf.OptionOrder = append(pf.OptionOrder, opt.Name)
 	}
 
 	return pf, nil
+}
+
+// ProjectBoardURL returns the canonical github.com URL for the Projects v2
+// board described by pf. Returns "" when pf is nil or the owner data is
+// missing. OwnerType is the GraphQL __typename surfaced by DiscoverProject
+// ("Organization" or "User"); anything other than "Organization" is treated
+// as a user-owned project so personal accounts work without a special case.
+func ProjectBoardURL(pf *ProjectField) string {
+	if pf == nil {
+		return ""
+	}
+	owner := strings.TrimSpace(pf.Owner)
+	if owner == "" || pf.Number <= 0 {
+		return ""
+	}
+	segment := "users"
+	if strings.EqualFold(pf.OwnerType, "Organization") {
+		segment = "orgs"
+	}
+	return fmt.Sprintf("https://github.com/%s/%s/projects/%d", segment, owner, pf.Number)
+}
+
+// ProjectBoardIssueFilterURL returns a board URL with a filter query that
+// surfaces the given issue on the board. GitHub Projects v2 accepts the
+// `?filterQuery=#NN` query string and applies it to view 1 (the default),
+// which is the closest deep-link to the corresponding project card without
+// requiring the per-item GraphQL ID lookup.
+func ProjectBoardIssueFilterURL(pf *ProjectField, issueNumber int) string {
+	base := ProjectBoardURL(pf)
+	if base == "" || issueNumber <= 0 {
+		return base
+	}
+	return fmt.Sprintf("%s?pane=info&filterQuery=%s", base, url.QueryEscape(fmt.Sprintf("#%d", issueNumber)))
 }
 
 // ProjectItem represents an item on a GitHub Project board with its linked issue info.
@@ -247,6 +302,122 @@ func parseNonDoneProjectItemsResponse(out []byte, doneOptionID string) ([]Projec
 	}
 
 	return items, nil
+}
+
+// ProjectBoardColumn captures one Status column on the board with its current
+// item count. Used by the fleet API to render a WIP rollup (#529).
+type ProjectBoardColumn struct {
+	Name     string `json:"name"`
+	OptionID string `json:"option_id,omitempty"`
+	Count    int    `json:"count"`
+}
+
+// ListProjectItemStatusCounts returns one ProjectBoardColumn per Status option
+// on the board (preserving board order) plus the total item count. The
+// "No Status" bucket is appended only when at least one item lacks a Status
+// value, so empty boards stay tidy.
+//
+// The query fetches up to 100 items in one page; that ceiling matches the
+// rest of this package's ProjectV2 helpers and is more than enough for the
+// maestro coordination board (#5). Larger boards would need pagination; left
+// as a known follow-up since the rollup is operator-glance, not authoritative.
+func (c *Client) ListProjectItemStatusCounts(pf *ProjectField) ([]ProjectBoardColumn, int, error) {
+	if pf == nil {
+		return nil, 0, fmt.Errorf("nil ProjectField")
+	}
+
+	query := fmt.Sprintf(`{
+  node(id: %q) {
+    ... on ProjectV2 {
+      items(first: 100) {
+        totalCount
+        nodes {
+          fieldValueByName(name: "Status") {
+            ... on ProjectV2ItemFieldSingleSelectValue {
+              optionId
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}`, pf.ProjectID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", "query="+query).Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, 0, fmt.Errorf("graphql project status counts: %w\nstderr: %s", err, exitErr.Stderr)
+		}
+		return nil, 0, fmt.Errorf("graphql project status counts: %w", err)
+	}
+	return parseProjectItemStatusCountsResponse(out, pf)
+}
+
+func parseProjectItemStatusCountsResponse(out []byte, pf *ProjectField) ([]ProjectBoardColumn, int, error) {
+	var resp struct {
+		Data struct {
+			Node struct {
+				Items struct {
+					TotalCount int `json:"totalCount"`
+					Nodes      []struct {
+						FieldValueByName *struct {
+							OptionID string `json:"optionId"`
+							Name     string `json:"name"`
+						} `json:"fieldValueByName"`
+					} `json:"nodes"`
+				} `json:"items"`
+			} `json:"node"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, 0, fmt.Errorf("parse project status counts: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		msgs := make([]string, len(resp.Errors))
+		for i, e := range resp.Errors {
+			msgs[i] = e.Message
+		}
+		return nil, 0, fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
+	}
+
+	byOption := make(map[string]int)
+	noStatus := 0
+	for _, node := range resp.Data.Node.Items.Nodes {
+		if node.FieldValueByName == nil || strings.TrimSpace(node.FieldValueByName.OptionID) == "" {
+			noStatus++
+			continue
+		}
+		byOption[node.FieldValueByName.OptionID]++
+	}
+
+	columns := make([]ProjectBoardColumn, 0, len(pf.OptionOrder)+1)
+	for _, name := range pf.OptionOrder {
+		optionID := pf.Options[name]
+		columns = append(columns, ProjectBoardColumn{
+			Name:     name,
+			OptionID: optionID,
+			Count:    byOption[optionID],
+		})
+	}
+	if noStatus > 0 {
+		columns = append(columns, ProjectBoardColumn{Name: "No Status", Count: noStatus})
+	}
+
+	total := resp.Data.Node.Items.TotalCount
+	if total == 0 {
+		// Fall back to the summed page when totalCount is missing so the
+		// rollup is at least as accurate as the page we saw.
+		for _, col := range columns {
+			total += col.Count
+		}
+	}
+	return columns, total, nil
 }
 
 // SyncIssueStatus adds an issue to the project (if not already) and sets its Status.
