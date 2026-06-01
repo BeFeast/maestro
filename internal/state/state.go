@@ -2539,6 +2539,62 @@ func (s *State) MarkApprovalAwaitingDispatch(id string, now time.Time, actor, re
 	return approval, nil
 }
 
+// MigrateApprovalsBindRepo back-fills the Repo stamp on any in-flight
+// approval that predates #489 (premortem failure mode #3).
+//
+// Approvals created before #489 were not bound to a project at write-time
+// — the executor trusted ambient cfg.Repo. After #489 every fresh approval
+// carries Repo + Project (see RecordPendingApprovalForDecision +
+// dispatchApprovalAction), and the executor refuses any approval whose
+// Repo does not match its cfg.Repo. To roll #489 out without aborting
+// already-pending approvals on upgrade, this migration walks Approvals
+// that are still in a non-terminal status (pending, awaiting_dispatch,
+// approved) and stamps the missing Repo from the caller-supplied repo
+// slug. Project stays blank when we cannot infer it — the executor only
+// fences on Repo.
+//
+// Returns the number of approvals stamped. The intended call site is
+// once per supervisor cycle: the operation is idempotent (already-stamped
+// approvals are skipped), cheap (a single in-memory pass), and converges
+// fresh after a daemon restart so a long-running daemon and a freshly
+// loaded daemon agree.
+//
+// Terminal-status approvals (executed / execution_failed / rejected /
+// stale / superseded / execution_skipped) are deliberately NOT migrated
+// — they are historical records that have already had their side effect
+// adjudicated, and rewriting them retroactively would muddy the audit
+// trail.
+//
+// Takes a plain repo string (not *config.Config) on purpose: the state
+// package must not depend on internal/config, which would invert the
+// existing layering.
+func (s *State) MigrateApprovalsBindRepo(repo string) int {
+	if s == nil {
+		return 0
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return 0
+	}
+	migrated := 0
+	for i := range s.Approvals {
+		a := &s.Approvals[i]
+		switch a.Status {
+		case ApprovalStatusPending,
+			ApprovalStatusAwaitingDispatch,
+			ApprovalStatusApproved:
+		default:
+			continue
+		}
+		if strings.TrimSpace(a.Repo) != "" {
+			continue
+		}
+		a.Repo = repo
+		migrated++
+	}
+	return migrated
+}
+
 // ValidateSlotID is the canonical slot-id validator used at EVERY
 // state-write ingress (#490 / premortem #5). A slot id names a session
 // in `state.Sessions` and is later concatenated into a worktree path

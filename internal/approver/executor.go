@@ -105,10 +105,14 @@ type Executor struct {
 //   - Err            — non-nil only when Status == execution_failed; the
 //     caller marks failure and surfaces err to its
 //     operator (CLI exit code, supervisor log).
+//   - Warning        — non-fatal advisory the caller should log out-of-band
+//     (#489: unstamped legacy approval fell through the repo
+//     guard). Empty in the happy path.
 type Result struct {
 	Status  state.ApprovalStatus
 	Summary string
 	Err     error
+	Warning string
 }
 
 // ErrUnknownAction is returned when the approval's Action does not match
@@ -171,22 +175,42 @@ func (e *Executor) Execute(approval *state.Approval) Result {
 	// against a refactor that pools Executors across projects and
 	// silently fires merge_pr against the wrong owner/repo. Empty
 	// approval.Repo is back-compat — approvals created before #489 had
-	// no stamp; we fall through to the existing behaviour to avoid
-	// breaking already-pending approvals on upgrade.
-	if strings.TrimSpace(approval.Repo) != "" && e.Cfg != nil {
+	// no stamp; we fall through to the existing behaviour (with a
+	// deprecation warning) so already-pending approvals don't abort on
+	// upgrade. state.MigrateApprovalsBindRepo back-fills the stamp on
+	// each supervisor cycle, so the unstamped window is narrow.
+	var legacyWarning string
+	stampedRepo := strings.TrimSpace(approval.Repo)
+	if stampedRepo != "" && e.Cfg != nil {
 		cfgRepo := strings.TrimSpace(e.Cfg.Repo)
-		if cfgRepo != "" && approval.Repo != cfgRepo {
+		if cfgRepo != "" && stampedRepo != cfgRepo {
 			return Result{
 				Status: state.ApprovalStatusExecutionFailed,
 				Summary: fmt.Sprintf(
 					"approval %s is bound to repo %q but executor cfg.Repo is %q — refusing cross-project mutation",
-					approval.ID, approval.Repo, cfgRepo,
+					approval.ID, stampedRepo, cfgRepo,
 				),
-				Err: fmt.Errorf("approval %s repo mismatch: approval=%s cfg=%s", approval.ID, approval.Repo, cfgRepo),
+				Err: fmt.Errorf("approval %s repo mismatch: approval=%s cfg=%s", approval.ID, stampedRepo, cfgRepo),
 			}
 		}
+	} else if stampedRepo == "" && e.Cfg != nil && strings.TrimSpace(e.Cfg.Repo) != "" {
+		legacyWarning = fmt.Sprintf(
+			"approval %s has no Repo stamp (pre-#489); executing against ambient cfg.Repo=%q — back-fill via state.MigrateApprovalsBindRepo",
+			approval.ID, strings.TrimSpace(e.Cfg.Repo),
+		)
 	}
 
+	res := e.dispatchAction(approval)
+	if legacyWarning != "" && res.Warning == "" {
+		res.Warning = legacyWarning
+	}
+	return res
+}
+
+// dispatchAction is the post-guard verb switch, kept separate so the
+// repo-guard / legacy-warning prelude in Execute can decorate the
+// returned Result uniformly.
+func (e *Executor) dispatchAction(approval *state.Approval) Result {
 	switch approval.Action {
 	case config.SupervisorActionMergePR:
 		return e.executeMergePR(approval)

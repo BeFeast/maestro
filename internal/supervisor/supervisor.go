@@ -234,6 +234,12 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		return state.SupervisorDecision{}, fmt.Errorf("load state: %w", err)
 	}
 	st.MarkStaleApprovals(time.Now().UTC())
+	// #489 migration: stamp Repo on any pre-#489 approval still in
+	// flight so the executor's cross-project guard can fence reliably.
+	// Idempotent — no-op once every in-flight approval is stamped.
+	if migrated := st.MigrateApprovalsBindRepo(cfg.Repo); migrated > 0 {
+		fmt.Fprintf(os.Stderr, "[supervisor] migrated %d unstamped approval(s) to repo=%s (#489)\n", migrated, cfg.Repo)
+	}
 	if reader == nil {
 		reader = github.New(cfg.Repo)
 	}
@@ -3396,6 +3402,12 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 	}
 	for _, a := range approvals {
 		res := ex.Execute(a)
+		if res.Warning != "" {
+			// #489 deprecation: legacy unstamped approval fell through the
+			// repo guard. Surface loudly so the operator notices the next
+			// MigrateApprovalsBindRepo pass should close the window.
+			fmt.Fprintf(os.Stderr, "[supervisor] approver warning: %s\n", res.Warning)
+		}
 		now := time.Now().UTC()
 		switch res.Status {
 		case state.ApprovalStatusExecuted:
