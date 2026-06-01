@@ -913,6 +913,55 @@ func isHighSeverity(body string) bool {
 	return false
 }
 
+// isCriticalSeverity reports whether a review comment is P0 (critical) only.
+// P1/P2/P3 are non-critical for the #565 convergence-merge escape.
+func isCriticalSeverity(body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "alt=\"p0\"") {
+		return true
+	}
+	if strings.Contains(lower, "/p0") {
+		return true
+	}
+	if strings.Contains(lower, "badge/p0") {
+		return true
+	}
+	return false
+}
+
+// hasGreptileCriticalCommentOnHead reports whether any Greptile inline comment
+// on the current head SHA is P0 (critical).
+func hasGreptileCriticalCommentOnHead(comments []greptileReviewComment, sha string) bool {
+	for _, comment := range comments {
+		if !isGreptileLogin(comment.User.Login) {
+			continue
+		}
+		if !reviewCommentTargetsHead(comment, sha) {
+			continue
+		}
+		if isCriticalSeverity(comment.Body) {
+			return true
+		}
+	}
+	return false
+}
+
+// PRHasCriticalReviewOnHead reports whether the PR has a P0 (critical) Greptile
+// inline comment on its current head SHA. Used by the orchestrator #565
+// convergence-merge escape: a retry-exhausted green PR with only non-critical
+// findings may merge, but a P0 on head hard-blocks.
+func (c *Client) PRHasCriticalReviewOnHead(prNumber int) (bool, error) {
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil {
+		return false, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	comments, err := c.greptileReviewComments(prNumber)
+	if err != nil {
+		return false, fmt.Errorf("greptile review comments for PR %d: %w", prNumber, err)
+	}
+	return hasGreptileCriticalCommentOnHead(comments, sha), nil
+}
+
 func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, error) {
 	out, err := exec.Command("gh", "api",
 		fmt.Sprintf("repos/%s/pulls/%d/comments", c.Repo, prNumber),

@@ -98,6 +98,7 @@ type Orchestrator struct {
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn              func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn      func(prNumber int) (approved bool, pending bool, err error)
+	ghPRHasCriticalReviewFn     func(prNumber int) (bool, error)
 	ghMergePRFn                 func(prNumber int) error
 	ghClosePRFn                 func(prNumber int, comment string) error
 	ghPRChecksOutputFn          func(prNumber int) (string, error)
@@ -215,6 +216,17 @@ func (o *Orchestrator) prGreptileApproved(prNumber int) (bool, bool, error) {
 		return o.ghPRGreptileApprovedFn(prNumber)
 	}
 	return o.gh.PRGreptileApproved(prNumber)
+}
+
+func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
+	if o.ghPRHasCriticalReviewFn != nil {
+		return o.ghPRHasCriticalReviewFn(prNumber)
+	}
+	if o.gh == nil {
+		// Fail safe: cannot determine criticality -> caller must NOT auto-merge.
+		return false, fmt.Errorf("no github client configured for critical-review check")
+	}
+	return o.gh.PRHasCriticalReviewOnHead(prNumber)
 }
 
 func (o *Orchestrator) mergePR(prNumber int) error {
@@ -2147,6 +2159,22 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					// has reached a stable terminal state that needs an
 					// operator decision, not another refused retry cycle.
 					if isSettledRetryExhausted(sess, pr.Number) {
+						// #565 convergence: the worker honestly exhausted its
+						// review-feedback retries. If no CRITICAL (P0) finding
+						// remains on head, do not dead-end — merge the green PR;
+						// residual P1/P2/P3 stay as advisory comments on the PR.
+						// A P0 on head still hard-blocks (operator/repair).
+						if o.cfg.MergeExhaustedNonCriticalReviewEnabled() {
+							hasCritical, cerr := o.prHasCriticalReview(pr.Number)
+							if cerr != nil {
+								log.Printf("[orch] convergence: critical-review check PR #%d failed: %v", pr.Number, cerr)
+							} else if !hasCritical {
+								log.Printf("[orch] convergence-merge: PR #%d retry-exhausted on review feedback but no P0 on head — merging green PR with residual advisory findings (#565)", pr.Number)
+								ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
+								continue
+							}
+							log.Printf("[orch] PR #%d retry-exhausted with a P0 finding on head — holding for operator/repair", pr.Number)
+						}
 						continue
 					}
 					log.Printf("[orch] PR #%d has review feedback; scheduling retry", pr.Number)

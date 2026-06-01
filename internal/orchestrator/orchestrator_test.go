@@ -7904,3 +7904,60 @@ func TestStartNewWorkers_RespectsMaxParallelHardCap(t *testing.T) {
 		t.Fatalf("active sessions = %d, want at most max_parallel=%d", len(s.ActiveSessions()), cfg.MaxParallel)
 	}
 }
+
+func TestAutoMergePRs_ConvergenceMergesRetryExhaustedNonCritical(t *testing.T) {
+	pr := github.PR{Number: 42, HeadRefName: "feat/x"}
+	merged := make([]int, 0)
+	cfg := &config.Config{Repo: "owner/repo", AutoRetryReviewFeedback: true, MergeStrategy: "parallel"}
+	o := &Orchestrator{
+		cfg:                         cfg,
+		notifier:                    &notify.Notifier{},
+		listOpenPRsFn:               func() ([]github.PR, error) { return []github.PR{pr}, nil },
+		ghPRCIStatusFn:              func(int) (string, error) { return "success", nil },
+		ghCollectPRReviewFeedbackFn: func(int) (string, error) { return "P1: non-blocking nit", nil },
+		ghPRHasCriticalReviewFn:     func(int) (bool, error) { return false, nil },
+		ghPRGreptileApprovedFn:      func(int) (bool, bool, error) { return false, false, nil },
+		ghMergePRFn:                 func(n int) error { merged = append(merged, n); return nil },
+		ghCloseIssueFn:              func(int, string) error { return nil },
+		workerStopFn:                func(*config.Config, string, *state.Session) error { return nil },
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 100, Status: state.StatusRetryExhausted, PRNumber: 42,
+		Branch: "feat/x", LastNotifiedStatus: "review_retry_exhausted",
+	}
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 1 || merged[0] != 42 {
+		t.Fatalf("convergence: merged = %v, want [42] (retry-exhausted green PR, no P0 on head, must merge #565)", merged)
+	}
+}
+
+func TestAutoMergePRs_ConvergenceHoldsOnCritical(t *testing.T) {
+	pr := github.PR{Number: 42, HeadRefName: "feat/x"}
+	merged := make([]int, 0)
+	cfg := &config.Config{Repo: "owner/repo", AutoRetryReviewFeedback: true, MergeStrategy: "parallel"}
+	o := &Orchestrator{
+		cfg:                         cfg,
+		notifier:                    &notify.Notifier{},
+		listOpenPRsFn:               func() ([]github.PR, error) { return []github.PR{pr}, nil },
+		ghPRCIStatusFn:              func(int) (string, error) { return "success", nil },
+		ghCollectPRReviewFeedbackFn: func(int) (string, error) { return "P0: critical", nil },
+		ghPRHasCriticalReviewFn:     func(int) (bool, error) { return true, nil },
+		ghMergePRFn:                 func(n int) error { merged = append(merged, n); return nil },
+		ghCloseIssueFn:              func(int, string) error { return nil },
+		workerStopFn:                func(*config.Config, string, *state.Session) error { return nil },
+	}
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 100, Status: state.StatusRetryExhausted, PRNumber: 42,
+		Branch: "feat/x", LastNotifiedStatus: "review_retry_exhausted",
+	}
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 0 {
+		t.Fatalf("convergence: a P0 finding on head must hard-block; merged = %v, want []", merged)
+	}
+}
