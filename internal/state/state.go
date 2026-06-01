@@ -1929,10 +1929,17 @@ func (s *State) LiveSessionsAt(now time.Time) []*Session {
 	return live
 }
 
-// SessionAt returns the live session bound to slot, if any. Used by the
-// approver executor (#488 slot-reuse fence) to verify a delete_worktree
-// approval still targets the worker that was running when the approval
-// was queued.
+// SessionAt returns the session currently bound to slot, if any —
+// regardless of session status (running, done, failed, dead). No
+// liveness filter is applied; callers that need one must compose with
+// SessionLive / SessionLiveAt explicitly.
+//
+// Used by the approver executor (#488 slot-reuse fence) to verify a
+// delete_worktree approval still targets the issue that was running
+// when the approval was queued. The fence intentionally treats any
+// session at the slot — including a freshly-terminated one — as the
+// authoritative slot owner, since a terminated session for issue #N
+// still indicates the slot was most recently bound to #N.
 func (s *State) SessionAt(slot string) (*Session, bool) {
 	if s == nil || s.Sessions == nil {
 		return nil, false

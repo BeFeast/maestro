@@ -153,10 +153,17 @@ func (e *Executor) Execute(approval *state.Approval) Result {
 				Summary: fmt.Sprintf("approval %s already executing in another goroutine", id),
 			}
 		}
-		defer lock.Unlock()
-		// Drop the lock from the map after release so long-lived processes
-		// don't accumulate one mutex per ever-seen approval ID.
+		// Defers are LIFO: register Delete first so it runs LAST (after
+		// Unlock). The inverse ordering — Delete runs first, then Unlock —
+		// would leave a window in which a second goroutine for the same ID
+		// calls LoadOrStore and receives a brand-new unlocked mutex,
+		// succeeds on TryLock against that fresh entry, and proceeds to
+		// fire the side effect concurrently with this still-locked one.
+		// Unlock-then-Delete keeps map and mutex state aligned: while the
+		// mutex is held, the map entry is also present, so every concurrent
+		// caller observes the same locked mutex and short-circuits.
 		defer e.locks.Delete(id)
+		defer lock.Unlock()
 	}
 
 	// Repo guard (#489 / premortem #3): refuse any approval whose
