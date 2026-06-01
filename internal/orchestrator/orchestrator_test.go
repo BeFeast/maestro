@@ -7538,6 +7538,120 @@ func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
 	}
 }
 
+// TestClearStaleRestartRequired_ClearsOnFreshStart verifies that a restart_required
+// flag persisted by a previous process is reconciled away on a fresh daemon start
+// (issue #549). The banner must not survive the very restart it asked the operator to
+// perform. A genuine config change after start must still re-raise the signal.
+func TestClearStaleRestartRequired_ClearsOnFreshStart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:     "owner/repo",
+		StateDir: dir,
+		Model: config.ModelConfig{
+			Default:  "codex",
+			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
+		},
+	}
+
+	// Seed state.json with a stale restart-required flag left over from a previous
+	// process (e.g. a model.default change that has since been reverted).
+	s, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	s.RestartRequired = true
+	s.RestartRequiredReason = "model.default changed (claude → freellm)"
+	if err := state.Save(dir, s); err != nil {
+		t.Fatalf("save seed state: %v", err)
+	}
+
+	// Fresh orchestrator: in-memory restartRequired is the zero value (false), which
+	// is the truth right after a (re)start.
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", "", ""),
+		router:   router.New(cfg),
+	}
+
+	o.clearStaleRestartRequired()
+
+	if o.restartRequired {
+		t.Fatal("in-memory restartRequired unexpectedly set on a fresh start")
+	}
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("reload state: %v", err)
+	}
+	if st.RestartRequired {
+		t.Fatalf("state.RestartRequired = true, want cleared after fresh start; reason=%q", st.RestartRequiredReason)
+	}
+	if st.RestartRequiredReason != "" {
+		t.Fatalf("state.RestartRequiredReason = %q, want empty after fresh start", st.RestartRequiredReason)
+	}
+
+	// A real config change applied AFTER start must still surface the signal — the
+	// fix clears stale state, it must not break the live signal.
+	newCfg := &config.Config{
+		Repo:     "owner/repo",
+		StateDir: dir,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
+		},
+	}
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(newCfg, &ticker)
+
+	if !o.restartRequired {
+		t.Fatal("restartRequired not re-raised by a real config change after start")
+	}
+	st, err = state.Load(dir)
+	if err != nil {
+		t.Fatalf("reload state after change: %v", err)
+	}
+	if !st.RestartRequired || !strings.Contains(st.RestartRequiredReason, "model.default") {
+		t.Fatalf("state restart-required not re-persisted after real change: %+v", st)
+	}
+}
+
+// TestClearStaleRestartRequired_PreservesInProcessSignal verifies that if a real
+// restart-required signal was already raised within this process before start
+// completes, clearStaleRestartRequired keeps it (it only reconciles stale state from a
+// PREVIOUS process, never a live in-process signal).
+func TestClearStaleRestartRequired_PreservesInProcessSignal(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:     "owner/repo",
+		StateDir: dir,
+		Model: config.ModelConfig{
+			Default:  "codex",
+			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}},
+		},
+	}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", "", ""),
+		router:   router.New(cfg),
+	}
+	o.markRestartRequired("model.default changed (codex → claude)")
+
+	o.clearStaleRestartRequired()
+
+	if !o.restartRequired {
+		t.Fatal("clearStaleRestartRequired wiped a live in-process restart-required signal")
+	}
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if !st.RestartRequired {
+		t.Fatal("state restart-required cleared despite a live in-process signal")
+	}
+}
+
 // --- issue #456: pre-spawn guard for already-merged / closed issues ---
 
 // TestStartNewWorkers_SkipsIssueWithMergedPRDespiteStaleReadyLabel verifies that an
