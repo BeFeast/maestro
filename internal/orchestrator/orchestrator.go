@@ -99,6 +99,7 @@ type Orchestrator struct {
 	ghPRCIStatusFn              func(prNumber int) (string, error)
 	ghPRGreptileApprovedFn      func(prNumber int) (approved bool, pending bool, err error)
 	ghPRHasCriticalReviewFn     func(prNumber int) (bool, error)
+	ghUpdateBranchFn            func(prNumber int) error
 	ghMergePRFn                 func(prNumber int) error
 	ghClosePRFn                 func(prNumber int, comment string) error
 	ghPRChecksOutputFn          func(prNumber int) (string, error)
@@ -227,6 +228,16 @@ func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
 		return false, fmt.Errorf("no github client configured for critical-review check")
 	}
 	return o.gh.PRHasCriticalReviewOnHead(prNumber)
+}
+
+func (o *Orchestrator) updateBranch(prNumber int) error {
+	if o.ghUpdateBranchFn != nil {
+		return o.ghUpdateBranchFn(prNumber)
+	}
+	if o.gh == nil {
+		return fmt.Errorf("no github client configured for update-branch")
+	}
+	return o.gh.UpdateBranch(prNumber)
 }
 
 func (o *Orchestrator) mergePR(prNumber int) error {
@@ -2748,15 +2759,30 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 	if err := o.mergePR(pr.Number); err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
 
-		// If the branch is behind main (not conflicting, just outdated), auto-rebase
+		// If the branch is behind main (not conflicting, just outdated),
+		// rebase the worktree when present; otherwise (worker already cleaned
+		// up, or the local rebase fails) fall back to server-side
+		// update-branch (#551) so a behind PR still converges to merge
+		// instead of dead-ending as an unresolvable conflict.
 		if strings.Contains(err.Error(), "not up to date") && o.cfg.AutoRebase {
-			log.Printf("[orch] PR #%d branch is behind main, auto-rebasing %s", pr.Number, slotName)
-			if rebaseErr := o.rebaseWorktree(sess.Worktree, sess.Branch); rebaseErr != nil {
-				log.Printf("[orch] auto-rebase failed for %s: %v", slotName, rebaseErr)
-				o.markUnresolvableConflict(slotName, sess, pr.Number, rebaseErr)
-			} else {
-				o.markRebaseQueued(slotName, sess, pr.Number)
+			log.Printf("[orch] PR #%d branch is behind main, updating %s", pr.Number, slotName)
+			rebased := false
+			if strings.TrimSpace(sess.Worktree) != "" {
+				if rebaseErr := o.rebaseWorktree(sess.Worktree, sess.Branch); rebaseErr != nil {
+					log.Printf("[orch] auto-rebase failed for %s: %v — falling back to server-side update-branch", slotName, rebaseErr)
+				} else {
+					rebased = true
+				}
 			}
+			if !rebased {
+				if upErr := o.updateBranch(pr.Number); upErr != nil {
+					log.Printf("[orch] update-branch fallback for PR #%d failed: %v", pr.Number, upErr)
+					o.markUnresolvableConflict(slotName, sess, pr.Number, upErr)
+					return false
+				}
+				log.Printf("[orch] PR #%d updated via server-side update-branch — re-validating next cycle", pr.Number)
+			}
+			o.markRebaseQueued(slotName, sess, pr.Number)
 			return false
 		}
 

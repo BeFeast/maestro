@@ -7961,3 +7961,29 @@ func TestAutoMergePRs_ConvergenceHoldsOnCritical(t *testing.T) {
 		t.Fatalf("convergence: a P0 finding on head must hard-block; merged = %v, want []", merged)
 	}
 }
+
+func TestMergeReadyPR_BehindBaseNoWorktreeFallsBackToUpdateBranch(t *testing.T) {
+	updateCalled := 0
+	cfg := &config.Config{Repo: "owner/repo", AutoRebase: true}
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(int) error {
+			return fmt.Errorf("Pull request is not mergeable: the head branch is not up to date with the base branch")
+		},
+		ghUpdateBranchFn: func(int) error { updateCalled++; return nil },
+	}
+	sess := &state.Session{IssueNumber: 100, PRNumber: 10, Branch: "feat/a", Status: state.StatusRetryExhausted}
+	s := state.NewState()
+	s.Sessions["slot-0"] = sess
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	o.mergeReadyPR(s, "slot-0", sess, pr)
+
+	if updateCalled != 1 {
+		t.Fatalf("server-side update-branch called %d times, want 1 (behind base + no worktree)", updateCalled)
+	}
+	if sess.Status != state.StatusQueued {
+		t.Fatalf("status = %q, want queued for re-validation after update-branch", sess.Status)
+	}
+}
