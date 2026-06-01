@@ -969,6 +969,73 @@ func validateSupervisorActions(field string, actions []string) error {
 	return nil
 }
 
+// Warnings returns non-fatal configuration issues an operator should
+// address. Each entry is a single-line human-readable sentence; callers
+// log them on startup / hot-reload. Returns nil when nothing is wrong so
+// callers can early-out without checking length.
+//
+// #425 (sup-98): hands-off projects (`review_gate` configured for
+// auto-merge AND no human in the loop) silently broke when
+// `merge_pr` was in `approval_required` — the supervisor recommended
+// `merge_pr`, the cautious gate minted an approval, and nothing ever
+// merged because nobody was around to click. The warning makes the
+// misconfiguration loud at config load time.
+func (c *Config) Warnings() []string {
+	if c == nil {
+		return nil
+	}
+	var warnings []string
+	if msg := c.handsOffMergeApprovalWarning(); msg != "" {
+		warnings = append(warnings, msg)
+	}
+	return warnings
+}
+
+func (c *Config) handsOffMergeApprovalWarning() string {
+	if c == nil {
+		return ""
+	}
+	gate := strings.ToLower(strings.TrimSpace(c.ReviewGate))
+	// Hands-off here means the project relies on Maestro to drive PRs
+	// through the merge gate without a human in the loop. The greptile /
+	// none gates are both compatible with hands-off operation; what
+	// matters is whether an operator is expected to click the merge
+	// button. Today that signal lives in approval_required.
+	if gate == "" {
+		return ""
+	}
+	gated := mergeApprovalGatedVerbs(c.Supervisor.ApprovalRequired)
+	if len(gated) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"config: hands-off project (review_gate=%s) has %s in supervisor.approval_required — the supervisor will mint an approval for every green PR and merge will block until a human acts. Remove from approval_required or accept the manual step.",
+		gate,
+		strings.Join(gated, "/"),
+	)
+}
+
+func mergeApprovalGatedVerbs(approvalRequired []string) []string {
+	wanted := map[string]struct{}{
+		SupervisorActionMergePR:    {},
+		SupervisorActionCloseIssue: {},
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, raw := range approvalRequired {
+		v := strings.ToLower(strings.TrimSpace(raw))
+		if _, ok := wanted[v]; !ok {
+			continue
+		}
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
 func knownSupervisorActions() map[string]bool {
 	return map[string]bool{
 		SupervisorActionAddReadyLabel:      true,

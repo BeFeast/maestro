@@ -2352,6 +2352,32 @@ func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorS
 			Summary:    firstNonEmpty(summary, "A PR is in checks/review/merge gate; no code worker is expected right now."),
 			NextAction: "Wait for checks and review gates, then merge or respawn from feedback.",
 		}
+	case "merge_pr":
+		// #425 (sup-98): the supervisor recommended a merge but the
+		// project policy lists merge_pr in approval_required, so a human
+		// must click. Surface as "approval required" instead of the
+		// generic "monitoring PR" so the dashboard shows the operator the
+		// blocker, not a passive "monitoring" pill.
+		if stuck, ok := findStuckState(latest.StuckStates, state.StuckPolicyBlocksMerge); ok {
+			operator = fleetOperatorState{
+				Kind:       "approval_required",
+				Tone:       "attention",
+				Label:      "Approval required",
+				Summary:    firstNonEmpty(stuck.Summary, summary, "PR is ready to merge but supervisor policy requires operator approval."),
+				NextAction: "Open the PR or the approvals queue and approve the merge so Maestro can complete the green-PR path.",
+			}
+			if stuck.Target != nil {
+				target = stuck.Target
+			}
+		} else {
+			operator = fleetOperatorState{
+				Kind:       "merge_ready",
+				Tone:       "busy",
+				Label:      "Ready to merge",
+				Summary:    firstNonEmpty(summary, "PR is ready to merge; supervisor will execute on the next cycle."),
+				NextAction: "Wait for the supervisor's next tick to merge the PR.",
+			}
+		}
 	case "spawn_worker":
 		operator = fleetOperatorState{
 			Kind:       "pending_dispatch",
@@ -2407,6 +2433,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func findStuckState(stucks []state.SupervisorStuckState, code string) (state.SupervisorStuckState, bool) {
+	for _, stuck := range stucks {
+		if stuck.Code == code {
+			return stuck, true
+		}
+	}
+	return state.SupervisorStuckState{}, false
 }
 
 func truncateFleetOperatorText(value string, limit int) string {
