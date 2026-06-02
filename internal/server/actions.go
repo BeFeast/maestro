@@ -69,6 +69,12 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 	if id == "" {
 		return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": "action_id is required"}, err: errors.New("missing action_id")}
 	}
+	// #567: the fleet snapshot surfaces operator-friendly verbs
+	// (mark_issue_ready / mark_issue_blocked / approve_merge); translate
+	// them to the underlying safe/approval verb BEFORE the dispatcher
+	// switches so the wiring stays in one place.
+	id = translateUIActionID(id)
+	req.ActionID = id
 	if isApprovalRequiredAction(id) || isUIOnlyAffordance(id) {
 		// Not our responsibility — caller dispatches to dispatchApprovalAction
 		// for the cautious-gate verbs, or falls back to 501 for UI-only.
@@ -113,6 +119,18 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("remove ready label: %v", err)}, err: err}
 		}
 		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target)}
+	case config.SupervisorActionAddBlockedLabel:
+		if blockedLabel == "" {
+			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no blocked label configured (cfg.Supervisor.BlockedLabel)"}, err: errors.New("no blocked label")}
+		}
+		summary := fmt.Sprintf("+label %s", blockedLabel)
+		if err := auditOrAbort(audit, req, authenticatedActor, id, target, summary); err != nil {
+			return auditFailureResult(id, target, err)
+		}
+		if err := gh.AddIssueLabel(req.IssueNumber, blockedLabel); err != nil {
+			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("add blocked label: %v", err)}, err: err}
+		}
+		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(id, target)}
 	case config.SupervisorActionRemoveBlockedLabel:
 		if blockedLabel == "" {
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no blocked label configured (cfg.Supervisor.BlockedLabel)"}, err: errors.New("no blocked label")}
@@ -149,6 +167,7 @@ func isSafeAction(id string) bool {
 	switch id {
 	case config.SupervisorActionAddReadyLabel,
 		config.SupervisorActionRemoveReadyLabel,
+		config.SupervisorActionAddBlockedLabel,
 		config.SupervisorActionRemoveBlockedLabel,
 		config.SupervisorActionAddIssueComment:
 		return true
@@ -168,7 +187,12 @@ func isApprovalRequiredAction(id string) bool {
 		// #565: review-repair respawn is approval-gated (RiskMutating);
 		// the orchestrator dispatcher loop spawns the actual worker once
 		// the cautious gate approves.
-		config.SupervisorActionSpawnReviewRepair:
+		config.SupervisorActionSpawnReviewRepair,
+		// #567: per-session worker-control verbs surfaced by the fleet
+		// snapshot — both go through the cautious gate before the
+		// executor calls into the WorkerController.
+		config.SupervisorActionRestartWorker,
+		config.SupervisorActionStopWorker:
 		return true
 	}
 	return false
@@ -177,14 +201,36 @@ func isApprovalRequiredAction(id string) bool {
 // isUIOnlyAffordance reports whether the action_id is a legacy UI-affordance
 // verb that is mutating but not yet wired into either dispatcher. These keep
 // returning 501 until they are migrated to safe or approval-required
-// semantics.
+// semantics. #567 moved the original five fleet-snapshot verbs out of this
+// set — mark_issue_ready / mark_issue_blocked / approve_merge / restart_worker
+// / stop_worker — so the set is now empty in the default build. Kept for
+// future verbs that surface in the UI before the cautious gate catches up.
 func isUIOnlyAffordance(id string) bool {
-	switch id {
-	case "approve_merge", "restart_worker", "stop_worker",
-		"mark_issue_ready", "mark_issue_blocked":
-		return true
-	}
+	_ = id
 	return false
+}
+
+// translateUIActionID maps the operator-friendly verbs the fleet snapshot
+// surfaces on per-worker / per-project rows to the underlying safe or
+// approval verb the dispatcher knows about (#567). Returns id unchanged
+// when no translation is needed.
+//
+//   - mark_issue_ready   → add_ready_label   (safe)
+//   - mark_issue_blocked → add_blocked_label (safe)
+//   - approve_merge      → merge_pr          (cautious-gate enqueue)
+//
+// restart_worker / stop_worker keep their UI names because the executor
+// dispatches on those exact verbs.
+func translateUIActionID(id string) string {
+	switch id {
+	case "mark_issue_ready":
+		return config.SupervisorActionAddReadyLabel
+	case "mark_issue_blocked":
+		return config.SupervisorActionAddBlockedLabel
+	case "approve_merge":
+		return config.SupervisorActionMergePR
+	}
+	return id
 }
 
 func safeActionReadyLabel(cfg *config.Config) string {
@@ -280,7 +326,10 @@ type approvalEnqueueResponse struct {
 // for an authenticated caller the verb is enqueued (not executed) AND the
 // audit + decision identity comes from the credential, not the body.
 func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateDir string, audit actionAuditRecorder, authenticatedActor string) safeActionResult {
-	id := strings.TrimSpace(req.ActionID)
+	// #567: translate UI verbs to underlying verbs first so the per-verb
+	// switches below operate on canonical action_ids.
+	id := translateUIActionID(strings.TrimSpace(req.ActionID))
+	req.ActionID = id
 	if !isApprovalRequiredAction(id) {
 		return safeActionResult{handled: false}
 	}
@@ -361,6 +410,17 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 		// manually against the latest head).
 		if req.PRNumber <= 0 {
 			return errors.New("pr_number is required for spawn_review_repair")
+		}
+	case config.SupervisorActionRestartWorker, config.SupervisorActionStopWorker:
+		// #567: the executor / WorkerController needs the slot to kill
+		// the tmux session. We also require an issue number so the
+		// slot-reuse fence (premortem #7) can refuse to operate on a
+		// recycled slot that now belongs to a different issue.
+		if err := state.ValidateSlotID(req.Slot); err != nil {
+			return fmt.Errorf("%s: %w", id, err)
+		}
+		if req.IssueNumber <= 0 {
+			return fmt.Errorf("issue_number is required for %s (slot-reuse fence)", id)
 		}
 	}
 	return nil

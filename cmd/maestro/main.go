@@ -675,6 +675,7 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
 		Sessions:  approver.SessionLookupFunc(st.SessionAt),
+		Workers:   newWorkerController(cfg),
 	}
 	res := ex.Execute(approval)
 
@@ -712,6 +713,45 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 			log.Fatalf("Approval %s execution failed: %v", approval.ID, res.Err)
 		}
 		log.Fatalf("Approval %s execution failed: %s", approval.ID, res.Summary)
+	}
+}
+
+// newWorkerController wires worker.Stop + state transitions into the
+// approver WorkerController interface (#567). The approver's executor
+// calls these when an operator approves a restart_worker / stop_worker
+// approval from the fleet snapshot.
+//
+//   - stop_worker: terminate the worker, mark the session StatusDead,
+//     and clear NextRetryAt so the orchestrator does NOT respawn.
+//   - restart_worker: terminate the worker, mark the session StatusDead,
+//     and set NextRetryAt = now so respawnDueRetries picks it up on the
+//     next dispatcher cycle.
+//
+// Both functions mutate sess in place; the caller of ex.Execute() is
+// responsible for state.Save (the supervisor and CLI approve paths do
+// this immediately).
+func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
+	return approver.WorkerControllerFuncs{
+		Stop: func(slot string, sess *state.Session) error {
+			if err := worker.Stop(cfg, slot, sess); err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			sess.Status = state.StatusDead
+			sess.FinishedAt = &now
+			sess.NextRetryAt = nil
+			return nil
+		},
+		Restart: func(slot string, sess *state.Session) error {
+			if err := worker.Stop(cfg, slot, sess); err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			sess.Status = state.StatusDead
+			sess.FinishedAt = &now
+			sess.NextRetryAt = &now
+			return nil
+		},
 	}
 }
 

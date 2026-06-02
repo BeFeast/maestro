@@ -3699,16 +3699,34 @@ func assertFleetReadOnlyAction(t *testing.T, action controlAction) {
 		t.Fatalf("action %s label = %q, want concise non-wrapping label", action.ID, action.Label)
 	}
 	if action.Description == "" {
-		t.Fatalf("action %+v should describe the disabled operation", action)
+		t.Fatalf("action %+v should describe the operation", action)
 	}
 	if action.Scope == "" || action.Target == "" {
 		t.Fatalf("action %+v should include scope and target metadata", action)
 	}
-	if !action.Mutating || !action.RequiresApproval || !action.Disabled {
-		t.Fatalf("action %+v should be disabled mutating approval affordance", action)
+	if !action.Mutating || !action.Disabled {
+		t.Fatalf("action %+v should be disabled mutating affordance in read-only mode", action)
 	}
-	if action.ApprovalPolicy != controlApprovalPolicyManual {
-		t.Fatalf("approval policy = %q, want %q", action.ApprovalPolicy, controlApprovalPolicyManual)
+	// #567: safe verbs (mark_issue_*) execute directly through the
+	// safe-action dispatcher and report safe_direct + requires_approval=false.
+	// Approval-gated verbs (restart_worker / stop_worker / approve_merge)
+	// keep the manual_approval_required policy. The disabled-in-read-only
+	// invariant is identical for both groups.
+	switch action.ID {
+	case "mark_issue_ready", "mark_issue_blocked":
+		if action.ApprovalPolicy != controlApprovalPolicySafe {
+			t.Fatalf("safe action %s policy = %q, want %q", action.ID, action.ApprovalPolicy, controlApprovalPolicySafe)
+		}
+		if action.RequiresApproval {
+			t.Fatalf("safe action %s should not require approval", action.ID)
+		}
+	default:
+		if action.ApprovalPolicy != controlApprovalPolicyManual {
+			t.Fatalf("approval policy = %q, want %q", action.ApprovalPolicy, controlApprovalPolicyManual)
+		}
+		if !action.RequiresApproval {
+			t.Fatalf("approval-gated action %s should require approval", action.ID)
+		}
 	}
 	if !contains(action.DisabledReason, "Read-only mode") {
 		t.Fatalf("disabled reason = %q, want read-only explanation", action.DisabledReason)

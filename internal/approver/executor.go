@@ -54,6 +54,47 @@ func (f WorktreeRemoverFunc) RemoveWorktree(localPath, worktreePath string) erro
 	return f(localPath, worktreePath)
 }
 
+// WorkerController is the narrow surface the executor needs to drive
+// the per-session worker-control verbs (#567: restart_worker /
+// stop_worker). Implementations kill the tmux session + reap the worker
+// process tree, and — for restart — leave the slot in a state the
+// orchestrator's dispatcher loop will respawn on the next cycle.
+//
+// Both methods MUST mutate sess in place: stop_worker transitions the
+// session to a terminal status; restart_worker leaves it in StatusDead
+// with NextRetryAt = now so respawnDueRetries picks it up. The caller of
+// ex.Execute() is responsible for persisting state via state.Save.
+type WorkerController interface {
+	StopWorker(slot string, sess *state.Session) error
+	RestartWorker(slot string, sess *state.Session) error
+}
+
+// WorkerControllerFuncs adapts a pair of plain functions to the
+// WorkerController interface so cmd/maestro and supervisor can plug in
+// worker.Stop + small state mutations via closures without defining a
+// concrete type. Either field may be nil — calling the corresponding
+// method returns a clear error instead of panicking.
+type WorkerControllerFuncs struct {
+	Stop    func(slot string, sess *state.Session) error
+	Restart func(slot string, sess *state.Session) error
+}
+
+// StopWorker satisfies the WorkerController interface.
+func (w WorkerControllerFuncs) StopWorker(slot string, sess *state.Session) error {
+	if w.Stop == nil {
+		return errors.New("no stop function configured for WorkerController")
+	}
+	return w.Stop(slot, sess)
+}
+
+// RestartWorker satisfies the WorkerController interface.
+func (w WorkerControllerFuncs) RestartWorker(slot string, sess *state.Session) error {
+	if w.Restart == nil {
+		return errors.New("no restart function configured for WorkerController")
+	}
+	return w.Restart(slot, sess)
+}
+
 // SessionLookup is the narrow surface the executor needs from a state
 // container to fence slot-reuse races (#488). state.State satisfies this
 // trivially via SessionLookupFunc(st.SessionAt); tests inject fakes.
@@ -88,6 +129,11 @@ type Executor struct {
 	// approval enqueue and execute (premortem failure mode #7). Optional;
 	// nil disables the fence.
 	Sessions SessionLookup
+
+	// Workers, when non-nil, drives the per-session worker-control verbs
+	// (#567: restart_worker / stop_worker). nil disables both verbs —
+	// the executor returns execution_failed with a clear summary.
+	Workers WorkerController
 
 	// locks serializes Execute(approval) per approval.ID within the same
 	// process. The second concurrent caller for the same ID returns
@@ -218,6 +264,10 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 		return e.executeCloseIssue(approval)
 	case config.SupervisorActionDeleteWorktree:
 		return e.executeDeleteWorktree(approval)
+	case config.SupervisorActionStopWorker:
+		return e.executeStopWorker(approval)
+	case config.SupervisorActionRestartWorker:
+		return e.executeRestartWorker(approval)
 	case config.SupervisorActionChangeGlobalConfig:
 		// Intentionally NOT implemented in this PR — the YAML mutation
 		// pipeline (whitelist, atomic write, restart coordination) is
@@ -455,6 +505,87 @@ func (e *Executor) executeDeleteWorktree(approval *state.Approval) Result {
 	return Result{
 		Status:  state.ApprovalStatusExecuted,
 		Summary: fmt.Sprintf("removed worktree for slot %s (%s)", slot, worktreePath),
+	}
+}
+
+// executeStopWorker terminates the worker session at approval.Target.Session
+// via the WorkerController. The controller is expected to kill the tmux
+// pane + reap the worker process tree AND mutate sess.Status to a
+// terminal state (typically StatusFailed with FinishedAt set). #567.
+func (e *Executor) executeStopWorker(approval *state.Approval) Result {
+	return e.executeWorkerControl(approval, "stop_worker", true)
+}
+
+// executeRestartWorker stops the worker at approval.Target.Session and
+// leaves the slot in a state the orchestrator's respawnDueRetries loop
+// will pick up on the next cycle. The controller is expected to mutate
+// sess.Status to StatusDead with NextRetryAt = now. #567.
+func (e *Executor) executeRestartWorker(approval *state.Approval) Result {
+	return e.executeWorkerControl(approval, "restart_worker", false)
+}
+
+func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, stop bool) Result {
+	if approval.Target == nil || strings.TrimSpace(approval.Target.Session) == "" {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("%w: session/slot missing", ErrMissingTarget)}
+	}
+	if e.Workers == nil {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("%s: no worker controller wired into executor", verb),
+			Err:     errors.New("nil worker controller"),
+		}
+	}
+
+	slot := approval.Target.Session
+
+	// Slot-reuse fence — same shape as executeDeleteWorktree (#488 /
+	// premortem #7). By the time the operator approves a stop/restart,
+	// the slot may have been recycled to a different live issue.
+	// Refuse to act when the live session belongs to another issue.
+	// When Sessions is not wired (older callers / tests) fall through
+	// without the fence so the verb still functions.
+	var sess *state.Session
+	if e.Sessions != nil {
+		live, ok := e.Sessions.LookupSession(slot)
+		if !ok || live == nil {
+			return Result{
+				Status:  state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf("%s: no session bound to slot %s", verb, slot),
+			}
+		}
+		if approval.Target.Issue > 0 && live.IssueNumber != approval.Target.Issue {
+			return Result{
+				Status: state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf(
+					"slot %s now bound to issue #%d (approval expected #%d) — refusing to %s a recycled worker",
+					slot, live.IssueNumber, approval.Target.Issue, verb,
+				),
+				Err: fmt.Errorf("slot %s reused: live=#%d approval=#%d", slot, live.IssueNumber, approval.Target.Issue),
+			}
+		}
+		sess = live
+	}
+
+	var err error
+	if stop {
+		err = e.Workers.StopWorker(slot, sess)
+	} else {
+		err = e.Workers.RestartWorker(slot, sess)
+	}
+	if err != nil {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("%s on slot %s: %v", verb, slot, err),
+			Err:     fmt.Errorf("%s on slot %s: %w", verb, slot, err),
+		}
+	}
+	summary := fmt.Sprintf("stopped worker on slot %s", slot)
+	if !stop {
+		summary = fmt.Sprintf("restarted worker on slot %s (queued for respawn)", slot)
+	}
+	return Result{
+		Status:  state.ApprovalStatusExecuted,
+		Summary: summary,
 	}
 }
 

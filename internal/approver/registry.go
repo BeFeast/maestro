@@ -35,6 +35,12 @@ var KnownApprovalActions = map[string]struct{}{
 	// re-attempted. Replaces the refused `spawn_repair_worker` verb for
 	// the green+retry_exhausted+P0/P1-on-head case.
 	"spawn_review_repair": {},
+	// #567: per-session worker-control verbs surfaced by the fleet
+	// Mission Control snapshot. Executor calls into the WorkerController
+	// to kill the tmux session + (for restart) flag the slot for the
+	// next dispatcher respawn.
+	"restart_worker": {},
+	"stop_worker":    {},
 }
 
 // KnownSafeActions is the canonical set of safe (non-approval-gated)
@@ -45,6 +51,7 @@ var KnownApprovalActions = map[string]struct{}{
 var KnownSafeActions = map[string]struct{}{
 	"add_ready_label":      {},
 	"remove_ready_label":   {},
+	"add_blocked_label":    {},
 	"remove_blocked_label": {},
 	"add_issue_comment":    {},
 }

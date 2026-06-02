@@ -79,12 +79,22 @@ type GitHubProjectsConfig struct {
 const (
 	SupervisorActionAddReadyLabel      = "add_ready_label"
 	SupervisorActionRemoveReadyLabel   = "remove_ready_label"
+	SupervisorActionAddBlockedLabel    = "add_blocked_label"
 	SupervisorActionRemoveBlockedLabel = "remove_blocked_label"
 	SupervisorActionAddIssueComment    = "add_issue_comment"
 	SupervisorActionMergePR            = "merge_pr"
 	SupervisorActionCloseIssue         = "close_issue"
 	SupervisorActionDeleteWorktree     = "delete_worktree"
 	SupervisorActionChangeGlobalConfig = "change_global_config"
+	// SupervisorActionRestartWorker / SupervisorActionStopWorker are the
+	// per-session worker-control verbs surfaced by the fleet snapshot
+	// (#567). Both are approval-gated: the operator clicks Restart/Stop on
+	// a worker row, the server enqueues a pending Approval, and the
+	// approver executor calls the WorkerController to kill the tmux
+	// session + (for restart) mark the slot for the next dispatcher
+	// respawn.
+	SupervisorActionRestartWorker = "restart_worker"
+	SupervisorActionStopWorker    = "stop_worker"
 	// SupervisorActionSpawnReviewRepair is the auto review-repair respawn verb
 	// minted by the supervisor when a green+mergeable PR is settled
 	// retry_exhausted on review feedback and at least one Greptile P0/P1
@@ -1231,6 +1241,7 @@ func knownSupervisorActions() map[string]bool {
 	return map[string]bool{
 		SupervisorActionAddReadyLabel:      true,
 		SupervisorActionRemoveReadyLabel:   true,
+		SupervisorActionAddBlockedLabel:    true,
 		SupervisorActionRemoveBlockedLabel: true,
 		SupervisorActionAddIssueComment:    true,
 		SupervisorActionMergePR:            true,
@@ -1238,6 +1249,8 @@ func knownSupervisorActions() map[string]bool {
 		SupervisorActionDeleteWorktree:     true,
 		SupervisorActionChangeGlobalConfig: true,
 		SupervisorActionSpawnReviewRepair:  true,
+		SupervisorActionRestartWorker:      true,
+		SupervisorActionStopWorker:         true,
 	}
 }
 
@@ -1245,6 +1258,7 @@ func knownSupervisorActionNames() []string {
 	return []string{
 		SupervisorActionAddReadyLabel,
 		SupervisorActionRemoveReadyLabel,
+		SupervisorActionAddBlockedLabel,
 		SupervisorActionRemoveBlockedLabel,
 		SupervisorActionAddIssueComment,
 		SupervisorActionMergePR,
@@ -1252,6 +1266,8 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionDeleteWorktree,
 		SupervisorActionChangeGlobalConfig,
 		SupervisorActionSpawnReviewRepair,
+		SupervisorActionRestartWorker,
+		SupervisorActionStopWorker,
 	}
 }
 

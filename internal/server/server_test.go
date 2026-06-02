@@ -1118,17 +1118,22 @@ func TestHandleAction_ReadOnlyRejectsMutation(t *testing.T) {
 	}
 }
 
-func TestHandleAction_NotImplementedWhenWritable(t *testing.T) {
+func TestHandleAction_StopWorkerRejectsMissingIssueNumber(t *testing.T) {
+	// #567: stop_worker now flows through the cautious-gate approval
+	// dispatcher. The slot-reuse fence requires both slot and
+	// issue_number, so a body that omits issue_number is a 400. The
+	// legacy "approval-backed action endpoints are not implemented yet"
+	// 501 response is gone — this test pins that the verb is now wired.
 	srv, _ := setupTestServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/actions", bytes.NewBufferString(`{"action_id":"stop_worker","slot":"slot-1"}`))
 	w := httptest.NewRecorder()
 	srv.handleAction(w, req)
 
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusNotImplemented)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d (stop_worker requires issue_number for slot-reuse fence)", w.Code, http.StatusBadRequest)
 	}
-	if !contains(w.Body.String(), "approval-backed") {
-		t.Fatalf("response = %q, want approval-backed explanation", w.Body.String())
+	if contains(w.Body.String(), "not implemented") {
+		t.Fatalf("response = %q, must no longer surface the 'not implemented' stub (#567)", w.Body.String())
 	}
 }
 
@@ -1413,16 +1418,32 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 		t.Fatalf("action %s label = %q, want concise non-wrapping label", action.ID, action.Label)
 	}
 	if action.Description == "" {
-		t.Fatalf("action %+v should describe the disabled operation", action)
+		t.Fatalf("action %+v should describe the operation", action)
 	}
 	if action.Scope == "" || action.Target == "" {
 		t.Fatalf("action %+v should include scope and target metadata", action)
 	}
-	if !action.Mutating || !action.RequiresApproval {
-		t.Fatalf("action %+v should be mutating and approval-required", action)
+	if !action.Mutating {
+		t.Fatalf("action %+v should be mutating", action)
 	}
-	if action.ApprovalPolicy != controlApprovalPolicyManual {
-		t.Fatalf("approval policy = %q, want %q", action.ApprovalPolicy, controlApprovalPolicyManual)
+	// #567: mark_issue_* execute synchronously via the safe-action
+	// dispatcher (requires_approval=false / safe_direct policy);
+	// restart_worker / stop_worker / approve_merge stay approval-gated.
+	switch action.ID {
+	case "mark_issue_ready", "mark_issue_blocked":
+		if action.RequiresApproval {
+			t.Fatalf("safe action %s should not require approval", action.ID)
+		}
+		if action.ApprovalPolicy != controlApprovalPolicySafe {
+			t.Fatalf("safe action %s policy = %q, want %q", action.ID, action.ApprovalPolicy, controlApprovalPolicySafe)
+		}
+	default:
+		if !action.RequiresApproval {
+			t.Fatalf("approval-gated action %s should require approval", action.ID)
+		}
+		if action.ApprovalPolicy != controlApprovalPolicyManual {
+			t.Fatalf("approval policy = %q, want %q", action.ApprovalPolicy, controlApprovalPolicyManual)
+		}
 	}
 	if !action.Disabled {
 		t.Fatalf("action %+v should be disabled", action)

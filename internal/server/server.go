@@ -785,35 +785,72 @@ func sessionInfosWithActions(repo string, st *state.State, readOnly bool, endpoi
 	return infos
 }
 
-const controlApprovalPolicyManual = "manual_approval_required"
+const (
+	controlApprovalPolicyManual = "manual_approval_required"
+	controlApprovalPolicySafe   = "safe_direct"
+)
 
 func projectActionAffordances(readOnly bool, endpoint, target string) []controlAction {
-	reason := controlActionDisabledReason(readOnly)
 	return []controlAction{
-		newControlAction("mark_issue_ready", "Mark ready", "Would mark a selected issue ready for Maestro.", "project", target, 0, 0, endpoint, reason),
-		newControlAction("mark_issue_blocked", "Mark blocked", "Would mark a selected issue blocked for Maestro.", "project", target, 0, 0, endpoint, reason),
+		newSafeControlAction("mark_issue_ready", "Mark ready", "Add the maestro-ready label so the supervisor picks the issue up.", "project", target, 0, 0, endpoint, readOnly),
+		newSafeControlAction("mark_issue_blocked", "Mark blocked", "Add the blocked label so the supervisor holds the issue.", "project", target, 0, 0, endpoint, readOnly),
 	}
 }
 
 func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {
-	reason := controlActionDisabledReason(readOnly)
-	mergeReason := reason
-	if !readOnly && worker.PRNumber == 0 {
-		mergeReason = "No PR is associated with this worker; merge approval will require approval-backed controls after a PR exists."
-	} else if readOnly && worker.PRNumber == 0 {
-		mergeReason = reason + " This worker has no PR to approve."
+	merge := newApprovalControlAction("approve_merge", "Approve merge", "Enqueue a cautious-gate approval to merge this PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	if worker.PRNumber == 0 {
+		// PR-less workers can't enqueue merge_pr regardless of read-only;
+		// surface a verb-specific reason. In read-only mode this still
+		// mentions read-only so the operator knows enabling writes alone
+		// isn't sufficient — the worker needs to open a PR first.
+		merge.Disabled = true
+		if readOnly {
+			merge.DisabledReason = readOnlyDisabledReason() + " Additionally, this worker has no PR to approve."
+		} else {
+			merge.DisabledReason = "No PR is associated with this worker; approve merge becomes available once a PR is open."
+		}
 	}
 	return []controlAction{
-		newControlAction("restart_worker", "Restart", "Would restart this worker in place.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("stop_worker", "Stop", "Would stop this worker session.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("mark_issue_ready", "Mark ready", "Would mark this issue ready for Maestro.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("mark_issue_blocked", "Mark blocked", "Would mark this issue blocked for Maestro.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, reason),
-		newControlAction("approve_merge", "Approve merge", "Would approve merge for this PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, mergeReason),
+		newApprovalControlAction("restart_worker", "Restart", "Enqueue a cautious-gate approval to restart this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
+		newApprovalControlAction("stop_worker", "Stop", "Enqueue a cautious-gate approval to stop this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
+		newSafeControlAction("mark_issue_ready", "Mark ready", "Add the maestro-ready label so the supervisor picks the issue up.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
+		newSafeControlAction("mark_issue_blocked", "Mark blocked", "Add the blocked label so the supervisor holds the issue.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
+		merge,
 	}
 }
 
-func newControlAction(id, label, description, scope, target string, issueNumber, prNumber int, endpoint, disabledReason string) controlAction {
-	return controlAction{
+// newSafeControlAction returns a button for a safe verb (label/comment).
+// The control fires synchronously through dispatchSafeAction (no approval
+// queue), so requires_approval=false. Disabled only in read-only mode.
+func newSafeControlAction(id, label, description, scope, target string, issueNumber, prNumber int, endpoint string, readOnly bool) controlAction {
+	a := controlAction{
+		ID:               id,
+		Label:            label,
+		Description:      description,
+		Scope:            scope,
+		Target:           target,
+		IssueNumber:      issueNumber,
+		PRNumber:         prNumber,
+		Mutating:         true,
+		RequiresApproval: false,
+		ApprovalPolicy:   controlApprovalPolicySafe,
+		Method:           http.MethodPost,
+		Endpoint:         endpoint,
+	}
+	if readOnly {
+		a.Disabled = true
+		a.DisabledReason = readOnlyDisabledReason()
+	}
+	return a
+}
+
+// newApprovalControlAction returns a button for an approval-gated verb
+// (restart_worker / stop_worker / approve_merge). The control enqueues a
+// pending Approval through dispatchApprovalAction; the executor / operator
+// completes the cautious-gate verb. Disabled only in read-only mode.
+func newApprovalControlAction(id, label, description, scope, target string, issueNumber, prNumber int, endpoint string, readOnly bool) controlAction {
+	a := controlAction{
 		ID:               id,
 		Label:            label,
 		Description:      description,
@@ -824,18 +861,18 @@ func newControlAction(id, label, description, scope, target string, issueNumber,
 		Mutating:         true,
 		RequiresApproval: true,
 		ApprovalPolicy:   controlApprovalPolicyManual,
-		Disabled:         true,
-		DisabledReason:   disabledReason,
 		Method:           http.MethodPost,
 		Endpoint:         endpoint,
 	}
+	if readOnly {
+		a.Disabled = true
+		a.DisabledReason = readOnlyDisabledReason()
+	}
+	return a
 }
 
-func controlActionDisabledReason(readOnly bool) string {
-	if readOnly {
-		return "Read-only mode keeps write actions disabled until approval-backed controls are configured."
-	}
-	return "Approval-backed controls are not implemented yet."
+func readOnlyDisabledReason() string {
+	return "Read-only mode keeps write actions disabled. Restart maestro with --read-only=false (and an auth token) to enable."
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
