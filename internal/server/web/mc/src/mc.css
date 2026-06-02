@@ -1255,6 +1255,92 @@ input, textarea { font: inherit; color: inherit; }
 }
 .setting-input:focus { outline: none; border-color: var(--accent); }
 
+.settings-project-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  margin-bottom: var(--s-4);
+}
+.settings-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--s-3);
+  margin-bottom: var(--s-4);
+}
+.settings-metric {
+  background: var(--bg-2);
+  border: 1px solid var(--border-1);
+  border-radius: var(--r-2);
+  padding: var(--s-3);
+  min-width: 0;
+}
+.settings-metric span {
+  display: block;
+  color: var(--fg-3);
+  font-size: 10.5px;
+  margin-bottom: 4px;
+}
+.settings-metric strong {
+  color: var(--fg-0);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.settings-section {
+  border-top: 1px solid var(--border-1);
+  padding-top: var(--s-4);
+  margin-top: var(--s-4);
+}
+.settings-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-0);
+  margin-bottom: var(--s-3);
+}
+.settings-backends {
+  display: grid;
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+.settings-backend {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: var(--s-3);
+  background: var(--bg-2);
+  border: 1px solid var(--border-1);
+  border-radius: var(--r-2);
+  padding: var(--s-3);
+  min-width: 0;
+}
+.settings-backend > div { min-width: 0; }
+.settings-backend strong,
+.settings-backend .dim { overflow-wrap: anywhere; }
+.settings-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: flex-end;
+}
+.settings-tags span {
+  background: var(--bg-2);
+  border: 1px solid var(--border-1);
+  border-radius: var(--r-2);
+  color: var(--fg-1);
+  font-size: 10.5px;
+  padding: 2px 6px;
+  overflow-wrap: anywhere;
+}
+.settings-edit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  border-top: 1px solid var(--border-1);
+  margin-top: var(--s-4);
+  padding-top: var(--s-4);
+}
+
 .switch {
   width: 32px; height: 18px; border-radius: 10px;
   background: var(--bg-3); position: relative;
@@ -1268,6 +1354,14 @@ input, textarea { font: inherit; color: inherit; }
 }
 .switch.on { background: var(--accent-soft); }
 .switch.on::after { transform: translateX(14px); background: var(--accent); }
+
+@media (max-width: 860px) {
+  .settings-grid { grid-template-columns: 1fr; }
+  .settings-nav { flex-direction: row; flex-wrap: wrap; }
+  .settings-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-project-head,
+  .settings-edit-row { align-items: stretch; flex-direction: column; }
+}
 
 /* ===================================================================
    COMMAND PALETTE
