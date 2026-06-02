@@ -215,6 +215,64 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 	}
 }
 
+func TestReconcileRunningSessions_DeadWorkerWithOpenPR_CapturesTokensFromPersistedLog(t *testing.T) {
+	stateDir := t.TempDir()
+	logDir := state.LogDir(stateDir)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		t.Fatalf("mkdir log dir: %v", err)
+	}
+	logPath := logDir + "/sup-150.log"
+	if err := os.WriteFile(logPath, []byte("worker output\n\ntokens used\n100,965\nImplemented and opened PR\n"), 0644); err != nil {
+		t.Fatalf("write worker log: %v", err)
+	}
+
+	s := state.NewState()
+	s.Sessions["sup-150"] = &state.Session{
+		IssueNumber:       633,
+		IssueTitle:        "capture token total",
+		Status:            state.StatusRunning,
+		PID:               9999,
+		TmuxSession:       "maestro-sup-150",
+		Branch:            "feat/sup-150-633-cost-obs",
+		TokensUsedAttempt: 2000,
+		TokensUsedTotal:   5000,
+	}
+
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: stateDir},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 632, HeadRefName: "feat/sup-150-633-cost-obs", Title: "cost obs"}}, nil
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["sup-150"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.PRNumber != 632 {
+		t.Fatalf("pr_number = %d, want 632", sess.PRNumber)
+	}
+	if sess.TokensUsedAttempt != 100965 {
+		t.Fatalf("tokens_used_attempt = %d, want 100965", sess.TokensUsedAttempt)
+	}
+	if sess.TokensUsedTotal != 103965 {
+		t.Fatalf("tokens_used_total = %d, want 103965", sess.TokensUsedTotal)
+	}
+	if sess.PID != 0 {
+		t.Fatalf("pid = %d, want 0", sess.PID)
+	}
+	if sess.TmuxSession != "" {
+		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+}
+
 func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["mae-8"] = &state.Session{

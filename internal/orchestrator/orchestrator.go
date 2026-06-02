@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -399,6 +400,47 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 		return &reset
 	}
 	return nil
+}
+
+func (o *Orchestrator) workerLogFile(slotName string, sess *state.Session) string {
+	if sess == nil {
+		return ""
+	}
+	if logFile := strings.TrimSpace(sess.LogFile); logFile != "" {
+		return logFile
+	}
+	if o != nil && o.cfg != nil && strings.TrimSpace(o.cfg.StateDir) != "" {
+		return filepath.Join(state.LogDir(o.cfg.StateDir), slotName+".log")
+	}
+	return ""
+}
+
+func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.Session, output string) bool {
+	if sess == nil {
+		return false
+	}
+	tokens := worker.ParseTokensFromOutput(output)
+	if tokens <= sess.TokensUsedAttempt {
+		return false
+	}
+	delta := tokens - sess.TokensUsedAttempt
+	sess.TokensUsedAttempt = tokens
+	sess.TokensUsedTotal += delta
+	log.Printf("[orch] %s tokens_used updated: attempt=%d total=%d", slotName, tokens, sess.TokensUsedTotal)
+	return true
+}
+
+func (o *Orchestrator) updateTokensUsedFromWorkerLog(slotName string, sess *state.Session) bool {
+	logFile := o.workerLogFile(slotName, sess)
+	if logFile == "" {
+		return false
+	}
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		log.Printf("[orch] warn: could not read worker log for token capture %s (%s): %v", slotName, logFile, err)
+		return false
+	}
+	return o.updateTokensUsedFromOutput(slotName, sess, string(data))
 }
 
 // runAfterRunHook executes the after_run hook for a session (best-effort, never fatal).
@@ -1537,6 +1579,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// Without this check, reconcile would mark the session dead, causing
 		// IssueInProgress to return false and startNewWorkers to spawn a duplicate.
 		if pr, found := branchToPR[sess.Branch]; found {
+			o.updateTokensUsedFromWorkerLog(slotName, sess)
 			log.Printf("[orch] reconcile: %s running->pr_open (PR #%d already open for branch %q; %s)",
 				slotName, pr.Number, sess.Branch, strings.Join(reasons, ", "))
 			sess.Status = state.StatusPROpen
@@ -1569,6 +1612,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// fallback is configured / available, or when the respawn itself fails (#506).
 		if o.isRateLimited(sess.LogFile) {
 			now := time.Now().UTC()
+			o.updateTokensUsedFromWorkerLog(slotName, sess)
 			resetAt := o.rateLimitResetFromLog(sess.LogFile)
 			o.recordProviderLimit(s, slotName, sess, "log_rate_limit_reconcile", resetAt, now)
 			selection := o.selectProviderLimitFallback(s, sess, now)
@@ -1642,6 +1686,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 		oldPID := sess.PID
 		oldTmux := tmuxName
+		o.updateTokensUsedFromWorkerLog(slotName, sess)
 		sess.Status = state.StatusDead
 		sess.PID = 0
 		sess.TmuxSession = ""
@@ -1678,6 +1723,7 @@ func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.S
 		return 0, false
 	}
 
+	o.updateTokensUsedFromWorkerLog(slotName, sess)
 	sess.Status = state.StatusPROpen
 	sess.PRNumber = prNumber
 	sess.PID = 0
@@ -1870,6 +1916,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
+					o.updateTokensUsedFromWorkerLog(slotName, sess)
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -1881,6 +1928,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else if o.isRateLimited(sess.LogFile) {
 					// Provider capacity limit detected — gate this backend and select a fallback.
 					now := time.Now().UTC()
+					o.updateTokensUsedFromWorkerLog(slotName, sess)
 					resetAt := o.rateLimitResetFromLog(sess.LogFile)
 					o.recordProviderLimit(s, slotName, sess, "log_rate_limit", resetAt, now)
 					selection := o.selectProviderLimitFallback(s, sess, now)
@@ -1931,6 +1979,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						slotName, sess.IssueNumber, previousBackend, nextBackend)
 				} else if o.canRetryIssue(s, sess) {
 					// Schedule retry with exponential backoff (respects max_retries_per_issue)
+					o.updateTokensUsedFromWorkerLog(slotName, sess)
 					sess.RetryCount++
 					backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
@@ -1945,6 +1994,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
 				} else {
 					// Retry limit reached — mark as permanently failed
+					o.updateTokensUsedFromWorkerLog(slotName, sess)
 					log.Printf("[orch] worker %s (pid=%d) permanently failed after %d retries", slotName, sess.PID, sess.RetryCount)
 					// auto-label blocked disabled
 					o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
@@ -1988,12 +2038,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					log.Printf("[orch] warn: tmux capture-pane failed for %s (%s): %v", slotName, tmuxName, err)
 				} else {
 					// --- Token tracking ---
-					if tokens := worker.ParseTokensFromOutput(output); tokens > sess.TokensUsedAttempt {
-						delta := tokens - sess.TokensUsedAttempt
-						sess.TokensUsedAttempt = tokens
-						sess.TokensUsedTotal += delta
-						log.Printf("[orch] %s tokens_used updated: attempt=%d total=%d", slotName, tokens, sess.TokensUsedTotal)
-					}
+					o.updateTokensUsedFromOutput(slotName, sess, output)
 
 					// --- Rate-limit detection ---
 					if !sess.RateLimitHit && sess.LastNotifiedStatus != "rate_limit" {
