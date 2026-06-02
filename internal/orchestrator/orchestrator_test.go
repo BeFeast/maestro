@@ -2252,6 +2252,125 @@ func TestCheckSessions_SettledRetryExhausted_NoFlipFlop(t *testing.T) {
 	}
 }
 
+// #424: when the aggregate PRCIStatus sticks at "pending" (e.g. a legacy
+// commit-status that never resolves) but GitHub's per-PR mergeable_state
+// is "clean" (every required check has gone green) the orchestrator must
+// trust mergeable_state and merge the PR instead of looping on CI=pending.
+func TestAutoMergePRs_CIAggregateStaleButMergeStateClean_Merges(t *testing.T) {
+	prs := []github.PR{{Number: 99, HeadRefName: "feat/auth"}}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "pending", nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "clean", nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 1 || merged[0] != 99 {
+		t.Fatalf("merged = %v, want [99] (mergeable_state=clean must override stale aggregate CI=pending)", merged)
+	}
+}
+
+// mergeable_state="blocked" means a required check is still failing; the
+// orchestrator must NOT override CI=pending in that case.
+func TestAutoMergePRs_CIPendingAndMergeStateBlocked_DoesNotMerge(t *testing.T) {
+	prs := []github.PR{{Number: 101, HeadRefName: "feat/blocked"}}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "pending", nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "blocked", nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 0 {
+		t.Fatalf("merged = %v, want [] (mergeable_state=blocked must keep CI=pending blocking)", merged)
+	}
+}
+
+// mergeable_state="unstable" — only non-required checks are failing, so
+// the PR is still safe to merge under the same #424 override.
+func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
+	prs := []github.PR{{Number: 102, HeadRefName: "feat/unstable"}}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
+	merged := make([]int, 0)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "pending", nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "unstable", nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = append(merged, prNumber)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			return nil
+		},
+		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
+			return nil
+		},
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(merged) != 1 || merged[0] != 102 {
+		t.Fatalf("merged = %v, want [102] (mergeable_state=unstable should still allow merge)", merged)
+	}
+}
+
 func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
