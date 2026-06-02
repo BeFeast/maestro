@@ -887,6 +887,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #600: clear elapsed-RetryAfter / TTL-expired / proven-recovered
+	// cooldown entries so dashboard consumers see a truthful health map
+	// even between orchestrator cycles. Done here, not inside
+	// buildStateResponse, so the side effect is visible at the call site.
+	state.ReconcileBackendHealth(st, time.Now().UTC())
 	writeJSON(w, http.StatusOK, buildStateResponse(s.cfg, st))
 }
 
