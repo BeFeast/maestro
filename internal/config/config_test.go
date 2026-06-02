@@ -1199,6 +1199,7 @@ func TestParse_BlockerPatternsDefault(t *testing.T) {
 	}
 	want := []string{
 		`blocked by.*?#(\d+)`,
+		`blocked until.*?#(\d+).*merged`,
 		`depends on.*?#(\d+)`,
 	}
 	if len(cfg.BlockerPatterns) != len(want) {

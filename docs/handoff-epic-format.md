@@ -219,6 +219,14 @@ Depends on: #147
 ```
 
 ```markdown
+Blocked by #147
+```
+
+```markdown
+Blocked until #147 merged
+```
+
+```markdown
 Depends on: #148, #149
 ```
 
@@ -229,13 +237,20 @@ Depends on: #148, #149
 - #148 — UX wave 1 issues filed
 ```
 
-All three are recognised by `github.FindDependencies`. The structured
-section variant is preferred for wave epics because it survives template
-edits cleanly.
+The `Depends on:` and structured section variants are recognised by the
+built-in dependency parser. `Blocked by` / `Blocked until` forms are recognised
+through `blocker_patterns`, which are also used to keep issues out of the
+runnable queue while a blocker remains open. The structured section variant is
+preferred for wave epics because it survives template edits cleanly.
 
 ### Config
 
 ```yaml
+blocker_patterns:
+  - "blocked by.*?#(\\d+)"
+  - "blocked until.*?#(\\d+).*merged"
+  - "depends on.*?#(\\d+)"
+
 supervisor:
   ready_label: maestro-ready
   blocked_label: blocked

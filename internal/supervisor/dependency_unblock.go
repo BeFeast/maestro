@@ -163,7 +163,7 @@ func (e *Engine) evaluateDependencyUnblock(st *state.State, issues []github.Issu
 	}
 
 	for _, issue := range candidates {
-		deps := github.FindDependencies(issue.Body)
+		deps := dependencyUnblockDependencies(issue.Body, cfg.BlockerPatterns)
 		if len(deps) == 0 {
 			// A blocked issue without parseable dependencies is operator-
 			// gated: we don't guess when it's safe to unblock. Skip silently
@@ -225,6 +225,28 @@ func (e *Engine) evaluateDependencyUnblock(st *state.State, issues []github.Issu
 	}
 
 	return nil
+}
+
+func dependencyUnblockDependencies(body string, blockerPatterns []string) []int {
+	return mergeIssueRefs(github.FindBlockers(body, blockerPatterns), github.FindDependencies(body))
+}
+
+func mergeIssueRefs(groups ...[]int) []int {
+	seen := make(map[int]struct{})
+	var refs []int
+	for _, group := range groups {
+		for _, n := range group {
+			if n <= 0 {
+				continue
+			}
+			if _, ok := seen[n]; ok {
+				continue
+			}
+			seen[n] = struct{}{}
+			refs = append(refs, n)
+		}
+	}
+	return refs
 }
 
 // resolveDependencies returns the dependency issues that are closed or whose
