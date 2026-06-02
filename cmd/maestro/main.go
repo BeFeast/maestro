@@ -689,6 +689,17 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 		if _, mErr := st.MarkApprovalExecutionSkipped(approval.ID, now, *actor, res.Summary); mErr != nil {
 			log.Fatalf("supervise approve: mark skipped: %v", mErr)
 		}
+	case state.ApprovalStatusAwaitingDispatch:
+		// #430: spawn_worker / spawn_review_repair / open_child_issue
+		// hand off to the orchestrator's dispatcher loop — the executor
+		// records the intent but the actual worker.Start (or issue
+		// creation) is owned by another loop. Mark the approval as
+		// awaiting_dispatch so the dashboard + dedup keep treating it as
+		// effective, and tell the operator explicitly what's pending
+		// instead of falling through to "execution failed".
+		if _, mErr := st.MarkApprovalAwaitingDispatch(approval.ID, now, *actor, res.Summary); mErr != nil {
+			log.Fatalf("supervise approve: mark awaiting_dispatch: %v", mErr)
+		}
 	default: // execution_failed
 		msg := res.Summary
 		if msg == "" && res.Err != nil {
@@ -708,6 +719,8 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 		fmt.Printf("Approval %s executed: %s\n", approval.ID, res.Summary)
 	case state.ApprovalStatusExecutionSkipped:
 		fmt.Printf("Approval %s skipped: %s\n", approval.ID, res.Summary)
+	case state.ApprovalStatusAwaitingDispatch:
+		fmt.Printf("Approval %s awaiting dispatch: %s\n", approval.ID, res.Summary)
 	default:
 		if res.Err != nil {
 			log.Fatalf("Approval %s execution failed: %v", approval.ID, res.Err)
@@ -772,6 +785,13 @@ func printSupervisorDecision(decision state.SupervisorDecision, jsonOutput bool)
 	fmt.Printf("Confidence: %.2f\n", decision.Confidence)
 	if decision.ErrorClass != "" {
 		fmt.Printf("Error class: %s\n", decision.ErrorClass)
+	}
+	// #430: surface the requires_approval flag explicitly so an operator
+	// reading the CLI text output can tell at a glance that the supervisor
+	// only journaled a recommendation and the side effect is gated on an
+	// approval (or an autonomous-mode config flip).
+	if decision.RequiresApproval {
+		fmt.Println("Requires approval: yes (no side effect was executed; approve via `maestro supervise approve <id>` or unset supervisor.approval_required[_actions] to make it autonomous)")
 	}
 	if decision.ApprovalID != "" {
 		fmt.Printf("Approval: %s\n", decision.ApprovalID)
