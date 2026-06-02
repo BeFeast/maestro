@@ -458,8 +458,12 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 	if resp.Supervisor.LastSafeAction.OperatorSentence != "Watching PR #12 until checks and review pass." {
 		t.Fatalf("last safe operator sentence = %q", resp.Supervisor.LastSafeAction.OperatorSentence)
 	}
-	if len(resp.Supervisor.ApprovalActions) != 1 || !resp.Supervisor.ApprovalActions[0].Disabled {
-		t.Fatalf("approval actions = %#v, want one disabled action", resp.Supervisor.ApprovalActions)
+	// #477: the supervisor "controls not implemented yet" disabled button
+	// was a dead affordance — mutating verbs now flow through the per-worker
+	// controlAction buttons and the cautious approval gate. The supervisor
+	// info no longer publishes a standalone approval-actions list.
+	if len(resp.Supervisor.ApprovalActions) != 0 {
+		t.Fatalf("approval actions = %#v, want none", resp.Supervisor.ApprovalActions)
 	}
 	if resp.SupervisorLatest == nil || resp.SupervisorLatest.ID != "sup-latest" {
 		t.Fatalf("legacy supervisor_latest = %#v, want sup-latest", resp.SupervisorLatest)
@@ -1185,17 +1189,24 @@ func TestHandleDashboard(t *testing.T) {
 	if !contains(body, "issueSummaryHTML") || !contains(body, "issue-main") || !contains(body, "issue-title") {
 		t.Error("dashboard should keep issue links visible while truncating long titles")
 	}
-	if !contains(body, "renderWorkerActions") || !contains(body, "actionDetailHTML") || !contains(body, "manual approval required") {
-		t.Error("dashboard should render disabled approval-gated action affordances")
+	// #477: the legacy single-project dashboard is no longer the canonical
+	// write surface. renderWorkerActions still gates on the read-only banner,
+	// but the dead "disabled in both modes" button row was retired —
+	// operators land on Mission Control for live POSTs instead.
+	if !contains(body, "renderWorkerActions") || !contains(body, "Write controls disabled in read-only mode.") {
+		t.Error("dashboard should still render the read-only banner from renderWorkerActions")
+	}
+	if !contains(body, "Worker controls live in Mission Control") {
+		t.Error("dashboard non-read-only branch should point operators at Mission Control")
+	}
+	for _, unwanted := range []string{"actionDetailHTML", "renderActionButtons", "actionDisabledReason", "actionTargetText", "actionPolicyText", "manual approval required"} {
+		if contains(body, unwanted) {
+			t.Errorf("dashboard should no longer ship the dead disabled-button helper %q", unwanted)
+		}
 	}
 	for _, want := range []string{"<html data-theme=\"light\">", "/static/tokens.css", "/static/components.css", "/static/status-icons.svg", "/static/maestro-mark.svg", "/static/favicon-32.png", "/static/apple-touch-icon-180.png", "/static/og-1200x630.png", "Inter Tight", "JetBrains Mono", "#059669", "#0891b2", "color-scheme: light"} {
 		if !contains(body, want) {
 			t.Fatalf("dashboard design tokens should contain %q", want)
-		}
-	}
-	for _, want := range []string{"Scope", "Target", "Approval", "Disabled", "replace(/^Would\\s+/i"} {
-		if !contains(body, want) {
-			t.Fatalf("dashboard action guardrails should contain %q", want)
 		}
 	}
 }

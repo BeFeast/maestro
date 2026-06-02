@@ -60,3 +60,17 @@ Fresh machine (not .14 or .22), testing the full install -> init -> run flow.
 - #103: install.sh — add checksum verification
 - #104: init — validate model backend and generate richer config
 - #105: init — set PATH in generated systemd unit for AI CLI discovery
+
+## Dashboard write-path posture (#477)
+
+A fresh `maestro serve` boots **write-enabled by default** (trusted-LAN
+posture). The cautious approval gate still guards `merge_pr`, `close_issue`,
+`delete_worktree`, and `change_global_config`, so the writable dashboard
+cannot bypass operator approval for those four verbs. The flag override
+semantics are: pass `--read-only=true` to force read-only, otherwise the
+flag falls back to `server.read_only` from the per-project YAML (zero
+value = writable).
+
+For installs that need to be reachable beyond a trusted LAN, flip
+`server.read_only: true` (or pass `--read-only=true`) and configure the
+optional HTTP auth layer wired up by #616 (off by default).

@@ -123,8 +123,10 @@ maestro run --once
 # 5. Check status
 maestro status
 
-# 6. Watch the read-only web dashboard
-maestro serve --port 8787 --read-only
+# 6. Watch the Mission Control dashboard (trusted-LAN default: write-enabled)
+#    Add --read-only=true (or set server.read_only: true in YAML) for installs
+#    exposed beyond a trusted LAN; #616 covers optional HTTP auth.
+maestro serve --port 8787
 
 # 7. When ready, run continuously
 maestro run
@@ -137,10 +139,12 @@ To manually spawn a worker for a specific issue:
 maestro spawn --issue 42
 ```
 
-To watch Maestro from a browser, use the read-only Mission Control dashboard:
+To watch Maestro from a browser, use the Mission Control dashboard:
 ```bash
-maestro serve --config ./maestro.yaml --host 127.0.0.1 --port 8787 --read-only
+maestro serve --config ./maestro.yaml --host 127.0.0.1 --port 8787
 ```
+
+The dashboard now boots **write-enabled by default** (trusted-LAN posture, #477). The cautious approval gate still guards the four mutating verbs — `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config` — so even a writable HTTP caller cannot bypass operator approval. For installs exposed beyond a trusted LAN, run with `--read-only=true` (or set `server.read_only: true` in YAML) and configure the optional HTTP auth layer (#616, off by default).
 
 For multi-project Fleet Mission Control operations, see [`docs/fleet-mission-control-runbook.md`](docs/fleet-mission-control-runbook.md).
 
@@ -199,7 +203,7 @@ claude_cmd: claude                 # deprecated: use model.backends.claude.cmd
 server:
   host: 127.0.0.1                  # bind address for `maestro serve`
   port: 8787                       # 0 = disabled for `maestro run`
-  read_only: true                  # dashboard mode: block mutating HTTP endpoints
+  read_only: false                 # default: trusted-LAN, writes enabled; flip true for exposed installs (#477)
 issue_labels:                      # preferred label filter (OR semantics)
   - enhancement
 exclude_labels:

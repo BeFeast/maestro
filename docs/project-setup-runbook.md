@@ -269,7 +269,7 @@ Use the fleet dashboard when one operator needs a read-only overview across mult
 
 For day-to-day operations, review gates, queue policy, approvals, and safe recovery steps, see the [Fleet Mission Control operating runbook](fleet-mission-control-runbook.md).
 
-Start read-only first, controls later: keep the fleet dashboard in `--read-only` mode while it is used for observation and dogfooding. Add mutating controls only after the auth, audit, and per-project safety model is explicit.
+Trusted-LAN default (#477): the fleet dashboard now boots write-enabled out of the box. The cautious approval gate still guards `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config`, so the writable HTTP surface cannot bypass operator approval for those four verbs. For installs exposed beyond a trusted LAN, pass `--read-only=true` (or set `server.read_only: true` in YAML) and configure the optional HTTP auth layer that #616 wires up (off by default). This supersedes the prior "never flip --read-only before auth" caveat.
 
 To add a project:
 
@@ -291,10 +291,10 @@ projects:
 
 `config` may be absolute, `~/...`, or relative to the fleet YAML file. `dashboard_url` is deprecated (#516); any value still present is silently overridden with the project-scoped MC route on load. For dogfooding, add Maestro's own project config to the same fleet file so the team can watch Maestro manage Maestro alongside application repos.
 
-Run the fleet dashboard manually:
+Run the fleet dashboard manually (writes enabled by default on the trusted LAN; add `--read-only=true` for exposed installs):
 
 ```bash
-maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only
+maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787
 ```
 
 Verify the API:
@@ -322,7 +322,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/maestro serve --fleet %h/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only
+ExecStart=/usr/local/bin/maestro serve --fleet %h/.maestro/fleet.yaml --host 127.0.0.1 --port 8787
 Restart=on-failure
 RestartSec=10
 
@@ -338,10 +338,10 @@ systemctl --user enable --now maestro-fleet.service
 systemctl --user status maestro-fleet.service
 ```
 
-Bind to the LAN only on a trusted network or behind a firewall/reverse proxy:
+Bind to the LAN only on a trusted network or behind a firewall/reverse proxy. For non-LAN exposure, force `--read-only=true` and configure the auth layer (#616):
 
 ```bash
-maestro serve --fleet ~/.maestro/fleet.yaml --host 0.0.0.0 --port 8787 --read-only
+maestro serve --fleet ~/.maestro/fleet.yaml --host 0.0.0.0 --port 8787 --read-only=true
 ```
 
 ---

@@ -1,6 +1,6 @@
 # Fleet Mission Control Operating Runbook
 
-Use Fleet Mission Control as the primary operations surface for Maestro-managed repositories. The fleet dashboard shows one read-only view across project configs, runner state, supervisor decisions, approvals, stuck states, and active workers.
+Use Fleet Mission Control as the primary operations surface for Maestro-managed repositories. The fleet dashboard aggregates project configs, runner state, supervisor decisions, approvals, stuck states, and active workers in one view. On a trusted LAN the dashboard ships write-enabled by default (#477); the cautious approval gate still guards `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config`. Add `--read-only=true` (or `server.read_only: true` in YAML) for installs exposed beyond a trusted LAN, and configure the optional HTTP auth layer that #616 wires up.
 
 This runbook is intentionally safe for shared docs. It uses placeholders for local paths and never requires printing tokens, environment variables, raw config dumps, or full worker logs.
 
@@ -10,7 +10,7 @@ Reserve these services and ports on the workshop host:
 
 | Service | Default bind | Port | Purpose | Notes |
 |---|---:|---:|---|---|
-| Fleet Mission Control | `127.0.0.1` | `8787` | The single dashboard for the whole fleet, plus the `/api/v1/fleet` aggregate API and project-scoped routes (`/project/<name>`) | Start with `maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only` |
+| Fleet Mission Control | `127.0.0.1` | `8787` | The single dashboard for the whole fleet, plus the `/api/v1/fleet` aggregate API and project-scoped routes (`/project/<name>`) | Start with `maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787` (writes enabled on trusted LAN; add `--read-only=true` for exposed installs) |
 | Project runner | none by default | none | Runs `maestro run --config ...` and owns workers, worktrees, PR handling, and merge/deploy loops | It only serves HTTP when that project config has `server.port` set |
 | Supervisor loop | none | none | Runs `maestro supervise --config ...` to record decisions, safe queue label mutations, and approval requests | Can be manual, timer-driven, or a user service |
 | Worker sessions | none | none | tmux sessions and log files created under each project's `state_dir` | Inspect through Mission Control, `maestro status`, or `maestro logs` |
@@ -70,7 +70,7 @@ outcome:
 server:
   host: 127.0.0.1
   port: 8788
-  read_only: true
+  # read_only defaults to false (#477 trusted-LAN posture); set true for exposed installs.
 
 supervisor:
   enabled: true
@@ -228,8 +228,8 @@ Supervisor approvals are stale-sensitive. A pending approval becomes stale if th
 Use explicit config paths for project commands. These commands are safe for local operation because they do not print token values or dump entire configs. Treat worker logs as potentially sensitive and avoid pasting full logs into PRs or issues.
 
 ```bash
-# Fleet dashboard and API
-maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787 --read-only
+# Fleet dashboard and API (writes enabled by default on trusted LAN; add --read-only=true for exposed installs)
+maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787
 curl -fsS http://127.0.0.1:8787/api/v1/fleet
 
 # Project status and queue analysis
@@ -366,7 +366,7 @@ Safe response:
 
 ## Operator Checklist
 
-- Fleet dashboard is reachable on `127.0.0.1:8787` and is read-only.
+- Fleet dashboard is reachable on `127.0.0.1:8787`; on a trusted LAN it is write-enabled by default (#477), with the cautious approval gate guarding `merge_pr` / `close_issue` / `delete_worktree` / `change_global_config`.
 - Every project in `~/.maestro/fleet.yaml` has a distinct `state_dir`, `session_prefix`, and optional project dashboard port.
 - Project commands use `--config ~/.maestro/maestro-<project>.yaml`.
 - Dynamic wave has known runnable statuses and clear ready/blocked label ownership.
