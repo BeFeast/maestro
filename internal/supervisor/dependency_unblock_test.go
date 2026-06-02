@@ -198,6 +198,68 @@ func TestEvaluate_UnblocksWhenAllDependenciesClosed(t *testing.T) {
 	}
 }
 
+func TestEvaluate_UnblocksUsingConfiguredBlockerPatterns(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.BlockerPatterns = []string{`blocked until #(\d+) merged`}
+	enableDependencyUnblock(cfg)
+	issue := testIssue(150, "blocked until predecessor merges", "blocked")
+	issue.Body = "Blocked until #147 merged."
+	reader := &fakeReader{
+		issues:       []github.Issue{issue},
+		closedIssues: map[int]bool{147: true},
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionUnblockIssue {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionUnblockIssue)
+	}
+	if decision.Target == nil || decision.Target.Issue != 150 {
+		t.Fatalf("target = %#v, want issue 150", decision.Target)
+	}
+	if !strings.Contains(strings.Join(decision.Reasons, "\n"), "#147 closed") {
+		t.Fatalf("reasons = %#v, want closed dependency evidence", decision.Reasons)
+	}
+}
+
+func TestRunOnceDependencyUnblockAppliesSafeLabelMutations(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.BlockerPatterns = []string{`blocked until #(\d+) merged`}
+	enableDependencyUnblock(cfg)
+	issue := testIssue(150, "blocked until predecessor merges", "blocked")
+	issue.Body = "Blocked until #147 merged."
+	reader := &fakeReader{
+		issues:       []github.Issue{issue},
+		closedIssues: map[int]bool{147: true},
+	}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if decision.RecommendedAction != ActionUnblockIssue {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionUnblockIssue)
+	}
+	if got, want := strings.Join(reader.removedLabels, ","), "#150:blocked"; got != want {
+		t.Fatalf("removed labels = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(reader.addedLabels, ","), "#150:maestro-ready"; got != want {
+		t.Fatalf("added labels = %q, want %q", got, want)
+	}
+	if len(reader.comments) != 1 || !strings.Contains(reader.comments[0], "#147 closed") {
+		t.Fatalf("comments = %#v, want dependency evidence comment", reader.comments)
+	}
+	for _, mutation := range decision.Mutations {
+		if mutation.Status != MutationStatusSucceeded {
+			t.Fatalf("mutation %#v status = %q, want succeeded", mutation, mutation.Status)
+		}
+	}
+}
+
 // Test: dep merged-PR also resolves the dependency --------------------------
 
 func TestEvaluate_UnblocksWhenDependencyPRMerged(t *testing.T) {

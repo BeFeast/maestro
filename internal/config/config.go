@@ -747,7 +747,7 @@ type Config struct {
 	Pipeline                        PipelineConfig               `yaml:"pipeline"`
 	Hooks                           HooksConfig                  `yaml:"hooks"`
 	Missions                        MissionsConfig               `yaml:"missions"`
-	BlockerPatterns                 []string                     `yaml:"blocker_patterns"`         // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
+	BlockerPatterns                 []string                     `yaml:"blocker_patterns"`         // regex patterns to detect blocker references in issue body for queue skips and dependency_unblock (e.g. "blocked by #(\\d+)"; first capture group must be issue number)
 	PollIntervalSeconds             int                          `yaml:"poll_interval_seconds"`    // override poll interval from config (0 = use CLI flag)
 	StaleSessionReconciler          StaleSessionReconcilerConfig `yaml:"stale_session_reconciler"` // filter stale supervisor sessions from operator attention
 	SessionRetention                SessionRetentionConfig       `yaml:"session_retention"`        // #497: bound state.Sessions growth via terminal-session compaction
@@ -1056,6 +1056,7 @@ func parse(data []byte) (*Config, error) {
 	if cfg.BlockerPatterns == nil {
 		cfg.BlockerPatterns = []string{
 			`blocked by.*?#(\d+)`,
+			`blocked until.*?#(\d+).*merged`,
 			`depends on.*?#(\d+)`,
 		}
 	}

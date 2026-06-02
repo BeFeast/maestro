@@ -72,6 +72,11 @@ server:
   port: 8788
   # read_only defaults to false (#477 trusted-LAN posture); set true for exposed installs.
 
+blocker_patterns:
+  - "blocked by.*?#(\\d+)"
+  - "blocked until.*?#(\\d+).*merged"
+  - "depends on.*?#(\\d+)"
+
 supervisor:
   enabled: true
   mode: cautious
@@ -86,6 +91,11 @@ supervisor:
       - Ready
       - Backlog
       - New
+    dependency_unblock:
+      enabled: true
+      max_runnable: 1
+      enroll_in_project: true
+      announce_with_comment: true
   safe_actions:
     - add_ready_label
     - remove_ready_label
