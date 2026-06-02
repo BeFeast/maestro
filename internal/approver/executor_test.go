@@ -453,3 +453,182 @@ func TestWorktreePathForSlot_TrailingSlashBase(t *testing.T) {
 		t.Fatalf("got=%q err=%v", got, err)
 	}
 }
+
+// --- #567: restart_worker / stop_worker ----------------------------------
+
+type fakeWorkers struct {
+	stopCalls    []wcCall
+	restartCalls []wcCall
+	stopErr      error
+	restartErr   error
+}
+
+type wcCall struct {
+	slot string
+	sess *state.Session
+}
+
+func (f *fakeWorkers) StopWorker(slot string, sess *state.Session) error {
+	f.stopCalls = append(f.stopCalls, wcCall{slot: slot, sess: sess})
+	return f.stopErr
+}
+
+func (f *fakeWorkers) RestartWorker(slot string, sess *state.Session) error {
+	f.restartCalls = append(f.restartCalls, wcCall{slot: slot, sess: sess})
+	return f.restartErr
+}
+
+type fakeSessions map[string]*state.Session
+
+func (f fakeSessions) LookupSession(slot string) (*state.Session, bool) {
+	s, ok := f[slot]
+	return s, ok
+}
+
+func TestExecute_StopWorker_HappyPath(t *testing.T) {
+	wc := &fakeWorkers{}
+	sess := &state.Session{IssueNumber: 42, Status: state.StatusRunning}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": sess}}
+	a := mkApproval(config.SupervisorActionStopWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "stop me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("status = %q, want executed; res=%+v", res.Status, res)
+	}
+	if len(wc.stopCalls) != 1 || wc.stopCalls[0].slot != "slot-1" {
+		t.Fatalf("stopCalls = %+v", wc.stopCalls)
+	}
+	if len(wc.restartCalls) != 0 {
+		t.Fatalf("restart must NOT be called for stop_worker; got %+v", wc.restartCalls)
+	}
+	if !strings.Contains(res.Summary, "slot-1") {
+		t.Fatalf("summary = %q, want slot ref", res.Summary)
+	}
+}
+
+func TestExecute_RestartWorker_HappyPath(t *testing.T) {
+	wc := &fakeWorkers{}
+	sess := &state.Session{IssueNumber: 42, Status: state.StatusRunning}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": sess}}
+	a := mkApproval(config.SupervisorActionRestartWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "restart me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("status = %q, want executed; res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 1 || wc.restartCalls[0].slot != "slot-1" {
+		t.Fatalf("restartCalls = %+v", wc.restartCalls)
+	}
+	if len(wc.stopCalls) != 0 {
+		t.Fatalf("stop must NOT be called for restart_worker; got %+v", wc.stopCalls)
+	}
+}
+
+// TestExecute_StopWorker_SlotReuseFence pins the cautious-gate slot-reuse
+// fence (#488 pattern): if the slot now binds a different issue than the
+// approval targeted, refuse the stop without calling the controller.
+func TestExecute_StopWorker_SlotReuseFence(t *testing.T) {
+	wc := &fakeWorkers{}
+	// Live session bound to issue 999, but approval targets issue 42.
+	live := &state.Session{IssueNumber: 999, Status: state.StatusRunning}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": live}}
+	a := mkApproval(config.SupervisorActionStopWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "stop", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed (slot-reuse fence)", res.Status)
+	}
+	if len(wc.stopCalls) != 0 {
+		t.Fatalf("StopWorker must NOT be called when slot is recycled; got %+v", wc.stopCalls)
+	}
+	if !strings.Contains(res.Summary, "recycled") {
+		t.Fatalf("summary = %q, want mention of recycled slot", res.Summary)
+	}
+}
+
+func TestExecute_StopWorker_NoControllerFails(t *testing.T) {
+	// Workers nil → executor must report the misconfiguration loudly so
+	// the operator doesn't get a silent no-op approval.
+	ex := &Executor{Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionStopWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "stop", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed (no controller wired)", res.Status)
+	}
+}
+
+func TestExecute_StopWorker_MissingSlot(t *testing.T) {
+	wc := &fakeWorkers{}
+	ex := &Executor{Cfg: newCfg(), Workers: wc}
+	a := mkApproval(config.SupervisorActionStopWorker, &state.SupervisorTarget{Issue: 42}, "stop", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed (missing slot)", res.Status)
+	}
+	if !errors.Is(res.Err, ErrMissingTarget) {
+		t.Fatalf("err = %v, want ErrMissingTarget", res.Err)
+	}
+}
+
+// TestExecute_RestartWorker_ControllerErrorSurfaces ensures the
+// controller's error is wrapped and surfaced as execution_failed.
+func TestExecute_RestartWorker_ControllerErrorSurfaces(t *testing.T) {
+	wc := &fakeWorkers{restartErr: errors.New("tmux kill: ENOENT")}
+	sess := &state.Session{IssueNumber: 42, Status: state.StatusRunning}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": sess}}
+	a := mkApproval(config.SupervisorActionRestartWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "restart", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed (controller failed)", res.Status)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "tmux kill") {
+		t.Fatalf("err = %v, want wrapped controller error", res.Err)
+	}
+}
+
+func TestExecute_StopWorker_NoLiveSessionSkipped(t *testing.T) {
+	// Sessions wired but no session at the slot — return execution_skipped
+	// rather than failing, so the operator sees an actionable summary
+	// instead of a noisy execution_failed when the slot has already been
+	// freed before the approval lands.
+	wc := &fakeWorkers{}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{}}
+	a := mkApproval(config.SupervisorActionStopWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "stop", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped (no live session)", res.Status)
+	}
+	if len(wc.stopCalls) != 0 {
+		t.Fatalf("StopWorker must NOT be called when no session at slot; got %+v", wc.stopCalls)
+	}
+}
+
+// TestWorkerControllerFuncs_AdapterDispatches verifies the function-pair
+// adapter routes correctly to Stop / Restart.
+func TestWorkerControllerFuncs_AdapterDispatches(t *testing.T) {
+	var stopSlot, restartSlot string
+	wc := WorkerControllerFuncs{
+		Stop:    func(slot string, _ *state.Session) error { stopSlot = slot; return nil },
+		Restart: func(slot string, _ *state.Session) error { restartSlot = slot; return nil },
+	}
+	if err := wc.StopWorker("a", nil); err != nil || stopSlot != "a" {
+		t.Fatalf("stop dispatch: slot=%q err=%v", stopSlot, err)
+	}
+	if err := wc.RestartWorker("b", nil); err != nil || restartSlot != "b" {
+		t.Fatalf("restart dispatch: slot=%q err=%v", restartSlot, err)
+	}
+}
+
+func TestWorkerControllerFuncs_NilFunctionsReturnError(t *testing.T) {
+	wc := WorkerControllerFuncs{}
+	if err := wc.StopWorker("x", nil); err == nil {
+		t.Fatal("StopWorker with nil Stop func should return an error, not panic")
+	}
+	if err := wc.RestartWorker("x", nil); err == nil {
+		t.Fatal("RestartWorker with nil Restart func should return an error, not panic")
+	}
+}

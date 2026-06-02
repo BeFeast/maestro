@@ -252,6 +252,99 @@ func TestApprovalAction_SecondEnqueueDedupsToSameApproval(t *testing.T) {
 	}
 }
 
+// --- #567: per-session worker-control verbs ---------------------------------
+
+// TestApprovalAction_RestartWorker_Enqueues202 pins the fleet snapshot's
+// Restart button → HTTP enqueue path: POST `restart_worker` records a
+// pending approval bound to the slot + issue; gh is never touched.
+func TestApprovalAction_RestartWorker_Enqueues202(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"restart_worker","slot":"slot-3","issue_number":42,"reason":"manual respawn"}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	st := loadStateAt(t, dir)
+	if len(st.Approvals) != 1 || st.Approvals[0].Action != "restart_worker" {
+		t.Fatalf("state.Approvals = %+v", st.Approvals)
+	}
+	if got := st.Approvals[0].Target; got == nil || got.Session != "slot-3" || got.Issue != 42 {
+		t.Fatalf("target = %+v, want session=slot-3 issue=42", got)
+	}
+}
+
+func TestApprovalAction_StopWorker_Enqueues202(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"stop_worker","slot":"slot-3","issue_number":42}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	st := loadStateAt(t, dir)
+	if len(st.Approvals) != 1 || st.Approvals[0].Action != "stop_worker" {
+		t.Fatalf("state.Approvals = %+v", st.Approvals)
+	}
+}
+
+// TestApprovalAction_ApproveMerge_TranslatesToMergePR pins the UI-verb
+// translation: the fleet snapshot's Approve-merge button POSTs
+// action_id=approve_merge; the dispatcher rewrites that to merge_pr
+// before enqueueing — so the pending approval that lands matches the
+// /approvals screen's verb exactly.
+func TestApprovalAction_ApproveMerge_TranslatesToMergePR(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"approve_merge","pr_number":42}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	var resp approvalEnqueueResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ActionID != "merge_pr" {
+		t.Fatalf("action_id = %q, want merge_pr (UI verb must translate)", resp.ActionID)
+	}
+	st := loadStateAt(t, dir)
+	if len(st.Approvals) != 1 || st.Approvals[0].Action != "merge_pr" {
+		t.Fatalf("state.Approvals = %+v, want one merge_pr", st.Approvals)
+	}
+}
+
+// TestApprovalAction_RestartWorker_RequiresSlot pins the slot-reuse fence
+// at the HTTP boundary: an enqueue that omits the slot must 400 before
+// touching state.
+func TestApprovalAction_RestartWorker_RequiresSlot(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"restart_worker","issue_number":42}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (slot required)", w.Code)
+	}
+	if st := loadStateAt(t, dir); len(st.Approvals) != 0 {
+		t.Fatalf("approvals leaked on bad request: %+v", st.Approvals)
+	}
+}
+
+func TestApprovalAction_StopWorker_RequiresIssueNumber(t *testing.T) {
+	cfg, _ := approvalEnqueueCfg(t)
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"stop_worker","slot":"slot-1"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (issue_number required for slot-reuse fence)", w.Code)
+	}
+}
+
 // Different targets (different PR numbers) for the same action MUST stay
 // distinct. Dedup is keyed on (Action, Target), not Action alone.
 func TestApprovalAction_DifferentTargetsCoexist(t *testing.T) {

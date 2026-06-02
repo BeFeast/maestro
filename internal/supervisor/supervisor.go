@@ -3411,6 +3411,41 @@ func commandBinary(cmd, fallback string) string {
 	return fields[0]
 }
 
+// newWorkerController wires worker.Stop + state transitions into the
+// approver WorkerController interface (#567). The supervisor's
+// executeApprovedApprovals loop uses this to apply approved
+// restart_worker / stop_worker verbs from the fleet snapshot.
+//
+//   - stop_worker: terminate the worker, mark the session StatusDead,
+//     clear NextRetryAt so the orchestrator does NOT respawn.
+//   - restart_worker: terminate the worker, mark StatusDead with
+//     NextRetryAt = now so respawnDueRetries picks it up on the next
+//     dispatcher cycle.
+func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
+	return approver.WorkerControllerFuncs{
+		Stop: func(slot string, sess *state.Session) error {
+			if err := worker.Stop(cfg, slot, sess); err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			sess.Status = state.StatusDead
+			sess.FinishedAt = &now
+			sess.NextRetryAt = nil
+			return nil
+		},
+		Restart: func(slot string, sess *state.Session) error {
+			if err := worker.Stop(cfg, slot, sess); err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			sess.Status = state.StatusDead
+			sess.FinishedAt = &now
+			sess.NextRetryAt = &now
+			return nil
+		},
+	}
+}
+
 // executeApprovedApprovals runs any approvals currently in status=approved
 // through the approver.Executor and persists the resulting state
 // transitions. Failures are logged but do not abort the supervisor cycle —
@@ -3437,6 +3472,7 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
 		Sessions:  approver.SessionLookupFunc(st.SessionAt),
+		Workers:   newWorkerController(cfg),
 	}
 	for _, a := range approvals {
 		res := ex.Execute(a)

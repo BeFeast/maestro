@@ -1033,6 +1033,52 @@ async function parseApprovalResponse(res, verb) {
   return payload;
 }
 
+// postFleetAction drives the fleet snapshot's per-worker / per-project
+// action buttons (#567): mark_issue_ready, mark_issue_blocked,
+// restart_worker, stop_worker, approve_merge. The server translates UI
+// verbs to the underlying safe-action / cautious-gate verb and either
+// executes synchronously (200 for safe) or enqueues a pending Approval
+// (202 for cautious-gate). The caller surfaces the resolved
+// action_id / approval_id and any server-supplied error message.
+export async function postFleetAction({
+  actionId,
+  project,
+  slot,
+  issueNumber,
+  prNumber,
+  actor,
+  reason,
+}) {
+  if (!actionId) throw new Error("actionId is required");
+  const body = { action_id: actionId };
+  if (project) body.project = project;
+  if (slot) body.slot = slot;
+  if (issueNumber) body.issue_number = Number(issueNumber);
+  if (prNumber) body.pr_number = Number(prNumber);
+  if (actor) body.actor = actor;
+  if (reason) body.reason = reason;
+  const res = await fetch("/api/v1/fleet/actions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch (_) {
+    /* non-JSON body */
+  }
+  if (!res.ok) {
+    const msg =
+      (payload && (payload.error || payload.message)) ||
+      `action ${actionId} failed with status ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return payload;
+}
+
 // pickVerdictTuple returns the [headline, detail] pair the SPA hero
 // renders. Prefers the server-built short form (verdict.headline +
 // verdict.detail, issue #474); falls back to splitting the legacy

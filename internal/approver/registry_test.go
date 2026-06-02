@@ -49,11 +49,13 @@ func TestRegistry_IsKnownApprovalAction(t *testing.T) {
 		{"spawn_worker", true},
 		{"open_child_issue", true},
 		{"spawn_review_repair", true}, // #565: auto review-repair respawn
+		{"restart_worker", true},      // #567: per-session worker-control
+		{"stop_worker", true},         // #567: per-session worker-control
 
 		// Negative cases — the live-found bugs.
 		{"spawn_repair_repair", false},
 		{"spawn_repair_worker", false}, // dogfood 2026-05-30: minted by LLM, never implemented
-		{"approve_merge", false},       // hypothetical drift
+		{"approve_merge", false},       // UI verb — server translates to merge_pr before enqueue
 		{"add_ready_label", false},     // safe action, NOT in approval registry
 		{"", false},
 	}
@@ -74,6 +76,7 @@ func TestRegistry_IsKnownSafeAction(t *testing.T) {
 	}{
 		{"add_ready_label", true},
 		{"remove_ready_label", true},
+		{"add_blocked_label", true}, // #567: needed for mark_issue_blocked UI verb
 		{"remove_blocked_label", true},
 		{"add_issue_comment", true},
 

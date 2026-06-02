@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -170,22 +169,75 @@ func TestSafeAction_RequiresIssueNumber(t *testing.T) {
 	}
 }
 
-func TestSafeAction_UIOnlyAffordancesStill501(t *testing.T) {
-	// The 5 legacy UI-affordance verbs are still 501. They are not in the
-	// "safe" set (no GH call) and not yet wired into the cautious-gate
-	// dispatcher; we surface the same response the dashboard shipped before.
+func TestSafeAction_UIVerbsTranslate_MarkReadyExecutesDirectly(t *testing.T) {
+	// #567: mark_issue_ready now translates to add_ready_label and
+	// executes synchronously through the safe-action dispatcher — the
+	// 501 stub is gone.
 	gh := &fakeActionGH{}
 	srv := New(newSafeActionTestCfg(), nil)
 	srv.SetActionDeps(gh, nil)
 
-	for _, id := range []string{"approve_merge", "restart_worker", "stop_worker",
-		"mark_issue_ready", "mark_issue_blocked"} {
-		w := postAction(t, srv, fmt.Sprintf(`{"action_id":%q,"issue_number":1}`, id))
-		if w.Code != http.StatusNotImplemented {
-			t.Fatalf("action %q: status = %d, want 501; body=%s", id, w.Code, w.Body.String())
+	w := postAction(t, srv, `{"action_id":"mark_issue_ready","issue_number":42}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(gh.addLabelCalls) != 1 || gh.addLabelCalls[0].issue != 42 || gh.addLabelCalls[0].label != "maestro-ready" {
+		t.Fatalf("addLabelCalls = %+v, want one add of maestro-ready to #42", gh.addLabelCalls)
+	}
+}
+
+func TestSafeAction_UIVerbsTranslate_MarkBlockedExecutesDirectly(t *testing.T) {
+	// #567: mark_issue_blocked translates to add_blocked_label.
+	gh := &fakeActionGH{}
+	srv := New(newSafeActionTestCfg(), nil)
+	srv.SetActionDeps(gh, nil)
+
+	w := postAction(t, srv, `{"action_id":"mark_issue_blocked","issue_number":7}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(gh.addLabelCalls) != 1 || gh.addLabelCalls[0].issue != 7 || gh.addLabelCalls[0].label != "blocked" {
+		t.Fatalf("addLabelCalls = %+v, want one add of blocked to #7", gh.addLabelCalls)
+	}
+}
+
+func TestSafeAction_AddBlockedLabel_Executes(t *testing.T) {
+	// #567: new safe verb backing mark_issue_blocked.
+	gh := &fakeActionGH{}
+	srv := New(newSafeActionTestCfg(), nil)
+	srv.SetActionDeps(gh, nil)
+
+	w := postAction(t, srv, `{"action_id":"add_blocked_label","issue_number":99}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(gh.addLabelCalls) != 1 || gh.addLabelCalls[0].label != "blocked" {
+		t.Fatalf("addLabelCalls = %+v, want one add of blocked", gh.addLabelCalls)
+	}
+}
+
+func TestSafeAction_UIVerbsTranslate_ApprovalVerbsDoNotExecuteSafely(t *testing.T) {
+	// #567: approve_merge / restart_worker / stop_worker are approval-
+	// gated. The safe dispatcher must NOT call gh; the approval
+	// dispatcher takes over. The single-project handler has no stateDir
+	// in the test cfg, so the approval enqueue returns 500 (not 501
+	// "not implemented"). The important contract: no gh side effect
+	// fires, and the response is no longer the legacy 501 stub.
+	gh := &fakeActionGH{}
+	srv := New(newSafeActionTestCfg(), nil)
+	srv.SetActionDeps(gh, nil)
+
+	for _, payload := range []string{
+		`{"action_id":"approve_merge","issue_number":1,"pr_number":11}`,
+		`{"action_id":"restart_worker","issue_number":1,"slot":"slot-1"}`,
+		`{"action_id":"stop_worker","issue_number":1,"slot":"slot-1"}`,
+	} {
+		w := postAction(t, srv, payload)
+		if w.Code == http.StatusNotImplemented {
+			t.Fatalf("payload %s: status = 501; want the legacy 'not implemented' stub to be gone (#567)", payload)
 		}
 		if len(gh.addLabelCalls) != 0 || len(gh.removeLabelCalls) != 0 || len(gh.commentCalls) != 0 {
-			t.Fatalf("action %q: dispatcher unexpectedly called gh: add=%v rm=%v cmt=%v", id, gh.addLabelCalls, gh.removeLabelCalls, gh.commentCalls)
+			t.Fatalf("payload %s: approval-gated verb leaked a gh call: add=%v rm=%v cmt=%v", payload, gh.addLabelCalls, gh.removeLabelCalls, gh.commentCalls)
 		}
 	}
 }

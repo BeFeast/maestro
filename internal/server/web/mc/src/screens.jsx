@@ -12,6 +12,7 @@ import {
   formatAttributionTimeline,
   isApprovalActionCloseIssue,
   isApprovalActionMergePR,
+  postFleetAction,
   postFleetApproval,
   postProjectApproval,
   projectBoardIssueURL,
@@ -688,6 +689,8 @@ export function WorkerDrawer({ worker, onClose, now }) {
             </div>
           </div>
 
+          <WorkerActionsPanel worker={worker} readOnly={fleet?.readOnly} />
+
           <div className="drawer-sec">
             <div className="drawer-sec-title">Links</div>
             <div className="row gap-2">
@@ -713,6 +716,88 @@ export function WorkerDrawer({ worker, onClose, now }) {
         </div>
       </div>
     </>
+  );
+}
+
+// WorkerActionsPanel renders the per-worker action buttons surfaced in
+// the fleet snapshot (#567). Safe verbs (mark_issue_ready /
+// mark_issue_blocked) execute synchronously; cautious-gate verbs
+// (restart_worker / stop_worker / approve_merge) enqueue a pending
+// Approval the operator completes from the Approvals screen. Buttons
+// the server reports as `disabled` keep their disabled state and
+// expose the server's reason as a tooltip.
+function WorkerActionsPanel({ worker, readOnly }) {
+  const actions = Array.isArray(worker?.actions) ? worker.actions : [];
+  const [busyId, setBusyId] = React.useState("");
+  const [message, setMessage] = React.useState(null);
+
+  if (!actions.length) return null;
+
+  const project = worker.project_name || worker.project || "";
+  const slot = worker.slot || "";
+  const issueNumber = worker.issue_number || worker.issue?.num || 0;
+  const prNumber = worker.pr_number || 0;
+
+  const onClick = async (action) => {
+    if (action.disabled || busyId) return;
+    setBusyId(action.id);
+    setMessage(null);
+    try {
+      const resp = await postFleetAction({
+        actionId: action.id,
+        project,
+        slot,
+        issueNumber,
+        prNumber,
+      });
+      const tag = resp?.approval_id
+        ? `approval ${resp.approval_id}`
+        : (resp?.action_id ? `executed ${resp.action_id}` : "ok");
+      setMessage({ tone: "ok", text: `${action.label || action.id}: ${tag}` });
+    } catch (err) {
+      setMessage({ tone: "stuck", text: `${action.label || action.id}: ${err.message || String(err)}` });
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Controls</div>
+      <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+        {actions.map(action => {
+          const danger = action.id === "stop_worker" || action.id === "restart_worker";
+          const cls = "tb-btn" + (danger ? " danger" : "") + (action.disabled ? " ghost" : "");
+          const title = action.disabled
+            ? (action.disabled_reason || "Unavailable")
+            : (action.description || action.label || action.id);
+          return (
+            <button
+              key={action.id}
+              className={cls}
+              disabled={action.disabled || busyId === action.id}
+              title={title}
+              onClick={() => onClick(action)}
+            >
+              {busyId === action.id ? "…" : (action.label || action.id)}
+              {action.requires_approval && !action.disabled && (
+                <span className="mono dim" style={{ fontSize: 10, marginLeft: 4 }}>(approval)</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+      {message && (
+        <div className={`mono mt-2`} style={{ fontSize: 11, color: message.tone === "stuck" ? "var(--stuck)" : "var(--ok)" }}>
+          {message.text}
+        </div>
+      )}
+      {readOnly && (
+        <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>
+          Controls are disabled while the fleet runs in read-only mode.
+        </div>
+      )}
+    </div>
   );
 }
 
