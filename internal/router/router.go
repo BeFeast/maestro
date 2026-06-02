@@ -40,7 +40,9 @@ func New(cfg *config.Config) *Router {
 
 // Route calls the router model to decide which backend to use for the issue.
 // Returns the backend name and a short reason for the decision.
-// On any error or unknown backend, falls back to config's default backend.
+// On any error (model call, parse, unknown backend), returns the configured
+// default backend and a non-nil error so callers can distinguish a real
+// auto-routed pick from a silent fallback (#427).
 func (r *Router) Route(issue github.Issue) (backendName string, reason string, err error) {
 	prompt := r.buildPrompt(issue)
 
@@ -56,10 +58,12 @@ func (r *Router) Route(issue github.Issue) (backendName string, reason string, e
 		return r.cfg.Model.Default, "parse error", err
 	}
 
-	// Validate that the chosen backend exists in config
+	// Validate that the chosen backend exists in config. Return an error so
+	// ResolveBackend can attribute the fallback to router_error rather than
+	// silently presenting the default backend as if it was task-routed (#427).
 	if _, ok := r.cfg.Model.Backends[resp.Backend]; !ok {
 		log.Printf("[router] unknown backend %q — falling back to default", resp.Backend)
-		return r.cfg.Model.Default, fmt.Sprintf("unknown backend %q", resp.Backend), nil
+		return r.cfg.Model.Default, fmt.Sprintf("unknown backend %q", resp.Backend), fmt.Errorf("router picked unknown backend %q", resp.Backend)
 	}
 
 	return resp.Backend, resp.Reason, nil

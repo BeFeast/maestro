@@ -954,6 +954,56 @@ func TestResolveBackend_MultipleLabelsFirstModelWins(t *testing.T) {
 	}
 }
 
+// #427: resolveBackendWithReason returns the canonical reason string the
+// dispatch loop stamps onto Session.BackendSelection so the dashboard can
+// distinguish label-pinned picks from real auto-routed picks from silent
+// router_error fallbacks.
+func TestResolveBackendWithReason_LabelReturnsReasonLabel(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	name, reason := o.resolveBackendWithReason(makeIssue(11, "Fix bug", "model:codex"))
+	if name != "codex" || reason != router.ReasonLabel {
+		t.Fatalf("resolveBackendWithReason() = (%q, %q), want (codex, label)", name, reason)
+	}
+}
+
+func TestResolveBackendWithReason_DefaultReturnsReasonDefault(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	name, reason := o.resolveBackendWithReason(makeIssue(12, "Fix bug"))
+	if name != "claude" || reason != router.ReasonDefault {
+		t.Fatalf("resolveBackendWithReason() = (%q, %q), want (claude, default)", name, reason)
+	}
+}
+
+func TestResolveBackendWithReason_AutoReturnsReasonAuto(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Routing.Mode = "auto"
+	r := router.New(cfg)
+	r.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "codex", "small bugfix", nil
+	}
+	o := &Orchestrator{cfg: cfg, router: r}
+	name, reason := o.resolveBackendWithReason(makeIssue(13, "Small bugfix"))
+	if name != "codex" || reason != router.ReasonAuto {
+		t.Fatalf("resolveBackendWithReason() = (%q, %q), want (codex, auto)", name, reason)
+	}
+}
+
+func TestResolveBackendWithReason_RouterFailureReturnsReasonRouterError(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Routing.Mode = "auto"
+	r := router.New(cfg)
+	r.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "", "", fmt.Errorf("network error")
+	}
+	o := &Orchestrator{cfg: cfg, router: r}
+	name, reason := o.resolveBackendWithReason(makeIssue(14, "Fix bug"))
+	if name != "claude" || reason != router.ReasonRouterError {
+		t.Fatalf("resolveBackendWithReason() = (%q, %q), want (claude, router_error)", name, reason)
+	}
+}
+
 // newMergeTestOrchestrator creates an Orchestrator wired with test fakes for
 // autoMergePRs / mergeReadyPR. It records which PR numbers were merged and
 // stubs CI + Greptile to always return "success" / approved.
@@ -3649,6 +3699,102 @@ func TestStartNewWorkers_RecordsProjectStatusSyncOnStart(t *testing.T) {
 	}
 	if !s.ProjectStatusSynced(347, string(github.ProjectStatusInProgress)) {
 		t.Fatal("startNewWorkers did not record project status sync")
+	}
+}
+
+// #427: when a new worker is dispatched, the orchestrator must stamp the
+// session's BackendSelection with a canonical reason so the dashboard /
+// fleet API can surface label vs default vs auto vs router_error.
+func TestStartNewWorkers_StampsBackendSelectionReason_Label(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	issues := []github.Issue{makeIssue(427, "Fix bug", "model:codex")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+
+	s := state.NewState()
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 {
+		t.Fatalf("started = %d, want 1", len(*started))
+	}
+	sess := s.Sessions["slot-1"]
+	if sess == nil || sess.BackendSelection == nil {
+		t.Fatalf("session.BackendSelection not stamped: %+v", sess)
+	}
+	if sess.BackendSelection.SelectionReason != router.ReasonLabel {
+		t.Errorf("BackendSelection.SelectionReason = %q, want %q", sess.BackendSelection.SelectionReason, router.ReasonLabel)
+	}
+	if sess.BackendSelection.SelectedBackend != "codex" {
+		t.Errorf("BackendSelection.SelectedBackend = %q, want %q", sess.BackendSelection.SelectedBackend, "codex")
+	}
+}
+
+func TestStartNewWorkers_StampsBackendSelectionReason_Default(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	issues := []github.Issue{makeIssue(428, "Fix bug")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+
+	s := state.NewState()
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 {
+		t.Fatalf("started = %d, want 1", len(*started))
+	}
+	sess := s.Sessions["slot-1"]
+	if sess == nil || sess.BackendSelection == nil {
+		t.Fatalf("session.BackendSelection not stamped: %+v", sess)
+	}
+	if sess.BackendSelection.SelectionReason != router.ReasonDefault {
+		t.Errorf("BackendSelection.SelectionReason = %q, want %q", sess.BackendSelection.SelectionReason, router.ReasonDefault)
+	}
+}
+
+func TestStartNewWorkers_StampsBackendSelectionReason_Auto(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Routing.Mode = "auto"
+	issues := []github.Issue{makeIssue(429, "Refactor module")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.router = router.New(cfg)
+	o.router.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "codex", "tight loop", nil
+	}
+
+	s := state.NewState()
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 {
+		t.Fatalf("started = %d, want 1", len(*started))
+	}
+	sess := s.Sessions["slot-1"]
+	if sess == nil || sess.BackendSelection == nil {
+		t.Fatalf("session.BackendSelection not stamped: %+v", sess)
+	}
+	if sess.BackendSelection.SelectionReason != router.ReasonAuto {
+		t.Errorf("BackendSelection.SelectionReason = %q, want %q", sess.BackendSelection.SelectionReason, router.ReasonAuto)
+	}
+}
+
+func TestStartNewWorkers_StampsBackendSelectionReason_RouterError(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Routing.Mode = "auto"
+	issues := []github.Issue{makeIssue(430, "Routing fails")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.router = router.New(cfg)
+	o.router.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "", "", fmt.Errorf("network error")
+	}
+
+	s := state.NewState()
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 {
+		t.Fatalf("started = %d, want 1", len(*started))
+	}
+	sess := s.Sessions["slot-1"]
+	if sess == nil || sess.BackendSelection == nil {
+		t.Fatalf("session.BackendSelection not stamped: %+v", sess)
+	}
+	if sess.BackendSelection.SelectionReason != router.ReasonRouterError {
+		t.Errorf("BackendSelection.SelectionReason = %q, want %q", sess.BackendSelection.SelectionReason, router.ReasonRouterError)
 	}
 }
 

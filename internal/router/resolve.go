@@ -15,6 +15,17 @@ const (
 	RoleValidator   = "validator"
 )
 
+// Selection reason canonical values written to Session.BackendSelection.SelectionReason
+// when the orchestrator records why a backend was chosen for an issue.
+const (
+	ReasonLabel       = "label"
+	ReasonRole        = "role"
+	ReasonAuto        = "auto"
+	ReasonDefault     = "default"
+	ReasonRouterError = "router_error"
+	ReasonUnknownPin  = "unknown_label_backend"
+)
+
 // BackendFromLabels extracts a backend name from issue labels with the "model:" prefix.
 // Returns the backend name if found, empty string otherwise.
 // If multiple model: labels exist, the first one wins.
@@ -43,6 +54,11 @@ func ValidateBackend(name string, cfg *config.Config) (string, bool) {
 //  1. model:<backend> label on the issue (highest priority)
 //  2. Auto-routing via LLM (if routing.mode == "auto")
 //  3. Default backend from config
+//
+// The returned reason is one of the canonical Reason* constants. When auto-routing
+// is configured but its execution fails (network / parse / unknown backend), the
+// reason is ReasonRouterError instead of ReasonDefault so operators can tell
+// auto-routing failed silently rather than not being configured at all (#427).
 func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string) {
 	// 1. Check for model: label (highest priority)
 	if name := BackendFromLabels(issue); name != "" {
@@ -50,10 +66,10 @@ func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string)
 		if !ok {
 			log.Printf("[router] issue #%d: label specifies unknown backend %q, falling back to default %q",
 				issue.Number, name, r.cfg.Model.Default)
-			return validated, "unknown label backend"
+			return validated, ReasonUnknownPin
 		}
 		log.Printf("[router] issue #%d → %s (label override)", issue.Number, validated)
-		return validated, "label"
+		return validated, ReasonLabel
 	}
 
 	// 2. Auto-routing via LLM (if enabled)
@@ -64,16 +80,23 @@ func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string)
 		}
 		routedBackend, routeReason, err := routeFn(issue)
 		if err != nil {
-			log.Printf("[router] issue #%d: error %v — using default", issue.Number, err)
-		} else if routedBackend != "" {
-			log.Printf("[router] issue #%d → %s (%s)", issue.Number, routedBackend, routeReason)
-			return routedBackend, routeReason
+			log.Printf("[router] issue #%d: auto-routing failed (%v) — using default %q with reason=%s",
+				issue.Number, err, r.cfg.Model.Default, ReasonRouterError)
+			return r.cfg.Model.Default, ReasonRouterError
 		}
-		// Fall through to default on error or empty backend
+		if routedBackend != "" {
+			log.Printf("[router] issue #%d → %s (auto: %s)", issue.Number, routedBackend, routeReason)
+			return routedBackend, ReasonAuto
+		}
+		// Auto-routing returned empty without an error — treat as router_error too
+		// so the dashboard can distinguish silent fallback from manual mode.
+		log.Printf("[router] issue #%d: auto-routing returned empty backend — using default %q with reason=%s",
+			issue.Number, r.cfg.Model.Default, ReasonRouterError)
+		return r.cfg.Model.Default, ReasonRouterError
 	}
 
 	// 3. Default backend
-	return r.cfg.Model.Default, "default"
+	return r.cfg.Model.Default, ReasonDefault
 }
 
 // roleBackend returns the configured backend name for a given role, or empty string if not set.
@@ -102,10 +125,10 @@ func (r *Router) ResolveBackendForRole(issue github.Issue, role string) (backend
 		if !ok {
 			log.Printf("[router] issue #%d role=%s: label specifies unknown backend %q, falling back to default %q",
 				issue.Number, role, name, r.cfg.Model.Default)
-			return validated, "unknown label backend"
+			return validated, ReasonUnknownPin
 		}
 		log.Printf("[router] issue #%d role=%s → %s (label override)", issue.Number, role, validated)
-		return validated, "label"
+		return validated, ReasonLabel
 	}
 
 	// 2. Role-specific backend from config
@@ -116,7 +139,7 @@ func (r *Router) ResolveBackendForRole(issue github.Issue, role string) (backend
 				issue.Number, role, rb)
 		} else {
 			log.Printf("[router] issue #%d role=%s → %s (role config)", issue.Number, role, validated)
-			return validated, "role"
+			return validated, ReasonRole
 		}
 	}
 

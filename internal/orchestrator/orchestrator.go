@@ -3226,6 +3226,14 @@ func (o *Orchestrator) resolveBackend(issue github.Issue) string {
 	return name
 }
 
+// resolveBackendWithReason is like resolveBackend but also returns the
+// selection reason (one of router.Reason*) so the orchestrator can stamp it
+// on the session for the dashboard. Introduced for #427 to make it visible
+// whether a backend came from a model: label, auto-routing, or default.
+func (o *Orchestrator) resolveBackendWithReason(issue github.Issue) (string, string) {
+	return o.router.ResolveBackend(issue)
+}
+
 // availableSlots calculates how many new workers can be started, considering
 // both the global max_parallel limit and per-state limits from max_concurrent_by_state.
 // New workers enter the "running" state, so the "running" per-state limit is applied.
@@ -3814,6 +3822,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		initialPhase := pipeline.InitialPhase(o.cfg)
 		var backendName string
 		var promptBase string
+		// backendReason tracks why this backend was chosen so the dashboard /
+		// session record can show provenance: label, role, auto, default,
+		// router_error, phase, review_repair. (#427)
+		var backendReason string
 
 		// #565: when the supervisor selected spawn_review_repair for this
 		// issue, override backend + prompt with the strong backend and
@@ -3830,6 +3842,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 			promptBase = supervisor.FormatReviewRepairPromptFromPayload(issue.Number, repairTarget.PR, reviewRepair)
 			initialPhase = state.PhaseNone
+			backendReason = "review_repair"
 			log.Printf("[orch] starting auto review-repair worker for issue #%d (PR #%d, head %s, backend=%s, %d findings)",
 				issue.Number, repairTarget.PR, shortReviewRepairSHA(reviewRepair.HeadSHA), backendName, len(reviewRepair.Findings))
 		} else if initialPhase != state.PhaseNone && initialPhase != state.PhaseImplement {
@@ -3837,15 +3850,24 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			// (worker.Start → assemblePrompt will substitute {{WORKTREE}} etc.)
 			backendName = pipeline.BackendForPhase(o.cfg, initialPhase)
 			promptBase = pipeline.PromptTemplateForPhase(o.cfg, initialPhase)
+			backendReason = "phase"
 		} else {
 			// Normal mode or pipeline starting at implement — use standard resolution
-			backendName = o.resolveBackend(issue)
+			backendName, backendReason = o.resolveBackendWithReason(issue)
 			promptBase = o.selectPrompt(issue)
 			if initialPhase == state.PhaseImplement {
 				// Pipeline mode but no planner — add pipeline preamble
 				preamble := pipeline.ImplementerPreamble(&state.Session{})
 				promptBase = preamble + "\n" + promptBase
 			}
+		}
+
+		// #427: surface router_error as a visible warning so operators don't
+		// have to grep the daemon log to discover that auto-routing fell
+		// through to default silently.
+		if backendReason == router.ReasonRouterError {
+			o.notifier.Sendf("⚠️ maestro: auto-routing failed for issue #%d — falling back to default backend %s. Check router model configuration.",
+				issue.Number, backendName)
 		}
 
 		// Detect long-running label
@@ -3857,7 +3879,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 		}
 
-		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, phase=%s, long_running=%v)", issue.Number, issue.Title, backendName, initialPhase, longRunning)
+		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, reason=%s, phase=%s, long_running=%v)", issue.Number, issue.Title, backendName, backendReason, initialPhase, longRunning)
 		slotName, err := o.startWorker(s, issue, promptBase, backendName)
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
@@ -3871,6 +3893,15 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 		if initialPhase != state.PhaseNone {
 			s.Sessions[slotName].Phase = initialPhase
+		}
+		// #427: stamp the backend selection reason on the session so the
+		// dashboard / fleet API can show why this backend was chosen
+		// (label / role / auto / default / router_error / phase / review_repair).
+		if sess := s.Sessions[slotName]; sess != nil {
+			sess.BackendSelection = &state.BackendSelection{
+				SelectedBackend: backendName,
+				SelectionReason: backendReason,
+			}
 		}
 		if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
 			s.MarkProjectStatusSynced(issue.Number, string(github.ProjectStatusInProgress), time.Now().UTC())
