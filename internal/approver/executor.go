@@ -254,6 +254,27 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 			Status:  state.ApprovalStatusAwaitingDispatch,
 			Summary: summary,
 		}
+	case "spawn_review_repair":
+		// #565: same dispatcher shape as spawn_worker. The supervisor
+		// records the intent; the orchestrator's dispatcher loop owns
+		// the actual worker spawn and gates idempotency on
+		// (pr_number, head_sha). Returning AwaitingDispatch keeps the
+		// approval effective so RecordPendingApprovalForDecision's
+		// at-mint dedup coalesces fresh recommendations for the same
+		// (action, target) until the dispatcher resolves it.
+		pr, issue := 0, 0
+		if approval.Target != nil {
+			pr = approval.Target.PR
+			issue = approval.Target.Issue
+		}
+		summary := "spawn_review_repair approval recorded; next dispatcher loop will start the scoped repair worker"
+		if pr > 0 {
+			summary = fmt.Sprintf("spawn_review_repair for PR #%d (issue #%d) approved; next dispatcher loop will start the scoped repair worker (no extra command required)", pr, issue)
+		}
+		return Result{
+			Status:  state.ApprovalStatusAwaitingDispatch,
+			Summary: summary,
+		}
 	case "open_child_issue":
 		// Same shape as spawn_worker: the v1 supervisor records the
 		// intent, but the safe-action executor for create_issue lands

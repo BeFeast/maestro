@@ -35,8 +35,14 @@ const (
 	ActionNotifyRed            = "notify_red"
 	ActionSpawnWorker          = "spawn_worker"
 	ActionSpawnRepairWorker    = "spawn_repair_worker"
-	ActionLabelIssueReady      = "label_issue_ready"
-	ActionMergePR              = "merge_pr"
+	// ActionSpawnReviewRepair is the auto review-repair respawn (#565).
+	// Emitted when a green+mergeable+retry_exhausted PR carries ≥1
+	// Greptile P0/P1 inline comment on its current head SHA — a fresh
+	// scoped worker on the strong backend addresses the comments
+	// instead of the silent dead-end the issue describes.
+	ActionSpawnReviewRepair = config.SupervisorActionSpawnReviewRepair
+	ActionLabelIssueReady   = "label_issue_ready"
+	ActionMergePR           = "merge_pr"
 	// ActionOpenChildIssue asks the supervisor (or operator) to create the
 	// next concrete child issue from an open handoff/epic when no runnable
 	// issue remains. Approval-gated in v1; the safe-action executor for
@@ -126,6 +132,18 @@ type prMergeableReader interface {
 // check verdict and is therefore authoritative. #425 (sup-98).
 type prMergeStateReader interface {
 	PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus string, err error)
+}
+
+// prHighSeverityReviewReader exposes the Greptile P0/P1 inline comments
+// still on the current head SHA. The supervisor uses it for the #565
+// auto review-repair branch: when a PR is green+mergeable+settled
+// retry_exhausted AND this returns hasFindings=true, the supervisor
+// mints a spawn_review_repair decision scoped to the returned
+// findings. Optional — when the reader does not implement it the
+// branch is a no-op and the existing convergence-merge path keeps the
+// PR moving.
+type prHighSeverityReviewReader interface {
+	PRHighSeverityReviewOnHead(prNumber int) (sha string, findings []github.ReviewComment, hasFindings bool, err error)
 }
 
 // PreflightResult is the outcome of running a configured preflight command.
@@ -357,6 +375,26 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
 	if slot, sess, pr, ok := e.sessionWithOpenPR(st, prs, cache); ok {
+		// #565: auto review-repair respawn. When a green+mergeable PR is
+		// settled retry_exhausted on review feedback AND Greptile flags
+		// ≥1 P0/P1 inline comment on its current head SHA, mint a
+		// spawn_review_repair recommendation instead of dead-ending. The
+		// branch runs BEFORE openPRNeedsRepair so the deterministic
+		// repair-spawn does not fire the refused spawn_repair_worker
+		// verb for the same PR.
+		if candidate := e.evaluateAutoReviewRepair(st, sess, pr); candidate != nil {
+			if !candidate.Exhausted {
+				decision := e.buildReviewRepairDecision(st, now, projectState, baseReasons, slot, sess, pr, candidate)
+				decision.StuckStates = appendStuck(stuckStates, decision.StuckStates...)
+				return decision, nil
+			}
+			// Budget exhausted: fall through to a visible operator
+			// decision (merge_pr approval or attention stuck state).
+			decision := e.buildReviewRepairExhaustedDecision(st, now, projectState, baseReasons, slot, sess, pr, candidate)
+			decision.StuckStates = appendStuck(stuckStates, decision.StuckStates...)
+			return decision, nil
+		}
+
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),

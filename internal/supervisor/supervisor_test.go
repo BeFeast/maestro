@@ -18,29 +18,31 @@ import (
 )
 
 type fakeReader struct {
-	issues             []github.Issue
-	prs                []github.PR
-	openPRIssues       map[int]bool
-	mergedPRIssues     map[int]bool
-	closedIssues       map[int]bool
-	mergedPRs          map[int]bool
-	ciStatuses         map[int]string
-	greptileOK         map[int]bool
-	greptilePend       map[int]bool
-	mergeStates        map[int]string
-	rateLimit          *github.RateLimitStatus
-	rateLimitErr       error
-	rateLimitCalls     int
-	issueCalls         int
-	closedIssueCalls   map[int]int
-	mergedPRIssueCalls map[int]int
-	mergedPRCalls      map[int]int
-	addedLabels        []string
-	removedLabels      []string
-	comments           []string
-	addLabelErr        error
-	removeLabelErr     error
-	commentErr         error
+	issues               []github.Issue
+	prs                  []github.PR
+	openPRIssues         map[int]bool
+	mergedPRIssues       map[int]bool
+	closedIssues         map[int]bool
+	mergedPRs            map[int]bool
+	ciStatuses           map[int]string
+	greptileOK           map[int]bool
+	greptilePend         map[int]bool
+	mergeStates          map[int]string
+	highSeverityHeadSHA  map[int]string
+	highSeverityFindings map[int][]github.ReviewComment
+	rateLimit            *github.RateLimitStatus
+	rateLimitErr         error
+	rateLimitCalls       int
+	issueCalls           int
+	closedIssueCalls     map[int]int
+	mergedPRIssueCalls   map[int]int
+	mergedPRCalls        map[int]int
+	addedLabels          []string
+	removedLabels        []string
+	comments             []string
+	addLabelErr          error
+	removeLabelErr       error
+	commentErr           error
 }
 
 type fakeLLM struct {
@@ -144,6 +146,15 @@ func (f *fakeReader) PRGreptileApproved(prNumber int) (bool, bool, error) {
 		return true, false, nil
 	}
 	return approved, false, nil
+}
+
+// PRHighSeverityReviewOnHead lets the supervisor #565 auto-review-repair
+// branch peek at fake P0/P1 inline findings. Returns the configured head
+// SHA + findings for prNumber; missing entries are no findings.
+func (f *fakeReader) PRHighSeverityReviewOnHead(prNumber int) (string, []github.ReviewComment, bool, error) {
+	sha := f.highSeverityHeadSHA[prNumber]
+	findings := f.highSeverityFindings[prNumber]
+	return sha, findings, len(findings) > 0, nil
 }
 
 func (f *fakeReader) RateLimit() (github.RateLimitStatus, error) {

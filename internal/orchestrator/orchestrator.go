@@ -3284,13 +3284,135 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 		return false
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker {
+	if decision == nil {
+		return false
+	}
+	switch decision.RecommendedAction {
+	case supervisor.ActionSpawnRepairWorker, supervisor.ActionSpawnReviewRepair:
+	default:
 		return false
 	}
 	if decision.RequiresApproval || decision.Risk == supervisor.RiskApprovalGated {
-		return false
+		// #565: when cautious mode gates the spawn behind an approval, an
+		// approved or awaiting_dispatch approval also unlocks dispatch.
+		if !o.hasEffectiveApprovalForDecision(s, decision) {
+			return false
+		}
 	}
 	if decision.Target == nil || decision.Target.Issue != issueNumber {
+		return false
+	}
+	return true
+}
+
+// tryClaimReviewRepairSlot bumps the (pr_number, head_sha) attempt counter
+// and reports whether this dispatcher tick is allowed to spawn a worker.
+// Returns false when the budget for the (pr,head_sha) pair has already
+// been spent — the caller must NOT spawn, so the supervisor's next
+// cycle observes the exhaust and emits the fall-through decision.
+//
+// This is the per-(pr,head_sha) idempotency guard called out in the
+// #565 acceptance criteria: a new head pushed by the repair worker
+// does not re-trigger on the already-handled SHA, and a settled repair
+// does not loop.
+func (o *Orchestrator) tryClaimReviewRepairSlot(s *state.State, target *state.SupervisorTarget, payload *state.SupervisorReviewRepairPayload) bool {
+	if s == nil || target == nil || payload == nil {
+		return false
+	}
+	now := time.Now().UTC()
+	max := payload.MaxRetries
+	if max <= 0 {
+		max = o.cfg.Supervisor.ReviewRepair.EffectiveMaxRetries()
+	}
+	_, spawned := s.RecordReviewRepairAttempt(target.PR, payload.HeadSHA, target.Issue, "", max, now)
+	if !spawned {
+		log.Printf("[orch] auto review-repair: refusing duplicate spawn for PR #%d head %s — budget exhausted", target.PR, shortReviewRepairSHA(payload.HeadSHA))
+		return false
+	}
+	return true
+}
+
+// shortReviewRepairSHA trims a SHA for log messages — keeps the path
+// dependency-free from internal/supervisor's shortSHA helper.
+func shortReviewRepairSHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
+}
+
+// supervisorSelectedReviewRepair returns the spawn_review_repair payload
+// for the given issue when the supervisor has minted (and the cautious
+// gate has cleared) such a decision. nil means "no review-repair spawn
+// applies to this issue right now". The (pr_number, head_sha) idempotency
+// check is the caller's responsibility — this only resolves the LATEST
+// supervisor decision.
+func (o *Orchestrator) supervisorSelectedReviewRepair(s *state.State, issueNumber int) (*state.SupervisorReviewRepairPayload, *state.SupervisorTarget) {
+	if s == nil || issueNumber <= 0 {
+		return nil, nil
+	}
+	decision := s.LatestSupervisorDecision()
+	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnReviewRepair {
+		return nil, nil
+	}
+	if decision.Target == nil || decision.Target.Issue != issueNumber {
+		return nil, nil
+	}
+	if decision.RequiresApproval || decision.Risk == supervisor.RiskApprovalGated {
+		if !o.hasEffectiveApprovalForDecision(s, decision) {
+			return nil, nil
+		}
+	}
+	if decision.ReviewRepair == nil {
+		return nil, decision.Target
+	}
+	return decision.ReviewRepair, decision.Target
+}
+
+// hasEffectiveApprovalForDecision reports whether the supervisor decision
+// has a matching approval that is currently effective (approved or
+// awaiting_dispatch). Used to gate cautious-mode dispatch on the
+// operator's signoff. The match is by (Action, Target) — the same
+// identity used by RecordPendingApprovalForDecision's at-mint dedup.
+func (o *Orchestrator) hasEffectiveApprovalForDecision(s *state.State, decision *state.SupervisorDecision) bool {
+	if s == nil || decision == nil {
+		return false
+	}
+	for i := range s.Approvals {
+		a := &s.Approvals[i]
+		if a.Action != decision.RecommendedAction {
+			continue
+		}
+		if !approvalTargetSameAsDecision(a.Target, decision.Target) {
+			continue
+		}
+		switch a.Status {
+		case state.ApprovalStatusApproved, state.ApprovalStatusAwaitingDispatch, state.ApprovalStatusExecutionSkipped:
+			return true
+		}
+	}
+	return false
+}
+
+// approvalTargetSameAsDecision compares two SupervisorTargets by the
+// identity fields the executor cares about (issue, pr, head_sha,
+// session). Mirrors approvalTargetsEqual in the state package, kept
+// here so the orchestrator does not need to reach into state internals.
+func approvalTargetSameAsDecision(a, b *state.SupervisorTarget) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.Issue != b.Issue || a.PR != b.PR {
+		return false
+	}
+	if strings.TrimSpace(a.HeadSHA) != strings.TrimSpace(b.HeadSHA) {
+		return false
+	}
+	if strings.TrimSpace(a.Session) != strings.TrimSpace(b.Session) {
 		return false
 	}
 	return true
@@ -3554,7 +3676,25 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		initialPhase := pipeline.InitialPhase(o.cfg)
 		var backendName string
 		var promptBase string
-		if initialPhase != state.PhaseNone && initialPhase != state.PhaseImplement {
+
+		// #565: when the supervisor selected spawn_review_repair for this
+		// issue, override backend + prompt with the strong backend and
+		// the scoped Greptile-finding prompt. Skip the pipeline preamble
+		// — the review-repair worker is a focused, single-phase fixer
+		// (not a planner/implementer/validator pass).
+		if reviewRepair, repairTarget := o.supervisorSelectedReviewRepair(s, issue.Number); reviewRepair != nil && repairTarget != nil {
+			if !o.tryClaimReviewRepairSlot(s, repairTarget, reviewRepair) {
+				continue
+			}
+			backendName = reviewRepair.Backend
+			if backendName == "" {
+				backendName = o.cfg.Supervisor.ReviewRepair.EffectiveBackend()
+			}
+			promptBase = supervisor.FormatReviewRepairPromptFromPayload(issue.Number, repairTarget.PR, reviewRepair)
+			initialPhase = state.PhaseNone
+			log.Printf("[orch] starting auto review-repair worker for issue #%d (PR #%d, head %s, backend=%s, %d findings)",
+				issue.Number, repairTarget.PR, shortReviewRepairSHA(reviewRepair.HeadSHA), backendName, len(reviewRepair.Findings))
+		} else if initialPhase != state.PhaseNone && initialPhase != state.PhaseImplement {
 			// Pipeline mode with planner — use planner backend and raw template
 			// (worker.Start → assemblePrompt will substitute {{WORKTREE}} etc.)
 			backendName = pipeline.BackendForPhase(o.cfg, initialPhase)
