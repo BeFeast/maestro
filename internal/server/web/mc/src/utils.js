@@ -57,3 +57,40 @@ export function truncateBranchName(branch, max = 32) {
   const tail = Math.max(3, keep - head);
   return `${s.slice(0, head)}…${s.slice(s.length - tail)}`;
 }
+
+// classifyURLScope tags a URL as "lan" (private RFC1918 / loopback / mDNS) or
+// "public". Returns "" for non-URL strings. Issue #536.
+export function classifyURLScope(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  let u;
+  try {
+    u = new URL(s);
+  } catch (_) {
+    return "";
+  }
+  const host = u.hostname.toLowerCase();
+  if (!host) return "";
+  if (host === "localhost" || host === "ip6-localhost" || host === "ip6-loopback") return "lan";
+  if (/^127\./.test(host)) return "lan";
+  if (host === "::1") return "lan";
+  if (/^10\./.test(host)) return "lan";
+  if (/^192\.168\./.test(host)) return "lan";
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)) return "lan";
+  if (/^169\.254\./.test(host)) return "lan";
+  if (/^fe80::/i.test(host) || /^fc/i.test(host) || /^fd/i.test(host)) return "lan";
+  if (host.endsWith(".local") || host.endsWith(".lan") || host.endsWith(".internal")) return "lan";
+  return "public";
+}
+
+// isHTTPURL is true for http(s) / ws(s) URLs the SPA should render as anchors.
+export function isHTTPURL(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return false;
+  try {
+    const u = new URL(s);
+    return /^(https?|wss?):$/.test(u.protocol);
+  } catch (_) {
+    return false;
+  }
+}

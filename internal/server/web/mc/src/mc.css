@@ -671,6 +671,46 @@ input, textarea { font: inherit; color: inherit; }
 .pill.policy{ color: var(--policy);border-color: var(--policy-dim);background: var(--policy-soft); }
 .pill.info  { color: var(--info);  border-color: rgba(96,165,250,0.3); background: var(--info-soft); }
 
+/* URL value renderings — a real anchor plus a tiny scope badge so the
+   operator can distinguish a Runtime URL pointing at the home LAN from one
+   that's reachable off-network. Issue #536. */
+.url-value { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.url-value a { word-break: break-all; }
+.url-badge {
+  display: inline-flex; align-items: center;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid;
+  flex-shrink: 0;
+  line-height: 1.4;
+}
+.url-badge.lan    { color: var(--watch); border-color: var(--watch-dim); background: var(--watch-soft); }
+.url-badge.public { color: var(--ok);    border-color: var(--ok-dim);    background: var(--ok-soft); }
+.drawer-issue-link a { font-size: 14px; font-weight: 600; }
+
+/* Path value rendering — mono text plus a single-click copy button. Used
+   for worktree / log paths in the worker drawer; the copy affordance is the
+   path equivalent of «open URL in new tab». Issue #536. */
+.path-value { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.path-value .mono { word-break: break-all; }
+.path-copy {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-3);
+  border: 1px solid var(--border-2);
+  border-radius: 3px;
+  background: var(--bg-2);
+  flex-shrink: 0;
+}
+.path-copy:hover { color: var(--fg-0); border-color: var(--border-3); background: var(--bg-3); }
+
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.5; transform: scale(0.7); }
