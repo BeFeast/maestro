@@ -159,8 +159,7 @@ export function FleetScreen({ navigate }) {
       <div className="dash-grid mt-6">
         <div>
           <Panel
-            title="Live workers"
-            sub={`${fleet.workerCount} running`}
+            title="Workers (last 24h)"
             right={<a onClick={() => navigate("workers")} style={{ fontSize: 11.5 }}>Open workers →</a>}
           >
             <LiveWorkersPreview navigate={navigate} />
@@ -247,7 +246,7 @@ function LiveWorkersPreview({ navigate }) {
   if (live.length === 0) {
     return (
       <div style={{ padding: "var(--s-5)", textAlign: "center" }}>
-        <div style={{ color: "var(--fg-1)", fontSize: 13 }}>No workers running.</div>
+        <div style={{ color: "var(--fg-1)", fontSize: 13 }}>No workers active in the last 24h.</div>
         <div className="mono dim mt-2" style={{ fontSize: 11 }}>
           {fleet?.daemonAlive ? "Supervisor checking for eligible issues." : "Daemon offline. Restart to resume."}
         </div>

@@ -43,3 +43,17 @@ export function parseTimestamp(value) {
 export function slugifyProject(name) {
   return String(name || "").trim();
 }
+
+// truncateBranchName returns a middle-truncated branch name that keeps the
+// meaningful leading segment (project prefix + issue id) and the trailing
+// segment, joined by `…`. Returns the full name when it already fits.
+// Callers should still expose the full value via a `title` attribute so the
+// operator can hover to read the unabridged branch.
+export function truncateBranchName(branch, max = 32) {
+  const s = String(branch || "");
+  if (s.length <= max) return s;
+  const keep = Math.max(8, max - 1);
+  const head = Math.max(4, Math.ceil(keep * 0.6));
+  const tail = Math.max(3, keep - head);
+  return `${s.slice(0, head)}…${s.slice(s.length - tail)}`;
+}
