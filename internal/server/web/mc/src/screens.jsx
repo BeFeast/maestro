@@ -20,7 +20,7 @@ import {
   workerNextAction,
   workerSessionsFromFleet,
 } from "./fleetApi.js";
-import { parseTimestamp, relTime } from "./utils.js";
+import { parseTimestamp, relTime, truncateBranchName } from "./utils.js";
 
 export function ProjectScreen({ slug, navigate, openDrawer }) {
   const { fleet, now } = useFleet();
@@ -404,15 +404,17 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
             ) : allRecent.map(w => (
               <div key={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
                 <div className="wt-slot">{w.slot}</div>
-                <div>
+                <div className="wt-issue-cell">
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
                   <div className="wt-project">{w.project}</div>
                   <AttributionInline worker={w} now={now} />
                 </div>
-                <div><Pill tone={w.tone} noDot>{w.status}</Pill></div>
-                <div className="mono" style={{ fontSize: 11, color: "var(--fg-1)" }}>
+                <div className="wt-status"><Pill tone={w.tone} noDot title={w.status}>{w.status}</Pill></div>
+                <div className="wt-branch mono">
                   {w.pr ? <>PR #{w.pr}</> : <span className="dim">draft</span>}
-                  <div className="dim" style={{ fontSize: 10, marginTop: 2 }}>{w.branch}</div>
+                  {w.branch && (
+                    <div className="wt-branch-name dim" title={w.branch}>{truncateBranchName(w.branch)}</div>
+                  )}
                 </div>
                 <div className="wt-next">{w.summary}</div>
                 <div className="wt-age">{relTime(w.age, now)}</div>
@@ -431,15 +433,17 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
             {allStuck.map(w => (
               <div key={`${w.slot}-stuck`} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
                 <div className="wt-slot">{w.slot}</div>
-                <div>
+                <div className="wt-issue-cell">
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
                   <div className="wt-project">{w.project}</div>
                   <AttributionInline worker={w} now={now} />
                 </div>
-                <div><Pill tone={w.tone} noDot>{w.status}</Pill></div>
-                <div className="mono" style={{ fontSize: 11, color: "var(--fg-1)" }}>
+                <div className="wt-status"><Pill tone={w.tone} noDot title={w.status}>{w.status}</Pill></div>
+                <div className="wt-branch mono">
                   {w.pr ? <>PR #{w.pr}</> : <span className="dim">no PR</span>}
-                  <div className="dim" style={{ fontSize: 10, marginTop: 2 }}>{w.branch || ""}</div>
+                  {w.branch && (
+                    <div className="wt-branch-name dim" title={w.branch}>{truncateBranchName(w.branch)}</div>
+                  )}
                 </div>
                 <div className="wt-next">{workerNextAction(w).text || w.summary}</div>
                 <div className="wt-age">{relTime(w.age, now)}</div>
@@ -457,12 +461,12 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
             {allToday.map(w => (
               <div key={`${w.slot}-done`} className="wt-row" onClick={() => openDrawer(w)}>
                 <div className="wt-slot dim">{w.slot}</div>
-                <div>
+                <div className="wt-issue-cell">
                   <div className="wt-issue dim2">#{w.issue.num} {w.issue.title}</div>
                   <div className="wt-project">{w.project}</div>
                 </div>
-                <div><Pill tone="ok" noDot>done</Pill></div>
-                <div className="mono dim" style={{ fontSize: 11 }}>{w.pr ? `PR #${w.pr}` : "—"}</div>
+                <div className="wt-status"><Pill tone="ok" noDot>done</Pill></div>
+                <div className="wt-branch mono dim">{w.pr ? `PR #${w.pr}` : "—"}</div>
                 <div className="dim" style={{ fontSize: 11.5 }}>{w.summary}</div>
                 <div className="wt-age">{relTime(w.age, now)}</div>
               </div>
