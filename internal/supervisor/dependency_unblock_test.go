@@ -261,6 +261,42 @@ func TestEvaluate_MaxRunnableCapPreventsExtraUnblocks(t *testing.T) {
 	}
 }
 
+// Test: cap reached → enrollment still happens, but no unblock (issue #568) -
+
+func TestEvaluate_MaxRunnableCapStillEnrollsBlockedWaveMembers(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDependencyUnblock(cfg)
+	cfg.Supervisor.DynamicWave.DependencyUnblock.MaxRunnable = 1
+	cfg.GitHubProjects.Enabled = true
+	cfg.GitHubProjects.ProjectNumber = 7
+
+	// Pool already at cap (one ready-labeled issue). #148 is the next blocked
+	// wave member with a resolved dep — supervisor must not unblock it, but
+	// must still enroll it onto the Project board so operators see the
+	// upcoming wave even when the runnable pool is saturated.
+	already := testIssue(140, "already runnable", "maestro-ready")
+	pending := blockedIssue(148, []int{147})
+	reader := &fakeReader{
+		issues:       []github.Issue{already, pending},
+		closedIssues: map[int]bool{147: true},
+	}
+
+	enroller := &fakeEnroller{}
+	eng := testEngine(cfg, reader)
+	eng.SetProjectEnroller(enroller)
+	decision, err := eng.Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction == ActionUnblockIssue {
+		t.Fatalf("action = %q, want NOT unblock_issue (cap reached)", decision.RecommendedAction)
+	}
+	if !equalInts(enroller.enrolled, []int{148}) {
+		t.Fatalf("enrolled = %v, want [148] (visibility must happen even at cap)", enroller.enrolled)
+	}
+}
+
 // Test: idempotency — once recorded as succeeded, no duplicate mutation ----
 
 func TestEvaluate_DoesNotRecommendDuplicateUnblockAfterSuccess(t *testing.T) {
