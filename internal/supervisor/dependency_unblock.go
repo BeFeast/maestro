@@ -82,16 +82,6 @@ func (e *Engine) evaluateDependencyUnblock(st *state.State, issues []github.Issu
 		return nil
 	}
 
-	// Respect max_runnable: we count current ready-labeled open issues so
-	// that supervising the wave never grows the runnable pool past the
-	// operator cap. Ordered/dynamic wave concurrency lives elsewhere; this
-	// cap is specific to the dependency-unblock controller.
-	if cap := unblockCfg.MaxRunnable; cap > 0 {
-		if currentlyReady := countOpenIssuesWithLabel(issues, readyLabel); currentlyReady >= cap {
-			return nil
-		}
-	}
-
 	candidates := blockedWaveMembers(issues, blockedLabel)
 	if len(candidates) == 0 {
 		return nil
@@ -99,12 +89,25 @@ func (e *Engine) evaluateDependencyUnblock(st *state.State, issues []github.Issu
 
 	// Project enrollment side-effect: surface blocked wave members on the
 	// configured GitHub Project so operators see the upcoming wave even
-	// before any one item is unblocked. Errors are best-effort.
+	// before any one item is unblocked. Errors are best-effort. Runs ahead
+	// of the max_runnable gate so an at-cap pool does not silently hide the
+	// upcoming wave from operators (issue #568).
 	enrolled := e.enrollBlockedWaveMembers(candidates)
 	if len(enrolled) > 0 {
 		baseReasons = appendReasons(baseReasons,
 			fmt.Sprintf("Enrolled %d blocked wave member(s) onto GitHub Project: %s", len(enrolled), dependencyRefs(enrolled)),
 		)
+	}
+
+	// Respect max_runnable: we count current ready-labeled open issues so
+	// that supervising the wave never grows the runnable pool past the
+	// operator cap. Ordered/dynamic wave concurrency lives elsewhere; this
+	// cap is specific to the dependency-unblock controller. Gated AFTER
+	// enrollment so visibility still happens when the pool is at cap.
+	if cap := unblockCfg.MaxRunnable; cap > 0 {
+		if currentlyReady := countOpenIssuesWithLabel(issues, readyLabel); currentlyReady >= cap {
+			return nil
+		}
 	}
 
 	for _, issue := range candidates {
