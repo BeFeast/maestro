@@ -77,6 +77,30 @@ function issueSummaryText(worker) {
   return (issue + " " + (worker.issue_title || "")).trim();
 }
 
+// #426: render agent runtime separately from total workflow elapsed time,
+// so the dashboard doesn't conflate "agent ran for 1h46m" with "session
+// (including PR/CI/Greptile/merge waiting) elapsed 1h46m".
+function runtimeCellHTML(worker) {
+  const workerRt = worker.worker_runtime || "-";
+  const workflowRt = worker.workflow_runtime || worker.runtime || "-";
+  if (!workerRt || workerRt === workflowRt) {
+    return escapeText(workflowRt);
+  }
+  return '<span class="runtime-agent">' + escapeText(workerRt) + '</span>' +
+    '<span class="runtime-sep"> / </span>' +
+    '<span class="runtime-total">' + escapeText(workflowRt) + '</span>';
+}
+
+function runtimeTitleText(worker) {
+  const workerRt = worker.worker_runtime || "-";
+  const workflowRt = worker.workflow_runtime || worker.runtime || "-";
+  const parts = ["Agent runtime: " + workerRt, "Workflow elapsed: " + workflowRt];
+  if (worker.pr_open_runtime) {
+    parts.push("PR/CI waiting: " + worker.pr_open_runtime);
+  }
+  return parts.join("\n");
+}
+
 function actionLabel(action) {
   switch (String(action || "").trim()) {
   case "none": return "Skipped tick";
@@ -359,7 +383,7 @@ function renderWorkers() {
       '<td class="status"><span class="' + pillClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
       '<td class="backend">' + escapeText(worker.backend || "-") + '</td>' +
       '<td class="pr">' + linkHTML(worker.pr_url, pr) + '</td>' +
-      '<td class="runtime">' + escapeText(worker.runtime || "-") + '</td>' +
+      '<td class="runtime" title="' + escapeText(runtimeTitleText(worker)) + '">' + runtimeCellHTML(worker) + '</td>' +
       '<td class="tokens">' + compactNumber(worker.tokens_used_total) + '</td>' +
     '</tr>';
   }).join("");

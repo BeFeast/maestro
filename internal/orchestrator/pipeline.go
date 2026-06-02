@@ -40,6 +40,7 @@ func (o *Orchestrator) handlePlanComplete(slotName string, sess *state.Session) 
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		o.notifier.Sendf("⚠️ maestro: planner %s (issue #%d) failed — no plan artifacts produced",
 			slotName, sess.IssueNumber)
 		return true
@@ -54,6 +55,7 @@ func (o *Orchestrator) handlePlanComplete(slotName string, sess *state.Session) 
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		return true
 	}
 
@@ -65,6 +67,7 @@ func (o *Orchestrator) handlePlanComplete(slotName string, sess *state.Session) 
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		return true
 	}
 
@@ -94,6 +97,7 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		return true
 	}
 
@@ -105,6 +109,7 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		return true
 	}
 
@@ -142,6 +147,7 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 		sess.Status = state.StatusFailed
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		o.notifier.Sendf("❌ maestro: %s (issue #%d) failed validation %d times — giving up",
 			slotName, sess.IssueNumber, sess.ValidationFails)
 		return true
@@ -155,6 +161,7 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		return true
 	}
 
@@ -166,6 +173,7 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		return true
 	}
 

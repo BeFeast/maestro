@@ -138,6 +138,18 @@ type Session struct {
 	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
 	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
 
+	// #426: distinguish agent execution time from workflow elapsed time.
+	// WorkerEndedAt is stamped the FIRST time the worker process exits
+	// (running -> pr_open / dead / failed / etc.). It is never overwritten
+	// by later status transitions, so worker_runtime (StartedAt -> WorkerEndedAt)
+	// reflects only the coding agent's wall-clock time, not subsequent
+	// PR-open / CI / Greptile / merge waiting. PROpenedAt is stamped the
+	// first time the session enters pr_open and is preserved similarly,
+	// so pr_open_runtime (PROpenedAt -> FinishedAt) is attributable to
+	// orchestration latency instead of agent runtime.
+	WorkerEndedAt *time.Time `json:"worker_ended_at,omitempty"`
+	PROpenedAt    *time.Time `json:"pr_opened_at,omitempty"`
+
 	// #513: per-segment attribution timeline. Every spawn / respawn /
 	// fallover appends a new entry; the previous entry's EndedAt is
 	// closed at the same moment. Records who actually produced the
@@ -2203,6 +2215,38 @@ func sessionAttentionActionableAt(sess *Session, now time.Time, ttl time.Duratio
 		return true
 	}
 	return now.Sub(changedAt) <= ttl
+}
+
+// MarkWorkerEnded stamps WorkerEndedAt with `now` the FIRST time the worker
+// process is observed to have stopped. Subsequent calls are no-ops, so a
+// later status transition (pr_open -> code_landed -> done) cannot move the
+// recorded agent-exit time forward. Callers should invoke this before/at
+// any transition out of StatusRunning (running -> pr_open / dead / failed /
+// retry_exhausted / conflict_failed / code_landed / done).
+//
+// See #426: dashboard "Runtime" used to conflate agent execution with
+// PR-open / CI / Greptile / merge waiting because FinishedAt was rewritten
+// at every status change.
+func MarkWorkerEnded(sess *Session, now time.Time) {
+	if sess == nil || sess.WorkerEndedAt != nil {
+		return
+	}
+	t := normalizedTime(now)
+	sess.WorkerEndedAt = &t
+}
+
+// MarkPROpened stamps PROpenedAt with `now` the FIRST time the session
+// enters StatusPROpen. Subsequent calls are no-ops, so a session that
+// flips pr_open -> running -> pr_open during a review-retry loop keeps
+// the original PR-open timestamp. Used by the dashboard to attribute
+// pr_open_runtime (PROpenedAt -> FinishedAt) to orchestration latency
+// rather than agent execution.
+func MarkPROpened(sess *Session, now time.Time) {
+	if sess == nil || sess.PROpenedAt != nil {
+		return
+	}
+	t := normalizedTime(now)
+	sess.PROpenedAt = &t
 }
 
 // SessionChangedAt returns the newest persisted activity timestamp for a session.

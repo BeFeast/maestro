@@ -539,19 +539,31 @@ type fleetWorkerState struct {
 	PRURL             string `json:"pr_url,omitempty"`
 	TokensUsedAttempt int    `json:"tokens_used_attempt"`
 	TokensUsedTotal   int    `json:"tokens_used_total"`
-	Runtime           string `json:"runtime"`
-	RuntimeSeconds    int64  `json:"runtime_seconds"`
-	StartedAt         string `json:"started_at"`
-	FinishedAt        string `json:"finished_at,omitempty"`
-	NextRetryAt       string `json:"next_retry_at,omitempty"`
-	PID               int    `json:"pid,omitempty"`
-	Alive             *bool  `json:"alive,omitempty"`
-	Worktree          string `json:"worktree,omitempty"`
-	Branch            string `json:"branch,omitempty"`
-	TmuxSession       string `json:"tmux_session,omitempty"`
-	HasLog            bool   `json:"has_log"`
-	RetryCount        int    `json:"retry_count,omitempty"`
-	LastNotification  string `json:"last_notification,omitempty"`
+	// Runtime / RuntimeSeconds (legacy fields, kept for backwards
+	// compatibility) reflect workflow elapsed time and include PR-open /
+	// CI / Greptile / merge waiting. See #426 — WorkerRuntimeSeconds is
+	// the agent's wall-clock; WorkflowRuntimeSeconds is the full session.
+	Runtime                string `json:"runtime"`
+	RuntimeSeconds         int64  `json:"runtime_seconds"`
+	WorkerRuntime          string `json:"worker_runtime"`
+	WorkerRuntimeSeconds   int64  `json:"worker_runtime_seconds"`
+	WorkflowRuntime        string `json:"workflow_runtime"`
+	WorkflowRuntimeSeconds int64  `json:"workflow_runtime_seconds"`
+	PROpenRuntime          string `json:"pr_open_runtime,omitempty"`
+	PROpenRuntimeSeconds   int64  `json:"pr_open_runtime_seconds,omitempty"`
+	StartedAt              string `json:"started_at"`
+	FinishedAt             string `json:"finished_at,omitempty"`
+	WorkerEndedAt          string `json:"worker_ended_at,omitempty"`
+	PROpenedAt             string `json:"pr_opened_at,omitempty"`
+	NextRetryAt            string `json:"next_retry_at,omitempty"`
+	PID                    int    `json:"pid,omitempty"`
+	Alive                  *bool  `json:"alive,omitempty"`
+	Worktree               string `json:"worktree,omitempty"`
+	Branch                 string `json:"branch,omitempty"`
+	TmuxSession            string `json:"tmux_session,omitempty"`
+	HasLog                 bool   `json:"has_log"`
+	RetryCount             int    `json:"retry_count,omitempty"`
+	LastNotification       string `json:"last_notification,omitempty"`
 	// Attribution is the per-segment backend timeline for this session
 	// (#513 / #534). The SPA renders the active segment inline on the card
 	// and the complete list with EndReason between segments inside the
@@ -2661,39 +2673,47 @@ func isFleetWorkerDefaultVisible(worker sessionInfo) bool {
 
 func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
 	return fleetWorkerState{
-		ProjectName:       project.Name,
-		ProjectRepo:       project.Repo,
-		DashboardURL:      project.DashboardURL,
-		Slot:              worker.Slot,
-		IssueNumber:       worker.IssueNumber,
-		IssueTitle:        worker.IssueTitle,
-		IssueURL:          worker.IssueURL,
-		Status:            worker.Status,
-		DisplayStatus:     worker.DisplayStatus,
-		StatusReason:      worker.StatusReason,
-		NextAction:        worker.NextAction,
-		NeedsAttention:    worker.NeedsAttention,
-		Live:              worker.Live,
-		Backend:           worker.Backend,
-		PRNumber:          worker.PRNumber,
-		PRURL:             worker.PRURL,
-		TokensUsedAttempt: worker.TokensUsedAttempt,
-		TokensUsedTotal:   worker.TokensUsedTotal,
-		Runtime:           worker.Runtime,
-		RuntimeSeconds:    worker.RuntimeSeconds,
-		StartedAt:         worker.StartedAt,
-		FinishedAt:        worker.FinishedAt,
-		NextRetryAt:       worker.NextRetryAt,
-		PID:               worker.PID,
-		Alive:             worker.Alive,
-		Worktree:          worker.Worktree,
-		Branch:            worker.Branch,
-		TmuxSession:       worker.TmuxSession,
-		HasLog:            worker.HasLog,
-		RetryCount:        worker.RetryCount,
-		LastNotification:  worker.LastNotification,
-		Attribution:       worker.Attribution,
-		Actions:           worker.Actions,
+		ProjectName:            project.Name,
+		ProjectRepo:            project.Repo,
+		DashboardURL:           project.DashboardURL,
+		Slot:                   worker.Slot,
+		IssueNumber:            worker.IssueNumber,
+		IssueTitle:             worker.IssueTitle,
+		IssueURL:               worker.IssueURL,
+		Status:                 worker.Status,
+		DisplayStatus:          worker.DisplayStatus,
+		StatusReason:           worker.StatusReason,
+		NextAction:             worker.NextAction,
+		NeedsAttention:         worker.NeedsAttention,
+		Live:                   worker.Live,
+		Backend:                worker.Backend,
+		PRNumber:               worker.PRNumber,
+		PRURL:                  worker.PRURL,
+		TokensUsedAttempt:      worker.TokensUsedAttempt,
+		TokensUsedTotal:        worker.TokensUsedTotal,
+		Runtime:                worker.Runtime,
+		RuntimeSeconds:         worker.RuntimeSeconds,
+		WorkerRuntime:          worker.WorkerRuntime,
+		WorkerRuntimeSeconds:   worker.WorkerRuntimeSeconds,
+		WorkflowRuntime:        worker.WorkflowRuntime,
+		WorkflowRuntimeSeconds: worker.WorkflowRuntimeSeconds,
+		PROpenRuntime:          worker.PROpenRuntime,
+		PROpenRuntimeSeconds:   worker.PROpenRuntimeSeconds,
+		StartedAt:              worker.StartedAt,
+		FinishedAt:             worker.FinishedAt,
+		WorkerEndedAt:          worker.WorkerEndedAt,
+		PROpenedAt:             worker.PROpenedAt,
+		NextRetryAt:            worker.NextRetryAt,
+		PID:                    worker.PID,
+		Alive:                  worker.Alive,
+		Worktree:               worker.Worktree,
+		Branch:                 worker.Branch,
+		TmuxSession:            worker.TmuxSession,
+		HasLog:                 worker.HasLog,
+		RetryCount:             worker.RetryCount,
+		LastNotification:       worker.LastNotification,
+		Attribution:            worker.Attribution,
+		Actions:                worker.Actions,
 	}
 }
 

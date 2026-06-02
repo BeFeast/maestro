@@ -151,6 +151,31 @@ function issueSummaryText(worker) {
   return (issue + " " + (worker.issue_title || "")).trim();
 }
 
+// #426: render agent runtime separately from total workflow elapsed time.
+// The fleet table previously labelled "Runtime" but it was actually total
+// session wall-clock from start to finish, which conflated coding-agent
+// runtime with PR-open / CI / Greptile / merge waiting.
+function runtimeCellHTML(worker) {
+  const workerRt = worker.worker_runtime || "-";
+  const workflowRt = worker.workflow_runtime || worker.runtime || "-";
+  if (!workerRt || workerRt === workflowRt) {
+    return escapeText(workflowRt);
+  }
+  return '<span class="runtime-agent">' + escapeText(workerRt) + '</span>' +
+    '<span class="runtime-sep"> / </span>' +
+    '<span class="runtime-total">' + escapeText(workflowRt) + '</span>';
+}
+
+function runtimeTitleText(worker) {
+  const workerRt = worker.worker_runtime || "-";
+  const workflowRt = worker.workflow_runtime || worker.runtime || "-";
+  const parts = ["Agent runtime: " + workerRt, "Workflow elapsed: " + workflowRt];
+  if (worker.pr_open_runtime) {
+    parts.push("PR/CI waiting: " + worker.pr_open_runtime);
+  }
+  return parts.join("\n");
+}
+
 function actionLabel(action) {
   switch (String(action || "").trim()) {
   case "none": return "Skipped tick";
@@ -1876,7 +1901,7 @@ function renderFleetWorkers() {
       '<td class="status-col" title="' + escapeText(statusLabel(worker)) + '"><span class="' + statusClass(worker) + '">' + escapeText(statusLabel(worker)) + '</span></td>' +
       '<td class="backend-col" title="' + escapeText(worker.backend || "-") + '">' + escapeText(worker.backend || "-") + '</td>' +
       '<td class="pr-col" title="' + escapeText(pr) + '">' + linkHTML(worker.pr_url, pr) + '</td>' +
-      '<td class="runtime-col" title="' + escapeText(worker.runtime || "-") + '">' + escapeText(worker.runtime || "-") + '</td>' +
+      '<td class="runtime-col" title="' + escapeText(runtimeTitleText(worker)) + '">' + runtimeCellHTML(worker) + '</td>' +
       '<td class="tokens-col">' + compactNumber(worker.tokens_used_total) + '</td>' +
       '<td class="action-col">' + renderActions(worker.actions || [], { details: false }) + '</td>' +
     '</tr>';
@@ -2078,8 +2103,12 @@ function renderWorkerDetail(data) {
     detailField("Worktree", worker.worktree || "-"),
     detailField("Branch", worker.branch || "-"),
     detailField("Started", formatTimestamp(worker.started_at)),
+    detailField("Worker ended", formatTimestamp(worker.worker_ended_at)),
+    detailField("PR opened", formatTimestamp(worker.pr_opened_at)),
     detailField("Finished", formatTimestamp(worker.finished_at)),
-    detailField("Runtime", worker.runtime || "-"),
+    detailField("Agent runtime", worker.worker_runtime || "-"),
+    detailField("Workflow elapsed", worker.workflow_runtime || worker.runtime || "-"),
+    detailField("PR/CI waiting", worker.pr_open_runtime || "-"),
     detailField("Next retry", formatTimestamp(worker.next_retry_at)),
     detailField("Retry count", worker.retry_count ? String(worker.retry_count) : "0"),
     detailField("Log", worker.has_log ? "recorded" : "not recorded")
