@@ -352,6 +352,9 @@ input, textarea { font: inherit; color: inherit; }
 .tb-btn.primary { background: var(--accent); color: #04212a; border-color: var(--accent); font-weight: 600; }
 .tb-btn.primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
 .tb-btn.danger { background: var(--stuck); color: #fff; border-color: var(--stuck); font-weight: 600; }
+.tb-btn.recovery { background: var(--bg-2); color: var(--fg-1); border-color: var(--border-3); font-weight: 600; }
+.tb-btn.recovery:hover { border-color: var(--accent); color: var(--accent); }
+.tb-btn.danger .approval-on-danger { color: rgba(255, 255, 255, 0.88); }
 
 .tb-divider { width: 1px; height: 18px; background: var(--border-2); margin: 0 var(--s-1); }
 

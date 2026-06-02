@@ -816,11 +816,16 @@ function WorkerActionsPanel({ worker, readOnly }) {
       <div className="drawer-sec-title">Controls</div>
       <div className="row gap-2" style={{ flexWrap: "wrap" }}>
         {actions.map(action => {
-          const danger = action.id === "stop_worker" || action.id === "restart_worker";
-          const cls = "tb-btn" + (danger ? " danger" : "") + (action.disabled ? " ghost" : "");
+          const danger = action.id === "stop_worker";
+          const recovery = action.id === "restart_worker";
+          const cls = "tb-btn"
+            + (danger ? " danger" : "")
+            + (recovery ? " recovery" : "")
+            + (action.disabled ? " ghost" : "");
           const title = action.disabled
             ? (action.disabled_reason || "Unavailable")
             : (action.description || action.label || action.id);
+          const approvalCls = "mono " + (danger ? "approval-on-danger" : "dim");
           return (
             <button
               key={action.id}
@@ -831,7 +836,7 @@ function WorkerActionsPanel({ worker, readOnly }) {
             >
               {busyId === action.id ? "…" : (action.label || action.id)}
               {action.requires_approval && !action.disabled && (
-                <span className="mono dim" style={{ fontSize: 10, marginLeft: 4 }}>(approval)</span>
+                <span className={approvalCls} style={{ fontSize: 10, marginLeft: 4 }}>(approval)</span>
               )}
             </button>
           );
