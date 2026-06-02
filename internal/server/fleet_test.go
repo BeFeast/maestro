@@ -3435,3 +3435,107 @@ func assertFleetReadOnlyAction(t *testing.T, action controlAction) {
 		t.Fatalf("action endpoint = %s %s, want POST /api/v1/fleet/actions", action.Method, action.Endpoint)
 	}
 }
+
+// TestFleetAPISurfacesBackendHealthAndAttribution pins #534: the fleet
+// snapshot must echo state.BackendHealth on each project (so the SPA can
+// render «claude in cooldown until 21:00 UTC») and must echo the per-
+// session Attribution timeline on each worker (so the SPA can render
+// «claude opus-4.8 xhigh (12m) → codex gpt-5.5 medium (4m, fallover)»).
+func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "one")
+	now := time.Now().UTC()
+	cooldownUntil := now.Add(2 * time.Hour)
+	segStart := now.Add(-16 * time.Minute)
+	segMid := now.Add(-4 * time.Minute)
+
+	st := state.NewState()
+	st.Sessions["one-1"] = &state.Session{
+		IssueNumber: 87,
+		IssueTitle:  "Surface backend health",
+		Status:      state.StatusRunning,
+		StartedAt:   segStart,
+		Backend:     "codex",
+		Attribution: []state.BackendAttribution{
+			{
+				Backend:   "claude",
+				Provider:  "anthropic",
+				Model:     "opus-4.8",
+				Variant:   "opus[1m]",
+				Effort:    "xhigh",
+				StartedAt: segStart,
+				EndedAt:   fleetTimePtr(segMid),
+				EndReason: "provider_limit",
+				Reason:    "initial_spawn",
+			},
+			{
+				Backend:   "codex",
+				Provider:  "openai",
+				Model:     "gpt-5.5",
+				Effort:    "medium",
+				StartedAt: segMid,
+				Reason:    "fallover",
+			},
+		},
+	}
+	st.BackendHealth["claude"] = state.BackendHealth{
+		State:      state.BackendHealthCooldown,
+		Reason:     "provider rate limit",
+		Pattern:    "anthropic_5h_limit",
+		Since:      now.Add(-5 * time.Minute),
+		RetryAfter: &cooldownUntil,
+	}
+	st.BackendHealth["codex"] = state.BackendHealth{State: state.BackendHealthAvailable}
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	project := findFleetProject(t, resp.Projects, "One")
+	claudeHealth, ok := project.BackendHealth["claude"]
+	if !ok {
+		t.Fatalf("project.backend_health missing claude entry: %+v", project.BackendHealth)
+	}
+	if claudeHealth.State != state.BackendHealthCooldown {
+		t.Fatalf("claude state = %q, want cooldown", claudeHealth.State)
+	}
+	if claudeHealth.RetryAfter == nil || !claudeHealth.RetryAfter.Equal(cooldownUntil) {
+		t.Fatalf("claude retry_after = %v, want %v", claudeHealth.RetryAfter, cooldownUntil)
+	}
+	codexHealth, ok := project.BackendHealth["codex"]
+	if !ok || codexHealth.State != state.BackendHealthAvailable {
+		t.Fatalf("codex health = %+v, want available", codexHealth)
+	}
+
+	worker := findFleetWorker(t, resp.Workers, "one-1")
+	if len(worker.Attribution) != 2 {
+		t.Fatalf("worker.attribution len = %d, want 2 segments", len(worker.Attribution))
+	}
+	if worker.Attribution[0].Backend != "claude" || worker.Attribution[0].EndReason != "provider_limit" {
+		t.Fatalf("first segment = %+v, want closed claude segment", worker.Attribution[0])
+	}
+	if worker.Attribution[1].Backend != "codex" || worker.Attribution[1].EndedAt != nil {
+		t.Fatalf("second segment = %+v, want open codex segment", worker.Attribution[1])
+	}
+	if worker.Attribution[1].Reason != "fallover" {
+		t.Fatalf("second segment.Reason = %q, want fallover", worker.Attribution[1].Reason)
+	}
+}

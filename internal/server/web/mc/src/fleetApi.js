@@ -82,7 +82,134 @@ export function mapFleetResponse(raw, now = Date.now()) {
       : [],
     lastDecisionAge: latestSupervisorAge(raw.projects || []),
     supervisorPulse: aggregateSupervisorPulse(raw.projects || []),
+    backendHealth: aggregateBackendHealth(raw.projects || []),
   };
+}
+
+// aggregateBackendHealth folds per-project `backend_health` maps (#534)
+// into a single fleet-level list the SPA header can render as
+// «claude — cooldown until 21:00 UTC · codex — available · opencode —
+// available». When the same backend appears across projects, the worst
+// state wins (cooldown > available) and the earliest RetryAfter is kept
+// so the countdown reflects the soonest recovery.
+export function aggregateBackendHealth(rawProjects) {
+  const out = new Map();
+  for (const project of rawProjects || []) {
+    const map = project?.backend_health || {};
+    for (const [name, entry] of Object.entries(map)) {
+      if (!entry || typeof entry !== "object") continue;
+      const state = String(entry.state || "");
+      const retry = entry.retry_after || null;
+      const retryMs = retry ? parseTimestamp(retry) : null;
+      const existing = out.get(name);
+      if (!existing) {
+        out.set(name, {
+          backend: name,
+          state,
+          reason: entry.reason || "",
+          pattern: entry.pattern || "",
+          retryAfter: retry,
+          retryAfterMs: retryMs,
+          since: entry.since || "",
+        });
+        continue;
+      }
+      // Worst-state wins: cooldown > available > unknown empty.
+      if (existing.state !== "cooldown" && state === "cooldown") {
+        existing.state = "cooldown";
+        existing.reason = entry.reason || existing.reason;
+        existing.pattern = entry.pattern || existing.pattern;
+      }
+      if (retryMs != null && (existing.retryAfterMs == null || retryMs < existing.retryAfterMs)) {
+        existing.retryAfter = retry;
+        existing.retryAfterMs = retryMs;
+      }
+    }
+  }
+  return Array.from(out.values()).sort((a, b) => a.backend.localeCompare(b.backend));
+}
+
+// backendHealthTone maps a BackendHealth.state value to the SPA's pill
+// tone vocabulary so the row uses the same red/green/grey palette as the
+// rest of Mission Control.
+export function backendHealthTone(state) {
+  switch (String(state || "")) {
+  case "cooldown": return "stuck";
+  case "available": return "ok";
+  default: return "idle";
+  }
+}
+
+// formatBackendHealthSentence renders one row's status as a single
+// operator-readable sentence. Returns "" when the backend is healthy
+// and the SPA already shows an "available" pill so the row isn't
+// double-talked.
+export function formatBackendHealthSentence(entry, now = Date.now()) {
+  if (!entry) return "";
+  if (entry.state !== "cooldown") return "";
+  const target = entry.retryAfterMs != null ? entry.retryAfterMs : parseTimestamp(entry.retryAfter);
+  if (target == null) {
+    return entry.reason
+      ? `auto-recovery pending (${entry.reason})`
+      : "auto-recovery pending";
+  }
+  const remainingSec = Math.max(0, Math.round((target - now) / 1000));
+  const eta = formatCountdown(remainingSec);
+  return `cooldown · auto-recovery in ${eta}`;
+}
+
+// formatAttributionSegment renders one BackendAttribution entry as the
+// short inline string used on session cards: "claude opus-4.8 xhigh
+// (12m)". Backend name is always present; provider/model/variant/effort
+// degrade individually when absent. Duration is computed from
+// started_at / ended_at; if the segment is still open, ended_at is
+// taken as `now`.
+export function formatAttributionSegment(segment, now = Date.now()) {
+  if (!segment) return "";
+  const parts = [];
+  if (segment.backend) parts.push(segment.backend);
+  const meta = [segment.model, segment.variant, segment.effort]
+    .filter(Boolean)
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+  if (meta.length) parts.push(meta.join(" "));
+  const duration = attributionSegmentDuration(segment, now);
+  if (duration) parts.push(`(${duration})`);
+  return parts.join(" ").trim();
+}
+
+export function attributionSegmentDuration(segment, now = Date.now()) {
+  const startMs = parseTimestamp(segment?.started_at);
+  if (startMs == null) return "";
+  const endMs = segment.ended_at ? parseTimestamp(segment.ended_at) : now;
+  if (endMs == null || endMs < startMs) return "";
+  const seconds = Math.max(1, Math.round((endMs - startMs) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return rem > 0 ? `${hours}h ${rem}m` : `${hours}h`;
+}
+
+// formatAttributionTimeline joins the per-segment summary with arrow
+// separators for inline session-card use, e.g. "claude opus-4.8 xhigh
+// (12m) → codex gpt-5.5 medium (4m, fallover)". When the previous
+// segment carries an end_reason the cause is tucked into the next
+// segment's parens so the operator can read the fallover cause inline
+// without opening the drawer.
+export function formatAttributionTimeline(attribution, now = Date.now()) {
+  const segments = Array.isArray(attribution) ? attribution : [];
+  if (!segments.length) return "";
+  return segments
+    .map((seg, i) => {
+      const base = formatAttributionSegment(seg, now);
+      if (i === 0) return base;
+      const prevReason = segments[i - 1]?.end_reason || "";
+      if (!prevReason) return base;
+      if (/\)$/.test(base)) return base.replace(/\)$/, `, ${prevReason})`);
+      return `${base} (${prevReason})`;
+    })
+    .join(" → ");
 }
 
 // aggregateSupervisorPulse rolls the per-project `supervisor_pulse` blocks

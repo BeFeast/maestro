@@ -4,7 +4,9 @@ import { useFleet } from "./fleetContext.jsx";
 import { parseTimestamp, relTime } from "./utils.js";
 import {
   actionLabel,
+  backendHealthTone,
   formatAbsoluteTimestamp,
+  formatBackendHealthSentence,
   formatCountdown,
   nextDecisionCountdown,
   pulseFreshnessTone,
@@ -98,6 +100,8 @@ export function FleetScreen({ navigate }) {
         </div>
         <Heartbeat tone={tone} bpm={fleet.heartbeatBpm} daemonAlive={fleet.daemonAlive} />
       </div>
+
+      <BackendHealthRow entries={fleet.backendHealth || []} now={now} />
 
       <div className="stats">
         <Stat
@@ -330,6 +334,38 @@ function DecisionSparkline({ actions }) {
           </span>
         ))}
       </div>
+    </div>
+  );
+}
+
+// BackendHealthRow renders one pill per configured backend so an
+// operator can see at a glance that, e.g., claude is in cooldown until
+// 21:00 UTC while codex / opencode remain available. Rendered between
+// the hero card and the rollup stats — that is where the operator
+// looks for "is the fleet flying right now". Hidden entirely when no
+// project surfaces backend_health (older servers / unconfigured).
+function BackendHealthRow({ entries, now }) {
+  if (!entries || entries.length === 0) return null;
+  return (
+    <div className="backend-health row gap-2" style={{ flexWrap: "wrap", marginTop: "var(--s-3)", marginBottom: "var(--s-3)" }}>
+      <span className="mono dim" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        backends
+      </span>
+      {entries.map(entry => {
+        const tone = backendHealthTone(entry.state);
+        const sentence = formatBackendHealthSentence(entry, now);
+        const title = entry.retryAfter
+          ? `${entry.backend} ${entry.state}; retry after ${entry.retryAfter}`
+          : `${entry.backend} ${entry.state || "unknown"}`;
+        return (
+          <Pill key={entry.backend} tone={tone} noDot title={title}>
+            <strong style={{ fontSize: 11.5, marginRight: 6 }}>{entry.backend}</strong>
+            <span style={{ fontSize: 10.5, opacity: 0.85 }}>
+              {sentence || entry.state || "unknown"}
+            </span>
+          </Pill>
+        );
+      })}
     </div>
   );
 }

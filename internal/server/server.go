@@ -277,7 +277,12 @@ type sessionInfo struct {
 	RetryCount        int                     `json:"retry_count,omitempty"`
 	LastNotification  string                  `json:"last_notification,omitempty"`
 	BackendSelection  *state.BackendSelection `json:"backend_selection,omitempty"`
-	Actions           []controlAction         `json:"actions,omitempty"`
+	// Attribution is the per-segment provider/model/variant/effort timeline
+	// recorded across spawn / respawn / fallover (#513, PR #518). The SPA
+	// renders the active segment inline on the session card and the full
+	// list with EndReason between segments in the worker drawer.
+	Attribution []state.BackendAttribution `json:"attribution,omitempty"`
+	Actions     []controlAction            `json:"actions,omitempty"`
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
@@ -301,6 +306,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		RetryCount:        sess.RetryCount,
 		LastNotification:  sess.LastNotifiedStatus,
 		BackendSelection:  sess.BackendSelection,
+		Attribution:       sess.Attribution,
 		Live:              state.SessionLiveAt(sess, now),
 	}
 
