@@ -3192,6 +3192,373 @@ func TestMergeReadyPR_OtherMergeErrorNoRebase(t *testing.T) {
 	}
 }
 
+// #602 — A real merge conflict on a StatusPROpen session must route through
+// the conflict-resolution path (rebase worktree → markRebaseQueued on success)
+// instead of looping with merge_failed forever.
+func TestMergeReadyPR_RealConflictRoutesToRebaseForPROpen(t *testing.T) {
+	rebased := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: merge commit cannot be cleanly created")
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "CONFLICTING", "dirty", nil
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
+			rebased = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false for a CONFLICTING merge failure")
+	}
+	if !rebased {
+		t.Fatal("rebase should be triggered when GitHub reports CONFLICTING")
+	}
+	if sess.Status != state.StatusQueued {
+		t.Errorf("session status = %q, want %q after successful rebase", sess.Status, state.StatusQueued)
+	}
+	if !sess.RebaseAttempted {
+		t.Error("RebaseAttempted should be true after rebase")
+	}
+	if sess.LastNotifiedStatus == "merge_failed" {
+		t.Error("LastNotifiedStatus must not be merge_failed — the conflict was routed, not surfaced as a generic failure")
+	}
+}
+
+// #602 — When the merge fails on a retry_exhausted convergence candidate and
+// GitHub reports CONFLICTING, the session must reach a terminal advanced state
+// (conflict_failed + blocked label) so the slot frees and the dynamic-wave
+// queue advances on the next cycle. No worker respawn.
+func TestMergeReadyPR_RealConflictMarksRetryExhaustedUnresolvable(t *testing.T) {
+	labels := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: merge commit cannot be cleanly created")
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "CONFLICTING", "dirty", nil
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
+			return fmt.Errorf("CONFLICT (content): main.go")
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labels = append(labels, label)
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "test issue",
+		Branch:             "feat/a",
+		Worktree:           "/tmp/wt",
+		Status:             state.StatusRetryExhausted,
+		PRNumber:           10,
+		LastNotifiedStatus: "review_retry_exhausted",
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false on real conflict")
+	}
+	if sess.Status != state.StatusConflictFailed {
+		t.Errorf("session status = %q, want %q (slot must free)", sess.Status, state.StatusConflictFailed)
+	}
+	if sess.FinishedAt == nil {
+		t.Error("FinishedAt should be set so the slot is no longer active")
+	}
+	if !sess.RebaseAttempted {
+		t.Error("RebaseAttempted should be true")
+	}
+	if len(labels) == 0 || labels[0] != "blocked" {
+		t.Errorf("issue must be labelled blocked, got %v", labels)
+	}
+	if sess.LastNotifiedStatus == "merge_failed" {
+		t.Error("LastNotifiedStatus must not stay merge_failed — conflict was reconciled, not silently logged")
+	}
+}
+
+// #602 — A retry_exhausted convergence candidate with no remaining worktree
+// (worker already cleaned up after retry exhaustion) must still reach
+// conflict_failed without trying to respawn a worker via handleRebaseConflictRetry.
+func TestMergeReadyPR_RealConflictRetryExhaustedNoWorktree(t *testing.T) {
+	labels := make([]string, 0)
+	rebaseCalled := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: merge commit cannot be cleanly created")
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "CONFLICTING", "dirty", nil
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
+			rebaseCalled = true
+			return nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labels = append(labels, label)
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "test issue",
+		Branch:             "feat/a",
+		Worktree:           "",
+		Status:             state.StatusRetryExhausted,
+		PRNumber:           10,
+		LastNotifiedStatus: "review_retry_exhausted",
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false on real conflict")
+	}
+	if rebaseCalled {
+		t.Error("rebase must NOT be called when there is no worktree")
+	}
+	if sess.Status != state.StatusConflictFailed {
+		t.Errorf("session status = %q, want %q (slot must free)", sess.Status, state.StatusConflictFailed)
+	}
+	if len(labels) == 0 || labels[0] != "blocked" {
+		t.Errorf("issue must be labelled blocked, got %v", labels)
+	}
+}
+
+// #602 — AutoRebase disabled: a real conflict still drives to a terminal state
+// instead of looping silently.
+func TestMergeReadyPR_RealConflictAutoRebaseDisabledMarksUnresolvable(t *testing.T) {
+	labels := make([]string, 0)
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: false},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: merge commit cannot be cleanly created")
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "CONFLICTING", "dirty", nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labels = append(labels, label)
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	if o.mergeReadyPR(state.NewState(), "slot-0", sess, pr) {
+		t.Fatal("mergeReadyPR should return false on real conflict")
+	}
+	if sess.Status != state.StatusConflictFailed {
+		t.Errorf("session status = %q, want %q", sess.Status, state.StatusConflictFailed)
+	}
+	if len(labels) == 0 || labels[0] != "blocked" {
+		t.Errorf("issue must be labelled blocked, got %v", labels)
+	}
+}
+
+// #602 — End-to-end: a retry_exhausted convergence candidate whose PR is
+// CONFLICTING must NOT be re-selected on the next autoMergePRs cycle. After
+// one cycle it should be in conflict_failed (slot freed) and on the second
+// cycle mergePR must not be called again.
+func TestAutoMergePRs_RetryExhaustedConflictDoesNotLoopHaltQueue(t *testing.T) {
+	mergeAttempts := 0
+	labels := make([]string, 0)
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:                            "owner/repo",
+			MergeStrategy:                   "parallel",
+			AutoRebase:                      true,
+			AutoRetryReviewFeedback:         true,
+			MergeExhaustedNonCriticalReview: boolPtr(true),
+		},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "P3 nit: rename foo", nil
+		},
+		ghPRHasCriticalReviewFn: func(prNumber int) (bool, error) {
+			return false, nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			mergeAttempts++
+			return fmt.Errorf("gh pr merge %d: merge commit cannot be cleanly created", prNumber)
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "CONFLICTING", "dirty", nil
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
+			return fmt.Errorf("CONFLICT (content): conflicted.go")
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labels = append(labels, label)
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "test issue",
+		Branch:             "feat/a",
+		Worktree:           "/tmp/wt",
+		Status:             state.StatusRetryExhausted,
+		PRNumber:           10,
+		LastNotifiedStatus: "review_retry_exhausted",
+	}
+
+	// First cycle: convergence picks the retry_exhausted PR, merge fails on
+	// real conflict, mergeReadyPR drives the session to conflict_failed.
+	o.autoMergePRs(s)
+	if mergeAttempts != 1 {
+		t.Fatalf("first cycle: mergeAttempts = %d, want 1", mergeAttempts)
+	}
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusConflictFailed {
+		t.Fatalf("after first cycle status = %q, want %q", sess.Status, state.StatusConflictFailed)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt must be set so the supervisor stops treating the slot as active")
+	}
+	if len(labels) == 0 || labels[0] != "blocked" {
+		t.Errorf("issue must be labelled blocked, got %v", labels)
+	}
+
+	// Second cycle: the session is no longer retry_exhausted, so convergence
+	// must not select it again. mergePR must NOT be called a second time.
+	o.autoMergePRs(s)
+	if mergeAttempts != 1 {
+		t.Fatalf("second cycle: mergeAttempts = %d, want 1 (queue must not loop)", mergeAttempts)
+	}
+}
+
+// #602 — rebaseConflicts loop safety net: if a retry_exhausted session has a
+// CONFLICTING open PR (e.g., entered this state via another path), the loop
+// must drive it to conflict_failed without respawning a worker.
+func TestRebaseConflicts_RetryExhaustedConflictingMarksUnresolvable(t *testing.T) {
+	labels := make([]string, 0)
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "CONFLICTING", "dirty", nil
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
+			return fmt.Errorf("CONFLICT (content): main.go")
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labels = append(labels, label)
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "test issue",
+		Branch:             "feat/a",
+		Worktree:           "/tmp/wt",
+		Status:             state.StatusRetryExhausted,
+		PRNumber:           10,
+		LastNotifiedStatus: "review_retry_exhausted",
+	}
+
+	o.rebaseConflicts(s)
+
+	sess := s.Sessions["slot-0"]
+	if sess.Status != state.StatusConflictFailed {
+		t.Errorf("session status = %q, want %q", sess.Status, state.StatusConflictFailed)
+	}
+	if !sess.RebaseAttempted {
+		t.Error("RebaseAttempted should be true after the safety-net rebase attempt")
+	}
+	if sess.FinishedAt == nil {
+		t.Error("FinishedAt must be set")
+	}
+	if len(labels) == 0 || labels[0] != "blocked" {
+		t.Errorf("issue must be labelled blocked, got %v", labels)
+	}
+}
+
+// #602 — When the merge fails with a non-"not up to date" error AND GitHub
+// reports MERGEABLE (so it's not actually a conflict), fall through to the
+// existing single-notification merge_failed path instead of mis-routing.
+func TestMergeReadyPR_NonConflictingMergeErrorFallsThroughToMergeFailed(t *testing.T) {
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return fmt.Errorf("gh pr merge 10: branch protection rule blocked the merge")
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "blocked", nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	if o.mergeReadyPR(state.NewState(), "slot-0", sess, pr) {
+		t.Fatal("mergeReadyPR should return false")
+	}
+	if sess.Status != state.StatusPROpen {
+		t.Errorf("session status = %q, want %q (unchanged)", sess.Status, state.StatusPROpen)
+	}
+	if sess.LastNotifiedStatus != "merge_failed" {
+		t.Errorf("LastNotifiedStatus = %q, want %q", sess.LastNotifiedStatus, "merge_failed")
+	}
+}
+
 // --- silent timeout tests ---
 
 // newSilentTimeoutOrchestrator creates an Orchestrator wired for checkSessions
