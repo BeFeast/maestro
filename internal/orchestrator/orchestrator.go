@@ -921,6 +921,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			sess.Status = state.StatusFailed
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
+			state.MarkWorkerEnded(sess, now)
 			o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) retry failed (could not fetch issue)",
 				slotName, sess.IssueNumber, sess.IssueTitle)
 			continue
@@ -958,6 +959,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			sess.Status = state.StatusFailed
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
+			state.MarkWorkerEnded(sess, now)
 			o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) respawn failed: %v",
 				slotName, sess.IssueNumber, sess.IssueTitle, respawnErr)
 			continue
@@ -1475,6 +1477,8 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			sess.TmuxSession = ""
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
+			state.MarkWorkerEnded(sess, now)
+			state.MarkPROpened(sess, now)
 			reconciled = true
 			continue
 		}
@@ -1514,6 +1518,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
+				state.MarkWorkerEnded(sess, now)
 				sess.LastNotifiedStatus = "rate_limit"
 				sess.Status = state.StatusDead
 				reconciled = true
@@ -1529,6 +1534,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
+				state.MarkWorkerEnded(sess, now)
 				sess.LastNotifiedStatus = "rate_limit"
 				sess.Status = state.StatusDead
 				reconciled = true
@@ -1547,6 +1553,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
+				state.MarkWorkerEnded(sess, now)
 				sess.LastNotifiedStatus = "rate_limit"
 				sess.Status = state.StatusDead
 				reconciled = true
@@ -1572,6 +1579,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		sess.TmuxSession = ""
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		reconciled = true
 
 		log.Printf("[orch] reconcile: %s running->dead (%s); pid=%d tmux=%q",
@@ -1608,6 +1616,8 @@ func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.S
 	sess.TmuxSession = ""
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
+	state.MarkPROpened(sess, now)
 	if o.notifier != nil {
 		o.notifier.Sendf("🔀 maestro: worker %s pushed branch %s and exited before opening a PR; auto-created PR #%d for issue #%d (%s)",
 			slotName, branch, prNumber, sess.IssueNumber, sess.IssueTitle)
@@ -1681,6 +1691,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					sess.TmuxSession = ""
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
+					state.MarkWorkerEnded(sess, now)
+					state.MarkPROpened(sess, now)
 					o.syncProject(sess.IssueNumber, github.ProjectStatusInReview)
 					continue
 				}
@@ -1705,6 +1717,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if sess.FinishedAt == nil {
 						now := time.Now().UTC()
 						sess.FinishedAt = &now
+						state.MarkWorkerEnded(sess, now)
 					}
 				} else if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					merged, err := o.isPRMerged(sess.PRNumber)
@@ -1751,6 +1764,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
+				state.MarkWorkerEnded(sess, now)
 				continue
 			}
 		}
@@ -1770,6 +1784,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
+				state.MarkWorkerEnded(sess, now)
 				continue
 			}
 
@@ -1790,6 +1805,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
+					now := time.Now().UTC()
+					state.MarkWorkerEnded(sess, now)
+					state.MarkPROpened(sess, now)
 					o.notifier.Sendf("🔀 maestro: worker %s completed, PR #%d open for issue #%d (%s)",
 						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
 				} else if o.isRateLimited(sess.LogFile) {
@@ -1805,6 +1823,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = "rate_limit"
 						sess.FinishedAt = &now
+						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit; no fallback backend available",
 							slotName, sess.IssueNumber, sess.IssueTitle)
 						continue
@@ -1818,6 +1837,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.Status = state.StatusFailed
 						now := time.Now().UTC()
 						sess.FinishedAt = &now
+						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) rate-limited and fallback failed (could not fetch issue)",
 							slotName, sess.IssueNumber, sess.IssueTitle)
 						continue
@@ -1833,6 +1853,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.Status = state.StatusFailed
 						now := time.Now().UTC()
 						sess.FinishedAt = &now
+						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) rate-limited and fallback to %s failed: %v",
 							slotName, sess.IssueNumber, sess.IssueTitle, nextBackend, err)
 						continue
@@ -1849,6 +1870,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					sess.Status = state.StatusDead
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
+					state.MarkWorkerEnded(sess, now)
 					log.Printf("[orch] worker %s (pid=%d) died, scheduling retry %d in %dms",
 						slotName, sess.PID, sess.RetryCount, backoffMs)
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) died, retry %d scheduled in %ds",
@@ -1861,6 +1883,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					sess.Status = state.StatusFailed
 					now := time.Now().UTC()
 					sess.FinishedAt = &now
+					state.MarkWorkerEnded(sess, now)
 					o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) permanently failed after %d retries.\nCheck log: %s",
 						slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, sess.LogFile)
 				}
@@ -1877,6 +1900,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					log.Printf("[orch] worker %s opened PR #%d while still running — transitioning to pr_open", slotName, pr.Number)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
+					state.MarkPROpened(sess, time.Now().UTC())
 					o.notifier.Sendf("🔀 maestro: worker %s opened PR #%d for issue #%d (%s)",
 						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
 					continue
@@ -1929,6 +1953,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									sess.LastNotifiedStatus = "rate_limit"
 									now := time.Now().UTC()
 									sess.FinishedAt = &now
+									state.MarkWorkerEnded(sess, now)
 									o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback failed (could not fetch issue)",
 										slotName, sess.IssueNumber, pattern)
 									continue
@@ -1945,6 +1970,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									sess.LastNotifiedStatus = "rate_limit"
 									now := time.Now().UTC()
 									sess.FinishedAt = &now
+									state.MarkWorkerEnded(sess, now)
 									o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); fallback to %s failed: %v",
 										slotName, sess.IssueNumber, pattern, fallback, respawnErr)
 									continue
@@ -1961,6 +1987,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							sess.LastNotifiedStatus = "rate_limit"
 							now = time.Now().UTC()
 							sess.FinishedAt = &now
+							state.MarkWorkerEnded(sess, now)
 							o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d) hit rate limit (%s); no fallback configured",
 								slotName, sess.IssueNumber, pattern)
 							continue
@@ -2012,6 +2039,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = "token_limit"
 						sess.FinishedAt = &now
+						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("⚠️ Worker %s (issue #%d) exceeded token limit: %s tokens used (attempt), %s total",
 							slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(sess.TokensUsedTotal))
 						continue
@@ -2041,6 +2069,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								sess.Status = state.StatusDead
 								sess.LastNotifiedStatus = "silent_timeout"
 								sess.FinishedAt = &now
+								state.MarkWorkerEnded(sess, now)
 
 								if prevSilentKills > 0 {
 									// auto-label blocked disabled
@@ -2080,6 +2109,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				sess.Status = state.StatusFailed
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
+				state.MarkWorkerEnded(sess, now)
 
 				o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d: %s) timed out after %d min.\nLast log lines:\n%s",
 					slotName, sess.IssueNumber, sess.IssueTitle, maxMinutes, logTail)
@@ -2146,6 +2176,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			sess.Status = state.StatusDone
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
+			state.MarkWorkerEnded(sess, now)
 			continue
 		}
 
@@ -2438,6 +2469,7 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 		sess.LastNotifiedStatus = "review_retry_exhausted"
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		if !alreadyNotified {
 			o.notifier.Sendf("💀 maestro: review feedback on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
 				pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
@@ -2471,6 +2503,7 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 	sess.Status = state.StatusDead
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
 
 	log.Printf("[orch] review feedback on PR #%d — scheduling retry %d in %dms for issue #%d",
 		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
@@ -2496,6 +2529,7 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		sess.LastNotifiedStatus = "ci_retry_exhausted"
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		if !alreadyNotified {
 			o.notifier.Sendf("💀 maestro: CI failing on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
 				pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
@@ -2547,6 +2581,7 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	sess.PRNumber = 0
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
 
 	log.Printf("[orch] CI failure on PR #%d — scheduling retry %d in %dms for issue #%d",
 		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
@@ -2588,6 +2623,7 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 	sess.Status = state.StatusCodeLanded
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
 }
 
 func (o *Orchestrator) markDeploymentFinished(sess *state.Session) {
@@ -2621,6 +2657,7 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	sess.Status = state.StatusDone
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
 	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 	o.closeVerifiedIssueIfAllowed(sess, prNumber)
 }
@@ -3092,6 +3129,7 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 		sess.LastNotifiedStatus = "rebase_conflict_retry_exhausted"
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
 		o.notifier.Sendf("💀 maestro: rebase conflict on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
 			prNumber, sess.IssueNumber, sess.IssueTitle, totalAttempts)
 		return
@@ -3124,6 +3162,7 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 	sess.RebaseAttempted = true
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
 
 	log.Printf("[orch] rebase conflict on PR #%d — scheduling retry %d in %dms for issue #%d",
 		prNumber, sess.RetryCount, backoffMs, sess.IssueNumber)
@@ -3155,6 +3194,7 @@ func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Ses
 	sess.PRNumber = prNumber
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
 	o.notifier.Sendf("⚠️ Worker %s (issue #%d) has unresolvable conflicts — manual intervention needed", slotName, sess.IssueNumber)
 }
 

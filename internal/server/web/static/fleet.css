@@ -1014,7 +1014,10 @@
   .status-col { width: 132px; }
   .backend-col { width: 108px; }
   .pr-col { width: 70px; }
-  .runtime-col { width: 90px; }
+  .runtime-col { width: 140px; white-space: nowrap; }
+  .runtime-col .runtime-agent { font-weight: 600; }
+  .runtime-col .runtime-sep,
+  .runtime-col .runtime-total { color: var(--muted); }
   .tokens-col { width: 82px; text-align: right; }
   .action-col { width: 180px; }
   .grid {

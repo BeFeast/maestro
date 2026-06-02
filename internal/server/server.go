@@ -248,35 +248,49 @@ type controlActionRequest struct {
 }
 
 type sessionInfo struct {
-	Slot              string                  `json:"slot"`
-	IssueNumber       int                     `json:"issue_number"`
-	IssueTitle        string                  `json:"issue_title"`
-	IssueURL          string                  `json:"issue_url,omitempty"`
-	Status            string                  `json:"status"`
-	DisplayStatus     string                  `json:"display_status,omitempty"`
-	StatusReason      string                  `json:"status_reason,omitempty"`
-	NextAction        string                  `json:"next_action,omitempty"`
-	NeedsAttention    bool                    `json:"needs_attention,omitempty"`
-	Live              bool                    `json:"live"`
-	Backend           string                  `json:"backend,omitempty"`
-	PRNumber          int                     `json:"pr_number,omitempty"`
-	PRURL             string                  `json:"pr_url,omitempty"`
-	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
-	TokensUsedTotal   int                     `json:"tokens_used_total"`
-	Runtime           string                  `json:"runtime"`
-	RuntimeSeconds    int64                   `json:"runtime_seconds"`
-	StartedAt         string                  `json:"started_at"`
-	FinishedAt        string                  `json:"finished_at,omitempty"`
-	NextRetryAt       string                  `json:"next_retry_at,omitempty"`
-	PID               int                     `json:"pid,omitempty"`
-	Alive             *bool                   `json:"alive,omitempty"`
-	Worktree          string                  `json:"worktree,omitempty"`
-	Branch            string                  `json:"branch,omitempty"`
-	TmuxSession       string                  `json:"tmux_session,omitempty"`
-	HasLog            bool                    `json:"has_log"`
-	RetryCount        int                     `json:"retry_count,omitempty"`
-	LastNotification  string                  `json:"last_notification,omitempty"`
-	BackendSelection  *state.BackendSelection `json:"backend_selection,omitempty"`
+	Slot              string `json:"slot"`
+	IssueNumber       int    `json:"issue_number"`
+	IssueTitle        string `json:"issue_title"`
+	IssueURL          string `json:"issue_url,omitempty"`
+	Status            string `json:"status"`
+	DisplayStatus     string `json:"display_status,omitempty"`
+	StatusReason      string `json:"status_reason,omitempty"`
+	NextAction        string `json:"next_action,omitempty"`
+	NeedsAttention    bool   `json:"needs_attention,omitempty"`
+	Live              bool   `json:"live"`
+	Backend           string `json:"backend,omitempty"`
+	PRNumber          int    `json:"pr_number,omitempty"`
+	PRURL             string `json:"pr_url,omitempty"`
+	TokensUsedAttempt int    `json:"tokens_used_attempt"`
+	TokensUsedTotal   int    `json:"tokens_used_total"`
+	// Runtime / RuntimeSeconds (legacy fields, kept for backwards
+	// compatibility) reflect WORKFLOW elapsed time — StartedAt to
+	// FinishedAt — including PR-open / CI / Greptile / merge waiting.
+	// Prefer WorkerRuntimeSeconds for "how long the coding agent ran"
+	// and WorkflowRuntimeSeconds for "how long the whole session took";
+	// see #426.
+	Runtime                string                  `json:"runtime"`
+	RuntimeSeconds         int64                   `json:"runtime_seconds"`
+	WorkerRuntime          string                  `json:"worker_runtime"`
+	WorkerRuntimeSeconds   int64                   `json:"worker_runtime_seconds"`
+	WorkflowRuntime        string                  `json:"workflow_runtime"`
+	WorkflowRuntimeSeconds int64                   `json:"workflow_runtime_seconds"`
+	PROpenRuntime          string                  `json:"pr_open_runtime,omitempty"`
+	PROpenRuntimeSeconds   int64                   `json:"pr_open_runtime_seconds,omitempty"`
+	StartedAt              string                  `json:"started_at"`
+	FinishedAt             string                  `json:"finished_at,omitempty"`
+	WorkerEndedAt          string                  `json:"worker_ended_at,omitempty"`
+	PROpenedAt             string                  `json:"pr_opened_at,omitempty"`
+	NextRetryAt            string                  `json:"next_retry_at,omitempty"`
+	PID                    int                     `json:"pid,omitempty"`
+	Alive                  *bool                   `json:"alive,omitempty"`
+	Worktree               string                  `json:"worktree,omitempty"`
+	Branch                 string                  `json:"branch,omitempty"`
+	TmuxSession            string                  `json:"tmux_session,omitempty"`
+	HasLog                 bool                    `json:"has_log"`
+	RetryCount             int                     `json:"retry_count,omitempty"`
+	LastNotification       string                  `json:"last_notification,omitempty"`
+	BackendSelection       *state.BackendSelection `json:"backend_selection,omitempty"`
 	// Attribution is the per-segment provider/model/variant/effort timeline
 	// recorded across spawn / respawn / fallover (#513, PR #518). The SPA
 	// renders the active segment inline on the session card and the full
@@ -310,15 +324,51 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		Live:              state.SessionLiveAt(sess, now),
 	}
 
-	// Calculate runtime
+	// Calculate runtime breakdown (#426). The workflow runtime is the
+	// total session wall-clock (StartedAt -> FinishedAt or now). The
+	// worker runtime is the time the coding agent was actually executing
+	// (StartedAt -> WorkerEndedAt). When WorkerEndedAt is not yet recorded
+	// (legacy sessions or transitions that did not flow through MarkWorkerEnded),
+	// fall back to FinishedAt and finally to now, so historical rows remain
+	// understandable.
 	end := now
 	if sess.FinishedAt != nil {
 		end = *sess.FinishedAt
 		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339)
 	}
-	runtime := end.Sub(sess.StartedAt).Round(time.Second)
-	info.Runtime = runtime.String()
-	info.RuntimeSeconds = int64(runtime / time.Second)
+	workflowDur := end.Sub(sess.StartedAt).Round(time.Second)
+	info.Runtime = workflowDur.String()
+	info.RuntimeSeconds = int64(workflowDur / time.Second)
+	info.WorkflowRuntime = workflowDur.String()
+	info.WorkflowRuntimeSeconds = info.RuntimeSeconds
+
+	workerEnd := end
+	if sess.WorkerEndedAt != nil {
+		workerEnd = *sess.WorkerEndedAt
+		info.WorkerEndedAt = sess.WorkerEndedAt.Format(time.RFC3339)
+	} else if sess.Status == state.StatusRunning {
+		workerEnd = now
+	}
+	workerDur := workerEnd.Sub(sess.StartedAt).Round(time.Second)
+	if workerDur < 0 {
+		workerDur = 0
+	}
+	info.WorkerRuntime = workerDur.String()
+	info.WorkerRuntimeSeconds = int64(workerDur / time.Second)
+
+	if sess.PROpenedAt != nil {
+		info.PROpenedAt = sess.PROpenedAt.Format(time.RFC3339)
+		prEnd := end
+		if sess.Status == state.StatusPROpen {
+			prEnd = now
+		}
+		prDur := prEnd.Sub(*sess.PROpenedAt).Round(time.Second)
+		if prDur < 0 {
+			prDur = 0
+		}
+		info.PROpenRuntime = prDur.String()
+		info.PROpenRuntimeSeconds = int64(prDur / time.Second)
+	}
 
 	if sess.Status == state.StatusRunning {
 		info.PID = sess.PID
