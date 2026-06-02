@@ -97,6 +97,7 @@ type Orchestrator struct {
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn              func(prNumber int) (string, error)
+	ghPRMergeStatusFn           func(prNumber int) (mergeable string, mergeStateStatus string, err error)
 	ghPRGreptileApprovedFn      func(prNumber int) (approved bool, pending bool, err error)
 	ghPRHasCriticalReviewFn     func(prNumber int) (bool, error)
 	ghUpdateBranchFn            func(prNumber int) error
@@ -210,6 +211,22 @@ func (o *Orchestrator) prCIStatus(prNumber int) (string, error) {
 		return o.ghPRCIStatusFn(prNumber)
 	}
 	return o.gh.PRCIStatus(prNumber)
+}
+
+// prMergeStatus returns GitHub's per-PR mergeable verdict together with the
+// raw mergeable_state ("clean" / "unstable" / "blocked" / "behind" / "dirty"
+// / "" / "unknown" / "draft" / "has_hooks"). It mirrors the supervisor's
+// prMergeStateReader and is consulted by autoMergePRs when the aggregate
+// PRCIStatus sticks at "pending" — GitHub's own required-checks verdict is
+// the authoritative override for legacy commit-status drift (#424).
+func (o *Orchestrator) prMergeStatus(prNumber int) (string, string, error) {
+	if o.ghPRMergeStatusFn != nil {
+		return o.ghPRMergeStatusFn(prNumber)
+	}
+	if o.gh == nil {
+		return "", "", fmt.Errorf("no github client configured for merge-status")
+	}
+	return o.gh.PRMergeStatus(prNumber)
 }
 
 func (o *Orchestrator) prGreptileApproved(prNumber int) (bool, bool, error) {
@@ -2189,6 +2206,22 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if err != nil {
 			log.Printf("[orch] CI status for PR #%d: %v", pr.Number, err)
 			continue
+		}
+
+		// #424: the aggregate PRCIStatus can stick at "pending" long after
+		// every required check has gone green (a common cause is a legacy
+		// commit-status used by some review bots that never resolves).
+		// GitHub's own per-PR mergeable_state already encodes the
+		// required-check verdict, so "clean" or "unstable" overrides the
+		// stale aggregate and lets autoMergePRs converge instead of looping.
+		if ciStatus == "pending" {
+			if mergeable, mergeState, mErr := o.prMergeStatus(pr.Number); mErr == nil && mergeable == "MERGEABLE" {
+				switch mergeState {
+				case "clean", "unstable":
+					log.Printf("[orch] PR #%d (%s) aggregate CI=pending but mergeable_state=%s — treating as success (#424)", pr.Number, sess.Branch, mergeState)
+					ciStatus = "success"
+				}
+			}
 		}
 
 		log.Printf("[orch] PR #%d (%s) CI=%s", pr.Number, sess.Branch, ciStatus)
