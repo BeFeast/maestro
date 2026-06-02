@@ -104,7 +104,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	checkpointContext := ""
 	if sess.CheckpointFile != "" {
 		if data, err := os.ReadFile(sess.CheckpointFile); err == nil {
-			checkpointContext = string(data)
+			checkpointContext = sanitizePromptUTF8(string(data))
 		}
 	}
 
@@ -113,7 +113,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
-	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
+	if err := writePromptFile(promptFile, prompt); err != nil {
 		return fmt.Errorf("write prompt file: %w", err)
 	}
 

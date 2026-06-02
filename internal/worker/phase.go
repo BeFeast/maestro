@@ -27,7 +27,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 
 	// Write prompt to file
 	promptFile := fmt.Sprintf("%s/%s-prompt.md", cfg.StateDir, slotName)
-	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
+	if err := writePromptFile(promptFile, prompt); err != nil {
 		return fmt.Errorf("write prompt file: %w", err)
 	}
 
