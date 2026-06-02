@@ -1113,6 +1113,12 @@ func TestFleetAPISnapshotIncludesNextAction(t *testing.T) {
 			Status:      state.StatusRetryExhausted,
 			StartedAt:   now.Add(-30 * time.Minute),
 			PRNumber:    71,
+			// #598: CI failure evidence keeps this session actionable;
+			// without it the session would be classified as
+			// convergence-bound (auto_merging) and excluded from the
+			// next-action picker.
+			LastNotifiedStatus: "ci_failure",
+			CIFailureOutput:    "FAIL: pkg/example TestStuck",
 		},
 	})
 	srv := NewFleet([]FleetProject{
@@ -3125,11 +3131,16 @@ func TestFleetAPIStaleDeadSessionsAgeOutOfAttention(t *testing.T) {
 	}
 }
 
-// TestFleetAPIRetryExhaustedWithOpenPRStaysActionable pins the #564 regression
-// for #566: a retry_exhausted session whose linked PR is still open is
-// always actionable regardless of age. The fleet verdict must stay
-// `attention` and the PR must surface in attention[].
-func TestFleetAPIRetryExhaustedWithOpenPRStaysActionable(t *testing.T) {
+// TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
+// regression. A retry_exhausted session whose linked PR is still open and
+// whose last notification is NOT a CI failure is convergence-bound: the
+// orchestrator will auto-merge it once the merge gate clears. The session
+// must stay surfaced (#564) AND counted in prs_open (#566), but the fleet
+// verdict tone must read calm — never the alarming "Action required — p1"
+// the legacy code path produced. The matching project card surfaces an
+// "auto_merging" operator state so the SPA renders a calm
+// "Auto-merging — no action needed" line instead of an attention CTA.
+func TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
 	stateDir := filepath.Join(dir, "state")
@@ -3193,8 +3204,84 @@ func TestFleetAPIRetryExhaustedWithOpenPRStaysActionable(t *testing.T) {
 	if resp.Summary.NeedsAttention < 1 {
 		t.Fatalf("summary needs_attention = %d, want >=1", resp.Summary.NeedsAttention)
 	}
+	if resp.Summary.SelfResolving != resp.Summary.NeedsAttention {
+		t.Fatalf("summary self_resolving = %d, want %d (every attention item is convergence-bound)", resp.Summary.SelfResolving, resp.Summary.NeedsAttention)
+	}
+	if resp.Verdict.Tone != "healthy" {
+		t.Fatalf("verdict tone = %q, want healthy (convergence-bound PR must not alarm; #598)", resp.Verdict.Tone)
+	}
+	if project.OperatorState.Kind != "auto_merging" {
+		t.Fatalf("project operator_state.kind = %q, want auto_merging (#598)", project.OperatorState.Kind)
+	}
+	if project.OperatorState.Tone != "healthy" {
+		t.Fatalf("project operator_state.tone = %q, want healthy (#598)", project.OperatorState.Tone)
+	}
+	if resp.NextAction != nil {
+		t.Fatalf("next_action = %+v, want nil (convergence-bound items are not operator-actionable; #598)", resp.NextAction)
+	}
+}
+
+// TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable pins the
+// alarm side of #598: a retry_exhausted PR whose last notification IS a
+// CI failure is NOT convergence-bound (failing checks block the auto-merge
+// path), so the fleet verdict must remain `attention` and the project
+// card must surface the actionable kind, not the calm "auto_merging" one.
+func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	finishedRecent := now.Add(-30 * time.Minute)
+	saveFleetTestSnapshot(t, stateDir, map[string]*state.Session{
+		"sup-failing": {
+			IssueNumber:        443,
+			IssueTitle:         "Retry exhausted with failing CI",
+			Status:             state.StatusRetryExhausted,
+			PRNumber:           600,
+			StartedAt:          finishedRecent.Add(-time.Hour),
+			FinishedAt:         &finishedRecent,
+			LastNotifiedStatus: "ci_failure",
+			CIFailureOutput:    "FAIL: pkg/foo TestBar",
+		},
+	}, []state.SupervisorDecision{
+		{
+			ID:                "dec-fail",
+			CreatedAt:         now.Add(-1 * time.Minute),
+			Project:           "maestro",
+			RecommendedAction: "monitor_open_pr",
+			Risk:              "safe",
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
+			Repo:        "befeast/maestro",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	if resp.Summary.NeedsAttention < 1 {
+		t.Fatalf("summary needs_attention = %d, want >=1", resp.Summary.NeedsAttention)
+	}
+	if resp.Summary.SelfResolving != 0 {
+		t.Fatalf("summary self_resolving = %d, want 0 (failing CI is not convergence-bound)", resp.Summary.SelfResolving)
+	}
 	if resp.Verdict.Tone != "attention" {
-		t.Fatalf("verdict tone = %q, want attention (stuck PR is exactly attention)", resp.Verdict.Tone)
+		t.Fatalf("verdict tone = %q, want attention (failing-CI PR is operator-actionable)", resp.Verdict.Tone)
+	}
+	project := findFleetProject(t, resp.Projects, "maestro")
+	if project.OperatorState.Kind != "attention" {
+		t.Fatalf("project operator_state.kind = %q, want attention", project.OperatorState.Kind)
+	}
+	if resp.NextAction == nil {
+		t.Fatalf("next_action = nil, want a candidate naming PR #600")
+	}
+	if resp.NextAction.PRNumber != 600 {
+		t.Fatalf("next_action.pr_number = %d, want 600", resp.NextAction.PRNumber)
+	}
+	if cta := resp.NextAction.CTALabel; cta == "" || !contains(cta, "600") {
+		t.Fatalf("next_action.cta_label = %q, want a label naming PR #600", cta)
 	}
 }
 

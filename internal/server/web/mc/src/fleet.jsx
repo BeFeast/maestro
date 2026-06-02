@@ -49,7 +49,19 @@ export function FleetScreen({ navigate }) {
   const prSub = fleet.prCount > 0
     ? `${fleet.summary?.monitoring_pr || 0} monitored`
     : "none open";
-  const attSub = fleet.attentionCount > 0 ? "items need you" : "nothing waiting";
+  // #598: when the only "attention" items are convergence-bound PRs the
+  // operator has nothing to do, so the stat sub-line reads calm.
+  const selfResolvingCount = Number(fleet.selfResolvingCount || 0);
+  let attSub;
+  if (fleet.attentionCount > 0) {
+    attSub = "items need you";
+  } else if (selfResolvingCount > 0) {
+    attSub = selfResolvingCount === 1
+      ? "1 auto-merging"
+      : `${selfResolvingCount} auto-merging`;
+  } else {
+    attSub = "nothing waiting";
+  }
   const approvalSub = fleet.activeApprovals > 0 ? "pending review" : "queue empty";
 
   const ctaLabel = fleet.nextAction?.cta_label || "";

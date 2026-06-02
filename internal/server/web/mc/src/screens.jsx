@@ -114,17 +114,66 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
               </div>
             )}
             <div className="hb-actions" style={{ marginTop: 12 }}>
-              {p.operatorState.session && (
+              {p.operatorState.pr_number ? (
+                <a
+                  className="tb-btn primary"
+                  href={p.operatorState.pr_url || `https://github.com/${p.repo}/pull/${p.operatorState.pr_number}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Review PR #{p.operatorState.pr_number} →
+                </a>
+              ) : p.operatorState.session ? (
                 <button
                   className="tb-btn primary"
                   onClick={() => navigate(`workers?project=${encodeURIComponent(p.slug)}&slot=${encodeURIComponent(p.operatorState.session)}`)}
                 >
-                  Open worker {p.operatorState.session} →
+                  Open worker log {p.operatorState.session} →
                 </button>
-              )}
+              ) : null}
               {p.operatorState.issue_url && (
                 <a className="tb-btn ghost" href={p.operatorState.issue_url} target="_blank" rel="noreferrer">
                   Open issue{p.operatorState.issue_number ? ` #${p.operatorState.issue_number}` : ""} →
+                </a>
+              )}
+            </div>
+          </div>
+        </Panel>
+      )}
+
+      {/* #598: convergence-bound PR — read as calm "Auto-merging — no action
+          needed" instead of an alarm. Mirrors the fleet verdict logic so the
+          per-project view never asks the operator to click for a PR Maestro
+          will merge on its own. */}
+      {p.operatorState?.kind === "auto_merging" && (
+        <Panel title="Auto-merging" sub={p.operatorState.session || undefined}>
+          <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+            <div style={{ fontSize: 14, color: "var(--fg-0)" }}>
+              {p.operatorState.pr_number ? (
+                <a href={p.operatorState.pr_url || `https://github.com/${p.repo}/pull/${p.operatorState.pr_number}`} target="_blank" rel="noreferrer">
+                  PR #{p.operatorState.pr_number}
+                </a>
+              ) : null}
+              {p.operatorState.issue_number ? (
+                <span>{p.operatorState.pr_number ? " · " : ""}
+                  <a href={p.operatorState.issue_url} target="_blank" rel="noreferrer">#{p.operatorState.issue_number}</a>
+                </span>
+              ) : null}
+              {(p.operatorState.pr_number || p.operatorState.issue_number) ? " — " : ""}
+              {p.operatorState.summary}
+            </div>
+            <div style={{ marginTop: 8, fontSize: 13, color: "var(--ok)" }}>
+              <strong style={{ color: "var(--fg-1)" }}>Status:</strong> Auto-merging — no action needed.
+            </div>
+            <div className="hb-actions" style={{ marginTop: 12 }}>
+              {p.operatorState.pr_number && (
+                <a
+                  className="tb-btn ghost"
+                  href={p.operatorState.pr_url || `https://github.com/${p.repo}/pull/${p.operatorState.pr_number}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Open PR #{p.operatorState.pr_number} →
                 </a>
               )}
             </div>

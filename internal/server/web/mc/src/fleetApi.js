@@ -46,8 +46,21 @@ export function mapFleetResponse(raw, now = Date.now()) {
   const projects = (raw.projects || []).map(p => mapProject(p, workers, now));
   const summary = raw.summary || {};
   const verdictTone = mapVerdictUiTone(raw.verdict?.tone);
+  // #598: subtract convergence-bound items (retry_exhausted with an open
+  // PR and no failing-check evidence) so a self-resolving PR does not
+  // inflate the operator-facing attention count or the red attention
+  // stat card. The raw needs_attention count is still available via
+  // summary.needs_attention for diagnostics.
+  const selfResolving = Math.max(
+    0,
+    Math.min(Number(summary.needs_attention || 0), Number(summary.self_resolving || 0)),
+  );
+  const actionableAttention = Math.max(
+    0,
+    Number(summary.needs_attention || 0) - selfResolving,
+  );
   const attentionCount =
-    Number(summary.needs_attention || 0) +
+    actionableAttention +
     Number(summary.approvals_pending || 0) +
     Number(summary.errors || 0) +
     Number(summary.stale || 0) +
@@ -76,6 +89,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
     prCount: Number(summary.pr_open || 0),
     attentionCount,
     activeApprovals: Number(summary.approvals_pending || 0),
+    selfResolvingCount: selfResolving,
     throughputMerged7d: Number(summary.throughput_merged_7d || 0),
     throughputDaily7d: Array.isArray(summary.throughput_daily_7d)
       ? summary.throughput_daily_7d.map(v => Number(v || 0))
@@ -465,10 +479,15 @@ export function mapProjectState(project) {
   if (Number(project.running || 0) > 0 || kind === "working") {
     return { state: "live", label, count: project.running };
   }
+  // #598: auto_merging is convergence-bound and calm — render alongside
+  // monitoring_pr (watch tone) rather than stuck/red.
+  if (kind === "auto_merging") {
+    return { state: "watch", label, pr: op.pr_number ? { num: op.pr_number, label } : undefined };
+  }
   if (
     kind === "stale_worker" ||
     kind === "dispatch_failure" ||
-    Number(project.needs_attention || 0) > 0
+    Number(project.needs_attention || 0) > Number(project.self_resolving || 0)
   ) {
     return { state: "stuck", label };
   }
