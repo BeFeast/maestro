@@ -144,7 +144,14 @@ maestro serve --config ./maestro.yaml --host 127.0.0.1 --port 8787 --read-only
 
 For multi-project Fleet Mission Control operations, see [`docs/fleet-mission-control-runbook.md`](docs/fleet-mission-control-runbook.md).
 
-When the dashboard runs anywhere other than `127.0.0.1`, configure HTTP auth on every mutating endpoint (#487). The token is loaded at runtime from an environment variable populated by your secret manager (Infisical, 1Password CLI, etc.) — never hardcoded in YAML:
+### Dashboard auth posture: trusted LAN vs. exposed
+
+Maestro's dashboard auth is opt-in and disabled by default. The right posture depends on where the port is reachable from:
+
+- **Trusted LAN (default).** When the dashboard is bound to `127.0.0.1` or a network only operators can reach, leave `server.auth` empty. The cautious approval gate still protects `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config` — flipping `--read-only=false` on a trusted LAN does not expose the four destructive verbs.
+- **Exposed / shared network.** When the dashboard is reachable from anywhere outside the trusted LAN — `--host 0.0.0.0`, behind a reverse proxy, on a multi-tenant host — set `server.auth.token_env`. With auth enabled, **every** endpoint (read GETs, write POSTs, and the SPA HTML) rejects unauthenticated requests with `401`; the cautious approval gate still fires for authenticated callers as defense in depth.
+
+The token is loaded at runtime from an environment variable populated by your secret manager (Infisical, 1Password CLI, etc.) — never hardcoded in YAML:
 
 ```yaml
 server:
@@ -156,7 +163,12 @@ server:
     actor_name: dashboard-operator       # optional; audit actor recorded for authed requests
 ```
 
-When `auth.token_env` resolves to a non-empty value, every `POST /api/v1/...` (`/actions`, `/approvals/{id}/{approve|reject}`, `/audit/log`, `/refresh`) requires `Authorization: Bearer <token>` and returns `401` otherwise. The authenticated identity replaces any `actor` field in the request body. Read-only GETs stay open.
+When `auth.token_env` resolves to a non-empty value, every request — `GET /api/v1/...`, `POST /api/v1/...` (`/actions`, `/approvals/{id}/{approve|reject}`, `/audit/log`, `/refresh`), and the dashboard HTML / static assets — requires a credential and returns `401` otherwise. Two authentication schemes are accepted (the server advertises both in the `WWW-Authenticate` challenge):
+
+- **HTTP Basic** — any username, password equal to the token. Browsers prompt natively, then cache the credential for the realm so subsequent SPA fetches authenticate automatically.
+- **Bearer token** — `Authorization: Bearer <token>`. Use this for `curl`, scripts, and clients driven directly by a secret manager.
+
+The authenticated identity replaces any `actor` field in the request body — operators cannot impersonate one another even if they share the token.
 
 To watch workers live in a tmux dashboard:
 ```bash

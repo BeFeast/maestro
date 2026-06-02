@@ -119,14 +119,43 @@ func constantTimeEqual(a, b string) bool {
 // on failure and returns ok=false; the caller MUST return immediately.
 // When auth is disabled, returns ("", true) and the caller proceeds with
 // its existing actor-fallback logic.
+//
+// The WWW-Authenticate challenge advertises Basic first so browsers prompt
+// natively (the SPA inherits credentials via the cached realm) and Bearer
+// second so curl / scripts / secret-manager-driven clients can attach a
+// header directly. Both schemes accept the configured token (Basic
+// password field for browser UX; Bearer for programmatic access).
 func requireAuth(w http.ResponseWriter, r *http.Request, a authChecker) (actor string, ok bool) {
 	actor, ok = a.Check(r)
 	if !ok {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="maestro-dashboard"`)
-		writeError(w, http.StatusUnauthorized, "authentication required for mutating endpoints; provide Authorization: Bearer <token> loaded from your secret manager")
+		w.Header().Set("WWW-Authenticate", `Basic realm="maestro-dashboard", Bearer realm="maestro-dashboard"`)
+		writeError(w, http.StatusUnauthorized, "authentication required; provide HTTP Basic credentials (any user, password = token) or Authorization: Bearer <token> loaded from your secret manager")
 		return "", false
 	}
 	return actor, true
+}
+
+// authMiddleware wraps a handler so every request — read AND write —
+// passes the auth check before any inner handler runs. This is the
+// "exposed install" posture (#616): when auth.Required() is true, the
+// dashboard, the JSON read endpoints, and the mutating endpoints all
+// reject unauthenticated callers with 401 so an attacker on a public
+// network cannot enumerate state, harvest issue / PR / actor data, or
+// trigger any side effect.
+//
+// When auth.Required() is false (default, trusted-LAN posture), the
+// middleware is a pass-through — behaviour is byte-identical to a build
+// without this middleware so existing LAN installs see no regression.
+func authMiddleware(next http.Handler, a authChecker) http.Handler {
+	if !a.Required() {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := requireAuth(w, r, a); !ok {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // resolveActor returns the final actor recorded in audit. authenticatedActor
