@@ -773,13 +773,13 @@ func TestFailedAttemptsForIssue(t *testing.T) {
 	s := NewState()
 	s.Sessions["slot-1"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 0}
 	s.Sessions["slot-2"] = &Session{IssueNumber: 42, Status: StatusFailed, PRNumber: 0}
-	s.Sessions["slot-3"] = &Session{IssueNumber: 42, Status: StatusDone, PRNumber: 10}                   // success — not counted
-	s.Sessions["slot-4"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 5}                    // has PR — not counted
-	s.Sessions["slot-5"] = &Session{IssueNumber: 42, Status: StatusRetryExhausted, PRNumber: 0}          // counted
-	s.Sessions["slot-6"] = &Session{IssueNumber: 99, Status: StatusDead, PRNumber: 0}                    // different issue
-	s.Sessions["slot-7"] = &Session{IssueNumber: 42, Status: StatusRunning, PRNumber: 0, StartedAt: now} // running — not counted
-	s.Sessions["slot-8"] = &Session{IssueNumber: 42, Status: StatusConflictFailed, PRNumber: 0}          // conflict — not counted
-	s.Sessions["slot-9"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 0, RateLimitHit: true}    // rate-limited — not counted (#466)
+	s.Sessions["slot-3"] = &Session{IssueNumber: 42, Status: StatusDone, PRNumber: 10}                    // success — not counted
+	s.Sessions["slot-4"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 5}                     // has PR — not counted
+	s.Sessions["slot-5"] = &Session{IssueNumber: 42, Status: StatusRetryExhausted, PRNumber: 0}           // counted
+	s.Sessions["slot-6"] = &Session{IssueNumber: 99, Status: StatusDead, PRNumber: 0}                     // different issue
+	s.Sessions["slot-7"] = &Session{IssueNumber: 42, Status: StatusRunning, PRNumber: 0, StartedAt: now}  // running — not counted
+	s.Sessions["slot-8"] = &Session{IssueNumber: 42, Status: StatusConflictFailed, PRNumber: 0}           // conflict — not counted
+	s.Sessions["slot-9"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 0, RateLimitHit: true} // rate-limited — not counted (#466)
 
 	if got := s.FailedAttemptsForIssue(42); got != 3 {
 		t.Errorf("FailedAttemptsForIssue(42) = %d, want 3", got)
@@ -1175,6 +1175,78 @@ func TestSessionLiveAt(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := SessionLiveAt(tt.sess, now); got != tt.want {
 				t.Fatalf("SessionLiveAt = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSessionAttentionActionableAt pins the #566 TTL semantics:
+// dead/failed/conflict_failed sessions without a scheduled retry age out
+// of attention after FleetAttentionTTL; retry_exhausted with an open PR
+// stays actionable regardless of age; live-status sessions are always
+// actionable.
+func TestSessionAttentionActionableAt(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-1 * time.Hour)
+	stale := now.Add(-FleetAttentionTTL - time.Hour)
+	future := now.Add(15 * time.Minute)
+
+	tests := []struct {
+		name string
+		sess *Session
+		want bool
+	}{
+		{
+			name: "running session is always actionable",
+			sess: &Session{Status: StatusRunning, StartedAt: stale},
+			want: true,
+		},
+		{
+			name: "pr_open session is always actionable",
+			sess: &Session{Status: StatusPROpen, StartedAt: stale, PRNumber: 1},
+			want: true,
+		},
+		{
+			name: "dead with scheduled retry is actionable",
+			sess: &Session{Status: StatusDead, StartedAt: stale, FinishedAt: &stale, NextRetryAt: &future},
+			want: true,
+		},
+		{
+			name: "fresh dead session is actionable",
+			sess: &Session{Status: StatusDead, StartedAt: fresh, FinishedAt: &fresh},
+			want: true,
+		},
+		{
+			name: "stale dead session ages out",
+			sess: &Session{Status: StatusDead, StartedAt: stale, FinishedAt: &stale},
+			want: false,
+		},
+		{
+			name: "stale failed session ages out",
+			sess: &Session{Status: StatusFailed, StartedAt: stale, FinishedAt: &stale},
+			want: false,
+		},
+		{
+			name: "stale conflict_failed session ages out",
+			sess: &Session{Status: StatusConflictFailed, StartedAt: stale, FinishedAt: &stale},
+			want: false,
+		},
+		{
+			name: "retry_exhausted with open PR never ages out",
+			sess: &Session{Status: StatusRetryExhausted, StartedAt: stale, FinishedAt: &stale, PRNumber: 564},
+			want: true,
+		},
+		{
+			name: "retry_exhausted without PR ages out",
+			sess: &Session{Status: StatusRetryExhausted, StartedAt: stale, FinishedAt: &stale},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SessionAttentionActionableAt(tt.sess, now); got != tt.want {
+				t.Fatalf("SessionAttentionActionableAt = %v, want %v", got, tt.want)
 			}
 		})
 	}

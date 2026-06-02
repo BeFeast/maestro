@@ -336,6 +336,16 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	info.NextAction = attention.NextAction
 	info.NeedsAttention = attention.NeedsAttention
 
+	// #566: an old dead / failed / conflict_failed worker is reconcilable,
+	// not actionable. Drop `needs_attention` and the derived `live` flag
+	// once the session ages past FleetAttentionTTL so a 2-day-old zombie
+	// session cannot dominate the fleet verdict. retry_exhausted with an
+	// open PR (#564) and any session with a scheduled retry stay live.
+	if attention.NeedsAttention && !state.SessionAttentionActionableAt(sess, now) {
+		info.NeedsAttention = false
+		info.Live = false
+	}
+
 	return info
 }
 
