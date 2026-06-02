@@ -373,11 +373,18 @@ type fleetSummary struct {
 	// failed / conflict_failed sessions whose PR is still open;
 	// WorkersRunning mirrors `running` under the stable field name the
 	// project card reads. Plain ints — never null.
-	PRsOpen             int   `json:"prs_open"`
-	WorkersRunning      int   `json:"workers_running"`
-	Failed              int   `json:"failed"`
-	Sessions            int   `json:"sessions"`
-	NeedsAttention      int   `json:"needs_attention"`
+	PRsOpen        int `json:"prs_open"`
+	WorkersRunning int `json:"workers_running"`
+	Failed         int `json:"failed"`
+	Sessions       int `json:"sessions"`
+	NeedsAttention int `json:"needs_attention"`
+	// SelfResolving counts attention items that are convergence-bound
+	// and need no operator action (e.g. retry_exhausted with a green PR
+	// — the orchestrator auto-merges once the merge gate clears). See
+	// issue #598: subtracted from NeedsAttention when computing the
+	// fleet verdict tone so a self-resolving PR does not alarm with a
+	// passive `Action required — p1` headline.
+	SelfResolving       int   `json:"self_resolving,omitempty"`
 	Approvals           int   `json:"approvals"`
 	ApprovalsPending    int   `json:"approvals_pending"`
 	ApprovalsHistorical int   `json:"approvals_historical"`
@@ -442,10 +449,16 @@ type fleetProjectState struct {
 	// WorkersRunning mirrors Running with a stable field name expected
 	// by the SPA project card (#566). It is the count of sessions in
 	// StatusRunning. Always non-null.
-	WorkersRunning  int                   `json:"workers_running"`
-	Failed          int                   `json:"failed"`
-	Sessions        int                   `json:"sessions"`
-	NeedsAttention  int                   `json:"needs_attention"`
+	WorkersRunning int `json:"workers_running"`
+	Failed         int `json:"failed"`
+	Sessions       int `json:"sessions"`
+	NeedsAttention int `json:"needs_attention"`
+	// SelfResolving is the count of attention sessions on this project
+	// that are convergence-bound (the orchestrator will resolve them
+	// without operator action — see fleetSessionIsConvergenceBound and
+	// issue #598). The SPA project card uses this to render a calm
+	// "auto-merging" line instead of an alarming attention CTA.
+	SelfResolving   int                   `json:"self_resolving,omitempty"`
 	Active          []sessionInfo         `json:"active,omitempty"`
 	Attention       []sessionInfo         `json:"attention,omitempty"`
 	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
@@ -934,6 +947,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 		resp.Summary.Failed += item.Failed
 		resp.Summary.Sessions += item.Sessions
 		resp.Summary.NeedsAttention += item.NeedsAttention
+		resp.Summary.SelfResolving += item.SelfResolving
 		addFleetThroughputSummary(throughputBuckets, workers)
 		for _, approval := range item.Approvals {
 			addFleetApprovalSummary(&resp.Summary, approval.Status)
@@ -1108,7 +1122,16 @@ func fleetVerdictTone(summary fleetSummary, latest *supervisorDecisionInfo, now 
 	if latest == nil || supervisorHeartbeatStale(latest, now) {
 		return "daemon-down"
 	}
-	if summary.Stale > 0 || summary.Errors > 0 || summary.NeedsAttention > 0 || summary.ApprovalsPending > 0 || summary.DispatchFailures > 0 || summary.OutcomeDrift > 0 || summary.NoEligibleIssues > 0 {
+	// #598: subtract convergence-bound items (retry_exhausted + open PR
+	// + checks green) so a self-resolving PR never alarms the verdict.
+	// Reserve `attention` for items that genuinely need a human:
+	// stale snapshots, project errors, pending approvals, dispatch
+	// failures, outcome drift, or empty/stuck queues.
+	actionableAttention := summary.NeedsAttention - summary.SelfResolving
+	if actionableAttention < 0 {
+		actionableAttention = 0
+	}
+	if summary.Stale > 0 || summary.Errors > 0 || actionableAttention > 0 || summary.ApprovalsPending > 0 || summary.DispatchFailures > 0 || summary.OutcomeDrift > 0 || summary.NoEligibleIssues > 0 {
 		return "attention"
 	}
 	if summary.Running > 0 {
@@ -1199,15 +1222,35 @@ func fleetPRSentence(prOpen int) string {
 }
 
 func fleetAttentionSentence(summary fleetSummary) string {
-	items := summary.NeedsAttention + summary.ApprovalsPending + summary.Errors + summary.Stale + summary.DispatchFailures + summary.OutcomeDrift + summary.NoEligibleIssues
+	// #598: convergence-bound items (retry_exhausted + open PR + checks
+	// green) are not operator-actionable; subtract them from the
+	// attention count so the sentence reads honestly. Self-resolving
+	// items are surfaced as a separate calm clause when present.
+	selfResolving := summary.SelfResolving
+	if selfResolving > summary.NeedsAttention {
+		selfResolving = summary.NeedsAttention
+	}
+	actionable := summary.NeedsAttention - selfResolving
+	items := actionable + summary.ApprovalsPending + summary.Errors + summary.Stale + summary.DispatchFailures + summary.OutcomeDrift + summary.NoEligibleIssues
+	var base string
 	switch items {
 	case 0:
-		return "No item needs attention."
+		base = "No item needs attention."
 	case 1:
-		return "1 item needs attention."
+		base = "1 item needs attention."
 	default:
-		return fmt.Sprintf("%d items need attention.", items)
+		base = fmt.Sprintf("%d items need attention.", items)
 	}
+	if selfResolving > 0 {
+		var tail string
+		if selfResolving == 1 {
+			tail = "1 PR is auto-merging — no action needed."
+		} else {
+			tail = fmt.Sprintf("%d PRs are auto-merging — no action needed.", selfResolving)
+		}
+		return base + " " + tail
+	}
+	return base
 }
 
 func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState) {
@@ -1583,6 +1626,9 @@ func fleetNextActionCTAForApproval(approval *fleetApprovalState) string {
 // operator state kind (dispatch_failure, outcome_drift, stale_worker, …).
 // Each branch names a concrete next step so the button replaces the
 // passive «Action required» text with a verb the operator can act on.
+// See issue #598: a self-resolving state ("auto_merging") returns "" so the
+// SPA can render a calm "Auto-merging — no action needed" line instead of
+// a button.
 func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 	switch strings.TrimSpace(kind) {
 	case "error":
@@ -1590,18 +1636,29 @@ func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 	case "dispatch_failure":
 		return "Resolve stuck dispatch"
 	case "stale_worker":
-		if op.Session != "" {
-			return "Resolve stuck session " + op.Session
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Open worker log for PR #%d", op.PRNumber)
 		}
-		return "Resolve stuck session"
+		if op.Session != "" {
+			return "Open worker log for " + op.Session
+		}
+		return "Open worker log"
 	case "attention":
 		if op.PRNumber > 0 {
+			if strings.Contains(strings.ToLower(op.Summary), "conflict") {
+				return fmt.Sprintf("Resolve conflict on PR #%d", op.PRNumber)
+			}
+			if strings.Contains(strings.ToLower(op.Summary), "check") {
+				return fmt.Sprintf("Fix failing checks on PR #%d", op.PRNumber)
+			}
 			return fmt.Sprintf("Review PR #%d", op.PRNumber)
 		}
 		if op.IssueNumber > 0 {
 			return fmt.Sprintf("Review issue #%d", op.IssueNumber)
 		}
 		return "Review attention"
+	case "auto_merging":
+		return ""
 	case "outcome_drift":
 		return "Reconcile outcome drift"
 	case "outcome_missing":
@@ -1678,6 +1735,14 @@ func fleetOperatorKindNeedsAction(kind string) bool {
 	}
 }
 
+// fleetOperatorKindIsSelfResolving reports whether an operator-state kind
+// represents a convergence-bound state that the orchestrator will resolve
+// on its own (#598). The fleet verdict and the next-action picker treat
+// these as calm signals — never as `Action required — p1`.
+func fleetOperatorKindIsSelfResolving(kind string) bool {
+	return strings.TrimSpace(kind) == "auto_merging"
+}
+
 func fleetActionTone(tone string) string {
 	switch strings.TrimSpace(tone) {
 	case "error", "daemon-down":
@@ -1736,6 +1801,11 @@ func fleetOperatorStatePriority(kind string) int {
 	case "working":
 		return 7
 	case "monitoring_pr":
+		return 8
+	case "auto_merging":
+		// #598: convergence-bound, calm — sort alongside monitoring_pr,
+		// before idle/queue states so the project card still surfaces
+		// near the top of the list but never alarms the verdict.
 		return 8
 	case "no_eligible_issues", "queue_blocked":
 		return 9
@@ -2136,6 +2206,9 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 			item.Attention = append(item.Attention, worker)
+			if fleetSessionIsConvergenceBound(worker) {
+				item.SelfResolving++
+			}
 		}
 		workers = append(workers, makeFleetWorkerState(item, worker))
 		if _, isStale := staleSlots[worker.Slot]; isStale {
@@ -2279,6 +2352,16 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		return state
 	}
 	if project.NeedsAttention > 0 {
+		// #598: separate "self-resolving" sessions (retry_exhausted with an
+		// open PR and no failing-check evidence — convergence will auto-merge
+		// once gates clear) from genuinely operator-actionable ones. When all
+		// attention is self-resolving the project reads calm ("auto-merging,
+		// no action needed") instead of alarming the fleet verdict with a
+		// passive `Action required — p1`.
+		actionable, autoMerging := partitionFleetAttentionByResolvability(project.Attention)
+		if len(actionable) == 0 && len(autoMerging) > 0 {
+			return fleetAutoMergingOperatorState(project, autoMerging[0])
+		}
 		state := fleetOperatorState{
 			Kind:       "attention",
 			Tone:       "attention",
@@ -2286,8 +2369,12 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			Summary:    fmt.Sprintf("%d worker item(s) need operator review.", project.NeedsAttention),
 			NextAction: "Open the worker detail and resolve the first blocking reason.",
 		}
-		if len(project.Attention) > 0 {
-			worker := highestPriorityAttentionSession(project.Attention)
+		pickFrom := actionable
+		if len(pickFrom) == 0 {
+			pickFrom = project.Attention
+		}
+		if len(pickFrom) > 0 {
+			worker := highestPriorityAttentionSession(pickFrom)
 			if fleetSessionLooksStale(worker) {
 				state.Kind = "stale_worker"
 				state.Label = "Stale worker"
@@ -2406,6 +2493,66 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		Label:      "No eligible issues",
 		Summary:    summary,
 		NextAction: "Change labels/dependencies/project status if these issues should run now.",
+	}
+}
+
+// partitionFleetAttentionByResolvability splits attention sessions into
+// operator-actionable items and convergence-bound "self-resolving" items
+// (see issue #598). A self-resolving session is currently the
+// retry_exhausted-with-open-PR-and-no-failed-checks shape: the orchestrator
+// will auto-merge it as soon as the merge gate clears, so the fleet verdict
+// must not alarm with `Action required — p1`. Other shapes are returned in
+// the actionable slice; the order of both slices mirrors the input.
+func partitionFleetAttentionByResolvability(workers []sessionInfo) (actionable, autoMerging []sessionInfo) {
+	for _, w := range workers {
+		if fleetSessionIsConvergenceBound(w) {
+			autoMerging = append(autoMerging, w)
+			continue
+		}
+		actionable = append(actionable, w)
+	}
+	return actionable, autoMerging
+}
+
+// fleetSessionIsConvergenceBound reports whether a session in the
+// attention list is "self-resolving" — convergence (the orchestrator's
+// auto-merge once gates clear) will resolve it without operator action.
+// Today this is the retry_exhausted-with-open-PR-and-no-failing-checks
+// shape from issue #598: a green PR whose retry budget has been used up
+// but whose merge will land naturally once the merge gate clears. A PR
+// known to have failed checks (CIFailureOutput / LastNotifiedStatus =
+// ci_failure) is NOT convergence-bound and stays actionable.
+func fleetSessionIsConvergenceBound(worker sessionInfo) bool {
+	if state.SessionStatus(worker.Status) != state.StatusRetryExhausted {
+		return false
+	}
+	if worker.PRNumber <= 0 {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(worker.LastNotification), "ci_failure") {
+		return false
+	}
+	return true
+}
+
+// fleetAutoMergingOperatorState builds the calm operator state for a
+// project whose attention list contains only convergence-bound sessions
+// (#598). Tone reads `healthy` so the fleet verdict does not alarm; the
+// summary names the PR and the next-action line says explicitly that no
+// operator action is required.
+func fleetAutoMergingOperatorState(project fleetProjectState, worker sessionInfo) fleetOperatorState {
+	summary := fmt.Sprintf("PR #%d retry budget exhausted but checks are green; Maestro will auto-merge once the merge gate clears.", worker.PRNumber)
+	return fleetOperatorState{
+		Kind:        "auto_merging",
+		Tone:        "healthy",
+		Label:       "Auto-merging",
+		Summary:     summary,
+		NextAction:  "Auto-merging — no action needed.",
+		Session:     worker.Slot,
+		IssueNumber: worker.IssueNumber,
+		IssueURL:    firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber)),
+		PRNumber:    worker.PRNumber,
+		PRURL:       firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber)),
 	}
 }
 

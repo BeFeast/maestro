@@ -194,14 +194,18 @@ func TestFleetNextActionCTAForProjectNamesTheStuckPath(t *testing.T) {
 		want string
 	}{
 		{name: "dispatch_failure", kind: "dispatch_failure", want: "Resolve stuck dispatch"},
-		{name: "stale_worker with session", kind: "stale_worker", op: fleetOperatorState{Session: "wk-3"}, want: "Resolve stuck session wk-3"},
-		{name: "stale_worker without session", kind: "stale_worker", want: "Resolve stuck session"},
+		{name: "stale_worker with PR", kind: "stale_worker", op: fleetOperatorState{PRNumber: 9, Session: "wk-3"}, want: "Open worker log for PR #9"},
+		{name: "stale_worker with session", kind: "stale_worker", op: fleetOperatorState{Session: "wk-3"}, want: "Open worker log for wk-3"},
+		{name: "stale_worker without session", kind: "stale_worker", want: "Open worker log"},
 		{name: "outcome_drift", kind: "outcome_drift", want: "Reconcile outcome drift"},
 		{name: "outcome_missing", kind: "outcome_missing", want: "Configure outcome"},
 		{name: "no_eligible_issues", kind: "no_eligible_issues", want: "Queue more work"},
 		{name: "queue_blocked", kind: "queue_blocked", want: "Unblock queue"},
 		{name: "stale", kind: "stale", want: "Refresh stale snapshot"},
 		{name: "attention with PR", kind: "attention", op: fleetOperatorState{PRNumber: 5}, want: "Review PR #5"},
+		{name: "attention with PR + failing checks", kind: "attention", op: fleetOperatorState{PRNumber: 5, Summary: "CI checks failed on PR"}, want: "Fix failing checks on PR #5"},
+		{name: "attention with PR + conflict", kind: "attention", op: fleetOperatorState{PRNumber: 5, Summary: "rebase conflict on branch"}, want: "Resolve conflict on PR #5"},
+		{name: "auto_merging is calm", kind: "auto_merging", op: fleetOperatorState{PRNumber: 7}, want: ""},
 		{name: "unknown kind", kind: "unknown", want: ""},
 	}
 	for _, tc := range cases {
