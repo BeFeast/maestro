@@ -328,8 +328,44 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		if err := state.Save(cfg.StateDir, st); err != nil {
 			return state.SupervisorDecision{}, fmt.Errorf("save state: %w", err)
 		}
+		// #497: bound state.Sessions growth by compacting old terminal
+		// sessions every cycle. Runs after Save so a compaction failure
+		// can never lose a decision already persisted; we only re-Save
+		// when something was actually pruned.
+		compactTerminalSessions(cfg, st, "supervisor")
 	}
 	return decision, nil
+}
+
+// compactTerminalSessions applies cfg.SessionRetention to st and persists the
+// result when sessions were pruned. Failures are logged but never returned,
+// since retention is an idempotent best-effort sweep — the next cycle will
+// retry. caller is a tag used only in log lines.
+func compactTerminalSessions(cfg *config.Config, st *state.State, caller string) {
+	if cfg == nil || st == nil {
+		return
+	}
+	if !cfg.SessionRetention.IsEnabled() {
+		return
+	}
+	policy := state.SessionRetentionPolicy{
+		KeepLast:    cfg.SessionRetention.EffectiveKeepLast(),
+		MinAge:      cfg.SessionRetention.EffectiveMinAge(),
+		ArchiveFile: cfg.SessionRetention.EffectiveArchiveFile(cfg.StateDir),
+	}
+	res, err := st.CompactSessions(policy, time.Now().UTC())
+	if err != nil {
+		log.Printf("[%s] compact sessions: %v", caller, err)
+		return
+	}
+	if res.Removed == 0 {
+		return
+	}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		log.Printf("[%s] compact sessions: save: %v", caller, err)
+		return
+	}
+	log.Printf("[%s] compacted %d terminal session(s) (archived=%d)", caller, res.Removed, res.Archived)
 }
 
 func recordOutcomeHealth(cfg *config.Config, st *state.State) {

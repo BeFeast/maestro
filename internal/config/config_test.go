@@ -1937,3 +1937,78 @@ supervisor:
 		t.Fatalf("OrderedQueue.Issues = %v, want [262]", got)
 	}
 }
+
+func TestParse_SessionRetentionDefaults(t *testing.T) {
+	yaml := `
+repo: owner/repo
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.SessionRetention.IsEnabled() {
+		t.Fatalf("default session_retention must be enabled")
+	}
+	if got := cfg.SessionRetention.EffectiveKeepLast(); got != 20 {
+		t.Fatalf("default KeepLast = %d, want 20", got)
+	}
+	if got := cfg.SessionRetention.EffectiveMinAge(); got != 7*24*60*60*1e9 {
+		t.Fatalf("default MinAge = %v, want 168h", got)
+	}
+	if !cfg.SessionRetention.ArchiveEnabled() {
+		t.Fatalf("default archive must be enabled")
+	}
+	if got := cfg.SessionRetention.EffectiveArchiveFile("/tmp/state"); got != "/tmp/state/sessions-archive.jsonl" {
+		t.Fatalf("default archive file = %q, want /tmp/state/sessions-archive.jsonl", got)
+	}
+}
+
+func TestParse_SessionRetentionExplicitOverride(t *testing.T) {
+	yaml := `
+repo: owner/repo
+session_retention:
+  enabled: false
+  keep_last: 50
+  min_age_days: 14
+  archive: false
+  archive_file: /custom/sessions.jsonl
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.SessionRetention.IsEnabled() {
+		t.Fatalf("enabled=false must disable retention")
+	}
+	if got := cfg.SessionRetention.EffectiveKeepLast(); got != 50 {
+		t.Fatalf("KeepLast = %d, want 50", got)
+	}
+	if got := cfg.SessionRetention.EffectiveMinAge(); got != 14*24*60*60*1e9 {
+		t.Fatalf("MinAge = %v, want 336h", got)
+	}
+	if cfg.SessionRetention.ArchiveEnabled() {
+		t.Fatalf("archive=false must disable archiving")
+	}
+	if got := cfg.SessionRetention.EffectiveArchiveFile("/tmp/state"); got != "" {
+		t.Fatalf("archive_file with archive=false should resolve empty, got %q", got)
+	}
+}
+
+func TestParse_SessionRetentionNegativeDisablesFloor(t *testing.T) {
+	yaml := `
+repo: owner/repo
+session_retention:
+  keep_last: -1
+  min_age_days: -1
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.SessionRetention.EffectiveKeepLast(); got != 0 {
+		t.Fatalf("negative KeepLast must clamp to 0 (disables floor), got %d", got)
+	}
+	if got := cfg.SessionRetention.EffectiveMinAge(); got != 0 {
+		t.Fatalf("negative MinAgeDays must clamp to 0 (disables floor), got %v", got)
+	}
+}
