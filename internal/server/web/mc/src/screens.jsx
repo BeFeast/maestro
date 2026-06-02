@@ -11,6 +11,8 @@ import {
   fetchWorkerDetail,
   formatAttributionSegment,
   formatAttributionTimeline,
+  formatTokens,
+  formatUSD,
   isApprovalActionCloseIssue,
   isApprovalActionMergePR,
   isExecutionSkippedApproval,
@@ -615,6 +617,63 @@ function AttributionTimeline({ attribution, now }) {
   );
 }
 
+// WorkerSpendSection surfaces the per-session token / $ counters and
+// the issue-level rollup the server precomputes in cost_observability
+// (#619). When the project has pricing configured for the worker's
+// backend the card shows a $ value alongside the token count; without
+// pricing it shows tokens only and notes "no pricing configured" so the
+// operator knows why the dollar field is blank.
+function WorkerSpendSection({ worker, fleet }) {
+  if (!worker) return null;
+  const tokens = Number(worker.tokens_used_total || 0);
+  const attemptTokens = Number(worker.tokens_used_attempt || 0);
+  const usd = Number(worker.cost_usd_estimate || 0);
+  // Find the issue-level rollup so retries are visible on the drawer.
+  const projectName = worker.project_name || worker.project || "";
+  const project = (fleet?.projects || []).find(
+    p => p.name === projectName || p.slug === projectName,
+  );
+  const issueNum = worker.issue_number || worker.issue?.num || 0;
+  const issueRow = (project?.costObservability?.perIssue || []).find(
+    e => Number(e.issueNumber) === Number(issueNum),
+  );
+  if (tokens <= 0 && !(issueRow && issueRow.tokens > 0)) return null;
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Spend</div>
+      <div className="kv">
+        <span>This session</span>
+        <strong className="mono">
+          {usd > 0 ? `${formatUSD(usd)} · ` : ""}
+          {formatTokens(tokens)} tok
+          {attemptTokens > 0 && attemptTokens !== tokens && (
+            <span className="dim" style={{ marginLeft: 6, fontSize: 11 }}>
+              attempt {formatTokens(attemptTokens)}
+            </span>
+          )}
+        </strong>
+      </div>
+      {issueRow && (
+        <div className="kv">
+          <span>Issue #{issueRow.issueNumber} (all attempts)</span>
+          <strong className="mono">
+            {issueRow.usd > 0 ? `${formatUSD(issueRow.usd)} · ` : ""}
+            {formatTokens(issueRow.tokens)} tok
+            <span className="dim" style={{ marginLeft: 6, fontSize: 11 }}>
+              {issueRow.sessions} session{issueRow.sessions === 1 ? "" : "s"}
+            </span>
+          </strong>
+        </div>
+      )}
+      {tokens > 0 && usd <= 0 && (
+        <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>
+          No pricing configured for backend {worker.backend || "—"} — set model.backends.{worker.backend || "<backend>"}.pricing in maestro.yaml to surface a $ estimate.
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function WorkerDrawer({ worker, onClose, now }) {
   const { fleet, refresh } = useFleet();
   const [detail, setDetail] = React.useState(null);
@@ -698,6 +757,8 @@ export function WorkerDrawer({ worker, onClose, now }) {
               <div className="kv mt-2"><span>Worktree</span><PathValue path={worker.worktree} /></div>
             )}
           </div>
+
+          <WorkerSpendSection worker={worker} fleet={fleet} />
 
           <div className="drawer-sec">
             <div className="drawer-sec-title">Next action</div>

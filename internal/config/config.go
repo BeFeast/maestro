@@ -49,6 +49,45 @@ type BackendDef struct {
 	// strings, no commits or PR materialised). config.parse rejects
 	// any config that wires a NonAgentic backend into the worker chain.
 	NonAgentic bool `yaml:"non_agentic,omitempty"`
+
+	// Pricing carries the per-backend $/Mtok rates used by the fleet
+	// cost-observability aggregation (#619). Both fields are optional —
+	// when neither is set, the cost panel renders tokens only for the
+	// backend ("price not configured") instead of a $ estimate. Workers
+	// only stamp a single total-token count per session, so the estimator
+	// blends input/output 50/50; operators who care about precision can
+	// set the same value for both.
+	Pricing BackendPricing `yaml:"pricing,omitempty"`
+}
+
+// BackendPricing is the per-backend cost table used by the fleet cost
+// observability rollup (#619). Rates are USD per million tokens. Both
+// fields default to 0; a backend whose pricing is unset is reported
+// with tokens only ("price not configured") so it degrades gracefully.
+type BackendPricing struct {
+	InputUSDPerMtok  float64 `yaml:"input_usd_per_mtok,omitempty"`
+	OutputUSDPerMtok float64 `yaml:"output_usd_per_mtok,omitempty"`
+}
+
+// Configured reports whether at least one rate is non-zero. Callers use
+// this to switch a backend's cost cell between a $ value and a
+// "price not configured" hint.
+func (p BackendPricing) Configured() bool {
+	return p.InputUSDPerMtok > 0 || p.OutputUSDPerMtok > 0
+}
+
+// EstimateCostUSD returns the USD estimate for the given total token
+// count using a 50/50 input/output blend. Workers record a single
+// combined token counter so a finer split is not available; operators
+// who only price one side can leave the other at zero and the average
+// halves the cost as expected. Returns 0 when no rates are set or
+// tokens is non-positive.
+func (p BackendPricing) EstimateCostUSD(tokens int) float64 {
+	if tokens <= 0 || !p.Configured() {
+		return 0
+	}
+	rate := (p.InputUSDPerMtok + p.OutputUSDPerMtok) / 2
+	return float64(tokens) * rate / 1_000_000.0
 }
 
 func (b BackendDef) IsEnabled() bool {

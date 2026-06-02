@@ -56,6 +56,12 @@ model:
   backends:
     claude:
       cmd: claude
+      # Optional per-backend pricing for the MC cost-observability panel
+      # (issue #619). USD per million tokens. When unset, the SPA shows
+      # tokens only ("price not configured") for this backend.
+      # pricing:
+      #   input_usd_per_mtok: 15
+      #   output_usd_per_mtok: 75
     codex:
       cmd: codex
     gemini:
