@@ -3647,6 +3647,41 @@ func TestFleetActionProjectReadOnlyRejectsMutation(t *testing.T) {
 	}
 }
 
+// TestFleetAction_Never501 pins the #475 contract for the fleet handler:
+// the safe + approval dispatchers cover every verb that should ever land
+// here, so no payload may surface the legacy "approval-backed action
+// endpoints are not implemented yet" 501 stub.
+func TestFleetAction_Never501(t *testing.T) {
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("one", "/tmp/one.yaml", "", &config.Config{
+			Repo:   "owner/one",
+			Server: config.ServerConfig{ReadOnly: false},
+			Supervisor: config.SupervisorConfig{
+				ReadyLabel:   "maestro-ready",
+				BlockedLabel: "blocked",
+			},
+		}),
+	}, "127.0.0.1", 8786, false)
+
+	for _, payload := range []string{
+		``,
+		`{}`,
+		`{"project":"one","action_id":""}`,
+		`{"project":"one","action_id":"do_a_barrel_roll"}`,
+		`{"project":"one","action_id":"do_a_barrel_roll","issue_number":1}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", bytes.NewBufferString(payload))
+		w := httptest.NewRecorder()
+		srv.handleFleetAction(w, req)
+		if w.Code == http.StatusNotImplemented {
+			t.Errorf("payload %q: status = 501; the legacy 'not implemented' stub must be gone (#475)", payload)
+		}
+		if contains(w.Body.String(), "not implemented yet") {
+			t.Errorf("payload %q: body still surfaces legacy stub text: %s", payload, w.Body.String())
+		}
+	}
+}
+
 func findFleetWorker(t *testing.T, workers []fleetWorkerState, slot string) fleetWorkerState {
 	t.Helper()
 	for _, worker := range workers {

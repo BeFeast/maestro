@@ -253,6 +253,35 @@ func TestSafeAction_UnknownActionID_Rejected(t *testing.T) {
 	}
 }
 
+// TestHandleAction_Never501 pins the #475 contract: the action endpoints
+// are wired through dispatchSafeAction + dispatchApprovalAction, so no
+// payload (known verb, unknown verb, empty verb, malformed) may surface
+// the legacy "approval-backed action endpoints are not implemented yet"
+// 501 stub. Unknown verbs return 4xx, server-side bugs return 5xx, but
+// 501 is gone.
+func TestHandleAction_Never501(t *testing.T) {
+	gh := &fakeActionGH{}
+	srv := New(newSafeActionTestCfg(), nil)
+	srv.SetActionDeps(gh, nil)
+
+	for _, payload := range []string{
+		``,
+		`{}`,
+		`{"action_id":""}`,
+		`{"action_id":"do_a_barrel_roll"}`,
+		`{"action_id":"do_a_barrel_roll","issue_number":1}`,
+		`{"action_id":"add_ready_label","issue_number":42}`,
+	} {
+		w := postAction(t, srv, payload)
+		if w.Code == http.StatusNotImplemented {
+			t.Errorf("payload %q: status = 501; the legacy 'not implemented' stub must be gone (#475)", payload)
+		}
+		if strings.Contains(w.Body.String(), "not implemented yet") {
+			t.Errorf("payload %q: body still surfaces legacy stub text: %s", payload, w.Body.String())
+		}
+	}
+}
+
 func TestSafeAction_ReadOnlyStillWins(t *testing.T) {
 	// Even with safe-action wiring in place, --read-only must keep returning
 	// 403 — no behavior change in the default deployment.
