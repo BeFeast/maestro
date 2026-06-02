@@ -274,6 +274,18 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
+	// #430: a mutating recommendation that the cautious gate will mint a
+	// pending approval for must report requires_approval=true in --once
+	// JSON / dashboard / journal. The Decide() shape only sets
+	// RequiresApproval when Risk==RiskApprovalGated; this misses the
+	// RiskMutating verbs the operator config gates (spawn_worker,
+	// merge_pr, close_issue, ...), so `--once --json` claimed
+	// requires_approval=false while the supervisor silently minted (or
+	// would mint) an approval. Recompute against the same predicate that
+	// drives the mint so the field never lies.
+	if decisionRequiresApproval(cfg, decision) {
+		decision.RequiresApproval = true
+	}
 	if !cfg.Supervisor.DryRun {
 		// Execute any approvals that were transitioned to status=approved
 		// outside this loop (CLI approve already executes inline; this

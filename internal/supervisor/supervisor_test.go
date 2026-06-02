@@ -2574,3 +2574,96 @@ func TestDecideWithLLM_AddReadyLabelAliasAccepted(t *testing.T) {
 		t.Fatalf("action = %q, want canonical %q", decision.RecommendedAction, ActionLabelIssueReady)
 	}
 }
+
+// #430: a spawn_worker recommendation that the cautious gate will mint a
+// pending approval for must report decision.RequiresApproval=true in
+// `maestro supervise --once --json`. Before the fix the field was wired
+// to `risk == RiskApprovalGated` only, so a RiskMutating decision (the
+// common case for spawn_worker) reported requires_approval=false while
+// the supervisor silently minted a pending approval. The operator then
+// saw "Approval ... approved. No risky action was executed." with no
+// indication the verb needed approval at all. RunOnce must reconcile
+// the JSON flag with the actual mint predicate (decisionRequiresApproval).
+func TestRunOnce_SpawnWorker_RecommendedActionRequiresApprovalReflectsGate(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.ApprovalRequiredActions = []string{
+		ActionSpawnWorker,
+		ActionLabelIssueReady,
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(119, "fix CI flake", "maestro-ready")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Status != DecisionStatusRecommended {
+		t.Fatalf("status = %q, want %q (action must not be reported as executed)", decision.Status, DecisionStatusRecommended)
+	}
+	if !decision.RequiresApproval {
+		t.Fatal("RequiresApproval = false, want true — JSON would otherwise claim no approval is needed while supervisor silently mints a pending approval (#430)")
+	}
+	if decision.ApprovalID == "" {
+		t.Fatal("ApprovalID is empty, want a minted approval id so the operator can address it")
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(st.Approvals) != 1 {
+		t.Fatalf("approvals = %d, want 1 pending approval", len(st.Approvals))
+	}
+	a := st.Approvals[0]
+	if a.Action != ActionSpawnWorker {
+		t.Fatalf("approval action = %q, want %q", a.Action, ActionSpawnWorker)
+	}
+	if a.Status != state.ApprovalStatusPending {
+		t.Fatalf("approval status = %q, want %q", a.Status, state.ApprovalStatusPending)
+	}
+	if a.Target == nil || a.Target.Issue != 119 {
+		t.Fatalf("approval target = %#v, want issue 119", a.Target)
+	}
+}
+
+// #430: when ApprovalRequiredActions explicitly excludes spawn_worker (the
+// operator opted into autonomous execution of spawn_worker), the supervisor
+// must NOT report requires_approval=true. The flag tracks reality: an
+// autonomous spawn_worker (still recommended-only inside the supervisor —
+// the orchestrator dispatcher owns the actual worker.Start) must surface
+// as a non-approval-gated action so the operator does not chase a phantom
+// approval.
+func TestRunOnce_SpawnWorker_AutonomousModeReportsNoApprovalRequired(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	// Empty-but-non-nil list: the operator has explicitly listed which
+	// actions require approval, and spawn_worker is intentionally absent.
+	cfg.Supervisor.ApprovalRequiredActions = []string{ActionMergePR}
+	reader := &fakeReader{issues: []github.Issue{testIssue(119, "fix CI flake", "maestro-ready")}}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.RequiresApproval {
+		t.Fatal("RequiresApproval = true, want false when spawn_worker is not in ApprovalRequiredActions")
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, a := range st.Approvals {
+		if a.Action == ActionSpawnWorker {
+			t.Fatalf("approval minted for spawn_worker = %#v, want none when not gated", a)
+		}
+	}
+}
