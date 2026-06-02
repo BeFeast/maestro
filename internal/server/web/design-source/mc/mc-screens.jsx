@@ -72,8 +72,8 @@ function ProjectScreen({ slug, scenarioKey, now, navigate, openDrawer }) {
           )}
           <div className="hb-actions">
             <button className="tb-btn" onClick={() => navigate(`workers?project=${slug}`)}>Open workers →</button>
-            <button className="tb-btn ghost">Open in GitHub →</button>
-            <button className="tb-btn ghost">Pause project</button>
+            <button className="tb-btn">Open in GitHub →</button>
+            <button className="tb-btn">Pause project</button>
           </div>
         </div>
         <ProjectMiniHeartbeat tone={vtone} slug={slug} scenarioKey={scenarioKey} />
