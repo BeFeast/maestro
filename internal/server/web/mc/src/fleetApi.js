@@ -721,6 +721,59 @@ export function isPendingApproval(approval) {
   return (approval.status || "") === "pending";
 }
 
+// isExecutionSkippedApproval is the SPA-side predicate for the post-#492
+// "operationally honest skip" rendering: an approval the operator already
+// approved, where the executor returned execution_skipped with a summary
+// describing why no side effect ran. The audit row surfaces this distinctly
+// from a true `executed` outcome (premortem failure mode #8).
+export function isExecutionSkippedApproval(approval) {
+  return (approval && approval.status) === "execution_skipped";
+}
+
+// manualFollowupForApproval returns the operator follow-up payload the SPA
+// renders alongside an execution_skipped approval. For change_global_config
+// (the YAML mutation pipeline that hasn't landed yet) the executor returns
+// `execution_skipped` with a manual-edit summary; this helper builds the
+// concrete shell command the operator still has to run so the audit row is
+// operationally honest rather than reading like a fait accompli.
+//
+// `project` is the project name (fleet project slug). Returns null when the
+// approval doesn't need a manual follow-up (most execution_skipped cases —
+// merge_pr behind main, stop_worker no live session, etc. — are recoverable
+// by the next supervisor cycle and don't need an operator command).
+export function manualFollowupForApproval(approval) {
+  if (!isExecutionSkippedApproval(approval)) return null;
+  const action = String((approval && approval.action) || "").trim();
+  if (action !== "change_global_config") return null;
+  const project = slugifyProjectForCommand(
+    (approval && (approval.project || approval.project_name)) || ""
+  );
+  const configName = project || "<project>";
+  const serviceProject = project || "<project>";
+  const command =
+    `vim ~/.maestro/maestro.d/${configName}.yaml && ` +
+    `systemctl --user restart maestro-supervisor-${serviceProject}.service`;
+  return {
+    headline: "Manual follow-up required",
+    detail:
+      "The supervisor recorded the intent but did not apply the change. " +
+      "Edit the project's config file and restart the supervisor unit to land it.",
+    command,
+  };
+}
+
+// slugifyProjectForCommand normalises a project name into the lowercase,
+// shell-safe slug used in config filenames and systemd unit names. Mirrors
+// utils.slugifyProject but kept local so the helper has no surprise import
+// cycle.
+function slugifyProjectForCommand(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 function approvalTone(approval) {
   if (approval.past_sla) return "stuck";
   if ((approval.status || "") === "pending") return "watch";

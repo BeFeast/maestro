@@ -161,6 +161,57 @@ func TestRenderFleetApprovalAuditRowsMixedDropsPending(t *testing.T) {
 	}
 }
 
+// TestExecutionSkippedAuditRowSurfacesSummary pins premortem failure mode #8:
+// an approval the operator approved that came back execution_skipped must
+// keep its executor summary on the audit row, AND must render with a CSS
+// class distinct from `approval-executed`. Both signals feed the SPA-side
+// distinct rendering (amber border + manual-follow-up callout) and the
+// server-rendered audit page.
+func TestExecutionSkippedAuditRowSurfacesSummary(t *testing.T) {
+	now := time.Now().UTC()
+	manualSummary := "change_global_config requires a manual edit + systemctl restart (executor not implemented)"
+	items := []fleetApprovalState{
+		{
+			ProjectName: "proj",
+			ID:          "skip-1",
+			Action:      "change_global_config",
+			Status:      string(state.ApprovalStatusExecutionSkipped),
+			Risk:        "approval_gated",
+			Summary:     manualSummary,
+			createdAt:   now.Add(-time.Hour),
+			updatedAt:   now.Add(-time.Hour),
+		},
+		{
+			ProjectName: "proj",
+			ID:          "exec-1",
+			Action:      "merge_pr",
+			Status:      string(state.ApprovalStatusExecuted),
+			Risk:        "approval_gated",
+			Summary:     "merged PR #1",
+			createdAt:   now.Add(-2 * time.Hour),
+			updatedAt:   now.Add(-2 * time.Hour),
+		},
+	}
+
+	html := renderFleetApprovalAuditRows(items)
+	if !strings.Contains(html, "approval-execution_skipped") {
+		t.Fatalf("execution_skipped row should carry approval-execution_skipped class for distinct styling, got:\n%s", html)
+	}
+	if !strings.Contains(html, "approval-executed") {
+		t.Fatalf("executed row should still carry approval-executed class, got:\n%s", html)
+	}
+	if strings.Contains(html, "approval-executed") &&
+		strings.Index(html, "approval-execution_skipped") == strings.Index(html, "approval-executed") {
+		t.Fatalf("execution_skipped and executed rows must NOT collapse to the same CSS class")
+	}
+	if !strings.Contains(html, "change_global_config requires a manual edit") {
+		t.Fatalf("execution_skipped audit row must surface executor summary verbatim, got:\n%s", html)
+	}
+	if !strings.Contains(html, "execution_skipped") {
+		t.Fatalf("execution_skipped audit row must surface status label, got:\n%s", html)
+	}
+}
+
 // --- audit subtitle -------------------------------------------------------
 
 func TestApprovalAuditSubtitleReportsPendingCount(t *testing.T) {
