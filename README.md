@@ -453,6 +453,35 @@ systemctl --user status maestro@panoptikon
 journalctl --user -u maestro@panoptikon -f
 ```
 
+## Mission Control bundle
+
+The Mission Control SPA lives in `internal/server/web/mc/` and ships as a pre-built bundle committed under `internal/server/web/static/mc/`. CI rebuilds the bundle on every PR and fails the `frontend-build` job if the committed output drifts from a fresh build.
+
+### Toolchain
+
+The frontend toolchain is pinned via the `packageManager` field in `internal/server/web/mc/package.json` and the matching `bun-version` in `.github/workflows/ci.yml`. Use the same bun version locally — Corepack will respect `packageManager` automatically, or install it explicitly:
+
+```bash
+bun --version   # must match the pinned version in package.json
+```
+
+When bumping bun, update both `packageManager` in `package.json` and `bun-version` in `.github/workflows/ci.yml` in the same PR so they cannot drift.
+
+### Bundle-rebuild SOP (staleness gate failures)
+
+When CI fails with `Committed MC bundle is stale`, the fix is always to rebuild and commit — never `gh pr merge --admin`. The canonical recipe:
+
+```bash
+cd internal/server/web/mc
+bun install --frozen-lockfile
+bun run build
+cd -
+git add internal/server/web/static/mc/
+git commit -m "chore: rebuild MC bundle"
+```
+
+If the diff still appears after a clean rebuild, your local bun/vite versions disagree with CI. Verify `bun --version` matches the pin in `package.json`. Bypassing the gate with `--admin` is the failure mode this guard exists to prevent — the bundle that ships from `static/mc/` is what users load, so a stale commit ships stale UI.
+
 ## Troubleshooting
 
 ### `gh auth status` fails or maestro can't access the repo
