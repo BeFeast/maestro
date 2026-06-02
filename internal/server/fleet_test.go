@@ -2806,7 +2806,7 @@ func TestFleetDashboardReadOnlyProjectControlsRenderQuietNote(t *testing.T) {
 	body := legacyFleetJS(t)
 	readOnlyBranch := dashboardSnippet(t, body,
 		"if (project.read_only === true || fleetState.readOnly)",
-		"return '<div class=\"project-actions\"><div class=\"label\">Approval-gated controls</div>'")
+		"function projectFreshnessHTML")
 
 	if !contains(readOnlyBranch, "Write controls disabled in read-only mode.") {
 		t.Fatalf("read-only project controls should render disabled-write footer, got:\n%s", readOnlyBranch)
@@ -2821,18 +2821,26 @@ func TestFleetDashboardReadOnlyProjectControlsRenderQuietNote(t *testing.T) {
 	}
 }
 
-func TestFleetDashboardWritableProjectControlsKeepApprovalDiagnostics(t *testing.T) {
+// #477: when not read-only, the legacy fleet view used to render an
+// "Approval-gated controls" panel of unconditionally-disabled buttons.
+// That dead affordance has been retired — Mission Control owns the live
+// POSTs. The non-read-only branch now points operators at MC instead.
+func TestFleetDashboardWritableProjectControlsPointToMissionControl(t *testing.T) {
 	body := legacyFleetJS(t)
 	writableBranch := dashboardSnippet(t, body,
-		"return '<div class=\"project-actions\"><div class=\"label\">Approval-gated controls</div>'",
+		"if (project.read_only === true || fleetState.readOnly)",
 		"function projectFreshnessHTML")
 
-	for _, want := range []string{
+	if !contains(writableBranch, "Project controls live in Mission Control") {
+		t.Fatalf("writable project controls should point at Mission Control, got:\n%s", writableBranch)
+	}
+	for _, unwanted := range []string{
 		"Approval-gated controls",
-		"renderActions(project.actions || [], { details: false })",
+		"action-btn",
+		"<button",
 	} {
-		if !contains(writableBranch, want) {
-			t.Fatalf("writable project controls should preserve %q in:\n%s", want, writableBranch)
+		if contains(writableBranch, unwanted) {
+			t.Fatalf("writable project controls should no longer surface dead affordance %q in:\n%s", unwanted, writableBranch)
 		}
 	}
 }

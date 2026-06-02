@@ -202,45 +202,18 @@ function cssToken(value) {
   return String(value || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
 }
 
-function actionDisabledReason(actions) {
-  const action = (actions || []).find(item => item.disabled_reason);
-  return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
-}
-
-function actionTargetText(action) {
-  const parts = [];
-  if (action.target) parts.push(action.target);
-  if (action.issue_number) parts.push("issue #" + action.issue_number);
-  if (action.pr_number) parts.push("PR #" + action.pr_number);
-  return parts.length ? parts.join(" · ") : "project";
-}
-
-function actionPolicyText(action) {
-  if (action.approval_policy) return actionLabel(action.approval_policy);
-  return action.requires_approval ? "manual approval required" : "none";
-}
-
-function actionDetailHTML(action) {
-  const description = action.description ? '<div><strong>Would</strong> ' + escapeText(action.description.replace(/^Would\s+/i, "")) + '</div>' : "";
-  return '<div class="action-detail">' + description +
-    '<div><strong>Scope</strong> ' + escapeText(actionLabel(action.scope || "unknown")) + '</div>' +
-    '<div><strong>Target</strong> ' + escapeText(actionTargetText(action)) + '</div>' +
-    '<div><strong>Approval</strong> ' + escapeText(actionPolicyText(action)) + '</div>' +
-    '<div><strong>Disabled</strong> ' + escapeText(action.disabled_reason || "Write action unavailable") + '</div>' +
-    '</div>';
-}
-
 function renderActions(actions, options) {
   const items = actions || [];
   if (!items.length) return '<span class="empty">No controls.</span>';
-  const showDetails = !options || options.details !== false;
-  return '<div class="actions">' + items.map(action =>
-    '<div class="action-item"><button type="button" class="action-btn" disabled aria-disabled="true" title="' +
-    escapeText(action.disabled_reason || "Write action unavailable") + '">' +
-    escapeText(action.label || actionLabel(action.id)) + '</button>' +
-    (showDetails ? actionDetailHTML(action) : "") + '</div>'
-  ).join("") + '</div>' +
-  '<div class="action-note">' + escapeText(actionDisabledReason(items)) + '</div>';
+  // #477: the legacy fleet view does not POST to the action endpoints.
+  // Render the action list as inert metadata only — disabled when read_only
+  // is on, otherwise as a Mission Control pointer. The dead "disabled in
+  // both modes" affordance is gone.
+  void options;
+  if (fleetState.readOnly) {
+    return '<div class="action-note">Write controls disabled in read-only mode.</div>';
+  }
+  return '<div class="action-note">Use Mission Control for write controls.</div>';
 }
 
 function approvalStatusRank(status) {
@@ -2121,9 +2094,13 @@ function renderWorkerDetail(data) {
     ? (log.truncated ? "tail, " : "") + (log.updated_at || "")
     : "unavailable";
 
+  // #477: the legacy fleet view is no longer the canonical write surface —
+  // Mission Control owns the live POST handlers. Surfacing the disabled
+  // affordance row here was a dead path; only the genuine read-only banner
+  // remains, with a pointer to MC otherwise.
   const workerActionsHTML = fleetState.readOnly
     ? '<div class="project-actions-readonly">Write controls disabled in read-only mode.</div>'
-    : '<div class="project-actions"><div class="label">Approval-gated controls</div>' + renderActions(worker.actions || [], { details: false }) + '</div>';
+    : '<div class="project-actions-note">Worker controls live in Mission Control. Use the per-worker drawer there to restart, stop, or approve a merge.</div>';
   workerDetailBodyEl.innerHTML = '<div class="detail-grid">' + fields + '</div>' +
     '<div class="' + noteClass + '"><strong>State</strong> ' + escapeText(reason) +
       (links.length ? '<div class="detail-links">' + links.join("") + '</div>' : "") +
@@ -2332,8 +2309,9 @@ function renderProjectActions(project) {
   if (project.read_only === true || fleetState.readOnly) {
     return '<div class="project-actions-readonly">Write controls disabled in read-only mode.</div>';
   }
-  return '<div class="project-actions"><div class="label">Approval-gated controls</div>' +
-    renderActions(project.actions || [], { details: false }) + '</div>';
+  // #477: project-level write controls are owned by Mission Control. The
+  // legacy fleet view no longer surfaces dead disabled buttons here.
+  return '<div class="project-actions-note">Project controls live in Mission Control.</div>';
 }
 
 function projectFreshnessHTML(project) {

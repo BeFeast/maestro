@@ -440,10 +440,12 @@ func buildSupervisorInfo(cfg *config.Config, st *state.State) supervisorInfo {
 	if latest != nil {
 		info.EmptyState = ""
 		info.Latest = makeSupervisorDecisionInfo(cfg, st, *latest)
-		if latest.Risk != "" && latest.Risk != "safe" && latest.RecommendedAction != "" {
-			info.ApprovalActions = append(info.ApprovalActions, makeSupervisorActionInfo(cfg, *latest, true,
-				"Supervisor controls are not implemented yet; this read-only panel only shows the required action."))
-		}
+		// #477: the "Supervisor controls are not implemented yet"
+		// affordance has been retired. The supervisor's recommended
+		// action is surfaced through info.Latest; mutating verbs flow
+		// through the per-worker / per-project controlAction buttons
+		// and the cautious approval gate (#475/#476). No standalone
+		// disabled supervisor button is rendered anymore.
 	}
 
 	if safe := latestSafeSupervisorDecision(st); safe != nil {

@@ -79,7 +79,10 @@ Serve flags:
   --fleet string        Path to fleet YAML file for multi-project dashboard
   --host string         Host/interface to bind (default from config, then 127.0.0.1)
   --port int            Port to bind (overrides server.port)
-  --read-only           Disable mutating HTTP endpoints (default true)
+  --read-only           Disable mutating HTTP endpoints (default false; trusted-LAN posture).
+                        Set --read-only=true (or server.read_only: true in YAML) for installs
+                        exposed beyond a trusted LAN; non-LAN deployments should also configure
+                        the HTTP auth layer (#616, off by default).
 
 Spawn flags:
   --issue int           Issue number to work on
@@ -886,8 +889,20 @@ func serveCmd(args []string) {
 	fleetPath := fs.String("fleet", "", "Path to fleet YAML file")
 	host := fs.String("host", "", "Host/interface to bind")
 	port := fs.Int("port", 0, "Port to bind")
-	readOnly := fs.Bool("read-only", true, "Disable mutating HTTP endpoints")
+	// #477: trusted-LAN posture — the dashboard write path is enabled by
+	// default. The cautious approval gate still gates the four mutating
+	// verbs (merge_pr / close_issue / delete_worktree / change_global_config).
+	// Operators exposing the dashboard beyond a trusted LAN should set
+	// --read-only=true (or server.read_only: true in YAML) and configure
+	// the optional HTTP auth layer (#616, off by default).
+	readOnly := fs.Bool("read-only", false, "Disable mutating HTTP endpoints")
 	fs.Parse(args)
+	readOnlyExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "read-only" {
+			readOnlyExplicit = true
+		}
+	})
 
 	var cfgs []*config.Config
 	if strings.TrimSpace(*fleetPath) == "" {
@@ -958,7 +973,12 @@ func serveCmd(args []string) {
 	if *port > 0 {
 		cfg.Server.Port = *port
 	}
-	cfg.Server.ReadOnly = *readOnly
+	// #477: only override the YAML setting when --read-only was passed
+	// explicitly. Defaulting to false (trusted-LAN posture) must not
+	// silently flip a YAML that opts back into read-only mode.
+	if readOnlyExplicit {
+		cfg.Server.ReadOnly = *readOnly
+	}
 	if cfg.Server.Port <= 0 {
 		log.Fatalf("serve requires server.port in config or --port")
 	}

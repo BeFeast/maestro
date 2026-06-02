@@ -101,28 +101,6 @@ function runtimeTitleText(worker) {
   return parts.join("\n");
 }
 
-function actionLabel(action) {
-  switch (String(action || "").trim()) {
-  case "none": return "Skipped tick";
-  case "monitor_open_pr": return "Watching PR";
-  case "merge_pr": return "Merging PR";
-  case "approve_merge": return "Ready to merge PR";
-  case "skip_wave": return "Skipped tick";
-  case "spawn_worker": return "Starting worker";
-  case "label_issue_ready": return "Mark issue ready";
-  case "review_retry_exhausted": return "Review retry-exhausted work";
-  case "check_outcome_health": return "Check runtime health";
-  case "wait_for_review": return "Waiting on review";
-  case "wait_for_ci": return "Waiting on CI";
-  case "wait_for_running_worker":
-  case "wait_for_worker": return "Waiting for worker";
-  case "wait_for_capacity": return "Waiting for free slot";
-  case "wait_for_ordered_queue": return "Waiting for queue order";
-  default:
-    return String(action || "-").replace(/_/g, " ");
-  }
-}
-
 function rawSupervisorAction(action) {
   const raw = String(action || "").trim();
   return raw || "none";
@@ -164,52 +142,16 @@ function supervisorOperatorSentence(item) {
   return "Supervisor chose " + raw + ". Inspect diagnostics for details.";
 }
 
-function actionDisabledReason(actions) {
-  const action = (actions || []).find(item => item.disabled_reason);
-  return action ? action.disabled_reason : "Write actions require approval-backed configuration.";
-}
-
-function actionTargetText(action) {
-  const parts = [];
-  if (action.target) parts.push(action.target);
-  if (action.issue_number) parts.push("issue #" + action.issue_number);
-  if (action.pr_number) parts.push("PR #" + action.pr_number);
-  return parts.length ? parts.join(" · ") : "project";
-}
-
-function actionPolicyText(action) {
-  if (action.approval_policy) return actionLabel(action.approval_policy);
-  return action.requires_approval ? "manual approval required" : "none";
-}
-
-function actionDetailHTML(action) {
-  const description = action.description ? '<div><strong>Would</strong> ' + escapeText(action.description.replace(/^Would\s+/i, "")) + '</div>' : "";
-  return '<div class="action-detail">' + description +
-    '<div><strong>Scope</strong> ' + escapeText(actionLabel(action.scope || "unknown")) + '</div>' +
-    '<div><strong>Target</strong> ' + escapeText(actionTargetText(action)) + '</div>' +
-    '<div><strong>Approval</strong> ' + escapeText(actionPolicyText(action)) + '</div>' +
-    '<div><strong>Disabled</strong> ' + escapeText(action.disabled_reason || "Write action unavailable") + '</div>' +
-    '</div>';
-}
-
-function renderActionButtons(actions, showDetails) {
-  const items = actions || [];
-  if (!items.length) return "";
-  return '<div class="action-list">' + items.map(action =>
-    '<div class="action-item"><button type="button" class="action-btn" disabled aria-disabled="true" title="' +
-    escapeText(action.disabled_reason || "Write action unavailable") + '">' +
-    escapeText(action.label || actionLabel(action.id)) + '</button>' +
-    (showDetails ? actionDetailHTML(action) : "") + '</div>'
-  ).join("") + '</div>';
-}
-
 function renderWorkerActions(actions) {
   if (state.readOnly) {
     return '<div class="project-actions-readonly">Write controls disabled in read-only mode.</div>';
   }
+  // #477: the legacy single-project dashboard is not the canonical operator
+  // surface — Mission Control owns the live write-path POSTs. Surfacing
+  // unconditionally-disabled buttons here was a dead affordance; replace it
+  // with a pointer so operators land on the working UI.
   if (!actions || !actions.length) return "";
-  return '<div class="worker-actions"><span>Actions</span>' + renderActionButtons(actions, false) + '</div>' +
-    '<div class="action-note">' + escapeText(actionDisabledReason(actions)) + '</div>';
+  return '<div class="worker-actions-note">Worker controls live in Mission Control. Use the per-worker drawer there to restart, stop, or approve a merge.</div>';
 }
 
 function formatTimestamp(value) {
@@ -318,14 +260,10 @@ function renderSupervisor(info) {
     '<span title="Raw action: ' + escapeText(lastSafeRaw) + '">Last safe action: ' + escapeText(supervisorOperatorSentence(info.last_safe_action)) + '</span>' +
     '<span>' + escapeText(formatTimestamp(info.last_safe_action.created_at)) + '</span>' +
     '</div>' : "";
-  const approvals = (info.approval_actions || []).length ? '<div class="supervisor-actions">' +
-    '<span>Requires approval:</span>' +
-    (info.approval_actions || []).map(action =>
-      '<button class="supervisor-approval" disabled title="Raw action: ' + escapeText(rawSupervisorAction(action.action)) + ' · ' + escapeText(action.disabled_reason || "Controls not available yet") + '">' +
-      escapeText(supervisorOperatorSentence(action)) +
-      '</button>'
-    ).join("") +
-    '</div>' : "";
+  // #477: the supervisor "Requires approval" disabled-button row was a
+  // dead affordance — the server no longer publishes approval_actions.
+  // Per-worker controls and the cautious approval gate own the write path.
+  const approvals = "";
 
   const rawAction = rawSupervisorAction(latest.recommended_action);
   const operatorSentence = supervisorOperatorSentence(latest);
