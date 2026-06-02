@@ -2165,6 +2165,11 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
 	item.RestartRequired = st.RestartRequired
 	item.RestartRequiredReason = st.RestartRequiredReason
+	// #600: normalize stale cooldown entries for display so the BACKENDS
+	// panel matches reality between orchestrator cycles — RetryAfter in
+	// the past, max-cooldown TTL elapsed, or a successful session
+	// recorded after the cooldown was set all render as healthy.
+	state.ReconcileBackendHealth(st, now)
 	item.BackendHealth = st.BackendHealth
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary

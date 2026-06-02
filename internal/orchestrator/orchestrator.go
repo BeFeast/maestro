@@ -1090,6 +1090,14 @@ func (o *Orchestrator) RunOnce() error {
 		}
 	}
 
+	// Step 4c: Clear stale BackendHealth cooldown entries (#600) — backends
+	// that have since produced successful sessions, whose RetryAfter has
+	// elapsed, or whose cooldown is older than the max-cooldown TTL. The
+	// selector already ignores elapsed RetryAfter, but the MC BACKENDS
+	// panel reads the raw map; without this the panel reports working
+	// backends as "auto-recovery pending" indefinitely.
+	state.ReconcileBackendHealth(s, time.Now().UTC())
+
 	// Save after all checks/reconciliation
 	if err := state.Save(o.cfg.StateDir, s); err != nil {
 		return fmt.Errorf("save state: %w", err)

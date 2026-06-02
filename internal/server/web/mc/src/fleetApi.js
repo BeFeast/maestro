@@ -106,24 +106,33 @@ export function mapFleetResponse(raw, now = Date.now()) {
 // available». When the same backend appears across projects, the worst
 // state wins (cooldown > available) and the earliest RetryAfter is kept
 // so the countdown reflects the soonest recovery.
-export function aggregateBackendHealth(rawProjects) {
+//
+// #600: a cooldown entry whose retry_after is already in the past is
+// coerced to "available" on the client too. The server normalizes the
+// map on every snapshot, but this guard protects against older
+// orchestrators / unrefreshed snapshots so the panel never reports a
+// working backend as limited.
+export function aggregateBackendHealth(rawProjects, now = Date.now()) {
   const out = new Map();
   for (const project of rawProjects || []) {
     const map = project?.backend_health || {};
     for (const [name, entry] of Object.entries(map)) {
       if (!entry || typeof entry !== "object") continue;
-      const state = String(entry.state || "");
+      let state = String(entry.state || "");
       const retry = entry.retry_after || null;
       const retryMs = retry ? parseTimestamp(retry) : null;
+      if (state === "cooldown" && retryMs != null && retryMs <= now) {
+        state = "available";
+      }
       const existing = out.get(name);
       if (!existing) {
         out.set(name, {
           backend: name,
           state,
-          reason: entry.reason || "",
-          pattern: entry.pattern || "",
-          retryAfter: retry,
-          retryAfterMs: retryMs,
+          reason: state === "available" ? "" : entry.reason || "",
+          pattern: state === "available" ? "" : entry.pattern || "",
+          retryAfter: state === "available" ? null : retry,
+          retryAfterMs: state === "available" ? null : retryMs,
           since: entry.since || "",
         });
         continue;
@@ -134,7 +143,7 @@ export function aggregateBackendHealth(rawProjects) {
         existing.reason = entry.reason || existing.reason;
         existing.pattern = entry.pattern || existing.pattern;
       }
-      if (retryMs != null && (existing.retryAfterMs == null || retryMs < existing.retryAfterMs)) {
+      if (state === "cooldown" && retryMs != null && (existing.retryAfterMs == null || retryMs < existing.retryAfterMs)) {
         existing.retryAfter = retry;
         existing.retryAfterMs = retryMs;
       }

@@ -892,6 +892,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 
 func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 	latestDecision := st.LatestSupervisorDecision()
+	// #600: clear elapsed-RetryAfter / TTL-expired / proven-recovered
+	// cooldown entries so dashboard consumers see a truthful health map
+	// even between orchestrator cycles.
+	state.ReconcileBackendHealth(st, time.Now().UTC())
 	resp := stateResponse{
 		Repo:                cfg.Repo,
 		MaxParallel:         cfg.MaxParallel,

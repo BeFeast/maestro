@@ -123,6 +123,141 @@ func TestBackendHealthPersistence(t *testing.T) {
 	}
 }
 
+// #600: a backend that successfully produced a PR after the cooldown was
+// recorded must be cleared by ReconcileBackendHealth — the dashboard
+// should show it as healthy, not "auto-recovery pending".
+func TestReconcileBackendHealth_ClearsAfterSuccessfulSession(t *testing.T) {
+	s := NewState()
+	since := time.Date(2026, 5, 30, 18, 30, 0, 0, time.UTC)
+	s.BackendHealth["claude"] = BackendHealth{
+		State:       BackendHealthCooldown,
+		Reason:      BackendBlockProviderLimit,
+		Since:       since,
+		LastSession: "sup-83",
+	}
+	s.Sessions["sup-128"] = &Session{
+		IssueNumber: 600,
+		Backend:     "claude",
+		Status:      StatusPROpen,
+		StartedAt:   since.Add(48 * time.Hour),
+		PRNumber:    599,
+	}
+
+	now := since.Add(72 * time.Hour)
+	if !ReconcileBackendHealth(s, now) {
+		t.Fatal("ReconcileBackendHealth should report a change when a successful session post-dates the cooldown")
+	}
+	if _, ok := s.BackendHealth["claude"]; ok {
+		t.Fatalf("BackendHealth[claude] should be cleared, got %+v", s.BackendHealth["claude"])
+	}
+}
+
+// #600: an elapsed RetryAfter must clear the cooldown — the selector
+// already treats this backend as available, so the panel must too.
+func TestReconcileBackendHealth_ClearsAfterElapsedRetryAfter(t *testing.T) {
+	s := NewState()
+	since := time.Date(2026, 5, 29, 23, 0, 0, 0, time.UTC)
+	retryAfter := since.Add(2 * time.Hour)
+	s.BackendHealth["codex"] = BackendHealth{
+		State:      BackendHealthCooldown,
+		Reason:     BackendBlockProviderLimit,
+		Since:      since,
+		RetryAfter: &retryAfter,
+	}
+
+	now := retryAfter.Add(48 * time.Hour)
+	if !ReconcileBackendHealth(s, now) {
+		t.Fatal("ReconcileBackendHealth should clear cooldown when RetryAfter has elapsed")
+	}
+	if _, ok := s.BackendHealth["codex"]; ok {
+		t.Fatal("BackendHealth[codex] should be cleared after RetryAfter elapses")
+	}
+}
+
+// #600: a cooldown with no RetryAfter must be capped by MaxBackendCooldownTTL
+// so a transient provider limit cannot render as "auto-recovery pending"
+// forever.
+func TestReconcileBackendHealth_ClearsAfterMaxTTL(t *testing.T) {
+	s := NewState()
+	since := time.Now().UTC().Add(-MaxBackendCooldownTTL - time.Hour)
+	s.BackendHealth["claude"] = BackendHealth{
+		State:  BackendHealthCooldown,
+		Reason: BackendBlockProviderLimit,
+		Since:  since,
+	}
+
+	if !ReconcileBackendHealth(s, time.Now().UTC()) {
+		t.Fatal("ReconcileBackendHealth should clear cooldown after max TTL elapses")
+	}
+	if _, ok := s.BackendHealth["claude"]; ok {
+		t.Fatal("BackendHealth[claude] should be cleared after max-cooldown TTL")
+	}
+}
+
+// #600: an active cooldown whose RetryAfter is still in the future must
+// be preserved so the selector keeps blocking the backend.
+func TestReconcileBackendHealth_KeepsActiveCooldown(t *testing.T) {
+	s := NewState()
+	now := time.Now().UTC()
+	retryAfter := now.Add(30 * time.Minute)
+	s.BackendHealth["claude"] = BackendHealth{
+		State:      BackendHealthCooldown,
+		Reason:     BackendBlockProviderLimit,
+		Since:      now.Add(-5 * time.Minute),
+		RetryAfter: &retryAfter,
+	}
+
+	if ReconcileBackendHealth(s, now) {
+		t.Fatal("ReconcileBackendHealth should not clear an active cooldown")
+	}
+	if got, ok := s.BackendHealth["claude"]; !ok || got.State != BackendHealthCooldown {
+		t.Fatalf("BackendHealth[claude] = %+v, want active cooldown", got)
+	}
+}
+
+// #600: a successful session that pre-dates the cooldown must not clear
+// it — only later successes prove recovery.
+func TestReconcileBackendHealth_IgnoresOlderSuccess(t *testing.T) {
+	s := NewState()
+	since := time.Date(2026, 5, 30, 18, 0, 0, 0, time.UTC)
+	s.BackendHealth["claude"] = BackendHealth{
+		State:  BackendHealthCooldown,
+		Reason: BackendBlockProviderLimit,
+		Since:  since,
+	}
+	s.Sessions["sup-50"] = &Session{
+		Backend:   "claude",
+		Status:    StatusDone,
+		StartedAt: since.Add(-24 * time.Hour),
+		PRNumber:  500,
+	}
+
+	now := since.Add(1 * time.Hour)
+	if ReconcileBackendHealth(s, now) {
+		t.Fatal("ReconcileBackendHealth should not clear when only older successes exist")
+	}
+}
+
+// #600: MarkBackendHealthy removes a backend from the cooldown map
+// regardless of RetryAfter so a successful use immediately frees the
+// dashboard pill.
+func TestMarkBackendHealthy(t *testing.T) {
+	s := NewState()
+	retryAfter := time.Now().Add(2 * time.Hour)
+	s.BackendHealth["claude"] = BackendHealth{
+		State:      BackendHealthCooldown,
+		Reason:     BackendBlockProviderLimit,
+		RetryAfter: &retryAfter,
+	}
+	MarkBackendHealthy(s, "claude")
+	if _, ok := s.BackendHealth["claude"]; ok {
+		t.Fatal("MarkBackendHealthy should remove the cooldown entry")
+	}
+	// Idempotent on missing backend.
+	MarkBackendHealthy(s, "nonexistent")
+	MarkBackendHealthy(nil, "claude")
+}
+
 func TestBackendHealthMergeKeepsLatest(t *testing.T) {
 	base := NewState()
 	current := NewState()

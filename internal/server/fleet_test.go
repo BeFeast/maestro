@@ -3972,3 +3972,71 @@ func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
 		t.Fatalf("second segment.Reason = %q, want fallover", worker.Attribution[1].Reason)
 	}
 }
+
+// #600: stale BackendHealth cooldown entries (RetryAfter in the past,
+// successful sessions recorded after the cooldown was set) must be
+// omitted from the fleet snapshot so the BACKENDS panel reflects
+// reality. Mirrors the operator-reported scenario where claude+codex
+// were producing merges while the panel reported them as "auto-recovery
+// pending".
+func TestFleetAPIClearsStaleBackendCooldown(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "one")
+	now := time.Now().UTC()
+
+	expiredRetry := now.Add(-48 * time.Hour)
+	staleSince := now.Add(-72 * time.Hour)
+	successStart := now.Add(-1 * time.Hour)
+
+	st := state.NewState()
+	st.Sessions["one-7"] = &state.Session{
+		IssueNumber: 600,
+		IssueTitle:  "Successful claude session post-cooldown",
+		Status:      state.StatusPROpen,
+		StartedAt:   successStart,
+		Backend:     "claude",
+		PRNumber:    597,
+	}
+	st.BackendHealth["claude"] = state.BackendHealth{
+		State:       state.BackendHealthCooldown,
+		Reason:      state.BackendBlockProviderLimit,
+		Since:       staleSince,
+		LastSession: "sup-83",
+	}
+	st.BackendHealth["codex"] = state.BackendHealth{
+		State:      state.BackendHealthCooldown,
+		Reason:     state.BackendBlockProviderLimit,
+		Since:      staleSince,
+		RetryAfter: &expiredRetry,
+	}
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8787, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	project := findFleetProject(t, resp.Projects, "One")
+	if got, ok := project.BackendHealth["claude"]; ok {
+		t.Fatalf("claude cooldown should be cleared after a successful PR session, got %+v", got)
+	}
+	if got, ok := project.BackendHealth["codex"]; ok {
+		t.Fatalf("codex cooldown should be cleared after RetryAfter elapses, got %+v", got)
+	}
+}

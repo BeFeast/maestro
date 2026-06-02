@@ -2249,6 +2249,95 @@ func MarkPROpened(sess *Session, now time.Time) {
 	sess.PROpenedAt = &t
 }
 
+// MaxBackendCooldownTTL caps how long a BackendHealth cooldown entry stays
+// surfaced when no RetryAfter was parsed from the provider message. Without
+// this cap, a transient provider rate-limit would render as
+// "auto-recovery pending" indefinitely even though the backend is back in
+// active use (#600). 24h is the longest a Claude/Codex provider limit
+// realistically takes to reset.
+const MaxBackendCooldownTTL = 24 * time.Hour
+
+// MarkBackendHealthy clears any cooldown entry recorded for the named
+// backend. Called when the backend successfully completes a session,
+// opens a PR, or merges code — a successful use proves the backend is
+// no longer rate-limited regardless of the original RetryAfter (#600).
+func MarkBackendHealthy(s *State, backend string) {
+	if s == nil || backend == "" {
+		return
+	}
+	if _, ok := s.BackendHealth[backend]; !ok {
+		return
+	}
+	delete(s.BackendHealth, backend)
+}
+
+// ReconcileBackendHealth walks the BackendHealth map and clears stale
+// cooldown entries so the MC BACKENDS panel reflects reality (#600):
+//
+//   - RetryAfter is non-nil and in the past → cooldown has elapsed; the
+//     selector already treats this backend as available, so the panel
+//     should too.
+//   - RetryAfter is nil but Since is older than MaxBackendCooldownTTL →
+//     a stale provider-limit cooldown that was never cleared because no
+//     RetryAfter was parsed. Caps the "auto-recovery pending" indefinite
+//     state.
+//   - A session bound to this backend started after Since AND reached a
+//     successful status (pr_open / code_landed / done) → the backend is
+//     demonstrably back in service, regardless of the original RetryAfter.
+//
+// Returns true when at least one entry was cleared so the caller can
+// decide whether to persist the change.
+func ReconcileBackendHealth(s *State, now time.Time) bool {
+	if s == nil || len(s.BackendHealth) == 0 {
+		return false
+	}
+	changed := false
+	for name, health := range s.BackendHealth {
+		if health.State != BackendHealthCooldown {
+			continue
+		}
+		if health.RetryAfter != nil && !now.Before(*health.RetryAfter) {
+			delete(s.BackendHealth, name)
+			changed = true
+			continue
+		}
+		if health.RetryAfter == nil && !health.Since.IsZero() && now.Sub(health.Since) >= MaxBackendCooldownTTL {
+			delete(s.BackendHealth, name)
+			changed = true
+			continue
+		}
+		if backendHasSuccessAfter(s, name, health.Since) {
+			delete(s.BackendHealth, name)
+			changed = true
+			continue
+		}
+	}
+	return changed
+}
+
+func backendHasSuccessAfter(s *State, backend string, since time.Time) bool {
+	if s == nil || backend == "" {
+		return false
+	}
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.Backend != backend {
+			continue
+		}
+		switch sess.Status {
+		case StatusPROpen, StatusCodeLanded, StatusDone:
+		default:
+			continue
+		}
+		if sess.StartedAt.IsZero() {
+			continue
+		}
+		if since.IsZero() || sess.StartedAt.After(since) {
+			return true
+		}
+	}
+	return false
+}
+
 // SessionChangedAt returns the newest persisted activity timestamp for a session.
 func SessionChangedAt(sess *Session) time.Time {
 	if sess == nil {
