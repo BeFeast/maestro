@@ -2145,12 +2145,64 @@ func SessionLiveAt(sess *Session, now time.Time) bool {
 		return true
 	}
 
-	if SessionAttentionForAt(sess, nil, now).NeedsAttention {
+	if SessionAttentionForAt(sess, nil, now).NeedsAttention && SessionAttentionActionableAt(sess, now) {
 		return true
 	}
 
 	changedAt := SessionChangedAt(sess)
 	return !changedAt.IsZero() && now.Sub(changedAt.UTC()) <= LiveSessionRecentWindow
+}
+
+// FleetAttentionTTL is the freshness window during which a non-progressing
+// session (dead, failed, conflict_failed, or retry_exhausted without an open
+// PR) still counts as actionable operator attention. Older sessions are
+// reconcilable/archivable, not actionable, and must not be surfaced as
+// `live, needs_attention` on the fleet snapshot (#566).
+const FleetAttentionTTL = 24 * time.Hour
+
+// SessionAttentionActionableAt reports whether a session that
+// SessionAttentionForAt classifies as needs_attention is still inside the
+// actionable window for fleet surfaces.
+//
+// A retry_exhausted session that still has an open PR (PRNumber > 0) is
+// always actionable: a green-but-gate-blocked PR with no respawn is exactly
+// what a human needs to look at (#564). A session with a scheduled retry
+// (NextRetryAt set) is also always actionable. Beyond those, dead / failed /
+// conflict_failed / retry_exhausted-without-PR sessions age out after
+// FleetAttentionTTL so a deploy 2 days ago cannot dominate the verdict.
+//
+// Statuses that intrinsically represent live work (running, pr_open, queued)
+// are always actionable for as long as the session exists; they are not the
+// "stale dead worker" failure mode this gate guards against.
+func SessionAttentionActionableAt(sess *Session, now time.Time) bool {
+	return sessionAttentionActionableAt(sess, now, FleetAttentionTTL)
+}
+
+func sessionAttentionActionableAt(sess *Session, now time.Time, ttl time.Duration) bool {
+	if sess == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	switch sess.Status {
+	case StatusRunning, StatusPROpen, StatusQueued, StatusCodeLanded:
+		return true
+	}
+	if sess.NextRetryAt != nil {
+		return true
+	}
+	if sess.Status == StatusRetryExhausted && sess.PRNumber > 0 {
+		return true
+	}
+	if ttl <= 0 {
+		return true
+	}
+	changedAt := SessionChangedAt(sess)
+	if changedAt.IsZero() {
+		return true
+	}
+	return now.Sub(changedAt) <= ttl
 }
 
 // SessionChangedAt returns the newest persisted activity timestamp for a session.

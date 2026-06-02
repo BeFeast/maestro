@@ -354,20 +354,27 @@ type fleetOperatorState struct {
 }
 
 type fleetSummary struct {
-	Projects            int   `json:"projects"`
-	Stale               int   `json:"stale"`
-	Errors              int   `json:"errors"`
-	Active              int   `json:"active"`
-	MonitoringPR        int   `json:"monitoring_pr"`
-	DispatchPending     int   `json:"dispatch_pending"`
-	DispatchFailures    int   `json:"dispatch_failures"`
-	QueueBlocked        int   `json:"queue_blocked"`
-	NoEligibleIssues    int   `json:"no_eligible_issues"`
-	OutcomeMissing      int   `json:"outcome_missing"`
-	OutcomeDrift        int   `json:"outcome_drift"`
-	StaleWorkers        int   `json:"stale_workers"`
-	Running             int   `json:"running"`
-	PROpen              int   `json:"pr_open"`
+	Projects         int `json:"projects"`
+	Stale            int `json:"stale"`
+	Errors           int `json:"errors"`
+	Active           int `json:"active"`
+	MonitoringPR     int `json:"monitoring_pr"`
+	DispatchPending  int `json:"dispatch_pending"`
+	DispatchFailures int `json:"dispatch_failures"`
+	QueueBlocked     int `json:"queue_blocked"`
+	NoEligibleIssues int `json:"no_eligible_issues"`
+	OutcomeMissing   int `json:"outcome_missing"`
+	OutcomeDrift     int `json:"outcome_drift"`
+	StaleWorkers     int `json:"stale_workers"`
+	Running          int `json:"running"`
+	PROpen           int `json:"pr_open"`
+	// PRsOpen / WorkersRunning are truth-table mirrors expected by the
+	// SPA (#566). PRsOpen extends pr_open with retry_exhausted /
+	// failed / conflict_failed sessions whose PR is still open;
+	// WorkersRunning mirrors `running` under the stable field name the
+	// project card reads. Plain ints — never null.
+	PRsOpen             int   `json:"prs_open"`
+	WorkersRunning      int   `json:"workers_running"`
 	Failed              int   `json:"failed"`
 	Sessions            int   `json:"sessions"`
 	NeedsAttention      int   `json:"needs_attention"`
@@ -420,11 +427,22 @@ type fleetProjectState struct {
 	RestartRequired       bool   `json:"restart_required,omitempty"`
 	RestartRequiredReason string `json:"restart_required_reason,omitempty"`
 
-	OperatorState   fleetOperatorState    `json:"operator_state"`
-	Outcome         outcome.Status        `json:"outcome"`
-	Summary         map[string]int        `json:"summary"`
-	Running         int                   `json:"running"`
-	PROpen          int                   `json:"pr_open"`
+	OperatorState fleetOperatorState `json:"operator_state"`
+	Outcome       outcome.Status     `json:"outcome"`
+	Summary       map[string]int     `json:"summary"`
+	Running       int                `json:"running"`
+	PROpen        int                `json:"pr_open"`
+	// PRsOpen is the truthful count of open PRs for this project,
+	// including retry_exhausted (or otherwise terminal) sessions whose
+	// linked PR is still open and gate-blocked (#564). When the latest
+	// supervisor decision reports ProjectState.OpenPRs (the GitHub
+	// truth), that value is preferred over session-derived counts. The
+	// field is a plain int so it is never null (#566).
+	PRsOpen int `json:"prs_open"`
+	// WorkersRunning mirrors Running with a stable field name expected
+	// by the SPA project card (#566). It is the count of sessions in
+	// StatusRunning. Always non-null.
+	WorkersRunning  int                   `json:"workers_running"`
 	Failed          int                   `json:"failed"`
 	Sessions        int                   `json:"sessions"`
 	NeedsAttention  int                   `json:"needs_attention"`
@@ -895,6 +913,8 @@ func (s *FleetServer) snapshot() fleetResponse {
 		addFleetOperatorSummary(&resp.Summary, item.OperatorState)
 		resp.Summary.Running += item.Running
 		resp.Summary.PROpen += item.PROpen
+		resp.Summary.PRsOpen += item.PRsOpen
+		resp.Summary.WorkersRunning += item.WorkersRunning
 		resp.Summary.Failed += item.Failed
 		resp.Summary.Sessions += item.Sessions
 		resp.Summary.NeedsAttention += item.NeedsAttention
@@ -2065,6 +2085,8 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Outcome = projectState.Outcome
 	item.Running = len(projectState.Running)
 	item.PROpen = len(projectState.PROpen)
+	item.WorkersRunning = item.Running
+	item.PRsOpen = fleetTruthfulOpenPRCount(projectState, st)
 	item.Failed = failedCount(projectState.Summary)
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
@@ -2943,6 +2965,48 @@ func failedCount(summary map[string]int) int {
 		summary[string(state.StatusFailed)] +
 		summary[string(state.StatusRetryExhausted)] +
 		summary[string(state.StatusConflictFailed)]
+}
+
+// fleetTruthfulOpenPRCount returns the project-level open-PR count expected
+// by the SPA project card (#566). It is broader than the legacy
+// `pr_open` (sessions in StatusPROpen): a session in StatusRetryExhausted
+// with PRNumber > 0 is exactly the "gate-blocked PR that needs a human"
+// case (#564) and must contribute to the count. When the latest supervisor
+// decision reports ProjectState.OpenPRs (the GitHub truth, populated from
+// ListOpenPRs), the larger of the two values wins so a transient session
+// drift never under-counts the dashboard while a stale supervisor decision
+// cannot over-count it.
+func fleetTruthfulOpenPRCount(projectState stateResponse, st *state.State) int {
+	count := len(projectState.PROpen)
+	if st != nil {
+		seen := make(map[int]struct{}, count)
+		for _, info := range projectState.PROpen {
+			if info.PRNumber > 0 {
+				seen[info.PRNumber] = struct{}{}
+			}
+		}
+		for _, sess := range st.Sessions {
+			if sess == nil || sess.PRNumber <= 0 {
+				continue
+			}
+			switch sess.Status {
+			case state.StatusRetryExhausted, state.StatusFailed, state.StatusConflictFailed:
+			default:
+				continue
+			}
+			if _, ok := seen[sess.PRNumber]; ok {
+				continue
+			}
+			seen[sess.PRNumber] = struct{}{}
+			count++
+		}
+	}
+	if latest := projectState.SupervisorLatest; latest != nil {
+		if latest.ProjectState.OpenPRs > count {
+			count = latest.ProjectState.OpenPRs
+		}
+	}
+	return count
 }
 
 func (s *FleetServer) handleFleetDashboard(w http.ResponseWriter, r *http.Request) {

@@ -2871,8 +2871,13 @@ func TestFleetAPIFiltersStaleSessionsFromAttention(t *testing.T) {
 		t.Fatalf("stale-1 status reason = %q, want reconciliation explanation", stale.StatusReason)
 	}
 
-	if !findFleetWorker(t, resp.Workers, "present-dead").NeedsAttention {
-		t.Fatalf("present-dead has a live worktree, must remain in attention")
+	// #566: a 30h-old dead worker ages past FleetAttentionTTL even when
+	// its worktree is still on disk — the reconciler keeps it in the
+	// workers list (it is not "stale session reconciled"), but the
+	// fleet-level TTL drops it from `needs_attention`. The recent-dead
+	// session (2h old) stays well inside the window.
+	if findFleetWorker(t, resp.Workers, "present-dead").NeedsAttention {
+		t.Fatalf("present-dead aged past TTL, must not remain in needs_attention")
 	}
 	if !findFleetWorker(t, resp.Workers, "recent-dead").NeedsAttention {
 		t.Fatalf("recent-dead is inside the idle window, must remain in attention")
@@ -2908,13 +2913,15 @@ func TestFleetAPIDisabledReconcilerKeepsAttention(t *testing.T) {
 	now := time.Now().UTC()
 	stateDir := filepath.Join(dir, "state")
 	missingWorktree := filepath.Join(dir, "missing-worktree")
-	finishedOld := now.Add(-30 * time.Hour)
+	// #566: keep this session well inside FleetAttentionTTL so the test
+	// exercises the reconciler-disabled path, not the TTL gate.
+	finishedRecent := now.Add(-90 * time.Minute)
 	saveFleetTestState(t, stateDir, map[string]*state.Session{
 		"stale-1": {
 			IssueNumber: 501,
 			Status:      state.StatusDead,
-			StartedAt:   finishedOld.Add(-time.Hour),
-			FinishedAt:  &finishedOld,
+			StartedAt:   finishedRecent.Add(-time.Hour),
+			FinishedAt:  &finishedRecent,
 			Worktree:    missingWorktree,
 		},
 	})
@@ -2940,6 +2947,228 @@ func TestFleetAPIDisabledReconcilerKeepsAttention(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(stateDir, "audit-log.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("disabled reconciler must not write audit entries; err = %v", err)
+	}
+}
+
+// TestFleetAPIStaleDeadSessionsAgeOutOfAttention pins the #471 regression
+// for #566: a `dead` session whose newest activity is older than
+// FleetAttentionTTL must NOT surface as `live, needs_attention`, regardless
+// of the stale-session reconciler config. The fleet verdict must stay
+// healthy when the only remaining attention candidates are stale dead
+// workers (the "Action required p1" verdict driven by 2-day-old sup-82/83/84
+// must go away).
+func TestFleetAPIStaleDeadSessionsAgeOutOfAttention(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	// 2 days old, like the sup-82/83/84 sessions on #471.
+	finishedAncient := now.Add(-48 * time.Hour)
+	freshStarted := now.Add(-10 * time.Minute)
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"sup-82": {
+			IssueNumber: 82,
+			IssueTitle:  "Ancient dead worker on removed backend",
+			Status:      state.StatusDead,
+			Backend:     "freellm",
+			StartedAt:   finishedAncient.Add(-30 * time.Minute),
+			FinishedAt:  &finishedAncient,
+		},
+		"sup-83": {
+			IssueNumber: 83,
+			IssueTitle:  "Ancient dead worker (failed)",
+			Status:      state.StatusFailed,
+			StartedAt:   finishedAncient.Add(-30 * time.Minute),
+			FinishedAt:  &finishedAncient,
+		},
+		"sup-84": {
+			IssueNumber: 84,
+			IssueTitle:  "Ancient dead worker (conflict_failed)",
+			Status:      state.StatusConflictFailed,
+			StartedAt:   finishedAncient.Add(-30 * time.Minute),
+			FinishedAt:  &finishedAncient,
+		},
+		"fresh-done": {
+			IssueNumber: 90,
+			IssueTitle:  "Recently completed worker",
+			Status:      state.StatusDone,
+			StartedAt:   freshStarted.Add(-30 * time.Minute),
+			FinishedAt:  fleetTimePtr(freshStarted),
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
+			Repo:        "befeast/maestro",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	for _, slot := range []string{"sup-82", "sup-83", "sup-84"} {
+		worker := findFleetWorker(t, resp.Workers, slot)
+		if worker.NeedsAttention {
+			t.Fatalf("%s aged past TTL but still needs_attention: %+v", slot, worker)
+		}
+		if worker.Live {
+			t.Fatalf("%s aged past TTL but still Live=true: %+v", slot, worker)
+		}
+	}
+	for _, w := range resp.Attention {
+		switch w.Slot {
+		case "sup-82", "sup-83", "sup-84":
+			t.Fatalf("stale dead worker %s leaked into attention[]", w.Slot)
+		}
+	}
+	project := findFleetProject(t, resp.Projects, "maestro")
+	if project.NeedsAttention != 0 {
+		t.Fatalf("project needs_attention = %d, want 0 (stale dead sessions must not count)", project.NeedsAttention)
+	}
+}
+
+// TestFleetAPIRetryExhaustedWithOpenPRStaysActionable pins the #564 regression
+// for #566: a retry_exhausted session whose linked PR is still open is
+// always actionable regardless of age. The fleet verdict must stay
+// `attention` and the PR must surface in attention[].
+func TestFleetAPIRetryExhaustedWithOpenPRStaysActionable(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	// 2 days old, like PR #564 in the dogfood log.
+	finishedAncient := now.Add(-48 * time.Hour)
+	saveFleetTestSnapshot(t, stateDir, map[string]*state.Session{
+		"sup-stuck": {
+			IssueNumber:        442,
+			IssueTitle:         "Greptile P1 retry-exhausted with open PR",
+			Status:             state.StatusRetryExhausted,
+			PRNumber:           564,
+			StartedAt:          finishedAncient.Add(-time.Hour),
+			FinishedAt:         &finishedAncient,
+			LastNotifiedStatus: "review_retry_exhausted",
+		},
+	}, []state.SupervisorDecision{
+		{
+			ID:                "dec-recent",
+			CreatedAt:         now.Add(-1 * time.Minute),
+			Project:           "maestro",
+			RecommendedAction: "monitor_open_pr",
+			Risk:              "safe",
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
+			Repo:        "befeast/maestro",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	stuck := findFleetWorker(t, resp.Workers, "sup-stuck")
+	if !stuck.NeedsAttention {
+		t.Fatalf("retry_exhausted with open PR must keep needs_attention regardless of age: %+v", stuck)
+	}
+	if !stuck.Live {
+		t.Fatalf("retry_exhausted with open PR must stay Live: %+v", stuck)
+	}
+	if stuck.PRNumber != 564 {
+		t.Fatalf("attention worker PR = %d, want 564", stuck.PRNumber)
+	}
+
+	foundInAttention := false
+	for _, w := range resp.Attention {
+		if w.Slot == "sup-stuck" {
+			foundInAttention = true
+			break
+		}
+	}
+	if !foundInAttention {
+		t.Fatalf("retry_exhausted with open PR must appear in attention[]: %+v", resp.Attention)
+	}
+
+	project := findFleetProject(t, resp.Projects, "maestro")
+	if project.PRsOpen < 1 {
+		t.Fatalf("project.prs_open = %d, want >=1 (retry_exhausted PR counts as open)", project.PRsOpen)
+	}
+	if resp.Summary.NeedsAttention < 1 {
+		t.Fatalf("summary needs_attention = %d, want >=1", resp.Summary.NeedsAttention)
+	}
+	if resp.Verdict.Tone != "attention" {
+		t.Fatalf("verdict tone = %q, want attention (stuck PR is exactly attention)", resp.Verdict.Tone)
+	}
+}
+
+// TestFleetAPIProjectCountersNonNull pins the #566 contract: per-project
+// prs_open and workers_running are plain ints that always serialise as
+// numbers — never null — so the SPA project card never falls back to
+// "PRS OPEN 0 / WORKERS 0" because of a missing key.
+func TestFleetAPIProjectCountersNonNull(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"slot-running": {
+			IssueNumber: 1,
+			IssueTitle:  "Running",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-5 * time.Minute),
+		},
+		"slot-pr-open": {
+			IssueNumber: 2,
+			IssueTitle:  "Waiting on PR",
+			Status:      state.StatusPROpen,
+			PRNumber:    100,
+			StartedAt:   now.Add(-30 * time.Minute),
+		},
+		"slot-retry-pr": {
+			IssueNumber: 3,
+			IssueTitle:  "Retry exhausted with PR still open",
+			Status:      state.StatusRetryExhausted,
+			PRNumber:    101,
+			StartedAt:   now.Add(-10 * time.Minute),
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
+			Repo:        "befeast/maestro",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	// The raw JSON must include the keys with numeric values — `null`
+	// fails the contract.
+	body := w.Body.String()
+	if !strings.Contains(body, `"prs_open":`) {
+		t.Fatalf("response missing prs_open key: %s", body)
+	}
+	if !strings.Contains(body, `"workers_running":`) {
+		t.Fatalf("response missing workers_running key: %s", body)
+	}
+	if strings.Contains(body, `"prs_open":null`) || strings.Contains(body, `"workers_running":null`) {
+		t.Fatalf("counters must never be null: %s", body)
+	}
+
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	project := findFleetProject(t, resp.Projects, "maestro")
+	if project.WorkersRunning != 1 {
+		t.Fatalf("workers_running = %d, want 1", project.WorkersRunning)
+	}
+	// PRsOpen includes both StatusPROpen and retry_exhausted-with-PR.
+	if project.PRsOpen < 2 {
+		t.Fatalf("prs_open = %d, want >=2 (StatusPROpen + retry_exhausted with PR)", project.PRsOpen)
 	}
 }
 
