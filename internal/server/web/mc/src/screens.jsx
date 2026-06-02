@@ -75,11 +75,11 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
           <div className="hb-actions">
             <button className="tb-btn" onClick={() => navigate(`workers?project=${encodeURIComponent(p.slug)}`)}>Open workers →</button>
             {p.repo && (
-              <a className="tb-btn ghost" href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer">Open in GitHub →</a>
+              <a className="tb-btn" href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer">Open in GitHub →</a>
             )}
             {p.projectBoard?.url && (
               <a
-                className="tb-btn ghost"
+                className="tb-btn"
                 href={p.projectBoard.url}
                 target="_blank"
                 rel="noreferrer"
