@@ -2,6 +2,8 @@ package main
 
 import (
 	"flag"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -158,5 +160,21 @@ func TestReorderArgsParseEquivalence(t *testing.T) {
 				t.Errorf("args mismatch: after=%q first=%q", afterArgs, firstArgs)
 			}
 		})
+	}
+}
+
+func TestLoadConfigsWithStoreFallsBackToYAMLPath(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "maestro.yaml")
+	if err := os.WriteFile(configPath, []byte("repo: owner/repo\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfgs := loadConfigsWithStore([]string{configPath}, filepath.Join(dir, "missing", "config.db"), "")
+	if len(cfgs) != 1 {
+		t.Fatalf("len(cfgs) = %d, want 1", len(cfgs))
+	}
+	if cfgs[0].Repo != "owner/repo" {
+		t.Fatalf("Repo = %q, want owner/repo", cfgs[0].Repo)
 	}
 }

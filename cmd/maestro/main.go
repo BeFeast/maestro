@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
@@ -52,6 +54,7 @@ Commands:
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
+  config-store  Migrate YAML runtime config to SQLite or export it back
   history       Show recently completed sessions
   cleanup       Remove worktrees for all completed/dead sessions
   version-bump  Bump project version based on merged PR labels
@@ -59,6 +62,7 @@ Commands:
 
 Global flags:
   --config string       Path to config file (can be repeated for multiple projects)
+  --config-store string Path to SQLite config store (optional read path)
 
   Multiple projects: pass --config for each project config file, or place
   configs in a maestro.d/ directory for automatic discovery.
@@ -165,6 +169,12 @@ func (f *multiFlag) String() string { return strings.Join(*f, ", ") }
 func (f *multiFlag) Set(value string) error {
 	*f = append(*f, value)
 	return nil
+}
+
+func configStoreFlags(fs *flag.FlagSet) (*string, *string) {
+	store := fs.String("config-store", "", "Path to SQLite config store")
+	project := fs.String("config-store-project", "", "Project name in SQLite config store")
+	return store, project
 }
 
 // reorderArgs moves flag tokens ahead of positional arguments so that flags
@@ -285,6 +295,8 @@ func main() {
 		killCmd(args)
 	case "import":
 		importCmd(args)
+	case "config-store":
+		configStoreCmd(args)
 	case "history":
 		historyCmd(args)
 	case "cleanup":
@@ -307,6 +319,21 @@ func main() {
 
 // loadConfig loads config from a specific path or uses default discovery.
 func loadConfig(configPath string) *config.Config {
+	return loadConfigWithStore(configPath, "", "")
+}
+
+func loadConfigWithStore(configPath, storePath, project string) *config.Config {
+	if strings.TrimSpace(storePath) != "" {
+		cfg, err := loadConfigFromStore(storePath, project)
+		if err == nil {
+			logConfigWarnings(cfg)
+			return cfg
+		}
+		if strings.TrimSpace(configPath) == "" {
+			log.Fatalf("load config store: %v", err)
+		}
+		log.Printf("warn: load config store failed, falling back to YAML %s: %v", configPath, err)
+	}
 	var cfg *config.Config
 	var err error
 	if configPath != "" {
@@ -321,6 +348,26 @@ func loadConfig(configPath string) *config.Config {
 	return cfg
 }
 
+func loadConfigFromStore(storePath, project string) (*config.Config, error) {
+	store, err := configstore.Open(storePath)
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if strings.TrimSpace(project) != "" {
+		return store.Load(ctx, project)
+	}
+	cfgs, err := store.LoadAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfgs) != 1 {
+		return nil, fmt.Errorf("config store has %d projects; pass --config-store-project", len(cfgs))
+	}
+	return cfgs[0], nil
+}
+
 // logConfigWarnings emits any non-fatal configuration issues at WARN
 // level so an operator notices a hands-off project that has merge_pr in
 // approval_required (etc.) without grepping the daemon journal. #425.
@@ -332,6 +379,53 @@ func logConfigWarnings(cfg *config.Config) {
 
 // loadConfigs resolves multiple config paths, maestro.d/ directory, or default discovery.
 func loadConfigs(paths []string) []*config.Config {
+	return loadConfigsWithStore(paths, "", "")
+}
+
+func loadConfigsWithStore(paths []string, storePath, project string) []*config.Config {
+	if strings.TrimSpace(storePath) != "" {
+		store, err := configstore.Open(storePath)
+		if err != nil {
+			if len(paths) == 0 {
+				log.Fatalf("load config store: %v", err)
+			}
+			log.Printf("warn: load config store failed, falling back to YAML: %v", err)
+		} else {
+			defer store.Close()
+			ctx := context.Background()
+			var cfgs []*config.Config
+			if strings.TrimSpace(project) != "" {
+				cfg, err := store.Load(ctx, project)
+				if err != nil {
+					if len(paths) == 0 {
+						log.Fatalf("load config store project %s: %v", project, err)
+					}
+					log.Printf("warn: load config store project %s failed, falling back to YAML: %v", project, err)
+				} else {
+					cfgs = []*config.Config{cfg}
+				}
+			} else {
+				cfgs, err = store.LoadAll(ctx)
+				if err != nil {
+					if len(paths) == 0 {
+						log.Fatalf("load config store: %v", err)
+					}
+					log.Printf("warn: load config store failed, falling back to YAML: %v", err)
+				} else {
+					for _, cfg := range cfgs {
+						logConfigWarnings(cfg)
+					}
+					return cfgs
+				}
+			}
+			if cfgs != nil {
+				for _, cfg := range cfgs {
+					logConfigWarnings(cfg)
+				}
+				return cfgs
+			}
+		}
+	}
 	if len(paths) > 0 {
 		var cfgs []*config.Config
 		for _, p := range paths {
@@ -361,16 +455,57 @@ func loadConfigs(paths []string) []*config.Config {
 	return []*config.Config{loadConfig("")}
 }
 
+func configStoreCmd(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: maestro config-store migrate --db <path> --dir <maestro.d> | export --db <path> --dir <out>")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "migrate":
+		fs := flag.NewFlagSet("config-store migrate", flag.ExitOnError)
+		dbPath := fs.String("db", filepath.Join(os.Getenv("HOME"), ".maestro", "config.db"), "SQLite config store path")
+		dir := fs.String("dir", filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.d"), "Directory containing project YAML files")
+		fs.Parse(args[1:])
+		store, err := configstore.Open(*dbPath)
+		if err != nil {
+			log.Fatalf("config-store migrate: open db: %v", err)
+		}
+		defer store.Close()
+		if err := store.ImportDir(context.Background(), *dir); err != nil {
+			log.Fatalf("config-store migrate: %v", err)
+		}
+		fmt.Printf("Migrated YAML configs from %s into SQLite store %s.\n", *dir, *dbPath)
+	case "export":
+		fs := flag.NewFlagSet("config-store export", flag.ExitOnError)
+		dbPath := fs.String("db", filepath.Join(os.Getenv("HOME"), ".maestro", "config.db"), "SQLite config store path")
+		dir := fs.String("dir", filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.d.export"), "Directory to write portable YAML files")
+		fs.Parse(args[1:])
+		store, err := configstore.Open(*dbPath)
+		if err != nil {
+			log.Fatalf("config-store export: open db: %v", err)
+		}
+		defer store.Close()
+		if err := store.ExportDir(context.Background(), *dir); err != nil {
+			log.Fatalf("config-store export: %v", err)
+		}
+		fmt.Printf("Exported SQLite config store %s to YAML directory %s.\n", *dbPath, *dir)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown config-store command: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	storePath, storeProject := configStoreFlags(fs)
 	interval := fs.Duration("interval", 10*time.Minute, "Loop interval")
 	once := fs.Bool("once", false, "Run once and exit")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	fs.Parse(args)
 
-	cfgs := loadConfigs(configs)
+	cfgs := loadConfigsWithStore(configs, *storePath, *storeProject)
 
 	if len(cfgs) == 1 {
 		cfg := cfgs[0]
@@ -483,6 +618,7 @@ func superviseCmd(args []string) {
 
 	fs := flag.NewFlagSet("supervise", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to config file")
+	storePath, storeProject := configStoreFlags(fs)
 	once := fs.Bool("once", false, "Run once and exit")
 	interval := fs.Duration("interval", 5*time.Minute, "Loop interval")
 	jsonOutput := fs.Bool("json", false, "Output decision as JSON")
@@ -503,7 +639,7 @@ func superviseCmd(args []string) {
 		log.Fatalf("supervise: --interval must be positive")
 	}
 
-	cfg := loadConfig(*configPath)
+	cfg := loadConfigWithStore(*configPath, *storePath, *storeProject)
 	if *dryRun {
 		cfg.Supervisor.DryRun = true
 	}
@@ -886,6 +1022,7 @@ func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file")
+	storePath, storeProject := configStoreFlags(fs)
 	fleetPath := fs.String("fleet", "", "Path to fleet YAML file")
 	host := fs.String("host", "", "Host/interface to bind")
 	port := fs.Int("port", 0, "Port to bind")
@@ -906,7 +1043,7 @@ func serveCmd(args []string) {
 
 	var cfgs []*config.Config
 	if strings.TrimSpace(*fleetPath) == "" {
-		cfgs = loadConfigs(configs)
+		cfgs = loadConfigsWithStore(configs, *storePath, *storeProject)
 	}
 	if strings.TrimSpace(*fleetPath) != "" || len(cfgs) > 1 {
 		var projects []server.FleetProject
@@ -1045,10 +1182,11 @@ func statusCmd(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	storePath, storeProject := configStoreFlags(fs)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	fs.Parse(args)
 
-	cfgs := loadConfigs(configs)
+	cfgs := loadConfigsWithStore(configs, *storePath, *storeProject)
 
 	// JSON: for multiple projects, emit an array of objects
 	if *jsonOutput && len(cfgs) > 1 {
@@ -1731,6 +1869,7 @@ func spawnCmd(args []string) {
 	fs := flag.NewFlagSet("spawn", flag.ExitOnError)
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	storePath, storeProject := configStoreFlags(fs)
 	issueNum := fs.Int("issue", 0, "Issue number")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	fs.Parse(reorderArgs(fs, args))
@@ -1740,7 +1879,7 @@ func spawnCmd(args []string) {
 		os.Exit(1)
 	}
 
-	cfgs := loadConfigs(configs)
+	cfgs := loadConfigsWithStore(configs, *storePath, *storeProject)
 	if len(cfgs) > 1 {
 		fmt.Fprintln(os.Stderr, "error: spawn requires a single --config (ambiguous with multiple projects)")
 		os.Exit(1)
@@ -1853,10 +1992,11 @@ func drainCmd(args []string) {
 	fs := flag.NewFlagSet("drain", flag.ExitOnError)
 	var configs multiFlag
 	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	storePath, storeProject := configStoreFlags(fs)
 	timeout := fs.Duration("timeout", drainDefaultTimeout, "Max time to wait for in-flight workers to finish")
 	fs.Parse(reorderArgs(fs, args))
 
-	cfgs := loadConfigs(configs)
+	cfgs := loadConfigsWithStore(configs, *storePath, *storeProject)
 	if len(cfgs) > 1 {
 		fmt.Fprintln(os.Stderr, "error: drain requires a single --config (one project at a time; see #541 out-of-scope)")
 		os.Exit(1)
@@ -2056,13 +2196,14 @@ func importCmd(args []string) {
 func historyCmd(args []string) {
 	fs := flag.NewFlagSet("history", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to config file")
+	storePath, storeProject := configStoreFlags(fs)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	limit := fs.Int("limit", 20, "Number of recent sessions to show")
 	prune := fs.Bool("prune", false, "Remove sessions older than retention period")
 	retentionDays := fs.Int("retention-days", 30, "Retention period in days for pruning")
 	fs.Parse(args)
 
-	cfg := loadConfig(*configPath)
+	cfg := loadConfigWithStore(*configPath, *storePath, *storeProject)
 
 	s, err := state.Load(cfg.StateDir)
 	if err != nil {
