@@ -804,6 +804,12 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// Parse decodes one project config document and applies the same defaults and
+// validation used by LoadFrom. It does not load sidecar supervisor policy files.
+func Parse(data []byte) (*Config, error) {
+	return parse(data)
+}
+
 func parse(data []byte) (*Config, error) {
 
 	cfg := &Config{

@@ -271,6 +271,59 @@ For day-to-day operations, review gates, queue policy, approvals, and safe recov
 
 Trusted-LAN default (#477): the fleet dashboard now boots write-enabled out of the box. The cautious approval gate still guards `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config`, so the writable HTTP surface cannot bypass operator approval for those four verbs. For installs exposed beyond a trusted LAN, pass `--read-only=true` (or set `server.read_only: true` in YAML) and configure the optional HTTP auth layer that #616 wires up (off by default). This supersedes the prior "never flip --read-only before auth" caveat.
 
+### Runtime config store (phase 1)
+
+Runtime project settings can be imported from `~/.maestro/maestro.d/*.yaml` into a small SQLite store. Phase 1 keeps the YAML files as the fallback read path; write-path changes, change history, and Mission Control settings UI edits are follow-up work.
+
+Proposed SQLite schema:
+
+```sql
+CREATE TABLE global (
+  key TEXT PRIMARY KEY,
+  value_yaml TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE backends (
+  name TEXT PRIMARY KEY,
+  definition_yaml TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE project (
+  name TEXT PRIMARY KEY,
+  source_path TEXT NOT NULL,
+  config_yaml TEXT NOT NULL,
+  backend_ref TEXT NOT NULL DEFAULT 'global',
+  updated_at TEXT NOT NULL
+);
+```
+
+`project.config_yaml` stores the project config without `model.backends`; `backends.definition_yaml` stores each backend definition once and the loader reconstructs the effective config before applying the existing YAML parser defaults and validation. Import rejects divergent definitions for the same backend name so the backend chain cannot silently fork per project.
+
+One-shot migration:
+
+```sh
+maestro config-store migrate --db ~/.maestro/config.db --dir ~/.maestro/maestro.d
+```
+
+Read from the store:
+
+```sh
+maestro run --config-store ~/.maestro/config.db
+maestro serve --config-store ~/.maestro/config.db --port 8787
+```
+
+If `--config-store` is set and the store cannot be opened or read, Maestro falls back to the YAML paths passed with `--config`. Without YAML paths, store load failure remains fatal so operators do not accidentally run with an unintended default config.
+
+Export portable YAML backups:
+
+```sh
+maestro config-store export --db ~/.maestro/config.db --dir ~/.maestro/maestro.d.export
+```
+
+Exports restore the shared backend definitions into each YAML file so the result can be loaded by the legacy YAML loader or copied to another host.
+
 To add a project:
 
 1. Create or update `~/.maestro/maestro-<project>.yaml` using the config shape above.
