@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -30,6 +31,44 @@ type ProjectEnroller interface {
 	EnrollBlockedIssue(issueNumber int) error
 }
 
+// enrollmentTracker remembers which blocked issue numbers have already
+// been handed to ProjectEnroller this process so subsequent supervisor
+// cycles do not re-issue the same GraphQL enrollment call (#569). The
+// reset-on-restart cost is bounded: enrollment is idempotent, and a fresh
+// daemon process only pays the dedup miss once per blocked issue.
+type enrollmentTracker interface {
+	Seen(issueNumber int) bool
+	Mark(issueNumber int)
+}
+
+type inMemoryEnrollmentTracker struct {
+	mu   sync.Mutex
+	seen map[int]struct{}
+}
+
+func newInMemoryEnrollmentTracker() *inMemoryEnrollmentTracker {
+	return &inMemoryEnrollmentTracker{seen: make(map[int]struct{})}
+}
+
+func (t *inMemoryEnrollmentTracker) Seen(issueNumber int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.seen[issueNumber]
+	return ok
+}
+
+func (t *inMemoryEnrollmentTracker) Mark(issueNumber int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.seen[issueNumber] = struct{}{}
+}
+
+// defaultEnrollmentTracker is the process-wide tracker shared by every
+// Engine created via NewEngine. RunOnce constructs a fresh Engine per
+// cycle, so the dedup has to live above the Engine to survive cycle
+// boundaries.
+var defaultEnrollmentTracker = newInMemoryEnrollmentTracker()
+
 // enrollBlockedWaveMembers walks every blocked wave member and asks the
 // configured enroller to add it to the GitHub Project. Returns the issues
 // that were attempted (regardless of success) so the decision Reasons can
@@ -46,14 +85,27 @@ func (e *Engine) enrollBlockedWaveMembers(blocked []github.Issue) []int {
 	if e.enroller == nil {
 		return nil
 	}
+	tracker := e.enrollmentTracker
+	if tracker == nil {
+		tracker = defaultEnrollmentTracker
+	}
 	enrolled := make([]int, 0, len(blocked))
 	for _, issue := range blocked {
+		// Dedup against prior cycles in this process (#569). Enrollment
+		// is idempotent on the GraphQL side, but re-issuing the call
+		// every cycle burns rate-limit budget proportional to wave size
+		// × cycle count.
+		if tracker.Seen(issue.Number) {
+			continue
+		}
 		if err := e.enroller.EnrollBlockedIssue(issue.Number); err != nil {
 			// Best-effort: keep the supervisor cycle moving. The
 			// fake reader in tests can capture this through its own
 			// counter; production wiring logs via the gh client.
+			// Do NOT mark on failure — the next cycle should retry.
 			continue
 		}
+		tracker.Mark(issue.Number)
 		enrolled = append(enrolled, issue.Number)
 	}
 	sort.Ints(enrolled)

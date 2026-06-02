@@ -26,6 +26,19 @@ func (f *fakeEnroller) EnrollBlockedIssue(issueNumber int) error {
 	return nil
 }
 
+// errorEnroller always fails the enrollment call and counts attempts so a
+// test can assert that a failure is retried on the next supervisor cycle
+// (the dedup tracker must not mark failed enrollments as seen). #569.
+type errorEnroller struct {
+	err   error
+	calls int
+}
+
+func (e *errorEnroller) EnrollBlockedIssue(int) error {
+	e.calls++
+	return e.err
+}
+
 // Helpers ---------------------------------------------------------------
 
 func enableDependencyUnblock(cfg *config.Config) {
@@ -372,6 +385,83 @@ func TestEvaluate_EnrollmentSkippedWhenDisabled(t *testing.T) {
 	}
 	if len(enroller.enrolled) != 0 {
 		t.Fatalf("enrolled = %v, want none (enroll_in_project=false)", enroller.enrolled)
+	}
+}
+
+// Test: dedup — a previously enrolled blocked issue is not re-enrolled (#569)
+
+func TestEvaluate_DoesNotReEnrollAlreadyEnrolledBlockedIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDependencyUnblock(cfg)
+	cfg.GitHubProjects.Enabled = true
+	cfg.GitHubProjects.ProjectNumber = 7
+
+	reader := &fakeReader{issues: []github.Issue{blockedIssue(148, []int{147})}}
+	enroller := &fakeEnroller{}
+	eng := testEngine(cfg, reader)
+	eng.SetProjectEnroller(enroller)
+
+	// First cycle: candidate is unseen → enroller is called once.
+	if _, err := eng.Decide(state.NewState()); err != nil {
+		t.Fatalf("Decide(1): %v", err)
+	}
+	if !equalInts(enroller.enrolled, []int{148}) {
+		t.Fatalf("after cycle 1: enrolled = %v, want [148]", enroller.enrolled)
+	}
+
+	// Second cycle: same blocked candidate, same reader. The dedup
+	// tracker must suppress the redundant GraphQL call. Acceptance #1.
+	if _, err := eng.Decide(state.NewState()); err != nil {
+		t.Fatalf("Decide(2): %v", err)
+	}
+	if !equalInts(enroller.enrolled, []int{148}) {
+		t.Fatalf("after cycle 2: enrolled = %v, want [148] (no re-enroll)", enroller.enrolled)
+	}
+
+	// Third cycle: a newly-blocked issue appears. Only the new one is
+	// enrolled — calls are O(new blocked members). Acceptance #2.
+	reader.issues = []github.Issue{
+		blockedIssue(148, []int{147}),
+		blockedIssue(149, []int{147}),
+	}
+	if _, err := eng.Decide(state.NewState()); err != nil {
+		t.Fatalf("Decide(3): %v", err)
+	}
+	if !equalInts(enroller.enrolled, []int{148, 149}) {
+		t.Fatalf("after cycle 3: enrolled = %v, want [148 149] (only the new one)", enroller.enrolled)
+	}
+}
+
+// Test: a failed enrollment is retried on the next cycle (failures don't mark
+// the issue as seen). #569.
+
+func TestEvaluate_FailedEnrollmentIsRetriedOnNextCycle(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDependencyUnblock(cfg)
+	cfg.GitHubProjects.Enabled = true
+	cfg.GitHubProjects.ProjectNumber = 7
+
+	reader := &fakeReader{issues: []github.Issue{blockedIssue(148, []int{147})}}
+	failing := &errorEnroller{err: errors.New("graphql rate limited")}
+	eng := testEngine(cfg, reader)
+	eng.SetProjectEnroller(failing)
+
+	if _, err := eng.Decide(state.NewState()); err != nil {
+		t.Fatalf("Decide(1): %v", err)
+	}
+	if failing.calls != 1 {
+		t.Fatalf("after cycle 1: enroller calls = %d, want 1", failing.calls)
+	}
+
+	// Cycle 2: the failure must not have marked the issue as enrolled,
+	// so the enroller is called again.
+	if _, err := eng.Decide(state.NewState()); err != nil {
+		t.Fatalf("Decide(2): %v", err)
+	}
+	if failing.calls != 2 {
+		t.Fatalf("after cycle 2: enroller calls = %d, want 2 (retry after failure)", failing.calls)
 	}
 }
 

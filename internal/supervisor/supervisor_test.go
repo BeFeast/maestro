@@ -191,6 +191,9 @@ func testEngine(cfg *config.Config, reader *fakeReader) *Engine {
 	eng.now = func() time.Time { return time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC) }
 	eng.pidAlive = func(pid int) bool { return true }
 	eng.lookPath = func(file string) (string, error) { return file, nil }
+	// Isolate the in-process enrollment dedup (#569) so each test starts
+	// with an empty set and does not bleed state into sibling tests.
+	eng.enrollmentTracker = newInMemoryEnrollmentTracker()
 	return eng
 }
 
