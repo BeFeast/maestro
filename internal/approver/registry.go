@@ -23,12 +23,18 @@ package approver
 // here, by enumerating the verbs and checking each one routes through
 // Execute() without falling into default).
 var KnownApprovalActions = map[string]struct{}{
-	"merge_pr":              {},
-	"close_issue":           {},
-	"delete_worktree":       {},
-	"change_global_config":  {}, // executor returns execution_skipped pending YAML pipeline
-	"spawn_worker":          {}, // executor returns awaiting_dispatch (#515)
-	"open_child_issue":      {}, // executor returns awaiting_dispatch (#515)
+	"merge_pr":             {},
+	"close_issue":          {},
+	"delete_worktree":      {},
+	"change_global_config": {}, // executor returns execution_skipped pending YAML pipeline
+	"spawn_worker":         {}, // executor returns awaiting_dispatch (#515)
+	"open_child_issue":     {}, // executor returns awaiting_dispatch (#515)
+	// #565: auto review-repair respawn. Executor returns awaiting_dispatch
+	// — the orchestrator's dispatcher spawns a scoped opus repair worker
+	// keyed on (pr_number, head_sha) so the same head is never
+	// re-attempted. Replaces the refused `spawn_repair_worker` verb for
+	// the green+retry_exhausted+P0/P1-on-head case.
+	"spawn_review_repair": {},
 }
 
 // KnownSafeActions is the canonical set of safe (non-approval-gated)
@@ -37,10 +43,10 @@ var KnownApprovalActions = map[string]struct{}{
 // for symmetry but the at-mint guard does not gate them — safe actions
 // never mint pending approvals.
 var KnownSafeActions = map[string]struct{}{
-	"add_ready_label":       {},
-	"remove_ready_label":    {},
-	"remove_blocked_label":  {},
-	"add_issue_comment":     {},
+	"add_ready_label":      {},
+	"remove_ready_label":   {},
+	"remove_blocked_label": {},
+	"add_issue_comment":    {},
 }
 
 // IsKnownApprovalAction returns true if the verb is implemented by the

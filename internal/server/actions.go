@@ -156,7 +156,7 @@ func isSafeAction(id string) bool {
 	return false
 }
 
-// isApprovalRequiredAction reports whether the action_id is one of the four
+// isApprovalRequiredAction reports whether the action_id is one of the
 // cautious-gate verbs that must be enqueued as a pending Approval rather
 // than executed synchronously. dispatchApprovalAction handles these.
 func isApprovalRequiredAction(id string) bool {
@@ -164,7 +164,11 @@ func isApprovalRequiredAction(id string) bool {
 	case config.SupervisorActionMergePR,
 		config.SupervisorActionCloseIssue,
 		config.SupervisorActionDeleteWorktree,
-		config.SupervisorActionChangeGlobalConfig:
+		config.SupervisorActionChangeGlobalConfig,
+		// #565: review-repair respawn is approval-gated (RiskMutating);
+		// the orchestrator dispatcher loop spawns the actual worker once
+		// the cautious gate approves.
+		config.SupervisorActionSpawnReviewRepair:
 		return true
 	}
 	return false
@@ -349,6 +353,14 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 	case config.SupervisorActionChangeGlobalConfig:
 		if strings.TrimSpace(req.Reason) == "" {
 			return errors.New("reason is required for change_global_config")
+		}
+	case config.SupervisorActionSpawnReviewRepair:
+		// #565: the dispatcher needs a PR number to spawn the scoped
+		// repair worker; the head SHA is observed at decision time and
+		// can be empty for the HTTP enqueue (operators may invoke this
+		// manually against the latest head).
+		if req.PRNumber <= 0 {
+			return errors.New("pr_number is required for spawn_review_repair")
 		}
 	}
 	return nil

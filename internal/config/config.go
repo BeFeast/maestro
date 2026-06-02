@@ -85,6 +85,13 @@ const (
 	SupervisorActionCloseIssue         = "close_issue"
 	SupervisorActionDeleteWorktree     = "delete_worktree"
 	SupervisorActionChangeGlobalConfig = "change_global_config"
+	// SupervisorActionSpawnReviewRepair is the auto review-repair respawn verb
+	// minted by the supervisor when a green+mergeable PR is settled
+	// retry_exhausted on review feedback and at least one Greptile P0/P1
+	// inline comment is still on the head SHA (#565). The orchestrator
+	// dispatcher spawns a scoped opus repair worker keyed on
+	// (pr_number, head_sha) so the same head is never re-attempted.
+	SupervisorActionSpawnReviewRepair = "spawn_review_repair"
 )
 
 // SupervisorConfig defines local policy for supervisor decisions.
@@ -105,6 +112,7 @@ type SupervisorConfig struct {
 	OrderedQueue            SupervisorOrderedQueueConfig    `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
 	DynamicWave             SupervisorDynamicWaveConfig     `yaml:"dynamic_wave" json:"dynamic_wave,omitempty"`
 	HandoffPlanner          SupervisorHandoffPlannerConfig  `yaml:"handoff_planner" json:"handoff_planner,omitempty"`
+	ReviewRepair            SupervisorReviewRepairConfig    `yaml:"review_repair" json:"review_repair,omitempty"`
 	PreflightCommand        string                          `yaml:"preflight_command" json:"preflight_command,omitempty"`
 	CompletionGates         SupervisorCompletionGatesConfig `yaml:"completion_gates" json:"completion_gates,omitempty"`
 	SafeActions             []string                        `yaml:"safe_actions" json:"safe_actions,omitempty"`
@@ -153,6 +161,82 @@ func (h SupervisorHandoffPlannerConfig) EffectiveSourceLabels() []string {
 		return h.SourceIssueLabels
 	}
 	return []string{"epic", "design-handoff"}
+}
+
+// SupervisorReviewRepairConfig governs the auto review-repair respawn
+// (#565). When a green+mergeable PR is settled retry_exhausted on review
+// feedback AND ≥1 Greptile P0/P1 inline comment is still on the current
+// head SHA, the supervisor mints a spawn_review_repair action so a fresh
+// worker scoped to those comments — running on the configured strong
+// backend — can address them. A separate retry budget keeps the main
+// retries-per-issue budget independent.
+//
+// Default is enabled when the SupervisorConfig is otherwise live (review
+// feedback retry exhaustion is the dogfood failure mode this config
+// targets; an explicit nil means "default on").
+type SupervisorReviewRepairConfig struct {
+	// Enabled gates the entire feature. nil = default on so the dogfood
+	// failure mode (#564, #555, #535) is fixed without explicit opt-in.
+	Enabled *bool `yaml:"enabled" json:"enabled,omitempty"`
+	// Backend names the worker backend used for review repair. Empty =
+	// "claude" so the strongest backend addresses the residual P0/P1.
+	Backend string `yaml:"backend" json:"backend,omitempty"`
+	// Model and Effort are forwarded to the backend selection when set.
+	Model  string `yaml:"model" json:"model,omitempty"`
+	Effort string `yaml:"effort" json:"effort,omitempty"`
+	// MaxRetries caps how many review-repair workers can be spawned for a
+	// single (pr_number, head_sha) before falling through to operator
+	// review. Default 1: the head SHA changes after every push, so a
+	// single retry is enough to either land the fix or surface to the
+	// operator. Set 0 to disable spawning entirely.
+	MaxRetries int `yaml:"max_retries" json:"max_retries,omitempty"`
+	// FallThroughToMergeApproval, when true, makes the supervisor emit a
+	// merge_pr decision after the review-repair budget exhausts so the
+	// cautious gate mints an approval and the operator can sign off on
+	// the residual P0/P1. When false (default) the supervisor stays on
+	// monitor_open_pr with an attention stuck state. Either way the PR
+	// never dead-ends silently.
+	FallThroughToMergeApproval *bool `yaml:"fall_through_to_merge_approval" json:"fall_through_to_merge_approval,omitempty"`
+}
+
+// Active reports whether the auto review-repair respawn should fire.
+// Default true — the feature exists to close a hands-off ceiling, and
+// every project that does not want it can flip Enabled to false.
+func (r SupervisorReviewRepairConfig) Active() bool {
+	if r.Enabled == nil {
+		return true
+	}
+	return *r.Enabled
+}
+
+// EffectiveBackend returns the configured backend or "claude" (the
+// default strong backend per the issue's acceptance criteria).
+func (r SupervisorReviewRepairConfig) EffectiveBackend() string {
+	if b := strings.TrimSpace(r.Backend); b != "" {
+		return b
+	}
+	return "claude"
+}
+
+// EffectiveMaxRetries returns the configured retry cap or 1 when unset.
+// MaxRetries==0 is treated literally (disable spawning) — the default is
+// applied at parse time so callers see the operator's intent verbatim.
+func (r SupervisorReviewRepairConfig) EffectiveMaxRetries() int {
+	if r.MaxRetries < 0 {
+		return 0
+	}
+	return r.MaxRetries
+}
+
+// FallThroughMergeEnabled reports whether the supervisor should mint a
+// merge_pr decision (cautious-gate approval) once the review-repair
+// budget exhausts. Default false: the supervisor surfaces the residual
+// findings via stuck states instead.
+func (r SupervisorReviewRepairConfig) FallThroughMergeEnabled() bool {
+	if r.FallThroughToMergeApproval == nil {
+		return false
+	}
+	return *r.FallThroughToMergeApproval
 }
 
 // SupervisorCompletionGatesConfig configures the issue-specific completion
@@ -756,6 +840,7 @@ func parse(data []byte) (*Config, error) {
 			"notify_red",
 			"spawn_worker",
 			"spawn_repair_worker",
+			"spawn_review_repair",
 			"label_issue_ready",
 			"add_ready_label",
 			"open_child_issue",
@@ -767,10 +852,18 @@ func parse(data []byte) (*Config, error) {
 			"review_retry_exhausted",
 			"spawn_worker",
 			"spawn_repair_worker",
+			"spawn_review_repair",
 			"label_issue_ready",
 			"add_ready_label",
 			"open_child_issue",
 		}
+	}
+	// #565 default budget: 1 review-repair attempt per (pr_number, head_sha).
+	// The head SHA changes after every push, so a single repair worker is
+	// enough to either land the fix or surface to operator review. Operators
+	// can override per-project via supervisor.review_repair.max_retries.
+	if cfg.Supervisor.ReviewRepair.MaxRetries == 0 {
+		cfg.Supervisor.ReviewRepair.MaxRetries = 1
 	}
 
 	// Routing defaults
@@ -1094,6 +1187,7 @@ func knownSupervisorActions() map[string]bool {
 		SupervisorActionCloseIssue:         true,
 		SupervisorActionDeleteWorktree:     true,
 		SupervisorActionChangeGlobalConfig: true,
+		SupervisorActionSpawnReviewRepair:  true,
 	}
 }
 
@@ -1107,6 +1201,7 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionCloseIssue,
 		SupervisorActionDeleteWorktree,
 		SupervisorActionChangeGlobalConfig,
+		SupervisorActionSpawnReviewRepair,
 	}
 }
 

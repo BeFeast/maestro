@@ -962,6 +962,43 @@ func (c *Client) PRHasCriticalReviewOnHead(prNumber int) (bool, error) {
 	return hasGreptileCriticalCommentOnHead(comments, sha), nil
 }
 
+// PRHighSeverityReviewOnHead returns the head SHA and the list of P0/P1
+// Greptile inline comments still on that head. Used by the #565
+// auto-review-repair pipeline: the supervisor scopes the repair worker's
+// prompt to exactly these comments (path / line / body) so the worker is
+// not asked to re-implement the whole issue. Returns hasFindings=false
+// when no high-severity comment remains on head (the convergence-merge
+// path takes over) and a non-nil error only when the upstream lookups
+// fail — never use error as a "no findings" signal.
+func (c *Client) PRHighSeverityReviewOnHead(prNumber int) (sha string, findings []ReviewComment, hasFindings bool, err error) {
+	sha, err = c.pullHeadSHA(prNumber)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	comments, err := c.greptileReviewComments(prNumber)
+	if err != nil {
+		return sha, nil, false, fmt.Errorf("greptile review comments for PR %d: %w", prNumber, err)
+	}
+	for _, cm := range comments {
+		if !isGreptileLogin(cm.User.Login) {
+			continue
+		}
+		if !reviewCommentTargetsHead(cm, sha) {
+			continue
+		}
+		if !isHighSeverity(cm.Body) {
+			continue
+		}
+		findings = append(findings, ReviewComment{
+			Path: cm.Path,
+			Line: cm.Line,
+			Body: cm.Body,
+			User: cm.User.Login,
+		})
+	}
+	return sha, findings, len(findings) > 0, nil
+}
+
 func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, error) {
 	out, err := exec.Command("gh", "api",
 		fmt.Sprintf("repos/%s/pulls/%d/comments", c.Repo, prNumber),

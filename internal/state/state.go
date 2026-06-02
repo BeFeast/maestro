@@ -452,8 +452,14 @@ var (
 
 // SupervisorTarget identifies the primary object a supervisor decision refers to.
 type SupervisorTarget struct {
-	Issue   int    `json:"issue,omitempty"`
-	PR      int    `json:"pr,omitempty"`
+	Issue int `json:"issue,omitempty"`
+	PR    int `json:"pr,omitempty"`
+	// HeadSHA stamps the PR head SHA at decision time. Used by the
+	// review-repair pipeline (#565) so a decision is keyed on the exact
+	// head it observed; a new push that moves head invalidates a pending
+	// spawn_review_repair recommendation automatically (dedup hashes
+	// include the target).
+	HeadSHA string `json:"head_sha,omitempty"`
 	Session string `json:"session,omitempty"`
 }
 
@@ -487,6 +493,18 @@ const (
 	// yet cleared. Lets the dashboard render a specific "waiting on checks"
 	// state instead of conflating it with policy or repair gating.
 	StuckPendingChecks = "pending_checks"
+	// StuckReviewRepairSpawned is emitted when the supervisor mints a
+	// spawn_review_repair decision: a green+mergeable+retry_exhausted PR
+	// carries ≥1 Greptile P0/P1 inline comment on its current head SHA
+	// and a scoped repair worker should run. Surfaces as an attention
+	// item so operators see the auto-respawn instead of a silent
+	// monitor_open_pr loop (#565).
+	StuckReviewRepairSpawned = "review_repair_spawned"
+	// StuckReviewRepairExhausted is emitted when the (pr,head_sha) repair
+	// budget is exhausted but Greptile P0/P1 findings remain on head. The
+	// PR is held for operator review with the unresolved comments
+	// surfaced as evidence. NEVER a silent dead-end (#565).
+	StuckReviewRepairExhausted = "review_repair_exhausted"
 )
 
 // SupervisorIssueCandidate describes the issue selected by queue policy without
@@ -636,6 +654,37 @@ type SupervisorDecision struct {
 	ProjectState      SupervisorProjectState   `json:"project_state"`
 	QueueAnalysis     *SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
 	ApprovalID        string                   `json:"approval_id,omitempty"`
+	// ReviewRepair carries the scoped findings and backend choice for a
+	// spawn_review_repair decision (#565). The orchestrator dispatcher
+	// uses this payload to build the worker prompt and pick the strong
+	// backend without re-fetching review comments from GitHub. nil for
+	// every non-review-repair decision.
+	ReviewRepair *SupervisorReviewRepairPayload `json:"review_repair,omitempty"`
+}
+
+// SupervisorReviewRepairPayload carries the auto-review-repair payload
+// on a SupervisorDecision (#565). The orchestrator dispatcher reads it
+// to build the scoped worker prompt and pick the configured strong
+// backend.
+type SupervisorReviewRepairPayload struct {
+	HeadSHA    string                    `json:"head_sha"`
+	Backend    string                    `json:"backend,omitempty"`
+	Model      string                    `json:"model,omitempty"`
+	Effort     string                    `json:"effort,omitempty"`
+	MaxRetries int                       `json:"max_retries,omitempty"`
+	Attempts   int                       `json:"attempts,omitempty"`
+	Findings   []SupervisorReviewFinding `json:"findings,omitempty"`
+}
+
+// SupervisorReviewFinding is one Greptile inline P0/P1 comment scoped
+// onto a spawn_review_repair decision. Carries enough context for the
+// worker prompt to address the comment without re-fetching from GitHub.
+type SupervisorReviewFinding struct {
+	Path     string `json:"path,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Body     string `json:"body,omitempty"`
+	Severity string `json:"severity,omitempty"`
+	User     string `json:"user,omitempty"`
 }
 
 type ApprovalStatus string
@@ -747,8 +796,123 @@ type State struct {
 	SpawnDrain   bool      `json:"spawn_drain,omitempty"`
 	SpawnDrainAt time.Time `json:"spawn_drain_at,omitempty"`
 
+	// ReviewRepairTracks records per-(pr_number,head_sha) idempotency for
+	// the #565 auto review-repair respawn. Each spawn bumps the Attempts
+	// counter; the supervisor refuses to mint a fresh recommendation once
+	// the counter reaches the configured budget. Keyed on
+	// "PR#<n>@<head_sha>" to keep the map JSON-stable; HeadSHA is the
+	// short SHA observed when the decision was recorded.
+	ReviewRepairTracks map[string]ReviewRepairTrack `json:"review_repair_tracks,omitempty"`
+
 	loadedHash  string
 	loadedState *State
+}
+
+// ReviewRepairTrack is one (pr_number, head_sha) idempotency record for
+// the auto review-repair respawn (#565). It carries the count of repair
+// workers spawned for this exact head and the terminal state once the
+// budget is exhausted, so the supervisor neither double-spawns nor loops
+// after the head SHA has been retired.
+type ReviewRepairTrack struct {
+	PRNumber          int       `json:"pr_number"`
+	HeadSHA           string    `json:"head_sha"`
+	IssueNumber       int       `json:"issue_number,omitempty"`
+	Attempts          int       `json:"attempts"`
+	LastDecisionAt    time.Time `json:"last_decision_at,omitempty"`
+	LastApprovalID    string    `json:"last_approval_id,omitempty"`
+	Exhausted         bool      `json:"exhausted,omitempty"`
+	ExhaustedAt       time.Time `json:"exhausted_at,omitempty"`
+	UnresolvedSummary string    `json:"unresolved_summary,omitempty"`
+}
+
+// reviewRepairTrackKey is the JSON-stable key used in ReviewRepairTracks.
+// Empty headSHA falls back to a sentinel so a missing SHA never collapses
+// two distinct heads under the same key.
+func reviewRepairTrackKey(pr int, headSHA string) string {
+	head := strings.TrimSpace(headSHA)
+	if head == "" {
+		head = "unknown"
+	}
+	return fmt.Sprintf("PR#%d@%s", pr, head)
+}
+
+// LookupReviewRepairTrack returns the existing (pr,head_sha) record if
+// any. Callers use this to gate a fresh recommendation (already at
+// budget → fall through to operator) or to bump the attempt counter on
+// dispatch.
+func (s *State) LookupReviewRepairTrack(prNumber int, headSHA string) (ReviewRepairTrack, bool) {
+	if s == nil || prNumber <= 0 {
+		return ReviewRepairTrack{}, false
+	}
+	track, ok := s.ReviewRepairTracks[reviewRepairTrackKey(prNumber, headSHA)]
+	return track, ok
+}
+
+// RecordReviewRepairAttempt increments the attempt counter for the given
+// (pr,head_sha) pair, capping at maxAttempts. Returns (track, spawned)
+// where spawned reports whether this call actually took a slot (false
+// when the budget was already exhausted). When spawned=true, the caller
+// is free to dispatch the worker; when false the caller should leave the
+// PR for operator review.
+func (s *State) RecordReviewRepairAttempt(prNumber int, headSHA string, issueNumber int, approvalID string, maxAttempts int, now time.Time) (ReviewRepairTrack, bool) {
+	if s == nil || prNumber <= 0 {
+		return ReviewRepairTrack{}, false
+	}
+	if s.ReviewRepairTracks == nil {
+		s.ReviewRepairTracks = make(map[string]ReviewRepairTrack)
+	}
+	key := reviewRepairTrackKey(prNumber, headSHA)
+	track := s.ReviewRepairTracks[key]
+	track.PRNumber = prNumber
+	track.HeadSHA = strings.TrimSpace(headSHA)
+	if issueNumber > 0 {
+		track.IssueNumber = issueNumber
+	}
+	if track.Exhausted || (maxAttempts > 0 && track.Attempts >= maxAttempts) {
+		track.Exhausted = true
+		if track.ExhaustedAt.IsZero() {
+			track.ExhaustedAt = normalizedTime(now)
+		}
+		s.ReviewRepairTracks[key] = track
+		return track, false
+	}
+	track.Attempts++
+	track.LastDecisionAt = normalizedTime(now)
+	if strings.TrimSpace(approvalID) != "" {
+		track.LastApprovalID = approvalID
+	}
+	if maxAttempts > 0 && track.Attempts >= maxAttempts {
+		// Budget reached this attempt — leave Exhausted=false so the
+		// dispatched worker can land its fix; the next supervisor cycle
+		// that still sees a P0/P1 on this head will flip Exhausted.
+	}
+	s.ReviewRepairTracks[key] = track
+	return track, true
+}
+
+// MarkReviewRepairExhausted records that a (pr,head_sha) pair has run
+// out of repair attempts and the operator must take over. Idempotent —
+// calling twice does not multiply the timestamp.
+func (s *State) MarkReviewRepairExhausted(prNumber int, headSHA string, summary string, now time.Time) ReviewRepairTrack {
+	if s == nil || prNumber <= 0 {
+		return ReviewRepairTrack{}
+	}
+	if s.ReviewRepairTracks == nil {
+		s.ReviewRepairTracks = make(map[string]ReviewRepairTrack)
+	}
+	key := reviewRepairTrackKey(prNumber, headSHA)
+	track := s.ReviewRepairTracks[key]
+	track.PRNumber = prNumber
+	track.HeadSHA = strings.TrimSpace(headSHA)
+	if !track.Exhausted {
+		track.Exhausted = true
+		track.ExhaustedAt = normalizedTime(now)
+	}
+	if strings.TrimSpace(summary) != "" {
+		track.UnresolvedSummary = summary
+	}
+	s.ReviewRepairTracks[key] = track
+	return track
 }
 
 type ProjectStatusSync struct {
@@ -1509,8 +1673,11 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 }
 
 // approvalTargetsEqual returns true if two SupervisorTarget pointers refer
-// to the same target identity (issue/pr/session). Used by the at-mint
-// dedup check in RecordPendingApprovalForDecision.
+// to the same target identity (issue/pr/head_sha/session). Used by the
+// at-mint dedup check in RecordPendingApprovalForDecision. HeadSHA is
+// part of the identity (#565) so a new head SHA — i.e. the repair worker
+// pushed an update — produces a distinct approval instead of being
+// coalesced as a duplicate of the stale one.
 func approvalTargetsEqual(a, b *SupervisorTarget) bool {
 	if a == nil && b == nil {
 		return true
@@ -1522,6 +1689,9 @@ func approvalTargetsEqual(a, b *SupervisorTarget) bool {
 		return false
 	}
 	if a.PR != b.PR {
+		return false
+	}
+	if strings.TrimSpace(a.HeadSHA) != strings.TrimSpace(b.HeadSHA) {
 		return false
 	}
 	if strings.TrimSpace(a.Session) != strings.TrimSpace(b.Session) {

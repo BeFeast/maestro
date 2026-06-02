@@ -48,8 +48,10 @@ func TestRegistry_IsKnownApprovalAction(t *testing.T) {
 		{"change_global_config", true},
 		{"spawn_worker", true},
 		{"open_child_issue", true},
+		{"spawn_review_repair", true}, // #565: auto review-repair respawn
 
 		// Negative cases — the live-found bugs.
+		{"spawn_repair_repair", false},
 		{"spawn_repair_worker", false}, // dogfood 2026-05-30: minted by LLM, never implemented
 		{"approve_merge", false},       // hypothetical drift
 		{"add_ready_label", false},     // safe action, NOT in approval registry
