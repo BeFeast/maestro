@@ -123,6 +123,29 @@ func TestApprovalAction_CloseIssue_Enqueues202(t *testing.T) {
 	}
 }
 
+func TestApprovalAction_CloseIssueBatch_EnqueuesOneApproval(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	gh := &fakeActionGH{}
+	srv := New(cfg, nil)
+	srv.SetActionDeps(gh, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"close_issue_batch","issues":[{"issue":7,"pr":70},{"issue":8,"pr":80}],"reason":"verified backlog"}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	if len(gh.commentCalls)+len(gh.addLabelCalls)+len(gh.removeLabelCalls) != 0 {
+		t.Fatalf("safe-action GitHub client was touched during approval enqueue")
+	}
+	st := loadStateAt(t, dir)
+	if len(st.Approvals) != 1 {
+		t.Fatalf("approvals = %d, want 1", len(st.Approvals))
+	}
+	got := st.Approvals[0]
+	if got.Action != config.SupervisorActionCloseIssueBatch || got.Target == nil || len(got.Target.Issues) != 2 {
+		t.Fatalf("approval = %+v, want close_issue_batch with two targets", got)
+	}
+}
+
 func TestApprovalAction_DeleteWorktree_Enqueues202(t *testing.T) {
 	cfg, dir := approvalEnqueueCfg(t)
 	srv := New(cfg, nil)

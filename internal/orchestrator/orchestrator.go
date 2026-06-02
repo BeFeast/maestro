@@ -2742,8 +2742,11 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
-	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-	o.closeVerifiedIssueIfAllowed(sess, prNumber)
+	if o.closeVerifiedIssueIfAllowed(sess, prNumber) {
+		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+		return
+	}
+	o.syncProject(sess.IssueNumber, github.ProjectStatusAwaitingClose)
 }
 
 // completionGatesRequireLiveVerification returns true when the supervisor
@@ -2876,20 +2879,20 @@ func (o *Orchestrator) codeLandedPRMerged(sess *state.Session) bool {
 	return merged
 }
 
-func (o *Orchestrator) closeVerifiedIssueIfAllowed(sess *state.Session, prNumber int) {
+func (o *Orchestrator) closeVerifiedIssueIfAllowed(sess *state.Session, prNumber int) bool {
 	if o == nil || o.cfg == nil || sess == nil || sess.IssueNumber <= 0 {
-		return
+		return false
 	}
 	if !o.supervisorActionAllowed(config.SupervisorActionCloseIssue) || o.supervisorActionRequiresApproval(config.SupervisorActionCloseIssue) {
-		return
+		return false
 	}
 	closed, err := o.isIssueClosed(sess.IssueNumber)
 	if err != nil {
 		log.Printf("[orch] verified issue #%d was not auto-closed because issue state could not be checked: %v", sess.IssueNumber, err)
-		return
+		return false
 	}
 	if closed {
-		return
+		return true
 	}
 	comment := "Maestro verified the configured runtime outcome after code landed; closing this issue as done."
 	if prNumber > 0 {
@@ -2900,11 +2903,12 @@ func (o *Orchestrator) closeVerifiedIssueIfAllowed(sess *state.Session, prNumber
 		if o.notifier != nil {
 			o.notifier.Sendf("⚠️ maestro: verified issue #%d is done but auto-close failed: %v", sess.IssueNumber, err)
 		}
-		return
+		return false
 	}
 	if o.notifier != nil {
 		o.notifier.Sendf("✅ maestro: closed verified issue #%d after code_landed outcome pass", sess.IssueNumber)
 	}
+	return true
 }
 
 func (o *Orchestrator) supervisorActionAllowed(action string) bool {

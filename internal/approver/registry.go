@@ -25,6 +25,7 @@ package approver
 var KnownApprovalActions = map[string]struct{}{
 	"merge_pr":             {},
 	"close_issue":          {},
+	"close_issue_batch":    {},
 	"delete_worktree":      {},
 	"change_global_config": {}, // executor returns execution_skipped pending YAML pipeline
 	"spawn_worker":         {}, // executor returns awaiting_dispatch (#515)

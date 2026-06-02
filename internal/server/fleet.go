@@ -482,6 +482,7 @@ type fleetProjectState struct {
 	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
 	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
 	Actions         []controlAction       `json:"actions,omitempty"`
+	CloseCandidates []fleetCloseCandidate `json:"close_candidates,omitempty"`
 	Supervisor      supervisorInfo        `json:"supervisor"`
 	QueueSnapshot   *fleetQueueSnapshot   `json:"queue_snapshot,omitempty"`
 	Freshness       fleetProjectFreshness `json:"freshness"`
@@ -511,6 +512,15 @@ type fleetProjectState struct {
 	// USD windows per backend and per issue (#619). Backends without
 	// pricing configured render in the SPA as tokens only.
 	CostObservability fleetCostObservability `json:"cost_observability"`
+}
+
+type fleetCloseCandidate struct {
+	IssueNumber int    `json:"issue_number"`
+	IssueURL    string `json:"issue_url,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	PRURL       string `json:"pr_url,omitempty"`
+	Session     string `json:"session,omitempty"`
+	FinishedAt  string `json:"finished_at,omitempty"`
 }
 
 // fleetSupervisorPulse describes the supervisor's liveness, cadence and
@@ -788,6 +798,11 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		cfg = project.cfg
 		gh = project.actionGH
 		audit = s.fleetActionAudit(project)
+	}
+	if translateUIActionID(strings.TrimSpace(req.ActionID)) == config.SupervisorActionCloseIssueBatch && len(req.Issues) == 0 && cfg != nil {
+		if st, err := state.Load(cfg.StateDir); err == nil {
+			req.Issues = fleetCloseCandidateTargets(fleetCloseCandidates(fleetProjectState{Name: project.Name, Repo: cfg.Repo}, st))
+		}
 	}
 
 	if res := dispatchSafeAction(req, cfg, gh, audit, authenticatedActor); res.handled {
@@ -1639,6 +1654,8 @@ func fleetNextActionCTAForApproval(approval *fleetApprovalState) string {
 			return fmt.Sprintf("Close issue #%d", approval.IssueNumber)
 		}
 		return "Close issue"
+	case config.SupervisorActionCloseIssueBatch:
+		return "Close verified issues"
 	case "delete_worktree":
 		return "Delete worktree"
 	case "change_global_config":
@@ -2206,6 +2223,10 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
 	item.RestartRequired = st.RestartRequired
 	item.RestartRequiredReason = st.RestartRequiredReason
+	item.CloseCandidates = fleetCloseCandidates(item, st)
+	if len(item.CloseCandidates) > 0 {
+		item.Actions = append(item.Actions, closeIssueBatchControlAction(item.ReadOnly, "/api/v1/fleet/actions", item.Name, item.CloseCandidates))
+	}
 	// #600: normalize stale cooldown entries for display so the BACKENDS
 	// panel matches reality between orchestrator cycles — RetryAfter in
 	// the past, max-cooldown TTL elapsed, or a successful PR-evidence
@@ -2270,6 +2291,79 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	}
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetCloseCandidate {
+	if st == nil {
+		return nil
+	}
+	alreadyClosed := fleetIssuesCoveredByExecutedCloseApproval(st)
+	candidates := make([]fleetCloseCandidate, 0)
+	for slot, sess := range st.Sessions {
+		if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 || sess.Status != state.StatusDone {
+			continue
+		}
+		if alreadyClosed[sess.IssueNumber] {
+			continue
+		}
+		candidates = append(candidates, fleetCloseCandidate{
+			IssueNumber: sess.IssueNumber,
+			IssueURL:    githubIssueURL(project.Repo, sess.IssueNumber),
+			PRNumber:    sess.PRNumber,
+			PRURL:       githubPRURL(project.Repo, sess.PRNumber),
+			Session:     slot,
+			FinishedAt:  formatOptionalFleetTime(sess.FinishedAt),
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].IssueNumber != candidates[j].IssueNumber {
+			return candidates[i].IssueNumber < candidates[j].IssueNumber
+		}
+		return candidates[i].PRNumber < candidates[j].PRNumber
+	})
+	return candidates
+}
+
+func fleetCloseCandidateTargets(candidates []fleetCloseCandidate) []state.SupervisorIssueTarget {
+	if len(candidates) == 0 {
+		return nil
+	}
+	out := make([]state.SupervisorIssueTarget, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.IssueNumber <= 0 {
+			continue
+		}
+		out = append(out, state.SupervisorIssueTarget{Issue: candidate.IssueNumber, PR: candidate.PRNumber})
+	}
+	return out
+}
+
+func fleetIssuesCoveredByExecutedCloseApproval(st *state.State) map[int]bool {
+	covered := make(map[int]bool)
+	if st == nil {
+		return covered
+	}
+	for _, approval := range st.Approvals {
+		if approval.Status != state.ApprovalStatusExecuted {
+			continue
+		}
+		switch approval.Action {
+		case config.SupervisorActionCloseIssue:
+			if approval.Target != nil && approval.Target.Issue > 0 {
+				covered[approval.Target.Issue] = true
+			}
+		case config.SupervisorActionCloseIssueBatch:
+			if approval.Target == nil {
+				continue
+			}
+			for _, target := range approval.Target.Issues {
+				if target.Issue > 0 {
+					covered[target.Issue] = true
+				}
+			}
+		}
+	}
+	return covered
 }
 
 func reconcileStaleSessions(cfg *config.Config, st *state.State, now time.Time) []state.StaleSessionAudit {
@@ -3101,6 +3195,13 @@ func formatFleetTime(t time.Time) string {
 		return ""
 	}
 	return t.Format(time.RFC3339)
+}
+
+func formatOptionalFleetTime(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return formatFleetTime(*t)
 }
 
 // fleetSupervisorPulseRecentLimit caps the number of recommended_action

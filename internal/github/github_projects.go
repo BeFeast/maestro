@@ -19,13 +19,14 @@ const ghTimeout = 30 * time.Second
 type ProjectStatus string
 
 const (
-	ProjectStatusTodo       ProjectStatus = "todo"
-	ProjectStatusInProgress ProjectStatus = "in_progress"
-	ProjectStatusInReview   ProjectStatus = "in_review"
-	ProjectStatusBlocked    ProjectStatus = "blocked"
-	ProjectStatusDeploying  ProjectStatus = "deploying"
-	ProjectStatusLiveVerify ProjectStatus = "live_verification"
-	ProjectStatusDone       ProjectStatus = "done"
+	ProjectStatusTodo          ProjectStatus = "todo"
+	ProjectStatusInProgress    ProjectStatus = "in_progress"
+	ProjectStatusInReview      ProjectStatus = "in_review"
+	ProjectStatusBlocked       ProjectStatus = "blocked"
+	ProjectStatusDeploying     ProjectStatus = "deploying"
+	ProjectStatusLiveVerify    ProjectStatus = "live_verification"
+	ProjectStatusAwaitingClose ProjectStatus = "verified_awaiting_close"
+	ProjectStatusDone          ProjectStatus = "done"
 )
 
 // ProjectStatusCandidates returns the ordered list of column names to try when
@@ -49,6 +50,8 @@ func ProjectStatusCandidates(status ProjectStatus) []string {
 		return []string{"Deploying", "Deploy", "Deployment"}
 	case ProjectStatusLiveVerify:
 		return []string{"Live Verification", "Verification", "Verifying", "QA"}
+	case ProjectStatusAwaitingClose:
+		return []string{"Verified — awaiting close", "Verified - awaiting close", "Awaiting Close", "Ready to Close"}
 	case ProjectStatusDone:
 		return []string{"Done", "Completed", "Closed"}
 	default:

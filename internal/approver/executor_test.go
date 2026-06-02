@@ -361,6 +361,31 @@ func TestExecute_CloseIssue_RequiresTarget(t *testing.T) {
 	}
 }
 
+func TestExecute_CloseIssueBatch_ClosesAllTargetsAfterApproval(t *testing.T) {
+	gh := &fakeGH{}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionCloseIssueBatch, &state.SupervisorTarget{
+		Issues: []state.SupervisorIssueTarget{
+			{Issue: 7, PR: 70},
+			{Issue: 8, PR: 80},
+		},
+	}, "", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("res = %+v, want executed", res)
+	}
+	if len(gh.closeCalls) != 2 {
+		t.Fatalf("closeCalls = %d, want 2: %+v", len(gh.closeCalls), gh.closeCalls)
+	}
+	if gh.closeCalls[0].issue != 7 || !strings.Contains(gh.closeCalls[0].comment, "PR #70") {
+		t.Fatalf("first close call = %+v, want issue #7 comment naming PR #70", gh.closeCalls[0])
+	}
+	if gh.closeCalls[1].issue != 8 || !strings.Contains(gh.closeCalls[1].comment, "PR #80") {
+		t.Fatalf("second close call = %+v, want issue #8 comment naming PR #80", gh.closeCalls[1])
+	}
+}
+
 // --- delete_worktree --------------------------------------------------------
 
 func TestExecute_DeleteWorktree_HappyPath_AnchoredUnderBase(t *testing.T) {

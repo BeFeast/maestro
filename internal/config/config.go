@@ -124,6 +124,7 @@ const (
 	SupervisorActionAddIssueComment    = "add_issue_comment"
 	SupervisorActionMergePR            = "merge_pr"
 	SupervisorActionCloseIssue         = "close_issue"
+	SupervisorActionCloseIssueBatch    = "close_issue_batch"
 	SupervisorActionDeleteWorktree     = "delete_worktree"
 	SupervisorActionChangeGlobalConfig = "change_global_config"
 	// SupervisorActionRestartWorker / SupervisorActionStopWorker are the
@@ -1355,6 +1356,7 @@ func knownSupervisorActions() map[string]bool {
 		SupervisorActionAddIssueComment:    true,
 		SupervisorActionMergePR:            true,
 		SupervisorActionCloseIssue:         true,
+		SupervisorActionCloseIssueBatch:    true,
 		SupervisorActionDeleteWorktree:     true,
 		SupervisorActionChangeGlobalConfig: true,
 		SupervisorActionSpawnReviewRepair:  true,
@@ -1372,6 +1374,7 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionAddIssueComment,
 		SupervisorActionMergePR,
 		SupervisorActionCloseIssue,
+		SupervisorActionCloseIssueBatch,
 		SupervisorActionDeleteWorktree,
 		SupervisorActionChangeGlobalConfig,
 		SupervisorActionSpawnReviewRepair,
