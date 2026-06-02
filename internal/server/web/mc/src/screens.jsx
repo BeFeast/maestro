@@ -6,7 +6,10 @@ import {
   approvalCTA,
   approvalRejectLabel,
   approvalReasonPlaceholder,
+  attributionSegmentDuration,
   fetchWorkerDetail,
+  formatAttributionSegment,
+  formatAttributionTimeline,
   isApprovalActionCloseIssue,
   isApprovalActionMergePR,
   postFleetApproval,
@@ -157,6 +160,7 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
                         )}
                       </div>
                       <div className="dim" style={{ fontSize: 11.5, marginTop: 2 }}>{w.summary}</div>
+                      <AttributionInline worker={w} now={now} />
                     </div>
                     <div style={{ textAlign: "right" }}>
                       <Pill tone={w.tone} noDot>{w.status}</Pill>
@@ -403,6 +407,7 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
                 <div>
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
                   <div className="wt-project">{w.project}</div>
+                  <AttributionInline worker={w} now={now} />
                 </div>
                 <div><Pill tone={w.tone} noDot>{w.status}</Pill></div>
                 <div className="mono" style={{ fontSize: 11, color: "var(--fg-1)" }}>
@@ -429,6 +434,7 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
                 <div>
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
                   <div className="wt-project">{w.project}</div>
+                  <AttributionInline worker={w} now={now} />
                 </div>
                 <div><Pill tone={w.tone} noDot>{w.status}</Pill></div>
                 <div className="mono" style={{ fontSize: 11, color: "var(--fg-1)" }}>
@@ -479,6 +485,68 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
             </div>
           )
         )}
+      </div>
+    </div>
+  );
+}
+
+// AttributionInline renders the short single-line attribution text on a
+// session card: «claude opus-4.8 xhigh (12m) → codex gpt-5.5 medium
+// (4m, fallover)». Renders nothing when the worker has no attribution
+// timeline (older sessions before #518 / backends without metadata).
+export function AttributionInline({ worker, now }) {
+  const attribution = worker?.attribution || [];
+  if (!attribution.length) return null;
+  const text = formatAttributionTimeline(attribution, now);
+  if (!text) return null;
+  return (
+    <div
+      className="mono dim mt-2"
+      style={{ fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+      title={text}
+    >
+      {text}
+    </div>
+  );
+}
+
+// AttributionTimeline renders the full per-segment list for the worker
+// drawer, including the EndReason between segments. Each segment becomes
+// a row with backend/model/duration; closed segments display a small
+// tag like "ended: provider_limit" so the cause of fallover is explicit.
+function AttributionTimeline({ attribution, now }) {
+  const segments = Array.isArray(attribution) ? attribution : [];
+  if (!segments.length) return null;
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Backend timeline</div>
+      <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)" }}>
+        {segments.map((seg, i) => {
+          const summary = formatAttributionSegment(seg, now);
+          const duration = attributionSegmentDuration(seg, now);
+          const open = !seg.ended_at;
+          return (
+            <div key={i} style={{ display: "flex", flexDirection: "column", marginBottom: i < segments.length - 1 ? 8 : 0 }}>
+              <div className="row gap-2" style={{ alignItems: "center" }}>
+                <Pill tone={open ? "info" : "idle"} noDot>{seg.backend || "—"}</Pill>
+                <span className="mono" style={{ fontSize: 12, color: "var(--fg-1)" }}>
+                  {summary || seg.backend || "—"}
+                </span>
+                {duration && <span className="mono dim" style={{ fontSize: 10.5 }}>· {duration}</span>}
+                {open && <span className="mono" style={{ fontSize: 10.5, color: "var(--ok)" }}>· active</span>}
+              </div>
+              <div className="mono dim" style={{ fontSize: 10.5, marginLeft: 4 }}>
+                {seg.reason ? `start: ${seg.reason}` : ""}
+                {seg.ended_at && seg.end_reason ? `${seg.reason ? " · " : ""}end: ${seg.end_reason}` : ""}
+              </div>
+              {i < segments.length - 1 && (
+                <div className="mono dim" style={{ fontSize: 11, marginLeft: 4, marginTop: 4 }}>
+                  ↓ {seg.end_reason || "rolled over"}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -578,6 +646,11 @@ export function WorkerDrawer({ worker, onClose, now }) {
               <div className="mono dim mt-2" style={{ fontSize: 11 }}>{worker.status_reason}</div>
             )}
           </div>
+
+          <AttributionTimeline
+            attribution={detail?.worker?.attribution || worker.attribution}
+            now={now}
+          />
 
           <div className="drawer-sec" ref={logRef}>
             <div className="drawer-sec-title row" style={{ justifyContent: "space-between" }}>

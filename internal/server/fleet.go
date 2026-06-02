@@ -448,6 +448,14 @@ type fleetProjectState struct {
 	// the policy mode (cautious / read_only / …), and the last N
 	// recommended_action verbs for the decision sparkline.
 	SupervisorPulse fleetSupervisorPulse `json:"supervisor_pulse"`
+
+	// BackendHealth is the cross-session per-backend availability snapshot
+	// (#513 / #534). When a backend hits a provider rate-limit it goes to
+	// state "cooldown" with RetryAfter set; the SPA renders this as a
+	// header row («claude in cooldown until 21:00 UTC», «codex available»)
+	// so an operator can see that a whole backend is paused and that
+	// auto-recovery is on a known clock.
+	BackendHealth map[string]state.BackendHealth `json:"backend_health,omitempty"`
 }
 
 // fleetSupervisorPulse describes the supervisor's liveness, cadence and
@@ -495,38 +503,43 @@ type fleetApprovalState struct {
 }
 
 type fleetWorkerState struct {
-	ProjectName       string          `json:"project_name"`
-	ProjectRepo       string          `json:"project_repo,omitempty"`
-	DashboardURL      string          `json:"dashboard_url,omitempty"`
-	Slot              string          `json:"slot"`
-	IssueNumber       int             `json:"issue_number"`
-	IssueTitle        string          `json:"issue_title"`
-	IssueURL          string          `json:"issue_url,omitempty"`
-	Status            string          `json:"status"`
-	DisplayStatus     string          `json:"display_status,omitempty"`
-	StatusReason      string          `json:"status_reason,omitempty"`
-	NextAction        string          `json:"next_action,omitempty"`
-	NeedsAttention    bool            `json:"needs_attention,omitempty"`
-	Live              bool            `json:"live"`
-	Backend           string          `json:"backend,omitempty"`
-	PRNumber          int             `json:"pr_number,omitempty"`
-	PRURL             string          `json:"pr_url,omitempty"`
-	TokensUsedAttempt int             `json:"tokens_used_attempt"`
-	TokensUsedTotal   int             `json:"tokens_used_total"`
-	Runtime           string          `json:"runtime"`
-	RuntimeSeconds    int64           `json:"runtime_seconds"`
-	StartedAt         string          `json:"started_at"`
-	FinishedAt        string          `json:"finished_at,omitempty"`
-	NextRetryAt       string          `json:"next_retry_at,omitempty"`
-	PID               int             `json:"pid,omitempty"`
-	Alive             *bool           `json:"alive,omitempty"`
-	Worktree          string          `json:"worktree,omitempty"`
-	Branch            string          `json:"branch,omitempty"`
-	TmuxSession       string          `json:"tmux_session,omitempty"`
-	HasLog            bool            `json:"has_log"`
-	RetryCount        int             `json:"retry_count,omitempty"`
-	LastNotification  string          `json:"last_notification,omitempty"`
-	Actions           []controlAction `json:"actions,omitempty"`
+	ProjectName       string `json:"project_name"`
+	ProjectRepo       string `json:"project_repo,omitempty"`
+	DashboardURL      string `json:"dashboard_url,omitempty"`
+	Slot              string `json:"slot"`
+	IssueNumber       int    `json:"issue_number"`
+	IssueTitle        string `json:"issue_title"`
+	IssueURL          string `json:"issue_url,omitempty"`
+	Status            string `json:"status"`
+	DisplayStatus     string `json:"display_status,omitempty"`
+	StatusReason      string `json:"status_reason,omitempty"`
+	NextAction        string `json:"next_action,omitempty"`
+	NeedsAttention    bool   `json:"needs_attention,omitempty"`
+	Live              bool   `json:"live"`
+	Backend           string `json:"backend,omitempty"`
+	PRNumber          int    `json:"pr_number,omitempty"`
+	PRURL             string `json:"pr_url,omitempty"`
+	TokensUsedAttempt int    `json:"tokens_used_attempt"`
+	TokensUsedTotal   int    `json:"tokens_used_total"`
+	Runtime           string `json:"runtime"`
+	RuntimeSeconds    int64  `json:"runtime_seconds"`
+	StartedAt         string `json:"started_at"`
+	FinishedAt        string `json:"finished_at,omitempty"`
+	NextRetryAt       string `json:"next_retry_at,omitempty"`
+	PID               int    `json:"pid,omitempty"`
+	Alive             *bool  `json:"alive,omitempty"`
+	Worktree          string `json:"worktree,omitempty"`
+	Branch            string `json:"branch,omitempty"`
+	TmuxSession       string `json:"tmux_session,omitempty"`
+	HasLog            bool   `json:"has_log"`
+	RetryCount        int    `json:"retry_count,omitempty"`
+	LastNotification  string `json:"last_notification,omitempty"`
+	// Attribution is the per-segment backend timeline for this session
+	// (#513 / #534). The SPA renders the active segment inline on the card
+	// and the complete list with EndReason between segments inside the
+	// worker drawer.
+	Attribution []state.BackendAttribution `json:"attribution,omitempty"`
+	Actions     []controlAction            `json:"actions,omitempty"`
 }
 
 type fleetWorkerDetailResponse struct {
@@ -2046,6 +2059,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
 	item.RestartRequired = st.RestartRequired
 	item.RestartRequiredReason = st.RestartRequiredReason
+	item.BackendHealth = st.BackendHealth
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary
 	item.Outcome = projectState.Outcome
@@ -2656,6 +2670,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		HasLog:            worker.HasLog,
 		RetryCount:        worker.RetryCount,
 		LastNotification:  worker.LastNotification,
+		Attribution:       worker.Attribution,
 		Actions:           worker.Actions,
 	}
 }
