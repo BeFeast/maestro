@@ -13,6 +13,8 @@ import {
   formatAttributionTimeline,
   isApprovalActionCloseIssue,
   isApprovalActionMergePR,
+  isExecutionSkippedApproval,
+  manualFollowupForApproval,
   postFleetAction,
   postFleetApproval,
   postProjectApproval,
@@ -915,24 +917,128 @@ export function ApprovalsScreen({ navigate }) {
         </div>
       ) : (
         <div className="appv">
-          {audit.map((a, i) => (
-            <div key={a.id || i} className="app-row stale">
-              <div className="app-row-stage">
-                <small>{approvalSlotLabel(a)}</small>
-                <strong>{actionLabel(a.action)}</strong>
-              </div>
-              <div className="app-row-body">
-                <h4 style={{ color: "var(--fg-2)" }}>{a.title}</h4>
-                <div className="meta">{a.project} · {a.status}</div>
-              </div>
-              <div className="app-row-actions">
-                <span className="age">{a.updated_age || a.created_age || "—"}</span>
-              </div>
-            </div>
-          ))}
+          {audit.map((a, i) => <AuditApprovalRow key={a.id || i} a={a} />)}
           <a onClick={() => setShowAudit(false)} className="mono" style={{ fontSize: 11 }}>collapse</a>
         </div>
       )}
+    </div>
+  );
+}
+
+// AuditApprovalRow renders one row of the historical-approval list. Approved
+// and rejected entries render dimmed; `execution_skipped` entries break out of
+// that pattern (premortem #8): the executor returned a non-failure status but
+// no side effect ran, so showing it as a dim "executed" row misleads the
+// operator into thinking the change took effect. Instead we surface an amber
+// warning row with the executor summary inline and, for change_global_config,
+// a non-dismissible follow-up command the operator still has to run.
+function AuditApprovalRow({ a }) {
+  const skipped = isExecutionSkippedApproval(a);
+  const followup = manualFollowupForApproval(a);
+  const summary = a.summary || a.body || "";
+  const rowClass = skipped ? "app-row skipped" : "app-row stale";
+  const statusLabel = skipped ? "execution skipped · no side effect ran" : a.status;
+  const stageLabel = skipped ? "skipped" : a.stage;
+  return (
+    <div className={rowClass}>
+      <div className="app-row-stage">
+        <small>{approvalSlotLabel(a)}</small>
+        <strong>{actionLabel(a.action)}</strong>
+      </div>
+      <div className="app-row-body">
+        <h4 style={skipped ? undefined : { color: "var(--fg-2)" }}>
+          {skipped && <SkippedIcon />} {a.title}
+        </h4>
+        <div className="meta">
+          <span>{a.project}</span>
+          <span>· {stageLabel}</span>
+          {skipped
+            ? <Pill tone="watch" noDot>{statusLabel}</Pill>
+            : <span>· {statusLabel}</span>}
+        </div>
+        {skipped && summary && summary !== a.title && (
+          <p className="app-row-skipped-summary">{summary}</p>
+        )}
+        {followup && <ManualFollowupBanner followup={followup} />}
+      </div>
+      <div className="app-row-actions">
+        <span className="age">{a.updated_age || a.created_age || "—"}</span>
+      </div>
+    </div>
+  );
+}
+
+// SkippedIcon is the distinct glyph used on `execution_skipped` audit rows.
+// A triangle-with-bang reads as "warning, not done" without colliding with
+// the green check used for completed approvals.
+function SkippedIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ verticalAlign: "-2px", color: "var(--watch)" }}
+    >
+      <path d="M8 1.5L15 13.5H1L8 1.5Z" />
+      <path d="M8 6V9.5" />
+      <circle cx="8" cy="11.6" r="0.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+// ManualFollowupBanner renders the non-dismissible callout shown inside an
+// execution_skipped audit row when the verb still needs an operator command
+// (today: change_global_config). The command is a one-line copy-friendly
+// shell snippet so the operator can paste it into a terminal without
+// constructing the path/unit name by hand.
+function ManualFollowupBanner({ followup }) {
+  const [copied, setCopied] = React.useState(false);
+  const onCopy = React.useCallback(async () => {
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(followup.command);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = followup.command;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (_) {
+      // Clipboard rejection (e.g. permission denied) is non-fatal; the
+      // command is still selectable from the mono text node.
+    }
+  }, [followup.command]);
+  return (
+    <div className="app-row-followup" role="note" aria-label={followup.headline}>
+      <div className="app-row-followup-head">
+        <SkippedIcon />
+        <strong>{followup.headline}</strong>
+      </div>
+      <div className="app-row-followup-detail">{followup.detail}</div>
+      <div className="app-row-followup-cmd">
+        <code className="mono">{followup.command}</code>
+        <button
+          type="button"
+          className="tb-btn"
+          style={{ fontSize: 11 }}
+          onClick={onCopy}
+          title={copied ? "Copied" : "Copy command"}
+        >
+          {copied ? "Copied ✓" : "Copy"}
+        </button>
+      </div>
     </div>
   );
 }
