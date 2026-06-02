@@ -26,15 +26,25 @@ export function SidebarV2({ route, navigate, projectStates, fleet }) {
   const screen = route.screen;
   const projects = fleet?.projects || [];
 
+  // Brand mark = real `<a href="/">` so right-click "open in new tab" and
+  // middle-click work; regular clicks fall through to SPA navigate() so we
+  // don't lose the in-memory fleet state. The conventional contract is
+  // "brand mark → home / overview" (issue #537, gap 13).
+  const onBrandClick = (e) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    navigate("fleet");
+  };
+
   return (
     <aside className="sb">
-      <div className="sb-brand">
+      <a href="/" className="sb-brand" onClick={onBrandClick} aria-label="Maestro mission control — home">
         <BrandMark />
         <div>
           <div className="sb-brand-name">Maestro</div>
           <div className="sb-brand-sub">mission control · v1.4</div>
         </div>
-      </div>
+      </a>
 
       <div className="sb-search" onClick={() => navigate("cmdk")}>
         <Icon.Search s={12} />

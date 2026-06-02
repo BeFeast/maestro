@@ -6,6 +6,7 @@ import {
   approvalCTA,
   approvalRejectLabel,
   approvalReasonPlaceholder,
+  approvalSlotLabel,
   attributionSegmentDuration,
   fetchWorkerDetail,
   formatAttributionSegment,
@@ -863,7 +864,7 @@ export function ApprovalsScreen({ navigate }) {
           {audit.map((a, i) => (
             <div key={a.id || i} className="app-row stale">
               <div className="app-row-stage">
-                <small>#{a.pr || "—"}</small>
+                <small>{approvalSlotLabel(a)}</small>
                 <strong>{actionLabel(a.action)}</strong>
               </div>
               <div className="app-row-body">
@@ -930,7 +931,7 @@ function ApprovalRow({ a }) {
   return (
     <div className={`app-row ${a.state}`}>
       <div className="app-row-stage">
-        <strong>#{a.pr || a.issue_number || "—"}</strong>
+        <strong>{approvalSlotLabel(a)}</strong>
         <small>{a.stage}</small>
       </div>
       <div className="app-row-body">

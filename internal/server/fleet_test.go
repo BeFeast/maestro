@@ -2221,6 +2221,52 @@ func TestMissionControlCommandPaletteSearchesFleetData(t *testing.T) {
 	}
 }
 
+// TestMissionControlBrandMarkLinksHome pins the sidebar brand mark to its
+// "brand mark → home / overview" contract (issue #537 / gap 13). Before
+// the fix the «Maestro / mission control · v1.4» block had hover affordance
+// but no navigation — a dead click. The bundle must now ship a real
+// <a href="/"> wrapping the brand block AND keep the SPA pushState path
+// active so a regular click does not full-page-reload the fleet snapshot.
+func TestMissionControlBrandMarkLinksHome(t *testing.T) {
+	body := mcBundleJS(t)
+	for _, want := range []string{
+		// Real anchor with href="/" and the sb-brand class — right-click
+		// "open in new tab" / middle-click must work; bare div onClick
+		// would silently strip that affordance.
+		`href:"/"`,
+		`className:"sb-brand"`,
+		// aria-label survives minification verbatim — pins the
+		// accessibility contract for the brand mark as a home link.
+		`"aria-label":"Maestro mission control — home"`,
+	} {
+		if !contains(body, want) {
+			t.Fatalf("mission control brand mark anchor should contain %q", want)
+		}
+	}
+}
+
+// TestMissionControlApprovalSlotShowsActionVerb pins the approval-card
+// slot column to its «show action verb when target.session is empty»
+// contract (issue #537 / gap 6). spawn_worker / label_issue_ready /
+// add_issue_comment are minted before a worker slot exists; the legacy
+// fallback rendered "#—" which read as a missing value. The bundle must
+// now ship the helper that returns the action verb in that case.
+func TestMissionControlApprovalSlotShowsActionVerb(t *testing.T) {
+	body := mcBundleJS(t)
+	// Action-verb literals the helper falls back to when no concrete
+	// numeric target is present. These three actions are the ones called
+	// out in the issue (target.session always empty by construction).
+	for _, want := range []string{
+		`"Starting worker"`,
+		`"Mark issue ready"`,
+		`"Comment on issue"`,
+	} {
+		if !contains(body, want) {
+			t.Fatalf("mission control bundle should contain action-verb label %q for empty-session approvals", want)
+		}
+	}
+}
+
 func TestFleetDashboardSearchIndexUsesLoadedFleetData(t *testing.T) {
 	body := legacyFleetJS(t)
 	indexSnippet := dashboardSnippet(t, body, "function buildFleetSearchIndex()", "function fuzzySearchMatch")

@@ -173,7 +173,12 @@ input, textarea { font: inherit; color: inherit; }
   display: flex; align-items: center; gap: var(--s-2);
   padding: var(--s-3) var(--s-4);
   margin-bottom: var(--s-3);
+  color: inherit; text-decoration: none;
+  cursor: pointer;
+  border-radius: var(--r-2);
 }
+.sb-brand:hover { background: var(--bg-2); }
+.sb-brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .sb-brand-mark {
   width: 30px; height: 30px;
   border-radius: var(--r-2);

@@ -873,9 +873,35 @@ export function actionLabel(action) {
   case "skip_wave": return "Skipped tick";
   case "spawn_worker": return "Starting worker";
   case "label_issue_ready": return "Mark issue ready";
+  case "add_issue_comment": return "Comment on issue";
   default:
     return String(action || "-").replace(/_/g, " ");
   }
+}
+
+// approvalSlotLabel renders the leftmost "slot" column on an approval card.
+// The column conceptually holds the *worker slot* (session id like "01")
+// when the approval is tied to a running worker — merge_pr, close_issue,
+// delete_worktree, etc. For approvals minted BEFORE a worker is allocated
+// (spawn_worker, label_issue_ready, add_issue_comment), target.session is
+// empty; the legacy fallback rendered "#—" which reads as a missing
+// value instead of "this is the action, not a session". Issue #537 / gap 6:
+// show the action verb in that case so the column conveys *what* the
+// approval will do.
+//
+// Priority: PR # → issue # → action verb. Session id is the conceptual
+// identity but the existing UI shows PR/issue numbers operators are used
+// to scanning, so those win when present; the action-verb fallback only
+// fires when neither a PR, an issue, nor a session is bound.
+export function approvalSlotLabel(approval) {
+  const a = approval || {};
+  const pr = Number(a.pr || a.pr_number || 0);
+  if (pr > 0) return `#${pr}`;
+  const issue = Number(a.issue_number || 0);
+  if (issue > 0) return `#${issue}`;
+  const session = typeof a.session === "string" ? a.session.trim() : "";
+  if (session !== "") return session;
+  return actionLabel(a.action);
 }
 
 // approvalCTA returns the primary-button label for an approval card. The

@@ -4,6 +4,7 @@ import { useFleet } from "./fleetContext.jsx";
 import { parseTimestamp, relTime } from "./utils.js";
 import {
   actionLabel,
+  approvalSlotLabel,
   backendHealthTone,
   formatAbsoluteTimestamp,
   formatBackendHealthSentence,
@@ -290,7 +291,7 @@ function ApprovalsPreview() {
     <div style={{ padding: "var(--s-2)" }}>
       {apps.slice(0, 3).map((a, i) => (
         <div key={a.id || i} className="dec" style={{ gridTemplateColumns: "60px 1fr auto" }}>
-          <div className="dec-t mono">#{a.pr || "—"}</div>
+          <div className="dec-t mono">{approvalSlotLabel(a)}</div>
           <div className="dec-body">
             <div style={{ color: "var(--fg-0)", fontSize: 12.5 }}>{a.title}</div>
             <div className="mono dim" style={{ fontSize: 10.5, marginTop: 2 }}>{a.project} · {a.stage}</div>
