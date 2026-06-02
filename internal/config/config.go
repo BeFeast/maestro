@@ -1129,7 +1129,57 @@ func (c *Config) Warnings() []string {
 	if msg := c.handsOffMergeApprovalWarning(); msg != "" {
 		warnings = append(warnings, msg)
 	}
+	if msg := c.manualRoutingLabelPinWarning(); msg != "" {
+		warnings = append(warnings, msg)
+	}
 	return warnings
+}
+
+// manualRoutingLabelPinWarning surfaces the #427 misconfiguration where the
+// project advertises multiple backends but uses no routing mechanism that
+// reacts to issue content. In that shape, every dispatched issue picks its
+// backend from a model:* label (or falls through to model.default) — which is
+// label-pinning, not task-based routing. Operators reading the docs may
+// believe Maestro is matching tasks to backends when it is not.
+//
+// The warning fires only when ALL three are true:
+//   - 2+ backends are configured (single-backend setups have nothing to route)
+//   - routing.mode is empty or "manual" (auto-routing would be the task lever)
+//   - no role-specific backends are set (planner/implementer/validator overrides
+//     would be a legitimate role-based shape even without auto)
+//
+// This keeps the warning silent for the common single-backend project, for
+// projects that opted into auto-routing, and for projects that purposefully
+// pin per-role backends. It fires loudly for the failure mode in #427.
+func (c *Config) manualRoutingLabelPinWarning() string {
+	if c == nil {
+		return ""
+	}
+	if len(c.Model.Backends) < 2 {
+		return ""
+	}
+	mode := strings.ToLower(strings.TrimSpace(c.Routing.Mode))
+	if mode == "auto" {
+		return ""
+	}
+	if strings.TrimSpace(c.Routing.PlannerBackend) != "" ||
+		strings.TrimSpace(c.Routing.ImplementationBackend) != "" ||
+		strings.TrimSpace(c.Routing.ValidatorBackend) != "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"config: %d backends are configured but routing.mode is %q and no planner/implementation/validator_backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: auto for task-based routing or per-role backends for role-based routing.",
+		len(c.Model.Backends),
+		coalesceRoutingMode(c.Routing.Mode),
+	)
+}
+
+func coalesceRoutingMode(mode string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(mode))
+	if trimmed == "" {
+		return "manual"
+	}
+	return trimmed
 }
 
 func (c *Config) handsOffMergeApprovalWarning() string {

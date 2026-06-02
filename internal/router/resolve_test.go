@@ -143,8 +143,8 @@ func TestResolveBackend_LabelOverride_UnknownBackend(t *testing.T) {
 	if name != "claude" {
 		t.Errorf("ResolveBackend() name = %q, want %q (should fall back to default)", name, "claude")
 	}
-	if reason != "unknown label backend" {
-		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "unknown label backend")
+	if reason != ReasonUnknownPin {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, ReasonUnknownPin)
 	}
 }
 
@@ -289,8 +289,8 @@ func TestResolveBackend_AutoRoutingViaRouteFn(t *testing.T) {
 	if name != "codex" {
 		t.Errorf("ResolveBackend() name = %q, want %q", name, "codex")
 	}
-	if reason != "simple fix" {
-		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "simple fix")
+	if reason != ReasonAuto {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, ReasonAuto)
 	}
 }
 
@@ -662,8 +662,8 @@ func TestResolveBackendForRole_WithAutoRouting(t *testing.T) {
 	if name != "codex" {
 		t.Errorf("ResolveBackendForRole(planner) name = %q, want %q (should fall through to auto-routing)", name, "codex")
 	}
-	if reason != "auto-routed" {
-		t.Errorf("ResolveBackendForRole(planner) reason = %q, want %q", reason, "auto-routed")
+	if reason != ReasonAuto {
+		t.Errorf("ResolveBackendForRole(planner) reason = %q, want %q", reason, ReasonAuto)
 	}
 }
 
@@ -702,7 +702,7 @@ func TestResolveBackendForRole_RoleBackendOverridesAutoRouting(t *testing.T) {
 	}
 }
 
-func TestResolveBackend_AutoRoutingErrorFallsToDefault(t *testing.T) {
+func TestResolveBackend_AutoRoutingErrorFallsToDefaultWithRouterErrorReason(t *testing.T) {
 	cfg := &config.Config{
 		Model: config.ModelConfig{
 			Default: "claude",
@@ -718,12 +718,78 @@ func TestResolveBackend_AutoRoutingErrorFallsToDefault(t *testing.T) {
 		return "", "", fmt.Errorf("network error")
 	}
 
+	// #427: when routing.mode=auto is configured but the router call fails,
+	// the fallback to the default backend must surface a router_error reason
+	// (not the bare "default" used in manual mode) so operators can see that
+	// auto-routing failed silently rather than being unconfigured.
 	issue := makeIssue(48, "Fix bug")
 	name, reason := r.ResolveBackend(issue)
 	if name != "claude" {
 		t.Errorf("ResolveBackend() name = %q, want %q (should fall back to default)", name, "claude")
 	}
-	if reason != "default" {
-		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "default")
+	if reason != ReasonRouterError {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, ReasonRouterError)
+	}
+}
+
+// #427: command strings with arguments must reach the router CLI through
+// splitRouterCmd, and a router that picks an unknown backend must surface
+// router_error so the dashboard does not present the default as auto-routed.
+func TestRoute_UnknownBackendFromCommandReturnsRouterError(t *testing.T) {
+	dir := t.TempDir()
+	cliPath := filepath.Join(dir, "router-cli")
+	// The fake CLI accepts any --foo arg and prints a backend that isn't in config.
+	script := "#!/bin/sh\nprintf '{\"backend\":\"nonexistent\",\"reason\":\"pick\"}'\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake router cli: %v", err)
+	}
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: cliPath + " --temperature 0"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode:        "auto",
+			RouterModel: "claude",
+		},
+	}
+
+	r := New(cfg)
+	name, reason := r.ResolveBackend(github.Issue{Number: 99, Title: "Anything"})
+	if name != "claude" {
+		t.Fatalf("ResolveBackend() name = %q, want claude (default fallback)", name)
+	}
+	if reason != ReasonRouterError {
+		t.Fatalf("ResolveBackend() reason = %q, want %q (silent unknown-backend fallback must surface router_error)", reason, ReasonRouterError)
+	}
+}
+
+// #427: an auto-routed call that returns an empty backend without error is
+// still a silent fallback — operators need the router_error signal too.
+func TestResolveBackend_AutoRoutingEmptyBackendUsesRouterErrorReason(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "auto"},
+	}
+	r := New(cfg)
+	r.RouteFn = func(issue github.Issue) (string, string, error) {
+		return "", "", nil
+	}
+
+	name, reason := r.ResolveBackend(makeIssue(49, "Empty route"))
+	if name != "claude" {
+		t.Errorf("ResolveBackend() name = %q, want %q", name, "claude")
+	}
+	if reason != ReasonRouterError {
+		t.Errorf("ResolveBackend() reason = %q, want %q", reason, ReasonRouterError)
 	}
 }

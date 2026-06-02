@@ -521,24 +521,28 @@ type fleetApprovalState struct {
 }
 
 type fleetWorkerState struct {
-	ProjectName       string `json:"project_name"`
-	ProjectRepo       string `json:"project_repo,omitempty"`
-	DashboardURL      string `json:"dashboard_url,omitempty"`
-	Slot              string `json:"slot"`
-	IssueNumber       int    `json:"issue_number"`
-	IssueTitle        string `json:"issue_title"`
-	IssueURL          string `json:"issue_url,omitempty"`
-	Status            string `json:"status"`
-	DisplayStatus     string `json:"display_status,omitempty"`
-	StatusReason      string `json:"status_reason,omitempty"`
-	NextAction        string `json:"next_action,omitempty"`
-	NeedsAttention    bool   `json:"needs_attention,omitempty"`
-	Live              bool   `json:"live"`
-	Backend           string `json:"backend,omitempty"`
-	PRNumber          int    `json:"pr_number,omitempty"`
-	PRURL             string `json:"pr_url,omitempty"`
-	TokensUsedAttempt int    `json:"tokens_used_attempt"`
-	TokensUsedTotal   int    `json:"tokens_used_total"`
+	ProjectName    string `json:"project_name"`
+	ProjectRepo    string `json:"project_repo,omitempty"`
+	DashboardURL   string `json:"dashboard_url,omitempty"`
+	Slot           string `json:"slot"`
+	IssueNumber    int    `json:"issue_number"`
+	IssueTitle     string `json:"issue_title"`
+	IssueURL       string `json:"issue_url,omitempty"`
+	Status         string `json:"status"`
+	DisplayStatus  string `json:"display_status,omitempty"`
+	StatusReason   string `json:"status_reason,omitempty"`
+	NextAction     string `json:"next_action,omitempty"`
+	NeedsAttention bool   `json:"needs_attention,omitempty"`
+	Live           bool   `json:"live"`
+	Backend        string `json:"backend,omitempty"`
+	// BackendSelection records why this backend was chosen (label, role, auto,
+	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
+	// so operators can tell task-based routing from label-pinned defaults. (#427)
+	BackendSelection  *state.BackendSelection `json:"backend_selection,omitempty"`
+	PRNumber          int                     `json:"pr_number,omitempty"`
+	PRURL             string                  `json:"pr_url,omitempty"`
+	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
+	TokensUsedTotal   int                     `json:"tokens_used_total"`
 	// Runtime / RuntimeSeconds (legacy fields, kept for backwards
 	// compatibility) reflect workflow elapsed time and include PR-open /
 	// CI / Greptile / merge waiting. See #426 — WorkerRuntimeSeconds is
@@ -2687,6 +2691,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		NeedsAttention:         worker.NeedsAttention,
 		Live:                   worker.Live,
 		Backend:                worker.Backend,
+		BackendSelection:       worker.BackendSelection,
 		PRNumber:               worker.PRNumber,
 		PRURL:                  worker.PRURL,
 		TokensUsedAttempt:      worker.TokensUsedAttempt,
