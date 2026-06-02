@@ -1,5 +1,5 @@
 import React from "react";
-import { Icon, Panel, Pill, QueueBar, Segmented, ConfirmDialog } from "./atoms.jsx";
+import { Icon, Panel, PathValue, Pill, QueueBar, Segmented, ConfirmDialog, UrlValue } from "./atoms.jsx";
 import { useFleet } from "./fleetContext.jsx";
 import {
   actionLabel,
@@ -184,7 +184,13 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
             {p.goal ? (
               <>
                 <div className="kv"><span>Health</span><strong style={{ color: p.outcome?.health_state === "healthy" ? "var(--ok)" : "var(--watch)" }}>{p.outcome?.health_state || "unknown"}</strong></div>
-                <div className="kv"><span>Runtime</span><span className="mono">{p.outcome?.runtime_target || p.runtime || "—"}</span></div>
+                <div className="kv"><span>Runtime</span><UrlValue url={p.outcome?.runtime_target || p.runtime || ""} /></div>
+                {p.outcome?.healthcheck_url && (
+                  <div className="kv"><span>Healthcheck</span><UrlValue url={p.outcome.healthcheck_url} /></div>
+                )}
+                {p.dashboardUrl && (
+                  <div className="kv"><span>Dashboard</span><UrlValue url={p.dashboardUrl} /></div>
+                )}
                 <div className="kv"><span>Last check</span><span className="mono">{p.outcome?.health_checked_at ? relTime(parseTimestamp(p.outcome.health_checked_at), now) : "—"}</span></div>
                 <div className="kv"><span>Sessions</span><strong className="mono">{p.sessions}</strong></div>
               </>
@@ -624,11 +630,20 @@ export function WorkerDrawer({ worker, onClose, now }) {
           <div className="drawer-sec">
             <div className="drawer-sec-title">Issue</div>
             {worker.issue_url ? (
-              <a href={worker.issue_url} target="_blank" rel="noreferrer" style={{ fontSize: 14, fontWeight: 600 }}>#{worker.issue.num} {worker.issue.title}</a>
+              <UrlValue
+                url={worker.issue_url}
+                label={`#${worker.issue.num} ${worker.issue.title}`}
+                monospace={false}
+                scopeBadge={false}
+                className="drawer-issue-link"
+              />
             ) : (
               <span style={{ fontSize: 14, fontWeight: 600 }}>#{worker.issue.num} {worker.issue.title}</span>
             )}
             <div className="mono dim mt-2" style={{ fontSize: 11 }}>{worker.project} · {worker.branch || "—"}</div>
+            {worker.worktree && (
+              <div className="kv mt-2"><span>Worktree</span><PathValue path={worker.worktree} /></div>
+            )}
           </div>
 
           <div className="drawer-sec">

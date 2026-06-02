@@ -1,5 +1,5 @@
 import React from "react";
-import { ecgPath } from "./utils.js";
+import { classifyURLScope, ecgPath, isHTTPURL } from "./utils.js";
 
 export const Icon = {
   Fleet: () => (<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round"><path d="M1.5 3.5H4L5 2L6.5 5L8 3.5H14.5" /><path d="M1.5 8H5L6 6.5L7.5 9.5L9 8H14.5" /><path d="M1.5 12.5H6L7 11L8.5 13.5L10 12.5H14.5" /></svg>),
@@ -132,6 +132,81 @@ export function QueueBar({ ready = 0, held = 0, blocked = 0, height = 6 }) {
       {held > 0 && <span style={{ flex: held / total, background: "var(--policy)" }} title={`${held} held`} />}
       {blocked > 0 && <span style={{ flex: blocked / total, background: "var(--stuck)" }} title={`${blocked} blocked`} />}
     </div>
+  );
+}
+
+// UrlValue renders a URL value as a real `<a target="_blank">` plus a small
+// `lan` / `public` scope badge (#536). Non-URL strings degrade to plain text.
+export function UrlValue({ url, label, placeholder = "—", scopeBadge = true, monospace = true, className }) {
+  const trimmed = String(url || "").trim();
+  if (!trimmed) {
+    return <span className={`${monospace ? "mono " : ""}dim ${className || ""}`.trim()}>{placeholder}</span>;
+  }
+  if (!isHTTPURL(trimmed)) {
+    return <span className={`${monospace ? "mono " : ""}${className || ""}`.trim()}>{label || trimmed}</span>;
+  }
+  const scope = scopeBadge ? classifyURLScope(trimmed) : "";
+  return (
+    <span className={`url-value ${className || ""}`.trim()}>
+      <a
+        className={monospace ? "mono" : undefined}
+        href={trimmed}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {label || trimmed}
+      </a>
+      {scope && <UrlScopeBadge scope={scope} />}
+    </span>
+  );
+}
+
+export function UrlScopeBadge({ scope }) {
+  if (!scope) return null;
+  const tone = scope === "lan" ? "lan" : "public";
+  const title = scope === "lan"
+    ? "Private / LAN-only URL — won't resolve off-network."
+    : "Public URL — reachable from anywhere.";
+  return <span className={`url-badge ${tone}`} title={title}>{scope}</span>;
+}
+
+// PathValue renders a filesystem path with a one-click copy button (#536).
+export function PathValue({ path, placeholder = "—", copy = true, className }) {
+  const value = String(path || "").trim();
+  const [copied, setCopied] = React.useState(false);
+  const onCopy = React.useCallback(async () => {
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = value;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch (_) {
+      // Clipboard rejection (e.g. permission denied) is non-fatal; the path
+      // is still selectable via the mono text node.
+    }
+  }, [value]);
+  if (!value) {
+    return <span className={`mono dim ${className || ""}`.trim()}>{placeholder}</span>;
+  }
+  return (
+    <span className={`path-value ${className || ""}`.trim()}>
+      <span className="mono">{value}</span>
+      {copy && (
+        <button type="button" className="path-copy" onClick={onCopy} title={copied ? "Copied" : "Copy path"} aria-label={copied ? "Path copied" : "Copy path"}>
+          {copied ? "✓" : "⧉"}
+        </button>
+      )}
+    </span>
   );
 }
 
