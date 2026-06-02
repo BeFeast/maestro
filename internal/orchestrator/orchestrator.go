@@ -2120,6 +2120,19 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		pr, found := mergeFlowPRForSession(sess, branchToPR, numberToPR)
 		if !found {
 			if sess.Status == state.StatusRetryExhausted {
+				if sess.PRNumber == 0 {
+					// #577: worker exhausted retries without ever producing a PR
+					// (e.g. the issue was already implemented by a prior merge via
+					// `Refs #N`, so the worker found zero diff). Without action the
+					// orchestrator would log "waiting for reconciliation" forever
+					// and the dynamic-wave queue would halt at max_parallel=1.
+					// Reconcile once: either close the issue (when a merged PR
+					// already closes it and auto-close is allowed) or label it
+					// blocked so the supervisor's dynamic-wave drops it and picks
+					// the next eligible candidate.
+					o.reconcileNoPRRetryExhausted(slotName, sess)
+					continue
+				}
 				log.Printf("[orch] retry_exhausted session %s records PR #%d, but no open PR was found — waiting for reconciliation", slotName, sess.PRNumber)
 				continue
 			}
@@ -2311,6 +2324,91 @@ func mergeFlowPRForSession(sess *state.Session, byBranch map[string]github.PR, b
 		}
 	}
 	return github.PR{}, false
+}
+
+// noPRReconciledStatus marks a retry_exhausted session whose worker never
+// produced a PR as having been reconciled by autoMergePRs. The marker keeps
+// the reconciliation idempotent so subsequent cycles do not re-label, re-close,
+// or re-notify, and so the "waiting for reconciliation" log stops firing.
+const noPRReconciledStatus = "no_pr_reconciled"
+
+// reconcileNoPRRetryExhausted handles the #577 deadlock: a worker exhausted
+// retries without opening a PR (often because the issue was already
+// implemented by a prior merge via `Refs #N`), so the merge flow has nothing
+// to advance, the session is terminal, and at max_parallel=1 the dynamic-wave
+// queue halts. This helper runs once per session: it auto-closes the issue
+// when a merged PR already closes it (and close_issue is a configured safe
+// action), otherwise it adds the configured blocked label so the supervisor
+// drops the issue from the wave and selects the next eligible candidate.
+func (o *Orchestrator) reconcileNoPRRetryExhausted(slotName string, sess *state.Session) {
+	if sess == nil || sess.IssueNumber <= 0 {
+		return
+	}
+	if sess.LastNotifiedStatus == noPRReconciledStatus {
+		// Already reconciled — suppress duplicate side-effects and the
+		// "waiting for reconciliation" log spam.
+		return
+	}
+
+	merged, err := o.hasMergedPRForIssue(sess.IssueNumber)
+	if err != nil {
+		// Don't mark reconciled on transient GitHub failure; try again next
+		// cycle. Log so operators can correlate with API errors.
+		log.Printf("[orch] no-PR retry_exhausted: could not check merged PR for issue #%d (slot %s): %v", sess.IssueNumber, slotName, err)
+		return
+	}
+
+	if merged {
+		// The work was already landed by another PR (closing-keyword link).
+		// Auto-close when the operator has granted close_issue as a safe
+		// action without an approval gate; otherwise surface it as a
+		// close-candidate via notification.
+		comment := fmt.Sprintf("Maestro: closing this issue because worker session %s exhausted retries without producing a PR (the work appears to be implemented by an already-merged PR).", slotName)
+		if o.supervisorActionAllowed(config.SupervisorActionCloseIssue) && !o.supervisorActionRequiresApproval(config.SupervisorActionCloseIssue) {
+			if cerr := o.closeIssue(sess.IssueNumber, comment); cerr != nil {
+				log.Printf("[orch] no-PR retry_exhausted: auto-close failed for issue #%d (slot %s): %v", sess.IssueNumber, slotName, cerr)
+				if o.notifier != nil {
+					o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted with no PR (work appears merged); auto-close failed: %v", sess.IssueNumber, cerr)
+				}
+				return
+			}
+			log.Printf("[orch] no-PR retry_exhausted: auto-closed issue #%d (slot %s) — merged PR already implements it", sess.IssueNumber, slotName)
+			if o.notifier != nil {
+				o.notifier.Sendf("✅ maestro: closed issue #%d after retry_exhausted with no PR (already implemented by a merged PR)", sess.IssueNumber)
+			}
+			o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+		} else {
+			log.Printf("[orch] no-PR retry_exhausted: issue #%d (slot %s) has a merged PR — surfaced as operator close-candidate", sess.IssueNumber, slotName)
+			if o.notifier != nil {
+				o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted with no PR; a merged PR already implements it — operator close-candidate", sess.IssueNumber)
+			}
+		}
+	} else {
+		// No merged PR detected — apply the configured blocked label so the
+		// supervisor's dynamic-wave skips this issue on the next cycle and
+		// the run-loop advances to the next eligible candidate.
+		if blockedLabel := strings.TrimSpace(o.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
+			if lerr := o.addIssueLabel(sess.IssueNumber, blockedLabel); lerr != nil {
+				log.Printf("[orch] no-PR retry_exhausted: could not add %q label to issue #%d (slot %s): %v", blockedLabel, sess.IssueNumber, slotName, lerr)
+				if o.notifier != nil {
+					o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted with no PR; could not apply %q label: %v", sess.IssueNumber, blockedLabel, lerr)
+				}
+				return
+			}
+			log.Printf("[orch] no-PR retry_exhausted: labelled issue #%d %q (slot %s, no PR produced and no merged PR detected)", sess.IssueNumber, blockedLabel, slotName)
+		} else {
+			log.Printf("[orch] no-PR retry_exhausted: issue #%d (slot %s) produced no PR and no merged PR detected — operator review required (no blocked_label configured)", sess.IssueNumber, slotName)
+		}
+		if o.notifier != nil {
+			o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted with no PR — needs operator review", sess.IssueNumber)
+		}
+		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
+	}
+
+	// Mark the session reconciled so future cycles short-circuit. The status
+	// stays retry_exhausted (terminal) but the marker prevents repeated
+	// labels, close attempts, or notifications.
+	sess.LastNotifiedStatus = noPRReconciledStatus
 }
 
 // handleReviewFeedbackRetry schedules a retry worker with review feedback in

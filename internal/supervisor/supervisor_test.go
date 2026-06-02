@@ -1638,6 +1638,57 @@ func TestRunOnceDynamicWaveAddsReadyOnlyToBestCandidateAndCleansStale(t *testing
 	}
 }
 
+// #577 regression: when the most recent dynamic-wave candidate exhausted
+// retries without ever producing a PR, the wave must skip that issue and
+// select the next eligible candidate so max_parallel=1 does not halt the
+// queue waiting for the dead session to reconcile. The retry-exhausted-
+// repair-candidate path is suppressed here by signalling the failed issue
+// as merged-elsewhere (the scenario from #577: a prior PR landed via
+// `Refs #N`), forcing supervisor to fall through to dynamic-wave eval.
+func TestDecide_DynamicWaveSkipsNoPRRetryExhaustedAndAdvances(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(488, "already-done candidate", "maestro-ready", "p0"),
+			testIssue(490, "next eligible candidate", "maestro-ready", "p1"),
+		},
+		mergedPRIssues: map[int]bool{488: true},
+	}
+	st := state.NewState()
+	st.Sessions["sup-114"] = &state.Session{
+		IssueNumber: 488,
+		IssueTitle:  "already-done candidate",
+		Branch:      "feat/sup-114",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    0,
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.SelectedCandidate == nil {
+		t.Fatalf("queue analysis = %#v, want selected candidate (got action=%q)", decision.QueueAnalysis, decision.RecommendedAction)
+	}
+	if got := decision.QueueAnalysis.SelectedCandidate.Number; got != 490 {
+		t.Fatalf("selected candidate = #%d, want #490 (next eligible after #488 retry_exhausted no-PR)", got)
+	}
+	foundSkipReason := false
+	for _, reason := range decision.QueueAnalysis.SkippedReasons {
+		if strings.Contains(reason, "#488") && strings.Contains(reason, "retry limit exhausted") {
+			foundSkipReason = true
+			break
+		}
+	}
+	if !foundSkipReason {
+		t.Fatalf("expected #488 retry_exhausted skip reason in %#v", decision.QueueAnalysis.SkippedReasons)
+	}
+}
+
 func TestDecide_DynamicWaveClassifiesTitleEpicAsHeld(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
