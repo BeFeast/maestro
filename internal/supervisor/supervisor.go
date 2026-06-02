@@ -166,15 +166,16 @@ type PreflightRunner func(command string) PreflightResult
 // Engine makes deterministic supervisor decisions. It plans safe queue mutations
 // and emits structured stuck-state explanations.
 type Engine struct {
-	cfg       *config.Config
-	reader    Reader
-	llm       LLMClient
-	now       func() time.Time
-	pidAlive  func(pid int) bool
-	stat      func(name string) (os.FileInfo, error)
-	lookPath  func(file string) (string, error)
-	preflight PreflightRunner
-	enroller  ProjectEnroller
+	cfg               *config.Config
+	reader            Reader
+	llm               LLMClient
+	now               func() time.Time
+	pidAlive          func(pid int) bool
+	stat              func(name string) (os.FileInfo, error)
+	lookPath          func(file string) (string, error)
+	preflight         PreflightRunner
+	enroller          ProjectEnroller
+	enrollmentTracker enrollmentTracker
 }
 
 func NewEngine(cfg *config.Config, reader Reader) *Engine {
@@ -182,13 +183,14 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 		reader = github.New(cfg.Repo)
 	}
 	eng := &Engine{
-		cfg:       cfg,
-		reader:    reader,
-		now:       func() time.Time { return time.Now().UTC() },
-		pidAlive:  pidAlive,
-		stat:      os.Stat,
-		lookPath:  exec.LookPath,
-		preflight: defaultPreflightRunner,
+		cfg:               cfg,
+		reader:            reader,
+		now:               func() time.Time { return time.Now().UTC() },
+		pidAlive:          pidAlive,
+		stat:              os.Stat,
+		lookPath:          exec.LookPath,
+		preflight:         defaultPreflightRunner,
+		enrollmentTracker: defaultEnrollmentTracker,
 	}
 	if enroller, ok := reader.(ProjectEnroller); ok {
 		eng.enroller = enroller
