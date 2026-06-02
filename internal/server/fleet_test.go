@@ -1372,6 +1372,73 @@ func TestFleetVerdictCoversHeaderStates(t *testing.T) {
 	}
 }
 
+// TestFleetSummaryRunningDistinguishesRunningFromRecent pins issue #496:
+// the "in flight" hero on the Workers screen must reflect only sessions
+// whose status is actually `running` — not every session that fell inside
+// the 24-h `Live` activity window. With one running session alongside five
+// terminal `done` sessions finished within the last hour, summary.Running
+// must read 1, the fleet verdict headline must say "1 worker in flight.",
+// and the historical 24-h reach (resp.Summary.Sessions) must still
+// account for the recent activity that the SPA renders under "Recent 24h".
+func TestFleetSummaryRunningDistinguishesRunningFromRecent(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "in-flight")
+
+	sessions := map[string]*state.Session{
+		"running-1": {
+			IssueNumber: 1,
+			IssueTitle:  "Actually running worker",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-3 * time.Minute),
+			PID:         os.Getpid(),
+		},
+	}
+	for i := 0; i < 5; i++ {
+		finished := now.Add(-time.Duration(i+1) * time.Hour)
+		started := finished.Add(-30 * time.Minute)
+		slot := "done-" + strconv.Itoa(i+1)
+		sessions[slot] = &state.Session{
+			IssueNumber: 100 + i,
+			IssueTitle:  "Recently completed worker",
+			Status:      state.StatusDone,
+			StartedAt:   started,
+			FinishedAt:  &finished,
+			PRNumber:    200 + i,
+		}
+	}
+	saveFleetTestSnapshot(t, stateDir, sessions, []state.SupervisorDecision{{
+		ID:                "sup-in-flight",
+		CreatedAt:         now,
+		Project:           "owner/in-flight",
+		Summary:           "Worker is already running.",
+		RecommendedAction: "wait_for_worker",
+		Risk:              "safe",
+	}})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("InFlight", "/tmp/in-flight.yaml", "", &config.Config{
+			Repo:        "owner/in-flight",
+			StateDir:    stateDir,
+			MaxParallel: 2,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+
+	if resp.Summary.Running != 1 {
+		t.Fatalf("summary.running = %d, want 1 (5 done sessions in last 24 h must not count as in-flight)", resp.Summary.Running)
+	}
+	if resp.Summary.Sessions != 6 {
+		t.Fatalf("summary.sessions = %d, want 6 (1 running + 5 done)", resp.Summary.Sessions)
+	}
+
+	headline := fleetVerdictHeadline(resp.Summary, resp.Projects[0].Supervisor.Latest, "busy", now)
+	if headline != "1 worker in flight." {
+		t.Fatalf("verdict headline = %q, want %q (must use summary.Running, not 24-h reach)", headline, "1 worker in flight.")
+	}
+}
+
 func TestFleetVerdictDoesNotTreatProjectFreshnessStaleAsHeartbeatStale(t *testing.T) {
 	now := time.Now().UTC()
 	latest := &supervisorDecisionInfo{CreatedAt: now}
