@@ -403,6 +403,8 @@ func canonicalAction(action string) string {
 		return ActionMergePR
 	case config.SupervisorActionCloseIssue:
 		return config.SupervisorActionCloseIssue
+	case config.SupervisorActionCloseIssueBatch:
+		return config.SupervisorActionCloseIssueBatch
 	case config.SupervisorActionDeleteWorktree:
 		return config.SupervisorActionDeleteWorktree
 	case config.SupervisorActionChangeGlobalConfig:

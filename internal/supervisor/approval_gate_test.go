@@ -21,6 +21,7 @@ func cautiousApprovalCfg() *config.Config {
 	cfg.Supervisor.ApprovalRequired = []string{
 		config.SupervisorActionMergePR,
 		config.SupervisorActionCloseIssue,
+		config.SupervisorActionCloseIssueBatch,
 		config.SupervisorActionDeleteWorktree,
 		config.SupervisorActionChangeGlobalConfig,
 	}
@@ -31,6 +32,7 @@ func TestCanonicalAction_MutatingVerbsPassthrough(t *testing.T) {
 	verbs := []string{
 		config.SupervisorActionMergePR,
 		config.SupervisorActionCloseIssue,
+		config.SupervisorActionCloseIssueBatch,
 		config.SupervisorActionDeleteWorktree,
 		config.SupervisorActionChangeGlobalConfig,
 	}
@@ -50,6 +52,7 @@ func TestDecisionRequiresApproval_GatesMutatingVerbs(t *testing.T) {
 	verbs := []string{
 		config.SupervisorActionMergePR,
 		config.SupervisorActionCloseIssue,
+		config.SupervisorActionCloseIssueBatch,
 		config.SupervisorActionDeleteWorktree,
 		config.SupervisorActionChangeGlobalConfig,
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -182,6 +183,7 @@ func isApprovalRequiredAction(id string) bool {
 	switch id {
 	case config.SupervisorActionMergePR,
 		config.SupervisorActionCloseIssue,
+		config.SupervisorActionCloseIssueBatch,
 		config.SupervisorActionDeleteWorktree,
 		config.SupervisorActionChangeGlobalConfig,
 		// #565: review-repair respawn is approval-gated (RiskMutating);
@@ -395,6 +397,10 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 		if req.IssueNumber <= 0 {
 			return errors.New("issue_number is required for close_issue")
 		}
+	case config.SupervisorActionCloseIssueBatch:
+		if len(normalizeCloseIssueBatch(req.Issues)) == 0 {
+			return errors.New("issues is required for close_issue_batch")
+		}
 	case config.SupervisorActionDeleteWorktree:
 		if err := state.ValidateSlotID(req.Slot); err != nil {
 			return fmt.Errorf("delete_worktree: %w", err)
@@ -443,9 +449,10 @@ func buildApprovalDecision(id string, req controlActionRequest, cfg *config.Conf
 	target := &state.SupervisorTarget{
 		Issue:   req.IssueNumber,
 		PR:      req.PRNumber,
+		Issues:  normalizeCloseIssueBatch(req.Issues),
 		Session: strings.TrimSpace(req.Slot),
 	}
-	if target.Issue == 0 && target.PR == 0 && target.Session == "" {
+	if target.Issue == 0 && target.PR == 0 && len(target.Issues) == 0 && target.Session == "" {
 		target = nil
 	}
 
@@ -483,10 +490,42 @@ func approvalTargetSummary(target *state.SupervisorTarget) string {
 	if target.PR > 0 {
 		parts = append(parts, fmt.Sprintf("PR #%d", target.PR))
 	}
+	if len(target.Issues) > 0 {
+		parts = append(parts, fmt.Sprintf("%d issues", len(target.Issues)))
+	}
 	if target.Session != "" {
 		parts = append(parts, "session "+target.Session)
 	}
 	return strings.Join(parts, " ")
+}
+
+func normalizeCloseIssueBatch(in []state.SupervisorIssueTarget) []state.SupervisorIssueTarget {
+	if len(in) == 0 {
+		return nil
+	}
+	byIssue := make(map[int]state.SupervisorIssueTarget, len(in))
+	for _, item := range in {
+		if item.Issue <= 0 {
+			continue
+		}
+		existing := byIssue[item.Issue]
+		if existing.Issue == 0 || existing.PR <= 0 {
+			byIssue[item.Issue] = item
+		}
+	}
+	if len(byIssue) == 0 {
+		return nil
+	}
+	issues := make([]int, 0, len(byIssue))
+	for issue := range byIssue {
+		issues = append(issues, issue)
+	}
+	sort.Ints(issues)
+	out := make([]state.SupervisorIssueTarget, 0, len(issues))
+	for _, issue := range issues {
+		out = append(out, byIssue[issue])
+	}
+	return out
 }
 
 // randomDecisionSuffix returns a short random hex token used to

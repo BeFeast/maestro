@@ -466,6 +466,9 @@ var (
 type SupervisorTarget struct {
 	Issue int `json:"issue,omitempty"`
 	PR    int `json:"pr,omitempty"`
+	// Issues carries a batch of verified merged issue candidates for one
+	// cautious-gate close approval. Single-issue verbs keep using Issue/PR.
+	Issues []SupervisorIssueTarget `json:"issues,omitempty"`
 	// HeadSHA stamps the PR head SHA at decision time. Used by the
 	// review-repair pipeline (#565) so a decision is keyed on the exact
 	// head it observed; a new push that moves head invalidates a pending
@@ -473,6 +476,11 @@ type SupervisorTarget struct {
 	// include the target).
 	HeadSHA string `json:"head_sha,omitempty"`
 	Session string `json:"session,omitempty"`
+}
+
+type SupervisorIssueTarget struct {
+	Issue int `json:"issue"`
+	PR    int `json:"pr,omitempty"`
 }
 
 // SupervisorProjectState captures the read-only state snapshot behind a decision.
@@ -1703,11 +1711,26 @@ func approvalTargetsEqual(a, b *SupervisorTarget) bool {
 	if a.PR != b.PR {
 		return false
 	}
+	if !supervisorIssueTargetsEqual(a.Issues, b.Issues) {
+		return false
+	}
 	if strings.TrimSpace(a.HeadSHA) != strings.TrimSpace(b.HeadSHA) {
 		return false
 	}
 	if strings.TrimSpace(a.Session) != strings.TrimSpace(b.Session) {
 		return false
+	}
+	return true
+}
+
+func supervisorIssueTargetsEqual(a, b []SupervisorIssueTarget) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Issue != b[i].Issue || a[i].PR != b[i].PR {
+			return false
+		}
 	}
 	return true
 }
@@ -2003,6 +2026,14 @@ func approvalTargetMatches(target *SupervisorTarget, slot string, sess *Session)
 	if target.PR > 0 && target.PR == sess.PRNumber {
 		return true
 	}
+	for _, issue := range target.Issues {
+		if issue.Issue > 0 && issue.Issue == sess.IssueNumber {
+			return true
+		}
+		if issue.PR > 0 && issue.PR == sess.PRNumber {
+			return true
+		}
+	}
 	return false
 }
 
@@ -2011,6 +2042,7 @@ func cloneSupervisorTarget(target *SupervisorTarget) *SupervisorTarget {
 		return nil
 	}
 	clone := *target
+	clone.Issues = append([]SupervisorIssueTarget(nil), target.Issues...)
 	return &clone
 }
 

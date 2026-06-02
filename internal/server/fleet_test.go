@@ -208,8 +208,8 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	for _, action := range worker.Actions {
 		assertFleetReadOnlyAction(t, action)
 	}
-	if len(resp.Projects[0].Actions) != 2 {
-		t.Fatalf("project actions = %d, want 2", len(resp.Projects[0].Actions))
+	if len(resp.Projects[0].Actions) != 3 {
+		t.Fatalf("project actions = %d, want 3", len(resp.Projects[0].Actions))
 	}
 	for _, action := range resp.Projects[0].Actions {
 		assertFleetReadOnlyAction(t, action)
@@ -3799,6 +3799,50 @@ func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Ses
 // has its GitHub Project board client wired, the snapshot exposes a
 // project_board with the canonical URL and the per-column WIP counts the
 // MC SPA renders on the project drawer.
+func TestFleetAPIIncludesCloseCandidatesAndBatchAction(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Repo:        "owner/repo",
+		StateDir:    dir,
+		MaxParallel: 2,
+	}
+	finished := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.Sessions["sup-1"] = &state.Session{IssueNumber: 7, PRNumber: 70, Status: state.StatusDone, FinishedAt: &finished}
+	st.Sessions["sup-2"] = &state.Session{IssueNumber: 8, PRNumber: 80, Status: state.StatusDone, FinishedAt: &finished}
+	st.Approvals = append(st.Approvals, state.Approval{
+		Action: config.SupervisorActionCloseIssue,
+		Status: state.ApprovalStatusExecuted,
+		Target: &state.SupervisorTarget{Issue: 8},
+	})
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	fleet := NewFleet([]FleetProject{NewFleetProject("Project", "", "", cfg)}, "127.0.0.1", 0, false)
+	resp := fleet.snapshot()
+	if len(resp.Projects) != 1 {
+		t.Fatalf("projects = %d, want 1", len(resp.Projects))
+	}
+	project := resp.Projects[0]
+	if len(project.CloseCandidates) != 1 || project.CloseCandidates[0].IssueNumber != 7 || project.CloseCandidates[0].PRNumber != 70 {
+		t.Fatalf("close candidates = %+v, want only issue #7 / PR #70", project.CloseCandidates)
+	}
+	var batch *controlAction
+	for i := range project.Actions {
+		if project.Actions[i].ID == config.SupervisorActionCloseIssueBatch {
+			batch = &project.Actions[i]
+			break
+		}
+	}
+	if batch == nil {
+		t.Fatalf("project actions = %+v, want close_issue_batch action", project.Actions)
+	}
+	if !batch.RequiresApproval || len(batch.Issues) != 1 || batch.Issues[0].Issue != 7 {
+		t.Fatalf("batch action = %+v, want one approval-gated issue target", batch)
+	}
+}
+
 func TestFleetAPIIncludesProjectBoardSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "one")

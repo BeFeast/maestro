@@ -229,29 +229,31 @@ type tokenTotalsInfo struct {
 }
 
 type controlAction struct {
-	ID               string `json:"id"`
-	Label            string `json:"label"`
-	Description      string `json:"description,omitempty"`
-	Scope            string `json:"scope"`
-	Target           string `json:"target,omitempty"`
-	IssueNumber      int    `json:"issue_number,omitempty"`
-	PRNumber         int    `json:"pr_number,omitempty"`
-	Mutating         bool   `json:"mutating"`
-	RequiresApproval bool   `json:"requires_approval"`
-	ApprovalPolicy   string `json:"approval_policy,omitempty"`
-	Disabled         bool   `json:"disabled"`
-	DisabledReason   string `json:"disabled_reason,omitempty"`
-	Method           string `json:"method,omitempty"`
-	Endpoint         string `json:"endpoint,omitempty"`
+	ID               string                        `json:"id"`
+	Label            string                        `json:"label"`
+	Description      string                        `json:"description,omitempty"`
+	Scope            string                        `json:"scope"`
+	Target           string                        `json:"target,omitempty"`
+	IssueNumber      int                           `json:"issue_number,omitempty"`
+	PRNumber         int                           `json:"pr_number,omitempty"`
+	Issues           []state.SupervisorIssueTarget `json:"issues,omitempty"`
+	Mutating         bool                          `json:"mutating"`
+	RequiresApproval bool                          `json:"requires_approval"`
+	ApprovalPolicy   string                        `json:"approval_policy,omitempty"`
+	Disabled         bool                          `json:"disabled"`
+	DisabledReason   string                        `json:"disabled_reason,omitempty"`
+	Method           string                        `json:"method,omitempty"`
+	Endpoint         string                        `json:"endpoint,omitempty"`
 }
 
 type controlActionRequest struct {
-	ActionID    string `json:"action_id"`
-	Project     string `json:"project,omitempty"`
-	Slot        string `json:"slot,omitempty"`
-	IssueNumber int    `json:"issue_number,omitempty"`
-	PRNumber    int    `json:"pr_number,omitempty"`
-	ApprovalID  string `json:"approval_id,omitempty"`
+	ActionID    string                        `json:"action_id"`
+	Project     string                        `json:"project,omitempty"`
+	Slot        string                        `json:"slot,omitempty"`
+	IssueNumber int                           `json:"issue_number,omitempty"`
+	PRNumber    int                           `json:"pr_number,omitempty"`
+	Issues      []state.SupervisorIssueTarget `json:"issues,omitempty"`
+	ApprovalID  string                        `json:"approval_id,omitempty"`
 
 	// Body is the comment text for add_issue_comment safe actions.
 	Body string `json:"body,omitempty"`
@@ -816,6 +818,12 @@ func projectActionAffordances(readOnly bool, endpoint, target string) []controlA
 		newSafeControlAction("mark_issue_ready", "Mark ready", "Add the maestro-ready label so the supervisor picks the issue up.", "project", target, 0, 0, endpoint, readOnly),
 		newSafeControlAction("mark_issue_blocked", "Mark blocked", "Add the blocked label so the supervisor holds the issue.", "project", target, 0, 0, endpoint, readOnly),
 	}
+}
+
+func closeIssueBatchControlAction(readOnly bool, endpoint, target string, candidates []fleetCloseCandidate) controlAction {
+	a := newApprovalControlAction(config.SupervisorActionCloseIssueBatch, "Close batch", "Enqueue one cautious-gate approval to close all verified merged issues awaiting closure.", "project", target, 0, 0, endpoint, readOnly)
+	a.Issues = fleetCloseCandidateTargets(candidates)
+	return a
 }
 
 func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {

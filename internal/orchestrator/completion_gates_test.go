@@ -178,6 +178,52 @@ func TestReconcile_CompletionGatesInactiveLegacyPath(t *testing.T) {
 	}
 }
 
+func TestMarkDoneAfterOutcomePass_GatedCloseSyncsAwaitingClose(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 1,
+		},
+		Supervisor: config.SupervisorConfig{
+			SafeActions:      []string{config.SupervisorActionCloseIssue},
+			ApprovalRequired: []string{config.SupervisorActionCloseIssue},
+		},
+	}
+	now := time.Now().UTC()
+	closeCalled := 0
+	statuses := []github.ProjectStatus{}
+	o := &Orchestrator{
+		cfg:                  cfg,
+		projectRateAllowed:   true,
+		projectRateCheckedAt: now,
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			closeCalled++
+			return nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			statuses = append(statuses, status)
+			return true
+		},
+	}
+	sess := &state.Session{IssueNumber: 621, Status: state.StatusCodeLanded, PRNumber: 99}
+
+	o.markDoneAfterOutcomePass(sess, 99)
+
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want done after outcome pass", sess.Status)
+	}
+	if closeCalled != 0 {
+		t.Fatalf("CloseIssue called %d times; approval-gated close must not bypass cautious gate", closeCalled)
+	}
+	if len(statuses) != 1 || statuses[0] != github.ProjectStatusAwaitingClose {
+		t.Fatalf("project statuses = %v, want [verified awaiting close]", statuses)
+	}
+}
+
 // TestMarkDoneAfterOutcomePass_BodyMarkerHoldsClose covers the case where
 // the issue carries no special label but its body contains a configured
 // marker (e.g. "live visual command:").

@@ -44,6 +44,7 @@ func TestRegistry_IsKnownApprovalAction(t *testing.T) {
 	}{
 		{"merge_pr", true},
 		{"close_issue", true},
+		{"close_issue_batch", true},
 		{"delete_worktree", true},
 		{"change_global_config", true},
 		{"spawn_worker", true},

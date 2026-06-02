@@ -262,6 +262,8 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 		return e.executeMergePR(approval)
 	case config.SupervisorActionCloseIssue:
 		return e.executeCloseIssue(approval)
+	case config.SupervisorActionCloseIssueBatch:
+		return e.executeCloseIssueBatch(approval)
 	case config.SupervisorActionDeleteWorktree:
 		return e.executeDeleteWorktree(approval)
 	case config.SupervisorActionStopWorker:
@@ -443,6 +445,45 @@ func (e *Executor) executeCloseIssue(approval *state.Approval) Result {
 	}
 }
 
+func (e *Executor) executeCloseIssueBatch(approval *state.Approval) Result {
+	if approval.Target == nil || len(approval.Target.Issues) == 0 {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("%w: issues missing", ErrMissingTarget)}
+	}
+	if e.GH == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
+	}
+	comment := strings.TrimSpace(approvalCloseIssueComment(approval))
+	if comment == "" {
+		comment = "Maestro verified the configured runtime outcome after code landed; closing this issue as done."
+	}
+
+	closed := make([]int, 0, len(approval.Target.Issues))
+	for _, target := range approval.Target.Issues {
+		if target.Issue <= 0 {
+			continue
+		}
+		issueComment := comment
+		if target.PR > 0 && issueComment == "Maestro verified the configured runtime outcome after code landed; closing this issue as done." {
+			issueComment = fmt.Sprintf("Maestro verified the configured runtime outcome after PR #%d landed; closing this issue as done.", target.PR)
+		}
+		if err := e.GH.CloseIssue(target.Issue, issueComment); err != nil {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("close issue batch after %d/%d issue(s): issue #%d: %v", len(closed), len(approval.Target.Issues), target.Issue, err),
+				Err:     fmt.Errorf("close issue batch: issue #%d: %w", target.Issue, err),
+			}
+		}
+		closed = append(closed, target.Issue)
+	}
+	if len(closed) == 0 {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("%w: no valid issue numbers in batch", ErrMissingTarget)}
+	}
+	return Result{
+		Status:  state.ApprovalStatusExecuted,
+		Summary: fmt.Sprintf("closed %d verified issue(s): %s", len(closed), formatIssueList(closed)),
+	}
+}
+
 func approvalCloseIssueComment(approval *state.Approval) string {
 	// Prefer the operator's reason (it is the most recent audit entry's
 	// Reason for the Approve event). Fall back to the approval Summary.
@@ -455,6 +496,17 @@ func approvalCloseIssueComment(approval *state.Approval) string {
 		}
 	}
 	return strings.TrimSpace(approval.Summary)
+}
+
+func formatIssueList(issues []int) string {
+	if len(issues) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		parts = append(parts, fmt.Sprintf("#%d", issue))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (e *Executor) executeDeleteWorktree(approval *state.Approval) Result {

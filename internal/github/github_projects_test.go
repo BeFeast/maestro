@@ -192,6 +192,7 @@ func TestProjectStatusCandidates(t *testing.T) {
 		{ProjectStatusBlocked, "Blocked"},
 		{ProjectStatusDeploying, "Deploying"},
 		{ProjectStatusLiveVerify, "Live Verification"},
+		{ProjectStatusAwaitingClose, "Verified — awaiting close"},
 		{ProjectStatusDone, "Done"},
 	}
 	for _, tc := range tests {
