@@ -13,7 +13,9 @@ import {
   isApprovalActionCloseIssue,
   isApprovalActionMergePR,
   postFleetApproval,
+  postFleetApprovalBulk,
   postProjectApproval,
+  postProjectApprovalBulk,
   projectBoardIssueURL,
   projectBySlug,
   supervisorDecisionsFromProject,
@@ -698,12 +700,82 @@ export function WorkerDrawer({ worker, onClose, now }) {
 }
 
 export function ApprovalsScreen({ navigate }) {
-  const { fleet } = useFleet();
+  const { fleet, refresh } = useFleet();
   const [showAudit, setShowAudit] = React.useState(false);
+  const [selected, setSelected] = React.useState(() => new Set());
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [bulkError, setBulkError] = React.useState(null);
   const apps = fleet?.pendingApprovals || [];
   const audit = fleet?.historicalApprovals || [];
   const stuck = apps.filter(a => a.state === "stuck");
   const watch = apps.filter(a => a.state === "watch");
+  const canMutate = fleet && fleet.readOnly === false;
+
+  // Drop selections for cards that disappeared between refreshes so the
+  // "Reject selected (3)" badge does not lie.
+  React.useEffect(() => {
+    const liveIds = new Set();
+    for (const a of apps) {
+      if (a && a.id) liveIds.add(a.id);
+      if (a && Array.isArray(a.groupMembers)) {
+        for (const m of a.groupMembers) {
+          if (m && m.id) liveIds.add(m.id);
+        }
+      }
+    }
+    setSelected(prev => {
+      const next = new Set();
+      for (const id of prev) if (liveIds.has(id)) next.add(id);
+      return next.size === prev.size ? prev : next;
+    });
+  }, [apps]);
+
+  const toggleCard = React.useCallback((a) => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      const ids = collectApprovalIds(a);
+      const allSelected = ids.every(id => next.has(id));
+      if (allSelected) {
+        for (const id of ids) next.delete(id);
+      } else {
+        for (const id of ids) next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const runBulk = React.useCallback(async (verb) => {
+    if (selected.size === 0 || !canMutate) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      // Group selected ids by project so we route to the right fleet
+      // bulk endpoint per project — the server endpoint is per-project.
+      const byProject = new Map();
+      for (const a of apps) {
+        const ids = collectApprovalIds(a).filter(id => selected.has(id));
+        if (ids.length === 0) continue;
+        const key = a.project || "";
+        const bucket = byProject.get(key) || [];
+        bucket.push(...ids);
+        byProject.set(key, bucket);
+      }
+      for (const [project, ids] of byProject.entries()) {
+        if (ids.length === 0) continue;
+        if (project) {
+          await postFleetApprovalBulk({ approvalIds: ids, project, verb, reason: "" });
+        } else {
+          await postProjectApprovalBulk({ approvalIds: ids, verb, reason: "" });
+        }
+      }
+      setSelected(new Set());
+      await refresh();
+    } catch (err) {
+      setBulkError(err && err.message ? err.message : String(err));
+    } finally {
+      setBulkBusy(false);
+    }
+  }, [apps, canMutate, refresh, selected]);
 
   return (
     <div>
@@ -714,6 +786,55 @@ export function ApprovalsScreen({ navigate }) {
         </div>
       </div>
 
+      {canMutate && selected.size > 0 && (
+        <div
+          className="app-bulk-bar"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "var(--s-3) var(--s-4)",
+            marginBottom: "var(--s-4)",
+            background: "var(--bg-1)",
+            border: "1px solid var(--border-1)",
+            borderRadius: "var(--r-4)",
+          }}
+        >
+          <strong style={{ fontSize: 13, color: "var(--fg-0)" }}>{selected.size} selected</strong>
+          <span className="dim mono" style={{ fontSize: 11 }}>· bulk action across the selected approvals</span>
+          <div style={{ flex: 1 }} />
+          <button
+            className="tb-btn"
+            disabled={bulkBusy}
+            style={{ fontSize: 11 }}
+            onClick={() => setSelected(new Set())}
+          >
+            Clear
+          </button>
+          <button
+            className="tb-btn"
+            disabled={bulkBusy}
+            style={{ fontSize: 11 }}
+            onClick={() => runBulk("supersede")}
+            title="Dismiss the selected approvals as superseded (operator says: no longer relevant)"
+          >
+            Supersede selected
+          </button>
+          <button
+            className="tb-btn danger"
+            disabled={bulkBusy}
+            style={{ fontSize: 11 }}
+            onClick={() => runBulk("reject")}
+            title="Reject the selected approvals (operator says: do not perform these actions)"
+          >
+            Reject selected
+          </button>
+          {bulkError && (
+            <span className="mono dim" style={{ color: "var(--bad, #c33)", fontSize: 11 }}>{bulkError}</span>
+          )}
+        </div>
+      )}
+
       {stuck.length > 0 && (
         <>
           <div className="layout-head" style={{ marginTop: 0 }}>
@@ -721,7 +842,14 @@ export function ApprovalsScreen({ navigate }) {
             <div className="hint">{stuck.length} stuck</div>
           </div>
           <div className="appv">
-            {stuck.map((a, i) => <ApprovalRow key={a.id || i} a={a} />)}
+            {stuck.map((a, i) => (
+              <ApprovalRow
+                key={a.id || i}
+                a={a}
+                selected={collectApprovalIds(a).every(id => selected.has(id))}
+                onToggleSelect={canMutate ? toggleCard : null}
+              />
+            ))}
           </div>
         </>
       )}
@@ -730,7 +858,14 @@ export function ApprovalsScreen({ navigate }) {
         <>
           <div className="layout-head"><h2>Within SLA · watching</h2><div className="hint">{watch.length} pending</div></div>
           <div className="appv">
-            {watch.map((a, i) => <ApprovalRow key={a.id || i} a={a} />)}
+            {watch.map((a, i) => (
+              <ApprovalRow
+                key={a.id || i}
+                a={a}
+                selected={collectApprovalIds(a).every(id => selected.has(id))}
+                onToggleSelect={canMutate ? toggleCard : null}
+              />
+            ))}
           </div>
         </>
       )}
@@ -778,10 +913,29 @@ export function ApprovalsScreen({ navigate }) {
   );
 }
 
-function ApprovalRow({ a }) {
+// collectApprovalIds returns every approval id represented by a card —
+// the card's own id plus any sibling re-emits folded into its
+// groupMembers (#533 spec gap 1). Used by the bulk-action bar so a
+// single click on a «regenerated 3 times» card selects all three live
+// approval ids, not just the representative.
+function collectApprovalIds(a) {
+  if (!a) return [];
+  const ids = new Set();
+  if (a.id) ids.add(a.id);
+  if (Array.isArray(a.groupMembers)) {
+    for (const m of a.groupMembers) {
+      if (m && m.id) ids.add(m.id);
+    }
+  }
+  return Array.from(ids);
+}
+
+function ApprovalRow({ a, selected = false, onToggleSelect = null }) {
   const overdue = a.past_sla || a.ageMin > a.sla;
   const { fleet, refresh } = useFleet();
   const canMutate = !!a.id && fleet && fleet.readOnly === false;
+  const groupSize = Number(a.groupSize || 0);
+  const regeneratedBadge = groupSize > 1 ? `regenerated ${groupSize} times` : "";
   const [busy, setBusy] = React.useState(false);
   const [pendingVerb, setPendingVerb] = React.useState(null); // "approve" | "reject" | null
   const [pendingReason, setPendingReason] = React.useState("");
@@ -825,6 +979,22 @@ function ApprovalRow({ a }) {
     : [];
   return (
     <div className={`app-row ${a.state}`}>
+      {onToggleSelect && (
+        <label
+          className="app-row-select"
+          style={{ display: "flex", alignItems: "center", padding: "0 var(--s-2)" }}
+          onClick={(e) => e.stopPropagation()}
+          title="Select for bulk action"
+        >
+          <input
+            type="checkbox"
+            checked={!!selected}
+            onChange={() => onToggleSelect(a)}
+            disabled={!canMutate}
+            style={{ cursor: canMutate ? "pointer" : "default" }}
+          />
+        </label>
+      )}
       <div className="app-row-stage">
         <strong>#{a.pr || a.issue_number || "—"}</strong>
         <small>{a.stage}</small>
@@ -834,6 +1004,11 @@ function ApprovalRow({ a }) {
         <div className="meta" style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
           <span>{a.project}</span>
           <span>· action <strong className="mono" style={{ color: "var(--fg-1)" }}>{actionLabel(a.action)}</strong></span>
+          {regeneratedBadge && (
+            <Pill tone="watch" noDot title="Multiple live approvals for the same target — same group can be dismissed in bulk.">
+              {regeneratedBadge}
+            </Pill>
+          )}
           {gateBadges.map(b => (
             <Pill key={b.label} tone={b.tone} noDot>{b.label}</Pill>
           ))}

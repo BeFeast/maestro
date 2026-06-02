@@ -372,7 +372,12 @@ function collectApprovals(raw) {
           dashboard_url: approval.dashboard_url || project.dashboard_url,
         }))
       );
-  return approvals.map(mapApproval);
+  // #533 spec gap 1: fold duplicate live approvals on the same target
+  // onto a single card before the SPA renders. Without this the inbox
+  // showed two flat rows for two re-emitted approvals on the same
+  // issue even though the server-computed group_key marked them as
+  // the same group.
+  return foldApprovalGroups(approvals.map(mapApproval));
 }
 
 function mapProject(project, workers, now) {
@@ -675,19 +680,85 @@ function mapApproval(approval) {
     0,
     Math.floor(Number(approval.updated_age_seconds || approval.created_age_seconds || 0) / 60)
   );
+  // Issue #533 spec gap 12: prefer the server-rendered short Title
+  // ("Start worker · #487") over the long supervisor summary. Older fleet
+  // snapshots (pre-#533) lack the field — fall back to the action label
+  // plus target so the SPA never crashes and the card still reads as a
+  // verb+target, not as the full reasoning sentence. Includes the
+  // session slot arm (Greptile Comment 4) so a delete_worktree approval
+  // from an older snapshot does not render as a bare "Delete worktree".
+  const fallbackTitle = `${actionLabel(approval.action)}${
+    approval.pr_number ? ` · #${approval.pr_number}` :
+    approval.issue_number ? ` · #${approval.issue_number}` :
+    approval.session ? ` · slot ${approval.session}` : ""
+  }`;
+  const title = approval.title || fallbackTitle;
   return {
     ...approval,
     project: approval.project_name || "",
     pr: approval.pr_number || 0,
-    title: approval.summary || actionLabel(approval.action),
+    title,
     author: approval.session || approval.decision_id || "supervisor",
     reviewer: approval.risk || "operator",
     ageMin,
     sla: 30,
     state: approvalTone(approval),
+    // body = supervisor's reasoning. Distinct from title (gap 12): the SPA
+    // renders body only when it differs from title, so the long sentence
+    // appears exactly once, as the body.
     body: approval.summary || "",
     stage: actionLabel(approval.action),
+    groupKey: approval.group_key || "",
+    groupSize: Number(approval.group_size || 0),
   };
+}
+
+// foldApprovalGroups collapses live (pending/awaiting/approved) approvals
+// that share the same server-computed groupKey onto a single
+// "representative" entry — the freshest record — annotated with
+// groupMembers (the full per-id list) and groupSize (the count). The SPA
+// renders the representative as one card with a «regenerated N times»
+// badge instead of N flat rows. Resolved approvals (rejected, stale,
+// superseded, executed) and approvals without a groupKey pass through
+// untouched, preserving audit-history rendering.
+//
+// Implementation note: GroupKey is empty for target+id-less approvals
+// (per the Go-side ApprovalGroupKey contract), so they always pass
+// through as singletons — never folded into a bogus shared group.
+export function foldApprovalGroups(approvals) {
+  if (!Array.isArray(approvals) || approvals.length === 0) return approvals || [];
+  const groups = new Map();
+  const out = [];
+  for (const approval of approvals) {
+    const key = approval && approval.groupKey;
+    if (!key || !isPendingApproval(approval)) {
+      out.push(approval);
+      continue;
+    }
+    const existing = groups.get(key);
+    if (!existing) {
+      const seeded = { ...approval, groupMembers: [approval], groupSize: approval.groupSize || 1 };
+      groups.set(key, seeded);
+      out.push(seeded);
+      continue;
+    }
+    existing.groupMembers.push(approval);
+    // Keep the freshest record as the representative so the card's
+    // visible metadata matches the most recent re-emit.
+    const existingTs = Number(existing.updated_age_seconds || existing.created_age_seconds || 0);
+    const candidateTs = Number(approval.updated_age_seconds || approval.created_age_seconds || 0);
+    if (candidateTs > 0 && (existingTs === 0 || candidateTs < existingTs)) {
+      // Smaller "age seconds" means more recent — preserve the previous
+      // groupMembers list and counted GroupSize while swapping in the
+      // newer representative's fields.
+      const preservedMembers = existing.groupMembers;
+      const preservedSize = Math.max(existing.groupSize || 0, approval.groupSize || 0, preservedMembers.length);
+      Object.assign(existing, approval, { groupMembers: preservedMembers, groupSize: preservedSize });
+    } else {
+      existing.groupSize = Math.max(existing.groupSize || 0, approval.groupSize || 0, existing.groupMembers.length);
+    }
+  }
+  return out;
 }
 
 export function isPendingApproval(approval) {
@@ -1013,6 +1084,56 @@ export async function postProjectApproval({ approvalId, verb, actor, reason }) {
     body: JSON.stringify({ actor: actor || "dashboard", reason: reason || "" }),
   });
   return parseApprovalResponse(res, verb);
+}
+
+// postFleetApprovalBulk / postProjectApprovalBulk drive the multi-id
+// reject/supersede endpoints introduced for #533 spec gap 7. The body
+// shape mirrors approvalBulkRequest on the server; the response is the
+// approvalBulkResponse (counts + per-id Items) so the SPA can render
+// "rejected 3, skipped 1" inline without re-fetching.
+export async function postFleetApprovalBulk({ approvalIds, project, verb, actor, reason }) {
+  if (!Array.isArray(approvalIds) || approvalIds.length === 0) {
+    throw new Error("approvalIds must be a non-empty array");
+  }
+  if (!project) throw new Error("project is required");
+  if (verb !== "reject" && verb !== "supersede") throw new Error("verb must be reject|supersede");
+  const url = `/api/v1/fleet/approvals/bulk?project=${encodeURIComponent(project)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: approvalIds, verb, actor: actor || "dashboard", reason: reason || "" }),
+  });
+  return parseBulkApprovalResponse(res, verb);
+}
+
+export async function postProjectApprovalBulk({ approvalIds, verb, actor, reason }) {
+  if (!Array.isArray(approvalIds) || approvalIds.length === 0) {
+    throw new Error("approvalIds must be a non-empty array");
+  }
+  if (verb !== "reject" && verb !== "supersede") throw new Error("verb must be reject|supersede");
+  const res = await fetch("/api/v1/approvals/bulk", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: approvalIds, verb, actor: actor || "dashboard", reason: reason || "" }),
+  });
+  return parseBulkApprovalResponse(res, verb);
+}
+
+async function parseBulkApprovalResponse(res, verb) {
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch (_) {
+    /* non-JSON; fall through */
+  }
+  if (!res.ok) {
+    const msg = (payload && (payload.error || payload.message)) || `bulk ${verb} failed with status ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.payload = payload;
+    throw err;
+  }
+  return payload;
 }
 
 async function parseApprovalResponse(res, verb) {
