@@ -2573,6 +2573,141 @@ func (s *State) PruneOldSessions(maxAge time.Duration) int {
 	return pruned
 }
 
+// IsRetentionEligible reports whether a session in this status is eligible
+// for CompactSessions to consider it. Active states (running / pr_open /
+// queued and any non-listed state) are never touched. Matches the issue
+// #497 spec, which includes code_landed in the retention-eligible set even
+// though IsTerminal does not (code_landed is treated as terminal once the
+// session falls outside both retention floors).
+func IsRetentionEligible(status SessionStatus) bool {
+	switch status {
+	case StatusDone, StatusFailed, StatusConflictFailed, StatusDead, StatusRetryExhausted, StatusCodeLanded:
+		return true
+	}
+	return false
+}
+
+// SessionRetentionPolicy controls CompactSessions.
+//
+// A retention-eligible session is removed only when it is BOTH outside the
+// newest KeepLast window AND older than MinAge. This implements the #497
+// rule "keep last N or last D days, whichever is longer". Setting either
+// floor to 0 or negative disables that floor.
+type SessionRetentionPolicy struct {
+	KeepLast    int           // minimum newest-N eligible sessions to retain regardless of age
+	MinAge      time.Duration // retain any eligible session younger than this duration
+	ArchiveFile string        // if non-empty, append pruned sessions to this JSONL file before delete
+}
+
+// SessionCompactionResult is the count summary returned by CompactSessions.
+type SessionCompactionResult struct {
+	Removed  int // number of sessions deleted from state.Sessions
+	Archived int // number of sessions appended to the archive file
+}
+
+// archivedSessionRecord is the JSONL line format written to the archive
+// file. Each pruned session is serialized as one record per line so the
+// archive remains append-only and grep-friendly.
+type archivedSessionRecord struct {
+	Slot       string    `json:"slot"`
+	ArchivedAt time.Time `json:"archived_at"`
+	Session    *Session  `json:"session"`
+}
+
+// CompactSessions removes retention-eligible sessions from s.Sessions that
+// fall outside BOTH the policy's count window (KeepLast newest) AND the
+// policy's age window (MinAge). When policy.ArchiveFile is non-empty,
+// pruned sessions are first appended to that file as JSONL (one record per
+// line) for forensics, mirroring the audit-log pattern. The function is
+// idempotent — invoking it repeatedly with the same state and clock is a
+// no-op after the first call.
+//
+// Active sessions (running, pr_open, queued, and any non-listed state) are
+// never touched. now is the wall clock used for the age window so callers
+// can inject a deterministic clock in tests.
+func (s *State) CompactSessions(policy SessionRetentionPolicy, now time.Time) (SessionCompactionResult, error) {
+	var result SessionCompactionResult
+	if s == nil || len(s.Sessions) == 0 {
+		return result, nil
+	}
+
+	type candidate struct {
+		slot     string
+		sess     *Session
+		finished time.Time
+	}
+	eligible := make([]candidate, 0, len(s.Sessions))
+	for slot, sess := range s.Sessions {
+		if sess == nil || !IsRetentionEligible(sess.Status) {
+			continue
+		}
+		finished := sess.StartedAt
+		if sess.FinishedAt != nil {
+			finished = *sess.FinishedAt
+		}
+		eligible = append(eligible, candidate{slot: slot, sess: sess, finished: finished})
+	}
+	if len(eligible) == 0 {
+		return result, nil
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		if !eligible[i].finished.Equal(eligible[j].finished) {
+			return eligible[i].finished.After(eligible[j].finished)
+		}
+		// Stable tiebreak on slot name so the kept set is deterministic
+		// across runs even when several sessions share a FinishedAt.
+		return eligible[i].slot < eligible[j].slot
+	})
+
+	keepLast := policy.KeepLast
+	if keepLast < 0 {
+		keepLast = 0
+	}
+
+	pruneSlots := make([]candidate, 0)
+	for i, c := range eligible {
+		if i < keepLast {
+			continue
+		}
+		if policy.MinAge > 0 && now.Sub(c.finished) < policy.MinAge {
+			continue
+		}
+		pruneSlots = append(pruneSlots, c)
+	}
+	if len(pruneSlots) == 0 {
+		return result, nil
+	}
+
+	if policy.ArchiveFile != "" {
+		archivedAt := now.UTC()
+		if err := os.MkdirAll(filepath.Dir(policy.ArchiveFile), 0755); err != nil {
+			return result, fmt.Errorf("create archive dir: %w", err)
+		}
+		f, err := os.OpenFile(policy.ArchiveFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return result, fmt.Errorf("open archive: %w", err)
+		}
+		enc := json.NewEncoder(f)
+		for _, c := range pruneSlots {
+			rec := archivedSessionRecord{Slot: c.slot, ArchivedAt: archivedAt, Session: c.sess}
+			if err := enc.Encode(rec); err != nil {
+				_ = f.Close()
+				return result, fmt.Errorf("write archive record: %w", err)
+			}
+			result.Archived++
+		}
+		if err := f.Close(); err != nil {
+			return result, fmt.Errorf("close archive: %w", err)
+		}
+	}
+
+	for _, c := range pruneSlots {
+		delete(s.Sessions, c.slot)
+		result.Removed++
+	}
+	return result, nil
+}
+
 // StaleSessionPolicy controls reconciliation of sessions that have been idle
 // past their useful lifetime. The policy is intentionally conservative so a
 // live worker is never reclassified as stale.

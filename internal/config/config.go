@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/befeast/maestro/internal/outcome"
 	"gopkg.in/yaml.v3"
@@ -594,6 +595,73 @@ func (c StaleSessionReconcilerConfig) MergedPRDismissesEnabled() bool {
 	return *c.MergedPRDismisses
 }
 
+// SessionRetentionConfig bounds the growth of state.Sessions by compacting
+// terminal sessions once both the count and age floors are exceeded (#497).
+// Defaults keep the 20 newest terminal sessions per project and any terminal
+// session younger than 7 days (whichever is larger), and append pruned
+// sessions to <state_dir>/sessions-archive.jsonl for forensics.
+type SessionRetentionConfig struct {
+	Enabled     *bool  `yaml:"enabled,omitempty"`      // default: true
+	KeepLast    int    `yaml:"keep_last,omitempty"`    // default: 20 (0 = default; negative = no count floor)
+	MinAgeDays  int    `yaml:"min_age_days,omitempty"` // default: 7  (0 = default; negative = no age floor)
+	Archive     *bool  `yaml:"archive,omitempty"`      // default: true
+	ArchiveFile string `yaml:"archive_file,omitempty"` // default: <state_dir>/sessions-archive.jsonl
+}
+
+// IsEnabled reports whether session retention runs. Default true.
+func (c SessionRetentionConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+// EffectiveKeepLast returns the count floor. 0 means "use default (20)";
+// a negative value disables the count floor entirely.
+func (c SessionRetentionConfig) EffectiveKeepLast() int {
+	if c.KeepLast < 0 {
+		return 0
+	}
+	if c.KeepLast == 0 {
+		return 20
+	}
+	return c.KeepLast
+}
+
+// EffectiveMinAge returns the age floor. 0 means "use default (7d)";
+// a negative value disables the age floor entirely.
+func (c SessionRetentionConfig) EffectiveMinAge() time.Duration {
+	if c.MinAgeDays < 0 {
+		return 0
+	}
+	if c.MinAgeDays == 0 {
+		return 7 * 24 * time.Hour
+	}
+	return time.Duration(c.MinAgeDays) * 24 * time.Hour
+}
+
+// ArchiveEnabled reports whether pruned sessions are appended to a JSONL
+// archive before deletion. Default true.
+func (c SessionRetentionConfig) ArchiveEnabled() bool {
+	if c.Archive == nil {
+		return true
+	}
+	return *c.Archive
+}
+
+// EffectiveArchiveFile returns the absolute path to the archive file, or
+// empty when archiving is disabled. stateDir is the per-project state
+// directory and is used as the default location.
+func (c SessionRetentionConfig) EffectiveArchiveFile(stateDir string) string {
+	if !c.ArchiveEnabled() {
+		return ""
+	}
+	if strings.TrimSpace(c.ArchiveFile) != "" {
+		return expandHome(c.ArchiveFile)
+	}
+	return filepath.Join(stateDir, "sessions-archive.jsonl")
+}
+
 type Config struct {
 	Server                          ServerConfig                 `yaml:"server"`
 	Supervisor                      SupervisorConfig             `yaml:"supervisor"`
@@ -643,6 +711,7 @@ type Config struct {
 	BlockerPatterns                 []string                     `yaml:"blocker_patterns"`         // regex patterns to detect blocker references in issue body (e.g. "blocked by #(\\d+)")
 	PollIntervalSeconds             int                          `yaml:"poll_interval_seconds"`    // override poll interval from config (0 = use CLI flag)
 	StaleSessionReconciler          StaleSessionReconcilerConfig `yaml:"stale_session_reconciler"` // filter stale supervisor sessions from operator attention
+	SessionRetention                SessionRetentionConfig       `yaml:"session_retention"`        // #497: bound state.Sessions growth via terminal-session compaction
 	SourcePath                      string                       `yaml:"-"`                        // path the config was loaded from (not serialized)
 }
 

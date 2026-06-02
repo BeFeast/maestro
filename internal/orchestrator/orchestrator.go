@@ -1177,6 +1177,12 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 		// daemon clears it — a `run --once` reconcile tick must not lift a
 		// drain that an operator is mid-way through.
 		o.clearSpawnDrainOnStartup()
+
+		// #497: bound state.Sessions growth — sweep terminal sessions
+		// older than the retention window at daemon startup, before the
+		// first poll cycle. Idempotent: a no-op when nothing is past the
+		// floors. Failures are logged inside the helper.
+		o.compactTerminalSessionsOnStartup()
 	}
 	if err := o.RunOnce(); err != nil {
 		log.Printf("[orch] run error: %v", err)
@@ -1230,6 +1236,43 @@ func (o *Orchestrator) clearSpawnDrainOnStartup() {
 		return
 	}
 	log.Printf("[orch] drain flag cleared on startup — resuming normal spawns")
+}
+
+// compactTerminalSessionsOnStartup applies cfg.SessionRetention to the
+// persisted state once at daemon startup so the long-running supervise loop
+// does not have to wait a full cycle before bounding state.Sessions (#497).
+// Idempotent: a no-op when retention is disabled or nothing falls outside
+// both retention floors. Failures are logged; the daemon still starts.
+func (o *Orchestrator) compactTerminalSessionsOnStartup() {
+	if o == nil || o.cfg == nil {
+		return
+	}
+	if !o.cfg.SessionRetention.IsEnabled() {
+		return
+	}
+	s, err := state.Load(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] compact sessions: load state: %v", err)
+		return
+	}
+	policy := state.SessionRetentionPolicy{
+		KeepLast:    o.cfg.SessionRetention.EffectiveKeepLast(),
+		MinAge:      o.cfg.SessionRetention.EffectiveMinAge(),
+		ArchiveFile: o.cfg.SessionRetention.EffectiveArchiveFile(o.cfg.StateDir),
+	}
+	res, err := s.CompactSessions(policy, time.Now().UTC())
+	if err != nil {
+		log.Printf("[orch] compact sessions: %v", err)
+		return
+	}
+	if res.Removed == 0 {
+		return
+	}
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		log.Printf("[orch] compact sessions: save: %v", err)
+		return
+	}
+	log.Printf("[orch] startup compaction removed %d terminal session(s) (archived=%d)", res.Removed, res.Archived)
 }
 
 // reloadConfig applies non-destructive config changes at runtime.
