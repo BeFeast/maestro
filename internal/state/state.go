@@ -1761,6 +1761,47 @@ func (s *State) RejectApproval(id string, now time.Time, actor, reason string) (
 	return approval, nil
 }
 
+// SupersedeApproval marks a pending or awaiting_dispatch approval as
+// superseded by operator action (#533 spec gap 7: bulk supersede). The
+// supervisor uses markApprovalSuperseded for automatic dedup when fresh
+// state lands; this exported variant gives the dashboard the same lever
+// for operator-driven dismissal of stale or duplicate cards without
+// rejecting them — semantically "this card is no longer relevant", not
+// "the action is forbidden".
+//
+// Returns ErrApprovalNotFound when no approval matches id, or
+// ErrApprovalNotPending when the approval is in a terminal state
+// (rejected/stale/superseded/executed/execution_failed/execution_skipped).
+// Approved-but-not-yet-executed approvals are NOT supersedable here — the
+// operator already committed to executing them; the executor pipeline
+// owns the terminal transition.
+func (s *State) SupersedeApproval(id string, now time.Time, actor, reason string) (*Approval, error) {
+	approval, ok := s.FindApproval(id)
+	if !ok {
+		return nil, ErrApprovalNotFound
+	}
+	if approval.Status == ApprovalStatusStale {
+		return approval, ErrApprovalStale
+	}
+	if approval.Status == ApprovalStatusSuperseded {
+		return approval, ErrApprovalSuperseded
+	}
+	if approval.Status != ApprovalStatusPending && approval.Status != ApprovalStatusAwaitingDispatch {
+		return approval, ErrApprovalNotPending
+	}
+	approval.Status = ApprovalStatusSuperseded
+	approval.UpdatedAt = normalizedTime(now)
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:              approval.UpdatedAt,
+		Event:           ApprovalAuditSuperseded,
+		Actor:           actor,
+		Reason:          reason,
+		PayloadHash:     approval.PayloadHash,
+		TargetStateHash: approval.TargetStateHash,
+	})
+	return approval, nil
+}
+
 // MarkStaleApprovals marks pending approvals stale when their payload or target snapshot changes.
 func (s *State) MarkStaleApprovals(now time.Time) int {
 	count := 0

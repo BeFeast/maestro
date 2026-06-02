@@ -27,6 +27,41 @@ type approvalDecisionResponse struct {
 	Approval *state.Approval `json:"approval"`
 }
 
+// approvalBulkRequest is the JSON body accepted by bulk reject/supersede
+// endpoints (#533 spec gap 7). IDs is the list of approval identifiers
+// the operator multi-selected on the dashboard; Verb is "reject" or
+// "supersede" — the server applies the same audit-recorded transition
+// to each id, atomically (single state.Save) so a partial failure does
+// not leave the queue in a half-applied state.
+type approvalBulkRequest struct {
+	IDs    []string `json:"ids"`
+	Verb   string   `json:"verb"`
+	Actor  string   `json:"actor,omitempty"`
+	Reason string   `json:"reason,omitempty"`
+}
+
+// approvalBulkItemResult describes the per-id outcome inside an
+// approvalBulkResponse. Status is "ok" for an applied transition,
+// "skipped" when the approval was already in a terminal state, or
+// "error" with Error populated for unrecoverable per-id failures.
+type approvalBulkItemResult struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// approvalBulkResponse is the JSON body returned by bulk endpoints. OK
+// is true when at least one id was applied AND no id produced an error.
+// Counts let the dashboard render a "rejected 3, skipped 1" toast
+// without re-scanning Items.
+type approvalBulkResponse struct {
+	OK      bool                     `json:"ok"`
+	Applied int                      `json:"applied"`
+	Skipped int                      `json:"skipped"`
+	Errors  int                      `json:"errors"`
+	Items   []approvalBulkItemResult `json:"items"`
+}
+
 // approvalRoute is "approve" or "reject" parsed from the URL.
 type approvalRoute struct {
 	id   string
@@ -144,12 +179,147 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 	writeJSON(w, http.StatusOK, approvalDecisionResponse{OK: true, Approval: approval})
 }
 
+// applyApprovalBulk runs reject-or-supersede across a set of approval ids
+// in a single state Load/Save (#533 spec gap 7). Each id transitions
+// independently — an already-terminal approval is reported with
+// status="skipped" instead of failing the whole batch — but the final
+// state.Save is conditional on at least one transition succeeding, so a
+// "no ids matched" request does not churn the on-disk state.
+//
+// Identity rules mirror applyApprovalDecision: the authenticated actor
+// (when auth is configured) overrides any body field; the read-only
+// gate fires AFTER auth so an unauthenticated probe always sees 401.
+func applyApprovalBulk(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, stateDir string, auth authChecker) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	authenticatedActor, ok := requireAuth(w, r, auth)
+	if !ok {
+		return
+	}
+	if readOnly {
+		writeError(w, http.StatusForbidden, scope+" is read-only; approval write actions require approval-backed controls to be enabled in configuration")
+		return
+	}
+	if strings.TrimSpace(stateDir) == "" {
+		writeError(w, http.StatusInternalServerError, "no state dir is available to update approvals")
+		return
+	}
+
+	var req approvalBulkRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode bulk approval request: %v", err))
+			return
+		}
+	}
+	verb := strings.TrimSpace(req.Verb)
+	if verb != "reject" && verb != "supersede" {
+		writeError(w, http.StatusBadRequest, "verb must be \"reject\" or \"supersede\"")
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "ids is required and must contain at least one approval id")
+		return
+	}
+
+	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
+	reason := strings.TrimSpace(req.Reason)
+
+	st, err := state.Load(stateDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load state: %v", err))
+		return
+	}
+
+	now := time.Now().UTC()
+	resp := approvalBulkResponse{Items: make([]approvalBulkItemResult, 0, len(req.IDs))}
+	seen := make(map[string]struct{}, len(req.IDs))
+	for _, raw := range req.IDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		var txErr error
+		switch verb {
+		case "reject":
+			_, txErr = st.RejectApproval(id, now, actor, reason)
+		case "supersede":
+			_, txErr = st.SupersedeApproval(id, now, actor, reason)
+		}
+		item := approvalBulkItemResult{ID: id}
+		switch {
+		case txErr == nil:
+			item.Status = "ok"
+			resp.Applied++
+		case errors.Is(txErr, state.ErrApprovalNotFound):
+			item.Status = "error"
+			item.Error = txErr.Error()
+			resp.Errors++
+		case errors.Is(txErr, state.ErrApprovalStale),
+			errors.Is(txErr, state.ErrApprovalSuperseded),
+			errors.Is(txErr, state.ErrApprovalNotPending),
+			errors.Is(txErr, state.ErrApprovalPayloadMismatch):
+			// Already-resolved approvals are not failures for bulk —
+			// the operator may have re-submitted after a partial apply
+			// or a stale snapshot. Report them as skipped so the SPA
+			// can render «3 rejected · 1 skipped» without raising an
+			// error banner.
+			item.Status = "skipped"
+			item.Error = txErr.Error()
+			resp.Skipped++
+		default:
+			item.Status = "error"
+			item.Error = txErr.Error()
+			resp.Errors++
+		}
+		resp.Items = append(resp.Items, item)
+	}
+
+	// Persist only when at least one transition actually mutated state.
+	// A "nothing applied" request leaves the on-disk store untouched.
+	if resp.Applied > 0 {
+		if err := state.Save(stateDir, st); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
+			return
+		}
+	}
+	resp.OK = resp.Applied > 0 && resp.Errors == 0
+	status := http.StatusOK
+	if !resp.OK && resp.Applied == 0 && resp.Errors > 0 {
+		// All ids errored — surface 4xx so the dashboard treats the
+		// response as a failure, not a half-success.
+		status = http.StatusBadRequest
+	}
+	writeJSON(w, status, resp)
+}
+
 // --- single-project server hookup -------------------------------------------
 
 func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
+	// #533 spec gap 7: /api/v1/approvals/bulk handles multi-id
+	// reject/supersede. Route it here so the single-project server does
+	// not need a separate mux entry (the catch-all /api/v1/approvals/
+	// prefix already owns this segment).
+	if strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/v1/approvals/")) == "bulk" {
+		stateDir := ""
+		cfg := s.cfg
+		if cfg != nil {
+			stateDir = cfg.StateDir
+		}
+		applyApprovalBulk(w, r, cfgServerReadOnly(cfg), "server", stateDir, s.auth)
+		return
+	}
 	route, ok := parseApprovalPath("/api/v1/approvals/", r.URL.Path)
 	if !ok {
-		writeError(w, http.StatusNotFound, "expected /api/v1/approvals/{id}/{approve|reject}")
+		writeError(w, http.StatusNotFound, "expected /api/v1/approvals/{id}/{approve|reject} or /api/v1/approvals/bulk")
 		return
 	}
 	stateDir := ""
@@ -182,9 +352,33 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	if _, ok := requireAuth(w, r, s.auth); !ok {
 		return
 	}
+	// #533 spec gap 7: /api/v1/fleet/approvals/bulk handles multi-id
+	// reject/supersede across one project (selected via ?project=...).
+	if strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/v1/fleet/approvals/")) == "bulk" {
+		projectName := strings.TrimSpace(r.URL.Query().Get("project"))
+		if projectName == "" {
+			writeError(w, http.StatusBadRequest, "project query parameter is required")
+			return
+		}
+		project, ok := s.findProject(projectName)
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("unknown project %q", projectName))
+			return
+		}
+		readOnly := s.readOnly
+		if project.cfg != nil && project.cfg.Server.ReadOnly {
+			readOnly = true
+		}
+		stateDir := ""
+		if project.cfg != nil {
+			stateDir = project.cfg.StateDir
+		}
+		applyApprovalBulk(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, s.auth)
+		return
+	}
 	route, ok := parseApprovalPath("/api/v1/fleet/approvals/", r.URL.Path)
 	if !ok {
-		writeError(w, http.StatusNotFound, "expected /api/v1/fleet/approvals/{id}/{approve|reject}?project=...")
+		writeError(w, http.StatusNotFound, "expected /api/v1/fleet/approvals/{id}/{approve|reject}?project=... or /api/v1/fleet/approvals/bulk?project=...")
 		return
 	}
 	projectName := strings.TrimSpace(r.URL.Query().Get("project"))

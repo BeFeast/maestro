@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
@@ -514,7 +515,24 @@ type fleetApprovalState struct {
 	UpdatedAgeSeconds int64                   `json:"updated_age_seconds,omitempty"`
 	Risk              string                  `json:"risk,omitempty"`
 	Summary           string                  `json:"summary,omitempty"`
-	PastSLA           bool                    `json:"past_sla,omitempty"`
+	// Title is the short, action-first card title introduced for #533
+	// (spec gap 12). Format: "<verb> · #<target>" — e.g. "Start worker
+	// · #487", "Merge PR · #123". The SPA renders Title as the card
+	// heading and Summary as the body, eliminating the 1:1 duplication
+	// where both spots used to read the same supervisor reasoning.
+	Title string `json:"title,omitempty"`
+	// GroupKey collapses re-emitted approvals on the same target onto
+	// one card (spec gap 1). Two approvals on PR #99 share GroupKey
+	// "pr:99"; the SPA renders a single card with the «regenerated 2
+	// times» badge instead of two flat rows.
+	GroupKey string `json:"group_key,omitempty"`
+	// GroupSize is the count of LIVE approvals (pending +
+	// awaiting_dispatch + approved-but-not-executed) sharing this
+	// GroupKey on the same project. 1 for a singleton; ≥2 for a
+	// regenerated group. The SPA uses this for the «regenerated N
+	// times» badge.
+	GroupSize int  `json:"group_size,omitempty"`
+	PastSLA   bool `json:"past_sla,omitempty"`
 
 	createdAt time.Time
 	updatedAt time.Time
@@ -2730,8 +2748,46 @@ func makeFleetApprovalStates(project fleetProjectState, st *state.State, now tim
 	for _, approval := range st.Approvals {
 		items = append(items, makeFleetApprovalState(project, st, approval, now))
 	}
+	// #533 spec gap 1: count live approvals per (group_key) so the SPA can
+	// fold N re-emitted approvals on the same target onto one card with a
+	// «regenerated N times» badge. Counts only "live" statuses (pending,
+	// awaiting_dispatch, approved-not-yet-executed) — resolved approvals
+	// (rejected, stale, superseded, executed) have already exited the
+	// queue and should not inflate the regenerated count.
+	liveByGroup := make(map[string]int, len(items))
+	for _, item := range items {
+		if item.GroupKey == "" {
+			continue
+		}
+		if !isLiveFleetApprovalStatus(item.Status) {
+			continue
+		}
+		liveByGroup[item.GroupKey]++
+	}
+	for i := range items {
+		if items[i].GroupKey == "" {
+			continue
+		}
+		if n, ok := liveByGroup[items[i].GroupKey]; ok && n > 0 {
+			items[i].GroupSize = n
+		}
+	}
 	sortFleetApprovals(items)
 	return items
+}
+
+// isLiveFleetApprovalStatus reports whether the named approval status
+// represents an unresolved (still effective) record that contributes to
+// the per-target regenerated count. Used by makeFleetApprovalStates when
+// computing GroupSize (#533 spec gap 1).
+func isLiveFleetApprovalStatus(status string) bool {
+	switch state.ApprovalStatus(status) {
+	case state.ApprovalStatusPending,
+		state.ApprovalStatusAwaitingDispatch,
+		state.ApprovalStatusApproved:
+		return true
+	}
+	return false
 }
 
 func makeFleetApprovalState(project fleetProjectState, st *state.State, approval state.Approval, now time.Time) fleetApprovalState {
@@ -2758,6 +2814,8 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		Status:            string(approval.Status),
 		Risk:              approval.Risk,
 		Summary:           approval.Summary,
+		Title:             approver.ApprovalTitle(&approval),
+		GroupKey:          approver.ApprovalGroupKey(&approval),
 		CreatedAt:         formatFleetTime(createdAt),
 		UpdatedAt:         formatFleetTime(updatedAt),
 		CreatedAge:        formatFleetAge(createdAt, now),

@@ -675,18 +675,33 @@ function mapApproval(approval) {
     0,
     Math.floor(Number(approval.updated_age_seconds || approval.created_age_seconds || 0) / 60)
   );
+  // Issue #533 spec gap 12: prefer the server-rendered short Title
+  // ("Start worker · #487") over the long supervisor summary. Older fleet
+  // snapshots (pre-#533) lack the field — fall back to the action label
+  // plus target so the SPA never crashes and the card still reads as a
+  // verb+target, not as the full reasoning sentence.
+  const fallbackTitle = `${actionLabel(approval.action)}${
+    approval.pr_number ? ` · #${approval.pr_number}` :
+    approval.issue_number ? ` · #${approval.issue_number}` : ""
+  }`;
+  const title = approval.title || fallbackTitle;
   return {
     ...approval,
     project: approval.project_name || "",
     pr: approval.pr_number || 0,
-    title: approval.summary || actionLabel(approval.action),
+    title,
     author: approval.session || approval.decision_id || "supervisor",
     reviewer: approval.risk || "operator",
     ageMin,
     sla: 30,
     state: approvalTone(approval),
+    // body = supervisor's reasoning. Distinct from title (gap 12): the SPA
+    // renders body only when it differs from title, so the long sentence
+    // appears exactly once, as the body.
     body: approval.summary || "",
     stage: actionLabel(approval.action),
+    groupKey: approval.group_key || "",
+    groupSize: Number(approval.group_size || 0),
   };
 }
 
@@ -1013,6 +1028,56 @@ export async function postProjectApproval({ approvalId, verb, actor, reason }) {
     body: JSON.stringify({ actor: actor || "dashboard", reason: reason || "" }),
   });
   return parseApprovalResponse(res, verb);
+}
+
+// postFleetApprovalBulk / postProjectApprovalBulk drive the multi-id
+// reject/supersede endpoints introduced for #533 spec gap 7. The body
+// shape mirrors approvalBulkRequest on the server; the response is the
+// approvalBulkResponse (counts + per-id Items) so the SPA can render
+// "rejected 3, skipped 1" inline without re-fetching.
+export async function postFleetApprovalBulk({ approvalIds, project, verb, actor, reason }) {
+  if (!Array.isArray(approvalIds) || approvalIds.length === 0) {
+    throw new Error("approvalIds must be a non-empty array");
+  }
+  if (!project) throw new Error("project is required");
+  if (verb !== "reject" && verb !== "supersede") throw new Error("verb must be reject|supersede");
+  const url = `/api/v1/fleet/approvals/bulk?project=${encodeURIComponent(project)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: approvalIds, verb, actor: actor || "dashboard", reason: reason || "" }),
+  });
+  return parseBulkApprovalResponse(res, verb);
+}
+
+export async function postProjectApprovalBulk({ approvalIds, verb, actor, reason }) {
+  if (!Array.isArray(approvalIds) || approvalIds.length === 0) {
+    throw new Error("approvalIds must be a non-empty array");
+  }
+  if (verb !== "reject" && verb !== "supersede") throw new Error("verb must be reject|supersede");
+  const res = await fetch("/api/v1/approvals/bulk", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: approvalIds, verb, actor: actor || "dashboard", reason: reason || "" }),
+  });
+  return parseBulkApprovalResponse(res, verb);
+}
+
+async function parseBulkApprovalResponse(res, verb) {
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch (_) {
+    /* non-JSON; fall through */
+  }
+  if (!res.ok) {
+    const msg = (payload && (payload.error || payload.message)) || `bulk ${verb} failed with status ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.payload = payload;
+    throw err;
+  }
+  return payload;
 }
 
 async function parseApprovalResponse(res, verb) {
