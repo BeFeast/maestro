@@ -1343,8 +1343,52 @@ function ApprovalRow({ a }) {
 }
 
 export function SettingsScreen() {
-  const { fleet } = useFleet();
+  const { fleet, refresh } = useFleet();
   const [section, setSection] = React.useState("general");
+  const [selectedSlug, setSelectedSlug] = React.useState("");
+  const [editProject, setEditProject] = React.useState(null);
+  const [editReason, setEditReason] = React.useState("");
+  const [editBusy, setEditBusy] = React.useState(false);
+  const [editResult, setEditResult] = React.useState(null);
+  const projects = fleet?.projects || [];
+  React.useEffect(() => {
+    if (!projects.length) return;
+    if (!selectedSlug || !projects.some(p => p.slug === selectedSlug)) {
+      setSelectedSlug(projects[0].slug);
+    }
+  }, [projects, selectedSlug]);
+  const selectedProject = projects.find(p => p.slug === selectedSlug) || projects[0] || null;
+
+  const openEdit = project => {
+    setEditProject(project);
+    setEditReason("");
+    setEditResult(null);
+  };
+  const closeEdit = () => {
+    if (editBusy) return;
+    setEditProject(null);
+    setEditReason("");
+  };
+  const submitEdit = async () => {
+    if (!editProject || !editReason.trim()) return;
+    setEditBusy(true);
+    setEditResult(null);
+    try {
+      const resp = await postFleetAction({
+        actionId: editProject.effectiveConfig?.approvalAction || "change_global_config",
+        project: editProject.name,
+        reason: editReason.trim(),
+      });
+      setEditResult({ tone: "ok", text: resp?.approval_id ? `Approval ${resp.approval_id} queued.` : "Approval queued." });
+      setEditProject(null);
+      setEditReason("");
+      await refresh();
+    } catch (err) {
+      setEditResult({ tone: "stuck", text: err?.message || String(err) });
+    } finally {
+      setEditBusy(false);
+    }
+  };
 
   return (
     <div>
@@ -1358,6 +1402,7 @@ export function SettingsScreen() {
           {[
             ["general", "General"],
             ["projects", "Projects"],
+            ["effective", "Effective config"],
           ].map(([k, lbl]) => (
             <a key={k} className={section === k ? "active" : ""} onClick={() => setSection(k)}>{lbl}</a>
           ))}
@@ -1377,6 +1422,11 @@ export function SettingsScreen() {
                 <span className="desc">Projects loaded from fleet YAML.</span>
                 <span className="mono">{fleet?.projects?.length || 0}</span>
               </div>
+              <div className="setting-row">
+                <label>Config edits</label>
+                <span className="desc">Dashboard edits enqueue the cautious config-change approval.</span>
+                <Pill tone="watch" noDot>change_global_config</Pill>
+              </div>
             </div>
           )}
 
@@ -1390,13 +1440,181 @@ export function SettingsScreen() {
                     <div className="dim mono" style={{ fontSize: 11 }}>{project.repo} · max {project.maxParallel || "—"} parallel</div>
                   </div>
                   <Pill tone={project.goal ? "ok" : "idle"} noDot>{project.goal ? "configured" : "unconfigured"}</Pill>
-                  <button className="tb-btn ghost" disabled>Edit</button>
+                  <button className="tb-btn ghost" onClick={() => { setSelectedSlug(project.slug); setSection("effective"); }}>View</button>
                 </div>
               ))}
             </div>
           )}
+
+          {section === "effective" && (
+            <div>
+              <div className="setting-card">
+                <div className="settings-project-head">
+                  <div>
+                    <h4>Effective project config</h4>
+                    <div className="mono dim" style={{ fontSize: 11 }}>
+                      {selectedProject?.repo || "—"} · sanitized runtime view
+                    </div>
+                  </div>
+                  <select
+                    className="setting-input"
+                    value={selectedProject?.slug || ""}
+                    onChange={e => setSelectedSlug(e.target.value)}
+                  >
+                    {projects.map(project => <option key={project.slug} value={project.slug}>{project.slug}</option>)}
+                  </select>
+                </div>
+                {selectedProject ? (
+                  <EffectiveConfigView project={selectedProject} onEdit={() => openEdit(selectedProject)} />
+                ) : (
+                  <div className="dim" style={{ padding: "var(--s-4)" }}>No projects configured.</div>
+                )}
+                {editResult && (
+                  <div className="mono mt-3" style={{ fontSize: 11, color: editResult.tone === "stuck" ? "var(--stuck)" : "var(--ok)" }}>
+                    {editResult.text}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
+      </div>
+
+      <ConfirmDialog
+        open={editProject !== null}
+        title={editProject ? `Request config change for ${editProject.slug}?` : ""}
+        confirmLabel="Queue approval"
+        busy={editBusy}
+        onClose={closeEdit}
+        onConfirm={submitEdit}
+      >
+        <div style={{ marginBottom: 12, fontSize: 12, color: "var(--fg-2)" }}>
+          This enqueues <strong>change_global_config</strong> through the approval pipeline. It does not write config directly.
+        </div>
+        <label htmlFor="config-change-reason" style={{ display: "block", fontSize: 11, color: "var(--fg-2)", marginBottom: 4 }}>
+          Requested change and reason
+        </label>
+        <textarea
+          id="config-change-reason"
+          value={editReason}
+          onChange={e => setEditReason(e.target.value)}
+          rows={4}
+          autoFocus
+          disabled={editBusy}
+          placeholder="Example: lower max_parallel to 2 until the provider cooldown clears."
+          style={{
+            width: "100%",
+            fontFamily: "inherit",
+            fontSize: 13,
+            padding: 8,
+            border: "1px solid var(--border-1)",
+            borderRadius: "var(--r-2)",
+            background: "var(--bg-0)",
+            color: "var(--fg-0)",
+            resize: "vertical",
+            boxSizing: "border-box",
+          }}
+        />
+        {!editReason.trim() && <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>A reason is required before the approval can be queued.</div>}
+      </ConfirmDialog>
+    </div>
+  );
+}
+
+function EffectiveConfigView({ project, onEdit }) {
+  const cfg = project.effectiveConfig;
+  if (!cfg) {
+    return <div className="dim" style={{ padding: "var(--s-4)" }}>Effective config is unavailable for this project.</div>;
+  }
+  const labels = cfg.labels || {};
+  const retention = cfg.retention || {};
+  const cost = cfg.costCaps || {};
+  const gate = cfg.supervisorGate || {};
+  return (
+    <div>
+      <div className="settings-summary-grid">
+        <SettingMetric label="max_parallel" value={cfg.maxParallel || "—"} />
+        <SettingMetric label="review_gate" value={cfg.reviewGate || "—"} />
+        <SettingMetric label="default backend" value={cfg.modelPolicy?.default || "—"} />
+        <SettingMetric label="pricing" value={`${cost.backendPricingConfigured || 0}/${cost.backendPricingTotal || 0}`} />
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-title">Model policy</div>
+        <div className="kv"><span>Default</span><strong className="mono">{cfg.modelPolicy?.default || "—"}</strong></div>
+        <div className="kv"><span>Fallbacks</span><TagList values={cfg.modelPolicy?.fallbackBackends} /></div>
+        <div className="kv"><span>Routing</span><span className="mono">{routingLabel(cfg.modelPolicy?.routing)}</span></div>
+        <div className="settings-backends">
+          {(cfg.modelPolicy?.backends || []).map(backend => (
+            <div key={backend.name} className="settings-backend">
+              <div>
+                <strong className="mono">{backend.name}</strong>
+                <div className="dim" style={{ fontSize: 11 }}>
+                  {[backend.provider, backend.model, backend.variant, backend.effort].filter(Boolean).join(" · ") || "metadata not set"}
+                </div>
+              </div>
+              <Pill tone={backend.enabled ? "ok" : "idle"} noDot>{backend.enabled ? "enabled" : "disabled"}</Pill>
+              <span className="mono dim" style={{ fontSize: 11 }}>{backend.priceConfigured ? "priced" : "unpriced"}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-title">Gates and labels</div>
+        <div className="kv"><span>Issue labels</span><TagList values={labels.issue} empty="all open issues" /></div>
+        <div className="kv"><span>Exclude labels</span><TagList values={labels.exclude} /></div>
+        <div className="kv"><span>Ready / blocked</span><TagList values={[labels.ready, labels.blocked].filter(Boolean)} /></div>
+        <div className="kv"><span>Supervisor approvals</span><TagList values={gate.approvalRequired} /></div>
+        <div className="kv"><span>Completion labels</span><TagList values={labels.completionRequired} /></div>
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-title">Retention and cost caps</div>
+        <div className="kv"><span>Session retention</span><strong>{retention.enabled ? "enabled" : "disabled"}</strong></div>
+        <div className="kv"><span>Keep last / min age</span><span className="mono">{retention.keepLast || "—"} · {retention.minAge || "—"}</span></div>
+        <div className="kv"><span>Archive</span><span>{retention.archiveEnabled ? (retention.archiveFilePresent ? "custom location configured" : "default archive") : "disabled"}</span></div>
+        <div className="kv"><span>Worker token cap</span><span className="mono">{cost.workerMaxTokens || "unlimited"}</span></div>
+        <div className="kv"><span>Soft token threshold</span><span className="mono">{cost.workerSoftTokenThreshold == null ? "default" : cost.workerSoftTokenThreshold}</span></div>
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-title">Supervisor config gate</div>
+        <div className="kv"><span>Mode</span><span className="mono">{gate.mode || "—"}</span></div>
+        <div className="kv"><span>Safe actions</span><TagList values={gate.safeActions} /></div>
+        <div className="kv"><span>Approval-required actions</span><TagList values={gate.approvalRequiredActions} /></div>
+        <div className="kv"><span>Review repair</span><span>{gate.reviewRepairActive ? `${gate.reviewRepairBackend || "backend"} · ${gate.reviewRepairMaxRetries || 0} retry` : "disabled"}</span></div>
+      </div>
+
+      <div className="settings-edit-row">
+        <div>
+          <strong>Need to change runtime config?</strong>
+          <div className="dim" style={{ fontSize: 11.5 }}>Requests are approval-gated and recorded in project state.</div>
+        </div>
+        <button className="tb-btn primary" disabled={project.readOnly} onClick={onEdit}>
+          Request edit
+        </button>
       </div>
     </div>
   );
+}
+
+function SettingMetric({ label, value }) {
+  return (
+    <div className="settings-metric">
+      <span>{label}</span>
+      <strong className="mono">{value}</strong>
+    </div>
+  );
+}
+
+function TagList({ values, empty = "—" }) {
+  const list = (values || []).filter(Boolean);
+  if (!list.length) return <span className="dim">{empty}</span>;
+  return <span className="settings-tags">{list.map(v => <span key={v} className="mono">{v}</span>)}</span>;
+}
+
+function routingLabel(routing) {
+  if (!routing) return "—";
+  return [routing.mode, routing.router_model || routing.routerModel, routing.router_model_name || routing.routerModelName].filter(Boolean).join(" · ") || "—";
 }

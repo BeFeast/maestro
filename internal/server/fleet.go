@@ -512,6 +512,90 @@ type fleetProjectState struct {
 	// USD windows per backend and per issue (#619). Backends without
 	// pricing configured render in the SPA as tokens only.
 	CostObservability fleetCostObservability `json:"cost_observability"`
+
+	// EffectiveConfig is the sanitized, parsed runtime config surfaced on
+	// MC Settings (#622). It deliberately excludes raw YAML, commands,
+	// auth, notification endpoints/tokens and local prompt paths.
+	EffectiveConfig fleetEffectiveConfig `json:"effective_config"`
+}
+
+type fleetEffectiveConfig struct {
+	ModelPolicy    fleetModelPolicy      `json:"model_policy"`
+	MaxParallel    int                   `json:"max_parallel"`
+	ReviewGate     string                `json:"review_gate"`
+	Labels         fleetConfigLabels     `json:"labels"`
+	Retention      fleetConfigRetention  `json:"retention"`
+	CostCaps       fleetConfigCostCaps   `json:"cost_caps"`
+	SupervisorGate fleetConfigSupervisor `json:"supervisor_gate"`
+	ApprovalAction string                `json:"approval_action"`
+}
+
+type fleetModelPolicy struct {
+	Default          string                        `json:"default"`
+	FallbackBackends []string                      `json:"fallback_backends,omitempty"`
+	Backends         []fleetEffectiveBackendConfig `json:"backends"`
+	Routing          fleetEffectiveRoutingConfig   `json:"routing"`
+}
+
+type fleetEffectiveBackendConfig struct {
+	Name             string  `json:"name"`
+	Enabled          bool    `json:"enabled"`
+	Provider         string  `json:"provider,omitempty"`
+	Model            string  `json:"model,omitempty"`
+	Variant          string  `json:"variant,omitempty"`
+	Effort           string  `json:"effort,omitempty"`
+	PromptMode       string  `json:"prompt_mode,omitempty"`
+	NonAgentic       bool    `json:"non_agentic,omitempty"`
+	PriceConfigured  bool    `json:"price_configured"`
+	InputUSDPerMtok  float64 `json:"input_usd_per_mtok,omitempty"`
+	OutputUSDPerMtok float64 `json:"output_usd_per_mtok,omitempty"`
+}
+
+type fleetEffectiveRoutingConfig struct {
+	Mode            string `json:"mode,omitempty"`
+	RouterModel     string `json:"router_model,omitempty"`
+	RouterModelName string `json:"router_model_name,omitempty"`
+}
+
+type fleetConfigLabels struct {
+	Issue        []string `json:"issue,omitempty"`
+	Exclude      []string `json:"exclude,omitempty"`
+	Ready        string   `json:"ready,omitempty"`
+	Blocked      string   `json:"blocked,omitempty"`
+	Excluded     []string `json:"supervisor_excluded,omitempty"`
+	AllowTypes   []string `json:"allow_issue_types,omitempty"`
+	Mission      []string `json:"mission,omitempty"`
+	Completion   []string `json:"completion_required,omitempty"`
+	Verification string   `json:"verification,omitempty"`
+}
+
+type fleetConfigRetention struct {
+	Enabled            bool   `json:"enabled"`
+	KeepLast           int    `json:"keep_last,omitempty"`
+	MinAge             string `json:"min_age,omitempty"`
+	ArchiveEnabled     bool   `json:"archive_enabled"`
+	ArchiveFilePresent bool   `json:"archive_file_present"`
+}
+
+type fleetConfigCostCaps struct {
+	WorkerMaxTokens          int      `json:"worker_max_tokens,omitempty"`
+	WorkerSoftTokenThreshold *float64 `json:"worker_soft_token_threshold,omitempty"`
+	BackendPricingConfigured int      `json:"backend_pricing_configured"`
+	BackendPricingTotal      int      `json:"backend_pricing_total"`
+}
+
+type fleetConfigSupervisor struct {
+	Mode                    string   `json:"mode,omitempty"`
+	DryRun                  bool     `json:"dry_run,omitempty"`
+	SafeActions             []string `json:"safe_actions,omitempty"`
+	ApprovalRequired        []string `json:"approval_required,omitempty"`
+	AllowedActions          []string `json:"allowed_actions,omitempty"`
+	ApprovalRequiredActions []string `json:"approval_required_actions,omitempty"`
+	CompletionGatesActive   bool     `json:"completion_gates_active"`
+	HandoffPlannerActive    bool     `json:"handoff_planner_active"`
+	ReviewRepairActive      bool     `json:"review_repair_active"`
+	ReviewRepairBackend     string   `json:"review_repair_backend,omitempty"`
+	ReviewRepairMaxRetries  int      `json:"review_repair_max_retries,omitempty"`
 }
 
 type fleetCloseCandidate struct {
@@ -2192,6 +2276,87 @@ func fleetWorkerStartedAt(worker fleetWorkerState) time.Time {
 	return startedAt
 }
 
+func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
+	if cfg == nil {
+		return fleetEffectiveConfig{}
+	}
+	backends := make([]fleetEffectiveBackendConfig, 0, len(cfg.Model.Backends))
+	priced := 0
+	for name, def := range cfg.Model.Backends {
+		if def.Pricing.Configured() {
+			priced++
+		}
+		backends = append(backends, fleetEffectiveBackendConfig{
+			Name:             name,
+			Enabled:          def.IsEnabled(),
+			Provider:         strings.TrimSpace(def.Provider),
+			Model:            strings.TrimSpace(def.Model),
+			Variant:          strings.TrimSpace(def.Variant),
+			Effort:           strings.TrimSpace(def.Effort),
+			PromptMode:       strings.TrimSpace(def.PromptMode),
+			NonAgentic:       def.NonAgentic,
+			PriceConfigured:  def.Pricing.Configured(),
+			InputUSDPerMtok:  def.Pricing.InputUSDPerMtok,
+			OutputUSDPerMtok: def.Pricing.OutputUSDPerMtok,
+		})
+	}
+	sort.Slice(backends, func(i, j int) bool { return backends[i].Name < backends[j].Name })
+
+	retention := cfg.SessionRetention
+	return fleetEffectiveConfig{
+		ModelPolicy: fleetModelPolicy{
+			Default:          strings.TrimSpace(cfg.Model.Default),
+			FallbackBackends: append([]string(nil), cfg.Model.FallbackBackends...),
+			Backends:         backends,
+			Routing: fleetEffectiveRoutingConfig{
+				Mode:            strings.TrimSpace(cfg.Routing.Mode),
+				RouterModel:     strings.TrimSpace(cfg.Routing.RouterModel),
+				RouterModelName: strings.TrimSpace(cfg.Routing.RouterModelName),
+			},
+		},
+		MaxParallel: cfg.MaxParallel,
+		ReviewGate:  strings.TrimSpace(cfg.ReviewGate),
+		Labels: fleetConfigLabels{
+			Issue:        append([]string(nil), cfg.IssueLabels...),
+			Exclude:      append([]string(nil), cfg.ExcludeLabels...),
+			Ready:        strings.TrimSpace(cfg.Supervisor.ReadyLabel),
+			Blocked:      strings.TrimSpace(cfg.Supervisor.BlockedLabel),
+			Excluded:     append([]string(nil), cfg.Supervisor.ExcludedLabels...),
+			AllowTypes:   append([]string(nil), cfg.Supervisor.AllowIssueTypes...),
+			Mission:      append([]string(nil), cfg.Missions.Labels...),
+			Completion:   append([]string(nil), cfg.Supervisor.CompletionGates.RequiredLabels...),
+			Verification: strings.TrimSpace(cfg.Supervisor.CompletionGates.VerificationLabel),
+		},
+		Retention: fleetConfigRetention{
+			Enabled:            retention.IsEnabled(),
+			KeepLast:           retention.EffectiveKeepLast(),
+			MinAge:             retention.EffectiveMinAge().String(),
+			ArchiveEnabled:     retention.ArchiveEnabled(),
+			ArchiveFilePresent: strings.TrimSpace(retention.ArchiveFile) != "",
+		},
+		CostCaps: fleetConfigCostCaps{
+			WorkerMaxTokens:          cfg.WorkerMaxTokens,
+			WorkerSoftTokenThreshold: cfg.WorkerSoftTokenThreshold,
+			BackendPricingConfigured: priced,
+			BackendPricingTotal:      len(backends),
+		},
+		SupervisorGate: fleetConfigSupervisor{
+			Mode:                    strings.TrimSpace(cfg.Supervisor.Mode),
+			DryRun:                  cfg.Supervisor.DryRun,
+			SafeActions:             append([]string(nil), cfg.Supervisor.SafeActions...),
+			ApprovalRequired:        append([]string(nil), cfg.Supervisor.ApprovalRequired...),
+			AllowedActions:          append([]string(nil), cfg.Supervisor.AllowedActions...),
+			ApprovalRequiredActions: append([]string(nil), cfg.Supervisor.ApprovalRequiredActions...),
+			CompletionGatesActive:   cfg.Supervisor.CompletionGates.Active(),
+			HandoffPlannerActive:    cfg.Supervisor.HandoffPlanner.Active(),
+			ReviewRepairActive:      cfg.Supervisor.ReviewRepair.Active(),
+			ReviewRepairBackend:     cfg.Supervisor.ReviewRepair.EffectiveBackend(),
+			ReviewRepairMaxRetries:  cfg.Supervisor.ReviewRepair.EffectiveMaxRetries(),
+		},
+		ApprovalAction: config.SupervisorActionChangeGlobalConfig,
+	}
+}
+
 func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (fleetProjectState, []fleetWorkerState) {
 	cfg := project.cfg
 	item := fleetProjectState{
@@ -2211,6 +2376,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.ReadOnly = cfg.Server.ReadOnly || s.readOnly
 	item.Outcome = outcome.StatusFor(cfg.Outcome, 0, time.Time{})
 	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", item.Name)
+	item.EffectiveConfig = buildFleetEffectiveConfig(cfg)
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, nil, now)
 	item.ProjectBoard = project.snapshotBoard()
 

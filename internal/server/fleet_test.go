@@ -232,6 +232,154 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 }
 
+func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, nil)
+	secret := "super-secret-token-622"
+	enabled := false
+	soft := 0.75
+	cfg := &config.Config{
+		Repo:                     "owner/settings",
+		StateDir:                 stateDir,
+		LocalPath:                filepath.Join(dir, "local-"+secret),
+		WorkerPrompt:             filepath.Join(dir, "prompt-"+secret),
+		MaxParallel:              4,
+		ReviewGate:               "none",
+		IssueLabels:              []string{"ready", "bug"},
+		ExcludeLabels:            []string{"hold"},
+		WorkerMaxTokens:          200000,
+		WorkerSoftTokenThreshold: &soft,
+		Telegram: config.TelegramConfig{
+			BotToken:    secret,
+			OpenclawURL: "https://relay.example/" + secret,
+		},
+		Model: config.ModelConfig{
+			Default:          "codex",
+			FallbackBackends: []string{"claude"},
+			Backends: map[string]config.BackendDef{
+				"codex": {
+					Cmd:        "codex --token " + secret,
+					ExtraArgs:  []string{"--api-key", secret},
+					Provider:   "openai",
+					Model:      "gpt-5.5",
+					Effort:     "high",
+					PromptMode: "stdin",
+					Pricing:    config.BackendPricing{InputUSDPerMtok: 1.25, OutputUSDPerMtok: 10},
+				},
+				"helper": {
+					Cmd:     "helper " + secret,
+					Enabled: &enabled,
+				},
+			},
+		},
+		Supervisor: config.SupervisorConfig{
+			Mode:                    "cautious",
+			ReadyLabel:              "maestro-ready",
+			BlockedLabel:            "blocked",
+			ApprovalRequired:        []string{config.SupervisorActionChangeGlobalConfig},
+			ApprovalRequiredActions: []string{"spawn_worker"},
+			SafeActions:             []string{config.SupervisorActionAddIssueComment},
+			CompletionGates:         config.SupervisorCompletionGatesConfig{RequiredLabels: []string{"runtime-verified"}},
+		},
+		SessionRetention: config.SessionRetentionConfig{
+			KeepLast:    12,
+			MinAgeDays:  3,
+			ArchiveFile: filepath.Join(dir, "archive-"+secret+".jsonl"),
+		},
+	}
+	srv := NewFleet([]FleetProject{NewFleetProject("Settings", "/tmp/settings.yaml", "", cfg)}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, secret) {
+		t.Fatalf("fleet snapshot leaked secret-bearing config value: %s", body)
+	}
+
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Projects) != 1 {
+		t.Fatalf("projects len = %d, want 1", len(resp.Projects))
+	}
+	eff := resp.Projects[0].EffectiveConfig
+	if eff.MaxParallel != 4 || eff.ReviewGate != "none" || eff.ModelPolicy.Default != "codex" {
+		t.Fatalf("effective config basics = %+v", eff)
+	}
+	if eff.ApprovalAction != config.SupervisorActionChangeGlobalConfig {
+		t.Fatalf("approval action = %q", eff.ApprovalAction)
+	}
+	if eff.Labels.Ready != "maestro-ready" || eff.Labels.Blocked != "blocked" || !containsString(eff.Labels.Completion, "runtime-verified") {
+		t.Fatalf("labels = %+v", eff.Labels)
+	}
+	if !eff.Retention.Enabled || eff.Retention.KeepLast != 12 || eff.Retention.MinAge != (72*time.Hour).String() || !eff.Retention.ArchiveFilePresent {
+		t.Fatalf("retention = %+v", eff.Retention)
+	}
+	if eff.CostCaps.WorkerMaxTokens != 200000 || eff.CostCaps.WorkerSoftTokenThreshold == nil || *eff.CostCaps.WorkerSoftTokenThreshold != soft || eff.CostCaps.BackendPricingConfigured != 1 {
+		t.Fatalf("cost caps = %+v", eff.CostCaps)
+	}
+	if len(eff.ModelPolicy.Backends) != 2 {
+		t.Fatalf("backends len = %d, want 2", len(eff.ModelPolicy.Backends))
+	}
+	var codex fleetEffectiveBackendConfig
+	for _, backend := range eff.ModelPolicy.Backends {
+		if backend.Name == "codex" {
+			codex = backend
+		}
+	}
+	if !codex.Enabled || codex.Provider != "openai" || codex.Model != "gpt-5.5" || !codex.PriceConfigured {
+		t.Fatalf("codex backend = %+v", codex)
+	}
+}
+
+func TestFleetChangeGlobalConfigEnqueuesApproval(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, nil)
+	cfg := &config.Config{
+		Repo:     "owner/settings",
+		StateDir: stateDir,
+		Server:   config.ServerConfig{ReadOnly: false},
+	}
+	srv := NewFleet([]FleetProject{NewFleetProject("Settings", "/tmp/settings.yaml", "", cfg)}, "127.0.0.1", 8786, false)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fleet/actions", bytes.NewBufferString(`{
+		"action_id":"change_global_config",
+		"project":"Settings",
+		"reason":"lower max_parallel to 2 during provider cooldown"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handleFleetAction(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+
+	var resp approvalEnqueueResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.OK || resp.ActionID != config.SupervisorActionChangeGlobalConfig || resp.ApprovalID == "" {
+		t.Fatalf("response = %+v", resp)
+	}
+	st, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if len(st.Approvals) != 1 {
+		t.Fatalf("approvals len = %d, want 1", len(st.Approvals))
+	}
+	if st.Approvals[0].Action != config.SupervisorActionChangeGlobalConfig || st.Approvals[0].Status != state.ApprovalStatusPending {
+		t.Fatalf("approval = %+v", st.Approvals[0])
+	}
+}
+
 func TestFleetThroughputBucketsAggregateSevenDayWindows(t *testing.T) {
 	now := time.Date(2026, 5, 2, 15, 0, 0, 0, time.UTC)
 	donePR := func(pr int, finishedAt time.Time) fleetWorkerState {
@@ -3793,6 +3941,15 @@ func findFleetApproval(t *testing.T, approvals []fleetApprovalState, id string) 
 func saveFleetTestState(t *testing.T, dir string, sessions map[string]*state.Session) {
 	t.Helper()
 	saveFleetTestSnapshot(t, dir, sessions, nil)
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // TestFleetAPIIncludesProjectBoardSnapshot pins #529: when a fleet project

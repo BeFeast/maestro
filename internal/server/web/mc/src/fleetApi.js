@@ -520,8 +520,86 @@ function mapProject(project, workers, now) {
     tapeEvents: deriveTapeEvents(project, workers, now),
     projectBoard: mapProjectBoard(project.project_board),
     costObservability: mapCostObservability(project.cost_observability),
+    effectiveConfig: mapEffectiveConfig(project.effective_config),
     raw: project,
   };
+}
+
+function mapEffectiveConfig(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const policy = raw.model_policy || {};
+  const labels = raw.labels || {};
+  const retention = raw.retention || {};
+  const costCaps = raw.cost_caps || {};
+  const gate = raw.supervisor_gate || {};
+  return {
+    modelPolicy: {
+      default: String(policy.default || ""),
+      fallbackBackends: Array.isArray(policy.fallback_backends) ? policy.fallback_backends.map(String) : [],
+      backends: Array.isArray(policy.backends) ? policy.backends.map(mapEffectiveBackend) : [],
+      routing: policy.routing || {},
+    },
+    maxParallel: Number(raw.max_parallel || 0),
+    reviewGate: String(raw.review_gate || ""),
+    labels: {
+      issue: arrayOfString(labels.issue),
+      exclude: arrayOfString(labels.exclude),
+      ready: String(labels.ready || ""),
+      blocked: String(labels.blocked || ""),
+      supervisorExcluded: arrayOfString(labels.supervisor_excluded),
+      allowIssueTypes: arrayOfString(labels.allow_issue_types),
+      mission: arrayOfString(labels.mission),
+      completionRequired: arrayOfString(labels.completion_required),
+      verification: String(labels.verification || ""),
+    },
+    retention: {
+      enabled: retention.enabled === true,
+      keepLast: Number(retention.keep_last || 0),
+      minAge: String(retention.min_age || ""),
+      archiveEnabled: retention.archive_enabled === true,
+      archiveFilePresent: retention.archive_file_present === true,
+    },
+    costCaps: {
+      workerMaxTokens: Number(costCaps.worker_max_tokens || 0),
+      workerSoftTokenThreshold: costCaps.worker_soft_token_threshold == null ? null : Number(costCaps.worker_soft_token_threshold),
+      backendPricingConfigured: Number(costCaps.backend_pricing_configured || 0),
+      backendPricingTotal: Number(costCaps.backend_pricing_total || 0),
+    },
+    supervisorGate: {
+      mode: String(gate.mode || ""),
+      dryRun: gate.dry_run === true,
+      safeActions: arrayOfString(gate.safe_actions),
+      approvalRequired: arrayOfString(gate.approval_required),
+      allowedActions: arrayOfString(gate.allowed_actions),
+      approvalRequiredActions: arrayOfString(gate.approval_required_actions),
+      completionGatesActive: gate.completion_gates_active === true,
+      handoffPlannerActive: gate.handoff_planner_active === true,
+      reviewRepairActive: gate.review_repair_active === true,
+      reviewRepairBackend: String(gate.review_repair_backend || ""),
+      reviewRepairMaxRetries: Number(gate.review_repair_max_retries || 0),
+    },
+    approvalAction: String(raw.approval_action || "change_global_config"),
+  };
+}
+
+function mapEffectiveBackend(raw) {
+  return {
+    name: String(raw?.name || ""),
+    enabled: raw?.enabled !== false,
+    provider: String(raw?.provider || ""),
+    model: String(raw?.model || ""),
+    variant: String(raw?.variant || ""),
+    effort: String(raw?.effort || ""),
+    promptMode: String(raw?.prompt_mode || ""),
+    nonAgentic: raw?.non_agentic === true,
+    priceConfigured: raw?.price_configured === true,
+    inputUSDPerMtok: Number(raw?.input_usd_per_mtok || 0),
+    outputUSDPerMtok: Number(raw?.output_usd_per_mtok || 0),
+  };
+}
+
+function arrayOfString(v) {
+  return Array.isArray(v) ? v.map(String).filter(Boolean) : [];
 }
 
 // mapProjectBoard normalizes the optional /api/v1/fleet `project_board` payload
