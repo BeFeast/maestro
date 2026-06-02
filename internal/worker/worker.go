@@ -95,7 +95,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
-	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
+	if err := writePromptFile(promptFile, prompt); err != nil {
 		return "", fmt.Errorf("write prompt file: %w", err)
 	}
 
@@ -236,7 +236,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
-	if err := os.WriteFile(promptFile, []byte(prompt), 0644); err != nil {
+	if err := writePromptFile(promptFile, prompt); err != nil {
 		return fmt.Errorf("write prompt file: %w", err)
 	}
 
@@ -765,7 +765,7 @@ func readValidationContract(worktreePath string) string {
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	return sanitizePromptUTF8(string(data))
 }
 
 // assemblePrompt builds the final worker prompt.
@@ -866,7 +866,7 @@ func appendSectionsAndValidation(prompt string, sectionPaths []string, validatio
 			continue
 		}
 		b.WriteString("\n\n---\n\n")
-		b.WriteString(string(data))
+		b.WriteString(sanitizePromptUTF8(string(data)))
 	}
 
 	// Append validation contract if present and not already inlined

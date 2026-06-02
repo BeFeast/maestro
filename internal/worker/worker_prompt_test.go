@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
@@ -211,5 +212,27 @@ func TestAssemblePrompt_NoValidationFileIsOK(t *testing.T) {
 	// Should still produce a valid prompt
 	if !strings.Contains(prompt, "Base prompt with 1") {
 		t.Error("prompt should work without VALIDATION.md")
+	}
+}
+
+func TestAssemblePrompt_SanitizesInjectedFileContext(t *testing.T) {
+	dir := t.TempDir()
+	section := filepath.Join(dir, "section.md")
+	if err := os.WriteFile(section, []byte{'#', ' ', 'S', 'e', 'c', 't', 'i', 'o', 'n', '\n', 0xff}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "VALIDATION.md"), []byte{'V', 'a', 'l', 'i', 'd', 'a', 't', 'i', 'o', 'n', ':', ' ', 0xfe}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", PromptSections: []string{section}}
+	issue := github.Issue{Number: 7, Title: "utf8", Body: "body"}
+	prompt := assemblePrompt("Base prompt with {{ISSUE_NUMBER}} and {{VALIDATION_CONTRACT}}", issue, dir, "feat/utf8", cfg)
+
+	if !utf8.ValidString(prompt) {
+		t.Fatalf("assembled prompt is not valid UTF-8: %q", prompt)
+	}
+	if got := strings.Count(prompt, "\uFFFD"); got != 2 {
+		t.Fatalf("replacement count = %d, want 2; prompt=%q", got, prompt)
 	}
 }

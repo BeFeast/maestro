@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestBuildWorkerCmd_Claude(t *testing.T) {
@@ -141,6 +142,31 @@ func TestBuildWorkerCmd_Codex(t *testing.T) {
 	}
 	if cmd.Dir != worktree {
 		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+func TestBuildWorkerCmd_CodexPromptFileIsValidUTF8(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	prompt := "assembled prompt with invalid byte: " + string([]byte{0xff}) + " end"
+	if err := writePromptFile(promptFile, prompt); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stdinFile, err := BuildWorkerCmd("codex", BackendConfig{Cmd: "codex"}, promptFile, "/tmp/codex-worktree")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !utf8.Valid(data) {
+		t.Fatalf("codex stdin prompt is not valid UTF-8: %q", data)
+	}
+	if !strings.Contains(string(data), "\uFFFD") {
+		t.Fatalf("expected invalid byte to be replaced with U+FFFD, got %q", string(data))
 	}
 }
 
