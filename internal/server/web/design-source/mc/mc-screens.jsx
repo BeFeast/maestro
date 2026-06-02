@@ -410,13 +410,23 @@ function WorkerDrawer({ worker, onClose, now }) {
           </div>
 
           <div className="drawer-sec">
-            <div className="drawer-sec-title">Actions</div>
-            <div className="row gap-2">
-              <button className="tb-btn">Open PR in GitHub →</button>
-              <button className="tb-btn ghost">Restart worker</button>
-              <button className="tb-btn ghost" style={{ color: "var(--stuck)" }}>Stop worker</button>
+            <div className="drawer-sec-title">Controls</div>
+            <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+              <button className="tb-btn">Mark ready</button>
+              <button className="tb-btn recovery">
+                Restart <span className="mono dim" style={{ fontSize: 10, marginLeft: 4 }}>(approval)</span>
+              </button>
+              <button className="tb-btn danger">
+                Stop <span className="mono approval-on-danger" style={{ fontSize: 10, marginLeft: 4 }}>(approval)</span>
+              </button>
+              <button className="tb-btn">
+                Approve merge <span className="mono dim" style={{ fontSize: 10, marginLeft: 4 }}>(approval)</span>
+              </button>
             </div>
-            <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>Write actions disabled in read-only mode.</div>
+            <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>
+              Mutating clicks open a confirmation dialog. Verbs tagged (approval) enqueue a pending Approval on the cautious gate; the action does not execute until resolved from Approvals.
+            </div>
+            <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>Controls are disabled while the fleet runs in read-only mode.</div>
           </div>
         </div>
       </div>

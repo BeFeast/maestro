@@ -616,7 +616,7 @@ function AttributionTimeline({ attribution, now }) {
 }
 
 export function WorkerDrawer({ worker, onClose, now }) {
-  const { fleet } = useFleet();
+  const { fleet, refresh } = useFleet();
   const [detail, setDetail] = React.useState(null);
   const [error, setError] = React.useState(null);
   const logRef = React.useRef(null);
@@ -741,7 +741,7 @@ export function WorkerDrawer({ worker, onClose, now }) {
             </div>
           </div>
 
-          <WorkerActionsPanel worker={worker} readOnly={fleet?.readOnly} />
+          <WorkerActionsPanel worker={worker} readOnly={fleet?.readOnly} refresh={refresh} />
 
           <div className="drawer-sec">
             <div className="drawer-sec-title">Links</div>
@@ -778,10 +778,18 @@ export function WorkerDrawer({ worker, onClose, now }) {
 // Approval the operator completes from the Approvals screen. Buttons
 // the server reports as `disabled` keep their disabled state and
 // expose the server's reason as a tooltip.
-function WorkerActionsPanel({ worker, readOnly }) {
+//
+// #476 (dashboard write-path, frontend): every mutating click is gated
+// behind a ConfirmDialog. Approval-required verbs make the
+// approval-gate semantics explicit in the body so the operator knows
+// the click enqueues a pending Approval rather than executing
+// immediately.
+function WorkerActionsPanel({ worker, readOnly, refresh }) {
   const actions = Array.isArray(worker?.actions) ? worker.actions : [];
   const [busyId, setBusyId] = React.useState("");
   const [message, setMessage] = React.useState(null);
+  const [pending, setPending] = React.useState(null);
+  const [pendingReason, setPendingReason] = React.useState("");
 
   if (!actions.length) return null;
 
@@ -790,8 +798,14 @@ function WorkerActionsPanel({ worker, readOnly }) {
   const issueNumber = worker.issue_number || worker.issue?.num || 0;
   const prNumber = worker.pr_number || 0;
 
-  const onClick = async (action) => {
-    if (action.disabled || busyId) return;
+  const closeDialog = () => {
+    setPending(null);
+    setPendingReason("");
+  };
+
+  const send = async () => {
+    if (!pending) return;
+    const action = pending;
     setBusyId(action.id);
     setMessage(null);
     try {
@@ -801,11 +815,16 @@ function WorkerActionsPanel({ worker, readOnly }) {
         slot,
         issueNumber,
         prNumber,
+        reason: pendingReason.trim(),
       });
       const tag = resp?.approval_id
-        ? `approval ${resp.approval_id}`
+        ? `approval ${resp.approval_id} queued`
         : (resp?.action_id ? `executed ${resp.action_id}` : "ok");
       setMessage({ tone: "ok", text: `${action.label || action.id}: ${tag}` });
+      closeDialog();
+      if (typeof refresh === "function") {
+        try { await refresh(); } catch (_) { /* swallow; message already surfaced */ }
+      }
     } catch (err) {
       setMessage({ tone: "stuck", text: `${action.label || action.id}: ${err.message || String(err)}` });
     } finally {
@@ -813,13 +832,30 @@ function WorkerActionsPanel({ worker, readOnly }) {
     }
   };
 
+  const openConfirm = (action) => {
+    if (action.disabled || busyId) return;
+    setMessage(null);
+    setPendingReason("");
+    setPending(action);
+  };
+
+  const targetSummary = [
+    slot && `slot ${slot}`,
+    issueNumber > 0 && `issue #${issueNumber}`,
+    prNumber > 0 && `PR #${prNumber}`,
+    project && `project ${project}`,
+  ].filter(Boolean).join(" · ");
+
+  const isDangerVerb = (id) => id === "stop_worker";
+  const isRecoveryVerb = (id) => id === "restart_worker";
+
   return (
     <div className="drawer-sec">
       <div className="drawer-sec-title">Controls</div>
       <div className="row gap-2" style={{ flexWrap: "wrap" }}>
         {actions.map(action => {
-          const danger = action.id === "stop_worker";
-          const recovery = action.id === "restart_worker";
+          const danger = isDangerVerb(action.id);
+          const recovery = isRecoveryVerb(action.id);
           const cls = "tb-btn"
             + (danger ? " danger" : "")
             + (recovery ? " recovery" : "")
@@ -834,7 +870,7 @@ function WorkerActionsPanel({ worker, readOnly }) {
               className={cls}
               disabled={action.disabled || busyId === action.id}
               title={title}
-              onClick={() => onClick(action)}
+              onClick={() => openConfirm(action)}
             >
               {busyId === action.id ? "…" : (action.label || action.id)}
               {action.requires_approval && !action.disabled && (
@@ -854,6 +890,73 @@ function WorkerActionsPanel({ worker, readOnly }) {
           Controls are disabled while the fleet runs in read-only mode.
         </div>
       )}
+      <ConfirmDialog
+        open={pending !== null}
+        title={pending ? `${pending.label || pending.id}?` : ""}
+        danger={pending ? isDangerVerb(pending.id) : false}
+        confirmLabel={pending ? (pending.label || pending.id) : "Confirm"}
+        busy={!!busyId}
+        onClose={closeDialog}
+        onConfirm={send}
+      >
+        {pending && (
+          <>
+            <div className="mono dim" style={{ fontSize: 11, marginBottom: 8 }}>
+              action: {pending.label || pending.id}
+              {targetSummary ? ` · ${targetSummary}` : ""}
+            </div>
+            <div style={{ marginBottom: 12, fontSize: 12, color: "var(--fg-2)" }}>
+              {pending.requires_approval ? (
+                <>
+                  This <strong>enqueues a pending Approval</strong> on the cautious gate;
+                  the action does <strong>not</strong> execute until the approval is
+                  resolved from the Approvals screen.
+                </>
+              ) : (
+                <>
+                  This will <strong>execute immediately</strong> against GitHub.
+                </>
+              )}
+            </div>
+            {pending.description && pending.description !== pending.label && (
+              <div className="dim" style={{ fontSize: 11.5, marginBottom: 12 }}>{pending.description}</div>
+            )}
+            <label htmlFor={`reason-action-${slot || "p"}-${pending.id}`} style={{ display: "block", fontSize: 11, color: "var(--fg-2)", marginBottom: 4 }}>
+              Reason <span className="dim">(optional, recorded in the audit log)</span>
+            </label>
+            <textarea
+              id={`reason-action-${slot || "p"}-${pending.id}`}
+              value={pendingReason}
+              onChange={e => setPendingReason(e.target.value)}
+              placeholder={pending.requires_approval ? "why this approval is being enqueued" : "why this safe action is being executed"}
+              autoFocus
+              rows={3}
+              disabled={!!busyId}
+              style={{
+                width: "100%",
+                fontFamily: "inherit",
+                fontSize: 13,
+                padding: 8,
+                border: "1px solid var(--border-1)",
+                borderRadius: "var(--r-2)",
+                background: "var(--bg-0)",
+                color: "var(--fg-0)",
+                resize: "vertical",
+                boxSizing: "border-box",
+              }}
+              onKeyDown={e => {
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                  e.preventDefault();
+                  if (!busyId) send();
+                }
+              }}
+            />
+            <div className="mono dim" style={{ fontSize: 10, marginTop: 4 }}>
+              ⌘/Ctrl+Enter to confirm, Esc to cancel.
+            </div>
+          </>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }
