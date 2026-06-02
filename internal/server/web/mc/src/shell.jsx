@@ -1,6 +1,6 @@
 import React from "react";
 import { Icon } from "./atoms.jsx";
-import { formatRefreshAge } from "./fleetApi.js";
+import { formatRefreshAge, searchFleetItems } from "./fleetApi.js";
 import { useFleet } from "./fleetContext.jsx";
 
 export function BrandMark({ size = 32 }) {
@@ -137,32 +137,34 @@ export function Topbar({ route, navigate, theme, toggleTheme }) {
   );
 }
 
+// CommandPalette is the Cmd-K / Ctrl-K search palette (issue #345 / M-010).
+// It is *read-only*: every entry resolves to either a navigation path, an
+// external URL opened in a new tab, or the local theme toggle. No write
+// actions (approve/reject, retry, dispatch, etc.) are exposed through the
+// palette in V1 — the supervisor's existing approval surfaces stay the only
+// way to take state-changing actions.
 export function CommandPalette({ onClose, navigate, toggleTheme, fleet }) {
   const [q, setQ] = React.useState("");
   const [sel, setSel] = React.useState(0);
-  const projects = fleet?.projects || [];
 
-  const items = React.useMemo(() => {
-    const all = [
-      { kind: "page", title: "Fleet overview", to: "fleet", k: "G F" },
-      { kind: "page", title: "Workers", to: "workers", k: "G W" },
-      { kind: "page", title: "Approvals", to: "approvals", k: "G A" },
-      { kind: "page", title: "Settings", to: "settings", k: "G ," },
-      ...projects.map(project => ({ kind: "project", title: project.slug, to: `project/${project.slug}`, k: "" })),
-      { kind: "action", title: "Toggle theme", to: "theme", k: "T" },
-    ];
-    if (!q) return all;
-    return all.filter(x => x.title.toLowerCase().includes(q.toLowerCase()));
-  }, [q, projects]);
+  const items = React.useMemo(() => searchFleetItems(fleet, q, 12), [fleet, q]);
 
   const inputRef = React.useRef();
   React.useEffect(() => { inputRef.current?.focus(); }, []);
+  React.useEffect(() => { setSel(0); }, [q]);
 
   const select = (i) => {
     const item = items[i];
     if (!item) return;
     if (item.to === "theme") {
       toggleTheme();
+    } else if (item.external) {
+      try {
+        window.open(item.to, "_blank", "noopener,noreferrer");
+      } catch (_) {
+        // Some hosts (jsdom in tests, locked-down embeds) block window.open;
+        // we silently degrade — read-only navigation must never throw.
+      }
     } else {
       navigate(item.to);
     }
@@ -176,24 +178,55 @@ export function CommandPalette({ onClose, navigate, toggleTheme, fleet }) {
     else if (e.key === "Escape") { e.preventDefault(); onClose(); }
   };
 
+  const iconForKind = (kind) => {
+    switch (kind) {
+    case "Project": return <Icon.Project />;
+    case "Dashboard": return <Icon.Fleet />;
+    case "Session": return <Icon.Workers />;
+    case "Issue": return <Icon.Github />;
+    case "PR": return <Icon.Github />;
+    case "Approval": return <Icon.Approval />;
+    case "Action": return <Icon.Settings />;
+    case "Page":
+    default: return <Icon.Fleet />;
+    }
+  };
+
   return (
-    <div className="cmdk-scrim" onClick={onClose}>
+    <div className="cmdk-scrim" onClick={onClose} role="dialog" aria-label="Command palette">
       <div className="cmdk" onClick={e => e.stopPropagation()}>
-        <input ref={inputRef} placeholder="Type a command or search…" value={q} onChange={e => { setQ(e.target.value); setSel(0); }} onKeyDown={onKey} />
-        <div className="cmdk-list">
+        <input
+          ref={inputRef}
+          placeholder="Type a command or search projects, slots, issues, PRs…"
+          value={q}
+          onChange={e => setQ(e.target.value)}
+          onKeyDown={onKey}
+          aria-label="Search"
+          aria-autocomplete="list"
+        />
+        <div className="cmdk-list" role="listbox">
           {items.length === 0 && <div className="dim mono" style={{ padding: "var(--s-3)", fontSize: 11 }}>No results</div>}
           {items.map((it, i) => (
-            <div key={it.to} className={`cmdk-item ${i === sel ? "sel" : ""}`} onClick={() => select(i)} onMouseEnter={() => setSel(i)}>
-              <span style={{ width: 16, color: "var(--fg-3)" }}>
-                {it.kind === "page" && <Icon.Fleet />}
-                {it.kind === "project" && <Icon.Project />}
-                {it.kind === "action" && <Icon.Settings />}
+            <div
+              key={it.id}
+              className={`cmdk-item ${i === sel ? "sel" : ""}`}
+              role="option"
+              aria-selected={i === sel}
+              onClick={() => select(i)}
+              onMouseEnter={() => setSel(i)}
+            >
+              <span style={{ width: 16, color: "var(--fg-3)" }}>{iconForKind(it.kind)}</span>
+              <span style={{ flex: "1 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <strong>{it.title}</strong>
+                {it.meta ? <span className="dim" style={{ marginLeft: 8, fontSize: 11 }}>{it.meta}</span> : null}
               </span>
-              {it.title}
               <span className="dim mono" style={{ fontSize: 10, marginLeft: 6, textTransform: "uppercase" }}>{it.kind}</span>
-              {it.k && <span className="k">{it.k}</span>}
+              {it.external && <span className="k" title="Opens externally">↗</span>}
             </div>
           ))}
+        </div>
+        <div className="cmdk-foot dim mono" style={{ padding: "var(--s-2) var(--s-3)", fontSize: 10, borderTop: "1px solid var(--border-1)" }}>
+          ↑↓ navigate · Enter open · Esc close · read-only
         </div>
       </div>
     </div>

@@ -1045,3 +1045,267 @@ export function pickVerdictTuple(verdict, brief) {
   }
   return splitVerdict((verdict && verdict.sentence) || (brief && brief.sentence) || "");
 }
+
+// Command palette search (issue #345 / M-010).
+//
+// buildSearchIndex turns the already-loaded fleet payload into a flat list
+// of palette-ready entries (one per project, project dashboard, worker
+// session, issue, PR, approval, plus a handful of static pages and read-only
+// actions). The index is pure: it does not call the network and exposes no
+// write controls — read-only is enforced by giving every entry a navigation
+// `to` (path or external URL) and nothing else. Callers (CommandPalette)
+// then filter the index against the typed query with searchFleetItems.
+//
+// Each entry shape:
+//   { id, kind, title, meta, to, external, project, slot, rank, terms }
+//
+// `kind` strings are the user-visible category labels in the result row.
+// `external: true` means `to` is an absolute URL the palette should open
+// in a new tab instead of pushing onto history.
+function searchNormalize(value) {
+  return String(value == null ? "" : value).toLowerCase();
+}
+
+function searchCompact(value) {
+  return searchNormalize(value).replace(/[^a-z0-9]+/g, "");
+}
+
+function searchNumberAliases(label, number) {
+  const value = Number(number || 0);
+  if (!Number.isFinite(value) || value <= 0) return [];
+  const text = String(value);
+  const prefix = String(label || "").trim();
+  return [text, "#" + text, prefix + " " + text, prefix + " #" + text, prefix + text];
+}
+
+function searchMetaText(parts) {
+  return parts
+    .map(value => String(value == null ? "" : value).trim())
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function pushSearchItem(out, seen, item) {
+  if (!item || !item.id || seen.has(item.id)) return;
+  seen.add(item.id);
+  const terms = Array.isArray(item.terms) ? item.terms : [];
+  const blob = [item.kind, item.title, item.meta, item.project, item.slot, item.to]
+    .concat(terms)
+    .map(searchNormalize)
+    .join(" ");
+  out.push({
+    id: item.id,
+    kind: item.kind,
+    title: item.title,
+    meta: item.meta || "",
+    to: item.to || "",
+    external: item.external === true,
+    project: item.project || "",
+    slot: item.slot || "",
+    rank: Number(item.rank || 0),
+    searchText: blob,
+    searchCompact: searchCompact(blob),
+  });
+}
+
+export function buildSearchIndex(fleet) {
+  const out = [];
+  const seen = new Set();
+  const projects = (fleet && fleet.projects) || [];
+  const workers = (fleet && fleet.workers) || [];
+  const approvals = (fleet && fleet.approvals) || [];
+
+  // Static pages — keyboard-friendly jumps even when the fleet is empty.
+  pushSearchItem(out, seen, {
+    id: "page:fleet", kind: "Page", title: "Fleet overview",
+    meta: "Jump to fleet", to: "/fleet", rank: 20,
+    terms: ["fleet", "overview", "home"],
+  });
+  pushSearchItem(out, seen, {
+    id: "page:workers", kind: "Page", title: "Workers",
+    meta: "Jump to workers", to: "/workers", rank: 20,
+    terms: ["workers", "sessions"],
+  });
+  pushSearchItem(out, seen, {
+    id: "page:approvals", kind: "Page", title: "Approvals",
+    meta: "Jump to approvals", to: "/approvals", rank: 20,
+    terms: ["approvals", "pending"],
+  });
+  pushSearchItem(out, seen, {
+    id: "page:settings", kind: "Page", title: "Settings",
+    meta: "Jump to settings", to: "/settings", rank: 10,
+    terms: ["settings", "config"],
+  });
+
+  for (const project of projects) {
+    const slug = project.slug || project.name || "";
+    if (!slug) continue;
+    const stateLabel = (project.state && project.state.label) || "";
+    pushSearchItem(out, seen, {
+      id: "project:" + slug,
+      kind: "Project",
+      title: slug,
+      meta: searchMetaText([project.repo, stateLabel, project.summaryLine]),
+      to: "/project/" + encodeURIComponent(slug),
+      project: slug,
+      rank: 40,
+      terms: ["project", "slug", project.repo, project.name],
+    });
+    if (project.dashboardUrl) {
+      pushSearchItem(out, seen, {
+        id: "dashboard:" + slug,
+        kind: "Dashboard",
+        title: slug + " dashboard",
+        meta: searchMetaText([project.repo, project.dashboardUrl]),
+        to: project.dashboardUrl,
+        external: true,
+        project: slug,
+        rank: 35,
+        terms: ["dashboard", "project dashboard", slug, project.repo],
+      });
+    }
+  }
+
+  for (const worker of workers) {
+    const project = worker.project_name || worker.project || "";
+    const slot = worker.slot || "";
+    if (!project && !slot) continue;
+    const issueNumber = (worker.issue && worker.issue.num) || worker.issue_number || 0;
+    const issueTitle = (worker.issue && worker.issue.title) || worker.issue_title || "";
+    const issueURL = (worker.issue && worker.issue.url) || worker.issue_url || "";
+    const prNumber = worker.pr || worker.pr_number || 0;
+    const prURL = worker.pr_url || "";
+    const status = worker.status || worker.rawStatus || "";
+    const issueAliases = searchNumberAliases("issue", issueNumber);
+    const prAliases = searchNumberAliases("pr", prNumber);
+    const rank = (worker.needs_attention ? 70 : 0) + (worker.live ? 55 : 20);
+    const sessionParams = new URLSearchParams();
+    if (project) sessionParams.set("project", project);
+    if (slot) sessionParams.set("slot", slot);
+    const sessionTo = "/workers" + (sessionParams.toString() ? "?" + sessionParams.toString() : "");
+
+    pushSearchItem(out, seen, {
+      id: "session:" + project + ":" + slot,
+      kind: "Session",
+      title: searchMetaText([project, slot]) || "Worker session",
+      meta: searchMetaText([
+        issueNumber ? "Issue #" + issueNumber : "",
+        prNumber ? "PR #" + prNumber : "",
+        status,
+        worker.branch,
+      ]),
+      to: sessionTo,
+      project,
+      slot,
+      rank,
+      terms: ["worker", "session", "slot", issueTitle, worker.branch].concat(issueAliases, prAliases),
+    });
+
+    if (issueNumber) {
+      pushSearchItem(out, seen, {
+        id: "issue:" + project + ":" + issueNumber + ":" + slot,
+        kind: "Issue",
+        title: "Issue #" + issueNumber,
+        meta: searchMetaText([project, slot, issueTitle]),
+        to: issueURL || sessionTo,
+        external: Boolean(issueURL),
+        project,
+        slot,
+        rank: rank - 5,
+        terms: [issueTitle, "issue"].concat(issueAliases),
+      });
+    }
+
+    if (prNumber) {
+      pushSearchItem(out, seen, {
+        id: "pr:" + project + ":" + prNumber + ":" + slot,
+        kind: "PR",
+        title: "PR #" + prNumber,
+        meta: searchMetaText([project, slot, issueNumber ? "Issue #" + issueNumber : ""]),
+        to: prURL || sessionTo,
+        external: Boolean(prURL),
+        project,
+        slot,
+        rank: rank - 10,
+        terms: [issueTitle, "pull request", "pr"].concat(prAliases),
+      });
+    }
+  }
+
+  for (const approval of approvals) {
+    const project = approval.project_name || approval.project || "";
+    const issueNumber = approval.issue_number || 0;
+    const prNumber = approval.pr_number || approval.pr || 0;
+    const session = approval.session || "";
+    const targets = [];
+    if (issueNumber) targets.push("Issue #" + issueNumber);
+    if (prNumber) targets.push("PR #" + prNumber);
+    if (session) targets.push("Session " + session);
+    const externalURL = approval.pr_url || approval.issue_url || "";
+    pushSearchItem(out, seen, {
+      id: "approval:" + (approval.id || targets.join(":") || project),
+      kind: "Approval",
+      title: targets.length ? "Approval " + targets.join(" / ") : "Approval " + (approval.id || "target"),
+      meta: searchMetaText([project, actionLabel(approval.action), approval.status, approval.summary]),
+      to: externalURL || "/approvals",
+      external: Boolean(externalURL),
+      project,
+      slot: session,
+      rank: (approval.status || "") === "pending" ? 65 : 15,
+      terms: [approval.id, approval.decision_id, approval.summary, approval.action]
+        .concat(searchNumberAliases("issue", issueNumber), searchNumberAliases("pr", prNumber)),
+    });
+  }
+
+  // Read-only action: theme toggle. We intentionally surface no write
+  // actions through the palette in V1 — see acceptance criteria for #345.
+  pushSearchItem(out, seen, {
+    id: "action:theme",
+    kind: "Action",
+    title: "Toggle theme",
+    meta: "Switch light / dark",
+    to: "theme",
+    rank: 5,
+    terms: ["theme", "dark", "light"],
+  });
+
+  return out;
+}
+
+export function fuzzySearchMatch(haystack, needle) {
+  if (!needle) return true;
+  let index = 0;
+  for (const ch of haystack) {
+    if (ch === needle[index]) index++;
+    if (index === needle.length) return true;
+  }
+  return false;
+}
+
+function scoreSearchItem(item, normalized, compact) {
+  if (!normalized) return item.rank;
+  if (item.searchText.includes(normalized)) return item.rank + 100;
+  if (compact && item.searchCompact.includes(compact)) return item.rank + 60;
+  if (compact && fuzzySearchMatch(item.searchCompact, compact)) return item.rank + 25;
+  return -1;
+}
+
+export function searchFleetItems(fleet, query, limit) {
+  const max = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Number(limit) : 12;
+  const index = buildSearchIndex(fleet);
+  const normalized = searchNormalize(query);
+  const compact = searchCompact(query);
+  if (!normalized) {
+    return index.slice().sort((a, b) => b.rank - a.rank).slice(0, max);
+  }
+  const scored = [];
+  for (const item of index) {
+    const score = scoreSearchItem(item, normalized, compact);
+    if (score >= 0) scored.push({ item, score });
+  }
+  scored.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score;
+    return a.item.title.localeCompare(b.item.title);
+  });
+  return scored.slice(0, max).map(entry => entry.item);
+}

@@ -2168,6 +2168,59 @@ func TestFleetDashboardRendersReadOnlySearchPalette(t *testing.T) {
 	}
 }
 
+// TestMissionControlCommandPaletteSearchesFleetData pins the Cmd-K palette
+// to its M-010 contract (issue #345): the palette indexes loaded fleet
+// data — projects, sessions, GitHub issues, PRs, and approvals — so the
+// operator can jump straight to a record by typing its slug or number.
+// The Vite bundle is minified but kind: literals and the placeholder
+// copy survive intact, so we assert against those rather than function
+// names that mangle.
+func TestMissionControlCommandPaletteSearchesFleetData(t *testing.T) {
+	body := mcBundleJS(t)
+	for _, want := range []string{
+		// User-visible kinds for each searchable record type.
+		`kind:"Project"`,
+		`kind:"Dashboard"`,
+		`kind:"Session"`,
+		`kind:"Issue"`,
+		`kind:"PR"`,
+		`kind:"Approval"`,
+		`kind:"Page"`,
+		`kind:"Action"`,
+		// Search input copy advertises the supported record types so an
+		// operator with no fleet loaded still knows what they can type.
+		"projects, slots, issues",
+		// Number-prefix aliases (#123, "issue 123", "pr 123") so a bare
+		// number is enough to land on a GH record.
+		`"#"`,
+		`"issue"`,
+		`"pr"`,
+		// Read-only footer hint surfaces that the palette never mutates state.
+		"read-only",
+	} {
+		if !contains(body, want) {
+			t.Fatalf("mission control command palette bundle should contain %q", want)
+		}
+	}
+
+	// Guardrail: V1 must not expose write actions (approve/reject, retry,
+	// dispatch, merge) through the palette UI itself. We allow the strings
+	// to appear elsewhere in the bundle (the approvals screen uses them),
+	// but the palette must never use any kind: literal that names a
+	// write verb.
+	for _, banned := range []string{
+		`kind:"Approve"`,
+		`kind:"Reject"`,
+		`kind:"Retry"`,
+		`kind:"Merge"`,
+		`kind:"Dispatch"`,
+	} {
+		if contains(body, banned) {
+			t.Fatalf("mission control command palette must not expose write action kind %q in V1", banned)
+		}
+	}
+}
+
 func TestFleetDashboardSearchIndexUsesLoadedFleetData(t *testing.T) {
 	body := legacyFleetJS(t)
 	indexSnippet := dashboardSnippet(t, body, "function buildFleetSearchIndex()", "function fuzzySearchMatch")
