@@ -114,4 +114,3 @@ func TestSafeAction_AuditNilStillExecutes(t *testing.T) {
 		t.Fatalf("gh not called with audit=nil: %v", gh.addLabelCalls)
 	}
 }
-

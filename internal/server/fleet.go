@@ -779,7 +779,16 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeError(w, http.StatusNotImplemented, "approval-backed action endpoints are not implemented yet")
+	// #475 (1/3): the safe and approval-required action endpoints are now
+	// implemented; this fallback is reachable only when a verb is neither
+	// safe, approval-required, nor a known UI-translation alias — i.e. an
+	// unknown action_id. Return 400, not the legacy 501 stub.
+	id := strings.TrimSpace(req.ActionID)
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "action_id is required")
+		return
+	}
+	writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown action_id %q", id))
 }
 
 type fleetAuditLogRequest struct {
