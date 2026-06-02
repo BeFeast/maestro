@@ -2962,6 +2962,16 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 			return false
 		}
 
+		// Real-conflict path (#602): a merge failure that is NOT "not up to
+		// date" can still be a real merge conflict (GitHub returns variants
+		// like "merge commit cannot be cleanly created"). Confirm with the
+		// authoritative mergeable verdict and route to the conflict-resolution
+		// path so retry_exhausted convergence candidates can't loop forever and
+		// halt the queue.
+		if o.routeConflictingMergeFailure(s, slotName, sess, pr, err) {
+			return false
+		}
+
 		// Only notify merge failure once per PR
 		if sess.LastNotifiedStatus != "merge_failed" {
 			o.notifier.Sendf("❌ maestro: failed to merge PR #%d (%s): %v", pr.Number, sess.Branch, err)
@@ -3075,6 +3085,64 @@ func (o *Orchestrator) runDeployCmd(prNumber int) error {
 	return nil
 }
 
+// routeConflictingMergeFailure reconciles a merge failure that GitHub reports
+// as CONFLICTING — the real-merge-conflict sibling of the behind-base path
+// (#602). Returns true when the failure was handled (session advanced to a
+// terminal/self-healing state) and the caller should stop further fallthrough.
+//
+// For StatusPROpen sessions this mirrors the existing CONFLICTING loop in
+// rebaseConflicts (rebase worktree → handleRebaseConflictRetry on failure /
+// markUnresolvableConflict when rebase is impossible). For sessions that are
+// already retry_exhausted (convergence-merge candidates after #565/#574) we
+// must NOT respawn another worker via handleRebaseConflictRetry — the worker
+// has already exhausted its budget — so on rebase failure we go straight to
+// markUnresolvableConflict, which labels the issue blocked and frees the slot.
+func (o *Orchestrator) routeConflictingMergeFailure(s *state.State, slotName string, sess *state.Session, pr github.PR, mergeErr error) bool {
+	mergeable, _, mErr := o.prMergeStatus(pr.Number)
+	if mErr != nil {
+		log.Printf("[orch] PR #%d merge-status lookup after failed merge: %v", pr.Number, mErr)
+		return false
+	}
+	if mergeable != "CONFLICTING" {
+		return false
+	}
+
+	log.Printf("[orch] PR #%d merge failed and GitHub reports CONFLICTING — routing to conflict resolution (#602): %v", pr.Number, mergeErr)
+
+	retryExhausted := sess.Status == state.StatusRetryExhausted
+
+	if !o.cfg.AutoRebase {
+		o.markUnresolvableConflict(slotName, sess, pr.Number, fmt.Errorf("auto_rebase disabled"))
+		return true
+	}
+
+	if strings.TrimSpace(sess.Worktree) == "" {
+		// No worktree to rebase. For an in-flight (pr_open) session let the
+		// retry path handle worker respawn; for a settled retry_exhausted
+		// session the worker is already gone — mark unresolvable so the slot
+		// advances instead of looping on the same merge failure forever.
+		if retryExhausted {
+			o.markUnresolvableConflict(slotName, sess, pr.Number, mergeErr)
+			return true
+		}
+		o.handleRebaseConflictRetry(s, slotName, sess, pr.Number, mergeErr)
+		return true
+	}
+
+	if rerr := o.rebaseWorktree(sess.Worktree, sess.Branch); rerr != nil {
+		log.Printf("[orch] auto-rebase failed for %s: %v", slotName, rerr)
+		if retryExhausted {
+			o.markUnresolvableConflict(slotName, sess, pr.Number, rerr)
+			return true
+		}
+		o.handleRebaseConflictRetry(s, slotName, sess, pr.Number, rerr)
+		return true
+	}
+
+	o.markRebaseQueued(slotName, sess, pr.Number)
+	return true
+}
+
 // rebaseConflicts handles branch conflicts in two phases:
 //  1. Auto-rebase (if enabled)
 //  2. Label issue as blocked + keep session in conflict_failed permanently
@@ -3137,6 +3205,35 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 				continue
 			}
 			o.markRebaseQueued(slotName, sess, pr.Number)
+
+		case state.StatusRetryExhausted:
+			// #602: a retry_exhausted convergence candidate whose PR is
+			// CONFLICTING must reach a terminal advanced state — the worker
+			// has already exhausted retries, so we never respawn from this
+			// branch. Acts as a safety net for mergeReadyPR's primary route.
+			if !hasPR || sess.RebaseAttempted {
+				continue
+			}
+			mergeable, _, mErr := o.prMergeStatus(pr.Number)
+			if mErr != nil {
+				log.Printf("[orch] mergeable PR #%d: %v", pr.Number, mErr)
+				continue
+			}
+			if mergeable != "CONFLICTING" {
+				continue
+			}
+			if o.cfg.AutoRebase && strings.TrimSpace(sess.Worktree) != "" {
+				log.Printf("[orch] retry_exhausted PR #%d is CONFLICTING, attempting one-shot rebase for %s (#602)", pr.Number, slotName)
+				if err := o.rebaseWorktree(sess.Worktree, sess.Branch); err != nil {
+					log.Printf("[orch] rebase for retry_exhausted %s failed: %v — marking unresolvable", slotName, err)
+					o.markUnresolvableConflict(slotName, sess, pr.Number, err)
+					continue
+				}
+				o.markRebaseQueued(slotName, sess, pr.Number)
+				continue
+			}
+			log.Printf("[orch] retry_exhausted PR #%d is CONFLICTING and cannot self-heal (auto_rebase=%v, worktree=%q) — marking unresolvable for %s (#602)", pr.Number, o.cfg.AutoRebase, sess.Worktree, slotName)
+			o.markUnresolvableConflict(slotName, sess, pr.Number, fmt.Errorf("retry_exhausted PR is CONFLICTING"))
 		}
 	}
 }
