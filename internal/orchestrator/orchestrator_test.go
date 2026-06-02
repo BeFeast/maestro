@@ -7987,3 +7987,204 @@ func TestMergeReadyPR_BehindBaseNoWorktreeFallsBackToUpdateBranch(t *testing.T) 
 		t.Fatalf("status = %q, want queued for re-validation after update-branch", sess.Status)
 	}
 }
+
+// #577: a worker that exhausts retries without ever opening a PR (e.g. because
+// the issue was already implemented by a prior `Refs #N` merge) used to leave
+// autoMergePRs logging "waiting for reconciliation" every cycle with no
+// recovery action, halting the dynamic-wave queue at max_parallel=1. The
+// reconciler must apply the configured blocked label so the supervisor's
+// dynamic-wave drops the issue and selects the next candidate.
+func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Supervisor: config.SupervisorConfig{
+			BlockedLabel: "blocked",
+		},
+	}
+	addedLabels := make(map[int]string)
+	o := &Orchestrator{
+		cfg:           cfg,
+		notifier:      &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			addedLabels[number] = label
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["sup-7"] = &state.Session{
+		IssueNumber: 488,
+		IssueTitle:  "already-done issue",
+		Branch:      "feat/sup-7-already-done",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    0,
+	}
+
+	o.autoMergePRs(s)
+
+	if got, want := addedLabels[488], "blocked"; got != want {
+		t.Fatalf("issue #488 label = %q, want %q (no-PR retry_exhausted must mark blocked)", got, want)
+	}
+	sess := s.Sessions["sup-7"]
+	if sess.LastNotifiedStatus != noPRReconciledStatus {
+		t.Fatalf("LastNotifiedStatus = %q, want %q (reconciler must mark idempotent)", sess.LastNotifiedStatus, noPRReconciledStatus)
+	}
+
+	// Second autoMergePRs cycle must NOT re-apply the label or re-notify.
+	clear(addedLabels)
+	o.autoMergePRs(s)
+	if len(addedLabels) != 0 {
+		t.Fatalf("second cycle re-applied labels = %v, want none (idempotency)", addedLabels)
+	}
+}
+
+// #577: when a merged PR already closes the issue (closing-keyword link),
+// the reconciler should auto-close the issue if close_issue is allowed as a
+// safe action without an approval gate. The dynamic-wave queue then sees
+// the issue as closed and advances.
+func TestAutoMergePRs_NoPRRetryExhaustedAutoClosesWhenMergedPRDetected(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Supervisor: config.SupervisorConfig{
+			BlockedLabel: "blocked",
+			SafeActions:  []string{config.SupervisorActionCloseIssue},
+		},
+	}
+	closed := make(map[int]string)
+	labelled := 0
+	o := &Orchestrator{
+		cfg:           cfg,
+		notifier:      &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return issueNumber == 490, nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			closed[number] = comment
+			return nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labelled++
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["sup-9"] = &state.Session{
+		IssueNumber: 490,
+		IssueTitle:  "merged via Refs only",
+		Branch:      "feat/sup-9-merged-elsewhere",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    0,
+	}
+
+	o.autoMergePRs(s)
+
+	if _, ok := closed[490]; !ok {
+		t.Fatalf("issue #490 not auto-closed; closed=%v (merged PR detected + close_issue safe action must close)", closed)
+	}
+	if labelled != 0 {
+		t.Fatalf("blocked label was applied %d times, want 0 (auto-close branch must not also label)", labelled)
+	}
+	if sess := s.Sessions["sup-9"]; sess.LastNotifiedStatus != noPRReconciledStatus {
+		t.Fatalf("LastNotifiedStatus = %q, want %q", sess.LastNotifiedStatus, noPRReconciledStatus)
+	}
+}
+
+// #577: when close_issue is not granted as a safe action (or requires
+// approval) the reconciler must surface the merged-elsewhere issue as a
+// close-candidate without silently re-spawning workers — it must still
+// idempotently mark the session reconciled so the queue advances.
+func TestAutoMergePRs_NoPRRetryExhaustedMergedPRSurfacesCloseCandidate(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Supervisor: config.SupervisorConfig{
+			BlockedLabel: "blocked",
+			ApprovalRequired: []string{
+				config.SupervisorActionCloseIssue,
+			},
+		},
+	}
+	closeCalls := 0
+	labelled := 0
+	o := &Orchestrator{
+		cfg:           cfg,
+		notifier:      &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return true, nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			closeCalls++
+			return nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labelled++
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["sup-11"] = &state.Session{
+		IssueNumber: 491,
+		IssueTitle:  "merged via Refs; close gated",
+		Branch:      "feat/sup-11",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    0,
+	}
+
+	o.autoMergePRs(s)
+
+	if closeCalls != 0 {
+		t.Fatalf("close_issue without safe-action grant must not auto-close; calls=%d", closeCalls)
+	}
+	if labelled != 0 {
+		t.Fatalf("merged-elsewhere branch must not apply blocked label; labelled=%d", labelled)
+	}
+	if sess := s.Sessions["sup-11"]; sess.LastNotifiedStatus != noPRReconciledStatus {
+		t.Fatalf("LastNotifiedStatus = %q, want %q (must still mark reconciled to stop log spam)", sess.LastNotifiedStatus, noPRReconciledStatus)
+	}
+}
+
+// #577: a transient GitHub failure when probing for a merged PR must NOT
+// mark the session reconciled — the next cycle should try again instead of
+// silently dropping the issue.
+func TestAutoMergePRs_NoPRRetryExhaustedHasMergedPRErrorDefersReconcile(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Supervisor: config.SupervisorConfig{
+			BlockedLabel: "blocked",
+		},
+	}
+	o := &Orchestrator{
+		cfg:           cfg,
+		notifier:      &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return false, fmt.Errorf("gh: transient API failure")
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			t.Fatalf("addIssueLabel(%d, %q) must not run when merged-PR probe failed", number, label)
+			return nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			t.Fatalf("closeIssue(%d) must not run when merged-PR probe failed", number)
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["sup-13"] = &state.Session{
+		IssueNumber: 492,
+		IssueTitle:  "transient gh failure",
+		Branch:      "feat/sup-13",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    0,
+	}
+
+	o.autoMergePRs(s)
+
+	if sess := s.Sessions["sup-13"]; sess.LastNotifiedStatus == noPRReconciledStatus {
+		t.Fatalf("transient probe failure must not mark reconciled; LastNotifiedStatus=%q", sess.LastNotifiedStatus)
+	}
+}
