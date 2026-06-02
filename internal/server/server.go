@@ -276,6 +276,12 @@ type sessionInfo struct {
 	PRURL             string `json:"pr_url,omitempty"`
 	TokensUsedAttempt int    `json:"tokens_used_attempt"`
 	TokensUsedTotal   int    `json:"tokens_used_total"`
+	// CostUSDEstimate is the $ estimate for this session's
+	// TokensUsedTotal under the configured per-backend pricing (#619).
+	// Zero when no pricing is configured for the backend or when the
+	// token count is zero. The SPA reads this directly so it never
+	// computes pricing client-side.
+	CostUSDEstimate float64 `json:"cost_usd_estimate,omitempty"`
 	// Runtime / RuntimeSeconds (legacy fields, kept for backwards
 	// compatibility) reflect WORKFLOW elapsed time — StartedAt to
 	// FinishedAt — including PR-open / CI / Greptile / merge waiting.
@@ -934,8 +940,10 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		resp.StuckStates = latestDecision.StuckStates
 	}
 
+	pricing := backendPricingMap(cfg)
 	var activeTokens, totalTokens int
 	for _, info := range sessionInfosWithActions(cfg.Repo, st, cfg.Server.ReadOnly, "/api/v1/actions") {
+		info.CostUSDEstimate = applySessionCostEstimate(info.Backend, info.TokensUsedTotal, pricing)
 		resp.All = append(resp.All, info)
 		summaryStatus := info.Status
 		if info.DisplayStatus != "" {

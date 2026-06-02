@@ -9,6 +9,8 @@ import {
   formatAbsoluteTimestamp,
   formatBackendHealthSentence,
   formatCountdown,
+  formatTokens,
+  formatUSD,
   nextDecisionCountdown,
   pulseFreshnessTone,
   relTimePrecise,
@@ -188,6 +190,172 @@ export function FleetScreen({ navigate }) {
           </Panel>
         </div>
       </div>
+
+      <CostObservabilityPanel cost={fleet.costObservability} />
+    </div>
+  );
+}
+
+// CostObservabilityPanel renders the fleet-wide token + USD spend
+// rollup the server precomputes for /api/v1/fleet (#619). It shows the
+// today/7d totals up top, then a per-backend row table and a
+// per-project row table. The SPA never blends pricing rates client-side
+// — every $ figure comes straight from cost_observability — so the
+// panel degrades gracefully to tokens-only when a backend has no
+// pricing configured.
+export function CostObservabilityPanel({ cost }) {
+  if (!cost) return null;
+  const today = cost.today || {};
+  const week = cost.week || {};
+  const lifetime = cost.lifetime || {};
+  const hasAnyTokens =
+    Number(today.tokens || 0) > 0 ||
+    Number(week.tokens || 0) > 0 ||
+    Number(lifetime.tokens || 0) > 0;
+  if (!hasAnyTokens) {
+    return (
+      <div className="mt-6">
+        <Panel title="Cost & usage" sub="no token activity recorded">
+          <div style={{ padding: "var(--s-5)", textAlign: "center" }}>
+            <div className="dim" style={{ fontSize: 13 }}>
+              No worker has recorded token usage yet. Cost figures will appear here once the first session ticks.
+            </div>
+          </div>
+        </Panel>
+      </div>
+    );
+  }
+  return (
+    <div className="mt-6">
+      <Panel title="Cost & usage" sub="today · 7d · lifetime · per backend · per project">
+        <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+          <div className="row gap-4" style={{ flexWrap: "wrap", marginBottom: "var(--s-3)" }}>
+            <CostWindowCard label="Today" window={today} />
+            <CostWindowCard label="7 days" window={week} />
+            <CostWindowCard label="Lifetime" window={lifetime} />
+          </div>
+
+          {cost.perBackend && cost.perBackend.length > 0 && (
+            <div style={{ marginTop: "var(--s-4)" }}>
+              <div className="mono dim" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+                by backend
+              </div>
+              <CostBackendTable rows={cost.perBackend} />
+            </div>
+          )}
+
+          {cost.perProject && cost.perProject.length > 0 && (
+            <div style={{ marginTop: "var(--s-4)" }}>
+              <div className="mono dim" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+                by project
+              </div>
+              <CostProjectTable rows={cost.perProject} />
+            </div>
+          )}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function CostWindowCard({ label, window: w }) {
+  const tokens = Number(w?.tokens || 0);
+  const usd = Number(w?.usd || 0);
+  const sessions = Number(w?.sessions || 0);
+  const unpriced = Number(w?.unpricedTokens || 0);
+  return (
+    <div style={{ minWidth: 160, padding: "var(--s-3) var(--s-4)", border: "1px solid var(--grid-line)", borderRadius: 4 }}>
+      <div className="mono dim" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 20, fontWeight: 600, color: "var(--fg-0)", marginTop: 4 }}>
+        {usd > 0 ? formatUSD(usd) : "—"}
+      </div>
+      <div className="mono dim" style={{ fontSize: 11, marginTop: 2 }}>
+        {formatTokens(tokens)} tokens · {sessions} session{sessions === 1 ? "" : "s"}
+      </div>
+      {unpriced > 0 && usd > 0 && (
+        <div className="mono" style={{ fontSize: 10.5, marginTop: 2, color: "var(--watch)" }}>
+          {formatTokens(unpriced)} tokens unpriced
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CostBackendTable({ rows }) {
+  return (
+    <div className="cost-table" role="table">
+      <div className="cost-row cost-head mono dim" role="row" style={{ display: "grid", gridTemplateColumns: "1.2fr 0.6fr 1.2fr 1.2fr 1.2fr", fontSize: 10.5, padding: "4px 0", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        <div role="columnheader">Backend</div>
+        <div role="columnheader">Price</div>
+        <div role="columnheader">Today</div>
+        <div role="columnheader">7 days</div>
+        <div role="columnheader">Lifetime</div>
+      </div>
+      {rows.map(row => (
+        <div key={row.backend} role="row" style={{ display: "grid", gridTemplateColumns: "1.2fr 0.6fr 1.2fr 1.2fr 1.2fr", fontSize: 12, padding: "4px 0", borderTop: "1px solid var(--grid-line)" }}>
+          <div role="cell" className="mono">
+            <strong>{row.backend}</strong>
+          </div>
+          <div role="cell" className="mono">
+            {row.priceConfigured ? (
+              <span title={`input $${row.inputUSDPerMtok}/Mtok · output $${row.outputUSDPerMtok}/Mtok`}>
+                set
+              </span>
+            ) : (
+              <span className="dim" title="No pricing configured — tokens only">tokens only</span>
+            )}
+          </div>
+          <CostCell w={row.today} priced={row.priceConfigured} />
+          <CostCell w={row.week} priced={row.priceConfigured} />
+          <CostCell w={row.lifetime} priced={row.priceConfigured} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CostProjectTable({ rows }) {
+  return (
+    <div className="cost-table" role="table">
+      <div className="cost-row cost-head mono dim" role="row" style={{ display: "grid", gridTemplateColumns: "1.8fr 1.2fr 1.2fr 1.2fr", fontSize: 10.5, padding: "4px 0", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        <div role="columnheader">Project</div>
+        <div role="columnheader">Today</div>
+        <div role="columnheader">7 days</div>
+        <div role="columnheader">Lifetime</div>
+      </div>
+      {rows.map(row => (
+        <div key={row.project} role="row" style={{ display: "grid", gridTemplateColumns: "1.8fr 1.2fr 1.2fr 1.2fr", fontSize: 12, padding: "4px 0", borderTop: "1px solid var(--grid-line)" }}>
+          <div role="cell" className="mono">
+            <strong>{row.project}</strong>
+            {row.repo && <span className="dim" style={{ marginLeft: 6, fontSize: 10.5 }}>{row.repo}</span>}
+          </div>
+          <CostCell w={row.today} priced={true} />
+          <CostCell w={row.week} priced={true} />
+          <CostCell w={row.lifetime} priced={true} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CostCell({ w, priced }) {
+  const tokens = Number(w?.tokens || 0);
+  const usd = Number(w?.usd || 0);
+  if (tokens <= 0) {
+    return <div role="cell" className="mono dim">—</div>;
+  }
+  return (
+    <div role="cell" className="mono">
+      {priced && usd > 0 ? (
+        <span>
+          <strong>{formatUSD(usd)}</strong>
+          <span className="dim" style={{ marginLeft: 6, fontSize: 10.5 }}>{formatTokens(tokens)}</span>
+        </span>
+      ) : (
+        <span>{formatTokens(tokens)}</span>
+      )}
     </div>
   );
 }

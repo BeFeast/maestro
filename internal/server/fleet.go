@@ -303,6 +303,11 @@ type fleetResponse struct {
 	Workers       []fleetWorkerState   `json:"workers"`
 	Attention     []fleetWorkerState   `json:"attention"`
 	Approvals     []fleetApprovalState `json:"approvals,omitempty"`
+	// CostObservability is the fleet-wide token + USD rollup (#619).
+	// The per-project block is also surfaced under each fleetProjectState
+	// so the SPA can render both the hero ("today / 7d") and the
+	// per-project drill-down without recomputing pricing client-side.
+	CostObservability fleetGlobalCost `json:"cost_observability"`
 }
 
 // fleetNextAction names the single canonical operator action across the fleet.
@@ -500,6 +505,12 @@ type fleetProjectState struct {
 	// so an operator can see that a whole backend is paused and that
 	// auto-recovery is on a known clock.
 	BackendHealth map[string]state.BackendHealth `json:"backend_health,omitempty"`
+
+	// CostObservability rolls the per-session token counters already
+	// recorded by the orchestrator into today / 7d / lifetime token +
+	// USD windows per backend and per issue (#619). Backends without
+	// pricing configured render in the SPA as tokens only.
+	CostObservability fleetCostObservability `json:"cost_observability"`
 }
 
 // fleetSupervisorPulse describes the supervisor's liveness, cadence and
@@ -569,6 +580,11 @@ type fleetWorkerState struct {
 	PRURL             string                  `json:"pr_url,omitempty"`
 	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
 	TokensUsedTotal   int                     `json:"tokens_used_total"`
+	// CostUSDEstimate is the $ estimate for TokensUsedTotal under the
+	// project's configured per-backend pricing (#619). 0 when no
+	// pricing is set for the backend; the SPA renders that as tokens
+	// only without computing pricing client-side.
+	CostUSDEstimate float64 `json:"cost_usd_estimate,omitempty"`
 	// Runtime / RuntimeSeconds (legacy fields, kept for backwards
 	// compatibility) reflect workflow elapsed time and include PR-open /
 	// CI / Greptile / merge waiting. See #426 — WorkerRuntimeSeconds is
@@ -666,6 +682,8 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	}
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
+	pricing := backendPricingMap(project.cfg)
+	infos[0].CostUSDEstimate = applySessionCostEstimate(infos[0].Backend, infos[0].TokensUsedTotal, pricing)
 	infos[0].Actions = workerActionAffordances(projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
 	worker := makeFleetWorkerState(projectState, infos[0])
 	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)
@@ -1027,6 +1045,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.OperatorBrief = buildFleetOperatorBrief(resp.Projects, resp.Approvals, now)
 	resp.NextAction = buildFleetNextAction(resp.Projects, resp.Approvals, now)
 	resp.Verdict = buildFleetVerdict(resp, now)
+	resp.CostObservability = rollupGlobalCost(resp.Projects)
 	return resp
 }
 
@@ -2193,6 +2212,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	// session recorded after the cooldown was set all render as healthy.
 	state.ReconcileBackendHealth(st, now)
 	item.BackendHealth = st.BackendHealth
+	item.CostObservability = buildFleetCostObservability(cfg, st, now)
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary
 	item.Outcome = projectState.Outcome
@@ -2870,6 +2890,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		PRURL:                  worker.PRURL,
 		TokensUsedAttempt:      worker.TokensUsedAttempt,
 		TokensUsedTotal:        worker.TokensUsedTotal,
+		CostUSDEstimate:        worker.CostUSDEstimate,
 		Runtime:                worker.Runtime,
 		RuntimeSeconds:         worker.RuntimeSeconds,
 		WorkerRuntime:          worker.WorkerRuntime,

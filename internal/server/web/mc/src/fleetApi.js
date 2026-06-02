@@ -97,7 +97,95 @@ export function mapFleetResponse(raw, now = Date.now()) {
     lastDecisionAge: latestSupervisorAge(raw.projects || []),
     supervisorPulse: aggregateSupervisorPulse(raw.projects || []),
     backendHealth: aggregateBackendHealth(raw.projects || []),
+    costObservability: mapCostObservability(raw.cost_observability),
   };
+}
+
+// mapCostObservability normalizes the server-side cost rollup (#619)
+// for SPA consumers. The server computes pricing — the SPA never blends
+// rates client-side — so this is a thin shape adapter that fills in
+// missing arrays and coerces numbers so React renders cleanly when the
+// server returns sparse fields. Returns null when the snapshot lacks
+// cost_observability so a legacy server / unconfigured project simply
+// hides the panel.
+export function mapCostObservability(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    today: mapCostWindow(raw.window_today),
+    week: mapCostWindow(raw.window_7d),
+    lifetime: mapCostWindow(raw.lifetime),
+    perBackend: (raw.per_backend || []).map(mapCostBackend),
+    perProject: (raw.per_project || []).map(mapCostProject),
+    perIssue: (raw.per_issue || []).map(mapCostIssue),
+  };
+}
+
+function mapCostIssue(raw) {
+  return {
+    issueNumber: Number(raw?.issue_number || 0),
+    issueTitle: String(raw?.issue_title || ""),
+    tokens: Number(raw?.tokens || 0),
+    usd: Number(raw?.usd || 0),
+    sessions: Number(raw?.sessions || 0),
+    backends: Array.isArray(raw?.backends) ? raw.backends.map(String) : [],
+  };
+}
+
+function mapCostWindow(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { tokens: 0, pricedTokens: 0, unpricedTokens: 0, usd: 0, sessions: 0 };
+  }
+  return {
+    tokens: Number(raw.tokens || 0),
+    pricedTokens: Number(raw.priced_tokens || 0),
+    unpricedTokens: Number(raw.unpriced_tokens || 0),
+    usd: Number(raw.usd || 0),
+    sessions: Number(raw.sessions || 0),
+  };
+}
+
+function mapCostBackend(raw) {
+  return {
+    backend: String(raw?.backend || ""),
+    priceConfigured: raw?.price_configured === true,
+    inputUSDPerMtok: Number(raw?.input_usd_per_mtok || 0),
+    outputUSDPerMtok: Number(raw?.output_usd_per_mtok || 0),
+    today: mapCostWindow(raw?.today),
+    week: mapCostWindow(raw?.week),
+    lifetime: mapCostWindow(raw?.lifetime),
+  };
+}
+
+function mapCostProject(raw) {
+  return {
+    project: String(raw?.project || ""),
+    repo: String(raw?.repo || ""),
+    today: mapCostWindow(raw?.today),
+    week: mapCostWindow(raw?.week),
+    lifetime: mapCostWindow(raw?.lifetime),
+  };
+}
+
+// formatTokens renders an integer token count using a K/M suffix so the
+// panel keeps a narrow column width. 1_234 → "1.2K", 12_345_678 → "12.3M".
+// Numbers under 1000 render as-is.
+export function formatTokens(n) {
+  const v = Number(n || 0);
+  if (v <= 0) return "0";
+  if (v < 1000) return String(v);
+  if (v < 1_000_000) return `${(v / 1000).toFixed(v < 10_000 ? 1 : 0)}K`;
+  return `${(v / 1_000_000).toFixed(v < 10_000_000 ? 2 : 1)}M`;
+}
+
+// formatUSD renders a USD estimate with sensible precision for the
+// dashboard: values under $10 keep two decimals, values under $1000
+// keep one, larger values drop decimals entirely.
+export function formatUSD(n) {
+  const v = Number(n || 0);
+  if (v <= 0) return "$0";
+  if (v < 10) return `$${v.toFixed(2)}`;
+  if (v < 1000) return `$${v.toFixed(1)}`;
+  return `$${Math.round(v).toLocaleString()}`;
 }
 
 // aggregateBackendHealth folds per-project `backend_health` maps (#534)
@@ -431,6 +519,7 @@ function mapProject(project, workers, now) {
     summaryLine: projectSummaryLine(project),
     tapeEvents: deriveTapeEvents(project, workers, now),
     projectBoard: mapProjectBoard(project.project_board),
+    costObservability: mapCostObservability(project.cost_observability),
     raw: project,
   };
 }
