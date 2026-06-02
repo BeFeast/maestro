@@ -18,7 +18,14 @@ Reserve these services and ports on the workshop host:
 
 > Per-project Mission Control ports (`8788+`) were retired in #516. Every project is now reachable through the fleet aggregator at `/project/<name>`. Old `maestro-<project>-web.service` user units can be stopped and disabled; their `server.port` settings in project YAMLs are honored only when a project runs its own single-tenant `maestro serve --config ...` outside the fleet.
 
-Mutating endpoints require app-level HTTP auth (#487). Configure `server.auth.token_env` in each project config (the fleet picks up the first project that sets it) and populate the named environment variable from your secret manager (Infisical, 1Password CLI, etc.) — never inline the token in YAML. When auth is configured, every `POST /api/v1/...` (`/actions`, `/approvals/.../{approve|reject}`, `/audit/log`, `/fleet/actions`) requires `Authorization: Bearer <token>` and returns `401` without it. Read-only GETs stay open. The LAN is no longer treated as trusted: do not skip the token, even on `127.0.0.1`, when other devices share the network.
+### Dashboard auth posture: trusted LAN vs. exposed install
+
+The dashboard auth layer is opt-in. Choose the posture that matches the network the port is reachable from:
+
+- **Trusted LAN (default, no auth configured).** The dashboard binds to `127.0.0.1` or a private network only operators reach. The cautious approval gate still protects `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config` so flipping `--read-only=false` on a trusted LAN does not expose the four destructive verbs. Per the operator decision recorded against #477 (2026-06-02): the LAN is closed, alien access is not part of the threat model, and `server.auth` may be left empty.
+- **Exposed / shared-network install (auth required, #616).** The dashboard is reachable from anywhere outside the trusted LAN — `--host 0.0.0.0`, behind a reverse proxy, on a multi-tenant host, or on a workshop network shared with untrusted devices. Configure `server.auth.token_env` in each project config (the fleet picks up the first project that sets it) and populate the named environment variable from your secret manager (Infisical, 1Password CLI, etc.) — never inline the token in YAML. With auth enabled, every endpoint — **read** `GET /api/v1/...`, **write** `POST /api/v1/...` (`/actions`, `/approvals/.../{approve|reject}`, `/audit/log`, `/fleet/actions`, `/refresh`), and the SPA HTML / static assets — requires a credential and returns `401` otherwise. The cautious approval gate still fires for authenticated callers as defense in depth.
+
+The server advertises both **HTTP Basic** (any username, password equal to the token — so browsers prompt natively and cache the credential for the realm) and **Bearer** (`Authorization: Bearer <token>` — for `curl`, scripts, and secret-manager-driven clients) in the `WWW-Authenticate` challenge. The authenticated identity replaces any `actor` field in the request body so operators sharing a token cannot impersonate one another in the audit log.
 
 ## Config Boundaries
 

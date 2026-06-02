@@ -233,12 +233,13 @@ func (s *FleetServer) SetAuthForTest(token, actorName string) {
 	s.auth = newAuthCheckerForTest(token, actorName)
 }
 
-// Start begins serving the fleet dashboard. It blocks until shutdown.
-func (s *FleetServer) Start(ctx context.Context) error {
-	if s.port == 0 {
-		return nil
-	}
-
+// buildHandler returns the fleet mux wrapped with the auth middleware.
+// When auth.Required() is true (#616: exposed install posture), every
+// route — JSON read endpoints, the SPA HTML, static assets, mutating
+// POSTs — rejects unauthenticated requests with 401 before the inner
+// handler runs. When auth is disabled (default LAN posture), the
+// middleware is a pass-through.
+func (s *FleetServer) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
@@ -248,6 +249,18 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/approvals/audit", s.handleFleetApprovalAudit)
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleFleetDashboard)
+	return authMiddleware(mux, s.auth)
+}
+
+// HandlerForTest exposes the wrapped handler so tests can exercise the
+// auth middleware without spinning up an httptest server.
+func (s *FleetServer) HandlerForTest() http.Handler { return s.buildHandler() }
+
+// Start begins serving the fleet dashboard. It blocks until shutdown.
+func (s *FleetServer) Start(ctx context.Context) error {
+	if s.port == 0 {
+		return nil
+	}
 
 	host := strings.TrimSpace(s.host)
 	if host == "" {
@@ -256,7 +269,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	addr := net.JoinHostPort(host, strconv.Itoa(s.port))
 	s.srv = &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      s.buildHandler(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}

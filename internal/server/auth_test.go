@@ -437,3 +437,135 @@ func TestFleetApproval_NoCredentialReturns401_BeforeProjectLookup(t *testing.T) 
 		t.Fatalf("status = %d, want 401 (auth must fire before project lookup)", w.Code)
 	}
 }
+
+// --- #616 exposed-install posture: read endpoints also gated when auth is on
+
+// Pin the WWW-Authenticate challenge advertises Basic so browsers prompt
+// natively when an exposed install gates the SPA. Bearer is kept so curl /
+// secret-manager-driven clients can attach a token directly.
+func TestAuthChallenge_AdvertisesBasicAndBearer(t *testing.T) {
+	srv := New(newSafeActionTestCfg(), nil)
+	srv.SetAuthForTest("good-token", "alice")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.HandlerForTest().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	challenge := w.Header().Get("WWW-Authenticate")
+	if !strings.Contains(challenge, "Basic") {
+		t.Fatalf("WWW-Authenticate = %q, want Basic (browser prompt UX)", challenge)
+	}
+	if !strings.Contains(challenge, "Bearer") {
+		t.Fatalf("WWW-Authenticate = %q, want Bearer (curl/secret-manager UX)", challenge)
+	}
+}
+
+// Read endpoints (GETs) must reject unauthenticated callers when auth is
+// enabled. #616 acceptance: "every endpoint (read and write) rejects
+// unauthenticated requests".
+func TestRead_NoCredentialReturns401_WhenAuthEnabled(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"state", "/api/v1/state"},
+		{"workers", "/api/v1/workers"},
+		{"issue", "/api/v1/42"},
+		{"log", "/api/v1/logs/slot-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := setupTestServer(t)
+			srv.SetAuthForTest("good-token", "alice")
+
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			w := httptest.NewRecorder()
+			srv.HandlerForTest().ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 (read endpoints must be gated when auth is enabled)", w.Code)
+			}
+		})
+	}
+}
+
+// The SPA HTML itself is gated when auth is enabled — otherwise an
+// unauthenticated visitor could harvest the embedded repo / initial-state
+// payload that the dashboard renders inline.
+func TestDashboardHTML_NoCredentialReturns401_WhenAuthEnabled(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.SetAuthForTest("good-token", "alice")
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	srv.HandlerForTest().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (SPA HTML must be gated when auth is enabled)", w.Code)
+	}
+}
+
+// Authenticated reads succeed. Pin that a valid Bearer token unlocks the
+// read endpoints — proves the middleware is not a hard block.
+func TestRead_ValidBearerReturns200_WhenAuthEnabled(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	srv.SetAuthForTest("good-token", "alice")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	req.Header.Set("Authorization", "Bearer good-token")
+	w := httptest.NewRecorder()
+	srv.HandlerForTest().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (valid token must unlock reads)", w.Code)
+	}
+}
+
+// Backward-compat: with auth disabled (default), read endpoints stay open
+// — this is the trusted-LAN posture from #477 and the no-regression
+// guarantee for existing installs.
+func TestRead_AuthDisabled_OpenAccess(t *testing.T) {
+	srv, _ := setupTestServer(t)
+	// no SetAuthForTest → auth disabled (default)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/state", nil)
+	w := httptest.NewRecorder()
+	srv.HandlerForTest().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (auth disabled = LAN posture preserved)", w.Code)
+	}
+}
+
+// Fleet equivalent: GET /api/v1/fleet is gated when auth is enabled so an
+// unauthenticated probe cannot enumerate the fleet topology.
+func TestFleetRead_NoCredentialReturns401_WhenAuthEnabled(t *testing.T) {
+	srv := NewFleet(nil, "127.0.0.1", 8786, false)
+	srv.SetAuthForTest("good-token", "alice")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.HandlerForTest().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (fleet read endpoints must be gated when auth is enabled)", w.Code)
+	}
+}
+
+// Fleet read endpoints stay open in the default LAN posture so existing
+// installs see no regression.
+func TestFleetRead_AuthDisabled_OpenAccess(t *testing.T) {
+	srv := NewFleet(nil, "127.0.0.1", 8786, false)
+	// no SetAuthForTest → auth disabled
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.HandlerForTest().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (auth disabled fleet should stay open)", w.Code)
+	}
+}

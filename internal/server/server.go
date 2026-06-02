@@ -69,13 +69,12 @@ func (s *Server) SetAuthForTest(token, actorName string) {
 	s.auth = newAuthCheckerForTest(token, actorName)
 }
 
-// Start begins serving HTTP on the configured port. It blocks until the server
-// is shut down. Returns nil if port is 0 (disabled).
-func (s *Server) Start(ctx context.Context) error {
-	if s.cfg.Server.Port == 0 {
-		return nil
-	}
-
+// buildHandler returns the dashboard mux wrapped with auth middleware.
+// Exported only for the test that exercises read-endpoint gating end-to-end
+// through the same handler that production serves (#616 acceptance: every
+// endpoint, read and write, rejects unauthenticated requests when auth
+// is enabled). When auth is disabled, the middleware is a pass-through.
+func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/state", s.handleState)
 	mux.HandleFunc("/api/v1/workers", s.handleWorkers)
@@ -86,6 +85,20 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/", s.handleIssue)
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleDashboard)
+	return authMiddleware(mux, s.auth)
+}
+
+// HandlerForTest exposes the wrapped handler so tests can exercise the
+// auth middleware without spinning up an httptest server. Production code
+// goes through Start().
+func (s *Server) HandlerForTest() http.Handler { return s.buildHandler() }
+
+// Start begins serving HTTP on the configured port. It blocks until the server
+// is shut down. Returns nil if port is 0 (disabled).
+func (s *Server) Start(ctx context.Context) error {
+	if s.cfg.Server.Port == 0 {
+		return nil
+	}
 
 	host := strings.TrimSpace(s.cfg.Server.Host)
 	if host == "" {
@@ -94,7 +107,7 @@ func (s *Server) Start(ctx context.Context) error {
 	addr := net.JoinHostPort(host, strconv.Itoa(s.cfg.Server.Port))
 	s.srv = &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      s.buildHandler(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
