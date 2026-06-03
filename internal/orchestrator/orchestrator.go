@@ -31,6 +31,7 @@ const (
 	minProjectGraphQLRemaining = 100
 	projectBoardSweepInterval  = 30 * time.Minute
 	projectBoardSweepRetry     = 10 * time.Minute
+	pipelineFullLabel          = "pipeline:full"
 )
 
 // Orchestrator coordinates all agent sessions
@@ -1913,7 +1914,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				// Pipeline phase transition: if this is a pipeline session,
 				// try to advance to the next phase before falling through
 				// to normal dead-worker handling.
-				if pipeline.IsEnabled(o.cfg) && o.advancePipeline(slotName, sess) {
+				if sess.Phase != state.PhaseNone && o.advancePipeline(slotName, sess) {
 					continue
 				}
 
@@ -3513,11 +3514,34 @@ func (o *Orchestrator) listOpenIssues(labels []string) ([]github.Issue, error) {
 	return o.gh.ListOpenIssues(labels)
 }
 
-func (o *Orchestrator) startWorker(s *state.State, issue github.Issue, promptBase, backend string) (string, error) {
-	if o.workerStartFn != nil {
-		return o.workerStartFn(o.cfg, s, o.repo, issue, promptBase, backend)
+func (o *Orchestrator) startWorker(cfg *config.Config, s *state.State, issue github.Issue, promptBase, backend string) (string, error) {
+	if cfg == nil {
+		cfg = o.cfg
 	}
-	return worker.Start(o.cfg, s, o.repo, issue, promptBase, backend)
+	if o.workerStartFn != nil {
+		return o.workerStartFn(cfg, s, o.repo, issue, promptBase, backend)
+	}
+	return worker.Start(cfg, s, o.repo, issue, promptBase, backend)
+}
+
+func issueHasLabel(issue github.Issue, label string) bool {
+	for _, issueLabel := range issue.Labels {
+		if strings.EqualFold(strings.TrimSpace(issueLabel.Name), label) {
+			return true
+		}
+	}
+	return false
+}
+
+func pipelineConfigForIssue(base *config.Config, issue github.Issue) (*config.Config, bool) {
+	if base == nil || !issueHasLabel(issue, pipelineFullLabel) {
+		return base, false
+	}
+	cfg := *base
+	cfg.Pipeline.Enabled = true
+	cfg.Pipeline.Planner.Enabled = true
+	cfg.Pipeline.Validator.Enabled = true
+	return &cfg, true
 }
 
 func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (bool, string, error) {
@@ -4062,8 +4086,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			log.Printf("[orch] allowing repair worker for issue #%d despite open PR because supervisor selected spawn_repair_worker", issue.Number)
 		}
 
-		// Determine initial phase and backend
-		initialPhase := pipeline.InitialPhase(o.cfg)
+		// Determine initial phase and backend. A pipeline:full issue label
+		// enables the phase pipeline only for this worker's copied config.
+		workerCfg, pipelineFull := pipelineConfigForIssue(o.cfg, issue)
+		initialPhase := pipeline.InitialPhase(workerCfg)
 		var backendName string
 		var promptBase string
 		// backendReason tracks why this backend was chosen so the dashboard /
@@ -4092,8 +4118,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		} else if initialPhase != state.PhaseNone && initialPhase != state.PhaseImplement {
 			// Pipeline mode with planner — use planner backend and raw template
 			// (worker.Start → assemblePrompt will substitute {{WORKTREE}} etc.)
-			backendName = pipeline.BackendForPhase(o.cfg, initialPhase)
-			promptBase = pipeline.PromptTemplateForPhase(o.cfg, initialPhase)
+			backendName = pipeline.BackendForPhase(workerCfg, initialPhase)
+			promptBase = pipeline.PromptTemplateForPhase(workerCfg, initialPhase)
 			backendReason = "phase"
 		} else {
 			// Normal mode or pipeline starting at implement — use standard resolution
@@ -4124,7 +4150,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 
 		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, reason=%s, phase=%s, long_running=%v)", issue.Number, issue.Title, backendName, backendReason, initialPhase, longRunning)
-		slotName, err := o.startWorker(s, issue, promptBase, backendName)
+		slotName, err := o.startWorker(workerCfg, s, issue, promptBase, backendName)
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
@@ -4137,6 +4163,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 		if initialPhase != state.PhaseNone {
 			s.Sessions[slotName].Phase = initialPhase
+		}
+		if pipelineFull {
+			s.Sessions[slotName].PipelineFull = true
 		}
 		// #427: stamp the backend selection reason on the session so the
 		// dashboard / fleet API can show why this backend was chosen

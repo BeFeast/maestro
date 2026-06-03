@@ -1,19 +1,19 @@
 // Package pipeline implements the planner → implementer → validator phase pipeline
-// and the GSD-inspired pre-worker context preparation phases.
+// and the deterministic pre-worker context preparation phases.
 //
 // Phase pipeline (when pipeline.enabled is true):
 //  1. Plan   — creates MAESTRO_PLAN.md + VALIDATION.md in the worktree
 //  2. Implement — writes code based on the plan (current worker behavior)
 //  3. Validate — checks assertions from VALIDATION.md, gates PR creation
 //
-// GSD pre-worker phases (configurable independently):
+// Deterministic pre-worker context-prep phases (configurable independently):
 //   - Research: scans codebase for relevant patterns, writes context file
-//   - Plan Validation: extracts requirements, builds and validates a plan
+//   - Plan Validation: heuristically extracts requirements and checks plan coverage
 //   - Test Mapping: maps requirements to verification commands, generates verify.sh
 //
 // Each phase-pipeline phase runs as a separate worker session in the same worktree.
 // Failed validation retries the implementer with feedback, not a full re-plan.
-// GSD phases run before the worker starts and inject context into the prompt.
+// Context-prep phases run before the worker starts and inject context into the prompt.
 package pipeline
 
 import (
@@ -138,9 +138,9 @@ func MaxRuntimeForPhase(cfg *config.Config, phase state.Phase) int {
 	return cfg.MaxRuntimeMinutes
 }
 
-// ---- GSD-inspired pre-worker context preparation ----
+// ---- Deterministic pre-worker context preparation ----
 
-// GSDResult holds the output of the GSD pre-worker pipeline phases.
+// GSDResult holds the output of the deterministic pre-worker context-prep phases.
 // The context fields are appended to the worker prompt.
 type GSDResult struct {
 	// ResearchContext is the markdown context from the research phase.
@@ -182,7 +182,7 @@ func (r *GSDResult) PromptSection() string {
 	return "\n\n---\n\n# Pipeline Context\n\n" + strings.Join(sections, "\n\n---\n\n")
 }
 
-// RunGSD executes the GSD-inspired pre-worker pipeline phases before a worker starts.
+// RunGSD executes deterministic context-prep phases before a worker starts.
 // All phases are best-effort — a failure in one phase logs a warning
 // but does not prevent subsequent phases or worker startup.
 func RunGSD(cfg *config.Config, worktreePath string, issueNumber int, issueTitle, issueBody string) *GSDResult {
@@ -194,12 +194,12 @@ func RunGSD(cfg *config.Config, worktreePath string, issueNumber int, issueTitle
 		return result
 	}
 
-	log.Printf("[pipeline] running GSD pre-worker pipeline for issue #%d (research=%v, plan_validation=%v, test_mapping=%v)",
+	log.Printf("[pipeline] running deterministic context-prep for issue #%d (research=%v, heuristic_plan_validation=%v, test_mapping=%v)",
 		issueNumber, pipeline.Research, pipeline.PlanValidationEnabled(), pipeline.TestMappingEnabled())
 
 	// Phase 1: Research
 	if pipeline.Research {
-		log.Printf("[pipeline] GSD phase 1/3: research")
+		log.Printf("[pipeline] context-prep phase 1/3: research")
 		ctx, err := runResearch(worktreePath, issueNumber, issueTitle, issueBody)
 		if err != nil {
 			log.Printf("[pipeline] research phase error: %v (continuing)", err)
@@ -208,9 +208,9 @@ func RunGSD(cfg *config.Config, worktreePath string, issueNumber int, issueTitle
 		}
 	}
 
-	// Phase 2: Plan Validation
+	// Phase 2: heuristic plan validation
 	if pipeline.PlanValidationEnabled() {
-		log.Printf("[pipeline] GSD phase 2/3: plan validation")
+		log.Printf("[pipeline] context-prep phase 2/3: heuristic plan validation")
 		plan, err := validatePlan(issueNumber, issueTitle, issueBody, worktreePath, result.ResearchContext)
 		if err != nil {
 			log.Printf("[pipeline] plan validation error: %v (continuing)", err)
@@ -221,7 +221,7 @@ func RunGSD(cfg *config.Config, worktreePath string, issueNumber int, issueTitle
 
 	// Phase 3: Test Mapping
 	if pipeline.TestMappingEnabled() {
-		log.Printf("[pipeline] GSD phase 3/3: test mapping")
+		log.Printf("[pipeline] context-prep phase 3/3: test mapping")
 		verifyPath, summary, err := mapTests(issueNumber, issueTitle, issueBody, worktreePath, result.Plan)
 		if err != nil {
 			log.Printf("[pipeline] test mapping error: %v (continuing)", err)
@@ -231,6 +231,6 @@ func RunGSD(cfg *config.Config, worktreePath string, issueNumber int, issueTitle
 		}
 	}
 
-	log.Printf("[pipeline] GSD pre-worker pipeline complete for issue #%d", issueNumber)
+	log.Printf("[pipeline] deterministic context-prep complete for issue #%d", issueNumber)
 	return result
 }

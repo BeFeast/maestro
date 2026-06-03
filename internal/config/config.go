@@ -541,18 +541,19 @@ type RoleConfig struct {
 	MaxRuntimeMinutes int    `yaml:"max_runtime_minutes"` // override per-role max runtime (0 = use global)
 }
 
-// PipelineConfig controls the planner → implementer → validator pipeline
-// and the GSD-inspired pre-worker context preparation phases.
+// PipelineConfig controls the planner → implementer → validator phase pipeline
+// and deterministic pre-worker context preparation phases.
 type PipelineConfig struct {
 	// Phase-based pipeline (planner → implementer → validator)
-	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline (default: false = legacy single-phase)
+	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline globally (default: false; issue label pipeline:full opts in per worker)
 	Planner   RoleConfig `yaml:"planner"`   // planner role settings
 	Validator RoleConfig `yaml:"validator"` // validator role settings
 	// Implementer uses the existing worker_prompt / bug_prompt / enhancement_prompt settings.
 
-	// GSD-inspired pre-worker context preparation phases
-	Research       bool  `yaml:"research"`        // spawn a research subagent before worker starts (default: false)
-	PlanValidation *bool `yaml:"plan_validation"` // validate a plan before coding starts (default: true)
+	// Deterministic pre-worker context preparation phases. These are heuristic
+	// local scans/checks, not separate agent sessions.
+	Research       bool  `yaml:"research"`        // scan repo context before worker starts (default: false)
+	PlanValidation *bool `yaml:"plan_validation"` // heuristic plan coverage check before coding starts (default: true)
 	TestMapping    *bool `yaml:"test_mapping"`    // map requirements to verify commands (default: true)
 }
 

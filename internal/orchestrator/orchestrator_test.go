@@ -13,6 +13,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/outcome"
+	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
@@ -4339,6 +4340,103 @@ func TestStartNewWorkers_StampsBackendSelectionReason_RouterError(t *testing.T) 
 	}
 	if sess.BackendSelection.SelectionReason != router.ReasonRouterError {
 		t.Errorf("BackendSelection.SelectionReason = %q, want %q", sess.BackendSelection.SelectionReason, router.ReasonRouterError)
+	}
+}
+
+func TestStartNewWorkers_PipelineFullLabelSelectsPlannerPhase(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude", "planner")
+	cfg.Pipeline.Enabled = false
+	cfg.Pipeline.Planner.Backend = "planner"
+	issues := []github.Issue{makeIssue(641, "Use full pipeline", "pipeline:full")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+
+	var startCfg *config.Config
+	var promptBase string
+	o.workerStartFn = func(cfg *config.Config, s *state.State, repo string, issue github.Issue, prompt, backend string) (string, error) {
+		startCfg = cfg
+		promptBase = prompt
+		s.Sessions["slot-1"] = &state.Session{
+			IssueNumber: issue.Number,
+			IssueTitle:  issue.Title,
+			Status:      state.StatusRunning,
+			PID:         1001,
+			StartedAt:   time.Now().UTC(),
+		}
+		*started = append(*started, issue.Number)
+		return "slot-1", nil
+	}
+
+	s := state.NewState()
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 || (*started)[0] != 641 {
+		t.Fatalf("started = %v, want [641]", *started)
+	}
+	if cfg.Pipeline.Enabled {
+		t.Fatal("global config Pipeline.Enabled was mutated")
+	}
+	if startCfg == nil {
+		t.Fatal("worker config was not captured")
+	}
+	if !startCfg.Pipeline.Enabled || !startCfg.Pipeline.Planner.Enabled || !startCfg.Pipeline.Validator.Enabled {
+		t.Fatalf("worker config did not enable full pipeline: %+v", startCfg.Pipeline)
+	}
+	sess := s.Sessions["slot-1"]
+	if sess == nil {
+		t.Fatal("session not recorded")
+	}
+	if sess.Phase != state.PhasePlan {
+		t.Fatalf("session phase = %q, want %q", sess.Phase, state.PhasePlan)
+	}
+	if !sess.PipelineFull {
+		t.Fatal("session PipelineFull was not recorded")
+	}
+	if sess.BackendSelection == nil || sess.BackendSelection.SelectedBackend != "planner" || sess.BackendSelection.SelectionReason != "phase" {
+		t.Fatalf("backend selection = %+v, want planner phase", sess.BackendSelection)
+	}
+	if !strings.Contains(promptBase, pipeline.PlanFile) || !strings.Contains(promptBase, pipeline.ValidationFile) {
+		t.Fatalf("planner prompt does not mention handoff artifacts %s/%s", pipeline.PlanFile, pipeline.ValidationFile)
+	}
+}
+
+func TestStartNewWorkers_WithoutPipelineFullLabelKeepsSingleSession(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.Pipeline.Enabled = false
+	issues := []github.Issue{makeIssue(642, "Routine issue")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+
+	var startCfg *config.Config
+	o.workerStartFn = func(cfg *config.Config, s *state.State, repo string, issue github.Issue, prompt, backend string) (string, error) {
+		startCfg = cfg
+		s.Sessions["slot-1"] = &state.Session{
+			IssueNumber: issue.Number,
+			IssueTitle:  issue.Title,
+			Status:      state.StatusRunning,
+			PID:         1001,
+			StartedAt:   time.Now().UTC(),
+		}
+		*started = append(*started, issue.Number)
+		return "slot-1", nil
+	}
+
+	s := state.NewState()
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 || (*started)[0] != 642 {
+		t.Fatalf("started = %v, want [642]", *started)
+	}
+	if startCfg != cfg {
+		t.Fatal("unlabeled issue should use the original config")
+	}
+	sess := s.Sessions["slot-1"]
+	if sess == nil {
+		t.Fatal("session not recorded")
+	}
+	if sess.Phase != state.PhaseNone {
+		t.Fatalf("session phase = %q, want no pipeline phase", sess.Phase)
+	}
+	if sess.PipelineFull {
+		t.Fatal("unlabeled session should not record PipelineFull")
 	}
 }
 
