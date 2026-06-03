@@ -439,13 +439,14 @@ type fleetQueueSnapshot struct {
 }
 
 type fleetProjectState struct {
-	Name         string `json:"name"`
-	Repo         string `json:"repo"`
-	ConfigPath   string `json:"config_path"`
-	DashboardURL string `json:"dashboard_url,omitempty"`
-	StateDir     string `json:"state_dir,omitempty"`
-	MaxParallel  int    `json:"max_parallel"`
-	ReadOnly     bool   `json:"read_only"`
+	Name               string `json:"name"`
+	Repo               string `json:"repo"`
+	ConfigPath         string `json:"config_path"`
+	DashboardURL       string `json:"dashboard_url,omitempty"`
+	StateDir           string `json:"state_dir,omitempty"`
+	MaxParallel        int    `json:"max_parallel"`
+	ReadOnly           bool   `json:"read_only"`
+	DispatchSLASeconds int    `json:"dispatch_sla_seconds,omitempty"`
 
 	// RestartRequired/RestartRequiredReason mirror the orchestrator's restart-required
 	// signal (set when model.default / routing.* changed but cannot be hot-applied).
@@ -587,6 +588,7 @@ type fleetConfigCostCaps struct {
 type fleetConfigSupervisor struct {
 	Mode                    string   `json:"mode,omitempty"`
 	DryRun                  bool     `json:"dry_run,omitempty"`
+	DispatchSLASeconds      int      `json:"dispatch_sla_seconds,omitempty"`
 	SafeActions             []string `json:"safe_actions,omitempty"`
 	ApprovalRequired        []string `json:"approval_required,omitempty"`
 	AllowedActions          []string `json:"allowed_actions,omitempty"`
@@ -1816,9 +1818,44 @@ func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 }
 
 const fleetApprovalSLASeconds int64 = 30 * 60
+const fleetDispatchDefaultSLASeconds int64 = 5 * 60
 
 func fleetApprovalSLAText() string {
 	return "30m"
+}
+
+func fleetDispatchSLASeconds(project fleetProjectState) int64 {
+	if project.DispatchSLASeconds > 0 {
+		return int64(project.DispatchSLASeconds)
+	}
+	return fleetDispatchDefaultSLASeconds
+}
+
+func fleetDispatchSLAText(project fleetProjectState) string {
+	return fleetDurationText(time.Duration(fleetDispatchSLASeconds(project)) * time.Second)
+}
+
+func fleetDurationText(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	}
+	return fmt.Sprintf("%ds", int(d/time.Second))
+}
+
+func fleetPendingDispatchPastSLA(project fleetProjectState, now time.Time) bool {
+	if project.Supervisor.Latest == nil || project.Supervisor.Latest.CreatedAt.IsZero() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return now.Sub(project.Supervisor.Latest.CreatedAt.UTC()) > time.Duration(fleetDispatchSLASeconds(project))*time.Second
 }
 
 func approvalPastSLA(approval *fleetApprovalState, now time.Time) bool {
@@ -2343,6 +2380,7 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 		SupervisorGate: fleetConfigSupervisor{
 			Mode:                    strings.TrimSpace(cfg.Supervisor.Mode),
 			DryRun:                  cfg.Supervisor.DryRun,
+			DispatchSLASeconds:      int(fleetDispatchSLASeconds(fleetProjectState{DispatchSLASeconds: cfg.Supervisor.DispatchSLASeconds})),
 			SafeActions:             append([]string(nil), cfg.Supervisor.SafeActions...),
 			ApprovalRequired:        append([]string(nil), cfg.Supervisor.ApprovalRequired...),
 			AllowedActions:          append([]string(nil), cfg.Supervisor.AllowedActions...),
@@ -2374,6 +2412,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.StateDir = cfg.StateDir
 	item.MaxParallel = cfg.MaxParallel
 	item.ReadOnly = cfg.Server.ReadOnly || s.readOnly
+	item.DispatchSLASeconds = cfg.Supervisor.DispatchSLASeconds
 	item.Outcome = outcome.StatusFor(cfg.Outcome, 0, time.Time{})
 	item.Actions = projectActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", item.Name)
 	item.EffectiveConfig = buildFleetEffectiveConfig(cfg)
@@ -2787,6 +2826,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			state.IssueNumber = q.SelectedCandidate.Number
 			state.IssueURL = githubIssueURL(project.Repo, q.SelectedCandidate.Number)
 			state.Summary = fmt.Sprintf("Issue #%d is selected for the next worker.", q.SelectedCandidate.Number)
+			if fleetPendingDispatchPastSLA(project, time.Now().UTC()) {
+				state = fleetDispatchSLAOperatorState(project, state)
+			}
 		}
 		return state
 	}
@@ -3083,7 +3125,31 @@ func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorS
 		}
 	}
 	operator = applyFleetOperatorTarget(project, operator, target)
+	if operator.Kind == "pending_dispatch" && operator.IssueNumber > 0 && fleetPendingDispatchPastSLA(project, time.Now().UTC()) {
+		operator = fleetDispatchSLAOperatorState(project, operator)
+	}
 	return operator, true
+}
+
+func fleetDispatchSLAOperatorState(project fleetProjectState, pending fleetOperatorState) fleetOperatorState {
+	sla := fleetDispatchSLAText(project)
+	issue := pending.IssueNumber
+	summary := pending.Summary
+	if issue > 0 {
+		summary = fmt.Sprintf("Issue #%d was selected for dispatch, but no worker started within the %s SLA.", issue, sla)
+	}
+	return fleetOperatorState{
+		Kind:        "dispatch_failure",
+		Tone:        "error",
+		Label:       "Dispatch SLA missed",
+		Summary:     firstNonEmpty(summary, "Supervisor selected work, but no worker started within the dispatch SLA."),
+		NextAction:  "Check the supervisor/orchestrator dispatch loop and rerun the project supervisor after clearing the blocker.",
+		IssueNumber: pending.IssueNumber,
+		IssueURL:    pending.IssueURL,
+		PRNumber:    pending.PRNumber,
+		PRURL:       pending.PRURL,
+		Session:     pending.Session,
+	}
 }
 
 func applyFleetOperatorTarget(project fleetProjectState, operator fleetOperatorState, target *state.SupervisorTarget) fleetOperatorState {

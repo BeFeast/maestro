@@ -824,6 +824,61 @@ func TestFleetAPIOperatorStateExplainsZeroRunningActiveWork(t *testing.T) {
 	}
 }
 
+func TestFleetAPIEscalatesSelectedPendingDispatchPastSLA(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "dispatch-sla")
+
+	st := state.NewState()
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-dispatch-sla",
+		CreatedAt:         now.Add(-10 * time.Minute),
+		Project:           "owner/dispatch-sla",
+		Summary:           "Start a worker for issue #354.",
+		RecommendedAction: "spawn_worker",
+		Risk:              "mutating",
+		Target:            &state.SupervisorTarget{Issue: 354},
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			OpenIssues:         1,
+			EligibleCandidates: 1,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 354,
+				Title:  "Selected overdue issue",
+			},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("DispatchSLA", "/tmp/dispatch-sla.yaml", "", &config.Config{
+			Repo:        "owner/dispatch-sla",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+			Outcome:     outcome.Brief{DesiredOutcome: "Dispatch SLA outcome"},
+			Supervisor: config.SupervisorConfig{
+				DispatchSLASeconds: 60,
+			},
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	project := findFleetProject(t, resp.Projects, "DispatchSLA")
+	if project.OperatorState.Kind != "dispatch_failure" || project.OperatorState.IssueNumber != 354 {
+		t.Fatalf("operator state = %+v, want dispatch_failure for selected issue #354", project.OperatorState)
+	}
+	if resp.Summary.DispatchFailures != 1 || resp.Summary.DispatchPending != 0 {
+		t.Fatalf("summary = %+v, want one dispatch failure and no pending dispatch", resp.Summary)
+	}
+	if resp.NextAction == nil || resp.NextAction.Priority != "P0" || resp.NextAction.Kind != "dispatch_failure" {
+		t.Fatalf("next action = %+v, want P0 dispatch failure", resp.NextAction)
+	}
+	if !contains(resp.OperatorBrief.Sentence, "Dispatch SLA missed") {
+		t.Fatalf("operator brief = %+v, want dispatch SLA action", resp.OperatorBrief)
+	}
+}
+
 func TestFleetOperatorBriefNamesSingleHighestPriorityAction(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -1375,6 +1430,57 @@ func TestFleetProjectOperatorStateDistinguishesBriefStates(t *testing.T) {
 	})
 	if dispatch.Kind != "dispatch_failure" || dispatch.IssueNumber != 9 {
 		t.Fatalf("dispatch operator state = %+v, want dispatch failure for issue #9", dispatch)
+	}
+
+	pendingWithinSLA := buildFleetProjectOperatorState(fleetProjectState{
+		Name:               "Pending",
+		Repo:               "owner/pending",
+		Outcome:            configuredOutcome,
+		DispatchSLASeconds: 3600,
+		Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{
+			CreatedAt:         now.Add(-5 * time.Minute),
+			Summary:           "Start a worker for issue #354.",
+			RecommendedAction: "spawn_worker",
+			Target:            &state.SupervisorTarget{Issue: 354},
+		}},
+		QueueSnapshot: &fleetQueueSnapshot{
+			Open:     1,
+			Eligible: 1,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 354,
+				Title:  "Selected next issue",
+			},
+		},
+	})
+	if pendingWithinSLA.Kind != "pending_dispatch" || pendingWithinSLA.IssueNumber != 354 {
+		t.Fatalf("pending operator state = %+v, want pending dispatch for selected issue #354", pendingWithinSLA)
+	}
+
+	pastSLA := buildFleetProjectOperatorState(fleetProjectState{
+		Name:               "PastSLA",
+		Repo:               "owner/past-sla",
+		Outcome:            configuredOutcome,
+		DispatchSLASeconds: 60,
+		Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{
+			CreatedAt:         now.Add(-5 * time.Minute),
+			Summary:           "Start a worker for issue #355.",
+			RecommendedAction: "spawn_worker",
+			Target:            &state.SupervisorTarget{Issue: 355},
+		}},
+		QueueSnapshot: &fleetQueueSnapshot{
+			Open:     1,
+			Eligible: 1,
+			SelectedCandidate: &state.SupervisorIssueCandidate{
+				Number: 355,
+				Title:  "Selected overdue issue",
+			},
+		},
+	})
+	if pastSLA.Kind != "dispatch_failure" || pastSLA.IssueNumber != 355 {
+		t.Fatalf("past-SLA operator state = %+v, want dispatch failure for selected issue #355", pastSLA)
+	}
+	if !contains(pastSLA.Summary, "1m SLA") || !contains(pastSLA.Label, "Dispatch SLA") {
+		t.Fatalf("past-SLA operator state = %+v, want SLA explanation", pastSLA)
 	}
 
 	drift := buildFleetProjectOperatorState(fleetProjectState{
