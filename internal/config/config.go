@@ -117,16 +117,17 @@ type GitHubProjectsConfig struct {
 }
 
 const (
-	SupervisorActionAddReadyLabel      = "add_ready_label"
-	SupervisorActionRemoveReadyLabel   = "remove_ready_label"
-	SupervisorActionAddBlockedLabel    = "add_blocked_label"
-	SupervisorActionRemoveBlockedLabel = "remove_blocked_label"
-	SupervisorActionAddIssueComment    = "add_issue_comment"
-	SupervisorActionMergePR            = "merge_pr"
-	SupervisorActionCloseIssue         = "close_issue"
-	SupervisorActionCloseIssueBatch    = "close_issue_batch"
-	SupervisorActionDeleteWorktree     = "delete_worktree"
-	SupervisorActionChangeGlobalConfig = "change_global_config"
+	SupervisorActionAddReadyLabel       = "add_ready_label"
+	SupervisorActionRemoveReadyLabel    = "remove_ready_label"
+	SupervisorActionAddBlockedLabel     = "add_blocked_label"
+	SupervisorActionRemoveBlockedLabel  = "remove_blocked_label"
+	SupervisorActionAddIssueComment     = "add_issue_comment"
+	SupervisorActionMergePR             = "merge_pr"
+	SupervisorActionCloseIssue          = "close_issue"
+	SupervisorActionCloseIssueBatch     = "close_issue_batch"
+	SupervisorActionDeleteWorktree      = "delete_worktree"
+	SupervisorActionChangeGlobalConfig  = "change_global_config"
+	SupervisorActionApplyLessonProposal = "apply_lesson_proposal"
 	// SupervisorActionRestartWorker / SupervisorActionStopWorker are the
 	// per-session worker-control verbs surfaced by the fleet snapshot
 	// (#567). Both are approval-gated: the operator clicks Restart/Stop on
@@ -1370,19 +1371,20 @@ func mergeApprovalGatedVerbs(approvalRequired []string) []string {
 
 func knownSupervisorActions() map[string]bool {
 	return map[string]bool{
-		SupervisorActionAddReadyLabel:      true,
-		SupervisorActionRemoveReadyLabel:   true,
-		SupervisorActionAddBlockedLabel:    true,
-		SupervisorActionRemoveBlockedLabel: true,
-		SupervisorActionAddIssueComment:    true,
-		SupervisorActionMergePR:            true,
-		SupervisorActionCloseIssue:         true,
-		SupervisorActionCloseIssueBatch:    true,
-		SupervisorActionDeleteWorktree:     true,
-		SupervisorActionChangeGlobalConfig: true,
-		SupervisorActionSpawnReviewRepair:  true,
-		SupervisorActionRestartWorker:      true,
-		SupervisorActionStopWorker:         true,
+		SupervisorActionAddReadyLabel:       true,
+		SupervisorActionRemoveReadyLabel:    true,
+		SupervisorActionAddBlockedLabel:     true,
+		SupervisorActionRemoveBlockedLabel:  true,
+		SupervisorActionAddIssueComment:     true,
+		SupervisorActionMergePR:             true,
+		SupervisorActionCloseIssue:          true,
+		SupervisorActionCloseIssueBatch:     true,
+		SupervisorActionDeleteWorktree:      true,
+		SupervisorActionChangeGlobalConfig:  true,
+		SupervisorActionApplyLessonProposal: true,
+		SupervisorActionSpawnReviewRepair:   true,
+		SupervisorActionRestartWorker:       true,
+		SupervisorActionStopWorker:          true,
 	}
 }
 
@@ -1398,6 +1400,7 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionCloseIssueBatch,
 		SupervisorActionDeleteWorktree,
 		SupervisorActionChangeGlobalConfig,
+		SupervisorActionApplyLessonProposal,
 		SupervisorActionSpawnReviewRepair,
 		SupervisorActionRestartWorker,
 		SupervisorActionStopWorker,

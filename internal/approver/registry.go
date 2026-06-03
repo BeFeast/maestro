@@ -23,13 +23,14 @@ package approver
 // here, by enumerating the verbs and checking each one routes through
 // Execute() without falling into default).
 var KnownApprovalActions = map[string]struct{}{
-	"merge_pr":             {},
-	"close_issue":          {},
-	"close_issue_batch":    {},
-	"delete_worktree":      {},
-	"change_global_config": {}, // executor returns execution_skipped pending YAML pipeline
-	"spawn_worker":         {}, // executor returns awaiting_dispatch (#515)
-	"open_child_issue":     {}, // executor returns awaiting_dispatch (#515)
+	"merge_pr":              {},
+	"close_issue":           {},
+	"close_issue_batch":     {},
+	"delete_worktree":       {},
+	"change_global_config":  {}, // executor returns execution_skipped pending YAML pipeline
+	"apply_lesson_proposal": {},
+	"spawn_worker":          {}, // executor returns awaiting_dispatch (#515)
+	"open_child_issue":      {}, // executor returns awaiting_dispatch (#515)
 	// #565: auto review-repair respawn. Executor returns awaiting_dispatch
 	// — the orchestrator's dispatcher spawns a scoped opus repair worker
 	// keyed on (pr_number, head_sha) so the same head is never

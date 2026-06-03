@@ -14,8 +14,11 @@ package approver
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
@@ -134,6 +137,10 @@ type Executor struct {
 	// (#567: restart_worker / stop_worker). nil disables both verbs —
 	// the executor returns execution_failed with a clear summary.
 	Workers WorkerController
+
+	// State is optional for most actions. apply_lesson_proposal uses it to
+	// fetch the proposed rule and mark it applied after the gated append.
+	State *state.State
 
 	// locks serializes Execute(approval) per approval.ID within the same
 	// process. The second concurrent caller for the same ID returns
@@ -280,6 +287,8 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 			Status:  state.ApprovalStatusExecutionSkipped,
 			Summary: "change_global_config requires a manual edit + systemctl restart (executor not implemented)",
 		}
+	case config.SupervisorActionApplyLessonProposal:
+		return e.executeApplyLessonProposal(approval)
 	case "spawn_worker":
 		// The approver runs in the supervisor cycle; it does not own the
 		// dispatch loop that actually spawns workers. Mark the approval
@@ -507,6 +516,115 @@ func formatIssueList(issues []int) string {
 		parts = append(parts, fmt.Sprintf("#%d", issue))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func (e *Executor) executeApplyLessonProposal(approval *state.Approval) Result {
+	if e.State == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no state wired into executor")}
+	}
+	if e.Cfg == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no project config wired into executor")}
+	}
+	id := strings.TrimSpace(approval.LessonProposalID)
+	if id == "" {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("%w: lesson proposal id missing", ErrMissingTarget)}
+	}
+	proposal, ok := e.State.FindLessonProposal(id)
+	if !ok {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("lesson proposal %s not found", id)}
+	}
+	if proposal.Status == state.LessonProposalStatusApplied {
+		return Result{
+			Status:  state.ApprovalStatusExecutionSkipped,
+			Summary: fmt.Sprintf("lesson proposal %s was already applied", proposal.ID),
+		}
+	}
+	path, targetLabel, err := e.lessonProposalTargetPath(proposal)
+	if err != nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Summary: err.Error(), Err: err}
+	}
+	block := formatLessonProposalBlock(*proposal)
+	if err := appendLessonBlock(path, block); err != nil {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("apply lesson proposal %s to %s: %v", proposal.ID, targetLabel, err),
+			Err:     err,
+		}
+	}
+	e.State.MarkLessonProposalApplied(proposal.ID, time.Now().UTC(), approvalApprovedActor(approval), fmt.Sprintf("appended to %s", targetLabel))
+	return Result{
+		Status:  state.ApprovalStatusExecuted,
+		Summary: fmt.Sprintf("applied lesson proposal %s to %s", proposal.ID, targetLabel),
+	}
+}
+
+func (e *Executor) lessonProposalTargetPath(proposal *state.LessonProposal) (string, string, error) {
+	switch strings.TrimSpace(proposal.Target) {
+	case state.LessonProposalTargetWorkerPrompt:
+		path := strings.TrimSpace(e.Cfg.WorkerPrompt)
+		if path == "" {
+			return "", "", errors.New("worker_prompt is not configured; cannot apply worker prompt lesson")
+		}
+		return path, "worker prompt", nil
+	case state.LessonProposalTargetAgentsMD, "":
+		root := strings.TrimSpace(e.Cfg.LocalPath)
+		if root == "" {
+			return "", "", errors.New("local_path is not configured; cannot apply AGENTS.md lesson")
+		}
+		return filepath.Join(root, "AGENTS.md"), "AGENTS.md", nil
+	default:
+		return "", "", fmt.Errorf("unknown lesson proposal target %q", proposal.Target)
+	}
+}
+
+func formatLessonProposalBlock(proposal state.LessonProposal) string {
+	rule := strings.TrimSpace(proposal.SuggestedRule)
+	repro := strings.TrimSpace(proposal.MinimalRepro)
+	var b strings.Builder
+	b.WriteString("\n\n<!-- maestro:lesson-proposal ")
+	b.WriteString(proposal.ID)
+	b.WriteString(" -->\n")
+	b.WriteString("## Maestro Lesson: ")
+	b.WriteString(proposal.FailureClass)
+	b.WriteString("\n\n")
+	if repro != "" {
+		b.WriteString("Context: ")
+		b.WriteString(repro)
+		b.WriteString("\n\n")
+	}
+	b.WriteString(rule)
+	b.WriteString("\n")
+	b.WriteString("<!-- /maestro:lesson-proposal -->\n")
+	return b.String()
+}
+
+func appendLessonBlock(path, block string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("empty lesson target path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("create lesson target dir: %w", err)
+	}
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read lesson target: %w", err)
+	}
+	if strings.Contains(string(existing), strings.TrimSpace(block)) {
+		return nil
+	}
+	return os.WriteFile(path, append(existing, []byte(block)...), 0644)
+}
+
+func approvalApprovedActor(approval *state.Approval) string {
+	if approval == nil {
+		return ""
+	}
+	for i := len(approval.Audit) - 1; i >= 0; i-- {
+		if approval.Audit[i].Event == state.ApprovalAuditApproved {
+			return approval.Audit[i].Actor
+		}
+	}
+	return ""
 }
 
 func (e *Executor) executeDeleteWorktree(approval *state.Approval) Result {

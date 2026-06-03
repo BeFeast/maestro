@@ -2,6 +2,8 @@ package approver
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +139,49 @@ func TestExecute_OpenChildIssue_ReturnsAwaitingDispatchWithActionableSummary(t *
 	}
 	if !strings.Contains(strings.ToLower(res.Summary), "manually") {
 		t.Fatalf("summary = %q, want manual-create hint for v1", res.Summary)
+	}
+}
+
+func TestExecute_ApplyLessonProposal_AppendsWorkerPromptAndMarksApplied(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "worker-prompt.md")
+	if err := os.WriteFile(promptPath, []byte("base prompt\n"), 0644); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+	st := state.NewState()
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	proposal, approval, created := st.RecordLessonProposal(state.LessonProposal{
+		FailureClass:  "retry_exhausted",
+		Area:          "issue:640",
+		MinimalRepro:  "Session sup-155 status=retry_exhausted retry_count=3",
+		SuggestedRule: "Inspect failed attempts before retrying.",
+		Target:        state.LessonProposalTargetWorkerPrompt,
+	}, now, "owner/repo", "owner/repo")
+	if !created {
+		t.Fatal("proposal was not created")
+	}
+	approval.Status = state.ApprovalStatusApproved
+	approval.Audit = append(approval.Audit, state.ApprovalAudit{At: now.Add(time.Minute), Event: state.ApprovalAuditApproved, Actor: "operator"})
+
+	ex := &Executor{Cfg: &config.Config{Repo: "owner/repo", WorkerPrompt: promptPath}, State: st}
+	res := ex.Execute(approval)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("status = %q, want executed; res=%+v", res.Status, res)
+	}
+	data, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatalf("read prompt: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, proposal.ID) || !strings.Contains(content, "Inspect failed attempts before retrying.") {
+		t.Fatalf("prompt content missing lesson block:\n%s", content)
+	}
+	stored, ok := st.FindLessonProposal(proposal.ID)
+	if !ok {
+		t.Fatalf("proposal %s missing", proposal.ID)
+	}
+	if stored.Status != state.LessonProposalStatusApplied || stored.AppliedAt == nil {
+		t.Fatalf("proposal = %+v, want applied", stored)
 	}
 }
 
