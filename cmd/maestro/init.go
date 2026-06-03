@@ -304,6 +304,10 @@ func checkInitPrerequisites(w io.Writer) {
 		allOK = false
 	}
 
+	if _, err := exec.LookPath("gopls"); err != nil {
+		fmt.Fprintln(w, "  NOTE: gopls not found — Go repo research will fall back to filename search")
+	}
+
 	if !allOK {
 		fmt.Fprintln(w)
 	}

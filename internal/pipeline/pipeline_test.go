@@ -297,6 +297,116 @@ func TestRunResearch(t *testing.T) {
 	}
 }
 
+func TestRunResearchIncludesGoplsSymbolContext(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeGopls(t, dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldGopls := goplsBinary
+	goplsBinary = "gopls"
+	t.Cleanup(func() { goplsBinary = oldGopls })
+
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/research\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "internal", "pipeline"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	researchGo := `package pipeline
+
+func runResearch() string {
+	return "context"
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "internal", "pipeline", "research.go"), []byte(researchGo), 0644); err != nil {
+		t.Fatal(err)
+	}
+	callGo := `package pipeline
+
+func callSite() {
+	_ = runResearch()
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "internal", "pipeline", "call.go"), []byte(callGo), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := runResearch(dir, 646, "worker: improve `runResearch`", "Use gopls references for `runResearch`.")
+	if err != nil {
+		t.Fatalf("runResearch: %v", err)
+	}
+
+	for _, want := range []string{
+		"## Symbol Context (gopls)",
+		"### `runResearch`",
+		"**Definitions**",
+		"`internal/pipeline/research.go:3:6`",
+		"**References**",
+		"`internal/pipeline/call.go:4:6`",
+	} {
+		if !strings.Contains(ctx, want) {
+			t.Fatalf("research context missing %q:\n%s", want, ctx)
+		}
+	}
+}
+
+func TestRunResearchFallsBackWhenGoplsUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	oldGopls := goplsBinary
+	goplsBinary = "definitely-not-gopls"
+	t.Cleanup(func() { goplsBinary = oldGopls })
+
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/research\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "internal", "pipeline"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "internal", "pipeline", "research.go"), []byte("package pipeline\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := runResearch(dir, 647, "Add pipeline research", "Research phase for worker pipeline")
+	if err != nil {
+		t.Fatalf("runResearch should keep filename-grep fallback working: %v", err)
+	}
+	if !strings.Contains(ctx, "## Relevant Files") {
+		t.Fatalf("expected fallback relevant files context, got:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "## Symbol Context (gopls)") {
+		t.Fatalf("did not expect symbol context when gopls is unavailable:\n%s", ctx)
+	}
+}
+
+func writeFakeGopls(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+verb="$1"
+case "$verb" in
+definition)
+cat <<JSON
+[{"span":"` + dir + `/internal/pipeline/research.go:3:6-17","description":"func runResearch() string"}]
+JSON
+;;
+references)
+cat <<JSON
+[{"span":"` + dir + `/internal/pipeline/research.go:3:6-17"},{"uri":"file://` + dir + `/internal/pipeline/call.go","range":{"start":{"line":3,"character":5},"end":{"line":3,"character":16}}}]
+JSON
+;;
+implementation)
+echo "[]"
+;;
+*)
+echo "unexpected gopls verb: $verb" >&2
+exit 1
+;;
+esac
+`
+	path := filepath.Join(dir, "gopls")
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDiscoverPatterns_Go(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test"), 0644)
