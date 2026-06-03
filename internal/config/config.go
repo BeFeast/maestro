@@ -158,6 +158,7 @@ type SupervisorConfig struct {
 	BlockedLabel            string                          `yaml:"blocked_label" json:"blocked_label,omitempty"`
 	QueueComments           bool                            `yaml:"queue_comments" json:"queue_comments,omitempty"`
 	OneAtATime              bool                            `yaml:"one_at_a_time" json:"one_at_a_time,omitempty"`
+	DispatchSLASeconds      int                             `yaml:"dispatch_sla_seconds" json:"dispatch_sla_seconds,omitempty"`
 	ExcludedLabels          []string                        `yaml:"excluded_labels" json:"excluded_labels,omitempty"`
 	AllowIssueTypes         []string                        `yaml:"allow_issue_types" json:"allow_issue_types,omitempty"`
 	OrderedQueue            SupervisorOrderedQueueConfig    `yaml:"ordered_queue" json:"ordered_queue,omitempty"`
@@ -1177,6 +1178,9 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	policy.ReadyLabel = strings.TrimSpace(policy.ReadyLabel)
 	policy.BlockedLabel = strings.TrimSpace(policy.BlockedLabel)
 	policy.PreflightCommand = strings.TrimSpace(policy.PreflightCommand)
+	if policy.DispatchSLASeconds < 0 {
+		return fmt.Errorf("supervisor.dispatch_sla_seconds must be >= 0")
+	}
 	policy.ExcludedLabels = normalizeStringList(policy.ExcludedLabels)
 	policy.AllowIssueTypes = normalizeStringList(policy.AllowIssueTypes)
 	policy.SafeActions = normalizeActionList(policy.SafeActions)

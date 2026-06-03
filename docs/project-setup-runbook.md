@@ -227,13 +227,13 @@ telegram:
 | `issue_labels` | Only pick issues with at least one of these labels (OR semantics) |
 | `exclude_labels` | Skip issues with any of these labels |
 | `outcome` | Project operating brief used by the supervisor to judge runtime progress |
-| `supervisor` | Optional local policy for supervisor queue order, safe actions, and issue-type skips |
+| `supervisor` | Optional local policy for supervisor queue order, safe actions, dispatch SLA, and issue-type skips |
 | `max_parallel` | Maximum concurrent worker sessions |
 | `deploy_cmd` | Shell command maestro runs after merging a PR |
 | `session_prefix` | Prefix for tmux session names |
 | `worker_prompt` | Path to the worker prompt template file |
 
-Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules.
+Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker.
 
 For Maestro dogfooding, add the `outcome` block to the `BeFeast/maestro` project config first. Point `runtime_target` and `healthcheck_url` at the local Mission Control dashboard, and keep deploy/runtime actions read-only until approval-backed controls exist.
 

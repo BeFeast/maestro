@@ -82,6 +82,7 @@ supervisor:
   mode: cautious
   ready_label: maestro-ready
   blocked_label: blocked
+  dispatch_sla_seconds: 300
   dynamic_wave:
     enabled: true
     owns_ready_label: true
@@ -156,12 +157,12 @@ Selection algorithm (deterministic, code-readable in `internal/server/fleet.go: 
 
    | Tier | Sources |
    |---|---|
-   | P0 | project `error`, `dispatch_failure`, `stale_worker`; pending approval past the 30m SLA |
+   | P0 | project `error`, `dispatch_failure`, `stale_worker`; selected issue pending dispatch past the configured dispatch SLA; pending approval past the 30m SLA |
    | P1 | project `attention`; pending approval inside SLA |
    | P2 | project `outcome_drift`, `stale`, `no_eligible_issues`, `queue_blocked` |
    | P3 | project `outcome_missing` |
 
-   Non-actionable kinds (`working`, `monitoring_pr`, `pending_dispatch`, `idle`, ...) are excluded.
+   Non-actionable kinds (`working`, `monitoring_pr`, `pending_dispatch` within SLA, `idle`, ...) are excluded.
 
 3. Sort by priority ascending (P0 first).
 4. Within the highest-occupied tier the **oldest by `updated_at`** wins. The "updated_at" comes from the underlying input — the worker session `started_at` for worker-driven kinds, the supervisor decision `created_at` for queue/dispatch/drift kinds, the approval `updated_at` for approvals — never from the snapshot timestamp. That keeps the choice stable across consecutive snapshots while the input is unchanged.
@@ -208,6 +209,7 @@ Dynamic wave policy:
 | Other skips | Already running, done, and retry exhausted |
 | Ready label | `supervisor.ready_label` is treated as a queue label and is added to selected work only when `add_ready_label` is allowed |
 | Owned ready label | When `owns_ready_label: true`, dynamic wave keeps the ready label on the selected issue and can remove it from other issues if policy allows |
+| Dispatch SLA | `supervisor.dispatch_sla_seconds` controls how long a selected issue may remain pending dispatch before Fleet promotes it from `pending_dispatch` to `dispatch_failure` |
 | Blocked label | `supervisor.blocked_label` makes an issue ineligible; it can be removed only when `remove_blocked_label` is an allowed safe action |
 
 Fleet cards surface `open`, `eligible`, `excluded`, `held/meta`, `blocked-deps`, `non_runnable_project_status`, selected candidate, and top skipped reason so operators can tell whether the queue is empty, held by parent/meta policy, blocked by dependencies, or waiting on project status.

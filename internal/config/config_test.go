@@ -1215,6 +1215,7 @@ supervisor:
   blocked_label: waiting
   queue_comments: true
   one_at_a_time: true
+  dispatch_sla_seconds: 90
 `
 	cfg, err := parse([]byte(yaml))
 	if err != nil {
@@ -1231,6 +1232,24 @@ supervisor:
 	}
 	if !cfg.Supervisor.OneAtATime {
 		t.Error("Supervisor.OneAtATime should be true")
+	}
+	if cfg.Supervisor.DispatchSLASeconds != 90 {
+		t.Errorf("Supervisor.DispatchSLASeconds = %d, want 90", cfg.Supervisor.DispatchSLASeconds)
+	}
+}
+
+func TestParse_SupervisorDispatchSLAMustBeNonNegative(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  dispatch_sla_seconds: -1
+`
+	_, err := parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("parse succeeded, want invalid dispatch SLA error")
+	}
+	if !strings.Contains(err.Error(), "supervisor.dispatch_sla_seconds") {
+		t.Fatalf("error = %v, want supervisor.dispatch_sla_seconds", err)
 	}
 }
 
