@@ -297,6 +297,19 @@ model:
       cmd: codex
 ```
 
+### Optional: parallel review streams
+
+By default, `review_gate: greptile` waits for the single Greptile verdict before merge. Projects that also run the simplicity / over-engineering reviewer can opt in to the aggregate gate:
+
+```yaml
+review_gate: greptile
+review_gate_streams:
+  - greptile
+  - simplicity
+```
+
+`review_gate: none` disables all review streams. A blocking simplicity finding is treated like a blocking Greptile finding for merge gating and review-repair.
+
 ### Running as a systemd service
 
 ```bash

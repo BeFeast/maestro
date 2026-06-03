@@ -89,6 +89,67 @@ func TestDecide_RetryExhaustedGreenPR_WithGreptileP1OnHead_SpawnsReviewRepair(t 
 	}
 }
 
+func TestDecide_RetryExhaustedGreenPR_WithSimplicityFinding_SpawnsReviewRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "greptile"
+	cfg.ReviewGateStreams = []string{"greptile", "simplicity"}
+	cfg.Supervisor.ReviewRepair.MaxRetries = 1
+
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 650, HeadRefName: "feat/sup-161", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{650: "success"},
+		reviewVerdicts: map[int]github.ReviewGateVerdict{
+			650: {
+				Passed: false,
+				Streams: []github.ReviewStreamVerdict{
+					{Name: "greptile", Passed: true},
+					{Name: "simplicity", Passed: false, Findings: []github.ReviewComment{{
+						Path: "internal/foo.go",
+						Line: 27,
+						Body: "blocking: this adds an unnecessary abstraction; inline the single caller",
+						User: "maestro-simplicity-reviewer",
+					}}},
+				},
+			},
+		},
+		highSeverityHeadSHA: map[int]string{650: "feedfacecafebeef"},
+		highSeverityFindings: map[int][]github.ReviewComment{
+			650: {{
+				Path: "internal/foo.go",
+				Line: 27,
+				Body: "blocking: this adds an unnecessary abstraction; inline the single caller",
+				User: "maestro-simplicity-reviewer",
+			}},
+		},
+	}
+	st := state.NewState()
+	st.Sessions["sup-161"] = &state.Session{
+		IssueNumber:                 649,
+		IssueTitle:                  "add simplicity reviewer",
+		Status:                      state.StatusRetryExhausted,
+		Branch:                      "feat/sup-161",
+		PRNumber:                    650,
+		LastNotifiedStatus:          "review_retry_exhausted",
+		PreviousAttemptFeedbackKind: state.RetryReasonReviewFeedback,
+		StartedAt:                   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnReviewRepair {
+		t.Fatalf("action = %q, want %q for blocking simplicity finding", decision.RecommendedAction, ActionSpawnReviewRepair)
+	}
+	if decision.ReviewRepair == nil || len(decision.ReviewRepair.Findings) != 1 {
+		t.Fatalf("review repair payload = %#v, want one simplicity finding", decision.ReviewRepair)
+	}
+	got := decision.ReviewRepair.Findings[0]
+	if got.User != "maestro-simplicity-reviewer" || !strings.Contains(got.Body, "unnecessary abstraction") {
+		t.Fatalf("review repair finding = %#v, want simplicity finding", got)
+	}
+}
+
 // Negative: the review-repair branch must NOT fire on a green PR that
 // has no Greptile P0/P1 findings on head (convergence-merge handles
 // that case).

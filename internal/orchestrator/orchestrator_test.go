@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1514,6 +1515,57 @@ func TestAutoMergePRs_ParallelMergesAllReady(t *testing.T) {
 		if (*merged)[i] != want {
 			t.Errorf("merged[%d] = %d, want %d", i, (*merged)[i], want)
 		}
+	}
+}
+
+func TestAutoMergePRs_AggregatesGreptileAndSimplicityStreams(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MergeStrategy:     "parallel",
+		ReviewGate:        "greptile",
+		ReviewGateStreams: []string{"greptile", "simplicity"},
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	calledStreams := []string{}
+	o.ghPRReviewGateVerdictFn = func(prNumber int, streams []string) (github.ReviewGateVerdict, error) {
+		calledStreams = append(calledStreams, streams...)
+		return github.ReviewGateVerdict{
+			Passed: false,
+			Streams: []github.ReviewStreamVerdict{
+				{Name: "greptile", Passed: true},
+				{Name: "simplicity", Passed: false, Findings: []github.ReviewComment{{
+					Path: "internal/foo.go",
+					Line: 7,
+					Body: "blocking: over-engineered for one caller",
+					User: "maestro-simplicity-reviewer",
+				}}},
+			},
+		}, nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 0 {
+		t.Fatalf("merged = %v, want no merge while simplicity stream has blocking findings", *merged)
+	}
+	if !reflect.DeepEqual(calledStreams, []string{"greptile", "simplicity"}) {
+		t.Fatalf("review streams = %#v, want [greptile simplicity]", calledStreams)
+	}
+
+	o.ghPRReviewGateVerdictFn = func(prNumber int, streams []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{
+			Passed: true,
+			Streams: []github.ReviewStreamVerdict{
+				{Name: "greptile", Passed: true},
+				{Name: "simplicity", Passed: true},
+			},
+		}, nil
+	}
+	o.autoMergePRs(s)
+	if len(*merged) != 1 || (*merged)[0] != 10 {
+		t.Fatalf("merged = %v, want PR #10 after both review streams pass", *merged)
 	}
 }
 

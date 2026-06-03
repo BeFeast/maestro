@@ -101,6 +101,7 @@ type Orchestrator struct {
 	ghPRCIStatusFn              func(prNumber int) (string, error)
 	ghPRMergeStatusFn           func(prNumber int) (mergeable string, mergeStateStatus string, err error)
 	ghPRGreptileApprovedFn      func(prNumber int) (approved bool, pending bool, err error)
+	ghPRReviewGateVerdictFn     func(prNumber int, streams []string) (github.ReviewGateVerdict, error)
 	ghPRHasCriticalReviewFn     func(prNumber int) (bool, error)
 	ghUpdateBranchFn            func(prNumber int) error
 	ghMergePRFn                 func(prNumber int) error
@@ -236,6 +237,32 @@ func (o *Orchestrator) prGreptileApproved(prNumber int) (bool, bool, error) {
 		return o.ghPRGreptileApprovedFn(prNumber)
 	}
 	return o.gh.PRGreptileApproved(prNumber)
+}
+
+func (o *Orchestrator) prReviewGateVerdict(prNumber int) (github.ReviewGateVerdict, error) {
+	streams := o.cfg.EffectiveReviewGateStreams()
+	if len(streams) == 0 {
+		return github.ReviewGateVerdict{Passed: true}, nil
+	}
+	if len(streams) == 1 && streams[0] == "greptile" {
+		approved, pending, err := o.prGreptileApproved(prNumber)
+		if err != nil {
+			return github.ReviewGateVerdict{}, err
+		}
+		return github.ReviewGateVerdict{
+			Passed:  approved && !pending,
+			Pending: pending,
+			Streams: []github.ReviewStreamVerdict{{
+				Name:    "greptile",
+				Passed:  approved,
+				Pending: pending,
+			}},
+		}, nil
+	}
+	if o.ghPRReviewGateVerdictFn != nil {
+		return o.ghPRReviewGateVerdictFn(prNumber, streams)
+	}
+	return o.gh.PRReviewGateVerdict(prNumber, streams)
 }
 
 func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
@@ -2379,17 +2406,17 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue
 			}
 
-			greptileOK, greptilePending, err := o.prGreptileApproved(pr.Number)
+			reviewVerdict, err := o.prReviewGateVerdict(pr.Number)
 			if err != nil {
-				log.Printf("[orch] greptile check PR #%d: %v", pr.Number, err)
+				log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
 				continue // skip this cycle, try next
 			}
-			if greptilePending {
-				log.Printf("[orch] PR #%d waiting for Greptile review", pr.Number)
+			if reviewVerdict.Pending {
+				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				continue // not ready yet
 			}
-			if !greptileOK {
-				log.Printf("[orch] PR #%d not approved by Greptile", pr.Number)
+			if !reviewVerdict.Passed {
+				log.Printf("[orch] PR #%d blocked by review gate (%s)", pr.Number, reviewVerdict.Summary())
 				// auto-label blocked disabled
 				continue
 			}
