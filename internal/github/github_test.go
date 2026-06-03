@@ -519,6 +519,78 @@ func TestFindBlockers_DefaultPatternsMarkdown(t *testing.T) {
 	}
 }
 
+func TestFindChildIssues_InlineChildren(t *testing.T) {
+	body := "Children: #147, #148, #149\n"
+	got := FindChildIssues(body)
+	want := []int{147, 148, 149}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FindChildIssues() = %v, want %v", got, want)
+	}
+}
+
+func TestFindChildIssues_ChildrenSectionTaskList(t *testing.T) {
+	body := `# Epic: Scribe redesign
+
+## Issue Wave
+
+- [ ] #147 — route shell
+- [x] #148 — replace /inbox
+- [ ] #149 — replace /settings
+
+## Notes
+no children referenced here
+`
+	got := FindChildIssues(body)
+	want := []int{147, 148, 149}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FindChildIssues() = %v, want %v", got, want)
+	}
+}
+
+func TestFindChildIssues_DeduplicatesAndExcludesSelf(t *testing.T) {
+	body := `## Children
+- #200 — slice A
+- #200 — duplicate
+- #201 — slice B
+
+Children: #201, #202
+Refs #300 (self)
+`
+	got := FindChildIssuesExcluding(body, 300)
+	sort.Ints(got)
+	want := []int{200, 201, 202}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FindChildIssuesExcluding() = %v, want %v", got, want)
+	}
+}
+
+func TestFindChildIssues_EmptyBody(t *testing.T) {
+	if got := FindChildIssues(""); len(got) != 0 {
+		t.Errorf("FindChildIssues(\"\") = %v, want empty", got)
+	}
+	if got := FindChildIssues("no children here"); len(got) != 0 {
+		t.Errorf("FindChildIssues(no children) = %v, want empty", got)
+	}
+}
+
+func TestFindChildIssues_NestedHeading(t *testing.T) {
+	body := `## Issue Wave
+- #1
+### Subnotes
+- #2
+## Other
+- #3
+`
+	got := FindChildIssues(body)
+	// Subnotes is nested under Issue Wave (deeper level), so #2 stays in the
+	// section. #3 lives under "Other" which is NOT a child section heading,
+	// so it must not be picked up.
+	want := []int{1, 2}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FindChildIssues() = %v, want %v", got, want)
+	}
+}
+
 func TestFormatReviewFeedback_NonEmpty(t *testing.T) {
 	comments := []ReviewComment{
 		{Path: "bridge.rs", Line: 42, Body: "P2: enabled flag logic inverted", User: "greptile-apps[bot]"},

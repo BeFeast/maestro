@@ -714,6 +714,36 @@ type SupervisorDecision struct {
 	// backend without re-fetching review comments from GitHub. nil for
 	// every non-review-repair decision.
 	ReviewRepair *SupervisorReviewRepairPayload `json:"review_repair,omitempty"`
+	// Epics is the epic-completion aggregate snapshot for the cycle that
+	// produced this decision (#650). Each entry summarises one open epic's
+	// children-merged ratio and the outcome health gate, so the fleet /
+	// status surfaces can render "epic in progress" / "epic complete"
+	// without re-listing issues. Empty when no candidate epic is open or
+	// no candidate epic has parseable children.
+	Epics []EpicProgress `json:"epics,omitempty"`
+}
+
+// EpicProgress is the per-epic aggregate the supervisor records alongside
+// a decision (#650). Counts and child slices are read by the fleet /
+// status surface; Complete=true means every child is merged or closed AND
+// the configured outcome health gate is healthy — the precondition for
+// the approval-gated epic close recommendation. Never used to auto-close
+// without a human approval.
+type EpicProgress struct {
+	Number          int      `json:"number"`
+	Title           string   `json:"title,omitempty"`
+	Children        []int    `json:"children,omitempty"`
+	MergedChildren  []int    `json:"merged_children,omitempty"`
+	OpenChildren    []int    `json:"open_children,omitempty"`
+	TotalChildren   int      `json:"total_children"`
+	MergedCount     int      `json:"merged_count"`
+	OpenCount       int      `json:"open_count"`
+	OutcomeHealth   string   `json:"outcome_health,omitempty"`
+	OutcomeHealthy  bool     `json:"outcome_healthy"`
+	AllChildrenDone bool     `json:"all_children_done"`
+	Complete        bool     `json:"complete"`
+	Summary         string   `json:"summary,omitempty"`
+	Evidence        []string `json:"evidence,omitempty"`
 }
 
 // SupervisorReviewRepairPayload carries the auto-review-repair payload

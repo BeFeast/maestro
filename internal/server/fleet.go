@@ -514,6 +514,18 @@ type fleetProjectState struct {
 	// pricing configured render in the SPA as tokens only.
 	CostObservability fleetCostObservability `json:"cost_observability"`
 
+	// Epics is the epic-completion aggregate the supervisor stamped on
+	// its latest decision (#650). The SPA renders per-epic progress
+	// (children merged / total) and the "epic complete" badge when all
+	// children are merged AND the configured outcome health gate is
+	// healthy. Empty when the project has no open epic with parseable
+	// children, or the supervisor has not run yet.
+	Epics []state.EpicProgress `json:"epics,omitempty"`
+	// EpicSummary is the operator-glance roll-up used by the project
+	// card to render an "N epic(s) tracked, 1 complete" pill without
+	// the SPA walking the Epics slice.
+	EpicSummary fleetEpicSummary `json:"epic_summary"`
+
 	// EffectiveConfig is the sanitized, parsed runtime config surfaced on
 	// MC Settings (#622). It deliberately excludes raw YAML, commands,
 	// auth, notification endpoints/tokens and local prompt paths.
@@ -607,6 +619,19 @@ type fleetCloseCandidate struct {
 	PRURL       string `json:"pr_url,omitempty"`
 	Session     string `json:"session,omitempty"`
 	FinishedAt  string `json:"finished_at,omitempty"`
+}
+
+// fleetEpicSummary is the operator-glance roll-up of the project's
+// epic-completion aggregate (#650). Zero values render as a calm
+// "no epics tracked" line in the SPA project card.
+type fleetEpicSummary struct {
+	Tracked          int `json:"tracked"`
+	Complete         int `json:"complete"`
+	InProgress       int `json:"in_progress"`
+	ChildrenTotal    int `json:"children_total"`
+	ChildrenMerged   int `json:"children_merged"`
+	ChildrenOpen     int `json:"children_open"`
+	AwaitingApproval int `json:"awaiting_approval"`
 }
 
 // fleetSupervisorPulse describes the supervisor's liveness, cadence and
@@ -2134,6 +2159,57 @@ func fleetProjectFreshnessForState(stateDir string, st *state.State, now time.Ti
 	return freshness
 }
 
+// fleetEpicProgressFromState returns the epic-completion aggregate the
+// supervisor stamped on its latest decision (#650), together with the
+// operator-glance roll-up the project card renders. Returns an empty
+// slice and zero-valued summary when no decision is recorded or the
+// recorded decision has no epic aggregate.
+func fleetEpicProgressFromState(st *state.State) ([]state.EpicProgress, fleetEpicSummary) {
+	if st == nil {
+		return nil, fleetEpicSummary{}
+	}
+	latest := st.LatestSupervisorDecision()
+	if latest == nil || len(latest.Epics) == 0 {
+		return nil, fleetEpicSummary{}
+	}
+	epics := append([]state.EpicProgress(nil), latest.Epics...)
+	summary := fleetEpicSummary{Tracked: len(epics)}
+	epicNumbers := make(map[int]bool, len(epics))
+	for _, epic := range epics {
+		summary.ChildrenTotal += epic.TotalChildren
+		summary.ChildrenMerged += epic.MergedCount
+		summary.ChildrenOpen += epic.OpenCount
+		if epic.Complete {
+			summary.Complete++
+		} else {
+			summary.InProgress++
+		}
+		if epic.Number > 0 {
+			epicNumbers[epic.Number] = true
+		}
+	}
+	// Cross-reference pending close_issue approvals against the epic
+	// list so the SPA can render an "awaiting approval" pill on the
+	// epic row. The executor verb stays `close_issue`; the epic-vs-
+	// child-close discriminator is whether the approval's target issue
+	// is one of the open epics surfaced by this snapshot.
+	for _, approval := range st.Approvals {
+		if approval.Status != state.ApprovalStatusPending {
+			continue
+		}
+		if approval.Action != config.SupervisorActionCloseIssue {
+			continue
+		}
+		if approval.Target == nil {
+			continue
+		}
+		if epicNumbers[approval.Target.Issue] {
+			summary.AwaitingApproval++
+		}
+	}
+	return epics, summary
+}
+
 func fleetQueueSnapshotFromSupervisor(info supervisorInfo) *fleetQueueSnapshot {
 	if info.Latest == nil || info.Latest.QueueAnalysis == nil {
 		return nil
@@ -2451,6 +2527,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Supervisor = projectState.Supervisor
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
 	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
+	item.Epics, item.EpicSummary = fleetEpicProgressFromState(st)
 	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
