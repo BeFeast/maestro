@@ -37,6 +37,11 @@ The supervisor selects issues that match **all** of:
 
 Source of truth: `~/.maestro/maestro.d/maestro-supervisor-dogfood.yaml`.
 
+For hard or architectural dogfood issues, add `pipeline:full` to that GitHub
+issue. The dogfood config should keep `pipeline.enabled` unset or `false` so
+routine `maestro-ready` issues continue to use the cheaper single implementer
+session by default.
+
 If a spec needs to wait, add `blocked` and explain in a comment. Do not delete the issue — supervisor needs the
 audit trail.
 

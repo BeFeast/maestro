@@ -129,6 +129,7 @@ type Session struct {
 	ProviderLimitResetAt        *time.Time        `json:"provider_limit_reset_at,omitempty"`        // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
 	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
 	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
+	PipelineFull                bool              `json:"pipeline_full,omitempty"`                  // true when issue label opted this session into plan/implement/validate
 	ValidationFails             int               `json:"validation_fails,omitempty"`               // number of failed validation attempts
 	ValidationFeedback          string            `json:"validation_feedback,omitempty"`            // feedback from last failed validation
 	CIFailureOutput             string            `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)

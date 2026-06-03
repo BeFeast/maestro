@@ -145,6 +145,54 @@ func TestAdvancePipeline_ImplementComplete_ValidatorEnabled(t *testing.T) {
 	}
 }
 
+func TestAdvancePipeline_PipelineFullSessionUsesValidatorBackendWithGlobalPipelineDisabled(t *testing.T) {
+	cfg := pipelineConfig()
+	cfg.Pipeline.Enabled = false
+	cfg.Pipeline.Planner.Enabled = false
+	cfg.Pipeline.Validator.Enabled = false
+	cfg.Pipeline.Validator.Backend = "validator"
+	cfg.Model.Backends["validator"] = config.BackendDef{Cmd: "validator"}
+	o := pipelineOrchestrator(cfg)
+
+	worktreeDir := t.TempDir()
+	sess := &state.Session{
+		IssueNumber:  42,
+		IssueTitle:   "Test issue",
+		Phase:        state.PhaseImplement,
+		PipelineFull: true,
+		Worktree:     worktreeDir,
+		Branch:       "feat/test",
+		Status:       state.StatusRunning,
+	}
+
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		return github.Issue{Number: number, Title: "Test issue"}, nil
+	}
+	var gotBackend string
+	var gotValidatorEnabled bool
+	o.workerStartPhaseFn = func(cfg *config.Config, s *state.Session, slotName, prompt, backendName string) error {
+		gotBackend = backendName
+		gotValidatorEnabled = cfg.Pipeline.Validator.Enabled
+		s.Status = state.StatusRunning
+		s.PID = 999
+		return nil
+	}
+
+	handled := o.advancePipeline("slot-1", sess)
+	if !handled {
+		t.Fatal("expected handled")
+	}
+	if sess.Phase != state.PhaseValidate {
+		t.Errorf("expected validate phase, got %s", sess.Phase)
+	}
+	if !gotValidatorEnabled {
+		t.Fatal("pipeline:full session did not enable validator for phase transition")
+	}
+	if gotBackend != "validator" {
+		t.Fatalf("validator backend = %q, want validator", gotBackend)
+	}
+}
+
 func TestAdvancePipeline_ImplementComplete_ValidatorDisabled(t *testing.T) {
 	cfg := pipelineConfig()
 	cfg.Pipeline.Validator.Enabled = false

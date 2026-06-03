@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
@@ -33,6 +34,7 @@ func (o *Orchestrator) advancePipeline(slotName string, sess *state.Session) boo
 
 // handlePlanComplete checks if the planner produced artifacts and advances to implement phase.
 func (o *Orchestrator) handlePlanComplete(slotName string, sess *state.Session) bool {
+	cfg := o.pipelineConfigForSession(sess)
 	o.runAfterRunHook(sess)
 
 	if !pipeline.PlanArtifactsExist(sess.Worktree) {
@@ -60,9 +62,9 @@ func (o *Orchestrator) handlePlanComplete(slotName string, sess *state.Session) 
 	}
 
 	promptContent := o.buildImplementerPrompt(sess, issue)
-	backendName := pipeline.BackendForPhase(o.cfg, state.PhaseImplement)
+	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 
-	if err := o.startPhase(slotName, sess, promptContent, backendName); err != nil {
+	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
 		log.Printf("[pipeline] start implement phase for %s: %v — marking dead", slotName, err)
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
@@ -78,9 +80,10 @@ func (o *Orchestrator) handlePlanComplete(slotName string, sess *state.Session) 
 
 // handleImplementComplete advances to validate phase or proceeds to PR flow.
 func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Session) bool {
+	cfg := o.pipelineConfigForSession(sess)
 	o.runAfterRunHook(sess)
 
-	nextPhase := pipeline.NextPhase(o.cfg, state.PhaseImplement)
+	nextPhase := pipeline.NextPhase(cfg, state.PhaseImplement)
 	if nextPhase == state.PhaseNone {
 		// No validator — fall through to normal dead-worker handling (PR detection, retry, etc.)
 		log.Printf("[pipeline] implementer %s done, no validator configured — returning to normal flow", slotName)
@@ -101,10 +104,10 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 		return true
 	}
 
-	promptContent := pipeline.PromptForPhase(o.cfg, state.PhaseValidate, issue, sess.Worktree, sess.Branch)
-	backendName := pipeline.BackendForPhase(o.cfg, state.PhaseValidate)
+	promptContent := pipeline.PromptForPhase(cfg, state.PhaseValidate, issue, sess.Worktree, sess.Branch)
+	backendName := pipeline.BackendForPhase(cfg, state.PhaseValidate)
 
-	if err := o.startPhase(slotName, sess, promptContent, backendName); err != nil {
+	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
 		log.Printf("[pipeline] start validate phase for %s: %v — marking dead", slotName, err)
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
@@ -120,6 +123,7 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 
 // handleValidateComplete checks validation result and either proceeds to PR flow or retries implementer.
 func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Session) bool {
+	cfg := o.pipelineConfigForSession(sess)
 	o.runAfterRunHook(sess)
 
 	passed, feedback, err := pipeline.ValidationPassed(sess.Worktree)
@@ -166,9 +170,9 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	}
 
 	promptContent := o.buildImplementerPrompt(sess, issue)
-	backendName := pipeline.BackendForPhase(o.cfg, state.PhaseImplement)
+	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 
-	if err := o.startPhase(slotName, sess, promptContent, backendName); err != nil {
+	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
 		log.Printf("[pipeline] start implement retry for %s: %v — marking dead", slotName, err)
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
@@ -180,6 +184,17 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	o.notifier.Sendf("✅→🔨 maestro: %s (issue #%d) validation failed, retrying implementer (attempt %d)",
 		slotName, sess.IssueNumber, sess.ValidationFails+1)
 	return true
+}
+
+func (o *Orchestrator) pipelineConfigForSession(sess *state.Session) *config.Config {
+	if o.cfg == nil || sess == nil || !sess.PipelineFull {
+		return o.cfg
+	}
+	cfg := *o.cfg
+	cfg.Pipeline.Enabled = true
+	cfg.Pipeline.Planner.Enabled = true
+	cfg.Pipeline.Validator.Enabled = true
+	return &cfg
 }
 
 // buildImplementerPrompt builds the implementer prompt with pipeline preamble.
@@ -208,11 +223,14 @@ func (o *Orchestrator) buildImplementerPrompt(sess *state.Session, issue github.
 }
 
 // startPhase is a wrapper around worker.StartPhase with test hook support.
-func (o *Orchestrator) startPhase(slotName string, sess *state.Session, prompt, backendName string) error {
-	if o.workerStartPhaseFn != nil {
-		return o.workerStartPhaseFn(o.cfg, sess, slotName, prompt, backendName)
+func (o *Orchestrator) startPhase(cfg *config.Config, slotName string, sess *state.Session, prompt, backendName string) error {
+	if cfg == nil {
+		cfg = o.cfg
 	}
-	return worker.StartPhase(o.cfg, sess, slotName, prompt, backendName)
+	if o.workerStartPhaseFn != nil {
+		return o.workerStartPhaseFn(cfg, sess, slotName, prompt, backendName)
+	}
+	return worker.StartPhase(cfg, sess, slotName, prompt, backendName)
 }
 
 func truncateFeedback(s string) string {
