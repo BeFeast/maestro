@@ -25,12 +25,6 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	tmuxName := TmuxSessionName(slotName)
 	exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput()
 
-	// Write prompt to file
-	promptFile := fmt.Sprintf("%s/%s-prompt.md", cfg.StateDir, slotName)
-	if err := writePromptFile(promptFile, prompt); err != nil {
-		return fmt.Errorf("write prompt file: %w", err)
-	}
-
 	// Determine backend
 	if backendName == "" {
 		backendName = cfg.Model.Default
@@ -48,6 +42,18 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+	}
+
+	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, backendName, cfg.Hooks)
+	if err != nil {
+		return fmt.Errorf("setup worker tool hooks: %w", err)
+	}
+	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+
+	// Write prompt to file
+	promptFile := fmt.Sprintf("%s/%s-prompt.md", cfg.StateDir, slotName)
+	if err := writePromptFile(promptFile, prompt); err != nil {
+		return fmt.Errorf("write prompt file: %w", err)
 	}
 
 	// Prepare log file

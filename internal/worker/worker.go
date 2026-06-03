@@ -90,15 +90,6 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		promptBase = promptBase + section
 	}
 
-	// Assemble worker prompt
-	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
-
-	// Write prompt to file
-	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
-	if err := writePromptFile(promptFile, prompt); err != nil {
-		return "", fmt.Errorf("write prompt file: %w", err)
-	}
-
 	// Determine backend
 	if backendName == "" {
 		backendName = cfg.Model.Default
@@ -116,6 +107,21 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+	}
+
+	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, backendName, cfg.Hooks)
+	if err != nil {
+		return "", fmt.Errorf("setup worker tool hooks: %w", err)
+	}
+
+	// Assemble worker prompt
+	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+
+	// Write prompt to file
+	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
+	if err := writePromptFile(promptFile, prompt); err != nil {
+		return "", fmt.Errorf("write prompt file: %w", err)
 	}
 
 	// Prepare log file
@@ -231,15 +237,6 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		promptBase = promptBase + section
 	}
 
-	// Assemble worker prompt
-	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
-
-	// Write prompt to file
-	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
-	if err := writePromptFile(promptFile, prompt); err != nil {
-		return fmt.Errorf("write prompt file: %w", err)
-	}
-
 	// Determine backend
 	if backendName == "" {
 		backendName = cfg.Model.Default
@@ -256,6 +253,21 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+	}
+
+	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, backendName, cfg.Hooks)
+	if err != nil {
+		return fmt.Errorf("setup worker tool hooks: %w", err)
+	}
+
+	// Assemble worker prompt
+	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+
+	// Write prompt to file
+	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
+	if err := writePromptFile(promptFile, prompt); err != nil {
+		return fmt.Errorf("write prompt file: %w", err)
 	}
 
 	// Prepare log file

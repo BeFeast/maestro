@@ -1671,6 +1671,12 @@ func TestParse_HooksDefault(t *testing.T) {
 	if cfg.Hooks.BeforeRemove != "" {
 		t.Errorf("Hooks.BeforeRemove = %q, want empty", cfg.Hooks.BeforeRemove)
 	}
+	if cfg.Hooks.PreTool.Command != "" {
+		t.Errorf("Hooks.PreTool.Command = %q, want empty", cfg.Hooks.PreTool.Command)
+	}
+	if cfg.Hooks.PostEdit.Command != "" {
+		t.Errorf("Hooks.PostEdit.Command = %q, want empty", cfg.Hooks.PostEdit.Command)
+	}
 	if cfg.Hooks.TimeoutMs != 60000 {
 		t.Errorf("Hooks.TimeoutMs = %d, want 60000", cfg.Hooks.TimeoutMs)
 	}
@@ -1689,6 +1695,14 @@ hooks:
     echo "Agent finished for $ISSUE_ID"
   before_remove: |
     echo "Cleaning up"
+  pre_tool:
+    command: ./scripts/pre-tool-check.sh
+    matcher: Bash|Write
+    block_on_failure: true
+  post_edit:
+    command: gofmt -w .
+    matcher: Edit|MultiEdit|Write
+    block_on_failure: false
   timeout_ms: 30000
 `
 	cfg, err := parse([]byte(yaml))
@@ -1706,6 +1720,24 @@ hooks:
 	}
 	if cfg.Hooks.BeforeRemove == "" {
 		t.Error("Hooks.BeforeRemove should not be empty")
+	}
+	if cfg.Hooks.PreTool.Command != "./scripts/pre-tool-check.sh" {
+		t.Errorf("Hooks.PreTool.Command = %q, want pre-tool script", cfg.Hooks.PreTool.Command)
+	}
+	if cfg.Hooks.PreTool.Matcher != "Bash|Write" {
+		t.Errorf("Hooks.PreTool.Matcher = %q, want Bash|Write", cfg.Hooks.PreTool.Matcher)
+	}
+	if !cfg.Hooks.PreTool.BlockOnFailure {
+		t.Error("Hooks.PreTool.BlockOnFailure should be true")
+	}
+	if cfg.Hooks.PostEdit.Command != "gofmt -w ." {
+		t.Errorf("Hooks.PostEdit.Command = %q, want gofmt", cfg.Hooks.PostEdit.Command)
+	}
+	if cfg.Hooks.PostEdit.Matcher != "Edit|MultiEdit|Write" {
+		t.Errorf("Hooks.PostEdit.Matcher = %q, want edit matcher", cfg.Hooks.PostEdit.Matcher)
+	}
+	if cfg.Hooks.PostEdit.BlockOnFailure {
+		t.Error("Hooks.PostEdit.BlockOnFailure should be false")
 	}
 	if cfg.Hooks.TimeoutMs != 30000 {
 		t.Errorf("Hooks.TimeoutMs = %d, want 30000", cfg.Hooks.TimeoutMs)

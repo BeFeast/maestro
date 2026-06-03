@@ -580,13 +580,23 @@ type MissionsConfig struct {
 	Labels      []string `yaml:"labels"`       // labels that identify mission issues (default: ["mission", "epic"])
 }
 
+// ToolHookConfig describes an agent tool hook that runs inside the worker
+// session. Command is executed from the worker worktree.
+type ToolHookConfig struct {
+	Command        string `yaml:"command" json:"command"`                   // shell command to run for the hook
+	Matcher        string `yaml:"matcher" json:"matcher"`                   // backend-specific tool matcher; defaults by event
+	BlockOnFailure bool   `yaml:"block_on_failure" json:"block_on_failure"` // when true, non-zero command results block the tool/event
+}
+
 // HooksConfig holds lifecycle hook scripts that run at key points.
 type HooksConfig struct {
-	AfterCreate  string `yaml:"after_create"`  // runs once when a new issue workspace is first created
-	BeforeRun    string `yaml:"before_run"`    // runs before each agent attempt (fatal on failure)
-	AfterRun     string `yaml:"after_run"`     // runs after each agent attempt (logged, not fatal)
-	BeforeRemove string `yaml:"before_remove"` // runs before workspace cleanup (logged, not fatal)
-	TimeoutMs    int    `yaml:"timeout_ms"`    // timeout for hook execution in milliseconds (default: 60000)
+	AfterCreate  string         `yaml:"after_create"`  // runs once when a new issue workspace is first created
+	BeforeRun    string         `yaml:"before_run"`    // runs before each agent attempt (fatal on failure)
+	AfterRun     string         `yaml:"after_run"`     // runs after each agent attempt (logged, not fatal)
+	BeforeRemove string         `yaml:"before_remove"` // runs before workspace cleanup (logged, not fatal)
+	PreTool      ToolHookConfig `yaml:"pre_tool"`      // runs inside the worker session before matching tool calls
+	PostEdit     ToolHookConfig `yaml:"post_edit"`     // runs inside the worker session after file edit tools
+	TimeoutMs    int            `yaml:"timeout_ms"`    // timeout for hook execution in milliseconds (default: 60000)
 }
 
 // StaleSessionReconcilerConfig configures filtering of stale supervisor
