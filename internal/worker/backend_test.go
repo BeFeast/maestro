@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/befeast/maestro/internal/config"
 )
 
 func TestBuildWorkerCmd_Claude(t *testing.T) {
@@ -167,6 +169,118 @@ func TestBuildWorkerCmd_CodexPromptFileIsValidUTF8(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "\uFFFD") {
 		t.Fatalf("expected invalid byte to be replaced with U+FFFD, got %q", string(data))
+	}
+}
+
+func TestBuildWorkerCmd_ClaudeWithMCPConfig(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("use docs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{
+		Cmd: "claude",
+		MCP: config.MCPConfig{
+			Strict:  true,
+			Configs: []string{"/tmp/project-mcp.json"},
+			Servers: map[string]config.MCPServerDef{
+				"docs": {
+					Command: "npx",
+					Args:    []string{"-y", "@example/docs-mcp"},
+					Env:     map[string]string{"DOCS_ENV": "test"},
+				},
+			},
+		},
+	}
+	cmd, stdinFile, err := BuildWorkerCmd("claude", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	for _, want := range []string{
+		"--mcp-config",
+		"/tmp/project-mcp.json",
+		"--strict-mcp-config",
+		`"mcpServers"`,
+		`"docs"`,
+		`"command":"npx"`,
+		`"args":["-y","@example/docs-mcp"]`,
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("expected %q in args, got: %s", want, args)
+		}
+	}
+}
+
+func TestBuildWorkerCmd_CodexWithMCPServers(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("use docs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{
+		Cmd: "codex",
+		MCP: config.MCPConfig{
+			Servers: map[string]config.MCPServerDef{
+				"docs": {
+					Command:          "npx",
+					Args:             []string{"-y", "@example/docs-mcp"},
+					AllowedTools:     []string{"search_docs"},
+					StartupTimeoutMs: 15000,
+				},
+				"symbols": {
+					URL:               "https://mcp.example.invalid/mcp",
+					BearerTokenEnvVar: "SYMBOLS_MCP_TOKEN",
+				},
+			},
+		},
+	}
+	cmd, stdinFile, err := BuildWorkerCmd("codex", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	for _, want := range []string{
+		`mcp_servers."docs".command="npx"`,
+		`mcp_servers."docs".args=["-y","@example/docs-mcp"]`,
+		`mcp_servers."docs".allowed_tools=["search_docs"]`,
+		`mcp_servers."docs".startup_timeout_ms=15000`,
+		`mcp_servers."symbols".url="https://mcp.example.invalid/mcp"`,
+		`mcp_servers."symbols".bearer_token_env_var="SYMBOLS_MCP_TOKEN"`,
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("expected %q in args, got: %s", want, args)
+		}
+	}
+	if cmd.Args[len(cmd.Args)-1] != "-" {
+		t.Errorf("codex stdin prompt marker should remain last, got args: %v", cmd.Args)
+	}
+}
+
+func TestBuildWorkerCmd_NoMCPByDefault(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("plain worker"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, backendName := range []string{"claude", "codex"} {
+		cmd, _, err := BuildWorkerCmd(backendName, BackendConfig{Cmd: backendName}, promptFile, "/tmp/wt")
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", backendName, err)
+		}
+		args := strings.Join(cmd.Args, " ")
+		if strings.Contains(args, "mcp") || strings.Contains(args, "MCP") {
+			t.Errorf("%s: expected no MCP args by default, got: %s", backendName, args)
+		}
 	}
 }
 

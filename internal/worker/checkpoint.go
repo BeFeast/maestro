@@ -124,6 +124,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+		MCP:        backendDef.MCP,
 	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, backendName, cfg.Hooks)

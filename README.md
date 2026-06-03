@@ -260,6 +260,34 @@ model:
 > Headless mode: `cline -y "task"` — auto-approves all actions and exits when done.
 > SAP AI Core example: set provider to `sapaicore`, model to `anthropic--claude-4.5-opus`.
 
+### Optional worker MCP tools
+
+Worker sessions receive no MCP tools by default. Attach project-specific MCP servers per backend with `model.backends.<name>.mcp`:
+
+```yaml
+model:
+  default: codex
+  backends:
+    codex:
+      cmd: codex
+      mcp:
+        servers:
+          docs:
+            command: npx
+            args: ["-y", "@example/docs-mcp"]
+          symbols:
+            url: https://mcp.example.com/mcp
+            bearer_token_env_var: SYMBOLS_MCP_TOKEN
+    claude:
+      cmd: claude
+      mcp:
+        strict: true
+        configs:
+          - /path/to/project-mcp.json
+```
+
+For Codex workers, Maestro passes configured servers as `-c mcp_servers...` overrides. For Claude workers, Maestro passes `--mcp-config` and `--strict-mcp-config` when requested. Keep tokens in environment variables and reference their names from config.
+
 ### Per-issue routing
 Label a GitHub issue with `model:codex`, `model:gemini`, or `model:cline` to override the default backend for that specific issue:
 ```
@@ -382,7 +410,7 @@ The exact command depends on the selected backend. Examples:
 
 ```bash
 # Claude
-cd /worktree/path && claude --dangerously-skip-permissions -p "<assembled prompt>"
+cd /worktree/path && claude --dangerously-skip-permissions -p < /path/to/prompt.txt
 
 # Codex
 cd /worktree/path && codex exec --dangerously-bypass-approvals-and-sandbox -C /worktree/path - < /path/to/prompt.txt
