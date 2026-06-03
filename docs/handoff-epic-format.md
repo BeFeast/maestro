@@ -157,6 +157,61 @@ maestro outcome check --project <name>
   `Issue Wave` list
 ```
 
+## Epic completion aggregate
+
+When an epic references its concrete child issues, the supervisor aggregates
+their merged / closed verdicts each cycle and surfaces the result on
+`fleet.epics[]` and the latest `SupervisorDecision.epics`. The aggregate
+is the basis for the approval-gated `close_epic` recommendation
+(`policy_rule: supervisor.epic_completion`): when **every** child is
+merged AND the configured outcome health gate is `healthy`, the
+supervisor mints a `close_issue` decision against the epic with
+`risk=approval_gated`. The cautious gate then queues an approval — no
+auto-close ever happens without operator confirmation.
+
+### Children reference shapes the supervisor understands
+
+```markdown
+Children: #147, #148, #149
+```
+
+```markdown
+## Children
+
+- #147 — slice A
+- [ ] #148 — slice B
+- [x] #149 — slice C
+```
+
+```markdown
+## Issue Wave
+
+- [ ] #147 — route shell
+- [ ] #148 — replace /inbox
+```
+
+Recognised section headings (case-insensitive): `Children`, `Child issues`,
+`Subtasks`, `Issue Wave`, `Slices`, `Wave`, `Epic checklist`. Both
+checked and unchecked task-list items are parsed; the closed-or-merged
+verdict comes from GitHub, not from the checkbox.
+
+### Aggregate semantics
+
+For each open epic with parseable children, the supervisor computes:
+
+- `total_children`, `merged_count`, `open_count`
+- `all_children_done = open_count == 0 && total_children > 0`
+- `outcome_healthy = outcome.health_state == "healthy"`
+- `complete = all_children_done && outcome_healthy`
+
+Only `complete=true` epics trigger the `close_epic` recommendation. An
+epic whose children are all merged but whose outcome health is
+`failing`/`unknown`/`unmonitored` stays in-progress: the
+`SupervisorDecision.summary` flags the unhealthy signal and the operator
+can choose to verify the runtime before approving the close. This matches
+the existing `pass_required_for_done` semantics — runtime health is the
+ground truth, not the checklist state.
+
 ## Completion gates
 
 Healthcheck passing is evidence, not the whole "Done" gate. When the

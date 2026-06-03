@@ -1318,6 +1318,136 @@ func headingLevelAndText(line string) (int, string, bool) {
 	return level, text, true
 }
 
+// childInlinePattern matches `Children: #147, #148` (case-insensitive). Used
+// by FindChildIssues alongside a scan of structured child sections.
+var childInlinePattern = regexp.MustCompile(`(?im)^\s*child(?:ren)?(?:\s+issues?)?\s*[:\-]\s*([^\r\n]+)$`)
+
+// childSectionHeadings is the set of markdown headings that FindChildIssues
+// treats as a structured list of child issue references. The supervisor
+// epic-completion aggregate (sup-162) reads any `#N` token inside one of
+// these sections — including checked / unchecked task-list items — as a
+// child of the epic.
+var childSectionHeadings = []string{
+	"children",
+	"child issues",
+	"child issue",
+	"subtasks",
+	"sub-tasks",
+	"sub tasks",
+	"issue wave",
+	"wave",
+	"slices",
+	"epic checklist",
+}
+
+// FindChildIssues scans an issue body for child issue references used by
+// the epic-completion aggregate. It recognises two shapes:
+//
+//   - inline: `Children: #147, #148` (also `Child issues:` / `Child:`)
+//   - structured section: a markdown heading whose text matches one of
+//     childSectionHeadings (case-insensitive) followed by any lines that
+//     contain `#NNN` issue references. Task list items (`- [ ] #147`) and
+//     plain bullets are both recognised.
+//
+// Returns deduplicated issue numbers in the order they first appear. The
+// epic issue's own number is filtered out so a `Refs #<self>` line in
+// the body never inflates progress. Returns nil for the zero body.
+func FindChildIssues(body string) []int {
+	return findChildIssues(body, 0)
+}
+
+// FindChildIssuesExcluding behaves like FindChildIssues but skips the given
+// issue number even when it appears in the body. Callers use this to filter
+// out the epic's own number when it is known.
+func FindChildIssuesExcluding(body string, selfNumber int) []int {
+	return findChildIssues(body, selfNumber)
+}
+
+func findChildIssues(body string, selfNumber int) []int {
+	if strings.TrimSpace(body) == "" {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	var children []int
+	add := func(n int) {
+		if n <= 0 || (selfNumber > 0 && n == selfNumber) {
+			return
+		}
+		if _, ok := seen[n]; ok {
+			return
+		}
+		seen[n] = struct{}{}
+		children = append(children, n)
+	}
+
+	for _, match := range childInlinePattern.FindAllStringSubmatch(body, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		for _, ref := range dependencyIssueNumber.FindAllStringSubmatch(match[1], -1) {
+			if len(ref) < 2 {
+				continue
+			}
+			n, err := strconv.Atoi(ref[1])
+			if err != nil {
+				continue
+			}
+			add(n)
+		}
+	}
+
+	for _, section := range extractChildSections(body) {
+		for _, ref := range dependencyIssueNumber.FindAllStringSubmatch(section, -1) {
+			if len(ref) < 2 {
+				continue
+			}
+			n, err := strconv.Atoi(ref[1])
+			if err != nil {
+				continue
+			}
+			add(n)
+		}
+	}
+
+	return children
+}
+
+// extractChildSections returns the markdown body of every section in the
+// given body whose heading text matches childSectionHeadings. A section
+// spans from its heading line until the next heading of equal-or-shallower
+// depth, or end of file.
+func extractChildSections(body string) []string {
+	lines := strings.Split(body, "\n")
+	var sections []string
+	for i := 0; i < len(lines); i++ {
+		level, heading, ok := headingLevelAndText(lines[i])
+		if !ok || !isChildSectionHeading(heading) {
+			continue
+		}
+		end := len(lines)
+		for j := i + 1; j < len(lines); j++ {
+			otherLevel, _, otherOK := headingLevelAndText(lines[j])
+			if otherOK && otherLevel <= level {
+				end = j
+				break
+			}
+		}
+		sections = append(sections, strings.Join(lines[i+1:end], "\n"))
+		i = end - 1
+	}
+	return sections
+}
+
+func isChildSectionHeading(heading string) bool {
+	heading = strings.ToLower(strings.TrimSpace(heading))
+	for _, name := range childSectionHeadings {
+		if heading == name {
+			return true
+		}
+	}
+	return false
+}
+
 // FindBlockers scans an issue body for blocker references matching the given
 // regex patterns. Each pattern must contain a capture group for the issue number.
 // Returns deduplicated issue numbers referenced as blockers.

@@ -771,9 +771,15 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		}
 	}
 	stuckStates := e.detectStuckStates(st, now, prs, issues, candidates, result.skipped, true, cache)
+	// Epic-completion aggregate (#650): compute once per cycle so every
+	// decision returned by this path carries the latest children-merged /
+	// outcome-healthy snapshot. The fleet snapshot reads this off the
+	// latest decision to render "epic in progress" / "epic complete".
+	epicProgresses := e.epicProgressForIssues(issues, cache, outcomeStatus)
 	withAnalysis := func(decision state.SupervisorDecision) state.SupervisorDecision {
 		decision.QueueAnalysis = analysis
 		decision.StuckStates = stuckStates
+		decision.Epics = epicProgresses
 		return decision
 	}
 
@@ -794,6 +800,27 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		)
 		for _, reason := range firstN(result.skipped, 3) {
 			reasons = append(reasons, reason)
+		}
+
+		// Epic-completion aggregate (#650): if any open epic has all
+		// children merged AND the configured outcome health gate is
+		// healthy, mint an approval-gated close_issue recommendation
+		// instead of silently idling on `none`. The cautious gate
+		// guarantees no unsupervised epic close — every close still
+		// requires explicit operator approval.
+		if completed := firstCompletedEpic(epicProgresses); completed != nil {
+			epicReasons := appendReasons(reasons,
+				completed.Summary,
+				fmt.Sprintf("Outcome health is %s; all %d child issue(s) are merged or closed", healthLabel(completed.OutcomeHealth), completed.TotalChildren),
+				"Epic close is approval-gated; the operator must confirm before Maestro closes the epic.",
+			)
+			for _, ev := range completed.Evidence {
+				epicReasons = append(epicReasons, ev)
+			}
+			decision := e.decision(st, now, projectState, config.SupervisorActionCloseIssue,
+				fmt.Sprintf("Epic #%d is complete (%d/%d children merged, outcome healthy); request approval to close it.", completed.Number, completed.MergedCount, completed.TotalChildren),
+				RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: completed.Number}, PolicyRuleEpicCompletion, epicReasons)
+			return withAnalysis(decision), nil
 		}
 
 		// Handoff planner v1: when an open handoff/epic remains but no
