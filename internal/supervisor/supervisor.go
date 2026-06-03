@@ -546,15 +546,20 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	if slot, sess, issue, ok, err := e.retryExhaustedRepairCandidate(st, issues, cache); err != nil {
 		return state.SupervisorDecision{}, err
 	} else if ok {
+		// #556: spawn_repair_worker is NOT in the executor's action registry
+		// (see approver/registry.go). The at-mint guard in RunOnce refuses the
+		// verb every cycle, logging "refusing to mint approval" — the dogfood
+		// loop the issue calls out. The supervisor must not recommend a verb
+		// the executor cannot handle. Fall through to review_retry_exhausted
+		// so the operator can triage the issue manually instead of re-recommending
+		// a refused spawn each poll.
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Session %s for issue #%d is retry_exhausted with no usable PR", slot, sess.IssueNumber),
-			"Ready-labeled issue is still open and has no dependency/blocking label reason",
-			"Retry exhaustion may have moved the project item to Blocked, but supervisor can start one intentional repair worker instead of dead-ending the queue",
-			"Starting a repair worker would mutate local worktrees, so supervisor records an explicit repair recommendation",
+			"Retry-exhausted work requires a human decision before more automation",
 		)
-		decision := e.decision(st, now, projectState, ActionSpawnRepairWorker,
-			fmt.Sprintf("Start a repair worker for retry-exhausted issue #%d: %s", issue.Number, issue.Title),
-			RiskMutating, 0.88, &state.SupervisorTarget{Issue: issue.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
+		decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
+			fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", issue.Number),
+			RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: issue.Number, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
 		return decision, nil
 	}
@@ -1130,6 +1135,16 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 
 func (e *Engine) staleReviewFeedbackNeedsAttention(sess *state.Session) bool {
 	if sess == nil || sess.Status == state.StatusRunning || sess.Status == state.StatusDone {
+		return false
+	}
+	// #556: a retry-exhausted session with an open PR is handled by the
+	// deterministic path (bucket 1 – sessionWithOpenPR). Emitting a
+	// stale_review_feedback stuck state here creates a conflicting board
+	// signal: the stuck state says "blocked" while the decision may
+	// recommend merge_pr or monitor_open_pr for the same PR. The
+	// deterministic path already resolves the PR's fate; adding a
+	// redundant stuck state flip-flops the project board status.
+	if sess.Status == state.StatusRetryExhausted && sess.PRNumber > 0 {
 		return false
 	}
 	if sess.PRNumber > 0 {

@@ -626,6 +626,11 @@ func TestDecide_RetryExhaustedUnaddressedFeedback_DoesNotRecommendSpawnRepairWor
 	if decision.RecommendedAction == ActionSpawnRepairWorker {
 		t.Fatalf("action = %q, must NOT recommend spawn_repair_worker for retry_exhausted (verb is refused at mint, leads to dogfood loop)", decision.RecommendedAction)
 	}
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == "stale_review_feedback" {
+			t.Fatalf("stuck states include stale_review_feedback for retry_exhausted open PR: %+v", decision.StuckStates)
+		}
+	}
 }
 
 // #512: CI is still pending → planner stays on monitor_open_pr with a
@@ -926,7 +931,14 @@ func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T
 	}
 }
 
-func TestDecide_RetryExhaustedReadyIssueSpawnsRepairWorkerEvenWhenProjectBlocked(t *testing.T) {
+// TestDecide_RetryExhaustedReadyIssueRecommendsManualReview verifies that
+// when dynamic-wave is active and a retry-exhausted session has no open PR,
+// the supervisor recommends ActionReviewRetryExhausted instead of
+// ActionSpawnRepairWorker (#556). spawn_repair_worker is NOT in the
+// executor's action registry and gets refused every cycle by the at-mint
+// guard; review_retry_exhausted replaces it so the operator sees a stable
+// signal instead of re-recommended refused spawn each poll.
+func TestDecide_RetryExhaustedReadyIssueRecommendsManualReview(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
 	enableDynamicWave(cfg)
@@ -946,18 +958,18 @@ func TestDecide_RetryExhaustedReadyIssueSpawnsRepairWorkerEvenWhenProjectBlocked
 		t.Fatalf("Decide: %v", err)
 	}
 
-	if decision.RecommendedAction != ActionSpawnRepairWorker {
-		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnRepairWorker)
+	if decision.RecommendedAction != ActionReviewRetryExhausted {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionReviewRetryExhausted)
 	}
-	if decision.RequiresApproval {
-		t.Fatalf("RequiresApproval = true, want false for policy-allowed repair spawn")
+	if !decision.RequiresApproval {
+		t.Fatalf("RequiresApproval = false, want true for review_retry_exhausted (RiskApprovalGated)")
 	}
 	if decision.Target == nil || decision.Target.Issue != 808 || decision.Target.Session != "pan-72" {
 		t.Fatalf("target = %#v, want issue 808 pan-72", decision.Target)
 	}
 	rationale := strings.Join(decision.Reasons, "\n")
-	if !strings.Contains(rationale, "retry_exhausted") || !strings.Contains(rationale, "Blocked") {
-		t.Fatalf("reasons = %q, want retry_exhausted and Blocked rationale", rationale)
+	if !strings.Contains(rationale, "retry_exhausted") {
+		t.Fatalf("reasons = %q, want retry_exhausted rationale", rationale)
 	}
 }
 
