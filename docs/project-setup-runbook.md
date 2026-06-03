@@ -140,6 +140,10 @@ exclude_labels:
   - blocked
   - duplicate
   - invalid
+blocker_patterns:
+  - "blocked by.*?#(\\d+)"
+  - "blocked until.*?#(\\d+).*merged"
+  - "depends on.*?#(\\d+)"
 
 # Supervisor policy (optional)
 supervisor:
@@ -164,6 +168,13 @@ supervisor:
       - Ready
       - Backlog
       - New
+    dependency_unblock:
+      # Defaults on when dynamic_wave owns ready/blocked labels; set false
+      # only when blocker chains are intentionally operator-managed.
+      enabled: true
+      max_runnable: 1
+      enroll_in_project: true
+      announce_with_comment: true
   safe_actions:
     - add_ready_label
     - remove_ready_label

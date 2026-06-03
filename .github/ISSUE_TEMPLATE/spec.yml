@@ -59,6 +59,14 @@ body:
       required: true
 
   - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies / blockers
+      description: Optional. For chained work, use a parseable form such as `Blocked by #123` or `Blocked until #123 merged`.
+      placeholder: |
+        Blocked by #123
+
+  - type: textarea
     id: test_plan
     attributes:
       label: Test plan

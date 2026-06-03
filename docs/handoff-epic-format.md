@@ -266,7 +266,7 @@ supervisor:
     owns_ready_label: false
     runnable_project_statuses: [Todo, To Do, Ready, Backlog, New]
     dependency_unblock:
-      enabled: true             # opt-in; default false
+      enabled: true             # default true when owns_ready_label=true with ready/blocked labels
       max_runnable: 5           # cap concurrent runnable wave members
       enroll_in_project: true   # default true when projects are configured
       announce_with_comment: true  # default true; comment lists dep evidence
@@ -317,5 +317,7 @@ to the supervisor:
 
 If your repo previously ran an external cron for this purpose, you can
 retire it once `supervisor.dynamic_wave.dependency_unblock.enabled` is
-true and `safe_actions` grants `remove_blocked_label`, `add_ready_label`,
-and `add_issue_comment`.
+true (or defaulted on through `owns_ready_label: true`) and
+`safe_actions` grants `remove_blocked_label`, `add_ready_label`, and
+`add_issue_comment`. Set `dependency_unblock.enabled: false` only when
+blocker chains are intentionally operator-managed.
