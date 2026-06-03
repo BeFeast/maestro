@@ -815,6 +815,7 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 		Cfg:       cfg,
 		Sessions:  approver.SessionLookupFunc(st.SessionAt),
 		Workers:   newWorkerController(cfg),
+		State:     st,
 	}
 	res := ex.Execute(approval)
 

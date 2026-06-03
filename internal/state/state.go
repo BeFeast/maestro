@@ -525,7 +525,40 @@ const (
 	// PR is held for operator review with the unresolved comments
 	// surfaced as evidence. NEVER a silent dead-end (#565).
 	StuckReviewRepairExhausted = "review_repair_exhausted"
+	StuckSearchGuardrailTrip   = "search_guardrail_trip"
 )
+
+const (
+	LessonProposalStatusPending  = "pending"
+	LessonProposalStatusApplied  = "applied"
+	LessonProposalStatusDeclined = "declined"
+
+	LessonProposalTargetWorkerPrompt = "worker_prompt"
+	LessonProposalTargetAgentsMD     = "agents_md"
+)
+
+// LessonProposal is a durable, approval-gated candidate rule derived from a
+// recurring terminal failure. Maestro records it for operator review, but never
+// applies it until the linked approval is explicitly approved.
+type LessonProposal struct {
+	ID              string            `json:"id"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at,omitempty"`
+	FailureClass    string            `json:"failure_class"`
+	Area            string            `json:"area"`
+	MinimalRepro    string            `json:"minimal_repro"`
+	SuggestedRule   string            `json:"suggested_rule"`
+	Target          string            `json:"target"`
+	Fingerprint     string            `json:"fingerprint"`
+	Status          string            `json:"status"`
+	ApprovalID      string            `json:"approval_id,omitempty"`
+	SourceDecision  string            `json:"source_decision,omitempty"`
+	SourceTarget    *SupervisorTarget `json:"source_target,omitempty"`
+	AppliedAt       *time.Time        `json:"applied_at,omitempty"`
+	DeclinedAt      *time.Time        `json:"declined_at,omitempty"`
+	ResolutionActor string            `json:"resolution_actor,omitempty"`
+	ResolutionNote  string            `json:"resolution_note,omitempty"`
+}
 
 // SupervisorIssueCandidate describes the issue selected by queue policy without
 // exposing issue body content in persisted supervisor state.
@@ -766,6 +799,10 @@ type Approval struct {
 	// Both omitempty for back-compat with approvals created before #489.
 	Repo    string `json:"repo,omitempty"`
 	Project string `json:"project,omitempty"`
+
+	// LessonProposalID links apply_lesson_proposal approvals to the durable
+	// proposed rule they gate. Rejection/apply transitions update that record.
+	LessonProposalID string `json:"lesson_proposal_id,omitempty"`
 }
 
 type ApprovalAudit struct {
@@ -782,6 +819,7 @@ type State struct {
 	Missions            map[int]*Mission           `json:"missions,omitempty"` // parent issue number → mission
 	SupervisorDecisions []SupervisorDecision       `json:"supervisor_decisions,omitempty"`
 	Approvals           []Approval                 `json:"approvals,omitempty"`
+	LessonProposals     []LessonProposal           `json:"lesson_proposals,omitempty"`
 	OutcomeHealth       *outcome.HealthCheckResult `json:"outcome_health,omitempty"`
 	BackendHealth       map[string]BackendHealth   `json:"backend_health,omitempty"`
 	ProjectStatusSync   map[int]ProjectStatusSync  `json:"project_status_sync,omitempty"`
@@ -1125,6 +1163,7 @@ func (s *State) copyFrom(src *State) {
 	s.Missions = src.Missions
 	s.SupervisorDecisions = src.SupervisorDecisions
 	s.Approvals = src.Approvals
+	s.LessonProposals = src.LessonProposals
 	s.OutcomeHealth = src.OutcomeHealth
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
@@ -1166,6 +1205,9 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 		return nil, err
 	}
 	if err := mergeSupervisorDecisions(merged, base, current, ours); err != nil {
+		return nil, err
+	}
+	if err := mergeLessonProposals(merged, base, current, ours); err != nil {
 		return nil, err
 	}
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
@@ -1339,6 +1381,26 @@ func mergeSupervisorDecisions(merged, base, current, ours *State) error {
 	}
 	if len(merged.SupervisorDecisions) > DefaultSupervisorDecisionLimit {
 		merged.SupervisorDecisions = append([]SupervisorDecision(nil), merged.SupervisorDecisions[len(merged.SupervisorDecisions)-DefaultSupervisorDecisionLimit:]...)
+	}
+	return nil
+}
+
+func mergeLessonProposals(merged, base, current, ours *State) error {
+	merged.LessonProposals = cloneState(current).LessonProposals
+	keys := unionStringSets(lessonProposalKeys(base.LessonProposals), lessonProposalKeys(current.LessonProposals), lessonProposalKeys(ours.LessonProposals))
+	for _, key := range keys {
+		baseValue, baseOK := lessonProposalByKey(base.LessonProposals, key)
+		currentValue, currentOK := lessonProposalByKey(current.LessonProposals, key)
+		oursValue, oursOK := lessonProposalByKey(ours.LessonProposals, key)
+		resolved, keep, err := resolveListValue("lesson proposal "+key, baseValue, baseOK, currentValue, currentOK, oursValue, oursOK)
+		if err != nil {
+			return err
+		}
+		if keep {
+			merged.LessonProposals = upsertLessonProposal(merged.LessonProposals, resolved.(LessonProposal))
+		} else {
+			merged.LessonProposals = deleteLessonProposal(merged.LessonProposals, key)
+		}
 	}
 	return nil
 }
@@ -1558,6 +1620,54 @@ func deleteDecision(decisions []SupervisorDecision, key string) []SupervisorDeci
 	return filtered
 }
 
+func lessonProposalKeys(proposals []LessonProposal) map[string]bool {
+	keys := make(map[string]bool)
+	for _, proposal := range proposals {
+		keys[lessonProposalKey(proposal)] = true
+	}
+	return keys
+}
+
+func lessonProposalByKey(proposals []LessonProposal, key string) (LessonProposal, bool) {
+	for _, proposal := range proposals {
+		if lessonProposalKey(proposal) == key {
+			return proposal, true
+		}
+	}
+	return LessonProposal{}, false
+}
+
+func lessonProposalKey(proposal LessonProposal) string {
+	if proposal.ID != "" {
+		return proposal.ID
+	}
+	if proposal.Fingerprint != "" {
+		return "fingerprint:" + proposal.Fingerprint
+	}
+	return stableHash(proposal)
+}
+
+func upsertLessonProposal(proposals []LessonProposal, proposal LessonProposal) []LessonProposal {
+	key := lessonProposalKey(proposal)
+	for i := range proposals {
+		if lessonProposalKey(proposals[i]) == key {
+			proposals[i] = proposal
+			return proposals
+		}
+	}
+	return append(proposals, proposal)
+}
+
+func deleteLessonProposal(proposals []LessonProposal, key string) []LessonProposal {
+	filtered := proposals[:0]
+	for _, proposal := range proposals {
+		if lessonProposalKey(proposal) != key {
+			filtered = append(filtered, proposal)
+		}
+	}
+	return filtered
+}
+
 // NextSlotName returns "{prefix}-N" for the next available slot
 func (s *State) NextSlotName(prefix string) string {
 	name := fmt.Sprintf("%s-%d", prefix, s.NextSlot)
@@ -1696,6 +1806,152 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	return &s.Approvals[len(s.Approvals)-1]
 }
 
+// RecordLessonProposal records a recurring-failure lesson candidate and mints a
+// linked pending approval. If the same failure class and area already has a
+// non-declined proposal, it returns that proposal without creating noise.
+func (s *State) RecordLessonProposal(proposal LessonProposal, now time.Time, repo, project string) (*LessonProposal, *Approval, bool) {
+	if s == nil {
+		return nil, nil, false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	proposal.CreatedAt = normalizedTime(firstNonZeroTime(proposal.CreatedAt, now))
+	proposal.UpdatedAt = normalizedTime(now)
+	proposal.FailureClass = strings.TrimSpace(proposal.FailureClass)
+	proposal.Area = strings.TrimSpace(proposal.Area)
+	proposal.MinimalRepro = strings.TrimSpace(proposal.MinimalRepro)
+	proposal.SuggestedRule = strings.TrimSpace(proposal.SuggestedRule)
+	proposal.Target = strings.TrimSpace(proposal.Target)
+	if proposal.Target == "" {
+		proposal.Target = LessonProposalTargetAgentsMD
+	}
+	if proposal.Status == "" {
+		proposal.Status = LessonProposalStatusPending
+	}
+	if proposal.Fingerprint == "" {
+		proposal.Fingerprint = LessonProposalFingerprint(proposal.FailureClass, proposal.Area)
+	}
+	if proposal.ID == "" {
+		proposal.ID = lessonProposalID(proposal.Fingerprint)
+	}
+	if proposal.FailureClass == "" || proposal.Area == "" || proposal.SuggestedRule == "" {
+		return nil, nil, false
+	}
+	for i := range s.LessonProposals {
+		existing := &s.LessonProposals[i]
+		if existing.Fingerprint != proposal.Fingerprint {
+			continue
+		}
+		if existing.Status == LessonProposalStatusDeclined {
+			continue
+		}
+		return existing, s.findApprovalByLessonProposalID(existing.ID), false
+	}
+
+	s.LessonProposals = append(s.LessonProposals, proposal)
+	stored := &s.LessonProposals[len(s.LessonProposals)-1]
+	approval := Approval{
+		ID:               "approval-" + stored.ID,
+		CreatedAt:        stored.CreatedAt,
+		UpdatedAt:        stored.UpdatedAt,
+		Action:           "apply_lesson_proposal",
+		Summary:          fmt.Sprintf("Apply lesson proposal for %s in %s.", stored.FailureClass, stored.Area),
+		Risk:             "approval_gated",
+		Evidence:         []string{stored.MinimalRepro, stored.SuggestedRule},
+		Status:           ApprovalStatusPending,
+		Repo:             repo,
+		Project:          project,
+		LessonProposalID: stored.ID,
+	}
+	approval.PayloadHash = approval.ComputePayloadHash()
+	approval.Audit = append(approval.Audit, ApprovalAudit{
+		At:          stored.UpdatedAt,
+		Event:       ApprovalAuditCreated,
+		PayloadHash: approval.PayloadHash,
+	})
+	s.Approvals = append(s.Approvals, approval)
+	stored.ApprovalID = approval.ID
+	return stored, &s.Approvals[len(s.Approvals)-1], true
+}
+
+func firstNonZeroTime(values ...time.Time) time.Time {
+	for _, value := range values {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
+func LessonProposalFingerprint(failureClass, area string) string {
+	return stableHash(struct {
+		FailureClass string `json:"failure_class"`
+		Area         string `json:"area"`
+	}{
+		FailureClass: strings.ToLower(strings.TrimSpace(failureClass)),
+		Area:         strings.ToLower(strings.TrimSpace(area)),
+	})
+}
+
+func lessonProposalID(fingerprint string) string {
+	fp := strings.TrimSpace(fingerprint)
+	if len(fp) > 12 {
+		fp = fp[:12]
+	}
+	if fp == "" {
+		fp = time.Now().UTC().Format("20060102T150405")
+	}
+	return "lesson-" + fp
+}
+
+func (s *State) findApprovalByLessonProposalID(id string) *Approval {
+	for i := range s.Approvals {
+		if s.Approvals[i].LessonProposalID == id {
+			return &s.Approvals[i]
+		}
+	}
+	return nil
+}
+
+func (s *State) FindLessonProposal(id string) (*LessonProposal, bool) {
+	for i := range s.LessonProposals {
+		proposal := &s.LessonProposals[i]
+		if proposal.ID == id || proposal.Fingerprint == id {
+			return proposal, true
+		}
+	}
+	return nil, false
+}
+
+func (s *State) MarkLessonProposalApplied(id string, now time.Time, actor, note string) bool {
+	proposal, ok := s.FindLessonProposal(id)
+	if !ok {
+		return false
+	}
+	at := normalizedTime(now)
+	proposal.Status = LessonProposalStatusApplied
+	proposal.UpdatedAt = at
+	proposal.AppliedAt = &at
+	proposal.ResolutionActor = actor
+	proposal.ResolutionNote = note
+	return true
+}
+
+func (s *State) MarkLessonProposalDeclined(id string, now time.Time, actor, note string) bool {
+	proposal, ok := s.FindLessonProposal(id)
+	if !ok {
+		return false
+	}
+	at := normalizedTime(now)
+	proposal.Status = LessonProposalStatusDeclined
+	proposal.UpdatedAt = at
+	proposal.DeclinedAt = &at
+	proposal.ResolutionActor = actor
+	proposal.ResolutionNote = note
+	return true
+}
+
 // approvalTargetsEqual returns true if two SupervisorTarget pointers refer
 // to the same target identity (issue/pr/head_sha/session). Used by the
 // at-mint dedup check in RecordPendingApprovalForDecision. HeadSHA is
@@ -1785,6 +2041,9 @@ func (s *State) RejectApproval(id string, now time.Time, actor, reason string) (
 		PayloadHash:     approval.PayloadHash,
 		TargetStateHash: approval.TargetStateHash,
 	})
+	if approval.LessonProposalID != "" {
+		s.MarkLessonProposalDeclined(approval.LessonProposalID, approval.UpdatedAt, actor, reason)
+	}
 	return approval, nil
 }
 
@@ -1989,12 +2248,13 @@ func spawnWorkerApprovalMatchesSession(approval *Approval, slot string, sess *Se
 
 func (a Approval) ComputePayloadHash() string {
 	return stableHash(approvalPayload{
-		DecisionID: a.DecisionID,
-		Action:     a.Action,
-		Target:     a.Target,
-		Summary:    a.Summary,
-		Risk:       a.Risk,
-		Evidence:   a.Evidence,
+		DecisionID:       a.DecisionID,
+		Action:           a.Action,
+		Target:           a.Target,
+		Summary:          a.Summary,
+		Risk:             a.Risk,
+		Evidence:         a.Evidence,
+		LessonProposalID: a.LessonProposalID,
 	})
 }
 
@@ -2029,12 +2289,13 @@ func (s *State) ApprovalTargetStateHash(target *SupervisorTarget) string {
 }
 
 type approvalPayload struct {
-	DecisionID string            `json:"decision_id,omitempty"`
-	Action     string            `json:"action"`
-	Target     *SupervisorTarget `json:"target,omitempty"`
-	Summary    string            `json:"summary"`
-	Risk       string            `json:"risk"`
-	Evidence   []string          `json:"evidence,omitempty"`
+	DecisionID       string            `json:"decision_id,omitempty"`
+	Action           string            `json:"action"`
+	Target           *SupervisorTarget `json:"target,omitempty"`
+	Summary          string            `json:"summary"`
+	Risk             string            `json:"risk"`
+	Evidence         []string          `json:"evidence,omitempty"`
+	LessonProposalID string            `json:"lesson_proposal_id,omitempty"`
 }
 
 type approvalTargetStateSnapshot struct {

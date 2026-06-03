@@ -293,6 +293,9 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		// restart). Lives inside the dry-run guard so the resulting
 		// state transitions are persisted by the state.Save below.
 		executeApprovedApprovals(cfg, st, reader)
+		if proposal, created := recordLessonProposalForDecision(cfg, st, decision); created && proposal != nil {
+			log.Printf("[supervisor] proposed lesson %s for %s/%s; approval=%s", proposal.ID, proposal.FailureClass, proposal.Area, proposal.ApprovalID)
+		}
 		if decisionRequiresApproval(cfg, decision) {
 			// #505: gate the mint on the executor registry. A verb the
 			// executor cannot handle would otherwise pile up
@@ -3523,6 +3526,7 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		Cfg:       cfg,
 		Sessions:  approver.SessionLookupFunc(st.SessionAt),
 		Workers:   newWorkerController(cfg),
+		State:     st,
 	}
 	for _, a := range approvals {
 		res := ex.Execute(a)
