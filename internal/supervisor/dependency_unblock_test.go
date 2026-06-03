@@ -260,6 +260,47 @@ func TestRunOnceDependencyUnblockAppliesSafeLabelMutations(t *testing.T) {
 	}
 }
 
+func TestRunOnceOwnedDynamicWaveDefaultsDependencyUnblock(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+repo: owner/repo
+issue_labels:
+  - maestro-ready
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: blocked
+  dynamic_wave:
+    enabled: true
+    owns_ready_label: true
+  safe_actions:
+    - add_ready_label
+    - remove_blocked_label
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg.StateDir = t.TempDir()
+	issue := testIssue(151, "blocked successor", "blocked")
+	issue.Body = "Blocked by #150"
+	reader := &fakeReader{
+		issues:       []github.Issue{issue},
+		closedIssues: map[int]bool{150: true},
+	}
+
+	decision, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if decision.RecommendedAction != ActionUnblockIssue {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionUnblockIssue)
+	}
+	if got, want := strings.Join(reader.removedLabels, ","), "#151:blocked"; got != want {
+		t.Fatalf("removed labels = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(reader.addedLabels, ","), "#151:maestro-ready"; got != want {
+		t.Fatalf("added labels = %q, want %q", got, want)
+	}
+}
+
 // Test: dep merged-PR also resolves the dependency --------------------------
 
 func TestEvaluate_UnblocksWhenDependencyPRMerged(t *testing.T) {

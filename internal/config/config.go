@@ -384,7 +384,9 @@ func (w SupervisorDynamicWaveConfig) Active() bool {
 // blocked issues into the configured GitHub Project so wave members are
 // visible before they go runnable.
 //
-// Default is disabled. The Scribe redesign handoff used an external cron
+// Defaults on for dynamic waves that own the ready/blocked labels. Set
+// enabled: false when blocker chains are intentionally operator-managed.
+// The Scribe redesign handoff used an external cron
 // (`scribe-redesign-handoff-unblocker`) as a workaround; this config lets
 // supervisor own that handoff dev role directly. See issue #442.
 type SupervisorDependencyUnblockConfig struct {
@@ -394,8 +396,9 @@ type SupervisorDependencyUnblockConfig struct {
 	AnnounceWithComment *bool `yaml:"announce_with_comment" json:"announce_with_comment,omitempty"`
 }
 
-// Active reports whether the dependency-unblock controller should run. Disabled
-// by default so existing projects without the explicit opt-in stay unchanged.
+// Active reports whether the dependency-unblock controller should run. Parsed
+// configs default this on for owned dynamic waves with both ready and blocked
+// labels, unless the operator explicitly sets enabled: false.
 func (d SupervisorDependencyUnblockConfig) Active() bool {
 	return d.Enabled != nil && *d.Enabled
 }
@@ -1189,6 +1192,14 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	policy.CompletionGates.LiveVisualCommand = strings.TrimSpace(policy.CompletionGates.LiveVisualCommand)
 	policy.CompletionGates.DeploymentStatusCmd = strings.TrimSpace(policy.CompletionGates.DeploymentStatusCmd)
 	policy.CompletionGates.VerificationLabel = strings.TrimSpace(policy.CompletionGates.VerificationLabel)
+	if policy.DynamicWave.DependencyUnblock.Enabled == nil &&
+		policy.DynamicWave.Active() &&
+		policy.DynamicWave.OwnsReadyLabel &&
+		policy.ReadyLabel != "" &&
+		policy.BlockedLabel != "" {
+		enabled := true
+		policy.DynamicWave.DependencyUnblock.Enabled = &enabled
+	}
 
 	if !policy.excludedLabelsSet && len(policy.ExcludedLabels) == 0 {
 		policy.ExcludedLabels = []string{"epic", "meta"}

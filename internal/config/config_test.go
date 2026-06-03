@@ -283,6 +283,49 @@ supervisor:
 	}
 }
 
+func TestParse_SupervisorDependencyUnblockDefaultsOnForOwnedDynamicWave(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: blocked
+  dynamic_wave:
+    enabled: true
+    owns_ready_label: true
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Supervisor.DynamicWave.DependencyUnblock.Active() {
+		t.Fatal("DependencyUnblock should default on when dynamic_wave owns ready/blocked handoff labels")
+	}
+	if len(cfg.BlockerPatterns) == 0 {
+		t.Fatal("BlockerPatterns should default to machine-readable blocker forms")
+	}
+}
+
+func TestParse_SupervisorDependencyUnblockExplicitFalseWins(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  ready_label: maestro-ready
+  blocked_label: blocked
+  dynamic_wave:
+    enabled: true
+    owns_ready_label: true
+    dependency_unblock:
+      enabled: false
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Supervisor.DynamicWave.DependencyUnblock.Active() {
+		t.Fatal("DependencyUnblock should stay disabled when explicitly configured enabled=false")
+	}
+}
+
 func TestParse_OutcomeBrief(t *testing.T) {
 	yaml := `
 repo: owner/repo
