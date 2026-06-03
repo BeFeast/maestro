@@ -108,15 +108,6 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		}
 	}
 
-	// Assemble prompt with checkpoint
-	prompt := assemblePromptWithCheckpoint(promptBase, issue, sess.Worktree, sess.Branch, cfg, checkpointContext)
-
-	// Write prompt to file
-	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
-	if err := writePromptFile(promptFile, prompt); err != nil {
-		return fmt.Errorf("write prompt file: %w", err)
-	}
-
 	// Determine backend
 	if backendName == "" {
 		backendName = cfg.Model.Default
@@ -133,6 +124,21 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+	}
+
+	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, backendName, cfg.Hooks)
+	if err != nil {
+		return fmt.Errorf("setup worker tool hooks: %w", err)
+	}
+
+	// Assemble prompt with checkpoint
+	prompt := assemblePromptWithCheckpoint(promptBase, issue, sess.Worktree, sess.Branch, cfg, checkpointContext)
+	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+
+	// Write prompt to file
+	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
+	if err := writePromptFile(promptFile, prompt); err != nil {
+		return fmt.Errorf("write prompt file: %w", err)
 	}
 
 	// Prepare log file

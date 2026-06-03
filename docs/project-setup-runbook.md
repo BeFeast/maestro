@@ -196,6 +196,18 @@ session_prefix: proj
 # Worker prompt template
 worker_prompt: /path/to/worker-prompt-template.md
 
+# Optional in-session worker tool hooks
+hooks:
+  timeout_ms: 60000
+  post_edit:
+    command: gofmt -w .
+    matcher: Edit|MultiEdit|Write
+    block_on_failure: true
+  pre_tool:
+    command: ./scripts/check-safe-tool.sh
+    matcher: Bash
+    block_on_failure: true
+
 # Outcome brief (read-only supervisor context)
 outcome:
   desired_outcome: Users can run the product end-to-end.
@@ -232,10 +244,14 @@ telegram:
 | `deploy_cmd` | Shell command maestro runs after merging a PR |
 | `session_prefix` | Prefix for tmux session names |
 | `worker_prompt` | Path to the worker prompt template file |
+| `hooks.post_edit` | Optional command run inside worker sessions after matching file edit tools |
+| `hooks.pre_tool` | Optional command run inside worker sessions before matching tool calls |
 
 Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker.
 
 For Maestro dogfooding, add the `outcome` block to the `BeFeast/maestro` project config first. Point `runtime_target` and `healthcheck_url` at the local Mission Control dashboard, and keep deploy/runtime actions read-only until approval-backed controls exist.
+
+Worker tool hooks are default-off and opt in per project. `command` runs from the worker worktree and receives the backend hook JSON in `MAESTRO_HOOK_INPUT`, plus `MAESTRO_HOOK_EVENT`, `MAESTRO_HOOK_TOOL_NAME`, and `MAESTRO_HOOK_FILE_PATH` when available. For Claude workers, Maestro writes a local `.claude/settings.local.json` hook file in the worktree and excludes it from git; stdout/stderr is returned to the agent as hook context. Other backends receive the same hook contract in the worker prompt so the configured command remains visible, but automatic per-tool interception depends on backend support. Set `block_on_failure: true` when a non-zero hook result should stop the matching tool/event until the worker corrects it.
 
 ### Optional: versioning config
 
