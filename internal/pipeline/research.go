@@ -1,16 +1,24 @@
 package pipeline
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 )
 
 // researchDir is the directory under the worktree where research files are written.
 const researchDir = ".maestro/research"
+
+var goplsBinary = "gopls"
 
 // runResearch performs the pre-coding research phase.
 // It scans the codebase for files relevant to the issue keywords and writes
@@ -62,6 +70,14 @@ func runResearch(worktreePath string, issueNumber int, issueTitle, issueBody str
 		}
 	}
 
+	symbols, err := findSymbolContexts(worktreePath, issueTitle, issueBody)
+	if err != nil {
+		log.Printf("[pipeline] research: symbol context unavailable: %v (falling back to filename search only)", err)
+	} else if len(symbols) > 0 {
+		log.Printf("[pipeline] research: found symbol context for %d symbols", len(symbols))
+		appendSymbolContexts(&sb, worktreePath, symbols)
+	}
+
 	// Discover project structure patterns
 	patterns := discoverPatterns(worktreePath)
 	if len(patterns) > 0 {
@@ -91,6 +107,22 @@ func runResearch(worktreePath string, issueNumber int, issueTitle, issueBody str
 type relevantFile struct {
 	Path            string
 	MatchedKeywords []string
+}
+
+type symbolContext struct {
+	Symbol          string
+	LookupPath      string
+	LookupLine      int
+	LookupCharacter int
+	Definitions     []symbolLocation
+	References      []symbolLocation
+	Implementations []symbolLocation
+}
+
+type symbolLocation struct {
+	Path      string
+	Line      int
+	Character int
 }
 
 // extractKeywords extracts meaningful keywords from issue title and body.
@@ -202,6 +234,373 @@ func findRelevantFiles(worktreePath string, keywords []string) []relevantFile {
 	return results
 }
 
+func findSymbolContexts(worktreePath, issueTitle, issueBody string) ([]symbolContext, error) {
+	if _, err := os.Stat(filepath.Join(worktreePath, "go.mod")); err != nil {
+		return nil, fmt.Errorf("not a Go module")
+	}
+	if _, err := exec.LookPath(goplsBinary); err != nil {
+		return nil, fmt.Errorf("%s not available: %w", goplsBinary, err)
+	}
+
+	candidates := extractSymbolCandidates(issueTitle, issueBody)
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	goFiles := listGoSourceFiles(worktreePath)
+	if len(goFiles) == 0 {
+		return nil, nil
+	}
+
+	var contexts []symbolContext
+	for _, symbol := range candidates {
+		path, line, char, ok := findSymbolTokenPosition(worktreePath, goFiles, symbol)
+		if !ok {
+			continue
+		}
+		ctx := symbolContext{
+			Symbol:          symbol,
+			LookupPath:      path,
+			LookupLine:      line,
+			LookupCharacter: char,
+		}
+		var err error
+		ctx.Definitions, err = runGoplsLocationQuery(worktreePath, "definition", path, line, char)
+		if err != nil {
+			log.Printf("[pipeline] research: gopls definition failed for %s: %v", symbol, err)
+			continue
+		}
+		ctx.References, err = runGoplsLocationQuery(worktreePath, "references", path, line, char)
+		if err != nil {
+			log.Printf("[pipeline] research: gopls references failed for %s: %v", symbol, err)
+		}
+		ctx.Implementations, err = runGoplsLocationQuery(worktreePath, "implementation", path, line, char)
+		if err != nil {
+			log.Printf("[pipeline] research: gopls implementation failed for %s: %v", symbol, err)
+		}
+		if len(ctx.Definitions)+len(ctx.References)+len(ctx.Implementations) > 0 {
+			contexts = append(contexts, ctx)
+		}
+		if len(contexts) >= 3 {
+			break
+		}
+	}
+
+	return contexts, nil
+}
+
+func appendSymbolContexts(sb *strings.Builder, worktreePath string, contexts []symbolContext) {
+	sb.WriteString("\n## Symbol Context (gopls)\n\n")
+	sb.WriteString("Language-server context for primary Go symbols named in the issue.\n\n")
+	for _, ctx := range contexts {
+		sb.WriteString(fmt.Sprintf("### `%s`\n\n", ctx.Symbol))
+		sb.WriteString(fmt.Sprintf("Lookup position: `%s:%d:%d`\n\n", ctx.LookupPath, ctx.LookupLine, ctx.LookupCharacter))
+		appendSymbolLocationList(sb, "Definitions", ctx.Definitions, 5)
+		appendSymbolLocationList(sb, "References", ctx.References, 10)
+		appendSymbolLocationList(sb, "Implementations", ctx.Implementations, 10)
+		appendSymbolSnippets(sb, worktreePath, ctx)
+	}
+}
+
+func appendSymbolLocationList(sb *strings.Builder, title string, locs []symbolLocation, limit int) {
+	if len(locs) == 0 {
+		return
+	}
+	sb.WriteString(fmt.Sprintf("**%s**\n", title))
+	for i, loc := range locs {
+		if i >= limit {
+			sb.WriteString(fmt.Sprintf("- ...and %d more.\n", len(locs)-limit))
+			break
+		}
+		sb.WriteString(fmt.Sprintf("- `%s:%d:%d`\n", loc.Path, loc.Line, loc.Character))
+	}
+	sb.WriteString("\n")
+}
+
+func appendSymbolSnippets(sb *strings.Builder, worktreePath string, ctx symbolContext) {
+	locs := dedupeSymbolLocations(append(append([]symbolLocation{}, ctx.Definitions...), ctx.References...))
+	if len(locs) == 0 {
+		return
+	}
+	sb.WriteString("**Snippets**\n\n")
+	limit := len(locs)
+	if limit > 3 {
+		limit = 3
+	}
+	for _, loc := range locs[:limit] {
+		snippet := readFileWindow(filepath.Join(worktreePath, loc.Path), loc.Line, 4)
+		if snippet == "" {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("`%s:%d`\n```go\n%s\n```\n\n", loc.Path, loc.Line, snippet))
+	}
+}
+
+func extractSymbolCandidates(title, body string) []string {
+	var candidates []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if !isUsefulGoSymbolCandidate(s) || seen[s] {
+			return
+		}
+		seen[s] = true
+		candidates = append(candidates, s)
+	}
+
+	codeSpanRe := regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_]*)`")
+	for _, m := range codeSpanRe.FindAllStringSubmatch(title+" "+body, -1) {
+		add(m[1])
+	}
+
+	identRe := regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\b`)
+	for _, m := range identRe.FindAllString(title+" "+body, -1) {
+		if hasGoIdentifierShape(m) {
+			add(m)
+		}
+	}
+
+	if len(candidates) > 8 {
+		candidates = candidates[:8]
+	}
+	return candidates
+}
+
+func isUsefulGoSymbolCandidate(s string) bool {
+	if len(s) < 3 {
+		return false
+	}
+	goKeywords := map[string]bool{
+		"break": true, "case": true, "chan": true, "const": true, "continue": true,
+		"default": true, "defer": true, "else": true, "fallthrough": true, "for": true,
+		"func": true, "go": true, "goto": true, "if": true, "import": true,
+		"interface": true, "map": true, "package": true, "range": true, "return": true,
+		"select": true, "struct": true, "switch": true, "type": true, "var": true,
+	}
+	lower := strings.ToLower(s)
+	if goKeywords[lower] {
+		return false
+	}
+	return regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(s)
+}
+
+func hasGoIdentifierShape(s string) bool {
+	if strings.Contains(s, "_") {
+		return true
+	}
+	if len(s) >= 5 && s[0] >= 'a' && s[0] <= 'z' {
+		for _, r := range s[1:] {
+			if r >= 'A' && r <= 'Z' {
+				return true
+			}
+		}
+	}
+	return len(s) >= 3 && s[0] >= 'A' && s[0] <= 'Z'
+}
+
+func listGoSourceFiles(worktreePath string) []string {
+	var files []string
+	skipDirs := map[string]bool{
+		".git": true, "node_modules": true, "vendor": true, ".maestro": true,
+		"target": true, "dist": true, "build": true, "__pycache__": true,
+	}
+	_ = filepath.Walk(worktreePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if skipDirs[info.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(info.Name(), ".go") {
+			rel, err := filepath.Rel(worktreePath, path)
+			if err == nil {
+				files = append(files, rel)
+			}
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files
+}
+
+func findSymbolTokenPosition(worktreePath string, files []string, symbol string) (string, int, int, bool) {
+	tokenRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(symbol) + `\b`)
+	for _, rel := range files {
+		data, err := os.ReadFile(filepath.Join(worktreePath, rel))
+		if err != nil {
+			continue
+		}
+		for lineIndex, line := range strings.Split(string(data), "\n") {
+			if loc := tokenRe.FindStringIndex(line); loc != nil {
+				return rel, lineIndex + 1, loc[0] + 1, true
+			}
+		}
+	}
+	return "", 0, 0, false
+}
+
+func runGoplsLocationQuery(worktreePath, verb, relPath string, line, char int) ([]symbolLocation, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pos := fmt.Sprintf("%s:%d:%d", filepath.Join(worktreePath, relPath), line, char)
+	cmd := exec.CommandContext(ctx, goplsBinary, verb, "-json", pos)
+	cmd.Dir = worktreePath
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return parseGoplsLocations(worktreePath, out), nil
+}
+
+func parseGoplsLocations(worktreePath string, data []byte) []symbolLocation {
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	var locs []symbolLocation
+	walkGoplsJSON(worktreePath, raw, func(uri string, line, character int) {
+		path := uriToPath(uri)
+		if path == "" {
+			return
+		}
+		rel, err := filepath.Rel(worktreePath, path)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return
+		}
+		locs = append(locs, symbolLocation{
+			Path:      filepath.ToSlash(rel),
+			Line:      line + 1,
+			Character: character + 1,
+		})
+	})
+	return dedupeSymbolLocations(locs)
+}
+
+func walkGoplsJSON(worktreePath string, v any, emit func(uri string, line, character int)) {
+	switch x := v.(type) {
+	case []any:
+		for _, item := range x {
+			walkGoplsJSON(worktreePath, item, emit)
+		}
+	case map[string]any:
+		if span, ok := x["span"].(string); ok {
+			if loc, ok := parseGoplsSpan(worktreePath, span); ok {
+				emit("file://"+loc.Path, loc.Line-1, loc.Character-1)
+			}
+		}
+		uri, _ := x["uri"].(string)
+		if uri == "" {
+			if target, ok := x["targetUri"].(string); ok {
+				uri = target
+			}
+		}
+		if uri != "" {
+			if line, character, ok := jsonRangeStart(x); ok {
+				emit(uri, line, character)
+			}
+		}
+		for _, item := range x {
+			walkGoplsJSON(worktreePath, item, emit)
+		}
+	case string:
+		if loc, ok := parseGoplsSpan(worktreePath, x); ok {
+			emit("file://"+loc.Path, loc.Line-1, loc.Character-1)
+		}
+	}
+}
+
+func jsonRangeStart(m map[string]any) (int, int, bool) {
+	rangeValue := m["range"]
+	if rangeValue == nil {
+		rangeValue = m["targetRange"]
+	}
+	rangeMap, ok := rangeValue.(map[string]any)
+	if !ok {
+		return 0, 0, false
+	}
+	start, ok := rangeMap["start"].(map[string]any)
+	if !ok {
+		return 0, 0, false
+	}
+	line, lineOK := start["line"].(float64)
+	char, charOK := start["character"].(float64)
+	return int(line), int(char), lineOK && charOK
+}
+
+func uriToPath(uri string) string {
+	if !strings.HasPrefix(uri, "file://") {
+		return ""
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return ""
+	}
+	return u.Path
+}
+
+func parseGoplsSpan(worktreePath, span string) (symbolLocation, bool) {
+	match := regexp.MustCompile(`^(.+):([0-9]+):([0-9]+)`).FindStringSubmatch(span)
+	if match == nil {
+		return symbolLocation{}, false
+	}
+	line, err := parsePositiveInt(match[2])
+	if err != nil {
+		return symbolLocation{}, false
+	}
+	character, err := parsePositiveInt(match[3])
+	if err != nil {
+		return symbolLocation{}, false
+	}
+	path := match[1]
+	if worktreePath != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(worktreePath, path)
+	}
+	return symbolLocation{Path: path, Line: line, Character: character}, true
+}
+
+func parsePositiveInt(s string) (int, error) {
+	var n int
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("not a positive integer: %s", s)
+		}
+		n = n*10 + int(r-'0')
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("not a positive integer: %s", s)
+	}
+	return n, nil
+}
+
+func dedupeSymbolLocations(locs []symbolLocation) []symbolLocation {
+	seen := map[string]bool{}
+	var out []symbolLocation
+	for _, loc := range locs {
+		key := fmt.Sprintf("%s:%d:%d", loc.Path, loc.Line, loc.Character)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, loc)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].Character < out[j].Character
+	})
+	return out
+}
+
 // isSourceExt returns true for common source file extensions.
 func isSourceExt(ext string) bool {
 	switch ext {
@@ -225,6 +624,30 @@ func readFileHead(path string, lines int) string {
 		allLines = allLines[:lines]
 	}
 	return strings.Join(allLines, "\n")
+}
+
+func readFileWindow(path string, centerLine, radius int) string {
+	data, err := os.ReadFile(path)
+	if err != nil || centerLine <= 0 {
+		return ""
+	}
+	allLines := strings.Split(string(data), "\n")
+	start := centerLine - radius
+	if start < 1 {
+		start = 1
+	}
+	end := centerLine + radius
+	if end > len(allLines) {
+		end = len(allLines)
+	}
+	var b strings.Builder
+	for i := start; i <= end; i++ {
+		b.WriteString(fmt.Sprintf("%4d: %s", i, allLines[i-1]))
+		if i < end {
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
 }
 
 // discoverPatterns identifies project structure patterns in the worktree.

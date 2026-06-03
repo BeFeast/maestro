@@ -34,12 +34,16 @@ maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini, 
 
 You only need one — whichever you have access to.
 
+### Optional for Go repositories
+- **`gopls`** — enables symbol-aware pre-worker research context for Go modules (`go install golang.org/x/tools/gopls@latest`)
+
 ### Verify prerequisites
 ```bash
 git --version        # any recent version
 gh --version         # 2.x+
 tmux -V              # any recent version
 claude --version     # or: codex --version / gemini --version / cline --version
+gopls version        # optional; used for Go symbol context when available
 ```
 
 ### Setup
