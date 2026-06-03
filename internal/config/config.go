@@ -780,6 +780,7 @@ type Config struct {
 	MergeStrategy                   string                       `yaml:"merge_strategy"`                     // "sequential" | "parallel"
 	MergeIntervalSeconds            int                          `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
 	ReviewGate                      string                       `yaml:"review_gate"`                        // "greptile" (default) | "none"
+	ReviewGateStreams               []string                     `yaml:"review_gate_streams"`                // optional review dimensions; default ["greptile"], opt-in ["greptile","simplicity"]
 	AutoRetryReviewFeedback         bool                         `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
 	MergeExhaustedNonCriticalReview *bool                        `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
 	AutoRetryRebaseConflicts        bool                         `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts
@@ -1083,6 +1084,7 @@ func parse(data []byte) (*Config, error) {
 	default:
 		cfg.ReviewGate = "greptile"
 	}
+	cfg.ReviewGateStreams = normalizeReviewGateStreams(cfg.ReviewGate, cfg.ReviewGateStreams)
 
 	// Default hooks timeout
 	if cfg.Hooks.TimeoutMs <= 0 {
@@ -1118,6 +1120,44 @@ func parse(data []byte) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func normalizeReviewGateStreams(reviewGate string, streams []string) []string {
+	if strings.EqualFold(strings.TrimSpace(reviewGate), "none") {
+		return nil
+	}
+	if len(streams) == 0 {
+		return []string{"greptile"}
+	}
+	out := make([]string, 0, len(streams))
+	seen := make(map[string]struct{}, len(streams))
+	for _, raw := range streams {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		switch name {
+		case "", "off", "disabled", "none":
+			continue
+		case "greptile", "simplicity":
+			// supported as configured
+		default:
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return []string{"greptile"}
+	}
+	return out
+}
+
+func (c *Config) EffectiveReviewGateStreams() []string {
+	if c == nil {
+		return nil
+	}
+	return normalizeReviewGateStreams(c.ReviewGate, c.ReviewGateStreams)
 }
 
 // SupervisorPolicyCandidatePaths returns structured policy files that may live

@@ -113,6 +113,10 @@ type prGreptileReader interface {
 	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
 }
 
+type prReviewGateVerdictReader interface {
+	PRReviewGateVerdict(prNumber int, streams []string) (github.ReviewGateVerdict, error)
+}
+
 // prMergeableReader fetches the per-PR mergeable state via the
 // SINGLE-PR endpoint (`gh api repos/.../pulls/{N}`) which triggers
 // GitHub's mergeability computation. The LIST endpoint (used by
@@ -144,6 +148,10 @@ type prMergeStateReader interface {
 // PR moving.
 type prHighSeverityReviewReader interface {
 	PRHighSeverityReviewOnHead(prNumber int) (sha string, findings []github.ReviewComment, hasFindings bool, err error)
+}
+
+type prBlockingReviewFindingsReader interface {
+	PRBlockingReviewFindingsOnHead(prNumber int, streams []string) (sha string, findings []github.ReviewComment, hasFindings bool, err error)
 }
 
 // PreflightResult is the outcome of running a configured preflight command.
@@ -1254,7 +1262,24 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		}
 
 		if e.cfg.ReviewGate == "greptile" && (ciStatus == "" || ciStatus == "success") {
-			if greptileReader, ok := e.reader.(prGreptileReader); ok {
+			streams := e.cfg.EffectiveReviewGateStreams()
+			if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok && !onlyGreptileReviewStream(streams) {
+				verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, streams)
+				if err == nil {
+					switch {
+					case verdict.Pending:
+						findings = append(findings, stuckState("review_gate_pending", SeverityInfo,
+							fmt.Sprintf("PR #%d is waiting for review gate streams.", pr.Number),
+							"Wait for all configured review streams to finish before merging.", true, target,
+							fmt.Sprintf("PR #%d review_gate=%s", pr.Number, verdict.Summary())))
+					case !verdict.Passed:
+						findings = append(findings, stuckState("review_gate_not_approved", SeverityBlocked,
+							fmt.Sprintf("PR #%d is blocked by review gate findings.", pr.Number),
+							"Address blocking review feedback or change this project's review gate policy.", e.cfg.AutoRetryReviewFeedback, target,
+							fmt.Sprintf("PR #%d review_gate=%s", pr.Number, verdict.Summary())))
+					}
+				}
+			} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
 				approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 				if err == nil {
 					switch {
@@ -1274,6 +1299,10 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		}
 	}
 	return findings
+}
+
+func onlyGreptileReviewStream(streams []string) bool {
+	return len(streams) == 1 && streams[0] == "greptile"
 }
 
 func (e *Engine) detectQueueStuckStates(st *state.State, prs []github.PR, issues, eligible []github.Issue, skipped []string) []state.SupervisorStuckState {

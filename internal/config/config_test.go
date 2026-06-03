@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1205,11 +1206,30 @@ func TestParse_ReviewGateDefaults(t *testing.T) {
 	if cfg.ReviewGate != "greptile" {
 		t.Errorf("ReviewGate = %q, want %q", cfg.ReviewGate, "greptile")
 	}
+	if got := cfg.EffectiveReviewGateStreams(); !reflect.DeepEqual(got, []string{"greptile"}) {
+		t.Errorf("EffectiveReviewGateStreams() = %#v, want [greptile]", got)
+	}
 	if cfg.AutoRetryReviewFeedback {
 		t.Error("AutoRetryReviewFeedback should default to false")
 	}
 	if cfg.AutoRetryRebaseConflicts {
 		t.Error("AutoRetryRebaseConflicts should default to false")
+	}
+}
+
+func TestParse_ReviewGateStreamsOptInSimplicity(t *testing.T) {
+	yaml := `
+repo: owner/repo
+review_gate_streams:
+  - greptile
+  - simplicity
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.EffectiveReviewGateStreams(); !reflect.DeepEqual(got, []string{"greptile", "simplicity"}) {
+		t.Fatalf("EffectiveReviewGateStreams() = %#v, want [greptile simplicity]", got)
 	}
 }
 
@@ -1226,6 +1246,9 @@ auto_retry_rebase_conflicts: true
 	}
 	if cfg.ReviewGate != "none" {
 		t.Errorf("ReviewGate = %q, want %q", cfg.ReviewGate, "none")
+	}
+	if got := cfg.EffectiveReviewGateStreams(); len(got) != 0 {
+		t.Errorf("EffectiveReviewGateStreams() = %#v, want empty when review_gate=none", got)
 	}
 	if !cfg.AutoRetryReviewFeedback {
 		t.Error("AutoRetryReviewFeedback should be true when configured")

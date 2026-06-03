@@ -1412,6 +1412,45 @@ type ReviewComment struct {
 	User string `json:"user"`
 }
 
+type ReviewStreamVerdict struct {
+	Name     string          `json:"name"`
+	Passed   bool            `json:"passed"`
+	Pending  bool            `json:"pending"`
+	Findings []ReviewComment `json:"findings,omitempty"`
+}
+
+type ReviewGateVerdict struct {
+	Passed  bool                  `json:"passed"`
+	Pending bool                  `json:"pending"`
+	Streams []ReviewStreamVerdict `json:"streams"`
+}
+
+func (v ReviewGateVerdict) BlockingFindings() []ReviewComment {
+	var findings []ReviewComment
+	for _, stream := range v.Streams {
+		findings = append(findings, stream.Findings...)
+	}
+	return findings
+}
+
+func (v ReviewGateVerdict) Summary() string {
+	if len(v.Streams) == 0 {
+		return "review gate disabled"
+	}
+	var parts []string
+	for _, stream := range v.Streams {
+		status := "pass"
+		switch {
+		case stream.Pending:
+			status = "pending"
+		case !stream.Passed:
+			status = "findings"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", stream.Name, status))
+	}
+	return strings.Join(parts, ", ")
+}
+
 var reviewLocationPattern = regexp.MustCompile(`(?mi)(^|\s)([A-Za-z0-9_./-]+\.[A-Za-z0-9]+:\d+|file:\s*\S+)`)
 
 // CollectReviewFeedback collects actionable inline review comments from Greptile and Codex on a PR.
@@ -1448,6 +1487,208 @@ func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
 		result = append(result, comment)
 	}
 	return result, nil
+}
+
+func (c *Client) PRReviewGateVerdict(prNumber int, streams []string) (ReviewGateVerdict, error) {
+	normalized := normalizeReviewStreams(streams)
+	verdict := ReviewGateVerdict{Passed: true}
+	if len(normalized) == 0 {
+		return verdict, nil
+	}
+	for _, stream := range normalized {
+		var sv ReviewStreamVerdict
+		var err error
+		switch stream {
+		case "greptile":
+			sv, err = c.greptileReviewStreamVerdict(prNumber)
+		case "simplicity":
+			sv, err = c.namedReviewStreamVerdict(prNumber, reviewStreamSpec{
+				Name:          "simplicity",
+				CheckContains: []string{"simplicity", "over-engineering", "overengineering"},
+				UserContains:  []string{"simplicity", "maestro-simplicity", "over-engineering", "overengineering"},
+			})
+		default:
+			continue
+		}
+		if err != nil {
+			return ReviewGateVerdict{}, err
+		}
+		verdict.Streams = append(verdict.Streams, sv)
+		if sv.Pending {
+			verdict.Pending = true
+			verdict.Passed = false
+		}
+		if !sv.Passed {
+			verdict.Passed = false
+		}
+	}
+	return verdict, nil
+}
+
+func (c *Client) PRBlockingReviewFindingsOnHead(prNumber int, streams []string) (sha string, findings []ReviewComment, hasFindings bool, err error) {
+	sha, err = c.pullHeadSHA(prNumber)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	comments, err := c.greptileReviewComments(prNumber)
+	if err != nil {
+		return sha, nil, false, fmt.Errorf("review comments for PR %d: %w", prNumber, err)
+	}
+	for _, cm := range comments {
+		if !reviewCommentTargetsHead(cm, sha) {
+			continue
+		}
+		login := cm.User.Login
+		body := cm.Body
+		if streamEnabled(streams, "greptile") && isGreptileLogin(login) && isHighSeverity(body) {
+			findings = append(findings, ReviewComment{Path: cm.Path, Line: cm.Line, Body: body, User: login})
+			continue
+		}
+		if streamEnabled(streams, "simplicity") && isSimplicityReviewerLogin(login) && isActionableReviewComment(ReviewComment{Path: cm.Path, Line: cm.Line, Body: body, User: login}) {
+			findings = append(findings, ReviewComment{Path: cm.Path, Line: cm.Line, Body: body, User: login})
+		}
+	}
+	return sha, findings, len(findings) > 0, nil
+}
+
+type reviewStreamSpec struct {
+	Name          string
+	CheckContains []string
+	UserContains  []string
+}
+
+func (c *Client) greptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdict, error) {
+	approved, pending, err := c.PRGreptileApproved(prNumber)
+	if err != nil {
+		return ReviewStreamVerdict{}, err
+	}
+	sv := ReviewStreamVerdict{Name: "greptile", Passed: approved, Pending: pending}
+	if !approved && !pending {
+		if _, findings, hasFindings, err := c.PRHighSeverityReviewOnHead(prNumber); err == nil && hasFindings {
+			sv.Findings = findings
+		}
+	}
+	return sv, nil
+}
+
+func (c *Client) namedReviewStreamVerdict(prNumber int, spec reviewStreamSpec) (ReviewStreamVerdict, error) {
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil {
+		return ReviewStreamVerdict{}, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	checks, checkErr := c.checkRunsForSHA(sha)
+	var checkFound, checkPassed, checkPending bool
+	if checkErr == nil {
+		checkFound, checkPassed, checkPending = namedCheckDecision(checks, spec.CheckContains)
+	}
+	findings, commentsErr := c.reviewFindingsForStream(prNumber, sha, spec)
+	if commentsErr != nil && checkErr != nil {
+		return ReviewStreamVerdict{}, commentsErr
+	}
+	sv := ReviewStreamVerdict{Name: spec.Name, Passed: false, Pending: false, Findings: findings}
+	switch {
+	case checkPending:
+		sv.Pending = true
+	case len(findings) > 0:
+		// Any actionable inline finding from this reviewer blocks, even if
+		// the external check has already settled successfully.
+	case checkFound:
+		sv.Passed = checkPassed
+		if !checkPassed {
+			sv.Findings = []ReviewComment{{
+				Body: fmt.Sprintf("%s review check did not pass", spec.Name),
+				User: spec.Name,
+			}}
+		}
+	default:
+		sv.Pending = true
+	}
+	return sv, nil
+}
+
+func namedCheckDecision(checks []greptileCheckRun, needles []string) (found bool, passed bool, pending bool) {
+	for _, cr := range checks {
+		name := strings.ToLower(cr.Name)
+		if !containsAny(name, needles) {
+			continue
+		}
+		found = true
+		if cr.Conclusion == "success" || cr.Conclusion == "neutral" {
+			return true, true, false
+		}
+		if cr.Status == "in_progress" || cr.Status == "queued" || cr.Status == "waiting" || cr.Conclusion == "" {
+			return true, false, true
+		}
+		return true, false, false
+	}
+	return false, false, false
+}
+
+func (c *Client) reviewFindingsForStream(prNumber int, sha string, spec reviewStreamSpec) ([]ReviewComment, error) {
+	comments, err := c.greptileReviewComments(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	var findings []ReviewComment
+	for _, cm := range comments {
+		if !reviewCommentTargetsHead(cm, sha) {
+			continue
+		}
+		if !containsAny(strings.ToLower(cm.User.Login), spec.UserContains) {
+			continue
+		}
+		comment := ReviewComment{Path: cm.Path, Line: cm.Line, Body: cm.Body, User: cm.User.Login}
+		if !isActionableReviewComment(comment) {
+			continue
+		}
+		findings = append(findings, comment)
+	}
+	return findings, nil
+}
+
+func normalizeReviewStreams(streams []string) []string {
+	if len(streams) == 0 {
+		return []string{"greptile"}
+	}
+	out := make([]string, 0, len(streams))
+	seen := map[string]struct{}{}
+	for _, raw := range streams {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		switch name {
+		case "greptile", "simplicity":
+		default:
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func streamEnabled(streams []string, name string) bool {
+	for _, stream := range normalizeReviewStreams(streams) {
+		if stream == name {
+			return true
+		}
+	}
+	return false
+}
+
+func isSimplicityReviewerLogin(login string) bool {
+	lower := strings.ToLower(strings.TrimSpace(login))
+	return containsAny(lower, []string{"simplicity", "maestro-simplicity", "over-engineering", "overengineering"})
+}
+
+func containsAny(s string, needles []string) bool {
+	for _, needle := range needles {
+		if needle = strings.ToLower(strings.TrimSpace(needle)); needle != "" && strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func isActionableReviewComment(comment ReviewComment) bool {

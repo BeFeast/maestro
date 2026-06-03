@@ -27,6 +27,7 @@ type fakeReader struct {
 	ciStatuses           map[int]string
 	greptileOK           map[int]bool
 	greptilePend         map[int]bool
+	reviewVerdicts       map[int]github.ReviewGateVerdict
 	mergeStates          map[int]string
 	highSeverityHeadSHA  map[int]string
 	highSeverityFindings map[int][]github.ReviewComment
@@ -148,6 +149,23 @@ func (f *fakeReader) PRGreptileApproved(prNumber int) (bool, bool, error) {
 	return approved, false, nil
 }
 
+func (f *fakeReader) PRReviewGateVerdict(prNumber int, streams []string) (github.ReviewGateVerdict, error) {
+	if f.reviewVerdicts != nil {
+		if verdict, ok := f.reviewVerdicts[prNumber]; ok {
+			return verdict, nil
+		}
+	}
+	approved, pending, err := f.PRGreptileApproved(prNumber)
+	if err != nil {
+		return github.ReviewGateVerdict{}, err
+	}
+	return github.ReviewGateVerdict{
+		Passed:  approved && !pending,
+		Pending: pending,
+		Streams: []github.ReviewStreamVerdict{{Name: "greptile", Passed: approved, Pending: pending}},
+	}, nil
+}
+
 // PRHighSeverityReviewOnHead lets the supervisor #565 auto-review-repair
 // branch peek at fake P0/P1 inline findings. Returns the configured head
 // SHA + findings for prNumber; missing entries are no findings.
@@ -155,6 +173,10 @@ func (f *fakeReader) PRHighSeverityReviewOnHead(prNumber int) (string, []github.
 	sha := f.highSeverityHeadSHA[prNumber]
 	findings := f.highSeverityFindings[prNumber]
 	return sha, findings, len(findings) > 0, nil
+}
+
+func (f *fakeReader) PRBlockingReviewFindingsOnHead(prNumber int, streams []string) (string, []github.ReviewComment, bool, error) {
+	return f.PRHighSeverityReviewOnHead(prNumber)
 }
 
 func (f *fakeReader) RateLimit() (github.RateLimitStatus, error) {

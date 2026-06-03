@@ -37,10 +37,11 @@ type reviewRepairCandidate struct {
 //
 //   - SupervisorReviewRepairConfig.Active() (default on).
 //   - The session is settled retry_exhausted on review feedback.
-//   - The PR is not draft, mergeable, CI green, AND the Greptile gate
-//     is "not approved" only because of inline P0/P1 findings on head.
-//   - The Greptile reader exposes PRHighSeverityReviewOnHead and reports
-//     at least one P0/P1 inline finding on the current head SHA.
+//   - The PR is not draft, mergeable, CI green, AND the review gate is
+//     blocked by configured reviewer findings on head.
+//   - The reader exposes blocking review findings for the configured
+//     streams (or the legacy Greptile high-severity reader) and reports
+//     at least one blocking inline finding on the current head SHA.
 //
 // When the budget for the (pr,head_sha) pair is exhausted the candidate
 // is returned with Exhausted=true so the caller can choose a fall-
@@ -87,11 +88,7 @@ func (e *Engine) evaluateAutoReviewRepair(st *state.State, sess *state.Session, 
 		return nil
 	}
 
-	reader, ok := e.reader.(prHighSeverityReviewReader)
-	if !ok {
-		return nil
-	}
-	sha, findings, hasFindings, err := reader.PRHighSeverityReviewOnHead(pr.Number)
+	sha, findings, hasFindings, err := e.blockingReviewFindingsOnHead(pr.Number)
 	if err != nil {
 		return nil
 	}
@@ -115,6 +112,18 @@ func (e *Engine) evaluateAutoReviewRepair(st *state.State, sess *state.Session, 
 		return candidate
 	}
 	return candidate
+}
+
+func (e *Engine) blockingReviewFindingsOnHead(prNumber int) (string, []github.ReviewComment, bool, error) {
+	streams := e.cfg.EffectiveReviewGateStreams()
+	if reader, ok := e.reader.(prBlockingReviewFindingsReader); ok && !onlyGreptileReviewStream(streams) {
+		return reader.PRBlockingReviewFindingsOnHead(prNumber, streams)
+	}
+	reader, ok := e.reader.(prHighSeverityReviewReader)
+	if !ok {
+		return "", nil, false, nil
+	}
+	return reader.PRHighSeverityReviewOnHead(prNumber)
 }
 
 // reviewRepairSessionSettled reports whether the session has reached the
@@ -160,12 +169,12 @@ func (e *Engine) buildReviewRepairDecision(st *state.State, now time.Time, proje
 		Session: slot,
 	}
 	reasons := appendReasons(baseReasons,
-		fmt.Sprintf("PR #%d is green and mergeable but Greptile flags %d P0/P1 inline comment(s) on head %s", pr.Number, len(candidate.Findings), shortSHA(candidate.HeadSHA)),
+		fmt.Sprintf("PR #%d is green and mergeable but review gate flags %d blocking inline comment(s) on head %s", pr.Number, len(candidate.Findings), shortSHA(candidate.HeadSHA)),
 		fmt.Sprintf("Session %s is settled retry_exhausted on review feedback (#565: would otherwise dead-end)", slot),
 		fmt.Sprintf("Review-repair budget: attempt %d of %d for (PR #%d, head %s)", candidate.Track.Attempts+1, e.cfg.Supervisor.ReviewRepair.EffectiveMaxRetries(), pr.Number, shortSHA(candidate.HeadSHA)),
 	)
 	reasons = appendReasons(reasons, formatReviewRepairFindings(candidate.Findings)...)
-	summary := fmt.Sprintf("Spawn a scoped review-repair worker for PR #%d to address %d Greptile P0/P1 inline comment(s) on head %s", pr.Number, len(candidate.Findings), shortSHA(candidate.HeadSHA))
+	summary := fmt.Sprintf("Spawn a scoped review-repair worker for PR #%d to address %d blocking review finding(s) on head %s", pr.Number, len(candidate.Findings), shortSHA(candidate.HeadSHA))
 	decision := e.decision(st, now, projectState, ActionSpawnReviewRepair, summary,
 		RiskMutating, 0.9, target, PolicyRuleReviewRepair, reasons)
 	decision.StuckStates = append(decision.StuckStates, reviewRepairSpawnedStuckState(target, candidate))
@@ -214,7 +223,7 @@ func (e *Engine) buildReviewRepairExhaustedDecision(st *state.State, now time.Ti
 	}
 	reasons := appendReasons(baseReasons,
 		fmt.Sprintf("PR #%d retry-exhausted on review feedback; review-repair budget for (PR #%d, head %s) is also exhausted", pr.Number, pr.Number, shortSHA(candidate.HeadSHA)),
-		fmt.Sprintf("%d Greptile P0/P1 inline comment(s) remain unaddressed on head %s — operator decision required", len(candidate.Findings), shortSHA(candidate.HeadSHA)),
+		fmt.Sprintf("%d blocking review finding(s) remain unaddressed on head %s — operator decision required", len(candidate.Findings), shortSHA(candidate.HeadSHA)),
 	)
 	reasons = appendReasons(reasons, formatReviewRepairFindings(candidate.Findings)...)
 
@@ -234,7 +243,7 @@ func (e *Engine) buildReviewRepairExhaustedDecision(st *state.State, now time.Ti
 }
 
 func reviewRepairSpawnedStuckState(target *state.SupervisorTarget, candidate *reviewRepairCandidate) state.SupervisorStuckState {
-	summary := fmt.Sprintf("Auto review-repair worker queued for PR #%d (head %s): %d Greptile P0/P1 finding(s) on head", target.PR, shortSHA(candidate.HeadSHA), len(candidate.Findings))
+	summary := fmt.Sprintf("Auto review-repair worker queued for PR #%d (head %s): %d blocking review finding(s) on head", target.PR, shortSHA(candidate.HeadSHA), len(candidate.Findings))
 	return state.SupervisorStuckState{
 		Code:              state.StuckReviewRepairSpawned,
 		Severity:          SeverityWarning,
@@ -246,7 +255,7 @@ func reviewRepairSpawnedStuckState(target *state.SupervisorTarget, candidate *re
 }
 
 func reviewRepairExhaustedStuckState(target *state.SupervisorTarget, candidate *reviewRepairCandidate) state.SupervisorStuckState {
-	summary := fmt.Sprintf("Review-repair budget exhausted for PR #%d on head %s — %d Greptile P0/P1 finding(s) unresolved; operator decision required", target.PR, shortSHA(candidate.HeadSHA), len(candidate.Findings))
+	summary := fmt.Sprintf("Review-repair budget exhausted for PR #%d on head %s — %d blocking review finding(s) unresolved; operator decision required", target.PR, shortSHA(candidate.HeadSHA), len(candidate.Findings))
 	return state.SupervisorStuckState{
 		Code:              state.StuckReviewRepairExhausted,
 		Severity:          SeverityBlocked,
@@ -264,7 +273,7 @@ func reviewRepairExhaustedStuckState(target *state.SupervisorTarget, candidate *
 func formatReviewRepairFindings(findings []github.ReviewComment) []string {
 	out := make([]string, 0, len(findings))
 	for _, f := range findings {
-		out = append(out, "Greptile finding: "+formatReviewCommentLine(f))
+		out = append(out, "Review finding: "+formatReviewCommentLine(f))
 	}
 	return out
 }
@@ -293,7 +302,7 @@ func formatReviewCommentLine(f github.ReviewComment) string {
 	}
 }
 
-// severityLabel extracts P0/P1 from a Greptile comment body. Defaults to
+// severityLabel extracts P0/P1 from a review comment body. Defaults to
 // "P?" when no marker is found — the comment must already be a known
 // high-severity finding to reach this code path.
 func severityLabel(body string) string {
@@ -303,6 +312,8 @@ func severityLabel(body string) string {
 		return "P0"
 	case strings.Contains(lower, "alt=\"p1\""), strings.Contains(lower, "/p1"), strings.Contains(lower, "badge/p1"):
 		return "P1"
+	case strings.Contains(lower, "blocking"), strings.Contains(lower, "over-engineering"), strings.Contains(lower, "overengineering"):
+		return "blocking"
 	}
 	return "P?"
 }
@@ -352,22 +363,22 @@ func FormatReviewRepairPromptFromPayload(issueNumber, prNumber int, payload *sta
 }
 
 // FormatReviewRepairPrompt builds the worker prompt for a spawn_review_repair
-// dispatch. The prompt is scoped to the specific Greptile findings (path /
+// dispatch. The prompt is scoped to the specific review findings (path /
 // line / body) so the worker addresses only the comments — not a restatement
 // of the original issue. Used by the orchestrator when starting the scoped
 // repair worker.
 func FormatReviewRepairPrompt(issueNumber int, prNumber int, headSHA string, findings []github.ReviewComment) string {
 	var b strings.Builder
 	b.WriteString("# Auto review-repair worker\n\n")
-	b.WriteString(fmt.Sprintf("You are addressing Greptile review feedback on PR #%d (issue #%d) at head %s.\n\n", prNumber, issueNumber, shortSHA(headSHA)))
+	b.WriteString(fmt.Sprintf("You are addressing blocking review feedback on PR #%d (issue #%d) at head %s.\n\n", prNumber, issueNumber, shortSHA(headSHA)))
 	b.WriteString("The previous worker for this issue exhausted its review-feedback retry budget on this PR.\n")
-	b.WriteString("Your scope is NARROW: resolve EACH of the inline Greptile P0/P1 comments listed below.\n")
+	b.WriteString("Your scope is NARROW: resolve EACH of the inline blocking review comments listed below.\n")
 	b.WriteString("Do NOT re-implement the original issue. Do NOT refactor outside the touched files.\n\n")
 	b.WriteString("Per finding:\n")
 	b.WriteString("  1. Read the comment context (path, line, body).\n")
 	b.WriteString("  2. Make the minimal code change that resolves the comment.\n")
 	b.WriteString("  3. Push to the existing PR branch (do not open a new PR).\n\n")
-	b.WriteString("## Unresolved Greptile P0/P1 inline comments on head ")
+	b.WriteString("## Unresolved blocking review inline comments on head ")
 	b.WriteString(shortSHA(headSHA))
 	b.WriteString("\n\n")
 	for i, f := range findings {
