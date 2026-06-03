@@ -178,7 +178,7 @@ func TestReconcile_CompletionGatesInactiveLegacyPath(t *testing.T) {
 	}
 }
 
-func TestMarkDoneAfterOutcomePass_GatedCloseSyncsAwaitingClose(t *testing.T) {
+func TestMarkDoneAfterOutcomePass_VerifiedMergeBypassesCloseApprovalGate(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
 		GitHubProjects: config.GitHubProjectsConfig{
@@ -216,11 +216,92 @@ func TestMarkDoneAfterOutcomePass_GatedCloseSyncsAwaitingClose(t *testing.T) {
 	if sess.Status != state.StatusDone {
 		t.Fatalf("status = %q, want done after outcome pass", sess.Status)
 	}
-	if closeCalled != 0 {
-		t.Fatalf("CloseIssue called %d times; approval-gated close must not bypass cautious gate", closeCalled)
+	if closeCalled != 1 {
+		t.Fatalf("CloseIssue called %d times; verified merge should auto-close despite approval gate", closeCalled)
 	}
-	if len(statuses) != 1 || statuses[0] != github.ProjectStatusAwaitingClose {
-		t.Fatalf("project statuses = %v, want [verified awaiting close]", statuses)
+	if len(statuses) != 1 || statuses[0] != github.ProjectStatusDone {
+		t.Fatalf("project statuses = %v, want [done]", statuses)
+	}
+}
+
+func TestReconcileCodeLandedSessionsExpiresMootCloseApprovalsAfterAutoClose(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "Live app works",
+			VerifierCommand:     "check-live",
+			PassRequiredForDone: boolPtr(true),
+		},
+		Supervisor: config.SupervisorConfig{
+			ApprovalRequired: []string{config.SupervisorActionCloseIssue},
+		},
+	}
+	closeCalled := 0
+	o := &Orchestrator{
+		cfg:            cfg,
+		notifier:       &notify.Notifier{},
+		outcomeCheckFn: healthyOutcome(),
+		isPRMergedFn: func(prNumber int) (bool, error) {
+			return prNumber == 99, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			if number != 621 {
+				t.Fatalf("CloseIssue issue = %d, want 621", number)
+			}
+			closeCalled++
+			return nil
+		},
+	}
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 621,
+		Status:      state.StatusCodeLanded,
+		PRNumber:    99,
+	}
+	s.Approvals = []state.Approval{
+		{
+			ID:        "close-single",
+			CreatedAt: now,
+			UpdatedAt: now,
+			Action:    config.SupervisorActionCloseIssue,
+			Target:    &state.SupervisorTarget{Issue: 621},
+			Status:    state.ApprovalStatusPending,
+		},
+		{
+			ID:        "close-batch",
+			CreatedAt: now,
+			UpdatedAt: now,
+			Action:    config.SupervisorActionCloseIssueBatch,
+			Target:    &state.SupervisorTarget{Issues: []state.SupervisorIssueTarget{{Issue: 621, PR: 99}, {Issue: 622, PR: 100}}},
+			Status:    state.ApprovalStatusApproved,
+		},
+		{
+			ID:        "other-close",
+			CreatedAt: now,
+			UpdatedAt: now,
+			Action:    config.SupervisorActionCloseIssue,
+			Target:    &state.SupervisorTarget{Issue: 622},
+			Status:    state.ApprovalStatusPending,
+		},
+	}
+
+	o.reconcileCodeLandedSessions(s)
+
+	if closeCalled != 1 {
+		t.Fatalf("CloseIssue called %d times, want 1", closeCalled)
+	}
+	if s.Approvals[0].Status != state.ApprovalStatusStale {
+		t.Fatalf("single close approval status = %q, want stale", s.Approvals[0].Status)
+	}
+	if s.Approvals[1].Status != state.ApprovalStatusStale {
+		t.Fatalf("batch close approval status = %q, want stale", s.Approvals[1].Status)
+	}
+	if s.Approvals[2].Status != state.ApprovalStatusPending {
+		t.Fatalf("other issue close approval status = %q, want pending", s.Approvals[2].Status)
 	}
 }
 

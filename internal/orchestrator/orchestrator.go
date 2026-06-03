@@ -290,6 +290,9 @@ func (o *Orchestrator) closeIssue(number int, comment string) error {
 	if o.ghCloseIssueFn != nil {
 		return o.ghCloseIssueFn(number, comment)
 	}
+	if o.gh == nil {
+		return fmt.Errorf("no github client configured for close-issue")
+	}
 	return o.gh.CloseIssue(number, comment)
 }
 
@@ -366,6 +369,9 @@ func (o *Orchestrator) captureTmux(session string) (string, error) {
 func (o *Orchestrator) isIssueClosed(number int) (bool, error) {
 	if o.isIssueClosedFn != nil {
 		return o.isIssueClosedFn(number)
+	}
+	if o.gh == nil {
+		return false, fmt.Errorf("no github client configured for issue-closed check")
 	}
 	return o.gh.IsIssueClosed(number)
 }
@@ -2766,9 +2772,9 @@ func (o *Orchestrator) markDeploymentFinished(sess *state.Session) {
 	}
 }
 
-func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber int) {
+func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber int) bool {
 	if sess == nil {
-		return
+		return false
 	}
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
@@ -2781,7 +2787,7 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	// last-mile check instead of Maestro silently closing.
 	if o.completionGatesRequireLiveVerification(sess) {
 		o.holdForLiveVerification(sess, prNumber)
-		return
+		return false
 	}
 	sess.Status = state.StatusDone
 	now := time.Now().UTC()
@@ -2789,9 +2795,10 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	state.MarkWorkerEnded(sess, now)
 	if o.closeVerifiedIssueIfAllowed(sess, prNumber) {
 		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-		return
+		return true
 	}
 	o.syncProject(sess.IssueNumber, github.ProjectStatusAwaitingClose)
+	return false
 }
 
 // completionGatesRequireLiveVerification returns true when the supervisor
@@ -2896,7 +2903,12 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 			continue
 		}
 		log.Printf("[orch] code_landed session for issue #%d passed outcome reconciliation; marking done", sess.IssueNumber)
-		o.markDoneAfterOutcomePass(sess, sess.PRNumber)
+		if o.markDoneAfterOutcomePass(sess, sess.PRNumber) {
+			stale := s.MarkCloseIssueApprovalsStaleForVerifiedIssue(sess.IssueNumber, time.Now().UTC())
+			if stale > 0 {
+				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
+			}
+		}
 	}
 }
 
@@ -2928,17 +2940,13 @@ func (o *Orchestrator) closeVerifiedIssueIfAllowed(sess *state.Session, prNumber
 	if o == nil || o.cfg == nil || sess == nil || sess.IssueNumber <= 0 {
 		return false
 	}
-	if !o.supervisorActionAllowed(config.SupervisorActionCloseIssue) || o.supervisorActionRequiresApproval(config.SupervisorActionCloseIssue) {
-		return false
-	}
 	closed, err := o.isIssueClosed(sess.IssueNumber)
 	if err != nil {
-		log.Printf("[orch] verified issue #%d was not auto-closed because issue state could not be checked: %v", sess.IssueNumber, err)
-		return false
-	}
-	if closed {
+		log.Printf("[orch] verified issue #%d close precheck skipped: %v", sess.IssueNumber, err)
+	} else if closed {
 		return true
 	}
+
 	comment := "Maestro verified the configured runtime outcome after code landed; closing this issue as done."
 	if prNumber > 0 {
 		comment = fmt.Sprintf("Maestro verified the configured runtime outcome after PR #%d landed; closing this issue as done.", prNumber)
@@ -2953,6 +2961,7 @@ func (o *Orchestrator) closeVerifiedIssueIfAllowed(sess *state.Session, prNumber
 	if o.notifier != nil {
 		o.notifier.Sendf("✅ maestro: closed verified issue #%d after code_landed outcome pass", sess.IssueNumber)
 	}
+	log.Printf("[orch] auto-closed issue #%d after verified merge", sess.IssueNumber)
 	return true
 }
 
@@ -3143,7 +3152,12 @@ func (o *Orchestrator) verifyOutcomeAfterMerge(s *state.State, sess *state.Sessi
 	s.OutcomeHealth = &result
 	if result.State == outcome.HealthHealthy {
 		log.Printf("[orch] outcome verifier passed after PR #%d; marking issue #%d done", prNumber, sess.IssueNumber)
-		o.markDoneAfterOutcomePass(sess, prNumber)
+		if o.markDoneAfterOutcomePass(sess, prNumber) {
+			stale := s.MarkCloseIssueApprovalsStaleForVerifiedIssue(sess.IssueNumber, time.Now().UTC())
+			if stale > 0 {
+				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
+			}
+		}
 		o.notifier.Sendf("✅ maestro: outcome verifier passed after PR #%d; issue #%d can be treated as done", prNumber, sess.IssueNumber)
 		return
 	}
