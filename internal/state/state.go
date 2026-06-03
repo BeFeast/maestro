@@ -738,7 +738,11 @@ const (
 	ApprovalAuditAwaitingDispatch = "awaiting_dispatch"
 )
 
-const approvalActionSpawnWorker = "spawn_worker"
+const (
+	approvalActionCloseIssue      = "close_issue"
+	approvalActionCloseIssueBatch = "close_issue_batch"
+	approvalActionSpawnWorker     = "spawn_worker"
+)
 
 // Approval records a risky supervisor decision that needs explicit resolution.
 type Approval struct {
@@ -1833,6 +1837,46 @@ func (s *State) ReconcileSpawnWorkerApprovalsForStartedSession(slot string, sess
 		count++
 	}
 	return count
+}
+
+// MarkCloseIssueApprovalsStaleForVerifiedIssue expires in-flight close_issue
+// approvals that became moot because Maestro already closed the verified,
+// merged issue on the orchestrator trust path.
+func (s *State) MarkCloseIssueApprovalsStaleForVerifiedIssue(issueNumber int, now time.Time) int {
+	if s == nil || issueNumber <= 0 {
+		return 0
+	}
+	count := 0
+	reason := fmt.Sprintf("issue #%d auto-closed after verified merge", issueNumber)
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if !closeIssueApprovalTargetsIssue(approval, issueNumber) {
+			continue
+		}
+		switch approval.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			s.markApprovalStale(approval, now, reason)
+			count++
+		}
+	}
+	return count
+}
+
+func closeIssueApprovalTargetsIssue(approval *Approval, issueNumber int) bool {
+	if approval == nil || approval.Target == nil || issueNumber <= 0 {
+		return false
+	}
+	switch approval.Action {
+	case approvalActionCloseIssue:
+		return approval.Target.Issue == issueNumber
+	case approvalActionCloseIssueBatch:
+		for _, target := range approval.Target.Issues {
+			if target.Issue == issueNumber {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *State) pendingApproval(id string) (*Approval, error) {
