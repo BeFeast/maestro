@@ -186,6 +186,24 @@ supervisor:
     - delete_worktree
     - change_global_config
 
+# Model backends. MCP is opt-in per backend; omit mcp to spawn workers
+# without external MCP tools.
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+      # mcp:
+      #   servers:
+      #     docs:
+      #       command: npx
+      #       args: ["-y", "@example/docs-mcp"]
+      #     symbols:
+      #       url: https://mcp.example.com/mcp
+      #       bearer_token_env_var: SYMBOLS_MCP_TOKEN
+
 # Concurrency
 max_parallel: 5
 max_runtime_minutes: 120
@@ -240,6 +258,7 @@ telegram:
 | `exclude_labels` | Skip issues with any of these labels |
 | `outcome` | Project operating brief used by the supervisor to judge runtime progress |
 | `supervisor` | Optional local policy for supervisor queue order, safe actions, dispatch SLA, and issue-type skips |
+| `model.backends.<name>.mcp` | Optional worker MCP attachment for that backend; omitted means no MCP tools |
 | `max_parallel` | Maximum concurrent worker sessions |
 | `deploy_cmd` | Shell command maestro runs after merging a PR |
 | `session_prefix` | Prefix for tmux session names |

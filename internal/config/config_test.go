@@ -784,6 +784,71 @@ model:
 	}
 }
 
+func TestParse_ModelBackendMCPConfig(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: codex
+  backends:
+    codex:
+      cmd: codex
+      mcp:
+        servers:
+          docs:
+            command: npx
+            args: ["-y", "@example/docs-mcp"]
+            env:
+              DOCS_ENV: test
+            allowed_tools: ["search_docs"]
+            startup_timeout_ms: 15000
+          symbols:
+            url: https://mcp.example.invalid/mcp
+            bearer_token_env_var: SYMBOLS_MCP_TOKEN
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	mcp := cfg.Model.Backends["codex"].MCP
+	if len(mcp.Servers) != 2 {
+		t.Fatalf("expected 2 MCP servers, got %d", len(mcp.Servers))
+	}
+	docs := mcp.Servers["docs"]
+	if docs.Command != "npx" {
+		t.Errorf("docs.Command = %q, want npx", docs.Command)
+	}
+	if len(docs.Args) != 2 || docs.Args[1] != "@example/docs-mcp" {
+		t.Errorf("docs.Args = %v", docs.Args)
+	}
+	if docs.Env["DOCS_ENV"] != "test" {
+		t.Errorf("docs.Env = %v", docs.Env)
+	}
+	if len(docs.AllowedTools) != 1 || docs.AllowedTools[0] != "search_docs" {
+		t.Errorf("docs.AllowedTools = %v", docs.AllowedTools)
+	}
+	if docs.StartupTimeoutMs != 15000 {
+		t.Errorf("docs.StartupTimeoutMs = %d, want 15000", docs.StartupTimeoutMs)
+	}
+	symbols := mcp.Servers["symbols"]
+	if symbols.URL != "https://mcp.example.invalid/mcp" {
+		t.Errorf("symbols.URL = %q", symbols.URL)
+	}
+	if symbols.BearerTokenEnvVar != "SYMBOLS_MCP_TOKEN" {
+		t.Errorf("symbols.BearerTokenEnvVar = %q", symbols.BearerTokenEnvVar)
+	}
+}
+
+func TestParse_ModelBackendMCPDefaultEmpty(t *testing.T) {
+	cfg, err := parse([]byte(`repo: owner/repo`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	mcp := cfg.Model.Backends["claude"].MCP
+	if len(mcp.Configs) != 0 || len(mcp.Servers) != 0 || mcp.Strict {
+		t.Errorf("MCP default should be empty, got %+v", mcp)
+	}
+}
+
 func TestParse_GeminiDefaultBackend(t *testing.T) {
 	yaml := `
 repo: owner/repo

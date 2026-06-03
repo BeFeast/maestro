@@ -22,10 +22,11 @@ type TelegramConfig struct {
 
 // BackendDef defines a model backend CLI.
 type BackendDef struct {
-	Cmd        string   `yaml:"cmd"`
-	ExtraArgs  []string `yaml:"extra_args"`
-	PromptMode string   `yaml:"prompt_mode"` // how to deliver prompt: "arg" (last argument), "stdin" (via stdin), "file" (file path as argument)
-	Enabled    *bool    `yaml:"enabled"`     // nil means enabled for backward compatibility
+	Cmd        string    `yaml:"cmd"`
+	ExtraArgs  []string  `yaml:"extra_args"`
+	PromptMode string    `yaml:"prompt_mode"` // how to deliver prompt: "arg" (last argument), "stdin" (via stdin), "file" (file path as argument)
+	Enabled    *bool     `yaml:"enabled"`     // nil means enabled for backward compatibility
+	MCP        MCPConfig `yaml:"mcp,omitempty"`
 
 	// #513: optional per-backend attribution metadata. Lets the
 	// dashboard / commit trailer record which provider+model actually
@@ -58,6 +59,34 @@ type BackendDef struct {
 	// blends input/output 50/50; operators who care about precision can
 	// set the same value for both.
 	Pricing BackendPricing `yaml:"pricing,omitempty"`
+}
+
+// MCPConfig is an opt-in per-backend worker MCP attachment. When empty,
+// Maestro passes no MCP configuration to spawned workers.
+type MCPConfig struct {
+	// Configs are backend-native MCP config JSON strings or file paths. Claude
+	// receives them via --mcp-config. Codex cannot consume these directly; use
+	// Servers for Codex workers.
+	Configs []string `yaml:"configs,omitempty"`
+	// Strict is supported by Claude workers and makes --mcp-config the only
+	// MCP source for the session.
+	Strict  bool                    `yaml:"strict,omitempty"`
+	Servers map[string]MCPServerDef `yaml:"servers,omitempty"`
+}
+
+// MCPServerDef describes one MCP server exposed to a worker backend.
+// Configure either Command for stdio or URL for streamable HTTP.
+type MCPServerDef struct {
+	Command           string            `yaml:"command,omitempty"`
+	Args              []string          `yaml:"args,omitempty"`
+	Env               map[string]string `yaml:"env,omitempty"`
+	URL               string            `yaml:"url,omitempty"`
+	BearerTokenEnvVar string            `yaml:"bearer_token_env_var,omitempty"`
+	Headers           map[string]string `yaml:"headers,omitempty"`
+	AllowedTools      []string          `yaml:"allowed_tools,omitempty"`
+	StartupTimeoutMs  int               `yaml:"startup_timeout_ms,omitempty"`
+	ToolTimeoutMs     int               `yaml:"tool_timeout_ms,omitempty"`
+	Trust             string            `yaml:"trust,omitempty"`
 }
 
 // BackendPricing is the per-backend cost table used by the fleet cost

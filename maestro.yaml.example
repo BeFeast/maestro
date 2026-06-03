@@ -64,6 +64,16 @@ model:
       #   output_usd_per_mtok: 75
     codex:
       cmd: codex
+      # Optional worker MCP tools. Omit this block for the safe default:
+      # workers receive no MCP servers unless explicitly configured.
+      # mcp:
+      #   servers:
+      #     docs:
+      #       command: npx
+      #       args: ["-y", "@example/docs-mcp"]
+      #     symbols:
+      #       url: https://mcp.example.com/mcp
+      #       bearer_token_env_var: SYMBOLS_MCP_TOKEN
     gemini:
       cmd: gemini
     cline:
