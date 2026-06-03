@@ -768,6 +768,46 @@ func readValidationContract(worktreePath string) string {
 	return sanitizePromptUTF8(string(data))
 }
 
+const repoRulesPromptMaxBytes = 32 * 1024
+
+var repoRulesPromptFiles = []string{"AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"}
+
+// repoRulesPromptSection reads the target repository's primary convention file
+// from the worktree root and formats it for worker prompt injection.
+func repoRulesPromptSection(worktreePath string) string {
+	for _, name := range repoRulesPromptFiles {
+		path := filepath.Join(worktreePath, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		truncated := len(data) > repoRulesPromptMaxBytes
+		if truncated {
+			data = data[:repoRulesPromptMaxBytes]
+		}
+
+		content := strings.TrimSpace(sanitizePromptUTF8(string(data)))
+		if content == "" {
+			continue
+		}
+
+		var b strings.Builder
+		b.WriteString("\n\n---\n\n## Repository Rules / Conventions\n\n")
+		b.WriteString("Source: `")
+		b.WriteString(name)
+		b.WriteString("` in the target repo worktree.")
+		if truncated {
+			b.WriteString(fmt.Sprintf(" Showing the first %d bytes; read the file for the rest.", repoRulesPromptMaxBytes))
+		}
+		b.WriteString("\n\n")
+		b.WriteString(content)
+		b.WriteByte('\n')
+		return b.String()
+	}
+	return ""
+}
+
 // assemblePrompt builds the final worker prompt.
 // If the base template contains {{ISSUE_NUMBER}} placeholders, it performs
 // template substitution. Otherwise it falls back to appending a task block.
@@ -804,7 +844,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		result := r.Replace(base) + workerSearchSafetyPromptSection(worktreePath)
+		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath)
 		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
@@ -848,6 +888,7 @@ Always rebase on origin/main immediately before creating the PR.
 		issue.Title,
 		issue.Number,
 	)
+	result += repoRulesPromptSection(worktreePath)
 	result += workerSearchSafetyPromptSection(worktreePath)
 	return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, false)
 }

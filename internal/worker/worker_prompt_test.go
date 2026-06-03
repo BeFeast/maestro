@@ -53,6 +53,140 @@ func TestAssemblePromptIncludesSearchSafetyGuardrails(t *testing.T) {
 	}
 }
 
+func TestAssemblePromptIncludesRepoRulesFromAgentsFile(t *testing.T) {
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "AGENTS.md"), []byte("## Rules\n- Run go test ./...\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 642, Title: "repo rules", Body: "body"}
+
+	prompt := assemblePrompt("base prompt", issue, worktree, "feat/rules", cfg)
+
+	for _, want := range []string{
+		"## Repository Rules / Conventions",
+		"Source: `AGENTS.md` in the target repo worktree.",
+		"Run go test ./...",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("assemblePrompt() missing %q\nprompt:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestAssemblePromptOmitsRepoRulesWhenNoConventionFileExists(t *testing.T) {
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 642, Title: "repo rules", Body: "body"}
+
+	prompt := assemblePrompt("base prompt", issue, t.TempDir(), "feat/rules", cfg)
+
+	if strings.Contains(prompt, "Repository Rules / Conventions") {
+		t.Fatalf("repo rules section should be omitted when no convention file exists\nprompt:\n%s", prompt)
+	}
+}
+
+func TestAssemblePromptRepoRulesPrecedence(t *testing.T) {
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "CONTRIBUTING.md"), []byte("contributing rules\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "CLAUDE.md"), []byte("claude rules\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "AGENTS.md"), []byte("agents rules\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 642, Title: "repo rules", Body: "body"}
+
+	prompt := assemblePrompt("base prompt", issue, worktree, "feat/rules", cfg)
+
+	if !strings.Contains(prompt, "Source: `AGENTS.md`") || !strings.Contains(prompt, "agents rules") {
+		t.Fatalf("expected AGENTS.md rules in prompt:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "claude rules") || strings.Contains(prompt, "contributing rules") {
+		t.Fatalf("expected only the primary repo rules file in prompt:\n%s", prompt)
+	}
+}
+
+func TestAssemblePromptRepoRulesFallbackToClaudeThenContributing(t *testing.T) {
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 642, Title: "repo rules", Body: "body"}
+
+	t.Run("claude before contributing", func(t *testing.T) {
+		worktree := t.TempDir()
+		if err := os.WriteFile(filepath.Join(worktree, "CLAUDE.md"), []byte("claude rules\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worktree, "CONTRIBUTING.md"), []byte("contributing rules\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		prompt := assemblePrompt("base prompt", issue, worktree, "feat/rules", cfg)
+
+		if !strings.Contains(prompt, "Source: `CLAUDE.md`") || !strings.Contains(prompt, "claude rules") {
+			t.Fatalf("expected CLAUDE.md rules in prompt:\n%s", prompt)
+		}
+		if strings.Contains(prompt, "contributing rules") {
+			t.Fatalf("expected only CLAUDE.md rules in prompt:\n%s", prompt)
+		}
+	})
+
+	t.Run("contributing when primary files missing", func(t *testing.T) {
+		worktree := t.TempDir()
+		if err := os.WriteFile(filepath.Join(worktree, "CONTRIBUTING.md"), []byte("contributing rules\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		prompt := assemblePrompt("base prompt", issue, worktree, "feat/rules", cfg)
+
+		if !strings.Contains(prompt, "Source: `CONTRIBUTING.md`") || !strings.Contains(prompt, "contributing rules") {
+			t.Fatalf("expected CONTRIBUTING.md rules in prompt:\n%s", prompt)
+		}
+	})
+}
+
+func TestAssemblePromptRepoRulesTruncatesOversizedFile(t *testing.T) {
+	worktree := t.TempDir()
+	content := strings.Repeat("a", repoRulesPromptMaxBytes) + "tail"
+	if err := os.WriteFile(filepath.Join(worktree, "AGENTS.md"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 642, Title: "repo rules", Body: "body"}
+
+	prompt := assemblePrompt("base prompt", issue, worktree, "feat/rules", cfg)
+
+	if !strings.Contains(prompt, "Showing the first 32768 bytes; read the file for the rest.") {
+		t.Fatalf("expected truncation notice in prompt:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "tail") {
+		t.Fatalf("expected oversized content to be truncated")
+	}
+}
+
+func TestAssemblePromptRepoRulesSanitizesInvalidUTF8(t *testing.T) {
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "AGENTS.md"), []byte{'r', 'u', 'l', 'e', ':', ' ', 0xff}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 642, Title: "repo rules", Body: "body"}
+
+	prompt := assemblePrompt("base prompt", issue, worktree, "feat/rules", cfg)
+
+	if !utf8.ValidString(prompt) {
+		t.Fatalf("assembled prompt is not valid UTF-8: %q", prompt)
+	}
+	if !strings.Contains(prompt, "rule: \uFFFD") {
+		t.Fatalf("expected invalid byte to be replaced in repo rules section:\n%q", prompt)
+	}
+}
+
 // --- Tests from main: validation contract placeholder ---
 
 func TestAssemblePrompt_ValidationContractFromFile(t *testing.T) {
