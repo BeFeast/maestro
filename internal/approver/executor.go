@@ -336,6 +336,32 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 			Status:  state.ApprovalStatusAwaitingDispatch,
 			Summary: summary,
 		}
+	case "spawn_repair_worker":
+		// #662: classic repair worker. Same shape as spawn_worker —
+		// the orchestrator's dispatcher loop (supervisorSelectedRepairSpawn)
+		// owns the actual respawn for the open-PR-not-progressing and
+		// retry-exhausted-without-PR cases. Returning AwaitingDispatch
+		// keeps the approval effective so RecordPendingApprovalForDecision's
+		// at-mint dedup coalesces fresh recommendations until the
+		// dispatcher resolves it; before #662 this verb fell through
+		// to the unknown-action default and cautious projects refused
+		// to mint the approval every cycle (silent stall).
+		pr, issue := 0, 0
+		if approval.Target != nil {
+			pr = approval.Target.PR
+			issue = approval.Target.Issue
+		}
+		summary := "spawn_repair_worker approval recorded; next dispatcher loop will start the repair worker"
+		switch {
+		case pr > 0 && issue > 0:
+			summary = fmt.Sprintf("spawn_repair_worker for issue #%d (PR #%d) approved; next dispatcher loop will start the repair worker (no extra command required)", issue, pr)
+		case issue > 0:
+			summary = fmt.Sprintf("spawn_repair_worker for issue #%d approved; next dispatcher loop will start the repair worker (no extra command required)", issue)
+		}
+		return Result{
+			Status:  state.ApprovalStatusAwaitingDispatch,
+			Summary: summary,
+		}
 	case "open_child_issue":
 		// Same shape as spawn_worker: the v1 supervisor records the
 		// intent, but the safe-action executor for create_issue lands
