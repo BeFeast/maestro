@@ -56,11 +56,12 @@ type Orchestrator struct {
 	isPRMergedFn          func(prNumber int) (bool, error)
 
 	// Testing hooks for checkSessions
-	captureTmuxFn   func(session string) (string, error)
-	tmuxCaptureFn   func(session string) (string, error)
-	isIssueClosedFn func(issueNumber int) (bool, error)
-	addIssueLabelFn func(number int, label string) error
-	isRateLimitedFn func(logFile string) bool
+	captureTmuxFn           func(session string) (string, error)
+	tmuxCaptureFn           func(session string) (string, error)
+	isIssueClosedFn         func(issueNumber int) (bool, error)
+	addIssueLabelFn         func(number int, label string) error
+	isRateLimitedFn         func(logFile string) bool
+	rateLimitResetFromLogFn func(logFile string) *time.Time
 	// workerRespawnFn / respawnWorkerFn: used by respawnWorker() for dead-worker fallback (tests set one or the other)
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
@@ -432,9 +433,18 @@ func (o *Orchestrator) isRateLimited(logFile string) bool {
 
 // rateLimitResetFromLog reads a dead worker's log file and parses the
 // provider-stated reset time ("try again at ...") if present. It returns nil
-// when the log is unreadable or carries no parseable reset hint, so callers can
-// fall back to a reasonable default cooldown.
+// when the log is unreadable or carries no parseable reset hint.
+//
+// Per issue #663, a nil result from this function is the orchestrator's signal
+// that the rate-limit detection is LOW-confidence: the classifier matched a
+// pattern but the provider did not state when the limit resets, so the match
+// may well be a stale prompt-context echo or a transient tool/exec error.
+// Callers that switch backends on rate-limit signals MUST treat nil as "do
+// not fall back" and let the ordinary worker-died path handle the session.
 func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
+	if o.rateLimitResetFromLogFn != nil {
+		return o.rateLimitResetFromLogFn(logFile)
+	}
 	if logFile == "" {
 		return nil
 	}
@@ -446,6 +456,25 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 		return &reset
 	}
 	return nil
+}
+
+// providerRateLimitFromLog returns the high-confidence rate-limit verdict for
+// a dead worker's log. It reports hit=true only when the classifier matches
+// AND a provider-stated reset window is parseable — a positive rate-limit
+// signal in the sense of issue #663. A classifier match without a reset hint
+// is treated as low-confidence and reported as hit=false, so the caller falls
+// through to the ordinary worker-died handling instead of triggering a false
+// backend fallback. The non-nil resetAt is also returned so callers can
+// stamp BackendHealth.RetryAfter without re-reading the log.
+func (o *Orchestrator) providerRateLimitFromLog(logFile string) (hit bool, resetAt *time.Time) {
+	if !o.isRateLimited(logFile) {
+		return false, nil
+	}
+	reset := o.rateLimitResetFromLog(logFile)
+	if reset == nil {
+		return false, nil
+	}
+	return true, reset
 }
 
 func (o *Orchestrator) workerLogFile(slotName string, sess *state.Session) string {
@@ -1658,10 +1687,15 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// (see :worker-died and :log-scanner paths) — select an available fallback
 		// backend and respawn the session there. Mark the session Dead only when no
 		// fallback is configured / available, or when the respawn itself fails (#506).
-		if o.isRateLimited(sess.LogFile) {
+		//
+		// Per #663, fallback is gated on a positive (parseable-reset) rate-limit
+		// signal. A pattern match without a reset hint is too easy to false-positive
+		// — a stale prompt-context echo, a codex tools-router error, or a transient
+		// stderr line containing "429" — and switching backends on it burns the
+		// more expensive fallback and can loop the session to the retry cap.
+		if hit, resetAt := o.providerRateLimitFromLog(sess.LogFile); hit {
 			now := time.Now().UTC()
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
-			resetAt := o.rateLimitResetFromLog(sess.LogFile)
 			o.recordProviderLimit(s, slotName, sess, "log_rate_limit_reconcile", resetAt, now)
 			selection := o.selectProviderLimitFallback(s, sess, now)
 			sess.BackendSelection = &selection
@@ -2045,11 +2079,15 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					state.MarkPROpened(sess, now)
 					o.notifier.Sendf("🔀 maestro: worker %s completed, PR #%d open for issue #%d (%s)",
 						slotName, pr.Number, sess.IssueNumber, sess.IssueTitle)
-				} else if o.isRateLimited(sess.LogFile) {
+				} else if hit, resetAt := o.providerRateLimitFromLog(sess.LogFile); hit {
 					// Provider capacity limit detected — gate this backend and select a fallback.
+					// Per #663, only a high-confidence signal (parseable reset window)
+					// triggers backend fallback; a pattern match without a reset hint
+					// is too easy to false-positive (stale prompt echo, codex tool-exec
+					// errors, transient stderr containing "429") and is left to the
+					// ordinary retry/canRetryIssue path below.
 					now := time.Now().UTC()
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
-					resetAt := o.rateLimitResetFromLog(sess.LogFile)
 					o.recordProviderLimit(s, slotName, sess, "log_rate_limit", resetAt, now)
 					selection := o.selectProviderLimitFallback(s, sess, now)
 					sess.BackendSelection = &selection
@@ -2161,18 +2199,30 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					o.updateTokensUsedFromOutput(slotName, sess, output)
 
 					// --- Rate-limit detection ---
+					// Per #663, the orchestrator only acts on a HIGH-confidence
+					// rate-limit signal: the classifier must match AND the provider
+					// must have stated a parseable reset window. A bare pattern match
+					// without a reset hint is too easy to false-positive — a stale
+					// prompt-context echo, a codex tools-router error, or a transient
+					// stderr line containing "429" — and killing the worker on it
+					// burns the more-expensive fallback for no reason. A live worker
+					// that is still progressing despite a low-confidence match is left
+					// alone so it can recover (the apertune case from #663).
 					if !sess.RateLimitHit && sess.LastNotifiedStatus != "rate_limit" {
-						if hit, pattern := worker.DetectRateLimit(output); hit {
-							log.Printf("[orch] worker %s hit rate limit (pattern=%s), stopping", slotName, pattern)
+						classifyHit, pattern, confidence, resetTime := worker.ClassifyRateLimit(output)
+						if classifyHit && confidence != "high" {
+							log.Printf("[orch] worker %s rate-limit pattern matched (pattern=%s) but reset window unparseable — treating as low-confidence and letting worker continue (per #663)",
+								slotName, pattern)
+						}
+						if classifyHit && confidence == "high" {
+							log.Printf("[orch] worker %s hit rate limit (pattern=%s, reset=%s), stopping",
+								slotName, pattern, resetTime.Format(time.RFC3339))
 							o.runAfterRunHook(sess)
 							if err := o.stopWorker(slotName, sess); err != nil {
 								log.Printf("[orch] warn: could not stop rate-limited worker %s: %v", slotName, err)
 							}
 							now := time.Now().UTC()
-							var resetAt *time.Time
-							if reset, ok := worker.ParseRateLimitReset(output); ok {
-								resetAt = &reset
-							}
+							resetAt := &resetTime
 							o.recordProviderLimit(s, slotName, sess, pattern, resetAt, now)
 							selection := o.selectProviderLimitFallback(s, sess, now)
 							sess.BackendSelection = &selection

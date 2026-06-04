@@ -294,6 +294,124 @@ func TestParseRateLimitReset_CodexSignature(t *testing.T) {
 	}
 }
 
+// codexWriteStdinClosed is the exact codex tools-router error from issue #663
+// (apertune session apt-2, 2026-06-04). Codex emits this when the worker's
+// stdin gets closed mid-session; the worker recovers and continues. It MUST
+// NOT be classified as a backend rate-limit, otherwise the orchestrator
+// triggers a false fallback to a more expensive backend and can loop the
+// session to the retry cap.
+const codexWriteStdinClosed = "2026-06-04T19:41:32Z ERROR codex_core::tools::router: error=write_stdin failed: stdin is closed\nfor this session; rerun exec_command with tty=true to keep stdin open"
+
+// TestRateLimit_CodexWriteStdinError_NotClassified is the #663 regression
+// guard. The codex tools-router `write_stdin failed: stdin is closed` line
+// is a transient tool error, not a provider rate-limit, so all three entry
+// points must report rate_limited=false.
+func TestRateLimit_CodexWriteStdinError_NotClassified(t *testing.T) {
+	if hit, label := DetectRateLimit(codexWriteStdinClosed); hit {
+		t.Errorf("DetectRateLimit incorrectly classified codex write_stdin error as rate-limit (label=%q)", label)
+	}
+	if OutputContainsRateLimit(codexWriteStdinClosed) {
+		t.Error("OutputContainsRateLimit incorrectly classified codex write_stdin error as rate-limit")
+	}
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "apt-2.log")
+	content := "Starting worker apt-2 on issue #471\nProcessing...\n" + codexWriteStdinClosed + "\nworker continued, opened PR.\n"
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+	if IsRateLimited(logFile) {
+		t.Error("IsRateLimited incorrectly classified codex write_stdin error log as rate-limit")
+	}
+}
+
+// TestRateLimit_BareDigitsNotClassified guards against the previous bare-429
+// substring match. Stray "429" sequences in IDs, version strings, or token
+// counts must not classify as HTTP 429 — only a 429 paired with an HTTP /
+// status / error context word counts.
+func TestRateLimit_BareDigitsNotClassified(t *testing.T) {
+	cases := []string{
+		"processed 14290 records",
+		"build artifact v0.4.29 ready",
+		"tokens 4290 (in 1000 / out 3290)",
+		"commit sha 429abcd",
+	}
+	for _, in := range cases {
+		if hit, label := DetectRateLimit(in); hit {
+			t.Errorf("DetectRateLimit(%q) incorrectly hit (label=%q) — bare 429 must not classify", in, label)
+		}
+		if OutputContainsRateLimit(in) {
+			t.Errorf("OutputContainsRateLimit(%q) incorrectly matched — bare 429 must not classify", in)
+		}
+	}
+}
+
+// TestRateLimit_BarePhrasesNotClassified guards against the previous bare
+// "rate limit" / "rate_limit" substring match. Generic mentions in prompt
+// context, runbook docs, or config field names must not classify — only a
+// concrete "rate limit exceeded/reached/hit/error" phrasing counts.
+func TestRateLimit_BarePhrasesNotClassified(t *testing.T) {
+	cases := []string{
+		"see the rate limit section in the runbook",
+		`{"config": {"rate_limit": 100}}`,
+		"the API has a rate limit of 60 req/min",
+	}
+	for _, in := range cases {
+		if hit, label := DetectRateLimit(in); hit {
+			t.Errorf("DetectRateLimit(%q) incorrectly hit (label=%q) — bare 'rate limit' must not classify", in, label)
+		}
+		if OutputContainsRateLimit(in) {
+			t.Errorf("OutputContainsRateLimit(%q) incorrectly matched — bare 'rate limit' must not classify", in)
+		}
+	}
+}
+
+// TestClassifyRateLimit_Confidence verifies that ClassifyRateLimit returns
+// "high" only when a parseable reset hint is present, and "low" otherwise.
+// Per #663, the orchestrator must use this confidence signal to gate backend
+// fallback — a low-confidence detection (reset=unknown) does NOT justify
+// switching to a more-expensive backend.
+func TestClassifyRateLimit_Confidence(t *testing.T) {
+	t.Run("high confidence with reset", func(t *testing.T) {
+		hit, label, confidence, resetAt := ClassifyRateLimit(codexUsageLimitSignature)
+		if !hit {
+			t.Fatal("expected hit=true on codex usage-limit signature")
+		}
+		if label != "hit_limit" {
+			t.Errorf("label = %q, want hit_limit", label)
+		}
+		if confidence != "high" {
+			t.Errorf("confidence = %q, want high (parseable reset hint)", confidence)
+		}
+		want := time.Date(2026, time.May, 30, 20, 13, 0, 0, time.UTC)
+		if !resetAt.Equal(want) {
+			t.Errorf("resetAt = %v, want %v", resetAt, want)
+		}
+	})
+
+	t.Run("low confidence without reset", func(t *testing.T) {
+		hit, _, confidence, resetAt := ClassifyRateLimit("Error: rate limit exceeded.")
+		if !hit {
+			t.Fatal("expected hit=true on 'rate limit exceeded'")
+		}
+		if confidence != "low" {
+			t.Errorf("confidence = %q, want low (no reset hint)", confidence)
+		}
+		if !resetAt.IsZero() {
+			t.Errorf("resetAt = %v, want zero on low confidence", resetAt)
+		}
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		hit, label, confidence, _ := ClassifyRateLimit(codexWriteStdinClosed)
+		if hit {
+			t.Errorf("expected hit=false on write_stdin error, got label=%q confidence=%q", label, confidence)
+		}
+		if confidence != "" {
+			t.Errorf("confidence = %q, want empty when no hit", confidence)
+		}
+	})
+}
+
 func TestParseRateLimitReset_Variants(t *testing.T) {
 	tests := []struct {
 		name  string

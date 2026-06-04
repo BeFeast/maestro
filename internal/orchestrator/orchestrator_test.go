@@ -543,6 +543,17 @@ func TestReconcileRunningSessions_DeadPIDGetsMarkedDead(t *testing.T) {
 	}
 }
 
+// mockRateLimitReset returns a fixed parseable reset time, used by reconcile
+// rate-limit tests to simulate a high-confidence provider rate-limit response.
+// Per #663, the orchestrator only triggers backend fallback when the
+// rate-limit signal is accompanied by a parseable reset window — tests that
+// want to exercise the fallback path mock this so providerRateLimitFromLog
+// reports hit=true.
+func mockRateLimitReset(string) *time.Time {
+	r := time.Date(2027, time.January, 1, 12, 0, 0, 0, time.UTC)
+	return &r
+}
+
 // TestReconcileRunningSessions_RateLimitedDeadWorker_DoesNotBurnRetryBudget
 // guards #466: when reconcile observes a dead worker whose log carries a
 // provider rate-limit signature, it must record the provider limit and skip
@@ -570,11 +581,12 @@ func TestReconcileRunningSessions_RateLimitedDeadWorker_DoesNotBurnRetryBudget(t
 				Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}},
 			},
 		},
-		notifier:            &notify.Notifier{},
-		pidAliveFn:          func(pid int) bool { return false },
-		tmuxSessionExistsFn: func(name string) bool { return false },
-		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
-		isRateLimitedFn:     func(logFile string) bool { return true },
+		notifier:                &notify.Notifier{},
+		pidAliveFn:              func(pid int) bool { return false },
+		tmuxSessionExistsFn:     func(name string) bool { return false },
+		listOpenPRsFn:           func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:         func(logFile string) bool { return true },
+		rateLimitResetFromLogFn: mockRateLimitReset,
 	}
 
 	changed := o.reconcileRunningSessions(s)
@@ -639,11 +651,12 @@ func TestReconcileRunningSessions_RateLimitedDeadWorker_FallsOverToNextBackend(t
 				},
 			},
 		},
-		notifier:            &notify.Notifier{},
-		pidAliveFn:          func(pid int) bool { return false },
-		tmuxSessionExistsFn: func(name string) bool { return false },
-		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
-		isRateLimitedFn:     func(logFile string) bool { return true },
+		notifier:                &notify.Notifier{},
+		pidAliveFn:              func(pid int) bool { return false },
+		tmuxSessionExistsFn:     func(name string) bool { return false },
+		listOpenPRsFn:           func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:         func(logFile string) bool { return true },
+		rateLimitResetFromLogFn: mockRateLimitReset,
 		getIssueFn: func(number int) (github.Issue, error) {
 			return github.Issue{Number: number, Title: "ciStatusFromREST returns pending forever"}, nil
 		},
@@ -722,11 +735,12 @@ func TestReconcileRunningSessions_RateLimitedDeadWorker_FallbackRespawnFails_Mar
 				},
 			},
 		},
-		notifier:            &notify.Notifier{},
-		pidAliveFn:          func(pid int) bool { return false },
-		tmuxSessionExistsFn: func(name string) bool { return false },
-		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
-		isRateLimitedFn:     func(logFile string) bool { return true },
+		notifier:                &notify.Notifier{},
+		pidAliveFn:              func(pid int) bool { return false },
+		tmuxSessionExistsFn:     func(name string) bool { return false },
+		listOpenPRsFn:           func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:         func(logFile string) bool { return true },
+		rateLimitResetFromLogFn: mockRateLimitReset,
 		getIssueFn: func(number int) (github.Issue, error) {
 			return github.Issue{Number: number, Title: "ci"}, nil
 		},
@@ -781,11 +795,12 @@ func TestReconcileRunningSessions_RateLimitedDeadWorker_FetchIssueFails_MarksDea
 				},
 			},
 		},
-		notifier:            &notify.Notifier{},
-		pidAliveFn:          func(pid int) bool { return false },
-		tmuxSessionExistsFn: func(name string) bool { return false },
-		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
-		isRateLimitedFn:     func(logFile string) bool { return true },
+		notifier:                &notify.Notifier{},
+		pidAliveFn:              func(pid int) bool { return false },
+		tmuxSessionExistsFn:     func(name string) bool { return false },
+		listOpenPRsFn:           func() ([]github.PR, error) { return []github.PR{}, nil },
+		isRateLimitedFn:         func(logFile string) bool { return true },
+		rateLimitResetFromLogFn: mockRateLimitReset,
 		getIssueFn: func(number int) (github.Issue, error) {
 			return github.Issue{}, fmt.Errorf("gh transient: rate limit")
 		},
@@ -5572,9 +5587,17 @@ func newRateLimitOrchestrator(cfg *config.Config, tmuxOutput string) (*Orchestra
 
 // newFallbackTestOrchestrator creates an Orchestrator wired for testing
 // rate-limit fallback in checkSessions. It records respawned backends.
+//
+// When rateLimited is true the fixture also mocks rateLimitResetFromLogFn to
+// return a non-nil reset time, mirroring a real high-confidence provider
+// usage-limit response. Per #663, the orchestrator only triggers a backend
+// fallback on a high-confidence signal (parseable reset window); a tests that
+// wants to verify low-confidence behavior should leave rateLimitResetFromLogFn
+// nil (or override it) so providerRateLimitFromLog reports no positive signal.
 func newFallbackTestOrchestrator(cfg *config.Config, rateLimited bool) (*Orchestrator, *[]string) {
 	respawnedBackends := make([]string, 0)
-	return &Orchestrator{
+	fixedReset := time.Date(2027, time.January, 1, 12, 0, 0, 0, time.UTC)
+	o := &Orchestrator{
 		cfg:        cfg,
 		notifier:   &notify.Notifier{},
 		router:     router.New(cfg),
@@ -5603,7 +5626,14 @@ func newFallbackTestOrchestrator(cfg *config.Config, rateLimited bool) (*Orchest
 			sess.FinishedAt = nil
 			return nil
 		},
-	}, &respawnedBackends
+	}
+	if rateLimited {
+		o.rateLimitResetFromLogFn = func(string) *time.Time {
+			r := fixedReset
+			return &r
+		}
+	}
+	return o, &respawnedBackends
 }
 
 // ---- Running-worker rate-limit tests (tmux detection, worker alive) ----
@@ -5617,7 +5647,7 @@ func TestCheckSessions_RateLimitDetected_NoFallback_MarksDead(t *testing.T) {
 			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
 		},
 	}
-	o, stopped, _ := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today.")
+	o, stopped, _ := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today. Try again at January 1, 2027 12:00 PM.")
 
 	s := state.NewState()
 	s.Sessions["mae-1"] = &state.Session{
@@ -5664,7 +5694,7 @@ func TestCheckSessions_RateLimitDetected_WithFallback_Respawns(t *testing.T) {
 			},
 		},
 	}
-	o, stopped, respawned := newRateLimitOrchestrator(cfg, "rate limit exceeded â try again later")
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "rate limit exceeded. Try again at January 1, 2027 12:00 PM.")
 
 	s := state.NewState()
 	s.Sessions["mae-2"] = &state.Session{
@@ -5715,7 +5745,7 @@ func TestCheckSessions_RateLimitDetected_DefaultBackendFallback_Respawns(t *test
 			},
 		},
 	}
-	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today.")
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today. Try again at January 1, 2027 12:00 PM.")
 
 	s := state.NewState()
 	s.Sessions["mae-default"] = &state.Session{
@@ -5766,7 +5796,7 @@ func TestCheckSessions_RateLimitDetected_NoAvailableFallback_RecordsSelection(t 
 			},
 		},
 	}
-	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today.")
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error: You've hit your limit for today. Try again at January 1, 2027 12:00 PM.")
 
 	s := state.NewState()
 	s.Sessions["mae-none"] = &state.Session{
@@ -5814,7 +5844,7 @@ func TestCheckSessions_RateLimitDetected_AlreadyOnFallback_MarksDead(t *testing.
 			},
 		},
 	}
-	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error 429: too many requests")
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "Error 429: too many requests. Try again at January 1, 2027 12:00 PM.")
 
 	s := state.NewState()
 	s.Sessions["mae-3"] = &state.Session{
@@ -5938,7 +5968,7 @@ func TestCheckSessions_RateLimit429Pattern_Detected(t *testing.T) {
 			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
 		},
 	}
-	o, stopped, _ := newRateLimitOrchestrator(cfg, "API returned status 429")
+	o, stopped, _ := newRateLimitOrchestrator(cfg, "API returned status 429. Try again at January 1, 2027 12:00 PM.")
 
 	s := state.NewState()
 	s.Sessions["mae-6"] = &state.Session{
@@ -5963,6 +5993,196 @@ func TestCheckSessions_RateLimit429Pattern_Detected(t *testing.T) {
 	}
 	if len(*stopped) != 1 {
 		t.Fatalf("stopped = %v, want 1 entry", *stopped)
+	}
+}
+
+// TestCheckSessions_RateLimit_LowConfidenceNoFallback_LiveWorker is the
+// #663 regression guard for the live tmux path: when the classifier matches a
+// rate-limit pattern in worker output but no provider-stated reset window is
+// present, the orchestrator must NOT kill the worker and MUST NOT switch
+// backends. The apertune session apt-2 hit a codex tools-router
+// `write_stdin failed: stdin is closed` error and recovered to open a PR;
+// any classifier match without a reset hint is treated the same way — a
+// pass-through, low-confidence signal that the worker is left to resolve.
+func TestCheckSessions_RateLimit_LowConfidenceNoFallback_LiveWorker(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:          "codex",
+			FallbackBackends: []string{"claude"},
+			Backends: map[string]config.BackendDef{
+				"codex":  {Cmd: "codex"},
+				"claude": {Cmd: "claude"},
+			},
+		},
+	}
+	// "rate limit exceeded" matches the classifier but carries no parseable
+	// reset — the orchestrator must treat this as low-confidence (per #663).
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, "transient: rate limit exceeded once, retrying")
+
+	s := state.NewState()
+	s.Sessions["mae-663-live"] = &state.Session{
+		IssueNumber: 663,
+		IssueTitle:  "issue under test",
+		Status:      state.StatusRunning,
+		PID:         42421,
+		TmuxSession: "maestro-mae-663-live",
+		Branch:      "feat/mae-663-live",
+		Backend:     "codex",
+		StartedAt:   time.Now().Add(-2 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-663-live"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q — low-confidence signal must not kill a live worker (#663)", sess.Status, state.StatusRunning)
+	}
+	if sess.RateLimitHit {
+		t.Fatal("rate_limit_hit must remain false on low-confidence signal (#663)")
+	}
+	if sess.Backend != "codex" {
+		t.Fatalf("backend = %q, want %q — must not switch backends on low-confidence signal", sess.Backend, "codex")
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty — must not stop the worker on low-confidence signal", *stopped)
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want empty — must not respawn on low-confidence signal", *respawned)
+	}
+}
+
+// TestCheckSessions_RateLimit_CodexWriteStdinError_NotClassified is the
+// direct #663 regression: a codex tools-router `write_stdin failed: stdin is
+// closed` error, in the exact shape that wedged apertune apt-2, MUST be
+// passed through as ordinary worker output — no kill, no provider-limit
+// record, no fallback selection.
+func TestCheckSessions_RateLimit_CodexWriteStdinError_NotClassified(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRuntimeMinutes: 999,
+		Model: config.ModelConfig{
+			Default:          "codex",
+			FallbackBackends: []string{"claude"},
+			Backends: map[string]config.BackendDef{
+				"codex":  {Cmd: "codex"},
+				"claude": {Cmd: "claude"},
+			},
+		},
+	}
+	tmuxOutput := "2026-06-04T19:41:32Z ERROR codex_core::tools::router: error=write_stdin failed: stdin is closed\nfor this session; rerun exec_command with tty=true to keep stdin open\nworker continued and opened PR.\n"
+	o, stopped, respawned := newRateLimitOrchestrator(cfg, tmuxOutput)
+
+	s := state.NewState()
+	s.Sessions["mae-663-wstdin"] = &state.Session{
+		IssueNumber: 663,
+		IssueTitle:  "apertune apt-2 repro",
+		Status:      state.StatusRunning,
+		PID:         42422,
+		TmuxSession: "maestro-mae-663-wstdin",
+		Branch:      "feat/mae-663-wstdin",
+		Backend:     "codex",
+		StartedAt:   time.Now().Add(-2 * time.Minute),
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["mae-663-wstdin"]
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want %q — codex write_stdin error must not be classified as rate-limit (#663)", sess.Status, state.StatusRunning)
+	}
+	if sess.RateLimitHit {
+		t.Fatal("rate_limit_hit must remain false for write_stdin error (#663)")
+	}
+	if sess.ProviderLimitBackend != "" {
+		t.Fatalf("provider_limit_backend = %q, want empty — must not record provider limit (#663)", sess.ProviderLimitBackend)
+	}
+	if sess.BackendSelection != nil {
+		t.Fatalf("backend_selection = %+v, want nil — must not run fallback selector (#663)", sess.BackendSelection)
+	}
+	if len(*stopped) != 0 {
+		t.Fatalf("stopped = %v, want empty (#663)", *stopped)
+	}
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want empty (#663)", *respawned)
+	}
+}
+
+// TestReconcileRunningSessions_RateLimit_LowConfidenceNoFallback is the #663
+// regression guard for the reconcile path: when the dead worker's log shows a
+// rate-limit pattern WITHOUT a parseable reset window, the orchestrator must
+// fall through to the ordinary running->dead handling instead of triggering a
+// backend fallback. The reconcile log line `rate-limited on backend=...
+// reset=unknown — respawned with backend=...` that wedged apertune MUST NOT
+// be emitted in this case.
+func TestReconcileRunningSessions_RateLimit_LowConfidenceNoFallback(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["sup-663"] = &state.Session{
+		IssueNumber: 663,
+		IssueTitle:  "apertune apt-2 repro",
+		Status:      state.StatusRunning,
+		PID:         42423,
+		TmuxSession: "maestro-sup-663",
+		Branch:      "feat/sup-663-663-apertune-repro",
+		Backend:     "codex",
+		StartedAt:   time.Now().Add(-2 * time.Minute),
+		LogFile:     "/tmp/sup-663-rl.log",
+	}
+
+	respawnAttempts := []string{}
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo: "owner/repo",
+			Model: config.ModelConfig{
+				Default:          "codex",
+				FallbackBackends: []string{"claude"},
+				Backends: map[string]config.BackendDef{
+					"codex":  {Cmd: "codex"},
+					"claude": {Cmd: "claude"},
+				},
+			},
+		},
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		// Classifier reports a hit (e.g. stale prompt context echoed "rate limit")...
+		isRateLimitedFn: func(logFile string) bool { return true },
+		// ...but the log carries no parseable reset hint — low confidence.
+		rateLimitResetFromLogFn: func(string) *time.Time { return nil },
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "apertune apt-2 repro"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnAttempts = append(respawnAttempts, backendName)
+			return nil
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to mark dead worker dead")
+	}
+
+	sess := s.Sessions["sup-663"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (ordinary dead path)", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus == "rate_limit" {
+		t.Fatal("last_notified_status must NOT be 'rate_limit' on low-confidence detection (#663)")
+	}
+	if sess.RateLimitHit {
+		t.Fatal("rate_limit_hit must remain false on low-confidence detection (#663)")
+	}
+	if sess.ProviderLimitBackend != "" {
+		t.Fatalf("provider_limit_backend = %q, want empty (#663)", sess.ProviderLimitBackend)
+	}
+	if len(respawnAttempts) != 0 {
+		t.Fatalf("respawnWorkerFn called %v, want no fallback respawn on low-confidence signal (#663)", respawnAttempts)
+	}
+	if _, recorded := s.BackendHealth["codex"]; recorded {
+		t.Fatal("BackendHealth[codex] must not be recorded on low-confidence signal (#663)")
 	}
 }
 
