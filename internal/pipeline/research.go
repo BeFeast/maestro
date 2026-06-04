@@ -20,6 +20,19 @@ const researchDir = ".maestro/research"
 
 var goplsBinary = "gopls"
 
+var goplsAggregateTimeout = 20 * time.Second
+
+var (
+	markdownCodeBlockRe      = regexp.MustCompile("```[\\s\\S]*?```")
+	markdownInlineCodeRe     = regexp.MustCompile("`[^`]+`")
+	markdownURLRe            = regexp.MustCompile(`https?://\S+`)
+	markdownFormattingRe     = regexp.MustCompile(`[#*_\[\]()>~]`)
+	goCodeSpanSymbolRe       = regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_]*)`")
+	goIdentifierRe           = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\b`)
+	goSymbolCandidateShapeRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	goplsSpanRe              = regexp.MustCompile(`^(.+):([0-9]+):([0-9]+)`)
+)
+
 // runResearch performs the pre-coding research phase.
 // It scans the codebase for files relevant to the issue keywords and writes
 // a context file to .maestro/research/<issue-number>.md.
@@ -131,10 +144,10 @@ func extractKeywords(title, body string) []string {
 	text := title + " " + body
 
 	// Remove markdown formatting, URLs, code blocks
-	text = regexp.MustCompile("```[\\s\\S]*?```").ReplaceAllString(text, "")
-	text = regexp.MustCompile("`[^`]+`").ReplaceAllString(text, "")
-	text = regexp.MustCompile(`https?://\S+`).ReplaceAllString(text, "")
-	text = regexp.MustCompile(`[#*_\[\]()>~]`).ReplaceAllString(text, " ")
+	text = markdownCodeBlockRe.ReplaceAllString(text, "")
+	text = markdownInlineCodeRe.ReplaceAllString(text, "")
+	text = markdownURLRe.ReplaceAllString(text, "")
+	text = markdownFormattingRe.ReplaceAllString(text, " ")
 
 	words := strings.Fields(strings.ToLower(text))
 
@@ -252,8 +265,14 @@ func findSymbolContexts(worktreePath, issueTitle, issueBody string) ([]symbolCon
 		return nil, nil
 	}
 
+	queryCtx, cancel := context.WithTimeout(context.Background(), goplsAggregateTimeout)
+	defer cancel()
+
 	var contexts []symbolContext
 	for _, symbol := range candidates {
+		if queryCtx.Err() != nil {
+			return contexts, nil
+		}
 		path, line, char, ok := findSymbolTokenPosition(worktreePath, goFiles, symbol)
 		if !ok {
 			continue
@@ -265,18 +284,27 @@ func findSymbolContexts(worktreePath, issueTitle, issueBody string) ([]symbolCon
 			LookupCharacter: char,
 		}
 		var err error
-		ctx.Definitions, err = runGoplsLocationQuery(worktreePath, "definition", path, line, char)
+		ctx.Definitions, err = runGoplsLocationQuery(queryCtx, worktreePath, "definition", path, line, char)
 		if err != nil {
 			log.Printf("[pipeline] research: gopls definition failed for %s: %v", symbol, err)
+			if queryCtx.Err() != nil {
+				return contexts, nil
+			}
 			continue
 		}
-		ctx.References, err = runGoplsLocationQuery(worktreePath, "references", path, line, char)
+		ctx.References, err = runGoplsLocationQuery(queryCtx, worktreePath, "references", path, line, char)
 		if err != nil {
 			log.Printf("[pipeline] research: gopls references failed for %s: %v", symbol, err)
+			if queryCtx.Err() != nil {
+				return contexts, nil
+			}
 		}
-		ctx.Implementations, err = runGoplsLocationQuery(worktreePath, "implementation", path, line, char)
+		ctx.Implementations, err = runGoplsLocationQuery(queryCtx, worktreePath, "implementation", path, line, char)
 		if err != nil {
 			log.Printf("[pipeline] research: gopls implementation failed for %s: %v", symbol, err)
+			if queryCtx.Err() != nil {
+				return contexts, nil
+			}
 		}
 		if len(ctx.Definitions)+len(ctx.References)+len(ctx.Implementations) > 0 {
 			contexts = append(contexts, ctx)
@@ -347,13 +375,11 @@ func extractSymbolCandidates(title, body string) []string {
 		candidates = append(candidates, s)
 	}
 
-	codeSpanRe := regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_]*)`")
-	for _, m := range codeSpanRe.FindAllStringSubmatch(title+" "+body, -1) {
+	for _, m := range goCodeSpanSymbolRe.FindAllStringSubmatch(title+" "+body, -1) {
 		add(m[1])
 	}
 
-	identRe := regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\b`)
-	for _, m := range identRe.FindAllString(title+" "+body, -1) {
+	for _, m := range goIdentifierRe.FindAllString(title+" "+body, -1) {
 		if hasGoIdentifierShape(m) {
 			add(m)
 		}
@@ -380,7 +406,7 @@ func isUsefulGoSymbolCandidate(s string) bool {
 	if goKeywords[lower] {
 		return false
 	}
-	return regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(s)
+	return goSymbolCandidateShapeRe.MatchString(s)
 }
 
 func hasGoIdentifierShape(s string) bool {
@@ -426,23 +452,46 @@ func listGoSourceFiles(worktreePath string) []string {
 }
 
 func findSymbolTokenPosition(worktreePath string, files []string, symbol string) (string, int, int, bool) {
-	tokenRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(symbol) + `\b`)
 	for _, rel := range files {
 		data, err := os.ReadFile(filepath.Join(worktreePath, rel))
 		if err != nil {
 			continue
 		}
 		for lineIndex, line := range strings.Split(string(data), "\n") {
-			if loc := tokenRe.FindStringIndex(line); loc != nil {
-				return rel, lineIndex + 1, loc[0] + 1, true
+			if loc := findIdentifierTokenIndex(line, symbol); loc >= 0 {
+				return rel, lineIndex + 1, loc + 1, true
 			}
 		}
 	}
 	return "", 0, 0, false
 }
 
-func runGoplsLocationQuery(worktreePath, verb, relPath string, line, char int) ([]symbolLocation, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func findIdentifierTokenIndex(line, symbol string) int {
+	for offset := 0; offset < len(line); {
+		idx := strings.Index(line[offset:], symbol)
+		if idx < 0 {
+			return -1
+		}
+		idx += offset
+		end := idx + len(symbol)
+		if isIdentifierBoundary(line, idx-1) && isIdentifierBoundary(line, end) {
+			return idx
+		}
+		offset = end
+	}
+	return -1
+}
+
+func isIdentifierBoundary(s string, idx int) bool {
+	if idx < 0 || idx >= len(s) {
+		return true
+	}
+	c := s[idx]
+	return !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')
+}
+
+func runGoplsLocationQuery(parentCtx context.Context, worktreePath, verb, relPath string, line, char int) ([]symbolLocation, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
 	defer cancel()
 
 	pos := fmt.Sprintf("%s:%d:%d", filepath.Join(worktreePath, relPath), line, char)
@@ -545,7 +594,7 @@ func uriToPath(uri string) string {
 }
 
 func parseGoplsSpan(worktreePath, span string) (symbolLocation, bool) {
-	match := regexp.MustCompile(`^(.+):([0-9]+):([0-9]+)`).FindStringSubmatch(span)
+	match := goplsSpanRe.FindStringSubmatch(span)
 	if match == nil {
 		return symbolLocation{}, false
 	}
