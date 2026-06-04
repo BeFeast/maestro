@@ -4,9 +4,11 @@ package approver
 // verbs the executor knows how to handle. The supervisor and any other
 // approval-mint surface MUST consult this registry before persisting a
 // pending approval; minting a verb the executor does not implement leads
-// to the silent execution_failed loop seen on dogfood 2026-05-30
-// (spawn_repair_worker piled up 4 execution_failed records before an
-// operator noticed).
+// to the silent execution_failed loop seen on dogfood 2026-05-30 (an
+// earlier shape of `spawn_repair_worker` piled up 4 execution_failed
+// records before an operator noticed; #662 then resurfaced the issue on
+// cautious projects where the verb was still emitted but the executor
+// had no case — fix lands `spawn_repair_worker` as awaiting_dispatch).
 //
 // Adding a new approval-required verb is a TWO-step deliberate change:
 //   1. Add a case in executor.go::Execute() switch.
@@ -34,9 +36,18 @@ var KnownApprovalActions = map[string]struct{}{
 	// #565: auto review-repair respawn. Executor returns awaiting_dispatch
 	// — the orchestrator's dispatcher spawns a scoped opus repair worker
 	// keyed on (pr_number, head_sha) so the same head is never
-	// re-attempted. Replaces the refused `spawn_repair_worker` verb for
-	// the green+retry_exhausted+P0/P1-on-head case.
+	// re-attempted. Covers the green+retry_exhausted+P0/P1-on-head case;
+	// orthogonal to `spawn_repair_worker` below, which covers the
+	// not-progressing / retry-exhausted-without-PR cases.
 	"spawn_review_repair": {},
+	// #662: classic repair worker. Executor returns awaiting_dispatch —
+	// the orchestrator's dispatcher loop owns the actual respawn (see
+	// supervisorSelectedRepairSpawn in internal/orchestrator). Before
+	// #662 the supervisor emitted this verb deterministically (open PR
+	// not progressing, retry-exhausted with no usable PR) but the
+	// executor had no case, so cautious projects refused to mint the
+	// approval every cycle and the issue stalled silently.
+	"spawn_repair_worker": {},
 	// #567: per-session worker-control verbs surfaced by the fleet
 	// Mission Control snapshot. Executor calls into the WorkerController
 	// to kill the tmux session + (for restart) flag the slot for the
