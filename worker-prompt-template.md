@@ -91,6 +91,7 @@ When rebasing conflicts in these files: **keep BOTH sides**. Your additions + wh
 
 ### 7. Done means done
 Once you've opened a PR:
+- Preserve any `Maestro-Backend:` attribution trailer Maestro adds to commit messages or PR bodies.
 - Verify CI started with REST only:
   `sha=$(gh api repos/OWNER/REPO/pulls/PR_NUMBER --jq .head.sha) && gh api repos/OWNER/REPO/commits/$sha/check-runs --jq '.check_runs[] | {name,status,conclusion}'`
 - Write a brief summary of what you did

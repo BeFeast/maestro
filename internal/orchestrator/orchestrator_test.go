@@ -277,6 +277,8 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_CapturesTokensFromPersist
 
 func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing.T) {
 	s := state.NewState()
+	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(12 * time.Minute)
 	s.Sessions["mae-8"] = &state.Session{
 		IssueNumber: 108,
 		IssueTitle:  "add branch rescue",
@@ -284,9 +286,30 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 		PID:         8080,
 		TmuxSession: "maestro-mae-8",
 		Branch:      "feat/mae-8-108-add-branch-rescue",
+		Worktree:    "/tmp/mae-8",
+		Attribution: []state.BackendAttribution{
+			{
+				Backend:   "codex",
+				Provider:  "openai",
+				Model:     "gpt-5.5",
+				Effort:    "medium",
+				StartedAt: t0,
+				EndedAt:   &t1,
+				EndReason: "fallover",
+			},
+			{
+				Backend:   "claude",
+				Provider:  "anthropic",
+				Model:     "opus-4.8",
+				Effort:    "xhigh",
+				StartedAt: t1,
+			},
+		},
 	}
 
 	var gotTitle, gotBody, gotBase, gotHead string
+	var amendedWorktree, amendedBranch string
+	var amendedAttribution []state.BackendAttribution
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return false },
@@ -297,6 +320,12 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 		createPRFn: func(title, body, base, head string) (int, error) {
 			gotTitle, gotBody, gotBase, gotHead = title, body, base, head
 			return 144, nil
+		},
+		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+			amendedWorktree = worktreePath
+			amendedBranch = branch
+			amendedAttribution = append([]state.BackendAttribution(nil), attribution...)
+			return nil
 		},
 	}
 
@@ -333,8 +362,78 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	if !strings.Contains(gotBody, "Refs #108") || strings.Contains(gotBody, "Closes #108") || !strings.Contains(gotBody, "auto-created") {
 		t.Fatalf("unexpected body %q", gotBody)
 	}
+	if !strings.Contains(gotBody, "Maestro-Backend: codex openai gpt-5.5 medium") ||
+		!strings.Contains(gotBody, "; claude anthropic opus-4.8 xhigh") ||
+		!strings.Contains(gotBody, "fallover") {
+		t.Fatalf("body missing attribution trailer: %q", gotBody)
+	}
+	if amendedWorktree != "/tmp/mae-8" || amendedBranch != "feat/mae-8-108-add-branch-rescue" {
+		t.Fatalf("amend target = %q/%q", amendedWorktree, amendedBranch)
+	}
+	if len(amendedAttribution) != 2 {
+		t.Fatalf("amended attribution len = %d, want 2", len(amendedAttribution))
+	}
 	if !s.IssueInProgress(108) {
 		t.Fatal("IssueInProgress(108) must remain true after auto-created PR")
+	}
+}
+
+func TestReconcileRunningSessions_OpenPR_AppendsAttributionTrailer(t *testing.T) {
+	s := state.NewState()
+	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	s.Sessions["mae-9"] = &state.Session{
+		IssueNumber: 109,
+		IssueTitle:  "existing pr",
+		Status:      state.StatusRunning,
+		PID:         9090,
+		TmuxSession: "maestro-mae-9",
+		Branch:      "feat/mae-9-109-existing-pr",
+		Worktree:    "/tmp/mae-9",
+		Attribution: []state.BackendAttribution{{
+			Backend:   "codex",
+			Provider:  "openai",
+			Model:     "gpt-5.5",
+			Effort:    "medium",
+			StartedAt: t0,
+		}},
+	}
+
+	var updatedPR int
+	var updatedBody string
+	var amended bool
+	o := &Orchestrator{
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{
+				Number:      145,
+				HeadRefName: "feat/mae-9-109-existing-pr",
+				Body:        "Refs #109\n",
+			}}, nil
+		},
+		updatePRBodyFn: func(prNumber int, body string) error {
+			updatedPR = prNumber
+			updatedBody = body
+			return nil
+		},
+		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+			amended = true
+			return nil
+		},
+	}
+
+	changed := o.reconcileRunningSessions(s)
+	if !changed {
+		t.Fatal("expected reconciliation to report changes")
+	}
+	if updatedPR != 145 {
+		t.Fatalf("updated PR = %d, want 145", updatedPR)
+	}
+	if !strings.Contains(updatedBody, "Maestro-Backend: codex openai gpt-5.5 medium") {
+		t.Fatalf("updated body missing attribution trailer: %q", updatedBody)
+	}
+	if !amended {
+		t.Fatal("expected branch head amend hook")
 	}
 }
 
