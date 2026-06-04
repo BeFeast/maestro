@@ -11,14 +11,22 @@ import (
 // errors in AI CLI output. Each entry pairs a human-readable label with
 // its regex.
 //
+// Patterns are intentionally high-precision: they must NOT match transient
+// tool/exec errors (e.g. codex `write_stdin failed: stdin is closed`) or
+// stray digit sequences like "429" embedded in unrelated text — that
+// misclassification triggered a false backend fallback on apertune (issue
+// #663), where the orchestrator respawned a healthy codex worker on a more
+// expensive backend chasing a phantom quota block.
+//
 // Supported patterns (case-insensitive):
-//   - "You've hit your limit" (Claude web / API)
-//   - "You've hit your usage limit" (Codex / OpenAI) — the inserted "usage"
-//     word is matched by the optional "(usage )?" group, so both Claude and
-//     Codex signatures hit the same label
+//   - "You've hit your (usage )?limit" (Claude / Codex provider phrasing)
 //   - "chatgpt.com/codex/settings/usage" marker (Codex usage-limit URL)
-//   - HTTP 429 status codes
-//   - "rate limit exceeded" (generic)
+//   - HTTP 429 paired with a status/code/error context word — bare 429
+//     embedded in unrelated text is NOT matched
+//   - "<NNN> too many requests" (HTTP reason phrase)
+//   - "rate limit exceeded|reached|hit" / "rate_limit_error|exceeded" — the
+//     bare phrase "rate limit" alone is NOT matched (too noisy: appears in
+//     prompt context, runbook docs, etc.)
 //   - "quota exceeded" (Google / generic)
 //   - "too many requests" (HTTP 429 reason)
 //   - "resource_exhausted" (gRPC status)
@@ -28,28 +36,15 @@ var rateLimitPatterns = []struct {
 }{
 	{"hit_limit", regexp.MustCompile(`(?i)you'?ve hit your (usage )?limit`)},
 	{"codex_usage_limit", regexp.MustCompile(`(?i)(chatgpt\.com/)?codex/settings/usage`)},
-	{"http_429", regexp.MustCompile(`\b429\b`)},
-	{"rate_limit_exceeded", regexp.MustCompile(`(?i)rate.limit.exceeded`)},
-	{"quota_exceeded", regexp.MustCompile(`(?i)quota.exceeded`)},
-	{"too_many_requests", regexp.MustCompile(`(?i)too many requests`)},
+	// HTTP 429 with a rate-limit context word. Requires the literal 429 to
+	// appear next to an HTTP / status / code / error / response marker so
+	// "1.0.429" or "processed 14290 records" do not false-positive.
+	{"http_429", regexp.MustCompile(`(?i)\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*429\b`)},
+	{"http_429_reason", regexp.MustCompile(`(?i)\b429\b[ \t:,-]*too[ \t]+many[ \t]+requests`)},
+	{"rate_limit_exceeded", regexp.MustCompile(`(?i)rate[ _.-]?limit[ _.-]?(?:exceeded|reached|hit|error)`)},
+	{"quota_exceeded", regexp.MustCompile(`(?i)quota[ _.-]?exceeded`)},
+	{"too_many_requests", regexp.MustCompile(`(?i)too\s+many\s+requests`)},
 	{"resource_exhausted", regexp.MustCompile(`(?i)resource[_.\s]?exhausted`)},
-}
-
-// rateLimitSubstrings is a flat list of case-insensitive substrings used for
-// quick log-file scanning (OutputContainsRateLimit / IsRateLimited).
-var rateLimitSubstrings = []string{
-	"you've hit your limit",
-	"you have hit your limit",
-	"you've hit your usage limit",
-	"you have hit your usage limit",
-	"chatgpt.com/codex/settings/usage",
-	"codex/settings/usage",
-	"rate limit",
-	"rate_limit",
-	"too many requests",
-	"quota exceeded",
-	"resource_exhausted",
-	"429",
 }
 
 // rateLimitResetRe extracts the human-readable reset hint emitted after a
@@ -98,17 +93,13 @@ func DetectRateLimit(output string) (bool, string) {
 	return false, ""
 }
 
-// OutputContainsRateLimit checks if the given output text contains
-// any known rate-limit error patterns (case-insensitive).
-// Used for post-mortem detection from log files (dead workers).
+// OutputContainsRateLimit checks if the given output text contains any known
+// rate-limit error patterns (case-insensitive). It uses the same regex set as
+// DetectRateLimit so live and post-mortem detection share one source of truth
+// and neither false-positives on transient tool/exec errors.
 func OutputContainsRateLimit(output string) bool {
-	lower := strings.ToLower(output)
-	for _, pattern := range rateLimitSubstrings {
-		if strings.Contains(lower, pattern) {
-			return true
-		}
-	}
-	return false
+	hit, _ := DetectRateLimit(output)
+	return hit
 }
 
 // IsRateLimited checks if a log file contains rate-limit error messages.
@@ -123,6 +114,30 @@ func IsRateLimited(logFile string) bool {
 		return false
 	}
 	return OutputContainsRateLimit(string(data))
+}
+
+// ClassifyRateLimit inspects output for a rate-limit signal and reports both
+// the match and its confidence. confidence is "high" when the output carries a
+// parseable provider-stated reset window (e.g. the codex "try again at
+// <when>" suffix), and "low" otherwise.
+//
+// Callers that switch backends on a rate-limit signal MUST require confidence
+// == "high". A low-confidence detection is too easy to false-positive — a
+// pattern match without a reset hint is often a stale prompt-context echo, a
+// transient tool/exec error, or a codex tools-router error that looks superficially
+// like a quota message — and switching backends on it burns the more-expensive
+// fallback for no reason, masks the real worker error in operator signal, and
+// can wedge the session in a respawn loop when no fallback is configured.
+// See issue #663.
+func ClassifyRateLimit(output string) (hit bool, label string, confidence string, resetAt time.Time) {
+	hit, label = DetectRateLimit(output)
+	if !hit {
+		return false, "", "", time.Time{}
+	}
+	if reset, ok := ParseRateLimitReset(output); ok {
+		return true, label, "high", reset
+	}
+	return true, label, "low", time.Time{}
 }
 
 // ParseRateLimitReset extracts the provider-stated reset time from output that
