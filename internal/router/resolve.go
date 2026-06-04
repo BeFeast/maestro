@@ -15,6 +15,14 @@ const (
 	RoleValidator   = "validator"
 )
 
+// BackendDecision is the resolved backend plus visibility metadata that callers
+// persist on sessions.
+type BackendDecision struct {
+	Backend  string
+	Reason   string
+	TaskType string
+}
+
 // Selection reason canonical values written to Session.BackendSelection.SelectionReason
 // when the orchestrator records why a backend was chosen for an issue.
 const (
@@ -60,43 +68,69 @@ func ValidateBackend(name string, cfg *config.Config) (string, bool) {
 // reason is ReasonRouterError instead of ReasonDefault so operators can tell
 // auto-routing failed silently rather than not being configured at all (#427).
 func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string) {
+	decision := r.ResolveBackendDecision(issue)
+	return decision.Backend, decision.Reason
+}
+
+// ResolveBackendDecision determines the backend for an issue and includes the
+// structured task type when routing.mode=auto produced one.
+func (r *Router) ResolveBackendDecision(issue github.Issue) BackendDecision {
 	// 1. Check for model: label (highest priority)
 	if name := BackendFromLabels(issue); name != "" {
 		validated, ok := ValidateBackend(name, r.cfg)
 		if !ok {
 			log.Printf("[router] issue #%d: label specifies unknown backend %q, falling back to default %q",
 				issue.Number, name, r.cfg.Model.Default)
-			return validated, ReasonUnknownPin
+			return BackendDecision{Backend: validated, Reason: ReasonUnknownPin}
 		}
 		log.Printf("[router] issue #%d → %s (label override)", issue.Number, validated)
-		return validated, ReasonLabel
+		return BackendDecision{Backend: validated, Reason: ReasonLabel}
 	}
 
 	// 2. Auto-routing via LLM (if enabled)
 	if r.cfg.Routing.Mode == "auto" {
-		routeFn := r.Route
-		if r.RouteFn != nil {
-			routeFn = r.RouteFn
+		routeDecisionFn := r.RouteDecision
+		if r.DecisionFn != nil {
+			routeDecisionFn = r.DecisionFn
+		} else if r.RouteFn != nil {
+			routeDecisionFn = func(issue github.Issue) (Decision, error) {
+				backend, reason, err := r.RouteFn(issue)
+				return Decision{Backend: backend, Reason: reason}, err
+			}
 		}
-		routedBackend, routeReason, err := routeFn(issue)
+		routeDecision, err := routeDecisionFn(issue)
 		if err != nil {
 			log.Printf("[router] issue #%d: auto-routing failed (%v) — using default %q with reason=%s",
 				issue.Number, err, r.cfg.Model.Default, ReasonRouterError)
-			return r.cfg.Model.Default, ReasonRouterError
+			return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonRouterError, TaskType: routeDecision.TaskType}
 		}
-		if routedBackend != "" {
-			log.Printf("[router] issue #%d → %s (auto: %s)", issue.Number, routedBackend, routeReason)
-			return routedBackend, ReasonAuto
+		taskType := normalizeTaskType(routeDecision.TaskType)
+		if taskType != "" {
+			if mappedBackend := strings.TrimSpace(r.cfg.Routing.TaskTypeBackends[taskType]); mappedBackend != "" {
+				validated, ok := ValidateBackend(mappedBackend, r.cfg)
+				if !ok {
+					log.Printf("[router] issue #%d: task_type=%s maps to unknown backend %q — using default %q with reason=%s",
+						issue.Number, taskType, mappedBackend, r.cfg.Model.Default, ReasonRouterError)
+					return BackendDecision{Backend: validated, Reason: ReasonRouterError, TaskType: taskType}
+				}
+				log.Printf("[router] issue #%d → %s (auto task_type=%s mapped from router backend=%s: %s)",
+					issue.Number, validated, taskType, routeDecision.Backend, routeDecision.Reason)
+				return BackendDecision{Backend: validated, Reason: ReasonAuto, TaskType: taskType}
+			}
+		}
+		if routeDecision.Backend != "" {
+			log.Printf("[router] issue #%d → %s (auto task_type=%s: %s)", issue.Number, routeDecision.Backend, taskType, routeDecision.Reason)
+			return BackendDecision{Backend: routeDecision.Backend, Reason: ReasonAuto, TaskType: taskType}
 		}
 		// Auto-routing returned empty without an error — treat as router_error too
 		// so the dashboard can distinguish silent fallback from manual mode.
 		log.Printf("[router] issue #%d: auto-routing returned empty backend — using default %q with reason=%s",
 			issue.Number, r.cfg.Model.Default, ReasonRouterError)
-		return r.cfg.Model.Default, ReasonRouterError
+		return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonRouterError, TaskType: taskType}
 	}
 
 	// 3. Default backend
-	return r.cfg.Model.Default, ReasonDefault
+	return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonDefault}
 }
 
 // roleBackend returns the configured backend name for a given role, or empty string if not set.

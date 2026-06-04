@@ -11,18 +11,37 @@ import (
 	"github.com/befeast/maestro/internal/github"
 )
 
-const defaultRouterPrompt = `Given this GitHub issue, choose the best AI coding backend.
+const defaultRouterPrompt = `Given this GitHub issue, choose the best AI coding backend and classify the task type.
 Available backends: {{BACKENDS}}
+Task types: refactor, bugfix, test, vision, design, docs, infra
 
 Issue: #{{NUMBER}} — {{TITLE}}
 {{BODY}}
 
-Return JSON only: {"backend": "<name>", "reason": "<one sentence>"}`
+Return JSON only: {"backend": "<name>", "task_type": "<task type>", "reason": "<one sentence>"}`
+
+const (
+	TaskTypeRefactor = "refactor"
+	TaskTypeBugfix   = "bugfix"
+	TaskTypeTest     = "test"
+	TaskTypeVision   = "vision"
+	TaskTypeDesign   = "design"
+	TaskTypeDocs     = "docs"
+	TaskTypeInfra    = "infra"
+)
 
 // routerResponse is the expected JSON response from the router model.
 type routerResponse struct {
-	Backend string `json:"backend"`
-	Reason  string `json:"reason"`
+	Backend  string `json:"backend"`
+	TaskType string `json:"task_type"`
+	Reason   string `json:"reason"`
+}
+
+// Decision is the structured router result used by auto-routing.
+type Decision struct {
+	Backend  string
+	TaskType string
+	Reason   string
 }
 
 // Router selects the best backend for a given issue using an LLM call.
@@ -31,6 +50,10 @@ type Router struct {
 
 	// RouteFn overrides the default Route method (used in tests).
 	RouteFn func(issue github.Issue) (string, string, error)
+
+	// DecisionFn overrides the default RouteDecision method (used in tests
+	// that need task_type-aware routing).
+	DecisionFn func(issue github.Issue) (Decision, error)
 }
 
 // New creates a new Router.
@@ -44,18 +67,25 @@ func New(cfg *config.Config) *Router {
 // default backend and a non-nil error so callers can distinguish a real
 // auto-routed pick from a silent fallback (#427).
 func (r *Router) Route(issue github.Issue) (backendName string, reason string, err error) {
+	decision, err := r.RouteDecision(issue)
+	return decision.Backend, decision.Reason, err
+}
+
+// RouteDecision calls the router model and returns the structured backend
+// decision including the task taxonomy classification.
+func (r *Router) RouteDecision(issue github.Issue) (Decision, error) {
 	prompt := r.buildPrompt(issue)
 
 	output, err := r.callModel(prompt)
 	if err != nil {
 		log.Printf("[router] model call failed: %v — falling back to default", err)
-		return r.cfg.Model.Default, "router error", err
+		return Decision{Backend: r.cfg.Model.Default, Reason: "router error"}, err
 	}
 
 	resp, err := parseResponse(output)
 	if err != nil {
 		log.Printf("[router] parse response failed: %v — falling back to default", err)
-		return r.cfg.Model.Default, "parse error", err
+		return Decision{Backend: r.cfg.Model.Default, Reason: "parse error"}, err
 	}
 
 	// Validate that the chosen backend exists in config. Return an error so
@@ -63,10 +93,10 @@ func (r *Router) Route(issue github.Issue) (backendName string, reason string, e
 	// silently presenting the default backend as if it was task-routed (#427).
 	if _, ok := r.cfg.Model.Backends[resp.Backend]; !ok {
 		log.Printf("[router] unknown backend %q — falling back to default", resp.Backend)
-		return r.cfg.Model.Default, fmt.Sprintf("unknown backend %q", resp.Backend), fmt.Errorf("router picked unknown backend %q", resp.Backend)
+		return Decision{Backend: r.cfg.Model.Default, TaskType: resp.TaskType, Reason: fmt.Sprintf("unknown backend %q", resp.Backend)}, fmt.Errorf("router picked unknown backend %q", resp.Backend)
 	}
 
-	return resp.Backend, resp.Reason, nil
+	return Decision{Backend: resp.Backend, TaskType: resp.TaskType, Reason: resp.Reason}, nil
 }
 
 // buildPrompt constructs the router prompt from the template and issue data.
@@ -143,10 +173,8 @@ func hasModelArg(args []string) bool {
 // parseResponse extracts a JSON object from the model output.
 // The model may include extra text around the JSON, so we find and extract it.
 func parseResponse(output string) (routerResponse, error) {
-	var resp routerResponse
-
 	// Try direct unmarshal first
-	if err := json.Unmarshal([]byte(output), &resp); err == nil && resp.Backend != "" {
+	if resp, err := decodeRouterResponse(output); err == nil {
 		return resp, nil
 	}
 
@@ -155,12 +183,46 @@ func parseResponse(output string) (routerResponse, error) {
 	end := strings.LastIndex(output, "}")
 	if start >= 0 && end > start {
 		jsonStr := output[start : end+1]
-		if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil && resp.Backend != "" {
+		if resp, err := decodeRouterResponse(jsonStr); err == nil {
 			return resp, nil
 		}
 	}
 
-	return resp, fmt.Errorf("no valid JSON with backend field in output: %s", truncate(output, 200))
+	return routerResponse{}, fmt.Errorf("no valid JSON with backend field in output: %s", truncate(output, 200))
+}
+
+func normalizeTaskType(taskType string) string {
+	taskType = strings.ToLower(strings.TrimSpace(taskType))
+	if IsTaskType(taskType) {
+		return taskType
+	}
+	return ""
+}
+
+func IsTaskType(taskType string) bool {
+	switch taskType {
+	case TaskTypeRefactor, TaskTypeBugfix, TaskTypeTest, TaskTypeVision, TaskTypeDesign, TaskTypeDocs, TaskTypeInfra:
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeRouterResponse(output string) (routerResponse, error) {
+	var resp routerResponse
+	if err := json.Unmarshal([]byte(output), &resp); err != nil {
+		return resp, err
+	}
+	if strings.TrimSpace(resp.Backend) == "" {
+		return resp, fmt.Errorf("missing backend")
+	}
+	resp.Backend = strings.TrimSpace(resp.Backend)
+	rawTaskType := resp.TaskType
+	resp.TaskType = normalizeTaskType(resp.TaskType)
+	if strings.TrimSpace(rawTaskType) != "" && resp.TaskType == "" {
+		return resp, fmt.Errorf("invalid task_type %q", rawTaskType)
+	}
+	return resp, nil
 }
 
 func truncate(s string, max int) string {

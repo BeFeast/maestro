@@ -8,7 +8,7 @@ import (
 )
 
 func TestParseResponse_ValidJSON(t *testing.T) {
-	resp, err := parseResponse(`{"backend": "codex", "reason": "simple bug fix"}`)
+	resp, err := parseResponse(`{"backend": "codex", "task_type": "bugfix", "reason": "simple bug fix"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -18,11 +18,14 @@ func TestParseResponse_ValidJSON(t *testing.T) {
 	if resp.Reason != "simple bug fix" {
 		t.Errorf("reason = %q, want %q", resp.Reason, "simple bug fix")
 	}
+	if resp.TaskType != TaskTypeBugfix {
+		t.Errorf("task_type = %q, want %q", resp.TaskType, TaskTypeBugfix)
+	}
 }
 
 func TestParseResponse_JSONWithSurroundingText(t *testing.T) {
 	input := `Here is my analysis:
-{"backend": "claude", "reason": "multi-file refactor"}
+{"backend": "claude", "task_type": "refactor", "reason": "multi-file refactor"}
 That's my recommendation.`
 	resp, err := parseResponse(input)
 	if err != nil {
@@ -30,6 +33,16 @@ That's my recommendation.`
 	}
 	if resp.Backend != "claude" {
 		t.Errorf("backend = %q, want %q", resp.Backend, "claude")
+	}
+	if resp.TaskType != TaskTypeRefactor {
+		t.Errorf("task_type = %q, want %q", resp.TaskType, TaskTypeRefactor)
+	}
+}
+
+func TestParseResponse_InvalidTaskType(t *testing.T) {
+	_, err := parseResponse(`{"backend": "codex", "task_type": "feature", "reason": "new feature"}`)
+	if err == nil {
+		t.Error("expected error for invalid task_type")
 	}
 }
 
@@ -82,6 +95,9 @@ func TestBuildPrompt_DefaultTemplate(t *testing.T) {
 	// Should contain both backend names (order may vary)
 	if !contains(prompt, "claude") || !contains(prompt, "codex") {
 		t.Error("prompt should contain backend names")
+	}
+	if !contains(prompt, "task_type") || !contains(prompt, "vision") || !contains(prompt, "design") {
+		t.Error("prompt should request task_type classification with enum values")
 	}
 }
 

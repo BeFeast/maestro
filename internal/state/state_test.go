@@ -60,6 +60,50 @@ func TestNotifiedCIFail_Persistence(t *testing.T) {
 	}
 }
 
+func TestBackendTaskTypePersistence(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{
+		IssueNumber: 42,
+		Status:      StatusRunning,
+		StartedAt:   now,
+		Backend:     "claude",
+		BackendSelection: &BackendSelection{
+			SelectedBackend: "claude",
+			SelectionReason: "auto",
+			TaskType:        "vision",
+		},
+		Attribution: []BackendAttribution{
+			{
+				Backend:   "claude",
+				TaskType:  "vision",
+				StartedAt: now,
+				Reason:    "initial_spawn",
+			},
+		},
+	}
+
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	sess := loaded.Sessions["slot-1"]
+	if sess == nil {
+		t.Fatal("slot-1 not found after load")
+	}
+	if sess.BackendSelection == nil || sess.BackendSelection.TaskType != "vision" {
+		t.Fatalf("BackendSelection = %+v, want task_type vision", sess.BackendSelection)
+	}
+	if len(sess.Attribution) != 1 || sess.Attribution[0].TaskType != "vision" {
+		t.Fatalf("Attribution = %+v, want task_type vision", sess.Attribution)
+	}
+}
+
 func TestDonePRCount(t *testing.T) {
 	s := NewState()
 	s.Sessions["merged-1"] = &Session{IssueNumber: 1, Status: StatusDone, PRNumber: 10}
