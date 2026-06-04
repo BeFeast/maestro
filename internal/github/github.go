@@ -681,6 +681,19 @@ func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 	return n, nil
 }
 
+// UpdatePRBody replaces a pull request body.
+func (c *Client) UpdatePRBody(prNumber int, body string) error {
+	out, err := exec.Command("gh",
+		"pr", "edit", strconv.Itoa(prNumber),
+		"--repo", c.Repo,
+		"--body", body,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr edit %d --body: %w\n%s", prNumber, err, out)
+	}
+	return nil
+}
+
 // IsPRMerged returns true if the PR has been merged.
 func (c *Client) IsPRMerged(prNumber int) (bool, error) {
 	pr, err := c.getRESTPull(prNumber)

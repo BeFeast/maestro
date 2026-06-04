@@ -49,6 +49,8 @@ type Orchestrator struct {
 	listOpenPRsFn         func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
+	updatePRBodyFn        func(prNumber int, body string) error
+	amendHeadFn           func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 	hasMergedPRForIssueFn func(issueNumber int) (bool, error)
 	isPRMergedFn          func(prNumber int) (bool, error)
@@ -186,6 +188,16 @@ func (o *Orchestrator) createPR(title, body, base, head string) (int, error) {
 		return o.createPRFn(title, body, base, head)
 	}
 	return o.gh.CreatePR(title, body, base, head)
+}
+
+func (o *Orchestrator) updatePRBody(prNumber int, body string) error {
+	if o.updatePRBodyFn != nil {
+		return o.updatePRBodyFn(prNumber, body)
+	}
+	if o.gh == nil {
+		return fmt.Errorf("no github client configured for PR body update")
+	}
+	return o.gh.UpdatePRBody(prNumber, body)
 }
 
 func (o *Orchestrator) hasOpenPRForIssue(issueNumber int) (bool, error) {
@@ -1614,6 +1626,8 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// IssueInProgress to return false and startNewWorkers to spawn a duplicate.
 		if pr, found := branchToPR[sess.Branch]; found {
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
+			o.ensureAttributionTrailerOnPR(slotName, sess, pr)
+			o.ensureAttributionTrailerOnBranch(slotName, sess)
 			log.Printf("[orch] reconcile: %s running->pr_open (PR #%d already open for branch %q; %s)",
 				slotName, pr.Number, sess.Branch, strings.Join(reasons, ", "))
 			sess.Status = state.StatusPROpen
@@ -1750,7 +1764,8 @@ func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.S
 	}
 
 	title := autoCreatedPRTitle(sess)
-	body := autoCreatedPRBody(sess, branch, reasons)
+	o.ensureAttributionTrailerOnBranch(slotName, sess)
+	body := state.AppendAttributionTrailer(autoCreatedPRBody(sess, branch, reasons), sess.Attribution, time.Now().UTC())
 	prNumber, err := o.createPR(title, body, "main", branch)
 	if err != nil {
 		log.Printf("[orch] reconcile: could not auto-create PR for %s branch %q: %v", slotName, branch, err)
@@ -1801,6 +1816,73 @@ Observed worker state: %s.
 `, sess.IssueNumber, branch, reasonText)
 }
 
+func (o *Orchestrator) ensureAttributionTrailerOnPR(slotName string, sess *state.Session, pr github.PR) {
+	if sess == nil || len(sess.Attribution) == 0 {
+		return
+	}
+	body := state.AppendAttributionTrailer(pr.Body, sess.Attribution, time.Now().UTC())
+	if body == pr.Body {
+		return
+	}
+	if err := o.updatePRBody(pr.Number, body); err != nil {
+		log.Printf("[orch] attribution: could not update PR #%d body for %s: %v", pr.Number, slotName, err)
+	}
+}
+
+func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *state.Session) {
+	if sess == nil || len(sess.Attribution) == 0 {
+		return
+	}
+	if err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC()); err != nil {
+		log.Printf("[orch] attribution: could not amend branch %q for %s: %v", sess.Branch, slotName, err)
+	}
+}
+
+func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+	if o.amendHeadFn != nil {
+		return o.amendHeadFn(worktreePath, branch, attribution, now)
+	}
+	return amendHeadWithAttributionTrailer(worktreePath, branch, attribution, now)
+}
+
+func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+	worktreePath = strings.TrimSpace(worktreePath)
+	branch = strings.TrimSpace(branch)
+	if worktreePath == "" || branch == "" || len(attribution) == 0 {
+		return nil
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	status, err := exec.Command("git", "-C", worktreePath, "status", "--porcelain").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git status: %w\n%s", err, status)
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		return fmt.Errorf("worktree has uncommitted changes; refusing attribution amend")
+	}
+	out, err := exec.Command("git", "-C", worktreePath, "log", "-1", "--pretty=%B").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git log -1: %w\n%s", err, out)
+	}
+	msg := state.AppendAttributionTrailer(string(out), attribution, now)
+	if msg == string(out) {
+		return nil
+	}
+	cmd := exec.Command("git", "-C", worktreePath, "commit", "--amend", "-F", "-")
+	cmd.Stdin = strings.NewReader(msg)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git commit --amend: %w\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", worktreePath, "push", "--force-with-lease", "origin", branch).CombinedOutput(); err != nil {
+		return fmt.Errorf("git push --force-with-lease origin %s: %w\n%s", branch, err, out)
+	}
+	return nil
+}
+
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
 	// Fetch open PRs once for the whole check cycle
@@ -1832,6 +1914,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						// log, no project sync, no FinishedAt churn.
 						continue
 					}
+					o.ensureAttributionTrailerOnPR(slotName, sess, pr)
+					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] session %s %s->pr_open (PR #%d now open for branch %q)", slotName, sess.Status, pr.Number, sess.Branch)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -1951,6 +2035,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
+					o.ensureAttributionTrailerOnPR(slotName, sess, pr)
+					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -2330,6 +2416,8 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if sess.PRNumber == 0 {
 			sess.PRNumber = pr.Number
 		}
+		o.ensureAttributionTrailerOnPR(slotName, sess, pr)
+		o.ensureAttributionTrailerOnBranch(slotName, sess)
 
 		// Check CI
 		ciStatus, err := o.prCIStatus(pr.Number)
