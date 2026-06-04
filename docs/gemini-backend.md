@@ -97,6 +97,23 @@ issue #42 labels: enhancement, model:gemini  -> runs with Gemini
 issue #43 labels: enhancement                -> runs with default
 ```
 
+When `routing.mode: auto` is enabled, the LLM router also returns a structured
+`task_type` classification: `refactor`, `bugfix`, `test`, `vision`, `design`,
+`docs`, or `infra`. You can map task types to preferred backends before the
+router's free-text backend pick is used:
+
+```yaml
+routing:
+  mode: auto
+  task_type_backends:
+    vision: claude
+    design: claude
+```
+
+Manual routing is unchanged: with `routing.mode: manual`, `task_type_backends`
+is inert and backend selection remains `model:<backend>` labels or
+`model.default`.
+
 ## Test coverage
 
 The Gemini backend has unit tests covering:

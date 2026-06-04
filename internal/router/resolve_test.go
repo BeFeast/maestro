@@ -294,6 +294,101 @@ func TestResolveBackend_AutoRoutingViaRouteFn(t *testing.T) {
 	}
 }
 
+func TestResolveBackend_AutoRoutingTaskTypeMappingWinsBeforeBackendPick(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "codex",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+				"gemini": {Cmd: "gemini"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode: "auto",
+			TaskTypeBackends: map[string]string{
+				TaskTypeVision: "claude",
+			},
+		},
+	}
+	r := New(cfg)
+	r.DecisionFn = func(issue github.Issue) (Decision, error) {
+		return Decision{Backend: "gemini", TaskType: TaskTypeVision, Reason: "image-heavy UI issue"}, nil
+	}
+
+	decision := r.ResolveBackendDecision(makeIssue(658, "Match screenshot"))
+	if decision.Backend != "claude" {
+		t.Fatalf("Backend = %q, want claude from vision task_type mapping", decision.Backend)
+	}
+	if decision.Reason != ReasonAuto {
+		t.Fatalf("Reason = %q, want %q", decision.Reason, ReasonAuto)
+	}
+	if decision.TaskType != TaskTypeVision {
+		t.Fatalf("TaskType = %q, want %q", decision.TaskType, TaskTypeVision)
+	}
+}
+
+func TestResolveBackend_AutoRoutingTaskTypeWithoutMappingUsesBackendPick(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "codex",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+				"gemini": {Cmd: "gemini"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "auto"},
+	}
+	r := New(cfg)
+	r.DecisionFn = func(issue github.Issue) (Decision, error) {
+		return Decision{Backend: "gemini", TaskType: TaskTypeVision, Reason: "image-heavy UI issue"}, nil
+	}
+
+	decision := r.ResolveBackendDecision(makeIssue(659, "Inspect screenshot"))
+	if decision.Backend != "gemini" {
+		t.Fatalf("Backend = %q, want router backend pick gemini", decision.Backend)
+	}
+	if decision.TaskType != TaskTypeVision {
+		t.Fatalf("TaskType = %q, want %q", decision.TaskType, TaskTypeVision)
+	}
+}
+
+func TestResolveBackend_ManualModeIgnoresTaskTypeBackends(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "codex",
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+		Routing: config.RoutingConfig{
+			Mode: "manual",
+			TaskTypeBackends: map[string]string{
+				TaskTypeVision: "claude",
+			},
+		},
+	}
+	r := New(cfg)
+	routerCalled := false
+	r.DecisionFn = func(issue github.Issue) (Decision, error) {
+		routerCalled = true
+		return Decision{Backend: "claude", TaskType: TaskTypeVision, Reason: "vision"}, nil
+	}
+
+	decision := r.ResolveBackendDecision(makeIssue(660, "Screenshot task"))
+	if decision.Backend != "codex" || decision.Reason != ReasonDefault {
+		t.Fatalf("decision = %+v, want codex/default", decision)
+	}
+	if decision.TaskType != "" {
+		t.Fatalf("TaskType = %q, want empty in manual mode", decision.TaskType)
+	}
+	if routerCalled {
+		t.Fatal("manual mode must not call router even when task_type_backends is configured")
+	}
+}
+
 func TestRoute_UsesBackendCommandPrefixArgs(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args.txt")

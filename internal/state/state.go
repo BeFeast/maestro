@@ -83,6 +83,7 @@ type BackendCandidate struct {
 type BackendSelection struct {
 	SelectedBackend string             `json:"selected_backend,omitempty"`
 	SelectionReason string             `json:"selection_reason"`
+	TaskType        string             `json:"task_type,omitempty"`
 	CandidateScores []BackendCandidate `json:"candidate_scores,omitempty"`
 	HardPin         bool               `json:"hard_pin,omitempty"`
 	PreviousBackend string             `json:"previous_backend,omitempty"`
@@ -170,6 +171,7 @@ type BackendAttribution struct {
 	Model     string     `json:"model,omitempty"`      // opus-4.8, gpt-5.5, llama-3.3-70b-versatile, …
 	Variant   string     `json:"variant,omitempty"`    // opus[1m], fast, sonnet, …
 	Effort    string     `json:"effort,omitempty"`     // xhigh, medium, low, …
+	TaskType  string     `json:"task_type,omitempty"`  // router classification: refactor, bugfix, test, vision, design, docs, infra
 	StartedAt time.Time  `json:"started_at"`           // when this segment became active
 	EndedAt   *time.Time `json:"ended_at,omitempty"`   // when the segment was closed; nil if still active
 	EndReason string     `json:"end_reason,omitempty"` // why the segment closed: "completed", "provider_limit", "fallover", "in_place_respawn", "killed"

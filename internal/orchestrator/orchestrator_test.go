@@ -4329,13 +4329,22 @@ func newStartWorkersOrchestrator(cfg *config.Config, issues []github.Issue) (*Or
 		workerStartFn: func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error) {
 			slotCounter++
 			slotName := fmt.Sprintf("slot-%d", slotCounter)
+			startedAt := time.Now().UTC()
 			s.Sessions[slotName] = &state.Session{
 				IssueNumber: issue.Number,
 				IssueTitle:  issue.Title,
 				Status:      state.StatusRunning,
 				PID:         1000 + slotCounter,
 				Branch:      fmt.Sprintf("feat/%s", slotName),
-				StartedAt:   time.Now().UTC(),
+				StartedAt:   startedAt,
+				Backend:     backend,
+				Attribution: []state.BackendAttribution{
+					{
+						Backend:   backend,
+						StartedAt: startedAt,
+						Reason:    "initial_spawn",
+					},
+				},
 			}
 			started = append(started, issue.Number)
 			return slotName, nil
@@ -4450,8 +4459,8 @@ func TestStartNewWorkers_StampsBackendSelectionReason_Auto(t *testing.T) {
 	issues := []github.Issue{makeIssue(429, "Refactor module")}
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
 	o.router = router.New(cfg)
-	o.router.RouteFn = func(issue github.Issue) (string, string, error) {
-		return "codex", "tight loop", nil
+	o.router.DecisionFn = func(issue github.Issue) (router.Decision, error) {
+		return router.Decision{Backend: "codex", TaskType: router.TaskTypeRefactor, Reason: "tight loop"}, nil
 	}
 
 	s := state.NewState()
@@ -4466,6 +4475,12 @@ func TestStartNewWorkers_StampsBackendSelectionReason_Auto(t *testing.T) {
 	}
 	if sess.BackendSelection.SelectionReason != router.ReasonAuto {
 		t.Errorf("BackendSelection.SelectionReason = %q, want %q", sess.BackendSelection.SelectionReason, router.ReasonAuto)
+	}
+	if sess.BackendSelection.TaskType != router.TaskTypeRefactor {
+		t.Errorf("BackendSelection.TaskType = %q, want %q", sess.BackendSelection.TaskType, router.TaskTypeRefactor)
+	}
+	if len(sess.Attribution) != 1 || sess.Attribution[0].TaskType != router.TaskTypeRefactor {
+		t.Fatalf("Attribution = %+v, want task_type %q on first segment", sess.Attribution, router.TaskTypeRefactor)
 	}
 }
 

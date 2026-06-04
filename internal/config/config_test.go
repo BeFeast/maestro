@@ -649,6 +649,58 @@ routing:
 	}
 }
 
+func TestParse_RoutingTaskTypeBackends(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: codex
+  backends:
+    codex:
+      cmd: codex
+    claude:
+      cmd: claude
+routing:
+  mode: auto
+  task_type_backends:
+    Vision: claude
+    design: claude
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.Routing.TaskTypeBackends["vision"]; got != "claude" {
+		t.Fatalf("task_type_backends[vision] = %q, want claude", got)
+	}
+	if got := cfg.Routing.TaskTypeBackends["design"]; got != "claude" {
+		t.Fatalf("task_type_backends[design] = %q, want claude", got)
+	}
+}
+
+func TestParse_RoutingTaskTypeBackendsRejectsUnknownTaskType(t *testing.T) {
+	yaml := `
+repo: owner/repo
+routing:
+  task_type_backends:
+    feature: claude
+`
+	if _, err := parse([]byte(yaml)); err == nil {
+		t.Fatal("expected parse error for unknown task type")
+	}
+}
+
+func TestParse_RoutingTaskTypeBackendsRejectsUnknownBackend(t *testing.T) {
+	yaml := `
+repo: owner/repo
+routing:
+  task_type_backends:
+    vision: ghost
+`
+	if _, err := parse([]byte(yaml)); err == nil {
+		t.Fatal("expected parse error for unknown mapped backend")
+	}
+}
+
 func TestParse_MaxRuntimeMinutesDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))

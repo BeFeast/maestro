@@ -503,10 +503,11 @@ func (s SupervisorConfig) AllowsSafeAction(action string) bool {
 
 // RoutingConfig controls automatic backend selection via LLM router.
 type RoutingConfig struct {
-	Mode            string `yaml:"mode"`              // "auto", "manual" (labels only)
-	RouterModel     string `yaml:"router_model"`      // backend name from model.backends (default: "claude")
-	RouterModelName string `yaml:"router_model_name"` // specific model to use (default: "claude-sonnet-4-6")
-	RouterPrompt    string `yaml:"router_prompt"`     // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
+	Mode             string            `yaml:"mode"`               // "auto", "manual" (labels only)
+	RouterModel      string            `yaml:"router_model"`       // backend name from model.backends (default: "claude")
+	RouterModelName  string            `yaml:"router_model_name"`  // specific model to use (default: "claude-sonnet-4-6")
+	RouterPrompt     string            `yaml:"router_prompt"`      // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
+	TaskTypeBackends map[string]string `yaml:"task_type_backends"` // task_type -> backend override used only when routing.mode=auto
 
 	// Role-specific backend overrides for the planner → implementer → validator pipeline.
 	// Each maps to a backend name from model.backends. If empty, falls back to issue-level routing.
@@ -1047,6 +1048,24 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Routing.RouterModelName == "" {
 		cfg.Routing.RouterModelName = "claude-sonnet-4-6"
 	}
+	if len(cfg.Routing.TaskTypeBackends) > 0 {
+		normalized := make(map[string]string, len(cfg.Routing.TaskTypeBackends))
+		for taskType, backend := range cfg.Routing.TaskTypeBackends {
+			taskType = strings.ToLower(strings.TrimSpace(taskType))
+			backend = strings.TrimSpace(backend)
+			if !validRoutingTaskType(taskType) {
+				return nil, fmt.Errorf("config: routing.task_type_backends has unknown task type %q (valid: refactor, bugfix, test, vision, design, docs, infra)", taskType)
+			}
+			if backend == "" {
+				return nil, fmt.Errorf("config: routing.task_type_backends.%s is empty", taskType)
+			}
+			if _, ok := cfg.Model.Backends[backend]; !ok {
+				return nil, fmt.Errorf("config: routing.task_type_backends.%s = %q is not declared in model.backends", taskType, backend)
+			}
+			normalized[taskType] = backend
+		}
+		cfg.Routing.TaskTypeBackends = normalized
+	}
 
 	// Versioning defaults
 	if cfg.Versioning.DefaultBump == "" {
@@ -1158,6 +1177,15 @@ func (c *Config) EffectiveReviewGateStreams() []string {
 		return nil
 	}
 	return normalizeReviewGateStreams(c.ReviewGate, c.ReviewGateStreams)
+}
+
+func validRoutingTaskType(taskType string) bool {
+	switch taskType {
+	case "refactor", "bugfix", "test", "vision", "design", "docs", "infra":
+		return true
+	default:
+		return false
+	}
 }
 
 // SupervisorPolicyCandidatePaths returns structured policy files that may live

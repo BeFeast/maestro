@@ -1928,10 +1928,21 @@ func spawnCmd(args []string) {
 
 	// Resolve backend via 3-tier priority: label → auto-routing → default
 	r := router.New(cfg)
-	backendName, _ := r.ResolveBackend(*targetIssue)
+	backendDecision := r.ResolveBackendDecision(*targetIssue)
+	backendName := backendDecision.Backend
 	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)
 	if err != nil {
 		log.Fatalf("start worker: %v", err)
+	}
+	if sess := s.Sessions[slotName]; sess != nil {
+		sess.BackendSelection = &state.BackendSelection{
+			SelectedBackend: backendName,
+			SelectionReason: backendDecision.Reason,
+			TaskType:        backendDecision.TaskType,
+		}
+		if backendDecision.TaskType != "" && len(sess.Attribution) > 0 {
+			sess.Attribution[len(sess.Attribution)-1].TaskType = backendDecision.TaskType
+		}
 	}
 
 	if err := state.Save(cfg.StateDir, s); err != nil {

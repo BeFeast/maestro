@@ -1384,7 +1384,7 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		o.markRestartRequired(fmt.Sprintf("model.default changed (%s → %s)", old.Model.Default, newCfg.Model.Default))
 		log.Printf("[orch] config reload: model.default changed (%s → %s) — requires restart (not applied)", old.Model.Default, newCfg.Model.Default)
 	}
-	if newCfg.Routing != old.Routing {
+	if !reflect.DeepEqual(newCfg.Routing, old.Routing) {
 		o.markRestartRequired(fmt.Sprintf("routing.* changed (router_model %s → %s, mode %s → %s)",
 			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode))
 		log.Printf("[orch] config reload: routing.* changed (router_model %s → %s, mode %s → %s) — requires restart (not applied)",
@@ -3582,8 +3582,8 @@ func (o *Orchestrator) findOpenBlockers(blockers []int) []int {
 //  2. Auto-routing via LLM (if routing.mode == "auto")
 //  3. Default backend from config
 func (o *Orchestrator) resolveBackend(issue github.Issue) string {
-	name, _ := o.router.ResolveBackend(issue)
-	return name
+	decision := o.router.ResolveBackendDecision(issue)
+	return decision.Backend
 }
 
 // resolveBackendWithReason is like resolveBackend but also returns the
@@ -3591,7 +3591,12 @@ func (o *Orchestrator) resolveBackend(issue github.Issue) string {
 // on the session for the dashboard. Introduced for #427 to make it visible
 // whether a backend came from a model: label, auto-routing, or default.
 func (o *Orchestrator) resolveBackendWithReason(issue github.Issue) (string, string) {
-	return o.router.ResolveBackend(issue)
+	decision := o.router.ResolveBackendDecision(issue)
+	return decision.Backend, decision.Reason
+}
+
+func (o *Orchestrator) resolveBackendDecision(issue github.Issue) router.BackendDecision {
+	return o.router.ResolveBackendDecision(issue)
 }
 
 // availableSlots calculates how many new workers can be started, considering
@@ -4211,6 +4216,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// session record can show provenance: label, role, auto, default,
 		// router_error, phase, review_repair. (#427)
 		var backendReason string
+		var taskType string
 
 		// #565: when the supervisor selected spawn_review_repair for this
 		// issue, override backend + prompt with the strong backend and
@@ -4238,7 +4244,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			backendReason = "phase"
 		} else {
 			// Normal mode or pipeline starting at implement — use standard resolution
-			backendName, backendReason = o.resolveBackendWithReason(issue)
+			backendDecision := o.resolveBackendDecision(issue)
+			backendName = backendDecision.Backend
+			backendReason = backendDecision.Reason
+			taskType = backendDecision.TaskType
 			promptBase = o.selectPrompt(issue)
 			if initialPhase == state.PhaseImplement {
 				// Pipeline mode but no planner — add pipeline preamble
@@ -4289,6 +4298,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			sess.BackendSelection = &state.BackendSelection{
 				SelectedBackend: backendName,
 				SelectionReason: backendReason,
+				TaskType:        taskType,
+			}
+			if taskType != "" && len(sess.Attribution) > 0 {
+				sess.Attribution[len(sess.Attribution)-1].TaskType = taskType
 			}
 		}
 		if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
