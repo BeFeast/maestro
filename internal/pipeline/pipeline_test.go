@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
@@ -377,6 +378,53 @@ func TestRunResearchFallsBackWhenGoplsUnavailable(t *testing.T) {
 	}
 }
 
+func TestRunResearchFallsBackWithinGoplsAggregateBudget(t *testing.T) {
+	dir := t.TempDir()
+	writeStallingGopls(t, dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	oldGopls := goplsBinary
+	goplsBinary = "gopls"
+	oldBudget := goplsAggregateTimeout
+	goplsAggregateTimeout = 100 * time.Millisecond
+	t.Cleanup(func() {
+		goplsBinary = oldGopls
+		goplsAggregateTimeout = oldBudget
+	})
+
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/research\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "internal", "pipeline"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	researchGo := `package pipeline
+
+func runResearch() string {
+	return "context"
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "internal", "pipeline", "research.go"), []byte(researchGo), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	ctx, err := runResearch(dir, 657, "Add pipeline research", "Research phase for worker pipeline uses `runResearch`.")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("runResearch should keep filename-grep fallback working: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("runResearch exceeded aggregate gopls budget by too much: %s", elapsed)
+	}
+	if !strings.Contains(ctx, "## Relevant Files") {
+		t.Fatalf("expected fallback relevant files context, got:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "## Symbol Context (gopls)") {
+		t.Fatalf("did not expect symbol context after aggregate gopls timeout:\n%s", ctx)
+	}
+}
+
 func writeFakeGopls(t *testing.T, dir string) {
 	t.Helper()
 	script := `#!/bin/sh
@@ -403,6 +451,14 @@ esac
 `
 	path := filepath.Join(dir, "gopls")
 	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeStallingGopls(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "gopls")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 10\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 }
