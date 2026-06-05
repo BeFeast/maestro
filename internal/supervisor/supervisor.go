@@ -261,6 +261,9 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	if err != nil {
 		return state.SupervisorDecision{}, fmt.Errorf("load state: %w", err)
 	}
+	if migrated := st.MigrateDuplicateApprovalIDs(); migrated > 0 {
+		fmt.Fprintf(os.Stderr, "[supervisor] migrated %d duplicate approval id/link(s) (#672)\n", migrated)
+	}
 	st.MarkStaleApprovals(time.Now().UTC())
 	// #489 migration: stamp Repo on any pre-#489 approval still in
 	// flight so the executor's cross-project guard can fence reliably.
