@@ -2348,15 +2348,29 @@ func versionBumpCmd(args []string) {
 	fs := flag.NewFlagSet("version-bump", flag.ExitOnError)
 	configPath := fs.String("config", "", "Path to config file")
 	prNumber := fs.Int("pr", 0, "PR number to read labels/commits from")
+	sinceLastTag := fs.Bool("since-last-tag", false, "Bump once for commits since the latest version tag")
 	fs.Parse(args)
 
-	if *prNumber == 0 {
-		fmt.Fprintln(os.Stderr, "error: --pr is required")
+	if (*prNumber == 0 && !*sinceLastTag) || (*prNumber != 0 && *sinceLastTag) {
+		fmt.Fprintln(os.Stderr, "error: specify exactly one of --pr or --since-last-tag")
 		os.Exit(1)
 	}
 
 	cfg := loadConfig(*configPath)
 	gh := github.New(cfg.Repo)
+
+	if *sinceLastTag {
+		result, err := versioning.RunSinceLastTag(cfg, gh)
+		if err != nil {
+			log.Fatalf("version bump: %v", err)
+		}
+		if result.NoChanges {
+			fmt.Println("No version bump needed.")
+			return
+		}
+		fmt.Printf("Version bump complete: %s -> %s (%s).\n", result.OldVersion, result.NewVersion, result.BumpType)
+		return
+	}
 
 	if err := versioning.Run(cfg, gh, *prNumber); err != nil {
 		log.Fatalf("version bump: %v", err)

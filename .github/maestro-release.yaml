@@ -1,0 +1,9 @@
+repo: BeFeast/maestro
+local_path: .
+
+versioning:
+  enabled: true
+  files:
+    - VERSION
+  default_bump: patch
+  tag_prefix: v
