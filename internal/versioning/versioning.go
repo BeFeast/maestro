@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -125,7 +126,7 @@ func DetectBumpFromLabels(labels []string, defaultBump string) (BumpType, bool) 
 
 // DetectBumpFromCommits parses conventional commit prefixes.
 // feat!: or BREAKING CHANGE → major, feat: → minor, fix: → patch.
-func DetectBumpFromCommits(messages []string, defaultBump string) BumpType {
+func DetectBumpSignalFromCommits(messages []string) (BumpType, bool) {
 	highest := BumpType(-1)
 	for _, msg := range messages {
 		lower := strings.ToLower(msg)
@@ -145,7 +146,16 @@ func DetectBumpFromCommits(messages []string, defaultBump string) BumpType {
 		}
 	}
 	if highest >= 0 {
-		return highest
+		return highest, true
+	}
+	return BumpPatch, false
+}
+
+// DetectBumpFromCommits parses conventional commit prefixes and returns the
+// configured default when no conventional-commit signal is present.
+func DetectBumpFromCommits(messages []string, defaultBump string) BumpType {
+	if bump, ok := DetectBumpSignalFromCommits(messages); ok {
+		return bump
 	}
 	return ParseBumpType(defaultBump)
 }
@@ -201,12 +211,12 @@ func UpdateVersionInFile(path, oldVer, newVer string) error {
 }
 
 // CommitAndTag creates a version bump commit and tag in the given repo.
-func CommitAndTag(repoPath, version, tagPrefix string) error {
+func CommitAndTag(repoPath, version, tagPrefix string, files []string) error {
 	tag := tagPrefix + version
 	commitMsg := fmt.Sprintf("chore: bump version to %s", version)
 
-	// Stage all changes
-	if out, err := runGit(repoPath, "add", "-A"); err != nil {
+	addArgs := append([]string{"add", "--"}, files...)
+	if out, err := runGit(repoPath, addArgs...); err != nil {
 		return fmt.Errorf("git add: %w\n%s", err, out)
 	}
 
@@ -255,6 +265,15 @@ type BumpResult struct {
 	BumpType   BumpType
 }
 
+// BatchBumpResult holds the result of a batched version bump.
+type BatchBumpResult struct {
+	BumpResult
+	LastTag     string
+	CommitCount int
+	PRNumbers   []int
+	NoChanges   bool
+}
+
 // DetectBump reads PR labels and commits to determine the bump type,
 // then computes the new version. It reads the current version from the
 // given files and uses labels-first with commit-message fallback.
@@ -289,6 +308,176 @@ func DetectBump(gh PRClient, prNumber int, files []string, defaultBump string) (
 
 	newVer := Bump(current, bumpType)
 	return BumpResult{OldVersion: current, NewVersion: newVer, BumpType: bumpType}, nil
+}
+
+var prNumberPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`\(#(\d+)\)`),
+	regexp.MustCompile(`(?i)\bpull request #(\d+)\b`),
+}
+
+func extractPRNumbers(messages []string) []int {
+	seen := make(map[int]struct{})
+	for _, msg := range messages {
+		for _, pat := range prNumberPatterns {
+			for _, match := range pat.FindAllStringSubmatch(msg, -1) {
+				if len(match) < 2 {
+					continue
+				}
+				n, err := strconv.Atoi(match[1])
+				if err != nil || n <= 0 {
+					continue
+				}
+				seen[n] = struct{}{}
+			}
+		}
+	}
+	prs := make([]int, 0, len(seen))
+	for n := range seen {
+		prs = append(prs, n)
+	}
+	sort.Ints(prs)
+	return prs
+}
+
+func maxBump(a, b BumpType) BumpType {
+	if b > a {
+		return b
+	}
+	return a
+}
+
+// DetectBatchBump computes one bump for all commits and PR labels in a range.
+func DetectBatchBump(gh PRClient, files []string, defaultBump string, messages []string) (BumpResult, []int, error) {
+	currentStr, err := ReadCurrentVersion(files)
+	if err != nil {
+		return BumpResult{}, nil, fmt.Errorf("read current version: %w", err)
+	}
+	current, err := ParseVersion(currentStr)
+	if err != nil {
+		return BumpResult{}, nil, fmt.Errorf("parse current version: %w", err)
+	}
+
+	highest := BumpType(-1)
+	prNumbers := extractPRNumbers(messages)
+	for _, prNumber := range prNumbers {
+		labels, err := gh.PRLabels(prNumber)
+		if err != nil {
+			return BumpResult{}, nil, fmt.Errorf("get PR %d labels: %w", prNumber, err)
+		}
+		if bump, ok := DetectBumpFromLabels(labels, defaultBump); ok {
+			highest = maxBump(highest, bump)
+		}
+	}
+
+	if bump, ok := DetectBumpSignalFromCommits(messages); ok {
+		highest = maxBump(highest, bump)
+	}
+	if highest < 0 {
+		highest = ParseBumpType(defaultBump)
+	}
+
+	newVer := Bump(current, highest)
+	return BumpResult{OldVersion: current, NewVersion: newVer, BumpType: highest}, prNumbers, nil
+}
+
+func latestTag(repoPath, tagPrefix string) (string, error) {
+	match := tagPrefix + "*"
+	out, err := runGit(repoPath, "describe", "--tags", "--match", match, "--abbrev=0")
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func commitMessagesSince(repoPath, tag string) ([]string, error) {
+	rangeArg := "HEAD"
+	if tag != "" {
+		rangeArg = tag + "..HEAD"
+	}
+	out, err := runGit(repoPath, "log", "--format=%B%x00", rangeArg)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(out, "\x00")
+	messages := make([]string, 0, len(parts))
+	for _, part := range parts {
+		msg := strings.TrimSpace(part)
+		if msg == "" {
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	return messages, nil
+}
+
+// RunSinceLastTag executes one batched version bump for commits since the
+// latest matching tag. If no commits exist in the range, it returns NoChanges.
+func RunSinceLastTag(cfg *config.Config, gh PRClient) (BatchBumpResult, error) {
+	if !cfg.Versioning.Enabled {
+		log.Printf("[versioning] disabled, skipping")
+		return BatchBumpResult{NoChanges: true}, nil
+	}
+
+	if len(cfg.Versioning.Files) == 0 {
+		return BatchBumpResult{}, fmt.Errorf("versioning enabled but no files configured")
+	}
+
+	if out, err := runGit(cfg.LocalPath, "checkout", "main"); err != nil {
+		return BatchBumpResult{}, fmt.Errorf("git checkout main: %w\n%s", err, out)
+	}
+	if out, err := runGit(cfg.LocalPath, "pull", "origin", "main"); err != nil {
+		return BatchBumpResult{}, fmt.Errorf("git pull: %w\n%s", err, out)
+	}
+
+	lastTag, err := latestTag(cfg.LocalPath, cfg.Versioning.TagPrefix)
+	if err != nil {
+		return BatchBumpResult{}, fmt.Errorf("find latest tag: %w", err)
+	}
+	messages, err := commitMessagesSince(cfg.LocalPath, lastTag)
+	if err != nil {
+		return BatchBumpResult{}, fmt.Errorf("list commits since %q: %w", lastTag, err)
+	}
+	if len(messages) == 0 {
+		log.Printf("[versioning] no commits since latest %s* tag, skipping", cfg.Versioning.TagPrefix)
+		return BatchBumpResult{LastTag: lastTag, NoChanges: true}, nil
+	}
+
+	files := ResolveFiles(cfg.LocalPath, cfg.Versioning.Files)
+	result, prs, err := DetectBatchBump(gh, files, cfg.Versioning.DefaultBump, messages)
+	if err != nil {
+		return BatchBumpResult{}, err
+	}
+	log.Printf("[versioning] bumping %s → %s (%s) from %d commit(s) since %s", result.OldVersion, result.NewVersion, result.BumpType, len(messages), lastTag)
+
+	oldStr := result.OldVersion.String()
+	newStr := result.NewVersion.String()
+	for _, f := range files {
+		if err := UpdateVersionInFile(f, oldStr, newStr); err != nil {
+			log.Printf("[versioning] warn: %v", err)
+			continue
+		}
+		log.Printf("[versioning] updated %s", f)
+	}
+
+	if err := CommitAndTag(cfg.LocalPath, newStr, cfg.Versioning.TagPrefix, files); err != nil {
+		return BatchBumpResult{}, fmt.Errorf("commit and tag: %w", err)
+	}
+	log.Printf("[versioning] committed and tagged %s%s", cfg.Versioning.TagPrefix, result.NewVersion)
+
+	if cfg.Versioning.CreateRelease {
+		tag := cfg.Versioning.TagPrefix + newStr
+		if err := gh.CreateRelease(tag, tag); err != nil {
+			return BatchBumpResult{}, fmt.Errorf("create release: %w", err)
+		}
+		log.Printf("[versioning] created release %s", tag)
+	}
+
+	return BatchBumpResult{
+		BumpResult:  result,
+		LastTag:     lastTag,
+		CommitCount: len(messages),
+		PRNumbers:   prs,
+	}, nil
 }
 
 // Run executes the full version bump flow for a merged PR.
@@ -331,7 +520,7 @@ func Run(cfg *config.Config, gh PRClient, prNumber int) error {
 	}
 
 	// Commit, tag, push
-	if err := CommitAndTag(cfg.LocalPath, newStr, cfg.Versioning.TagPrefix); err != nil {
+	if err := CommitAndTag(cfg.LocalPath, newStr, cfg.Versioning.TagPrefix, files); err != nil {
 		return fmt.Errorf("commit and tag: %w", err)
 	}
 	log.Printf("[versioning] committed and tagged %s%s", cfg.Versioning.TagPrefix, result.NewVersion)

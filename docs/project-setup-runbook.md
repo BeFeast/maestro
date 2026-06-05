@@ -278,12 +278,18 @@ Worker tool hooks are default-off and opt in per project. `command` runs from th
 versioning:
   enabled: true
   files:
-    - "version.go"
-    - "package.json"
+    - "VERSION"
   default_bump: patch
   tag_prefix: v
   create_release: true
 ```
+
+For a batched release cadence, run `maestro version-bump --since-last-tag` from
+a scheduled GitHub Actions workflow with `workflow_dispatch`, full history
+checkout (`fetch-depth: 0`), and idempotent `version:major`,
+`version:minor`, and `version:patch` label creation. The workflow should use
+one repo-local config like `.github/maestro-release.yaml` with `files:
+[VERSION]`, `default_bump: patch`, and `tag_prefix: v`.
 
 ### Optional: model routing
 

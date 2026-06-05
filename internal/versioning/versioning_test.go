@@ -250,8 +250,9 @@ func TestResolveFiles(t *testing.T) {
 
 // mockPRClient implements PRClient for testing.
 type mockPRClient struct {
-	labels  []string
-	commits []string
+	labels     []string
+	commits    []string
+	labelsByPR map[int][]string
 
 	labelsErr  error
 	commitsErr error
@@ -261,6 +262,9 @@ type mockPRClient struct {
 }
 
 func (m *mockPRClient) PRLabels(prNumber int) ([]string, error) {
+	if m.labelsByPR != nil {
+		return m.labelsByPR[prNumber], m.labelsErr
+	}
 	return m.labels, m.labelsErr
 }
 
@@ -400,6 +404,91 @@ func TestDetectBump(t *testing.T) {
 			}
 			if result.NewVersion != tt.wantNew {
 				t.Errorf("NewVersion = %v, want %v", result.NewVersion, tt.wantNew)
+			}
+		})
+	}
+}
+
+func TestExtractPRNumbers(t *testing.T) {
+	got := extractPRNumbers([]string{
+		"feat: add batched release (#675)",
+		"Merge pull request #674 from BeFeast/release-cycle",
+		"docs: mention #999 without merge syntax",
+		"fix: duplicate (#675)",
+	})
+	want := []int{674, 675}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("extractPRNumbers() = %v, want %v", got, want)
+	}
+}
+
+func TestDetectBatchBump(t *testing.T) {
+	tests := []struct {
+		name        string
+		labelsByPR  map[int][]string
+		messages    []string
+		defaultBump string
+		wantBump    BumpType
+		wantNew     Version
+		wantPRs     []int
+	}{
+		{
+			name:        "minor label in batch wins",
+			labelsByPR:  map[int][]string{10: []string{"version:patch"}, 11: []string{"version:minor"}},
+			messages:    []string{"fix: typo (#10)", "chore: plumbing (#11)"},
+			defaultBump: "patch",
+			wantBump:    BumpMinor,
+			wantNew:     Version{1, 3, 0},
+			wantPRs:     []int{10, 11},
+		},
+		{
+			name:        "conventional commit fallback",
+			labelsByPR:  map[int][]string{12: []string{"bug"}},
+			messages:    []string{"feat: add API (#12)", "fix: typo"},
+			defaultBump: "patch",
+			wantBump:    BumpMinor,
+			wantNew:     Version{1, 3, 0},
+			wantPRs:     []int{12},
+		},
+		{
+			name:        "default patch without signals",
+			labelsByPR:  map[int][]string{13: []string{"maintenance"}},
+			messages:    []string{"chore: update docs (#13)"},
+			defaultBump: "patch",
+			wantBump:    BumpPatch,
+			wantNew:     Version{1, 2, 4},
+			wantPRs:     []int{13},
+		},
+		{
+			name:        "major commit beats minor label",
+			labelsByPR:  map[int][]string{14: []string{"version:minor"}},
+			messages:    []string{"feat!: replace API (#14)"},
+			defaultBump: "patch",
+			wantBump:    BumpMajor,
+			wantNew:     Version{2, 0, 0},
+			wantPRs:     []int{14},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			versionFile := filepath.Join(dir, "VERSION")
+			os.WriteFile(versionFile, []byte(`version = "1.2.3"`), 0644)
+
+			mock := &mockPRClient{labelsByPR: tt.labelsByPR}
+			result, prs, err := DetectBatchBump(mock, []string{versionFile}, tt.defaultBump, tt.messages)
+			if err != nil {
+				t.Fatalf("DetectBatchBump: %v", err)
+			}
+			if result.BumpType != tt.wantBump {
+				t.Fatalf("BumpType = %v, want %v", result.BumpType, tt.wantBump)
+			}
+			if result.NewVersion != tt.wantNew {
+				t.Fatalf("NewVersion = %v, want %v", result.NewVersion, tt.wantNew)
+			}
+			if fmt.Sprint(prs) != fmt.Sprint(tt.wantPRs) {
+				t.Fatalf("PRs = %v, want %v", prs, tt.wantPRs)
 			}
 		})
 	}

@@ -1,0 +1,49 @@
+name: Version Bump
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: version-bump-main
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump and tag
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure version labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "version:major" --color "B60205" --description "Major version bump" --force
+          gh label create "version:minor" --color "0E8A16" --description "Minor version bump" --force
+          gh label create "version:patch" --color "1D76DB" --description "Patch version bump" --force
+
+      - name: Bump version since latest tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: go run ./cmd/maestro/ version-bump --since-last-tag --config .github/maestro-release.yaml
