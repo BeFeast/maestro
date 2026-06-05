@@ -59,9 +59,12 @@ export function mapFleetResponse(raw, now = Date.now()) {
     0,
     Number(summary.needs_attention || 0) - selfResolving,
   );
+  const actionableApprovals = summary.approvals_actionable == null
+    ? Number(summary.approvals_pending || 0)
+    : Number(summary.approvals_actionable || 0);
   const attentionCount =
     actionableAttention +
-    Number(summary.approvals_pending || 0) +
+    actionableApprovals +
     Number(summary.errors || 0) +
     Number(summary.stale || 0) +
     Number(summary.dispatch_failures || 0) +
@@ -879,6 +882,7 @@ function mapApproval(approval) {
     ageMin,
     sla: 30,
     state: approvalTone(approval),
+    suggestion: String(approval.action || "").trim() === "apply_lesson_proposal",
     body: approval.summary || "",
     stage: actionLabel(approval.action),
   };
@@ -942,6 +946,7 @@ function slugifyProjectForCommand(name) {
 }
 
 function approvalTone(approval) {
+  if (String(approval.action || "").trim() === "apply_lesson_proposal") return "idle";
   if (approval.past_sla) return "stuck";
   if ((approval.status || "") === "pending") return "watch";
   return "idle";

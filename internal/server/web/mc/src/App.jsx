@@ -12,12 +12,12 @@ import {
 
 function parseRoute(pathname, search) {
   const path = (pathname || "/").replace(/\/+$/, "") || "/";
+  const q = new URLSearchParams(search || "");
   if (path === "/" || path === "/fleet") return { screen: "fleet" };
   if (path === "/workers") {
-    const q = new URLSearchParams(search || "");
     return { screen: "workers", slot: q.get("slot"), project: q.get("project") };
   }
-  if (path === "/approvals") return { screen: "approvals" };
+  if (path === "/approvals") return { screen: "approvals", id: q.get("id") };
   if (path === "/settings") return { screen: "settings" };
   const projectMatch = path.match(/^\/project\/(.+)$/);
   if (projectMatch) {
@@ -30,7 +30,15 @@ function parseRoute(pathname, search) {
       // See issue #473.
       return { screen: "fleet" };
     }
-    return { screen: "project", slug };
+    return {
+      screen: "project",
+      slug,
+      focus: {
+        approval: q.get("approval"),
+        issue: q.get("issue"),
+        pr: q.get("pr"),
+      },
+    };
   }
   return { screen: "fleet" };
 }
@@ -47,11 +55,17 @@ function routeToPath(route) {
     return qs ? `/workers?${qs}` : "/workers";
   }
   case "approvals":
-    return "/approvals";
+    return route.id ? `/approvals?id=${encodeURIComponent(route.id)}` : "/approvals";
   case "settings":
     return "/settings";
-  case "project":
-    return `/project/${encodeURIComponent(route.slug || "")}`;
+  case "project": {
+    const params = new URLSearchParams();
+    if (route.focus?.approval) params.set("approval", route.focus.approval);
+    if (route.focus?.issue) params.set("issue", route.focus.issue);
+    if (route.focus?.pr) params.set("pr", route.focus.pr);
+    const qs = params.toString();
+    return `/project/${encodeURIComponent(route.slug || "")}${qs ? `?${qs}` : ""}`;
+  }
   default:
     return "/fleet";
   }
@@ -115,6 +129,7 @@ function AppShell() {
         now={now}
         navigate={navigate}
         openDrawer={setDrawer}
+        focus={route.focus}
       />
     );
   } else if (route.screen === "workers") {
@@ -128,7 +143,7 @@ function AppShell() {
       />
     );
   } else if (route.screen === "approvals") {
-    screen = <ApprovalsScreen navigate={navigate} />;
+    screen = <ApprovalsScreen navigate={navigate} focusId={route.id} />;
   } else if (route.screen === "settings") {
     screen = <SettingsScreen />;
   } else {
