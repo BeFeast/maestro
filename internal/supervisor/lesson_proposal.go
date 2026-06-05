@@ -22,6 +22,9 @@ func lessonProposalFromDecision(cfg *config.Config, st *state.State, decision st
 	if cfg == nil || st == nil {
 		return state.LessonProposal{}, false
 	}
+	if !cfg.Supervisor.LessonProposalsOn() {
+		return state.LessonProposal{}, false
+	}
 	for _, stuck := range decision.StuckStates {
 		if !lessonProposalEligibleForStuckState(st, stuck) {
 			continue

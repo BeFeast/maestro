@@ -202,8 +202,17 @@ type SupervisorConfig struct {
 	AllowedActions          []string                        `yaml:"allowed_actions" json:"allowed_actions,omitempty"`
 	ApprovalRequiredActions []string                        `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
 	PolicyPath              string                          `yaml:"-" json:"policy_path,omitempty"`
+	LessonProposalsEnabled  *bool                           `yaml:"lesson_proposals_enabled" json:"lesson_proposals_enabled,omitempty"`
 
 	excludedLabelsSet bool
+}
+
+// LessonProposalsOn reports whether the supervisor should generate lesson
+// proposals. Defaults to true; set supervisor.lesson_proposals_enabled: false
+// to suppress the low-value, never-approved lesson-proposal approvals until the
+// dedup / auto-resolve work (#668) lands.
+func (c SupervisorConfig) LessonProposalsOn() bool {
+	return c.LessonProposalsEnabled == nil || *c.LessonProposalsEnabled
 }
 
 // SupervisorHandoffPlannerConfig describes the supervisor-owned continuation
