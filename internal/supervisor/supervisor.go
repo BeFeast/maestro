@@ -1151,7 +1151,7 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 			}
 		}
 
-		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 && !e.retryExhaustedSessionResolvedOnGitHub(sess, cache) {
+		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 && !e.retryExhaustedSessionResolved(st, sess, cache) {
 			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
@@ -1216,6 +1216,9 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 			continue
 		}
 		if e.sessionResolvedOnGitHub(sess, cache) {
+			continue
+		}
+		if sess.Status == state.StatusRetryExhausted && e.retryExhaustedSessionSupersededByIssueProgress(st, sess) {
 			continue
 		}
 		pr, found := openPRForSession(sess, byNumber, byBranch)
@@ -2495,7 +2498,7 @@ func (e *Engine) retryExhaustedSession(st *state.State, cache *resolutionCache) 
 		if sess == nil || sess.Status != state.StatusRetryExhausted {
 			continue
 		}
-		if e.retryExhaustedSessionResolvedOnGitHub(sess, cache) {
+		if e.retryExhaustedSessionResolved(st, sess, cache) {
 			continue
 		}
 		return slot, sess, true
@@ -2516,7 +2519,7 @@ func (e *Engine) retryExhaustedRepairCandidate(st *state.State, issues []github.
 		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 {
 			continue
 		}
-		if e.hasLiveRunningSessionForIssue(st, sess.IssueNumber) || e.retryExhaustedSessionResolvedOnGitHub(sess, cache) {
+		if e.retryExhaustedSessionResolved(st, sess, cache) {
 			continue
 		}
 		issue, ok := issueByNumber[sess.IssueNumber]
@@ -2544,6 +2547,45 @@ func (e *Engine) retryExhaustedRepairCandidate(st *state.State, issues []github.
 // review or worker spawning for the already-resolved issue.
 func (e *Engine) retryExhaustedSessionResolvedOnGitHub(sess *state.Session, cache *resolutionCache) bool {
 	return e.sessionResolvedOnGitHub(sess, cache)
+}
+
+func (e *Engine) retryExhaustedSessionResolved(st *state.State, sess *state.Session, cache *resolutionCache) bool {
+	return e.retryExhaustedSessionResolvedOnGitHub(sess, cache) || e.retryExhaustedSessionSupersededByIssueProgress(st, sess)
+}
+
+func (e *Engine) retryExhaustedSessionSupersededByIssueProgress(st *state.State, exhausted *state.Session) bool {
+	if st == nil || exhausted == nil || exhausted.IssueNumber <= 0 {
+		return false
+	}
+	exhaustedAt := state.SessionChangedAt(exhausted)
+	for _, sess := range st.Sessions {
+		if sess == nil || sess == exhausted || sess.IssueNumber != exhausted.IssueNumber {
+			continue
+		}
+		if !sessionCanSupersedeRetryExhausted(sess) {
+			continue
+		}
+		if !exhaustedAt.IsZero() && !state.SessionChangedAt(sess).After(exhaustedAt) {
+			continue
+		}
+		if sess.Status == state.StatusRunning && sess.PID > 0 && !e.pidAlive(sess.PID) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func sessionCanSupersedeRetryExhausted(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	switch sess.Status {
+	case state.StatusRunning, state.StatusQueued, state.StatusPROpen, state.StatusCodeLanded, state.StatusDone:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *Engine) sessionResolvedOnGitHub(sess *state.Session, cache *resolutionCache) bool {
