@@ -1841,9 +1841,9 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 }
 
 // RecordLessonProposal records a recurring-failure lesson candidate and mints a
-// linked pending approval. If the same fingerprint already exists, it updates
-// the durable proposal metadata without re-opening resolved proposals or
-// appending another same-id approval.
+// linked pending approval. If the same failure class, source session, and
+// suggested rule already exists, it updates the durable proposal metadata
+// without re-opening resolved proposals or appending another same-id approval.
 func (s *State) RecordLessonProposal(proposal LessonProposal, now time.Time, repo, project string) (*LessonProposal, *Approval, bool) {
 	if s == nil {
 		return nil, nil, false
@@ -1865,7 +1865,7 @@ func (s *State) RecordLessonProposal(proposal LessonProposal, now time.Time, rep
 		proposal.Status = LessonProposalStatusPending
 	}
 	if proposal.Fingerprint == "" {
-		proposal.Fingerprint = LessonProposalFingerprint(proposal.FailureClass, proposal.Area)
+		proposal.Fingerprint = LessonProposalFingerprint(proposal.FailureClass, lessonProposalSourceSession(&proposal), proposal.SuggestedRule)
 	}
 	if proposal.ID == "" {
 		proposal.ID = lessonProposalID(proposal.Fingerprint)
@@ -1875,7 +1875,7 @@ func (s *State) RecordLessonProposal(proposal LessonProposal, now time.Time, rep
 	}
 	for i := range s.LessonProposals {
 		existing := &s.LessonProposals[i]
-		if existing.Fingerprint != proposal.Fingerprint {
+		if existing.Fingerprint != proposal.Fingerprint && !lessonProposalEquivalent(*existing, proposal) {
 			continue
 		}
 		existing.UpdatedAt = proposal.UpdatedAt
@@ -1947,14 +1947,29 @@ func firstNonZeroTime(values ...time.Time) time.Time {
 	return time.Time{}
 }
 
-func LessonProposalFingerprint(failureClass, area string) string {
+func LessonProposalFingerprint(failureClass, sourceSession, suggestedRule string) string {
 	return stableHash(struct {
-		FailureClass string `json:"failure_class"`
-		Area         string `json:"area"`
+		FailureClass  string `json:"failure_class"`
+		SourceSession string `json:"source_session"`
+		SuggestedRule string `json:"suggested_rule"`
 	}{
-		FailureClass: strings.ToLower(strings.TrimSpace(failureClass)),
-		Area:         strings.ToLower(strings.TrimSpace(area)),
+		FailureClass:  strings.ToLower(strings.TrimSpace(failureClass)),
+		SourceSession: strings.ToLower(strings.TrimSpace(sourceSession)),
+		SuggestedRule: strings.TrimSpace(suggestedRule),
 	})
+}
+
+func lessonProposalEquivalent(a, b LessonProposal) bool {
+	return strings.EqualFold(strings.TrimSpace(a.FailureClass), strings.TrimSpace(b.FailureClass)) &&
+		strings.EqualFold(lessonProposalSourceSession(&a), lessonProposalSourceSession(&b)) &&
+		strings.TrimSpace(a.SuggestedRule) == strings.TrimSpace(b.SuggestedRule)
+}
+
+func lessonProposalSourceSession(proposal *LessonProposal) string {
+	if proposal == nil || proposal.SourceTarget == nil {
+		return ""
+	}
+	return strings.TrimSpace(proposal.SourceTarget.Session)
 }
 
 func lessonProposalID(fingerprint string) string {

@@ -23,6 +23,9 @@ func lessonProposalFromDecision(cfg *config.Config, st *state.State, decision st
 		return state.LessonProposal{}, false
 	}
 	for _, stuck := range decision.StuckStates {
+		if !lessonProposalEligibleForStuckState(st, stuck) {
+			continue
+		}
 		if proposal, ok := lessonProposalFromStuckState(cfg, decision, stuck); ok {
 			return proposal, true
 		}
@@ -41,6 +44,9 @@ func lessonProposalFromDecision(cfg *config.Config, st *state.State, decision st
 				Target:            target,
 				Evidence:          []string{fmt.Sprintf("Session %s status=conflict_failed", slot)},
 			}
+			if !lessonProposalEligibleForStuckState(st, stuck) {
+				continue
+			}
 			return lessonProposalFromStuckState(cfg, decision, stuck)
 		}
 	}
@@ -52,7 +58,7 @@ func lessonProposalFromStuckState(cfg *config.Config, decision state.SupervisorD
 	if failureClass == "" {
 		return state.LessonProposal{}, false
 	}
-	area := lessonArea(decision.Target, stuck.Target)
+	area := lessonArea(stuck.Target, decision.Target)
 	minimalRepro := lessonMinimalRepro(stuck)
 	target := state.LessonProposalTargetAgentsMD
 	if strings.TrimSpace(cfg.WorkerPrompt) != "" {
@@ -73,6 +79,58 @@ func lessonProposalFromStuckState(cfg *config.Config, decision state.SupervisorD
 		proposal.CreatedAt = time.Now().UTC()
 	}
 	return proposal, true
+}
+
+func lessonProposalEligibleForStuckState(st *state.State, stuck state.SupervisorStuckState) bool {
+	if lessonFailureClass(stuck.Code) != "retry_exhausted" {
+		return true
+	}
+	issue := 0
+	if stuck.Target != nil {
+		issue = stuck.Target.Issue
+	}
+	if issue <= 0 {
+		return true
+	}
+	return retryExhaustedIssueHasTaskRunEvidence(st, issue)
+}
+
+func retryExhaustedIssueHasTaskRunEvidence(st *state.State, issue int) bool {
+	if st == nil || issue <= 0 {
+		return true
+	}
+	seenFailedAttempt := false
+	for _, sess := range st.Sessions {
+		if sess == nil || sess.IssueNumber != issue || sess.RateLimitHit {
+			continue
+		}
+		switch sess.Status {
+		case state.StatusDead, state.StatusFailed, state.StatusRetryExhausted, state.StatusConflictFailed:
+			seenFailedAttempt = true
+		default:
+			continue
+		}
+		if sessionHasTaskRunEvidence(sess) {
+			return true
+		}
+	}
+	return !seenFailedAttempt
+}
+
+func sessionHasTaskRunEvidence(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	if sess.PRNumber > 0 || sess.TokensUsedAttempt > 0 || sess.TokensUsedTotal > 0 {
+		return true
+	}
+	if !sess.LastOutputChangedAt.IsZero() {
+		return true
+	}
+	if strings.TrimSpace(sess.CIFailureOutput) != "" || strings.TrimSpace(sess.PreviousAttemptFeedback) != "" {
+		return true
+	}
+	return false
 }
 
 func lessonFailureClass(code string) string {

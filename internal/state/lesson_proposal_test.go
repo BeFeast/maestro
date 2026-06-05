@@ -39,6 +39,42 @@ func TestRecordLessonProposal_DedupsPendingFingerprint(t *testing.T) {
 	}
 }
 
+func TestRecordLessonProposal_DedupsBySourceSessionAndRuleNotArea(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	input := LessonProposal{
+		FailureClass:  "retry_exhausted",
+		Area:          "issue:528",
+		MinimalRepro:  "Session scr-528 status=retry_exhausted retry_count=3",
+		SuggestedRule: "Inspect failed attempts before retrying.",
+		Target:        LessonProposalTargetWorkerPrompt,
+		SourceTarget:  &SupervisorTarget{Issue: 528, Session: "scr-528"},
+	}
+
+	first, _, created := s.RecordLessonProposal(input, now, "owner/repo", "owner/repo")
+	if !created || first == nil {
+		t.Fatalf("first created=%v proposal=%+v, want proposal", created, first)
+	}
+	s.MarkLessonProposalApplied(first.ID, now.Add(time.Minute), "operator", "appended to worker prompt")
+
+	rotated := input
+	rotated.Area = "issue:999"
+	rotated.SourceTarget = &SupervisorTarget{Issue: 528, Session: "scr-528"}
+	second, approval, created := s.RecordLessonProposal(rotated, now.Add(2*time.Minute), "owner/repo", "owner/repo")
+	if created {
+		t.Fatal("created duplicate proposal for same source session and suggested rule with different area")
+	}
+	if second == nil || second.ID != first.ID {
+		t.Fatalf("second = %+v, want existing %s", second, first.ID)
+	}
+	if approval == nil || approval.ID != first.ApprovalID {
+		t.Fatalf("approval = %+v, want original approval %q", approval, first.ApprovalID)
+	}
+	if len(s.LessonProposals) != 1 || len(s.Approvals) != 1 {
+		t.Fatalf("counts proposals=%d approvals=%d, want 1/1", len(s.LessonProposals), len(s.Approvals))
+	}
+}
+
 func TestRejectLessonProposalApprovalMarksDeclined(t *testing.T) {
 	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
 	s := NewState()

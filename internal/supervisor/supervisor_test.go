@@ -472,6 +472,45 @@ func TestDecide_RetryExhaustedSkippedWhenSessionPRIsMerged(t *testing.T) {
 	}
 }
 
+func TestDecide_RetryExhaustedSkippedWhenNewerSessionForIssueIsLive(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{}
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	finished := now.Add(-20 * time.Minute)
+	st := state.NewState()
+	st.Sessions["scr-528"] = &state.Session{
+		IssueNumber: 528,
+		IssueTitle:  "stale exhausted work",
+		Status:      state.StatusRetryExhausted,
+		StartedAt:   now.Add(-time.Hour),
+		FinishedAt:  &finished,
+	}
+	st.Sessions["scr-532"] = &state.Session{
+		IssueNumber: 528,
+		IssueTitle:  "fresh respawn",
+		Status:      state.StatusRunning,
+		PID:         12345,
+		StartedAt:   now.Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.RecommendedAction == ActionReviewRetryExhausted {
+		t.Fatalf("action = %q, must not review stale retry_exhausted once same issue has a newer live session", decision.RecommendedAction)
+	}
+	if decision.Target != nil && decision.Target.Session == "scr-528" {
+		t.Fatalf("target = %#v, must not target stale session scr-528", decision.Target)
+	}
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == "retry_exhausted" && stuck.Target != nil && stuck.Target.Session == "scr-528" {
+			t.Fatalf("stale retry_exhausted stuck state reported: %#v", stuck)
+		}
+	}
+}
+
 func TestDecide_RetryExhaustedResolutionCachedPerDecisionCycle(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{}
