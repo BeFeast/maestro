@@ -118,6 +118,7 @@ type Session struct {
 	LastNotifiedStatus          string            `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
 	LiveVerificationNotified    bool              `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
 	RetryCount                  int               `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
+	MaintenanceRetryCount       int               `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
 	NextRetryAt                 *time.Time        `json:"next_retry_at,omitempty"`
 	LastOutputHash              string            `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt         time.Time         `json:"last_output_changed_at,omitempty"`

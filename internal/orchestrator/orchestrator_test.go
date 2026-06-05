@@ -2149,7 +2149,7 @@ func TestAutoMergePRs_ReviewFeedbackFallsBackToCloseWhenWorktreeMissing(t *testi
 	}
 }
 
-func TestAutoMergePRs_ReviewFeedbackRetryLimitMarksTerminal(t *testing.T) {
+func TestAutoMergePRs_ReviewFeedbackImplementationRetryLimitStillSchedulesMaintenance(t *testing.T) {
 	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
 	cfg := &config.Config{
 		Repo:                    "owner/repo",
@@ -2181,11 +2181,61 @@ func TestAutoMergePRs_ReviewFeedbackRetryLimitMarksTerminal(t *testing.T) {
 
 	o.autoMergePRs(s)
 
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set for maintenance retry")
+	}
+	if sess.RetryCount != 3 {
+		t.Fatalf("RetryCount = %d, want 3 (implementation retry budget must not be consumed)", sess.RetryCount)
+	}
+	if sess.MaintenanceRetryCount != 1 {
+		t.Fatalf("MaintenanceRetryCount = %d, want 1", sess.MaintenanceRetryCount)
+	}
+	if sess.PreviousAttemptFeedbackKind != state.RetryReasonReviewFeedback {
+		t.Fatalf("PreviousAttemptFeedbackKind = %q, want review_feedback", sess.PreviousAttemptFeedbackKind)
+	}
+}
+
+func TestAutoMergePRs_ReviewFeedbackMaintenanceBudgetMarksTerminal(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "none",
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	notifier := notify.NewWithToken("", "123", "", "")
+	notifier.SetDigestMode(true)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: notifier,
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			return "success", nil
+		},
+		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
+		},
+	}
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.Worktree = "/tmp/maestro-slot-0"
+	sess.RetryCount = 3
+	sess.MaintenanceRetryCount = 1
+
+	o.autoMergePRs(s)
+
 	if sess.Status != state.StatusRetryExhausted {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRetryExhausted)
 	}
 	if sess.NextRetryAt != nil {
-		t.Fatal("NextRetryAt should be nil after retry exhaustion")
+		t.Fatal("NextRetryAt should be nil after maintenance exhaustion")
 	}
 	if sess.LastNotifiedStatus != "review_retry_exhausted" {
 		t.Fatalf("LastNotifiedStatus = %q, want review_retry_exhausted", sess.LastNotifiedStatus)
@@ -2257,7 +2307,7 @@ func TestAutoMergePRs_RetryExhaustedGreenPRNoFeedbackMerges(t *testing.T) {
 	}
 }
 
-func TestAutoMergePRs_RetryExhaustedActionableFeedbackStillBlocks(t *testing.T) {
+func TestAutoMergePRs_RetryExhaustedActionableFeedbackGetsMaintenancePass(t *testing.T) {
 	prs := []github.PR{{Number: 10, HeadRefName: "feat/a", Mergeable: "MERGEABLE"}}
 	cfg := &config.Config{
 		Repo:                    "owner/repo",
@@ -2292,6 +2342,7 @@ func TestAutoMergePRs_RetryExhaustedActionableFeedbackStillBlocks(t *testing.T) 
 		IssueNumber: 100,
 		IssueTitle:  "green with current-head comments",
 		Branch:      "feat/a",
+		Worktree:    "/tmp/maestro-slot-0",
 		Status:      state.StatusRetryExhausted,
 		PRNumber:    10,
 		RetryCount:  3,
@@ -2303,11 +2354,17 @@ func TestAutoMergePRs_RetryExhaustedActionableFeedbackStillBlocks(t *testing.T) 
 		t.Fatalf("actionable review feedback should block merge, got merged=%v", merged)
 	}
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusRetryExhausted {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusRetryExhausted)
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
 	}
-	if sess.LastNotifiedStatus != "review_retry_exhausted" {
-		t.Fatalf("LastNotifiedStatus = %q, want review_retry_exhausted", sess.LastNotifiedStatus)
+	if sess.RetryCount != 3 {
+		t.Fatalf("RetryCount = %d, want 3 (implementation retry budget must not be consumed)", sess.RetryCount)
+	}
+	if sess.MaintenanceRetryCount != 1 {
+		t.Fatalf("MaintenanceRetryCount = %d, want 1", sess.MaintenanceRetryCount)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set for maintenance pass")
 	}
 	if notifier.Buffered() != 1 {
 		t.Fatalf("notifications buffered = %d, want 1", notifier.Buffered())
@@ -2365,12 +2422,13 @@ func TestAutoMergePRs_RetryExhaustedFeedback_NoReSyncAfterSettled(t *testing.T) 
 	}
 	s := state.NewState()
 	s.Sessions["sup-92"] = &state.Session{
-		IssueNumber: 535,
-		IssueTitle:  "review feedback PR",
-		Branch:      "feat/sup-92",
-		Status:      state.StatusRetryExhausted,
-		PRNumber:    555,
-		RetryCount:  2,
+		IssueNumber:           535,
+		IssueTitle:            "review feedback PR",
+		Branch:                "feat/sup-92",
+		Status:                state.StatusRetryExhausted,
+		PRNumber:              555,
+		RetryCount:            2,
+		MaintenanceRetryCount: 1,
 	}
 
 	// First cycle marks the session retry-exhausted (one project sync).
@@ -3276,6 +3334,7 @@ func TestHandleRebaseConflictRetry_SchedulesInPlaceRetry(t *testing.T) {
 		Status:      state.StatusPROpen,
 		PRNumber:    10,
 		Backend:     "claude",
+		RetryCount:  3,
 	}
 	s.Sessions["slot-0"] = sess
 
@@ -3287,8 +3346,11 @@ func TestHandleRebaseConflictRetry_SchedulesInPlaceRetry(t *testing.T) {
 	if sess.PRNumber != 10 {
 		t.Fatalf("PRNumber = %d, want 10", sess.PRNumber)
 	}
-	if sess.RetryCount != 1 {
-		t.Fatalf("RetryCount = %d, want 1", sess.RetryCount)
+	if sess.RetryCount != 3 {
+		t.Fatalf("RetryCount = %d, want 3 (implementation retry budget must not be consumed)", sess.RetryCount)
+	}
+	if sess.MaintenanceRetryCount != 1 {
+		t.Fatalf("MaintenanceRetryCount = %d, want 1", sess.MaintenanceRetryCount)
 	}
 	if sess.NextRetryAt == nil {
 		t.Fatal("NextRetryAt should be set")
@@ -3745,6 +3807,54 @@ func TestRebaseConflicts_RetryExhaustedConflictingMarksUnresolvable(t *testing.T
 	}
 	if len(labels) == 0 || labels[0] != "blocked" {
 		t.Errorf("issue must be labelled blocked, got %v", labels)
+	}
+}
+
+func TestRebaseConflicts_OpenPRBehindMainUpdatesUnderMaintenance(t *testing.T) {
+	updateCalled := 0
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "behind", nil
+		},
+		ghUpdateBranchFn: func(prNumber int) error {
+			updateCalled++
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["slot-0"] = &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+		RetryCount:  3,
+	}
+
+	o.rebaseConflicts(s)
+
+	sess := s.Sessions["slot-0"]
+	if updateCalled != 1 {
+		t.Fatalf("updateBranch called %d times, want 1", updateCalled)
+	}
+	if sess.Status != state.StatusQueued {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusQueued)
+	}
+	if !sess.RebaseAttempted {
+		t.Fatal("RebaseAttempted should be true after behind update")
+	}
+	if sess.RetryCount != 3 {
+		t.Fatalf("RetryCount = %d, want 3 (behind maintenance must not consume implementation retries)", sess.RetryCount)
+	}
+	if sess.MaintenanceRetryCount != 0 {
+		t.Fatalf("MaintenanceRetryCount = %d, want 0 (clean branch update is not a worker retry)", sess.MaintenanceRetryCount)
 	}
 }
 
@@ -4387,6 +4497,45 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 
 	if len(*started) != 0 {
 		t.Fatalf("started %d workers, want 0 for already closed issue", len(*started))
+	}
+}
+
+func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.Supervisor.ReviewRepair.MaxRetries = 1
+	issues := []github.Issue{makeIssue(669, "repair open PR", "blocked")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "repair-1",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnReviewRepair,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 669, PR: 1001, HeadSHA: "deadbeef"},
+		ReviewRepair: &state.SupervisorReviewRepairPayload{
+			HeadSHA:    "deadbeef",
+			MaxRetries: 1,
+			Backend:    "claude",
+			Findings: []state.SupervisorReviewFinding{{
+				Path:     "internal/foo.go",
+				Line:     10,
+				Body:     "P1: address this",
+				Severity: "P1",
+			}},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 || (*started)[0] != 669 {
+		t.Fatalf("started = %v, want [669] for supervisor-selected maintenance despite excluded label", *started)
+	}
+	track, ok := s.LookupReviewRepairTrack(1001, "deadbeef")
+	if !ok || track.Attempts != 1 {
+		t.Fatalf("review repair track = %+v, ok=%v; want one maintenance attempt", track, ok)
 	}
 }
 
