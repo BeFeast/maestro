@@ -310,6 +310,9 @@ func (o *Orchestrator) closePR(prNumber int, comment string) error {
 	if o.ghClosePRFn != nil {
 		return o.ghClosePRFn(prNumber, comment)
 	}
+	if o.gh == nil {
+		return fmt.Errorf("no github client configured for close-pr")
+	}
 	return o.gh.ClosePR(prNumber, comment)
 }
 
@@ -996,6 +999,24 @@ func (o *Orchestrator) canRetryIssue(s *state.State, sess *state.Session) bool {
 	}
 	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
 	return totalAttempts < maxRetries
+}
+
+func (o *Orchestrator) maintenanceRetryBudget() int {
+	if o == nil || o.cfg == nil {
+		return 1
+	}
+	max := o.cfg.Supervisor.ReviewRepair.EffectiveMaxRetries()
+	if max <= 0 {
+		return 1
+	}
+	return max
+}
+
+func (o *Orchestrator) canRetryPRMaintenance(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	return sess.MaintenanceRetryCount < o.maintenanceRetryBudget()
 }
 
 func pendingRetryReservations(s *state.State) int {
@@ -2747,10 +2768,8 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(slotName string, sess *state.
 // its prompt. When the PR worktree is still available, keep the PR open and
 // respawn in place so the fixer pushes updates to the same PR.
 func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string, sess *state.Session, pr github.PR, reviewFeedback string) {
-	maxRetries := o.cfg.MaxRetriesPerIssue
-	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
-
-	if maxRetries > 0 && totalAttempts >= maxRetries {
+	maxRetries := o.maintenanceRetryBudget()
+	if !o.canRetryPRMaintenance(sess) {
 		// #556: when the session is already settled retry-exhausted on
 		// this PR, short-circuit so the orchestrator does not re-emit
 		// the retry-limit log, re-sync the project board, or churn
@@ -2760,8 +2779,8 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 		if isSettledRetryExhausted(sess, pr.Number) {
 			return
 		}
-		log.Printf("[orch] review feedback on PR #%d — retry limit reached (%d/%d) for issue #%d",
-			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
+		log.Printf("[orch] review feedback on PR #%d — maintenance retry limit reached (%d/%d) for issue #%d",
+			pr.Number, sess.MaintenanceRetryCount, maxRetries, sess.IssueNumber)
 		alreadyNotified := sess.LastNotifiedStatus == "review_retry_exhausted"
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
 		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
@@ -2772,8 +2791,8 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 		sess.FinishedAt = &now
 		state.MarkWorkerEnded(sess, now)
 		if !alreadyNotified {
-			o.notifier.Sendf("💀 maestro: review feedback on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
-				pr.Number, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+			o.notifier.Sendf("💀 maestro: review feedback on PR #%d (issue #%d: %s) — maintenance retry limit exhausted (%d attempts)",
+				pr.Number, sess.IssueNumber, sess.IssueTitle, sess.MaintenanceRetryCount)
 		}
 		return
 	}
@@ -2797,8 +2816,8 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 	sess.PreviousAttemptFeedbackKind = state.RetryReasonReviewFeedback
 	sess.RetryReason = state.RetryReasonReviewFeedback
 
-	sess.RetryCount++
-	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
+	sess.MaintenanceRetryCount++
+	backoffMs := retryBackoffMs(sess.MaintenanceRetryCount, o.cfg.MaxRetryBackoffMs)
 	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 	sess.NextRetryAt = &retryAt
 	sess.Status = state.StatusDead
@@ -2806,10 +2825,10 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
 
-	log.Printf("[orch] review feedback on PR #%d — scheduling retry %d in %dms for issue #%d",
-		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
-	o.notifier.Sendf("🔄 maestro: review feedback on PR #%d (issue #%d: %s), in-place retry %d scheduled in %ds",
-		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
+	log.Printf("[orch] review feedback on PR #%d — scheduling maintenance retry %d/%d in %dms for issue #%d",
+		pr.Number, sess.MaintenanceRetryCount, maxRetries, backoffMs, sess.IssueNumber)
+	o.notifier.Sendf("🔄 maestro: review feedback on PR #%d (issue #%d: %s), in-place maintenance retry %d/%d scheduled in %ds",
+		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.MaintenanceRetryCount, maxRetries, backoffMs/1000)
 }
 
 // handleCIFailureRetry closes the failed PR, captures CI output, cleans up,
@@ -3438,9 +3457,26 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			if !hasPR {
 				continue
 			}
-			mergeable, err := o.gh.PRMergeable(pr.Number)
+			mergeable, mergeState, err := o.prMergeStatus(pr.Number)
 			if err != nil {
 				log.Printf("[orch] mergeable PR #%d: %v", pr.Number, err)
+				continue
+			}
+			if mergeState == "behind" && mergeable != "CONFLICTING" {
+				if !o.cfg.AutoRebase {
+					log.Printf("[orch] PR #%d is behind main for %s, auto_rebase disabled", pr.Number, slotName)
+					continue
+				}
+				if sess.RebaseAttempted {
+					continue
+				}
+				log.Printf("[orch] PR #%d is behind main, updating %s", pr.Number, slotName)
+				if err := o.updateBehindPRBranch(slotName, sess, pr.Number); err != nil {
+					log.Printf("[orch] update behind PR #%d for %s failed: %v", pr.Number, slotName, err)
+					o.handleRebaseConflictRetry(s, slotName, sess, pr.Number, err)
+					continue
+				}
+				o.markRebaseQueued(slotName, sess, pr.Number)
 				continue
 			}
 			if mergeable != "CONFLICTING" {
@@ -3486,12 +3522,21 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			if !hasPR || sess.RebaseAttempted {
 				continue
 			}
-			mergeable, _, mErr := o.prMergeStatus(pr.Number)
+			mergeable, mergeState, mErr := o.prMergeStatus(pr.Number)
 			if mErr != nil {
 				log.Printf("[orch] mergeable PR #%d: %v", pr.Number, mErr)
 				continue
 			}
 			if mergeable != "CONFLICTING" {
+				if mergeState == "behind" && o.cfg.AutoRebase && !sess.RebaseAttempted {
+					log.Printf("[orch] retry_exhausted PR #%d is behind main, attempting maintenance update for %s", pr.Number, slotName)
+					if err := o.updateBehindPRBranch(slotName, sess, pr.Number); err != nil {
+						log.Printf("[orch] update behind retry_exhausted PR #%d for %s failed: %v", pr.Number, slotName, err)
+						o.handleRebaseConflictRetry(s, slotName, sess, pr.Number, err)
+						continue
+					}
+					o.markRebaseQueued(slotName, sess, pr.Number)
+				}
 				continue
 			}
 			if o.cfg.AutoRebase && strings.TrimSpace(sess.Worktree) != "" {
@@ -3508,6 +3553,21 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 			o.markUnresolvableConflict(slotName, sess, pr.Number, fmt.Errorf("retry_exhausted PR is CONFLICTING"))
 		}
 	}
+}
+
+func (o *Orchestrator) updateBehindPRBranch(slotName string, sess *state.Session, prNumber int) error {
+	rebased := false
+	if strings.TrimSpace(sess.Worktree) != "" {
+		if err := o.rebaseWorktree(sess.Worktree, sess.Branch); err != nil {
+			log.Printf("[orch] auto-rebase failed for %s: %v — falling back to server-side update-branch", slotName, err)
+		} else {
+			rebased = true
+		}
+	}
+	if rebased {
+		return nil
+	}
+	return o.updateBranch(prNumber)
 }
 
 func (o *Orchestrator) markRebaseQueued(slotName string, sess *state.Session, prNumber int) {
@@ -3527,11 +3587,10 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 		return
 	}
 
-	maxRetries := o.cfg.MaxRetriesPerIssue
-	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
-	if maxRetries > 0 && totalAttempts >= maxRetries {
-		log.Printf("[orch] rebase conflict on PR #%d — retry limit reached (%d/%d) for issue #%d",
-			prNumber, totalAttempts, maxRetries, sess.IssueNumber)
+	maxRetries := o.maintenanceRetryBudget()
+	if !o.canRetryPRMaintenance(sess) {
+		log.Printf("[orch] rebase conflict on PR #%d — maintenance retry limit reached (%d/%d) for issue #%d",
+			prNumber, sess.MaintenanceRetryCount, maxRetries, sess.IssueNumber)
 		s.MarkIssueRetryExhausted(sess.IssueNumber)
 		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
 		sess.Status = state.StatusRetryExhausted
@@ -3540,8 +3599,8 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
 		state.MarkWorkerEnded(sess, now)
-		o.notifier.Sendf("💀 maestro: rebase conflict on PR #%d (issue #%d: %s) — retry limit exhausted (%d attempts)",
-			prNumber, sess.IssueNumber, sess.IssueTitle, totalAttempts)
+		o.notifier.Sendf("💀 maestro: rebase conflict on PR #%d (issue #%d: %s) — maintenance retry limit exhausted (%d attempts)",
+			prNumber, sess.IssueNumber, sess.IssueTitle, sess.MaintenanceRetryCount)
 		return
 	}
 
@@ -3564,8 +3623,8 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 	sess.PreviousAttemptFeedback = rebaseConflictFeedback(prNumber, cause)
 	sess.PreviousAttemptFeedbackKind = "rebase_conflict"
 
-	sess.RetryCount++
-	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
+	sess.MaintenanceRetryCount++
+	backoffMs := retryBackoffMs(sess.MaintenanceRetryCount, o.cfg.MaxRetryBackoffMs)
 	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 	sess.NextRetryAt = &retryAt
 	sess.Status = state.StatusDead
@@ -3574,10 +3633,10 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
 
-	log.Printf("[orch] rebase conflict on PR #%d — scheduling retry %d in %dms for issue #%d",
-		prNumber, sess.RetryCount, backoffMs, sess.IssueNumber)
-	o.notifier.Sendf("🔄 maestro: rebase conflict on PR #%d (issue #%d: %s), in-place retry %d scheduled in %ds",
-		prNumber, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
+	log.Printf("[orch] rebase conflict on PR #%d — scheduling maintenance retry %d/%d in %dms for issue #%d",
+		prNumber, sess.MaintenanceRetryCount, maxRetries, backoffMs, sess.IssueNumber)
+	o.notifier.Sendf("🔄 maestro: rebase conflict on PR #%d (issue #%d: %s), in-place maintenance retry %d/%d scheduled in %ds",
+		prNumber, sess.IssueNumber, sess.IssueTitle, sess.MaintenanceRetryCount, maxRetries, backoffMs/1000)
 }
 
 func rebaseConflictFeedback(prNumber int, cause error) string {
@@ -4203,8 +4262,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 
 		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
-			log.Printf("[orch] skipping issue #%d (excluded label)", issue.Number)
-			continue
+			if repairSpawn {
+				log.Printf("[orch] allowing repair worker for issue #%d despite excluded label because supervisor selected repair maintenance", issue.Number)
+			} else {
+				log.Printf("[orch] skipping issue #%d (excluded label)", issue.Number)
+				continue
+			}
 		}
 
 		// Check retry limit: skip issues that have exhausted their retry budget
