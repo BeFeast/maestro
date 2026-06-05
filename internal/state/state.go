@@ -1841,8 +1841,9 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 }
 
 // RecordLessonProposal records a recurring-failure lesson candidate and mints a
-// linked pending approval. If the same failure class and area already has a
-// non-declined proposal, it returns that proposal without creating noise.
+// linked pending approval. If the same fingerprint already exists, it updates
+// the durable proposal metadata without re-opening resolved proposals or
+// appending another same-id approval.
 func (s *State) RecordLessonProposal(proposal LessonProposal, now time.Time, repo, project string) (*LessonProposal, *Approval, bool) {
 	if s == nil {
 		return nil, nil, false
@@ -1877,10 +1878,37 @@ func (s *State) RecordLessonProposal(proposal LessonProposal, now time.Time, rep
 		if existing.Fingerprint != proposal.Fingerprint {
 			continue
 		}
-		if existing.Status == LessonProposalStatusDeclined {
-			continue
+		existing.UpdatedAt = proposal.UpdatedAt
+		existing.MinimalRepro = proposal.MinimalRepro
+		existing.SuggestedRule = proposal.SuggestedRule
+		existing.Target = proposal.Target
+		existing.SourceDecision = proposal.SourceDecision
+		existing.SourceTarget = cloneSupervisorTarget(proposal.SourceTarget)
+		if existing.ID == "" {
+			existing.ID = proposal.ID
 		}
-		return existing, s.findApprovalByLessonProposalID(existing.ID), false
+		if existing.FailureClass == "" {
+			existing.FailureClass = proposal.FailureClass
+		}
+		if existing.Area == "" {
+			existing.Area = proposal.Area
+		}
+		approval := s.findApprovalByLessonProposalID(existing.ID)
+		if approval != nil {
+			existing.ApprovalID = approval.ID
+			if approval.DecisionID == "" {
+				approval.DecisionID = existing.SourceDecision
+				approval.PayloadHash = approval.ComputePayloadHash()
+			}
+			if existing.Status == LessonProposalStatusPending && approval.Status == ApprovalStatusPending {
+				approval.UpdatedAt = proposal.UpdatedAt
+				approval.Evidence = []string{existing.MinimalRepro, existing.SuggestedRule}
+				approval.Repo = repo
+				approval.Project = project
+				approval.PayloadHash = approval.ComputePayloadHash()
+			}
+		}
+		return existing, approval, false
 	}
 
 	s.LessonProposals = append(s.LessonProposals, proposal)
@@ -1890,6 +1918,7 @@ func (s *State) RecordLessonProposal(proposal LessonProposal, now time.Time, rep
 		CreatedAt:        stored.CreatedAt,
 		UpdatedAt:        stored.UpdatedAt,
 		Action:           "apply_lesson_proposal",
+		DecisionID:       stored.SourceDecision,
 		Summary:          fmt.Sprintf("Apply lesson proposal for %s in %s.", stored.FailureClass, stored.Area),
 		Risk:             "approval_gated",
 		Evidence:         []string{stored.MinimalRepro, stored.SuggestedRule},
@@ -1940,12 +1969,20 @@ func lessonProposalID(fingerprint string) string {
 }
 
 func (s *State) findApprovalByLessonProposalID(id string) *Approval {
+	var fallback *Approval
 	for i := range s.Approvals {
 		if s.Approvals[i].LessonProposalID == id {
-			return &s.Approvals[i]
+			approval := &s.Approvals[i]
+			switch approval.Status {
+			case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+				return approval
+			}
+			if fallback == nil {
+				fallback = approval
+			}
 		}
 	}
-	return nil
+	return fallback
 }
 
 func (s *State) FindLessonProposal(id string) (*LessonProposal, bool) {
@@ -2030,13 +2067,42 @@ func supervisorIssueTargetsEqual(a, b []SupervisorIssueTarget) bool {
 }
 
 func (s *State) FindApproval(id string) (*Approval, bool) {
+	if approval, ok := s.findApprovalByIDAndStatus(id, ApprovalStatusPending); ok {
+		return approval, true
+	}
+	if approval, ok := s.findApprovalByIDAndStatus(id, ApprovalStatusApproved); ok {
+		return approval, true
+	}
+	if approval, ok := s.findApprovalByIDAndStatus(id, ApprovalStatusAwaitingDispatch); ok {
+		return approval, true
+	}
 	for i := range s.Approvals {
 		approval := &s.Approvals[i]
-		if approval.ID == id || approval.DecisionID == id {
+		if approvalMatchesID(approval, id) {
 			return approval, true
 		}
 	}
 	return nil, false
+}
+
+func (s *State) findApprovalByIDAndStatus(id string, status ApprovalStatus) (*Approval, bool) {
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Status == status && approvalMatchesID(approval, id) {
+			return approval, true
+		}
+	}
+	return nil, false
+}
+
+func approvalMatchesID(approval *Approval, id string) bool {
+	if approval == nil {
+		return false
+	}
+	if approval.ID == id || approval.DecisionID == id {
+		return true
+	}
+	return false
 }
 
 func (s *State) ApproveApproval(id string, now time.Time, actor, reason string) (*Approval, error) {
@@ -3453,6 +3519,108 @@ func (s *State) MigrateApprovalsBindRepo(repo string) int {
 		migrated++
 	}
 	return migrated
+}
+
+// MigrateDuplicateApprovalIDs rewrites legacy duplicate approval IDs so the
+// actionable approval keeps the canonical operator-facing ID and historical
+// twins become individually addressable. It also back-fills lesson approval
+// DecisionID links from the durable lesson proposal when older state omitted
+// them.
+func (s *State) MigrateDuplicateApprovalIDs() int {
+	if s == nil || len(s.Approvals) == 0 {
+		return 0
+	}
+	migrated := 0
+	proposalsByID := make(map[string]*LessonProposal, len(s.LessonProposals))
+	for i := range s.LessonProposals {
+		proposal := &s.LessonProposals[i]
+		if proposal.ID != "" {
+			proposalsByID[proposal.ID] = proposal
+		}
+	}
+	used := make(map[string]int, len(s.Approvals))
+	byID := make(map[string][]int)
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.LessonProposalID != "" && approval.DecisionID == "" {
+			if proposal := proposalsByID[approval.LessonProposalID]; proposal != nil && proposal.SourceDecision != "" {
+				approval.DecisionID = proposal.SourceDecision
+				approval.PayloadHash = approval.ComputePayloadHash()
+				migrated++
+			}
+		}
+		id := strings.TrimSpace(approval.ID)
+		if id == "" {
+			continue
+		}
+		used[id]++
+		byID[id] = append(byID[id], i)
+	}
+	for id, indexes := range byID {
+		if len(indexes) < 2 {
+			continue
+		}
+		canonical := canonicalApprovalIndex(s.Approvals, indexes)
+		for _, idx := range indexes {
+			if idx == canonical {
+				continue
+			}
+			approval := &s.Approvals[idx]
+			oldID := approval.ID
+			approval.ID = nextDuplicateApprovalID(id, used)
+			if proposal := proposalsByID[approval.LessonProposalID]; proposal != nil && proposal.ApprovalID == oldID {
+				proposal.ApprovalID = approval.ID
+			}
+			migrated++
+		}
+		for _, idx := range indexes {
+			approval := &s.Approvals[idx]
+			if proposal := proposalsByID[approval.LessonProposalID]; proposal != nil {
+				if proposal.ApprovalID == "" || idx == canonical || approval.Status == ApprovalStatusPending {
+					proposal.ApprovalID = approval.ID
+				}
+			}
+		}
+	}
+	return migrated
+}
+
+func canonicalApprovalIndex(approvals []Approval, indexes []int) int {
+	if len(indexes) == 0 {
+		return -1
+	}
+	for _, status := range []ApprovalStatus{
+		ApprovalStatusPending,
+		ApprovalStatusApproved,
+		ApprovalStatusAwaitingDispatch,
+	} {
+		best := -1
+		for _, idx := range indexes {
+			if approvals[idx].Status != status {
+				continue
+			}
+			if best == -1 || approvals[idx].CreatedAt.After(approvals[best].CreatedAt) {
+				best = idx
+			}
+		}
+		if best != -1 {
+			return best
+		}
+	}
+	return indexes[0]
+}
+
+func nextDuplicateApprovalID(base string, used map[string]int) string {
+	n := used[base]
+	for {
+		n++
+		candidate := fmt.Sprintf("%s-legacy-%d", base, n)
+		if used[candidate] == 0 {
+			used[base] = n
+			used[candidate] = 1
+			return candidate
+		}
+	}
 }
 
 // ValidateSlotID is the canonical slot-id validator used at EVERY
