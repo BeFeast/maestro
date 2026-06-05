@@ -85,7 +85,9 @@ Requires Go 1.22+.
 ```bash
 git clone https://github.com/BeFeast/maestro
 cd maestro
-go build ./cmd/maestro/
+VERSION="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' VERSION)"
+test -n "$VERSION"
+go build -trimpath -ldflags "-X main.version=${VERSION}" ./cmd/maestro/
 sudo mv maestro /usr/local/bin/  # or add to PATH
 ```
 

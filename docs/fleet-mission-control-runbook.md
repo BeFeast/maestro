@@ -127,6 +127,17 @@ Fleet Mission Control is an observation surface. It loads each project config, r
 
 The project runner remains the execution surface. It starts workers, reconciles dead sessions, opens and monitors PRs, waits for review gates, merges eligible PRs, deploys when configured, and updates local state.
 
+When deploying Maestro itself from source on the fleet host, stamp the binary with the release version from `VERSION`; an unstamped source build leaves `maestro version` reporting build metadata instead of the release. Use the same stamped build shape as the release workflow, then verify the installed binary:
+
+```bash
+cd /path/to/repos/maestro
+git pull --ff-only origin main
+VERSION="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' VERSION)"
+test -n "$VERSION"
+go build -trimpath -ldflags "-X main.version=${VERSION}" -o maestro ./cmd/maestro/
+./maestro version
+```
+
 The supervisor is the explainability and policy surface. It records queue analysis, selected candidates, stuck states, outcome context, safe label mutations, and approval requests. Safe actions are limited to actions explicitly listed in `supervisor.safe_actions`. Risky recommendations are recorded for an operator; approving them with the CLI records the approval but does not execute the risky action by itself.
 
 Each project card shows an outcome status: goal, runtime target, health state, and next action. If no `outcome` brief is configured, Mission Control says so explicitly because merged PR throughput is not the same as a working runtime. If PRs keep merging while runtime health is unknown or failing, the supervisor records `no_outcome_progress` and recommends a read-only deploy/runtime check instead of mutating production.

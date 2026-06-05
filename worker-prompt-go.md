@@ -27,9 +27,11 @@ git rebase origin/main
 go fmt ./...
 go vet ./...
 go test ./...
-go build ./cmd/maestro/
+VERSION="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' VERSION)"
+test -n "$VERSION"
+go build -trimpath -ldflags "-X main.version=${VERSION}" ./cmd/maestro/
 ```
-All four must pass before creating a PR. If rebase has conflicts, resolve them.
+All commands must pass before creating a PR. If rebase has conflicts, resolve them.
 
 ### 3. Go conventions
 - Run `go fmt ./...` before every commit
@@ -41,7 +43,9 @@ All four must pass before creating a PR. If rebase has conflicts, resolve them.
 
 ### 4. Build verification
 ```bash
-go build ./cmd/maestro/
+VERSION="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' VERSION)"
+test -n "$VERSION"
+go build -trimpath -ldflags "-X main.version=${VERSION}" ./cmd/maestro/
 ./maestro version
 ```
 Binary must build successfully before creating PR.
