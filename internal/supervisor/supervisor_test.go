@@ -1739,6 +1739,52 @@ func TestDecide_DynamicWaveClassifiesTitleEpicAsHeld(t *testing.T) {
 	}
 }
 
+func TestDecide_DynamicWaveDoesNotBlockChildOnNegatedDependencyProse(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.BlockerPatterns = []string{`depends on.*?#(\d+)`}
+	enableDynamicWave(cfg)
+	epic := testIssue(307, "Epic: parent work", "epic")
+	child := testIssue(310, "child work", "maestro-ready")
+	child.Body = "Depends on #307 sibling work but is independently mergeable."
+	reader := &fakeReader{issues: []github.Issue{epic, child}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 310 {
+		t.Fatalf("target = %#v, want child issue 310", decision.Target)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.BlockedByDependencyIssues != 0 {
+		t.Fatalf("queue analysis = %#v, want no dependency-blocked issue", decision.QueueAnalysis)
+	}
+}
+
+func TestDecide_DynamicWaveDoesNotCountParentEpicAsBlocker(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.BlockerPatterns = []string{`blocked by.*?#(\d+)`}
+	enableDynamicWave(cfg)
+	epic := testIssue(307, "tracking parent", "epic")
+	child := testIssue(310, "child work", "maestro-ready")
+	child.Body = "Blocked by #307."
+	reader := &fakeReader{issues: []github.Issue{epic, child}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 310 {
+		t.Fatalf("target = %#v, want child issue 310", decision.Target)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.BlockedByDependencyIssues != 0 {
+		t.Fatalf("queue analysis = %#v, want parent epic excluded from blockers", decision.QueueAnalysis)
+	}
+}
+
 func TestDecide_DynamicWaveClassifiesAllSkipCategories(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
@@ -2217,7 +2263,8 @@ func TestDynamicWaveDoneStateDoesNotSkipWhenOutcomeNotVerified(t *testing.T) {
 		Summary:   "live verifier failed",
 	}
 
-	reason, _, err := testEngine(cfg, &fakeReader{}).dynamicWaveSkipReason(st, testIssue(42, "done issue", "maestro-ready"))
+	issue := testIssue(42, "done issue", "maestro-ready")
+	reason, _, err := testEngine(cfg, &fakeReader{}).dynamicWaveSkipReason(st, issue, []github.Issue{issue})
 	if err != nil {
 		t.Fatalf("dynamicWaveSkipReason: %v", err)
 	}

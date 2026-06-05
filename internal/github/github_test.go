@@ -591,6 +591,18 @@ func TestFindChildIssues_NestedHeading(t *testing.T) {
 	}
 }
 
+func TestFindBlockers_IgnoresNegatedDependencyProse(t *testing.T) {
+	body := "Depends on #307 sibling work but is independently mergeable.\nBlocked by #42"
+	patterns := []string{
+		`blocked by.*?#(\d+)`,
+		`depends on.*?#(\d+)`,
+	}
+	got := FindBlockers(body, patterns)
+	if !reflect.DeepEqual(got, []int{42}) {
+		t.Errorf("FindBlockers() = %v, want [42]", got)
+	}
+}
+
 func TestFormatReviewFeedback_NonEmpty(t *testing.T) {
 	comments := []ReviewComment{
 		{Path: "bridge.rs", Line: 42, Body: "P2: enabled flag logic inverted", User: "greptile-apps[bot]"},

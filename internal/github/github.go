@@ -1221,6 +1221,8 @@ var dependencyInlinePattern = regexp.MustCompile(`(?im)^\s*depends(?:\s+on)?\s*[
 // line or section. Reused for both inline and structured forms.
 var dependencyIssueNumber = regexp.MustCompile(`#(\d+)`)
 
+var dependencyNegatingQualifierPattern = regexp.MustCompile(`(?i)\b(independently\s+mergeable|independent\s+mergeable|but\s+is\s+independent|but\s+independent|not\s+blocked|not\s+a\s+blocker)\b`)
+
 // FindDependencies scans an issue body for dependency references in two
 // supported shapes (see issue #442):
 //
@@ -1472,17 +1474,22 @@ func FindBlockers(body string, patterns []string) []int {
 		if err != nil {
 			continue
 		}
-		for _, match := range re.FindAllStringSubmatch(body, -1) {
-			if len(match) < 2 {
+		for _, line := range strings.Split(body, "\n") {
+			if dependencyNegatingQualifierPattern.MatchString(line) {
 				continue
 			}
-			n, err := strconv.Atoi(match[1])
-			if err != nil || n <= 0 {
-				continue
-			}
-			if _, ok := seen[n]; !ok {
-				seen[n] = struct{}{}
-				blockers = append(blockers, n)
+			for _, match := range re.FindAllStringSubmatch(line, -1) {
+				if len(match) < 2 {
+					continue
+				}
+				n, err := strconv.Atoi(match[1])
+				if err != nil || n <= 0 {
+					continue
+				}
+				if _, ok := seen[n]; !ok {
+					seen[n] = struct{}{}
+					blockers = append(blockers, n)
+				}
 			}
 		}
 	}

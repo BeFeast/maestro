@@ -6623,6 +6623,24 @@ func TestFindOpenBlockers_SomeOpen(t *testing.T) {
 	}
 }
 
+func TestFindOpenBlockersExceptEpics_IgnoresOpenEpic(t *testing.T) {
+	o := &Orchestrator{
+		isIssueClosedFn: func(number int) (bool, error) {
+			return false, nil
+		},
+	}
+	issues := []github.Issue{
+		{Number: 307, Title: "Epic: parent work", Labels: []struct {
+			Name string `json:"name"`
+		}{{Name: "epic"}}},
+	}
+
+	got := o.findOpenBlockersExceptEpics([]int{307, 42}, issues)
+	if len(got) != 1 || got[0] != 42 {
+		t.Errorf("findOpenBlockersExceptEpics() = %v, want [42]", got)
+	}
+}
+
 func TestFindOpenBlockers_ErrorAssumesOpen(t *testing.T) {
 	o := &Orchestrator{
 		isIssueClosedFn: func(number int) (bool, error) {

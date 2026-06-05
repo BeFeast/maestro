@@ -3610,8 +3610,16 @@ func (o *Orchestrator) markUnresolvableConflict(slotName string, sess *state.Ses
 
 // findOpenBlockers returns the subset of blocker issue numbers that are still open.
 func (o *Orchestrator) findOpenBlockers(blockers []int) []int {
+	return o.findOpenBlockersExceptEpics(blockers, nil)
+}
+
+func (o *Orchestrator) findOpenBlockersExceptEpics(blockers []int, issues []github.Issue) []int {
+	epics := epicIssueNumbers(issues)
 	var open []int
 	for _, num := range blockers {
+		if _, ok := epics[num]; ok {
+			continue
+		}
 		closed, err := o.isIssueClosed(num)
 		if err != nil {
 			// If we can't determine the state, assume it's open (safe default)
@@ -3624,6 +3632,16 @@ func (o *Orchestrator) findOpenBlockers(blockers []int) []int {
 		}
 	}
 	return open
+}
+
+func epicIssueNumbers(issues []github.Issue) map[int]struct{} {
+	epics := make(map[int]struct{})
+	for _, issue := range issues {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(issue.Title)), "epic:") || github.HasLabel(issue, []string{"epic"}) {
+			epics[issue.Number] = struct{}{}
+		}
+	}
+	return epics
 }
 
 // resolveBackend determines which backend to use for the given issue.
@@ -3792,7 +3810,7 @@ func (o *Orchestrator) orderedQueueIssueNumberPauseReason(s *state.State, issueN
 	return ""
 }
 
-func (o *Orchestrator) orderedQueueIssuePauseReason(s *state.State, issue github.Issue) string {
+func (o *Orchestrator) orderedQueueIssuePauseReason(s *state.State, issue github.Issue, issues []github.Issue) string {
 	if s.IsMissionParent(issue.Number) {
 		return fmt.Sprintf("issue #%d is a mission parent", issue.Number)
 	}
@@ -3805,7 +3823,7 @@ func (o *Orchestrator) orderedQueueIssuePauseReason(s *state.State, issue github
 	if len(o.cfg.BlockerPatterns) > 0 {
 		blockers := github.FindBlockers(issue.Body, o.cfg.BlockerPatterns)
 		if len(blockers) > 0 {
-			openBlockers := o.findOpenBlockers(blockers)
+			openBlockers := o.findOpenBlockersExceptEpics(blockers, issues)
 			if len(openBlockers) > 0 {
 				return fmt.Sprintf("issue #%d is blocked by open issue(s) %v", issue.Number, openBlockers)
 			}
@@ -3847,7 +3865,7 @@ func (o *Orchestrator) applyOrderedQueueFilter(s *state.State, issues []github.I
 			return nil, true
 		}
 
-		if reason := o.orderedQueueIssuePauseReason(s, issue); reason != "" {
+		if reason := o.orderedQueueIssuePauseReason(s, issue, issues); reason != "" {
 			log.Printf("[orch] ordered queue paused: %s", reason)
 			return nil, true
 		}
@@ -4214,7 +4232,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if len(o.cfg.BlockerPatterns) > 0 {
 			blockers := github.FindBlockers(issue.Body, o.cfg.BlockerPatterns)
 			if len(blockers) > 0 {
-				openBlockers := o.findOpenBlockers(blockers)
+				openBlockers := o.findOpenBlockersExceptEpics(blockers, issues)
 				if len(openBlockers) > 0 {
 					log.Printf("[orch] skipping issue #%d: blocked by open issues %v", issue.Number, openBlockers)
 					continue
