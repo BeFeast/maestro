@@ -1613,7 +1613,7 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 
 	candidates := make([]github.Issue, 0, len(issues))
 	for _, issue := range issues {
-		reason, category, err := e.dynamicWaveSkipReason(st, issue)
+		reason, category, err := e.dynamicWaveSkipReason(st, issue, issues)
 		if err != nil {
 			return policyCandidateResult{}, err
 		}
@@ -1650,7 +1650,7 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 	}, nil
 }
 
-func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue) (string, dynamicSkipCategory, error) {
+func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue, issues []github.Issue) (string, dynamicSkipCategory, error) {
 	if st.IssueInProgress(issue.Number) {
 		return "already in progress", dynamicSkipOther, nil
 	}
@@ -1686,7 +1686,7 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue) (str
 	}
 	if len(e.cfg.BlockerPatterns) > 0 {
 		blockers := github.FindBlockers(issue.Body, e.cfg.BlockerPatterns)
-		openBlockers, err := e.openBlockers(blockers)
+		openBlockers, err := e.openBlockersExceptEpics(blockers, issues)
 		if err != nil {
 			return "", dynamicSkipOther, err
 		}
@@ -2059,6 +2059,32 @@ func (e *Engine) openBlockers(blockers []int) ([]int, error) {
 		}
 	}
 	return open, nil
+}
+
+func (e *Engine) openBlockersExceptEpics(blockers []int, issues []github.Issue) ([]int, error) {
+	epics := epicIssueNumbers(issues)
+	filtered := blockers[:0]
+	for _, blocker := range blockers {
+		if _, ok := epics[blocker]; ok {
+			continue
+		}
+		filtered = append(filtered, blocker)
+	}
+	return e.openBlockers(filtered)
+}
+
+func epicIssueNumbers(issues []github.Issue) map[int]struct{} {
+	epics := make(map[int]struct{})
+	for _, issue := range issues {
+		if titleLooksEpic(issue.Title) {
+			epics[issue.Number] = struct{}{}
+			continue
+		}
+		if github.HasLabel(issue, []string{"epic"}) {
+			epics[issue.Number] = struct{}{}
+		}
+	}
+	return epics
 }
 
 func sessionWithOpenPR(st *state.State, prs []github.PR) (string, *state.Session, github.PR, bool) {
