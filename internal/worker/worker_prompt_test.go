@@ -53,6 +53,30 @@ func TestAssemblePromptIncludesSearchSafetyGuardrails(t *testing.T) {
 	}
 }
 
+func TestGoWorkerPromptUsesStampedMaestroBuild(t *testing.T) {
+	promptPath := filepath.Join("..", "..", "worker-prompt-go.md")
+	data, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", promptPath, err)
+	}
+	prompt := string(data)
+
+	required := []string{
+		`VERSION="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' VERSION)"`,
+		`go build -trimpath -ldflags "-X main.version=${VERSION}" ./cmd/maestro/`,
+		`./maestro version`,
+	}
+	for _, want := range required {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("worker-prompt-go.md missing %q", want)
+		}
+	}
+	unstampedBuild := "\ngo build " + "./cmd/maestro/"
+	if strings.Contains(prompt, unstampedBuild) {
+		t.Fatalf("worker-prompt-go.md still contains an unstamped maestro build")
+	}
+}
+
 func TestAssemblePromptIncludesRepoRulesFromAgentsFile(t *testing.T) {
 	worktree := t.TempDir()
 	if err := os.WriteFile(filepath.Join(worktree, "AGENTS.md"), []byte("## Rules\n- Run go test ./...\n"), 0644); err != nil {
