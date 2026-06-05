@@ -69,6 +69,7 @@ export function FleetScreen({ navigate }) {
   const ctaLabel = fleet.nextAction?.cta_label || "";
   const ctaTone = ctaToneForKind(fleet.nextAction?.kind);
   const onCTA = ctaHandlerForNextAction(fleet.nextAction, navigate);
+  const attentionURL = attentionTargetURL(fleet);
 
   return (
     <div>
@@ -108,7 +109,7 @@ export function FleetScreen({ navigate }) {
               <button className="tb-btn" onClick={() => navigate("workers")}>Watch live workers →</button>
             )}
             {fleet.attentionCount > 0 && (
-              <button className="tb-btn danger" onClick={() => navigate("workers")}>Review attention →</button>
+              <button className="tb-btn danger" onClick={() => navigateDashboardTarget(attentionURL, navigate)}>Review attention →</button>
             )}
             <a className="tb-btn ghost" href="https://github.com/BeFeast/maestro/blob/main/docs/fleet-mission-control-runbook.md" target="_blank" rel="noreferrer">View runbook →</a>
           </div>
@@ -618,15 +619,32 @@ function ctaToneForKind(kind) {
   }
 }
 
-// ctaHandlerForNextAction routes the header button to the right SPA
-// screen for the chosen `next_action.kind`. Approvals jump to the inbox,
-// stuck/dispatch failures jump to the workers screen, everything else
-// zooms into the project.
+function navigateDashboardTarget(target, navigate) {
+  const value = String(target || "").trim();
+  if (!value) {
+    navigate("approvals");
+    return;
+  }
+  if (/^https?:\/\//i.test(value)) {
+    window.location.assign(value);
+    return;
+  }
+  navigate(value);
+}
+
+// ctaHandlerForNextAction routes the header button to the server-selected
+// dashboard target. The backend owns item specificity (`/approvals?id=...`,
+// `/workers?slot=...`, `/project/<slug>?issue=...`); this fallback only
+// exists for older snapshots without target_url.
 function ctaHandlerForNextAction(action, navigate) {
   if (!action) return () => {};
   const kind = String(action.kind || "").trim();
   const project = action.project || "";
   return () => {
+    if (action.target_url) {
+      navigateDashboardTarget(action.target_url, navigate);
+      return;
+    }
     if (kind === "approval_pending") {
       navigate("approvals");
       return;
@@ -641,4 +659,27 @@ function ctaHandlerForNextAction(action, navigate) {
     }
     navigate("approvals");
   };
+}
+
+function attentionTargetURL(fleet) {
+  const next = fleet?.nextAction;
+  if (next?.target_url && next.kind !== "approval_pending") {
+    return next.target_url;
+  }
+  const projects = fleet?.projects || [];
+  const project = projects.find(p => {
+    const kind = String(p.operatorState?.kind || "").trim();
+    return kind === "stale_worker" || kind === "dispatch_failure" || kind === "attention" ||
+      p.state?.state === "stuck";
+  });
+  if (!project) return "workers";
+  const op = project.operatorState || {};
+  if (op.session && (op.kind === "stale_worker" || op.kind === "attention")) {
+    return `workers?project=${encodeURIComponent(project.slug || project.name)}&slot=${encodeURIComponent(op.session)}`;
+  }
+  const params = new URLSearchParams();
+  if (op.pr_number) params.set("pr", op.pr_number);
+  if (op.issue_number) params.set("issue", op.issue_number);
+  const qs = params.toString();
+  return `project/${encodeURIComponent(project.slug || project.name)}${qs ? `?${qs}` : ""}`;
 }

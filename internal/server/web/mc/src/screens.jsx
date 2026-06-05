@@ -28,9 +28,36 @@ import {
 } from "./fleetApi.js";
 import { parseTimestamp, relTime, truncateBranchName } from "./utils.js";
 
-export function ProjectScreen({ slug, navigate, openDrawer }) {
+function cssEscape(value) {
+  if (window.CSS?.escape) return window.CSS.escape(value);
+  return String(value || "").replace(/["\\]/g, "\\$&");
+}
+
+function useScrollToFocus(selector, deps) {
+  React.useEffect(() => {
+    if (!selector) return;
+    const node = document.querySelector(selector);
+    if (!node) return;
+    node.scrollIntoView({ behavior: "smooth", block: "center" });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+}
+
+function projectFocusMatches(p, focus) {
+  if (!p || !focus) return false;
+  const op = p.operatorState || {};
+  const issue = Number(focus.issue || 0);
+  const pr = Number(focus.pr || 0);
+  return (issue > 0 && Number(op.issue_number || 0) === issue) ||
+    (pr > 0 && Number(op.pr_number || 0) === pr) ||
+    !!focus.approval;
+}
+
+export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
   const { fleet, now } = useFleet();
   const p = projectBySlug(fleet, slug);
+  const focusMatch = projectFocusMatches(p, focus);
+  useScrollToFocus(focusMatch ? "[data-project-focus='true']" : "", [slug, focus?.approval, focus?.issue, focus?.pr, focusMatch]);
 
   if (!p) {
     return (
@@ -55,7 +82,7 @@ export function ProjectScreen({ slug, navigate, openDrawer }) {
 
   return (
     <div>
-      <div className={`hb tone-${vtone}`} style={{ gridTemplateColumns: "1fr 320px" }}>
+      <div className={`hb tone-${vtone} ${focusMatch ? "selected" : ""}`} data-project-focus={focusMatch ? "true" : undefined} style={{ gridTemplateColumns: "1fr 320px" }}>
         <div className="hb-left">
           <div className={`hb-line ${vtone}`}>
             <span className="pulse-dot" />
@@ -409,6 +436,7 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
     const start = new Date(now); start.setHours(0, 0, 0, 0);
     return finished >= start.getTime();
   }).length;
+  useScrollToFocus(selectedSlot ? `[data-worker-slot="${cssEscape(selectedSlot)}"]` : "", [selectedSlot, filterProject, scope, allRecent.length, allStuck.length]);
 
   return (
     <div>
@@ -463,7 +491,7 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
                 <div className="mono dim mt-2" style={{ fontSize: 11 }}>{fleet?.daemonAlive ? "Supervisor checking for eligible issues." : "Daemon offline."}</div>
               </div>
             ) : allRecent.map(w => (
-              <div key={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
+              <div key={w.slot} data-worker-slot={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
                 <div className="wt-slot">{w.slot}</div>
                 <div className="wt-issue-cell">
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
@@ -492,7 +520,7 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
               {stuckTodayCount > 0 && <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>· {stuckTodayCount} stuck today</span>}
             </div>
             {allStuck.map(w => (
-              <div key={`${w.slot}-stuck`} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
+              <div key={`${w.slot}-stuck`} data-worker-slot={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
                 <div className="wt-slot">{w.slot}</div>
                 <div className="wt-issue-cell">
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
@@ -1022,13 +1050,15 @@ function WorkerActionsPanel({ worker, readOnly, refresh }) {
   );
 }
 
-export function ApprovalsScreen({ navigate }) {
+export function ApprovalsScreen({ navigate, focusId }) {
   const { fleet } = useFleet();
   const [showAudit, setShowAudit] = React.useState(false);
   const apps = fleet?.pendingApprovals || [];
   const audit = fleet?.historicalApprovals || [];
-  const stuck = apps.filter(a => a.state === "stuck");
-  const watch = apps.filter(a => a.state === "watch");
+  const suggestions = apps.filter(a => a.suggestion);
+  const stuck = apps.filter(a => a.state === "stuck" && !a.suggestion);
+  const watch = apps.filter(a => a.state === "watch" && !a.suggestion);
+  useScrollToFocus(focusId ? `[data-approval-id="${cssEscape(focusId)}"]` : "", [focusId, apps.length, showAudit]);
 
   return (
     <div>
@@ -1046,7 +1076,7 @@ export function ApprovalsScreen({ navigate }) {
             <div className="hint">{stuck.length} stuck</div>
           </div>
           <div className="appv">
-            {stuck.map((a, i) => <ApprovalRow key={a.id || i} a={a} />)}
+            {stuck.map((a, i) => <ApprovalRow key={a.id || i} a={a} focused={a.id === focusId} />)}
           </div>
         </>
       )}
@@ -1055,7 +1085,16 @@ export function ApprovalsScreen({ navigate }) {
         <>
           <div className="layout-head"><h2>Within SLA · watching</h2><div className="hint">{watch.length} pending</div></div>
           <div className="appv">
-            {watch.map((a, i) => <ApprovalRow key={a.id || i} a={a} />)}
+            {watch.map((a, i) => <ApprovalRow key={a.id || i} a={a} focused={a.id === focusId} />)}
+          </div>
+        </>
+      )}
+
+      {suggestions.length > 0 && (
+        <>
+          <div className="layout-head"><h2>Suggestions</h2><div className="hint">{suggestions.length} low priority</div></div>
+          <div className="appv">
+            {suggestions.map((a, i) => <ApprovalRow key={a.id || i} a={a} focused={a.id === focusId} />)}
           </div>
         </>
       )}
@@ -1207,8 +1246,8 @@ function ManualFollowupBanner({ followup }) {
   );
 }
 
-function ApprovalRow({ a }) {
-  const overdue = a.past_sla || a.ageMin > a.sla;
+function ApprovalRow({ a, focused }) {
+  const overdue = !a.suggestion && (a.past_sla || a.ageMin > a.sla);
   const { fleet, refresh } = useFleet();
   const canMutate = !!a.id && fleet && fleet.readOnly === false;
   const [busy, setBusy] = React.useState(false);
@@ -1253,7 +1292,7 @@ function ApprovalRow({ a }) {
     ]
     : [];
   return (
-    <div className={`app-row ${a.state}`}>
+    <div className={`app-row ${a.state} ${focused ? "selected" : ""}`} data-approval-id={a.id || undefined}>
       <div className="app-row-stage">
         <strong>{approvalSlotLabel(a)}</strong>
         <small>{a.stage}</small>

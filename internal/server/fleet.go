@@ -109,6 +109,49 @@ func fleetProjectScopedPath(name string) string {
 	return "/project/" + url.PathEscape(name)
 }
 
+func fleetProjectFocusedPath(name string, issue int, pr int, approvalID string) string {
+	base := fleetProjectScopedPath(name)
+	if base == "" {
+		return ""
+	}
+	params := url.Values{}
+	if strings.TrimSpace(approvalID) != "" {
+		params.Set("approval", strings.TrimSpace(approvalID))
+	}
+	if pr > 0 {
+		params.Set("pr", strconv.Itoa(pr))
+	}
+	if issue > 0 {
+		params.Set("issue", strconv.Itoa(issue))
+	}
+	if encoded := params.Encode(); encoded != "" {
+		return base + "?" + encoded
+	}
+	return base
+}
+
+func fleetApprovalsFocusedPath(approvalID string) string {
+	approvalID = strings.TrimSpace(approvalID)
+	if approvalID == "" {
+		return "/approvals"
+	}
+	return "/approvals?id=" + url.QueryEscape(approvalID)
+}
+
+func fleetWorkersFocusedPath(projectName string, session string) string {
+	params := url.Values{}
+	if strings.TrimSpace(projectName) != "" {
+		params.Set("project", strings.TrimSpace(projectName))
+	}
+	if strings.TrimSpace(session) != "" {
+		params.Set("slot", strings.TrimSpace(session))
+	}
+	if encoded := params.Encode(); encoded != "" {
+		return "/workers?" + encoded
+	}
+	return "/workers"
+}
+
 // FleetFile is the YAML shape accepted by maestro serve --fleet.
 type FleetFile struct {
 	Projects []FleetProject `yaml:"projects"`
@@ -405,6 +448,8 @@ type fleetSummary struct {
 	SelfResolving       int   `json:"self_resolving,omitempty"`
 	Approvals           int   `json:"approvals"`
 	ApprovalsPending    int   `json:"approvals_pending"`
+	ApprovalsActionable int   `json:"approvals_actionable,omitempty"`
+	ApprovalsSuggestion int   `json:"approvals_suggestion,omitempty"`
 	ApprovalsHistorical int   `json:"approvals_historical"`
 	ApprovalsStale      int   `json:"approvals_stale"`
 	ApprovalsSuperseded int   `json:"approvals_superseded"`
@@ -1116,7 +1161,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 		resp.Summary.SelfResolving += item.SelfResolving
 		addFleetThroughputSummary(throughputBuckets, workers)
 		for _, approval := range item.Approvals {
-			addFleetApprovalSummary(&resp.Summary, approval.Status)
+			addFleetApprovalSummary(&resp.Summary, approval)
 		}
 	}
 	resp.Summary.ThroughputDaily7D = throughputBuckets.Counts()
@@ -1298,7 +1343,7 @@ func fleetVerdictTone(summary fleetSummary, latest *supervisorDecisionInfo, now 
 	if actionableAttention < 0 {
 		actionableAttention = 0
 	}
-	if summary.Stale > 0 || summary.Errors > 0 || actionableAttention > 0 || summary.ApprovalsPending > 0 || summary.DispatchFailures > 0 || summary.OutcomeDrift > 0 || summary.NoEligibleIssues > 0 {
+	if summary.Stale > 0 || summary.Errors > 0 || actionableAttention > 0 || fleetActionableApprovalCount(summary) > 0 || summary.DispatchFailures > 0 || summary.OutcomeDrift > 0 || summary.NoEligibleIssues > 0 {
 		return "attention"
 	}
 	if summary.Running > 0 {
@@ -1398,7 +1443,7 @@ func fleetAttentionSentence(summary fleetSummary) string {
 		selfResolving = summary.NeedsAttention
 	}
 	actionable := summary.NeedsAttention - selfResolving
-	items := actionable + summary.ApprovalsPending + summary.Errors + summary.Stale + summary.DispatchFailures + summary.OutcomeDrift + summary.NoEligibleIssues
+	items := actionable + fleetActionableApprovalCount(summary) + summary.Errors + summary.Stale + summary.DispatchFailures + summary.OutcomeDrift + summary.NoEligibleIssues
 	var base string
 	switch items {
 	case 0:
@@ -1418,6 +1463,13 @@ func fleetAttentionSentence(summary fleetSummary) string {
 		return base + " " + tail
 	}
 	return base
+}
+
+func fleetActionableApprovalCount(summary fleetSummary) int {
+	if summary.ApprovalsActionable > 0 || summary.ApprovalsSuggestion > 0 {
+		return summary.ApprovalsActionable
+	}
+	return summary.ApprovalsPending
 }
 
 func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState) {
@@ -1637,6 +1689,32 @@ func parseFleetWorkerTime(value string) time.Time {
 	return time.Time{}
 }
 
+func fleetApprovalIsSuggestion(approval *fleetApprovalState) bool {
+	if approval == nil {
+		return false
+	}
+	switch strings.TrimSpace(approval.Action) {
+	case config.SupervisorActionApplyLessonProposal:
+		return true
+	default:
+		return false
+	}
+}
+
+func fleetNextActionTargetForProject(project *fleetProjectState) string {
+	if project == nil {
+		return ""
+	}
+	op := project.OperatorState
+	if strings.TrimSpace(op.Session) != "" {
+		switch strings.TrimSpace(op.Kind) {
+		case "attention", "stale_worker":
+			return fleetWorkersFocusedPath(project.Name, op.Session)
+		}
+	}
+	return fleetProjectFocusedPath(project.Name, op.IssueNumber, op.PRNumber, "")
+}
+
 // buildFleetNextAction picks the single canonical next operator action across
 // the fleet using the priority + age algorithm documented in
 // docs/fleet-mission-control-runbook.md. Returns nil when nothing needs the
@@ -1651,14 +1729,17 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 		}
 		priority := 1
 		reason := "Approve or reject the pending supervisor approval after checking the target state."
-		if approvalPastSLA(approval, now) {
+		if fleetApprovalIsSuggestion(approval) {
+			priority = 3
+			reason = "Review the supervisor suggestion when higher-priority operator decisions are clear."
+		} else if approvalPastSLA(approval, now) {
 			priority = 0
 			reason = "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now."
 		}
 		if summary := strings.TrimSpace(approval.Summary); summary != "" {
 			reason = summary + " " + reason
 		}
-		target := firstNonEmpty(approval.PRURL, approval.IssueURL, approval.DashboardURL)
+		target := firstNonEmpty(approval.DashboardURL, fleetApprovalsFocusedPath(approval.ID))
 		candidates = append(candidates, fleetNextActionCandidate{
 			Project:     approval.ProjectName,
 			Kind:        "approval_pending",
@@ -1687,11 +1768,7 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 		if reason == "" {
 			reason = strings.TrimSpace(project.OperatorState.Label)
 		}
-		target := firstNonEmpty(
-			project.OperatorState.PRURL,
-			project.OperatorState.IssueURL,
-			project.DashboardURL,
-		)
+		target := fleetNextActionTargetForProject(project)
 		candidates = append(candidates, fleetNextActionCandidate{
 			Project:     project.Name,
 			Kind:        kind,
@@ -1900,7 +1977,7 @@ func oldestPastSLAPendingFleetApproval(approvals []fleetApprovalState, now time.
 	var selected *fleetApprovalState
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || !approvalPastSLA(approval, now) {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || fleetApprovalIsSuggestion(approval) || !approvalPastSLA(approval, now) {
 			continue
 		}
 		if selected == nil || fleetApprovalRecency(*approval).Before(fleetApprovalRecency(*selected)) {
@@ -1914,7 +1991,7 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 	var selected *fleetApprovalState
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || fleetApprovalIsSuggestion(approval) {
 			continue
 		}
 		if selected == nil {
@@ -2270,11 +2347,16 @@ func latestTime(left, right time.Time) time.Time {
 	return left
 }
 
-func addFleetApprovalSummary(summary *fleetSummary, status string) {
-	switch state.ApprovalStatus(status) {
+func addFleetApprovalSummary(summary *fleetSummary, approval fleetApprovalState) {
+	switch state.ApprovalStatus(approval.Status) {
 	case state.ApprovalStatusPending:
 		summary.Approvals++
 		summary.ApprovalsPending++
+		if fleetApprovalIsSuggestion(&approval) {
+			summary.ApprovalsSuggestion++
+		} else {
+			summary.ApprovalsActionable++
+		}
 	case state.ApprovalStatusStale:
 		summary.ApprovalsHistorical++
 		summary.ApprovalsStale++
@@ -3342,7 +3424,7 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 	item := fleetApprovalState{
 		ProjectName:       project.Name,
 		ProjectRepo:       project.Repo,
-		DashboardURL:      project.DashboardURL,
+		DashboardURL:      fleetApprovalsFocusedPath(approval.ID),
 		ID:                approval.ID,
 		DecisionID:        approval.DecisionID,
 		Action:            approval.Action,

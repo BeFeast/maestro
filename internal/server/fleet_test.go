@@ -1226,8 +1226,93 @@ func TestBuildFleetNextActionApprovalPastSLABeatsRegularPending(t *testing.T) {
 	if got.Kind != "approval_pending" {
 		t.Fatalf("kind = %q, want approval_pending", got.Kind)
 	}
-	if got.TargetURL != "https://github.com/owner/past-sla/pull/12" {
-		t.Fatalf("target_url = %q, want PR URL", got.TargetURL)
+	if got.TargetURL != "/approvals?id=past-sla" {
+		t.Fatalf("target_url = %q, want focused approvals URL", got.TargetURL)
+	}
+}
+
+func TestBuildFleetNextActionSuggestionPastSLADoesNotEscalate(t *testing.T) {
+	now := time.Now().UTC()
+	approvals := []fleetApprovalState{{
+		ProjectName:  "Apertune",
+		ID:           "lesson-1",
+		Status:       string(state.ApprovalStatusPending),
+		Action:       config.SupervisorActionApplyLessonProposal,
+		Summary:      "Apply lesson proposal for retry_exhausted in issue:1.",
+		DashboardURL: "/approvals?id=lesson-1",
+		createdAt:    now.Add(-2 * time.Hour),
+		updatedAt:    now.Add(-2 * time.Hour),
+	}}
+
+	got := buildFleetNextAction(nil, approvals, now)
+	if got == nil {
+		t.Fatalf("buildFleetNextAction = nil, want low-priority suggestion candidate")
+	}
+	if got.Priority != "P3" {
+		t.Fatalf("priority = %q, want P3 (suggestions must not become P0 when past SLA)", got.Priority)
+	}
+	if got.TargetURL != "/approvals?id=lesson-1" {
+		t.Fatalf("target_url = %q, want focused approvals URL", got.TargetURL)
+	}
+}
+
+func TestBuildFleetNextActionRealOperatorStateBeatsSuggestion(t *testing.T) {
+	now := time.Now().UTC()
+	approvals := []fleetApprovalState{{
+		ProjectName: "Suggestions",
+		ID:          "lesson-1",
+		Status:      string(state.ApprovalStatusPending),
+		Action:      config.SupervisorActionApplyLessonProposal,
+		createdAt:   now.Add(-24 * time.Hour),
+		updatedAt:   now.Add(-24 * time.Hour),
+	}}
+	projects := []fleetProjectState{{
+		Name: "Runtime",
+		OperatorState: fleetOperatorState{
+			Kind:       "stale_worker",
+			Summary:    "Worker PID is not alive.",
+			NextAction: "Open the worker log.",
+			Session:    "sup-1",
+		},
+		Attention: []sessionInfo{{Slot: "sup-1", Status: string(state.StatusRunning), StartedAt: now.Add(-time.Minute).Format(time.RFC3339)}},
+	}}
+
+	got := buildFleetNextAction(projects, approvals, now)
+	if got == nil {
+		t.Fatalf("buildFleetNextAction = nil, want stale worker candidate")
+	}
+	if got.Kind != "stale_worker" || got.Project != "Runtime" || got.Priority != "P0" {
+		t.Fatalf("next action = %+v, want P0 stale_worker for Runtime", got)
+	}
+	if got.TargetURL != "/workers?project=Runtime&slot=sup-1" {
+		t.Fatalf("target_url = %q, want focused worker URL", got.TargetURL)
+	}
+}
+
+func TestSuggestionOnlyApprovalsDoNotAlarmHero(t *testing.T) {
+	now := time.Now().UTC()
+	summary := fleetSummary{}
+	addFleetApprovalSummary(&summary, fleetApprovalState{
+		Status: string(state.ApprovalStatusPending),
+		Action: config.SupervisorActionApplyLessonProposal,
+	})
+	latest := &supervisorDecisionInfo{CreatedAt: now}
+
+	if tone := fleetVerdictTone(summary, latest, now); tone != "healthy" {
+		t.Fatalf("fleetVerdictTone = %q, want healthy for suggestion-only approvals", tone)
+	}
+	if sentence := fleetAttentionSentence(summary); sentence != "No item needs attention." {
+		t.Fatalf("fleetAttentionSentence = %q, want calm sentence", sentence)
+	}
+	brief := buildFleetOperatorBrief([]fleetProjectState{{Name: "Apertune"}}, []fleetApprovalState{{
+		ProjectName: "Apertune",
+		Status:      string(state.ApprovalStatusPending),
+		Action:      config.SupervisorActionApplyLessonProposal,
+		createdAt:   now.Add(-time.Hour),
+		updatedAt:   now.Add(-time.Hour),
+	}}, now)
+	if brief.ActionRequired || brief.Kind == "approval_pending" {
+		t.Fatalf("operator brief = %+v, want no action-required approval for suggestion-only approvals", brief)
 	}
 }
 
@@ -1962,7 +2047,7 @@ func TestFleetApprovalSummaryCountsOnlyActivePendingApprovals(t *testing.T) {
 		string(state.ApprovalStatusApproved),
 		string(state.ApprovalStatusRejected),
 	} {
-		addFleetApprovalSummary(&summary, status)
+		addFleetApprovalSummary(&summary, fleetApprovalState{Status: status})
 	}
 
 	if summary.Approvals != 1 || summary.ApprovalsPending != 1 {
