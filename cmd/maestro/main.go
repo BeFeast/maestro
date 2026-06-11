@@ -51,6 +51,8 @@ Commands:
   watch         Open tmux dashboard with live worker output
   spawn         Spawn a worker for a specific issue number
   drain         Stop spawning new workers and wait for in-flight workers to finish
+  pause         Pause issue selection for a project (in-flight workers finish normally)
+  resume        Resume issue selection for a paused project
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
@@ -101,6 +103,16 @@ Drain flags:
   it as the systemd ExecStop so "systemctl --user restart" drains first:
     ExecStop=/usr/local/bin/maestro drain --config <cfg> --timeout 30m
   The drain flag clears automatically when the supervisor next starts.
+
+Pause / Resume:
+  maestro pause --config <cfg>    Pause the project: the orchestrator stops
+                                  selecting and spawning new issues on its next
+                                  cycle. In-flight workers are NOT killed — they
+                                  finish and land their PRs normally. The flag
+                                  persists in the state dir and survives unit
+                                  restarts; only resume clears it (#683).
+  maestro resume --config <cfg>   Resume issue selection on the next cycle
+                                  without restarting any unit.
 
 Stop flags:
   --session string      Session name to stop (e.g. pan-1)
@@ -289,6 +301,10 @@ func main() {
 		spawnCmd(args)
 	case "drain":
 		drainCmd(args)
+	case "pause":
+		pauseCmd(args)
+	case "resume":
+		resumeCmd(args)
 	case "stop":
 		stopCmd(args)
 	case "kill":
@@ -2056,6 +2072,69 @@ func drainCmd(args []string) {
 	}
 
 	fmt.Printf("Drained: no in-flight workers remain. Safe to restart the supervisor (the drain flag clears automatically on startup).\n")
+}
+
+// pauseResumeConfig parses the shared pause/resume flag set and resolves the
+// single project config the verb operates on.
+func pauseResumeConfig(name string, args []string) *config.Config {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	var configs multiFlag
+	fs.Var(&configs, "config", "Path to config file (can be repeated)")
+	storePath, storeProject := configStoreFlags(fs)
+	fs.Parse(reorderArgs(fs, args))
+
+	cfgs := loadConfigsWithStore(configs, *storePath, *storeProject)
+	if len(cfgs) > 1 {
+		fmt.Fprintf(os.Stderr, "error: %s requires a single --config (one project at a time)\n", name)
+		os.Exit(1)
+	}
+	return cfgs[0]
+}
+
+func pauseCmd(args []string) {
+	cfg := pauseResumeConfig("pause", args)
+
+	// Set the pause flag (#683) so the running orchestrator skips issue
+	// selection on its next cycle. Load-then-save under the state lock; a
+	// concurrent orchestrator save resolves latest-write-wins by PausedAt.
+	s, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+	if s.PauseActive() {
+		fmt.Printf("Project %s is already paused (since %s).\n", cfg.Repo, s.PausedAt.Format(time.RFC3339))
+		return
+	}
+	s.SetPaused(time.Now().UTC())
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		log.Fatalf("save state (set paused): %v", err)
+	}
+
+	running := s.RunningSessionCount()
+	fmt.Printf("Paused %s — the orchestrator will skip issue selection from its next cycle.\n", cfg.Repo)
+	if running > 0 {
+		fmt.Printf("%d in-flight worker(s) keep running and will land their PRs normally.\n", running)
+	}
+	fmt.Printf("The pause persists across unit restarts; run `maestro resume --config <cfg>` to resume.\n")
+}
+
+func resumeCmd(args []string) {
+	cfg := pauseResumeConfig("resume", args)
+
+	s, err := state.Load(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("load state: %v", err)
+	}
+	if !s.PauseActive() {
+		fmt.Printf("Project %s is not paused — nothing to resume.\n", cfg.Repo)
+		return
+	}
+	s.ClearPaused(time.Now().UTC())
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		log.Fatalf("save state (clear paused): %v", err)
+	}
+
+	fmt.Printf("Resumed %s — the orchestrator restores issue selection on its next cycle (no restart needed).\n", cfg.Repo)
 }
 
 func stopCmd(args []string) {

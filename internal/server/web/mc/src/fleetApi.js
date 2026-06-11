@@ -517,6 +517,7 @@ function mapProject(project, workers, now) {
     supervisor: project.supervisor || {},
     error: project.error || "",
     readOnly: project.read_only === true,
+    paused: project.paused === true,
     maxParallel: Number(project.max_parallel || 0),
     state: mapProjectState(project),
     summaryLine: projectSummaryLine(project),
@@ -656,6 +657,14 @@ export function mapProjectState(project) {
 
   if (Number(project.running || 0) > 0 || kind === "working") {
     return { state: "live", label, count: project.running };
+  }
+  // #683: an intentional operator pause renders as a calm policy-toned
+  // "paused" state — never dead/missing. The server only emits kind=paused
+  // once no in-flight work remains, so a still-running worker keeps its
+  // live/watch state (it finishes normally); the dedicated paused badge
+  // shows alongside either way.
+  if (kind === "paused") {
+    return { state: "policy", label };
   }
   // #598: auto_merging is convergence-bound and calm — render alongside
   // monitoring_pr (watch tone) rather than stuck/red.
