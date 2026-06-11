@@ -3,6 +3,7 @@ package worker
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -718,6 +719,172 @@ func TestBuildWorkerCmd_CmdWithArgs(t *testing.T) {
 	}
 	if !strings.Contains(args, "--debug") {
 		t.Errorf("expected --debug in args, got: %s", args)
+	}
+}
+
+// #684: the Anthropic CLI registered under a custom backend key (the sup-175
+// `fable:` shape) must build the exact same exec invocation as the `claude:`
+// key — skip-permissions flag, -p, prompt via stdin — resolved via the
+// per-backend provider field.
+func TestBuildWorkerCmd_CustomNameProviderAnthropic(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("implement the issue"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/fable-worktree"
+
+	cfg := BackendConfig{Cmd: "claude --model claude-fable-5 --effort xhigh", Provider: "anthropic"}
+	cmd, stdinFile, err := BuildWorkerCmd("fable", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--dangerously-skip-permissions") {
+		t.Errorf("expected --dangerously-skip-permissions in args, got: %s", args)
+	}
+	if !strings.Contains(args, "-p") {
+		t.Errorf("expected -p in args, got: %s", args)
+	}
+	if strings.Contains(args, "implement the issue") {
+		t.Errorf("prompt content must not appear in argv (stdin delivery): %s", args)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+
+	// Same invocation as the claude: key with the same cmd.
+	direct, directStdin, err := BuildWorkerCmd("claude", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error building claude-key cmd: %v", err)
+	}
+	if !reflect.DeepEqual(cmd.Args, direct.Args) {
+		t.Errorf("custom-name args = %v, want same as claude-key args %v", cmd.Args, direct.Args)
+	}
+	if stdinFile != directStdin {
+		t.Errorf("custom-name stdinFile = %q, want same as claude-key %q", stdinFile, directStdin)
+	}
+}
+
+// #684: provider: openai under a custom key must build the codex exec shape
+// (exec subcommand, bypass flag, -C worktree, stdin prompt via "-").
+func TestBuildWorkerCmd_CustomNameProviderOpenAI(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("implement the issue"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/fast-worktree"
+
+	cfg := BackendConfig{Cmd: "codex --profile fast", Provider: "openai"}
+	cmd, stdinFile, err := BuildWorkerCmd("fast", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "exec") {
+		t.Errorf("expected 'exec' subcommand in args, got: %s", args)
+	}
+	if !strings.Contains(args, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Errorf("expected --dangerously-bypass-approvals-and-sandbox in args, got: %s", args)
+	}
+	if !strings.Contains(args, "-C "+worktree) {
+		t.Errorf("expected -C %s in args, got: %s", worktree, args)
+	}
+	if cmd.Args[len(cmd.Args)-1] != "-" {
+		t.Errorf("expected stdin prompt marker '-' as last arg, got: %v", cmd.Args)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+
+	// Same invocation as the codex: key with the same cmd.
+	direct, _, err := BuildWorkerCmd("codex", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error building codex-key cmd: %v", err)
+	}
+	if !reflect.DeepEqual(cmd.Args, direct.Args) {
+		t.Errorf("custom-name args = %v, want same as codex-key args %v", cmd.Args, direct.Args)
+	}
+}
+
+// #684 second heuristic: no provider set, but the cmd binary basename is a
+// known CLI — must still resolve to the CLI-specific path.
+func TestBuildWorkerCmd_CustomNameCmdBasenameFallback(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("do the thing"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{Cmd: "/usr/local/bin/claude --model opus"}
+	cmd, stdinFile, err := BuildWorkerCmd("mymodel", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--dangerously-skip-permissions") {
+		t.Errorf("expected --dangerously-skip-permissions in args, got: %s", args)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	if strings.Contains(args, "do the thing") {
+		t.Errorf("prompt content must not appear in argv (stdin delivery): %s", args)
+	}
+}
+
+// #684: a genuinely custom CLI (unknown provider, unknown binary) keeps the
+// generic path and its prompt_mode semantics.
+func TestBuildWorkerCmd_UnknownProviderStaysGeneric(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("stdin prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{Cmd: "groq-cli --auto", Provider: "groq", PromptMode: "stdin"}
+	cmd, stdinFile, err := BuildWorkerCmd("helper", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if strings.Contains(args, "dangerously") {
+		t.Errorf("generic backend must not gain CLI permission-bypass flags: %s", args)
+	}
+}
+
+// #684: supervisor commands for custom-named claude backends keep stdin
+// prompt delivery and still avoid worker-only bypass flags.
+func TestBuildSupervisorCmd_CustomNameProviderAnthropic(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("decide safely"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BackendConfig{Cmd: "claude --model claude-fable-5", Provider: "anthropic"}
+	cmd, stdinFile, err := BuildSupervisorCmd("fable", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "-p") {
+		t.Errorf("expected -p in args, got: %s", args)
+	}
+	if strings.Contains(args, "dangerously") || strings.Contains(args, "bypass") {
+		t.Errorf("supervisor command should not include worker permission bypass flags: %s", args)
+	}
+	if strings.Contains(args, "decide safely") {
+		t.Errorf("prompt content must not appear in argv (stdin delivery): %s", args)
 	}
 }
 

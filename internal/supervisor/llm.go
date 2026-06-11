@@ -82,6 +82,7 @@ func (c *backendLLMClient) Complete(prompt string) (string, error) {
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+		Provider:   backendDef.Provider,
 		Model:      c.cfg.Supervisor.Model,
 		Effort:     c.cfg.Supervisor.Effort,
 	}

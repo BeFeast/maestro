@@ -23,7 +23,10 @@ type workerToolHookSetup struct {
 	Claude     bool
 }
 
-func setupWorkerToolHooks(stateDir, worktree, backendName string, hooks config.HooksConfig) (workerToolHookSetup, error) {
+// setupWorkerToolHooks prepares the hook runner. backendKind is the resolved
+// exec-path kind from resolveBackendKind (not the raw config key), so a claude
+// CLI under a custom backend name still gets the automatic hook installer (#684).
+func setupWorkerToolHooks(stateDir, worktree, backendKind string, hooks config.HooksConfig) (workerToolHookSetup, error) {
 	if !toolHookConfigured(hooks.PreTool) && !toolHookConfigured(hooks.PostEdit) {
 		return workerToolHookSetup{}, nil
 	}
@@ -40,7 +43,7 @@ func setupWorkerToolHooks(stateDir, worktree, backendName string, hooks config.H
 	}
 
 	setup := workerToolHookSetup{RunnerPath: runnerPath}
-	if backendName == "claude" {
+	if backendKind == config.BackendKindClaude {
 		if err := writeClaudeToolHookSettings(worktree, runnerPath, hooks); err != nil {
 			return setup, err
 		}
