@@ -530,6 +530,14 @@ const (
 	// surfaced as evidence. NEVER a silent dead-end (#565).
 	StuckReviewRepairExhausted = "review_repair_exhausted"
 	StuckSearchGuardrailTrip   = "search_guardrail_trip"
+	// StuckGuardrailConflict is emitted when the supervisor LLM's
+	// recommendation disagrees with the deterministic guardrail (#689).
+	// The conflict is resolved to the safe side for the cycle (the
+	// deterministic decision when it is risk=safe, otherwise an explicit
+	// no-op) instead of exiting rc=1 — a stable disagreement used to put
+	// systemd in a restart loop. This code surfaces the standoff to the
+	// operator while the loop stays alive.
+	StuckGuardrailConflict = "guardrail_conflict"
 )
 
 const (

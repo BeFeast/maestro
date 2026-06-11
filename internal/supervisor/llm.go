@@ -3,8 +3,10 @@ package supervisor
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 
@@ -152,7 +154,15 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
-	return validateLLMDecision(llmDecision, deterministic, policy)
+	decision, err := validateLLMDecision(llmDecision, deterministic, policy)
+	var conflict *guardrailConflictError
+	if errors.As(err, &conflict) {
+		return resolveGuardrailConflict(llmDecision, deterministic, conflict), nil
+	}
+	if err != nil {
+		return state.SupervisorDecision{}, err
+	}
+	return decision, nil
 }
 
 func buildSupervisorPrompt(cfg *config.Config, packet supervisorStatePacket) (string, error) {
@@ -244,19 +254,30 @@ func validateLLMContractFields(decision LLMDecision) error {
 	return nil
 }
 
+// guardrailConflictError marks a decision-layer disagreement between the
+// supervisor LLM and the deterministic guardrail (action, target, or risk).
+// It is deliberately a distinct type: a conflict is not a process fault, so
+// decideWithLLM resolves it to a safe decision and keeps the loop alive
+// instead of failing the cycle (#689).
+type guardrailConflictError struct {
+	reason string
+}
+
+func (e *guardrailConflictError) Error() string { return e.reason }
+
 func validateLLMDecision(llm LLMDecision, deterministic state.SupervisorDecision, policy supervisorPolicy) (state.SupervisorDecision, error) {
 	action := canonicalAction(llm.RecommendedAction)
 	if action == "" || !policy.isAllowed(action) {
 		return state.SupervisorDecision{}, fmt.Errorf("supervisor LLM action %q is not allowed by policy", llm.RecommendedAction)
 	}
 	if action != deterministic.RecommendedAction {
-		return state.SupervisorDecision{}, fmt.Errorf("supervisor LLM action %q disagrees with deterministic guardrail %q", action, deterministic.RecommendedAction)
+		return state.SupervisorDecision{}, &guardrailConflictError{reason: fmt.Sprintf("supervisor LLM action %q disagrees with deterministic guardrail %q", action, deterministic.RecommendedAction)}
 	}
 	if !targetsAgree(llm.Target, deterministic.Target) {
-		return state.SupervisorDecision{}, fmt.Errorf("supervisor LLM target disagrees with deterministic guardrail")
+		return state.SupervisorDecision{}, &guardrailConflictError{reason: "supervisor LLM target disagrees with deterministic guardrail"}
 	}
 	if riskRank(llm.Risk) < riskRank(deterministic.Risk) {
-		return state.SupervisorDecision{}, fmt.Errorf("supervisor LLM risk %q is lower than deterministic guardrail %q", llm.Risk, deterministic.Risk)
+		return state.SupervisorDecision{}, &guardrailConflictError{reason: fmt.Sprintf("supervisor LLM risk %q is lower than deterministic guardrail %q", llm.Risk, deterministic.Risk)}
 	}
 	requiresApproval := policy.requiresApproval(action)
 	if requiresApproval && !llm.RequiresApproval {
@@ -272,6 +293,62 @@ func validateLLMDecision(llm LLMDecision, deterministic state.SupervisorDecision
 	decision.Reasons = compactReasons(append(outcomeGuardrailReasons(deterministic), redactReasons(llm.Reasons)...))
 	decision.RequiresApproval = llm.RequiresApproval || requiresApproval
 	return decision, nil
+}
+
+// resolveGuardrailConflict converts an LLM-vs-guardrail disagreement into a
+// non-fatal decision (#689). Failing the cycle here turned a stable
+// disagreement into a systemd crash-loop: the same project state reproduces
+// the same answers on every restart (karaoke 2026-06-11, 13+ restarts in ~20
+// minutes on PR #137), leaving the supervisor effectively down for the whole
+// window. The conflict is a decision-layer condition, not a process fault,
+// so it is logged, recorded as a guardrail_conflict stuck state, and
+// resolved to the safe side:
+//   - guardrail action is risk=safe (read-only, or operator-whitelisted
+//     safe_actions in cautious mode): deterministic tie-break — the
+//     guardrail decision wins and proceeds.
+//   - guardrail action is mutating/approval-gated: neither side proceeds
+//     unilaterally; hold an explicit no-op this cycle until LLM and
+//     guardrail agree or an operator intervenes.
+func resolveGuardrailConflict(llm LLMDecision, deterministic state.SupervisorDecision, conflict *guardrailConflictError) state.SupervisorDecision {
+	// The policy check in validateLLMDecision runs before the guardrail
+	// comparisons, so the LLM action is always canonical here.
+	llmAction := canonicalAction(llm.RecommendedAction)
+	log.Printf("[supervisor] guardrail conflict held as logged no-op, not a fatal exit (#689): %s", conflict.reason)
+
+	stuck := state.SupervisorStuckState{
+		Code:              state.StuckGuardrailConflict,
+		Severity:          SeverityWarning,
+		Summary:           fmt.Sprintf("Supervisor LLM and deterministic guardrail disagree: %s.", conflict.reason),
+		Evidence:          compactReasons(append([]string{fmt.Sprintf("LLM recommended %q; deterministic guardrail computed %q", llmAction, deterministic.RecommendedAction)}, redactReasons(llm.Reasons)...)),
+		RecommendedAction: "Inspect why the LLM and the deterministic guardrail disagree; the supervise loop stays alive and re-evaluates next cycle.",
+		SupervisorCanAct:  false,
+		Target:            copyTarget(deterministic.Target),
+	}
+
+	if deterministic.Risk == RiskSafe {
+		decision := deterministic
+		decision.Reasons = compactReasons(append([]string{
+			conflict.reason,
+			"Guardrail action is risk=safe, so the deterministic decision wins the tie-break",
+		}, deterministic.Reasons...))
+		decision.StuckStates = appendStuck(decision.StuckStates, stuck)
+		return decision
+	}
+
+	decision := deterministic
+	decision.RecommendedAction = ActionNone
+	decision.Risk = RiskSafe
+	decision.RequiresApproval = false
+	decision.Mutations = nil
+	decision.Target = nil
+	decision.Confidence = 0.5
+	decision.Summary = "Supervisor LLM and deterministic guardrail disagree on a mutating action; holding a no-op this cycle."
+	decision.Reasons = compactReasons(append([]string{
+		conflict.reason,
+		fmt.Sprintf("Guardrail action %q is not risk=safe, so neither side executes until the disagreement resolves", deterministic.RecommendedAction),
+	}, outcomeGuardrailReasons(deterministic)...))
+	decision.StuckStates = appendStuck(decision.StuckStates, stuck)
+	return decision
 }
 
 func outcomeGuardrailReasons(deterministic state.SupervisorDecision) []string {
