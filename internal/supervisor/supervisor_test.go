@@ -2634,7 +2634,12 @@ func TestDecideWithLLM_MalformedOutputRejected(t *testing.T) {
 	}
 }
 
-func TestDecideWithLLM_DetectorDisagreementRejected(t *testing.T) {
+// #689: an LLM-vs-guardrail disagreement is a decision-layer condition, not
+// a process fault. When the guardrail side is risk=safe, the deterministic
+// decision wins the tie-break and the cycle succeeds with a
+// guardrail_conflict stuck state instead of an error (which used to exit
+// rc=1 and put systemd in a crash-loop).
+func TestDecideWithLLM_DetectorDisagreementResolvesToDeterministicSafeSide(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work")}}
 	llm := &fakeLLM{output: `{
@@ -2654,9 +2659,22 @@ func TestDecideWithLLM_DetectorDisagreementRejected(t *testing.T) {
 		StartedAt:   time.Now().UTC(),
 	}
 
-	_, err := testLLMEngine(cfg, reader, llm).Decide(st)
-	if err == nil || !strings.Contains(err.Error(), "disagrees with deterministic guardrail") {
-		t.Fatalf("Decide error = %v, want detector disagreement", err)
+	decision, err := testLLMEngine(cfg, reader, llm).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v (disagreement must resolve, not fail the cycle — #689)", err)
+	}
+	if decision.RecommendedAction != ActionWaitForRunningWorker {
+		t.Fatalf("action = %q, want deterministic %q (safe guardrail side wins the tie-break)", decision.RecommendedAction, ActionWaitForRunningWorker)
+	}
+	if decision.Risk != RiskSafe {
+		t.Fatalf("risk = %q, want safe", decision.Risk)
+	}
+	stuck := requireStuckState(t, decision, state.StuckGuardrailConflict)
+	if stuck.Severity != SeverityWarning {
+		t.Errorf("severity = %q, want warning", stuck.Severity)
+	}
+	if !strings.Contains(stuck.Summary, "disagrees with deterministic guardrail") {
+		t.Errorf("summary = %q, want it to name the disagreement", stuck.Summary)
 	}
 }
 

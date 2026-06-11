@@ -660,15 +660,21 @@ func superviseCmd(args []string) {
 		cfg.Supervisor.DryRun = true
 	}
 	gh := github.New(cfg.Repo)
-	runOnce := func() {
+	runOnce := func() error {
 		decision, err := supervisor.RunOnce(cfg, gh)
 		if err != nil {
-			log.Fatalf("supervise: %v", err)
+			return err
 		}
 		printSupervisorDecision(decision, *jsonOutput)
+		return nil
 	}
 
-	runOnce()
+	// The first cycle stays fatal so a broken setup (bad config, missing
+	// backend, auth) fails `systemctl start` loudly instead of leaving a
+	// daemon up that can never work.
+	if err := runOnce(); err != nil {
+		log.Fatalf("supervise: %v", err)
+	}
 	if *once {
 		return
 	}
@@ -701,7 +707,16 @@ func superviseCmd(args []string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runOnce()
+			// #689: a failed cycle inside the loop is logged and retried on
+			// the next tick, never rc=1 — exiting here converted stable
+			// decision-layer errors and transient GitHub failures into a
+			// systemd crash-loop (~40s CPU per restart, supervisor down for
+			// the whole window). Persistent failures still surface: the
+			// #499 watchdog flags SupervisorStuck when LastRunOnceAt stops
+			// advancing.
+			if err := runOnce(); err != nil {
+				log.Printf("supervise: cycle failed (will retry in %s): %v", *interval, err)
+			}
 		}
 	}
 }
