@@ -690,6 +690,50 @@ func (c StaleSessionReconcilerConfig) MergedPRDismissesEnabled() bool {
 	return *c.MergedPRDismisses
 }
 
+// ReviewRetriggerConfig governs the orchestrator's self-healing re-trigger
+// for the greptile review gate (#691). Greptile occasionally misses its
+// review webhook: the PR sits CI=green with zero review signal on the
+// current head and the orchestrator loops "waiting for review gate
+// (greptile=pending)" forever. Server-side update-branch makes this worse —
+// the gate resets on the new head and the re-review webhook is missed again.
+// When the greptile stream has been pending on the same head SHA for more
+// than PendingMinutes, the orchestrator posts "@greptile review" on the PR
+// (bounded by CooldownMinutes to avoid comment churn) so the review re-runs
+// without operator intervention.
+type ReviewRetriggerConfig struct {
+	Enabled         *bool `yaml:"enabled"`          // default: true
+	PendingMinutes  int   `yaml:"pending_minutes"`  // re-trigger after this many minutes of greptile=pending on one head (default: 10)
+	CooldownMinutes int   `yaml:"cooldown_minutes"` // minimum minutes between re-trigger comments per session (default: 30)
+}
+
+// Active reports whether the stale-review re-trigger runs. Default true —
+// the orchestrator owns the review gate and should own its liveness.
+func (c ReviewRetriggerConfig) Active() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+// EffectivePendingFor returns how long the greptile stream must stay pending
+// on the same head before a re-trigger fires. Default 10 minutes when unset
+// or non-positive.
+func (c ReviewRetriggerConfig) EffectivePendingFor() time.Duration {
+	if c.PendingMinutes <= 0 {
+		return 10 * time.Minute
+	}
+	return time.Duration(c.PendingMinutes) * time.Minute
+}
+
+// EffectiveCooldown returns the minimum gap between re-trigger comments for
+// one session. Default 30 minutes when unset or non-positive.
+func (c ReviewRetriggerConfig) EffectiveCooldown() time.Duration {
+	if c.CooldownMinutes <= 0 {
+		return 30 * time.Minute
+	}
+	return time.Duration(c.CooldownMinutes) * time.Minute
+}
+
 // SessionRetentionConfig bounds the growth of state.Sessions by compacting
 // terminal sessions once both the count and age floors are exceeded (#497).
 // Defaults keep the 20 newest terminal sessions per project and any terminal
@@ -791,6 +835,7 @@ type Config struct {
 	MergeIntervalSeconds            int                          `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
 	ReviewGate                      string                       `yaml:"review_gate"`                        // "greptile" (default) | "none"
 	ReviewGateStreams               []string                     `yaml:"review_gate_streams"`                // optional review dimensions; default ["greptile"], opt-in ["greptile","simplicity"]
+	ReviewRetrigger                 ReviewRetriggerConfig        `yaml:"review_retrigger"`                   // #691: re-post "@greptile review" when the gate wedges at pending with no review on head
 	AutoRetryReviewFeedback         bool                         `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
 	MergeExhaustedNonCriticalReview *bool                        `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
 	AutoRetryRebaseConflicts        bool                         `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts

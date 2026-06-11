@@ -630,6 +630,11 @@ func (c *Client) pullHeadSHA(prNumber int) (string, error) {
 	return sha, nil
 }
 
+// PRHeadSHA returns the current head commit SHA of a PR.
+func (c *Client) PRHeadSHA(prNumber int) (string, error) {
+	return c.pullHeadSHA(prNumber)
+}
+
 func (c *Client) checkRunsForSHA(sha string) ([]greptileCheckRun, error) {
 	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/commits/%s/check-runs?per_page=100", c.Repo, sha), "--paginate")
 	if err != nil {
@@ -1149,6 +1154,19 @@ func (c *Client) CommentIssue(issueNumber int, body string) error {
 	).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("gh issue comment: %w\n%s", err, out)
+	}
+	return nil
+}
+
+// CommentPR leaves a comment on a pull request.
+func (c *Client) CommentPR(prNumber int, body string) error {
+	out, err := exec.Command("gh", "pr", "comment",
+		strconv.Itoa(prNumber),
+		"--repo", c.Repo,
+		"--body", body,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr comment: %w\n%s", err, out)
 	}
 	return nil
 }
