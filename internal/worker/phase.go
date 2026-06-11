@@ -42,10 +42,11 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+		Provider:   backendDef.Provider,
 		MCP:        backendDef.MCP,
 	}
 
-	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, backendName, cfg.Hooks)
+	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
 		return fmt.Errorf("setup worker tool hooks: %w", err)
 	}

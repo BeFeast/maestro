@@ -27,6 +27,7 @@ type BackendConfig struct {
 	Cmd        string   // binary name (e.g. "claude", "codex", "gemini")
 	ExtraArgs  []string // additional args from config
 	PromptMode string   // how to deliver prompt: "arg", "stdin", "file"
+	Provider   string   // per-backend provider field; resolves the exec path for custom-named backends (#684)
 	Model      string   // optional model name for role-specific backend calls
 	Effort     string   // optional reasoning effort for role-specific backend calls
 	MCP        config.MCPConfig
@@ -337,17 +338,27 @@ func tomlStringMap(values map[string]string) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
-// BuildWorkerCmd creates the right exec.Cmd based on backend name.
-// Known backends (claude, codex, gemini) use their specific command builders.
-// Unknown backends use the generic builder with prompt_mode from config.
-// Returns the command, an optional stdinFile path (for backends that read
-// the prompt via stdin, e.g. codex), and any error.
-func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
+// resolveBackendKind maps a backend name + config to the CLI-specific exec
+// path (#684). Custom-named backends resolve by the per-backend provider
+// field, then by the binary basename of cmd, so a known CLI registered under
+// a custom key (e.g. `fable: {provider: anthropic, cmd: "claude --model …"}`)
+// keeps its CLI-specific behaviour — permission-bypass flags and stdin prompt
+// delivery — instead of silently degrading to the generic path.
+func resolveBackendKind(backendName string, cfg BackendConfig) string {
 	if backendName == "" {
 		backendName = "claude"
 	}
+	return config.ResolveBackendKind(backendName, cfg.Provider, cfg.Cmd)
+}
 
-	if b, ok := knownBackends[backendName]; ok {
+// BuildWorkerCmd creates the right exec.Cmd for a backend. The backend name,
+// provider field, and cmd binary resolve to a CLI-specific builder (claude,
+// codex, gemini, cline — see resolveBackendKind); anything else uses the
+// generic builder with prompt_mode from config.
+// Returns the command, an optional stdinFile path (for backends that read
+// the prompt via stdin, e.g. claude/codex), and any error.
+func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
+	if b, ok := knownBackends[resolveBackendKind(backendName, cfg)]; ok {
 		return b.BuildCmd(cfg, promptFile, worktree)
 	}
 
@@ -357,13 +368,11 @@ func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree 
 
 // BuildSupervisorCmd creates a read-only model command for supervisor decisions.
 // It reuses backend prompt delivery semantics but intentionally avoids worker-only
-// permission bypass flags.
+// permission bypass flags. Like BuildWorkerCmd, the exec path is resolved from
+// the backend name, provider field, and cmd binary (#684) so custom-named
+// backends keep stdin prompt delivery.
 func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
-	if backendName == "" {
-		backendName = "claude"
-	}
-
-	switch backendName {
+	switch resolveBackendKind(backendName, cfg) {
 	case "claude":
 		claudeCmd := cfg.Cmd
 		if claudeCmd == "" {

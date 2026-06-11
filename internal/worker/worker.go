@@ -107,10 +107,11 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+		Provider:   backendDef.Provider,
 		MCP:        backendDef.MCP,
 	}
 
-	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, backendName, cfg.Hooks)
+	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
 		return "", fmt.Errorf("setup worker tool hooks: %w", err)
 	}
@@ -254,10 +255,11 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		Cmd:        backendDef.Cmd,
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
+		Provider:   backendDef.Provider,
 		MCP:        backendDef.MCP,
 	}
 
-	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, backendName, cfg.Hooks)
+	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
 		return fmt.Errorf("setup worker tool hooks: %w", err)
 	}

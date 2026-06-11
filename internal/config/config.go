@@ -1391,6 +1391,7 @@ func (c *Config) Warnings() []string {
 	if msg := c.manualRoutingLabelPinWarning(); msg != "" {
 		warnings = append(warnings, msg)
 	}
+	warnings = append(warnings, c.backendResolutionWarnings()...)
 	return warnings
 }
 

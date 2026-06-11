@@ -262,6 +262,28 @@ model:
 > Headless mode: `cline -y "task"` — auto-approves all actions and exits when done.
 > SAP AI Core example: set provider to `sapaicore`, model to `anthropic--claude-4.5-opus`.
 
+### Custom-named backends
+
+Backends do not have to be named after the CLI they run. A custom key (e.g. a model nickname) keeps full CLI-specific behaviour — permission-bypass flags and stdin prompt delivery — as long as Maestro can tell which CLI it wraps. Resolution order:
+
+1. the backend name itself (`claude`, `codex`, `gemini`, `cline`),
+2. the `provider` field (`anthropic`/`claude` → Claude, `openai`/`codex` → Codex, `google`/`gemini` → Gemini, `cline` → Cline),
+3. the binary basename of `cmd` (`claude`, `codex`, `gemini`, `cline`).
+
+```yaml
+model:
+  default: fable
+  backends:
+    fable:
+      provider: anthropic    # → claude exec path (--dangerously-skip-permissions, -p, prompt via stdin)
+      cmd: claude --model claude-fable-5 --effort xhigh
+    fast:
+      provider: openai       # → codex exec path (exec, bypass flag, prompt via stdin)
+      cmd: codex --profile fast
+```
+
+A backend that matches none of the above falls back to the generic exec path: `prompt_mode` applies, no permission-bypass flag is added, and Maestro logs a startup warning naming the backend. Use the generic path only for genuinely custom CLIs.
+
 ### Optional worker MCP tools
 
 Worker sessions receive no MCP tools by default. Attach project-specific MCP servers per backend with `model.backends.<name>.mcp`:
