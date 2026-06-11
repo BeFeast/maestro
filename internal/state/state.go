@@ -892,6 +892,16 @@ type State struct {
 	SpawnDrain   bool      `json:"spawn_drain,omitempty"`
 	SpawnDrainAt time.Time `json:"spawn_drain_at,omitempty"`
 
+	// Paused is the first-class operator pause (#683): while it is set, the
+	// orchestrator skips issue selection entirely and spawns no new workers,
+	// but in-flight workers run to completion and land their PRs normally.
+	// Unlike SpawnDrain it deliberately survives restarts of both project
+	// units — only `maestro resume` clears it. PausedAt records when the
+	// flag last toggled (UTC) so concurrent state writers resolve pause
+	// on/off latest-write-wins, mirroring the drain merge semantics.
+	Paused   bool      `json:"paused,omitempty"`
+	PausedAt time.Time `json:"paused_at,omitempty"`
+
 	// ReviewRepairTracks records per-(pr_number,head_sha) idempotency for
 	// the #565 auto review-repair respawn. Each spawn bumps the Attempts
 	// counter; the supervisor refuses to mint a fresh recommendation once
@@ -1205,6 +1215,8 @@ func (s *State) copyFrom(src *State) {
 	s.LastMergeAt = src.LastMergeAt
 	s.SpawnDrain = src.SpawnDrain
 	s.SpawnDrainAt = src.SpawnDrainAt
+	s.Paused = src.Paused
+	s.PausedAt = src.PausedAt
 }
 
 func cloneState(s *State) *State {
@@ -1250,6 +1262,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	mergeSpawnDrain(merged, current, ours)
+	mergePaused(merged, current, ours)
 	return merged, nil
 }
 
@@ -1266,6 +1279,21 @@ func mergeSpawnDrain(merged, current, ours *State) {
 	}
 	merged.SpawnDrain = current.SpawnDrain
 	merged.SpawnDrainAt = current.SpawnDrainAt
+}
+
+// mergePaused resolves the pause flag (#683) latest-write-wins by PausedAt,
+// mirroring mergeSpawnDrain: `maestro pause` sets Paused=true and `maestro
+// resume` clears it — both stamp PausedAt — so picking the snapshot with the
+// newer timestamp keeps a concurrent orchestrator save from clobbering a
+// fresh pause request, and a fresh resume from being undone by a stale set.
+func mergePaused(merged, current, ours *State) {
+	if ours.PausedAt.After(current.PausedAt) {
+		merged.Paused = ours.Paused
+		merged.PausedAt = ours.PausedAt
+		return
+	}
+	merged.Paused = current.Paused
+	merged.PausedAt = current.PausedAt
 }
 
 func mergeProjectStatusSync(current, ours map[int]ProjectStatusSync) map[int]ProjectStatusSync {
@@ -2541,6 +2569,33 @@ func (s *State) ClearSpawnDrain(at time.Time) {
 // DrainActive reports whether a graceful drain is currently requested.
 func (s *State) DrainActive() bool {
 	return s != nil && s.SpawnDrain
+}
+
+// SetPaused marks the project paused (#683): the orchestrator skips issue
+// selection and spawns no new workers, while in-flight workers finish
+// normally. The timestamp is stamped so concurrent state writers resolve
+// pause on/off latest-write-wins.
+func (s *State) SetPaused(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.Paused = true
+	s.PausedAt = normalizedTime(at)
+}
+
+// ClearPaused lifts an operator pause. Called by `maestro resume`; the
+// orchestrator picks the change up on its next cycle without a restart.
+func (s *State) ClearPaused(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.Paused = false
+	s.PausedAt = normalizedTime(at)
+}
+
+// PauseActive reports whether the project is currently paused by an operator.
+func (s *State) PauseActive() bool {
+	return s != nil && s.Paused
 }
 
 // LiveSessions returns sessions that belong in the default operator view.

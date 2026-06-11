@@ -397,7 +397,14 @@ func recordOutcomeHealth(cfg *config.Config, st *state.State) {
 func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 	var decision state.SupervisorDecision
 	var err error
-	if e.cfg.Supervisor.Enabled {
+	if st.PauseActive() && len(st.ActiveSessions()) == 0 {
+		// Operator pause (#683) with no in-flight work: report the paused
+		// state instead of treating the idle project as a stall or
+		// recommending new work. While a worker is still finishing, normal
+		// decision flow continues so its PR keeps being monitored; the
+		// orchestrator's spawn gate prevents any new worker regardless.
+		decision = e.pausedDecision(st)
+	} else if e.cfg.Supervisor.Enabled {
 		decision, err = e.decideWithLLM(st)
 	} else {
 		decision, err = e.decideDeterministic(st)
@@ -414,6 +421,23 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		decision.Repo = strings.TrimSpace(e.cfg.Repo)
 	}
 	return decision, nil
+}
+
+// pausedDecision reports an operator pause (#683) as a calm, explicit
+// supervisor state: no GitHub reads, no stall detection, no recommendations.
+// The supervise loop stays alive and keeps emitting this decision until
+// `maestro resume` clears the flag.
+func (e *Engine) pausedDecision(st *state.State) state.SupervisorDecision {
+	now := e.now().UTC()
+	projectState := e.projectState(st)
+	reasons := []string{
+		fmt.Sprintf("Project is paused by an operator since %s (maestro pause)", st.PausedAt.Format(time.RFC3339)),
+		"Issue selection is skipped while paused; no new workers will be spawned",
+		"No in-flight worker remains, so there is nothing to monitor until the project is resumed",
+	}
+	return e.decision(st, now, projectState, ActionNone,
+		"Project is paused; run `maestro resume` to restore issue selection.",
+		RiskSafe, 0.95, nil, PolicyRuleRuntimeState, reasons)
 }
 
 func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision, error) {

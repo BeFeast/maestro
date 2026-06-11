@@ -92,6 +92,7 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
             <span><Icon.Github /> {p.repo}</span>
             <span style={{ color: "var(--fg-4)" }}>·</span>
             <span>backend <strong>{p.backend}</strong></span>
+            {p.paused && <Pill tone="policy" noDot>paused</Pill>}
           </div>
           <h1 className={`hb-verdict tone-${vtone}`}>
             <em>{verdict[0]}</em>{verdict[1]}

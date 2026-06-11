@@ -355,6 +355,29 @@ Stop a specific session and remove its worktree.
 maestro stop --session pan-1
 ```
 
+### `maestro pause` / `maestro resume`
+
+First-class pause/resume for a project's execution — no systemd unit or config
+file surgery needed.
+
+```bash
+maestro pause --config /path/to/project.yaml    # stop selecting/spawning new issues
+maestro resume --config /path/to/project.yaml   # restore issue selection next cycle
+```
+
+While paused:
+
+- The orchestrator skips issue selection entirely and spawns zero new workers,
+  even when `maestro-ready` issues exist.
+- An in-flight worker is **not** killed — it runs to completion and lands its
+  PR normally (drain semantics are unchanged).
+- The flag is persisted in the project state dir and survives a
+  `systemctl --user restart` of both the run and supervise units; only
+  `maestro resume` clears it.
+- The supervisor stays alive and reports the paused state instead of treating
+  the idle project as a stall, and `GET /api/v1/fleet` exposes a per-project
+  `paused` flag (Mission Control shows a paused badge).
+
 ## State
 
 State is stored in `~/.maestro/<repo-hash>/state.json`:

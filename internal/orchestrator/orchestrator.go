@@ -4195,6 +4195,16 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			s.SpawnDrainAt.Format(time.RFC3339), s.RunningSessionCount())
 		return
 	}
+	// Operator pause (#683): while `maestro pause` is in effect, skip issue
+	// selection entirely — no listing, no claiming, no spawns — while
+	// in-flight workers keep running to completion. Unlike drain, the flag
+	// is NOT cleared on startup; it persists until `maestro resume`, which
+	// the next cycle picks up from disk without a unit restart.
+	if s.PauseActive() {
+		log.Printf("[orch] project paused (since %s): skipping issue selection — not spawning new workers (running=%d)",
+			s.PausedAt.Format(time.RFC3339), s.RunningSessionCount())
+		return
+	}
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)

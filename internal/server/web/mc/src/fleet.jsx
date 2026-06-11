@@ -376,6 +376,7 @@ function FleetTape({ projects, navigate, now }) {
           <div className="tape-id">
             <div className="tape-id-top">
               <ProjectStatePill state={p.state} />
+              {p.paused && <Pill tone="policy" noDot>paused</Pill>}
             </div>
             <div className="tape-name mt-2">{p.slug}</div>
             <div className="tape-summary">{p.summaryLine}</div>

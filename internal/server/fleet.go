@@ -498,6 +498,15 @@ type fleetProjectState struct {
 	RestartRequired       bool   `json:"restart_required,omitempty"`
 	RestartRequiredReason string `json:"restart_required_reason,omitempty"`
 
+	// Paused mirrors the first-class operator pause (#683): `maestro pause`
+	// set the persisted flag, the orchestrator skips issue selection, and
+	// in-flight workers finish normally. Surfaced so Mission Control and
+	// the operator brief can tell an intentional pause from an outage.
+	// Paused is a plain bool (never omitted) so the SPA reads an explicit
+	// value for every project.
+	Paused   bool      `json:"paused"`
+	PausedAt time.Time `json:"paused_at,omitempty"`
+
 	OperatorState fleetOperatorState `json:"operator_state"`
 	Outcome       outcome.Status     `json:"outcome"`
 	Summary       map[string]int     `json:"summary"`
@@ -2586,6 +2595,8 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
 	item.RestartRequired = st.RestartRequired
 	item.RestartRequiredReason = st.RestartRequiredReason
+	item.Paused = st.PauseActive()
+	item.PausedAt = st.PausedAt
 	item.CloseCandidates = fleetCloseCandidates(item, st)
 	if len(item.CloseCandidates) > 0 {
 		item.Actions = append(item.Actions, closeIssueBatchControlAction(item.ReadOnly, "/api/v1/fleet/actions", item.Name, item.CloseCandidates))
@@ -2933,6 +2944,21 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			}
 		}
 		return state
+	}
+	// Operator pause (#683): once no in-flight work remains, an intentional
+	// pause reads as "Paused" — not dead, not stalled, not idle. Placed
+	// after the stale check so a genuinely dead unit still surfaces as an
+	// outage, and after the running/PR checks so a finishing worker still
+	// reads "Working" / "Monitoring PR" while it lands (the SPA shows the
+	// paused badge alongside either way).
+	if project.Paused && project.PROpen == 0 {
+		return fleetOperatorState{
+			Kind:       "paused",
+			Tone:       "muted",
+			Label:      "Paused",
+			Summary:    "Project execution is paused by an operator; issue selection is skipped.",
+			NextAction: "Run `maestro resume --config <cfg>` to restore issue selection.",
+		}
 	}
 	if state, ok := fleetOperatorStateFromSupervisor(project); ok {
 		return state
