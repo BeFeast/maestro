@@ -112,6 +112,8 @@ type Orchestrator struct {
 	ghPRChecksOutputFn          func(prNumber int) (string, error)
 	ghCollectPRReviewFeedbackFn func(prNumber int) (string, error)
 	ghCloseIssueFn              func(number int, comment string) error
+	ghPRHeadSHAFn               func(prNumber int) (string, error)
+	ghCommentPRFn               func(prNumber int, body string) error
 	workerStopFn                func(cfg *config.Config, slotName string, sess *state.Session) error
 	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 	outcomeCheckFn              func(context.Context, outcome.Brief) outcome.HealthCheckResult
@@ -276,6 +278,26 @@ func (o *Orchestrator) prReviewGateVerdict(prNumber int) (github.ReviewGateVerdi
 		return o.ghPRReviewGateVerdictFn(prNumber, streams)
 	}
 	return o.gh.PRReviewGateVerdict(prNumber, streams)
+}
+
+func (o *Orchestrator) prHeadSHA(prNumber int) (string, error) {
+	if o.ghPRHeadSHAFn != nil {
+		return o.ghPRHeadSHAFn(prNumber)
+	}
+	if o.gh == nil {
+		return "", fmt.Errorf("no github client configured for head SHA")
+	}
+	return o.gh.PRHeadSHA(prNumber)
+}
+
+func (o *Orchestrator) commentPR(prNumber int, body string) error {
+	if o.ghCommentPRFn != nil {
+		return o.ghCommentPRFn(prNumber, body)
+	}
+	if o.gh == nil {
+		return fmt.Errorf("no github client configured for PR comment")
+	}
+	return o.gh.CommentPR(prNumber, body)
 }
 
 func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
@@ -1486,6 +1508,10 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		changed = append(changed, fmt.Sprintf("review_gate: %s→%s", old.ReviewGate, newCfg.ReviewGate))
 		o.cfg.ReviewGate = newCfg.ReviewGate
 	}
+	if !reflect.DeepEqual(newCfg.ReviewRetrigger, old.ReviewRetrigger) {
+		changed = append(changed, "review_retrigger")
+		o.cfg.ReviewRetrigger = newCfg.ReviewRetrigger
+	}
 	if newCfg.AutoRetryReviewFeedback != old.AutoRetryReviewFeedback {
 		changed = append(changed, fmt.Sprintf("auto_retry_review_feedback: %v→%v", old.AutoRetryReviewFeedback, newCfg.AutoRetryReviewFeedback))
 		o.cfg.AutoRetryReviewFeedback = newCfg.AutoRetryReviewFeedback
@@ -2572,8 +2598,10 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			if reviewVerdict.Pending {
 				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
+				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
 				continue // not ready yet
 			}
+			clearReviewPendingTracking(sess)
 			if !reviewVerdict.Passed {
 				log.Printf("[orch] PR #%d blocked by review gate (%s)", pr.Number, reviewVerdict.Summary())
 				// auto-label blocked disabled
@@ -2628,6 +2656,80 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
+}
+
+// greptileRetriggerComment is the PR comment that asks Greptile to (re)run
+// its review — the same comment an operator posts manually to un-wedge a PR.
+const greptileRetriggerComment = "@greptile review"
+
+// maybeRetriggerStalePendingReview self-heals the Greptile webhook-miss wedge
+// (#691): a PR sits CI=green with zero Greptile review signal on the current
+// head and the review gate loops greptile=pending forever. Server-side
+// update-branch re-arms the wedge by resetting the gate on the new head.
+// When the greptile stream has been pending on the same head SHA for longer
+// than review_retrigger.pending_minutes, post "@greptile review" on the PR —
+// at most once per review_retrigger.cooldown_minutes — so the review re-runs
+// without operator intervention. One info log line per re-trigger.
+func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr github.PR, verdict github.ReviewGateVerdict) {
+	if o.cfg == nil || !o.cfg.ReviewRetrigger.Active() {
+		return
+	}
+	if !greptileReviewStreamPending(verdict) {
+		return // a non-greptile stream is pending; "@greptile review" won't help
+	}
+	head, err := o.prHeadSHA(pr.Number)
+	if err != nil {
+		log.Printf("[orch] review re-trigger: head SHA for PR #%d: %v", pr.Number, err)
+		return
+	}
+	now := time.Now().UTC()
+	if sess.ReviewPendingSince == nil || sess.ReviewPendingHeadSHA != head {
+		// First pending observation on this head — start the clock. A new
+		// head (push or server-side update-branch) restarts it.
+		sess.ReviewPendingHeadSHA = head
+		sess.ReviewPendingSince = &now
+		return
+	}
+	pendingFor := now.Sub(*sess.ReviewPendingSince)
+	if pendingFor < o.cfg.ReviewRetrigger.EffectivePendingFor() {
+		return
+	}
+	if sess.ReviewRetriggerAt != nil && now.Sub(*sess.ReviewRetriggerAt) < o.cfg.ReviewRetrigger.EffectiveCooldown() {
+		return
+	}
+	if err := o.commentPR(pr.Number, greptileRetriggerComment); err != nil {
+		log.Printf("[orch] review re-trigger: comment on PR #%d: %v", pr.Number, err)
+		return
+	}
+	sess.ReviewRetriggerAt = &now
+	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (#691)",
+		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment)
+}
+
+// greptileReviewStreamPending reports whether the greptile stream is the one
+// holding the review gate at pending.
+func greptileReviewStreamPending(verdict github.ReviewGateVerdict) bool {
+	for _, stream := range verdict.Streams {
+		if stream.Name == "greptile" {
+			return stream.Pending
+		}
+	}
+	return false
+}
+
+// clearReviewPendingTracking resets the #691 pending clock once the review
+// gate resolves (passed or blocked by findings) so a later pending phase on
+// the same head starts a fresh window.
+func clearReviewPendingTracking(sess *state.Session) {
+	sess.ReviewPendingHeadSHA = ""
+	sess.ReviewPendingSince = nil
+}
+
+func shortHeadSHA(sha string) string {
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
 }
 
 func mergeFlowEligibleStatus(sess *state.Session) bool {

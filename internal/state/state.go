@@ -141,6 +141,15 @@ type Session struct {
 	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
 	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
 
+	// #691: greptile webhook-miss self-heal. The orchestrator tracks how
+	// long the review gate has been greptile=pending on one head SHA; past
+	// the configured threshold it posts "@greptile review" on the PR
+	// (cooldown-bounded) to re-trigger the missed review. A new head SHA
+	// (push or server-side update-branch) restarts the pending clock.
+	ReviewPendingHeadSHA string     `json:"review_pending_head_sha,omitempty"` // head SHA the pending clock applies to
+	ReviewPendingSince   *time.Time `json:"review_pending_since,omitempty"`    // first observation of greptile=pending on that head
+	ReviewRetriggerAt    *time.Time `json:"review_retrigger_at,omitempty"`     // last "@greptile review" re-trigger (cooldown anchor)
+
 	// #426: distinguish agent execution time from workflow elapsed time.
 	// WorkerEndedAt is stamped the FIRST time the worker process exits
 	// (running -> pr_open / dead / failed / etc.). It is never overwritten
