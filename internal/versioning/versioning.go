@@ -193,16 +193,34 @@ func ReadCurrentVersion(files []string) (string, error) {
 	return "", fmt.Errorf("no version found in any configured file")
 }
 
-// UpdateVersionInFile replaces oldVer with newVer in the file.
+// replaceVersionField replaces the first version field whose value equals
+// oldVer, using the same anchored patterns as ReadVersionFromFile. It must
+// not touch other occurrences of the version string (e.g. a dependency pin
+// like "yt-dlp-ejs==0.8.0" in pyproject.toml, or a nested "version" key in
+// a lockfile dependency that coincidentally matches the project version).
+func replaceVersionField(content, oldVer, newVer string) (string, bool) {
+	for _, pat := range versionPatterns {
+		for _, m := range pat.FindAllStringSubmatchIndex(content, -1) {
+			// m[4]:m[5] bound the version capture group.
+			if content[m[4]:m[5]] != oldVer {
+				continue
+			}
+			return content[:m[4]] + newVer + content[m[5]:], true
+		}
+	}
+	return content, false
+}
+
+// UpdateVersionInFile updates the project version field from oldVer to newVer
+// in the file, leaving any other occurrences of oldVer untouched.
 func UpdateVersionInFile(path, oldVer, newVer string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
-	content := string(data)
-	updated := strings.ReplaceAll(content, oldVer, newVer)
-	if updated == content {
-		return fmt.Errorf("version %s not found in %s", oldVer, path)
+	updated, replaced := replaceVersionField(string(data), oldVer, newVer)
+	if !replaced {
+		return fmt.Errorf("version field %s not found in %s", oldVer, path)
 	}
 	if err := os.WriteFile(path, []byte(updated), 0644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)

@@ -208,6 +208,168 @@ edition = "2021"
 	}
 }
 
+func TestUpdateVersionInFile_PreservesDependencyPins(t *testing.T) {
+	// Regression test for the karaoke v0.9.0 incident: a dependency pinned at
+	// the same version as the project must not be rewritten by the bump.
+	dir := t.TempDir()
+
+	content := `[project]
+name = "karaoke"
+version = "0.8.0"
+dependencies = [
+    "yt-dlp-ejs==0.8.0",
+    "fastapi>=0.110",
+]
+`
+	path := filepath.Join(dir, "pyproject.toml")
+	os.WriteFile(path, []byte(content), 0644)
+
+	if err := UpdateVersionInFile(path, "0.8.0", "0.9.0"); err != nil {
+		t.Fatalf("UpdateVersionInFile: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	got := string(data)
+	want := `[project]
+name = "karaoke"
+version = "0.9.0"
+dependencies = [
+    "yt-dlp-ejs==0.8.0",
+    "fastapi>=0.110",
+]
+`
+	if got != want {
+		t.Errorf("file content mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+func TestUpdateVersionInFile_PackageJSONDependencyPins(t *testing.T) {
+	dir := t.TempDir()
+
+	content := `{
+  "name": "myapp",
+  "version": "1.2.3",
+  "dependencies": {
+    "leftpad": "1.2.3"
+  }
+}
+`
+	path := filepath.Join(dir, "package.json")
+	os.WriteFile(path, []byte(content), 0644)
+
+	if err := UpdateVersionInFile(path, "1.2.3", "1.3.0"); err != nil {
+		t.Fatalf("UpdateVersionInFile: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	got := string(data)
+	want := `{
+  "name": "myapp",
+  "version": "1.3.0",
+  "dependencies": {
+    "leftpad": "1.2.3"
+  }
+}
+`
+	if got != want {
+		t.Errorf("file content mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+func TestUpdateVersionInFile_OnlyFirstVersionField(t *testing.T) {
+	// Lockfile-style nested "version" keys matching the project version must
+	// not be rewritten: only the first version field (the one
+	// ReadVersionFromFile reads) is updated.
+	dir := t.TempDir()
+
+	content := `{
+  "version": "1.2.3",
+  "packages": {
+    "node_modules/dep": {
+      "version": "1.2.3"
+    }
+  }
+}
+`
+	path := filepath.Join(dir, "package.json")
+	os.WriteFile(path, []byte(content), 0644)
+
+	if err := UpdateVersionInFile(path, "1.2.3", "2.0.0"); err != nil {
+		t.Fatalf("UpdateVersionInFile: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	got := string(data)
+	want := `{
+  "version": "2.0.0",
+  "packages": {
+    "node_modules/dep": {
+      "version": "1.2.3"
+    }
+  }
+}
+`
+	if got != want {
+		t.Errorf("file content mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+func TestUpdateVersionInFile_VersionOnlyInDependencyPin(t *testing.T) {
+	// If the old version appears only inside a dependency pin (no version
+	// field carries it), the update must fail instead of clobbering the pin.
+	dir := t.TempDir()
+
+	content := `[project]
+name = "myapp"
+version = "0.5.0"
+dependencies = [
+    "foo==0.8.0",
+]
+`
+	path := filepath.Join(dir, "pyproject.toml")
+	os.WriteFile(path, []byte(content), 0644)
+
+	if err := UpdateVersionInFile(path, "0.8.0", "0.9.0"); err == nil {
+		t.Error("expected error when version only appears in a dependency pin")
+	}
+
+	data, _ := os.ReadFile(path)
+	if string(data) != content {
+		t.Errorf("file must be unchanged, got: %q", string(data))
+	}
+}
+
+func TestUpdateVersionInFile_SkipsNonMatchingVersionField(t *testing.T) {
+	// A version field holding a different value (e.g. a Cargo dependency
+	// table) is skipped in favor of the field that matches oldVer.
+	dir := t.TempDir()
+
+	content := `[dependencies.serde]
+version = "1.0.0"
+
+[package]
+version = "0.5.0"
+`
+	path := filepath.Join(dir, "Cargo.toml")
+	os.WriteFile(path, []byte(content), 0644)
+
+	if err := UpdateVersionInFile(path, "0.5.0", "0.6.0"); err != nil {
+		t.Fatalf("UpdateVersionInFile: %v", err)
+	}
+
+	data, _ := os.ReadFile(path)
+	got := string(data)
+	want := `[dependencies.serde]
+version = "1.0.0"
+
+[package]
+version = "0.6.0"
+`
+	if got != want {
+		t.Errorf("file content mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
 func TestBumpTypeString(t *testing.T) {
 	tests := []struct {
 		bt   BumpType
