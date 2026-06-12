@@ -8,7 +8,17 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
-const selectionReasonProviderLimitFallback = "fallback_after_provider_limit"
+const (
+	selectionReasonProviderLimitFallback = "fallback_after_provider_limit"
+	selectionReasonAuthFailureFallback   = "fallback_after_backend_auth_failure"
+)
+
+// backendAuthFailureCooldown is how long an auth-failed backend stays gated
+// before the fallback selector may pick it again. Credential failures clear
+// when the operator (or the cred-sync agent) refreshes the token, and the
+// provider states no reset time, so a short fixed window re-probes the
+// backend a few times an hour instead of per-spawn (#693).
+const backendAuthFailureCooldown = 10 * time.Minute
 
 // recordProviderLimit marks the session's backend as rate-limited and puts it
 // into cooldown. resetAt, when non-nil, is the provider-stated reset time
@@ -43,9 +53,53 @@ func (o *Orchestrator) recordProviderLimit(st *state.State, slotName string, ses
 	st.BackendHealth[sess.Backend] = health
 }
 
+// recordBackendAuthFailure marks the session's backend as failing
+// authentication and puts it into cooldown (#693). Unlike a provider
+// capacity limit there is no provider-stated reset time, so RetryAfter is a
+// fixed short window (backendAuthFailureCooldown) after which the selector
+// re-probes the backend automatically. RateLimitHit is set because it is the
+// shared "transient backend block" marker: FailedAttemptsForIssue excludes
+// such sessions, so the auth outage does not burn the per-issue retry budget.
+func (o *Orchestrator) recordBackendAuthFailure(st *state.State, slotName string, sess *state.Session, pattern string, now time.Time) {
+	if st == nil || sess == nil || sess.Backend == "" {
+		return
+	}
+	if st.BackendHealth == nil {
+		st.BackendHealth = make(map[string]state.BackendHealth)
+	}
+	if pattern == "" {
+		pattern = state.BackendBlockAuthFailure
+	}
+	sess.RateLimitHit = true
+	sess.ProviderLimitBackend = sess.Backend
+	sess.ProviderLimitReason = state.BackendBlockAuthFailure
+	retryAfter := now.UTC().Add(backendAuthFailureCooldown)
+	st.BackendHealth[sess.Backend] = state.BackendHealth{
+		State:       state.BackendHealthCooldown,
+		Reason:      state.BackendBlockAuthFailure,
+		Pattern:     pattern,
+		Since:       now.UTC(),
+		RetryAfter:  &retryAfter,
+		LastSession: slotName,
+	}
+}
+
 func (o *Orchestrator) selectProviderLimitFallback(st *state.State, sess *state.Session, now time.Time) state.BackendSelection {
+	return o.selectBackendFallback(st, sess, now, selectionReasonProviderLimitFallback)
+}
+
+func (o *Orchestrator) selectAuthFailureFallback(st *state.State, sess *state.Session, now time.Time) state.BackendSelection {
+	return o.selectBackendFallback(st, sess, now, selectionReasonAuthFailureFallback)
+}
+
+// selectBackendFallback picks the next backend for a session whose current
+// backend is blocked (provider limit or auth failure), walking
+// backendFallbackCandidates and skipping disabled, already-tried, current,
+// and cooling-down backends. selectionReason records which failure class
+// triggered the fallover in the session's BackendSelection audit record.
+func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Session, now time.Time, selectionReason string) state.BackendSelection {
 	selection := state.BackendSelection{
-		SelectionReason: selectionReasonProviderLimitFallback,
+		SelectionReason: selectionReason,
 		PreviousBackend: backendName(sess),
 	}
 	for _, candidate := range o.backendFallbackCandidates(sess) {
