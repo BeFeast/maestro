@@ -106,6 +106,23 @@ worker_prompt: /path/to/worker-prompt-template.md
 # deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
 # deploy_timeout_minutes: 15         # timeout for deploy command in minutes (default: 15)
 
+# Opt-in self-deploy of the maestro binary itself after every merge (#698).
+# Default OFF. For the dogfood project only: builds merged origin/main
+# (version-stamped), installs atomically keeping the previous binary as
+# <bin_path>.prev, restarts the units via a detached transient unit so the
+# restart survives the orchestrator restarting itself (drain semantics are
+# honored via the units' stop path), verifies the restarted process reports
+# the new version, and rolls back to .prev on failure. See
+# docs/self-deploy-runbook.md.
+# self_deploy:
+#   enabled: true
+#   bin_path: /usr/local/bin/maestro   # default: path of the running binary
+#   units: ["maestro.service"]         # systemd user units to restart
+#   # health_url: http://127.0.0.1:8788/api/v1/state  # default: derived from server.port
+#   # health_token_env: MAESTRO_DASH_TOKEN            # default: server.auth.token_env
+#   # script: ./scripts/self-deploy.sh                # default: <local_path>/scripts/self-deploy.sh
+#   # timeout_minutes: 30                             # build+restart+verify budget (covers drain)
+
 # Stale supervisor sessions are filtered out of the Fleet API attention list
 # under two independent conditions: (a) idle past idle_after_minutes AND the
 # recorded worktree is missing on disk (when require_worktree_missing=true),

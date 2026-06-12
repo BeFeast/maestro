@@ -21,6 +21,7 @@ import (
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/router"
+	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/befeast/maestro/internal/versioning"
@@ -117,6 +118,7 @@ type Orchestrator struct {
 	ghPRHeadSHAFn               func(prNumber int) (string, error)
 	ghCommentPRFn               func(prNumber int, body string) error
 	workerStopFn                func(cfg *config.Config, slotName string, sess *state.Session) error
+	selfDeployStartFn           func(prNumber int) error
 	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 	outcomeCheckFn              func(context.Context, outcome.Brief) outcome.HealthCheckResult
 	syncProjectFn               func(issueNumber int, status github.ProjectStatus) bool
@@ -1251,6 +1253,15 @@ func (o *Orchestrator) RunOnce() error {
 	}
 
 	log.Printf("[orch] === cycle start — %d sessions in state ===", len(s.Sessions))
+
+	// Step 0: Surface a finished self-deploy (#698) as a supervisor finding.
+	// Persist immediately: the result file is already consumed, so the
+	// finding must not depend on the rest of the cycle succeeding.
+	if o.consumeSelfDeployResult(s) {
+		if err := state.Save(o.cfg.StateDir, s); err != nil {
+			return fmt.Errorf("save state after self-deploy result: %w", err)
+		}
+	}
 
 	// Step 1: Reconcile stale running sessions before scheduling/slot calculation.
 	reconciled := o.reconcileRunningSessions(s)
@@ -3632,6 +3643,9 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 		}
 	}
 
+	// Self-deploy hook (#698)
+	o.maybeSelfDeployAfterMerge(pr.Number)
+
 	// Deploy hook
 	deploySucceeded := false
 	if o.cfg.DeployCmd != "" {
@@ -3714,6 +3728,74 @@ func (o *Orchestrator) runDeployCmd(prNumber int) error {
 		return fmt.Errorf("deploy command failed: %w\n%s", err, out)
 	}
 	return nil
+}
+
+// maybeSelfDeployAfterMerge launches the opt-in self-deploy (#698) for a
+// merged PR. Default OFF: without self_deploy.enabled this is a no-op. The
+// deploy script runs in a detached transient unit and restarts this very
+// process, so we must not wait on it here — the outcome lands as a
+// supervisor finding when the result file is consumed on a later cycle (see
+// consumeSelfDeployResult).
+func (o *Orchestrator) maybeSelfDeployAfterMerge(prNumber int) {
+	if !o.cfg.SelfDeploy.Enabled {
+		return
+	}
+	if err := o.triggerSelfDeploy(prNumber); err != nil {
+		log.Printf("[orch] self-deploy trigger failed for PR #%d: %v", prNumber, err)
+		o.notifier.Sendf("⚠️ maestro: self-deploy trigger failed after PR #%d merge: %v", prNumber, err)
+		return
+	}
+	log.Printf("[orch] self-deploy started for PR #%d (detached transient unit)", prNumber)
+	o.notifier.Sendf("🚀 maestro: self-deploy started after PR #%d merge — units will restart after drain", prNumber)
+}
+
+// triggerSelfDeploy starts the opt-in self-deploy (#698) for a merged PR.
+func (o *Orchestrator) triggerSelfDeploy(prNumber int) error {
+	if o.selfDeployStartFn != nil {
+		return o.selfDeployStartFn(prNumber)
+	}
+	return selfdeploy.Trigger(o.cfg, prNumber)
+}
+
+// consumeSelfDeployResult surfaces a finished self-deploy (#698) as a
+// supervisor finding. The deploy script runs detached from this process and
+// drops a JSON result file in the state dir; the first cycle that sees it —
+// typically the first cycle of the freshly deployed binary — records the
+// deployed version (or rollback reason) as a supervisor decision and
+// notifies the operator. Returns true when state changed.
+func (o *Orchestrator) consumeSelfDeployResult(s *state.State) bool {
+	res, err := selfdeploy.ReadResult(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] self-deploy result unreadable: %v", err)
+		// Clear the malformed file so the error is not re-logged forever.
+		if rmErr := selfdeploy.ClearResult(o.cfg.StateDir); rmErr != nil {
+			log.Printf("[orch] self-deploy result cleanup: %v", rmErr)
+		}
+		return false
+	}
+	if res == nil {
+		return false
+	}
+	// Clear before recording so a save failure cannot double-record on the
+	// next cycle; losing the finding is the lesser failure mode.
+	if err := selfdeploy.ClearResult(o.cfg.StateDir); err != nil {
+		log.Printf("[orch] self-deploy result cleanup: %v", err)
+		return false
+	}
+
+	finding := selfdeploy.Finding(res, o.cfg.Repo, time.Now().UTC())
+	s.RecordSupervisorDecision(finding, state.DefaultSupervisorDecisionLimit)
+	log.Printf("[orch] %s", finding.Summary)
+
+	switch res.Status {
+	case selfdeploy.StatusDeployed:
+		o.notifier.Sendf("✅ maestro: self-deploy finished — running v%s (PR #%d)", res.Version, res.PR)
+	case selfdeploy.StatusRolledBack:
+		o.notifier.Sendf("⏪ maestro: self-deploy ROLLED BACK after PR #%d: %s", res.PR, res.Reason)
+	default:
+		o.notifier.Sendf("❌ maestro: self-deploy FAILED after PR #%d: %s — manual intervention may be needed", res.PR, res.Reason)
+	}
+	return true
 }
 
 // routeConflictingMergeFailure reconciles a merge failure that GitHub reports

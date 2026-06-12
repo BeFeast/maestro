@@ -142,9 +142,22 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// binaryVersion is the resolved version of the running maestro process, set
+// once at startup by cmd/maestro via SetBinaryVersion. Surfacing it on the
+// state and fleet endpoints lets the self-deploy health probe (#698) confirm
+// the restarted process actually runs the freshly stamped build.
+var binaryVersion string
+
+// SetBinaryVersion records the running binary's resolved version for the
+// state and fleet API responses.
+func SetBinaryVersion(v string) {
+	binaryVersion = strings.TrimSpace(v)
+}
+
 // stateResponse is the JSON shape for GET /api/v1/state.
 type stateResponse struct {
 	Repo                string                         `json:"repo"`
+	Version             string                         `json:"version,omitempty"` // running maestro binary version (#698)
 	MaxParallel         int                            `json:"max_parallel"`
 	ReadOnly            bool                           `json:"read_only"`
 	Outcome             outcome.Status                 `json:"outcome"`
@@ -928,6 +941,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 	latestDecision := st.LatestSupervisorDecision()
 	resp := stateResponse{
 		Repo:                cfg.Repo,
+		Version:             binaryVersion,
 		MaxParallel:         cfg.MaxParallel,
 		ReadOnly:            cfg.Server.ReadOnly,
 		Outcome:             outcomeStatusForState(cfg, st),
