@@ -2318,9 +2318,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					issue, err := o.getIssue(sess.IssueNumber)
 					if err != nil {
-						log.Printf("[orch] fetch issue #%d for auth-failure fallback: %v — marking as failed", sess.IssueNumber, err)
-						sess.Status = state.StatusFailed
-						now := time.Now().UTC()
+						log.Printf("[orch] fetch issue #%d for auth-failure fallback: %v — marking as dead (backend_auth_failure)", sess.IssueNumber, err)
+						sess.Status = state.StatusDead
+						sess.LastNotifiedStatus = "backend_auth_failure"
 						sess.FinishedAt = &now
 						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) backend auth failure and fallback failed (could not fetch issue)",
@@ -2334,9 +2334,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
-						log.Printf("[orch] auth-failure fallback respawn worker %s with %s: %v — marking as failed", slotName, nextBackend, err)
-						sess.Status = state.StatusFailed
-						now := time.Now().UTC()
+						log.Printf("[orch] auth-failure fallback respawn worker %s with %s: %v — marking as dead (backend_auth_failure)", slotName, nextBackend, err)
+						sess.Status = state.StatusDead
+						sess.LastNotifiedStatus = "backend_auth_failure"
 						sess.FinishedAt = &now
 						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) backend auth failure and fallback to %s failed: %v",
