@@ -108,6 +108,7 @@ type Orchestrator struct {
 	ghPRReviewGateVerdictFn     func(prNumber int, streams []string) (github.ReviewGateVerdict, error)
 	ghPRHasCriticalReviewFn     func(prNumber int) (bool, error)
 	ghUpdateBranchFn            func(prNumber int) error
+	ghMarkPRReadyFn             func(prNumber int) error
 	ghMergePRFn                 func(prNumber int) error
 	ghClosePRFn                 func(prNumber int, comment string) error
 	ghPRChecksOutputFn          func(prNumber int) (string, error)
@@ -320,6 +321,16 @@ func (o *Orchestrator) updateBranch(prNumber int) error {
 		return fmt.Errorf("no github client configured for update-branch")
 	}
 	return o.gh.UpdateBranch(prNumber)
+}
+
+func (o *Orchestrator) markPRReady(prNumber int) error {
+	if o.ghMarkPRReadyFn != nil {
+		return o.ghMarkPRReadyFn(prNumber)
+	}
+	if o.gh == nil {
+		return fmt.Errorf("no github client configured for mark-pr-ready")
+	}
+	return o.gh.MarkPRReady(prNumber)
 }
 
 func (o *Orchestrator) mergePR(prNumber int) error {
@@ -2790,6 +2801,20 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		}
 	}
 
+	// #697: a green draft carrying an explicit WIP/Partial marker is a
+	// deliberate draft — never auto-ready or merge it. Filter here (not in
+	// mergeReadyPR) so a marked draft cannot occupy the single sequential-mode
+	// merge slot and starve other ready PRs.
+	kept := ready[:0]
+	for _, candidate := range ready {
+		if candidate.pr.IsDraft && prHasDeliberateDraftMarker(candidate.pr) {
+			log.Printf("[orch] PR #%d is a draft with an explicit WIP/Partial marker — skipping auto-ready/merge (#697)", candidate.pr.Number)
+			continue
+		}
+		kept = append(kept, candidate)
+	}
+	ready = kept
+
 	if len(ready) == 0 {
 		return
 	}
@@ -2926,6 +2951,34 @@ func isSettledRetryExhausted(sess *state.Session, prNumber int) bool {
 		return true
 	}
 	return false
+}
+
+// prHasDeliberateDraftMarker reports whether a draft PR carries an explicit
+// WIP/Partial marker, meaning the draft is deliberate and must NOT be
+// auto-readied for merge (#697). The recognised markers are:
+//
+//   - title: a `[WIP]` or `[Partial]` token, or a `WIP:` / `WIP ` /
+//     `Partial:` / `Draft:` prefix (case-insensitive)
+//   - body: a literal `maestro:partial` or `maestro:wip` token — the TDD
+//     worker prompt's Partial flow embeds `<!-- maestro:partial -->`
+//
+// Only consulted for PRs with IsDraft=true; a non-draft PR mentioning WIP
+// keeps its normal merge flow.
+func prHasDeliberateDraftMarker(pr github.PR) bool {
+	title := strings.ToLower(strings.TrimSpace(pr.Title))
+	if strings.Contains(title, "[wip]") || strings.Contains(title, "[partial]") {
+		return true
+	}
+	for _, prefix := range []string{"wip:", "wip ", "partial:", "draft:"} {
+		if strings.HasPrefix(title, prefix) {
+			return true
+		}
+	}
+	if title == "wip" || title == "partial" {
+		return true
+	}
+	body := strings.ToLower(pr.Body)
+	return strings.Contains(body, "maestro:partial") || strings.Contains(body, "maestro:wip")
 }
 
 func mergeFlowPRForSession(sess *state.Session, byBranch map[string]github.PR, byNumber map[int]github.PR) (github.PR, bool) {
@@ -3483,6 +3536,27 @@ func outcomeHealthChecks(s *state.State) []outcome.HealthCheckResult {
 }
 
 func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state.Session, pr github.PR) bool {
+	// #697: `gh pr merge` on a draft fails with "still a draft", wedging the
+	// pipeline until a human runs `gh pr ready`. A PR that reached this point
+	// is green (CI pass + review gate resolved), so an unmarked draft is an
+	// accident — ready it and merge in the same cycle. Deliberate WIP/Partial
+	// drafts are filtered out by autoMergePRs before they get here; the guard
+	// below is defense-in-depth for any other caller.
+	if pr.IsDraft {
+		if prHasDeliberateDraftMarker(pr) {
+			log.Printf("[orch] PR #%d is a draft with an explicit WIP/Partial marker — skipping auto-ready/merge (#697)", pr.Number)
+			return false
+		}
+		log.Printf("[orch] PR #%d is a green draft without a WIP/Partial marker — marking ready for review (#697)", pr.Number)
+		if err := o.markPRReady(pr.Number); err != nil {
+			log.Printf("[orch] mark PR #%d ready: %v", pr.Number, err)
+			return false
+		}
+		// One-time mention: after a successful ready the PR stops being a
+		// draft, so this path cannot fire again for the same PR.
+		o.notifier.Sendf("📣 maestro: PR #%d (%s) was a green draft — marked ready for review, proceeding to merge", pr.Number, sess.Branch)
+	}
+
 	log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
 	if err := o.mergePR(pr.Number); err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)

@@ -62,6 +62,8 @@ git push --force-with-lease origin {{BRANCH}}
 gh pr create --repo {{REPO}} --title "feat: {{ISSUE_TITLE}} (#{{ISSUE_NUMBER}})" --body "Refs #{{ISSUE_NUMBER}}"
 ```
 
+Open the PR **ready for review** — NEVER pass `--draft`. Maestro auto-merges green PRs and a draft wedges the pipeline; it will mark an unmarked green draft ready automatically. The only legitimate draft is the deliberate Partial flow: prefix the title with `[Partial]` (or `[WIP]`) and include the literal marker `<!-- maestro:partial -->` in the PR body so Maestro knows not to auto-ready it.
+
 ### 3. Code quality
 - `cargo fmt --all` before EVERY commit — unformatted code fails CI
 - `cargo check` before pushing — don't open PRs with compile errors

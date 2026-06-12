@@ -41,3 +41,9 @@ When creating the PR, include validation evidence in the description:
 
 If a VALIDATION.md file exists in the worktree, read it first and use it as your
 validation checklist. Report which assertions passed in the PR body.
+
+Open the PR **ready for review** — never as a draft. If some assertions are
+genuinely blocked and you must hand off partial work, open a **draft** PR with
+`[Partial]` prefixed to the title AND the literal marker `<!-- maestro:partial -->`
+in the PR body; that marker tells Maestro the draft is deliberate so it will
+not auto-ready or auto-merge it.

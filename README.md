@@ -330,7 +330,7 @@ issue #44 labels: enhancement               → runs with default (claude)
 
 Runs the orchestration loop. Every interval:
 1. Checks running sessions (kill dead, clean stale)
-2. Auto-merges PRs where CI is green (sequential by default, configurable via `merge_strategy`)
+2. Auto-merges PRs where CI is green (sequential by default, configurable via `merge_strategy`). A green draft PR is automatically marked ready for review first (`gh pr ready`), unless its title/body carries an explicit WIP/Partial marker (`[WIP]` / `[Partial]` in the title, or `maestro:partial` / `maestro:wip` in the body) — those drafts are deliberate and stay untouched.
 3. Rebases PRs with conflicts
 4. Picks new issues to work on (up to `max_parallel - active`)
 5. Starts new workers for picked issues

@@ -66,6 +66,8 @@ gh pr create \
   --head {{BRANCH}}
 ```
 
+Open the PR **ready for review** — NEVER pass `--draft`. Maestro auto-merges green PRs and a draft wedges the pipeline. The only legitimate draft is deliberately partial work: prefix the title with `[Partial]` (or `[WIP]`) and include the literal marker `<!-- maestro:partial -->` in the PR body so Maestro knows not to auto-ready it.
+
 ### 6. After PR is created — STOP
 Do not wait for CI. Do not merge. Just stop.
 
