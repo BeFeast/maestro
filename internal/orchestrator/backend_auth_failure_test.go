@@ -8,6 +8,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -332,5 +333,175 @@ func TestCanRetryIssue_AuthFailedSessions_DoNotConsumeBudget(t *testing.T) {
 	o := &Orchestrator{cfg: &config.Config{MaxRetriesPerIssue: 3}}
 	if !o.canRetryIssue(s, live) {
 		t.Fatal("canRetryIssue = false — four auth-failed sessions burned the retry budget (#693 regression)")
+	}
+}
+
+// --- #695: fresh dispatch consults BackendHealth ---
+
+func dispatchHealthConfig() *config.Config {
+	cfg := cfgWithBackends("claude", "claude", "codex")
+	cfg.Model.FallbackBackends = []string{"codex"}
+	return cfg
+}
+
+func stateWithBackendCooldowns(now time.Time, retryAfterByBackend map[string]time.Time) *state.State {
+	s := state.NewState()
+	s.BackendHealth = make(map[string]state.BackendHealth, len(retryAfterByBackend))
+	for backend, retryAfter := range retryAfterByBackend {
+		retryAfter := retryAfter
+		s.BackendHealth[backend] = state.BackendHealth{
+			State:      state.BackendHealthCooldown,
+			Reason:     state.BackendBlockAuthFailure,
+			Since:      now,
+			RetryAfter: &retryAfter,
+		}
+	}
+	return s
+}
+
+// #695 acceptance 1 (selection path): with the default backend inside its
+// auth-failure cooldown, a fresh dispatch resolves directly to the first
+// healthy fallback backend instead of spawning a doomed worker.
+func TestResolveDispatchBackend_DefaultInAuthCooldown_SubstitutesFirstHealthyFallback(t *testing.T) {
+	cfg := dispatchHealthConfig()
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	now := time.Now().UTC()
+	s := stateWithBackendCooldowns(now, map[string]time.Time{"claude": now.Add(8 * time.Minute)})
+
+	decision, ok, retryAt := o.resolveDispatchBackend(s, makeIssue(695, "conveyor churn"), now)
+
+	if !ok {
+		t.Fatal("ok = false, want dispatchable — codex is healthy")
+	}
+	if decision.Backend != "codex" {
+		t.Fatalf("Backend = %q, want codex (first healthy fallback)", decision.Backend)
+	}
+	if decision.Reason != selectionReasonDispatchBlockedFallback {
+		t.Fatalf("Reason = %q, want %q", decision.Reason, selectionReasonDispatchBlockedFallback)
+	}
+	if retryAt != nil {
+		t.Fatalf("retryAt = %v, want nil for a dispatchable decision", retryAt)
+	}
+}
+
+// #695: a healthy routed backend passes through unchanged — same backend,
+// same router-provided reason.
+func TestResolveDispatchBackend_HealthyDefault_DecisionUnchanged(t *testing.T) {
+	cfg := dispatchHealthConfig()
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	now := time.Now().UTC()
+
+	decision, ok, _ := o.resolveDispatchBackend(state.NewState(), makeIssue(695, "conveyor churn"), now)
+
+	if !ok || decision.Backend != "claude" || decision.Reason != router.ReasonDefault {
+		t.Fatalf("decision = %+v ok=%v, want claude/%s dispatchable", decision, ok, router.ReasonDefault)
+	}
+}
+
+// #695: an expired cooldown no longer blocks the routed backend, even before
+// ReconcileBackendHealth has cleared the stale entry.
+func TestResolveDispatchBackend_CooldownExpired_UsesRoutedBackend(t *testing.T) {
+	cfg := dispatchHealthConfig()
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	now := time.Now().UTC()
+	s := stateWithBackendCooldowns(now.Add(-20*time.Minute), map[string]time.Time{"claude": now.Add(-time.Minute)})
+
+	decision, ok, _ := o.resolveDispatchBackend(s, makeIssue(695, "conveyor churn"), now)
+
+	if !ok || decision.Backend != "claude" || decision.Reason != router.ReasonDefault {
+		t.Fatalf("decision = %+v ok=%v, want claude/%s after cooldown expiry", decision, ok, router.ReasonDefault)
+	}
+}
+
+// #695: the gate applies to label-pinned backends too — a pin onto a
+// cooling-down backend is substituted exactly like the fallback selector
+// would, instead of honoring the pin into a doomed spawn.
+func TestResolveDispatchBackend_LabelPinnedBackendCooling_SubstitutesHealthyDefault(t *testing.T) {
+	cfg := dispatchHealthConfig()
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	now := time.Now().UTC()
+	s := stateWithBackendCooldowns(now, map[string]time.Time{"codex": now.Add(8 * time.Minute)})
+
+	decision, ok, _ := o.resolveDispatchBackend(s, makeIssue(695, "conveyor churn", "model:codex"), now)
+
+	if !ok {
+		t.Fatal("ok = false, want dispatchable — claude is healthy")
+	}
+	if decision.Backend != "claude" || decision.Reason != selectionReasonDispatchBlockedFallback {
+		t.Fatalf("decision = %+v, want claude/%s", decision, selectionReasonDispatchBlockedFallback)
+	}
+}
+
+// #695 acceptance 2 (selection path): with every backend cooling down,
+// resolveDispatchBackend reports not-dispatchable and the earliest cooldown
+// expiry so dispatch can pause instead of spawn-die churning.
+func TestResolveDispatchBackend_AllBackendsCoolingDown_NotDispatchable(t *testing.T) {
+	cfg := dispatchHealthConfig()
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	now := time.Now().UTC()
+	codexRetry := now.Add(4 * time.Minute)
+	s := stateWithBackendCooldowns(now, map[string]time.Time{
+		"claude": now.Add(9 * time.Minute),
+		"codex":  codexRetry,
+	})
+
+	_, ok, retryAt := o.resolveDispatchBackend(s, makeIssue(695, "conveyor churn"), now)
+
+	if ok {
+		t.Fatal("ok = true, want not-dispatchable with all backends cooling down")
+	}
+	if retryAt == nil || !retryAt.Equal(codexRetry) {
+		t.Fatalf("retryAt = %v, want earliest cooldown expiry %v (codex)", retryAt, codexRetry)
+	}
+}
+
+// #695 acceptance 1 (dispatch loop): a newly dispatched issue whose default
+// backend is in auth cooldown spawns directly on the first healthy fallback,
+// with the substitution stamped on the session's BackendSelection.
+func TestStartNewWorkers_DefaultInCooldown_SpawnsOnFirstHealthyFallback(t *testing.T) {
+	cfg := dispatchHealthConfig()
+	issues := []github.Issue{makeIssue(695, "conveyor churn")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+
+	now := time.Now().UTC()
+	s := stateWithBackendCooldowns(now, map[string]time.Time{"claude": now.Add(8 * time.Minute)})
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 1 || (*started)[0] != 695 {
+		t.Fatalf("started = %v, want [695]", *started)
+	}
+	sess := s.Sessions["slot-1"]
+	if sess == nil || sess.Backend != "codex" {
+		t.Fatalf("session = %+v, want spawn on codex", sess)
+	}
+	if sess.BackendSelection == nil || sess.BackendSelection.SelectedBackend != "codex" ||
+		sess.BackendSelection.SelectionReason != selectionReasonDispatchBlockedFallback {
+		t.Fatalf("BackendSelection = %+v, want codex/%s", sess.BackendSelection, selectionReasonDispatchBlockedFallback)
+	}
+}
+
+// #695 acceptance 2 (dispatch loop): with all backends cooling down, no
+// worker is spawned — dispatch pauses until a cooldown expires instead of
+// churning one doomed spawn per poll cycle per issue.
+func TestStartNewWorkers_AllBackendsCoolingDown_NoSpawn(t *testing.T) {
+	cfg := dispatchHealthConfig()
+	issues := []github.Issue{
+		makeIssue(695, "conveyor churn"),
+		makeIssue(696, "second eligible issue"),
+	}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+
+	now := time.Now().UTC()
+	s := stateWithBackendCooldowns(now, map[string]time.Time{
+		"claude": now.Add(9 * time.Minute),
+		"codex":  now.Add(4 * time.Minute),
+	})
+	o.startNewWorkers(s, 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want none while every backend is cooling down", *started)
+	}
+	if len(s.Sessions) != 0 {
+		t.Fatalf("sessions = %d, want 0 — dispatch must pause, not spawn doomed workers", len(s.Sessions))
 	}
 }
