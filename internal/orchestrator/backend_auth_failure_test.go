@@ -311,6 +311,133 @@ func TestCheckSessions_AuthFailureDeadWorker_FallsOverToNextBackend(t *testing.T
 	}
 }
 
+// #696: when the auth fallover in checkSessions aborts because the issue
+// cannot be fetched, the session must carry the same status + display token
+// as the reconcile paths (dead + backend_auth_failure), not a bare failed —
+// otherwise the credential-outage context is lost on the dashboard.
+func TestCheckSessions_AuthFailureGetIssueError_CarriesAuthFailureToken(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["kar-47"] = &state.Session{
+		IssueNumber: 169,
+		IssueTitle:  "karaoke conveyor",
+		Status:      state.StatusRunning,
+		PID:         424246,
+		TmuxSession: "maestro-kar-47",
+		Branch:      "feat/kar-47-169-conveyor",
+		Backend:     "claude",
+		StartedAt:   time.Now().UTC().Add(-2 * time.Minute),
+		LogFile:     "/tmp/kar-47-auth.log",
+	}
+
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 3,
+		Model: config.ModelConfig{
+			Default:          "claude",
+			FallbackBackends: []string{"codex"},
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+	}
+	o, _ := newCheckSessionsOrchestrator(cfg, "")
+	o.pidAliveFn = func(pid int) bool { return false }
+	o.isRateLimitedFn = func(logFile string) bool { return false }
+	o.authFailureFromLogFn = func(logFile string) (bool, string) {
+		return true, "failed_to_authenticate"
+	}
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		return github.Issue{}, fmt.Errorf("github unreachable")
+	}
+	o.respawnWorkerFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+		t.Fatal("respawnWorkerFn must not be called when the issue fetch fails")
+		return nil
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["kar-47"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (same as the reconcile auth-failure paths)", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus != "backend_auth_failure" {
+		t.Fatalf("last_notified_status = %q, want backend_auth_failure", sess.LastNotifiedStatus)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set")
+	}
+	if got := state.SessionDisplayStatusFor(sess, nil); got != string(state.DisplayBackendAuthFailure) {
+		t.Fatalf("display status = %q, want %q", got, state.DisplayBackendAuthFailure)
+	}
+	if failed := s.FailedAttemptsForIssue(169); failed != 0 {
+		t.Fatalf("FailedAttemptsForIssue(169) = %d, want 0 — auth-classified death must not burn retry budget", failed)
+	}
+}
+
+// #696: same as above for the respawn-failed sub-path of the auth fallover
+// in checkSessions.
+func TestCheckSessions_AuthFailureRespawnError_CarriesAuthFailureToken(t *testing.T) {
+	s := state.NewState()
+	s.Sessions["kar-48"] = &state.Session{
+		IssueNumber: 169,
+		IssueTitle:  "karaoke conveyor",
+		Status:      state.StatusRunning,
+		PID:         424247,
+		TmuxSession: "maestro-kar-48",
+		Branch:      "feat/kar-48-169-conveyor",
+		Backend:     "claude",
+		StartedAt:   time.Now().UTC().Add(-2 * time.Minute),
+		LogFile:     "/tmp/kar-48-auth.log",
+	}
+
+	cfg := &config.Config{
+		Repo:               "owner/repo",
+		MaxRuntimeMinutes:  999,
+		MaxRetriesPerIssue: 3,
+		Model: config.ModelConfig{
+			Default:          "claude",
+			FallbackBackends: []string{"codex"},
+			Backends: map[string]config.BackendDef{
+				"claude": {Cmd: "claude"},
+				"codex":  {Cmd: "codex"},
+			},
+		},
+	}
+	o, _ := newCheckSessionsOrchestrator(cfg, "")
+	o.pidAliveFn = func(pid int) bool { return false }
+	o.isRateLimitedFn = func(logFile string) bool { return false }
+	o.authFailureFromLogFn = func(logFile string) (bool, string) {
+		return true, "failed_to_authenticate"
+	}
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		return github.Issue{Number: number, Title: "karaoke conveyor"}, nil
+	}
+	o.respawnWorkerFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+		return fmt.Errorf("tmux spawn failed")
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["kar-48"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (same as the reconcile auth-failure paths)", sess.Status, state.StatusDead)
+	}
+	if sess.LastNotifiedStatus != "backend_auth_failure" {
+		t.Fatalf("last_notified_status = %q, want backend_auth_failure", sess.LastNotifiedStatus)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set")
+	}
+	if got := state.SessionDisplayStatusFor(sess, nil); got != string(state.DisplayBackendAuthFailure) {
+		t.Fatalf("display status = %q, want %q", got, state.DisplayBackendAuthFailure)
+	}
+	if failed := s.FailedAttemptsForIssue(169); failed != 0 {
+		t.Fatalf("FailedAttemptsForIssue(169) = %d, want 0 — auth-classified death must not burn retry budget", failed)
+	}
+}
+
 // #693: repeated auth deaths across the fallback chain must never wedge the
 // issue via retry_exhausted. With both backends auth-failed (claude gated,
 // codex tried), canRetryIssue still sees zero consumed attempts.

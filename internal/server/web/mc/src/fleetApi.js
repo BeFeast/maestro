@@ -744,7 +744,7 @@ function mapWorker(worker) {
 //   - "recent":  not running but live in the last 24h (pr_open, code_landed,
 //                blocked-by-project, idle awaiting reconciliation)
 //   - "stuck":   needs operator attention (dead, failed, conflict_failed,
-//                retry_exhausted, backend_rate_limited)
+//                retry_exhausted, backend_rate_limited, backend_auth_failure)
 //   - "done":    `status === "done"` only — true completion
 //
 // Pill tones map to CSS classes in mc.css:
@@ -770,6 +770,14 @@ export function workerStatusTaxonomy(worker) {
 
   if (display === "backend_rate_limited") {
     return { label: "rate limited", tone: "watch", section: "stuck" };
+  }
+
+  // backend_auth_failure (#693): the worker died because its backend failed
+  // authentication (credential outage), not because the work failed. The
+  // retry budget is preserved; the operator needs to fix credentials. Must
+  // not degrade to the generic red "dead" pill.
+  if (display === "backend_auth_failure") {
+    return { label: "auth failure", tone: "watch", section: "stuck" };
   }
 
   if (display === "blocked" && !isStuckStatus(status)) {
@@ -822,6 +830,14 @@ export function workerNextAction(worker) {
     const tail = resetAt ? ` Auto-recovery at ${resetAt}.` : "";
     return {
       text: `Worker hit provider limit on ${backend}.${tail}`,
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    };
+  }
+
+  if (display === "backend_auth_failure") {
+    const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
+    return {
+      text: `Backend ${backend} failed authentication. Fix credentials; the retry budget is preserved.`,
       buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
     };
   }
@@ -1048,7 +1064,8 @@ export function workerSessionsFromFleet(fleet, now) {
   //               pr_open, code_landed, blocked-by-project, etc. so the
   //               "in flight" group reflects active flow only.
   //   - stuck   = any session whose taxonomy section is "stuck" (dead, failed,
-  //               conflict_failed, retry_exhausted, backend_rate_limited). Both
+  //               conflict_failed, retry_exhausted, backend_rate_limited,
+  //               backend_auth_failure). Both
   //               live and terminal stuck sessions land here — they never
   //               hide under DONE.
   //   - today   = `rawStatus === "done"` finished today (true completion).
