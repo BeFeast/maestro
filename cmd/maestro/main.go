@@ -272,6 +272,11 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[maestro] ")
 
+	// Surface the running binary's version on the state/fleet APIs so the
+	// self-deploy health probe (#698) can confirm a restart picked up the
+	// freshly stamped build.
+	server.SetBinaryVersion(resolveVersion())
+
 	if len(os.Args) < 2 {
 		fmt.Print(usage)
 		os.Exit(1)

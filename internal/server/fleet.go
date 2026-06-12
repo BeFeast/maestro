@@ -337,6 +337,7 @@ func (s *FleetServer) Start(ctx context.Context) error {
 
 type fleetResponse struct {
 	ReadOnly      bool                 `json:"read_only"`
+	Version       string               `json:"version,omitempty"` // running maestro binary version (#698)
 	RefreshedAt   string               `json:"refreshed_at"`
 	NextAction    *fleetNextAction     `json:"next_action"`
 	Verdict       fleetVerdict         `json:"verdict"`
@@ -1137,6 +1138,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	now := time.Now().UTC()
 	resp := fleetResponse{
 		ReadOnly:    s.readOnly,
+		Version:     binaryVersion,
 		RefreshedAt: formatFleetTime(now),
 		Projects:    make([]fleetProjectState, 0, len(s.projects)),
 		Workers:     make([]fleetWorkerState, 0),

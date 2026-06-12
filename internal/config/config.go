@@ -3,8 +3,10 @@ package config
 import (
 	"crypto/md5"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -143,6 +145,87 @@ type VersioningConfig struct {
 type GitHubProjectsConfig struct {
 	Enabled       bool `yaml:"enabled"`
 	ProjectNumber int  `yaml:"project_number"` // GitHub Project number (auto-detect from repo)
+}
+
+// SelfDeployConfig gates the opt-in post-merge self-deploy of the maestro
+// binary itself (#698). Default OFF: projects without a `self_deploy:` block
+// (or with enabled: false) see no behavior change.
+//
+// When enabled, the orchestrator launches scripts/self-deploy.sh through a
+// detached transient systemd unit (systemd-run --user) after every PR merge.
+// Running detached is what lets the script restart maestro's own units and
+// survive that restart; restarting via `systemctl --user restart` keeps the
+// unit's ExecStop drain semantics intact.
+type SelfDeployConfig struct {
+	Enabled        bool     `yaml:"enabled"`          // default false (opt-in)
+	Script         string   `yaml:"script"`           // deploy script path (default: <local_path>/scripts/self-deploy.sh)
+	BinPath        string   `yaml:"bin_path"`         // install target (default: path of the running binary)
+	Units          []string `yaml:"units"`            // systemd user units to restart (default: ["maestro.service"])
+	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
+	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
+	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+}
+
+// EffectiveScript returns the deploy script path, defaulting to
+// scripts/self-deploy.sh inside the project checkout.
+func (c SelfDeployConfig) EffectiveScript(localPath string) string {
+	if s := strings.TrimSpace(c.Script); s != "" {
+		return expandHome(s)
+	}
+	if strings.TrimSpace(localPath) == "" {
+		return ""
+	}
+	return filepath.Join(localPath, "scripts", "self-deploy.sh")
+}
+
+// EffectiveUnits returns the systemd user units to restart, defaulting to
+// the unit name `maestro init` installs.
+func (c SelfDeployConfig) EffectiveUnits() []string {
+	units := make([]string, 0, len(c.Units))
+	for _, u := range c.Units {
+		if u = strings.TrimSpace(u); u != "" {
+			units = append(units, u)
+		}
+	}
+	if len(units) == 0 {
+		return []string{"maestro.service"}
+	}
+	return units
+}
+
+// EffectiveHealthURL returns the URL polled to confirm the restarted process
+// reports the freshly stamped version. Empty means CLI + unit checks only.
+func (c SelfDeployConfig) EffectiveHealthURL(server ServerConfig) string {
+	if u := strings.TrimSpace(c.HealthURL); u != "" {
+		return u
+	}
+	if server.Port <= 0 {
+		return ""
+	}
+	host := strings.TrimSpace(server.Host)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s/api/v1/state", net.JoinHostPort(host, strconv.Itoa(server.Port)))
+}
+
+// EffectiveHealthTokenEnv returns the env var name holding the bearer token
+// for the health probe, falling back to the dashboard auth token env.
+func (c SelfDeployConfig) EffectiveHealthTokenEnv(server ServerConfig) string {
+	if e := strings.TrimSpace(c.HealthTokenEnv); e != "" {
+		return e
+	}
+	return strings.TrimSpace(server.Auth.TokenEnv)
+}
+
+// EffectiveTimeoutMinutes returns the total deploy budget. The default is
+// deliberately larger than deploy_timeout_minutes because a unit restart
+// honors drain (in-flight workers finish before the stop completes).
+func (c SelfDeployConfig) EffectiveTimeoutMinutes() int {
+	if c.TimeoutMinutes > 0 {
+		return c.TimeoutMinutes
+	}
+	return 30
 }
 
 const (
@@ -841,6 +924,7 @@ type Config struct {
 	AutoRetryRebaseConflicts        bool                         `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts
 	Telegram                        TelegramConfig               `yaml:"telegram"`
 	Versioning                      VersioningConfig             `yaml:"versioning"`
+	SelfDeploy                      SelfDeployConfig             `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
 	GitHubProjects                  GitHubProjectsConfig         `yaml:"github_projects"`
 	MaxRetryBackoffMs               int                          `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles                []string                     `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
@@ -982,6 +1066,8 @@ func parse(data []byte) (*Config, error) {
 		cfg.PromptSections[i] = expandHome(s)
 	}
 	cfg.StateDir = expandHome(cfg.StateDir)
+	cfg.SelfDeploy.Script = expandHome(cfg.SelfDeploy.Script)
+	cfg.SelfDeploy.BinPath = expandHome(cfg.SelfDeploy.BinPath)
 
 	// Default session_prefix: first 3 chars of repo name
 	if cfg.SessionPrefix == "" {
