@@ -58,6 +58,7 @@ Commands:
   import        Seed state from existing worktrees
   config-store  Migrate YAML runtime config to SQLite or export it back
   history       Show recently completed sessions
+  digest        Write the morning operator digest across all fleet projects
   cleanup       Remove worktrees for all completed/dead sessions
   version-bump  Bump project version based on merged PR labels
   version       Print version
@@ -132,6 +133,18 @@ History:
   maestro history --limit 50   Show last 50 completed sessions
   maestro history --json       Machine-readable JSON output
   maestro history --prune      Remove sessions older than retention period
+
+Digest flags:
+  --fleet string             Path to fleet YAML covering every project
+  --out string               Report destination: directory or .md file (default: stdout only)
+  --notify                   Send notifier summary when decisions are pending (default true)
+  --stale-review-hours int   Age threshold for unresolved review findings (default 24)
+  --json                     Print the report as JSON instead of Markdown
+
+  Ranked morning report across the fleet: pending approvals, retry-exhausted
+  sessions with open PRs, blocked issues whose blockers are resolved, PRs with
+  stale unresolved review findings, promotable issues, and a per-project
+  health line. See docs/digest-runbook.md for a systemd timer example.
 
 Watch:
   maestro watch             Open tmux dashboard attached to live worker sessions
@@ -320,6 +333,8 @@ func main() {
 		configStoreCmd(args)
 	case "history":
 		historyCmd(args)
+	case "digest":
+		digestCmd(args)
 	case "cleanup":
 		cleanupCmd(args)
 	case "version-bump":
