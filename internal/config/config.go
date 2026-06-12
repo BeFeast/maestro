@@ -744,6 +744,51 @@ func (p PipelineConfig) TestMappingEnabled() bool {
 	return *p.TestMapping
 }
 
+// VerifyConfig holds opt-in post-implementation verification steps.
+type VerifyConfig struct {
+	Visual VerifyVisualConfig `yaml:"visual"` // #705: visual evidence for UI-affecting PRs
+}
+
+// VerifyVisualConfig configures the opt-in visual-evidence step for
+// UI-affecting PRs (#705). When enabled, workers are instructed to run the
+// project's screenshot harness and attach the resulting images to the PR
+// before declaring done; the orchestrator checks UI-affecting PRs (changed
+// files matching Paths) for attached evidence and posts a warning comment
+// when it is missing. Advisory in v1 — never blocks merge.
+type VerifyVisualConfig struct {
+	Enabled        bool     `yaml:"enabled"`         // opt in per project (default: false)
+	Command        string   `yaml:"command"`         // project script that launches the app and writes screenshots to OutputDir; run from the worktree root
+	Paths          []string `yaml:"paths"`           // globs that classify a PR as UI-affecting (e.g. "**/*.jsx", "web/**"); `**` crosses directories
+	OutputDir      string   `yaml:"output_dir"`      // worktree-relative screenshot directory (default: .maestro/screenshots)
+	TimeoutMinutes int      `yaml:"timeout_minutes"` // capture command budget in minutes (default: 10)
+}
+
+// Active reports whether the visual-evidence step is fully configured:
+// enabled with a capture command and at least one UI path glob. The
+// misconfigured shapes (enabled without command/paths) surface via
+// Config.Warnings instead of half-running.
+func (v VerifyVisualConfig) Active() bool {
+	return v.Enabled && strings.TrimSpace(v.Command) != "" && len(v.Paths) > 0
+}
+
+// ResolvedOutputDir returns the worktree-relative directory the capture
+// command writes screenshots to. Default: .maestro/screenshots.
+func (v VerifyVisualConfig) ResolvedOutputDir() string {
+	dir := strings.TrimSpace(v.OutputDir)
+	if dir == "" {
+		return filepath.Join(".maestro", "screenshots")
+	}
+	return dir
+}
+
+// Timeout returns the capture command budget. Default: 10 minutes.
+func (v VerifyVisualConfig) Timeout() time.Duration {
+	if v.TimeoutMinutes <= 0 {
+		return 10 * time.Minute
+	}
+	return time.Duration(v.TimeoutMinutes) * time.Minute
+}
+
 // MissionsConfig controls mission mode for decomposing epics into child issues.
 type MissionsConfig struct {
 	Enabled     bool     `yaml:"enabled"`
@@ -980,6 +1025,7 @@ type Config struct {
 	AutoRestoreFiles                []string                     `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase
 	CleanupWorktreesOnMerge         *bool                        `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
 	Pipeline                        PipelineConfig               `yaml:"pipeline"`
+	Verify                          VerifyConfig                 `yaml:"verify"` // #705: opt-in post-implementation verify steps (visual evidence)
 	Hooks                           HooksConfig                  `yaml:"hooks"`
 	Missions                        MissionsConfig               `yaml:"missions"`
 	BlockerPatterns                 []string                     `yaml:"blocker_patterns"`         // regex patterns to detect blocker references in issue body for queue skips and dependency_unblock (e.g. "blocked by #(\\d+)"; first capture group must be issue number)
@@ -1585,7 +1631,31 @@ func (c *Config) Warnings() []string {
 		warnings = append(warnings, msg)
 	}
 	warnings = append(warnings, c.backendResolutionWarnings()...)
+	if msg := c.verifyVisualWarning(); msg != "" {
+		warnings = append(warnings, msg)
+	}
 	return warnings
+}
+
+// verifyVisualWarning surfaces a verify.visual block that is enabled but
+// cannot run (#705): without a capture command or UI path globs the step is
+// silently inert, which reads as "visual evidence is covered" when it is not.
+func (c *Config) verifyVisualWarning() string {
+	v := c.Verify.Visual
+	if !v.Enabled || v.Active() {
+		return ""
+	}
+	var missing []string
+	if strings.TrimSpace(v.Command) == "" {
+		missing = append(missing, "verify.visual.command")
+	}
+	if len(v.Paths) == 0 {
+		missing = append(missing, "verify.visual.paths")
+	}
+	return fmt.Sprintf(
+		"config: verify.visual.enabled is true but %s is not set — the visual-evidence step is inert. Set a capture command and UI path globs, or disable verify.visual.",
+		strings.Join(missing, " and "),
+	)
 }
 
 // manualRoutingLabelPinWarning surfaces the #427 misconfiguration where the

@@ -103,27 +103,30 @@ type Orchestrator struct {
 	restartRequiredReason string
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
-	ghPRCIStatusFn              func(prNumber int) (string, error)
-	ghPRMergeStatusFn           func(prNumber int) (mergeable string, mergeStateStatus string, err error)
-	ghPRGreptileApprovedFn      func(prNumber int) (approved bool, pending bool, err error)
-	ghPRReviewGateVerdictFn     func(prNumber int, streams []string) (github.ReviewGateVerdict, error)
-	ghPRHasCriticalReviewFn     func(prNumber int) (bool, error)
-	ghUpdateBranchFn            func(prNumber int) error
-	ghMarkPRReadyFn             func(prNumber int) error
-	ghMergePRFn                 func(prNumber int) error
-	ghClosePRFn                 func(prNumber int, comment string) error
-	ghPRChecksOutputFn          func(prNumber int) (string, error)
-	ghCollectPRReviewFeedbackFn func(prNumber int) (string, error)
-	ghCloseIssueFn              func(number int, comment string) error
-	ghPRHeadSHAFn               func(prNumber int) (string, error)
-	ghCommentPRFn               func(prNumber int, body string) error
-	workerStopFn                func(cfg *config.Config, slotName string, sess *state.Session) error
-	selfDeployStartFn           func(prNumber int) error
-	rebaseWorktreeFn            func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
-	outcomeCheckFn              func(context.Context, outcome.Brief) outcome.HealthCheckResult
-	syncProjectFn               func(issueNumber int, status github.ProjectStatus) bool
-	listNonDoneProjectItemsFn   func(pf *github.ProjectField) ([]github.ProjectItem, error)
-	rateLimitFn                 func() (github.RateLimitStatus, error)
+	ghPRCIStatusFn               func(prNumber int) (string, error)
+	ghPRMergeStatusFn            func(prNumber int) (mergeable string, mergeStateStatus string, err error)
+	ghPRGreptileApprovedFn       func(prNumber int) (approved bool, pending bool, err error)
+	ghPRReviewGateVerdictFn      func(prNumber int, streams []string) (github.ReviewGateVerdict, error)
+	ghPRHasCriticalReviewFn      func(prNumber int) (bool, error)
+	ghUpdateBranchFn             func(prNumber int) error
+	ghMarkPRReadyFn              func(prNumber int) error
+	ghMergePRFn                  func(prNumber int) error
+	ghClosePRFn                  func(prNumber int, comment string) error
+	ghPRChecksOutputFn           func(prNumber int) (string, error)
+	ghCollectPRReviewFeedbackFn  func(prNumber int) (string, error)
+	ghCloseIssueFn               func(number int, comment string) error
+	ghPRHeadSHAFn                func(prNumber int) (string, error)
+	ghCommentPRFn                func(prNumber int, body string) error
+	ghPRChangedFilesFn           func(prNumber int) ([]string, error)
+	ghPRVisualEvidenceAttachedFn func(prNumber int) (bool, error)
+	runVisualCaptureFn           func(v config.VerifyVisualConfig, worktreePath string) ([]string, error)
+	workerStopFn                 func(cfg *config.Config, slotName string, sess *state.Session) error
+	selfDeployStartFn            func(prNumber int) error
+	rebaseWorktreeFn             func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
+	outcomeCheckFn               func(context.Context, outcome.Brief) outcome.HealthCheckResult
+	syncProjectFn                func(issueNumber int, status github.ProjectStatus) bool
+	listNonDoneProjectItemsFn    func(pf *github.ProjectField) ([]github.ProjectItem, error)
+	rateLimitFn                  func() (github.RateLimitStatus, error)
 }
 
 // New creates a new Orchestrator
@@ -2707,6 +2710,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		}
 		o.ensureAttributionTrailerOnPR(slotName, sess, pr)
 		o.ensureAttributionTrailerOnBranch(slotName, sess)
+
+		// #705: opt-in visual evidence for UI-affecting PRs. One-shot,
+		// advisory — posts a warning comment when evidence is missing but
+		// never blocks or delays the merge flow below.
+		o.ensureVisualEvidence(slotName, sess, pr)
 
 		// Check CI
 		ciStatus, err := o.prCIStatus(pr.Number)

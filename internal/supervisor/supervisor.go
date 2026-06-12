@@ -1026,7 +1026,42 @@ func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.
 	findings = append(findings, e.detectBackendAuthFailureStuckStates(st, now)...)
 	findings = append(findings, e.detectBackendQuotaPressureStuckStates(st, now)...)
 	findings = append(findings, e.detectOutcomeStuckStates(st)...)
+	findings = append(findings, detectVisualEvidenceStuckStates(st)...)
 	return compactStuckStates(findings)
+}
+
+// detectVisualEvidenceStuckStates surfaces UI-affecting PRs that reached the
+// merge flow without attached screenshot evidence (#705). The orchestrator
+// stamps Session.VisualEvidence after its one-shot verify.visual check; this
+// finding keeps the gap visible to the operator while the PR is still in
+// flight. Advisory by design: SeverityWarning, never a merge block.
+func detectVisualEvidenceStuckStates(st *state.State) []state.SupervisorStuckState {
+	if st == nil {
+		return nil
+	}
+	var findings []state.SupervisorStuckState
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil || sess.VisualEvidence != state.VisualEvidenceMissing || sess.PRNumber <= 0 {
+			continue
+		}
+		switch sess.Status {
+		case state.StatusPROpen, state.StatusQueued, state.StatusRetryExhausted:
+		default:
+			continue // PR no longer in flight — the finding self-clears
+		}
+		evidence := []string{fmt.Sprintf("Session %s status=%s pr=%d visual_evidence=missing", slot, sess.Status, sess.PRNumber)}
+		if detail := strings.TrimSpace(sess.VisualEvidenceDetail); detail != "" {
+			evidence = append(evidence, detail)
+		}
+		findings = append(findings, stuckState("visual_evidence_missing", SeverityWarning,
+			fmt.Sprintf("PR #%d (issue #%d) touches UI paths but has no visual evidence attached.", sess.PRNumber, sess.IssueNumber),
+			"Run the project's verify.visual capture command and attach the screenshots to the PR, or verify the rendered UI manually before merge. Does not block merge (v1).",
+			false,
+			&state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot},
+			evidence...))
+	}
+	return findings
 }
 
 // detectBackendAuthFailureStuckStates surfaces backends gated by an

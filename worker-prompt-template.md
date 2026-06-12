@@ -93,6 +93,7 @@ When rebasing conflicts in these files: **keep BOTH sides**. Your additions + wh
 
 ### 7. Done means done
 Once you've opened a PR:
+- If Maestro appended a **Visual Evidence** section to this prompt (the project has `verify.visual` enabled) and your diff touches the listed UI path globs: run the capture command, then attach the resulting screenshots to the PR as a comment with embedded images BEFORE declaring done. If the capture fails, post a PR comment saying so instead — do not block the PR on it.
 - Preserve any `Maestro-Backend:` attribution trailer Maestro adds to commit messages or PR bodies.
 - Verify CI started with REST only:
   `sha=$(gh api repos/OWNER/REPO/pulls/PR_NUMBER --jq .head.sha) && gh api repos/OWNER/REPO/commits/$sha/check-runs --jq '.check_runs[] | {name,status,conclusion}'`
