@@ -1024,6 +1024,7 @@ func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.
 	}
 	findings = append(findings, e.detectEnvironmentStuckStates(st, eligible)...)
 	findings = append(findings, e.detectBackendAuthFailureStuckStates(st, now)...)
+	findings = append(findings, e.detectBackendQuotaPressureStuckStates(st, now)...)
 	findings = append(findings, e.detectOutcomeStuckStates(st)...)
 	return compactStuckStates(findings)
 }
@@ -1074,6 +1075,53 @@ func (e *Engine) detectBackendAuthFailureStuckStates(st *state.State, now time.T
 		findings = append(findings, stuckState("backend_auth_failure", severity,
 			fmt.Sprintf("Backend %s is failing authentication (invalid or expired credentials); workers cannot use it.", name),
 			"Re-authenticate the backend CLI or re-sync its credentials; fallback backends keep the queue moving meanwhile and the per-issue retry budget is preserved.", false, nil,
+			evidence...))
+	}
+	return findings
+}
+
+// detectBackendQuotaPressureStuckStates surfaces backends gated by
+// subscription quota pressure (#704): estimated window usage crossed the
+// dispatch threshold, so fresh dispatches prefer fallback backends until
+// the window resets. One finding per pressure episode — the orchestrator
+// keeps Since anchored at episode start and the summary is stable, so
+// compactStuckStates collapses repeats while usage fluctuates. The
+// finding self-clears when the gate is removed (window reset via
+// RetryAfter, or usage dropping below threshold). Always a warning:
+// unlike an auth failure the backend still works — capacity is being
+// preserved, not lost.
+func (e *Engine) detectBackendQuotaPressureStuckStates(st *state.State, now time.Time) []state.SupervisorStuckState {
+	if st == nil || len(st.BackendHealth) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(st.BackendHealth))
+	for name := range st.BackendHealth {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var findings []state.SupervisorStuckState
+	for _, name := range names {
+		health := st.BackendHealth[name]
+		if health.State != state.BackendHealthCooldown || health.Reason != state.BackendBlockQuotaPressure {
+			continue
+		}
+		if health.RetryAfter != nil && !now.Before(*health.RetryAfter) {
+			continue // window has reset; the orchestrator will clear the gate
+		}
+		evidence := []string{fmt.Sprintf("backend=%s", name)}
+		if health.Pattern != "" {
+			evidence = append(evidence, fmt.Sprintf("usage=%s", health.Pattern))
+		}
+		if !health.Since.IsZero() {
+			evidence = append(evidence, fmt.Sprintf("since=%s", health.Since.Format(time.RFC3339)))
+		}
+		if health.RetryAfter != nil {
+			evidence = append(evidence, fmt.Sprintf("reset_at=%s", health.RetryAfter.Format(time.RFC3339)))
+		}
+		findings = append(findings, stuckState("backend_quota_pressure", SeverityWarning,
+			fmt.Sprintf("Backend %s is above its subscription quota threshold; fresh dispatches prefer fallback backends until the window resets.", name),
+			"No action required — dispatch reroutes automatically and the gate self-clears at window reset. If this recurs every window, recalibrate quota.window_tokens / quota.weekly_tokens or reduce max_parallel.", false, nil,
 			evidence...))
 	}
 	return findings

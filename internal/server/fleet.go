@@ -563,6 +563,12 @@ type fleetProjectState struct {
 	// auto-recovery is on a known clock.
 	BackendHealth map[string]state.BackendHealth `json:"backend_health,omitempty"`
 
+	// BackendQuota is the per-backend subscription quota position (#704)
+	// for backends with quota config: window/weekly percent used, reset
+	// ETAs and whether dispatch is currently steered to fallbacks. The
+	// SPA renders this as a gauge row next to the backend health pills.
+	BackendQuota []fleetBackendQuota `json:"backend_quota,omitempty"`
+
 	// CostObservability rolls the per-session token counters already
 	// recorded by the orchestrator into today / 7d / lifetime token +
 	// USD windows per backend and per issue (#619). Backends without
@@ -2609,6 +2615,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	// session recorded after the cooldown was set all render as healthy.
 	state.ReconcileBackendHealth(st, now)
 	item.BackendHealth = st.BackendHealth
+	item.BackendQuota = buildFleetBackendQuota(cfg, st, now)
 	item.CostObservability = buildFleetCostObservability(cfg, st, now)
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary

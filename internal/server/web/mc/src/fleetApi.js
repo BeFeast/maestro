@@ -100,6 +100,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
     lastDecisionAge: latestSupervisorAge(raw.projects || []),
     supervisorPulse: aggregateSupervisorPulse(raw.projects || []),
     backendHealth: aggregateBackendHealth(raw.projects || []),
+    backendQuota: aggregateBackendQuota(raw.projects || []),
     costObservability: mapCostObservability(raw.cost_observability),
   };
 }
@@ -269,6 +270,82 @@ export function formatBackendHealthSentence(entry, now = Date.now()) {
   const remainingSec = Math.max(0, Math.round((target - now) / 1000));
   const eta = formatCountdown(remainingSec);
   return `cooldown · auto-recovery in ${eta}`;
+}
+
+// aggregateBackendQuota folds per-project `backend_quota` rows (#704)
+// into one fleet-level list for the header gauge. Each project's
+// orchestrator only meters its own sessions against the shared
+// subscription, so when the same backend appears across projects the
+// fullest reading wins (max of window/week percent) — the displayed
+// gauge is then a lower bound on the true account-level usage.
+export function aggregateBackendQuota(rawProjects) {
+  const out = new Map();
+  for (const project of rawProjects || []) {
+    for (const raw of project?.backend_quota || []) {
+      if (!raw || typeof raw !== "object") continue;
+      const entry = {
+        backend: String(raw.backend || ""),
+        windowCapTokens: Number(raw.window_cap_tokens || 0),
+        windowUsedTokens: Number(raw.window_used_tokens || 0),
+        windowPercent: Number(raw.window_percent || 0),
+        windowResetAt: raw.window_reset_at || null,
+        weeklyCapTokens: Number(raw.weekly_cap_tokens || 0),
+        weekUsedTokens: Number(raw.week_used_tokens || 0),
+        weekPercent: Number(raw.week_percent || 0),
+        weekResetAt: raw.week_reset_at || null,
+        dispatchThreshold: Number(raw.dispatch_threshold || 0),
+        pressured: raw.pressured === true,
+      };
+      if (!entry.backend) continue;
+      const existing = out.get(entry.backend);
+      if (!existing || quotaMaxPercent(entry) > quotaMaxPercent(existing)) {
+        out.set(entry.backend, entry);
+      }
+    }
+  }
+  return Array.from(out.values()).sort((a, b) => a.backend.localeCompare(b.backend));
+}
+
+function quotaMaxPercent(entry) {
+  return Math.max(Number(entry.windowPercent || 0), Number(entry.weekPercent || 0));
+}
+
+// backendQuotaTone maps a quota row to the SPA's pill palette: red once
+// dispatch is being steered away, amber within 10 points of the
+// threshold, green otherwise.
+export function backendQuotaTone(entry) {
+  if (!entry) return "idle";
+  if (entry.pressured) return "stuck";
+  const threshold = (Number(entry.dispatchThreshold || 0) || 0.85) * 100;
+  if (quotaMaxPercent(entry) >= threshold - 10) return "watch";
+  return "ok";
+}
+
+// formatBackendQuotaSentence renders one quota row as an operator
+// sentence: «window 62% · resets in 1h 12m» (plus «week 34%» when a
+// weekly cap is calibrated). Pressured rows get an explicit marker so
+// the gauge explains why dispatch moved to fallbacks.
+export function formatBackendQuotaSentence(entry, now = Date.now()) {
+  if (!entry) return "";
+  const parts = [];
+  if (entry.windowCapTokens > 0) {
+    parts.push(`window ${Math.round(entry.windowPercent)}%`);
+  }
+  if (entry.weeklyCapTokens > 0) {
+    parts.push(`week ${Math.round(entry.weekPercent)}%`);
+  }
+  if (parts.length === 0) return "";
+  const resetAt = entry.pressured && entry.weekPercent >= entry.windowPercent && entry.weekResetAt
+    ? entry.weekResetAt
+    : (entry.windowResetAt || entry.weekResetAt);
+  const resetMs = resetAt ? parseTimestamp(resetAt) : null;
+  if (resetMs != null && resetMs > now) {
+    parts.push(`resets in ${formatCountdown(Math.round((resetMs - now) / 1000))}`);
+  }
+  if (entry.pressured) {
+    parts.push("dispatch → fallback");
+  }
+  return parts.join(" · ");
 }
 
 // formatAttributionSegment renders one BackendAttribution entry as the
