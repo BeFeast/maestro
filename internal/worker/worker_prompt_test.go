@@ -211,6 +211,73 @@ func TestAssemblePromptRepoRulesSanitizesInvalidUTF8(t *testing.T) {
 	}
 }
 
+func TestAssemblePromptIncludesVisualEvidenceSectionWhenActive(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "BeFeast/panoptikon",
+		Verify: config.VerifyConfig{Visual: config.VerifyVisualConfig{
+			Enabled: true,
+			Command: "./scripts/capture-screenshots.sh",
+			Paths:   []string{"**/*.jsx", "web/**"},
+		}},
+	}
+	issue := github.Issue{Number: 705, Title: "ui change", Body: "body"}
+
+	for name, base := range map[string]string{
+		"template": "base prompt {{ISSUE_NUMBER}}",
+		"legacy":   "base prompt",
+	} {
+		t.Run(name, func(t *testing.T) {
+			prompt := assemblePrompt(base, issue, t.TempDir(), "feat/ui", cfg)
+			for _, want := range []string{
+				"## Visual Evidence (UI changes)",
+				"`**/*.jsx`, `web/**`",
+				"`./scripts/capture-screenshots.sh`",
+				"`.maestro/screenshots`",
+				"git diff --name-only origin/main...HEAD",
+				"do NOT block the PR on it",
+			} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("assemblePrompt() missing %q\nprompt:\n%s", want, prompt)
+				}
+			}
+		})
+	}
+}
+
+func TestAssemblePromptOmitsVisualEvidenceSectionWhenInactive(t *testing.T) {
+	for name, cfg := range map[string]*config.Config{
+		"disabled": {Repo: "owner/repo"},
+		"enabled but unconfigured": {
+			Repo:   "owner/repo",
+			Verify: config.VerifyConfig{Visual: config.VerifyVisualConfig{Enabled: true}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			issue := github.Issue{Number: 1, Title: "t", Body: "b"}
+			prompt := assemblePrompt("base prompt {{ISSUE_NUMBER}}", issue, t.TempDir(), "feat/x", cfg)
+			if strings.Contains(prompt, "Visual Evidence (UI changes)") {
+				t.Fatalf("visual evidence section should be omitted\nprompt:\n%s", prompt)
+			}
+		})
+	}
+}
+
+func TestWorkerPromptTemplateExplainsVisualEvidenceAttachment(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "worker-prompt-template.md"))
+	if err != nil {
+		t.Fatalf("read worker-prompt-template.md: %v", err)
+	}
+	prompt := string(data)
+	for _, want := range []string{
+		"Visual Evidence",
+		"verify.visual",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("worker-prompt-template.md missing %q", want)
+		}
+	}
+}
+
 // --- Tests from main: validation contract placeholder ---
 
 func TestAssemblePrompt_ValidationContractFromFile(t *testing.T) {

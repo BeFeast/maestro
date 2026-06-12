@@ -132,6 +132,23 @@ worker_prompt: /path/to/worker-prompt-template.md
 #   # script: ./scripts/self-deploy.sh                # default: <local_path>/scripts/self-deploy.sh
 #   # timeout_minutes: 30                             # build+restart+verify budget (covers drain)
 
+# Opt-in visual evidence for UI-affecting PRs (#705). When a PR's changed
+# files match any of the path globs, the worker is instructed to run the
+# capture command (a project-specific script that launches the app and writes
+# screenshots to output_dir) and attach the images to the PR before declaring
+# done. Missing/failed evidence produces a warning comment on the PR and a
+# supervisor finding — it never blocks merge in v1. The command runs from the
+# worktree root with $MAESTRO_SCREENSHOT_DIR set to the absolute output dir.
+# verify:
+#   visual:
+#     enabled: true
+#     command: ./scripts/capture-screenshots.sh
+#     paths:
+#       - "web/**"
+#       - "**/*.jsx"
+#     # output_dir: .maestro/screenshots   # default
+#     # timeout_minutes: 10                # default
+
 # Stale supervisor sessions are filtered out of the Fleet API attention list
 # under two independent conditions: (a) idle past idle_after_minutes AND the
 # recorded worktree is missing on disk (when require_worktree_missing=true),

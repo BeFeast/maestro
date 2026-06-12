@@ -316,6 +316,42 @@ review_gate_streams:
 
 `review_gate: none` disables all review streams. A blocking simplicity finding is treated like a blocking Greptile finding for merge gating and review-repair.
 
+### Optional: visual evidence for UI-affecting PRs (`verify.visual`)
+
+Green tests are not proof a UI renders correctly. Projects with a screenshot
+harness can opt in to the visual-evidence step (#705):
+
+```yaml
+verify:
+  visual:
+    enabled: true
+    command: ./scripts/capture-screenshots.sh   # launches the app, writes screenshots
+    paths:                                      # globs that classify a PR as UI-affecting
+      - "web/**"
+      - "**/*.jsx"
+    # output_dir: .maestro/screenshots          # default; command also sees $MAESTRO_SCREENSHOT_DIR
+    # timeout_minutes: 10                       # capture command budget
+```
+
+How it behaves:
+
+- Workers get a **Visual Evidence** prompt section: when their diff touches a
+  configured glob, they run the capture command and attach the screenshots to
+  the PR (a comment with embedded images) before declaring done.
+- The orchestrator then checks each UI-affecting PR once. If no image is
+  attached it re-runs the capture command in the session worktree as a
+  diagnostic, posts a single advisory warning comment on the PR, and the
+  supervisor records a `visual_evidence_missing` finding (severity: warning).
+- Non-UI PRs are unaffected. The step never blocks or delays merge in v1 —
+  it makes the missing evidence loud instead of leaving it to the operator's
+  eyes after merge.
+
+The capture command runs from the worktree root with
+`MAESTRO_SCREENSHOT_DIR` set to the absolute output directory. Maestro counts
+`*.png`, `*.jpg`, `*.jpeg`, `*.gif`, and `*.webp` files (recursive) as
+screenshots. `verify.visual.enabled: true` without `command`/`paths` logs a
+config warning and stays inert.
+
 ### Running as a systemd service
 
 ```bash

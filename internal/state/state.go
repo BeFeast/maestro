@@ -159,6 +159,14 @@ type Session struct {
 	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
 	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
 
+	// #705: opt-in verify.visual outcome for this session's PR. Set once by
+	// the orchestrator's merge flow: "not_required" (no UI paths touched),
+	// "attached" (evidence found on the PR), or "missing" (UI-affecting PR
+	// without attached evidence — warning comment posted, supervisor records
+	// a finding). Empty until checked. Advisory only; never blocks merge.
+	VisualEvidence       string `json:"visual_evidence,omitempty"`
+	VisualEvidenceDetail string `json:"visual_evidence_detail,omitempty"` // operator-facing detail for the "missing" case
+
 	// #691: greptile webhook-miss self-heal. The orchestrator tracks how
 	// long the review gate has been greptile=pending on one head SHA; past
 	// the configured threshold it posts "@greptile review" on the PR
@@ -188,6 +196,18 @@ type Session struct {
 	// then 4m on codex gpt-5.5 medium after rate-limit fallover".
 	Attribution []BackendAttribution `json:"attribution,omitempty"`
 }
+
+// Session.VisualEvidence outcomes for the opt-in verify.visual step (#705).
+const (
+	// VisualEvidenceNotRequired: the PR touches no configured UI paths.
+	VisualEvidenceNotRequired = "not_required"
+	// VisualEvidenceAttached: image evidence was found on the PR.
+	VisualEvidenceAttached = "attached"
+	// VisualEvidenceMissing: UI-affecting PR without attached evidence —
+	// the orchestrator posted a warning comment and the supervisor records
+	// a visual_evidence_missing finding. Advisory; never blocks merge.
+	VisualEvidenceMissing = "missing"
+)
 
 // BackendAttribution is one segment of a session's backend timeline.
 // A session has at least one (the initial spawn) and gains more if the

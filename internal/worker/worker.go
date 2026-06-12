@@ -824,6 +824,42 @@ func repoRulesPromptSection(worktreePath string) string {
 	return ""
 }
 
+// visualEvidencePromptSection instructs the worker to attach screenshot
+// evidence to UI-affecting PRs before declaring done (#705). Returns the
+// empty string unless verify.visual is fully configured (enabled + command +
+// paths). The section is advisory for the worker but the orchestrator checks
+// the PR afterwards and posts a warning when the evidence is missing.
+func visualEvidencePromptSection(cfg *config.Config) string {
+	visual := cfg.Verify.Visual
+	if !visual.Active() {
+		return ""
+	}
+
+	globs := make([]string, 0, len(visual.Paths))
+	for _, p := range visual.Paths {
+		globs = append(globs, "`"+p+"`")
+	}
+
+	var b strings.Builder
+	b.WriteString("\n\n---\n\n## Visual Evidence (UI changes)\n\n")
+	b.WriteString("This project has Maestro's `verify.visual` step enabled: UI-affecting PRs must carry screenshot evidence (a PR comment with images) before you declare done. Maestro checks the PR afterwards and posts a warning if the evidence is missing.\n\n")
+	fmt.Fprintf(&b, "- UI path globs: %s\n", strings.Join(globs, ", "))
+	fmt.Fprintf(&b, "- Capture command (run from the worktree root): `%s`\n", visual.Command)
+	fmt.Fprintf(&b, "- Screenshot output directory: `%s`\n\n", visual.ResolvedOutputDir())
+	b.WriteString("After implementing and committing, before declaring done:\n\n")
+	b.WriteString("1. Run `git diff --name-only origin/main...HEAD`. If NO changed file matches the globs above, skip the rest of this section — non-UI PRs are unaffected.\n")
+	b.WriteString("2. Run the capture command from the worktree root. It launches the app and writes screenshots to the output directory.\n")
+	fmt.Fprintf(&b, "3. Confirm at least one image (png/jpg/jpeg/gif/webp) exists in `%s`.\n", visual.ResolvedOutputDir())
+	fmt.Fprintf(&b, "4. Attach the screenshots to the PR as a comment with embedded images. Unless the repository rules define another evidence channel, commit the screenshots on your branch inside `%s` (this evidence directory is the one exception to the no-artifacts rule), push, then post a PR comment embedding each image pinned to the commit SHA, e.g.:\n", visual.ResolvedOutputDir())
+	b.WriteString("   ```bash\n")
+	b.WriteString("   sha=$(git rev-parse HEAD)\n")
+	fmt.Fprintf(&b, "   gh pr comment <PR_NUMBER> --repo %s --body \"### 📸 Visual evidence\n", cfg.Repo)
+	fmt.Fprintf(&b, "   ![home](https://raw.githubusercontent.com/%s/$sha/%s/home.png)\"\n", cfg.Repo, visual.ResolvedOutputDir())
+	b.WriteString("   ```\n")
+	b.WriteString("5. If the capture command fails or produces no screenshots, post a PR comment briefly explaining why visual evidence could not be captured, then continue — do NOT block the PR on it; Maestro records a finding for the operator.\n")
+	return b.String()
+}
+
 // assemblePrompt builds the final worker prompt.
 // If the base template contains {{ISSUE_NUMBER}} placeholders, it performs
 // template substitution. Otherwise it falls back to appending a task block.
@@ -860,7 +896,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath)
+		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath) + visualEvidencePromptSection(cfg)
 		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
@@ -907,6 +943,7 @@ Always rebase on origin/main immediately before creating the PR.
 	)
 	result += repoRulesPromptSection(worktreePath)
 	result += workerSearchSafetyPromptSection(worktreePath)
+	result += visualEvidencePromptSection(cfg)
 	return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, false)
 }
 
