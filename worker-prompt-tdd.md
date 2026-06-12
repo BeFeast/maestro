@@ -73,8 +73,8 @@ The following contract defines what "done" means for this issue. Every item must
 - [ ] `go build ./...` — builds successfully (or `cargo build` / `bun run build`)
 
 ### Done vs Partial
-- **Done**: All assertions in the validation contract pass, all quality gates green, PR opened
-- **Partial**: Some assertions pass but others are blocked — open a draft PR, document what works and what's blocked in the PR body
+- **Done**: All assertions in the validation contract pass, all quality gates green, PR opened **ready for review** (never a draft)
+- **Partial**: Some assertions pass but others are blocked — open a **draft** PR with `[Partial]` prefixed to the title AND the literal marker `<!-- maestro:partial -->` in the PR body, documenting what works and what's blocked. The marker tells Maestro the draft is deliberate so it will not auto-ready or auto-merge it.
 
 ---
 

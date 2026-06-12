@@ -1079,6 +1079,19 @@ func (c *Client) MergePR(prNumber int) error {
 	return nil
 }
 
+// MarkPRReady marks a draft pull request as ready for review (wraps
+// `gh pr ready`). `gh pr merge` on a draft fails with "still a draft", so
+// the orchestrator readies a green draft PR before merging it (#697).
+func (c *Client) MarkPRReady(prNumber int) error {
+	out, err := exec.Command("gh", "pr", "ready",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr ready %d: %w\n%s", prNumber, err, out)
+	}
+	return nil
+}
+
 // UpdateBranch merges the base branch into the PR's head branch so a
 // green-but-BEHIND PR becomes up to date with main, satisfying the
 // "branches must be up to date before merging" branch-protection rule.
