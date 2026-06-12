@@ -1,16 +1,23 @@
 package orchestrator
 
 import (
+	"log"
 	"sort"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 )
 
 const (
 	selectionReasonProviderLimitFallback = "fallback_after_provider_limit"
 	selectionReasonAuthFailureFallback   = "fallback_after_backend_auth_failure"
+	// selectionReasonDispatchBlockedFallback marks a fresh dispatch whose
+	// routed backend was blocked (disabled or in BackendHealth cooldown), so
+	// the first healthy candidate was substituted before spawn (#695).
+	selectionReasonDispatchBlockedFallback = "dispatch_fallback_blocked_backend"
 )
 
 // backendAuthFailureCooldown is how long an auth-failed backend stays gated
@@ -154,6 +161,117 @@ func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Sessio
 		}
 	}
 	return selection
+}
+
+// resolveDispatchBackend resolves the backend for a fresh dispatch and gates
+// the routed choice on BackendHealth (#695). Without this gate the router's
+// decision never saw cooldowns, so during a credential outage every new
+// dispatch spawned a doomed ~2-minute worker on the gated default backend
+// once per poll cycle. When the routed backend is blocked — disabled, or
+// cooling down after an auth failure / provider limit — the first healthy
+// candidate from dispatchBackendCandidates is substituted, with a log line
+// naming the substitution. ok=false means every candidate is blocked too;
+// retryAt then carries the earliest known cooldown expiry (nil when none of
+// the blocked backends states one) so the caller can pause fresh dispatch
+// until a cooldown lapses instead of spawn-die churning.
+func (o *Orchestrator) resolveDispatchBackend(st *state.State, issue github.Issue, now time.Time) (decision router.BackendDecision, ok bool, retryAt *time.Time) {
+	decision = o.resolveBackendDecision(issue)
+	blockedBy, blockedRetry := o.dispatchBackendBlock(st, decision.Backend, now)
+	if blockedBy == "" {
+		return decision, true, nil
+	}
+	earliest := blockedRetry
+	for _, candidate := range o.dispatchBackendCandidates() {
+		if candidate == decision.Backend {
+			continue
+		}
+		candidateBlock, candidateRetry := o.dispatchBackendBlock(st, candidate, now)
+		if candidateBlock != "" {
+			if candidateRetry != nil && (earliest == nil || candidateRetry.Before(*earliest)) {
+				earliest = candidateRetry
+			}
+			continue
+		}
+		log.Printf("[orch] issue #%d: backend %s blocked for fresh dispatch (%s%s) — substituting %s",
+			issue.Number, decision.Backend, blockedBy, retryAfterHint(blockedRetry), candidate)
+		return router.BackendDecision{
+			Backend:  candidate,
+			Reason:   selectionReasonDispatchBlockedFallback,
+			TaskType: decision.TaskType,
+		}, true, nil
+	}
+	return decision, false, earliest
+}
+
+// dispatchBackendBlock reports why a backend cannot receive a fresh dispatch,
+// or "" when it can. The skip rules mirror selectBackendFallback: unknown and
+// disabled backends are never dispatchable, and a backend in BackendHealth
+// cooldown stays blocked until its RetryAfter passes (or indefinitely while
+// RetryAfter is unset). retryAfter is the cooldown expiry when one exists.
+func (o *Orchestrator) dispatchBackendBlock(st *state.State, name string, now time.Time) (blockedBy string, retryAfter *time.Time) {
+	backendDef, ok := o.cfg.Model.Backends[name]
+	if !ok {
+		return state.BackendBlockUnknown, nil
+	}
+	if !backendDef.IsEnabled() {
+		return state.BackendBlockDisabled, nil
+	}
+	if st == nil {
+		return "", nil
+	}
+	if health, ok := st.BackendHealth[name]; ok && health.State == state.BackendHealthCooldown {
+		if health.RetryAfter == nil || now.Before(*health.RetryAfter) {
+			reason := health.Reason
+			if reason == "" {
+				reason = state.BackendHealthCooldown
+			}
+			return reason, health.RetryAfter
+		}
+	}
+	return "", nil
+}
+
+// dispatchBackendCandidates is the substitution order for a fresh dispatch
+// whose routed backend is blocked: the default backend first, then the
+// configured fallback chain — the same chain selectBackendFallback walks —
+// and, only when no explicit chain is configured, the remaining configured
+// backends sorted by name.
+func (o *Orchestrator) dispatchBackendCandidates() []string {
+	seen := make(map[string]bool)
+	ordered := make([]string, 0, len(o.cfg.Model.Backends)+1)
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		ordered = append(ordered, name)
+	}
+	add(o.cfg.Model.Default)
+	for _, name := range o.cfg.Model.FallbackBackends {
+		add(name)
+	}
+	if len(o.cfg.Model.FallbackBackends) > 0 {
+		return ordered
+	}
+	remaining := make([]string, 0, len(o.cfg.Model.Backends))
+	for name := range o.cfg.Model.Backends {
+		if !seen[name] {
+			remaining = append(remaining, name)
+		}
+	}
+	sort.Strings(remaining)
+	for _, name := range remaining {
+		add(name)
+	}
+	return ordered
+}
+
+// retryAfterHint formats a cooldown expiry for dispatch log lines.
+func retryAfterHint(retryAfter *time.Time) string {
+	if retryAfter == nil {
+		return ""
+	}
+	return ", retry after " + retryAfter.UTC().Format(time.RFC3339)
 }
 
 func (o *Orchestrator) backendFallbackCandidates(sess *state.Session) []string {

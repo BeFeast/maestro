@@ -4489,6 +4489,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	}
 
 	started := 0
+	// #695: when every backend is blocked or cooling down, fresh dispatch
+	// pauses for the cycle. Log the reason once, not once per eligible issue.
+	dispatchPauseLogged := false
 	for _, issue := range issues {
 		repairSpawn := o.supervisorSelectedRepairSpawn(s, issue.Number)
 		if s.IssueInProgress(issue.Number) {
@@ -4650,8 +4653,22 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			promptBase = pipeline.PromptTemplateForPhase(workerCfg, initialPhase)
 			backendReason = "phase"
 		} else {
-			// Normal mode or pipeline starting at implement — use standard resolution
-			backendDecision := o.resolveBackendDecision(issue)
+			// Normal mode or pipeline starting at implement — use standard
+			// resolution, gated on BackendHealth so a fresh dispatch never
+			// lands on a backend that is disabled or cooling down after an
+			// auth failure / provider limit (#695).
+			backendDecision, dispatchable, retryAt := o.resolveDispatchBackend(s, issue, time.Now().UTC())
+			if !dispatchable {
+				if !dispatchPauseLogged {
+					expiry := "no cooldown expiry recorded"
+					if retryAt != nil {
+						expiry = "earliest cooldown expires " + retryAt.UTC().Format(time.RFC3339)
+					}
+					log.Printf("[orch] dispatch paused: all backends blocked or cooling down (%s) — not spawning fresh workers this cycle", expiry)
+					dispatchPauseLogged = true
+				}
+				continue
+			}
 			backendName = backendDecision.Backend
 			backendReason = backendDecision.Reason
 			taskType = backendDecision.TaskType
