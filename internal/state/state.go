@@ -66,6 +66,13 @@ const (
 	BackendBlockAlreadyTried = "already_tried"
 	BackendBlockCurrent      = "current_backend"
 	BackendBlockUnknown      = "unknown_backend"
+	// BackendBlockQuotaPressure gates a backend whose estimated
+	// subscription-window usage crossed the quota dispatch threshold
+	// (#704). Unlike auth_failure it is a soft, predictive gate: the
+	// backend still works, but fresh dispatch prefers fallbacks until
+	// the window resets so the remaining capacity survives for work
+	// already in flight.
+	BackendBlockQuotaPressure = "quota_pressure"
 )
 
 // BackendHealth records cross-session availability for a configured backend.
@@ -134,6 +141,7 @@ type Session struct {
 	LastOutputChangedAt         time.Time         `json:"last_output_changed_at,omitempty"`
 	TokensUsedAttempt           int               `json:"tokens_used_attempt,omitempty"`            // tokens consumed in current attempt (reset on respawn)
 	TokensUsedTotal             int               `json:"tokens_used_total,omitempty"`              // cumulative tokens across the issue lifecycle
+	QuotaTokensAccounted        int               `json:"quota_tokens_accounted,omitempty"`         // portion of TokensUsedTotal already accrued into BackendQuotaUsage windows (#704)
 	RateLimitHit                bool              `json:"rate_limit_hit,omitempty"`                 // true when the worker died on a transient backend block (provider limit or auth failure, #693); excludes the session from the per-issue retry budget
 	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for backend-failure fallback)
 	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit or auth failure
@@ -886,16 +894,17 @@ type ApprovalAudit struct {
 }
 
 type State struct {
-	Sessions            map[string]*Session        `json:"sessions"`
-	Missions            map[int]*Mission           `json:"missions,omitempty"` // parent issue number → mission
-	SupervisorDecisions []SupervisorDecision       `json:"supervisor_decisions,omitempty"`
-	Approvals           []Approval                 `json:"approvals,omitempty"`
-	LessonProposals     []LessonProposal           `json:"lesson_proposals,omitempty"`
-	OutcomeHealth       *outcome.HealthCheckResult `json:"outcome_health,omitempty"`
-	BackendHealth       map[string]BackendHealth   `json:"backend_health,omitempty"`
-	ProjectStatusSync   map[int]ProjectStatusSync  `json:"project_status_sync,omitempty"`
-	NextSlot            int                        `json:"next_slot"`
-	LastMergeAt         time.Time                  `json:"last_merge_at,omitempty"`
+	Sessions            map[string]*Session           `json:"sessions"`
+	Missions            map[int]*Mission              `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision          `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval                    `json:"approvals,omitempty"`
+	LessonProposals     []LessonProposal              `json:"lesson_proposals,omitempty"`
+	OutcomeHealth       *outcome.HealthCheckResult    `json:"outcome_health,omitempty"`
+	BackendHealth       map[string]BackendHealth      `json:"backend_health,omitempty"`
+	BackendQuotaUsage   map[string]*BackendQuotaUsage `json:"backend_quota_usage,omitempty"`
+	ProjectStatusSync   map[int]ProjectStatusSync     `json:"project_status_sync,omitempty"`
+	NextSlot            int                           `json:"next_slot"`
+	LastMergeAt         time.Time                     `json:"last_merge_at,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
 	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
@@ -1248,6 +1257,7 @@ func (s *State) copyFrom(src *State) {
 	s.OutcomeHealth = src.OutcomeHealth
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
+	s.BackendQuotaUsage = src.BackendQuotaUsage
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
 	s.SpawnDrain = src.SpawnDrain
@@ -1296,6 +1306,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
+	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	mergeSpawnDrain(merged, current, ours)
@@ -2841,7 +2852,12 @@ func ReconcileBackendHealth(s *State, now time.Time) bool {
 			changed = true
 			continue
 		}
-		if backendHasPRSuccessAfter(s, name, health.Since) {
+		// PR evidence proves the backend works, which clears auth and
+		// provider-limit cooldowns — but a quota_pressure gate (#704) is
+		// predictive, not a malfunction: the backend keeps producing PRs
+		// while pressured. It clears only via RetryAfter (window reset)
+		// or the orchestrator's quota reconcile dropping below threshold.
+		if health.Reason != BackendBlockQuotaPressure && backendHasPRSuccessAfter(s, name, health.Since) {
 			delete(s.BackendHealth, name)
 			changed = true
 			continue

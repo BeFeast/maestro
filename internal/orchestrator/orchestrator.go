@@ -1302,6 +1302,12 @@ func (o *Orchestrator) RunOnce() error {
 		}
 	}
 
+	// Step 4b2: Accrue session token usage into the per-backend quota
+	// windows and gate backends whose estimated subscription usage crossed
+	// the dispatch threshold (#704). Runs before the fresh-dispatch step so
+	// startNewWorkers sees the quota_pressure cooldowns this cycle.
+	o.reconcileBackendQuota(s, time.Now().UTC())
+
 	// Step 4c: Clear stale BackendHealth cooldown entries (#600) — backends
 	// that have since produced PR evidence, whose RetryAfter has elapsed,
 	// or whose cooldown is older than the max-cooldown TTL. The selector

@@ -66,6 +66,15 @@ model:
       # pricing:
       #   input_usd_per_mtok: 15
       #   output_usd_per_mtok: 75
+      # Optional subscription quota calibration (issue #704). Maestro
+      # estimates usage of the provider's 5-hour session window and
+      # weekly cap from its own token counters; above dispatch_threshold
+      # (default 0.85) fresh dispatches prefer fallback_backends until
+      # the window resets. See docs/subscription-quota.md to calibrate.
+      # quota:
+      #   window_tokens: 12000000   # est. tokens per 5h session window
+      #   weekly_tokens: 80000000   # est. tokens per week
+      #   dispatch_threshold: 0.85  # fraction (0..1)
     codex:
       cmd: codex
       # Optional worker MCP tools. Omit this block for the safe default:

@@ -1,0 +1,104 @@
+# Subscription quota telemetry & quota-aware dispatch (#704)
+
+The whole fleet typically burns one Claude subscription account. The
+subscription meters a **5-hour session window** (starts at first use,
+resets 5 hours later) and a **weekly cap** — and the provider exposes no
+programmatic usage API, so hitting either limit used to be discovered
+reactively: workers start dying and dispatch degrades to fallback
+backends (#694/#695).
+
+With quota calibration configured, maestro instead:
+
+1. **Tracks usage** — every cycle, newly observed session tokens accrue
+   into per-backend rolling windows (`backend_quota_usage` in state):
+   a 5-hour window and a 7-day window, each anchored at the first
+   tokens observed after the previous window expired.
+2. **Exposes it** — `/api/v1/fleet` carries a `backend_quota` row per
+   calibrated backend (percent used, reset ETA, pressured flag), and
+   Mission Control renders a gauge next to the backend health pills.
+3. **Steers dispatch** — once estimated usage crosses
+   `dispatch_threshold` (default **0.85**), the backend gets a
+   BackendHealth cooldown with reason `quota_pressure` and `RetryAfter`
+   at the window reset. The existing dispatch gate (#695) then routes
+   fresh dispatches to the next healthy backend in
+   `model.fallback_backends`; running workers are not touched. A
+   `backend_quota_pressure` supervisor finding (warning) is emitted once
+   per pressure episode and self-clears at reset.
+
+Out of scope (by design): keep-alive pings to start the window early,
+multi-account rotation.
+
+## Configuration
+
+```yaml
+model:
+  default: claude
+  fallback_backends: [codex]
+  backends:
+    claude:
+      cmd: claude
+      quota:
+        window_tokens: 12000000   # est. token capacity of one 5h window
+        weekly_tokens: 80000000   # est. token capacity of one week
+        dispatch_threshold: 0.85  # fraction (0..1); default 0.85
+    codex:
+      cmd: codex
+```
+
+- A backend without a `quota:` block is not quota-tracked and never
+  quota-gated.
+- Either capacity may be omitted; only configured windows are checked.
+- `dispatch_threshold` must be a fraction in `(0, 1]` — `85` is
+  rejected at config parse so a percent-style typo cannot silently
+  disable steering.
+
+## Calibrating window_tokens / weekly_tokens
+
+Maestro estimates usage from its own per-session token counters (the
+same counters behind the MC cost panel, #619). The provider's metering
+is opaque and not token-for-token identical, so the capacities are
+deliberately operator-calibrated knobs:
+
+1. Run the fleet for a stretch where the subscription's own usage
+   readout is visible (run `claude /status` interactively, or check the
+   provider dashboard) and note the percent used for the current 5h
+   session and for the week.
+2. Read maestro's token burn for the same stretch: the MC **Cost &
+   usage** panel (today/7d per backend) or `backend_quota_usage` in the
+   fleet snapshot.
+3. Divide: `window_tokens ≈ tokens_burned / fraction_used`. Example: if
+   maestro metered 4.2M tokens while `claude /status` shows 35% of the
+   session window, calibrate `window_tokens: 12000000`. Same arithmetic
+   for `weekly_tokens` against the weekly readout.
+4. Re-check after a week. If the gauge consistently reads low (pressure
+   never fires before the provider limits hit), lower the capacities;
+   if dispatch is steered away while `claude /status` still shows
+   headroom, raise them.
+
+Estimation caveats to keep in mind:
+
+- Each project's orchestrator only meters its **own** sessions. When
+  several projects share one subscription, either give each project a
+  proportional share of the capacity, or treat the MC gauge (which
+  shows the fullest per-project reading per backend) as a lower bound.
+- Tokens are observed from worker logs with some lag, and supervisor /
+  router calls outside worker sessions are not metered. The threshold
+  (15% headroom by default) is the buffer for this drift.
+- Window anchoring is approximate: maestro anchors a window at the
+  first tokens it observes, which can lag the provider's anchor by up
+  to one poll cycle.
+
+## Operations
+
+- **MC gauge** — green below `threshold − 10pp`, amber when
+  approaching, red once pressured (`dispatch → fallback`). Tooltip
+  shows exact window/week percentages and the threshold.
+- **Pressure episode** — one `backend_quota_pressure` warning finding
+  per episode; evidence carries the usage pattern and `reset_at`. No
+  operator action is required: the gate self-clears when the window
+  resets or usage drops below threshold. If episodes recur every
+  window, recalibrate the capacities or reduce `max_parallel`.
+- **Interaction with hard failures** — a quota gate never overwrites an
+  auth-failure or provider-limit cooldown, and unlike those, PR
+  evidence does not clear it (the backend keeps working while
+  pressured; only the reset clock ends the episode).

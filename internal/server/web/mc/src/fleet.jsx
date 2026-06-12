@@ -6,8 +6,10 @@ import {
   actionLabel,
   approvalSlotLabel,
   backendHealthTone,
+  backendQuotaTone,
   formatAbsoluteTimestamp,
   formatBackendHealthSentence,
+  formatBackendQuotaSentence,
   formatCountdown,
   formatTokens,
   formatUSD,
@@ -118,6 +120,7 @@ export function FleetScreen({ navigate }) {
       </div>
 
       <BackendHealthRow entries={fleet.backendHealth || []} now={now} />
+      <BackendQuotaRow entries={fleet.backendQuota || []} now={now} />
 
       <div className="stats">
         <Stat
@@ -545,6 +548,43 @@ function BackendHealthRow({ entries, now }) {
             <span style={{ fontSize: 10.5, opacity: 0.85 }}>
               {sentence || entry.state || "unknown"}
             </span>
+          </Pill>
+        );
+      })}
+    </div>
+  );
+}
+
+// BackendQuotaRow renders one gauge per quota-calibrated backend (#704)
+// so the operator sees how much of the subscription window is left —
+// «claude ▓▓▓▓░ window 62% · resets in 1h 12m» — and, once a backend is
+// pressured, why fresh dispatches moved to the fallback chain. Hidden
+// entirely when no project calibrates quota (legacy servers).
+function BackendQuotaRow({ entries, now }) {
+  if (!entries || entries.length === 0) return null;
+  return (
+    <div className="backend-quota row gap-2" style={{ flexWrap: "wrap", marginTop: "var(--s-3)", marginBottom: "var(--s-3)" }}>
+      <span className="mono dim" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        quota
+      </span>
+      {entries.map(entry => {
+        const tone = backendQuotaTone(entry);
+        const sentence = formatBackendQuotaSentence(entry, now);
+        const percent = Math.max(entry.windowPercent || 0, entry.weekPercent || 0);
+        const width = Math.max(0, Math.min(100, Math.round(percent)));
+        const threshold = ((entry.dispatchThreshold || 0.85) * 100).toFixed(0);
+        const title = `${entry.backend} subscription window ${Math.round(entry.windowPercent)}% / week ${Math.round(entry.weekPercent)}% used (dispatch threshold ${threshold}%)`;
+        return (
+          <Pill key={entry.backend} tone={tone} noDot title={title}>
+            <strong style={{ fontSize: 11.5, marginRight: 6 }}>{entry.backend}</strong>
+            <span aria-hidden style={{
+              display: "inline-block", width: 44, height: 5, borderRadius: 3,
+              background: "color-mix(in srgb, currentColor 18%, transparent)",
+              verticalAlign: "middle", marginRight: 6, overflow: "hidden",
+            }}>
+              <span style={{ display: "block", width: `${width}%`, height: "100%", borderRadius: 3, background: "currentColor" }} />
+            </span>
+            <span style={{ fontSize: 10.5, opacity: 0.85 }}>{sentence}</span>
           </Pill>
         );
       })}

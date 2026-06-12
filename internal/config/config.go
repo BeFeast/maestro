@@ -61,6 +61,13 @@ type BackendDef struct {
 	// blends input/output 50/50; operators who care about precision can
 	// set the same value for both.
 	Pricing BackendPricing `yaml:"pricing,omitempty"`
+
+	// Quota describes the backend's subscription window capacity (#704).
+	// When configured, maestro tracks estimated token usage against the
+	// provider's 5-hour session window and weekly cap, surfaces the
+	// percentages on the fleet API / Mission Control, and steers fresh
+	// dispatch to fallback backends once usage crosses the threshold.
+	Quota BackendQuota `yaml:"quota,omitempty"`
 }
 
 // MCPConfig is an opt-in per-backend worker MCP attachment. When empty,
@@ -119,6 +126,48 @@ func (p BackendPricing) EstimateCostUSD(tokens int) float64 {
 	}
 	rate := (p.InputUSDPerMtok + p.OutputUSDPerMtok) / 2
 	return float64(tokens) * rate / 1_000_000.0
+}
+
+// BackendQuota calibrates a subscription-style backend against its
+// provider's usage windows (#704). Subscription plans (e.g. Claude
+// Max) meter a 5-hour rolling session window plus a weekly cap, and
+// the provider exposes no programmatic usage API — so maestro
+// estimates usage from its own per-session token counters against
+// these operator-calibrated capacities. Both capacities are optional;
+// a backend with neither set is not quota-tracked.
+type BackendQuota struct {
+	// WindowTokens is the estimated token capacity of one 5-hour
+	// session window. Calibrate by reading `claude /status` (or the
+	// provider dashboard) at a known usage percent and dividing the
+	// fleet's token burn for that window by that fraction.
+	WindowTokens int `yaml:"window_tokens,omitempty"`
+	// WeeklyTokens is the estimated token capacity of the weekly cap,
+	// calibrated the same way against the weekly usage readout.
+	WeeklyTokens int `yaml:"weekly_tokens,omitempty"`
+	// DispatchThreshold is the used fraction (0..1) above which fresh
+	// dispatches prefer the next fallback backend until the window
+	// resets. Defaults to 0.85 when unset.
+	DispatchThreshold float64 `yaml:"dispatch_threshold,omitempty"`
+}
+
+// Configured reports whether at least one window capacity is set, i.e.
+// whether the backend participates in quota tracking at all.
+func (q BackendQuota) Configured() bool {
+	return q.WindowTokens > 0 || q.WeeklyTokens > 0
+}
+
+// DefaultQuotaDispatchThreshold is the used fraction above which fresh
+// dispatch prefers fallback backends when quota.dispatch_threshold is
+// not set (#704: "default 85%").
+const DefaultQuotaDispatchThreshold = 0.85
+
+// EffectiveDispatchThreshold returns the configured threshold or the
+// 0.85 default. parse() rejects values outside (0, 1].
+func (q BackendQuota) EffectiveDispatchThreshold() float64 {
+	if q.DispatchThreshold > 0 {
+		return q.DispatchThreshold
+	}
+	return DefaultQuotaDispatchThreshold
 }
 
 func (b BackendDef) IsEnabled() bool {
@@ -1133,6 +1182,19 @@ func parse(data []byte) (*Config, error) {
 		}
 		if def.NonAgentic {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
+		}
+	}
+
+	// #704: quota calibration sanity. Capacities must be non-negative and
+	// the dispatch threshold a fraction in (0, 1]; a percent-style value
+	// (e.g. 85) almost certainly means the operator meant 0.85, so fail
+	// fast instead of silently never steering dispatch.
+	for name, def := range cfg.Model.Backends {
+		if def.Quota.WindowTokens < 0 || def.Quota.WeeklyTokens < 0 {
+			return nil, fmt.Errorf("config: model.backends.%s.quota window_tokens/weekly_tokens must be >= 0", name)
+		}
+		if t := def.Quota.DispatchThreshold; t < 0 || t > 1 {
+			return nil, fmt.Errorf("config: model.backends.%s.quota.dispatch_threshold = %v; want a fraction in (0, 1], e.g. 0.85 for 85%%", name, t)
 		}
 	}
 
