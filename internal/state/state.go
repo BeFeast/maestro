@@ -42,6 +42,11 @@ const (
 	// distinct, non-failure display token so operators do not confuse a
 	// rate-limited backend with a genuine retry_exhausted code failure.
 	DisplayBackendRateLimited SessionDisplayStatus = "backend_rate_limited"
+	// DisplayBackendAuthFailure marks a session whose worker exited because its
+	// backend could not authenticate (e.g. claude CLI 401, #693) with no
+	// fallback available. Like DisplayBackendRateLimited it is a backend
+	// outage, not a work failure, and did not burn the per-issue retry budget.
+	DisplayBackendAuthFailure SessionDisplayStatus = "backend_auth_failure"
 	LiveSessionRecentWindow                        = 24 * time.Hour
 )
 
@@ -52,10 +57,15 @@ const (
 	BackendHealthCooldown  = "cooldown"
 
 	BackendBlockProviderLimit = "provider_limit"
-	BackendBlockDisabled      = "disabled"
-	BackendBlockAlreadyTried  = "already_tried"
-	BackendBlockCurrent       = "current_backend"
-	BackendBlockUnknown       = "unknown_backend"
+	// BackendBlockAuthFailure gates a backend whose CLI failed to
+	// authenticate (e.g. 401 invalid/expired credentials, #693). Worker
+	// deaths attributed to it are backend failures, not work failures: they
+	// must not consume the per-issue retry budget.
+	BackendBlockAuthFailure  = "auth_failure"
+	BackendBlockDisabled     = "disabled"
+	BackendBlockAlreadyTried = "already_tried"
+	BackendBlockCurrent      = "current_backend"
+	BackendBlockUnknown      = "unknown_backend"
 )
 
 // BackendHealth records cross-session availability for a configured backend.
@@ -124,10 +134,10 @@ type Session struct {
 	LastOutputChangedAt         time.Time         `json:"last_output_changed_at,omitempty"`
 	TokensUsedAttempt           int               `json:"tokens_used_attempt,omitempty"`            // tokens consumed in current attempt (reset on respawn)
 	TokensUsedTotal             int               `json:"tokens_used_total,omitempty"`              // cumulative tokens across the issue lifecycle
-	RateLimitHit                bool              `json:"rate_limit_hit,omitempty"`                 // true if worker was rate-limited (tmux detection, running worker)
-	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for rate-limit fallback)
-	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit
-	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // provider limit signature or class
+	RateLimitHit                bool              `json:"rate_limit_hit,omitempty"`                 // true when the worker died on a transient backend block (provider limit or auth failure, #693); excludes the session from the per-issue retry budget
+	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for backend-failure fallback)
+	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit or auth failure
+	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // backend block signature or class (e.g. BackendBlockAuthFailure)
 	ProviderLimitResetAt        *time.Time        `json:"provider_limit_reset_at,omitempty"`        // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
 	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
 	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
@@ -272,6 +282,13 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 			if backend == "" {
 				backend = sess.Backend
 			}
+			if sess.ProviderLimitReason == BackendBlockAuthFailure {
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Backend %s failed authentication (invalid or expired credentials); no fallback backend is currently available or allowed.", backend),
+					NextAction:     "Re-authenticate the backend CLI (or wait for credential sync), then retry; the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			return SessionAttention{
 				Reason:         fmt.Sprintf("Backend %s hit a provider capacity limit; no fallback backend is currently available or allowed.", backend),
 				NextAction:     "Wait for provider capacity to recover, enable another backend, or change routing policy before retrying.",
@@ -339,16 +356,19 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 		return string(display)
 	}
 	if backendRateLimitedDisplayStatus(sess) {
+		if sess.ProviderLimitReason == BackendBlockAuthFailure {
+			return string(DisplayBackendAuthFailure)
+		}
 		return string(DisplayBackendRateLimited)
 	}
 	return string(sess.Status)
 }
 
 // backendRateLimitedDisplayStatus reports whether a session represents a worker
-// that exited because its backend hit a provider usage limit with no fallback
-// available. Such a session is marked Dead but, unlike a real failure, did not
-// burn the per-issue retry budget; it must be shown distinctly so operators do
-// not mistake it for retry_exhausted.
+// that exited because of a backend block (provider usage limit or auth
+// failure, #693) with no fallback available. Such a session is marked Dead
+// but, unlike a real failure, did not burn the per-issue retry budget; it
+// must be shown distinctly so operators do not mistake it for retry_exhausted.
 func backendRateLimitedDisplayStatus(sess *Session) bool {
 	if sess == nil {
 		return false
@@ -2934,9 +2954,10 @@ func (s *State) IssueDone(issueNum int) bool {
 // FailedAttemptsForIssue counts sessions for the given issue that ended
 // without producing a PR (dead, failed, or retry_exhausted).
 //
-// Sessions marked as rate-limited (RateLimitHit) are NOT counted as failed
-// attempts: a transient backend block must not consume the per-issue retry
-// budget. See #432 / #458 / #466.
+// Sessions marked as backend-blocked (RateLimitHit — provider capacity limit
+// or backend auth failure) are NOT counted as failed attempts: a transient
+// backend block must not consume the per-issue retry budget.
+// See #432 / #458 / #466 / #693.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {

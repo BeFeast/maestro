@@ -1023,8 +1023,60 @@ func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.
 		findings = append(findings, detectPolicyStuckStates(skipped)...)
 	}
 	findings = append(findings, e.detectEnvironmentStuckStates(st, eligible)...)
+	findings = append(findings, e.detectBackendAuthFailureStuckStates(st, now)...)
 	findings = append(findings, e.detectOutcomeStuckStates(st)...)
 	return compactStuckStates(findings)
+}
+
+// detectBackendAuthFailureStuckStates surfaces backends gated by an
+// auth/credential failure (#693) so the operator sees the backend is down
+// (e.g. an expired/invalidated OAuth token) instead of discovering it later
+// as wedged issues. The finding self-clears once the cooldown expires or
+// ReconcileBackendHealth removes the entry. The default backend going dark
+// is blocking (every new spawn prefers it); a non-default backend is a
+// warning because routing can avoid it.
+func (e *Engine) detectBackendAuthFailureStuckStates(st *state.State, now time.Time) []state.SupervisorStuckState {
+	if st == nil || len(st.BackendHealth) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(st.BackendHealth))
+	for name := range st.BackendHealth {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var findings []state.SupervisorStuckState
+	for _, name := range names {
+		health := st.BackendHealth[name]
+		if health.State != state.BackendHealthCooldown || health.Reason != state.BackendBlockAuthFailure {
+			continue
+		}
+		if health.RetryAfter != nil && !now.Before(*health.RetryAfter) {
+			continue // cooldown elapsed; the selector will re-probe the backend
+		}
+		severity := SeverityWarning
+		if name == e.cfg.Model.Default {
+			severity = SeverityBlocked
+		}
+		evidence := []string{fmt.Sprintf("backend=%s", name)}
+		if health.Pattern != "" {
+			evidence = append(evidence, fmt.Sprintf("signature=%s", health.Pattern))
+		}
+		if !health.Since.IsZero() {
+			evidence = append(evidence, fmt.Sprintf("since=%s", health.Since.Format(time.RFC3339)))
+		}
+		if health.RetryAfter != nil {
+			evidence = append(evidence, fmt.Sprintf("retry_after=%s", health.RetryAfter.Format(time.RFC3339)))
+		}
+		if health.LastSession != "" {
+			evidence = append(evidence, fmt.Sprintf("last_session=%s", health.LastSession))
+		}
+		findings = append(findings, stuckState("backend_auth_failure", severity,
+			fmt.Sprintf("Backend %s is failing authentication (invalid or expired credentials); workers cannot use it.", name),
+			"Re-authenticate the backend CLI or re-sync its credentials; fallback backends keep the queue moving meanwhile and the per-issue retry budget is preserved.", false, nil,
+			evidence...))
+	}
+	return findings
 }
 
 func (e *Engine) outcomeStatus(st *state.State) outcome.Status {
