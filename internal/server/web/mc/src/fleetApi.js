@@ -821,7 +821,8 @@ function mapWorker(worker) {
 //   - "recent":  not running but live in the last 24h (pr_open, code_landed,
 //                blocked-by-project, idle awaiting reconciliation)
 //   - "stuck":   needs operator attention (dead, failed, conflict_failed,
-//                retry_exhausted, backend_rate_limited, backend_auth_failure)
+//                retry_exhausted, backend_rate_limited, backend_auth_failure,
+//                backend_model_unavailable)
 //   - "done":    `status === "done"` only — true completion
 //
 // Pill tones map to CSS classes in mc.css:
@@ -855,6 +856,14 @@ export function workerStatusTaxonomy(worker) {
   // not degrade to the generic red "dead" pill.
   if (display === "backend_auth_failure") {
     return { label: "auth failure", tone: "watch", section: "stuck" };
+  }
+
+  // backend_model_unavailable (#713): the worker died because its backend's
+  // configured model is gone — pulled, renamed, or no longer accessible — not
+  // because the work failed. The retry budget is preserved; the operator
+  // swaps the model id (distinct remediation from an auth outage).
+  if (display === "backend_model_unavailable") {
+    return { label: "model unavailable", tone: "watch", section: "stuck" };
   }
 
   if (display === "blocked" && !isStuckStatus(status)) {
@@ -915,6 +924,14 @@ export function workerNextAction(worker) {
     const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
     return {
       text: `Backend ${backend} failed authentication. Fix credentials; the retry budget is preserved.`,
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    };
+  }
+
+  if (display === "backend_model_unavailable") {
+    const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
+    return {
+      text: `Backend ${backend} cannot load its configured model (unavailable or no access). Swap the model id or restore access; the retry budget is preserved.`,
       buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
     };
   }
@@ -1142,7 +1159,7 @@ export function workerSessionsFromFleet(fleet, now) {
   //               "in flight" group reflects active flow only.
   //   - stuck   = any session whose taxonomy section is "stuck" (dead, failed,
   //               conflict_failed, retry_exhausted, backend_rate_limited,
-  //               backend_auth_failure). Both
+  //               backend_auth_failure, backend_model_unavailable). Both
   //               live and terminal stuck sessions land here — they never
   //               hide under DONE.
   //   - today   = `rawStatus === "done"` finished today (true completion).

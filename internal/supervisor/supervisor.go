@@ -1024,6 +1024,7 @@ func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.
 	}
 	findings = append(findings, e.detectEnvironmentStuckStates(st, eligible)...)
 	findings = append(findings, e.detectBackendAuthFailureStuckStates(st, now)...)
+	findings = append(findings, e.detectBackendModelUnavailableStuckStates(st, now)...)
 	findings = append(findings, e.detectBackendQuotaPressureStuckStates(st, now)...)
 	findings = append(findings, e.detectOutcomeStuckStates(st)...)
 	findings = append(findings, detectVisualEvidenceStuckStates(st)...)
@@ -1110,6 +1111,59 @@ func (e *Engine) detectBackendAuthFailureStuckStates(st *state.State, now time.T
 		findings = append(findings, stuckState("backend_auth_failure", severity,
 			fmt.Sprintf("Backend %s is failing authentication (invalid or expired credentials); workers cannot use it.", name),
 			"Re-authenticate the backend CLI or re-sync its credentials; fallback backends keep the queue moving meanwhile and the per-issue retry budget is preserved.", false, nil,
+			evidence...))
+	}
+	return findings
+}
+
+// detectBackendModelUnavailableStuckStates surfaces backends gated because
+// their configured model is unavailable — pulled, renamed, or not accessible
+// to the account (#713; live: Fable pulled from Pro/Max started returning "It
+// may not exist or you may not have access to it"). Distinct from the auth
+// finding because the remediation differs: swap the model id (or restore
+// access), not fix credentials. The default backend going dark is blocking —
+// every new spawn prefers it; a non-default backend is a warning because
+// routing can avoid it. The finding self-clears once the cooldown expires or
+// ReconcileBackendHealth removes the entry (i.e. a healthy model responds).
+func (e *Engine) detectBackendModelUnavailableStuckStates(st *state.State, now time.Time) []state.SupervisorStuckState {
+	if st == nil || len(st.BackendHealth) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(st.BackendHealth))
+	for name := range st.BackendHealth {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var findings []state.SupervisorStuckState
+	for _, name := range names {
+		health := st.BackendHealth[name]
+		if health.State != state.BackendHealthCooldown || health.Reason != state.BackendBlockModelUnavailable {
+			continue
+		}
+		if health.RetryAfter != nil && !now.Before(*health.RetryAfter) {
+			continue // cooldown elapsed; the selector will re-probe the backend
+		}
+		severity := SeverityWarning
+		if name == e.cfg.Model.Default {
+			severity = SeverityBlocked
+		}
+		evidence := []string{fmt.Sprintf("backend=%s", name)}
+		if health.Pattern != "" {
+			evidence = append(evidence, fmt.Sprintf("signature=%s", health.Pattern))
+		}
+		if !health.Since.IsZero() {
+			evidence = append(evidence, fmt.Sprintf("since=%s", health.Since.Format(time.RFC3339)))
+		}
+		if health.RetryAfter != nil {
+			evidence = append(evidence, fmt.Sprintf("retry_after=%s", health.RetryAfter.Format(time.RFC3339)))
+		}
+		if health.LastSession != "" {
+			evidence = append(evidence, fmt.Sprintf("last_session=%s", health.LastSession))
+		}
+		findings = append(findings, stuckState("backend_model_unavailable", severity,
+			fmt.Sprintf("Backend %s cannot load its configured model (unavailable, renamed, or no access); workers cannot use it.", name),
+			"Point the backend at an available model id (or restore model access for this account); fallback backends keep the queue moving meanwhile and the per-issue retry budget is preserved.", false, nil,
 			evidence...))
 	}
 	return findings

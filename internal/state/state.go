@@ -47,7 +47,14 @@ const (
 	// fallback available. Like DisplayBackendRateLimited it is a backend
 	// outage, not a work failure, and did not burn the per-issue retry budget.
 	DisplayBackendAuthFailure SessionDisplayStatus = "backend_auth_failure"
-	LiveSessionRecentWindow                        = 24 * time.Hour
+	// DisplayBackendModelUnavailable marks a session whose worker exited
+	// because its backend's configured model was unavailable — pulled,
+	// renamed, or not accessible to the account (#713) — with no fallback
+	// available. Distinct from DisplayBackendAuthFailure so operators see
+	// "the model is gone" (swap the model id) rather than "fix credentials".
+	// Like the other backend-block tokens it did not burn the retry budget.
+	DisplayBackendModelUnavailable SessionDisplayStatus = "backend_model_unavailable"
+	LiveSessionRecentWindow                             = 24 * time.Hour
 )
 
 const RetryReasonReviewFeedback = "review_feedback"
@@ -61,11 +68,19 @@ const (
 	// authenticate (e.g. 401 invalid/expired credentials, #693). Worker
 	// deaths attributed to it are backend failures, not work failures: they
 	// must not consume the per-issue retry budget.
-	BackendBlockAuthFailure  = "auth_failure"
-	BackendBlockDisabled     = "disabled"
-	BackendBlockAlreadyTried = "already_tried"
-	BackendBlockCurrent      = "current_backend"
-	BackendBlockUnknown      = "unknown_backend"
+	BackendBlockAuthFailure = "auth_failure"
+	// BackendBlockModelUnavailable gates a backend whose CLI failed because
+	// its configured model is unavailable — pulled from the plan, renamed, or
+	// not accessible to the account (#713). Like auth_failure it is a hard
+	// backend failure, not a work failure: worker deaths attributed to it must
+	// not consume the per-issue retry budget. It is kept distinct from
+	// auth_failure so the operator remediation differs (swap the model id vs
+	// fix credentials).
+	BackendBlockModelUnavailable = "model_unavailable"
+	BackendBlockDisabled         = "disabled"
+	BackendBlockAlreadyTried     = "already_tried"
+	BackendBlockCurrent          = "current_backend"
+	BackendBlockUnknown          = "unknown_backend"
 	// BackendBlockQuotaPressure gates a backend whose estimated
 	// subscription-window usage crossed the quota dispatch threshold
 	// (#704). Unlike auth_failure it is a soft, predictive gate: the
@@ -317,6 +332,13 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 					NeedsAttention: true,
 				}
 			}
+			if sess.ProviderLimitReason == BackendBlockModelUnavailable {
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Backend %s could not load its configured model (unavailable, renamed, or no access); no fallback backend is currently available or allowed.", backend),
+					NextAction:     "Point the backend at an available model id (or restore model access), then retry; the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			return SessionAttention{
 				Reason:         fmt.Sprintf("Backend %s hit a provider capacity limit; no fallback backend is currently available or allowed.", backend),
 				NextAction:     "Wait for provider capacity to recover, enable another backend, or change routing policy before retrying.",
@@ -384,8 +406,11 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 		return string(display)
 	}
 	if backendRateLimitedDisplayStatus(sess) {
-		if sess.ProviderLimitReason == BackendBlockAuthFailure {
+		switch sess.ProviderLimitReason {
+		case BackendBlockAuthFailure:
 			return string(DisplayBackendAuthFailure)
+		case BackendBlockModelUnavailable:
+			return string(DisplayBackendModelUnavailable)
 		}
 		return string(DisplayBackendRateLimited)
 	}
