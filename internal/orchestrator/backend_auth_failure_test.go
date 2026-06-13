@@ -98,7 +98,7 @@ func TestReconcileRunningSessions_AuthFailureDeadWorker_FallsOverToNextBackend(t
 	}
 	health, ok := s.BackendHealth["claude"]
 	if !ok {
-		t.Fatal("BackendHealth[claude] should be recorded by recordBackendAuthFailure")
+		t.Fatal("BackendHealth[claude] should be recorded by recordBackendFailure")
 	}
 	if health.State != state.BackendHealthCooldown || health.Reason != state.BackendBlockAuthFailure {
 		t.Fatalf("BackendHealth[claude] = %+v, want cooldown/auth_failure", health)
