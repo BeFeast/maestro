@@ -15,6 +15,9 @@ func TestSelfDeployDefaultOff(t *testing.T) {
 	if cfg.SelfDeploy.Enabled {
 		t.Fatal("self_deploy.enabled must default to false")
 	}
+	if cfg.SelfDeploy.InstallViaSudo {
+		t.Fatal("self_deploy.install_via_sudo must default to false")
+	}
 }
 
 func TestSelfDeployParse(t *testing.T) {
@@ -23,6 +26,7 @@ repo: owner/repo
 self_deploy:
   enabled: true
   bin_path: /usr/local/bin/maestro
+  install_via_sudo: true
   units: ["maestro.service", " maestro-fleet.service "]
   health_url: http://127.0.0.1:9999/api/v1/state
   timeout_minutes: 45
@@ -37,6 +41,9 @@ self_deploy:
 	}
 	if sd.BinPath != "/usr/local/bin/maestro" {
 		t.Errorf("bin_path = %q", sd.BinPath)
+	}
+	if !sd.InstallViaSudo {
+		t.Error("install_via_sudo = false, want true")
 	}
 	if got := sd.EffectiveUnits(); len(got) != 2 || got[0] != "maestro.service" || got[1] != "maestro-fleet.service" {
 		t.Errorf("EffectiveUnits() = %v", got)

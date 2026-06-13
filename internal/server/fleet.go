@@ -1897,6 +1897,9 @@ func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 	case "error":
 		return "Investigate project error"
 	case "dispatch_failure":
+		if op.Label == "Self-deploy failed" {
+			return "Redeploy maestro binary" // #711
+		}
 		return "Resolve stuck dispatch"
 	case "stale_worker":
 		if op.PRNumber > 0 {
@@ -3149,6 +3152,22 @@ func fleetDispatchFailureOperatorState(project fleetProjectState) (fleetOperator
 	}
 	if strings.TrimSpace(latest.Status) != "failed" && strings.TrimSpace(latest.ErrorClass) == "" {
 		return fleetOperatorState{}, false
+	}
+	// #711: a failed/rolled-back self-deploy lands as a supervisor finding with
+	// a `self-deploy-` decision ID. Surface it as an error-tone, high-priority
+	// operator state with deploy-specific copy so an undeployed-but-merged host
+	// is loud in Mission Control instead of silent (or mislabeled as a queue
+	// dispatch failure). It reuses the dispatch_failure kind so it inherits the
+	// existing error-tier priority/needs-action/next-action plumbing.
+	if strings.HasPrefix(strings.TrimSpace(latest.ID), "self-deploy-") {
+		operator := fleetOperatorState{
+			Kind:       "dispatch_failure",
+			Tone:       "error",
+			Label:      "Self-deploy failed",
+			Summary:    firstNonEmpty(latest.Summary, "Self-deploy of the maestro binary failed; the host may be running an undeployed version."),
+			NextAction: firstNonEmpty(latest.RecommendedAction, "Inspect journalctl --user -u 'maestro-self-deploy-*', then redeploy the merged binary by hand."),
+		}
+		return applyFleetOperatorTarget(project, operator, latest.Target), true
 	}
 	operator := fleetOperatorState{
 		Kind:       "dispatch_failure",

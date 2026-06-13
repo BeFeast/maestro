@@ -22,7 +22,10 @@ The script then:
    #682, extended with the commit SHA as semver build metadata).
 2. **Installs atomically** — stages the new binary next to the target
    (`<bin>.next`), preserves the current binary as `<bin>.prev`, and renames
-   into place (same-filesystem rename; safe under a running process).
+   into place (same-filesystem rename; safe under a running process). When
+   `install_via_sudo: true`, these file ops run through `sudo -n` so a
+   root-owned `bin_path` (e.g. `/usr/local/bin/maestro`) can be updated by the
+   unprivileged deploy user without losing atomic-rename semantics (#711).
 3. **Restarts the units** — `systemctl --user restart <unit>` for each
    configured unit. The unit's normal stop path runs, so existing **drain
    semantics are honored**: if your unit declares `ExecStop=... drain`,
@@ -39,7 +42,10 @@ The script then:
 6. **Writes a result file** — `<state_dir>/self-deploy-result.json`. The next
    orchestrator cycle (running the new binary, on success) consumes it,
    records a **supervisor finding** (deployed version / rollback reason)
-   visible in Mission Control, and sends a notification.
+   visible in Mission Control, and sends a notification. A `failed` /
+   `rolled_back` result surfaces as an **error-tone operator state**
+   ("Self-deploy failed") in `/api/v1/fleet`, so an undeployed-but-merged host
+   is loud rather than buried in journald (#711).
 
 ## Enabling it
 
@@ -51,6 +57,7 @@ server:
 self_deploy:
   enabled: true
   bin_path: /usr/local/bin/maestro   # default: path of the running binary
+  install_via_sudo: true             # #711: stage/rename/rollback bin_path via `sudo -n` (root-owned target)
   units: ["maestro.service"]         # systemd user units to restart
   # health_url: http://127.0.0.1:8788/api/v1/state  # default: derived from server.port
   # health_token_env: MAESTRO_DASH_TOKEN            # default: server.auth.token_env
@@ -65,9 +72,27 @@ Prerequisites on the host:
   `loginctl enable-linger $USER`).
 - Go toolchain reachable from the orchestrator's `PATH` (it is handed down
   to the transient unit) or at `/usr/local/go/bin`.
-- The user can write `bin_path` and its directory (no sudo: install the
-  binary under the user's control, e.g. `~/.local/bin/maestro`, or make
-  `/usr/local/bin/maestro` user-writable).
+- **Write access to `bin_path`** — the deploy runs as the unprivileged user
+  that owns the maestro units. Pick one:
+  - **User-writable target** (simplest, no sudo): point `bin_path` at a
+    directory the user owns, e.g. `~/.local/bin/maestro`, and make the unit
+    `ExecStart` use that path. Leave `install_via_sudo` unset/false.
+  - **Root-owned target via sudo** (`install_via_sudo: true`): keep
+    `bin_path` at a root-owned path such as `/usr/local/bin/maestro` and grant
+    the deploy user **passwordless sudo**. The script then runs the privileged
+    file ops (`install`/`cp`/`mv`/`rm` of `<bin>`, `<bin>.next`, `<bin>.prev`)
+    through `sudo -n`, preserving the same-filesystem atomic-rename install and
+    rollback. The deploy fails fast with a recorded finding if passwordless
+    sudo is unavailable. A minimal sudoers grant:
+
+    ```
+    # /etc/sudoers.d/maestro-self-deploy  (validate with: visudo -c -f <file>)
+    god ALL=(root) NOPASSWD: /usr/bin/install, /bin/cp, /bin/mv, /bin/rm
+    ```
+
+> Without one of these, the install step fails (`staging
+> /usr/local/bin/maestro.next failed`) and the merge self-deploys nothing —
+> the symptom that motivated #711.
 
 ## Verifying a rollout
 
@@ -110,6 +135,8 @@ maestro version
 
 | Symptom | Meaning | Action |
 |---|---|---|
+| Finding `self-deploy: failed … staging <bin>.next failed` | The deploy user cannot write `bin_path` (root-owned target, no sudo) | Set `install_via_sudo: true` + grant passwordless sudo, or move `bin_path` to a user-writable path (#711) |
+| Finding `self-deploy: failed … passwordless sudo is unavailable` | `install_via_sudo` is set but `sudo -n` does not work for the deploy user | Add a NOPASSWD sudoers grant for the install file ops (see Enabling it) |
 | Finding `self-deploy: failed … no .prev` | First deploy failed before any previous binary existed | Build + install manually once, re-merge |
 | Finding `rolled_back … health check timed out` | New binary started but never reported the stamped version | Check `journalctl --user -u maestro.service`; the regression is in the merged code |
 | No finding, no restart | Trigger failed (script missing, systemd-run unavailable) | Orchestrator log shows `self-deploy trigger failed …`; a ⚠️ notification is sent |

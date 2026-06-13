@@ -110,6 +110,39 @@ func TestTriggerCommand(t *testing.T) {
 	}
 }
 
+func TestTriggerCommandInstallViaSudo(t *testing.T) {
+	cfg := triggerTestConfig(t)
+	now := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+
+	// Default off: the flag must not be passed.
+	_, args, err := TriggerCommand(cfg, 711, now)
+	if err != nil {
+		t.Fatalf("TriggerCommand: %v", err)
+	}
+	if strings.Contains(strings.Join(args, " "), "--install-via-sudo") {
+		t.Error("--install-via-sudo passed with install_via_sudo off")
+	}
+
+	// Opt-in: the flag is forwarded to the deploy script.
+	cfg.SelfDeploy.InstallViaSudo = true
+	_, args, err = TriggerCommand(cfg, 711, now)
+	if err != nil {
+		t.Fatalf("TriggerCommand: %v", err)
+	}
+	if !contains(args, "--install-via-sudo") {
+		t.Errorf("--install-via-sudo missing when enabled: %v", args)
+	}
+}
+
+func contains(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestTriggerCommandNoHealthURLWithoutServerPort(t *testing.T) {
 	cfg := triggerTestConfig(t)
 	cfg.Server = config.ServerConfig{}

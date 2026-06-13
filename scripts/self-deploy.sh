@@ -17,10 +17,16 @@
 #   6. write a JSON result file the orchestrator surfaces as a supervisor
 #      finding on its next cycle.
 #
+# When --install-via-sudo is passed (#711), the privileged file operations
+# (stage <bin>.next, preserve <bin>.prev, atomic rename into place, rollback)
+# run through `sudo -n` so a root-owned bin_path such as /usr/local/bin/maestro
+# can be updated by the unprivileged deploy user. Requires passwordless sudo;
+# atomic-rename semantics are preserved (sudo mv on the same filesystem).
+#
 # Usage:
 #   self-deploy.sh --repo-dir DIR --bin PATH --units a.service[,b.service] \
 #     --result-file PATH --timeout-seconds N --pr N \
-#     [--health-url URL] [--health-token-env ENVVAR]
+#     [--health-url URL] [--health-token-env ENVVAR] [--install-via-sudo]
 
 set -euo pipefail
 
@@ -32,6 +38,7 @@ TIMEOUT_SECONDS=1800
 PR=0
 HEALTH_URL=""
 HEALTH_TOKEN_ENV=""
+INSTALL_VIA_SUDO=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --pr) PR="$2"; shift 2 ;;
     --health-url) HEALTH_URL="$2"; shift 2 ;;
     --health-token-env) HEALTH_TOKEN_ENV="$2"; shift 2 ;;
+    --install-via-sudo) INSTALL_VIA_SUDO=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -70,6 +78,19 @@ PREV_VERSION=""
 IFS=',' read -r -a UNIT_LIST <<<"$UNITS"
 
 log() { echo "[self-deploy] $*" >&2; }
+
+# priv runs a privileged file operation against bin_path. With
+# --install-via-sudo it prefixes `sudo -n` (non-interactive: fail fast rather
+# than block on a password prompt the detached unit has no tty to answer);
+# otherwise it runs the command directly, so the no-sudo path is byte-for-byte
+# unchanged (#711).
+priv() {
+  if (( INSTALL_VIA_SUDO )); then
+    sudo -n "$@"
+  else
+    "$@"
+  fi
+}
 
 json_escape() {
   # Minimal JSON string escaper: backslash, double quote, newlines/tabs.
@@ -166,15 +187,16 @@ rollback() {
   fi
   log "rolling back to $BIN.prev"
   # Restore atomically: copy .prev to a temp name on the same filesystem and
-  # rename over the live binary, keeping .prev itself for inspection.
-  if cp -p "$BIN.prev" "$BIN.rollback.$$" && mv -f "$BIN.rollback.$$" "$BIN"; then
+  # rename over the live binary, keeping .prev itself for inspection. priv
+  # escalates via sudo when bin_path is root-owned (#711).
+  if priv cp -p "$BIN.prev" "$BIN.rollback.$$" && priv mv -f "$BIN.rollback.$$" "$BIN"; then
     if restart_units "$ROLLBACK_RESTART_TIMEOUT" && units_active; then
       write_result rolled_back "$reason"
     else
       write_result failed "$reason; rollback restored $BIN.prev but units did not come back active"
     fi
   else
-    rm -f "$BIN.rollback.$$"
+    priv rm -f "$BIN.rollback.$$"
     write_result failed "$reason; rollback copy of $BIN.prev failed"
   fi
 }
@@ -207,6 +229,15 @@ trap 'fail "command failed: ${BASH_COMMAND}"' ERR
 command -v go >/dev/null 2>&1 || export PATH="$PATH:/usr/local/go/bin"
 command -v go >/dev/null 2>&1 || fail "go toolchain not found in PATH"
 
+# Preflight passwordless sudo when install_via_sudo is requested, so a
+# misconfigured host fails loudly here (recorded as a finding) instead of at
+# the first privileged file op (#711).
+if (( INSTALL_VIA_SUDO )); then
+  command -v sudo >/dev/null 2>&1 || fail "install_via_sudo set but sudo not found in PATH"
+  sudo -n true >/dev/null 2>&1 || fail "install_via_sudo set but passwordless sudo is unavailable for $(id -un)"
+  log "install_via_sudo enabled — privileged file ops on $BIN run via sudo -n"
+fi
+
 # --- 1. build from merged origin/main, version-stamped (#682) ---------------
 log "fetching origin/main in $REPO_DIR"
 git -C "$REPO_DIR" fetch --quiet origin main
@@ -235,12 +266,13 @@ if [[ -n "$PREV_VERSION" && "$PREV_VERSION" == "$STAMP" ]]; then
 fi
 
 # Stage next to the target so the final rename is atomic (same filesystem).
-install -m 0755 "$BUILD_ROOT/maestro" "$BIN.next" || fail "staging $BIN.next failed"
+# priv escalates these ops via sudo when bin_path is root-owned (#711).
+priv install -m 0755 "$BUILD_ROOT/maestro" "$BIN.next" || fail "staging $BIN.next failed"
 if [[ -f "$BIN" ]]; then
-  cp -p "$BIN" "$BIN.prev" || { rm -f "$BIN.next"; fail "preserving $BIN.prev failed"; }
+  priv cp -p "$BIN" "$BIN.prev" || { priv rm -f "$BIN.next"; fail "preserving $BIN.prev failed"; }
   HAVE_PREV=1
 fi
-mv -f "$BIN.next" "$BIN" || fail "installing $BIN failed"
+priv mv -f "$BIN.next" "$BIN" || fail "installing $BIN failed"
 INSTALLED=1
 if (( HAVE_PREV )); then
   log "installed $BIN (previous kept at $BIN.prev)"
