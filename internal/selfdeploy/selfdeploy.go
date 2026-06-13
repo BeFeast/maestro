@@ -139,6 +139,12 @@ func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []
 		"--timeout-seconds", strconv.Itoa(timeoutSec),
 		"--pr", strconv.Itoa(prNumber),
 	)
+	// #711: when bin_path is root-owned, the unprivileged deploy user cannot
+	// stage/rename into it. install_via_sudo escalates the file ops with
+	// passwordless `sudo -n` so atomic-rename install + rollback still work.
+	if cfg.SelfDeploy.InstallViaSudo {
+		args = append(args, "--install-via-sudo")
+	}
 	if url := cfg.SelfDeploy.EffectiveHealthURL(cfg.Server); url != "" {
 		args = append(args, "--health-url", url)
 		if env := cfg.SelfDeploy.EffectiveHealthTokenEnv(cfg.Server); env != "" {
