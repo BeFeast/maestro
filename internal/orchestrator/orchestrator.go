@@ -57,13 +57,14 @@ type Orchestrator struct {
 	isPRMergedFn          func(prNumber int) (bool, error)
 
 	// Testing hooks for checkSessions
-	captureTmuxFn           func(session string) (string, error)
-	tmuxCaptureFn           func(session string) (string, error)
-	isIssueClosedFn         func(issueNumber int) (bool, error)
-	addIssueLabelFn         func(number int, label string) error
-	isRateLimitedFn         func(logFile string) bool
-	rateLimitResetFromLogFn func(logFile string) *time.Time
-	authFailureFromLogFn    func(logFile string) (bool, string)
+	captureTmuxFn             func(session string) (string, error)
+	tmuxCaptureFn             func(session string) (string, error)
+	isIssueClosedFn           func(issueNumber int) (bool, error)
+	addIssueLabelFn           func(number int, label string) error
+	isRateLimitedFn           func(logFile string) bool
+	rateLimitResetFromLogFn   func(logFile string) *time.Time
+	authFailureFromLogFn      func(logFile string) (bool, string)
+	modelUnavailableFromLogFn func(logFile string) (bool, string)
 	// workerRespawnFn / respawnWorkerFn: used by respawnWorker() for dead-worker fallback (tests set one or the other)
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
@@ -519,33 +520,71 @@ func (o *Orchestrator) providerRateLimitFromLog(logFile string) (hit bool, reset
 	return true, reset
 }
 
-// backendAuthFailureWindow bounds how long after spawn an auth-error log
-// signature is trusted as a backend credential failure (#693). An
-// unauthenticated CLI dies on its first API call — within a couple of
-// minutes of spawn (live case: claude 401 killed every worker ~2 minutes
-// in) — so an auth signature in a longer-lived worker's log is more likely
-// incidental work content (the worker reading or writing auth-related code)
-// than a backend outage, and is left to the ordinary retry path.
+// backendAuthFailureWindow bounds how long after spawn a backend-failure log
+// signature is trusted as a real backend outage (#693 auth, #713 model
+// unavailable). A CLI that cannot authenticate, or is pointed at a missing
+// model, dies on its first API call — within a couple of minutes of spawn
+// (live cases: claude 401 / claude-fable-5 unavailable killed every worker ~2
+// minutes in) — so the same signature in a longer-lived worker's log is more
+// likely incidental work content (the worker reading or writing auth/model
+// code) than a backend outage, and is left to the ordinary retry path.
 const backendAuthFailureWindow = 10 * time.Minute
 
-// backendAuthFailureFromLog reports whether a dead worker died because its
-// backend could not authenticate (e.g. "Failed to authenticate. API Error:
-// 401 Invalid authentication credentials"). It returns hit=true only when
-// the worker died within backendAuthFailureWindow of its spawn AND the log
-// tail carries a known auth-failure signature. Such a death is a backend
-// failure, not a work failure: callers must gate the backend, preserve the
-// per-issue retry budget, and respawn the attempt on a fallback backend.
-func (o *Orchestrator) backendAuthFailureFromLog(sess *state.Session, now time.Time) (bool, string) {
+// classifyBackendFailure reports whether a dead worker died because of a
+// backend outage and, if so, which class: an auth/credential failure (#693,
+// class BackendBlockAuthFailure) or a configured model that is unavailable /
+// not accessible (#713, class BackendBlockModelUnavailable). It returns
+// hit=true only when the worker died within backendAuthFailureWindow of its
+// spawn AND the log tail carries a known signature. Auth is checked first so a
+// 401 is never reported as a model outage. Such a death is a backend failure,
+// not a work failure: callers must gate the backend, preserve the per-issue
+// retry budget, and respawn the attempt on a fallback backend.
+func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time) (hit bool, class, pattern string) {
 	if sess == nil {
-		return false, ""
+		return false, "", ""
 	}
 	if sess.StartedAt.IsZero() || now.Sub(sess.StartedAt) > backendAuthFailureWindow {
-		return false, ""
+		return false, "", ""
 	}
+	if hit, pattern := o.authFailureFromLog(sess.LogFile); hit {
+		return true, state.BackendBlockAuthFailure, pattern
+	}
+	if hit, pattern := o.modelUnavailableFromLog(sess.LogFile); hit {
+		return true, state.BackendBlockModelUnavailable, pattern
+	}
+	return false, "", ""
+}
+
+func (o *Orchestrator) authFailureFromLog(logFile string) (bool, string) {
 	if o.authFailureFromLogFn != nil {
-		return o.authFailureFromLogFn(sess.LogFile)
+		return o.authFailureFromLogFn(logFile)
 	}
-	return worker.IsAuthFailure(sess.LogFile)
+	return worker.IsAuthFailure(logFile)
+}
+
+func (o *Orchestrator) modelUnavailableFromLog(logFile string) (bool, string) {
+	if o.modelUnavailableFromLogFn != nil {
+		return o.modelUnavailableFromLogFn(logFile)
+	}
+	return worker.IsModelUnavailable(logFile)
+}
+
+// backendFailureNotifiedStatus maps a backend-failure class to the
+// LastNotifiedStatus / display token operators see.
+func backendFailureNotifiedStatus(class string) string {
+	if class == state.BackendBlockModelUnavailable {
+		return "backend_model_unavailable"
+	}
+	return "backend_auth_failure"
+}
+
+// backendFailureSummary returns operator-facing phrasing for a backend-failure
+// class: a short description of what went wrong and the remediation.
+func backendFailureSummary(class string) (what, remediation string) {
+	if class == state.BackendBlockModelUnavailable {
+		return "model is unavailable or not accessible", "swap the model id to an available one"
+	}
+	return "failed authentication", "fix credentials"
 }
 
 func (o *Orchestrator) workerLogFile(slotName string, sess *state.Session) string {
@@ -1874,19 +1913,23 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			continue
 		}
 
-		// Backend auth/credential failure (#693): the worker died early with
-		// an auth-error signature in its log tail (e.g. claude CLI "Failed to
-		// authenticate. API Error: 401 Invalid authentication credentials").
-		// This is a backend outage, not a work failure — respawning on the
-		// same backend dies the same way and burns the per-issue retry budget
-		// on an auth hiccup. Gate the backend (short cooldown; the credential
-		// usually recovers via re-login / cred-sync), keep the budget intact,
+		// Backend failure: the worker died early with a backend-outage
+		// signature in its log tail — either an auth/credential failure (#693,
+		// e.g. claude CLI "Failed to authenticate. API Error: 401") or a
+		// configured model that is unavailable / not accessible (#713, e.g.
+		// "It may not exist or you may not have access to it" after Fable was
+		// pulled). Either way it is a backend outage, not a work failure —
+		// respawning on the same backend dies the same way and burns the
+		// per-issue retry budget. Gate the backend (short cooldown; it recovers
+		// via re-login/cred-sync or a model-id swap), keep the budget intact,
 		// and respawn the same attempt on the next fallback backend.
-		if hit, pattern := o.backendAuthFailureFromLog(sess, time.Now().UTC()); hit {
+		if hit, class, pattern := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
 			now := time.Now().UTC()
+			notifyStatus := backendFailureNotifiedStatus(class)
+			what, remediation := backendFailureSummary(class)
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
-			o.recordBackendAuthFailure(s, slotName, sess, pattern, now)
-			selection := o.selectAuthFailureFallback(s, sess, now)
+			o.recordBackendFailure(s, slotName, sess, class, pattern, now)
+			selection := o.selectBackendFailureFallback(s, sess, now, class)
 			sess.BackendSelection = &selection
 			oldPID := sess.PID
 			oldTmux := tmuxName
@@ -1898,13 +1941,13 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
 				state.MarkWorkerEnded(sess, now)
-				sess.LastNotifiedStatus = "backend_auth_failure"
+				sess.LastNotifiedStatus = notifyStatus
 				sess.Status = state.StatusDead
 				reconciled = true
-				log.Printf("[orch] reconcile: %s running->dead via backend auth failure on backend=%s signature=%s (no fallback available; %s); pid=%d tmux=%q",
-					slotName, previousBackend, pattern, strings.Join(reasons, ", "), oldPID, oldTmux)
-				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s failed authentication (%s); no fallback backend available — fix credentials",
-					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, pattern)
+				log.Printf("[orch] reconcile: %s running->dead via backend %s on backend=%s signature=%s (no fallback available; %s); pid=%d tmux=%q",
+					slotName, class, previousBackend, pattern, strings.Join(reasons, ", "), oldPID, oldTmux)
+				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, what, pattern, remediation)
 				continue
 			}
 
@@ -1914,13 +1957,13 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
 				state.MarkWorkerEnded(sess, now)
-				sess.LastNotifiedStatus = "backend_auth_failure"
+				sess.LastNotifiedStatus = notifyStatus
 				sess.Status = state.StatusDead
 				reconciled = true
-				log.Printf("[orch] reconcile: %s running->dead via backend auth failure on backend=%s signature=%s (fallback to %s aborted: could not fetch issue #%d: %v; %s); pid=%d tmux=%q",
-					slotName, previousBackend, pattern, nextBackend, sess.IssueNumber, fetchErr, strings.Join(reasons, ", "), oldPID, oldTmux)
-				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s failed authentication; fallback to %s failed (could not fetch issue): %v",
-					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, nextBackend, fetchErr)
+				log.Printf("[orch] reconcile: %s running->dead via backend %s on backend=%s signature=%s (fallback to %s aborted: could not fetch issue #%d: %v; %s); pid=%d tmux=%q",
+					slotName, class, previousBackend, pattern, nextBackend, sess.IssueNumber, fetchErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s; fallback to %s failed (could not fetch issue): %v",
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, what, nextBackend, fetchErr)
 				continue
 			}
 
@@ -1933,21 +1976,21 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
 				state.MarkWorkerEnded(sess, now)
-				sess.LastNotifiedStatus = "backend_auth_failure"
+				sess.LastNotifiedStatus = notifyStatus
 				sess.Status = state.StatusDead
 				reconciled = true
-				log.Printf("[orch] reconcile: %s running->dead via backend auth failure on backend=%s signature=%s (fallback respawn on %s failed: %v; %s); pid=%d tmux=%q",
-					slotName, previousBackend, pattern, nextBackend, respawnErr, strings.Join(reasons, ", "), oldPID, oldTmux)
-				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s failed authentication; fallback to %s failed: %v",
-					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, nextBackend, respawnErr)
+				log.Printf("[orch] reconcile: %s running->dead via backend %s on backend=%s signature=%s (fallback respawn on %s failed: %v; %s); pid=%d tmux=%q",
+					slotName, class, previousBackend, pattern, nextBackend, respawnErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s; fallback to %s failed: %v",
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, what, nextBackend, respawnErr)
 				continue
 			}
 
 			reconciled = true
-			log.Printf("[orch] reconcile: %s backend auth failure on backend=%s signature=%s — respawned with backend=%s, retry budget preserved (%s); old pid=%d tmux=%q",
-				slotName, previousBackend, pattern, nextBackend, strings.Join(reasons, ", "), oldPID, oldTmux)
-			o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) backend %s failed authentication (%s) — respawned on %s, retry budget preserved",
-				slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, pattern, nextBackend)
+			log.Printf("[orch] reconcile: %s backend %s on backend=%s signature=%s — respawned with backend=%s, retry budget preserved (%s); old pid=%d tmux=%q",
+				slotName, class, previousBackend, pattern, nextBackend, strings.Join(reasons, ", "), oldPID, oldTmux)
+			o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) backend %s %s (%s) — respawned on %s, retry budget preserved",
+				slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, what, pattern, nextBackend)
 			continue
 		}
 
@@ -2320,42 +2363,46 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
 						slotName, sess.IssueNumber, previousBackend, nextBackend)
-				} else if hit, pattern := o.backendAuthFailureFromLog(sess, time.Now().UTC()); hit {
-					// Backend auth/credential failure (e.g. claude CLI
-					// "Failed to authenticate. API Error: 401"). This is a
-					// backend outage, not a work failure (#693): every retry
-					// on the same backend dies the same way and silently burns
-					// max_retries_per_issue on an auth hiccup. Gate the
-					// backend, keep the retry budget intact, and respawn the
-					// same attempt on the next fallback backend.
+				} else if hit, class, pattern := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
+					// Backend failure: an auth/credential failure (#693, claude
+					// CLI "Failed to authenticate. API Error: 401") or a
+					// configured model that is unavailable / not accessible
+					// (#713, "It may not exist or you may not have access to
+					// it"). Either is a backend outage, not a work failure:
+					// every retry on the same backend dies the same way and
+					// silently burns max_retries_per_issue. Gate the backend,
+					// keep the retry budget intact, and respawn the same attempt
+					// on the next fallback backend.
 					now := time.Now().UTC()
+					notifyStatus := backendFailureNotifiedStatus(class)
+					what, remediation := backendFailureSummary(class)
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
-					o.recordBackendAuthFailure(s, slotName, sess, pattern, now)
-					selection := o.selectAuthFailureFallback(s, sess, now)
+					o.recordBackendFailure(s, slotName, sess, class, pattern, now)
+					selection := o.selectBackendFailureFallback(s, sess, now, class)
 					sess.BackendSelection = &selection
 					nextBackend := selection.SelectedBackend
 					if nextBackend == "" {
-						log.Printf("[orch] worker %s (backend=%s) backend auth failure (%s); no fallback backend available", slotName, sess.Backend, pattern)
+						log.Printf("[orch] worker %s (backend=%s) backend %s (%s); no fallback backend available", slotName, sess.Backend, class, pattern)
 						sess.Status = state.StatusDead
-						sess.LastNotifiedStatus = "backend_auth_failure"
+						sess.LastNotifiedStatus = notifyStatus
 						sess.FinishedAt = &now
 						state.MarkWorkerEnded(sess, now)
-						o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s failed authentication (%s); no fallback backend available — fix credentials",
-							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, pattern)
+						o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
+							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, what, pattern, remediation)
 						continue
 					}
-					log.Printf("[orch] worker %s (backend=%s) failed authentication (%s), falling back to %s — retry budget preserved",
-						slotName, sess.Backend, pattern, nextBackend)
+					log.Printf("[orch] worker %s (backend=%s) %s (%s), falling back to %s — retry budget preserved",
+						slotName, sess.Backend, what, pattern, nextBackend)
 
 					issue, err := o.getIssue(sess.IssueNumber)
 					if err != nil {
-						log.Printf("[orch] fetch issue #%d for auth-failure fallback: %v — marking as dead (backend_auth_failure)", sess.IssueNumber, err)
+						log.Printf("[orch] fetch issue #%d for backend-failure fallback: %v — marking as dead (%s)", sess.IssueNumber, err, notifyStatus)
 						sess.Status = state.StatusDead
-						sess.LastNotifiedStatus = "backend_auth_failure"
+						sess.LastNotifiedStatus = notifyStatus
 						sess.FinishedAt = &now
 						state.MarkWorkerEnded(sess, now)
-						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) backend auth failure and fallback failed (could not fetch issue)",
-							slotName, sess.IssueNumber, sess.IssueTitle)
+						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) backend %s and fallback failed (could not fetch issue)",
+							slotName, sess.IssueNumber, sess.IssueTitle, what)
 						continue
 					}
 
@@ -2365,18 +2412,18 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
-						log.Printf("[orch] auth-failure fallback respawn worker %s with %s: %v — marking as dead (backend_auth_failure)", slotName, nextBackend, err)
+						log.Printf("[orch] backend-failure fallback respawn worker %s with %s: %v — marking as dead (%s)", slotName, nextBackend, err, notifyStatus)
 						sess.Status = state.StatusDead
-						sess.LastNotifiedStatus = "backend_auth_failure"
+						sess.LastNotifiedStatus = notifyStatus
 						sess.FinishedAt = &now
 						state.MarkWorkerEnded(sess, now)
-						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) backend auth failure and fallback to %s failed: %v",
-							slotName, sess.IssueNumber, sess.IssueTitle, nextBackend, err)
+						o.notifier.Sendf("💀 maestro: worker %s (issue #%d: %s) backend %s and fallback to %s failed: %v",
+							slotName, sess.IssueNumber, sess.IssueTitle, what, nextBackend, err)
 						continue
 					}
 
-					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) backend %s failed authentication (%s), switched to %s — retry budget preserved",
-						slotName, sess.IssueNumber, previousBackend, pattern, nextBackend)
+					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) backend %s %s (%s), switched to %s — retry budget preserved",
+						slotName, sess.IssueNumber, previousBackend, what, pattern, nextBackend)
 				} else if o.canRetryIssue(s, sess) {
 					// Schedule retry with exponential backoff (respects max_retries_per_issue)
 					o.updateTokensUsedFromWorkerLog(slotName, sess)

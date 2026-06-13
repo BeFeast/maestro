@@ -47,7 +47,14 @@ const (
 	// fallback available. Like DisplayBackendRateLimited it is a backend
 	// outage, not a work failure, and did not burn the per-issue retry budget.
 	DisplayBackendAuthFailure SessionDisplayStatus = "backend_auth_failure"
-	LiveSessionRecentWindow                        = 24 * time.Hour
+	// DisplayBackendModelUnavailable marks a session whose worker exited because
+	// its backend's configured model is unavailable — pulled from the plan,
+	// renamed, or not accessible to the account (#713) — with no fallback
+	// available. Distinct from DisplayBackendAuthFailure because the remediation
+	// differs (swap the model id vs fix credentials); like it, the death did not
+	// burn the per-issue retry budget.
+	DisplayBackendModelUnavailable SessionDisplayStatus = "backend_model_unavailable"
+	LiveSessionRecentWindow                             = 24 * time.Hour
 )
 
 const RetryReasonReviewFeedback = "review_feedback"
@@ -61,11 +68,19 @@ const (
 	// authenticate (e.g. 401 invalid/expired credentials, #693). Worker
 	// deaths attributed to it are backend failures, not work failures: they
 	// must not consume the per-issue retry budget.
-	BackendBlockAuthFailure  = "auth_failure"
-	BackendBlockDisabled     = "disabled"
-	BackendBlockAlreadyTried = "already_tried"
-	BackendBlockCurrent      = "current_backend"
-	BackendBlockUnknown      = "unknown_backend"
+	BackendBlockAuthFailure = "auth_failure"
+	// BackendBlockModelUnavailable gates a backend whose CLI failed because its
+	// configured model is unavailable or not accessible to the account (e.g.
+	// the claude CLI "It may not exist or you may not have access to it" after
+	// Fable was pulled from subscriptions, #713). Like auth_failure the worker
+	// deaths it attributes are backend failures, not work failures, and must
+	// not consume the per-issue retry budget; unlike it the fix is to swap the
+	// model id rather than refresh credentials.
+	BackendBlockModelUnavailable = "model_unavailable"
+	BackendBlockDisabled         = "disabled"
+	BackendBlockAlreadyTried     = "already_tried"
+	BackendBlockCurrent          = "current_backend"
+	BackendBlockUnknown          = "unknown_backend"
 	// BackendBlockQuotaPressure gates a backend whose estimated
 	// subscription-window usage crossed the quota dispatch threshold
 	// (#704). Unlike auth_failure it is a soft, predictive gate: the
@@ -317,6 +332,13 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 					NeedsAttention: true,
 				}
 			}
+			if sess.ProviderLimitReason == BackendBlockModelUnavailable {
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Backend %s's configured model is unavailable or not accessible (pulled, renamed, or no access); no fallback backend is currently available or allowed.", backend),
+					NextAction:     "Swap the model id (model.default or the backend's model) to an available one, or restore access, then retry; the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			return SessionAttention{
 				Reason:         fmt.Sprintf("Backend %s hit a provider capacity limit; no fallback backend is currently available or allowed.", backend),
 				NextAction:     "Wait for provider capacity to recover, enable another backend, or change routing policy before retrying.",
@@ -384,8 +406,11 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 		return string(display)
 	}
 	if backendRateLimitedDisplayStatus(sess) {
-		if sess.ProviderLimitReason == BackendBlockAuthFailure {
+		switch sess.ProviderLimitReason {
+		case BackendBlockAuthFailure:
 			return string(DisplayBackendAuthFailure)
+		case BackendBlockModelUnavailable:
+			return string(DisplayBackendModelUnavailable)
 		}
 		return string(DisplayBackendRateLimited)
 	}
@@ -2990,10 +3015,10 @@ func (s *State) IssueDone(issueNum int) bool {
 // FailedAttemptsForIssue counts sessions for the given issue that ended
 // without producing a PR (dead, failed, or retry_exhausted).
 //
-// Sessions marked as backend-blocked (RateLimitHit — provider capacity limit
-// or backend auth failure) are NOT counted as failed attempts: a transient
-// backend block must not consume the per-issue retry budget.
-// See #432 / #458 / #466 / #693.
+// Sessions marked as backend-blocked (RateLimitHit — provider capacity limit,
+// backend auth failure, or model unavailable) are NOT counted as failed
+// attempts: a transient backend block must not consume the per-issue retry
+// budget. See #432 / #458 / #466 / #693 / #713.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {
