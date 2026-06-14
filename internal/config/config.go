@@ -210,10 +210,26 @@ type SelfDeployConfig struct {
 	Script         string   `yaml:"script"`           // deploy script path (default: <local_path>/scripts/self-deploy.sh)
 	BinPath        string   `yaml:"bin_path"`         // install target (default: path of the running binary)
 	InstallViaSudo bool     `yaml:"install_via_sudo"` // #711: stage/rename/rollback bin_path via `sudo -n` so a root-owned target (e.g. /usr/local/bin/maestro) can be updated by the unprivileged deploy user; requires passwordless sudo (default false)
-	Units          []string `yaml:"units"`            // systemd user units to restart (default: ["maestro.service"])
+	Scope          string   `yaml:"scope"`            // #716: systemd unit scope — "user" (systemctl --user, default for back-compat) or "system" (sudo -n systemctl restart, for system units like the Loki fleet)
+	Units          []string `yaml:"units"`            // systemd units to restart (default: ["maestro.service"])
 	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
 	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
 	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+}
+
+// SelfDeployScope* are the valid values for SelfDeployConfig.Scope.
+const (
+	SelfDeployScopeUser   = "user"   // per-user systemd manager (systemctl --user)
+	SelfDeployScopeSystem = "system" // system systemd manager (sudo -n systemctl)
+)
+
+// EffectiveScope returns the systemd unit scope, defaulting to "user" for
+// back-compat (#716). Any value other than "system" maps to "user".
+func (c SelfDeployConfig) EffectiveScope() string {
+	if strings.EqualFold(strings.TrimSpace(c.Scope), SelfDeployScopeSystem) {
+		return SelfDeployScopeSystem
+	}
+	return SelfDeployScopeUser
 }
 
 // EffectiveScript returns the deploy script path, defaulting to

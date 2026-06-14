@@ -6,8 +6,10 @@
 // a detached transient systemd unit (systemd-run --user), so the script
 // survives the maestro unit restarting. The script builds from merged main
 // (version-stamped per #682), installs the binary atomically keeping the
-// previous one as `.prev`, restarts the configured user units (which honors
-// the units' drain semantics via their normal stop path), verifies the
+// previous one as `.prev`, restarts the configured units — user units via
+// `systemctl --user` or, with scope=system, system units via
+// `sudo -n systemctl` (#716) — which honors the units' drain semantics via
+// their normal stop path, verifies the
 // restarted process reports the expected version, rolls back to `.prev` on
 // failure, and writes a JSON result file into the state dir. The next
 // orchestrator cycle — running the freshly deployed binary on success —
@@ -138,6 +140,11 @@ func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []
 		"--result-file", ResultPath(cfg.StateDir),
 		"--timeout-seconds", strconv.Itoa(timeoutSec),
 		"--pr", strconv.Itoa(prNumber),
+		// #716: select the systemd unit scope. Default "user" keeps the
+		// pre-migration behavior; "system" restarts system units via
+		// `sudo -n systemctl` (e.g. the Loki fleet, where maestro runs as
+		// User=god system units rather than per-user units).
+		"--scope", cfg.SelfDeploy.EffectiveScope(),
 	)
 	// #711: when bin_path is root-owned, the unprivileged deploy user cannot
 	// stage/rename into it. install_via_sudo escalates the file ops with

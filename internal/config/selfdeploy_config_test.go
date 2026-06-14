@@ -18,6 +18,40 @@ func TestSelfDeployDefaultOff(t *testing.T) {
 	if cfg.SelfDeploy.InstallViaSudo {
 		t.Fatal("self_deploy.install_via_sudo must default to false")
 	}
+	// #716: scope defaults to "user" for back-compat.
+	if got := cfg.SelfDeploy.EffectiveScope(); got != SelfDeployScopeUser {
+		t.Fatalf("EffectiveScope() = %q, want %q", got, SelfDeployScopeUser)
+	}
+}
+
+// #716: scope is config-driven, defaults to "user", and only "system"
+// (case-insensitive) selects the system manager.
+func TestSelfDeployScope(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"", SelfDeployScopeUser},
+		{"   ", SelfDeployScopeUser},
+		{"user", SelfDeployScopeUser},
+		{"bogus", SelfDeployScopeUser},
+		{"system", SelfDeployScopeSystem},
+		{" System ", SelfDeployScopeSystem},
+	}
+	for _, tc := range cases {
+		sd := SelfDeployConfig{Scope: tc.raw}
+		if got := sd.EffectiveScope(); got != tc.want {
+			t.Errorf("EffectiveScope(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	cfg, err := Parse([]byte("repo: owner/repo\nself_deploy:\n  enabled: true\n  scope: system\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.SelfDeploy.EffectiveScope(); got != SelfDeployScopeSystem {
+		t.Errorf("parsed scope EffectiveScope() = %q, want %q", got, SelfDeployScopeSystem)
+	}
 }
 
 func TestSelfDeployParse(t *testing.T) {
