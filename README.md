@@ -17,6 +17,28 @@ maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini, 
 - Notifies you via Telegram (through OpenClaw gateway) on important events
 - Cleans up dead/stale sessions
 
+## Mission Control
+
+Mission Control (MC) is the fleet web dashboard maestro serves at `http://127.0.0.1:8786`. It's how an operator watches every project, worker, and approval at a glance.
+
+![Fleet overview](docs/images/mc/overview.png)
+
+*Fleet overview (`/`) — the operator brief: hero next-action, fleet KPIs, the per-project health grid, recent workers, and cost/usage.*
+
+![Approvals](docs/images/mc/approvals.png)
+
+*Approvals (`/approvals`) — the cautious-gate write-path: pending approvals to approve/reject, with the full audit history below.*
+
+![Project view](docs/images/mc/project.png)
+
+*Project view (`/project/<name>`) — single-project drill-down: attention/next-action, live workers, health, project board, and recent supervisor decisions.*
+
+![Workers](docs/images/mc/workers.png)
+
+*Workers (`/workers`) — every worker across the fleet with status, branch/PR, and next step.*
+
+> Screenshots are captured from a live MC instance with [`scripts/capture-mc-screenshots.mjs`](scripts/capture-mc-screenshots.mjs). To refresh them, run `bun scripts/capture-mc-screenshots.mjs` on the host serving MC (override the target with `MC_BASE_URL`).
+
 ## Prerequisites
 
 ### Required
