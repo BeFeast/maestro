@@ -1929,6 +1929,69 @@ func TestDecide_DynamicWaveSupportsConfiguredRunnableProjectStatus(t *testing.T)
 	}
 }
 
+func TestDecide_DynamicWaveQueueAnalysisCarriesRankedEligibleAndSkippedCandidates(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	enableDynamicWave(cfg)
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(2, "ready work", "p1"),
+		testIssue(1, "urgent work", "p0"),
+		testIssue(3, "low work", "p3"),
+		testIssue(50, "Epic: umbrella tracking", "p1"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	q := decision.QueueAnalysis
+	if q == nil {
+		t.Fatalf("queue analysis is nil")
+	}
+
+	// Eligible set is ranked by priority (P0<P1<P2<P3) then issue number.
+	if q.SelectedCandidate == nil || q.SelectedCandidate.Number != 1 {
+		t.Fatalf("selected candidate = %#v, want issue #1", q.SelectedCandidate)
+	}
+	gotOrder := make([]int, 0, len(q.EligibleRanked))
+	for _, c := range q.EligibleRanked {
+		gotOrder = append(gotOrder, c.Number)
+	}
+	wantOrder := []int{1, 2, 3}
+	if len(gotOrder) != len(wantOrder) {
+		t.Fatalf("eligible ranked = %v, want %v", gotOrder, wantOrder)
+	}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Fatalf("eligible ranked = %v, want %v", gotOrder, wantOrder)
+		}
+	}
+	if q.EligibleRanked[0].PriorityLabel != "p0" {
+		t.Fatalf("eligible ranked[0] priority = %q, want p0", q.EligibleRanked[0].PriorityLabel)
+	}
+
+	// The held epic is surfaced as a structured skipped candidate.
+	var epic *state.SupervisorSkippedCandidate
+	for i := range q.SkippedCandidates {
+		if q.SkippedCandidates[i].Number == 50 {
+			epic = &q.SkippedCandidates[i]
+			break
+		}
+	}
+	if epic == nil {
+		t.Fatalf("skipped candidates = %#v, want issue #50", q.SkippedCandidates)
+	}
+	if epic.Category != string(dynamicSkipHeldMeta) {
+		t.Fatalf("skipped #50 category = %q, want %q", epic.Category, dynamicSkipHeldMeta)
+	}
+	if epic.PriorityLabel != "p1" {
+		t.Fatalf("skipped #50 priority = %q, want p1", epic.PriorityLabel)
+	}
+	if !strings.Contains(strings.ToLower(epic.Reason), "epic") {
+		t.Fatalf("skipped #50 reason = %q, want epic reason", epic.Reason)
+	}
+}
+
 func TestRunOnceLabelsNextIssueReadyAndComments(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}

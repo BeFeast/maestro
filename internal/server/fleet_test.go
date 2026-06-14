@@ -736,6 +736,51 @@ func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	}
 }
 
+func TestFleetQueueSnapshotFromSupervisorCarriesDecisionPlane(t *testing.T) {
+	info := supervisorInfo{
+		Latest: &supervisorDecisionInfo{
+			QueueAnalysis: &state.SupervisorQueueAnalysis{
+				PolicyRule:         "supervisor.dynamic_wave",
+				OpenIssues:         3,
+				EligibleCandidates: 2,
+				ExcludedIssues:     1,
+				SelectedCandidate:  &state.SupervisorIssueCandidate{Number: 1, PriorityLabel: "p0"},
+				EligibleRanked: []state.SupervisorIssueCandidate{
+					{Number: 1, PriorityLabel: "p0"},
+					{Number: 2, PriorityLabel: "p1"},
+				},
+				SkippedCandidates: []state.SupervisorSkippedCandidate{
+					{Number: 3, PriorityLabel: "p2", Category: "held_meta", Reason: "title indicates epic"},
+				},
+			},
+		},
+	}
+
+	snap := fleetQueueSnapshotFromSupervisor(info)
+	if snap == nil {
+		t.Fatalf("snapshot is nil")
+	}
+	if len(snap.EligibleRanked) != 2 || snap.EligibleRanked[0].Number != 1 || snap.EligibleRanked[1].Number != 2 {
+		t.Fatalf("eligible ranked = %#v, want #1 then #2", snap.EligibleRanked)
+	}
+	if snap.EligibleRanked[0].PriorityLabel != "p0" {
+		t.Fatalf("eligible ranked[0] priority = %q, want p0", snap.EligibleRanked[0].PriorityLabel)
+	}
+	if len(snap.SkippedCandidates) != 1 {
+		t.Fatalf("skipped candidates = %#v, want one entry", snap.SkippedCandidates)
+	}
+	if got := snap.SkippedCandidates[0]; got.Number != 3 || got.Category != "held_meta" || got.Reason != "title indicates epic" {
+		t.Fatalf("skipped candidate = %#v, want #3 held_meta", got)
+	}
+
+	// The copy is defensive: mutating the source analysis after building the
+	// snapshot must not bleed into the served payload.
+	info.Latest.QueueAnalysis.EligibleRanked[0].Number = 999
+	if snap.EligibleRanked[0].Number != 1 {
+		t.Fatalf("snapshot eligible ranked mutated with source: got #%d", snap.EligibleRanked[0].Number)
+	}
+}
+
 func TestFleetAPIOperatorStateExplainsZeroRunningActiveWork(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

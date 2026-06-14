@@ -287,26 +287,9 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
 
         {p.projectBoard && <ProjectBoardPanel board={p.projectBoard} />}
 
-        <Panel title="Queue" sub={`${p.open} open · ${p.eligible} eligible`}>
-          <div style={{ padding: "var(--s-4) var(--s-5)" }}>
-            {p.open > 0 ? (
-              <>
-                <QueueBar ready={p.eligible} held={p.held} blocked={p.blocked} height={8} />
-                <div className="kv mt-4"><span style={{ color: "var(--ok)" }}>Ready</span><strong className="mono">{p.eligible}</strong></div>
-                <div className="kv"><span style={{ color: "var(--policy)" }}>Held (epic/meta)</span><strong className="mono">{p.held}</strong></div>
-                <div className="kv"><span style={{ color: "var(--stuck)" }}>Blocked (deps)</span><strong className="mono">{p.blocked}</strong></div>
-                <div className="mono dim mt-4" style={{ fontSize: 11 }}>
-                  {p.queueSnapshot?.policy_rule ? `Wave policy: ${p.queueSnapshot.policy_rule}` : ""}
-                  {p.maxParallel ? ` · max parallel: ${p.maxParallel}` : ""}
-                </div>
-              </>
-            ) : (
-              <div className="dim" style={{ textAlign: "center", padding: "var(--s-4)" }}>
-                {p.queueSnapshot?.idle_reason || "No open issues with matching label."}
-              </div>
-            )}
-          </div>
-        </Panel>
+        <div className="span-2">
+          <QueueNextPanel p={p} />
+        </div>
 
         <div className="span-2">
           <Panel
@@ -379,6 +362,194 @@ function ProjectBoardPanel({ board }) {
       </div>
     </Panel>
   );
+}
+
+// QueueNextPanel renders the supervisor "decision plane" (#720): the next
+// selected issue, the eligible set in real selection order, and every skipped
+// candidate with its reason. It renders entirely from the supervisor decision
+// already held in fleet state (project.queue_snapshot) — no GitHub calls on
+// the request path — so it stays correct across issue trackers and refreshes
+// on the existing 12s fleet poll. Rows link to their GitHub issue.
+function QueueNextPanel({ p }) {
+  const q = p.queueSnapshot || {};
+  const eligibleRanked = Array.isArray(q.eligible_ranked) ? q.eligible_ranked : [];
+  const skipped = Array.isArray(q.skipped_candidates) ? q.skipped_candidates : [];
+  const next = q.selected_candidate || eligibleRanked[0] || null;
+  const nextNum = Number(next?.number || 0);
+  const queueAfterNext = eligibleRanked.filter(c => Number(c.number) !== nextNum);
+  const open = Number(q.open ?? p.open ?? 0);
+  const eligibleCount = Number(q.eligible ?? p.eligible ?? 0);
+  const excluded = Number(q.excluded || 0);
+
+  const issueURL = num => (p.repo && num ? `https://github.com/${p.repo}/issues/${num}` : "");
+  const counts = [];
+  counts.push(`${open} open`);
+  counts.push(`${eligibleCount} eligible`);
+  if (excluded > 0) counts.push(`${excluded} excluded`);
+
+  return (
+    <Panel
+      title="Queue / Next"
+      sub={counts.join(" · ")}
+      right={p.projectBoard?.url
+        ? <a href={p.projectBoard.url} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>Open board →</a>
+        : (p.repo ? <a href={`https://github.com/${p.repo}/issues`} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>Open issues →</a> : null)}
+    >
+      <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+        {open > 0 && (
+          <>
+            <QueueBar ready={p.eligible} held={p.held} blocked={p.blocked} height={8} />
+            <div className="row gap-4 mt-3" style={{ flexWrap: "wrap" }}>
+              <QueueCount tone="ok" label="ready" value={eligibleCount} />
+              <QueueCount tone="policy" label="held (epic/meta)" value={Number(q.held ?? p.held ?? 0)} />
+              <QueueCount tone="stuck" label="blocked (deps)" value={Number(q.blocked_by_dependency ?? p.blocked ?? 0)} />
+              <QueueCount tone="watch" label="excluded" value={excluded} />
+            </div>
+          </>
+        )}
+
+        <QueuePlaneHeading label="Next" />
+        {next ? (
+          <a
+            href={issueURL(next.number)}
+            target={issueURL(next.number) ? "_blank" : undefined}
+            rel="noreferrer"
+            style={{
+              display: "block", marginTop: 4, padding: "var(--s-3) var(--s-4)",
+              borderLeft: "3px solid var(--ok)", background: "var(--ok-soft)",
+              borderRadius: 4, textDecoration: "none",
+            }}
+            title={issueURL(next.number) ? `Open issue #${next.number} on GitHub` : undefined}
+          >
+            <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+              <PriorityPill label={next.priority_label} />
+              <strong className="mono" style={{ color: "var(--fg-0)" }}>#{next.number}</strong>
+              <span style={{ color: "var(--fg-0)", minWidth: 0 }}>{next.title || ""}</span>
+            </div>
+            {next.project_status && (
+              <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>status: {next.project_status}</div>
+            )}
+          </a>
+        ) : (
+          <div className="dim" style={{ marginTop: 4, padding: "var(--s-3)" }}>
+            {q.idle_reason || "No issue is eligible right now."}
+          </div>
+        )}
+
+        {queueAfterNext.length > 0 && (
+          <>
+            <QueuePlaneHeading label={`Eligible · ${queueAfterNext.length} after next`} />
+            <div>
+              {queueAfterNext.map((c, i) => (
+                <div key={c.number || i} className="dec" style={{ gridTemplateColumns: "28px 1fr auto", alignItems: "center" }}>
+                  <span className="dec-t mono">{i + 2}</span>
+                  <div className="dec-body" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <IssueLink num={c.number} url={issueURL(c.number)} />
+                    <span style={{ color: "var(--fg-1)", marginLeft: 6 }}>{c.title || ""}</span>
+                  </div>
+                  <PriorityPill label={c.priority_label} />
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {skipped.length > 0 && (
+          <>
+            <QueuePlaneHeading label={`Skipped · ${skipped.length}`} />
+            <div>
+              {skipped.map((c, i) => {
+                const meta = skipCategoryMeta(c.category);
+                return (
+                  <div key={`${c.number || "x"}-${i}`} className="dec" style={{ gridTemplateColumns: "auto 1fr", alignItems: "start" }}>
+                    <PriorityPill label={c.priority_label} fallbackTone="idle" />
+                    <div className="dec-body">
+                      <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {c.number ? <IssueLink num={c.number} url={issueURL(c.number)} /> : null}
+                        <span style={{ color: "var(--fg-1)", marginLeft: c.number ? 6 : 0 }}>{c.title || ""}</span>
+                      </div>
+                      <div className="mt-2" style={{ fontSize: 11.5 }}>
+                        {meta.label && (
+                          <span className="mono" style={{ color: `var(--${meta.tone})`, marginRight: 6, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                            {meta.label}
+                          </span>
+                        )}
+                        <span className="dim">{c.reason || "skipped"}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        <div className="mono dim mt-4" style={{ fontSize: 11 }}>
+          {q.policy_rule ? `policy: ${q.policy_rule}` : ""}
+          {p.maxParallel ? ` · max parallel: ${p.maxParallel}` : ""}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function QueueCount({ tone, label, value }) {
+  return (
+    <div className="mono" style={{ fontSize: 11.5 }}>
+      <strong style={{ color: `var(--${tone})` }}>{value}</strong>{" "}
+      <span className="dim">{label}</span>
+    </div>
+  );
+}
+
+function QueuePlaneHeading({ label }) {
+  return (
+    <div className="mono dim" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em", marginTop: "var(--s-4)", marginBottom: 4 }}>
+      {label}
+    </div>
+  );
+}
+
+function IssueLink({ num, url }) {
+  if (!num) return null;
+  if (!url) return <strong className="mono" style={{ color: "var(--fg-0)" }}>#{num}</strong>;
+  return (
+    <a className="mono" href={url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} title={`Open issue #${num} on GitHub`}>
+      #{num}
+    </a>
+  );
+}
+
+function PriorityPill({ label, fallbackTone }) {
+  const l = String(label || "").trim();
+  if (!l) {
+    if (!fallbackTone) return null;
+    return <Pill tone={fallbackTone} noDot>—</Pill>;
+  }
+  return <Pill tone={priorityTone(l)} noDot>{l}</Pill>;
+}
+
+function priorityTone(label) {
+  switch (String(label || "").trim().toUpperCase()) {
+  case "P0": return "stuck";
+  case "P1": return "watch";
+  case "P2": return "info";
+  case "P3": return "idle";
+  default: return "policy";
+  }
+}
+
+// skipCategoryMeta maps the supervisor skip category onto a short tag + token
+// tone for the Skipped list. "other" (retry-exhausted, already-in-progress,
+// etc.) carries no tag — the reason text already explains it.
+function skipCategoryMeta(category) {
+  switch (String(category || "").trim()) {
+  case "excluded": return { label: "excluded", tone: "policy" };
+  case "held_meta": return { label: "epic/meta", tone: "policy" };
+  case "blocked_by_dependency": return { label: "blocked", tone: "stuck" };
+  case "project_status": return { label: "status", tone: "watch" };
+  default: return { label: "", tone: "idle" };
+  }
 }
 
 function ProjectMiniHeartbeat({ tone, events }) {

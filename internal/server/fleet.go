@@ -482,6 +482,13 @@ type fleetQueueSnapshot struct {
 	SelectedCandidate             *state.SupervisorIssueCandidate `json:"selected_candidate,omitempty"`
 	TopSkippedReason              string                          `json:"top_skipped_reason,omitempty"`
 	IdleReason                    string                          `json:"idle_reason,omitempty"`
+	// EligibleRanked + SkippedCandidates carry the supervisor decision plane
+	// (#720): the eligible set in real selection order and every skipped
+	// candidate with its reason. Surfaced straight from the persisted
+	// SupervisorDecision so Mission Control renders next/eligible/skipped
+	// without any GitHub calls on the request path.
+	EligibleRanked    []state.SupervisorIssueCandidate   `json:"eligible_ranked,omitempty"`
+	SkippedCandidates []state.SupervisorSkippedCandidate `json:"skipped_candidates,omitempty"`
 }
 
 type fleetProjectState struct {
@@ -2330,6 +2337,12 @@ func fleetQueueSnapshotFromSupervisor(info supervisorInfo) *fleetQueueSnapshot {
 	if analysis.SelectedCandidate != nil {
 		candidate := *analysis.SelectedCandidate
 		snapshot.SelectedCandidate = &candidate
+	}
+	if len(analysis.EligibleRanked) > 0 {
+		snapshot.EligibleRanked = append([]state.SupervisorIssueCandidate(nil), analysis.EligibleRanked...)
+	}
+	if len(analysis.SkippedCandidates) > 0 {
+		snapshot.SkippedCandidates = append([]state.SupervisorSkippedCandidate(nil), analysis.SkippedCandidates...)
 	}
 	return snapshot
 }
