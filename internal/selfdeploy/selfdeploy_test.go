@@ -102,12 +102,48 @@ func TestTriggerCommand(t *testing.T) {
 		"--result-file " + ResultPath(cfg.StateDir),
 		"--timeout-seconds 1800",
 		"--pr 698",
+		"--scope user",
 		"--health-url http://127.0.0.1:8788/api/v1/state",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args missing %q in:\n%s", want, joined)
 		}
 	}
+}
+
+// #716: scope flows from the self_deploy block to a --scope flag; default user.
+func TestTriggerCommandScope(t *testing.T) {
+	cfg := triggerTestConfig(t)
+	now := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+
+	// Default (no scope set) → --scope user.
+	_, args, err := TriggerCommand(cfg, 716, now)
+	if err != nil {
+		t.Fatalf("TriggerCommand: %v", err)
+	}
+	if !flagValue(args, "--scope", "user") {
+		t.Errorf("default scope: want --scope user, got %v", args)
+	}
+
+	// Opt-in system scope is forwarded verbatim.
+	cfg.SelfDeploy.Scope = "system"
+	_, args, err = TriggerCommand(cfg, 716, now)
+	if err != nil {
+		t.Fatalf("TriggerCommand: %v", err)
+	}
+	if !flagValue(args, "--scope", "system") {
+		t.Errorf("system scope: want --scope system, got %v", args)
+	}
+}
+
+// flagValue reports whether args contains "<flag> <value>" as adjacent items.
+func flagValue(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestTriggerCommandInstallViaSudo(t *testing.T) {

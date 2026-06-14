@@ -8,14 +8,22 @@
 #   1. build from merged origin/main, version-stamped per #682
 #      (-X main.version=<VERSION>+g<shortsha>),
 #   2. install atomically, keeping the previous binary as <bin>.prev,
-#   3. restart the maestro user units via systemctl --user restart — the
-#      units' normal stop path runs, so existing drain semantics are honored,
+#   3. restart the maestro units — the units' normal stop path runs, so
+#      existing drain semantics are honored,
 #   4. verify post-restart health: installed CLI reports the stamped version,
 #      units are active, and (when --health-url is given) the running process
 #      reports the stamped version within the timeout,
 #   5. on failure roll back to <bin>.prev, restart the units again,
 #   6. write a JSON result file the orchestrator surfaces as a supervisor
 #      finding on its next cycle.
+#
+# --scope selects the systemd unit manager (#716):
+#   * user   (default, back-compat) — `systemctl --user restart/is-active`,
+#     for per-user units (the pre-migration workshop@opti deployment).
+#   * system — `sudo -n systemctl restart` (non-interactive, mirroring
+#     --install-via-sudo) and `systemctl is-active` (no --user), for system
+#     units like the Loki fleet, where maestro runs as User=god system units.
+# The is-active poll and the rollback restart path are scope-aware too.
 #
 # When --install-via-sudo is passed (#711), the privileged file operations
 # (stage <bin>.next, preserve <bin>.prev, atomic rename into place, rollback)
@@ -26,7 +34,8 @@
 # Usage:
 #   self-deploy.sh --repo-dir DIR --bin PATH --units a.service[,b.service] \
 #     --result-file PATH --timeout-seconds N --pr N \
-#     [--health-url URL] [--health-token-env ENVVAR] [--install-via-sudo]
+#     [--health-url URL] [--health-token-env ENVVAR] [--install-via-sudo] \
+#     [--scope user|system]
 
 set -euo pipefail
 
@@ -39,6 +48,7 @@ PR=0
 HEALTH_URL=""
 HEALTH_TOKEN_ENV=""
 INSTALL_VIA_SUDO=0
+SCOPE="user"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,12 +61,18 @@ while [[ $# -gt 0 ]]; do
     --health-url) HEALTH_URL="$2"; shift 2 ;;
     --health-token-env) HEALTH_TOKEN_ENV="$2"; shift 2 ;;
     --install-via-sudo) INSTALL_VIA_SUDO=1; shift ;;
+    --scope) SCOPE="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 [[ -n "$REPO_DIR" && -n "$BIN" && -n "$UNITS" && -n "$RESULT_FILE" ]] || {
   echo "usage: --repo-dir, --bin, --units, --result-file are required" >&2
+  exit 2
+}
+
+[[ "$SCOPE" == "user" || "$SCOPE" == "system" ]] || {
+  echo "invalid --scope: $SCOPE (want user|system)" >&2
   exit 2
 }
 
@@ -127,21 +143,41 @@ cleanup_build() {
   rm -rf "$BUILD_ROOT"
 }
 
+# restart_units restarts each configured unit, scoped per --scope (#716).
+# user-scope uses the per-user manager (`systemctl --user restart`); system-scope
+# targets the system manager via `sudo -n systemctl restart` (non-interactive,
+# mirroring --install-via-sudo), since restarting a system unit needs privilege.
+# Either way the unit's normal stop path runs, so drain semantics are honored.
+# The user-scope command is byte-for-byte unchanged from before scope support.
 restart_units() {
   local budget=$1 unit
+  local -a restart_cmd
+  if [[ "$SCOPE" == "system" ]]; then
+    restart_cmd=(sudo -n systemctl restart)
+  else
+    restart_cmd=(systemctl --user restart)
+  fi
   for unit in "${UNIT_LIST[@]}"; do
-    log "restarting $unit (honors the unit's stop/drain path; budget ${budget}s)"
-    if ! timeout "$budget" systemctl --user restart "$unit"; then
+    log "restarting $unit (scope=$SCOPE; honors the unit's stop/drain path; budget ${budget}s)"
+    if ! timeout "$budget" "${restart_cmd[@]}" "$unit"; then
       log "restart of $unit failed or timed out"
       return 1
     fi
   done
 }
 
+# units_active is scope-aware too (#716). The read-only liveness query needs no
+# privilege even for system units, so system-scope simply drops --user (no sudo).
 units_active() {
   local unit
+  local -a active_cmd
+  if [[ "$SCOPE" == "system" ]]; then
+    active_cmd=(systemctl is-active --quiet)
+  else
+    active_cmd=(systemctl --user is-active --quiet)
+  fi
   for unit in "${UNIT_LIST[@]}"; do
-    systemctl --user is-active --quiet "$unit" || return 1
+    "${active_cmd[@]}" "$unit" || return 1
   done
 }
 
@@ -229,13 +265,19 @@ trap 'fail "command failed: ${BASH_COMMAND}"' ERR
 command -v go >/dev/null 2>&1 || export PATH="$PATH:/usr/local/go/bin"
 command -v go >/dev/null 2>&1 || fail "go toolchain not found in PATH"
 
-# Preflight passwordless sudo when install_via_sudo is requested, so a
-# misconfigured host fails loudly here (recorded as a finding) instead of at
-# the first privileged file op (#711).
+# Preflight passwordless sudo when any privileged operation is requested —
+# install_via_sudo file ops (#711) or system-scope unit restarts (#716) — so a
+# misconfigured host fails loudly here (recorded as a finding) instead of at the
+# first privileged operation.
+if (( INSTALL_VIA_SUDO )) || [[ "$SCOPE" == "system" ]]; then
+  command -v sudo >/dev/null 2>&1 || fail "privileged self-deploy requested but sudo not found in PATH"
+  sudo -n true >/dev/null 2>&1 || fail "privileged self-deploy requested but passwordless sudo is unavailable for $(id -un)"
+fi
 if (( INSTALL_VIA_SUDO )); then
-  command -v sudo >/dev/null 2>&1 || fail "install_via_sudo set but sudo not found in PATH"
-  sudo -n true >/dev/null 2>&1 || fail "install_via_sudo set but passwordless sudo is unavailable for $(id -un)"
   log "install_via_sudo enabled — privileged file ops on $BIN run via sudo -n"
+fi
+if [[ "$SCOPE" == "system" ]]; then
+  log "scope=system — unit restarts run via sudo -n systemctl"
 fi
 
 # --- 1. build from merged origin/main, version-stamped (#682) ---------------

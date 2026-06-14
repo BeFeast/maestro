@@ -26,11 +26,13 @@ The script then:
    `install_via_sudo: true`, these file ops run through `sudo -n` so a
    root-owned `bin_path` (e.g. `/usr/local/bin/maestro`) can be updated by the
    unprivileged deploy user without losing atomic-rename semantics (#711).
-3. **Restarts the units** — `systemctl --user restart <unit>` for each
-   configured unit. The unit's normal stop path runs, so existing **drain
-   semantics are honored**: if your unit declares `ExecStop=... drain`,
-   in-flight workers finish before the stop completes. Budget for this in
-   `timeout_minutes`.
+3. **Restarts the units** — for each configured unit, scoped by `scope`
+   (#716): `systemctl --user restart <unit>` for `user` (default) or
+   `sudo -n systemctl restart <unit>` for `system` units (e.g. the Loki fleet,
+   where maestro runs as `User=god` system units). Either way the unit's normal
+   stop path runs, so existing **drain semantics are honored**: if your unit
+   declares `ExecStop=... drain`, in-flight workers finish before the stop
+   completes. Budget for this in `timeout_minutes`.
 4. **Verifies health** — the installed CLI must report the stamped version
    (`maestro version` → `maestro v<VERSION>+g<shortsha>`), every unit must be
    `active`, and (when a health URL is configured) the **running process**
@@ -58,12 +60,36 @@ self_deploy:
   enabled: true
   bin_path: /usr/local/bin/maestro   # default: path of the running binary
   install_via_sudo: true             # #711: stage/rename/rollback bin_path via `sudo -n` (root-owned target)
-  units: ["maestro.service"]         # systemd user units to restart
+  scope: user                        # #716: user (default, systemctl --user) | system (sudo -n systemctl, for system units)
+  units: ["maestro.service"]         # systemd units to restart
   # health_url: http://127.0.0.1:8788/api/v1/state  # default: derived from server.port
   # health_token_env: MAESTRO_DASH_TOKEN            # default: server.auth.token_env
   # script: ./scripts/self-deploy.sh                # default: <local_path>/scripts/self-deploy.sh
   # timeout_minutes: 30                             # build+restart+verify budget (covers drain)
 ```
+
+### Scope: user vs system units (#716)
+
+`scope` selects which systemd manager owns the units:
+
+- **`user`** (default, back-compat) — per-user units, restarted with
+  `systemctl --user restart` / `systemctl --user is-active`. This was the only
+  mode before #716 (the workshop@opti deployment).
+- **`system`** — system units (`User=god`, managed by the system manager),
+  restarted with `sudo -n systemctl restart` and checked with
+  `systemctl is-active` (no `--user`). This is the **Loki fleet** layout, where
+  maestro runs as `maestro-<project>{,-supervise,-web}.service` system units.
+  System scope needs **passwordless sudo** for `systemctl restart` (the
+  read-only `is-active` poll does not); the deploy preflights it and fails fast
+  with a recorded finding if it is missing. A minimal sudoers grant:
+
+  ```
+  # /etc/sudoers.d/maestro-self-deploy  (validate with: visudo -c -f <file>)
+  god ALL=(root) NOPASSWD: /usr/bin/systemctl restart maestro-*
+  ```
+
+  On Loki, combine with `install_via_sudo: true` (root-owned
+  `/usr/local/bin/maestro`) — the two are independent but both used there.
 
 Prerequisites on the host:
 
