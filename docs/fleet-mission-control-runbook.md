@@ -225,6 +225,21 @@ Dynamic wave policy:
 
 Fleet cards surface `open`, `eligible`, `excluded`, `held/meta`, `blocked-deps`, `non_runnable_project_status`, selected candidate, and top skipped reason so operators can tell whether the queue is empty, held by parent/meta policy, blocked by dependencies, or waiting on project status.
 
+### Queue / Next decision plane (#720)
+
+The per-project **Queue / Next** panel in Mission Control visualizes the supervisor's selection decision: the **next** issue (selected candidate, highlighted with its priority label), the **eligible** set in real selection order (priority `P0<P1<P2<P3`, then ascending issue number — the same order as the supervisor's `sortDynamicWaveCandidates`), and every **skipped** candidate with its reason (`retry limit exhausted`, `epic`/`meta`, `blocked`, `project status not runnable`, etc.) and queue counts. Rows link to their GitHub issue.
+
+The panel renders entirely from the supervisor decision already held in fleet state — there are **no GitHub calls on the request path** — and refreshes on the existing 12s `/api/v1/fleet` poll. It stays correct regardless of the issue tracker (GitHub Projects today; Jira / Linear / Asana adapters later), because it reads the persisted decision rather than the tracker.
+
+To carry the full ranked-eligible and skipped sets, the persisted `SupervisorDecision.QueueAnalysis` (`state.SupervisorQueueAnalysis`) gained two bounded fields (capped at 50 entries each):
+
+| Field | JSON | Meaning |
+| --- | --- | --- |
+| `EligibleRanked` | `eligible_ranked` | Eligible candidates in real selection order; the first entry mirrors `selected_candidate`. |
+| `SkippedCandidates` | `skipped_candidates` | Each skipped issue with `number`, `title`, `priority_label`, `category` (`excluded` / `held_meta` / `blocked_by_dependency` / `project_status` / `other`), and `reason`. |
+
+Both are mirrored onto the fleet `queue_snapshot` so the SPA can read them without re-deriving anything client-side.
+
 ## Review And Approval Gates
 
 The default PR review gate is Greptile. A project with `review_gate: greptile` waits for CI and Greptile approval before merge. A project with `review_gate: none` skips the Greptile gate, but this should be an explicit per-project policy decision.

@@ -664,6 +664,21 @@ type SupervisorIssueCandidate struct {
 	ProjectStatus string   `json:"project_status,omitempty"`
 }
 
+// SupervisorSkippedCandidate is one open issue the queue policy excluded this
+// cycle, paired with the human-readable reason and skip category so the
+// Mission Control Queue / Next view can render "why #707 was skipped" without
+// re-deriving it from the free-text SkippedReasons strings (#720). Number is
+// best-effort: it is always set on the dynamic-wave path (where the issue
+// object is in hand) and recovered from the leading "Issue #N" token on the
+// ordered-queue / default paths.
+type SupervisorSkippedCandidate struct {
+	Number        int    `json:"number,omitempty"`
+	Title         string `json:"title,omitempty"`
+	PriorityLabel string `json:"priority_label,omitempty"`
+	Category      string `json:"category,omitempty"`
+	Reason        string `json:"reason"`
+}
+
 // SupervisorQueueAnalysis captures explainable issue-selection counts for
 // Mission Control and --json output.
 type SupervisorQueueAnalysis struct {
@@ -676,6 +691,17 @@ type SupervisorQueueAnalysis struct {
 	NonRunnableProjectStatusCount int                       `json:"non_runnable_project_status_count"`
 	SelectedCandidate             *SupervisorIssueCandidate `json:"selected_candidate,omitempty"`
 	SkippedReasons                []string                  `json:"skipped_reasons,omitempty"`
+
+	// EligibleRanked is the eligible candidate set in the real selection
+	// order (priority P0<P1<P2<P3, then ascending issue number — see the
+	// supervisor's sortDynamicWaveCandidates). The first entry mirrors
+	// SelectedCandidate. Bounded to keep persisted decisions small; added
+	// for the Mission Control Queue / Next decision plane (#720).
+	EligibleRanked []SupervisorIssueCandidate `json:"eligible_ranked,omitempty"`
+	// SkippedCandidates pairs each skipped open issue with its reason and
+	// skip category so the decision plane can render every skipped candidate
+	// next to the next/eligible set (#720). Bounded to match EligibleRanked.
+	SkippedCandidates []SupervisorSkippedCandidate `json:"skipped_candidates,omitempty"`
 }
 
 // TopSkippedReason returns the first concise queue skip reason available for UI cards.

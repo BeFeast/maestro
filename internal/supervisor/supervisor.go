@@ -792,7 +792,14 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 	analysis := result.analysis
 	outcomeStatus := e.outcomeStatus(st)
 	if analysis == nil {
-		analysis = &state.SupervisorQueueAnalysis{PolicyRule: PolicyRuleDynamicWave, OpenIssues: len(issues), EligibleCandidates: len(candidates), SkippedReasons: firstN(result.skipped, 5)}
+		analysis = &state.SupervisorQueueAnalysis{
+			PolicyRule:         PolicyRuleDynamicWave,
+			OpenIssues:         len(issues),
+			EligibleCandidates: len(candidates),
+			SkippedReasons:     firstN(result.skipped, 5),
+			EligibleRanked:     supervisorIssueCandidates(candidates),
+			SkippedCandidates:  parseSkippedCandidates(result.skipped),
+		}
 		if len(candidates) > 0 {
 			analysis.SelectedCandidate = supervisorIssueCandidate(candidates[0])
 		}
@@ -1830,6 +1837,10 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 		OpenIssues: len(issues),
 	}
 
+	// Seed the structured skip list with the ordered-queue prefix reasons
+	// (parsed for their leading issue number) so the decision plane shows
+	// every skipped candidate, not just the ones the dynamic wave examined.
+	skippedCandidates := parseSkippedCandidates(prefixSkipped)
 	candidates := make([]github.Issue, 0, len(issues))
 	for _, issue := range issues {
 		reason, category, err := e.dynamicWaveSkipReason(st, issue, issues)
@@ -1848,6 +1859,9 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 				analysis.NonRunnableProjectStatusCount++
 			}
 			skipped = append(skipped, fmt.Sprintf("Issue #%d skipped by dynamic wave policy: %s", issue.Number, reason))
+			if len(skippedCandidates) < maxQueuePlaneCandidates {
+				skippedCandidates = append(skippedCandidates, supervisorSkippedCandidate(issue, reason, category))
+			}
 			continue
 		}
 		candidates = append(candidates, issue)
@@ -1859,6 +1873,8 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 		analysis.SelectedCandidate = supervisorIssueCandidate(candidates[0])
 	}
 	analysis.SkippedReasons = firstN(skipped, 5)
+	analysis.EligibleRanked = supervisorIssueCandidates(candidates)
+	analysis.SkippedCandidates = skippedCandidates
 
 	return policyCandidateResult{
 		candidates:  candidates,
@@ -3241,6 +3257,83 @@ func supervisorIssueCandidate(issue github.Issue) *state.SupervisorIssueCandidat
 	}
 }
 
+// maxQueuePlaneCandidates bounds the eligible-ranked and skipped-candidate
+// lists persisted on a SupervisorDecision so the Mission Control decision
+// plane stays cheap to store across the rolling decision history (#720).
+const maxQueuePlaneCandidates = 50
+
+// supervisorIssueCandidates maps a selection-ordered issue slice into the
+// persisted candidate shape, bounded to maxQueuePlaneCandidates. The caller
+// is responsible for ordering (the dynamic-wave path sorts first).
+func supervisorIssueCandidates(issues []github.Issue) []state.SupervisorIssueCandidate {
+	if len(issues) == 0 {
+		return nil
+	}
+	limit := len(issues)
+	if limit > maxQueuePlaneCandidates {
+		limit = maxQueuePlaneCandidates
+	}
+	out := make([]state.SupervisorIssueCandidate, 0, limit)
+	for _, issue := range issues[:limit] {
+		if c := supervisorIssueCandidate(issue); c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out
+}
+
+// supervisorSkippedCandidate builds a structured skip record from the issue in
+// hand (dynamic-wave path) so the decision plane can show "#707 — retry limit
+// exhausted" with the issue's priority label.
+func supervisorSkippedCandidate(issue github.Issue, reason string, category dynamicSkipCategory) state.SupervisorSkippedCandidate {
+	_, priorityLabel := issuePriority(issue)
+	return state.SupervisorSkippedCandidate{
+		Number:        issue.Number,
+		Title:         RedactSensitive(issue.Title),
+		PriorityLabel: priorityLabel,
+		Category:      string(category),
+		Reason:        reason,
+	}
+}
+
+// parseSkippedCandidate converts a free-text skip reason into a structured
+// skipped candidate, recovering the leading "Issue #N" number when present.
+// Used on the ordered-queue / default paths where only reason strings exist.
+func parseSkippedCandidate(reason string) state.SupervisorSkippedCandidate {
+	candidate := state.SupervisorSkippedCandidate{Reason: reason}
+	const prefix = "Issue #"
+	if strings.HasPrefix(reason, prefix) {
+		rest := reason[len(prefix):]
+		num := 0
+		digits := 0
+		for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+			num = num*10 + int(rest[digits]-'0')
+			digits++
+		}
+		if digits > 0 {
+			candidate.Number = num
+		}
+	}
+	return candidate
+}
+
+// parseSkippedCandidates maps a bounded slice of skip-reason strings into
+// structured skipped candidates for the decision plane.
+func parseSkippedCandidates(reasons []string) []state.SupervisorSkippedCandidate {
+	if len(reasons) == 0 {
+		return nil
+	}
+	limit := len(reasons)
+	if limit > maxQueuePlaneCandidates {
+		limit = maxQueuePlaneCandidates
+	}
+	out := make([]state.SupervisorSkippedCandidate, 0, limit)
+	for _, reason := range reasons[:limit] {
+		out = append(out, parseSkippedCandidate(reason))
+	}
+	return out
+}
+
 func supervisorQueueAnalysis(policyRule string, openIssues int, eligible []github.Issue, skipped []string) *state.SupervisorQueueAnalysis {
 	analysis := &state.SupervisorQueueAnalysis{
 		PolicyRule:                    policyRule,
@@ -3251,6 +3344,8 @@ func supervisorQueueAnalysis(policyRule string, openIssues int, eligible []githu
 		BlockedByDependencyIssues:     countQueueBlockedByDependencyReasons(skipped),
 		NonRunnableProjectStatusCount: countQueueNonRunnableReasons(skipped),
 		SkippedReasons:                firstN(skipped, 5),
+		EligibleRanked:                supervisorIssueCandidates(eligible),
+		SkippedCandidates:             parseSkippedCandidates(skipped),
 	}
 	if len(eligible) > 0 {
 		analysis.SelectedCandidate = supervisorIssueCandidate(eligible[0])
