@@ -41,6 +41,13 @@ const (
 // unit and the orchestrator agree on the location without extra plumbing.
 const resultFileName = "self-deploy-result.json"
 
+// triggerMarkerName records when the orchestrator last launched a deploy, so a
+// burst of merges — or a run-loop restarted by its own deploy — can debounce
+// re-triggers instead of stacking deploys that bounce the fleet mid-verify
+// (#722). It lives in the state dir alongside the result file so it survives the
+// orchestrator unit restarting.
+const triggerMarkerName = "self-deploy-last-trigger.json"
+
 // Result is the JSON contract between scripts/self-deploy.sh and the
 // orchestrator.
 type Result struct {
@@ -82,6 +89,57 @@ func ClearResult(stateDir string) error {
 		return err
 	}
 	return nil
+}
+
+// triggerMarker is the JSON persisted by RecordTrigger / read by LastTrigger.
+type triggerMarker struct {
+	TriggeredAt time.Time `json:"triggered_at"`
+	PR          int       `json:"pr,omitempty"`
+}
+
+// triggerMarkerPath returns the path of the last-trigger marker inside stateDir.
+func triggerMarkerPath(stateDir string) string {
+	return filepath.Join(stateDir, triggerMarkerName)
+}
+
+// RecordTrigger persists the time (and PR) of a self-deploy trigger so a
+// re-evaluating — or restarted — orchestrator can debounce the same wave of
+// merges (#722). A blank stateDir is a no-op so callers without a state dir
+// (e.g. tests) do not write into the working directory.
+func RecordTrigger(stateDir string, prNumber int, now time.Time) error {
+	if strings.TrimSpace(stateDir) == "" {
+		return nil
+	}
+	data, err := json.Marshal(triggerMarker{TriggeredAt: now.UTC(), PR: prNumber})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return err
+	}
+	tmp := triggerMarkerPath(stateDir) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, triggerMarkerPath(stateDir))
+}
+
+// LastTrigger reports when a self-deploy was last triggered from stateDir, the
+// PR that triggered it, and whether a usable marker existed. A missing or
+// malformed marker reports ok=false (no debounce — fail open toward deploying).
+func LastTrigger(stateDir string) (when time.Time, pr int, ok bool) {
+	if strings.TrimSpace(stateDir) == "" {
+		return time.Time{}, 0, false
+	}
+	data, err := os.ReadFile(triggerMarkerPath(stateDir))
+	if err != nil {
+		return time.Time{}, 0, false
+	}
+	var m triggerMarker
+	if err := json.Unmarshal(data, &m); err != nil || m.TriggeredAt.IsZero() {
+		return time.Time{}, 0, false
+	}
+	return m.TriggeredAt, m.PR, true
 }
 
 // TriggerCommand builds the detached systemd-run invocation for a deploy

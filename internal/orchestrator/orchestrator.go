@@ -3799,10 +3799,33 @@ func (o *Orchestrator) maybeSelfDeployAfterMerge(prNumber int) {
 	if !o.cfg.SelfDeploy.Enabled {
 		return
 	}
+	now := time.Now().UTC()
+	// #722: debounce re-triggers. The deploy restarts the run-loop's own unit,
+	// so a burst of merges — or a run-loop restarted by its own deploy — can
+	// re-fire a fresh deploy while a previous one is still in flight (build +
+	// drain + verify + rollback). That stacks deploys that bounce the fleet web
+	// process mid-verify, so verify never converges (the cascade in #722). Skip
+	// if we triggered a deploy within the min-interval window.
+	if last, lastPR, ok := selfdeploy.LastTrigger(o.cfg.StateDir); ok {
+		window := time.Duration(o.cfg.SelfDeploy.EffectiveMinIntervalMinutes()) * time.Minute
+		if since := now.Sub(last); since >= 0 && since < window {
+			log.Printf("[orch] self-deploy debounced for PR #%d: last trigger (PR #%d) was %s ago (< %s window)", prNumber, lastPR, since.Round(time.Second), window)
+			return
+		}
+	}
 	if err := o.triggerSelfDeploy(prNumber); err != nil {
 		log.Printf("[orch] self-deploy trigger failed for PR #%d: %v", prNumber, err)
 		o.notifier.Sendf("⚠️ maestro: self-deploy trigger failed after PR #%d merge: %v", prNumber, err)
 		return
+	}
+	// Record the trigger now that the deploy is launched. The detached script
+	// fetches+builds before it restarts any unit, so this marker lands well
+	// before the run-loop's own restart — a run-loop restarted by this deploy
+	// then sees it on its next cycle and does not re-fire for the same wave
+	// (#722). Recording only on success keeps a pure trigger failure (no deploy
+	// happened) from suppressing the next attempt.
+	if err := selfdeploy.RecordTrigger(o.cfg.StateDir, prNumber, now); err != nil {
+		log.Printf("[orch] self-deploy trigger marker write failed for PR #%d: %v", prNumber, err)
 	}
 	log.Printf("[orch] self-deploy started for PR #%d (detached transient unit)", prNumber)
 	o.notifier.Sendf("🚀 maestro: self-deploy started after PR #%d merge — units will restart after drain", prNumber)

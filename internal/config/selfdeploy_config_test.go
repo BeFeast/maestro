@@ -105,6 +105,11 @@ func TestSelfDeployEffectiveDefaults(t *testing.T) {
 	if got := sd.EffectiveTimeoutMinutes(); got != 30 {
 		t.Errorf("EffectiveTimeoutMinutes() = %d, want 30", got)
 	}
+	// #722: the debounce window defaults to the deploy timeout so at most one
+	// deploy runs per budget.
+	if got := sd.EffectiveMinIntervalMinutes(); got != 30 {
+		t.Errorf("EffectiveMinIntervalMinutes() default = %d, want 30 (timeout)", got)
+	}
 
 	// No server port → no health URL (CLI + unit checks only).
 	if got := sd.EffectiveHealthURL(ServerConfig{}); got != "" {
@@ -116,5 +121,30 @@ func TestSelfDeployEffectiveDefaults(t *testing.T) {
 	}
 	if got := sd.EffectiveHealthTokenEnv(ServerConfig{Auth: ServerAuthConfig{TokenEnv: "MC_TOKEN"}}); got != "MC_TOKEN" {
 		t.Errorf("EffectiveHealthTokenEnv() = %q", got)
+	}
+}
+
+// #722: the debounce window defaults to the deploy timeout (so re-triggers
+// cannot stack while a deploy may still be in flight) and an explicit
+// min_interval_minutes overrides it for faster back-to-back deploys.
+func TestSelfDeployEffectiveMinInterval(t *testing.T) {
+	// Default: falls back to EffectiveTimeoutMinutes().
+	if got := (SelfDeployConfig{}).EffectiveMinIntervalMinutes(); got != 30 {
+		t.Errorf("default EffectiveMinIntervalMinutes() = %d, want 30", got)
+	}
+	if got := (SelfDeployConfig{TimeoutMinutes: 45}).EffectiveMinIntervalMinutes(); got != 45 {
+		t.Errorf("EffectiveMinIntervalMinutes() with timeout 45 = %d, want 45", got)
+	}
+	// Explicit override wins over the timeout default.
+	if got := (SelfDeployConfig{TimeoutMinutes: 45, MinIntervalMinutes: 5}).EffectiveMinIntervalMinutes(); got != 5 {
+		t.Errorf("EffectiveMinIntervalMinutes() override = %d, want 5", got)
+	}
+
+	cfg, err := Parse([]byte("repo: owner/repo\nself_deploy:\n  enabled: true\n  min_interval_minutes: 7\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.SelfDeploy.EffectiveMinIntervalMinutes(); got != 7 {
+		t.Errorf("parsed min_interval_minutes EffectiveMinIntervalMinutes() = %d, want 7", got)
 	}
 }

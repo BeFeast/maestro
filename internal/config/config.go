@@ -215,6 +215,15 @@ type SelfDeployConfig struct {
 	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
 	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
 	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+
+	// #722: minimum interval between self-deploy triggers. The deploy restarts
+	// the run-loop's own unit, so a burst of merges — or a run-loop restarted by
+	// its own deploy — can re-fire a new deploy while a previous one is still in
+	// flight (build + drain + verify + rollback), producing a self-triggering
+	// cascade that bounces the fleet web process mid-verify so verify never
+	// converges. The orchestrator debounces re-triggers within this window.
+	// Default: timeout_minutes (at most one deploy per budget).
+	MinIntervalMinutes int `yaml:"min_interval_minutes"`
 }
 
 // SelfDeployScope* are the valid values for SelfDeployConfig.Scope.
@@ -292,6 +301,19 @@ func (c SelfDeployConfig) EffectiveTimeoutMinutes() int {
 		return c.TimeoutMinutes
 	}
 	return 30
+}
+
+// EffectiveMinIntervalMinutes returns the debounce window between self-deploy
+// triggers (#722). Because the deploy restarts the run-loop's own unit, a burst
+// of merges (or a run-loop restarted mid-deploy) must not re-fire a fresh
+// deploy while a previous one may still be in flight — that is the
+// self-triggering cascade. Defaults to the deploy timeout so at most one deploy
+// runs per budget; set explicitly to allow faster back-to-back deploys.
+func (c SelfDeployConfig) EffectiveMinIntervalMinutes() int {
+	if c.MinIntervalMinutes > 0 {
+		return c.MinIntervalMinutes
+	}
+	return c.EffectiveTimeoutMinutes()
 }
 
 const (

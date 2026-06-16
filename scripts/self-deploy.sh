@@ -12,10 +12,16 @@
 #      existing drain semantics are honored,
 #   4. verify post-restart health: installed CLI reports the stamped version,
 #      units are active, and (when --health-url is given) the running process
-#      reports the stamped version within the timeout,
+#      reports a version built from the deployed commit SHA within the timeout
+#      (SHA match, not full-string match, so a stamp vs Go pseudo-version
+#      formatting difference can't cause a false miss — #722),
 #   5. on failure roll back to <bin>.prev, restart the units again,
 #   6. write a JSON result file the orchestrator surfaces as a supervisor
 #      finding on its next cycle.
+#
+# A non-blocking single-flight lock (flock on <result-file>.lock) guarantees one
+# deploy at a time: a re-triggered deploy that lands while one is in flight exits
+# cleanly instead of bouncing the units mid-verify (#722).
 #
 # --scope selects the systemd unit manager (#716):
 #   * user   (default, back-compat) — `systemctl --user restart/is-active`,
@@ -182,12 +188,22 @@ units_active() {
 }
 
 health_ok() {
-  # Running-process check: the API must answer and report the stamped version.
-  local curl_args=(-fsS --max-time 10)
+  # Running-process check: the API must answer and report a version built from
+  # the deployed commit. Match on the commit SHA (embedded in the stamp as
+  # "+g<shortsha>") rather than the full version string: a stamped build reports
+  # "1.4.2+gf4550ef" while an unstamped one reports a Go pseudo-version
+  # "1.4.3-0.<ts>-f4550ef38a42" — same commit, different string. Matching the
+  # SHA is format-agnostic, so an ldflags-stamp vs pseudo-version mismatch can't
+  # cause a false verify miss (#722). The short SHA is a prefix of the 12-char
+  # pseudo-version SHA, so it matches both.
+  local curl_args=(-fsS --max-time 10) body
   if [[ -n "$HEALTH_TOKEN_ENV" && -n "${!HEALTH_TOKEN_ENV:-}" ]]; then
     curl_args+=(-H "Authorization: Bearer ${!HEALTH_TOKEN_ENV}")
   fi
-  curl "${curl_args[@]}" "$HEALTH_URL" 2>/dev/null | grep -qF "\"version\": \"$STAMP\""
+  body=$(curl "${curl_args[@]}" "$HEALTH_URL" 2>/dev/null) || return 1
+  # Constrain the SHA match to the reported "version" field (handles both
+  # indented `"version": "..."` and compact `"version":"..."` JSON).
+  printf '%s' "$body" | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -qF "$SHORT_SHA"
 }
 
 verify() {
@@ -278,6 +294,29 @@ if (( INSTALL_VIA_SUDO )); then
 fi
 if [[ "$SCOPE" == "system" ]]; then
   log "scope=system — unit restarts run via sudo -n systemctl"
+fi
+
+# --- single-flight: one deploy at a time (#722) -----------------------------
+# Overlapping deploys restart the same units (notably the fleet web process the
+# verify step polls), so a re-triggered deploy landing on top of an in-flight
+# one bounces those units mid-verify and verify never converges. Take a
+# non-blocking exclusive lock; if another deploy already holds it, exit cleanly
+# without touching the binary or any unit — the in-flight deploy owns this wave.
+# (The orchestrator also debounces re-triggers; this is the host-side backstop.)
+LOCK_FD=
+if command -v flock >/dev/null 2>&1; then
+  LOCK_FILE="$RESULT_FILE.lock"
+  mkdir -p "$(dirname "$LOCK_FILE")"
+  exec {LOCK_FD}>"$LOCK_FILE" || fail "could not open self-deploy lock $LOCK_FILE"
+  if ! flock -n "$LOCK_FD"; then
+    log "another self-deploy holds $LOCK_FILE — skipping (one deploy at a time)"
+    trap - ERR EXIT
+    cleanup_build
+    exit 0
+  fi
+  log "acquired self-deploy lock $LOCK_FILE"
+else
+  log "flock not found — proceeding without single-flight lock"
 fi
 
 # --- 1. build from merged origin/main, version-stamped (#682) ---------------
