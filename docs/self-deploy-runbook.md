@@ -36,8 +36,14 @@ The script then:
 4. **Verifies health** — the installed CLI must report the stamped version
    (`maestro version` → `maestro v<VERSION>+g<shortsha>`), every unit must be
    `active`, and (when a health URL is configured) the **running process**
-   must report the stamped version via the `version` field on
-   `/api/v1/state` (or `/api/v1/fleet`) before the deadline.
+   must report a version **built from the deployed commit SHA** via the
+   `version` field on `/api/v1/state` (or `/api/v1/fleet`) before the deadline.
+   The health check matches the commit SHA (the `+g<shortsha>` build metadata),
+   **not** the full version string: a stamped build reports `1.4.2+gf4550ef`
+   while an unstamped one reports a Go pseudo-version
+   `1.4.3-0.<ts>-f4550ef38a42` — same commit, different string. Matching the SHA
+   is format-agnostic, so a stamp-vs-pseudo-version formatting difference cannot
+   cause a false verify miss (#722).
 5. **Rolls back on failure** — restores `<bin>.prev`, restarts the units
    again, and records the rollback reason. `.prev` is kept either way for
    manual rollback.
@@ -66,7 +72,35 @@ self_deploy:
   # health_token_env: MAESTRO_DASH_TOKEN            # default: server.auth.token_env
   # script: ./scripts/self-deploy.sh                # default: <local_path>/scripts/self-deploy.sh
   # timeout_minutes: 30                             # build+restart+verify budget (covers drain)
+  # min_interval_minutes: 30                        # #722: debounce window between triggers (default: timeout_minutes)
 ```
+
+### Avoiding the self-trigger cascade (#722)
+
+The deploy restarts the **run-loop's own unit** (it must, to pick up the new
+binary). If that unit is in `units`, a deploy restarts the very process that
+triggers deploys — and on a busy fleet a burst of merges (or a deploy that rolls
+back) can re-fire fresh deploys while a previous one is still in flight. Stacked
+deploys keep bouncing the fleet web process the verify step polls, so verify
+never converges and every attempt rolls back and re-fires. Three guards prevent
+this:
+
+- **SHA-based verify** — the health check matches the commit SHA, not the full
+  version string, so a stamped binary and a rolled-back pseudo-version of the
+  *same commit* both satisfy verify (step 4 above).
+- **Single-flight lock** — `scripts/self-deploy.sh` takes a non-blocking
+  `flock` on `<result-file>.lock`; a re-triggered deploy that lands while one is
+  in flight exits cleanly instead of restarting units mid-verify.
+- **Orchestrator debounce** — the orchestrator records each trigger in the state
+  dir (`self-deploy-last-trigger.json`) and skips re-triggering within
+  `min_interval_minutes` (default: `timeout_minutes`). This survives the
+  run-loop being restarted by its own deploy. Lower it for faster back-to-back
+  deploys on an idle fleet.
+
+It is still safe (and simplest) to keep the run-loop unit in `units`; these
+guards make that configuration converge. Re-enable `self_deploy` on the dogfood
+orchestrator only after validating a deploy → verify-pass → no-re-trigger cycle
+on an idle fleet.
 
 ### Scope: user vs system units (#716)
 
@@ -166,6 +200,8 @@ maestro version
 | Finding `self-deploy: failed … no .prev` | First deploy failed before any previous binary existed | Build + install manually once, re-merge |
 | Finding `rolled_back … health check timed out` | New binary started but never reported the stamped version | Check `journalctl --user -u maestro.service`; the regression is in the merged code |
 | No finding, no restart | Trigger failed (script missing, systemd-run unavailable) | Orchestrator log shows `self-deploy trigger failed …`; a ⚠️ notification is sent |
+| Log `self-deploy debounced for PR #… < … window` | A deploy was triggered within `min_interval_minutes` of the previous one — expected on a burst of merges (#722) | None; the in-flight/previous deploy covers the merged code. Lower `min_interval_minutes` for faster successive deploys |
+| Deploy log `another self-deploy holds … — skipping` | A deploy started while one was already in flight; the single-flight lock skipped it (#722) | None; the in-flight deploy owns the rollout |
 | Units inactive after rollback | Rollback restart also failed | `systemctl --user start maestro.service` by hand; binary on disk is the previous version |
 
 ## Interaction with `deploy_cmd`

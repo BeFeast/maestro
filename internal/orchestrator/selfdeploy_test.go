@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/notify"
@@ -40,6 +41,63 @@ func TestMaybeSelfDeployAfterMerge_Enabled(t *testing.T) {
 	o.maybeSelfDeployAfterMerge(698)
 	if gotPR != 698 {
 		t.Fatalf("trigger called with PR %d, want 698", gotPR)
+	}
+}
+
+// #722: a deploy triggered within the debounce window is skipped, so a burst of
+// merges (or a run-loop restarted by its own deploy) cannot stack overlapping
+// deploys — the self-trigger cascade.
+func TestMaybeSelfDeployAfterMerge_DebouncesRecentTrigger(t *testing.T) {
+	stateDir := t.TempDir()
+	// A trigger fired moments ago for PR 698.
+	if err := selfdeploy.RecordTrigger(stateDir, 698, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:       "owner/repo",
+			StateDir:   stateDir,
+			SelfDeploy: config.SelfDeployConfig{Enabled: true, MinIntervalMinutes: 30},
+		},
+		notifier:          &notify.Notifier{},
+		selfDeployStartFn: func(prNumber int) error { calls++; return nil },
+	}
+
+	o.maybeSelfDeployAfterMerge(699)
+	if calls != 0 {
+		t.Fatalf("trigger fired %d times within the debounce window, want 0", calls)
+	}
+}
+
+// Outside the debounce window the next merge deploys again and refreshes the
+// trigger marker.
+func TestMaybeSelfDeployAfterMerge_FiresAfterWindow(t *testing.T) {
+	stateDir := t.TempDir()
+	// Last trigger is well past the (1 minute) window.
+	if err := selfdeploy.RecordTrigger(stateDir, 698, time.Now().UTC().Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	gotPR := 0
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:       "owner/repo",
+			StateDir:   stateDir,
+			SelfDeploy: config.SelfDeployConfig{Enabled: true, MinIntervalMinutes: 1},
+		},
+		notifier:          &notify.Notifier{},
+		selfDeployStartFn: func(prNumber int) error { gotPR = prNumber; return nil },
+	}
+
+	o.maybeSelfDeployAfterMerge(720)
+	if gotPR != 720 {
+		t.Fatalf("trigger called with PR %d, want 720", gotPR)
+	}
+	// The marker advanced to the new trigger.
+	if _, pr, ok := selfdeploy.LastTrigger(stateDir); !ok || pr != 720 {
+		t.Fatalf("marker after fire = (pr %d, ok %v), want (720, true)", pr, ok)
 	}
 }
 

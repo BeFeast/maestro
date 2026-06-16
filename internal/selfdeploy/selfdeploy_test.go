@@ -57,6 +57,55 @@ func TestReadResultMalformed(t *testing.T) {
 	}
 }
 
+// #722: the trigger marker round-trips through the state dir so a restarted
+// orchestrator can debounce re-triggers.
+func TestRecordAndReadLastTrigger(t *testing.T) {
+	dir := t.TempDir()
+
+	// No marker yet → not ok.
+	if _, _, ok := LastTrigger(dir); ok {
+		t.Fatal("LastTrigger ok=true with no marker")
+	}
+
+	when := time.Date(2026, 6, 16, 15, 1, 39, 0, time.UTC)
+	if err := RecordTrigger(dir, 722, when); err != nil {
+		t.Fatalf("RecordTrigger: %v", err)
+	}
+	got, pr, ok := LastTrigger(dir)
+	if !ok {
+		t.Fatal("LastTrigger ok=false after RecordTrigger")
+	}
+	if !got.Equal(when) {
+		t.Errorf("LastTrigger time = %s, want %s", got, when)
+	}
+	if pr != 722 {
+		t.Errorf("LastTrigger pr = %d, want 722", pr)
+	}
+}
+
+// A blank state dir is a no-op (no marker written, nothing read) so callers
+// without a state dir don't scribble in the working directory.
+func TestTriggerMarkerBlankStateDir(t *testing.T) {
+	if err := RecordTrigger("", 1, time.Now().UTC()); err != nil {
+		t.Fatalf("RecordTrigger(\"\"): %v", err)
+	}
+	if _, _, ok := LastTrigger(""); ok {
+		t.Fatal("LastTrigger(\"\") ok=true, want false")
+	}
+}
+
+// A malformed marker fails open (ok=false) so a corrupt file never wedges
+// deploys forever.
+func TestLastTriggerMalformed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(triggerMarkerPath(dir), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := LastTrigger(dir); ok {
+		t.Fatal("LastTrigger ok=true for malformed marker")
+	}
+}
+
 func triggerTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	local := t.TempDir()
