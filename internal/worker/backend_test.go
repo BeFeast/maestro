@@ -650,6 +650,13 @@ func TestSplitCmd(t *testing.T) {
 		// tabs are valid field separators, just like spaces
 		{"claude\t--model\topus", "claude", []string{"--model", "opus"}},
 		{"", "", nil},
+		// strings.Fields collapses runs of whitespace, so multiple
+		// consecutive spaces between tokens yield no empty args.
+		{"claude   --model   opus", "claude", []string{"--model", "opus"}},
+		// Leading and trailing whitespace is trimmed away entirely.
+		{"  claude --model opus  ", "claude", []string{"--model", "opus"}},
+		// Tabs are whitespace too and act as token separators.
+		{"claude\t--model\topus", "claude", []string{"--model", "opus"}},
 	}
 	for _, tt := range tests {
 		binary, args := splitCmd(tt.input)
