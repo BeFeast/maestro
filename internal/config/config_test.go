@@ -1712,6 +1712,81 @@ model:
 	}
 }
 
+// #727: every entry in model.fallback_backends must reference a backend
+// declared in model.backends; a typo used to load cleanly and only
+// surface as a runtime warning in the router/worker. Fail fast at parse.
+func TestParse_FallbackBackendsMustBeDefined(t *testing.T) {
+	cases := []struct {
+		name     string
+		yaml     string
+		wantErr  bool
+		wantSubs []string // required substrings in the error message
+	}{
+		{
+			name: "dangling fallback rejected",
+			yaml: `
+repo: owner/repo
+model:
+  default: claude
+  fallback_backends: [codex, opencodee]
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+`,
+			wantErr:  true,
+			wantSubs: []string{"fallback_backends", "opencodee", "model.backends"},
+		},
+		{
+			name: "valid fallback accepted",
+			yaml: `
+repo: owner/repo
+model:
+  default: claude
+  fallback_backends: [codex, opencode]
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+    opencode:
+      cmd: opencode
+`,
+			wantErr: false,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parse([]byte(tc.yaml))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected parse error, got nil; cfg=%+v", cfg)
+				}
+				for _, want := range tc.wantSubs {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error = %q, want substring %q", err.Error(), want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			want := []string{"codex", "opencode"}
+			if len(cfg.Model.FallbackBackends) != len(want) {
+				t.Fatalf("FallbackBackends = %v, want %v", cfg.Model.FallbackBackends, want)
+			}
+			for i, fb := range cfg.Model.FallbackBackends {
+				if fb != want[i] {
+					t.Errorf("FallbackBackends[%d] = %q, want %q", i, fb, want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestParse_MaxConcurrentByStateDefault(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
