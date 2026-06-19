@@ -604,6 +604,13 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	if sess == nil {
 		return false
 	}
+	// #730: Pi-backed sessions stream a newline-delimited JSON event
+	// stream that carries provider/model + usage + cost. Parse it
+	// directly so model/tokens/cost_usd get attributed instead of the
+	// generic token regex (which sees none of the JSON shapes).
+	if o.backendKindForSession(sess) == config.BackendKindPi {
+		return o.updatePiUsageFromOutput(slotName, sess, output)
+	}
 	tokens := worker.ParseTokensFromOutput(output)
 	if tokens <= sess.TokensUsedAttempt {
 		return false
@@ -613,6 +620,55 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	sess.TokensUsedTotal += delta
 	log.Printf("[orch] %s tokens_used updated: attempt=%d total=%d", slotName, tokens, sess.TokensUsedTotal)
 	return true
+}
+
+// updatePiUsageFromOutput parses a Pi --mode json event stream from the
+// worker log and stamps model/tokens/cost_usd onto the session. Tokens use
+// the run-total (sum across turns); model is the provider-reported model;
+// cost is Pi's self-reported cost.total. Returns true when anything changed.
+func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Session, output string) bool {
+	usage, ok := worker.ParsePiUsage(output)
+	if !ok {
+		return false
+	}
+	changed := false
+	if usage.TotalTokens > sess.TokensUsedAttempt {
+		delta := usage.TotalTokens - sess.TokensUsedAttempt
+		sess.TokensUsedAttempt = usage.TotalTokens
+		sess.TokensUsedTotal += delta
+		changed = true
+	}
+	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
+		sess.Model = usage.Model
+		changed = true
+	}
+	if usage.CostUSD > 0 && sess.CostUSDBackend == 0 {
+		sess.CostUSDBackend = usage.CostUSD
+		changed = true
+	}
+	if changed {
+		log.Printf("[orch] %s pi usage: model=%s tokens=%d cost=$%.4f (total=%d)",
+			slotName, usage.Model, usage.TotalTokens, usage.CostUSD, sess.TokensUsedTotal)
+	}
+	return changed
+}
+
+// backendKindForSession resolves the CLI exec-path kind for a session's
+// backend from the configured backend def, so Pi (and other provider-mapped
+// backends) get their first-class usage parser instead of the generic one.
+func (o *Orchestrator) backendKindForSession(sess *state.Session) string {
+	if sess == nil {
+		return ""
+	}
+	name := strings.TrimSpace(sess.Backend)
+	var provider, cmd string
+	if o != nil && o.cfg != nil {
+		if def, ok := o.cfg.Model.Backends[name]; ok {
+			provider = def.Provider
+			cmd = def.Cmd
+		}
+	}
+	return config.ResolveBackendKind(name, provider, cmd)
 }
 
 func (o *Orchestrator) updateTokensUsedFromWorkerLog(slotName string, sess *state.Session) bool {

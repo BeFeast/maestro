@@ -132,18 +132,24 @@ const (
 )
 
 type Session struct {
-	IssueNumber                 int               `json:"issue_number"`
-	IssueTitle                  string            `json:"issue_title"`
-	Worktree                    string            `json:"worktree"`
-	Branch                      string            `json:"branch"`
-	PID                         int               `json:"pid"`
-	TmuxSession                 string            `json:"tmux_session,omitempty"`
-	LogFile                     string            `json:"log_file"`
-	StartedAt                   time.Time         `json:"started_at"`
-	FinishedAt                  *time.Time        `json:"finished_at,omitempty"`
-	Status                      SessionStatus     `json:"status"`
-	PRNumber                    int               `json:"pr_number,omitempty"`
-	Backend                     string            `json:"backend,omitempty"` // "claude", "codex", etc.
+	IssueNumber int           `json:"issue_number"`
+	IssueTitle  string        `json:"issue_title"`
+	Worktree    string        `json:"worktree"`
+	Branch      string        `json:"branch"`
+	PID         int           `json:"pid"`
+	TmuxSession string        `json:"tmux_session,omitempty"`
+	LogFile     string        `json:"log_file"`
+	StartedAt   time.Time     `json:"started_at"`
+	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
+	Status      SessionStatus `json:"status"`
+	PRNumber    int           `json:"pr_number,omitempty"`
+	Backend     string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	// #730: model + self-reported cost captured from the backend's own
+	// usage stream (Pi --mode json event stream). Empty/zero for backends
+	// that do not self-report; the fleet cost panel then falls back to the
+	// configured per-backend pricing estimate.
+	Model                       string            `json:"model,omitempty"`            // model the backend reported for this run (e.g. glm-5.2:cloud)
+	CostUSDBackend              float64           `json:"cost_usd_backend,omitempty"` // USD cost the backend self-reported (Pi cost.total)
 	LongRunning                 bool              `json:"long_running,omitempty"`
 	RebaseAttempted             bool              `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail              bool              `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus

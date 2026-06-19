@@ -761,6 +761,9 @@ type fleetWorkerState struct {
 	NeedsAttention bool   `json:"needs_attention,omitempty"`
 	Live           bool   `json:"live"`
 	Backend        string `json:"backend,omitempty"`
+	// #730: model the backend self-reported for this run (Pi --mode json).
+	// Empty for backends that do not self-report a model.
+	Model string `json:"model,omitempty"`
 	// BackendSelection records why this backend was chosen (label, role, auto,
 	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
@@ -770,10 +773,15 @@ type fleetWorkerState struct {
 	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
 	TokensUsedTotal   int                     `json:"tokens_used_total"`
 	// CostUSDEstimate is the $ estimate for TokensUsedTotal under the
-	// project's configured per-backend pricing (#619). 0 when no
-	// pricing is set for the backend; the SPA renders that as tokens
-	// only without computing pricing client-side.
+	// project's configured per-backend pricing (#619), OR the backend's
+	// self-reported cost when present (#730, Pi --mode json cost.total). 0
+	// when neither is set; the SPA renders that as tokens only without
+	// computing pricing client-side.
 	CostUSDEstimate float64 `json:"cost_usd_estimate,omitempty"`
+	// CostUSDBackend is the USD cost the backend self-reported (#730).
+	// Zero when not reported; surfaced separately from the pricing estimate
+	// so Mission Control can mark the value as backend-reported.
+	CostUSDBackend float64 `json:"cost_usd_backend,omitempty"`
 	// Runtime / RuntimeSeconds (legacy fields, kept for backwards
 	// compatibility) reflect workflow elapsed time and include PR-open /
 	// CI / Greptile / merge waiting. See #426 — WorkerRuntimeSeconds is
@@ -872,7 +880,7 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	pricing := backendPricingMap(project.cfg)
-	infos[0].CostUSDEstimate = applySessionCostEstimate(infos[0].Backend, infos[0].TokensUsedTotal, pricing)
+	infos[0].CostUSDEstimate = sessionCostEstimate(infos[0].Backend, infos[0].TokensUsedTotal, pricing, infos[0].CostUSDBackend)
 	infos[0].Actions = workerActionAffordances(projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
 	worker := makeFleetWorkerState(projectState, infos[0])
 	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)
@@ -3437,12 +3445,14 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		NeedsAttention:         worker.NeedsAttention,
 		Live:                   worker.Live,
 		Backend:                worker.Backend,
+		Model:                  worker.Model,
 		BackendSelection:       worker.BackendSelection,
 		PRNumber:               worker.PRNumber,
 		PRURL:                  worker.PRURL,
 		TokensUsedAttempt:      worker.TokensUsedAttempt,
 		TokensUsedTotal:        worker.TokensUsedTotal,
 		CostUSDEstimate:        worker.CostUSDEstimate,
+		CostUSDBackend:         worker.CostUSDBackend,
 		Runtime:                worker.Runtime,
 		RuntimeSeconds:         worker.RuntimeSeconds,
 		WorkerRuntime:          worker.WorkerRuntime,

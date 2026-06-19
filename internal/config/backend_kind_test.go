@@ -24,6 +24,9 @@ func TestResolveBackendKind(t *testing.T) {
 		{"fast", "openai", "codex --profile fast", BackendKindCodex},
 		{"flash", "google", "gemini", BackendKindGemini},
 		{"wrapped", "cline", "cline", BackendKindCline},
+		// #730: provider pi / ollama resolves to the first-class pi backend.
+		{"pi-ollama", "ollama", "pi", BackendKindPi},
+		{"picustom", "pi", "my-pi-shim", BackendKindPi},
 		// Provider matching is case/whitespace-insensitive.
 		{"fable", " Anthropic ", "", BackendKindClaude},
 		// Provider wins over a conflicting cmd binary.
@@ -32,6 +35,7 @@ func TestResolveBackendKind(t *testing.T) {
 		{"mymodel", "", "/usr/local/bin/claude --model opus", BackendKindClaude},
 		{"mymodel", "", "codex --flag", BackendKindCodex},
 		{"mymodel", "groq", "gemini", BackendKindGemini},
+		{"picli", "", "/usr/local/bin/pi", BackendKindPi},
 		// 4. Everything else is generic.
 		{"helper", "groq", "groq-cli", BackendKindGeneric},
 		{"custom", "", "my-cli --verbose", BackendKindGeneric},
@@ -85,6 +89,24 @@ func TestConfig_Warnings_CustomBackendProviderResolvedNoWarning(t *testing.T) {
 	for _, msg := range cfg.Warnings() {
 		if strings.Contains(msg, "generic exec path") {
 			t.Fatalf("Warnings() = %v, provider/basename-resolved backends should not trigger the generic path warning", cfg.Warnings())
+		}
+	}
+}
+
+// #730: a custom-named pi backend (provider: ollama) keeps the first-class
+// pi exec path — no generic-path warning.
+func TestConfig_Warnings_PiBackendNoGenericWarning(t *testing.T) {
+	cfg := &Config{
+		Model: ModelConfig{
+			Default: "pi-ollama",
+			Backends: map[string]BackendDef{
+				"pi-ollama": {Provider: "ollama", Cmd: "pi", Model: "glm-5.2:cloud"},
+			},
+		},
+	}
+	for _, msg := range cfg.Warnings() {
+		if strings.Contains(msg, "generic exec path") {
+			t.Fatalf("Warnings() = %v, pi backend should not trigger the generic path warning", cfg.Warnings())
 		}
 	}
 }

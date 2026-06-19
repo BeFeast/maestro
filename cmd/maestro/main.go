@@ -2355,25 +2355,32 @@ func historyCmd(args []string) {
 
 	if *jsonOutput {
 		type jsonEntry struct {
-			Session    string `json:"session"`
-			Issue      int    `json:"issue"`
-			Title      string `json:"title"`
-			Status     string `json:"status"`
-			PRNumber   int    `json:"pr_number,omitempty"`
-			Duration   string `json:"duration"`
-			FinishedAt string `json:"finished_at,omitempty"`
-			Backend    string `json:"backend,omitempty"`
+			Session         string  `json:"session"`
+			Issue           int     `json:"issue"`
+			Title           string  `json:"title"`
+			Status          string  `json:"status"`
+			PRNumber        int     `json:"pr_number,omitempty"`
+			Duration        string  `json:"duration"`
+			FinishedAt      string  `json:"finished_at,omitempty"`
+			Backend         string  `json:"backend,omitempty"`
+			Model           string  `json:"model,omitempty"`
+			TokensUsedTotal int     `json:"tokens_used_total,omitempty"`
+			CostUSDEstimate float64 `json:"cost_usd_estimate,omitempty"`
 		}
 		entries := make([]jsonEntry, 0, len(completed))
 		for _, c := range completed {
+			sess := c.Session
 			entry := jsonEntry{
-				Session:  c.SlotName,
-				Issue:    c.IssueNumber,
-				Title:    c.IssueTitle,
-				Status:   string(c.Status),
-				PRNumber: c.PRNumber,
-				Duration: sessionDuration(c.Session),
-				Backend:  c.Backend,
+				Session:         c.SlotName,
+				Issue:           c.IssueNumber,
+				Title:           c.IssueTitle,
+				Status:          string(c.Status),
+				PRNumber:        c.PRNumber,
+				Duration:        sessionDuration(sess),
+				Backend:         c.Backend,
+				Model:           sess.Model,
+				TokensUsedTotal: sess.TokensUsedTotal,
+				CostUSDEstimate: server.SessionCostEstimate(cfg, c.Backend, sess.TokensUsedTotal, sess.CostUSDBackend),
 			}
 			if c.FinishedAt != nil {
 				entry.FinishedAt = c.FinishedAt.Format(time.RFC3339)
