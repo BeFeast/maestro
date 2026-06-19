@@ -147,9 +147,9 @@ func ParsePiUsage(text string) (PiUsage, bool) {
 	return out, seen
 }
 
-func nonEmpty(preferred, candidate string) string {
+func nonEmpty(fallback, candidate string) string {
 	if strings.TrimSpace(candidate) == "" {
-		return preferred
+		return fallback
 	}
 	return candidate
 }
