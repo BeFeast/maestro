@@ -53,12 +53,17 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
 
+	// #734: sync the local base branch to origin so the worker branches from an
+	// up-to-date base, then root the worktree directly at origin/main. A stale
+	// or diverged base fails loudly here rather than silently branching from it.
+	if err := SyncBaseBranch(cfg.LocalPath, defaultBaseBranch); err != nil {
+		return "", fmt.Errorf("sync base branch before spawning worker: %w", err)
+	}
+
 	// Create worktree
 	log.Printf("[worker] creating worktree %s on branch %s", worktreePath, branchName)
-	out, err := exec.Command("git", "-C", cfg.LocalPath,
-		"worktree", "add", worktreePath, "-b", branchName).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("git worktree add: %w\n%s", err, out)
+	if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
+		return "", err
 	}
 
 	// Run after_create hook
@@ -205,11 +210,15 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
 
+	// #734: sync the local base branch to origin and root the worktree directly
+	// at origin/main so the respawned worker branches from an up-to-date base.
+	if err := SyncBaseBranch(cfg.LocalPath, defaultBaseBranch); err != nil {
+		return fmt.Errorf("sync base branch before respawning worker: %w", err)
+	}
+
 	log.Printf("[worker] respawn: creating worktree %s on branch %s", worktreePath, branchName)
-	out, err := exec.Command("git", "-C", cfg.LocalPath,
-		"worktree", "add", worktreePath, "-b", branchName).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git worktree add: %w\n%s", err, out)
+	if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
+		return err
 	}
 
 	// Run after_create hook
