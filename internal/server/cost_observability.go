@@ -388,3 +388,22 @@ func applySessionCostEstimate(backend string, tokens int, pricing map[string]con
 	}
 	return p.EstimateCostUSD(tokens)
 }
+
+// sessionCostEstimate returns the USD cost to surface for a session. It
+// prefers the backend's self-reported cost (Pi --mode json cost.total,
+// #730) and falls back to the per-backend pricing estimate (#619) when the
+// backend did not report a cost. Zero when neither is available.
+func sessionCostEstimate(backend string, tokens int, pricing map[string]config.BackendPricing, backendCost float64) float64 {
+	if backendCost > 0 {
+		return backendCost
+	}
+	return applySessionCostEstimate(backend, tokens, pricing)
+}
+
+// SessionCostEstimate is the exported form used by cmd/maestro (history
+// --json) so the CLI does not need to rebuild the pricing map logic. It
+// prefers the backend's self-reported cost and falls back to the configured
+// per-backend pricing estimate.
+func SessionCostEstimate(cfg *config.Config, backend string, tokens int, backendCost float64) float64 {
+	return sessionCostEstimate(backend, tokens, backendPricingMap(cfg), backendCost)
+}

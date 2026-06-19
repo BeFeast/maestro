@@ -896,7 +896,7 @@ func TestBuildSupervisorCmd_CustomNameProviderAnthropic(t *testing.T) {
 
 func TestKnownBackends(t *testing.T) {
 	backends := KnownBackends()
-	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false}
+	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false, "pi": false}
 	for _, name := range backends {
 		if _, ok := expected[name]; ok {
 			expected[name] = true
@@ -906,5 +906,127 @@ func TestKnownBackends(t *testing.T) {
 		if !found {
 			t.Errorf("expected %q in KnownBackends(), got: %v", name, backends)
 		}
+	}
+}
+
+// #730: the Pi backend runs headless in JSON event-stream mode with the
+// prompt delivered via stdin (-p with no prompt argument) so a large worker
+// prompt never hits the Linux MAX_ARG_STRLEN single-argument limit.
+func TestBuildWorkerCmd_Pi(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("implement the issue"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/pi-worktree"
+
+	cfg := BackendConfig{Cmd: "pi", Provider: "ollama", Model: "glm-5.2:cloud", ExtraArgs: []string{"--verbose"}}
+	cmd, stdinFile, err := BuildWorkerCmd("pi", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q (Pi -p reads prompt from stdin)", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	for _, want := range []string{"--mode json", "--no-session", "--provider ollama", "--model glm-5.2:cloud", "--tools", "-p", "--verbose"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("expected %q in args, got: %s", want, args)
+		}
+	}
+	if strings.Contains(args, "implement the issue") {
+		t.Errorf("prompt content must not appear in argv (stdin delivery): %s", args)
+	}
+	// -p must be the last token so extra_args flags stay flags.
+	if cmd.Args[len(cmd.Args)-1] != "-p" {
+		t.Errorf("expected -p as last arg, got: %v", cmd.Args)
+	}
+	if cmd.Dir != worktree {
+		t.Errorf("expected Dir=%s, got %s", worktree, cmd.Dir)
+	}
+}
+
+// #730: a large Pi prompt is delivered via stdin, never as an argument.
+func TestBuildWorkerCmd_PiLargePromptViaStdin(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	largePrompt := strings.Repeat("PI_PROMPT_PAYLOAD\n", (1<<20)/16+16)
+	if err := os.WriteFile(promptFile, []byte(largePrompt), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := BackendConfig{Cmd: "pi", Provider: "ollama", Model: "glm-5.2:cloud"}
+	cmd, stdinFile, err := BuildWorkerCmd("pi", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for i, a := range cmd.Args {
+		if strings.Contains(a, "PI_PROMPT_PAYLOAD") {
+			t.Fatalf("prompt content leaked into argv at index %d (E2BIG risk): %s", i, a)
+		}
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+}
+
+// #730: a custom-named Pi backend resolves via provider: ollama to the pi
+// exec path, mirroring the claude/codex custom-name behaviour from #684.
+func TestBuildWorkerCmd_CustomNameProviderOllama(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("do the thing"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := BackendConfig{Cmd: "pi", Provider: "ollama", Model: "glm-5.2:cloud"}
+	cmd, stdinFile, err := BuildWorkerCmd("pi-ollama", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args := strings.Join(cmd.Args, " ")
+	if !strings.Contains(args, "--mode json") || !strings.Contains(args, "--provider ollama") {
+		t.Errorf("expected pi json+provider args, got: %s", args)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	direct, _, err := BuildWorkerCmd("pi", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error building pi-key cmd: %v", err)
+	}
+	if !reflect.DeepEqual(cmd.Args, direct.Args) {
+		t.Errorf("custom-name args = %v, want same as pi-key args %v", cmd.Args, direct.Args)
+	}
+}
+
+// #730: the Pi supervisor command runs read-only (--no-tools) and delivers
+// the prompt via stdin, never via argv, and never with worker bypass flags.
+func TestBuildSupervisorCmd_PiReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("decide safely"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := BackendConfig{Cmd: "pi", Provider: "ollama", Model: "glm-5.2:cloud"}
+	cmd, stdinFile, err := BuildSupervisorCmd("pi", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Errorf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	for _, want := range []string{"--mode json", "--no-session", "--provider ollama", "--model glm-5.2:cloud", "--no-tools", "-p"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("expected %q in args, got: %s", want, args)
+		}
+	}
+	if strings.Contains(args, "decide safely") {
+		t.Errorf("prompt content must not appear in argv (stdin delivery): %s", args)
+	}
+	if strings.Contains(args, "dangerously") || strings.Contains(args, "bypass") {
+		t.Errorf("supervisor command should not include worker permission bypass flags: %s", args)
+	}
+	if cmd.Args[len(cmd.Args)-1] != "-p" {
+		t.Errorf("expected -p as last arg, got: %v", cmd.Args)
 	}
 }

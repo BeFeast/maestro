@@ -108,6 +108,8 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
 		Provider:   backendDef.Provider,
+		Model:      backendDef.Model,
+		Effort:     backendDef.Effort,
 		MCP:        backendDef.MCP,
 	}
 
@@ -256,6 +258,8 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
 		Provider:   backendDef.Provider,
+		Model:      backendDef.Model,
+		Effort:     backendDef.Effort,
 		MCP:        backendDef.MCP,
 	}
 
