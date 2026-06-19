@@ -643,6 +643,12 @@ func TestSplitCmd(t *testing.T) {
 		{"claude --model claude-opus-4-6", "claude", []string{"--model", "claude-opus-4-6"}},
 		{"/usr/local/bin/codex --flag", "/usr/local/bin/codex", []string{"--flag"}},
 		{"  gemini  --fast  ", "gemini", []string{"--fast"}},
+		// multiple consecutive spaces between tokens collapse per strings.Fields
+		{"claude   --model   opus", "claude", []string{"--model", "opus"}},
+		// leading and trailing whitespace around a multi-token command is stripped
+		{"  claude --model opus  ", "claude", []string{"--model", "opus"}},
+		// tabs are valid field separators, just like spaces
+		{"claude\t--model\topus", "claude", []string{"--model", "opus"}},
 		{"", "", nil},
 	}
 	for _, tt := range tests {
