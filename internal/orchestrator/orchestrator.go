@@ -632,9 +632,17 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 		return false
 	}
 	changed := false
-	if usage.TotalTokens > sess.TokensUsedAttempt {
-		delta := usage.TotalTokens - sess.TokensUsedAttempt
-		sess.TokensUsedAttempt = usage.TotalTokens
+	// #730: Pi re-parses the full appended slot log on each call, so
+	// usage.TotalTokens is the cumulative run total across every attempt.
+	// On a respawn, the runner keeps appending to the same slot log while
+	// TokensUsedAttempt resets to 0 — comparing against TokensUsedAttempt
+	// would re-add the prior attempts' tokens. Use a separate monotonic
+	// watermark (PiTokensWatermark) that persists across respawns so only
+	// the new attempt's tokens are counted.
+	if usage.TotalTokens > sess.PiTokensWatermark {
+		delta := usage.TotalTokens - sess.PiTokensWatermark
+		sess.PiTokensWatermark = usage.TotalTokens
+		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
 		changed = true
 	}
@@ -642,7 +650,10 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 		sess.Model = usage.Model
 		changed = true
 	}
-	if usage.CostUSD > 0 && sess.CostUSDBackend == 0 {
+	// #730: cost uses the same monotonic watermark as tokens — the full-log
+	// parse returns the cumulative run cost, so guard with `>` instead of a
+	// first-non-zero freeze (which would never update after the first turn).
+	if usage.CostUSD > sess.CostUSDBackend {
 		sess.CostUSDBackend = usage.CostUSD
 		changed = true
 	}

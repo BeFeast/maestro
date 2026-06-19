@@ -148,8 +148,9 @@ type Session struct {
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
 	// configured per-backend pricing estimate.
-	Model                       string            `json:"model,omitempty"`            // model the backend reported for this run (e.g. glm-5.2:cloud)
-	CostUSDBackend              float64           `json:"cost_usd_backend,omitempty"` // USD cost the backend self-reported (Pi cost.total)
+	Model                       string            `json:"model,omitempty"`               // model the backend reported for this run (e.g. glm-5.2:cloud)
+	CostUSDBackend              float64           `json:"cost_usd_backend,omitempty"`    // USD cost the backend self-reported (Pi cost.total)
+	PiTokensWatermark           int               `json:"pi_tokens_watermark,omitempty"` // #730: high-water mark of the Pi full-log cumulative token count; persists across respawns so re-parsing the appended log does not double-count prior attempts
 	LongRunning                 bool              `json:"long_running,omitempty"`
 	RebaseAttempted             bool              `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail              bool              `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
