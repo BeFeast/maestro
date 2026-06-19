@@ -17,6 +17,7 @@ const (
 	BackendKindCodex   = "codex"
 	BackendKindGemini  = "gemini"
 	BackendKindCline   = "cline"
+	BackendKindPi      = "pi"
 	BackendKindGeneric = "generic"
 )
 
@@ -32,6 +33,8 @@ var providerBackendKinds = map[string]string{
 	"google":    BackendKindGemini,
 	"gemini":    BackendKindGemini,
 	"cline":     BackendKindCline,
+	"pi":        BackendKindPi,
+	"ollama":    BackendKindPi,
 }
 
 // ResolveBackendKind decides which CLI-specific exec path a backend uses.
@@ -48,7 +51,7 @@ var providerBackendKinds = map[string]string{
 // mutating tool call was denied by the CLI's permission layer (sup-175).
 func ResolveBackendKind(name, provider, cmd string) string {
 	switch name {
-	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline:
+	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi:
 		return name
 	}
 	if kind, ok := providerBackendKinds[strings.ToLower(strings.TrimSpace(provider))]; ok {
@@ -68,7 +71,7 @@ func backendKindFromCmd(cmd string) string {
 		return ""
 	}
 	switch base := filepath.Base(fields[0]); base {
-	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline:
+	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi:
 		return base
 	}
 	return ""
@@ -100,7 +103,7 @@ func (c *Config) backendResolutionWarnings() []string {
 		kind := ResolveBackendKind(name, def.Provider, def.Cmd)
 		if kind == BackendKindGeneric {
 			warnings = append(warnings, fmt.Sprintf(
-				"config: backend %q resolves to the generic exec path (provider %q and cmd %q match no known CLI) — workers run without a permission-bypass flag (mutating tool calls may be denied) and the prompt is delivered per prompt_mode=%q (argv delivery risks E2BIG on large prompts). If this wraps a known CLI, set provider: anthropic|openai|google|cline or use a claude/codex/gemini/cline binary in cmd.",
+				"config: backend %q resolves to the generic exec path (provider %q and cmd %q match no known CLI) — workers run without a permission-bypass flag (mutating tool calls may be denied) and the prompt is delivered per prompt_mode=%q (argv delivery risks E2BIG on large prompts). If this wraps a known CLI, set provider: anthropic|openai|google|cline|pi|ollama or use a claude/codex/gemini/cline/pi binary in cmd.",
 				name, def.Provider, def.Cmd, coalescePromptMode(def.PromptMode)))
 			continue
 		}

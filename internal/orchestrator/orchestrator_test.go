@@ -9529,3 +9529,71 @@ func TestAutoMergePRs_NoPRRetryExhaustedHasMergedPRErrorDefersReconcile(t *testi
 		t.Fatalf("transient probe failure must not mark reconciled; LastNotifiedStatus=%q", sess.LastNotifiedStatus)
 	}
 }
+
+// #730: a Pi-backed session's JSON event stream is parsed for usage, and the
+// orchestrator stamps model/tokens/cost_usd onto the session instead of the
+// generic token regex (which sees none of the JSON shapes).
+func TestUpdateTokensUsedFromOutput_PiBackendStampsModelTokensCost(t *testing.T) {
+	const piLog = `{"type":"session","version":3,"id":"abc"}
+{"type":"turn_end","message":{"role":"assistant","provider":"ollama","model":"glm-5.2:cloud","usage":{"input":770,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":773,"cost":{"input":0.001078,"output":0.0000132,"total":0.0010912}}},"toolResults":[]}
+`
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: t.TempDir(),
+			Model: config.ModelConfig{
+				Default: "pi-ollama",
+				Backends: map[string]config.BackendDef{
+					"pi-ollama": {Provider: "ollama", Cmd: "pi", Model: "glm-5.2:cloud"},
+				},
+			},
+		},
+	}
+	sess := &state.Session{Backend: "pi-ollama"}
+
+	changed := o.updateTokensUsedFromOutput("sup-730", sess, piLog)
+	if !changed {
+		t.Fatal("expected updateTokensUsedFromOutput to report a change for the Pi event stream")
+	}
+	if sess.TokensUsedAttempt != 773 {
+		t.Errorf("TokensUsedAttempt = %d, want 773", sess.TokensUsedAttempt)
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Errorf("TokensUsedTotal = %d, want 773", sess.TokensUsedTotal)
+	}
+	if sess.Model != "glm-5.2:cloud" {
+		t.Errorf("Model = %q, want glm-5.2:cloud", sess.Model)
+	}
+	if sess.CostUSDBackend < 0.0010911 || sess.CostUSDBackend > 0.0010913 {
+		t.Errorf("CostUSDBackend = %v, want ~0.0010912", sess.CostUSDBackend)
+	}
+}
+
+// #730: a non-Pi backend (claude/codex) keeps the generic token parser — the
+// Pi usage path must not engage just because the log happens to contain JSON.
+func TestUpdateTokensUsedFromOutput_ClaudeBackendKeepsGenericParser(t *testing.T) {
+	const claudeLog = "worker output\n\ntokens used\n100,965\nImplemented and opened PR\n"
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Model: config.ModelConfig{
+				Default: "claude",
+				Backends: map[string]config.BackendDef{
+					"claude": {Cmd: "claude"},
+				},
+			},
+		},
+	}
+	sess := &state.Session{Backend: "claude"}
+	changed := o.updateTokensUsedFromOutput("sup-150", sess, claudeLog)
+	if !changed {
+		t.Fatal("expected generic parser to capture tokens")
+	}
+	if sess.TokensUsedAttempt != 100965 {
+		t.Errorf("TokensUsedAttempt = %d, want 100965", sess.TokensUsedAttempt)
+	}
+	if sess.Model != "" {
+		t.Errorf("Model = %q, want empty (claude does not self-report a model here)", sess.Model)
+	}
+	if sess.CostUSDBackend != 0 {
+		t.Errorf("CostUSDBackend = %v, want 0", sess.CostUSDBackend)
+	}
+}

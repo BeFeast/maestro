@@ -276,27 +276,34 @@ type controlActionRequest struct {
 }
 
 type sessionInfo struct {
-	Slot              string `json:"slot"`
-	IssueNumber       int    `json:"issue_number"`
-	IssueTitle        string `json:"issue_title"`
-	IssueURL          string `json:"issue_url,omitempty"`
-	Status            string `json:"status"`
-	DisplayStatus     string `json:"display_status,omitempty"`
-	StatusReason      string `json:"status_reason,omitempty"`
-	NextAction        string `json:"next_action,omitempty"`
-	NeedsAttention    bool   `json:"needs_attention,omitempty"`
-	Live              bool   `json:"live"`
-	Backend           string `json:"backend,omitempty"`
+	Slot           string `json:"slot"`
+	IssueNumber    int    `json:"issue_number"`
+	IssueTitle     string `json:"issue_title"`
+	IssueURL       string `json:"issue_url,omitempty"`
+	Status         string `json:"status"`
+	DisplayStatus  string `json:"display_status,omitempty"`
+	StatusReason   string `json:"status_reason,omitempty"`
+	NextAction     string `json:"next_action,omitempty"`
+	NeedsAttention bool   `json:"needs_attention,omitempty"`
+	Live           bool   `json:"live"`
+	Backend        string `json:"backend,omitempty"`
+	// #730: model the backend self-reported for this run (Pi --mode json).
+	// Empty for backends that do not self-report a model.
+	Model             string `json:"model,omitempty"`
 	PRNumber          int    `json:"pr_number,omitempty"`
 	PRURL             string `json:"pr_url,omitempty"`
 	TokensUsedAttempt int    `json:"tokens_used_attempt"`
 	TokensUsedTotal   int    `json:"tokens_used_total"`
 	// CostUSDEstimate is the $ estimate for this session's
-	// TokensUsedTotal under the configured per-backend pricing (#619).
-	// Zero when no pricing is configured for the backend or when the
-	// token count is zero. The SPA reads this directly so it never
-	// computes pricing client-side.
+	// TokensUsedTotal under the configured per-backend pricing (#619),
+	// OR the backend's self-reported cost when present (#730, Pi
+	// --mode json cost.total). Zero when neither is available. The SPA
+	// reads this directly so it never computes pricing client-side.
 	CostUSDEstimate float64 `json:"cost_usd_estimate,omitempty"`
+	// CostUSDBackend is the USD cost the backend self-reported (#730).
+	// Surfaced separately so Mission Control can show "reported by
+	// backend" vs the pricing-block estimate. Zero when not reported.
+	CostUSDBackend float64 `json:"cost_usd_backend,omitempty"`
 	// Runtime / RuntimeSeconds (legacy fields, kept for backwards
 	// compatibility) reflect WORKFLOW elapsed time — StartedAt to
 	// FinishedAt — including PR-open / CI / Greptile / merge waiting.
@@ -342,10 +349,12 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		IssueURL:          githubIssueURL(repo, sess.IssueNumber),
 		Status:            string(sess.Status),
 		Backend:           sess.Backend,
+		Model:             sess.Model,
 		PRNumber:          sess.PRNumber,
 		PRURL:             githubPRURL(repo, sess.PRNumber),
 		TokensUsedAttempt: sess.TokensUsedAttempt,
 		TokensUsedTotal:   sess.TokensUsedTotal,
+		CostUSDBackend:    sess.CostUSDBackend,
 		StartedAt:         sess.StartedAt.Format(time.RFC3339),
 		Worktree:          sess.Worktree,
 		Branch:            sess.Branch,
@@ -965,7 +974,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 	pricing := backendPricingMap(cfg)
 	var activeTokens, totalTokens int
 	for _, info := range sessionInfosWithActions(cfg.Repo, st, cfg.Server.ReadOnly, "/api/v1/actions") {
-		info.CostUSDEstimate = applySessionCostEstimate(info.Backend, info.TokensUsedTotal, pricing)
+		info.CostUSDEstimate = sessionCostEstimate(info.Backend, info.TokensUsedTotal, pricing, info.CostUSDBackend)
 		resp.All = append(resp.All, info)
 		summaryStatus := info.Status
 		if info.DisplayStatus != "" {

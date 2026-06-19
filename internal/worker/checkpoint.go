@@ -125,6 +125,8 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		ExtraArgs:  backendDef.ExtraArgs,
 		PromptMode: backendDef.PromptMode,
 		Provider:   backendDef.Provider,
+		Model:      backendDef.Model,
+		Effort:     backendDef.Effort,
 		MCP:        backendDef.MCP,
 	}
 

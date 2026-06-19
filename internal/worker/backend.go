@@ -47,6 +47,7 @@ var knownBackends = map[string]Backend{
 	"cline":  clineBackend{},
 	"codex":  codexBackend{},
 	"gemini": geminiBackend{},
+	"pi":     piBackend{},
 }
 
 // --- Claude Backend ---
@@ -122,6 +123,56 @@ func (geminiBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	return cmd, "", nil
+}
+
+// --- Pi Backend ---
+
+// piWorkerTools is the default built-in tool allowlist for an autonomous
+// Pi worker run. read/bash/edit/write are on by default in Pi; grep/find/ls
+// are off by default — enable them so the worker can search the worktree.
+// Operators can override the allowlist per-backend via extra_args (a
+// trailing --tools wins) or narrow it there for locked-down runs. #730.
+const piWorkerTools = "read,bash,edit,write,grep,find,ls"
+
+// piBackend runs the Pi coding agent (badlogic/pi-mono) headless in JSON
+// event-stream mode so Maestro can capture provider usage (model/tokens/
+// cost) the way it does for the first-class claude/codex backends. #730.
+//
+// Pi is invoked as: pi --mode json --no-session --provider <provider>
+// --model <model> --tools <allowlist> [extra_args...] -p
+//
+// Print mode (-p) reads the prompt from stdin when no prompt argument is
+// given, mirroring claude -p / codex - and keeping large worker prompts
+// (retries append CI-failure + review context) under the Linux
+// MAX_ARG_STRLEN single-argument limit (128 KiB). The runner script wires
+// promptFile to stdin. The newline-delimited JSON event stream is written
+// to the worker log, where the orchestrator's Pi usage parser aggregates
+// model/tokens/cost from turn_end / agent_end events.
+type piBackend struct{}
+
+func (piBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	piCmd := cfg.Cmd
+	if piCmd == "" {
+		piCmd = "pi"
+	}
+	binary, cmdArgs := splitCmd(piCmd)
+	args := append([]string(nil), cmdArgs...)
+	args = append(args, "--mode", "json", "--no-session")
+	if p := strings.TrimSpace(cfg.Provider); p != "" {
+		args = append(args, "--provider", p)
+	}
+	if m := strings.TrimSpace(cfg.Model); m != "" {
+		args = append(args, "--model", m)
+	}
+	args = append(args, "--tools", piWorkerTools)
+	args = append(args, cfg.ExtraArgs...)
+	// -p with no prompt argument reads the prompt from stdin; keep it last
+	// so extra_args flags stay flags and never shadow the stdin prompt.
+	args = append(args, "-p")
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = worktree
+	// Stdin redirection is handled by the runner script — no file opened here.
+	return cmd, promptFile, nil
 }
 
 // --- Cline Backend ---
@@ -440,6 +491,33 @@ func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, workt
 		cmd := exec.Command(binary, args...)
 		cmd.Dir = worktree
 		return cmd, "", nil
+	case "pi":
+		piCmd := cfg.Cmd
+		if piCmd == "" {
+			piCmd = "pi"
+		}
+		binary, cmdArgs := splitCmd(piCmd)
+		args := append([]string(nil), cmdArgs...)
+		args = append(args, "--mode", "json", "--no-session")
+		if p := strings.TrimSpace(cfg.Provider); p != "" {
+			args = append(args, "--provider", p)
+		}
+		// Supervisor prompts are read-only; run Pi with no mutating tools so a
+		// decision prompt cannot accidentally touch the worktree. -p reads
+		// the prompt from stdin (no prompt argument), keeping supervisor
+		// prompts that embed live PR/issue/review context under the Linux
+		// MAX_ARG_STRLEN single-argument limit. Pi uses --thinking (not
+		// --effort) for reasoning level, so cfg.Effort is intentionally not
+		// mapped here; operators can pass --thinking via extra_args.
+		args = append(args, "--no-tools")
+		args = append(args, cfg.ExtraArgs...)
+		if m := strings.TrimSpace(cfg.Model); m != "" {
+			args = append(args, "--model", m)
+		}
+		args = append(args, "-p")
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, promptFile, nil
 	default:
 		return buildGenericSupervisorCmd(cfg, promptFile, worktree)
 	}
