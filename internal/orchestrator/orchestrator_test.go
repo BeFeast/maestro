@@ -9597,3 +9597,134 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendKeepsGenericParser(t *testing.T
 		t.Errorf("CostUSDBackend = %v, want 0", sess.CostUSDBackend)
 	}
 }
+
+// approxCostEq compares two USD floats with a 1e-9 tolerance (avoids pulling
+// in math just for cost assertions in the Pi usage tests).
+func approxCostEq(a, b float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= 1e-9
+}
+
+// #730/#732: Pi re-parses the full appended slot log on every call, so
+// usage.TotalTokens + CostUSD are cumulative run totals. Cost must keep
+// updating past the first non-zero turn (the old `== 0` freeze would
+// permanently report the first turn's cost) — guard with `>` like tokens.
+func TestUpdateTokensUsedFromOutput_PiBackendCostGrowsPastFirstTurn(t *testing.T) {
+	const turn1 = `{"type":"turn_end","message":{"role":"assistant","provider":"ollama","model":"glm-5.2:cloud","usage":{"input":770,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":773,"cost":{"input":0.001078,"output":0.0000132,"total":0.0010912}}}}
+`
+	// Second parse simulates the appended log now containing two turns:
+	// turn 1 (773 tokens, $0.0010912) + turn 2 (2220 tokens, $0.003168).
+	const turn1And2 = turn1 + `{"type":"turn_end","message":{"role":"assistant","provider":"ollama","model":"glm-5.2:cloud","usage":{"input":2200,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":2220,"cost":{"input":0.00308,"output":0.000088,"total":0.003168}}}}
+`
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: t.TempDir(),
+			Model: config.ModelConfig{
+				Default: "pi-ollama",
+				Backends: map[string]config.BackendDef{
+					"pi-ollama": {Provider: "ollama", Cmd: "pi", Model: "glm-5.2:cloud"},
+				},
+			},
+		},
+	}
+	sess := &state.Session{Backend: "pi-ollama"}
+
+	if !o.updateTokensUsedFromOutput("sup-732", sess, turn1) {
+		t.Fatal("first turn: expected a change")
+	}
+	if sess.TokensUsedAttempt != 773 || sess.TokensUsedTotal != 773 {
+		t.Fatalf("after turn1: attempt=%d total=%d, want 773/773", sess.TokensUsedAttempt, sess.TokensUsedTotal)
+	}
+	if sess.PiTokensWatermark != 773 {
+		t.Errorf("PiTokensWatermark = %d, want 773", sess.PiTokensWatermark)
+	}
+	if !approxCostEq(sess.CostUSDBackend, 0.0010912) {
+		t.Errorf("after turn1: CostUSDBackend = %v, want 0.0010912", sess.CostUSDBackend)
+	}
+
+	// Re-parsing the appended log (cumulative) must update cost past the
+	// first turn instead of freezing at $0.0010912.
+	if !o.updateTokensUsedFromOutput("sup-732", sess, turn1And2) {
+		t.Fatal("second turn: expected a change (cost/tokens must grow)")
+	}
+	wantCost := 0.0010912 + 0.003168
+	if !approxCostEq(sess.CostUSDBackend, wantCost) {
+		t.Errorf("after turn2: CostUSDBackend = %v, want %v (frozen-cost bug)", sess.CostUSDBackend, wantCost)
+	}
+	// Cumulative tokens = 773 + 2220 = 2993; only the delta (2220) is added.
+	if sess.TokensUsedAttempt != 2993 || sess.TokensUsedTotal != 2993 {
+		t.Errorf("after turn2: attempt=%d total=%d, want 2993/2993", sess.TokensUsedAttempt, sess.TokensUsedTotal)
+	}
+	if sess.PiTokensWatermark != 2993 {
+		t.Errorf("PiTokensWatermark = %d, want 2993", sess.PiTokensWatermark)
+	}
+}
+
+// #730/#732: on respawn/checkpoint resume the runner keeps appending to the
+// same slot log, so the full-log parse returns the all-attempt cumulative
+// token count. TokensUsedAttempt resets to 0 but the PiTokensWatermark
+// persists, so only the new attempt's delta is added — the prior attempts'
+// tokens are NOT re-counted into TokensUsedTotal.
+func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
+	// Attempt 1: single turn, 773 tokens. Watermark + total = 773.
+	const attempt1 = `{"type":"turn_end","message":{"role":"assistant","provider":"ollama","model":"glm-5.2:cloud","usage":{"input":770,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":773,"cost":{"total":0.0010912}}}}
+`
+	// Attempt 2: the appended log now carries the original turn (773) plus a
+	// NEW turn (1000 tokens). The full-log parse yields cumulative 1773.
+	const attempt1And2 = attempt1 + `{"type":"turn_end","message":{"role":"assistant","provider":"ollama","model":"glm-5.2:cloud","usage":{"input":900,"output":100,"cacheRead":0,"cacheWrite":0,"totalTokens":1000,"cost":{"total":0.002}}}}
+`
+
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: t.TempDir(),
+			Model: config.ModelConfig{
+				Default: "pi-ollama",
+				Backends: map[string]config.BackendDef{
+					"pi-ollama": {Provider: "ollama", Cmd: "pi", Model: "glm-5.2:cloud"},
+				},
+			},
+		},
+	}
+	sess := &state.Session{Backend: "pi-ollama"}
+
+	if !o.updateTokensUsedFromOutput("sup-732", sess, attempt1) {
+		t.Fatal("attempt1: expected a change")
+	}
+	if sess.TokensUsedTotal != 773 || sess.PiTokensWatermark != 773 || sess.TokensUsedAttempt != 773 {
+		t.Fatalf("attempt1: total=%d wm=%d attempt=%d, want 773/773/773",
+			sess.TokensUsedTotal, sess.PiTokensWatermark, sess.TokensUsedAttempt)
+	}
+
+	// Simulate respawn: per-attempt counter resets to 0 (checkpoint/worker/phase
+	// reset it), but PiTokensWatermark persists across respawns.
+	sess.TokensUsedAttempt = 0
+
+	// Re-parse the SAME appended log (cumulative 773) before the new turn
+	// lands — must NOT re-add the prior attempt's tokens.
+	if o.updateTokensUsedFromOutput("sup-732", sess, attempt1) {
+		t.Fatal("re-parse of unchanged cumulative log must not report a change (would double-count)")
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("after re-parse: TokensUsedTotal = %d, want 773 (no double-count)", sess.TokensUsedTotal)
+	}
+	if sess.TokensUsedAttempt != 0 {
+		t.Errorf("TokensUsedAttempt = %d, want 0 (no delta yet)", sess.TokensUsedAttempt)
+	}
+
+	// New turn lands: cumulative 1773. Only the delta (1000) is added.
+	if !o.updateTokensUsedFromOutput("sup-732", sess, attempt1And2) {
+		t.Fatal("new turn: expected a change")
+	}
+	if sess.TokensUsedTotal != 1773 {
+		t.Errorf("after new turn: TokensUsedTotal = %d, want 1773 (delta only)", sess.TokensUsedTotal)
+	}
+	if sess.TokensUsedAttempt != 1000 {
+		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
+	}
+	if sess.PiTokensWatermark != 1773 {
+		t.Errorf("PiTokensWatermark = %d, want 1773", sess.PiTokensWatermark)
+	}
+}
