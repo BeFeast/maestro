@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1709,6 +1710,87 @@ model:
 	}
 	if cfg.Model.Default != "claude" {
 		t.Fatalf("Default = %q, want claude", cfg.Model.Default)
+	}
+}
+
+// #727: every entry in model.fallback_backends must resolve to a
+// backend declared under model.backends. The default backend is
+// auto-defined, but fallback names are not — a typo like "opencodee" used
+// to load cleanly and only blow up (quietly) at runtime when a fallback
+// was actually needed. Parse must fail fast and name the offender.
+func TestParse_FallbackBackendsMustReferenceDefinedBackend(t *testing.T) {
+	baseBackends := `
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+    opencode:
+      cmd: opencode
+`
+	tests := []struct {
+		name        string
+		fallbacks   string
+		backends    string
+		wantErr     bool
+		wantSubstrs []string
+	}{
+		{
+			name:        "dangling fallback name rejected",
+			fallbacks:   "[codex, opencodee]",
+			backends:    baseBackends,
+			wantErr:     true,
+			wantSubstrs: []string{"opencodee", "fallback_backends", "backends"},
+		},
+		{
+			name:      "all fallback names defined load cleanly",
+			fallbacks: "[codex, opencode]",
+			backends:  baseBackends,
+			wantErr:   false,
+		},
+		{
+			name:      "default backend used as fallback is allowed (auto-defined)",
+			fallbacks: "[claude]",
+			backends:  baseBackends,
+			wantErr:   false,
+		},
+		{
+			name:        "empty fallback list is fine",
+			fallbacks:   "[]",
+			backends:    baseBackends,
+			wantErr:     false,
+			wantSubstrs: nil,
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := []byte(fmt.Sprintf(`
+repo: owner/repo
+local_path: /tmp/repo
+worktree_base: /tmp/worktrees
+session_prefix: x
+model:
+  default: claude
+  fallback_backends: %s
+  backends:
+%s`, tc.fallbacks, tc.backends))
+			cfg, err := parse(yaml)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected parse to reject dangling fallback_backends entry, got nil error")
+				}
+				for _, s := range tc.wantSubstrs {
+					if !strings.Contains(err.Error(), s) {
+						t.Errorf("error = %q, want substring %q", err.Error(), s)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			_ = cfg
+		})
 	}
 }
 
