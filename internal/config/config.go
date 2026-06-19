@@ -1263,7 +1263,7 @@ func parse(data []byte) (*Config, error) {
 	for _, fb := range cfg.Model.FallbackBackends {
 		def, ok := cfg.Model.Backends[fb]
 		if !ok {
-			continue // unknown backend names are caught elsewhere; we only gate non-agentic here.
+			return nil, fmt.Errorf("config: model.fallback_backends references %q which is not defined in model.backends; define it under model.backends or remove it from fallback_backends (the default backend is auto-defined, but fallback names must be declared explicitly)", fb)
 		}
 		if def.NonAgentic {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
