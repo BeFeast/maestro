@@ -3770,7 +3770,7 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 	}
 
 	// Self-deploy hook (#698)
-	o.maybeSelfDeployAfterMerge(pr.Number)
+	o.maybeSelfDeployAfterMerge(s, pr.Number)
 
 	// Deploy hook
 	deploySucceeded := false
@@ -3862,7 +3862,7 @@ func (o *Orchestrator) runDeployCmd(prNumber int) error {
 // process, so we must not wait on it here — the outcome lands as a
 // supervisor finding when the result file is consumed on a later cycle (see
 // consumeSelfDeployResult).
-func (o *Orchestrator) maybeSelfDeployAfterMerge(prNumber int) {
+func (o *Orchestrator) maybeSelfDeployAfterMerge(s *state.State, prNumber int) {
 	if !o.cfg.SelfDeploy.Enabled {
 		return
 	}
@@ -3882,7 +3882,14 @@ func (o *Orchestrator) maybeSelfDeployAfterMerge(prNumber int) {
 	}
 	if err := o.triggerSelfDeploy(prNumber); err != nil {
 		log.Printf("[orch] self-deploy trigger failed for PR #%d: %v", prNumber, err)
-		o.notifier.Sendf("⚠️ maestro: self-deploy trigger failed after PR #%d merge: %v", prNumber, err)
+		o.notifier.Sendf("⚠️ maestro: self-deploy trigger failed after PR #%d merge: %v — fleet still on the previous binary", prNumber, err)
+		// #742: surface the failure as a supervisor finding so a merge that
+		// silently failed to deploy shows up as fleet attention rather than a
+		// lone log line; the next merge retries (the trigger marker is recorded
+		// only on success, below).
+		if s != nil {
+			s.RecordSupervisorDecision(selfdeploy.TriggerFailedFinding(prNumber, err, o.cfg.Repo, now), state.DefaultSupervisorDecisionLimit)
+		}
 		return
 	}
 	// Record the trigger now that the deploy is launched. The detached script

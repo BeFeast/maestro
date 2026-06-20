@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # self-deploy.sh — opt-in post-merge self-deploy of the maestro binary (#698).
 #
-# Launched by the orchestrator through a detached transient systemd unit
-# (systemd-run --user) after a PR merges, so this script survives restarting
-# the very units that run the orchestrator. Steps:
+# Launched by the orchestrator through a detached transient systemd unit after
+# a PR merges, so this script survives restarting the very units that run the
+# orchestrator. The launcher scope matches --scope (#742): `systemd-run --user`
+# for user scope, `sudo -n systemd-run --uid=<user>` (system manager) for
+# system scope. Steps:
 #
 #   1. build from merged origin/main, version-stamped per #682
 #      (-X main.version=<VERSION>+g<shortsha>),
