@@ -339,6 +339,8 @@ func main() {
 		cleanupCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
+	case "stream-split":
+		streamSplitCmd(args)
 	case "_watch-updater":
 		watchUpdaterCmd(args)
 	case "_watch-tail":

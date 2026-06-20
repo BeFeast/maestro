@@ -608,8 +608,17 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	// stream that carries provider/model + usage + cost. Parse it
 	// directly so model/tokens/cost_usd get attributed instead of the
 	// generic token regex (which sees none of the JSON shapes).
-	if o.backendKindForSession(sess) == config.BackendKindPi {
+	kind := o.backendKindForSession(sess)
+	if kind == config.BackendKindPi {
 		return o.updatePiUsageFromOutput(slotName, sess, output)
+	}
+	// #737: a claude session with usage_stream opted in carries its usage on a
+	// side-channel slot.jsonl (the human-readable slot.log has no parseable
+	// token total), so the passed `output` (tmux pane / slot.log) is ignored
+	// in favour of the raw NDJSON the stream-splitter appended. Without the
+	// opt-in, claude stays on the generic text parser (legacy behaviour).
+	if kind == config.BackendKindClaude && o.sessionUsageStream(sess) {
+		return o.updateClaudeUsageFromJSONL(slotName, sess)
 	}
 	tokens := worker.ParseTokensFromOutput(output)
 	if tokens <= sess.TokensUsedAttempt {
@@ -637,11 +646,11 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 	// On a respawn, the runner keeps appending to the same slot log while
 	// TokensUsedAttempt resets to 0 — comparing against TokensUsedAttempt
 	// would re-add the prior attempts' tokens. Use a separate monotonic
-	// watermark (PiTokensWatermark) that persists across respawns so only
+	// watermark (UsageTokensWatermark) that persists across respawns so only
 	// the new attempt's tokens are counted.
-	if usage.TotalTokens > sess.PiTokensWatermark {
-		delta := usage.TotalTokens - sess.PiTokensWatermark
-		sess.PiTokensWatermark = usage.TotalTokens
+	if usage.TotalTokens > sess.UsageTokensWatermark {
+		delta := usage.TotalTokens - sess.UsageTokensWatermark
+		sess.UsageTokensWatermark = usage.TotalTokens
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
 		changed = true
@@ -662,6 +671,80 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 			slotName, usage.Model, usage.TotalTokens, usage.CostUSD, sess.TokensUsedTotal)
 	}
 	return changed
+}
+
+// workerJSONLFile returns the side-channel NDJSON path the claude
+// stream-splitter appends to (slot.jsonl), derived from the worker log path
+// (slot.log). Empty when no log path can be resolved.
+func (o *Orchestrator) workerJSONLFile(slotName string, sess *state.Session) string {
+	logFile := o.workerLogFile(slotName, sess)
+	if logFile == "" {
+		return ""
+	}
+	return worker.JSONLPathForLog(logFile)
+}
+
+// updateClaudeUsageFromJSONL parses the claude stream-json side-channel
+// (slot.jsonl) and stamps model/tokens/cost_usd onto the session (#737).
+// Like the Pi path it re-parses the full appended jsonl on each call, so
+// ParseClaudeUsage returns the cumulative run total across every attempt;
+// the monotonic UsageTokensWatermark persists across respawns so only the
+// new attempt's tokens are added (no double-count on retry/respawn). Cost
+// prefers the backend-reported total_cost_usd. Returns true when anything
+// changed; false (usage stays 0) when the jsonl is absent — the documented
+// degradation when the stream-splitter was unavailable.
+func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.Session) bool {
+	jsonlPath := o.workerJSONLFile(slotName, sess)
+	if jsonlPath == "" {
+		return false
+	}
+	data, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		// No side-channel stream (splitter disabled/unavailable, or the
+		// worker has not emitted a frame yet) — leave tokens at 0.
+		return false
+	}
+	usage, ok := worker.ParseClaudeUsage(string(data))
+	if !ok {
+		return false
+	}
+	changed := false
+	if usage.TotalTokens > sess.UsageTokensWatermark {
+		delta := usage.TotalTokens - sess.UsageTokensWatermark
+		sess.UsageTokensWatermark = usage.TotalTokens
+		sess.TokensUsedAttempt += delta
+		sess.TokensUsedTotal += delta
+		changed = true
+	}
+	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
+		sess.Model = usage.Model
+		changed = true
+	}
+	// total_cost_usd is the run-cumulative the full-jsonl parse sums across
+	// every result frame, so guard with `>` (mirrors the Pi cost fix in #732):
+	// a first-non-zero freeze would never update past the first attempt.
+	if usage.CostUSD > sess.CostUSDBackend {
+		sess.CostUSDBackend = usage.CostUSD
+		changed = true
+	}
+	if changed {
+		log.Printf("[orch] %s claude usage: model=%s tokens=%d cost=$%.4f (total=%d)",
+			slotName, usage.Model, usage.TotalTokens, usage.CostUSD, sess.TokensUsedTotal)
+	}
+	return changed
+}
+
+// sessionUsageStream reports whether the session's backend opted into #737
+// structured usage capture (usage_stream). Only then does the claude path read
+// the slot.jsonl side channel; otherwise it stays on the generic text parser.
+func (o *Orchestrator) sessionUsageStream(sess *state.Session) bool {
+	if sess == nil || o == nil || o.cfg == nil {
+		return false
+	}
+	if def, ok := o.cfg.Model.Backends[strings.TrimSpace(sess.Backend)]; ok {
+		return def.UsageStream
+	}
+	return false
 }
 
 // backendKindForSession resolves the CLI exec-path kind for a session's

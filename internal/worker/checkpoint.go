@@ -121,13 +121,14 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		}
 	}
 	backendCfg := BackendConfig{
-		Cmd:        backendDef.Cmd,
-		ExtraArgs:  backendDef.ExtraArgs,
-		PromptMode: backendDef.PromptMode,
-		Provider:   backendDef.Provider,
-		Model:      backendDef.Model,
-		Effort:     backendDef.Effort,
-		MCP:        backendDef.MCP,
+		Cmd:         backendDef.Cmd,
+		ExtraArgs:   backendDef.ExtraArgs,
+		PromptMode:  backendDef.PromptMode,
+		Provider:    backendDef.Provider,
+		Model:       backendDef.Model,
+		Effort:      backendDef.Effort,
+		UsageStream: backendDef.UsageStream,
+		MCP:         backendDef.MCP,
 	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
@@ -160,7 +161,8 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree); err != nil {
+	split := streamSplitForBackend(backendName, backendCfg, logFile)
+	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
 

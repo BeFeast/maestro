@@ -41,6 +41,16 @@ type BackendDef struct {
 	Variant  string `yaml:"variant,omitempty"`  // e.g. "opus[1m]", "fast", "sonnet"
 	Effort   string `yaml:"effort,omitempty"`   // e.g. "xhigh", "medium", "low"
 
+	// #737: opt-in structured usage capture. When true, a claude-kind backend
+	// runs in `--output-format stream-json --verbose` mode and the worker
+	// runner pipes its NDJSON through `maestro stream-split`, which writes the
+	// raw frames to a side-channel slot.jsonl (parsed for tokens/cost) while
+	// keeping slot.log human-readable. Off by default: plain `claude -p` text
+	// mode prints no parseable token total, so usage/cost stay 0 (the #737
+	// symptom) until an operator opts in. Overridable via extra_args (a
+	// trailing --output-format wins). Only the claude kind consumes this today.
+	UsageStream bool `yaml:"usage_stream,omitempty"`
+
 	// #507: NonAgentic marks a backend that is a TEXT-COMPLETION helper,
 	// not an agentic CLI capable of producing a real PR. Such a backend
 	// MUST NOT be used as model.default or in model.fallback_backends —

@@ -39,13 +39,14 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		}
 	}
 	backendCfg := BackendConfig{
-		Cmd:        backendDef.Cmd,
-		ExtraArgs:  backendDef.ExtraArgs,
-		PromptMode: backendDef.PromptMode,
-		Provider:   backendDef.Provider,
-		Model:      backendDef.Model,
-		Effort:     backendDef.Effort,
-		MCP:        backendDef.MCP,
+		Cmd:         backendDef.Cmd,
+		ExtraArgs:   backendDef.ExtraArgs,
+		PromptMode:  backendDef.PromptMode,
+		Provider:    backendDef.Provider,
+		Model:       backendDef.Model,
+		Effort:      backendDef.Effort,
+		UsageStream: backendDef.UsageStream,
+		MCP:         backendDef.MCP,
 	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
@@ -75,7 +76,8 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree); err != nil {
+	split := streamSplitForBackend(backendName, backendCfg, logFile)
+	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
 
