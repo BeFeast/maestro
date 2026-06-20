@@ -204,6 +204,7 @@ func TestBuildWorkerRunnerScriptIncludesSearchGuardrails(t *testing.T) {
 		"/tmp/worker.log",
 		"/tmp/worktree",
 		"/tmp/state/search-guardrails",
+		nil,
 	)
 
 	for _, want := range []string{
@@ -217,6 +218,25 @@ func TestBuildWorkerRunnerScriptIncludesSearchGuardrails(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Fatalf("runner script missing %q\nscript:\n%s", want, script)
 		}
+	}
+}
+
+// #737: with a stream-split config the worker command is piped through
+// `maestro stream-split` (raw NDJSON -> slot.jsonl) before tee, keeping
+// slot.log human-readable while capturing usage on the side channel.
+func TestBuildWorkerRunnerScriptStreamSplitPipeline(t *testing.T) {
+	script := buildWorkerRunnerScript(
+		[]string{"claude", "--dangerously-skip-permissions", "-p", "--output-format", "stream-json", "--verbose"},
+		"/tmp/prompt.md",
+		"/tmp/worker.log",
+		"/tmp/worktree",
+		"/tmp/state/search-guardrails",
+		&streamSplit{MaestroBin: "/usr/local/bin/maestro", Backend: "claude", JSONLPath: "/tmp/worker.jsonl"},
+	)
+
+	want := "2>&1 | /usr/local/bin/maestro stream-split --backend claude --jsonl /tmp/worker.jsonl | tee -a '/tmp/worker.log'"
+	if !strings.Contains(script, want) {
+		t.Fatalf("runner script missing stream-split pipeline %q\nscript:\n%s", want, script)
 	}
 }
 

@@ -9638,8 +9638,8 @@ func TestUpdateTokensUsedFromOutput_PiBackendCostGrowsPastFirstTurn(t *testing.T
 	if sess.TokensUsedAttempt != 773 || sess.TokensUsedTotal != 773 {
 		t.Fatalf("after turn1: attempt=%d total=%d, want 773/773", sess.TokensUsedAttempt, sess.TokensUsedTotal)
 	}
-	if sess.PiTokensWatermark != 773 {
-		t.Errorf("PiTokensWatermark = %d, want 773", sess.PiTokensWatermark)
+	if sess.UsageTokensWatermark != 773 {
+		t.Errorf("UsageTokensWatermark = %d, want 773", sess.UsageTokensWatermark)
 	}
 	if !approxCostEq(sess.CostUSDBackend, 0.0010912) {
 		t.Errorf("after turn1: CostUSDBackend = %v, want 0.0010912", sess.CostUSDBackend)
@@ -9658,14 +9658,14 @@ func TestUpdateTokensUsedFromOutput_PiBackendCostGrowsPastFirstTurn(t *testing.T
 	if sess.TokensUsedAttempt != 2993 || sess.TokensUsedTotal != 2993 {
 		t.Errorf("after turn2: attempt=%d total=%d, want 2993/2993", sess.TokensUsedAttempt, sess.TokensUsedTotal)
 	}
-	if sess.PiTokensWatermark != 2993 {
-		t.Errorf("PiTokensWatermark = %d, want 2993", sess.PiTokensWatermark)
+	if sess.UsageTokensWatermark != 2993 {
+		t.Errorf("UsageTokensWatermark = %d, want 2993", sess.UsageTokensWatermark)
 	}
 }
 
 // #730/#732: on respawn/checkpoint resume the runner keeps appending to the
 // same slot log, so the full-log parse returns the all-attempt cumulative
-// token count. TokensUsedAttempt resets to 0 but the PiTokensWatermark
+// token count. TokensUsedAttempt resets to 0 but the UsageTokensWatermark
 // persists, so only the new attempt's delta is added — the prior attempts'
 // tokens are NOT re-counted into TokensUsedTotal.
 func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
@@ -9693,13 +9693,13 @@ func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
 	if !o.updateTokensUsedFromOutput("sup-732", sess, attempt1) {
 		t.Fatal("attempt1: expected a change")
 	}
-	if sess.TokensUsedTotal != 773 || sess.PiTokensWatermark != 773 || sess.TokensUsedAttempt != 773 {
+	if sess.TokensUsedTotal != 773 || sess.UsageTokensWatermark != 773 || sess.TokensUsedAttempt != 773 {
 		t.Fatalf("attempt1: total=%d wm=%d attempt=%d, want 773/773/773",
-			sess.TokensUsedTotal, sess.PiTokensWatermark, sess.TokensUsedAttempt)
+			sess.TokensUsedTotal, sess.UsageTokensWatermark, sess.TokensUsedAttempt)
 	}
 
 	// Simulate respawn: per-attempt counter resets to 0 (checkpoint/worker/phase
-	// reset it), but PiTokensWatermark persists across respawns.
+	// reset it), but UsageTokensWatermark persists across respawns.
 	sess.TokensUsedAttempt = 0
 
 	// Re-parse the SAME appended log (cumulative 773) before the new turn
@@ -9724,7 +9724,116 @@ func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
 	if sess.TokensUsedAttempt != 1000 {
 		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
 	}
-	if sess.PiTokensWatermark != 1773 {
-		t.Errorf("PiTokensWatermark = %d, want 1773", sess.PiTokensWatermark)
+	if sess.UsageTokensWatermark != 1773 {
+		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
+	}
+}
+
+// claudeResultFrame builds one terminal claude stream-json `result` frame with
+// the given token totals + cost, as the stream-splitter would append it.
+func claudeResultFrame(in, out, cacheWrite, cacheRead int, cost float64, result string) string {
+	return fmt.Sprintf(`{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":%q,"total_cost_usd":%g,"usage":{"input_tokens":%d,"output_tokens":%d,"cache_creation_input_tokens":%d,"cache_read_input_tokens":%d}}`+"\n",
+		result, cost, in, out, cacheWrite, cacheRead)
+}
+
+// claudeTestOrchestrator wires a session to a claude backend whose slot.jsonl
+// lives at <dir>/<slot>.jsonl, returning the orchestrator, session, and jsonl
+// path. The session LogFile points at the sibling .log so the orchestrator
+// derives the .jsonl side channel (#737).
+func claudeTestOrchestrator(t *testing.T, slot string) (*Orchestrator, *state.Session, string) {
+	t.Helper()
+	dir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: dir,
+			Model: config.ModelConfig{
+				Default:  "claude",
+				Backends: map[string]config.BackendDef{"claude": {Cmd: "claude", UsageStream: true}},
+			},
+		},
+	}
+	logFile := dir + "/" + slot + ".log"
+	sess := &state.Session{Backend: "claude", LogFile: logFile}
+	return o, sess, dir + "/" + slot + ".jsonl"
+}
+
+// #737: a claude session reads usage from the slot.jsonl side channel (not the
+// human-readable slot.log) and stamps non-zero tokens + USD cost + model.
+func TestUpdateTokensUsedFromOutput_ClaudeBackendStampsUsage(t *testing.T) {
+	o, sess, jsonlPath := claudeTestOrchestrator(t, "sup-737")
+	frames := `{"type":"system","subtype":"init","model":"claude-opus-4-8[1m]"}` + "\n" +
+		claudeResultFrame(2487, 4, 1924, 15661, 0.0401785, "pong")
+	if err := os.WriteFile(jsonlPath, []byte(frames), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The passed output (slot.log/tmux) is intentionally ignored for claude.
+	if !o.updateTokensUsedFromOutput("sup-737", sess, "human readable log text, no token total") {
+		t.Fatal("expected a change from the claude jsonl side channel")
+	}
+	// 2487 + 4 + 1924 + 15661 = 20076
+	if sess.TokensUsedTotal != 20076 || sess.TokensUsedAttempt != 20076 {
+		t.Errorf("tokens total=%d attempt=%d, want 20076/20076", sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+	if sess.UsageTokensWatermark != 20076 {
+		t.Errorf("UsageTokensWatermark = %d, want 20076", sess.UsageTokensWatermark)
+	}
+	if !approxCostEq(sess.CostUSDBackend, 0.0401785) {
+		t.Errorf("CostUSDBackend = %v, want 0.0401785", sess.CostUSDBackend)
+	}
+	if sess.Model != "claude-opus-4-8[1m]" {
+		t.Errorf("Model = %q, want claude-opus-4-8[1m]", sess.Model)
+	}
+}
+
+// #737: a forced retry/respawn appends a second run's result frame to the same
+// slot.jsonl. The full-jsonl parse returns the cumulative total, but the
+// monotonic watermark ensures only the new run's delta is added — no
+// double-count of the prior attempt's tokens.
+func TestUpdateTokensUsedFromOutput_ClaudeBackendRetryNoDoubleCount(t *testing.T) {
+	o, sess, jsonlPath := claudeTestOrchestrator(t, "sup-737")
+
+	run1 := claudeResultFrame(770, 3, 0, 0, 0.001, "a") // total 773
+	if err := os.WriteFile(jsonlPath, []byte(run1), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateTokensUsedFromOutput("sup-737", sess, "") {
+		t.Fatal("run1: expected a change")
+	}
+	if sess.TokensUsedTotal != 773 || sess.UsageTokensWatermark != 773 || sess.TokensUsedAttempt != 773 {
+		t.Fatalf("run1: total=%d wm=%d attempt=%d, want 773/773/773",
+			sess.TokensUsedTotal, sess.UsageTokensWatermark, sess.TokensUsedAttempt)
+	}
+
+	// Respawn: per-attempt counter resets, watermark persists.
+	sess.TokensUsedAttempt = 0
+
+	// Re-parse the unchanged jsonl before the new run lands — must NOT re-add.
+	if o.updateTokensUsedFromOutput("sup-737", sess, "") {
+		t.Fatal("re-parse of unchanged jsonl must not report a change (would double-count)")
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("after re-parse: TokensUsedTotal = %d, want 773 (no double-count)", sess.TokensUsedTotal)
+	}
+
+	// New run appends its result frame: cumulative 1773, delta only (1000).
+	run2 := claudeResultFrame(900, 100, 0, 0, 0.002, "b") // total 1000
+	if err := os.WriteFile(jsonlPath, []byte(run1+run2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateTokensUsedFromOutput("sup-737", sess, "") {
+		t.Fatal("run2: expected a change")
+	}
+	if sess.TokensUsedTotal != 1773 {
+		t.Errorf("after run2: TokensUsedTotal = %d, want 1773 (delta only)", sess.TokensUsedTotal)
+	}
+	if sess.TokensUsedAttempt != 1000 {
+		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
+	}
+	if sess.UsageTokensWatermark != 1773 {
+		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
+	}
+	if !approxCostEq(sess.CostUSDBackend, 0.003) {
+		t.Errorf("CostUSDBackend = %v, want 0.003 (cumulative)", sess.CostUSDBackend)
 	}
 }

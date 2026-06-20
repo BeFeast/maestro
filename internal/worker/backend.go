@@ -22,6 +22,19 @@ func splitCmd(cmd string) (binary string, prefixArgs []string) {
 	return parts[0], parts[1:]
 }
 
+// argsHaveOutputFormat reports whether the given args already pin an
+// --output-format flag (either `--output-format json` or `--output-format=json`).
+// Used so an operator-specified output format in cmd/extra_args overrides the
+// #737 stream-json default instead of producing a duplicate flag.
+func argsHaveOutputFormat(args []string) bool {
+	for _, a := range args {
+		if a == "--output-format" || strings.HasPrefix(a, "--output-format=") {
+			return true
+		}
+	}
+	return false
+}
+
 // BackendConfig holds the CLI command and any extra args from config.
 type BackendConfig struct {
 	Cmd        string   // binary name (e.g. "claude", "codex", "gemini")
@@ -30,7 +43,11 @@ type BackendConfig struct {
 	Provider   string   // per-backend provider field; resolves the exec path for custom-named backends (#684)
 	Model      string   // optional model name for role-specific backend calls
 	Effort     string   // optional reasoning effort for role-specific backend calls
-	MCP        config.MCPConfig
+	// UsageStream opts a claude-kind worker into `--output-format stream-json
+	// --verbose` so its NDJSON usage stream can be captured on a side-channel
+	// slot.jsonl (#737). Off by default; ignored by non-claude backends.
+	UsageStream bool
+	MCP         config.MCPConfig
 }
 
 // Backend builds the exec.Cmd for a specific model CLI.
@@ -68,6 +85,13 @@ func (claudeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	// argument is given; the runner script wires promptFile to stdin (mirrors
 	// the codex `-` path and the supervisor claude branch from #453).
 	args := append(cmdArgs, "--dangerously-skip-permissions", "-p")
+	// #737: opt-in structured streaming so usage (tokens/cost) can be parsed
+	// from the NDJSON side-channel. stream-json with -p requires --verbose.
+	// Skipped when the operator already pins an --output-format via cmd or
+	// extra_args, so their choice (and the matching runner wiring) wins.
+	if cfg.UsageStream && !argsHaveOutputFormat(cmdArgs) && !argsHaveOutputFormat(cfg.ExtraArgs) {
+		args = append(args, "--output-format", "stream-json", "--verbose")
+	}
 	var err error
 	args, err = appendClaudeMCPOptions(args, cfg.MCP)
 	if err != nil {
@@ -400,6 +424,41 @@ func resolveBackendKind(backendName string, cfg BackendConfig) string {
 		backendName = "claude"
 	}
 	return config.ResolveBackendKind(backendName, cfg.Provider, cfg.Cmd)
+}
+
+// maestroExecutablePath resolves the running maestro binary, which provides
+// the `stream-split` subcommand the worker runner pipes a claude stream-json
+// stream through (#737). Returns ok=false when the path cannot be resolved,
+// signalling the caller to degrade to a plain `tee` pipeline (log preserved,
+// usage capture disabled).
+func maestroExecutablePath() (string, bool) {
+	exe, err := os.Executable()
+	if err != nil || strings.TrimSpace(exe) == "" {
+		return "", false
+	}
+	return exe, true
+}
+
+// streamSplitForBackend returns the worker runner's stream-split configuration,
+// or nil when the plain `tee` pipeline should be used. Only a claude-kind
+// backend with usage_stream opted in streams NDJSON; when the maestro binary
+// cannot be resolved it degrades to nil (plain tee) per #737.
+func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string) *streamSplit {
+	if !cfg.UsageStream {
+		return nil
+	}
+	if resolveBackendKind(backendName, cfg) != config.BackendKindClaude {
+		return nil
+	}
+	bin, ok := maestroExecutablePath()
+	if !ok {
+		return nil
+	}
+	return &streamSplit{
+		MaestroBin: bin,
+		Backend:    config.BackendKindClaude,
+		JSONLPath:  JSONLPathForLog(logFile),
+	}
 }
 
 // BuildWorkerCmd creates the right exec.Cmd for a backend. The backend name,

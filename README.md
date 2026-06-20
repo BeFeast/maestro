@@ -310,6 +310,21 @@ model:
 
 A backend that matches none of the above falls back to the generic exec path: `prompt_mode` applies, no permission-bypass flag is added, and Maestro logs a startup warning naming the backend. Use the generic path only for genuinely custom CLIs.
 
+### Claude usage capture (tokens + cost)
+
+Plain `claude -p` text mode prints no parseable token total, so a claude worker's `tokens_used_total` and USD cost stay `0`. Opt a claude backend into structured usage capture with `usage_stream: true`:
+
+```yaml
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+      usage_stream: true   # run claude in --output-format stream-json; capture tokens + cost
+```
+
+When enabled, the worker runs `claude --output-format stream-json --verbose` and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens + `total_cost_usd`) while keeping `<slot>.log` human-readable. The session then reports non-zero tokens + cost in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` in `extra_args` overrides it. (The `pi` backend captures usage natively and needs no opt-in.)
+
 ### Optional worker MCP tools
 
 Worker sessions receive no MCP tools by default. Attach project-specific MCP servers per backend with `model.backends.<name>.mcp`:

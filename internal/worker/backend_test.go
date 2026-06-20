@@ -49,6 +49,53 @@ func TestBuildWorkerCmd_Claude(t *testing.T) {
 	}
 }
 
+// TestBuildWorkerCmd_ClaudeUsageStream verifies the #737 opt-in: when
+// UsageStream is set the claude worker runs in stream-json mode, and an
+// operator-pinned --output-format in extra_args overrides it (no duplicate).
+func TestBuildWorkerCmd_ClaudeUsageStream(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("do the thing"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("opt-in appends stream-json flags", func(t *testing.T) {
+		cfg := BackendConfig{Cmd: "claude", UsageStream: true}
+		cmd, _, err := BuildWorkerCmd("claude", cfg, promptFile, "/tmp/wt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		args := strings.Join(cmd.Args, " ")
+		for _, want := range []string{"--output-format stream-json", "--verbose"} {
+			if !strings.Contains(args, want) {
+				t.Errorf("expected %q in args, got: %s", want, args)
+			}
+		}
+	})
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := BackendConfig{Cmd: "claude"}
+		cmd, _, err := BuildWorkerCmd("claude", cfg, promptFile, "/tmp/wt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(strings.Join(cmd.Args, " "), "stream-json") {
+			t.Errorf("stream-json must not appear unless UsageStream is set: %v", cmd.Args)
+		}
+	})
+
+	t.Run("extra_args output-format overrides", func(t *testing.T) {
+		cfg := BackendConfig{Cmd: "claude", UsageStream: true, ExtraArgs: []string{"--output-format", "json"}}
+		cmd, _, err := BuildWorkerCmd("claude", cfg, promptFile, "/tmp/wt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(strings.Join(cmd.Args, " "), "stream-json") {
+			t.Errorf("operator --output-format must win over the stream-json default: %v", cmd.Args)
+		}
+	})
+}
+
 // TestBuildWorkerCmd_ClaudeLargePromptViaStdin guards against the latent E2BIG
 // regression from #454: a worker claude prompt larger than the Linux
 // MAX_ARG_STRLEN single-argument limit (128 KiB) must be delivered via stdin,

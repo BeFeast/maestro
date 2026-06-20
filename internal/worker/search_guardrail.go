@@ -251,7 +251,34 @@ fi
 exec "$real_path" "$@"
 `
 
-func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardDir string) string {
+// streamSplit configures the worker runner to route a backend's structured
+// NDJSON stream through `maestro stream-split` before tee: the raw frames are
+// appended to JSONLPath (parsed for usage) while the rendered human-readable
+// text flows to slot.log (#737). A nil *streamSplit keeps the plain `tee`
+// pipeline — also the degradation path when the maestro binary is unresolvable.
+type streamSplit struct {
+	MaestroBin string // path to the maestro binary providing the stream-split subcommand
+	Backend    string // backend kind for rendering (e.g. "claude")
+	JSONLPath  string // side-channel file for raw NDJSON frames (slot.jsonl)
+}
+
+// logPipeline builds the trailing `| ... | tee -a LOG` stage. When split is
+// set it inserts `| maestro stream-split --backend B --jsonl J` ahead of tee
+// so the raw stream lands in slot.jsonl and slot.log stays human-readable.
+func logPipeline(split *streamSplit, logFile string) string {
+	tee := "tee -a " + shellQuote(logFile)
+	if split == nil {
+		return "2>&1 | " + tee
+	}
+	splitter := shellJoin([]string{
+		split.MaestroBin, "stream-split",
+		"--backend", split.Backend,
+		"--jsonl", split.JSONLPath,
+	})
+	return "2>&1 | " + splitter + " | " + tee
+}
+
+func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardDir string, split *streamSplit) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n")
 	b.WriteString("export MAESTRO_WORKTREE=" + shellQuote(worktree) + "\n")
@@ -260,20 +287,21 @@ func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardD
 	b.WriteString("export PATH=\"$MAESTRO_SEARCH_GUARDRAIL_DIR:$MAESTRO_ORIGINAL_PATH\"\n")
 	b.WriteString("cd \"$MAESTRO_WORKTREE\" || exit 1\n")
 	b.WriteString("printf '[maestro] worker worktree: %s\\n' \"$MAESTRO_WORKTREE\" | tee -a " + shellQuote(logFile) + "\n")
+	pipeline := logPipeline(split, logFile)
 	if stdinFile != "" {
-		b.WriteString(fmt.Sprintf("exec %s < %s 2>&1 | tee -a %s\n", shellJoin(args), shellQuote(stdinFile), shellQuote(logFile)))
+		b.WriteString(fmt.Sprintf("exec %s < %s %s\n", shellJoin(args), shellQuote(stdinFile), pipeline))
 	} else {
-		b.WriteString(fmt.Sprintf("exec %s 2>&1 | tee -a %s\n", shellJoin(args), shellQuote(logFile)))
+		b.WriteString(fmt.Sprintf("exec %s %s\n", shellJoin(args), pipeline))
 	}
 	return b.String()
 }
 
-func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFile, logFile, worktree string) error {
+func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit) error {
 	guardDir, err := ensureSearchGuardrailWrappers(stateDir)
 	if err != nil {
 		return err
 	}
-	runnerContent := buildWorkerRunnerScript(args, stdinFile, logFile, worktree, guardDir)
+	runnerContent := buildWorkerRunnerScript(args, stdinFile, logFile, worktree, guardDir, split)
 	if err := os.WriteFile(runnerPath, []byte(runnerContent), 0755); err != nil {
 		return fmt.Errorf("write runner script: %w", err)
 	}
