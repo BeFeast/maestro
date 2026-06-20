@@ -185,6 +185,70 @@ func TestTriggerCommandScope(t *testing.T) {
 	}
 }
 
+// #742: the OUTER launcher must match the unit scope. User scope launches
+// `systemd-run --user`; system scope launches `sudo -n systemd-run --uid=<user>`
+// (no --user) so it works from a system-service context lacking the user bus.
+func TestTriggerCommandOuterLauncherScope(t *testing.T) {
+	now := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+
+	// --- user scope (default): systemd-run --user, no sudo ---
+	cfg := triggerTestConfig(t)
+	name, args, err := TriggerCommand(cfg, 742, now)
+	if err != nil {
+		t.Fatalf("TriggerCommand: %v", err)
+	}
+	if name != "systemd-run" {
+		t.Errorf("user-scope launcher = %q, want systemd-run", name)
+	}
+	if len(args) == 0 || args[0] != "--user" {
+		t.Errorf("user-scope first arg = %v, want --user first", args)
+	}
+	for _, banned := range []string{"-n", "sudo"} {
+		if contains(args, banned) {
+			t.Errorf("user-scope args must not contain %q: %v", banned, args)
+		}
+	}
+	if hasPrefix(args, "--uid=") {
+		t.Errorf("user-scope args must not set --uid: %v", args)
+	}
+
+	// --- system scope: sudo -n systemd-run --uid=<user>, no --user ---
+	cfg = triggerTestConfig(t)
+	cfg.SelfDeploy.Scope = "system"
+	name, args, err = TriggerCommand(cfg, 742, now)
+	if err != nil {
+		t.Fatalf("TriggerCommand: %v", err)
+	}
+	if name != "sudo" {
+		t.Errorf("system-scope launcher = %q, want sudo", name)
+	}
+	if len(args) < 3 || args[0] != "-n" || args[1] != "systemd-run" {
+		t.Errorf("system-scope args = %v, want [-n systemd-run ...] prefix", args)
+	}
+	if contains(args, "--user") {
+		t.Errorf("system-scope must NOT pass --user (root cause of #742): %v", args)
+	}
+	if !hasPrefix(args, "--uid=") {
+		t.Errorf("system-scope must run the unit as the invoking user via --uid: %v", args)
+	}
+	// The shared unit properties still flow through regardless of scope.
+	for _, want := range []string{"--collect", "/bin/bash"} {
+		if !contains(args, want) {
+			t.Errorf("system-scope args missing %q: %v", want, args)
+		}
+	}
+}
+
+// hasPrefix reports whether any arg starts with the given prefix.
+func hasPrefix(args []string, prefix string) bool {
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // flagValue reports whether args contains "<flag> <value>" as adjacent items.
 func flagValue(args []string, flag, value string) bool {
 	for i := 0; i < len(args)-1; i++ {

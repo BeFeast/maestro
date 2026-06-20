@@ -3,8 +3,11 @@
 //
 // The orchestrator does not build/install/restart in-process: it would kill
 // itself halfway through. Instead Trigger launches scripts/self-deploy.sh in
-// a detached transient systemd unit (systemd-run --user), so the script
-// survives the maestro unit restarting. The script builds from merged main
+// a detached transient systemd unit, so the script survives the maestro unit
+// restarting. The launcher scope matches the unit scope (#742): `systemd-run
+// --user` for user scope, or `sudo -n systemd-run --uid=<user>` in the system
+// manager for scope=system (whose orchestrator service env lacks the user bus).
+// The script builds from merged main
 // (version-stamped per #682), installs the binary atomically keeping the
 // previous one as `.prev`, restarts the configured units — user units via
 // `systemctl --user` or, with scope=system, system units via
@@ -21,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -174,17 +178,38 @@ func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []
 	unitName := fmt.Sprintf("maestro-self-deploy-pr%d-%d", prNumber, now.Unix())
 	timeoutSec := cfg.SelfDeploy.EffectiveTimeoutMinutes() * 60
 
-	args := []string{
-		"--user",
+	scope := cfg.SelfDeploy.EffectiveScope()
+
+	// #742: the OUTER launcher scope must match the unit scope. #716 made only
+	// the inner unit restart scope-aware; the outer launcher stayed on
+	// `systemd-run --user`. On a system-scope host the orchestrator runs as a
+	// system service (e.g. User=god) whose process environment lacks
+	// XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS, so `systemd-run --user` cannot
+	// reach the user bus and exits 1 — silently dropping the deploy. For
+	// scope=system, launch the detached unit in the always-reachable system
+	// manager via `sudo -n systemd-run` (non-interactive, mirroring the script's
+	// privileged ops), running it as the invoking user via --uid so the build/git
+	// steps keep the same uid as the user-scope path (running as root would trip
+	// git's dubious-ownership guard on the user-owned checkout). Keep
+	// `systemd-run --user` for the legacy user scope.
+	launcher := "systemd-run"
+	var args []string
+	if scope == config.SelfDeployScopeSystem {
+		launcher = "sudo"
+		args = []string{"-n", "systemd-run", "--uid=" + deployRunAsUser()}
+	} else {
+		args = []string{"--user"}
+	}
+	args = append(args,
 		"--collect",
-		"--unit=" + unitName,
-		"--property=WorkingDirectory=" + localPath,
+		"--unit="+unitName,
+		"--property=WorkingDirectory="+localPath,
 		// Hard backstop well past the script's own deadline so a wedged
 		// deploy cannot linger forever; the script handles its own
 		// timeouts (and rollback) inside timeoutSec.
-		"--property=RuntimeMaxSec=" + strconv.Itoa(timeoutSec*2),
-	}
-	// The transient unit gets the user manager's default environment, which
+		"--property=RuntimeMaxSec="+strconv.Itoa(timeoutSec*2),
+	)
+	// The transient unit gets the systemd manager's default environment, which
 	// usually lacks the Go toolchain dirs the orchestrator unit configures.
 	// Hand our PATH down so the build step finds the same tools.
 	if path := strings.TrimSpace(os.Getenv("PATH")); path != "" {
@@ -198,11 +223,11 @@ func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []
 		"--result-file", ResultPath(cfg.StateDir),
 		"--timeout-seconds", strconv.Itoa(timeoutSec),
 		"--pr", strconv.Itoa(prNumber),
-		// #716: select the systemd unit scope. Default "user" keeps the
-		// pre-migration behavior; "system" restarts system units via
+		// #716: select the systemd unit scope inside the script. Default "user"
+		// keeps the pre-migration behavior; "system" restarts system units via
 		// `sudo -n systemctl` (e.g. the Loki fleet, where maestro runs as
 		// User=god system units rather than per-user units).
-		"--scope", cfg.SelfDeploy.EffectiveScope(),
+		"--scope", scope,
 	)
 	// #711: when bin_path is root-owned, the unprivileged deploy user cannot
 	// stage/rename into it. install_via_sudo escalates the file ops with
@@ -216,7 +241,29 @@ func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []
 			args = append(args, "--health-token-env", env)
 		}
 	}
-	return "systemd-run", args, nil
+	return launcher, args, nil
+}
+
+// deployRunAsUser returns the username the system-scope transient unit should
+// run as — the invoking user — so the build/git steps keep the same uid as the
+// user-scope path instead of running as root (which would trip git's
+// dubious-ownership guard on the user-owned checkout, and pollute root's build
+// cache). Falls back to the USER/LOGNAME env, then to the numeric uid.
+func deployRunAsUser() string {
+	if u, err := user.Current(); err == nil {
+		if name := strings.TrimSpace(u.Username); name != "" {
+			return name
+		}
+		if uid := strings.TrimSpace(u.Uid); uid != "" {
+			return uid
+		}
+	}
+	for _, k := range []string{"USER", "LOGNAME"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return strconv.Itoa(os.Getuid())
 }
 
 // Trigger starts the deploy script in a detached transient unit and returns
@@ -229,9 +276,39 @@ func Trigger(cfg *config.Config, prNumber int) error {
 	}
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("self-deploy: systemd-run: %w\n%s", err, out)
+		return fmt.Errorf("self-deploy: %s: %w\n%s", name, err, out)
 	}
 	return nil
+}
+
+// TriggerFailedFinding converts a failed self-deploy *trigger* — the detached
+// unit never launched (e.g. systemd-run/sudo rejected the request) — into a
+// supervisor finding so a merge that silently failed to deploy surfaces as
+// fleet attention instead of a lone log line (#742). Until acted on, the fleet
+// keeps running the previous binary, so this must not be invisible. The next
+// merge retries automatically (the trigger marker is only recorded on success).
+func TriggerFailedFinding(prNumber int, triggerErr error, project string, now time.Time) state.SupervisorDecision {
+	reason := "unknown error"
+	if triggerErr != nil {
+		reason = triggerErr.Error()
+	}
+	prSuffix := ""
+	if prNumber > 0 {
+		prSuffix = fmt.Sprintf(" after PR #%d", prNumber)
+	}
+	return state.SupervisorDecision{
+		ID:               "self-deploy-trigger-failed-" + now.Format("20060102T150405.000000000Z"),
+		CreatedAt:        now,
+		Project:          project,
+		Risk:             "safe",
+		Confidence:       1.0,
+		RequiresApproval: false,
+		Status:           "failed",
+		Summary:          fmt.Sprintf("self-deploy: trigger failed%s — merged change NOT deployed; fleet still on the previous binary", prSuffix),
+		RecommendedAction: "the detached deploy unit never launched: check `sudo -n systemd-run`/`systemd-run --user` from the orchestrator's service context, " +
+			"then redeploy by hand (a later merge retries automatically)",
+		Reasons: []string{"trigger error: " + reason},
+	}
 }
 
 // Finding converts a deploy result into the supervisor finding the
