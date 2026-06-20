@@ -345,3 +345,49 @@ func TestFindingRolledBack(t *testing.T) {
 		t.Errorf("Summary = %q", d.Summary)
 	}
 }
+
+func TestBuildSHA(t *testing.T) {
+	cases := []struct {
+		version string
+		want    string
+	}{
+		{"1.4.2+gabc1234", "abc1234"},              // self-deploy / release stamp (#682)
+		{"v1.4.2+gdeadbee", "deadbee"},             // leading v tolerated
+		{"dev-abc123456789", "abc123456789"},       // local checkout VCS fallback
+		{"dev-abc123456789-dirty", "abc123456789"}, // dirty working tree suffix stripped
+		{"dev", ""},                       // bare sentinel — no SHA
+		{"", ""},                          // empty
+		{"1.4.2", ""},                     // plain semver, no stamp
+		{"  1.4.2+gabc1234  ", "abc1234"}, // surrounding whitespace
+	}
+	for _, tc := range cases {
+		if got := BuildSHA(tc.version); got != tc.want {
+			t.Errorf("BuildSHA(%q) = %q, want %q", tc.version, got, tc.want)
+		}
+	}
+}
+
+func TestMainAdvanced(t *testing.T) {
+	const head = "abc1234567890abcdef1234567890abcdef123456" // full 40-char origin/main SHA
+
+	// Running binary built from the same commit as origin/main — up to date.
+	if MainAdvanced("1.4.2+gabc1234", head) {
+		t.Error("MainAdvanced = true when the binary's short SHA prefixes main head (no drift)")
+	}
+	// Case-insensitive prefix match still counts as up to date.
+	if MainAdvanced("1.4.2+gABC1234", strings.ToUpper(head)) {
+		t.Error("MainAdvanced = true for a case-only difference (no drift)")
+	}
+	// origin/main moved to a different commit — the binary lags.
+	if !MainAdvanced("1.4.2+gabc1234", "fed9876543210fed9876543210fed9876543210f") {
+		t.Error("MainAdvanced = false when main head differs from the running binary")
+	}
+	// Undeterminable running version (bare dev): never deploy on a guess.
+	if MainAdvanced("dev", head) {
+		t.Error("MainAdvanced = true for an unstamped binary")
+	}
+	// Missing head SHA (lookup failed): never deploy on a guess.
+	if MainAdvanced("1.4.2+gabc1234", "") {
+		t.Error("MainAdvanced = true with an empty main head SHA")
+	}
+}

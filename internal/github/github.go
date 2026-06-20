@@ -635,6 +635,32 @@ func (c *Client) PRHeadSHA(prNumber int) (string, error) {
 	return c.pullHeadSHA(prNumber)
 }
 
+// BranchHeadSHA returns the current head commit SHA of the given branch. The
+// orchestrator uses it to detect when origin/main has advanced past the running
+// binary so a PR merged outside the orchestrator's own merge path still
+// triggers a self-deploy (#751).
+func (c *Client) BranchHeadSHA(branch string) (string, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return "", fmt.Errorf("empty branch")
+	}
+	out, err := ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, url.PathEscape(branch)))
+	if err != nil {
+		return "", err
+	}
+	var commit struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(out, &commit); err != nil {
+		return "", fmt.Errorf("parse commit for branch %s: %w", branch, err)
+	}
+	sha := strings.TrimSpace(commit.SHA)
+	if sha == "" {
+		return "", fmt.Errorf("empty head sha for branch %s", branch)
+	}
+	return sha, nil
+}
+
 func (c *Client) checkRunsForSHA(sha string) ([]greptileCheckRun, error) {
 	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/commits/%s/check-runs?per_page=100", c.Repo, sha), "--paginate")
 	if err != nil {
