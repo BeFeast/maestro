@@ -7876,6 +7876,66 @@ func TestReconcileProjectBoard_ThrottlesNonDoneItemSweep(t *testing.T) {
 	}
 }
 
+// A CLOSED issue sitting in NO STATUS must move to Done on the next reconcile
+// sweep — not get bounced to Todo by the no-status branch — and must work for
+// externally-closed issues the reconcile never transitioned itself. This is the
+// core regression guard for #741.
+func TestReconcileProjectBoard_ClosedNoStatusItemMovesToDone(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 5,
+		},
+	}
+
+	synced := make(map[int]github.ProjectStatus)
+	o := &Orchestrator{
+		cfg: cfg,
+		projectField: &github.ProjectField{
+			ProjectID: "PVT_test",
+			FieldID:   "FIELD_test",
+			Options:   map[string]string{"Todo": "opt-todo", "In Progress": "opt-progress", "Done": "opt-done"},
+		},
+		rateLimitFn: func() (github.RateLimitStatus, error) {
+			return github.RateLimitStatus{
+				GraphQL: github.RateLimitBucket{Limit: 5000, Remaining: 5000},
+			}, nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			synced[issueNumber] = status
+			return true
+		},
+		listNonDoneProjectItemsFn: func(pf *github.ProjectField) ([]github.ProjectItem, error) {
+			return []github.ProjectItem{
+				// Externally-closed issue that never had a board Status.
+				{IssueNumber: 457, IssueClosed: true, HasStatus: false},
+				// Closed issue parked in a non-terminal column.
+				{IssueNumber: 458, IssueClosed: true, HasStatus: true},
+				// Open no-status item still belongs in the backlog (Todo).
+				{IssueNumber: 459, IssueClosed: false, HasStatus: false},
+			}, nil
+		},
+	}
+
+	s := state.NewState()
+	if !o.reconcileProjectBoard(s) {
+		t.Fatal("reconcile should report changes for closed/no-status drift")
+	}
+	if synced[457] != github.ProjectStatusDone {
+		t.Fatalf("closed no-status issue #457 status = %q, want %q", synced[457], github.ProjectStatusDone)
+	}
+	if synced[458] != github.ProjectStatusDone {
+		t.Fatalf("closed in-progress issue #458 status = %q, want %q", synced[458], github.ProjectStatusDone)
+	}
+	if synced[459] != github.ProjectStatusTodo {
+		t.Fatalf("open no-status issue #459 status = %q, want %q", synced[459], github.ProjectStatusTodo)
+	}
+	if !s.ProjectStatusSynced(457, string(github.ProjectStatusDone)) {
+		t.Fatal("reconcile did not persist Done sync for closed no-status issue #457")
+	}
+}
+
 func TestDeferProjectBoardSweepDelaysOnlyBroadSweep(t *testing.T) {
 	o := &Orchestrator{}
 	now := time.Now().UTC()

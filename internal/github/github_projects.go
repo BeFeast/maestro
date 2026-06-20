@@ -211,11 +211,25 @@ type ProjectItem struct {
 	HasStatus   bool // false when the item has no Status field value (shows as "No Status")
 }
 
+// maxProjectItemPages caps how many 100-item pages ListNonDoneProjectItems will
+// walk before giving up. At 100 items per page this covers 10k board items —
+// far beyond any real coordination board — while bounding the worst case if
+// pagination ever fails to terminate.
+const maxProjectItemPages = 100
+
 // ListNonDoneProjectItems fetches all project items not in Done status
 // and returns their linked issue numbers along with whether they are closed.
 // "Done" is resolved against every candidate column name (Done/Completed/Closed)
 // so boards that label their terminal column differently still filter out
 // already-finished items instead of leaking them back into the reconciler.
+//
+// The board is walked across every page (100 items per request) rather than
+// just the first 100. A long-lived board accumulates items indefinitely —
+// Done items are never removed — so a single-page fetch eventually stops
+// observing the older non-done tail, leaving CLOSED items (especially ones
+// that never got a Status) stranded in NO STATUS forever instead of moving to
+// Done. Paginating ensures every non-done item is reconciled each cycle and
+// backfills existing drift (#741).
 func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error) {
 	if pf == nil {
 		return nil, fmt.Errorf("nil ProjectField")
@@ -223,10 +237,41 @@ func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error
 
 	_, doneOptionID, _ := resolveProjectStatusOption(pf, ProjectStatusCandidates(ProjectStatusDone))
 
+	var items []ProjectItem
+	cursor := ""
+	for page := 0; page < maxProjectItemPages; page++ {
+		out, err := c.fetchProjectItemsPage(pf.ProjectID, cursor)
+		if err != nil {
+			return nil, err
+		}
+		pageItems, hasNext, endCursor, err := parseNonDoneProjectItemsPage(out, doneOptionID)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, pageItems...)
+		if !hasNext || endCursor == "" {
+			return items, nil
+		}
+		cursor = endCursor
+	}
+	return items, nil
+}
+
+// fetchProjectItemsPage runs the project-items query for a single page. An empty
+// cursor fetches the first page; a non-empty cursor fetches the page after it.
+func (c *Client) fetchProjectItemsPage(projectID, cursor string) ([]byte, error) {
+	after := ""
+	if cursor != "" {
+		after = fmt.Sprintf(", after: %q", cursor)
+	}
 	query := fmt.Sprintf(`{
   node(id: %q) {
     ... on ProjectV2 {
-      items(first: 100) {
+      items(first: 100%s) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           fieldValueByName(name: "Status") {
             ... on ProjectV2ItemFieldSingleSelectValue {
@@ -243,7 +288,7 @@ func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error
       }
     }
   }
-}`, pf.ProjectID)
+}`, projectID, after)
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
@@ -254,14 +299,29 @@ func (c *Client) ListNonDoneProjectItems(pf *ProjectField) ([]ProjectItem, error
 		}
 		return nil, fmt.Errorf("graphql project items: %w", err)
 	}
-	return parseNonDoneProjectItemsResponse(out, doneOptionID)
+	return out, nil
 }
 
+// parseNonDoneProjectItemsResponse parses a single page of project items and
+// discards the pagination cursor. Retained for callers/tests that only need the
+// item slice from one response.
 func parseNonDoneProjectItemsResponse(out []byte, doneOptionID string) ([]ProjectItem, error) {
+	items, _, _, err := parseNonDoneProjectItemsPage(out, doneOptionID)
+	return items, err
+}
+
+// parseNonDoneProjectItemsPage parses one page of project items, returning the
+// non-done items plus the pagination state (hasNextPage and endCursor) needed
+// to fetch the following page.
+func parseNonDoneProjectItemsPage(out []byte, doneOptionID string) ([]ProjectItem, bool, string, error) {
 	var resp struct {
 		Data struct {
 			Node struct {
 				Items struct {
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
 					Nodes []struct {
 						FieldValueByName *struct {
 							OptionID string `json:"optionId"`
@@ -279,14 +339,14 @@ func parseNonDoneProjectItemsResponse(out []byte, doneOptionID string) ([]Projec
 		} `json:"errors"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
-		return nil, fmt.Errorf("parse project items response: %w", err)
+		return nil, false, "", fmt.Errorf("parse project items response: %w", err)
 	}
 	if len(resp.Errors) > 0 {
 		msgs := make([]string, len(resp.Errors))
 		for i, e := range resp.Errors {
 			msgs[i] = e.Message
 		}
-		return nil, fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
+		return nil, false, "", fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
 	}
 
 	var items []ProjectItem
@@ -304,7 +364,8 @@ func parseNonDoneProjectItemsResponse(out []byte, doneOptionID string) ([]Projec
 		})
 	}
 
-	return items, nil
+	pageInfo := resp.Data.Node.Items.PageInfo
+	return items, pageInfo.HasNextPage, pageInfo.EndCursor, nil
 }
 
 // ProjectBoardColumn captures one Status column on the board with its current
