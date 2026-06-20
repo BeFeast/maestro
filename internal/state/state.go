@@ -1978,19 +1978,41 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	}
 
 	if existingMatch != nil {
-		if existingMatch.TargetStateHash == freshTargetStateHash {
-			// Same (action, target, target-state) — the storm case.
-			// Return the existing approval untouched.
-			return existingMatch
-		}
-		// Same (action, target) but state has moved on — supersede the
-		// stale record and fall through to create a fresh one.
-		s.markApprovalSuperseded(existingMatch, now,
-			"superseded by fresh re-emit: target state changed before approval")
+		// #750: same decision identity (action, target) → update the live
+		// approval IN PLACE and return it under its existing, stable id.
+		// Re-evaluation must NOT supersede + re-mint a sibling just because
+		// the volatile runtime snapshot (session status, retry count, PR
+		// head) moved between cycles — that churn staled the freshest id the
+		// operator just read, so `supervise approve <id>` and the SPA button
+		// raced a moving target every cycle (dogfood 2026-06-20: 170 stale +
+		// 81 superseded in history; merge_pr / spawn_repair_worker were
+		// un-actionable). The previous behaviour returned the existing record
+		// untouched only when the target-state snapshot was identical and
+		// otherwise superseded+re-minted; both branches now collapse to a
+		// single in-place refresh. Supersession is reserved for a genuinely
+		// different decision (different action/target), which hashes to a
+		// different id and falls through to the create path below, and for
+		// the dedicated reconcilers (worker started, issue auto-closed). The
+		// executor re-validates runtime preconditions at execute time
+		// (executeMergePR re-checks PRMergeStatus; the worktree/worker verbs
+		// re-check slot reuse), so keeping the approval live across churn does
+		// not widen the blast radius.
+		s.refreshPendingApproval(existingMatch, decision, freshTargetStateHash, now)
+		return existingMatch
+	}
+
+	id := approvalID(decision, createdAt)
+	if s.approvalIDInUse(id) {
+		// A terminal approval for the same decision identity already holds
+		// this content-addressed id (the previous instance completed and the
+		// same decision recurred). Disambiguate so ids stay unique; the LIVE
+		// pending record is refreshed in place above and never reaches here,
+		// so this never re-introduces per-cycle churn on an effective gate.
+		id = id + "-" + createdAt.UTC().Format("20060102T150405.000000000Z")
 	}
 
 	approval := Approval{
-		ID:              approvalID(decision, createdAt),
+		ID:              id,
 		DecisionID:      decision.ID,
 		CreatedAt:       createdAt,
 		UpdatedAt:       now,
@@ -2013,6 +2035,47 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 	})
 	s.Approvals = append(s.Approvals, approval)
 	return &s.Approvals[len(s.Approvals)-1]
+}
+
+// refreshPendingApproval updates a still-effective (pending or
+// awaiting_dispatch) approval in place from a fresh re-evaluation of the same
+// decision identity, preserving its id, creation time, status, and audit
+// trail so the record stays stable and approvable across supervise cycles
+// (#750). Only the re-derived decision content (summary, risk, evidence,
+// repo/project) and the informational target-state snapshot are refreshed;
+// the recomputed PayloadHash keeps ensureApprovalCurrent's internal-
+// consistency check satisfied. No audit entry is appended — a re-evaluation
+// that changed nothing material must not churn the audit log (that noise was
+// part of the #750 symptom).
+func (s *State) refreshPendingApproval(approval *Approval, decision SupervisorDecision, targetStateHash string, now time.Time) {
+	if approval == nil {
+		return
+	}
+	approval.Summary = decision.Summary
+	approval.Risk = decision.Risk
+	approval.Evidence = append([]string(nil), decision.Reasons...)
+	if strings.TrimSpace(decision.Repo) != "" {
+		approval.Repo = decision.Repo
+	}
+	if strings.TrimSpace(decision.Project) != "" {
+		approval.Project = decision.Project
+	}
+	approval.TargetStateHash = targetStateHash
+	approval.UpdatedAt = normalizedTime(now)
+	approval.PayloadHash = approval.ComputePayloadHash()
+}
+
+// approvalIDInUse reports whether any approval already carries id. Used by the
+// content-addressed mint path to disambiguate a fresh approval whose decision
+// identity collides with a terminal (executed/superseded/stale) record from a
+// previous instance of the same decision (#750).
+func (s *State) approvalIDInUse(id string) bool {
+	for i := range s.Approvals {
+		if s.Approvals[i].ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // RecordLessonProposal records a recurring-failure lesson candidate and mints a
@@ -2337,7 +2400,15 @@ func (s *State) RejectApproval(id string, now time.Time, actor, reason string) (
 	return approval, nil
 }
 
-// MarkStaleApprovals marks pending approvals stale when their payload or target snapshot changes.
+// MarkStaleApprovals marks a pending approval stale only when its payload
+// drifts out of sync with its stored PayloadHash (an internal-consistency
+// guard). As of #750 it no longer stales on target-state-snapshot drift:
+// re-evaluating the same (action, target) decision refreshes the approval in
+// place, and the volatile runtime snapshot moving between cycles must not make
+// the freshest id un-approvable. Genuinely-moot approvals are retired by the
+// dedicated reconcilers (ReconcileSpawnWorkerApprovalsForStartedWorkers,
+// MarkCloseIssueApprovalsStaleForVerifiedIssue, ...) or by the executor's
+// execute-time re-validation.
 func (s *State) MarkStaleApprovals(now time.Time) int {
 	count := 0
 	for i := range s.Approvals {
@@ -2450,11 +2521,19 @@ func (s *State) ensureApprovalCurrent(approval *Approval, now time.Time) error {
 		s.markApprovalStale(approval, now, "approval payload changed")
 		return ErrApprovalPayloadMismatch
 	}
-	currentTargetStateHash := s.ApprovalTargetStateHash(approval.Target)
-	if approval.TargetStateHash != "" && currentTargetStateHash != approval.TargetStateHash {
-		s.markApprovalStale(approval, now, "approval target state changed")
-		return ErrApprovalStale
-	}
+	// #750: a pending approval is NOT staled merely because the volatile
+	// runtime snapshot (session status, retry count, PR head) drifted since it
+	// was minted. The approval authorizes a decision identified by (action,
+	// target); that identity is unchanged here (the payload hash matched), and
+	// RecordPendingApprovalForDecision refreshes the record in place each
+	// cycle instead of re-minting. Staling on target-state churn is exactly
+	// what made the freshest id un-approvable a cycle later — the CLI/SPA
+	// approve path raced a moving target every supervise cycle (dogfood
+	// 2026-06-20: two `supervise approve <freshest-id>` attempts both returned
+	// "approval is stale"). Runtime preconditions are re-validated by the
+	// executor at execute time (e.g. executeMergePR re-checks PRMergeStatus;
+	// the delete/stop/restart verbs re-check slot reuse), so dropping the
+	// approve-time target-state gate does not weaken the safety envelope.
 	return nil
 }
 
@@ -2605,10 +2684,72 @@ type approvalSessionSnapshot struct {
 }
 
 func approvalID(decision SupervisorDecision, createdAt time.Time) string {
+	// #750: content-address the approval id on the decision IDENTITY —
+	// (action, target) — NOT the per-cycle decision.ID or mint timestamp.
+	// Re-evaluating the same logical decision across supervise cycles then
+	// yields the SAME id, so the approval minted in cycle N stays the live,
+	// approvable record in cycle N+k. The old timestamp/decision-id keying
+	// minted a fresh sibling id every cycle (and staled the prior one), so
+	// `maestro supervise approve <id>` and the SPA button always raced a
+	// moving target — the gate was un-actionable for the very verbs that
+	// matter (merge_pr / spawn_repair_worker). Two decisions that share an
+	// identity intentionally collapse to one approval (the idempotency the
+	// gate needs); a genuinely different decision (different action/target)
+	// hashes to a different id. RecordPendingApprovalForDecision updates the
+	// matching approval in place rather than minting a sibling under a new id.
+	if key := approvalDecisionIdentityHash(decision.RecommendedAction, decision.Target); key != "" {
+		return "approval-" + key
+	}
+	// Defensive fallback: a decision with neither an action nor a target
+	// identity (never produced by a real gated mint) keeps the legacy keying
+	// so two such records cannot collide on an empty hash.
 	if decision.ID != "" {
 		return "approval-" + decision.ID
 	}
 	return "approval-" + createdAt.UTC().Format("20060102T150405.000000000Z")
+}
+
+// approvalDecisionIdentityHash returns a stable 16-hex digest of a decision's
+// identity: the (action, target) tuple that determines WHICH side effect an
+// approval authorizes. The volatile per-cycle runtime snapshot folded into
+// ApprovalTargetStateHash (session status, retry count, next-retry time) is
+// deliberately excluded so the digest is stable across supervise cycles
+// (#750). Target.HeadSHA IS part of the identity — a decision stamped against
+// a specific PR head (e.g. spawn_review_repair, #565) genuinely changes when
+// the head moves. Returns "" when there is nothing to address (no action and
+// no target). Whitespace in Session/HeadSHA is trimmed so the digest matches
+// approvalTargetsEqual's trimmed comparison.
+func approvalDecisionIdentityHash(action string, target *SupervisorTarget) string {
+	action = strings.TrimSpace(action)
+	if action == "" && target == nil {
+		return ""
+	}
+	full := stableHash(approvalDecisionIdentity{
+		Action: action,
+		Target: normalizedTargetIdentity(target),
+	})
+	if len(full) > 16 {
+		return full[:16]
+	}
+	return full
+}
+
+type approvalDecisionIdentity struct {
+	Action string            `json:"action"`
+	Target *SupervisorTarget `json:"target,omitempty"`
+}
+
+// normalizedTargetIdentity returns a copy of target with Session/HeadSHA
+// trimmed, so the content-addressed approval id is robust to incidental
+// whitespace and consistent with approvalTargetsEqual.
+func normalizedTargetIdentity(target *SupervisorTarget) *SupervisorTarget {
+	if target == nil {
+		return nil
+	}
+	clone := cloneSupervisorTarget(target)
+	clone.HeadSHA = strings.TrimSpace(clone.HeadSHA)
+	clone.Session = strings.TrimSpace(clone.Session)
+	return clone
 }
 
 func approvalTargetMatches(target *SupervisorTarget, slot string, sess *Session) bool {

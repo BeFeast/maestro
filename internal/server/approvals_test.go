@@ -78,6 +78,58 @@ func TestHandleApproval_Approve_HappyPath(t *testing.T) {
 	}
 }
 
+// TestHandleApproval_ApproveAfterChurningCycle covers #750 criteria 1/3: the
+// SPA /approvals approve path must execute without a "stale" race when the
+// pending approval was read a supervise cycle earlier and the bound session's
+// runtime snapshot churned in between. The id stays the live, approvable
+// record across the cycle.
+func TestHandleApproval_ApproveAfterChurningCycle(t *testing.T) {
+	srv, dir := srvWithStateDir(t)
+	a := enqueuedApproval(t, dir, "merge_pr", &state.SupervisorTarget{PR: 748, Issue: 700})
+
+	// Simulate one supervise cycle landing between the operator reading the id
+	// and clicking approve: a bound session churns, MarkStaleApprovals runs at
+	// the cycle top, and the unchanged decision is re-emitted.
+	st, _ := state.Load(dir)
+	now := time.Now().UTC()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 700, PRNumber: 748, Status: state.StatusRetryExhausted, RetryCount: 5}
+	st.MarkStaleApprovals(now)
+	reemit := state.SupervisorDecision{
+		ID:                "synthetic-merge_pr-cycle2",
+		CreatedAt:         now,
+		Project:           "owner/repo",
+		Summary:           "test enqueue",
+		RecommendedAction: "merge_pr",
+		Target:            &state.SupervisorTarget{PR: 748, Issue: 700},
+		Risk:              "high",
+		RequiresApproval:  true,
+	}
+	reemitted := st.RecordPendingApprovalForDecision(reemit, now)
+	if reemitted.ID != a.ID {
+		t.Fatalf("approval id churned across cycle: %q -> %q", a.ID, reemitted.ID)
+	}
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Approve the id read before the cycle — must succeed, not 409 stale.
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/approvals/"+a.ID+"/approve",
+		bytes.NewBufferString(`{"actor":"oleg","reason":"green"}`))
+	w := httptest.NewRecorder()
+	srv.handleApproval(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp approvalDecisionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.OK || resp.Approval == nil || resp.Approval.Status != state.ApprovalStatusApproved {
+		t.Fatalf("response = %+v", resp)
+	}
+}
+
 func TestHandleApproval_Reject_HappyPath(t *testing.T) {
 	srv, dir := srvWithStateDir(t)
 	a := enqueuedApproval(t, dir, "close_issue", &state.SupervisorTarget{Issue: 7})
