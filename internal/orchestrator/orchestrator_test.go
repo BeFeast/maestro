@@ -9897,3 +9897,117 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendRetryNoDoubleCount(t *testing.T
 		t.Errorf("CostUSDBackend = %v, want 0.003 (cumulative)", sess.CostUSDBackend)
 	}
 }
+
+// codexTurnFrame builds one terminal codex `exec --json` turn.completed event
+// with the given token totals, as the stream-splitter would append it.
+// cached_input_tokens is a subset of input_tokens (OpenAI semantics).
+func codexTurnFrame(in, cached, out int) string {
+	return fmt.Sprintf(`{"type":"turn.completed","usage":{"input_tokens":%d,"cached_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":0}}`+"\n",
+		in, cached, out)
+}
+
+// codexTestOrchestrator wires a session to a codex backend (usage_stream on,
+// with pricing so virtual cost is exercisable) whose slot.jsonl lives at
+// <dir>/<slot>.jsonl. Returns the orchestrator, session, and jsonl path.
+func codexTestOrchestrator(t *testing.T, slot string) (*Orchestrator, *state.Session, string) {
+	t.Helper()
+	dir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: dir,
+			Model: config.ModelConfig{
+				Default: "codex",
+				Backends: map[string]config.BackendDef{
+					"codex": {
+						Cmd:         "codex",
+						UsageStream: true,
+						Pricing:     config.BackendPricing{InputUSDPerMtok: 1.25, OutputUSDPerMtok: 10},
+					},
+				},
+			},
+		},
+	}
+	logFile := dir + "/" + slot + ".log"
+	sess := &state.Session{Backend: "codex", LogFile: logFile}
+	return o, sess, dir + "/" + slot + ".jsonl"
+}
+
+// #738: a codex session reads usage from the slot.jsonl side channel (not the
+// human-readable slot.log) and stamps non-zero tokens. codex reports no USD,
+// so CostUSDBackend stays 0 — the dollar figure is virtual (configured pricing
+// via SessionCostEstimate). cached_input_tokens is a subset of input_tokens,
+// so the stamped total is input+output only.
+func TestUpdateTokensUsedFromOutput_CodexBackendStampsUsage(t *testing.T) {
+	o, sess, jsonlPath := codexTestOrchestrator(t, "sup-738")
+	frames := `{"type":"thread.started","thread_id":"REDACTED"}` + "\n" +
+		`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"pong"}}` + "\n" +
+		codexTurnFrame(12087, 4992, 5)
+	if err := os.WriteFile(jsonlPath, []byte(frames), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The passed output (slot.log/tmux) is intentionally ignored for codex.
+	if !o.updateTokensUsedFromOutput("sup-738", sess, "human readable log text, no token total") {
+		t.Fatal("expected a change from the codex jsonl side channel")
+	}
+	// input 12087 + output 5 = 12092 (cache is a subset of input, not added).
+	if sess.TokensUsedTotal != 12092 || sess.TokensUsedAttempt != 12092 {
+		t.Errorf("tokens total=%d attempt=%d, want 12092/12092", sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+	if sess.UsageTokensWatermark != 12092 {
+		t.Errorf("UsageTokensWatermark = %d, want 12092", sess.UsageTokensWatermark)
+	}
+	// codex never self-reports USD — cost stays virtual (CostUSDBackend == 0).
+	if sess.CostUSDBackend != 0 {
+		t.Errorf("CostUSDBackend = %v, want 0 (codex cost is virtual, never self-reported)", sess.CostUSDBackend)
+	}
+}
+
+// #738: a forced retry/respawn appends a second `codex exec` invocation's
+// turn.completed event to the same slot.jsonl. The full-jsonl parse returns
+// the cumulative total, but the monotonic watermark ensures only the new run's
+// delta is added — no double-count of the prior attempt's tokens.
+func TestUpdateTokensUsedFromOutput_CodexBackendRetryNoDoubleCount(t *testing.T) {
+	o, sess, jsonlPath := codexTestOrchestrator(t, "sup-738")
+
+	run1 := codexTurnFrame(770, 0, 3) // total 773
+	if err := os.WriteFile(jsonlPath, []byte(run1), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateTokensUsedFromOutput("sup-738", sess, "") {
+		t.Fatal("run1: expected a change")
+	}
+	if sess.TokensUsedTotal != 773 || sess.UsageTokensWatermark != 773 || sess.TokensUsedAttempt != 773 {
+		t.Fatalf("run1: total=%d wm=%d attempt=%d, want 773/773/773",
+			sess.TokensUsedTotal, sess.UsageTokensWatermark, sess.TokensUsedAttempt)
+	}
+
+	// Respawn: per-attempt counter resets, watermark persists.
+	sess.TokensUsedAttempt = 0
+
+	// Re-parse the unchanged jsonl before the new run lands — must NOT re-add.
+	if o.updateTokensUsedFromOutput("sup-738", sess, "") {
+		t.Fatal("re-parse of unchanged jsonl must not report a change (would double-count)")
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("after re-parse: TokensUsedTotal = %d, want 773 (no double-count)", sess.TokensUsedTotal)
+	}
+
+	// New run appends its turn.completed: cumulative 1773, delta only (1000).
+	run2 := codexTurnFrame(900, 0, 100) // total 1000
+	if err := os.WriteFile(jsonlPath, []byte(run1+run2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateTokensUsedFromOutput("sup-738", sess, "") {
+		t.Fatal("run2: expected a change")
+	}
+	if sess.TokensUsedTotal != 1773 {
+		t.Errorf("after run2: TokensUsedTotal = %d, want 1773 (delta only)", sess.TokensUsedTotal)
+	}
+	if sess.TokensUsedAttempt != 1000 {
+		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
+	}
+	if sess.UsageTokensWatermark != 1773 {
+		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
+	}
+}

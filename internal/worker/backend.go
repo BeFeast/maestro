@@ -27,8 +27,16 @@ func splitCmd(cmd string) (binary string, prefixArgs []string) {
 // Used so an operator-specified output format in cmd/extra_args overrides the
 // #737 stream-json default instead of producing a duplicate flag.
 func argsHaveOutputFormat(args []string) bool {
+	return argsHaveFlag(args, "--output-format")
+}
+
+// argsHaveFlag reports whether args already contain the given flag, either as
+// a bare token (`--json`) or in the `--json=value` form. Used so an
+// operator-pinned flag in cmd/extra_args overrides a backend default instead
+// of producing a duplicate (e.g. the codex #738 `--json` opt-in).
+func argsHaveFlag(args []string, flag string) bool {
 	for _, a := range args {
-		if a == "--output-format" || strings.HasPrefix(a, "--output-format=") {
+		if a == flag || strings.HasPrefix(a, flag+"=") {
 			return true
 		}
 	}
@@ -43,9 +51,10 @@ type BackendConfig struct {
 	Provider   string   // per-backend provider field; resolves the exec path for custom-named backends (#684)
 	Model      string   // optional model name for role-specific backend calls
 	Effort     string   // optional reasoning effort for role-specific backend calls
-	// UsageStream opts a claude-kind worker into `--output-format stream-json
-	// --verbose` so its NDJSON usage stream can be captured on a side-channel
-	// slot.jsonl (#737). Off by default; ignored by non-claude backends.
+	// UsageStream opts a structured-stream worker into emitting NDJSON usage
+	// frames on a side-channel slot.jsonl: claude `--output-format stream-json
+	// --verbose` (#737) and codex `exec --json` (#738). Off by default;
+	// ignored by backends without a structured-stream mode.
 	UsageStream bool
 	MCP         config.MCPConfig
 }
@@ -115,6 +124,14 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	}
 	binary, cmdArgs := splitCmd(codexCmd)
 	args := append(cmdArgs, "exec", "--dangerously-bypass-approvals-and-sandbox", "-C", worktree)
+	// #738: opt-in structured streaming so usage (tokens) can be parsed from
+	// the NDJSON side-channel. `codex exec --json` emits JSONL events incl. a
+	// terminal turn.completed usage block {input, cached_input, output}.
+	// Skipped when the operator already pins --json via cmd or extra_args, so
+	// their choice (and the matching runner wiring) wins — no duplicate flag.
+	if cfg.UsageStream && !argsHaveFlag(cmdArgs, "--json") && !argsHaveFlag(cfg.ExtraArgs, "--json") {
+		args = append(args, "--json")
+	}
 	var err error
 	args, err = appendCodexMCPOptions(args, cfg.MCP)
 	if err != nil {
@@ -440,14 +457,17 @@ func maestroExecutablePath() (string, bool) {
 }
 
 // streamSplitForBackend returns the worker runner's stream-split configuration,
-// or nil when the plain `tee` pipeline should be used. Only a claude-kind
-// backend with usage_stream opted in streams NDJSON; when the maestro binary
-// cannot be resolved it degrades to nil (plain tee) per #737.
+// or nil when the plain `tee` pipeline should be used. Only a structured-stream
+// backend (claude #737, codex #738) with usage_stream opted in streams NDJSON;
+// when the maestro binary cannot be resolved it degrades to nil (plain tee).
+// The resolved backend kind is passed to the splitter so it renders the right
+// human-readable form into slot.log.
 func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string) *streamSplit {
 	if !cfg.UsageStream {
 		return nil
 	}
-	if resolveBackendKind(backendName, cfg) != config.BackendKindClaude {
+	kind := resolveBackendKind(backendName, cfg)
+	if kind != config.BackendKindClaude && kind != config.BackendKindCodex {
 		return nil
 	}
 	bin, ok := maestroExecutablePath()
@@ -456,7 +476,7 @@ func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string
 	}
 	return &streamSplit{
 		MaestroBin: bin,
-		Backend:    config.BackendKindClaude,
+		Backend:    kind,
 		JSONLPath:  JSONLPathForLog(logFile),
 	}
 }

@@ -310,9 +310,9 @@ model:
 
 A backend that matches none of the above falls back to the generic exec path: `prompt_mode` applies, no permission-bypass flag is added, and Maestro logs a startup warning naming the backend. Use the generic path only for genuinely custom CLIs.
 
-### Claude usage capture (tokens + cost)
+### Claude / Codex usage capture (tokens + cost)
 
-Plain `claude -p` text mode prints no parseable token total, so a claude worker's `tokens_used_total` and USD cost stay `0`. Opt a claude backend into structured usage capture with `usage_stream: true`:
+Plain `claude -p` text mode prints no parseable token total, and `codex exec` text mode only prints a fuzzy single total — so a worker's `tokens_used_total` and USD cost are unreliable or `0`. Opt a `claude` or `codex` backend into structured usage capture with `usage_stream: true`:
 
 ```yaml
 model:
@@ -321,9 +321,15 @@ model:
     claude:
       cmd: claude
       usage_stream: true   # run claude in --output-format stream-json; capture tokens + cost
+    codex:
+      cmd: codex
+      usage_stream: true   # run codex exec --json; capture split tokens (cost = virtual)
+      pricing:
+        input_usd_per_mtok: 1.25
+        output_usd_per_mtok: 10
 ```
 
-When enabled, the worker runs `claude --output-format stream-json --verbose` and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens + `total_cost_usd`) while keeping `<slot>.log` human-readable. The session then reports non-zero tokens + cost in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` in `extra_args` overrides it. (The `pi` backend captures usage natively and needs no opt-in.)
+When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` (claude) or `--json` (codex) in `extra_args` overrides it. Claude reports its own `total_cost_usd`; codex does not, so its cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
 
 ### Optional worker MCP tools
 
