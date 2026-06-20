@@ -8,9 +8,26 @@ restarting units.
 
 ## How it works
 
-After the orchestrator merges a PR (and after the optional version bump),
-it launches `scripts/self-deploy.sh` through a **detached transient systemd
-unit** (`systemd-run --user --collect --unit maestro-self-deploy-pr<N>-<ts>`).
+A self-deploy fires on either of two triggers:
+
+- **Orchestrator merge** — after the orchestrator merges a PR (and after the
+  optional version bump).
+- **Observed main-advance (#751)** — when the orchestrator sees `origin/main`
+  point past the commit the running binary was built from, i.e. a PR merged
+  outside its own merge path (the GitHub UI, a manual `gh pr merge`, or the
+  approval-gate executor). Each cycle compares the running binary's stamped SHA
+  (`<version>+g<shortsha>`) against `origin/main`'s head; a difference is the
+  drift signal. This means a green PR merged by **any** path reaches the running
+  binary without manual intervention. It is the **same debounced trigger** as a
+  merge (see the debounce below), so an orchestrator merge that just launched a
+  deploy is not double-triggered, and a reconcile that sees many already-merged
+  *historical* PRs does not storm — once a deploy lands, the binary matches main
+  and the drift clears.
+
+Either trigger launches `scripts/self-deploy.sh` through a **detached transient
+systemd unit** (`systemd-run --user --collect --unit
+maestro-self-deploy-pr<N>-<ts>`; the observed-main-advance path uses `pr0`,
+since no specific PR was merged by the orchestrator).
 Detachment is the load-bearing part: the script restarts the very units that
 run the orchestrator, and must survive that restart.
 
@@ -95,7 +112,10 @@ this:
   dir (`self-deploy-last-trigger.json`) and skips re-triggering within
   `min_interval_minutes` (default: `timeout_minutes`). This survives the
   run-loop being restarted by its own deploy. Lower it for faster back-to-back
-  deploys on an idle fleet.
+  deploys on an idle fleet. The observed-main-advance trigger (#751) shares this
+  marker, so it never double-fires against an orchestrator merge — and its
+  drift check (running-binary SHA vs `origin/main`) self-clears once a deploy
+  lands, so historical merged PRs never storm it.
 
 It is still safe (and simplest) to keep the run-loop unit in `units`; these
 guards make that configuration converge. Re-enable `self_deploy` on the dogfood

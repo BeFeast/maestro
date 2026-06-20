@@ -548,6 +548,7 @@ func runCmd(args []string) {
 	if len(cfgs) == 1 {
 		cfg := cfgs[0]
 		orch := orchestrator.New(cfg)
+		orch.SetBinaryVersion(resolveVersion())
 		if err := orch.LoadPromptBase(*promptPath); err != nil {
 			log.Printf("warn: load prompt: %v", err)
 		}
@@ -606,6 +607,7 @@ func runCmd(args []string) {
 		go func(c *config.Config) {
 			defer wg.Done()
 			orch := orchestrator.New(c)
+			orch.SetBinaryVersion(resolveVersion())
 			if err := orch.LoadPromptBase(*promptPath); err != nil {
 				log.Printf("[%s] warn: load prompt: %v", c.SessionPrefix, err)
 			}
