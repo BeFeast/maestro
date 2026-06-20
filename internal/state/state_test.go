@@ -1952,7 +1952,13 @@ func TestRecordPendingApprovalDedupsIdenticalReEmit(t *testing.T) {
 	}
 }
 
-func TestRecordPendingApprovalSupersedesOnTargetStateChange(t *testing.T) {
+// #750: re-evaluating the same (action, target) decision after the volatile
+// target-state snapshot moved must UPDATE THE LIVE APPROVAL IN PLACE under its
+// stable id — NOT supersede it and re-mint a sibling. The pre-#750 behaviour
+// (asserted by the old TestRecordPendingApprovalSupersedesOnTargetStateChange)
+// is exactly the churn that made the CLI/SPA approve path race a moving target
+// every supervise cycle.
+func TestRecordPendingApprovalUpdatesInPlaceOnTargetStateChange(t *testing.T) {
 	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
 	s := NewState()
 
@@ -1981,58 +1987,125 @@ func TestRecordPendingApprovalSupersedesOnTargetStateChange(t *testing.T) {
 	}
 
 	later := now.Add(2 * time.Minute)
-	// Use a fresh decision ID — supervisor mints decisions with unique
-	// per-cycle IDs in production; testApprovalDecision reuses the same
-	// ID literal, so we'd otherwise collide on approvalID() output.
+	// A fresh per-cycle decision id must NOT change the content-addressed
+	// approval id — the id keys on (action, target), not decision.ID.
 	freshDecision := testApprovalDecision(later)
 	freshDecision.ID = "sup-approval-2"
+	freshDecision.Summary = "Start a worker for issue #42: ready work (re-evaluated)"
 	second := s.RecordPendingApprovalForDecision(freshDecision, later)
 	if second == nil {
 		t.Fatal("second approval was nil")
 	}
-	if second.ID == firstID {
-		t.Fatalf("expected a fresh approval after target-state change; got the original ID %q", firstID)
+	if second.ID != firstID {
+		t.Fatalf("approval id churned after target-state change: got %q, want stable %q", second.ID, firstID)
 	}
 
-	// Old one must be superseded.
-	old, ok := s.FindApproval(firstID)
-	if !ok {
-		t.Fatalf("original approval %q missing", firstID)
+	// Still exactly one approval, still pending, no superseded sibling.
+	if got := len(s.Approvals); got != 1 {
+		t.Fatalf("len(approvals) = %d, want 1 (no churn sibling minted)", got)
 	}
-	if old.Status != ApprovalStatusSuperseded {
-		t.Fatalf("original status = %q, want superseded", old.Status)
-	}
-	gotSupersededAudit := false
-	for _, a := range old.Audit {
-		if a.Event == ApprovalAuditSuperseded {
-			gotSupersededAudit = true
-			break
-		}
-	}
-	if !gotSupersededAudit {
-		t.Fatalf("expected superseded audit entry on original; got %+v", old.Audit)
-	}
-
-	// New one must be pending and tied to the new target hash.
 	if second.Status != ApprovalStatusPending {
-		t.Fatalf("new approval status = %q, want pending", second.Status)
+		t.Fatalf("status = %q, want pending", second.Status)
 	}
-	if second.TargetStateHash == firstTargetHash {
-		t.Fatalf("new TargetStateHash equal to old; expected fresh hash")
-	}
-
-	// Exactly one pending, one superseded.
-	var pending, superseded int
-	for _, a := range s.Approvals {
-		switch a.Status {
-		case ApprovalStatusPending:
-			pending++
-		case ApprovalStatusSuperseded:
-			superseded++
+	for _, a := range second.Audit {
+		if a.Event == ApprovalAuditSuperseded {
+			t.Fatalf("approval must not be superseded on target-state churn; audit = %+v", second.Audit)
 		}
 	}
-	if pending != 1 || superseded != 1 {
-		t.Fatalf("counts = pending %d / superseded %d, want 1 / 1", pending, superseded)
+
+	// Updated in place: target-state snapshot and re-derived content refreshed,
+	// UpdatedAt bumped, CreatedAt preserved, PayloadHash self-consistent.
+	if second.TargetStateHash != freshHash {
+		t.Fatalf("TargetStateHash = %q, want refreshed %q", second.TargetStateHash, freshHash)
+	}
+	if !second.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("CreatedAt moved: got %s, want %s", second.CreatedAt, first.CreatedAt)
+	}
+	if !second.UpdatedAt.After(first.CreatedAt) {
+		t.Fatalf("UpdatedAt = %s, want bumped past CreatedAt %s", second.UpdatedAt, first.CreatedAt)
+	}
+	if second.Summary != freshDecision.Summary {
+		t.Fatalf("summary = %q, want refreshed %q", second.Summary, freshDecision.Summary)
+	}
+	if second.ComputePayloadHash() != second.PayloadHash {
+		t.Fatalf("PayloadHash not refreshed in place: stored %q, computed %q", second.PayloadHash, second.ComputePayloadHash())
+	}
+
+	// The id remains approvable after the in-place update.
+	if _, err := s.ApproveApproval(firstID, later.Add(time.Minute), "cli", "go"); err != nil {
+		t.Fatalf("ApproveApproval after in-place update: %v", err)
+	}
+}
+
+// TestRecordPendingApprovalStableAcrossSupervisorCycles drives several
+// supervise cycles over an unchanged merge_pr decision while the bound
+// session's volatile runtime snapshot (status, retry count, next-retry time)
+// churns every cycle, and asserts the approval id is stable and still
+// approvable on the last cycle (#750 acceptance criteria 1, 2, 5). Before
+// #750 each cycle re-minted a fresh id keyed on the per-cycle decision
+// id/timestamp and staled the prior one, so `supervise approve <id>` always
+// raced a moving target.
+func TestRecordPendingApprovalStableAcrossSupervisorCycles(t *testing.T) {
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{
+		IssueNumber: 700,
+		Status:      StatusRetryExhausted,
+		PRNumber:    748,
+		RetryCount:  3,
+	}
+	decisionFor := func(cycle int, at time.Time) SupervisorDecision {
+		return SupervisorDecision{
+			// Production mints a UNIQUE per-cycle decision id; the stable
+			// approval id must NOT depend on it.
+			ID:                fmt.Sprintf("sup-cycle-%d", cycle),
+			CreatedAt:         at,
+			Project:           "owner/repo",
+			Summary:           "Merge PR #748 (retry-exhausted hand-off).",
+			RecommendedAction: "merge_pr",
+			Target:            &SupervisorTarget{PR: 748, Issue: 700},
+			Risk:              "mutating",
+			Reasons:           []string{"PR #748 is green"},
+		}
+	}
+
+	var ids []string
+	for cycle := 0; cycle < 4; cycle++ {
+		at := now.Add(time.Duration(cycle) * time.Minute)
+		// Cycle top: the supervisor stales drifted approvals before re-emit.
+		s.MarkStaleApprovals(at)
+		approval := s.RecordPendingApprovalForDecision(decisionFor(cycle, at), at)
+		if approval == nil {
+			t.Fatalf("cycle %d: approval was nil", cycle)
+		}
+		if approval.Status != ApprovalStatusPending {
+			t.Fatalf("cycle %d: status = %q, want pending", cycle, approval.Status)
+		}
+		ids = append(ids, approval.ID)
+		// Churn the bound session's runtime snapshot, the way a retry-exhausted
+		// worker's NextRetryAt / RetryCount move every supervise cycle.
+		next := at.Add(30 * time.Minute)
+		s.Sessions["slot-1"].NextRetryAt = &next
+		s.Sessions["slot-1"].RetryCount = 3 + cycle
+	}
+
+	for i, id := range ids {
+		if id != ids[0] {
+			t.Fatalf("approval id churned: cycle %d id = %q, cycle 0 id = %q", i, id, ids[0])
+		}
+	}
+	// Exactly one approval ever existed — no stale/superseded siblings.
+	if len(s.Approvals) != 1 {
+		t.Fatalf("len(approvals) = %d, want 1 (no churn siblings)", len(s.Approvals))
+	}
+
+	// The id read a cycle earlier is still approvable on the last cycle.
+	approved, err := s.ApproveApproval(ids[0], now.Add(5*time.Minute), "cli", "land hand-off")
+	if err != nil {
+		t.Fatalf("ApproveApproval(stable id) after %d cycles: %v", len(ids), err)
+	}
+	if approved.Status != ApprovalStatusApproved {
+		t.Fatalf("approved status = %q, want approved", approved.Status)
 	}
 }
 
@@ -2293,35 +2366,40 @@ func TestApproveMissingApprovalFailsSafely(t *testing.T) {
 	}
 }
 
-func TestApproveStaleApprovalFailsSafely(t *testing.T) {
+// #750: target-state drift between mint and approve must NOT stale the
+// approval. The pre-#750 behaviour (asserted by the old
+// TestApproveStaleApprovalFailsSafely) returned ErrApprovalStale here, which
+// is precisely why `supervise approve <freshest-id>` raced a moving target on
+// the dogfood supervisor. The executor re-validates runtime preconditions at
+// execute time, so the approve gate keys only on the unchanged decision
+// identity. Genuine payload-identity changes still fail safely — see
+// TestApproveChangedApprovalPayloadFailsSafely.
+func TestApproveSucceedsAcrossTargetStateDrift(t *testing.T) {
 	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
 	s := NewState()
 	s.Sessions["slot-1"] = &Session{IssueNumber: 77, Status: StatusRetryExhausted, PRNumber: 12}
 	decision := SupervisorDecision{
-		ID:                "sup-stale",
+		ID:                "sup-stable",
 		CreatedAt:         now,
 		Project:           "owner/repo",
 		Mode:              "read_only",
-		Summary:           "Review retry-exhausted issue #77.",
-		RecommendedAction: "review_retry_exhausted",
+		Summary:           "Merge PR #12 for issue #77.",
+		RecommendedAction: "merge_pr",
 		Target:            &SupervisorTarget{Issue: 77, PR: 12, Session: "slot-1"},
-		Risk:              "approval_gated",
+		Risk:              "mutating",
 		Confidence:        0.93,
-		Reasons:           []string{"retry budget exhausted"},
+		Reasons:           []string{"PR is green"},
 	}
 	approval := s.RecordPendingApprovalForDecision(decision, now)
+	// The bound session's runtime state moves before the operator approves.
 	s.Sessions["slot-1"].Status = StatusDone
 
-	_, err := s.ApproveApproval(approval.ID, now.Add(time.Minute), "cli", "")
-	if !errors.Is(err, ErrApprovalStale) {
-		t.Fatalf("ApproveApproval stale err = %v, want %v", err, ErrApprovalStale)
+	approved, err := s.ApproveApproval(approval.ID, now.Add(time.Minute), "cli", "land it")
+	if err != nil {
+		t.Fatalf("ApproveApproval across target-state drift: %v, want success", err)
 	}
-	if s.Approvals[0].Status != ApprovalStatusStale {
-		t.Fatalf("status = %q, want %q", s.Approvals[0].Status, ApprovalStatusStale)
-	}
-	last := s.Approvals[0].Audit[len(s.Approvals[0].Audit)-1]
-	if last.Event != ApprovalAuditStale {
-		t.Fatalf("last audit = %#v, want stale event", last)
+	if approved.Status != ApprovalStatusApproved {
+		t.Fatalf("status = %q, want approved", approved.Status)
 	}
 }
 

@@ -2023,8 +2023,11 @@ func TestFleetAPIIncludesApprovalInboxMetadata(t *testing.T) {
 		Target:            &state.SupervisorTarget{Issue: 43, Session: "slot-stale"},
 		Risk:              "approval_gated",
 	}, now.Add(-50*time.Minute))
-	st.Sessions["slot-stale"].PRNumber = 9
-	st.MarkStaleApprovals(now.Add(-10 * time.Minute))
+	// #750: target-state drift no longer stales a pending approval (that churn
+	// made the freshest id un-approvable a cycle later). Drive this fixture to
+	// the stale state directly so the snapshot still exercises stale rendering.
+	stale.Status = state.ApprovalStatusStale
+	stale.UpdatedAt = now.Add(-10 * time.Minute)
 	if err := state.Save(stateDir, st); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
