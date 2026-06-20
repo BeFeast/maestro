@@ -383,23 +383,151 @@ func TestApplySessionCostEstimate(t *testing.T) {
 // must come from the configured pricing block. With pricing the estimate is
 // non-zero; without it the session degrades to tokens-only ($0). A claude
 // session that DID self-report a cost still prefers that over the estimate.
+// Ported to the #739 split-token signature: codex carries no split tokens, so
+// the call falls through to the blended estimate (same result as pre-#739).
 func TestSessionCostEstimate_CodexVirtual(t *testing.T) {
 	pricing := map[string]config.BackendPricing{
 		"codex":  {InputUSDPerMtok: 1.25, OutputUSDPerMtok: 10},
 		"claude": {InputUSDPerMtok: 10, OutputUSDPerMtok: 30},
 	}
-	// codex: backendCost is always 0, so the (1.25+10)/2 = 5.625 $/Mtok blend
-	// applies → 1M tokens ≈ $5.625 (virtual, from pricing).
-	if got := sessionCostEstimate("codex", 1_000_000, pricing, 0); math.Abs(got-5.625) > 1e-6 {
+	// codex: backendCost is always 0 and no split tokens, so the
+	// (1.25+10)/2 = 5.625 $/Mtok blend applies → 1M tokens ≈ $5.625.
+	if got := sessionCostEstimate("codex", 1_000_000, 0, 0, 0, 0, pricing, 0); math.Abs(got-5.625) > 1e-6 {
 		t.Errorf("codex virtual cost = %f, want ~5.625", got)
 	}
 	// codex with no pricing → tokens-only ($0), never a self-reported cost.
-	if got := sessionCostEstimate("codex", 1_000_000, map[string]config.BackendPricing{"codex": {}}, 0); got != 0 {
+	if got := sessionCostEstimate("codex", 1_000_000, 0, 0, 0, 0, map[string]config.BackendPricing{"codex": {}}, 0); got != 0 {
 		t.Errorf("codex unpriced cost = %f, want 0", got)
 	}
 	// A self-reported cost (e.g. claude total_cost_usd) still wins over pricing.
-	if got := sessionCostEstimate("claude", 1_000_000, pricing, 0.04); math.Abs(got-0.04) > 1e-9 {
+	if got := sessionCostEstimate("claude", 1_000_000, 0, 0, 0, 0, pricing, 0.04); math.Abs(got-0.04) > 1e-9 {
 		t.Errorf("self-reported cost = %f, want 0.04 (prefer backend cost)", got)
+	}
+}
+
+// TestBuildFleetCostObservability_SplitCosting proves the rollup prices a
+// session carrying cache-aware split tokens (#739) with EstimateCostSplit —
+// the cache-read discount makes the panel's USD a small fraction of the naive
+// blended figure on a cache-heavy run.
+func TestBuildFleetCostObservability_SplitCosting(t *testing.T) {
+	now := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	dayStart := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Backends: map[string]config.BackendDef{
+				"claude": {Pricing: config.BackendPricing{InputUSDPerMtok: 15, OutputUSDPerMtok: 75}},
+			},
+		},
+	}
+	st := &state.State{Sessions: map[string]*state.Session{
+		// Cache-heavy split tokens, no self-reported cost → split estimate.
+		"split-1": {
+			IssueNumber:      1,
+			IssueTitle:       "cache-heavy run",
+			Backend:          "claude",
+			Status:           state.StatusDone,
+			StartedAt:        dayStart.Add(time.Hour),
+			FinishedAt:       timePtr(dayStart.Add(2 * time.Hour)),
+			TokensUsedTotal:  1_065_000,
+			TokensInput:      10_000,
+			TokensOutput:     5_000,
+			TokensCacheRead:  1_000_000,
+			TokensCacheWrite: 50_000,
+		},
+	}}
+
+	got := buildFleetCostObservability(cfg, st, now)
+
+	// Cache-aware split: $2.9625, NOT the blended $47.925.
+	if math.Abs(got.WindowToday.USD-2.9625) > 1e-6 {
+		t.Errorf("today USD = %f, want ~2.9625 (cache-aware split, not blended $47.925)", got.WindowToday.USD)
+	}
+	if math.Abs(got.Lifetime.USD-2.9625) > 1e-6 {
+		t.Errorf("lifetime USD = %f, want ~2.9625", got.Lifetime.USD)
+	}
+	// Tokens still report the full combined total for the panel.
+	if got.WindowToday.Tokens != 1_065_000 {
+		t.Errorf("today tokens = %d, want 1065000 (combined total preserved)", got.WindowToday.Tokens)
+	}
+	// The per-issue rollup carries the same split-priced figure.
+	if len(got.PerIssue) != 1 {
+		t.Fatalf("per_issue rows = %d, want 1", len(got.PerIssue))
+	}
+	if math.Abs(got.PerIssue[0].USD-2.9625) > 1e-6 {
+		t.Errorf("issue USD = %f, want ~2.9625", got.PerIssue[0].USD)
+	}
+}
+
+// TestBuildFleetCostObservability_SelfReportedCostWins proves the backend's
+// self-reported cost (#730) takes precedence over both the split and blended
+// estimates in the rollup (acceptance: "Self-reported cost still takes
+// precedence over the estimate").
+func TestBuildFleetCostObservability_SelfReportedCostWins(t *testing.T) {
+	now := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	dayStart := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Backends: map[string]config.BackendDef{
+				"claude": {Pricing: config.BackendPricing{InputUSDPerMtok: 15, OutputUSDPerMtok: 75}},
+			},
+		},
+	}
+	st := &state.State{Sessions: map[string]*state.Session{
+		"reported-1": {
+			IssueNumber:      1,
+			Backend:          "claude",
+			Status:           state.StatusDone,
+			StartedAt:        dayStart.Add(time.Hour),
+			FinishedAt:       timePtr(dayStart.Add(2 * time.Hour)),
+			TokensUsedTotal:  1_065_000,
+			TokensInput:      10_000,
+			TokensOutput:     5_000,
+			TokensCacheRead:  1_000_000,
+			TokensCacheWrite: 50_000,
+			CostUSDBackend:   1.23, // claude total_cost_usd
+		},
+	}}
+
+	got := buildFleetCostObservability(cfg, st, now)
+	if math.Abs(got.WindowToday.USD-1.23) > 1e-6 {
+		t.Errorf("today USD = %f, want 1.23 (self-reported wins over split/blended)", got.WindowToday.USD)
+	}
+}
+
+// TestSessionCostEstimate_Precedence covers the per-session cost helper's
+// self-reported > split > blended precedence (#739).
+func TestSessionCostEstimate_Precedence(t *testing.T) {
+	pricing := map[string]config.BackendPricing{
+		"claude": {InputUSDPerMtok: 15, OutputUSDPerMtok: 75},
+		"codex":  {},
+	}
+	const (
+		total      = 1_065_000
+		input      = 10_000
+		output     = 5_000
+		cacheRead  = 1_000_000
+		cacheWrite = 50_000
+	)
+
+	// Self-reported cost wins over everything else.
+	if got := sessionCostEstimate("claude", total, input, output, cacheRead, cacheWrite, pricing, 0.99); got != 0.99 {
+		t.Errorf("with self-reported cost = %f, want 0.99", got)
+	}
+	// Split tokens present, no self-reported cost → cache-aware split.
+	if got := sessionCostEstimate("claude", total, input, output, cacheRead, cacheWrite, pricing, 0); math.Abs(got-2.9625) > 1e-6 {
+		t.Errorf("split estimate = %f, want ~2.9625", got)
+	}
+	// No split tokens → legacy blended estimate over the combined total.
+	if got := sessionCostEstimate("claude", 1_000_000, 0, 0, 0, 0, pricing, 0); math.Abs(got-45.0) > 1e-6 {
+		t.Errorf("blended estimate = %f, want 45.00", got)
+	}
+	// Unpriced backend with split tokens → 0.
+	if got := sessionCostEstimate("codex", total, input, output, cacheRead, cacheWrite, pricing, 0); got != 0 {
+		t.Errorf("unpriced split = %f, want 0", got)
+	}
+	// Unknown backend with split tokens → 0.
+	if got := sessionCostEstimate("unknown", total, input, output, cacheRead, cacheWrite, pricing, 0); got != 0 {
+		t.Errorf("unknown backend split = %f, want 0", got)
 	}
 }
 

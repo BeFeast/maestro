@@ -2382,7 +2382,7 @@ func historyCmd(args []string) {
 				Backend:         c.Backend,
 				Model:           sess.Model,
 				TokensUsedTotal: sess.TokensUsedTotal,
-				CostUSDEstimate: server.SessionCostEstimate(cfg, c.Backend, sess.TokensUsedTotal, sess.CostUSDBackend),
+				CostUSDEstimate: server.SessionCostEstimate(cfg, sess),
 			}
 			if c.FinishedAt != nil {
 				entry.FinishedAt = c.FinishedAt.Format(time.RFC3339)
