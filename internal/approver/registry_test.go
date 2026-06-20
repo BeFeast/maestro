@@ -53,11 +53,12 @@ func TestRegistry_IsKnownApprovalAction(t *testing.T) {
 		{"restart_worker", true},      // #567: per-session worker-control
 		{"stop_worker", true},         // #567: per-session worker-control
 		{"spawn_repair_worker", true}, // #662: classic repair worker (awaiting_dispatch)
+		{"label_issue_ready", true},   // #736: ready-label approval fallback (executor applies the label)
 
 		// Negative cases — the live-found bugs.
 		{"spawn_repair_repair", false},
 		{"approve_merge", false},   // UI verb — server translates to merge_pr before enqueue
-		{"add_ready_label", false}, // safe action, NOT in approval registry
+		{"add_ready_label", false}, // safe action alias, NOT in approval registry (canonical verb label_issue_ready is)
 		{"", false},
 	}
 	for _, tc := range cases {

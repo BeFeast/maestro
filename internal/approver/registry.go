@@ -54,6 +54,18 @@ var KnownApprovalActions = map[string]struct{}{
 	// next dispatcher respawn.
 	"restart_worker": {},
 	"stop_worker":    {},
+	// #736: ready-label handoff fallback. The common path applies the
+	// add_ready_label mutation directly as an operator-whitelisted safe
+	// action (safe_actions), so it never reaches this registry. But when
+	// the operator gates the verb behind approval_required instead, the
+	// supervisor mints this approval and the executor applies the
+	// configured ready label on approve (executeLabelIssueReady). Before
+	// #736 the verb was absent here, so the at-mint guard refused it every
+	// cycle and a cautious+LLM project's dynamic-wave handoff stalled
+	// silently — the ready label was never applied and the orchestrator
+	// starved. Note: the safe-action alias "add_ready_label" stays OUT of
+	// this registry (it is a safe action, never an approval mint).
+	"label_issue_ready": {},
 }
 
 // KnownSafeActions is the canonical set of safe (non-approval-gated)

@@ -30,6 +30,11 @@ type GitHubClient interface {
 	MergePR(prNumber int) error
 	CloseIssue(number int, comment string) error
 
+	// AddIssueLabel applies a label to an issue. executeLabelIssueReady
+	// uses it to apply the configured ready label when an operator
+	// approves an approval-gated label_issue_ready decision (#736).
+	AddIssueLabel(issueNumber int, label string) error
+
 	// PRMergeStatus returns the normalized mergeable verdict
 	// ("MERGEABLE"/"CONFLICTING"/"UNKNOWN") and the raw GitHub
 	// mergeable_state ("clean", "behind", "dirty", ...). executeMergePR
@@ -289,6 +294,8 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 		}
 	case config.SupervisorActionApplyLessonProposal:
 		return e.executeApplyLessonProposal(approval)
+	case "label_issue_ready":
+		return e.executeLabelIssueReady(approval)
 	case "spawn_worker":
 		// The approver runs in the supervisor cycle; it does not own the
 		// dispatch loop that actually spawns workers. Mark the approval
@@ -478,6 +485,64 @@ func (e *Executor) executeCloseIssue(approval *state.Approval) Result {
 		Status:  state.ApprovalStatusExecuted,
 		Summary: fmt.Sprintf("closed issue #%d", issue),
 	}
+}
+
+// executeLabelIssueReady applies the configured ready label to the target
+// issue. It is the approval-gated counterpart to the supervisor's safe
+// add_ready_label mutation (#736): when the operator lists the ready-label
+// verb in approval_required (instead of whitelisting add_ready_label as a
+// safe action), the supervisor mints a pending approval and this runs on
+// approve. The label name comes from cfg (supervisor.ready_label, falling
+// back to the first issue_labels entry) — the approval payload only carries
+// the target issue, mirroring how the safe mutation resolves the label.
+func (e *Executor) executeLabelIssueReady(approval *state.Approval) Result {
+	if approval.Target == nil || approval.Target.Issue <= 0 {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("%w: issue number missing", ErrMissingTarget)}
+	}
+	if e.GH == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
+	}
+	if e.Cfg == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no project config wired into executor")}
+	}
+	label := approverReadyLabel(e.Cfg)
+	if label == "" {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: "no ready label configured (supervisor.ready_label / issue_labels) — cannot label issue ready",
+			Err:     errors.New("no ready label configured"),
+		}
+	}
+	issue := approval.Target.Issue
+	if err := e.GH.AddIssueLabel(issue, label); err != nil {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("add ready label %q to issue #%d: %v", label, issue, err),
+			Err:     fmt.Errorf("add ready label to issue #%d: %w", issue, err),
+		}
+	}
+	return Result{
+		Status:  state.ApprovalStatusExecuted,
+		Summary: fmt.Sprintf("added ready label %q to issue #%d", label, issue),
+	}
+}
+
+// approverReadyLabel resolves the project ready label the same way the
+// supervisor's Engine.readyLabel does: prefer supervisor.ready_label, then
+// fall back to the first non-empty issue_labels entry.
+func approverReadyLabel(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	if label := strings.TrimSpace(cfg.Supervisor.ReadyLabel); label != "" {
+		return label
+	}
+	for _, label := range cfg.IssueLabels {
+		if label = strings.TrimSpace(label); label != "" {
+			return label
+		}
+	}
+	return ""
 }
 
 func (e *Executor) executeCloseIssueBatch(approval *state.Approval) Result {
