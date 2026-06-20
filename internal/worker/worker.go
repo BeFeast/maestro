@@ -126,6 +126,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	// Assemble worker prompt
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
 
 	// Write prompt to file
@@ -282,6 +283,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Assemble worker prompt
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
 
 	// Write prompt to file
@@ -874,6 +876,27 @@ func visualEvidencePromptSection(cfg *config.Config) string {
 	fmt.Fprintf(&b, "   ![home](https://raw.githubusercontent.com/%s/$sha/%s/home.png)\"\n", cfg.Repo, visual.ResolvedOutputDir())
 	b.WriteString("   ```\n")
 	b.WriteString("5. If the capture command fails or produces no screenshots, post a PR comment briefly explaining why visual evidence could not be captured, then continue — do NOT block the PR on it; Maestro records a finding for the operator.\n")
+	return b.String()
+}
+
+// subagentHintPromptSection renders the per-backend sub-agent model policy
+// (#706). Orchestrating backends (e.g. Claude Code) spawn their own
+// sub-agents and, by default, run them on the same expensive orchestrator
+// model; bulk grunt subtasks then burn the subscription window at
+// orchestrator prices, multiplied across parallel sub-agents. When the
+// backend has a `subagent_hint` configured, this section injects that policy
+// into the worker prompt. Returns "" when the hint is unset so configs
+// without the field render a byte-for-byte unchanged prompt.
+func subagentHintPromptSection(hint string) string {
+	hint = strings.TrimSpace(sanitizePromptUTF8(hint))
+	if hint == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\n---\n\n## Sub-agent Model Policy\n\n")
+	b.WriteString("This backend orchestrates its own sub-agents. Follow this delegation policy:\n\n")
+	b.WriteString(hint)
+	b.WriteByte('\n')
 	return b.String()
 }
 

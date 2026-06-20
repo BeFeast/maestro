@@ -262,6 +262,63 @@ func TestAssemblePromptOmitsVisualEvidenceSectionWhenInactive(t *testing.T) {
 	}
 }
 
+func TestSubagentHintPromptSectionRendersWhenSet(t *testing.T) {
+	hint := "Use cheaper sub-agent models (opus/sonnet) for delegated subtasks; reserve the main model for orchestration and final review."
+	section := subagentHintPromptSection(hint)
+	for _, want := range []string{
+		"## Sub-agent Model Policy",
+		hint,
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("subagentHintPromptSection() missing %q\nsection:\n%s", want, section)
+		}
+	}
+}
+
+func TestSubagentHintPromptSectionOmittedWhenUnset(t *testing.T) {
+	for name, hint := range map[string]string{
+		"empty":      "",
+		"whitespace": "   \n\t ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := subagentHintPromptSection(hint); got != "" {
+				t.Fatalf("expected empty section for %s hint, got %q", name, got)
+			}
+		})
+	}
+}
+
+// TestWorkerPromptSubagentHintGolden is the acceptance golden check (#706):
+// with subagent_hint set the rendered worker prompt gains the policy section;
+// without it the prompt is byte-for-byte unchanged.
+func TestWorkerPromptSubagentHintGolden(t *testing.T) {
+	cfg := &config.Config{Repo: "owner/repo"}
+	issue := github.Issue{Number: 706, Title: "subagent hint", Body: "body"}
+	worktree := t.TempDir()
+
+	base := assemblePrompt("base prompt", issue, worktree, "feat/subagent-hint", cfg)
+
+	// Unset hint: the rendered prompt is identical to the base prompt.
+	if got := base + subagentHintPromptSection(""); got != base {
+		t.Fatalf("unset subagent_hint must not change the prompt; unexpected delta:\n%s", strings.TrimPrefix(got, base))
+	}
+
+	// Hint set: the prompt is the base with the policy section appended.
+	hint := config.DefaultSubagentHint
+	withHint := base + subagentHintPromptSection(hint)
+	if !strings.HasPrefix(withHint, base) {
+		t.Fatal("subagent_hint section must append to, not rewrite, the base prompt")
+	}
+	for _, want := range []string{"## Sub-agent Model Policy", hint} {
+		if !strings.Contains(withHint, want) {
+			t.Fatalf("rendered prompt with subagent_hint missing %q\nprompt:\n%s", want, withHint)
+		}
+	}
+	if strings.Contains(base, "Sub-agent Model Policy") {
+		t.Fatal("base prompt (no hint) must not contain the sub-agent policy section")
+	}
+}
+
 func TestWorkerPromptTemplateExplainsVisualEvidenceAttachment(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "worker-prompt-template.md"))
 	if err != nil {

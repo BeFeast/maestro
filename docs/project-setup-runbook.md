@@ -259,6 +259,7 @@ telegram:
 | `outcome` | Project operating brief used by the supervisor to judge runtime progress |
 | `supervisor` | Optional local policy for supervisor queue order, safe actions, dispatch SLA, and issue-type skips |
 | `model.backends.<name>.mcp` | Optional worker MCP attachment for that backend; omitted means no MCP tools |
+| `model.backends.<name>.subagent_hint` | Optional sub-agent model policy injected into the worker prompt for that backend; omitted means the prompt is unchanged |
 | `max_parallel` | Maximum concurrent worker sessions |
 | `deploy_cmd` | Shell command maestro runs after merging a PR |
 | `session_prefix` | Prefix for tmux session names |
@@ -301,6 +302,19 @@ model:
       cmd: claude
     codex:
       cmd: codex
+```
+
+### Optional: sub-agent model policy (`subagent_hint`)
+
+When a worker backend is an orchestrating CLI such as Claude Code, it spawns its own sub-agents and, by default, runs them on the same expensive model as the orchestrator. Bulk grunt subtasks (file sweeps, searches, mechanical edits) then burn the subscription window at orchestrator-model prices, multiplied across parallel sub-agents. Set `model.backends.<name>.subagent_hint` to steer those sub-agents to cheaper models; the worker prompt gains a "Sub-agent Model Policy" section carrying the text verbatim. The field is optional and field-driven — backends without it render an unchanged prompt, so non-orchestrating backends (codex, gemini, …) can leave it unset. A recommended default ships under the claude backend in `maestro.yaml.example`:
+
+```yaml
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+      subagent_hint: "Use cheaper sub-agent models (e.g. opus/sonnet) for delegated grunt subtasks such as file sweeps, searches, and mechanical edits; reserve the main orchestrator model for planning and final review."
 ```
 
 ### Optional: parallel review streams

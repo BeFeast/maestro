@@ -78,7 +78,25 @@ type BackendDef struct {
 	// percentages on the fleet API / Mission Control, and steers fresh
 	// dispatch to fallback backends once usage crosses the threshold.
 	Quota BackendQuota `yaml:"quota,omitempty"`
+
+	// SubagentHint steers an orchestrating backend (e.g. Claude Code) to
+	// delegate grunt subtasks to cheaper sub-agent models instead of
+	// reusing the expensive orchestrator model for everything (#706). When
+	// set, the worker prompt gains a "Sub-agent Model Policy" section
+	// carrying this text. When empty, the prompt is unchanged — configs
+	// without the field behave exactly as before. DefaultSubagentHint is a
+	// ready-made value operators can paste under their claude backend.
+	SubagentHint string `yaml:"subagent_hint,omitempty"`
 }
+
+// DefaultSubagentHint is the recommended sub-agent model policy shipped for
+// the claude backend (#706). Orchestrating CLIs spawn their own sub-agents
+// and, by default, run them on the same expensive model — bulk grunt subtasks
+// (file sweeps, searches, mechanical edits) then burn the subscription window
+// at orchestrator-model prices, multiplied across parallel sub-agents. Set
+// model.backends.<name>.subagent_hint to this (or a tuned variant) to opt in;
+// leaving it unset keeps the prompt unchanged.
+const DefaultSubagentHint = "Use cheaper sub-agent models (e.g. opus/sonnet) for delegated grunt subtasks such as file sweeps, searches, and mechanical edits; reserve the main orchestrator model for planning and final review."
 
 // MCPConfig is an opt-in per-backend worker MCP attachment. When empty,
 // Maestro passes no MCP configuration to spawned workers.
