@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -21,7 +22,7 @@ func TestMaybeSelfDeployAfterMerge_DefaultOff(t *testing.T) {
 		selfDeployStartFn: func(prNumber int) error { called = true; return nil },
 	}
 
-	o.maybeSelfDeployAfterMerge(698)
+	o.maybeSelfDeployAfterMerge(nil, 698)
 	if called {
 		t.Fatal("self-deploy triggered with the flag off")
 	}
@@ -38,9 +39,44 @@ func TestMaybeSelfDeployAfterMerge_Enabled(t *testing.T) {
 		selfDeployStartFn: func(prNumber int) error { gotPR = prNumber; return nil },
 	}
 
-	o.maybeSelfDeployAfterMerge(698)
+	o.maybeSelfDeployAfterMerge(nil, 698)
 	if gotPR != 698 {
 		t.Fatalf("trigger called with PR %d, want 698", gotPR)
+	}
+}
+
+// #742: a trigger failure (the detached unit never launched) is surfaced as a
+// supervisor finding so a silently-undeployed merge shows as fleet attention
+// instead of just a log line — and does not record a trigger marker, so the
+// next merge retries.
+func TestMaybeSelfDeployAfterMerge_TriggerFailureSurfacesFinding(t *testing.T) {
+	stateDir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:       "owner/repo",
+			StateDir:   stateDir,
+			SelfDeploy: config.SelfDeployConfig{Enabled: true, MinIntervalMinutes: 30},
+		},
+		notifier:          &notify.Notifier{},
+		selfDeployStartFn: func(prNumber int) error { return errors.New("systemd-run: exit status 1") },
+	}
+	s := &state.State{}
+
+	o.maybeSelfDeployAfterMerge(s, 742)
+
+	if len(s.SupervisorDecisions) != 1 {
+		t.Fatalf("decisions recorded = %d, want 1", len(s.SupervisorDecisions))
+	}
+	d := s.SupervisorDecisions[0]
+	if d.Status != "failed" {
+		t.Errorf("Status = %q, want failed", d.Status)
+	}
+	if !strings.Contains(d.Summary, "trigger failed") || !strings.Contains(d.Summary, "PR #742") {
+		t.Errorf("Summary = %q", d.Summary)
+	}
+	// A pure trigger failure must not suppress the next attempt: no marker.
+	if _, _, ok := selfdeploy.LastTrigger(stateDir); ok {
+		t.Error("trigger marker recorded despite trigger failure — next merge would be debounced")
 	}
 }
 
@@ -65,7 +101,7 @@ func TestMaybeSelfDeployAfterMerge_DebouncesRecentTrigger(t *testing.T) {
 		selfDeployStartFn: func(prNumber int) error { calls++; return nil },
 	}
 
-	o.maybeSelfDeployAfterMerge(699)
+	o.maybeSelfDeployAfterMerge(nil, 699)
 	if calls != 0 {
 		t.Fatalf("trigger fired %d times within the debounce window, want 0", calls)
 	}
@@ -91,7 +127,7 @@ func TestMaybeSelfDeployAfterMerge_FiresAfterWindow(t *testing.T) {
 		selfDeployStartFn: func(prNumber int) error { gotPR = prNumber; return nil },
 	}
 
-	o.maybeSelfDeployAfterMerge(720)
+	o.maybeSelfDeployAfterMerge(nil, 720)
 	if gotPR != 720 {
 		t.Fatalf("trigger called with PR %d, want 720", gotPR)
 	}
