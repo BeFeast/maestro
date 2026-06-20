@@ -1,0 +1,40 @@
+name: agent-lint
+description: >-
+  Enforce the fleet's agent anti-pattern rules on a pull request: no
+  auto-closing keywords, no committed artifacts, no leaked secrets, and a
+  warning on drafts that lack an explicit WIP/Partial marker.
+
+inputs:
+  pr-number:
+    description: Pull request number to lint. Defaults to the triggering pull_request.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  repo:
+    description: owner/repo to read the PR from. Defaults to the current repository.
+    required: false
+    default: ${{ github.repository }}
+  artifact-allowlist:
+    description: Space- or newline-separated extra glob patterns exempt from the artifact check.
+    required: false
+    default: ""
+  override-label:
+    description: PR label that downgrades hard failures to warnings.
+    required: false
+    default: "agent-lint:override"
+  github-token:
+    description: Token used to read PR metadata and diff (needs contents:read + pull-requests:read).
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: agent-lint
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        AGENT_LINT_PR: ${{ inputs.pr-number }}
+        AGENT_LINT_REPO: ${{ inputs.repo }}
+        AGENT_LINT_ARTIFACT_ALLOWLIST: ${{ inputs.artifact-allowlist }}
+        AGENT_LINT_OVERRIDE_LABEL: ${{ inputs.override-label }}
+      run: bash "${GITHUB_ACTION_PATH}/agent-lint.sh"

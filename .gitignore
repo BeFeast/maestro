@@ -12,9 +12,11 @@
 # Config files with secrets
 *.yaml
 *.yml
-# But keep CI workflows
+# But keep CI workflows and composite actions
 !.github/workflows/*.yml
 !.github/ISSUE_TEMPLATE/*.yml
+!.github/actions/**/*.yml
+!.github/actions/**/*.yaml
 .claude/
 
 # Frontend build
