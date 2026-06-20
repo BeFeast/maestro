@@ -1,0 +1,33 @@
+name: agent-lint
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - labeled
+      - unlabeled
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Lint the actual PR (closing keywords, artifacts, secrets, draft warning).
+  agent-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/agent-lint
+
+  # Continuously prove the fixtures still trip each check (acceptance criterion 1).
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fixture self-test
+        run: bash .github/actions/agent-lint/agent-lint.sh --self-test
