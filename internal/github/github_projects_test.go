@@ -145,6 +145,64 @@ func TestParseNonDoneProjectItemsResponse_GraphQLErrors(t *testing.T) {
 	}
 }
 
+// parseNonDoneProjectItemsPage must surface the board's pagination cursor so
+// ListNonDoneProjectItems can walk every page. A board that has grown past one
+// 100-item page would otherwise strand its older non-done tail — including
+// CLOSED + NO STATUS drift — out of the reconciler's view (#741).
+func TestParseNonDoneProjectItemsPage_ReturnsPaginationCursor(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"node": {
+				"items": {
+					"pageInfo": {"hasNextPage": true, "endCursor": "CURSOR_2"},
+					"nodes": [
+						{"fieldValueByName": null, "content": {"number": 457, "state": "CLOSED"}}
+					]
+				}
+			}
+		}
+	}`)
+
+	items, hasNext, endCursor, err := parseNonDoneProjectItemsPage(body, "opt-done")
+	if err != nil {
+		t.Fatalf("parseNonDoneProjectItemsPage: %v", err)
+	}
+	if !hasNext || endCursor != "CURSOR_2" {
+		t.Fatalf("pagination = (hasNext=%v, endCursor=%q), want (true, CURSOR_2)", hasNext, endCursor)
+	}
+	if len(items) != 1 || items[0].IssueNumber != 457 || items[0].HasStatus || !items[0].IssueClosed {
+		t.Fatalf("items = %+v, want one closed no-status item #457", items)
+	}
+}
+
+// The final page reports hasNextPage=false; the walk in ListNonDoneProjectItems
+// stops there instead of looping forever.
+func TestParseNonDoneProjectItemsPage_LastPageStopsPagination(t *testing.T) {
+	body := []byte(`{
+		"data": {
+			"node": {
+				"items": {
+					"pageInfo": {"hasNextPage": false, "endCursor": "CURSOR_END"},
+					"nodes": [
+						{"fieldValueByName": {"optionId": "opt-progress"}, "content": {"number": 99, "state": "OPEN"}}
+					]
+				}
+			}
+		}
+	}`)
+
+	items, hasNext, _, err := parseNonDoneProjectItemsPage(body, "opt-done")
+	if err != nil {
+		t.Fatalf("parseNonDoneProjectItemsPage: %v", err)
+	}
+	if hasNext {
+		t.Fatal("hasNext = true on final page, want false")
+	}
+	if len(items) != 1 || items[0].IssueNumber != 99 {
+		t.Fatalf("items = %+v, want one item #99", items)
+	}
+}
+
 // ListNonDoneProjectItems must resolve the terminal-column option ID through
 // ProjectStatusCandidates so a board whose Done column is named "Completed"
 // or "Closed" still filters out finished items. The unit-test angle: ensure

@@ -973,8 +973,13 @@ func projectStatusForSession(sess *state.Session, requiresDeploy bool) (github.P
 //   - every active session (running/queued/pr_open/code_landed/blocked) has its
 //     status mirrored on the board so a live worker is always visible as
 //     active work (no manual "panoptikon-project-sync" timer needed);
-//   - items whose underlying issue is closed move to Done;
-//   - items with no Status fall back to Todo so they show up in the backlog.
+//   - ANY item whose underlying issue is closed moves to Done, regardless of
+//     its current board Status — including NO STATUS / unset items and
+//     externally-closed (merge-keyword or manual) issues the reconcile never
+//     transitioned itself. Closed wins over the no-status branch below, so
+//     stranded closed items are backfilled instead of bounced to Todo (#741);
+//   - items with no Status that are still open fall back to Todo so they show
+//     up in the backlog.
 //
 // "Done" is only set on the board when the underlying GitHub issue is closed —
 // merging a PR alone keeps the item in In Progress until runtime/deploy
