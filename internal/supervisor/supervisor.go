@@ -294,7 +294,15 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	// requires_approval=false while the supervisor silently minted (or
 	// would mint) an approval. Recompute against the same predicate that
 	// drives the mint so the field never lies.
-	if decisionRequiresApproval(cfg, decision) {
+	//
+	// #736: a decision whose planned mutations are all operator-whitelisted
+	// safe actions is applied directly (no approval), so it must NOT report
+	// requires_approval — even when the LLM raised the headline decision.Risk
+	// for display. Otherwise fall back to the mint predicate so the field
+	// never under-reports a genuinely gated mutating verb.
+	if allQueueMutationsAllowed(cfg, decision.Mutations) {
+		decision.RequiresApproval = false
+	} else if decisionRequiresApproval(cfg, decision) {
 		decision.RequiresApproval = true
 	}
 	if !cfg.Supervisor.DryRun {
@@ -307,29 +315,7 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		if proposal, created := recordLessonProposalForDecision(cfg, st, decision); created && proposal != nil {
 			log.Printf("[supervisor] proposed lesson %s for %s/%s; approval=%s", proposal.ID, proposal.FailureClass, proposal.Area, proposal.ApprovalID)
 		}
-		if decisionRequiresApproval(cfg, decision) {
-			// #505: gate the mint on the executor registry. A verb the
-			// executor cannot handle would otherwise pile up
-			// execution_failed records every cycle (live evidence:
-			// spawn_repair_worker on dogfood 2026-05-30, 4 stuck records
-			// before the operator noticed). Refuse at mint time so the
-			// failure surfaces loudly in the journal instead of silently
-			// in state.json.
-			if !approver.IsKnownApprovalAction(decision.RecommendedAction) {
-				log.Printf("[supervisor] refusing to mint approval: action %q is not in the executor registry; supported actions = %v", decision.RecommendedAction, approver.KnownApprovalActionList())
-			} else {
-				approval := st.RecordPendingApprovalForDecision(decision, decision.CreatedAt)
-				decision.ApprovalID = approval.ID
-			}
-		}
-		if len(decision.Mutations) > 0 && decision.Risk == RiskSafe {
-			mutator, ok := reader.(Mutator)
-			if !ok {
-				markUnsupportedQueueAction(&decision)
-			} else {
-				applyQueueAction(cfg, &decision, mutator)
-			}
-		}
+		applyOrMintDecision(cfg, st, reader, &decision)
 		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
 		// Phase 1.2 (#499): stamp the last-run heartbeat just before save
 		// so the watchdog goroutine in cmd/maestro can see this cycle
@@ -349,6 +335,53 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 		compactTerminalSessions(cfg, st, "supervisor")
 	}
 	return decision, nil
+}
+
+// applyOrMintDecision is the post-decision side-effect stage of RunOnce,
+// extracted so the #736 apply-vs-mint choice is unit-testable without
+// shelling out to a real supervisor LLM backend.
+//
+// #736: a decision that carries only operator-whitelisted safe queue
+// mutations is applied DIRECTLY, regardless of the LLM-overridable headline
+// decision.Risk. The deterministic guardrail plans add_ready_label /
+// remove_*_label only when the operator put them in safe_actions
+// (queueMutationAllowed); the cautious+LLM merge may raise the headline risk
+// for display, but it must not nullify a safe mutation the operator already
+// whitelisted. Applying here — and minting only otherwise — also prevents
+// the double-handling the issue describes: before #736 label_issue_ready
+// could be both refused at mint (the #505 registry guard) AND dropped at
+// apply (the old `decision.Risk == RiskSafe` gate), so the ready label was
+// never applied and the orchestrator starved.
+//
+// Apply and mint are mutually exclusive: a decision whose mutations are all
+// safe-action-allowed is recorded as succeeded (applyQueueAction), never as
+// a refused/pending approval. Genuinely approval-gated verbs (empty or
+// non-whitelisted mutations) fall through to the existing mint path, still
+// gated on the executor registry (#505).
+func applyOrMintDecision(cfg *config.Config, st *state.State, reader Reader, decision *state.SupervisorDecision) {
+	if allQueueMutationsAllowed(cfg, decision.Mutations) {
+		mutator, ok := reader.(Mutator)
+		if !ok {
+			markUnsupportedQueueAction(decision)
+			return
+		}
+		applyQueueAction(cfg, decision, mutator)
+		return
+	}
+	if decisionRequiresApproval(cfg, *decision) {
+		// #505: gate the mint on the executor registry. A verb the executor
+		// cannot handle would otherwise pile up execution_failed records
+		// every cycle (live evidence: spawn_repair_worker on dogfood
+		// 2026-05-30, 4 stuck records before the operator noticed). Refuse
+		// at mint time so the failure surfaces loudly in the journal
+		// instead of silently in state.json.
+		if !approver.IsKnownApprovalAction(decision.RecommendedAction) {
+			log.Printf("[supervisor] refusing to mint approval: action %q is not in the executor registry; supported actions = %v", decision.RecommendedAction, approver.KnownApprovalActionList())
+			return
+		}
+		approval := st.RecordPendingApprovalForDecision(*decision, decision.CreatedAt)
+		decision.ApprovalID = approval.ID
+	}
 }
 
 // compactTerminalSessions applies cfg.SessionRetention to st and persists the
@@ -2080,6 +2113,31 @@ func safeActionAllowed(cfg *config.Config, action string) bool {
 		return false
 	}
 	return cfg.Supervisor.AllowsSafeAction(action)
+}
+
+// allQueueMutationsAllowed reports whether the decision carries ≥1 planned
+// mutation AND every one is an operator-whitelisted safe queue action
+// (queueMutationAllowed). RunOnce applies such mutations directly via
+// applyOrMintDecision, regardless of the LLM-overridable headline
+// decision.Risk (#736). An empty mutation list returns false — there is
+// nothing to apply, so the decision falls through to the approval mint path.
+//
+// This is the apply-gate counterpart of plannedMutations, which builds the
+// list using the same queueMutationAllowed predicate; if a mutation passed
+// the filter at planning time it passes here too. It deliberately uses
+// queueMutationAllowed (not the plain safeActionAllowed used by
+// allMutationsAllowed) so the owns_ready_label remove_ready_label carve-out
+// is honored at apply time as well.
+func allQueueMutationsAllowed(cfg *config.Config, mutations []state.SupervisorMutation) bool {
+	if len(mutations) == 0 {
+		return false
+	}
+	for _, m := range mutations {
+		if !queueMutationAllowed(cfg, m) {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Engine) firstQueueActionCandidate(st *state.State, issues []github.Issue) (*queueActionCandidate, error) {

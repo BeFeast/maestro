@@ -23,8 +23,10 @@ type fakeGH struct {
 	mergeCalls  []int
 	closeCalls  []closeCall
 	updateCalls []int
+	labelCalls  []labelCall
 	mergeErr    error
 	closeErr    error
+	labelErr    error
 
 	// #547 stubs for PRMergeStatus.
 	mergeable      string
@@ -37,6 +39,11 @@ type fakeGH struct {
 type closeCall struct {
 	issue   int
 	comment string
+}
+
+type labelCall struct {
+	issue int
+	label string
 }
 
 func (f *fakeGH) MergePR(pr int) error {
@@ -53,6 +60,13 @@ func (f *fakeGH) PRMergeStatus(pr int) (string, string, error) {
 func (f *fakeGH) UpdateBranch(pr int) error {
 	f.updateCalls = append(f.updateCalls, pr)
 	return f.updateErr
+}
+func (f *fakeGH) AddIssueLabel(issue int, label string) error {
+	if f.labelErr != nil {
+		return f.labelErr
+	}
+	f.labelCalls = append(f.labelCalls, labelCall{issue: issue, label: label})
+	return nil
 }
 
 type fakeWT struct {
@@ -700,5 +714,79 @@ func TestWorkerControllerFuncs_NilFunctionsReturnError(t *testing.T) {
 	}
 	if err := wc.RestartWorker("x", nil); err == nil {
 		t.Fatal("RestartWorker with nil Restart func should return an error, not panic")
+	}
+}
+
+// --- label_issue_ready (#736) ----------------------------------------------
+
+// TestExecute_LabelIssueReady_AppliesConfiguredReadyLabel verifies the
+// approval-gated ready-label handoff (#736): when the operator gates the
+// verb behind approval_required, approving the minted approval applies the
+// configured ready label to the target issue. The label name comes from
+// cfg (the approval payload only carries the target issue).
+func TestExecute_LabelIssueReady_AppliesConfiguredReadyLabel(t *testing.T) {
+	gh := &fakeGH{}
+	cfg := newCfg()
+	cfg.Supervisor.ReadyLabel = "maestro-ready"
+	ex := &Executor{GH: gh, Cfg: cfg}
+	a := mkApproval("label_issue_ready", &state.SupervisorTarget{Issue: 266}, "label ready", "operator ok")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("status = %q, want executed; res=%+v", res.Status, res)
+	}
+	if len(gh.labelCalls) != 1 || gh.labelCalls[0].issue != 266 || gh.labelCalls[0].label != "maestro-ready" {
+		t.Fatalf("label calls = %#v, want one #266:maestro-ready", gh.labelCalls)
+	}
+	if !strings.Contains(res.Summary, "#266") || !strings.Contains(res.Summary, "maestro-ready") {
+		t.Fatalf("summary = %q, want it to name the issue and label", res.Summary)
+	}
+}
+
+// Falls back to the first issue_labels entry when supervisor.ready_label
+// is unset — mirroring supervisor.Engine.readyLabel.
+func TestExecute_LabelIssueReady_FallsBackToIssueLabels(t *testing.T) {
+	gh := &fakeGH{}
+	cfg := newCfg()
+	cfg.IssueLabels = []string{"ready"}
+	ex := &Executor{GH: gh, Cfg: cfg}
+	a := mkApproval("label_issue_ready", &state.SupervisorTarget{Issue: 7}, "label ready", "ok")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("status = %q, want executed; res=%+v", res.Status, res)
+	}
+	if len(gh.labelCalls) != 1 || gh.labelCalls[0].label != "ready" {
+		t.Fatalf("label calls = %#v, want one #7:ready", gh.labelCalls)
+	}
+}
+
+func TestExecute_LabelIssueReady_MissingIssueFails(t *testing.T) {
+	gh := &fakeGH{}
+	cfg := newCfg()
+	cfg.Supervisor.ReadyLabel = "maestro-ready"
+	ex := &Executor{GH: gh, Cfg: cfg}
+	a := mkApproval("label_issue_ready", &state.SupervisorTarget{}, "label ready", "ok")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed for missing issue", res.Status)
+	}
+	if len(gh.labelCalls) != 0 {
+		t.Fatalf("label calls = %#v, want none on failure", gh.labelCalls)
+	}
+}
+
+func TestExecute_LabelIssueReady_NoReadyLabelConfiguredFails(t *testing.T) {
+	gh := &fakeGH{}
+	ex := &Executor{GH: gh, Cfg: newCfg()} // no ready_label / issue_labels
+	a := mkApproval("label_issue_ready", &state.SupervisorTarget{Issue: 9}, "label ready", "ok")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed when no ready label is configured", res.Status)
+	}
+	if len(gh.labelCalls) != 0 {
+		t.Fatalf("label calls = %#v, want none on failure", gh.labelCalls)
 	}
 }
