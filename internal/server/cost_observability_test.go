@@ -378,4 +378,29 @@ func TestApplySessionCostEstimate(t *testing.T) {
 	}
 }
 
+// TestSessionCostEstimate_CodexVirtual covers the #738 virtual-cost contract:
+// codex never self-reports USD (backendCost is always 0), so the dollar figure
+// must come from the configured pricing block. With pricing the estimate is
+// non-zero; without it the session degrades to tokens-only ($0). A claude
+// session that DID self-report a cost still prefers that over the estimate.
+func TestSessionCostEstimate_CodexVirtual(t *testing.T) {
+	pricing := map[string]config.BackendPricing{
+		"codex":  {InputUSDPerMtok: 1.25, OutputUSDPerMtok: 10},
+		"claude": {InputUSDPerMtok: 10, OutputUSDPerMtok: 30},
+	}
+	// codex: backendCost is always 0, so the (1.25+10)/2 = 5.625 $/Mtok blend
+	// applies → 1M tokens ≈ $5.625 (virtual, from pricing).
+	if got := sessionCostEstimate("codex", 1_000_000, pricing, 0); math.Abs(got-5.625) > 1e-6 {
+		t.Errorf("codex virtual cost = %f, want ~5.625", got)
+	}
+	// codex with no pricing → tokens-only ($0), never a self-reported cost.
+	if got := sessionCostEstimate("codex", 1_000_000, map[string]config.BackendPricing{"codex": {}}, 0); got != 0 {
+		t.Errorf("codex unpriced cost = %f, want 0", got)
+	}
+	// A self-reported cost (e.g. claude total_cost_usd) still wins over pricing.
+	if got := sessionCostEstimate("claude", 1_000_000, pricing, 0.04); math.Abs(got-0.04) > 1e-9 {
+		t.Errorf("self-reported cost = %f, want 0.04 (prefer backend cost)", got)
+	}
+}
+
 func timePtr(t time.Time) *time.Time { return &t }

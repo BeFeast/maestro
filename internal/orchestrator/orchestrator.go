@@ -620,6 +620,14 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	if kind == config.BackendKindClaude && o.sessionUsageStream(sess) {
 		return o.updateClaudeUsageFromJSONL(slotName, sess)
 	}
+	// #738: a codex session with usage_stream opted in carries its usage on a
+	// side-channel slot.jsonl (`codex exec --json`); the human-readable slot.log
+	// has no parseable total, so the passed `output` is ignored in favour of the
+	// raw NDJSON. Without the opt-in, codex stays on the legacy text parser
+	// (the two-line "tokens used\n89,655" regex below).
+	if kind == config.BackendKindCodex && o.sessionUsageStream(sess) {
+		return o.updateCodexUsageFromJSONL(slotName, sess)
+	}
 	tokens := worker.ParseTokensFromOutput(output)
 	if tokens <= sess.TokensUsedAttempt {
 		return false
@@ -734,9 +742,49 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 	return changed
 }
 
-// sessionUsageStream reports whether the session's backend opted into #737
-// structured usage capture (usage_stream). Only then does the claude path read
-// the slot.jsonl side channel; otherwise it stays on the generic text parser.
+// updateCodexUsageFromJSONL parses the codex `exec --json` side-channel
+// (slot.jsonl) and stamps tokens onto the session (#738). codex emits one
+// terminal turn.completed usage event per `codex exec` invocation; the
+// splitter appends each attempt's frames to the same slot.jsonl, so
+// ParseCodexUsage sums them to the cumulative run total. The monotonic
+// UsageTokensWatermark persists across respawns so a forced retry never
+// double-counts (mirrors the claude/Pi paths). codex reports no USD, so cost
+// stays virtual: CostUSDBackend is left at 0 and sessionCostEstimate supplies
+// the dollar figure from the configured pricing block. codex --json carries no
+// model name, so sess.Model is left as configured. Returns true when tokens
+// changed; false (tokens stay 0) when the jsonl is absent — the documented
+// degradation when the stream-splitter was unavailable.
+func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Session) bool {
+	jsonlPath := o.workerJSONLFile(slotName, sess)
+	if jsonlPath == "" {
+		return false
+	}
+	data, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		// No side-channel stream (splitter disabled/unavailable, or the
+		// worker has not emitted a turn.completed yet) — leave tokens at 0.
+		return false
+	}
+	usage, ok := worker.ParseCodexUsage(string(data))
+	if !ok {
+		return false
+	}
+	if usage.TotalTokens <= sess.UsageTokensWatermark {
+		return false
+	}
+	delta := usage.TotalTokens - sess.UsageTokensWatermark
+	sess.UsageTokensWatermark = usage.TotalTokens
+	sess.TokensUsedAttempt += delta
+	sess.TokensUsedTotal += delta
+	log.Printf("[orch] %s codex usage: input=%d output=%d cache_read=%d tokens=%d (total=%d)",
+		slotName, usage.Input, usage.Output, usage.CacheRead, usage.TotalTokens, sess.TokensUsedTotal)
+	return true
+}
+
+// sessionUsageStream reports whether the session's backend opted into
+// structured usage capture (usage_stream). Only then do the claude (#737) and
+// codex (#738) paths read the slot.jsonl side channel; otherwise they stay on
+// the generic text parser.
 func (o *Orchestrator) sessionUsageStream(sess *state.Session) bool {
 	if sess == nil || o == nil || o.cfg == nil {
 		return false

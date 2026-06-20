@@ -100,6 +100,61 @@ func TestBuildWorkerCmd_ClaudeUsageStream(t *testing.T) {
 // regression from #454: a worker claude prompt larger than the Linux
 // MAX_ARG_STRLEN single-argument limit (128 KiB) must be delivered via stdin,
 // never as a CLI argument, so fork/exec never sees "argument list too long".
+// TestBuildWorkerCmd_CodexUsageStream verifies the #738 opt-in: when
+// UsageStream is set the codex worker runs `exec --json`, and an
+// operator-pinned --json in extra_args overrides it (no duplicate flag).
+func TestBuildWorkerCmd_CodexUsageStream(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("do the thing"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("opt-in appends --json", func(t *testing.T) {
+		cfg := BackendConfig{Cmd: "codex", UsageStream: true}
+		cmd, _, err := BuildWorkerCmd("codex", cfg, promptFile, "/tmp/wt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		args := strings.Join(cmd.Args, " ")
+		if !strings.Contains(args, "--json") {
+			t.Errorf("expected --json in args, got: %s", args)
+		}
+		// The stdin prompt marker must remain the final argument.
+		if cmd.Args[len(cmd.Args)-1] != "-" {
+			t.Errorf("expected trailing '-' stdin marker, got: %v", cmd.Args)
+		}
+	})
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := BackendConfig{Cmd: "codex"}
+		cmd, _, err := BuildWorkerCmd("codex", cfg, promptFile, "/tmp/wt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(strings.Join(cmd.Args, " "), "--json") {
+			t.Errorf("--json must not appear unless UsageStream is set: %v", cmd.Args)
+		}
+	})
+
+	t.Run("extra_args --json is not duplicated", func(t *testing.T) {
+		cfg := BackendConfig{Cmd: "codex", UsageStream: true, ExtraArgs: []string{"--json"}}
+		cmd, _, err := BuildWorkerCmd("codex", cfg, promptFile, "/tmp/wt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		n := 0
+		for _, a := range cmd.Args {
+			if a == "--json" {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("operator --json must not be duplicated, found %d in: %v", n, cmd.Args)
+		}
+	})
+}
+
 func TestBuildWorkerCmd_ClaudeLargePromptViaStdin(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")

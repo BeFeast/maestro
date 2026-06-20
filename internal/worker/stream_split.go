@@ -78,15 +78,19 @@ func RunStreamSplit(backend, jsonlPath string, r io.Reader, w io.Writer) error {
 }
 
 // renderStreamLine converts one structured stream line into human-readable
-// text for the worker log. Only the claude backend is rendered today; any
+// text for the worker log. claude (#737) and codex (#738) are rendered; any
 // other backend (and any non-JSON or unrecognized line) passes through
 // verbatim, which preserves stderr error text so the rate-limit /
-// auth-failure text parsers keep matching (#737 acceptance).
+// auth-failure text parsers keep matching (acceptance criterion).
 func renderStreamLine(backend, line string) string {
-	if strings.TrimSpace(backend) != "claude" {
+	switch strings.TrimSpace(backend) {
+	case "claude":
+		return renderClaudeStreamLine(line)
+	case "codex":
+		return renderCodexStreamLine(line)
+	default:
 		return line
 	}
-	return renderClaudeStreamLine(line)
 }
 
 // RenderClaudeStreamLine is the exported entry point for rendering a single
@@ -94,6 +98,13 @@ func renderStreamLine(backend, line string) string {
 // rate-limit / auth-failure text intact).
 func RenderClaudeStreamLine(line string) string {
 	return renderClaudeStreamLine(line)
+}
+
+// RenderCodexStreamLine is the exported entry point for rendering a single
+// codex `exec --json` line (used by tests verifying the renderer keeps
+// rate-limit / auth-failure text intact).
+func RenderCodexStreamLine(line string) string {
+	return renderCodexStreamLine(line)
 }
 
 type claudeRenderFrame struct {
@@ -207,4 +218,117 @@ func renderClaudeContent(raw json.RawMessage) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// codexRenderFrame is the subset of a codex `exec --json` line the renderer
+// decodes. turn.completed carries the usage block (reused from codex_usage.go);
+// item.started / item.completed carry the work item being rendered.
+type codexRenderFrame struct {
+	Type  string           `json:"type"`
+	Item  *codexRenderItem `json:"item"`
+	Usage *codexUsageBlock `json:"usage"`
+}
+
+// codexRenderItem is the subset of a codex item.* envelope the renderer needs:
+// agent_message text, the executed command + its output/exit code, and file
+// changes.
+type codexRenderItem struct {
+	Type             string            `json:"type"`
+	Text             string            `json:"text"`
+	Command          string            `json:"command"`
+	AggregatedOutput string            `json:"aggregated_output"`
+	ExitCode         *int              `json:"exit_code"`
+	Changes          []codexFileChange `json:"changes"`
+}
+
+type codexFileChange struct {
+	Path string `json:"path"`
+	Kind string `json:"kind"`
+}
+
+// renderCodexStreamLine renders one codex `exec --json` event into
+// human-readable text for slot.log (#738). A line that is not a JSON object,
+// or fails to decode, is returned verbatim so nothing is lost from the worker
+// log (and any plain stderr error text — rate-limit / auth-failure — still
+// reaches the text parsers). Unknown top-level event types (e.g. turn.failed)
+// are likewise preserved verbatim so error signatures survive.
+func renderCodexStreamLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || trimmed[0] != '{' {
+		return line
+	}
+	var fr codexRenderFrame
+	if err := json.Unmarshal([]byte(trimmed), &fr); err != nil {
+		return line
+	}
+	switch fr.Type {
+	case "thread.started", "turn.started":
+		// Structural envelopes with no human-facing content — drop.
+		return ""
+	case "item.started":
+		return renderCodexItem(fr.Item, false)
+	case "item.completed":
+		return renderCodexItem(fr.Item, true)
+	case "turn.completed":
+		if fr.Usage == nil {
+			return ""
+		}
+		return fmt.Sprintf("[codex] usage: input=%d cached=%d output=%d",
+			fr.Usage.InputTokens, fr.Usage.CachedInputTokens, fr.Usage.OutputTokens)
+	default:
+		// Unknown event type — preserve it verbatim rather than drop it, so
+		// error/rate-limit text carried in an unrecognized frame still matches.
+		return line
+	}
+}
+
+// renderCodexItem renders one codex work item. command_execution shows the
+// command on start and its output + exit code on completion; agent_message and
+// file_change render on completion. An unrecognized item type renders its text
+// (if any) or a compact marker so slot.log never carries raw item JSON.
+func renderCodexItem(item *codexRenderItem, completed bool) string {
+	if item == nil {
+		return ""
+	}
+	switch item.Type {
+	case "agent_message":
+		if completed {
+			return item.Text
+		}
+		return ""
+	case "command_execution":
+		if !completed {
+			return "[codex] $ " + strings.TrimSpace(item.Command)
+		}
+		var b strings.Builder
+		if out := strings.TrimRight(item.AggregatedOutput, "\n"); out != "" {
+			b.WriteString(out)
+			b.WriteByte('\n')
+		}
+		exit := 0
+		if item.ExitCode != nil {
+			exit = *item.ExitCode
+		}
+		fmt.Fprintf(&b, "[codex] exit=%d", exit)
+		return b.String()
+	case "file_change":
+		if !completed {
+			return ""
+		}
+		parts := make([]string, 0, len(item.Changes))
+		for _, c := range item.Changes {
+			parts = append(parts, fmt.Sprintf("[codex] %s %s", strings.TrimSpace(c.Kind), strings.TrimSpace(c.Path)))
+		}
+		return strings.Join(parts, "\n")
+	default:
+		if completed {
+			if t := strings.TrimSpace(item.Text); t != "" {
+				return item.Text
+			}
+			if it := strings.TrimSpace(item.Type); it != "" {
+				return "[codex] " + it
+			}
+		}
+		return ""
+	}
 }
