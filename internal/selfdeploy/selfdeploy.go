@@ -146,6 +146,58 @@ func LastTrigger(stateDir string) (when time.Time, pr int, ok bool) {
 	return m.TriggeredAt, m.PR, true
 }
 
+// BuildSHA recovers the git commit SHA a maestro binary was built from out of
+// its version string, so the orchestrator can tell whether the running binary
+// still matches origin/main (#751). Two stamp formats are understood:
+//
+//   - release / self-deploy builds: "<semver>+g<shortsha>" — the
+//     "-X main.version=<VERSION>+g<shortsha>" stamp from #682
+//     (e.g. "1.4.2+gabc1234" -> "abc1234");
+//   - local checkout builds: "dev-<vcsrevision>[-dirty]" — the resolveVersion
+//     VCS fallback (e.g. "dev-abc123456789" -> "abc123456789").
+//
+// Returns "" when no SHA can be recovered (the bare "dev" sentinel, a Go
+// pseudo-version, or an empty string), in which case drift cannot be
+// determined and callers must not deploy on a guess.
+func BuildSHA(version string) string {
+	v := strings.TrimSpace(version)
+	if v == "" {
+		return ""
+	}
+	// "<semver>+g<shortsha>": take the segment after the last "+g".
+	if i := strings.LastIndex(v, "+g"); i >= 0 {
+		return strings.TrimSpace(v[i+2:])
+	}
+	// "dev-<rev>[-dirty]": strip the prefix and any "-dirty" suffix.
+	if rest, ok := strings.CutPrefix(v, "dev-"); ok {
+		rest = strings.TrimSuffix(rest, "-dirty")
+		return strings.TrimSpace(rest)
+	}
+	return ""
+}
+
+// MainAdvanced reports whether origin/main (mainHeadSHA, a full commit SHA)
+// points at a different commit than the one the running binary was built from
+// (recovered from runningVersion via BuildSHA). It is the storm guard for the
+// observe-merge self-deploy (#751 AC3): a reconcile that sees many
+// already-merged historical PRs must NOT redeploy unless main is genuinely
+// ahead of the live binary — once a deploy lands, the binary matches main and
+// the drift clears. The build stamp carries a short SHA while mainHeadSHA is a
+// full commit, so the match is a case-insensitive prefix check. Returns false
+// (no deploy) whenever either SHA is unknown, so an undeterminable version
+// never triggers a spurious deploy.
+func MainAdvanced(runningVersion, mainHeadSHA string) bool {
+	head := strings.ToLower(strings.TrimSpace(mainHeadSHA))
+	built := strings.ToLower(BuildSHA(runningVersion))
+	if head == "" || built == "" {
+		return false
+	}
+	if len(built) > len(head) {
+		return built != head
+	}
+	return !strings.HasPrefix(head, built)
+}
+
 // TriggerCommand builds the detached systemd-run invocation for a deploy
 // after the given merged PR. Split from Trigger so tests can assert the
 // argv without systemd.

@@ -42,6 +42,7 @@ type Orchestrator struct {
 	gh                    *github.Client
 	router                *router.Router
 	repo                  string
+	binaryVersion         string
 	promptBase            string
 	bugPromptBase         string
 	enhancementPromptBase string
@@ -123,6 +124,7 @@ type Orchestrator struct {
 	runVisualCaptureFn           func(v config.VerifyVisualConfig, worktreePath string) ([]string, error)
 	workerStopFn                 func(cfg *config.Config, slotName string, sess *state.Session) error
 	selfDeployStartFn            func(prNumber int) error
+	mainHeadSHAFn                func() (string, error)
 	rebaseWorktreeFn             func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 	outcomeCheckFn               func(context.Context, outcome.Brief) outcome.HealthCheckResult
 	syncProjectFn                func(issueNumber int, status github.ProjectStatus) bool
@@ -230,6 +232,26 @@ func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
 		return o.isPRMergedFn(prNumber)
 	}
 	return o.gh.IsPRMerged(prNumber)
+}
+
+// SetBinaryVersion records the running binary's resolved version (e.g.
+// "1.4.2+gabc1234"), set once at startup by cmd/maestro from resolveVersion().
+// The observe-merge self-deploy (#751) compares its stamped SHA against
+// origin/main to decide whether the live binary lags. Left unset (e.g. in
+// tests), the drift-based trigger stays off.
+func (o *Orchestrator) SetBinaryVersion(v string) {
+	o.binaryVersion = strings.TrimSpace(v)
+}
+
+// mainHeadSHA returns origin/main's current head commit SHA.
+func (o *Orchestrator) mainHeadSHA() (string, error) {
+	if o.mainHeadSHAFn != nil {
+		return o.mainHeadSHAFn()
+	}
+	if o.gh == nil {
+		return "", fmt.Errorf("no github client configured for main head sha")
+	}
+	return o.gh.BranchHeadSHA("main")
 }
 
 func (o *Orchestrator) prCIStatus(prNumber int) (string, error) {
@@ -1549,6 +1571,16 @@ func (o *Orchestrator) RunOnce() error {
 	// covers sessions that reached code_landed before the verifier was available
 	// or where the verifier passed on a later cycle.
 	o.reconcileCodeLandedSessions(s)
+
+	// Step 3c: Observe-merge self-deploy (#751). A PR merged outside the
+	// orchestrator's own merge path (GitHub UI, manual `gh pr merge`, or the
+	// approval-gate executor) advances origin/main but never reaches
+	// maybeSelfDeployAfterMerge, so without this the fleet binary silently lags
+	// main. Runs after autoMergePRs so a same-cycle orchestrator merge has
+	// already recorded its trigger and debounces this drift-based path. No-op
+	// unless self_deploy is enabled and main is genuinely ahead of the running
+	// binary.
+	o.maybeSelfDeployOnMainAdvance(s)
 
 	// Step 4: Rebase conflicting PRs
 	o.rebaseConflicts(s)
@@ -4055,6 +4087,72 @@ func (o *Orchestrator) maybeSelfDeployAfterMerge(s *state.State, prNumber int) {
 	}
 	log.Printf("[orch] self-deploy started for PR #%d (detached transient unit)", prNumber)
 	o.notifier.Sendf("🚀 maestro: self-deploy started after PR #%d merge — units will restart after drain", prNumber)
+}
+
+// maybeSelfDeployOnMainAdvance triggers the opt-in self-deploy (#698) when the
+// orchestrator OBSERVES origin/main advancing past the running binary — i.e. a
+// PR merged outside the orchestrator's own merge path: via the GitHub UI, a
+// manual `gh pr merge`, or the approval-gate executor (#751). Without this, only
+// orchestrator-merged PRs deploy and the fleet binary silently lags main.
+//
+// It reuses the same debounced trigger as maybeSelfDeployAfterMerge, gated on a
+// real drift signal rather than a specific merge:
+//   - storm guard (#751 AC3): deploy ONLY when origin/main's head SHA differs
+//     from the SHA the running binary was built from, so a reconcile that sees
+//     many already-merged historical PRs does not re-fire — once a deploy lands,
+//     the binary matches main and the drift clears.
+//   - debounce (#722 / #751 AC2): honor the existing RecordTrigger window so a
+//     deploy the orchestrator just launched for its own merge (which advanced
+//     main too) does not double-trigger here.
+func (o *Orchestrator) maybeSelfDeployOnMainAdvance(s *state.State) {
+	if o == nil || o.cfg == nil || !o.cfg.SelfDeploy.Enabled {
+		return
+	}
+	// Without a resolvable build SHA (e.g. a bare "dev" binary) drift cannot be
+	// told apart from a fresh build, so do nothing rather than redeploy every
+	// cycle.
+	if selfdeploy.BuildSHA(o.binaryVersion) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	// Cheap debounce check first: if a deploy already fired within the window
+	// (e.g. the orchestrator merged a PR this cycle and recorded it), skip
+	// before spending a GitHub round-trip on the head-SHA lookup.
+	if last, _, ok := selfdeploy.LastTrigger(o.cfg.StateDir); ok {
+		window := time.Duration(o.cfg.SelfDeploy.EffectiveMinIntervalMinutes()) * time.Minute
+		if since := now.Sub(last); since >= 0 && since < window {
+			return
+		}
+	}
+	head, err := o.mainHeadSHA()
+	if err != nil {
+		log.Printf("[orch] self-deploy main-advance check: could not resolve origin/main head: %v", err)
+		return
+	}
+	if !selfdeploy.MainAdvanced(o.binaryVersion, head) {
+		return // running binary already matches main — no externally-merged drift
+	}
+	log.Printf("[orch] self-deploy: origin/main (%s) advanced past running binary (%s) — deploying", shortHeadSHA(head), o.binaryVersion)
+	// PR 0: this deploy was triggered by observing main advance, not by a merge
+	// the orchestrator performed itself.
+	if err := o.triggerSelfDeploy(0); err != nil {
+		log.Printf("[orch] self-deploy (main-advance) trigger failed: %v", err)
+		o.notifier.Sendf("⚠️ maestro: self-deploy trigger failed after observing origin/main advance: %v — fleet still on the previous binary", err)
+		// Surface as a supervisor finding so a silently-undeployed external merge
+		// shows as fleet attention; no marker is recorded, so the next cycle
+		// retries (mirrors maybeSelfDeployAfterMerge).
+		if s != nil {
+			s.RecordSupervisorDecision(selfdeploy.TriggerFailedFinding(0, err, o.cfg.Repo, now), state.DefaultSupervisorDecisionLimit)
+		}
+		return
+	}
+	// Record the trigger so a run-loop restarted by this deploy — and the next
+	// few cycles within the window — do not re-fire for the same wave (#722).
+	if err := selfdeploy.RecordTrigger(o.cfg.StateDir, 0, now); err != nil {
+		log.Printf("[orch] self-deploy (main-advance) trigger marker write failed: %v", err)
+	}
+	log.Printf("[orch] self-deploy started after observing origin/main advance (detached transient unit)")
+	o.notifier.Sendf("🚀 maestro: self-deploy started — origin/main advanced past the running binary (externally-merged PR); units will restart after drain")
 }
 
 // triggerSelfDeploy starts the opt-in self-deploy (#698) for a merged PR.
