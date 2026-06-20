@@ -127,13 +127,32 @@ type MCPServerDef struct {
 }
 
 // BackendPricing is the per-backend cost table used by the fleet cost
-// observability rollup (#619). Rates are USD per million tokens. Both
+// observability rollup (#619). Rates are USD per million tokens. All
 // fields default to 0; a backend whose pricing is unset is reported
 // with tokens only ("price not configured") so it degrades gracefully.
 type BackendPricing struct {
 	InputUSDPerMtok  float64 `yaml:"input_usd_per_mtok,omitempty"`
 	OutputUSDPerMtok float64 `yaml:"output_usd_per_mtok,omitempty"`
+	// CacheReadUSDPerMtok prices reused (cache_read) input tokens — the bulk
+	// of an agentic run's tokens, since the full context is re-sent every
+	// turn and served from the prompt cache (#739). When unset (0) it
+	// defaults to DefaultCacheReadMultiplier × InputUSDPerMtok (Anthropic's
+	// cache-read rate). Set it to override for a non-Anthropic provider.
+	CacheReadUSDPerMtok float64 `yaml:"cache_read_usd_per_mtok,omitempty"`
+	// CacheWriteUSDPerMtok prices freshly written (cache_creation) input
+	// tokens. When unset (0) it defaults to DefaultCacheWriteMultiplier ×
+	// InputUSDPerMtok (Anthropic's 5-minute cache-write rate).
+	CacheWriteUSDPerMtok float64 `yaml:"cache_write_usd_per_mtok,omitempty"`
 }
+
+// Anthropic's published cache rates relative to the base input rate: a
+// cache read is ~10% of input, a 5-minute cache write ~125% of input.
+// These are the defaults applied when a backend leaves the cache rates
+// unset; operators on a different provider can override per-backend.
+const (
+	DefaultCacheReadMultiplier  = 0.1
+	DefaultCacheWriteMultiplier = 1.25
+)
 
 // Configured reports whether at least one rate is non-zero. Callers use
 // this to switch a backend's cost cell between a $ value and a
@@ -142,18 +161,71 @@ func (p BackendPricing) Configured() bool {
 	return p.InputUSDPerMtok > 0 || p.OutputUSDPerMtok > 0
 }
 
+// CacheReadRate returns the effective cache-read rate (USD/Mtok): the
+// configured rate when set, otherwise DefaultCacheReadMultiplier × input.
+func (p BackendPricing) CacheReadRate() float64 {
+	if p.CacheReadUSDPerMtok > 0 {
+		return p.CacheReadUSDPerMtok
+	}
+	return DefaultCacheReadMultiplier * p.InputUSDPerMtok
+}
+
+// CacheWriteRate returns the effective cache-write rate (USD/Mtok): the
+// configured rate when set, otherwise DefaultCacheWriteMultiplier × input.
+func (p BackendPricing) CacheWriteRate() float64 {
+	if p.CacheWriteUSDPerMtok > 0 {
+		return p.CacheWriteUSDPerMtok
+	}
+	return DefaultCacheWriteMultiplier * p.InputUSDPerMtok
+}
+
 // EstimateCostUSD returns the USD estimate for the given total token
 // count using a 50/50 input/output blend. Workers record a single
 // combined token counter so a finer split is not available; operators
 // who only price one side can leave the other at zero and the average
 // halves the cost as expected. Returns 0 when no rates are set or
 // tokens is non-positive.
+//
+// Prefer EstimateCostSplit when the backend stamps per-dimension tokens
+// (#739): the blend over-states an agentic run's cost by a large factor
+// because it prices cache_read tokens — most of an agentic run — at the
+// full input rate instead of the ~10% cache-read rate.
 func (p BackendPricing) EstimateCostUSD(tokens int) float64 {
 	if tokens <= 0 || !p.Configured() {
 		return 0
 	}
 	rate := (p.InputUSDPerMtok + p.OutputUSDPerMtok) / 2
 	return float64(tokens) * rate / 1_000_000.0
+}
+
+// EstimateCostSplit returns the USD estimate for a cache-aware token
+// breakdown (#739). Each dimension is priced with its own rate: input and
+// output at the configured rates, cache_read and cache_write at the
+// (defaulted) cache rates. Negative counts are treated as zero. Returns 0
+// when the backend has no pricing configured.
+//
+// This is the cache-aware replacement for the blended EstimateCostUSD: an
+// agentic run re-sends its full context every turn, so cache_read tokens
+// dominate and the ~10% cache-read rate makes the realistic cost a small
+// fraction of the naive blend.
+func (p BackendPricing) EstimateCostSplit(input, output, cacheRead, cacheWrite int) float64 {
+	if !p.Configured() {
+		return 0
+	}
+	cost := nonNegTokens(input)*p.InputUSDPerMtok +
+		nonNegTokens(output)*p.OutputUSDPerMtok +
+		nonNegTokens(cacheRead)*p.CacheReadRate() +
+		nonNegTokens(cacheWrite)*p.CacheWriteRate()
+	return cost / 1_000_000.0
+}
+
+// nonNegTokens clamps a token count to a non-negative float so a stray
+// negative counter cannot subtract from a cost estimate.
+func nonNegTokens(n int) float64 {
+	if n <= 0 {
+		return 0
+	}
+	return float64(n)
 }
 
 // BackendQuota calibrates a subscription-style backend against its

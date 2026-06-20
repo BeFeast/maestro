@@ -148,21 +148,31 @@ type Session struct {
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
 	// configured per-backend pricing estimate.
-	Model                       string            `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
-	CostUSDBackend              float64           `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark        int               `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of a backend usage stream's full-log cumulative token count (Pi --mode json, claude stream-json); persists across respawns so re-parsing the appended log/jsonl does not double-count prior attempts
-	LongRunning                 bool              `json:"long_running,omitempty"`
-	RebaseAttempted             bool              `json:"rebase_attempted,omitempty"`
-	NotifiedCIFail              bool              `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
-	LastNotifiedStatus          string            `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
-	LiveVerificationNotified    bool              `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
-	RetryCount                  int               `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
-	MaintenanceRetryCount       int               `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
-	NextRetryAt                 *time.Time        `json:"next_retry_at,omitempty"`
-	LastOutputHash              string            `json:"last_output_hash,omitempty"`
-	LastOutputChangedAt         time.Time         `json:"last_output_changed_at,omitempty"`
-	TokensUsedAttempt           int               `json:"tokens_used_attempt,omitempty"`            // tokens consumed in current attempt (reset on respawn)
-	TokensUsedTotal             int               `json:"tokens_used_total,omitempty"`              // cumulative tokens across the issue lifecycle
+	Model                    string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
+	CostUSDBackend           float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
+	UsageTokensWatermark     int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of a backend usage stream's full-log cumulative token count (Pi --mode json, claude stream-json); persists across respawns so re-parsing the appended log/jsonl does not double-count prior attempts
+	LongRunning              bool       `json:"long_running,omitempty"`
+	RebaseAttempted          bool       `json:"rebase_attempted,omitempty"`
+	NotifiedCIFail           bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
+	LastNotifiedStatus       string     `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
+	LiveVerificationNotified bool       `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
+	RetryCount               int        `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
+	MaintenanceRetryCount    int        `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
+	NextRetryAt              *time.Time `json:"next_retry_at,omitempty"`
+	LastOutputHash           string     `json:"last_output_hash,omitempty"`
+	LastOutputChangedAt      time.Time  `json:"last_output_changed_at,omitempty"`
+	TokensUsedAttempt        int        `json:"tokens_used_attempt,omitempty"` // tokens consumed in current attempt (reset on respawn)
+	TokensUsedTotal          int        `json:"tokens_used_total,omitempty"`   // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
+	// #739: cache-aware split token counters stamped from a backend usage
+	// stream (claude stream-json / Pi --mode json). Cumulative run totals so
+	// the cost panel can price each dimension separately — cache_read tokens
+	// dominate an agentic run and cost ~10% of input, so blending them into
+	// TokensUsedTotal over-states cost. Zero for backends that do not stamp a
+	// split; the cost rollup then falls back to the blended estimate.
+	TokensInput                 int               `json:"tokens_input,omitempty"`                   // cumulative non-cached input tokens
+	TokensOutput                int               `json:"tokens_output,omitempty"`                  // cumulative output (generated) tokens
+	TokensCacheRead             int               `json:"tokens_cache_read,omitempty"`              // cumulative cache-read (reused context) tokens, discounted
+	TokensCacheWrite            int               `json:"tokens_cache_write,omitempty"`             // cumulative cache-write (cache creation) tokens
 	QuotaTokensAccounted        int               `json:"quota_tokens_accounted,omitempty"`         // portion of TokensUsedTotal already accrued into BackendQuotaUsage windows (#704)
 	RateLimitHit                bool              `json:"rate_limit_hit,omitempty"`                 // true when the worker died on a transient backend block (provider limit or auth failure, #693); excludes the session from the per-issue retry budget
 	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for backend-failure fallback)
@@ -535,6 +545,17 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 		s.TokensUsedTotal = aux.LegacyTokensUsed
 	}
 	return nil
+}
+
+// HasSplitTokens reports whether the session carries the cache-aware split
+// token breakdown stamped from a backend usage stream (#739). When true the
+// cost rollup prices each dimension separately (EstimateCostSplit); when
+// false it falls back to the blended estimate over TokensUsedTotal.
+func (s *Session) HasSplitTokens() bool {
+	if s == nil {
+		return false
+	}
+	return s.TokensInput > 0 || s.TokensOutput > 0 || s.TokensCacheRead > 0 || s.TokensCacheWrite > 0
 }
 
 // Mission tracks a decomposed epic and its child issues.

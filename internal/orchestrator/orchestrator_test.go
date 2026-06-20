@@ -9628,6 +9628,49 @@ func TestUpdateTokensUsedFromOutput_PiBackendStampsModelTokensCost(t *testing.T)
 	}
 }
 
+// #739: a Pi-backed session's usage stream carries the cache-aware split
+// (input/output/cacheRead/cacheWrite); the orchestrator stamps each dimension
+// onto the session so the cost panel can apply the cache-read discount.
+func TestUpdateTokensUsedFromOutput_PiBackendStampsSplitTokens(t *testing.T) {
+	// Cache-heavy turn: the bulk of the tokens are reused cache_read.
+	const piLog = `{"type":"turn_end","message":{"role":"assistant","provider":"ollama","model":"glm-5.2:cloud","usage":{"input":1000,"output":500,"cacheRead":50000,"cacheWrite":2000,"totalTokens":53500,"cost":{"input":0,"output":0,"total":0}}}}
+`
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: t.TempDir(),
+			Model: config.ModelConfig{
+				Default: "pi-ollama",
+				Backends: map[string]config.BackendDef{
+					"pi-ollama": {Provider: "ollama", Cmd: "pi", Model: "glm-5.2:cloud"},
+				},
+			},
+		},
+	}
+	sess := &state.Session{Backend: "pi-ollama"}
+
+	if !o.updateTokensUsedFromOutput("sup-739", sess, piLog) {
+		t.Fatal("expected a change for the Pi event stream")
+	}
+	if sess.TokensUsedTotal != 53500 {
+		t.Errorf("TokensUsedTotal = %d, want 53500 (combined total preserved)", sess.TokensUsedTotal)
+	}
+	if sess.TokensInput != 1000 {
+		t.Errorf("TokensInput = %d, want 1000", sess.TokensInput)
+	}
+	if sess.TokensOutput != 500 {
+		t.Errorf("TokensOutput = %d, want 500", sess.TokensOutput)
+	}
+	if sess.TokensCacheRead != 50000 {
+		t.Errorf("TokensCacheRead = %d, want 50000", sess.TokensCacheRead)
+	}
+	if sess.TokensCacheWrite != 2000 {
+		t.Errorf("TokensCacheWrite = %d, want 2000", sess.TokensCacheWrite)
+	}
+	if !sess.HasSplitTokens() {
+		t.Error("HasSplitTokens() = false, want true after stamping a split")
+	}
+}
+
 // #730: a non-Pi backend (claude/codex) keeps the generic token parser — the
 // Pi usage path must not engage just because the log happens to contain JSON.
 func TestUpdateTokensUsedFromOutput_ClaudeBackendKeepsGenericParser(t *testing.T) {
@@ -9843,6 +9886,18 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendStampsUsage(t *testing.T) {
 	}
 	if sess.Model != "claude-opus-4-8[1m]" {
 		t.Errorf("Model = %q, want claude-opus-4-8[1m]", sess.Model)
+	}
+	// #739: the cache-aware split is stamped per dimension so the cost panel
+	// can apply the cache-read discount (in=2487, out=4, cacheWrite=1924,
+	// cacheRead=15661 per the claudeResultFrame arg order).
+	if sess.TokensInput != 2487 || sess.TokensOutput != 4 {
+		t.Errorf("input/output = %d/%d, want 2487/4", sess.TokensInput, sess.TokensOutput)
+	}
+	if sess.TokensCacheRead != 15661 || sess.TokensCacheWrite != 1924 {
+		t.Errorf("cache read/write = %d/%d, want 15661/1924", sess.TokensCacheRead, sess.TokensCacheWrite)
+	}
+	if !sess.HasSplitTokens() {
+		t.Error("HasSplitTokens() = false, want true")
 	}
 }
 

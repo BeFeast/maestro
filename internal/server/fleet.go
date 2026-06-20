@@ -880,7 +880,7 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	pricing := backendPricingMap(project.cfg)
-	infos[0].CostUSDEstimate = sessionCostEstimate(infos[0].Backend, infos[0].TokensUsedTotal, pricing, infos[0].CostUSDBackend)
+	infos[0].CostUSDEstimate = sessionCostUSD(sess, pricing)
 	infos[0].Actions = workerActionAffordances(projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
 	worker := makeFleetWorkerState(projectState, infos[0])
 	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)

@@ -96,16 +96,6 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 		p, ok := pricing[backend]
 		return ok && p.Configured()
 	}
-	estimate := func(backend string, tokens int) float64 {
-		if tokens <= 0 {
-			return 0
-		}
-		p, ok := pricing[backend]
-		if !ok {
-			return 0
-		}
-		return p.EstimateCostUSD(tokens)
-	}
 
 	type backendRow struct {
 		today    fleetCostWindow
@@ -135,7 +125,7 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 		}
 		stamp := sessionCostTimestamp(sess)
 		backend := sess.Backend
-		usd := estimate(backend, tokens)
+		usd := sessionCostUSD(sess, pricing)
 		priced := priceConfigured(backend)
 
 		row, ok := backends[backend]
@@ -389,21 +379,48 @@ func applySessionCostEstimate(backend string, tokens int, pricing map[string]con
 	return p.EstimateCostUSD(tokens)
 }
 
-// sessionCostEstimate returns the USD cost to surface for a session. It
-// prefers the backend's self-reported cost (Pi --mode json cost.total,
-// #730) and falls back to the per-backend pricing estimate (#619) when the
-// backend did not report a cost. Zero when neither is available.
-func sessionCostEstimate(backend string, tokens int, pricing map[string]config.BackendPricing, backendCost float64) float64 {
+// sessionCostEstimate returns the USD cost to surface for a session under
+// the cache-aware precedence:
+//
+//  1. the backend's self-reported cost (Pi --mode json cost.total / claude
+//     total_cost_usd, #730) always wins;
+//  2. otherwise a cache-aware split estimate when the session carries split
+//     tokens (#739) — this prices the cache-read discount so an agentic run's
+//     cost reflects reality rather than the over-stated blend;
+//  3. otherwise the legacy blended estimate over the combined total (#619).
+//
+// Zero when the backend is unpriced/unknown and nothing was reported.
+func sessionCostEstimate(backend string, tokens, input, output, cacheRead, cacheWrite int, pricing map[string]config.BackendPricing, backendCost float64) float64 {
 	if backendCost > 0 {
 		return backendCost
+	}
+	if input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0 {
+		p, ok := pricing[backend]
+		if !ok {
+			return 0
+		}
+		return p.EstimateCostSplit(input, output, cacheRead, cacheWrite)
 	}
 	return applySessionCostEstimate(backend, tokens, pricing)
 }
 
+// sessionCostUSD applies sessionCostEstimate to a state.Session, sourcing the
+// split tokens / self-reported cost directly off the session record. Used by
+// the fleet rollup and the per-worker drawer so the cost panel reflects split
+// costing for claude/codex/Pi sessions that carry split tokens (#739).
+func sessionCostUSD(sess *state.Session, pricing map[string]config.BackendPricing) float64 {
+	if sess == nil {
+		return 0
+	}
+	return sessionCostEstimate(sess.Backend, sess.TokensUsedTotal,
+		sess.TokensInput, sess.TokensOutput, sess.TokensCacheRead, sess.TokensCacheWrite,
+		pricing, sess.CostUSDBackend)
+}
+
 // SessionCostEstimate is the exported form used by cmd/maestro (history
 // --json) so the CLI does not need to rebuild the pricing map logic. It
-// prefers the backend's self-reported cost and falls back to the configured
-// per-backend pricing estimate.
-func SessionCostEstimate(cfg *config.Config, backend string, tokens int, backendCost float64) float64 {
-	return sessionCostEstimate(backend, tokens, backendPricingMap(cfg), backendCost)
+// applies the same self-reported > split > blended precedence over the
+// session's persisted counters.
+func SessionCostEstimate(cfg *config.Config, sess *state.Session) float64 {
+	return sessionCostUSD(sess, backendPricingMap(cfg))
 }

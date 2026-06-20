@@ -661,6 +661,14 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 		sess.UsageTokensWatermark = usage.TotalTokens
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
+		// #739: stamp the cache-aware split so the cost panel can price each
+		// dimension. The full-log parse is cumulative, so assigning (not
+		// accumulating) tracks the run total and is respawn-safe alongside the
+		// watermark guard above.
+		sess.TokensInput = usage.Input
+		sess.TokensOutput = usage.Output
+		sess.TokensCacheRead = usage.CacheRead
+		sess.TokensCacheWrite = usage.CacheWrite
 		changed = true
 	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
@@ -722,6 +730,14 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		sess.UsageTokensWatermark = usage.TotalTokens
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
+		// #739: stamp the cache-aware split (input/output/cache_read/cache_write)
+		// so the cost panel can price the cache-read discount. The full-jsonl
+		// parse is cumulative, so assigning the run totals is respawn-safe
+		// alongside the watermark guard.
+		sess.TokensInput = usage.Input
+		sess.TokensOutput = usage.Output
+		sess.TokensCacheRead = usage.CacheRead
+		sess.TokensCacheWrite = usage.CacheWrite
 		changed = true
 	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
