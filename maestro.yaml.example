@@ -60,6 +60,13 @@ model:
   backends:
     claude:
       cmd: claude
+      # Steer this orchestrating backend's own sub-agents to cheaper models
+      # (issue #706). Claude Code spawns sub-agents and, by default, runs them
+      # on the same expensive model — bulk grunt subtasks then burn the
+      # subscription window at orchestrator prices, multiplied across parallel
+      # sub-agents. When set, the worker prompt gains a "Sub-agent Model Policy"
+      # section. Omit the field to keep the prompt unchanged.
+      subagent_hint: "Use cheaper sub-agent models (e.g. opus/sonnet) for delegated grunt subtasks such as file sweeps, searches, and mechanical edits; reserve the main orchestrator model for planning and final review."
       # Optional per-backend pricing for the MC cost-observability panel
       # (issue #619). USD per million tokens. When unset, the SPA shows
       # tokens only ("price not configured") for this backend.

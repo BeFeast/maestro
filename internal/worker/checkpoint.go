@@ -138,6 +138,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 
 	// Assemble prompt with checkpoint
 	prompt := assemblePromptWithCheckpoint(promptBase, issue, sess.Worktree, sess.Branch, cfg, checkpointContext)
+	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
 
 	// Write prompt to file

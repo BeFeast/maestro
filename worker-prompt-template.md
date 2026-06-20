@@ -46,6 +46,8 @@ If the build **passes** → proceed to implementation.
 
 ## Rules — read carefully, these are non-negotiable
 
+If Maestro appended a **Sub-agent Model Policy** section to this prompt (the backend sets `subagent_hint`), follow it when delegating work: route bulk grunt subtasks to the cheaper sub-agent model it names and reserve the main model for orchestration and final review.
+
 ### 1. Git hygiene
 - You are already in the worktree at `{{WORKTREE}}`
 - Your branch is `{{BRANCH}}` — it's already checked out
