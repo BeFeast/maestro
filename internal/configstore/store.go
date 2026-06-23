@@ -172,6 +172,26 @@ func importProject(ctx context.Context, tx *sql.Tx, sourcePath string, data []by
 	}
 	backends := detachBackends(&root)
 	now := time.Now().UTC().Format(time.RFC3339)
+	if err := upsertSharedBackendsTx(ctx, tx, backends, now); err != nil {
+		return err
+	}
+	projectYAML, err := marshalNode(&root)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO project(name, source_path, config_yaml, backend_ref, updated_at)
+VALUES(?, ?, ?, 'global', ?)
+ON CONFLICT(name) DO UPDATE SET source_path = excluded.source_path, config_yaml = excluded.config_yaml, updated_at = excluded.updated_at
+`, projectName, sourcePath, string(projectYAML), now)
+	return err
+}
+
+// upsertSharedBackendsTx inserts/updates the shared backend definitions
+// detached from a project's YAML. It mirrors importProject's behavior:
+// a backend whose definition differs from one already stored is rejected,
+// so two projects can share a backend only when their definitions agree.
+func upsertSharedBackendsTx(ctx context.Context, tx *sql.Tx, backends map[string]*yaml.Node, now string) error {
 	for name, def := range backends {
 		defYAML, err := marshalNode(def)
 		if err != nil {
@@ -193,16 +213,126 @@ ON CONFLICT(name) DO UPDATE SET definition_yaml = excluded.definition_yaml, upda
 			return err
 		}
 	}
+	return nil
+}
+
+// UpsertProject writes a single project's config under an explicit name,
+// mirroring importProject: the YAML is validated through config.Parse, any
+// model.backends block is detached into the shared backends table, and the
+// remaining project document is stored INSERT ... ON CONFLICT. The whole
+// write runs in one transaction so a divergent shared backend rolls the
+// project write back too. source_path is left empty for write-API projects
+// (they have no originating file) and is preserved on conflict.
+func (s *Store) UpsertProject(ctx context.Context, name, configYAML string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("project name is required")
+	}
+	if _, err := config.Parse([]byte(configYAML)); err != nil {
+		return err
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(configYAML), &root); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	backends := detachBackends(&root)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := upsertSharedBackendsTx(ctx, tx, backends, now); err != nil {
+		return err
+	}
 	projectYAML, err := marshalNode(&root)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO project(name, source_path, config_yaml, backend_ref, updated_at)
-VALUES(?, ?, ?, 'global', ?)
-ON CONFLICT(name) DO UPDATE SET source_path = excluded.source_path, config_yaml = excluded.config_yaml, updated_at = excluded.updated_at
-`, projectName, sourcePath, string(projectYAML), now)
+VALUES(?, '', ?, 'global', ?)
+ON CONFLICT(name) DO UPDATE SET config_yaml = excluded.config_yaml, updated_at = excluded.updated_at
+`, name, string(projectYAML), now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteProject removes a project row. Deleting a missing project is a no-op
+// (no error), matching idempotent delete semantics. Shared backend rows are
+// left intact: they may still be referenced by other projects.
+func (s *Store) DeleteProject(ctx context.Context, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("project name is required")
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM project WHERE name = ?`, name)
 	return err
+}
+
+// UpsertBackend writes a shared backend definition directly (write-API).
+// Unlike the import path it overwrites an existing definition rather than
+// rejecting divergence — the caller is making an explicit edit. definitionYAML
+// is validated only as well-formed YAML; backend-shape validation happens when
+// a project that references it is parsed.
+func (s *Store) UpsertBackend(ctx context.Context, name, definitionYAML string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("backend name is required")
+	}
+	var probe yaml.Node
+	if err := yaml.Unmarshal([]byte(definitionYAML), &probe); err != nil {
+		return fmt.Errorf("parse backend %q: %w", name, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO backends(name, definition_yaml, updated_at)
+VALUES(?, ?, ?)
+ON CONFLICT(name) DO UPDATE SET definition_yaml = excluded.definition_yaml, updated_at = excluded.updated_at
+`, name, definitionYAML, now)
+	return err
+}
+
+// SetGlobal writes a global key/value (write-API). valueYAML is validated only
+// as well-formed YAML.
+func (s *Store) SetGlobal(ctx context.Context, key, valueYAML string) error {
+	if strings.TrimSpace(key) == "" {
+		return errors.New("global key is required")
+	}
+	var probe yaml.Node
+	if err := yaml.Unmarshal([]byte(valueYAML), &probe); err != nil {
+		return fmt.Errorf("parse global %q: %w", key, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO global(key, value_yaml, updated_at)
+VALUES(?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value_yaml = excluded.value_yaml, updated_at = excluded.updated_at
+`, key, valueYAML, now)
+	return err
+}
+
+// ProjectsFingerprint returns each project's name mapped to its updated_at
+// timestamp. Callers use it to detect which projects changed since a prior
+// snapshot without loading every config.
+func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, updated_at FROM project`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]time.Time)
+	for rows.Next() {
+		var name, updatedAt string
+		if err := rows.Scan(&name, &updatedAt); err != nil {
+			return nil, err
+		}
+		ts, err := time.Parse(time.RFC3339, updatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse updated_at for project %q: %w", name, err)
+		}
+		out[name] = ts
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) exportProjectYAML(ctx context.Context, name string) ([]byte, string, error) {

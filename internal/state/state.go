@@ -1210,6 +1210,44 @@ func LogDir(stateDir string) string {
 	return filepath.Join(stateDir, "logs")
 }
 
+// Store abstracts persistence of orchestration State so call-sites need not
+// depend on the package-level Load/Save free functions directly. The default
+// jsonStore implementation (NewJSONStore) wraps the existing JSON-file path —
+// flock + 3-way merge on Save — so its behavior is identical to calling
+// Load/Save directly. A future database-backed implementation can satisfy the
+// same contract without touching call-sites. The typed accessors/mutators
+// (Sessions, Approvals, RecordSupervisorDecision, …) live on the *State value
+// that Load returns and Save persists.
+type Store interface {
+	// Load returns the current persisted State, or a fresh empty State when
+	// none has been written yet.
+	Load() (*State, error)
+	// Save persists s, merging independent concurrent writes exactly as the
+	// package-level Save does (flock + 3-way merge).
+	Save(s *State) error
+}
+
+// jsonStore is the default Store backed by <dir>/state.json. It is a thin
+// wrapper over the package-level Load/Save free functions, so its on-disk
+// format and concurrency semantics are unchanged.
+type jsonStore struct {
+	dir string
+}
+
+// NewJSONStore returns the default file-backed Store rooted at stateDir.
+func NewJSONStore(stateDir string) Store {
+	return &jsonStore{dir: stateDir}
+}
+
+// StateDir returns the directory this store persists to.
+func (j *jsonStore) StateDir() string { return j.dir }
+
+// Load implements Store by delegating to the package-level Load.
+func (j *jsonStore) Load() (*State, error) { return Load(j.dir) }
+
+// Save implements Store by delegating to the package-level Save.
+func (j *jsonStore) Save(s *State) error { return Save(j.dir, s) }
+
 func Load(stateDir string) (*State, error) {
 	path := StatePath(stateDir)
 	data, err := os.ReadFile(path)
