@@ -725,7 +725,7 @@ func superviseCmd(args []string) {
 	// been bumped in 3*interval. The warning persists into state
 	// (SupervisorStuck=true) so the Fleet API and dashboards can
 	// surface it without grepping the journal.
-	go supervisor.Watchdog(ctx, cfg.StateDir, *interval)
+	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval)
 
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
@@ -1039,22 +1039,14 @@ func serveCmd(args []string) {
 			if err != nil {
 				log.Fatalf("load fleet: %v", err)
 			}
-			// LoadFleetProjects can't import github (cycle); wire the
-			// per-project safe-action GH client here at the boundary.
+			// LoadFleetProjects yields configs without their GitHub
+			// clients; wire the per-project safe-action + board client
+			// here via the shared helper (#529, #764).
 			for i := range projects {
-				if cfg := projects[i].Cfg(); cfg != nil {
-					gh := github.New(cfg.Repo)
-					projects[i].SetActionGH(gh)
-					// #529: surface the GitHub Project board (WIP
-					// rollup + URL) in the fleet snapshot when the
-					// project enables github_projects.
-					if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber > 0 {
-						projects[i].SetBoardClient(gh, cfg.GitHubProjects.ProjectNumber)
-					}
-				}
+				server.WireFleetProjectGitHub(&projects[i])
 			}
 		} else {
-			projects = fleetProjectsFromConfigs(cfgs)
+			projects = server.FleetProjectsFromConfigs(cfgs)
 		}
 		fleetHost := *host
 		if strings.TrimSpace(fleetHost) == "" {
@@ -1079,7 +1071,7 @@ func serveCmd(args []string) {
 		// #487: fleet auth uses the first project that configures a token
 		// env. A single shared token across the fleet is the deployment
 		// expectation; per-project tokens are out of scope.
-		fleetSrv.SetAuth(fleetAuthFromProjects(projects))
+		fleetSrv.SetAuth(server.FleetAuthFromProjects(projects))
 		if err := fleetSrv.Start(ctx); err != nil {
 			log.Fatalf("serve fleet: %v", err)
 		}
@@ -1123,45 +1115,6 @@ func serveCmd(args []string) {
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
-}
-
-func fleetProjectsFromConfigs(cfgs []*config.Config) []server.FleetProject {
-	projects := make([]server.FleetProject, 0, len(cfgs))
-	for _, cfg := range cfgs {
-		proj := server.NewFleetProject(defaultFleetProjectName(cfg.Repo), cfg.ResolvePath(), "", cfg)
-		gh := github.New(cfg.Repo)
-		proj.SetActionGH(gh)
-		if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber > 0 {
-			proj.SetBoardClient(gh, cfg.GitHubProjects.ProjectNumber)
-		}
-		projects = append(projects, proj)
-	}
-	return projects
-}
-
-// fleetAuthFromProjects returns the first non-empty Server.Auth config across
-// the fleet. The fleet uses a single shared token (#487); per-project
-// distinct tokens are intentionally out of scope.
-func fleetAuthFromProjects(projects []server.FleetProject) config.ServerAuthConfig {
-	for i := range projects {
-		cfg := projects[i].Cfg()
-		if cfg == nil {
-			continue
-		}
-		if strings.TrimSpace(cfg.Server.Auth.TokenEnv) != "" {
-			return cfg.Server.Auth
-		}
-	}
-	return config.ServerAuthConfig{}
-}
-
-func defaultFleetProjectName(repo string) string {
-	repo = strings.TrimSpace(repo)
-	if repo == "" {
-		return "project"
-	}
-	parts := strings.Split(repo, "/")
-	return parts[len(parts)-1]
 }
 
 func statusCmd(args []string) {

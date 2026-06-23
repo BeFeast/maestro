@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
@@ -21,8 +20,8 @@ import (
 func daemonCmd(args []string) {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	storePath := fs.String("store", defaultConfigStorePath(), "Path to SQLite config store")
-	runInterval := fs.Duration("run-interval", 10*time.Minute, "Orchestrator loop interval")
-	superviseInterval := fs.Duration("supervise-interval", 5*time.Minute, "Supervisor loop interval")
+	runInterval := fs.Duration("run-interval", daemon.DefaultRunInterval, "Orchestrator loop interval")
+	superviseInterval := fs.Duration("supervise-interval", daemon.DefaultSuperviseInterval, "Supervisor loop interval")
 	host := fs.String("host", "127.0.0.1", "Host/interface to bind the fleet web server")
 	port := fs.Int("port", 8786, "Port to bind the fleet web server")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")

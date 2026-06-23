@@ -7,45 +7,37 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
-	"github.com/befeast/maestro/internal/configwatch"
-	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/server"
 )
 
-// projectFlow is one project running inside the daemon: an orchestrator loop
-// and a supervisor loop sharing a child context. Cancelling that context
-// (stopFlow) tears both loops down.
+// projectFlow is one project running inside the daemon: an orchestrator loop, a
+// supervisor loop, and (when supervising) a liveness watchdog sharing a child
+// context. Cancelling that context (stopFlow) tears every goroutine down.
 type projectFlow struct {
 	name   string
+	key    string // stable flow identity (StateDir/Repo); the flows-map key
 	cfg    *config.Config
 	cancel context.CancelFunc
-	done   chan struct{} // closed once both loops have exited
+	done   chan struct{} // closed once every flow goroutine has exited
 }
 
-// newFleetProject wraps a config for in-process fleet serving, mirroring the
-// `maestro serve` wiring: a safe-action GitHub client, plus the GitHub Project
-// board client when github_projects is enabled. The project name is derived
-// from the repo (NewFleetProject's default) to match the serve path.
-func newFleetProject(cfg *config.Config) server.FleetProject {
-	proj := server.NewFleetProject("", cfg.ResolvePath(), "", cfg)
-	gh := github.New(cfg.Repo)
-	proj.SetActionGH(gh)
-	if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber > 0 {
-		proj.SetBoardClient(gh, cfg.GitHubProjects.ProjectNumber)
-	}
-	return proj
-}
-
-// startFlow launches the orchestrator + supervisor loops for proj under a
-// child of parent and registers the flow. Each loop runs in its own goroutine
-// with a panic recover so a single project's crash can never take the daemon
-// (or the other flows) down (#756).
+// startFlow launches the orchestrator + supervisor loops (and the liveness
+// watchdog) for proj under a child of parent and registers the flow. Each loop
+// runs in its own goroutine with a panic recover so a single project's crash
+// can never take the daemon (or the other flows) down (#756).
+//
+// Every goroutine the flow spawns is tracked in one WaitGroup, so close(done)
+// — and therefore stopFlow — does not return until the watchdog has also
+// exited. An untracked watchdog could otherwise Load/Save StateDir after the
+// flow is considered stopped, racing a restarted flow for the same project
+// (#764 P2).
 func (d *Daemon) startFlow(parent context.Context, proj server.FleetProject) *projectFlow {
 	cfg := proj.Cfg()
 	fctx, cancel := context.WithCancel(parent)
 	flow := &projectFlow{
 		name:   proj.Name,
+		key:    flowKey(cfg),
 		cfg:    cfg,
 		cancel: cancel,
 		done:   make(chan struct{}),
@@ -63,24 +55,39 @@ func (d *Daemon) startFlow(parent context.Context, proj server.FleetProject) *pr
 		defer recoverFlow(flow.name, "supervise")
 		d.superviseLoop(fctx, cfg, d.opts)
 	}()
+	// Phase 1.2 (#499) liveness watchdog, one per flow — tracked in the flow
+	// WaitGroup (#764 P2). The watchdog itself no-ops on a non-positive
+	// interval; gate here too so we never spawn a goroutine that immediately
+	// returns. The flow's fleet display name (unique across the daemon, #764)
+	// is woven into the watchdog's log lines so an operator can tell whose
+	// LastRunOnceAt went stale.
+	if d.opts.SuperviseInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer recoverFlow(flow.name, "watchdog")
+			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval)
+		}()
+	}
 	go func() {
 		wg.Wait()
 		close(flow.done)
 	}()
 
 	d.mu.Lock()
-	d.flows[flow.name] = flow
+	d.flows[flow.key] = flow
 	d.mu.Unlock()
 	return flow
 }
 
-// stopFlow cancels a flow's context, waits for both loops to drain, and
-// deregisters it. Safe to call for an unknown name (no-op).
-func (d *Daemon) stopFlow(name string) {
+// stopFlow cancels a flow's context, waits for every flow goroutine to drain,
+// and deregisters it. Keyed on the flow identity (flowKey). Safe to call for an
+// unknown key (no-op).
+func (d *Daemon) stopFlow(key string) {
 	d.mu.Lock()
-	flow, ok := d.flows[name]
+	flow, ok := d.flows[key]
 	if ok {
-		delete(d.flows, name)
+		delete(d.flows, key)
 	}
 	d.mu.Unlock()
 	if !ok {
@@ -88,24 +95,24 @@ func (d *Daemon) stopFlow(name string) {
 	}
 	flow.cancel()
 	<-flow.done
-	log.Printf("[daemon] stopped flow %q", name)
+	log.Printf("[daemon] stopped flow %q", flow.name)
 }
 
 // stopAll drains every running flow. Called on daemon shutdown.
 func (d *Daemon) stopAll() {
 	d.mu.Lock()
-	names := make([]string, 0, len(d.flows))
-	for name := range d.flows {
-		names = append(names, name)
+	keys := make([]string, 0, len(d.flows))
+	for key := range d.flows {
+		keys = append(keys, key)
 	}
 	d.mu.Unlock()
-	for _, name := range names {
-		d.stopFlow(name)
+	for _, key := range keys {
+		d.stopFlow(key)
 	}
 }
 
-// recoverFlow swallows a panic in a flow loop so it stays contained to that
-// project. A panicking goroutine would otherwise crash the whole daemon.
+// recoverFlow swallows a panic in a flow goroutine so it stays contained to
+// that project. A panicking goroutine would otherwise crash the whole daemon.
 func recoverFlow(name, loop string) {
 	if r := recover(); r != nil {
 		log.Printf("[daemon] flow %q %s loop panicked (contained, flow stopped): %v", name, loop, r)
@@ -118,6 +125,12 @@ func recoverFlow(name, loop string) {
 // on run error — a failing orchestrator must log-and-continue, never take the
 // daemon down (#756). orchestrator.Run already log-and-continues on per-cycle
 // errors and returns nil on ctx cancellation.
+//
+// Hot-reload note (#764 P3): the daemon's source of truth is the config store
+// (#754), not the import-time YAML, so we deliberately do NOT wire a YAML file
+// watcher here — watching a file the store supersedes would let the run loop
+// drift from the supervise loop, which has no such watcher. Store-driven reload
+// is Phase 2 (#757).
 func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options) {
 	orch := orchestrator.New(cfg)
 	orch.SetBinaryVersion(opts.Version)
@@ -126,12 +139,6 @@ func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options) {
 	}
 
 	refreshCh := make(chan struct{}, 1)
-
-	// Config file watcher for hot-reload, matching `maestro run`.
-	if cfgPath := cfg.ResolvePath(); cfgPath != "" {
-		reloadCh := configwatch.Watch(ctx, cfgPath, 2*time.Second)
-		orch.SetConfigReloadCh(reloadCh)
-	}
 
 	runInterval := opts.RunInterval
 	if cfg.PollIntervalSeconds > 0 {

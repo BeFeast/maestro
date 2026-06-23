@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/state"
@@ -19,10 +20,17 @@ import (
 // restart.
 //
 // One Watchdog runs per supervise loop: the single-project `maestro supervise`
-// CLI starts one, and `maestro daemon` starts one per project flow (#756).
-func Watchdog(ctx context.Context, stateDir string, interval time.Duration) {
+// CLI starts one, and `maestro daemon` starts one per project flow (#756). The
+// name (project / session prefix) is woven into every log line so that, with N
+// flows in one daemon, an operator can tell whose LastRunOnceAt went stale
+// (#764) instead of reading N identical `[supervise/watchdog]` prefixes.
+func Watchdog(ctx context.Context, name, stateDir string, interval time.Duration) {
 	if interval <= 0 {
 		return
+	}
+	logPrefix := "supervise/watchdog"
+	if name = strings.TrimSpace(name); name != "" {
+		logPrefix = name + " supervise/watchdog"
 	}
 	stuckThreshold := 3 * interval
 	startedAt := time.Now()
@@ -45,23 +53,23 @@ func Watchdog(ctx context.Context, stateDir string, interval time.Duration) {
 
 		st, err := state.Load(stateDir)
 		if err != nil {
-			log.Printf("[supervise/watchdog] could not read state: %v (will retry)", err)
+			log.Printf("[%s] could not read state: %v (will retry)", logPrefix, err)
 			continue
 		}
 		if st.LastRunOnceAt.IsZero() {
 			// Daemon never completed a cycle. Loud warning, but only
 			// after the startup grace.
-			log.Printf("[supervise/watchdog] WARNING: no RunOnce has stamped state.LastRunOnceAt since the daemon started %s ago; check whether RunOnce is wedged",
-				time.Since(startedAt).Round(time.Second))
-			persistSupervisorStuck(stateDir, "no RunOnce has completed since daemon start")
+			log.Printf("[%s] WARNING: no RunOnce has stamped state.LastRunOnceAt since the daemon started %s ago; check whether RunOnce is wedged",
+				logPrefix, time.Since(startedAt).Round(time.Second))
+			persistSupervisorStuck(logPrefix, stateDir, "no RunOnce has completed since daemon start")
 			continue
 		}
 		gap := time.Since(st.LastRunOnceAt)
 		if gap > stuckThreshold {
 			reason := fmt.Sprintf("LastRunOnceAt=%s is %s old (threshold %s)",
 				st.LastRunOnceAt.Format(time.RFC3339), gap.Round(time.Second), stuckThreshold)
-			log.Printf("[supervise/watchdog] WARNING: supervise loop appears stuck — %s", reason)
-			persistSupervisorStuck(stateDir, reason)
+			log.Printf("[%s] WARNING: supervise loop appears stuck — %s", logPrefix, reason)
+			persistSupervisorStuck(logPrefix, stateDir, reason)
 		}
 	}
 }
@@ -69,10 +77,10 @@ func Watchdog(ctx context.Context, stateDir string, interval time.Duration) {
 // persistSupervisorStuck flips SupervisorStuck=true in state.json so the
 // Fleet API surfaces it. Best-effort: a save failure is logged but does
 // not stop the watchdog.
-func persistSupervisorStuck(stateDir, reason string) {
+func persistSupervisorStuck(logPrefix, stateDir, reason string) {
 	st, err := state.Load(stateDir)
 	if err != nil {
-		log.Printf("[supervise/watchdog] persist: load state: %v", err)
+		log.Printf("[%s] persist: load state: %v", logPrefix, err)
 		return
 	}
 	if st.SupervisorStuck && st.SupervisorStuckReason == reason {
@@ -81,6 +89,6 @@ func persistSupervisorStuck(stateDir, reason string) {
 	st.SupervisorStuck = true
 	st.SupervisorStuckReason = reason
 	if err := state.Save(stateDir, st); err != nil {
-		log.Printf("[supervise/watchdog] persist: save state: %v", err)
+		log.Printf("[%s] persist: save state: %v", logPrefix, err)
 	}
 }
