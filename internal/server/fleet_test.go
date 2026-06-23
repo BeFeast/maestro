@@ -4590,3 +4590,51 @@ func TestFleetAPIClearsStaleBackendCooldown(t *testing.T) {
 		t.Fatalf("codex cooldown should be cleared after RetryAfter elapses, got %+v", got)
 	}
 }
+
+func TestLoadFleetProjectsAutoDisambiguatesSameBasename(t *testing.T) {
+	// #764: two distinct repos that share a basename and have NO explicit name
+	// must auto-disambiguate (api, org-b-api) instead of hard-erroring on a
+	// duplicate fleet project name — consistent with `maestro daemon`.
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a.yaml")
+	bPath := filepath.Join(dir, "b.yaml")
+	if err := os.WriteFile(aPath, []byte("repo: org-a/api\nstate_dir: "+filepath.Join(dir, "a")+"\nsession_prefix: api\n"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := os.WriteFile(bPath, []byte("repo: org-b/api\nstate_dir: "+filepath.Join(dir, "b")+"\nsession_prefix: api\n"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	fleetPath := filepath.Join(dir, "fleet.yaml")
+	if err := os.WriteFile(fleetPath, []byte("projects:\n  - config: a.yaml\n  - config: b.yaml\n"), 0o644); err != nil {
+		t.Fatalf("write fleet: %v", err)
+	}
+
+	projects, err := LoadFleetProjects(fleetPath)
+	if err != nil {
+		t.Fatalf("LoadFleetProjects failed (want auto-disambiguation, not error): %v", err)
+	}
+	if len(projects) != 2 {
+		t.Fatalf("projects len = %d, want 2", len(projects))
+	}
+	names := map[string]bool{projects[0].Name: true, projects[1].Name: true}
+	if !names["api"] || !names["org-b-api"] {
+		t.Fatalf("names = %v, want {api, org-b-api}", names)
+	}
+}
+
+func TestLoadFleetProjectsRejectsExplicitDuplicateName(t *testing.T) {
+	// An explicit duplicate name in the fleet file is operator error and must
+	// still be rejected (only derived names auto-disambiguate, #764).
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "p.yaml")
+	if err := os.WriteFile(cfgPath, []byte("repo: owner/project\nstate_dir: "+filepath.Join(dir, "s")+"\nsession_prefix: prj\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	fleetPath := filepath.Join(dir, "fleet.yaml")
+	if err := os.WriteFile(fleetPath, []byte("projects:\n  - name: Dup\n    config: p.yaml\n  - name: Dup\n    config: p.yaml\n"), 0o644); err != nil {
+		t.Fatalf("write fleet: %v", err)
+	}
+	if _, err := LoadFleetProjects(fleetPath); err == nil {
+		t.Fatal("LoadFleetProjects: want error on explicit duplicate name, got nil")
+	}
+}
