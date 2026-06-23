@@ -25,23 +25,24 @@ import (
 // flows, so every cycle (including the first) is logged and retried. Persistent
 // failures still surface: the #499 watchdog flags SupervisorStuck when
 // LastRunOnceAt stops advancing.
-func runSupervise(ctx context.Context, cfg *config.Config, interval time.Duration) {
+func runSupervise(ctx context.Context, name string, cfg *config.Config, interval time.Duration) {
 	gh := github.New(cfg.Repo)
-	// Capture and log each cycle's SupervisorDecision the way `maestro
-	// supervise` prints it. The daemon still acts (label/comment/approve), but
-	// without this the structural "why did the supervisor do that" trail was
-	// dropped — turning debugging into journal archaeology (#764).
+	// Capture and log each cycle's SupervisorDecision. The daemon still acts
+	// (label/comment/approve), but without this the structural "why did the
+	// supervisor do that" trail was dropped — turning debugging into journal
+	// archaeology (#764). Logs key on the unique fleet name (not the possibly
+	// shared session prefix) so two same-basename repos stay distinguishable.
 	runOnce := func() error {
 		decision, err := supervisor.RunOnce(cfg, gh)
 		if err != nil {
 			return err
 		}
-		logSupervisorDecision(cfg, decision)
+		logSupervisorDecision(name, decision)
 		return nil
 	}
 
 	if err := runOnce(); err != nil {
-		log.Printf("[%s] supervise: first cycle failed (will retry): %v", cfg.SessionPrefix, err)
+		log.Printf("[%s] supervise: first cycle failed (will retry): %v", name, err)
 	}
 
 	if interval <= 0 {
@@ -59,16 +60,21 @@ func runSupervise(ctx context.Context, cfg *config.Config, interval time.Duratio
 			// never fatal — a transient GitHub/decision-layer failure must
 			// not crash the daemon.
 			if err := runOnce(); err != nil {
-				log.Printf("[%s] supervise: cycle failed (will retry in %s): %v", cfg.SessionPrefix, interval, err)
+				log.Printf("[%s] supervise: cycle failed (will retry in %s): %v", name, interval, err)
 			}
 		}
 	}
 }
 
-// logSupervisorDecision emits a compact, per-cycle record of the supervisor's
-// decision so the daemon journal carries the same structural trail the CLI
-// `maestro supervise` printed (#764). One line, greppable by project prefix.
-func logSupervisorDecision(cfg *config.Config, decision state.SupervisorDecision) {
+// logSupervisorDecision emits a compact, single-line, per-cycle record of the
+// supervisor's decision so the daemon journal keeps the structural "why" trail
+// (#764). It is a one-line, greppable digest — action, status, risk,
+// confidence, error_class, approval, target, and a reasons count — not the
+// CLI's full multi-line dump (`printSupervisorDecision` also expands every
+// reason, the queue analysis, and each mutation); the count + summary point an
+// operator at the right cycle, and `maestro supervise --json` remains the
+// source for the full record. Keyed on the unique fleet name passed in.
+func logSupervisorDecision(name string, decision state.SupervisorDecision) {
 	parts := []string{fmt.Sprintf("action=%s", decision.RecommendedAction)}
 	if decision.Status != "" {
 		parts = append(parts, fmt.Sprintf("status=%s", decision.Status))
@@ -77,14 +83,42 @@ func logSupervisorDecision(cfg *config.Config, decision state.SupervisorDecision
 		parts = append(parts, fmt.Sprintf("risk=%s", decision.Risk))
 	}
 	parts = append(parts, fmt.Sprintf("confidence=%.2f", decision.Confidence))
+	if decision.ErrorClass != "" {
+		parts = append(parts, fmt.Sprintf("error_class=%s", decision.ErrorClass))
+	}
 	if decision.RequiresApproval {
 		parts = append(parts, "requires_approval=true")
 	}
 	if decision.ApprovalID != "" {
 		parts = append(parts, fmt.Sprintf("approval=%s", decision.ApprovalID))
 	}
+	if tgt := supervisorTargetLabel(decision.Target); tgt != "" {
+		parts = append(parts, fmt.Sprintf("target=%s", tgt))
+	}
+	if n := len(decision.Reasons); n > 0 {
+		parts = append(parts, fmt.Sprintf("reasons=%d", n))
+	}
 	if summary := strings.TrimSpace(decision.Summary); summary != "" {
 		parts = append(parts, fmt.Sprintf("summary=%q", summary))
 	}
-	log.Printf("[%s] supervise decision: %s", cfg.SessionPrefix, strings.Join(parts, " "))
+	log.Printf("[%s] supervise decision: %s", name, strings.Join(parts, " "))
+}
+
+// supervisorTargetLabel renders a decision target compactly (issue/PR/session)
+// for the one-line journal digest. Empty when there is no target.
+func supervisorTargetLabel(t *state.SupervisorTarget) string {
+	if t == nil {
+		return ""
+	}
+	var b []string
+	if t.Issue > 0 {
+		b = append(b, fmt.Sprintf("issue#%d", t.Issue))
+	}
+	if t.PR > 0 {
+		b = append(b, fmt.Sprintf("pr#%d", t.PR))
+	}
+	if s := strings.TrimSpace(t.Session); s != "" {
+		b = append(b, "session="+s)
+	}
+	return strings.Join(b, "/")
 }

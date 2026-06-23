@@ -76,7 +76,7 @@ type Daemon struct {
 	// override them to drive flows (and assert WaitGroup tracking) without
 	// reaching GitHub.
 	runLoop       func(ctx context.Context, cfg *config.Config, opts Options)
-	superviseLoop func(ctx context.Context, cfg *config.Config, opts Options)
+	superviseLoop func(ctx context.Context, name string, cfg *config.Config, opts Options)
 	watchdogLoop  func(ctx context.Context, name, stateDir string, interval time.Duration)
 }
 
@@ -103,8 +103,8 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		flows: make(map[string]*projectFlow),
 	}
 	d.runLoop = runOrchestrator
-	d.superviseLoop = func(ctx context.Context, cfg *config.Config, opts Options) {
-		runSupervise(ctx, cfg, opts.SuperviseInterval)
+	d.superviseLoop = func(ctx context.Context, name string, cfg *config.Config, opts Options) {
+		runSupervise(ctx, name, cfg, opts.SuperviseInterval)
 	}
 	d.watchdogLoop = supervisor.Watchdog
 	return d
@@ -139,10 +139,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// on Project.Name, and two repos that share a basename ("api") would
 	// otherwise route the second repo's routes/actions/audit to the first
 	// (#764).
+	//
+	// This StateDir dedup is intentionally NOT folded into
+	// server.FleetProjectsFromConfigs (which `serve --fleet` uses): the daemon
+	// owns exactly one *flow* per identity, so a repeated StateDir is a true
+	// duplicate to skip, whereas serve merely aggregates the configs it is
+	// handed. Keeping the dedup here — over the shared per-cfg construction
+	// (UniqueFleetName + NewFleetProjectWithGitHubNamed) — documents that
+	// divergence instead of silently forking the shared builder (#764).
 	seen := make(map[string]bool, len(cfgs))
 	usedNames := make(map[string]bool, len(cfgs))
 	projects := make([]server.FleetProject, 0, len(cfgs))
 	for _, cfg := range cfgs {
+		if cfg == nil {
+			// A nil entry from the loader must not panic Run: flowKey tolerates
+			// nil but the wiring below dereferences cfg. Skip it, mirroring
+			// server.FleetProjectsFromConfigs' cfgRepo(nil) tolerance (#764).
+			log.Printf("[daemon] skip nil config from store")
+			continue
+		}
 		key := flowKey(cfg)
 		if seen[key] {
 			log.Printf("[daemon] skip project (repo=%s state_dir=%s): duplicate flow identity already started", cfg.Repo, cfg.StateDir)
@@ -150,45 +165,55 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		seen[key] = true
 		name := server.UniqueFleetName(cfg.Repo, usedNames)
-		proj := server.NewFleetProjectWithGitHubNamed(name, cfg)
-		flow := d.startFlow(ctx, proj)
-		projects = append(projects, proj)
-		log.Printf("[daemon] started flow %q (repo=%s state_dir=%s)", flow.name, cfg.Repo, cfg.StateDir)
+		projects = append(projects, server.NewFleetProjectWithGitHubNamed(name, cfg))
 	}
 
 	// One FleetServer for the whole fleet — replaces the N per-project
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
 	fleet.SetAuth(server.FleetAuthFromProjects(projects))
+
+	// Bind the fleet port BEFORE starting any flow. If the port is already held
+	// (a legacy maestro@ unit, a second daemon), Listen fails here and we abort
+	// immediately — no flow has started, so there is nothing to drain. Binding
+	// AFTER starting flows would force the error path through stopAll, which
+	// blocks on a flow's in-flight, non-cancellable first RunOnce and hangs the
+	// startup-error return (#764 P2). Listen returns a nil listener for port 0
+	// (no web endpoint requested); Serve then no-ops on it.
+	ln, err := fleet.Listen()
+	if err != nil {
+		return err
+	}
+
+	for i := range projects {
+		flow := d.startFlow(ctx, projects[i])
+		log.Printf("[daemon] started flow %q (repo=%s state_dir=%s)", flow.name, flow.cfg.Repo, flow.cfg.StateDir)
+	}
+
+	// Expose the fleet only after the flows are started so callers that observe
+	// d.Fleet() can rely on the flows being live.
 	d.mu.Lock()
 	d.fleet = fleet
 	d.mu.Unlock()
 
 	log.Printf("[daemon] serving fleet — projects=%d addr=%s:%d read_only=%v", len(projects), d.opts.Host, d.opts.Port, d.opts.ReadOnly)
 	fleetErr := make(chan error, 1)
-	go func() { fleetErr <- fleet.Start(ctx) }()
+	go func() { fleetErr <- fleet.Serve(ctx, ln) }()
 
-	// Surface a fleet bind failure immediately. If the port is already held (a
-	// legacy maestro@ unit, a second daemon), fleet.Start returns the bind
-	// error right away — racing it against ctx.Done() means we abort and report
-	// it now instead of buffering it and running every flow with no web
-	// endpoint / dashboard / health probe until SIGTERM (#764 P1).
-	//
-	// fleet.Start returns nil immediately when the port is 0 (no web endpoint
-	// requested); that is intentional, not a failure, so keep running the flows
-	// and fall through to wait on ctx.Done().
 	select {
 	case <-ctx.Done():
 		d.stopAll()
 		return <-fleetErr
 	case err := <-fleetErr:
+		// Serve returned before shutdown — a runtime serve error after a
+		// successful bind (rare; the bind failure itself was already handled by
+		// Listen above). Flows are legitimately running, so drain them.
+		d.stopAll()
 		if err != nil {
 			log.Printf("[daemon] fleet server failed on %s:%d: %v", d.opts.Host, d.opts.Port, err)
-			d.stopAll()
 			return err
 		}
 		<-ctx.Done()
-		d.stopAll()
 		return nil
 	}
 }

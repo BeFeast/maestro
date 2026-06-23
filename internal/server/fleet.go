@@ -173,7 +173,7 @@ func LoadFleetProjects(path string) ([]FleetProject, error) {
 	}
 
 	baseDir := filepath.Dir(path)
-	seen := make(map[string]struct{}, len(file.Projects))
+	taken := make(map[string]bool, len(file.Projects))
 	projects := make([]FleetProject, 0, len(file.Projects))
 	for i, project := range file.Projects {
 		configPath := expandFleetPath(project.ConfigPath)
@@ -189,20 +189,30 @@ func LoadFleetProjects(path string) ([]FleetProject, error) {
 			return nil, fmt.Errorf("fleet project %d config %s: %w", i+1, project.ConfigPath, err)
 		}
 		project.cfg = cfg
-		if strings.TrimSpace(project.Name) == "" {
-			project.Name = defaultFleetProjectName(cfg.Repo)
+		if explicit := strings.TrimSpace(project.Name); explicit == "" {
+			// Derived (basename) name: auto-disambiguate distinct repos that
+			// share a basename (org-a/api vs org-b/api) the same way `maestro
+			// daemon` does via UniqueFleetName, instead of hard-erroring on a
+			// legitimate two-repo layout (#764). UniqueFleetName records the
+			// chosen name into taken.
+			project.Name = UniqueFleetName(cfg.Repo, taken)
+		} else {
+			// Explicit name from the fleet file: a real duplicate is operator
+			// error, so still reject it. Case-sensitive to match
+			// UniqueFleetName and findProject, which address project-scoped
+			// routes/actions by exact Project.Name (#764) — "Api" and "api" are
+			// distinct routes, not a collision.
+			if taken[explicit] {
+				return nil, fmt.Errorf("duplicate fleet project name %q", explicit)
+			}
+			taken[explicit] = true
+			project.Name = explicit
 		}
-		project.Name = strings.TrimSpace(project.Name)
 		if legacy := strings.TrimSpace(project.DashboardURL); legacy != "" {
 			log.Printf("[fleet] project %q: dashboard_url %q in %s is deprecated and ignored — the project is reachable at the unified MC route %s (#516)",
 				project.Name, legacy, path, fleetProjectScopedPath(project.Name))
 		}
 		project.DashboardURL = fleetProjectScopedPath(project.Name)
-		key := strings.ToLower(project.Name)
-		if _, exists := seen[key]; exists {
-			return nil, fmt.Errorf("duplicate fleet project name %q", project.Name)
-		}
-		seen[key] = struct{}{}
 		projects = append(projects, project)
 	}
 	return projects, nil
@@ -301,17 +311,46 @@ func (s *FleetServer) HandlerForTest() http.Handler { return s.buildHandler() }
 
 // Start begins serving the fleet dashboard. It blocks until shutdown.
 func (s *FleetServer) Start(ctx context.Context) error {
-	if s.port == 0 {
-		return nil
+	ln, err := s.Listen()
+	if err != nil {
+		return err
 	}
+	return s.Serve(ctx, ln)
+}
 
+// Listen binds the fleet's TCP port without serving. Splitting bind from serve
+// lets the daemon detect an "address already in use" failure BEFORE it starts
+// any project flow, so a bind error aborts startup immediately instead of
+// blocking on stopAll's flow drain — which cannot interrupt a flow's in-flight,
+// non-cancellable first RunOnce, hanging the startup-error return (#764 P2).
+//
+// Returns (nil, nil) when port == 0 (no web endpoint requested); Serve then
+// no-ops on the nil listener. A non-nil error is a real bind failure.
+func (s *FleetServer) Listen() (net.Listener, error) {
+	if s.port == 0 {
+		return nil, nil
+	}
 	host := strings.TrimSpace(s.host)
 	if host == "" {
 		host = "127.0.0.1"
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(s.port))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("fleet server bind %s: %w", addr, err)
+	}
+	return ln, nil
+}
+
+// Serve serves the fleet HTTP API on ln until ctx is cancelled, then gracefully
+// shuts down. A nil ln (port 0) blocks on ctx and returns nil, matching the
+// historical no-web behavior. Serve takes ownership of ln.
+func (s *FleetServer) Serve(ctx context.Context, ln net.Listener) error {
+	if ln == nil {
+		<-ctx.Done()
+		return nil
+	}
 	s.srv = &http.Server{
-		Addr:         addr,
 		Handler:      s.buildHandler(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -328,8 +367,8 @@ func (s *FleetServer) Start(ctx context.Context) error {
 	// on ctx.Done(). No-op for projects without a configured board client.
 	s.startBoardRefreshers(ctx)
 
-	log.Printf("[fleet] listening on %s", addr)
-	if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	log.Printf("[fleet] listening on %s", ln.Addr())
+	if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("fleet server: %w", err)
 	}
 	return nil

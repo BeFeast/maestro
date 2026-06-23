@@ -51,12 +51,20 @@ func (lt *loopTracker) loop(ctx context.Context, cfg *config.Config, opts Option
 	atomic.AddInt64(&lt.stopped, 1)
 }
 
+// superviseLoop is the supervise-shaped stub (the supervise loop takes the
+// flow's unique name as its first arg, #764). It records the same counters.
+func (lt *loopTracker) superviseLoop(ctx context.Context, name string, cfg *config.Config, opts Options) {
+	atomic.AddInt64(&lt.started, 1)
+	<-ctx.Done()
+	atomic.AddInt64(&lt.stopped, 1)
+}
+
 // newTestDaemon builds a daemon with stub loops (no GitHub) over the given
 // configs. The watchdog is also stubbed to a no-op so flows started through
 // this helper stay isolated from the real supervisor.Watchdog goroutine — a
 // future change to its shutdown path must not silently break these lifecycle
 // tests. Tests that assert watchdog behaviour install their own stub.
-func newTestDaemon(loader ConfigLoader, run, supervise func(context.Context, *config.Config, Options)) *Daemon {
+func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options), supervise func(context.Context, string, *config.Config, Options)) *Daemon {
 	d := New(loader, Options{Host: "127.0.0.1", Port: 0})
 	if run != nil {
 		d.runLoop = run
@@ -75,7 +83,7 @@ func TestRunStartsFlowPerProjectAndAggregatesFleet(t *testing.T) {
 		testConfig(t, "owner/gamma"),
 	}
 	var runTracker, supTracker loopTracker
-	d := newTestDaemon(fakeLoader{cfgs: cfgs}, runTracker.loop, supTracker.loop)
+	d := newTestDaemon(fakeLoader{cfgs: cfgs}, runTracker.loop, supTracker.superviseLoop)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -139,7 +147,7 @@ func TestRunSkipsDuplicateFlowIdentity(t *testing.T) {
 	dup.StateDir = shared.StateDir
 	cfgs := []*config.Config{shared, dup}
 	var run, sup loopTracker
-	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.loop)
+	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.superviseLoop)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -171,7 +179,7 @@ func TestRunSameBasenameDistinctReposBothStart(t *testing.T) {
 		testConfig(t, "org-b/api"),
 	}
 	var run, sup loopTracker
-	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.loop)
+	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.superviseLoop)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -205,7 +213,7 @@ func TestRunSameBasenameDistinctReposGetUniqueFleetNames(t *testing.T) {
 		testConfig(t, "org-b/api"),
 	}
 	var run, sup loopTracker
-	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.loop)
+	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.superviseLoop)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -262,7 +270,7 @@ func TestRunEmptyStoreReturnsError(t *testing.T) {
 func TestStartStopFlowDrains(t *testing.T) {
 	cfg := testConfig(t, "owner/solo")
 	var run, sup loopTracker
-	d := newTestDaemon(fakeLoader{cfgs: []*config.Config{cfg}}, run.loop, sup.loop)
+	d := newTestDaemon(fakeLoader{cfgs: []*config.Config{cfg}}, run.loop, sup.superviseLoop)
 
 	proj := server.NewFleetProjectWithGitHub(cfg)
 	flow := d.startFlow(context.Background(), proj)
@@ -293,13 +301,14 @@ func TestStartStopFlowDrains(t *testing.T) {
 	d.stopFlow("does-not-exist")
 }
 
-func TestFlowPanicContained(t *testing.T) {
-	// A panic in one loop must be contained: the daemon (and the other loop)
-	// survive. This is the "one bad project doesn't kill the daemon" guarantee
-	// at the goroutine level (#756).
+func TestFlowPanicCancelsFlow(t *testing.T) {
+	// A panic in one loop must (a) be contained — the daemon survives — and
+	// (b) cancel the whole flow so the OTHER goroutines drain, rather than
+	// leaving the flow half-alive and still registered (#764). flow.done closes
+	// on its own; no one calls stopFlow.
 	cfg := testConfig(t, "owner/panicky")
 	var supStarted, supStopped int64
-	supervise := func(ctx context.Context, c *config.Config, o Options) {
+	supervise := func(ctx context.Context, name string, c *config.Config, o Options) {
 		atomic.AddInt64(&supStarted, 1)
 		<-ctx.Done()
 		atomic.AddInt64(&supStopped, 1)
@@ -312,24 +321,40 @@ func TestFlowPanicContained(t *testing.T) {
 	proj := server.NewFleetProjectWithGitHub(cfg)
 	flow := d.startFlow(context.Background(), proj)
 
-	// The supervise loop keeps running despite the run loop's panic.
-	waitFor(t, func() bool { return atomic.LoadInt64(&supStarted) == 1 })
-
-	d.stopFlow(flow.key)
+	// The panic cancels the flow, so the supervise loop drains and flow.done
+	// closes without anyone calling stopFlow.
 	select {
 	case <-flow.done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("flow did not drain after a contained panic")
+		t.Fatal("panic did not cancel the flow; flow.done never closed")
+	}
+	if atomic.LoadInt64(&supStarted) != 1 {
+		t.Fatalf("supervise loop never started: supStarted=%d", supStarted)
 	}
 	if atomic.LoadInt64(&supStopped) != 1 {
-		t.Fatal("supervise loop did not drain after the run loop panicked")
+		t.Fatalf("supervise loop did not drain after the run loop panicked: supStopped=%d", supStopped)
 	}
+
+	// The cancelled flow is deregistered, not left lingering in the registry.
+	waitFor(t, func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		_, ok := d.flows[flow.key]
+		return !ok
+	})
 }
 
-// #764 P1: a fleet bind failure (port already held) must surface immediately —
-// Run returns the error on its own, without waiting for ctx cancellation /
-// SIGTERM. Otherwise the daemon runs every flow with no web endpoint until the
-// operator kills it.
+// #764 P1/P2: a fleet bind failure (port already held) must surface immediately
+// — Run returns the error on its own, without waiting for ctx cancellation /
+// SIGTERM. The fix binds the port BEFORE starting any flow, so a bind failure
+// also means NO flow ever started: this both proves the immediate return and
+// guards against a regression where the error path drains a flow whose
+// non-cancellable first RunOnce hangs startup.
+//
+// The run/supervise stubs here intentionally BLOCK forever (they ignore ctx) so
+// that, if Run ever reverted to starting flows before binding and then draining
+// them on the bind error, this test would hang on the 3s deadline instead of
+// passing — i.e. the stub models the real non-ctx-cancellable RunOnce.
 func TestRunSurfacesFleetBindErrorImmediately(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -339,10 +364,14 @@ func TestRunSurfacesFleetBindErrorImmediately(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 
 	cfg := testConfig(t, "owner/bind")
-	var run, sup loopTracker
+	var started int64
+	blockingLoop := func(ctx context.Context, c *config.Config, o Options) {
+		atomic.AddInt64(&started, 1)
+		select {} // never returns — models a flow stuck in a non-cancellable cycle
+	}
 	d := New(fakeLoader{cfgs: []*config.Config{cfg}}, Options{Host: "127.0.0.1", Port: port})
-	d.runLoop = run.loop
-	d.superviseLoop = sup.loop
+	d.runLoop = blockingLoop
+	d.superviseLoop = func(ctx context.Context, name string, c *config.Config, o Options) { blockingLoop(ctx, c, o) }
 	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {}
 
 	// ctx is intentionally never cancelled within the deadline.
@@ -358,7 +387,13 @@ func TestRunSurfacesFleetBindErrorImmediately(t *testing.T) {
 			t.Fatal("Run returned nil; want the fleet bind error surfaced immediately")
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Run did not return the bind error without ctx cancellation (#764 P1)")
+		t.Fatal("Run did not return the bind error without ctx cancellation (#764 P1/P2: bind must happen before flows start)")
+	}
+
+	// Bind happened before any flow started, so no goroutine is stuck in a
+	// blocking loop. (If flows had started first, Run would have hung above.)
+	if got := atomic.LoadInt64(&started); got != 0 {
+		t.Fatalf("flows started = %d, want 0 (bind must precede flow start)", got)
 	}
 }
 
@@ -389,7 +424,7 @@ func TestStopFlowDrainsWatchdog(t *testing.T) {
 	var run, sup loopTracker
 	d := New(fakeLoader{cfgs: []*config.Config{cfg}}, Options{Port: 0, SuperviseInterval: time.Minute})
 	d.runLoop = run.loop
-	d.superviseLoop = sup.loop
+	d.superviseLoop = sup.superviseLoop
 
 	var wdStarted, wdStopped int64
 	var gotName, gotStateDir string
@@ -429,19 +464,25 @@ func TestLogSupervisorDecisionEmitsStructuredLine(t *testing.T) {
 	log.SetOutput(&buf)
 	defer log.SetOutput(old)
 
-	cfg := &config.Config{SessionPrefix: "acme"}
-	logSupervisorDecision(cfg, state.SupervisorDecision{
+	logSupervisorDecision("org-b-api", state.SupervisorDecision{
 		RecommendedAction: "merge_pr",
 		Status:            "ready",
 		Risk:              "low",
 		Confidence:        0.92,
+		ErrorClass:        "none",
 		RequiresApproval:  true,
 		ApprovalID:        "appr-1",
+		Target:            &state.SupervisorTarget{Issue: 7, PR: 12},
+		Reasons:           []string{"ci green", "no P0"},
 		Summary:           "PR #12 is green",
 	})
 
 	out := buf.String()
-	for _, want := range []string{"acme", "supervise decision", "action=merge_pr", "requires_approval=true", "approval=appr-1", "PR #12 is green"} {
+	for _, want := range []string{
+		"org-b-api", "supervise decision", "action=merge_pr",
+		"error_class=none", "requires_approval=true", "approval=appr-1",
+		"target=issue#7/pr#12", "reasons=2", "PR #12 is green",
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("decision log %q missing %q", out, want)
 		}

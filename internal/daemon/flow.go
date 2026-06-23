@@ -43,17 +43,30 @@ func (d *Daemon) startFlow(parent context.Context, proj server.FleetProject) *pr
 		done:   make(chan struct{}),
 	}
 
+	// Register BEFORE launching any goroutine (including the reaper below), so
+	// the reaper's deregister can never run ahead of the insert. A fast-failing
+	// flow — a loop that panics or returns on its first cycle — could otherwise
+	// have its reaper acquire d.mu, find no entry (insert hadn't happened yet),
+	// skip the delete, and then the insert would re-add the now-dead flow
+	// permanently: exactly the lingering-flow leak this path exists to prevent.
+	d.mu.Lock()
+	d.flows[flow.key] = flow
+	d.mu.Unlock()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		defer recoverFlow(flow.name, "orchestrator")
+		defer recoverFlow(flow, "orchestrator")
 		d.runLoop(fctx, cfg, d.opts)
 	}()
 	go func() {
 		defer wg.Done()
-		defer recoverFlow(flow.name, "supervise")
-		d.superviseLoop(fctx, cfg, d.opts)
+		defer recoverFlow(flow, "supervise")
+		// flow.name is the unique fleet display name; the supervise loop keys
+		// its decision/cycle logs on it so two same-basename repos are
+		// distinguishable in the journal, matching the watchdog (#764).
+		d.superviseLoop(fctx, flow.name, cfg, d.opts)
 	}()
 	// Phase 1.2 (#499) liveness watchdog, one per flow — tracked in the flow
 	// WaitGroup (#764 P2). The watchdog itself no-ops on a non-positive
@@ -65,18 +78,24 @@ func (d *Daemon) startFlow(parent context.Context, proj server.FleetProject) *pr
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer recoverFlow(flow.name, "watchdog")
+			defer recoverFlow(flow, "watchdog")
 			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval)
 		}()
 	}
 	go func() {
 		wg.Wait()
 		close(flow.done)
+		// Deregister once every goroutine has exited, so a flow that stopped on
+		// its own — e.g. a panic that recoverFlow cancelled — does not linger in
+		// the registry reporting as live. Guarded against a restart that reused
+		// the same key (stopFlow may have already removed and replaced it).
+		d.mu.Lock()
+		if d.flows[flow.key] == flow {
+			delete(d.flows, flow.key)
+		}
+		d.mu.Unlock()
 	}()
 
-	d.mu.Lock()
-	d.flows[flow.key] = flow
-	d.mu.Unlock()
 	return flow
 }
 
@@ -98,24 +117,40 @@ func (d *Daemon) stopFlow(key string) {
 	log.Printf("[daemon] stopped flow %q", flow.name)
 }
 
-// stopAll drains every running flow. Called on daemon shutdown.
+// stopAll drains every running flow. Called on daemon shutdown. It cancels
+// every flow up front and only then waits, so the per-flow drains overlap and
+// total shutdown latency is the slowest single flow — not the sum across flows.
+// A serial cancel-then-wait would stack the drains, and each flow's first
+// RunOnce is not ctx-cancellable mid-cycle, so the sum could be many minutes
+// (#764).
 func (d *Daemon) stopAll() {
 	d.mu.Lock()
-	keys := make([]string, 0, len(d.flows))
-	for key := range d.flows {
-		keys = append(keys, key)
+	flows := make([]*projectFlow, 0, len(d.flows))
+	for _, flow := range d.flows {
+		flows = append(flows, flow)
 	}
+	d.flows = make(map[string]*projectFlow)
 	d.mu.Unlock()
-	for _, key := range keys {
-		d.stopFlow(key)
+
+	for _, flow := range flows {
+		flow.cancel()
+	}
+	for _, flow := range flows {
+		<-flow.done
+		log.Printf("[daemon] stopped flow %q", flow.name)
 	}
 }
 
 // recoverFlow swallows a panic in a flow goroutine so it stays contained to
-// that project. A panicking goroutine would otherwise crash the whole daemon.
-func recoverFlow(name, loop string) {
+// that project (a panicking goroutine would otherwise crash the whole daemon),
+// and cancels the flow so its OTHER goroutines drain too. Without the cancel a
+// panic in one loop would leave the flow half-alive — the surviving loops still
+// running and the flow still registered as healthy — while the log claimed it
+// stopped (#764).
+func recoverFlow(flow *projectFlow, loop string) {
 	if r := recover(); r != nil {
-		log.Printf("[daemon] flow %q %s loop panicked (contained, flow stopped): %v", name, loop, r)
+		log.Printf("[daemon] flow %q %s loop panicked (contained, cancelling flow): %v", flow.name, loop, r)
+		flow.cancel()
 	}
 }
 
@@ -138,15 +173,19 @@ func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options) {
 		log.Printf("[%s] warn: load prompt: %v", cfg.SessionPrefix, err)
 	}
 
-	refreshCh := make(chan struct{}, 1)
-
 	runInterval := opts.RunInterval
 	if cfg.PollIntervalSeconds > 0 {
 		runInterval = time.Duration(cfg.PollIntervalSeconds) * time.Second
 	}
 
+	// The daemon has no API-triggered refresh channel: the per-project HTTP
+	// server that drove one in `maestro run` is replaced by the shared
+	// FleetServer, which does not signal individual flows. Pass nil rather than
+	// a buffered channel nothing ever sends on, so orch.Run's `case <-refreshCh`
+	// arm is plainly inert instead of looking like a wired-but-dead feature
+	// (#764). Store-driven reload is Phase 2 (#757).
 	log.Printf("[%s] starting orchestrator — repo=%s interval=%s", cfg.SessionPrefix, cfg.Repo, runInterval)
-	if err := orch.Run(ctx, runInterval, false, refreshCh); err != nil {
+	if err := orch.Run(ctx, runInterval, false, nil); err != nil {
 		log.Printf("[%s] orchestrator exited: %v", cfg.SessionPrefix, err)
 	}
 }
