@@ -1,16 +1,21 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/server"
+	"github.com/befeast/maestro/internal/state"
 )
 
 // fakeLoader is an in-memory ConfigLoader so the daemon lifecycle can be
@@ -121,13 +126,14 @@ func TestRunStartsFlowPerProjectAndAggregatesFleet(t *testing.T) {
 	}
 }
 
-func TestRunSkipsDuplicateFleetName(t *testing.T) {
-	// Two configs deriving the same fleet name (same repo) — the second must
-	// be skipped, not silently overwrite the first.
-	cfgs := []*config.Config{
-		testConfig(t, "owner/dup"),
-		testConfig(t, "owner/dup"),
-	}
+func TestRunSkipsDuplicateFlowIdentity(t *testing.T) {
+	// Two configs that resolve to the same flow identity (same StateDir) are a
+	// true duplicate — the second must be skipped, not silently overwrite the
+	// first in the flows registry.
+	shared := testConfig(t, "owner/dup")
+	dup := testConfig(t, "owner/dup")
+	dup.StateDir = shared.StateDir
+	cfgs := []*config.Config{shared, dup}
 	var run, sup loopTracker
 	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.loop)
 
@@ -142,10 +148,43 @@ func TestRunSkipsDuplicateFleetName(t *testing.T) {
 	flows := len(d.flows)
 	d.mu.Unlock()
 	if flows != 1 {
-		t.Fatalf("flows = %d, want 1 (duplicate name skipped)", flows)
+		t.Fatalf("flows = %d, want 1 (duplicate flow identity skipped)", flows)
 	}
 	if got := atomic.LoadInt64(&run.started); got != 1 {
 		t.Fatalf("run loops started = %d, want 1", got)
+	}
+
+	cancel()
+	<-done
+}
+
+// #764 P2: two distinct repos that share a basename ("api") must BOTH get a
+// flow. The old dedup keyed on the repo-basename fleet name, so org-b/api was
+// silently skipped — its orchestrator and supervisor never started.
+func TestRunSameBasenameDistinctReposBothStart(t *testing.T) {
+	cfgs := []*config.Config{
+		testConfig(t, "org-a/api"),
+		testConfig(t, "org-b/api"),
+	}
+	var run, sup loopTracker
+	d := newTestDaemon(fakeLoader{cfgs: cfgs}, run.loop, sup.loop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitForFleet(t, d)
+	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 2 })
+
+	d.mu.Lock()
+	flows := len(d.flows)
+	d.mu.Unlock()
+	if flows != 2 {
+		t.Fatalf("flows = %d, want 2 (same-basename distinct repos both start)", flows)
+	}
+	if got := atomic.LoadInt64(&sup.started); got != 2 {
+		t.Fatalf("supervise loops started = %d, want 2", got)
 	}
 
 	cancel()
@@ -164,13 +203,13 @@ func TestStartStopFlowDrains(t *testing.T) {
 	var run, sup loopTracker
 	d := newTestDaemon(fakeLoader{cfgs: []*config.Config{cfg}}, run.loop, sup.loop)
 
-	proj := newFleetProject(cfg)
+	proj := server.NewFleetProjectWithGitHub(cfg)
 	flow := d.startFlow(context.Background(), proj)
 
 	// Both loops should be running.
 	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 1 && atomic.LoadInt64(&sup.started) == 1 })
 
-	d.stopFlow(flow.name)
+	d.stopFlow(flow.key)
 
 	select {
 	case <-flow.done:
@@ -183,7 +222,7 @@ func TestStartStopFlowDrains(t *testing.T) {
 
 	// Flow is deregistered.
 	d.mu.Lock()
-	_, ok := d.flows[flow.name]
+	_, ok := d.flows[flow.key]
 	d.mu.Unlock()
 	if ok {
 		t.Fatal("flow still registered after stopFlow")
@@ -209,13 +248,13 @@ func TestFlowPanicContained(t *testing.T) {
 	}
 	d := newTestDaemon(fakeLoader{cfgs: []*config.Config{cfg}}, run, supervise)
 
-	proj := newFleetProject(cfg)
+	proj := server.NewFleetProjectWithGitHub(cfg)
 	flow := d.startFlow(context.Background(), proj)
 
 	// The supervise loop keeps running despite the run loop's panic.
 	waitFor(t, func() bool { return atomic.LoadInt64(&supStarted) == 1 })
 
-	d.stopFlow(flow.name)
+	d.stopFlow(flow.key)
 	select {
 	case <-flow.done:
 	case <-time.After(2 * time.Second):
@@ -223,6 +262,127 @@ func TestFlowPanicContained(t *testing.T) {
 	}
 	if atomic.LoadInt64(&supStopped) != 1 {
 		t.Fatal("supervise loop did not drain after the run loop panicked")
+	}
+}
+
+// #764 P1: a fleet bind failure (port already held) must surface immediately —
+// Run returns the error on its own, without waiting for ctx cancellation /
+// SIGTERM. Otherwise the daemon runs every flow with no web endpoint until the
+// operator kills it.
+func TestRunSurfacesFleetBindErrorImmediately(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	cfg := testConfig(t, "owner/bind")
+	var run, sup loopTracker
+	d := New(fakeLoader{cfgs: []*config.Config{cfg}}, Options{Host: "127.0.0.1", Port: port})
+	d.runLoop = run.loop
+	d.superviseLoop = sup.loop
+
+	// ctx is intentionally never cancelled within the deadline.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Run returned nil; want the fleet bind error surfaced immediately")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return the bind error without ctx cancellation (#764 P1)")
+	}
+}
+
+// #764 P3: a non-positive interval must be clamped to the safe default with a
+// warn, never silently honored (a 0 run-interval panics time.NewTicker; a 0
+// supervise-interval kills the loop + watchdog while the flow reads healthy).
+func TestNewClampsNonPositiveIntervals(t *testing.T) {
+	d := New(fakeLoader{}, Options{RunInterval: 0, SuperviseInterval: -1})
+	if d.opts.RunInterval != DefaultRunInterval {
+		t.Fatalf("RunInterval = %s, want clamp to %s", d.opts.RunInterval, DefaultRunInterval)
+	}
+	if d.opts.SuperviseInterval != DefaultSuperviseInterval {
+		t.Fatalf("SuperviseInterval = %s, want clamp to %s", d.opts.SuperviseInterval, DefaultSuperviseInterval)
+	}
+
+	// A positive operator value is honored verbatim.
+	d2 := New(fakeLoader{}, Options{RunInterval: 3 * time.Minute, SuperviseInterval: 90 * time.Second})
+	if d2.opts.RunInterval != 3*time.Minute || d2.opts.SuperviseInterval != 90*time.Second {
+		t.Fatalf("positive intervals not honored: run=%s supervise=%s", d2.opts.RunInterval, d2.opts.SuperviseInterval)
+	}
+}
+
+// #764 P2: the watchdog goroutine must join the flow WaitGroup so stopFlow does
+// not return until it has exited. A stub watchdog records start/stop; after
+// stopFlow returns, stop must already be observed.
+func TestStopFlowDrainsWatchdog(t *testing.T) {
+	cfg := testConfig(t, "owner/wd")
+	var run, sup loopTracker
+	d := New(fakeLoader{cfgs: []*config.Config{cfg}}, Options{Port: 0, SuperviseInterval: time.Minute})
+	d.runLoop = run.loop
+	d.superviseLoop = sup.loop
+
+	var wdStarted, wdStopped int64
+	var gotName, gotStateDir string
+	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {
+		gotName, gotStateDir = name, stateDir
+		atomic.AddInt64(&wdStarted, 1)
+		<-ctx.Done()
+		atomic.AddInt64(&wdStopped, 1)
+	}
+
+	proj := server.NewFleetProjectWithGitHub(cfg)
+	flow := d.startFlow(context.Background(), proj)
+	waitFor(t, func() bool { return atomic.LoadInt64(&wdStarted) == 1 })
+
+	d.stopFlow(flow.key)
+
+	// stopFlow waits on flow.done, which only closes once the watchdog
+	// goroutine has also exited — so the stop must already be visible here,
+	// with no further wait.
+	if got := atomic.LoadInt64(&wdStopped); got != 1 {
+		t.Fatalf("watchdog not drained by stopFlow: wdStopped=%d, want 1", got)
+	}
+	// The watchdog is told which project it watches (#764 P2 log identity).
+	if gotName != flow.name {
+		t.Fatalf("watchdog name = %q, want %q", gotName, flow.name)
+	}
+	if gotStateDir != cfg.StateDir {
+		t.Fatalf("watchdog stateDir = %q, want %q", gotStateDir, cfg.StateDir)
+	}
+}
+
+// #764: the daemon supervise loop logs each cycle's SupervisorDecision so the
+// journal keeps the structural "why" trail the CLI printed.
+func TestLogSupervisorDecisionEmitsStructuredLine(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	cfg := &config.Config{SessionPrefix: "acme"}
+	logSupervisorDecision(cfg, state.SupervisorDecision{
+		RecommendedAction: "merge_pr",
+		Status:            "ready",
+		Risk:              "low",
+		Confidence:        0.92,
+		RequiresApproval:  true,
+		ApprovalID:        "appr-1",
+		Summary:           "PR #12 is green",
+	})
+
+	out := buf.String()
+	for _, want := range []string{"acme", "supervise decision", "action=merge_pr", "requires_approval=true", "approval=appr-1", "PR #12 is green"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("decision log %q missing %q", out, want)
+		}
 	}
 }
 
