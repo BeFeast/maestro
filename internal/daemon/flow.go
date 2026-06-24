@@ -292,7 +292,12 @@ func identityChanged(a, b *config.Config) bool {
 // deliberately does NOT watch the import-time YAML — a file the store supersedes
 // — which would let the run loop drift from the supervise loop. A nil reloadCh
 // (store-watch disabled) leaves the orchestrator's reload select arm inert.
-func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config) {
+//
+// It is a method so the orchestrator's self-deploy launcher can be wired to the
+// daemon's centralized, cross-flow-debounced RequestSelfDeploy (#758): each
+// flow signals the daemon instead of firing its own selfdeploy.Trigger, so a
+// burst of merges across flows launches exactly ONE deploy of ONE unit.
+func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config) {
 	// Hot-reload (reloadCh, #757) makes the orchestrator's reloadConfig mutate
 	// its config in place (field replacement). The supervise loop and the
 	// FleetProject HTTP snapshot read the flow's config through a shared holder
@@ -311,6 +316,18 @@ func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options, relo
 	orchCfg := *cfg
 	orch := orchestrator.New(&orchCfg)
 	orch.SetBinaryVersion(opts.Version)
+	// Route post-merge self-deploy through the daemon's centralized,
+	// cross-flow-debounced launcher (#758) instead of this flow firing its own
+	// selfdeploy.Trigger. The closure passes the orchestrator's OWN config
+	// pointer (&orchCfg, == o.cfg) — the live, reload-mutated config the prior
+	// per-flow selfdeploy.Trigger(o.cfg, …) used, supplying the build inputs
+	// (local_path/self_deploy/state_dir). It runs in the orchestrator goroutine
+	// (synchronous in triggerSelfDeploy), the same goroutine that mutates orchCfg
+	// on reload, so reading it here is race-free. The daemon overlays the
+	// single-endpoint health probe.
+	orch.SetSelfDeployStartFn(func(prNumber int) error {
+		return d.RequestSelfDeploy(&orchCfg, prNumber)
+	})
 	if err := orch.LoadPromptBase(opts.PromptPath); err != nil {
 		log.Printf("[%s] warn: load prompt: %v", cfg.SessionPrefix, err)
 	}

@@ -122,6 +122,28 @@ guards make that configuration converge. Re-enable `self_deploy` on the dogfood
 orchestrator only after validating a deploy → verify-pass → no-re-trigger cycle
 on an idle fleet.
 
+### Centralized trigger under the daemon (#758)
+
+Under `maestro daemon` (epic #754, the single-service redesign), the fleet is N
+project flows in one process restarting one shared `maestro.service` unit — not
+N units. If each flow fired its own `selfdeploy.Trigger` on merge, a wave of
+merges across projects would restart that one unit N times: a thundering herd.
+
+So the daemon **centralizes the trigger**. Each flow's orchestrator signals
+`Daemon.RequestSelfDeploy(pr)` instead of deploying directly, and the daemon
+debounces every flow against a **single shared marker** (in-memory plus an
+on-disk `self-deploy-last-trigger.json` next to the config store, so it survives
+the daemon being restarted by its own deploy). The first merge in a wave
+launches exactly **one** deploy of **one** unit; the rest are debounced. The
+post-restart health probe is routed to the single fleet endpoint
+(`http://<host>:<port>/api/v1/fleet`, default `:8786`), whose snapshot carries
+the `version` field the script SHA-matches — so result and verify both go
+through one endpoint rather than a per-project server the daemon no longer runs.
+
+The default `units: ["maestro.service"]` (`config.EffectiveUnits`) keeps the
+restart to that one unit. The legacy per-project `maestro run`/`serve` paths are
+unchanged: there each orchestrator still debounces on its own state dir.
+
 ### Scope: user vs system units (#716)
 
 `scope` selects which systemd manager owns the units:
