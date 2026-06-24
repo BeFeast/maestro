@@ -45,7 +45,7 @@ type loopTracker struct {
 	stopped int64
 }
 
-func (lt *loopTracker) loop(ctx context.Context, cfg *config.Config, opts Options) {
+func (lt *loopTracker) loop(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config) {
 	atomic.AddInt64(&lt.started, 1)
 	<-ctx.Done()
 	atomic.AddInt64(&lt.stopped, 1)
@@ -64,7 +64,7 @@ func (lt *loopTracker) superviseLoop(ctx context.Context, name string, cfg *conf
 // this helper stay isolated from the real supervisor.Watchdog goroutine — a
 // future change to its shutdown path must not silently break these lifecycle
 // tests. Tests that assert watchdog behaviour install their own stub.
-func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options), supervise func(context.Context, string, *config.Config, Options)) *Daemon {
+func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, *config.Config, Options)) *Daemon {
 	d := New(loader, Options{Host: "127.0.0.1", Port: 0})
 	if run != nil {
 		d.runLoop = run
@@ -273,7 +273,7 @@ func TestStartStopFlowDrains(t *testing.T) {
 	d := newTestDaemon(fakeLoader{cfgs: []*config.Config{cfg}}, run.loop, sup.superviseLoop)
 
 	proj := server.NewFleetProjectWithGitHub(cfg)
-	flow := d.startFlow(context.Background(), proj)
+	flow := d.startFlow(context.Background(), "", proj)
 
 	// Both loops should be running.
 	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 1 && atomic.LoadInt64(&sup.started) == 1 })
@@ -313,13 +313,13 @@ func TestFlowPanicCancelsFlow(t *testing.T) {
 		<-ctx.Done()
 		atomic.AddInt64(&supStopped, 1)
 	}
-	run := func(ctx context.Context, c *config.Config, o Options) {
+	run := func(ctx context.Context, c *config.Config, o Options, reloadCh <-chan *config.Config) {
 		panic("boom")
 	}
 	d := newTestDaemon(fakeLoader{cfgs: []*config.Config{cfg}}, run, supervise)
 
 	proj := server.NewFleetProjectWithGitHub(cfg)
-	flow := d.startFlow(context.Background(), proj)
+	flow := d.startFlow(context.Background(), "", proj)
 
 	// The panic cancels the flow, so the supervise loop drains and flow.done
 	// closes without anyone calling stopFlow.
@@ -365,13 +365,13 @@ func TestRunSurfacesFleetBindErrorImmediately(t *testing.T) {
 
 	cfg := testConfig(t, "owner/bind")
 	var started int64
-	blockingLoop := func(ctx context.Context, c *config.Config, o Options) {
+	blockingLoop := func(ctx context.Context, c *config.Config, o Options, reloadCh <-chan *config.Config) {
 		atomic.AddInt64(&started, 1)
 		select {} // never returns — models a flow stuck in a non-cancellable cycle
 	}
 	d := New(fakeLoader{cfgs: []*config.Config{cfg}}, Options{Host: "127.0.0.1", Port: port})
 	d.runLoop = blockingLoop
-	d.superviseLoop = func(ctx context.Context, name string, c *config.Config, o Options) { blockingLoop(ctx, c, o) }
+	d.superviseLoop = func(ctx context.Context, name string, c *config.Config, o Options) { blockingLoop(ctx, c, o, nil) }
 	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {}
 
 	// ctx is intentionally never cancelled within the deadline.
@@ -436,7 +436,7 @@ func TestStopFlowDrainsWatchdog(t *testing.T) {
 	}
 
 	proj := server.NewFleetProjectWithGitHub(cfg)
-	flow := d.startFlow(context.Background(), proj)
+	flow := d.startFlow(context.Background(), "", proj)
 	waitFor(t, func() bool { return atomic.LoadInt64(&wdStarted) == 1 })
 
 	d.stopFlow(flow.key)

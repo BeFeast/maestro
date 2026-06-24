@@ -26,6 +26,8 @@ func daemonCmd(args []string) {
 	port := fs.Int("port", 8786, "Port to bind the fleet web server")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	readOnly := fs.Bool("read-only", false, "Disable mutating fleet HTTP endpoints")
+	watchStore := fs.Bool("watch-store", false, "Hot add/remove/reload projects from the config store without a restart (#757)")
+	watchStoreInterval := fs.Duration("watch-store-interval", daemon.DefaultWatchStoreInterval, "Config-store diff/reload poll interval (with --watch-store)")
 	fs.Parse(args)
 
 	ctx := signalContext()
@@ -37,13 +39,15 @@ func daemonCmd(args []string) {
 	defer store.Close()
 
 	d := daemon.New(store, daemon.Options{
-		Host:              *host,
-		Port:              *port,
-		RunInterval:       *runInterval,
-		SuperviseInterval: *superviseInterval,
-		PromptPath:        *promptPath,
-		Version:           resolveVersion(),
-		ReadOnly:          *readOnly,
+		Host:               *host,
+		Port:               *port,
+		RunInterval:        *runInterval,
+		SuperviseInterval:  *superviseInterval,
+		PromptPath:         *promptPath,
+		Version:            resolveVersion(),
+		ReadOnly:           *readOnly,
+		WatchStore:         *watchStore,
+		WatchStoreInterval: *watchStoreInterval,
 	})
 
 	log.Printf("starting maestro daemon — store=%s addr=%s:%d", *storePath, *host, *port)

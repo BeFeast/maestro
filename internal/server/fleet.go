@@ -245,11 +245,16 @@ func defaultFleetProjectName(repo string) string {
 
 // FleetServer exposes a read-only dashboard/API across multiple Maestro configs.
 type FleetServer struct {
-	projects []FleetProject
-	host     string
-	port     int
-	readOnly bool
-	srv      *http.Server
+	// projectsMu guards projects so the daemon's diff-loop can add/remove
+	// flows at runtime (#757) while HTTP handlers read the slice concurrently.
+	// Reads go through projectsSnapshot; mutations through AddProject /
+	// RemoveProject.
+	projectsMu sync.RWMutex
+	projects   []FleetProject
+	host       string
+	port       int
+	readOnly   bool
+	srv        *http.Server
 	// auth gates every mutating fleet endpoint (#487, write-path premortem
 	// #4). When the resolved token is empty the checker is disabled and
 	// behaviour is unchanged; when non-empty, /api/v1/fleet/actions,
@@ -266,6 +271,55 @@ func NewFleet(projects []FleetProject, host string, port int, readOnly bool) *Fl
 		port:     port,
 		readOnly: readOnly,
 	}
+}
+
+// projectsSnapshot returns a copy of the project slice under the read lock so
+// callers can iterate without holding the lock across per-project work (state
+// loads, board calls). The backing array is fresh, so a concurrent AddProject /
+// RemoveProject can never mutate it mid-iteration.
+func (s *FleetServer) projectsSnapshot() []FleetProject {
+	s.projectsMu.RLock()
+	defer s.projectsMu.RUnlock()
+	out := make([]FleetProject, len(s.projects))
+	copy(out, s.projects)
+	return out
+}
+
+// AddProject registers a project at runtime (daemon hot-add, #757). A project
+// whose Name already exists is replaced in place rather than duplicated, so the
+// fleet's by-name addressing (findProject) stays unambiguous. Safe for
+// concurrent use with the HTTP read paths.
+func (s *FleetServer) AddProject(p FleetProject) {
+	if s == nil {
+		return
+	}
+	s.projectsMu.Lock()
+	defer s.projectsMu.Unlock()
+	for i := range s.projects {
+		if s.projects[i].Name == p.Name {
+			s.projects[i] = p
+			return
+		}
+	}
+	s.projects = append(s.projects, p)
+}
+
+// RemoveProject drops the project with the given fleet name (daemon hot-remove,
+// #757) and reports whether one was found. Safe for concurrent use with the
+// HTTP read paths.
+func (s *FleetServer) RemoveProject(name string) bool {
+	if s == nil {
+		return false
+	}
+	s.projectsMu.Lock()
+	defer s.projectsMu.Unlock()
+	for i := range s.projects {
+		if s.projects[i].Name == name {
+			s.projects = append(s.projects[:i], s.projects[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // SetAuth configures fleet-level auth from the operator's resolved
@@ -933,7 +987,7 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *FleetServer) findProject(name string) (FleetProject, bool) {
-	for _, project := range s.projects {
+	for _, project := range s.projectsSnapshot() {
 		if project.Name == name {
 			return project, true
 		}
@@ -1153,7 +1207,7 @@ func (s *FleetServer) fleetAuditLogStateDir(projectName string) (string, error) 
 		}
 		return "", nil
 	}
-	for _, project := range s.projects {
+	for _, project := range s.projectsSnapshot() {
 		if project.cfg != nil && strings.TrimSpace(project.cfg.StateDir) != "" {
 			return project.cfg.StateDir, nil
 		}
@@ -1196,17 +1250,18 @@ func newFleetAuditID() string {
 
 func (s *FleetServer) snapshot() fleetResponse {
 	now := time.Now().UTC()
+	projects := s.projectsSnapshot()
 	resp := fleetResponse{
 		ReadOnly:    s.readOnly,
 		Version:     binaryVersion,
 		RefreshedAt: formatFleetTime(now),
-		Projects:    make([]fleetProjectState, 0, len(s.projects)),
+		Projects:    make([]fleetProjectState, 0, len(projects)),
 		Workers:     make([]fleetWorkerState, 0),
 		Attention:   make([]fleetWorkerState, 0),
 		Approvals:   make([]fleetApprovalState, 0),
 	}
 	throughputBuckets := newFleetThroughputBuckets(now, 7)
-	for _, project := range s.projects {
+	for _, project := range projects {
 		item, workers := s.projectSnapshot(project, now)
 		resp.Projects = append(resp.Projects, item)
 		resp.Workers = append(resp.Workers, workers...)
