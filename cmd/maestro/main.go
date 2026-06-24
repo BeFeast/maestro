@@ -57,7 +57,7 @@ Commands:
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
-  config-store  Migrate YAML runtime config to SQLite or export it back
+  config-store  Manage the SQLite config store (migrate/export/add/rm/edit)
   history       Show recently completed sessions
   digest        Write the morning operator digest across all fleet projects
   cleanup       Remove worktrees for all completed/dead sessions
@@ -498,10 +498,21 @@ func loadConfigsWithStore(paths []string, storePath, project string) []*config.C
 
 func configStoreCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: maestro config-store migrate --db <path> --dir <maestro.d> | export --db <path> --dir <out>")
+		fmt.Fprintln(os.Stderr, "usage: maestro config-store <migrate|export|add|rm|edit> ...")
+		fmt.Fprintln(os.Stderr, "  migrate --db <path> --dir <maestro.d>   import a directory of YAML configs")
+		fmt.Fprintln(os.Stderr, "  export  --db <path> --dir <out>         export every project to YAML")
+		fmt.Fprintln(os.Stderr, "  add     --file <yaml> [--name <name>]   add/replace a single project")
+		fmt.Fprintln(os.Stderr, "  rm      <name>                          remove a project")
+		fmt.Fprintln(os.Stderr, "  edit    <name>                          export → $EDITOR → re-import")
 		os.Exit(1)
 	}
 	switch args[0] {
+	case "add":
+		configStoreAdd(args[1:])
+	case "rm":
+		configStoreRm(args[1:])
+	case "edit":
+		configStoreEdit(args[1:])
 	case "migrate":
 		fs := flag.NewFlagSet("config-store migrate", flag.ExitOnError)
 		dbPath := fs.String("db", filepath.Join(os.Getenv("HOME"), ".maestro", "config.db"), "SQLite config store path")
@@ -534,6 +545,166 @@ func configStoreCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "unknown config-store command: %s\n", args[0])
 		os.Exit(1)
 	}
+}
+
+// configStoreDBFlag registers the shared --db flag (default ~/.maestro/config.db)
+// used by the per-project CRUD subcommands so they target the same store the
+// daemon reads.
+func configStoreDBFlag(fs *flag.FlagSet) *string {
+	return fs.String("db", filepath.Join(os.Getenv("HOME"), ".maestro", "config.db"), "SQLite config store path")
+}
+
+// configStoreAdd implements `config-store add --file <yaml> [--name <name>]`:
+// it adds (or replaces) a single project row from a YAML file. The config is
+// validated by UpsertProject (config.Parse), so a malformed file is rejected
+// before it lands. With `maestro daemon --watch-store` running, the new project
+// appears in the fleet without a unit restart (#757).
+func configStoreAdd(args []string) {
+	fs := flag.NewFlagSet("config-store add", flag.ExitOnError)
+	dbPath := configStoreDBFlag(fs)
+	file := fs.String("file", "", "Path to the project YAML to add")
+	name := fs.String("name", "", "Project name (default: derived from repo, else filename)")
+	fs.Parse(args)
+
+	if strings.TrimSpace(*file) == "" {
+		log.Fatalf("config-store add: --file is required")
+	}
+	data, err := os.ReadFile(*file)
+	if err != nil {
+		log.Fatalf("config-store add: read %s: %v", *file, err)
+	}
+	projectName := strings.TrimSpace(*name)
+	if projectName == "" {
+		projectName, err = configstore.ProjectNameFor(*file, data)
+		if err != nil {
+			log.Fatalf("config-store add: %v", err)
+		}
+	}
+	store, err := configstore.Open(*dbPath)
+	if err != nil {
+		log.Fatalf("config-store add: open db: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertProject(context.Background(), projectName, string(data)); err != nil {
+		log.Fatalf("config-store add: %v", err)
+	}
+	fmt.Printf("Added project %q to config store %s.\n", projectName, *dbPath)
+}
+
+// configStoreRm implements `config-store rm <name>`: it removes a project row.
+// Deletion is idempotent (removing a missing project is not an error). With
+// `maestro daemon --watch-store` running, the flow is drained and the project
+// leaves the fleet after its workers finish (#757).
+func configStoreRm(args []string) {
+	fs := flag.NewFlagSet("config-store rm", flag.ExitOnError)
+	dbPath := configStoreDBFlag(fs)
+	fs.Parse(args)
+
+	rest := fs.Args()
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+		log.Fatalf("config-store rm: exactly one project name is required")
+	}
+	name := strings.TrimSpace(rest[0])
+	store, err := configstore.Open(*dbPath)
+	if err != nil {
+		log.Fatalf("config-store rm: open db: %v", err)
+	}
+	defer store.Close()
+	if err := store.DeleteProject(context.Background(), name); err != nil {
+		log.Fatalf("config-store rm: %v", err)
+	}
+	fmt.Printf("Removed project %q from config store %s.\n", name, *dbPath)
+}
+
+// configStoreEdit implements `config-store edit <name>`: export the project to a
+// temp file, open it in $EDITOR, and re-import the saved result with validation.
+// A parse failure on save aborts without touching the stored row, so a bad edit
+// can never break a running flow (#757).
+func configStoreEdit(args []string) {
+	fs := flag.NewFlagSet("config-store edit", flag.ExitOnError)
+	dbPath := configStoreDBFlag(fs)
+	fs.Parse(args)
+
+	rest := fs.Args()
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+		log.Fatalf("config-store edit: exactly one project name is required")
+	}
+	name := strings.TrimSpace(rest[0])
+	store, err := configstore.Open(*dbPath)
+	if err != nil {
+		log.Fatalf("config-store edit: open db: %v", err)
+	}
+	defer store.Close()
+	if err := editStoreProject(store, name); err != nil {
+		log.Fatalf("config-store edit: %v", err)
+	}
+}
+
+// editStoreProject round-trips a project through the operator's $EDITOR. It is
+// split out so the export/launch/re-import flow is testable apart from the CLI's
+// flag wiring.
+func editStoreProject(store *configstore.Store, name string) error {
+	ctx := context.Background()
+	original, err := store.ExportProject(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp("", "maestro-edit-"+name+"-*.yaml")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(original); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+
+	if err := launchEditor(tmpPath); err != nil {
+		return err
+	}
+
+	edited, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return fmt.Errorf("read edited file: %w", err)
+	}
+	if string(edited) == string(original) {
+		fmt.Printf("No changes to project %q; left unchanged.\n", name)
+		return nil
+	}
+	// UpsertProject validates via config.Parse, so an invalid edit is rejected
+	// here and the stored row is untouched.
+	if err := store.UpsertProject(ctx, name, string(edited)); err != nil {
+		return err
+	}
+	fmt.Printf("Updated project %q.\n", name)
+	return nil
+}
+
+// launchEditor opens path in the operator's editor ($EDITOR, then $VISUAL,
+// defaulting to vi), wired to the terminal. The editor command may include
+// arguments (e.g. `code --wait`), so it is split on whitespace.
+func launchEditor(path string) error {
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("VISUAL"))
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+	parts := strings.Fields(editor)
+	cmd := exec.Command(parts[0], append(parts[1:], path)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("editor %q exited with error: %w", editor, err)
+	}
+	return nil
 }
 
 func runCmd(args []string) {

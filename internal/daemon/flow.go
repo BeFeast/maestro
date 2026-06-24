@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/server"
 )
@@ -15,11 +16,12 @@ import (
 // supervisor loop, and (when supervising) a liveness watchdog sharing a child
 // context. Cancelling that context (stopFlow) tears every goroutine down.
 type projectFlow struct {
-	name   string
-	key    string // stable flow identity (StateDir/Repo); the flows-map key
-	cfg    *config.Config
-	cancel context.CancelFunc
-	done   chan struct{} // closed once every flow goroutine has exited
+	name      string
+	key       string // stable flow identity (StateDir/Repo); the flows-map key
+	storeName string // config-store project name; "" when not store-backed (#757)
+	cfg       *config.Config
+	cancel    context.CancelFunc
+	done      chan struct{} // closed once every flow goroutine has exited
 }
 
 // startFlow launches the orchestrator + supervisor loops (and the liveness
@@ -32,15 +34,27 @@ type projectFlow struct {
 // exited. An untracked watchdog could otherwise Load/Save StateDir after the
 // flow is considered stopped, racing a restarted flow for the same project
 // (#764 P2).
-func (d *Daemon) startFlow(parent context.Context, proj server.FleetProject) *projectFlow {
+func (d *Daemon) startFlow(parent context.Context, storeName string, proj server.FleetProject) *projectFlow {
 	cfg := proj.Cfg()
 	fctx, cancel := context.WithCancel(parent)
 	flow := &projectFlow{
-		name:   proj.Name,
-		key:    flowKey(cfg),
-		cfg:    cfg,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		name:      proj.Name,
+		key:       flowKey(cfg),
+		storeName: storeName,
+		cfg:       cfg,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+	}
+
+	// Per-flow hot-reload (#757): when store-watch is enabled and this flow is
+	// store-backed, feed the orchestrator a reload channel sourced from the
+	// project's row so an operator editing the config (config-store edit) is
+	// applied live, without restarting the flow or disturbing the rest of the
+	// fleet. The watcher is a child of fctx, so stopFlow drains it. nil disables
+	// reload (the orchestrator's select arm is then inert).
+	var reloadCh <-chan *config.Config
+	if d.projectStore != nil && storeName != "" {
+		reloadCh = configwatch.WatchStore(fctx, d.projectStore, storeName, d.opts.WatchStoreInterval)
 	}
 
 	// Register BEFORE launching any goroutine (including the reaper below), so
@@ -58,7 +72,7 @@ func (d *Daemon) startFlow(parent context.Context, proj server.FleetProject) *pr
 	go func() {
 		defer wg.Done()
 		defer recoverFlow(flow, "orchestrator")
-		d.runLoop(fctx, cfg, d.opts)
+		d.runLoop(fctx, cfg, d.opts, reloadCh)
 	}()
 	go func() {
 		defer wg.Done()
@@ -161,17 +175,19 @@ func recoverFlow(flow *projectFlow, loop string) {
 // daemon down (#756). orchestrator.Run already log-and-continues on per-cycle
 // errors and returns nil on ctx cancellation.
 //
-// Hot-reload note (#764 P3): the daemon's source of truth is the config store
-// (#754), not the import-time YAML, so we deliberately do NOT wire a YAML file
-// watcher here — watching a file the store supersedes would let the run loop
-// drift from the supervise loop, which has no such watcher. Store-driven reload
-// is Phase 2 (#757).
-func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options) {
+// Store-driven hot-reload (#757): reloadCh is fed by configwatch.WatchStore from
+// the project's config-store row (the daemon's source of truth, #754), wired in
+// by startFlow. The daemon deliberately does NOT watch the import-time YAML — a
+// file the store supersedes — which would let the run loop drift from the
+// supervise loop. A nil reloadCh (store-watch disabled) leaves the orchestrator's
+// reload select arm inert.
+func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config) {
 	orch := orchestrator.New(cfg)
 	orch.SetBinaryVersion(opts.Version)
 	if err := orch.LoadPromptBase(opts.PromptPath); err != nil {
 		log.Printf("[%s] warn: load prompt: %v", cfg.SessionPrefix, err)
 	}
+	orch.SetConfigReloadCh(reloadCh)
 
 	runInterval := opts.RunInterval
 	if cfg.PollIntervalSeconds > 0 {
@@ -183,7 +199,7 @@ func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options) {
 	// FleetServer, which does not signal individual flows. Pass nil rather than
 	// a buffered channel nothing ever sends on, so orch.Run's `case <-refreshCh`
 	// arm is plainly inert instead of looking like a wired-but-dead feature
-	// (#764). Store-driven reload is Phase 2 (#757).
+	// (#764).
 	log.Printf("[%s] starting orchestrator — repo=%s interval=%s", cfg.SessionPrefix, cfg.Repo, runInterval)
 	if err := orch.Run(ctx, runInterval, false, nil); err != nil {
 		log.Printf("[%s] orchestrator exited: %v", cfg.SessionPrefix, err)

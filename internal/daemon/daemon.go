@@ -16,11 +16,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/supervisor"
 )
@@ -31,6 +33,11 @@ import (
 const (
 	DefaultRunInterval       = 10 * time.Minute
 	DefaultSuperviseInterval = 5 * time.Minute
+	// DefaultWatchStoreInterval is the cadence of the store diff-loop and each
+	// flow's reload watcher when --watch-store is enabled (#757). Short enough
+	// that operator CRUD (config-store add/rm/edit) is reflected quickly, long
+	// enough that polling SQLite is negligible.
+	DefaultWatchStoreInterval = 15 * time.Second
 )
 
 // ConfigLoader yields the set of project configs the daemon supervises. It is
@@ -60,12 +67,30 @@ type Options struct {
 	Version string
 	// ReadOnly disables the fleet's mutating HTTP endpoints.
 	ReadOnly bool
+
+	// WatchStore enables DB-driven hot add/remove/reload of projects (#757):
+	// a diff-loop over the store's ProjectsFingerprint starts a flow for a new
+	// project name and drains one for a removed name, and each flow's
+	// orchestrator hot-reloads when its project row's config changes. It
+	// requires the store to satisfy configwatch.ProjectStore (the real
+	// *configstore.Store does); a store that does not is a no-op with a warn.
+	WatchStore bool
+	// WatchStoreInterval is the diff-loop / reload poll cadence; clamped to
+	// DefaultWatchStoreInterval when non-positive.
+	WatchStoreInterval time.Duration
 }
 
 // Daemon owns the running project flows and the shared FleetServer.
 type Daemon struct {
 	store ConfigLoader
 	opts  Options
+
+	// projectStore is store viewed as a configwatch.ProjectStore — non-nil only
+	// when the store supports per-project Load + ProjectsFingerprint, which the
+	// store diff-loop and per-flow reload watchers need (#757). The in-memory
+	// test ConfigLoader does not satisfy it, so the watch path is simply inert
+	// for those tests.
+	projectStore configwatch.ProjectStore
 
 	mu    sync.Mutex
 	fleet *server.FleetServer
@@ -74,8 +99,9 @@ type Daemon struct {
 	// runLoop, superviseLoop, and watchdogLoop build the per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
 	// override them to drive flows (and assert WaitGroup tracking) without
-	// reaching GitHub.
-	runLoop       func(ctx context.Context, cfg *config.Config, opts Options)
+	// reaching GitHub. runLoop receives the flow's hot-reload channel (#757),
+	// nil when store-watch is disabled.
+	runLoop       func(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config)
 	superviseLoop func(ctx context.Context, name string, cfg *config.Config, opts Options)
 	watchdogLoop  func(ctx context.Context, name, stateDir string, interval time.Duration)
 }
@@ -97,10 +123,24 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		log.Printf("[daemon] supervise-interval %s is not positive; clamping to default %s", opts.SuperviseInterval, DefaultSuperviseInterval)
 		opts.SuperviseInterval = DefaultSuperviseInterval
 	}
+	if opts.WatchStore && opts.WatchStoreInterval <= 0 {
+		log.Printf("[daemon] watch-store-interval %s is not positive; clamping to default %s", opts.WatchStoreInterval, DefaultWatchStoreInterval)
+		opts.WatchStoreInterval = DefaultWatchStoreInterval
+	}
 	d := &Daemon{
 		store: store,
 		opts:  opts,
 		flows: make(map[string]*projectFlow),
+	}
+	if opts.WatchStore {
+		// Only the richer store (Load + ProjectsFingerprint) can drive hot
+		// add/remove/reload. Degrade loudly rather than silently if an embedder
+		// flips the flag on a loader that cannot support it.
+		if ps, ok := store.(configwatch.ProjectStore); ok {
+			d.projectStore = ps
+		} else {
+			log.Printf("[daemon] --watch-store requested but the config store does not support per-project reload; disabling hot add/remove/reload")
+		}
 	}
 	d.runLoop = runOrchestrator
 	d.superviseLoop = func(ctx context.Context, name string, cfg *config.Config, opts Options) {
@@ -118,11 +158,11 @@ func New(store ConfigLoader, opts Options) *Daemon {
 // is logged and skipped — one bad project must never abort daemon startup or
 // the other flows (#756).
 func (d *Daemon) Run(ctx context.Context) error {
-	cfgs, err := d.store.LoadAll(ctx)
+	named, err := d.loadNamedConfigs(ctx)
 	if err != nil {
-		return fmt.Errorf("load configs: %w", err)
+		return err
 	}
-	if len(cfgs) == 0 {
+	if len(named) == 0 {
 		return errors.New("config store has no projects")
 	}
 
@@ -147,10 +187,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// handed. Keeping the dedup here — over the shared per-cfg construction
 	// (UniqueFleetName + NewFleetProjectWithGitHubNamed) — documents that
 	// divergence instead of silently forking the shared builder (#764).
-	seen := make(map[string]bool, len(cfgs))
-	usedNames := make(map[string]bool, len(cfgs))
-	projects := make([]server.FleetProject, 0, len(cfgs))
-	for _, cfg := range cfgs {
+	seen := make(map[string]bool, len(named))
+	usedNames := make(map[string]bool, len(named))
+	projects := make([]server.FleetProject, 0, len(named))
+	storeNames := make([]string, 0, len(named))
+	for _, nc := range named {
+		cfg := nc.cfg
 		if cfg == nil {
 			// A nil entry from the loader must not panic Run: flowKey tolerates
 			// nil but the wiring below dereferences cfg. Skip it, mirroring
@@ -166,6 +208,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		seen[key] = true
 		name := server.UniqueFleetName(cfg.Repo, usedNames)
 		projects = append(projects, server.NewFleetProjectWithGitHubNamed(name, cfg))
+		storeNames = append(storeNames, nc.name)
 	}
 
 	// One FleetServer for the whole fleet — replaces the N per-project
@@ -186,7 +229,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	for i := range projects {
-		flow := d.startFlow(ctx, projects[i])
+		flow := d.startFlow(ctx, storeNames[i], projects[i])
 		log.Printf("[daemon] started flow %q (repo=%s state_dir=%s)", flow.name, flow.cfg.Repo, flow.cfg.StateDir)
 	}
 
@@ -196,18 +239,45 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.fleet = fleet
 	d.mu.Unlock()
 
+	// Store diff-loop (#757): hot add/remove of project flows. It runs under its
+	// own context so it can be stopped on a serve error (where ctx is not yet
+	// cancelled) as well as on ctx.Done. New flows it starts are parented on the
+	// daemon ctx, not the loop's, so stopAll drains them; stopWatch always runs
+	// before stopAll, so the loop has exited and started no flow stopAll misses.
+	var stopWatch func()
+	if d.projectStore != nil {
+		wctx, watchCancel := context.WithCancel(ctx)
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			d.watchStoreLoop(wctx, ctx, d.opts.WatchStoreInterval)
+		}()
+		log.Printf("[daemon] store watch enabled — diff-loop poll every %s", d.opts.WatchStoreInterval)
+		stopWatch = func() {
+			watchCancel()
+			<-watchDone
+		}
+	}
+	drainWatch := func() {
+		if stopWatch != nil {
+			stopWatch()
+		}
+	}
+
 	log.Printf("[daemon] serving fleet — projects=%d addr=%s:%d read_only=%v", len(projects), d.opts.Host, d.opts.Port, d.opts.ReadOnly)
 	fleetErr := make(chan error, 1)
 	go func() { fleetErr <- fleet.Serve(ctx, ln) }()
 
 	select {
 	case <-ctx.Done():
+		drainWatch()
 		d.stopAll()
 		return <-fleetErr
 	case err := <-fleetErr:
 		// Serve returned before shutdown — a runtime serve error after a
 		// successful bind (rare; the bind failure itself was already handled by
 		// Listen above). Flows are legitimately running, so drain them.
+		drainWatch()
 		d.stopAll()
 		if err != nil {
 			log.Printf("[daemon] fleet server failed on %s:%d: %v", d.opts.Host, d.opts.Port, err)
@@ -216,6 +286,52 @@ func (d *Daemon) Run(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}
+}
+
+// namedConfig pairs a config-store project name with its loaded config. The
+// name (the store's primary key) is what the diff-loop and per-flow reload
+// watcher key on; it is empty on the LoadAll fallback path, which disables
+// per-flow reload for that flow but leaves it otherwise fully functional.
+type namedConfig struct {
+	name string
+	cfg  *config.Config
+}
+
+// loadNamedConfigs resolves the projects to start. When the store supports
+// per-project reload (projectStore != nil), it loads via ProjectsFingerprint so
+// each config carries its store name for the diff-loop; otherwise it falls back
+// to LoadAll with empty names, preserving the Phase 1 behaviour for plain
+// ConfigLoaders and the in-memory test loader.
+func (d *Daemon) loadNamedConfigs(ctx context.Context) ([]namedConfig, error) {
+	if d.projectStore != nil {
+		fp, err := d.projectStore.ProjectsFingerprint(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("fingerprint config store: %w", err)
+		}
+		names := make([]string, 0, len(fp))
+		for name := range fp {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		out := make([]namedConfig, 0, len(names))
+		for _, name := range names {
+			cfg, err := d.projectStore.Load(ctx, name)
+			if err != nil {
+				return nil, fmt.Errorf("load project %s: %w", name, err)
+			}
+			out = append(out, namedConfig{name: name, cfg: cfg})
+		}
+		return out, nil
+	}
+	cfgs, err := d.store.LoadAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load configs: %w", err)
+	}
+	out := make([]namedConfig, 0, len(cfgs))
+	for _, cfg := range cfgs {
+		out = append(out, namedConfig{cfg: cfg})
+	}
+	return out, nil
 }
 
 // flowKey is a flow's stable identity for dedup and the flows registry. The

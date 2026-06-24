@@ -259,6 +259,34 @@ ON CONFLICT(name) DO UPDATE SET config_yaml = excluded.config_yaml, updated_at =
 	return tx.Commit()
 }
 
+// ProjectNameFor derives the canonical project name for a config document the
+// same way ImportDir does: the sanitised `repo` field when present, else the
+// source file's basename. Exposed so `config-store add --file` names a single
+// file identically to a bulk `config-store migrate` (#757).
+func ProjectNameFor(sourcePath string, data []byte) (string, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return "", err
+	}
+	name := projectNameFromPath(sourcePath)
+	if repo := scalarAt(&root, "repo"); repo != "" {
+		name = safeProjectName(repo)
+	}
+	if strings.TrimSpace(name) == "" {
+		return "", fmt.Errorf("cannot derive a project name from %q (set repo or pass --name)", sourcePath)
+	}
+	return name, nil
+}
+
+// ExportProject returns one project's portable YAML — the stored project
+// document with its shared backend definitions re-attached, identical to a
+// single file written by ExportDir. Exposed for `config-store edit`, which
+// round-trips a project through $EDITOR (#757).
+func (s *Store) ExportProject(ctx context.Context, name string) ([]byte, error) {
+	data, _, err := s.exportProjectYAML(ctx, name)
+	return data, err
+}
+
 // DeleteProject removes a project row. Deleting a missing project is a no-op
 // (no error), matching idempotent delete semantics. Shared backend rows are
 // left intact: they may still be referenced by other projects.
