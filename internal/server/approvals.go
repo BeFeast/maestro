@@ -178,8 +178,11 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	}
 	// #487: auth fires BEFORE path / project parsing so an unauthenticated
 	// probe cannot enumerate fleet topology via 404/400 differences. Spec:
-	// "every mutating POST without a valid credential returns 401".
-	if _, ok := requireAuth(w, r, s.auth); !ok {
+	// "every mutating POST without a valid credential returns 401". Read the
+	// checker once (#768) so both the gate and applyApprovalDecision below see
+	// the same live token even if a hot-add re-derives it concurrently.
+	auth := s.liveAuth()
+	if _, ok := requireAuth(w, r, auth); !ok {
 		return
 	}
 	route, ok := parseApprovalPath("/api/v1/fleet/approvals/", r.URL.Path)
@@ -207,5 +210,5 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	if project.cfg != nil {
 		stateDir = project.cfg.StateDir
 	}
-	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route, s.auth)
+	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route, auth)
 }

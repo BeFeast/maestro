@@ -99,10 +99,13 @@ type Daemon struct {
 	// runLoop, superviseLoop, and watchdogLoop build the per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
 	// override them to drive flows (and assert WaitGroup tracking) without
-	// reaching GitHub. runLoop receives the flow's hot-reload channel (#757),
-	// nil when store-watch is disabled.
+	// reaching GitHub. runLoop receives the orchestrator's hot-reload channel
+	// (#757), nil when store-watch is disabled. superviseLoop receives a getCfg
+	// closure rather than a fixed *config.Config so it reads the flow's current
+	// config each cycle through the shared holder — a config-store edit reaches
+	// the supervise loop live, not just the orchestrator (#768).
 	runLoop       func(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config)
-	superviseLoop func(ctx context.Context, name string, cfg *config.Config, opts Options)
+	superviseLoop func(ctx context.Context, name string, getCfg func() *config.Config, opts Options)
 	watchdogLoop  func(ctx context.Context, name, stateDir string, interval time.Duration)
 }
 
@@ -143,8 +146,8 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		}
 	}
 	d.runLoop = runOrchestrator
-	d.superviseLoop = func(ctx context.Context, name string, cfg *config.Config, opts Options) {
-		runSupervise(ctx, name, cfg, opts.SuperviseInterval)
+	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+		runSupervise(ctx, name, getCfg, opts.SuperviseInterval)
 	}
 	d.watchdogLoop = supervisor.Watchdog
 	return d
