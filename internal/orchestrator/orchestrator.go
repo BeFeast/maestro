@@ -2439,6 +2439,21 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						// log, no project sync, no FinishedAt churn.
 						continue
 					}
+					// A Dead session with a pending NextRetryAt is QUEUED for an
+					// in-place respawn (review-feedback / CI-failure / rebase
+					// retry — handleReviewFeedbackRetry et al. set Status=Dead +
+					// NextRetryAt). Do NOT flip it to pr_open here: this reconcile
+					// runs at Step 1, BEFORE respawnDueRetries at Step 2b, which
+					// only relaunches sessions still in StatusDead. Flipping to
+					// pr_open clears the Dead status, so respawnDueRetries never
+					// sees the session and the worker never relaunches — every
+					// cycle re-detects the same review feedback and burns one
+					// maintenance retry until the budget exhausts and the PR holds,
+					// with not a single real fix attempt. Leave it Dead; the retry
+					// queue owns the relaunch (#758 in-place-respawn race).
+					if sess.Status == state.StatusDead && sess.NextRetryAt != nil {
+						continue
+					}
 					o.ensureAttributionTrailerOnPR(slotName, sess, pr)
 					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] session %s %s->pr_open (PR #%d now open for branch %q)", slotName, sess.Status, pr.Number, sess.Branch)

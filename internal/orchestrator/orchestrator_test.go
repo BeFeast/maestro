@@ -217,6 +217,45 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 	}
 }
 
+// A Dead session QUEUED for an in-place respawn (NextRetryAt set — the
+// review-feedback / CI-failure / rebase retry path) must NOT be flipped to
+// pr_open by the Step-1 reconcile. Flipping clears the Dead status before the
+// Step-2b respawnDueRetries — which only relaunches StatusDead sessions — so the
+// worker never respawns and the maintenance-retry budget burns to a held PR
+// without a single real fix attempt (#758 in-place-respawn race).
+func TestReconcileRunningSessions_DeadWithPendingRetry_NotFlippedToPROpen(t *testing.T) {
+	s := state.NewState()
+	retryAt := time.Now().UTC().Add(10 * time.Second)
+	s.Sessions["sup-9"] = &state.Session{
+		IssueNumber: 200,
+		IssueTitle:  "review-repair retry",
+		Status:      state.StatusDead,
+		NextRetryAt: &retryAt,
+		RetryCount:  1,
+		Branch:      "feat/sup-9-200-fix",
+		PRNumber:    300,
+	}
+	openPRs := []github.PR{{Number: 300, HeadRefName: "feat/sup-9-200-fix", Title: "fix"}}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return openPRs, nil },
+	}
+
+	// checkSessions (Step 2) is the reconcile that flips terminal sessions with
+	// an open PR to pr_open — and where the in-place-respawn race lives.
+	o.checkSessions(s)
+
+	sess := s.Sessions["sup-9"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q — a retry-queued Dead session must stay Dead so respawnDueRetries relaunches it", sess.Status, state.StatusDead)
+	}
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt must be preserved — the in-place respawn depends on it")
+	}
+}
+
 func TestReconcileRunningSessions_DeadWorkerWithOpenPR_CapturesTokensFromPersistedLog(t *testing.T) {
 	stateDir := t.TempDir()
 	logDir := state.LogDir(stateDir)
