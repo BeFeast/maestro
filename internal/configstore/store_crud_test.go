@@ -74,3 +74,42 @@ model:
 		t.Fatal("ExportProject of a missing project: want error, got nil")
 	}
 }
+
+// #757: two writes in the same wall-clock second must produce DIFFERENT
+// fingerprints — otherwise a config-store edit immediately after add/migrate
+// would never advance updated_at and a --watch-store daemon would never
+// hot-reload. Guards against a regression to seconds-precision (RFC3339).
+func TestUpsertProjectFingerprintAdvancesWithinSameSecond(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	const y1 = `repo: owner/svc
+max_parallel: 2
+model:
+  default: codex
+  backends:
+    codex:
+      cmd: codex
+      prompt_mode: stdin
+`
+	if err := store.UpsertProject(ctx, "svc", y1); err != nil {
+		t.Fatalf("UpsertProject 1: %v", err)
+	}
+	fp1, err := store.ProjectsFingerprint(ctx)
+	if err != nil {
+		t.Fatalf("fingerprint 1: %v", err)
+	}
+
+	y2 := strings.Replace(y1, "max_parallel: 2", "max_parallel: 3", 1)
+	if err := store.UpsertProject(ctx, "svc", y2); err != nil {
+		t.Fatalf("UpsertProject 2: %v", err)
+	}
+	fp2, err := store.ProjectsFingerprint(ctx)
+	if err != nil {
+		t.Fatalf("fingerprint 2: %v", err)
+	}
+
+	if !fp2["svc"].After(fp1["svc"]) {
+		t.Fatalf("fingerprint did not advance within the same second: %v not After %v — seconds-precision updated_at regression", fp2["svc"], fp1["svc"])
+	}
+}

@@ -44,10 +44,27 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout makes a connection wait (up to 5s) for a lock instead of
+	// erroring with "database is locked" immediately: the daemon's watch-loop
+	// reads config.db (ProjectsFingerprint every tick, Load on add) while
+	// `config-store add/rm/edit` writes it from a SEPARATE process (#757). WAL
+	// lets a reader and a writer proceed concurrently across processes. The
+	// pragmas go in the DSN so modernc applies them to every pooled connection.
+	dsn := path
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	dsn += sep + "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	// Serialize in-process access through a single connection — modernc/sqlite
+	// can still report SQLITE_BUSY between two pooled connections of the same
+	// process; one connection plus busy_timeout removes that contention while
+	// WAL handles the cross-process case.
+	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.Init(context.Background()); err != nil {
 		db.Close()
@@ -171,7 +188,7 @@ func importProject(ctx context.Context, tx *sql.Tx, sourcePath string, data []by
 		projectName = safeProjectName(repo)
 	}
 	backends := detachBackends(&root)
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano) // nano, not seconds: see ProjectsFingerprint (#757)
 	if err := upsertSharedBackendsTx(ctx, tx, backends, now); err != nil {
 		return err
 	}
@@ -241,7 +258,7 @@ func (s *Store) UpsertProject(ctx context.Context, name, configYAML string) erro
 	defer tx.Rollback()
 
 	backends := detachBackends(&root)
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano) // nano, not seconds: see ProjectsFingerprint (#757)
 	if err := upsertSharedBackendsTx(ctx, tx, backends, now); err != nil {
 		return err
 	}
@@ -311,7 +328,7 @@ func (s *Store) UpsertBackend(ctx context.Context, name, definitionYAML string) 
 	if err := yaml.Unmarshal([]byte(definitionYAML), &probe); err != nil {
 		return fmt.Errorf("parse backend %q: %w", name, err)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano) // nano, not seconds: see ProjectsFingerprint (#757)
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO backends(name, definition_yaml, updated_at)
 VALUES(?, ?, ?)
@@ -330,7 +347,7 @@ func (s *Store) SetGlobal(ctx context.Context, key, valueYAML string) error {
 	if err := yaml.Unmarshal([]byte(valueYAML), &probe); err != nil {
 		return fmt.Errorf("parse global %q: %w", key, err)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano) // nano, not seconds: see ProjectsFingerprint (#757)
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO global(key, value_yaml, updated_at)
 VALUES(?, ?, ?)
@@ -340,8 +357,13 @@ ON CONFLICT(key) DO UPDATE SET value_yaml = excluded.value_yaml, updated_at = ex
 }
 
 // ProjectsFingerprint returns each project's name mapped to its updated_at
-// timestamp. Callers use it to detect which projects changed since a prior
-// snapshot without loading every config.
+// timestamp. Callers (the daemon diff-loop and configwatch.WatchStore) use it
+// to detect which projects changed since a prior snapshot without loading every
+// config. updated_at is written at RFC3339Nano precision so two writes in the
+// same second do not compare equal — otherwise a config-store edit immediately
+// after add/migrate would never advance the fingerprint and a --watch-store
+// daemon would never hot-reload that project (#757). Parsing with RFC3339Nano
+// also accepts older seconds-precision rows.
 func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT name, updated_at FROM project`)
 	if err != nil {
@@ -354,7 +376,7 @@ func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, 
 		if err := rows.Scan(&name, &updatedAt); err != nil {
 			return nil, err
 		}
-		ts, err := time.Parse(time.RFC3339, updatedAt)
+		ts, err := time.Parse(time.RFC3339Nano, updatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("parse updated_at for project %q: %w", name, err)
 		}

@@ -80,6 +80,12 @@ func (d *Daemon) reconcileStore(flowParent context.Context, fp map[string]time.T
 			fleet.RemoveProject(flow.name)
 		}
 		d.stopFlow(flow.key)
+		// Free this flow's fleet display name AND its flow identity in the local
+		// snapshot maps, so a same-tick re-add of the same repo/StateDir reclaims
+		// the base name (instead of getting a numeric-suffixed UniqueFleetName)
+		// and is not wrongly skipped as a duplicate flow identity (#757).
+		delete(takenNames, flow.name)
+		delete(takenKeys, flow.key)
 	}
 
 	// Additions: a store project with no running flow.

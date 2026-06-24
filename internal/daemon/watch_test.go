@@ -216,3 +216,47 @@ func waitForNames(t *testing.T, d *Daemon, want ...string) {
 	}
 	t.Fatalf("fleet names = %v, want %v", last, want)
 }
+
+// #757: when one project is removed and a different project sharing its repo
+// basename is added in the SAME reconcile tick, the re-add must reclaim the
+// freed fleet name — not get a slug/numeric-suffixed one because the removed
+// flow's name lingered in the diff-loop's takenNames snapshot.
+func TestReconcileStoreSameTickRemoveAddReclaimsName(t *testing.T) {
+	store := newFakeWatchStore()
+	var run, sup loopTracker
+	d := newWatchDaemon(store, run.loop, sup.superviseLoop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Tick 1: project "old" (repo org-a/api) starts and takes fleet name "api".
+	store.Set("old", testConfig(t, "org-a/api"))
+	d.reconcileStore(ctx, map[string]time.Time{"old": time.Unix(1, 0)}, map[string]bool{})
+	if got := storeFlowName(d, "old"); got != "api" {
+		t.Fatalf("old fleet name = %q, want \"api\"", got)
+	}
+
+	// Tick 2 (one reconcile): "old" removed, "new" (same repo basename, distinct
+	// StateDir) added. The freed name "api" must be reclaimed.
+	store.Delete("old")
+	store.Set("new", testConfig(t, "org-a/api"))
+	d.reconcileStore(ctx, map[string]time.Time{"new": time.Unix(2, 0)}, map[string]bool{})
+
+	if got := storeFlowName(d, "new"); got != "api" {
+		t.Fatalf("re-added fleet name = %q, want reclaimed \"api\" (takenNames/takenKeys not freed on remove)", got)
+	}
+	cancel()
+}
+
+// storeFlowName returns the fleet display name of the running flow whose
+// config-store name is storeName, or "" if none.
+func storeFlowName(d *Daemon, storeName string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, flow := range d.flows {
+		if flow.storeName == storeName {
+			return flow.name
+		}
+	}
+	return ""
+}

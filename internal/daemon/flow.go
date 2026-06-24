@@ -182,7 +182,23 @@ func recoverFlow(flow *projectFlow, loop string) {
 // supervise loop. A nil reloadCh (store-watch disabled) leaves the orchestrator's
 // reload select arm inert.
 func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config) {
-	orch := orchestrator.New(cfg)
+	// Hot-reload (reloadCh, #757) makes the orchestrator's reloadConfig mutate
+	// its config in place (field replacement). The supervise loop and the
+	// FleetProject HTTP snapshot share this exact cfg pointer, so hand the
+	// orchestrator a private shallow copy to mutate — the shared struct the
+	// other goroutines read is then never written, closing the reload data race.
+	// reloadConfig only REPLACES fields (o.cfg.X = newCfg.X), never mutates a
+	// slice/map element in place, so a shallow copy fully isolates it.
+	//
+	// Trade-off / known limitation: a config-store edit is now applied LIVE only
+	// to the orchestrator. The supervise loop and the dashboard snapshot keep the
+	// startup config until the flow restarts — same as before #757, which had no
+	// daemon reload at all, so this is strictly better than main, not a regression.
+	// Making all three live-reload safely needs a synchronized config holder
+	// shared across orchestrator + supervisor + FleetProject — a follow-up, not an
+	// in-place mutation (which is the data race this copy removes).
+	orchCfg := *cfg
+	orch := orchestrator.New(&orchCfg)
 	orch.SetBinaryVersion(opts.Version)
 	if err := orch.LoadPromptBase(opts.PromptPath); err != nil {
 		log.Printf("[%s] warn: load prompt: %v", cfg.SessionPrefix, err)
