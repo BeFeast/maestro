@@ -118,6 +118,15 @@ type Daemon struct {
 	selfDeployLast    time.Time
 	selfDeployLastPR  int
 	selfDeployTrigger func(cfg *config.Config, prNumber int) error
+	// selfDeployWindow is the longest debounce window any flow has requested, so
+	// the shared marker debounces on the max — a short-window flow cannot bypass
+	// a long-window flow's in-flight deploy (#758). Guarded by selfDeployMu.
+	selfDeployWindow time.Duration
+	// fleetAuthTokenEnv is the env var of the fleet's single shared auth token
+	// (server.FleetAuthFromProjects over the startup project set), used to
+	// authenticate the post-merge self-deploy health probe against /api/v1/fleet
+	// (#758). Set once in Run before flows start, then read-only.
+	fleetAuthTokenEnv string
 
 	// runLoop, superviseLoop, and watchdogLoop build the per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
@@ -242,7 +251,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// One FleetServer for the whole fleet — replaces the N per-project
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
-	fleet.SetAuth(server.FleetAuthFromProjects(projects))
+	fleetAuth := server.FleetAuthFromProjects(projects)
+	fleet.SetAuth(fleetAuth)
+	// Capture the fleet's shared auth token env so the self-deploy health probe
+	// authenticates against /api/v1/fleet with the SAME token the server enforces
+	// — not the triggering flow's, which may differ or be empty (#758). Set here,
+	// before any flow starts, so RequestSelfDeploy reads it race-free.
+	d.fleetAuthTokenEnv = strings.TrimSpace(fleetAuth.TokenEnv)
 
 	// Bind the fleet port BEFORE starting any flow. If the port is already held
 	// (a legacy maestro@ unit, a second daemon), Listen fails here and we abort

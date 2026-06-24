@@ -42,7 +42,15 @@ func (d *Daemon) RequestSelfDeploy(cfg *config.Config, prNumber int) error {
 	defer d.selfDeployMu.Unlock()
 
 	now := time.Now().UTC()
-	window := time.Duration(cfg.SelfDeploy.EffectiveMinIntervalMinutes()) * time.Minute
+	// Debounce on the LONGEST min_interval any flow has ever requested, not just
+	// the requesting flow's. The marker is shared across flows, so deriving the
+	// window per-caller would let a flow with a short min_interval fire a second
+	// deploy inside a flow with a longer one's window — while that flow's build
+	// may still be in flight, defeating the single-deploy guarantee (#758).
+	if w := time.Duration(cfg.SelfDeploy.EffectiveMinIntervalMinutes()) * time.Minute; w > d.selfDeployWindow {
+		d.selfDeployWindow = w
+	}
+	window := d.selfDeployWindow
 
 	// Most-recent trigger across the in-memory marker (this process) and the
 	// shared on-disk marker. Either one inside the window debounces.
@@ -92,11 +100,16 @@ func (d *Daemon) selfDeployConfig(cfg *config.Config) *config.Config {
 	sd := cfg.SelfDeploy
 	if strings.TrimSpace(sd.HealthURL) == "" {
 		sd.HealthURL = d.fleetHealthURL() // "" when no fleet port is bound
-		dc.Server.Port = 0                // never derive a dead per-project URL
-		// Carry the auth token env so the probe authenticates against the single
-		// endpoint, defaulting to the flow's own server auth env.
-		if sd.HealthURL != "" && strings.TrimSpace(sd.HealthTokenEnv) == "" {
-			sd.HealthTokenEnv = strings.TrimSpace(cfg.Server.Auth.TokenEnv)
+		if sd.HealthURL != "" {
+			dc.Server.Port = 0 // never derive a dead per-project URL
+			// Authenticate the probe against the single fleet endpoint. The fleet
+			// uses ONE shared token derived via server.FleetAuthFromProjects (the
+			// first token-bearing project), NOT necessarily the requesting flow's:
+			// using the triggering flow's env would send the wrong (or empty)
+			// token and the probe would 401, rolling back a healthy daemon (#758).
+			if strings.TrimSpace(sd.HealthTokenEnv) == "" {
+				sd.HealthTokenEnv = d.fleetAuthTokenEnv
+			}
 		}
 	}
 	dc.SelfDeploy = sd
@@ -112,8 +125,13 @@ func (d *Daemon) fleetHealthURL() string {
 		return ""
 	}
 	host := strings.TrimSpace(d.opts.Host)
-	if host == "" || host == "0.0.0.0" {
+	switch host {
+	case "", "0.0.0.0":
 		host = "127.0.0.1"
+	case "::":
+		// IPv6 all-interfaces: probe the loopback, not the any-address, matching
+		// the 0.0.0.0 → 127.0.0.1 treatment.
+		host = "::1"
 	}
 	return fmt.Sprintf("http://%s/api/v1/fleet", net.JoinHostPort(host, strconv.Itoa(d.opts.Port)))
 }

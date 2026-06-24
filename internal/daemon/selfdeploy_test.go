@@ -88,17 +88,23 @@ func TestRequestSelfDeployRestartsExactlyOneUnit(t *testing.T) {
 // fleet snapshot carries the version field the script SHA-matches (#758/#698).
 func TestSelfDeployConfigRoutesHealthToFleetEndpoint(t *testing.T) {
 	d := New(fakeLoader{}, Options{Host: "127.0.0.1", Port: 8786})
+	// The fleet's single shared token env, as Run captures it from
+	// server.FleetAuthFromProjects. The probe hits /api/v1/fleet, so it must
+	// authenticate with THIS — not the triggering flow's own env (#758).
+	d.fleetAuthTokenEnv = "FLEET_DASH_TOKEN"
 	dc := d.selfDeployConfig(&config.Config{
-		Repo:       "owner/alpha",
-		Server:     config.ServerConfig{Auth: config.ServerAuthConfig{TokenEnv: "MAESTRO_DASH_TOKEN"}},
+		Repo: "owner/alpha",
+		// A DIFFERENT per-flow token env: it must NOT be the one the probe uses,
+		// or a probe from a non-token-bearing flow would 401 (Codex on #770).
+		Server:     config.ServerConfig{Auth: config.ServerAuthConfig{TokenEnv: "FLOW_TOKEN"}},
 		SelfDeploy: config.SelfDeployConfig{Enabled: true},
 	})
 	wantURL := "http://127.0.0.1:8786/api/v1/fleet"
 	if got := dc.SelfDeploy.EffectiveHealthURL(dc.Server); got != wantURL {
 		t.Fatalf("health URL = %q, want %q (single fleet endpoint)", got, wantURL)
 	}
-	if got := dc.SelfDeploy.HealthTokenEnv; got != "MAESTRO_DASH_TOKEN" {
-		t.Fatalf("health token env = %q, want carried from server auth", got)
+	if got := dc.SelfDeploy.HealthTokenEnv; got != "FLEET_DASH_TOKEN" {
+		t.Fatalf("health token env = %q, want the FLEET shared token env, not the flow's", got)
 	}
 }
 
