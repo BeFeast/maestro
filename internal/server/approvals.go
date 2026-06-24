@@ -181,7 +181,7 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	// "every mutating POST without a valid credential returns 401". Read the
 	// checker once (#768) so both the gate and applyApprovalDecision below see
 	// the same live token even if a hot-add re-derives it concurrently.
-	auth := s.authChecker()
+	auth := s.liveAuth()
 	if _, ok := requireAuth(w, r, auth); !ok {
 		return
 	}

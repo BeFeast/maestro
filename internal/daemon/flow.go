@@ -228,16 +228,31 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			if newCfg == nil {
 				continue
 			}
-			// Holder first, so the supervise loop's next cycle and the rebuilt
+			// Identity / restart-required fields (repo, state_dir, session_prefix)
+			// cannot be hot-applied: the orchestrator, supervisor, watchdog, and the
+			// supervisor's GitHub client were all built from the flow's STARTUP
+			// identity. Storing a changed identity in the holder would make
+			// supervisor.RunOnce(getCfg(), gh) read a repo/state_dir the rest of the
+			// flow is not running on (gh is pinned to the startup repo). Skip the
+			// live update and tell the operator to restart the project (rm+add, which
+			// the diff-loop handles as a fresh flow); hot-reloadable edits still
+			// apply (#768, Codex).
+			if identityChanged(flow.cfg, newCfg) {
+				log.Printf("[%s] config reload: identity field (repo/state_dir/session_prefix) changed — restart required, live reload skipped", flow.name)
+				continue
+			}
+			// Holder first, so the supervise loop's next cycle and the updated
 			// dashboard snapshot below both observe the new config.
 			flow.holder.Store(newCfg)
 
-			// Replace the project in the fleet so /api/v1/fleet reflects the edit
-			// and fleet auth is re-derived. d.Fleet() is nil only during the brief
+			// Update the project's config IN PLACE so /api/v1/fleet reflects the edit
+			// and fleet auth is re-derived — WITHOUT rebuilding the FleetProject,
+			// which would drop the live board refresher + action GH client a full
+			// replacement discards (#768). d.Fleet() is nil only during the brief
 			// startup window before Run publishes it; no reload can arrive that
 			// early, but tolerate nil to be safe.
 			if fleet := d.Fleet(); fleet != nil {
-				fleet.AddProject(server.NewFleetProjectWithGitHubNamed(flow.name, newCfg))
+				fleet.UpdateProjectConfig(flow.name, newCfg)
 			}
 
 			// Forward to the orchestrator. Non-blocking with drop-if-not-drained,
@@ -250,6 +265,18 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			}
 		}
 	}
+}
+
+// identityChanged reports whether two configs differ in a flow-identity /
+// restart-required field that cannot be hot-applied to a running flow: the
+// orchestrator, supervisor, watchdog, and the supervisor's GitHub client are
+// all built once from these at startup. flowKey already keys on StateDir/Repo;
+// session_prefix names worker sessions. A change here needs a flow restart.
+func identityChanged(a, b *config.Config) bool {
+	if a == nil || b == nil {
+		return a != b
+	}
+	return a.Repo != b.Repo || a.StateDir != b.StateDir || a.SessionPrefix != b.SessionPrefix
 }
 
 // runOrchestrator is the production run loop for one flow. It mirrors the

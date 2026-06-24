@@ -319,6 +319,31 @@ func (s *FleetServer) AddProject(p FleetProject) {
 	s.reauthLocked()
 }
 
+// UpdateProjectConfig swaps the config of the project named name IN PLACE and
+// re-derives fleet auth, preserving everything else about the FleetProject —
+// crucially its board refresher state and safe-action GitHub client. A full
+// AddProject replacement would hand back a fresh FleetProject with an empty
+// *boardState that no refresher updates (the refresher goroutine, started once
+// at Serve, keeps writing the project's existing board pointer), so any config
+// edit for a github_projects project would silently stop the board rollup. Used
+// by the daemon's reload pump (#768): a config-store edit updates the dashboard
+// snapshot without dropping the live board. Reports whether a project was found.
+func (s *FleetServer) UpdateProjectConfig(name string, cfg *config.Config) bool {
+	if s == nil || cfg == nil {
+		return false
+	}
+	s.projectsMu.Lock()
+	defer s.projectsMu.Unlock()
+	for i := range s.projects {
+		if s.projects[i].Name == name {
+			s.projects[i].cfg = cfg
+			s.reauthLocked()
+			return true
+		}
+	}
+	return false
+}
+
 // RemoveProject drops the project with the given fleet name (daemon hot-remove,
 // #757) and reports whether one was found. Safe for concurrent use with the
 // HTTP read paths. The shared auth token is re-derived from the remaining set
@@ -374,11 +399,12 @@ func (s *FleetServer) setAuthChecker(a authChecker) {
 	s.authMu.Unlock()
 }
 
-// authChecker returns the live auth checker under the read lock. Every fleet
+// liveAuth returns the current auth checker under the read lock. Every fleet
 // handler reads through this so a runtime SetAuth / hot-add re-derivation is
 // applied to the next request without a server rebuild and without racing the
-// write (#768).
-func (s *FleetServer) authChecker() authChecker {
+// write (#768). Named liveAuth (not authChecker) so call sites don't read like
+// a conversion to the authChecker type.
+func (s *FleetServer) liveAuth() authChecker {
 	s.authMu.RLock()
 	defer s.authMu.RUnlock()
 	return s.auth
@@ -393,7 +419,7 @@ func (s *FleetServer) authChecker() authChecker {
 //
 // The middleware reads the live checker per request (#768) rather than
 // capturing it at build time, so a hot-add that enables auth gates the read
-// path too — not only the mutating endpoints (which read s.authChecker()
+// path too — not only the mutating endpoints (which read s.liveAuth()
 // directly).
 func (s *FleetServer) buildHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -406,7 +432,7 @@ func (s *FleetServer) buildHandler() http.Handler {
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleFleetDashboard)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authMiddleware(mux, s.authChecker()).ServeHTTP(w, r)
+		authMiddleware(mux, s.liveAuth()).ServeHTTP(w, r)
 	})
 }
 
@@ -1096,7 +1122,7 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 	// #487: auth fires BEFORE the read-only gate so an unauthenticated POST
 	// always sees 401 (never 403/405). Spec: "every mutating POST without a
 	// valid credential returns 401".
-	authenticatedActor, ok := requireAuth(w, r, s.authChecker())
+	authenticatedActor, ok := requireAuth(w, r, s.liveAuth())
 	if !ok {
 		return
 	}
@@ -1203,7 +1229,7 @@ func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request
 	// arbitrary entries that bury the real attack signal under noise. Auth
 	// fires BEFORE payload parsing so probes cannot enumerate the project
 	// list via 400 differences.
-	authenticatedActor, ok := requireAuth(w, r, s.authChecker())
+	authenticatedActor, ok := requireAuth(w, r, s.liveAuth())
 	if !ok {
 		return
 	}
