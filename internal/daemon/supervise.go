@@ -25,15 +25,21 @@ import (
 // flows, so every cycle (including the first) is logged and retried. Persistent
 // failures still surface: the #499 watchdog flags SupervisorStuck when
 // LastRunOnceAt stops advancing.
-func runSupervise(ctx context.Context, name string, cfg *config.Config, interval time.Duration) {
-	gh := github.New(cfg.Repo)
+//
+// getCfg yields the flow's CURRENT config: the loop reads it once per cycle so
+// a live config-store edit (supervisor policy, labels, …) is applied without a
+// flow restart (#768). The GitHub client is built once from the startup repo —
+// repo is a restart-required field the orchestrator refuses to hot-apply, so it
+// is stable for the flow's lifetime.
+func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, interval time.Duration) {
+	gh := github.New(getCfg().Repo)
 	// Capture and log each cycle's SupervisorDecision. The daemon still acts
 	// (label/comment/approve), but without this the structural "why did the
 	// supervisor do that" trail was dropped — turning debugging into journal
 	// archaeology (#764). Logs key on the unique fleet name (not the possibly
 	// shared session prefix) so two same-basename repos stay distinguishable.
 	runOnce := func() error {
-		decision, err := supervisor.RunOnce(cfg, gh)
+		decision, err := supervisor.RunOnce(getCfg(), gh)
 		if err != nil {
 			return err
 		}

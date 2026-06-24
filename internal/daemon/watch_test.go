@@ -76,7 +76,7 @@ func (f *fakeWatchStore) ProjectsFingerprint(ctx context.Context) (map[string]ti
 	return out, nil
 }
 
-func newWatchDaemon(store ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, *config.Config, Options)) *Daemon {
+func newWatchDaemon(store ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, func() *config.Config, Options)) *Daemon {
 	d := New(store, Options{Host: "127.0.0.1", Port: 0, WatchStore: true, WatchStoreInterval: 25 * time.Millisecond})
 	if run != nil {
 		d.runLoop = run
@@ -175,7 +175,7 @@ func TestWatchStoreWiresReloadChannel(t *testing.T) {
 		}
 		<-ctx.Done()
 	}
-	sup := func(ctx context.Context, name string, cfg *config.Config, opts Options) { <-ctx.Done() }
+	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) { <-ctx.Done() }
 	d := newWatchDaemon(store, run, sup)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -188,6 +188,105 @@ func TestWatchStoreWiresReloadChannel(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// #768: a config-store edit must reach the supervise loop AND the /api/v1/fleet
+// dashboard snapshot live — not only the orchestrator (the #757 limitation).
+// The supervise loop reads the flow's current config each cycle through the
+// shared holder; the dashboard is rebuilt from the same config on reload. The
+// flow is never restarted (same StateDir → same flow identity).
+func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
+	store := newFakeWatchStore()
+	cfg := testConfig(t, "owner/alpha")
+	cfg.MaxParallel = 1
+	store.Set("alpha", cfg)
+
+	// The supervise stub polls the holder via getCfg() and records the latest
+	// MaxParallel it observed, modelling the real loop reading config each cycle.
+	var seenMax int64
+	run := func(ctx context.Context, c *config.Config, opts Options, reloadCh <-chan *config.Config) {
+		<-ctx.Done()
+	}
+	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+		tick := time.NewTicker(3 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			atomic.StoreInt64(&seenMax, int64(getCfg().MaxParallel))
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}
+	d := newWatchDaemon(store, run, sup)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitForNames(t, d, "alpha")
+	waitFor(t, func() bool { return atomic.LoadInt64(&seenMax) == 1 })
+	if got := fleetProjectMaxParallel(t, d, "alpha"); got != 1 {
+		t.Fatalf("dashboard max_parallel = %d, want 1 at startup", got)
+	}
+
+	// Live edit: same StateDir keeps the same flow; only MaxParallel changes.
+	edited := *cfg
+	edited.MaxParallel = 7
+	store.Set("alpha", &edited)
+
+	// The supervise loop observes the new config through the holder...
+	waitFor(t, func() bool { return atomic.LoadInt64(&seenMax) == 7 })
+	// ...and the dashboard snapshot reflects it too — both without a restart.
+	waitFor(t, func() bool { return fleetProjectMaxParallel(t, d, "alpha") == 7 })
+
+	// No new flow was started: the edit reloaded the existing one in place.
+	d.mu.Lock()
+	flows := len(d.flows)
+	d.mu.Unlock()
+	if flows != 1 {
+		t.Fatalf("flows = %d, want 1 (edit must reload in place, not restart)", flows)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancellation")
+	}
+}
+
+// fleetProjectMaxParallel reads max_parallel for the named project from the live
+// /api/v1/fleet snapshot, or -1 when the project is absent.
+func fleetProjectMaxParallel(t *testing.T, d *Daemon, name string) int {
+	t.Helper()
+	fleet := waitForFleet(t, d)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	rec := httptest.NewRecorder()
+	fleet.HandlerForTest().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/fleet = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Projects []struct {
+			Name        string `json:"name"`
+			MaxParallel int    `json:"max_parallel"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode fleet response: %v", err)
+	}
+	for _, p := range resp.Projects {
+		if p.Name == name {
+			return p.MaxParallel
+		}
+	}
+	return -1
 }
 
 func waitForNames(t *testing.T, d *Daemon, want ...string) {

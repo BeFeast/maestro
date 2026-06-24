@@ -17,11 +17,16 @@ import (
 // context. Cancelling that context (stopFlow) tears every goroutine down.
 type projectFlow struct {
 	name      string
-	key       string // stable flow identity (StateDir/Repo); the flows-map key
-	storeName string // config-store project name; "" when not store-backed (#757)
-	cfg       *config.Config
-	cancel    context.CancelFunc
-	done      chan struct{} // closed once every flow goroutine has exited
+	key       string         // stable flow identity (StateDir/Repo); the flows-map key
+	storeName string         // config-store project name; "" when not store-backed (#757)
+	cfg       *config.Config // startup config; identity (key) + logging source
+	// holder is the flow's current config, swapped by the reload pump on every
+	// config-store edit. The supervise loop reads it each cycle and the
+	// dashboard snapshot is rebuilt from it, so a live edit reaches all three
+	// readers — supervisor, dashboard, orchestrator — race-free (#768).
+	holder *configHolder
+	cancel context.CancelFunc
+	done   chan struct{} // closed once every flow goroutine has exited
 }
 
 // startFlow launches the orchestrator + supervisor loops (and the liveness
@@ -42,19 +47,29 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		key:       flowKey(cfg),
 		storeName: storeName,
 		cfg:       cfg,
+		holder:    newConfigHolder(cfg),
 		cancel:    cancel,
 		done:      make(chan struct{}),
 	}
 
-	// Per-flow hot-reload (#757): when store-watch is enabled and this flow is
-	// store-backed, feed the orchestrator a reload channel sourced from the
-	// project's row so an operator editing the config (config-store edit) is
-	// applied live, without restarting the flow or disturbing the rest of the
-	// fleet. The watcher is a child of fctx, so stopFlow drains it. nil disables
-	// reload (the orchestrator's select arm is then inert).
-	var reloadCh <-chan *config.Config
+	// Per-flow hot-reload (#757, #768): when store-watch is enabled and this
+	// flow is store-backed, watch the project's row so an operator editing the
+	// config (config-store edit) is applied live, without restarting the flow or
+	// disturbing the rest of the fleet. The watcher is a child of fctx, so
+	// stopFlow drains it.
+	//
+	// The raw watcher channel feeds a single reload PUMP (runReloadPump) — not
+	// the orchestrator directly — because a config edit must reach all three
+	// readers: the supervise loop and dashboard (via the holder, #768) and the
+	// orchestrator (via orchReloadCh, which keeps its selective reloadConfig +
+	// restart-required detection). One channel can have only one consumer, so
+	// the pump fans out. A nil watcher leaves orchReloadCh nil too, so the
+	// orchestrator's reload select arm stays inert.
+	var watchCh <-chan *config.Config
+	var orchReloadCh chan *config.Config
 	if d.projectStore != nil && storeName != "" {
-		reloadCh = configwatch.WatchStore(fctx, d.projectStore, storeName, d.opts.WatchStoreInterval)
+		watchCh = configwatch.WatchStore(fctx, d.projectStore, storeName, d.opts.WatchStoreInterval)
+		orchReloadCh = make(chan *config.Config, 1)
 	}
 
 	// Register BEFORE launching any goroutine (including the reaper below), so
@@ -72,16 +87,31 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	go func() {
 		defer wg.Done()
 		defer recoverFlow(flow, "orchestrator")
-		d.runLoop(fctx, cfg, d.opts, reloadCh)
+		// orchReloadCh (fed by the pump) is typed as <-chan; a nil channel
+		// leaves the orchestrator's reload arm inert (store-watch disabled).
+		d.runLoop(fctx, cfg, d.opts, orchReloadCh)
 	}()
 	go func() {
 		defer wg.Done()
 		defer recoverFlow(flow, "supervise")
 		// flow.name is the unique fleet display name; the supervise loop keys
 		// its decision/cycle logs on it so two same-basename repos are
-		// distinguishable in the journal, matching the watchdog (#764).
-		d.superviseLoop(fctx, flow.name, cfg, d.opts)
+		// distinguishable in the journal, matching the watchdog (#764). It reads
+		// the flow's CURRENT config through the holder each cycle (#768).
+		d.superviseLoop(fctx, flow.name, flow.holder.Load, d.opts)
 	}()
+	// Reload pump (#768): consume the store watcher and fan a config-store edit
+	// out to the holder (supervisor + dashboard) and the orchestrator. Tracked
+	// in the flow WaitGroup so stopFlow drains it before the flow is considered
+	// stopped. Only started when store-watch wired a channel.
+	if watchCh != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer recoverFlow(flow, "config-reload")
+			d.runReloadPump(fctx, flow, watchCh, orchReloadCh)
+		}()
+	}
 	// Phase 1.2 (#499) liveness watchdog, one per flow — tracked in the flow
 	// WaitGroup (#764 P2). The watchdog itself no-ops on a non-positive
 	// interval; gate here too so we never spawn a goroutine that immediately
@@ -168,6 +198,60 @@ func recoverFlow(flow *projectFlow, loop string) {
 	}
 }
 
+// runReloadPump is the single consumer of a flow's store watcher (#768). On
+// each config-store edit it fans the freshly loaded config out so all three
+// runtime readers see it without a flow restart:
+//
+//   - the holder — read each cycle by the supervise loop and used to rebuild
+//     the dashboard snapshot, so a changed supervisor policy / labels / etc.
+//     is applied LIVE (the gap #767 left: reload reached only the orchestrator);
+//   - the FleetServer project entry — replaced in place so /api/v1/fleet
+//     reflects the new config, and AddProject re-derives fleet auth so a newly
+//     token-bearing edit starts enforcing auth (#768);
+//   - the orchestrator — forwarded on orchReloadCh, which keeps its selective
+//     reloadConfig (restart-required detection, ticker reset) over a private
+//     shallow copy.
+//
+// The pump exits on ctx cancellation or when the watcher closes its channel on
+// shutdown. It never closes orchReloadCh: a closed channel would spin the
+// orchestrator's select on a nil config.
+func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <-chan *config.Config, orchReloadCh chan<- *config.Config) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case newCfg, ok := <-watchCh:
+			if !ok {
+				// Watcher closed its channel (flow shutdown); nothing more to pump.
+				return
+			}
+			if newCfg == nil {
+				continue
+			}
+			// Holder first, so the supervise loop's next cycle and the rebuilt
+			// dashboard snapshot below both observe the new config.
+			flow.holder.Store(newCfg)
+
+			// Replace the project in the fleet so /api/v1/fleet reflects the edit
+			// and fleet auth is re-derived. d.Fleet() is nil only during the brief
+			// startup window before Run publishes it; no reload can arrive that
+			// early, but tolerate nil to be safe.
+			if fleet := d.Fleet(); fleet != nil {
+				fleet.AddProject(server.NewFleetProjectWithGitHubNamed(flow.name, newCfg))
+			}
+
+			// Forward to the orchestrator. Non-blocking with drop-if-not-drained,
+			// matching configwatch's own buffered-depth-1 semantics: if the
+			// orchestrator is mid-cycle and has not drained the previous reload, it
+			// applies the next edit on the following tick.
+			select {
+			case orchReloadCh <- newCfg:
+			default:
+			}
+		}
+	}
+}
+
 // runOrchestrator is the production run loop for one flow. It mirrors the
 // single-project branch of `maestro run` minus the per-project HTTP server
 // (the daemon serves one shared FleetServer instead) and minus the fatal exit
@@ -175,28 +259,28 @@ func recoverFlow(flow *projectFlow, loop string) {
 // daemon down (#756). orchestrator.Run already log-and-continues on per-cycle
 // errors and returns nil on ctx cancellation.
 //
-// Store-driven hot-reload (#757): reloadCh is fed by configwatch.WatchStore from
-// the project's config-store row (the daemon's source of truth, #754), wired in
-// by startFlow. The daemon deliberately does NOT watch the import-time YAML — a
-// file the store supersedes — which would let the run loop drift from the
-// supervise loop. A nil reloadCh (store-watch disabled) leaves the orchestrator's
-// reload select arm inert.
+// Store-driven hot-reload (#757): reloadCh is fed by the flow's reload pump
+// (runReloadPump), which sources it from configwatch.WatchStore over the
+// project's config-store row (the daemon's source of truth, #754). The daemon
+// deliberately does NOT watch the import-time YAML — a file the store supersedes
+// — which would let the run loop drift from the supervise loop. A nil reloadCh
+// (store-watch disabled) leaves the orchestrator's reload select arm inert.
 func runOrchestrator(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config) {
 	// Hot-reload (reloadCh, #757) makes the orchestrator's reloadConfig mutate
 	// its config in place (field replacement). The supervise loop and the
-	// FleetProject HTTP snapshot share this exact cfg pointer, so hand the
-	// orchestrator a private shallow copy to mutate — the shared struct the
-	// other goroutines read is then never written, closing the reload data race.
-	// reloadConfig only REPLACES fields (o.cfg.X = newCfg.X), never mutates a
-	// slice/map element in place, so a shallow copy fully isolates it.
+	// FleetProject HTTP snapshot read the flow's config through a shared holder
+	// (#768) that the reload pump swaps atomically, so hand the orchestrator a
+	// private shallow copy to mutate — nothing the other goroutines read is ever
+	// written in place, keeping the #767 reload data race closed. reloadConfig
+	// only REPLACES fields (o.cfg.X = newCfg.X), never mutates a slice/map
+	// element in place, so a shallow copy fully isolates it.
 	//
-	// Trade-off / known limitation: a config-store edit is now applied LIVE only
-	// to the orchestrator. The supervise loop and the dashboard snapshot keep the
-	// startup config until the flow restarts — same as before #757, which had no
-	// daemon reload at all, so this is strictly better than main, not a regression.
-	// Making all three live-reload safely needs a synchronized config holder
-	// shared across orchestrator + supervisor + FleetProject — a follow-up, not an
-	// in-place mutation (which is the data race this copy removes).
+	// As of #768 a config-store edit reaches all three readers live: the pump
+	// stores the new config in the holder (supervisor + dashboard) and forwards
+	// it here for the orchestrator's selective reload. The orchestrator keeps the
+	// private-copy reload (rather than reading the holder) because reloadConfig
+	// detects restart-required fields and resets the poll ticker — it needs the
+	// reload event, not just the latest value.
 	orchCfg := *cfg
 	orch := orchestrator.New(&orchCfg)
 	orch.SetBinaryVersion(opts.Version)

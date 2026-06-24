@@ -52,8 +52,9 @@ func (lt *loopTracker) loop(ctx context.Context, cfg *config.Config, opts Option
 }
 
 // superviseLoop is the supervise-shaped stub (the supervise loop takes the
-// flow's unique name as its first arg, #764). It records the same counters.
-func (lt *loopTracker) superviseLoop(ctx context.Context, name string, cfg *config.Config, opts Options) {
+// flow's unique name and a current-config getter, #764/#768). It records the
+// same counters.
+func (lt *loopTracker) superviseLoop(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
 	atomic.AddInt64(&lt.started, 1)
 	<-ctx.Done()
 	atomic.AddInt64(&lt.stopped, 1)
@@ -64,7 +65,7 @@ func (lt *loopTracker) superviseLoop(ctx context.Context, name string, cfg *conf
 // this helper stay isolated from the real supervisor.Watchdog goroutine — a
 // future change to its shutdown path must not silently break these lifecycle
 // tests. Tests that assert watchdog behaviour install their own stub.
-func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, *config.Config, Options)) *Daemon {
+func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, func() *config.Config, Options)) *Daemon {
 	d := New(loader, Options{Host: "127.0.0.1", Port: 0})
 	if run != nil {
 		d.runLoop = run
@@ -308,7 +309,7 @@ func TestFlowPanicCancelsFlow(t *testing.T) {
 	// on its own; no one calls stopFlow.
 	cfg := testConfig(t, "owner/panicky")
 	var supStarted, supStopped int64
-	supervise := func(ctx context.Context, name string, c *config.Config, o Options) {
+	supervise := func(ctx context.Context, name string, getCfg func() *config.Config, o Options) {
 		atomic.AddInt64(&supStarted, 1)
 		<-ctx.Done()
 		atomic.AddInt64(&supStopped, 1)
@@ -371,7 +372,9 @@ func TestRunSurfacesFleetBindErrorImmediately(t *testing.T) {
 	}
 	d := New(fakeLoader{cfgs: []*config.Config{cfg}}, Options{Host: "127.0.0.1", Port: port})
 	d.runLoop = blockingLoop
-	d.superviseLoop = func(ctx context.Context, name string, c *config.Config, o Options) { blockingLoop(ctx, c, o, nil) }
+	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, o Options) {
+		blockingLoop(ctx, getCfg(), o, nil)
+	}
 	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {}
 
 	// ctx is intentionally never cancelled within the deadline.

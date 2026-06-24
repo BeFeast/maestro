@@ -255,11 +255,18 @@ type FleetServer struct {
 	port       int
 	readOnly   bool
 	srv        *http.Server
+	// authMu guards auth so the daemon can re-derive the fleet token when a
+	// project is hot-added/removed/edited (#768) while HTTP handlers read it
+	// concurrently. Writes go through SetAuth / reauthLocked; reads through
+	// authChecker(). #768 makes SetAuth a RUNTIME write (AddProject/RemoveProject
+	// re-derive auth), which without this lock would race the handlers reading
+	// s.auth — a data race under `go test -race`.
+	authMu sync.RWMutex
 	// auth gates every mutating fleet endpoint (#487, write-path premortem
 	// #4). When the resolved token is empty the checker is disabled and
 	// behaviour is unchanged; when non-empty, /api/v1/fleet/actions,
 	// /api/v1/fleet/approvals/{id}/{approve|reject}, and /api/v1/audit/log
-	// require Authorization: Bearer <token>.
+	// require Authorization: Bearer <token>. Always accessed under authMu.
 	auth authChecker
 }
 
@@ -289,6 +296,12 @@ func (s *FleetServer) projectsSnapshot() []FleetProject {
 // whose Name already exists is replaced in place rather than duplicated, so the
 // fleet's by-name addressing (findProject) stays unambiguous. Safe for
 // concurrent use with the HTTP read paths.
+//
+// The fleet's shared auth token is re-derived from the resulting project set
+// (#768): a hot-added project whose config carries server.auth.token_env starts
+// enforcing auth on the mutating endpoints without a daemon restart. Editing a
+// project's row goes through the same path (the daemon replaces the project in
+// place on reload).
 func (s *FleetServer) AddProject(p FleetProject) {
 	if s == nil {
 		return
@@ -298,15 +311,18 @@ func (s *FleetServer) AddProject(p FleetProject) {
 	for i := range s.projects {
 		if s.projects[i].Name == p.Name {
 			s.projects[i] = p
+			s.reauthLocked()
 			return
 		}
 	}
 	s.projects = append(s.projects, p)
+	s.reauthLocked()
 }
 
 // RemoveProject drops the project with the given fleet name (daemon hot-remove,
 // #757) and reports whether one was found. Safe for concurrent use with the
-// HTTP read paths.
+// HTTP read paths. The shared auth token is re-derived from the remaining set
+// (#768) — removing the last token-bearing project disables auth again.
 func (s *FleetServer) RemoveProject(name string) bool {
 	if s == nil {
 		return false
@@ -316,20 +332,31 @@ func (s *FleetServer) RemoveProject(name string) bool {
 	for i := range s.projects {
 		if s.projects[i].Name == name {
 			s.projects = append(s.projects[:i], s.projects[i+1:]...)
+			s.reauthLocked()
 			return true
 		}
 	}
 	return false
 }
 
+// reauthLocked re-derives the fleet's shared auth token from the current
+// project set and stores it under authMu (#768). The caller MUST hold
+// projectsMu (lock order projectsMu→authMu), so the project mutation and the
+// auth derivation it implies are one atomic step as far as any concurrent
+// handler is concerned.
+func (s *FleetServer) reauthLocked() {
+	s.setAuthChecker(newAuthChecker(FleetAuthFromProjects(s.projects)))
+}
+
 // SetAuth configures fleet-level auth from the operator's resolved
 // ServerAuthConfig. Empty token leaves auth disabled (backward-compat).
-// Call this BEFORE Start.
+// Safe to call before Start and at runtime (the handlers read the checker
+// live, #768).
 func (s *FleetServer) SetAuth(cfg config.ServerAuthConfig) {
 	if s == nil {
 		return
 	}
-	s.auth = newAuthChecker(cfg)
+	s.setAuthChecker(newAuthChecker(cfg))
 }
 
 // SetAuthForTest replaces the auth checker. Test-only helper.
@@ -337,7 +364,24 @@ func (s *FleetServer) SetAuthForTest(token, actorName string) {
 	if s == nil {
 		return
 	}
-	s.auth = newAuthCheckerForTest(token, actorName)
+	s.setAuthChecker(newAuthCheckerForTest(token, actorName))
+}
+
+// setAuthChecker stores the auth checker under authMu.
+func (s *FleetServer) setAuthChecker(a authChecker) {
+	s.authMu.Lock()
+	s.auth = a
+	s.authMu.Unlock()
+}
+
+// authChecker returns the live auth checker under the read lock. Every fleet
+// handler reads through this so a runtime SetAuth / hot-add re-derivation is
+// applied to the next request without a server rebuild and without racing the
+// write (#768).
+func (s *FleetServer) authChecker() authChecker {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.auth
 }
 
 // buildHandler returns the fleet mux wrapped with the auth middleware.
@@ -346,6 +390,11 @@ func (s *FleetServer) SetAuthForTest(token, actorName string) {
 // POSTs — rejects unauthenticated requests with 401 before the inner
 // handler runs. When auth is disabled (default LAN posture), the
 // middleware is a pass-through.
+//
+// The middleware reads the live checker per request (#768) rather than
+// capturing it at build time, so a hot-add that enables auth gates the read
+// path too — not only the mutating endpoints (which read s.authChecker()
+// directly).
 func (s *FleetServer) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
@@ -356,7 +405,9 @@ func (s *FleetServer) buildHandler() http.Handler {
 	mux.HandleFunc("/approvals/audit", s.handleFleetApprovalAudit)
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleFleetDashboard)
-	return authMiddleware(mux, s.auth)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authMiddleware(mux, s.authChecker()).ServeHTTP(w, r)
+	})
 }
 
 // HandlerForTest exposes the wrapped handler so tests can exercise the
@@ -1045,7 +1096,7 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 	// #487: auth fires BEFORE the read-only gate so an unauthenticated POST
 	// always sees 401 (never 403/405). Spec: "every mutating POST without a
 	// valid credential returns 401".
-	authenticatedActor, ok := requireAuth(w, r, s.auth)
+	authenticatedActor, ok := requireAuth(w, r, s.authChecker())
 	if !ok {
 		return
 	}
@@ -1152,7 +1203,7 @@ func (s *FleetServer) handleFleetAuditLog(w http.ResponseWriter, r *http.Request
 	// arbitrary entries that bury the real attack signal under noise. Auth
 	// fires BEFORE payload parsing so probes cannot enumerate the project
 	// list via 400 differences.
-	authenticatedActor, ok := requireAuth(w, r, s.auth)
+	authenticatedActor, ok := requireAuth(w, r, s.authChecker())
 	if !ok {
 		return
 	}
