@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -241,6 +242,18 @@ func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
 // tests), the drift-based trigger stays off.
 func (o *Orchestrator) SetBinaryVersion(v string) {
 	o.binaryVersion = strings.TrimSpace(v)
+}
+
+// SetSelfDeployStartFn installs a custom self-deploy launcher, replacing the
+// default in-process selfdeploy.Trigger. The daemon (#758) wires this to its
+// centralized, cross-flow-debounced RequestSelfDeploy so N flows merging PRs
+// near-simultaneously launch exactly ONE deploy of ONE unit instead of each
+// flow firing its own — a thundering herd that bounces the fleet mid-verify
+// (#722). A launcher that returns selfdeploy.ErrDebounced signals the request
+// was dropped by the central debounce, which the trigger paths treat as a
+// benign skip rather than a failure.
+func (o *Orchestrator) SetSelfDeployStartFn(fn func(prNumber int) error) {
+	o.selfDeployStartFn = fn
 }
 
 // mainHeadSHA returns origin/main's current head commit SHA.
@@ -4065,6 +4078,14 @@ func (o *Orchestrator) maybeSelfDeployAfterMerge(s *state.State, prNumber int) {
 		}
 	}
 	if err := o.triggerSelfDeploy(prNumber); err != nil {
+		// #758: the central (daemon) launcher debounced this request — another
+		// flow's deploy already covers this merge wave. Not a failure: don't
+		// notify, don't record a finding, and don't write a per-flow marker
+		// (the central marker owns the debounce). A later merge re-checks.
+		if errors.Is(err, selfdeploy.ErrDebounced) {
+			log.Printf("[orch] self-deploy for PR #%d debounced centrally — another flow's deploy covers this wave", prNumber)
+			return
+		}
 		log.Printf("[orch] self-deploy trigger failed for PR #%d: %v", prNumber, err)
 		o.notifier.Sendf("⚠️ maestro: self-deploy trigger failed after PR #%d merge: %v — fleet still on the previous binary", prNumber, err)
 		// #742: surface the failure as a supervisor finding so a merge that
@@ -4136,6 +4157,12 @@ func (o *Orchestrator) maybeSelfDeployOnMainAdvance(s *state.State) {
 	// PR 0: this deploy was triggered by observing main advance, not by a merge
 	// the orchestrator performed itself.
 	if err := o.triggerSelfDeploy(0); err != nil {
+		// #758: debounced by the central (daemon) launcher — another flow already
+		// fired a deploy for the same main-advance wave. Benign skip.
+		if errors.Is(err, selfdeploy.ErrDebounced) {
+			log.Printf("[orch] self-deploy (main-advance) debounced centrally — another flow's deploy covers this wave")
+			return
+		}
 		log.Printf("[orch] self-deploy (main-advance) trigger failed: %v", err)
 		o.notifier.Sendf("⚠️ maestro: self-deploy trigger failed after observing origin/main advance: %v — fleet still on the previous binary", err)
 		// Surface as a supervisor finding so a silently-undeployed external merge

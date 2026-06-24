@@ -137,6 +137,33 @@ func TestMaybeSelfDeployAfterMerge_FiresAfterWindow(t *testing.T) {
 	}
 }
 
+// #758: when the central (daemon) launcher debounces a request — another flow's
+// deploy already covers this merge wave — the orchestrator treats it as a benign
+// skip: no failure finding, no per-flow trigger marker, so a later merge
+// re-checks rather than being suppressed by a false-success marker.
+func TestMaybeSelfDeployAfterMerge_CentralDebounceIsBenignSkip(t *testing.T) {
+	stateDir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:       "owner/repo",
+			StateDir:   stateDir,
+			SelfDeploy: config.SelfDeployConfig{Enabled: true, MinIntervalMinutes: 30},
+		},
+		notifier:          &notify.Notifier{},
+		selfDeployStartFn: func(prNumber int) error { return selfdeploy.ErrDebounced },
+	}
+	s := &state.State{}
+
+	o.maybeSelfDeployAfterMerge(s, 758)
+
+	if len(s.SupervisorDecisions) != 0 {
+		t.Fatalf("decisions recorded = %d, want 0 (debounce is not a failure)", len(s.SupervisorDecisions))
+	}
+	if _, _, ok := selfdeploy.LastTrigger(stateDir); ok {
+		t.Error("per-flow trigger marker recorded on a central debounce — would suppress the next merge")
+	}
+}
+
 // #751: a PR merged outside the orchestrator's own merge path advances
 // origin/main past the running binary; the next cycle observes the drift and
 // fires exactly one debounced self-deploy. A second cycle within the window

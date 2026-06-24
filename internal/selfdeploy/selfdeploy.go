@@ -21,6 +21,7 @@ package selfdeploy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -33,6 +34,15 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 )
+
+// ErrDebounced reports that a self-deploy request was dropped because another
+// deploy already fired within the debounce window — not that the trigger
+// failed. The daemon's centralized RequestSelfDeploy returns it so N flows
+// merging PRs near-simultaneously launch exactly ONE deploy of ONE unit (#758):
+// the first request in a wave deploys, the rest see ErrDebounced. Callers must
+// treat it as a benign skip (no failure finding, no "deploy started" notice),
+// distinct from a real launcher failure (systemd-run rejected the unit).
+var ErrDebounced = errors.New("self-deploy: debounced (recent trigger within window)")
 
 // Result statuses written by scripts/self-deploy.sh.
 const (

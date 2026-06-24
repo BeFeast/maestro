@@ -23,6 +23,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
+	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/supervisor"
 )
@@ -68,6 +69,16 @@ type Options struct {
 	// ReadOnly disables the fleet's mutating HTTP endpoints.
 	ReadOnly bool
 
+	// SelfDeployStateDir is the shared directory the centralized self-deploy
+	// debounce marker lives in (#758). The orchestrator flows no longer each fire
+	// their own selfdeploy.Trigger; they signal Daemon.RequestSelfDeploy, which
+	// debounces on a SINGLE marker so N flows merging PRs near-simultaneously
+	// launch exactly ONE deploy of ONE unit. A per-flow StateDir cannot dedup
+	// across flows, so the daemon owns one shared marker dir that also survives
+	// the daemon being restarted by its own deploy (#722). Blank disables the
+	// on-disk marker; the in-process mutex still dedups within a single run.
+	SelfDeployStateDir string
+
 	// WatchStore enables DB-driven hot add/remove/reload of projects (#757):
 	// a diff-loop over the store's ProjectsFingerprint starts a flow for a new
 	// project name and drains one for a removed name, and each flow's
@@ -95,6 +106,27 @@ type Daemon struct {
 	mu    sync.Mutex
 	fleet *server.FleetServer
 	flows map[string]*projectFlow
+
+	// Centralized self-deploy (#758). RequestSelfDeploy serializes on
+	// selfDeployMu and debounces on a single marker — the in-memory
+	// selfDeployLast (deterministic within this process) plus the on-disk marker
+	// in opts.SelfDeployStateDir (survives the daemon restarting itself) — so a
+	// burst of merges across flows fires exactly ONE deploy. selfDeployTrigger is
+	// the launcher, defaulting to selfdeploy.Trigger; tests override it to count
+	// launches without touching systemd.
+	selfDeployMu      sync.Mutex
+	selfDeployLast    time.Time
+	selfDeployLastPR  int
+	selfDeployTrigger func(cfg *config.Config, prNumber int) error
+	// selfDeployWindow is the longest debounce window any flow has requested, so
+	// the shared marker debounces on the max — a short-window flow cannot bypass
+	// a long-window flow's in-flight deploy (#758). Guarded by selfDeployMu.
+	selfDeployWindow time.Duration
+	// fleetAuthTokenEnv is the env var of the fleet's single shared auth token
+	// (server.FleetAuthFromProjects over the startup project set), used to
+	// authenticate the post-merge self-deploy health probe against /api/v1/fleet
+	// (#758). Set once in Run before flows start, then read-only.
+	fleetAuthTokenEnv string
 
 	// runLoop, superviseLoop, and watchdogLoop build the per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
@@ -145,11 +177,13 @@ func New(store ConfigLoader, opts Options) *Daemon {
 			log.Printf("[daemon] --watch-store requested but the config store does not support per-project reload; disabling hot add/remove/reload")
 		}
 	}
-	d.runLoop = runOrchestrator
+	d.runLoop = d.runOrchestrator
 	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
 		runSupervise(ctx, name, getCfg, opts.SuperviseInterval)
 	}
 	d.watchdogLoop = supervisor.Watchdog
+	// Default to the real launcher; tests swap it for a counter (#758).
+	d.selfDeployTrigger = selfdeploy.Trigger
 	return d
 }
 
@@ -217,7 +251,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// One FleetServer for the whole fleet — replaces the N per-project
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
-	fleet.SetAuth(server.FleetAuthFromProjects(projects))
+	fleetAuth := server.FleetAuthFromProjects(projects)
+	fleet.SetAuth(fleetAuth)
+	// Capture the fleet's shared auth token env so the self-deploy health probe
+	// authenticates against /api/v1/fleet with the SAME token the server enforces
+	// — not the triggering flow's, which may differ or be empty (#758). Set here,
+	// before any flow starts, so RequestSelfDeploy reads it race-free.
+	d.fleetAuthTokenEnv = strings.TrimSpace(fleetAuth.TokenEnv)
 
 	// Bind the fleet port BEFORE starting any flow. If the port is already held
 	// (a legacy maestro@ unit, a second daemon), Listen fails here and we abort

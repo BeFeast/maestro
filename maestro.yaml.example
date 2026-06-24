@@ -130,11 +130,17 @@ worker_prompt: /path/to/worker-prompt-template.md
 # honored via the units' stop path), verifies the restarted process reports
 # the new version, and rolls back to .prev on failure. See
 # docs/self-deploy-runbook.md.
+#
+# Under `maestro daemon` (#758) the trigger is centralized: N project flows
+# restart ONE shared maestro.service unit, so the daemon debounces every flow
+# against a single marker — a wave of merges launches exactly one deploy of one
+# unit — and routes the health probe to the single fleet endpoint
+# (http://<host>:<port>/api/v1/fleet, default :8786).
 # self_deploy:
 #   enabled: true
 #   bin_path: /usr/local/bin/maestro   # default: path of the running binary
-#   units: ["maestro.service"]         # systemd user units to restart
-#   # health_url: http://127.0.0.1:8788/api/v1/state  # default: derived from server.port
+#   units: ["maestro.service"]         # systemd unit(s) to restart (default: one — maestro.service)
+#   # health_url: http://127.0.0.1:8788/api/v1/state  # default: derived from server.port (daemon: the fleet endpoint)
 #   # health_token_env: MAESTRO_DASH_TOKEN            # default: server.auth.token_env
 #   # script: ./scripts/self-deploy.sh                # default: <local_path>/scripts/self-deploy.sh
 #   # timeout_minutes: 30                             # build+restart+verify budget (covers drain)

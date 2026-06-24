@@ -39,13 +39,18 @@ func daemonCmd(args []string) {
 	defer store.Close()
 
 	d := daemon.New(store, daemon.Options{
-		Host:               *host,
-		Port:               *port,
-		RunInterval:        *runInterval,
-		SuperviseInterval:  *superviseInterval,
-		PromptPath:         *promptPath,
-		Version:            resolveVersion(),
-		ReadOnly:           *readOnly,
+		Host:              *host,
+		Port:              *port,
+		RunInterval:       *runInterval,
+		SuperviseInterval: *superviseInterval,
+		PromptPath:        *promptPath,
+		Version:           resolveVersion(),
+		ReadOnly:          *readOnly,
+		// Centralized self-deploy debounce marker (#758): one shared location next
+		// to the config store so every flow's RequestSelfDeploy debounces on the
+		// same marker, and it survives the daemon being restarted by its own
+		// deploy (#722).
+		SelfDeployStateDir: filepath.Join(filepath.Dir(*storePath), "self-deploy"),
 		WatchStore:         *watchStore,
 		WatchStoreInterval: *watchStoreInterval,
 	})
