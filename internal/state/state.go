@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/befeast/maestro/internal/outcome"
@@ -1269,6 +1270,40 @@ func Load(stateDir string) (*State, error) {
 	return s, nil
 }
 
+// SaveHook is invoked after every successful Save, with the state dir that was
+// written and the just-persisted snapshot. It is the single write-through
+// chokepoint that lets a long-lived process (the daemon) mirror EVERY state.Save
+// — orchestrator, supervisor, watchdog, server action — into a secondary store
+// (the shared maestro.db, #760) without threading a store handle through every
+// call site. The hook runs synchronously while the per-state flock is STILL held,
+// so the mirror write is serialised with the JSON write: two concurrent Saves for
+// the same dir mirror in the order they wrote JSON, and the mirror can never
+// settle on a snapshot older than the JSON. A hook MUST NOT re-enter Save/Load
+// for stateDir (it already holds the flock) and should be fast. A nil hook (the
+// default) leaves the JSON-only path unchanged.
+type SaveHook func(stateDir string, s *State)
+
+var (
+	saveHookMu sync.RWMutex
+	saveHook   SaveHook
+)
+
+// SetSaveHook installs (or clears, with nil) the process-global write-through
+// hook invoked after every successful Save. It is process-global because Save is
+// a free function reached from many packages; the daemon sets it once when the
+// SQLite mirror is enabled and clears it otherwise.
+func SetSaveHook(h SaveHook) {
+	saveHookMu.Lock()
+	saveHook = h
+	saveHookMu.Unlock()
+}
+
+func currentSaveHook() SaveHook {
+	saveHookMu.RLock()
+	defer saveHookMu.RUnlock()
+	return saveHook
+}
+
 func Save(stateDir string, s *State) error {
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
@@ -1279,7 +1314,18 @@ func Save(stateDir string, s *State) error {
 	}
 	defer unlock()
 
-	return saveLocked(stateDir, s)
+	if err := saveLocked(stateDir, s); err != nil {
+		return err
+	}
+	// Write-through mirror (#760): replicate the just-persisted snapshot into the
+	// secondary store while STILL holding the flock, so the mirror is serialised
+	// with the JSON write and cannot regress to an older snapshot under concurrent
+	// Saves. Nil unless the daemon registered a mirror, so the JSON-only path is
+	// unchanged.
+	if hook := currentSaveHook(); hook != nil {
+		hook(stateDir, s)
+	}
+	return nil
 }
 
 func saveLocked(stateDir string, s *State) error {

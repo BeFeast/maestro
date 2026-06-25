@@ -26,6 +26,8 @@ import (
 	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/server"
+	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/statestore"
 	"github.com/befeast/maestro/internal/supervisor"
 )
 
@@ -100,6 +102,16 @@ type Options struct {
 	// ApprovalsDBPath is the shared SQLite approvals database used when
 	// ApprovalsStore is "sqlite".
 	ApprovalsDBPath string
+
+	// StateStore selects the store backing the remaining orchestration state —
+	// sessions/decisions/backend-health/missions (#760): "json" (default) keeps
+	// per-project state.json as the only store; "sqlite" write-through-mirrors
+	// every project's state into the shared maestro.db on startup and after each
+	// Save so cross-project SQL queries are available. Empty is treated as json.
+	StateStore string
+	// StateDBPath is the shared SQLite state database used when StateStore is
+	// "sqlite" (defaults to the same maestro.db the approvals store uses).
+	StateDBPath string
 }
 
 // Daemon owns the running project flows and the shared FleetServer.
@@ -239,6 +251,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	usedNames := make(map[string]bool, len(named))
 	projects := make([]server.FleetProject, 0, len(named))
 	storeNames := make([]string, 0, len(named))
+	// importCfgs mirrors the deduped project configs so the startup state import
+	// (#760) and the fleet wiring see exactly the projects that became flows.
+	importCfgs := make([]*config.Config, 0, len(named))
 	for _, nc := range named {
 		cfg := nc.cfg
 		if cfg == nil {
@@ -257,6 +272,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		name := server.UniqueFleetName(cfg.Repo, usedNames)
 		projects = append(projects, server.NewFleetProjectWithGitHubNamed(name, cfg))
 		storeNames = append(storeNames, nc.name)
+		importCfgs = append(importCfgs, cfg)
 	}
 
 	// One FleetServer for the whole fleet — replaces the N per-project
@@ -268,6 +284,45 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if err := fleet.SetApprovalStore(approvalsMode, d.opts.ApprovalsDBPath); err != nil {
 		return fmt.Errorf("open approvals store %s: %w", d.opts.ApprovalsDBPath, err)
+	}
+	stateMode, err := statestore.ParseMode(d.opts.StateStore)
+	if err != nil {
+		return err
+	}
+	if err := fleet.SetStateStore(stateMode, d.opts.StateDBPath); err != nil {
+		return fmt.Errorf("open state store %s: %w", d.opts.StateDBPath, err)
+	}
+	// One-shot startup import (#760): mirror each project's existing state.json
+	// into the shared maestro.db so a cross-project query is answered from
+	// SQLite from the first tick. Idempotent — ImportState replaces a project's
+	// rows wholesale, so a re-run (daemon restart) re-converges. A per-project
+	// import failure is non-fatal: JSON stays authoritative and the fleet read
+	// path re-mirrors on its next snapshot.
+	if store := fleet.StateStore(); store != nil {
+		// keep is the CURRENT fleet's state dirs, built from importCfgs regardless
+		// of per-project import success, so a transient load/import error below
+		// never prunes a live project's rows.
+		keep := make([]string, 0, len(importCfgs))
+		for _, cfg := range importCfgs {
+			keep = append(keep, cfg.StateDir)
+			st, lerr := state.Load(cfg.StateDir)
+			if lerr != nil {
+				log.Printf("[daemon] state import skip (repo=%s state_dir=%s): load failed: %v", cfg.Repo, cfg.StateDir, lerr)
+				continue
+			}
+			rb := statestore.RowBinding{Project: cfg.Repo, Repo: cfg.Repo, StateDir: cfg.StateDir}
+			if ierr := store.ImportState(ctx, rb, st); ierr != nil {
+				log.Printf("[daemon] state import failed (repo=%s state_dir=%s): %v", cfg.Repo, cfg.StateDir, ierr)
+				continue
+			}
+			log.Printf("[daemon] imported state.json → maestro.db (repo=%s state_dir=%s, %d sessions)", cfg.Repo, cfg.StateDir, len(st.Sessions))
+		}
+		// Drop rows for projects no longer in the fleet (removed from the config
+		// store while the daemon was stopped). Without this, a cross-project query
+		// keeps returning sessions/health for a project that is not running (#760).
+		if perr := store.RetainStateDirs(ctx, keep); perr != nil {
+			log.Printf("[daemon] state prune (drop removed-project rows) failed: %v", perr)
+		}
 	}
 	fleetAuth := server.FleetAuthFromProjects(projects)
 	fleet.SetAuth(fleetAuth)
