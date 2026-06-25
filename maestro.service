@@ -1,0 +1,32 @@
+[Unit]
+# Single-service Maestro (epic #754, Phase 6 cutover): one maestro.service runs
+# `maestro daemon`, which drives EVERY config-store project in one process — an
+# orchestrator + supervisor loop per project plus one aggregating fleet web
+# server on :8786. It replaces the old per-project topology (the maestro@.service
+# template + per-project supervise/serve units, ~15 units in total).
+Description=Maestro agent orchestrator (single-service daemon, all projects)
+After=network.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# One unified SQLite database (%h/.maestro/maestro.db) holds config + approvals +
+# state; --approvals-db / --state-db default to that same file. --watch-store lets
+# the daemon hot add/remove/reload projects from the store (and powers dashboard
+# project CRUD: POST/DELETE /api/v1/fleet/projects) without a restart.
+ExecStart=/usr/local/bin/maestro daemon \
+    --store %h/.maestro/maestro.db \
+    --port 8786 \
+    --watch-store \
+    --approvals-store sqlite \
+    --state-store sqlite
+# Graceful in-process drain on SIGTERM: the daemon sets SpawnDrain on every flow
+# (no new workers) and waits for in-flight workers to finish — there is no
+# per-unit ExecStop=maestro drain anymore. Give it room before SIGKILL; the
+# daemon's own --drain-timeout (default 25m) finishes inside this window.
+TimeoutStopSec=30min
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

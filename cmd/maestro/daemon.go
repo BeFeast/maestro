@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/configstore"
@@ -34,9 +35,11 @@ func daemonCmd(args []string) {
 	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "Shared SQLite approvals db path (used with --approvals-store=sqlite)")
 	stateStore := fs.String("state-store", "json", "State store backend for sessions/decisions/health/missions: json|sqlite (write-through mirror, #760)")
 	stateDB := fs.String("state-db", statestore.DefaultDBPath(), "Shared SQLite state db path (used with --state-store=sqlite)")
+	drainTimeout := fs.Duration("drain-timeout", daemon.DefaultDrainTimeout, "Max time the SIGTERM in-process drain waits for in-flight workers to finish (#761)")
 	fs.Parse(args)
 
-	ctx := signalContext()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	store, err := configstore.Open(*storePath)
 	if err != nil {
@@ -65,24 +68,42 @@ func daemonCmd(args []string) {
 		StateDBPath:        *stateDB,
 	})
 
+	go handleDaemonSignals(ctx, cancel, d, *drainTimeout)
+
 	log.Printf("starting maestro daemon — store=%s addr=%s:%d", *storePath, *host, *port)
 	if err := d.Run(ctx); err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
 }
 
-// signalContext returns a context cancelled on SIGINT/SIGTERM so the daemon
-// drains its flows and shuts the fleet server down gracefully.
-func signalContext() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-	sigCh := make(chan os.Signal, 1)
+// handleDaemonSignals implements the two-phase shutdown the single-service
+// cutover needs (#761). The FIRST SIGINT/SIGTERM triggers a graceful, in-process
+// drain — SpawnDrain on every flow, then wait for in-flight workers — while the
+// flows are still live; only then is the daemon ctx cancelled, tearing the now
+// idle flows down. A SECOND signal aborts the drain wait and forces immediate
+// shutdown. It returns if the daemon stops on its own (ctx already done) before
+// any signal arrives.
+func handleDaemonSignals(ctx context.Context, cancel context.CancelFunc, d *daemon.Daemon, drainTimeout time.Duration) {
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-ctx.Done():
+		return
+	case <-sigCh:
+	}
+	log.Printf("received signal — draining flows in-process (no new workers; up to %s); send the signal again to force shutdown", drainTimeout)
+	drainCtx, abortDrain := context.WithCancel(ctx)
+	defer abortDrain()
 	go func() {
-		<-sigCh
-		log.Printf("received signal, shutting down daemon...")
-		cancel()
+		select {
+		case <-sigCh:
+			log.Printf("received second signal — aborting drain and shutting down now")
+			abortDrain()
+		case <-drainCtx.Done():
+		}
 	}()
-	return ctx
+	d.Drain(drainCtx, drainTimeout)
+	cancel()
 }
 
 // defaultConfigStorePath mirrors the config-store default used elsewhere
