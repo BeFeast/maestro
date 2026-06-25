@@ -14,7 +14,14 @@ Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/us
 # state; --approvals-db / --state-db default to that same file. --watch-store lets
 # the daemon hot add/remove/reload projects from the store (and powers dashboard
 # project CRUD: POST/DELETE /api/v1/fleet/projects) without a restart.
+# --host 0.0.0.0 binds the fleet web server on all interfaces so the Mission
+# Control dashboard is reachable on the LAN (http://<host>:8786/), matching the
+# retired per-project maestro-fleet-web unit (which ran `serve --host 0.0.0.0`).
+# Without it the daemon's default 127.0.0.1 bind makes the dashboard reachable
+# only from the host itself. The cautious approval gate — not the network bind —
+# is the write-path safety boundary.
 ExecStart=/usr/local/bin/maestro daemon \
+    --host 0.0.0.0 \
     --store %h/.maestro/maestro.db \
     --port 8786 \
     --watch-store \
