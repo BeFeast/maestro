@@ -205,32 +205,86 @@ ON CONFLICT(name) DO UPDATE SET source_path = excluded.source_path, config_yaml 
 }
 
 // upsertSharedBackendsTx inserts/updates the shared backend definitions
-// detached from a project's YAML. It mirrors importProject's behavior:
-// a backend whose definition differs from one already stored is rejected,
-// so two projects can share a backend only when their definitions agree.
+// detached from a project's YAML. Two projects may define the same backend
+// with an identical cmd but different optional metadata (provider / model /
+// pricing / effort) — that is not a real conflict, so the definitions are
+// merged (mergeBackendDefinitions, richest wins). Only a genuinely different
+// cmd is rejected, since the cmd is what dispatches the worker.
 func upsertSharedBackendsTx(ctx context.Context, tx *sql.Tx, backends map[string]*yaml.Node, now string) error {
 	for name, def := range backends {
 		defYAML, err := marshalNode(def)
 		if err != nil {
 			return err
 		}
+		toStore := string(defYAML)
 		var existing string
 		err = tx.QueryRowContext(ctx, `SELECT definition_yaml FROM backends WHERE name = ?`, name).Scan(&existing)
-		if err == nil && strings.TrimSpace(existing) != strings.TrimSpace(string(defYAML)) {
-			return fmt.Errorf("backend %q differs from an already imported definition", name)
-		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		switch {
+		case err == nil:
+			merged, mErr := mergeBackendDefinitions(name, existing, toStore)
+			if mErr != nil {
+				return mErr
+			}
+			toStore = merged
+		case errors.Is(err, sql.ErrNoRows):
+			// first definition for this backend name — store as-is
+		default:
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO backends(name, definition_yaml, updated_at)
 VALUES(?, ?, ?)
 ON CONFLICT(name) DO UPDATE SET definition_yaml = excluded.definition_yaml, updated_at = excluded.updated_at
-`, name, string(defYAML), now); err != nil {
+`, name, toStore, now); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// mergeBackendDefinitions reconciles two definitions of the same shared backend.
+// The store keeps backends in one global table, but per-project configs often
+// annotate the same backend with different optional metadata
+// (provider/model/pricing/effort) while keeping an identical cmd — not a real
+// conflict, since the cmd is what dispatches the worker. So a differing cmd is a
+// hard error; otherwise the definitions are merged into their union, the richer
+// (more-complete) definition winning any overlapping field. The merge is
+// order-independent and idempotent, so a bulk `config-store migrate` converges
+// regardless of the order files are imported in.
+func mergeBackendDefinitions(name, existingYAML, incomingYAML string) (string, error) {
+	if strings.TrimSpace(existingYAML) == strings.TrimSpace(incomingYAML) {
+		return existingYAML, nil
+	}
+	var existing, incoming map[string]any
+	if err := yaml.Unmarshal([]byte(existingYAML), &existing); err != nil {
+		return "", fmt.Errorf("backend %q: parse stored definition: %w", name, err)
+	}
+	if err := yaml.Unmarshal([]byte(incomingYAML), &incoming); err != nil {
+		return "", fmt.Errorf("backend %q: parse incoming definition: %w", name, err)
+	}
+	existingCmd, _ := existing["cmd"].(string)
+	incomingCmd, _ := incoming["cmd"].(string)
+	if existingCmd != "" && incomingCmd != "" && strings.TrimSpace(existingCmd) != strings.TrimSpace(incomingCmd) {
+		return "", fmt.Errorf("backend %q has a conflicting cmd (%q vs %q) — projects cannot share a backend name with different commands", name, existingCmd, incomingCmd)
+	}
+	// Union of fields; the richer definition (more keys) wins on overlap so no
+	// metadata is lost and the result does not depend on import order.
+	richer, poorer := existing, incoming
+	if len(incoming) > len(existing) {
+		richer, poorer = incoming, existing
+	}
+	merged := make(map[string]any, len(richer)+len(poorer))
+	for k, v := range poorer {
+		merged[k] = v
+	}
+	for k, v := range richer {
+		merged[k] = v
+	}
+	out, err := yaml.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("backend %q: marshal merged definition: %w", name, err)
+	}
+	return string(out), nil
 }
 
 // UpsertProject writes a single project's config under an explicit name,
