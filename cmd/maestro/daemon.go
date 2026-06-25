@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
 )
@@ -28,6 +29,8 @@ func daemonCmd(args []string) {
 	readOnly := fs.Bool("read-only", false, "Disable mutating fleet HTTP endpoints")
 	watchStore := fs.Bool("watch-store", false, "Hot add/remove/reload projects from the config store without a restart (#757)")
 	watchStoreInterval := fs.Duration("watch-store-interval", daemon.DefaultWatchStoreInterval, "Config-store diff/reload poll interval (with --watch-store)")
+	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend for the fleet approve/reject endpoint: json|sqlite (#759)")
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "Shared SQLite approvals db path (used with --approvals-store=sqlite)")
 	fs.Parse(args)
 
 	ctx := signalContext()
@@ -53,6 +56,8 @@ func daemonCmd(args []string) {
 		SelfDeployStateDir: filepath.Join(filepath.Dir(*storePath), "self-deploy"),
 		WatchStore:         *watchStore,
 		WatchStoreInterval: *watchStoreInterval,
+		ApprovalsStore:     *approvalsStore,
+		ApprovalsDBPath:    *approvalsDB,
 	})
 
 	log.Printf("starting maestro daemon — store=%s addr=%s:%d", *storePath, *host, *port)

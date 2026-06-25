@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
@@ -40,6 +41,45 @@ type Server struct {
 	// /actions, /approvals/.../{approve|reject}, and /refresh require
 	// Authorization: Bearer <token>.
 	auth authChecker
+
+	// approvalsMode / approvalsDBPath select the approvals store backing the
+	// approve/reject endpoint (#759). The zero value (mode "") is the legacy
+	// JSON path; SetApprovalStore flips it to the transactional SQLite
+	// claim-once store. approvalsHandle is the one shared store reused across
+	// requests so every in-process claim serializes through a single
+	// connection (no SQLITE_BUSY between concurrent dashboard approves).
+	approvalsMode   approvalstore.Mode
+	approvalsDBPath string
+	approvalsHandle *approvalstore.Store
+}
+
+// SetApprovalStore selects the approvals store backend for the approve/reject
+// endpoint. mode is "json" (default) or "sqlite"; dbPath is the SQLite
+// database used in sqlite mode (#759). In sqlite mode the shared store is
+// opened eagerly and reused for the server's lifetime.
+func (s *Server) SetApprovalStore(mode approvalstore.Mode, dbPath string) error {
+	s.approvalsMode = mode
+	s.approvalsDBPath = dbPath
+	if mode == approvalstore.ModeSQLite {
+		store, err := approvalstore.Open(dbPath)
+		if err != nil {
+			return err
+		}
+		s.approvalsHandle = store
+	}
+	return nil
+}
+
+// approvalBinding builds the per-request approvals-store binding from the
+// server's configured mode and the project's repo. StateDir is filled in by
+// applyApprovalDecision.
+func (s *Server) approvalBinding(cfg *config.Config) approvalstore.Binding {
+	b := approvalstore.Binding{Mode: s.approvalsMode, DBPath: s.approvalsDBPath, Handle: s.approvalsHandle}
+	if cfg != nil {
+		b.Repo = cfg.Repo
+		b.Project = cfg.Repo
+	}
+	return b
 }
 
 // SetActionDeps wires the GitHub client and (optional) audit recorder used
