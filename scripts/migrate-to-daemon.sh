@@ -9,6 +9,18 @@
 # so no project ever has both a legacy unit and the daemon driving it — that
 # would double-spawn workers.
 #
+# Scope (#761): --scope selects the systemd manager, mirroring self-deploy.sh
+# (#742). Both the legacy units and the new maestro.service live in the same
+# manager.
+#   * user   (default, back-compat) — `systemctl --user ...`, unit installed
+#     into ~/.config/systemd/user, the committed `%h`/default.target template.
+#   * system — `sudo -n systemctl ...` for mutations (non-interactive; requires
+#     passwordless sudo), unit installed into /etc/systemd/system rendered with
+#     User=/WorkingDirectory= and `%h` expanded to the service user's home, so it
+#     matches the existing system units (e.g. maestro-supervisor-dogfood.service
+#     on the Loki host, which run as User=god). Reads (list-units / is-active)
+#     use plain `systemctl` (no sudo).
+#
 # Steps:
 #   1. Seed the SQLite config store from EVERY legacy config source:
 #      - the newer `~/.maestro/maestro.d/*.yaml` directory (`config-store migrate`)
@@ -16,10 +28,9 @@
 #        `~/.maestro/maestro-*.yaml` (`config-store add`, one per file).
 #      Then refuse to go any further if the store is still empty — we never stop
 #      the legacy units only to start an empty daemon.
-#   2. Render maestro.service with the requested --bin/--store/--port and install
-#      it into the systemd user unit dir (the committed template hard-codes the
-#      defaults; a custom binary/store/port must reach the unit, not just the
-#      verification).
+#   2. Render maestro.service with the requested --bin/--store/--port (and, for
+#      system scope, User=/WorkingDirectory=/absolute home) and install it into
+#      the scope's unit dir.
 #   3. Stop + disable the legacy units — discovered from BOTH `list-units`
 #      (loaded/running) AND `list-unit-files` (enabled-but-inactive on disk), so
 #      an enabled instance that is not currently loaded cannot re-appear on the
@@ -27,10 +38,10 @@
 #   4. enable --now maestro.service.
 #   5. Verify :PORT/api/v1/fleet responds and print the running version.
 #
-# Rollback (the legacy unit files stay on disk):
-#   systemctl --user disable --now maestro.service
+# Rollback (the legacy unit files stay on disk; SC = the scope's systemctl):
+#   <SC> disable --now maestro.service
 #   maestro config-store export --db <store> --dir ~/.maestro/maestro.d   # regen YAML if needed
-#   systemctl --user enable --now maestro@<project> ...                   # re-enable the old units
+#   <SC> enable --now maestro@<project> ...                               # re-enable the old units
 #
 # This script changes the operational topology of a running host and REQUIRES an
 # operator to approve it. It does not touch secrets and prints no credentials.
@@ -41,30 +52,42 @@ MAESTRO_DIR="${HOME}/.maestro"
 STORE="${MAESTRO_DIR}/maestro.db"
 CONFIG_DIR="${MAESTRO_DIR}/maestro.d"
 PORT=8786
-UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+SCOPE=user
+SVCUSER="$(id -un)"
+UNIT_DIR=""          # resolved from --scope after parsing unless --unit-dir given
 BIN=""
 DRY_RUN=0
 ASSUME_YES=0
 NO_START=0
 
-# Legacy unit name patterns to stop + disable. None of these match the new
-# single-service unit (`maestro.service` — no `@`, no `-` after `maestro`).
+# Legacy unit name patterns to stop + disable. `maestro-*` (dash form) is the
+# broad catch for the per-host dash naming — per-project worker
+# (maestro-<project>.service), supervise (maestro-<project>-supervise.service),
+# web (maestro-<project>-web.service), plus the dogfood/fleet units — which is
+# what the Loki host actually runs; the `@` patterns cover the older
+# template-instance naming on other hosts. None of these match the new
+# single-service unit (`maestro.service` — no `@`, no `-` after `maestro`); the
+# new unit, the self-deploy transient units, and the documented standalone
+# maestro-digest unit are excluded in legacy_units (exclude_non_legacy) too.
 LEGACY_PATTERNS=(
-  'maestro@*'             # per-project run template instances
-  'maestro-supervise@*'   # per-project supervise template instances
-  'maestro-supervisor-*'  # per-project supervisor units (dash form)
-  'maestro-serve*'        # fleet serve unit(s)
-  'maestro-fleet*'        # documented legacy fleet dashboard unit(s)
+  'maestro@*'             # per-project run template instances (older naming)
+  'maestro-supervise@*'   # per-project supervise template instances (older naming)
+  'maestro-*'             # all dash-form units: per-project worker / -supervise /
+                          # -web, dogfood, fleet — the live Loki naming
 )
 
 usage() {
   cat >&2 <<EOF
 usage: migrate-to-daemon.sh [options]
 
+  --scope user|system honor the systemd --user manager (default) or the system
+                      manager via sudo -n (default: ${SCOPE})
+  --user NAME         service User= for --scope system (default: ${SVCUSER})
   --store PATH        SQLite store path (default: ${STORE})
   --config-dir DIR    YAML configs to seed the store from (default: ${CONFIG_DIR})
   --port N            Fleet web port — written into the unit AND verified (default: ${PORT})
-  --unit-dir DIR      systemd --user unit dir (default: ${UNIT_DIR})
+  --unit-dir DIR      systemd unit dir (default: scope-derived —
+                      ~/.config/systemd/user or /etc/systemd/system)
   --bin PATH          maestro binary — written into the unit's ExecStart
                       (default: resolved from PATH / /usr/local/bin/maestro)
   --dry-run           print the actions (incl. the rendered unit) without changing anything
@@ -90,6 +113,8 @@ run() {
 # --- parse args -------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --scope) SCOPE="$2"; shift 2 ;;
+    --user) SVCUSER="$2"; shift 2 ;;
     --store) STORE="$2"; shift 2 ;;
     --config-dir) CONFIG_DIR="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
@@ -103,8 +128,43 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "${SCOPE}" in user|system) ;; *) die "invalid --scope: ${SCOPE} (want user|system)" ;; esac
+
+# Service user's home: the unit's %h is expanded to this for system scope (system
+# units do not reliably resolve %h), and a system unit runs as User=${SVCUSER}.
+SVCHOME="$(getent passwd "${SVCUSER}" 2>/dev/null | cut -d: -f6)"
+[[ -n "${SVCHOME}" ]] || SVCHOME="${HOME}"
+
+# Default unit dir by scope unless the operator pinned one.
+if [[ -z "${UNIT_DIR}" ]]; then
+  if [[ "${SCOPE}" == "system" ]]; then
+    UNIT_DIR="/etc/systemd/system"
+  else
+    UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+  fi
+fi
+
 # Where the legacy per-instance files (maestro-*.yaml) live: next to maestro.d.
 LEGACY_CFG_DIR="$(dirname "${CONFIG_DIR}")"
+
+# --- scope-aware systemctl --------------------------------------------------
+# sc: read-only systemctl (list-units, is-active) — never needs sudo.
+sc() {
+  if [[ "${SCOPE}" == "system" ]]; then
+    systemctl "$@"
+  else
+    systemctl --user "$@"
+  fi
+}
+# sc_do: MUTATING systemctl (daemon-reload, stop, disable, enable) — routed
+# through run() for --dry-run, and via `sudo -n` for system scope.
+sc_do() {
+  if [[ "${SCOPE}" == "system" ]]; then
+    run sudo -n systemctl "$@"
+  else
+    run systemctl --user "$@"
+  fi
+}
 
 # --- resolve the binary -----------------------------------------------------
 if [[ -z "${BIN}" ]]; then
@@ -123,6 +183,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SRC="${SCRIPT_DIR}/../maestro.service"
 [[ -f "${UNIT_SRC}" ]] || die "maestro.service not found at ${UNIT_SRC}"
 
+log "scope:      ${SCOPE}$([[ "${SCOPE}" == system ]] && printf ' (User=%s, home %s, sudo -n)' "${SVCUSER}" "${SVCHOME}")"
 log "binary:     ${BIN} ($(${BIN} version 2>/dev/null || echo 'version unknown'))"
 log "store:      ${STORE}"
 log "config dir: ${CONFIG_DIR}"
@@ -147,17 +208,36 @@ sed_repl() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 # defaults (/usr/local/bin/maestro, %h/.maestro/maestro.db, 8786); rendering
 # keeps the installed unit consistent with the store this script seeds and the
 # endpoint it verifies. The rest of the unit (flag set, drain timeout, restart
-# policy) stays the template's — it remains the single source of truth.
+# policy) stays the template's.
+#
+# For --scope system the committed user-style template (%h, default.target, no
+# User=) is additionally transformed into a system unit: %h → the service user's
+# home, User=/WorkingDirectory= injected, and WantedBy → multi-user.target — so
+# it matches the existing system units on the host.
 render_unit() {
   local bin store port
   bin="$(sed_repl "${BIN}")"
   store="$(sed_repl "${STORE}")"
   port="$(sed_repl "${PORT}")"
-  sed \
-    -e "s|ExecStart=/usr/local/bin/maestro |ExecStart=${bin} |" \
-    -e "s|--store %h/.maestro/maestro.db|--store ${store}|" \
-    -e "s|--port 8786|--port ${port}|" \
-    "${UNIT_SRC}"
+  if [[ "${SCOPE}" == "system" ]]; then
+    local home user
+    home="$(sed_repl "${SVCHOME}")"
+    user="$(sed_repl "${SVCUSER}")"
+    sed \
+      -e "s|ExecStart=/usr/local/bin/maestro |ExecStart=${bin} |" \
+      -e "s|--store %h/.maestro/maestro.db|--store ${store}|" \
+      -e "s|--port 8786|--port ${port}|" \
+      -e "s|%h|${home}|g" \
+      -e "s|^\[Service\]\$|[Service]\nUser=${user}\nWorkingDirectory=${home}|" \
+      -e "s|^WantedBy=default.target\$|WantedBy=multi-user.target|" \
+      "${UNIT_SRC}"
+  else
+    sed \
+      -e "s|ExecStart=/usr/local/bin/maestro |ExecStart=${bin} |" \
+      -e "s|--store %h/.maestro/maestro.db|--store ${store}|" \
+      -e "s|--port 8786|--port ${port}|" \
+      "${UNIT_SRC}"
+  fi
 }
 
 # store_project_count prints how many projects the store currently holds, by
@@ -183,11 +263,24 @@ store_project_count() {
 # (`list-unit-files`). Bare template files (foo@.service) are dropped — only
 # instances/concrete units are stopped/disabled, and the templates stay on disk
 # for rollback.
+# exclude_non_legacy: drop maestro-prefixed units that the broad `maestro-*`
+# glob matches but that are NOT part of the per-project fleet topology this
+# cutover replaces, so they are never stopped/disabled:
+#   * maestro.service          — the new single-service unit (defense-in-depth;
+#                                `maestro-*` already can't match it).
+#   * maestro-self-deploy*      — ephemeral self-deploy transient units.
+#   * maestro-digest{.service,} — the documented standalone digest unit/timer
+#                                (docs/digest-runbook.md); orthogonal to the
+#                                fleet, must survive the cutover.
+exclude_non_legacy() {
+  grep -vxF 'maestro.service' | grep -vE '^maestro-self-deploy' | grep -vE '^maestro-digest'
+}
+
 legacy_units() {
   {
-    systemctl --user list-units --all --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
-    systemctl --user list-unit-files --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
-  } | grep -E '\.service$' | grep -vE '@\.service$' | sort -u || true
+    sc list-units --all --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
+    sc list-unit-files --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
+  } | grep -E '\.service$' | grep -vE '@\.service$' | exclude_non_legacy | sort -u || true
 }
 
 # --- 1. seed the config store ----------------------------------------------
@@ -225,14 +318,21 @@ log "  ExecStart binary: ${BIN}"
 log "  --store:          ${STORE}"
 log "  --port:           ${PORT}"
 if [[ "${DRY_RUN}" == "1" ]]; then
-  printf '  + mkdir -p %s\n' "${UNIT_DIR}"
-  printf '  + render maestro.service (from %s) → %s/maestro.service:\n' "${UNIT_SRC}" "${UNIT_DIR}"
+  printf '  + install %s/maestro.service (rendered from %s):\n' "${UNIT_DIR}" "${UNIT_SRC}"
   render_unit | sed 's/^/        /'
-  printf '  + systemctl --user daemon-reload\n'
+  if [[ "${SCOPE}" == "system" ]]; then
+    printf '  + sudo -n systemctl daemon-reload\n'
+  else
+    printf '  + systemctl --user daemon-reload\n'
+  fi
 else
-  mkdir -p "${UNIT_DIR}"
-  render_unit > "${UNIT_DIR}/maestro.service"
-  systemctl --user daemon-reload
+  if [[ "${SCOPE}" == "system" ]]; then
+    render_unit | sudo -n tee "${UNIT_DIR}/maestro.service" >/dev/null
+  else
+    mkdir -p "${UNIT_DIR}"
+    render_unit > "${UNIT_DIR}/maestro.service"
+  fi
+  sc_do daemon-reload
 fi
 
 if [[ "${NO_START}" == "1" ]]; then
@@ -256,8 +356,8 @@ fi
 mapfile -t OLD < <(legacy_units)
 if [[ ${#OLD[@]} -gt 0 ]]; then
   log "stopping + disabling ${#OLD[@]} legacy unit(s): ${OLD[*]}"
-  run systemctl --user stop "${OLD[@]}" || warn "some legacy units did not stop cleanly"
-  run systemctl --user disable "${OLD[@]}" || warn "some legacy units did not disable cleanly"
+  sc_do stop "${OLD[@]}" || warn "some legacy units did not stop cleanly"
+  sc_do disable "${OLD[@]}" || warn "some legacy units did not disable cleanly"
 else
   warn "no legacy maestro units found (loaded or enabled) — proceeding to start the daemon"
 fi
@@ -265,8 +365,8 @@ fi
 # Non-concurrency guard: nothing legacy may still be active when we start the
 # daemon, or two drivers would run the same project.
 if [[ "${DRY_RUN}" != "1" ]]; then
-  still_active="$(systemctl --user list-units --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null \
-    | awk '$3=="active"{print $1}' | grep -E '\.service$' | grep -vE '@\.service$' || true)"
+  still_active="$(sc list-units --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null \
+    | awk '$3=="active"{print $1}' | grep -E '\.service$' | grep -vE '@\.service$' | exclude_non_legacy || true)"
   if [[ -n "${still_active}" ]]; then
     die "legacy unit(s) still active after stop: ${still_active//$'\n'/ } — refusing to start maestro.service (it would double-drive those projects). Stop them and re-run."
   fi
@@ -274,7 +374,7 @@ fi
 
 # --- 4. start the daemon ----------------------------------------------------
 log "enabling + starting maestro.service"
-run systemctl --user enable --now maestro.service
+sc_do enable --now maestro.service
 
 # --- 5. verify --------------------------------------------------------------
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -292,13 +392,21 @@ for _ in $(seq 1 15); do
 done
 if [[ "${ok}" != "1" ]]; then
   warn "fleet endpoint :${PORT}/api/v1/fleet did not respond yet"
-  warn "check: systemctl --user status maestro.service ; journalctl --user -u maestro.service -e"
+  if [[ "${SCOPE}" == "system" ]]; then
+    warn "check: systemctl status maestro.service ; journalctl -u maestro.service -e"
+  else
+    warn "check: systemctl --user status maestro.service ; journalctl --user -u maestro.service -e"
+  fi
   die "verification failed — investigate before assuming the cutover succeeded"
 fi
 
 log "active maestro units now:"
-systemctl --user list-units --no-legend 'maestro*' 2>/dev/null || true
+sc list-units --no-legend 'maestro*' 2>/dev/null || true
 log "running version: $(${BIN} version 2>/dev/null || echo unknown)"
-log "cutover complete. Rollback: systemctl --user disable --now maestro.service && re-enable the legacy units."
+if [[ "${SCOPE}" == "system" ]]; then
+  log "cutover complete. Rollback: sudo systemctl disable --now maestro.service && re-enable the legacy units."
+else
+  log "cutover complete. Rollback: systemctl --user disable --now maestro.service && re-enable the legacy units."
+fi
 log "(legacy unit files remain on disk, now disabled, so rollback re-enables them.)"
 exit 0
