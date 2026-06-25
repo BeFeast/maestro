@@ -1498,7 +1498,11 @@ func (s *FleetServer) handleFleetProjectUpsert(w http.ResponseWriter, r *http.Re
 		name = derived
 	}
 	if err := store.UpsertProject(r.Context(), name, yamlText); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("upsert project %q: %v", name, err))
+		// The config was already validated (config.Parse + ProjectNameFor) above,
+		// so a store error here is an infrastructure failure (disk full, locked
+		// SQLite, I/O) — server-side, not a bad request. Mirror the 500 in
+		// handleFleetProjectDelete so clients can retry transient failures.
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("upsert project %q: %v", name, err))
 		return
 	}
 	log.Printf("[fleet] project upsert %q by %s (reason=%q) — config store written; flow reconciles on the next store-watch tick", name, actor, strings.TrimSpace(req.Reason))

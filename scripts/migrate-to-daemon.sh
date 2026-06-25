@@ -54,6 +54,7 @@ LEGACY_PATTERNS=(
   'maestro-supervise@*'   # per-project supervise template instances
   'maestro-supervisor-*'  # per-project supervisor units (dash form)
   'maestro-serve*'        # fleet serve unit(s)
+  'maestro-fleet*'        # documented legacy fleet dashboard unit(s)
 )
 
 usage() {

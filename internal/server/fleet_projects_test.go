@@ -235,8 +235,11 @@ func TestFleetProjectUpsertSurfacesStoreError(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.handleFleetProjects(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 on store error; body=%s", w.Code, w.Body.String())
+	// A store failure on already-validated input is server-side (disk full,
+	// locked SQLite), so it must surface as 500 — a 400 would tell the client
+	// its request was malformed and suppress retries on a transient error.
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on store error; body=%s", w.Code, w.Body.String())
 	}
 	var resp map[string]interface{}
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
