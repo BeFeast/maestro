@@ -12,6 +12,7 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
+	"github.com/befeast/maestro/internal/statestore"
 )
 
 // daemonCmd runs every project in the config store as one long-lived process:
@@ -31,6 +32,8 @@ func daemonCmd(args []string) {
 	watchStoreInterval := fs.Duration("watch-store-interval", daemon.DefaultWatchStoreInterval, "Config-store diff/reload poll interval (with --watch-store)")
 	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend for the fleet approve/reject endpoint: json|sqlite (#759)")
 	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "Shared SQLite approvals db path (used with --approvals-store=sqlite)")
+	stateStore := fs.String("state-store", "json", "State store backend for sessions/decisions/health/missions: json|sqlite (write-through mirror, #760)")
+	stateDB := fs.String("state-db", statestore.DefaultDBPath(), "Shared SQLite state db path (used with --state-store=sqlite)")
 	fs.Parse(args)
 
 	ctx := signalContext()
@@ -58,6 +61,8 @@ func daemonCmd(args []string) {
 		WatchStoreInterval: *watchStoreInterval,
 		ApprovalsStore:     *approvalsStore,
 		ApprovalsDBPath:    *approvalsDB,
+		StateStore:         *stateStore,
+		StateDBPath:        *stateDB,
 	})
 
 	log.Printf("starting maestro daemon — store=%s addr=%s:%d", *storePath, *host, *port)

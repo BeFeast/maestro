@@ -25,6 +25,7 @@ import (
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/statestore"
 	"gopkg.in/yaml.v3"
 )
 
@@ -280,6 +281,20 @@ type FleetServer struct {
 	approvalsMode   approvalstore.Mode
 	approvalsDBPath string
 	approvalsHandle *approvalstore.Store
+
+	// stateMode / stateDBPath select the store backing the remaining
+	// orchestration state — sessions/decisions/backend-health/missions (#760).
+	// The zero value (mode "") keeps per-project state.json as the only store;
+	// SetStateStore flips it to write-through-mirror every project's state into
+	// the shared maestro.db (rows tagged by project/repo/state_dir) so a
+	// cross-project query ("every running session across the fleet") is one SQL
+	// statement instead of N state.Load calls. stateHandle is the one shared
+	// store reused across requests (single pooled connection). JSON stays the
+	// authoritative mint source during the transition; the mirror is refreshed
+	// on the daemon's startup import and on every fleet state read.
+	stateMode   statestore.Mode
+	stateDBPath string
+	stateHandle *statestore.Store
 }
 
 // NewFleet creates a FleetServer.
@@ -322,6 +337,64 @@ func (s *FleetServer) approvalBinding(cfg *config.Config) approvalstore.Binding 
 		b.Project = cfg.Repo
 	}
 	return b
+}
+
+// SetStateStore selects the store backing the remaining orchestration state —
+// sessions/decisions/backend-health/missions (#760). mode is "json" (default)
+// or "sqlite"; dbPath is the shared maestro.db used in sqlite mode. In sqlite
+// mode the shared store is opened eagerly and reused for the server's lifetime,
+// so the daemon's startup import and every fleet state read share one pooled
+// connection.
+func (s *FleetServer) SetStateStore(mode statestore.Mode, dbPath string) error {
+	if s == nil {
+		return nil
+	}
+	s.stateMode = mode
+	s.stateDBPath = dbPath
+	if mode == statestore.ModeSQLite {
+		store, err := statestore.Open(dbPath)
+		if err != nil {
+			return err
+		}
+		s.stateHandle = store
+	}
+	return nil
+}
+
+// StateStore returns the shared SQLite state store handle when sqlite mode is
+// enabled, else nil. The daemon uses it to run the one-shot startup import;
+// cross-project callers use it for single-query fleet questions.
+func (s *FleetServer) StateStore() *statestore.Store {
+	if s == nil {
+		return nil
+	}
+	return s.stateHandle
+}
+
+// stateBinding builds the per-project state-store binding from the fleet's
+// configured mode and the target project's repo/state dir.
+func (s *FleetServer) stateBinding(cfg *config.Config) statestore.Binding {
+	b := statestore.Binding{Mode: s.stateMode, DBPath: s.stateDBPath, Handle: s.stateHandle}
+	if cfg != nil {
+		b.Repo = cfg.Repo
+		b.Project = cfg.Repo
+		b.StateDir = cfg.StateDir
+	}
+	return b
+}
+
+// mirrorState write-through-mirrors one project's freshly-loaded state into the
+// SQLite store. It is a no-op in json mode, so the fleet's per-project state
+// reads transparently keep the shared maestro.db in sync during the transition
+// without changing the HTTP response. A mirror failure is non-fatal — JSON
+// remains authoritative — so it is logged and swallowed rather than surfaced.
+func (s *FleetServer) mirrorState(cfg *config.Config, st *state.State) {
+	if s == nil || s.stateMode != statestore.ModeSQLite || cfg == nil {
+		return
+	}
+	if err := statestore.Mirror(s.stateBinding(cfg), st); err != nil {
+		log.Printf("[fleet] state mirror for %s failed (json remains authoritative): %v", cfg.Repo, err)
+	}
 }
 
 // projectsSnapshot returns a copy of the project slice under the read lock so
@@ -2839,6 +2912,10 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		item.OperatorState = buildFleetProjectOperatorState(item)
 		return item, nil
 	}
+	// Write-through the freshly-loaded snapshot into the shared maestro.db
+	// (no-op unless sqlite mode is on) so the cross-project mirror stays in
+	// sync at the fleet's read cadence. JSON stays authoritative (#760).
+	s.mirrorState(cfg, st)
 	item.Freshness = fleetProjectFreshnessForState(cfg.StateDir, st, now)
 	item.RestartRequired = st.RestartRequired
 	item.RestartRequiredReason = st.RestartRequiredReason
