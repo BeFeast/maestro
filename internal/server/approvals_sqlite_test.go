@@ -74,6 +74,35 @@ func TestHandleApproval_SQLite_Reject(t *testing.T) {
 	}
 }
 
+// TestHandleApproval_SQLite_ByDecisionID is the sqlite parity for the
+// CLI/JSON promise that `approve <approval-or-decision-id>` accepts either id.
+// The SQLite claim must target the RESOLVED Approval.ID (the row key), not the
+// user-supplied decision-id alias — claiming the raw alias would miss the row
+// and return 404 even though FindApproval resolves it.
+func TestHandleApproval_SQLite_ByDecisionID(t *testing.T) {
+	srv, dir := sqliteSrv(t)
+	a := enqueuedApproval(t, dir, "merge_pr", &state.SupervisorTarget{PR: 21})
+	if a.DecisionID == "" || a.DecisionID == a.ID {
+		t.Fatalf("test needs a distinct decision-id alias; got id=%q decision_id=%q", a.ID, a.DecisionID)
+	}
+
+	w := postApprove(t, srv, a.DecisionID, "approve")
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve by decision-id status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var resp approvalDecisionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.OK || resp.Approval == nil || resp.Approval.Status != state.ApprovalStatusApproved {
+		t.Fatalf("response = %+v", resp)
+	}
+	st, _ := state.Load(dir)
+	if st.Approvals[0].Status != state.ApprovalStatusApproved {
+		t.Fatalf("json disk status = %q, want approved", st.Approvals[0].Status)
+	}
+}
+
 func TestHandleApproval_SQLite_NotFound_404(t *testing.T) {
 	srv, _ := sqliteSrv(t)
 	w := postApprove(t, srv, "does-not-exist", "approve")

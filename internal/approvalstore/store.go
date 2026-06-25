@@ -18,7 +18,14 @@
 // Each row carries project / repo / state_dir columns so a single shared
 // maestro.db can hold every project's approvals without cross-project
 // mutation (premortem #2/#3 — the executor's repo guard re-checks the same
-// binding at execute time).
+// binding at execute time). Approval ids are content-addressed on
+// (action, target) only (state.approvalID), so two DIFFERENT projects that
+// gate the same action on the same target mint the SAME id. The row identity
+// and every claim predicate are therefore scoped by state_dir (the JSON state
+// directory, which is 1:1 with a project — repo can be shared by two configs,
+// the project name can be aliased, but the state dir is unique). Without that
+// scope the second project's INSERT OR IGNORE would be dropped and an
+// approve/reject would consume or block the first project's claim.
 package approvalstore
 
 import (
@@ -42,7 +49,7 @@ import (
 // row to its originating project context (premortem #2/#3).
 const Schema = `
 CREATE TABLE IF NOT EXISTS approvals (
-	id            TEXT PRIMARY KEY,
+	id            TEXT NOT NULL,
 	decision_id   TEXT NOT NULL DEFAULT '',
 	project       TEXT NOT NULL DEFAULT '',
 	repo          TEXT NOT NULL DEFAULT '',
@@ -52,7 +59,12 @@ CREATE TABLE IF NOT EXISTS approvals (
 	payload_hash  TEXT NOT NULL DEFAULT '',
 	created_at    TEXT NOT NULL,
 	updated_at    TEXT NOT NULL,
-	approval_json TEXT NOT NULL
+	approval_json TEXT NOT NULL,
+	-- Scope the row identity by state_dir: ids are content-addressed on
+	-- (action, target) only, so two projects can mint the same id. Without
+	-- (state_dir, id) the second project's INSERT OR IGNORE is dropped and a
+	-- claim consumes the wrong project's approval.
+	PRIMARY KEY (state_dir, id)
 );
 
 CREATE TABLE IF NOT EXISTS approval_audit (
@@ -185,10 +197,10 @@ func (s *Store) Put(ctx context.Context, a *state.Approval, b RowBinding) (inser
 	return ins, nil
 }
 
-// Get returns the full approval (audit included, via approval_json) for id,
-// or state.ErrApprovalNotFound.
-func (s *Store) Get(ctx context.Context, id string) (*state.Approval, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT approval_json FROM approvals WHERE id = ?`, id)
+// Get returns the full approval (audit included, via approval_json) for id
+// within the given state_dir scope, or state.ErrApprovalNotFound.
+func (s *Store) Get(ctx context.Context, stateDir, id string) (*state.Approval, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT approval_json FROM approvals WHERE state_dir = ? AND id = ?`, stateDir, id)
 	return scanApproval(row)
 }
 
@@ -231,28 +243,32 @@ func (s *Store) List(ctx context.Context, stateDir string) ([]*state.Approval, e
 //     processed" outcome)
 //   - state.ErrApprovalPayloadMismatch — payload drifted from its hash
 //
+// id must be the resolved Approval.ID (the row key) — callers that accept a
+// decision-id alias resolve it before claiming. stateDir scopes the claim to
+// one project so a shared maestro.db cannot cross-claim.
+//
 // Exactly one concurrent caller observes rows-affected==1 and returns nil;
 // every other caller returns ErrApprovalNotPending without mutating state.
-func (s *Store) Approve(ctx context.Context, id string, now time.Time, actor, reason string) (*state.Approval, error) {
-	return s.claim(ctx, id, state.ApprovalStatusApproved, state.ApprovalAuditApproved, now, actor, reason)
+func (s *Store) Approve(ctx context.Context, stateDir, id string, now time.Time, actor, reason string) (*state.Approval, error) {
+	return s.claim(ctx, stateDir, id, state.ApprovalStatusApproved, state.ApprovalAuditApproved, now, actor, reason)
 }
 
 // Reject atomically claims a pending approval (pending → rejected), with the
 // same claim-once semantics and error sentinels as Approve.
-func (s *Store) Reject(ctx context.Context, id string, now time.Time, actor, reason string) (*state.Approval, error) {
-	return s.claim(ctx, id, state.ApprovalStatusRejected, state.ApprovalAuditRejected, now, actor, reason)
+func (s *Store) Reject(ctx context.Context, stateDir, id string, now time.Time, actor, reason string) (*state.Approval, error) {
+	return s.claim(ctx, stateDir, id, state.ApprovalStatusRejected, state.ApprovalAuditRejected, now, actor, reason)
 }
 
 // claim implements the pending → {approved,rejected} transition with the
-// atomic UPDATE ... WHERE status='pending' guard.
-func (s *Store) claim(ctx context.Context, id string, target state.ApprovalStatus, event string, now time.Time, actor, reason string) (*state.Approval, error) {
+// atomic UPDATE ... WHERE status='pending' guard, scoped to one state_dir.
+func (s *Store) claim(ctx context.Context, stateDir, id string, target state.ApprovalStatus, event string, now time.Time, actor, reason string) (*state.Approval, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
-	a, b, err := loadApprovalTx(ctx, tx, id)
+	a, b, err := loadApprovalTx(ctx, tx, stateDir, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, state.ErrApprovalNotFound
 	}
@@ -286,8 +302,8 @@ func (s *Store) claim(ctx context.Context, id string, target state.ApprovalStatu
 
 	now = normalize(now)
 	res, err := tx.ExecContext(ctx,
-		`UPDATE approvals SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
-		string(target), formatTime(now), id, string(state.ApprovalStatusPending))
+		`UPDATE approvals SET status = ?, updated_at = ? WHERE state_dir = ? AND id = ? AND status = ?`,
+		string(target), formatTime(now), stateDir, id, string(state.ApprovalStatusPending))
 	if err != nil {
 		return a, err
 	}
@@ -299,7 +315,7 @@ func (s *Store) claim(ctx context.Context, id string, target state.ApprovalStatu
 		// Lost the claim to a concurrent writer between our read and UPDATE.
 		// Reload so the caller sees the winner's status, and report
 		// "already processed".
-		reloaded, _, lerr := loadApprovalTx(ctx, tx, id)
+		reloaded, _, lerr := loadApprovalTx(ctx, tx, stateDir, id)
 		if lerr == nil {
 			a = reloaded
 		}
@@ -317,7 +333,7 @@ func (s *Store) claim(ctx context.Context, id string, target state.ApprovalStatu
 		TargetStateHash: a.TargetStateHash,
 	}
 	a.Audit = append(a.Audit, audit)
-	if err := writeApprovalJSONTx(ctx, tx, a); err != nil {
+	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
 		return a, err
 	}
 	if err := insertAuditTx(ctx, tx, id, b, audit); err != nil {
@@ -333,35 +349,35 @@ func (s *Store) claim(ctx context.Context, id string, target state.ApprovalStatu
 // state.MarkApprovalExecuted. Idempotent at the caller boundary: an approval
 // not in status=approved returns state.ErrApprovalNotApproved unchanged, so a
 // concurrent executor cannot double-record.
-func (s *Store) MarkExecuted(ctx context.Context, id string, now time.Time, actor, summary string) (*state.Approval, error) {
-	return s.markTerminal(ctx, id, state.ApprovalStatusExecuted, state.ApprovalAuditExecuted, now, actor, summary)
+func (s *Store) MarkExecuted(ctx context.Context, stateDir, id string, now time.Time, actor, summary string) (*state.Approval, error) {
+	return s.markTerminal(ctx, stateDir, id, state.ApprovalStatusExecuted, state.ApprovalAuditExecuted, now, actor, summary)
 }
 
 // MarkExecutionFailed transitions approved → execution_failed.
-func (s *Store) MarkExecutionFailed(ctx context.Context, id string, now time.Time, actor, errMsg string) (*state.Approval, error) {
-	return s.markTerminal(ctx, id, state.ApprovalStatusExecutionFailed, state.ApprovalAuditExecutionFailed, now, actor, errMsg)
+func (s *Store) MarkExecutionFailed(ctx context.Context, stateDir, id string, now time.Time, actor, errMsg string) (*state.Approval, error) {
+	return s.markTerminal(ctx, stateDir, id, state.ApprovalStatusExecutionFailed, state.ApprovalAuditExecutionFailed, now, actor, errMsg)
 }
 
 // MarkExecutionSkipped transitions approved → execution_skipped.
-func (s *Store) MarkExecutionSkipped(ctx context.Context, id string, now time.Time, actor, reason string) (*state.Approval, error) {
-	return s.markTerminal(ctx, id, state.ApprovalStatusExecutionSkipped, state.ApprovalAuditExecutionSkipped, now, actor, reason)
+func (s *Store) MarkExecutionSkipped(ctx context.Context, stateDir, id string, now time.Time, actor, reason string) (*state.Approval, error) {
+	return s.markTerminal(ctx, stateDir, id, state.ApprovalStatusExecutionSkipped, state.ApprovalAuditExecutionSkipped, now, actor, reason)
 }
 
 // MarkAwaitingDispatch transitions approved → awaiting_dispatch.
-func (s *Store) MarkAwaitingDispatch(ctx context.Context, id string, now time.Time, actor, reason string) (*state.Approval, error) {
-	return s.markTerminal(ctx, id, state.ApprovalStatusAwaitingDispatch, state.ApprovalAuditAwaitingDispatch, now, actor, reason)
+func (s *Store) MarkAwaitingDispatch(ctx context.Context, stateDir, id string, now time.Time, actor, reason string) (*state.Approval, error) {
+	return s.markTerminal(ctx, stateDir, id, state.ApprovalStatusAwaitingDispatch, state.ApprovalAuditAwaitingDispatch, now, actor, reason)
 }
 
 // markTerminal implements the approved → terminal transition with the atomic
-// UPDATE ... WHERE status='approved' idempotency guard.
-func (s *Store) markTerminal(ctx context.Context, id string, target state.ApprovalStatus, event string, now time.Time, actor, reason string) (*state.Approval, error) {
+// UPDATE ... WHERE status='approved' idempotency guard, scoped to one state_dir.
+func (s *Store) markTerminal(ctx context.Context, stateDir, id string, target state.ApprovalStatus, event string, now time.Time, actor, reason string) (*state.Approval, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
-	a, b, err := loadApprovalTx(ctx, tx, id)
+	a, b, err := loadApprovalTx(ctx, tx, stateDir, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, state.ErrApprovalNotFound
 	}
@@ -374,8 +390,8 @@ func (s *Store) markTerminal(ctx context.Context, id string, target state.Approv
 
 	now = normalize(now)
 	res, err := tx.ExecContext(ctx,
-		`UPDATE approvals SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
-		string(target), formatTime(now), id, string(state.ApprovalStatusApproved))
+		`UPDATE approvals SET status = ?, updated_at = ? WHERE state_dir = ? AND id = ? AND status = ?`,
+		string(target), formatTime(now), stateDir, id, string(state.ApprovalStatusApproved))
 	if err != nil {
 		return a, err
 	}
@@ -384,7 +400,7 @@ func (s *Store) markTerminal(ctx context.Context, id string, target state.Approv
 		return a, err
 	}
 	if n != 1 {
-		reloaded, _, lerr := loadApprovalTx(ctx, tx, id)
+		reloaded, _, lerr := loadApprovalTx(ctx, tx, stateDir, id)
 		if lerr == nil {
 			a = reloaded
 		}
@@ -402,7 +418,7 @@ func (s *Store) markTerminal(ctx context.Context, id string, target state.Approv
 		TargetStateHash: a.TargetStateHash,
 	}
 	a.Audit = append(a.Audit, audit)
-	if err := writeApprovalJSONTx(ctx, tx, a); err != nil {
+	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
 		return a, err
 	}
 	if err := insertAuditTx(ctx, tx, id, b, audit); err != nil {
@@ -436,14 +452,14 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	return n == 1, nil
 }
 
-func writeApprovalJSONTx(ctx context.Context, tx *sql.Tx, a *state.Approval) error {
+func writeApprovalJSONTx(ctx context.Context, tx *sql.Tx, stateDir string, a *state.Approval) error {
 	blob, err := json.Marshal(a)
 	if err != nil {
 		return fmt.Errorf("marshal approval %s: %w", a.ID, err)
 	}
 	_, err = tx.ExecContext(ctx,
-		`UPDATE approvals SET payload_hash = ?, approval_json = ? WHERE id = ?`,
-		a.PayloadHash, string(blob), a.ID)
+		`UPDATE approvals SET payload_hash = ?, approval_json = ? WHERE state_dir = ? AND id = ?`,
+		a.PayloadHash, string(blob), stateDir, a.ID)
 	return err
 }
 
@@ -468,11 +484,11 @@ func markStaleTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBindin
 	}
 	a.Audit = append(a.Audit, audit)
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE approvals SET status = ?, updated_at = ? WHERE id = ?`,
-		string(state.ApprovalStatusStale), formatTime(now), a.ID); err != nil {
+		`UPDATE approvals SET status = ?, updated_at = ? WHERE state_dir = ? AND id = ?`,
+		string(state.ApprovalStatusStale), formatTime(now), b.StateDir, a.ID); err != nil {
 		return err
 	}
-	if err := writeApprovalJSONTx(ctx, tx, a); err != nil {
+	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
 		return err
 	}
 	return insertAuditTx(ctx, tx, a.ID, b, audit)
@@ -481,10 +497,10 @@ func markStaleTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBindin
 // loadApprovalTx returns the full approval plus its stored project/repo/
 // state_dir binding so audit rows written by a later transition carry the
 // same context that Put seeded.
-func loadApprovalTx(ctx context.Context, tx *sql.Tx, id string) (*state.Approval, RowBinding, error) {
+func loadApprovalTx(ctx context.Context, tx *sql.Tx, scopeDir, id string) (*state.Approval, RowBinding, error) {
 	var blob, project, repo, stateDir string
 	err := tx.QueryRowContext(ctx,
-		`SELECT approval_json, project, repo, state_dir FROM approvals WHERE id = ?`, id).
+		`SELECT approval_json, project, repo, state_dir FROM approvals WHERE state_dir = ? AND id = ?`, scopeDir, id).
 		Scan(&blob, &project, &repo, &stateDir)
 	if err != nil {
 		return nil, RowBinding{}, err

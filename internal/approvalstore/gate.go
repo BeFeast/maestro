@@ -119,12 +119,18 @@ func ApplyDecision(b Binding, verb, id string, now time.Time, actor, reason stri
 		return st, nil, err
 	}
 
+	// Claim the RESOLVED approval id (a0.ID), not the user-supplied value:
+	// FindApproval accepts either Approval.ID or DecisionID, but the row is
+	// keyed under a0.ID, so claiming the original `id` (a decision-id alias)
+	// would miss the row and spuriously return ErrApprovalNotFound. Scope the
+	// claim to b.StateDir so a shared maestro.db never cross-claims another
+	// project's same-id approval.
 	var claimed *state.Approval
 	switch verb {
 	case "approve":
-		claimed, err = store.Approve(ctx, id, now, actor, reason)
+		claimed, err = store.Approve(ctx, b.StateDir, a0.ID, now, actor, reason)
 	case "reject":
-		claimed, err = store.Reject(ctx, id, now, actor, reason)
+		claimed, err = store.Reject(ctx, b.StateDir, a0.ID, now, actor, reason)
 	}
 	if err != nil {
 		// Mirror a stale / payload-mismatch transition into JSON so both
@@ -165,13 +171,13 @@ func FinalizeExecution(b Binding, id string, status state.ApprovalStatus, now ti
 	ctx := context.Background()
 	switch status {
 	case state.ApprovalStatusExecuted:
-		_, err = store.MarkExecuted(ctx, id, now, actor, summary)
+		_, err = store.MarkExecuted(ctx, b.StateDir, id, now, actor, summary)
 	case state.ApprovalStatusExecutionFailed:
-		_, err = store.MarkExecutionFailed(ctx, id, now, actor, summary)
+		_, err = store.MarkExecutionFailed(ctx, b.StateDir, id, now, actor, summary)
 	case state.ApprovalStatusExecutionSkipped:
-		_, err = store.MarkExecutionSkipped(ctx, id, now, actor, summary)
+		_, err = store.MarkExecutionSkipped(ctx, b.StateDir, id, now, actor, summary)
 	case state.ApprovalStatusAwaitingDispatch:
-		_, err = store.MarkAwaitingDispatch(ctx, id, now, actor, summary)
+		_, err = store.MarkAwaitingDispatch(ctx, b.StateDir, id, now, actor, summary)
 	default:
 		return fmt.Errorf("approvalstore: unsupported finalize status %q", status)
 	}

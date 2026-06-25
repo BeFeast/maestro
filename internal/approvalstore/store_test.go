@@ -12,6 +12,10 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
+// testStateDir is the scope every seedPending row is bound to; tests pass it
+// as the claim scope so the (state_dir, id) row key resolves.
+const testStateDir = "/tmp/sd"
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "maestro.db"))
@@ -23,8 +27,16 @@ func openTestStore(t *testing.T) *Store {
 }
 
 // seedPending records a pending approval (with a self-consistent payload
-// hash, so the currency guard does not stale it) and returns its id.
+// hash, so the currency guard does not stale it) bound to testStateDir and
+// returns it.
 func seedPending(t *testing.T, s *Store, id, action string, target *state.SupervisorTarget) *state.Approval {
+	t.Helper()
+	return seedPendingScoped(t, s, RowBinding{Project: "owner/repo", Repo: "owner/repo", StateDir: testStateDir}, id, action, target)
+}
+
+// seedPendingScoped is seedPending with an explicit project binding, used by
+// the cross-project isolation test to seed the SAME id under two state dirs.
+func seedPendingScoped(t *testing.T, s *Store, b RowBinding, id, action string, target *state.SupervisorTarget) *state.Approval {
 	t.Helper()
 	now := time.Now().UTC()
 	a := &state.Approval{
@@ -36,17 +48,17 @@ func seedPending(t *testing.T, s *Store, id, action string, target *state.Superv
 		Summary:   "test " + action,
 		Risk:      "high",
 		Status:    state.ApprovalStatusPending,
-		Repo:      "owner/repo",
-		Project:   "owner/repo",
+		Repo:      b.Repo,
+		Project:   b.Project,
 		Audit:     []state.ApprovalAudit{{At: now, Event: state.ApprovalAuditCreated}},
 	}
 	a.PayloadHash = a.ComputePayloadHash()
-	inserted, err := s.Put(context.Background(), a, RowBinding{Project: "owner/repo", Repo: "owner/repo", StateDir: "/tmp/sd"})
+	inserted, err := s.Put(context.Background(), a, b)
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	if !inserted {
-		t.Fatalf("expected fresh insert for %s", id)
+		t.Fatalf("expected fresh insert for %s under %s", id, b.StateDir)
 	}
 	return a
 }
@@ -55,7 +67,7 @@ func TestApprove_HappyPath(t *testing.T) {
 	s := openTestStore(t)
 	seedPending(t, s, "a1", "merge_pr", &state.SupervisorTarget{PR: 7})
 
-	got, err := s.Approve(context.Background(), "a1", time.Now().UTC(), "oleg", "green")
+	got, err := s.Approve(context.Background(), testStateDir, "a1", time.Now().UTC(), "oleg", "green")
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -72,7 +84,7 @@ func TestReject_HappyPath(t *testing.T) {
 	s := openTestStore(t)
 	seedPending(t, s, "r1", "close_issue", &state.SupervisorTarget{Issue: 9})
 
-	got, err := s.Reject(context.Background(), "r1", time.Now().UTC(), "oleg", "no")
+	got, err := s.Reject(context.Background(), testStateDir, "r1", time.Now().UTC(), "oleg", "no")
 	if err != nil {
 		t.Fatalf("reject: %v", err)
 	}
@@ -83,7 +95,7 @@ func TestReject_HappyPath(t *testing.T) {
 
 func TestApprove_NotFound(t *testing.T) {
 	s := openTestStore(t)
-	if _, err := s.Approve(context.Background(), "missing", time.Now().UTC(), "x", ""); !errors.Is(err, state.ErrApprovalNotFound) {
+	if _, err := s.Approve(context.Background(), testStateDir, "missing", time.Now().UTC(), "x", ""); !errors.Is(err, state.ErrApprovalNotFound) {
 		t.Fatalf("err = %v, want ErrApprovalNotFound", err)
 	}
 }
@@ -92,12 +104,58 @@ func TestApprove_SecondAttemptAlreadyProcessed(t *testing.T) {
 	s := openTestStore(t)
 	seedPending(t, s, "a2", "merge_pr", &state.SupervisorTarget{PR: 1})
 
-	if _, err := s.Approve(context.Background(), "a2", time.Now().UTC(), "x", ""); err != nil {
+	if _, err := s.Approve(context.Background(), testStateDir, "a2", time.Now().UTC(), "x", ""); err != nil {
 		t.Fatalf("first approve: %v", err)
 	}
 	// Sequential second approve of an already-approved id → not pending.
-	if _, err := s.Approve(context.Background(), "a2", time.Now().UTC(), "y", ""); !errors.Is(err, state.ErrApprovalNotPending) {
+	if _, err := s.Approve(context.Background(), testStateDir, "a2", time.Now().UTC(), "y", ""); !errors.Is(err, state.ErrApprovalNotPending) {
 		t.Fatalf("second approve err = %v, want ErrApprovalNotPending", err)
+	}
+}
+
+// TestApprove_CrossProjectSameID_Isolated guards the P1 fix: approval ids are
+// content-addressed on (action, target) only, so two DIFFERENT projects that
+// both gate merge_pr on PR #1 mint the SAME id ("dup"). With a shared
+// maestro.db they must remain independent rows keyed by (state_dir, id):
+// approving project A's row must neither consume nor block project B's, and B
+// must still be able to approve (and reject) its own.
+func TestApprove_CrossProjectSameID_Isolated(t *testing.T) {
+	s := openTestStore(t)
+	const id = "dup"
+	bindA := RowBinding{Project: "owner/a", Repo: "owner/a", StateDir: "/tmp/a"}
+	bindB := RowBinding{Project: "owner/b", Repo: "owner/b", StateDir: "/tmp/b"}
+	seedPendingScoped(t, s, bindA, id, "merge_pr", &state.SupervisorTarget{PR: 1})
+	seedPendingScoped(t, s, bindB, id, "merge_pr", &state.SupervisorTarget{PR: 1})
+
+	// Approve A's copy — B's must stay untouched (still pending).
+	gotA, err := s.Approve(context.Background(), bindA.StateDir, id, time.Now().UTC(), "x", "")
+	if err != nil {
+		t.Fatalf("approve A: %v", err)
+	}
+	if gotA.Status != state.ApprovalStatusApproved {
+		t.Fatalf("A status = %q, want approved", gotA.Status)
+	}
+	gotB, err := s.Get(context.Background(), bindB.StateDir, id)
+	if err != nil {
+		t.Fatalf("get B: %v", err)
+	}
+	if gotB.Status != state.ApprovalStatusPending {
+		t.Fatalf("B status = %q after A approve, want pending (cross-project leak)", gotB.Status)
+	}
+	if gotB.Project != "owner/b" {
+		t.Fatalf("B project = %q, want owner/b (A's row leaked into B's scope)", gotB.Project)
+	}
+
+	// B reject its own copy independently — A stays approved.
+	if _, err := s.Reject(context.Background(), bindB.StateDir, id, time.Now().UTC(), "y", "no"); err != nil {
+		t.Fatalf("reject B: %v", err)
+	}
+	finalA, err := s.Get(context.Background(), bindA.StateDir, id)
+	if err != nil {
+		t.Fatalf("get A: %v", err)
+	}
+	if finalA.Status != state.ApprovalStatusApproved {
+		t.Fatalf("A status = %q after B reject, want still approved", finalA.Status)
 	}
 }
 
@@ -106,10 +164,10 @@ func TestApprove_PayloadMismatchStales(t *testing.T) {
 	a := seedPending(t, s, "a3", "merge_pr", &state.SupervisorTarget{PR: 5})
 	// Corrupt the stored payload hash so ComputePayloadHash() no longer matches.
 	a.PayloadHash = "stale-hash"
-	if err := s.forceWriteJSON(a); err != nil {
+	if err := s.forceWriteJSON(testStateDir, a); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
-	got, err := s.Approve(context.Background(), "a3", time.Now().UTC(), "x", "")
+	got, err := s.Approve(context.Background(), testStateDir, "a3", time.Now().UTC(), "x", "")
 	if !errors.Is(err, state.ErrApprovalPayloadMismatch) {
 		t.Fatalf("err = %v, want ErrApprovalPayloadMismatch", err)
 	}
@@ -139,7 +197,7 @@ func TestApprove_ConcurrentClaimOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := s.Approve(context.Background(), "race", time.Now().UTC(), "racer", "")
+			_, err := s.Approve(context.Background(), testStateDir, "race", time.Now().UTC(), "racer", "")
 			switch {
 			case err == nil:
 				atomic.AddInt32(&wins, 1)
@@ -198,7 +256,7 @@ func TestApprove_ConcurrentClaimOnce_SeparateConnections(t *testing.T) {
 			}
 			defer s.Close()
 			<-start
-			_, err = s.Approve(context.Background(), "xproc", time.Now().UTC(), "racer", "")
+			_, err = s.Approve(context.Background(), testStateDir, "xproc", time.Now().UTC(), "racer", "")
 			switch {
 			case err == nil:
 				atomic.AddInt32(&wins, 1)
@@ -226,10 +284,10 @@ func TestApprove_ConcurrentClaimOnce_SeparateConnections(t *testing.T) {
 func TestMarkExecuted_Idempotent(t *testing.T) {
 	s := openTestStore(t)
 	seedPending(t, s, "m1", "merge_pr", &state.SupervisorTarget{PR: 3})
-	if _, err := s.Approve(context.Background(), "m1", time.Now().UTC(), "x", ""); err != nil {
+	if _, err := s.Approve(context.Background(), testStateDir, "m1", time.Now().UTC(), "x", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	got, err := s.MarkExecuted(context.Background(), "m1", time.Now().UTC(), "x", "merged PR #3")
+	got, err := s.MarkExecuted(context.Background(), testStateDir, "m1", time.Now().UTC(), "x", "merged PR #3")
 	if err != nil {
 		t.Fatalf("mark executed: %v", err)
 	}
@@ -237,7 +295,7 @@ func TestMarkExecuted_Idempotent(t *testing.T) {
 		t.Fatalf("status = %q, want executed", got.Status)
 	}
 	// Second finalize is a no-op error (not in status=approved).
-	if _, err := s.MarkExecuted(context.Background(), "m1", time.Now().UTC(), "x", "again"); !errors.Is(err, state.ErrApprovalNotApproved) {
+	if _, err := s.MarkExecuted(context.Background(), testStateDir, "m1", time.Now().UTC(), "x", "again"); !errors.Is(err, state.ErrApprovalNotApproved) {
 		t.Fatalf("second mark err = %v, want ErrApprovalNotApproved", err)
 	}
 }
@@ -245,20 +303,20 @@ func TestMarkExecuted_Idempotent(t *testing.T) {
 func TestPut_DoesNotResetStatus(t *testing.T) {
 	s := openTestStore(t)
 	a := seedPending(t, s, "p1", "merge_pr", &state.SupervisorTarget{PR: 8})
-	if _, err := s.Approve(context.Background(), "p1", time.Now().UTC(), "x", ""); err != nil {
+	if _, err := s.Approve(context.Background(), testStateDir, "p1", time.Now().UTC(), "x", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	// A second seed of the same (still pending in JSON) approval must NOT
 	// reset the SQLite row back to pending — that would re-open the claim.
 	a.Status = state.ApprovalStatusPending
-	inserted, err := s.Put(context.Background(), a, RowBinding{})
+	inserted, err := s.Put(context.Background(), a, RowBinding{StateDir: testStateDir})
 	if err != nil {
 		t.Fatalf("re-put: %v", err)
 	}
 	if inserted {
 		t.Fatalf("re-put reported inserted; INSERT OR IGNORE must keep the existing row")
 	}
-	got, err := s.Get(context.Background(), "p1")
+	got, err := s.Get(context.Background(), testStateDir, "p1")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -278,13 +336,13 @@ func auditCount(t *testing.T, s *Store, id string) int {
 
 // forceWriteJSON rewrites the stored approval_json + payload_hash for tests
 // that need to simulate payload drift.
-func (s *Store) forceWriteJSON(a *state.Approval) error {
+func (s *Store) forceWriteJSON(stateDir string, a *state.Approval) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := writeApprovalJSONTx(context.Background(), tx, a); err != nil {
+	if err := writeApprovalJSONTx(context.Background(), tx, stateDir, a); err != nil {
 		return err
 	}
 	return tx.Commit()
