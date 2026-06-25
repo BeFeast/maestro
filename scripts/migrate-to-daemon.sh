@@ -67,7 +67,8 @@ NO_START=0
 # what the Loki host actually runs; the `@` patterns cover the older
 # template-instance naming on other hosts. None of these match the new
 # single-service unit (`maestro.service` — no `@`, no `-` after `maestro`); the
-# new unit and the ephemeral self-deploy units are excluded in legacy_units too.
+# new unit, the self-deploy transient units, and the documented standalone
+# maestro-digest unit are excluded in legacy_units (exclude_non_legacy) too.
 LEGACY_PATTERNS=(
   'maestro@*'             # per-project run template instances (older naming)
   'maestro-supervise@*'   # per-project supervise template instances (older naming)
@@ -262,18 +263,24 @@ store_project_count() {
 # (`list-unit-files`). Bare template files (foo@.service) are dropped — only
 # instances/concrete units are stopped/disabled, and the templates stay on disk
 # for rollback.
-# exclude_self: drop units that must NEVER be stopped by the cutover — the new
-# single-service unit itself (defense-in-depth; `maestro-*` already can't match
-# it) and the ephemeral self-deploy transient units.
-exclude_self() {
-  grep -vxF 'maestro.service' | grep -vE '^maestro-self-deploy'
+# exclude_non_legacy: drop maestro-prefixed units that the broad `maestro-*`
+# glob matches but that are NOT part of the per-project fleet topology this
+# cutover replaces, so they are never stopped/disabled:
+#   * maestro.service          — the new single-service unit (defense-in-depth;
+#                                `maestro-*` already can't match it).
+#   * maestro-self-deploy*      — ephemeral self-deploy transient units.
+#   * maestro-digest{.service,} — the documented standalone digest unit/timer
+#                                (docs/digest-runbook.md); orthogonal to the
+#                                fleet, must survive the cutover.
+exclude_non_legacy() {
+  grep -vxF 'maestro.service' | grep -vE '^maestro-self-deploy' | grep -vE '^maestro-digest'
 }
 
 legacy_units() {
   {
     sc list-units --all --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
     sc list-unit-files --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
-  } | grep -E '\.service$' | grep -vE '@\.service$' | exclude_self | sort -u || true
+  } | grep -E '\.service$' | grep -vE '@\.service$' | exclude_non_legacy | sort -u || true
 }
 
 # --- 1. seed the config store ----------------------------------------------
@@ -359,7 +366,7 @@ fi
 # daemon, or two drivers would run the same project.
 if [[ "${DRY_RUN}" != "1" ]]; then
   still_active="$(sc list-units --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null \
-    | awk '$3=="active"{print $1}' | grep -E '\.service$' | grep -vE '@\.service$' | exclude_self || true)"
+    | awk '$3=="active"{print $1}' | grep -E '\.service$' | grep -vE '@\.service$' | exclude_non_legacy || true)"
   if [[ -n "${still_active}" ]]; then
     die "legacy unit(s) still active after stop: ${still_active//$'\n'/ } — refusing to start maestro.service (it would double-drive those projects). Stop them and re-run."
   fi
