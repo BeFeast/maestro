@@ -3757,9 +3757,13 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 		}
 		log.Printf("[orch] code_landed session for issue #%d passed outcome reconciliation; marking done", sess.IssueNumber)
 		if o.markDoneAfterOutcomePass(sess, sess.PRNumber) {
-			stale := s.MarkCloseIssueApprovalsStaleForVerifiedIssue(sess.IssueNumber, time.Now().UTC())
+			now := time.Now().UTC()
+			stale := s.MarkCloseIssueApprovalsStaleForVerifiedIssue(sess.IssueNumber, now)
 			if stale > 0 {
 				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
+			}
+			if rstale := s.MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(sess.IssueNumber, now); rstale > 0 {
+				log.Printf("[orch] expired %d stale spawn_repair_worker approval(s) for auto-closed issue #%d", rstale, sess.IssueNumber)
 			}
 		}
 	}
@@ -4030,9 +4034,13 @@ func (o *Orchestrator) verifyOutcomeAfterMerge(s *state.State, sess *state.Sessi
 	if result.State == outcome.HealthHealthy {
 		log.Printf("[orch] outcome verifier passed after PR #%d; marking issue #%d done", prNumber, sess.IssueNumber)
 		if o.markDoneAfterOutcomePass(sess, prNumber) {
-			stale := s.MarkCloseIssueApprovalsStaleForVerifiedIssue(sess.IssueNumber, time.Now().UTC())
+			now := time.Now().UTC()
+			stale := s.MarkCloseIssueApprovalsStaleForVerifiedIssue(sess.IssueNumber, now)
 			if stale > 0 {
 				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
+			}
+			if rstale := s.MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(sess.IssueNumber, now); rstale > 0 {
+				log.Printf("[orch] expired %d stale spawn_repair_worker approval(s) for auto-closed issue #%d", rstale, sess.IssueNumber)
 			}
 		}
 		o.notifier.Sendf("✅ maestro: outcome verifier passed after PR #%d; issue #%d can be treated as done", prNumber, sess.IssueNumber)
