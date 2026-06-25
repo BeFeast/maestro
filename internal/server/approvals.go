@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 )
@@ -65,7 +66,7 @@ func parseApprovalPath(prefix, urlPath string) (approvalRoute, bool) {
 // overrides any actor field in the request body — closing the bypass where
 // "approve IS the human-authorization step, and approve has no auth"
 // (write-path premortem failure mode #4).
-func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, stateDir string, route approvalRoute, auth authChecker) {
+func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, stateDir string, route approvalRoute, auth authChecker, store approvalstore.Binding) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -94,25 +95,20 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
 	reason := strings.TrimSpace(req.Reason)
 
-	st, err := state.Load(stateDir)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load state: %v", err))
-		return
-	}
-
+	// ApplyDecision performs the approve/reject transition against the
+	// configured store. In sqlite mode the pending→approved/rejected claim is
+	// atomic (claim-once across processes), so two parallel approves of the
+	// same id resolve to exactly one winner; the loser gets ErrApprovalNotPending
+	// (409). In json mode it is the legacy st.ApproveApproval/RejectApproval.
+	store.StateDir = stateDir
 	now := time.Now().UTC()
-	var approval *state.Approval
-	switch route.verb {
-	case "approve":
-		approval, err = st.ApproveApproval(route.id, now, actor, reason)
-	case "reject":
-		approval, err = st.RejectApproval(route.id, now, actor, reason)
-	default:
-		// parseApprovalPath already enforces this; defensive fall-back.
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown approval verb %q", route.verb))
-		return
-	}
+	st, approval, err := approvalstore.ApplyDecision(store, route.verb, route.id, now, actor, reason)
 	if err != nil {
+		if st == nil {
+			// state.Load (or store Open) failed before any transition.
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("load state: %v", err))
+			return
+		}
 		// Persist any partial state changes (stale/superseded transitions
 		// can mutate even when the verb fails) before returning.
 		if persistErr := state.Save(stateDir, st); persistErr != nil {
@@ -132,8 +128,12 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 			// uniformly with the other conflict cases instead of
 			// receiving a misleading 400 Bad Request.
 			writeError(w, http.StatusConflict, err.Error())
-		default:
+		case errors.Is(err, state.ErrApprovalNotApproved):
 			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			// Infrastructure errors (sqlite open/exec, write-through) — the
+			// approval state machine only emits the sentinels above.
+			writeError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
@@ -157,7 +157,7 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	if cfg != nil {
 		stateDir = cfg.StateDir
 	}
-	applyApprovalDecision(w, r, cfgServerReadOnly(cfg), "server", stateDir, route, s.auth)
+	applyApprovalDecision(w, r, cfgServerReadOnly(cfg), "server", stateDir, route, s.auth, s.approvalBinding(cfg))
 }
 
 func cfgServerReadOnly(cfg *config.Config) bool {
@@ -210,5 +210,5 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	if project.cfg != nil {
 		stateDir = project.cfg.StateDir
 	}
-	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route, auth)
+	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route, auth, s.approvalBinding(project.cfg))
 }

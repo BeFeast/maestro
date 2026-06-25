@@ -19,6 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configstore"
@@ -715,7 +716,14 @@ func runCmd(args []string) {
 	interval := fs.Duration("interval", 10*time.Minute, "Loop interval")
 	once := fs.Bool("once", false, "Run once and exit")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
+	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend for the HTTP approve/reject endpoint: json|sqlite (#759)")
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals db path (used with --approvals-store=sqlite)")
 	fs.Parse(args)
+
+	approvalsMode, err := approvalstore.ParseMode(*approvalsStore)
+	if err != nil {
+		log.Fatalf("run: %v", err)
+	}
 
 	cfgs := loadConfigsWithStore(configs, *storePath, *storeProject)
 
@@ -733,6 +741,9 @@ func runCmd(args []string) {
 		if cfg.Server.Port > 0 {
 			srv := server.New(cfg, refreshCh)
 			srv.SetActionDeps(github.New(cfg.Repo), nil)
+			if err := srv.SetApprovalStore(approvalsMode, *approvalsDB); err != nil {
+				log.Fatalf("run: open approvals store: %v", err)
+			}
 			go func() {
 				if err := srv.Start(context.Background()); err != nil {
 					log.Printf("[server] error: %v", err)
@@ -792,6 +803,9 @@ func runCmd(args []string) {
 			if c.Server.Port > 0 {
 				srv := server.New(c, refreshCh)
 				srv.SetActionDeps(github.New(c.Repo), nil)
+				if err := srv.SetApprovalStore(approvalsMode, *approvalsDB); err != nil {
+					log.Fatalf("[%s] run: open approvals store: %v", c.SessionPrefix, err)
+				}
 				go func() {
 					if err := srv.Start(ctx); err != nil {
 						log.Printf("[%s][server] error: %v", c.SessionPrefix, err)
@@ -924,30 +938,35 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 	configPath := fs.String("config", defaultConfigPath, "Path to config file")
 	actor := fs.String("actor", "cli", "Audit actor")
 	reason := fs.String("reason", "", "Audit reason")
+	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend: json|sqlite (sqlite gives transactional claim-once)")
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals db path (used with --approvals-store=sqlite)")
 	fs.Parse(reorderArgs(fs, args))
 	if fs.NArg() != 1 {
 		log.Fatalf("supervise %s: expected approval or decision id", action)
 	}
 
 	cfg := loadConfig(*configPath)
-	st, err := state.Load(cfg.StateDir)
+	mode, err := approvalstore.ParseMode(*approvalsStore)
 	if err != nil {
-		log.Fatalf("supervise %s: load state: %v", action, err)
+		log.Fatalf("supervise %s: %v", action, err)
+	}
+	binding := approvalstore.Binding{
+		Mode:     mode,
+		DBPath:   *approvalsDB,
+		StateDir: cfg.StateDir,
+		Repo:     cfg.Repo,
+		Project:  cfg.Repo,
 	}
 
 	id := fs.Arg(0)
 	now := time.Now().UTC()
-	var approval *state.Approval
-	switch action {
-	case "approve":
-		approval, err = st.ApproveApproval(id, now, *actor, *reason)
-	case "reject":
-		approval, err = st.RejectApproval(id, now, *actor, *reason)
-	default:
-		log.Fatalf("supervise: unknown approval action %q", action)
-	}
+	// ApplyDecision performs the approve/reject transition. In sqlite mode the
+	// pending→approved claim is atomic (claim-once): a second concurrent
+	// approve loses the claim and is reported as "already processed", so the
+	// executor below fires exactly once (write-path premortem double-execute).
+	st, approval, err := approvalstore.ApplyDecision(binding, action, id, now, *actor, *reason)
 	if err != nil {
-		if errors.Is(err, state.ErrApprovalStale) || errors.Is(err, state.ErrApprovalPayloadMismatch) {
+		if st != nil && (errors.Is(err, state.ErrApprovalStale) || errors.Is(err, state.ErrApprovalPayloadMismatch)) {
 			if saveErr := state.Save(cfg.StateDir, st); saveErr != nil {
 				log.Fatalf("supervise %s: save stale approval: %v", action, saveErr)
 			}
@@ -1008,6 +1027,16 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 
 	if err := state.Save(cfg.StateDir, st); err != nil {
 		log.Fatalf("supervise approve: save state after execution: %v", err)
+	}
+	// Mirror the terminal execution status into the SQLite store (no-op in
+	// json mode). JSON state stays authoritative for the executor loop, so a
+	// mirror failure is logged, not fatal.
+	mirrorMsg := res.Summary
+	if res.Status == state.ApprovalStatusExecutionFailed && mirrorMsg == "" && res.Err != nil {
+		mirrorMsg = res.Err.Error()
+	}
+	if mErr := approvalstore.FinalizeExecution(binding, approval.ID, res.Status, now, *actor, mirrorMsg); mErr != nil {
+		log.Printf("supervise approve: mirror execution to approvals store: %v", mErr)
 	}
 
 	switch res.Status {

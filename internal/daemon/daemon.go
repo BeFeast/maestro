@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/selfdeploy"
@@ -89,6 +90,16 @@ type Options struct {
 	// WatchStoreInterval is the diff-loop / reload poll cadence; clamped to
 	// DefaultWatchStoreInterval when non-positive.
 	WatchStoreInterval time.Duration
+
+	// ApprovalsStore selects the store backing the fleet approve/reject
+	// endpoint (#759): "json" (default) keeps the legacy per-project JSON
+	// read-merge-write; "sqlite" routes the pending→approved/rejected claim
+	// through the transactional claim-once store at ApprovalsDBPath. Empty is
+	// treated as json.
+	ApprovalsStore string
+	// ApprovalsDBPath is the shared SQLite approvals database used when
+	// ApprovalsStore is "sqlite".
+	ApprovalsDBPath string
 }
 
 // Daemon owns the running project flows and the shared FleetServer.
@@ -251,6 +262,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// One FleetServer for the whole fleet — replaces the N per-project
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
+	approvalsMode, err := approvalstore.ParseMode(d.opts.ApprovalsStore)
+	if err != nil {
+		return err
+	}
+	if err := fleet.SetApprovalStore(approvalsMode, d.opts.ApprovalsDBPath); err != nil {
+		return fmt.Errorf("open approvals store %s: %w", d.opts.ApprovalsDBPath, err)
+	}
 	fleetAuth := server.FleetAuthFromProjects(projects)
 	fleet.SetAuth(fleetAuth)
 	// Capture the fleet's shared auth token env so the self-deploy health probe
