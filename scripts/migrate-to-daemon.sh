@@ -10,11 +10,20 @@
 # would double-spawn workers.
 #
 # Steps:
-#   1. Seed the SQLite config store from the YAML config dir
-#      (`config-store migrate`), unless it is already populated.
-#   2. Install maestro.service into the systemd user unit dir.
-#   3. Stop + disable the legacy units (maestro@*, maestro-supervise@*,
-#      maestro-serve) — OLD STOPS BEFORE NEW STARTS.
+#   1. Seed the SQLite config store from EVERY legacy config source:
+#      - the newer `~/.maestro/maestro.d/*.yaml` directory (`config-store migrate`)
+#      - the legacy per-instance files the `maestro@%i` template loaded,
+#        `~/.maestro/maestro-*.yaml` (`config-store add`, one per file).
+#      Then refuse to go any further if the store is still empty — we never stop
+#      the legacy units only to start an empty daemon.
+#   2. Render maestro.service with the requested --bin/--store/--port and install
+#      it into the systemd user unit dir (the committed template hard-codes the
+#      defaults; a custom binary/store/port must reach the unit, not just the
+#      verification).
+#   3. Stop + disable the legacy units — discovered from BOTH `list-units`
+#      (loaded/running) AND `list-unit-files` (enabled-but-inactive on disk), so
+#      an enabled instance that is not currently loaded cannot re-appear on the
+#      next login/boot next to maestro.service. OLD STOPS BEFORE NEW STARTS.
 #   4. enable --now maestro.service.
 #   5. Verify :PORT/api/v1/fleet responds and print the running version.
 #
@@ -28,8 +37,9 @@
 set -euo pipefail
 
 # --- defaults ---------------------------------------------------------------
-STORE="${HOME}/.maestro/maestro.db"
-CONFIG_DIR="${HOME}/.maestro/maestro.d"
+MAESTRO_DIR="${HOME}/.maestro"
+STORE="${MAESTRO_DIR}/maestro.db"
+CONFIG_DIR="${MAESTRO_DIR}/maestro.d"
 PORT=8786
 UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 BIN=""
@@ -37,16 +47,26 @@ DRY_RUN=0
 ASSUME_YES=0
 NO_START=0
 
+# Legacy unit name patterns to stop + disable. None of these match the new
+# single-service unit (`maestro.service` — no `@`, no `-` after `maestro`).
+LEGACY_PATTERNS=(
+  'maestro@*'             # per-project run template instances
+  'maestro-supervise@*'   # per-project supervise template instances
+  'maestro-supervisor-*'  # per-project supervisor units (dash form)
+  'maestro-serve*'        # fleet serve unit(s)
+)
+
 usage() {
   cat >&2 <<EOF
 usage: migrate-to-daemon.sh [options]
 
   --store PATH        SQLite store path (default: ${STORE})
   --config-dir DIR    YAML configs to seed the store from (default: ${CONFIG_DIR})
-  --port N            Fleet web port to verify (default: ${PORT})
+  --port N            Fleet web port — written into the unit AND verified (default: ${PORT})
   --unit-dir DIR      systemd --user unit dir (default: ${UNIT_DIR})
-  --bin PATH          maestro binary (default: resolved from PATH / /usr/local/bin/maestro)
-  --dry-run           print the actions without changing anything
+  --bin PATH          maestro binary — written into the unit's ExecStart
+                      (default: resolved from PATH / /usr/local/bin/maestro)
+  --dry-run           print the actions (incl. the rendered unit) without changing anything
   --no-start          install + seed only; do not stop old units or start the daemon
   --yes               do not prompt for confirmation
   -h, --help          this help
@@ -82,6 +102,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Where the legacy per-instance files (maestro-*.yaml) live: next to maestro.d.
+LEGACY_CFG_DIR="$(dirname "${CONFIG_DIR}")"
+
 # --- resolve the binary -----------------------------------------------------
 if [[ -z "${BIN}" ]]; then
   if command -v maestro >/dev/null 2>&1; then
@@ -94,7 +117,7 @@ if [[ -z "${BIN}" ]]; then
 fi
 [[ -x "${BIN}" ]] || die "maestro binary ${BIN} is not executable"
 
-# --- locate the unit file (next to this script's repo root) -----------------
+# --- locate the unit template (next to this script's repo root) -------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SRC="${SCRIPT_DIR}/../maestro.service"
 [[ -f "${UNIT_SRC}" ]] || die "maestro.service not found at ${UNIT_SRC}"
@@ -112,41 +135,140 @@ if [[ "${ASSUME_YES}" != "1" && "${DRY_RUN}" != "1" ]]; then
   case "${reply}" in y|Y|yes|YES) ;; *) die "aborted by operator" ;; esac
 fi
 
+# --- helpers ----------------------------------------------------------------
+
+# Escape a value for sed's replacement (right-hand) side when '|' is the
+# delimiter: backslash, the delimiter, and & are special there.
+sed_repl() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+
+# render_unit emits maestro.service with the operator's --bin/--store/--port
+# substituted into the template's ExecStart. The committed unit hard-codes the
+# defaults (/usr/local/bin/maestro, %h/.maestro/maestro.db, 8786); rendering
+# keeps the installed unit consistent with the store this script seeds and the
+# endpoint it verifies. The rest of the unit (flag set, drain timeout, restart
+# policy) stays the template's — it remains the single source of truth.
+render_unit() {
+  local bin store port
+  bin="$(sed_repl "${BIN}")"
+  store="$(sed_repl "${STORE}")"
+  port="$(sed_repl "${PORT}")"
+  sed \
+    -e "s|ExecStart=/usr/local/bin/maestro |ExecStart=${bin} |" \
+    -e "s|--store %h/.maestro/maestro.db|--store ${store}|" \
+    -e "s|--port 8786|--port ${port}|" \
+    "${UNIT_SRC}"
+}
+
+# store_project_count prints how many projects the store currently holds, by
+# exporting it to a throwaway dir and counting the emitted YAML files (there is
+# no `config-store list`). Used to refuse a cutover against an empty store.
+store_project_count() {
+  local tmp count
+  tmp="$(mktemp -d)"
+  if "${BIN}" config-store export --db "${STORE}" --dir "${tmp}" >/dev/null 2>&1; then
+    shopt -s nullglob
+    local files=( "${tmp}"/*.yaml "${tmp}"/*.yml )
+    shopt -u nullglob
+    count=${#files[@]}
+  else
+    count=0
+  fi
+  rm -rf "${tmp}"
+  printf '%s' "${count}"
+}
+
+# legacy_units prints the legacy service units to act on, unioning currently
+# loaded units (`list-units --all`) with installed-but-inactive unit files
+# (`list-unit-files`). Bare template files (foo@.service) are dropped — only
+# instances/concrete units are stopped/disabled, and the templates stay on disk
+# for rollback.
+legacy_units() {
+  {
+    systemctl --user list-units --all --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
+    systemctl --user list-unit-files --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null | awk '{print $1}'
+  } | grep -E '\.service$' | grep -vE '@\.service$' | sort -u || true
+}
+
 # --- 1. seed the config store ----------------------------------------------
+# Import the legacy per-instance files first (maestro@<i> → maestro-<i>.yaml) so
+# a current maestro.d/ wins on conflict; then the maestro.d directory on top.
+shopt -s nullglob
+LEGACY_CFGS=( "${LEGACY_CFG_DIR}"/maestro-*.yaml "${LEGACY_CFG_DIR}"/maestro-*.yml )
+shopt -u nullglob
+if [[ ${#LEGACY_CFGS[@]} -gt 0 ]]; then
+  log "importing ${#LEGACY_CFGS[@]} legacy maestro-*.yaml config(s) from ${LEGACY_CFG_DIR}"
+  for cfg in "${LEGACY_CFGS[@]}"; do
+    run "${BIN}" config-store add --db "${STORE}" --file "${cfg}"
+  done
+fi
 if [[ -d "${CONFIG_DIR}" ]]; then
   log "seeding config store from ${CONFIG_DIR}"
   run "${BIN}" config-store migrate --db "${STORE}" --dir "${CONFIG_DIR}"
-else
-  warn "config dir ${CONFIG_DIR} not found — skipping seed (store assumed already populated)"
+elif [[ ${#LEGACY_CFGS[@]} -eq 0 ]]; then
+  warn "no config sources found (${CONFIG_DIR} missing, no ${LEGACY_CFG_DIR}/maestro-*.yaml)"
+  warn "assuming the store at ${STORE} is already populated — verifying below"
 fi
 
-# --- 2. install the unit ----------------------------------------------------
+# Count what the store holds now (skip under --dry-run: nothing was seeded). The
+# empty-store guard that refuses to stop the legacy units lives just before the
+# stop step ("fail before stopping anything"); under --no-start we only warn.
+STORE_PROJECTS=""
+if [[ "${DRY_RUN}" != "1" ]]; then
+  STORE_PROJECTS="$(store_project_count)"
+  log "config store ${STORE} holds ${STORE_PROJECTS} project(s)"
+fi
+
+# --- 2. render + install the unit ------------------------------------------
 log "installing maestro.service into ${UNIT_DIR}"
-run mkdir -p "${UNIT_DIR}"
-run cp "${UNIT_SRC}" "${UNIT_DIR}/maestro.service"
-run systemctl --user daemon-reload
+log "  ExecStart binary: ${BIN}"
+log "  --store:          ${STORE}"
+log "  --port:           ${PORT}"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  printf '  + mkdir -p %s\n' "${UNIT_DIR}"
+  printf '  + render maestro.service (from %s) → %s/maestro.service:\n' "${UNIT_SRC}" "${UNIT_DIR}"
+  render_unit | sed 's/^/        /'
+  printf '  + systemctl --user daemon-reload\n'
+else
+  mkdir -p "${UNIT_DIR}"
+  render_unit > "${UNIT_DIR}/maestro.service"
+  systemctl --user daemon-reload
+fi
 
 if [[ "${NO_START}" == "1" ]]; then
+  if [[ "${STORE_PROJECTS}" == "0" ]]; then
+    warn "config store ${STORE} is empty — seed it before cutover (no projects to run)"
+  fi
   log "--no-start: store seeded and unit installed; not touching running units"
   exit 0
 fi
 
+# Refuse to stop anything if the store ended up empty: stopping the legacy units
+# only to start an empty daemon would take the whole fleet down. (Already gated
+# on a live store; --dry-run leaves STORE_PROJECTS empty and skips this.)
+if [[ "${STORE_PROJECTS}" == "0" ]]; then
+  die "config store ${STORE} has no projects after seeding — refusing to stop the legacy units (the daemon would start empty). Seed it first, e.g.:
+      ${BIN} config-store migrate --db ${STORE} --dir ${CONFIG_DIR}
+    or place the legacy per-project files at ${LEGACY_CFG_DIR}/maestro-<name>.yaml and re-run."
+fi
+
 # --- 3. stop + disable the legacy units (OLD STOPS BEFORE NEW STARTS) -------
-# Collect the legacy units actually present so we only act on what exists and the
-# cutover stays non-concurrent. Patterns: per-project run (maestro@*), per-project
-# supervise (maestro-supervise@*), and the single fleet serve unit (maestro-serve).
-legacy_units() {
-  systemctl --user list-units --all --plain --no-legend \
-    'maestro@*' 'maestro-supervise@*' 'maestro-serve.service' 2>/dev/null \
-    | awk '{print $1}' | grep -E '\.service$' || true
-}
 mapfile -t OLD < <(legacy_units)
 if [[ ${#OLD[@]} -gt 0 ]]; then
-  log "stopping ${#OLD[@]} legacy unit(s): ${OLD[*]}"
-  run systemctl --user stop "${OLD[@]}"
-  run systemctl --user disable "${OLD[@]}"
+  log "stopping + disabling ${#OLD[@]} legacy unit(s): ${OLD[*]}"
+  run systemctl --user stop "${OLD[@]}" || warn "some legacy units did not stop cleanly"
+  run systemctl --user disable "${OLD[@]}" || warn "some legacy units did not disable cleanly"
 else
-  warn "no legacy maestro units found running — proceeding to start the daemon"
+  warn "no legacy maestro units found (loaded or enabled) — proceeding to start the daemon"
+fi
+
+# Non-concurrency guard: nothing legacy may still be active when we start the
+# daemon, or two drivers would run the same project.
+if [[ "${DRY_RUN}" != "1" ]]; then
+  still_active="$(systemctl --user list-units --plain --no-legend "${LEGACY_PATTERNS[@]}" 2>/dev/null \
+    | awk '$3=="active"{print $1}' | grep -E '\.service$' | grep -vE '@\.service$' || true)"
+  if [[ -n "${still_active}" ]]; then
+    die "legacy unit(s) still active after stop: ${still_active//$'\n'/ } — refusing to start maestro.service (it would double-drive those projects). Stop them and re-run."
+  fi
 fi
 
 # --- 4. start the daemon ----------------------------------------------------
@@ -173,10 +295,9 @@ if [[ "${ok}" != "1" ]]; then
   die "verification failed — investigate before assuming the cutover succeeded"
 fi
 
-remaining="$(systemctl --user list-units --plain --no-legend 'maestro-*' 2>/dev/null | awk '{print $1}' || true)"
 log "active maestro units now:"
 systemctl --user list-units --no-legend 'maestro*' 2>/dev/null || true
 log "running version: $(${BIN} version 2>/dev/null || echo unknown)"
 log "cutover complete. Rollback: systemctl --user disable --now maestro.service && re-enable the legacy units."
-[[ -n "${remaining}" ]] && warn "note: legacy maestro-* units still present (left on disk for rollback): ${remaining}"
+log "(legacy unit files remain on disk, now disabled, so rollback re-enables them.)"
 exit 0
