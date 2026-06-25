@@ -78,6 +78,14 @@ func (d *Daemon) reconcileStore(flowParent context.Context, fp map[string]time.T
 		log.Printf("[daemon] store watch: project %q removed — draining flow %q", name, flow.name)
 		if fleet != nil {
 			fleet.RemoveProject(flow.name)
+			// Drop the removed project's rows from the shared maestro.db so its
+			// sessions/health stop surfacing in cross-project queries the moment it
+			// leaves the fleet (#760). No-op in json mode (StateStore() is nil).
+			if store := fleet.StateStore(); store != nil && flow.cfg != nil {
+				if err := store.ClearStateDir(flowParent, flow.cfg.StateDir); err != nil {
+					log.Printf("[daemon] store watch: clear state rows for %q (state_dir=%s) failed: %v", flow.name, flow.cfg.StateDir, err)
+				}
+			}
 		}
 		d.stopFlow(flow.key)
 		// Free this flow's fleet display name AND its flow identity in the local

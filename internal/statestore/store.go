@@ -207,6 +207,51 @@ func (s *Store) ImportState(ctx context.Context, b RowBinding, st *state.State) 
 	return tx.Commit()
 }
 
+// ClearStateDir removes every row bound to stateDir (all four tables) — the
+// removal counterpart used when a project is dropped from the fleet at runtime
+// (#760), so its sessions/health stop surfacing in cross-project queries the
+// moment it leaves. It is ImportState(stateDir, nil) under a clearer name.
+func (s *Store) ClearStateDir(ctx context.Context, stateDir string) error {
+	return s.ImportState(ctx, RowBinding{StateDir: stateDir}, nil)
+}
+
+// RetainStateDirs deletes every row whose state_dir is NOT in keep, across all
+// four tables, in one transaction. It is the startup reconcile for projects that
+// vanished from the config store while the daemon was stopped (#760): the import
+// loop refreshes the rows of the CURRENT fleet, and this drops the stale rows of
+// any project no longer present, so a cross-project query never returns sessions
+// or health for a project that is not running. An empty keep set clears every row
+// (no projects → no state). Blank/duplicate dirs in keep are ignored.
+func (s *Store) RetainStateDirs(ctx context.Context, keep []string) error {
+	seen := make(map[string]bool, len(keep))
+	placeholders := make([]string, 0, len(keep))
+	args := make([]any, 0, len(keep))
+	for _, dir := range keep {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		placeholders = append(placeholders, "?")
+		args = append(args, dir)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"sessions", "decisions", "backend_health", "missions"} {
+		q := `DELETE FROM ` + table
+		if len(placeholders) > 0 {
+			q += ` WHERE state_dir NOT IN (` + strings.Join(placeholders, ", ") + `)`
+		}
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("prune %s: %w", table, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // ProjectSession is one session row with its originating project binding,
 // returned by the cross-project queries so a fleet caller knows which project a
 // session belongs to without a second lookup.

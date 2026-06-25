@@ -21,6 +21,9 @@ func TestFleetStateStoreCrossProject(t *testing.T) {
 	if err := fleet.SetStateStore(statestore.ModeSQLite, db); err != nil {
 		t.Fatalf("set state store: %v", err)
 	}
+	// SetStateStore installs a process-global state.Save hook; clear it so it
+	// cannot fire into this closed store from a later test in the package.
+	t.Cleanup(func() { state.SetSaveHook(nil) })
 	store := fleet.StateStore()
 	if store == nil {
 		t.Fatal("expected a state store handle in sqlite mode")
@@ -55,6 +58,46 @@ func TestFleetStateStoreCrossProject(t *testing.T) {
 	}
 	if byProject["owner/a"] != 11 || byProject["owner/b"] != 22 {
 		t.Fatalf("cross-project running sessions mis-tagged: %+v", byProject)
+	}
+}
+
+// TestFleetStateStoreWriteThroughOnSave is the #760 P1 fix: with sqlite mode on,
+// a plain state.Save (the orchestrator/supervisor/watchdog/server write path)
+// mirrors into the shared maestro.db through the installed save hook — WITHOUT
+// the fleet read path ever polling the project. The cross-project query then
+// reflects the save immediately instead of being stuck at the startup snapshot.
+func TestFleetStateStoreWriteThroughOnSave(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "maestro.db")
+	cfg := &config.Config{Repo: "owner/a", StateDir: filepath.Join(t.TempDir(), "a")}
+	proj := NewFleetProject("a", "", "", cfg)
+	fleet := NewFleet([]FleetProject{proj}, "127.0.0.1", 0, false)
+	if err := fleet.SetStateStore(statestore.ModeSQLite, db); err != nil {
+		t.Fatalf("set state store: %v", err)
+	}
+	// SetStateStore installs a process-global hook; drop it so it cannot fire into
+	// this closed store from a later test in the package.
+	t.Cleanup(func() { state.SetSaveHook(nil) })
+	store := fleet.StateStore()
+	if store == nil {
+		t.Fatal("expected a state store handle in sqlite mode")
+	}
+
+	// A direct save — no fleet read path involved — must reach the mirror.
+	st := state.NewState()
+	st.Sessions["1"] = &state.Session{IssueNumber: 99, Status: state.StatusRunning}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	running, err := store.RunningSessions(context.Background())
+	if err != nil {
+		t.Fatalf("running sessions: %v", err)
+	}
+	if len(running) != 1 {
+		t.Fatalf("write-through did not mirror the save: got %d running sessions, want 1", len(running))
+	}
+	if running[0].Project != "owner/a" || running[0].Session.IssueNumber != 99 {
+		t.Fatalf("write-through row mis-tagged: %+v", running[0])
 	}
 }
 

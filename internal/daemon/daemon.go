@@ -299,7 +299,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// import failure is non-fatal: JSON stays authoritative and the fleet read
 	// path re-mirrors on its next snapshot.
 	if store := fleet.StateStore(); store != nil {
+		// keep is the CURRENT fleet's state dirs, built from importCfgs regardless
+		// of per-project import success, so a transient load/import error below
+		// never prunes a live project's rows.
+		keep := make([]string, 0, len(importCfgs))
 		for _, cfg := range importCfgs {
+			keep = append(keep, cfg.StateDir)
 			st, lerr := state.Load(cfg.StateDir)
 			if lerr != nil {
 				log.Printf("[daemon] state import skip (repo=%s state_dir=%s): load failed: %v", cfg.Repo, cfg.StateDir, lerr)
@@ -311,6 +316,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				continue
 			}
 			log.Printf("[daemon] imported state.json → maestro.db (repo=%s state_dir=%s, %d sessions)", cfg.Repo, cfg.StateDir, len(st.Sessions))
+		}
+		// Drop rows for projects no longer in the fleet (removed from the config
+		// store while the daemon was stopped). Without this, a cross-project query
+		// keeps returning sessions/health for a project that is not running (#760).
+		if perr := store.RetainStateDirs(ctx, keep); perr != nil {
+			log.Printf("[daemon] state prune (drop removed-project rows) failed: %v", perr)
 		}
 	}
 	fleetAuth := server.FleetAuthFromProjects(projects)

@@ -357,6 +357,17 @@ func (s *FleetServer) SetStateStore(mode statestore.Mode, dbPath string) error {
 			return err
 		}
 		s.stateHandle = store
+		// Install the process-global state.Save write-through hook so EVERY save
+		// in this daemon — orchestrator, supervisor, watchdog, server action —
+		// mirrors into the shared maestro.db, not only the projects the fleet read
+		// path has polled (#760). Without this the mirror is refreshed solely from
+		// projectSnapshot, so a cross-project query stays stuck at the startup
+		// import whenever the dashboard/API is idle.
+		state.SetSaveHook(s.mirrorSavedState)
+	} else {
+		// json mode: drop any hook a prior sqlite configuration installed so the
+		// JSON-only path is fully restored.
+		state.SetSaveHook(nil)
 	}
 	return nil
 }
@@ -384,10 +395,12 @@ func (s *FleetServer) stateBinding(cfg *config.Config) statestore.Binding {
 }
 
 // mirrorState write-through-mirrors one project's freshly-loaded state into the
-// SQLite store. It is a no-op in json mode, so the fleet's per-project state
-// reads transparently keep the shared maestro.db in sync during the transition
-// without changing the HTTP response. A mirror failure is non-fatal — JSON
-// remains authoritative — so it is logged and swallowed rather than surfaced.
+// SQLite store from the fleet READ path. With the state.Save hook installed
+// (mirrorSavedState) the in-process writers already mirror on every save, so this
+// is now a backstop: it re-syncs state written by ANOTHER process (a CLI verb
+// still writing JSON during the transition) on the next fleet snapshot. It is a
+// no-op in json mode. A mirror failure is non-fatal — JSON remains authoritative
+// — so it is logged and swallowed rather than surfaced.
 func (s *FleetServer) mirrorState(cfg *config.Config, st *state.State) {
 	if s == nil || s.stateMode != statestore.ModeSQLite || cfg == nil {
 		return
@@ -395,6 +408,49 @@ func (s *FleetServer) mirrorState(cfg *config.Config, st *state.State) {
 	if err := statestore.Mirror(s.stateBinding(cfg), st); err != nil {
 		log.Printf("[fleet] state mirror for %s failed (json remains authoritative): %v", cfg.Repo, err)
 	}
+}
+
+// mirrorSavedState is the process-global state.Save write-through hook installed
+// by SetStateStore in sqlite mode (#760). It fires after every state.Save in this
+// process and mirrors the persisted snapshot into the shared maestro.db so a
+// cross-project SQL query reflects every write — not only the projects the fleet
+// read path has polled. The originating project's repo/name are resolved from the
+// live project list so a hot-added project tags its rows; a state dir not (yet) in
+// the fleet still mirrors under its state_dir, which is the row scope. A mirror
+// failure is non-fatal: JSON remains the authoritative mint source.
+func (s *FleetServer) mirrorSavedState(stateDir string, st *state.State) {
+	if s == nil || s.stateMode != statestore.ModeSQLite {
+		return
+	}
+	b := statestore.Binding{
+		Mode:     s.stateMode,
+		DBPath:   s.stateDBPath,
+		Handle:   s.stateHandle,
+		StateDir: stateDir,
+	}
+	if cfg := s.cfgForStateDir(stateDir); cfg != nil {
+		b.Repo = cfg.Repo
+		b.Project = cfg.Repo
+	}
+	if err := statestore.Mirror(b, st); err != nil {
+		log.Printf("[fleet] state write-through mirror for %s failed (json remains authoritative): %v", stateDir, err)
+	}
+}
+
+// cfgForStateDir returns the resolved config of the live project whose state dir
+// matches, or nil. It lets the write-through hook tag rows with repo/project
+// without threading a binding through every state.Save call site.
+func (s *FleetServer) cfgForStateDir(stateDir string) *config.Config {
+	stateDir = strings.TrimSpace(stateDir)
+	if stateDir == "" {
+		return nil
+	}
+	for _, p := range s.projectsSnapshot() {
+		if p.cfg != nil && p.cfg.StateDir == stateDir {
+			return p.cfg
+		}
+	}
+	return nil
 }
 
 // projectsSnapshot returns a copy of the project slice under the read lock so

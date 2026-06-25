@@ -250,6 +250,100 @@ func TestImportNilClears(t *testing.T) {
 	}
 }
 
+// TestRetainStateDirs proves the startup reconcile drops rows for projects no
+// longer in the fleet while preserving the rows of projects still present — the
+// #760 fix for stale cross-project rows after a project is removed.
+func TestRetainStateDirs(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	a := bindingFor("/sd/a", "owner/a", "owner/a")
+	b := bindingFor("/sd/b", "owner/b", "owner/b")
+	c := bindingFor("/sd/c", "owner/c", "owner/c")
+	for _, bind := range []RowBinding{a, b, c} {
+		if err := s.ImportState(ctx, bind, sampleState()); err != nil {
+			t.Fatalf("import %s: %v", bind.StateDir, err)
+		}
+	}
+
+	// Keep only a and c; b was removed from the config store while stopped.
+	if err := s.RetainStateDirs(ctx, []string{"/sd/a", "", "/sd/a", "/sd/c"}); err != nil {
+		t.Fatalf("retain: %v", err)
+	}
+
+	running, err := s.RunningSessions(ctx)
+	if err != nil {
+		t.Fatalf("running: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, ps := range running {
+		seen[ps.Project] = true
+	}
+	if seen["owner/b"] {
+		t.Fatalf("removed project still surfaced in cross-project query: %+v", running)
+	}
+	if !seen["owner/a"] || !seen["owner/c"] {
+		t.Fatalf("retained projects missing after prune: %+v", running)
+	}
+	// b's rows must be gone from every table, not just sessions.
+	if h, _ := s.BackendHealth(ctx, "/sd/b"); len(h) != 0 {
+		t.Fatalf("removed project's backend_health rows not pruned: %d", len(h))
+	}
+	if m, _ := s.Missions(ctx, "/sd/b"); len(m) != 0 {
+		t.Fatalf("removed project's mission rows not pruned: %d", len(m))
+	}
+	if d, _ := s.Decisions(ctx, "/sd/b"); len(d) != 0 {
+		t.Fatalf("removed project's decision rows not pruned: %d", len(d))
+	}
+	// a's rows must be untouched.
+	if sess, _ := s.Sessions(ctx, "/sd/a"); len(sess) != 2 {
+		t.Fatalf("retained project's sessions disturbed: %d", len(sess))
+	}
+}
+
+// TestRetainStateDirsEmptyClearsAll asserts an empty keep set (no projects)
+// clears every row.
+func TestRetainStateDirsEmptyClearsAll(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.ImportState(ctx, bindingFor("/sd/a", "owner/a", "owner/a"), sampleState()); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := s.RetainStateDirs(ctx, nil); err != nil {
+		t.Fatalf("retain empty: %v", err)
+	}
+	running, err := s.RunningSessions(ctx)
+	if err != nil {
+		t.Fatalf("running: %v", err)
+	}
+	if len(running) != 0 {
+		t.Fatalf("empty keep set did not clear all rows: %d", len(running))
+	}
+}
+
+// TestClearStateDir asserts the runtime-removal counterpart drops one project's
+// rows without touching another's.
+func TestClearStateDir(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	a := bindingFor("/sd/a", "owner/a", "owner/a")
+	b := bindingFor("/sd/b", "owner/b", "owner/b")
+	if err := s.ImportState(ctx, a, sampleState()); err != nil {
+		t.Fatalf("import a: %v", err)
+	}
+	if err := s.ImportState(ctx, b, sampleState()); err != nil {
+		t.Fatalf("import b: %v", err)
+	}
+	if err := s.ClearStateDir(ctx, "/sd/a"); err != nil {
+		t.Fatalf("clear a: %v", err)
+	}
+	if sess, _ := s.Sessions(ctx, "/sd/a"); len(sess) != 0 {
+		t.Fatalf("cleared project still has sessions: %d", len(sess))
+	}
+	if sess, _ := s.Sessions(ctx, "/sd/b"); len(sess) != 2 {
+		t.Fatalf("clearing a disturbed b: %d", len(sess))
+	}
+}
+
 func TestMirrorModeJSONIsNoop(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
