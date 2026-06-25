@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -242,15 +243,58 @@ ON CONFLICT(name) DO UPDATE SET definition_yaml = excluded.definition_yaml, upda
 	return nil
 }
 
+// descriptiveBackendFields are the BackendDef fields that are attribution / cost
+// display metadata only (#513 provider/model/variant/effort, #619 pricing) — they
+// do not affect how the worker is dispatched, so two projects sharing a backend
+// name may carry different values and they get merged. EVERY other field (cmd,
+// extra_args, prompt_mode, enabled, mcp, usage_stream, non_agentic, quota,
+// subagent_hint) is execution-affecting: a difference there is a real conflict,
+// because the store keeps ONE global backend per name and re-attaches it to every
+// project, so a silent overlay would make one project run with another's runtime
+// settings.
+var descriptiveBackendFields = map[string]bool{
+	"provider": true,
+	"model":    true,
+	"variant":  true,
+	"effort":   true,
+	"pricing":  true,
+}
+
+// backendEffectiveCmd resolves the dispatch command: an empty cmd defaults to the
+// backend name for built-in backends (claude/codex/… BuildCmd), so `claude: {}`
+// and `claude: {cmd: claude}` are the same command, while `claude: {cmd: x}` is
+// not.
+func backendEffectiveCmd(def map[string]any, name string) string {
+	if c, _ := def["cmd"].(string); strings.TrimSpace(c) != "" {
+		return strings.TrimSpace(c)
+	}
+	return name
+}
+
+// behavioralCore returns the execution-affecting subset of a backend definition
+// (everything except descriptive metadata and cmd, which is compared separately
+// via its effective value).
+func behavioralCore(def map[string]any) map[string]any {
+	core := make(map[string]any, len(def))
+	for k, v := range def {
+		if k == "cmd" || descriptiveBackendFields[k] {
+			continue
+		}
+		core[k] = v
+	}
+	return core
+}
+
 // mergeBackendDefinitions reconciles two definitions of the same shared backend.
 // The store keeps backends in one global table, but per-project configs often
-// annotate the same backend with different optional metadata
-// (provider/model/pricing/effort) while keeping an identical cmd — not a real
-// conflict, since the cmd is what dispatches the worker. So a differing cmd is a
-// hard error; otherwise the definitions are merged into their union, the richer
-// (more-complete) definition winning any overlapping field. The merge is
+// annotate the same backend with different DESCRIPTIVE metadata (provider / model
+// / variant / effort / pricing) while keeping identical execution settings — not
+// a real conflict. So when the effective cmd and every other execution-affecting
+// field agree, the definitions are merged into their union (descriptive metadata
+// deep-merged, so e.g. complementary pricing fields converge to the superset).
+// A differing cmd, or any differing behavioral field, is rejected. The merge is
 // order-independent and idempotent, so a bulk `config-store migrate` converges
-// regardless of the order files are imported in.
+// regardless of file order.
 func mergeBackendDefinitions(name, existingYAML, incomingYAML string) (string, error) {
 	if strings.TrimSpace(existingYAML) == strings.TrimSpace(incomingYAML) {
 		return existingYAML, nil
@@ -262,29 +306,50 @@ func mergeBackendDefinitions(name, existingYAML, incomingYAML string) (string, e
 	if err := yaml.Unmarshal([]byte(incomingYAML), &incoming); err != nil {
 		return "", fmt.Errorf("backend %q: parse incoming definition: %w", name, err)
 	}
-	existingCmd, _ := existing["cmd"].(string)
-	incomingCmd, _ := incoming["cmd"].(string)
-	if existingCmd != "" && incomingCmd != "" && strings.TrimSpace(existingCmd) != strings.TrimSpace(incomingCmd) {
+	existingCmd := backendEffectiveCmd(existing, name)
+	incomingCmd := backendEffectiveCmd(incoming, name)
+	if existingCmd != incomingCmd {
 		return "", fmt.Errorf("backend %q has a conflicting cmd (%q vs %q) — projects cannot share a backend name with different commands", name, existingCmd, incomingCmd)
 	}
-	// Union of fields; the richer definition (more keys) wins on overlap so no
-	// metadata is lost and the result does not depend on import order.
-	richer, poorer := existing, incoming
-	if len(incoming) > len(existing) {
-		richer, poorer = incoming, existing
+	if !reflect.DeepEqual(behavioralCore(existing), behavioralCore(incoming)) {
+		return "", fmt.Errorf("backend %q has conflicting execution settings (extra_args/prompt_mode/enabled/mcp/usage_stream/non_agentic/quota/subagent_hint) — only descriptive metadata (provider/model/variant/effort/pricing) may differ between projects sharing a backend", name)
 	}
-	merged := make(map[string]any, len(richer)+len(poorer))
-	for k, v := range poorer {
-		merged[k] = v
-	}
-	for k, v := range richer {
-		merged[k] = v
+	merged := deepMergeMaps(existing, incoming)
+	// Keep an explicit cmd if either side had one (the effective values already
+	// match), so an omitted-cmd side never erases the spelled-out command.
+	if ec, _ := existing["cmd"].(string); strings.TrimSpace(ec) != "" {
+		merged["cmd"] = ec
+	} else if ic, _ := incoming["cmd"].(string); strings.TrimSpace(ic) != "" {
+		merged["cmd"] = ic
 	}
 	out, err := yaml.Marshal(merged)
 	if err != nil {
 		return "", fmt.Errorf("backend %q: marshal merged definition: %w", name, err)
 	}
 	return string(out), nil
+}
+
+// deepMergeMaps returns the recursive union of a and b. On a scalar-vs-scalar
+// overlap b wins; on a map-vs-map overlap the maps are merged recursively (so a
+// nested pricing map keeps both sides' fields instead of one overwriting the
+// other).
+func deepMergeMaps(a, b map[string]any) map[string]any {
+	out := make(map[string]any, len(a)+len(b))
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		if existing, ok := out[k]; ok {
+			em, eok := existing.(map[string]any)
+			vm, vok := v.(map[string]any)
+			if eok && vok {
+				out[k] = deepMergeMaps(em, vm)
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // UpsertProject writes a single project's config under an explicit name,
