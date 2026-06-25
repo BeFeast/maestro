@@ -78,16 +78,27 @@ func (d *Daemon) reconcileStore(flowParent context.Context, fp map[string]time.T
 		log.Printf("[daemon] store watch: project %q removed — draining flow %q", name, flow.name)
 		if fleet != nil {
 			fleet.RemoveProject(flow.name)
-			// Drop the removed project's rows from the shared maestro.db so its
-			// sessions/health stop surfacing in cross-project queries the moment it
-			// leaves the fleet (#760). No-op in json mode (StateStore() is nil).
-			if store := fleet.StateStore(); store != nil && flow.cfg != nil {
+		}
+		// Drain the flow BEFORE clearing its SQLite rows. stopFlow cancels the flow
+		// ctx and waits for the orchestrator, supervisor, and watchdog goroutines to
+		// exit — any of which may be mid-state.Save. Save fires the process-global
+		// write-through hook (mirrorSavedState), which re-imports the state_dir into
+		// maestro.db AFTER the save. If we cleared first, a save draining between
+		// ClearStateDir and goroutine exit would re-mirror the removed project's
+		// rows, leaving its sessions/health visible to cross-project queries until a
+		// later restart/prune (#760 review). Draining first guarantees no writer can
+		// touch this state_dir after we clear it.
+		d.stopFlow(flow.key)
+		// Now that every writer for this flow has exited, drop the removed project's
+		// rows from the shared maestro.db so its sessions/health stop surfacing in
+		// cross-project queries (#760). No-op in json mode (StateStore() is nil).
+		if fleet != nil && flow.cfg != nil {
+			if store := fleet.StateStore(); store != nil {
 				if err := store.ClearStateDir(flowParent, flow.cfg.StateDir); err != nil {
 					log.Printf("[daemon] store watch: clear state rows for %q (state_dir=%s) failed: %v", flow.name, flow.cfg.StateDir, err)
 				}
 			}
 		}
-		d.stopFlow(flow.key)
 		// Free this flow's fleet display name AND its flow identity in the local
 		// snapshot maps, so a same-tick re-add of the same repo/StateDir reclaims
 		// the base name (instead of getting a numeric-suffixed UniqueFleetName)
