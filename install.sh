@@ -87,6 +87,11 @@ main() {
     echo "  1. cd <your-repo>"
     echo "  2. maestro init"
     echo "  3. maestro run --once"
+    echo
+    echo "Running a fleet? Use the single-service daemon instead of a unit per project:"
+    echo "  maestro config-store migrate --db ~/.maestro/maestro.db --dir ~/.maestro/maestro.d"
+    echo "  cp maestro.service ~/.config/systemd/user/ && systemctl --user enable --now maestro.service"
+    echo "  (or run scripts/migrate-to-daemon.sh to cut over from the legacy units)"
 }
 
 main

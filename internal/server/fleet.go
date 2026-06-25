@@ -22,6 +22,7 @@ import (
 
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
@@ -295,6 +296,25 @@ type FleetServer struct {
 	stateMode   statestore.Mode
 	stateDBPath string
 	stateHandle *statestore.Store
+
+	// projectStore backs the dashboard project-CRUD endpoint (#761,
+	// POST/DELETE /api/v1/fleet/projects). It is wired by the daemon
+	// (SetProjectStore) to the SAME config store the daemon reads, so a UI add/rm
+	// writes the store and the daemon's --watch-store diff-loop reconciles it into
+	// a started/drained flow. nil under plain `serve --fleet`, where the endpoint
+	// reports 501. Guarded by projectStoreMu so the daemon can wire it after
+	// construction while handlers read it concurrently.
+	projectStoreMu sync.RWMutex
+	projectStore   FleetProjectStore
+}
+
+// FleetProjectStore is the write side of the daemon's config store that the
+// dashboard project-CRUD endpoint needs (#761): upsert a project row from
+// portable YAML and delete one by name. *configstore.Store satisfies it; the
+// fleet server holds it only when the daemon wires it.
+type FleetProjectStore interface {
+	UpsertProject(ctx context.Context, name, configYAML string) error
+	DeleteProject(ctx context.Context, name string) error
 }
 
 // NewFleet creates a FleetServer.
@@ -583,6 +603,27 @@ func (s *FleetServer) liveAuth() authChecker {
 	return s.auth
 }
 
+// SetProjectStore wires the config store backing dashboard project CRUD (#761).
+// The daemon calls it with the store it reads so a UI add/remove writes the same
+// source of truth the diff-loop reconciles. Safe to call before Start and at
+// runtime.
+func (s *FleetServer) SetProjectStore(store FleetProjectStore) {
+	if s == nil {
+		return
+	}
+	s.projectStoreMu.Lock()
+	s.projectStore = store
+	s.projectStoreMu.Unlock()
+}
+
+// liveProjectStore returns the current project-CRUD store under the read lock,
+// or nil when none is wired (the endpoint then reports 501).
+func (s *FleetServer) liveProjectStore() FleetProjectStore {
+	s.projectStoreMu.RLock()
+	defer s.projectStoreMu.RUnlock()
+	return s.projectStore
+}
+
 // buildHandler returns the fleet mux wrapped with the auth middleware.
 // When auth.Required() is true (#616: exposed install posture), every
 // route — JSON read endpoints, the SPA HTML, static assets, mutating
@@ -598,6 +639,7 @@ func (s *FleetServer) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
+	mux.HandleFunc("/api/v1/fleet/projects", s.handleFleetProjects)
 	mux.HandleFunc("/api/v1/fleet/actions", s.handleFleetAction)
 	mux.HandleFunc("/api/v1/fleet/approvals/", s.handleFleetApproval)
 	mux.HandleFunc("/api/v1/audit/log", s.handleFleetAuditLog)
@@ -1365,6 +1407,132 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown action_id %q", id))
+}
+
+// fleetProjectRequest is the body for the dashboard project-CRUD endpoint
+// (#761). POST carries the project's portable YAML (and optional name); DELETE
+// carries the name to remove. Actor/Reason are recorded in the journal.
+type fleetProjectRequest struct {
+	Name       string `json:"name,omitempty"`
+	Project    string `json:"project,omitempty"`
+	ConfigYAML string `json:"config_yaml,omitempty"`
+	Actor      string `json:"actor,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// handleFleetProjects is the dashboard "add / remove a project" endpoint (#761,
+// epic #754 Phase 6 — «добавить проект из UI»). POST upserts a project row from
+// portable YAML; DELETE removes one by name. Both write the daemon's config
+// store — the single source of truth — and with --watch-store the daemon's
+// diff-loop reconciles the change into a started/drained flow within one poll
+// interval, so the response is 202 Accepted to reflect that asynchronous
+// reconciliation.
+//
+// It is gated like the other mutating config surfaces (change_global_config is
+// already approval-gated): auth fires FIRST so an unauthenticated request always
+// sees 401 (never 403/405), the read-only posture rejects it with 403, and every
+// accepted mutation is journalled with the authenticated actor (the canonical
+// audit trail for the single-service daemon, surfaced via journalctl).
+func (s *FleetServer) handleFleetProjects(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost, http.MethodDelete:
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// Auth BEFORE the read-only / availability gates so an unauthenticated POST
+	// always sees 401, mirroring handleFleetAction (#487).
+	authenticatedActor, ok := requireAuth(w, r, s.liveAuth())
+	if !ok {
+		return
+	}
+	if s.readOnly {
+		writeError(w, http.StatusForbidden, "fleet server is read-only; project CRUD requires write-enabled controls")
+		return
+	}
+	store := s.liveProjectStore()
+	if store == nil {
+		writeError(w, http.StatusNotImplemented, "project CRUD requires the daemon config store (run `maestro daemon`); not available under `serve --fleet`")
+		return
+	}
+
+	var req fleetProjectRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode project request: %v", err))
+			return
+		}
+	}
+	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
+
+	if r.Method == http.MethodDelete {
+		s.handleFleetProjectDelete(w, r, store, req, actor)
+		return
+	}
+	s.handleFleetProjectUpsert(w, r, store, req, actor)
+}
+
+// handleFleetProjectUpsert validates the posted config, derives the project name
+// the SAME way the config store does (so the diff-loop dedups consistently), and
+// writes the row.
+func (s *FleetServer) handleFleetProjectUpsert(w http.ResponseWriter, r *http.Request, store FleetProjectStore, req fleetProjectRequest, actor string) {
+	yamlText := strings.TrimSpace(req.ConfigYAML)
+	if yamlText == "" {
+		writeError(w, http.StatusBadRequest, "config_yaml is required to add a project")
+		return
+	}
+	// Reject a malformed paste with 400 before touching the store. UpsertProject
+	// re-validates, but parsing here also lets ProjectNameFor derive the name.
+	if _, err := config.Parse([]byte(yamlText)); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid project config: %v", err))
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		derived, err := configstore.ProjectNameFor("", []byte(yamlText))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot derive a project name (set name or repo in the config): %v", err))
+			return
+		}
+		name = derived
+	}
+	if err := store.UpsertProject(r.Context(), name, yamlText); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("upsert project %q: %v", name, err))
+		return
+	}
+	log.Printf("[fleet] project upsert %q by %s (reason=%q) — config store written; flow reconciles on the next store-watch tick", name, actor, strings.TrimSpace(req.Reason))
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"ok":      true,
+		"project": name,
+		"action":  "upsert_project",
+		"note":    "config store updated; the daemon starts the flow on its next store-watch tick (requires --watch-store)",
+	})
+}
+
+// handleFleetProjectDelete removes a project row by name. Deleting a missing
+// project is a no-op in the store (idempotent), so this returns 202 even when
+// the name was already gone.
+func (s *FleetServer) handleFleetProjectDelete(w http.ResponseWriter, r *http.Request, store FleetProjectStore, req fleetProjectRequest, actor string) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = strings.TrimSpace(req.Project)
+	}
+	if name == "" {
+		writeError(w, http.StatusBadRequest, "name (or project) is required to remove a project")
+		return
+	}
+	if err := store.DeleteProject(r.Context(), name); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete project %q: %v", name, err))
+		return
+	}
+	log.Printf("[fleet] project delete %q by %s (reason=%q) — config store row removed; flow drains on the next store-watch tick", name, actor, strings.TrimSpace(req.Reason))
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"ok":      true,
+		"project": name,
+		"action":  "delete_project",
+		"note":    "config store row removed; the daemon drains the flow on its next store-watch tick (requires --watch-store)",
+	})
 }
 
 type fleetAuditLogRequest struct {

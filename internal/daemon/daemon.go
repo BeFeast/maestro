@@ -42,7 +42,17 @@ const (
 	// that operator CRUD (config-store add/rm/edit) is reflected quickly, long
 	// enough that polling SQLite is negligible.
 	DefaultWatchStoreInterval = 15 * time.Second
+	// DefaultDrainTimeout bounds the graceful in-process drain the daemon runs on
+	// SIGTERM (#761, single-service cutover): it sets SpawnDrain on every flow so
+	// no new workers are claimed, then waits for in-flight workers to finish. It
+	// is deliberately UNDER the unit's TimeoutStopSec=30min so the drain finishes
+	// before systemd escalates to SIGKILL.
+	DefaultDrainTimeout = 25 * time.Minute
 )
+
+// drainPollInterval is how often Drain re-reads each flow's state to see whether
+// the in-flight worker count has reached zero. A var so tests can shorten it.
+var drainPollInterval = 5 * time.Second
 
 // ConfigLoader yields the set of project configs the daemon supervises. It is
 // satisfied by *configstore.Store; tests inject an in-memory fake so the
@@ -278,6 +288,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// One FleetServer for the whole fleet — replaces the N per-project
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
+	// Back the dashboard project-CRUD endpoint (#761) with the SAME config store
+	// the daemon reads, when the store supports the write API. A UI add/remove
+	// then writes the store and the --watch-store diff-loop reconciles it into a
+	// started/drained flow. The in-memory test loader does not satisfy the
+	// interface, so the endpoint reports 501 there.
+	if ps, ok := d.store.(server.FleetProjectStore); ok {
+		fleet.SetProjectStore(ps)
+	}
 	approvalsMode, err := approvalstore.ParseMode(d.opts.ApprovalsStore)
 	if err != nil {
 		return err
@@ -469,4 +487,100 @@ func (d *Daemon) Fleet() *server.FleetServer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.fleet
+}
+
+// Drain runs the graceful, in-process shutdown the single-service cutover needs
+// (#761, epic #754 Phase 6). It is called by the daemon's SIGTERM handler BEFORE
+// the daemon context is cancelled: it sets SpawnDrain on every running flow's
+// state so each orchestrator stops claiming new issues on its next cycle, then
+// waits — the flows are still live, so their orchestrators keep reaping
+// finishing workers — until no in-flight workers remain across the whole fleet
+// or timeout elapses. It returns either way; the caller then cancels the daemon
+// ctx, which tears the (now idle) flows down via stopAll.
+//
+// There is no per-unit ExecStop=maestro drain anymore: the one maestro.service
+// drains in-process. ctx cancellation (a second SIGTERM) aborts the wait early
+// so an operator can force shutdown. Non-positive timeout clamps to
+// DefaultDrainTimeout.
+func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = DefaultDrainTimeout
+	}
+
+	// Snapshot the live flows' state dirs under the lock. Dedup on StateDir so a
+	// (degenerate) repeated dir is drained once; the flows map is already keyed
+	// on flowKey (StateDir/Repo), but be defensive.
+	d.mu.Lock()
+	dirs := make([]string, 0, len(d.flows))
+	names := make([]string, 0, len(d.flows))
+	seen := make(map[string]bool, len(d.flows))
+	for _, flow := range d.flows {
+		if flow.cfg == nil {
+			continue
+		}
+		dir := strings.TrimSpace(flow.cfg.StateDir)
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		dirs = append(dirs, dir)
+		names = append(names, flow.name)
+	}
+	d.mu.Unlock()
+	if len(dirs) == 0 {
+		return
+	}
+
+	// Phase 1: stop new spawns fleet-wide. SetSpawnDrain stamps SpawnDrainAt and
+	// the state merge resolves the flag latest-write-wins by that timestamp, so a
+	// concurrent orchestrator save cannot un-set the freshly requested drain.
+	requested := 0
+	for i, dir := range dirs {
+		s, err := state.Load(dir)
+		if err != nil {
+			log.Printf("[daemon] drain: load state for flow %q (%s) failed: %v", names[i], dir, err)
+			continue
+		}
+		s.SetSpawnDrain(time.Now().UTC())
+		if err := state.Save(dir, s); err != nil {
+			log.Printf("[daemon] drain: set drain flag for flow %q (%s) failed: %v", names[i], dir, err)
+			continue
+		}
+		requested++
+	}
+	log.Printf("[daemon] drain: requested on %d/%d flow(s) — no new workers; waiting up to %s for in-flight workers to finish", requested, len(dirs), timeout)
+
+	// Phase 2: wait for in-flight workers to finish across every flow.
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(drainPollInterval)
+	defer ticker.Stop()
+	lastReported := -1
+	for {
+		running := 0
+		for _, dir := range dirs {
+			s, err := state.Load(dir)
+			if err != nil {
+				continue
+			}
+			running += s.RunningSessionCount()
+		}
+		if running != lastReported {
+			log.Printf("[daemon] drain: in-flight workers running: %d", running)
+			lastReported = running
+		}
+		if running == 0 {
+			log.Printf("[daemon] drain: complete — no in-flight workers remain")
+			return
+		}
+		if !time.Now().Before(deadline) {
+			log.Printf("[daemon] drain: timed out after %s with %d worker(s) still running; proceeding with shutdown", timeout, running)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			log.Printf("[daemon] drain: aborted (forced shutdown) with %d worker(s) still running", running)
+			return
+		case <-ticker.C:
+		}
+	}
 }

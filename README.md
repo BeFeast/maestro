@@ -441,8 +441,8 @@ While paused:
 - An in-flight worker is **not** killed — it runs to completion and lands its
   PR normally (drain semantics are unchanged).
 - The flag is persisted in the project state dir and survives a
-  `systemctl --user restart` of both the run and supervise units; only
-  `maestro resume` clears it.
+  `systemctl --user restart` of the maestro service; only `maestro resume`
+  clears it.
 - The supervisor stays alive and reports the paused state instead of treating
   the idle project as a stall, and `GET /api/v1/fleet` exposes a per-project
   `paused` flag (Mission Control shows a paused badge).
@@ -574,26 +574,68 @@ journalctl --user -u maestro.service -f
 launchctl load ~/Library/LaunchAgents/com.maestro.agent.plist
 ```
 
-#### Multiple projects (systemd template)
+#### Multiple projects (single-service daemon)
 
-A `maestro@.service` template is included for running multiple instances as user services:
+For a fleet, run **one** `maestro.service` that drives every project. `maestro
+daemon` runs an orchestrator + supervisor loop per project in a single process
+plus one aggregating fleet dashboard on `:8786`. This replaces the old
+per-project `maestro@.service` template (and the separate supervise/serve units)
+— one unit instead of ~15.
+
+Projects live in a SQLite config store, not per-project YAML files. Seed it once
+from your existing `~/.maestro/maestro.d/*.yaml`:
 
 ```bash
-# Install the template
-cp maestro@.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-
-# Start per-project instances (uses ~/.maestro/maestro-<name>.yaml)
-systemctl --user start maestro@panoptikon
-systemctl --user start maestro@myapp
-
-# Enable on boot
-systemctl --user enable maestro@panoptikon
-
-# Check status
-systemctl --user status maestro@panoptikon
-journalctl --user -u maestro@panoptikon -f
+maestro config-store migrate --db ~/.maestro/maestro.db --dir ~/.maestro/maestro.d
 ```
+
+Then install and start the daemon unit (a `maestro.service` for the daemon ships
+in the repo root):
+
+```bash
+cp maestro.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now maestro.service
+
+# Check status — list-units shows ONE active maestro unit
+systemctl --user list-units 'maestro*'
+journalctl --user -u maestro.service -f
+```
+
+The whole cutover (seed store → stop legacy units → start the daemon → verify
+`:8786/api/v1/fleet`) is automated by `scripts/migrate-to-daemon.sh`:
+
+```bash
+scripts/migrate-to-daemon.sh            # prompts before changing a running host
+scripts/migrate-to-daemon.sh --dry-run  # show the actions without applying them
+```
+
+The cutover is non-concurrent per project (it stops the legacy units before
+starting the daemon, so no project is ever driven by both). **Rollback** is
+supported because the legacy unit files stay on disk:
+
+```bash
+systemctl --user disable --now maestro.service
+# regenerate per-project YAML from the store if you removed the originals:
+maestro config-store export --db ~/.maestro/maestro.db --dir ~/.maestro/maestro.d
+systemctl --user enable --now maestro@panoptikon maestro@myapp   # re-enable old units
+```
+
+**Adding / removing projects at runtime.** With the daemon you no longer create a
+unit per project. Edit the store and the daemon hot-reconciles (no restart):
+
+```bash
+maestro config-store add --db ~/.maestro/maestro.db --file ./new-project.yaml
+maestro config-store rm  --db ~/.maestro/maestro.db <project>
+```
+
+The fleet dashboard exposes the same as authenticated, audited endpoints —
+`POST /api/v1/fleet/projects` (body `{"config_yaml": "..."}`) and
+`DELETE /api/v1/fleet/projects` (body `{"name": "..."}`) — so you can add a
+project from the UI. On `SIGTERM` (`systemctl --user stop`) the daemon drains
+gracefully in-process: it stops claiming new issues and waits for in-flight
+workers to finish before exiting (bounded by `--drain-timeout`, default 25m,
+inside the unit's `TimeoutStopSec=30min`).
 
 ## Mission Control bundle
 
