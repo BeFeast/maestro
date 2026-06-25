@@ -951,9 +951,10 @@ const (
 )
 
 const (
-	approvalActionCloseIssue      = "close_issue"
-	approvalActionCloseIssueBatch = "close_issue_batch"
-	approvalActionSpawnWorker     = "spawn_worker"
+	approvalActionCloseIssue        = "close_issue"
+	approvalActionCloseIssueBatch   = "close_issue_batch"
+	approvalActionSpawnWorker       = "spawn_worker"
+	approvalActionSpawnRepairWorker = "spawn_repair_worker"
 )
 
 // Approval records a risky supervisor decision that needs explicit resolution.
@@ -2581,6 +2582,35 @@ func closeIssueApprovalTargetsIssue(approval *Approval, issueNumber int) bool {
 		}
 	}
 	return false
+}
+
+// MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue expires in-flight
+// spawn_repair_worker approvals that became moot because the issue they were
+// going to repair is resolved — the orchestrator auto-closed it after a verified
+// merge, so there is nothing left to repair. Without this the pending approval
+// lingers indefinitely and surfaces as a Past-SLA red flag on the Approvals
+// dashboard (dogfood #773/#774/#775: repair approvals outlived their merged PRs;
+// the operator had to reject them by hand every wave). Mirrors
+// MarkCloseIssueApprovalsStaleForVerifiedIssue, co-located at the same
+// auto-close trust path.
+func (s *State) MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(issueNumber int, now time.Time) int {
+	if s == nil || issueNumber <= 0 {
+		return 0
+	}
+	count := 0
+	reason := fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", issueNumber)
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Action != approvalActionSpawnRepairWorker || approval.Target == nil || approval.Target.Issue != issueNumber {
+			continue
+		}
+		switch approval.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			s.markApprovalStale(approval, now, reason)
+			count++
+		}
+	}
+	return count
 }
 
 func (s *State) pendingApproval(id string) (*Approval, error) {

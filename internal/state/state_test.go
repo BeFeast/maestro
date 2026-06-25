@@ -2185,6 +2185,44 @@ func TestRecordPendingApprovalDedupsAgainstAwaitingDispatch(t *testing.T) {
 	}
 }
 
+// #771 follow-up: a pending spawn_repair_worker approval must auto-stale when
+// its issue is resolved (orchestrator auto-closed it after a verified merge),
+// so it stops lingering as a Past-SLA red flag on the dashboard
+// (dogfood #773/#774/#775). Only the repair approval for the resolved issue is
+// touched — a repair approval for a different issue, and a spawn_worker approval
+// for the same issue, are left pending.
+func TestMarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(t *testing.T) {
+	now := time.Date(2026, 6, 25, 12, 0, 0, 0, time.UTC)
+	s := NewState()
+	s.Approvals = []Approval{
+		{ID: "ap-repair-759", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 759, PR: 773}, Status: ApprovalStatusPending, CreatedAt: now},
+		{ID: "ap-repair-800", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 800, PR: 801}, Status: ApprovalStatusPending, CreatedAt: now},
+		{ID: "ap-spawn-759", Action: approvalActionSpawnWorker, Target: &SupervisorTarget{Issue: 759}, Status: ApprovalStatusPending, CreatedAt: now},
+	}
+
+	count := s.MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(759, now.Add(time.Minute))
+	if count != 1 {
+		t.Fatalf("staled count = %d, want 1", count)
+	}
+
+	statusOf := func(id string) ApprovalStatus {
+		a, ok := s.FindApproval(id)
+		if !ok {
+			t.Fatalf("approval %q vanished", id)
+		}
+		return a.Status
+	}
+	if got := statusOf("ap-repair-759"); got != ApprovalStatusStale {
+		t.Fatalf("repair approval for resolved issue = %q, want %q", got, ApprovalStatusStale)
+	}
+	if got := statusOf("ap-repair-800"); got != ApprovalStatusPending {
+		t.Fatalf("repair approval for a different issue = %q, want pending (untouched)", got)
+	}
+	if got := statusOf("ap-spawn-759"); got != ApprovalStatusPending {
+		t.Fatalf("spawn_worker approval = %q, want pending (only spawn_repair_worker is staled)", got)
+	}
+}
+
 // #515: ReconcileSpawnWorkerApprovalsForStartedSession must supersede
 // awaiting_dispatch records too, not just pending ones — once the
 // worker actually starts, the awaiting record has done its job.
