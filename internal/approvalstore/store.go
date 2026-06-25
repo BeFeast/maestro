@@ -43,11 +43,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Schema creates the approvals + approval_audit tables. Both are
-// IF NOT EXISTS so Init is idempotent and safe to run against an existing
-// maestro.db. The denormalized project/repo/state_dir columns bind every
-// row to its originating project context (premortem #2/#3).
-const Schema = `
+// approvalsTableDDL is the approvals table on its own. It is reused as the
+// rebuild target for the legacy-schema migration (migrateApprovalsSchema),
+// which recreates the table under the composite (state_dir, id) primary key.
+const approvalsTableDDL = `
 CREATE TABLE IF NOT EXISTS approvals (
 	id            TEXT NOT NULL,
 	decision_id   TEXT NOT NULL DEFAULT '',
@@ -65,7 +64,22 @@ CREATE TABLE IF NOT EXISTS approvals (
 	-- (state_dir, id) the second project's INSERT OR IGNORE is dropped and a
 	-- claim consumes the wrong project's approval.
 	PRIMARY KEY (state_dir, id)
-);
+);`
+
+// approvalsColumns is the canonical column order of the approvals table. It is
+// the carry-over list when the legacy single-column-PK table is rebuilt under
+// the new schema (migrateApprovalsSchema copies the intersection of these with
+// whatever the legacy table actually has).
+var approvalsColumns = []string{
+	"id", "decision_id", "project", "repo", "state_dir", "action",
+	"status", "payload_hash", "created_at", "updated_at", "approval_json",
+}
+
+// Schema creates the approvals + approval_audit tables. Both are
+// IF NOT EXISTS so Init is idempotent and safe to run against an existing
+// maestro.db. The denormalized project/repo/state_dir columns bind every
+// row to its originating project context (premortem #2/#3).
+const Schema = approvalsTableDDL + `
 
 CREATE TABLE IF NOT EXISTS approval_audit (
 	seq               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,10 +168,113 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// Init creates the schema. Idempotent.
+// Init creates the schema and upgrades any legacy single-column-PK approvals
+// table to the (state_dir, id) composite key. Idempotent.
 func (s *Store) Init(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, Schema)
-	return err
+	if _, err := s.db.ExecContext(ctx, Schema); err != nil {
+		return err
+	}
+	return s.migrateApprovalsSchema(ctx)
+}
+
+// migrateApprovalsSchema upgrades a maestro.db created before approval rows
+// were scoped by state_dir. The original table used `id TEXT PRIMARY KEY`, so
+// CREATE TABLE IF NOT EXISTS above is a no-op against it and the composite
+// PRIMARY KEY (state_dir, id) is never installed. In that unscoped table two
+// projects that mint the same content-addressed id collide: the second
+// project's INSERT OR IGNORE is dropped and a scoped claim cannot find — or is
+// blocked by — the wrong project's row. This detects the legacy primary key
+// and rebuilds the table in place (rename → recreate → copy → drop), so the
+// fix reaches already-created databases, not only fresh ones. No-op once the
+// table already carries the composite key.
+func (s *Store) migrateApprovalsSchema(ctx context.Context) error {
+	scoped, cols, err := approvalsPKScopedByStateDir(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	// scoped==true: fresh DB or already migrated. len(cols)==0: the table does
+	// not exist (Schema would have created it, so this only guards a racing
+	// drop) — nothing to rebuild either way.
+	if scoped || len(cols) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Carry over only columns present in BOTH the legacy table and the new
+	// schema, so a partial legacy layout still migrates without a missing-column
+	// error; any new-only column falls back to its schema default.
+	carry := intersectColumns(cols, approvalsColumns)
+	colList := strings.Join(carry, ", ")
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE approvals RENAME TO approvals_legacy`); err != nil {
+		return fmt.Errorf("rename legacy approvals table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, approvalsTableDDL); err != nil {
+		return fmt.Errorf("recreate approvals table: %w", err)
+	}
+	// Legacy `id` was globally unique, so (state_dir, id) pairs are unique too —
+	// a plain INSERT cannot conflict and surfaces any unexpected duplicate.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+		`INSERT INTO approvals(%s) SELECT %s FROM approvals_legacy`, colList, colList)); err != nil {
+		return fmt.Errorf("copy legacy approvals rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE approvals_legacy`); err != nil {
+		return fmt.Errorf("drop legacy approvals table: %w", err)
+	}
+	return tx.Commit()
+}
+
+// approvalsPKScopedByStateDir reports whether the approvals table's primary key
+// includes state_dir (the new scoped schema) and returns the table's column
+// names. A table with no rows from PRAGMA table_info (the table does not exist)
+// returns scoped=false, cols=nil.
+func approvalsPKScopedByStateDir(ctx context.Context, db *sql.DB) (scoped bool, cols []string, err error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(approvals)`)
+	if err != nil {
+		return false, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, nil, err
+		}
+		cols = append(cols, name)
+		// pk is the 1-based position within the primary key (0 = not part of
+		// it). The new schema puts state_dir first; the legacy schema keys on
+		// id alone, leaving state_dir at pk=0.
+		if name == "state_dir" && pk > 0 {
+			scoped = true
+		}
+	}
+	return scoped, cols, rows.Err()
+}
+
+// intersectColumns returns the members of want present in have, preserving
+// want's order.
+func intersectColumns(have, want []string) []string {
+	set := make(map[string]bool, len(have))
+	for _, c := range have {
+		set[c] = true
+	}
+	out := make([]string, 0, len(want))
+	for _, c := range want {
+		if set[c] {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // Put seeds an approval into the store WITHOUT overwriting an existing row

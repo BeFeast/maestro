@@ -2,6 +2,8 @@ package approvalstore
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -38,6 +40,20 @@ func seedPending(t *testing.T, s *Store, id, action string, target *state.Superv
 // the cross-project isolation test to seed the SAME id under two state dirs.
 func seedPendingScoped(t *testing.T, s *Store, b RowBinding, id, action string, target *state.SupervisorTarget) *state.Approval {
 	t.Helper()
+	a := makeApproval(id, action, target, b)
+	inserted, err := s.Put(context.Background(), a, b)
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if !inserted {
+		t.Fatalf("expected fresh insert for %s under %s", id, b.StateDir)
+	}
+	return a
+}
+
+// makeApproval builds a self-consistent pending approval (payload hash matches
+// so the currency guard does not stale it) without writing it anywhere.
+func makeApproval(id, action string, target *state.SupervisorTarget, b RowBinding) *state.Approval {
 	now := time.Now().UTC()
 	a := &state.Approval{
 		ID:        id,
@@ -53,13 +69,6 @@ func seedPendingScoped(t *testing.T, s *Store, b RowBinding, id, action string, 
 		Audit:     []state.ApprovalAudit{{At: now, Event: state.ApprovalAuditCreated}},
 	}
 	a.PayloadHash = a.ComputePayloadHash()
-	inserted, err := s.Put(context.Background(), a, b)
-	if err != nil {
-		t.Fatalf("put: %v", err)
-	}
-	if !inserted {
-		t.Fatalf("expected fresh insert for %s under %s", id, b.StateDir)
-	}
 	return a
 }
 
@@ -322,6 +331,114 @@ func TestPut_DoesNotResetStatus(t *testing.T) {
 	}
 	if got.Status != state.ApprovalStatusApproved {
 		t.Fatalf("status = %q after re-put, want approved (claim must survive)", got.Status)
+	}
+}
+
+// legacyApprovalsDDL is the pre-scope approvals table: keyed on `id` alone, so
+// a shared maestro.db cannot hold two projects' same content-addressed id. It
+// reproduces a database an operator created before the (state_dir, id) key.
+const legacyApprovalsDDL = `
+CREATE TABLE approvals (
+	id            TEXT PRIMARY KEY,
+	decision_id   TEXT NOT NULL DEFAULT '',
+	project       TEXT NOT NULL DEFAULT '',
+	repo          TEXT NOT NULL DEFAULT '',
+	state_dir     TEXT NOT NULL DEFAULT '',
+	action        TEXT NOT NULL DEFAULT '',
+	status        TEXT NOT NULL,
+	payload_hash  TEXT NOT NULL DEFAULT '',
+	created_at    TEXT NOT NULL,
+	updated_at    TEXT NOT NULL,
+	approval_json TEXT NOT NULL
+);`
+
+// TestMigrate_LegacyIDPrimaryKey_Upgrades guards the review P1: an operator who
+// already created maestro.db with the legacy `approvals(id PRIMARY KEY)` table
+// would, with only CREATE TABLE IF NOT EXISTS, keep the unscoped key forever —
+// the second project's same-id approval is dropped by INSERT OR IGNORE. Opening
+// the store must rebuild the table under (state_dir, id), preserving existing
+// rows and unblocking per-project isolation.
+func TestMigrate_LegacyIDPrimaryKey_Upgrades(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "maestro.db")
+	bindA := RowBinding{Project: "owner/a", Repo: "owner/a", StateDir: "/tmp/a"}
+	legacy := makeApproval("legacy", "merge_pr", &state.SupervisorTarget{PR: 1}, bindA)
+	writeLegacyApprovalsDB(t, path, bindA, legacy)
+
+	// Open runs Init → migrateApprovalsSchema, which must detect and rebuild it.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	defer s.Close()
+
+	if scoped, _, err := approvalsPKScopedByStateDir(context.Background(), s.db); err != nil {
+		t.Fatalf("inspect pk: %v", err)
+	} else if !scoped {
+		t.Fatalf("approvals PK still unscoped after migration")
+	}
+
+	// The legacy row survived the rebuild.
+	got, err := s.Get(context.Background(), bindA.StateDir, "legacy")
+	if err != nil {
+		t.Fatalf("get migrated row: %v", err)
+	}
+	if got.Status != state.ApprovalStatusPending || got.Project != "owner/a" {
+		t.Fatalf("migrated row = {status:%q project:%q}, want pending owner/a", got.Status, got.Project)
+	}
+
+	// The bug is fixed: a second project can now seed the SAME id under its own
+	// state_dir (previously dropped by INSERT OR IGNORE), and approving B's copy
+	// must leave A's untouched.
+	bindB := RowBinding{Project: "owner/b", Repo: "owner/b", StateDir: "/tmp/b"}
+	seedPendingScoped(t, s, bindB, "legacy", "merge_pr", &state.SupervisorTarget{PR: 1})
+	if _, err := s.Approve(context.Background(), bindB.StateDir, "legacy", time.Now().UTC(), "x", ""); err != nil {
+		t.Fatalf("approve B: %v", err)
+	}
+	a, err := s.Get(context.Background(), bindA.StateDir, "legacy")
+	if err != nil {
+		t.Fatalf("get A after B approve: %v", err)
+	}
+	if a.Status != state.ApprovalStatusPending {
+		t.Fatalf("A status = %q after B approve, want pending (legacy row cross-claimed)", a.Status)
+	}
+}
+
+// TestMigrate_NoOpOnFreshDB asserts the migration leaves an already-scoped
+// (freshly created) database untouched and does not error on repeated Init.
+func TestMigrate_NoOpOnFreshDB(t *testing.T) {
+	s := openTestStore(t)
+	seedPending(t, s, "fresh", "merge_pr", &state.SupervisorTarget{PR: 1})
+	// Re-running Init (idempotent) must not disturb the row or the schema.
+	if err := s.Init(context.Background()); err != nil {
+		t.Fatalf("re-init: %v", err)
+	}
+	if _, err := s.Get(context.Background(), testStateDir, "fresh"); err != nil {
+		t.Fatalf("get after re-init: %v", err)
+	}
+}
+
+// writeLegacyApprovalsDB creates a maestro.db with the legacy approvals schema
+// and one row, then closes it — the on-disk state an upgrade has to migrate.
+func writeLegacyApprovalsDB(t *testing.T, path string, b RowBinding, a *state.Approval) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(legacyApprovalsDDL); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	blob, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal approval: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO approvals(id, decision_id, project, repo, state_dir, action, status, payload_hash, created_at, updated_at, approval_json)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.DecisionID, b.Project, b.Repo, b.StateDir, a.Action, string(a.Status), a.PayloadHash,
+		a.CreatedAt.Format(time.RFC3339Nano), a.UpdatedAt.Format(time.RFC3339Nano), string(blob)); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
 	}
 }
 
