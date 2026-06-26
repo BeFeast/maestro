@@ -92,6 +92,52 @@ func TestApplyTierOverride_NoOverrideReturnsSame(t *testing.T) {
 	}
 }
 
+// TestTierOverrideConfigForSession_ReappliesPolicyOverride is the #792 checkpoint
+// regression guard: a policy-routed session that hits the soft-token checkpoint
+// respawns through RespawnInPlace, which reads the override off the backend def.
+// The checkpoint path passes the base o.cfg (no override), so the override must
+// be reconstructed from the session's durable BackendSelection audit record or
+// the resumed worker silently drops the tier model/effort for the rest of the run.
+func TestTierOverrideConfigForSession_ReappliesPolicyOverride(t *testing.T) {
+	o := policyOrch(policyCfg())
+	sess := &state.Session{
+		IssueNumber: 1, Backend: "claude",
+		BackendSelection: &state.BackendSelection{Tier: "strong", Effort: "high", Model: "opus-4.8"},
+	}
+	out := o.tierOverrideConfigForSession(sess)
+	if out == o.cfg {
+		t.Fatalf("expected a cloned config carrying the tier override")
+	}
+	// The argv-threaded carriers must be set so the respawned worker dispatches
+	// on the selected tier (see worker.appendTierModelEffort).
+	if got := out.Model.Backends["claude"].TierEffort; got != "high" {
+		t.Fatalf("respawn TierEffort = %q, want high", got)
+	}
+	if got := out.Model.Backends["claude"].TierModel; got != "opus-4.8" {
+		t.Fatalf("respawn TierModel = %q, want opus-4.8", got)
+	}
+	// Base config must be untouched (override lives on the clone only).
+	if got := o.cfg.Model.Backends["claude"].TierEffort; got != "" {
+		t.Fatalf("base config mutated: claude TierEffort = %q, want empty", got)
+	}
+}
+
+// TestTierOverrideConfigForSession_NonPolicyUnchanged guards the #792 P1-A
+// inertness on the checkpoint path: a session with no recorded tier override
+// (non-policy, or shadow mode where Effort/Model stay empty and only ShadowTier
+// is set) must respawn on the base config so a non-policy checkpoint dispatch is
+// byte-for-byte unchanged.
+func TestTierOverrideConfigForSession_NonPolicyUnchanged(t *testing.T) {
+	o := policyOrch(policyCfg())
+	if out := o.tierOverrideConfigForSession(&state.Session{Backend: "claude"}); out != o.cfg {
+		t.Fatalf("nil BackendSelection: expected base config, got clone")
+	}
+	shadow := &state.Session{Backend: "codex", BackendSelection: &state.BackendSelection{ShadowTier: "strong"}}
+	if out := o.tierOverrideConfigForSession(shadow); out != o.cfg {
+		t.Fatalf("shadow selection (no effort/model): expected base config, got clone")
+	}
+}
+
 func TestRetryTrigger(t *testing.T) {
 	if got := retryTrigger(&state.Session{CIFailureOutput: "boom"}); got != config.EscalationOnCIFailure {
 		t.Fatalf("ci trigger = %q", got)

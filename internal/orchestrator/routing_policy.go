@@ -54,6 +54,29 @@ func applyTierOverride(cfg *config.Config, backendName string, decision router.B
 	return &clone
 }
 
+// tierOverrideConfigForSession re-applies a policy session's persisted per-tier
+// effort/model override (#783) onto the base config for an in-place / soft-token
+// checkpoint respawn (#792). RespawnInPlace reads the override off the backend
+// def, but the checkpoint path calls it with the base o.cfg — where the override
+// lives only on the cloned config from applyTierOverride — so without this the
+// resumed worker silently drops the tier model/effort and runs the rest of the
+// session on the base def.
+//
+// The override is read back from the durable BackendSelection audit record
+// (Effort/Model), which is set ONLY for a real policy tier decision; a non-policy
+// or shadow-mode session records no Effort/Model, so this returns o.cfg unchanged
+// and the byte-for-byte non-policy dispatch guarantee (#792 P1-A) holds.
+func (o *Orchestrator) tierOverrideConfigForSession(sess *state.Session) *config.Config {
+	sel := sess.BackendSelection
+	if sel == nil || (strings.TrimSpace(sel.Effort) == "" && strings.TrimSpace(sel.Model) == "") {
+		return o.cfg
+	}
+	return applyTierOverride(o.cfg, sess.Backend, router.BackendDecision{
+		Effort: sel.Effort,
+		Model:  sel.Model,
+	})
+}
+
 // policyBackendSelection builds the audit record for a policy decision (RFC
 // §2.7): the deciding signal+tier reason, the tier and its overrides, and
 // real, tier-rank-derived candidate scores (replacing the constant

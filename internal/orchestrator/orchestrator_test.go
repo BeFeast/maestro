@@ -8598,6 +8598,79 @@ func TestCheckSessions_SoftThreshold_CheckpointAndRespawn(t *testing.T) {
 	}
 }
 
+// TestCheckSessions_SoftThreshold_CheckpointRespawnKeepsTierOverride is the #792
+// greptile checkpoint regression guard: a policy-routed session that hits the
+// soft-token checkpoint must respawn with its tier effort/model re-applied. Before
+// the fix the checkpoint path passed the base o.cfg, so RespawnInPlace saw empty
+// tier fields and the resumed worker ran the rest of the session off-tier.
+func TestCheckSessions_SoftThreshold_CheckpointRespawnKeepsTierOverride(t *testing.T) {
+	softThreshold := 0.8
+	cfg := &config.Config{
+		Repo:                     "owner/repo",
+		WorkerMaxTokens:          100000,
+		WorkerSoftTokenThreshold: &softThreshold,
+		MaxRuntimeMinutes:        999,
+		Model: config.ModelConfig{
+			Default:  "claude",
+			Backends: map[string]config.BackendDef{"claude": {Cmd: "claude"}},
+		},
+	}
+
+	var respawnCfg *config.Config
+	respawned := 0
+	o := &Orchestrator{
+		cfg:             cfg,
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return []github.PR{}, nil },
+		isIssueClosedFn: func(int) (bool, error) { return false, nil },
+		pidAliveFn:      func(int) bool { return true },
+		captureTmuxFn:   func(string) (string, error) { return "tokens 85000 (in 25000 / out 60000)", nil },
+		workerStopFn:    func(*config.Config, string, *state.Session) error { return nil },
+		saveCheckpointFn: func(sess *state.Session) (string, error) {
+			return "/tmp/CHECKPOINT.md", nil
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "test issue"}, nil
+		},
+		respawnInPlaceFn: func(c *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawnCfg = c
+			respawned++
+			sess.Status = state.StatusRunning
+			sess.TokensUsedAttempt = 0
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["mae-1"] = &state.Session{
+		IssueNumber: 42,
+		Status:      state.StatusRunning,
+		PID:         1234,
+		TmuxSession: "maestro-mae-1",
+		Branch:      "feat/mae-1-42-test",
+		StartedAt:   time.Now().Add(-30 * time.Minute),
+		Backend:     "claude",
+		// Policy tier override recorded on the durable audit record.
+		BackendSelection: &state.BackendSelection{Tier: "strong", Effort: "high", Model: "opus-4.8"},
+	}
+
+	o.checkSessions(s)
+
+	if respawned != 1 || respawnCfg == nil {
+		t.Fatalf("respawned = %d (cfg nil = %v), want 1 with a config", respawned, respawnCfg == nil)
+	}
+	if got := respawnCfg.Model.Backends["claude"].TierEffort; got != "high" {
+		t.Fatalf("checkpoint respawn TierEffort = %q, want high (override dropped)", got)
+	}
+	if got := respawnCfg.Model.Backends["claude"].TierModel; got != "opus-4.8" {
+		t.Fatalf("checkpoint respawn TierModel = %q, want opus-4.8 (override dropped)", got)
+	}
+	// Base config must be untouched — the override lives on the respawn clone only.
+	if got := cfg.Model.Backends["claude"].TierEffort; got != "" {
+		t.Fatalf("base config mutated: claude TierEffort = %q, want empty", got)
+	}
+}
+
 func TestCheckSessions_SoftThreshold_AlreadyCheckpointed_NoRepeat(t *testing.T) {
 	softThreshold := 0.8
 	cfg := &config.Config{
