@@ -33,11 +33,18 @@ Every lever that influences which backend/model/effort a worker runs on lives in
 | `pipeline.{planner,validator}.backend` | the *other* per-role backend overrides | `internal/config/config.go:856-861` (`PipelineConfig`/`RoleConfig`) |
 | `supervisor.review_repair.{backend,model,effort}` | backend used when a green PR is held on blocking review findings | `internal/config/config.go:543-548` |
 
-A subtle but load-bearing fact: **`BackendDef.model`, `.variant`, `.effort`, and
-`.provider` are attribution metadata, not worker inputs.** They are documented as
-"optional per-backend attribution metadata" used by the dashboard and the commit
-trailer (`internal/config/config.go:33-42`). See §1.2 for where the worker's
-actual model/effort comes from.
+A subtle but load-bearing fact, with one backend-specific exception: for the
+first-class agentic backends (claude/codex/gemini) **`BackendDef.model`,
+`.variant`, `.effort`, and `.provider` are attribution metadata, not worker
+inputs** — documented as "optional per-backend attribution metadata" used by the
+dashboard and the commit trailer (`internal/config/config.go:33-42`). **The Pi
+backend is the exception:** its `Provider` and `Model` *are* live worker inputs —
+they are copied into `worker.BackendConfig` (`internal/worker/worker.go:115-116`)
+and `piBackend.BuildCmd` turns them into `--provider` / `--model` argv
+(`internal/worker/backend.go:202-207`). `Variant` is consumed by no worker
+builder, and `Effort` is ignored by every worker builder (including Pi); both
+stay pure attribution metadata for all backends. See §1.2 for where each worker's
+actual model and effort come from.
 
 ### 1.2 The fresh-dispatch path (the common case)
 
@@ -69,9 +76,10 @@ worker builders for the first-class agentic backends —
 `codexBackend.BuildCmd` (`internal/worker/backend.go:120-146`),
 `geminiBackend.BuildCmd` (`internal/worker/backend.go:152-167`) — assemble argv
 from `cfg.Cmd` (split into binary + prefix args by `splitCmd`,
-`internal/worker/backend.go:17-23`) plus `cfg.ExtraArgs`. **None of them consult
-`cfg.Model` or `cfg.Effort`.** So a worker's model and reasoning effort are
-whatever the operator baked into the backend's `cmd`/`extra_args` strings, e.g.
+`internal/worker/backend.go:17-23`) plus `cfg.ExtraArgs`. **None of these three
+(nor the `cline`/generic builders) consult `cfg.Model` or `cfg.Effort`.** So for
+them a worker's model and reasoning effort are whatever the operator baked into
+the backend's `cmd`/`extra_args` strings, e.g.
 
 ```yaml
 model:
@@ -80,13 +88,25 @@ model:
       cmd: "codex --model gpt-5.5 -c model_reasoning_effort=medium"
 ```
 
-The only place `cfg.Model`/`cfg.Effort` are turned into `--model`/`--effort`
-flags is `appendModelOptions` (`internal/worker/backend.go:286-295`), and it is
-called **only** by `BuildSupervisorCmd` (the read-only supervisor/decision path,
+**One worker exception: Pi.** `piBackend.BuildCmd`
+(`internal/worker/backend.go:194-217`) *does* read `cfg.Provider` and `cfg.Model`
+and emit them as `--provider` / `--model` argv (`internal/worker/backend.go:202-207`)
+— Pi is a multi-provider shim that selects its model at the CLI rather than
+baking it into a fixed `cmd`. So for a Pi-backed worker the per-backend
+`model`/`provider` fields are live worker inputs, not just attribution: a future
+tier that targets a Pi backend can already steer the model through
+`BackendDef.Model`, whereas a codex/claude/gemini tier cannot without editing
+`cmd`/`extra_args` (§2.4 step 5). Pi still ignores `cfg.Effort`.
+
+The only place `cfg.Effort` (and `cfg.Model` for the non-Pi backends) is turned
+into a `--model`/`--effort` flag is `appendModelOptions`
+(`internal/worker/backend.go:286-295`), and it is called **only** by
+`BuildSupervisorCmd` (the read-only supervisor/decision path,
 `internal/worker/backend.go:504-603`) — never on the worker path. This is the
-mechanical root of the issue's symptom: there is no per-issue model/effort lever
-short of editing the backend `cmd` or applying a `model:` label that swaps to an
-entirely different backend whose `cmd` happens to pin a stronger model.
+mechanical root of the issue's symptom: outside the Pi exception there is no
+per-issue model/effort lever short of editing the backend `cmd` or applying a
+`model:` label that swaps to an entirely different backend whose `cmd` happens to
+pin a stronger model.
 
 ### 1.3 What `routing.mode: auto` actually does — and why it is unused
 
@@ -336,7 +356,11 @@ machinery (`fallback_backends`, `BackendHealth`, `BackendSelection`,
    effort into the worker argv for the relevant CLIs (e.g. codex
    `-c model_reasoning_effort=`, claude effort flag), or the tier must express
    effort purely via distinct backend entries. The RFC recommends the former so a
-   single backend can serve multiple tiers by effort.
+   single backend can serve multiple tiers by effort. A tier's optional *model*
+   override is in the same boat: it is already wired for the Pi backend (which
+   reads `cfg.Model` → `--model`, §1.2) but for codex/claude/gemini the
+   implementation must thread it into argv the same way, or the tier must point at
+   a distinct backend entry whose `cmd` pins the model.
 
 ### 2.5 Config schema (backward-compatible)
 
