@@ -217,6 +217,29 @@ func TestEscalateRetryBackend_ShadowKeepsBackend(t *testing.T) {
 	}
 }
 
+// TestEscalateRetryBackend_ShadowHonorsLabelOverride is the #792 review
+// regression guard: shadow mode shadows only the *policy*. A model:<backend>
+// label override is resolved before policy evaluation (resolve.go precedence 1)
+// and is a deliberate operator move to relocate a stuck session, so the retry
+// must still honor it even in shadow mode (pre-fix the unconditional shadow
+// branch returned ok=false and the retry silently reused sess.Backend).
+func TestEscalateRetryBackend_ShadowHonorsLabelOverride(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Policy.Shadow = true
+	o := policyOrch(cfg)
+	s := state.NewState()
+	sess := &state.Session{IssueNumber: 1, RetryCount: 1, Backend: "codex"}
+	// Operator relabels the stuck session model:claude to move it off codex.
+	issue := issueWithLabels(1, "Stuck", "model:claude")
+	dec, ok := o.escalateRetryBackend(s, sess, issue)
+	if !ok {
+		t.Fatalf("shadow mode: label override dropped (ok=false); want the label honored")
+	}
+	if dec.Backend != "claude" || dec.Reason != router.ReasonLabel {
+		t.Fatalf("shadow retry decision = %+v, want claude/%s (label override)", dec, router.ReasonLabel)
+	}
+}
+
 func TestEscalateRetryBackend_InertWhenManual(t *testing.T) {
 	cfg := policyCfg()
 	cfg.Routing.Mode = "manual"

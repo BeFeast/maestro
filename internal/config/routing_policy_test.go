@@ -263,6 +263,39 @@ routing:
 	}
 }
 
+func TestRoutingPolicy_CappedEscalationBelowStrongDefault(t *testing.T) {
+	// #792 review: a high default_tier with a lower-tier rule and a max_tier
+	// ranked below default_tier is valid — rule-selected cheap tasks still climb
+	// up to max_tier while unmatched tasks start strong. Must NOT be rejected as a
+	// no-op ladder.
+	yaml := policyBackendsYAML + `
+routing:
+  mode: policy
+  tiers:
+    cheap:
+      backend: gemini
+      rank: 0
+    standard:
+      backend: codex
+      rank: 1
+    strong:
+      backend: claude
+      rank: 2
+  policy:
+    default_tier: strong
+    rules:
+      - when: { size: small, dependency: leaf }
+        tier: cheap
+    escalation:
+      enabled: true
+      on: [retry]
+      max_tier: standard
+`
+	if _, err := parse([]byte(yaml)); err != nil {
+		t.Fatalf("parse: capped escalation below a strong default must be accepted, got %v", err)
+	}
+}
+
 func TestRoutingPolicy_NonAgenticTierRejected(t *testing.T) {
 	yaml := `
 repo: owner/repo

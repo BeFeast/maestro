@@ -237,7 +237,15 @@ func (o *Orchestrator) escalateRetryBackend(s *state.State, sess *state.Session,
 	// retry path must not move sess.Backend at all — so log the would-escalate and
 	// return ok=false, leaving the retry on its current backend (the fresh-dispatch
 	// path is honored the same way: selection is unchanged in shadow mode).
-	if o.cfg.Routing.Policy.Shadow {
+	//
+	// Shadow shadows only the *policy*. A model:<backend> label override is
+	// resolved by ResolveBackendDecisionForAttempt BEFORE policy evaluation
+	// (resolve.go precedence 1, reason=label) and is a deliberate operator move,
+	// not a policy pick — so an operator who relabels a stuck session to move it
+	// must still be honored on retry, exactly as fresh dispatch honors the label
+	// in shadow mode. Suppress only non-label (policy) decisions; a label override
+	// falls through to the health gate below and dispatches as resolved.
+	if o.cfg.Routing.Policy.Shadow && decision.Reason != router.ReasonLabel {
 		if decision.ShadowTier != "" {
 			log.Printf("[orch] issue #%d retry: policy SHADOW would escalate to tier %q (%s) — keeping backend %s unchanged",
 				sess.IssueNumber, decision.ShadowTier, decision.ShadowReason, sess.Backend)
