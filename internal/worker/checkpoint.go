@@ -120,16 +120,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 			return fmt.Errorf("backend %q (default) not found in config", backendName)
 		}
 	}
-	backendCfg := BackendConfig{
-		Cmd:         backendDef.Cmd,
-		ExtraArgs:   backendDef.ExtraArgs,
-		PromptMode:  backendDef.PromptMode,
-		Provider:    backendDef.Provider,
-		Model:       backendDef.Model,
-		Effort:      backendDef.Effort,
-		UsageStream: backendDef.UsageStream,
-		MCP:         backendDef.MCP,
-	}
+	backendCfg := workerBackendConfig(backendDef)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {

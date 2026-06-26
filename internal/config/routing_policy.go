@@ -94,11 +94,30 @@ func validateRoutingPolicy(cfg *Config) error {
 		if _, ok := r.Tiers[mt]; !ok {
 			return fmt.Errorf("config: routing.policy.escalation.max_tier = %q is not declared in routing.tiers", mt)
 		}
+		// #792 P3: max_tier must rank at or above default_tier. The escalation
+		// climb is capped at max_tier's rank, so a max_tier ranked below the start
+		// tier silently clamps every climb back to the start — escalation becomes a
+		// no-op. Reject it instead of shipping a config that can never escalate.
+		order := r.OrderedTierNames()
+		if mtIdx, dtIdx := tierRankIndex(order, mt), tierRankIndex(order, dt); mtIdx >= 0 && dtIdx >= 0 && mtIdx < dtIdx {
+			return fmt.Errorf("config: routing.policy.escalation.max_tier = %q ranks below default_tier = %q, so the escalation ladder could never climb above the start tier; raise max_tier or lower default_tier", mt, dt)
+		}
 	}
 	if pol.Budget.MaxStrongPerWave < 0 {
 		return fmt.Errorf("config: routing.policy.budget.max_strong_per_wave must be >= 0")
 	}
 	return nil
+}
+
+// tierRankIndex returns the position of name in the rank-ordered tier list (the
+// same order the escalation ladder climbs), or -1 when absent.
+func tierRankIndex(order []string, name string) int {
+	for i, n := range order {
+		if n == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // isEmpty reports whether the predicate sets no signal, which would make a rule

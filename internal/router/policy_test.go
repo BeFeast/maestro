@@ -62,6 +62,25 @@ func TestPolicy_RiskKeywordMatch(t *testing.T) {
 	}
 }
 
+// TestPolicy_RiskKeywordWordBoundary is the #792 P3 regression guard: risk
+// keywords must match whole words only. The old strings.Contains over title+body
+// false-routed to the expensive tier — "auth" matched "author"/"oauth", "infra"
+// matched "infrastructure".
+func TestPolicy_RiskKeywordWordBoundary(t *testing.T) {
+	r := New(policyConfig())
+	// Standalone keyword still routes to strong.
+	if d := r.ResolveBackendDecision(makeIssue(20, "Rework the auth flow")); d.Tier != "strong" {
+		t.Fatalf("standalone 'auth' tier = %q, want strong", d.Tier)
+	}
+	// Substrings must NOT match.
+	if d := r.ResolveBackendDecision(makeIssue(21, "Credit the author in README")); d.Tier != "standard" {
+		t.Fatalf("'author' falsely matched 'auth': tier = %q, want standard", d.Tier)
+	}
+	if d := r.ResolveBackendDecision(makeIssue(22, "Add oauth login button")); d.Tier != "standard" {
+		t.Fatalf("'oauth' falsely matched 'auth': tier = %q, want standard", d.Tier)
+	}
+}
+
 func TestPolicy_SizeDependencyMatch(t *testing.T) {
 	r := New(policyConfig())
 	d := r.ResolveBackendDecision(makeIssue(3, "Tiny fix", "size:small", "dependency:leaf"))

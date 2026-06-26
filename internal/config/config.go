@@ -42,6 +42,15 @@ type BackendDef struct {
 	Variant  string `yaml:"variant,omitempty"`  // e.g. "opus[1m]", "fast", "sonnet"
 	Effort   string `yaml:"effort,omitempty"`   // e.g. "xhigh", "medium", "low"
 
+	// #783/#792 (P1-A): a routing tier's per-tier model/effort override, carried
+	// DISTINCTLY from the #513 attribution Model/Effort above. These are never
+	// parsed from YAML — the orchestrator injects them onto a config clone via
+	// applyTierOverride only for a real policy-resolved tier override. Only these
+	// reach the worker argv (see worker.appendTierModelEffort); the #513
+	// attribution Model/Effort must NOT leak into argv for a non-policy config.
+	TierModel  string `yaml:"-" json:"-"`
+	TierEffort string `yaml:"-" json:"-"`
+
 	// #737: opt-in structured usage capture. When true, a claude-kind backend
 	// runs in `--output-format stream-json --verbose` mode and the worker
 	// runner pipes its NDJSON through `maestro stream-split`, which writes the

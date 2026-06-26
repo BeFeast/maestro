@@ -453,9 +453,16 @@ Make the decision self-explaining (closing the §1.6 gap):
   `Signals` breakdown field to `BackendSelection`
   (`internal/state/state.go:115-123`).
 - Surface it where the reason already renders: the `maestro status` `BACKEND`
-  column (`cmd/maestro/main.go:1461`), the fleet drawer
+  column (`cmd/maestro/main.go:1461`), the fleet API
   (`internal/server/fleet.go:1152-1155`), and the dispatch log line
   (`orchestrator.go:5312`).
+  - **Implementation status (#792):** the `maestro status` column, the fleet API
+    JSON (`backend_selection` carries `tier`/`effort`/`model`/`shadow_tier` and
+    the tier-derived candidate scores), and the dispatch log line are wired. The
+    Mission Control **SPA drawer** does not yet render these new fields
+    (`internal/server/web/mc/src/` never reads `backend_selection`); rendering
+    them in the drawer is a tracked frontend follow-up, not part of #791/#792.
+    The data is already exposed on the API for whoever wires the view.
 - Keep the durable `Maestro-Backend:` trailer
   (`internal/state/attribution.go:9-20`) as the canonical backend timeline —
   escalation simply appends a new segment with its `EndReason`, which the trailer

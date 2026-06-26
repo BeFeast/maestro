@@ -33,11 +33,21 @@ func applyTierOverride(cfg *config.Config, backendName string, decision router.B
 	for k, v := range cfg.Model.Backends {
 		backends[k] = v
 	}
+	// Set BOTH the #513 attribution Model/Effort (so the dashboard + the durable
+	// Maestro-Backend: trailer reflect the model the tier actually ran, and the
+	// pi backend, which reads cfg.Model directly, still receives the override) AND
+	// the distinct TierModel/TierEffort carriers that thread into the worker argv
+	// for claude/codex/gemini. The distinct carriers are what keep a non-policy
+	// config's #513 attribution from leaking into argv (#792 P1-A): this function
+	// early-returns above when there is no real tier override, so for a non-policy
+	// dispatch TierModel/TierEffort stay empty and argv is byte-for-byte unchanged.
 	if effort != "" {
 		def.Effort = effort
+		def.TierEffort = effort
 	}
 	if model != "" {
 		def.Model = model
+		def.TierModel = model
 	}
 	backends[backendName] = def
 	clone.Model.Backends = backends
@@ -132,10 +142,24 @@ func (o *Orchestrator) applyPolicyBudget(s *state.State, decision router.Backend
 	}
 	reason := fmt.Sprintf("policy:%s (budget downgrade from %s, max_strong_per_wave=%d)",
 		target, top, pol.Budget.MaxStrongPerWave)
-	if downgraded, ok := o.router.DecisionForTier(target, reason); ok {
-		return downgraded
+	downgraded, ok := o.router.DecisionForTier(target, reason)
+	if !ok {
+		return decision
 	}
-	return decision
+	// #792 P1-B: honor BackendHealth on the budget path. DecisionForTier only
+	// checks config existence, so without this a downgrade could land on a
+	// backend that is disabled or cooling down after an auth failure / provider
+	// limit — re-introducing the #695 doomed-worker (the fresh-dispatch gate in
+	// resolveDispatchBackend runs BEFORE this and never sees the downgrade). The
+	// original (top-tier) decision was already health-gated, so when the downgrade
+	// target is blocked, keep the healthy strong dispatch this wave rather than
+	// spawn a doomed worker; the cap re-applies next cycle.
+	if blockedBy, _ := o.dispatchBackendBlock(s, downgraded.Backend, time.Now().UTC()); blockedBy != "" {
+		log.Printf("[orch] policy budget: downgrade target %s blocked (%s) — keeping %s (%s) dispatch this wave",
+			downgraded.Backend, blockedBy, decision.Backend, decision.Tier)
+		return decision
+	}
+	return downgraded
 }
 
 // policyBudgetDowngradeTier resolves the tier an over-budget top-tier dispatch
@@ -187,6 +211,13 @@ func (o *Orchestrator) countActiveTierSessions(s *state.State, tier string) int 
 //
 // Must be called before the retry consumes sess.CIFailureOutput /
 // PreviousAttemptFeedback, since the trigger is derived from them.
+//
+// The per-wave strong-tier budget cap (applyPolicyBudget) is intentionally NOT
+// applied here (#792 P3): the cap throttles fresh dispatch of a burst of large
+// tasks, whereas escalation is the failure-driven recovery of one already-active,
+// already-counted issue. Subjecting it to the cap would strand a stuck issue at a
+// tier that demonstrably failed it; the per-issue retry budget + max_tier already
+// bound the climb so it cannot loop.
 func (o *Orchestrator) escalateRetryBackend(s *state.State, sess *state.Session, issue github.Issue) (router.BackendDecision, bool) {
 	if !o.cfg.Routing.IsPolicyMode() || o.cfg.Routing.Policy == nil {
 		return router.BackendDecision{}, false
@@ -200,6 +231,19 @@ func (o *Orchestrator) escalateRetryBackend(s *state.State, sess *state.Session,
 	}
 	steps := escalationSteps(o.cfg.Routing.Policy, sess)
 	decision := o.router.ResolveBackendDecisionForAttempt(issue, steps)
+	// #792 P2-E: shadow mode promises "log the would-pick WITHOUT changing the
+	// dispatched backend" (RFC §2.8). resolvePolicyDecision already returns
+	// model.default with the would-escalate tier recorded as ShadowTier, but the
+	// retry path must not move sess.Backend at all — so log the would-escalate and
+	// return ok=false, leaving the retry on its current backend (the fresh-dispatch
+	// path is honored the same way: selection is unchanged in shadow mode).
+	if o.cfg.Routing.Policy.Shadow {
+		if decision.ShadowTier != "" {
+			log.Printf("[orch] issue #%d retry: policy SHADOW would escalate to tier %q (%s) — keeping backend %s unchanged",
+				sess.IssueNumber, decision.ShadowTier, decision.ShadowReason, sess.Backend)
+		}
+		return router.BackendDecision{}, false
+	}
 	if decision.Backend == "" {
 		return router.BackendDecision{}, false
 	}
@@ -227,10 +271,20 @@ func escalationSteps(pol *config.RoutingPolicy, sess *state.Session) int {
 	if pol == nil || !pol.Escalation.Enabled {
 		return 0
 	}
-	if !escalationTriggerEnabled(pol.Escalation.On, retryTrigger(sess)) {
+	trigger := retryTrigger(sess)
+	if !escalationTriggerEnabled(pol.Escalation.On, trigger) {
 		return 0
 	}
 	steps := sess.RetryCount
+	// #792 P1-C: the review-feedback maintenance-retry path
+	// (handleReviewFeedbackRetry) bumps sess.MaintenanceRetryCount, NOT
+	// sess.RetryCount. So for the review_rejection trigger the climb must count
+	// the maintenance retries, or a PR's blocking findings would never escalate
+	// the tier. Take the larger of the two so the climb tracks whichever counter
+	// actually advanced for this session.
+	if trigger == config.EscalationOnReviewRejection && sess.MaintenanceRetryCount > steps {
+		steps = sess.MaintenanceRetryCount
+	}
 	if steps < 1 {
 		steps = 1
 	}

@@ -228,6 +228,27 @@ routing:
 `,
 			wantSnip: "max_tier = \"titan\"",
 		},
+		{
+			name: "max_tier below default_tier",
+			routing: `
+routing:
+  mode: policy
+  tiers:
+    cheap:
+      backend: gemini
+      rank: 0
+    strong:
+      backend: claude
+      rank: 2
+  policy:
+    default_tier: strong
+    escalation:
+      enabled: true
+      on: [retry]
+      max_tier: cheap
+`,
+			wantSnip: "ranks below default_tier",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

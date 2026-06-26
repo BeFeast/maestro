@@ -65,10 +65,22 @@ func TestApplyTierOverride_AppliesToClone(t *testing.T) {
 	if got := out.Model.Backends["codex"].Model; got != "gpt-5.5" {
 		t.Fatalf("override model = %q, want gpt-5.5", got)
 	}
+	// #792 P1-A: the override is ALSO mirrored onto the distinct TierModel/
+	// TierEffort carriers — the only fields threaded into the worker argv — so the
+	// #513 attribution Model/Effort never leak for a non-policy dispatch.
+	if got := out.Model.Backends["codex"].TierEffort; got != "high" {
+		t.Fatalf("override TierEffort = %q, want high", got)
+	}
+	if got := out.Model.Backends["codex"].TierModel; got != "gpt-5.5" {
+		t.Fatalf("override TierModel = %q, want gpt-5.5", got)
+	}
 	// Base config must be untouched — the codex backend def carries no effort
 	// of its own (the override lived on the tier).
 	if got := cfg.Model.Backends["codex"].Effort; got != "" {
 		t.Fatalf("base config mutated: codex effort = %q, want empty", got)
+	}
+	if got := cfg.Model.Backends["codex"].TierEffort; got != "" {
+		t.Fatalf("base config mutated: codex TierEffort = %q, want empty", got)
 	}
 }
 
@@ -143,6 +155,65 @@ func TestEscalateRetryBackend_ClimbsTier(t *testing.T) {
 	}
 	if dec.Backend != "claude" || dec.Tier != "strong" {
 		t.Fatalf("escalated decision = %+v, want claude/strong", dec)
+	}
+}
+
+// TestEscalationSteps_ReviewRejectionCountsMaintenance is the #792 P1-C
+// regression guard: the review-feedback maintenance-retry path bumps
+// MaintenanceRetryCount (not RetryCount), so a review_rejection escalation must
+// count it or the climb is stuck at the floor (1) and never tracks the number of
+// review retries.
+func TestEscalationSteps_ReviewRejectionCountsMaintenance(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Policy.Escalation.On = []string{"review_rejection"}
+	pol := cfg.Routing.Policy
+	sess := &state.Session{
+		IssueNumber: 1, RetryCount: 0, MaintenanceRetryCount: 2,
+		RetryReason: state.RetryReasonReviewFeedback,
+	}
+	if got := escalationSteps(pol, sess); got != 2 {
+		t.Fatalf("escalationSteps (review_rejection) = %d, want 2 (maintenance retries)", got)
+	}
+}
+
+// TestEscalateRetryBackend_ReviewRejectionClimbsViaMaintenance proves the P1-C
+// fix end-to-end: a 2nd review-feedback retry of an issue that started at cheap
+// climbs two tiers to strong. The pre-fix climb counted RetryCount(0)→floor 1
+// and stranded the retry at standard.
+func TestEscalateRetryBackend_ReviewRejectionClimbsViaMaintenance(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Policy.Escalation.On = []string{"review_rejection"}
+	cfg.Routing.Policy.Rules = append(cfg.Routing.Policy.Rules,
+		config.RoutingPolicyRule{When: config.RoutingSignalMatch{Size: "small", Dependency: "leaf"}, Tier: "cheap"})
+	o := policyOrch(cfg)
+	s := state.NewState()
+	sess := &state.Session{
+		IssueNumber: 1, Backend: "gemini",
+		RetryReason: state.RetryReasonReviewFeedback, MaintenanceRetryCount: 2,
+	}
+	issue := issueWithLabels(1, "Tiny", "size:small", "dependency:leaf") // starts cheap (rank 0)
+	dec, ok := o.escalateRetryBackend(s, sess, issue)
+	if !ok {
+		t.Fatalf("escalateRetryBackend ok = false, want true")
+	}
+	if dec.Tier != "strong" || dec.Backend != "claude" {
+		t.Fatalf("review escalation decision = %+v, want strong/claude (climbed 2 from cheap)", dec)
+	}
+}
+
+// TestEscalateRetryBackend_ShadowKeepsBackend is the #792 P2-E regression guard:
+// in shadow mode the retry/escalation path must log the would-pick WITHOUT
+// changing the dispatched backend, so escalateRetryBackend returns ok=false and
+// the retry reuses sess.Backend (pre-fix it returned model.default with ok=true,
+// silently moving a strong-tier session to the default backend).
+func TestEscalateRetryBackend_ShadowKeepsBackend(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Policy.Shadow = true
+	o := policyOrch(cfg)
+	s := state.NewState()
+	sess := &state.Session{IssueNumber: 1, RetryCount: 1, Backend: "claude"}
+	if _, ok := o.escalateRetryBackend(s, sess, issueWithLabels(1, "Ordinary")); ok {
+		t.Fatalf("shadow mode: escalateRetryBackend ok = true, want false (dispatch unchanged)")
 	}
 }
 
@@ -254,6 +325,57 @@ func TestApplyPolicyBudget_SingleTierUnenforceable(t *testing.T) {
 	out := o.applyPolicyBudget(s, dec)
 	if out.Tier != "only" || out.Backend != "claude" {
 		t.Fatalf("single-tier budget = %+v, want unchanged only/claude", out)
+	}
+}
+
+// TestApplyPolicyBudget_SkipsDowngradeOntoCoolingDownBackend is the #792 P1-B
+// regression guard: resolveDispatchBackend health-gates the original (strong)
+// decision, but applyPolicyBudget runs AFTER and could swap to a downgrade tier
+// via DecisionForTier, which only checks config existence — never BackendHealth.
+// A downgrade onto a cooling-down standard backend would spawn the exact #695
+// doomed worker the gate prevents. So when the downgrade target is blocked, the
+// budget path must keep the already-gated strong dispatch instead.
+func TestApplyPolicyBudget_SkipsDowngradeOntoCoolingDownBackend(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Policy.Budget.MaxStrongPerWave = 1
+	o := policyOrch(cfg)
+	s := state.NewState()
+	// One active strong session → the next strong dispatch is over the cap and
+	// would normally downgrade to standard (codex).
+	s.Sessions["slot-a"] = &state.Session{
+		IssueNumber: 9, Status: state.StatusRunning,
+		BackendSelection: &state.BackendSelection{Tier: "strong"},
+	}
+	// But codex (the downgrade target) is cooling down after a provider limit.
+	s.BackendHealth = map[string]state.BackendHealth{
+		"codex": {State: state.BackendHealthCooldown, Reason: "provider_limit"},
+	}
+	strongDecision := router.BackendDecision{Backend: "claude", Tier: "strong", Reason: "policy:strong"}
+	out := o.applyPolicyBudget(s, strongDecision)
+	if out.Backend != "claude" || out.Tier != "strong" {
+		t.Fatalf("must not downgrade onto cooling-down codex; got %+v", out)
+	}
+}
+
+// TestApplyPolicyBudget_DowngradesWhenTargetHealthy confirms the P1-B gate does
+// not over-fire: a healthy downgrade target still downgrades as before.
+func TestApplyPolicyBudget_DowngradesWhenTargetHealthy(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Policy.Budget.MaxStrongPerWave = 1
+	o := policyOrch(cfg)
+	s := state.NewState()
+	s.Sessions["slot-a"] = &state.Session{
+		IssueNumber: 9, Status: state.StatusRunning,
+		BackendSelection: &state.BackendSelection{Tier: "strong"},
+	}
+	// A cooldown on an unrelated backend must not block the codex downgrade.
+	s.BackendHealth = map[string]state.BackendHealth{
+		"gemini": {State: state.BackendHealthCooldown, Reason: "provider_limit"},
+	}
+	strongDecision := router.BackendDecision{Backend: "claude", Tier: "strong", Reason: "policy:strong"}
+	out := o.applyPolicyBudget(s, strongDecision)
+	if out.Backend != "codex" || out.Tier != "standard" {
+		t.Fatalf("healthy downgrade target = %+v, want standard/codex", out)
 	}
 }
 
