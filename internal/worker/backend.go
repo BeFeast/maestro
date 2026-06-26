@@ -106,6 +106,9 @@ func (claudeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	if err != nil {
 		return nil, "", err
 	}
+	// #783: thread a routing tier's model/effort override into argv (skipped
+	// when the operator pinned them in cmd/extra_args).
+	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindClaude, cfg)
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
@@ -137,6 +140,10 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	if err != nil {
 		return nil, "", err
 	}
+	// #783: thread a routing tier's model/effort override into argv. codex takes
+	// the reasoning effort as `-c model_reasoning_effort=<e>`; skipped when the
+	// operator pinned the model/effort in cmd/extra_args.
+	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindCodex, cfg)
 	args = append(args, cfg.ExtraArgs...)
 	args = append(args, "-")
 	cmd := exec.Command(binary, args...)
@@ -160,6 +167,9 @@ func (geminiBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	}
 	binary, cmdArgs := splitCmd(geminiCmd)
 	args := append(cmdArgs, "-p", string(promptData))
+	// #783: thread a routing tier's model/effort override into argv (skipped
+	// when the operator pinned them in cmd/extra_args).
+	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindGemini, cfg)
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
@@ -281,6 +291,55 @@ func (genericBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	return cmd, stdinFile, nil
+}
+
+// argsHaveCodexEffort reports whether codex's reasoning-effort knob is already
+// pinned via `-c model_reasoning_effort=...` in cmd/extra_args, so a tier's
+// effort override is skipped instead of producing a conflicting -c override.
+func argsHaveCodexEffort(args []string) bool {
+	for _, a := range args {
+		if strings.Contains(a, "model_reasoning_effort") {
+			return true
+		}
+	}
+	return false
+}
+
+// appendTierModelEffort threads a routing tier's optional per-tier model/effort
+// override (#783, RFC §2.4 step 5) into a first-class agentic backend's worker
+// argv. Until #783 these builders ignored cfg.Model/cfg.Effort for
+// claude/codex/gemini (only Pi read cfg.Model), so a tier could not steer the
+// model/effort without a distinct backend entry. The flag spelling is
+// backend-specific: codex takes the reasoning effort as `-c
+// model_reasoning_effort=<e>`, while claude/gemini take `--effort <e>`; all
+// three take `--model <m>`. An operator who already pinned the model/effort in
+// cmd or extra_args wins — the override is skipped to avoid a duplicate or
+// conflicting flag. pinned is the union of the backend's cmd-prefix args and
+// extra_args.
+func appendTierModelEffort(args, pinned []string, kind string, cfg BackendConfig) []string {
+	if model := strings.TrimSpace(cfg.Model); model != "" && !argsHaveFlag(pinned, "--model") {
+		args = append(args, "--model", model)
+	}
+	if effort := strings.TrimSpace(cfg.Effort); effort != "" {
+		if kind == config.BackendKindCodex {
+			if !argsHaveCodexEffort(pinned) {
+				args = append(args, "-c", "model_reasoning_effort="+effort)
+			}
+		} else if !argsHaveFlag(pinned, "--effort") {
+			args = append(args, "--effort", effort)
+		}
+	}
+	return args
+}
+
+// pinnedArgs returns the union of a backend's cmd-prefix args and extra_args as
+// a fresh slice, used to detect operator-pinned flags so a tier override does
+// not duplicate them.
+func pinnedArgs(cmdArgs []string, cfg BackendConfig) []string {
+	pinned := make([]string, 0, len(cmdArgs)+len(cfg.ExtraArgs))
+	pinned = append(pinned, cmdArgs...)
+	pinned = append(pinned, cfg.ExtraArgs...)
+	return pinned
 }
 
 func appendModelOptions(args []string, cfg BackendConfig) []string {

@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -783,17 +784,120 @@ func (s SupervisorConfig) AllowsSafeAction(action string) bool {
 
 // RoutingConfig controls automatic backend selection via LLM router.
 type RoutingConfig struct {
-	Mode             string            `yaml:"mode"`               // "auto", "manual" (labels only)
+	Mode             string            `yaml:"mode"`               // "manual" (labels only, default), "auto" (LLM router), "policy" (task-aware tiers, #783)
 	RouterModel      string            `yaml:"router_model"`       // backend name from model.backends (default: "claude")
 	RouterModelName  string            `yaml:"router_model_name"`  // specific model to use (default: "claude-sonnet-4-6")
 	RouterPrompt     string            `yaml:"router_prompt"`      // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
 	TaskTypeBackends map[string]string `yaml:"task_type_backends"` // task_type -> backend override used only when routing.mode=auto
 
-	// Role-specific backend overrides for the planner → implementer → validator pipeline.
-	// Each maps to a backend name from model.backends. If empty, falls back to issue-level routing.
-	PlannerBackend        string `yaml:"planner_backend"`        // backend for planning phase (e.g. "gemini-flash")
-	ImplementationBackend string `yaml:"implementation_backend"` // backend for implementation phase (e.g. "claude")
-	ValidatorBackend      string `yaml:"validator_backend"`      // backend for validation phase (e.g. "claude")
+	// Task-aware model routing (#783, RFC docs/model-routing-rfc.md §2.5). Tiers
+	// are named strength bands (backend + optional effort/model override) and
+	// Policy is the deterministic signal→tier rule list evaluated only when
+	// Mode == "policy". When Mode != "policy" both are inert and selection is
+	// byte-for-byte today's behavior — the label override and model.default
+	// paths are untouched (RFC §2.9).
+	Tiers  map[string]RoutingTier `yaml:"tiers,omitempty"`
+	Policy *RoutingPolicy         `yaml:"policy,omitempty"`
+}
+
+// RoutingTier is one named strength tier (RFC §2.4). It points at a backend
+// declared in model.backends and may override that backend's reasoning effort
+// and/or model id per-tier; the overrides are threaded into the worker argv
+// (codex/claude/gemini) so one backend can serve multiple tiers. Rank orders
+// tiers for the escalation climb — lower is cheaper/weaker — and ties break by
+// tier name; set explicit ranks (e.g. cheap=0, standard=1, strong=2) when
+// escalation is enabled.
+type RoutingTier struct {
+	Backend string `yaml:"backend"`
+	Effort  string `yaml:"effort,omitempty"`
+	Model   string `yaml:"model,omitempty"`
+	Rank    int    `yaml:"rank,omitempty"`
+}
+
+// RoutingPolicy is the deterministic first-match signal→tier policy evaluated
+// when routing.mode == "policy" (RFC §2.5). The label override (model:<name>)
+// is evaluated before the policy and always wins; an unmatched issue falls to
+// DefaultTier.
+type RoutingPolicy struct {
+	DefaultTier string              `yaml:"default_tier"`
+	Rules       []RoutingPolicyRule `yaml:"rules,omitempty"`
+	Escalation  RoutingEscalation   `yaml:"escalation,omitempty"`
+	Budget      RoutingBudget       `yaml:"budget,omitempty"`
+	// Shadow logs the tier the policy would pick without changing the
+	// dispatched backend, so an operator can validate the rules against a real
+	// wave before enabling (RFC §2.8 shadow-mode rollout).
+	Shadow bool `yaml:"shadow,omitempty"`
+}
+
+// RoutingPolicyRule maps a signal predicate to a tier. Rules are evaluated in
+// order and the first whose When predicate matches wins (RFC §2.4 step 2).
+type RoutingPolicyRule struct {
+	When RoutingSignalMatch `yaml:"when"`
+	Tier string             `yaml:"tier"`
+}
+
+// RoutingSignalMatch is a rule predicate over issue signals. A rule matches
+// when every field it sets matches the issue (logical AND); unset fields are
+// ignored. The signals are all deterministically derivable from issue data the
+// router already holds (RFC §2.2), so no extra LLM call is needed.
+type RoutingSignalMatch struct {
+	Labels       []string `yaml:"labels,omitempty"`        // issue-label globs (filepath.Match), e.g. "model:*", "migration"
+	RiskKeywords []string `yaml:"risk_keywords,omitempty"` // case-insensitive substrings matched against title+body
+	Size         string   `yaml:"size,omitempty"`          // "small" | "large" (from a size:<v> label)
+	Dependency   string   `yaml:"dependency,omitempty"`    // "leaf" | "foundation" (from a dependency:<v> label)
+}
+
+// RoutingEscalation is the cheap-first, escalate-on-failure ladder (RFC §2.6):
+// on an enabled trigger the next attempt climbs one tier (effort-first within a
+// backend, then backend), capped at MaxTier and the per-issue retry budget.
+type RoutingEscalation struct {
+	Enabled bool     `yaml:"enabled,omitempty"`
+	On      []string `yaml:"on,omitempty"`       // any of: ci_failure, review_rejection, retry
+	MaxTier string   `yaml:"max_tier,omitempty"` // climb never exceeds this tier (default: highest-rank tier)
+}
+
+// RoutingBudget caps how many issues a wave routes to the strong band so a
+// burst of large tasks cannot blow the cost envelope (RFC §2.5 budget).
+type RoutingBudget struct {
+	MaxStrongPerWave int `yaml:"max_strong_per_wave,omitempty"` // 0 = unlimited
+}
+
+// Escalation trigger tokens accepted in routing.policy.escalation.on (RFC §2.6).
+const (
+	EscalationOnCIFailure       = "ci_failure"
+	EscalationOnReviewRejection = "review_rejection"
+	EscalationOnRetry           = "retry"
+)
+
+// PolicyPassthroughTier is the reserved rule tier that documents "this signal
+// bypasses the policy" (e.g. the model:* label rule in the RFC example). A rule
+// resolving to it is treated as no policy match, so resolution falls through to
+// DefaultTier / model.default exactly as if the rule were absent.
+const PolicyPassthroughTier = "passthrough"
+
+// PolicyMode is the routing.mode value that turns on task-aware tier routing.
+const PolicyMode = "policy"
+
+// IsPolicyMode reports whether task-aware tier routing is enabled.
+func (r RoutingConfig) IsPolicyMode() bool {
+	return strings.EqualFold(strings.TrimSpace(r.Mode), PolicyMode)
+}
+
+// OrderedTierNames returns tier names sorted by ascending rank, ties broken by
+// name. This is the deterministic order the escalation ladder climbs.
+func (r RoutingConfig) OrderedTierNames() []string {
+	names := make([]string, 0, len(r.Tiers))
+	for name := range r.Tiers {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		ri, rj := r.Tiers[names[i]].Rank, r.Tiers[names[j]].Rank
+		if ri != rj {
+			return ri < rj
+		}
+		return names[i] < names[j]
+	})
+	return names
 }
 
 // ServerConfig controls the optional HTTP API server.
@@ -1454,6 +1558,13 @@ func parse(data []byte) (*Config, error) {
 		cfg.Routing.TaskTypeBackends = normalized
 	}
 
+	// Task-aware routing tiers/policy (#783). Validation fires only when the
+	// new fields are present or mode: policy is requested, so existing configs
+	// (no tiers/policy, mode manual|auto) parse and validate identically.
+	if err := validateRoutingPolicy(cfg); err != nil {
+		return nil, err
+	}
+
 	// Versioning defaults
 	if cfg.Versioning.DefaultBump == "" {
 		cfg.Versioning.DefaultBump = "patch"
@@ -1806,13 +1917,14 @@ func (c *Config) verifyVisualWarning() string {
 //
 // The warning fires only when ALL three are true:
 //   - 2+ backends are configured (single-backend setups have nothing to route)
-//   - routing.mode is empty or "manual" (auto-routing would be the task lever)
-//   - no role-specific backends are set (planner/implementer/validator overrides
-//     would be a legitimate role-based shape even without auto)
+//   - routing.mode is empty or "manual" (auto/policy would be the task lever)
+//   - no per-role pipeline backends are set (pipeline.{planner,validator}.backend
+//     is a legitimate role-based shape even without auto/policy)
 //
 // This keeps the warning silent for the common single-backend project, for
-// projects that opted into auto-routing, and for projects that purposefully
-// pin per-role backends. It fires loudly for the failure mode in #427.
+// projects that opted into auto/policy routing, and for projects that
+// purposefully pin per-role pipeline backends. It fires loudly for the failure
+// mode in #427.
 func (c *Config) manualRoutingLabelPinWarning() string {
 	if c == nil {
 		return ""
@@ -1821,16 +1933,15 @@ func (c *Config) manualRoutingLabelPinWarning() string {
 		return ""
 	}
 	mode := strings.ToLower(strings.TrimSpace(c.Routing.Mode))
-	if mode == "auto" {
+	if mode == "auto" || mode == PolicyMode {
 		return ""
 	}
-	if strings.TrimSpace(c.Routing.PlannerBackend) != "" ||
-		strings.TrimSpace(c.Routing.ImplementationBackend) != "" ||
-		strings.TrimSpace(c.Routing.ValidatorBackend) != "" {
+	if strings.TrimSpace(c.Pipeline.Planner.Backend) != "" ||
+		strings.TrimSpace(c.Pipeline.Validator.Backend) != "" {
 		return ""
 	}
 	return fmt.Sprintf(
-		"config: %d backends are configured but routing.mode is %q and no planner/implementation/validator_backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: auto for task-based routing or per-role backends for role-based routing.",
+		"config: %d backends are configured but routing.mode is %q and no pipeline.{planner,validator}.backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: policy for task-aware routing, routing.mode: auto for LLM routing, or per-role pipeline backends for role-based routing.",
 		len(c.Model.Backends),
 		coalesceRoutingMode(c.Routing.Mode),
 	)

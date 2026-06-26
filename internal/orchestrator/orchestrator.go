@@ -430,14 +430,21 @@ func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
 }
 
 func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	return o.respawnWorkerWithConfig(o.cfg, slotName, sess, issue, promptBase, backendName)
+}
+
+// respawnWorkerWithConfig respawns a dead worker using the given config, which
+// the escalation ladder uses to carry a tier's per-tier effort/model override
+// (#783). It defaults to o.cfg via respawnWorker.
+func (o *Orchestrator) respawnWorkerWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	// Support both hook names for test compatibility (respawnWorkerFn = branch, workerRespawnFn = HEAD)
 	if o.respawnWorkerFn != nil {
-		return o.respawnWorkerFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+		return o.respawnWorkerFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
 	if o.workerRespawnFn != nil {
-		return o.workerRespawnFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+		return o.workerRespawnFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
-	return worker.Respawn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+	return worker.Respawn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 }
 
 func (o *Orchestrator) saveCheckpoint(sess *state.Session) (string, error) {
@@ -462,10 +469,17 @@ func (o *Orchestrator) rateLimit() (github.RateLimitStatus, error) {
 }
 
 func (o *Orchestrator) respawnInPlace(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	return o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, backendName)
+}
+
+// respawnInPlaceWithConfig respawns a worker in place using the given config so
+// the escalation ladder can carry a tier's per-tier effort/model override
+// (#783). It defaults to o.cfg via respawnInPlace.
+func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	if o.respawnInPlaceFn != nil {
-		return o.respawnInPlaceFn(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+		return o.respawnInPlaceFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
-	return worker.RespawnInPlace(o.cfg, slotName, sess, o.repo, issue, promptBase, backendName)
+	return worker.RespawnInPlace(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 }
 
 func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
@@ -1445,6 +1459,29 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 
 		promptBase := o.selectPrompt(issue)
 
+		// #783: under routing.mode: policy, re-resolve the tier for this retry
+		// and climb the escalation ladder when the retry's trigger is enabled,
+		// instead of blindly reusing sess.Backend. Resolved BEFORE the CI /
+		// review context is consumed below, since the trigger is derived from
+		// those fields. The per-issue retry budget bounds the total retries, so
+		// the climb cannot loop.
+		respawnBackend := sess.Backend
+		respawnCfg := o.cfg
+		if dec, ok := o.escalateRetryBackend(s, sess, issue); ok {
+			if dec.Backend != sess.Backend || dec.Tier != "" {
+				log.Printf("[orch] issue #%d retry %d: policy re-resolved backend %s → %s (%s)",
+					sess.IssueNumber, sess.RetryCount, sess.Backend, dec.Backend, dec.Reason)
+			}
+			respawnBackend = dec.Backend
+			respawnCfg = applyTierOverride(o.cfg, dec.Backend, dec)
+			sel := o.policyBackendSelection(dec)
+			sel.PreviousBackend = sess.Backend
+			sess.BackendSelection = sel
+			// Keep sess.Backend consistent with the dispatched backend for the
+			// in-place retry path (RespawnInPlace does not restamp it).
+			sess.Backend = dec.Backend
+		}
+
 		// If this is a CI failure retry, include CI output and review feedback
 		// in the prompt so the new worker knows what went wrong.
 		if sess.CIFailureOutput != "" {
@@ -1466,9 +1503,9 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 
 		var respawnErr error
 		if sess.PRNumber != 0 && sess.Worktree != "" {
-			respawnErr = o.respawnInPlace(slotName, sess, issue, promptBase, sess.Backend)
+			respawnErr = o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		} else {
-			respawnErr = o.respawnWorker(slotName, sess, issue, promptBase, sess.Backend)
+			respawnErr = o.respawnWorkerWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		}
 		if respawnErr != nil {
 			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, respawnErr)
@@ -5239,6 +5276,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// router_error, phase, review_repair. (#427)
 		var backendReason string
 		var taskType string
+		// backendDecision carries the full resolution (incl. policy tier +
+		// effort/model override) for the normal path; zero for the
+		// review-repair / phase branches (#783).
+		var backendDecision router.BackendDecision
 
 		// #565: when the supervisor selected spawn_review_repair for this
 		// issue, override backend + prompt with the strong backend and
@@ -5269,7 +5310,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			// resolution, gated on BackendHealth so a fresh dispatch never
 			// lands on a backend that is disabled or cooling down after an
 			// auth failure / provider limit (#695).
-			backendDecision, dispatchable, retryAt := o.resolveDispatchBackend(s, issue, time.Now().UTC())
+			decision, dispatchable, retryAt := o.resolveDispatchBackend(s, issue, time.Now().UTC())
 			if !dispatchable {
 				if !dispatchPauseLogged {
 					expiry := "no cooldown expiry recorded"
@@ -5281,6 +5322,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				}
 				continue
 			}
+			// #783: apply the per-wave strong-tier budget cap before committing.
+			backendDecision = o.applyPolicyBudget(s, decision)
 			backendName = backendDecision.Backend
 			backendReason = backendDecision.Reason
 			taskType = backendDecision.TaskType
@@ -5309,6 +5352,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 		}
 
+		// #783: thread the resolved tier's effort/model override into the
+		// dispatched worker's argv (no-op for non-policy decisions); surface the
+		// shadow would-pick on the dispatch line when policy shadow mode is on.
+		workerCfg = applyTierOverride(workerCfg, backendName, backendDecision)
+		if backendDecision.ShadowTier != "" {
+			log.Printf("[orch] issue #%d: policy SHADOW would pick %s — dispatching %s unchanged",
+				issue.Number, backendDecision.ShadowReason, backendName)
+		}
 		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, reason=%s, phase=%s, long_running=%v)", issue.Number, issue.Title, backendName, backendReason, initialPhase, longRunning)
 		slotName, err := o.startWorker(workerCfg, s, issue, promptBase, backendName)
 		if err != nil {
@@ -5327,14 +5378,20 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if pipelineFull {
 			s.Sessions[slotName].PipelineFull = true
 		}
-		// #427: stamp the backend selection reason on the session so the
-		// dashboard / fleet API can show why this backend was chosen
-		// (label / role / auto / default / router_error / phase / review_repair).
+		// #427/#783: stamp the backend selection reason on the session so the
+		// dashboard / fleet API can show why this backend was chosen (label /
+		// auto / default / router_error / phase / review_repair / policy:<tier>).
 		if sess := s.Sessions[slotName]; sess != nil {
-			sess.BackendSelection = &state.BackendSelection{
-				SelectedBackend: backendName,
-				SelectionReason: backendReason,
-				TaskType:        taskType,
+			if backendDecision.Tier != "" || backendDecision.ShadowTier != "" {
+				sel := o.policyBackendSelection(backendDecision)
+				sel.SelectedBackend = backendName
+				sess.BackendSelection = sel
+			} else {
+				sess.BackendSelection = &state.BackendSelection{
+					SelectedBackend: backendName,
+					SelectionReason: backendReason,
+					TaskType:        taskType,
+				}
 			}
 			if taskType != "" && len(sess.Attribution) > 0 {
 				sess.Attribution[len(sess.Attribution)-1].TaskType = taskType

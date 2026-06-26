@@ -8,30 +8,38 @@ import (
 	"github.com/befeast/maestro/internal/github"
 )
 
-// Role constants for the planner → implementer → validator pipeline.
-const (
-	RolePlanner     = "planner"
-	RoleImplementer = "implementer"
-	RoleValidator   = "validator"
-)
-
 // BackendDecision is the resolved backend plus visibility metadata that callers
 // persist on sessions.
 type BackendDecision struct {
 	Backend  string
 	Reason   string
 	TaskType string
+
+	// Task-aware policy routing (#783). Tier is the strength tier the policy
+	// resolved to (empty for non-policy decisions). Effort/Model are the tier's
+	// optional per-tier overrides threaded into the worker argv so one backend
+	// can serve multiple tiers. ShadowTier/ShadowReason carry the tier the
+	// policy *would* have picked when policy.shadow is on — selection is
+	// unchanged but the would-pick is logged/recorded for validation (RFC §2.8).
+	Tier         string
+	Effort       string
+	Model        string
+	ShadowTier   string
+	ShadowReason string
 }
 
 // Selection reason canonical values written to Session.BackendSelection.SelectionReason
 // when the orchestrator records why a backend was chosen for an issue.
 const (
 	ReasonLabel       = "label"
-	ReasonRole        = "role"
 	ReasonAuto        = "auto"
 	ReasonDefault     = "default"
 	ReasonRouterError = "router_error"
 	ReasonUnknownPin  = "unknown_label_backend"
+	// ReasonPolicyError marks a policy decision that could not resolve to a
+	// usable tier backend (e.g. tier points at a now-missing backend) and fell
+	// back to model.default — the policy analogue of ReasonRouterError.
+	ReasonPolicyError = "policy_error"
 )
 
 // BackendFromLabels extracts a backend name from issue labels with the "model:" prefix.
@@ -73,8 +81,19 @@ func (r *Router) ResolveBackend(issue github.Issue) (backendName, reason string)
 }
 
 // ResolveBackendDecision determines the backend for an issue and includes the
-// structured task type when routing.mode=auto produced one.
+// structured task type when routing.mode=auto produced one. It is the
+// fresh-dispatch entry point (escalation level 0); the escalation ladder uses
+// ResolveBackendDecisionForAttempt.
 func (r *Router) ResolveBackendDecision(issue github.Issue) BackendDecision {
+	return r.ResolveBackendDecisionForAttempt(issue, 0)
+}
+
+// ResolveBackendDecisionForAttempt resolves the backend for an issue at a given
+// escalation level (RFC §2.6). escalationSteps > 0 climbs that many strength
+// tiers above the signal-derived starting tier (capped at the policy max_tier);
+// it only applies under routing.mode == "policy" and is ignored otherwise. The
+// label override and model.default precedence is identical at every level.
+func (r *Router) ResolveBackendDecisionForAttempt(issue github.Issue, escalationSteps int) BackendDecision {
 	// 1. Check for model: label (highest priority)
 	if name := BackendFromLabels(issue); name != "" {
 		validated, ok := ValidateBackend(name, r.cfg)
@@ -87,7 +106,14 @@ func (r *Router) ResolveBackendDecision(issue github.Issue) BackendDecision {
 		return BackendDecision{Backend: validated, Reason: ReasonLabel}
 	}
 
-	// 2. Auto-routing via LLM (if enabled)
+	// 2. Task-aware policy routing (#783) — between the label override and
+	// auto/default, evaluated only when routing.mode == "policy". Inert
+	// otherwise, so manual/auto selection is byte-for-byte unchanged.
+	if r.cfg.Routing.IsPolicyMode() {
+		return r.resolvePolicyDecision(issue, escalationSteps)
+	}
+
+	// 3. Auto-routing via LLM (if enabled)
 	if r.cfg.Routing.Mode == "auto" {
 		routeDecisionFn := r.RouteDecision
 		if r.DecisionFn != nil {
@@ -129,54 +155,6 @@ func (r *Router) ResolveBackendDecision(issue github.Issue) BackendDecision {
 		return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonRouterError, TaskType: taskType}
 	}
 
-	// 3. Default backend
+	// 4. Default backend
 	return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonDefault}
-}
-
-// roleBackend returns the configured backend name for a given role, or empty string if not set.
-func roleBackend(cfg *config.Config, role string) string {
-	switch role {
-	case RolePlanner:
-		return cfg.Routing.PlannerBackend
-	case RoleImplementer:
-		return cfg.Routing.ImplementationBackend
-	case RoleValidator:
-		return cfg.Routing.ValidatorBackend
-	default:
-		return ""
-	}
-}
-
-// ResolveBackendForRole determines the backend for an issue and a specific pipeline role.
-// Priority:
-//  1. model:<backend> label on the issue (highest priority, same as issue-level)
-//  2. Role-specific backend from config (e.g. routing.planner_backend)
-//  3. Falls back to issue-level ResolveBackend (auto-routing or default)
-func (r *Router) ResolveBackendForRole(issue github.Issue, role string) (backendName, reason string) {
-	// 1. Label override takes precedence over everything (consistent with ResolveBackend)
-	if name := BackendFromLabels(issue); name != "" {
-		validated, ok := ValidateBackend(name, r.cfg)
-		if !ok {
-			log.Printf("[router] issue #%d role=%s: label specifies unknown backend %q, falling back to default %q",
-				issue.Number, role, name, r.cfg.Model.Default)
-			return validated, ReasonUnknownPin
-		}
-		log.Printf("[router] issue #%d role=%s → %s (label override)", issue.Number, role, validated)
-		return validated, ReasonLabel
-	}
-
-	// 2. Role-specific backend from config
-	if rb := roleBackend(r.cfg, role); rb != "" {
-		validated, ok := ValidateBackend(rb, r.cfg)
-		if !ok {
-			log.Printf("[router] issue #%d role=%s: configured role backend %q not found, falling back to issue-level routing",
-				issue.Number, role, rb)
-		} else {
-			log.Printf("[router] issue #%d role=%s → %s (role config)", issue.Number, role, validated)
-			return validated, ReasonRole
-		}
-	}
-
-	// 3. Fall back to issue-level resolution (auto-routing or default)
-	return r.ResolveBackend(issue)
 }

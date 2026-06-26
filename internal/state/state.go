@@ -120,6 +120,16 @@ type BackendSelection struct {
 	CandidateScores []BackendCandidate `json:"candidate_scores,omitempty"`
 	HardPin         bool               `json:"hard_pin,omitempty"`
 	PreviousBackend string             `json:"previous_backend,omitempty"`
+
+	// Task-aware policy routing observability (#783, RFC §2.7). Tier is the
+	// strength tier the policy resolved to; Effort/Model are the per-tier
+	// overrides threaded into the worker argv. ShadowTier is the tier the
+	// policy *would* have picked while routing.policy.shadow is on (dispatch
+	// unchanged) so a wave can be validated before enabling.
+	Tier       string `json:"tier,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	Model      string `json:"model,omitempty"`
+	ShadowTier string `json:"shadow_tier,omitempty"`
 }
 
 // Phase represents which pipeline phase a session is currently in.
