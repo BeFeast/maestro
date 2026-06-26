@@ -157,14 +157,32 @@ func TestConfig_Warnings_RoleBackendsNoWarning(t *testing.T) {
 				"claude": {Cmd: "claude"},
 			},
 		},
-		Routing: RoutingConfig{
-			Mode:                  "manual",
-			ImplementationBackend: "claude",
+		Routing: RoutingConfig{Mode: "manual"},
+		Pipeline: PipelineConfig{
+			Validator: RoleConfig{Backend: "claude"},
 		},
 	}
 	for _, msg := range cfg.Warnings() {
 		if strings.Contains(msg, "routing.mode") {
-			t.Fatalf("Warnings() = %v, role backends should not trigger the #427 warning", cfg.Warnings())
+			t.Fatalf("Warnings() = %v, per-role pipeline backends should not trigger the #427 warning", cfg.Warnings())
+		}
+	}
+}
+
+func TestConfig_Warnings_PolicyModeNoWarning(t *testing.T) {
+	cfg := &Config{
+		Model: ModelConfig{
+			Default: "codex",
+			Backends: map[string]BackendDef{
+				"codex":  {Cmd: "codex"},
+				"claude": {Cmd: "claude"},
+			},
+		},
+		Routing: RoutingConfig{Mode: "policy"},
+	}
+	for _, msg := range cfg.Warnings() {
+		if strings.Contains(msg, "routing.mode") {
+			t.Fatalf("Warnings() = %v, routing.mode: policy should not trigger the #427 warning", cfg.Warnings())
 		}
 	}
 }

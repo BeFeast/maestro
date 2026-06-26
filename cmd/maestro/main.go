@@ -1368,6 +1368,23 @@ func buildProjectStatusJSON(cfg *config.Config, s *state.State) projectStatusJSO
 	}
 }
 
+// decorateBackendWithTier annotates the status BACKEND cell with the routing
+// tier a policy decision resolved to (#783), e.g. "claude (strong)", or the
+// would-pick tier in shadow mode, e.g. "codex (shadow:strong)". Non-policy
+// selections render the bare backend name unchanged.
+func decorateBackendWithTier(backend string, sel *state.BackendSelection) string {
+	if sel == nil {
+		return backend
+	}
+	if sel.Tier != "" {
+		return backend + " (" + sel.Tier + ")"
+	}
+	if sel.ShadowTier != "" {
+		return backend + " (shadow:" + sel.ShadowTier + ")"
+	}
+	return backend
+}
+
 func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	s, err := state.Load(cfg.StateDir)
 	if err != nil {
@@ -1497,6 +1514,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 		if backend == "" {
 			backend = "-"
 		}
+		backend = decorateBackendWithTier(backend, sess.BackendSelection)
 		fmt.Fprintf(w, "%s\t#%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			name, sess.IssueNumber, displayStatus, backend, pr, ci, sess.PID, alive, age, retries, tokens, truncate(sess.IssueTitle, 50))
 	}

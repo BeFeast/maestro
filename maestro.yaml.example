@@ -98,6 +98,57 @@ model:
       cmd: gemini
     cline:
       cmd: cline          # Cline CLI — configure provider in ~/.cline/data/globalState.json
+
+# Task-aware model routing (#783, design: docs/model-routing-rfc.md).
+# OPT-IN: routing.mode defaults to "manual" (label / model.default only). With
+# mode: policy, each issue is dispatched to a named strength TIER chosen by a
+# deterministic first-match rule list over issue signals, and a cheap-first
+# ladder climbs a tier when a task fails CI / review / retry. The model:<name>
+# label still wins over the policy, and model.default is reached unchanged when
+# no rule matches and no policy is configured.
+#
+# Recommended rollout: start with policy.shadow: true — maestro then LOGS the
+# tier it *would* pick (and shows it as "backend (shadow:tier)" in `maestro
+# status`) WITHOUT changing the dispatched backend. Watch a wave, tune the
+# rules, then set shadow: false to enable.
+#
+# routing:
+#   mode: policy
+#   tiers:                       # each tier = a backend + optional per-tier
+#     cheap:                     # effort/model override (threaded into argv for
+#       backend: gemini          # codex/claude/gemini). rank orders the ladder.
+#       rank: 0
+#     standard:
+#       backend: codex
+#       effort: medium
+#       rank: 1
+#     strong:
+#       backend: claude
+#       effort: high
+#       rank: 2
+#   policy:
+#     shadow: true               # log the would-pick without changing dispatch
+#     default_tier: standard     # used when no rule matches
+#     rules:                     # first match wins; deterministic
+#       - when: { labels: ["model:*"] }   # documents that labels bypass policy
+#         tier: passthrough
+#       - when: { labels: ["security", "migration", "infra"] }
+#         tier: strong
+#       - when: { risk_keywords: ["migration", "schema", "auth"] }
+#         tier: strong
+#       - when: { size: large }            # from a size:large issue label
+#         tier: strong
+#       - when: { dependency: foundation } # from a dependency:foundation label
+#         tier: strong
+#       - when: { size: small, dependency: leaf }
+#         tier: cheap
+#     escalation:
+#       enabled: true
+#       on: [ci_failure, review_rejection, retry]  # each trigger is opt-in
+#       max_tier: strong         # climb is capped here and by the retry budget
+#     budget:
+#       max_strong_per_wave: 3   # excess strong-tier dispatches queue at default
+
 exclude_labels:
   - blocked
   - wontfix
