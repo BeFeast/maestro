@@ -468,13 +468,10 @@ func (o *Orchestrator) rateLimit() (github.RateLimitStatus, error) {
 	return o.gh.RateLimit()
 }
 
-func (o *Orchestrator) respawnInPlace(slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
-	return o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, backendName)
-}
-
 // respawnInPlaceWithConfig respawns a worker in place using the given config so
-// the escalation ladder can carry a tier's per-tier effort/model override
-// (#783). It defaults to o.cfg via respawnInPlace.
+// the escalation ladder (and the soft-token checkpoint path) can carry a tier's
+// per-tier effort/model override (#783/#792). Callers that have no override pass
+// o.cfg.
 func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	if o.respawnInPlaceFn != nil {
 		return o.respawnInPlaceFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
@@ -2900,7 +2897,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									log.Printf("[orch] fetch issue #%d for checkpoint respawn: %v — will hit hard limit", sess.IssueNumber, fetchErr)
 								} else {
 									promptBase := o.selectPrompt(issue)
-									if respawnErr := o.respawnInPlace(slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
+									// #792: re-apply this policy session's tier effort/model
+									// override so the checkpoint respawn resumes on the
+									// selected tier instead of the base backend def (no-op
+									// for non-policy/shadow sessions — base o.cfg unchanged).
+									respawnCfg := o.tierOverrideConfigForSession(sess)
+									if respawnErr := o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
 										log.Printf("[orch] checkpoint respawn %s failed: %v — will hit hard limit", slotName, respawnErr)
 									} else {
 										log.Printf("[orch] checkpoint respawn complete for %s", slotName)

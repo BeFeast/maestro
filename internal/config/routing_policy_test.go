@@ -228,6 +228,27 @@ routing:
 `,
 			wantSnip: "max_tier = \"titan\"",
 		},
+		{
+			name: "max_tier below default_tier",
+			routing: `
+routing:
+  mode: policy
+  tiers:
+    cheap:
+      backend: gemini
+      rank: 0
+    strong:
+      backend: claude
+      rank: 2
+  policy:
+    default_tier: strong
+    escalation:
+      enabled: true
+      on: [retry]
+      max_tier: cheap
+`,
+			wantSnip: "ranks below default_tier",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,6 +260,39 @@ routing:
 				t.Fatalf("parse error = %q, want substring %q", err.Error(), tc.wantSnip)
 			}
 		})
+	}
+}
+
+func TestRoutingPolicy_CappedEscalationBelowStrongDefault(t *testing.T) {
+	// #792 review: a high default_tier with a lower-tier rule and a max_tier
+	// ranked below default_tier is valid — rule-selected cheap tasks still climb
+	// up to max_tier while unmatched tasks start strong. Must NOT be rejected as a
+	// no-op ladder.
+	yaml := policyBackendsYAML + `
+routing:
+  mode: policy
+  tiers:
+    cheap:
+      backend: gemini
+      rank: 0
+    standard:
+      backend: codex
+      rank: 1
+    strong:
+      backend: claude
+      rank: 2
+  policy:
+    default_tier: strong
+    rules:
+      - when: { size: small, dependency: leaf }
+        tier: cheap
+    escalation:
+      enabled: true
+      on: [retry]
+      max_tier: standard
+`
+	if _, err := parse([]byte(yaml)); err != nil {
+		t.Fatalf("parse: capped escalation below a strong default must be accepted, got %v", err)
 	}
 }
 

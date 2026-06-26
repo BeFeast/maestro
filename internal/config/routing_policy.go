@@ -94,11 +94,52 @@ func validateRoutingPolicy(cfg *Config) error {
 		if _, ok := r.Tiers[mt]; !ok {
 			return fmt.Errorf("config: routing.policy.escalation.max_tier = %q is not declared in routing.tiers", mt)
 		}
+		// #792 P3: max_tier caps the escalation climb at its rank, so a climb is a
+		// silent no-op only when NO possible starting tier ranks below max_tier. The
+		// starting tiers are default_tier (unmatched issues) and each rule's tier
+		// (matched issues). A high default_tier is fine as long as some lower-tier
+		// rule can still climb up to max_tier — e.g. default_tier: strong, a
+		// small/leaf -> cheap rule, and max_tier: standard lets cheap tasks climb to
+		// standard while unmatched tasks start strong. Reject only when default_tier
+		// sits above max_tier AND no rule selects a lower tier to climb from.
+		order := r.OrderedTierNames()
+		mtIdx, dtIdx := tierRankIndex(order, mt), tierRankIndex(order, dt)
+		if mtIdx >= 0 && dtIdx >= 0 && mtIdx < dtIdx && !anyRuleTierBelow(order, mtIdx, pol.Rules) {
+			return fmt.Errorf("config: routing.policy.escalation.max_tier = %q ranks below default_tier = %q and no rule selects a lower-rank tier, so the escalation ladder could never climb above the start tier; raise max_tier, lower default_tier, or add a lower-tier rule", mt, dt)
+		}
 	}
 	if pol.Budget.MaxStrongPerWave < 0 {
 		return fmt.Errorf("config: routing.policy.budget.max_strong_per_wave must be >= 0")
 	}
 	return nil
+}
+
+// tierRankIndex returns the position of name in the rank-ordered tier list (the
+// same order the escalation ladder climbs), or -1 when absent.
+func tierRankIndex(order []string, name string) int {
+	for i, n := range order {
+		if n == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// anyRuleTierBelow reports whether some non-passthrough policy rule selects a
+// starting tier ranked strictly below rank. Such a rule gives the escalation
+// ladder a tier to climb up from even when default_tier sits at/above max_tier,
+// so max_tier ranked below default_tier is not necessarily a no-op (#792 P3).
+func anyRuleTierBelow(order []string, rank int, rules []RoutingPolicyRule) bool {
+	for _, rule := range rules {
+		t := strings.TrimSpace(rule.Tier)
+		if t == "" || t == PolicyPassthroughTier {
+			continue
+		}
+		if idx := tierRankIndex(order, t); idx >= 0 && idx < rank {
+			return true
+		}
+	}
+	return false
 }
 
 // isEmpty reports whether the predicate sets no signal, which would make a rule

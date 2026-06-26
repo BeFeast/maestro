@@ -5,6 +5,8 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
@@ -209,11 +211,51 @@ func matchAnyKeyword(issue github.Issue, keywords []string) (matched string, ok 
 	hay := strings.ToLower(issue.Title + "\n" + issue.Body)
 	for _, kw := range keywords {
 		k := strings.ToLower(strings.TrimSpace(kw))
-		if k != "" && strings.Contains(hay, k) {
+		if k != "" && containsWord(hay, k) {
 			return k, true
 		}
 	}
 	return "", false
+}
+
+// containsWord reports whether word occurs in hay delimited by non-word
+// boundaries on both sides, so a risk keyword matches whole words only. Plain
+// strings.Contains over title+body false-routed to the expensive tier:
+// "auth" matched "author"/"oauth" and "infra" matched "infrastructure" (#792
+// P3). A word character is a Unicode letter/number or underscore; any other rune
+// (space, punctuation, slash, hyphen) is a boundary, so multi-token or
+// punctuated keywords ("ci/cd", "data migration") still match as written.
+func containsWord(hay, word string) bool {
+	if word == "" {
+		return false
+	}
+	for start := 0; start <= len(hay)-len(word); {
+		i := strings.Index(hay[start:], word)
+		if i < 0 {
+			return false
+		}
+		i += start
+		boundaryBefore := i == 0
+		if !boundaryBefore {
+			r, _ := utf8.DecodeLastRuneInString(hay[:i])
+			boundaryBefore = !isWordRune(r)
+		}
+		end := i + len(word)
+		boundaryAfter := end == len(hay)
+		if !boundaryAfter {
+			r, _ := utf8.DecodeRuneInString(hay[end:])
+			boundaryAfter = !isWordRune(r)
+		}
+		if boundaryBefore && boundaryAfter {
+			return true
+		}
+		start = i + 1
+	}
+	return false
+}
+
+func isWordRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsNumber(r)
 }
 
 // issueSize derives the size signal from a size:<v> (or size/<v>) issue label.

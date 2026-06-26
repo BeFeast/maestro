@@ -49,8 +49,14 @@ type BackendConfig struct {
 	ExtraArgs  []string // additional args from config
 	PromptMode string   // how to deliver prompt: "arg", "stdin", "file"
 	Provider   string   // per-backend provider field; resolves the exec path for custom-named backends (#684)
-	Model      string   // optional model name for role-specific backend calls
-	Effort     string   // optional reasoning effort for role-specific backend calls
+	Model      string   // optional model name for role-specific backend calls (#513 attribution metadata)
+	Effort     string   // optional reasoning effort for role-specific backend calls (#513 attribution metadata)
+	// TierModel/TierEffort carry a routing tier's per-tier override (#783/#792
+	// P1-A), DISTINCT from the #513 attribution Model/Effort above. Only these
+	// are threaded into the worker argv by appendTierModelEffort, so the #513
+	// attribution fields never leak into a non-policy config's dispatch.
+	TierModel  string
+	TierEffort string
 	// UsageStream opts a structured-stream worker into emitting NDJSON usage
 	// frames on a side-channel slot.jsonl: claude `--output-format stream-json
 	// --verbose` (#737) and codex `exec --json` (#738). Off by default;
@@ -307,29 +313,62 @@ func argsHaveCodexEffort(args []string) bool {
 
 // appendTierModelEffort threads a routing tier's optional per-tier model/effort
 // override (#783, RFC §2.4 step 5) into a first-class agentic backend's worker
-// argv. Until #783 these builders ignored cfg.Model/cfg.Effort for
-// claude/codex/gemini (only Pi read cfg.Model), so a tier could not steer the
-// model/effort without a distinct backend entry. The flag spelling is
-// backend-specific: codex takes the reasoning effort as `-c
-// model_reasoning_effort=<e>`, while claude/gemini take `--effort <e>`; all
-// three take `--model <m>`. An operator who already pinned the model/effort in
-// cmd or extra_args wins — the override is skipped to avoid a duplicate or
-// conflicting flag. pinned is the union of the backend's cmd-prefix args and
-// extra_args.
+// argv. It reads cfg.TierModel/cfg.TierEffort — the DISTINCT tier-override
+// carriers — NOT the #513 attribution cfg.Model/cfg.Effort, so a non-policy
+// config (which only sets the attribution fields) dispatches byte-for-byte as
+// before (#792 P1-A). The tier-override fields are only populated by the
+// orchestrator's applyTierOverride for a real policy-resolved tier.
+//
+// The flag spelling is backend-specific: codex takes the reasoning effort as
+// `-c model_reasoning_effort=<e>` and claude takes `--effort <e>`; all three
+// take `--model <m>`. gemini has no reasoning-effort flag (RFC §2.4 step 5 only
+// names codex/claude), so a tier effort is dropped for it rather than emitting
+// an unsupported `--effort` that would crash the worker (#792 P2-D). An operator
+// who already pinned the model/effort in cmd or extra_args wins — the override
+// is skipped to avoid a duplicate or conflicting flag. pinned is the union of
+// the backend's cmd-prefix args and extra_args.
 func appendTierModelEffort(args, pinned []string, kind string, cfg BackendConfig) []string {
-	if model := strings.TrimSpace(cfg.Model); model != "" && !argsHaveFlag(pinned, "--model") {
+	if model := strings.TrimSpace(cfg.TierModel); model != "" && !argsHaveFlag(pinned, "--model") {
 		args = append(args, "--model", model)
 	}
-	if effort := strings.TrimSpace(cfg.Effort); effort != "" {
-		if kind == config.BackendKindCodex {
-			if !argsHaveCodexEffort(pinned) {
-				args = append(args, "-c", "model_reasoning_effort="+effort)
-			}
-		} else if !argsHaveFlag(pinned, "--effort") {
+	effort := strings.TrimSpace(cfg.TierEffort)
+	if effort == "" {
+		return args
+	}
+	switch kind {
+	case config.BackendKindCodex:
+		if !argsHaveCodexEffort(pinned) {
+			args = append(args, "-c", "model_reasoning_effort="+effort)
+		}
+	case config.BackendKindClaude:
+		if !argsHaveFlag(pinned, "--effort") {
 			args = append(args, "--effort", effort)
 		}
+	default:
+		// gemini and any other agentic backend routed here have no reasoning-effort
+		// CLI flag — silently drop the tier effort (the tier model still applies).
 	}
 	return args
+}
+
+// workerBackendConfig builds the worker BackendConfig from a resolved backend
+// def. TierModel/TierEffort carry a routing tier's override DISTINCTLY from the
+// #513 attribution Model/Effort so only a real policy tier override reaches the
+// worker argv (see appendTierModelEffort) — the attribution metadata never
+// leaks into a non-policy config's dispatch (#792 P1-A).
+func workerBackendConfig(def config.BackendDef) BackendConfig {
+	return BackendConfig{
+		Cmd:         def.Cmd,
+		ExtraArgs:   def.ExtraArgs,
+		PromptMode:  def.PromptMode,
+		Provider:    def.Provider,
+		Model:       def.Model,
+		Effort:      def.Effort,
+		TierModel:   def.TierModel,
+		TierEffort:  def.TierEffort,
+		UsageStream: def.UsageStream,
+		MCP:         def.MCP,
+	}
 }
 
 // pinnedArgs returns the union of a backend's cmd-prefix args and extra_args as

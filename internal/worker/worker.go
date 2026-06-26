@@ -108,16 +108,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 			return "", fmt.Errorf("backend %q (default) not found in config", backendName)
 		}
 	}
-	backendCfg := BackendConfig{
-		Cmd:         backendDef.Cmd,
-		ExtraArgs:   backendDef.ExtraArgs,
-		PromptMode:  backendDef.PromptMode,
-		Provider:    backendDef.Provider,
-		Model:       backendDef.Model,
-		Effort:      backendDef.Effort,
-		UsageStream: backendDef.UsageStream,
-		MCP:         backendDef.MCP,
-	}
+	backendCfg := workerBackendConfig(backendDef)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -265,16 +256,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 			return fmt.Errorf("backend %q (default) not found in config", backendName)
 		}
 	}
-	backendCfg := BackendConfig{
-		Cmd:         backendDef.Cmd,
-		ExtraArgs:   backendDef.ExtraArgs,
-		PromptMode:  backendDef.PromptMode,
-		Provider:    backendDef.Provider,
-		Model:       backendDef.Model,
-		Effort:      backendDef.Effort,
-		UsageStream: backendDef.UsageStream,
-		MCP:         backendDef.MCP,
-	}
+	backendCfg := workerBackendConfig(backendDef)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
