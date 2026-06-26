@@ -93,24 +93,41 @@ func TestRetryTrigger(t *testing.T) {
 }
 
 func TestEscalationSteps(t *testing.T) {
-	o := policyOrch(policyCfg())
-	s := state.NewState()
+	pol := policyCfg().Routing.Policy
 	// retry trigger enabled, RetryCount drives the climb.
 	sess := &state.Session{IssueNumber: 1, RetryCount: 2}
-	if got := o.escalationSteps(s, sess); got != 2 {
+	if got := escalationSteps(pol, sess); got != 2 {
 		t.Fatalf("escalationSteps = %d, want 2", got)
 	}
 	// review trigger NOT in escalation.on → no climb.
 	sess2 := &state.Session{IssueNumber: 2, RetryCount: 3, RetryReason: state.RetryReasonReviewFeedback}
-	if got := o.escalationSteps(s, sess2); got != 0 {
+	if got := escalationSteps(pol, sess2); got != 0 {
 		t.Fatalf("escalationSteps (disabled trigger) = %d, want 0", got)
 	}
 	// escalation disabled entirely.
-	cfg := policyCfg()
-	cfg.Routing.Policy.Escalation.Enabled = false
-	o2 := policyOrch(cfg)
-	if got := o2.escalationSteps(s, sess); got != 0 {
+	disabled := policyCfg().Routing.Policy
+	disabled.Escalation.Enabled = false
+	if got := escalationSteps(disabled, sess); got != 0 {
 		t.Fatalf("escalationSteps (disabled) = %d, want 0", got)
+	}
+}
+
+// TestEscalationSteps_IgnoresStaleAttempts is the regression guard for the
+// review finding: a stale dead/failed no-PR session for the same issue inflates
+// FailedAttemptsForIssue, but the climb must track only the live session's own
+// RetryCount so retries do not skip tiers the current attempt history does not
+// warrant.
+func TestEscalationSteps_IgnoresStaleAttempts(t *testing.T) {
+	pol := policyCfg().Routing.Policy
+	// The issue would have a high FailedAttemptsForIssue from old dead sessions,
+	// but escalationSteps no longer reads state — it climbs by RetryCount only.
+	sess := &state.Session{IssueNumber: 7, RetryCount: 1}
+	if got := escalationSteps(pol, sess); got != 1 {
+		t.Fatalf("escalationSteps with stale attempts = %d, want 1 (RetryCount only)", got)
+	}
+	// A fresh retry (RetryCount 0) still climbs at least one tier when triggered.
+	if got := escalationSteps(pol, &state.Session{IssueNumber: 7}); got != 1 {
+		t.Fatalf("escalationSteps floor = %d, want 1", got)
 	}
 }
 
@@ -195,6 +212,48 @@ func TestApplyPolicyBudget_UnderCapKeepsStrong(t *testing.T) {
 	out := o.applyPolicyBudget(s, strongDecision)
 	if out.Tier != "strong" {
 		t.Fatalf("under-cap decision = %+v, want strong unchanged", out)
+	}
+}
+
+// TestApplyPolicyBudget_DefaultTierIsTop is the regression guard for the review
+// finding: when default_tier == the top (strong) tier, the cap must still apply
+// — an over-budget dispatch downgrades to the tier one rank below top instead of
+// silently dispatching unlimited strong workers.
+func TestApplyPolicyBudget_DefaultTierIsTop(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Policy.DefaultTier = "strong" // default IS the top tier
+	cfg.Routing.Policy.Budget.MaxStrongPerWave = 1
+	o := policyOrch(cfg)
+	s := state.NewState()
+	s.Sessions["slot-a"] = &state.Session{
+		IssueNumber: 9, Status: state.StatusRunning,
+		BackendSelection: &state.BackendSelection{Tier: "strong"},
+	}
+	strongDecision := router.BackendDecision{Backend: "claude", Tier: "strong", Reason: "policy:strong"}
+	out := o.applyPolicyBudget(s, strongDecision)
+	if out.Tier != "standard" || out.Backend != "codex" {
+		t.Fatalf("budget downgrade with default_tier=strong = %+v, want standard/codex (tier below top)", out)
+	}
+}
+
+// TestApplyPolicyBudget_SingleTierUnenforceable documents that a config with a
+// single tier cannot enforce the cap (there is nowhere to downgrade) — the
+// decision is returned unchanged rather than downgrading to self.
+func TestApplyPolicyBudget_SingleTierUnenforceable(t *testing.T) {
+	cfg := policyCfg()
+	cfg.Routing.Tiers = map[string]config.RoutingTier{"only": {Backend: "claude", Rank: 0}}
+	cfg.Routing.Policy.DefaultTier = "only"
+	cfg.Routing.Policy.Budget.MaxStrongPerWave = 1
+	o := policyOrch(cfg)
+	s := state.NewState()
+	s.Sessions["slot-a"] = &state.Session{
+		IssueNumber: 9, Status: state.StatusRunning,
+		BackendSelection: &state.BackendSelection{Tier: "only"},
+	}
+	dec := router.BackendDecision{Backend: "claude", Tier: "only", Reason: "policy:only"}
+	out := o.applyPolicyBudget(s, dec)
+	if out.Tier != "only" || out.Backend != "claude" {
+		t.Fatalf("single-tier budget = %+v, want unchanged only/claude", out)
 	}
 }
 

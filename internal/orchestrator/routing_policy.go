@@ -107,27 +107,56 @@ func (o *Orchestrator) policyCandidateScores(selectedTier string) []state.Backen
 
 // applyPolicyBudget enforces routing.policy.budget.max_strong_per_wave (RFC
 // §2.5): when a fresh dispatch resolves to the top (strong) tier and the wave
-// already has that many active strong-tier sessions, it is downgraded to the
-// default tier ("excess large tasks queue at standard"). A zero/absent cap is
-// unlimited and escalated retries are not subject to the cap.
+// already has that many active strong-tier sessions, it is downgraded
+// ("excess large tasks queue at standard"). A zero/absent cap is unlimited and
+// escalated retries are not subject to the cap.
 func (o *Orchestrator) applyPolicyBudget(s *state.State, decision router.BackendDecision) router.BackendDecision {
 	pol := o.cfg.Routing.Policy
 	if pol == nil || pol.Budget.MaxStrongPerWave <= 0 || decision.Tier == "" {
 		return decision
 	}
 	top := o.policyTopTier()
-	if top == "" || decision.Tier != top || decision.Tier == strings.TrimSpace(pol.DefaultTier) {
+	if top == "" || decision.Tier != top {
 		return decision
 	}
 	if o.countActiveTierSessions(s, top) < pol.Budget.MaxStrongPerWave {
 		return decision
 	}
+	// Pick where the over-budget dispatch lands. Normally the default tier, but a
+	// config can set default_tier == top (everything defaults to strong); then a
+	// no-op downgrade-to-self would silently bypass the cap, so fall back to the
+	// tier one rank below top. "" means no lower tier exists — leave it unchanged.
+	target := o.policyBudgetDowngradeTier(top)
+	if target == "" || target == top {
+		return decision
+	}
 	reason := fmt.Sprintf("policy:%s (budget downgrade from %s, max_strong_per_wave=%d)",
-		pol.DefaultTier, top, pol.Budget.MaxStrongPerWave)
-	if downgraded, ok := o.router.DecisionForTier(strings.TrimSpace(pol.DefaultTier), reason); ok {
+		target, top, pol.Budget.MaxStrongPerWave)
+	if downgraded, ok := o.router.DecisionForTier(target, reason); ok {
 		return downgraded
 	}
 	return decision
+}
+
+// policyBudgetDowngradeTier resolves the tier an over-budget top-tier dispatch
+// is downgraded to. It is the default tier when that is below the top tier
+// ("excess large tasks queue at standard"); when default_tier is itself the top
+// tier (or unset) the cap would be unenforceable, so it falls back to the tier
+// one rank below top. Returns "" when no lower tier exists (a single-tier config
+// cannot enforce the cap).
+func (o *Orchestrator) policyBudgetDowngradeTier(top string) string {
+	pol := o.cfg.Routing.Policy
+	if pol == nil {
+		return ""
+	}
+	if def := strings.TrimSpace(pol.DefaultTier); def != "" && def != top {
+		return def
+	}
+	order := o.cfg.Routing.OrderedTierNames()
+	if len(order) >= 2 {
+		return order[len(order)-2]
+	}
+	return ""
 }
 
 func (o *Orchestrator) policyTopTier() string {
@@ -169,7 +198,7 @@ func (o *Orchestrator) escalateRetryBackend(s *state.State, sess *state.Session,
 	if sess.Phase == state.PhasePlan || sess.Phase == state.PhaseValidate {
 		return router.BackendDecision{}, false
 	}
-	steps := o.escalationSteps(s, sess)
+	steps := escalationSteps(o.cfg.Routing.Policy, sess)
 	decision := o.router.ResolveBackendDecisionForAttempt(issue, steps)
 	if decision.Backend == "" {
 		return router.BackendDecision{}, false
@@ -186,12 +215,15 @@ func (o *Orchestrator) escalateRetryBackend(s *state.State, sess *state.Session,
 }
 
 // escalationSteps returns how many tiers a retry climbs: 0 when escalation is
-// disabled or this retry's trigger is not in escalation.on, else the number of
-// prior failed attempts for the issue (each failure climbs one tier). The
-// policy resolver caps the climb at max_tier and the per-issue retry budget
-// bounds the number of retries, so the ladder cannot loop (RFC §2.6).
-func (o *Orchestrator) escalationSteps(s *state.State, sess *state.Session) int {
-	pol := o.cfg.Routing.Policy
+// disabled or this retry's trigger is not in escalation.on, else the live
+// session's own retry count (each retry of this session climbs one tier). It
+// deliberately uses sess.RetryCount rather than FailedAttemptsForIssue: the
+// latter counts every dead / failed no-PR session for the issue, so a stale
+// abandoned attempt would inflate the climb and skip tiers the current attempt
+// history does not warrant. FailedAttemptsForIssue + RetryCount remains the
+// per-issue *retry budget* (canRetryIssue) that, with max_tier, bounds the
+// ladder so it cannot loop (RFC §2.6).
+func escalationSteps(pol *config.RoutingPolicy, sess *state.Session) int {
 	if pol == nil || !pol.Escalation.Enabled {
 		return 0
 	}
@@ -199,9 +231,6 @@ func (o *Orchestrator) escalationSteps(s *state.State, sess *state.Session) int 
 		return 0
 	}
 	steps := sess.RetryCount
-	if fa := s.FailedAttemptsForIssue(sess.IssueNumber); fa > steps {
-		steps = fa
-	}
 	if steps < 1 {
 		steps = 1
 	}
