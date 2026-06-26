@@ -21,13 +21,13 @@ jobs:
   agent-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/agent-lint
 
   # Continuously prove the fixtures still trip each check (acceptance criterion 1).
   self-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Fixture self-test
         run: bash .github/actions/agent-lint/agent-lint.sh --self-test
