@@ -3,11 +3,14 @@ package github
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"math/rand"
 	"net/url"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type greptileCheckRun struct {
@@ -179,13 +182,116 @@ func ghAPI(endpoint string) ([]byte, error) {
 	return ghAPIWithArgs(endpoint)
 }
 
+// gh CLI rate-limit backoff (#794). The fleet runs 8 in-process flows polling
+// GitHub on a single shared PAT. A synchronized, redundant burst trips GitHub's
+// *secondary* (abuse / burst-concurrency) rate limit, which answers HTTP 403
+// even when the primary quota is healthy. Before this, ghAPIWithArgs was a
+// single-shot exec whose .Output() discarded stderr, so the real "403 rate
+// limit" message degraded to an opaque `exit status 1` and the first failed
+// read aborted the entire supervise / orchestrator cycle. We now:
+//   - use CombinedOutput so gh's real error text (HTTP status + the
+//     "rate limit" / "secondary rate limit" message) surfaces in logs, and
+//   - retry a bounded number of times on a detected rate-limit response,
+//     honoring an explicit Retry-After hint when gh surfaces one and otherwise
+//     backing off exponentially (with jitter, capped) — so a transient 403
+//     degrades to a brief stall + retry instead of a failed cycle.
+const (
+	ghAPIMaxAttempts = 4
+	ghAPIBaseBackoff = 2 * time.Second
+	ghAPIMaxBackoff  = 20 * time.Second
+)
+
+// ghAPIRunner runs `gh <args...>` and returns combined stdout+stderr plus the
+// process error. Indirection point so tests can drive the retry loop without a
+// real gh binary.
+var ghAPIRunner = func(args ...string) ([]byte, error) {
+	return exec.Command("gh", args...).CombinedOutput()
+}
+
+// ghAPISleep is the backoff sleeper, injectable so tests do not actually wait.
+var ghAPISleep = time.Sleep
+
+// ghAPIJitterFrac yields a random fraction in [0,1) used to spread retry
+// backoff so the fleet's flows do not re-burst in lockstep after a shared 403.
+var ghAPIJitterFrac = rand.Float64
+
+var ghRetryAfterRe = regexp.MustCompile(`(?i)retry-after:\s*(\d+)`)
+
 func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 	cmdArgs := append([]string{"api", endpoint}, args...)
-	out, err := exec.Command("gh", cmdArgs...).Output()
+	var out []byte
+	var err error
+	for attempt := 0; attempt < ghAPIMaxAttempts; attempt++ {
+		out, err = ghAPIRunner(cmdArgs...)
+		if err == nil {
+			return out, nil
+		}
+		retryAfter, rateLimited := parseGHRateLimit(out)
+		if !rateLimited || attempt == ghAPIMaxAttempts-1 {
+			break
+		}
+		wait := retryAfter
+		if wait <= 0 {
+			wait = ghBackoffDelay(attempt)
+		}
+		log.Printf("[github] gh api %s: rate-limited (%s); backing off %s before retry %d/%d",
+			endpoint, ghErrorDetail(out), wait.Round(time.Millisecond), attempt+1, ghAPIMaxAttempts-1)
+		ghAPISleep(wait)
+	}
 	if err != nil {
+		if detail := ghErrorDetail(out); detail != "" {
+			return nil, fmt.Errorf("gh api %s: %w: %s", endpoint, err, detail)
+		}
 		return nil, fmt.Errorf("gh api %s: %w", endpoint, err)
 	}
 	return out, nil
+}
+
+// parseGHRateLimit reports whether gh's combined output looks like a primary or
+// secondary rate-limit (or 429) response and, when gh surfaced an explicit
+// Retry-After hint, how long to wait. retryAfter is 0 when no hint is present,
+// in which case the caller falls back to exponential backoff.
+func parseGHRateLimit(out []byte) (retryAfter time.Duration, rateLimited bool) {
+	text := strings.ToLower(string(out))
+	rateLimited = strings.Contains(text, "rate limit") ||
+		strings.Contains(text, "secondary rate limit") ||
+		strings.Contains(text, "http 429") ||
+		(strings.Contains(text, "http 403") && strings.Contains(text, "abuse"))
+	if !rateLimited {
+		return 0, false
+	}
+	if m := ghRetryAfterRe.FindSubmatch(out); m != nil {
+		if secs, convErr := strconv.Atoi(string(m[1])); convErr == nil && secs > 0 {
+			return time.Duration(secs) * time.Second, true
+		}
+	}
+	return 0, true
+}
+
+// ghBackoffDelay computes the exponential backoff for the given zero-based retry
+// attempt, capped at ghAPIMaxBackoff, with full jitter over the lower half so
+// concurrent flows do not retry in lockstep.
+func ghBackoffDelay(attempt int) time.Duration {
+	d := ghAPIBaseBackoff << attempt // base * 2^attempt
+	if d <= 0 || d > ghAPIMaxBackoff {
+		d = ghAPIMaxBackoff
+	}
+	return d/2 + time.Duration(ghAPIJitterFrac()*float64(d/2))
+}
+
+// ghErrorDetail renders gh's combined output as a single-line, length-bounded
+// diagnostic so the actual GitHub error reaches the logs without flooding them.
+func ghErrorDetail(out []byte) string {
+	detail := strings.TrimSpace(string(out))
+	if detail == "" {
+		return ""
+	}
+	detail = strings.Join(strings.Fields(detail), " ")
+	const max = 400
+	if len(detail) > max {
+		detail = detail[:max] + "…"
+	}
+	return detail
 }
 
 func parseRateLimitStatus(out []byte) (RateLimitStatus, error) {

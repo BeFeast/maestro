@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -131,6 +132,21 @@ type Orchestrator struct {
 	syncProjectFn                func(issueNumber int, status github.ProjectStatus) bool
 	listNonDoneProjectItemsFn    func(pf *github.ProjectField) ([]github.ProjectItem, error)
 	rateLimitFn                  func() (github.RateLimitStatus, error)
+
+	// Per-cycle open-PR cache (#794). ListOpenPRs is the dominant forge REST
+	// read (~78% of the core-bucket calls at the 2026-06-28 secondary
+	// rate-limit incident) and was issued 4× per RunOnce —
+	// reconcileRunningSessions, checkSessions, autoMergePRs and rebaseConflicts
+	// each fetched the same open-PR list independently. While a cycle is active
+	// the first fetch is memoized and shared across those steps so a RunOnce
+	// issues exactly one ListOpenPRs read. Outside RunOnce the cache is inactive
+	// and every call fetches fresh, preserving the semantics of callers (and
+	// tests) that invoke those steps in isolation. RunOnce is serial per flow,
+	// so no locking is required.
+	cycleActive   bool
+	cyclePRsValid bool
+	cyclePRs      []github.PR
+	cyclePRsErr   error
 }
 
 // New creates a new Orchestrator
@@ -179,6 +195,66 @@ func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
 	return o.gh.ListOpenPRs()
 }
 
+// beginCycle resets the per-cycle GitHub-read cache and marks a RunOnce as
+// active so the cycle's steps share one ListOpenPRs fetch (#794).
+func (o *Orchestrator) beginCycle() {
+	o.cycleActive = true
+	o.cyclePRsValid = false
+	o.cyclePRs = nil
+	o.cyclePRsErr = nil
+}
+
+// endCycle clears the per-cycle cache and deactivates memoization so any
+// out-of-cycle caller fetches fresh.
+func (o *Orchestrator) endCycle() {
+	o.cycleActive = false
+	o.cyclePRsValid = false
+	o.cyclePRs = nil
+	o.cyclePRsErr = nil
+}
+
+// invalidateCyclePRs drops the memoized per-cycle open-PR snapshot so the next
+// listOpenPRsForCycle re-fetches fresh. The dedup cache (#794) is taken once at
+// the start of a cycle and shared across its four open-PR consumers
+// (reconcile, check, auto-merge, rebase), but a step that mutates the open-PR
+// set within the same RunOnce — reconcileRunningSessions auto-creating a PR,
+// autoMergePRs merging or closing one — would otherwise leave a later step
+// looking at the pre-mutation snapshot. The concrete failure this guards
+// against (#794 review): reconcile auto-creates a PR via
+// tryCreatePRForPushedBranch and flips the session to pr_open, but autoMergePRs
+// reuses the cache populated before that PR existed, fails to find it, takes
+// the "no open PR — assuming merged/closed" branch and marks the session done —
+// orphaning a live PR in the same cycle. Invalidating after every open-PR-set
+// mutation keeps the dedup win for the common, no-mutation cycle (still one
+// fetch) while guaranteeing correctness when the set does change (one extra
+// fetch). A no-op outside an active cycle.
+func (o *Orchestrator) invalidateCyclePRs() {
+	o.cyclePRsValid = false
+	o.cyclePRs = nil
+	o.cyclePRsErr = nil
+}
+
+// listOpenPRsForCycle returns the open-PR list, fetching it at most once per
+// orchestrator RunOnce. The four cycle steps that need open PRs share a single
+// fetch instead of issuing four identical core-bucket reads (#794). Outside an
+// active cycle it delegates straight to listOpenPRs (no memoization), so a
+// direct caller — or a test invoking a single step — sees the fresh,
+// per-call behavior. A fetch error is cached too: under a real 403 the cycle
+// makes one attempt, not four, which is the rate-limit relief this exists for.
+func (o *Orchestrator) listOpenPRsForCycle() ([]github.PR, error) {
+	if !o.cycleActive {
+		return o.listOpenPRs()
+	}
+	if o.cyclePRsValid {
+		return o.cyclePRs, o.cyclePRsErr
+	}
+	prs, err := o.listOpenPRs()
+	o.cyclePRs = prs
+	o.cyclePRsErr = err
+	o.cyclePRsValid = true
+	return prs, err
+}
+
 func (o *Orchestrator) remoteBranchExists(branch string) (bool, error) {
 	if o.remoteBranchExistsFn != nil {
 		return o.remoteBranchExistsFn(branch)
@@ -198,10 +274,22 @@ func (o *Orchestrator) remoteBranchExists(branch string) (bool, error) {
 }
 
 func (o *Orchestrator) createPR(title, body, base, head string) (int, error) {
+	var (
+		prNumber int
+		err      error
+	)
 	if o.createPRFn != nil {
-		return o.createPRFn(title, body, base, head)
+		prNumber, err = o.createPRFn(title, body, base, head)
+	} else {
+		prNumber, err = o.gh.CreatePR(title, body, base, head)
 	}
-	return o.gh.CreatePR(title, body, base, head)
+	// A new PR mutates the open-PR set; drop any per-cycle cache so a later
+	// cycle step re-fetches and sees it instead of the pre-creation snapshot
+	// (#794 review).
+	if err == nil {
+		o.invalidateCyclePRs()
+	}
+	return prNumber, err
 }
 
 func (o *Orchestrator) updatePRBody(prNumber int, body string) error {
@@ -375,20 +463,36 @@ func (o *Orchestrator) markPRReady(prNumber int) error {
 }
 
 func (o *Orchestrator) mergePR(prNumber int) error {
+	var err error
 	if o.ghMergePRFn != nil {
-		return o.ghMergePRFn(prNumber)
+		err = o.ghMergePRFn(prNumber)
+	} else {
+		err = o.gh.MergePR(prNumber)
 	}
-	return o.gh.MergePR(prNumber)
+	// A merge removes the PR from the open-PR set; drop the per-cycle cache so
+	// a later step (rebaseConflicts) re-fetches a current view (#794 review).
+	if err == nil {
+		o.invalidateCyclePRs()
+	}
+	return err
 }
 
 func (o *Orchestrator) closePR(prNumber int, comment string) error {
-	if o.ghClosePRFn != nil {
-		return o.ghClosePRFn(prNumber, comment)
+	var err error
+	switch {
+	case o.ghClosePRFn != nil:
+		err = o.ghClosePRFn(prNumber, comment)
+	case o.gh == nil:
+		err = fmt.Errorf("no github client configured for close-pr")
+	default:
+		err = o.gh.ClosePR(prNumber, comment)
 	}
-	if o.gh == nil {
-		return fmt.Errorf("no github client configured for close-pr")
+	// A close removes the PR from the open-PR set; drop the per-cycle cache so
+	// a later step re-fetches a current view (#794 review).
+	if err == nil {
+		o.invalidateCyclePRs()
 	}
-	return o.gh.ClosePR(prNumber, comment)
+	return err
 }
 
 func (o *Orchestrator) prChecksOutput(prNumber int) (string, error) {
@@ -1577,6 +1681,12 @@ func (o *Orchestrator) selectPrompt(issue github.Issue) string {
 
 // RunOnce executes one orchestration cycle
 func (o *Orchestrator) RunOnce() error {
+	// Activate the per-cycle GitHub-read cache so the cycle's steps share one
+	// ListOpenPRs fetch (#794), and clear it on the way out so nothing leaks
+	// across cycles.
+	o.beginCycle()
+	defer o.endCycle()
+
 	s, err := state.Load(o.cfg.StateDir)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
@@ -1704,6 +1814,36 @@ func (o *Orchestrator) SetConfigReloadCh(ch <-chan *config.Config) {
 	o.configReloadCh = ch
 }
 
+// startupJitterCap bounds the random first-cycle phase offset so a freshly
+// (re)started daemon still begins work promptly on long poll intervals (#794).
+const startupJitterCap = 60 * time.Second
+
+// startupJitterFrac yields a random fraction in [0,1); a package var so tests
+// can make the offset deterministic.
+var startupJitterFrac = rand.Float64
+
+// startupJitter returns a random phase offset in [0, min(interval, cap)) used
+// to de-synchronize the fleet's first GitHub read — and the poll ticker
+// anchored to it — so the flows do not burst on the shared PAT in one window
+// (#794). Returns 0 for a non-positive interval.
+func startupJitter(interval time.Duration) time.Duration {
+	return computeStartupJitter(interval, startupJitterFrac())
+}
+
+// computeStartupJitter is the pure phase-offset calculation: frac (in [0,1))
+// scaled across min(interval, startupJitterCap). Split out so it is unit
+// testable without touching the rng.
+func computeStartupJitter(interval time.Duration, frac float64) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	span := interval
+	if span > startupJitterCap {
+		span = startupJitterCap
+	}
+	return time.Duration(frac * float64(span))
+}
+
 // Run loops with the given interval; if once=true, runs once and returns.
 // The context can be used to stop the loop (e.g. for multi-project shutdown).
 // An optional refreshCh triggers an immediate poll cycle when a value is received.
@@ -1741,6 +1881,26 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 		// first poll cycle. Idempotent: a no-op when nothing is past the
 		// floors. Failures are logged inside the helper.
 		o.compactTerminalSessionsOnStartup()
+
+		// #794: de-phase this flow from the rest of the fleet before the first
+		// cycle. The daemon starts all flows in a tight loop and each anchors
+		// its poll ticker to its first RunOnce, so without a phase offset the 8
+		// flows fire their GitHub reads in one 1–2s window every interval and
+		// trip GitHub's secondary (burst) rate limit on the shared PAT. A random
+		// offset before the first cycle spreads both the first burst AND the
+		// ticker (anchored right after) across the poll window. `run --once`
+		// skips this (a one-shot reconcile must run now); the wait honors ctx so
+		// shutdown is never delayed.
+		if d := startupJitter(interval); d > 0 {
+			log.Printf("[orch] startup jitter — first cycle in %s (%s)", d.Round(time.Second), o.repo)
+			t := time.NewTimer(d)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil
+			case <-t.C:
+			}
+		}
 	}
 	if err := o.RunOnce(); err != nil {
 		log.Printf("[orch] run error: %v", err)
@@ -2058,7 +2218,8 @@ func strSliceEqual(a, b []string) bool {
 func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 	// Fetch open PRs once — used to rescue sessions where the worker exited
 	// after creating a PR (process/tmux gone, but PR is already open on GitHub).
-	prs, prErr := o.listOpenPRs()
+	// Shared across the cycle's four open-PR consumers (#794).
+	prs, prErr := o.listOpenPRsForCycle()
 	branchToPR := make(map[string]github.PR)
 	if prErr != nil {
 		log.Printf("[orch] reconcile: warn — could not list PRs: %v (will mark stale sessions dead)", prErr)
@@ -2444,8 +2605,8 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
-	// Fetch open PRs once for the whole check cycle
-	prs, prErr := o.listOpenPRs()
+	// Fetch open PRs once for the whole check cycle (shared per-cycle, #794)
+	prs, prErr := o.listOpenPRsForCycle()
 	branchToPR := make(map[string]github.PR)
 	if prErr != nil {
 		log.Printf("[orch] list PRs (check): %v", prErr)
@@ -3008,7 +3169,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 // autoMergePRs checks open PRs and merges ones with green CI
 func (o *Orchestrator) autoMergePRs(s *state.State) {
-	prs, err := o.listOpenPRs()
+	prs, err := o.listOpenPRsForCycle()
 	if err != nil {
 		log.Printf("[orch] list PRs: %v", err)
 		return
@@ -4355,7 +4516,7 @@ func (o *Orchestrator) routeConflictingMergeFailure(s *state.State, slotName str
 //  1. Auto-rebase (if enabled)
 //  2. Label issue as blocked + keep session in conflict_failed permanently
 func (o *Orchestrator) rebaseConflicts(s *state.State) {
-	prs, err := o.listOpenPRs()
+	prs, err := o.listOpenPRsForCycle()
 	if err != nil {
 		log.Printf("[orch] list PRs (rebase): %v", err)
 		return
