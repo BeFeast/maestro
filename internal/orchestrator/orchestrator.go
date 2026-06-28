@@ -213,6 +213,27 @@ func (o *Orchestrator) endCycle() {
 	o.cyclePRsErr = nil
 }
 
+// invalidateCyclePRs drops the memoized per-cycle open-PR snapshot so the next
+// listOpenPRsForCycle re-fetches fresh. The dedup cache (#794) is taken once at
+// the start of a cycle and shared across its four open-PR consumers
+// (reconcile, check, auto-merge, rebase), but a step that mutates the open-PR
+// set within the same RunOnce — reconcileRunningSessions auto-creating a PR,
+// autoMergePRs merging or closing one — would otherwise leave a later step
+// looking at the pre-mutation snapshot. The concrete failure this guards
+// against (#794 review): reconcile auto-creates a PR via
+// tryCreatePRForPushedBranch and flips the session to pr_open, but autoMergePRs
+// reuses the cache populated before that PR existed, fails to find it, takes
+// the "no open PR — assuming merged/closed" branch and marks the session done —
+// orphaning a live PR in the same cycle. Invalidating after every open-PR-set
+// mutation keeps the dedup win for the common, no-mutation cycle (still one
+// fetch) while guaranteeing correctness when the set does change (one extra
+// fetch). A no-op outside an active cycle.
+func (o *Orchestrator) invalidateCyclePRs() {
+	o.cyclePRsValid = false
+	o.cyclePRs = nil
+	o.cyclePRsErr = nil
+}
+
 // listOpenPRsForCycle returns the open-PR list, fetching it at most once per
 // orchestrator RunOnce. The four cycle steps that need open PRs share a single
 // fetch instead of issuing four identical core-bucket reads (#794). Outside an
@@ -253,10 +274,22 @@ func (o *Orchestrator) remoteBranchExists(branch string) (bool, error) {
 }
 
 func (o *Orchestrator) createPR(title, body, base, head string) (int, error) {
+	var (
+		prNumber int
+		err      error
+	)
 	if o.createPRFn != nil {
-		return o.createPRFn(title, body, base, head)
+		prNumber, err = o.createPRFn(title, body, base, head)
+	} else {
+		prNumber, err = o.gh.CreatePR(title, body, base, head)
 	}
-	return o.gh.CreatePR(title, body, base, head)
+	// A new PR mutates the open-PR set; drop any per-cycle cache so a later
+	// cycle step re-fetches and sees it instead of the pre-creation snapshot
+	// (#794 review).
+	if err == nil {
+		o.invalidateCyclePRs()
+	}
+	return prNumber, err
 }
 
 func (o *Orchestrator) updatePRBody(prNumber int, body string) error {
@@ -430,20 +463,36 @@ func (o *Orchestrator) markPRReady(prNumber int) error {
 }
 
 func (o *Orchestrator) mergePR(prNumber int) error {
+	var err error
 	if o.ghMergePRFn != nil {
-		return o.ghMergePRFn(prNumber)
+		err = o.ghMergePRFn(prNumber)
+	} else {
+		err = o.gh.MergePR(prNumber)
 	}
-	return o.gh.MergePR(prNumber)
+	// A merge removes the PR from the open-PR set; drop the per-cycle cache so
+	// a later step (rebaseConflicts) re-fetches a current view (#794 review).
+	if err == nil {
+		o.invalidateCyclePRs()
+	}
+	return err
 }
 
 func (o *Orchestrator) closePR(prNumber int, comment string) error {
-	if o.ghClosePRFn != nil {
-		return o.ghClosePRFn(prNumber, comment)
+	var err error
+	switch {
+	case o.ghClosePRFn != nil:
+		err = o.ghClosePRFn(prNumber, comment)
+	case o.gh == nil:
+		err = fmt.Errorf("no github client configured for close-pr")
+	default:
+		err = o.gh.ClosePR(prNumber, comment)
 	}
-	if o.gh == nil {
-		return fmt.Errorf("no github client configured for close-pr")
+	// A close removes the PR from the open-PR set; drop the per-cycle cache so
+	// a later step re-fetches a current view (#794 review).
+	if err == nil {
+		o.invalidateCyclePRs()
 	}
-	return o.gh.ClosePR(prNumber, comment)
+	return err
 }
 
 func (o *Orchestrator) prChecksOutput(prNumber int) (string, error) {
