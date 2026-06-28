@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -12,6 +13,37 @@ import (
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
 )
+
+// superviseJitterCap bounds the random first-cycle phase offset so a freshly
+// (re)started daemon still runs its first supervise cycle promptly on long
+// poll intervals (#794).
+const superviseJitterCap = 60 * time.Second
+
+// superviseJitterFrac yields a random fraction in [0,1); a package var so tests
+// can make the offset deterministic.
+var superviseJitterFrac = rand.Float64
+
+// superviseStartupJitter returns a random phase offset in
+// [0, min(interval, cap)) used to de-synchronize this flow's supervise GitHub
+// reads from the rest of the fleet — and the ticker anchored to the first
+// cycle — so the flows do not burst on the shared PAT in one window (#794).
+// Returns 0 for a non-positive interval.
+func superviseStartupJitter(interval time.Duration) time.Duration {
+	return computeSuperviseJitter(interval, superviseJitterFrac())
+}
+
+// computeSuperviseJitter is the pure phase-offset calculation, split out so it
+// is unit testable without touching the rng.
+func computeSuperviseJitter(interval time.Duration, frac float64) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	span := interval
+	if span > superviseJitterCap {
+		span = superviseJitterCap
+	}
+	return time.Duration(frac * float64(span))
+}
 
 // runSupervise is the per-project supervisor loop, extracted from the
 // single-project `maestro supervise` command (cmd/maestro/main.go). The daemon
@@ -45,6 +77,25 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		}
 		logSupervisorDecision(name, decision)
 		return nil
+	}
+
+	// #794: de-phase this flow's supervise reads from the rest of the fleet.
+	// Like the orchestrator loop, the first runOnce anchors the ticker, so a
+	// random phase offset here spreads the supervise GitHub reads across the
+	// poll interval instead of bursting in lockstep with the other flows on the
+	// shared PAT. Only the looping (interval > 0) path jitters — a one-shot
+	// cycle runs immediately. The wait honors ctx so shutdown is not delayed.
+	if interval > 0 {
+		if d := superviseStartupJitter(interval); d > 0 {
+			log.Printf("[%s] supervise: startup jitter — first cycle in %s", name, d.Round(time.Second))
+			t := time.NewTimer(d)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+		}
 	}
 
 	if err := runOnce(); err != nil {
