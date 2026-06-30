@@ -2,6 +2,7 @@ package config
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -176,5 +177,51 @@ model:
 	gemini := cfg.Model.Backends["gemini"]
 	if gemini.Pricing.Configured() {
 		t.Errorf("gemini pricing should not be configured")
+	}
+}
+
+// TestParse_BackendPricingFromYAMLNumericStrings keeps exported/edited seed YAML
+// from taking down legacy --config commands when a pricing number was quoted.
+func TestParse_BackendPricingFromYAMLNumericStrings(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: codex
+  backends:
+    codex:
+      cmd: codex
+      pricing:
+        input_usd_per_mtok: "5"
+        output_usd_per_mtok: "30"
+        cache_read_usd_per_mtok: "0.5"
+        cache_write_usd_per_mtok: "6.25"
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got := cfg.Model.Backends["codex"].Pricing
+	if got.InputUSDPerMtok != 5 || got.OutputUSDPerMtok != 30 || got.CacheReadUSDPerMtok != 0.5 || got.CacheWriteUSDPerMtok != 6.25 {
+		t.Fatalf("pricing = %+v, want input=5 output=30 cache_read=0.5 cache_write=6.25", got)
+	}
+}
+
+func TestParse_BackendPricingFromYAMLRejectsNonNumericStrings(t *testing.T) {
+	yaml := `
+repo: owner/repo
+model:
+  default: codex
+  backends:
+    codex:
+      cmd: codex
+      pricing:
+        input_usd_per_mtok: cheap
+`
+	_, err := parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("parse succeeded, want invalid pricing number error")
+	}
+	if !strings.Contains(err.Error(), "invalid pricing number") {
+		t.Fatalf("parse error = %v, want invalid pricing number", err)
 	}
 }

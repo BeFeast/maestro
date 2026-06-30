@@ -582,8 +582,9 @@ plus one aggregating fleet dashboard on `:8786`. This replaces the old
 per-project `maestro@.service` template (and the separate supervise/serve units)
 — one unit instead of ~15.
 
-Projects live in a SQLite config store, not per-project YAML files. Seed it once
-from your existing `~/.maestro/maestro.d/*.yaml`:
+Projects live in a SQLite config store, not per-project runtime YAML files. Seed
+it once from existing `~/.maestro/maestro.d/*.yaml`; after that, treat those
+YAML files as import/export artifacts, not as the operator source of truth:
 
 ```bash
 maestro config-store migrate --db ~/.maestro/maestro.db --dir ~/.maestro/maestro.d
@@ -602,6 +603,14 @@ systemctl --user list-units 'maestro*'
 journalctl --user -u maestro.service -f
 ```
 
+Day-to-day project inspection should target the store row the daemon is running,
+not a seed YAML file:
+
+```bash
+maestro config-store list --db ~/.maestro/maestro.db
+maestro status --config-store ~/.maestro/maestro.db --config-store-project <project-name>
+```
+
 The whole cutover (seed store → stop legacy units → start the daemon → verify
 `:8786/api/v1/fleet`) is automated by `scripts/migrate-to-daemon.sh`:
 
@@ -616,7 +625,7 @@ supported because the legacy unit files stay on disk:
 
 ```bash
 systemctl --user disable --now maestro.service
-# regenerate per-project YAML from the store if you removed the originals:
+# regenerate portable YAML from the store only when you need a backup/export:
 maestro config-store export --db ~/.maestro/maestro.db --dir ~/.maestro/maestro.d
 systemctl --user enable --now maestro@panoptikon maestro@myapp   # re-enable old units
 ```

@@ -3,19 +3,26 @@ package outcome
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 const (
-	defaultCheckTimeout = 15 * time.Second
-	maxCheckDetailBytes = 4000
+	defaultCheckTimeout     = 15 * time.Second
+	maxCheckDetailBytes     = 4000
+	outcomeLockPollInterval = 250 * time.Millisecond
 )
 
 // Checker executes configured read-only outcome signals and returns a compact
@@ -29,6 +36,9 @@ type Checker struct {
 
 func (c Checker) Check(ctx context.Context, brief Brief) HealthCheckResult {
 	brief = brief.Normalized()
+	if c.CommandTimeout <= 0 {
+		c.CommandTimeout = brief.HealthcheckTimeout()
+	}
 	start := c.now()
 	result := HealthCheckResult{
 		CheckedAt: start,
@@ -47,8 +57,18 @@ func (c Checker) Check(ctx context.Context, brief Brief) HealthCheckResult {
 	if strings.TrimSpace(brief.HealthcheckURL) != "" {
 		result = c.checkURL(ctx, brief.HealthcheckURL)
 	} else if strings.TrimSpace(brief.HealthcheckCommand) != "" {
+		unlock, lockResult := c.lockCommandCheck(ctx, brief.SourceRepoPath, brief.HealthcheckCommand, "healthcheck_command")
+		if lockResult != nil {
+			return *lockResult
+		}
+		defer unlock()
 		result = c.checkCommand(ctx, brief.HealthcheckCommand, brief.SourceRepoPath, "healthcheck_command")
 	} else {
+		unlock, lockResult := c.lockCommandCheck(ctx, brief.SourceRepoPath, brief.DeploymentStatusCommand, "deployment_status_command")
+		if lockResult != nil {
+			return *lockResult
+		}
+		defer unlock()
 		result = c.checkCommand(ctx, brief.DeploymentStatusCommand, brief.SourceRepoPath, "deployment_status_command")
 	}
 	if result.CheckedAt.IsZero() {
@@ -110,6 +130,41 @@ func (c Checker) checkCommand(ctx context.Context, command, dir, signal string) 
 		return c.result(start, signal, HealthFailing, summary, string(output), exitCode)
 	}
 	return c.result(start, signal, HealthHealthy, fmt.Sprintf("%s passed", signal), "", exitCode)
+}
+
+func (c Checker) lockCommandCheck(ctx context.Context, sourceRepoPath, command, signal string) (func(), *HealthCheckResult) {
+	start := c.now()
+	lockPath, err := outcomeLockPath(sourceRepoPath, command)
+	if err != nil {
+		result := c.result(start, signal, HealthFailing, fmt.Sprintf("%s lock unavailable: %v", signal, err), "", 0)
+		return nil, &result
+	}
+	lock := flock.New(lockPath)
+	ok, err := lock.TryLockContext(ctx, outcomeLockPollInterval)
+	if err != nil {
+		result := c.result(start, signal, HealthFailing, fmt.Sprintf("%s lock failed: %v", signal, err), "", 0)
+		return nil, &result
+	}
+	if !ok {
+		result := c.result(start, signal, HealthFailing, fmt.Sprintf("%s lock wait canceled", signal), "", 0)
+		return nil, &result
+	}
+	return func() {
+		_ = lock.Unlock()
+	}, nil
+}
+
+func outcomeLockPath(sourceRepoPath, command string) (string, error) {
+	root, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(root) == "" {
+		root = os.TempDir()
+	}
+	dir := filepath.Join(root, "maestro", "outcome-locks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(sourceRepoPath) + "\n" + strings.TrimSpace(command)))
+	return filepath.Join(dir, hex.EncodeToString(sum[:])+".lock"), nil
 }
 
 func (c Checker) runCommand(ctx context.Context, command, dir string) ([]byte, int, error) {

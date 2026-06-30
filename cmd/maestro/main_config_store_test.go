@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"os"
 	"path/filepath"
 	"testing"
@@ -43,6 +44,19 @@ func openEditTestStore(t *testing.T) *configstore.Store {
 		t.Fatalf("seed project: %v", err)
 	}
 	return store
+}
+
+func TestConfigStoreDBFlagDefaultsToMaestroDB(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+
+	got := configStoreDBFlag(fs)
+
+	want := filepath.Join(home, ".maestro", "maestro.db")
+	if *got != want {
+		t.Fatalf("config store db default = %q, want %q", *got, want)
+	}
 }
 
 func TestEditStoreProjectAppliesEdit(t *testing.T) {

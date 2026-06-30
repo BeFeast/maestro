@@ -337,6 +337,7 @@ outcome:
   runtime_target: https://repo.example.com
   deployment_status_command: systemctl --user status repo
   healthcheck_command: curl -fsS http://127.0.0.1:8080/healthz
+  healthcheck_timeout_seconds: 60
   healthcheck_url: https://repo.example.com/healthz
   source_repo_path: ~/src/repo-runtime
   runtime_host: fly.io/repo
@@ -354,6 +355,9 @@ outcome:
 	}
 	if cfg.Outcome.DesiredOutcome != "Users can run the hosted app end-to-end." {
 		t.Fatalf("DesiredOutcome = %q", cfg.Outcome.DesiredOutcome)
+	}
+	if cfg.Outcome.HealthcheckTimeoutSeconds != 60 {
+		t.Fatalf("HealthcheckTimeoutSeconds = %d, want 60", cfg.Outcome.HealthcheckTimeoutSeconds)
 	}
 	if cfg.Outcome.SourceRepoPath != filepath.Join(os.Getenv("HOME"), "src/repo-runtime") {
 		t.Fatalf("SourceRepoPath = %q", cfg.Outcome.SourceRepoPath)

@@ -16,50 +16,52 @@ const (
 // Brief is the project operating brief Maestro uses to judge progress by the
 // runtime outcome instead of by raw issue throughput.
 type Brief struct {
-	DesiredOutcome          string   `yaml:"desired_outcome" json:"desired_outcome,omitempty"`
-	RuntimeTarget           string   `yaml:"runtime_target" json:"runtime_target,omitempty"`
-	RuntimeURL              string   `yaml:"runtime_url" json:"runtime_url,omitempty"`
-	DeploymentStatusCommand string   `yaml:"deployment_status_command" json:"deployment_status_command,omitempty"`
-	DeployStatusCommand     string   `yaml:"deploy_status_command" json:"-"`
-	HealthcheckCommand      string   `yaml:"healthcheck_command" json:"healthcheck_command,omitempty"`
-	VerifierCommand         string   `yaml:"verifier_command" json:"verifier_command,omitempty"`
-	HealthcheckURL          string   `yaml:"healthcheck_url" json:"healthcheck_url,omitempty"`
-	SourceRepoPath          string   `yaml:"source_repo_path" json:"source_repo_path,omitempty"`
-	RuntimeHost             string   `yaml:"runtime_host" json:"runtime_host,omitempty"`
-	RequiredRoutes          []string `yaml:"required_routes" json:"required_routes,omitempty"`
-	RequiresDeploy          bool     `yaml:"requires_deploy" json:"requires_deploy,omitempty"`
-	PassRequiredForDone     *bool    `yaml:"pass_required_for_done" json:"-"`
-	FailRequiresVisibleWork *bool    `yaml:"fail_requires_visible_work" json:"-"`
-	NonGoals                []string `yaml:"non_goals" json:"non_goals,omitempty"`
+	DesiredOutcome            string   `yaml:"desired_outcome" json:"desired_outcome,omitempty"`
+	RuntimeTarget             string   `yaml:"runtime_target" json:"runtime_target,omitempty"`
+	RuntimeURL                string   `yaml:"runtime_url" json:"runtime_url,omitempty"`
+	DeploymentStatusCommand   string   `yaml:"deployment_status_command" json:"deployment_status_command,omitempty"`
+	DeployStatusCommand       string   `yaml:"deploy_status_command" json:"-"`
+	HealthcheckCommand        string   `yaml:"healthcheck_command" json:"healthcheck_command,omitempty"`
+	VerifierCommand           string   `yaml:"verifier_command" json:"verifier_command,omitempty"`
+	HealthcheckURL            string   `yaml:"healthcheck_url" json:"healthcheck_url,omitempty"`
+	HealthcheckTimeoutSeconds int      `yaml:"healthcheck_timeout_seconds" json:"healthcheck_timeout_seconds,omitempty"`
+	SourceRepoPath            string   `yaml:"source_repo_path" json:"source_repo_path,omitempty"`
+	RuntimeHost               string   `yaml:"runtime_host" json:"runtime_host,omitempty"`
+	RequiredRoutes            []string `yaml:"required_routes" json:"required_routes,omitempty"`
+	RequiresDeploy            bool     `yaml:"requires_deploy" json:"requires_deploy,omitempty"`
+	PassRequiredForDone       *bool    `yaml:"pass_required_for_done" json:"-"`
+	FailRequiresVisibleWork   *bool    `yaml:"fail_requires_visible_work" json:"-"`
+	NonGoals                  []string `yaml:"non_goals" json:"non_goals,omitempty"`
 }
 
 // Status is the concise outcome state exposed by CLI/API/dashboard surfaces.
 type Status struct {
-	Configured              bool     `json:"configured"`
-	Goal                    string   `json:"goal,omitempty"`
-	DesiredOutcome          string   `json:"desired_outcome,omitempty"`
-	RuntimeTarget           string   `json:"runtime_target,omitempty"`
-	RuntimeURL              string   `json:"runtime_url,omitempty"`
-	RuntimeHost             string   `json:"runtime_host,omitempty"`
-	HealthState             string   `json:"health_state"`
-	HealthCheckedAt         string   `json:"health_checked_at,omitempty"`
-	HealthSignal            string   `json:"health_signal,omitempty"`
-	HealthSummary           string   `json:"health_summary,omitempty"`
-	HealthDetail            string   `json:"health_detail,omitempty"`
-	NextAction              string   `json:"next_action,omitempty"`
-	SourceRepoPath          string   `json:"source_repo_path,omitempty"`
-	DeploymentStatusCommand string   `json:"deployment_status_command,omitempty"`
-	DeployStatusCommand     string   `json:"deploy_status_command,omitempty"`
-	HealthcheckCommand      string   `json:"healthcheck_command,omitempty"`
-	VerifierCommand         string   `json:"verifier_command,omitempty"`
-	HealthcheckURL          string   `json:"healthcheck_url,omitempty"`
-	RequiredRoutes          []string `json:"required_routes,omitempty"`
-	RequiresDeploy          bool     `json:"requires_deploy,omitempty"`
-	NonGoals                []string `json:"non_goals,omitempty"`
-	PassRequiredForDone     bool     `json:"pass_required_for_done,omitempty"`
-	FailRequiresVisibleWork bool     `json:"fail_requires_visible_work,omitempty"`
-	MergedPRs               int      `json:"merged_prs,omitempty"`
-	LastMergeAt             string   `json:"last_merge_at,omitempty"`
+	Configured                bool     `json:"configured"`
+	Goal                      string   `json:"goal,omitempty"`
+	DesiredOutcome            string   `json:"desired_outcome,omitempty"`
+	RuntimeTarget             string   `json:"runtime_target,omitempty"`
+	RuntimeURL                string   `json:"runtime_url,omitempty"`
+	RuntimeHost               string   `json:"runtime_host,omitempty"`
+	HealthState               string   `json:"health_state"`
+	HealthCheckedAt           string   `json:"health_checked_at,omitempty"`
+	HealthSignal              string   `json:"health_signal,omitempty"`
+	HealthSummary             string   `json:"health_summary,omitempty"`
+	HealthDetail              string   `json:"health_detail,omitempty"`
+	NextAction                string   `json:"next_action,omitempty"`
+	SourceRepoPath            string   `json:"source_repo_path,omitempty"`
+	DeploymentStatusCommand   string   `json:"deployment_status_command,omitempty"`
+	DeployStatusCommand       string   `json:"deploy_status_command,omitempty"`
+	HealthcheckCommand        string   `json:"healthcheck_command,omitempty"`
+	VerifierCommand           string   `json:"verifier_command,omitempty"`
+	HealthcheckURL            string   `json:"healthcheck_url,omitempty"`
+	HealthcheckTimeoutSeconds int      `json:"healthcheck_timeout_seconds,omitempty"`
+	RequiredRoutes            []string `json:"required_routes,omitempty"`
+	RequiresDeploy            bool     `json:"requires_deploy,omitempty"`
+	NonGoals                  []string `json:"non_goals,omitempty"`
+	PassRequiredForDone       bool     `json:"pass_required_for_done,omitempty"`
+	FailRequiresVisibleWork   bool     `json:"fail_requires_visible_work,omitempty"`
+	MergedPRs                 int      `json:"merged_prs,omitempty"`
+	LastMergeAt               string   `json:"last_merge_at,omitempty"`
 }
 
 // HealthCheckResult is the durable result of a read-only runtime/deploy health
@@ -98,6 +100,9 @@ func (b Brief) Normalized() Brief {
 		b.VerifierCommand = b.HealthcheckCommand
 	}
 	b.HealthcheckURL = strings.TrimSpace(b.HealthcheckURL)
+	if b.HealthcheckTimeoutSeconds < 0 {
+		b.HealthcheckTimeoutSeconds = 0
+	}
 	b.SourceRepoPath = strings.TrimSpace(b.SourceRepoPath)
 	b.RuntimeHost = strings.TrimSpace(b.RuntimeHost)
 	b.RequiredRoutes = compactStrings(b.RequiredRoutes)
@@ -135,6 +140,14 @@ func (b Brief) FailRequiresVisibleWorkEnabled() bool {
 	return b.Configured()
 }
 
+func (b Brief) HealthcheckTimeout() time.Duration {
+	b = b.Normalized()
+	if b.HealthcheckTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(b.HealthcheckTimeoutSeconds) * time.Second
+}
+
 // StatusFor returns the current known outcome status. Callers may pass the
 // latest persisted health check result; StatusFor never executes checks itself.
 func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...HealthCheckResult) Status {
@@ -148,24 +161,25 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...Heal
 	}
 
 	status := Status{
-		Configured:              true,
-		Goal:                    brief.Goal(),
-		DesiredOutcome:          brief.Goal(),
-		RuntimeTarget:           brief.RuntimeTarget,
-		RuntimeURL:              brief.RuntimeURL,
-		RuntimeHost:             brief.RuntimeHost,
-		SourceRepoPath:          brief.SourceRepoPath,
-		DeploymentStatusCommand: brief.DeploymentStatusCommand,
-		DeployStatusCommand:     brief.DeploymentStatusCommand,
-		HealthcheckCommand:      brief.HealthcheckCommand,
-		VerifierCommand:         brief.VerifierCommand,
-		HealthcheckURL:          brief.HealthcheckURL,
-		RequiredRoutes:          append([]string(nil), brief.RequiredRoutes...),
-		RequiresDeploy:          brief.RequiresDeploy,
-		NonGoals:                append([]string(nil), brief.NonGoals...),
-		PassRequiredForDone:     brief.PassRequiredForDoneEnabled(),
-		FailRequiresVisibleWork: brief.FailRequiresVisibleWorkEnabled(),
-		MergedPRs:               mergedPRs,
+		Configured:                true,
+		Goal:                      brief.Goal(),
+		DesiredOutcome:            brief.Goal(),
+		RuntimeTarget:             brief.RuntimeTarget,
+		RuntimeURL:                brief.RuntimeURL,
+		RuntimeHost:               brief.RuntimeHost,
+		SourceRepoPath:            brief.SourceRepoPath,
+		DeploymentStatusCommand:   brief.DeploymentStatusCommand,
+		DeployStatusCommand:       brief.DeploymentStatusCommand,
+		HealthcheckCommand:        brief.HealthcheckCommand,
+		VerifierCommand:           brief.VerifierCommand,
+		HealthcheckURL:            brief.HealthcheckURL,
+		HealthcheckTimeoutSeconds: brief.HealthcheckTimeoutSeconds,
+		RequiredRoutes:            append([]string(nil), brief.RequiredRoutes...),
+		RequiresDeploy:            brief.RequiresDeploy,
+		NonGoals:                  append([]string(nil), brief.NonGoals...),
+		PassRequiredForDone:       brief.PassRequiredForDoneEnabled(),
+		FailRequiresVisibleWork:   brief.FailRequiresVisibleWorkEnabled(),
+		MergedPRs:                 mergedPRs,
 	}
 	if !lastMergeAt.IsZero() {
 		status.LastMergeAt = lastMergeAt.UTC().Format(time.RFC3339)

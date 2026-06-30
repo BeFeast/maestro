@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -164,5 +165,107 @@ func TestCheckerCommandFailure(t *testing.T) {
 	})
 	if result.State != HealthFailing || result.ExitCode != 7 || result.Detail != "not healthy" {
 		t.Fatalf("result = %+v, want failing command result", result)
+	}
+}
+
+func TestCheckerCommandUsesBriefTimeout(t *testing.T) {
+	var gotTimeout time.Duration
+	result := Checker{
+		RunCommand: func(ctx context.Context, command, dir string) ([]byte, int, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("command context has no deadline")
+			}
+			gotTimeout = time.Until(deadline)
+			return []byte("ok"), 0, nil
+		},
+	}.Check(context.Background(), Brief{
+		DesiredOutcome:            "App is live",
+		HealthcheckCommand:        "status.sh",
+		HealthcheckTimeoutSeconds: 42,
+	})
+	if result.State != HealthHealthy {
+		t.Fatalf("result = %+v, want healthy", result)
+	}
+	if gotTimeout < 41*time.Second || gotTimeout > 42*time.Second {
+		t.Fatalf("command deadline = %s, want about 42s", gotTimeout)
+	}
+}
+
+func TestCheckerCommandSerializesConcurrentChecks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+	enteredFirst := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var first sync.Once
+
+	checker := Checker{
+		RunCommand: func(ctx context.Context, command, dir string) ([]byte, int, error) {
+			mu.Lock()
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
+			mu.Unlock()
+
+			first.Do(func() {
+				close(enteredFirst)
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+				}
+			})
+
+			time.Sleep(10 * time.Millisecond)
+
+			mu.Lock()
+			active--
+			mu.Unlock()
+			return []byte("ok"), 0, nil
+		},
+	}
+	brief := Brief{
+		DesiredOutcome:            "App is live",
+		HealthcheckCommand:        "verify.sh",
+		HealthcheckTimeoutSeconds: 5,
+		SourceRepoPath:            t.TempDir(),
+	}
+
+	results := make(chan HealthCheckResult, 2)
+	go func() { results <- checker.Check(ctx, brief) }()
+
+	select {
+	case <-enteredFirst:
+	case <-ctx.Done():
+		t.Fatal("first check did not enter command")
+	}
+	go func() { results <- checker.Check(ctx, brief) }()
+
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	if maxActive != 1 || active != 1 {
+		t.Fatalf("concurrent command active=%d maxActive=%d, want one active command", active, maxActive)
+	}
+	mu.Unlock()
+	close(releaseFirst)
+
+	for range 2 {
+		select {
+		case result := <-results:
+			if result.State != HealthHealthy {
+				t.Fatalf("result = %+v, want healthy", result)
+			}
+		case <-ctx.Done():
+			t.Fatal("checks did not finish")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if maxActive != 1 {
+		t.Fatalf("maxActive = %d, want serialized checks", maxActive)
 	}
 }

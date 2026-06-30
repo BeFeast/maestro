@@ -107,7 +107,7 @@ func handleDaemonSignals(ctx context.Context, cancel context.CancelFunc, d *daem
 }
 
 // defaultConfigStorePath mirrors the config-store default used elsewhere
-// (~/.maestro/config.db).
+// (~/.maestro/maestro.db).
 func defaultConfigStorePath() string {
-	return filepath.Join(os.Getenv("HOME"), ".maestro", "config.db")
+	return filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.db")
 }

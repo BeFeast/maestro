@@ -1073,9 +1073,12 @@ type State struct {
 	// workers but lets in-flight workers finish. It is set by `maestro
 	// drain` and cleared automatically when the orchestrator starts, so a
 	// drain never persists across a legitimate restart. SpawnDrainAt records
-	// when the drain was requested (UTC).
-	SpawnDrain   bool      `json:"spawn_drain,omitempty"`
-	SpawnDrainAt time.Time `json:"spawn_drain_at,omitempty"`
+	// when an active drain was requested (UTC); SpawnDrainClearAt records
+	// the clear transition for latest-write-wins merge semantics without
+	// making inactive state look drained.
+	SpawnDrain        bool      `json:"spawn_drain,omitempty"`
+	SpawnDrainAt      time.Time `json:"spawn_drain_at,omitempty,omitzero"`
+	SpawnDrainClearAt time.Time `json:"spawn_drain_clear_at,omitempty,omitzero"`
 
 	// Paused is the first-class operator pause (#683): while it is set, the
 	// orchestrator skips issue selection entirely and spawns no new workers,
@@ -1468,6 +1471,10 @@ func (s *State) normalize() {
 	if s.NextSlot == 0 {
 		s.NextSlot = 1
 	}
+	if !s.SpawnDrain && !s.SpawnDrainAt.IsZero() && s.SpawnDrainClearAt.IsZero() {
+		s.SpawnDrainClearAt = s.SpawnDrainAt
+		s.SpawnDrainAt = time.Time{}
+	}
 }
 
 func (s *State) copyFrom(src *State) {
@@ -1484,6 +1491,7 @@ func (s *State) copyFrom(src *State) {
 	s.LastMergeAt = src.LastMergeAt
 	s.SpawnDrain = src.SpawnDrain
 	s.SpawnDrainAt = src.SpawnDrainAt
+	s.SpawnDrainClearAt = src.SpawnDrainClearAt
 	s.Paused = src.Paused
 	s.PausedAt = src.PausedAt
 }
@@ -1536,19 +1544,39 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	return merged, nil
 }
 
-// mergeSpawnDrain resolves the drain flag (#541) latest-write-wins by
-// SpawnDrainAt. The drain CLI sets SpawnDrain=true and the orchestrator clears
-// it (SpawnDrain=false) — both stamp SpawnDrainAt — so picking the snapshot
-// with the newer timestamp keeps a concurrent orchestrator save from clobbering
-// a fresh drain request, and a fresh clear from being undone by a stale set.
+// mergeSpawnDrain resolves the drain flag (#541) latest-write-wins by the
+// newest set/clear transition. The drain CLI sets SpawnDrain=true and stamps
+// SpawnDrainAt; the orchestrator clears it and stamps SpawnDrainClearAt.
 func mergeSpawnDrain(merged, current, ours *State) {
-	if ours.SpawnDrainAt.After(current.SpawnDrainAt) {
-		merged.SpawnDrain = ours.SpawnDrain
-		merged.SpawnDrainAt = ours.SpawnDrainAt
+	if spawnDrainTransitionAt(ours).After(spawnDrainTransitionAt(current)) {
+		copySpawnDrainState(merged, ours)
 		return
 	}
-	merged.SpawnDrain = current.SpawnDrain
-	merged.SpawnDrainAt = current.SpawnDrainAt
+	copySpawnDrainState(merged, current)
+}
+
+func spawnDrainTransitionAt(s *State) time.Time {
+	if s == nil {
+		return time.Time{}
+	}
+	if s.SpawnDrain {
+		return s.SpawnDrainAt
+	}
+	if s.SpawnDrainClearAt.After(s.SpawnDrainAt) {
+		return s.SpawnDrainClearAt
+	}
+	return s.SpawnDrainAt
+}
+
+func copySpawnDrainState(dst, src *State) {
+	dst.SpawnDrain = src.SpawnDrain
+	if src.SpawnDrain {
+		dst.SpawnDrainAt = src.SpawnDrainAt
+		dst.SpawnDrainClearAt = time.Time{}
+		return
+	}
+	dst.SpawnDrainAt = time.Time{}
+	dst.SpawnDrainClearAt = spawnDrainTransitionAt(src)
 }
 
 // mergePaused resolves the pause flag (#683) latest-write-wins by PausedAt,
@@ -2994,6 +3022,7 @@ func (s *State) SetSpawnDrain(at time.Time) {
 	}
 	s.SpawnDrain = true
 	s.SpawnDrainAt = normalizedTime(at)
+	s.SpawnDrainClearAt = time.Time{}
 }
 
 // ClearSpawnDrain lifts a graceful drain. The orchestrator calls this on
@@ -3003,7 +3032,8 @@ func (s *State) ClearSpawnDrain(at time.Time) {
 		return
 	}
 	s.SpawnDrain = false
-	s.SpawnDrainAt = normalizedTime(at)
+	s.SpawnDrainAt = time.Time{}
+	s.SpawnDrainClearAt = normalizedTime(at)
 }
 
 // DrainActive reports whether a graceful drain is currently requested.

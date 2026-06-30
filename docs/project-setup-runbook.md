@@ -121,6 +121,10 @@ Issues with any exclude label are skipped even if they also have a required labe
 
 ## 4. Maestro Config (`maestro-<project>.yaml`)
 
+For daemon fleets, use this YAML shape as a seed/import template and then add it
+to `~/.maestro/maestro.db`; do not keep project YAML as the runtime source of
+truth.
+
 Create the config file at `~/.maestro/maestro-<project>.yaml`. Example:
 
 ```yaml
@@ -232,6 +236,7 @@ outcome:
   runtime_target: https://app.example.com
   deployment_status_command: /path/to/repo/scripts/status.sh
   healthcheck_url: https://app.example.com/healthz
+  healthcheck_timeout_seconds: 60
   source_repo_path: /path/to/local/clone
   runtime_host: production host or platform
   non_goals:
@@ -368,6 +373,10 @@ config warning and stays inert.
 
 ### Running as a systemd service
 
+This section is for legacy single-project installs. Fleet hosts should run one
+`maestro.service` daemon from `~/.maestro/maestro.db`; see the runtime config
+store section below.
+
 ```bash
 # Single project
 maestro init  # creates ~/.config/systemd/user/maestro.service
@@ -386,9 +395,13 @@ For day-to-day operations, review gates, queue policy, approvals, and safe recov
 
 Trusted-LAN default (#477): the fleet dashboard now boots write-enabled out of the box. The cautious approval gate still guards `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config`, so the writable HTTP surface cannot bypass operator approval for those four verbs. For installs exposed beyond a trusted LAN, pass `--read-only=true` (or set `server.read_only: true` in YAML) and configure the optional HTTP auth layer that #616 wires up (off by default). This supersedes the prior "never flip --read-only before auth" caveat.
 
-### Runtime config store (phase 1)
+### Runtime config store
 
-Runtime project settings can be imported from `~/.maestro/maestro.d/*.yaml` into a small SQLite store. Phase 1 keeps the YAML files as the fallback read path; write-path changes, change history, and Mission Control settings UI edits are follow-up work.
+Current fleet runtime is store-first: one `maestro daemon` process reads project
+rows from `~/.maestro/maestro.db`, runs every project flow in-process, and serves
+Mission Control from one port. Per-project YAML files are seed/export artifacts
+for migration and backups; they are not the day-to-day runtime surface once the
+daemon is cut over.
 
 Proposed SQLite schema:
 
@@ -419,78 +432,61 @@ CREATE TABLE project (
 One-shot migration:
 
 ```sh
-maestro config-store migrate --db ~/.maestro/config.db --dir ~/.maestro/maestro.d
+maestro config-store migrate --db ~/.maestro/maestro.db --dir ~/.maestro/maestro.d
 ```
 
-Read from the store:
+Operate against the store:
 
 ```sh
-maestro run --config-store ~/.maestro/config.db
-maestro serve --config-store ~/.maestro/config.db --port 8787
+maestro config-store list --db ~/.maestro/maestro.db
+maestro config-store edit --db ~/.maestro/maestro.db <project>
+maestro status --config-store ~/.maestro/maestro.db --config-store-project <project>
 ```
 
-If `--config-store` is set and the store cannot be opened or read, Maestro falls back to the YAML paths passed with `--config`. Without YAML paths, store load failure remains fatal so operators do not accidentally run with an unintended default config.
+If `--config-store` is set and the store cannot be opened or read, Maestro falls
+back to YAML paths only when explicit `--config` paths were also supplied.
+Without YAML paths, store load failure remains fatal so operators do not
+accidentally run with an unintended default config.
 
 Export portable YAML backups:
 
 ```sh
-maestro config-store export --db ~/.maestro/config.db --dir ~/.maestro/maestro.d.export
+maestro config-store export --db ~/.maestro/maestro.db --dir ~/.maestro/maestro.d.export
 ```
 
 Exports restore the shared backend definitions into each YAML file so the result can be loaded by the legacy YAML loader or copied to another host.
 
 To add a project:
 
-1. Create or update `~/.maestro/maestro-<project>.yaml` using the config shape above.
+1. Create a temporary project YAML using the config shape above, outside the product repo unless the team intentionally wants a checked-in template.
 2. Use a distinct `state_dir` and `session_prefix` for each project so worker sessions and state files do not overlap.
-3. Add the project to `~/.maestro/fleet.yaml` with a human name and config path. Every project is reachable through the unified Mission Control aggregator at `/project/<name>` (#516); per-project dashboard ports are retired and no longer need a separate user unit.
-4. Restart the fleet dashboard service and verify `/api/v1/fleet`.
-
-Minimal two-project fleet file:
-
-```yaml
-# ~/.maestro/fleet.yaml
-projects:
-  - name: api
-    config: maestro-api.yaml
-  - name: web
-    config: maestro-web.yaml
-```
-
-`config` may be absolute, `~/...`, or relative to the fleet YAML file. `dashboard_url` is deprecated (#516); any value still present is silently overridden with the project-scoped MC route on load. For dogfooding, add Maestro's own project config to the same fleet file so the team can watch Maestro manage Maestro alongside application repos.
-
-Run the fleet dashboard manually (writes enabled by default on the trusted LAN; add `--read-only=true` for exposed installs):
+3. Add or replace the project row in the store:
 
 ```bash
-maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787
+maestro config-store add --db ~/.maestro/maestro.db --file ./maestro-<project>.yaml
 ```
 
-Verify the API:
+4. With `maestro daemon --watch-store` running, the project appears without creating a systemd unit or restarting the daemon. Verify the store row and fleet API:
 
 ```bash
-curl -fsS http://127.0.0.1:8787/api/v1/fleet
+maestro config-store list --db ~/.maestro/maestro.db
+maestro status --config-store ~/.maestro/maestro.db --config-store-project <project>
+curl -fsS http://127.0.0.1:8786/api/v1/fleet
 ```
 
 The fleet response includes `refreshed_at` plus per-project freshness metadata. Project cards show snapshot age and are marked stale when the latest state or log snapshot is older than 15 minutes; one project's load error is shown on that card without hiding the rest of the fleet. Queue snapshots split skipped work into `excluded`, `held/meta`, `blocked-deps`, and non-runnable project status counts so an idle project shows why no worker starts.
 
-`--fleet` versus repeated `--config`:
-
-| Mode | Use it when | Notes |
-|---|---|---|
-| `maestro serve --fleet ~/.maestro/fleet.yaml --port 8787` | You want a stable operating model for a shared dashboard or systemd service | Supports human project names and relative config paths; project-scoped routes (`/project/<name>`) are served from the same port |
-| `maestro serve --config a.yaml --config b.yaml --port 8787` | You want a quick local aggregate view without writing a fleet file | Project names are derived from `repo` |
-
-For a persistent user service, create a dedicated fleet dashboard unit:
+Persistent runtime uses the single daemon service, not a dedicated fleet
+dashboard unit and not one runner unit per project:
 
 ```ini
-# ~/.config/systemd/user/maestro-fleet.service
 [Unit]
-Description=Maestro fleet dashboard
+Description=Maestro agent orchestrator
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/maestro serve --fleet %h/.maestro/fleet.yaml --host 127.0.0.1 --port 8787
+ExecStart=/usr/local/bin/maestro daemon --host 0.0.0.0 --store %h/.maestro/maestro.db --port 8786 --watch-store --approvals-store sqlite --state-store sqlite
 Restart=on-failure
 RestartSec=10
 
@@ -502,15 +498,13 @@ Enable it:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now maestro-fleet.service
-systemctl --user status maestro-fleet.service
+systemctl --user enable --now maestro.service
+systemctl --user status maestro.service
 ```
 
-Bind to the LAN only on a trusted network or behind a firewall/reverse proxy. For non-LAN exposure, force `--read-only=true` and configure the auth layer (#616):
-
-```bash
-maestro serve --fleet ~/.maestro/fleet.yaml --host 0.0.0.0 --port 8787 --read-only=true
-```
+Bind to the LAN only on a trusted network or behind a firewall/reverse proxy.
+For non-LAN exposure, configure the auth layer (#616) and keep destructive
+actions behind the cautious approval gate.
 
 ---
 
@@ -696,10 +690,10 @@ Use this checklist when onboarding a new repo to maestro:
 - [ ] Branch protection on `main` requiring PR + status checks
 - [ ] Labels created: `bug`, `enhancement`, `documentation`
 - [ ] Exclude labels created: `wontfix`, `question`, `blocked`, `duplicate`, `invalid`
-- [ ] `maestro-<project>.yaml` config file created
+- [ ] Project config added to `~/.maestro/maestro.db`
 - [ ] `scripts/deploy.sh` written, tested manually, made executable
 - [ ] Worker prompt template written with test requirements
 - [ ] Post-deploy smoke test in deploy script
 - [ ] Version bump configured (CI workflow or maestro `versioning` block)
-- [ ] `maestro run --once` succeeds (picks an issue, spawns a worker)
+- [ ] `maestro status --config-store ~/.maestro/maestro.db --config-store-project <project>` succeeds
 - [ ] Telegram notifications working (if configured)

@@ -167,6 +167,53 @@ type BackendPricing struct {
 	CacheWriteUSDPerMtok float64 `yaml:"cache_write_usd_per_mtok,omitempty"`
 }
 
+type pricingNumber float64
+
+func (n *pricingNumber) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil || value.Tag == "!!null" {
+		*n = 0
+		return nil
+	}
+	if value.Kind == yaml.ScalarNode && value.Tag == "!!str" {
+		raw := strings.TrimSpace(value.Value)
+		if raw == "" {
+			*n = 0
+			return nil
+		}
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("invalid pricing number %q: %w", value.Value, err)
+		}
+		*n = pricingNumber(parsed)
+		return nil
+	}
+	var parsed float64
+	if err := value.Decode(&parsed); err != nil {
+		return err
+	}
+	*n = pricingNumber(parsed)
+	return nil
+}
+
+func (p *BackendPricing) UnmarshalYAML(value *yaml.Node) error {
+	var raw struct {
+		InputUSDPerMtok      pricingNumber `yaml:"input_usd_per_mtok,omitempty"`
+		OutputUSDPerMtok     pricingNumber `yaml:"output_usd_per_mtok,omitempty"`
+		CacheReadUSDPerMtok  pricingNumber `yaml:"cache_read_usd_per_mtok,omitempty"`
+		CacheWriteUSDPerMtok pricingNumber `yaml:"cache_write_usd_per_mtok,omitempty"`
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*p = BackendPricing{
+		InputUSDPerMtok:      float64(raw.InputUSDPerMtok),
+		OutputUSDPerMtok:     float64(raw.OutputUSDPerMtok),
+		CacheReadUSDPerMtok:  float64(raw.CacheReadUSDPerMtok),
+		CacheWriteUSDPerMtok: float64(raw.CacheWriteUSDPerMtok),
+	}
+	return nil
+}
+
 // Anthropic's published cache rates relative to the base input rate: a
 // cache read is ~10% of input, a 5-minute cache write ~125% of input.
 // These are the defaults applied when a backend leaves the cache rates

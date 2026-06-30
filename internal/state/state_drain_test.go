@@ -1,6 +1,8 @@
 package state
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,14 +37,45 @@ func TestSetAndClearSpawnDrain(t *testing.T) {
 	if !s.SpawnDrainAt.Equal(at) {
 		t.Fatalf("SpawnDrainAt = %v, want %v", s.SpawnDrainAt, at)
 	}
+	if !s.SpawnDrainClearAt.IsZero() {
+		t.Fatalf("SpawnDrainClearAt = %v, want zero while drain is active", s.SpawnDrainClearAt)
+	}
 
 	later := at.Add(time.Minute)
 	s.ClearSpawnDrain(later)
 	if s.DrainActive() {
 		t.Fatal("DrainActive() true after ClearSpawnDrain")
 	}
-	if !s.SpawnDrainAt.Equal(later) {
-		t.Fatalf("SpawnDrainAt = %v, want %v after clear", s.SpawnDrainAt, later)
+	if !s.SpawnDrainAt.IsZero() {
+		t.Fatalf("SpawnDrainAt = %v, want zero after clear", s.SpawnDrainAt)
+	}
+	if !s.SpawnDrainClearAt.Equal(later) {
+		t.Fatalf("SpawnDrainClearAt = %v, want %v after clear", s.SpawnDrainClearAt, later)
+	}
+}
+
+func TestSpawnDrainJSONOmitsInactiveDrainAt(t *testing.T) {
+	s := NewState()
+	at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	s.SetSpawnDrain(at)
+	active, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal active state: %v", err)
+	}
+	if !strings.Contains(string(active), `"spawn_drain_at"`) {
+		t.Fatalf("active state JSON = %s, want spawn_drain_at", active)
+	}
+
+	s.ClearSpawnDrain(at.Add(time.Minute))
+	cleared, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal cleared state: %v", err)
+	}
+	if strings.Contains(string(cleared), `"spawn_drain_at"`) {
+		t.Fatalf("cleared state JSON = %s, want no spawn_drain_at", cleared)
+	}
+	if !strings.Contains(string(cleared), `"spawn_drain_clear_at"`) {
+		t.Fatalf("cleared state JSON = %s, want spawn_drain_clear_at", cleared)
 	}
 }
 
@@ -102,5 +135,26 @@ func TestMergeSpawnDrain_LatestWriteWins(t *testing.T) {
 		if merged.DrainActive() {
 			t.Fatal("stale set undid a fresh clear")
 		}
+		if !merged.SpawnDrainAt.IsZero() {
+			t.Fatalf("SpawnDrainAt = %v, want zero after merged clear", merged.SpawnDrainAt)
+		}
+		if !merged.SpawnDrainClearAt.Equal(t0.Add(2 * time.Minute)) {
+			t.Fatalf("SpawnDrainClearAt = %v, want fresh clear timestamp", merged.SpawnDrainClearAt)
+		}
 	})
+}
+
+func TestNormalizeMigratesInactiveSpawnDrainAtToClearAt(t *testing.T) {
+	clearAt := time.Date(2026, 6, 1, 10, 30, 0, 0, time.UTC)
+	s := NewState()
+	s.SpawnDrain = false
+	s.SpawnDrainAt = clearAt
+	s.normalize()
+
+	if !s.SpawnDrainAt.IsZero() {
+		t.Fatalf("SpawnDrainAt = %v, want zero for inactive drain", s.SpawnDrainAt)
+	}
+	if !s.SpawnDrainClearAt.Equal(clearAt) {
+		t.Fatalf("SpawnDrainClearAt = %v, want migrated clear timestamp %v", s.SpawnDrainClearAt, clearAt)
+	}
 }

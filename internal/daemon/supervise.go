@@ -65,6 +65,7 @@ func computeSuperviseJitter(interval time.Duration, frac float64) time.Duration 
 // is stable for the flow's lifetime.
 func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, interval time.Duration) {
 	gh := github.New(getCfg().Repo)
+	clearSupervisorStuckOnStartup(name, getCfg().StateDir)
 	// Capture and log each cycle's SupervisorDecision. The daemon still acts
 	// (label/comment/approve), but without this the structural "why did the
 	// supervisor do that" trail was dropped — turning debugging into journal
@@ -121,6 +122,27 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 			}
 		}
 	}
+}
+
+func clearSupervisorStuckOnStartup(name, stateDir string) {
+	if strings.TrimSpace(stateDir) == "" {
+		return
+	}
+	st, err := state.Load(stateDir)
+	if err != nil {
+		log.Printf("[%s] supervise: load state to clear stale supervisor_stuck flag: %v", name, err)
+		return
+	}
+	if !st.SupervisorStuck && strings.TrimSpace(st.SupervisorStuckReason) == "" {
+		return
+	}
+	st.SupervisorStuck = false
+	st.SupervisorStuckReason = ""
+	if err := state.Save(stateDir, st); err != nil {
+		log.Printf("[%s] supervise: clear stale supervisor_stuck flag on startup: %v", name, err)
+		return
+	}
+	log.Printf("[%s] supervise: cleared stale supervisor_stuck flag on startup; watchdog will re-set it if this loop stalls", name)
 }
 
 // logSupervisorDecision emits a compact, single-line, per-cycle record of the

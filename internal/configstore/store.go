@@ -47,7 +47,7 @@ type Store struct {
 func Open(path string) (*Store, error) {
 	// busy_timeout makes a connection wait (up to 5s) for a lock instead of
 	// erroring with "database is locked" immediately: the daemon's watch-loop
-	// reads config.db (ProjectsFingerprint every tick, Load on add) while
+	// reads maestro.db (ProjectsFingerprint every tick, Load on add) while
 	// `config-store add/rm/edit` writes it from a SEPARATE process (#757). WAL
 	// lets a reader and a writer proceed concurrently across processes. The
 	// pragmas go in the DSN so modernc applies them to every pooled connection.
@@ -435,6 +435,13 @@ func ProjectNameFor(sourcePath string, data []byte) (string, error) {
 func (s *Store) ExportProject(ctx context.Context, name string) ([]byte, error) {
 	data, _, err := s.exportProjectYAML(ctx, name)
 	return data, err
+}
+
+// ProjectNames returns the config-store project keys without loading or
+// validating each project document. Operators use it to discover the canonical
+// --config-store-project value even when a specific project config is broken.
+func (s *Store) ProjectNames(ctx context.Context) ([]string, error) {
+	return s.projectNames(ctx)
 }
 
 // DeleteProject removes a project row. Deleting a missing project is a no-op
