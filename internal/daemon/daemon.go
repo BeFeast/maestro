@@ -24,6 +24,7 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
@@ -503,6 +504,13 @@ func (d *Daemon) Fleet() *server.FleetServer {
 // so an operator can force shutdown. Non-positive timeout clamps to
 // DefaultDrainTimeout.
 func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
+	// Fail fast on GitHub rate limits from here on (#797): the flows keep
+	// polling while the drain waits for in-flight workers, and a rate-limited
+	// window at that moment must degrade to failed cycles — not minutes of
+	// backoff that stall flow stop past the drain deadline (observed
+	// 2026-07-02: a 0-worker drain stretched past 20 minutes).
+	github.BeginShutdown()
+
 	if timeout <= 0 {
 		timeout = DefaultDrainTimeout
 	}
