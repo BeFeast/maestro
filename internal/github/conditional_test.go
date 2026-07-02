@@ -195,6 +195,122 @@ func TestGHAPI_PaginatedMultiPageConcatenatesAndSkipsCache(t *testing.T) {
 	}
 }
 
+func TestGHAPI_PaginatedFullPageNotCached(t *testing.T) {
+	clearETagCache(t)
+	// Exactly per_page items: the collection can grow onto page 2 while page 1
+	// stays byte-identical, so a later 304 would hide the new items. The page
+	// must never enter the cache.
+	endpoint := "repos/owner/repo/issues/5/comments?per_page=2"
+	fullPage := `[{"id":1},{"id":2}]`
+	calls := withGHRunner(t, func(args []string) ([]byte, error) {
+		return includeResponse("200 OK", `W/"full"`, fullPage), nil
+	})
+
+	out, err := ghAPIWithArgs(endpoint, "--paginate")
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if string(out) != fullPage {
+		t.Fatalf("body = %q, want %q", out, fullPage)
+	}
+	if e, b := etagLookup(endpoint); e != "" || b != nil {
+		t.Fatalf("cache = (%q, %q), want empty — a full page can overflow to page 2 without changing", e, b)
+	}
+	if _, err := ghAPIWithArgs(endpoint, "--paginate"); err != nil {
+		t.Fatalf("second fetch error = %v", err)
+	}
+	if got := argWithPrefix((*calls)[1], "If-None-Match:"); got != "" {
+		t.Fatalf("second call sent %q, want no conditional header for an uncacheable full page", got)
+	}
+}
+
+func TestGHAPI_PaginatedPartialPageServes304FromCache(t *testing.T) {
+	clearETagCache(t)
+	// Fewer items than per_page: any growth changes page 1's bytes, so a 304
+	// proves the whole collection unchanged and the cache is safe to serve.
+	endpoint := "repos/owner/repo/pulls/7/comments?per_page=100"
+	body := `[{"id":1}]`
+	etag := `W/"partial"`
+	calls := withGHRunner(t, func(args []string) ([]byte, error) {
+		if argWithPrefix(args, "If-None-Match:") != "" {
+			out := append(includeResponse("304 Not Modified", "", ""),
+				[]byte("gh: HTTP 304 (https://api.github.com/"+endpoint+")")...)
+			return out, errors.New("exit status 1")
+		}
+		return includeResponse("200 OK", etag, body), nil
+	})
+
+	if _, err := ghAPIWithArgs(endpoint, "--paginate"); err != nil {
+		t.Fatalf("first fetch error = %v", err)
+	}
+	out, err := ghAPIWithArgs(endpoint, "--paginate")
+	if err != nil {
+		t.Fatalf("conditional refetch error = %v", err)
+	}
+	if string(out) != body {
+		t.Fatalf("304 body = %q, want the cached copy %q", out, body)
+	}
+	if got := argWithPrefix((*calls)[1], "If-None-Match:"); got != "If-None-Match: "+etag {
+		t.Fatalf("second call conditional header = %q, want the cached ETag", got)
+	}
+}
+
+func TestGHAPI_PaginatedTotalCountBodyCached(t *testing.T) {
+	clearETagCache(t)
+	// check-runs shape: growth anywhere changes total_count on page 1, so even
+	// a full page is safe to cache.
+	endpoint := "repos/owner/repo/commits/abc/check-runs?per_page=100"
+	body := `{"total_count":1,"check_runs":[{"id":9}]}`
+	withGHRunner(t, func(args []string) ([]byte, error) {
+		return includeResponse("200 OK", `W/"cr"`, body), nil
+	})
+
+	if _, err := ghAPIWithArgs(endpoint, "--paginate"); err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if e, b := etagLookup(endpoint); e != `W/"cr"` || string(b) != body {
+		t.Fatalf("cache = (%q, %q), want the total_count body cached", e, b)
+	}
+}
+
+func TestPaginatedCacheable(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		perPage int
+		want    bool
+	}{
+		{"array below page size", `[{"id":1}]`, 100, true},
+		{"array at page size", `[{"id":1},{"id":2}]`, 2, false},
+		{"empty array", `[]`, 100, true},
+		{"object with total_count", `{"total_count":3,"check_runs":[]}`, 100, true},
+		{"object without total_count", `{"check_runs":[]}`, 100, false},
+		{"invalid json", `[{"id":`, 100, false},
+		{"empty body", "", 100, false},
+	}
+	for _, tc := range cases {
+		if got := paginatedCacheable([]byte(tc.body), tc.perPage); got != tc.want {
+			t.Fatalf("%s: paginatedCacheable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestEndpointPerPage(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		want     int
+	}{
+		{"repos/o/r/issues/5/comments?per_page=100", 100},
+		{"repos/o/r/issues/5/comments?direction=asc&per_page=7", 7},
+		{"repos/o/r/issues/5/comments", 30},
+	}
+	for _, tc := range cases {
+		if got := endpointPerPage(tc.endpoint); got != tc.want {
+			t.Fatalf("endpointPerPage(%q) = %d, want %d", tc.endpoint, got, tc.want)
+		}
+	}
+}
+
 func TestGHAPI_ShutdownSkipsRateLimitRetries(t *testing.T) {
 	resetShutdownForTest()
 	t.Cleanup(resetShutdownForTest)
@@ -312,15 +428,16 @@ func TestAPIUsage_CountsAndRollsHourlyWindow(t *testing.T) {
 		t.Fatalf("rate-limited delta = %d, want 1", d)
 	}
 
-	// Crossing the window boundary emits the digest and resets the window.
+	// Crossing the window boundary emits the digest and resets the window; the
+	// request that crossed it opens the new window rather than vanishing.
 	now = base.Add(2 * time.Hour)
 	noteAPIRequest(false, false)
 	apiStatsMu.Lock()
 	windowReqs := apiStatsWindow.Requests
 	windowStart := apiWindowStart
 	apiStatsMu.Unlock()
-	if windowReqs != 0 {
-		t.Fatalf("window requests after rollover = %d, want 0", windowReqs)
+	if windowReqs != 1 {
+		t.Fatalf("window requests after rollover = %d, want 1 (the boundary-crossing request)", windowReqs)
 	}
 	if !windowStart.Equal(now) {
 		t.Fatalf("window start = %s, want reset to %s", windowStart, now)

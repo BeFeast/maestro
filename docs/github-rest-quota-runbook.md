@@ -21,7 +21,13 @@ incidents shaped the protections in `internal/github`:
   consume the hourly REST quota; the wrapper serves the cached body. This has
   no effect on merge-gating correctness — a 304 is GitHub's own guarantee
   that a 200 would have returned identical content, so every gate still sees
-  exactly what GitHub would have sent.
+  exactly what GitHub would have sent. For `--paginate` reads a 304 only
+  certifies the *first page*, so the wrapper caches a paginated response only
+  when an unchanged first page proves the whole collection unchanged: array
+  bodies with fewer items than `per_page`, or object bodies carrying
+  `total_count`. Full single pages and multi-page responses are always
+  refetched plain, so a collection growing onto page 2 can never be masked by
+  a stale cache.
 - **Usage counter.** Each gh exchange is counted (total, 304s served free,
   rate-limited responses) and a one-line digest is written to the journal
   every hour:

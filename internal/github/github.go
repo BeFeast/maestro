@@ -364,10 +364,11 @@ func evictOldestETagLocked() {
 }
 
 // ghConditionalEligible reports whether a gh api call can carry conditional
-// request headers. Plain GETs — no extra args, or --paginate only (whose
-// single-page response is by far the common case here; multi-page responses
-// are detected and simply not cached) — are eligible. rate_limit is excluded:
-// its body changes on every read, so a conditional fetch would never hit.
+// request headers. Plain GETs — no extra args, or --paginate only — are
+// eligible; whether a paginated response may actually be cached is decided per
+// response by paginatedCacheable, and multi-page responses are never cached.
+// rate_limit is excluded: its body changes on every read, so a conditional
+// fetch would never hit.
 func ghConditionalEligible(endpoint string, args []string) bool {
 	if endpoint == "rate_limit" {
 		return false
@@ -459,8 +460,10 @@ func headerValue(headers []byte, name string) string {
 // not yield a trustworthy body: with runErr != nil the caller falls through to
 // normal rate-limit/error handling; with runErr == nil (an inconsistent
 // conditional shape, e.g. a paginated response embedding a non-2xx page) the
-// caller must drop the cache entry and refetch plain.
-func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []byte) (body []byte, served bool, resolved bool) {
+// caller must drop the cache entry and refetch plain. paginated marks a
+// --paginate call, whose responses are cached only when paginatedCacheable
+// proves a later 304 cannot hide pages beyond the cached one.
+func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []byte, paginated bool) (body []byte, served bool, resolved bool) {
 	resp, ok := parseGHConditionalResponse(out)
 	if !ok {
 		// No header block. Trust a successful run's output as the plain body
@@ -478,16 +481,66 @@ func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []
 		return cachedBody, true, true
 	}
 	if runErr == nil && resp.allOK {
-		if resp.blocks == 1 {
+		if resp.blocks == 1 && (!paginated || paginatedCacheable(resp.body, endpointPerPage(endpoint))) {
 			etagStore(endpoint, resp.etag, resp.body)
 		} else {
 			// A multi-page response cannot be cached: the first page's ETag
-			// does not validate the concatenated whole.
+			// does not validate the concatenated whole. A full single page is
+			// not cached either — see paginatedCacheable.
 			etagDrop(endpoint)
 		}
 		return resp.body, false, true
 	}
 	return nil, false, false
+}
+
+// paginatedCacheable reports whether a single-page --paginate body may be
+// cached for If-None-Match revalidation. A 304 only certifies that page ONE is
+// unchanged: if the collection has meanwhile grown past the page size, the new
+// items live on a page the bodyless 304 carries no Link header to discover,
+// and serving the cache would hide them (e.g. review comments appended past
+// item 100). Caching is therefore limited to shapes where an unchanged first
+// page proves the whole collection is unchanged:
+//
+//   - a JSON array with fewer than per_page items — any growth lands on this
+//     page and changes its bytes;
+//   - a JSON object carrying GitHub's total_count (check-runs et al.) — growth
+//     anywhere changes the count on page one.
+//
+// A full single page (exactly per_page array items) is the one shape that can
+// overflow invisibly, so it is never cached.
+func paginatedCacheable(body []byte, perPage int) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+	switch trimmed[0] {
+	case '[':
+		var items []json.RawMessage
+		if err := json.Unmarshal(trimmed, &items); err != nil {
+			return false
+		}
+		return len(items) < perPage
+	case '{':
+		var probe struct {
+			TotalCount *int64 `json:"total_count"`
+		}
+		return json.Unmarshal(trimmed, &probe) == nil && probe.TotalCount != nil
+	}
+	return false
+}
+
+var ghPerPageRE = regexp.MustCompile(`[?&]per_page=(\d+)`)
+
+// endpointPerPage returns the page size a paginated endpoint requested,
+// defaulting to GitHub's 30 when the query string does not say.
+func endpointPerPage(endpoint string) int {
+	if m := ghPerPageRE.FindStringSubmatch(endpoint); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 30
 }
 
 // ghConditionalErrorDetail returns the body portion of a --include response so
@@ -502,6 +555,12 @@ func ghConditionalErrorDetail(out []byte) []byte {
 
 func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 	conditional := ghConditionalEligible(endpoint, args)
+	paginated := false
+	for _, a := range args {
+		if a == "--paginate" {
+			paginated = true
+		}
+	}
 	cmdArgs := append([]string{"api", endpoint}, args...)
 	var cachedBody []byte
 	if conditional {
@@ -519,7 +578,7 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 		anomaly = false
 		out, err = ghAPIRunner(cmdArgs...)
 		if conditional {
-			body, served, resolved := resolveConditional(endpoint, out, err, cachedBody)
+			body, served, resolved := resolveConditional(endpoint, out, err, cachedBody, paginated)
 			if resolved {
 				noteAPIRequest(served, false)
 				return body, nil
@@ -611,6 +670,14 @@ func noteAPIRequest(notModified, rateLimited bool) {
 	now := apiUsageNow()
 	if apiWindowStart.IsZero() {
 		apiWindowStart = now
+	} else if elapsed := now.Sub(apiWindowStart); elapsed >= apiUsageLogEvery {
+		// Roll the window before counting so the request that crossed the
+		// boundary opens the new window instead of vanishing with the digest.
+		w := apiStatsWindow
+		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited",
+			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited)
+		apiStatsWindow = APIStats{}
+		apiWindowStart = now
 	}
 	for _, s := range []*APIStats{&apiStatsTotal, &apiStatsWindow} {
 		s.Requests++
@@ -620,13 +687,6 @@ func noteAPIRequest(notModified, rateLimited bool) {
 		if rateLimited {
 			s.RateLimited++
 		}
-	}
-	if elapsed := now.Sub(apiWindowStart); elapsed >= apiUsageLogEvery {
-		w := apiStatsWindow
-		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited",
-			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited)
-		apiStatsWindow = APIStats{}
-		apiWindowStart = now
 	}
 }
 
