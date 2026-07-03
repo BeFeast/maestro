@@ -15,10 +15,16 @@ const (
 	selectionReasonProviderLimitFallback    = "fallback_after_provider_limit"
 	selectionReasonAuthFailureFallback      = "fallback_after_backend_auth_failure"
 	selectionReasonModelUnavailableFallback = "fallback_after_backend_model_unavailable"
+	selectionReasonUsageLimitFallback       = "fallback_after_backend_usage_limit"
 	// selectionReasonDispatchBlockedFallback marks a fresh dispatch whose
 	// routed backend was blocked (disabled or in BackendHealth cooldown), so
 	// the first healthy candidate was substituted before spawn (#695).
 	selectionReasonDispatchBlockedFallback = "dispatch_fallback_blocked_backend"
+	// selectionReasonRetryBlockedFallback marks a scheduled retry whose
+	// session backend was blocked at respawn time (in BackendHealth cooldown
+	// or disabled), so the first healthy fallback was substituted instead of
+	// re-burning the retry budget on a dead backend (#805).
+	selectionReasonRetryBlockedFallback = "retry_fallback_blocked_backend"
 )
 
 // backendFailureCopy holds the reason-dependent strings the dead-worker
@@ -36,13 +42,22 @@ type backendFailureCopy struct {
 }
 
 func backendFailureCopyFor(reason string) backendFailureCopy {
-	if reason == state.BackendBlockModelUnavailable {
+	switch reason {
+	case state.BackendBlockModelUnavailable:
 		return backendFailureCopy{
 			selectionReason: selectionReasonModelUnavailableFallback,
 			displayToken:    string(state.DisplayBackendModelUnavailable),
 			desc:            "could not load its configured model (unavailable or no access)",
 			noun:            "backend model unavailable",
 			remedy:          "swap the model id or restore model access",
+		}
+	case state.BackendBlockUsageLimit:
+		return backendFailureCopy{
+			selectionReason: selectionReasonUsageLimitFallback,
+			displayToken:    string(state.DisplayBackendUsageLimit),
+			desc:            "exhausted its account usage quota",
+			noun:            "backend usage limit",
+			remedy:          "wait for the provider quota window to reset or raise the plan limit",
 		}
 	}
 	return backendFailureCopy{
@@ -60,6 +75,25 @@ func backendFailureCopyFor(reason string) backendFailureCopy {
 // provider states no reset time, so a short fixed window re-probes the
 // backend a few times an hour instead of per-spawn (#693).
 const backendAuthFailureCooldown = 10 * time.Minute
+
+// backendUsageLimitCooldown is the gate window for a quota-exhausted backend
+// whose reset time could not be parsed (#805) — a quota death WITH a
+// parseable reset goes through the provider-limit path and carries the
+// provider's own RetryAfter instead. Quota windows reset on multi-hour
+// boundaries (5-hour session windows, weekly caps), so re-probing is slower
+// than the auth cooldown: fast enough to resume within half an hour of an
+// unknown reset, slow enough not to spawn-die churn against a window that
+// stays exhausted for hours.
+const backendUsageLimitCooldown = 30 * time.Minute
+
+// backendFailureCooldownFor picks the fixed re-probe window for a hard
+// backend failure by gating reason.
+func backendFailureCooldownFor(reason string) time.Duration {
+	if reason == state.BackendBlockUsageLimit {
+		return backendUsageLimitCooldown
+	}
+	return backendAuthFailureCooldown
+}
 
 // recordProviderLimit marks the session's backend as rate-limited and puts it
 // into cooldown. resetAt, when non-nil, is the provider-stated reset time
@@ -95,15 +129,16 @@ func (o *Orchestrator) recordProviderLimit(st *state.State, slotName string, ses
 }
 
 // recordBackendFailure marks the session's backend as failing for a hard,
-// non-work reason (auth/credential outage #693, or model unavailable #713)
-// and puts it into cooldown. Unlike a provider capacity limit there is no
-// provider-stated reset time, so RetryAfter is a fixed short window
-// (backendAuthFailureCooldown) after which the selector re-probes the backend
-// automatically. RateLimitHit is set because it is the shared "transient
-// backend block" marker: FailedAttemptsForIssue excludes such sessions, so
-// the outage does not burn the per-issue retry budget. reason is the gating
-// reason recorded on both the session and BackendHealth so the supervisor and
-// dashboard can tell an auth outage from a missing model.
+// non-work reason (auth/credential outage #693, model unavailable #713, or
+// account quota exhausted #805) and puts it into cooldown. Unlike a provider
+// capacity limit there is no provider-stated reset time, so RetryAfter is a
+// fixed window picked by gating reason (backendFailureCooldownFor) after
+// which the selector re-probes the backend automatically. RateLimitHit is
+// set because it is the shared "transient backend block" marker:
+// FailedAttemptsForIssue excludes such sessions, so the outage does not burn
+// the per-issue retry budget. reason is the gating reason recorded on both
+// the session and BackendHealth so the supervisor and dashboard can tell an
+// auth outage from a missing model from an exhausted quota.
 func (o *Orchestrator) recordBackendFailure(st *state.State, slotName string, sess *state.Session, reason, pattern string, now time.Time) {
 	if st == nil || sess == nil || sess.Backend == "" {
 		return
@@ -120,7 +155,7 @@ func (o *Orchestrator) recordBackendFailure(st *state.State, slotName string, se
 	sess.RateLimitHit = true
 	sess.ProviderLimitBackend = sess.Backend
 	sess.ProviderLimitReason = reason
-	retryAfter := now.UTC().Add(backendAuthFailureCooldown)
+	retryAfter := now.UTC().Add(backendFailureCooldownFor(reason))
 	st.BackendHealth[sess.Backend] = state.BackendHealth{
 		State:       state.BackendHealthCooldown,
 		Reason:      reason,

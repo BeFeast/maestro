@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -88,6 +89,17 @@ type BackendDef struct {
 	// percentages on the fleet API / Mission Control, and steers fresh
 	// dispatch to fallback backends once usage crosses the threshold.
 	Quota BackendQuota `yaml:"quota,omitempty"`
+
+	// UsageLimitPatterns (#805) holds extra regexes that classify this
+	// backend's dead-worker log tail as an account-quota exhaustion, in
+	// addition to the built-in signatures (codex "You've hit your usage
+	// limit", the codex settings/usage URL, claude "usage limit reached").
+	// A quota death gates the backend in backend_health and fails the
+	// attempt over to the next fallback backend without consuming the
+	// per-issue retry budget. Keep entries high-precision: a pattern that
+	// matches ordinary work output (a prompt echo, test output) causes
+	// false backend gating. Validated to compile at config parse.
+	UsageLimitPatterns []string `yaml:"usage_limit_patterns,omitempty"`
 
 	// SubagentHint steers an orchestrating backend (e.g. Claude Code) to
 	// delegate grunt subtasks to cheaper sub-agent models instead of
@@ -1493,6 +1505,14 @@ func parse(data []byte) (*Config, error) {
 		}
 		if t := def.Quota.DispatchThreshold; t < 0 || t > 1 {
 			return nil, fmt.Errorf("config: model.backends.%s.quota.dispatch_threshold = %v; want a fraction in (0, 1], e.g. 0.85 for 85%%", name, t)
+		}
+		// #805: usage-limit classifier extras must compile — an invalid
+		// regex would otherwise be skipped silently at classification
+		// time and the operator would believe the signature is covered.
+		for _, p := range def.UsageLimitPatterns {
+			if _, err := regexp.Compile(p); err != nil {
+				return nil, fmt.Errorf("config: model.backends.%s.usage_limit_patterns entry %q does not compile: %v", name, p, err)
+			}
 		}
 	}
 

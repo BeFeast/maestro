@@ -1368,6 +1368,46 @@ func buildProjectStatusJSON(cfg *config.Config, s *state.State) projectStatusJSO
 	}
 }
 
+// showBackendHealth prints the per-backend cooldown gates so the operator
+// sees "codex: cooling down until 12:30 (usage_limit)" at a glance (#805).
+// Entries whose cooldown has already elapsed are skipped — the selector
+// treats those backends as available again even before ReconcileBackendHealth
+// clears the row.
+func showBackendHealth(s *state.State) {
+	if len(s.BackendHealth) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	names := make([]string, 0, len(s.BackendHealth))
+	for name := range s.BackendHealth {
+		h := s.BackendHealth[name]
+		if h.State != state.BackendHealthCooldown {
+			continue
+		}
+		if h.RetryAfter != nil && !now.Before(*h.RetryAfter) {
+			continue
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return
+	}
+	sort.Strings(names)
+	fmt.Printf("Backend health:\n")
+	for _, name := range names {
+		h := s.BackendHealth[name]
+		when := "auto-recovery pending"
+		if h.RetryAfter != nil {
+			when = "until " + h.RetryAfter.UTC().Format("2006-01-02 15:04 MST")
+		}
+		detail := h.Reason
+		if h.Pattern != "" && h.Pattern != h.Reason {
+			detail += "; " + h.Pattern
+		}
+		fmt.Printf("  %-16s cooling down %s (%s)\n", name+":", when, detail)
+	}
+}
+
 // decorateBackendWithTier annotates the status BACKEND cell with the routing
 // tier a policy decision resolved to (#783), e.g. "claude (strong)", or the
 // would-pick tier in shadow mode, e.g. "codex (shadow:strong)". Non-policy
@@ -1412,6 +1452,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	}
 	showOutcomeStatus(cfg, s)
 	showSupervisorPolicy(cfg)
+	showBackendHealth(s)
 	if len(cfg.MaxConcurrentByState) > 0 {
 		// Sort keys for stable output
 		stateNames := make([]string, 0, len(cfg.MaxConcurrentByState))

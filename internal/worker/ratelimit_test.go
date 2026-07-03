@@ -471,3 +471,104 @@ func TestParseRateLimitReset_Variants(t *testing.T) {
 		})
 	}
 }
+
+// codexTimeOnlySignature is the live #805 signature (BeFeast/ok-folio fleet,
+// 2026-07-02): codex states only a wall-clock reset with no date. The
+// date-bearing layouts reject it, so before #805 the reset went unparsed, the
+// death stayed low-confidence, and no failover fired.
+const codexTimeOnlySignature = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/codex/settings/usage) or try again at 12:30 PM."
+
+// TestParseRateLimitResetAt_TimeOnly verifies clock-only reset hints resolve
+// against the reference time: same day when the clock time is still ahead,
+// next day when it has already passed (#805).
+func TestParseRateLimitResetAt_TimeOnly(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		now   time.Time
+		want  time.Time
+		ok    bool
+	}{
+		{
+			name:  "clock ahead of now resolves same day",
+			input: codexTimeOnlySignature,
+			now:   time.Date(2026, time.July, 2, 1, 17, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "clock already passed rolls to next day",
+			input: codexTimeOnlySignature,
+			now:   time.Date(2026, time.July, 2, 22, 45, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 12, 30, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "clock equal to now rolls to next day",
+			input: codexTimeOnlySignature,
+			now:   time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 12, 30, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "lowercase meridiem",
+			input: "You've hit your usage limit. try again at 8:13pm.",
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 2, 20, 13, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "24h clock",
+			input: "quota exceeded; try again at 09:15",
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 9, 15, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "date-bearing hint keeps absolute parse",
+			input: codexUsageLimitSignature,
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.May, 30, 20, 13, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "unparseable hint still fails",
+			input: "try again at some point soon.",
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			ok:    false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseRateLimitResetAt(tc.input, tc.now)
+			if ok != tc.ok {
+				t.Fatalf("ParseRateLimitResetAt ok = %v, want %v (got %v)", ok, tc.ok, got)
+			}
+			if tc.ok && !got.Equal(tc.want) {
+				t.Errorf("ParseRateLimitResetAt = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyRateLimitAt_TimeOnlyIsHighConfidence: the #805 signature must
+// classify as a HIGH-confidence rate limit so the orchestrator's provider-limit
+// fallover fires instead of burning the per-issue retry budget on retries
+// against a quota-dead backend.
+func TestClassifyRateLimitAt_TimeOnlyIsHighConfidence(t *testing.T) {
+	now := time.Date(2026, time.July, 2, 1, 17, 0, 0, time.UTC)
+	hit, label, confidence, resetAt := ClassifyRateLimitAt(codexTimeOnlySignature, now)
+	if !hit {
+		t.Fatal("expected hit=true on the codex time-only usage-limit signature")
+	}
+	if label != "hit_limit" {
+		t.Errorf("label = %q, want hit_limit", label)
+	}
+	if confidence != "high" {
+		t.Errorf("confidence = %q, want high — a resolvable time-only reset is a positive signal (#805)", confidence)
+	}
+	want := time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC)
+	if !resetAt.Equal(want) {
+		t.Errorf("resetAt = %v, want %v", resetAt, want)
+	}
+}
