@@ -72,6 +72,30 @@ supervisor:
 	}
 }
 
+// A row imported from a file keeps that file as its SourcePath; the
+// "store:<name>" pseudo path is only for rows with no originating file (#801).
+func TestLoadKeepsImportedSourcePath(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	yaml := "repo: BeFeast/maestro\n"
+	path := filepath.Join(dir, "befeast-maestro.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	store := openTestStore(t)
+	if err := store.ImportDir(ctx, dir); err != nil {
+		t.Fatalf("ImportDir: %v", err)
+	}
+	cfg, err := store.Load(ctx, "befeast-maestro")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SourcePath != path {
+		t.Fatalf("SourcePath = %q, want %q", cfg.SourcePath, path)
+	}
+}
+
 func TestExportDirRoundTrips(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
