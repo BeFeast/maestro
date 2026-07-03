@@ -57,6 +57,7 @@ type Orchestrator struct {
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 	hasMergedPRForIssueFn func(issueNumber int) (bool, error)
 	isPRMergedFn          func(prNumber int) (bool, error)
+	mergedPRForBranchFn   func(branch string) (int, error)
 
 	// Testing hooks for checkSessions
 	captureTmuxFn             func(session string) (string, error)
@@ -220,7 +221,7 @@ func (o *Orchestrator) endCycle() {
 // autoMergePRs merging or closing one — would otherwise leave a later step
 // looking at the pre-mutation snapshot. The concrete failure this guards
 // against (#794 review): reconcile auto-creates a PR via
-// tryCreatePRForPushedBranch and flips the session to pr_open, but autoMergePRs
+// reconcilePushedBranch and flips the session to pr_open, but autoMergePRs
 // reuses the cache populated before that PR existed, fails to find it, takes
 // the "no open PR — assuming merged/closed" branch and marks the session done —
 // orphaning a live PR in the same cycle. Invalidating after every open-PR-set
@@ -302,6 +303,9 @@ func (o *Orchestrator) hasMergedPRForIssue(issueNumber int) (bool, error) {
 	if o.hasMergedPRForIssueFn != nil {
 		return o.hasMergedPRForIssueFn(issueNumber)
 	}
+	if o.gh == nil {
+		return false, fmt.Errorf("no github client configured for merged-pr check")
+	}
 	return o.gh.HasMergedPRForIssue(issueNumber)
 }
 
@@ -309,7 +313,20 @@ func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
 	if o.isPRMergedFn != nil {
 		return o.isPRMergedFn(prNumber)
 	}
+	if o.gh == nil {
+		return false, fmt.Errorf("no github client configured for pr-merged check")
+	}
 	return o.gh.IsPRMerged(prNumber)
+}
+
+func (o *Orchestrator) mergedPRForBranch(branch string) (int, error) {
+	if o.mergedPRForBranchFn != nil {
+		return o.mergedPRForBranchFn(branch)
+	}
+	if o.gh == nil {
+		return 0, fmt.Errorf("no github client configured for merged-branch check")
+	}
+	return o.gh.MergedPRNumberForBranch(branch)
 }
 
 // SetBinaryVersion records the running binary's resolved version (e.g.
@@ -1531,6 +1548,14 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			continue
 		}
 
+		// #800: the saved retry state can outlive the work it was scheduled
+		// for — the PR may have merged or the issue closed while the backoff
+		// ran. Re-check GitHub before consuming a slot; a stale session
+		// settles instead of respawning a zombie worker.
+		if o.retireStaleRetry(slotName, sess) {
+			continue
+		}
+
 		// Backoff elapsed — respawn the worker
 		log.Printf("[orch] worker %s backoff elapsed, respawning (retry %d)", slotName, sess.RetryCount)
 		sess.NextRetryAt = nil
@@ -1612,6 +1637,60 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount)
 		respawned++
 	}
+}
+
+// retireStaleRetry re-checks issue and PR state on GitHub for a dead session
+// whose retry backoff has elapsed (#800). Merge of the session's PR — the one
+// still recorded on the session or the one the CI-retry path closed and an
+// operator later reopened and merged — or closing of its issue invalidates
+// the pending retry: the work is settled, and respawning would burn a worker
+// run on a closed issue and let reconcile auto-create a junk PR from the
+// already-squash-merged branch. Stale sessions transition to code_landed
+// (merged PR, so the normal post-merge reconcile converges them to done) or
+// done (issue closed) instead of respawning. Best-effort: a GitHub read
+// error fails open — the retry proceeds — so a transient API hiccup cannot
+// strand a legitimate retry.
+func (o *Orchestrator) retireStaleRetry(slotName string, sess *state.Session) bool {
+	for _, prNumber := range []int{sess.PRNumber, sess.LastClosedPRNumber} {
+		if prNumber <= 0 {
+			continue
+		}
+		merged, err := o.isPRMerged(prNumber)
+		if err != nil {
+			log.Printf("[orch] retry staleness check for %s could not read PR #%d: %v — proceeding with retry", slotName, prNumber, err)
+			continue
+		}
+		if !merged {
+			continue
+		}
+		log.Printf("[orch] worker %s retry invalidated: PR #%d for issue #%d is merged — marking code_landed instead of respawning", slotName, prNumber, sess.IssueNumber)
+		sess.NextRetryAt = nil
+		o.markCodeLanded(sess, prNumber)
+		if o.notifier != nil {
+			o.notifier.Sendf("🧟 maestro: cancelled scheduled retry for issue #%d (%s) — PR #%d already merged", sess.IssueNumber, sess.IssueTitle, prNumber)
+		}
+		return true
+	}
+
+	closed, err := o.isIssueClosed(sess.IssueNumber)
+	if err != nil {
+		log.Printf("[orch] retry staleness check for %s could not read issue #%d: %v — proceeding with retry", slotName, sess.IssueNumber, err)
+		return false
+	}
+	if !closed {
+		return false
+	}
+	log.Printf("[orch] worker %s retry invalidated: issue #%d is closed — marking done instead of respawning", slotName, sess.IssueNumber)
+	sess.NextRetryAt = nil
+	sess.Status = state.StatusDone
+	now := time.Now().UTC()
+	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
+	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+	if o.notifier != nil {
+		o.notifier.Sendf("🧟 maestro: cancelled scheduled retry for issue #%d (%s) — issue already closed", sess.IssueNumber, sess.IssueTitle)
+	}
+	return true
 }
 
 // LoadPromptBase reads the worker prompt template from config or a provided path.
@@ -2265,9 +2344,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			continue
 		}
 		if prErr == nil {
-			if prNumber, ok := o.tryCreatePRForPushedBranch(slotName, sess); ok {
-				log.Printf("[orch] reconcile: %s running->pr_open (auto-created PR #%d for pushed branch %q; %s)",
-					slotName, prNumber, sess.Branch, strings.Join(reasons, ", "))
+			if o.reconcilePushedBranch(slotName, sess, strings.Join(reasons, ", ")) {
 				reconciled = true
 				continue
 			}
@@ -2457,18 +2534,74 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 	return reconciled
 }
 
-func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.Session) (int, bool) {
+// reconcilePushedBranch handles a stale running session whose worker died
+// after pushing its branch. Outcomes, in order (#800):
+//
+//   - branch already merged via an earlier PR → settle the session as
+//     code_landed. Falling through to dead instead would strand it outside
+//     IssueInProgress: maestro PRs carry no auto-closing keywords, so the
+//     issue is still open and the HasMergedPRForIssue dispatch guard cannot
+//     see a branch-only merge — the next cycle would spawn a fresh worker
+//     for already-landed work.
+//   - issue closed → settle as done (same transition retireStaleRetry uses).
+//   - otherwise → auto-create a PR and flip the session to pr_open, rescuing
+//     the worker's pushed result.
+//
+// Returns true when the session was transitioned; false leaves the caller's
+// dead-marking fall-through in charge. GitHub read errors on the staleness
+// checks fail open — the auto-create rescue proceeds — so a transient API
+// hiccup cannot disable the rescue path.
+func (o *Orchestrator) reconcilePushedBranch(slotName string, sess *state.Session, reasons string) bool {
 	branch := strings.TrimSpace(sess.Branch)
 	if branch == "" {
-		return 0, false
+		return false
 	}
 	exists, err := o.remoteBranchExists(branch)
 	if err != nil {
 		log.Printf("[orch] reconcile: could not check remote branch %q for %s: %v", branch, slotName, err)
-		return 0, false
+		return false
 	}
 	if !exists {
-		return 0, false
+		return false
+	}
+
+	// #800: a branch can outlive its squash-merged PR (an operator merge
+	// without branch deletion leaves the tip un-ancestored but the content
+	// landed). Auto-creating a PR from it produces a junk PR that only exists
+	// to be closed.
+	if mergedPR, mergeErr := o.mergedPRForBranch(branch); mergeErr != nil {
+		log.Printf("[orch] reconcile: could not check merged PRs for branch %q (%s): %v — proceeding with auto-create", branch, slotName, mergeErr)
+	} else if mergedPR > 0 {
+		o.updateTokensUsedFromWorkerLog(slotName, sess)
+		sess.PID = 0
+		sess.TmuxSession = ""
+		o.markCodeLanded(sess, mergedPR)
+		log.Printf("[orch] reconcile: %s running->code_landed (branch %q already merged via PR #%d; %s)",
+			slotName, branch, mergedPR, reasons)
+		if o.notifier != nil {
+			o.notifier.Sendf("🧟 maestro: worker %s (issue #%d: %s) exited, but branch %s already merged via PR #%d — settled as code_landed",
+				slotName, sess.IssueNumber, sess.IssueTitle, branch, mergedPR)
+		}
+		return true
+	}
+	if closed, closedErr := o.isIssueClosed(sess.IssueNumber); closedErr != nil {
+		log.Printf("[orch] reconcile: could not check issue #%d state for %s: %v — proceeding with auto-create", sess.IssueNumber, slotName, closedErr)
+	} else if closed {
+		o.updateTokensUsedFromWorkerLog(slotName, sess)
+		sess.PID = 0
+		sess.TmuxSession = ""
+		sess.Status = state.StatusDone
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+		log.Printf("[orch] reconcile: %s running->done (issue #%d closed; not auto-creating a PR; %s)",
+			slotName, sess.IssueNumber, reasons)
+		if o.notifier != nil {
+			o.notifier.Sendf("🧟 maestro: worker %s (issue #%d: %s) exited with the issue already closed — settled as done",
+				slotName, sess.IssueNumber, sess.IssueTitle)
+		}
+		return true
 	}
 
 	title := autoCreatedPRTitle(sess)
@@ -2477,7 +2610,7 @@ func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.S
 	prNumber, err := o.createPR(title, body, "main", branch)
 	if err != nil {
 		log.Printf("[orch] reconcile: could not auto-create PR for %s branch %q: %v", slotName, branch, err)
-		return 0, false
+		return false
 	}
 
 	o.updateTokensUsedFromWorkerLog(slotName, sess)
@@ -2489,11 +2622,13 @@ func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.S
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
 	state.MarkPROpened(sess, now)
+	log.Printf("[orch] reconcile: %s running->pr_open (auto-created PR #%d for pushed branch %q; %s)",
+		slotName, prNumber, branch, reasons)
 	if o.notifier != nil {
 		o.notifier.Sendf("🔀 maestro: worker %s pushed branch %s and exited before opening a PR; auto-created PR #%d for issue #%d (%s)",
 			slotName, branch, prNumber, sess.IssueNumber, sess.IssueTitle)
 	}
-	return prNumber, true
+	return true
 }
 
 func autoCreatedPRTitle(sess *state.Session) string {
@@ -3644,6 +3779,7 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 			return
 		}
 		log.Printf("[orch] closed PR #%d due to review feedback (worktree unavailable)", pr.Number)
+		sess.LastClosedPRNumber = pr.Number
 		sess.PRNumber = 0
 	} else {
 		log.Printf("[orch] keeping PR #%d open and respawning %s in place to address review feedback", pr.Number, slotName)
@@ -3731,12 +3867,15 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		sess.PreviousAttemptFeedbackKind = ""
 	}
 
-	// Schedule retry with exponential backoff
+	// Schedule retry with exponential backoff. Remember which PR this retry
+	// closed (#800): if an operator reopens and merges it while the backoff
+	// runs, the pre-respawn staleness check cancels the retry.
 	sess.RetryCount++
 	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 	sess.NextRetryAt = &retryAt
 	sess.Status = state.StatusDead
+	sess.LastClosedPRNumber = pr.Number
 	sess.PRNumber = 0
 	now := time.Now().UTC()
 	sess.FinishedAt = &now

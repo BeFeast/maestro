@@ -90,7 +90,7 @@ func TestRunOnce_AutoCreatedPRNotOrphaned(t *testing.T) {
 
 	// A running session whose worker process + tmux are gone but whose branch
 	// was already pushed, with no PR recorded. reconcileRunningSessions takes the
-	// recovery path and auto-creates the PR via tryCreatePRForPushedBranch.
+	// recovery path and auto-creates the PR via reconcilePushedBranch.
 	s := state.NewState()
 	s.Sessions["slot-0"] = &state.Session{
 		IssueNumber: 200,

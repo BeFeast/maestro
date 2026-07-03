@@ -1309,6 +1309,33 @@ func (c *Client) HasMergedPRForIssue(issueNumber int) (bool, error) {
 	return false, nil
 }
 
+// MergedPRNumberForBranch returns the number of a merged PR that used the
+// given branch as its head, or 0 if none exists. After a squash-merge the
+// branch tip is not an ancestor of main, so ancestry cannot prove the content
+// landed — but a merged PR with this head branch can. The reconcile
+// pushed-branch path consults this so a branch that outlived its
+// squash-merged PR (e.g. an operator merge without branch deletion) settles
+// the session as code_landed instead of spawning a duplicate junk PR (#800).
+func (c *Client) MergedPRNumberForBranch(branch string) (int, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return 0, nil
+	}
+	prs, err := c.listClosedPRs()
+	if err != nil {
+		return 0, err
+	}
+	for _, pr := range prs {
+		// listClosedPRs only returns closed PRs, but require the closed state
+		// on the parsed record too (as IsPRMerged does) so the merged verdict
+		// never depends on the list source.
+		if strings.EqualFold(pr.State, "closed") && pr.MergedAt != "" && pr.HeadRefName == branch {
+			return pr.Number, nil
+		}
+	}
+	return 0, nil
+}
+
 // PRCIStatus returns "success", "failure", "pending", or "unknown"
 func (c *Client) PRCIStatus(prNumber int) (string, error) {
 	sha, err := c.pullHeadSHA(prNumber)
