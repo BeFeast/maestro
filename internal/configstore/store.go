@@ -124,6 +124,14 @@ func (s *Store) ImportDir(ctx context.Context, dir string) error {
 	return tx.Commit()
 }
 
+// SourcePathPrefix marks a config's SourcePath as a config-store row
+// reference ("store:<name>") rather than a file path. Rows created through
+// the write API (UpsertProject) have no originating file, and an empty
+// SourcePath makes ResolvePath fall back to a literal "maestro.yaml" — which
+// the fleet snapshot then reports as a vestigial config_path for a file that
+// does not exist post-#761 (#801).
+const SourcePathPrefix = "store:"
+
 func (s *Store) Load(ctx context.Context, name string) (*config.Config, error) {
 	data, sourcePath, err := s.exportProjectYAML(ctx, name)
 	if err != nil {
@@ -132,6 +140,12 @@ func (s *Store) Load(ctx context.Context, name string) (*config.Config, error) {
 	cfg, err := config.Parse(data)
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(sourcePath) == "" {
+		// No originating file (write-API row): report the store row itself so
+		// path consumers surface "store:<name>" instead of inventing a
+		// maestro.yaml that does not exist (#801).
+		sourcePath = SourcePathPrefix + name
 	}
 	cfg.SourcePath = sourcePath
 	return cfg, nil

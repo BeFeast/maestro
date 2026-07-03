@@ -30,6 +30,20 @@ func TestUniqueFleetName(t *testing.T) {
 	}
 }
 
+// A store-backed config carries a "store:<name>" SourcePath (configstore.Load,
+// #801); the fleet project must surface it verbatim as ConfigPath so the
+// snapshot's config_path reports the store row instead of a vestigial
+// maestro.yaml that does not exist post-#761.
+func TestNewFleetProjectWithGitHubNamedStoreSourcePath(t *testing.T) {
+	proj := NewFleetProjectWithGitHubNamed("ok-player", &config.Config{
+		Repo:       "BeFeast/ok-player",
+		SourcePath: "store:befeast-ok-player",
+	})
+	if want := "store:befeast-ok-player"; proj.ConfigPath != want {
+		t.Fatalf("ConfigPath = %q, want %q", proj.ConfigPath, want)
+	}
+}
+
 // FleetProjectsFromConfigs must produce one project per config, each with a
 // unique Name even when two configs share a repo basename.
 func TestFleetProjectsFromConfigsUniqueNames(t *testing.T) {

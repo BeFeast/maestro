@@ -69,6 +69,31 @@ func TestUpsertProjectLoadAllRoundTrip(t *testing.T) {
 	}
 }
 
+// A write-API row has no originating file (source_path = ”). Load must stamp
+// the store row reference on SourcePath — not leave it empty — otherwise
+// ResolvePath falls back to a literal "maestro.yaml" and the fleet snapshot
+// reports a vestigial config_path for a file that does not exist post-#761
+// (#801).
+func TestLoadStampsStoreRowSourcePath(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	if err := store.UpsertProject(ctx, "befeast-ok-player", writeTestYAML); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	cfg, err := store.Load(ctx, "befeast-ok-player")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	const want = "store:befeast-ok-player"
+	if cfg.SourcePath != want {
+		t.Fatalf("SourcePath = %q, want %q", cfg.SourcePath, want)
+	}
+	if got := cfg.ResolvePath(); got != want {
+		t.Fatalf("ResolvePath() = %q, want %q", got, want)
+	}
+}
+
 func TestUpsertProjectOverwrites(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
