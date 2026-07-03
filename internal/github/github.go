@@ -1326,7 +1326,10 @@ func (c *Client) MergedPRNumberForBranch(branch string) (int, error) {
 		return 0, err
 	}
 	for _, pr := range prs {
-		if pr.MergedAt != "" && pr.HeadRefName == branch {
+		// listClosedPRs only returns closed PRs, but require the closed state
+		// on the parsed record too (as IsPRMerged does) so the merged verdict
+		// never depends on the list source.
+		if strings.EqualFold(pr.State, "closed") && pr.MergedAt != "" && pr.HeadRefName == branch {
 			return pr.Number, nil
 		}
 	}
