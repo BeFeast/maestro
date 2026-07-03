@@ -77,6 +77,20 @@ var rateLimitResetRe = regexp.MustCompile(`(?i)(?:try again (?:at|after)|\breset
 // Claude signature states "(UTC)".
 var trailingTZParenRe = regexp.MustCompile(`\s*\([^)]*\)\s*$`)
 
+// stripResetDecorations removes the sentence punctuation and parenthesised
+// timezone a provider may append to a "<when>" reset capture, in EITHER order:
+// "9am (UTC)", "9am (UTC).", "8:13 PM.", and "9am. (UTC)" all reduce to the
+// bare timestamp. The trailing period is trimmed FIRST so a "(UTC)." tail
+// (period after the closing paren, as a sentence-terminated Claude reset
+// emits) does not defeat trailingTZParenRe's "$" anchor and leave an
+// unparseable "9am (UTC)"; the strip and trim are then repeated so residual
+// punctuation exposed by removing the paren is dropped too (#808 review).
+func stripResetDecorations(raw string) string {
+	cleaned := strings.TrimRight(strings.TrimSpace(raw), ". ")
+	cleaned = trailingTZParenRe.ReplaceAllString(cleaned, "")
+	return strings.TrimRight(strings.TrimSpace(cleaned), ". ")
+}
+
 // resetLayouts are the timestamp layouts ParseRateLimitReset attempts, in
 // order, against the cleaned "try again at <when>" capture. The Codex signature
 // uses a "May 30th, 2026 8:13 PM" shape; ordinal suffixes (st/nd/rd/th) are
@@ -272,11 +286,10 @@ func parseTimeOnlyReset(raw string, now time.Time) (time.Time, bool) {
 	if now.IsZero() {
 		return time.Time{}, false
 	}
-	// Drop a trailing parenthesised timezone ("9am (UTC)" -> "9am") before the
-	// sentence-period trim so the "(UTC)" the Claude signature appends does not
-	// defeat the clock layouts (#808).
-	cleaned := trailingTZParenRe.ReplaceAllString(strings.TrimSpace(raw), "")
-	cleaned = strings.TrimRight(strings.TrimSpace(cleaned), ". ")
+	// Drop the trailing sentence period and parenthesised timezone
+	// ("9am (UTC)." -> "9am") so the "(UTC)" the Claude signature appends — and
+	// any period after it — does not defeat the clock layouts (#808).
+	cleaned := stripResetDecorations(raw)
 	if cleaned == "" {
 		return time.Time{}, false
 	}
@@ -302,10 +315,9 @@ func parseTimeOnlyReset(raw string, now time.Time) (time.Time, bool) {
 // from a "try again at <when>" hint. Day ordinals are stripped and whitespace
 // is collapsed before trying each layout in resetLayouts.
 func parseResetTimestamp(raw string) (time.Time, bool) {
-	// Drop a trailing parenthesised timezone, then a trailing sentence period
-	// and surrounding whitespace ("... 8:13 PM (UTC)." -> "... 8:13 PM").
-	cleaned := trailingTZParenRe.ReplaceAllString(strings.TrimSpace(raw), "")
-	cleaned = strings.TrimRight(strings.TrimSpace(cleaned), ". ")
+	// Drop the trailing sentence period and parenthesised timezone in either
+	// order ("... 8:13 PM (UTC)." -> "... 8:13 PM").
+	cleaned := stripResetDecorations(raw)
 	if cleaned == "" {
 		return time.Time{}, false
 	}

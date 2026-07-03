@@ -466,6 +466,16 @@ func TestParseRateLimitReset_Variants(t *testing.T) {
 			ok:    true,
 		},
 		{
+			// Parenthesised timezone followed by a sentence period: the
+			// period-after-")" tail must be trimmed before the "$"-anchored
+			// timezone strip runs, or the date-bearing layouts see a trailing
+			// "(UTC)" and reject the hint (#808 review).
+			name:  "parenthesised timezone with trailing period",
+			input: "try again at May 30th, 2026 8:13 PM (UTC).",
+			want:  time.Date(2026, time.May, 30, 20, 13, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
 			name:  "no reset hint",
 			input: "You've hit your usage limit.",
 			ok:    false,
@@ -532,6 +542,25 @@ func TestParseRateLimitResetAt_ClaudeResetsTZ(t *testing.T) {
 		{
 			name:  "minute-bearing pm resolves same day",
 			input: claudeExtraUsageSignature,
+			now:   time.Date(2026, time.July, 3, 9, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 16, 10, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			// Sentence-terminated reset: the period lands AFTER the "(UTC)"
+			// paren, so the "$"-anchored timezone strip only fires once the
+			// period is trimmed first. Regression for the trim-order defect
+			// that left an unparseable "9am (UTC)" and downgraded an otherwise
+			// high-confidence reset to low (#808 review).
+			name:  "hour-only am with trailing sentence period",
+			input: "You've hit your session limit · resets 9am (UTC).",
+			now:   time.Date(2026, time.July, 3, 6, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 9, 0, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "minute-bearing pm with trailing sentence period",
+			input: "You're out of extra usage · resets 4:10pm (UTC).",
 			now:   time.Date(2026, time.July, 3, 9, 0, 0, 0, time.UTC),
 			want:  time.Date(2026, time.July, 3, 16, 10, 0, 0, time.UTC),
 			ok:    true,
