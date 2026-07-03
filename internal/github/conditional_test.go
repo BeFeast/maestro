@@ -15,6 +15,9 @@ func withGHRunner(t *testing.T, fn func(args []string) ([]byte, error)) *[][]str
 	origRunner := ghAPIRunner
 	origSleep := ghAPISleep
 	origJitter := ghAPIJitterFrac
+	// The primary-limit pause gate (#812) is process-wide; clear it before and
+	// after so a gate armed by another test cannot short-circuit this runner.
+	resetPrimaryLimitForTest()
 	var calls [][]string
 	ghAPIRunner = func(args ...string) ([]byte, error) {
 		calls = append(calls, args)
@@ -26,6 +29,7 @@ func withGHRunner(t *testing.T, fn func(args []string) ([]byte, error)) *[][]str
 		ghAPIRunner = origRunner
 		ghAPISleep = origSleep
 		ghAPIJitterFrac = origJitter
+		resetPrimaryLimitForTest()
 	})
 	return &calls
 }
