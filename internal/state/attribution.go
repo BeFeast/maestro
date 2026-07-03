@@ -8,9 +8,11 @@ import (
 
 const AttributionTrailerKey = "Maestro-Backend"
 
-// FormatAttributionTrailer renders the durable git/PR trailer for a session's
-// backend timeline. It uses relative ranges from the first segment so the line
-// remains stable and queryable after the live state file is gone.
+// FormatAttributionTrailer renders the durable git commit trailer for a
+// session's backend timeline. It uses relative ranges from the first segment
+// so the line remains stable and queryable after the live state file is gone.
+// The trailer goes on commit messages only — never on PR bodies, which land on
+// the target repo and may be public (#799).
 func FormatAttributionTrailer(attribution []BackendAttribution, now time.Time) string {
 	timeline := FormatAttributionTimeline(attribution, now)
 	if timeline == "" {

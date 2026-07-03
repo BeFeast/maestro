@@ -947,7 +947,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 4. Commit your changes with a clear message.
 5. Before committing or opening a PR, check for accidental secrets and generated artifacts. Do NOT commit or mention API keys, bearer tokens, oauth tokens, bot tokens, env values, raw config dumps, or diagnostic logs. Do NOT commit temp/debug artifacts such as tmp/, _tmp/, *.log, *.logs, *.test, or *.test.json unless the issue explicitly requires them.
 6. Keep the PR body minimal and safe. Use: gh pr create --repo %s --title "%s" --body "Refs #%d". Never use closing keywords such as Closes/Fixes/Resolves in PR bodies for Maestro-managed work. Do NOT paste logs, doctor output, env dumps, or secret-bearing snippets into the PR body or comments.
-7. Preserve any Maestro-Backend: attribution trailer that Maestro adds to commit messages or PR bodies.
+7. Preserve any Maestro-Backend: attribution trailer that Maestro adds to commit messages. Do NOT add backend/model attribution, pids, tmux session names, or host paths to PR bodies.
 8. After creating the PR, you are done. Do NOT merge it yourself.
 
 Important: Always run cargo fmt --all before committing if this is a Rust project.
