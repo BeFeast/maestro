@@ -411,6 +411,123 @@ func TestConsumeSelfDeployResult_NoFile(t *testing.T) {
 	}
 }
 
+// #807: a trigger that never produced a result within the RuntimeMaxSec backstop
+// — the detached deploy unit died silently — surfaces as a supervisor finding
+// exactly once (the resolved watermark advances so it does not re-fire every
+// cycle), and a later merge re-triggers.
+func TestMaybeSurfaceStaleSelfDeploy_Fires(t *testing.T) {
+	stateDir := t.TempDir()
+	// A trigger fired 90 minutes ago (past the default 2×30m backstop) with no
+	// result file — the silent-loss case.
+	if err := selfdeploy.RecordTrigger(stateDir, 806, time.Now().UTC().Add(-90*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:       "owner/repo",
+			StateDir:   stateDir,
+			SelfDeploy: config.SelfDeployConfig{Enabled: true},
+		},
+		notifier: &notify.Notifier{},
+	}
+	s := &state.State{}
+
+	if !o.maybeSurfaceStaleSelfDeploy(s) {
+		t.Fatal("maybeSurfaceStaleSelfDeploy = false, want true (stale trigger)")
+	}
+	if len(s.SupervisorDecisions) != 1 {
+		t.Fatalf("decisions recorded = %d, want 1", len(s.SupervisorDecisions))
+	}
+	d := s.SupervisorDecisions[0]
+	if d.Status != "failed" {
+		t.Errorf("Status = %q, want failed", d.Status)
+	}
+	if !strings.Contains(d.Summary, "no result") || !strings.Contains(d.Summary, "PR #806") {
+		t.Errorf("Summary = %q", d.Summary)
+	}
+
+	// Second cycle: the watermark advanced, so the same dead trigger must not
+	// re-fire (no finding storm).
+	if o.maybeSurfaceStaleSelfDeploy(s) {
+		t.Fatal("stale trigger re-fired on the next cycle — watermark did not advance")
+	}
+	if len(s.SupervisorDecisions) != 1 {
+		t.Errorf("decisions after second cycle = %d, want 1", len(s.SupervisorDecisions))
+	}
+}
+
+// Flag default OFF: the watchdog is inert even with an ancient trigger marker.
+func TestMaybeSurfaceStaleSelfDeploy_DefaultOff(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := selfdeploy.RecordTrigger(stateDir, 806, time.Now().UTC().Add(-90*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", StateDir: stateDir},
+		notifier: &notify.Notifier{},
+	}
+	s := &state.State{}
+	if o.maybeSurfaceStaleSelfDeploy(s) || len(s.SupervisorDecisions) != 0 {
+		t.Fatalf("flag off: fired watchdog (decisions=%d)", len(s.SupervisorDecisions))
+	}
+}
+
+// A recent trigger (a deploy still legitimately in flight — build + drain +
+// verify can take the full budget) is never mistaken for a silent loss.
+func TestMaybeSurfaceStaleSelfDeploy_InFlightNotStale(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := selfdeploy.RecordTrigger(stateDir, 806, time.Now().UTC().Add(-5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:       "owner/repo",
+			StateDir:   stateDir,
+			SelfDeploy: config.SelfDeployConfig{Enabled: true},
+		},
+		notifier: &notify.Notifier{},
+	}
+	s := &state.State{}
+	if o.maybeSurfaceStaleSelfDeploy(s) || len(s.SupervisorDecisions) != 0 {
+		t.Fatalf("in-flight deploy flagged as stale (decisions=%d)", len(s.SupervisorDecisions))
+	}
+}
+
+// A completed deploy consumed via consumeSelfDeployResult advances the resolved
+// watermark, so the watchdog does NOT then false-flag the surviving trigger
+// marker as a silent loss — even when the trigger is old. This mirrors the real
+// cycle order (consume first, then the watchdog).
+func TestConsumeThenStale_NoFalsePositive(t *testing.T) {
+	stateDir := t.TempDir()
+	// An old trigger, plus its (successful) result waiting to be consumed.
+	if err := selfdeploy.RecordTrigger(stateDir, 806, time.Now().UTC().Add(-90*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(selfdeploy.ResultPath(stateDir), []byte(`{"status":"deployed","version":"1.4.2+gabc1234","pr":806}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:       "owner/repo",
+			StateDir:   stateDir,
+			SelfDeploy: config.SelfDeployConfig{Enabled: true},
+		},
+		notifier: &notify.Notifier{},
+	}
+	s := &state.State{}
+
+	if !o.consumeSelfDeployResult(s) {
+		t.Fatal("consumeSelfDeployResult = false, want true")
+	}
+	// The watchdog must see the consume as a resolution, not a silent loss.
+	if o.maybeSurfaceStaleSelfDeploy(s) {
+		t.Fatal("watchdog flagged a just-consumed deploy as a stale trigger")
+	}
+	if len(s.SupervisorDecisions) != 1 {
+		t.Fatalf("decisions = %d, want 1 (only the deploy finding)", len(s.SupervisorDecisions))
+	}
+}
+
 // A malformed result file is cleared (not re-logged forever) and records nothing.
 func TestConsumeSelfDeployResult_Malformed(t *testing.T) {
 	stateDir := t.TempDir()

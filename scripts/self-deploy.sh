@@ -8,7 +8,12 @@
 # system scope. Steps:
 #
 #   1. build from merged origin/main, version-stamped per #682
-#      (-X main.version=<VERSION>+g<shortsha>),
+#      (-X main.version=<VERSION>+g<shortsha>). The build passes
+#      -buildvcs=false (#807): the transient unit builds from a detached git
+#      worktree under a different uid, where Go's default -buildvcs=auto runs
+#      `git status`, hits git's dubious-ownership guard, and exits 128 —
+#      failing the whole build (merges silently never shipped). The version is
+#      stamped via -ldflags, so VCS stamping is redundant here anyway,
 #   2. install atomically, keeping the previous binary as <bin>.prev,
 #   3. restart the maestro units — the units' normal stop path runs, so
 #      existing drain semantics are honored,
@@ -334,7 +339,13 @@ VERSION=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$BUILD_
 STAMP="${VERSION}+g${SHORT_SHA}"
 
 log "building maestro v$STAMP from $SHA"
-(cd "$BUILD_DIR" && go build -trimpath -ldflags "-s -w -X main.version=$STAMP" -o "$BUILD_ROOT/maestro" ./cmd/maestro/)
+# -buildvcs=false (#807): this build runs inside a detached git worktree owned by
+# the deploy uid, where Go's default -buildvcs=auto shells out to `git status`,
+# trips git's dubious-ownership guard, and exits 128 — aborting the build so the
+# merge silently never ships. The version is already stamped via -ldflags below,
+# so VCS stamping adds nothing; disabling it makes the build independent of git
+# VCS status in the transient unit. Keep -trimpath and the -X main.version stamp.
+(cd "$BUILD_DIR" && go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=$STAMP" -o "$BUILD_ROOT/maestro" ./cmd/maestro/)
 
 BUILT_VERSION=$("$BUILD_ROOT/maestro" version)
 [[ "$BUILT_VERSION" == *"v$STAMP"* ]] || fail "built binary reports '$BUILT_VERSION', want 'maestro v$STAMP'"

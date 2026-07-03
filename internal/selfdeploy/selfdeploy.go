@@ -62,6 +62,16 @@ const resultFileName = "self-deploy-result.json"
 // orchestrator unit restarting.
 const triggerMarkerName = "self-deploy-last-trigger.json"
 
+// resolvedMarkerName records when a self-deploy result was last consumed, so the
+// stale-trigger watchdog (#807) can tell a trigger that never produced a result
+// (the transient unit died — e.g. SIGKILL at the RuntimeMaxSec backstop, or a
+// crash before the script's own EXIT trap could write one) apart from a trigger
+// whose result was already surfaced and cleared. Without this watermark a
+// completed deploy — whose trigger marker legitimately outlives the consumed
+// result file — would look identical to a silently-lost deploy once the marker
+// aged past the timeout.
+const resolvedMarkerName = "self-deploy-last-resolved.json"
+
 // Result is the JSON contract between scripts/self-deploy.sh and the
 // orchestrator.
 type Result struct {
@@ -154,6 +164,95 @@ func LastTrigger(stateDir string) (when time.Time, pr int, ok bool) {
 		return time.Time{}, 0, false
 	}
 	return m.TriggeredAt, m.PR, true
+}
+
+// resolvedMarker is the JSON persisted by RecordResolved / read by LastResolved.
+type resolvedMarker struct {
+	ResolvedAt time.Time `json:"resolved_at"`
+}
+
+// resolvedMarkerPath returns the path of the last-resolved watermark inside
+// stateDir.
+func resolvedMarkerPath(stateDir string) string {
+	return filepath.Join(stateDir, resolvedMarkerName)
+}
+
+// RecordResolved advances the resolved watermark to `when` — the moment a deploy
+// outcome was accounted for, either because its result file was consumed or
+// because the stale-trigger watchdog surfaced its silent loss (#807). A trigger
+// whose timestamp is at or before this watermark has already been resolved, so
+// the watchdog will not (re-)flag it. A blank stateDir is a no-op, matching
+// RecordTrigger.
+func RecordResolved(stateDir string, when time.Time) error {
+	if strings.TrimSpace(stateDir) == "" {
+		return nil
+	}
+	data, err := json.Marshal(resolvedMarker{ResolvedAt: when.UTC()})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return err
+	}
+	tmp := resolvedMarkerPath(stateDir) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, resolvedMarkerPath(stateDir))
+}
+
+// LastResolved reports when a self-deploy outcome was last accounted for. A
+// missing or malformed watermark reports ok=false (treated as "nothing resolved
+// yet" — fail toward flagging so a genuinely-lost deploy is never hidden).
+func LastResolved(stateDir string) (when time.Time, ok bool) {
+	if strings.TrimSpace(stateDir) == "" {
+		return time.Time{}, false
+	}
+	data, err := os.ReadFile(resolvedMarkerPath(stateDir))
+	if err != nil {
+		return time.Time{}, false
+	}
+	var m resolvedMarker
+	if err := json.Unmarshal(data, &m); err != nil || m.ResolvedAt.IsZero() {
+		return time.Time{}, false
+	}
+	return m.ResolvedAt, true
+}
+
+// StaleTrigger reports a self-deploy trigger that fired but produced no result
+// within `timeout` (#807): the detached transient unit died without writing a
+// result file — the silent-no-op class this whole change targets (a merge that
+// never shipped and never surfaced). It returns the triggering PR, the trigger's
+// age, and stale=true only when ALL hold:
+//
+//   - a trigger marker exists in stateDir;
+//   - no result file is present (a present result is consumed on this same cycle,
+//     so it is not a silent loss);
+//   - the trigger is newer than the resolved watermark (its outcome has not
+//     already been accounted for — this is what keeps a completed-and-cleared
+//     deploy, whose marker outlives its consumed result, from false-flagging);
+//   - the trigger is older than `timeout`, so an in-flight deploy (build + drain
+//   - verify can legitimately take the full budget) is never mistaken for a
+//     lost one. Callers pass a timeout at/above the unit's RuntimeMaxSec hard
+//     backstop, past which systemd has definitively killed the unit.
+func StaleTrigger(stateDir string, now time.Time, timeout time.Duration) (pr int, age time.Duration, stale bool) {
+	when, pr, ok := LastTrigger(stateDir)
+	if !ok {
+		return 0, 0, false
+	}
+	// A result waiting to be consumed is not a silent loss.
+	if res, err := ReadResult(stateDir); err == nil && res != nil {
+		return 0, 0, false
+	}
+	// Already accounted for (result consumed, or previously flagged).
+	if resolved, ok := LastResolved(stateDir); ok && !when.After(resolved) {
+		return 0, 0, false
+	}
+	age = now.Sub(when)
+	if age < timeout {
+		return 0, 0, false
+	}
+	return pr, age, true
 }
 
 // BuildSHA recovers the git commit SHA a maestro binary was built from out of
@@ -370,6 +469,35 @@ func TriggerFailedFinding(prNumber int, triggerErr error, project string, now ti
 		RecommendedAction: "the detached deploy unit never launched: check `sudo -n systemd-run`/`systemd-run --user` from the orchestrator's service context, " +
 			"then redeploy by hand (a later merge retries automatically)",
 		Reasons: []string{"trigger error: " + reason},
+	}
+}
+
+// StaleTriggerFinding converts a self-deploy trigger that never produced a
+// result within the timeout — the detached deploy unit died silently — into a
+// supervisor finding (#807). This is the loud backstop for the failure that
+// motivated the issue: a merge triggered a deploy, the transient unit exited
+// (or was SIGKILLed at RuntimeMaxSec) without writing a result, and the fleet
+// kept running the previous binary with nothing but a lone journald line to show
+// for it. The next merge/main-advance re-triggers automatically once the
+// resolved watermark advances past this trigger.
+func StaleTriggerFinding(prNumber int, age time.Duration, project string, now time.Time) state.SupervisorDecision {
+	prSuffix := ""
+	if prNumber > 0 {
+		prSuffix = fmt.Sprintf(" after PR #%d", prNumber)
+	}
+	return state.SupervisorDecision{
+		ID:               "self-deploy-stale-trigger-" + now.Format("20060102T150405.000000000Z"),
+		CreatedAt:        now,
+		Project:          project,
+		Risk:             "safe",
+		Confidence:       1.0,
+		RequiresApproval: false,
+		Status:           "failed",
+		Summary: fmt.Sprintf("self-deploy: no result %s after trigger%s — the deploy unit died without deploying; fleet still on the previous binary",
+			age.Round(time.Minute), prSuffix),
+		RecommendedAction: "the detached deploy unit produced no result file (likely killed at RuntimeMaxSec or crashed before writing one): " +
+			"inspect journalctl -u 'maestro-self-deploy-*', verify `maestro version` and units by hand, then redeploy (a later merge retries automatically)",
+		Reasons: []string{fmt.Sprintf("trigger age at detection: %s", age.Round(time.Second))},
 	}
 }
 
