@@ -1869,7 +1869,14 @@ func (o *Orchestrator) RunOnce() error {
 	// Step 0: Surface a finished self-deploy (#698) as a supervisor finding.
 	// Persist immediately: the result file is already consumed, so the
 	// finding must not depend on the rest of the cycle succeeding.
-	if o.consumeSelfDeployResult(s) {
+	// The stale-trigger watchdog (#807) runs in the same step, right after — it
+	// makes the OPPOSITE outcome loud: a trigger that produced no result because
+	// the detached deploy unit died silently. Both persist together.
+	changed := o.consumeSelfDeployResult(s)
+	if o.maybeSurfaceStaleSelfDeploy(s) {
+		changed = true
+	}
+	if changed {
 		if err := state.Save(o.cfg.StateDir, s); err != nil {
 			return fmt.Errorf("save state after self-deploy result: %w", err)
 		}
@@ -4653,7 +4660,16 @@ func (o *Orchestrator) consumeSelfDeployResult(s *state.State) bool {
 		return false
 	}
 
-	finding := selfdeploy.Finding(res, o.cfg.Repo, time.Now().UTC())
+	now := time.Now().UTC()
+	// Advance the resolved watermark so the stale-trigger watchdog (#807) does not
+	// later flag this now-consumed deploy: its trigger marker legitimately outlives
+	// the result file we just cleared, and without this watermark that surviving
+	// marker would eventually look like a trigger that never produced a result.
+	if err := selfdeploy.RecordResolved(o.cfg.StateDir, now); err != nil {
+		log.Printf("[orch] self-deploy resolved-watermark write failed: %v", err)
+	}
+
+	finding := selfdeploy.Finding(res, o.cfg.Repo, now)
 	s.RecordSupervisorDecision(finding, state.DefaultSupervisorDecisionLimit)
 	log.Printf("[orch] %s", finding.Summary)
 
@@ -4665,6 +4681,54 @@ func (o *Orchestrator) consumeSelfDeployResult(s *state.State) bool {
 	default:
 		o.notifier.Sendf("❌ maestro: self-deploy FAILED after PR #%d: %s — manual intervention may be needed", res.PR, res.Reason)
 	}
+	return true
+}
+
+// selfDeployStaleTimeout is how long after a trigger a missing result file is
+// treated as a dead deploy (#807). The transient unit's RuntimeMaxSec hard
+// backstop is 2× the deploy budget (see selfdeploy.TriggerCommand), past which
+// systemd has definitively killed the unit — so a trigger older than that with
+// no result cannot be an in-flight deploy. Match that backstop so the watchdog
+// never false-flags a slow-but-live deploy.
+func (o *Orchestrator) selfDeployStaleTimeout() time.Duration {
+	return time.Duration(o.cfg.SelfDeploy.EffectiveTimeoutMinutes()) * 2 * time.Minute
+}
+
+// maybeSurfaceStaleSelfDeploy is the watchdog for the silent-no-op failure that
+// motivated #807: a merge triggered a self-deploy, but the detached transient
+// unit died without ever writing a result file (SIGKILLed at RuntimeMaxSec, or
+// crashed before its own EXIT trap could run), so the fleet keeps running the
+// previous binary with nothing but a lone journald line to show for it. The
+// normal consume path only surfaces deploys that DID write a result; this makes
+// the absence itself loud.
+//
+// It runs right after consumeSelfDeployResult (which clears any present result
+// and advances the resolved watermark), so a trigger seen here with no result
+// and older than the RuntimeMaxSec backstop is a genuine silent loss. On
+// detection it records a supervisor finding and advances the resolved watermark
+// past the dead trigger, so the finding surfaces once (not every cycle) and a
+// later merge/main-advance re-triggers a fresh deploy. Returns true when it
+// recorded a finding (state changed). No-op unless self_deploy is enabled.
+func (o *Orchestrator) maybeSurfaceStaleSelfDeploy(s *state.State) bool {
+	if o == nil || o.cfg == nil || !o.cfg.SelfDeploy.Enabled || s == nil {
+		return false
+	}
+	now := time.Now().UTC()
+	pr, age, stale := selfdeploy.StaleTrigger(o.cfg.StateDir, now, o.selfDeployStaleTimeout())
+	if !stale {
+		return false
+	}
+	// Advance the resolved watermark past this dead trigger BEFORE recording, so
+	// even if the save below fails the watchdog does not re-flag the same trigger
+	// every cycle. Losing a single finding is the lesser failure mode; a later
+	// merge re-triggers regardless.
+	if err := selfdeploy.RecordResolved(o.cfg.StateDir, now); err != nil {
+		log.Printf("[orch] self-deploy stale-trigger watermark write failed: %v", err)
+	}
+	finding := selfdeploy.StaleTriggerFinding(pr, age, o.cfg.Repo, now)
+	s.RecordSupervisorDecision(finding, state.DefaultSupervisorDecisionLimit)
+	log.Printf("[orch] %s", finding.Summary)
+	o.notifier.Sendf("❗ maestro: self-deploy produced no result %s after triggering (PR #%d) — the deploy unit died; fleet still on the previous binary", age.Round(time.Minute), pr)
 	return true
 }
 

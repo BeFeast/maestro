@@ -35,8 +35,16 @@ The script then:
 
 1. **Builds from merged main** — fetches `origin/main`, checks it out into a
    temporary git worktree, reads the `VERSION` file, and builds with
-   `-ldflags "-X main.version=<VERSION>+g<shortsha>"` (version stamping per
-   #682, extended with the commit SHA as semver build metadata).
+   `-buildvcs=false -trimpath -ldflags "-X main.version=<VERSION>+g<shortsha>"`
+   (version stamping per #682, extended with the commit SHA as semver build
+   metadata). `-buildvcs=false` is load-bearing (#807): the build runs inside a
+   **detached git worktree** owned by the deploy uid, where Go's default
+   `-buildvcs=auto` shells out to `git status`, trips git's dubious-ownership
+   guard (`safe.directory`), and exits 128 — aborting the build so the merge
+   silently never shipped. On 2026-07-03 this stranded two merged fixes (#806,
+   #798) on the running fleet for ~5h. The version is already stamped via
+   `-ldflags`, so VCS stamping adds nothing here; disabling it makes the build
+   independent of git VCS status in the transient unit.
 2. **Installs atomically** — stages the new binary next to the target
    (`<bin>.next`), preserves the current binary as `<bin>.prev`, and renames
    into place (same-filesystem rename; safe under a running process). When
@@ -64,13 +72,32 @@ The script then:
 5. **Rolls back on failure** — restores `<bin>.prev`, restarts the units
    again, and records the rollback reason. `.prev` is kept either way for
    manual rollback.
-6. **Writes a result file** — `<state_dir>/self-deploy-result.json`. The next
-   orchestrator cycle (running the new binary, on success) consumes it,
-   records a **supervisor finding** (deployed version / rollback reason)
-   visible in Mission Control, and sends a notification. A `failed` /
+6. **Writes a result file** — `<state_dir>/self-deploy-result.json`, on **every**
+   terminal path (deployed, rolled_back, failed, and the "already at this
+   version" no-op). The script's `set -e` ERR trap plus an EXIT trap guarantee a
+   result even when a step bails unexpectedly, so a merge never silently produces
+   no record. The next orchestrator cycle (running the new binary, on success)
+   consumes it, records a **supervisor finding** (deployed version / rollback
+   reason) visible in Mission Control, and sends a notification. A `failed` /
    `rolled_back` result surfaces as an **error-tone operator state**
    ("Self-deploy failed") in `/api/v1/fleet`, so an undeployed-but-merged host
    is loud rather than buried in journald (#711).
+
+### Stale-trigger watchdog (#807)
+
+The one case the result file cannot cover is the detached deploy unit dying
+**before it can write one** — SIGKILLed at the `RuntimeMaxSec` backstop, or a
+crash before the EXIT trap runs. That leaves a recorded trigger
+(`self-deploy-last-trigger.json`) with no result and no restart — exactly the
+silent no-op that stranded #806/#798. The orchestrator watches for it: each
+cycle, if a trigger is older than the `RuntimeMaxSec` backstop (2×
+`timeout_minutes`, past which systemd has definitively killed the unit) and no
+result landed, it records a **`self-deploy: no result … — the deploy unit died`**
+supervisor finding and notifies, then advances a resolved watermark
+(`self-deploy-last-resolved.json`) so the alert fires once, not every cycle. The
+watermark also distinguishes a genuinely-lost deploy from a completed one whose
+trigger marker legitimately outlives its consumed result. A later merge (or
+observed main-advance) re-triggers a fresh deploy automatically.
 
 ## Enabling it
 
@@ -242,6 +269,8 @@ maestro version
 | Finding `self-deploy: failed … no .prev` | First deploy failed before any previous binary existed | Build + install manually once, re-merge |
 | Finding `rolled_back … health check timed out` | New binary started but never reported the stamped version | Check `journalctl --user -u maestro.service`; the regression is in the merged code |
 | No finding, no restart | Trigger failed (script missing, systemd-run unavailable) | Orchestrator log shows `self-deploy trigger failed …`; a ⚠️ notification is sent |
+| Deploy log `error obtaining VCS status: exit status 128` | `go build` in the detached worktree tripped git's dubious-ownership guard | Fixed in #807 — the build now passes `-buildvcs=false`; if you see this, the deploy script is pre-#807 (update it) |
+| Finding `self-deploy: no result … — the deploy unit died` | Trigger recorded but the transient unit never wrote a result (SIGKILLed at `RuntimeMaxSec`, or crashed pre-EXIT-trap) (#807) | Inspect `journalctl -u 'maestro-self-deploy-*'`; verify `maestro version` + units by hand; a later merge retries automatically |
 | Log `self-deploy debounced for PR #… < … window` | A deploy was triggered within `min_interval_minutes` of the previous one — expected on a burst of merges (#722) | None; the in-flight/previous deploy covers the merged code. Lower `min_interval_minutes` for faster successive deploys |
 | Deploy log `another self-deploy holds … — skipping` | A deploy started while one was already in flight; the single-flight lock skipped it (#722) | None; the in-flight deploy owns the rollout |
 | Units inactive after rollback | Rollback restart also failed | `systemctl --user start maestro.service` by hand; binary on disk is the previous version |
