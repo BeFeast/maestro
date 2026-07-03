@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -222,6 +223,53 @@ func TestListOpenPRsForCycle_NoMemoizationOutsideCycle(t *testing.T) {
 		t.Fatalf("post-invalidate calls fetched %d times total, want 5 (one re-fetch then memoized)", calls)
 	}
 	o.endCycle()
+}
+
+// TestListOpenPRsForCycle_SkipsWhilePrimaryRateLimited proves requirement #2 /
+// acceptance #2 at the orchestrator layer: when the shared core-REST bucket is
+// paused on a primary rate-limit exhaustion (#812), a cycle skips its dominant
+// open-PR poll entirely — never issuing the doomed fetch — and surfaces the
+// pause instant so the four cycle steps degrade to a no-op until reset.
+func TestListOpenPRsForCycle_SkipsWhilePrimaryRateLimited(t *testing.T) {
+	reset := time.Now().Add(30 * time.Minute)
+	calls := 0
+	o := &Orchestrator{
+		repo: "owner/repo",
+		listOpenPRsFn: func() ([]github.PR, error) {
+			calls++
+			return nil, nil
+		},
+		primaryRESTPausedFn: func() (bool, time.Time) { return true, reset },
+	}
+	o.beginCycle()
+	defer o.endCycle()
+
+	prs, err := o.listOpenPRsForCycle()
+	if err == nil {
+		t.Fatal("listOpenPRsForCycle err = nil, want a primary-rate-limit skip error")
+	}
+	var primaryErr *github.PrimaryRateLimitError
+	if !errors.As(err, &primaryErr) {
+		t.Fatalf("err = %v, want a *github.PrimaryRateLimitError", err)
+	}
+	if !primaryErr.ResetAt.Equal(reset) {
+		t.Fatalf("skip error ResetAt = %s, want %s", primaryErr.ResetAt, reset)
+	}
+	if prs != nil {
+		t.Fatalf("prs = %v, want nil while paused", prs)
+	}
+	if calls != 0 {
+		t.Fatalf("ListOpenPRs fired %d times while paused, want 0 (the doomed call must be skipped)", calls)
+	}
+
+	// The skip verdict is cached for the cycle: a second consumer reuses it
+	// without a fetch (still zero calls).
+	if _, err := o.listOpenPRsForCycle(); err == nil {
+		t.Fatal("second consumer err = nil, want the cached skip error")
+	}
+	if calls != 0 {
+		t.Fatalf("ListOpenPRs fired %d times, want 0 (skip verdict cached per cycle)", calls)
+	}
 }
 
 func TestComputeStartupJitter(t *testing.T) {

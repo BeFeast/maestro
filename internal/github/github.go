@@ -234,6 +234,16 @@ var ghAPIJitterFrac = rand.Float64
 
 var ghRetryAfterRe = regexp.MustCompile(`(?i)retry-after:\s*(\d+)`)
 
+// X-RateLimit-* headers appear in a `gh api --include` exchange (the shape the
+// conditional/ETag layer already uses for polling reads). A primary (hourly)
+// exhaustion answers X-RateLimit-Remaining: 0 with X-RateLimit-Reset carrying
+// the epoch the bucket refills at — the two signals #812 uses to fail fast and
+// pause REST polling until reset instead of retrying a doomed call.
+var (
+	ghRateLimitRemainingRe = regexp.MustCompile(`(?im)^\s*x-ratelimit-remaining:\s*(\d+)`)
+	ghRateLimitResetRe     = regexp.MustCompile(`(?im)^\s*x-ratelimit-reset:\s*(\d+)`)
+)
+
 // ---------------------------------------------------------------------------
 // Shutdown fail-fast (#797). During the 2026-07-02 incident a drain that had
 // ZERO in-flight workers took 20+ minutes to stop because the still-live flows
@@ -554,6 +564,16 @@ func ghConditionalErrorDetail(out []byte) []byte {
 }
 
 func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
+	// #812: while the core REST bucket is known-exhausted, skip the call
+	// entirely — issuing it would only fail against an empty budget. rate_limit
+	// is exempt: it does not consume the core quota and is exactly the probe an
+	// operator/guard uses to confirm the bucket has refilled.
+	if endpoint != "rate_limit" {
+		if paused, resetAt := primaryRateLimitActive(); paused {
+			notePrimarySkip()
+			return nil, &PrimaryRateLimitError{Endpoint: endpoint, ResetAt: resetAt}
+		}
+	}
 	conditional := ghConditionalEligible(endpoint, args)
 	paginated := false
 	for _, a := range args {
@@ -599,9 +619,25 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 			cmdArgs = append([]string{"api", endpoint}, args...)
 			continue
 		}
-		retryAfter, rateLimited := parseGHRateLimit(out)
+		rl := classifyGHRateLimit(out)
+		rateLimited := rl.kind != ghRateLimitNone
 		noteAPIRequest(false, rateLimited)
-		if !rateLimited || attempt == ghAPIMaxAttempts-1 {
+		if rl.kind == ghRateLimitPrimary {
+			// #812: a primary (hourly) exhaustion does not refill for up to an
+			// hour, so retrying is guaranteed to fail and burns more of an
+			// already-empty budget. Fail fast after this one request and arm the
+			// shared gate so sibling flows skip their REST cycle until reset —
+			// replacing the old 4×-per-call amplification across all flows.
+			notePrimaryRateLimit(rl.resetAt, rl.remaining)
+			resetLabel := "a short fallback window"
+			if paused, resetAt := primaryRateLimitActive(); paused {
+				resetLabel = resetAt.UTC().Format(time.RFC3339)
+			}
+			log.Printf("[github] gh api %s: PRIMARY rate limit exhausted (%s); failing fast without retry, pausing REST polling until %s",
+				endpoint, ghErrorDetail(ghConditionalErrorDetail(out)), resetLabel)
+			break
+		}
+		if rl.kind != ghRateLimitSecondary || attempt == ghAPIMaxAttempts-1 {
 			break
 		}
 		// #797: once shutdown has begun a rate-limited read fails fast — the
@@ -613,11 +649,11 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 				endpoint, ghErrorDetail(ghConditionalErrorDetail(out)))
 			break
 		}
-		wait := retryAfter
+		wait := rl.retryAfter
 		if wait <= 0 {
 			wait = ghBackoffDelay(attempt)
 		}
-		log.Printf("[github] gh api %s: rate-limited (%s); backing off %s before retry %d/%d",
+		log.Printf("[github] gh api %s: secondary rate-limited (%s); backing off %s before retry %d/%d",
 			endpoint, ghErrorDetail(ghConditionalErrorDetail(out)), wait.Round(time.Millisecond), attempt+1, ghAPIMaxAttempts-1)
 		ghAPISleep(wait)
 		if ShuttingDown() {
@@ -674,8 +710,8 @@ func noteAPIRequest(notModified, rateLimited bool) {
 		// Roll the window before counting so the request that crossed the
 		// boundary opens the new window instead of vanishing with the digest.
 		w := apiStatsWindow
-		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited",
-			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited)
+		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited%s",
+			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited, primaryLimitDigest())
 		apiStatsWindow = APIStats{}
 		apiWindowStart = now
 	}
@@ -698,25 +734,248 @@ func APIUsage() APIStats {
 	return apiStatsTotal
 }
 
-// parseGHRateLimit reports whether gh's combined output looks like a primary or
-// secondary rate-limit (or 429) response and, when gh surfaced an explicit
-// Retry-After hint, how long to wait. retryAfter is 0 when no hint is present,
-// in which case the caller falls back to exponential backoff.
-func parseGHRateLimit(out []byte) (retryAfter time.Duration, rateLimited bool) {
+// ghRateLimitKind distinguishes the two GitHub rate limits, which need opposite
+// handling (#812). The secondary (abuse / burst-concurrency) limit is short and
+// clears in seconds, so #794's retry-with-backoff is correct. The primary
+// (hourly, 5000/hr) limit does not refill for up to an hour, so every retry is
+// guaranteed to fail and only burns more of an already-empty budget — it must
+// fail fast and pause polling until reset instead.
+type ghRateLimitKind int
+
+const (
+	ghRateLimitNone ghRateLimitKind = iota
+	ghRateLimitSecondary
+	ghRateLimitPrimary
+)
+
+// ghRateLimitInfo is the classified verdict for a failed gh exchange.
+type ghRateLimitInfo struct {
+	kind       ghRateLimitKind
+	retryAfter time.Duration // explicit Retry-After hint (secondary); 0 if none
+	resetAt    time.Time     // X-RateLimit-Reset (primary); zero if unknown
+	remaining  int           // last-seen X-RateLimit-Remaining; -1 if unknown
+}
+
+// classifyGHRateLimit inspects gh's combined output (and, on a conditional
+// --include exchange, its response headers) and reports whether the failure is
+// a primary or secondary rate limit, plus any reset/Retry-After timing.
+//
+// Signals, in priority order:
+//   - X-RateLimit-Remaining: 0 → the core bucket is empty: PRIMARY. Definitive
+//     even under a secondary-worded message, because a retry cannot succeed
+//     until the reset regardless of what tripped the response.
+//   - "secondary rate limit" / "abuse", or an explicit Retry-After (which the
+//     primary limit never sends) → SECONDARY: retry with backoff, unchanged.
+//   - "api rate limit exceeded" (the primary signature, e.g. "API rate limit
+//     exceeded for user ID <n>") → PRIMARY.
+//   - any other rate-limit-ish text (bare "rate limit", HTTP 429) with no
+//     primary evidence → SECONDARY, preserving pre-#812 retry behavior; only a
+//     clear primary signal short-circuits to fail-fast.
+func classifyGHRateLimit(out []byte) ghRateLimitInfo {
 	text := strings.ToLower(string(out))
-	rateLimited = strings.Contains(text, "rate limit") ||
-		strings.Contains(text, "secondary rate limit") ||
-		strings.Contains(text, "http 429") ||
-		(strings.Contains(text, "http 403") && strings.Contains(text, "abuse"))
-	if !rateLimited {
-		return 0, false
+	info := ghRateLimitInfo{remaining: -1}
+
+	if m := ghRateLimitRemainingRe.FindSubmatch(out); m != nil {
+		if n, convErr := strconv.Atoi(string(m[1])); convErr == nil {
+			info.remaining = n
+		}
+	}
+	if m := ghRateLimitResetRe.FindSubmatch(out); m != nil {
+		if secs, convErr := strconv.ParseInt(string(m[1]), 10, 64); convErr == nil && secs > 0 {
+			info.resetAt = time.Unix(secs, 0)
+		}
 	}
 	if m := ghRetryAfterRe.FindSubmatch(out); m != nil {
 		if secs, convErr := strconv.Atoi(string(m[1])); convErr == nil && secs > 0 {
-			return time.Duration(secs) * time.Second, true
+			info.retryAfter = time.Duration(secs) * time.Second
 		}
 	}
-	return 0, true
+
+	primaryByHeader := info.remaining == 0
+	primaryBySignature := strings.Contains(text, "api rate limit exceeded")
+	secondary := strings.Contains(text, "secondary rate limit") || strings.Contains(text, "abuse")
+	anyLimit := primaryByHeader || primaryBySignature || secondary || info.retryAfter > 0 ||
+		strings.Contains(text, "rate limit") || strings.Contains(text, "http 429")
+
+	switch {
+	case !anyLimit:
+		info.kind = ghRateLimitNone
+	case primaryByHeader:
+		info.kind = ghRateLimitPrimary
+	case secondary || info.retryAfter > 0:
+		info.kind = ghRateLimitSecondary
+	case primaryBySignature:
+		info.kind = ghRateLimitPrimary
+	default:
+		info.kind = ghRateLimitSecondary
+	}
+	return info
+}
+
+// parseGHRateLimit reports whether gh's combined output looks like a rate-limit
+// (or 429) response and, when gh surfaced an explicit Retry-After hint, how long
+// to wait. retryAfter is 0 when no hint is present, in which case the caller
+// falls back to exponential backoff. It intentionally does not distinguish
+// primary from secondary — callers that need that use classifyGHRateLimit.
+func parseGHRateLimit(out []byte) (retryAfter time.Duration, rateLimited bool) {
+	info := classifyGHRateLimit(out)
+	return info.retryAfter, info.kind != ghRateLimitNone
+}
+
+// ---------------------------------------------------------------------------
+// Primary (hourly) rate-limit fail-fast + shared pause gate (#812). During the
+// 2026-07-03 storm a primary exhaustion was misclassified as retryable, so
+// every doomed call fanned out to ghAPIMaxAttempts retries across all in-process
+// flows — a 4× amplifier against an already-empty budget. When the wrapper now
+// recognises a primary exhaustion it arms this process-wide gate with the
+// X-RateLimit-Reset instant; every subsequent core-REST call from any flow
+// short-circuits until the reset instead of issuing a call that cannot succeed.
+// This is the REST analogue of the orchestrator's GraphQL budget guard
+// (projectGraphQLBudgetAvailable).
+// ---------------------------------------------------------------------------
+
+// primaryLimitFallbackPause is how long the gate stays armed when a primary
+// exhaustion carried no parseable X-RateLimit-Reset (a non-conditional call has
+// no headers to read). Short by design: one doomed call per flow per window is a
+// negligible drip next to the 4×-per-call burst this replaces, and it bounds an
+// over-long stall if the true reset was never surfaced.
+const primaryLimitFallbackPause = 60 * time.Second
+
+var (
+	primaryLimitMu      sync.Mutex
+	primaryLimitReset   time.Time  // gate expiry; zero = never armed
+	primaryLimitSince   time.Time  // start of the current pause window
+	primaryLimitRemain  = -1       // last-seen X-RateLimit-Remaining (-1 unknown)
+	primaryLimitSkipped int64      // core-REST calls short-circuited by the gate
+	primaryLimitHits    int64      // primary exhaustions observed
+	primaryLimitNow     = time.Now // injectable for tests
+)
+
+// PrimaryLimitState is a diagnostic snapshot of the shared primary-rate-limit
+// pause gate (#812): whether REST polling is paused, until when, the pause's
+// start, the last-seen remaining budget, how many calls were skipped, and how
+// many primary exhaustions were observed.
+type PrimaryLimitState struct {
+	Paused    bool
+	ResetAt   time.Time
+	Since     time.Time
+	Remaining int
+	Skipped   int64
+	Hits      int64
+}
+
+// notePrimaryRateLimit arms (or refreshes) the gate after the wrapper observed a
+// primary exhaustion. resetAt is X-RateLimit-Reset when gh surfaced it; a
+// zero/past reset falls back to a short fixed pause. A refresh only ever extends
+// the window (keeps the furthest reset) so a stale header cannot shorten it.
+func notePrimaryRateLimit(resetAt time.Time, remaining int) {
+	primaryLimitMu.Lock()
+	defer primaryLimitMu.Unlock()
+	now := primaryLimitNow()
+	if resetAt.IsZero() || !resetAt.After(now) {
+		resetAt = now.Add(primaryLimitFallbackPause)
+	}
+	primaryLimitHits++
+	if remaining >= 0 {
+		primaryLimitRemain = remaining
+	}
+	alreadyPaused := primaryLimitReset.After(now)
+	if resetAt.After(primaryLimitReset) {
+		primaryLimitReset = resetAt
+	}
+	if !alreadyPaused {
+		primaryLimitSince = now
+	}
+}
+
+// notePrimarySkip records that a core-REST call was short-circuited by the gate.
+func notePrimarySkip() {
+	primaryLimitMu.Lock()
+	primaryLimitSkipped++
+	primaryLimitMu.Unlock()
+}
+
+// primaryRateLimitActive reports whether the gate is currently armed and, if so,
+// the reset instant to wait for.
+func primaryRateLimitActive() (paused bool, resetAt time.Time) {
+	primaryLimitMu.Lock()
+	defer primaryLimitMu.Unlock()
+	if !primaryLimitReset.IsZero() && primaryLimitNow().Before(primaryLimitReset) {
+		return true, primaryLimitReset
+	}
+	return false, time.Time{}
+}
+
+// PrimaryRateLimitPaused reports whether the shared core-REST bucket is
+// currently known-exhausted and, if so, the reset instant callers should wait
+// for before polling again (#812). Flows consult it to skip their REST poll
+// cycle instead of issuing doomed calls.
+func PrimaryRateLimitPaused() (paused bool, resetAt time.Time) {
+	return primaryRateLimitActive()
+}
+
+// PrimaryRateLimitState returns a diagnostic snapshot of the primary-limit pause
+// gate for status/diagnostic surfaces (#812).
+func PrimaryRateLimitState() PrimaryLimitState {
+	primaryLimitMu.Lock()
+	defer primaryLimitMu.Unlock()
+	paused := !primaryLimitReset.IsZero() && primaryLimitNow().Before(primaryLimitReset)
+	return PrimaryLimitState{
+		Paused:    paused,
+		ResetAt:   primaryLimitReset,
+		Since:     primaryLimitSince,
+		Remaining: primaryLimitRemain,
+		Skipped:   primaryLimitSkipped,
+		Hits:      primaryLimitHits,
+	}
+}
+
+// primaryLimitDigest renders the primary-limit pause state for the hourly REST
+// usage digest so an operator reading journalctl sees, alongside consumption,
+// whether a primary exhaustion paused polling — last-seen remaining, reset
+// time, and how many calls were skipped (#812). Empty when nothing to report.
+func primaryLimitDigest() string {
+	st := PrimaryRateLimitState()
+	if st.Hits == 0 && !st.Paused {
+		return ""
+	}
+	status := "clear"
+	if st.Paused {
+		status = "PAUSED until " + st.ResetAt.UTC().Format(time.RFC3339)
+	}
+	return fmt.Sprintf("; primary-limit %s (hits=%d, calls skipped=%d, last remaining=%d)",
+		status, st.Hits, st.Skipped, st.Remaining)
+}
+
+// resetPrimaryLimitForTest clears the shared gate so a test that arms it does
+// not leak state into the rest of the (serially-run) package tests.
+func resetPrimaryLimitForTest() {
+	primaryLimitMu.Lock()
+	defer primaryLimitMu.Unlock()
+	primaryLimitReset = time.Time{}
+	primaryLimitSince = time.Time{}
+	primaryLimitRemain = -1
+	primaryLimitSkipped = 0
+	primaryLimitHits = 0
+}
+
+// PrimaryRateLimitError is returned when a core-REST call is skipped because the
+// shared primary-limit gate is armed (#812): the call was never issued because
+// it could not succeed until ResetAt.
+type PrimaryRateLimitError struct {
+	Endpoint string
+	ResetAt  time.Time
+}
+
+func (e *PrimaryRateLimitError) Error() string {
+	if e == nil {
+		return "primary GitHub rate limit exhausted"
+	}
+	if e.ResetAt.IsZero() {
+		return fmt.Sprintf("gh api %s: skipped — primary GitHub rate limit exhausted", e.Endpoint)
+	}
+	return fmt.Sprintf("gh api %s: skipped — primary GitHub rate limit exhausted (resets %s)",
+		e.Endpoint, e.ResetAt.UTC().Format(time.RFC3339))
 }
 
 // ghBackoffDelay computes the exponential backoff for the given zero-based retry

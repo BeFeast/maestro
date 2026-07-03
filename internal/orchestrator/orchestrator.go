@@ -133,6 +133,7 @@ type Orchestrator struct {
 	syncProjectFn                func(issueNumber int, status github.ProjectStatus) bool
 	listNonDoneProjectItemsFn    func(pf *github.ProjectField) ([]github.ProjectItem, error)
 	rateLimitFn                  func() (github.RateLimitStatus, error)
+	primaryRESTPausedFn          func() (bool, time.Time)
 
 	// Per-cycle open-PR cache (#794). ListOpenPRs is the dominant forge REST
 	// read (~78% of the core-bucket calls at the 2026-06-28 secondary
@@ -249,11 +250,36 @@ func (o *Orchestrator) listOpenPRsForCycle() ([]github.PR, error) {
 	if o.cyclePRsValid {
 		return o.cyclePRs, o.cyclePRsErr
 	}
+	// #812: when the shared core-REST bucket is exhausted (a primary rate-limit
+	// pause armed by the gh wrapper), skip the fleet's dominant open-PR read
+	// until the reset instead of issuing a doomed call. Generalizes the GraphQL
+	// budget guard (projectGraphQLBudgetAvailable) to the core REST bucket: the
+	// cached error fans the skip out to the cycle's four open-PR consumers
+	// (reconcile / check / auto-merge / rebase), which each degrade to a no-op
+	// this cycle exactly as they already do for any open-PR read failure.
+	if paused, resetAt := o.primaryRESTPaused(); paused {
+		o.cyclePRs = nil
+		o.cyclePRsErr = &github.PrimaryRateLimitError{Endpoint: fmt.Sprintf("repos/%s/pulls", o.repo), ResetAt: resetAt}
+		o.cyclePRsValid = true
+		log.Printf("[orch] core REST bucket exhausted (primary rate limit, #812); skipping open-PR poll until %s", resetAt.UTC().Format(time.RFC3339))
+		return o.cyclePRs, o.cyclePRsErr
+	}
 	prs, err := o.listOpenPRs()
 	o.cyclePRs = prs
 	o.cyclePRsErr = err
 	o.cyclePRsValid = true
 	return prs, err
+}
+
+// primaryRESTPaused reports whether the shared core-REST bucket is paused on a
+// primary rate-limit exhaustion, and until when (#812). The gh wrapper arms the
+// gate; the orchestrator consults it to skip doomed REST polling. Injectable for
+// tests.
+func (o *Orchestrator) primaryRESTPaused() (bool, time.Time) {
+	if o.primaryRESTPausedFn != nil {
+		return o.primaryRESTPausedFn()
+	}
+	return github.PrimaryRateLimitPaused()
 }
 
 func (o *Orchestrator) remoteBranchExists(branch string) (bool, error) {
