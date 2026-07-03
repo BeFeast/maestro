@@ -18,7 +18,16 @@ import (
 // the false-positive class from #663.
 //
 // Supported signatures (case-insensitive):
-//   - "You've hit your (usage )?limit" (Codex / Claude provider phrasing)
+//   - "You've hit your <qualifier> limit" (Codex / Claude provider phrasing).
+//     The optional qualifier word covers "usage" (Codex) and "session"
+//     (Claude subscription: "You've hit your session limit · resets 9am
+//     (UTC)", #808) as well as the bare "You've hit your limit".
+//   - "You've reached your <plan> limit" — the Claude/Fable subscription cap
+//     ("You've reached your Fable 5 limit. Run /usage-credits ...", #808).
+//   - "/usage-credits" marker — the Claude slash-command the Fable-limit
+//     message points at, a high-precision quota signal on its own (#808).
+//   - "You're out of (extra )?usage" — the Claude extra-usage exhaustion
+//     ("You're out of extra usage · resets 4:10pm (UTC)", #808).
 //   - "chatgpt.com/codex/settings/usage" marker (Codex usage-limit URL)
 //   - "usage/5-hour/weekly limit reached" (claude CLI subscription-window
 //     phrasings, e.g. "Claude usage limit reached ...")
@@ -26,7 +35,10 @@ var usageLimitPatterns = []struct {
 	label string
 	re    *regexp.Regexp
 }{
-	{"hit_limit", regexp.MustCompile(`(?i)you'?ve hit your (usage )?limit`)},
+	{"hit_limit", regexp.MustCompile(`(?i)you'?ve hit your (?:\w+ )?limit`)},
+	{"reached_limit", regexp.MustCompile(`(?i)you'?ve reached your\b[^.\n]{0,40}?\blimit\b`)},
+	{"usage_credits", regexp.MustCompile(`(?i)/usage-credits\b`)},
+	{"out_of_usage", regexp.MustCompile(`(?i)you'?re out of (?:extra )?usage\b`)},
 	{"codex_usage_limit", regexp.MustCompile(`(?i)(chatgpt\.com/)?codex/settings/usage`)},
 	{"usage_limit_reached", regexp.MustCompile(`(?i)\b(?:usage|5-hour|weekly)[ _-]limit reached\b`)},
 }

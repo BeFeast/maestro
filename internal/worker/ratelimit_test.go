@@ -46,6 +46,27 @@ func TestDetectRateLimit(t *testing.T) {
 			wantLabel: "hit_limit",
 		},
 		{
+			// #808: the Claude subscription "session limit" phrasing inserts
+			// "session" between "your" and "limit"; the qualifier group must
+			// admit it just as it admits "usage".
+			name:      "claude session limit (#808)",
+			input:     "You've hit your session limit · resets 9am (UTC)",
+			wantHit:   true,
+			wantLabel: "hit_limit",
+		},
+		{
+			name:      "claude fable plan limit (#808)",
+			input:     "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+			wantHit:   true,
+			wantLabel: "reached_limit",
+		},
+		{
+			name:      "claude out of extra usage (#808)",
+			input:     "You're out of extra usage · resets 4:10pm (UTC)",
+			wantHit:   true,
+			wantLabel: "out_of_usage",
+		},
+		{
 			name:      "HTTP 429 status code",
 			input:     "HTTP error 429: Too Many Requests",
 			wantHit:   true,
@@ -468,6 +489,95 @@ func TestParseRateLimitReset_Variants(t *testing.T) {
 			}
 			if tc.ok && !got.Equal(tc.want) {
 				t.Errorf("ParseRateLimitReset = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// #808 live Claude/Fable subscription signatures (BeFeast ok-player fleet,
+// 2026-07-03). Both state the reset as "resets <clock> (UTC)", a shape the
+// pre-#808 "try again at <when>" reset parser did not recognise, so the death
+// stayed low-confidence and no failover fired.
+const (
+	claudeSessionLimitSignature = "You've hit your session limit · resets 9am (UTC)"
+	claudeExtraUsageSignature   = "You're out of extra usage · resets 4:10pm (UTC)"
+)
+
+// TestParseRateLimitResetAt_ClaudeResetsTZ verifies the "resets <clock> (TZ)"
+// hint parses to the next occurrence of that wall-clock time in UTC, with the
+// hour-only ("9am") and minute-bearing ("4:10pm") shapes both handled and the
+// trailing "(UTC)" stripped (#808).
+func TestParseRateLimitResetAt_ClaudeResetsTZ(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		now   time.Time
+		want  time.Time
+		ok    bool
+	}{
+		{
+			name:  "hour-only am resolves same day",
+			input: claudeSessionLimitSignature,
+			now:   time.Date(2026, time.July, 3, 6, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 9, 0, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "hour-only am already passed rolls next day",
+			input: claudeSessionLimitSignature,
+			now:   time.Date(2026, time.July, 3, 10, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 4, 9, 0, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "minute-bearing pm resolves same day",
+			input: claudeExtraUsageSignature,
+			now:   time.Date(2026, time.July, 3, 9, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 16, 10, 0, 0, time.UTC),
+			ok:    true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseRateLimitResetAt(tc.input, tc.now)
+			if ok != tc.ok {
+				t.Fatalf("ParseRateLimitResetAt ok = %v, want %v (got %v)", ok, tc.ok, got)
+			}
+			if tc.ok && !got.Equal(tc.want) {
+				t.Errorf("ParseRateLimitResetAt = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyRateLimitAt_ClaudeResetsTZ_HighConfidence: the Claude signatures
+// must classify HIGH-confidence so the orchestrator's provider-limit fallover
+// fires with the provider-stated reset as the backend cooldown, rather than a
+// blind 30-minute re-probe (#808).
+func TestClassifyRateLimitAt_ClaudeResetsTZ_HighConfidence(t *testing.T) {
+	now := time.Date(2026, time.July, 3, 6, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		input string
+		label string
+		want  time.Time
+	}{
+		{"session limit", claudeSessionLimitSignature, "hit_limit", time.Date(2026, time.July, 3, 9, 0, 0, 0, time.UTC)},
+		{"out of extra usage", claudeExtraUsageSignature, "out_of_usage", time.Date(2026, time.July, 3, 16, 10, 0, 0, time.UTC)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hit, label, confidence, resetAt := ClassifyRateLimitAt(tc.input, now)
+			if !hit {
+				t.Fatalf("expected hit=true on %q", tc.input)
+			}
+			if label != tc.label {
+				t.Errorf("label = %q, want %q", label, tc.label)
+			}
+			if confidence != "high" {
+				t.Errorf("confidence = %q, want high (parseable reset)", confidence)
+			}
+			if !resetAt.Equal(tc.want) {
+				t.Errorf("resetAt = %v, want %v", resetAt, tc.want)
 			}
 		})
 	}

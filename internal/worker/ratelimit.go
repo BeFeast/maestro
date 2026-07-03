@@ -19,7 +19,14 @@ import (
 // expensive backend chasing a phantom quota block.
 //
 // Supported patterns (case-insensitive):
-//   - "You've hit your (usage )?limit" (Claude / Codex provider phrasing)
+//   - "You've hit your <qualifier> limit" (Claude / Codex provider phrasing).
+//     The optional qualifier word matches "usage" (Codex) and "session"
+//     (Claude subscription: "You've hit your session limit · resets 9am
+//     (UTC)", #808) as well as the bare "You've hit your limit".
+//   - "You've reached your <plan> limit" (Claude/Fable subscription cap, #808)
+//   - "You're out of (extra )?usage" (Claude extra-usage exhaustion, #808) —
+//     paired with a parseable "resets <t>" hint this is the high-confidence
+//     provider-limit signal the fallover selector acts on.
 //   - "chatgpt.com/codex/settings/usage" marker (Codex usage-limit URL)
 //   - HTTP 429 paired with a status/code/error context word — bare 429
 //     embedded in unrelated text is NOT matched
@@ -34,7 +41,9 @@ var rateLimitPatterns = []struct {
 	label string
 	re    *regexp.Regexp
 }{
-	{"hit_limit", regexp.MustCompile(`(?i)you'?ve hit your (usage )?limit`)},
+	{"hit_limit", regexp.MustCompile(`(?i)you'?ve hit your (?:\w+ )?limit`)},
+	{"reached_limit", regexp.MustCompile(`(?i)you'?ve reached your\b[^.\n]{0,40}?\blimit\b`)},
+	{"out_of_usage", regexp.MustCompile(`(?i)you'?re out of (?:extra )?usage\b`)},
 	{"codex_usage_limit", regexp.MustCompile(`(?i)(chatgpt\.com/)?codex/settings/usage`)},
 	// HTTP 429 with a rate-limit context word. Requires the literal 429 to
 	// appear next to an HTTP / status / code / error / response marker so
@@ -50,11 +59,23 @@ var rateLimitPatterns = []struct {
 // rateLimitResetRe extracts the human-readable reset hint emitted after a
 // provider usage-limit error, e.g.
 //
-//	"... try again at May 30th, 2026 8:13 PM."
+//	"... try again at May 30th, 2026 8:13 PM."   (Codex / OpenAI)
+//	"You've hit your session limit · resets 9am (UTC)"   (Claude, #808)
+//	"You're out of extra usage · resets 4:10pm (UTC)"    (Claude, #808)
 //
-// The capture is greedy to the end of the line; parseResetTimestamp trims a
-// trailing sentence period and surrounding whitespace before parsing.
-var rateLimitResetRe = regexp.MustCompile(`(?i)try again (?:at|after)\s+([^\n]+)`)
+// The capture is greedy to the end of the line; parseResetTimestamp /
+// parseTimeOnlyReset trim a trailing sentence period, a trailing
+// parenthesised timezone ("(UTC)"), and surrounding whitespace before
+// parsing. The "resets" alternative is anchored on a word boundary so it does
+// not fire inside an unrelated token (e.g. "core-resets").
+var rateLimitResetRe = regexp.MustCompile(`(?i)(?:try again (?:at|after)|\bresets)\s+([^\n]+)`)
+
+// trailingTZParenRe strips a trailing parenthesised timezone marker from a
+// reset capture: "9am (UTC)" -> "9am", "4:10pm (UTC)" -> "4:10pm". The
+// timezone is dropped rather than honoured — parseTimeOnlyReset already
+// documents its result as a best-effort UTC lower bound, and every live
+// Claude signature states "(UTC)".
+var trailingTZParenRe = regexp.MustCompile(`\s*\([^)]*\)\s*$`)
 
 // resetLayouts are the timestamp layouts ParseRateLimitReset attempts, in
 // order, against the cleaned "try again at <when>" capture. The Codex signature
@@ -82,10 +103,15 @@ var ordinalSuffixRe = regexp.MustCompile(`(?i)(\d{1,2})(st|nd|rd|th)`)
 // went unparsed, the rate-limit signal stayed low-confidence (#663), and no
 // failover fired. A clock-only hint is resolved against a reference time to
 // the NEXT occurrence of that wall-clock time (see parseTimeOnlyReset).
+// The hour-only meridiem shapes ("3PM"/"3 PM") cover the Claude subscription
+// phrasing "resets 9am (UTC)" (#808), which states an hour with no minutes; the
+// date-bearing and minute-bearing layouts reject it.
 var timeOnlyResetLayouts = []string{
 	"3:04 PM",
 	"3:04PM",
 	"15:04",
+	"3PM",
+	"3 PM",
 }
 
 // DetectRateLimit scans multi-line output for known rate-limit / quota error
@@ -246,7 +272,11 @@ func parseTimeOnlyReset(raw string, now time.Time) (time.Time, bool) {
 	if now.IsZero() {
 		return time.Time{}, false
 	}
-	cleaned := strings.TrimRight(strings.TrimSpace(raw), ". ")
+	// Drop a trailing parenthesised timezone ("9am (UTC)" -> "9am") before the
+	// sentence-period trim so the "(UTC)" the Claude signature appends does not
+	// defeat the clock layouts (#808).
+	cleaned := trailingTZParenRe.ReplaceAllString(strings.TrimSpace(raw), "")
+	cleaned = strings.TrimRight(strings.TrimSpace(cleaned), ". ")
 	if cleaned == "" {
 		return time.Time{}, false
 	}
@@ -272,9 +302,10 @@ func parseTimeOnlyReset(raw string, now time.Time) (time.Time, bool) {
 // from a "try again at <when>" hint. Day ordinals are stripped and whitespace
 // is collapsed before trying each layout in resetLayouts.
 func parseResetTimestamp(raw string) (time.Time, bool) {
-	// Drop a trailing sentence period and surrounding whitespace ("... 8:13 PM."
-	// -> "... 8:13 PM").
-	cleaned := strings.TrimRight(strings.TrimSpace(raw), ". ")
+	// Drop a trailing parenthesised timezone, then a trailing sentence period
+	// and surrounding whitespace ("... 8:13 PM (UTC)." -> "... 8:13 PM").
+	cleaned := trailingTZParenRe.ReplaceAllString(strings.TrimSpace(raw), "")
+	cleaned = strings.TrimRight(strings.TrimSpace(cleaned), ". ")
 	if cleaned == "" {
 		return time.Time{}, false
 	}
