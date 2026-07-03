@@ -337,6 +337,32 @@ func (o *Orchestrator) dispatchBackendCandidates() []string {
 	return ordered
 }
 
+// earliestCandidateRetry returns the earliest cooldown expiry recorded across
+// a selection's blocked candidates, or nil when none states one. Only
+// candidates whose sole block is the cooldown carry a RetryAfter (see
+// selectBackendFallback — disabled/unknown/current/already-tried short-circuit
+// before the cooldown check), so the returned instant is one at which a
+// candidate genuinely becomes selectable. An all-blocked retry defers to this
+// instant when it beats the session backend's own expiry: waiting on the
+// session backend alone parks the session for hours a sooner-freeing fallback
+// could cover (#805).
+func earliestCandidateRetry(selection state.BackendSelection) *time.Time {
+	var earliest *time.Time
+	for _, entry := range selection.CandidateScores {
+		if entry.Available || entry.RetryAfter == "" {
+			continue
+		}
+		expiry, err := time.Parse(time.RFC3339, entry.RetryAfter)
+		if err != nil {
+			continue
+		}
+		if earliest == nil || expiry.Before(*earliest) {
+			earliest = &expiry
+		}
+	}
+	return earliest
+}
+
 // retryAfterHint formats a cooldown expiry for dispatch log lines.
 func retryAfterHint(retryAfter *time.Time) string {
 	if retryAfter == nil {

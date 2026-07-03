@@ -652,7 +652,19 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 	if err != nil {
 		return nil
 	}
-	if reset, ok := worker.ParseRateLimitResetAt(string(data), time.Now().UTC()); ok {
+	// Resolve a time-only reset hint ("try again at 12:30 PM", #805) against
+	// the log's last write — the moment the CLI printed the hint — not the
+	// moment the daemon got around to reading it. A dead worker can sit
+	// unreconciled past the stated reset (daemon restart, long poll gap);
+	// resolved against time.Now() the already-elapsed hint rolls a full day
+	// forward and gates the backend ~24h after its quota window actually
+	// reset. Against the write time the stale hint resolves to the elapsed
+	// instant instead, so the recorded cooldown is already expired.
+	ref := time.Now().UTC()
+	if fi, statErr := os.Stat(logFile); statErr == nil {
+		ref = fi.ModTime().UTC()
+	}
+	if reset, ok := worker.ParseRateLimitResetAt(string(data), ref); ok {
 		return &reset
 	}
 	return nil
@@ -1651,9 +1663,20 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			if blockedBy, blockedRetry := o.dispatchBackendBlock(s, respawnBackend, now); blockedBy != "" {
 				selection := o.selectBackendFallback(s, sess, now, selectionReasonRetryBlockedFallback)
 				if selection.SelectedBackend == "" {
+					// Defer to the EARLIEST cooldown expiry across the blocked
+					// candidate set — the session backend and every fallback —
+					// not the session backend's alone: with the default gated
+					// until 18:00 but a fallback freeing at 13:00, the next
+					// pass can resume on the fallback hours earlier. 5 minutes
+					// is the re-probe default when no blocked backend states
+					// an expiry.
 					retryAt := now.Add(5 * time.Minute)
-					if blockedRetry != nil && blockedRetry.After(now) {
-						retryAt = blockedRetry.UTC()
+					earliest := blockedRetry
+					if candidateRetry := earliestCandidateRetry(selection); candidateRetry != nil && (earliest == nil || candidateRetry.Before(*earliest)) {
+						earliest = candidateRetry
+					}
+					if earliest != nil && earliest.After(now) {
+						retryAt = earliest.UTC()
 					}
 					sess.NextRetryAt = &retryAt
 					log.Printf("[orch] worker %s retry deferred until %s: backend %s blocked (%s) and no healthy fallback is available",

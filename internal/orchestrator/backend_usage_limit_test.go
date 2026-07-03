@@ -393,10 +393,13 @@ func TestRespawnDueRetries_BackendInCooldown_SubstitutesHealthyFallback(t *testi
 	}
 }
 
-// #805: with every backend blocked, the due retry is deferred to the
-// cooldown expiry instead of respawning a doomed worker — and instead of
-// consuming the attempt.
-func TestRespawnDueRetries_AllBackendsBlocked_DefersRetryToCooldownExpiry(t *testing.T) {
+// #805: with every backend blocked, the due retry is deferred to the EARLIEST
+// cooldown expiry across the blocked candidate set instead of respawning a
+// doomed worker — and instead of consuming the attempt. Here the session
+// backend (codex) is gated for 25 minutes but the fallback (opencode) frees
+// after 8; deferring to the session backend's expiry alone would park the
+// session 17 minutes longer than the fallback requires.
+func TestRespawnDueRetries_AllBackendsBlocked_DefersRetryToEarliestCooldownExpiry(t *testing.T) {
 	cfg := usageLimitTestConfig()
 	cfg.MaxRetryBackoffMs = 300000
 	cfg.MaxRuntimeMinutes = 999
@@ -415,7 +418,10 @@ func TestRespawnDueRetries_AllBackendsBlocked_DefersRetryToCooldownExpiry(t *tes
 		},
 	}
 
-	now := time.Now().UTC()
+	// Whole-second expiries: the fallback candidate's RetryAfter round-trips
+	// through the RFC3339 audit string on BackendSelection, which drops
+	// sub-second precision.
+	now := time.Now().UTC().Truncate(time.Second)
 	pastTime := now.Add(-time.Second)
 	codexRetry := now.Add(25 * time.Minute)
 	opencodeRetry := now.Add(8 * time.Minute)
@@ -447,11 +453,68 @@ func TestRespawnDueRetries_AllBackendsBlocked_DefersRetryToCooldownExpiry(t *tes
 	if sess.NextRetryAt == nil {
 		t.Fatal("NextRetryAt should be re-armed so the retry fires after the cooldown")
 	}
-	if !sess.NextRetryAt.Equal(codexRetry) {
-		t.Fatalf("NextRetryAt = %v, want the blocked backend's cooldown expiry %v", sess.NextRetryAt, codexRetry)
+	if !sess.NextRetryAt.Equal(opencodeRetry) {
+		t.Fatalf("NextRetryAt = %v, want the EARLIEST blocked-candidate expiry %v (opencode), not the session backend's %v",
+			sess.NextRetryAt, opencodeRetry, codexRetry)
 	}
 	if sess.RetryCount != 1 {
 		t.Fatalf("RetryCount = %d, want unchanged 1 — a deferral must not consume the budget", sess.RetryCount)
+	}
+}
+
+// #805: when the session backend's own cooldown is the earliest, the
+// all-blocked deferral still uses it — the earliest-expiry rule is a min over
+// the whole candidate set, not a preference for fallbacks.
+func TestRespawnDueRetries_AllBackendsBlocked_SessionBackendEarliest_UsesItsExpiry(t *testing.T) {
+	cfg := usageLimitTestConfig()
+	cfg.MaxRetryBackoffMs = 300000
+	cfg.MaxRuntimeMinutes = 999
+
+	o := &Orchestrator{
+		cfg:             cfg,
+		notifier:        &notify.Notifier{},
+		promptBase:      "test prompt",
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "folio conveyor"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			t.Fatal("respawnWorkerFn must not be called while every backend is blocked")
+			return nil
+		},
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	pastTime := now.Add(-time.Second)
+	codexRetry := now.Add(5 * time.Minute)
+	opencodeRetry := now.Add(30 * time.Minute)
+	s := state.NewState()
+	s.BackendHealth["codex"] = state.BackendHealth{
+		State: state.BackendHealthCooldown, Reason: state.BackendBlockUsageLimit,
+		Since: now.Add(-5 * time.Minute), RetryAfter: &codexRetry,
+	}
+	s.BackendHealth["opencode"] = state.BackendHealth{
+		State: state.BackendHealthCooldown, Reason: state.BackendBlockAuthFailure,
+		Since: now.Add(-5 * time.Minute), RetryAfter: &opencodeRetry,
+	}
+	s.Sessions["ok-20"] = &state.Session{
+		IssueNumber: 220,
+		IssueTitle:  "folio conveyor",
+		Status:      state.StatusDead,
+		Backend:     "codex",
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		Branch:      "feat/ok-20-220-conveyor",
+	}
+
+	o.respawnDueRetries(s, 10)
+
+	sess := s.Sessions["ok-20"]
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be re-armed so the retry fires after the cooldown")
+	}
+	if !sess.NextRetryAt.Equal(codexRetry) {
+		t.Fatalf("NextRetryAt = %v, want the session backend's expiry %v (the earliest)", sess.NextRetryAt, codexRetry)
 	}
 }
 
@@ -496,6 +559,37 @@ func TestRespawnDueRetries_HealthyBackend_RespawnsUnchanged(t *testing.T) {
 	}
 	if sel := s.Sessions["ok-19"].BackendSelection; sel != nil {
 		t.Fatalf("BackendSelection = %+v, want nil (no substitution happened)", sel)
+	}
+}
+
+// #805 review: a dead worker's time-only reset hint must resolve against the
+// worker's time (the log's last write), not the daemon's read time. The CLI
+// died at 11:00 with "try again at 12:30 PM"; when the daemon only reconciles
+// the death after 12:30 (restart, long poll gap), resolving against
+// time.Now() rolls the hint to 12:30 the NEXT day and gates the backend ~24h
+// past its actual quota reset. Resolved from the log mtime the hint stays
+// 12:30 on the day the worker died — an already-expired cooldown.
+func TestRateLimitResetFromLog_TimeOnlyHint_ResolvedFromLogWriteTime(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "ok-21.log")
+	logContent := "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/codex/settings/usage) or try again at 12:30 PM.\n"
+	if err := os.WriteFile(logFile, []byte(logContent), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	// The incident timeline: worker died (last log write) 2026-07-02 11:00 UTC.
+	diedAt := time.Date(2026, 7, 2, 11, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(logFile, diedAt, diedAt); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	o := &Orchestrator{}
+	reset := o.rateLimitResetFromLog(logFile)
+	if reset == nil {
+		t.Fatal("reset should parse from the time-only hint")
+	}
+	want := time.Date(2026, 7, 2, 12, 30, 0, 0, time.UTC)
+	if !reset.Equal(want) {
+		t.Fatalf("reset = %v, want %v — the hint must resolve from the log write time, not the reconcile time", reset, want)
 	}
 }
 
