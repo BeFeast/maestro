@@ -241,7 +241,13 @@ func TestRespawnDueRetries_IssueOpenPRNotMerged_StillRespawns(t *testing.T) {
 	}
 }
 
-func TestTryCreatePRForPushedBranch_SkipsBranchAlreadyMerged(t *testing.T) {
+// A branch-only merge (operator merged the PR; maestro PRs carry no
+// auto-closing keywords, so the issue stays open) must settle the session as
+// code_landed, not dead: a dead session without NextRetryAt drops out of
+// IssueInProgress, and HasMergedPRForIssue cannot see a merge that closed no
+// issue — the next dispatch cycle would spawn a fresh worker for
+// already-landed work (#800 review).
+func TestReconcilePushedBranch_BranchAlreadyMerged_SettlesCodeLanded(t *testing.T) {
 	created := false
 	o := &Orchestrator{
 		cfg:                  &config.Config{Repo: "owner/repo"},
@@ -249,8 +255,11 @@ func TestTryCreatePRForPushedBranch_SkipsBranchAlreadyMerged(t *testing.T) {
 		tmuxSessionExistsFn:  func(name string) bool { return false },
 		listOpenPRsFn:        func() ([]github.PR, error) { return []github.PR{}, nil },
 		remoteBranchExistsFn: func(branch string) (bool, error) { return true, nil },
-		hasMergedPRForBranchFn: func(branch string) (bool, error) {
-			return branch == "feat/ok-player-1-133-test", nil
+		mergedPRForBranchFn: func(branch string) (int, error) {
+			if branch == "feat/ok-player-1-133-test" {
+				return 135, nil
+			}
+			return 0, nil
 		},
 		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
 		createPRFn: func(title, body, base, head string) (int, error) {
@@ -275,21 +284,30 @@ func TestTryCreatePRForPushedBranch_SkipsBranchAlreadyMerged(t *testing.T) {
 		t.Fatal("reconcile must NOT auto-create a PR from a branch that already merged via an earlier PR")
 	}
 	sess := s.Sessions["ok-player-1"]
-	if sess.Status != state.StatusDead {
-		t.Fatalf("status = %q, want %q (dead, not rescued into a junk PR)", sess.Status, state.StatusDead)
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q (settled, not dead — dead would re-open the zombie-respawn window)", sess.Status, state.StatusCodeLanded)
+	}
+	if sess.PRNumber != 135 {
+		t.Fatalf("PRNumber = %d, want 135 (the merged PR for the branch)", sess.PRNumber)
+	}
+	if sess.PID != 0 || sess.TmuxSession != "" {
+		t.Fatalf("PID = %d TmuxSession = %q, want cleared", sess.PID, sess.TmuxSession)
+	}
+	if !s.IssueInProgress(133) {
+		t.Fatal("settled session must keep issue #133 in progress so dispatch cannot spawn a duplicate worker")
 	}
 }
 
-func TestTryCreatePRForPushedBranch_SkipsClosedIssue(t *testing.T) {
+func TestReconcilePushedBranch_IssueClosed_SettlesDone(t *testing.T) {
 	created := false
 	o := &Orchestrator{
-		cfg:                    &config.Config{Repo: "owner/repo"},
-		pidAliveFn:             func(pid int) bool { return false },
-		tmuxSessionExistsFn:    func(name string) bool { return false },
-		listOpenPRsFn:          func() ([]github.PR, error) { return []github.PR{}, nil },
-		remoteBranchExistsFn:   func(branch string) (bool, error) { return true, nil },
-		hasMergedPRForBranchFn: func(branch string) (bool, error) { return false, nil },
-		isIssueClosedFn:        func(issueNumber int) (bool, error) { return issueNumber == 133, nil },
+		cfg:                  &config.Config{Repo: "owner/repo"},
+		pidAliveFn:           func(pid int) bool { return false },
+		tmuxSessionExistsFn:  func(name string) bool { return false },
+		listOpenPRsFn:        func() ([]github.PR, error) { return []github.PR{}, nil },
+		remoteBranchExistsFn: func(branch string) (bool, error) { return true, nil },
+		mergedPRForBranchFn:  func(branch string) (int, error) { return 0, nil },
+		isIssueClosedFn:      func(issueNumber int) (bool, error) { return issueNumber == 133, nil },
 		createPRFn: func(title, body, base, head string) (int, error) {
 			created = true
 			return 137, nil
@@ -310,5 +328,49 @@ func TestTryCreatePRForPushedBranch_SkipsClosedIssue(t *testing.T) {
 
 	if created {
 		t.Fatal("reconcile must NOT auto-create a PR for a closed issue")
+	}
+	sess := s.Sessions["ok-player-1"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDone)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatal("FinishedAt should be set when the session is settled")
+	}
+}
+
+func TestReconcilePushedBranch_MergedCheckErrorFailsOpen(t *testing.T) {
+	created := false
+	o := &Orchestrator{
+		cfg:                  &config.Config{Repo: "owner/repo"},
+		pidAliveFn:           func(pid int) bool { return false },
+		tmuxSessionExistsFn:  func(name string) bool { return false },
+		listOpenPRsFn:        func() ([]github.PR, error) { return []github.PR{}, nil },
+		remoteBranchExistsFn: func(branch string) (bool, error) { return true, nil },
+		mergedPRForBranchFn:  func(branch string) (int, error) { return 0, fmt.Errorf("transient API error") },
+		isIssueClosedFn:      func(issueNumber int) (bool, error) { return false, nil },
+		createPRFn: func(title, body, base, head string) (int, error) {
+			created = true
+			return 137, nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-player-1"] = &state.Session{
+		IssueNumber: 133,
+		IssueTitle:  "rescue survives GitHub hiccup",
+		Status:      state.StatusRunning,
+		PID:         4242,
+		TmuxSession: "maestro-ok-player-1",
+		Branch:      "feat/ok-player-1-133-test",
+	}
+
+	o.reconcileRunningSessions(s)
+
+	if !created {
+		t.Fatal("a transient GitHub read error on the merged-branch check must not disable the auto-create rescue")
+	}
+	sess := s.Sessions["ok-player-1"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
 	}
 }
