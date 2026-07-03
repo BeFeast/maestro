@@ -1309,6 +1309,29 @@ func (c *Client) HasMergedPRForIssue(issueNumber int) (bool, error) {
 	return false, nil
 }
 
+// HasMergedPRForBranch returns true if a merged PR used the given branch as
+// its head. After a squash-merge the branch tip is not an ancestor of main,
+// so ancestry cannot prove the content landed — but a merged PR with this
+// head branch can. The reconcile auto-create path consults this so a branch
+// that outlived its squash-merged PR (e.g. an operator merge without branch
+// deletion) does not spawn a duplicate junk PR (#800).
+func (c *Client) HasMergedPRForBranch(branch string) (bool, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return false, nil
+	}
+	prs, err := c.listClosedPRs()
+	if err != nil {
+		return false, err
+	}
+	for _, pr := range prs {
+		if pr.MergedAt != "" && pr.HeadRefName == branch {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // PRCIStatus returns "success", "failure", "pending", or "unknown"
 func (c *Client) PRCIStatus(prNumber int) (string, error) {
 	sha, err := c.pullHeadSHA(prNumber)
