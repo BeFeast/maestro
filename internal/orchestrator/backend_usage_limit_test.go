@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -669,5 +670,67 @@ func TestReconcileRunningSessions_CodexTimeOnlyUsageLimit_IncidentReplay(t *test
 	}
 	if failed := s.FailedAttemptsForIssue(217); failed != 0 {
 		t.Fatalf("FailedAttemptsForIssue(217) = %d, want 0", failed)
+	}
+}
+
+// #805 review regression, end to end through the real log classifiers: a
+// long-running worker echoed the live quota text early in its log (the issue
+// body it was working on quotes the provider message verbatim) and later died
+// for an unrelated reason. The whole-log scan used to read that echo as a
+// high-confidence provider limit — gating codex, preserving the retry budget,
+// and respawning on the fallback for a death that had nothing to do with
+// quota. Tail-bounded scanning must leave this death on the ordinary path.
+func TestReconcileRunningSessions_QuotaEchoAboveLogTail_NotClassified(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "ok-22.log")
+	var b strings.Builder
+	b.WriteString("## Issue body\n")
+	b.WriteString("You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/codex/settings/usage) or try again at 12:30 PM.\n")
+	for i := 0; i < 150; i++ {
+		b.WriteString("normal work output\n")
+	}
+	b.WriteString("worker crashed on an unrelated error\n")
+	if err := os.WriteFile(logFile, []byte(b.String()), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-22"] = &state.Session{
+		IssueNumber: 220,
+		IssueTitle:  "folio conveyor",
+		Status:      state.StatusRunning,
+		PID:         515156,
+		TmuxSession: "maestro-ok-22",
+		Branch:      "feat/ok-22-220-conveyor",
+		Backend:     "codex",
+		StartedAt:   time.Now().UTC().Add(-2 * time.Hour),
+		LogFile:     logFile,
+	}
+
+	o := &Orchestrator{
+		cfg:                 usageLimitTestConfig(),
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			t.Fatal("respawnWorkerFn must not be called — the quota echo is above the tail, this is an ordinary death")
+			return nil
+		},
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["ok-22"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (ordinary dead path)", sess.Status, state.StatusDead)
+	}
+	if sess.RateLimitHit {
+		t.Fatal("RateLimitHit must stay false — the echo above the tail is not a provider limit")
+	}
+	if _, ok := s.BackendHealth["codex"]; ok {
+		t.Fatal("BackendHealth[codex] must not be gated by a quota echo above the log tail")
 	}
 }

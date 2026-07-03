@@ -3,6 +3,7 @@ package worker
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -570,5 +571,91 @@ func TestClassifyRateLimitAt_TimeOnlyIsHighConfidence(t *testing.T) {
 	want := time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC)
 	if !resetAt.Equal(want) {
 		t.Errorf("resetAt = %v, want %v", resetAt, want)
+	}
+}
+
+// #805 review regression: a long-running worker can echo the live quota text
+// early in its log — a prompt quoting the provider message, work output
+// touching this very classifier — and later die for an unrelated reason.
+// Post-mortem detection must scan only the log tail, so an echo buried above
+// it neither classifies the death as rate-limited nor lends it a parseable
+// reset window.
+func TestIsRateLimited_QuotaEchoBeyondTail_NotDetected(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	var b strings.Builder
+	b.WriteString("## Issue body\n")
+	b.WriteString(codexTimeOnlySignature + "\n")
+	for i := 0; i < authFailureTailLines+20; i++ {
+		b.WriteString("normal work output\n")
+	}
+	b.WriteString("worker finished normally\n")
+	if err := os.WriteFile(logFile, []byte(b.String()), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	if IsRateLimited(logFile) {
+		t.Error("IsRateLimited must not match a quota echo above the log tail")
+	}
+	now := time.Date(2026, time.July, 2, 11, 0, 0, 0, time.UTC)
+	if reset, ok := ParseRateLimitResetFromLog(logFile, now); ok {
+		t.Errorf("ParseRateLimitResetFromLog = %v, want no parse — the hint is above the tail", reset)
+	}
+}
+
+// The terminal quota error that actually killed the CLI is always within the
+// tail, however long the log: tail-bounding must not lose the true positive.
+func TestIsRateLimited_TerminalQuotaErrorOnLongLog_StillDetected(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	var b strings.Builder
+	for i := 0; i < authFailureTailLines+200; i++ {
+		b.WriteString("normal work output\n")
+	}
+	b.WriteString(codexTimeOnlySignature + "\n")
+	if err := os.WriteFile(logFile, []byte(b.String()), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	if !IsRateLimited(logFile) {
+		t.Error("IsRateLimited must still match the terminal quota error on a long log")
+	}
+	now := time.Date(2026, time.July, 2, 11, 0, 0, 0, time.UTC)
+	reset, ok := ParseRateLimitResetFromLog(logFile, now)
+	if !ok {
+		t.Fatal("ParseRateLimitResetFromLog should parse the terminal time-only hint")
+	}
+	want := time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC)
+	if !reset.Equal(want) {
+		t.Errorf("reset = %v, want %v", reset, want)
+	}
+}
+
+// #805 review: when several "try again at" hints survive into the scanned
+// output, the LAST parseable one wins — the terminal error beats an earlier
+// echo — and an unparseable trailing capture falls back to the previous
+// parseable hint instead of failing the whole parse.
+func TestParseRateLimitResetAt_LastParseableHintWins(t *testing.T) {
+	now := time.Date(2026, time.July, 2, 8, 0, 0, 0, time.UTC)
+
+	echoThenTerminal := "the issue body quotes the provider: try again at 9:00 AM.\n" +
+		codexTimeOnlySignature + "\n"
+	got, ok := ParseRateLimitResetAt(echoThenTerminal, now)
+	if !ok {
+		t.Fatal("expected the terminal hint to parse")
+	}
+	want := time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("reset = %v, want %v — the terminal hint must beat the earlier echo", got, want)
+	}
+
+	terminalThenGarbage := codexTimeOnlySignature + "\n" +
+		"and the docs say to try again at some point soon.\n"
+	got, ok = ParseRateLimitResetAt(terminalThenGarbage, now)
+	if !ok {
+		t.Fatal("an unparseable trailing capture must fall back to the earlier parseable hint")
+	}
+	if !got.Equal(want) {
+		t.Errorf("reset = %v, want %v", got, want)
 	}
 }

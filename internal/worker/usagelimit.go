@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"os"
 	"regexp"
 	"strings"
 )
@@ -81,16 +80,9 @@ func DetectUsageLimit(output string, extraPatterns []string) (bool, string) {
 // earlier by the provider-limit path (any worker age) with the provider's own
 // RetryAfter.
 func IsUsageLimit(logFile string, extraPatterns []string) (bool, string) {
-	if logFile == "" {
+	tail, ok := logTail(logFile, authFailureTailLines)
+	if !ok {
 		return false, ""
 	}
-	data, err := os.ReadFile(logFile)
-	if err != nil {
-		return false, ""
-	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > authFailureTailLines {
-		lines = lines[len(lines)-authFailureTailLines:]
-	}
-	return DetectUsageLimit(strings.Join(lines, "\n"), extraPatterns)
+	return DetectUsageLimit(tail, extraPatterns)
 }

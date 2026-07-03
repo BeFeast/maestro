@@ -631,9 +631,13 @@ func (o *Orchestrator) isRateLimited(logFile string) bool {
 	return worker.IsRateLimited(logFile)
 }
 
-// rateLimitResetFromLog reads a dead worker's log file and parses the
+// rateLimitResetFromLog reads a dead worker's log tail and parses the
 // provider-stated reset time ("try again at ...") if present. It returns nil
-// when the log is unreadable or carries no parseable reset hint.
+// when the log is unreadable or carries no parseable reset hint. Only the log
+// tail is scanned, and the last parseable hint in it wins: a long-running
+// worker can echo the live quota text as prompt or work content and later die
+// for an unrelated reason, and a whole-log first-match scan read that echo as
+// the terminal error (#805 review).
 //
 // Per issue #663, a nil result from this function is the orchestrator's signal
 // that the rate-limit detection is LOW-confidence: the classifier matched a
@@ -648,10 +652,6 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 	if logFile == "" {
 		return nil
 	}
-	data, err := os.ReadFile(logFile)
-	if err != nil {
-		return nil
-	}
 	// Resolve a time-only reset hint ("try again at 12:30 PM", #805) against
 	// the log's last write — the moment the CLI printed the hint — not the
 	// moment the daemon got around to reading it. A dead worker can sit
@@ -664,7 +664,7 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 	if fi, statErr := os.Stat(logFile); statErr == nil {
 		ref = fi.ModTime().UTC()
 	}
-	if reset, ok := worker.ParseRateLimitResetAt(string(data), ref); ok {
+	if reset, ok := worker.ParseRateLimitResetFromLog(logFile, ref); ok {
 		return &reset
 	}
 	return nil
@@ -678,6 +678,12 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 // through to the ordinary worker-died handling instead of triggering a false
 // backend fallback. The non-nil resetAt is also returned so callers can
 // stamp BackendHealth.RetryAfter without re-reading the log.
+//
+// Both the classifier and the reset parse scan only the log TAIL (the CLI's
+// terminal output), like every other post-mortem backend-failure detector: a
+// long-running worker that echoed the live quota text mid-log — prompt
+// context, work output touching this very signature — and later died
+// normally must not be classified as a provider limit (#805 review).
 func (o *Orchestrator) providerRateLimitFromLog(logFile string) (hit bool, resetAt *time.Time) {
 	if !o.isRateLimited(logFile) {
 		return false, nil

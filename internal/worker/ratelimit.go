@@ -116,18 +116,40 @@ func OutputContainsRateLimit(output string) bool {
 	return hit
 }
 
-// IsRateLimited checks if a log file contains rate-limit error messages.
-// It reads the entire file and looks for known rate-limit patterns.
-// Used to detect rate-limiting in dead workers for fallback logic.
-func IsRateLimited(logFile string) bool {
+// logTail reads a dead worker's log file and returns its last n lines. It is
+// the shared read for every post-mortem log classifier in this package: the
+// error that killed a CLI is its terminal output, while earlier log content
+// can echo the same strings as prompt or work content (a worker fixing a
+// quota classifier, a runbook quoting the provider message). ok=false means
+// the path is empty or the file is unreadable.
+func logTail(logFile string, n int) (string, bool) {
 	if logFile == "" {
-		return false
+		return "", false
 	}
 	data, err := os.ReadFile(logFile)
 	if err != nil {
+		return "", false
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+// IsRateLimited checks whether a dead worker's log file ends with a
+// rate-limit error message. Only the last authFailureTailLines lines are
+// scanned — a long-running worker can echo live quota text as prompt or work
+// output and later die for an unrelated reason; scanning the whole log let
+// that echo classify the death as a provider limit (#805 review). The
+// terminal error that actually killed the CLI is always within the tail.
+// Used to detect rate-limiting in dead workers for fallback logic.
+func IsRateLimited(logFile string) bool {
+	tail, ok := logTail(logFile, authFailureTailLines)
+	if !ok {
 		return false
 	}
-	return OutputContainsRateLimit(string(data))
+	return OutputContainsRateLimit(tail)
 }
 
 // ClassifyRateLimit inspects output for a rate-limit signal and reports both
@@ -182,15 +204,37 @@ func ParseRateLimitReset(output string) (time.Time, bool) {
 // wall-clock time strictly after now. Without this, the reset went unparsed,
 // the death stayed a low-confidence rate-limit signal (#663), and the
 // orchestrator burned the per-issue retry budget on a quota-dead backend.
+//
+// When the output carries several "try again at" hints, the LAST parseable
+// one wins: the hint the provider printed as the CLI died is the most recent
+// output, while an earlier occurrence can be an echo of prompt or work
+// content quoting the same message (#805 review).
 func ParseRateLimitResetAt(output string, now time.Time) (time.Time, bool) {
-	m := rateLimitResetRe.FindStringSubmatch(output)
-	if m == nil {
+	matches := rateLimitResetRe.FindAllStringSubmatch(output, -1)
+	for i := len(matches) - 1; i >= 0; i-- {
+		if ts, ok := parseResetTimestamp(matches[i][1]); ok {
+			return ts, true
+		}
+		if ts, ok := parseTimeOnlyReset(matches[i][1], now); ok {
+			return ts, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// ParseRateLimitResetFromLog extracts the provider-stated reset hint from a
+// dead worker's log file, resolving time-only hints against the given
+// reference time. Like IsRateLimited it scans only the last
+// authFailureTailLines lines — a "try again at ..." echoed mid-log as prompt
+// or work content must not lend a later, unrelated death a high-confidence
+// reset window (#805 review). ok=false when the file is unreadable or the
+// tail carries no parseable hint.
+func ParseRateLimitResetFromLog(logFile string, now time.Time) (time.Time, bool) {
+	tail, ok := logTail(logFile, authFailureTailLines)
+	if !ok {
 		return time.Time{}, false
 	}
-	if ts, ok := parseResetTimestamp(m[1]); ok {
-		return ts, true
-	}
-	return parseTimeOnlyReset(m[1], now)
+	return ParseRateLimitResetAt(tail, now)
 }
 
 // parseTimeOnlyReset resolves a clock-only "<when>" capture ("12:30 PM",
