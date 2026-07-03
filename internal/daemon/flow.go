@@ -8,6 +8,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/server"
 )
@@ -168,6 +169,10 @@ func (d *Daemon) stopFlow(key string) {
 // RunOnce is not ctx-cancellable mid-cycle, so the sum could be many minutes
 // (#764).
 func (d *Daemon) stopAll() {
+	// Covers the teardown paths where Drain never ran (e.g. a serve error):
+	// gh reads fail fast on rate limits instead of blocking flow stop (#797).
+	github.BeginShutdown()
+
 	d.mu.Lock()
 	flows := make([]*projectFlow, 0, len(d.flows))
 	for _, flow := range d.flows {

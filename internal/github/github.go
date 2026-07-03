@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -195,6 +197,12 @@ func ghAPI(endpoint string) ([]byte, error) {
 //     honoring an explicit Retry-After hint when gh surfaces one and otherwise
 //     backing off exponentially (with jitter, capped) — so a transient 403
 //     degrades to a brief stall + retry instead of a failed cycle.
+//
+// #797 layers three more protections on top: conditional (ETag/If-None-Match)
+// requests so unchanged polling reads answer 304 and consume no quota, a
+// per-process usage counter with an hourly journal digest, and a shutdown
+// fail-fast mode (BeginShutdown) that skips retries so a rate-limited window
+// cannot stall a drain.
 const (
 	ghAPIMaxAttempts = 4
 	ghAPIBaseBackoff = 2 * time.Second
@@ -209,7 +217,16 @@ var ghAPIRunner = func(args ...string) ([]byte, error) {
 }
 
 // ghAPISleep is the backoff sleeper, injectable so tests do not actually wait.
-var ghAPISleep = time.Sleep
+// The default waits on a timer but returns early once BeginShutdown fires, so
+// an in-flight backoff cannot hold up daemon stop (#797).
+var ghAPISleep = func(d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ghShutdownChan():
+	}
+}
 
 // ghAPIJitterFrac yields a random fraction in [0,1) used to spread retry
 // backoff so the fleet's flows do not re-burst in lockstep after a shared 403.
@@ -217,17 +234,383 @@ var ghAPIJitterFrac = rand.Float64
 
 var ghRetryAfterRe = regexp.MustCompile(`(?i)retry-after:\s*(\d+)`)
 
+// ---------------------------------------------------------------------------
+// Shutdown fail-fast (#797). During the 2026-07-02 incident a drain that had
+// ZERO in-flight workers took 20+ minutes to stop because the still-live flows
+// kept polling a rate-limited GitHub and every read sat in the #794 backoff
+// loop. Once shutdown begins, a rate-limited response must degrade to a failed
+// cycle (retried after restart / next tick), never to minutes of sleeping.
+// ---------------------------------------------------------------------------
+
+var (
+	ghShutdownMu    sync.Mutex
+	ghShutdownCh    = make(chan struct{})
+	ghShutdownBegun bool
+)
+
+// BeginShutdown switches the gh wrapper into fail-fast mode for the rest of
+// the process lifetime: rate-limited responses are no longer retried and a
+// backoff already sleeping is cut short. The daemon calls it when drain or
+// teardown starts so a rate-limited window cannot block flow stop (#797).
+// Idempotent.
+func BeginShutdown() {
+	ghShutdownMu.Lock()
+	defer ghShutdownMu.Unlock()
+	if !ghShutdownBegun {
+		ghShutdownBegun = true
+		close(ghShutdownCh)
+	}
+}
+
+// ShuttingDown reports whether BeginShutdown has been called.
+func ShuttingDown() bool {
+	select {
+	case <-ghShutdownChan():
+		return true
+	default:
+		return false
+	}
+}
+
+func ghShutdownChan() <-chan struct{} {
+	ghShutdownMu.Lock()
+	defer ghShutdownMu.Unlock()
+	return ghShutdownCh
+}
+
+// resetShutdownForTest re-arms the one-way shutdown flag so tests can exercise
+// the fail-fast path without poisoning the rest of the test binary.
+func resetShutdownForTest() {
+	ghShutdownMu.Lock()
+	defer ghShutdownMu.Unlock()
+	ghShutdownCh = make(chan struct{})
+	ghShutdownBegun = false
+}
+
+// ---------------------------------------------------------------------------
+// Conditional (ETag) request layer (#797). The fleet's steady-state REST
+// consumption is dominated by per-cycle polling reads (open-PR lists, per-PR
+// lookups, check-runs, combined status) whose responses rarely change between
+// cycles. GitHub answers a conditional GET whose ETag still matches with
+// 304 Not Modified WITHOUT consuming the hourly REST quota, so the wrapper
+// remembers each endpoint's last ETag + body and replays the request with
+// If-None-Match. A 304 is served from the local copy for free; anything else
+// refreshes the cache. Merge-gating correctness is unchanged: a 304 is
+// GitHub's own guarantee that a 200 would have returned identical content.
+// ---------------------------------------------------------------------------
+
+const (
+	// etagCacheMaxEntries bounds the endpoint cache. The steady-state working
+	// set is a few dozen endpoints per flow, so this covers a large fleet;
+	// eviction is a safety valve, not a tuning knob.
+	etagCacheMaxEntries = 1024
+	// etagCacheMaxBody skips caching pathologically large responses so a
+	// long-lived daemon's memory stays bounded.
+	etagCacheMaxBody = 1 << 20
+)
+
+type etagEntry struct {
+	etag     string
+	body     []byte
+	lastUsed time.Time
+}
+
+var (
+	etagMu    sync.Mutex
+	etagCache = map[string]*etagEntry{}
+)
+
+func etagLookup(key string) (etag string, body []byte) {
+	etagMu.Lock()
+	defer etagMu.Unlock()
+	e, ok := etagCache[key]
+	if !ok {
+		return "", nil
+	}
+	e.lastUsed = time.Now()
+	return e.etag, e.body
+}
+
+func etagStore(key, etag string, body []byte) {
+	if etag == "" || len(body) > etagCacheMaxBody {
+		etagDrop(key)
+		return
+	}
+	etagMu.Lock()
+	defer etagMu.Unlock()
+	if _, exists := etagCache[key]; !exists && len(etagCache) >= etagCacheMaxEntries {
+		evictOldestETagLocked()
+	}
+	etagCache[key] = &etagEntry{etag: etag, body: body, lastUsed: time.Now()}
+}
+
+func etagDrop(key string) {
+	etagMu.Lock()
+	defer etagMu.Unlock()
+	delete(etagCache, key)
+}
+
+func evictOldestETagLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for k, e := range etagCache {
+		if oldestKey == "" || e.lastUsed.Before(oldest) {
+			oldestKey, oldest = k, e.lastUsed
+		}
+	}
+	if oldestKey != "" {
+		delete(etagCache, oldestKey)
+	}
+}
+
+// ghConditionalEligible reports whether a gh api call can carry conditional
+// request headers. Plain GETs — no extra args, or --paginate only — are
+// eligible; whether a paginated response may actually be cached is decided per
+// response by paginatedCacheable, and multi-page responses are never cached.
+// rate_limit is excluded: its body changes on every read, so a conditional
+// fetch would never hit.
+func ghConditionalEligible(endpoint string, args []string) bool {
+	if endpoint == "rate_limit" {
+		return false
+	}
+	for _, a := range args {
+		if a != "--paginate" {
+			return false
+		}
+	}
+	return true
+}
+
+// ghHTTPStatusLine matches the status line gh prints at the start of each
+// header block under --include, anchored at line start. It cannot collide with
+// response content: GitHub's JSON escapes control characters inside strings,
+// so a raw newline followed by "HTTP/" only ever comes from gh itself.
+var ghHTTPStatusLine = regexp.MustCompile(`(?m)^HTTP/[0-9.]+ (\d{3})`)
+
+// ghHTTPResponse is a parsed `gh api --include` exchange. With --paginate gh
+// prints one header block per page; body is every page's body concatenated
+// (the same shape a plain --paginate call yields) while status/etag describe
+// the FIRST block.
+type ghHTTPResponse struct {
+	status int
+	etag   string
+	body   []byte
+	blocks int
+	allOK  bool // every block's status was 2xx
+}
+
+// parseGHConditionalResponse splits combined --include output into status,
+// ETag, and body. ok=false when out does not start with a header block (e.g.
+// gh did not honor --include, or the output is only an error message); the
+// caller should then treat out as a plain body / error text.
+func parseGHConditionalResponse(out []byte) (ghHTTPResponse, bool) {
+	locs := ghHTTPStatusLine.FindAllSubmatchIndex(out, -1)
+	if len(locs) == 0 || locs[0][0] != 0 {
+		return ghHTTPResponse{}, false
+	}
+	resp := ghHTTPResponse{blocks: len(locs), allOK: true}
+	var body []byte
+	for i, loc := range locs {
+		status, convErr := strconv.Atoi(string(out[loc[2]:loc[3]]))
+		if convErr != nil {
+			return ghHTTPResponse{}, false
+		}
+		blockEnd := len(out)
+		if i+1 < len(locs) {
+			blockEnd = locs[i+1][0]
+		}
+		headers, blockBody := splitHeadersAndBody(out[loc[0]:blockEnd])
+		if i == 0 {
+			resp.status = status
+			resp.etag = headerValue(headers, "etag")
+		}
+		if status < 200 || status > 299 {
+			resp.allOK = false
+		}
+		body = append(body, blockBody...)
+	}
+	resp.body = body
+	return resp, true
+}
+
+// splitHeadersAndBody splits one header block from its body at the first blank
+// line. A block with no blank line (e.g. a bodyless 304) is all headers.
+func splitHeadersAndBody(block []byte) (headers, body []byte) {
+	for _, sep := range [][]byte{[]byte("\r\n\r\n"), []byte("\n\n")} {
+		if idx := bytes.Index(block, sep); idx >= 0 {
+			return block[:idx], block[idx+len(sep):]
+		}
+	}
+	return block, nil
+}
+
+func headerValue(headers []byte, name string) string {
+	for _, line := range strings.Split(string(headers), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(k), name) {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// resolveConditional interprets a --include exchange for a conditional GET.
+// served=true means GitHub answered 304 Not Modified and body is the cached
+// copy — the request consumed no quota. resolved=false means the exchange did
+// not yield a trustworthy body: with runErr != nil the caller falls through to
+// normal rate-limit/error handling; with runErr == nil (an inconsistent
+// conditional shape, e.g. a paginated response embedding a non-2xx page) the
+// caller must drop the cache entry and refetch plain. paginated marks a
+// --paginate call, whose responses are cached only when paginatedCacheable
+// proves a later 304 cannot hide pages beyond the cached one.
+func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []byte, paginated bool) (body []byte, served bool, resolved bool) {
+	resp, ok := parseGHConditionalResponse(out)
+	if !ok {
+		// No header block. Trust a successful run's output as the plain body
+		// (gh ignored --include); a 304 whose headers were swallowed still
+		// shows up in gh's error text and is safely served from cache.
+		if runErr == nil {
+			return out, false, true
+		}
+		if cachedBody != nil && strings.Contains(string(out), "HTTP 304") {
+			return cachedBody, true, true
+		}
+		return nil, false, false
+	}
+	if resp.status == 304 && cachedBody != nil {
+		return cachedBody, true, true
+	}
+	if runErr == nil && resp.allOK {
+		if resp.blocks == 1 && (!paginated || paginatedCacheable(resp.body, endpointPerPage(endpoint))) {
+			etagStore(endpoint, resp.etag, resp.body)
+		} else {
+			// A multi-page response cannot be cached: the first page's ETag
+			// does not validate the concatenated whole. A full single page is
+			// not cached either — see paginatedCacheable.
+			etagDrop(endpoint)
+		}
+		return resp.body, false, true
+	}
+	return nil, false, false
+}
+
+// paginatedCacheable reports whether a single-page --paginate body may be
+// cached for If-None-Match revalidation. A 304 only certifies that page ONE is
+// unchanged: if the collection has meanwhile grown past the page size, the new
+// items live on a page the bodyless 304 carries no Link header to discover,
+// and serving the cache would hide them (e.g. review comments appended past
+// item 100). Caching is therefore limited to shapes where an unchanged first
+// page proves the whole collection is unchanged:
+//
+//   - a JSON array with fewer than per_page items — any growth lands on this
+//     page and changes its bytes;
+//   - a JSON object carrying GitHub's total_count (check-runs et al.) — growth
+//     anywhere changes the count on page one.
+//
+// A full single page (exactly per_page array items) is the one shape that can
+// overflow invisibly, so it is never cached.
+func paginatedCacheable(body []byte, perPage int) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+	switch trimmed[0] {
+	case '[':
+		var items []json.RawMessage
+		if err := json.Unmarshal(trimmed, &items); err != nil {
+			return false
+		}
+		return len(items) < perPage
+	case '{':
+		var probe struct {
+			TotalCount *int64 `json:"total_count"`
+		}
+		return json.Unmarshal(trimmed, &probe) == nil && probe.TotalCount != nil
+	}
+	return false
+}
+
+var ghPerPageRE = regexp.MustCompile(`[?&]per_page=(\d+)`)
+
+// endpointPerPage returns the page size a paginated endpoint requested,
+// defaulting to GitHub's 30 when the query string does not say.
+func endpointPerPage(endpoint string) int {
+	if m := ghPerPageRE.FindStringSubmatch(endpoint); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 30
+}
+
+// ghConditionalErrorDetail returns the body portion of a --include response so
+// error logs surface GitHub's message rather than a screenful of headers; out
+// is returned unchanged when it carries no header block.
+func ghConditionalErrorDetail(out []byte) []byte {
+	if resp, ok := parseGHConditionalResponse(out); ok {
+		return resp.body
+	}
+	return out
+}
+
 func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
+	conditional := ghConditionalEligible(endpoint, args)
+	paginated := false
+	for _, a := range args {
+		if a == "--paginate" {
+			paginated = true
+		}
+	}
 	cmdArgs := append([]string{"api", endpoint}, args...)
+	var cachedBody []byte
+	if conditional {
+		var cachedETag string
+		cachedETag, cachedBody = etagLookup(endpoint)
+		cmdArgs = append(cmdArgs, "--include")
+		if cachedETag != "" {
+			cmdArgs = append(cmdArgs, "-H", "If-None-Match: "+cachedETag)
+		}
+	}
 	var out []byte
 	var err error
+	anomaly := false
 	for attempt := 0; attempt < ghAPIMaxAttempts; attempt++ {
+		anomaly = false
 		out, err = ghAPIRunner(cmdArgs...)
-		if err == nil {
+		if conditional {
+			body, served, resolved := resolveConditional(endpoint, out, err, cachedBody, paginated)
+			if resolved {
+				noteAPIRequest(served, false)
+				return body, nil
+			}
+		} else if err == nil {
+			noteAPIRequest(false, false)
 			return out, nil
 		}
+		if err == nil {
+			// A conditional exchange in a shape we refuse to trust: drop the
+			// cache entry and refetch plain so behavior matches the
+			// unconditional path.
+			anomaly = true
+			noteAPIRequest(false, false)
+			etagDrop(endpoint)
+			conditional = false
+			cachedBody = nil
+			cmdArgs = append([]string{"api", endpoint}, args...)
+			continue
+		}
 		retryAfter, rateLimited := parseGHRateLimit(out)
+		noteAPIRequest(false, rateLimited)
 		if !rateLimited || attempt == ghAPIMaxAttempts-1 {
+			break
+		}
+		// #797: once shutdown has begun a rate-limited read fails fast — the
+		// backoff loop was observed stretching a 0-worker drain past 20
+		// minutes. The post-sleep check catches a shutdown that began while
+		// the (interruptible) backoff was already sleeping.
+		if ShuttingDown() {
+			log.Printf("[github] gh api %s: rate-limited during shutdown (%s); failing fast without retry",
+				endpoint, ghErrorDetail(ghConditionalErrorDetail(out)))
 			break
 		}
 		wait := retryAfter
@@ -235,16 +618,84 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 			wait = ghBackoffDelay(attempt)
 		}
 		log.Printf("[github] gh api %s: rate-limited (%s); backing off %s before retry %d/%d",
-			endpoint, ghErrorDetail(out), wait.Round(time.Millisecond), attempt+1, ghAPIMaxAttempts-1)
+			endpoint, ghErrorDetail(ghConditionalErrorDetail(out)), wait.Round(time.Millisecond), attempt+1, ghAPIMaxAttempts-1)
 		ghAPISleep(wait)
+		if ShuttingDown() {
+			break
+		}
 	}
 	if err != nil {
-		if detail := ghErrorDetail(out); detail != "" {
+		if detail := ghErrorDetail(ghConditionalErrorDetail(out)); detail != "" {
 			return nil, fmt.Errorf("gh api %s: %w: %s", endpoint, err, detail)
 		}
 		return nil, fmt.Errorf("gh api %s: %w", endpoint, err)
 	}
+	if anomaly {
+		return nil, fmt.Errorf("gh api %s: inconsistent conditional response", endpoint)
+	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// REST usage accounting (#797). The acceptance criterion asks for measured
+// calls/hour before/after via a counter in the gh wrapper: every exchange is
+// counted here and a one-line digest lands in the journal every hour, so an
+// operator can read consumption straight from journalctl and cross-check it
+// against `gh api rate_limit`.
+// ---------------------------------------------------------------------------
+
+// APIStats counts gh REST exchanges. Requests-NotModified approximates what
+// was billed against the core quota (a 304 is free). A --paginate call counts
+// once even when gh fetched several pages, so the digest is a lower bound.
+type APIStats struct {
+	Requests    int64
+	NotModified int64
+	RateLimited int64
+}
+
+// apiUsageLogEvery is how often the wrapper writes the one-line usage digest.
+const apiUsageLogEvery = time.Hour
+
+var (
+	apiStatsMu     sync.Mutex
+	apiStatsTotal  APIStats
+	apiStatsWindow APIStats
+	apiWindowStart time.Time
+	apiUsageNow    = time.Now // injectable for tests
+)
+
+func noteAPIRequest(notModified, rateLimited bool) {
+	apiStatsMu.Lock()
+	defer apiStatsMu.Unlock()
+	now := apiUsageNow()
+	if apiWindowStart.IsZero() {
+		apiWindowStart = now
+	} else if elapsed := now.Sub(apiWindowStart); elapsed >= apiUsageLogEvery {
+		// Roll the window before counting so the request that crossed the
+		// boundary opens the new window instead of vanishing with the digest.
+		w := apiStatsWindow
+		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited",
+			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited)
+		apiStatsWindow = APIStats{}
+		apiWindowStart = now
+	}
+	for _, s := range []*APIStats{&apiStatsTotal, &apiStatsWindow} {
+		s.Requests++
+		if notModified {
+			s.NotModified++
+		}
+		if rateLimited {
+			s.RateLimited++
+		}
+	}
+}
+
+// APIUsage returns the process-lifetime REST exchange counters, the same
+// numbers the hourly journal digest reports per window.
+func APIUsage() APIStats {
+	apiStatsMu.Lock()
+	defer apiStatsMu.Unlock()
+	return apiStatsTotal
 }
 
 // parseGHRateLimit reports whether gh's combined output looks like a primary or
@@ -1150,9 +1601,9 @@ func (c *Client) PRHighSeverityReviewOnHead(prNumber int) (sha string, findings 
 }
 
 func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, error) {
-	out, err := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/pulls/%d/comments", c.Repo, prNumber),
-		"--paginate").Output()
+	// Routed through the shared wrapper (#797) so this per-cycle read gets the
+	// rate-limit backoff, the conditional-request cache, and usage accounting.
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return nil, err
 	}
@@ -1768,11 +2219,10 @@ var reviewLocationPattern = regexp.MustCompile(`(?mi)(^|\s)([A-Za-z0-9_./-]+\.[A
 
 // CollectReviewFeedback collects actionable inline review comments from Greptile and Codex on a PR.
 func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
-	// Get HEAD SHA — only return comments on the latest commit
-	prOut, _ := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber),
-		"--jq", ".head.sha").Output()
-	headSHA := strings.TrimSpace(string(prOut))
+	// Get HEAD SHA — only return comments on the latest commit. Errors are
+	// tolerated (empty SHA matches all comments, as before); the shared
+	// wrapper (#797) gives the read backoff + conditional caching.
+	headSHA, _ := c.pullHeadSHA(prNumber)
 
 	comments, err := c.greptileReviewComments(prNumber)
 	if err != nil {
@@ -2210,10 +2660,9 @@ func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 func (c *Client) CollectPRReviewFeedback(prNumber int) (string, error) {
 	var sections []string
 
-	// 1. Fetch issue-level comments (Greptile summary with confidence score)
-	issueCommentsOut, err := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/issues/%d/comments", c.Repo, prNumber),
-		"--paginate").Output()
+	// 1. Fetch issue-level comments (Greptile summary with confidence score),
+	// via the shared wrapper (#797) for backoff + conditional caching.
+	issueCommentsOut, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err == nil {
 		var comments []struct {
 			Body string `json:"body"`
