@@ -16,11 +16,13 @@ from the repo root) working in the maestro repository.
   > document records the convention; an operator still has to set that flag for
   > the trailer to actually disappear.
 
-- **Do preserve the `Maestro-Backend:` trailer.** maestro stamps it on commits
-  and PR bodies (`internal/state/attribution.go`,
+- **Do preserve the `Maestro-Backend:` trailer on commits.** maestro stamps it
+  on commit messages (`internal/state/attribution.go`,
   `state.AttributionTrailerKey`) to record the backend timeline for a session.
   It is the canonical, queryable attribution for this repo — never strip,
-  rewrite, or duplicate it.
+  rewrite, or duplicate it. It goes on commits only: PR bodies must contain no
+  backend/model attribution, pids, tmux session names, or host-side paths,
+  because they land on target repos that may be public (#799).
 
 - **Do NOT use GitHub auto-closing keywords** (`Closes`, `Fixes`, `Resolves`,
   and their variants) followed by an issue reference in commit messages, PR

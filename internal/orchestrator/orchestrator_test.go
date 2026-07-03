@@ -401,10 +401,19 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	if !strings.Contains(gotBody, "Refs #108") || strings.Contains(gotBody, "Closes #108") || !strings.Contains(gotBody, "auto-created") {
 		t.Fatalf("unexpected body %q", gotBody)
 	}
-	if !strings.Contains(gotBody, "Maestro-Backend: codex openai gpt-5.5 medium") ||
-		!strings.Contains(gotBody, "; claude anthropic opus-4.8 xhigh") ||
-		!strings.Contains(gotBody, "fallover") {
-		t.Fatalf("body missing attribution trailer: %q", gotBody)
+	if !strings.Contains(gotBody, "feat/mae-8-108-add-branch-rescue") {
+		t.Fatalf("body missing branch name: %q", gotBody)
+	}
+	// The PR body lands on the target repo, which may be public: no backend
+	// attribution, pids, tmux session names, or host-side paths (#799).
+	for _, leak := range []string{
+		"Maestro-Backend", "pid", "tmux", "state_dir",
+		"codex", "openai", "gpt-5.5", "claude", "anthropic", "opus-4.8",
+		"8080", "/tmp/mae-8",
+	} {
+		if strings.Contains(gotBody, leak) {
+			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, gotBody)
+		}
 	}
 	if amendedWorktree != "/tmp/mae-8" || amendedBranch != "feat/mae-8-108-add-branch-rescue" {
 		t.Fatalf("amend target = %q/%q", amendedWorktree, amendedBranch)
@@ -417,7 +426,9 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	}
 }
 
-func TestReconcileRunningSessions_OpenPR_AppendsAttributionTrailer(t *testing.T) {
+// The Maestro-Backend attribution trailer stays on commits only; PR bodies on
+// the (possibly public) target repo must not be rewritten to carry it (#799).
+func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *testing.T) {
 	s := state.NewState()
 	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	s.Sessions["mae-9"] = &state.Session{
@@ -437,8 +448,6 @@ func TestReconcileRunningSessions_OpenPR_AppendsAttributionTrailer(t *testing.T)
 		}},
 	}
 
-	var updatedPR int
-	var updatedBody string
 	var amended bool
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
@@ -450,11 +459,6 @@ func TestReconcileRunningSessions_OpenPR_AppendsAttributionTrailer(t *testing.T)
 				Body:        "Refs #109\n",
 			}}, nil
 		},
-		updatePRBodyFn: func(prNumber int, body string) error {
-			updatedPR = prNumber
-			updatedBody = body
-			return nil
-		},
 		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
 			amended = true
 			return nil
@@ -465,14 +469,37 @@ func TestReconcileRunningSessions_OpenPR_AppendsAttributionTrailer(t *testing.T)
 	if !changed {
 		t.Fatal("expected reconciliation to report changes")
 	}
-	if updatedPR != 145 {
-		t.Fatalf("updated PR = %d, want 145", updatedPR)
+	sess := s.Sessions["mae-9"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
 	}
-	if !strings.Contains(updatedBody, "Maestro-Backend: codex openai gpt-5.5 medium") {
-		t.Fatalf("updated body missing attribution trailer: %q", updatedBody)
+	if sess.PRNumber != 145 {
+		t.Fatalf("pr_number = %d, want 145", sess.PRNumber)
 	}
 	if !amended {
 		t.Fatal("expected branch head amend hook")
+	}
+}
+
+func TestAutoCreatedPRBody_NoOrchestrationInternals(t *testing.T) {
+	sess := &state.Session{
+		IssueNumber: 799,
+		IssueTitle:  "sanitize auto-created PR bodies",
+		PID:         4242,
+		TmuxSession: "maestro-mae-1",
+		Worktree:    "/home/god/worktrees/example/mae-1",
+	}
+	body := autoCreatedPRBody(sess, "feat/mae-1-799-sanitize")
+	if !strings.Contains(body, "Refs #799") {
+		t.Fatalf("body missing issue ref: %q", body)
+	}
+	if !strings.Contains(body, "feat/mae-1-799-sanitize") {
+		t.Fatalf("body missing branch name: %q", body)
+	}
+	for _, leak := range []string{"Maestro-Backend", "pid", "tmux", "state_dir", "4242", "maestro-mae-1", "/home/god"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, body)
+		}
 	}
 }
 

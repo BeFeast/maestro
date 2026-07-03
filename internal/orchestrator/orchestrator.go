@@ -53,7 +53,6 @@ type Orchestrator struct {
 	listOpenPRsFn         func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
-	updatePRBodyFn        func(prNumber int, body string) error
 	amendHeadFn           func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 	hasMergedPRForIssueFn func(issueNumber int) (bool, error)
@@ -290,16 +289,6 @@ func (o *Orchestrator) createPR(title, body, base, head string) (int, error) {
 		o.invalidateCyclePRs()
 	}
 	return prNumber, err
-}
-
-func (o *Orchestrator) updatePRBody(prNumber int, body string) error {
-	if o.updatePRBodyFn != nil {
-		return o.updatePRBodyFn(prNumber, body)
-	}
-	if o.gh == nil {
-		return fmt.Errorf("no github client configured for PR body update")
-	}
-	return o.gh.UpdatePRBody(prNumber, body)
 }
 
 func (o *Orchestrator) hasOpenPRForIssue(issueNumber int) (bool, error) {
@@ -2261,7 +2250,6 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// IssueInProgress to return false and startNewWorkers to spawn a duplicate.
 		if pr, found := branchToPR[sess.Branch]; found {
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
-			o.ensureAttributionTrailerOnPR(slotName, sess, pr)
 			o.ensureAttributionTrailerOnBranch(slotName, sess)
 			log.Printf("[orch] reconcile: %s running->pr_open (PR #%d already open for branch %q; %s)",
 				slotName, pr.Number, sess.Branch, strings.Join(reasons, ", "))
@@ -2277,7 +2265,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			continue
 		}
 		if prErr == nil {
-			if prNumber, ok := o.tryCreatePRForPushedBranch(slotName, sess, reasons); ok {
+			if prNumber, ok := o.tryCreatePRForPushedBranch(slotName, sess); ok {
 				log.Printf("[orch] reconcile: %s running->pr_open (auto-created PR #%d for pushed branch %q; %s)",
 					slotName, prNumber, sess.Branch, strings.Join(reasons, ", "))
 				reconciled = true
@@ -2469,7 +2457,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 	return reconciled
 }
 
-func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.Session, reasons []string) (int, bool) {
+func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.Session) (int, bool) {
 	branch := strings.TrimSpace(sess.Branch)
 	if branch == "" {
 		return 0, false
@@ -2485,7 +2473,7 @@ func (o *Orchestrator) tryCreatePRForPushedBranch(slotName string, sess *state.S
 
 	title := autoCreatedPRTitle(sess)
 	o.ensureAttributionTrailerOnBranch(slotName, sess)
-	body := state.AppendAttributionTrailer(autoCreatedPRBody(sess, branch, reasons), sess.Attribution, time.Now().UTC())
+	body := autoCreatedPRBody(sess, branch)
 	prNumber, err := o.createPR(title, body, "main", branch)
 	if err != nil {
 		log.Printf("[orch] reconcile: could not auto-create PR for %s branch %q: %v", slotName, branch, err)
@@ -2523,30 +2511,16 @@ func autoCreatedPRTitle(sess *state.Session) string {
 	return title
 }
 
-func autoCreatedPRBody(sess *state.Session, branch string, reasons []string) string {
-	reasonText := strings.TrimSpace(strings.Join(reasons, ", "))
-	if reasonText == "" {
-		reasonText = "worker process exited before PR creation was observed"
-	}
+// autoCreatedPRBody renders the public PR body for the reconcile auto-create
+// path: issue ref, branch, and a neutral one-liner only. Backend attribution,
+// pids, tmux session names, and host paths must never appear here — the PR
+// body lands on the target repo, which may be public (#799). Observed-worker-
+// state diagnostics stay in the orchestrator log at the call site.
+func autoCreatedPRBody(sess *state.Session, branch string) string {
 	return fmt.Sprintf(`Refs #%d
 
-Maestro auto-created this PR because the worker pushed branch %s but exited before opening a pull request.
-
-Observed worker state: %s.
-`, sess.IssueNumber, branch, reasonText)
-}
-
-func (o *Orchestrator) ensureAttributionTrailerOnPR(slotName string, sess *state.Session, pr github.PR) {
-	if sess == nil || len(sess.Attribution) == 0 {
-		return
-	}
-	body := state.AppendAttributionTrailer(pr.Body, sess.Attribution, time.Now().UTC())
-	if body == pr.Body {
-		return
-	}
-	if err := o.updatePRBody(pr.Number, body); err != nil {
-		log.Printf("[orch] attribution: could not update PR #%d body for %s: %v", pr.Number, slotName, err)
-	}
+Maestro auto-created this pull request for pushed branch %s because no open pull request was found for it.
+`, sess.IssueNumber, branch)
 }
 
 func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *state.Session) {
@@ -2649,7 +2623,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if sess.Status == state.StatusDead && sess.NextRetryAt != nil {
 						continue
 					}
-					o.ensureAttributionTrailerOnPR(slotName, sess, pr)
 					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] session %s %s->pr_open (PR #%d now open for branch %q)", slotName, sess.Status, pr.Number, sess.Branch)
 					sess.Status = state.StatusPROpen
@@ -2770,7 +2743,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
-					o.ensureAttributionTrailerOnPR(slotName, sess, pr)
 					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
 					sess.Status = state.StatusPROpen
@@ -3232,7 +3204,6 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if sess.PRNumber == 0 {
 			sess.PRNumber = pr.Number
 		}
-		o.ensureAttributionTrailerOnPR(slotName, sess, pr)
 		o.ensureAttributionTrailerOnBranch(slotName, sess)
 
 		// #705: opt-in visual evidence for UI-affecting PRs. One-shot,
