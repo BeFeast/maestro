@@ -12,6 +12,17 @@ import (
 // burned the whole per-issue retry budget respawning on the same dead backend.
 const codexUsageLimitDeath = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/codex/settings/usage) or try again at 12:30 PM."
 
+// #808 live Claude/Fable subscription signatures (BeFeast ok-player / ok-folio
+// fleet, 2026-07-03). Each was printed by the claude CLI as it exited on an
+// account-level quota; the daemon saw only "pid dead, tmux missing" and looped
+// respawns on the same exhausted backend until the issue was wrongly blocked.
+// The Codex-shaped built-in patterns matched none of them.
+const (
+	claudeFableLimitDeath   = "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model." // ok-player-23.log
+	claudeSessionLimitDeath = "You've hit your session limit · resets 9am (UTC)"                                                // ok-player-18.log
+	claudeExtraUsageDeath   = "You're out of extra usage · resets 4:10pm (UTC)"                                                 // bot-34.log
+)
+
 func TestDetectUsageLimit_KnownSignatures(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -23,6 +34,11 @@ func TestDetectUsageLimit_KnownSignatures(t *testing.T) {
 		{"codex usage url only", "See chatgpt.com/codex/settings/usage for details", "codex_usage_limit"},
 		{"claude usage limit reached", "Claude usage limit reached. Your limit will reset at 3am", "usage_limit_reached"},
 		{"claude 5-hour window", "5-hour limit reached ∙ resets 3am", "usage_limit_reached"},
+		// #808 live Claude/Fable signatures.
+		{"claude fable limit", claudeFableLimitDeath, "reached_limit"},
+		{"claude usage-credits marker only", "Run /usage-credits to continue.", "usage_credits"},
+		{"claude session limit", claudeSessionLimitDeath, "hit_limit"},
+		{"claude out of extra usage", claudeExtraUsageDeath, "out_of_usage"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
