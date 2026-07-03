@@ -1065,6 +1065,7 @@ func (e *Engine) detectStuckStates(st *state.State, now time.Time, prs []github.
 	findings = append(findings, e.detectEnvironmentStuckStates(st, eligible)...)
 	findings = append(findings, e.detectBackendAuthFailureStuckStates(st, now)...)
 	findings = append(findings, e.detectBackendModelUnavailableStuckStates(st, now)...)
+	findings = append(findings, e.detectBackendUsageLimitStuckStates(st, now)...)
 	findings = append(findings, e.detectBackendQuotaPressureStuckStates(st, now)...)
 	findings = append(findings, e.detectOutcomeStuckStates(st)...)
 	findings = append(findings, detectVisualEvidenceStuckStates(st)...)
@@ -1204,6 +1205,60 @@ func (e *Engine) detectBackendModelUnavailableStuckStates(st *state.State, now t
 		findings = append(findings, stuckState("backend_model_unavailable", severity,
 			fmt.Sprintf("Backend %s cannot load its configured model (unavailable, renamed, or no access); workers cannot use it.", name),
 			"Point the backend at an available model id (or restore model access for this account); fallback backends keep the queue moving meanwhile and the per-issue retry budget is preserved.", false, nil,
+			evidence...))
+	}
+	return findings
+}
+
+// detectBackendUsageLimitStuckStates surfaces backends gated because a dead
+// worker's log matched an account-quota exhaustion signature (#805; live:
+// codex "You've hit your usage limit"). Distinct from the predictive
+// quota_pressure gate (#704, token-estimate based) — this is the provider
+// itself refusing work — and from provider_limit (which carries a
+// provider-stated reset). The remediation is time, not credentials: the gate
+// self-clears at RetryAfter and fallback backends keep the queue moving
+// meanwhile, with the per-issue retry budget preserved. The default backend
+// going dark is blocking (every new spawn prefers it); a non-default backend
+// is a warning because routing can avoid it.
+func (e *Engine) detectBackendUsageLimitStuckStates(st *state.State, now time.Time) []state.SupervisorStuckState {
+	if st == nil || len(st.BackendHealth) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(st.BackendHealth))
+	for name := range st.BackendHealth {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var findings []state.SupervisorStuckState
+	for _, name := range names {
+		health := st.BackendHealth[name]
+		if health.State != state.BackendHealthCooldown || health.Reason != state.BackendBlockUsageLimit {
+			continue
+		}
+		if health.RetryAfter != nil && !now.Before(*health.RetryAfter) {
+			continue // cooldown elapsed; the selector will re-probe the backend
+		}
+		severity := SeverityWarning
+		if name == e.cfg.Model.Default {
+			severity = SeverityBlocked
+		}
+		evidence := []string{fmt.Sprintf("backend=%s", name)}
+		if health.Pattern != "" {
+			evidence = append(evidence, fmt.Sprintf("signature=%s", health.Pattern))
+		}
+		if !health.Since.IsZero() {
+			evidence = append(evidence, fmt.Sprintf("since=%s", health.Since.Format(time.RFC3339)))
+		}
+		if health.RetryAfter != nil {
+			evidence = append(evidence, fmt.Sprintf("retry_after=%s", health.RetryAfter.Format(time.RFC3339)))
+		}
+		if health.LastSession != "" {
+			evidence = append(evidence, fmt.Sprintf("last_session=%s", health.LastSession))
+		}
+		findings = append(findings, stuckState("backend_usage_limit", severity,
+			fmt.Sprintf("Backend %s has exhausted its account usage quota; workers cannot use it until the provider window resets.", name),
+			"No credential action needed — the gate self-clears when the quota window resets (retry_after); fallback backends keep the queue moving meanwhile and the per-issue retry budget is preserved. If this recurs every window, raise the plan limit or rebalance dispatch.", false, nil,
 			evidence...))
 	}
 	return findings

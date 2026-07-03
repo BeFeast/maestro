@@ -68,6 +68,7 @@ type Orchestrator struct {
 	rateLimitResetFromLogFn   func(logFile string) *time.Time
 	authFailureFromLogFn      func(logFile string) (bool, string)
 	modelUnavailableFromLogFn func(logFile string) (bool, string)
+	usageLimitFromLogFn       func(logFile string, extraPatterns []string) (bool, string)
 	// workerRespawnFn / respawnWorkerFn: used by respawnWorker() for dead-worker fallback (tests set one or the other)
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
@@ -630,9 +631,13 @@ func (o *Orchestrator) isRateLimited(logFile string) bool {
 	return worker.IsRateLimited(logFile)
 }
 
-// rateLimitResetFromLog reads a dead worker's log file and parses the
+// rateLimitResetFromLog reads a dead worker's log tail and parses the
 // provider-stated reset time ("try again at ...") if present. It returns nil
-// when the log is unreadable or carries no parseable reset hint.
+// when the log is unreadable or carries no parseable reset hint. Only the log
+// tail is scanned, and the last parseable hint in it wins: a long-running
+// worker can echo the live quota text as prompt or work content and later die
+// for an unrelated reason, and a whole-log first-match scan read that echo as
+// the terminal error (#805 review).
 //
 // Per issue #663, a nil result from this function is the orchestrator's signal
 // that the rate-limit detection is LOW-confidence: the classifier matched a
@@ -647,11 +652,19 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 	if logFile == "" {
 		return nil
 	}
-	data, err := os.ReadFile(logFile)
-	if err != nil {
-		return nil
+	// Resolve a time-only reset hint ("try again at 12:30 PM", #805) against
+	// the log's last write — the moment the CLI printed the hint — not the
+	// moment the daemon got around to reading it. A dead worker can sit
+	// unreconciled past the stated reset (daemon restart, long poll gap);
+	// resolved against time.Now() the already-elapsed hint rolls a full day
+	// forward and gates the backend ~24h after its quota window actually
+	// reset. Against the write time the stale hint resolves to the elapsed
+	// instant instead, so the recorded cooldown is already expired.
+	ref := time.Now().UTC()
+	if fi, statErr := os.Stat(logFile); statErr == nil {
+		ref = fi.ModTime().UTC()
 	}
-	if reset, ok := worker.ParseRateLimitReset(string(data)); ok {
+	if reset, ok := worker.ParseRateLimitResetFromLog(logFile, ref); ok {
 		return &reset
 	}
 	return nil
@@ -665,6 +678,12 @@ func (o *Orchestrator) rateLimitResetFromLog(logFile string) *time.Time {
 // through to the ordinary worker-died handling instead of triggering a false
 // backend fallback. The non-nil resetAt is also returned so callers can
 // stamp BackendHealth.RetryAfter without re-reading the log.
+//
+// Both the classifier and the reset parse scan only the log TAIL (the CLI's
+// terminal output), like every other post-mortem backend-failure detector: a
+// long-running worker that echoed the live quota text mid-log — prompt
+// context, work output touching this very signature — and later died
+// normally must not be classified as a provider limit (#805 review).
 func (o *Orchestrator) providerRateLimitFromLog(logFile string) (hit bool, resetAt *time.Time) {
 	if !o.isRateLimited(logFile) {
 		return false, nil
@@ -726,19 +745,59 @@ func (o *Orchestrator) backendModelUnavailableFromLog(sess *state.Session, now t
 	return worker.IsModelUnavailable(sess.LogFile)
 }
 
+// backendUsageLimitFromLog reports whether a dead worker died because its
+// backend's account usage quota is exhausted (#805; live: codex "You've hit
+// your usage limit ... try again at 12:30 PM" printed once and the CLI
+// exited). Like the auth-failure detector it is trusted only within the
+// early-death window: a quota-dead CLI dies on its first API call, while the
+// same signature in a longer-lived worker's log is more likely incidental
+// work content than a backend outage. A quota death whose reset time IS
+// parseable never reaches this classifier — providerRateLimitFromLog handles
+// it first (any worker age) with the provider-stated RetryAfter.
+func (o *Orchestrator) backendUsageLimitFromLog(sess *state.Session, now time.Time) (bool, string) {
+	if sess == nil {
+		return false, ""
+	}
+	if sess.StartedAt.IsZero() || now.Sub(sess.StartedAt) > backendAuthFailureWindow {
+		return false, ""
+	}
+	extra := o.backendUsageLimitPatterns(sess.Backend)
+	if o.usageLimitFromLogFn != nil {
+		return o.usageLimitFromLogFn(sess.LogFile, extra)
+	}
+	return worker.IsUsageLimit(sess.LogFile, extra)
+}
+
+// backendUsageLimitPatterns returns the operator-supplied extra quota-death
+// regexes for one backend (config: model.backends.<name>.usage_limit_patterns,
+// #805).
+func (o *Orchestrator) backendUsageLimitPatterns(backend string) []string {
+	if o == nil || o.cfg == nil || backend == "" {
+		return nil
+	}
+	def, ok := o.cfg.Model.Backends[backend]
+	if !ok {
+		return nil
+	}
+	return def.UsageLimitPatterns
+}
+
 // classifyBackendFailure inspects a dead worker's log for any hard backend
 // failure that must not burn the per-issue retry budget. It returns the gating
-// reason (state.BackendBlockAuthFailure or state.BackendBlockModelUnavailable)
-// and the matched signature label. Auth is checked first: a 401 and a model
-// 404 can co-occur in a noisy log, and a credential outage is the more common
-// recovery path (re-login / cred-sync) than a config change. hit=false leaves
-// the death to the ordinary retry path.
+// reason (state.BackendBlockAuthFailure, state.BackendBlockModelUnavailable,
+// or state.BackendBlockUsageLimit) and the matched signature label. Auth is
+// checked first: a 401 and a model 404 can co-occur in a noisy log, and a
+// credential outage is the more common recovery path (re-login / cred-sync)
+// than a config change. hit=false leaves the death to the ordinary retry path.
 func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time) (hit bool, reason string, pattern string) {
 	if ok, label := o.backendAuthFailureFromLog(sess, now); ok {
 		return true, state.BackendBlockAuthFailure, label
 	}
 	if ok, label := o.backendModelUnavailableFromLog(sess, now); ok {
 		return true, state.BackendBlockModelUnavailable, label
+	}
+	if ok, label := o.backendUsageLimitFromLog(sess, now); ok {
+		return true, state.BackendBlockUsageLimit, label
 	}
 	return false, "", ""
 }
@@ -1595,6 +1654,51 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			// Keep sess.Backend consistent with the dispatched backend for the
 			// in-place retry path (RespawnInPlace does not restamp it).
 			sess.Backend = dec.Backend
+		}
+
+		// #805: a scheduled retry must not respawn onto a backend that is
+		// blocked in BackendHealth (quota exhausted, auth-failed, provider
+		// limit) or disabled. During the live incident every backoff retry
+		// re-resolved to the quota-dead default backend and burned the whole
+		// per-issue budget against it. Substitute the first healthy fallback
+		// (recorded on BackendSelection), or push the retry to the cooldown
+		// expiry when no backend is healthy. Sessions without a stamped
+		// backend (legacy states, minimal configs) keep the old behavior.
+		if respawnBackend != "" && len(o.cfg.Model.Backends) > 0 {
+			now := time.Now().UTC()
+			if blockedBy, blockedRetry := o.dispatchBackendBlock(s, respawnBackend, now); blockedBy != "" {
+				selection := o.selectBackendFallback(s, sess, now, selectionReasonRetryBlockedFallback)
+				if selection.SelectedBackend == "" {
+					// Defer to the EARLIEST cooldown expiry across the blocked
+					// candidate set — the session backend and every fallback —
+					// not the session backend's alone: with the default gated
+					// until 18:00 but a fallback freeing at 13:00, the next
+					// pass can resume on the fallback hours earlier. 5 minutes
+					// is the re-probe default when no blocked backend states
+					// an expiry.
+					retryAt := now.Add(5 * time.Minute)
+					earliest := blockedRetry
+					if candidateRetry := earliestCandidateRetry(selection); candidateRetry != nil && (earliest == nil || candidateRetry.Before(*earliest)) {
+						earliest = candidateRetry
+					}
+					if earliest != nil && earliest.After(now) {
+						retryAt = earliest.UTC()
+					}
+					sess.NextRetryAt = &retryAt
+					log.Printf("[orch] worker %s retry deferred until %s: backend %s blocked (%s) and no healthy fallback is available",
+						slotName, retryAt.Format(time.RFC3339), respawnBackend, blockedBy)
+					continue
+				}
+				log.Printf("[orch] worker %s retry: backend %s blocked (%s%s) — substituting %s",
+					slotName, respawnBackend, blockedBy, retryAfterHint(blockedRetry), selection.SelectedBackend)
+				selection.PreviousBackend = respawnBackend
+				sess.BackendSelection = &selection
+				respawnBackend = selection.SelectedBackend
+				sess.Backend = respawnBackend
+				// Any tier override targeted the blocked backend; respawn the
+				// substitute on the plain config.
+				respawnCfg = o.cfg
+			}
 		}
 
 		// If this is a CI failure retry, include CI output and review feedback
@@ -3077,7 +3181,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					// that is still progressing despite a low-confidence match is left
 					// alone so it can recover (the apertune case from #663).
 					if !sess.RateLimitHit && sess.LastNotifiedStatus != "rate_limit" {
-						classifyHit, pattern, confidence, resetTime := worker.ClassifyRateLimit(output)
+						classifyHit, pattern, confidence, resetTime := worker.ClassifyRateLimitAt(output, time.Now().UTC())
 						if classifyHit && confidence != "high" {
 							log.Printf("[orch] worker %s rate-limit pattern matched (pattern=%s) but reset window unparseable — treating as low-confidence and letting worker continue (per #663)",
 								slotName, pattern)

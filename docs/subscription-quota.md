@@ -102,3 +102,51 @@ Estimation caveats to keep in mind:
   auth-failure or provider-limit cooldown, and unlike those, PR
   evidence does not clear it (the backend keeps working while
   pressured; only the reset clock ends the episode).
+
+## Reactive usage-limit classification (#805)
+
+Calibration is predictive and can miss (mis-calibrated capacities,
+another consumer draining the same account). When the provider itself
+starts refusing work — the CLI prints a quota error and exits — maestro
+classifies the death reactively instead of burning
+`max_retries_per_issue` respawning onto a dead backend:
+
+1. **Parseable reset** — a dead (or live) worker whose log matches a
+   rate-limit signature *and* states a reset time is a high-confidence
+   provider limit (#663). Reset hints may be date-bearing ("try again
+   at May 30, 2026 8:13 PM") or **time-only** ("try again at 12:30 PM",
+   the live codex phrasing) — a time-only hint resolves to the next
+   occurrence of that wall-clock time. The backend is gated with reason
+   `provider_limit` and `RetryAfter` at the stated reset.
+2. **No parseable reset** — a worker that died within the early-death
+   window (~10 min of spawn) whose log **tail** matches an
+   account-quota exhaustion signature ("You've hit your usage limit",
+   the codex settings/usage URL, claude "usage limit reached") is gated
+   with reason `usage_limit` and a fixed 30-minute re-probe cooldown.
+   Generic signals (bare 429, "too many requests") stay excluded — they
+   are transient and acting on them is the #663 false-positive class.
+
+Either way the attempt respawns on the next healthy backend from
+`model.fallback_backends` in the same cycle, the session is excluded
+from `FailedAttemptsForIssue` (retry budget preserved), a
+`backend_usage_limit` supervisor finding is emitted (blocking when the
+default backend is gated), and `maestro status` prints the gate under
+"Backend health". Scheduled retries also consult `backend_health`
+before respawning: a retry whose backend is gated substitutes the first
+healthy fallback, or defers to the cooldown expiry when none exists.
+
+Backends with quota phrasings maestro does not know can extend the
+classifier per backend:
+
+```yaml
+model:
+  backends:
+    mycli:
+      cmd: mycli
+      usage_limit_patterns:
+        - "(?i)monthly spend cap reached"
+```
+
+Entries are regexes (validated at config parse) matched against the
+dead worker's log tail. Keep them high-precision: a pattern that
+matches ordinary work output causes false backend gating.

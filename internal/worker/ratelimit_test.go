@@ -3,6 +3,7 @@ package worker
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -469,5 +470,192 @@ func TestParseRateLimitReset_Variants(t *testing.T) {
 				t.Errorf("ParseRateLimitReset = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// codexTimeOnlySignature is the live #805 signature (BeFeast/ok-folio fleet,
+// 2026-07-02): codex states only a wall-clock reset with no date. The
+// date-bearing layouts reject it, so before #805 the reset went unparsed, the
+// death stayed low-confidence, and no failover fired.
+const codexTimeOnlySignature = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/codex/settings/usage) or try again at 12:30 PM."
+
+// TestParseRateLimitResetAt_TimeOnly verifies clock-only reset hints resolve
+// against the reference time: same day when the clock time is still ahead,
+// next day when it has already passed (#805).
+func TestParseRateLimitResetAt_TimeOnly(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		now   time.Time
+		want  time.Time
+		ok    bool
+	}{
+		{
+			name:  "clock ahead of now resolves same day",
+			input: codexTimeOnlySignature,
+			now:   time.Date(2026, time.July, 2, 1, 17, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "clock already passed rolls to next day",
+			input: codexTimeOnlySignature,
+			now:   time.Date(2026, time.July, 2, 22, 45, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 12, 30, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "clock equal to now rolls to next day",
+			input: codexTimeOnlySignature,
+			now:   time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 12, 30, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "lowercase meridiem",
+			input: "You've hit your usage limit. try again at 8:13pm.",
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 2, 20, 13, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "24h clock",
+			input: "quota exceeded; try again at 09:15",
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.July, 3, 9, 15, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "date-bearing hint keeps absolute parse",
+			input: codexUsageLimitSignature,
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			want:  time.Date(2026, time.May, 30, 20, 13, 0, 0, time.UTC),
+			ok:    true,
+		},
+		{
+			name:  "unparseable hint still fails",
+			input: "try again at some point soon.",
+			now:   time.Date(2026, time.July, 2, 10, 0, 0, 0, time.UTC),
+			ok:    false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseRateLimitResetAt(tc.input, tc.now)
+			if ok != tc.ok {
+				t.Fatalf("ParseRateLimitResetAt ok = %v, want %v (got %v)", ok, tc.ok, got)
+			}
+			if tc.ok && !got.Equal(tc.want) {
+				t.Errorf("ParseRateLimitResetAt = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyRateLimitAt_TimeOnlyIsHighConfidence: the #805 signature must
+// classify as a HIGH-confidence rate limit so the orchestrator's provider-limit
+// fallover fires instead of burning the per-issue retry budget on retries
+// against a quota-dead backend.
+func TestClassifyRateLimitAt_TimeOnlyIsHighConfidence(t *testing.T) {
+	now := time.Date(2026, time.July, 2, 1, 17, 0, 0, time.UTC)
+	hit, label, confidence, resetAt := ClassifyRateLimitAt(codexTimeOnlySignature, now)
+	if !hit {
+		t.Fatal("expected hit=true on the codex time-only usage-limit signature")
+	}
+	if label != "hit_limit" {
+		t.Errorf("label = %q, want hit_limit", label)
+	}
+	if confidence != "high" {
+		t.Errorf("confidence = %q, want high — a resolvable time-only reset is a positive signal (#805)", confidence)
+	}
+	want := time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC)
+	if !resetAt.Equal(want) {
+		t.Errorf("resetAt = %v, want %v", resetAt, want)
+	}
+}
+
+// #805 review regression: a long-running worker can echo the live quota text
+// early in its log — a prompt quoting the provider message, work output
+// touching this very classifier — and later die for an unrelated reason.
+// Post-mortem detection must scan only the log tail, so an echo buried above
+// it neither classifies the death as rate-limited nor lends it a parseable
+// reset window.
+func TestIsRateLimited_QuotaEchoBeyondTail_NotDetected(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	var b strings.Builder
+	b.WriteString("## Issue body\n")
+	b.WriteString(codexTimeOnlySignature + "\n")
+	for i := 0; i < authFailureTailLines+20; i++ {
+		b.WriteString("normal work output\n")
+	}
+	b.WriteString("worker finished normally\n")
+	if err := os.WriteFile(logFile, []byte(b.String()), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	if IsRateLimited(logFile) {
+		t.Error("IsRateLimited must not match a quota echo above the log tail")
+	}
+	now := time.Date(2026, time.July, 2, 11, 0, 0, 0, time.UTC)
+	if reset, ok := ParseRateLimitResetFromLog(logFile, now); ok {
+		t.Errorf("ParseRateLimitResetFromLog = %v, want no parse — the hint is above the tail", reset)
+	}
+}
+
+// The terminal quota error that actually killed the CLI is always within the
+// tail, however long the log: tail-bounding must not lose the true positive.
+func TestIsRateLimited_TerminalQuotaErrorOnLongLog_StillDetected(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	var b strings.Builder
+	for i := 0; i < authFailureTailLines+200; i++ {
+		b.WriteString("normal work output\n")
+	}
+	b.WriteString(codexTimeOnlySignature + "\n")
+	if err := os.WriteFile(logFile, []byte(b.String()), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	if !IsRateLimited(logFile) {
+		t.Error("IsRateLimited must still match the terminal quota error on a long log")
+	}
+	now := time.Date(2026, time.July, 2, 11, 0, 0, 0, time.UTC)
+	reset, ok := ParseRateLimitResetFromLog(logFile, now)
+	if !ok {
+		t.Fatal("ParseRateLimitResetFromLog should parse the terminal time-only hint")
+	}
+	want := time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC)
+	if !reset.Equal(want) {
+		t.Errorf("reset = %v, want %v", reset, want)
+	}
+}
+
+// #805 review: when several "try again at" hints survive into the scanned
+// output, the LAST parseable one wins — the terminal error beats an earlier
+// echo — and an unparseable trailing capture falls back to the previous
+// parseable hint instead of failing the whole parse.
+func TestParseRateLimitResetAt_LastParseableHintWins(t *testing.T) {
+	now := time.Date(2026, time.July, 2, 8, 0, 0, 0, time.UTC)
+
+	echoThenTerminal := "the issue body quotes the provider: try again at 9:00 AM.\n" +
+		codexTimeOnlySignature + "\n"
+	got, ok := ParseRateLimitResetAt(echoThenTerminal, now)
+	if !ok {
+		t.Fatal("expected the terminal hint to parse")
+	}
+	want := time.Date(2026, time.July, 2, 12, 30, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("reset = %v, want %v — the terminal hint must beat the earlier echo", got, want)
+	}
+
+	terminalThenGarbage := codexTimeOnlySignature + "\n" +
+		"and the docs say to try again at some point soon.\n"
+	got, ok = ParseRateLimitResetAt(terminalThenGarbage, now)
+	if !ok {
+		t.Fatal("an unparseable trailing capture must fall back to the earlier parseable hint")
+	}
+	if !got.Equal(want) {
+		t.Errorf("reset = %v, want %v", got, want)
 	}
 }

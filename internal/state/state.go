@@ -55,7 +55,14 @@ const (
 	// "the model is gone" (swap the model id) rather than "fix credentials".
 	// Like the other backend-block tokens it did not burn the retry budget.
 	DisplayBackendModelUnavailable SessionDisplayStatus = "backend_model_unavailable"
-	LiveSessionRecentWindow                             = 24 * time.Hour
+	// DisplayBackendUsageLimit marks a session whose worker exited because
+	// its backend's account usage quota is exhausted (#805; live: codex
+	// "You've hit your usage limit") with no fallback available. Distinct
+	// from DisplayBackendRateLimited so operators see "quota exhausted,
+	// wait for the window reset" rather than a generic capacity blip. Like
+	// the other backend-block tokens it did not burn the retry budget.
+	DisplayBackendUsageLimit SessionDisplayStatus = "backend_usage_limit"
+	LiveSessionRecentWindow                       = 24 * time.Hour
 )
 
 const RetryReasonReviewFeedback = "review_feedback"
@@ -78,10 +85,21 @@ const (
 	// auth_failure so the operator remediation differs (swap the model id vs
 	// fix credentials).
 	BackendBlockModelUnavailable = "model_unavailable"
-	BackendBlockDisabled         = "disabled"
-	BackendBlockAlreadyTried     = "already_tried"
-	BackendBlockCurrent          = "current_backend"
-	BackendBlockUnknown          = "unknown_backend"
+	// BackendBlockUsageLimit gates a backend whose CLI died because the
+	// account's usage quota is exhausted (#805; live: codex "You've hit
+	// your usage limit ... try again at 12:30 PM" killed every worker on
+	// the then-default backend and the retry policy burned the per-issue
+	// budget respawning onto it). Like auth_failure it is a hard backend
+	// failure, not a work failure, and must not consume the retry budget.
+	// Distinct from provider_limit (which carries a provider-stated reset)
+	// and quota_pressure (predictive, token-estimate based): usage_limit is
+	// the reactive classification of a quota death whose reset time could
+	// not be parsed, so the cooldown is a fixed re-probe window.
+	BackendBlockUsageLimit   = "usage_limit"
+	BackendBlockDisabled     = "disabled"
+	BackendBlockAlreadyTried = "already_tried"
+	BackendBlockCurrent      = "current_backend"
+	BackendBlockUnknown      = "unknown_backend"
 	// BackendBlockQuotaPressure gates a backend whose estimated
 	// subscription-window usage crossed the quota dispatch threshold
 	// (#704). Unlike auth_failure it is a soft, predictive gate: the
@@ -368,6 +386,13 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 					NeedsAttention: true,
 				}
 			}
+			if sess.ProviderLimitReason == BackendBlockUsageLimit {
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Backend %s has exhausted its account usage quota; no fallback backend is currently available or allowed.", backend),
+					NextAction:     "Wait for the provider quota window to reset (or raise the plan limit / enable another backend); the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			return SessionAttention{
 				Reason:         fmt.Sprintf("Backend %s hit a provider capacity limit; no fallback backend is currently available or allowed.", backend),
 				NextAction:     "Wait for provider capacity to recover, enable another backend, or change routing policy before retrying.",
@@ -440,6 +465,8 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 			return string(DisplayBackendAuthFailure)
 		case BackendBlockModelUnavailable:
 			return string(DisplayBackendModelUnavailable)
+		case BackendBlockUsageLimit:
+			return string(DisplayBackendUsageLimit)
 		}
 		return string(DisplayBackendRateLimited)
 	}
