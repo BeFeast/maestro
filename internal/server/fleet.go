@@ -822,9 +822,17 @@ type fleetSummary struct {
 	// project card reads. Plain ints — never null.
 	PRsOpen        int `json:"prs_open"`
 	WorkersRunning int `json:"workers_running"`
-	Failed         int `json:"failed"`
-	Sessions       int `json:"sessions"`
-	NeedsAttention int `json:"needs_attention"`
+	// #814 capacity plane (fleet aggregate): LiveWorkers is the live
+	// implementation-worker count (StatusRunning) separated from PRGates
+	// (StatusPROpen, no live process, waiting on CI/review/merge gate).
+	// CapacityBlockedByGates sums the live-worker slots pr_open sessions are
+	// withholding across projects still on legacy counting.
+	LiveWorkers            int `json:"live_workers"`
+	PRGates                int `json:"pr_gates"`
+	CapacityBlockedByGates int `json:"capacity_blocked_by_gates"`
+	Failed                 int `json:"failed"`
+	Sessions               int `json:"sessions"`
+	NeedsAttention         int `json:"needs_attention"`
 	// SelfResolving counts attention items that are convergence-bound
 	// and need no operator action (e.g. retry_exhausted with a green PR
 	// — the orchestrator auto-merges once the merge gate clears). See
@@ -916,9 +924,24 @@ type fleetProjectState struct {
 	// by the SPA project card (#566). It is the count of sessions in
 	// StatusRunning. Always non-null.
 	WorkersRunning int `json:"workers_running"`
-	Failed         int `json:"failed"`
-	Sessions       int `json:"sessions"`
-	NeedsAttention int `json:"needs_attention"`
+	// #814 capacity plane: LiveWorkers separates live implementation workers
+	// (StatusRunning) from PRGates (StatusPROpen — PR open, no live process,
+	// waiting on CI/review/merge). CapacityUsed is the slots counted in-use
+	// for spawn accounting and CapacityBlockedByGates the live-worker slots
+	// pr_open sessions withhold on legacy counting (0 once max_live_workers
+	// separates gates out). LiveWorkerLimit is the effective spawn limit;
+	// Activity/ActivityReason explain why the project is or is not
+	// implementing (implementing / blocked_by_pr_gates / queue_empty / …).
+	LiveWorkers            int    `json:"live_workers"`
+	PRGates                int    `json:"pr_gates"`
+	CapacityUsed           int    `json:"capacity_used"`
+	CapacityBlockedByGates int    `json:"capacity_blocked_by_gates"`
+	LiveWorkerLimit        int    `json:"live_worker_limit,omitempty"`
+	Activity               string `json:"activity,omitempty"`
+	ActivityReason         string `json:"activity_reason,omitempty"`
+	Failed                 int    `json:"failed"`
+	Sessions               int    `json:"sessions"`
+	NeedsAttention         int    `json:"needs_attention"`
 	// SelfResolving is the count of attention sessions on this project
 	// that are convergence-bound (the orchestrator will resolve them
 	// without operator action — see fleetSessionIsConvergenceBound and
@@ -1703,6 +1726,9 @@ func (s *FleetServer) snapshot() fleetResponse {
 		resp.Summary.PROpen += item.PROpen
 		resp.Summary.PRsOpen += item.PRsOpen
 		resp.Summary.WorkersRunning += item.WorkersRunning
+		resp.Summary.LiveWorkers += item.LiveWorkers
+		resp.Summary.PRGates += item.PRGates
+		resp.Summary.CapacityBlockedByGates += item.CapacityBlockedByGates
 		resp.Summary.Failed += item.Failed
 		resp.Summary.Sessions += item.Sessions
 		resp.Summary.NeedsAttention += item.NeedsAttention
@@ -3167,6 +3193,18 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Running = len(projectState.Running)
 	item.PROpen = len(projectState.PROpen)
 	item.WorkersRunning = item.Running
+	// #814: expose the live-worker vs PR-gate capacity split so Mission
+	// Control never renders "0 workers" for a gate-bound-but-busy project.
+	capacity := st.Capacity(state.CapacityInput{
+		MaxParallel:          cfg.MaxParallel,
+		MaxLiveWorkers:       cfg.MaxLiveWorkers,
+		MaxConcurrentByState: cfg.MaxConcurrentByState,
+	})
+	item.LiveWorkers = capacity.LiveWorkers
+	item.PRGates = capacity.PRGates
+	item.CapacityUsed = capacity.CapacityUsed
+	item.CapacityBlockedByGates = capacity.BlockedByGates
+	item.LiveWorkerLimit = cfg.MaxLiveWorkers
 	item.PRsOpen = fleetTruthfulOpenPRCount(projectState, st)
 	item.Failed = failedCount(projectState.Summary)
 	item.Sessions = len(projectState.All)
@@ -3181,6 +3219,24 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.ApprovalSummary[approval.Status]++
 		}
 	}
+	// #814: classify why the project is (not) implementing so operators can tell
+	// an empty queue from a gate-bound-but-eligible pipeline. Signals are read
+	// from the same snapshot: eligible from the supervisor queue analysis,
+	// pending approvals from the approval summary, model limits from backend
+	// health.
+	eligibleIssues := 0
+	if item.QueueSnapshot != nil {
+		eligibleIssues = item.QueueSnapshot.Eligible
+	}
+	activity, activityReason := state.ClassifyActivity(state.ActivityInput{
+		Capacity:         capacity,
+		EligibleIssues:   eligibleIssues,
+		PendingApprovals: item.ApprovalSummary["pending"],
+		BackendsBlocked:  allBackendsBlocked(item.BackendHealth),
+		Paused:           item.Paused,
+	})
+	item.Activity = string(activity)
+	item.ActivityReason = activityReason
 	staleAudits := reconcileStaleSessions(cfg, st, now)
 	staleSlots := make(map[string]state.StaleSessionAudit, len(staleAudits))
 	for _, audit := range staleAudits {
@@ -3292,6 +3348,22 @@ func fleetIssuesCoveredByExecutedCloseApproval(st *state.State) map[int]bool {
 		}
 	}
 	return covered
+}
+
+// allBackendsBlocked reports whether every backend with a recorded health entry
+// is currently unavailable (e.g. cooldown / usage-limit). Used only as an
+// idle-reason signal (#814): with no health entries, backends are assumed
+// available so a fresh project never mislabels itself as model-limit-blocked.
+func allBackendsBlocked(health map[string]state.BackendHealth) bool {
+	if len(health) == 0 {
+		return false
+	}
+	for _, h := range health {
+		if h.State == "" || h.State == state.BackendHealthAvailable {
+			return false
+		}
+	}
+	return true
 }
 
 func reconcileStaleSessions(cfg *config.Config, st *state.State, now time.Time) []state.StaleSessionAudit {

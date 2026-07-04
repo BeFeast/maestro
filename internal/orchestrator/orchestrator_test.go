@@ -6794,6 +6794,38 @@ func TestAvailableSlots_NonRunningLimitIgnoredForDispatch(t *testing.T) {
 	}
 }
 
+// #814: with max_live_workers set, pr_open PR-gate sessions no longer consume
+// spawn capacity, so a gate-bound queue keeps dispatching live workers up to the
+// configured live-worker limit.
+func TestAvailableSlots_MaxLiveWorkersIgnoresPROpen(t *testing.T) {
+	cfg := &config.Config{MaxParallel: 4, MaxLiveWorkers: 4}
+	s := state.NewState()
+	s.Sessions["slot-1"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-2"] = &state.Session{Status: state.StatusRunning}
+	s.Sessions["slot-3"] = &state.Session{Status: state.StatusPROpen}
+	s.Sessions["slot-4"] = &state.Session{Status: state.StatusPROpen}
+
+	got := availableSlots(cfg, s, len(s.ActiveSessions()))
+	if got != 2 {
+		t.Errorf("availableSlots() = %d, want 2 (4 live limit - 2 running; pr_open ignored)", got)
+	}
+}
+
+// Acceptance: a project with N PR-open sessions can still spawn live workers up
+// to the live-worker limit — the case where legacy counting reported 0.
+func TestAvailableSlots_MaxLiveWorkersAllGatesStillDispatches(t *testing.T) {
+	cfg := &config.Config{MaxParallel: 2, MaxLiveWorkers: 3}
+	s := state.NewState()
+	for i := 1; i <= 4; i++ {
+		s.Sessions[fmt.Sprintf("gate-%d", i)] = &state.Session{Status: state.StatusPROpen}
+	}
+
+	// Legacy counting would give max_parallel(2) - active(4) => 0 slots.
+	if got := availableSlots(cfg, s, len(s.ActiveSessions())); got != 3 {
+		t.Errorf("availableSlots() = %d, want 3 (keep dispatching despite 4 open PRs)", got)
+	}
+}
+
 func TestPendingRetryReservations_CountsOnlyScheduledDeadRetries(t *testing.T) {
 	now := time.Now().UTC()
 	past := now.Add(-time.Second)

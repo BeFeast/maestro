@@ -736,6 +736,102 @@ func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	}
 }
 
+// #814: the fleet snapshot must separate live implementation workers from
+// pr_open PR-gate sessions and explain a gate-bound-but-eligible project instead
+// of rendering it as idle with 0 workers.
+func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+
+	// Legacy project: max_parallel filled entirely by pr_open PR-gate sessions
+	// while eligible work waits — the misleading "0 workers" case.
+	gateDir := filepath.Join(dir, "gatebound")
+	gateState := state.NewState()
+	gateState.Sessions["gate-1"] = &state.Session{Status: state.StatusPROpen, PRNumber: 101, IssueNumber: 11}
+	gateState.Sessions["gate-2"] = &state.Session{Status: state.StatusPROpen, PRNumber: 102, IssueNumber: 12}
+	gateState.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-gatebound",
+		CreatedAt:         now,
+		Project:           "owner/gatebound",
+		RecommendedAction: "spawn_worker",
+		Risk:              "mutating",
+		PolicyRule:        "supervisor.dynamic_wave",
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			PolicyRule:         "supervisor.dynamic_wave",
+			OpenIssues:         5,
+			EligibleCandidates: 3,
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(gateDir, gateState); err != nil {
+		t.Fatalf("save gate state: %v", err)
+	}
+
+	// Separated project: max_live_workers>0 keeps a live worker running while
+	// several PRs are open — capacity is not blocked by the gates.
+	liveDir := filepath.Join(dir, "separated")
+	liveState := state.NewState()
+	liveState.Sessions["run-1"] = &state.Session{Status: state.StatusRunning, PID: 4242, IssueNumber: 20}
+	liveState.Sessions["gate-1"] = &state.Session{Status: state.StatusPROpen, PRNumber: 201, IssueNumber: 21}
+	liveState.Sessions["gate-2"] = &state.Session{Status: state.StatusPROpen, PRNumber: 202, IssueNumber: 22}
+	liveState.Sessions["gate-3"] = &state.Session{Status: state.StatusPROpen, PRNumber: 203, IssueNumber: 23}
+	if err := state.Save(liveDir, liveState); err != nil {
+		t.Fatalf("save live state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("GateBound", "/tmp/gatebound.yaml", "", &config.Config{
+			Repo:        "owner/gatebound",
+			StateDir:    gateDir,
+			MaxParallel: 2,
+		}),
+		NewFleetProject("Separated", "/tmp/separated.yaml", "", &config.Config{
+			Repo:           "owner/separated",
+			StateDir:       liveDir,
+			MaxParallel:    2,
+			MaxLiveWorkers: 3,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	gate := findFleetProject(t, resp.Projects, "GateBound")
+	if gate.LiveWorkers != 0 || gate.WorkersRunning != 0 {
+		t.Fatalf("gate-bound live workers = %d/%d, want 0", gate.LiveWorkers, gate.WorkersRunning)
+	}
+	if gate.PRGates != 2 {
+		t.Errorf("gate-bound pr_gates = %d, want 2", gate.PRGates)
+	}
+	if gate.CapacityUsed != 2 || gate.CapacityBlockedByGates != 2 {
+		t.Errorf("gate-bound capacity_used=%d blocked_by_gates=%d, want 2/2", gate.CapacityUsed, gate.CapacityBlockedByGates)
+	}
+	if gate.Activity != string(state.ActivityBlockedByGates) {
+		t.Errorf("gate-bound activity = %q, want %q", gate.Activity, state.ActivityBlockedByGates)
+	}
+	if !contains(gate.ActivityReason, "Blocked by PR gates") {
+		t.Errorf("gate-bound activity reason = %q, want blocked-by-PR-gates explanation", gate.ActivityReason)
+	}
+
+	sep := findFleetProject(t, resp.Projects, "Separated")
+	if sep.LiveWorkers != 1 || sep.WorkersRunning != 1 {
+		t.Errorf("separated live workers = %d/%d, want 1", sep.LiveWorkers, sep.WorkersRunning)
+	}
+	if sep.PRGates != 3 {
+		t.Errorf("separated pr_gates = %d, want 3", sep.PRGates)
+	}
+	if sep.CapacityBlockedByGates != 0 {
+		t.Errorf("separated blocked_by_gates = %d, want 0 (gates separated out)", sep.CapacityBlockedByGates)
+	}
+	if sep.Activity != string(state.ActivityImplementing) {
+		t.Errorf("separated activity = %q, want %q", sep.Activity, state.ActivityImplementing)
+	}
+
+	if resp.Summary.LiveWorkers != 1 || resp.Summary.PRGates != 5 {
+		t.Errorf("summary live_workers=%d pr_gates=%d, want 1/5", resp.Summary.LiveWorkers, resp.Summary.PRGates)
+	}
+	if resp.Summary.CapacityBlockedByGates != 2 {
+		t.Errorf("summary capacity_blocked_by_gates = %d, want 2", resp.Summary.CapacityBlockedByGates)
+	}
+}
+
 func TestFleetQueueSnapshotFromSupervisorCarriesDecisionPlane(t *testing.T) {
 	info := supervisorInfo{
 		Latest: &supervisorDecisionInfo{

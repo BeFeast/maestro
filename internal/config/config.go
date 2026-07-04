@@ -1250,6 +1250,7 @@ type Config struct {
 	LocalPath                       string                       `yaml:"local_path"`
 	WorktreeBase                    string                       `yaml:"worktree_base"`
 	MaxParallel                     int                          `yaml:"max_parallel"`
+	MaxLiveWorkers                  int                          `yaml:"max_live_workers"`              // #814: cap on live implementation workers (StatusRunning). When >0, pr_open PR-gate sessions no longer consume spawn capacity, so a gate-bound queue keeps dispatching live workers up to this limit. 0 = legacy (pr_open counts against max_parallel).
 	MaxConcurrentByState            map[string]int               `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
 	MaxRuntimeMinutes               int                          `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes      int                          `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
@@ -1378,6 +1379,13 @@ func parse(data []byte) (*Config, error) {
 
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
+	}
+
+	// A negative max_live_workers is meaningless; clamp to 0 (legacy: pr_open
+	// counts against max_parallel) so a typo can never silently disable
+	// dispatch entirely (#814).
+	if cfg.MaxLiveWorkers < 0 {
+		cfg.MaxLiveWorkers = 0
 	}
 
 	// Normalize max_concurrent_by_state keys: trim + lowercase

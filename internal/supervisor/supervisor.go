@@ -3027,20 +3027,16 @@ func sortedSessionNames(st *state.State) []string {
 	return names
 }
 
+// availableSlots delegates to state.Capacity so the supervisor and orchestrator
+// share one live-worker spawn budget. With max_live_workers>0, pr_open PR-gate
+// sessions no longer consume capacity, so the supervisor stops reporting
+// wait-for-capacity while a queue is merely gate-bound (#814).
 func availableSlots(cfg *config.Config, st *state.State) int {
-	maxParallel := cfg.MaxParallel
-	active := len(st.ActiveSessions())
-	slots := maxParallel - active
-	if limit, ok := cfg.MaxConcurrentByState["running"]; ok && limit > 0 {
-		runningSlots := limit - st.CountByStatus()[state.StatusRunning]
-		if runningSlots < slots {
-			slots = runningSlots
-		}
-	}
-	if slots < 0 {
-		return 0
-	}
-	return slots
+	return st.Capacity(state.CapacityInput{
+		MaxParallel:          cfg.MaxParallel,
+		MaxLiveWorkers:       cfg.MaxLiveWorkers,
+		MaxConcurrentByState: cfg.MaxConcurrentByState,
+	}).AvailableSlots
 }
 
 func countSessions(st *state.State, status state.SessionStatus) int {

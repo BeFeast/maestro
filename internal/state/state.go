@@ -2984,6 +2984,164 @@ func (s *State) RunningSessionCount() int {
 	return len(s.RunningSessions())
 }
 
+// CapacityInput carries the concurrency knobs that govern how many live
+// implementation workers may be spawned. The caller populates it from config so
+// the state package stays free of a config import.
+//
+// #814: pr_open (PR-gate) sessions have no live worker process — their PID is
+// cleared when the PR is opened and Maestro only waits on CI / review / the
+// merge gate. Counting them against MaxParallel makes the pipeline look "full"
+// while it is merely gate-bound, so a long PRD-backed queue with a few open PRs
+// stops dispatching new implementation work and Mission Control shows 0 live
+// workers. When MaxLiveWorkers > 0, spawn capacity is computed from live
+// workers alone and pr_open sessions no longer consume a slot.
+type CapacityInput struct {
+	MaxParallel          int
+	MaxLiveWorkers       int
+	MaxConcurrentByState map[string]int
+}
+
+// Capacity is an operator-facing snapshot that separates live implementation
+// workers (StatusRunning) from PR-gate sessions (StatusPROpen) so Mission
+// Control can explain why a project is or is not spawning new work instead of
+// only reporting a single conflated "workers" number.
+type Capacity struct {
+	LiveWorkers    int  // StatusRunning — worker processes actively implementing
+	PRGates        int  // StatusPROpen — PR open, no live process, waiting on gates
+	Limit          int  // effective limit that governs live-worker spawning
+	CapacityUsed   int  // slots counted as in-use for spawn accounting
+	AvailableSlots int  // free slots available for new live workers
+	BlockedByGates int  // live-worker slots withheld purely because pr_open sessions count against capacity (0 once gates are separated out)
+	Separated      bool // true when MaxLiveWorkers>0, i.e. pr_open sessions do not consume live-worker capacity
+}
+
+// GateBound reports whether PR-gate sessions are the reason no live worker can
+// spawn: there are open PRs, no live worker is implementing, and no slot is
+// free. This is the misleading "0 workers but not idle" state from #814.
+func (c Capacity) GateBound() bool {
+	return c.LiveWorkers == 0 && c.PRGates > 0 && c.AvailableSlots == 0
+}
+
+// Capacity computes the live-worker spawn budget, separating live workers from
+// PR-gate sessions per the CapacityInput knobs. It is the single source of
+// truth for "how many new workers can start" shared by the orchestrator, the
+// supervisor, and Mission Control.
+func (s *State) Capacity(in CapacityInput) Capacity {
+	var counts map[SessionStatus]int
+	if s != nil {
+		counts = s.CountByStatus()
+	}
+	live := counts[StatusRunning]
+	gates := counts[StatusPROpen]
+
+	c := Capacity{LiveWorkers: live, PRGates: gates}
+
+	if in.MaxLiveWorkers > 0 {
+		// Separated accounting: pr_open sessions do not consume live-worker
+		// capacity. Spawning is governed by live workers alone.
+		c.Separated = true
+		c.Limit = in.MaxLiveWorkers
+		c.CapacityUsed = live
+		c.AvailableSlots = in.MaxLiveWorkers - live
+		c.BlockedByGates = 0
+	} else {
+		// Legacy accounting: running + pr_open both count against max_parallel.
+		c.Limit = in.MaxParallel
+		active := live + gates
+		c.CapacityUsed = active
+		c.AvailableSlots = in.MaxParallel - active
+		// How many additional live workers could run if gates were separated
+		// out of the budget — the slots pr_open sessions are withholding.
+		if headroom := in.MaxParallel - live; headroom > 0 && gates > 0 {
+			c.BlockedByGates = min(gates, headroom)
+		}
+	}
+	if c.AvailableSlots < 0 {
+		c.AvailableSlots = 0
+	}
+
+	// The per-state "running" limit caps live-worker spawning in either mode —
+	// new workers always enter StatusRunning. Non-"running" per-state limits
+	// (e.g. "pr_open") intentionally do not gate dispatch.
+	if limit, ok := in.MaxConcurrentByState["running"]; ok && limit > 0 {
+		runningSlots := limit - live
+		if runningSlots < 0 {
+			runningSlots = 0
+		}
+		if runningSlots < c.AvailableSlots {
+			c.AvailableSlots = runningSlots
+		}
+	}
+	return c
+}
+
+// ProjectActivity is a single operator-facing token that explains why a project
+// is or is not turning eligible issues into implementation work. It lets Mission
+// Control distinguish "idle because the queue is empty" from "idle because every
+// slot is a PR gate" at a glance (#814).
+type ProjectActivity string
+
+const (
+	ActivityImplementing         ProjectActivity = "implementing"            // at least one live worker is running
+	ActivityBlockedByGates       ProjectActivity = "blocked_by_pr_gates"     // no live worker; capacity is consumed by pr_open sessions while eligible work waits
+	ActivityWaitingOnGates       ProjectActivity = "waiting_on_pr_gates"     // no live worker, PRs open, and no eligible work left — just waiting for gates
+	ActivityBlockedByApprovals   ProjectActivity = "blocked_by_approvals"    // dispatch is held pending an operator approval decision
+	ActivityBlockedByModelLimits ProjectActivity = "blocked_by_model_limits" // every eligible backend is blocked by a model/usage limit
+	ActivityPaused               ProjectActivity = "paused"                  // operator paused the project
+	ActivityQueueEmpty           ProjectActivity = "queue_empty"             // no eligible ready issues remain
+	ActivityIdle                 ProjectActivity = "idle"                    // idle for none of the more specific reasons above
+)
+
+// ActivityInput carries the non-session signals ClassifyActivity needs beyond
+// the session-derived Capacity snapshot.
+type ActivityInput struct {
+	Capacity         Capacity
+	EligibleIssues   int  // ready issues that could be dispatched now
+	PendingApprovals int  // spawn/merge approvals awaiting an operator decision
+	BackendsBlocked  bool // every eligible backend is blocked by a model/usage limit
+	Paused           bool // operator paused the project
+}
+
+// ClassifyActivity returns the ProjectActivity token and a concise
+// operator-facing explanation for why a project is (not) implementing. The
+// ordering is deliberate: live work wins, then the specific block reasons, so an
+// operator always sees the most actionable cause rather than a generic "idle".
+func ClassifyActivity(in ActivityInput) (ProjectActivity, string) {
+	c := in.Capacity
+	if c.LiveWorkers > 0 {
+		return ActivityImplementing, fmt.Sprintf("Implementing: %d live worker(s) running%s.", c.LiveWorkers, prGateSuffix(c.PRGates))
+	}
+	if in.Paused {
+		return ActivityPaused, "Project is paused; dispatch is intentionally suspended."
+	}
+	if in.BackendsBlocked {
+		return ActivityBlockedByModelLimits, "Blocked by model limits: every eligible backend is rate/usage limited."
+	}
+	if in.PendingApprovals > 0 {
+		return ActivityBlockedByApprovals, fmt.Sprintf("Blocked by approvals: %d decision(s) awaiting an operator.", in.PendingApprovals)
+	}
+	// Gate-bound: no live worker and no free slot while PRs are open. Only a
+	// problem when eligible work is waiting — that is the recurring #814
+	// intervention loop. With eligible work drained it is simply "waiting".
+	if c.PRGates > 0 && c.AvailableSlots == 0 {
+		if in.EligibleIssues > 0 {
+			return ActivityBlockedByGates, fmt.Sprintf("Blocked by PR gates: %d PR gate(s) hold all capacity while %d ready issue(s) wait; raise max_live_workers or max_parallel to keep implementing.", c.PRGates, in.EligibleIssues)
+		}
+		return ActivityWaitingOnGates, fmt.Sprintf("Waiting on PR gates: %d PR(s) open, no eligible work left to dispatch.", c.PRGates)
+	}
+	if in.EligibleIssues <= 0 {
+		return ActivityQueueEmpty, "Queue empty: no eligible ready issues to dispatch."
+	}
+	return ActivityIdle, "Idle: eligible work exists and capacity is free; awaiting the next dispatch cycle."
+}
+
+func prGateSuffix(gates int) string {
+	if gates <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d PR gate(s) waiting on CI/review)", gates)
+}
+
 // SetSpawnDrain requests a graceful drain (#541): the run loop stops claiming
 // new issues and spawning new workers but lets in-flight workers finish. The
 // timestamp is stamped so concurrent state writers resolve drain on/off by
