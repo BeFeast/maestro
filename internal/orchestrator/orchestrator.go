@@ -1977,8 +1977,8 @@ func (o *Orchestrator) RunOnce() error {
 	}
 
 	// Step 5: Start new workers for available slots
-	active := len(s.ActiveSessions())
-	slots := availableSlots(o.cfg, s, active)
+	capNow := s.Capacity(capacityInput(o.cfg))
+	slots := capNow.AvailableSlots
 	if reserved := pendingRetryReservations(s); reserved > 0 && slots > 0 {
 		if reserved > slots {
 			reserved = slots
@@ -1986,7 +1986,8 @@ func (o *Orchestrator) RunOnce() error {
 		slots -= reserved
 		log.Printf("[orch] reserving %d worker slot(s) for scheduled retries", reserved)
 	}
-	log.Printf("[orch] active=%d max=%d available_slots=%d", active, o.cfg.MaxParallel, slots)
+	log.Printf("[orch] live_workers=%d pr_gates=%d limit=%d available_slots=%d (separated=%t blocked_by_gates=%d)",
+		capNow.LiveWorkers, capNow.PRGates, capNow.Limit, slots, capNow.Separated, capNow.BlockedByGates)
 
 	if slots > 0 {
 		o.startNewWorkers(s, slots)
@@ -5108,31 +5109,25 @@ func (o *Orchestrator) resolveBackendDecision(issue github.Issue) router.Backend
 	return o.router.ResolveBackendDecision(issue)
 }
 
-// availableSlots calculates how many new workers can be started, considering
-// both the global max_parallel limit and per-state limits from max_concurrent_by_state.
-// New workers enter the "running" state, so the "running" per-state limit is applied.
+// capacityInput builds the state.CapacityInput from a project config so the
+// spawn budget is computed by the single shared state.Capacity source of truth.
+func capacityInput(cfg *config.Config) state.CapacityInput {
+	return state.CapacityInput{
+		MaxParallel:          cfg.MaxParallel,
+		MaxLiveWorkers:       cfg.MaxLiveWorkers,
+		MaxConcurrentByState: cfg.MaxConcurrentByState,
+	}
+}
+
+// availableSlots calculates how many new workers can be started. It delegates to
+// state.Capacity, which separates live implementation workers from pr_open
+// PR-gate sessions: with max_live_workers>0, gate-bound sessions no longer
+// consume spawn capacity, so a long queue keeps dispatching implementation work
+// instead of stalling behind a handful of open PRs (#814). The active parameter
+// is retained for call-site clarity but Capacity recomputes from live state.
 func availableSlots(cfg *config.Config, s *state.State, active int) int {
-	slots := cfg.MaxParallel - active
-	if slots <= 0 {
-		return 0
-	}
-
-	// Apply per-state limit for "running" — new workers enter running state
-	if limit, ok := cfg.MaxConcurrentByState["running"]; ok && limit > 0 {
-		statusCounts := s.CountByStatus()
-		runningCount := statusCounts[state.StatusRunning]
-		runningSlots := limit - runningCount
-		if runningSlots < slots {
-			log.Printf("[orch] per-state limit: running=%d max_running=%d (capped from %d to %d slots)",
-				runningCount, limit, slots, runningSlots)
-			slots = runningSlots
-		}
-	}
-
-	if slots < 0 {
-		return 0
-	}
-	return slots
+	_ = active
+	return s.Capacity(capacityInput(cfg)).AvailableSlots
 }
 
 // startNewWorkers picks eligible issues and starts workers for them
@@ -5713,8 +5708,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			o.syncProject(issue.Number, github.ProjectStatusTodo)
 			continue
 		}
-		if liveActive := len(s.ActiveSessions()); o.cfg.MaxParallel > 0 && liveActive >= o.cfg.MaxParallel {
-			log.Printf("[orch] dispatch cap: %d active >= max_parallel %d — queueing issue #%d", liveActive, o.cfg.MaxParallel, issue.Number)
+		// Live backstop recomputed from current state each iteration (retry
+		// respawns earlier in the cycle already turned dead sessions running).
+		// Uses the same Capacity budget as availableSlots so pr_open PR-gate
+		// sessions do not count against live-worker capacity when
+		// max_live_workers is set (#814).
+		if capNow := s.Capacity(capacityInput(o.cfg)); capNow.Limit > 0 && capNow.AvailableSlots <= 0 {
+			log.Printf("[orch] dispatch cap: live=%d pr_gates=%d limit=%d (separated=%t) — queueing issue #%d",
+				capNow.LiveWorkers, capNow.PRGates, capNow.Limit, capNow.Separated, issue.Number)
 			o.syncProject(issue.Number, github.ProjectStatusTodo)
 			continue
 		}

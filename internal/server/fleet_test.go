@@ -736,6 +736,102 @@ func TestFleetAPIIncludesQueueSnapshotMetadata(t *testing.T) {
 	}
 }
 
+// #814: the fleet snapshot must separate live implementation workers from
+// pr_open PR-gate sessions and explain a gate-bound-but-eligible project instead
+// of rendering it as idle with 0 workers.
+func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+
+	// Legacy project: max_parallel filled entirely by pr_open PR-gate sessions
+	// while eligible work waits — the misleading "0 workers" case.
+	gateDir := filepath.Join(dir, "gatebound")
+	gateState := state.NewState()
+	gateState.Sessions["gate-1"] = &state.Session{Status: state.StatusPROpen, PRNumber: 101, IssueNumber: 11}
+	gateState.Sessions["gate-2"] = &state.Session{Status: state.StatusPROpen, PRNumber: 102, IssueNumber: 12}
+	gateState.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-gatebound",
+		CreatedAt:         now,
+		Project:           "owner/gatebound",
+		RecommendedAction: "spawn_worker",
+		Risk:              "mutating",
+		PolicyRule:        "supervisor.dynamic_wave",
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			PolicyRule:         "supervisor.dynamic_wave",
+			OpenIssues:         5,
+			EligibleCandidates: 3,
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(gateDir, gateState); err != nil {
+		t.Fatalf("save gate state: %v", err)
+	}
+
+	// Separated project: max_live_workers>0 keeps a live worker running while
+	// several PRs are open — capacity is not blocked by the gates.
+	liveDir := filepath.Join(dir, "separated")
+	liveState := state.NewState()
+	liveState.Sessions["run-1"] = &state.Session{Status: state.StatusRunning, PID: 4242, IssueNumber: 20}
+	liveState.Sessions["gate-1"] = &state.Session{Status: state.StatusPROpen, PRNumber: 201, IssueNumber: 21}
+	liveState.Sessions["gate-2"] = &state.Session{Status: state.StatusPROpen, PRNumber: 202, IssueNumber: 22}
+	liveState.Sessions["gate-3"] = &state.Session{Status: state.StatusPROpen, PRNumber: 203, IssueNumber: 23}
+	if err := state.Save(liveDir, liveState); err != nil {
+		t.Fatalf("save live state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("GateBound", "/tmp/gatebound.yaml", "", &config.Config{
+			Repo:        "owner/gatebound",
+			StateDir:    gateDir,
+			MaxParallel: 2,
+		}),
+		NewFleetProject("Separated", "/tmp/separated.yaml", "", &config.Config{
+			Repo:           "owner/separated",
+			StateDir:       liveDir,
+			MaxParallel:    2,
+			MaxLiveWorkers: 3,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	gate := findFleetProject(t, resp.Projects, "GateBound")
+	if gate.LiveWorkers != 0 || gate.WorkersRunning != 0 {
+		t.Fatalf("gate-bound live workers = %d/%d, want 0", gate.LiveWorkers, gate.WorkersRunning)
+	}
+	if gate.PRGates != 2 {
+		t.Errorf("gate-bound pr_gates = %d, want 2", gate.PRGates)
+	}
+	if gate.CapacityUsed != 2 || gate.CapacityBlockedByGates != 2 {
+		t.Errorf("gate-bound capacity_used=%d blocked_by_gates=%d, want 2/2", gate.CapacityUsed, gate.CapacityBlockedByGates)
+	}
+	if gate.Activity != string(state.ActivityBlockedByGates) {
+		t.Errorf("gate-bound activity = %q, want %q", gate.Activity, state.ActivityBlockedByGates)
+	}
+	if !contains(gate.ActivityReason, "Blocked by PR gates") {
+		t.Errorf("gate-bound activity reason = %q, want blocked-by-PR-gates explanation", gate.ActivityReason)
+	}
+
+	sep := findFleetProject(t, resp.Projects, "Separated")
+	if sep.LiveWorkers != 1 || sep.WorkersRunning != 1 {
+		t.Errorf("separated live workers = %d/%d, want 1", sep.LiveWorkers, sep.WorkersRunning)
+	}
+	if sep.PRGates != 3 {
+		t.Errorf("separated pr_gates = %d, want 3", sep.PRGates)
+	}
+	if sep.CapacityBlockedByGates != 0 {
+		t.Errorf("separated blocked_by_gates = %d, want 0 (gates separated out)", sep.CapacityBlockedByGates)
+	}
+	if sep.Activity != string(state.ActivityImplementing) {
+		t.Errorf("separated activity = %q, want %q", sep.Activity, state.ActivityImplementing)
+	}
+
+	if resp.Summary.LiveWorkers != 1 || resp.Summary.PRGates != 5 {
+		t.Errorf("summary live_workers=%d pr_gates=%d, want 1/5", resp.Summary.LiveWorkers, resp.Summary.PRGates)
+	}
+	if resp.Summary.CapacityBlockedByGates != 2 {
+		t.Errorf("summary capacity_blocked_by_gates = %d, want 2", resp.Summary.CapacityBlockedByGates)
+	}
+}
+
 func TestFleetQueueSnapshotFromSupervisorCarriesDecisionPlane(t *testing.T) {
 	info := supervisorInfo{
 		Latest: &supervisorDecisionInfo{
@@ -4636,5 +4732,80 @@ func TestLoadFleetProjectsRejectsExplicitDuplicateName(t *testing.T) {
 	}
 	if _, err := LoadFleetProjects(fleetPath); err == nil {
 		t.Fatal("LoadFleetProjects: want error on explicit duplicate name, got nil")
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// TestAllBackendsBlockedPartialHealthNotFullyBlocked guards the #814 review
+// finding: a health map holding only a cooldown entry for one backend must NOT
+// read as fully blocked while other configured backends have no health entry
+// yet and could still be dispatched.
+func TestAllBackendsBlockedPartialHealthNotFullyBlocked(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		Backends: map[string]config.BackendDef{
+			"claude": {},
+			"codex":  {},
+		},
+	}}
+	configured := configuredWorkerBackends(cfg)
+
+	// Only claude is in cooldown; codex has no entry -> dispatch can still try
+	// codex, so the project is not blocked_by_model_limits.
+	health := map[string]state.BackendHealth{
+		"claude": {State: state.BackendHealthCooldown},
+	}
+	if allBackendsBlocked(health, configured) {
+		t.Fatal("partial cooldown (codex still available) must not report all backends blocked")
+	}
+
+	// Both configured backends blocked -> genuinely blocked.
+	health["codex"] = state.BackendHealth{State: state.BackendHealthCooldown}
+	if !allBackendsBlocked(health, configured) {
+		t.Fatal("every configured backend in cooldown must report all backends blocked")
+	}
+
+	// An explicit available entry counts as an escape hatch.
+	health["codex"] = state.BackendHealth{State: state.BackendHealthAvailable}
+	if allBackendsBlocked(health, configured) {
+		t.Fatal("an available backend must not report all backends blocked")
+	}
+}
+
+// TestConfiguredWorkerBackendsOmitsDisabled confirms a disabled backend is not
+// counted as a dispatchable escape hatch, so its absence from the blocked set
+// cannot keep blocked_by_model_limits from firing when every enabled backend
+// is down.
+func TestConfiguredWorkerBackendsOmitsDisabled(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		Backends: map[string]config.BackendDef{
+			"claude": {},
+			"codex":  {Enabled: boolPtr(false)},
+		},
+	}}
+	configured := configuredWorkerBackends(cfg)
+	if len(configured) != 1 || configured[0] != "claude" {
+		t.Fatalf("configured = %v, want [claude] (codex disabled)", configured)
+	}
+	// claude down + codex disabled -> fully blocked (codex is not an escape).
+	health := map[string]state.BackendHealth{
+		"claude": {State: state.BackendBlockUsageLimit},
+	}
+	if !allBackendsBlocked(health, configured) {
+		t.Fatal("disabled codex must not prevent blocked_by_model_limits when claude is down")
+	}
+}
+
+// TestAllBackendsBlockedNoConfiguredFallsBackToHealthMap keeps the legacy
+// health-map-only behavior when the configured set is unknown.
+func TestAllBackendsBlockedNoConfiguredFallsBackToHealthMap(t *testing.T) {
+	if allBackendsBlocked(nil, nil) {
+		t.Fatal("empty health + no configured set must not report blocked")
+	}
+	blocked := map[string]state.BackendHealth{"claude": {State: state.BackendHealthCooldown}}
+	if !allBackendsBlocked(blocked, nil) {
+		t.Fatal("all recorded entries blocked + no configured set must report blocked")
 	}
 }
