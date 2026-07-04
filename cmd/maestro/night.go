@@ -21,18 +21,18 @@ import (
 // claude credits on a known-broken state.
 
 type nightPreflight struct {
-	StartedAt        time.Time         `json:"started_at"`
-	ConfigPath       string            `json:"config_path"`
-	BackendsChecked  map[string]string `json:"backends_checked"` // backend -> "ok" | "missing" | "exhausted" | "skipped: ..."
-	StatePath        string            `json:"state_path"`
-	StateRead        bool              `json:"state_read"`
-	StuckSupervisor  bool              `json:"stuck_supervisor"`
-	StalePending     int               `json:"stale_pending_approvals"`
-	MaxRuntimeMin    int               `json:"max_runtime_minutes"`
-	MaxRetriesIssue  int               `json:"max_retries_per_issue"`
-	WorkerChain      []string          `json:"worker_chain"`
-	OK               bool              `json:"ok"`
-	Reason           string            `json:"reason,omitempty"`
+	StartedAt       time.Time         `json:"started_at"`
+	ConfigPath      string            `json:"config_path"`
+	BackendsChecked map[string]string `json:"backends_checked"` // backend -> "ok" | "missing" | "exhausted" | "skipped: ..."
+	StatePath       string            `json:"state_path"`
+	StateRead       bool              `json:"state_read"`
+	StuckSupervisor bool              `json:"stuck_supervisor"`
+	StalePending    int               `json:"stale_pending_approvals"`
+	MaxRuntimeMin   int               `json:"max_runtime_minutes"`
+	MaxRetriesIssue int               `json:"max_retries_per_issue"`
+	WorkerChain     []string          `json:"worker_chain"`
+	OK              bool              `json:"ok"`
+	Reason          string            `json:"reason,omitempty"`
 }
 
 // nightStartCmd is the entry point bound to "maestro night-start <args>".

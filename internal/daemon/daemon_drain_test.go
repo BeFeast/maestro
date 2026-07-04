@@ -94,3 +94,71 @@ func TestDrainWaitsForWorkersThenAbortsOnCancel(t *testing.T) {
 		t.Fatal("Drain did not abort after ctx cancellation")
 	}
 }
+
+// TestStopAllTimesOutOnHangingFlow verifies that stopAll does not block
+// indefinitely when a flow's goroutines ignore context cancellation. It should
+// return within shutdownFlowTimeout and log a warning, not hang (#817).
+func TestStopAllTimesOutOnHangingFlow(t *testing.T) {
+	old := shutdownFlowTimeout
+	shutdownFlowTimeout = 50 * time.Millisecond
+	defer func() { shutdownFlowTimeout = old }()
+
+	d := New(fakeLoader{cfgs: nil}, Options{})
+
+	// A flow whose done channel never closes — the loop never exits.
+	neverDone := make(chan struct{})
+	_, cancel := context.WithCancel(context.Background())
+	flow := &projectFlow{
+		name:   "hanger",
+		key:    "hanger",
+		cfg:    testConfig(t, "owner/hanger"),
+		cancel: cancel,
+		done:   neverDone,
+	}
+	// Cancel so flow.cancel() works without panic; the done channel stays open.
+	cancel()
+	d.flows[flow.key] = flow
+
+	// stopAll must return within ~shutdownFlowTimeout, not hang.
+	done := make(chan struct{})
+	go func() {
+		d.stopAll()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopAll did not return within shutdownFlowTimeout for a hanging flow")
+	}
+}
+
+// TestDrainReturnsAfterDefaultTimeoutWithStuckWorkers verifies that Drain
+// respects the bounded default timeout (DefaultDrainTimeout) when in-flight
+// workers never finish (#817).
+func TestDrainReturnsAfterDefaultTimeoutWithStuckWorkers(t *testing.T) {
+	old := drainPollInterval
+	drainPollInterval = 5 * time.Millisecond
+	defer func() { drainPollInterval = old }()
+
+	cfg := testConfig(t, "owner/stuck")
+	d := New(fakeLoader{cfgs: nil}, Options{})
+	d.flows[flowKey(cfg)] = &projectFlow{name: "stuck", key: flowKey(cfg), cfg: cfg}
+
+	// Seed an in-flight worker that never finishes.
+	seed := &state.State{Sessions: map[string]*state.Session{
+		"stuck-1": {Status: state.StatusRunning},
+	}}
+	if err := state.Save(cfg.StateDir, seed); err != nil {
+		t.Fatalf("seed running state: %v", err)
+	}
+
+	start := time.Now()
+	// Use a very short timeout so the test completes quickly.
+	d.Drain(context.Background(), 100*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("Drain took %v with a 100ms timeout, should have returned near the deadline", elapsed)
+	}
+}

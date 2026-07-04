@@ -46,14 +46,23 @@ const (
 	// DefaultDrainTimeout bounds the graceful in-process drain the daemon runs on
 	// SIGTERM (#761, single-service cutover): it sets SpawnDrain on every flow so
 	// no new workers are claimed, then waits for in-flight workers to finish. It
-	// is deliberately UNDER the unit's TimeoutStopSec=30min so the drain finishes
-	// before systemd escalates to SIGKILL.
-	DefaultDrainTimeout = 25 * time.Minute
+	// is deliberately UNDER the unit's TimeoutStopSec so the drain finishes
+	// before systemd escalates to SIGKILL. The 5m default covers the vast
+	// majority of in-flight workers; a long-running worker that exceeds it is
+	// an external tmux process the daemon should not wait for (#817).
+	DefaultDrainTimeout = 5 * time.Minute
 )
 
 // drainPollInterval is how often Drain re-reads each flow's state to see whether
 // the in-flight worker count has reached zero. A var so tests can shorten it.
 var drainPollInterval = 5 * time.Second
+
+// shutdownFlowTimeout is the maximum time stopAll waits for a single flow's
+// goroutines (orchestrator, supervisor, watchdog) to exit after context
+// cancellation. If a flow hangs beyond this deadline stopAll logs a warning
+// and moves on, so the daemon never blocks indefinitely on shutdown (#817).
+// A var so tests can shorten it.
+var shutdownFlowTimeout = 10 * time.Second
 
 // ConfigLoader yields the set of project configs the daemon supervises. It is
 // satisfied by *configstore.Store; tests inject an in-memory fake so the
