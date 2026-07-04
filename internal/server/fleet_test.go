@@ -4734,3 +4734,78 @@ func TestLoadFleetProjectsRejectsExplicitDuplicateName(t *testing.T) {
 		t.Fatal("LoadFleetProjects: want error on explicit duplicate name, got nil")
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
+
+// TestAllBackendsBlockedPartialHealthNotFullyBlocked guards the #814 review
+// finding: a health map holding only a cooldown entry for one backend must NOT
+// read as fully blocked while other configured backends have no health entry
+// yet and could still be dispatched.
+func TestAllBackendsBlockedPartialHealthNotFullyBlocked(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		Backends: map[string]config.BackendDef{
+			"claude": {},
+			"codex":  {},
+		},
+	}}
+	configured := configuredWorkerBackends(cfg)
+
+	// Only claude is in cooldown; codex has no entry -> dispatch can still try
+	// codex, so the project is not blocked_by_model_limits.
+	health := map[string]state.BackendHealth{
+		"claude": {State: state.BackendHealthCooldown},
+	}
+	if allBackendsBlocked(health, configured) {
+		t.Fatal("partial cooldown (codex still available) must not report all backends blocked")
+	}
+
+	// Both configured backends blocked -> genuinely blocked.
+	health["codex"] = state.BackendHealth{State: state.BackendHealthCooldown}
+	if !allBackendsBlocked(health, configured) {
+		t.Fatal("every configured backend in cooldown must report all backends blocked")
+	}
+
+	// An explicit available entry counts as an escape hatch.
+	health["codex"] = state.BackendHealth{State: state.BackendHealthAvailable}
+	if allBackendsBlocked(health, configured) {
+		t.Fatal("an available backend must not report all backends blocked")
+	}
+}
+
+// TestConfiguredWorkerBackendsOmitsDisabled confirms a disabled backend is not
+// counted as a dispatchable escape hatch, so its absence from the blocked set
+// cannot keep blocked_by_model_limits from firing when every enabled backend
+// is down.
+func TestConfiguredWorkerBackendsOmitsDisabled(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		Backends: map[string]config.BackendDef{
+			"claude": {},
+			"codex":  {Enabled: boolPtr(false)},
+		},
+	}}
+	configured := configuredWorkerBackends(cfg)
+	if len(configured) != 1 || configured[0] != "claude" {
+		t.Fatalf("configured = %v, want [claude] (codex disabled)", configured)
+	}
+	// claude down + codex disabled -> fully blocked (codex is not an escape).
+	health := map[string]state.BackendHealth{
+		"claude": {State: state.BackendBlockUsageLimit},
+	}
+	if !allBackendsBlocked(health, configured) {
+		t.Fatal("disabled codex must not prevent blocked_by_model_limits when claude is down")
+	}
+}
+
+// TestAllBackendsBlockedNoConfiguredFallsBackToHealthMap keeps the legacy
+// health-map-only behavior when the configured set is unknown.
+func TestAllBackendsBlockedNoConfiguredFallsBackToHealthMap(t *testing.T) {
+	if allBackendsBlocked(nil, nil) {
+		t.Fatal("empty health + no configured set must not report blocked")
+	}
+	blocked := map[string]state.BackendHealth{"claude": {State: state.BackendHealthCooldown}}
+	if !allBackendsBlocked(blocked, nil) {
+		t.Fatal("all recorded entries blocked + no configured set must report blocked")
+	}
+}

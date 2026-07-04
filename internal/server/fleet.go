@@ -3232,7 +3232,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		Capacity:         capacity,
 		EligibleIssues:   eligibleIssues,
 		PendingApprovals: item.ApprovalSummary["pending"],
-		BackendsBlocked:  allBackendsBlocked(item.BackendHealth),
+		BackendsBlocked:  allBackendsBlocked(item.BackendHealth, configuredWorkerBackends(cfg)),
 		Paused:           item.Paused,
 	})
 	item.Activity = string(activity)
@@ -3350,11 +3350,69 @@ func fleetIssuesCoveredByExecutedCloseApproval(st *state.State) map[int]bool {
 	return covered
 }
 
-// allBackendsBlocked reports whether every backend with a recorded health entry
-// is currently unavailable (e.g. cooldown / usage-limit). Used only as an
-// idle-reason signal (#814): with no health entries, backends are assumed
-// available so a fresh project never mislabels itself as model-limit-blocked.
-func allBackendsBlocked(health map[string]state.BackendHealth) bool {
+// configuredWorkerBackends returns the set of backends a fresh dispatch could
+// route a worker to: the default backend plus every enabled backend declared
+// in model.backends. Disabled backends are omitted — they are never
+// dispatchable, so they cannot serve as an available escape hatch when
+// deciding whether the project is fully blocked by model limits (#814).
+func configuredWorkerBackends(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var names []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	// The default backend is auto-defined and dispatchable unless it is
+	// explicitly present-and-disabled in model.backends.
+	if def, ok := cfg.Model.Backends[cfg.Model.Default]; !ok || def.IsEnabled() {
+		add(cfg.Model.Default)
+	}
+	for name, def := range cfg.Model.Backends {
+		if def.IsEnabled() {
+			add(name)
+		}
+	}
+	return names
+}
+
+// allBackendsBlocked reports whether every dispatchable backend is currently
+// unavailable (e.g. cooldown / usage-limit). Used only as an idle-reason
+// signal (#814).
+//
+// A backend counts as blocked only when it has a health entry whose state is
+// non-available. Any configured backend WITHOUT a health entry is assumed
+// available — dispatch may still try it — so a project is reported
+// blocked_by_model_limits only when no configured backend can be dispatched.
+// This prevents a partial health map (e.g. one backend in cooldown while other
+// configured backends have no entry yet) from mislabeling the project as fully
+// blocked while dispatch still has an available backend to try.
+//
+// When the configured set is unknown (empty), fall back to the health map
+// alone: blocked only when it is non-empty and every recorded entry is
+// unavailable.
+func allBackendsBlocked(health map[string]state.BackendHealth, configured []string) bool {
+	blocked := func(name string) bool {
+		h, ok := health[name]
+		if !ok {
+			return false // untracked backend is assumed available
+		}
+		return h.State != "" && h.State != state.BackendHealthAvailable
+	}
+	if len(configured) > 0 {
+		for _, name := range configured {
+			if !blocked(name) {
+				return false
+			}
+		}
+		return true
+	}
 	if len(health) == 0 {
 		return false
 	}
