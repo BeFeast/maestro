@@ -75,11 +75,12 @@ type Backend interface {
 
 // knownBackends maps backend names to their implementations.
 var knownBackends = map[string]Backend{
-	"claude": claudeBackend{},
-	"cline":  clineBackend{},
-	"codex":  codexBackend{},
-	"gemini": geminiBackend{},
-	"pi":     piBackend{},
+	"claude":   claudeBackend{},
+	"cline":    clineBackend{},
+	"codex":    codexBackend{},
+	"gemini":   geminiBackend{},
+	"opencode": opencodeBackend{},
+	"pi":       piBackend{},
 }
 
 // --- Claude Backend ---
@@ -232,6 +233,46 @@ func (piBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec
 	return cmd, promptFile, nil
 }
 
+// --- OpenCode Backend ---
+
+// opencodeBackend runs the OpenCode coding agent headless in JSON event-stream
+// mode so Maestro can capture provider usage (model/tokens/cost) the way it
+// does for the first-class claude/codex backends.
+//
+// OpenCode is invoked as: opencode run --auto --format json
+// [--model <model>] [extra_args...]
+//
+// --auto auto-approves permissions that are not explicitly denied, rounding up to
+// the equivalent of claude --dangerously-skip-permissions. run reads the prompt
+// from stdin when no positional message is given; the runner script wires
+// promptFile to stdin, keeping large worker prompts under the Linux
+// MAX_ARG_STRLEN single-argument limit.
+//
+// --format json emits an NDJSON event stream (step_start / text / step_finish)
+// to the worker log. The stream-splitter forwards raw JSON frames to the
+// slot.jsonl side-channel and renders human-readable text to slot.log, and the
+// orchestrator's opencode usage parser aggregates model/tokens/cost from the
+// final step_finish event in the JSONL.
+type opencodeBackend struct{}
+
+func (opencodeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	opencodeCmd := cfg.Cmd
+	if opencodeCmd == "" {
+		opencodeCmd = "opencode"
+	}
+	binary, cmdArgs := splitCmd(opencodeCmd)
+	args := append(cmdArgs, "run", "--auto", "--format", "json")
+	if m := strings.TrimSpace(cfg.Model); m != "" {
+		args = append(args, "--model", m)
+	}
+	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindOpencode, cfg)
+	args = append(args, cfg.ExtraArgs...)
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = worktree
+	// Stdin redirection is handled by the runner script — no file opened here.
+	return cmd, promptFile, nil
+}
+
 // --- Cline Backend ---
 
 type clineBackend struct{}
@@ -343,6 +384,10 @@ func appendTierModelEffort(args, pinned []string, kind string, cfg BackendConfig
 	case config.BackendKindClaude:
 		if !argsHaveFlag(pinned, "--effort") {
 			args = append(args, "--effort", effort)
+		}
+	case config.BackendKindOpencode:
+		if !argsHaveFlag(pinned, "--variant") {
+			args = append(args, "--variant", effort)
 		}
 	default:
 		// gemini and any other agentic backend routed here have no reasoning-effort
@@ -565,7 +610,7 @@ func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string
 		return nil
 	}
 	kind := resolveBackendKind(backendName, cfg)
-	if kind != config.BackendKindClaude && kind != config.BackendKindCodex {
+	if kind != config.BackendKindClaude && kind != config.BackendKindCodex && kind != config.BackendKindOpencode {
 		return nil
 	}
 	bin, ok := maestroExecutablePath()
@@ -692,6 +737,24 @@ func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, workt
 			args = append(args, "--model", m)
 		}
 		args = append(args, "-p")
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, promptFile, nil
+	case "opencode":
+		opencodeCmd := cfg.Cmd
+		if opencodeCmd == "" {
+			opencodeCmd = "opencode"
+		}
+		binary, cmdArgs := splitCmd(opencodeCmd)
+		// Supervisor prompts are read-only decisions; no --auto bypass needed.
+		// run reads the prompt from stdin when no positional message is given,
+		// mirroring claude -p / codex - and keeping large supervisor prompts
+		// under the Linux MAX_ARG_STRLEN single-argument limit.
+		args := append(cmdArgs, "run", "--format", "json")
+		if m := strings.TrimSpace(cfg.Model); m != "" {
+			args = append(args, "--model", m)
+		}
+		args = append(args, cfg.ExtraArgs...)
 		cmd := exec.Command(binary, args...)
 		cmd.Dir = worktree
 		return cmd, promptFile, nil

@@ -88,6 +88,8 @@ func renderStreamLine(backend, line string) string {
 		return renderClaudeStreamLine(line)
 	case "codex":
 		return renderCodexStreamLine(line)
+	case "opencode":
+		return renderOpenCodeStreamLine(line)
 	default:
 		return line
 	}
@@ -330,5 +332,66 @@ func renderCodexItem(item *codexRenderItem, completed bool) string {
 			}
 		}
 		return ""
+	}
+}
+
+// --- OpenCode stream renderer ---
+
+// opencodeRenderFrame is the subset of an opencode --format json event line the
+// renderer decodes. step_finish carries the usage block with tokens/cost.
+type opencodeRenderFrame struct {
+	Type      string               `json:"type"`
+	Timestamp int64                `json:"timestamp"`
+	Part      *opencodeRenderPart  `json:"part"`
+}
+
+type opencodeRenderPart struct {
+	Type   string              `json:"type"`
+	Text   string              `json:"text"`
+	Reason string              `json:"reason"`
+	Tokens *opencodeUsageBlock `json:"tokens"`
+	Cost   float64             `json:"cost"`
+}
+
+// renderOpenCodeStreamLine renders one opencode --format json event into
+// human-readable text for slot.log. A line that is not a JSON object, or
+// fails to decode, is returned verbatim so nothing is lost from the worker
+// log (and any plain stderr error text — rate-limit / auth-failure — still
+// reaches the text parsers). Unknown top-level event types are likewise
+// preserved verbatim so error signatures survive.
+func renderOpenCodeStreamLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || trimmed[0] != '{' {
+		return line
+	}
+	var fr opencodeRenderFrame
+	if err := json.Unmarshal([]byte(trimmed), &fr); err != nil {
+		return line
+	}
+	switch fr.Type {
+	case "step_start":
+		return ""
+	case "text":
+		if fr.Part != nil && fr.Part.Text != "" {
+			return fr.Part.Text
+		}
+		return ""
+	case "step_finish":
+		if fr.Part == nil || fr.Part.Tokens == nil {
+			return ""
+		}
+		var b strings.Builder
+		tk := fr.Part.Tokens
+		fmt.Fprintf(&b, "[opencode] usage: input=%d output=%d total=%d", tk.Input, tk.Output, tk.Total)
+		if tk.Reasoning > 0 {
+			fmt.Fprintf(&b, " reasoning=%d", tk.Reasoning)
+		}
+		if tk.Cache != nil && (tk.Cache.Read > 0 || tk.Cache.Write > 0) {
+			fmt.Fprintf(&b, " cache_read=%d cache_write=%d", tk.Cache.Read, tk.Cache.Write)
+		}
+		fmt.Fprintf(&b, " cost=$%.4f", fr.Part.Cost)
+		return b.String()
+	default:
+		return line
 	}
 }

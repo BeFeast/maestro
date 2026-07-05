@@ -45,6 +45,12 @@ var authFailurePatterns = []struct {
 	{"oauth_token_expired", regexp.MustCompile(`(?i)oauth token (?:has )?(?:expired|been revoked)`)},
 	{"login_required", regexp.MustCompile(`(?i)please run /login`)},
 	{"invalid_api_key", regexp.MustCompile(`(?i)(?:invalid|incorrect|expired|revoked)[ _-]?api[ _-]?key|api key (?:is )?(?:not valid|invalid|expired|revoked)`)},
+	// Codex's CLIProxy/fireworks profile dies with "Missing environment variable:
+	// `CLIPROXY_API_KEY`" when the proxy API key is not wired into the worker
+	// environment. This is a credential/config failure, not a model-unavailable
+	// death, so classify it as an auth failure and fall over to the next
+	// fallback backend instead of mis-gating codex as model-unavailable.
+	{"missing_api_key_env_var", regexp.MustCompile(`(?i)missing environment variable[:\s].*\b[a-z0-9_]*api[_-]?key[a-z0-9_]*\b`)},
 }
 
 // authFailureTailLines bounds post-mortem auth detection to the end of a
