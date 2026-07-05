@@ -184,9 +184,19 @@ func (d *Daemon) stopAll() {
 	for _, flow := range flows {
 		flow.cancel()
 	}
+	// Give each flow its own independent deadline so a stuck cycle in one
+	// flow never consumes the timeout for a later one (review #660). Each
+	// flow gets shutdownFlowTimeout to exit after context cancellation;
+	// after that we log a warning and move on (#817).
 	for _, flow := range flows {
-		<-flow.done
-		log.Printf("[daemon] stopped flow %q", flow.name)
+		t := time.NewTimer(shutdownFlowTimeout)
+		select {
+		case <-flow.done:
+			t.Stop()
+			log.Printf("[daemon] stopped flow %q", flow.name)
+		case <-t.C:
+			log.Printf("[daemon] stopAll: timed out waiting for flow %q — proceeding with shutdown", flow.name)
+		}
 	}
 }
 

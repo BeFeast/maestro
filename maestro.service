@@ -30,8 +30,9 @@ ExecStart=/usr/local/bin/maestro daemon \
 # Graceful in-process drain on SIGTERM: the daemon sets SpawnDrain on every flow
 # (no new workers) and waits for in-flight workers to finish — there is no
 # per-unit ExecStop=maestro drain anymore. Give it room before SIGKILL; the
-# daemon's own --drain-timeout (default 25m) finishes inside this window.
-TimeoutStopSec=30min
+# daemon's own --drain-timeout (default 5m) finishes well inside this window
+# (#817).
+TimeoutStopSec=6min
 Restart=on-failure
 RestartSec=30
 
