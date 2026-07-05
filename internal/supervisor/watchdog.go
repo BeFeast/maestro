@@ -83,6 +83,17 @@ func Watchdog(ctx context.Context, name, stateDir string, interval time.Duration
 			tryKick(logPrefix, kickCh, consecutiveStuck)
 		} else {
 			consecutiveStuck = 0
+			// Recovery: the loop stamped a fresh LastRunOnceAt since
+			// the last tick. Clear SupervisorStuck so the Fleet API
+			// reflects the healthy state without waiting for the next
+			// RunOnce to complete (#816).
+			if st.SupervisorStuck {
+				st.SupervisorStuck = false
+				st.SupervisorStuckReason = ""
+				if err := state.Save(stateDir, st); err != nil {
+					log.Printf("[%s] recovery: save state while clearing SupervisorStuck: %v", logPrefix, err)
+				}
+			}
 		}
 	}
 }

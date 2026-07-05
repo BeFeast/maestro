@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -99,6 +100,13 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		return nil
 	}
 
+	// Track in-flight RunOnce goroutines so the function doesn't return (and
+	// therefore the flow does not report drained) while one is still writing
+	// state — even when a kick abandons the in-flight cycle (#816). Waited
+	// once on return, after the outer select has picked up ctx.Done.
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
+
 	// #794: de-phase this flow's supervise reads from the rest of the fleet.
 	// Like the orchestrator loop, the first runOnce anchors the ticker, so a
 	// random phase offset here spreads the supervise GitHub reads across the
@@ -122,7 +130,9 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		// Run the cycle asynchronously so a wedged RunOnce does not
 		// block the kick/ticker select loop (#816).
 		done := make(chan error, 1)
+		inflight.Add(1)
 		go func() {
+			defer inflight.Done()
 			done <- runOnce()
 		}()
 		select {
@@ -134,6 +144,8 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		case <-kickCh:
 			// Watchdog detected the loop is stuck; abort waiting
 			// and let the outer loop start a fresh cycle (#816).
+			// The in-flight goroutine is tracked via inflight so
+			// shutdown still waits for it to complete.
 			return
 		case err := <-done:
 			if err != nil {

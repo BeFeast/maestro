@@ -165,6 +165,100 @@ func TestRunSuperviseCancelsCleanlyWhileWaitingForRunOnce(t *testing.T) {
 // TestRunSuperviseKickWhileWaitingForRunOnce verifies that a kick sent
 // while runCycle is waiting for a stuck RunOnce is observed and causes
 // runCycle to abort waiting (#816 review comment 2).
+// TestRunSuperviseKickTracksInflightGoroutine verifies that after a kick
+// abandons the in-flight RunOnce, the function still exits cleanly on ctx
+// cancellation — proving the goroutine is tracked via inflight and does not
+// prevent shutdown (#816 review comment 1).
+func TestRunSuperviseKickTracksInflightGoroutine(t *testing.T) {
+	restore := disableJitter()
+	defer restore()
+
+	cfg := &config.Config{
+		Repo:     "test/repo",
+		StateDir: t.TempDir(),
+	}
+
+	st := state.NewState()
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("save initial state: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	kickCh := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		runSupervise(ctx, "test-track", func() *config.Config { return cfg }, 100*time.Millisecond, kickCh)
+		close(done)
+	}()
+
+	// Let the first runCycle complete (RunOnce fails fast without gh CLI).
+	time.Sleep(50 * time.Millisecond)
+
+	// Send a kick — the inner runCycle returns without consuming done,
+	// abandoning the goroutine. With the fix the goroutine is tracked.
+	kickCh <- struct{}{}
+
+	// Let the kicked cycle start.
+	time.Sleep(20 * time.Millisecond)
+
+	// Cancel the context and verify the function exits. The inflight
+	// WaitGroup must have counted down — otherwise done never closes.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runSupervise did not exit after ctx cancellation — inflight.Wait() may be stuck")
+	}
+}
+
+// TestRunSuperviseMultipleKicksTracksEachGoroutine verifies that multiple
+// rapid kicks don't cause a leak: each abandoned goroutine is tracked and
+// the function exits cleanly.
+func TestRunSuperviseMultipleKicksTracksEachGoroutine(t *testing.T) {
+	restore := disableJitter()
+	defer restore()
+
+	cfg := &config.Config{
+		Repo:     "test/repo",
+		StateDir: t.TempDir(),
+	}
+
+	st := state.NewState()
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("save initial state: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	kickCh := make(chan struct{}, 10)
+	done := make(chan struct{})
+	go func() {
+		runSupervise(ctx, "test-multi-kick", func() *config.Config { return cfg }, 100*time.Millisecond, kickCh)
+		close(done)
+	}()
+
+	// Let the first cycle complete.
+	time.Sleep(50 * time.Millisecond)
+
+	// Send multiple rapid kicks.
+	for i := 0; i < 5; i++ {
+		kickCh <- struct{}{}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runSupervise did not exit after multiple kicks — inflight.Wait() may be stuck")
+	}
+}
+
 func TestRunSuperviseKickWhileWaitingForRunOnce(t *testing.T) {
 	restore := disableJitter()
 	defer restore()

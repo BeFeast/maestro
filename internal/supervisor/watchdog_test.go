@@ -252,3 +252,60 @@ func TestConsecutiveStuckResetAfterPartialRecovery(t *testing.T) {
 		t.Fatal("expected kick after 2 consecutive stuck ticks following a reset")
 	}
 }
+
+// TestWatchdogClearsSupervisorStuckOnRecovery verifies that when the
+// watchdog detects a fresh LastRunOnceAt it clears the SupervisorStuck
+// flag (#816).
+func TestWatchdogClearsSupervisorStuckOnRecovery(t *testing.T) {
+	dir := t.TempDir()
+	interval := 30 * time.Millisecond
+
+	st := state.NewState()
+	st.LastRunOnceAt = time.Now().UTC().Add(-1 * time.Hour)
+	st.SupervisorStuck = true
+	st.SupervisorStuckReason = "synthetic stuck for test"
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save initial stuck state: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		Watchdog(ctx, "test", dir, interval, nil)
+		close(done)
+	}()
+
+	// Wait past startup grace so the watchdog loads state.
+	time.Sleep(4 * interval)
+
+	// Stamp a fresh LastRunOnceAt to simulate recovery.
+	// Use Load+modify+Save to match loadedHash.
+	st2, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	st2.LastRunOnceAt = time.Now().UTC().Add(time.Minute)
+	if err := state.Save(dir, st2); err != nil {
+		t.Fatalf("save recovered state: %v", err)
+	}
+
+	// Wait for the watchdog to tick and see the fresh timestamp.
+	time.Sleep(3 * interval)
+
+	cancel()
+	<-done
+
+	// Verify SupervisorStuck was cleared.
+	st3, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load final state: %v", err)
+	}
+	if st3.SupervisorStuck {
+		t.Fatalf("SupervisorStuck still true after recovery; watchdog should have cleared it")
+	}
+	if st3.SupervisorStuckReason != "" {
+		t.Fatalf("SupervisorStuckReason=%q; should be cleared on recovery", st3.SupervisorStuckReason)
+	}
+}
