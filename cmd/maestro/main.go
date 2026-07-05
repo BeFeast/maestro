@@ -984,7 +984,12 @@ func superviseCmd(args []string) {
 	// been bumped in 3*interval. The warning persists into state
 	// (SupervisorStuck=true) so the Fleet API and dashboards can
 	// surface it without grepping the journal.
-	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval)
+	// The CLI supervise loop does not have a kick channel because the
+	// single-project supervise command blocks on RunOnce directly (not
+	// through runSupervise). The daemon's per-flow loops wire a shared
+	// kick channel (#816); here we pass nil so the watchdog only warns.
+	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval, nil)
+
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for {

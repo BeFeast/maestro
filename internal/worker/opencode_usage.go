@@ -22,7 +22,7 @@ type OpenCodeUsage struct {
 	Reasoning   int
 	CacheRead   int
 	CacheWrite  int
-	TotalTokens int    // Input + Output + Reasoning
+	TotalTokens int // Input + Output + Reasoning
 	CostUSD     float64
 }
 
@@ -30,7 +30,7 @@ type OpenCodeUsage struct {
 // this package decodes. The terminal step_finish event carries
 // tokens + cost; all other event types (step_start, text) are ignored here.
 type opencodeStreamFrame struct {
-	Type string            `json:"type"`
+	Type string             `json:"type"`
 	Part *opencodeUsagePart `json:"part"`
 }
 

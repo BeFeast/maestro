@@ -63,7 +63,12 @@ func computeSuperviseJitter(interval time.Duration, frac float64) time.Duration 
 // flow restart (#768). The GitHub client is built once from the startup repo —
 // repo is a restart-required field the orchestrator refuses to hot-apply, so it
 // is stable for the flow's lifetime.
-func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration, approvalsDBPath string, emergencyLLMHalt func() bool) {
+//
+// kickCh is an optional signal from the watchdog: when the supervise loop is
+// wedged (a RunOnce has not completed within 3*interval), the watchdog sends
+// a value on kickCh to abort the in-flight RunOnce and start a fresh cycle
+// immediately (#816).
+func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration, approvalsDBPath string, emergencyLLMHalt func() bool, kickCh <-chan struct{}) {
 	// reader is the flow's read surface. The daemon passes a mirror-first source
 	// when github_mirror.source is mirror-first (#826); it satisfies
 	// supervisor.Reader and serves the poll reads locally when the mirror is warm,
@@ -113,9 +118,24 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		}
 	}
 
-	if err := runOnce(); err != nil {
-		log.Printf("[%s] supervise: first cycle failed (will retry): %v", name, err)
+	runCycle := func() {
+		// Run the cycle asynchronously so a wedged RunOnce does not
+		// block the kick/ticker select loop (#816).
+		done := make(chan error, 1)
+		go func() {
+			done <- runOnce()
+		}()
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-done:
+			if err != nil {
+				log.Printf("[%s] supervise: cycle failed (will retry in %s): %v", name, interval, err)
+			}
+		}
 	}
+
+	runCycle()
 
 	if interval <= 0 {
 		return
@@ -124,16 +144,15 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		// #689: a failed cycle is logged and retried on the next tick,
+		// never fatal — a transient GitHub/decision-layer failure must
+		// not crash the daemon.
+		runCycle()
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// #689: a failed cycle is logged and retried on the next tick,
-			// never fatal — a transient GitHub/decision-layer failure must
-			// not crash the daemon.
-			if err := runOnce(); err != nil {
-				log.Printf("[%s] supervise: cycle failed (will retry in %s): %v", name, interval, err)
-			}
+		case <-kickCh:
 		}
 	}
 }

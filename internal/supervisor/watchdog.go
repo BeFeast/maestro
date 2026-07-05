@@ -24,7 +24,12 @@ import (
 // name (project / session prefix) is woven into every log line so that, with N
 // flows in one daemon, an operator can tell whose LastRunOnceAt went stale
 // (#764) instead of reading N identical `[supervise/watchdog]` prefixes.
-func Watchdog(ctx context.Context, name, stateDir string, interval time.Duration) {
+//
+// When kickCh is non-nil and the watchdog observes 2+ consecutive stuck ticks
+// (warn + confirmation) it sends a kick signal so the supervise loop can
+// self-heal by aborting the in-flight RunOnce and starting a fresh cycle
+// (#816).
+func Watchdog(ctx context.Context, name, stateDir string, interval time.Duration, kickCh chan<- struct{}) {
 	if interval <= 0 {
 		return
 	}
@@ -37,6 +42,8 @@ func Watchdog(ctx context.Context, name, stateDir string, interval time.Duration
 
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
+
+	var consecutiveStuck int
 
 	for {
 		select {
@@ -62,6 +69,8 @@ func Watchdog(ctx context.Context, name, stateDir string, interval time.Duration
 			log.Printf("[%s] WARNING: no RunOnce has stamped state.LastRunOnceAt since the daemon started %s ago; check whether RunOnce is wedged",
 				logPrefix, time.Since(startedAt).Round(time.Second))
 			persistSupervisorStuck(logPrefix, stateDir, "no RunOnce has completed since daemon start")
+			consecutiveStuck++
+			tryKick(logPrefix, kickCh, consecutiveStuck)
 			continue
 		}
 		gap := time.Since(st.LastRunOnceAt)
@@ -70,7 +79,26 @@ func Watchdog(ctx context.Context, name, stateDir string, interval time.Duration
 				st.LastRunOnceAt.Format(time.RFC3339), gap.Round(time.Second), stuckThreshold)
 			log.Printf("[%s] WARNING: supervise loop appears stuck — %s", logPrefix, reason)
 			persistSupervisorStuck(logPrefix, stateDir, reason)
+			consecutiveStuck++
+			tryKick(logPrefix, kickCh, consecutiveStuck)
+		} else {
+			consecutiveStuck = 0
 		}
+	}
+}
+
+// tryKick sends a kick signal on kickCh when consecutiveStuck >= 2,
+// so the supervise loop can self-heal by aborting its in-flight RunOnce
+// and starting a fresh cycle. Non-blocking send so the watchdog never
+// blocks if the supervise loop hasn't drained the previous kick.
+func tryKick(logPrefix string, kickCh chan<- struct{}, consecutiveStuck int) {
+	if kickCh == nil || consecutiveStuck < 2 {
+		return
+	}
+	log.Printf("[%s] kick: supervise loop is wedged — sending recovery signal (consecutive stuck ticks=%d)", logPrefix, consecutiveStuck)
+	select {
+	case kickCh <- struct{}{}:
+	default:
 	}
 }
 

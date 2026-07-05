@@ -54,7 +54,7 @@ func (lt *loopTracker) loop(ctx context.Context, cfg *config.Config, opts Option
 // superviseLoop is the supervise-shaped stub (the supervise loop takes the
 // flow's unique name and a current-config getter, #764/#768). It records the
 // same counters.
-func (lt *loopTracker) superviseLoop(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+func (lt *loopTracker) superviseLoop(ctx context.Context, name string, getCfg func() *config.Config, opts Options, kickCh <-chan struct{}) {
 	atomic.AddInt64(&lt.started, 1)
 	<-ctx.Done()
 	atomic.AddInt64(&lt.stopped, 1)
@@ -64,7 +64,7 @@ func (lt *loopTracker) superviseLoop(ctx context.Context, name string, getCfg fu
 // configs. Both watchdog loops are stubbed to no-ops so flows started through
 // this helper stay isolated from real state writers. Tests that assert watchdog
 // behaviour install their own stubs.
-func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, func() *config.Config, Options)) *Daemon {
+func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, func() *config.Config, Options, <-chan struct{})) *Daemon {
 	d := New(loader, Options{Host: "127.0.0.1", Port: 0})
 	if run != nil {
 		d.runLoop = run
@@ -72,7 +72,7 @@ func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config
 	if supervise != nil {
 		d.superviseLoop = supervise
 	}
-	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {}
+	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration, kickCh chan<- struct{}) {}
 	d.materialProgressLoop = func(ctx context.Context, name string, getCfg func() *config.Config) {}
 	return d
 }
@@ -347,7 +347,7 @@ func TestFlowPanicCancelsFlow(t *testing.T) {
 	// on its own; no one calls stopFlow.
 	cfg := testConfig(t, "owner/panicky")
 	var supStarted, supStopped int64
-	supervise := func(ctx context.Context, name string, getCfg func() *config.Config, o Options) {
+	supervise := func(ctx context.Context, name string, getCfg func() *config.Config, o Options, kickCh <-chan struct{}) {
 		atomic.AddInt64(&supStarted, 1)
 		<-ctx.Done()
 		atomic.AddInt64(&supStopped, 1)
@@ -410,10 +410,10 @@ func TestRunSurfacesFleetBindErrorImmediately(t *testing.T) {
 	}
 	d := New(fakeLoader{cfgs: []*config.Config{cfg}}, Options{Host: "127.0.0.1", Port: port})
 	d.runLoop = blockingLoop
-	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, o Options) {
+	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, o Options, kickCh <-chan struct{}) {
 		blockingLoop(ctx, getCfg(), o, nil)
 	}
-	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {}
+	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration, kickCh chan<- struct{}) {}
 
 	// ctx is intentionally never cancelled within the deadline.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -469,7 +469,7 @@ func TestStopFlowDrainsWatchdog(t *testing.T) {
 
 	var wdStarted, wdStopped int64
 	var gotName, gotStateDir string
-	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {
+	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration, kickCh chan<- struct{}) {
 		gotName, gotStateDir = name, stateDir
 		atomic.AddInt64(&wdStarted, 1)
 		<-ctx.Done()

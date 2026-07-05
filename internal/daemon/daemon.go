@@ -341,9 +341,14 @@ type Daemon struct {
 	// closure rather than a fixed *config.Config so it reads the flow's current
 	// config each cycle through the shared holder — a config-store edit reaches
 	// the supervise loop live, not just the orchestrator (#768).
+	//
+	// kickCh is shared between superviseLoop and watchdogLoop: when the
+	// watchdog detects 2+ consecutive stuck ticks it sends a kick signal
+	// on this channel so the supervise loop aborts its in-flight RunOnce
+	// and starts a fresh cycle (#816).
 	runLoop              func(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config)
-	superviseLoop        func(ctx context.Context, name string, getCfg func() *config.Config, opts Options)
-	watchdogLoop         func(ctx context.Context, name, stateDir string, interval time.Duration)
+	superviseLoop        func(ctx context.Context, name string, getCfg func() *config.Config, opts Options, kickCh <-chan struct{})
+	watchdogLoop         func(ctx context.Context, name, stateDir string, interval time.Duration, kickCh chan<- struct{})
 	materialProgressLoop func(ctx context.Context, name string, getCfg func() *config.Config)
 }
 
@@ -434,7 +439,7 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		}
 	}
 	d.runLoop = d.runOrchestrator
-	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, opts Options, kickCh <-chan struct{}) {
 		// #826: build the flow's mirror-first read source (nil when the mirror is
 		// disabled). Its escape hatch reads getCfg() — the holder the reload pump
 		// swaps — so a config-store edit flips the supervisor between mirror-first
@@ -443,7 +448,7 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		if src := d.newReadSource(getCfg().Repo, getCfg); src != nil {
 			reader = src
 		}
-		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval, opts.ApprovalsDBPath, d.emergencyLLMHalt)
+		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval, opts.ApprovalsDBPath, d.emergencyLLMHalt, kickCh)
 	}
 	d.watchdogLoop = supervisor.Watchdog
 	d.materialProgressLoop = supervisor.RunMaterialProgressEvaluator
