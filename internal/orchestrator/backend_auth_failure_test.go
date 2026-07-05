@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -630,5 +632,42 @@ func TestStartNewWorkers_AllBackendsCoolingDown_NoSpawn(t *testing.T) {
 	}
 	if len(s.Sessions) != 0 {
 		t.Fatalf("sessions = %d, want 0 — dispatch must pause, not spawn doomed workers", len(s.Sessions))
+	}
+}
+
+// Codex with --profile proxy prints a "Model metadata for `fw-kimi-k2.7-code`
+// not found" warning followed by "Missing environment variable: `CLIPROXY_API_KEY`"
+// when the proxy key is absent. Without an auth-failure pattern for the missing
+// env var, the model-unavailable classifier would fire on the metadata warning
+// and gate codex with the wrong reason. The death must be classified as an auth
+// (credential/config) failure so the attempt falls back instead of being
+// mislabelled model-unavailable.
+func TestClassifyBackendFailure_CodexCLIProxyMissingEnvVar_IsAuthFailure(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "codex-cliproxy.log")
+	content := "OpenAI Codex v0.142.5\n" +
+		"model: fw-kimi-k2p7-code\n" +
+		"provider: cliproxy\n" +
+		"warning: Model metadata for `fw-kimi-k2p7-code` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.\n" +
+		"ERROR: Missing environment variable: `CLIPROXY_API_KEY`.\n"
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	o := &Orchestrator{cfg: claudeChainTestConfig()}
+	sess := &state.Session{
+		Backend:   "codex",
+		StartedAt: time.Now().UTC().Add(-90 * time.Second),
+		LogFile:   logFile,
+	}
+	hit, reason, pattern := o.classifyBackendFailure(sess, time.Now().UTC())
+	if !hit {
+		t.Fatal("classifyBackendFailure = false, want true")
+	}
+	if reason != state.BackendBlockAuthFailure {
+		t.Fatalf("reason = %q, want %q", reason, state.BackendBlockAuthFailure)
+	}
+	if pattern != "missing_api_key_env_var" {
+		t.Fatalf("pattern = %q, want missing_api_key_env_var", pattern)
 	}
 }

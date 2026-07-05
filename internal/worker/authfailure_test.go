@@ -58,6 +58,11 @@ func TestDetectAuthFailure_KnownSignatures(t *testing.T) {
 			output:    "API key not valid. Please pass a valid API key.",
 			wantLabel: "invalid_api_key",
 		},
+		{
+			name:      "codex cliproxy missing env var",
+			output:    "ERROR: Missing environment variable: `CLIPROXY_API_KEY`.",
+			wantLabel: "missing_api_key_env_var",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
