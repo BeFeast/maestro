@@ -13,12 +13,13 @@ import (
 // CLI-specific behaviour: permission-bypass flags and stdin prompt
 // delivery. #684.
 const (
-	BackendKindClaude  = "claude"
-	BackendKindCodex   = "codex"
-	BackendKindGemini  = "gemini"
-	BackendKindCline   = "cline"
-	BackendKindPi      = "pi"
-	BackendKindGeneric = "generic"
+	BackendKindClaude   = "claude"
+	BackendKindCodex    = "codex"
+	BackendKindGemini   = "gemini"
+	BackendKindCline    = "cline"
+	BackendKindPi       = "pi"
+	BackendKindOpencode = "opencode"
+	BackendKindGeneric  = "generic"
 )
 
 // providerBackendKinds maps the per-backend provider attribution field
@@ -35,6 +36,7 @@ var providerBackendKinds = map[string]string{
 	"cline":     BackendKindCline,
 	"pi":        BackendKindPi,
 	"ollama":    BackendKindPi,
+	"opencode":  BackendKindOpencode,
 }
 
 // ResolveBackendKind decides which CLI-specific exec path a backend uses.
@@ -51,7 +53,7 @@ var providerBackendKinds = map[string]string{
 // mutating tool call was denied by the CLI's permission layer (sup-175).
 func ResolveBackendKind(name, provider, cmd string) string {
 	switch name {
-	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi:
+	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi, BackendKindOpencode:
 		return name
 	}
 	if kind, ok := providerBackendKinds[strings.ToLower(strings.TrimSpace(provider))]; ok {
@@ -71,7 +73,7 @@ func backendKindFromCmd(cmd string) string {
 		return ""
 	}
 	switch base := filepath.Base(fields[0]); base {
-	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi:
+	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi, BackendKindOpencode:
 		return base
 	}
 	return ""

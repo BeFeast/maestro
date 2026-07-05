@@ -869,6 +869,9 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	if kind == config.BackendKindCodex && o.sessionUsageStream(sess) {
 		return o.updateCodexUsageFromJSONL(slotName, sess)
 	}
+	if kind == config.BackendKindOpencode && o.sessionUsageStream(sess) {
+		return o.updateOpenCodeUsageFromJSONL(slotName, sess)
+	}
 	tokens := worker.ParseTokensFromOutput(output)
 	if tokens <= sess.TokensUsedAttempt {
 		return false
@@ -1036,6 +1039,55 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 	log.Printf("[orch] %s codex usage: input=%d output=%d cache_read=%d tokens=%d (total=%d)",
 		slotName, usage.Input, usage.Output, usage.CacheRead, usage.TotalTokens, sess.TokensUsedTotal)
 	return true
+}
+
+// updateOpenCodeUsageFromJSONL parses the opencode --format json side-channel
+// (slot.jsonl) and stamps tokens/cost onto the session. opencode emits one
+// terminal step_finish event per `opencode run` invocation; the stream-splitter
+// appends each attempt's frames to the same slot.jsonl, so
+// ParseOpenCodeUsage sums them to the cumulative run total. The monotonic
+// UsageTokensWatermark persists across respawns so a forced retry never
+// double-counts (mirrors the claude/codex/Pi paths). opencode carries no model
+// name in the event stream, so sess.Model is left as configured. Returns true
+// when anything changed; false (tokens stay 0) when the jsonl is absent — the
+// documented degradation when the stream-splitter was unavailable.
+func (o *Orchestrator) updateOpenCodeUsageFromJSONL(slotName string, sess *state.Session) bool {
+	jsonlPath := o.workerJSONLFile(slotName, sess)
+	if jsonlPath == "" {
+		return false
+	}
+	data, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		return false
+	}
+	usage, ok := worker.ParseOpenCodeUsage(string(data))
+	if !ok {
+		return false
+	}
+	changed := false
+	if usage.TotalTokens > sess.UsageTokensWatermark {
+		delta := usage.TotalTokens - sess.UsageTokensWatermark
+		sess.UsageTokensWatermark = usage.TotalTokens
+		sess.TokensUsedAttempt += delta
+		sess.TokensUsedTotal += delta
+		// Reasoning tokens are a separate thinking-tokens bucket in opencode
+		// (not a subset of output). Assign output+reasoning to TokensOutput
+		// since there is no dedicated reasoning field on the session.
+		sess.TokensInput = usage.Input
+		sess.TokensOutput = usage.Output + usage.Reasoning
+		sess.TokensCacheRead = usage.CacheRead
+		sess.TokensCacheWrite = usage.CacheWrite
+		changed = true
+	}
+	if usage.CostUSD > sess.CostUSDBackend {
+		sess.CostUSDBackend = usage.CostUSD
+		changed = true
+	}
+	if changed {
+		log.Printf("[orch] %s opencode usage: input=%d output=%d reasoning=%d cache_read=%d cache_write=%d tokens=%d cost=$%.4f (total=%d)",
+			slotName, usage.Input, usage.Output, usage.Reasoning, usage.CacheRead, usage.CacheWrite, usage.TotalTokens, usage.CostUSD, sess.TokensUsedTotal)
+	}
+	return changed
 }
 
 // sessionUsageStream reports whether the session's backend opted into
