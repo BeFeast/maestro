@@ -3509,7 +3509,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					o.reconcileNoPRRetryExhausted(slotName, sess)
 					continue
 				}
-				log.Printf("[orch] retry_exhausted session %s records PR #%d, but no open PR was found — waiting for reconciliation", slotName, sess.PRNumber)
+				// #818: retry_exhausted session records a PR, but no open PR
+				// was found. The PR was either merged (→ close issue) or closed
+				// without merge (→ label blocked so the queue advances).
+				// Previously this logged "waiting for reconciliation" forever,
+				// holding the issue slot and stalling the dynamic-wave queue.
+				o.reconcileClosedPRRetryExhausted(slotName, sess)
 				continue
 			}
 			log.Printf("[orch] no open PR found for branch %s (slot %s) — assuming merged/closed", sess.Branch, slotName)
@@ -3925,6 +3930,68 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(slotName string, sess *state.
 	// Mark the session reconciled so future cycles short-circuit. The status
 	// stays retry_exhausted (terminal) but the marker prevents repeated
 	// labels, close attempts, or notifications.
+	sess.LastNotifiedStatus = noPRReconciledStatus
+}
+
+// reconcileClosedPRRetryExhausted handles retry_exhausted sessions whose PR
+// is no longer open (#818). The PR was either merged by another path or
+// closed without merge. Without this reconciliation the session sat in
+// retry_exhausted forever logging "waiting for reconciliation", which held
+// the issue slot and stalled the dynamic-wave queue at max_parallel=1.
+func (o *Orchestrator) reconcileClosedPRRetryExhausted(slotName string, sess *state.Session) {
+	if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 {
+		return
+	}
+	if sess.LastNotifiedStatus == noPRReconciledStatus {
+		return
+	}
+
+	merged, err := o.isPRMerged(sess.PRNumber)
+	if err != nil {
+		log.Printf("[orch] closed-PR retry_exhausted: could not check if PR #%d was merged for issue #%d (slot %s): %v", sess.PRNumber, sess.IssueNumber, slotName, err)
+		return
+	}
+
+	if merged {
+		comment := fmt.Sprintf("Maestro: closing this issue because worker session %s exhausted retries, but its PR #%d was merged.", slotName, sess.PRNumber)
+		if o.supervisorActionAllowed(config.SupervisorActionCloseIssue) && !o.supervisorActionRequiresApproval(config.SupervisorActionCloseIssue) {
+			if cerr := o.closeIssue(sess.IssueNumber, comment); cerr != nil {
+				log.Printf("[orch] closed-PR retry_exhausted: auto-close failed for issue #%d (slot %s, PR #%d): %v", sess.IssueNumber, slotName, sess.PRNumber, cerr)
+				if o.notifier != nil {
+					o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted (PR #%d merged); auto-close failed: %v", sess.IssueNumber, sess.PRNumber, cerr)
+				}
+				return
+			}
+			log.Printf("[orch] closed-PR retry_exhausted: auto-closed issue #%d (slot %s, PR #%d merged)", sess.IssueNumber, slotName, sess.PRNumber)
+			if o.notifier != nil {
+				o.notifier.Sendf("✅ maestro: closed issue #%d after retry_exhausted (PR #%d merged)", sess.IssueNumber, sess.PRNumber)
+			}
+			o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+		} else {
+			log.Printf("[orch] closed-PR retry_exhausted: issue #%d (slot %s) PR #%d was merged — surfaced as operator close-candidate", sess.IssueNumber, slotName, sess.PRNumber)
+			if o.notifier != nil {
+				o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted; PR #%d was merged — operator close-candidate", sess.IssueNumber, sess.PRNumber)
+			}
+		}
+	} else {
+		if blockedLabel := strings.TrimSpace(o.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
+			if lerr := o.addIssueLabel(sess.IssueNumber, blockedLabel); lerr != nil {
+				log.Printf("[orch] closed-PR retry_exhausted: could not add %q label to issue #%d (slot %s): %v", blockedLabel, sess.IssueNumber, slotName, lerr)
+				if o.notifier != nil {
+					o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted (PR #%d closed); could not apply %q label: %v", sess.IssueNumber, sess.PRNumber, blockedLabel, lerr)
+				}
+				return
+			}
+			log.Printf("[orch] closed-PR retry_exhausted: labelled issue #%d %q (slot %s, PR #%d closed without merge)", sess.IssueNumber, blockedLabel, slotName, sess.PRNumber)
+		} else {
+			log.Printf("[orch] closed-PR retry_exhausted: issue #%d (slot %s) PR #%d closed without merge — operator review required (no blocked_label configured)", sess.IssueNumber, slotName, sess.PRNumber)
+		}
+		if o.notifier != nil {
+			o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted (PR #%d closed without merge) — needs operator review", sess.IssueNumber, sess.PRNumber)
+		}
+		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
+	}
+
 	sess.LastNotifiedStatus = noPRReconciledStatus
 }
 
