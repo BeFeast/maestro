@@ -285,6 +285,14 @@ func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardD
 	b.WriteString("export MAESTRO_SEARCH_GUARDRAIL_DIR=" + shellQuote(guardDir) + "\n")
 	b.WriteString("export MAESTRO_ORIGINAL_PATH=\"${PATH:-}\"\n")
 	b.WriteString("export PATH=\"$MAESTRO_SEARCH_GUARDRAIL_DIR:$MAESTRO_ORIGINAL_PATH\"\n")
+	// Inherit provider credential env vars from the daemon so harness CLIs can
+	// reach CLIProxyAPI / upstream APIs. The daemon gets these from its systemd
+	// drop-in; tmux new-session does not propagate them by default (#822).
+	for _, key := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLIPROXY_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY"} {
+		if v := os.Getenv(key); v != "" {
+			b.WriteString(fmt.Sprintf("export %s=%s\n", key, shellQuote(v)))
+		}
+	}
 	b.WriteString("cd \"$MAESTRO_WORKTREE\" || exit 1\n")
 	b.WriteString("printf '[maestro] worker worktree: %s\\n' \"$MAESTRO_WORKTREE\" | tee -a " + shellQuote(logFile) + "\n")
 	pipeline := logPipeline(split, logFile)
