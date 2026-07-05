@@ -127,6 +127,13 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		}()
 		select {
 		case <-ctx.Done():
+			// Wait for the in-flight runOnce to finish so it doesn't
+			// keep making changes after stopFlow reports the flow drained.
+			<-done
+			return
+		case <-kickCh:
+			// Watchdog detected the loop is stuck; abort waiting
+			// and let the outer loop start a fresh cycle (#816).
 			return
 		case err := <-done:
 			if err != nil {
@@ -147,13 +154,13 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		// #689: a failed cycle is logged and retried on the next tick,
 		// never fatal — a transient GitHub/decision-layer failure must
 		// not crash the daemon.
-		runCycle()
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		case <-kickCh:
 		}
+		runCycle()
 	}
 }
 
