@@ -144,8 +144,11 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		case <-kickCh:
 			// Watchdog detected the loop is stuck; abort waiting
 			// and let the outer loop start a fresh cycle (#816).
-			// The in-flight goroutine is tracked via inflight so
-			// shutdown still waits for it to complete.
+			// Wait for the in-flight goroutine to finish before
+			// returning so the outer loop cannot start a new
+			// runCycle that overlaps with the still-running one
+			// (#816 review).
+			<-done
 			return
 		case err := <-done:
 			if err != nil {
