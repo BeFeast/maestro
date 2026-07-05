@@ -4605,6 +4605,53 @@ func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
 	}
 }
 
+// #816 regression: when the supervisor owns the ready label and recommends a
+// review-repair spawn (policy rule supervisor.review_repair, not
+// supervisor.dynamic_wave), the orchestrator must still treat the targeted
+// issue as the selected candidate. Otherwise applySupervisorOwnedReadyFilter
+// filters it out and the approved repair spawn never dispatches.
+func TestStartNewWorkers_ReviewRepairSpawnBypassesSupervisorOwnedReadyFilter(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	dynamicWaveEnabled := true
+	cfg.Supervisor.DynamicWave.Enabled = &dynamicWaveEnabled
+	cfg.Supervisor.DynamicWave.OwnsReadyLabel = true
+	cfg.Supervisor.ReviewRepair.MaxRetries = 3
+	issues := []github.Issue{makeIssue(816, "wedged supervise loop", "maestro-ready")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	s := state.NewState()
+	now := time.Now().UTC()
+	decision := state.SupervisorDecision{
+		ID:                "repair-816",
+		CreatedAt:         now,
+		PolicyRule:        supervisor.PolicyRuleReviewRepair,
+		RecommendedAction: supervisor.ActionSpawnReviewRepair,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  true,
+		Target:            &state.SupervisorTarget{Issue: 816, PR: 820, HeadSHA: "4484a21c50b4"},
+		ReviewRepair: &state.SupervisorReviewRepairPayload{
+			HeadSHA:    "4484a21c50b4",
+			MaxRetries: 3,
+			Backend:    "claude",
+			Findings: []state.SupervisorReviewFinding{{
+				Path:     "internal/daemon/supervise.go",
+				Line:     136,
+				Body:     "P1: kick waits on wedged cycle",
+				Severity: "P1",
+			}},
+		},
+	}
+	s.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
+	approval := s.RecordPendingApprovalForDecision(decision, now)
+	approval.Status = state.ApprovalStatusAwaitingDispatch
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 1 || (*started)[0] != 816 {
+		t.Fatalf("started = %v, want [816] for supervisor-selected review-repair under owned ready label", *started)
+	}
+}
+
 func TestStartNewWorkers_RecordsProjectStatusSyncOnStart(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
 	cfg.GitHubProjects = config.GitHubProjectsConfig{Enabled: true, ProjectNumber: 3}

@@ -5595,14 +5595,27 @@ func (o *Orchestrator) supervisorOwnedReadySelectedIssue(s *state.State) (int, b
 		return 0, false
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil || decision.PolicyRule != supervisor.PolicyRuleDynamicWave {
+	if decision == nil {
 		return 0, false
 	}
-	if decision.QueueAnalysis != nil && decision.QueueAnalysis.SelectedCandidate != nil && decision.QueueAnalysis.SelectedCandidate.Number > 0 {
-		return decision.QueueAnalysis.SelectedCandidate.Number, true
-	}
-	if decision.Target != nil && decision.Target.Issue > 0 {
-		return decision.Target.Issue, true
+
+	switch decision.PolicyRule {
+	case supervisor.PolicyRuleDynamicWave:
+		if decision.QueueAnalysis != nil && decision.QueueAnalysis.SelectedCandidate != nil && decision.QueueAnalysis.SelectedCandidate.Number > 0 {
+			return decision.QueueAnalysis.SelectedCandidate.Number, true
+		}
+		if decision.Target != nil && decision.Target.Issue > 0 {
+			return decision.Target.Issue, true
+		}
+	case supervisor.PolicyRuleRuntimeState, supervisor.PolicyRuleReviewRepair:
+		// When the supervisor selects a repair/review-repair action, the targeted
+		// issue is the effective "owned ready" candidate even though the policy
+		// rule is not dynamic-wave. Without this branch the orchestrator filters
+		// the issue out and the repair spawn never dispatches (#816 regression).
+		if decision.Target != nil && decision.Target.Issue > 0 &&
+			(decision.RecommendedAction == supervisor.ActionSpawnReviewRepair || decision.RecommendedAction == supervisor.ActionSpawnRepairWorker) {
+			return decision.Target.Issue, true
+		}
 	}
 	return 0, false
 }
