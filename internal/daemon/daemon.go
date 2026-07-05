@@ -416,7 +416,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		drainWatch()
 		d.stopAll()
-		return <-fleetErr
+		// Don't block indefinitely on fleet server shutdown: the server's
+		// Shutdown goroutine has a 5s timeout, but bound the read so a
+		// pathological case never keeps the process alive (#817).
+		select {
+		case err := <-fleetErr:
+			return err
+		case <-time.After(shutdownFlowTimeout):
+			return nil
+		}
 	case err := <-fleetErr:
 		// Serve returned before shutdown — a runtime serve error after a
 		// successful bind (rare; the bind failure itself was already handled by

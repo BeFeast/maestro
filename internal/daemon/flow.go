@@ -184,16 +184,17 @@ func (d *Daemon) stopAll() {
 	for _, flow := range flows {
 		flow.cancel()
 	}
-	// Bound the per-flow wait so a stuck orchestrator cycle never blocks
-	// shutdown indefinitely. Each flow gets shutdownFlowTimeout to exit after
-	// context cancellation; after that we log a warning and move on (#817).
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownFlowTimeout)
-	defer cancel()
+	// Give each flow its own independent deadline so a stuck cycle in one
+	// flow never consumes the timeout for a later one (review #660). Each
+	// flow gets shutdownFlowTimeout to exit after context cancellation;
+	// after that we log a warning and move on (#817).
 	for _, flow := range flows {
+		t := time.NewTimer(shutdownFlowTimeout)
 		select {
 		case <-flow.done:
+			t.Stop()
 			log.Printf("[daemon] stopped flow %q", flow.name)
-		case <-shutdownCtx.Done():
+		case <-t.C:
 			log.Printf("[daemon] stopAll: timed out waiting for flow %q — proceeding with shutdown", flow.name)
 		}
 	}
