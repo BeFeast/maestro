@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +138,32 @@ func TestIngestMissingDeliveryID(t *testing.T) {
 	}
 }
 
+// TestIngestOversizePayloadRejected proves an oversize body is rejected as 413
+// (payload too large) BEFORE signature validation — not silently truncated and
+// then surfaced as a misleading 401 invalid signature. The signature here is
+// valid over the full body, so a 401 would mean the size check ran too late.
+func TestIngestOversizePayloadRejected(t *testing.T) {
+	in, store := newTestIngestor(t)
+	body := bytes.Repeat([]byte("a"), maxBodyBytes+1)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, DefaultPath, bytes.NewReader(body))
+	req.Header.Set(HeaderEvent, "issues")
+	req.Header.Set(HeaderDelivery, "too-big")
+	req.Header.Set(HeaderSignature, Sign(testSecret, body))
+	in.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize payload: status=%d want 413 body=%s", rec.Code, rec.Body.String())
+	}
+	if _, ok, _ := store.Get(context.Background(), "too-big"); ok {
+		t.Fatal("oversize payload should not be stored")
+	}
+	if stats := in.Stats(); stats.SignatureFailures != 0 {
+		t.Fatalf("oversize should not count as a signature failure: %+v", stats)
+	}
+}
+
 func TestIngestMethodNotAllowed(t *testing.T) {
 	in, _ := newTestIngestor(t)
 	rec := httptest.NewRecorder()
@@ -217,5 +244,13 @@ func TestSeedFromDurableStore(t *testing.T) {
 	}
 	if stats.ByEventType["issues"] != 2 {
 		t.Fatalf("seeded per-event=%d want 2", stats.ByEventType["issues"])
+	}
+	// A restart must restore BOTH the last-delivery time and its event type — a
+	// non-zero time with an empty event type is the bug this guards.
+	if stats.LastDeliveryAt.IsZero() {
+		t.Fatal("seeded last delivery time not restored")
+	}
+	if stats.LastEventType != "issues" {
+		t.Fatalf("seeded last event type=%q want issues", stats.LastEventType)
 	}
 }

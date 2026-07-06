@@ -16,9 +16,11 @@ import (
 )
 
 // maxBodyBytes caps the request body the ingestor reads. GitHub documents a
-// 25 MiB maximum webhook payload; anything larger is refused rather than read
-// into memory unbounded. The signature is computed over exactly the bytes read,
-// so a truncated oversize body fails signature validation and is rejected.
+// 25 MiB maximum webhook payload; anything larger is refused (413) rather than
+// read into memory unbounded. The request is rejected as OVERSIZE before the
+// signature is checked — otherwise a truncated body would fail signature
+// validation and surface a misleading "401 invalid signature" for what is really
+// a size problem, which GitHub would then retry indefinitely.
 const maxBodyBytes = 25 << 20
 
 // DefaultPath is the endpoint path the fleet daemon serves webhook ingestion on
@@ -35,7 +37,9 @@ type Store interface {
 	Insert(ctx context.Context, d webhookstore.Delivery) (bool, error)
 	Count(ctx context.Context) (int, error)
 	CountsByEventType(ctx context.Context) (map[string]int, error)
-	LastDeliveryAt(ctx context.Context) (time.Time, error)
+	// LastDelivery returns the time and event type of the most recent stored
+	// delivery so restart seeding can restore both diagnostics, not just the time.
+	LastDelivery(ctx context.Context) (time.Time, string, error)
 }
 
 // Ingestor is the HTTP handler that authenticates, deduplicates and persists
@@ -95,7 +99,7 @@ func (in *Ingestor) seed(ctx context.Context) {
 		log.Printf("[webhook] seed per-event counts failed: %v", err)
 		byType = nil
 	}
-	last, err := in.store.LastDeliveryAt(ctx)
+	last, lastEvent, err := in.store.LastDelivery(ctx)
 	if err != nil {
 		log.Printf("[webhook] seed last-delivery time failed: %v", err)
 	}
@@ -108,6 +112,9 @@ func (in *Ingestor) seed(ctx context.Context) {
 	}
 	if !last.IsZero() {
 		in.lastDeliveryAt = last.UTC()
+		// Restore the event type alongside the time so a restart does not report a
+		// last-delivery timestamp with an empty event type (#824 observability).
+		in.lastEventType = lastEvent
 	}
 }
 
@@ -129,10 +136,21 @@ func (in *Ingestor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	// Read one byte past the cap so an oversize body is DETECTED (not silently
+	// truncated). A truncated body would fail signature validation and be reported
+	// as a bogus 401; reject it up front as 413 so operators see the real cause and
+	// GitHub gets a distinct, non-retryable-as-signature-failure status.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		in.countBadRequest()
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("read body: %v", err)})
+		return
+	}
+	if int64(len(body)) > maxBodyBytes {
+		in.countBadRequest()
+		log.Printf("[webhook] rejected delivery: payload exceeds %d bytes (event=%q delivery=%q)",
+			maxBodyBytes, r.Header.Get(HeaderEvent), r.Header.Get(HeaderDelivery))
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "payload too large"})
 		return
 	}
 

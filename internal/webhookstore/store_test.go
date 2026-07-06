@@ -127,6 +127,79 @@ func TestLastDeliveryEmptyStore(t *testing.T) {
 	if !last.IsZero() {
 		t.Fatalf("want zero time on empty store, got %s", last)
 	}
+	lastT, event, err := store.LastDelivery(context.Background())
+	if err != nil {
+		t.Fatalf("LastDelivery on empty store: %v", err)
+	}
+	if !lastT.IsZero() || event != "" {
+		t.Fatalf("want zero time and empty event on empty store, got %s %q", lastT, event)
+	}
+}
+
+// TestLastDeliveryReturnsEventType proves LastDelivery carries the event type of
+// the most recent delivery, which restart seeding needs so the last-event-type
+// diagnostic survives a daemon restart (not just the timestamp).
+func TestLastDeliveryReturnsEventType(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+	for _, d := range []Delivery{
+		{DeliveryID: "old", EventType: "issues", ReceivedAt: time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC), Payload: []byte("{}")},
+		{DeliveryID: "new", EventType: "pull_request", ReceivedAt: time.Date(2026, 7, 6, 11, 0, 0, 0, time.UTC), Payload: []byte("{}")},
+	} {
+		if _, err := store.Insert(ctx, d); err != nil {
+			t.Fatalf("insert %s: %v", d.DeliveryID, err)
+		}
+	}
+	last, event, err := store.LastDelivery(ctx)
+	if err != nil {
+		t.Fatalf("LastDelivery: %v", err)
+	}
+	if event != "pull_request" {
+		t.Fatalf("last event type = %q, want pull_request", event)
+	}
+	if want := time.Date(2026, 7, 6, 11, 0, 0, 0, time.UTC); !last.Equal(want) {
+		t.Fatalf("last delivery time = %s, want %s", last, want)
+	}
+}
+
+// TestReceivedAtFixedWidthOrdering guards the fixed-width timestamp encoding.
+// received_at is TEXT read back with MAX()/ORDER BY, so its byte order must equal
+// its time order. With RFC3339Nano (trailing zeros trimmed) ".123Z" sorts AFTER
+// ".1234Z", so a burst would report an EARLIER delivery as the latest. The
+// deliveries below differ only in the fourth fractional digit within the same
+// second — exactly the case that misorders under trimming.
+func TestReceivedAtFixedWidthOrdering(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	// earlier: .123 (123ms) — trims to ".123Z", which sorts lexically HIGH.
+	// later:   .1234 (123.4ms) — trims to ".1234Z", which sorts lexically LOW.
+	earlier := Delivery{DeliveryID: "earlier", EventType: "issues",
+		ReceivedAt: time.Date(2026, 7, 6, 12, 0, 0, 123000000, time.UTC), Payload: []byte("{}")}
+	later := Delivery{DeliveryID: "later", EventType: "pull_request",
+		ReceivedAt: time.Date(2026, 7, 6, 12, 0, 0, 123400000, time.UTC), Payload: []byte("{}")}
+	// Insert the lexically-high (but chronologically earlier) one last to make sure
+	// insertion order does not paper over the bug.
+	for _, d := range []Delivery{later, earlier} {
+		if _, err := store.Insert(ctx, d); err != nil {
+			t.Fatalf("insert %s: %v", d.DeliveryID, err)
+		}
+	}
+
+	last, err := store.LastDeliveryAt(ctx)
+	if err != nil {
+		t.Fatalf("LastDeliveryAt: %v", err)
+	}
+	if !last.Equal(later.ReceivedAt) {
+		t.Fatalf("LastDeliveryAt = %s, want the chronologically later %s", last, later.ReceivedAt)
+	}
+	_, event, err := store.LastDelivery(ctx)
+	if err != nil {
+		t.Fatalf("LastDelivery: %v", err)
+	}
+	if event != "pull_request" {
+		t.Fatalf("LastDelivery event = %q, want the later delivery's pull_request", event)
+	}
 }
 
 // TestDurabilityAcrossReopen proves an acknowledged delivery survives a store

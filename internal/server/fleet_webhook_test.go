@@ -56,6 +56,29 @@ func TestFleetWebhookBypassesAuth(t *testing.T) {
 	}
 }
 
+// TestFleetWebhookTrailingSlashRoutes proves a delivery to "<path>/" (as a proxy
+// or re-typed webhook URL may forward it) still reaches the ingestor and lands,
+// instead of falling through to the "/" dashboard catch-all — which in the
+// default unauthenticated posture would 200 GitHub without storing anything.
+func TestFleetWebhookTrailingSlashRoutes(t *testing.T) {
+	fleet, store := newFleetWithWebhook(t)
+	handler := fleet.HandlerForTest()
+
+	body := []byte(`{"action":"opened","repository":{"full_name":"BeFeast/maestro"}}`)
+	req := httptest.NewRequest(http.MethodPost, webhook.DefaultPath+"/", strings.NewReader(string(body)))
+	req.Header.Set(webhook.HeaderEvent, "issues")
+	req.Header.Set(webhook.HeaderDelivery, "trailing-1")
+	req.Header.Set(webhook.HeaderSignature, webhook.Sign(fleetWebhookSecret, body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("trailing-slash webhook delivery: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, ok, err := store.Get(req.Context(), "trailing-1"); err != nil || !ok {
+		t.Fatalf("trailing-slash delivery not stored: ok=%v err=%v", ok, err)
+	}
+}
+
 // TestFleetWebhookInvalidSignature401 confirms an unsigned/bad-signature
 // delivery is 401'd by the ingestor even though it bypassed the fleet auth
 // middleware.

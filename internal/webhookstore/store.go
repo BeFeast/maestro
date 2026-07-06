@@ -52,6 +52,15 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event ON webhook_deliveries(ev
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_received ON webhook_deliveries(received_at);
 `
 
+// receivedAtLayout is a FIXED-WIDTH, UTC, nanosecond-precision timestamp layout.
+// received_at is stored as TEXT and read back with MAX()/ORDER BY, so its lexical
+// order must equal its chronological order. time.RFC3339Nano would trim trailing
+// zeros from the fractional seconds (".1234Z" vs ".123Z"), making shorter strings
+// sort AFTER longer ones and letting a webhook burst report an older delivery as
+// the latest. Padding to a constant nine fractional digits (and always emitting
+// "Z" for UTC) keeps the field a constant width, so byte-order == time-order.
+const receivedAtLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
 // Delivery is one ingested GitHub webhook delivery. Payload is the raw request
 // body verbatim (the signed bytes), so a later read-path phase can re-parse it
 // without depending on the denormalised columns.
@@ -145,7 +154,7 @@ func (s *Store) Insert(ctx context.Context, d Delivery) (stored bool, err error)
 INSERT OR IGNORE INTO webhook_deliveries(delivery_id, event_type, action, repo, sender, hook_id, received_at, payload)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
 		d.DeliveryID, d.EventType, d.Action, d.Repo, d.Sender, d.HookID,
-		received.UTC().Format(time.RFC3339Nano), string(d.Payload))
+		received.UTC().Format(receivedAtLayout), string(d.Payload))
 	if err != nil {
 		return false, err
 	}
@@ -198,6 +207,36 @@ func (s *Store) LastDeliveryAt(ctx context.Context) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse received_at %q: %w", raw.String, err)
 	}
 	return t, nil
+}
+
+// LastDelivery returns the received_at time AND the event_type of the most recent
+// stored delivery, or (zero time, "") when the store is empty. Restart seeding
+// uses this so BOTH the "last delivery time" and "last event type" diagnostics
+// survive a daemon restart — LastDeliveryAt alone would leave the event type
+// blank until the next live webhook (#824 observability). Ordering by received_at
+// is safe because it is stored fixed-width (see receivedAtLayout).
+func (s *Store) LastDelivery(ctx context.Context) (time.Time, string, error) {
+	var (
+		raw   sql.NullString
+		event sql.NullString
+	)
+	err := s.db.QueryRowContext(ctx, `
+SELECT received_at, event_type FROM webhook_deliveries
+ORDER BY received_at DESC LIMIT 1`).Scan(&raw, &event)
+	if err == sql.ErrNoRows {
+		return time.Time{}, "", nil
+	}
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return time.Time{}, event.String, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("parse received_at %q: %w", raw.String, err)
+	}
+	return t, event.String, nil
 }
 
 // Get returns the stored delivery for id, or ok=false when none exists. Used by

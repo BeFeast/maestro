@@ -662,6 +662,21 @@ func (s *FleetServer) liveWebhook() (*webhook.Ingestor, string) {
 	return s.webhook, s.webhookPath
 }
 
+// webhookPathMatches reports whether an inbound request path should route to the
+// webhook ingestor. It tolerates a single trailing slash on either side: a proxy
+// (or a re-typed GitHub webhook URL) that forwards "<path>/" must still reach the
+// ingestor. Without this, the trailing-slash variant falls through to the fleet
+// mux's "/" catch-all and, in the default unauthenticated posture, GitHub gets a
+// 200 dashboard response and marks the delivery succeeded even though nothing was
+// stored (greptile P1). An empty configured path never matches.
+func webhookPathMatches(reqPath, cfgPath string) bool {
+	cfgPath = strings.TrimRight(cfgPath, "/")
+	if cfgPath == "" {
+		return false
+	}
+	return strings.TrimRight(reqPath, "/") == cfgPath
+}
+
 // buildHandler returns the fleet mux wrapped with the auth middleware.
 // When auth.Required() is true (#616: exposed install posture), every
 // route — JSON read endpoints, the SPA HTML, static assets, mutating
@@ -690,7 +705,7 @@ func (s *FleetServer) buildHandler() http.Handler {
 		// header. Route it BEFORE the auth middleware so an exposed-posture
 		// deployment (auth enabled) does not 401 every legitimate delivery
 		// (#824). The ingestor still fails closed on a bad/missing signature.
-		if in, path := s.liveWebhook(); in != nil && r.URL.Path == path {
+		if in, path := s.liveWebhook(); in != nil && webhookPathMatches(r.URL.Path, path) {
 			in.ServeHTTP(w, r)
 			return
 		}
