@@ -39,9 +39,15 @@ const (
 
 // Orchestrator coordinates all agent sessions
 type Orchestrator struct {
-	cfg                   *config.Config
-	notifier              *notify.Notifier
-	gh                    *github.Client
+	cfg      *config.Config
+	notifier *notify.Notifier
+	gh       *github.Client
+	// readSource is the optional mirror-first read source (#826). When set
+	// (SetReadSource), the high-volume read wrappers consult it instead of the
+	// direct GitHub client — it serves fresh mirror rows locally and falls back
+	// to the API on a miss/stale. Writes and un-mirrored reads always stay on
+	// gh, so GitHub remains authoritative. nil = today's API-direct behavior.
+	readSource            githubReadSource
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -173,6 +179,25 @@ func New(cfg *config.Config) *Orchestrator {
 	return o
 }
 
+// githubReadSource is the mirror-first read surface the orchestrator's poll-loop
+// wrappers consult when one is wired (#826). *mirrorstore.Source satisfies it.
+// It is a strict subset of *github.Client, so the orchestrator falls straight
+// back to gh for every read it does not list here and for all writes.
+type githubReadSource interface {
+	ListOpenIssues(labels []string) ([]github.Issue, error)
+	ListOpenPRs() ([]github.PR, error)
+	GetIssue(number int) (github.Issue, error)
+	IsIssueClosed(number int) (bool, error)
+	IsPRMerged(prNumber int) (bool, error)
+}
+
+// SetReadSource wires a mirror-first read source (#826). The daemon builds one
+// per flow when github_mirror.source is "mirror-first"; left unset, the
+// orchestrator reads GitHub directly exactly as before.
+func (o *Orchestrator) SetReadSource(src githubReadSource) {
+	o.readSource = src
+}
+
 func (o *Orchestrator) pidAlive(pid int) bool {
 	if o.pidAliveFn != nil {
 		return o.pidAliveFn(pid)
@@ -193,6 +218,9 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
 	if o.listOpenPRsFn != nil {
 		return o.listOpenPRsFn()
+	}
+	if o.readSource != nil {
+		return o.readSource.ListOpenPRs()
 	}
 	return o.gh.ListOpenPRs()
 }
@@ -339,6 +367,9 @@ func (o *Orchestrator) hasMergedPRForIssue(issueNumber int) (bool, error) {
 func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
 	if o.isPRMergedFn != nil {
 		return o.isPRMergedFn(prNumber)
+	}
+	if o.readSource != nil {
+		return o.readSource.IsPRMerged(prNumber)
 	}
 	if o.gh == nil {
 		return false, fmt.Errorf("no github client configured for pr-merged check")
@@ -563,6 +594,9 @@ func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
 	if o.getIssueFn != nil {
 		return o.getIssueFn(number)
 	}
+	if o.readSource != nil {
+		return o.readSource.GetIssue(number)
+	}
 	return o.gh.GetIssue(number)
 }
 
@@ -636,6 +670,9 @@ func (o *Orchestrator) captureTmux(session string) (string, error) {
 func (o *Orchestrator) isIssueClosed(number int) (bool, error) {
 	if o.isIssueClosedFn != nil {
 		return o.isIssueClosedFn(number)
+	}
+	if o.readSource != nil {
+		return o.readSource.IsIssueClosed(number)
 	}
 	if o.gh == nil {
 		return false, fmt.Errorf("no github client configured for issue-closed check")
@@ -2311,6 +2348,13 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	if !reflect.DeepEqual(newCfg.Supervisor, old.Supervisor) {
 		changed = append(changed, "supervisor policy")
 		o.cfg.Supervisor = newCfg.Supervisor
+	}
+	if newCfg.GitHubMirror != old.GitHubMirror {
+		// #826: the mirror-first read source's escape hatch reads o.cfg.GitHubMirror
+		// each cycle, so applying it here flips this flow between mirror-first and
+		// API-direct on a live config-store edit — no redeploy (AC 3/8).
+		changed = append(changed, fmt.Sprintf("github_mirror.source: %s→%s", old.GitHubMirror.Source, newCfg.GitHubMirror.Source))
+		o.cfg.GitHubMirror = newCfg.GitHubMirror
 	}
 	if newCfg.MergeStrategy != old.MergeStrategy {
 		changed = append(changed, fmt.Sprintf("merge_strategy: %s→%s", old.MergeStrategy, newCfg.MergeStrategy))
@@ -5253,6 +5297,9 @@ func availableSlots(cfg *config.Config, s *state.State, active int) int {
 func (o *Orchestrator) listOpenIssues(labels []string) ([]github.Issue, error) {
 	if o.listOpenIssuesFn != nil {
 		return o.listOpenIssuesFn(labels)
+	}
+	if o.readSource != nil {
+		return o.readSource.ListOpenIssues(labels)
 	}
 	return o.gh.ListOpenIssues(labels)
 }

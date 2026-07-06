@@ -169,6 +169,15 @@ type Daemon struct {
 	fleet *server.FleetServer
 	flows map[string]*projectFlow
 
+	// mirror is the shared GitHub read-model mirror (#825/#826). Opened once in
+	// Run when webhook ingestion is configured — the ingestor projects accepted
+	// deliveries into it, and the per-flow mirror-first read sources serve the
+	// supervisor/orchestrator poll loops from it. nil when ingestion is disabled,
+	// in which case every flow reads GitHub directly (mirror-first has nothing to
+	// read from without inbound deliveries).
+	mirror        *mirrorstore.Store
+	mirrorHorizon time.Duration
+
 	// Centralized self-deploy (#758). RequestSelfDeploy serializes on
 	// selfDeployMu and debounces on a single marker — the in-memory
 	// selfDeployLast (deterministic within this process) plus the on-disk marker
@@ -241,7 +250,15 @@ func New(store ConfigLoader, opts Options) *Daemon {
 	}
 	d.runLoop = d.runOrchestrator
 	d.superviseLoop = func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
-		runSupervise(ctx, name, getCfg, opts.SuperviseInterval)
+		// #826: build the flow's mirror-first read source (nil when the mirror is
+		// disabled). Its escape hatch reads getCfg() — the holder the reload pump
+		// swaps — so a config-store edit flips the supervisor between mirror-first
+		// and API-direct live.
+		var reader supervisor.Reader
+		if src := d.newReadSource(getCfg().Repo, getCfg); src != nil {
+			reader = src
+		}
+		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval)
 	}
 	d.watchdogLoop = supervisor.Watchdog
 	// Default to the real launcher; tests swap it for a counter (#758).
@@ -375,7 +392,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// port when a webhook secret file is configured. Non-fatal on any error —
 	// the daemon logs it loudly and comes up without ingestion (the fleet keeps
 	// polling), rather than aborting startup over an unreadable secret.
-	configureWebhookIngestion(fleet, d.opts)
+	d.configureWebhookIngestion(fleet)
 
 	fleetAuth := server.FleetAuthFromProjects(projects)
 	fleet.SetAuth(fleetAuth)
@@ -565,7 +582,8 @@ func configureFleetGitHubAppAuth(projects []server.FleetProject) {
 // that will not open, disables ingestion with a loud warning instead of
 // blocking daemon startup — webhooks are an optimisation over polling, so their
 // absence degrades to today's polling behaviour.
-func configureWebhookIngestion(fleet *server.FleetServer, opts Options) {
+func (d *Daemon) configureWebhookIngestion(fleet *server.FleetServer) {
+	opts := d.opts
 	secretPath := strings.TrimSpace(opts.WebhookSecretFile)
 	if secretPath == "" {
 		log.Printf("[daemon] webhook ingestion not configured (no --webhook-secret-file) — GitHub state continues to arrive by polling")
@@ -600,6 +618,13 @@ func configureWebhookIngestion(fleet *server.FleetServer, opts Options) {
 	} else {
 		ingestor.SetProjector(mirror)
 		fleet.SetMirrorStore(mirror, mirrorstore.DefaultStaleHorizon)
+		// Share the SAME handle with the per-flow mirror-first read sources (#826)
+		// so the reads a flow serves reflect the deliveries the ingestor just
+		// projected. The counters that flow through the source land in the gh
+		// wrapper's hourly REST-usage journal line via this hook.
+		d.mirror = mirror
+		d.mirrorHorizon = mirrorstore.DefaultStaleHorizon
+		github.SetMirrorReadDigest(mirrorReadDigestLine)
 		log.Printf("[daemon] github mirror active — accepted deliveries project into the read model in %s", dbPath)
 	}
 

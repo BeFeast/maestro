@@ -63,15 +63,22 @@ func computeSuperviseJitter(interval time.Duration, frac float64) time.Duration 
 // flow restart (#768). The GitHub client is built once from the startup repo —
 // repo is a restart-required field the orchestrator refuses to hot-apply, so it
 // is stable for the flow's lifetime.
-func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, interval time.Duration) {
-	gh := github.New(getCfg().Repo)
+func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration) {
+	// reader is the flow's read surface. The daemon passes a mirror-first source
+	// when github_mirror.source is mirror-first (#826); it satisfies
+	// supervisor.Reader and serves the poll reads locally when the mirror is warm,
+	// falling back to the API on a miss/stale. A nil reader (mirror disabled)
+	// falls back to a plain client, byte-identical to pre-#826 behavior.
+	if reader == nil {
+		reader = github.New(getCfg().Repo)
+	}
 	// Capture and log each cycle's SupervisorDecision. The daemon still acts
 	// (label/comment/approve), but without this the structural "why did the
 	// supervisor do that" trail was dropped — turning debugging into journal
 	// archaeology (#764). Logs key on the unique fleet name (not the possibly
 	// shared session prefix) so two same-basename repos stay distinguishable.
 	runOnce := func() error {
-		decision, err := supervisor.RunOnce(getCfg(), gh)
+		decision, err := supervisor.RunOnce(getCfg(), reader)
 		if err != nil {
 			return err
 		}

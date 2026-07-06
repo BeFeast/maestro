@@ -74,6 +74,15 @@ is configured:
 the horizon — usually a sign deliveries stopped arriving for a repo. The block is
 omitted entirely when the mirror is not configured.
 
+## Phase D — reads switch over
+
+Phase D (#826) puts the supervisor/orchestrator read paths behind a mirror-first
+source (`mirrorstore.Source`): the open-issue/open-PR lists and issue/PR state
+reads are served from a warm mirror and fall back to the API on a miss/stale.
+It is opt-in per project via `github_mirror.source: mirror-first`, with `source:
+api` as the fleet-wide escape hatch. See
+[mirror-first-source-runbook.md](mirror-first-source-runbook.md).
+
 ## Notes / limits (phase C)
 
 - Hydration is implemented for **issues** (`Hydrator.Issue`); other entity types

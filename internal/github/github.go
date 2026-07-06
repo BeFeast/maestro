@@ -754,8 +754,8 @@ func noteAPIRequest(notModified, rateLimited bool) {
 		// Roll the window before counting so the request that crossed the
 		// boundary opens the new window instead of vanishing with the digest.
 		w := apiStatsWindow
-		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited%s%s",
-			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited, authModeDigest(), primaryLimitDigest())
+		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited%s%s%s",
+			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited, authModeDigest(), primaryLimitDigest(), mirrorReadDigest())
 		apiStatsWindow = APIStats{}
 		apiWindowStart = now
 	}
@@ -776,6 +776,26 @@ func APIUsage() APIStats {
 	apiStatsMu.Lock()
 	defer apiStatsMu.Unlock()
 	return apiStatsTotal
+}
+
+// mirrorReadDigestFn, when set by the daemon, returns a fragment describing how
+// many supervisor/orchestrator reads the local mirror served vs how many fell
+// back to the API (#826). github cannot import internal/mirrorstore — that would
+// be an import cycle, since mirrorstore imports github — so the fragment is
+// injected as a hook. Unset appends nothing, so the pre-#826 line is unchanged.
+var mirrorReadDigestFn func() string
+
+// SetMirrorReadDigest installs the mirror-usage fragment appended to the hourly
+// REST usage journal line. The daemon wires it to the mirrorstore read counters
+// so the "API calls/hour" journal line also reports mirror hit/fallback counts
+// (#826 AC 5). Passing nil clears it.
+func SetMirrorReadDigest(fn func() string) { mirrorReadDigestFn = fn }
+
+func mirrorReadDigest() string {
+	if mirrorReadDigestFn == nil {
+		return ""
+	}
+	return mirrorReadDigestFn()
 }
 
 // ghRateLimitKind distinguishes the two GitHub rate limits, which need opposite
