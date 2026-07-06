@@ -67,6 +67,11 @@ type Issue struct {
 	Number int    `json:"number"`
 	Title  string `json:"title"`
 	Body   string `json:"body"`
+	// State is the issue's lifecycle state ("open"/"closed") as GitHub reports it.
+	// The REST issue payload always carries it; consumers that mirror issue state
+	// (e.g. internal/mirrorstore hydration) rely on it so an already-closed issue
+	// is not recorded as open. Empty when a payload omits it.
+	State  string `json:"state"`
 	Labels []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
@@ -114,6 +119,7 @@ type restIssue struct {
 	Number int     `json:"number"`
 	Title  string  `json:"title"`
 	Body   *string `json:"body"`
+	State  string  `json:"state"`
 	Labels []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
@@ -154,6 +160,7 @@ func (ri restIssue) issue() Issue {
 		Number: ri.Number,
 		Title:  ri.Title,
 		Body:   body,
+		State:  ri.State,
 		Labels: ri.Labels,
 	}
 }

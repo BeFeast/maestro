@@ -42,15 +42,27 @@ type Store interface {
 	LastDelivery(ctx context.Context) (time.Time, string, error)
 }
 
+// Projector projects a newly-accepted delivery into the GitHub mirror read model
+// (epic #811, phase C — issue #825). *mirrorstore.Store satisfies it. It is
+// optional: when no projector is wired the ingestor is pure phase-B ingestion,
+// landing raw deliveries only. When one is wired, each first-time delivery is
+// also normalised into the mirror tables so a later phase can read GitHub state
+// locally. Projection is best-effort — the raw delivery is already durably
+// stored, so a projection error is logged and the delivery is still acknowledged.
+type Projector interface {
+	ProjectWebhook(ctx context.Context, eventType string, payload []byte, receivedAt time.Time) error
+}
+
 // Ingestor is the HTTP handler that authenticates, deduplicates and persists
 // inbound GitHub webhook deliveries. It is safe for concurrent use: the store
 // serialises writes through a single SQLite connection, and the in-memory
 // observability counters are guarded by a mutex, so the endpoint keeps working
 // while the daemon is under normal fleet load (#824 acceptance).
 type Ingestor struct {
-	store  Store
-	secret string
-	now    func() time.Time
+	store     Store
+	secret    string
+	now       func() time.Time
+	projector Projector
 
 	mu sync.Mutex
 	// Session counters. accepted/duplicates/byEventType are seeded from the
@@ -81,6 +93,21 @@ func NewIngestor(store Store, secret string) *Ingestor {
 	}
 	in.seed(context.Background())
 	return in
+}
+
+// SetProjector wires the GitHub mirror projector (#825). Passing nil disables
+// projection (pure phase-B ingestion). Safe to call before Start; the projector
+// is read under the ingestor's mutex so a hot-add is race-free.
+func (in *Ingestor) SetProjector(p Projector) {
+	in.mu.Lock()
+	in.projector = p
+	in.mu.Unlock()
+}
+
+func (in *Ingestor) liveProjector() Projector {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.projector
 }
 
 // seed loads durable totals from the store into the in-memory counters so a
@@ -205,6 +232,18 @@ func (in *Ingestor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	in.countAccepted(eventType, delivery.ReceivedAt)
+	// Project the newly-accepted delivery into the GitHub mirror (#825). Best
+	// effort: the raw delivery is already durably stored, so a projection failure
+	// is logged and the delivery is still acknowledged — the mirror can be
+	// reconciled later from the stored delivery rather than losing the ack and
+	// making GitHub retry. Done before responding so a synchronous test observes
+	// the mirror row, but off the store's critical section.
+	if p := in.liveProjector(); p != nil {
+		if err := p.ProjectWebhook(r.Context(), eventType, body, delivery.ReceivedAt); err != nil {
+			log.Printf("[webhook] mirror projection failed (delivery stored, mirror will lag) event=%q delivery=%s: %v",
+				eventType, deliveryID, err)
+		}
+	}
 	// One journal line per accepted delivery gives the "last webhook delivery
 	// time and counts" diagnostic straight from journalctl (#824 AC 10). The
 	// payload itself is never logged.

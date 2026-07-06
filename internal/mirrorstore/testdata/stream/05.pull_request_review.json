@@ -1,0 +1,18 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 555111222,
+    "state": "approved",
+    "body": "LGTM, ship it.",
+    "user": { "login": "maintainer" },
+    "submitted_at": "2026-07-02T10:05:00Z"
+  },
+  "pull_request": {
+    "number": 828
+  },
+  "repository": {
+    "full_name": "BeFeast/maestro",
+    "name": "maestro"
+  },
+  "sender": { "login": "maintainer" }
+}

@@ -26,6 +26,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mirrorstore"
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
@@ -587,6 +588,21 @@ func configureWebhookIngestion(fleet *server.FleetServer, opts Options) {
 	}
 
 	ingestor := webhook.NewIngestor(store, secret)
+
+	// Wire the GitHub mirror read model (#825, phase C). It lives in the same
+	// maestro.db as the raw deliveries; the ingestor projects each accepted
+	// delivery into its normalised tables, and the fleet snapshot exposes its
+	// counts/staleness diagnostics. A mirror that will not open is non-fatal:
+	// ingestion still lands raw deliveries (phase B behaviour), the mirror just
+	// stays empty until the next start.
+	if mirror, err := mirrorstore.Open(dbPath); err != nil {
+		log.Printf("[daemon] github mirror disabled: open mirror store %s: %v (raw deliveries still land)", dbPath, err)
+	} else {
+		ingestor.SetProjector(mirror)
+		fleet.SetMirrorStore(mirror, mirrorstore.DefaultStaleHorizon)
+		log.Printf("[daemon] github mirror active — accepted deliveries project into the read model in %s", dbPath)
+	}
+
 	path := strings.TrimSpace(opts.WebhookPath)
 	if path == "" {
 		path = webhook.DefaultPath
