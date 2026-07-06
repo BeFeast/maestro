@@ -3,6 +3,7 @@ package mirrorstore
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -156,7 +157,11 @@ func (s *Store) newestSeen(ctx context.Context, table, repo string) (time.Time, 
 // ---- label helpers ---------------------------------------------------------
 
 // labelFilter normalises the requested labels into a lookup set, returning nil
-// when no filter was requested (every open issue matches).
+// when no filter was requested (every open issue matches). Keys are lower-cased
+// so the match is case-insensitive: GitHub's own labels= query filter matches
+// case-insensitively, so a mirror asked for "maestro-ready" must still match a
+// mirrored "Maestro-Ready" label rather than filtering the issue out and
+// silently skipping label-gated work (see anyLabelMatches).
 func labelFilter(labels []string) map[string]struct{} {
 	if len(labels) == 0 {
 		return nil
@@ -164,7 +169,7 @@ func labelFilter(labels []string) map[string]struct{} {
 	want := make(map[string]struct{}, len(labels))
 	for _, l := range labels {
 		if l != "" {
-			want[l] = struct{}{}
+			want[strings.ToLower(l)] = struct{}{}
 		}
 	}
 	if len(want) == 0 {
@@ -173,9 +178,11 @@ func labelFilter(labels []string) map[string]struct{} {
 	return want
 }
 
+// anyLabelMatches reports whether any mirrored label name matches one of the
+// requested labels, case-insensitively (want holds already-lower-cased keys).
 func anyLabelMatches(have []string, want map[string]struct{}) bool {
 	for _, name := range have {
-		if _, ok := want[name]; ok {
+		if _, ok := want[strings.ToLower(name)]; ok {
 			return true
 		}
 	}

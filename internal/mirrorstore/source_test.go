@@ -347,6 +347,30 @@ func TestLabelFilter(t *testing.T) {
 	}
 }
 
+// TestLabelFilterCaseInsensitive: a requested label matches a mirrored label
+// that differs only in case, mirroring GitHub's own case-insensitive labels=
+// filter, so label-gated work is not silently skipped over a case variant.
+func TestLabelFilterCaseInsensitive(t *testing.T) {
+	s := openTestStore(t)
+	now := mustTime(t, "2026-07-06T12:00:00Z")
+	// Mirrored label is capitalised; caller asks for the lower-case form.
+	seedIssue(t, s, 1, "ready", "open", "b", now, "Maestro-Ready")
+
+	api := &fakeAPI{}
+	src := newTestSource(t, s, api, now, time.Hour, nil)
+
+	got, err := src.ListOpenIssues([]string{"maestro-ready"})
+	if err != nil {
+		t.Fatalf("ListOpenIssues: %v", err)
+	}
+	if len(got) != 1 || got[0].Number != 1 {
+		t.Fatalf("case-variant label filter returned %+v; want #1", got)
+	}
+	if api.totalCalls() != 0 {
+		t.Fatalf("case-variant mirror read hit the API %d time(s)", api.totalCalls())
+	}
+}
+
 // TestNilStoreIsAPIDirect: a Source with no mirror store is fail-safe API-direct.
 func TestNilStoreIsAPIDirect(t *testing.T) {
 	now := mustTime(t, "2026-07-06T12:00:00Z")
