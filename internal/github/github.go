@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/url"
@@ -1096,6 +1097,38 @@ func (c *Client) RateLimit() (RateLimitStatus, error) {
 	return status, nil
 }
 
+// mergePaginatedJSONArrays flattens the body of a `gh api --paginate` call over
+// an ARRAY endpoint into a single JSON array. gh does not merge array pages the
+// way it merges object endpoints that carry total_count (check-runs, search):
+// for a plain array endpoint (repos/*/issues, repos/*/pulls) it emits each page
+// as its own back-to-back `[...]` document, so a repo with more than one page of
+// results yields `[...][...]`, which a single json.Unmarshal rejects with a
+// syntax error at the second `[`. The `gh api` manual notes `--slurp` as the
+// wrapper for this, but --slurp would take the call out of the conditional
+// (ETag) path — ghConditionalEligible only allows --paginate — and cost the
+// reconciler its 304s, so instead we decode the concatenated documents as a
+// stream here and concatenate their elements. A single-page (or 304-served)
+// body is one `[...]` document and passes through as that same one array.
+//
+// #827 review: the reconciliation loop treats an issue/PR absent from this list
+// as a missed close, so a parse failure on the first multi-page reconcile would
+// strand exactly the >100-item repos this loop exists to heal.
+func mergePaginatedJSONArrays(out []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(out))
+	merged := []json.RawMessage{}
+	for {
+		var page []json.RawMessage
+		if err := dec.Decode(&page); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		merged = append(merged, page...)
+	}
+	return json.Marshal(merged)
+}
+
 func parseRESTIssues(out []byte) ([]Issue, error) {
 	var restIssues []restIssue
 	if err := json.Unmarshal(out, &restIssues); err != nil {
@@ -1477,7 +1510,11 @@ func (c *Client) listAllOpenIssuesByLabel(label string) ([]Issue, error) {
 		return nil, fmt.Errorf("list all open issues: %w", err)
 	}
 
-	issues, err := parseRESTIssues(out)
+	merged, err := mergePaginatedJSONArrays(out)
+	if err != nil {
+		return nil, fmt.Errorf("merge paginated issues: %w", err)
+	}
+	issues, err := parseRESTIssues(merged)
 	if err != nil {
 		return nil, fmt.Errorf("parse issues: %w", err)
 	}
@@ -1535,7 +1572,11 @@ func (c *Client) ListAllOpenPRs() ([]PR, error) {
 		return nil, fmt.Errorf("list all open PRs: %w", err)
 	}
 
-	prs, err := parseRESTPulls(out)
+	merged, err := mergePaginatedJSONArrays(out)
+	if err != nil {
+		return nil, fmt.Errorf("merge paginated prs: %w", err)
+	}
+	prs, err := parseRESTPulls(merged)
 	if err != nil {
 		return nil, fmt.Errorf("parse prs: %w", err)
 	}

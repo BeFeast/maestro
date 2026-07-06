@@ -715,3 +715,40 @@ func TestHasLabel_NoMatch(t *testing.T) {
 		t.Error("HasLabel should return false when no labels match")
 	}
 }
+
+func TestMergePaginatedJSONArrays(t *testing.T) {
+	// gh api --paginate over an array endpoint emits one `[...]` document per
+	// page back-to-back; the wrapper concatenates page bodies (with or without a
+	// separating newline). mergePaginatedJSONArrays must flatten every shape a
+	// real reconcile sees into one array parseREST* can consume.
+	cases := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"single page passes through", `[{"number":1},{"number":2}]`, `[{"number":1},{"number":2}]`, false},
+		{"two pages concatenated", `[{"number":1}][{"number":2},{"number":3}]`, `[{"number":1},{"number":2},{"number":3}]`, false},
+		{"pages separated by newline", "[{\"number\":1}]\n[{\"number\":2}]", `[{"number":1},{"number":2}]`, false},
+		{"empty first page then items", `[][{"number":9}]`, `[{"number":9}]`, false},
+		{"empty input yields empty array", ``, `[]`, false},
+		{"error object is not silently flattened", `{"message":"Not Found"}`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := mergePaginatedJSONArrays([]byte(tc.in))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got %q", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("mergePaginatedJSONArrays(%q) error = %v", tc.in, err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("mergePaginatedJSONArrays(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
