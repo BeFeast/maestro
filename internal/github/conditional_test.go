@@ -188,7 +188,7 @@ func TestGHAPI_PaginatedMultiPageConcatenatesAndSkipsCache(t *testing.T) {
 	if string(out) != "{\"check_runs\":[\n]}" {
 		t.Fatalf("body = %q, want the pages' bodies concatenated", out)
 	}
-	if e, b := etagLookup(endpoint); e != "" || b != nil {
+	if e, b := etagLookup(etagCacheKey(endpoint, true)); e != "" || b != nil {
 		t.Fatalf("cache = (%q, %q), want empty — a multi-page response must not be cached", e, b)
 	}
 	if _, err := ghAPIWithArgs(endpoint, "--paginate"); err != nil {
@@ -217,7 +217,7 @@ func TestGHAPI_PaginatedFullPageNotCached(t *testing.T) {
 	if string(out) != fullPage {
 		t.Fatalf("body = %q, want %q", out, fullPage)
 	}
-	if e, b := etagLookup(endpoint); e != "" || b != nil {
+	if e, b := etagLookup(etagCacheKey(endpoint, true)); e != "" || b != nil {
 		t.Fatalf("cache = (%q, %q), want empty — a full page can overflow to page 2 without changing", e, b)
 	}
 	if _, err := ghAPIWithArgs(endpoint, "--paginate"); err != nil {
@@ -272,7 +272,7 @@ func TestGHAPI_PaginatedTotalCountBodyCached(t *testing.T) {
 	if _, err := ghAPIWithArgs(endpoint, "--paginate"); err != nil {
 		t.Fatalf("error = %v", err)
 	}
-	if e, b := etagLookup(endpoint); e != `W/"cr"` || string(b) != body {
+	if e, b := etagLookup(etagCacheKey(endpoint, true)); e != `W/"cr"` || string(b) != body {
 		t.Fatalf("cache = (%q, %q), want the total_count body cached", e, b)
 	}
 }
@@ -478,7 +478,7 @@ func TestListAllOpenIssues_FlattensPaginatedPages(t *testing.T) {
 	}
 	// A multi-page response is never cached, so the ETag of page one must not be
 	// stored and used to serve a truncated 304 next pass.
-	if e, b := etagLookup("repos/owner/repo/issues?state=open&per_page=100"); e != "" || b != nil {
+	if e, b := etagLookup(etagCacheKey("repos/owner/repo/issues?state=open&per_page=100", true)); e != "" || b != nil {
 		t.Fatalf("cache = (%q, %q), want empty for a multi-page open set", e, b)
 	}
 	if len(*calls) != 1 {
@@ -545,5 +545,55 @@ func TestListAllOpenIssues_UnchangedRepoServes304(t *testing.T) {
 	}
 	if d := APIUsage().NotModified - before.NotModified; d != 1 {
 		t.Fatalf("not-modified delta = %d, want 1 (the free 304 on the unchanged repo)", d)
+	}
+}
+
+// TestPaginatedReadDoesNotReuseNonPaginatedCache proves the #827 review fix for
+// the paginated cache collision. A single-page ListOpenIssues caches page one
+// under the endpoint key; the paginated ListAllOpenIssues reconcile read hits
+// the SAME endpoint string. If the paginated read reused that cache entry it
+// could replay the page-one ETag, receive a 304, and serve the first page as
+// the entire open set — wrongly treating still-open issues past page one as
+// missing and stamping them closed. The namespaced cache key must keep the two
+// reads from sharing a body, so the paginated read always fetches every page.
+func TestPaginatedReadDoesNotReuseNonPaginatedCache(t *testing.T) {
+	clearETagCache(t)
+	c := &Client{Repo: "owner/repo"}
+	// Two concatenated --include blocks: the reconciler's authoritative open set
+	// spans two pages (issues #1 and #2).
+	full := append(
+		includeResponse("200 OK", `W/"p1"`, "[{\"number\":1,\"title\":\"one\"}]\n"),
+		includeResponse("200 OK", `W/"p2"`, `[{"number":2,"title":"two"}]`)...,
+	)
+	calls := withGHRunner(t, func(args []string) ([]byte, error) {
+		paginated := hasArg(args, "--paginate")
+		if paginated && argWithPrefix(args, "If-None-Match:") != "" {
+			// The bug: the paginated reconcile read replaying the non-paginated
+			// page-one ETag. GitHub would answer 304 and hide page two.
+			t.Errorf("paginated read replayed a non-paginated ETag (%q) — cache collision",
+				argWithPrefix(args, "If-None-Match:"))
+		}
+		if paginated {
+			return full, nil
+		}
+		// Non-paginated ListOpenIssues sees only page one and caches it.
+		return includeResponse("200 OK", `W/"page1"`, `[{"number":1,"title":"one"}]`), nil
+	})
+
+	// Prime the non-paginated cache entry.
+	if _, err := c.ListOpenIssues(nil); err != nil {
+		t.Fatalf("ListOpenIssues error = %v", err)
+	}
+	// The reconciler's authoritative read must fetch every page fresh, not serve
+	// the truncated page-one body cached by the non-paginated read.
+	issues, err := c.ListAllOpenIssues(nil)
+	if err != nil {
+		t.Fatalf("ListAllOpenIssues error = %v", err)
+	}
+	if len(issues) != 2 || issues[0].Number != 1 || issues[1].Number != 2 {
+		t.Fatalf("open set = %#v, want both pages (issues #1 and #2)", issues)
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("runner calls = %d, want 2 (one non-paginated, one paginated)", len(*calls))
 	}
 }

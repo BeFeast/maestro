@@ -436,6 +436,25 @@ func ghConditionalEligible(endpoint string, args []string) bool {
 	return true
 }
 
+// etagCacheKey namespaces the conditional cache by whether the call paginates.
+// A --paginate reconcile read and a plain single-page read can target the SAME
+// endpoint string — ListAllOpenIssues and ListOpenIssues both hit
+// `.../issues?state=open&per_page=100` — but their cached bodies are NOT
+// interchangeable. A non-paginated read caches only page one; replaying that
+// page-one ETag for a --paginate read could earn a 304 whose cached body is
+// just those first 100 rows, silently truncating the authoritative open set the
+// reconciler closes rows against (a still-open issue past #100 would look
+// missing and be stamped closed — #827 review). Separate namespaces guarantee a
+// paginated read only ever revalidates against a body a paginated read itself
+// stored, and paginated bodies are cached only when paginatedCacheable proved
+// one page holds the whole collection.
+func etagCacheKey(endpoint string, paginated bool) string {
+	if paginated {
+		return "\x00paginate\x00" + endpoint
+	}
+	return endpoint
+}
+
 // ghHTTPStatusLine matches the status line gh prints at the start of each
 // header block under --include, anchored at line start. It cannot collide with
 // response content: GitHub's JSON escapes control characters inside strings,
@@ -517,8 +536,10 @@ func headerValue(headers []byte, name string) string {
 // conditional shape, e.g. a paginated response embedding a non-2xx page) the
 // caller must drop the cache entry and refetch plain. paginated marks a
 // --paginate call, whose responses are cached only when paginatedCacheable
-// proves a later 304 cannot hide pages beyond the cached one.
-func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []byte, paginated bool) (body []byte, served bool, resolved bool) {
+// proves a later 304 cannot hide pages beyond the cached one. cacheKey is the
+// namespaced storage key (see etagCacheKey); endpoint is the raw path, used
+// only to read the requested per_page.
+func resolveConditional(cacheKey, endpoint string, out []byte, runErr error, cachedBody []byte, paginated bool) (body []byte, served bool, resolved bool) {
 	resp, ok := parseGHConditionalResponse(out)
 	if !ok {
 		// No header block. Trust a successful run's output as the plain body
@@ -537,12 +558,12 @@ func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []
 	}
 	if runErr == nil && resp.allOK {
 		if resp.blocks == 1 && (!paginated || paginatedCacheable(resp.body, endpointPerPage(endpoint))) {
-			etagStore(endpoint, resp.etag, resp.body)
+			etagStore(cacheKey, resp.etag, resp.body)
 		} else {
 			// A multi-page response cannot be cached: the first page's ETag
 			// does not validate the concatenated whole. A full single page is
 			// not cached either — see paginatedCacheable.
-			etagDrop(endpoint)
+			etagDrop(cacheKey)
 		}
 		return resp.body, false, true
 	}
@@ -626,11 +647,12 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 			paginated = true
 		}
 	}
+	cacheKey := etagCacheKey(endpoint, paginated)
 	cmdArgs := append([]string{"api", endpoint}, args...)
 	var cachedBody []byte
 	if conditional {
 		var cachedETag string
-		cachedETag, cachedBody = etagLookup(endpoint)
+		cachedETag, cachedBody = etagLookup(cacheKey)
 		cmdArgs = append(cmdArgs, "--include")
 		if cachedETag != "" {
 			cmdArgs = append(cmdArgs, "-H", "If-None-Match: "+cachedETag)
@@ -643,7 +665,7 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 		anomaly = false
 		out, err = ghAPIRunner(cmdArgs...)
 		if conditional {
-			body, served, resolved := resolveConditional(endpoint, out, err, cachedBody, paginated)
+			body, served, resolved := resolveConditional(cacheKey, endpoint, out, err, cachedBody, paginated)
 			if resolved {
 				noteAPIRequest(served, false)
 				return body, nil
@@ -658,7 +680,7 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 			// unconditional path.
 			anomaly = true
 			noteAPIRequest(false, false)
-			etagDrop(endpoint)
+			etagDrop(cacheKey)
 			conditional = false
 			cachedBody = nil
 			cmdArgs = append([]string{"api", endpoint}, args...)
