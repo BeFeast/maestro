@@ -322,7 +322,7 @@ func TestAppToken_FallbackOnRefreshFailure(t *testing.T) {
 	}
 }
 
-func TestConfigureAppAuth_InitialFetchFailureIsError(t *testing.T) {
+func TestConfigureAppAuth_InitialFetchFailureRecordsFallback(t *testing.T) {
 	cleanup := resetAppAuthForTest(t)
 	defer cleanup()
 
@@ -331,16 +331,39 @@ func TestConfigureAppAuth_InitialFetchFailureIsError(t *testing.T) {
 	appTokenHTTPPost = func(url, jwt string) ([]byte, error) {
 		return nil, fmt.Errorf("network down")
 	}
+	// Setup still returns an error so startup logs the failure loudly.
 	if err := ConfigureAppAuth(1, 2, keyPath); err == nil {
 		t.Fatal("expected error when initial token fetch fails")
 	}
-	// On failure the source is NOT armed — appToken stays on PAT (empty, nil).
-	tok, err := appToken()
-	if tok != "" || err != nil {
-		t.Fatalf("expected PAT fallback after failed setup, got tok=%q err=%v", tok, err)
+
+	// The configured source is armed with the failure recorded so diagnostics
+	// show the App fallback state and reason — not a plain PAT path (#823
+	// review): a bad installation ID or revoked app must not read as ordinary
+	// PAT auth in `maestro digest`.
+	info := GetAuthInfo()
+	if !info.FallbackActive {
+		t.Fatal("expected FallbackActive after failed setup")
 	}
-	if GetAuthInfo().Mode != AuthModePAT {
-		t.Fatal("expected PAT mode after failed setup")
+	if info.Mode != AuthModePAT {
+		t.Fatalf("mode = %q, want pat during fallback", info.Mode)
+	}
+	if info.AppID != 1 || info.InstallationID != 2 {
+		t.Fatalf("expected configured app/installation recorded, got %+v", info)
+	}
+	if !strings.Contains(info.LastError, "network down") {
+		t.Fatalf("LastError = %q, want network down", info.LastError)
+	}
+
+	// The hourly digest names the App fallback rather than staying silent.
+	if d := authModeDigest(); !strings.Contains(d, "app fallback") {
+		t.Fatalf("digest should surface app fallback, got %q", d)
+	}
+
+	// The gh wrapper still degrades to PAT: appToken yields an empty token so
+	// GH_TOKEN is never injected (ghApplyAuth ignores the error). Runtime
+	// behavior is byte-identical to the pre-#823 PAT path.
+	if tok, _ := appToken(); tok != "" {
+		t.Fatalf("expected empty token (PAT fallback) after failed setup, got %q", tok)
 	}
 }
 

@@ -171,10 +171,18 @@ func ConfigureAppAuth(appID, installationID int64, privateKeyPath string) error 
 		privateKey:     key,
 	}
 
-	// Eagerly fetch the first token so startup fails visibly when the config
-	// is wrong (bad key, wrong installation ID, etc.).
+	// Eagerly fetch the first token so a misconfigured App (wrong installation
+	// ID, revoked app, transient network failure) surfaces at startup. On
+	// failure we still ARM the source with lastErr recorded — but no valid
+	// token — so GetAuthInfo()/the digest report the App fallback state and
+	// reason instead of a plain PAT path (#823 review). Subsequent gh calls
+	// retry the exchange via appToken() and self-heal if the failure was
+	// transient; until then appToken() returns an empty token and the gh
+	// wrapper stays on PAT, so runtime behavior is byte-identical to today.
 	token, expiry, err := src.fetchInstallationToken()
 	if err != nil {
+		src.lastErr = err
+		appTokenSrc = src
 		return fmt.Errorf("github app auth: initial token fetch: %w", err)
 	}
 	now := appTokenNow()
