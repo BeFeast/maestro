@@ -23,6 +23,7 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configstore"
+	"github.com/befeast/maestro/internal/mirrorstore"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
@@ -318,6 +319,16 @@ type FleetServer struct {
 	webhookMu   sync.RWMutex
 	webhook     *webhook.Ingestor
 	webhookPath string
+
+	// mirror is the GitHub read-model mirror store (epic #811, phase C — #825).
+	// nil disables the mirror diagnostics block. Wired by the daemon
+	// (SetMirrorStore) alongside webhook ingestion; the projection that fills it
+	// runs inside the ingestor. mirrorHorizon is the staleness horizon used for
+	// the queryable stale counts. Guarded by mirrorMu for the same reason as the
+	// webhook fields.
+	mirrorMu      sync.RWMutex
+	mirror        MirrorStatsSource
+	mirrorHorizon time.Duration
 }
 
 // FleetProjectStore is the write side of the daemon's config store that the
@@ -662,6 +673,41 @@ func (s *FleetServer) liveWebhook() (*webhook.Ingestor, string) {
 	return s.webhook, s.webhookPath
 }
 
+// MirrorStatsSource is the read-only diagnostics surface the fleet snapshot needs
+// from the GitHub mirror (#825). *mirrorstore.Store satisfies it; the interface
+// keeps the snapshot testable and avoids the server depending on the mirror's
+// write path.
+type MirrorStatsSource interface {
+	Counts(ctx context.Context) (mirrorstore.Counts, error)
+	StaleCounts(ctx context.Context, now time.Time, horizon time.Duration) (mirrorstore.Counts, error)
+}
+
+// SetMirrorStore wires the GitHub mirror read model for diagnostics (#825). The
+// daemon calls it with the mirror store and the staleness horizon used for the
+// stale counts. A nil store disables the mirror diagnostics block; a
+// non-positive horizon falls back to mirrorstore.DefaultStaleHorizon. Safe to
+// call before Start.
+func (s *FleetServer) SetMirrorStore(store MirrorStatsSource, horizon time.Duration) {
+	if s == nil {
+		return
+	}
+	if horizon <= 0 {
+		horizon = mirrorstore.DefaultStaleHorizon
+	}
+	s.mirrorMu.Lock()
+	s.mirror = store
+	s.mirrorHorizon = horizon
+	s.mirrorMu.Unlock()
+}
+
+// liveMirror returns the current mirror stats source and staleness horizon under
+// the read lock. The source is nil when the mirror is not configured.
+func (s *FleetServer) liveMirror() (MirrorStatsSource, time.Duration) {
+	s.mirrorMu.RLock()
+	defer s.mirrorMu.RUnlock()
+	return s.mirror, s.mirrorHorizon
+}
+
 // webhookPathMatches reports whether an inbound request path should route to the
 // webhook ingestor. It tolerates a single trailing slash on either side: a proxy
 // (or a re-typed GitHub webhook URL) that forwards "<path>/" must still reach the
@@ -804,6 +850,11 @@ type fleetResponse struct {
 	// last delivery time, total + per-event-type counts, and the
 	// signature-failure counter. nil when ingestion is not configured.
 	Webhooks *fleetWebhookStats `json:"webhooks,omitempty"`
+
+	// Mirror is the GitHub read-model mirror diagnostic (#825): per-entity row
+	// counts and how many are stale against the configured horizon. nil when the
+	// mirror is not configured.
+	Mirror *fleetMirrorStats `json:"mirror,omitempty"`
 }
 
 // fleetWebhookStats is the webhook ingestion observability block surfaced on the
@@ -845,6 +896,50 @@ func (s *FleetServer) webhookStatsSnapshot() *fleetWebhookStats {
 		out.LastDeliveryAt = formatFleetTime(st.LastDeliveryAt)
 	}
 	return out
+}
+
+// fleetMirrorStats is the GitHub mirror observability block surfaced on the fleet
+// snapshot (#825 AC 4 — "staleness marking works and is queryable; counts exposed
+// in diagnostics"). Counts is the total mirrored rows per entity; Stale is the
+// subset older than StaleHorizon. An operator reads Stale > 0 as "the mirror is
+// lagging for this much of its state" without querying SQLite directly.
+type fleetMirrorStats struct {
+	Enabled      bool               `json:"enabled"`
+	StaleHorizon string             `json:"stale_horizon,omitempty"`
+	Counts       mirrorstore.Counts `json:"counts"`
+	Stale        mirrorstore.Counts `json:"stale"`
+	TotalRows    int                `json:"total_rows"`
+	TotalStale   int                `json:"total_stale"`
+}
+
+// mirrorStatsSnapshot maps the mirror store's counts into the fleet response
+// block. Returns nil when the mirror is not configured so the field is omitted.
+// A query error degrades to nil rather than failing the whole fleet snapshot —
+// diagnostics must never take down the read path.
+func (s *FleetServer) mirrorStatsSnapshot() *fleetMirrorStats {
+	store, horizon := s.liveMirror()
+	if store == nil {
+		return nil
+	}
+	ctx := context.Background()
+	counts, err := store.Counts(ctx)
+	if err != nil {
+		log.Printf("[fleet] mirror counts query failed (omitting mirror diagnostics): %v", err)
+		return nil
+	}
+	stale, err := store.StaleCounts(ctx, time.Now().UTC(), horizon)
+	if err != nil {
+		log.Printf("[fleet] mirror stale-counts query failed (reporting counts only): %v", err)
+		stale = mirrorstore.Counts{}
+	}
+	return &fleetMirrorStats{
+		Enabled:      true,
+		StaleHorizon: horizon.String(),
+		Counts:       counts,
+		Stale:        stale,
+		TotalRows:    counts.Total(),
+		TotalStale:   stale.Total(),
+	}
 }
 
 // fleetNextAction names the single canonical operator action across the fleet.
@@ -1900,6 +1995,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.Verdict = buildFleetVerdict(resp, now)
 	resp.CostObservability = rollupGlobalCost(resp.Projects)
 	resp.Webhooks = s.webhookStatsSnapshot()
+	resp.Mirror = s.mirrorStatsSnapshot()
 	return resp
 }
 

@@ -1,0 +1,17 @@
+{
+  "action": "completed",
+  "check_run": {
+    "id": 987654321,
+    "name": "go test ./...",
+    "status": "completed",
+    "conclusion": "success",
+    "head_sha": "0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e",
+    "started_at": "2026-07-02T09:16:00Z",
+    "completed_at": "2026-07-02T09:20:00Z"
+  },
+  "repository": {
+    "full_name": "BeFeast/maestro",
+    "name": "maestro"
+  },
+  "sender": { "login": "github-actions[bot]" }
+}

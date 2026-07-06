@@ -1,0 +1,18 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 824
+  },
+  "comment": {
+    "id": 700800900,
+    "body": "Landed in phase B.",
+    "user": { "login": "octocat" },
+    "created_at": "2026-07-02T11:00:00Z",
+    "updated_at": "2026-07-02T11:00:00Z"
+  },
+  "repository": {
+    "full_name": "BeFeast/maestro",
+    "name": "maestro"
+  },
+  "sender": { "login": "octocat" }
+}

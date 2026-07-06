@@ -1,0 +1,19 @@
+{
+  "action": "opened",
+  "issue": {
+    "number": 824,
+    "title": "Webhook ingestion into the unified SQLite store",
+    "body": "Land signed webhook deliveries durably.",
+    "state": "open",
+    "created_at": "2026-07-01T10:00:00Z",
+    "updated_at": "2026-07-01T10:00:00Z",
+    "labels": [
+      { "name": "maestro-ready" }
+    ]
+  },
+  "repository": {
+    "full_name": "BeFeast/maestro",
+    "name": "maestro"
+  },
+  "sender": { "login": "octocat" }
+}
