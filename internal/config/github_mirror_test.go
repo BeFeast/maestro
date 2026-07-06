@@ -19,6 +19,9 @@ func TestParse_GitHubMirror_DefaultIsAPIDirect(t *testing.T) {
 	if got := cfg.GitHubMirror.StaleHorizon(); got != 24*time.Hour {
 		t.Fatalf("default StaleHorizon = %s, want 24h", got)
 	}
+	if got := cfg.GitHubMirror.ReconcileInterval(); got != DefaultMirrorReconcileInterval {
+		t.Fatalf("default ReconcileInterval = %s, want %s", got, DefaultMirrorReconcileInterval)
+	}
 }
 
 func TestParse_GitHubMirror_MirrorFirst(t *testing.T) {
@@ -27,6 +30,7 @@ repo: owner/repo
 github_mirror:
   source: mirror-first
   stale_seconds: 300
+  reconcile_seconds: 600
 `
 	cfg, err := parse([]byte(yaml))
 	if err != nil {
@@ -37,6 +41,9 @@ github_mirror:
 	}
 	if got := cfg.GitHubMirror.StaleHorizon(); got != 5*time.Minute {
 		t.Fatalf("StaleHorizon = %s, want 5m", got)
+	}
+	if got := cfg.GitHubMirror.ReconcileInterval(); got != 10*time.Minute {
+		t.Fatalf("ReconcileInterval = %s, want 10m", got)
 	}
 }
 

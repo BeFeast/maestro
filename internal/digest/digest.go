@@ -213,12 +213,40 @@ func (u GitHubUsage) Line() string {
 		base, u.MirrorHits, u.APIFallbacks, pct)
 }
 
+// ReconcileSummary is the fleet-wide rollup of the mirror reconciliation loop
+// (#827, phase E): how many repos the loop covers, how many passes ran, how many
+// failed, the cumulative drift-repair count, and the most recent successful
+// reconcile across repos. Surfacing drift repairs and the last-reconcile time in
+// the digest is one of phase E's observability requirements — a nonzero repair
+// count is the visible sign a missed webhook was healed without operator action.
+type ReconcileSummary struct {
+	Repos         int       `json:"repos"`
+	Runs          int64     `json:"runs"`
+	Failures      int64     `json:"failures"`
+	DriftRepairs  int64     `json:"drift_repairs"`
+	LastReconcile time.Time `json:"last_reconcile,omitempty"`
+}
+
+// Line renders the reconcile rollup as a single human line for the digest header.
+func (r ReconcileSummary) Line() string {
+	if r.Repos == 0 && r.Runs == 0 {
+		return "reconciliation loop not enabled"
+	}
+	last := "never"
+	if !r.LastReconcile.IsZero() {
+		last = r.LastReconcile.UTC().Format("2006-01-02 15:04 MST")
+	}
+	return fmt.Sprintf("%d repo(s), %d pass(es), %d failure(s), %d drift repair(s) · last reconcile %s",
+		r.Repos, r.Runs, r.Failures, r.DriftRepairs, last)
+}
+
 // Report is the full fleet digest.
 type Report struct {
-	GeneratedAt time.Time       `json:"generated_at"`
-	Auth        AuthSummary     `json:"auth"`
-	GitHub      GitHubUsage     `json:"github_usage"`
-	Projects    []ProjectReport `json:"projects"`
+	GeneratedAt time.Time        `json:"generated_at"`
+	Auth        AuthSummary      `json:"auth"`
+	GitHub      GitHubUsage      `json:"github_usage"`
+	Reconcile   ReconcileSummary `json:"reconcile"`
+	Projects    []ProjectReport  `json:"projects"`
 }
 
 // DecideTodayCount is the number of action items that need an operator
@@ -243,11 +271,26 @@ func (r *Report) PromotableCount() int {
 // Collect builds the fleet digest across all projects.
 func Collect(projects []Project, opts Options) *Report {
 	opts = opts.withDefaults()
-	rep := &Report{GeneratedAt: opts.Now, Auth: authSummary(), GitHub: githubUsage()}
+	rep := &Report{GeneratedAt: opts.Now, Auth: authSummary(), GitHub: githubUsage(), Reconcile: reconcileSummary()}
 	for _, p := range projects {
 		rep.Projects = append(rep.Projects, CollectProject(p, opts))
 	}
 	return rep
+}
+
+// reconcileSummary snapshots the process-wide mirror reconciliation counters
+// (#827) into the serializable digest field. In the long-running daemon these
+// accumulate the fleet's real reconcile activity; in the one-shot `maestro digest`
+// process no loop has run, so the summary reports "not enabled".
+func reconcileSummary() ReconcileSummary {
+	t := mirrorstore.ReconcileTotalsSnapshot()
+	return ReconcileSummary{
+		Repos:         t.Repos,
+		Runs:          t.Runs,
+		Failures:      t.Failures,
+		DriftRepairs:  t.Repairs,
+		LastReconcile: t.LastSuccessAt,
+	}
 }
 
 // githubUsage snapshots the process-wide GitHub read counters (#826): the gh

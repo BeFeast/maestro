@@ -127,6 +127,11 @@ observability labels, never persistence, so no acknowledged event is dropped.
   `signature_failures` / `duplicates` / `bad_requests` are the current process's
   tally.
 
+- **Missed deliveries self-heal.** A dropped or never-emitted delivery leaves the
+  mirror stale until the phase-E reconciliation loop repairs it — `last_delivery_at`
+  going quiet alongside a rising `mirror.drift_repairs` is that safety net working.
+  See the [mirror reconciliation & health runbook](mirror-reconciliation-runbook.md).
+
 ## Inspecting the store
 
 ```

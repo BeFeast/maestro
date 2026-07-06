@@ -910,6 +910,39 @@ type fleetMirrorStats struct {
 	Stale        mirrorstore.Counts `json:"stale"`
 	TotalRows    int                `json:"total_rows"`
 	TotalStale   int                `json:"total_stale"`
+
+	// Reconcile is the per-repo status of the low-frequency reconciliation loop
+	// (#827): when it last ran/succeeded, how many passes and failures, and the
+	// cumulative + last-pass drift-repair count. DriftRepairs sums Repairs across
+	// repos so an operator sees fleet-wide healed drift at a glance.
+	Reconcile    []fleetReconcileStat `json:"reconcile,omitempty"`
+	DriftRepairs int64                `json:"drift_repairs"`
+
+	// Reads is the mirror-first read outcome (#826/#827): reads served locally vs
+	// reads that fell back to the GitHub API, and the hit rate. The fallback count
+	// is one of the observability fields phase E surfaces in diagnostics.
+	Reads fleetMirrorReadStats `json:"reads"`
+}
+
+// fleetReconcileStat is one repo's reconciliation status in the mirror block.
+type fleetReconcileStat struct {
+	Repo          string `json:"repo"`
+	LastRunAt     string `json:"last_run_at,omitempty"`
+	LastSuccessAt string `json:"last_success_at,omitempty"`
+	Runs          int64  `json:"runs"`
+	Failures      int64  `json:"failures"`
+	Repairs       int64  `json:"repairs"`
+	LastRepairs   int    `json:"last_repairs"`
+	LastError     string `json:"last_error,omitempty"`
+}
+
+// fleetMirrorReadStats surfaces the mirror-first read hit/fallback counters on the
+// fleet snapshot so the fallback-to-GitHub count is visible in diagnostics, not
+// only in the journal digest.
+type fleetMirrorReadStats struct {
+	MirrorHits   int64   `json:"mirror_hits"`
+	APIFallbacks int64   `json:"api_fallbacks"`
+	HitRate      float64 `json:"hit_rate"`
 }
 
 // mirrorStatsSnapshot maps the mirror store's counts into the fleet response
@@ -932,7 +965,7 @@ func (s *FleetServer) mirrorStatsSnapshot() *fleetMirrorStats {
 		log.Printf("[fleet] mirror stale-counts query failed (reporting counts only): %v", err)
 		stale = mirrorstore.Counts{}
 	}
-	return &fleetMirrorStats{
+	out := &fleetMirrorStats{
 		Enabled:      true,
 		StaleHorizon: horizon.String(),
 		Counts:       counts,
@@ -940,6 +973,31 @@ func (s *FleetServer) mirrorStatsSnapshot() *fleetMirrorStats {
 		TotalRows:    counts.Total(),
 		TotalStale:   stale.Total(),
 	}
+	for _, st := range mirrorstore.ReconcileStatsSnapshot() {
+		out.DriftRepairs += st.Repairs
+		rs := fleetReconcileStat{
+			Repo:        st.Repo,
+			Runs:        st.Runs,
+			Failures:    st.Failures,
+			Repairs:     st.Repairs,
+			LastRepairs: st.LastRepairs,
+			LastError:   st.LastError,
+		}
+		if !st.LastRunAt.IsZero() {
+			rs.LastRunAt = formatFleetTime(st.LastRunAt)
+		}
+		if !st.LastSuccessAt.IsZero() {
+			rs.LastSuccessAt = formatFleetTime(st.LastSuccessAt)
+		}
+		out.Reconcile = append(out.Reconcile, rs)
+	}
+	reads := mirrorstore.ReadStatsSnapshot()
+	out.Reads = fleetMirrorReadStats{
+		MirrorHits:   reads.MirrorHits,
+		APIFallbacks: reads.APIFallbacks,
+		HitRate:      reads.HitRate(),
+	}
+	return out
 }
 
 // fleetNextAction names the single canonical operator action across the fleet.

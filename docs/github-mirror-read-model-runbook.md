@@ -74,6 +74,12 @@ is configured:
 the horizon — usually a sign deliveries stopped arriving for a repo. The block is
 omitted entirely when the mirror is not configured.
 
+Phase E (#827) adds `drift_repairs`, a per-repo `reconcile` array (last
+run/success time and drift-repair counts), and a `reads` sub-block (mirror
+hits / API fallbacks) to this block — see the [mirror reconciliation &
+health runbook](mirror-reconciliation-runbook.md) for how to read them, force a
+full reconcile, and run the soak.
+
 ## Phase D — reads switch over
 
 Phase D (#826) puts the supervisor/orchestrator read paths behind a mirror-first
