@@ -1,0 +1,19 @@
+{
+  "action": "opened",
+  "issue": {
+    "number": 824,
+    "title": "Webhook ingestion into the unified SQLite store",
+    "state": "open",
+    "labels": [
+      { "name": "maestro-ready" }
+    ]
+  },
+  "repository": {
+    "full_name": "BeFeast/maestro",
+    "name": "maestro",
+    "private": true
+  },
+  "sender": {
+    "login": "octocat"
+  }
+}

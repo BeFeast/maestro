@@ -293,6 +293,17 @@ systemctl --user restart maestro-fleet.service
 
 Avoid these during incident handling unless you are deliberately debugging credentials: `env`, raw config dumps, `gh auth token`, shell history dumps, and full worker log pastebacks.
 
+## Webhook Ingestion (#824)
+
+The single-service `maestro daemon` can also ingest inbound GitHub webhooks into
+the unified `~/.maestro/maestro.db` — a push-shaped alternative to polling for
+issue / PR / check / review / label state. It is default OFF and opt-in via
+`--webhook-secret-file`; the ingestion diagnostics surface on `/api/v1/fleet`
+under the `webhooks` block (last delivery time, per-event-type counts,
+signature-failure counter). See the dedicated
+[Webhook Ingestion Runbook](webhook-ingestion-runbook.md) for setup, tunnel
+configuration, and semantics.
+
 ## Recovery Playbook
 
 ### No eligible issues

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +31,8 @@ import (
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/statestore"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/webhook"
+	"github.com/befeast/maestro/internal/webhookstore"
 )
 
 // Default loop intervals, shared by the daemon command's flag defaults and the
@@ -132,6 +135,21 @@ type Options struct {
 	// StateDBPath is the shared SQLite state database used when StateStore is
 	// "sqlite" (defaults to the same maestro.db the approvals store uses).
 	StateDBPath string
+
+	// WebhookSecretFile is the path to a file holding the GitHub webhook secret
+	// (epic #811 phase B, #824). When set and readable, the daemon exposes the
+	// inbound webhook ingestion endpoint on the fleet port, validating
+	// X-Hub-Signature-256 against this secret. Only the PATH is configured here;
+	// the secret is read from disk at startup, never logged, and never stored in
+	// the config store. Empty disables ingestion.
+	WebhookSecretFile string
+	// WebhookPath is the endpoint path served under the fleet port (default
+	// webhook.DefaultPath). Configurable so operators can obscure it or align it
+	// with a reverse-proxy route.
+	WebhookPath string
+	// WebhookDBPath is the shared SQLite database webhook deliveries land in
+	// (defaults to the same maestro.db the state/approvals stores use).
+	WebhookDBPath string
 }
 
 // Daemon owns the running project flows and the shared FleetServer.
@@ -352,6 +370,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			log.Printf("[daemon] state prune (drop removed-project rows) failed: %v", perr)
 		}
 	}
+	// #824: expose the inbound GitHub webhook ingestion endpoint on the fleet
+	// port when a webhook secret file is configured. Non-fatal on any error —
+	// the daemon logs it loudly and comes up without ingestion (the fleet keeps
+	// polling), rather than aborting startup over an unreadable secret.
+	configureWebhookIngestion(fleet, d.opts)
+
 	fleetAuth := server.FleetAuthFromProjects(projects)
 	fleet.SetAuth(fleetAuth)
 	// Capture the fleet's shared auth token env so the self-deploy health probe
@@ -529,6 +553,61 @@ func configureFleetGitHubAppAuth(projects []server.FleetProject) {
 		return
 	}
 	log.Printf("[daemon] github app auth not configured — using PAT/gh for GitHub calls")
+}
+
+// configureWebhookIngestion wires the inbound GitHub webhook ingestion endpoint
+// (#824) onto the fleet server when opts.WebhookSecretFile is set. It reads the
+// secret from disk (never logging it), opens the delivery store in the shared
+// maestro.db, and hands the fleet an ingestor plus the configured path.
+//
+// Every failure is non-fatal: a blank/unreadable/empty secret file, or a store
+// that will not open, disables ingestion with a loud warning instead of
+// blocking daemon startup — webhooks are an optimisation over polling, so their
+// absence degrades to today's polling behaviour.
+func configureWebhookIngestion(fleet *server.FleetServer, opts Options) {
+	secretPath := strings.TrimSpace(opts.WebhookSecretFile)
+	if secretPath == "" {
+		log.Printf("[daemon] webhook ingestion not configured (no --webhook-secret-file) — GitHub state continues to arrive by polling")
+		return
+	}
+	secret, err := readWebhookSecret(secretPath)
+	if err != nil {
+		log.Printf("[daemon] webhook ingestion disabled: %v", err)
+		return
+	}
+
+	dbPath := strings.TrimSpace(opts.WebhookDBPath)
+	if dbPath == "" {
+		dbPath = webhookstore.DefaultDBPath()
+	}
+	store, err := webhookstore.Open(dbPath)
+	if err != nil {
+		log.Printf("[daemon] webhook ingestion disabled: open delivery store %s: %v", dbPath, err)
+		return
+	}
+
+	ingestor := webhook.NewIngestor(store, secret)
+	path := strings.TrimSpace(opts.WebhookPath)
+	if path == "" {
+		path = webhook.DefaultPath
+	}
+	fleet.SetWebhookIngestor(ingestor, path)
+	log.Printf("[daemon] webhook ingestion active — POST %s validates X-Hub-Signature-256 and lands deliveries in %s", path, dbPath)
+}
+
+// readWebhookSecret reads and trims the webhook secret from disk. The secret's
+// bytes never enter a log line; only errors (which carry the path, not the
+// content) are surfaced. An empty file is an operator error worth reporting.
+func readWebhookSecret(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read webhook secret file %s: %w", path, err)
+	}
+	secret := strings.TrimSpace(string(data))
+	if secret == "" {
+		return "", fmt.Errorf("webhook secret file %s is empty", path)
+	}
+	return secret, nil
 }
 
 // Fleet returns the aggregating FleetServer once Run has built it, or nil
