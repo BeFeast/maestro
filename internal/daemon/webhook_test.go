@@ -53,11 +53,12 @@ func TestConfigureWebhookIngestionWiresEndpoint(t *testing.T) {
 	}
 
 	fleet := server.NewFleet(nil, "127.0.0.1", 0, false)
-	configureWebhookIngestion(fleet, Options{
+	d := &Daemon{opts: Options{
 		WebhookSecretFile: secretPath,
 		WebhookDBPath:     filepath.Join(dir, "maestro.db"),
 		WebhookPath:       webhook.DefaultPath,
-	})
+	}}
+	d.configureWebhookIngestion(fleet)
 
 	body := []byte(`{"action":"opened","repository":{"full_name":"BeFeast/maestro"}}`)
 	req := httptest.NewRequest(http.MethodPost, webhook.DefaultPath, strings.NewReader(string(body)))
@@ -76,7 +77,8 @@ func TestConfigureWebhookIngestionWiresEndpoint(t *testing.T) {
 // through to the dashboard rather than accepting unsigned input.
 func TestConfigureWebhookIngestionDisabledWithoutSecret(t *testing.T) {
 	fleet := server.NewFleet(nil, "127.0.0.1", 0, false)
-	configureWebhookIngestion(fleet, Options{})
+	d := &Daemon{opts: Options{}}
+	d.configureWebhookIngestion(fleet)
 
 	req := httptest.NewRequest(http.MethodPost, webhook.DefaultPath, strings.NewReader("{}"))
 	req.Header.Set(webhook.HeaderDelivery, "nope")

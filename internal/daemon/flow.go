@@ -331,6 +331,15 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	orchCfg := *cfg
 	orch := orchestrator.New(&orchCfg)
 	orch.SetBinaryVersion(opts.Version)
+	// Mirror-first reads (#826): serve the orchestrator's high-volume poll reads
+	// from the shared mirror when github_mirror.source is mirror-first, falling
+	// back to the API on a miss/stale. The closure reads &orchCfg — the live,
+	// reload-mutated config (reloadConfig copies GitHubMirror), so the escape
+	// hatch flips this flow without a redeploy. nil source (no mirror) leaves the
+	// orchestrator reading GitHub directly, unchanged.
+	if src := d.newReadSource(orchCfg.Repo, func() *config.Config { return &orchCfg }); src != nil {
+		orch.SetReadSource(src)
+	}
 	// Route post-merge self-deploy through the daemon's centralized,
 	// cross-flow-debounced launcher (#758) instead of this flow firing its own
 	// selfdeploy.Trigger. The closure passes the orchestrator's OWN config

@@ -16,6 +16,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mirrorstore"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -177,10 +178,46 @@ func (a AuthSummary) Line() string {
 	return "PAT/`gh` · bucket `shared-pat`"
 }
 
+// GitHubUsage summarizes the process-lifetime GitHub read traffic so the digest
+// shows the quota picture at a glance (#826 AC 5/10): how many REST exchanges the
+// gh wrapper made, how many were billed against the core quota vs served free by
+// a 304, and — once mirror-first reads are enabled — how many reads the local
+// mirror served vs how many fell back to the API. A high MirrorHits with a low
+// APIFallbacks is the phase-D quota win, made visible.
+//
+// The counters are process-lifetime for whichever process built the report; in
+// the long-running daemon they accumulate the fleet's real traffic, and the gh
+// wrapper's hourly journal line reports the same numbers per window.
+type GitHubUsage struct {
+	Requests     int64 `json:"requests"`      // total gh REST exchanges
+	Billed       int64 `json:"billed"`        // exchanges billed against the core quota (requests - not_modified)
+	NotModified  int64 `json:"not_modified"`  // served free by a 304 conditional response
+	RateLimited  int64 `json:"rate_limited"`  // exchanges that hit a rate limit
+	MirrorHits   int64 `json:"mirror_hits"`   // reads served from the local mirror (zero API traffic)
+	APIFallbacks int64 `json:"api_fallbacks"` // reads that fell back to the GitHub API
+}
+
+// Line renders the usage summary as a single human line for the digest header.
+func (u GitHubUsage) Line() string {
+	base := fmt.Sprintf("%d REST exchange(s) (~%d billed against core quota, %d served free by 304, %d rate-limited)",
+		u.Requests, u.Billed, u.NotModified, u.RateLimited)
+	if u.MirrorHits == 0 && u.APIFallbacks == 0 {
+		return base + " · mirror-first reads: not enabled"
+	}
+	total := u.MirrorHits + u.APIFallbacks
+	pct := 0.0
+	if total > 0 {
+		pct = 100 * float64(u.MirrorHits) / float64(total)
+	}
+	return fmt.Sprintf("%s · mirror reads: %d served locally, %d fell back to API (%.0f%% hit)",
+		base, u.MirrorHits, u.APIFallbacks, pct)
+}
+
 // Report is the full fleet digest.
 type Report struct {
 	GeneratedAt time.Time       `json:"generated_at"`
 	Auth        AuthSummary     `json:"auth"`
+	GitHub      GitHubUsage     `json:"github_usage"`
 	Projects    []ProjectReport `json:"projects"`
 }
 
@@ -206,11 +243,26 @@ func (r *Report) PromotableCount() int {
 // Collect builds the fleet digest across all projects.
 func Collect(projects []Project, opts Options) *Report {
 	opts = opts.withDefaults()
-	rep := &Report{GeneratedAt: opts.Now, Auth: authSummary()}
+	rep := &Report{GeneratedAt: opts.Now, Auth: authSummary(), GitHub: githubUsage()}
 	for _, p := range projects {
 		rep.Projects = append(rep.Projects, CollectProject(p, opts))
 	}
 	return rep
+}
+
+// githubUsage snapshots the process-wide GitHub read counters (#826): the gh
+// wrapper's REST exchange tallies and the mirror-first read hit/fallback counts.
+func githubUsage() GitHubUsage {
+	api := github.APIUsage()
+	mirror := mirrorstore.ReadStatsSnapshot()
+	return GitHubUsage{
+		Requests:     api.Requests,
+		Billed:       api.Requests - api.NotModified,
+		NotModified:  api.NotModified,
+		RateLimited:  api.RateLimited,
+		MirrorHits:   mirror.MirrorHits,
+		APIFallbacks: mirror.APIFallbacks,
+	}
 }
 
 // authSummary snapshots the process-wide GitHub auth mode into a serializable

@@ -104,7 +104,9 @@ CREATE TABLE IF NOT EXISTS mirror_pull_requests (
 	draft        INTEGER NOT NULL DEFAULT 0,
 	merged       INTEGER NOT NULL DEFAULT 0,
 	head_sha     TEXT    NOT NULL DEFAULT '',
+	head_ref     TEXT    NOT NULL DEFAULT '',
 	base_ref     TEXT    NOT NULL DEFAULT '',
+	body         TEXT    NOT NULL DEFAULT '',
 	last_seen_at TEXT    NOT NULL DEFAULT '',
 	source       TEXT    NOT NULL DEFAULT '',
 	PRIMARY KEY (repo, number)
@@ -223,36 +225,121 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// Init creates the schema. Idempotent — safe to call on every daemon start, and
-// safe to run against a maestro.db that already has the other stores' tables.
+// Init creates the schema and applies post-schema column migrations. Idempotent
+// — safe to call on every daemon start, and safe to run against a maestro.db
+// that already has the other stores' tables.
 func (s *Store) Init(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, Schema)
-	return err
+	if _, err := s.db.ExecContext(ctx, Schema); err != nil {
+		return err
+	}
+	return s.migrate(ctx)
+}
+
+// migrate adds columns introduced after the original schema to a pre-existing
+// mirror. CREATE TABLE IF NOT EXISTS never alters an existing table, so a fleet
+// that initialised the mirror before #826 needs mirror_pull_requests.head_ref
+// and .body added — the mirror-first source (source.go) serves ListOpenPRs from
+// these columns. The ALTER only adds the columns with an empty default; it does
+// NOT backfill the head branch of PRs already mirrored before the upgrade (that
+// value is not recoverable from the row). Those rows would report an empty head
+// branch and break branch matching, so Source.ListOpenPRs treats an open PR row
+// with an empty head_ref as untrustworthy and falls back to the API for the list
+// until a webhook repopulates the branch. Each add is idempotent: it is skipped
+// when the column already exists, so re-running Init on an already-migrated
+// database is a no-op.
+func (s *Store) migrate(ctx context.Context) error {
+	return s.addColumns(ctx, "mirror_pull_requests", []columnDef{
+		{name: "head_ref", decl: "TEXT NOT NULL DEFAULT ''"},
+		{name: "body", decl: "TEXT NOT NULL DEFAULT ''"},
+	})
+}
+
+// columnDef is one column to add during migration.
+type columnDef struct {
+	name string
+	decl string
+}
+
+// addColumns adds each missing column to table. Existing columns are left
+// untouched, so the whole call is idempotent.
+func (s *Store) addColumns(ctx context.Context, table string, cols []columnDef) error {
+	existing, err := s.tableColumns(ctx, table)
+	if err != nil {
+		return err
+	}
+	for _, c := range cols {
+		if existing[c.name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, c.name, c.decl)
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("add column %s.%s: %w", table, c.name, err)
+		}
+	}
+	return nil
+}
+
+// tableColumns returns the set of column names on table via PRAGMA table_info.
+func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notNull   int
+			dfltValue any
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			return nil, err
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
 }
 
 // ---- Row types -------------------------------------------------------------
 
 // Issue is one mirrored GitHub issue.
 type Issue struct {
-	Repo       string
-	Number     int
-	Title      string
-	State      string
-	Body       string
+	Repo   string
+	Number int
+	Title  string
+	State  string
+	Body   string
+	// Labels is the mirrored label set. It is NOT persisted on the issue row —
+	// labels live in mirror_labels — so it is only populated by reads that join
+	// them in (ListOpenIssues); a bare GetIssue leaves it nil. The mirror-first
+	// source fills it so a reconstructed github.Issue carries the same labels the
+	// REST list would (#826).
+	Labels     []string
 	LastSeenAt time.Time
 	Source     string
 }
 
 // PullRequest is one mirrored GitHub pull request.
 type PullRequest struct {
-	Repo       string
-	Number     int
-	Title      string
-	State      string
-	Draft      bool
-	Merged     bool
-	HeadSHA    string
-	BaseRef    string
+	Repo    string
+	Number  int
+	Title   string
+	State   string
+	Draft   bool
+	Merged  bool
+	HeadSHA string
+	// HeadRef is the head branch name. The mirror-first source needs it to
+	// reconstruct github.PR.HeadRefName for ListOpenPRs — the supervisor and
+	// orchestrator key running sessions to open PRs by head branch (#826).
+	HeadRef string
+	BaseRef string
+	// Body is the PR description, mirrored so a locally-served ListOpenPRs can
+	// reconstruct github.PR.Body (draft-marker detection reads it).
+	Body       string
 	LastSeenAt time.Time
 	Source     string
 }
@@ -348,20 +435,22 @@ func (s *Store) UpsertPullRequest(ctx context.Context, r PullRequest) (applied b
 
 func upsertPullRequest(ctx context.Context, ex execer, r PullRequest) (bool, error) {
 	res, err := ex.ExecContext(ctx, `
-INSERT INTO mirror_pull_requests (repo, number, title, state, draft, merged, head_sha, base_ref, last_seen_at, source)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO mirror_pull_requests (repo, number, title, state, draft, merged, head_sha, head_ref, base_ref, body, last_seen_at, source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(repo, number) DO UPDATE SET
 	title = excluded.title,
 	state = excluded.state,
 	draft = excluded.draft,
 	merged = excluded.merged,
 	head_sha = excluded.head_sha,
+	head_ref = excluded.head_ref,
 	base_ref = excluded.base_ref,
+	body = excluded.body,
 	last_seen_at = excluded.last_seen_at,
 	source = excluded.source
 WHERE excluded.last_seen_at >= mirror_pull_requests.last_seen_at`,
 		r.Repo, r.Number, r.Title, r.State, boolToInt(r.Draft), boolToInt(r.Merged),
-		r.HeadSHA, r.BaseRef, formatTS(r.LastSeenAt), r.Source)
+		r.HeadSHA, r.HeadRef, r.BaseRef, r.Body, formatTS(r.LastSeenAt), r.Source)
 	return rowsApplied(res, err)
 }
 
@@ -566,9 +655,9 @@ func (s *Store) GetPullRequest(ctx context.Context, repo string, number int) (Pu
 		seen          string
 	)
 	err := s.db.QueryRowContext(ctx, `
-SELECT repo, number, title, state, draft, merged, head_sha, base_ref, last_seen_at, source
+SELECT repo, number, title, state, draft, merged, head_sha, head_ref, base_ref, body, last_seen_at, source
 FROM mirror_pull_requests WHERE repo = ? AND number = ?`, repo, number).
-		Scan(&r.Repo, &r.Number, &r.Title, &r.State, &draft, &merged, &r.HeadSHA, &r.BaseRef, &seen, &r.Source)
+		Scan(&r.Repo, &r.Number, &r.Title, &r.State, &draft, &merged, &r.HeadSHA, &r.HeadRef, &r.BaseRef, &r.Body, &seen, &r.Source)
 	if err == sql.ErrNoRows {
 		return PullRequest{}, false, nil
 	}

@@ -120,8 +120,10 @@ func (s *Store) projectPullRequest(ctx context.Context, payload []byte, received
 			Merged    bool   `json:"merged"`
 			UpdatedAt string `json:"updated_at"`
 			CreatedAt string `json:"created_at"`
+			Body      string `json:"body"`
 			Head      struct {
 				SHA string `json:"sha"`
+				Ref string `json:"ref"`
 			} `json:"head"`
 			Base struct {
 				Ref string `json:"ref"`
@@ -142,7 +144,9 @@ func (s *Store) projectPullRequest(ctx context.Context, payload []byte, received
 		Draft:      p.PullRequest.Draft,
 		Merged:     p.PullRequest.Merged,
 		HeadSHA:    strings.TrimSpace(p.PullRequest.Head.SHA),
+		HeadRef:    strings.TrimSpace(p.PullRequest.Head.Ref),
 		BaseRef:    strings.TrimSpace(p.PullRequest.Base.Ref),
+		Body:       p.PullRequest.Body,
 		LastSeenAt: ts,
 		Source:     SourceWebhook,
 	}, labelNames(p.PullRequest.Labels))

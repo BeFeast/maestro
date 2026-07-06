@@ -22,6 +22,8 @@ The header carries a **GitHub auth** line so an operator can confirm which rate-
 - `GitHub App installation <id> · bucket installation · token expires <ts>` — authenticated as a GitHub App installation, which has its own bucket independent of the operator PAT. Configure it with a `github_app:` block (`app_id`, `private_key_path`, `installation_id`) on any fleet project; the private key stays on disk and is never logged or stored in the config store.
 - `PAT/gh (App fallback active …)` — a `github_app:` block is present but token issuance failed, so the daemon fell back to the PAT. The reason is shown inline and a loud line is written to the daemon journal. The same auth mode is appended to the hourly `[github] REST usage …` journal digest.
 
+The header also carries a **GitHub reads** line summarizing the process-lifetime REST traffic (#826): total exchanges, how many were billed against the core quota vs served free by a 304, and — once `github_mirror.source: mirror-first` is enabled — how many reads the local mirror served vs how many fell back to the API. A high `served locally` with a low `fell back to API` is the mirror-first quota win. The same mirror hit/fallback counts are appended to the hourly `[github] REST usage …` journal digest. See [mirror-first-source-runbook.md](mirror-first-source-runbook.md).
+
 ## Running it
 
 One command covers the whole fleet using the same `fleet.yaml` that Mission Control uses:

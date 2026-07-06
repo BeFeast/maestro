@@ -14,6 +14,7 @@ func (r *Report) Markdown() string {
 	fmt.Fprintf(&b, "Generated %s · %d project(s) · **%d decision(s) needed** · %d promotable\n\n",
 		r.GeneratedAt.Format("2006-01-02 15:04 MST"), len(r.Projects), r.DecideTodayCount(), r.PromotableCount())
 	fmt.Fprintf(&b, "GitHub auth: %s\n\n", r.Auth.Line())
+	fmt.Fprintf(&b, "GitHub reads: %s\n\n", r.GitHub.Line())
 
 	fmt.Fprintf(&b, "## 1. Decide today (%d)\n\n", r.DecideTodayCount())
 	if r.DecideTodayCount() == 0 {

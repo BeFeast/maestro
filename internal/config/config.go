@@ -338,6 +338,50 @@ func (c GitHubAppConfig) Configured() bool {
 	return c.AppID > 0 && c.InstallationID > 0 && strings.TrimSpace(c.PrivateKeyPath) != ""
 }
 
+// Mirror source modes for supervisor/orchestrator reads (#826, epic #811 phase
+// D). The GitHub read-model mirror lives in maestro.db (phase C); this selects
+// whether the read paths consult it.
+const (
+	// GitHubSourceAPI reads every supervisor/orchestrator GitHub state directly
+	// from the API — today's behavior, and the fleet-wide escape hatch.
+	GitHubSourceAPI = "api"
+	// GitHubSourceMirrorFirst serves the high-volume reads (open-issue/open-PR
+	// lists, issue/PR state) from a warm local mirror, falling back to the API on
+	// a miss or a stale row.
+	GitHubSourceMirrorFirst = "mirror-first"
+)
+
+// GitHubMirrorConfig selects how the supervisor/orchestrator read GitHub state
+// (#826). Empty defaults to "api" (today's behavior) until the mirror-first path
+// has soaked in production, after which the default flips to "mirror-first".
+//
+// Setting `source: api` is the fleet-wide escape hatch: the source is consulted
+// on every read, so a live config-store edit restores API-direct reads without a
+// redeploy (#826 AC 3/8). GitHub stays authoritative for all writes and
+// merge-gating reads regardless of this setting.
+type GitHubMirrorConfig struct {
+	Source       string `yaml:"source"`        // "" (=api) | "api" | "mirror-first"
+	StaleSeconds int    `yaml:"stale_seconds"` // freshness horizon override in seconds; 0 = default (24h)
+}
+
+// MirrorFirst reports whether reads should be served mirror-first. Any value
+// other than "mirror-first" (including the empty default and typos) is API — the
+// safe direction, since a mis-set flag can only fall back to the authoritative
+// API, never fabricate a stale mirror read.
+func (c GitHubMirrorConfig) MirrorFirst() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Source), GitHubSourceMirrorFirst)
+}
+
+// StaleHorizon is the freshness window a mirror row must fall within to be
+// served locally. A non-positive stale_seconds falls back to 24h — the same
+// conservative horizon mirrorstore.DefaultStaleHorizon uses.
+func (c GitHubMirrorConfig) StaleHorizon() time.Duration {
+	if c.StaleSeconds <= 0 {
+		return 24 * time.Hour
+	}
+	return time.Duration(c.StaleSeconds) * time.Second
+}
+
 // SelfDeployConfig gates the opt-in post-merge self-deploy of the maestro
 // binary itself (#698). Default OFF: projects without a `self_deploy:` block
 // (or with enabled: false) see no behavior change.
@@ -1306,6 +1350,7 @@ type Config struct {
 	SelfDeploy                      SelfDeployConfig             `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
 	GitHubProjects                  GitHubProjectsConfig         `yaml:"github_projects"`
 	GitHubApp                       GitHubAppConfig              `yaml:"github_app"`                 // #823: GitHub App auth (app_id + private_key_path + installation_id)
+	GitHubMirror                    GitHubMirrorConfig           `yaml:"github_mirror"`              // #826: mirror-first vs api-direct supervisor/orchestrator reads
 	MaxRetryBackoffMs               int                          `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles                []string                     `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	AutoRestoreFiles                []string                     `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase
@@ -1660,6 +1705,16 @@ func parse(data []byte) (*Config, error) {
 		cfg.ReviewGate = "greptile"
 	}
 	cfg.ReviewGateStreams = normalizeReviewGateStreams(cfg.ReviewGate, cfg.ReviewGateStreams)
+
+	// GitHub read source (#826). Normalize to a known value; anything unrecognised
+	// — including the empty default and typos — resolves to API-direct, which is
+	// always the safe direction (it can only fall back to the authoritative API).
+	switch strings.ToLower(strings.TrimSpace(cfg.GitHubMirror.Source)) {
+	case GitHubSourceMirrorFirst:
+		cfg.GitHubMirror.Source = GitHubSourceMirrorFirst
+	default:
+		cfg.GitHubMirror.Source = GitHubSourceAPI
+	}
 
 	// Default hooks timeout
 	if cfg.Hooks.TimeoutMs <= 0 {
