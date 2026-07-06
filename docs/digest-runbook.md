@@ -16,6 +16,12 @@ This runbook is intentionally safe for shared docs. It uses placeholders for loc
 
 Every item links to its GitHub issue or PR. GitHub API hiccups degrade gracefully: the affected check is skipped or over-reports, and a "Collection warnings" section flags the gap instead of silently dropping data.
 
+The header carries a **GitHub auth** line so an operator can confirm which rate-limit bucket the fleet spends against (#823):
+
+- `PAT/gh · bucket shared-pat` — the shared personal access token; all projects share one 5 000/hr core bucket.
+- `GitHub App installation <id> · bucket installation · token expires <ts>` — authenticated as a GitHub App installation, which has its own bucket independent of the operator PAT. Configure it with a `github_app:` block (`app_id`, `private_key_path`, `installation_id`) on any fleet project; the private key stays on disk and is never logged or stored in the config store.
+- `PAT/gh (App fallback active …)` — a `github_app:` block is present but token issuance failed, so the daemon fell back to the PAT. The reason is shown inline and a loud line is written to the daemon journal. The same auth mode is appended to the hourly `[github] REST usage …` journal digest.
+
 ## Running it
 
 One command covers the whole fleet using the same `fleet.yaml` that Mission Control uses:

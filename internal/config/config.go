@@ -318,6 +318,26 @@ type GitHubProjectsConfig struct {
 	ProjectNumber int  `yaml:"project_number"` // GitHub Project number (auto-detect from repo)
 }
 
+// GitHubAppConfig holds credentials for authenticating as a GitHub App
+// installation instead of a personal access token (#823). When populated the
+// daemon signs a JWT with the App's private key, exchanges it for a
+// short-lived installation access token, and auto-refreshes before expiry.
+// The PAT/`gh` path stays as fallback when this block is absent or incomplete.
+//
+// The private key MUST live on disk — `private_key_path` points to the PEM
+// file. The key is never read into config, never logged, and never stored in
+// the config store; only the path is persisted.
+type GitHubAppConfig struct {
+	AppID          int64  `yaml:"app_id"`           // GitHub App ID (numeric)
+	PrivateKeyPath string `yaml:"private_key_path"` // path to the PEM-encoded RSA private key
+	InstallationID int64  `yaml:"installation_id"`  // installation ID for the target org/account
+}
+
+// Configured reports whether all three required fields are set.
+func (c GitHubAppConfig) Configured() bool {
+	return c.AppID > 0 && c.InstallationID > 0 && strings.TrimSpace(c.PrivateKeyPath) != ""
+}
+
 // SelfDeployConfig gates the opt-in post-merge self-deploy of the maestro
 // binary itself (#698). Default OFF: projects without a `self_deploy:` block
 // (or with enabled: false) see no behavior change.
@@ -1285,6 +1305,7 @@ type Config struct {
 	Versioning                      VersioningConfig             `yaml:"versioning"`
 	SelfDeploy                      SelfDeployConfig             `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
 	GitHubProjects                  GitHubProjectsConfig         `yaml:"github_projects"`
+	GitHubApp                       GitHubAppConfig              `yaml:"github_app"`                 // #823: GitHub App auth (app_id + private_key_path + installation_id)
 	MaxRetryBackoffMs               int                          `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
 	AutoResolveFiles                []string                     `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
 	AutoRestoreFiles                []string                     `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase

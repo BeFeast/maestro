@@ -101,6 +101,21 @@ func loadDigestProjects(fleetPath string, configs multiFlag, storePath, storePro
 		}
 	}
 
+	// #823: configure GitHub App auth from the first project carrying a complete
+	// github_app block so the digest's reads use the installation token and the
+	// report's auth line matches the daemon. A setup failure is non-fatal — the
+	// command stays on PAT/gh and the report says so.
+	for _, entry := range named {
+		if entry.cfg == nil || !entry.cfg.GitHubApp.Configured() {
+			continue
+		}
+		app := entry.cfg.GitHubApp
+		if err := github.ConfigureAppAuth(app.AppID, app.InstallationID, app.PrivateKeyPath); err != nil {
+			log.Printf("digest: github app auth setup failed (using PAT/gh): %v", err)
+		}
+		break
+	}
+
 	var projects []digest.Project
 	var notifierCfg *config.Config
 	for _, entry := range named {
