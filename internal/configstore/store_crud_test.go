@@ -75,6 +75,48 @@ model:
 	}
 }
 
+// #823: the GitHub App block must round-trip through the store carrying only
+// the private-key PATH, never key material — the "no secrets in the config
+// store" acceptance criterion. The stored YAML is asserted to hold the path and
+// nothing resembling a PEM private key.
+func TestGitHubAppConfigRoundTripStoresPathNotKey(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	const yaml = `repo: owner/svc
+github_app:
+  app_id: 4242
+  private_key_path: /etc/maestro/app-key.pem
+  installation_id: 99
+`
+	if err := store.UpsertProject(ctx, "svc", yaml); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+
+	cfg, err := store.Load(ctx, "svc")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.GitHubApp.AppID != 4242 || cfg.GitHubApp.InstallationID != 99 {
+		t.Fatalf("app config not preserved: %+v", cfg.GitHubApp)
+	}
+	if cfg.GitHubApp.PrivateKeyPath != "/etc/maestro/app-key.pem" {
+		t.Fatalf("private_key_path = %q", cfg.GitHubApp.PrivateKeyPath)
+	}
+
+	out, err := store.ExportProject(ctx, "svc")
+	if err != nil {
+		t.Fatalf("ExportProject: %v", err)
+	}
+	if !strings.Contains(string(out), "private_key_path: /etc/maestro/app-key.pem") {
+		t.Fatalf("exported YAML missing key path:\n%s", out)
+	}
+	// No key material should ever appear in the persisted document.
+	if strings.Contains(string(out), "PRIVATE KEY") || strings.Contains(string(out), "BEGIN RSA") {
+		t.Fatalf("exported YAML leaked private key material:\n%s", out)
+	}
+}
+
 // #757: two writes in the same wall-clock second must produce DIFFERENT
 // fingerprints — otherwise a config-store edit immediately after add/migrate
 // would never advance updated_at and a --watch-store daemon would never

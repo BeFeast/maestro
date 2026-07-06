@@ -2,11 +2,13 @@ package github
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -213,7 +215,42 @@ const (
 // process error. Indirection point so tests can drive the retry loop without a
 // real gh binary.
 var ghAPIRunner = func(args ...string) ([]byte, error) {
-	return exec.Command("gh", args...).CombinedOutput()
+	return ghCommand(args...).CombinedOutput()
+}
+
+// ghCommand builds an exec.Command for `gh <args...>` with GitHub App auth
+// injected when configured. All direct `gh` call sites in this package use it
+// instead of exec.Command so installation-token auth is uniform (#823).
+func ghCommand(args ...string) *exec.Cmd {
+	cmd := exec.Command("gh", args...)
+	ghApplyAuth(cmd)
+	return cmd
+}
+
+// ghCommandContext is the context-aware sibling of ghCommand, used by the
+// GraphQL Projects calls in github_projects.go so they authenticate with the
+// installation token when App auth is active (#823).
+func ghCommandContext(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "gh", args...)
+	ghApplyAuth(cmd)
+	return cmd
+}
+
+// ghApplyAuth sets GH_TOKEN on cmd's environment when GitHub App installation
+// auth is active. When App auth is not configured, or a refresh failed, appToken
+// returns an empty token and cmd is left untouched — the process falls back to
+// the ambient gh auth (PAT path), so behavior is byte-identical to pre-#823. A
+// refresh failure was already logged loudly by appToken.
+func ghApplyAuth(cmd *exec.Cmd) {
+	token, _ := appToken()
+	if token == "" {
+		return
+	}
+	// Inherit the current environment and override GH_TOKEN.
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = append(cmd.Env, "GH_TOKEN="+token)
 }
 
 // ghAPISleep is the backoff sleeper, injectable so tests do not actually wait.
@@ -710,8 +747,8 @@ func noteAPIRequest(notModified, rateLimited bool) {
 		// Roll the window before counting so the request that crossed the
 		// boundary opens the new window instead of vanishing with the digest.
 		w := apiStatsWindow
-		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited%s",
-			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited, primaryLimitDigest())
+		log.Printf("[github] REST usage last %s: %d requests, ~%d billed against core quota, %d served free by 304, %d rate-limited%s%s",
+			elapsed.Round(time.Minute), w.Requests, w.Requests-w.NotModified, w.NotModified, w.RateLimited, authModeDigest(), primaryLimitDigest())
 		apiStatsWindow = APIStats{}
 		apiWindowStart = now
 	}
@@ -1511,7 +1548,7 @@ func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 		"--base", base,
 		"--head", head,
 	}
-	out, err := exec.Command("gh", args...).CombinedOutput()
+	out, err := ghCommand(args...).CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("gh pr create: %w\n%s", err, out)
 	}
@@ -1530,7 +1567,7 @@ func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 
 // UpdatePRBody replaces a pull request body.
 func (c *Client) UpdatePRBody(prNumber int, body string) error {
-	out, err := exec.Command("gh",
+	out, err := ghCommand(
 		"pr", "edit", strconv.Itoa(prNumber),
 		"--repo", c.Repo,
 		"--body", body,
@@ -1903,7 +1940,7 @@ func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, 
 // ClosePR closes a PR without merging and leaves a comment explaining why.
 func (c *Client) ClosePR(prNumber int, comment string) error {
 	if comment != "" {
-		out, err := exec.Command("gh", "pr", "comment",
+		out, err := ghCommand("pr", "comment",
 			fmt.Sprint(prNumber),
 			"--repo", c.Repo,
 			"--body", comment).CombinedOutput()
@@ -1911,7 +1948,7 @@ func (c *Client) ClosePR(prNumber int, comment string) error {
 			return fmt.Errorf("gh pr comment %d: %w\n%s", prNumber, err, out)
 		}
 	}
-	out, err := exec.Command("gh", "pr", "close",
+	out, err := ghCommand("pr", "close",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo).CombinedOutput()
 	if err != nil {
@@ -1937,7 +1974,7 @@ func (c *Client) PRChecksOutput(prNumber int) (string, error) {
 
 // MergePR squash-merges a PR
 func (c *Client) MergePR(prNumber int) error {
-	out, err := exec.Command("gh", "pr", "merge",
+	out, err := ghCommand("pr", "merge",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo,
 		"--squash",
@@ -1952,7 +1989,7 @@ func (c *Client) MergePR(prNumber int) error {
 // `gh pr ready`). `gh pr merge` on a draft fails with "still a draft", so
 // the orchestrator readies a green draft PR before merging it (#697).
 func (c *Client) MarkPRReady(prNumber int) error {
-	out, err := exec.Command("gh", "pr", "ready",
+	out, err := ghCommand("pr", "ready",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo).CombinedOutput()
 	if err != nil {
@@ -1972,7 +2009,7 @@ func (c *Client) MarkPRReady(prNumber int) error {
 // same pass; they should let the next supervisor cycle re-validate and
 // re-mint against the new state (#547).
 func (c *Client) UpdateBranch(prNumber int) error {
-	out, err := exec.Command("gh", "pr", "update-branch",
+	out, err := ghCommand("pr", "update-branch",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo).CombinedOutput()
 	if err != nil {
@@ -1984,7 +2021,7 @@ func (c *Client) UpdateBranch(prNumber int) error {
 // CloseIssue closes a GitHub issue and leaves a comment explaining why
 func (c *Client) CloseIssue(number int, comment string) error {
 	if comment != "" {
-		out, err := exec.Command("gh", "issue", "comment",
+		out, err := ghCommand("issue", "comment",
 			fmt.Sprint(number),
 			"--repo", c.Repo,
 			"--body", comment).CombinedOutput()
@@ -1992,7 +2029,7 @@ func (c *Client) CloseIssue(number int, comment string) error {
 			return fmt.Errorf("gh issue comment %d: %w\n%s", number, err, out)
 		}
 	}
-	out, err := exec.Command("gh", "issue", "close",
+	out, err := ghCommand("issue", "close",
 		fmt.Sprint(number),
 		"--repo", c.Repo).CombinedOutput()
 	if err != nil {
@@ -2003,7 +2040,7 @@ func (c *Client) CloseIssue(number int, comment string) error {
 
 // AddIssueLabel adds a label to an issue.
 func (c *Client) AddIssueLabel(issueNumber int, label string) error {
-	out, err := exec.Command("gh", "issue", "edit",
+	out, err := ghCommand("issue", "edit",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
 		"--add-label", label,
@@ -2016,7 +2053,7 @@ func (c *Client) AddIssueLabel(issueNumber int, label string) error {
 
 // RemoveIssueLabel removes a label from an issue.
 func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
-	out, err := exec.Command("gh", "issue", "edit",
+	out, err := ghCommand("issue", "edit",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
 		"--remove-label", label,
@@ -2029,7 +2066,7 @@ func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
 
 // CommentIssue leaves a comment on an issue.
 func (c *Client) CommentIssue(issueNumber int, body string) error {
-	out, err := exec.Command("gh", "issue", "comment",
+	out, err := ghCommand("issue", "comment",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
 		"--body", body,
@@ -2042,7 +2079,7 @@ func (c *Client) CommentIssue(issueNumber int, body string) error {
 
 // CommentPR leaves a comment on a pull request.
 func (c *Client) CommentPR(prNumber int, body string) error {
-	out, err := exec.Command("gh", "pr", "comment",
+	out, err := ghCommand("pr", "comment",
 		strconv.Itoa(prNumber),
 		"--repo", c.Repo,
 		"--body", body,
@@ -2081,7 +2118,7 @@ func (c *Client) PRCommits(prNumber int) ([]string, error) {
 
 // CreateRelease creates a GitHub release for the given tag.
 func (c *Client) CreateRelease(tag, title string) error {
-	out, err := exec.Command("gh", "release", "create",
+	out, err := ghCommand("release", "create",
 		tag,
 		"--repo", c.Repo,
 		"--title", title,
@@ -2408,7 +2445,7 @@ func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
 		args = append(args, "--label", l)
 	}
 
-	out, err := exec.Command("gh", args...).CombinedOutput()
+	out, err := ghCommand(args...).CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("gh issue create: %w\n%s", err, out)
 	}
@@ -2428,7 +2465,7 @@ func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
 
 // EditIssueBody updates the body of a GitHub issue.
 func (c *Client) EditIssueBody(number int, body string) error {
-	out, err := exec.Command("gh", "issue", "edit",
+	out, err := ghCommand("issue", "edit",
 		strconv.Itoa(number),
 		"--repo", c.Repo,
 		"--body", body,

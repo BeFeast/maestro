@@ -351,6 +351,43 @@ func TestMarkdownEmptyReport(t *testing.T) {
 	}
 }
 
+// #823: the digest surfaces the GitHub auth mode. With no App configured the
+// process defaults to the PAT path, and both the report field and the rendered
+// header say so.
+func TestReportAuthSummaryDefaultsToPAT(t *testing.T) {
+	rep := Collect([]Project{baseProject(state.NewState(), &fakeGH{})}, testOptions())
+	if rep.Auth.Mode != string(github.AuthModePAT) {
+		t.Fatalf("auth mode = %q, want pat", rep.Auth.Mode)
+	}
+	if rep.Auth.Bucket != "shared-pat" {
+		t.Fatalf("auth bucket = %q, want shared-pat", rep.Auth.Bucket)
+	}
+	if !strings.Contains(rep.Markdown(), "GitHub auth: PAT/`gh`") {
+		t.Fatalf("markdown missing PAT auth line:\n%s", rep.Markdown())
+	}
+}
+
+// TestAuthSummaryLine covers the three rendered states of the header line.
+func TestAuthSummaryLine(t *testing.T) {
+	exp := time.Date(2026, 7, 6, 13, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		a    AuthSummary
+		want string
+	}{
+		{"pat", AuthSummary{Mode: "pat", Bucket: "shared-pat"}, "PAT/`gh` · bucket `shared-pat`"},
+		{"app", AuthSummary{Mode: "app", Bucket: "installation", InstallationID: 99, TokenExpiry: exp}, "GitHub App installation 99 · bucket `installation`"},
+		{"fallback", AuthSummary{Mode: "pat", Bucket: "shared-pat", FallbackActive: true, FallbackReason: "revoked"}, "App fallback active"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.a.Line(); !strings.Contains(got, tc.want) {
+				t.Fatalf("Line() = %q, want substring %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNotifySummaryCountsByKind(t *testing.T) {
 	st := state.NewState()
 	st.Approvals = []state.Approval{

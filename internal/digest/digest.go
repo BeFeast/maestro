@@ -145,9 +145,42 @@ type ProjectReport struct {
 	Errors      []string `json:"errors,omitempty"`
 }
 
+// AuthSummary captures which GitHub auth mode and rate-limit bucket the daemon
+// is using, surfaced in the digest so an operator can confirm at a glance
+// whether the fleet is on the shared PAT or a GitHub App installation (#823).
+type AuthSummary struct {
+	Mode           string    `json:"mode"`                      // "app" or "pat"
+	Bucket         string    `json:"bucket"`                    // "installation" or "shared-pat"
+	InstallationID int64     `json:"installation_id,omitempty"` // App installation, when mode=app
+	TokenExpiry    time.Time `json:"token_expiry,omitempty"`    // installation token expiry, when mode=app
+	FallbackActive bool      `json:"fallback_active,omitempty"` // App configured but currently on PAT fallback
+	FallbackReason string    `json:"fallback_reason,omitempty"` // why the fallback is active
+}
+
+// Line renders the auth summary as a single human line for the digest header.
+func (a AuthSummary) Line() string {
+	if a.FallbackActive {
+		reason := a.FallbackReason
+		if reason == "" {
+			reason = "app token unavailable"
+		}
+		return fmt.Sprintf("PAT/`gh` (App fallback active — bucket %s; reason: %s)", a.Bucket, reason)
+	}
+	if a.Mode == string(github.AuthModeApp) {
+		exp := "unknown"
+		if !a.TokenExpiry.IsZero() {
+			exp = a.TokenExpiry.UTC().Format("2006-01-02 15:04 MST")
+		}
+		return fmt.Sprintf("GitHub App installation %d · bucket `%s` · token expires %s",
+			a.InstallationID, a.Bucket, exp)
+	}
+	return "PAT/`gh` · bucket `shared-pat`"
+}
+
 // Report is the full fleet digest.
 type Report struct {
 	GeneratedAt time.Time       `json:"generated_at"`
+	Auth        AuthSummary     `json:"auth"`
 	Projects    []ProjectReport `json:"projects"`
 }
 
@@ -173,11 +206,32 @@ func (r *Report) PromotableCount() int {
 // Collect builds the fleet digest across all projects.
 func Collect(projects []Project, opts Options) *Report {
 	opts = opts.withDefaults()
-	rep := &Report{GeneratedAt: opts.Now}
+	rep := &Report{GeneratedAt: opts.Now, Auth: authSummary()}
 	for _, p := range projects {
 		rep.Projects = append(rep.Projects, CollectProject(p, opts))
 	}
 	return rep
+}
+
+// authSummary snapshots the process-wide GitHub auth mode into a serializable
+// digest field (#823). In the daemon this reflects the live installation-token
+// state; the standalone `maestro digest` command configures App auth from its
+// loaded configs before Collect so the report matches the daemon.
+func authSummary() AuthSummary {
+	info := github.GetAuthInfo()
+	s := AuthSummary{
+		Mode:           string(info.Mode),
+		InstallationID: info.InstallationID,
+		TokenExpiry:    info.TokenExpiry,
+		FallbackActive: info.FallbackActive,
+		FallbackReason: info.LastError,
+	}
+	if info.Mode == github.AuthModeApp {
+		s.Bucket = "installation"
+	} else {
+		s.Bucket = "shared-pat"
+	}
+	return s
 }
 
 // CollectProject builds one project's digest sections. GitHub failures

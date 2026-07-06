@@ -360,6 +360,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// before any flow starts, so RequestSelfDeploy reads it race-free.
 	d.fleetAuthTokenEnv = strings.TrimSpace(fleetAuth.TokenEnv)
 
+	// #823: configure GitHub App installation-token auth process-wide before any
+	// flow issues a GitHub call. The token source is a package-level singleton
+	// (all flows share one gh wrapper and one rate-limit bucket), so the first
+	// project carrying a complete github_app block wins. When no project sets it,
+	// or the initial token fetch fails, the daemon keeps the PAT/`gh` path and
+	// logs which bucket is in use.
+	configureFleetGitHubAppAuth(projects)
+
 	// Bind the fleet port BEFORE starting any flow. If the port is already held
 	// (a legacy maestro@ unit, a second daemon), Listen fails here and we abort
 	// immediately — no flow has started, so there is nothing to drain. Binding
@@ -497,6 +505,30 @@ func flowKey(cfg *config.Config) string {
 		return sd
 	}
 	return strings.TrimSpace(cfg.Repo)
+}
+
+// configureFleetGitHubAppAuth arms process-wide GitHub App installation-token
+// auth from the first project whose github_app block is complete (#823). The
+// gh wrapper's token source is a singleton shared by every flow, so a fleet
+// with an org-wide App configures it once here. A configuration or initial
+// fetch failure is non-fatal: the daemon logs it loudly and keeps the PAT/`gh`
+// path, so a bad App block degrades to today's behavior rather than blocking
+// startup.
+func configureFleetGitHubAppAuth(projects []server.FleetProject) {
+	for i := range projects {
+		cfg := projects[i].Cfg()
+		if cfg == nil || !cfg.GitHubApp.Configured() {
+			continue
+		}
+		app := cfg.GitHubApp
+		if err := github.ConfigureAppAuth(app.AppID, app.InstallationID, app.PrivateKeyPath); err != nil {
+			log.Printf("[daemon] github app auth setup failed for %s (staying on PAT/gh): %v", cfg.Repo, err)
+			return
+		}
+		log.Printf("[daemon] github app auth active (app_id=%d installation_id=%d) — daemon GitHub calls use an installation token", app.AppID, app.InstallationID)
+		return
+	}
+	log.Printf("[daemon] github app auth not configured — using PAT/gh for GitHub calls")
 }
 
 // Fleet returns the aggregating FleetServer once Run has built it, or nil
