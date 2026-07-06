@@ -1432,6 +1432,58 @@ func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 	return issues, nil
 }
 
+// ListAllOpenIssues is ListOpenIssues that follows pagination: it fetches EVERY
+// page of the repo's open issues, not just the first 100. The reconciliation
+// loop (#827) needs the AUTHORITATIVE open set — it treats a mirrored-open issue
+// absent from this list as a missed close and stamps it closed, so a truncated
+// first page would wrongly close every still-open issue past #100. Ordinary
+// callers that only need a working set can stay on the cheaper single-page
+// ListOpenIssues. The read still flows through the conditional (ETag) layer, so
+// an unchanged repo whose open set fits one partial page answers 304 for free.
+func (c *Client) ListAllOpenIssues(labels []string) ([]Issue, error) {
+	if len(labels) <= 1 {
+		label := ""
+		if len(labels) == 1 {
+			label = labels[0]
+		}
+		return c.listAllOpenIssuesByLabel(label)
+	}
+
+	seen := make(map[int]struct{})
+	var result []Issue
+	for _, label := range labels {
+		issues, err := c.listAllOpenIssuesByLabel(label)
+		if err != nil {
+			return nil, err
+		}
+		for _, issue := range issues {
+			if _, ok := seen[issue.Number]; !ok {
+				seen[issue.Number] = struct{}{}
+				result = append(result, issue)
+			}
+		}
+	}
+	return result, nil
+}
+
+func (c *Client) listAllOpenIssuesByLabel(label string) ([]Issue, error) {
+	endpoint := fmt.Sprintf("repos/%s/issues?state=open&per_page=100", c.Repo)
+	if label != "" {
+		endpoint += "&labels=" + url.QueryEscape(label)
+	}
+
+	out, err := ghAPIWithArgs(endpoint, "--paginate")
+	if err != nil {
+		return nil, fmt.Errorf("list all open issues: %w", err)
+	}
+
+	issues, err := parseRESTIssues(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse issues: %w", err)
+	}
+	return issues, nil
+}
+
 // GetIssue fetches a single issue by number
 func (c *Client) GetIssue(number int) (Issue, error) {
 	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
@@ -1465,6 +1517,22 @@ func (c *Client) ListOpenPRs() ([]PR, error) {
 	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo))
 	if err != nil {
 		return nil, fmt.Errorf("list open PRs: %w", err)
+	}
+
+	prs, err := parseRESTPulls(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse prs: %w", err)
+	}
+	return prs, nil
+}
+
+// ListAllOpenPRs is ListOpenPRs that follows pagination — see ListAllOpenIssues
+// for why the reconciliation loop (#827) needs the full open set rather than
+// page one before it uses absence as a close signal.
+func (c *Client) ListAllOpenPRs() ([]PR, error) {
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo), "--paginate")
+	if err != nil {
+		return nil, fmt.Errorf("list all open PRs: %w", err)
 	}
 
 	prs, err := parseRESTPulls(out)

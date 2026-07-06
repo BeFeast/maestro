@@ -37,3 +37,28 @@ func TestReportMarkdownIncludesGitHubReads(t *testing.T) {
 		t.Fatalf("markdown missing GitHub reads line:\n%s", md)
 	}
 }
+
+func TestReconcileSummaryLine(t *testing.T) {
+	if got := (ReconcileSummary{}).Line(); !strings.Contains(got, "not enabled") {
+		t.Fatalf("empty reconcile summary should say not enabled: %q", got)
+	}
+	s := ReconcileSummary{Repos: 2, Runs: 8, Failures: 1, DriftRepairs: 3}
+	got := s.Line()
+	if !strings.Contains(got, "3 drift repair(s)") {
+		t.Fatalf("line missing drift repairs: %q", got)
+	}
+	if !strings.Contains(got, "2 repo(s)") {
+		t.Fatalf("line missing repo count: %q", got)
+	}
+}
+
+func TestReportMarkdownIncludesReconcile(t *testing.T) {
+	r := &Report{Reconcile: ReconcileSummary{Repos: 1, Runs: 1, DriftRepairs: 2}}
+	md := r.Markdown()
+	if !strings.Contains(md, "Mirror reconcile:") {
+		t.Fatalf("markdown missing reconcile line:\n%s", md)
+	}
+	if !strings.Contains(md, "2 drift repair(s)") {
+		t.Fatalf("markdown missing drift-repair count:\n%s", md)
+	}
+}

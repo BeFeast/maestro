@@ -9,8 +9,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mirrorstore"
 )
+
+// stubReconcileAPI is a minimal mirrorstore.ReconcileReader for driving a real
+// reconcile pass so the fleet diagnostics reconcile block can be asserted.
+type stubReconcileAPI struct {
+	issues []github.Issue
+	prs    []github.PR
+}
+
+func (s stubReconcileAPI) ListAllOpenIssues(labels []string) ([]github.Issue, error) {
+	return s.issues, nil
+}
+func (s stubReconcileAPI) ListAllOpenPRs() ([]github.PR, error)  { return s.prs, nil }
+func (s stubReconcileAPI) IsPRMerged(prNumber int) (bool, error) { return false, nil }
 
 func newMirrorStore(t *testing.T) *mirrorstore.Store {
 	t.Helper()
@@ -71,6 +85,44 @@ func TestFleetSnapshotMirrorStats(t *testing.T) {
 	}
 	if payload.Mirror == nil || payload.Mirror.TotalRows != 2 || payload.Mirror.TotalStale != 1 {
 		t.Fatalf("fleet JSON missing mirror stats: %+v", payload.Mirror)
+	}
+}
+
+// TestFleetSnapshotReconcileStats proves the reconciliation status surfaces on the
+// mirror diagnostics block (#827): a pass that repaired drift shows up per repo,
+// with a fleet-wide drift-repair total.
+func TestFleetSnapshotReconcileStats(t *testing.T) {
+	store := newMirrorStore(t)
+	ctx := context.Background()
+
+	// A reconcile that discovers a GitHub-open issue the mirror never saw repairs
+	// one row and records a successful pass for the repo.
+	api := stubReconcileAPI{issues: []github.Issue{{Number: 1, Title: "hi", State: "open"}}}
+	if _, err := mirrorstore.NewReconciler(store, api, "o/r").Reconcile(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	fleet := NewFleet(nil, "127.0.0.1", 0, false)
+	fleet.SetMirrorStore(store, mirrorstore.DefaultStaleHorizon)
+
+	snap := fleet.snapshot()
+	if snap.Mirror == nil {
+		t.Fatal("fleet snapshot missing mirror block")
+	}
+	if snap.Mirror.DriftRepairs != 1 {
+		t.Fatalf("drift repairs = %d, want 1", snap.Mirror.DriftRepairs)
+	}
+	var found bool
+	for _, rs := range snap.Mirror.Reconcile {
+		if rs.Repo == "o/r" {
+			found = true
+			if rs.Runs != 1 || rs.Repairs != 1 || rs.LastSuccessAt == "" {
+				t.Fatalf("unexpected reconcile stat: %+v", rs)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("reconcile block missing repo o/r: %+v", snap.Mirror.Reconcile)
 	}
 }
 
