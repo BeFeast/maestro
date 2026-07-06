@@ -100,6 +100,50 @@ func TestHydrateDoesNotClobberFresherWebhook(t *testing.T) {
 	}
 }
 
+// TestHydratePreservesClosedState covers the P1 fix: hydrating an already-closed
+// issue must record its real state, not hard-code "open". Otherwise a later
+// "issues"/"closed" webhook whose issue.updated_at predates the hydration time
+// would be guard-rejected as stale and the mirror would stay open indefinitely.
+func TestHydratePreservesClosedState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	fake := &fakeGitHub{issue: github.Issue{Number: 5, Title: "done", State: "closed"}}
+	h := NewHydrator(s, fake, "o/r")
+
+	row, err := h.Issue(ctx, 5)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if row.State != "closed" {
+		t.Fatalf("hydrated state = %q, want closed", row.State)
+	}
+
+	// A later close webhook that predates the hydration time is a no-op — but the
+	// mirror already shows closed, so it never regressed to open in the first place.
+	stored, ok, _ := s.GetIssue(ctx, "o/r", 5)
+	if !ok || stored.State != "closed" {
+		t.Fatalf("stored issue = %+v, want state closed", stored)
+	}
+}
+
+// TestHydrateEmptyStateDefaultsOpen confirms the safety fallback: a client that
+// does not populate state records the issue as open (the mirror only hydrates
+// issues a reader is actively working, which are open by construction).
+func TestHydrateEmptyStateDefaultsOpen(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	fake := &fakeGitHub{issue: github.Issue{Number: 6, Title: "no state"}}
+	h := NewHydrator(s, fake, "o/r")
+	row, err := h.Issue(ctx, 6)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if row.State != "open" {
+		t.Fatalf("hydrated state = %q, want open fallback", row.State)
+	}
+}
+
 func TestHydrateErrorPropagates(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

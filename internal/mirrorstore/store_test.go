@@ -202,3 +202,99 @@ func TestStaleCountsAndClassify(t *testing.T) {
 		t.Fatalf("StaleCounts with zero horizon = %+v, want all zero", sc)
 	}
 }
+
+// TestUpsertIssueWithLabelsStaleKeepsLabels covers the P2 fix: reconciling an
+// issue's row and its labels atomically under one timestamp guard. A strictly
+// older event must not replace (and so must not delete) a fresher label set, even
+// though a bare UpsertIssue would report applied=false only after the fact.
+func TestUpsertIssueWithLabelsStaleKeepsLabels(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	newer := mustTime(t, "2026-07-02T12:00:00Z")
+	older := mustTime(t, "2026-07-02T09:00:00Z")
+
+	// A fresh event set the row and labels.
+	applied, err := s.UpsertIssueWithLabels(ctx, Issue{
+		Repo: "o/r", Number: 1, Title: "NEW", State: "closed", LastSeenAt: newer, Source: SourceWebhook,
+	}, []string{"keep"})
+	if err != nil || !applied {
+		t.Fatalf("seed applied=%v err=%v", applied, err)
+	}
+
+	// A strictly older event arrives: its upsert is rejected and, crucially, it does
+	// NOT run the label replace — so "keep" survives.
+	applied, err = s.UpsertIssueWithLabels(ctx, Issue{
+		Repo: "o/r", Number: 1, Title: "OLD", State: "open", LastSeenAt: older, Source: SourceWebhook,
+	}, []string{"stale-label"})
+	if err != nil {
+		t.Fatalf("stale upsert err=%v", err)
+	}
+	if applied {
+		t.Fatalf("stale event reported applied=true")
+	}
+	row, _, _ := s.GetIssue(ctx, "o/r", 1)
+	if row.Title != "NEW" || row.State != "closed" {
+		t.Fatalf("stale event regressed row: %+v", row)
+	}
+	labels, _ := s.Labels(ctx, "o/r", SubjectIssue, 1)
+	if len(labels) != 1 || labels[0] != "keep" {
+		t.Fatalf("stale event regressed labels: %v", labels)
+	}
+}
+
+// TestUpsertIssueWithLabelsAppliedReplaces confirms that when the row DOES move
+// forward, its labels are reconciled to the new set in the same transaction.
+func TestUpsertIssueWithLabelsAppliedReplaces(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	t0 := mustTime(t, "2026-07-02T09:00:00Z")
+	t1 := mustTime(t, "2026-07-02T12:00:00Z")
+
+	if _, err := s.UpsertIssueWithLabels(ctx, Issue{
+		Repo: "o/r", Number: 1, Title: "v0", State: "open", LastSeenAt: t0, Source: SourceWebhook,
+	}, []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.UpsertIssueWithLabels(ctx, Issue{
+		Repo: "o/r", Number: 1, Title: "v1", State: "open", LastSeenAt: t1, Source: SourceWebhook,
+	}, []string{"b", "c"})
+	if err != nil || !applied {
+		t.Fatalf("newer applied=%v err=%v", applied, err)
+	}
+	labels, _ := s.Labels(ctx, "o/r", SubjectIssue, 1)
+	if !equalStrings(labels, []string{"b", "c"}) {
+		t.Fatalf("labels after applied upsert = %v, want [b c]", labels)
+	}
+}
+
+// TestUpsertPullRequestWithLabels confirms the PR variant reconciles row + labels
+// atomically the same way.
+func TestUpsertPullRequestWithLabels(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+
+	t0 := mustTime(t, "2026-07-02T09:00:00Z")
+	t1 := mustTime(t, "2026-07-02T12:00:00Z")
+
+	if _, err := s.UpsertPullRequestWithLabels(ctx, PullRequest{
+		Repo: "o/r", Number: 5, Title: "pr", State: "open", LastSeenAt: t1, Source: SourceWebhook,
+	}, []string{"ready"}); err != nil {
+		t.Fatal(err)
+	}
+	// Older event: rejected, labels preserved.
+	applied, err := s.UpsertPullRequestWithLabels(ctx, PullRequest{
+		Repo: "o/r", Number: 5, Title: "pr-old", State: "closed", LastSeenAt: t0, Source: SourceWebhook,
+	}, []string{"stale"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatalf("older PR event reported applied=true")
+	}
+	labels, _ := s.Labels(ctx, "o/r", SubjectPullRequest, 5)
+	if !equalStrings(labels, []string{"ready"}) {
+		t.Fatalf("older PR event regressed labels: %v", labels)
+	}
+}

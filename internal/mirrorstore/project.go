@@ -59,6 +59,12 @@ type labeled struct {
 	Name string `json:"name"`
 }
 
+// isDeleteAction reports whether a webhook's action field marks a deletion, so
+// the projection removes the mirror row instead of upserting it.
+func isDeleteAction(action string) bool {
+	return strings.EqualFold(strings.TrimSpace(action), "deleted")
+}
+
 func labelNames(ls []labeled) []string {
 	out := make([]string, 0, len(ls))
 	for _, l := range ls {
@@ -87,7 +93,11 @@ func (s *Store) projectIssue(ctx context.Context, payload []byte, receivedAt tim
 	}
 	repo := strings.TrimSpace(p.Repository.FullName)
 	ts := pickTime(receivedAt, p.Issue.UpdatedAt, p.Issue.CreatedAt)
-	applied, err := s.UpsertIssue(ctx, Issue{
+	// The issue row and its label set are reconciled atomically: the labels are
+	// replaced only when the guarded upsert applied, and inside the same
+	// transaction, so a late-arriving old event can neither clobber a fresher label
+	// set nor race a concurrent newer delivery between the row and its labels.
+	_, err := s.UpsertIssueWithLabels(ctx, Issue{
 		Repo:       repo,
 		Number:     p.Issue.Number,
 		Title:      p.Issue.Title,
@@ -95,16 +105,8 @@ func (s *Store) projectIssue(ctx context.Context, payload []byte, receivedAt tim
 		Body:       p.Issue.Body,
 		LastSeenAt: ts,
 		Source:     SourceWebhook,
-	})
-	if err != nil {
-		return err
-	}
-	// Only reconcile the label set when this event was not stale — otherwise a
-	// late-arriving old event would clobber a fresher label set.
-	if applied {
-		return s.ReplaceLabels(ctx, repo, SubjectIssue, p.Issue.Number, labelNames(p.Issue.Labels), ts, SourceWebhook)
-	}
-	return nil
+	}, labelNames(p.Issue.Labels))
+	return err
 }
 
 func (s *Store) projectPullRequest(ctx context.Context, payload []byte, receivedAt time.Time) error {
@@ -132,7 +134,7 @@ func (s *Store) projectPullRequest(ctx context.Context, payload []byte, received
 	}
 	repo := strings.TrimSpace(p.Repository.FullName)
 	ts := pickTime(receivedAt, p.PullRequest.UpdatedAt, p.PullRequest.CreatedAt)
-	applied, err := s.UpsertPullRequest(ctx, PullRequest{
+	_, err := s.UpsertPullRequestWithLabels(ctx, PullRequest{
 		Repo:       repo,
 		Number:     p.PullRequest.Number,
 		Title:      p.PullRequest.Title,
@@ -143,20 +145,15 @@ func (s *Store) projectPullRequest(ctx context.Context, payload []byte, received
 		BaseRef:    strings.TrimSpace(p.PullRequest.Base.Ref),
 		LastSeenAt: ts,
 		Source:     SourceWebhook,
-	})
-	if err != nil {
-		return err
-	}
-	if applied {
-		return s.ReplaceLabels(ctx, repo, SubjectPullRequest, p.PullRequest.Number, labelNames(p.PullRequest.Labels), ts, SourceWebhook)
-	}
-	return nil
+	}, labelNames(p.PullRequest.Labels))
+	return err
 }
 
 func (s *Store) projectIssueComment(ctx context.Context, payload []byte, receivedAt time.Time) error {
 	var p struct {
 		repoEnvelope
-		Issue struct {
+		Action string `json:"action"`
+		Issue  struct {
 			Number      int              `json:"number"`
 			PullRequest *json.RawMessage `json:"pull_request"`
 		} `json:"issue"`
@@ -164,6 +161,13 @@ func (s *Store) projectIssueComment(ctx context.Context, payload []byte, receive
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return err
+	}
+	// A "deleted" delivery means the comment is gone from GitHub; remove the mirror
+	// row so a reader (and staleness diagnostics) does not keep seeing a comment
+	// that no longer exists. Upserting it here would leave the read model diverging
+	// from the direct API snapshot.
+	if isDeleteAction(p.Action) {
+		return s.DeleteComment(ctx, strings.TrimSpace(p.Repository.FullName), p.Comment.ID)
 	}
 	// GitHub delivers comments on a PR as issue_comment too; the issue object then
 	// carries a pull_request field. Record the correct subject type so a reader can
@@ -189,6 +193,7 @@ func (s *Store) projectIssueComment(ctx context.Context, payload []byte, receive
 func (s *Store) projectReviewComment(ctx context.Context, payload []byte, receivedAt time.Time) error {
 	var p struct {
 		repoEnvelope
+		Action      string `json:"action"`
 		PullRequest struct {
 			Number int `json:"number"`
 		} `json:"pull_request"`
@@ -196,6 +201,11 @@ func (s *Store) projectReviewComment(ctx context.Context, payload []byte, receiv
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return err
+	}
+	// A deleted review comment is removed from the mirror for the same reason as a
+	// deleted issue comment: the read model must match the direct API snapshot.
+	if isDeleteAction(p.Action) {
+		return s.DeleteComment(ctx, strings.TrimSpace(p.Repository.FullName), p.Comment.ID)
 	}
 	ts := pickTime(receivedAt, p.Comment.UpdatedAt, p.Comment.CreatedAt)
 	_, err := s.UpsertComment(ctx, Comment{

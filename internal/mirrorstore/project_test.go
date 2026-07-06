@@ -200,6 +200,81 @@ func TestProjectReviewAndComments(t *testing.T) {
 	}
 }
 
+// TestProjectIssueCommentDelete covers the P2 fix: a "deleted" issue_comment
+// removes the mirror row instead of leaving a comment that no longer exists on
+// GitHub visible (and fresh for staleness diagnostics).
+func TestProjectIssueCommentDelete(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	created := []byte(`{
+		"action": "created",
+		"issue": {"number": 42},
+		"comment": {"id": 111, "body": "hi", "user": {"login": "u"},
+			"updated_at": "2026-07-02T11:00:00Z"},
+		"repository": {"full_name": "o/r"}
+	}`)
+	if err := s.ProjectWebhook(ctx, "issue_comment", created, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetComment(ctx, "o/r", 111); !ok {
+		t.Fatalf("comment not stored on create")
+	}
+
+	deleted := []byte(`{
+		"action": "deleted",
+		"issue": {"number": 42},
+		"comment": {"id": 111, "body": "hi", "user": {"login": "u"},
+			"updated_at": "2026-07-02T11:05:00Z"},
+		"repository": {"full_name": "o/r"}
+	}`)
+	if err := s.ProjectWebhook(ctx, "issue_comment", deleted, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetComment(ctx, "o/r", 111); ok {
+		t.Fatalf("deleted comment still present in mirror")
+	}
+	// Idempotent: a duplicate delete is a no-op, not an error.
+	if err := s.ProjectWebhook(ctx, "issue_comment", deleted, time.Time{}); err != nil {
+		t.Fatalf("duplicate delete errored: %v", err)
+	}
+}
+
+// TestProjectReviewCommentDelete confirms the same removal for a deleted PR review
+// comment.
+func TestProjectReviewCommentDelete(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	created := []byte(`{
+		"action": "created",
+		"pull_request": {"number": 828},
+		"comment": {"id": 222, "body": "nit", "user": {"login": "rev"},
+			"updated_at": "2026-07-02T11:00:00Z"},
+		"repository": {"full_name": "o/r"}
+	}`)
+	if err := s.ProjectWebhook(ctx, "pull_request_review_comment", created, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetComment(ctx, "o/r", 222); !ok {
+		t.Fatalf("review comment not stored on create")
+	}
+
+	deleted := []byte(`{
+		"action": "deleted",
+		"pull_request": {"number": 828},
+		"comment": {"id": 222, "body": "nit", "user": {"login": "rev"},
+			"updated_at": "2026-07-02T11:05:00Z"},
+		"repository": {"full_name": "o/r"}
+	}`)
+	if err := s.ProjectWebhook(ctx, "pull_request_review_comment", deleted, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.GetComment(ctx, "o/r", 222); ok {
+		t.Fatalf("deleted review comment still present in mirror")
+	}
+}
+
 func TestProjectProjectItem(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

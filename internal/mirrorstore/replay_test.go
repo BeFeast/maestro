@@ -162,6 +162,7 @@ func TestReplayIssueMatchesAPIHydration(t *testing.T) {
 		Number: 824,
 		Title:  "Webhook ingestion into the unified SQLite store",
 		Body:   "Land signed webhook deliveries durably.",
+		State:  "open",
 		Labels: []struct {
 			Name string `json:"name"`
 		}{{Name: "maestro-ready"}, {Name: "phase-b"}},

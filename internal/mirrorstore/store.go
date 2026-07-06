@@ -313,10 +313,21 @@ type ProjectItem struct {
 // for an issue) gate that work on the returned applied flag so a stale parent
 // event does not clobber a fresher child set.
 
+// execer is the subset of *sql.DB / *sql.Tx the guarded upserts need, so the same
+// upsert body can run either standalone (against the pool) or inside a
+// transaction that also reconciles a dependent set (labels).
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // UpsertIssue writes or refreshes an issue row, guarded by last_seen_at. Returns
 // applied=false when a strictly-older event was rejected.
 func (s *Store) UpsertIssue(ctx context.Context, r Issue) (applied bool, err error) {
-	res, err := s.db.ExecContext(ctx, `
+	return upsertIssue(ctx, s.db, r)
+}
+
+func upsertIssue(ctx context.Context, ex execer, r Issue) (bool, error) {
+	res, err := ex.ExecContext(ctx, `
 INSERT INTO mirror_issues (repo, number, title, state, body, last_seen_at, source)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(repo, number) DO UPDATE SET
@@ -332,7 +343,11 @@ WHERE excluded.last_seen_at >= mirror_issues.last_seen_at`,
 
 // UpsertPullRequest writes or refreshes a PR row, guarded by last_seen_at.
 func (s *Store) UpsertPullRequest(ctx context.Context, r PullRequest) (applied bool, err error) {
-	res, err := s.db.ExecContext(ctx, `
+	return upsertPullRequest(ctx, s.db, r)
+}
+
+func upsertPullRequest(ctx context.Context, ex execer, r PullRequest) (bool, error) {
+	res, err := ex.ExecContext(ctx, `
 INSERT INTO mirror_pull_requests (repo, number, title, state, draft, merged, head_sha, base_ref, last_seen_at, source)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(repo, number) DO UPDATE SET
@@ -348,6 +363,49 @@ WHERE excluded.last_seen_at >= mirror_pull_requests.last_seen_at`,
 		r.Repo, r.Number, r.Title, r.State, boolToInt(r.Draft), boolToInt(r.Merged),
 		r.HeadSHA, r.BaseRef, formatTS(r.LastSeenAt), r.Source)
 	return rowsApplied(res, err)
+}
+
+// UpsertIssueWithLabels writes the issue row and, only when that write applied
+// (i.e. the event was not stale), reconciles the full label set — both inside ONE
+// transaction. The shared handle is single-connection, so the transaction holds it
+// for the whole logical update; a concurrent newer delivery cannot interleave its
+// own upsert+labels between this upsert and its label replace and then have this
+// (older) goroutine delete the fresher labels. The label set is thus reconciled
+// under the SAME timestamp guard as the parent row, closing the race a separate
+// UpsertIssue-then-ReplaceLabels sequence left open (#825 AC 2).
+func (s *Store) UpsertIssueWithLabels(ctx context.Context, r Issue, labels []string) (applied bool, err error) {
+	return s.upsertWithLabels(ctx, SubjectIssue, r.Repo, r.Number, r.LastSeenAt, r.Source, labels,
+		func(ex execer) (bool, error) { return upsertIssue(ctx, ex, r) })
+}
+
+// UpsertPullRequestWithLabels is UpsertIssueWithLabels for a pull request: the PR
+// row and its labels are reconciled atomically under one timestamp guard.
+func (s *Store) UpsertPullRequestWithLabels(ctx context.Context, r PullRequest, labels []string) (applied bool, err error) {
+	return s.upsertWithLabels(ctx, SubjectPullRequest, r.Repo, r.Number, r.LastSeenAt, r.Source, labels,
+		func(ex execer) (bool, error) { return upsertPullRequest(ctx, ex, r) })
+}
+
+// upsertWithLabels runs upsert inside a transaction and, when it applied, replaces
+// the subject's labels in the same transaction so both share one timestamp guard.
+func (s *Store) upsertWithLabels(ctx context.Context, subjectType, repo string, subjectNumber int, ts time.Time, source string, labels []string, upsert func(execer) (bool, error)) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	applied, err := upsert(tx)
+	if err != nil {
+		return false, err
+	}
+	if applied {
+		if err := replaceLabelsTx(ctx, tx, repo, subjectType, subjectNumber, labels, ts, source); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return applied, nil
 }
 
 // UpsertComment writes or refreshes a comment row, guarded by last_seen_at.
@@ -366,6 +424,18 @@ WHERE excluded.last_seen_at >= mirror_comments.last_seen_at`,
 		r.Repo, r.CommentID, r.SubjectType, r.SubjectNumber, r.Author, r.Body,
 		formatTS(r.LastSeenAt), r.Source)
 	return rowsApplied(res, err)
+}
+
+// DeleteComment removes the mirror comment row for (repo, commentID). It is called
+// when a deletion webhook arrives (issue_comment or pull_request_review_comment
+// with action "deleted") so the read model stops exposing — and stops staleness
+// diagnostics from tracking — a comment that no longer exists on GitHub. A comment
+// id is never reused, so a straight delete keeps the mirror matching the direct
+// API snapshot. Idempotent: deleting an absent row is a no-op.
+func (s *Store) DeleteComment(ctx context.Context, repo string, commentID int64) error {
+	_, err := s.db.ExecContext(ctx, `
+DELETE FROM mirror_comments WHERE repo = ? AND comment_id = ?`, repo, commentID)
+	return err
 }
 
 // UpsertReview writes or refreshes a review row, guarded by last_seen_at.
@@ -434,6 +504,16 @@ func (s *Store) ReplaceLabels(ctx context.Context, repo, subjectType string, sub
 		return err
 	}
 	defer tx.Rollback()
+	if err := replaceLabelsTx(ctx, tx, repo, subjectType, subjectNumber, names, ts, source); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// replaceLabelsTx is the transaction body of ReplaceLabels, factored out so the
+// same delete-then-insert can run inside a caller's transaction (upsertWithLabels)
+// and share that transaction's timestamp guard rather than racing it.
+func replaceLabelsTx(ctx context.Context, tx *sql.Tx, repo, subjectType string, subjectNumber int, names []string, ts time.Time, source string) error {
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM mirror_labels WHERE repo = ? AND subject_type = ? AND subject_number = ?`,
 		repo, subjectType, subjectNumber); err != nil {
@@ -451,7 +531,7 @@ VALUES (?, ?, ?, ?, ?, ?)`, repo, subjectType, subjectNumber, name, stamp, sourc
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // ---- Reads -----------------------------------------------------------------

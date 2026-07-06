@@ -3,6 +3,7 @@ package mirrorstore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/github"
@@ -81,11 +82,8 @@ func (h *Hydrator) Issue(ctx context.Context, number int) (Issue, error) {
 		LastSeenAt: now,
 		Source:     SourceAPI,
 	}
-	if _, err := h.store.UpsertIssue(ctx, row); err != nil {
+	if _, err := h.store.UpsertIssueWithLabels(ctx, row, issueLabelNames(gh)); err != nil {
 		return Issue{}, fmt.Errorf("store hydrated issue %d: %w", number, err)
-	}
-	if err := h.store.ReplaceLabels(ctx, h.repo, SubjectIssue, gh.Number, issueLabelNames(gh), now, SourceAPI); err != nil {
-		return Issue{}, fmt.Errorf("store hydrated issue %d labels: %w", number, err)
 	}
 	// Re-read so the returned row reflects exactly what a subsequent local read
 	// would see (e.g. if a fresher webhook row was already present, the guarded
@@ -97,13 +95,22 @@ func (h *Hydrator) Issue(ctx context.Context, number int) (Issue, error) {
 	return stored, nil
 }
 
-// issueStateFromGitHub reports the issue state. github.Issue does not carry an
-// explicit state field (the REST fetch drops it), so a hydrated issue is recorded
-// as "open" — the mirror only hydrates issues a reader is actively working, which
-// are open by construction. A later close arrives as an "issues"/"closed" webhook
-// and updates the row.
-func issueStateFromGitHub(github.Issue) string {
-	return "open"
+// issueStateFromGitHub reports the mirror state for a hydrated issue, preserving
+// the REST payload's own state ("open"/"closed") so hydrating an already-closed
+// issue is not silently reopened. If it were forced to "open", a subsequent
+// "issues"/"closed" webhook whose issue.updated_at predates the hydration time
+// would be rejected as stale and the mirror could stay open indefinitely (P1).
+//
+// GitHub reports lowercase state; the webhook projection stores it verbatim, so
+// hydration lower-cases to match and the two write paths converge. An empty state
+// (a client that does not populate it) falls back to "open": the mirror only
+// hydrates issues a reader is actively working, which are open by construction.
+func issueStateFromGitHub(gh github.Issue) string {
+	state := strings.ToLower(strings.TrimSpace(gh.State))
+	if state == "" {
+		return "open"
+	}
+	return state
 }
 
 func issueLabelNames(gh github.Issue) []string {
