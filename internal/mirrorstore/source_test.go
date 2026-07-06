@@ -187,6 +187,79 @@ func TestStaleRowFallsBackToAPI(t *testing.T) {
 	}
 }
 
+// TestWarmListWithStaleMemberFallsBack: a list whose NEWEST row is fresh (so the
+// mirror is warm) but which also contains an individually-stale open row must
+// fall back to the API for the whole list rather than serve the stale member. A
+// missed close/unlabel delivery would otherwise leak a no-longer-open issue/PR
+// into supervisor/orchestrator decisions (review comment 2).
+func TestWarmListWithStaleMemberFallsBack(t *testing.T) {
+	s := openTestStore(t)
+	now := mustTime(t, "2026-07-06T12:00:00Z")
+	stale := mustTime(t, "2026-07-01T00:00:00Z") // > 24h before now
+	// Newest row is fresh → warmth check passes; #11 is an individually-stale member.
+	seedIssue(t, s, 10, "fresh", "open", "body", now)
+	seedIssue(t, s, 11, "stale", "open", "body", stale)
+	seedPR(t, s, 20, "fresh pr", "open", false, false, "feat/a", "b", now)
+	seedPR(t, s, 21, "stale pr", "open", false, false, "feat/b", "b", stale)
+
+	api := &fakeAPI{
+		issues: []github.Issue{{Number: 99, Title: "from api"}},
+		prs:    []github.PR{{Number: 98, HeadRefName: "from-api"}},
+	}
+	src := newTestSource(t, s, api, now, 24*time.Hour, nil)
+
+	issues, err := src.ListOpenIssues(nil)
+	if err != nil {
+		t.Fatalf("ListOpenIssues: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Number != 99 {
+		t.Fatalf("stale list member should force API fallback, got %+v", issues)
+	}
+	prs, err := src.ListOpenPRs()
+	if err != nil {
+		t.Fatalf("ListOpenPRs: %v", err)
+	}
+	if len(prs) != 1 || prs[0].Number != 98 {
+		t.Fatalf("stale PR list member should force API fallback, got %+v", prs)
+	}
+	if api.listIssuesCalls != 1 || api.listPRsCalls != 1 {
+		t.Fatalf("expected one API fallback each: %+v", api)
+	}
+	if got := ReadStatsSnapshot().MirrorHits; got != 0 {
+		t.Fatalf("MirrorHits = %d; want 0 (both lists fell back)", got)
+	}
+}
+
+// TestListOpenPRsMissingHeadRefFallsBack: after an in-place upgrade the migration
+// adds head_ref with an empty default on already-open PR rows, which keep their
+// (still fresh) last_seen_at. Serving such a row would hand the orchestrator an
+// empty HeadRefName and break branch matching, so the source must fall back to the
+// API for the list even though the row is fresh (review comment 1).
+func TestListOpenPRsMissingHeadRefFallsBack(t *testing.T) {
+	s := openTestStore(t)
+	now := mustTime(t, "2026-07-06T12:00:00Z")
+	// Fresh row, but empty head_ref — exactly the shape a pre-#826 row has after the
+	// ALTER TABLE adds the column with its empty default.
+	seedPR(t, s, 20, "migrated pr", "open", false, false, "", "body", now)
+
+	api := &fakeAPI{prs: []github.PR{{Number: 20, HeadRefName: "feat/real"}}}
+	src := newTestSource(t, s, api, now, 24*time.Hour, nil)
+
+	prs, err := src.ListOpenPRs()
+	if err != nil {
+		t.Fatalf("ListOpenPRs: %v", err)
+	}
+	if len(prs) != 1 || prs[0].HeadRefName != "feat/real" {
+		t.Fatalf("empty-head_ref row should force API fallback, got %+v", prs)
+	}
+	if api.listPRsCalls != 1 {
+		t.Fatalf("expected 1 API fallback, got %d", api.listPRsCalls)
+	}
+	if got := ReadStatsSnapshot().MirrorHits; got != 0 {
+		t.Fatalf("MirrorHits = %d; want 0 (missing head_ref fell back)", got)
+	}
+}
+
 // TestGetIssueHydrates covers the hydration path: a miss fetches from the API,
 // stores the row, and the NEXT GetIssue is served locally (zero further API).
 func TestGetIssueHydrates(t *testing.T) {

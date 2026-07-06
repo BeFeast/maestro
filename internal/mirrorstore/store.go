@@ -238,11 +238,15 @@ func (s *Store) Init(ctx context.Context) error {
 // migrate adds columns introduced after the original schema to a pre-existing
 // mirror. CREATE TABLE IF NOT EXISTS never alters an existing table, so a fleet
 // that initialised the mirror before #826 needs mirror_pull_requests.head_ref
-// and .body backfilled — the mirror-first source (source.go) serves ListOpenPRs
-// from these columns, so an un-migrated PR row would report an empty head branch
-// and body and break branch matching / draft-marker detection. Each add is
-// idempotent: it is skipped when the column already exists, so re-running Init
-// on an already-migrated database is a no-op.
+// and .body added — the mirror-first source (source.go) serves ListOpenPRs from
+// these columns. The ALTER only adds the columns with an empty default; it does
+// NOT backfill the head branch of PRs already mirrored before the upgrade (that
+// value is not recoverable from the row). Those rows would report an empty head
+// branch and break branch matching, so Source.ListOpenPRs treats an open PR row
+// with an empty head_ref as untrustworthy and falls back to the API for the list
+// until a webhook repopulates the branch. Each add is idempotent: it is skipped
+// when the column already exists, so re-running Init on an already-migrated
+// database is a no-op.
 func (s *Store) migrate(ctx context.Context) error {
 	return s.addColumns(ctx, "mirror_pull_requests", []columnDef{
 		{name: "head_ref", decl: "TEXT NOT NULL DEFAULT ''"},

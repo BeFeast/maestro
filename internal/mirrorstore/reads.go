@@ -19,6 +19,14 @@ import (
 // NewestPullRequestAt against a freshness horizon) and falls back to the API
 // when the mirror is cold, so an unpopulated mirror degrades to today's
 // API-direct behavior rather than silently under-reporting.
+//
+// Warmth is necessary but not sufficient: the newest row being fresh proves
+// webhooks are flowing for the repo, but an individual open row can still be
+// stale (its close/unlabel delivery was missed) or, for a PR mirrored before the
+// head_ref column existed, be missing its head branch. The source therefore also
+// inspects each returned row and falls back for the whole list when any member is
+// untrustworthy — the rows here carry last_seen_at (and PRs carry head_ref) so it
+// can. See Source.ListOpenIssues / Source.ListOpenPRs.
 
 // ListOpenIssues returns every mirrored issue for repo whose state is "open",
 // each with its mirrored label set attached, ordered by issue number. When

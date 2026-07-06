@@ -128,6 +128,17 @@ func (s *Source) ListOpenIssues(labels []string) ([]github.Issue, error) {
 	if err != nil {
 		return s.apiListOpenIssues(labels)
 	}
+	// The newest-row warmth check only proves webhooks are flowing for the repo as
+	// a whole; it does not vouch for every individual row. A single open row older
+	// than the horizon may have had its close/unlabel delivery missed, so it could
+	// be a no-longer-open (or mis-labelled) issue the mirror is still exposing —
+	// which would leak into supervisor/orchestrator decisions. Reject the whole
+	// list to the authoritative API if any returned row is itself stale (#826).
+	for i := range rows {
+		if !s.fresh(rows[i].LastSeenAt) {
+			return s.apiListOpenIssues(labels)
+		}
+	}
 	noteMirrorHit()
 	out := make([]github.Issue, 0, len(rows))
 	for _, r := range rows {
@@ -148,6 +159,20 @@ func (s *Source) ListOpenPRs() ([]github.PR, error) {
 	rows, err := s.store.ListOpenPullRequests(s.ctx(), s.repo)
 	if err != nil {
 		return s.apiListOpenPRs()
+	}
+	// As in ListOpenIssues, reject the list to the API if any returned open PR is
+	// itself stale (a missed close delivery could keep a merged/closed PR "open").
+	// ALSO reject it if any row is missing its head branch: a mirror upgraded before
+	// the head_ref column existed backfills head_ref = '' on every already-open PR
+	// (store.go migrate), and those rows keep their old — possibly still fresh —
+	// last_seen_at, so the staleness check alone would not catch them. The
+	// supervisor/orchestrator match running sessions to open PRs BY HEAD BRANCH, so
+	// serving a PR with an empty HeadRefName would mis-match or duplicate work; fall
+	// back to GitHub until a webhook repopulates the branch (#826).
+	for i := range rows {
+		if !s.fresh(rows[i].LastSeenAt) || strings.TrimSpace(rows[i].HeadRef) == "" {
+			return s.apiListOpenPRs()
+		}
 	}
 	noteMirrorHit()
 	out := make([]github.PR, 0, len(rows))

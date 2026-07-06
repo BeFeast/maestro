@@ -43,6 +43,22 @@ mirrored row for that entity must be within the freshness horizon (webhooks are
 flowing). A cold or lagging mirror falls back to the API, so an unpopulated mirror
 degrades to today's API-direct correctness rather than silently under-reporting.
 
+Warmth of the *newest* row is necessary but not sufficient, so the source also
+inspects every row it is about to serve and falls back to the API for the **whole
+list** when any member is untrustworthy:
+
+- **An individually-stale open row.** The newest row can be fresh while another
+  open row is older than the horizon — e.g. its `closed`/`unlabeled` delivery was
+  missed. Serving it would leak a no-longer-open (or mis-labelled) issue/PR into a
+  decision, so the list falls back.
+- **A PR row missing its head branch.** An existing mirror upgraded in place gets
+  `head_ref` added with an empty default (the `ALTER TABLE` cannot backfill the
+  branch of a PR mirrored before the column existed). Those rows keep their old,
+  possibly-still-fresh `last_seen_at`, so the staleness check alone would not catch
+  them. Because the supervisor/orchestrator match sessions to open PRs **by head
+  branch**, an empty `head_ref` would mis-match or duplicate work — so `ListOpenPRs`
+  falls back until a webhook repopulates the branch.
+
 ## Enabling / the escape hatch
 
 Per project, in config (or the config store):
@@ -103,10 +119,17 @@ the source (mirror-first off, or mirror empty).
 
 - **List completeness** depends on webhooks. A PR/issue that exists on GitHub but
   never produced a delivery is not in the mirror; warmth catches a *lagging*
-  mirror (stale newest row) but not a *missed single delivery*. Mitigations: the
-  soak period, the escape hatch, and that maestro itself creates the PRs it gates.
+  mirror (stale newest row), and the per-row guard above catches a *missed close/
+  unlabel delivery* on a row that IS mirrored (it goes stale and forces a
+  fallback) — but neither catches a brand-new entity the mirror has never seen a
+  delivery for. Mitigations: the soak period, the escape hatch, and that maestro
+  itself creates the PRs it gates.
 - **Merge-gating stays on the API** by design (see above), so a warm-mirror cycle
   still issues the low-frequency CI/mergeable/review reads for PRs under active
   gating. The dominant per-cycle list + state reads are what move to the mirror.
 - `head_ref` and `body` were added to `mirror_pull_requests` in phase D; an
   existing mirror is migrated in place on daemon start (idempotent `ALTER TABLE`).
+  The migration adds the columns with an empty default and does not backfill the
+  head branch of already-open PRs, so `ListOpenPRs` falls back to the API for any
+  list containing such a row until a webhook repopulates its `head_ref` (see the
+  per-row guard above).
