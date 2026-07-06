@@ -63,3 +63,32 @@ func TestNewReadSourceServesWarmMirror(t *testing.T) {
 		t.Fatalf("digest line missing local-serve count: %q", line)
 	}
 }
+
+// TestReconcileIntervalReadsConfig: the reconcile cadence comes from the flow's
+// live config, defaulting when it is momentarily unavailable (#827).
+func TestReconcileIntervalReadsConfig(t *testing.T) {
+	if got := reconcileInterval(func() *config.Config { return nil }); got != config.DefaultMirrorReconcileInterval {
+		t.Fatalf("nil config cadence = %s, want default %s", got, config.DefaultMirrorReconcileInterval)
+	}
+	cfg := &config.Config{GitHubMirror: config.GitHubMirrorConfig{ReconcileSeconds: 120}}
+	if got := reconcileInterval(func() *config.Config { return cfg }); got != 2*time.Minute {
+		t.Fatalf("configured cadence = %s, want 2m", got)
+	}
+}
+
+// TestRunMirrorReconcileNoopWithoutMirror: the loop returns immediately when the
+// daemon has no open mirror, so a flow without webhook ingestion spawns no
+// reconcile work.
+func TestRunMirrorReconcileNoopWithoutMirror(t *testing.T) {
+	d := &Daemon{}
+	done := make(chan struct{})
+	go func() {
+		d.runMirrorReconcile(context.Background(), "flow", "o/r", func() *config.Config { return nil })
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runMirrorReconcile should return immediately without a mirror")
+	}
+}

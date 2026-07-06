@@ -127,6 +127,20 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval)
 		}()
 	}
+	// Mirror reconciliation loop (#827, phase E): a low-frequency GitHub snapshot
+	// that repairs mirror drift a missed webhook left behind, keeping the read
+	// model correct without operator action. Only started when the daemon has an
+	// open mirror (webhook ingestion configured) — without inbound deliveries there
+	// is nothing to reconcile. Tracked in the flow WaitGroup so stopFlow drains it,
+	// and reads its cadence live from the holder (a config-store edit retimes it).
+	if d.mirror != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer recoverFlow(flow, "mirror-reconcile")
+			d.runMirrorReconcile(fctx, flow.name, cfg.Repo, flow.holder.Load)
+		}()
+	}
 	go func() {
 		wg.Wait()
 		close(flow.done)

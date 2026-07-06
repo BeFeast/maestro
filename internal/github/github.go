@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/url"
@@ -435,6 +436,25 @@ func ghConditionalEligible(endpoint string, args []string) bool {
 	return true
 }
 
+// etagCacheKey namespaces the conditional cache by whether the call paginates.
+// A --paginate reconcile read and a plain single-page read can target the SAME
+// endpoint string — ListAllOpenIssues and ListOpenIssues both hit
+// `.../issues?state=open&per_page=100` — but their cached bodies are NOT
+// interchangeable. A non-paginated read caches only page one; replaying that
+// page-one ETag for a --paginate read could earn a 304 whose cached body is
+// just those first 100 rows, silently truncating the authoritative open set the
+// reconciler closes rows against (a still-open issue past #100 would look
+// missing and be stamped closed — #827 review). Separate namespaces guarantee a
+// paginated read only ever revalidates against a body a paginated read itself
+// stored, and paginated bodies are cached only when paginatedCacheable proved
+// one page holds the whole collection.
+func etagCacheKey(endpoint string, paginated bool) string {
+	if paginated {
+		return "\x00paginate\x00" + endpoint
+	}
+	return endpoint
+}
+
 // ghHTTPStatusLine matches the status line gh prints at the start of each
 // header block under --include, anchored at line start. It cannot collide with
 // response content: GitHub's JSON escapes control characters inside strings,
@@ -516,8 +536,10 @@ func headerValue(headers []byte, name string) string {
 // conditional shape, e.g. a paginated response embedding a non-2xx page) the
 // caller must drop the cache entry and refetch plain. paginated marks a
 // --paginate call, whose responses are cached only when paginatedCacheable
-// proves a later 304 cannot hide pages beyond the cached one.
-func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []byte, paginated bool) (body []byte, served bool, resolved bool) {
+// proves a later 304 cannot hide pages beyond the cached one. cacheKey is the
+// namespaced storage key (see etagCacheKey); endpoint is the raw path, used
+// only to read the requested per_page.
+func resolveConditional(cacheKey, endpoint string, out []byte, runErr error, cachedBody []byte, paginated bool) (body []byte, served bool, resolved bool) {
 	resp, ok := parseGHConditionalResponse(out)
 	if !ok {
 		// No header block. Trust a successful run's output as the plain body
@@ -536,12 +558,12 @@ func resolveConditional(endpoint string, out []byte, runErr error, cachedBody []
 	}
 	if runErr == nil && resp.allOK {
 		if resp.blocks == 1 && (!paginated || paginatedCacheable(resp.body, endpointPerPage(endpoint))) {
-			etagStore(endpoint, resp.etag, resp.body)
+			etagStore(cacheKey, resp.etag, resp.body)
 		} else {
 			// A multi-page response cannot be cached: the first page's ETag
 			// does not validate the concatenated whole. A full single page is
 			// not cached either — see paginatedCacheable.
-			etagDrop(endpoint)
+			etagDrop(cacheKey)
 		}
 		return resp.body, false, true
 	}
@@ -625,11 +647,12 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 			paginated = true
 		}
 	}
+	cacheKey := etagCacheKey(endpoint, paginated)
 	cmdArgs := append([]string{"api", endpoint}, args...)
 	var cachedBody []byte
 	if conditional {
 		var cachedETag string
-		cachedETag, cachedBody = etagLookup(endpoint)
+		cachedETag, cachedBody = etagLookup(cacheKey)
 		cmdArgs = append(cmdArgs, "--include")
 		if cachedETag != "" {
 			cmdArgs = append(cmdArgs, "-H", "If-None-Match: "+cachedETag)
@@ -642,7 +665,7 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 		anomaly = false
 		out, err = ghAPIRunner(cmdArgs...)
 		if conditional {
-			body, served, resolved := resolveConditional(endpoint, out, err, cachedBody, paginated)
+			body, served, resolved := resolveConditional(cacheKey, endpoint, out, err, cachedBody, paginated)
 			if resolved {
 				noteAPIRequest(served, false)
 				return body, nil
@@ -657,7 +680,7 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 			// unconditional path.
 			anomaly = true
 			noteAPIRequest(false, false)
-			etagDrop(endpoint)
+			etagDrop(cacheKey)
 			conditional = false
 			cachedBody = nil
 			cmdArgs = append([]string{"api", endpoint}, args...)
@@ -1096,6 +1119,38 @@ func (c *Client) RateLimit() (RateLimitStatus, error) {
 	return status, nil
 }
 
+// mergePaginatedJSONArrays flattens the body of a `gh api --paginate` call over
+// an ARRAY endpoint into a single JSON array. gh does not merge array pages the
+// way it merges object endpoints that carry total_count (check-runs, search):
+// for a plain array endpoint (repos/*/issues, repos/*/pulls) it emits each page
+// as its own back-to-back `[...]` document, so a repo with more than one page of
+// results yields `[...][...]`, which a single json.Unmarshal rejects with a
+// syntax error at the second `[`. The `gh api` manual notes `--slurp` as the
+// wrapper for this, but --slurp would take the call out of the conditional
+// (ETag) path — ghConditionalEligible only allows --paginate — and cost the
+// reconciler its 304s, so instead we decode the concatenated documents as a
+// stream here and concatenate their elements. A single-page (or 304-served)
+// body is one `[...]` document and passes through as that same one array.
+//
+// #827 review: the reconciliation loop treats an issue/PR absent from this list
+// as a missed close, so a parse failure on the first multi-page reconcile would
+// strand exactly the >100-item repos this loop exists to heal.
+func mergePaginatedJSONArrays(out []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(out))
+	merged := []json.RawMessage{}
+	for {
+		var page []json.RawMessage
+		if err := dec.Decode(&page); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		merged = append(merged, page...)
+	}
+	return json.Marshal(merged)
+}
+
 func parseRESTIssues(out []byte) ([]Issue, error) {
 	var restIssues []restIssue
 	if err := json.Unmarshal(out, &restIssues); err != nil {
@@ -1432,6 +1487,62 @@ func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 	return issues, nil
 }
 
+// ListAllOpenIssues is ListOpenIssues that follows pagination: it fetches EVERY
+// page of the repo's open issues, not just the first 100. The reconciliation
+// loop (#827) needs the AUTHORITATIVE open set — it treats a mirrored-open issue
+// absent from this list as a missed close and stamps it closed, so a truncated
+// first page would wrongly close every still-open issue past #100. Ordinary
+// callers that only need a working set can stay on the cheaper single-page
+// ListOpenIssues. The read still flows through the conditional (ETag) layer, so
+// an unchanged repo whose open set fits one partial page answers 304 for free.
+func (c *Client) ListAllOpenIssues(labels []string) ([]Issue, error) {
+	if len(labels) <= 1 {
+		label := ""
+		if len(labels) == 1 {
+			label = labels[0]
+		}
+		return c.listAllOpenIssuesByLabel(label)
+	}
+
+	seen := make(map[int]struct{})
+	var result []Issue
+	for _, label := range labels {
+		issues, err := c.listAllOpenIssuesByLabel(label)
+		if err != nil {
+			return nil, err
+		}
+		for _, issue := range issues {
+			if _, ok := seen[issue.Number]; !ok {
+				seen[issue.Number] = struct{}{}
+				result = append(result, issue)
+			}
+		}
+	}
+	return result, nil
+}
+
+func (c *Client) listAllOpenIssuesByLabel(label string) ([]Issue, error) {
+	endpoint := fmt.Sprintf("repos/%s/issues?state=open&per_page=100", c.Repo)
+	if label != "" {
+		endpoint += "&labels=" + url.QueryEscape(label)
+	}
+
+	out, err := ghAPIWithArgs(endpoint, "--paginate")
+	if err != nil {
+		return nil, fmt.Errorf("list all open issues: %w", err)
+	}
+
+	merged, err := mergePaginatedJSONArrays(out)
+	if err != nil {
+		return nil, fmt.Errorf("merge paginated issues: %w", err)
+	}
+	issues, err := parseRESTIssues(merged)
+	if err != nil {
+		return nil, fmt.Errorf("parse issues: %w", err)
+	}
+	return issues, nil
+}
+
 // GetIssue fetches a single issue by number
 func (c *Client) GetIssue(number int) (Issue, error) {
 	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
@@ -1468,6 +1579,26 @@ func (c *Client) ListOpenPRs() ([]PR, error) {
 	}
 
 	prs, err := parseRESTPulls(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse prs: %w", err)
+	}
+	return prs, nil
+}
+
+// ListAllOpenPRs is ListOpenPRs that follows pagination — see ListAllOpenIssues
+// for why the reconciliation loop (#827) needs the full open set rather than
+// page one before it uses absence as a close signal.
+func (c *Client) ListAllOpenPRs() ([]PR, error) {
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo), "--paginate")
+	if err != nil {
+		return nil, fmt.Errorf("list all open PRs: %w", err)
+	}
+
+	merged, err := mergePaginatedJSONArrays(out)
+	if err != nil {
+		return nil, fmt.Errorf("merge paginated prs: %w", err)
+	}
+	prs, err := parseRESTPulls(merged)
 	if err != nil {
 		return nil, fmt.Errorf("parse prs: %w", err)
 	}

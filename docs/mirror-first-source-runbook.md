@@ -115,15 +115,25 @@ the source (mirror-first off, or mirror empty).
    `billed against core quota` drops.
 4. To roll back instantly, set `source: api` — no redeploy.
 
+## Reconciliation closes the gap (phase E)
+
+Phase E (#827) adds a low-frequency reconciliation loop that snapshots GitHub and
+repairs mirror drift a missed webhook left behind — including the brand-new-entity
+and missed-close cases the warmth/per-row guards below can only *fall back* on,
+not repair. It runs whenever the mirror is open (even with reads still API-direct),
+so the mirror stays correct and warm. See the
+[mirror reconciliation & health runbook](mirror-reconciliation-runbook.md).
+
 ## Notes / limits
 
-- **List completeness** depends on webhooks. A PR/issue that exists on GitHub but
-  never produced a delivery is not in the mirror; warmth catches a *lagging*
-  mirror (stale newest row), and the per-row guard above catches a *missed close/
-  unlabel delivery* on a row that IS mirrored (it goes stale and forces a
-  fallback) — but neither catches a brand-new entity the mirror has never seen a
-  delivery for. Mitigations: the soak period, the escape hatch, and that maestro
-  itself creates the PRs it gates.
+- **List completeness** depends on webhooks *and* the reconciliation loop. A
+  PR/issue that exists on GitHub but never produced a delivery is not in the mirror
+  until either a webhook or the next reconcile pass records it; warmth catches a
+  *lagging* mirror (stale newest row), and the per-row guard above catches a
+  *missed close/unlabel delivery* on a row that IS mirrored (it goes stale and
+  forces a fallback). The reconciliation loop (#827) repairs all three within one
+  cadence. Additional mitigations: the soak period, the escape hatch, and that
+  maestro itself creates the PRs it gates.
 - **Merge-gating stays on the API** by design (see above), so a warm-mirror cycle
   still issues the low-frequency CI/mergeable/review reads for PRs under active
   gating. The dominant per-cycle list + state reads are what move to the mirror.

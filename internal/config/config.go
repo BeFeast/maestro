@@ -362,7 +362,20 @@ const (
 type GitHubMirrorConfig struct {
 	Source       string `yaml:"source"`        // "" (=api) | "api" | "mirror-first"
 	StaleSeconds int    `yaml:"stale_seconds"` // freshness horizon override in seconds; 0 = default (24h)
+	// ReconcileSeconds is the cadence of the low-frequency reconciliation loop
+	// (#827, phase E) that snapshots GitHub and repairs mirror drift a missed
+	// webhook left behind. 0 = default (DefaultMirrorReconcileInterval). The loop
+	// only runs when the mirror is open (webhook ingestion configured); a caught-up
+	// mirror costs near-zero quota per pass because the snapshot reads answer 304.
+	ReconcileSeconds int `yaml:"reconcile_seconds"`
 }
+
+// DefaultMirrorReconcileInterval is the reconciliation cadence used when
+// github_mirror.reconcile_seconds is unset. Low by design: reconciliation is a
+// safety net over webhook ingestion, not the primary refresh path, and each pass
+// is cheap on an unchanged repo (conditional 304 reads), so a 15-minute sweep
+// keeps drift bounded without adding meaningful API load.
+const DefaultMirrorReconcileInterval = 15 * time.Minute
 
 // MirrorFirst reports whether reads should be served mirror-first. Any value
 // other than "mirror-first" (including the empty default and typos) is API — the
@@ -380,6 +393,15 @@ func (c GitHubMirrorConfig) StaleHorizon() time.Duration {
 		return 24 * time.Hour
 	}
 	return time.Duration(c.StaleSeconds) * time.Second
+}
+
+// ReconcileInterval is the cadence of the mirror reconciliation loop (#827). A
+// non-positive reconcile_seconds falls back to DefaultMirrorReconcileInterval.
+func (c GitHubMirrorConfig) ReconcileInterval() time.Duration {
+	if c.ReconcileSeconds <= 0 {
+		return DefaultMirrorReconcileInterval
+	}
+	return time.Duration(c.ReconcileSeconds) * time.Second
 }
 
 // SelfDeployConfig gates the opt-in post-merge self-deploy of the maestro
