@@ -1,0 +1,19 @@
+{
+  "action": "synchronize",
+  "number": 828,
+  "pull_request": {
+    "number": 828,
+    "state": "open",
+    "title": "GitHub App auth path with PAT fallback",
+    "merged": false,
+    "head": { "sha": "0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e" },
+    "base": { "ref": "main" }
+  },
+  "repository": {
+    "full_name": "BeFeast/maestro",
+    "name": "maestro"
+  },
+  "sender": {
+    "login": "octocat"
+  }
+}

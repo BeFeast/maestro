@@ -27,6 +27,7 @@ import (
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/statestore"
+	"github.com/befeast/maestro/internal/webhook"
 	"gopkg.in/yaml.v3"
 )
 
@@ -306,6 +307,17 @@ type FleetServer struct {
 	// construction while handlers read it concurrently.
 	projectStoreMu sync.RWMutex
 	projectStore   FleetProjectStore
+
+	// webhook is the inbound GitHub webhook ingestion endpoint (epic #811,
+	// phase B — #824). nil disables ingestion (no endpoint registered). When
+	// wired by the daemon (SetWebhookIngestor) it serves POST <webhookPath>
+	// under the fleet port, authenticated by X-Hub-Signature-256 rather than the
+	// fleet bearer token — so buildHandler routes it BEFORE the auth middleware.
+	// Guarded by webhookMu so the daemon can wire it after construction while the
+	// snapshot/read paths read it concurrently.
+	webhookMu   sync.RWMutex
+	webhook     *webhook.Ingestor
+	webhookPath string
 }
 
 // FleetProjectStore is the write side of the daemon's config store that the
@@ -624,6 +636,32 @@ func (s *FleetServer) liveProjectStore() FleetProjectStore {
 	return s.projectStore
 }
 
+// SetWebhookIngestor wires the inbound GitHub webhook ingestion endpoint (#824).
+// The daemon calls it with an ingestor over the shared maestro.db and the
+// configured path (default webhook.DefaultPath). A blank path falls back to the
+// default; a nil ingestor disables ingestion. Safe to call before Start.
+func (s *FleetServer) SetWebhookIngestor(in *webhook.Ingestor, path string) {
+	if s == nil {
+		return
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = webhook.DefaultPath
+	}
+	s.webhookMu.Lock()
+	s.webhook = in
+	s.webhookPath = path
+	s.webhookMu.Unlock()
+}
+
+// liveWebhook returns the current webhook ingestor and its path under the read
+// lock. The ingestor is nil when ingestion is not configured.
+func (s *FleetServer) liveWebhook() (*webhook.Ingestor, string) {
+	s.webhookMu.RLock()
+	defer s.webhookMu.RUnlock()
+	return s.webhook, s.webhookPath
+}
+
 // buildHandler returns the fleet mux wrapped with the auth middleware.
 // When auth.Required() is true (#616: exposed install posture), every
 // route — JSON read endpoints, the SPA HTML, static assets, mutating
@@ -647,6 +685,15 @@ func (s *FleetServer) buildHandler() http.Handler {
 	mux.Handle("/static/", web.StaticHandler())
 	mux.HandleFunc("/", s.handleFleetDashboard)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The webhook ingestion endpoint authenticates by X-Hub-Signature-256,
+		// not the fleet bearer token — GitHub cannot attach an Authorization
+		// header. Route it BEFORE the auth middleware so an exposed-posture
+		// deployment (auth enabled) does not 401 every legitimate delivery
+		// (#824). The ingestor still fails closed on a bad/missing signature.
+		if in, path := s.liveWebhook(); in != nil && r.URL.Path == path {
+			in.ServeHTTP(w, r)
+			return
+		}
 		authMiddleware(mux, s.liveAuth()).ServeHTTP(w, r)
 	})
 }
@@ -737,6 +784,52 @@ type fleetResponse struct {
 	// so the SPA can render both the hero ("today / 7d") and the
 	// per-project drill-down without recomputing pricing client-side.
 	CostObservability fleetGlobalCost `json:"cost_observability"`
+
+	// Webhooks is the inbound GitHub webhook ingestion diagnostic (#824):
+	// last delivery time, total + per-event-type counts, and the
+	// signature-failure counter. nil when ingestion is not configured.
+	Webhooks *fleetWebhookStats `json:"webhooks,omitempty"`
+}
+
+// fleetWebhookStats is the webhook ingestion observability block surfaced on the
+// fleet snapshot (#824 AC 5/10 — "diagnostics show last webhook delivery time
+// and counts"). Counts are cumulative; Accepted/ByEventType reflect the durable
+// store total (seeded across restarts), SignatureFailures/Duplicates are the
+// current process's tally.
+type fleetWebhookStats struct {
+	Enabled           bool             `json:"enabled"`
+	Path              string           `json:"path,omitempty"`
+	LastDeliveryAt    string           `json:"last_delivery_at,omitempty"`
+	LastEventType     string           `json:"last_event_type,omitempty"`
+	TotalDeliveries   int64            `json:"total_deliveries"`
+	ByEventType       map[string]int64 `json:"by_event_type,omitempty"`
+	Duplicates        int64            `json:"duplicates"`
+	SignatureFailures int64            `json:"signature_failures"`
+	BadRequests       int64            `json:"bad_requests"`
+}
+
+// webhookStatsSnapshot maps the ingestor's counters into the fleet response
+// block. Returns nil when ingestion is not configured so the field is omitted.
+func (s *FleetServer) webhookStatsSnapshot() *fleetWebhookStats {
+	in, path := s.liveWebhook()
+	if in == nil {
+		return nil
+	}
+	st := in.Stats()
+	out := &fleetWebhookStats{
+		Enabled:           true,
+		Path:              path,
+		LastEventType:     st.LastEventType,
+		TotalDeliveries:   st.Accepted,
+		ByEventType:       st.ByEventType,
+		Duplicates:        st.Duplicates,
+		SignatureFailures: st.SignatureFailures,
+		BadRequests:       st.BadRequests,
+	}
+	if !st.LastDeliveryAt.IsZero() {
+		out.LastDeliveryAt = formatFleetTime(st.LastDeliveryAt)
+	}
+	return out
 }
 
 // fleetNextAction names the single canonical operator action across the fleet.
@@ -1791,6 +1884,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.NextAction = buildFleetNextAction(resp.Projects, resp.Approvals, now)
 	resp.Verdict = buildFleetVerdict(resp, now)
 	resp.CostObservability = rollupGlobalCost(resp.Projects)
+	resp.Webhooks = s.webhookStatsSnapshot()
 	return resp
 }
 
