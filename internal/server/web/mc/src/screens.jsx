@@ -94,9 +94,8 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
             <span>backend <strong>{p.backend}</strong></span>
             {p.paused && <Pill tone="policy" noDot>paused</Pill>}
           </div>
-          <h1 className={`hb-verdict tone-${vtone}`}>
-            <em>{verdict[0]}</em>{verdict[1]}
-          </h1>
+          <h1 className={`hb-verdict tone-${vtone}`}>{verdict[0].trim()}</h1>
+          {verdict[1].trim() && <p className="hb-desc">{verdict[1].trim()}</p>}
           {p.goal ? (
             <div style={{ fontSize: 14, color: "var(--fg-2)", maxWidth: "60ch", marginTop: -4 }}>
               <strong style={{ color: "var(--fg-1)" }}>Goal:</strong> {p.goal}

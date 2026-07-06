@@ -360,7 +360,7 @@ input, textarea { font: inherit; color: inherit; }
 
 .tb-jump {
   display: inline-flex; align-items: center; gap: var(--s-2);
-  padding: 4px 6px 4px 10px;
+  padding: 6px var(--s-3);
   font-size: 12px;
   border: 1px solid var(--border-1);
   border-radius: var(--r-2);
@@ -368,10 +368,11 @@ input, textarea { font: inherit; color: inherit; }
   background: var(--bg-2);
 }
 .tb-jump:hover { border-color: var(--border-2); color: var(--fg-0); }
+.tb-jump svg { display: block; flex-shrink: 0; }
 .tb-jump > span { color: var(--fg-2); }
 .tb-jump kbd {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 10px;
   padding: 1px 5px;
   border: 1px solid var(--border-2);
   border-radius: 3px;
@@ -467,21 +468,29 @@ input, textarea { font: inherit; color: inherit; }
   font-family: var(--font-sans);
   font-size: 26px;
   line-height: 1.2;
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: -0.02em;
-  color: var(--fg-0);
   margin: 0;
   text-wrap: balance;
   max-width: 32ch;
-}
-.hb-verdict em {
-  font-style: normal;
   background: linear-gradient(120deg, var(--accent), var(--accent-2));
   -webkit-background-clip: text; background-clip: text;
   color: transparent;
 }
-.hb-verdict.tone-watch em { background: var(--watch); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.hb-verdict.tone-stuck em { background: var(--stuck); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hb-verdict.tone-watch { background: var(--watch); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hb-verdict.tone-stuck { background: var(--stuck); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hb-verdict.tone-idle { background: none; -webkit-text-fill-color: initial; color: var(--fg-0); }
+
+.hb-desc {
+  margin: 6px 0 0;
+  padding-left: var(--s-3);
+  border-left: 2px solid var(--border-2);
+  font-size: 13.5px;
+  font-style: italic;
+  color: var(--fg-2);
+  max-width: 46ch;
+  line-height: 1.5;
+}
 
 .hb-meta {
   display: flex; flex-wrap: wrap; gap: var(--s-5);

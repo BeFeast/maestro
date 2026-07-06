@@ -85,9 +85,8 @@ export function FleetScreen({ navigate }) {
             <span style={{ color: "var(--fg-4)" }}>·</span>
             <span>next in <strong>{formatCountdown(countdownSec)}</strong></span>
           </div>
-          <h1 className={`hb-verdict tone-${tone}`}>
-            <em>{fleet.verdict[0]}</em>{fleet.verdict[1]}
-          </h1>
+          <h1 className={`hb-verdict tone-${tone}`}>{fleet.verdict[0].trim()}</h1>
+          {fleet.verdict[1].trim() && <p className="hb-desc">{fleet.verdict[1].trim()}</p>}
           <div className="hb-meta">
             <div><span>Projects</span><strong>{fleet.summary?.projects || projects.length}</strong></div>
             <div><span>Workers running</span><strong>{fleet.workerCount}</strong></div>
