@@ -90,9 +90,15 @@ func TestDecideWithLLM_GuardrailConflictOnMutatingAction_HoldsNoOp(t *testing.T)
 // action disagreement and must also resolve instead of failing the cycle.
 // The guardrail side (monitor_open_pr) is risk=safe, so the deterministic
 // decision wins the tie-break and keeps its own target.
+//
+// #837: a pure safe, mutation-free decision (monitor_open_pr) now
+// short-circuits the LLM entirely, so a disagreement can only arise when the
+// operator opts back into consulting the LLM. always_consult_llm=true restores
+// that path and, with it, this conflict-resolution behavior.
 func TestDecideWithLLM_GuardrailTargetDisagreement_ResolvesToDeterministic(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ReviewGate = "none"
+	cfg.Supervisor.AlwaysConsultLLM = true
 	reader := &fakeReader{
 		prs:        []github.PR{{Number: 117, HeadRefName: "feat/pending", Mergeable: "MERGEABLE"}},
 		ciStatuses: map[int]string{117: "pending"},

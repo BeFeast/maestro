@@ -88,6 +88,42 @@ issue selection and the supervisor restores its LLM path on the next cycle. A
   per-project, gates only issue selection, and must be invoked once per
   project).
 
+## Supervisor LLM cost profile (baseline spend)
+
+The emergency stop is the brake for a runaway burn; the everyday floor of
+supervisor spend is set by how often the supervise loop actually calls its
+backend. That floor is deliberately low:
+
+- **Safe, mutation-free cycles do not call the LLM (#837).** When the
+  deterministic guardrail already decides `action=none`, a `wait_*` action, or
+  `monitor_open_pr` with `risk=safe` and no planned GitHub mutation, the
+  supervisor records that decision and skips the backend entirely. It builds no
+  state packet and makes no `Complete` call, so an idle project spends **zero**
+  supervisor tokens per cycle. The skip is safe because the LLM is only ever
+  allowed to *agree* with a `risk=safe` guardrail decision — any disagreement
+  resolves back to the deterministic side — so the full-context call could only
+  reword the summary, never change the outcome.
+- **The LLM still runs where it adds value.** Mutating / approval-gated
+  decisions (`spawn_worker`, `spawn_repair_worker`, `merge_pr`,
+  `review_retry_exhausted`, and `label_issue_ready` when it plans a real label
+  mutation) have `risk != safe` or carry planned mutations, so they take the
+  full LLM path exactly as before.
+- **Journal signal.** Each skipped cycle logs
+  `supervise: safe idle decision, LLM skipped (action=… risk=…)`, so the saving
+  is visible in `journalctl` and the proxy log shows no matching
+  `session=<backend>:*` supervise request.
+
+Why it matters: before #837 every enabled cycle sent a ~55K-token state packet,
+so nine idle fleet projects on a 180s poll interval issued ≈180 LLM calls/hour
+that almost all decided "do nothing" — the exact shape of the 2026-07-09 metered
+backend incident. The short-circuit removes that baseline; the emergency stop
+remains the fast brake for anything the baseline does not cover.
+
+**Escape hatch.** Set `supervisor.always_consult_llm: true` (default `false`) to
+restore the pre-#837 behavior and force a full-context LLM call on every enabled
+cycle — use it only when you specifically want a second opinion on idle
+decisions and accept the token cost.
+
 ## Relationship to `pause` / `drain`
 
 `maestro pause` and `maestro drain` remain per-project operator controls that

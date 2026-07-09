@@ -2702,8 +2702,13 @@ func TestDecideWithLLM_MalformedOutputRejected(t *testing.T) {
 // decision wins the tie-break and the cycle succeeds with a
 // guardrail_conflict stuck state instead of an error (which used to exit
 // rc=1 and put systemd in a crash-loop).
+//
+// #837: wait_for_running_worker is a pure safe, mutation-free decision, which
+// now short-circuits the LLM. always_consult_llm=true keeps the LLM in the loop
+// so this conflict-resolution path is still exercised.
 func TestDecideWithLLM_DetectorDisagreementResolvesToDeterministicSafeSide(t *testing.T) {
 	cfg := testConfig(t)
+	cfg.Supervisor.AlwaysConsultLLM = true
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work")}}
 	llm := &fakeLLM{output: `{
   "summary": "Start a new worker anyway.",
