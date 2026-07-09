@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { FleetScreen } from "./fleet.jsx";
 import { FleetProvider, useFleet } from "./fleetContext.jsx";
+import { EmergencyBanner } from "./emergency.jsx";
 import { CommandPalette, SidebarV2, Topbar } from "./shell.jsx";
 import {
   ApprovalsScreen,
@@ -158,6 +159,7 @@ function AppShell() {
           <Topbar route={route} navigate={navigate} theme={theme} toggleTheme={toggleTheme} />
           <div className="page">
             <div className="page-inner">
+              <EmergencyBanner emergency={fleet?.emergency} />
               {error && !fleet && (
                 <div className="error" style={{ marginBottom: "var(--s-4)" }}>
                   Fleet API error: {error}

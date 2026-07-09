@@ -1,5 +1,6 @@
 import React from "react";
 import { Icon } from "./atoms.jsx";
+import { EmergencyControls } from "./emergency.jsx";
 import { formatRefreshAge, searchFleetItems } from "./fleetApi.js";
 import { useFleet } from "./fleetContext.jsx";
 
@@ -130,6 +131,7 @@ export function Topbar({ route, navigate, theme, toggleTheme }) {
           <span className="dot" />
           {fleet?.daemonAlive ? <>supervisor · {fleet.heartbeatBpm}/h</> : "supervisor offline"}
         </div>
+        <EmergencyControls />
         <button className="tb-btn ghost" onClick={refresh} title="Refresh">
           <Icon.Refresh spin={refreshing} /> {formatRefreshAge(fleet?.refreshedAt, now)}
         </button>

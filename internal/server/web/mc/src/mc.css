@@ -356,6 +356,43 @@ input, textarea { font: inherit; color: inherit; }
 .tb-btn.recovery:hover { border-color: var(--accent); color: var(--accent); }
 .tb-btn.danger .approval-on-danger { color: rgba(255, 255, 255, 0.88); }
 
+/* EMERGENCY STOP (#840): the topbar red button pulses while active so it reads
+   as the fastest lever on the page during a burn. */
+.emergency-btn-active { animation: pulse 0.9s ease-in-out infinite; }
+
+/* Persistent fleet-wide banner shown on every page while a stop is active. */
+.emergency-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--s-4);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--stuck);
+  border-left-width: 4px;
+  border-radius: var(--r-2, 8px);
+  background: var(--stuck-soft);
+  color: var(--fg-1);
+  font-size: 13px;
+}
+.emergency-banner strong { color: var(--stuck); letter-spacing: 0.02em; }
+.emergency-banner-dot { font-size: 14px; }
+.emergency-banner-detail { color: var(--fg-2); }
+
+.emergency-reason-label { display: block; font-size: 12px; color: var(--fg-2); }
+.emergency-reason-input {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-3);
+  border-radius: var(--r-1, 6px);
+  background: var(--bg-1);
+  color: var(--fg-1);
+  font-size: 13px;
+}
+.emergency-dialog-err { margin-top: 10px; color: var(--stuck); font-size: 12px; }
+
 .tb-divider { width: 1px; height: 18px; background: var(--border-2); margin: 0 var(--s-1); }
 
 .tb-jump {
