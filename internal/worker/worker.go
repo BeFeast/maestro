@@ -861,6 +861,29 @@ func visualEvidencePromptSection(cfg *config.Config) string {
 	return b.String()
 }
 
+// workDisciplinePromptSection appends a fleet-wide "work discipline" block to
+// every worker prompt. Maestro workers are single-shot headless runs with no
+// human in the loop, so prompt-encoded discipline is the only lever over how a
+// worker sequences its work.
+//
+// The three checkpoints below come from Anthropic's advisor-tool best-practices
+// guidance on prompting coding and agent tasks
+// (https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool):
+// an early plan checkpoint (after read-only orientation, before the first
+// state-changing write) and making the deliverable durable before a final
+// review pass each measured +7–10 pp on under-planning workloads. The same
+// source found that aggressive "always plan first" nudges helped Haiku-class
+// models but slightly hurt Opus-class executors, so the block is phrased as a
+// lightweight checkpoint ("a checkpoint, not an essay") rather than a hard
+// demand for elaborate planning.
+func workDisciplinePromptSection() string {
+	return "\n\n---\n\n## Work Discipline\n\n" +
+		"Sequence your work so an interrupted run still leaves something durable:\n\n" +
+		"- **Plan before your first change.** Do read-only orientation first (ls, cat, grep, go doc, gh issue view — no plan needed). Before your first state-changing action (a file write/edit or state-changing bash), jot a short plan: the approach, the files you expect to touch, and how you will verify. Keep it brief — a checkpoint, not an essay.\n" +
+		"- **Make it durable before you declare done.** Commit, push, and open/update the PR *before* any final review or summary pass. A durable partial result beats a perfect plan lost to a dead session.\n" +
+		"- **Surface conflicts, don't silently switch.** If evidence you gather (test output, file contents, CI logs) contradicts your plan or the issue description, state the conflict and your resolution in the PR body or an issue comment instead of quietly changing approach.\n"
+}
+
 // subagentHintPromptSection renders the per-backend sub-agent model policy
 // (#706). Orchestrating backends (e.g. Claude Code) spawn their own
 // sub-agents and, by default, run them on the same expensive orchestrator
@@ -918,7 +941,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath) + visualEvidencePromptSection(cfg)
+		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath) + visualEvidencePromptSection(cfg) + workDisciplinePromptSection()
 		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
@@ -966,6 +989,7 @@ Always rebase on origin/main immediately before creating the PR.
 	result += repoRulesPromptSection(worktreePath)
 	result += workerSearchSafetyPromptSection(worktreePath)
 	result += visualEvidencePromptSection(cfg)
+	result += workDisciplinePromptSection()
 	return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, false)
 }
 

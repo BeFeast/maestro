@@ -53,6 +53,40 @@ func TestAssemblePromptIncludesSearchSafetyGuardrails(t *testing.T) {
 	}
 }
 
+func TestAssemblePromptIncludesWorkDisciplineSection(t *testing.T) {
+	cfg := &config.Config{Repo: "BeFeast/maestro"}
+	issue := github.Issue{Number: 834, Title: "work discipline", Body: "Sequence the work."}
+
+	want := []string{
+		"## Work Discipline",
+		"Plan before your first change.",
+		"read-only orientation first",
+		"a checkpoint, not an essay",
+		"Make it durable before you declare done.",
+		"A durable partial result beats a perfect plan lost to a dead session.",
+		"Surface conflicts, don't silently switch.",
+	}
+
+	// Both assemblePrompt branches must carry the section: the template path
+	// (base contains {{ISSUE_NUMBER}}) and the legacy append path (it does not).
+	for _, tc := range []struct {
+		name string
+		base string
+	}{
+		{name: "template", base: "Task {{ISSUE_NUMBER}} in {{REPO}}"},
+		{name: "legacy", base: "base prompt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prompt := assemblePrompt(tc.base, issue, "/tmp/worktree", "feat/discipline", cfg)
+			for _, w := range want {
+				if !strings.Contains(prompt, w) {
+					t.Fatalf("assemblePrompt() [%s] missing %q\nprompt:\n%s", tc.name, w, prompt)
+				}
+			}
+		})
+	}
+}
+
 func TestGoWorkerPromptUsesStampedMaestroBuild(t *testing.T) {
 	promptPath := filepath.Join("..", "..", "worker-prompt-go.md")
 	data, err := os.ReadFile(promptPath)
