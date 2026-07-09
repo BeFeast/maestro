@@ -23,6 +23,7 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configstore"
+	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/mirrorstore"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
@@ -329,6 +330,34 @@ type FleetServer struct {
 	mirrorMu      sync.RWMutex
 	mirror        MirrorStatsSource
 	mirrorHorizon time.Duration
+
+	// emergencyMu guards emergencySource, the fleet-wide EMERGENCY STOP switch
+	// (#840). The daemon wires it (SetEmergencySource) to read the cached switch
+	// from the unified DB, so the fleet snapshot reports `emergency: llm_stopped`
+	// and the SPA renders the red banner while active. emergencyStore is the write
+	// side used by the /api/v1/fleet/emergency endpoint (the red button + CLI-less
+	// UI path). Both are nil under plain `serve --fleet`, where the block reports
+	// "none" and the endpoint returns 501.
+	emergencyMu       sync.RWMutex
+	emergencySource   func() emergencystore.State
+	emergencyStore    EmergencySwitch
+	emergencyNotifier EmergencyNotifier
+}
+
+// EmergencySwitch is the write side of the fleet-wide EMERGENCY STOP store the
+// dashboard red button needs (#840): set a level or resume. *emergencystore.Store
+// satisfies it. The fleet server holds it only when the daemon wires it.
+type EmergencySwitch interface {
+	Set(ctx context.Context, level emergencystore.Level, actor, reason string, at time.Time) error
+	Resume(ctx context.Context, actor string, at time.Time) error
+	Get(ctx context.Context) (emergencystore.State, error)
+}
+
+// EmergencyNotifier is the minimal notify surface the dashboard red button uses
+// to send the notify_red-grade alert on activation/resume (#840). *notify.Notifier
+// satisfies it. nil disables the alert (the switch still flips).
+type EmergencyNotifier interface {
+	Sendf(format string, args ...any)
 }
 
 // FleetProjectStore is the write side of the daemon's config store that the
@@ -338,6 +367,83 @@ type FleetServer struct {
 type FleetProjectStore interface {
 	UpsertProject(ctx context.Context, name, configYAML string) error
 	DeleteProject(ctx context.Context, name string) error
+}
+
+// SetEmergencySource wires the read side of the fleet-wide EMERGENCY STOP switch
+// (#840): the daemon passes a closure over its cached switch state so the fleet
+// snapshot reports the current level and the SPA renders the banner. Passing nil
+// leaves the block reporting "none".
+func (s *FleetServer) SetEmergencySource(src func() emergencystore.State) {
+	if s == nil {
+		return
+	}
+	s.emergencyMu.Lock()
+	s.emergencySource = src
+	s.emergencyMu.Unlock()
+}
+
+// SetEmergencyStore wires the write side used by POST /api/v1/fleet/emergency
+// (the dashboard red button, #840). nil disables the endpoint (501).
+func (s *FleetServer) SetEmergencyStore(store EmergencySwitch) {
+	if s == nil {
+		return
+	}
+	s.emergencyMu.Lock()
+	s.emergencyStore = store
+	s.emergencyMu.Unlock()
+}
+
+// SetEmergencyNotifier wires the notify_red-grade alert channel for dashboard-
+// driven emergency stop/resume (#840). nil leaves the switch working silently.
+func (s *FleetServer) SetEmergencyNotifier(n EmergencyNotifier) {
+	if s == nil {
+		return
+	}
+	s.emergencyMu.Lock()
+	s.emergencyNotifier = n
+	s.emergencyMu.Unlock()
+}
+
+func (s *FleetServer) liveEmergencyNotifier() EmergencyNotifier {
+	s.emergencyMu.RLock()
+	defer s.emergencyMu.RUnlock()
+	return s.emergencyNotifier
+}
+
+func (s *FleetServer) liveEmergencySource() func() emergencystore.State {
+	s.emergencyMu.RLock()
+	defer s.emergencyMu.RUnlock()
+	return s.emergencySource
+}
+
+func (s *FleetServer) liveEmergencyStore() EmergencySwitch {
+	s.emergencyMu.RLock()
+	defer s.emergencyMu.RUnlock()
+	return s.emergencyStore
+}
+
+// emergencySnapshot maps the cached switch into the fleet response block. When no
+// source is wired (plain serve --fleet) it reports the inactive default so the
+// field is always an explicit object.
+func (s *FleetServer) emergencySnapshot() fleetEmergency {
+	src := s.liveEmergencySource()
+	if src == nil {
+		return fleetEmergency{Active: false, Level: string(emergencystore.LevelNone)}
+	}
+	st := src()
+	out := fleetEmergency{
+		Active: st.Active(),
+		Level:  string(st.Level),
+		Actor:  st.Actor,
+		Reason: st.Reason,
+	}
+	if out.Level == "" {
+		out.Level = string(emergencystore.LevelNone)
+	}
+	if !st.Since.IsZero() {
+		out.Since = formatFleetTime(st.Since)
+	}
+	return out
 }
 
 // NewFleet creates a FleetServer.
@@ -740,6 +846,7 @@ func (s *FleetServer) buildHandler() http.Handler {
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
 	mux.HandleFunc("/api/v1/fleet/projects", s.handleFleetProjects)
 	mux.HandleFunc("/api/v1/fleet/actions", s.handleFleetAction)
+	mux.HandleFunc("/api/v1/fleet/emergency", s.handleFleetEmergency)
 	mux.HandleFunc("/api/v1/fleet/approvals/", s.handleFleetApproval)
 	mux.HandleFunc("/api/v1/audit/log", s.handleFleetAuditLog)
 	mux.HandleFunc("/approvals/audit", s.handleFleetApprovalAudit)
@@ -855,6 +962,22 @@ type fleetResponse struct {
 	// counts and how many are stale against the configured horizon. nil when the
 	// mirror is not configured.
 	Mirror *fleetMirrorStats `json:"mirror,omitempty"`
+
+	// Emergency is the fleet-wide EMERGENCY STOP state (#840). It is ALWAYS
+	// present (level "none" when not active) so the SPA never reads undefined and
+	// can render the persistent banner while a stop is in effect. `level` is one
+	// of none|llm_stopped|all_stopped — the acceptance criterion "fleet API
+	// reports emergency: llm_stopped".
+	Emergency fleetEmergency `json:"emergency"`
+}
+
+// fleetEmergency is the fleet-wide big-red-button state on the snapshot (#840).
+type fleetEmergency struct {
+	Active bool   `json:"active"`
+	Level  string `json:"level"`            // none | llm_stopped | all_stopped
+	Since  string `json:"since,omitempty"`  // RFC3339, when the current stop began
+	Actor  string `json:"actor,omitempty"`  // who engaged it
+	Reason string `json:"reason,omitempty"` // why
 }
 
 // fleetWebhookStats is the webhook ingestion observability block surfaced on the
@@ -1693,6 +1816,136 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 	writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown action_id %q", id))
 }
 
+// fleetEmergencyRequest is the body for the dashboard EMERGENCY STOP endpoint
+// (#840). It accepts either a `level` (none|llm_stopped|all_stopped) or an
+// `action` alias (resume|stop-llm|stop-all); Actor/Reason are recorded on the
+// switch and in the notification.
+type fleetEmergencyRequest struct {
+	Level  string `json:"level,omitempty"`
+	Action string `json:"action,omitempty"`
+	Actor  string `json:"actor,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// handleFleetEmergency is the dashboard big-red-button endpoint (#840): it
+// engages or clears the fleet-wide EMERGENCY STOP switch in the unified DB, which
+// every flow's supervisor/orchestrator gate reads on its next cycle.
+//
+// Auth fires FIRST so an unauthenticated POST always sees 401 (mirroring the
+// other mutating endpoints). It is deliberately NOT approval-gated — an
+// emergency stop must never wait in an approval queue — and it is honored even
+// under the read-only posture: halting spend is always safe, and the button is
+// the operator's fastest lever during a money-burn incident. The write goes
+// straight to the switch store; the running daemon picks it up via its
+// emergency-watch loop and fires the notify_red-grade alert, so this handler does
+// not itself notify (avoiding a duplicate).
+func (s *FleetServer) handleFleetEmergency(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet, http.MethodPost:
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	authenticatedActor, ok := requireAuth(w, r, s.liveAuth())
+	if !ok {
+		return
+	}
+
+	store := s.liveEmergencyStore()
+	if store == nil {
+		writeError(w, http.StatusNotImplemented, "emergency stop switch is not configured on this server")
+		return
+	}
+
+	// GET reports the current switch (same shape the /api/v1/fleet block carries)
+	// so a script can poll it without parsing the full snapshot.
+	if r.Method == http.MethodGet {
+		st, err := store.Get(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("read emergency switch: %v", err))
+			return
+		}
+		writeJSON(w, http.StatusOK, emergencyStateToWire(st))
+		return
+	}
+
+	var req fleetEmergencyRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode emergency request: %v", err))
+			return
+		}
+	}
+
+	raw := strings.TrimSpace(req.Level)
+	if raw == "" {
+		raw = strings.TrimSpace(req.Action)
+	}
+	level, err := emergencystore.ParseLevel(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Prefer the authenticated actor for the audit trail; fall back to a
+	// self-reported actor (unauthenticated LAN posture) or "dashboard".
+	actor := strings.TrimSpace(authenticatedActor)
+	if actor == "" {
+		actor = strings.TrimSpace(req.Actor)
+	}
+	if actor == "" {
+		actor = "dashboard"
+	}
+
+	now := time.Now().UTC()
+	if level == emergencystore.LevelNone {
+		err = store.Resume(r.Context(), actor, now)
+	} else {
+		err = store.Set(r.Context(), level, actor, strings.TrimSpace(req.Reason), now)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write emergency switch: %v", err))
+		return
+	}
+	log.Printf("[fleet] EMERGENCY STOP %s by %q (reason=%q)", level, actor, strings.TrimSpace(req.Reason))
+
+	st, err := store.Get(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("read emergency switch: %v", err))
+		return
+	}
+	// notify_red-grade alert (#840): the dashboard is the initiator here, so it
+	// sends exactly one alert — the daemon's watch loop only logs the per-flow
+	// journal confirmation.
+	if n := s.liveEmergencyNotifier(); n != nil {
+		if st.Active() {
+			n.Sendf("%s", st.ActivationMessage())
+		} else {
+			n.Sendf("%s", emergencystore.ResumeMessage(emergencystore.State{Level: level}, st))
+		}
+	}
+	writeJSON(w, http.StatusOK, emergencyStateToWire(st))
+}
+
+// emergencyStateToWire maps a store State into the same JSON shape the fleet
+// snapshot's `emergency` block uses.
+func emergencyStateToWire(st emergencystore.State) fleetEmergency {
+	out := fleetEmergency{
+		Active: st.Active(),
+		Level:  string(st.Level),
+		Actor:  st.Actor,
+		Reason: st.Reason,
+	}
+	if out.Level == "" {
+		out.Level = string(emergencystore.LevelNone)
+	}
+	if !st.Since.IsZero() {
+		out.Since = formatFleetTime(st.Since)
+	}
+	return out
+}
+
 // fleetProjectRequest is the body for the dashboard project-CRUD endpoint
 // (#761). POST carries the project's portable YAML (and optional name); DELETE
 // carries the name to remove. Actor/Reason are recorded in the journal.
@@ -2054,6 +2307,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.CostObservability = rollupGlobalCost(resp.Projects)
 	resp.Webhooks = s.webhookStatsSnapshot()
 	resp.Mirror = s.mirrorStatsSnapshot()
+	resp.Emergency = s.emergencySnapshot()
 	return resp
 }
 

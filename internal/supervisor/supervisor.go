@@ -184,6 +184,15 @@ type Engine struct {
 	preflight         PreflightRunner
 	enroller          ProjectEnroller
 	enrollmentTracker enrollmentTracker
+
+	// emergencyLLMHalt, when true, forces Decide down the deterministic-only
+	// path — decideWithLLM (and therefore any supervisor backend invocation) is
+	// never called. It is the fleet-wide EMERGENCY STOP LLM gate (#840): the
+	// daemon reads the emergency switch from the unified DB each cycle and passes
+	// it through RunOnce, so an active stop halts the supervisor's LLM spend on
+	// the next cycle without a restart. The deterministic decision still runs (it
+	// does no LLM call), so dashboards/state/journal stay populated.
+	emergencyLLMHalt bool
 }
 
 func NewEngine(cfg *config.Config, reader Reader) *Engine {
@@ -217,6 +226,17 @@ func (e *Engine) SetProjectEnroller(enroller ProjectEnroller) {
 		return
 	}
 	e.enroller = enroller
+}
+
+// SetEmergencyLLMHalt toggles the fleet-wide EMERGENCY STOP LLM gate (#840).
+// While set, Decide takes the deterministic-only branch and never calls
+// decideWithLLM, so the supervisor stops spending on its backend within one
+// cycle.
+func (e *Engine) SetEmergencyLLMHalt(halt bool) {
+	if e == nil {
+		return
+	}
+	e.emergencyLLMHalt = halt
 }
 
 // defaultPreflightRunner shells out to `bash -c <command>` and returns
@@ -254,9 +274,29 @@ func firstLine(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// RunOption customises a single RunOnce cycle without changing the signature
+// every existing caller passes. It is how the daemon threads the fleet-wide
+// EMERGENCY STOP switch (#840) into the per-project supervise loop.
+type RunOption func(*runOptions)
+
+type runOptions struct {
+	emergencyLLMHalt bool
+}
+
+// WithEmergencyLLMHalt forces this cycle's decision down the deterministic-only
+// path (decideWithLLM is never called). The daemon passes it when the unified
+// DB's emergency switch is set to llm_stopped/all_stopped.
+func WithEmergencyLLMHalt(halt bool) RunOption {
+	return func(o *runOptions) { o.emergencyLLMHalt = halt }
+}
+
 // RunOnce records one supervisor decision in Maestro state and applies any safe
 // queue mutations selected by the decision.
-func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error) {
+func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.SupervisorDecision, error) {
+	var ro runOptions
+	for _, opt := range opts {
+		opt(&ro)
+	}
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
 		return state.SupervisorDecision{}, fmt.Errorf("load state: %w", err)
@@ -281,7 +321,9 @@ func RunOnce(cfg *config.Config, reader Reader) (state.SupervisorDecision, error
 	// the same approvals on every cycle. We move the call there.
 	recordOutcomeHealth(cfg, st)
 
-	decision, err := NewEngine(cfg, reader).Decide(st)
+	engine := NewEngine(cfg, reader)
+	engine.SetEmergencyLLMHalt(ro.emergencyLLMHalt)
+	decision, err := engine.Decide(st)
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
@@ -437,7 +479,11 @@ func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 		// decision flow continues so its PR keeps being monitored; the
 		// orchestrator's spawn gate prevents any new worker regardless.
 		decision = e.pausedDecision(st)
-	} else if e.cfg.Supervisor.Enabled {
+	} else if e.cfg.Supervisor.Enabled && !e.emergencyLLMHalt {
+		// EMERGENCY STOP (#840): when the fleet-wide LLM stop is active the
+		// supervisor drops to deterministic-only — decideWithLLM is never
+		// invoked, so no supervisor backend call is made — while every other
+		// read-only signal (state, GitHub reads, journal) keeps flowing.
 		decision, err = e.decideWithLLM(st)
 	} else {
 		decision, err = e.decideDeterministic(st)

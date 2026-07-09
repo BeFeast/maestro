@@ -74,6 +74,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
   return {
     raw,
     readOnly: raw.read_only === true,
+    emergency: mapEmergency(raw.emergency),
     refreshedAt: raw.refreshed_at || "",
     nextAction: raw.next_action || null,
     verdict: pickVerdictTuple(raw.verdict, raw.operator_brief),
@@ -1475,6 +1476,52 @@ export async function postFleetAction({
     throw err;
   }
   return payload;
+}
+
+// mapEmergency normalizes the fleet-wide EMERGENCY STOP block (#840). It is
+// always present in the wire format (level "none" when inactive), but tolerate a
+// missing block so a legacy server simply reports "not active".
+export function mapEmergency(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { active: false, level: "none", since: "", actor: "", reason: "" };
+  }
+  return {
+    active: raw.active === true,
+    level: raw.level || "none",
+    since: raw.since || "",
+    actor: raw.actor || "",
+    reason: raw.reason || "",
+  };
+}
+
+// postFleetEmergency engages or clears the fleet-wide EMERGENCY STOP switch
+// (#840). level is "llm_stopped" | "all_stopped" (engage) or "none" (resume).
+// Returns the new switch state; throws on a non-2xx with the server message.
+export async function postFleetEmergency({ level, actor, reason }) {
+  if (!level) throw new Error("level is required");
+  const body = { level };
+  if (actor) body.actor = actor;
+  if (reason) body.reason = reason;
+  const res = await fetch("/api/v1/fleet/emergency", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let payload = null;
+  try {
+    payload = await res.json();
+  } catch (_) {
+    /* non-JSON body */
+  }
+  if (!res.ok) {
+    const msg =
+      (payload && (payload.error || payload.message)) ||
+      `emergency ${level} failed with status ${res.status}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return mapEmergency(payload);
 }
 
 // pickVerdictTuple returns the [headline, detail] pair the SPA hero

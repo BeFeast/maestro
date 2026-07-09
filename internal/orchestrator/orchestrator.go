@@ -105,6 +105,13 @@ type Orchestrator struct {
 	// Config hot-reload channel (nil = disabled, safe in select)
 	configReloadCh <-chan *config.Config
 
+	// emergencyHaltFn reports whether the fleet-wide EMERGENCY STOP switch (#840)
+	// currently closes the spawn gate. nil = no gate (today's behavior). The
+	// daemon wires it to read the switch from the unified DB each cycle, so an
+	// active stop halts new worker spawns within one poll interval without a
+	// restart. In-flight workers are unaffected — this gate only refuses NEW work.
+	emergencyHaltFn func() bool
+
 	// Restart-required signal. Some config fields (model.default, routing.*) cannot
 	// be hot-applied because the backend router is built once at startup. When such a
 	// field changes during a config reload we do not apply it; instead we raise this
@@ -196,6 +203,13 @@ type githubReadSource interface {
 // orchestrator reads GitHub directly exactly as before.
 func (o *Orchestrator) SetReadSource(src githubReadSource) {
 	o.readSource = src
+}
+
+// SetEmergencyHalt wires the fleet-wide EMERGENCY STOP spawn gate (#840). fn is
+// consulted at the top of startNewWorkers; when it returns true the orchestrator
+// claims no new issues and spawns no new workers. Passing nil clears the gate.
+func (o *Orchestrator) SetEmergencyHalt(fn func() bool) {
+	o.emergencyHaltFn = fn
 }
 
 func (o *Orchestrator) pidAlive(pid int) bool {
@@ -5740,6 +5754,15 @@ func sortedStateSessionNames(s *state.State) []string {
 }
 
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
+	// EMERGENCY STOP (#840): the fleet-wide big red button closes the spawn gate
+	// ahead of every other check. It halts ALL new worker spawns (and, since the
+	// router is only consulted inside this issue loop, every router LLM call for a
+	// spawn) within one poll interval. In-flight workers keep running; the daemon
+	// stays up so the operator can watch while nothing spends.
+	if o.emergencyHaltFn != nil && o.emergencyHaltFn() {
+		log.Printf("[orch] EMERGENCY STOP active: not spawning new workers (running=%d)", s.RunningSessionCount())
+		return
+	}
 	// Graceful drain (#541): while a drain is requested, refuse to claim new
 	// issues or spawn new workers. In-flight workers keep running; the
 	// operator runs `maestro drain` before a restart so a `systemctl restart`

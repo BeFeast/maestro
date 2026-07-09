@@ -345,6 +345,12 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	orchCfg := *cfg
 	orch := orchestrator.New(&orchCfg)
 	orch.SetBinaryVersion(opts.Version)
+	// Fleet-wide EMERGENCY STOP spawn gate (#840): the orchestrator consults this
+	// at the top of startNewWorkers each cycle, so an active stop halts new
+	// spawns (and the router LLM calls that only happen inside the spawn loop)
+	// within one poll interval. nil emergency store (open failed / test loader)
+	// leaves the closure reading a permanently-normal cache, i.e. inert.
+	orch.SetEmergencyHalt(d.emergencySpawnHalt)
 	// Mirror-first reads (#826): serve the orchestrator's high-volume poll reads
 	// from the shared mirror when github_mirror.source is mirror-first, falling
 	// back to the API on a miss/stale. The closure reads &orchCfg — the live,
