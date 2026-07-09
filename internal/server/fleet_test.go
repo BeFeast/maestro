@@ -338,6 +338,53 @@ func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 	}
 }
 
+// effective_config.settings reports each cost/LLM knob with the layer that
+// supplied its value (#839), so Mission Control can highlight non-default overrides.
+func TestFleetEffectiveConfigSettingsSource(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, nil)
+	cfg := &config.Config{
+		Repo:            "owner/settings",
+		StateDir:        stateDir,
+		WorkerMaxTokens: 250000,
+		Supervisor:      config.SupervisorConfig{Enabled: false},
+		SettingsSources: map[string]string{
+			"supervisor.enabled": config.SettingSourceProject,
+			"worker_max_tokens":  config.SettingSourceFleet,
+		},
+	}
+	srv := NewFleet([]FleetProject{NewFleetProject("Settings", "/tmp/settings.yaml", "", cfg)}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	byKey := map[string]fleetSettingSource{}
+	for _, s := range resp.Projects[0].EffectiveConfig.Settings {
+		byKey[s.Key] = s
+	}
+	if len(byKey) != len(config.FleetSettingKeys()) {
+		t.Fatalf("settings len = %d, want %d", len(byKey), len(config.FleetSettingKeys()))
+	}
+	if s := byKey["supervisor.enabled"]; s.Source != config.SettingSourceProject || s.Value != "false" || s.IsDefault {
+		t.Fatalf("supervisor.enabled = %+v", s)
+	}
+	if s := byKey["worker_max_tokens"]; s.Source != config.SettingSourceFleet || s.Value != "250000" || s.IsDefault {
+		t.Fatalf("worker_max_tokens = %+v", s)
+	}
+	// An unmapped key falls back to builtin + is_default.
+	if s := byKey["poll_interval_seconds"]; s.Source != config.SettingSourceBuiltin || !s.IsDefault {
+		t.Fatalf("poll_interval_seconds = %+v", s)
+	}
+}
+
 func TestFleetChangeGlobalConfigEnqueuesApproval(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")

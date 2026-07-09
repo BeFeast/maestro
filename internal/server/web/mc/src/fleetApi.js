@@ -669,6 +669,19 @@ function mapEffectiveConfig(raw) {
       meteredBackend: String(gate.metered_backend || ""),
     },
     approvalAction: String(raw.approval_action || "change_global_config"),
+    settings: Array.isArray(raw.settings) ? raw.settings.map(mapSettingSource) : [],
+  };
+}
+
+// mapSettingSource maps one fleet-controllable cost/LLM knob (#839): its
+// effective value and the layer it came from (builtin/fleet/project). isDefault
+// drives the "non-default override" highlight in the Settings panel.
+function mapSettingSource(raw) {
+  return {
+    key: String(raw?.key || ""),
+    value: String(raw?.value == null ? "" : raw.value),
+    source: String(raw?.source || "builtin"),
+    isDefault: raw?.is_default === true,
   };
 }
 

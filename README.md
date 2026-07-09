@@ -176,6 +176,8 @@ The dashboard now boots **write-enabled by default** (trusted-LAN posture, #477)
 
 For multi-project Fleet Mission Control operations, see [`docs/fleet-mission-control-runbook.md`](docs/fleet-mission-control-runbook.md).
 
+To flip fleet-wide or per-project cost/LLM knobs (`supervisor.enabled`, backends, token budgets) with hot reload and an audit trail, see [`docs/fleet-settings-runbook.md`](docs/fleet-settings-runbook.md).
+
 ### Dashboard auth posture: trusted LAN vs. exposed
 
 Maestro's dashboard auth is opt-in and disabled by default. The right posture depends on where the port is reachable from:
