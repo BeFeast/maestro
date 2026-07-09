@@ -65,6 +65,7 @@ Commands:
   digest        Write the morning operator digest across all fleet projects
   cleanup       Remove worktrees for all completed/dead sessions
   version-bump  Bump project version based on merged PR labels
+  selfcheck     Run the bundled behavioral smoke gate (self-deploy pre-finalize check)
   version       Print version
 
 Global flags:
@@ -367,6 +368,8 @@ func main() {
 		cleanupCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
+	case "selfcheck":
+		selfcheckCmd(args)
 	case "stream-split":
 		streamSplitCmd(args)
 	case "_watch-updater":

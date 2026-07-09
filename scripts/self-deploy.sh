@@ -22,9 +22,16 @@
 #      reports a version built from the deployed commit SHA within the timeout
 #      (SHA match, not full-string match, so a stamp vs Go pseudo-version
 #      formatting difference can't cause a false miss — #722),
-#   5. on failure roll back to <bin>.prev, restart the units again,
+#   4b. run the behavioral smoke gate `maestro selfcheck` against the freshly
+#      installed binary (#842): a held-out, side-effect-free self-test of core
+#      invariants (config-store load, backend resolution, prompt assembly, state
+#      round-trip). The version check proves the binary booted; this proves it
+#      still behaves. It is the evaluator OUTSIDE the self-editing loop — a
+#      binary that boots and reports the right version but regressed fails here,
+#   5. on failure (version OR gate) roll back to <bin>.prev, restart the units
+#      again,
 #   6. write a JSON result file the orchestrator surfaces as a supervisor
-#      finding on its next cycle.
+#      finding on its next cycle (a gate rollback names the failing check).
 #
 # A non-blocking single-flight lock (flock on <result-file>.lock) guarantees one
 # deploy at a time: a re-triggered deploy that lands while one is in flight exits
@@ -103,6 +110,7 @@ RESULT_WRITTEN=0
 SHA=""
 STAMP=""
 PREV_VERSION=""
+GATE_FAIL_DETAIL=""
 
 IFS=',' read -r -a UNIT_LIST <<<"$UNITS"
 
@@ -236,6 +244,34 @@ verify() {
     fi
     sleep 5
   done
+}
+
+# smoke_gate runs the behavioral smoke gate (#842) against the freshly-installed
+# binary: `maestro selfcheck` exercises core invariants (config-store load,
+# backend resolution, prompt assembly, state round-trip) against a held-out
+# fixture, with no external side effects. It is the evaluator that sits OUTSIDE
+# the self-editing loop — CI ran pre-merge inside the loop that produced the
+# change, so this is the first held-out functional assertion between "new binary
+# live" and "deploy finalized". A binary that boots and reports the right
+# version but behaves worse fails here and is rolled back exactly like a version
+# mismatch. Returns 0 on pass; on failure sets GATE_FAIL_DETAIL to the failing
+# check name(s) and returns 1. Deterministic and side-effect-free, so it is safe
+# to run against the live binary before finalizing.
+smoke_gate() {
+  local out rc failed
+  out=$("$BIN" selfcheck 2>&1) && rc=0 || rc=$?
+  # Log the gate's own report either way so a gate-triggered rollback is
+  # diagnosable straight from the transient unit's journal.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && log "gate: $line"
+  done <<<"$out"
+  if (( rc == 0 )); then
+    return 0
+  fi
+  # The subcommand's final line is "[selfcheck] FAILED: <name>[,<name>...]".
+  failed=$(printf '%s\n' "$out" | sed -nE 's/^\[selfcheck\] FAILED: (.+)$/\1/p' | tail -n1)
+  GATE_FAIL_DETAIL="${failed:-selfcheck exited $rc}"
+  return 1
 }
 
 rollback() {
@@ -381,6 +417,14 @@ restart_units "$RESTART_BUDGET" || fail "unit restart failed or exceeded ${RESTA
 
 # --- 4. verify post-restart health ------------------------------------------
 verify || fail "post-restart verification failed (expected v$STAMP from sha $SHA)"
+
+# --- 4b. behavioral smoke gate (#842) ---------------------------------------
+# The version check above confirms the new binary booted and reports v$STAMP; it
+# does NOT confirm the binary still behaves correctly. Run the held-out smoke
+# gate against it before finalizing (and before .prev is used for rollback). On
+# failure, fail() rolls back to .prev exactly like a version mismatch, and the
+# result records which check failed.
+smoke_gate || fail "behavioral smoke gate failed: $GATE_FAIL_DETAIL"
 
 # --- 5. success ---------------------------------------------------------------
 write_result deployed ""
