@@ -142,6 +142,110 @@ model:
 	}
 }
 
+// #841: the per-phase backend + effort fields (pipeline.{planner,implementer,
+// validator}.{backend,effort}) live in the project document, so the store must
+// round-trip them through import → export → parse without a schema change, and a
+// row that omits them must load with empty defaults.
+func TestExportDirRoundTripsPerPhaseBackendEffort(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	yaml := `
+repo: owner/gsd
+model:
+  default: fable
+  backends:
+    fable:
+      cmd: claude --model fable
+    codex:
+      cmd: codex
+pipeline:
+  enabled: true
+  planner:
+    enabled: true
+    backend: fable
+    effort: xhigh
+  implementer:
+    backend: codex
+    effort: low
+  validator:
+    enabled: true
+    backend: fable
+    effort: high
+`
+	if err := os.WriteFile(filepath.Join(dir, "gsd.yaml"), []byte(yaml), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+
+	store := openTestStore(t)
+	if err := store.ImportDir(ctx, dir); err != nil {
+		t.Fatalf("ImportDir: %v", err)
+	}
+	exportDir := t.TempDir()
+	if err := store.ExportDir(ctx, exportDir); err != nil {
+		t.Fatalf("ExportDir: %v", err)
+	}
+	exported, err := os.ReadFile(filepath.Join(exportDir, "owner-gsd.yaml"))
+	if err != nil {
+		t.Fatalf("read export: %v", err)
+	}
+	roundTrip, err := config.Parse(exported)
+	if err != nil {
+		t.Fatalf("parse exported yaml: %v", err)
+	}
+	original, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse original yaml: %v", err)
+	}
+	if !reflect.DeepEqual(roundTrip.Pipeline, original.Pipeline) {
+		t.Fatalf("round-trip pipeline = %#v, want %#v", roundTrip.Pipeline, original.Pipeline)
+	}
+	if roundTrip.Pipeline.Implementer.Backend != "codex" || roundTrip.Pipeline.Implementer.Effort != "low" {
+		t.Fatalf("implementer backend/effort not preserved: %#v", roundTrip.Pipeline.Implementer)
+	}
+	if roundTrip.Pipeline.Planner.Effort != "xhigh" || roundTrip.Pipeline.Validator.Effort != "high" {
+		t.Fatalf("planner/validator effort not preserved: planner=%q validator=%q",
+			roundTrip.Pipeline.Planner.Effort, roundTrip.Pipeline.Validator.Effort)
+	}
+}
+
+// A project row that predates #841 (no pipeline effort/implementer fields) must
+// still load, with the new fields defaulting to empty.
+func TestLoadDefaultsPerPhaseFieldsWhenAbsent(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	yaml := `
+repo: owner/legacy
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+pipeline:
+  enabled: true
+  planner:
+    enabled: true
+    backend: claude
+`
+	if err := os.WriteFile(filepath.Join(dir, "legacy.yaml"), []byte(yaml), 0644); err != nil {
+		t.Fatalf("write yaml: %v", err)
+	}
+	store := openTestStore(t)
+	if err := store.ImportDir(ctx, dir); err != nil {
+		t.Fatalf("ImportDir: %v", err)
+	}
+	cfg, err := store.Load(ctx, "owner-legacy")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Pipeline.Implementer.Backend != "" || cfg.Pipeline.Implementer.Effort != "" {
+		t.Fatalf("absent implementer should default empty: %#v", cfg.Pipeline.Implementer)
+	}
+	if cfg.Pipeline.Planner.Effort != "" || cfg.Pipeline.Validator.Effort != "" {
+		t.Fatalf("absent effort should default empty: planner=%q validator=%q",
+			cfg.Pipeline.Planner.Effort, cfg.Pipeline.Validator.Effort)
+	}
+}
+
 func TestImportDirRejectsDivergentSharedBackend(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

@@ -106,33 +106,81 @@ func ValidationPassed(worktreePath string) (bool, string, error) {
 	return false, feedback, nil
 }
 
-// BackendForPhase returns the backend name to use for a given phase.
-// Falls back to the default backend if no role-specific backend is configured.
-func BackendForPhase(cfg *config.Config, phase state.Phase) string {
+// roleForPhase returns the RoleConfig governing a pipeline phase, and whether a
+// role is defined for it. The implement phase carries its own role (#841) so it
+// can run on a cheap backend + low effort while plan/validate keep the strong
+// model; PhaseNone / unknown phases have no role.
+func roleForPhase(cfg *config.Config, phase state.Phase) (config.RoleConfig, bool) {
 	switch phase {
 	case state.PhasePlan:
-		if cfg.Pipeline.Planner.Backend != "" {
-			return cfg.Pipeline.Planner.Backend
-		}
+		return cfg.Pipeline.Planner, true
+	case state.PhaseImplement:
+		return cfg.Pipeline.Implementer, true
 	case state.PhaseValidate:
-		if cfg.Pipeline.Validator.Backend != "" {
-			return cfg.Pipeline.Validator.Backend
+		return cfg.Pipeline.Validator, true
+	default:
+		return config.RoleConfig{}, false
+	}
+}
+
+// BackendForPhase returns the backend name to use for a given phase.
+// Falls back to the default backend if no role-specific backend is configured.
+// The implement phase honors pipeline.implementer.backend when set (#841); unset
+// keeps the historical default of model.default.
+func BackendForPhase(cfg *config.Config, phase state.Phase) string {
+	if role, ok := roleForPhase(cfg, phase); ok {
+		if b := strings.TrimSpace(role.Backend); b != "" {
+			return b
 		}
 	}
 	return cfg.Model.Default
 }
 
+// EffortForPhase returns the reasoning-effort override configured for a pipeline
+// phase's role (planner/implementer/validator), or "" when the role carries no
+// effort (#841). The empty default preserves today's behavior: no per-phase
+// --effort / -c model_reasoning_effort is emitted.
+func EffortForPhase(cfg *config.Config, phase state.Phase) string {
+	if role, ok := roleForPhase(cfg, phase); ok {
+		return strings.TrimSpace(role.Effort)
+	}
+	return ""
+}
+
+// ApplyPhaseEffort returns a config whose backendName def carries the phase
+// role's effort as a TierEffort override (#841), threaded into the worker argv by
+// worker.appendTierModelEffort (claude `--effort`, codex `-c
+// model_reasoning_effort`; gemini drops it as unsupported). When the phase has no
+// effort configured — or the backend is unknown — cfg is returned unchanged, so
+// today's dispatch is byte-for-byte preserved. The override is applied to a clone
+// (deep-copying the Backends map) so the shared base config is never mutated,
+// mirroring the routing-tier override path.
+func ApplyPhaseEffort(cfg *config.Config, backendName string, phase state.Phase) *config.Config {
+	effort := EffortForPhase(cfg, phase)
+	if effort == "" {
+		return cfg
+	}
+	def, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		return cfg
+	}
+	clone := *cfg
+	backends := make(map[string]config.BackendDef, len(cfg.Model.Backends))
+	for k, v := range cfg.Model.Backends {
+		backends[k] = v
+	}
+	def.TierEffort = effort
+	backends[backendName] = def
+	clone.Model.Backends = backends
+	return &clone
+}
+
 // MaxRuntimeForPhase returns the max runtime in minutes for a given phase.
 // Falls back to the global max_runtime_minutes if no role-specific value is set.
 func MaxRuntimeForPhase(cfg *config.Config, phase state.Phase) int {
-	switch phase {
-	case state.PhasePlan:
-		if cfg.Pipeline.Planner.MaxRuntimeMinutes > 0 {
-			return cfg.Pipeline.Planner.MaxRuntimeMinutes
-		}
-	case state.PhaseValidate:
-		if cfg.Pipeline.Validator.MaxRuntimeMinutes > 0 {
-			return cfg.Pipeline.Validator.MaxRuntimeMinutes
+	if role, ok := roleForPhase(cfg, phase); ok {
+		if role.MaxRuntimeMinutes > 0 {
+			return role.MaxRuntimeMinutes
 		}
 	}
 	return cfg.MaxRuntimeMinutes

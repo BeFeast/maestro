@@ -154,27 +154,98 @@ func TestBackendForPhase(t *testing.T) {
 	cfg := &config.Config{
 		Model: config.ModelConfig{Default: "claude"},
 		Pipeline: config.PipelineConfig{
-			Planner:   config.RoleConfig{Backend: "haiku"},
-			Validator: config.RoleConfig{Backend: "sonnet"},
+			Planner:     config.RoleConfig{Backend: "haiku"},
+			Implementer: config.RoleConfig{Backend: "codex"},
+			Validator:   config.RoleConfig{Backend: "sonnet"},
 		},
 	}
 
 	if got := BackendForPhase(cfg, state.PhasePlan); got != "haiku" {
 		t.Errorf("plan backend: got %q, want haiku", got)
 	}
-	if got := BackendForPhase(cfg, state.PhaseImplement); got != "claude" {
-		t.Errorf("implement backend: got %q, want claude", got)
+	// #841: the implement phase now honors pipeline.implementer.backend when set.
+	if got := BackendForPhase(cfg, state.PhaseImplement); got != "codex" {
+		t.Errorf("implement backend: got %q, want codex", got)
 	}
 	if got := BackendForPhase(cfg, state.PhaseValidate); got != "sonnet" {
 		t.Errorf("validate backend: got %q, want sonnet", got)
 	}
 
-	// Empty role backends → default
+	// Empty role backends → default (unchanged historical behavior).
 	cfg2 := &config.Config{
 		Model: config.ModelConfig{Default: "claude"},
 	}
 	if got := BackendForPhase(cfg2, state.PhasePlan); got != "claude" {
 		t.Errorf("empty plan backend: got %q, want claude", got)
+	}
+	// Implement phase with no implementer backend falls back to model.default.
+	if got := BackendForPhase(cfg2, state.PhaseImplement); got != "claude" {
+		t.Errorf("empty implement backend: got %q, want claude", got)
+	}
+}
+
+func TestEffortForPhase(t *testing.T) {
+	cfg := &config.Config{
+		Pipeline: config.PipelineConfig{
+			Planner:     config.RoleConfig{Effort: "xhigh"},
+			Implementer: config.RoleConfig{Effort: "low"},
+			Validator:   config.RoleConfig{Effort: "high"},
+		},
+	}
+
+	if got := EffortForPhase(cfg, state.PhasePlan); got != "xhigh" {
+		t.Errorf("plan effort: got %q, want xhigh", got)
+	}
+	if got := EffortForPhase(cfg, state.PhaseImplement); got != "low" {
+		t.Errorf("implement effort: got %q, want low", got)
+	}
+	if got := EffortForPhase(cfg, state.PhaseValidate); got != "high" {
+		t.Errorf("validate effort: got %q, want high", got)
+	}
+	// No role / unset effort → empty (no per-phase --effort emitted).
+	if got := EffortForPhase(cfg, state.PhaseNone); got != "" {
+		t.Errorf("none effort: got %q, want empty", got)
+	}
+	cfg2 := &config.Config{}
+	if got := EffortForPhase(cfg2, state.PhaseImplement); got != "" {
+		t.Errorf("unset implement effort: got %q, want empty", got)
+	}
+}
+
+func TestApplyPhaseEffort(t *testing.T) {
+	base := &config.Config{
+		Model: config.ModelConfig{
+			Default: "claude",
+			Backends: map[string]config.BackendDef{
+				"codex": {Cmd: "codex"},
+			},
+		},
+		Pipeline: config.PipelineConfig{
+			Implementer: config.RoleConfig{Backend: "codex", Effort: "low"},
+		},
+	}
+
+	// Effort set → clone carries the effort as a TierEffort override on the
+	// selected backend def, without mutating the base config.
+	got := ApplyPhaseEffort(base, "codex", state.PhaseImplement)
+	if got == base {
+		t.Fatal("expected a cloned config when effort is applied")
+	}
+	if te := got.Model.Backends["codex"].TierEffort; te != "low" {
+		t.Errorf("clone TierEffort: got %q, want low", te)
+	}
+	if te := base.Model.Backends["codex"].TierEffort; te != "" {
+		t.Errorf("base config was mutated: TierEffort=%q, want empty", te)
+	}
+
+	// No effort configured for the phase → same config returned unchanged.
+	if got := ApplyPhaseEffort(base, "codex", state.PhasePlan); got != base {
+		t.Error("expected unchanged config pointer when phase has no effort")
+	}
+
+	// Unknown backend → unchanged config pointer (defensive).
+	if got := ApplyPhaseEffort(base, "missing", state.PhaseImplement); got != base {
+		t.Error("expected unchanged config pointer for unknown backend")
 	}
 }
 
@@ -182,19 +253,26 @@ func TestMaxRuntimeForPhase(t *testing.T) {
 	cfg := &config.Config{
 		MaxRuntimeMinutes: 120,
 		Pipeline: config.PipelineConfig{
-			Planner:   config.RoleConfig{MaxRuntimeMinutes: 30},
-			Validator: config.RoleConfig{MaxRuntimeMinutes: 45},
+			Planner:     config.RoleConfig{MaxRuntimeMinutes: 30},
+			Implementer: config.RoleConfig{MaxRuntimeMinutes: 90},
+			Validator:   config.RoleConfig{MaxRuntimeMinutes: 45},
 		},
 	}
 
 	if got := MaxRuntimeForPhase(cfg, state.PhasePlan); got != 30 {
 		t.Errorf("plan runtime: got %d, want 30", got)
 	}
-	if got := MaxRuntimeForPhase(cfg, state.PhaseImplement); got != 120 {
-		t.Errorf("implement runtime: got %d, want 120", got)
+	if got := MaxRuntimeForPhase(cfg, state.PhaseImplement); got != 90 {
+		t.Errorf("implement runtime: got %d, want 90", got)
 	}
 	if got := MaxRuntimeForPhase(cfg, state.PhaseValidate); got != 45 {
 		t.Errorf("validate runtime: got %d, want 45", got)
+	}
+
+	// Unset implementer runtime falls back to the global default.
+	cfg2 := &config.Config{MaxRuntimeMinutes: 120}
+	if got := MaxRuntimeForPhase(cfg2, state.PhaseImplement); got != 120 {
+		t.Errorf("unset implement runtime: got %d, want 120", got)
 	}
 }
 

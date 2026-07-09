@@ -1119,12 +1119,21 @@ func (a ServerAuthConfig) ResolvedActorName() string {
 	return name
 }
 
-// RoleConfig defines settings for a single pipeline role (planner, validator).
+// RoleConfig defines settings for a single pipeline role (planner,
+// implementer, validator).
 type RoleConfig struct {
 	Enabled           bool   `yaml:"enabled"`
 	Backend           string `yaml:"backend"`             // backend name from model.backends (empty = use default)
 	Prompt            string `yaml:"prompt"`              // path to prompt template (empty = built-in default)
 	MaxRuntimeMinutes int    `yaml:"max_runtime_minutes"` // override per-role max runtime (0 = use global)
+	// Effort is the per-phase reasoning-effort override (#841). When set it is
+	// threaded into the worker argv for the phase via
+	// worker.appendTierModelEffort — claude `--effort <e>`, codex `-c
+	// model_reasoning_effort=<e>`; gemini has no effort flag and drops it. Empty
+	// leaves the backend's effort unchanged (today's behavior). This enables the
+	// "plan-big / execute-small" economics: strong effort on plan/validate, a low
+	// effort on the token-heavy implement phase.
+	Effort string `yaml:"effort"`
 }
 
 // PipelineConfig controls the planner → implementer → validator phase pipeline
@@ -1134,7 +1143,12 @@ type PipelineConfig struct {
 	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline globally (default: false; issue label pipeline:full opts in per worker)
 	Planner   RoleConfig `yaml:"planner"`   // planner role settings
 	Validator RoleConfig `yaml:"validator"` // validator role settings
-	// Implementer uses the existing worker_prompt / bug_prompt / enhancement_prompt settings.
+	// Implementer carries the implement phase's own backend/effort override (#841)
+	// so the token-heavy implement phase can run on a cheap backend + low effort
+	// while plan/validate keep the strong model. Empty backend falls back to
+	// model.default (unchanged default); the prompt still comes from the existing
+	// worker_prompt / bug_prompt / enhancement_prompt settings.
+	Implementer RoleConfig `yaml:"implementer"`
 
 	// Deterministic pre-worker context preparation phases. These are heuristic
 	// local scans/checks, not separate agent sessions.
@@ -1586,6 +1600,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.BugPrompt = expandHome(cfg.BugPrompt)
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
+	cfg.Pipeline.Implementer.Prompt = expandHome(cfg.Pipeline.Implementer.Prompt)
 	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
 	cfg.Supervisor.Prompt = expandHome(cfg.Supervisor.Prompt)
 	for i, s := range cfg.PromptSections {

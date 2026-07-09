@@ -112,3 +112,34 @@ func TestTierArgv_OperatorPinnedCodexEffortWins(t *testing.T) {
 		t.Errorf("operator-pinned codex effort missing: %s", args)
 	}
 }
+
+// #841: a pipeline phase's per-role effort rides the SAME TierEffort carrier as a
+// routing tier's effort, so it emits per-backend exactly like the tier path —
+// claude --effort, codex -c model_reasoning_effort, gemini drops it. These guard
+// the per-phase effort argv emission end-to-end (pipeline.ApplyPhaseEffort /
+// StartPhase set TierEffort; the builders emit it).
+func TestPhaseEffort_ClaudeEmitsEffort(t *testing.T) {
+	args := buildArgs(t, "claude", BackendConfig{Cmd: "claude", TierEffort: "high"})
+	if !strings.Contains(args, "--effort high") {
+		t.Errorf("claude phase effort not emitted: %s", args)
+	}
+}
+
+func TestPhaseEffort_CodexEmitsReasoningEffort(t *testing.T) {
+	args := buildArgs(t, "codex", BackendConfig{Cmd: "codex", TierEffort: "low"})
+	if !strings.Contains(args, "model_reasoning_effort=low") {
+		t.Errorf("codex phase effort not emitted: %s", args)
+	}
+	if strings.Contains(args, "--effort") {
+		t.Errorf("codex must not use --effort: %s", args)
+	}
+}
+
+func TestPhaseEffort_GeminiDropsEffort(t *testing.T) {
+	// gemini has no reasoning-effort flag — a phase effort must be dropped, not
+	// emitted as an unsupported --effort that would crash the worker.
+	args := buildArgs(t, "gemini", BackendConfig{Cmd: "gemini", TierEffort: "medium"})
+	if strings.Contains(args, "--effort") {
+		t.Errorf("gemini must not emit --effort for a phase effort: %s", args)
+	}
+}

@@ -6026,6 +6026,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// dispatched worker's argv (no-op for non-policy decisions); surface the
 		// shadow would-pick on the dispatch line when policy shadow mode is on.
 		workerCfg = applyTierOverride(workerCfg, backendName, backendDecision)
+		// #841: thread the initial pipeline phase's role effort (plan, or implement
+		// when no planner) into the dispatched worker's argv. No-op for non-pipeline
+		// dispatch (PhaseNone) and when the phase role sets no effort, so today's
+		// dispatch is unchanged. Implement/validate phase transitions apply their own
+		// effort in worker.StartPhase.
+		workerCfg = pipeline.ApplyPhaseEffort(workerCfg, backendName, initialPhase)
 		if backendDecision.ShadowTier != "" {
 			log.Printf("[orch] issue #%d: policy SHADOW would pick %s — dispatching %s unchanged",
 				issue.Number, backendDecision.ShadowReason, backendName)
