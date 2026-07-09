@@ -132,6 +132,25 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 		return state.SupervisorDecision{}, err
 	}
 
+	// #837: short-circuit the LLM call on a safe, mutation-free deterministic
+	// decision (idle-project token burn). validateLLMDecision forces the LLM to
+	// agree with the guardrail on action/target/risk, and resolveGuardrailConflict
+	// resolves any disagreement in favor of the deterministic side whenever the
+	// guardrail decision is risk=safe — so on an idle project the LLM can only
+	// reword the summary, never change the decision. Building the ~55K-token state
+	// packet and calling the backend there buys nothing, so skip both.
+	//
+	// The LLM stays in the loop exactly where it adds value: every mutating /
+	// approval-gated decision (spawn_worker, spawn_repair_worker, merge_pr,
+	// review_retry_exhausted, ...) has Risk != safe, and a safe decision that
+	// still plans a GitHub mutation (label_issue_ready with add_ready_label) has
+	// len(Mutations) > 0 — both fall through to the LLM path below. The escape
+	// hatch supervisor.always_consult_llm=true restores the old always-call path.
+	if !e.cfg.Supervisor.AlwaysConsultLLM && deterministic.Risk == RiskSafe && len(deterministic.Mutations) == 0 {
+		log.Printf("[supervisor] supervise: safe idle decision, LLM skipped (action=%s risk=%s)", deterministic.RecommendedAction, deterministic.Risk)
+		return deterministic, nil
+	}
+
 	policy := newSupervisorPolicy(e.cfg)
 	packet, err := e.buildStatePacket(st, deterministic, policy)
 	if err != nil {

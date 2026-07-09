@@ -582,6 +582,14 @@ type SupervisorConfig struct {
 	ApprovalRequiredActions []string                        `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
 	PolicyPath              string                          `yaml:"-" json:"policy_path,omitempty"`
 	LessonProposalsEnabled  *bool                           `yaml:"lesson_proposals_enabled" json:"lesson_proposals_enabled,omitempty"`
+	// AlwaysConsultLLM restores the pre-#837 behavior of calling the supervisor
+	// LLM on every enabled cycle, even when the deterministic guardrail already
+	// decided a safe, mutation-free action (action=none / wait_* / monitor_open_pr).
+	// Default false: those cycles short-circuit and skip the backend call, since
+	// the LLM can only agree with a risk=safe guardrail decision and therefore
+	// cannot change it (see internal/supervisor/llm.go decideWithLLM). Set true to
+	// force a full-context second opinion on every cycle regardless of token cost.
+	AlwaysConsultLLM bool `yaml:"always_consult_llm" json:"always_consult_llm,omitempty"`
 
 	excludedLabelsSet bool
 }
