@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -39,6 +40,13 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		}
 	}
 	backendCfg := workerBackendConfig(backendDef)
+	// #841: thread the phase role's effort override into the worker argv via the
+	// existing tier-effort path (claude --effort, codex -c model_reasoning_effort;
+	// gemini drops it). An operator-pinned effort still wins — appendTierModelEffort
+	// skips the override when the flag is already present in cmd/extra_args.
+	if effort := pipeline.EffortForPhase(cfg, sess.Phase); effort != "" {
+		backendCfg.TierEffort = effort
+	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {

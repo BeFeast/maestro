@@ -30,7 +30,7 @@ Every lever that influences which backend/model/effort a worker runs on lives in
 | `routing.router_prompt` | router prompt template | `internal/config/config.go:789` |
 | `routing.task_type_backends` | `task_type → backend`, used **only** when `mode: auto` | `internal/config/config.go:790` |
 | `routing.{planner,implementation,validator}_backend` | per-role backend overrides | `internal/config/config.go:794-796` |
-| `pipeline.{planner,validator}.backend` | the *other* per-role backend overrides | `internal/config/config.go:856-861` (`PipelineConfig`/`RoleConfig`) |
+| `pipeline.{planner,implementer,validator}.{backend,effort}` | the *other* per-role backend/effort overrides (implement phase + `effort:` added in #841) | `internal/config/config.go` (`PipelineConfig`/`RoleConfig`) |
 | `supervisor.review_repair.{backend,model,effort}` | backend used when a green PR is held on blocking review findings | `internal/config/config.go:543-548` |
 
 A subtle but load-bearing fact, with one backend-specific exception: for the
@@ -157,16 +157,41 @@ code:
   `roleBackend` at `:136-148`). **This function has no non-test callers** — it is
   exercised only by `internal/router/resolve_test.go`. It is dead code on the
   dispatch path.
-- `pipeline.{planner,validator}.backend` is consumed by
-  `pipeline.BackendForPhase` (`internal/pipeline/pipeline.go:111-123`), which
-  **is** wired into the dispatch loop for pipeline phases —
-  `internal/orchestrator/orchestrator.go:5261-5266`. The implementer phase has no
-  override and always uses `model.default` (`internal/pipeline/pipeline.go:122`).
+- `pipeline.{planner,implementer,validator}.backend` is consumed by
+  `pipeline.BackendForPhase` (`internal/pipeline/pipeline.go`), which **is** wired
+  into the dispatch loop for pipeline phases. Since #841 the implement phase
+  carries its own `pipeline.implementer.backend` (empty falls back to
+  `model.default`, the unchanged default), and every phase role also takes an
+  optional `effort:` threaded into the worker argv via
+  `worker.appendTierModelEffort` (claude `--effort`, codex `-c
+  model_reasoning_effort`; gemini drops it). This enables the "plan-big /
+  execute-small" economics — a strong backend + high effort on plan/validate and a
+  cheap backend + low effort on the token-heavy implement phase:
+
+  ```yaml
+  pipeline:
+    enabled: true
+    planner:
+      enabled: true
+      backend: fable      # strong model plans
+      effort: xhigh
+    implementer:
+      backend: codex      # cheap model executes the mechanical implement phase
+      effort: low
+    validator:
+      enabled: true
+      backend: fable      # strong model verifies
+      effort: high
+  ```
+
+  Operator-pinned flags (a `--model`/`--effort` in the backend `cmd`/`extra_args`)
+  still win — the per-phase effort is skipped when the flag is already present.
 
 So the "per-role backend" that actually runs is the `pipeline.*` one, and only
-for the planner/validator phases of the opt-in 3-phase pipeline
-(`pipeline.enabled` / `pipeline:full` label). The `routing.*_backend` fields
-parse and validate but never affect a worker.
+for the phases of the opt-in 3-phase pipeline (`pipeline.enabled` /
+`pipeline:full` label). The `routing.*_backend` fields parse and validate but
+never affect a worker. Per-phase config is orthogonal to `routing.mode` — it is
+phase config, not issue routing.
 
 ### 1.5 Failure, fallback, and escalation semantics
 
