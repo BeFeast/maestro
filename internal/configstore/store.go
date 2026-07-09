@@ -38,6 +38,29 @@ CREATE TABLE IF NOT EXISTS project (
 	backend_ref TEXT NOT NULL DEFAULT 'global',
 	updated_at TEXT NOT NULL
 );
+
+-- settings is the fleet-level defaults layer (#839): one row per dotted
+-- cost/LLM control key (supervisor.enabled, worker_max_tokens, …). A project's
+-- own YAML value overrides a fleet default, which overrides the built-in.
+CREATE TABLE IF NOT EXISTS settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+-- settings_audit is the append-only journal of every settings change (#839):
+-- who/when/old->new, at RFC3339(Nano). It is never pruned, so its most-recent
+-- fleet-scope row is a monotonic settings-change clock — ProjectsFingerprint
+-- folds it in so a deleted/reverted fleet default still forces a reload.
+CREATE TABLE IF NOT EXISTS settings_audit (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	key TEXT NOT NULL,
+	scope TEXT NOT NULL,
+	old_value TEXT NOT NULL DEFAULT '',
+	new_value TEXT NOT NULL DEFAULT '',
+	actor TEXT NOT NULL DEFAULT '',
+	changed_at TEXT NOT NULL
+);
 `
 
 type Store struct {
@@ -110,6 +133,14 @@ func (s *Store) ImportDir(ctx context.Context, dir string) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
+		if name == FleetSettingsFileName {
+			// The reserved settings file loads into the settings table, not the
+			// project table (#839).
+			if err := importFleetSettingsTx(ctx, tx, data, "config-store import"); err != nil {
+				return fmt.Errorf("import %s: %w", path, err)
+			}
+			continue
+		}
 		if err := importProject(ctx, tx, path, data); err != nil {
 			return fmt.Errorf("import %s: %w", path, err)
 		}
@@ -137,10 +168,19 @@ func (s *Store) Load(ctx context.Context, name string) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := config.Parse(data)
+	fleet, err := s.FleetSettings(ctx)
 	if err != nil {
 		return nil, err
 	}
+	merged, sources, err := applyFleetDefaults(data, fleet)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.Parse(merged)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SettingsSources = sources
 	if strings.TrimSpace(sourcePath) == "" {
 		// No originating file (write-API row): report the store row itself so
 		// path consumers surface "store:<name>" instead of inventing a
@@ -185,6 +225,16 @@ func (s *Store) ExportDir(ctx context.Context, dir string) error {
 		}
 		if err := os.WriteFile(filepath.Join(dir, name+".yaml"), data, 0644); err != nil {
 			return fmt.Errorf("write export %s: %w", name, err)
+		}
+	}
+	// Round-trip the fleet settings layer alongside the project YAMLs (#839).
+	settingsYAML, err := s.ExportFleetSettings(ctx)
+	if err != nil {
+		return fmt.Errorf("export fleet settings: %w", err)
+	}
+	if len(settingsYAML) > 0 {
+		if err := os.WriteFile(filepath.Join(dir, FleetSettingsFileName), settingsYAML, 0644); err != nil {
+			return fmt.Errorf("write fleet settings export: %w", err)
 		}
 	}
 	return nil
@@ -374,6 +424,24 @@ func deepMergeMaps(a, b map[string]any) map[string]any {
 // project write back too. source_path is left empty for write-API projects
 // (they have no originating file) and is preserved on conflict.
 func (s *Store) UpsertProject(ctx context.Context, name, configYAML string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := upsertProjectTx(ctx, tx, name, configYAML); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// upsertProjectTx is UpsertProject's core, factored out so a settings write can
+// upsert the project row and record its audit entry in one transaction
+// (SetProjectSetting). The YAML is validated through config.Parse, any
+// model.backends block is detached into the shared backends table, and the
+// remaining document is stored INSERT ... ON CONFLICT with a fresh RFC3339Nano
+// updated_at so the watch-store fingerprint advances.
+func upsertProjectTx(ctx context.Context, tx *sql.Tx, name, configYAML string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("project name is required")
 	}
@@ -384,12 +452,6 @@ func (s *Store) UpsertProject(ctx context.Context, name, configYAML string) erro
 	if err := yaml.Unmarshal([]byte(configYAML), &root); err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
 	backends := detachBackends(&root)
 	now := time.Now().UTC().Format(time.RFC3339Nano) // nano, not seconds: see ProjectsFingerprint (#757)
 	if err := upsertSharedBackendsTx(ctx, tx, backends, now); err != nil {
@@ -399,14 +461,12 @@ func (s *Store) UpsertProject(ctx context.Context, name, configYAML string) erro
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO project(name, source_path, config_yaml, backend_ref, updated_at)
 VALUES(?, '', ?, 'global', ?)
 ON CONFLICT(name) DO UPDATE SET config_yaml = excluded.config_yaml, updated_at = excluded.updated_at
-`, name, string(projectYAML), now); err != nil {
-		return err
-	}
-	return tx.Commit()
+`, name, string(projectYAML), now)
+	return err
 }
 
 // ProjectNameFor derives the canonical project name for a config document the
@@ -498,6 +558,17 @@ ON CONFLICT(key) DO UPDATE SET value_yaml = excluded.value_yaml, updated_at = ex
 // daemon would never hot-reload that project (#757). Parsing with RFC3339Nano
 // also accepts older seconds-precision rows.
 func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, error) {
+	// A fleet-level settings change (#839) alters every project's effective
+	// config, so fold the latest fleet settings-change timestamp into every
+	// project's fingerprint. It comes from settings_audit — an append-only log —
+	// not MAX(settings.updated_at): a DELETE (revert-to-builtin) removes the
+	// settings row, so MAX(settings.updated_at) would stall or move backward and
+	// --watch-store would never reload the projects that must revert. The audit
+	// row for that delete keeps the clock moving forward.
+	fleetTS, err := s.latestFleetSettingsChange(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT name, updated_at FROM project`)
 	if err != nil {
 		return nil, err
@@ -512,6 +583,9 @@ func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, 
 		ts, err := time.Parse(time.RFC3339Nano, updatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("parse updated_at for project %q: %w", name, err)
+		}
+		if fleetTS.After(ts) {
+			ts = fleetTS
 		}
 		out[name] = ts
 	}

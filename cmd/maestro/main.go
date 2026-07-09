@@ -60,6 +60,7 @@ Commands:
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
   config-store  Manage the SQLite config store (migrate/export/add/rm/edit)
+  settings      View/flip fleet-level cost/LLM knobs (list/get/set/rm/audit)
   history       Show recently completed sessions
   digest        Write the morning operator digest across all fleet projects
   cleanup       Remove worktrees for all completed/dead sessions
@@ -356,6 +357,8 @@ func main() {
 		importCmd(args)
 	case "config-store":
 		configStoreCmd(args)
+	case "settings":
+		settingsCmd(args)
 	case "history":
 		historyCmd(args)
 	case "digest":

@@ -1451,6 +1451,12 @@ type Config struct {
 	StaleSessionReconciler          StaleSessionReconcilerConfig `yaml:"stale_session_reconciler"` // filter stale supervisor sessions from operator attention
 	SessionRetention                SessionRetentionConfig       `yaml:"session_retention"`        // #497: bound state.Sessions growth via terminal-session compaction
 	SourcePath                      string                       `yaml:"-"`                        // path the config was loaded from (not serialized)
+	// SettingsSources records, per fleet-controllable settings key (#839), which
+	// layer supplied the effective value: "project" (the project's own YAML),
+	// "fleet" (a config-store settings default), or "builtin". Populated by
+	// configstore.Load; nil for file-loaded configs. Not serialized and ignored
+	// by config equality — it is display provenance for effective_config only.
+	SettingsSources map[string]string `yaml:"-" json:"-"`
 }
 
 // LoadFrom loads config from a specific path.

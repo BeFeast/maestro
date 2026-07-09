@@ -1749,6 +1749,24 @@ function EffectiveConfigView({ project, onEdit }) {
         <SettingMetric label="pricing" value={`${cost.backendPricingConfigured || 0}/${cost.backendPricingTotal || 0}`} />
       </div>
 
+      {(cfg.settings || []).length > 0 && (
+        <div className="settings-section">
+          <div className="settings-section-title">Cost &amp; LLM settings</div>
+          <div className="dim" style={{ fontSize: 11.5, marginBottom: "var(--s-3)" }}>
+            Fleet-controllable knobs. Source shows which layer supplied the value; a fleet or project badge marks a non-default override.
+          </div>
+          {cfg.settings.map(s => (
+            <div key={s.key} className="kv">
+              <span className="mono">{s.key}</span>
+              <span className="setting-source">
+                <strong className="mono">{s.value === "" ? "—" : s.value}</strong>
+                <Pill tone={settingSourceTone(s.source)} noDot title={`source: ${s.source}`}>{s.source}</Pill>
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="settings-section">
         <div className="settings-section-title">Model policy</div>
         <div className="kv"><span>Default</span><strong className="mono">{cfg.modelPolicy?.default || "—"}</strong></div>
@@ -1827,4 +1845,12 @@ function TagList({ values, empty = "—" }) {
 function routingLabel(routing) {
   if (!routing) return "—";
   return [routing.mode, routing.router_model || routing.routerModel, routing.router_model_name || routing.routerModelName].filter(Boolean).join(" · ") || "—";
+}
+
+// settingSourceTone maps a settings-layer source (#839) to a pill tone: a
+// project or fleet override reads as active/policy, a built-in default as muted.
+function settingSourceTone(source) {
+  if (source === "project") return "policy";
+  if (source === "fleet") return "info";
+  return "idle";
 }

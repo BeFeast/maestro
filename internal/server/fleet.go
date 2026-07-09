@@ -1405,6 +1405,19 @@ type fleetEffectiveConfig struct {
 	CostCaps       fleetConfigCostCaps   `json:"cost_caps"`
 	SupervisorGate fleetConfigSupervisor `json:"supervisor_gate"`
 	ApprovalAction string                `json:"approval_action"`
+	// Settings is the fleet-controllable cost/LLM knob layer (#839): each
+	// registered key with its effective value and the layer that supplied it
+	// (builtin/fleet/project). Mission Control uses Source to highlight
+	// non-default overrides. Source is builtin for file-loaded configs.
+	Settings []fleetSettingSource `json:"settings"`
+}
+
+// fleetSettingSource is one cost/LLM knob's effective value and provenance.
+type fleetSettingSource struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	Source    string `json:"source"` // builtin | fleet | project
+	IsDefault bool   `json:"is_default"`
 }
 
 type fleetModelPolicy struct {
@@ -3684,7 +3697,30 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			MeteredBackendRefused:   meteredRefused,
 		},
 		ApprovalAction: config.SupervisorActionChangeGlobalConfig,
+		Settings:       buildFleetSettingSources(cfg),
 	}
+}
+
+// buildFleetSettingSources reports each fleet-controllable knob's effective
+// value and the layer it came from (#839). Source is read from cfg.SettingsSources
+// (populated by configstore.Load); a file-loaded config has no provenance map,
+// so every knob reports builtin.
+func buildFleetSettingSources(cfg *config.Config) []fleetSettingSource {
+	specs := config.FleetSettingSpecs()
+	out := make([]fleetSettingSource, 0, len(specs))
+	for _, spec := range specs {
+		src := cfg.SettingsSources[spec.Key]
+		if src == "" {
+			src = config.SettingSourceBuiltin
+		}
+		out = append(out, fleetSettingSource{
+			Key:       spec.Key,
+			Value:     spec.Value(cfg),
+			Source:    src,
+			IsDefault: src == config.SettingSourceBuiltin,
+		})
+	}
+	return out
 }
 
 func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (fleetProjectState, []fleetWorkerState) {
