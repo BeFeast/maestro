@@ -69,10 +69,28 @@ The script then:
    `1.4.3-0.<ts>-f4550ef38a42` — same commit, different string. Matching the SHA
    is format-agnostic, so a stamp-vs-pseudo-version formatting difference cannot
    cause a false verify miss (#722).
-5. **Rolls back on failure** — restores `<bin>.prev`, restarts the units
-   again, and records the rollback reason. `.prev` is kept either way for
+5. **Runs the behavioral smoke gate** (#842) — `maestro selfcheck` against the
+   freshly-installed binary, after the version/health check and **before the
+   deploy is finalized** (and before `<bin>.prev` is used for rollback). The
+   version check proves the binary *booted and reports the right version*; the
+   gate proves it *still behaves*. It is the evaluator that sits **outside the
+   self-editing loop** (Weng, harness engineering): CI ran pre-merge inside the
+   same loop that produced the change, so this is the first held-out functional
+   assertion between "new binary live" and "deploy successful". The gate exercises
+   core invariants — config-store load, backend resolution, prompt assembly, and
+   state round-trip — against a **held-out fixture embedded in the binary**, not
+   live fleet state, so it is deterministic and asserts behavior independent of
+   current production data. It is side-effect-free: no GitHub writes, no
+   config-store mutation, no network beyond localhost. A binary that boots and
+   reports the correct version but has regressed one of these invariants fails
+   the gate and is rolled back exactly like a version mismatch; the result names
+   the failing check.
+6. **Rolls back on failure** — on a failed version/health check **or a failed
+   smoke gate**, restores `<bin>.prev`, restarts the units again, and records the
+   rollback reason (for a gate failure, the reason names the failing check, e.g.
+   `behavioral smoke gate failed: prompt`). `.prev` is kept either way for
    manual rollback.
-6. **Writes a result file** — `<state_dir>/self-deploy-result.json`, on **every**
+7. **Writes a result file** — `<state_dir>/self-deploy-result.json`, on **every**
    terminal path (deployed, rolled_back, failed, and the "already at this
    version" no-op). The script's `set -e` ERR trap plus an EXIT trap guarantee a
    result even when a step bails unexpectedly, so a merge never silently produces
@@ -98,6 +116,63 @@ supervisor finding and notifies, then advances a resolved watermark
 watermark also distinguishes a genuinely-lost deploy from a completed one whose
 trigger marker legitimately outlives its consumed result. A later merge (or
 observed main-advance) re-triggers a fresh deploy automatically.
+
+### Behavioral smoke gate (#842)
+
+Self-deploy is Maestro's one true self-editing loop: the running daemon observes
+an `origin/main` advance, builds and installs the new binary, and restarts the
+fleet — the binary that orchestrates everything replaces itself. Before #842 the
+only post-restart gate was the version/health check in step 4, which a binary
+that boots and reports the right version but **behaves worse** passes cleanly.
+That is the one place the loop lacks an evaluator *outside* itself: CI ran
+pre-merge, inside the same loop that produced the change.
+
+The smoke gate (step 5 above) closes that gap. It runs `maestro selfcheck`
+against the freshly-installed binary and asserts a small set of core invariants:
+
+- **config** — the embedded fixture config parses with full validation,
+  including the routing-policy validator;
+- **backend** — the router resolves backends deterministically (a `model:` label
+  overrides everything; an unlabelled issue routes through the policy to its
+  default tier's backend);
+- **prompt** — the supervisor prompt (the highest-stakes text the fleet-
+  orchestrating binary produces) assembles, with the state packet substituted
+  into the template;
+- **state** — a `State` survives a JSON-store save→load round-trip in a
+  throwaway temp dir, and an empty dir cold-starts to a fresh `State`.
+
+Everything runs against a **fixture embedded in the binary** (never live fleet
+state) and a temp dir, so the gate is deterministic, asserts behavior
+independent of production data, and has **no external side effects** — no GitHub
+writes, no config-store mutation, no network beyond localhost. Run it by hand
+any time to reproduce the gate:
+
+```bash
+maestro selfcheck          # human output, one PASS/FAIL line per check
+maestro selfcheck --json   # machine-readable {"ok":…,"checks":[…]}
+echo $?                    # 0 = all invariants held, 1 = a check failed
+```
+
+**Diagnosing a gate-triggered rollback.** A gate failure looks exactly like a
+version-mismatch rollback — `<bin>.prev` restored, units restarted on the old
+binary, a `rolled_back` finding + notification — but the reason names the smoke
+gate and the failing check:
+
+```
+self-deploy: rolled back to previous binary after PR #… — behavioral smoke gate failed: prompt
+```
+
+The failing check name (`config` / `backend` / `prompt` / `state`) points at the
+regressed invariant. To reproduce and drill in:
+
+```bash
+journalctl --user -u 'maestro-self-deploy-*' --since -2h | grep 'gate:'  # the gate's own report, logged line-by-line
+maestro selfcheck                                                        # re-run the gate against the installed binary
+```
+
+Because the gate only *adds* a stage, the existing version check and the
+drain-honoring restart are unchanged; a healthy build passes the gate and
+finalizes as `deployed` exactly as before.
 
 ## Enabling it
 
@@ -229,6 +304,7 @@ After a merge, within `timeout_minutes`:
 
 ```bash
 maestro version                                  # maestro v<VERSION>+g<shortsha> of merged main
+maestro selfcheck                                # re-run the behavioral smoke gate the deploy ran (#842)
 curl -s http://127.0.0.1:8788/api/v1/state | grep '"version"'
 systemctl --user status maestro.service
 journalctl --user -u 'maestro-self-deploy-*' -n 200   # deploy log
@@ -239,12 +315,14 @@ The supervisor finding appears in the state API under
 
 ## When it rolls back
 
-A deliberately broken build or failed health check leaves:
+A deliberately broken build, a failed health check, or a **failed behavioral
+smoke gate** (#842) leaves:
 
 - the previous binary restored at `bin_path` (and still kept at
   `<bin_path>.prev`),
 - units restarted and active on the old version,
-- a `rolled_back` finding + notification carrying the reason.
+- a `rolled_back` finding + notification carrying the reason (a gate failure
+  names the failing check, e.g. `behavioral smoke gate failed: prompt`).
 
 Inspect the deploy log, fix the regression, merge again:
 
@@ -268,6 +346,7 @@ maestro version
 | Finding `self-deploy: failed … passwordless sudo is unavailable` | `install_via_sudo` is set but `sudo -n` does not work for the deploy user | Add a NOPASSWD sudoers grant for the install file ops (see Enabling it) |
 | Finding `self-deploy: failed … no .prev` | First deploy failed before any previous binary existed | Build + install manually once, re-merge |
 | Finding `rolled_back … health check timed out` | New binary started but never reported the stamped version | Check `journalctl --user -u maestro.service`; the regression is in the merged code |
+| Finding `rolled_back … behavioral smoke gate failed: <check>` | New binary booted and reported the right version but failed the `maestro selfcheck` invariant `<check>` (config/backend/prompt/state) (#842) | Run `maestro selfcheck` to reproduce; inspect `journalctl --user -u 'maestro-self-deploy-*' \| grep gate:`; the regression is behavioral, in the merged code |
 | No finding, no restart | Trigger failed (script missing, systemd-run unavailable) | Orchestrator log shows `self-deploy trigger failed …`; a ⚠️ notification is sent |
 | Deploy log `error obtaining VCS status: exit status 128` | `go build` in the detached worktree tripped git's dubious-ownership guard | Fixed in #807 — the build now passes `-buildvcs=false`; if you see this, the deploy script is pre-#807 (update it) |
 | Finding `self-deploy: no result … — the deploy unit died` | Trigger recorded but the transient unit never wrote a result (SIGKILLed at `RuntimeMaxSec`, or crashed pre-EXIT-trap) (#807) | Inspect `journalctl -u 'maestro-self-deploy-*'`; verify `maestro version` + units by hand; a later merge retries automatically |

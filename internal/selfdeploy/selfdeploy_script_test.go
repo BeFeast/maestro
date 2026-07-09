@@ -114,6 +114,47 @@ func TestSelfDeployBuildIsVCSIndependent(t *testing.T) {
 	}
 }
 
+// TestSelfDeployScriptSmokeGateWiring (#842) is the static guard that the
+// behavioral smoke gate is wired into the deploy path correctly: it runs the
+// freshly-installed binary's `selfcheck`, does so AFTER the version/health
+// verify and BEFORE the deploy is finalized (write_result deployed), and routes
+// a gate failure through fail() — the same function the version-mismatch path
+// uses to roll back to .prev. A refactor that reorders these, or drops the gate
+// past the finalize point, would let a merely-booting-but-worse binary through.
+func TestSelfDeployScriptSmokeGateWiring(t *testing.T) {
+	data, err := os.ReadFile(selfDeployScriptPath(t))
+	if err != nil {
+		t.Fatalf("read script: %v", err)
+	}
+	script := string(data)
+
+	// The gate must invoke selfcheck on the installed binary and route failure
+	// through fail() (which rolls back when INSTALLED).
+	for _, want := range []string{
+		`"$BIN" selfcheck`,   // the gate exercises the new binary's behavior
+		"smoke_gate || fail", // gate failure → fail() → rollback
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("self-deploy.sh missing smoke-gate wiring %q", want)
+		}
+	}
+
+	// Ordering: the gate call must sit AFTER the verify call and BEFORE the
+	// deploy is finalized, so a booting-but-broken binary is caught pre-finalize.
+	verifyIdx := strings.Index(script, "verify || fail")
+	gateIdx := strings.Index(script, "smoke_gate || fail")
+	// Anchor on the finalize-specific form `write_result deployed ""`; a bare
+	// `write_result deployed` also appears earlier in the "already at this
+	// version" no-op path, which precedes verify.
+	finalizeIdx := strings.Index(script, `write_result deployed ""`)
+	if verifyIdx < 0 || gateIdx < 0 || finalizeIdx < 0 {
+		t.Fatalf("missing anchor(s): verify=%d gate=%d finalize=%d", verifyIdx, gateIdx, finalizeIdx)
+	}
+	if !(verifyIdx < gateIdx && gateIdx < finalizeIdx) {
+		t.Errorf("smoke gate is misordered: want verify(%d) < gate(%d) < finalize(%d)", verifyIdx, gateIdx, finalizeIdx)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
