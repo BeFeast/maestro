@@ -25,8 +25,10 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
+	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mirrorstore"
+	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
@@ -55,6 +57,13 @@ const (
 	// majority of in-flight workers; a long-running worker that exceeds it is
 	// an external tmux process the daemon should not wait for (#817).
 	DefaultDrainTimeout = 5 * time.Minute
+	// DefaultEmergencyWatchInterval is how often the daemon re-reads the
+	// fleet-wide EMERGENCY STOP switch from the unified DB (#840). It is short so
+	// the switch takes effect well within one supervise/orchestrate poll interval
+	// — the acceptance guarantee is "within one cycle (≤ poll interval)" — while
+	// polling one SQLite row is negligible. It runs independently of
+	// --watch-store, since the emergency switch must always be honored.
+	DefaultEmergencyWatchInterval = 5 * time.Second
 )
 
 // drainPollInterval is how often Drain re-reads each flow's state to see whether
@@ -151,6 +160,14 @@ type Options struct {
 	// WebhookDBPath is the shared SQLite database webhook deliveries land in
 	// (defaults to the same maestro.db the state/approvals stores use).
 	WebhookDBPath string
+
+	// EmergencyDBPath is the shared SQLite database the fleet-wide EMERGENCY STOP
+	// switch lives in (#840), defaulting to the same maestro.db the other stores
+	// use. The daemon reads it every EmergencyWatchInterval so an operator's
+	// `maestro emergency stop-llm` takes effect within one cycle without a
+	// restart, and it is re-read on startup so a switch set while the daemon was
+	// down is honored on the next start.
+	EmergencyDBPath string
 }
 
 // Daemon owns the running project flows and the shared FleetServer.
@@ -198,6 +215,18 @@ type Daemon struct {
 	// authenticate the post-merge self-deploy health probe against /api/v1/fleet
 	// (#758). Set once in Run before flows start, then read-only.
 	fleetAuthTokenEnv string
+
+	// emergency is the fleet-wide EMERGENCY STOP switch store (#840), opened once
+	// in Run against the unified maestro.db. emergencyState caches the last read
+	// so the per-flow gate closures (supervisor LLM halt, orchestrator spawn
+	// gate) resolve without a DB hit per cycle; the emergency-watch loop refreshes
+	// it every EmergencyWatchInterval. emergencyNotifier sends the notify_red-grade
+	// alert on activation/resume, built from the first project's Telegram config.
+	// nil emergency (open failed / test loader) leaves every gate inert.
+	emergency         *emergencystore.Store
+	emergencyMu       sync.RWMutex
+	emergencyState    emergencystore.State
+	emergencyNotifier *notify.Notifier
 
 	// runLoop, superviseLoop, and watchdogLoop build the per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
@@ -258,7 +287,7 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		if src := d.newReadSource(getCfg().Repo, getCfg); src != nil {
 			reader = src
 		}
-		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval)
+		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval, d.emergencyLLMHalt)
 	}
 	d.watchdogLoop = supervisor.Watchdog
 	// Default to the real launcher; tests swap it for a counter (#758).
@@ -394,6 +423,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// polling), rather than aborting startup over an unreadable secret.
 	d.configureWebhookIngestion(fleet)
 
+	// #840: open the fleet-wide EMERGENCY STOP switch, seed the gate cache from
+	// the current value (so a switch set while the daemon was down is honored on
+	// this start), and expose it on the fleet snapshot. Non-fatal on any error —
+	// the gate is a safety brake over the normal flows. Closed when Run returns.
+	if store := d.configureEmergencyStop(ctx, importCfgs); store != nil {
+		defer store.Close()
+		fleet.SetEmergencySource(d.EmergencyState)
+		// Back the dashboard red button (#840): the SPA POST writes the same
+		// switch store the CLI does, and the daemon's emergency-watch loop picks it
+		// up within one cycle. The notifier sends the notify_red-grade alert for
+		// dashboard-driven changes (the CLI sends its own for CLI-driven ones).
+		fleet.SetEmergencyStore(store)
+		if d.emergencyNotifier != nil {
+			fleet.SetEmergencyNotifier(d.emergencyNotifier)
+		}
+	}
+
 	fleetAuth := server.FleetAuthFromProjects(projects)
 	fleet.SetAuth(fleetAuth)
 	// Capture the fleet's shared auth token env so the self-deploy health probe
@@ -452,9 +498,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 			<-watchDone
 		}
 	}
+	// EMERGENCY STOP watch (#840): re-read the fleet-wide switch every interval so
+	// an operator's `maestro emergency stop-llm` takes effect within one cycle
+	// without a restart, and announce each transition (notify + per-flow journal
+	// line). It runs unconditionally (not gated on --watch-store) since the
+	// switch must always be honored, under its own context so it stops on a serve
+	// error as well as ctx.Done.
+	var stopEmergencyWatch func()
+	if d.emergency != nil {
+		ectx, emergencyCancel := context.WithCancel(ctx)
+		emergencyDone := make(chan struct{})
+		go func() {
+			defer close(emergencyDone)
+			d.watchEmergencyLoop(ectx, DefaultEmergencyWatchInterval)
+		}()
+		log.Printf("[daemon] EMERGENCY STOP watch enabled — poll every %s", DefaultEmergencyWatchInterval)
+		stopEmergencyWatch = func() {
+			emergencyCancel()
+			<-emergencyDone
+		}
+	}
 	drainWatch := func() {
 		if stopWatch != nil {
 			stopWatch()
+		}
+		if stopEmergencyWatch != nil {
+			stopEmergencyWatch()
 		}
 	}
 

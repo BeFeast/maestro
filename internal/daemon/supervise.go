@@ -63,7 +63,7 @@ func computeSuperviseJitter(interval time.Duration, frac float64) time.Duration 
 // flow restart (#768). The GitHub client is built once from the startup repo —
 // repo is a restart-required field the orchestrator refuses to hot-apply, so it
 // is stable for the flow's lifetime.
-func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration) {
+func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration, emergencyLLMHalt func() bool) {
 	// reader is the flow's read surface. The daemon passes a mirror-first source
 	// when github_mirror.source is mirror-first (#826); it satisfies
 	// supervisor.Reader and serves the poll reads locally when the mirror is warm,
@@ -78,7 +78,15 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 	// archaeology (#764). Logs key on the unique fleet name (not the possibly
 	// shared session prefix) so two same-basename repos stay distinguishable.
 	runOnce := func() error {
-		decision, err := supervisor.RunOnce(getCfg(), reader)
+		// Fleet-wide EMERGENCY STOP (#840): when the switch halts LLM calls, run
+		// the cycle deterministic-only so the supervisor stops spending on its
+		// backend within one cycle. The rest of the cycle (state, GitHub reads,
+		// journal) is unchanged, so the operator keeps seeing what is happening.
+		var opts []supervisor.RunOption
+		if emergencyLLMHalt != nil && emergencyLLMHalt() {
+			opts = append(opts, supervisor.WithEmergencyLLMHalt(true))
+		}
+		decision, err := supervisor.RunOnce(getCfg(), reader, opts...)
 		if err != nil {
 			return err
 		}

@@ -55,6 +55,7 @@ Commands:
   drain         Stop spawning new workers and wait for in-flight workers to finish
   pause         Pause issue selection for a project (in-flight workers finish normally)
   resume        Resume issue selection for a paused project
+  emergency     Fleet-wide EMERGENCY STOP: halt all LLM calls in one action (stop-llm/stop-all/resume/status)
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
@@ -116,6 +117,24 @@ Pause / Resume:
                                   restarts; only resume clears it (#683).
   maestro resume --config <cfg>   Resume issue selection on the next cycle
                                   without restarting any unit.
+
+Emergency stop (#840) — fleet-wide BIG RED BUTTON:
+  maestro emergency stop-llm      Halt ALL LLM spend fleet-wide in one action:
+                                  supervisor drops to deterministic-only, no new
+                                  worker spawns, router calls stopped. The daemon
+                                  keeps running (dashboards/state/reads stay up);
+                                  in-flight workers are left running unless you
+                                  pass --kill-workers. Flag lives in the unified
+                                  DB and survives a daemon restart.
+  maestro emergency stop-all      Whole-fleet stop, recorded as an emergency
+                                  state that survives restart until resumed.
+  maestro emergency resume        Clear the emergency stop; normal operation
+                                  resumes on the next cycle (no restart).
+  maestro emergency status        Print the current emergency switch.
+    --db string       Unified SQLite db the switch lives in (default ~/.maestro/maestro.db)
+    --reason string   Why the stop was engaged (recorded + notified)
+    --actor string    Who engaged it (default: current user)
+    --kill-workers    Also kill in-flight tmux workers (stop-llm/stop-all)
 
 Stop flags:
   --session string      Session name to stop (e.g. pan-1)
@@ -327,6 +346,8 @@ func main() {
 		pauseCmd(args)
 	case "resume":
 		resumeCmd(args)
+	case "emergency":
+		emergencyCmd(args)
 	case "stop":
 		stopCmd(args)
 	case "kill":

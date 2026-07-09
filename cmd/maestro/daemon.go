@@ -13,6 +13,7 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
+	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/statestore"
 	"github.com/befeast/maestro/internal/webhook"
 	"github.com/befeast/maestro/internal/webhookstore"
@@ -40,6 +41,7 @@ func daemonCmd(args []string) {
 	webhookSecretFile := fs.String("webhook-secret-file", "", "Path to a file holding the GitHub webhook secret; enables inbound webhook ingestion on the fleet port (#824)")
 	webhookPath := fs.String("webhook-path", webhook.DefaultPath, "HTTP path the webhook ingestion endpoint is served on (#824)")
 	webhookDB := fs.String("webhook-db", webhookstore.DefaultDBPath(), "Shared SQLite db path webhook deliveries land in (#824)")
+	emergencyDB := fs.String("emergency-db", emergencystore.DefaultDBPath(), "Shared SQLite db path the fleet-wide EMERGENCY STOP switch lives in (#840)")
 	drainTimeout := fs.Duration("drain-timeout", daemon.DefaultDrainTimeout, "Max time the SIGTERM in-process drain waits for in-flight workers to finish (#761)")
 	fs.Parse(args)
 
@@ -74,6 +76,7 @@ func daemonCmd(args []string) {
 		WebhookSecretFile:  *webhookSecretFile,
 		WebhookPath:        *webhookPath,
 		WebhookDBPath:      *webhookDB,
+		EmergencyDBPath:    *emergencyDB,
 	})
 
 	go handleDaemonSignals(ctx, cancel, d, *drainTimeout)
