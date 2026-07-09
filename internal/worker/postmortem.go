@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Prior-attempt post-mortem extraction (#835).
@@ -71,8 +72,38 @@ var postmortemRedactions = []struct {
 	{regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{20,}\b`), "[REDACTED_SLACK_TOKEN]"},
 }
 
-// redactPostmortemSecrets masks common credential shapes in place.
+// postmortemMultilineRedactions collapse credential shapes whose body spans
+// several lines. The per-line postmortemRedactions above only mask the first
+// line of such a value — a `KEY="-----BEGIN … KEY-----` assignment redacts the
+// assignment line but leaves the PEM body and footer lines, which are still
+// collected as recent actions and reach the prompt / persisted file (#835
+// review). These run first, over the whole assembled text, so a multiline
+// secret is redacted in full before the single-line patterns run.
+var postmortemMultilineRedactions = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	// PEM blocks: -----BEGIN … KEY----- … -----END … KEY----- (also CERTIFICATE).
+	// (?s) lets . span the base64 body/footer lines — including any per-line
+	// bullet prefixes the post-mortem adds — and the lazy .*? stops at the first
+	// matching END so adjacent blocks are not merged. Catches a bare PEM key
+	// dumped to the log as well as one embedded in a KEY="…" assignment.
+	{regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9]+-----.*?-----END[ A-Z0-9]+-----`), "[REDACTED_PRIVATE_KEY_BLOCK]"},
+	// KEY="…" whose closing quote lands on a later line (any multiline secret
+	// value). The embedded \n forces a genuine multiline match; single-line
+	// assignments are left to the per-line patterns. [^"] spans newlines, so the
+	// whole value through its closing quote — and the bullet-prefixed body lines
+	// inside it — is masked.
+	{regexp.MustCompile(`(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY)[A-Z0-9_]*)\s*[:=]\s*"[^"]*\n[^"]*"`), "${1}=[REDACTED]"},
+}
+
+// redactPostmortemSecrets masks common credential shapes in place. Multiline
+// patterns run first so a PEM key or other multiline secret value is collapsed
+// to a single redacted token before the per-line patterns run.
 func redactPostmortemSecrets(text string) string {
+	for _, r := range postmortemMultilineRedactions {
+		text = r.re.ReplaceAllString(text, r.repl)
+	}
 	for _, r := range postmortemRedactions {
 		text = r.re.ReplaceAllString(text, r.repl)
 	}
@@ -279,21 +310,62 @@ func extractPostmortemBody(logText string, sideChannelFiles []string) string {
 	return redactPostmortemSecrets(strings.TrimRight(b.String(), "\n"))
 }
 
-// CapPostmortem hard-caps a post-mortem to at most capBytes of content and
-// appends a short truncation marker when it had to cut. Truncation lands on a
-// line boundary where possible and always yields valid UTF-8. capBytes <= 0
-// disables the cap.
+// postmortemTruncationMarker is appended when CapPostmortem has to cut. Its
+// byte length is reserved out of the caller's budget so the returned excerpt —
+// content plus marker — never exceeds capBytes (#835 review).
+const postmortemTruncationMarker = "\n\n… (post-mortem truncated for the prompt; full version saved to the state dir)"
+
+// CapPostmortem hard-caps a post-mortem so the returned string is at most
+// capBytes and appends a short truncation marker when it had to cut. The marker
+// is counted against capBytes, so the total never exceeds the budget. Truncation
+// lands on a line boundary where possible and always yields valid UTF-8.
+// capBytes <= 0 disables the cap.
 func CapPostmortem(s string, capBytes int) string {
 	if capBytes <= 0 || len(s) <= capBytes {
 		return s
 	}
-	truncated := s[:capBytes]
+	// Make the text valid UTF-8 up front so the subsequent byte-slice can only
+	// ever remove bytes (sanitizing after the slice could expand a split rune to
+	// U+FFFD and push content+marker back over capBytes).
+	s = sanitizePromptUTF8(s)
+	if len(s) <= capBytes {
+		return s
+	}
+	// Reserve room for the marker so content+marker stays within capBytes. When
+	// the cap is too small to fit the marker at all, fall back to a marker-free
+	// excerpt bounded to a rune boundary (never grows past capBytes).
+	budget := capBytes - len(postmortemTruncationMarker)
+	if budget <= 0 {
+		return truncateToRuneBoundary(s, capBytes)
+	}
+	truncated := truncateToRuneBoundary(s, budget)
 	if idx := strings.LastIndexByte(truncated, '\n'); idx > 0 {
 		truncated = truncated[:idx]
 	}
-	truncated = sanitizePromptUTF8(truncated)
-	return strings.TrimRight(truncated, "\n") +
-		"\n\n… (post-mortem truncated for the prompt; full version saved to the state dir)"
+	return strings.TrimRight(truncated, "\n") + postmortemTruncationMarker
+}
+
+// truncateToRuneBoundary returns the longest prefix of s that is at most
+// capBytes bytes and does not split a UTF-8 rune. It only ever removes bytes,
+// so the result is guaranteed <= capBytes (unlike sanitizePromptUTF8, which can
+// grow a string by expanding invalid bytes to U+FFFD). s is assumed valid
+// UTF-8, so the only possible invalid tail is a rune the byte-slice split.
+func truncateToRuneBoundary(s string, capBytes int) string {
+	if capBytes <= 0 {
+		return ""
+	}
+	if len(s) <= capBytes {
+		return s
+	}
+	b := s[:capBytes]
+	for len(b) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(b); r == utf8.RuneError && size <= 1 {
+			b = b[:len(b)-1] // drop the partial trailing byte left by the slice
+			continue
+		}
+		break
+	}
+	return b
 }
 
 func trimPostmortemLine(raw string) string {

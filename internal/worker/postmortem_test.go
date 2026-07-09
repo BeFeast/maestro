@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestExtractPostmortem_FailedCommands(t *testing.T) {
@@ -113,6 +114,57 @@ func TestExtractPostmortem_RedactsSecrets(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsMultilineSecrets covers PEM/multiline secret
+// bodies: the per-line patterns only mask the assignment line, so the base64
+// body and footer lines of a `KEY="-----BEGIN … KEY-----` value survived into
+// the prompt and persisted file (#835 review).
+func TestExtractPostmortem_RedactsMultilineSecrets(t *testing.T) {
+	// Fabricated PEM body so secret scanners don't match it in the diff.
+	body1 := "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB"
+	body2 := "AAAAMwAAAAtzc2gtZWQyNTUxOQAAACDddeadbeefdeadbeefdeadbe"
+	log := strings.Join([]string{
+		"error: ssh auth failed",
+		`SSH_PRIVATE_KEY="-----BEGIN OPENSSH PRIVATE KEY-----`,
+		body1,
+		body2,
+		`-----END OPENSSH PRIVATE KEY-----"`,
+		"last line",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	for _, secret := range []string{body1, body2, "BEGIN OPENSSH PRIVATE KEY", "END OPENSSH PRIVATE KEY"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("post-mortem leaked multiline secret content %q:\n%s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "REDACTED") {
+		t.Errorf("expected a redaction marker in output:\n%s", out)
+	}
+}
+
+// TestExtractPostmortem_RedactsBarePEMBlock covers a private key dumped to the
+// log outside any KEY=… assignment (e.g. a `cat key.pem` echo).
+func TestExtractPostmortem_RedactsBarePEMBlock(t *testing.T) {
+	body := "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q"
+	log := strings.Join([]string{
+		"error: reading deploy key",
+		"-----BEGIN RSA PRIVATE KEY-----",
+		body,
+		"-----END RSA PRIVATE KEY-----",
+		"build failed",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, body) {
+		t.Errorf("post-mortem leaked bare PEM body %q:\n%s", body, out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected PEM block redaction marker in output:\n%s", out)
+	}
+}
+
 func TestCapPostmortem_Enforced(t *testing.T) {
 	// A body far larger than the cap.
 	var sb strings.Builder
@@ -125,9 +177,10 @@ func TestCapPostmortem_Enforced(t *testing.T) {
 	}
 
 	capped := CapPostmortem(big, PostmortemPromptCapBytes)
-	// Content is capped to capBytes; a short marker may be appended.
-	if len(capped) > PostmortemPromptCapBytes+160 {
-		t.Errorf("capped output too large: %d bytes", len(capped))
+	// The marker is reserved out of the budget: content plus marker must never
+	// exceed capBytes (#835 review: marker previously overshot the cap).
+	if len(capped) > PostmortemPromptCapBytes {
+		t.Errorf("capped output exceeds cap: %d > %d bytes", len(capped), PostmortemPromptCapBytes)
 	}
 	if !strings.Contains(capped, "truncated") {
 		t.Errorf("expected truncation marker in capped output")
@@ -141,6 +194,47 @@ func TestCapPostmortem_Enforced(t *testing.T) {
 	// capBytes <= 0 disables the cap.
 	if got := CapPostmortem(big, 0); got != big {
 		t.Errorf("capBytes<=0 should disable cap")
+	}
+}
+
+// TestCapPostmortem_MarkerWithinCap exercises a range of caps — including ones
+// smaller than the truncation marker itself — and asserts the result stays
+// within budget and remains valid UTF-8 (#835 review: marker overshoot).
+func TestCapPostmortem_MarkerWithinCap(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 500; i++ {
+		sb.WriteString("- a reasonably long line of post-mortem content ☃\n")
+	}
+	big := sb.String()
+
+	for _, capBytes := range []int{10, 40, len(postmortemTruncationMarker), 100, 512, PostmortemPromptCapBytes} {
+		got := CapPostmortem(big, capBytes)
+		if len(got) > capBytes {
+			t.Errorf("cap=%d: output %d bytes exceeds cap", capBytes, len(got))
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("cap=%d: output is not valid UTF-8: %q", capBytes, got)
+		}
+	}
+}
+
+// TestCapPostmortem_MultibyteBoundary ensures a cap landing mid-rune does not
+// split a multibyte character or overshoot the byte budget — across both the
+// marker-free small-cap branch and the main branch (cap larger than the marker,
+// no newline in the budget window, where an after-slice sanitize could
+// previously expand a split rune and push content+marker back over the cap).
+func TestCapPostmortem_MultibyteBoundary(t *testing.T) {
+	s := strings.Repeat("☃", 200) // 3 bytes each, no newlines
+	m := len(postmortemTruncationMarker)
+	caps := []int{1, 2, 3, 5, 20, m - 1, m, m + 1, m + 2, m + 5, m + 10, m + 100}
+	for _, capBytes := range caps {
+		got := CapPostmortem(s, capBytes)
+		if len(got) > capBytes {
+			t.Fatalf("cap=%d: output %d bytes exceeds cap", capBytes, len(got))
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("cap=%d: output not valid UTF-8: %q", capBytes, got)
+		}
 	}
 }
 
