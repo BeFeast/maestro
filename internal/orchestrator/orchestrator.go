@@ -1639,6 +1639,66 @@ Do NOT repeat the same mistakes.
 `, promptBase, feedback)
 }
 
+// appendPriorAttemptPostmortem appends a bounded, automatically-extracted
+// summary of the previous failed attempt's own worker-log trajectory (#835).
+// It sits alongside — not in place of — the CI/review/conflict context, so the
+// retry worker sees what the last attempt actually tried locally and can avoid
+// repeating the same dead ends until retry_exhausted. The postmortem argument
+// is already secret-redacted and hard-capped by the caller.
+func appendPriorAttemptPostmortem(promptBase, postmortem string, attempt int) string {
+	return fmt.Sprintf(`%s
+
+---
+
+## Prior Attempt Post-Mortem (Attempt %d)
+
+A previous attempt on this issue failed. The following is an automatically
+extracted summary of what that attempt tried, distilled from its own worker log
+(not from GitHub CI or review):
+
+`+"```"+`
+%s
+`+"```"+`
+
+Do NOT repeat the same approach without addressing why it failed. If the summary
+shows a command, file, or hypothesis that led nowhere, change strategy rather
+than retrying it verbatim.
+`, promptBase, attempt, postmortem)
+}
+
+// maybeAppendPriorAttemptPostmortem distills the previous attempt's worker log
+// into a post-mortem, persists the full version to the state dir for operator
+// inspection, and appends a hard-capped excerpt to the retry prompt. It is
+// best-effort: a missing/empty/unreadable log yields no section and no error,
+// so respawn proceeds exactly as it does today.
+func (o *Orchestrator) maybeAppendPriorAttemptPostmortem(slotName string, sess *state.Session, promptBase string) string {
+	logFile := o.workerLogFile(slotName, sess)
+	postmortem := worker.ExtractPostmortem(logFile, worker.PostmortemTailLines)
+	if strings.TrimSpace(postmortem) == "" {
+		return promptBase
+	}
+	// Persist the full post-mortem for operators; only a capped excerpt goes
+	// into the prompt (token budget). All attempts accumulate on disk under a
+	// per-attempt filename.
+	o.persistPostmortem(slotName, sess.RetryCount, postmortem)
+	capped := worker.CapPostmortem(postmortem, worker.PostmortemPromptCapBytes)
+	return appendPriorAttemptPostmortem(promptBase, capped, sess.RetryCount)
+}
+
+// persistPostmortem writes the full post-mortem to
+// <state_dir>/<slot>-attempt<N>-postmortem.md. Best-effort: a write failure is
+// logged, never fatal, and never blocks the respawn.
+func (o *Orchestrator) persistPostmortem(slotName string, attempt int, body string) {
+	if o == nil || o.cfg == nil || strings.TrimSpace(o.cfg.StateDir) == "" {
+		return
+	}
+	name := fmt.Sprintf("%s-attempt%d-postmortem.md", slotName, attempt)
+	path := filepath.Join(o.cfg.StateDir, name)
+	if err := os.WriteFile(path, []byte(body+"\n"), 0o644); err != nil {
+		log.Printf("[orch] warn: could not persist post-mortem for %s: %v", slotName, err)
+	}
+}
+
 // appendRebaseConflictContext appends a section to the worker prompt with
 // auto-rebase failure details so the retry worker can update the same PR branch.
 func appendRebaseConflictContext(promptBase, feedback string) string {
@@ -1848,6 +1908,12 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			sess.PreviousAttemptFeedback = "" // consumed — don't persist stale feedback
 			sess.PreviousAttemptFeedbackKind = ""
 		}
+
+		// #835: append a bounded post-mortem distilled from the previous
+		// attempt's own worker log, alongside (not replacing) the CI/review/
+		// conflict context above. Read before respawn — respawnWorker /
+		// RespawnInPlace repoint sess.LogFile to the new attempt's log.
+		promptBase = o.maybeAppendPriorAttemptPostmortem(slotName, sess, promptBase)
 
 		var respawnErr error
 		if sess.PRNumber != 0 && sess.Worktree != "" {
