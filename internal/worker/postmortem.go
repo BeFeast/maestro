@@ -2,6 +2,7 @@ package worker
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -43,6 +44,16 @@ const (
 	maxPostmortemLineRunes = 400
 )
 
+// workerLogAttemptMarker is the banner buildWorkerRunnerScript writes to
+// slot.log at the start of every (re)spawn ("[maestro] worker worktree: …").
+// Respawns append to the same slot.log, so this line is the per-attempt
+// boundary: the tail can otherwise carry an older attempt's failures/files
+// whenever the just-failed attempt produced fewer than the scanned lines, and
+// the prompt would mislabel that stale content as the current attempt (#835
+// review). isolateCurrentAttempt slices the tail to the region after the last
+// marker before extraction.
+const workerLogAttemptMarker = "[maestro] worker worktree:"
+
 // postmortemRedactions mirrors internal/supervisor's sensitiveRedactions so
 // obvious credential shapes never reach the retry prompt or the persisted
 // post-mortem file. The worker package cannot import supervisor (supervisor
@@ -81,6 +92,7 @@ var failureSignatures = []*regexp.Regexp{
 	regexp.MustCompile(`\bundefined:\s`), // go link/compile
 	regexp.MustCompile(`(?i)\bexit status [1-9]`),
 	regexp.MustCompile(`(?i)\bexit code [1-9]`),
+	regexp.MustCompile(`^\s*\[codex\]\s+exit=[1-9]`), // codex stream-splitter's rendered non-zero exit
 	regexp.MustCompile(`(?i)\bcommand (?:failed|not found)\b`),
 	regexp.MustCompile(`(?i)^\s*error[:\s]`),
 	regexp.MustCompile(`(?i)\berror:`),
@@ -91,11 +103,20 @@ var failureSignatures = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(?:build|tests?)\s+failed\b`),
 }
 
-// editedFilePatterns capture the path a line reports as edited/written. They
-// cover claude stream-json tool inputs ("file_path": "…"), common human-style
-// verbs some CLIs print, and unified-diff headers.
+// editedFilePatterns capture the path a line reports as edited/written from the
+// human-readable slot.log. They cover raw claude stream-json tool inputs
+// ("file_path": "…") on non-stream-split logs, the codex stream-splitter's
+// rendered file-change form ("[codex] <kind> <path>"), common human-style verbs
+// some CLIs print, and unified-diff headers. claude's stream-splitter renders
+// tool_use without its file_path input, so those edits are recovered from the
+// raw .jsonl side channel instead (see filesFromSideChannel).
 var editedFilePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`"file_path"\s*:\s*"([^"]+)"`),
+	// codex `exec --json` file_change rendered by the stream-splitter as
+	// "[codex] <kind> <path>" (renderCodexItem). The two whitespace-separated
+	// tokens after the tag distinguish it from "[codex] $ …", "[codex] exit=…",
+	// and "[codex] usage: …", none of which present as <word> <token>.
+	regexp.MustCompile(`^\s*\[codex\]\s+\w+\s+(\S+)`),
 	regexp.MustCompile(`(?i)^\s*(?:Edited|Editing|Wrote|Writing|Created|Creating|Modified|Updated)\s+(?:file\s+)?(\S+)`),
 	regexp.MustCompile(`^\+\+\+ b/(\S+)`),
 	regexp.MustCompile(`^diff --git a/\S+ b/(\S+)`),
@@ -116,10 +137,41 @@ func ExtractPostmortem(path string, tailLines int) string {
 	if err != nil {
 		return "" // missing / unreadable ⇒ graceful degradation
 	}
+	// Bound extraction to the just-failed attempt: respawns append to the same
+	// slot.log, so a short final attempt would otherwise inherit an older
+	// attempt's failures/files (#835 review).
+	tail = isolateCurrentAttempt(tail)
 	if strings.TrimSpace(tail) == "" {
 		return "" // empty log ⇒ no section
 	}
-	return extractPostmortemBody(tail)
+	// The claude stream-splitter renders tool_use without its file_path input,
+	// so the "files touched" section would be empty for stream-split logs.
+	// Recover those paths from the raw NDJSON side channel, likewise bounded to
+	// the current attempt. Best-effort: a missing/unreadable jsonl yields none.
+	sideChannelFiles := filesFromSideChannel(JSONLPathForLog(path), tailLines)
+	return extractPostmortemBody(tail, sideChannelFiles)
+}
+
+// isolateCurrentAttempt returns the slice of log text after the last line whose
+// trimmed form begins with workerLogAttemptMarker — the banner the worker
+// runner writes at the start of every (re)spawn. The final marker delimits the
+// most recent attempt, so everything after it is that attempt's own output. The
+// marker line itself is dropped (it carries a host worktree path). When no
+// marker is present — a non-stream-split/legacy log, or an attempt longer than
+// the scanned tail — the whole tail is already current-attempt output and is
+// returned unchanged.
+func isolateCurrentAttempt(text string) string {
+	lines := strings.Split(text, "\n")
+	last := -1
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), workerLogAttemptMarker) {
+			last = i
+		}
+	}
+	if last < 0 {
+		return text
+	}
+	return strings.Join(lines[last+1:], "\n")
 }
 
 // readLogTail returns the last limit lines of the file at path joined by
@@ -152,12 +204,24 @@ func readLogTail(path string, limit int) (string, error) {
 
 // extractPostmortemBody runs the heuristic pass over already-read log text and
 // returns the redacted markdown body (or "" when nothing useful was found).
-func extractPostmortemBody(logText string) string {
+// sideChannelFiles are paths recovered from the raw .jsonl side channel (edits
+// the rendered slot.log dropped); they are merged after the in-log matches so
+// log order is preserved.
+func extractPostmortemBody(logText string, sideChannelFiles []string) string {
 	rawLines := strings.Split(logText, "\n")
 
 	var failures, files, actions []string
 	seenFailure := map[string]bool{}
 	seenFile := map[string]bool{}
+
+	addFile := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || seenFile[path] || len(files) >= maxPostmortemEditedFiles {
+			return
+		}
+		seenFile[path] = true
+		files = append(files, path)
+	}
 
 	for _, raw := range rawLines {
 		line := trimPostmortemLine(raw)
@@ -168,12 +232,12 @@ func extractPostmortemBody(logText string) string {
 			seenFailure[line] = true
 			failures = append(failures, line)
 		}
-		if len(files) < maxPostmortemEditedFiles {
-			if path := extractEditedFile(raw); path != "" && !seenFile[path] {
-				seenFile[path] = true
-				files = append(files, path)
-			}
+		if path := extractEditedFile(raw); path != "" {
+			addFile(path)
 		}
+	}
+	for _, path := range sideChannelFiles {
+		addFile(path)
 	}
 
 	// Last actions: the final non-empty lines, in chronological order.
@@ -265,6 +329,158 @@ func extractEditedFile(raw string) string {
 		}
 	}
 	return ""
+}
+
+// filesFromSideChannel recovers the paths of files the attempt edited from the
+// raw NDJSON side channel (slot.jsonl) the stream-splitter appends alongside the
+// rendered slot.log. This is where claude tool_use edits keep their file_path
+// (the rendered log drops it) and where codex file_change items keep their
+// paths. Best-effort: an empty path, a missing/unreadable jsonl, or a log that
+// never used stream-split all yield no extra files. Like the log tail it is
+// bounded to the current attempt so a respawn's earlier edits are not attributed
+// to the just-failed one.
+func filesFromSideChannel(jsonlPath string, tailLines int) []string {
+	if strings.TrimSpace(jsonlPath) == "" {
+		return nil
+	}
+	if tailLines <= 0 {
+		tailLines = PostmortemTailLines
+	}
+	tail, err := readLogTail(jsonlPath, tailLines)
+	if err != nil || strings.TrimSpace(tail) == "" {
+		return nil
+	}
+	return filesFromRawFrames(isolateCurrentAttemptJSONL(tail))
+}
+
+// isolateCurrentAttemptJSONL slices raw NDJSON to the frames at and after the
+// last session-start frame. The side channel carries no worker-worktree banner
+// (that goes straight to slot.log, not through the splitter), so the backend's
+// own run-start frame — claude's system/init, codex's thread.started — is the
+// per-attempt boundary. When none is present the whole tail is returned.
+func isolateCurrentAttemptJSONL(text string) string {
+	lines := strings.Split(text, "\n")
+	last := -1
+	for i, l := range lines {
+		if isSessionStartFrame(l) {
+			last = i
+		}
+	}
+	if last < 0 {
+		return text
+	}
+	return strings.Join(lines[last:], "\n")
+}
+
+// isSessionStartFrame reports whether a raw NDJSON line is a backend's
+// session-start frame: claude emits {"type":"system","subtype":"init",…} and
+// codex emits {"type":"thread.started",…} at the start of each (re)spawn.
+func isSessionStartFrame(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || trimmed[0] != '{' {
+		return false
+	}
+	var f struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+	}
+	if json.Unmarshal([]byte(trimmed), &f) != nil {
+		return false
+	}
+	switch f.Type {
+	case "system":
+		return f.Subtype == "init"
+	case "thread.started":
+		return true
+	}
+	return false
+}
+
+// rawFileFrame is the subset of a raw NDJSON frame that carries an edited path:
+// a claude assistant/user message (tool_use blocks live in Content) or a codex
+// item envelope (file_change items carry Changes).
+type rawFileFrame struct {
+	Message *struct {
+		Content json.RawMessage `json:"content"`
+	} `json:"message"`
+	Item *struct {
+		Changes []struct {
+			Path string `json:"path"`
+		} `json:"changes"`
+	} `json:"item"`
+}
+
+// rawToolBlock is the subset of a claude message content block needed to
+// recover an edit target: a tool_use block whose input names a file.
+type rawToolBlock struct {
+	Type  string `json:"type"`
+	Input struct {
+		FilePath     string `json:"file_path"`
+		NotebookPath string `json:"notebook_path"`
+	} `json:"input"`
+}
+
+// filesFromRawFrames extracts edited-file paths from raw NDJSON frames: claude
+// tool_use file_path/notebook_path inputs and codex file_change item paths.
+// Paths are de-duplicated and capped at maxPostmortemEditedFiles.
+func filesFromRawFrames(text string) []string {
+	var files []string
+	seen := map[string]bool{}
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || seen[path] || len(files) >= maxPostmortemEditedFiles {
+			return
+		}
+		seen[path] = true
+		files = append(files, path)
+	}
+	for _, raw := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || trimmed[0] != '{' {
+			continue
+		}
+		var fr rawFileFrame
+		if json.Unmarshal([]byte(trimmed), &fr) != nil {
+			continue
+		}
+		if fr.Message != nil {
+			for _, p := range claudeEditPaths(fr.Message.Content) {
+				add(p)
+			}
+		}
+		if fr.Item != nil {
+			for _, c := range fr.Item.Changes {
+				add(c.Path)
+			}
+		}
+	}
+	return files
+}
+
+// claudeEditPaths returns the file paths of the tool_use blocks in a claude
+// message content field. Only blocks that actually carry a file_path or
+// notebook_path input contribute, so Read/Grep/Bash tool_use blocks add
+// nothing; content that is a plain string (some user messages) yields none.
+func claudeEditPaths(content json.RawMessage) []string {
+	if len(content) == 0 {
+		return nil
+	}
+	var blocks []rawToolBlock
+	if json.Unmarshal(content, &blocks) != nil {
+		return nil
+	}
+	var paths []string
+	for _, b := range blocks {
+		if b.Type != "tool_use" {
+			continue
+		}
+		if p := strings.TrimSpace(b.Input.FilePath); p != "" {
+			paths = append(paths, p)
+		} else if p := strings.TrimSpace(b.Input.NotebookPath); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 func reverse(s []string) {

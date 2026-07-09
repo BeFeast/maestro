@@ -158,6 +158,143 @@ func TestExtractPostmortem_TailBounded(t *testing.T) {
 	}
 }
 
+// #835 review comment 1: respawns append to the same slot.log, so the tail can
+// carry an older attempt's output. The extractor isolates the region after the
+// last worker-worktree banner (the per-(re)spawn marker) so the prior attempt's
+// failures/files are not mislabeled as the current one — and the banner's host
+// path never leaks into the post-mortem.
+func TestExtractPostmortem_IsolatesCurrentAttempt(t *testing.T) {
+	log := strings.Join([]string{
+		"[maestro] worker worktree: /home/wt/slot-1",
+		"--- FAIL: TestOld (0.00s)",
+		"Wrote internal/old.go",
+		"exit status 1",
+		"[maestro] worker worktree: /home/wt/slot-1", // attempt 2 begins here
+		"running go test ./...",
+		"--- FAIL: TestNew (0.00s)",
+		"Wrote internal/new.go",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	for _, stale := range []string{"TestOld", "internal/old.go"} {
+		if strings.Contains(out, stale) {
+			t.Errorf("prior attempt content %q should be isolated out:\n%s", stale, out)
+		}
+	}
+	for _, want := range []string{"TestNew", "internal/new.go"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("current attempt content %q missing:\n%s", want, out)
+		}
+	}
+	// The worker-worktree banner is a host path and must not reach the prompt.
+	if strings.Contains(out, "worker worktree") {
+		t.Errorf("worktree banner should not appear in the post-mortem:\n%s", out)
+	}
+}
+
+// #835 review comment 2: the codex stream-splitter renders file changes as
+// "[codex] <kind> <path>", which the earlier patterns ignored, so the edited
+// files were dropped for stream-split codex logs. Command/exit lines under the
+// same tag must not be misread as files.
+func TestExtractPostmortem_CodexRenderedFileChange(t *testing.T) {
+	log := strings.Join([]string{
+		"[codex] $ /bin/bash -lc go test ./...",
+		"--- FAIL: TestFoo (0.00s)",
+		"[codex] exit=1",
+		"[codex] modified internal/codexedit.go",
+		"[codex] add newpkg/newfile.go",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	for _, want := range []string{"internal/codexedit.go", "newpkg/newfile.go"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("codex-rendered edit %q not captured:\n%s", want, out)
+		}
+	}
+	// "[codex] $ …" (a command, not a file change) must not leak into the files
+	// section — it legitimately appears under "last actions".
+	if files := postmortemSection(out, "Files the previous attempt touched"); strings.Contains(files, "/bin/bash") {
+		t.Errorf("codex command token misparsed as a file:\n%s", files)
+	}
+	// A rendered non-zero codex exit is a failure signal.
+	if !strings.Contains(out, "[codex] exit=1") {
+		t.Errorf("codex non-zero exit should be flagged as a failure:\n%s", out)
+	}
+}
+
+// #835 review comment 2: the claude stream-splitter renders tool_use without
+// its file_path input, so the edited files live only in the raw .jsonl side
+// channel. The extractor reads that side channel to recover them.
+func TestExtractPostmortem_ClaudeJSONLSideChannel(t *testing.T) {
+	// slot.log — the rendered stream — drops file_path from tool_use.
+	logContent := strings.Join([]string{
+		"[claude] model: claude-opus-4",
+		"Let me edit the file.",
+		"[tool_use: Edit]",
+		"--- FAIL: TestBar (0.00s)",
+		"[tool_use: Write]",
+	}, "\n")
+	// slot.jsonl — the raw NDJSON side channel — keeps file_path.
+	jsonlContent := strings.Join([]string{
+		`{"type":"system","subtype":"init","model":"claude-opus-4"}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"internal/edited.go"}}]}}`,
+		`{"type":"user","message":{"content":"tool result string, not an array"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"internal/written.go"}}]}}`,
+	}, "\n")
+
+	logPath := writeTempLogAndJSONL(t, logContent, jsonlContent)
+	out := ExtractPostmortem(logPath, PostmortemTailLines)
+
+	for _, want := range []string{"Files the previous attempt touched", "internal/edited.go", "internal/written.go"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("claude jsonl side-channel edit %q not captured:\n%s", want, out)
+		}
+	}
+}
+
+// The .jsonl side channel also accumulates across respawns; its per-attempt
+// boundary is the backend's session-start frame (claude system/init here), so a
+// prior attempt's edits must not surface for the just-failed attempt.
+func TestExtractPostmortem_JSONLIsolatesCurrentAttempt(t *testing.T) {
+	logContent := strings.Join([]string{
+		"[maestro] worker worktree: /home/wt/slot-1",
+		"[tool_use: Edit]",
+	}, "\n")
+	jsonlContent := strings.Join([]string{
+		`{"type":"system","subtype":"init","model":"m"}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"internal/attempt1.go"}}]}}`,
+		`{"type":"system","subtype":"init","model":"m"}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"internal/attempt2.go"}}]}}`,
+	}, "\n")
+
+	logPath := writeTempLogAndJSONL(t, logContent, jsonlContent)
+	out := ExtractPostmortem(logPath, PostmortemTailLines)
+
+	if strings.Contains(out, "internal/attempt1.go") {
+		t.Errorf("prior attempt's jsonl edit should be isolated out:\n%s", out)
+	}
+	if !strings.Contains(out, "internal/attempt2.go") {
+		t.Errorf("current attempt's jsonl edit missing:\n%s", out)
+	}
+}
+
+// postmortemSection returns the body of the "### <heading>" section of a
+// post-mortem, up to the next "### " heading or the end of the text.
+func postmortemSection(out, heading string) string {
+	marker := "### " + heading
+	idx := strings.Index(out, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := out[idx+len(marker):]
+	if next := strings.Index(rest, "\n### "); next >= 0 {
+		return rest[:next]
+	}
+	return rest
+}
+
 func writeTempLog(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "worker.log")
@@ -165,4 +302,19 @@ func writeTempLog(t *testing.T, content string) string {
 		t.Fatalf("write temp log: %v", err)
 	}
 	return path
+}
+
+// writeTempLogAndJSONL writes slot.log and its paired slot.jsonl side channel
+// into the same directory so JSONLPathForLog resolves the pair.
+func writeTempLogAndJSONL(t *testing.T, logContent, jsonlContent string) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "slot.log")
+	if err := os.WriteFile(logPath, []byte(logContent), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	if err := os.WriteFile(JSONLPathForLog(logPath), []byte(jsonlContent), 0o644); err != nil {
+		t.Fatalf("write jsonl: %v", err)
+	}
+	return logPath
 }
