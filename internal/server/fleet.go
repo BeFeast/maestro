@@ -1405,6 +1405,44 @@ type fleetEffectiveConfig struct {
 	CostCaps       fleetConfigCostCaps   `json:"cost_caps"`
 	SupervisorGate fleetConfigSupervisor `json:"supervisor_gate"`
 	ApprovalAction string                `json:"approval_action"`
+
+	// CostControls is the #839 fleet-settings layer surfaced per project: each
+	// cost-control knob with its effective value and source (builtin/fleet/
+	// project), so Mission Control can render a Settings panel that highlights
+	// non-default overrides. Populated only when the config came from the store
+	// (SettingSources is non-nil); empty for file-loaded configs.
+	CostControls []fleetCostControl `json:"cost_controls"`
+}
+
+// fleetCostControl is one fleet-settable knob's effective value and provenance.
+type fleetCostControl struct {
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+	Source string `json:"source"` // builtin | fleet | project
+}
+
+// buildFleetCostControls renders the #839 cost-control knobs from a resolved
+// config and its SettingSources annotation. A nil SettingSources (file-loaded
+// config, no fleet layer) yields an empty slice, so the panel simply shows no
+// provenance for non-store deployments.
+func buildFleetCostControls(cfg *config.Config) []fleetCostControl {
+	if cfg == nil || cfg.SettingSources == nil {
+		return nil
+	}
+	values := configstore.CostControlValues(cfg)
+	out := make([]fleetCostControl, 0, len(configstore.SettingSpecs()))
+	for _, spec := range configstore.SettingSpecs() {
+		source := cfg.SettingSources[spec.Name]
+		if source == "" {
+			source = configstore.SourceBuiltin
+		}
+		out = append(out, fleetCostControl{
+			Key:    spec.Name,
+			Value:  values[spec.Name],
+			Source: source,
+		})
+	}
+	return out
 }
 
 type fleetModelPolicy struct {
@@ -3684,6 +3722,7 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			MeteredBackendRefused:   meteredRefused,
 		},
 		ApprovalAction: config.SupervisorActionChangeGlobalConfig,
+		CostControls:   buildFleetCostControls(cfg),
 	}
 }
 

@@ -67,6 +67,7 @@ supervisor:
 	}
 	fromYAML.SourcePath = ""
 	fromStore.SourcePath = ""
+	fromStore.SettingSources = nil // load-time provenance annotation (#839), not from Parse
 	if !reflect.DeepEqual(fromStore, fromYAML) {
 		t.Fatalf("store config differs from yaml\nstore=%#v\nyaml=%#v", fromStore.Model, fromYAML.Model)
 	}

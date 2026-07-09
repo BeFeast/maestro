@@ -1451,6 +1451,14 @@ type Config struct {
 	StaleSessionReconciler          StaleSessionReconcilerConfig `yaml:"stale_session_reconciler"` // filter stale supervisor sessions from operator attention
 	SessionRetention                SessionRetentionConfig       `yaml:"session_retention"`        // #497: bound state.Sessions growth via terminal-session compaction
 	SourcePath                      string                       `yaml:"-"`                        // path the config was loaded from (not serialized)
+
+	// SettingSources records, for each fleet-settable cost-control knob
+	// (#839), where its effective value came from: "project" (row YAML),
+	// "fleet" (fleet-level default overlaid at load), or "builtin" (neither
+	// set; config.parse default). Populated only by the config store's Load;
+	// nil for file-loaded configs (which have no fleet layer). Surfaced on
+	// effective_config so Mission Control can flag non-default overrides.
+	SettingSources map[string]string `yaml:"-" json:"-"`
 }
 
 // LoadFrom loads config from a specific path.

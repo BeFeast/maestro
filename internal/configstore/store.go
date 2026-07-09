@@ -82,7 +82,13 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Init(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, Schema)
+	if _, err := s.db.ExecContext(ctx, Schema); err != nil {
+		return err
+	}
+	// SettingsSchema adds the fleet-settings layer tables (#839). Run in the
+	// same Init so a store opened against an older config.db migrates forward
+	// (both use IF NOT EXISTS, so re-running is a no-op).
+	_, err := s.db.ExecContext(ctx, SettingsSchema)
 	return err
 }
 
@@ -97,6 +103,7 @@ func (s *Store) ImportDir(ctx context.Context, dir string) error {
 	}
 	defer tx.Rollback()
 
+	var fleetSettingsData []byte // #839: routed to the settings table post-commit
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -110,6 +117,10 @@ func (s *Store) ImportDir(ctx context.Context, dir string) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
+		if name == fleetSettingsFileName {
+			fleetSettingsData = data // not a project — import after the project tx
+			continue
+		}
 		if err := importProject(ctx, tx, path, data); err != nil {
 			return fmt.Errorf("import %s: %w", path, err)
 		}
@@ -121,7 +132,17 @@ func (s *Store) ImportDir(ctx context.Context, dir string) error {
 	if count == 0 {
 		return fmt.Errorf("no config files found in %s", dir)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// SetFleetSetting opens its own transaction, so it must run after the
+	// project tx commits (the store serializes on a single connection).
+	if len(fleetSettingsData) > 0 {
+		if err := s.importFleetSettings(ctx, fleetSettingsData); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SourcePathPrefix marks a config's SourcePath as a config-store row
@@ -137,10 +158,32 @@ func (s *Store) Load(ctx context.Context, name string) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Overlay fleet-level defaults (#839): parse the row's raw YAML, inject each
+	// fleet default the project does not set itself, then parse the merged
+	// document. Sources are computed off the RAW node (before overlay) so a
+	// project value reads as "project", an injected default as "fleet", and an
+	// untouched knob as "builtin".
+	fleet, err := s.FleetSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var rawRoot yaml.Node
+	if err := yaml.Unmarshal(data, &rawRoot); err != nil {
+		return nil, err
+	}
+	sources := settingSources(&rawRoot, fleet)
+	if len(fleet) > 0 {
+		applyFleetSettings(&rawRoot, fleet)
+		data, err = marshalNode(&rawRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
 	cfg, err := config.Parse(data)
 	if err != nil {
 		return nil, err
 	}
+	cfg.SettingSources = sources
 	if strings.TrimSpace(sourcePath) == "" {
 		// No originating file (write-API row): report the store row itself so
 		// path consumers surface "store:<name>" instead of inventing a
@@ -185,6 +228,59 @@ func (s *Store) ExportDir(ctx context.Context, dir string) error {
 		}
 		if err := os.WriteFile(filepath.Join(dir, name+".yaml"), data, 0644); err != nil {
 			return fmt.Errorf("write export %s: %w", name, err)
+		}
+	}
+	// Round-trip the fleet-settings layer as a standalone file (#839 AC5) so a
+	// re-import restores the fleet defaults, not just the per-project rows. The
+	// leading underscore keeps it out of the project-import glob and sorts it
+	// first for an operator eyeballing the export dir.
+	if err := s.exportFleetSettings(ctx, dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fleetSettingsFileName is the export/import filename for the fleet-settings
+// layer. It is NOT a project config — ImportDir routes it to the settings table
+// and the project glob skips it.
+const fleetSettingsFileName = "_fleet-settings.yaml"
+
+// fleetSettingsDoc is the on-disk shape of the exported fleet-settings layer.
+type fleetSettingsDoc struct {
+	Settings map[string]string `yaml:"settings"`
+}
+
+func (s *Store) exportFleetSettings(ctx context.Context, dir string) error {
+	fleet, err := s.FleetSettings(ctx)
+	if err != nil {
+		return err
+	}
+	if len(fleet) == 0 {
+		return nil // nothing to round-trip
+	}
+	data, err := yaml.Marshal(fleetSettingsDoc{Settings: fleet})
+	if err != nil {
+		return fmt.Errorf("marshal fleet settings: %w", err)
+	}
+	header := []byte("# maestro fleet-level settings layer (#839): defaults applied\n" +
+		"# to any project that does not set the key itself.\n")
+	if err := os.WriteFile(filepath.Join(dir, fleetSettingsFileName), append(header, data...), 0644); err != nil {
+		return fmt.Errorf("write fleet settings: %w", err)
+	}
+	return nil
+}
+
+// importFleetSettings loads a previously exported fleet-settings file into the
+// settings table. Unknown keys are rejected so a typo in a hand-edited export
+// is caught at import rather than silently overlaying a dead key.
+func (s *Store) importFleetSettings(ctx context.Context, data []byte) error {
+	var doc fleetSettingsDoc
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("parse %s: %w", fleetSettingsFileName, err)
+	}
+	for key, value := range doc.Settings {
+		if err := s.SetFleetSetting(ctx, key, value, "config-store import"); err != nil {
+			return fmt.Errorf("%s: %w", fleetSettingsFileName, err)
 		}
 	}
 	return nil
@@ -515,7 +611,25 @@ func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, 
 		}
 		out[name] = ts
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Fold the fleet-settings fingerprint into every project's timestamp so a
+	// fleet-level `settings set` advances all store-backed watchers and each
+	// project hot-reloads on its next poll without a restart (#839 AC1). A
+	// per-project override already advances that row's own updated_at above.
+	settingsTS, err := s.settingsFingerprint(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !settingsTS.IsZero() {
+		for name, ts := range out {
+			if settingsTS.After(ts) {
+				out[name] = settingsTS
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) exportProjectYAML(ctx context.Context, name string) ([]byte, string, error) {
