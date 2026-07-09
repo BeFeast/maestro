@@ -679,6 +679,14 @@ const (
 	// surfaced as evidence. NEVER a silent dead-end (#565).
 	StuckReviewRepairExhausted = "review_repair_exhausted"
 	StuckSearchGuardrailTrip   = "search_guardrail_trip"
+	// StuckSupervisorMeteredBackend is emitted when the supervisor LLM path is
+	// refused because supervisor.backend (or its model.default fallback) resolves
+	// to a metered (per-token) backend and supervisor.allow_metered_backend is not
+	// set (#838). The cycle runs deterministic-only so an always-on loop cannot
+	// silently burn per-token cost; the code surfaces the disabled LLM path as a
+	// red attention badge on Mission Control until the operator re-points the
+	// backend or opts in.
+	StuckSupervisorMeteredBackend = "supervisor_metered_backend"
 	// StuckGuardrailConflict is emitted when the supervisor LLM's
 	// recommendation disagrees with the deterministic guardrail (#689).
 	// The conflict is resolved to the safe side for the cycle (the

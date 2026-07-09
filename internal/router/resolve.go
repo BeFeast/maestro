@@ -40,6 +40,12 @@ const (
 	// usable tier backend (e.g. tier points at a now-missing backend) and fell
 	// back to model.default — the policy analogue of ReasonRouterError.
 	ReasonPolicyError = "policy_error"
+	// ReasonMeteredRefused marks an auto-routing decision that skipped the router
+	// LLM call because routing.router_model is metered (per-token) and
+	// routing.allow_metered_backend is not set (#838). Selection falls back to
+	// model.default deterministically — distinct from ReasonRouterError so the
+	// dashboard can tell a cost guard from a genuine router failure.
+	ReasonMeteredRefused = "metered_refused"
 )
 
 // BackendFromLabels extracts a backend name from issue labels with the "model:" prefix.
@@ -115,6 +121,16 @@ func (r *Router) ResolveBackendDecisionForAttempt(issue github.Issue, escalation
 
 	// 3. Auto-routing via LLM (if enabled)
 	if r.cfg.Routing.Mode == "auto" {
+		// #838: refuse the router LLM call when router_model is metered
+		// (per-token) and routing.allow_metered_backend is not set. A per-issue
+		// LLM classification on a per-token backend is the same unbounded burn
+		// class as the supervisor loop, so fall back to model.default
+		// deterministically instead of dispatching the call.
+		if backend, refused := r.cfg.RouterMeteredRefusal(); refused {
+			log.Printf("[router] issue #%d: router_model %q is metered (per-token) and routing.allow_metered_backend is not set — skipping router LLM, using default %q (#838)",
+				issue.Number, backend, r.cfg.Model.Default)
+			return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonMeteredRefused}
+		}
 		routeDecisionFn := r.RouteDecision
 		if r.DecisionFn != nil {
 			routeDecisionFn = r.DecisionFn

@@ -472,24 +472,40 @@ func recordOutcomeHealth(cfg *config.Config, st *state.State) {
 func (e *Engine) Decide(st *state.State) (state.SupervisorDecision, error) {
 	var decision state.SupervisorDecision
 	var err error
-	if st.PauseActive() && len(st.ActiveSessions()) == 0 {
+	// #838: refuse the LLM supervisor path when its resolved backend is metered
+	// (per-token) and the project has not opted in. The refusal drops this cycle
+	// to deterministic-only — decideWithLLM (and any supervisor backend call) is
+	// never reached — so a config-store edit re-pointing supervisor.backend at a
+	// per-token model cannot silently burn on always-on "do nothing" cycles.
+	meteredBackend, meteredRefused := e.meteredBackendRefused()
+	paused := st.PauseActive() && len(st.ActiveSessions()) == 0
+	if paused {
 		// Operator pause (#683) with no in-flight work: report the paused
 		// state instead of treating the idle project as a stall or
 		// recommending new work. While a worker is still finishing, normal
 		// decision flow continues so its PR keeps being monitored; the
 		// orchestrator's spawn gate prevents any new worker regardless.
 		decision = e.pausedDecision(st)
-	} else if e.cfg.Supervisor.Enabled && !e.emergencyLLMHalt {
+	} else if e.cfg.Supervisor.Enabled && !e.emergencyLLMHalt && !meteredRefused {
 		// EMERGENCY STOP (#840): when the fleet-wide LLM stop is active the
 		// supervisor drops to deterministic-only — decideWithLLM is never
 		// invoked, so no supervisor backend call is made — while every other
-		// read-only signal (state, GitHub reads, journal) keeps flowing.
+		// read-only signal (state, GitHub reads, journal) keeps flowing. The
+		// metered-backend guard (#838) drops to the same deterministic path.
 		decision, err = e.decideWithLLM(st)
 	} else {
 		decision, err = e.decideDeterministic(st)
 	}
 	if err != nil {
 		return state.SupervisorDecision{}, err
+	}
+	if meteredRefused && !paused {
+		// notify_red-grade: the supervisor is silently running degraded (no LLM
+		// second opinion) until an operator acts, so log it loudly every cycle and
+		// attach the red stuck state so Mission Control surfaces the disabled path.
+		// Suppressed while fully paused — nothing is spending, so it is not a red.
+		log.Printf("[supervisor] REFUSING LLM path: supervisor backend %q is metered (per-token) and supervisor.allow_metered_backend is not set; running deterministic-only this cycle (#838)", meteredBackend)
+		decision.StuckStates = appendStuck(decision.StuckStates, meteredBackendStuckState(meteredBackend))
 	}
 	outcomeStatus := e.outcomeStatus(st)
 	decision.Outcome = &outcomeStatus

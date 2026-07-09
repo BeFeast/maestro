@@ -317,6 +317,65 @@ model:
       subagent_hint: "Use cheaper sub-agent models (e.g. opus/sonnet) for delegated grunt subtasks such as file sweeps, searches, and mechanical edits; reserve the main orchestrator model for planning and final review."
 ```
 
+### Pricing classes and the metered-backend guard (`pricing_class`, #838)
+
+Maestro's always-on internal loops — the supervisor cycle and the auto-router —
+call an LLM on a schedule regardless of whether there is work to do. Pointing one
+of those loops at a **per-token metered** model burns money making "do nothing"
+decisions: on 2026-07-09 the shared `codex` backend row was re-pointed at a
+per-token model and supervise cycles burned ~$4/hour across nine idle projects
+before anyone noticed. The `pricing_class` guard caps that blast radius.
+
+Declare how each backend bills with `pricing_class`:
+
+```yaml
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude
+      pricing_class: subscription   # fixed monthly plan (Claude Max, etc.)
+    fireworks-kimi:
+      cmd: fw
+      provider: fireworks
+      pricing_class: metered        # per-token — gated from always-on loops
+```
+
+- `flat` / `subscription` — a fixed-cost plan. Always-on loops run normally.
+- `metered` — billed per token. The supervisor and router **refuse** to run
+  their LLM path on this backend unless the project opts in explicitly.
+- unset — treated as `flat` for backward compatibility. A backend that only sets
+  a `pricing:` table for cost observability (#619) is **not** gated; mark it
+  `metered` explicitly to activate the guard.
+
+When `supervisor.backend` (or the `model.default` fallback the supervisor uses)
+resolves to a `metered` backend and the project has not opted in, the supervisor
+drops to **deterministic-only** for that cycle — no supervisor backend call is
+made — and surfaces a red *"Metered backend"* attention badge on Mission Control
+until the operator re-points the backend or opts in. A config-store edit that
+re-points the backend at a per-token model therefore cannot silently start
+burning: the next supervise cycle runs deterministic-only and logs the refusal.
+The same guard applies to `routing.router_model` when `routing.mode: auto` — the
+router skips its per-issue LLM classification and falls back to `model.default`.
+
+Opt in per project when the per-token cost is acceptable:
+
+```yaml
+supervisor:
+  allow_metered_backend: true   # supervisor LLM may run on a metered backend
+routing:
+  allow_metered_backend: true   # auto-router LLM may run on a metered backend
+```
+
+The supervisor opt-in and the current refusal are visible on the fleet API under
+`effective_config.supervisor_gate` (`allow_metered_backend`,
+`metered_backend_refused`, `metered_backend`), and each backend's classification
+appears under `effective_config.model_policy.backends[].metered`.
+
+**Workers are not gated.** A worker is bounded by `worker_max_tokens` and produces
+a concrete PR, so a metered worker backend is a deliberate, bounded spend — this
+guard targets only the unbounded always-on loops.
+
 ### Optional: parallel review streams
 
 By default, `review_gate: greptile` waits for the single Greptile verdict before merge. Projects that also run the simplicity / over-engineering reviewer can opt in to the aggregate gate:

@@ -1197,8 +1197,12 @@ type fleetSummary struct {
 	OutcomeMissing   int `json:"outcome_missing"`
 	OutcomeDrift     int `json:"outcome_drift"`
 	StaleWorkers     int `json:"stale_workers"`
-	Running          int `json:"running"`
-	PROpen           int `json:"pr_open"`
+	// MeteredBackend counts projects whose supervisor LLM path is disabled
+	// because it resolves to a metered backend without opt-in (#838). It
+	// escalates the fleet verdict to attention like the other error-class states.
+	MeteredBackend int `json:"metered_backend"`
+	Running        int `json:"running"`
+	PROpen         int `json:"pr_open"`
 	// PRsOpen / WorkersRunning are truth-table mirrors expected by the
 	// SPA (#566). PRsOpen extends pr_open with retry_exhausted /
 	// failed / conflict_failed sessions whose PR is still open;
@@ -1422,12 +1426,19 @@ type fleetEffectiveBackendConfig struct {
 	PriceConfigured  bool    `json:"price_configured"`
 	InputUSDPerMtok  float64 `json:"input_usd_per_mtok,omitempty"`
 	OutputUSDPerMtok float64 `json:"output_usd_per_mtok,omitempty"`
+	// PricingClass / Metered surface the #838 pricing classification so an
+	// operator can see which backends the metered guard treats as per-token.
+	PricingClass string `json:"pricing_class,omitempty"`
+	Metered      bool   `json:"metered,omitempty"`
 }
 
 type fleetEffectiveRoutingConfig struct {
 	Mode            string `json:"mode,omitempty"`
 	RouterModel     string `json:"router_model,omitempty"`
 	RouterModelName string `json:"router_model_name,omitempty"`
+	// AllowMeteredBackend surfaces the router opt-in for a metered router_model
+	// (#838); false is the default guarded behavior.
+	AllowMeteredBackend bool `json:"allow_metered_backend,omitempty"`
 }
 
 type fleetConfigLabels struct {
@@ -1470,6 +1481,13 @@ type fleetConfigSupervisor struct {
 	ReviewRepairActive      bool     `json:"review_repair_active"`
 	ReviewRepairBackend     string   `json:"review_repair_backend,omitempty"`
 	ReviewRepairMaxRetries  int      `json:"review_repair_max_retries,omitempty"`
+	// AllowMeteredBackend surfaces the #838 supervisor opt-in: when false (the
+	// default) the supervisor refuses its LLM path if the resolved backend is
+	// metered. MeteredBackendRefused reports whether that refusal is currently
+	// active for this project's resolved supervisor backend.
+	AllowMeteredBackend   bool   `json:"allow_metered_backend"`
+	MeteredBackendRefused bool   `json:"metered_backend_refused,omitempty"`
+	MeteredBackend        string `json:"metered_backend,omitempty"`
 }
 
 type fleetCloseCandidate struct {
@@ -2434,7 +2452,7 @@ func fleetVerdictTone(summary fleetSummary, latest *supervisorDecisionInfo, now 
 	if actionableAttention < 0 {
 		actionableAttention = 0
 	}
-	if summary.Stale > 0 || summary.Errors > 0 || actionableAttention > 0 || fleetActionableApprovalCount(summary) > 0 || summary.DispatchFailures > 0 || summary.OutcomeDrift > 0 || summary.NoEligibleIssues > 0 {
+	if summary.Stale > 0 || summary.Errors > 0 || actionableAttention > 0 || fleetActionableApprovalCount(summary) > 0 || summary.DispatchFailures > 0 || summary.OutcomeDrift > 0 || summary.NoEligibleIssues > 0 || summary.MeteredBackend > 0 {
 		return "attention"
 	}
 	if summary.Running > 0 {
@@ -2534,7 +2552,7 @@ func fleetAttentionSentence(summary fleetSummary) string {
 		selfResolving = summary.NeedsAttention
 	}
 	actionable := summary.NeedsAttention - selfResolving
-	items := actionable + fleetActionableApprovalCount(summary) + summary.Errors + summary.Stale + summary.DispatchFailures + summary.OutcomeDrift + summary.NoEligibleIssues
+	items := actionable + fleetActionableApprovalCount(summary) + summary.Errors + summary.Stale + summary.DispatchFailures + summary.OutcomeDrift + summary.NoEligibleIssues + summary.MeteredBackend
 	var base string
 	switch items {
 	case 0:
@@ -2584,6 +2602,8 @@ func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState)
 		summary.OutcomeDrift++
 	case "stale_worker":
 		summary.StaleWorkers++
+	case "metered_backend":
+		summary.MeteredBackend++
 	}
 }
 
@@ -2717,7 +2737,7 @@ type fleetNextActionCandidate struct {
 // kinds (working, monitoring_pr, idle, ...) are excluded from the brief.
 func fleetNextActionPriorityForKind(kind string) (int, bool) {
 	switch strings.TrimSpace(kind) {
-	case "error", "dispatch_failure", "stale_worker":
+	case "error", "dispatch_failure", "metered_backend", "stale_worker":
 		return 0, true
 	case "attention":
 		return 1, true
@@ -2748,7 +2768,7 @@ func fleetProjectOperatorUpdatedAt(project fleetProjectState) time.Time {
 				return t
 			}
 		}
-	case "dispatch_failure", "outcome_drift", "queue_blocked", "no_eligible_issues":
+	case "dispatch_failure", "metered_backend", "outcome_drift", "queue_blocked", "no_eligible_issues":
 		if project.Supervisor.Latest != nil && !project.Supervisor.Latest.CreatedAt.IsZero() {
 			return project.Supervisor.Latest.CreatedAt.UTC()
 		}
@@ -2975,6 +2995,8 @@ func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 			return "Redeploy maestro binary" // #711
 		}
 		return "Resolve stuck dispatch"
+	case "metered_backend":
+		return "Fix metered supervisor backend" // #838
 	case "stale_worker":
 		if op.PRNumber > 0 {
 			return fmt.Sprintf("Open worker log for PR #%d", op.PRNumber)
@@ -3103,7 +3125,7 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 
 func fleetOperatorKindNeedsAction(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "error", "dispatch_failure", "stale_worker", "attention", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
+	case "error", "dispatch_failure", "metered_backend", "stale_worker", "attention", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
 		return true
 	default:
 		return false
@@ -3162,6 +3184,10 @@ func fleetOperatorStatePriority(kind string) int {
 	case "error":
 		return 0
 	case "dispatch_failure":
+		return 1
+	case "metered_backend":
+		// #838: supervisor LLM disabled + per-token cost burn risk — an error-tone
+		// project outage that must sort near the top of the fleet list.
 		return 1
 	case "stale_worker":
 		return 2
@@ -3593,9 +3619,13 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			PriceConfigured:  def.Pricing.Configured(),
 			InputUSDPerMtok:  def.Pricing.InputUSDPerMtok,
 			OutputUSDPerMtok: def.Pricing.OutputUSDPerMtok,
+			PricingClass:     strings.TrimSpace(def.PricingClass),
+			Metered:          def.IsMetered(),
 		})
 	}
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Name < backends[j].Name })
+
+	meteredBackend, meteredRefused := cfg.SupervisorMeteredRefusal()
 
 	retention := cfg.SessionRetention
 	return fleetEffectiveConfig{
@@ -3604,9 +3634,10 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			FallbackBackends: append([]string(nil), cfg.Model.FallbackBackends...),
 			Backends:         backends,
 			Routing: fleetEffectiveRoutingConfig{
-				Mode:            strings.TrimSpace(cfg.Routing.Mode),
-				RouterModel:     strings.TrimSpace(cfg.Routing.RouterModel),
-				RouterModelName: strings.TrimSpace(cfg.Routing.RouterModelName),
+				Mode:                strings.TrimSpace(cfg.Routing.Mode),
+				RouterModel:         strings.TrimSpace(cfg.Routing.RouterModel),
+				RouterModelName:     strings.TrimSpace(cfg.Routing.RouterModelName),
+				AllowMeteredBackend: cfg.Routing.AllowMeteredBackend,
 			},
 		},
 		MaxParallel: cfg.MaxParallel,
@@ -3648,6 +3679,9 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			ReviewRepairActive:      cfg.Supervisor.ReviewRepair.Active(),
 			ReviewRepairBackend:     cfg.Supervisor.ReviewRepair.EffectiveBackend(),
 			ReviewRepairMaxRetries:  cfg.Supervisor.ReviewRepair.EffectiveMaxRetries(),
+			AllowMeteredBackend:     cfg.Supervisor.AllowMeteredBackend,
+			MeteredBackend:          meteredBackend,
+			MeteredBackendRefused:   meteredRefused,
 		},
 		ApprovalAction: config.SupervisorActionChangeGlobalConfig,
 	}
@@ -4067,6 +4101,12 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 	if state, ok := fleetDispatchFailureOperatorState(project); ok {
 		return state
 	}
+	// #838: supervisor LLM path disabled because its backend is metered and the
+	// project has not opted in. Surface as a high-priority red badge — the loop is
+	// running degraded (deterministic-only) and only an operator can restore it.
+	if state, ok := fleetMeteredBackendOperatorState(project); ok {
+		return state
+	}
 	if project.NeedsAttention > 0 {
 		// #598: separate "self-resolving" sessions (retry_exhausted with an
 		// open PR and no failing-check evidence — convergence will auto-merge
@@ -4431,6 +4471,29 @@ func fleetOutcomeHealthState(project fleetProjectState, health string) fleetOper
 		Summary:    fmt.Sprintf("Runtime outcome health is %s for %s.", strings.ReplaceAll(firstNonEmpty(health, outcome.HealthUnknown), "_", " "), goal),
 		NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
 	}
+}
+
+// fleetMeteredBackendOperatorState surfaces the #838 metered-backend refusal as
+// a red operator state. The supervisor attaches a StuckSupervisorMeteredBackend
+// stuck state to every deterministic-only cycle it runs while refusing a metered
+// backend, so the presence of that code on the latest decision is the signal.
+func fleetMeteredBackendOperatorState(project fleetProjectState) (fleetOperatorState, bool) {
+	latest := project.Supervisor.Latest
+	if latest == nil {
+		return fleetOperatorState{}, false
+	}
+	stuck, ok := findStuckState(latest.StuckStates, state.StuckSupervisorMeteredBackend)
+	if !ok {
+		return fleetOperatorState{}, false
+	}
+	operator := fleetOperatorState{
+		Kind:       "metered_backend",
+		Tone:       "error",
+		Label:      "Metered backend",
+		Summary:    firstNonEmpty(stuck.Summary, "Supervisor LLM disabled: metered backend without opt-in."),
+		NextAction: firstNonEmpty(stuck.RecommendedAction, "Point supervisor.backend at a flat/subscription backend, or set supervisor.allow_metered_backend: true to accept per-token cost."),
+	}
+	return applyFleetOperatorTarget(project, operator, stuck.Target), true
 }
 
 func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorState, bool) {
