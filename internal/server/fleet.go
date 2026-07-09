@@ -369,6 +369,17 @@ type FleetProjectStore interface {
 	DeleteProject(ctx context.Context, name string) error
 }
 
+// FleetSettingsStore is the write side of the fleet-level settings layer (#839)
+// the dashboard Settings panel needs: set a fleet default, set a per-project
+// override, or clear a fleet default. *configstore.Store satisfies it; the fleet
+// server reaches it by type-asserting the wired project store, so a deployment
+// without the daemon config store (serve --fleet) simply lacks the surface.
+type FleetSettingsStore interface {
+	SetFleetSetting(ctx context.Context, key, rawValue, actor string) error
+	SetProjectSetting(ctx context.Context, project, key, rawValue, actor string) error
+	DeleteFleetSetting(ctx context.Context, key, actor string) error
+}
+
 // SetEmergencySource wires the read side of the fleet-wide EMERGENCY STOP switch
 // (#840): the daemon passes a closure over its cached switch state so the fleet
 // snapshot reports the current level and the SPA renders the banner. Passing nil
@@ -845,6 +856,7 @@ func (s *FleetServer) buildHandler() http.Handler {
 	mux.HandleFunc("/api/v1/fleet/worker", s.handleFleetWorker)
 	mux.HandleFunc("/api/v1/fleet", s.handleFleet)
 	mux.HandleFunc("/api/v1/fleet/projects", s.handleFleetProjects)
+	mux.HandleFunc("/api/v1/fleet/settings", s.handleFleetSettings)
 	mux.HandleFunc("/api/v1/fleet/actions", s.handleFleetAction)
 	mux.HandleFunc("/api/v1/fleet/emergency", s.handleFleetEmergency)
 	mux.HandleFunc("/api/v1/fleet/approvals/", s.handleFleetApproval)
@@ -2129,6 +2141,115 @@ func (s *FleetServer) handleFleetProjectDelete(w http.ResponseWriter, r *http.Re
 		"project": name,
 		"action":  "delete_project",
 		"note":    "config store row removed; the daemon drains the flow on its next store-watch tick (requires --watch-store)",
+	})
+}
+
+type fleetSettingsRequest struct {
+	Key     string `json:"key"`
+	Value   string `json:"value"`
+	Project string `json:"project,omitempty"` // per-project override; empty = fleet default
+	Actor   string `json:"actor,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Unset   bool   `json:"unset,omitempty"` // clear a fleet default (revert to built-in)
+}
+
+// handleFleetSettings is the dashboard Settings-panel write endpoint for the
+// fleet-level cost-control knobs (#839). It writes the daemon's config store —
+// a fleet default (settings table), a per-project override (row YAML), or a
+// clear — and the change hot-reloads via the store-watch loop within one poll
+// interval. Every write is journaled in the store's settings_audit with the
+// authenticated actor and old→new values.
+//
+// Gating mirrors handleFleetProjects (change_global_config-class): auth fires
+// FIRST so an unauthenticated request always sees 401, read-only rejects with
+// 403, and a missing config store yields 501. A bad key/value is pre-validated
+// to 400 so a store write error is unambiguously infrastructure (500).
+func (s *FleetServer) handleFleetSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	authenticatedActor, ok := requireAuth(w, r, s.liveAuth())
+	if !ok {
+		return
+	}
+	if s.readOnly {
+		writeError(w, http.StatusForbidden, "fleet server is read-only; settings changes require write-enabled controls")
+		return
+	}
+	settingsStore, ok := s.liveProjectStore().(FleetSettingsStore)
+	if !ok || settingsStore == nil {
+		writeError(w, http.StatusNotImplemented, "settings changes require the daemon config store (run `maestro daemon`); not available under `serve --fleet`")
+		return
+	}
+
+	var req fleetSettingsRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("decode settings request: %v", err))
+			return
+		}
+	}
+	key := strings.TrimSpace(req.Key)
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
+	project := strings.TrimSpace(req.Project)
+
+	if req.Unset {
+		if project != "" {
+			writeError(w, http.StatusBadRequest, "--unset clears a fleet default only; a per-project override lives in its config row")
+			return
+		}
+		if !configstore.SettingKeyValid(key) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown setting %q", key))
+			return
+		}
+		if err := settingsStore.DeleteFleetSetting(r.Context(), key, actor); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("clear fleet setting %q: %v", key, err))
+			return
+		}
+		s.writeFleetSettingsAccepted(w, key, "", project, actor, req.Reason, "unset_setting")
+		return
+	}
+
+	// Pre-validate key + value so a bad request is 400, not a store 500.
+	if err := configstore.ValidateSetting(key, req.Value); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var err error
+	action := "set_fleet_setting"
+	if project != "" {
+		action = "set_project_setting"
+		err = settingsStore.SetProjectSetting(r.Context(), project, key, req.Value, actor)
+	} else {
+		err = settingsStore.SetFleetSetting(r.Context(), key, req.Value, actor)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("set setting %q: %v", key, err))
+		return
+	}
+	s.writeFleetSettingsAccepted(w, key, req.Value, project, actor, req.Reason, action)
+}
+
+func (s *FleetServer) writeFleetSettingsAccepted(w http.ResponseWriter, key, value, project, actor, reason, action string) {
+	scope := configstore.FleetScope
+	if project != "" {
+		scope = project
+	}
+	log.Printf("[fleet] settings %s %s=%q scope=%s by %s (reason=%q) — config store written; hot-reloads on the next store-watch tick", action, key, value, scope, actor, strings.TrimSpace(reason))
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"ok":     true,
+		"key":    key,
+		"scope":  scope,
+		"action": action,
+		"note":   "config store updated; effective on the next store-watch tick without a restart (requires --watch-store)",
 	})
 }
 

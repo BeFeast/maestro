@@ -113,8 +113,25 @@ files, so the builtin/fleet/project distinction survives a round-trip.
 ## Mission Control
 
 Mission Control surfaces `effective_config.cost_controls` per project, flagging
-each knob's source. Writing settings from the dashboard is a
-`change_global_config`-class action and is gated through the cautious approval
-flow — the same gate that guards other global-config changes — so a dashboard
-flip requires an approval, while the CLI (an operator on the host) writes
-directly.
+each knob's source (`builtin` / `fleet` / `project`).
+
+Writing settings from the dashboard goes through `POST /api/v1/fleet/settings`:
+
+```
+POST /api/v1/fleet/settings
+{ "key": "supervisor.enabled", "value": "false", "reason": "idle burn" }   # fleet default
+{ "key": "worker_max_tokens", "value": "400000", "project": "<row>" }       # per-project override
+{ "key": "supervisor.enabled", "unset": true }                             # clear a fleet default
+```
+
+The endpoint is gated like the other mutating config surfaces
+(`change_global_config`-class): auth fires first (401 when unauthenticated),
+the read-only posture rejects it (403), a bad key/value is a 400, and every
+accepted write is journaled in `settings_audit` with the authenticated actor.
+It requires the daemon config store (`maestro daemon --watch-store`); under
+`serve --fleet` it returns 501. The CLI (an operator on the host) writes the
+store directly.
+
+> The dashboard **SPA control** that drives this endpoint is a follow-up; today
+> the read side (per-project provenance) renders and the write endpoint is live
+> for API clients.

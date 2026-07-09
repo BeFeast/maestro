@@ -125,6 +125,27 @@ func lookupSpec(name string) (SettingSpec, bool) {
 	return SettingSpec{}, false
 }
 
+// SettingKeyValid reports whether key names a known fleet setting (its value is
+// not checked). Lets an API layer reject an unknown key with 400 before a store
+// write.
+func SettingKeyValid(key string) bool {
+	_, ok := lookupSpec(key)
+	return ok
+}
+
+// ValidateSetting reports whether key is known and rawValue is acceptable for
+// its type, WITHOUT writing anything — the read-only pre-check an HTTP handler
+// runs so a bad key/value returns 400 (client error) while a later store write
+// failure is treated as 500 (infrastructure), mirroring the project-CRUD path.
+func ValidateSetting(key, rawValue string) error {
+	spec, ok := lookupSpec(key)
+	if !ok {
+		return fmt.Errorf("unknown setting %q", key)
+	}
+	_, err := canonicalizeSettingValue(spec, rawValue)
+	return err
+}
+
 // canonicalizeSettingValue validates raw against the key's type and returns the
 // canonical stored form ("true"/"false", a base-10 int, or the trimmed string).
 // A per-type parse keeps a `settings set poll_interval_seconds=banana` from
