@@ -83,6 +83,17 @@ type BackendDef struct {
 	// set the same value for both.
 	Pricing BackendPricing `yaml:"pricing,omitempty"`
 
+	// PricingClass declares how the backend bills so always-on internal
+	// loops (supervisor cycles, the auto-router) can refuse to run their
+	// LLM path on a per-token model without an explicit opt-in (#838). One
+	// of PricingClassFlat / PricingClassSubscription / PricingClassMetered;
+	// empty is treated as flat for backward compatibility. Only an explicit
+	// `metered` gates the loops — a backend that leaves this unset keeps
+	// running unchanged, even when it has a `pricing:` table set for cost
+	// observability (a subscription backend legitimately configures pricing
+	// for #619). parse() rejects any value outside the three classes.
+	PricingClass string `yaml:"pricing_class,omitempty"`
+
 	// Quota describes the backend's subscription window capacity (#704).
 	// When configured, maestro tracks estimated token usage against the
 	// provider's 5-hour session window and weekly cap, surfaces the
@@ -294,6 +305,35 @@ func (q BackendQuota) EffectiveDispatchThreshold() float64 {
 
 func (b BackendDef) IsEnabled() bool {
 	return b.Enabled == nil || *b.Enabled
+}
+
+// Backend pricing classes (#838). Only PricingClassMetered gates the always-on
+// supervisor/router LLM loops; flat, subscription, and unset run unchanged.
+const (
+	PricingClassFlat         = "flat"
+	PricingClassSubscription = "subscription"
+	PricingClassMetered      = "metered"
+)
+
+// IsMetered reports whether the backend bills per token in a way that must not
+// back an unbounded always-on loop without an explicit opt-in (#838). Only an
+// explicit `pricing_class: metered` qualifies; an unset class — even with a
+// `pricing:` table configured for cost observability (#619) — is treated as
+// flat so existing subscription backends keep running unchanged.
+func (b BackendDef) IsMetered() bool {
+	return strings.EqualFold(strings.TrimSpace(b.PricingClass), PricingClassMetered)
+}
+
+// validPricingClass reports whether a pricing_class string is one of the known
+// classes (or empty, which defaults to flat). parse() uses it to reject typos
+// that would otherwise silently disable the metered guard.
+func validPricingClass(class string) bool {
+	switch strings.ToLower(strings.TrimSpace(class)) {
+	case "", PricingClassFlat, PricingClassSubscription, PricingClassMetered:
+		return true
+	default:
+		return false
+	}
 }
 
 // ModelConfig holds multi-backend configuration.
@@ -590,6 +630,16 @@ type SupervisorConfig struct {
 	// cannot change it (see internal/supervisor/llm.go decideWithLLM). Set true to
 	// force a full-context second opinion on every cycle regardless of token cost.
 	AlwaysConsultLLM bool `yaml:"always_consult_llm" json:"always_consult_llm,omitempty"`
+
+	// AllowMeteredBackend opts this project's supervisor LLM loop into running on
+	// a metered (per-token) backend (#838). Default false: when supervisor.backend
+	// (or the model.default fallback the supervisor uses) resolves to a backend
+	// with pricing_class: metered, the supervisor refuses the LLM path and runs
+	// deterministic-only, emitting a red stuck state — so a config-store edit that
+	// re-points the backend at a per-token model cannot silently burn cost on
+	// always-on "do nothing" cycles (incident 2026-07-09). Set true to accept the
+	// per-token cost explicitly.
+	AllowMeteredBackend bool `yaml:"allow_metered_backend" json:"allow_metered_backend,omitempty"`
 
 	excludedLabelsSet bool
 }
@@ -904,6 +954,13 @@ type RoutingConfig struct {
 	RouterModelName  string            `yaml:"router_model_name"`  // specific model to use (default: "claude-sonnet-4-6")
 	RouterPrompt     string            `yaml:"router_prompt"`      // prompt template with {{BACKENDS}}, {{NUMBER}}, {{TITLE}}, {{BODY}}
 	TaskTypeBackends map[string]string `yaml:"task_type_backends"` // task_type -> backend override used only when routing.mode=auto
+
+	// AllowMeteredBackend opts the auto-router into running its per-issue LLM
+	// classification on a metered (per-token) backend (#838). Default false: when
+	// routing.router_model resolves to a pricing_class: metered backend the router
+	// refuses the LLM call and falls back to model.default — the same guard the
+	// supervisor applies to its own always-on loop.
+	AllowMeteredBackend bool `yaml:"allow_metered_backend,omitempty"`
 
 	// Task-aware model routing (#783, RFC docs/model-routing-rfc.md §2.5). Tiers
 	// are named strength bands (backend + optional effort/model override) and
@@ -1617,6 +1674,12 @@ func parse(data []byte) (*Config, error) {
 			if _, err := regexp.Compile(p); err != nil {
 				return nil, fmt.Errorf("config: model.backends.%s.usage_limit_patterns entry %q does not compile: %v", name, p, err)
 			}
+		}
+		// #838: a mistyped pricing_class (e.g. "meterd", "per_token") would
+		// silently leave the metered guard disabled, re-opening the exact
+		// always-on burn the field exists to prevent. Fail fast instead.
+		if !validPricingClass(def.PricingClass) {
+			return nil, fmt.Errorf("config: model.backends.%s.pricing_class = %q; want one of flat, subscription, metered (or empty)", name, def.PricingClass)
 		}
 	}
 

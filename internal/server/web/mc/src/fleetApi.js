@@ -619,7 +619,12 @@ function mapEffectiveConfig(raw) {
       default: String(policy.default || ""),
       fallbackBackends: Array.isArray(policy.fallback_backends) ? policy.fallback_backends.map(String) : [],
       backends: Array.isArray(policy.backends) ? policy.backends.map(mapEffectiveBackend) : [],
-      routing: policy.routing || {},
+      routing: {
+        mode: String((policy.routing || {}).mode || ""),
+        routerModel: String((policy.routing || {}).router_model || ""),
+        routerModelName: String((policy.routing || {}).router_model_name || ""),
+        allowMeteredBackend: (policy.routing || {}).allow_metered_backend === true,
+      },
     },
     maxParallel: Number(raw.max_parallel || 0),
     reviewGate: String(raw.review_gate || ""),
@@ -659,6 +664,9 @@ function mapEffectiveConfig(raw) {
       reviewRepairActive: gate.review_repair_active === true,
       reviewRepairBackend: String(gate.review_repair_backend || ""),
       reviewRepairMaxRetries: Number(gate.review_repair_max_retries || 0),
+      allowMeteredBackend: gate.allow_metered_backend === true,
+      meteredBackendRefused: gate.metered_backend_refused === true,
+      meteredBackend: String(gate.metered_backend || ""),
     },
     approvalAction: String(raw.approval_action || "change_global_config"),
   };
@@ -677,6 +685,8 @@ function mapEffectiveBackend(raw) {
     priceConfigured: raw?.price_configured === true,
     inputUSDPerMtok: Number(raw?.input_usd_per_mtok || 0),
     outputUSDPerMtok: Number(raw?.output_usd_per_mtok || 0),
+    pricingClass: String(raw?.pricing_class || ""),
+    metered: raw?.metered === true,
   };
 }
 
