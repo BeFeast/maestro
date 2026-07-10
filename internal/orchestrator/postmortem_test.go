@@ -122,6 +122,68 @@ func TestRespawnDueRetries_PriorAttemptPostmortem_IncludedAndPersisted(t *testin
 	}
 }
 
+// TestRespawnDueRetries_PostmortemRedactsInlinePEMTailInBothSinks guards the
+// #835 review finding end-to-end: a tail-clipped private-key fragment embedded
+// in a command line (`$ echo <fragment>`) must not survive into EITHER sink the
+// respawn writes it to — the retry prompt or the persisted post-mortem file.
+// The worker-level unit test proves ExtractPostmortem redacts the short padded
+// tail; this asserts both orchestrator sinks carry the redacted form, since the
+// finding named them both ("written to the saved post-mortem and copied into the
+// retry prompt").
+func TestRespawnDueRetries_PostmortemRedactsInlinePEMTailInBothSinks(t *testing.T) {
+	const secretFragment = "Kj34GkxFhD90vcNLYLInFE=" // short '='-padded base64 tail
+	stateDir := t.TempDir()
+	logFile := filepath.Join(stateDir, "slot-1.log")
+	logContent := strings.Join([]string{
+		"running deploy",
+		"$ echo " + secretFragment,
+		"exit status 1",
+	}, "\n")
+	if err := os.WriteFile(logFile, []byte(logContent), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	captured := ""
+	o := postmortemRetryOrchestrator(t, stateDir, &captured)
+
+	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-1 * time.Minute)
+	s.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 42,
+		IssueTitle:  "test issue",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &retryAt,
+		Backend:     "claude",
+		LogFile:     logFile,
+	}
+
+	o.respawnDueRetries(s, 10)
+
+	if captured == "" {
+		t.Fatal("respawnWorkerFn should have been called")
+	}
+	// Sink 1: the retry prompt must carry the redacted form, not the raw tail.
+	if strings.Contains(captured, secretFragment) {
+		t.Errorf("inline PEM tail leaked into the retry prompt:\n%s", captured)
+	}
+	if !strings.Contains(captured, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected redaction marker in the retry prompt:\n%s", captured)
+	}
+	// Sink 2: the persisted post-mortem file must likewise be redacted.
+	persisted := filepath.Join(stateDir, "slot-1-attempt1-postmortem.md")
+	data, err := os.ReadFile(persisted)
+	if err != nil {
+		t.Fatalf("expected persisted post-mortem at %s: %v", persisted, err)
+	}
+	if strings.Contains(string(data), secretFragment) {
+		t.Errorf("inline PEM tail leaked into the persisted post-mortem:\n%s", data)
+	}
+	if !strings.Contains(string(data), "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected redaction marker in the persisted post-mortem:\n%s", data)
+	}
+}
+
 func TestRespawnDueRetries_MissingLog_GracefulDegradation(t *testing.T) {
 	stateDir := t.TempDir()
 	captured := ""
