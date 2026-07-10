@@ -8126,6 +8126,7 @@ func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 		{name: "retry_exhausted -> blocked", sess: &state.Session{IssueNumber: 6, Status: state.StatusRetryExhausted}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "conflict_failed -> blocked", sess: &state.Session{IssueNumber: 7, Status: state.StatusConflictFailed}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "failed -> blocked", sess: &state.Session{IssueNumber: 8, Status: state.StatusFailed}, want: github.ProjectStatusBlocked, wantOK: true},
+		{name: "failed+released -> todo", sess: &state.Session{IssueNumber: 8, Status: state.StatusFailed, ReleasedForRedispatch: true}, want: github.ProjectStatusTodo, wantOK: true},
 		{name: "dead awaiting retry stays in_progress", sess: &state.Session{IssueNumber: 9, Status: state.StatusDead, NextRetryAt: &soon}, want: github.ProjectStatusInProgress, wantOK: true},
 		{name: "dead without retry -> blocked", sess: &state.Session{IssueNumber: 10, Status: state.StatusDead}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "unknown status returns no mapping", sess: &state.Session{IssueNumber: 11, Status: state.SessionStatus("weird")}, want: "", wantOK: false},
@@ -9858,6 +9859,16 @@ func TestAutoMergePRs_ClosedPRRetryExhaustedReleasesIssueForFreshDispatch(t *tes
 	if sess.LastClosedPRNumber != 218 {
 		t.Fatalf("LastClosedPRNumber = %d, want 218", sess.LastClosedPRNumber)
 	}
+	if !sess.ReleasedForRedispatch {
+		t.Fatalf("ReleasedForRedispatch = false, want true (released session must mirror as runnable Todo, not Blocked)")
+	}
+	// #818: the released StatusFailed session must map to a runnable board
+	// status. Otherwise reconcileSessionsToProjectBoard re-pushes Blocked over
+	// the Todo the reconcile set, and the dynamic wave (Blocked = non-runnable)
+	// re-strands the issue when a fresh worker does not start the same cycle.
+	if status, ok := projectStatusForSession(sess, false); !ok || status != github.ProjectStatusTodo {
+		t.Fatalf("projectStatusForSession(released) = (%q, %v), want (%q, true)", status, ok, github.ProjectStatusTodo)
+	}
 	if sess.FinishedAt == nil {
 		t.Fatalf("FinishedAt must be set on a reconciled terminal session")
 	}
@@ -9992,6 +10003,85 @@ func TestAutoMergePRs_ClosedPRRetryExhaustedMergeCheckErrorDefersReconcile(t *te
 	}
 	if sess.PRNumber != 221 {
 		t.Fatalf("PRNumber = %d, want 221 (must not be cleared on probe failure)", sess.PRNumber)
+	}
+}
+
+// #818 follow-up: a merged retry_exhausted session whose auto-close hits a
+// transient GitHub failure must NOT settle done — it stays retry_exhausted so
+// the next cycle retries the close (otherwise the issue can stay open forever
+// because the settled session leaves the merge flow). The retry must not
+// re-post the close comment, and once the close succeeds the session settles.
+func TestAutoMergePRs_ClosedPRRetryExhaustedTransientCloseFailureRetries(t *testing.T) {
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		Supervisor: config.SupervisorConfig{
+			BlockedLabel: "blocked",
+			SafeActions:  []string{config.SupervisorActionCloseIssue},
+		},
+	}
+	var closeComments []string
+	closeErr := fmt.Errorf("gh: transient API failure")
+	o := &Orchestrator{
+		cfg:           cfg,
+		notifier:      &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isPRMergedFn: func(prNumber int) (bool, error) {
+			return prNumber == 223, nil
+		},
+		ghCloseIssueFn: func(number int, comment string) error {
+			closeComments = append(closeComments, comment)
+			return closeErr
+		},
+	}
+	s := state.NewState()
+	s.Sessions["sup-26"] = &state.Session{
+		IssueNumber: 503,
+		IssueTitle:  "merged PR, transient close failure",
+		Branch:      "feat/sup-26",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    223,
+	}
+
+	// Cycle 1: close fails transiently — session must stay retry_exhausted.
+	o.autoMergePRs(s)
+
+	sess := s.Sessions["sup-26"]
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q (transient close failure must not settle done)", sess.Status, state.StatusRetryExhausted)
+	}
+	if sess.PRNumber != 223 {
+		t.Fatalf("PRNumber = %d, want 223 (recorded PR must survive so reconcile retries the close)", sess.PRNumber)
+	}
+	if len(closeComments) != 1 {
+		t.Fatalf("close attempts = %d, want 1", len(closeComments))
+	}
+	if closeComments[0] == "" {
+		t.Fatalf("first close attempt posted an empty comment, want the close note")
+	}
+	if sess.LastNotifiedStatus != closedPRCloseRetryStatus {
+		t.Fatalf("LastNotifiedStatus = %q, want %q (marker gates comment/notify re-spam)", sess.LastNotifiedStatus, closedPRCloseRetryStatus)
+	}
+
+	// Cycle 2: still transient — retry must not re-post the close comment.
+	o.autoMergePRs(s)
+	if len(closeComments) != 2 {
+		t.Fatalf("close attempts after retry = %d, want 2 (close must be retried)", len(closeComments))
+	}
+	if closeComments[1] != "" {
+		t.Fatalf("retry close comment = %q, want empty (must not re-post the close note)", closeComments[1])
+	}
+	if s.Sessions["sup-26"].Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q while close keeps failing", s.Sessions["sup-26"].Status, state.StatusRetryExhausted)
+	}
+
+	// Cycle 3: close succeeds — session settles done and releases the slot.
+	closeErr = nil
+	o.autoMergePRs(s)
+	if s.Sessions["sup-26"].Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q after the close succeeds", s.Sessions["sup-26"].Status, state.StatusDone)
+	}
+	if s.IssueRetryExhausted(503) {
+		t.Fatalf("issue #503 still retry-exhausted after close succeeded; slot not released")
 	}
 }
 
