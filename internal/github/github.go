@@ -2154,6 +2154,187 @@ func (c *Client) PRChecksOutput(prNumber int) (string, error) {
 	return formatChecksOverview(checks, combined), nil
 }
 
+// FailingCheck is one non-passing check-run on a PR head, carrying the check's
+// name, its GitHub conclusion, and a best-effort excerpt of the failing log
+// (the annotation / `##[error]` lines). Excerpt is empty when no log detail is
+// fetchable, so a caller degrades gracefully to name + conclusion (#857).
+type FailingCheck struct {
+	Name       string
+	Conclusion string
+	Excerpt    string
+}
+
+// PRFailingChecks returns the check-runs on a PR's head SHA whose conclusion is
+// a failure, each enriched with a best-effort excerpt of its failing log. It
+// exists so a retry can surface a red lint check the worker's previous push
+// introduced, instead of only the review feedback (or bare checks overview)
+// that triggered the retry (#857). The excerpt is drawn from the check-run's
+// own output fields, falling back to its failure annotations; either fetch
+// failing leaves the excerpt empty rather than erroring, so the caller still
+// names the check. A nil slice means no check is failing.
+func (c *Client) PRFailingChecks(prNumber int) ([]FailingCheck, error) {
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	checks, err := c.checkRunsForSHA(sha)
+	if err != nil {
+		return nil, fmt.Errorf("get check-runs for PR %d: %w", prNumber, err)
+	}
+	var failing []FailingCheck
+	for _, ck := range checks {
+		if !isFailingConclusion(ck.Conclusion) {
+			continue
+		}
+		excerpt := checkRunOutputErrorLines(ck)
+		if excerpt == "" {
+			// Plain GitHub Actions jobs rarely populate the check-run output
+			// body; the `::error::` lines they emit (e.g. agent-lint) land as
+			// failure annotations instead. Fetch them best-effort — an error
+			// here degrades to name + conclusion, never fails the whole call.
+			if anns, aerr := c.checkRunAnnotations(ck.ID); aerr != nil {
+				log.Printf("[github] warn: could not read annotations for check-run %q (id %d): %v", ck.Name, ck.ID, aerr)
+			} else {
+				excerpt = formatFailureAnnotations(anns)
+			}
+		}
+		failing = append(failing, FailingCheck{
+			Name:       ck.Name,
+			Conclusion: ck.Conclusion,
+			Excerpt:    excerpt,
+		})
+	}
+	return failing, nil
+}
+
+// checkAnnotation is one entry from a check-run's annotations endpoint. GitHub
+// records each `::error::` / `::warning::` workflow command a job emits as an
+// annotation carrying the level and message.
+type checkAnnotation struct {
+	Path            string `json:"path"`
+	StartLine       int    `json:"start_line"`
+	AnnotationLevel string `json:"annotation_level"`
+	Message         string `json:"message"`
+	Title           string `json:"title"`
+}
+
+func (c *Client) checkRunAnnotations(id int64) ([]checkAnnotation, error) {
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/check-runs/%d/annotations?per_page=100", c.Repo, id), "--paginate")
+	if err != nil {
+		return nil, err
+	}
+	anns, err := parseCheckAnnotations(out)
+	if err != nil {
+		return nil, fmt.Errorf("parse annotations for check-run %d: %w", id, err)
+	}
+	return anns, nil
+}
+
+// parseCheckAnnotations decodes the body of the annotations `--paginate` call.
+// The annotations endpoint is a plain JSON array, so a check-run with more than
+// 100 annotations yields back-to-back `[...][...]` documents that a single
+// json.Unmarshal rejects; merge the pages first (same shape handled by
+// mergePaginatedJSONArrays for the reconcile lists) so >100 annotations still
+// parse and the failing-log excerpt survives (#857).
+func parseCheckAnnotations(out []byte) ([]checkAnnotation, error) {
+	merged, err := mergePaginatedJSONArrays(out)
+	if err != nil {
+		return nil, err
+	}
+	var anns []checkAnnotation
+	if err := json.Unmarshal(merged, &anns); err != nil {
+		return nil, err
+	}
+	return anns, nil
+}
+
+// failingConclusions are the check-run conclusions ciStatusFromREST treats as a
+// hard failure; PRFailingChecks selects the same set so the excerpt path and the
+// aggregate CI verdict never disagree on what "failing" means.
+var failingConclusions = map[string]struct{}{
+	"failure":         {},
+	"timed_out":       {},
+	"cancelled":       {},
+	"action_required": {},
+	"startup_failure": {},
+	"stale":           {},
+}
+
+func isFailingConclusion(conclusion string) bool {
+	_, ok := failingConclusions[strings.ToLower(strings.TrimSpace(conclusion))]
+	return ok
+}
+
+// checkErrorLineRe matches an annotation / error line as emitted into a job log:
+// a GitHub workflow command (`::error::…`, `::error file=…::…`), the Azure-style
+// `##[error]…`, or a generic `Error:` prefix.
+var checkErrorLineRe = regexp.MustCompile(`(?i)^(?:::error\b[^:]*::|##\[error\]|error:)`)
+
+// checkErrorPrefixRe strips the recognized annotation prefix from a matched line
+// so the surfaced text reads as the message alone.
+var checkErrorPrefixRe = regexp.MustCompile(`(?i)^(?:::error\b[^:]*::|##\[error\]|error:\s*)`)
+
+// checkRunOutputErrorLines distills the error lines from a check-run's own
+// output body (summary + text). It keeps only lines that look like an error
+// annotation; if none match it falls back to the concise output summary, and to
+// "" when the check reported no output at all (the graceful-degradation case).
+func checkRunOutputErrorLines(ck greptileCheckRun) string {
+	body := strings.TrimSpace(ck.Output.Text)
+	if body == "" {
+		body = strings.TrimSpace(ck.Output.Summary)
+	} else if s := strings.TrimSpace(ck.Output.Summary); s != "" {
+		body = s + "\n" + body
+	}
+	if body == "" {
+		return ""
+	}
+	var lines []string
+	for _, raw := range strings.Split(body, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if checkErrorLineRe.MatchString(line) {
+			lines = append(lines, strings.TrimSpace(checkErrorPrefixRe.ReplaceAllString(line, "")))
+		}
+	}
+	if len(lines) == 0 {
+		// No annotation-shaped line — fall back to the human summary, which is
+		// short and safe to surface, over the (possibly large) full text.
+		return strings.TrimSpace(ck.Output.Summary)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatFailureAnnotations renders the failure-level annotations of a check-run
+// as one message per line, prefixing the file:line when GitHub attached one.
+// Non-failure levels (warning/notice) are dropped so only blocking detail
+// reaches the retry prompt.
+func formatFailureAnnotations(anns []checkAnnotation) string {
+	var lines []string
+	for _, a := range anns {
+		if !strings.EqualFold(strings.TrimSpace(a.AnnotationLevel), "failure") {
+			continue
+		}
+		msg := strings.TrimSpace(a.Message)
+		if msg == "" {
+			msg = strings.TrimSpace(a.Title)
+		}
+		if msg == "" {
+			continue
+		}
+		if p := strings.TrimSpace(a.Path); p != "" && p != ".github" {
+			if a.StartLine > 0 {
+				msg = fmt.Sprintf("%s:%d: %s", p, a.StartLine, msg)
+			} else {
+				msg = fmt.Sprintf("%s: %s", p, msg)
+			}
+		}
+		lines = append(lines, msg)
+	}
+	return strings.Join(lines, "\n")
+}
+
 // MergePR squash-merges a PR
 func (c *Client) MergePR(prNumber int) error {
 	out, err := ghCommand("pr", "merge",

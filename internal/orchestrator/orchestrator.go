@@ -131,6 +131,7 @@ type Orchestrator struct {
 	ghMergePRFn                  func(prNumber int) error
 	ghClosePRFn                  func(prNumber int, comment string) error
 	ghPRChecksOutputFn           func(prNumber int) (string, error)
+	ghPRFailingChecksFn          func(prNumber int) ([]github.FailingCheck, error)
 	ghCollectPRReviewFeedbackFn  func(prNumber int) (string, error)
 	ghCloseIssueFn               func(number int, comment string) error
 	ghPRHeadSHAFn                func(prNumber int) (string, error)
@@ -585,6 +586,30 @@ func (o *Orchestrator) collectPRReviewFeedback(prNumber int) (string, error) {
 		return o.ghCollectPRReviewFeedbackFn(prNumber)
 	}
 	return o.gh.CollectPRReviewFeedback(prNumber)
+}
+
+func (o *Orchestrator) prFailingChecks(prNumber int) ([]github.FailingCheck, error) {
+	if o.ghPRFailingChecksFn != nil {
+		return o.ghPRFailingChecksFn(prNumber)
+	}
+	if o.gh == nil {
+		return nil, fmt.Errorf("no github client configured for failing-checks")
+	}
+	return o.gh.PRFailingChecks(prNumber)
+}
+
+// collectFailingCheckContext fetches the check-runs still failing on a PR head
+// and renders a bounded, redacted excerpt for the retry prompt (#857).
+// Best-effort: a fetch error yields "" (no section) rather than blocking the
+// retry, and an all-green head yields "" so a retry with no red check is
+// unchanged.
+func (o *Orchestrator) collectFailingCheckContext(prNumber int) string {
+	checks, err := o.prFailingChecks(prNumber)
+	if err != nil {
+		log.Printf("[orch] warn: could not collect failing-check context for PR #%d: %v", prNumber, err)
+		return ""
+	}
+	return formatFailingCheckContext(checks, failingCheckExcerptCapBytes)
 }
 
 func (o *Orchestrator) closeIssue(number int, comment string) error {
@@ -1639,6 +1664,82 @@ Do NOT repeat the same mistakes.
 `, promptBase, feedback)
 }
 
+// failingCheckExcerptCapBytes hard-caps the failing-check excerpt placed in a
+// retry prompt, mirroring the post-mortem cap discipline from #835 so a verbose
+// lint log cannot crowd out the rest of the prompt.
+const failingCheckExcerptCapBytes = 2048
+
+const failingCheckTruncationMarker = "\n… (failing-check excerpt truncated for the prompt)"
+
+// formatFailingCheckContext assembles a bounded, secret-redacted excerpt naming
+// each check-run still failing on the PR head. Each check contributes its
+// distilled error lines; a check with no fetchable log degrades to its name and
+// conclusion only. The whole excerpt is redacted and then hard-capped. It
+// returns "" when nothing is failing, so the caller adds no section (#857).
+func formatFailingCheckContext(checks []github.FailingCheck, capBytes int) string {
+	var b strings.Builder
+	for _, ck := range checks {
+		name := strings.TrimSpace(ck.Name)
+		if name == "" {
+			name = "check"
+		}
+		conclusion := strings.TrimSpace(ck.Conclusion)
+		if conclusion == "" {
+			conclusion = "failure"
+		}
+		excerpt := strings.TrimSpace(ck.Excerpt)
+		if excerpt == "" {
+			fmt.Fprintf(&b, "- %s failed (conclusion: %s); no log excerpt available.\n", name, conclusion)
+			continue
+		}
+		fmt.Fprintf(&b, "- %s failed (conclusion: %s):\n", name, conclusion)
+		for _, line := range strings.Split(excerpt, "\n") {
+			line = strings.TrimRight(line, " \t\r")
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "    %s\n", line)
+		}
+	}
+	assembled := strings.TrimRight(b.String(), "\n")
+	if assembled == "" {
+		return ""
+	}
+	assembled = supervisor.RedactSensitive(assembled)
+	return capFailingCheckExcerpt(assembled, capBytes)
+}
+
+// capFailingCheckExcerpt bounds s to capBytes with a check-specific truncation
+// marker, delegating to the shared worker cap so it honors the same UTF-8 /
+// line-boundary discipline as the #835 post-mortem cap. capBytes <= 0 disables
+// the cap.
+func capFailingCheckExcerpt(s string, capBytes int) string {
+	return worker.CapWithMarker(s, capBytes, failingCheckTruncationMarker)
+}
+
+// appendFailingCheckContext appends a section naming the check-run(s) still
+// failing on the PR head, so a retry treats a red lint check as a hard
+// constraint on the new diff instead of only the review comments / bare checks
+// overview that triggered the retry (#857). excerpt is already bounded/redacted
+// by formatFailingCheckContext.
+func appendFailingCheckContext(promptBase, excerpt string) string {
+	return fmt.Sprintf(`%s
+
+---
+
+## IMPORTANT: Failing Check on the Current PR Head
+
+Besides any review or CI-failure context above, the following CI check(s) are
+FAILING on your PR's current head commit — your previous push did not make them
+pass. Treat this as a hard constraint on the new diff and do NOT reintroduce the
+same failure:
+
+%s
+
+Make the failing check(s) pass AND address any other feedback before you push again.
+`, promptBase, excerpt)
+}
+
 // appendPriorAttemptPostmortem appends a bounded, automatically-extracted
 // summary of the previous failed attempt's own worker-log trajectory (#835).
 // It sits alongside — not in place of — the CI/review/conflict context, so the
@@ -1907,6 +2008,16 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			}
 			sess.PreviousAttemptFeedback = "" // consumed — don't persist stale feedback
 			sess.PreviousAttemptFeedbackKind = ""
+		}
+		// #857: a retry whose PR head also has a red check (e.g. agent-lint)
+		// carries a bounded excerpt of that check alongside — not in place of —
+		// the CI/review context above, so the worker fixes the lint failure its
+		// previous push introduced instead of only the review P1s / bare
+		// checks-overview. Populated by both the CI-failure and review-feedback
+		// retry handlers; consumed here regardless of which path scheduled it.
+		if sess.FailingCheckContext != "" {
+			promptBase = appendFailingCheckContext(promptBase, sess.FailingCheckContext)
+			sess.FailingCheckContext = "" // consumed — don't persist stale excerpt
 		}
 
 		// #835: append a bounded post-mortem distilled from the previous
@@ -4171,6 +4282,13 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 	sess.PreviousAttemptFeedback = reviewFeedback
 	sess.PreviousAttemptFeedbackKind = state.RetryReasonReviewFeedback
 	sess.RetryReason = state.RetryReasonReviewFeedback
+	// #857: a review-feedback retry is scheduled off a green aggregate CI, but
+	// an individual non-required check (e.g. agent-lint) can still be red on the
+	// PR head — the #424 mergeable_state=unstable override treats that as
+	// "success" and routes here. Capture a bounded excerpt so the respawned
+	// worker also sees the failing check its previous push introduced, not just
+	// the review comments.
+	sess.FailingCheckContext = o.collectFailingCheckContext(pr.Number)
 
 	sess.MaintenanceRetryCount++
 	backoffMs := retryBackoffMs(sess.MaintenanceRetryCount, o.cfg.MaxRetryBackoffMs)
@@ -4226,6 +4344,15 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
 	}
 
+	// #857: this is the path a red required check (e.g. agent-lint) actually
+	// takes — its failure conclusion makes the aggregate CI verdict "failure".
+	// CIFailureOutput above is only the bare checks overview (name + state); the
+	// concrete `##[error]` annotation lines that say WHY the check failed live
+	// here. Capture them before closing the PR so the retry worker sees the
+	// exact lint constraint its previous push broke, not just "agent-lint
+	// failed" — this was the observed PR #850 blindness.
+	failingCheckContext := o.collectFailingCheckContext(pr.Number)
+
 	// Close the failed PR with an explanation
 	closeComment := fmt.Sprintf("CI failed — maestro is closing this PR and respawning a new worker to retry (attempt %d).\n\nCI output:\n```\n%s\n```",
 		sess.RetryCount+1, ciOutput)
@@ -4241,6 +4368,7 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 
 	// Store CI failure output and review feedback for the next worker
 	sess.CIFailureOutput = ciOutput
+	sess.FailingCheckContext = failingCheckContext // #857: concrete failing-check error lines, alongside the overview
 	sess.PreviousAttemptFeedback = reviewFeedback
 	if strings.TrimSpace(reviewFeedback) != "" {
 		sess.PreviousAttemptFeedbackKind = "review_feedback"
@@ -5246,6 +5374,7 @@ func (o *Orchestrator) handleRebaseConflictRetry(s *state.State, slotName string
 	}
 
 	sess.CIFailureOutput = ""
+	sess.FailingCheckContext = "" // #857: rebase-conflict retry carries no failing-check excerpt
 	sess.PreviousAttemptFeedback = rebaseConflictFeedback(prNumber, cause)
 	sess.PreviousAttemptFeedbackKind = "rebase_conflict"
 
