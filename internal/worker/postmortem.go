@@ -118,17 +118,21 @@ var pemStrongBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{44,}={0,3}$`)
 // token (a git SHA, a digest). It is disambiguated by pemHexHashRe below.
 var pemWeakBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{8,}={0,3}$`)
 
-// pemHexHashRe matches a fragment that is plausibly a hex hash — a git SHA, a
-// checksum, a digest — being purely hex digits with no base64-only character
-// (uppercase, g-z, '+', '/') and no '=' padding. A short base64 body tail from a
-// clipped PEM dump virtually never satisfies this (its base64 alphabet spans far
-// beyond hex), so a short fragment that is NOT pure hex is treated as key
-// material and redacted even in isolation; a pure-hex fragment stays weak and is
-// only swept into a redaction run when adjacent to a marker or full-width body
-// line. This closes the short-PEM-tail leak (#835 review) — a lone short final
-// body line was previously classified weak and left unredacted — without
-// over-redacting a lone git SHA.
-var pemHexHashRe = regexp.MustCompile(`^[0-9a-fA-F]+$`)
+// pemHexHashRe matches a fragment that is plausibly a git SHA / digest and so may
+// be benign: purely LOWERCASE hex digits, with no uppercase A–F, no base64-only
+// character (g-z, '+', '/'), and no '=' padding. The lowercase restriction is
+// what separates a hash from key material: a PEM/DER base64 body line draws on the
+// full base64 alphabet, so it routinely carries uppercase letters, '+', '/', or
+// padding — none of which survive here — whereas git SHAs, checksums, and hex
+// digests are conventionally lowercase. A short fragment that is NOT lowercase hex
+// is therefore treated as clipped key material and redacted even in isolation.
+// This is where an uppercase-bearing hex fragment such as `DEADBEEF…` — a
+// plausible clipped PEM body tail — is caught: the earlier `[0-9a-fA-F]` form
+// accepted it as a hash and left it weak, leaking the short final body line of a
+// tail-clipped key (#835 review — short PEM tail leak). A lowercase-hex fragment
+// stays weak and is only swept into a redaction run when adjacent to a marker or
+// full-width body line, so a lone git SHA is still not over-redacted.
+var pemHexHashRe = regexp.MustCompile(`^[0-9a-f]+$`)
 
 // pemInlineBodyRe matches a full-width PEM/DER base64 body run (>=44 chars — the
 // same width pemStrongBodyRe treats as key material) wherever it appears, even
@@ -210,10 +214,12 @@ func redactClippedPEM(text string) string {
 			class[i] = strong
 		case pemWeakBodyRe.MatchString(content):
 			// A short base64 fragment. Anchor it as key material (a clipped PEM
-			// body tail) unless it is a plausible hex hash: a git SHA / digest is
-			// pure hex with no base64-only character or '=' padding and may be
-			// benign, so it stays weak and is only redacted when adjacent to a
-			// marker or full-width body line (#835 review — short PEM tail leak).
+			// body tail) unless it is a plausible git SHA / digest: only a
+			// LOWERCASE-hex fragment (no uppercase A–F, no base64-only character,
+			// no '=' padding — see pemHexHashRe) stays weak, since a real PEM body
+			// line almost always carries a character outside lowercase hex. Any
+			// other short fragment — uppercase hex included — is redacted even in
+			// isolation (#835 review — short PEM tail leak).
 			if pemHexHashRe.MatchString(content) {
 				class[i] = weak
 			} else {

@@ -268,6 +268,43 @@ func TestExtractPostmortem_RedactsShortClippedPEMTail(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsUppercaseHexShortPEMTail closes the residual of the
+// same finding (#835 review comment 1 — "Short PEM Tail Leaks"): after realistic
+// (base64) short tails were already anchored, a fragment that is PURE HEX but
+// carries uppercase A–F — which a PEM/DER base64 body routinely does — was still
+// accepted as a hex hash by the earlier `[0-9a-fA-F]` rule, classified weak, and
+// left unredacted. Only a conventional LOWERCASE git SHA keeps the carve-out now.
+func TestExtractPostmortem_RedactsUppercaseHexShortPEMTail(t *testing.T) {
+	// The lone survivor of a clipped key dump: below the strong width and pure hex,
+	// but uppercase — so a base64 body tail, not a lowercase git SHA.
+	tail := "DEADBEEFCAFE1234DEADBEEF"
+	// A benign lowercase git SHA on its own line must still survive (the carve-out).
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	log := strings.Join([]string{
+		"$ cat ~/.ssh/id_rsa",
+		tail, // BEGIN, full-width body, and END all fell outside the scanned tail
+		"$ git rev-parse HEAD",
+		sha,
+		"$ go build ./...",
+		"build failed",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, tail) {
+		t.Errorf("uppercase-hex short PEM tail leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected clipped-PEM redaction marker in output:\n%s", out)
+	}
+	if !strings.Contains(out, sha) {
+		t.Errorf("lone lowercase git SHA should be preserved (not over-redacted):\n%s", out)
+	}
+	if !strings.Contains(out, "build failed") {
+		t.Errorf("benign trailing line should be preserved:\n%s", out)
+	}
+}
+
 // TestExtractPostmortem_RedactsInlinePEMBody covers the finding's inline case: a
 // clipped full-width base64 body appears inside a larger log line — command
 // output prefixed with `$ echo ` or a `cat id_rsa: ` label — so the anchored
@@ -374,11 +411,15 @@ func TestRedactClippedPEM(t *testing.T) {
 
 	// A lone short base64 body tail (below the strong width) with both banners and
 	// full-width lines clipped away — a tail that landed on the PEM's final line.
-	// It carries base64-only characters no hex hash can, so it anchors on its own
-	// and is redacted even in isolation (#835 review comment 1 — short PEM tail).
+	// Each carries a character no LOWERCASE-hex git SHA can (base64-only letters,
+	// '=' padding, or uppercase A–F), so it anchors on its own and is redacted even
+	// in isolation (#835 review comment 1 — short PEM tail).
 	for _, shortTail := range []string{
-		"Kj34GkxFhD90vcNLYLInFE=", // padded final line
-		"MIIBOgIBAAJBAKj3GkxF",    // unpadded, but uppercase ⇒ not a hex hash
+		"Kj34GkxFhD90vcNLYLInFE=",  // padded final line
+		"MIIBOgIBAAJBAKj3GkxF",     // unpadded, but uppercase base64 ⇒ not a hex hash
+		"DEADBEEFCAFE1234DEADBEEF", // pure UPPERCASE hex ⇒ a base64 body tail, not a
+		//                            lowercase git SHA; the old [0-9a-fA-F] rule left
+		//                            it weak and leaked it.
 	} {
 		single := "- $ cat id_rsa\n- " + shortTail + "\n- $ go build ./...\n- build failed"
 		got := redactClippedPEM(single)
@@ -396,7 +437,7 @@ func TestRedactClippedPEM(t *testing.T) {
 	}
 
 	// A lone base64-looking token (e.g. a 40-char git SHA, or a single short blob)
-	// with no PEM context must be left intact: a pure-hex token is a plausible
+	// with no PEM context must be left intact: a LOWERCASE-hex token is a plausible
 	// hash/digest, not key material.
 	sha := "0123456789abcdef0123456789abcdef01234567"
 	loneBlob := "- edited internal/foo.go\n- " + sha + "\n- build failed"
