@@ -620,6 +620,16 @@ const postmortemTruncationMarker = "\n\n… (post-mortem truncated for the promp
 // lands on a line boundary where possible and always yields valid UTF-8.
 // capBytes <= 0 disables the cap.
 func CapPostmortem(s string, capBytes int) string {
+	return CapWithMarker(s, capBytes, postmortemTruncationMarker)
+}
+
+// CapWithMarker hard-caps s to capBytes, appending marker (whose byte length is
+// reserved out of the budget, so content+marker never exceeds capBytes) when it
+// has to cut. Truncation lands on a line boundary where possible and always
+// yields valid UTF-8. capBytes <= 0 disables the cap. Shared by CapPostmortem
+// (#835) and the orchestrator's failing-check excerpt cap (#857) so both honor
+// the same truncation discipline with their own marker text.
+func CapWithMarker(s string, capBytes int, marker string) string {
 	if capBytes <= 0 || len(s) <= capBytes {
 		return s
 	}
@@ -633,7 +643,7 @@ func CapPostmortem(s string, capBytes int) string {
 	// Reserve room for the marker so content+marker stays within capBytes. When
 	// the cap is too small to fit the marker at all, fall back to a marker-free
 	// excerpt bounded to a rune boundary (never grows past capBytes).
-	budget := capBytes - len(postmortemTruncationMarker)
+	budget := capBytes - len(marker)
 	if budget <= 0 {
 		return truncateToRuneBoundary(s, capBytes)
 	}
@@ -641,7 +651,7 @@ func CapPostmortem(s string, capBytes int) string {
 	if idx := strings.LastIndexByte(truncated, '\n'); idx > 0 {
 		truncated = truncated[:idx]
 	}
-	return strings.TrimRight(truncated, "\n") + postmortemTruncationMarker
+	return strings.TrimRight(truncated, "\n") + marker
 }
 
 // truncateToRuneBoundary returns the longest prefix of s that is at most
