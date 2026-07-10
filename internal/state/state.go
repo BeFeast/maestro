@@ -214,6 +214,7 @@ type Session struct {
 	ValidationFails             int               `json:"validation_fails,omitempty"`               // number of failed validation attempts
 	ValidationFeedback          string            `json:"validation_feedback,omitempty"`            // feedback from last failed validation
 	CIFailureOutput             string            `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)
+	FailingCheckContext         string            `json:"failing_check_context,omitempty"`          // #857: bounded excerpt of a check-run still failing on the PR head, carried into a review-feedback retry so the worker sees the red check its previous push introduced (consumed on respawn)
 	PreviousAttemptFeedback     string            `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
 	PreviousAttemptFeedbackKind string            `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
 	RetryReason                 string            `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
