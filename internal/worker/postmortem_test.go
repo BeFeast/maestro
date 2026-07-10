@@ -235,6 +235,41 @@ func TestExtractPostmortem_RedactsShortInlinePEMTail(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsUnpaddedInlinePEMTail covers the residual of the
+// same finding (#835 review — "Unpadded Inline PEM Tail Leaks"): a tail-clipped
+// key fragment embedded in a command line WITHOUT '=' padding (`$ echo
+// Kj34GkxFhD90vcNLYLInFE`) fell under both the 44-byte full-width width and the
+// padded-tail branch, so the inline matcher skipped it and the whole-line PEM
+// scrubber could not classify it — leaking the fragment into the prompt and the
+// persisted post-mortem. A digit-free file path in the same window must still
+// survive so the fix does not over-redact ordinary post-mortem content.
+func TestExtractPostmortem_RedactsUnpaddedInlinePEMTail(t *testing.T) {
+	frag := "Kj34GkxFhD90vcNLYLInFE" // no '=' padding
+	path := "internal/worker/postmortem.go"
+	log := strings.Join([]string{
+		"running deploy",
+		"$ echo " + frag,
+		"$ vim " + path,
+		"exit status 1",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, frag) {
+		t.Errorf("unpadded inline PEM tail leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected PEM redaction marker in output:\n%s", out)
+	}
+	// The command prose and a digit-free path must survive.
+	if !strings.Contains(out, "$ echo") {
+		t.Errorf("command prefix should be preserved:\n%s", out)
+	}
+	if !strings.Contains(out, path) {
+		t.Errorf("digit-free path should be preserved (not over-redacted):\n%s", out)
+	}
+}
+
 // TestExtractPostmortem_RedactsSingleClippedPEMBodyLine covers the finding's
 // sharpest case: the tail starts inside a PEM dump and only ONE full-width base64
 // body line survives into the last-actions window, with both -----BEGIN----- and
@@ -401,6 +436,27 @@ func TestRedactInlinePEMBody(t *testing.T) {
 		t.Errorf("padded short inline tail not redacted:\n%s", got)
 	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
 		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// The same short tail with the '=' padding CLIPPED OFF (`$ echo Kj34…InFE`,
+	// no '=') is the finding's leak: it is under the full-width width and has no
+	// padding, so the padded-only bar skipped it. It is disambiguated from a hash
+	// by its digits together with base64-only characters (uppercase, no '='), so it
+	// is redacted while the command prose survives (#835 review — unpadded inline
+	// PEM tail leak).
+	unpadded := "Kj34GkxFhD90vcNLYLInFE"
+	if got := redactInlinePEMBody("$ echo " + unpadded); strings.Contains(got, unpadded) {
+		t.Errorf("unpadded short inline tail not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// A digit-free file path embedded in a command line reaches the same >=16-char
+	// candidate matcher but carries no digit, so it must survive intact — the
+	// unpadded-tail rule must not garble the paths a post-mortem records.
+	path := "internal/worker/postmortem"
+	if got := redactInlinePEMBody("$ vim " + path + ".go"); !strings.Contains(got, path) {
+		t.Errorf("digit-free path should survive inline redaction:\n%s", got)
 	}
 }
 

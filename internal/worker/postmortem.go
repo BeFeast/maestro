@@ -134,25 +134,22 @@ var pemWeakBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{8,}={0,3}$`)
 // full-width body line, so a lone git SHA is still not over-redacted.
 var pemHexHashRe = regexp.MustCompile(`^[0-9a-f]+$`)
 
-// pemInlineBodyRe matches a PEM/DER base64 body run wherever it appears, even
-// embedded inside a larger line such as command output (`$ echo MIIEv…`, `cat
-// id_rsa: MIIEv…`). redactClippedPEM only recognizes a body that is the whole
-// line (after any list bullet), so an inline clipped body carrying a command or
-// label prefix would otherwise survive into the prompt and persisted file (#835
-// review). Two shapes qualify as key material:
-//
-//   - a full-width run (>=44 chars, the same width pemStrongBodyRe treats as key
-//     material), with or without '=' padding; or
-//   - a shorter run (>=16 chars) that carries base64 '=' padding — the tail
-//     signature of an encoded binary blob such as a clipped final PEM body line
-//     (`$ echo Kj34…Ec=`). '=' padding never appears in a git SHA / hex digest,
-//     so this catches a short inline tail the >=44 branch alone missed (#835
-//     review — short inline PEM tail leak) without redacting a lone hash.
+// pemInlineBodyRe finds a candidate PEM/DER base64 run — >=16 base64 characters
+// with optional '=' padding — embedded anywhere in a line, such as command output
+// (`$ echo MIIEv…`, `cat id_rsa: MIIEv…`). redactClippedPEM only recognizes a body
+// that is the whole line (after any list bullet), so an inline clipped body
+// carrying a command or label prefix would otherwise survive into the prompt and
+// persisted file (#835 review). The pattern is deliberately broad — every
+// >=16-char run is a candidate, padded or not — so a short UNPADDED tail reaches
+// the classifier (inlineRunIsKeyMaterial) instead of being skipped by the regex
+// itself; the earlier padded-only bar let `$ echo Kj34GkxFhD90vcNLYLInFE` (no '=')
+// slip through into both sinks (#835 review — unpadded inline PEM tail leak).
 //
 // The run is unanchored and bounded by non-base64 characters, so the surrounding
-// prose ("$ echo", "cat id_rsa:") is preserved. The full-width alternative is
-// tried first so a padded full-width run is masked whole rather than split.
-var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{44,}={0,3}|[A-Za-z0-9+/]{16,}={1,2}`)
+// prose ("$ echo", "cat id_rsa:") is preserved. Greedy matching grabs the whole
+// run plus any trailing '=' padding, so a full-width padded body is masked whole
+// rather than split.
+var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{16,}={0,3}`)
 
 // listBulletPrefixRe captures the leading whitespace and optional list bullet
 // ("- ", "* ", "+ ") of a post-mortem line so classification ignores the bullet
@@ -179,15 +176,55 @@ func redactPostmortemSecrets(text string) string {
 // the inline complement to redactClippedPEM's whole-line scrubber. It runs after
 // redactClippedPEM (whole-line body runs are already collapsed to a marker there,
 // so this only catches genuinely embedded runs like `$ echo <body>` or `cat
-// id_rsa: <body>`) and masks just the base64 run, keeping the command or label
-// prefix so the post-mortem still records what the attempt tried (#835 review).
-// The two run shapes it treats as key material — a full-width run and a shorter
-// '='-padded tail — are described on pemInlineBodyRe. A benign 44+ base64 run (a
-// long hex hash, a signed-URL token) or a padded blob is redacted too; that
-// mirrors pemStrongBodyRe's existing whole-line behavior and is the conservative
-// choice for a secrets-hygiene pass.
+// id_rsa: <body>`) and masks just the base64 run inlineRunIsKeyMaterial flags as
+// key material, keeping the command or label prefix so the post-mortem still
+// records what the attempt tried (#835 review).
 func redactInlinePEMBody(text string) string {
-	return pemInlineBodyRe.ReplaceAllString(text, pemRedactionMarker)
+	return pemInlineBodyRe.ReplaceAllStringFunc(text, func(run string) string {
+		if inlineRunIsKeyMaterial(run) {
+			return pemRedactionMarker
+		}
+		return run
+	})
+}
+
+// inlineRunIsKeyMaterial reports whether an embedded >=16-char base64 run
+// (pemInlineBodyRe) is (clipped) PEM/DER key material worth redacting. It mirrors
+// the whole-line classification in redactClippedPEM but is tuned to spare the
+// identifiers and file paths that legitimately fill a post-mortem:
+//
+//   - a '='-padded run, or a full-width run (>=44 non-padding chars), is key
+//     material outright — the same shapes the padded whole-line tail and
+//     pemStrongBodyRe already redact ('=' padding never appears in a git SHA /
+//     hex digest, and 44 is above a bare 40-char SHA);
+//   - a shorter UNPADDED run is key material only when it is NOT a plausible hex
+//     hash (pemHexHashRe) AND carries BOTH an uppercase letter and a digit — the
+//     encoded-byte mix a clipped final PEM body line such as
+//     `$ echo Kj34GkxFhD90vcNLYLInFE` has and the two kinds of benign run that
+//     reach this matcher do not: a lowercase file path keeps its digits but has no
+//     uppercase (`internal/attempt2`, `stream/01`), and a camelCase identifier
+//     keeps its case but has no digit (`handleUserRequest`). Requiring both masks
+//     the finding's unpadded inline tail (#835 review — unpadded inline PEM tail
+//     leak) without gutting the post-mortem, and a lowercase-hex fragment (a git
+//     SHA / digest) stays intact, matching redactClippedPEM's carve-out.
+//
+// A bare fragment carrying only one of the two signals is inherently
+// indistinguishable from a path or identifier — redacting it would garble those —
+// so the residual is left to the padded / full-width / whole-line-clipped and
+// complete-block branches, which cover the shapes real key dumps actually take.
+func inlineRunIsKeyMaterial(run string) bool {
+	body := strings.TrimRight(run, "=")
+	if len(body) < len(run) { // carried '=' padding — an encoded blob, not a hash
+		return true
+	}
+	if len(body) >= 44 { // full-width PEM/DER body line
+		return true
+	}
+	if pemHexHashRe.MatchString(body) { // a lone lowercase git SHA / digest
+		return false
+	}
+	return strings.ContainsAny(body, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") &&
+		strings.ContainsAny(body, "0123456789")
 }
 
 // redactClippedPEM masks PEM private-key material whose -----BEGIN----- banner
