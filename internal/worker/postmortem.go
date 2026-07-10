@@ -113,9 +113,22 @@ var pemMarkerRe = regexp.MustCompile(`^-{5}(?:BEGIN|END)[ A-Z0-9]+-{5}$`)
 var pemStrongBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{44,}={0,3}$`)
 
 // pemWeakBodyRe matches a short base64 fragment (>=8 chars) — a clipped final
-// body line. On its own it is too short to trust as key material, so it is only
-// redacted when it sits directly against a strong body line or a PEM marker.
+// body line. A short fragment is ambiguous: it may be a PEM body tail whose
+// banners and full-width lines were clipped out of the tail, or a benign lone
+// token (a git SHA, a digest). It is disambiguated by pemHexHashRe below.
 var pemWeakBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{8,}={0,3}$`)
+
+// pemHexHashRe matches a fragment that is plausibly a hex hash — a git SHA, a
+// checksum, a digest — being purely hex digits with no base64-only character
+// (uppercase, g-z, '+', '/') and no '=' padding. A short base64 body tail from a
+// clipped PEM dump virtually never satisfies this (its base64 alphabet spans far
+// beyond hex), so a short fragment that is NOT pure hex is treated as key
+// material and redacted even in isolation; a pure-hex fragment stays weak and is
+// only swept into a redaction run when adjacent to a marker or full-width body
+// line. This closes the short-PEM-tail leak (#835 review) — a lone short final
+// body line was previously classified weak and left unredacted — without
+// over-redacting a lone git SHA.
+var pemHexHashRe = regexp.MustCompile(`^[0-9a-fA-F]+$`)
 
 // pemInlineBodyRe matches a full-width PEM/DER base64 body run (>=44 chars — the
 // same width pemStrongBodyRe treats as key material) wherever it appears, even
@@ -169,13 +182,15 @@ func redactInlinePEMBody(text string) string {
 // and persisted file.
 //
 // It is line-oriented over the assembled body: classify each line (after any
-// list bullet) as a PEM marker, a full-width base64 body line, or a short base64
-// fragment, then redact each maximal contiguous run of such lines that either
-// contains a marker or holds at least one full-width body line. A single
-// full-width line is enough because a tail clipped so that both PEM banners fall
-// outside it can leave one genuine key body line alone (#835 review). A run of
-// only short base64 fragments (no full-width line, no marker) is left alone — a
-// lone short token may be a hash or blob, not key material.
+// list bullet) as a PEM marker, a full-width base64 body line, a short base64
+// body tail (a short fragment that is not a plausible hex hash — see
+// pemHexHashRe), or a short hex fragment, then redact each maximal contiguous run
+// of such lines that either contains a marker or holds at least one full-width /
+// short-body-tail anchor line. A single anchor is enough because a tail clipped
+// so that both PEM banners fall outside it can leave one genuine key body line
+// alone — full-width or, when the clip lands on the final line, short (#835
+// review). A run of only short hex fragments (no anchor, no marker) is left alone
+// — a lone hex token may be a git SHA or digest, not key material.
 func redactClippedPEM(text string) string {
 	lines := strings.Split(text, "\n")
 	n := len(lines)
@@ -194,7 +209,16 @@ func redactClippedPEM(text string) string {
 		case pemStrongBodyRe.MatchString(content):
 			class[i] = strong
 		case pemWeakBodyRe.MatchString(content):
-			class[i] = weak
+			// A short base64 fragment. Anchor it as key material (a clipped PEM
+			// body tail) unless it is a plausible hex hash: a git SHA / digest is
+			// pure hex with no base64-only character or '=' padding and may be
+			// benign, so it stays weak and is only redacted when adjacent to a
+			// marker or full-width body line (#835 review — short PEM tail leak).
+			if pemHexHashRe.MatchString(content) {
+				class[i] = weak
+			} else {
+				class[i] = strong
+			}
 		}
 	}
 	// A line joins a PEM run if it is a marker or full-width body line, or a weak
@@ -218,13 +242,15 @@ func redactClippedPEM(text string) string {
 			}
 		}
 	}
-	// Walk maximal runs; redact those with a marker or any full-width body line,
-	// collapsing each to a single marker that keeps the run's first bullet. One
-	// full-width line is enough: when a PEM dump is clipped so both banners fall
-	// outside the scanned tail, a genuine key body line can remain alone (#835
-	// review) — requiring >=2 leaked it. The guard is also a defensive floor: it
-	// never collapses a run that carries no key-material evidence, so a run of
-	// only short base64 fragments (a lone hash or blob) is left intact.
+	// Walk maximal runs; redact those with a marker or any anchor body line
+	// (full-width, or a short non-hex body tail), collapsing each to a single
+	// marker that keeps the run's first bullet. One anchor is enough: when a PEM
+	// dump is clipped so both banners fall outside the scanned tail, a genuine key
+	// body line can remain alone (#835 review) — requiring >=2 leaked it, and a
+	// tail clipped on the final line leaves only a short body tail. The guard is
+	// also a defensive floor: it never collapses a run that carries no key-material
+	// evidence, so a run of only short hex fragments (a lone SHA or digest) is
+	// left intact.
 	var out []string
 	for i := 0; i < n; {
 		if !inRun[i] {

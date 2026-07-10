@@ -235,6 +235,39 @@ func TestExtractPostmortem_RedactsSingleClippedPEMBodyLine(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsShortClippedPEMTail covers the finding's sharpest
+// remaining case (#835 review comment 1 — "Short PEM Tail Leaks"): the scanned
+// tail starts inside a PEM dump so the -----BEGIN----- banner, every full-width
+// body line, and the -----END----- footer are all clipped away, leaving ONLY the
+// short final base64 body line. That fragment is below the 44-char strong width,
+// so the old adjacency rule classified it weak and — with no adjacent marker or
+// full-width line — left it unredacted, leaking a key fragment into the prompt
+// and persisted file.
+func TestExtractPostmortem_RedactsShortClippedPEMTail(t *testing.T) {
+	// A short final PEM body line: below the strong width and carrying base64
+	// characters no hex hash can (uppercase, '=' padding), so it is the tail of a
+	// clipped key rather than a git SHA.
+	tail := "Kj34GkxFhD90vcNLYLInFE="
+	log := strings.Join([]string{
+		"$ cat ~/.ssh/id_rsa",
+		tail, // lone survivor: BEGIN, body, and END all fell outside the scanned tail
+		"$ go build ./...",
+		"build failed",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, tail) {
+		t.Errorf("short clipped PEM tail leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected clipped-PEM redaction marker in output:\n%s", out)
+	}
+	if !strings.Contains(out, "build failed") {
+		t.Errorf("benign trailing line should be preserved:\n%s", out)
+	}
+}
+
 // TestExtractPostmortem_RedactsInlinePEMBody covers the finding's inline case: a
 // clipped full-width base64 body appears inside a larger log line — command
 // output prefixed with `$ echo ` or a `cat id_rsa: ` label — so the anchored
@@ -339,8 +372,32 @@ func TestRedactClippedPEM(t *testing.T) {
 		}
 	}
 
+	// A lone short base64 body tail (below the strong width) with both banners and
+	// full-width lines clipped away — a tail that landed on the PEM's final line.
+	// It carries base64-only characters no hex hash can, so it anchors on its own
+	// and is redacted even in isolation (#835 review comment 1 — short PEM tail).
+	for _, shortTail := range []string{
+		"Kj34GkxFhD90vcNLYLInFE=", // padded final line
+		"MIIBOgIBAAJBAKj3GkxF",    // unpadded, but uppercase ⇒ not a hex hash
+	} {
+		single := "- $ cat id_rsa\n- " + shortTail + "\n- $ go build ./...\n- build failed"
+		got := redactClippedPEM(single)
+		if strings.Contains(got, shortTail) {
+			t.Errorf("short clipped PEM body tail %q leaked:\n%s", shortTail, got)
+		}
+		if !strings.Contains(got, pemRedactionMarker) {
+			t.Errorf("short clipped PEM body tail %q not redacted:\n%s", shortTail, got)
+		}
+		for _, benign := range []string{"$ cat id_rsa", "$ go build ./...", "build failed"} {
+			if !strings.Contains(got, benign) {
+				t.Errorf("benign line %q should survive:\n%s", benign, got)
+			}
+		}
+	}
+
 	// A lone base64-looking token (e.g. a 40-char git SHA, or a single short blob)
-	// with no PEM context must be left intact: too short to trust as key material.
+	// with no PEM context must be left intact: a pure-hex token is a plausible
+	// hash/digest, not key material.
 	sha := "0123456789abcdef0123456789abcdef01234567"
 	loneBlob := "- edited internal/foo.go\n- " + sha + "\n- build failed"
 	if got := redactClippedPEM(loneBlob); !strings.Contains(got, sha) {
