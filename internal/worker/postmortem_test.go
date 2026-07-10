@@ -207,6 +207,34 @@ func TestExtractPostmortem_RedactsTailClippedPEM(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsShortInlinePEMTail covers a tail-clipped private
+// key fragment embedded in a larger command line (`$ echo <fragment>`). The
+// whole-line clipped-PEM pass cannot match an embedded run, and the fragment is
+// under the 44-byte full-width width, so redactInlinePEMBody must catch it by its
+// base64 '=' padding — the tail signature the >=44-only branch missed (#835
+// review — short inline PEM tail leak).
+func TestExtractPostmortem_RedactsShortInlinePEMTail(t *testing.T) {
+	frag := "Kj34GkxFhD90vcNLYLInFE="
+	log := strings.Join([]string{
+		"running deploy",
+		"$ echo " + frag,
+		"exit status 1",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, frag) {
+		t.Errorf("short inline PEM tail leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected PEM redaction marker in output:\n%s", out)
+	}
+	// The command prose around the fragment must survive.
+	if !strings.Contains(out, "$ echo") {
+		t.Errorf("command prefix should be preserved:\n%s", out)
+	}
+}
+
 // TestExtractPostmortem_RedactsSingleClippedPEMBodyLine covers the finding's
 // sharpest case: the tail starts inside a PEM dump and only ONE full-width base64
 // body line survives into the last-actions window, with both -----BEGIN----- and
@@ -356,11 +384,23 @@ func TestRedactInlinePEMBody(t *testing.T) {
 	}
 
 	// A short base64 fragment embedded in a line (below the 44-char strong width)
-	// is not key material and must be left alone.
+	// with no '=' padding is ambiguous (may be a hash) and must be left alone.
 	frag := "deadbeefdeadbeef"
 	benign := "commit " + frag + " touched foo.go"
 	if got := redactInlinePEMBody(benign); !strings.Contains(got, frag) {
 		t.Errorf("short embedded fragment should not be redacted:\n%s", got)
+	}
+
+	// A short base64 tail that DOES carry '=' padding (a clipped final PEM body
+	// line embedded in a command) is key material and must be redacted, even
+	// though it is under the full-width width (#835 review — short inline PEM tail
+	// leak). '=' padding never appears in a git SHA / hex digest, so this does not
+	// reclassify the padding-free fragment above.
+	tail := "Kj34GkxFhD90vcNLYLInFE="
+	if got := redactInlinePEMBody("$ echo " + tail); strings.Contains(got, tail) {
+		t.Errorf("padded short inline tail not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
 	}
 }
 

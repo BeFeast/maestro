@@ -134,15 +134,25 @@ var pemWeakBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{8,}={0,3}$`)
 // full-width body line, so a lone git SHA is still not over-redacted.
 var pemHexHashRe = regexp.MustCompile(`^[0-9a-f]+$`)
 
-// pemInlineBodyRe matches a full-width PEM/DER base64 body run (>=44 chars — the
-// same width pemStrongBodyRe treats as key material) wherever it appears, even
+// pemInlineBodyRe matches a PEM/DER base64 body run wherever it appears, even
 // embedded inside a larger line such as command output (`$ echo MIIEv…`, `cat
 // id_rsa: MIIEv…`). redactClippedPEM only recognizes a body that is the whole
 // line (after any list bullet), so an inline clipped body carrying a command or
 // label prefix would otherwise survive into the prompt and persisted file (#835
-// review). The run is unanchored and bounded by non-base64 characters, so the
-// surrounding prose ("$ echo", "cat id_rsa:") is preserved.
-var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{44,}={0,3}`)
+// review). Two shapes qualify as key material:
+//
+//   - a full-width run (>=44 chars, the same width pemStrongBodyRe treats as key
+//     material), with or without '=' padding; or
+//   - a shorter run (>=16 chars) that carries base64 '=' padding — the tail
+//     signature of an encoded binary blob such as a clipped final PEM body line
+//     (`$ echo Kj34…Ec=`). '=' padding never appears in a git SHA / hex digest,
+//     so this catches a short inline tail the >=44 branch alone missed (#835
+//     review — short inline PEM tail leak) without redacting a lone hash.
+//
+// The run is unanchored and bounded by non-base64 characters, so the surrounding
+// prose ("$ echo", "cat id_rsa:") is preserved. The full-width alternative is
+// tried first so a padded full-width run is masked whole rather than split.
+var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{44,}={0,3}|[A-Za-z0-9+/]{16,}={1,2}`)
 
 // listBulletPrefixRe captures the leading whitespace and optional list bullet
 // ("- ", "* ", "+ ") of a post-mortem line so classification ignores the bullet
@@ -165,15 +175,17 @@ func redactPostmortemSecrets(text string) string {
 	return text
 }
 
-// redactInlinePEMBody masks a full-width base64 body run embedded inside a
-// larger line — the inline complement to redactClippedPEM's whole-line scrubber.
-// It runs after redactClippedPEM (whole-line body runs are already collapsed to a
-// marker there, so this only catches genuinely embedded runs like `$ echo <body>`
-// or `cat id_rsa: <body>`) and masks just the base64 run, keeping the command or
-// label prefix so the post-mortem still records what the attempt tried (#835
-// review). A 44+ base64 run in benign output (a long hex hash, a signed-URL token)
-// is redacted too; that mirrors pemStrongBodyRe's existing whole-line behavior and
-// is the conservative choice for a secrets-hygiene pass.
+// redactInlinePEMBody masks a base64 body run embedded inside a larger line —
+// the inline complement to redactClippedPEM's whole-line scrubber. It runs after
+// redactClippedPEM (whole-line body runs are already collapsed to a marker there,
+// so this only catches genuinely embedded runs like `$ echo <body>` or `cat
+// id_rsa: <body>`) and masks just the base64 run, keeping the command or label
+// prefix so the post-mortem still records what the attempt tried (#835 review).
+// The two run shapes it treats as key material — a full-width run and a shorter
+// '='-padded tail — are described on pemInlineBodyRe. A benign 44+ base64 run (a
+// long hex hash, a signed-URL token) or a padded blob is redacted too; that
+// mirrors pemStrongBodyRe's existing whole-line behavior and is the conservative
+// choice for a secrets-hygiene pass.
 func redactInlinePEMBody(text string) string {
 	return pemInlineBodyRe.ReplaceAllString(text, pemRedactionMarker)
 }
