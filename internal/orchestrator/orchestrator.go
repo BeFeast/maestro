@@ -3185,11 +3185,13 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		}
 
 		// Record the commit we are about to attribute so a later refetch can
-		// prove the remote only moved forward from it (never discarding work).
-		origHead, err := exec.Command("git", "-C", worktreePath, "rev-parse", "HEAD").CombinedOutput()
+		// prove the remote only moved forward from it (never discarding work),
+		// and so we can undo an un-pushed amend by resetting back to it.
+		origHeadRaw, err := exec.Command("git", "-C", worktreePath, "rev-parse", "HEAD").CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("git rev-parse HEAD: %w\n%s", err, origHead)
+			return fmt.Errorf("git rev-parse HEAD: %w\n%s", err, origHeadRaw)
 		}
+		origHead := strings.TrimSpace(string(origHeadRaw))
 
 		out, err := exec.Command("git", "-C", worktreePath, "log", "-1", "--pretty=%B").CombinedOutput()
 		if err != nil {
@@ -3216,12 +3218,27 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		if pushErr == nil {
 			return nil // trailer landed exactly once
 		}
+
+		// The push did not land, so the local --amend is now an un-pushed commit
+		// carrying the trailer while the remote head does not. Undo it before we
+		// return or retry, restoring HEAD to the exact pre-amend commit. Otherwise
+		// a later cycle reads the local trailer, AppendAttributionTrailer no-ops
+		// before any fetch/push, and attribution is lost forever despite the
+		// deferral promising a retry (#858). Resetting to the captured pre-amend
+		// HEAD discards nothing but our own reword — the worker's real commits
+		// live on the remote, not in this un-pushed amend.
+		if out, err := exec.Command("git", "-C", worktreePath, "reset", "--hard", origHead).CombinedOutput(); err != nil {
+			return fmt.Errorf("git reset --hard %s (undo un-pushed amend): %w\n%s", origHead, err, out)
+		}
+
 		if !isStaleInfoLeaseRejection(string(pushOut)) {
 			return fmt.Errorf("git push --force-with-lease origin %s: %w\n%s", branch, pushErr, pushOut)
 		}
 
 		// Stale lease: the remote advanced under a concurrent push. Out of
-		// attempts → defer to a later cycle rather than erroring.
+		// attempts → defer to a later cycle rather than erroring. HEAD is back on
+		// the pre-amend commit, so the next cycle re-reads the untrailered message
+		// and genuinely retries instead of no-oping on a stale local trailer.
 		if attempt == amendMaxAttempts {
 			return errAmendDeferred
 		}
@@ -3237,7 +3254,7 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		// (e.g. an unpushed local commit), defer rather than risk dropping a
 		// commit that is not ours (lease semantics preserved, #858).
 		if err := exec.Command("git", "-C", worktreePath, "merge-base", "--is-ancestor",
-			strings.TrimSpace(string(origHead)), "origin/"+branch).Run(); err != nil {
+			origHead, "origin/"+branch).Run(); err != nil {
 			return errAmendDeferred
 		}
 		if out, err := exec.Command("git", "-C", worktreePath, "reset", "--hard", "origin/"+branch).CombinedOutput(); err != nil {

@@ -207,6 +207,67 @@ func TestAmendHead_IdempotentNoDuplicateTrailer(t *testing.T) {
 	}
 }
 
+// After a deferral (the branch kept moving on every attempt), the worktree must
+// NOT be left sitting on an un-pushed local amend that already carries the
+// trailer. If it were, the next cycle's AppendAttributionTrailer would see the
+// local trailer and no-op before any fetch/push, so the remote — which advanced
+// during the race — would permanently miss attribution despite the deferral
+// promising a retry. This drives the deferral, then a quiet second cycle, and
+// asserts the trailer actually lands on the remote (#858).
+func TestAmendHead_DeferDoesNotPoisonNextCycle(t *testing.T) {
+	origin, wt, seed, branch := setupAmendRepo(t)
+
+	prevBackoff := amendRetryBackoff
+	amendRetryBackoff = 0
+	defer func() { amendRetryBackoff = prevBackoff }()
+
+	// First cycle: the branch advances on every push attempt, forcing a defer.
+	pushes := 0
+	amendPushRaceHook = func() {
+		pushes++
+		amendWrite(t, seed, "work.txt", strings.Repeat("live churn\n", pushes+1))
+		amendGit(t, seed, "commit", "-am", "worker: live push")
+		amendGit(t, seed, "push", "origin", branch)
+	}
+
+	if err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), time.Now().UTC()); !errors.Is(err, errAmendDeferred) {
+		t.Fatalf("expected errAmendDeferred while branch keeps moving, got: %v", err)
+	}
+	if pushes < 2 {
+		t.Fatalf("expected multiple retry attempts, saw %d", pushes)
+	}
+
+	// The worktree must not be left carrying an un-pushed trailer: HEAD must be a
+	// commit whose message has no attribution trailer, or the next cycle no-ops.
+	localMsg := amendGit(t, wt, "log", "-1", "--pretty=%B")
+	if strings.Contains(localMsg, state.AttributionTrailerKey+":") {
+		t.Fatalf("deferred amend left an un-pushed local trailer (poisons next cycle):\n%s", localMsg)
+	}
+
+	// Second cycle: the branch is now quiet. The amend must land the trailer on
+	// the remote exactly once — proving the first deferral did not poison this.
+	amendPushRaceHook = nil
+	if err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), time.Now().UTC()); err != nil {
+		t.Fatalf("quiet second cycle should land the trailer, got: %v", err)
+	}
+
+	headMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", branch)
+	if !strings.Contains(headMsg, state.AttributionTrailerKey+":") {
+		t.Fatalf("remote head missing attribution trailer after quiet retry:\n%s", headMsg)
+	}
+	if n := trailerCount(headMsg); n != 1 {
+		t.Fatalf("trailer appears %d times, want exactly 1:\n%s", n, headMsg)
+	}
+	// The worker's latest concurrent commit is what got reworded — nothing lost.
+	if last := amendGit(t, seed, "rev-parse", branch); amendGit(t, origin, "rev-parse", branch) == last {
+		t.Fatal("expected the remote head to be the reworded worker commit, not the raw worker push")
+	}
+	work := amendGit(t, origin, "show", branch+":work.txt")
+	if !strings.Contains(work, "live churn") {
+		t.Fatalf("worker's concurrent work.txt was discarded: %q", work)
+	}
+}
+
 // If the new remote head does NOT descend from the commit we were attributing
 // (a real divergence, e.g. an unpushed local commit), the amend must defer
 // rather than reset --hard and drop a commit that is not ours.
