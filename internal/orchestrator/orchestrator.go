@@ -3096,9 +3096,19 @@ Maestro auto-created this pull request for pushed branch %s because no open pull
 `, sess.IssueNumber, branch)
 }
 
-func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *state.Session) {
+// ensureAttributionTrailerOnBranch stamps the durable Maestro-Backend trailer
+// onto the branch head. It returns deferred=true when the amend could not land
+// this cycle because the branch is advancing under a concurrent worker/operator
+// push (errAmendDeferred). The merge flow MUST NOT merge a PR whose amend
+// deferred: merging now would land the PR permanently without the required
+// attribution trailer while the "later retry" the deferral promises never gets
+// to run (#858). A later quiet cycle re-invokes this and completes the trailer
+// before the merge proceeds. Non-merge callers (reconcile, pr_open transitions)
+// can ignore the return: for them the trailer legitimately lands on a later
+// cycle and nothing irreversible happens in between.
+func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *state.Session) (deferred bool) {
 	if sess == nil || len(sess.Attribution) == 0 {
-		return
+		return false
 	}
 	if err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC()); err != nil {
 		if errors.Is(err, errAmendDeferred) {
@@ -3108,10 +3118,11 @@ func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *s
 			// (or the pre-merge amend) completes the trailer. Log one concise
 			// line instead of spamming raw git rejection output (#858).
 			log.Printf("[orch] attribution: deferring amend for %s (branch %q advancing under concurrent push; will retry next cycle)", slotName, sess.Branch)
-			return
+			return true
 		}
 		log.Printf("[orch] attribution: could not amend branch %q for %s: %v", sess.Branch, slotName, err)
 	}
+	return false
 }
 
 func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
@@ -3142,9 +3153,27 @@ var amendPushRaceHook func()
 // on later cycles, so a quieter cycle or the pre-merge pass completes it (#858).
 var errAmendDeferred = errors.New("attribution amend deferred: branch advancing under concurrent push")
 
+// amendGitCommand builds a git subprocess for the attribution amend with a
+// forced C locale. Git localizes its porcelain and error text per
+// LC_ALL/LC_MESSAGES/LANG, which the git child would otherwise inherit from the
+// orchestrator's environment. Under a non-English locale git translates the
+// "stale info" force-with-lease rejection, so isStaleInfoLeaseRejection (which
+// matches that English marker) would miss the real race and take the hard-error
+// path instead of retrying/deferring. Pinning LC_ALL=C keeps git's messages
+// stable and English regardless of the host locale (#858). os/exec keeps the
+// last value for a duplicate key, so this overrides any inherited LC_ALL, and
+// LC_ALL outranks LC_MESSAGES/LANG in the locale precedence.
+func amendGitCommand(worktreePath string, args ...string) *exec.Cmd {
+	cmd := exec.Command("git", append([]string{"-C", worktreePath}, args...)...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	return cmd
+}
+
 // isStaleInfoLeaseRejection reports whether `git push --force-with-lease` output
 // is the "stale info" rejection that occurs when the remote branch advanced
-// between our fetch and our push — i.e. a worker or operator pushed first.
+// between our fetch and our push — i.e. a worker or operator pushed first. The
+// git subprocess is run under LC_ALL=C (see amendGitCommand), so this English
+// marker is locale-stable and cannot be missed under a translated locale.
 func isStaleInfoLeaseRejection(out string) bool {
 	return strings.Contains(strings.ToLower(out), "stale info")
 }
@@ -3176,7 +3205,7 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		// Never amend over a dirty tree: a worker may still be writing, and a
 		// force-push here could clobber uncommitted work the lease cannot
 		// protect (it only guards committed history). Defer instead.
-		status, err := exec.Command("git", "-C", worktreePath, "status", "--porcelain").CombinedOutput()
+		status, err := amendGitCommand(worktreePath, "status", "--porcelain").CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("git status: %w\n%s", err, status)
 		}
@@ -3187,13 +3216,13 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		// Record the commit we are about to attribute so a later refetch can
 		// prove the remote only moved forward from it (never discarding work),
 		// and so we can undo an un-pushed amend by resetting back to it.
-		origHeadRaw, err := exec.Command("git", "-C", worktreePath, "rev-parse", "HEAD").CombinedOutput()
+		origHeadRaw, err := amendGitCommand(worktreePath, "rev-parse", "HEAD").CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("git rev-parse HEAD: %w\n%s", err, origHeadRaw)
 		}
 		origHead := strings.TrimSpace(string(origHeadRaw))
 
-		out, err := exec.Command("git", "-C", worktreePath, "log", "-1", "--pretty=%B").CombinedOutput()
+		out, err := amendGitCommand(worktreePath, "log", "-1", "--pretty=%B").CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("git log -1: %w\n%s", err, out)
 		}
@@ -3204,7 +3233,7 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 			return nil
 		}
 
-		cmd := exec.Command("git", "-C", worktreePath, "commit", "--amend", "-F", "-")
+		cmd := amendGitCommand(worktreePath, "commit", "--amend", "-F", "-")
 		cmd.Stdin = strings.NewReader(msg)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("git commit --amend: %w\n%s", err, out)
@@ -3214,7 +3243,7 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 			amendPushRaceHook()
 		}
 
-		pushOut, pushErr := exec.Command("git", "-C", worktreePath, "push", "--force-with-lease", "origin", branch).CombinedOutput()
+		pushOut, pushErr := amendGitCommand(worktreePath, "push", "--force-with-lease", "origin", branch).CombinedOutput()
 		if pushErr == nil {
 			return nil // trailer landed exactly once
 		}
@@ -3227,7 +3256,7 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		// deferral promising a retry (#858). Resetting to the captured pre-amend
 		// HEAD discards nothing but our own reword — the worker's real commits
 		// live on the remote, not in this un-pushed amend.
-		if out, err := exec.Command("git", "-C", worktreePath, "reset", "--hard", origHead).CombinedOutput(); err != nil {
+		if out, err := amendGitCommand(worktreePath, "reset", "--hard", origHead).CombinedOutput(); err != nil {
 			return fmt.Errorf("git reset --hard %s (undo un-pushed amend): %w\n%s", origHead, err, out)
 		}
 
@@ -3245,7 +3274,7 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 
 		// Re-fetch the branch so we can re-apply the trailer onto the head the
 		// worker actually pushed.
-		if out, err := exec.Command("git", "-C", worktreePath, "fetch", "origin", branch).CombinedOutput(); err != nil {
+		if out, err := amendGitCommand(worktreePath, "fetch", "origin", branch).CombinedOutput(); err != nil {
 			return fmt.Errorf("git fetch origin %s: %w\n%s", branch, err, out)
 		}
 		// Only re-target the amend when the new remote head descends from the
@@ -3253,11 +3282,11 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		// contained and resetting to it discards nothing. If the branch diverged
 		// (e.g. an unpushed local commit), defer rather than risk dropping a
 		// commit that is not ours (lease semantics preserved, #858).
-		if err := exec.Command("git", "-C", worktreePath, "merge-base", "--is-ancestor",
+		if err := amendGitCommand(worktreePath, "merge-base", "--is-ancestor",
 			origHead, "origin/"+branch).Run(); err != nil {
 			return errAmendDeferred
 		}
-		if out, err := exec.Command("git", "-C", worktreePath, "reset", "--hard", "origin/"+branch).CombinedOutput(); err != nil {
+		if out, err := amendGitCommand(worktreePath, "reset", "--hard", "origin/"+branch).CombinedOutput(); err != nil {
 			return fmt.Errorf("git reset --hard origin/%s: %w\n%s", branch, err, out)
 		}
 		if amendRetryBackoff > 0 {
@@ -3899,7 +3928,17 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if sess.PRNumber == 0 {
 			sess.PRNumber = pr.Number
 		}
-		o.ensureAttributionTrailerOnBranch(slotName, sess)
+		if o.ensureAttributionTrailerOnBranch(slotName, sess) {
+			// The attribution amend deferred because the branch is still moving
+			// under a concurrent worker/operator push. Do NOT let this PR reach
+			// the merge decision this cycle: merging now would land it without
+			// the durable Maestro-Backend trailer, and the deferral's "retry next
+			// cycle" would then have nothing left to amend. Skip it; a later quiet
+			// cycle stamps the trailer and this PR becomes merge-eligible (#858).
+			// ensureAttributionTrailerOnBranch already logged the concise defer
+			// line, so no extra journal noise here.
+			continue
+		}
 
 		// #705: opt-in visual evidence for UI-affecting PRs. One-shot,
 		// advisory — posts a warning comment when evidence is missing but
