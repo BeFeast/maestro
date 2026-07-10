@@ -69,6 +69,54 @@ func TestCheckRunOutputErrorLines(t *testing.T) {
 	}
 }
 
+// A GitHub Actions step that fails emits "Error: Process completed with exit
+// code 1" into its output body; checkErrorLineRe matches it (via the `error:`
+// prefix) and strips it to "Process completed with exit code 1". That excerpt
+// is non-empty but names no actionable error, so PRFailingChecks must recognize
+// it as generic and fall through to the failure annotations instead of skipping
+// them — otherwise the real agent-lint error never reaches the retry prompt
+// (#857 review: generic output hid annotations).
+func TestCheckRunOutputErrorLines_GenericBoilerplateStaysGeneric(t *testing.T) {
+	var ck greptileCheckRun
+	ck.Output.Text = "Error: Process completed with exit code 1"
+	got := checkRunOutputErrorLines(ck)
+	if got == "" {
+		t.Fatalf("expected non-empty excerpt for generic boilerplate, got empty")
+	}
+	if !isGenericCheckExcerpt(got) {
+		t.Fatalf("excerpt %q should be classified generic so annotations fallback runs", got)
+	}
+}
+
+func TestIsGenericCheckExcerpt(t *testing.T) {
+	generic := []string{
+		"Process completed with exit code 1",
+		"process completed with exit code 137",
+		"Process completed with exit code 1.",
+		"The process '/usr/bin/bash' failed with exit code 1",
+		"  Process completed with exit code 2  ",
+		"Process completed with exit code 1\n\nProcess completed with exit code 2",
+	}
+	for _, s := range generic {
+		if !isGenericCheckExcerpt(s) {
+			t.Errorf("isGenericCheckExcerpt(%q) = false, want true", s)
+		}
+	}
+	actionable := []string{
+		"",
+		"agent-lint: possible secret detected (github-token) in added diff lines.",
+		"agent-lint: 1 check(s) failed",
+		// A generic line mixed with a real error must NOT be treated as generic,
+		// so a genuine excerpt is never discarded in favor of annotations.
+		"Process completed with exit code 1\nagent-lint: possible secret detected",
+	}
+	for _, s := range actionable {
+		if isGenericCheckExcerpt(s) {
+			t.Errorf("isGenericCheckExcerpt(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestFormatFailureAnnotations(t *testing.T) {
 	anns := []checkAnnotation{
 		{AnnotationLevel: "failure", Message: "possible secret detected (github-token) in added diff lines.", Path: ".github"},

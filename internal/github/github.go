@@ -2187,15 +2187,19 @@ func (c *Client) PRFailingChecks(prNumber int) ([]FailingCheck, error) {
 			continue
 		}
 		excerpt := checkRunOutputErrorLines(ck)
-		if excerpt == "" {
-			// Plain GitHub Actions jobs rarely populate the check-run output
-			// body; the `::error::` lines they emit (e.g. agent-lint) land as
-			// failure annotations instead. Fetch them best-effort — an error
-			// here degrades to name + conclusion, never fails the whole call.
+		if excerpt == "" || isGenericCheckExcerpt(excerpt) {
+			// The output body was empty, or carried only generic runner
+			// boilerplate ("Process completed with exit code 1") that names no
+			// actionable error. Plain GitHub Actions jobs (e.g. agent-lint) emit
+			// their real `::error::` detail as failure annotations, so fetch
+			// those and prefer them. A fetch error, or no failure-level
+			// annotation, leaves whatever the output gave us — the generic line
+			// still names the failure and the call never fails (#857 review:
+			// a generic excerpt must not hide the annotations fallback).
 			if anns, aerr := c.checkRunAnnotations(ck.ID); aerr != nil {
 				log.Printf("[github] warn: could not read annotations for check-run %q (id %d): %v", ck.Name, ck.ID, aerr)
-			} else {
-				excerpt = formatFailureAnnotations(anns)
+			} else if formatted := formatFailureAnnotations(anns); formatted != "" {
+				excerpt = formatted
 			}
 		}
 		failing = append(failing, FailingCheck{
@@ -2273,6 +2277,34 @@ var checkErrorLineRe = regexp.MustCompile(`(?i)^(?:::error\b[^:]*::|##\[error\]|
 // checkErrorPrefixRe strips the recognized annotation prefix from a matched line
 // so the surfaced text reads as the message alone.
 var checkErrorPrefixRe = regexp.MustCompile(`(?i)^(?:::error\b[^:]*::|##\[error\]|error:\s*)`)
+
+// genericCheckFailureLineRe matches the runner boilerplate a failed GitHub
+// Actions step emits — "Error: Process completed with exit code 1" or "Error:
+// The process '/usr/bin/bash' failed with exit code 1" — after checkErrorLineRe
+// strips its `error:` prefix. Such a line names no actionable error.
+var genericCheckFailureLineRe = regexp.MustCompile(`(?i)^(?:the process\b.*failed|process completed) with exit code \d+\.?$`)
+
+// isGenericCheckExcerpt reports whether an output-derived excerpt consists only
+// of generic runner boilerplate ("Process completed with exit code 1") that
+// carries no actionable detail. Such an excerpt is non-empty yet useless to a
+// retrying worker, so PRFailingChecks treats it like an empty excerpt and falls
+// through to the check-run's failure annotations, where the real `::error::`
+// lines (e.g. agent-lint) actually live (#857 review). An excerpt with any
+// non-boilerplate line is kept as-is.
+func isGenericCheckExcerpt(excerpt string) bool {
+	var sawLine bool
+	for _, raw := range strings.Split(excerpt, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if !genericCheckFailureLineRe.MatchString(line) {
+			return false
+		}
+		sawLine = true
+	}
+	return sawLine
+}
 
 // checkRunOutputErrorLines distills the error lines from a check-run's own
 // output body (summary + text). It keeps only lines that look like an error
