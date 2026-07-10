@@ -4171,21 +4171,39 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(slotName string, sess *state.
 // reconcileClosedPRRetryExhausted handles retry_exhausted sessions whose PR
 // is no longer open (#818). The PR was either merged by another path or
 // closed without merge. Without this reconciliation the session sat in
-// retry_exhausted forever logging "waiting for reconciliation", which held
-// the issue slot and stalled the dynamic-wave queue at max_parallel=1.
+// retry_exhausted forever: reported live (SessionAttentionForAt marks
+// retry_exhausted+PRNumber>0 as needs_attention/actionable), holding the
+// issue slot (IssueRetryExhausted stays true), logging "waiting for
+// reconciliation" every cycle, and surviving daemon restarts.
+//
+// The fix transitions the *session status* out of retry_exhausted so it stops
+// being reported live and releases the issue slot without any supervisor:
+//
+//   - merged PR → StatusDone. The work landed, so the session settles done
+//     (SessionAttentionForAt no longer flags it, SessionLive → false) and the
+//     issue is auto-closed when close_issue is a safe action, otherwise
+//     surfaced as an operator close-candidate.
+//   - closed-unmerged PR → StatusFailed with the recorded PR cleared. This
+//     drops IssueRetryExhausted for the issue and makes the attempt count via
+//     FailedAttemptsForIssue, so the dispatch loop re-picks the issue for a
+//     fresh worker while it stays under max_retries_per_issue. No blocked
+//     label is applied: only the supervisor removes that label, so labelling
+//     blocked would re-create the exact supervisor-dependence #818 removes.
 func (o *Orchestrator) reconcileClosedPRRetryExhausted(slotName string, sess *state.Session) {
 	if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 {
-		return
-	}
-	if sess.LastNotifiedStatus == noPRReconciledStatus {
 		return
 	}
 
 	merged, err := o.isPRMerged(sess.PRNumber)
 	if err != nil {
+		// Outcome unknown on a transient GitHub failure — leave the session in
+		// retry_exhausted and try again next cycle rather than settling it
+		// on a guess.
 		log.Printf("[orch] closed-PR retry_exhausted: could not check if PR #%d was merged for issue #%d (slot %s): %v", sess.PRNumber, sess.IssueNumber, slotName, err)
 		return
 	}
+
+	now := time.Now().UTC()
 
 	if merged {
 		comment := fmt.Sprintf("Maestro: closing this issue because worker session %s exhausted retries, but its PR #%d was merged.", slotName, sess.PRNumber)
@@ -4195,39 +4213,43 @@ func (o *Orchestrator) reconcileClosedPRRetryExhausted(slotName string, sess *st
 				if o.notifier != nil {
 					o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted (PR #%d merged); auto-close failed: %v", sess.IssueNumber, sess.PRNumber, cerr)
 				}
-				return
+				// Best-effort: even if the close API hiccupped, the PR is
+				// merged, so settle the session done below rather than leave it
+				// live forever waiting on a comment call.
+			} else {
+				log.Printf("[orch] closed-PR retry_exhausted: auto-closed issue #%d (slot %s, PR #%d merged)", sess.IssueNumber, slotName, sess.PRNumber)
+				if o.notifier != nil {
+					o.notifier.Sendf("✅ maestro: closed issue #%d after retry_exhausted (PR #%d merged)", sess.IssueNumber, sess.PRNumber)
+				}
 			}
-			log.Printf("[orch] closed-PR retry_exhausted: auto-closed issue #%d (slot %s, PR #%d merged)", sess.IssueNumber, slotName, sess.PRNumber)
-			if o.notifier != nil {
-				o.notifier.Sendf("✅ maestro: closed issue #%d after retry_exhausted (PR #%d merged)", sess.IssueNumber, sess.PRNumber)
-			}
-			o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 		} else {
 			log.Printf("[orch] closed-PR retry_exhausted: issue #%d (slot %s) PR #%d was merged — surfaced as operator close-candidate", sess.IssueNumber, slotName, sess.PRNumber)
 			if o.notifier != nil {
 				o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted; PR #%d was merged — operator close-candidate", sess.IssueNumber, sess.PRNumber)
 			}
 		}
-	} else {
-		if blockedLabel := strings.TrimSpace(o.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
-			if lerr := o.addIssueLabel(sess.IssueNumber, blockedLabel); lerr != nil {
-				log.Printf("[orch] closed-PR retry_exhausted: could not add %q label to issue #%d (slot %s): %v", blockedLabel, sess.IssueNumber, slotName, lerr)
-				if o.notifier != nil {
-					o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted (PR #%d closed); could not apply %q label: %v", sess.IssueNumber, sess.PRNumber, blockedLabel, lerr)
-				}
-				return
-			}
-			log.Printf("[orch] closed-PR retry_exhausted: labelled issue #%d %q (slot %s, PR #%d closed without merge)", sess.IssueNumber, blockedLabel, slotName, sess.PRNumber)
-		} else {
-			log.Printf("[orch] closed-PR retry_exhausted: issue #%d (slot %s) PR #%d closed without merge — operator review required (no blocked_label configured)", sess.IssueNumber, slotName, sess.PRNumber)
-		}
-		if o.notifier != nil {
-			o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted (PR #%d closed without merge) — needs operator review", sess.IssueNumber, sess.PRNumber)
-		}
-		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+		sess.Status = state.StatusDone
+		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
+		return
 	}
 
-	sess.LastNotifiedStatus = noPRReconciledStatus
+	// PR closed without merge: release the issue for fresh dispatch. Marking
+	// the session failed and clearing the recorded PR drops
+	// IssueRetryExhausted for the issue and makes FailedAttemptsForIssue count
+	// this attempt, so the dispatch loop re-picks the issue (subject to
+	// max_retries_per_issue) without any supervisor un-block step.
+	log.Printf("[orch] closed-PR retry_exhausted: PR #%d closed without merge for issue #%d (slot %s) — marking session failed and releasing issue for fresh dispatch (subject to max_retries_per_issue)", sess.PRNumber, sess.IssueNumber, slotName)
+	if o.notifier != nil {
+		o.notifier.Sendf("🔁 maestro: issue #%d retry_exhausted (PR #%d closed without merge) — released for fresh dispatch (subject to max_retries)", sess.IssueNumber, sess.PRNumber)
+	}
+	o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+	sess.LastClosedPRNumber = sess.PRNumber
+	sess.PRNumber = 0
+	sess.Status = state.StatusFailed
+	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
 }
 
 // handleReviewFeedbackRetry schedules a retry worker with review feedback in

@@ -9809,9 +9809,12 @@ func TestAutoMergePRs_NoPRRetryExhaustedHasMergedPRErrorDefersReconcile(t *testi
 }
 
 // #818: a retry_exhausted session whose PR was closed without merge must be
-// labelled blocked so the dynamic-wave queue advances instead of logging
-// "waiting for reconciliation" forever.
-func TestAutoMergePRs_ClosedPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
+// released for fresh dispatch. The session goes terminal (failed) with its
+// recorded PR cleared, which drops the IssueRetryExhausted slot-hold and makes
+// the attempt count via FailedAttemptsForIssue (so re-dispatch stays subject to
+// max_retries_per_issue). No blocked label is applied: only the supervisor
+// removes that label, and #818 must clear without the supervisor.
+func TestAutoMergePRs_ClosedPRRetryExhaustedReleasesIssueForFreshDispatch(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
 		Supervisor: config.SupervisorConfig{
@@ -9842,25 +9845,50 @@ func TestAutoMergePRs_ClosedPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	if got, want := addedLabels[500], "blocked"; got != want {
-		t.Fatalf("issue #500 label = %q, want %q (closed-PR retry_exhausted must mark blocked)", got, want)
+	if len(addedLabels) != 0 {
+		t.Fatalf("blocked label applied %v, want none (closed-PR retry_exhausted must release, not block)", addedLabels)
 	}
 	sess := s.Sessions["sup-20"]
-	if sess.LastNotifiedStatus != noPRReconciledStatus {
-		t.Fatalf("LastNotifiedStatus = %q, want %q (reconciler must mark idempotent)", sess.LastNotifiedStatus, noPRReconciledStatus)
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q (closed-unmerged retry_exhausted must go failed)", sess.Status, state.StatusFailed)
+	}
+	if sess.PRNumber != 0 {
+		t.Fatalf("PRNumber = %d, want 0 (closed PR must be cleared so the attempt counts and the issue re-dispatches)", sess.PRNumber)
+	}
+	if sess.LastClosedPRNumber != 218 {
+		t.Fatalf("LastClosedPRNumber = %d, want 218", sess.LastClosedPRNumber)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatalf("FinishedAt must be set on a reconciled terminal session")
+	}
+	if s.IssueRetryExhausted(500) {
+		t.Fatalf("issue #500 still retry-exhausted; slot not released")
+	}
+	if got := s.FailedAttemptsForIssue(500); got != 1 {
+		t.Fatalf("FailedAttemptsForIssue(500) = %d, want 1 (attempt must count toward max_retries_per_issue)", got)
+	}
+	// The released session ages out of the live window instead of staying live
+	// forever (#818 / no permanent "waiting for reconciliation" state).
+	aged := sess.FinishedAt.Add(state.LiveSessionRecentWindow + time.Hour)
+	if state.SessionLiveAt(sess, aged) {
+		t.Fatalf("failed session still live after the aging window; must not be a permanent live state")
 	}
 
-	// Second cycle must NOT re-apply.
+	// Second cycle is a structural no-op: a failed session is not merge-flow
+	// eligible, so the reconciler does not run again.
 	clear(addedLabels)
 	o.autoMergePRs(s)
 	if len(addedLabels) != 0 {
-		t.Fatalf("second cycle re-applied labels = %v, want none (idempotency)", addedLabels)
+		t.Fatalf("second cycle applied labels = %v, want none (idempotency)", addedLabels)
+	}
+	if s.Sessions["sup-20"].Status != state.StatusFailed {
+		t.Fatalf("second cycle changed status to %q, want failed (idempotency)", s.Sessions["sup-20"].Status)
 	}
 }
 
-// #818: a retry_exhausted session whose PR was merged must auto-close the
-// issue when close_issue is a safe action, or surface as close-candidate
-// when it requires approval.
+// #818: a retry_exhausted session whose PR was merged settles the session done
+// (so it stops being reported live/needs_attention and releases the slot) and
+// auto-closes the issue when close_issue is a safe action.
 func TestAutoMergePRs_ClosedPRRetryExhaustedAutoClosesWhenMerged(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
@@ -9902,15 +9930,32 @@ func TestAutoMergePRs_ClosedPRRetryExhaustedAutoClosesWhenMerged(t *testing.T) {
 		t.Fatalf("issue #501 not auto-closed; closed=%v (merged PR + close_issue safe action must close)", closed)
 	}
 	if labelled != 0 {
-		t.Fatalf("blocked label applied %d times, want 0 (auto-close branch must not label)", labelled)
+		t.Fatalf("blocked label applied %d times, want 0 (merged branch must not label)", labelled)
 	}
-	if sess := s.Sessions["sup-22"]; sess.LastNotifiedStatus != noPRReconciledStatus {
-		t.Fatalf("LastNotifiedStatus = %q, want %q", sess.LastNotifiedStatus, noPRReconciledStatus)
+	sess := s.Sessions["sup-22"]
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q (merged retry_exhausted must settle done)", sess.Status, state.StatusDone)
+	}
+	if sess.FinishedAt == nil {
+		t.Fatalf("FinishedAt must be set on a settled-done session")
+	}
+	if s.IssueRetryExhausted(501) {
+		t.Fatalf("issue #501 still retry-exhausted after merge; slot not released")
+	}
+	// A done session no longer flags for attention and ages out of the live
+	// window — it is not a permanent live/needs_attention state (#818).
+	if state.SessionAttentionForAt(sess, nil, *sess.FinishedAt).NeedsAttention {
+		t.Fatalf("done session must not need attention")
+	}
+	aged := sess.FinishedAt.Add(state.LiveSessionRecentWindow + time.Hour)
+	if state.SessionLiveAt(sess, aged) {
+		t.Fatalf("done session still live after the aging window; must not be a permanent live state")
 	}
 }
 
-// #818: a transient GitHub failure when checking if the PR was merged must
-// NOT mark the session reconciled.
+// #818: a transient GitHub failure when checking if the PR was merged must NOT
+// transition the session — it stays retry_exhausted so reconcile retries next
+// cycle rather than settling the outcome on a guess.
 func TestAutoMergePRs_ClosedPRRetryExhaustedMergeCheckErrorDefersReconcile(t *testing.T) {
 	cfg := &config.Config{
 		Repo: "owner/repo",
@@ -9941,8 +9986,12 @@ func TestAutoMergePRs_ClosedPRRetryExhaustedMergeCheckErrorDefersReconcile(t *te
 
 	o.autoMergePRs(s)
 
-	if sess := s.Sessions["sup-24"]; sess.LastNotifiedStatus == noPRReconciledStatus {
-		t.Fatalf("transient probe failure must not mark reconciled; LastNotifiedStatus=%q", sess.LastNotifiedStatus)
+	sess := s.Sessions["sup-24"]
+	if sess.Status != state.StatusRetryExhausted {
+		t.Fatalf("status = %q, want %q (transient probe failure must not transition the session)", sess.Status, state.StatusRetryExhausted)
+	}
+	if sess.PRNumber != 221 {
+		t.Fatalf("PRNumber = %d, want 221 (must not be cleared on probe failure)", sess.PRNumber)
 	}
 }
 
