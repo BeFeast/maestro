@@ -377,6 +377,46 @@ func TestExtractPostmortem_RedactsShortAllCapsInlinePEMTail(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsMixedCaseInlinePEMTail closes the successor of the
+// all-caps finding (#835 review — "Mixed-Case PEM Tail Leaks"). A digit-free
+// base64 tail that mixes case (`$ echo AbCdEfGh`) or carries a '+' (`$ echo
+// abc+DefG`) sat below every earlier branch — it has lowercase (so the all-caps
+// branch skips it) and no digit (so the upper+digit branch skips it) — and reached
+// both the persisted post-mortem and the capped retry prompt intact. The
+// same-case-run density branch (and the '+' signal) now redact the dense
+// alternation while a real identifier keeps its word run and survives.
+func TestExtractPostmortem_RedactsMixedCaseInlinePEMTail(t *testing.T) {
+	mixed := "AbCdEfGh" // alternating case, no digit, no word run
+	plus := "abc+DefG"  // '+' is base64-only
+	ident := "handleUserRequest"
+	log := strings.Join([]string{
+		"running deploy",
+		"$ echo " + mixed,
+		"$ echo " + plus,
+		"$ grep " + ident,
+		"exit status 1",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+	for _, leak := range []string{mixed, plus} {
+		if strings.Contains(out, leak) {
+			t.Errorf("mixed-case inline PEM tail %q leaked into post-mortem:\n%s", leak, out)
+		}
+		if capped := CapPostmortem(out, 2048); strings.Contains(capped, leak) {
+			t.Errorf("mixed-case inline PEM tail %q leaked into capped prompt excerpt:\n%s", leak, capped)
+		}
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected PEM redaction marker in output:\n%s", out)
+	}
+	// A digit-free identifier with a word run must not be over-redacted.
+	for _, keep := range []string{ident, "$ echo", "exit status 1"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("benign content %q should survive inline redaction:\n%s", keep, out)
+		}
+	}
+}
+
 // TestExtractPostmortem_RedactsSingleClippedPEMBodyLine covers the finding's
 // sharpest case: the tail starts inside a PEM dump and only ONE full-width base64
 // body line survives into the last-actions window, with both -----BEGIN----- and
@@ -622,11 +662,42 @@ func TestRedactInlinePEMBody(t *testing.T) {
 	}
 
 	// A mixed-case, digit-free identifier stays intact: it has lowercase (so the
-	// all-caps branch skips it) and no digit (so the upper+digit branch skips it) —
-	// the unpadded-tail rules must not garble the identifiers a post-mortem records.
+	// all-caps branch skips it) and no digit (so the upper+digit branch skips it) and
+	// carries a word run of >=4 same-case letters (so the mixed-case density branch
+	// skips it) — the unpadded-tail rules must not garble the identifiers a
+	// post-mortem records.
 	ident := "handleUserRequest"
 	if got := redactInlinePEMBody("$ grep " + ident); !strings.Contains(got, ident) {
 		t.Errorf("mixed-case identifier should survive inline redaction:\n%s", got)
+	}
+
+	// A PascalCase type carrying an uppercase acronym run (`HTTPSConn`, HTTPS is a
+	// 5-letter same-case run) is also ordinary post-mortem prose and must survive.
+	acronym := "HTTPSConn"
+	if got := redactInlinePEMBody("$ grep " + acronym); !strings.Contains(got, acronym) {
+		t.Errorf("acronym-bearing identifier should survive inline redaction:\n%s", got)
+	}
+
+	// A MIXED-CASE, digit-free run that alternates case densely with no word/acronym
+	// run (`$ echo AbCdEfGh`) is a clipped key tail that the earlier all-caps and
+	// upper+digit branches both skip (it has lowercase, and no digit). It leaked into
+	// both sinks intact (#835 review — mixed-case inline PEM tail leak). The
+	// same-case-run density branch now redacts it while the command prose survives.
+	mixed := "AbCdEfGh" // 8 chars, alternating case, no digit, longest same-case run 1
+	if got := redactInlinePEMBody("$ echo " + mixed); strings.Contains(got, mixed) {
+		t.Errorf("mixed-case inline PEM tail not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// A run carrying a '+' (`$ echo abc+DefG`) is key material outright: '+' is a
+	// base64-only character that never appears in a path, identifier, or hex digest
+	// (#835 review — mixed-case inline PEM tail leak, '+' case).
+	plus := "abc+DefG"
+	if got := redactInlinePEMBody("$ echo " + plus); strings.Contains(got, plus) {
+		t.Errorf("'+'-bearing inline blob not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
 	}
 }
 

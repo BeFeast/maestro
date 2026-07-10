@@ -210,6 +210,10 @@ func redactInlinePEMBody(text string) string {
 //     lowercase file path keeps its digits but has no uppercase
 //     (`internal/attempt2`, `stream/01`), and a camelCase identifier keeps its case
 //     but has no digit (`handleUserRequest`);
+//   - a run carrying a '+' is key material: '+' is a base64-only character that
+//     never appears in a file path, a Go identifier, or a hex digest, so its
+//     presence marks an encoded blob (#835 review — mixed-case inline PEM tail leak,
+//     `$ echo abc+DefG`);
 //   - an ALL-UPPERCASE run (no lowercase, no digit) at or above the >=8 inline
 //     floor is likewise key material. The base64 alphabet spans all 26 uppercase
 //     letters, so a clipped DER body window can land entirely in A–Z with no other
@@ -220,10 +224,18 @@ func redactInlinePEMBody(text string) string {
 //     leak); a secrets-hygiene extractor resolves the ambiguity toward masking. The
 //     rare legitimate all-caps word of the same width (`HOSTNAME`, `PASSWORD`) is
 //     over-redacted, while shorter all-caps tokens (`SIGKILL`, HTTP verbs) fall
-//     below the >=8 floor and survive.
+//     below the >=8 floor and survive;
+//   - a MIXED-CASE, digit-free run of >=8 chars is key material when it holds no
+//     same-case letter run of >=4 — the "word" or "acronym" signal of a real
+//     identifier. A camelCase/PascalCase name the post-mortem records
+//     (`handleUserRequest`, `HTTPSConn`) always carries such a run, while a clipped
+//     base64 key tail (`$ echo AbCdEfGh`) alternates case almost every character
+//     with no readable word to lean on (#835 review — mixed-case inline PEM tail
+//     leak). The rare short-word identifier (`getUrlFor`) is over-redacted, the safe
+//     direction for a secrets-hygiene extractor.
 //
-// A run whose only signal is LOWERCASE — a file path or camelCase identifier
-// (`internal/attempt2`, `handleUserRequest`) — is indistinguishable from ordinary
+// A run whose only signal is LOWERCASE — a file path or lowercase word
+// (`internal/attempt2`, `something`) — is indistinguishable from ordinary
 // post-mortem prose and is left intact, so the extractor does not garble the
 // identifiers and paths it exists to record. The residual key shapes it declines
 // here are covered by the padded / full-width / whole-line-clipped and
@@ -239,15 +251,54 @@ func inlineRunIsKeyMaterial(run string) bool {
 	if pemHexHashRe.MatchString(body) { // a lone lowercase git SHA / digest
 		return false
 	}
+	if strings.Contains(body, "+") { // '+' is base64-only: never a path/identifier/hash
+		return true
+	}
 	hasUpper := strings.ContainsAny(body, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 	hasLower := strings.ContainsAny(body, "abcdefghijklmnopqrstuvwxyz")
 	hasDigit := strings.ContainsAny(body, "0123456789")
 	if hasUpper && hasDigit { // encoded-byte mix of a clipped key body tail
 		return true
 	}
-	// An all-uppercase base64 run has no lowercase or digit to lean on; mask it at
-	// the >=8 inline floor rather than leak a clipped 8–15 char key tail.
-	return hasUpper && !hasLower && len(body) >= 8
+	if hasUpper && !hasLower && len(body) >= 8 {
+		// An all-uppercase base64 run has no lowercase or digit to lean on; mask it at
+		// the >=8 inline floor rather than leak a clipped 8–15 char key tail.
+		return true
+	}
+	// A mixed-case, digit-free run: a camelCase identifier or PascalCase type carries
+	// a word/acronym run of >=4 same-case letters; a clipped base64 key tail
+	// (`AbCdEfGh`) alternates case densely with no such run. Mask the
+	// dense-alternation shape at the >=8 inline floor while the identifier survives.
+	return hasUpper && hasLower && len(body) >= 8 && longestSameCaseRun(body) < 4
+}
+
+// longestSameCaseRun returns the length of the longest maximal run of adjacent
+// same-case ASCII letters in s; digits and any other character break a run. A
+// readable identifier or type name carries a word or acronym of several letters in
+// one case (`handle`, `HTTPS`); a base64 key fragment alternates case almost every
+// character, so its longest same-case run is short.
+func longestSameCaseRun(s string) int {
+	best, cur := 0, 0
+	var prevUpper, have bool
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		upper := c >= 'A' && c <= 'Z'
+		lower := c >= 'a' && c <= 'z'
+		if !upper && !lower {
+			cur, have = 0, false
+			continue
+		}
+		if have && upper == prevUpper {
+			cur++
+		} else {
+			cur = 1
+		}
+		prevUpper, have = upper, true
+		if cur > best {
+			best = cur
+		}
+	}
+	return best
 }
 
 // redactClippedPEM masks PEM private-key material whose -----BEGIN----- banner
