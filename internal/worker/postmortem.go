@@ -134,22 +134,31 @@ var pemWeakBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{8,}={0,3}$`)
 // full-width body line, so a lone git SHA is still not over-redacted.
 var pemHexHashRe = regexp.MustCompile(`^[0-9a-f]+$`)
 
-// pemInlineBodyRe finds a candidate PEM/DER base64 run — >=16 base64 characters
-// with optional '=' padding — embedded anywhere in a line, such as command output
-// (`$ echo MIIEv…`, `cat id_rsa: MIIEv…`). redactClippedPEM only recognizes a body
-// that is the whole line (after any list bullet), so an inline clipped body
-// carrying a command or label prefix would otherwise survive into the prompt and
-// persisted file (#835 review). The pattern is deliberately broad — every
-// >=16-char run is a candidate, padded or not — so a short UNPADDED tail reaches
-// the classifier (inlineRunIsKeyMaterial) instead of being skipped by the regex
-// itself; the earlier padded-only bar let `$ echo Kj34GkxFhD90vcNLYLInFE` (no '=')
-// slip through into both sinks (#835 review — unpadded inline PEM tail leak).
+// pemInlineBodyRe finds a candidate PEM/DER base64 run embedded anywhere in a
+// line, such as command output (`$ echo MIIEv…`, `cat id_rsa: MIIEv…`).
+// redactClippedPEM only recognizes a body that is the whole line (after any list
+// bullet), so an inline clipped body carrying a command or label prefix would
+// otherwise survive into the prompt and persisted file (#835 review). Two
+// alternatives feed the classifier (inlineRunIsKeyMaterial):
+//
+//   - a >=16-char run with optional '=' padding — deliberately broad so a short
+//     UNPADDED tail still reaches the classifier instead of being skipped by the
+//     regex itself; the earlier padded-only bar let `$ echo Kj34GkxFhD90vcNLYLInFE`
+//     (no '=') slip through into both sinks (#835 review — unpadded inline PEM
+//     tail leak).
+//   - a >=8-char run that CARRIES '=' padding — a short clipped final body line
+//     such as `$ echo AbCdEfGhIjK=`. The 16-char floor above skipped an 8–15-char
+//     padded fragment before the classifier could see it, leaking the raw key tail
+//     into both sinks (#835 review — short inline PEM tail leak). '=' padding never
+//     appears in a git SHA / hex digest, so lowering the floor only for padded runs
+//     closes the leak without garbling the shorter identifiers and paths a
+//     post-mortem legitimately records.
 //
 // The run is unanchored and bounded by non-base64 characters, so the surrounding
 // prose ("$ echo", "cat id_rsa:") is preserved. Greedy matching grabs the whole
 // run plus any trailing '=' padding, so a full-width padded body is masked whole
 // rather than split.
-var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{16,}={0,3}`)
+var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{16,}={0,3}|[A-Za-z0-9+/]{8,}={1,3}`)
 
 // listBulletPrefixRe captures the leading whitespace and optional list bullet
 // ("- ", "* ", "+ ") of a post-mortem line so classification ignores the bullet

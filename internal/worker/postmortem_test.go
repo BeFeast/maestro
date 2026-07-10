@@ -235,6 +235,36 @@ func TestExtractPostmortem_RedactsShortInlinePEMTail(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsShortPaddedInlinePEMTail covers the finding's
+// sharpest inline case (#835 review — short inline PEM tail leak): a tail-clipped
+// key fragment embedded in a larger command line whose remaining base64 run is
+// only 8–15 characters. The >=16-char inline floor skipped the run before
+// inlineRunIsKeyMaterial could classify it, so `$ echo AbCdEfGhIjK=` reached both
+// the persisted post-mortem and the retry prompt with the raw fragment intact. The
+// run carries '=' padding — the unambiguous key-material signal — so the short
+// padded alternative in pemInlineBodyRe now hands it to the classifier.
+func TestExtractPostmortem_RedactsShortPaddedInlinePEMTail(t *testing.T) {
+	frag := "AbCdEfGhIjK=" // 11 base64 chars + '=' padding: under the 16-char floor
+	log := strings.Join([]string{
+		"running deploy",
+		"$ echo " + frag,
+		"exit status 1",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, frag) {
+		t.Errorf("short padded inline PEM tail leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected PEM redaction marker in output:\n%s", out)
+	}
+	// The command prose around the fragment must survive.
+	if !strings.Contains(out, "$ echo") {
+		t.Errorf("command prefix should be preserved:\n%s", out)
+	}
+}
+
 // TestExtractPostmortem_RedactsUnpaddedInlinePEMTail covers the residual of the
 // same finding (#835 review — "Unpadded Inline PEM Tail Leaks"): a tail-clipped
 // key fragment embedded in a command line WITHOUT '=' padding (`$ echo
@@ -434,6 +464,19 @@ func TestRedactInlinePEMBody(t *testing.T) {
 	tail := "Kj34GkxFhD90vcNLYLInFE="
 	if got := redactInlinePEMBody("$ echo " + tail); strings.Contains(got, tail) {
 		t.Errorf("padded short inline tail not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// A padded tail whose base64 run is under the 16-char candidate floor
+	// (`AbCdEfGhIjK=`, 11 chars) is the finding's leak: the >=16 alternative
+	// skipped it before inlineRunIsKeyMaterial could classify it, so the raw
+	// fragment reached both sinks. The short padded alternative now hands it to the
+	// classifier, whose '=' padding signal redacts it (#835 review — short inline
+	// PEM tail leak).
+	shortTail := "AbCdEfGhIjK="
+	if got := redactInlinePEMBody("$ echo " + shortTail); strings.Contains(got, shortTail) {
+		t.Errorf("short (<16-char) padded inline tail not redacted:\n%s", got)
 	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
 		t.Errorf("expected command prose kept and marker present:\n%s", got)
 	}
