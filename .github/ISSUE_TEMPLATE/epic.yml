@@ -35,7 +35,9 @@ body:
       description: |
         Ordered list of concrete, runnable slices — one child issue each. The planner reads the first
         unchecked line as the next slice to schedule, so keep them small and in dependency order.
-      value: |
+        Replace the example below with your real slices — this field is intentionally left empty so an
+        unedited epic cannot ship placeholder slices as schedulable work.
+      placeholder: |
         - [ ] Slice 1: route shell + layout primitives
         - [ ] Slice 2: replace `/inbox` route with the redesigned shell
         - [ ] Slice 3: replace `/settings` route with the redesigned shell
@@ -48,7 +50,7 @@ body:
     attributes:
       label: Route Replacement Map
       description: Optional (useful for UI epics). Map old route → new route and which slice owns the migration.
-      value: |
+      placeholder: |
         | Old route  | New route      | Owning slice |
         |------------|----------------|--------------|
         | /inbox     | /v2/inbox      | Slice 2      |
