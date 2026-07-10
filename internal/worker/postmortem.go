@@ -210,17 +210,24 @@ func redactInlinePEMBody(text string) string {
 //     lowercase file path keeps its digits but has no uppercase
 //     (`internal/attempt2`, `stream/01`), and a camelCase identifier keeps its case
 //     but has no digit (`handleUserRequest`);
-//   - an ALL-UPPERCASE run of >=16 chars (no lowercase, no digit) is likewise key
-//     material: camelCase/PascalCase identifiers carry lowercase and all-caps
-//     constants use '_' separators that break the run below this width, so a long
-//     bare uppercase base64 blob such as `$ echo ABCDEFGHIJKLMNOPQRSTUVWXYZAB` is a
-//     clipped key body, not ordinary post-mortem prose (#835 review — unpadded
-//     inline PEM tail leak, all-caps case).
+//   - an ALL-UPPERCASE run (no lowercase, no digit) at or above the >=8 inline
+//     floor is likewise key material. The base64 alphabet spans all 26 uppercase
+//     letters, so a clipped DER body window can land entirely in A–Z with no other
+//     signal, and an 8–15 char fragment such as `$ echo ABCDEFGH` is
+//     indistinguishable by shape from a bare-caps clipped key tail. A previous
+//     >=16-char floor left the 8–15 band weak and leaked the raw tail into the
+//     prompt and persisted file (#835 review — short all-caps inline PEM tail
+//     leak); a secrets-hygiene extractor resolves the ambiguity toward masking. The
+//     rare legitimate all-caps word of the same width (`HOSTNAME`, `PASSWORD`) is
+//     over-redacted, while shorter all-caps tokens (`SIGKILL`, HTTP verbs) fall
+//     below the >=8 floor and survive.
 //
-// A shorter run carrying only one of these signals is inherently indistinguishable
-// from a path or identifier — redacting it would garble those — so the residual is
-// left to the padded / full-width / whole-line-clipped and complete-block branches,
-// which cover the shapes real key dumps actually take.
+// A run whose only signal is LOWERCASE — a file path or camelCase identifier
+// (`internal/attempt2`, `handleUserRequest`) — is indistinguishable from ordinary
+// post-mortem prose and is left intact, so the extractor does not garble the
+// identifiers and paths it exists to record. The residual key shapes it declines
+// here are covered by the padded / full-width / whole-line-clipped and
+// complete-block branches.
 func inlineRunIsKeyMaterial(run string) bool {
 	body := strings.TrimRight(run, "=")
 	if len(body) < len(run) { // carried '=' padding — an encoded blob, not a hash
@@ -238,8 +245,9 @@ func inlineRunIsKeyMaterial(run string) bool {
 	if hasUpper && hasDigit { // encoded-byte mix of a clipped key body tail
 		return true
 	}
-	// A long, all-uppercase base64 blob is not an ordinary identifier or path.
-	return hasUpper && !hasLower && len(body) >= 16
+	// An all-uppercase base64 run has no lowercase or digit to lean on; mask it at
+	// the >=8 inline floor rather than leak a clipped 8–15 char key tail.
+	return hasUpper && !hasLower && len(body) >= 8
 }
 
 // redactClippedPEM masks PEM private-key material whose -----BEGIN----- banner

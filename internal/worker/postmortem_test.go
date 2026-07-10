@@ -342,6 +342,41 @@ func TestExtractPostmortem_RedactsShortAndAllCapsInlinePEMTail(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsShortAllCapsInlinePEMTail closes the last residual of
+// the finding (#835 review — "Short Uppercase PEM Fragment Leaks"). An 8–15 char
+// ALL-UPPERCASE fragment (`$ echo ABCDEFGH`) sits below the old >=16 all-caps floor,
+// so it carried no digit and no '=' padding to trip any earlier branch and reached
+// both sinks intact. It survives selection as a last action, so it must be scrubbed
+// out of the extracted post-mortem AND out of the capped prompt excerpt. The >=8
+// all-caps floor now redacts it while the surrounding command prose is preserved.
+func TestExtractPostmortem_RedactsShortAllCapsInlinePEMTail(t *testing.T) {
+	shortAllCaps := "ABCDEFGH" // 8 chars, all uppercase, no digit, no padding
+	log := strings.Join([]string{
+		"running deploy",
+		"$ echo " + shortAllCaps,
+		"exit status 1",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+	if strings.Contains(out, shortAllCaps) {
+		t.Errorf("short all-caps inline PEM tail %q leaked into post-mortem:\n%s", shortAllCaps, out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected PEM redaction marker in output:\n%s", out)
+	}
+	for _, keep := range []string{"$ echo", "exit status 1"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("benign content %q should survive inline redaction:\n%s", keep, out)
+		}
+	}
+
+	// The capped prompt excerpt is the second sink; the fragment must not survive a
+	// tight cap either (the marker replaces it before any truncation runs).
+	if capped := CapPostmortem(out, 2048); strings.Contains(capped, shortAllCaps) {
+		t.Errorf("short all-caps inline PEM tail %q leaked into capped prompt excerpt:\n%s", shortAllCaps, capped)
+	}
+}
+
 // TestExtractPostmortem_RedactsSingleClippedPEMBodyLine covers the finding's
 // sharpest case: the tail starts inside a PEM dump and only ONE full-width base64
 // body line survives into the last-actions window, with both -----BEGIN----- and
@@ -564,6 +599,26 @@ func TestRedactInlinePEMBody(t *testing.T) {
 		t.Errorf("all-uppercase inline blob not redacted:\n%s", got)
 	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
 		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// A SHORT (8–15 char) ALL-UPPERCASE run is the finding's remaining leak: the old
+	// >=16 all-caps floor left it weak, so a clipped bare-caps key tail such as
+	// `$ echo ABCDEFGH` slipped into both sinks intact (#835 review — short all-caps
+	// inline PEM tail leak). The floor now matches the >=8 inline floor and redacts
+	// it. Over-redacting a same-width all-caps word is the safe direction here.
+	shortAllCaps := "ABCDEFGH" // 8 chars, all uppercase, no digit
+	if got := redactInlinePEMBody("$ echo " + shortAllCaps); strings.Contains(got, shortAllCaps) {
+		t.Errorf("short all-uppercase inline tail not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// A sub-floor all-caps token (7 chars) never reaches the classifier — the >=8
+	// pemInlineBodyRe floor does not match it — so short signal names and HTTP verbs
+	// survive intact and are not garbled.
+	subFloor := "SIGKILL" // 7 chars, below the >=8 inline floor
+	if got := redactInlinePEMBody("worker exited on " + subFloor); !strings.Contains(got, subFloor) {
+		t.Errorf("sub-floor all-caps token should survive inline redaction:\n%s", got)
 	}
 
 	// A mixed-case, digit-free identifier stays intact: it has lowercase (so the
