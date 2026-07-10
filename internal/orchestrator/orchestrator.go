@@ -3101,6 +3101,15 @@ func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *s
 		return
 	}
 	if err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC()); err != nil {
+		if errors.Is(err, errAmendDeferred) {
+			// The branch is advancing under a live worker/operator push, so the
+			// force-with-lease could not land this cycle. This is not a failure:
+			// autoMergePRs re-invokes this on every cycle, so a later quiet cycle
+			// (or the pre-merge amend) completes the trailer. Log one concise
+			// line instead of spamming raw git rejection output (#858).
+			log.Printf("[orch] attribution: deferring amend for %s (branch %q advancing under concurrent push; will retry next cycle)", slotName, sess.Branch)
+			return
+		}
 		log.Printf("[orch] attribution: could not amend branch %q for %s: %v", sess.Branch, slotName, err)
 	}
 }
@@ -3112,6 +3121,44 @@ func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch stri
 	return amendHeadWithAttributionTrailer(worktreePath, branch, attribution, now)
 }
 
+// amendMaxAttempts bounds how many times amendHeadWithAttributionTrailer will
+// re-fetch and re-apply the trailer after a stale-info lease rejection before
+// deferring to a later cycle: one initial try plus up to two refetch-retries.
+const amendMaxAttempts = 3
+
+// amendRetryBackoff is the pause between stale-info retry attempts. It is a var
+// so tests can shorten it.
+var amendRetryBackoff = 400 * time.Millisecond
+
+// amendPushRaceHook, when non-nil, runs immediately before each force-with-lease
+// push inside amendHeadWithAttributionTrailer. Tests use it to advance the
+// remote and deterministically reproduce the stale-info race; it is nil in
+// production.
+var amendPushRaceHook func()
+
+// errAmendDeferred signals that the attribution amend could not land this cycle
+// because the branch kept advancing under a concurrent worker/operator push (or
+// the worktree is mid-write). It is not a failure: the caller re-runs the amend
+// on later cycles, so a quieter cycle or the pre-merge pass completes it (#858).
+var errAmendDeferred = errors.New("attribution amend deferred: branch advancing under concurrent push")
+
+// isStaleInfoLeaseRejection reports whether `git push --force-with-lease` output
+// is the "stale info" rejection that occurs when the remote branch advanced
+// between our fetch and our push — i.e. a worker or operator pushed first.
+func isStaleInfoLeaseRejection(out string) bool {
+	return strings.Contains(strings.ToLower(out), "stale info")
+}
+
+// amendHeadWithAttributionTrailer amends the branch head to carry the durable
+// Maestro-Backend attribution trailer and force-pushes it. It is race-tolerant:
+// when the worker (or an operator) pushes a new commit between our read and our
+// force-with-lease push, git rejects the lease with "stale info". Rather than
+// losing the trailer and spamming raw git errors, it re-fetches the branch,
+// re-applies the trailer onto the commit the worker actually pushed, and retries
+// with backoff. If the branch keeps moving, it defers (errAmendDeferred) so a
+// later cycle completes it. The force-with-lease is only ever retargeted at a
+// head that descends from the commit we were about to attribute, so no push ever
+// discards a commit that is not our own reworded head (#858).
 func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
 	worktreePath = strings.TrimSpace(worktreePath)
 	branch = strings.TrimSpace(branch)
@@ -3124,30 +3171,83 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		}
 		return err
 	}
-	status, err := exec.Command("git", "-C", worktreePath, "status", "--porcelain").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git status: %w\n%s", err, status)
+
+	for attempt := 1; attempt <= amendMaxAttempts; attempt++ {
+		// Never amend over a dirty tree: a worker may still be writing, and a
+		// force-push here could clobber uncommitted work the lease cannot
+		// protect (it only guards committed history). Defer instead.
+		status, err := exec.Command("git", "-C", worktreePath, "status", "--porcelain").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git status: %w\n%s", err, status)
+		}
+		if strings.TrimSpace(string(status)) != "" {
+			return errAmendDeferred
+		}
+
+		// Record the commit we are about to attribute so a later refetch can
+		// prove the remote only moved forward from it (never discarding work).
+		origHead, err := exec.Command("git", "-C", worktreePath, "rev-parse", "HEAD").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git rev-parse HEAD: %w\n%s", err, origHead)
+		}
+
+		out, err := exec.Command("git", "-C", worktreePath, "log", "-1", "--pretty=%B").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git log -1: %w\n%s", err, out)
+		}
+		msg := state.AppendAttributionTrailer(string(out), attribution, now)
+		if msg == string(out) {
+			// Trailer already present on this head (idempotent — e.g. a prior
+			// cycle landed it), so there is nothing to do and never a duplicate.
+			return nil
+		}
+
+		cmd := exec.Command("git", "-C", worktreePath, "commit", "--amend", "-F", "-")
+		cmd.Stdin = strings.NewReader(msg)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git commit --amend: %w\n%s", err, out)
+		}
+
+		if amendPushRaceHook != nil {
+			amendPushRaceHook()
+		}
+
+		pushOut, pushErr := exec.Command("git", "-C", worktreePath, "push", "--force-with-lease", "origin", branch).CombinedOutput()
+		if pushErr == nil {
+			return nil // trailer landed exactly once
+		}
+		if !isStaleInfoLeaseRejection(string(pushOut)) {
+			return fmt.Errorf("git push --force-with-lease origin %s: %w\n%s", branch, pushErr, pushOut)
+		}
+
+		// Stale lease: the remote advanced under a concurrent push. Out of
+		// attempts → defer to a later cycle rather than erroring.
+		if attempt == amendMaxAttempts {
+			return errAmendDeferred
+		}
+
+		// Re-fetch the branch so we can re-apply the trailer onto the head the
+		// worker actually pushed.
+		if out, err := exec.Command("git", "-C", worktreePath, "fetch", "origin", branch).CombinedOutput(); err != nil {
+			return fmt.Errorf("git fetch origin %s: %w\n%s", branch, err, out)
+		}
+		// Only re-target the amend when the new remote head descends from the
+		// commit we were attributing: then our work (and the worker's) is fully
+		// contained and resetting to it discards nothing. If the branch diverged
+		// (e.g. an unpushed local commit), defer rather than risk dropping a
+		// commit that is not ours (lease semantics preserved, #858).
+		if err := exec.Command("git", "-C", worktreePath, "merge-base", "--is-ancestor",
+			strings.TrimSpace(string(origHead)), "origin/"+branch).Run(); err != nil {
+			return errAmendDeferred
+		}
+		if out, err := exec.Command("git", "-C", worktreePath, "reset", "--hard", "origin/"+branch).CombinedOutput(); err != nil {
+			return fmt.Errorf("git reset --hard origin/%s: %w\n%s", branch, err, out)
+		}
+		if amendRetryBackoff > 0 {
+			time.Sleep(amendRetryBackoff)
+		}
 	}
-	if strings.TrimSpace(string(status)) != "" {
-		return fmt.Errorf("worktree has uncommitted changes; refusing attribution amend")
-	}
-	out, err := exec.Command("git", "-C", worktreePath, "log", "-1", "--pretty=%B").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git log -1: %w\n%s", err, out)
-	}
-	msg := state.AppendAttributionTrailer(string(out), attribution, now)
-	if msg == string(out) {
-		return nil
-	}
-	cmd := exec.Command("git", "-C", worktreePath, "commit", "--amend", "-F", "-")
-	cmd.Stdin = strings.NewReader(msg)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git commit --amend: %w\n%s", err, out)
-	}
-	if out, err := exec.Command("git", "-C", worktreePath, "push", "--force-with-lease", "origin", branch).CombinedOutput(); err != nil {
-		return fmt.Errorf("git push --force-with-lease origin %s: %w\n%s", branch, err, out)
-	}
-	return nil
+	return errAmendDeferred
 }
 
 // checkSessions inspects all sessions and updates their status
