@@ -547,6 +547,47 @@ func (s *Store) markTerminal(ctx context.Context, stateDir, id string, target st
 	return a, nil
 }
 
+// MarkStale idempotently reconciles a moot approval to the terminal `stale`
+// status in SQLite, mirroring state.markApprovalStale. It is the SQLite half of
+// the #866 fix: when the orchestrator stales a spawn_repair_worker approval in
+// JSON because its target issue reached a terminal state, the same transition
+// must reach the unified approval store so a later approve/reject claim cannot
+// act on a row the JSON state already retired. Only an active row (pending /
+// approved / awaiting_dispatch) is transitioned; a row already stale — or in any
+// other terminal status — is returned unchanged with a nil error, so repeated
+// reconciles, daemon restarts, and concurrent saves converge without churn or a
+// duplicate audit entry. A missing row returns state.ErrApprovalNotFound for the
+// caller (approvalstore.ReconcileMoot) to tolerate.
+func (s *Store) MarkStale(ctx context.Context, stateDir, id string, now time.Time, reason string) (*state.Approval, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	a, b, err := loadApprovalTx(ctx, tx, stateDir, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, state.ErrApprovalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch a.Status {
+	case state.ApprovalStatusPending, state.ApprovalStatusApproved, state.ApprovalStatusAwaitingDispatch:
+		// Active — fall through and stale it.
+	default:
+		// Already stale / superseded / executed / rejected — idempotent no-op.
+		return a, nil
+	}
+	if err := markStaleTx(ctx, tx, a, b, now, reason); err != nil {
+		return a, err
+	}
+	if err := tx.Commit(); err != nil {
+		return a, err
+	}
+	return a, nil
+}
+
 // --- tx helpers -------------------------------------------------------------
 
 func putApprovalTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBinding) (bool, error) {

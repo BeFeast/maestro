@@ -2223,6 +2223,69 @@ func TestMarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(t *testing.T) {
 	}
 }
 
+// #866: the reason-carrying core stales approved/awaiting_dispatch repair
+// approvals too, records the supplied terminal-outcome reason in the audit
+// trail, returns the staled approvals for per-approval journaling, and is
+// idempotent (a second call finds nothing left to stale).
+func TestStaleSpawnRepairWorkerApprovalsForResolvedIssue(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 47, 0, 0, time.UTC)
+	s := NewState()
+	s.Approvals = []Approval{
+		{ID: "ap-repair-858", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 858, PR: 864}, Status: ApprovalStatusPending, CreatedAt: now},
+		{ID: "ap-repair-858b", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 858, PR: 864}, Status: ApprovalStatusAwaitingDispatch, CreatedAt: now},
+		{ID: "ap-repair-900", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 900}, Status: ApprovalStatusPending, CreatedAt: now},
+	}
+
+	reason := "issue #858 resolved (verified merge) — repair worker moot"
+	staled := s.StaleSpawnRepairWorkerApprovalsForResolvedIssue(858, now.Add(time.Minute), reason)
+	if len(staled) != 2 {
+		t.Fatalf("staled = %d approvals, want 2 (pending + awaiting_dispatch for issue 858)", len(staled))
+	}
+	for _, ap := range staled {
+		if ap.Status != ApprovalStatusStale {
+			t.Fatalf("returned approval %s status = %q, want stale", ap.ID, ap.Status)
+		}
+		last := ap.Audit[len(ap.Audit)-1]
+		if last.Event != ApprovalAuditStale || last.Reason != reason {
+			t.Fatalf("approval %s last audit = {%q,%q}, want {stale,%q}", ap.ID, last.Event, last.Reason, reason)
+		}
+	}
+	if got, _ := s.FindApproval("ap-repair-900"); got.Status != ApprovalStatusPending {
+		t.Fatalf("unrelated issue approval = %q, want pending (untouched)", got.Status)
+	}
+
+	// Idempotent: nothing left active for issue 858.
+	if again := s.StaleSpawnRepairWorkerApprovalsForResolvedIssue(858, now.Add(2*time.Minute), reason); len(again) != 0 {
+		t.Fatalf("second reconcile staled %d approvals, want 0 (idempotent)", len(again))
+	}
+}
+
+// #866: ActiveSpawnRepairWorkerApprovalIssues enumerates only issues that still
+// carry an active repair approval, distinct and sorted, ignoring terminal
+// approvals and non-repair actions.
+func TestActiveSpawnRepairWorkerApprovalIssues(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 47, 0, 0, time.UTC)
+	s := NewState()
+	s.Approvals = []Approval{
+		{ID: "a1", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 858}, Status: ApprovalStatusPending, CreatedAt: now},
+		{ID: "a2", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 858}, Status: ApprovalStatusAwaitingDispatch, CreatedAt: now},
+		{ID: "a3", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 700}, Status: ApprovalStatusApproved, CreatedAt: now},
+		{ID: "a4", Action: approvalActionSpawnRepairWorker, Target: &SupervisorTarget{Issue: 999}, Status: ApprovalStatusStale, CreatedAt: now},
+		{ID: "a5", Action: approvalActionSpawnWorker, Target: &SupervisorTarget{Issue: 500}, Status: ApprovalStatusPending, CreatedAt: now},
+	}
+
+	got := s.ActiveSpawnRepairWorkerApprovalIssues()
+	want := []int{700, 858}
+	if len(got) != len(want) {
+		t.Fatalf("active issues = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("active issues = %v, want %v", got, want)
+		}
+	}
+}
+
 // #515: ReconcileSpawnWorkerApprovalsForStartedSession must supersede
 // awaiting_dispatch records too, not just pending ones — once the
 // worker actually starts, the awaiting record has done its job.
