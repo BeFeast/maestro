@@ -73,6 +73,41 @@ func TestDetectUsageLimit_GenericRateLimitSignalsNotClassified(t *testing.T) {
 	}
 }
 
+// TestDetectUsageLimit_ProxyCoolingDown is the #859 escalation guard. The
+// CLIProxyAPI credential-pool exhaustion signature carries no parseable reset,
+// so the provider-limit path (which needs one) never fires; the usage-limit
+// path is what marks the death RateLimitHit=true (recordBackendFailure) and
+// keeps it off the per-issue retry budget. Only the "cooling down" phrasing
+// classifies here — the generic 429 the same message carries stays excluded
+// (the #663 false-positive class).
+func TestDetectUsageLimit_ProxyCoolingDown(t *testing.T) {
+	const proxyDeath = "API Error: Request rejected (429) · All credentials for model claude-opus-4-8 are cooling down"
+	hit, label := DetectUsageLimit(proxyDeath, nil)
+	if !hit {
+		t.Fatalf("DetectUsageLimit(%q) = false, want hit", proxyDeath)
+	}
+	if label != "proxy_cooling_down" {
+		t.Errorf("label = %q, want proxy_cooling_down", label)
+	}
+	// #859 review: a long, fully-qualified model ID (>40 chars) must still take
+	// the usage-limit path. A fixed ".{0,40}" bound missed these, so the death
+	// fell through to the bare "rejected (429)" (excluded here) and burned the
+	// per-issue retry budget instead of being marked RateLimitHit.
+	const longModelDeath = "API Error: Request rejected (429) · All credentials for model us.anthropic.claude-opus-4-8-20250805-canary-v1:0 are cooling down"
+	if hit, label := DetectUsageLimit(longModelDeath, nil); !hit || label != "proxy_cooling_down" {
+		t.Errorf("DetectUsageLimit(long model cooling down) = %v/%q, want true/proxy_cooling_down", hit, label)
+	}
+	// The bare 429 without the cooling-down phrasing must NOT classify here:
+	// generic 429 stays out of the usage-limit set.
+	if hit, label := DetectUsageLimit("API Error: Request rejected (429)", nil); hit {
+		t.Errorf("DetectUsageLimit(bare rejected 429) incorrectly hit (label=%q) — generic 429 stays excluded", label)
+	}
+	// Unrelated prose containing "cooling down" must not classify.
+	if hit, label := DetectUsageLimit("the compressor needs a cooling down period in HVAC docs", nil); hit {
+		t.Errorf("DetectUsageLimit(HVAC prose) incorrectly hit (label=%q)", label)
+	}
+}
+
 // #805: operators can extend the classifier per backend via
 // model.backends.<name>.usage_limit_patterns; the matched label is the regex
 // source so BackendHealth.Pattern names which entry fired.

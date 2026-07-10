@@ -28,8 +28,16 @@ import (
 //     paired with a parseable "resets <t>" hint this is the high-confidence
 //     provider-limit signal the fallover selector acts on.
 //   - "chatgpt.com/codex/settings/usage" marker (Codex usage-limit URL)
-//   - HTTP 429 paired with a status/code/error context word — bare 429
-//     embedded in unrelated text is NOT matched
+//   - "credentials for model <m> are cooling down" — the CLIProxyAPI
+//     credential-pool exhaustion signature (#859). CLIProxyAPI returns quota
+//     exhaustion as "Request rejected (429) · All credentials for model
+//     claude-opus-4-8 are cooling down"; before #859 neither the 429 nor the
+//     cooling-down phrasing matched, so the death burned the per-issue retry
+//     budget.
+//   - HTTP 429 paired with a status/code/error/rejected context word — bare 429
+//     embedded in unrelated text is NOT matched. The "rejected (429)" shape
+//     (CLIProxyAPI, #859) is covered by the "rejected" marker plus an optional
+//     "(" separator.
 //   - "<NNN> too many requests" (HTTP reason phrase)
 //   - "rate limit exceeded|reached|hit" / "rate_limit_error|exceeded" — the
 //     bare phrase "rate limit" alone is NOT matched (too noisy: appears in
@@ -45,10 +53,23 @@ var rateLimitPatterns = []struct {
 	{"reached_limit", regexp.MustCompile(`(?i)you'?ve reached your\b[^.\n]{0,40}?\blimit\b`)},
 	{"out_of_usage", regexp.MustCompile(`(?i)you'?re out of (?:extra )?usage\b`)},
 	{"codex_usage_limit", regexp.MustCompile(`(?i)(chatgpt\.com/)?codex/settings/usage`)},
+	// CLIProxyAPI credential-pool exhaustion (#859): "All credentials for model
+	// <model> are cooling down". The model identifier is matched as a single
+	// "\S+" token (any length): a fixed ".{0,40}" bound silently missed model
+	// IDs longer than 40 chars (bedrock/vertex-qualified names such as
+	// "us.anthropic.claude-opus-4-8-20250805-canary-v1:0"), which then fell
+	// through to the bare "rejected (429)" and never reached a RateLimitHit
+	// path. "\S+" stays anchored to the token and cannot sprawl across
+	// whitespace into unrelated prose, and the required "credentials for model"
+	// prefix plus "cooling down" suffix keep stray "cooling down" text ("cooling
+	// down period in HVAC docs") from false-positiving.
+	{"proxy_cooling_down", regexp.MustCompile(`(?i)credentials? for model \S+ (?:are|is) cooling down`)},
 	// HTTP 429 with a rate-limit context word. Requires the literal 429 to
-	// appear next to an HTTP / status / code / error / response marker so
-	// "1.0.429" or "processed 14290 records" do not false-positive.
-	{"http_429", regexp.MustCompile(`(?i)\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*429\b`)},
+	// appear next to an HTTP / status / code / error / response / rejected
+	// marker so "1.0.429" or "processed 14290 records" do not false-positive.
+	// The optional "(" separator admits the CLIProxyAPI "Request rejected (429)"
+	// shape (#859); the trailing "\b" still rejects "42900".
+	{"http_429", regexp.MustCompile(`(?i)\b(?:http|https|status|code|err(?:or)?|response|received|rejected)\b[ \t]*[:=(]?[ \t]*429\b`)},
 	{"http_429_reason", regexp.MustCompile(`(?i)\b429\b[ \t:,-]*too[ \t]+many[ \t]+requests`)},
 	{"rate_limit_exceeded", regexp.MustCompile(`(?i)rate[ _.-]?limit[ _.-]?(?:exceeded|reached|hit|error)`)},
 	{"quota_exceeded", regexp.MustCompile(`(?i)quota[ _.-]?exceeded`)},
