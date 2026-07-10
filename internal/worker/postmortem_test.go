@@ -235,6 +235,65 @@ func TestExtractPostmortem_RedactsSingleClippedPEMBodyLine(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsInlinePEMBody covers the finding's inline case: a
+// clipped full-width base64 body appears inside a larger log line — command
+// output prefixed with `$ echo ` or a `cat id_rsa: ` label — so the anchored
+// whole-line classifier in redactClippedPEM never sees it as PEM material and it
+// would otherwise reach the prompt and persisted file with the key body intact
+// (#835 review).
+func TestExtractPostmortem_RedactsInlinePEMBody(t *testing.T) {
+	body := "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q"
+	log := strings.Join([]string{
+		"$ echo " + body,
+		"cat id_rsa: " + body,
+		"build failed",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, body) {
+		t.Errorf("inline PEM body leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected clipped-PEM redaction marker in output:\n%s", out)
+	}
+	// The command / label prefix around the redacted body must survive so the
+	// post-mortem still records what the attempt tried.
+	for _, ctx := range []string{"$ echo", "cat id_rsa:", "build failed"} {
+		if !strings.Contains(out, ctx) {
+			t.Errorf("benign context %q should survive inline redaction:\n%s", ctx, out)
+		}
+	}
+}
+
+// TestRedactInlinePEMBody covers the inline scrubber directly: a full-width body
+// embedded in a command line is masked while the prefix is kept, and a short
+// base64 token (below the strong width) embedded in a line is left intact.
+func TestRedactInlinePEMBody(t *testing.T) {
+	body := "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q"
+	line := "- $ printf %s " + body + " > /tmp/k"
+	got := redactInlinePEMBody(line)
+	if strings.Contains(got, body) {
+		t.Errorf("inline body not redacted:\n%s", got)
+	}
+	if !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected redaction marker:\n%s", got)
+	}
+	for _, ctx := range []string{"- $ printf", "> /tmp/k"} {
+		if !strings.Contains(got, ctx) {
+			t.Errorf("context %q should survive:\n%s", ctx, got)
+		}
+	}
+
+	// A short base64 fragment embedded in a line (below the 44-char strong width)
+	// is not key material and must be left alone.
+	frag := "deadbeefdeadbeef"
+	benign := "commit " + frag + " touched foo.go"
+	if got := redactInlinePEMBody(benign); !strings.Contains(got, frag) {
+		t.Errorf("short embedded fragment should not be redacted:\n%s", got)
+	}
+}
+
 // TestRedactClippedPEM covers the scrubber directly against assembled-body
 // shapes: an orphaned END + body run, a marker-free multi-line body run, and a
 // lone base64 token that must NOT be redacted (it may be a hash, not a key).

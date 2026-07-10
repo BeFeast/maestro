@@ -117,6 +117,16 @@ var pemStrongBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{44,}={0,3}$`)
 // redacted when it sits directly against a strong body line or a PEM marker.
 var pemWeakBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{8,}={0,3}$`)
 
+// pemInlineBodyRe matches a full-width PEM/DER base64 body run (>=44 chars — the
+// same width pemStrongBodyRe treats as key material) wherever it appears, even
+// embedded inside a larger line such as command output (`$ echo MIIEv…`, `cat
+// id_rsa: MIIEv…`). redactClippedPEM only recognizes a body that is the whole
+// line (after any list bullet), so an inline clipped body carrying a command or
+// label prefix would otherwise survive into the prompt and persisted file (#835
+// review). The run is unanchored and bounded by non-base64 characters, so the
+// surrounding prose ("$ echo", "cat id_rsa:") is preserved.
+var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{44,}={0,3}`)
+
 // listBulletPrefixRe captures the leading whitespace and optional list bullet
 // ("- ", "* ", "+ ") of a post-mortem line so classification ignores the bullet
 // and a redacted run can be re-emitted with the same one.
@@ -131,10 +141,24 @@ func redactPostmortemSecrets(text string) string {
 		text = r.re.ReplaceAllString(text, r.repl)
 	}
 	text = redactClippedPEM(text)
+	text = redactInlinePEMBody(text)
 	for _, r := range postmortemRedactions {
 		text = r.re.ReplaceAllString(text, r.repl)
 	}
 	return text
+}
+
+// redactInlinePEMBody masks a full-width base64 body run embedded inside a
+// larger line — the inline complement to redactClippedPEM's whole-line scrubber.
+// It runs after redactClippedPEM (whole-line body runs are already collapsed to a
+// marker there, so this only catches genuinely embedded runs like `$ echo <body>`
+// or `cat id_rsa: <body>`) and masks just the base64 run, keeping the command or
+// label prefix so the post-mortem still records what the attempt tried (#835
+// review). A 44+ base64 run in benign output (a long hex hash, a signed-URL token)
+// is redacted too; that mirrors pemStrongBodyRe's existing whole-line behavior and
+// is the conservative choice for a secrets-hygiene pass.
+func redactInlinePEMBody(text string) string {
+	return pemInlineBodyRe.ReplaceAllString(text, pemRedactionMarker)
 }
 
 // redactClippedPEM masks PEM private-key material whose -----BEGIN----- banner
