@@ -2,6 +2,32 @@
 
 Source of truth for spec **drafts** is the Obsidian vault at `Dev/Areas/maestro/specs/`. This document describes the GitHub-side execution contract that workers and reviewers rely on.
 
+## Which template for what
+
+`.github/ISSUE_TEMPLATE/` is a small registry of typed templates. Blank issues are
+disabled (`config.yml`), so every report lands pre-structured — this is what lets
+future automated grooming produce consistent output, and it keeps bugs/ops/docs from
+arriving free-form and ranking poorly for supervisor pickup or the digest "Promotable"
+list. Pick by the shape of the work:
+
+| Template | File | Use it for | Auto label |
+|----------|------|------------|------------|
+| **Spec** | `spec.yml` | A feature a worker implements hands-off. The default. | `enhancement` |
+| **Bug** | `bug.yml` | A defect: observed vs expected, repro/evidence, affected surface, verification. | `bug` |
+| **Runbook / Docs change** | `runbook-docs.yml` | A docs/runbook fix: which doc, what's wrong/missing, done-criteria. | `documentation` |
+| **Infra / Ops change** | `infra-ops.yml` | An ops/config change: target unit/row/host, rollback plan, verification commands. | *(none)* |
+| **Handoff Epic** | `epic.yml` | A multi-slice epic the supervisor planner dispatches slice-by-slice (see [`handoff-epic-format.md`](./handoff-epic-format.md)). | `epic` |
+
+Label notes that matter for the [pickup contract](#pickup-contract-do-not-break-by-accident):
+
+- None of these templates apply `maestro-ready` — a reviewer applies that once the
+  issue is complete (or moves it into the Project, and the supervisor labels it).
+- `bug.yml` / `runbook-docs.yml` / `infra-ops.yml` apply no pickup-excluded label, so
+  they enter the runnable queue normally once marked ready.
+- `epic.yml` applies `epic` on purpose — that label is pickup-excluded, so a worker
+  never picks up the epic itself; the handoff planner reads it and schedules the child
+  slices.
+
 ## Loop
 
 1. **Draft in Obsidian** — create a note in `Dev/Areas/maestro/specs/<kebab-case>.md` with frontmatter

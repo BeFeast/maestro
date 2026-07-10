@@ -1,0 +1,90 @@
+name: Handoff Epic
+description: Multi-slice handoff epic the supervisor planner dispatches from, one slice at a time
+title: "Epic: <product-area> — <short description>"
+labels:
+  - epic
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use a handoff epic when a single PR cannot deliver the whole change and the work splits into
+        1-day-or-less slices you want the overnight supervisor to keep dispatching. See
+        [docs/handoff-epic-format.md](../../docs/handoff-epic-format.md) for the full contract.
+
+        This form applies the `epic` label and an `Epic:` title prefix — either identifies the issue
+        to `supervisor.handoff_planner`. The `epic` label is **pickup-excluded** on purpose: workers
+        never pick up the epic itself; the planner reads it and opens/schedules the child slices.
+        The section headings below are what the planner parses — keep them intact.
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: One paragraph — the runtime goal, the target user, and what "done" looks like for the whole epic (not for a single PR).
+      placeholder: |
+        Replace the legacy inspector-style fleet UI with the redesigned status-board shell across
+        every route, so operators read live truth at a glance. Done = every route migrated and the
+        live visual gate passes on staging.
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue_wave
+    attributes:
+      label: Issue Wave
+      description: |
+        Ordered list of concrete, runnable slices — one child issue each. The planner reads the first
+        unchecked line as the next slice to schedule, so keep them small and in dependency order.
+      value: |
+        - [ ] Slice 1: route shell + layout primitives
+        - [ ] Slice 2: replace `/inbox` route with the redesigned shell
+        - [ ] Slice 3: replace `/settings` route with the redesigned shell
+        - [ ] Slice 4: live visual gate + production preflight wiring
+    validations:
+      required: true
+
+  - type: textarea
+    id: route_map
+    attributes:
+      label: Route Replacement Map
+      description: Optional (useful for UI epics). Map old route → new route and which slice owns the migration.
+      value: |
+        | Old route  | New route      | Owning slice |
+        |------------|----------------|--------------|
+        | /inbox     | /v2/inbox      | Slice 2      |
+        | /settings  | /v2/settings   | Slice 3      |
+
+  - type: textarea
+    id: done_for_epic
+    attributes:
+      label: Done For The Epic
+      description: The conditions under which the whole epic — not a single slice — is Done. Runtime health is the ground truth, not the checklist.
+      value: |
+        The whole epic is Done only when:
+        1. every slice in `Issue Wave` is checked off;
+        2. the live visual verification on staging passes;
+        3. the runtime health gate is `healthy` for at least one full deploy cycle;
+        4. the operator confirms the sign-off comment on this epic.
+    validations:
+      required: true
+
+  - type: textarea
+    id: source_materials
+    attributes:
+      label: Source Materials
+      description: Assets a slice worker needs — design zip checksum/location, design-system spec or Figma link, the runtime URL to verify against.
+      placeholder: |
+        - design zip: `/mnt/storage/src/<project>.redesign.zip` (sha256: ...)
+        - design ref: `<design-system route or asset id>`
+        - runtime URL: `<staging URL the worker must verify against>`
+
+  - type: textarea
+    id: children
+    attributes:
+      label: Children
+      description: |
+        Optional. When you open the child issues up front, list their numbers here so the
+        epic-completion aggregate can track merged/open counts. Both `- [ ] #147` and `#147` are read.
+      placeholder: |
+        - [ ] #147 — Slice 1: route shell
+        - [ ] #148 — Slice 2: replace /inbox

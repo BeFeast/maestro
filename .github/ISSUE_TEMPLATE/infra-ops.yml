@@ -1,0 +1,81 @@
+name: Infra / Ops change
+description: Request an ops or config change with an explicit target, rollback, and verification
+title: "ops: <short description>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for changes to running infrastructure and configuration — a systemd unit, a
+        config-store row, a host-level setting, a workflow file. Every ops change needs a rollback
+        and a verification command before anyone touches production.
+
+        This template deliberately applies **no** label: it must not carry `maestro-ready` (a
+        reviewer applies that) or any pickup-excluded label. Ops work is operator-driven; a worker
+        only proposes the diff.
+
+  - type: textarea
+    id: target
+    attributes:
+      label: Target
+      description: Exactly what changes — unit name, config-store key + scope, host, file path, or workflow.
+      placeholder: |
+        - Unit: maestro.service on workshop
+        - Config row: supervisor.spec_groom.enabled (scope: befeast-maestro)
+        - File: .github/workflows/ci.yml
+    validations:
+      required: true
+
+  - type: textarea
+    id: change
+    attributes:
+      label: Change
+      description: The new desired state and why. Include the exact command or diff if you know it.
+      placeholder: |
+        Set `supervisor.spec_groom.enabled=true` for the befeast-maestro project so spec-lint runs
+        on new issues. Command: `maestro settings set supervisor.spec_groom.enabled=true --project befeast-maestro`
+    validations:
+      required: true
+
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback plan
+      description: The exact steps to revert to the prior state if the change misbehaves.
+      placeholder: |
+        `maestro settings set supervisor.spec_groom.enabled=false --project befeast-maestro`
+        (config-store change only — no restart required).
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification commands
+      description: Commands the operator runs after applying the change to confirm it took effect and nothing regressed.
+      placeholder: |
+        - `maestro settings get supervisor.spec_groom.enabled --project befeast-maestro` → `true`
+        - `curl -fsS http://127.0.0.1:8786/api/v1/fleet | jq .verdict.sentence` still returns
+        - `journalctl -u maestro.service -n 50` shows no new errors after one cycle
+    validations:
+      required: true
+
+  - type: textarea
+    id: blast_radius
+    attributes:
+      label: Blast radius / risk
+      description: Optional. What else this could affect, and how urgent.
+      placeholder: |
+        Fleet-wide default vs per-project scope; enabling adds one LLM pass per open issue per cycle.
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority hint
+      description: Reporter's desired priority; a reviewer applies the actual P-label.
+      options:
+        - P0 — critical, drop other work
+        - P1 — high, schedule next
+        - P2 — medium, queue normally
+        - P3 — low, opportunistic
+    validations:
+      required: true
