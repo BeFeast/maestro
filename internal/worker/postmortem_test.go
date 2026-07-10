@@ -300,6 +300,48 @@ func TestExtractPostmortem_RedactsUnpaddedInlinePEMTail(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsShortAndAllCapsInlinePEMTail closes the residual of
+// the same finding (#835 review — "Unpadded Inline PEM Tail Escapes"). Two inline
+// fragments still slipped through: a short UNPADDED run below the old >=16 candidate
+// floor (`$ echo XyZ12aBc`, never matched by the regex at all) and a 16–43 char
+// ALL-UPPERCASE run (`$ echo ABCDEFGHIJKLMNOPQRSTUVWXYZAB`, matched but left weak by
+// the classifier's digit requirement). Both reach both sinks as raw key tails. The
+// >=8 inline floor now hands the short run to the classifier (whose upper+digit mix
+// redacts it) and the all-uppercase branch redacts the long bare-caps blob, while a
+// digit-free camelCase identifier and a lowercase hash in the same window survive.
+func TestExtractPostmortem_RedactsShortAndAllCapsInlinePEMTail(t *testing.T) {
+	shortTail := "XyZ12aBc"                   // 8 chars, unpadded, upper+lower+digit
+	allCaps := "ABCDEFGHIJKLMNOPQRSTUVWXYZAB" // 28 chars, all uppercase, no digit
+	ident := "handleUserRequest"              // camelCase identifier: case, no digit
+	hash := "deadbeefdeadbeef"                // lowercase hex: a plausible digest
+	log := strings.Join([]string{
+		"running deploy",
+		"$ echo " + shortTail,
+		"$ echo " + allCaps,
+		"$ grep " + ident,
+		"$ git show " + hash,
+		"exit status 1",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	for _, leak := range []string{shortTail, allCaps} {
+		if strings.Contains(out, leak) {
+			t.Errorf("inline PEM tail %q leaked into post-mortem:\n%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected PEM redaction marker in output:\n%s", out)
+	}
+	// Ordinary post-mortem content must survive: a digit-free identifier and a
+	// lowercase hash are not over-redacted, and the command prose is kept.
+	for _, keep := range []string{ident, hash, "$ echo", "exit status 1"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("benign content %q should survive inline redaction:\n%s", keep, out)
+		}
+	}
+}
+
 // TestExtractPostmortem_RedactsSingleClippedPEMBodyLine covers the finding's
 // sharpest case: the tail starts inside a PEM dump and only ONE full-width base64
 // body line survives into the last-actions window, with both -----BEGIN----- and
@@ -494,12 +536,42 @@ func TestRedactInlinePEMBody(t *testing.T) {
 		t.Errorf("expected command prose kept and marker present:\n%s", got)
 	}
 
-	// A digit-free file path embedded in a command line reaches the same >=16-char
-	// candidate matcher but carries no digit, so it must survive intact — the
+	// A digit-free file path embedded in a command line reaches the same >=8-char
+	// candidate matcher but carries no uppercase, so it must survive intact — the
 	// unpadded-tail rule must not garble the paths a post-mortem records.
 	path := "internal/worker/postmortem"
 	if got := redactInlinePEMBody("$ vim " + path + ".go"); !strings.Contains(got, path) {
 		t.Errorf("digit-free path should survive inline redaction:\n%s", got)
+	}
+
+	// A short (<16-char) UNPADDED run carrying the encoded-byte mix (uppercase +
+	// digit) is a clipped key tail the old >=16 floor never matched at all, leaking
+	// it into both sinks (#835 review — unpadded inline PEM tail escapes). The >=8
+	// floor now hands it to the classifier, which redacts it.
+	shortUnpadded := "XyZ12aBc" // 8 chars, upper+lower+digit
+	if got := redactInlinePEMBody("$ echo " + shortUnpadded); strings.Contains(got, shortUnpadded) {
+		t.Errorf("short unpadded inline tail not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// A 16–43 char ALL-UPPERCASE run (no lowercase, no digit) was matched but left
+	// weak by the classifier's digit requirement, so a bare-caps clipped key body
+	// reached both sinks (#835 review — unpadded inline PEM tail escapes, all-caps
+	// case). The all-uppercase branch now redacts it.
+	allCaps := "ABCDEFGHIJKLMNOPQRSTUVWXYZAB" // 28 chars, all uppercase
+	if got := redactInlinePEMBody("$ echo " + allCaps); strings.Contains(got, allCaps) {
+		t.Errorf("all-uppercase inline blob not redacted:\n%s", got)
+	} else if !strings.Contains(got, "$ echo") || !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("expected command prose kept and marker present:\n%s", got)
+	}
+
+	// A mixed-case, digit-free identifier stays intact: it has lowercase (so the
+	// all-caps branch skips it) and no digit (so the upper+digit branch skips it) —
+	// the unpadded-tail rules must not garble the identifiers a post-mortem records.
+	ident := "handleUserRequest"
+	if got := redactInlinePEMBody("$ grep " + ident); !strings.Contains(got, ident) {
+		t.Errorf("mixed-case identifier should survive inline redaction:\n%s", got)
 	}
 }
 

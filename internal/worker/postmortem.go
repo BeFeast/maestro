@@ -138,27 +138,23 @@ var pemHexHashRe = regexp.MustCompile(`^[0-9a-f]+$`)
 // line, such as command output (`$ echo MIIEv…`, `cat id_rsa: MIIEv…`).
 // redactClippedPEM only recognizes a body that is the whole line (after any list
 // bullet), so an inline clipped body carrying a command or label prefix would
-// otherwise survive into the prompt and persisted file (#835 review). Two
-// alternatives feed the classifier (inlineRunIsKeyMaterial):
+// otherwise survive into the prompt and persisted file (#835 review).
 //
-//   - a >=16-char run with optional '=' padding — deliberately broad so a short
-//     UNPADDED tail still reaches the classifier instead of being skipped by the
-//     regex itself; the earlier padded-only bar let `$ echo Kj34GkxFhD90vcNLYLInFE`
-//     (no '=') slip through into both sinks (#835 review — unpadded inline PEM
-//     tail leak).
-//   - a >=8-char run that CARRIES '=' padding — a short clipped final body line
-//     such as `$ echo AbCdEfGhIjK=`. The 16-char floor above skipped an 8–15-char
-//     padded fragment before the classifier could see it, leaking the raw key tail
-//     into both sinks (#835 review — short inline PEM tail leak). '=' padding never
-//     appears in a git SHA / hex digest, so lowering the floor only for padded runs
-//     closes the leak without garbling the shorter identifiers and paths a
-//     post-mortem legitimately records.
+// It matches any base64 run of >=8 characters with optional '=' padding and
+// hands the accept/reject decision to inlineRunIsKeyMaterial. The floor is a
+// deliberately broad >=8 whether or not the run carries '=' padding: an earlier
+// >=16-only bar for UNPADDED runs skipped short fragments such as
+// `$ echo XyZ12aBc` before the classifier could see them, leaking the raw key
+// tail into both sinks (#835 review — unpadded inline PEM tail leak). 8 is the
+// shortest run the classifier can still tell apart from the identifiers and
+// paths a post-mortem records, so a lower floor would only feed it fragments it
+// must preserve anyway.
 //
 // The run is unanchored and bounded by non-base64 characters, so the surrounding
 // prose ("$ echo", "cat id_rsa:") is preserved. Greedy matching grabs the whole
 // run plus any trailing '=' padding, so a full-width padded body is masked whole
 // rather than split.
-var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{16,}={0,3}|[A-Za-z0-9+/]{8,}={1,3}`)
+var pemInlineBodyRe = regexp.MustCompile(`[A-Za-z0-9+/]{8,}={0,3}`)
 
 // listBulletPrefixRe captures the leading whitespace and optional list bullet
 // ("- ", "* ", "+ ") of a post-mortem line so classification ignores the bullet
@@ -197,8 +193,8 @@ func redactInlinePEMBody(text string) string {
 	})
 }
 
-// inlineRunIsKeyMaterial reports whether an embedded >=16-char base64 run
-// (pemInlineBodyRe) is (clipped) PEM/DER key material worth redacting. It mirrors
+// inlineRunIsKeyMaterial reports whether an embedded base64 run (>=8 chars,
+// pemInlineBodyRe) is (clipped) PEM/DER key material worth redacting. It mirrors
 // the whole-line classification in redactClippedPEM but is tuned to spare the
 // identifiers and file paths that legitimately fill a post-mortem:
 //
@@ -206,21 +202,25 @@ func redactInlinePEMBody(text string) string {
 //     material outright — the same shapes the padded whole-line tail and
 //     pemStrongBodyRe already redact ('=' padding never appears in a git SHA /
 //     hex digest, and 44 is above a bare 40-char SHA);
-//   - a shorter UNPADDED run is key material only when it is NOT a plausible hex
-//     hash (pemHexHashRe) AND carries BOTH an uppercase letter and a digit — the
-//     encoded-byte mix a clipped final PEM body line such as
-//     `$ echo Kj34GkxFhD90vcNLYLInFE` has and the two kinds of benign run that
-//     reach this matcher do not: a lowercase file path keeps its digits but has no
-//     uppercase (`internal/attempt2`, `stream/01`), and a camelCase identifier
-//     keeps its case but has no digit (`handleUserRequest`). Requiring both masks
-//     the finding's unpadded inline tail (#835 review — unpadded inline PEM tail
-//     leak) without gutting the post-mortem, and a lowercase-hex fragment (a git
-//     SHA / digest) stays intact, matching redactClippedPEM's carve-out.
+//   - a lowercase-hex fragment (pemHexHashRe) is a plausible git SHA / digest and
+//     stays intact, matching redactClippedPEM's carve-out;
+//   - a shorter UNPADDED run is key material when it carries BOTH an uppercase
+//     letter and a digit — the encoded-byte mix a clipped final PEM body line such
+//     as `$ echo XyZ12aBc` has and the benign runs reaching this matcher do not: a
+//     lowercase file path keeps its digits but has no uppercase
+//     (`internal/attempt2`, `stream/01`), and a camelCase identifier keeps its case
+//     but has no digit (`handleUserRequest`);
+//   - an ALL-UPPERCASE run of >=16 chars (no lowercase, no digit) is likewise key
+//     material: camelCase/PascalCase identifiers carry lowercase and all-caps
+//     constants use '_' separators that break the run below this width, so a long
+//     bare uppercase base64 blob such as `$ echo ABCDEFGHIJKLMNOPQRSTUVWXYZAB` is a
+//     clipped key body, not ordinary post-mortem prose (#835 review — unpadded
+//     inline PEM tail leak, all-caps case).
 //
-// A bare fragment carrying only one of the two signals is inherently
-// indistinguishable from a path or identifier — redacting it would garble those —
-// so the residual is left to the padded / full-width / whole-line-clipped and
-// complete-block branches, which cover the shapes real key dumps actually take.
+// A shorter run carrying only one of these signals is inherently indistinguishable
+// from a path or identifier — redacting it would garble those — so the residual is
+// left to the padded / full-width / whole-line-clipped and complete-block branches,
+// which cover the shapes real key dumps actually take.
 func inlineRunIsKeyMaterial(run string) bool {
 	body := strings.TrimRight(run, "=")
 	if len(body) < len(run) { // carried '=' padding — an encoded blob, not a hash
@@ -232,8 +232,14 @@ func inlineRunIsKeyMaterial(run string) bool {
 	if pemHexHashRe.MatchString(body) { // a lone lowercase git SHA / digest
 		return false
 	}
-	return strings.ContainsAny(body, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") &&
-		strings.ContainsAny(body, "0123456789")
+	hasUpper := strings.ContainsAny(body, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	hasLower := strings.ContainsAny(body, "abcdefghijklmnopqrstuvwxyz")
+	hasDigit := strings.ContainsAny(body, "0123456789")
+	if hasUpper && hasDigit { // encoded-byte mix of a clipped key body tail
+		return true
+	}
+	// A long, all-uppercase base64 blob is not an ordinary identifier or path.
+	return hasUpper && !hasLower && len(body) >= 16
 }
 
 // redactClippedPEM masks PEM private-key material whose -----BEGIN----- banner
