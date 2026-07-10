@@ -89,6 +89,14 @@ func TestDetectUsageLimit_ProxyCoolingDown(t *testing.T) {
 	if label != "proxy_cooling_down" {
 		t.Errorf("label = %q, want proxy_cooling_down", label)
 	}
+	// #859 review: a long, fully-qualified model ID (>40 chars) must still take
+	// the usage-limit path. A fixed ".{0,40}" bound missed these, so the death
+	// fell through to the bare "rejected (429)" (excluded here) and burned the
+	// per-issue retry budget instead of being marked RateLimitHit.
+	const longModelDeath = "API Error: Request rejected (429) · All credentials for model us.anthropic.claude-opus-4-8-20250805-canary-v1:0 are cooling down"
+	if hit, label := DetectUsageLimit(longModelDeath, nil); !hit || label != "proxy_cooling_down" {
+		t.Errorf("DetectUsageLimit(long model cooling down) = %v/%q, want true/proxy_cooling_down", hit, label)
+	}
 	// The bare 429 without the cooling-down phrasing must NOT classify here:
 	// generic 429 stays out of the usage-limit set.
 	if hit, label := DetectUsageLimit("API Error: Request rejected (429)", nil); hit {

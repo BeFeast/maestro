@@ -49,7 +49,11 @@ var usageLimitPatterns = []struct {
 	{"out_of_usage", regexp.MustCompile(`(?i)you'?re out of (?:extra )?usage\b`)},
 	{"codex_usage_limit", regexp.MustCompile(`(?i)(chatgpt\.com/)?codex/settings/usage`)},
 	{"usage_limit_reached", regexp.MustCompile(`(?i)\b(?:usage|5-hour|weekly)[ _-]limit reached\b`)},
-	{"proxy_cooling_down", regexp.MustCompile(`(?i)credentials? for model .{0,40}(?:are|is) cooling down`)},
+	// The model identifier is matched as a single "\S+" token (any length) so a
+	// cooling-down death for a long, fully-qualified model ID (>40 chars) still
+	// classifies — a fixed ".{0,40}" bound missed those and let the death burn
+	// the retry budget (#859 review). Kept in sync with rateLimitPatterns.
+	{"proxy_cooling_down", regexp.MustCompile(`(?i)credentials? for model \S+ (?:are|is) cooling down`)},
 }
 
 // DetectUsageLimit scans multi-line output for known account-quota exhaustion

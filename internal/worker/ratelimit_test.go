@@ -132,6 +132,15 @@ func TestDetectRateLimit(t *testing.T) {
 			wantLabel: "proxy_cooling_down",
 		},
 		{
+			// #859 review: a long, fully-qualified model ID (>40 chars) must
+			// still classify. A fixed ".{0,40}" bound missed these, dropping the
+			// death to the bare "rejected (429)" and burning the retry budget.
+			name:      "cooling down with long model id (#859 review)",
+			input:     "API Error: Request rejected (429) · All credentials for model us.anthropic.claude-opus-4-8-20250805-canary-v1:0 are cooling down",
+			wantHit:   true,
+			wantLabel: "proxy_cooling_down",
+		},
+		{
 			// #859: "rejected (429)" now matches the widened http_429 even
 			// without the cooling-down phrase.
 			name:      "Request rejected (429) widened http_429 (#859)",
