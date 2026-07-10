@@ -207,6 +207,34 @@ func TestExtractPostmortem_RedactsTailClippedPEM(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsSingleClippedPEMBodyLine covers the finding's
+// sharpest case: the tail starts inside a PEM dump and only ONE full-width base64
+// body line survives into the last-actions window, with both -----BEGIN----- and
+// -----END----- banners clipped away. strongCount is 1, so the old >=2 threshold
+// left the line unredacted and it leaked into the prompt and persisted file (#835
+// review comment 1).
+func TestExtractPostmortem_RedactsSingleClippedPEMBodyLine(t *testing.T) {
+	body := "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q"
+	log := strings.Join([]string{
+		"$ cat ~/.ssh/id_rsa",
+		body, // lone survivor: both PEM banners fell outside the scanned tail
+		"$ go build ./...",
+		"build failed",
+	}, "\n")
+
+	out := ExtractPostmortem(writeTempLog(t, log), PostmortemTailLines)
+
+	if strings.Contains(out, body) {
+		t.Errorf("single clipped PEM body line leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected clipped-PEM redaction marker in output:\n%s", out)
+	}
+	if !strings.Contains(out, "build failed") {
+		t.Errorf("benign trailing line should be preserved:\n%s", out)
+	}
+}
+
 // TestRedactClippedPEM covers the scrubber directly against assembled-body
 // shapes: an orphaned END + body run, a marker-free multi-line body run, and a
 // lone base64 token that must NOT be redacted (it may be a hash, not a key).
@@ -234,12 +262,38 @@ func TestRedactClippedPEM(t *testing.T) {
 		t.Errorf("marker-free body run leaked:\n%s", got)
 	}
 
-	// A lone base64-looking token (e.g. a 40-char git SHA, or a single blob) with
-	// no PEM context must be left intact.
+	// A SINGLE full-width body line with both banners clipped and surrounded by
+	// non-base64 lines: the tail started inside a PEM dump and only one body line
+	// survived. One full-width line must be enough to redact (#835 review comment
+	// 1 — the old >=2 threshold leaked this line).
+	single := "- $ cat id_rsa\n- " + body1 + "\n- $ go build ./...\n- build failed"
+	got = redactClippedPEM(single)
+	if strings.Contains(got, body1) {
+		t.Errorf("single full-width body line leaked:\n%s", got)
+	}
+	if !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("single full-width body line not redacted:\n%s", got)
+	}
+	for _, benign := range []string{"$ cat id_rsa", "$ go build ./...", "build failed"} {
+		if !strings.Contains(got, benign) {
+			t.Errorf("benign line %q should survive:\n%s", benign, got)
+		}
+	}
+
+	// A lone base64-looking token (e.g. a 40-char git SHA, or a single short blob)
+	// with no PEM context must be left intact: too short to trust as key material.
 	sha := "0123456789abcdef0123456789abcdef01234567"
 	loneBlob := "- edited internal/foo.go\n- " + sha + "\n- build failed"
 	if got := redactClippedPEM(loneBlob); !strings.Contains(got, sha) {
 		t.Errorf("lone base64 token should not be redacted:\n%s", got)
+	}
+
+	// Two adjacent short fragments with no full-width line and no marker must also
+	// survive: without a key-material anchor they never enter a redaction run.
+	frag1, frag2 := "0123456789abcdef", "fedcba9876543210"
+	weakPair := "- " + frag1 + "\n- " + frag2
+	if got := redactClippedPEM(weakPair); !strings.Contains(got, frag1) || !strings.Contains(got, frag2) {
+		t.Errorf("marker-free short-fragment pair should not be redacted:\n%s", got)
 	}
 }
 

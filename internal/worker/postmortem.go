@@ -147,8 +147,11 @@ func redactPostmortemSecrets(text string) string {
 // It is line-oriented over the assembled body: classify each line (after any
 // list bullet) as a PEM marker, a full-width base64 body line, or a short base64
 // fragment, then redact each maximal contiguous run of such lines that either
-// contains a marker or holds >=2 full-width body lines. A lone base64 line with
-// no PEM context is left alone — it may be a hash or blob, not key material.
+// contains a marker or holds at least one full-width body line. A single
+// full-width line is enough because a tail clipped so that both PEM banners fall
+// outside it can leave one genuine key body line alone (#835 review). A run of
+// only short base64 fragments (no full-width line, no marker) is left alone — a
+// lone short token may be a hash or blob, not key material.
 func redactClippedPEM(text string) string {
 	lines := strings.Split(text, "\n")
 	n := len(lines)
@@ -191,8 +194,13 @@ func redactClippedPEM(text string) string {
 			}
 		}
 	}
-	// Walk maximal runs; redact those with a marker or >=2 full-width body lines,
-	// collapsing each to a single marker that keeps the run's first bullet.
+	// Walk maximal runs; redact those with a marker or any full-width body line,
+	// collapsing each to a single marker that keeps the run's first bullet. One
+	// full-width line is enough: when a PEM dump is clipped so both banners fall
+	// outside the scanned tail, a genuine key body line can remain alone (#835
+	// review) — requiring >=2 leaked it. The guard is also a defensive floor: it
+	// never collapses a run that carries no key-material evidence, so a run of
+	// only short base64 fragments (a lone hash or blob) is left intact.
 	var out []string
 	for i := 0; i < n; {
 		if !inRun[i] {
@@ -211,7 +219,7 @@ func redactClippedPEM(text string) string {
 			}
 			j++
 		}
-		if hasMarker || strongCount >= 2 {
+		if hasMarker || strongCount >= 1 {
 			prefix := listBulletPrefixRe.FindString(lines[i])
 			out = append(out, prefix+pemRedactionMarker)
 		} else {
