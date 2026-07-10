@@ -14,6 +14,14 @@ import (
 // "(usage )?" group and/or the codex/settings/usage marker.
 const codexUsageLimitSignature = "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to see your usage. You can try again at May 30th, 2026 8:13 PM."
 
+// proxyCoolingDownSignature is the exact CLIProxyAPI quota-exhaustion line that
+// killed sessions sup-275/276/277 (#859, root cause of #835's day-long stall,
+// 2026-07-09). The proxy returns quota exhaustion as a 429 whose "rejected
+// (429)" shape sat outside the old http_429 marker list, alongside an "All
+// credentials ... are cooling down" phrase no pattern matched — so the deaths
+// were recorded rate_limit_hit=false and burned the per-issue retry budget.
+const proxyCoolingDownSignature = "API Error: Request rejected (429) · All credentials for model claude-opus-4-8 are cooling down"
+
 func TestDetectRateLimit(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -107,6 +115,36 @@ func TestDetectRateLimit(t *testing.T) {
 			input:     "rpc error: code = ResourceExhausted desc = request limit",
 			wantHit:   true,
 			wantLabel: "resource_exhausted",
+		},
+		{
+			// #859: the exact CLIProxyAPI line. It matches both the
+			// proxy_cooling_down pattern and the widened http_429; the
+			// more-specific proxy_cooling_down is listed first, so it wins.
+			name:      "CLIProxyAPI credentials cooling down (#859)",
+			input:     proxyCoolingDownSignature,
+			wantHit:   true,
+			wantLabel: "proxy_cooling_down",
+		},
+		{
+			name:      "credentials cooling down bare phrasing (#859)",
+			input:     "All credentials for model claude-opus-4-8 are cooling down",
+			wantHit:   true,
+			wantLabel: "proxy_cooling_down",
+		},
+		{
+			// #859: "rejected (429)" now matches the widened http_429 even
+			// without the cooling-down phrase.
+			name:      "Request rejected (429) widened http_429 (#859)",
+			input:     "API Error: Request rejected (429)",
+			wantHit:   true,
+			wantLabel: "http_429",
+		},
+		{
+			// #859 negative: "cooling down" in unrelated prose (no "credentials
+			// for model" prefix) must not classify.
+			name:    "cooling down in unrelated prose no match (#859)",
+			input:   "the compressor needs a cooling down period in HVAC docs",
+			wantHit: false,
 		},
 		{
 			name:      "multiline with rate limit on later line",
@@ -302,6 +340,53 @@ func TestRateLimit_ClaudeStillMatches(t *testing.T) {
 	}
 	if !OutputContainsRateLimit(output) {
 		t.Error("OutputContainsRateLimit should still match the Claude phrasing")
+	}
+}
+
+// TestRateLimit_ProxyCoolingDownSignature is the #859 regression guard. The
+// exact CLIProxyAPI quota-exhaustion line that killed sup-275/276/277 must be
+// classified as a rate-limit across every entry point. Because it carries no
+// "try again at/resets" clause, the reset extractor must tolerate it — yield no
+// reset (ok=false), not a parse error — which leaves ClassifyRateLimit
+// low-confidence. The escalation to RateLimitHit=true then happens on the
+// usage-limit path (usagelimit.go), not the provider-limit path.
+func TestRateLimit_ProxyCoolingDownSignature(t *testing.T) {
+	if hit, label := DetectRateLimit(proxyCoolingDownSignature); !hit {
+		t.Fatal("DetectRateLimit should classify the CLIProxyAPI cooling-down signature")
+	} else if label != "proxy_cooling_down" {
+		t.Errorf("label = %q, want proxy_cooling_down", label)
+	}
+	if !OutputContainsRateLimit(proxyCoolingDownSignature) {
+		t.Error("OutputContainsRateLimit should classify the CLIProxyAPI cooling-down signature")
+	}
+
+	// No "try again at/resets" clause: the extractor must return ok=false
+	// (no reset time) rather than erroring or panicking (#859 requirement 2).
+	if reset, ok := ParseRateLimitReset(proxyCoolingDownSignature); ok {
+		t.Errorf("ParseRateLimitReset = %v, want no reset — the proxy signature states no reset window", reset)
+	}
+
+	// Classification is therefore low-confidence (no parseable reset).
+	hit, label, confidence, resetAt := ClassifyRateLimit(proxyCoolingDownSignature)
+	if !hit || label != "proxy_cooling_down" {
+		t.Errorf("ClassifyRateLimit hit/label = %v/%q, want true/proxy_cooling_down", hit, label)
+	}
+	if confidence != "low" {
+		t.Errorf("confidence = %q, want low (no reset hint)", confidence)
+	}
+	if !resetAt.IsZero() {
+		t.Errorf("resetAt = %v, want zero on low confidence", resetAt)
+	}
+
+	// The terminal error in a dead worker's log tail must still be recognised.
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "sup-277.log")
+	content := "Starting worker sup-277 on issue #835\nProcessing...\n" + proxyCoolingDownSignature + "\n"
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write log file: %v", err)
+	}
+	if !IsRateLimited(logFile) {
+		t.Error("IsRateLimited should recognise the CLIProxyAPI cooling-down signature from a log file")
 	}
 }
 

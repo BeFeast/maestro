@@ -31,6 +31,14 @@ import (
 //   - "chatgpt.com/codex/settings/usage" marker (Codex usage-limit URL)
 //   - "usage/5-hour/weekly limit reached" (claude CLI subscription-window
 //     phrasings, e.g. "Claude usage limit reached ...")
+//   - "credentials for model <m> are cooling down" — the CLIProxyAPI
+//     credential-pool exhaustion signature (#859). This is a capacity
+//     exhaustion with no provider-stated reset, so the generic 429 the same
+//     message carries ("Request rejected (429)") never reaches a RateLimitHit
+//     path (the provider-limit path needs a parseable reset, and generic 429 is
+//     the #663 false-positive class). The cooling-down phrasing is specific
+//     enough to gate the backend and fall over without a reset, exactly like
+//     the other account-quota signatures here.
 var usageLimitPatterns = []struct {
 	label string
 	re    *regexp.Regexp
@@ -41,6 +49,7 @@ var usageLimitPatterns = []struct {
 	{"out_of_usage", regexp.MustCompile(`(?i)you'?re out of (?:extra )?usage\b`)},
 	{"codex_usage_limit", regexp.MustCompile(`(?i)(chatgpt\.com/)?codex/settings/usage`)},
 	{"usage_limit_reached", regexp.MustCompile(`(?i)\b(?:usage|5-hour|weekly)[ _-]limit reached\b`)},
+	{"proxy_cooling_down", regexp.MustCompile(`(?i)credentials? for model .{0,40}(?:are|is) cooling down`)},
 }
 
 // DetectUsageLimit scans multi-line output for known account-quota exhaustion
