@@ -171,6 +171,78 @@ func TestExtractPostmortem_RedactsBarePEMBlock(t *testing.T) {
 	}
 }
 
+// TestExtractPostmortem_RedactsTailClippedPEM covers the case where the scanned
+// tail starts inside a PEM dump: the -----BEGIN----- banner is beyond the tail
+// window, so the complete-block regex cannot see it, but the base64 body and the
+// -----END----- footer remain in the last-actions section. The clipped-PEM
+// scrubber must still redact the orphaned key material (#835 review comment 1).
+func TestExtractPostmortem_RedactsTailClippedPEM(t *testing.T) {
+	// A private key so large its BEGIN banner falls outside the last-400-line
+	// tail; only later body lines and the END footer survive into the window.
+	body := "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q"
+	dashes := strings.Repeat("-", 5)
+	var lines []string
+	lines = append(lines, "some early setup output")
+	lines = append(lines, dashes+"BEGIN RSA PRIVATE "+"KEY"+dashes) // clipped out of the tail
+	for i := 0; i < PostmortemTailLines+50; i++ {
+		lines = append(lines, body)
+	}
+	lines = append(lines, dashes+"END RSA PRIVATE "+"KEY"+dashes)
+	lines = append(lines, "build failed")
+
+	out := ExtractPostmortem(writeTempLog(t, strings.Join(lines, "\n")), PostmortemTailLines)
+
+	if strings.Contains(out, body) {
+		t.Errorf("tail-clipped PEM body leaked into post-mortem:\n%s", out)
+	}
+	if strings.Contains(out, "END RSA PRIVATE "+"KEY") {
+		t.Errorf("orphaned PEM footer leaked into post-mortem:\n%s", out)
+	}
+	if !strings.Contains(out, "REDACTED_PRIVATE_KEY_BLOCK") {
+		t.Errorf("expected clipped-PEM redaction marker in output:\n%s", out)
+	}
+	// A benign non-key line near the end must survive.
+	if !strings.Contains(out, "build failed") {
+		t.Errorf("benign trailing line should be preserved:\n%s", out)
+	}
+}
+
+// TestRedactClippedPEM covers the scrubber directly against assembled-body
+// shapes: an orphaned END + body run, a marker-free multi-line body run, and a
+// lone base64 token that must NOT be redacted (it may be a hash, not a key).
+func TestRedactClippedPEM(t *testing.T) {
+	body1 := "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB"
+	body2 := "AAAAMwAAAAtzc2gtZWQyNTUxOQAAACDddeadbeefdeadbeefdeadbe"
+	dashes := strings.Repeat("-", 5)
+	end := dashes + "END OPENSSH PRIVATE " + "KEY" + dashes
+
+	// Orphaned END + body (BEGIN clipped): redact the whole run.
+	orphanEnd := "### Last actions before the attempt ended\n- " + body1 + "\n- " + body2 + "\n- " + end
+	got := redactClippedPEM(orphanEnd)
+	for _, secret := range []string{body1, body2, "END OPENSSH PRIVATE " + "KEY"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("orphaned-END run leaked %q:\n%s", secret, got)
+		}
+	}
+	if !strings.Contains(got, pemRedactionMarker) {
+		t.Errorf("orphaned-END run not redacted:\n%s", got)
+	}
+
+	// Marker-free body run (both banners clipped): >=2 full-width lines ⇒ redact.
+	bodyOnly := "- " + body1 + "\n- " + body2
+	if got := redactClippedPEM(bodyOnly); strings.Contains(got, body1) || strings.Contains(got, body2) {
+		t.Errorf("marker-free body run leaked:\n%s", got)
+	}
+
+	// A lone base64-looking token (e.g. a 40-char git SHA, or a single blob) with
+	// no PEM context must be left intact.
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	loneBlob := "- edited internal/foo.go\n- " + sha + "\n- build failed"
+	if got := redactClippedPEM(loneBlob); !strings.Contains(got, sha) {
+		t.Errorf("lone base64 token should not be redacted:\n%s", got)
+	}
+}
+
 func TestCapPostmortem_Enforced(t *testing.T) {
 	// A body far larger than the cap.
 	var sb strings.Builder

@@ -72,6 +72,10 @@ var postmortemRedactions = []struct {
 	{regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{20,}\b`), "[REDACTED_SLACK_TOKEN]"},
 }
 
+// pemRedactionMarker replaces a redacted PEM private-key block, whether the
+// complete-block regex or the tail-clipped scrubber (redactClippedPEM) caught it.
+const pemRedactionMarker = "[REDACTED_PRIVATE_KEY_BLOCK]"
+
 // postmortemMultilineRedactions collapse credential shapes whose body spans
 // several lines. The per-line postmortemRedactions above only mask the first
 // line of such a value — a `KEY="-----BEGIN … KEY-----` assignment redacts the
@@ -87,8 +91,10 @@ var postmortemMultilineRedactions = []struct {
 	// (?s) lets . span the base64 body/footer lines — including any per-line
 	// bullet prefixes the post-mortem adds — and the lazy .*? stops at the first
 	// matching END so adjacent blocks are not merged. Catches a bare PEM key
-	// dumped to the log as well as one embedded in a KEY="…" assignment.
-	{regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9]+-----.*?-----END[ A-Z0-9]+-----`), "[REDACTED_PRIVATE_KEY_BLOCK]"},
+	// dumped to the log as well as one embedded in a KEY="…" assignment. A block
+	// whose BEGIN banner fell outside the scanned tail is handled separately by
+	// redactClippedPEM.
+	{regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9]+-----.*?-----END[ A-Z0-9]+-----`), pemRedactionMarker},
 	// KEY="…" whose closing quote lands on a later line (any multiline secret
 	// value). The embedded \n forces a genuine multiline match; single-line
 	// assignments are left to the per-line patterns. [^"] spans newlines, so the
@@ -97,17 +103,123 @@ var postmortemMultilineRedactions = []struct {
 	{regexp.MustCompile(`(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY)[A-Z0-9_]*)\s*[:=]\s*"[^"]*\n[^"]*"`), "${1}=[REDACTED]"},
 }
 
+// pemMarkerRe matches a PEM banner line (-----BEGIN … KEY----- / -----END …
+// -----, also CERTIFICATE), after any list-bullet prefix the post-mortem adds.
+var pemMarkerRe = regexp.MustCompile(`^-{5}(?:BEGIN|END)[ A-Z0-9]+-{5}$`)
+
+// pemStrongBodyRe matches a full-width PEM/DER base64 body line: >=44 base64
+// characters with optional '=' padding. 44 is above a bare 40-char git SHA, so a
+// lone hash is never mistaken for key material; canonical PEM body lines are 64.
+var pemStrongBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{44,}={0,3}$`)
+
+// pemWeakBodyRe matches a short base64 fragment (>=8 chars) — a clipped final
+// body line. On its own it is too short to trust as key material, so it is only
+// redacted when it sits directly against a strong body line or a PEM marker.
+var pemWeakBodyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{8,}={0,3}$`)
+
+// listBulletPrefixRe captures the leading whitespace and optional list bullet
+// ("- ", "* ", "+ ") of a post-mortem line so classification ignores the bullet
+// and a redacted run can be re-emitted with the same one.
+var listBulletPrefixRe = regexp.MustCompile(`^\s*(?:[-*+]\s+)?`)
+
 // redactPostmortemSecrets masks common credential shapes in place. Multiline
 // patterns run first so a PEM key or other multiline secret value is collapsed
-// to a single redacted token before the per-line patterns run.
+// to a single redacted token; redactClippedPEM then catches key material whose
+// BEGIN banner fell outside the scanned tail; the per-line patterns run last.
 func redactPostmortemSecrets(text string) string {
 	for _, r := range postmortemMultilineRedactions {
 		text = r.re.ReplaceAllString(text, r.repl)
 	}
+	text = redactClippedPEM(text)
 	for _, r := range postmortemRedactions {
 		text = r.re.ReplaceAllString(text, r.repl)
 	}
 	return text
+}
+
+// redactClippedPEM masks PEM private-key material whose -----BEGIN----- banner
+// fell outside the scanned log tail, so the complete-block regex in
+// postmortemMultilineRedactions cannot see it (#835 review). When a 400-line
+// tail starts inside a key dump, the orphaned base64 body lines (and any END
+// footer) otherwise survive into the "last actions" section and reach the prompt
+// and persisted file.
+//
+// It is line-oriented over the assembled body: classify each line (after any
+// list bullet) as a PEM marker, a full-width base64 body line, or a short base64
+// fragment, then redact each maximal contiguous run of such lines that either
+// contains a marker or holds >=2 full-width body lines. A lone base64 line with
+// no PEM context is left alone — it may be a hash or blob, not key material.
+func redactClippedPEM(text string) string {
+	lines := strings.Split(text, "\n")
+	n := len(lines)
+	const (
+		other = iota
+		weak
+		strong
+		marker
+	)
+	class := make([]int, n)
+	for i, ln := range lines {
+		content := ln[len(listBulletPrefixRe.FindString(ln)):]
+		switch {
+		case pemMarkerRe.MatchString(content):
+			class[i] = marker
+		case pemStrongBodyRe.MatchString(content):
+			class[i] = strong
+		case pemWeakBodyRe.MatchString(content):
+			class[i] = weak
+		}
+	}
+	// A line joins a PEM run if it is a marker or full-width body line, or a weak
+	// fragment transitively adjacent to one (so a clipped final body line next to
+	// the block is swept in, but an isolated short token is not).
+	inRun := make([]bool, n)
+	for i, c := range class {
+		if c == marker || c == strong {
+			inRun[i] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for i := 0; i < n; i++ {
+			if inRun[i] || class[i] != weak {
+				continue
+			}
+			if (i > 0 && inRun[i-1]) || (i+1 < n && inRun[i+1]) {
+				inRun[i] = true
+				changed = true
+			}
+		}
+	}
+	// Walk maximal runs; redact those with a marker or >=2 full-width body lines,
+	// collapsing each to a single marker that keeps the run's first bullet.
+	var out []string
+	for i := 0; i < n; {
+		if !inRun[i] {
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+		j := i
+		hasMarker, strongCount := false, 0
+		for j < n && inRun[j] {
+			switch class[j] {
+			case marker:
+				hasMarker = true
+			case strong:
+				strongCount++
+			}
+			j++
+		}
+		if hasMarker || strongCount >= 2 {
+			prefix := listBulletPrefixRe.FindString(lines[i])
+			out = append(out, prefix+pemRedactionMarker)
+		} else {
+			out = append(out, lines[i:j]...)
+		}
+		i = j
+	}
+	return strings.Join(out, "\n")
 }
 
 // failureSignatures identify lines that report a failed command, build error,
