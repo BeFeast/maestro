@@ -576,6 +576,12 @@ const (
 	SupervisorActionDeleteWorktree      = "delete_worktree"
 	SupervisorActionChangeGlobalConfig  = "change_global_config"
 	SupervisorActionApplyLessonProposal = "apply_lesson_proposal"
+	// SupervisorActionEditIssueBody applies a groomed issue-body rewrite
+	// (#851). It is approval-gated: the spec-groom step posts the proposed
+	// rewrite as a comment and mints this approval carrying the new body on
+	// Target.Body; the approver executor calls gh.EditIssueBody on approve,
+	// and a reject leaves the issue untouched.
+	SupervisorActionEditIssueBody = "edit_issue_body"
 	// SupervisorActionRestartWorker / SupervisorActionStopWorker are the
 	// per-session worker-control verbs surfaced by the fleet snapshot
 	// (#567). Both are approval-gated: the operator clicks Restart/Stop on
@@ -641,7 +647,43 @@ type SupervisorConfig struct {
 	// per-token cost explicitly.
 	AllowMeteredBackend bool `yaml:"allow_metered_backend" json:"allow_metered_backend,omitempty"`
 
+	// SpecGroom configures the issue-grooming agent + spec-lint quality gate
+	// (#851). Off by default: the supervisor only lints ready-candidate issues
+	// and answers `@maestro groom` mentions when SpecGroom.Enabled is set. All
+	// side effects (a single lint checklist comment, a groom proposal comment)
+	// go through the existing safe/cautious surfaces, and applying a rewrite is
+	// the approval-gated edit_issue_body verb.
+	SpecGroom SupervisorSpecGroomConfig `yaml:"spec_groom" json:"spec_groom,omitempty"`
+
 	excludedLabelsSet bool
+}
+
+// SupervisorSpecGroomConfig gates the spec-lint + grooming capability (#851).
+// Both knobs default to false (plain bools), so an untouched config never lints,
+// grooms, or withholds a ready label — enabling is a config-store row change.
+type SupervisorSpecGroomConfig struct {
+	// Enabled turns the whole capability on for this project. While false the
+	// supervisor performs no lint pass, posts no comments, and mints no
+	// edit_issue_body approvals.
+	Enabled bool `yaml:"enabled" json:"enabled,omitempty"`
+
+	// RequireLintPass, when true, withholds the ready label from an issue whose
+	// current body has not passed spec-lint (default warn-only: a failing issue
+	// still gets its lint comment but keeps its normal labeling flow). Has no
+	// effect unless Enabled is also true.
+	RequireLintPass bool `yaml:"require_lint_pass" json:"require_lint_pass,omitempty"`
+}
+
+// SpecGroomOn reports whether the spec-lint + grooming capability is enabled
+// for this project. Default false (#851).
+func (c SupervisorConfig) SpecGroomOn() bool {
+	return c.SpecGroom.Enabled
+}
+
+// SpecGroomRequireLintPass reports whether the ready label must be withheld from
+// issues that have not passed spec-lint. Only meaningful when SpecGroomOn().
+func (c SupervisorConfig) SpecGroomRequireLintPass() bool {
+	return c.SpecGroom.Enabled && c.SpecGroom.RequireLintPass
 }
 
 // LessonProposalsOn reports whether the supervisor should generate lesson
@@ -2243,6 +2285,7 @@ func knownSupervisorActions() map[string]bool {
 		SupervisorActionSpawnReviewRepair:   true,
 		SupervisorActionRestartWorker:       true,
 		SupervisorActionStopWorker:          true,
+		SupervisorActionEditIssueBody:       true,
 	}
 }
 
@@ -2262,6 +2305,7 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionSpawnReviewRepair,
 		SupervisorActionRestartWorker,
 		SupervisorActionStopWorker,
+		SupervisorActionEditIssueBody,
 	}
 }
 

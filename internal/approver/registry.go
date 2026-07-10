@@ -54,6 +54,12 @@ var KnownApprovalActions = map[string]struct{}{
 	// next dispatcher respawn.
 	"restart_worker": {},
 	"stop_worker":    {},
+	// #851: apply a groomed issue-body rewrite. The spec-groom step posts
+	// the proposed rewrite as a comment and mints this approval carrying the
+	// new body on Target.Body; executeEditIssueBody calls gh.EditIssueBody on
+	// approve, and a reject leaves the issue untouched. add_issue_comment (the
+	// safe verb used to post the proposal itself) stays OUT of this registry.
+	"edit_issue_body": {},
 	// #736: ready-label handoff fallback. The common path applies the
 	// add_ready_label mutation directly as an operator-whitelisted safe
 	// action (safe_actions), so it never reaches this registry. But when

@@ -35,6 +35,12 @@ type GitHubClient interface {
 	// approves an approval-gated label_issue_ready decision (#736).
 	AddIssueLabel(issueNumber int, label string) error
 
+	// EditIssueBody replaces an issue's body. executeEditIssueBody uses it
+	// to apply a groomed spec rewrite when an operator approves an
+	// edit_issue_body approval (#851); the proposed body rides
+	// approval.Target.Body.
+	EditIssueBody(issueNumber int, body string) error
+
 	// PRMergeStatus returns the normalized mergeable verdict
 	// ("MERGEABLE"/"CONFLICTING"/"UNKNOWN") and the raw GitHub
 	// mergeable_state ("clean", "behind", "dirty", ...). executeMergePR
@@ -294,6 +300,8 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 		}
 	case config.SupervisorActionApplyLessonProposal:
 		return e.executeApplyLessonProposal(approval)
+	case config.SupervisorActionEditIssueBody:
+		return e.executeEditIssueBody(approval)
 	case "label_issue_ready":
 		return e.executeLabelIssueReady(approval)
 	case "spawn_worker":
@@ -484,6 +492,40 @@ func (e *Executor) executeCloseIssue(approval *state.Approval) Result {
 	return Result{
 		Status:  state.ApprovalStatusExecuted,
 		Summary: fmt.Sprintf("closed issue #%d", issue),
+	}
+}
+
+// executeEditIssueBody applies a groomed issue-body rewrite (#851). The
+// proposed body rides approval.Target.Body, set at mint time by the spec-groom
+// step (state.RecordEditIssueBodyApproval). Approving runs the edit; a reject
+// never reaches the executor, so the issue is left untouched. An empty body is
+// refused rather than silently blanking the issue.
+func (e *Executor) executeEditIssueBody(approval *state.Approval) Result {
+	if approval.Target == nil || approval.Target.Issue <= 0 {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("%w: issue number missing", ErrMissingTarget)}
+	}
+	if e.GH == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
+	}
+	issue := approval.Target.Issue
+	body := strings.TrimSpace(approval.Target.Body)
+	if body == "" {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("edit_issue_body for issue #%d has an empty body — refusing to blank the issue", issue),
+			Err:     fmt.Errorf("%w: issue body is empty", ErrMissingTarget),
+		}
+	}
+	if err := e.GH.EditIssueBody(issue, body); err != nil {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("edit issue #%d body: %v", issue, err),
+			Err:     fmt.Errorf("edit issue #%d body: %w", issue, err),
+		}
+	}
+	return Result{
+		Status:  state.ApprovalStatusExecuted,
+		Summary: fmt.Sprintf("applied groomed body to issue #%d", issue),
 	}
 }
 

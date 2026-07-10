@@ -54,6 +54,7 @@ func TestRegistry_IsKnownApprovalAction(t *testing.T) {
 		{"stop_worker", true},         // #567: per-session worker-control
 		{"spawn_repair_worker", true}, // #662: classic repair worker (awaiting_dispatch)
 		{"label_issue_ready", true},   // #736: ready-label approval fallback (executor applies the label)
+		{"edit_issue_body", true},     // #851: apply a groomed issue-body rewrite
 
 		// Negative cases — the live-found bugs.
 		{"spawn_repair_repair", false},

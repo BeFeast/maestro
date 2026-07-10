@@ -20,13 +20,15 @@ import (
 // tests keep merging without any extra setup. Tests that exercise the
 // #547 paths set mergeable/mergeState explicitly.
 type fakeGH struct {
-	mergeCalls  []int
-	closeCalls  []closeCall
-	updateCalls []int
-	labelCalls  []labelCall
-	mergeErr    error
-	closeErr    error
-	labelErr    error
+	mergeCalls    []int
+	closeCalls    []closeCall
+	updateCalls   []int
+	labelCalls    []labelCall
+	editBodyCalls []editBodyCall
+	mergeErr      error
+	closeErr      error
+	labelErr      error
+	editBodyErr   error
 
 	// #547 stubs for PRMergeStatus.
 	mergeable      string
@@ -44,6 +46,11 @@ type closeCall struct {
 type labelCall struct {
 	issue int
 	label string
+}
+
+type editBodyCall struct {
+	issue int
+	body  string
 }
 
 func (f *fakeGH) MergePR(pr int) error {
@@ -66,6 +73,13 @@ func (f *fakeGH) AddIssueLabel(issue int, label string) error {
 		return f.labelErr
 	}
 	f.labelCalls = append(f.labelCalls, labelCall{issue: issue, label: label})
+	return nil
+}
+func (f *fakeGH) EditIssueBody(issue int, body string) error {
+	if f.editBodyErr != nil {
+		return f.editBodyErr
+	}
+	f.editBodyCalls = append(f.editBodyCalls, editBodyCall{issue: issue, body: body})
 	return nil
 }
 
@@ -417,6 +431,52 @@ func TestExecute_CloseIssue_RequiresTarget(t *testing.T) {
 	res := ex.Execute(a)
 	if !errors.Is(res.Err, ErrMissingTarget) {
 		t.Fatalf("res = %+v, want ErrMissingTarget", res)
+	}
+}
+
+func TestExecute_EditIssueBody_AppliesRewriteOnApprove(t *testing.T) {
+	gh := &fakeGH{}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Issue: 12, Body: "## Summary\nGroomed body"}, "apply rewrite", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(gh.editBodyCalls) != 1 || gh.editBodyCalls[0].issue != 12 || gh.editBodyCalls[0].body != "## Summary\nGroomed body" {
+		t.Fatalf("editBodyCalls = %+v", gh.editBodyCalls)
+	}
+}
+
+func TestExecute_EditIssueBody_MissingIssueFails(t *testing.T) {
+	ex := &Executor{GH: &fakeGH{}, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Body: "x"}, "s", "")
+	res := ex.Execute(a)
+	if !errors.Is(res.Err, ErrMissingTarget) {
+		t.Fatalf("res = %+v, want ErrMissingTarget", res)
+	}
+}
+
+func TestExecute_EditIssueBody_EmptyBodyRefused(t *testing.T) {
+	gh := &fakeGH{}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Issue: 12, Body: "   "}, "s", "")
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("empty body must fail, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 0 {
+		t.Fatalf("must not call EditIssueBody with an empty body: %+v", gh.editBodyCalls)
+	}
+}
+
+func TestExecute_EditIssueBody_PropagatesGitHubError(t *testing.T) {
+	gh := &fakeGH{editBodyErr: errors.New("gh boom")}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Issue: 12, Body: "body"}, "s", "")
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("expected execution_failed with err, got %+v", res)
 	}
 }
 

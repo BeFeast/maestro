@@ -357,6 +357,12 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		if proposal, created := recordLessonProposalForDecision(cfg, st, decision); created && proposal != nil {
 			log.Printf("[supervisor] proposed lesson %s for %s/%s; approval=%s", proposal.ID, proposal.FailureClass, proposal.Area, proposal.ApprovalID)
 		}
+		// #851: spec-lint + grooming. No-op unless supervisor.spec_groom.enabled
+		// is set; runs before the queue mutation applies so a require_lint_pass
+		// gate reads freshly-recorded lint marks on the next cycle.
+		if mutator, ok := reader.(Mutator); ok {
+			engine.runSpecGroom(st, mutator)
+		}
 		applyOrMintDecision(cfg, st, reader, &decision)
 		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
 		// Phase 1.2 (#499): stamp the last-run heartbeat just before save
@@ -2268,6 +2274,11 @@ func (e *Engine) firstQueueActionCandidate(st *state.State, issues []github.Issu
 		hasReadyLabel := readyLabel == "" || github.HasLabel(issue, []string{readyLabel})
 		hasBlockedLabel := blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel})
 		addReady := readyLabel != "" && !hasReadyLabel && !supervisorMutationSucceeded(st, issue.Number, MutationAddReadyLabel, readyLabel)
+		// #851: require_lint_pass withholds the ready label until spec-lint has
+		// passed for the current body. Default (gate off) never blocks.
+		if addReady && !e.specLintAllowsReady(st, issue) {
+			addReady = false
+		}
 		removeBlocked := hasBlockedLabel && !supervisorMutationSucceeded(st, issue.Number, MutationRemoveBlockedLabel, blockedLabel)
 		candidate := queueActionCandidate{
 			issue:         issue,
@@ -2299,10 +2310,15 @@ func (e *Engine) dynamicQueueActionCandidate(st *state.State, selected github.Is
 	}
 
 	hasReadyLabel := github.HasLabel(selected, []string{readyLabel})
+	addReady := !hasReadyLabel && !supervisorMutationSucceeded(st, selected.Number, MutationAddReadyLabel, readyLabel)
+	// #851: require_lint_pass withholds the ready label until spec-lint passes.
+	if addReady && !e.specLintAllowsReady(st, selected) {
+		addReady = false
+	}
 	candidate := queueActionCandidate{
 		issue:      selected,
 		readyLabel: readyLabel,
-		addReady:   !hasReadyLabel && !supervisorMutationSucceeded(st, selected.Number, MutationAddReadyLabel, readyLabel),
+		addReady:   addReady,
 	}
 
 	if e.cfg.Supervisor.DynamicWave.OwnsReadyLabel {
