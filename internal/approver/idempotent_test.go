@@ -57,6 +57,13 @@ func (b *blockingGH) AddIssueLabel(issue int, label string) error {
 	atomic.AddInt32(&b.calls, 1)
 	return nil
 }
+func (b *blockingGH) EditIssueBody(issue int, body string) error {
+	atomic.AddInt32(&b.calls, 1)
+	return nil
+}
+func (b *blockingGH) IssueBody(issue int) (string, error) {
+	return "", nil
+}
 
 // --- #488: per-approval-ID lock (concurrent Execute) -----------------------
 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -34,6 +35,18 @@ type GitHubClient interface {
 	// uses it to apply the configured ready label when an operator
 	// approves an approval-gated label_issue_ready decision (#736).
 	AddIssueLabel(issueNumber int, label string) error
+
+	// EditIssueBody replaces an issue's body. executeEditIssueBody uses it
+	// to apply a groomed spec rewrite when an operator approves an
+	// edit_issue_body approval (#851); the proposed body rides
+	// approval.Target.Body.
+	EditIssueBody(issueNumber int, body string) error
+
+	// IssueBody returns an issue's current body. executeEditIssueBody reads
+	// it just before applying a groomed rewrite and refuses the edit if the
+	// body changed since the proposal was minted, so a manual edit made in
+	// the interim is never silently overwritten (#851 review).
+	IssueBody(issueNumber int) (string, error)
 
 	// PRMergeStatus returns the normalized mergeable verdict
 	// ("MERGEABLE"/"CONFLICTING"/"UNKNOWN") and the raw GitHub
@@ -294,6 +307,8 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 		}
 	case config.SupervisorActionApplyLessonProposal:
 		return e.executeApplyLessonProposal(approval)
+	case config.SupervisorActionEditIssueBody:
+		return e.executeEditIssueBody(approval)
 	case "label_issue_ready":
 		return e.executeLabelIssueReady(approval)
 	case "spawn_worker":
@@ -484,6 +499,62 @@ func (e *Executor) executeCloseIssue(approval *state.Approval) Result {
 	return Result{
 		Status:  state.ApprovalStatusExecuted,
 		Summary: fmt.Sprintf("closed issue #%d", issue),
+	}
+}
+
+// executeEditIssueBody applies a groomed issue-body rewrite (#851). The
+// proposed body rides approval.Target.Body, set at mint time by the spec-groom
+// step (state.RecordEditIssueBodyApproval). Approving runs the edit; a reject
+// never reaches the executor, so the issue is left untouched. An empty body is
+// refused rather than silently blanking the issue.
+func (e *Executor) executeEditIssueBody(approval *state.Approval) Result {
+	if approval.Target == nil || approval.Target.Issue <= 0 {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: fmt.Errorf("%w: issue number missing", ErrMissingTarget)}
+	}
+	if e.GH == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
+	}
+	issue := approval.Target.Issue
+	body := strings.TrimSpace(approval.Target.Body)
+	if body == "" {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("edit_issue_body for issue #%d has an empty body — refusing to blank the issue", issue),
+			Err:     fmt.Errorf("%w: issue body is empty", ErrMissingTarget),
+		}
+	}
+	// Stale-edit guard (#851 review): the rewrite was groomed against a
+	// specific body snapshot (BaseBodyHash, stamped at mint). Re-read the live
+	// body and refuse the whole-body replace if it changed since — otherwise an
+	// edit a maintainer made between proposal and approval is silently dropped.
+	// A missing base hash (approvals minted before this guard) skips the check.
+	if base := strings.TrimSpace(approval.Target.BaseBodyHash); base != "" {
+		current, err := e.GH.IssueBody(issue)
+		if err != nil {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("verify issue #%d body before edit: %v", issue, err),
+				Err:     fmt.Errorf("verify issue #%d body: %w", issue, err),
+			}
+		}
+		if specgroom.BodyHash(current) != base {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("issue #%d body changed since this rewrite was proposed — refusing to overwrite the intervening edit; re-run @maestro groom to propose against the current body", issue),
+				Err:     fmt.Errorf("edit issue #%d body: base body is stale", issue),
+			}
+		}
+	}
+	if err := e.GH.EditIssueBody(issue, body); err != nil {
+		return Result{
+			Status:  state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf("edit issue #%d body: %v", issue, err),
+			Err:     fmt.Errorf("edit issue #%d body: %w", issue, err),
+		}
+	}
+	return Result{
+		Status:  state.ApprovalStatusExecuted,
+		Summary: fmt.Sprintf("applied groomed body to issue #%d", issue),
 	}
 }
 

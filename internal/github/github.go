@@ -64,6 +64,18 @@ type issueComment struct {
 	} `json:"user"`
 }
 
+// IssueComment is the public view of a single issue comment. Unlike the
+// internal issueComment (used only for PR Greptile scanning) it carries the
+// comment ID and creation time so callers can track "have I already handled
+// this comment" idempotently — required by the spec-groom mention trigger
+// (#851), which reacts to `@maestro groom` at most once per comment.
+type IssueComment struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	Author    string `json:"author"`
+	CreatedAt string `json:"created_at"`
+}
+
 type Issue struct {
 	Number int    `json:"number"`
 	Title  string `json:"title"`
@@ -1556,6 +1568,18 @@ func (c *Client) GetIssue(number int) (Issue, error) {
 	return issue, nil
 }
 
+// IssueBody returns just the current body of an issue. The approver executor
+// uses it to re-read the live body before applying a groomed edit_issue_body
+// rewrite, so an edit made after the proposal was minted is not clobbered
+// (#851 review).
+func (c *Client) IssueBody(number int) (string, error) {
+	issue, err := c.GetIssue(number)
+	if err != nil {
+		return "", err
+	}
+	return issue.Body, nil
+}
+
 // IsIssueClosed returns true if the issue is closed
 func (c *Client) IsIssueClosed(number int) (bool, error) {
 	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
@@ -2233,6 +2257,39 @@ func (c *Client) CommentIssue(issueNumber int, body string) error {
 		return fmt.Errorf("gh issue comment: %w\n%s", err, out)
 	}
 	return nil
+}
+
+// ListIssueComments returns the comments on an issue in chronological order,
+// carrying each comment's ID, author login, and creation time. Used by the
+// spec-groom mention trigger (#851) to poll for `@maestro groom` commands
+// without a webhook dependency. GitHub treats PRs as issues, so this also
+// works for PR numbers, but the supervisor only calls it for issues.
+func (c *Client) ListIssueComments(issueNumber int) ([]IssueComment, error) {
+	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, issueNumber), "--paginate")
+	if err != nil {
+		return nil, fmt.Errorf("list issue comments for #%d: %w", issueNumber, err)
+	}
+	var raw []struct {
+		ID        int64  `json:"id"`
+		Body      string `json:"body"`
+		CreatedAt string `json:"created_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parse issue #%d comments: %w", issueNumber, err)
+	}
+	comments := make([]IssueComment, 0, len(raw))
+	for _, r := range raw {
+		comments = append(comments, IssueComment{
+			ID:        r.ID,
+			Body:      r.Body,
+			Author:    r.User.Login,
+			CreatedAt: r.CreatedAt,
+		})
+	}
+	return comments, nil
 }
 
 // CommentPR leaves a comment on a pull request.

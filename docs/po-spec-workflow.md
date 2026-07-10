@@ -61,6 +61,42 @@ audit trail.
 - Specs that require running things off-workshop (laptop, NFS) — violates the hard operating rules.
 - Specs that re-introduce dense, nested, inspector-style UI — see the UI direction in the handover.
 
+## Spec-lint + grooming agent (#851)
+
+The supervisor can enforce the "good spec" rules above automatically. It is
+**off by default**; enabling it is a config-store row change, no code or restart:
+
+```bash
+maestro settings set supervisor.spec_groom.enabled=true            # fleet default
+maestro settings set supervisor.spec_groom.enabled=true --project befeast-maestro
+```
+
+Once enabled, per supervisor cycle (polling only — no webhook):
+
+- **Spec-lint** — each open, not-yet-`maestro-ready` issue is scored against the
+  rules above in a single cheap LLM pass (same backend selection as the
+  supervisor, respecting `supervisor.allow_metered_backend`). A failing issue
+  gets **exactly one** checklist comment naming what is missing; a well-formed
+  issue gets none. Lint runs at most once per issue-body change (a body hash is
+  tracked in state), so there is zero comment churn on unchanged issues.
+- **Grooming** — comment `@maestro groom` on any issue to get a proposed rewrite
+  in the Spec template structure (Summary / Why / Scope / Acceptance / Test Plan
+  / Non-goals; nothing dropped, gaps marked `TBD`) posted as a comment. The
+  proposal changes nothing on its own: applying it is the approval-gated
+  `edit_issue_body` verb — **approve** to replace the issue body, **reject** to
+  leave it untouched. Both outcomes are visible in the approvals UI and audit.
+
+Optional strict gate:
+
+```bash
+maestro settings set supervisor.spec_groom.require_lint_pass=true --project befeast-maestro
+```
+
+With `require_lint_pass` set, the supervisor withholds the `maestro-ready` label
+from an issue until its current body has **passed** spec-lint (default is
+warn-only: a failing issue still gets its lint comment but keeps its normal
+labeling flow).
+
 ## Operator commands
 
 Inspect the queue:

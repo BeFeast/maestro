@@ -84,6 +84,18 @@ func FleetSettingSpecs() []FleetSettingSpec {
 			Value:    func(c *Config) string { return strconv.FormatBool(c.Supervisor.AlwaysConsultLLM) },
 		},
 		{
+			Key:      "supervisor.spec_groom.enabled",
+			YAMLPath: []string{"supervisor", "spec_groom", "enabled"},
+			Kind:     SettingKindBool,
+			Value:    func(c *Config) string { return strconv.FormatBool(c.Supervisor.SpecGroom.Enabled) },
+		},
+		{
+			Key:      "supervisor.spec_groom.require_lint_pass",
+			YAMLPath: []string{"supervisor", "spec_groom", "require_lint_pass"},
+			Kind:     SettingKindBool,
+			Value:    func(c *Config) string { return strconv.FormatBool(c.Supervisor.SpecGroom.RequireLintPass) },
+		},
+		{
 			Key:      "poll_interval_seconds",
 			YAMLPath: []string{"poll_interval_seconds"},
 			Kind:     SettingKindInt,

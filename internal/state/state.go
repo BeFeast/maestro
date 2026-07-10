@@ -629,6 +629,22 @@ type SupervisorTarget struct {
 	// include the target).
 	HeadSHA string `json:"head_sha,omitempty"`
 	Session string `json:"session,omitempty"`
+	// Body carries the proposed replacement issue body for an edit_issue_body
+	// approval (#851). It is set only on that verb's target; the approver
+	// executor reads it on approve and calls gh.EditIssueBody. It is part of
+	// the approval payload hash (ComputePayloadHash hashes the whole Target)
+	// but intentionally NOT part of approvalTargetsEqual, so a re-groom with a
+	// fresh rewrite refreshes the pending approval in place rather than piling
+	// up a duplicate.
+	Body string `json:"body,omitempty"`
+	// BaseBodyHash is the digest of the issue body the edit_issue_body rewrite
+	// was groomed against, stamped at mint time (#851 review). On approve the
+	// executor re-fetches the live body and refuses the edit if its hash no
+	// longer matches — so a manual edit made after the proposal was minted is
+	// never silently clobbered. Like Body, it is intentionally NOT part of
+	// approvalTargetsEqual so a fresh re-groom refreshes the pending approval
+	// in place.
+	BaseBodyHash string `json:"base_body_hash,omitempty"`
 }
 
 type SupervisorIssueTarget struct {
@@ -1103,6 +1119,26 @@ type State struct {
 	// short SHA observed when the decision was recorded.
 	ReviewRepairTracks map[string]ReviewRepairTrack `json:"review_repair_tracks,omitempty"`
 
+	// SpecLintTracks records the last spec-lint result per issue (#851),
+	// keyed by issue number (project scope is the state.json file itself).
+	// The supervisor lints an issue at most once per body change by comparing
+	// the current body hash to the stored one, and records the last handled
+	// `@maestro groom` comment so a mention fires grooming only once. Wired
+	// through the 3-way merge (mergeSpecLintTracks) latest-write-wins so a
+	// concurrent orchestrator Save cannot clobber a fresh lint mark.
+	SpecLintTracks map[int]SpecLintTrack `json:"spec_lint_tracks,omitempty"`
+
+	// SpecGroomCursor is the issue number where the last spec-groom cycle
+	// stopped examining (#851 review). The per-cycle cap only lets a bounded
+	// window of open issues be examined (comment fetch + LLM pass); the cursor
+	// lets the next cycle resume just past that window and wrap around, so a
+	// repo with more open issues than the cap eventually drains every issue
+	// instead of forever re-examining the same first N and starving the tail.
+	// Best-effort: it only steers which window runs, never lint/groom
+	// idempotency (guaranteed by SpecLintTracks), so a merge that keeps the
+	// on-disk value simply re-examines a window and self-heals next cycle.
+	SpecGroomCursor int `json:"spec_groom_cursor,omitempty"`
+
 	loadedHash  string
 	loadedState *State
 }
@@ -1225,6 +1261,7 @@ func NewState() *State {
 		Missions:          make(map[int]*Mission),
 		ProjectStatusSync: make(map[int]ProjectStatusSync),
 		BackendHealth:     make(map[string]BackendHealth),
+		SpecLintTracks:    make(map[int]SpecLintTrack),
 		NextSlot:          1,
 	}
 }
@@ -1473,6 +1510,9 @@ func (s *State) normalize() {
 	if s.BackendHealth == nil {
 		s.BackendHealth = make(map[string]BackendHealth)
 	}
+	if s.SpecLintTracks == nil {
+		s.SpecLintTracks = make(map[int]SpecLintTrack)
+	}
 	if s.NextSlot == 0 {
 		s.NextSlot = 1
 	}
@@ -1488,6 +1528,8 @@ func (s *State) copyFrom(src *State) {
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
 	s.BackendQuotaUsage = src.BackendQuotaUsage
+	s.SpecLintTracks = src.SpecLintTracks
+	s.SpecGroomCursor = src.SpecGroomCursor
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
 	s.SpawnDrain = src.SpawnDrain
@@ -1535,6 +1577,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	}
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
+	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
 	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
@@ -2901,7 +2944,11 @@ type approvalDecisionIdentity struct {
 
 // normalizedTargetIdentity returns a copy of target with Session/HeadSHA
 // trimmed, so the content-addressed approval id is robust to incidental
-// whitespace and consistent with approvalTargetsEqual.
+// whitespace and consistent with approvalTargetsEqual. Body is cleared: for
+// edit_issue_body (#851) the identity is (action, issue), so a re-groom with a
+// fresh rewrite refreshes the pending approval in place rather than minting a
+// duplicate under a new content-addressed id — matching approvalTargetsEqual,
+// which also ignores Body.
 func normalizedTargetIdentity(target *SupervisorTarget) *SupervisorTarget {
 	if target == nil {
 		return nil
@@ -2909,6 +2956,7 @@ func normalizedTargetIdentity(target *SupervisorTarget) *SupervisorTarget {
 	clone := cloneSupervisorTarget(target)
 	clone.HeadSHA = strings.TrimSpace(clone.HeadSHA)
 	clone.Session = strings.TrimSpace(clone.Session)
+	clone.Body = ""
 	return clone
 }
 

@@ -44,6 +44,15 @@ type fakeReader struct {
 	addLabelErr          error
 	removeLabelErr       error
 	commentErr           error
+	issueComments        map[int][]github.IssueComment
+	listCommentsErr      error
+}
+
+func (f *fakeReader) ListIssueComments(issueNumber int) ([]github.IssueComment, error) {
+	if f.listCommentsErr != nil {
+		return nil, f.listCommentsErr
+	}
+	return f.issueComments[issueNumber], nil
 }
 
 type fakeLLM struct {

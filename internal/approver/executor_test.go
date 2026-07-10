@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -20,13 +21,21 @@ import (
 // tests keep merging without any extra setup. Tests that exercise the
 // #547 paths set mergeable/mergeState explicitly.
 type fakeGH struct {
-	mergeCalls  []int
-	closeCalls  []closeCall
-	updateCalls []int
-	labelCalls  []labelCall
-	mergeErr    error
-	closeErr    error
-	labelErr    error
+	mergeCalls    []int
+	closeCalls    []closeCall
+	updateCalls   []int
+	labelCalls    []labelCall
+	editBodyCalls []editBodyCall
+	mergeErr      error
+	closeErr      error
+	labelErr      error
+	editBodyErr   error
+
+	// issueBody is what IssueBody returns (the "current" live body used by
+	// executeEditIssueBody's stale-edit guard); issueBodyErr forces a fetch
+	// failure.
+	issueBody    string
+	issueBodyErr error
 
 	// #547 stubs for PRMergeStatus.
 	mergeable      string
@@ -44,6 +53,11 @@ type closeCall struct {
 type labelCall struct {
 	issue int
 	label string
+}
+
+type editBodyCall struct {
+	issue int
+	body  string
 }
 
 func (f *fakeGH) MergePR(pr int) error {
@@ -67,6 +81,19 @@ func (f *fakeGH) AddIssueLabel(issue int, label string) error {
 	}
 	f.labelCalls = append(f.labelCalls, labelCall{issue: issue, label: label})
 	return nil
+}
+func (f *fakeGH) EditIssueBody(issue int, body string) error {
+	if f.editBodyErr != nil {
+		return f.editBodyErr
+	}
+	f.editBodyCalls = append(f.editBodyCalls, editBodyCall{issue: issue, body: body})
+	return nil
+}
+func (f *fakeGH) IssueBody(issue int) (string, error) {
+	if f.issueBodyErr != nil {
+		return "", f.issueBodyErr
+	}
+	return f.issueBody, nil
 }
 
 type fakeWT struct {
@@ -417,6 +444,108 @@ func TestExecute_CloseIssue_RequiresTarget(t *testing.T) {
 	res := ex.Execute(a)
 	if !errors.Is(res.Err, ErrMissingTarget) {
 		t.Fatalf("res = %+v, want ErrMissingTarget", res)
+	}
+}
+
+func TestExecute_EditIssueBody_AppliesRewriteOnApprove(t *testing.T) {
+	gh := &fakeGH{}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Issue: 12, Body: "## Summary\nGroomed body"}, "apply rewrite", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("res = %+v", res)
+	}
+	if len(gh.editBodyCalls) != 1 || gh.editBodyCalls[0].issue != 12 || gh.editBodyCalls[0].body != "## Summary\nGroomed body" {
+		t.Fatalf("editBodyCalls = %+v", gh.editBodyCalls)
+	}
+}
+
+func TestExecute_EditIssueBody_MissingIssueFails(t *testing.T) {
+	ex := &Executor{GH: &fakeGH{}, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Body: "x"}, "s", "")
+	res := ex.Execute(a)
+	if !errors.Is(res.Err, ErrMissingTarget) {
+		t.Fatalf("res = %+v, want ErrMissingTarget", res)
+	}
+}
+
+func TestExecute_EditIssueBody_EmptyBodyRefused(t *testing.T) {
+	gh := &fakeGH{}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Issue: 12, Body: "   "}, "s", "")
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("empty body must fail, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 0 {
+		t.Fatalf("must not call EditIssueBody with an empty body: %+v", gh.editBodyCalls)
+	}
+}
+
+func TestExecute_EditIssueBody_PropagatesGitHubError(t *testing.T) {
+	gh := &fakeGH{editBodyErr: errors.New("gh boom")}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody, &state.SupervisorTarget{Issue: 12, Body: "body"}, "s", "")
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("expected execution_failed with err, got %+v", res)
+	}
+}
+
+// TestExecute_EditIssueBody_RefusesStaleBody pins the #851-review guard: if the
+// live issue body changed after the rewrite was proposed (BaseBodyHash no longer
+// matches), the executor must refuse rather than clobber the intervening edit.
+func TestExecute_EditIssueBody_RefusesStaleBody(t *testing.T) {
+	gh := &fakeGH{issueBody: "the CURRENT body after a manual edit"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	base := specgroom.BodyHash("the body the rewrite was groomed against")
+	a := mkApproval(config.SupervisorActionEditIssueBody,
+		&state.SupervisorTarget{Issue: 12, Body: "## Summary\nGroomed", BaseBodyHash: base}, "apply", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("a body that changed since the proposal must fail, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 0 {
+		t.Fatalf("must not overwrite an intervening edit: %+v", gh.editBodyCalls)
+	}
+}
+
+// TestExecute_EditIssueBody_AppliesWhenBaseBodyMatches confirms the guard is not
+// over-eager: when the live body still matches what was groomed, the rewrite is
+// applied.
+func TestExecute_EditIssueBody_AppliesWhenBaseBodyMatches(t *testing.T) {
+	const current = "the exact body the rewrite was groomed against"
+	gh := &fakeGH{issueBody: current}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody,
+		&state.SupervisorTarget{Issue: 12, Body: "## Summary\nGroomed", BaseBodyHash: specgroom.BodyHash(current)}, "apply", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("a matching base body should apply, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 1 || gh.editBodyCalls[0].body != "## Summary\nGroomed" {
+		t.Fatalf("expected the rewrite applied once: %+v", gh.editBodyCalls)
+	}
+}
+
+// TestExecute_EditIssueBody_StaleGuardFailsClosedOnFetchError verifies the guard
+// fails closed: if the live body cannot be re-read, the executor refuses rather
+// than apply a possibly-stale overwrite.
+func TestExecute_EditIssueBody_StaleGuardFailsClosedOnFetchError(t *testing.T) {
+	gh := &fakeGH{issueBodyErr: errors.New("gh down")}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody,
+		&state.SupervisorTarget{Issue: 12, Body: "x", BaseBodyHash: "somehash"}, "apply", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("a failed body fetch must fail closed, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 0 {
+		t.Fatalf("must not edit when the guard cannot verify the live body: %+v", gh.editBodyCalls)
 	}
 }
 
