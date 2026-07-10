@@ -18,6 +18,10 @@ type editBodyGH struct {
 	editIssue int
 	editBody  string
 	edits     int
+	// currentBody is what IssueBody reports as the live issue body — the
+	// stale-edit guard hashes it against the approval's BaseBodyHash before
+	// applying the rewrite.
+	currentBody string
 }
 
 func (g *editBodyGH) MergePR(int) error               { return nil }
@@ -33,6 +37,7 @@ func (g *editBodyGH) EditIssueBody(issue int, body string) error {
 	g.edits++
 	return nil
 }
+func (g *editBodyGH) IssueBody(int) (string, error) { return g.currentBody, nil }
 
 func issueWithBody(number int, title, body string, labels ...string) github.Issue {
 	issue := testIssue(number, title, labels...)
@@ -84,6 +89,88 @@ func TestRunSpecGroom_DisabledIsNoOp(t *testing.T) {
 	}
 	if len(reader.comments) != 0 {
 		t.Fatalf("disabled feature must post no comments: %v", reader.comments)
+	}
+}
+
+func TestRunSpecGroom_EmergencyHaltSkipsLLM(t *testing.T) {
+	reader := &fakeReader{issues: []github.Issue{issueWithBody(1, "vague", "do stuff")}}
+	llm := &fakeLLM{output: failVerdict}
+	cfg := testConfig(t)
+	cfg.Supervisor.SpecGroom.Enabled = true
+	eng := testEngine(cfg, reader)
+	eng.llm = llm
+	eng.SetEmergencyLLMHalt(true) // #840 fleet-wide EMERGENCY STOP LLM gate
+	st := state.NewState()
+
+	eng.runSpecGroom(st, reader)
+
+	if llm.calls != 0 {
+		t.Fatalf("emergency LLM halt must skip the grooming LLM pass (calls=%d)", llm.calls)
+	}
+	if len(reader.comments) != 0 {
+		t.Fatalf("emergency LLM halt must post no comments: %v", reader.comments)
+	}
+}
+
+func TestRunSpecGroom_RedactsIssueTextBeforePrompt(t *testing.T) {
+	// A credential-shaped token in the title AND body must be scrubbed before
+	// it reaches the LLM backend (#851 review), matching how every other
+	// supervisor prompt redacts issue text.
+	secret := "sk-abcdefghijklmnopqrstuvwxyz012345"
+	reader := &fakeReader{issues: []github.Issue{
+		issueWithBody(1, "leaky "+secret, "Deploy with Authorization: Bearer "+secret),
+	}}
+	llm := &fakeLLM{output: failVerdict}
+	cfg := testConfig(t)
+	cfg.Supervisor.SpecGroom.Enabled = true
+	eng := testEngine(cfg, reader)
+	eng.llm = llm
+	st := state.NewState()
+
+	eng.runSpecGroom(st, reader)
+
+	if llm.calls == 0 {
+		t.Fatalf("expected the grooming LLM pass to run")
+	}
+	if strings.Contains(llm.prompt, secret) {
+		t.Fatalf("issue text with a credential shape leaked into the prompt: %q", llm.prompt)
+	}
+	if !strings.Contains(llm.prompt, "[REDACTED") {
+		t.Fatalf("expected a redaction marker in the prompt, got: %q", llm.prompt)
+	}
+}
+
+func TestRunSpecGroom_RotatesWindowToDrainBacklog(t *testing.T) {
+	// More open issues than the per-cycle cap: the old fixed [0,cap) window
+	// examined the same first N every cycle and starved the tail. The rotating
+	// window (#851 review) must reach issue cap+1.. over successive cycles.
+	total := maxSpecGroomIssuesPerCycle + 5
+	var issues []github.Issue
+	for i := 1; i <= total; i++ {
+		issues = append(issues, issueWithBody(i, "vague", "needs work"))
+	}
+	reader := &fakeReader{issues: issues}
+	eng := specGroomEngine(t, reader, failVerdict)
+	st := state.NewState()
+
+	// Cycle 1 examines exactly the cap; the tail is untouched.
+	eng.runSpecGroom(st, reader)
+	if len(reader.comments) != maxSpecGroomIssuesPerCycle {
+		t.Fatalf("cycle 1 should lint exactly the cap (%d), got %d", maxSpecGroomIssuesPerCycle, len(reader.comments))
+	}
+	if _, ok := st.SpecLintTrackFor(total); ok {
+		t.Fatalf("issue #%d must not be examined in cycle 1 (past the cap)", total)
+	}
+
+	// Cycle 2 resumes past the window and reaches the tail.
+	eng.runSpecGroom(st, reader)
+	if _, ok := st.SpecLintTrackFor(total); !ok {
+		t.Fatalf("issue #%d must be examined by cycle 2 (rotating window)", total)
+	}
+	for i := 1; i <= total; i++ {
+		if _, ok := st.SpecLintTrackFor(i); !ok {
+			t.Fatalf("issue #%d never linted across two cycles — window did not drain", i)
+		}
 	}
 }
 
@@ -279,7 +366,9 @@ func TestSpecGroom_EndToEnd_MintApproveExecute(t *testing.T) {
 	if _, err := st.ApproveApproval(approval.ID, time.Now().UTC(), "operator", "looks good"); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	gh := &editBodyGH{}
+	// The live body still matches what the rewrite was groomed against, so the
+	// stale-edit guard passes and the rewrite is applied.
+	gh := &editBodyGH{currentBody: "do the thing"}
 	ex := &approver.Executor{GH: gh, Cfg: &config.Config{Repo: "owner/repo"}}
 	res := ex.Execute(approval)
 	if res.Status != state.ApprovalStatusExecuted {
@@ -290,7 +379,7 @@ func TestSpecGroom_EndToEnd_MintApproveExecute(t *testing.T) {
 	}
 
 	// Reject path: a fresh proposal that is rejected fires no side effect.
-	rej := st.RecordEditIssueBodyApproval(99, "## Summary\nx", "apply", "owner/repo", "owner/repo", nil, time.Now().UTC())
+	rej := st.RecordEditIssueBodyApproval(99, "## Summary\nx", "basehash", "apply", "owner/repo", "owner/repo", nil, time.Now().UTC())
 	if _, err := st.RejectApproval(rej.ID, time.Now().UTC(), "operator", "no thanks"); err != nil {
 		t.Fatalf("reject: %v", err)
 	}

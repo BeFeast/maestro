@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -40,6 +41,12 @@ type GitHubClient interface {
 	// edit_issue_body approval (#851); the proposed body rides
 	// approval.Target.Body.
 	EditIssueBody(issueNumber int, body string) error
+
+	// IssueBody returns an issue's current body. executeEditIssueBody reads
+	// it just before applying a groomed rewrite and refuses the edit if the
+	// body changed since the proposal was minted, so a manual edit made in
+	// the interim is never silently overwritten (#851 review).
+	IssueBody(issueNumber int) (string, error)
 
 	// PRMergeStatus returns the normalized mergeable verdict
 	// ("MERGEABLE"/"CONFLICTING"/"UNKNOWN") and the raw GitHub
@@ -514,6 +521,28 @@ func (e *Executor) executeEditIssueBody(approval *state.Approval) Result {
 			Status:  state.ApprovalStatusExecutionFailed,
 			Summary: fmt.Sprintf("edit_issue_body for issue #%d has an empty body — refusing to blank the issue", issue),
 			Err:     fmt.Errorf("%w: issue body is empty", ErrMissingTarget),
+		}
+	}
+	// Stale-edit guard (#851 review): the rewrite was groomed against a
+	// specific body snapshot (BaseBodyHash, stamped at mint). Re-read the live
+	// body and refuse the whole-body replace if it changed since — otherwise an
+	// edit a maintainer made between proposal and approval is silently dropped.
+	// A missing base hash (approvals minted before this guard) skips the check.
+	if base := strings.TrimSpace(approval.Target.BaseBodyHash); base != "" {
+		current, err := e.GH.IssueBody(issue)
+		if err != nil {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("verify issue #%d body before edit: %v", issue, err),
+				Err:     fmt.Errorf("verify issue #%d body: %w", issue, err),
+			}
+		}
+		if specgroom.BodyHash(current) != base {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("issue #%d body changed since this rewrite was proposed — refusing to overwrite the intervening edit; re-run @maestro groom to propose against the current body", issue),
+				Err:     fmt.Errorf("edit issue #%d body: base body is stale", issue),
+			}
 		}
 	}
 	if err := e.GH.EditIssueBody(issue, body); err != nil {

@@ -74,7 +74,7 @@ func TestRecordEditIssueBodyApproval_MintAndRefreshInPlace(t *testing.T) {
 	s := NewState()
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 
-	a := s.RecordEditIssueBodyApproval(77, "## Summary\nv1", "Apply rewrite", "owner/repo", "owner/repo", []string{"reason"}, now)
+	a := s.RecordEditIssueBodyApproval(77, "## Summary\nv1", "basehash-v1", "Apply rewrite", "owner/repo", "owner/repo", []string{"reason"}, now)
 	if a == nil {
 		t.Fatalf("expected an approval")
 	}
@@ -83,6 +83,9 @@ func TestRecordEditIssueBodyApproval_MintAndRefreshInPlace(t *testing.T) {
 	}
 	if a.Target == nil || a.Target.Issue != 77 || a.Target.Body != "## Summary\nv1" {
 		t.Fatalf("target not carried: %+v", a.Target)
+	}
+	if a.Target.BaseBodyHash != "basehash-v1" {
+		t.Fatalf("base body hash not carried: %q", a.Target.BaseBodyHash)
 	}
 	if a.PayloadHash == "" || a.ComputePayloadHash() != a.PayloadHash {
 		t.Fatalf("payload hash must be set and self-consistent")
@@ -93,7 +96,7 @@ func TestRecordEditIssueBodyApproval_MintAndRefreshInPlace(t *testing.T) {
 	firstID := a.ID
 
 	// A re-groom with a fresh rewrite refreshes IN PLACE under the same id.
-	b := s.RecordEditIssueBodyApproval(77, "## Summary\nv2", "Apply rewrite", "owner/repo", "owner/repo", nil, now.Add(time.Minute))
+	b := s.RecordEditIssueBodyApproval(77, "## Summary\nv2", "basehash-v2", "Apply rewrite", "owner/repo", "owner/repo", nil, now.Add(time.Minute))
 	if len(s.Approvals) != 1 {
 		t.Fatalf("re-groom must not mint a duplicate; got %d approvals", len(s.Approvals))
 	}
@@ -103,6 +106,9 @@ func TestRecordEditIssueBodyApproval_MintAndRefreshInPlace(t *testing.T) {
 	if b.Target.Body != "## Summary\nv2" {
 		t.Fatalf("refreshed approval must carry the new body, got %q", b.Target.Body)
 	}
+	if b.Target.BaseBodyHash != "basehash-v2" {
+		t.Fatalf("refreshed approval must carry the new base body hash, got %q", b.Target.BaseBodyHash)
+	}
 	if b.ComputePayloadHash() != b.PayloadHash {
 		t.Fatalf("payload hash must be recomputed after body refresh")
 	}
@@ -111,8 +117,8 @@ func TestRecordEditIssueBodyApproval_MintAndRefreshInPlace(t *testing.T) {
 func TestRecordEditIssueBodyApproval_DistinctIssuesGetDistinctApprovals(t *testing.T) {
 	s := NewState()
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
-	s.RecordEditIssueBodyApproval(1, "a", "s", "owner/repo", "owner/repo", nil, now)
-	s.RecordEditIssueBodyApproval(2, "b", "s", "owner/repo", "owner/repo", nil, now)
+	s.RecordEditIssueBodyApproval(1, "a", "ha", "s", "owner/repo", "owner/repo", nil, now)
+	s.RecordEditIssueBodyApproval(2, "b", "hb", "s", "owner/repo", "owner/repo", nil, now)
 	if len(s.Approvals) != 2 {
 		t.Fatalf("expected 2 approvals for 2 issues, got %d", len(s.Approvals))
 	}

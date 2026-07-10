@@ -1568,6 +1568,18 @@ func (c *Client) GetIssue(number int) (Issue, error) {
 	return issue, nil
 }
 
+// IssueBody returns just the current body of an issue. The approver executor
+// uses it to re-read the live body before applying a groomed edit_issue_body
+// rewrite, so an edit made after the proposal was minted is not clobbered
+// (#851 review).
+func (c *Client) IssueBody(number int) (string, error) {
+	issue, err := c.GetIssue(number)
+	if err != nil {
+		return "", err
+	}
+	return issue.Body, nil
+}
+
 // IsIssueClosed returns true if the issue is closed
 func (c *Client) IsIssueClosed(number int) (bool, error) {
 	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))

@@ -122,11 +122,14 @@ func (s *State) MarkGroomMentionHandled(issue int, commentID int64, now time.Tim
 
 // RecordEditIssueBodyApproval mints (or refreshes in place) a pending
 // edit_issue_body approval carrying the proposed rewrite on Target.Body (#851).
-// Dedup is keyed on (edit_issue_body, issue): a re-groom with a fresh rewrite
-// updates the live pending approval's body and payload hash under its stable
-// id rather than piling up a sibling. Approving executes the edit; rejecting
+// baseBodyHash is the digest of the issue body the rewrite was groomed against;
+// it rides Target.BaseBodyHash so the approver can refuse the edit if the live
+// body changed after this proposal was minted (#851 review). Dedup is keyed on
+// (edit_issue_body, issue): a re-groom with a fresh rewrite updates the live
+// pending approval's body, base hash, and payload hash under its stable id
+// rather than piling up a sibling. Approving executes the edit; rejecting
 // leaves the issue untouched. Returns the stored approval.
-func (s *State) RecordEditIssueBodyApproval(issue int, body, summary, repo, project string, evidence []string, now time.Time) *Approval {
+func (s *State) RecordEditIssueBodyApproval(issue int, body, baseBodyHash, summary, repo, project string, evidence []string, now time.Time) *Approval {
 	if s == nil || issue <= 0 {
 		return nil
 	}
@@ -134,7 +137,7 @@ func (s *State) RecordEditIssueBodyApproval(issue int, body, summary, repo, proj
 		now = time.Now().UTC()
 	}
 	now = normalizedTime(now)
-	target := &SupervisorTarget{Issue: issue, Body: body}
+	target := &SupervisorTarget{Issue: issue, Body: body, BaseBodyHash: baseBodyHash}
 
 	// Dedup against a still-effective approval for the same issue.
 	for i := range s.Approvals {

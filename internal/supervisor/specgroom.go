@@ -3,6 +3,7 @@ package supervisor
 import (
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,9 +14,10 @@ import (
 
 // maxSpecGroomIssuesPerCycle bounds how many issues one supervisor cycle will
 // examine for spec-lint/grooming (comment fetch + LLM pass). It caps both the
-// GitHub API calls and the backend spend per cycle; issues past the cap are
-// picked up on the next cycle. Lint is already once-per-body-change, so a
-// backlog drains within a few cycles and then stays quiet.
+// GitHub API calls and the backend spend per cycle. The examined window rotates
+// across cycles (State.SpecGroomCursor), so issues past the cap are picked up on
+// subsequent cycles rather than starved. Lint is already once-per-body-change,
+// so a backlog drains within a few cycles and then stays quiet.
 const maxSpecGroomIssuesPerCycle = 30
 
 // issueCommentLister is the optional reader capability the spec-groom step needs
@@ -39,6 +41,14 @@ type issueCommentLister interface {
 // persisted by the cycle's single state.Save.
 func (e *Engine) runSpecGroom(st *state.State, mutator Mutator) {
 	if e == nil || e.cfg == nil || st == nil || !e.cfg.Supervisor.SpecGroomOn() {
+		return
+	}
+	// Honor the fleet-wide EMERGENCY STOP LLM halt (#840). The grooming pass
+	// dispatches to the same supervisor backend as Decide, so an active halt
+	// must short-circuit it too — otherwise spec-groom keeps supervisor LLM
+	// calls (and spend) running straight through the emergency stop.
+	if e.emergencyLLMHalt {
+		log.Printf("[supervisor] spec-groom: skipped; emergency LLM halt is active")
 		return
 	}
 	// Respect the metered-backend refusal (#838): the lint pass dispatches to
@@ -67,20 +77,42 @@ func (e *Engine) runSpecGroom(st *state.State, mutator Mutator) {
 	excluded := e.excludeLabels()
 	now := e.now()
 
-	// examined bounds how many issues get a comment fetch + (maybe) an LLM pass
-	// this cycle, capping GitHub and backend cost. truncated counts the
-	// non-excluded issues deferred to the next cycle so the cap is never silent.
-	examined := 0
-	truncated := 0
+	// Candidate set: the non-excluded open issues, sorted by number so the
+	// rotating window (below) is deterministic and issue numbers — which are
+	// stable and monotonic — can key the resume cursor.
+	candidates := make([]github.Issue, 0, len(issues))
 	for _, issue := range issues {
 		if len(excluded) > 0 && github.HasLabel(issue, excluded) {
 			continue
 		}
-		if examined >= maxSpecGroomIssuesPerCycle {
-			truncated++
-			continue
+		candidates = append(candidates, issue)
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Number < candidates[j].Number })
+
+	// Rotate the capped window so the backlog drains (#851 review). The cap
+	// bounds how many issues get a comment fetch + (maybe) an LLM pass per
+	// cycle. A fixed [0,cap) window let the first N non-excluded issues consume
+	// the cap on every cycle — so with more open issues than the cap, issue N+1
+	// was never examined (and under require_lint_pass its ready label could stay
+	// withheld forever). Resume just past the last-examined issue and wrap, so
+	// every issue is eventually reached over successive cycles.
+	start := 0
+	for i, issue := range candidates {
+		if issue.Number > st.SpecGroomCursor {
+			start = i
+			break
 		}
+	}
+
+	examined := 0
+	lastExamined := st.SpecGroomCursor
+	for k := 0; k < len(candidates) && examined < maxSpecGroomIssuesPerCycle; k++ {
+		issue := candidates[(start+k)%len(candidates)]
 		examined++
+		lastExamined = issue.Number
 
 		isReady := readyLabel != "" && github.HasLabel(issue, []string{readyLabel})
 
@@ -105,11 +137,14 @@ func (e *Engine) runSpecGroom(st *state.State, mutator Mutator) {
 			e.applyLintVerdict(st, mutator, issue.Number, bodyHash, verdict, now)
 		}
 		if haveMention {
-			e.applyGroomProposal(st, mutator, issue.Number, mention, verdict, now)
+			e.applyGroomProposal(st, mutator, issue.Number, bodyHash, mention, verdict, now)
 		}
 	}
-	if truncated > 0 {
-		log.Printf("[supervisor] spec-groom: examined the first %d issues this cycle; %d more will be examined next cycle", maxSpecGroomIssuesPerCycle, truncated)
+	// Advance the cursor so the next cycle resumes past this window. deferred is
+	// the count not reached this cycle — logged so the cap is never silent.
+	st.SpecGroomCursor = lastExamined
+	if deferred := len(candidates) - examined; deferred > 0 {
+		log.Printf("[supervisor] spec-groom: examined %d issue(s) this cycle (rotating window through issue #%d); %d more will be examined over the next cycles", examined, lastExamined, deferred)
 	}
 }
 
@@ -155,7 +190,7 @@ func (e *Engine) applyLintVerdict(st *state.State, mutator Mutator, issueNumber 
 // marked handled only after the proposal is posted, so a transient error
 // retries next cycle. When the model returned no rewrite the mention is marked
 // handled without a proposal (nothing to apply).
-func (e *Engine) applyGroomProposal(st *state.State, mutator Mutator, issueNumber int, mention specgroom.Comment, verdict specgroom.Verdict, now time.Time) {
+func (e *Engine) applyGroomProposal(st *state.State, mutator Mutator, issueNumber int, baseBodyHash string, mention specgroom.Comment, verdict specgroom.Verdict, now time.Time) {
 	proposal := specgroom.RenderGroomComment(verdict)
 	if proposal == "" {
 		st.MarkGroomMentionHandled(issueNumber, mention.ID, now)
@@ -170,7 +205,10 @@ func (e *Engine) applyGroomProposal(st *state.State, mutator Mutator, issueNumbe
 		"Proposed by the spec-groom agent in response to an @maestro groom mention.",
 		"Approve to replace the issue body with the proposed rewrite; reject to leave it untouched.",
 	}
-	st.RecordEditIssueBodyApproval(issueNumber, verdict.RewrittenBody, summary, e.cfg.Repo, e.cfg.Repo, evidence, now)
+	// baseBodyHash stamps the body the rewrite was groomed against so the
+	// approver can refuse a stale overwrite if the issue is edited before the
+	// operator approves (#851 review).
+	st.RecordEditIssueBodyApproval(issueNumber, verdict.RewrittenBody, baseBodyHash, summary, e.cfg.Repo, e.cfg.Repo, evidence, now)
 	st.MarkGroomMentionHandled(issueNumber, mention.ID, now)
 	log.Printf("[supervisor] spec-groom: posted groom proposal + minted edit_issue_body approval for issue #%d", issueNumber)
 }
@@ -195,6 +233,13 @@ func (e *Engine) specLintAllowsReady(st *state.State, issue github.Issue) bool {
 	return false
 }
 
+// toSpecgroomIssue projects a GitHub issue into the specgroom prompt input.
+// Title and Body are redacted first (#851 review): the spec-groom LLM pass is a
+// backend call, and an issue body carrying a credential shape (Authorization:,
+// sk-..., etc.) must be scrubbed before it reaches the model — the same way
+// every other supervisor prompt redacts issue text (packet.go). The un-redacted
+// body is still what the body hash and the approver's stale-edit guard compare
+// against; only the prompt-bound copy is scrubbed.
 func toSpecgroomIssue(issue github.Issue) specgroom.Issue {
 	labels := make([]string, 0, len(issue.Labels))
 	for _, l := range issue.Labels {
@@ -204,8 +249,8 @@ func toSpecgroomIssue(issue github.Issue) specgroom.Issue {
 	}
 	return specgroom.Issue{
 		Number: issue.Number,
-		Title:  issue.Title,
-		Body:   issue.Body,
+		Title:  RedactSensitive(issue.Title),
+		Body:   RedactSensitive(issue.Body),
 		Labels: labels,
 	}
 }

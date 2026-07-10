@@ -637,6 +637,14 @@ type SupervisorTarget struct {
 	// fresh rewrite refreshes the pending approval in place rather than piling
 	// up a duplicate.
 	Body string `json:"body,omitempty"`
+	// BaseBodyHash is the digest of the issue body the edit_issue_body rewrite
+	// was groomed against, stamped at mint time (#851 review). On approve the
+	// executor re-fetches the live body and refuses the edit if its hash no
+	// longer matches — so a manual edit made after the proposal was minted is
+	// never silently clobbered. Like Body, it is intentionally NOT part of
+	// approvalTargetsEqual so a fresh re-groom refreshes the pending approval
+	// in place.
+	BaseBodyHash string `json:"base_body_hash,omitempty"`
 }
 
 type SupervisorIssueTarget struct {
@@ -1120,6 +1128,17 @@ type State struct {
 	// concurrent orchestrator Save cannot clobber a fresh lint mark.
 	SpecLintTracks map[int]SpecLintTrack `json:"spec_lint_tracks,omitempty"`
 
+	// SpecGroomCursor is the issue number where the last spec-groom cycle
+	// stopped examining (#851 review). The per-cycle cap only lets a bounded
+	// window of open issues be examined (comment fetch + LLM pass); the cursor
+	// lets the next cycle resume just past that window and wrap around, so a
+	// repo with more open issues than the cap eventually drains every issue
+	// instead of forever re-examining the same first N and starving the tail.
+	// Best-effort: it only steers which window runs, never lint/groom
+	// idempotency (guaranteed by SpecLintTracks), so a merge that keeps the
+	// on-disk value simply re-examines a window and self-heals next cycle.
+	SpecGroomCursor int `json:"spec_groom_cursor,omitempty"`
+
 	loadedHash  string
 	loadedState *State
 }
@@ -1510,6 +1529,7 @@ func (s *State) copyFrom(src *State) {
 	s.BackendHealth = src.BackendHealth
 	s.BackendQuotaUsage = src.BackendQuotaUsage
 	s.SpecLintTracks = src.SpecLintTracks
+	s.SpecGroomCursor = src.SpecGroomCursor
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
 	s.SpawnDrain = src.SpawnDrain

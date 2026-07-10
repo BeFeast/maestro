@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -29,6 +30,12 @@ type fakeGH struct {
 	closeErr      error
 	labelErr      error
 	editBodyErr   error
+
+	// issueBody is what IssueBody returns (the "current" live body used by
+	// executeEditIssueBody's stale-edit guard); issueBodyErr forces a fetch
+	// failure.
+	issueBody    string
+	issueBodyErr error
 
 	// #547 stubs for PRMergeStatus.
 	mergeable      string
@@ -81,6 +88,12 @@ func (f *fakeGH) EditIssueBody(issue int, body string) error {
 	}
 	f.editBodyCalls = append(f.editBodyCalls, editBodyCall{issue: issue, body: body})
 	return nil
+}
+func (f *fakeGH) IssueBody(issue int) (string, error) {
+	if f.issueBodyErr != nil {
+		return "", f.issueBodyErr
+	}
+	return f.issueBody, nil
 }
 
 type fakeWT struct {
@@ -477,6 +490,62 @@ func TestExecute_EditIssueBody_PropagatesGitHubError(t *testing.T) {
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
 		t.Fatalf("expected execution_failed with err, got %+v", res)
+	}
+}
+
+// TestExecute_EditIssueBody_RefusesStaleBody pins the #851-review guard: if the
+// live issue body changed after the rewrite was proposed (BaseBodyHash no longer
+// matches), the executor must refuse rather than clobber the intervening edit.
+func TestExecute_EditIssueBody_RefusesStaleBody(t *testing.T) {
+	gh := &fakeGH{issueBody: "the CURRENT body after a manual edit"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	base := specgroom.BodyHash("the body the rewrite was groomed against")
+	a := mkApproval(config.SupervisorActionEditIssueBody,
+		&state.SupervisorTarget{Issue: 12, Body: "## Summary\nGroomed", BaseBodyHash: base}, "apply", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("a body that changed since the proposal must fail, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 0 {
+		t.Fatalf("must not overwrite an intervening edit: %+v", gh.editBodyCalls)
+	}
+}
+
+// TestExecute_EditIssueBody_AppliesWhenBaseBodyMatches confirms the guard is not
+// over-eager: when the live body still matches what was groomed, the rewrite is
+// applied.
+func TestExecute_EditIssueBody_AppliesWhenBaseBodyMatches(t *testing.T) {
+	const current = "the exact body the rewrite was groomed against"
+	gh := &fakeGH{issueBody: current}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody,
+		&state.SupervisorTarget{Issue: 12, Body: "## Summary\nGroomed", BaseBodyHash: specgroom.BodyHash(current)}, "apply", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("a matching base body should apply, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 1 || gh.editBodyCalls[0].body != "## Summary\nGroomed" {
+		t.Fatalf("expected the rewrite applied once: %+v", gh.editBodyCalls)
+	}
+}
+
+// TestExecute_EditIssueBody_StaleGuardFailsClosedOnFetchError verifies the guard
+// fails closed: if the live body cannot be re-read, the executor refuses rather
+// than apply a possibly-stale overwrite.
+func TestExecute_EditIssueBody_StaleGuardFailsClosedOnFetchError(t *testing.T) {
+	gh := &fakeGH{issueBodyErr: errors.New("gh down")}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionEditIssueBody,
+		&state.SupervisorTarget{Issue: 12, Body: "x", BaseBodyHash: "somehash"}, "apply", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("a failed body fetch must fail closed, got %+v", res)
+	}
+	if len(gh.editBodyCalls) != 0 {
+		t.Fatalf("must not edit when the guard cannot verify the live body: %+v", gh.editBodyCalls)
 	}
 }
 
