@@ -1,0 +1,52 @@
+name: Runbook / Docs change
+description: Fix or add documentation or runbook content so a worker can land the change hands-off
+title: "docs: <short description>"
+labels:
+  - documentation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for documentation and runbook changes — prose, examples, missing steps, stale
+        commands. For a code defect use **Bug**; for a config/ops change use **Infra / Ops change**.
+        Do **not** apply `maestro-ready` yourself; a reviewer applies it once the request is complete.
+
+  - type: input
+    id: doc
+    attributes:
+      label: Which doc
+      description: Repo-relative path of the doc (or the doc to create).
+      placeholder: docs/agent-lint-runbook.md
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong or missing
+      description: The specific gap or error — quote the offending lines or name the missing section.
+      placeholder: |
+        The "Self-test" section references `--self-check`, but the flag is `--self-test`
+        (see .github/workflows/agent-lint.yml). A reader copy-pasting the command gets an error.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed change
+      description: Optional. Sketch the new/edited text or an outline. Leave blank if you only know the gap.
+      placeholder: |
+        Replace `--self-check` with `--self-test` and add a one-line note that CI runs it on every PR.
+
+  - type: textarea
+    id: done
+    attributes:
+      label: Done criteria
+      description: How a reviewer confirms the doc is right — concrete, checkable statements.
+      value: |
+        - [ ] The doc reflects the current behavior / commands.
+        - [ ] Examples are copy-pasteable and run as written.
+        - [ ] Links and cross-references resolve.
+    validations:
+      required: true

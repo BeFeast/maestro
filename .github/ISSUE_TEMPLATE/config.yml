@@ -1,0 +1,12 @@
+# Free-form (blank) issues are disabled so intake lands pre-structured by type.
+# Pick the template that matches the work: Spec (feature), Bug, Runbook / Docs,
+# Infra / Ops, or Handoff Epic. Structured issues rank higher for supervisor
+# pickup and digest "Promotable" ranking, so a template is never busywork.
+blank_issues_enabled: false
+contact_links:
+  - name: Which template should I use?
+    url: https://github.com/BeFeast/maestro/blob/main/docs/po-spec-workflow.md#which-template-for-what
+    about: Guide to picking a template and writing an issue that is ready for Maestro pickup.
+  - name: How handoff epics work
+    url: https://github.com/BeFeast/maestro/blob/main/docs/handoff-epic-format.md
+    about: The Epic title/label contract, Issue Wave slice list, and child-issue layout the supervisor planner reads.

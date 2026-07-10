@@ -1,0 +1,93 @@
+name: Bug
+description: Report a defect with repro and evidence so a Maestro worker can fix it hands-off
+title: "bug: <short description>"
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        File one bug per report. Fill every required section — a worker fixes this from the
+        issue alone, so vagueness turns into a wrong or partial PR.
+        Do **not** apply `maestro-ready` yourself; a reviewer applies it once the report is
+        complete and the supervisor picks it up from there.
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: What actually happens. State it as a fact, not a guess.
+      placeholder: |
+        `maestro outcome check` reports `healthy` for a project whose runtime container has
+        been down for 20 minutes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen instead, and where that expectation comes from (doc, prior behavior, acceptance criterion).
+      placeholder: |
+        Outcome health should flip to `failing` within one supervisor cycle when the container
+        is not running, per docs/handoff-epic-format.md "runtime health is the ground truth".
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro / evidence
+      description: |
+        Minimal steps to reproduce, plus evidence a worker can trace: log excerpts, session IDs
+        (e.g. `sup-301`), PR/issue numbers, commit SHAs, `curl`/`jq` output. Redact secrets.
+      placeholder: |
+        1. Stop the runtime container: `docker stop maestro-<project>`
+        2. Wait one supervisor cycle (~2 min)
+        3. `curl -fsS http://127.0.0.1:8786/api/v1/fleet | jq '.outcome.health_state'` → still "healthy"
+
+        Session: sup-274 · Log: `journalctl -u maestro.service --since "10:00"` shows no health probe.
+    validations:
+      required: true
+
+  - type: textarea
+    id: surface
+    attributes:
+      label: Affected surface
+      description: Which package / service / host / UI is involved. Point at the code path if you know it.
+      placeholder: |
+        internal/supervisor/outcome.go — health probe; maestro.service on workshop.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: How a reviewer confirms the fix — a concrete check, not "it works now".
+      placeholder: |
+        - Repeat the repro; health flips to `failing` within one cycle.
+        - `go test ./internal/supervisor/...` covers the down-container case.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Optional. Related things the fix must NOT touch, to keep the PR focused.
+      placeholder: |
+        - Do not change the fleet refresh interval.
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority hint
+      description: Reporter's desired priority; a reviewer applies the actual P-label.
+      options:
+        - P0 — critical, drop other work
+        - P1 — high, schedule next
+        - P2 — medium, queue normally
+        - P3 — low, opportunistic
+    validations:
+      required: true
