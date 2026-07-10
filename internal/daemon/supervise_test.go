@@ -42,7 +42,7 @@ func TestRunSuperviseRespondsToKick(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		runSupervise(ctx, "test-kick", func() *config.Config { return cfg }, 60*time.Second, kickCh)
+		runSupervise(ctx, "test-kick", func() *config.Config { return cfg }, nil, 60*time.Second, nil, kickCh)
 		close(done)
 	}()
 
@@ -97,7 +97,7 @@ func TestRunSuperviseStartupCycleRunsOnce(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runSupervise(ctx, "test-once", func() *config.Config { return cfg }, 500*time.Millisecond, nil)
+		runSupervise(ctx, "test-once", func() *config.Config { return cfg }, nil, 500*time.Millisecond, nil, nil)
 		close(done)
 	}()
 
@@ -145,7 +145,7 @@ func TestRunSuperviseCancelsCleanlyWhileWaitingForRunOnce(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runSupervise(ctx, "test-cancel", func() *config.Config { return cfg }, 100*time.Millisecond, nil)
+		runSupervise(ctx, "test-cancel", func() *config.Config { return cfg }, nil, 100*time.Millisecond, nil, nil)
 		close(done)
 	}()
 
@@ -189,7 +189,7 @@ func TestRunSuperviseKickTracksInflightGoroutine(t *testing.T) {
 	kickCh := make(chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
-		runSupervise(ctx, "test-track", func() *config.Config { return cfg }, 100*time.Millisecond, kickCh)
+		runSupervise(ctx, "test-track", func() *config.Config { return cfg }, nil, 100*time.Millisecond, nil, kickCh)
 		close(done)
 	}()
 
@@ -236,7 +236,7 @@ func TestRunSuperviseMultipleKicksTracksEachGoroutine(t *testing.T) {
 	kickCh := make(chan struct{}, 10)
 	done := make(chan struct{})
 	go func() {
-		runSupervise(ctx, "test-multi-kick", func() *config.Config { return cfg }, 100*time.Millisecond, kickCh)
+		runSupervise(ctx, "test-multi-kick", func() *config.Config { return cfg }, nil, 100*time.Millisecond, nil, kickCh)
 		close(done)
 	}()
 
@@ -280,7 +280,7 @@ func TestRunSuperviseKickWhileWaitingForRunOnce(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		runSupervise(ctx, "test-kick-wait", func() *config.Config { return cfg }, 60*time.Second, kickCh)
+		runSupervise(ctx, "test-kick-wait", func() *config.Config { return cfg }, nil, 60*time.Second, nil, kickCh)
 		close(done)
 	}()
 
