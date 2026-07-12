@@ -472,3 +472,68 @@ func TestAmendHead_NarrowRefspec_MissingBranchReportedDistinctly(t *testing.T) {
 	}
 	_ = branch
 }
+
+// A same-named tag must never be mistaken for either the remote branch tip or
+// the local push source. Fully qualified fetch and HEAD:refs/heads/<branch> push
+// refspecs keep the entire amend anchored to the branch.
+func TestAmendHead_NarrowRefspec_SameNamedTagUsesBranch(t *testing.T) {
+	origin, wt, seed, branch := setupNarrowAmendRepo(t)
+
+	// Point the ambiguous tag at main so it is deliberately different from the
+	// feature branch head.
+	amendGit(t, seed, "tag", branch, "main")
+	amendGit(t, seed, "push", "origin", "refs/tags/"+branch)
+	branchOID := amendGit(t, origin, "rev-parse", "refs/heads/"+branch)
+	tagOID := amendGit(t, origin, "rev-parse", "refs/tags/"+branch)
+	if branchOID == tagOID {
+		t.Fatal("test precondition failed: same-named tag and branch point to the same object")
+	}
+
+	if err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), time.Now().UTC()); err != nil {
+		t.Fatalf("amend with same-named tag: %v", err)
+	}
+	branchMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", "refs/heads/"+branch)
+	if n := trailerCount(branchMsg); n != 1 {
+		t.Fatalf("branch trailer count = %d, want 1:\n%s", n, branchMsg)
+	}
+	if got := amendGit(t, origin, "rev-parse", "refs/tags/"+branch); got != tagOID {
+		t.Fatalf("same-named tag moved: got %s, want %s", got, tagOID)
+	}
+	tagMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", "refs/tags/"+branch)
+	if strings.Contains(tagMsg, state.AttributionTrailerKey+":") {
+		t.Fatalf("attribution landed on the tag target instead of only the branch:\n%s", tagMsg)
+	}
+}
+
+// If a previous process amended a local-ahead commit and stopped before its
+// push, the next cycle sees a local head that already carries the trailer while
+// the remote remains on its ancestor. That is not success yet: publish the
+// attributed local head under the explicit lease.
+func TestAmendHead_NarrowRefspec_LocalAheadAlreadyAttributedIsPushed(t *testing.T) {
+	origin, wt, _, branch := setupNarrowAmendRepo(t)
+	now := time.Date(2026, 7, 12, 4, 5, 0, 0, time.UTC)
+
+	amendWrite(t, wt, "local-ahead.txt", "work completed before daemon restart\n")
+	amendGit(t, wt, "add", "local-ahead.txt")
+	msg := "worker: local follow-up\n\n" + state.FormatAttributionTrailer(testAttribution(), now)
+	amendGit(t, wt, "commit", "-m", msg)
+	localHead := amendGit(t, wt, "rev-parse", "HEAD")
+	remoteBefore := amendGit(t, origin, "rev-parse", "refs/heads/"+branch)
+	if localHead == remoteBefore {
+		t.Fatal("test precondition failed: local head is not ahead of the remote")
+	}
+
+	if err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), now); err != nil {
+		t.Fatalf("publish already-attributed local-ahead head: %v", err)
+	}
+	if got := amendGit(t, origin, "rev-parse", "refs/heads/"+branch); got != localHead {
+		t.Fatalf("remote head = %s, want attributed local head %s", got, localHead)
+	}
+	remoteMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", "refs/heads/"+branch)
+	if n := trailerCount(remoteMsg); n != 1 {
+		t.Fatalf("remote trailer count = %d, want 1:\n%s", n, remoteMsg)
+	}
+	if got := amendGit(t, origin, "show", "refs/heads/"+branch+":local-ahead.txt"); !strings.Contains(got, "completed") {
+		t.Fatalf("local-ahead work was not published: %q", got)
+	}
+}

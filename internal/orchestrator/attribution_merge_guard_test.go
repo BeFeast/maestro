@@ -77,6 +77,44 @@ func TestAutoMergePRs_DeferredAttributionBlocksMerge(t *testing.T) {
 	}
 }
 
+// An unexpected amend failure is just as unsafe as a known deferral: the
+// trailer is not known to be on the remote, so the merge path must fail closed
+// before querying CI or attempting the merge.
+func TestAutoMergePRs_UnexpectedAttributionFailureBlocksMerge(t *testing.T) {
+	branch := "feat/sup-873-amend-error"
+	s := state.NewState()
+	s.Sessions["sup-873"] = mergeGuardSession(branch, 875)
+
+	ciQueried := false
+	merged := false
+	o := &Orchestrator{
+		cfg: &config.Config{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 875, HeadRefName: branch}}, nil
+		},
+		amendHeadFn: func(worktreePath, b string, attribution []state.BackendAttribution, now time.Time) error {
+			return errors.New("ordinary git failure")
+		},
+		ghPRCIStatusFn: func(prNumber int) (string, error) {
+			ciQueried = true
+			return "success", nil
+		},
+		ghMergePRFn: func(prNumber int) error {
+			merged = true
+			return nil
+		},
+	}
+
+	o.autoMergePRs(s)
+
+	if merged {
+		t.Fatal("unexpected attribution failure must block the merge")
+	}
+	if ciQueried {
+		t.Fatal("unexpected attribution failure must short-circuit before CI is queried")
+	}
+}
+
 // The guard is specific to the deferral: when the attribution amend lands (or is
 // a no-op), autoMergePRs proceeds past the attribution step into the normal
 // merge flow (here it reaches the CI query). This proves the guard does not

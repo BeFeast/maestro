@@ -3134,10 +3134,10 @@ func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *s
 		log.Printf("[orch] attribution: deferring amend for %s (could not fetch remote branch %q: %v; will retry next cycle)", slotName, sess.Branch, err)
 		return true
 	default:
-		// An unexpected git failure (not a known deferral). Log it; the merge flow
-		// continues as before, but never on a claim that the branch is advancing.
-		log.Printf("[orch] attribution: could not amend branch %q for %s: %v", sess.Branch, slotName, err)
-		return false
+		// Any unexpected amend failure means the trailer is not known to be on
+		// the remote. Fail closed: block the merge and retry on a later cycle.
+		log.Printf("[orch] attribution: deferring amend for %s (could not amend branch %q: %v; will retry next cycle)", slotName, sess.Branch, err)
+		return true
 	}
 }
 
@@ -3310,17 +3310,19 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 			return fmt.Errorf("git log -1: %w\n%s", err, out)
 		}
 		msg := state.AppendAttributionTrailer(string(out), attribution, now)
-		if msg == string(out) {
+		if msg == string(out) && base == remoteOID {
 			// Trailer already present on this head (idempotent — a prior cycle
 			// landed it, or we reset onto an already-attributed remote head), so
 			// there is nothing to push and never a duplicate.
 			return nil
 		}
 
-		cmd := amendGitCommand(worktreePath, "commit", "--amend", "-F", "-")
-		cmd.Stdin = strings.NewReader(msg)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("git commit --amend: %w\n%s", err, out)
+		if msg != string(out) {
+			cmd := amendGitCommand(worktreePath, "commit", "--amend", "-F", "-")
+			cmd.Stdin = strings.NewReader(msg)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("git commit --amend: %w\n%s", err, out)
+			}
 		}
 
 		if amendPushRaceHook != nil {
@@ -3332,8 +3334,9 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		// expectation from refs/remotes/origin/<branch>, which a narrow-refspec
 		// checkout lacks — there git rejects every push as "stale info" and wedges
 		// a quiet branch forever (#873).
+		remoteRef := "refs/heads/" + branch
 		pushOut, pushErr := amendGitCommand(worktreePath, "push",
-			"--force-with-lease=refs/heads/"+branch+":"+remoteOID, "origin", branch).CombinedOutput()
+			"--force-with-lease="+remoteRef+":"+remoteOID, "origin", "HEAD:"+remoteRef).CombinedOutput()
 		if pushErr == nil {
 			return nil // trailer landed exactly once
 		}
@@ -3350,7 +3353,7 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		}
 
 		if !isStaleInfoLeaseRejection(string(pushOut)) {
-			return fmt.Errorf("git push --force-with-lease origin %s: %w\n%s", branch, pushErr, pushOut)
+			return fmt.Errorf("git push --force-with-lease origin HEAD:%s: %w\n%s", remoteRef, pushErr, pushOut)
 		}
 
 		// Stale lease: the remote advanced under a concurrent push between our
@@ -3372,13 +3375,16 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 // its OID. It deliberately does NOT rely on a refs/remotes/origin/<branch>
 // tracking ref: a checkout may intentionally track only main (narrow fetch
 // refspec `+refs/heads/main:refs/remotes/origin/main`), so that ref never exists.
-// `git fetch origin <branch>` updates FETCH_HEAD regardless of the configured
-// refspec and without broadening or rewriting it (#873). A fetch failure —
-// missing remote branch, auth, or network — is wrapped in errAmendFetchFailed so
-// the caller reports it distinctly rather than as an advancing race.
+// `git fetch origin refs/heads/<branch>` updates FETCH_HEAD regardless of the
+// configured refspec and without broadening or rewriting it. The fully qualified
+// source ref prevents a same-named tag from being selected instead of the branch
+// tip (#873). A fetch failure — missing remote branch, auth, or network — is
+// wrapped in errAmendFetchFailed so the caller reports it distinctly rather than
+// as an advancing race.
 func fetchRemoteBranchOID(worktreePath, branch string) (string, error) {
-	if out, err := amendGitCommand(worktreePath, "fetch", "origin", branch).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("%w: git fetch origin %s: %v\n%s", errAmendFetchFailed, branch, err, out)
+	remoteRef := "refs/heads/" + branch
+	if out, err := amendGitCommand(worktreePath, "fetch", "origin", remoteRef).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("%w: git fetch origin %s: %v\n%s", errAmendFetchFailed, remoteRef, err, out)
 	}
 	oidRaw, err := amendGitCommand(worktreePath, "rev-parse", "FETCH_HEAD").CombinedOutput()
 	if err != nil {
