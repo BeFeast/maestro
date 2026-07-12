@@ -290,6 +290,96 @@ func TestApprove_ConcurrentClaimOnce_SeparateConnections(t *testing.T) {
 	}
 }
 
+// #866: MarkStale reconciles a moot pending approval to stale, mirrors the
+// audit entry, and is idempotent — a second call neither errors nor appends a
+// duplicate audit row.
+func TestMarkStale_ReconcilesMootPendingApproval(t *testing.T) {
+	s := openTestStore(t)
+	seedPending(t, s, "rp1", "spawn_repair_worker", &state.SupervisorTarget{Issue: 858, PR: 864})
+
+	got, err := s.MarkStale(context.Background(), testStateDir, "rp1", time.Now().UTC(), "issue #858 resolved (verified merge) — repair worker moot")
+	if err != nil {
+		t.Fatalf("mark stale: %v", err)
+	}
+	if got.Status != state.ApprovalStatusStale {
+		t.Fatalf("status = %q, want stale", got.Status)
+	}
+	if n := auditCount(t, s, "rp1"); n != 2 {
+		t.Fatalf("audit rows = %d, want 2 (created + stale)", n)
+	}
+
+	// Idempotent: second reconcile is a no-op, no duplicate audit row.
+	again, err := s.MarkStale(context.Background(), testStateDir, "rp1", time.Now().UTC(), "again")
+	if err != nil {
+		t.Fatalf("second mark stale: %v", err)
+	}
+	if again.Status != state.ApprovalStatusStale {
+		t.Fatalf("second status = %q, want stale", again.Status)
+	}
+	if n := auditCount(t, s, "rp1"); n != 2 {
+		t.Fatalf("audit rows after re-reconcile = %d, want 2 (idempotent)", n)
+	}
+}
+
+// #866: an approved-but-awaiting_dispatch repair approval (its worker not yet
+// spawned) is reconciled to stale when the issue resolves under it, so the
+// SQLite claim arbiter agrees with the JSON state that dispatch is moot.
+func TestMarkStale_AwaitingDispatchTransitions(t *testing.T) {
+	s := openTestStore(t)
+	seedPending(t, s, "rp2", "spawn_repair_worker", &state.SupervisorTarget{Issue: 858})
+	if _, err := s.Approve(context.Background(), testStateDir, "rp2", time.Now().UTC(), "x", ""); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := s.MarkAwaitingDispatch(context.Background(), testStateDir, "rp2", time.Now().UTC(), "x", "queued"); err != nil {
+		t.Fatalf("mark awaiting dispatch: %v", err)
+	}
+	got, err := s.MarkStale(context.Background(), testStateDir, "rp2", time.Now().UTC(), "issue #858 closed — repair worker moot")
+	if err != nil {
+		t.Fatalf("mark stale: %v", err)
+	}
+	if got.Status != state.ApprovalStatusStale {
+		t.Fatalf("status = %q, want stale (awaiting_dispatch is active)", got.Status)
+	}
+}
+
+func TestMarkStale_NotFound(t *testing.T) {
+	s := openTestStore(t)
+	if _, err := s.MarkStale(context.Background(), testStateDir, "missing", time.Now().UTC(), "gone"); !errors.Is(err, state.ErrApprovalNotFound) {
+		t.Fatalf("err = %v, want ErrApprovalNotFound", err)
+	}
+}
+
+// #866: ReconcileMoot is the gate-level mirror. In json mode it is a pure
+// no-op; in sqlite mode it stales the row and tolerates a missing row (an
+// approval that was never approved has no SQLite row to reconcile).
+func TestReconcileMoot(t *testing.T) {
+	s := openTestStore(t)
+	seedPending(t, s, "gm1", "spawn_repair_worker", &state.SupervisorTarget{Issue: 858, PR: 864})
+	sqliteBind := Binding{Mode: ModeSQLite, StateDir: testStateDir, Handle: s}
+
+	// json mode: no-op even though the handle could reach the row.
+	jsonBind := Binding{Mode: ModeJSON, StateDir: testStateDir, Handle: s}
+	if err := ReconcileMoot(jsonBind, "gm1", time.Now().UTC(), "moot"); err != nil {
+		t.Fatalf("json ReconcileMoot: %v", err)
+	}
+	if got, _ := s.Get(context.Background(), testStateDir, "gm1"); got.Status != state.ApprovalStatusPending {
+		t.Fatalf("json mode changed status to %q, want pending (no-op)", got.Status)
+	}
+
+	// sqlite mode: reconciles the row to stale.
+	if err := ReconcileMoot(sqliteBind, "gm1", time.Now().UTC(), "issue #858 resolved — repair worker moot"); err != nil {
+		t.Fatalf("sqlite ReconcileMoot: %v", err)
+	}
+	if got, _ := s.Get(context.Background(), testStateDir, "gm1"); got.Status != state.ApprovalStatusStale {
+		t.Fatalf("sqlite mode status = %q, want stale", got.Status)
+	}
+
+	// Missing row (never approved → never seeded) is tolerated.
+	if err := ReconcileMoot(sqliteBind, "never-seeded", time.Now().UTC(), "moot"); err != nil {
+		t.Fatalf("ReconcileMoot on missing row = %v, want nil (tolerated)", err)
+	}
+}
+
 func TestMarkExecuted_Idempotent(t *testing.T) {
 	s := openTestStore(t)
 	seedPending(t, s, "m1", "merge_pr", &state.SupervisorTarget{PR: 3})

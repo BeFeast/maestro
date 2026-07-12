@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mission"
@@ -101,6 +102,13 @@ type Orchestrator struct {
 
 	// Mission processor (nil when missions disabled)
 	missionProc *mission.Processor
+
+	// approvalsBinding, when SetApprovalStore is called, lets the standing
+	// repair-approval reconciler (#866) mirror a moot-approval stale transition
+	// into the same unified SQLite approval store the fleet approve/reject
+	// endpoint uses, so JSON state and SQLite never diverge under
+	// --approvals-store sqlite. Zero value (ModeJSON) makes the mirror a no-op.
+	approvalsBinding approvalstore.Binding
 
 	// Config hot-reload channel (nil = disabled, safe in select)
 	configReloadCh <-chan *config.Config
@@ -211,6 +219,25 @@ func (o *Orchestrator) SetReadSource(src githubReadSource) {
 // claims no new issues and spawns no new workers. Passing nil clears the gate.
 func (o *Orchestrator) SetEmergencyHalt(fn func() bool) {
 	o.emergencyHaltFn = fn
+}
+
+// SetApprovalStore configures which approval store the orchestrator's standing
+// repair-approval reconciler (#866) mirrors a moot-approval stale transition
+// into. mode/dbPath come from the daemon's --approvals-store/--approvals-db
+// flags (the same pair the fleet approve/reject endpoint uses); StateDir and
+// Repo are taken from the orchestrator config at reconcile time. An unparseable
+// mode falls back to json (mirror is a no-op) and is logged rather than fatal —
+// the JSON reconciliation, which the fleet dashboard reads, still happens.
+func (o *Orchestrator) SetApprovalStore(mode, dbPath string) {
+	if o == nil {
+		return
+	}
+	m, err := approvalstore.ParseMode(mode)
+	if err != nil {
+		log.Printf("[orch] invalid --approvals-store %q; repair-approval reconcile mirrors to JSON only: %v", mode, err)
+		m = approvalstore.ModeJSON
+	}
+	o.approvalsBinding = approvalstore.Binding{Mode: m, DBPath: dbPath}
 }
 
 func (o *Orchestrator) pidAlive(pid int) bool {
@@ -2226,6 +2253,15 @@ func (o *Orchestrator) RunOnce() error {
 	// covers sessions that reached code_landed before the verifier was available
 	// or where the verifier passed on a later cycle.
 	o.reconcileCodeLandedSessions(s)
+
+	// Step 3b2: Standing reconciliation of moot spawn_repair_worker approvals
+	// (#866). Independent of the exact done-transition cycle, this stales any
+	// repair approval whose target issue already reached a terminal state (a
+	// done session, or the issue closed on GitHub), so a transition lost to a
+	// conflicting concurrent state save self-heals here instead of aging past
+	// SLA as a false operator gate. Runs after checkSessions/reconcileCodeLanded
+	// so freshly-done sessions are already reflected in state.
+	o.reconcileResolvedRepairApprovals(s)
 
 	// Step 3c: Observe-merge self-deploy (#751). A PR merged outside the
 	// orchestrator's own merge path (GitHub UI, manual `gh pr merge`, or the
@@ -4869,6 +4905,140 @@ func (o *Orchestrator) holdForLiveVerification(sess *state.Session, prNumber int
 	sess.LiveVerificationNotified = true
 }
 
+// reconcileResolvedRepairApprovals is the standing, idempotent safety net for
+// #866. The edge-triggered stale calls in verifyOutcomeAfterMerge /
+// reconcileCodeLandedSessions fire only in the exact cycle a session transitions
+// to done; if that save is rolled back by a conflicting concurrent write (the
+// supervisor re-recording the same approval, a dashboard action, a merge landing
+// on disk between load and save), the session is already done next cycle and
+// neither edge re-fires — the spawn_repair_worker approval then ages past SLA as
+// a false operator gate, exactly the #858 dogfood incident. This pass runs every
+// cycle and re-derives the transition for any active repair approval whose target
+// issue has reached a terminal state (a done session, or the issue closed on
+// GitHub), so reconciliation converges regardless of which cycle first missed it
+// and survives a daemon restart. markApprovalStale is a no-op once stale, so it
+// is safe to run every cycle; unrelated approvals are never touched.
+func (o *Orchestrator) reconcileResolvedRepairApprovals(s *state.State) {
+	if o == nil || s == nil {
+		return
+	}
+	issues := s.ActiveSpawnRepairWorkerApprovalIssues()
+	if len(issues) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	for _, issue := range issues {
+		resolved, reason := o.repairApprovalIssueResolved(s, issue)
+		if !resolved {
+			continue
+		}
+		o.reconcileMootRepairApprovals(s, issue, now, reason)
+	}
+}
+
+// repairApprovalIssueResolved reports whether a spawn_repair_worker approval for
+// issue is moot: its target work reached a terminal state. An active session
+// always takes precedence over an older done session for the same issue, because
+// the active session may be the very repair the approval controls. When no
+// session is active, a done session is authoritative and needs no GitHub read
+// only when no terminal-failure session also exists. A failed/dead/conflicted/
+// retry-exhausted session means the issue may have reopened or a newer repair
+// may still be needed, so it takes precedence over the done shortcut and falls
+// through to the GitHub issue check. Otherwise the issue is treated as resolved
+// when closed (the externally-closed path). A GitHub read error is reported
+// unresolved so a legitimately-pending repair approval is never staled out from
+// under an operator.
+func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (bool, string) {
+	activeSession := false
+	doneSession := false
+	failedSession := false
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issue {
+			continue
+		}
+		if sess.Status == state.StatusDone {
+			doneSession = true
+		}
+		if state.IsTerminal(sess.Status) && sess.Status != state.StatusDone {
+			failedSession = true
+		}
+		if repairIssueSessionActive(sess.Status) {
+			activeSession = true
+		}
+	}
+	if activeSession {
+		return false, ""
+	}
+	if doneSession && !failedSession {
+		return true, fmt.Sprintf("issue #%d resolved (session done) — repair worker moot", issue)
+	}
+	closed, err := o.isIssueClosed(issue)
+	if err != nil {
+		log.Printf("[orch] repair-approval reconcile: issue #%d closed-state check failed; leaving approval pending: %v", issue, err)
+		return false, ""
+	}
+	if closed {
+		return true, fmt.Sprintf("issue #%d closed — repair worker moot", issue)
+	}
+	return false, ""
+}
+
+// repairIssueSessionActive reports whether a session status means the issue is
+// still being worked, so a repair approval is not yet moot. The terminal-failure
+// statuses (failed/dead/conflict_failed/retry_exhausted) are deliberately NOT
+// active: with those the repair approval may be legitimate, so resolution falls
+// through to the GitHub issue-closed check rather than assuming the issue open.
+func repairIssueSessionActive(status state.SessionStatus) bool {
+	switch status {
+	case state.StatusQueued, state.StatusRunning, state.StatusPROpen, state.StatusCodeLanded:
+		return true
+	default:
+		return false
+	}
+}
+
+// reconcileMootRepairApprovals stales every active spawn_repair_worker approval
+// targeting issue, emits a per-approval operator journal record (approval id +
+// issue/PR target + terminal-outcome reason), and mirrors the terminal
+// transition into the SQLite approval store when one is configured. It is the
+// single reconcile path shared by the edge-triggered post-merge/outcome callers
+// and the standing reconciler, so every path journals and persists identically
+// (#866). Returns the number staled.
+func (o *Orchestrator) reconcileMootRepairApprovals(s *state.State, issue int, now time.Time, reason string) int {
+	staled := s.StaleSpawnRepairWorkerApprovalsForResolvedIssue(issue, now, reason)
+	for i := range staled {
+		ap := staled[i]
+		pr := 0
+		if ap.Target != nil {
+			pr = ap.Target.PR
+		}
+		log.Printf("[orch] reconciled moot spawn_repair_worker approval %s (issue #%d, PR #%d): %s", ap.ID, issue, pr, reason)
+		if o.approvalsBinding.UseSQLite() {
+			b := o.approvalsBinding
+			b.StateDir = o.cfg.StateDir
+			b.Repo = o.repo
+			b.Project = o.repo
+			if err := approvalstore.ReconcileMoot(b, ap.ID, now, reason); err != nil {
+				log.Printf("[orch] approval %s stale mirror to SQLite failed (JSON already reconciled, retried next cycle): %v", ap.ID, err)
+			}
+		}
+	}
+	return len(staled)
+}
+
+// reconcileMootRepairApprovalsAfterResolution is the edge-triggered counterpart
+// to the standing reconciler. A session may have just reached done while another
+// same-issue session is still active; in that case the repair approval is not
+// moot and must survive. Reuse the same full-session resolution check before
+// staling by issue number so edge and standing paths cannot disagree (#866).
+func (o *Orchestrator) reconcileMootRepairApprovalsAfterResolution(s *state.State, issue int, now time.Time, reason string) int {
+	resolved, _ := o.repairApprovalIssueResolved(s, issue)
+	if !resolved {
+		return 0
+	}
+	return o.reconcileMootRepairApprovals(s, issue, now, reason)
+}
+
 func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 	if o == nil || o.cfg == nil || s == nil {
 		return
@@ -4912,9 +5082,8 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 			if stale > 0 {
 				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
 			}
-			if rstale := s.MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(sess.IssueNumber, now); rstale > 0 {
-				log.Printf("[orch] expired %d stale spawn_repair_worker approval(s) for auto-closed issue #%d", rstale, sess.IssueNumber)
-			}
+			o.reconcileMootRepairApprovalsAfterResolution(s, sess.IssueNumber, now,
+				fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", sess.IssueNumber))
 		}
 	}
 }
@@ -5189,9 +5358,8 @@ func (o *Orchestrator) verifyOutcomeAfterMerge(s *state.State, sess *state.Sessi
 			if stale > 0 {
 				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
 			}
-			if rstale := s.MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(sess.IssueNumber, now); rstale > 0 {
-				log.Printf("[orch] expired %d stale spawn_repair_worker approval(s) for auto-closed issue #%d", rstale, sess.IssueNumber)
-			}
+			o.reconcileMootRepairApprovalsAfterResolution(s, sess.IssueNumber, now,
+				fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", sess.IssueNumber))
 		}
 		o.notifier.Sendf("✅ maestro: outcome verifier passed after PR #%d; issue #%d can be treated as done", prNumber, sess.IssueNumber)
 		return

@@ -345,6 +345,11 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	orchCfg := *cfg
 	orch := orchestrator.New(&orchCfg)
 	orch.SetBinaryVersion(opts.Version)
+	// #866: let the orchestrator's standing repair-approval reconciler mirror a
+	// moot-approval stale transition into the same SQLite approval store the
+	// fleet approve/reject endpoint uses, so JSON state and SQLite never diverge
+	// under --approvals-store sqlite. json mode makes the mirror a no-op.
+	orch.SetApprovalStore(opts.ApprovalsStore, opts.ApprovalsDBPath)
 	// Fleet-wide EMERGENCY STOP spawn gate (#840): the orchestrator consults this
 	// at the top of startNewWorkers each cycle, so an active stop halts new
 	// spawns (and the router LLM calls that only happen inside the spawn loop)

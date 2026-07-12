@@ -187,6 +187,30 @@ func FinalizeExecution(b Binding, id string, status state.ApprovalStatus, now ti
 	return err
 }
 
+// ReconcileMoot mirrors a moot-approval stale transition into the SQLite store
+// after the caller has already recorded it in JSON state (#866). It is a no-op
+// in ModeJSON. A missing row — the common case for an approval that was never
+// approved, so was never seeded into SQLite — is tolerated (there is nothing to
+// reconcile), as is a row already in a terminal status, so a repeated reconcile
+// across cycles, restarts, and concurrent saves never turns into a spurious
+// error. Only the JSON state is authoritative for the fleet read path; this
+// keeps the claim arbiter from diverging.
+func ReconcileMoot(b Binding, id string, now time.Time, reason string) error {
+	if !b.UseSQLite() {
+		return nil
+	}
+	store, cleanup, err := b.resolveStore()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	_, err = store.MarkStale(context.Background(), b.StateDir, id, now, reason)
+	if errors.Is(err, state.ErrApprovalNotFound) {
+		return nil
+	}
+	return err
+}
+
 func applyJSONTransition(st *state.State, verb, id string, now time.Time, actor, reason string) (*state.Approval, error) {
 	switch verb {
 	case "approve":

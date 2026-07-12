@@ -2685,11 +2685,27 @@ func closeIssueApprovalTargetsIssue(approval *Approval, issueNumber int) bool {
 // MarkCloseIssueApprovalsStaleForVerifiedIssue, co-located at the same
 // auto-close trust path.
 func (s *State) MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(issueNumber int, now time.Time) int {
-	if s == nil || issueNumber <= 0 {
-		return 0
-	}
-	count := 0
 	reason := fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", issueNumber)
+	return len(s.StaleSpawnRepairWorkerApprovalsForResolvedIssue(issueNumber, now, reason))
+}
+
+// StaleSpawnRepairWorkerApprovalsForResolvedIssue is the reason-carrying core of
+// MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue. It expires every active
+// (pending/approved/awaiting_dispatch) spawn_repair_worker approval targeting
+// issueNumber and returns the staled approvals (post-transition copies) so the
+// caller can emit a per-approval operator journal record — approval id +
+// issue/PR target — and mirror the terminal transition into the SQLite approval
+// store (#866). The reason distinguishes the terminal outcome (verified merge vs
+// externally closed) in the audit trail. Idempotent: an approval already stale
+// is skipped by markApprovalStale, so re-running returns nothing new.
+func (s *State) StaleSpawnRepairWorkerApprovalsForResolvedIssue(issueNumber int, now time.Time, reason string) []Approval {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = fmt.Sprintf("issue #%d resolved — repair worker moot", issueNumber)
+	}
+	var staled []Approval
 	for i := range s.Approvals {
 		approval := &s.Approvals[i]
 		if approval.Action != approvalActionSpawnRepairWorker || approval.Target == nil || approval.Target.Issue != issueNumber {
@@ -2698,10 +2714,41 @@ func (s *State) MarkSpawnRepairWorkerApprovalsStaleForResolvedIssue(issueNumber 
 		switch approval.Status {
 		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
 			s.markApprovalStale(approval, now, reason)
-			count++
+			staled = append(staled, *approval)
 		}
 	}
-	return count
+	return staled
+}
+
+// ActiveSpawnRepairWorkerApprovalIssues returns the sorted, distinct set of
+// issue numbers that still carry an active (pending/approved/awaiting_dispatch)
+// spawn_repair_worker approval. The orchestrator's standing reconciler (#866)
+// uses it to check only issues with a repair approval actually outstanding,
+// rather than scanning every session or every open issue each cycle.
+func (s *State) ActiveSpawnRepairWorkerApprovalIssues() []int {
+	if s == nil {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Action != approvalActionSpawnRepairWorker || approval.Target == nil || approval.Target.Issue <= 0 {
+			continue
+		}
+		switch approval.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			seen[approval.Target.Issue] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	issues := make([]int, 0, len(seen))
+	for issue := range seen {
+		issues = append(issues, issue)
+	}
+	sort.Ints(issues)
+	return issues
 }
 
 func (s *State) pendingApproval(id string) (*Approval, error) {
