@@ -88,6 +88,36 @@ func TestReconcileResolvedRepairApprovals_DoneSessionSelfHeals(t *testing.T) {
 	}
 }
 
+// A newer active session for an issue must take precedence over an older done
+// session. Otherwise the standing reconciler can stale the approval controlling
+// the active repair and make legitimate work disappear.
+func TestReconcileResolvedRepairApprovals_ActiveSessionOutranksOlderDone(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 47, 0, 0, time.UTC)
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo"},
+		notifier: &notify.Notifier{},
+		isIssueClosedFn: func(issue int) (bool, error) {
+			t.Fatalf("active issue #%d must not fall through to a GitHub closed-state check", issue)
+			return false, nil
+		},
+	}
+
+	s := state.NewState()
+	s.Sessions = map[string]*state.Session{
+		"sup-old": {IssueNumber: 858, Status: state.StatusDone, PRNumber: 864},
+		"sup-new": {IssueNumber: 858, Status: state.StatusRunning},
+	}
+	s.Approvals = []state.Approval{
+		repairApproval("ap-repair-858-active", 858, 864, state.ApprovalStatusPending, now),
+	}
+
+	o.reconcileResolvedRepairApprovals(s)
+
+	if got := approvalStatus(t, s, "ap-repair-858-active"); got != state.ApprovalStatusPending {
+		t.Fatalf("repair approval with active session = %q, want pending", got)
+	}
+}
+
 // TestReconcileResolvedRepairApprovals_ExternallyClosedIssue covers the
 // externally-closed reconciliation path: an issue with no done session but
 // closed on GitHub is reconciled; an issue that is still open (a failed session
