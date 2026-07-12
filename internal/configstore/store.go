@@ -241,7 +241,9 @@ func (s *Store) ExportDir(ctx context.Context, dir string) error {
 }
 
 func importProject(ctx context.Context, tx *sql.Tx, sourcePath string, data []byte) error {
-	if _, err := config.Parse(data); err != nil {
+	// Import is a create/edit write path: strict-decode so a misspelled field in
+	// a migrated file is reported by name rather than silently dropped (#869).
+	if _, err := config.ParseStrict(data); err != nil {
 		return err
 	}
 	var root yaml.Node
@@ -251,6 +253,9 @@ func importProject(ctx context.Context, tx *sql.Tx, sourcePath string, data []by
 	projectName := projectNameFromPath(sourcePath)
 	if repo := scalarAt(&root, "repo"); repo != "" {
 		projectName = safeProjectName(repo)
+	}
+	if err := enforceImmutableProjectID(ctx, tx, projectName, &root); err != nil {
+		return err
 	}
 	backends := detachBackends(&root)
 	now := time.Now().UTC().Format(time.RFC3339Nano) // nano, not seconds: see ProjectsFingerprint (#757)
@@ -424,6 +429,13 @@ func deepMergeMaps(a, b map[string]any) map[string]any {
 // project write back too. source_path is left empty for write-API projects
 // (they have no originating file) and is preserved on conflict.
 func (s *Store) UpsertProject(ctx context.Context, name, configYAML string) error {
+	// Public create/edit write path: reject unknown/misspelled keys by name so a
+	// typo cannot be silently discarded (#869). The internal settings re-persist
+	// (SetProjectSetting -> upsertProjectTx) stays tolerant because it re-writes
+	// already-validated stored YAML, not fresh operator input.
+	if _, err := config.ParseStrict([]byte(configYAML)); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -452,6 +464,9 @@ func upsertProjectTx(ctx context.Context, tx *sql.Tx, name, configYAML string) e
 	if err := yaml.Unmarshal([]byte(configYAML), &root); err != nil {
 		return err
 	}
+	if err := enforceImmutableProjectID(ctx, tx, name, &root); err != nil {
+		return err
+	}
 	backends := detachBackends(&root)
 	now := time.Now().UTC().Format(time.RFC3339Nano) // nano, not seconds: see ProjectsFingerprint (#757)
 	if err := upsertSharedBackendsTx(ctx, tx, backends, now); err != nil {
@@ -467,6 +482,47 @@ VALUES(?, '', ?, 'global', ?)
 ON CONFLICT(name) DO UPDATE SET config_yaml = excluded.config_yaml, updated_at = excluded.updated_at
 `, name, string(projectYAML), now)
 	return err
+}
+
+// enforceImmutableProjectID rejects an in-place project write that would change
+// a stable project_id that is already recorded on the row (#869). A stored id is
+// the durable identity an external bootstrap adapter correlates against, so it
+// must not silently flip on an edit. The rules mirror the acceptance criteria:
+//
+//   - incoming id empty            -> preserve the stored id (ordinary edits do
+//     not implicitly clear identity);
+//   - stored id empty              -> allowed (adding an id to a legacy id-less row);
+//   - stored == incoming           -> allowed (no change);
+//   - stored != incoming, both set -> REJECTED as an identity mismatch.
+//
+// A genuinely different id is an explicit migration concern, not an ordinary
+// upsert, so the caller must create a new project or migrate deliberately.
+func enforceImmutableProjectID(ctx context.Context, tx *sql.Tx, name string, incomingRoot *yaml.Node) error {
+	incoming := scalarAt(incomingRoot, "project_id")
+	var storedYAML string
+	err := tx.QueryRowContext(ctx, `SELECT config_yaml FROM project WHERE name = ?`, name).Scan(&storedYAML)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var storedRoot yaml.Node
+	if err := yaml.Unmarshal([]byte(storedYAML), &storedRoot); err != nil {
+		return err
+	}
+	stored := scalarAt(&storedRoot, "project_id")
+	if stored != "" && incoming == "" {
+		// Upserts replace config_yaml wholesale. Preserve the durable id in the
+		// incoming node so an older client or an ordinary id-less edit cannot
+		// silently erase identity (#869).
+		setMappingChild(incomingRoot, "project_id", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: stored})
+		return nil
+	}
+	if stored != "" && stored != incoming {
+		return fmt.Errorf("project %q: project_id is immutable (stored %q, refusing to overwrite with %q); create a new project or run an explicit migration to change it", name, stored, incoming)
+	}
+	return nil
 }
 
 // ProjectNameFor derives the canonical project name for a config document the
