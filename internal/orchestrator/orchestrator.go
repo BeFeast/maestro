@@ -4941,19 +4941,26 @@ func (o *Orchestrator) reconcileResolvedRepairApprovals(s *state.State) {
 // always takes precedence over an older done session for the same issue, because
 // the active session may be the very repair the approval controls. When no
 // session is active, a done session is authoritative and needs no GitHub read
-// (the merged/verified/closed path). Otherwise the issue is checked on GitHub
-// and treated as resolved when closed (the externally-closed path). A GitHub
-// read error is reported unresolved so a legitimately-pending repair approval
-// is never staled out from under an operator.
+// only when no terminal-failure session also exists. A failed/dead/conflicted/
+// retry-exhausted session means the issue may have reopened or a newer repair
+// may still be needed, so it takes precedence over the done shortcut and falls
+// through to the GitHub issue check. Otherwise the issue is treated as resolved
+// when closed (the externally-closed path). A GitHub read error is reported
+// unresolved so a legitimately-pending repair approval is never staled out from
+// under an operator.
 func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (bool, string) {
 	activeSession := false
 	doneSession := false
+	failedSession := false
 	for _, sess := range s.Sessions {
 		if sess == nil || sess.IssueNumber != issue {
 			continue
 		}
 		if sess.Status == state.StatusDone {
 			doneSession = true
+		}
+		if state.IsTerminal(sess.Status) && sess.Status != state.StatusDone {
+			failedSession = true
 		}
 		if repairIssueSessionActive(sess.Status) {
 			activeSession = true
@@ -4962,7 +4969,7 @@ func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (b
 	if activeSession {
 		return false, ""
 	}
-	if doneSession {
+	if doneSession && !failedSession {
 		return true, fmt.Sprintf("issue #%d resolved (session done) — repair worker moot", issue)
 	}
 	closed, err := o.isIssueClosed(issue)

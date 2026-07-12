@@ -119,6 +119,51 @@ func TestReconcileResolvedRepairApprovals_ActiveSessionOutranksOlderDone(t *test
 	}
 }
 
+// A terminal-failure session must also outrank the done-session shortcut. The
+// GitHub issue is the authority in this ambiguous history: if it is open the
+// repair remains actionable; if it is closed the approval is safely staled.
+func TestReconcileResolvedRepairApprovals_FailedSessionOutranksOlderDone(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 47, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name        string
+		issueClosed bool
+		want        state.ApprovalStatus
+	}{
+		{name: "open issue keeps repair pending", issueClosed: false, want: state.ApprovalStatusPending},
+		{name: "closed issue stales repair", issueClosed: true, want: state.ApprovalStatusStale},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checks := 0
+			o := &Orchestrator{
+				cfg:      &config.Config{Repo: "owner/repo"},
+				notifier: &notify.Notifier{},
+				isIssueClosedFn: func(issue int) (bool, error) {
+					checks++
+					return tc.issueClosed, nil
+				},
+			}
+
+			s := state.NewState()
+			s.Sessions = map[string]*state.Session{
+				"sup-old-done":   {IssueNumber: 858, Status: state.StatusDone, PRNumber: 864},
+				"sup-new-failed": {IssueNumber: 858, Status: state.StatusRetryExhausted, PRNumber: 867},
+			}
+			s.Approvals = []state.Approval{
+				repairApproval("ap-repair-858-after-failure", 858, 867, state.ApprovalStatusPending, now),
+			}
+
+			o.reconcileResolvedRepairApprovals(s)
+
+			if checks != 1 {
+				t.Fatalf("GitHub issue checks = %d, want 1", checks)
+			}
+			if got := approvalStatus(t, s, "ap-repair-858-after-failure"); got != tc.want {
+				t.Fatalf("repair approval = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestReconcileResolvedRepairApprovals_ExternallyClosedIssue covers the
 // externally-closed reconciliation path: an issue with no done session but
 // closed on GitHub is reconciled; an issue that is still open (a failed session
