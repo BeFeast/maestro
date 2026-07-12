@@ -14,8 +14,8 @@ worktree_base: ~/.worktrees/maestro
 project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
 management_home:
   kind: obsidian
-  path: /home/god/Obsidian/Dev
-  vault: Obsidian Vault
+  path: /srv/example-vault/Dev
+  vault: Example Vault
   vault_path: Dev/Areas/maestro
 `
 
@@ -45,8 +45,8 @@ repo: BeFeast/maestro
 management_home:
   vault_path: Dev/Areas/maestro
   kind: obsidian
-  vault: Obsidian Vault
-  path: /home/god/Obsidian/Dev
+  vault: Example Vault
+  path: /srv/example-vault/Dev
 `
 	a, err := PrepareProject("a.yaml", []byte(genesisYAML))
 	if err != nil {
@@ -79,10 +79,12 @@ func TestPrepareProjectRejections(t *testing.T) {
 		{"unknown field", genesisYAML + "worktree_basee: typo\n", "worktree_basee"},
 		{"missing project_id", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nworktree_base: ~/.wt/x\n", "project_id"},
 		{"invalid project_id", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: not-a-uuid\n", "not a valid UUID"},
+		{"uppercase project_id", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: 3F2504E0-4F89-41D3-9A0C-0305E82C3301\n", "canonical lowercase"},
 		{"missing repo", "local_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "repo is required"},
 		{"missing local_path", "repo: BeFeast/maestro\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "local_path is required"},
 		{"missing worktree_base", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "worktree_base is required"},
 		{"invalid management_home", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\nmanagement_home:\n  kind: notion\n", "not supported"},
+		{"shared backend definition", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\nmodel:\n  default: claude\n  backends:\n    claude:\n      provider: claude\n", "must not define shared model.backends"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,7 +150,7 @@ func TestApplyProjectIdempotent(t *testing.T) {
 	}
 	confirm := p.ProjectID
 
-	first, err := store.ApplyProject(ctx, p, confirm, p.Fingerprint)
+	first, err := store.ApplyProject(ctx, p, confirm, p.Fingerprint, BaselineAbsent)
 	if err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
@@ -168,7 +170,11 @@ func TestApplyProjectIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-prepare: %v", err)
 	}
-	second, err := store.ApplyProject(ctx, p2, confirm, p2.Fingerprint)
+	secondPlan, err := store.PlanProject(ctx, p2)
+	if err != nil {
+		t.Fatalf("second plan: %v", err)
+	}
+	second, err := store.ApplyProject(ctx, p2, confirm, p2.Fingerprint, secondPlan.BaselineFingerprint)
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
@@ -181,6 +187,35 @@ func TestApplyProjectIdempotent(t *testing.T) {
 	}
 }
 
+func TestApplyProjectIdempotentWithUnrelatedSharedBackends(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertProject(ctx, "backend-seed", writeTestYAML); err != nil {
+		t.Fatalf("seed shared backends: %v", err)
+	}
+	p, err := PrepareProject("portable.yaml", []byte(genesisYAML))
+	if err != nil {
+		t.Fatalf("PrepareProject: %v", err)
+	}
+	plan, err := store.PlanProject(ctx, p)
+	if err != nil {
+		t.Fatalf("first plan: %v", err)
+	}
+	if plan.Effect != EffectCreate {
+		t.Fatalf("first effect = %q, want create", plan.Effect)
+	}
+	if _, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, plan.BaselineFingerprint); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	after, err := store.PlanProject(ctx, p)
+	if err != nil {
+		t.Fatalf("second plan: %v", err)
+	}
+	if after.Effect != EffectNoOp {
+		t.Fatalf("second effect = %q, want no-op despite shared backends (existing=%+v)", after.Effect, after.Existing)
+	}
+}
+
 func TestApplyProjectConfirmGate(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -189,10 +224,10 @@ func TestApplyProjectConfirmGate(t *testing.T) {
 		t.Fatalf("PrepareProject: %v", err)
 	}
 
-	if _, err := store.ApplyProject(ctx, p, "", p.Fingerprint); err == nil {
+	if _, err := store.ApplyProject(ctx, p, "", p.Fingerprint, BaselineAbsent); err == nil {
 		t.Fatal("missing --confirm should be refused")
 	}
-	if _, err := store.ApplyProject(ctx, p, "11111111-2222-3333-4444-555555555555", p.Fingerprint); err == nil {
+	if _, err := store.ApplyProject(ctx, p, "11111111-2222-3333-4444-555555555555", p.Fingerprint, BaselineAbsent); err == nil {
 		t.Fatal("wrong --confirm should be refused")
 	}
 	// Nothing was written by the refused applies.
@@ -209,7 +244,10 @@ func TestApplyProjectFingerprintGate(t *testing.T) {
 		t.Fatalf("PrepareProject: %v", err)
 	}
 	// A stale plan-time fingerprint (file changed since plan) is refused.
-	_, err = store.ApplyProject(ctx, p, p.ProjectID, "sha256:deadbeef")
+	if _, err := store.ApplyProject(ctx, p, p.ProjectID, "", BaselineAbsent); err == nil {
+		t.Fatal("missing fingerprint should be refused")
+	}
+	_, err = store.ApplyProject(ctx, p, p.ProjectID, "sha256:deadbeef", BaselineAbsent)
 	if err == nil {
 		t.Fatal("stale fingerprint should be refused")
 	}
@@ -218,6 +256,43 @@ func TestApplyProjectFingerprintGate(t *testing.T) {
 	}
 	if names, _ := store.projectNames(ctx); len(names) != 0 {
 		t.Fatalf("refused apply wrote a row: %v", names)
+	}
+}
+
+func TestApplyProjectRefusesStoreDriftSincePlan(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	p, err := PrepareProject("portable.yaml", []byte(genesisYAML))
+	if err != nil {
+		t.Fatalf("PrepareProject: %v", err)
+	}
+	plan, err := store.PlanProject(ctx, p)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if plan.BaselineFingerprint != BaselineAbsent {
+		t.Fatalf("baseline = %q, want absent", plan.BaselineFingerprint)
+	}
+
+	// Another process creates the same identity with different config after the
+	// plan. Apply must not reinterpret the approved create as an update.
+	drifted := strings.Replace(genesisYAML, "~/src/maestro", "/srv/concurrent-change", 1)
+	if err := store.UpsertProject(ctx, p.Name, drifted); err != nil {
+		t.Fatalf("seed concurrent change: %v", err)
+	}
+	report, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, plan.BaselineFingerprint)
+	if err == nil || !strings.Contains(err.Error(), "store changed since plan") {
+		t.Fatalf("apply err = %v, want store-drift refusal", err)
+	}
+	if report == nil || report.BaselineFingerprint == BaselineAbsent {
+		t.Fatalf("drift report = %+v, want observed current baseline", report)
+	}
+	cfg, err := store.Load(ctx, p.Name)
+	if err != nil {
+		t.Fatalf("load drifted row: %v", err)
+	}
+	if cfg.LocalPath != "/srv/concurrent-change" {
+		t.Fatalf("apply overwrote concurrent config: local_path=%q", cfg.LocalPath)
 	}
 }
 
@@ -247,7 +322,7 @@ func TestApplyProjectIdentityConflictSameName(t *testing.T) {
 		t.Fatalf("plan effect = %q, want conflict", plan.Effect)
 	}
 
-	report, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint)
+	report, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, plan.BaselineFingerprint)
 	if !errors.Is(err, ErrIdentityConflict) {
 		t.Fatalf("apply err = %v, want ErrIdentityConflict", err)
 	}
@@ -279,7 +354,7 @@ func TestApplyProjectIdentityConflictOtherName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareProject: %v", err)
 	}
-	report, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint)
+	report, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, BaselineAbsent)
 	if !errors.Is(err, ErrIdentityConflict) {
 		t.Fatalf("apply err = %v, want ErrIdentityConflict", err)
 	}

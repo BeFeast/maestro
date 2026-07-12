@@ -88,7 +88,8 @@ main() {
     echo "     cp maestro.service ~/.config/systemd/user/ && systemctl --user enable --now maestro.service"
     echo "  2. Register a project (write a portable YAML with repo/local_path/worktree_base/project_id):"
     echo "     maestro project plan  --file <project.yaml> --db ~/.maestro/maestro.db --json"
-    echo "     maestro project apply --file <project.yaml> --db ~/.maestro/maestro.db --confirm <project-id> --json"
+    echo "     # Run the exact next[0] command returned by the approved plan receipt:"
+    echo "     maestro project apply --file <project.yaml> --db ~/.maestro/maestro.db --confirm <project-id> --fingerprint <sha256-from-plan> --baseline <baseline-from-plan> --json"
     echo
     echo "The daemon runs with --watch-store and hot-reconciles new rows — no per-project service."
     echo "Migrating from legacy per-project units? Run scripts/migrate-to-daemon.sh."

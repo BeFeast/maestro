@@ -445,15 +445,17 @@ shipped `maestro.service` uses `%h/.maestro/maestro.db`).
 # 1. Preview the effect on the store — strictly validated, changes no files/rows:
 maestro project plan  --file ~/myproject.project.yaml --db ~/.maestro/maestro.db --json
 
-# 2. Apply it — idempotent upsert of exactly one row; --confirm is the project_id:
+# 2. Apply the exact `next[0]` command returned by the approved plan receipt:
 maestro project apply --file ~/myproject.project.yaml --db ~/.maestro/maestro.db \
-    --confirm <project-id> --json
+    --confirm <project-id> --fingerprint <sha256-from-plan> \
+    --baseline <baseline-from-plan> --json
 ```
 
 `plan` is read-only and reports the predicted effect (`create` / `update` /
 `no-op` / `conflict`) plus a config fingerprint. `apply` refuses a missing/wrong
-`--confirm`, and (with `--fingerprint <sha256:…>`) a config that changed since the
-plan. A second identical apply is a reported no-op; an identity conflict is a hard
+`--confirm`, the exact desired `--fingerprint`, and the plan-time store
+`--baseline`; a config-file or concurrent store change is refused. A second
+identical apply is a reported no-op; an identity conflict is a hard
 stop that never overwrites a row by name. Both emit a machine-readable receipt
 (store, project id, fingerprint, effect, daemon-reconciliation expectation, exact
 next commands) for scripted bootstrap adapters.

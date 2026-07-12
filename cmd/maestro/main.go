@@ -177,10 +177,10 @@ Project (single-daemon genesis, replaces the retired init wizard):
   maestro project plan  --file <portable-project.yaml> --db <store> [--json]
                             Strict-validate the config and preview its effect on the
                             store (create/update/no-op/conflict). Zero writes.
-  maestro project apply --file <portable-project.yaml> --db <store> --confirm <project-id> [--fingerprint <sha256:...>] [--json]
+  maestro project apply --file <portable-project.yaml> --db <store> --confirm <project-id> --fingerprint <sha256:...> --baseline <fingerprint|absent> [--json]
                             Idempotently upsert exactly one config-store row after an
-                            explicit project_id confirmation (and optional plan-time
-                            fingerprint gate). A matching row is a reported no-op; an
+                            explicit project_id confirmation plus required plan-time
+                            desired and store-baseline fingerprints. A matching row is a reported no-op; an
                             identity conflict is a hard stop that never overwrites.
                             The single 'maestro daemon --watch-store' then observes the
                             row and reconciles one flow — no per-project service is

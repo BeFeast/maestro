@@ -19,8 +19,8 @@ import (
 // the one long-lived `maestro daemon --watch-store` observes and starts as one
 // flow — no per-project maestro.yaml, systemd unit, or launchd plist. `plan` is a
 // pure, zero-write validation + effect preview; `apply` upserts idempotently
-// after an explicit project_id confirmation and an optional plan-time fingerprint
-// gate. Both are structured so an external bootstrap adapter can drive them by
+// after an explicit project_id confirmation plus required plan-time desired and
+// store-baseline fingerprint gates. Both are structured so an external bootstrap adapter can drive them by
 // their machine-readable receipts.
 
 // Genesis effect vocabulary shared by PlanProject (predicted) and ApplyProject
@@ -31,6 +31,7 @@ const (
 	EffectUpdate   = "update"
 	EffectNoOp     = "no-op"
 	EffectConflict = "conflict"
+	BaselineAbsent = "absent"
 )
 
 // ErrIdentityConflict is the sentinel wrapped by ApplyProject when a row cannot
@@ -69,14 +70,19 @@ type ExistingRow struct {
 // project id, config fingerprint, effect, and whether a write happened. The CLI
 // wraps it with the daemon-reconciliation expectation and next-step commands.
 type GenesisReport struct {
-	Project     string       `json:"project"`
-	ProjectID   string       `json:"project_id"`
-	Fingerprint string       `json:"fingerprint"`
-	Effect      string       `json:"effect"`
-	Conflict    string       `json:"conflict,omitempty"`
-	Wrote       bool         `json:"wrote"`
-	Existing    *ExistingRow `json:"existing,omitempty"`
-	Warnings    []string     `json:"warnings,omitempty"`
+	Project     string `json:"project"`
+	ProjectID   string `json:"project_id"`
+	Fingerprint string `json:"fingerprint"`
+	// BaselineFingerprint is the store state observed before the effect:
+	// "absent" for no row, otherwise the existing row's config fingerprint.
+	// Apply requires the exact plan-time value to prevent a concurrent store
+	// change from being overwritten between plan and apply.
+	BaselineFingerprint string       `json:"baseline_fingerprint"`
+	Effect              string       `json:"effect"`
+	Conflict            string       `json:"conflict,omitempty"`
+	Wrote               bool         `json:"wrote"`
+	Existing            *ExistingRow `json:"existing,omitempty"`
+	Warnings            []string     `json:"warnings,omitempty"`
 }
 
 // PrepareProject validates a portable project YAML for the genesis flow and
@@ -98,6 +104,16 @@ func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 	id := strings.TrimSpace(cfg.ProjectID)
 	if id == "" {
 		return nil, fmt.Errorf("project plan/apply requires a stable project_id (a canonical 8-4-4-4-12 UUID); none is set — generate one and add `project_id:` to the config (#869)")
+	}
+	if id != strings.ToLower(id) {
+		return nil, fmt.Errorf("project_id must use canonical lowercase UUID form; got %q", id)
+	}
+	var source yaml.Node
+	if err := yaml.Unmarshal(data, &source); err != nil {
+		return nil, err
+	}
+	if backends := detachBackends(&source); len(backends) > 0 {
+		return nil, fmt.Errorf("portable project genesis must not define shared model.backends; configure fleet backends separately before plan/apply")
 	}
 	if strings.TrimSpace(cfg.LocalPath) == "" {
 		return nil, fmt.Errorf("local_path is required for project plan/apply (the on-disk clone the daemon works from)")
@@ -148,8 +164,12 @@ func canonicalProjectDoc(data []byte) ([]byte, string, error) {
 	if err := yaml.Unmarshal(data, &root); err != nil {
 		return nil, "", err
 	}
-	backends := detachBackends(&root)
-	attachBackends(&root, backends)
+	// Backends live in the fleet-shared table and ExportProject attaches every
+	// shared definition to every row. Genesis forbids defining them above, and
+	// excludes attached definitions here, so a second identical apply remains a
+	// no-op regardless of unrelated fleet backend changes.
+	detachBackends(&root)
+	removeEmptyTopLevelMapping(&root, "model")
 	sortMappingKeys(&root)
 	out, err := marshalNode(&root)
 	if err != nil {
@@ -157,6 +177,18 @@ func canonicalProjectDoc(data []byte) ([]byte, string, error) {
 	}
 	sum := sha256.Sum256(out)
 	return out, "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func removeEmptyTopLevelMapping(root *yaml.Node, key string) {
+	doc := documentValue(root)
+	if doc == nil || doc.Kind != yaml.MappingNode {
+		return
+	}
+	idx := mappingKeyIndex(doc, key)
+	if idx < 0 || doc.Content[idx+1].Kind != yaml.MappingNode || len(doc.Content[idx+1].Content) != 0 {
+		return
+	}
+	doc.Content = append(doc.Content[:idx], doc.Content[idx+2:]...)
 }
 
 // sortMappingKeys recursively sorts the key/value pairs of every mapping node by
@@ -198,12 +230,13 @@ func sortMappingKeys(node *yaml.Node) {
 // config must not leave a schema-only DB behind.
 func PlanEmpty(p *PreparedProject) *GenesisReport {
 	return &GenesisReport{
-		Project:     p.Name,
-		ProjectID:   p.ProjectID,
-		Fingerprint: p.Fingerprint,
-		Effect:      EffectCreate,
-		Wrote:       false,
-		Warnings:    p.Warnings,
+		Project:             p.Name,
+		ProjectID:           p.ProjectID,
+		Fingerprint:         p.Fingerprint,
+		BaselineFingerprint: BaselineAbsent,
+		Effect:              EffectCreate,
+		Wrote:               false,
+		Warnings:            p.Warnings,
 	}
 }
 
@@ -212,19 +245,25 @@ func PlanEmpty(p *PreparedProject) *GenesisReport {
 // it compared against, and any validation warnings. It only issues reads, so a
 // caller can compare the store fingerprint before and after and see it unchanged.
 func (s *Store) PlanProject(ctx context.Context, p *PreparedProject) (*GenesisReport, error) {
-	effect, conflict, existing, err := s.evaluate(ctx, p)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	effect, conflict, existing, err := evaluateProjectTx(ctx, tx, p)
 	if err != nil {
 		return nil, err
 	}
 	return &GenesisReport{
-		Project:     p.Name,
-		ProjectID:   p.ProjectID,
-		Fingerprint: p.Fingerprint,
-		Effect:      effect,
-		Conflict:    conflict,
-		Wrote:       false,
-		Existing:    existing,
-		Warnings:    p.Warnings,
+		Project:             p.Name,
+		ProjectID:           p.ProjectID,
+		Fingerprint:         p.Fingerprint,
+		BaselineFingerprint: baselineFingerprint(existing),
+		Effect:              effect,
+		Conflict:            conflict,
+		Wrote:               false,
+		Existing:            existing,
+		Warnings:            p.Warnings,
 	}, nil
 }
 
@@ -232,36 +271,55 @@ func (s *Store) PlanProject(ctx context.Context, p *PreparedProject) (*GenesisRe
 //
 //   - confirm: must exactly equal p.ProjectID (an explicit operator ack that this
 //     durable identity is the one being written);
-//   - wantFingerprint (optional): the fingerprint the plan reported — a mismatch
+//   - wantFingerprint: the desired-config fingerprint the plan reported — a mismatch
 //     means the file changed since the plan was reviewed, so the write is refused.
+//   - wantBaseline: the row fingerprint (or "absent") observed by plan — a
+//     mismatch means the store changed concurrently, so the write is refused.
 //
 // A create/update performs exactly one UpsertProject; a no-op writes nothing; an
 // identity conflict returns the report plus ErrIdentityConflict and never
 // overwrites. Removal/rollback is deliberately NOT handled here — it stays a
 // separate explicit operator action.
-func (s *Store) ApplyProject(ctx context.Context, p *PreparedProject, confirm, wantFingerprint string) (*GenesisReport, error) {
+func (s *Store) ApplyProject(ctx context.Context, p *PreparedProject, confirm, wantFingerprint, wantBaseline string) (*GenesisReport, error) {
 	if strings.TrimSpace(confirm) == "" {
 		return nil, fmt.Errorf("--confirm is required: pass the exact project_id (%s) to apply", p.ProjectID)
 	}
 	if strings.TrimSpace(confirm) != p.ProjectID {
 		return nil, fmt.Errorf("--confirm %q does not match the config project_id %q; refusing to apply", strings.TrimSpace(confirm), p.ProjectID)
 	}
-	if wf := strings.TrimSpace(wantFingerprint); wf != "" && wf != p.Fingerprint {
+	wf := strings.TrimSpace(wantFingerprint)
+	if wf == "" {
+		return nil, fmt.Errorf("--fingerprint is required: pass the exact fingerprint returned by `maestro project plan`")
+	}
+	if wf != p.Fingerprint {
 		return nil, fmt.Errorf("config changed since plan (approved fingerprint %s, current %s); re-run `maestro project plan` and review before applying", wf, p.Fingerprint)
 	}
+	wb := strings.TrimSpace(wantBaseline)
+	if wb == "" {
+		return nil, fmt.Errorf("--baseline is required: pass the exact baseline_fingerprint returned by `maestro project plan`")
+	}
 
-	effect, conflict, existing, err := s.evaluate(ctx, p)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	effect, conflict, existing, err := evaluateProjectTx(ctx, tx, p)
 	if err != nil {
 		return nil, err
 	}
 	report := &GenesisReport{
-		Project:     p.Name,
-		ProjectID:   p.ProjectID,
-		Fingerprint: p.Fingerprint,
-		Effect:      effect,
-		Conflict:    conflict,
-		Existing:    existing,
-		Warnings:    p.Warnings,
+		Project:             p.Name,
+		ProjectID:           p.ProjectID,
+		Fingerprint:         p.Fingerprint,
+		BaselineFingerprint: baselineFingerprint(existing),
+		Effect:              effect,
+		Conflict:            conflict,
+		Existing:            existing,
+		Warnings:            p.Warnings,
+	}
+	if wb != report.BaselineFingerprint {
+		return report, fmt.Errorf("config store changed since plan (approved baseline %s, current %s); re-run `maestro project plan` and review before applying", wb, report.BaselineFingerprint)
 	}
 	switch effect {
 	case EffectConflict:
@@ -272,7 +330,10 @@ func (s *Store) ApplyProject(ctx context.Context, p *PreparedProject, confirm, w
 		report.Wrote = false
 		return report, nil
 	case EffectCreate, EffectUpdate:
-		if err := s.UpsertProject(ctx, p.Name, string(p.Raw)); err != nil {
+		if err := upsertProjectTx(ctx, tx, p.Name, string(p.Raw)); err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
 			return nil, err
 		}
 		report.Wrote = true
@@ -280,6 +341,83 @@ func (s *Store) ApplyProject(ctx context.Context, p *PreparedProject, confirm, w
 	default:
 		return report, fmt.Errorf("internal: unknown genesis effect %q", effect)
 	}
+}
+
+func evaluateProjectTx(ctx context.Context, tx *sql.Tx, p *PreparedProject) (effect, conflict string, existing *ExistingRow, err error) {
+	row, err := existingRowTx(ctx, tx, p.Name)
+	if err != nil {
+		return "", "", nil, err
+	}
+	other, err := projectNameByIDTx(ctx, tx, p.ProjectID, p.Name)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if other != "" {
+		return EffectConflict,
+			fmt.Sprintf("project_id %s is already registered under project %q; refusing to create a second row for the same identity", p.ProjectID, other),
+			row, nil
+	}
+	if row == nil {
+		return EffectCreate, "", nil, nil
+	}
+	if row.ProjectID != "" && row.ProjectID != p.ProjectID {
+		return EffectConflict,
+			fmt.Sprintf("project %q already exists with a different project_id (stored %s, incoming %s); refusing to overwrite by name", p.Name, row.ProjectID, p.ProjectID),
+			row, nil
+	}
+	if row.Fingerprint == p.Fingerprint {
+		return EffectNoOp, "", row, nil
+	}
+	return EffectUpdate, "", row, nil
+}
+
+func existingRowTx(ctx context.Context, tx *sql.Tx, name string) (*ExistingRow, error) {
+	var data string
+	err := tx.QueryRowContext(ctx, `SELECT config_yaml FROM project WHERE name = ?`, name).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	_, fp, err := canonicalProjectDoc([]byte(data))
+	if err != nil {
+		return nil, err
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(data), &root); err != nil {
+		return nil, err
+	}
+	return &ExistingRow{Name: name, ProjectID: scalarAt(&root, "project_id"), Fingerprint: fp}, nil
+}
+
+func projectNameByIDTx(ctx context.Context, tx *sql.Tx, id, exclude string) (string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name, config_yaml FROM project WHERE name <> ? ORDER BY name`, exclude)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, data string
+		if err := rows.Scan(&name, &data); err != nil {
+			return "", err
+		}
+		var root yaml.Node
+		if err := yaml.Unmarshal([]byte(data), &root); err != nil {
+			return "", err
+		}
+		if strings.EqualFold(strings.TrimSpace(scalarAt(&root, "project_id")), strings.TrimSpace(id)) {
+			return name, nil
+		}
+	}
+	return "", rows.Err()
+}
+
+func baselineFingerprint(existing *ExistingRow) string {
+	if existing == nil {
+		return BaselineAbsent
+	}
+	return existing.Fingerprint
 }
 
 // evaluate decides the effect of applying p by comparing it to the current

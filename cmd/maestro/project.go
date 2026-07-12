@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -24,7 +25,8 @@ import (
 //     preconditions, and report the predicted effect (create/update/no-op/
 //     conflict) plus warnings. It never writes.
 //   - `apply` — idempotent upsert of exactly one row, gated on an explicit
-//     --confirm <project_id> and (optionally) the plan-time --fingerprint. A
+//     --confirm <project_id>, the plan-time --fingerprint, and the plan-time
+//     --baseline store fingerprint. A
 //     matching row is a reported no-op; an identity conflict is a hard stop that
 //     never overwrites.
 //
@@ -50,18 +52,27 @@ type genesisReconciliation struct {
 // verification commands. Its JSON shape is the contract the private vault-side
 // bootstrap adapter consumes.
 type genesisReceipt struct {
-	Command        string                   `json:"command"` // "plan" | "apply"
-	Store          string                   `json:"store"`
-	Project        string                   `json:"project"`
-	ProjectID      string                   `json:"project_id"`
-	Fingerprint    string                   `json:"fingerprint"`
-	Effect         string                   `json:"effect"`
-	Wrote          bool                     `json:"wrote"`
-	Conflict       string                   `json:"conflict,omitempty"`
-	Existing       *configstore.ExistingRow `json:"existing,omitempty"`
-	Warnings       []string                 `json:"warnings,omitempty"`
-	Reconciliation genesisReconciliation    `json:"reconciliation"`
-	Next           []string                 `json:"next"`
+	SchemaVersion       int                      `json:"schema_version"`
+	OK                  bool                     `json:"ok"`
+	Command             string                   `json:"command"` // "plan" | "apply"
+	Store               string                   `json:"store"`
+	Project             string                   `json:"project"`
+	ProjectID           string                   `json:"project_id"`
+	Fingerprint         string                   `json:"fingerprint"`
+	BaselineFingerprint string                   `json:"baseline_fingerprint"`
+	Effect              string                   `json:"effect"`
+	Wrote               bool                     `json:"wrote"`
+	Conflict            string                   `json:"conflict,omitempty"`
+	Existing            *configstore.ExistingRow `json:"existing,omitempty"`
+	Warnings            []string                 `json:"warnings,omitempty"`
+	Reconciliation      genesisReconciliation    `json:"reconciliation"`
+	Next                []string                 `json:"next"`
+	Error               *genesisErrorDetail      `json:"error,omitempty"`
+}
+
+type genesisErrorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 // projectCmd dispatches the `maestro project <plan|apply>` genesis subcommands.
@@ -90,89 +101,164 @@ func projectCmd(args []string) {
 func projectPlanCmd(args []string) {
 	fs := flag.NewFlagSet("project plan", flag.ExitOnError)
 	file := fs.String("file", "", "Path to the portable project YAML")
-	dbPath := fs.String("db", defaultConfigStorePath(), "Path to the SQLite config store")
+	dbPath := fs.String("db", defaultProjectStorePath(), "Path to the SQLite config store")
 	asJSON := fs.Bool("json", false, "Emit the receipt as JSON")
 	fs.Parse(args)
 
-	prepared := prepareGenesisFile(*file, "project plan")
+	prepared := prepareGenesisFile(*file, "project plan", *asJSON)
+	if err := validateGenesisRuntime(prepared); err != nil {
+		failGenesis("plan", *asJSON, "preflight_failed", fmt.Sprintf("project plan: preflight: %v", err))
+	}
 
-	report := planReport(*dbPath, prepared)
+	report := planReport(*dbPath, prepared, *asJSON)
 	receipt := buildGenesisReceipt("plan", *dbPath, *file, prepared, report)
-	emitGenesisReceipt(receipt, *asJSON)
 	if receipt.Effect == configstore.EffectConflict {
+		receipt.OK = false
+		receipt.Error = &genesisErrorDetail{Code: "identity_conflict", Message: receipt.Conflict}
+		emitGenesisReceipt(receipt, *asJSON)
 		os.Exit(1)
 	}
+	emitGenesisReceipt(receipt, *asJSON)
 }
 
 // projectApplyCmd implements `maestro project apply --file <yaml> --db <store>
-// --confirm <project-id> [--fingerprint <sha256:...>] [--json]`. It upserts
+// --confirm <project-id> --fingerprint <sha256:...> --baseline <fp|absent>
+// [--json]`. It upserts
 // exactly one row idempotently after the confirm/fingerprint gates. Exit is
 // non-zero on any refusal (missing/wrong confirm, stale fingerprint, conflict).
 func projectApplyCmd(args []string) {
 	fs := flag.NewFlagSet("project apply", flag.ExitOnError)
 	file := fs.String("file", "", "Path to the portable project YAML")
-	dbPath := fs.String("db", defaultConfigStorePath(), "Path to the SQLite config store")
+	dbPath := fs.String("db", defaultProjectStorePath(), "Path to the SQLite config store")
 	confirm := fs.String("confirm", "", "Exact project_id to confirm the write (required)")
-	fingerprint := fs.String("fingerprint", "", "Plan-time config fingerprint to gate on (optional; refuses if the config changed since plan)")
+	fingerprint := fs.String("fingerprint", "", "Exact plan-time config fingerprint (required)")
+	baseline := fs.String("baseline", "", "Exact plan-time baseline_fingerprint (required; `absent` for create)")
 	asJSON := fs.Bool("json", false, "Emit the receipt as JSON")
 	fs.Parse(args)
 
-	prepared := prepareGenesisFile(*file, "project apply")
+	prepared := prepareGenesisFile(*file, "project apply", *asJSON)
+	if err := validateGenesisRuntime(prepared); err != nil {
+		failGenesis("apply", *asJSON, "preflight_failed", fmt.Sprintf("project apply: preflight: %v", err))
+	}
+	if err := validateApplyApproval(prepared, *confirm, *fingerprint, *baseline); err != nil {
+		failGenesis("apply", *asJSON, "approval_mismatch", fmt.Sprintf("project apply: %v", err))
+	}
 	store, err := configstore.Open(*dbPath)
 	if err != nil {
-		log.Fatalf("project apply: open config store %s: %v", *dbPath, err)
+		failGenesis("apply", *asJSON, "store_open_failed", fmt.Sprintf("project apply: open config store %s: %v", *dbPath, err))
 	}
 	defer store.Close()
 
-	report, err := store.ApplyProject(context.Background(), prepared, *confirm, *fingerprint)
+	report, err := store.ApplyProject(context.Background(), prepared, *confirm, *fingerprint, *baseline)
 	if err != nil {
 		// An identity conflict still returns a report; print it so the adapter
 		// sees the reason, then exit non-zero. Other errors (bad confirm, stale
 		// fingerprint) carry no report.
 		if report != nil {
 			receipt := buildGenesisReceipt("apply", *dbPath, *file, prepared, report)
+			receipt.OK = false
+			receipt.Error = &genesisErrorDetail{Code: "apply_refused", Message: err.Error()}
 			emitGenesisReceipt(receipt, *asJSON)
+			os.Exit(1)
 		}
-		log.Fatalf("project apply: %v", err)
+		failGenesis("apply", *asJSON, "apply_refused", fmt.Sprintf("project apply: %v", err))
 	}
 	receipt := buildGenesisReceipt("apply", *dbPath, *file, prepared, report)
 	emitGenesisReceipt(receipt, *asJSON)
+}
+
+func validateApplyApproval(p *configstore.PreparedProject, confirm, fingerprint, baseline string) error {
+	if strings.TrimSpace(confirm) == "" || strings.TrimSpace(confirm) != p.ProjectID {
+		return fmt.Errorf("--confirm must equal project_id %s", p.ProjectID)
+	}
+	if strings.TrimSpace(fingerprint) == "" || strings.TrimSpace(fingerprint) != p.Fingerprint {
+		return fmt.Errorf("--fingerprint must equal the approved plan fingerprint %s", p.Fingerprint)
+	}
+	if strings.TrimSpace(baseline) == "" {
+		return fmt.Errorf("--baseline must equal the approved plan baseline_fingerprint")
+	}
+	return nil
 }
 
 // prepareGenesisFile reads and strict-validates the portable project file,
 // sharing the flag-plumbing between plan and apply. It fatals (with a clear
 // cmd-prefixed message) on any read/validation failure. Opening the store is the
 // caller's job so `plan` can avoid creating an absent store.
-func prepareGenesisFile(file, cmd string) *configstore.PreparedProject {
+func prepareGenesisFile(file, cmd string, asJSON bool) *configstore.PreparedProject {
 	if strings.TrimSpace(file) == "" {
-		log.Fatalf("%s: --file is required (a portable project YAML)", cmd)
+		failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "invalid_input", fmt.Sprintf("%s: --file is required (a portable project YAML)", cmd))
 	}
 	data, err := os.ReadFile(file)
 	if err != nil {
-		log.Fatalf("%s: read %s: %v", cmd, file, err)
+		failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "file_read_failed", fmt.Sprintf("%s: read %s: %v", cmd, file, err))
 	}
 	prepared, err := configstore.PrepareProject(file, data)
 	if err != nil {
-		log.Fatalf("%s: %v", cmd, err)
+		failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "validation_failed", fmt.Sprintf("%s: %v", cmd, err))
 	}
 	return prepared
+}
+
+func validateGenesisRuntime(p *configstore.PreparedProject) error {
+	localInfo, err := os.Stat(p.LocalPath)
+	if err != nil {
+		return fmt.Errorf("local_path %s is unavailable: %w", p.LocalPath, err)
+	}
+	if !localInfo.IsDir() {
+		return fmt.Errorf("local_path %s is not a directory", p.LocalPath)
+	}
+	inside, err := exec.Command("git", "-C", p.LocalPath, "rev-parse", "--is-inside-work-tree").Output()
+	if err != nil || strings.TrimSpace(string(inside)) != "true" {
+		return fmt.Errorf("local_path %s is not a Git worktree", p.LocalPath)
+	}
+	remote, err := exec.Command("git", "-C", p.LocalPath, "remote", "get-url", "origin").Output()
+	if err != nil {
+		return fmt.Errorf("local_path %s has no readable origin remote", p.LocalPath)
+	}
+	if !remoteMatchesRepo(strings.TrimSpace(string(remote)), p.Repo) {
+		return fmt.Errorf("local_path origin %q does not match configured repo %q", strings.TrimSpace(string(remote)), p.Repo)
+	}
+
+	worktreeInfo, err := os.Stat(p.WorktreeBase)
+	switch {
+	case err == nil && !worktreeInfo.IsDir():
+		return fmt.Errorf("worktree_base %s exists but is not a directory", p.WorktreeBase)
+	case err == nil:
+		if worktreeInfo.Mode().Perm()&0o222 == 0 {
+			return fmt.Errorf("worktree_base %s is not writable", p.WorktreeBase)
+		}
+	case os.IsNotExist(err):
+		parentInfo, parentErr := os.Stat(filepath.Dir(p.WorktreeBase))
+		if parentErr != nil || !parentInfo.IsDir() || parentInfo.Mode().Perm()&0o222 == 0 {
+			return fmt.Errorf("worktree_base parent %s is unavailable or not writable", filepath.Dir(p.WorktreeBase))
+		}
+	default:
+		return fmt.Errorf("inspect worktree_base %s: %w", p.WorktreeBase, err)
+	}
+	return nil
+}
+
+func remoteMatchesRepo(remote, repo string) bool {
+	r := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(remote)), ".git")
+	want := strings.ToLower(strings.Trim(strings.TrimSpace(repo), "/"))
+	return want != "" && (strings.HasSuffix(r, "/"+want) || strings.HasSuffix(r, ":"+want))
 }
 
 // planReport previews prepared against the store at dbPath without any write. A
 // store file that does not exist yet is treated as empty (effect create) WITHOUT
 // opening it, so `plan` never creates a schema-only DB — it changes no files.
-func planReport(dbPath string, prepared *configstore.PreparedProject) *configstore.GenesisReport {
+func planReport(dbPath string, prepared *configstore.PreparedProject, asJSON bool) *configstore.GenesisReport {
 	if !storeFileExists(dbPath) {
 		return configstore.PlanEmpty(prepared)
 	}
-	store, err := configstore.Open(dbPath)
+	store, err := configstore.OpenReadOnly(dbPath)
 	if err != nil {
-		log.Fatalf("project plan: open config store %s: %v", dbPath, err)
+		failGenesis("plan", asJSON, "store_open_failed", fmt.Sprintf("project plan: open config store %s: %v", dbPath, err))
 	}
 	defer store.Close()
 	report, err := store.PlanProject(context.Background(), prepared)
 	if err != nil {
-		log.Fatalf("project plan: %v", err)
+		failGenesis("plan", asJSON, "plan_failed", fmt.Sprintf("project plan: %v", err))
 	}
 	return report
 }
@@ -189,19 +275,36 @@ func storeFileExists(path string) bool {
 // the receipt shape is unit-testable without a store or a live daemon.
 func buildGenesisReceipt(command, storePath, file string, p *configstore.PreparedProject, report *configstore.GenesisReport) genesisReceipt {
 	return genesisReceipt{
-		Command:        command,
-		Store:          storePath,
-		Project:        report.Project,
-		ProjectID:      report.ProjectID,
-		Fingerprint:    report.Fingerprint,
-		Effect:         report.Effect,
-		Wrote:          report.Wrote,
-		Conflict:       report.Conflict,
-		Existing:       report.Existing,
-		Warnings:       report.Warnings,
-		Reconciliation: genesisReconcileFor(command, report.Effect, report.Conflict, probeDaemonWatchStore()),
-		Next:           genesisNextCommands(command, storePath, file, report.ProjectID, report.Effect),
+		SchemaVersion:       1,
+		OK:                  true,
+		Command:             command,
+		Store:               storePath,
+		Project:             report.Project,
+		ProjectID:           report.ProjectID,
+		Fingerprint:         report.Fingerprint,
+		BaselineFingerprint: report.BaselineFingerprint,
+		Effect:              report.Effect,
+		Wrote:               report.Wrote,
+		Conflict:            report.Conflict,
+		Existing:            report.Existing,
+		Warnings:            report.Warnings,
+		Reconciliation:      genesisReconcileFor(command, report.Effect, report.Conflict, probeDaemonWatchStore(storePath)),
+		Next:                genesisNextCommands(command, storePath, file, report.ProjectID, report.Fingerprint, report.BaselineFingerprint, report.Effect),
 	}
+}
+
+func failGenesis(command string, asJSON bool, code, message string) {
+	if asJSON {
+		_ = json.NewEncoder(os.Stdout).Encode(struct {
+			SchemaVersion int                 `json:"schema_version"`
+			OK            bool                `json:"ok"`
+			Command       string              `json:"command"`
+			Error         *genesisErrorDetail `json:"error"`
+		}{SchemaVersion: 1, OK: false, Command: command, Error: &genesisErrorDetail{Code: code, Message: message}})
+	} else {
+		fmt.Fprintln(os.Stderr, message)
+	}
+	os.Exit(1)
 }
 
 // genesisReconcileFor renders the single-daemon reconciliation expectation for
@@ -236,6 +339,8 @@ func genesisReconcileFor(command, effect, conflict, watchStore string) genesisRe
 		// Expectation already covers it; no extra note needed.
 	case watchStoreRunningWithout:
 		r.Note = appendNote(r.Note, "a maestro daemon is running WITHOUT --watch-store on this host; it will not hot-reconcile the row — restart it with --watch-store or reconcile manually")
+	case watchStoreDifferentStore:
+		r.Note = appendNote(r.Note, "a maestro daemon with --watch-store is running on this host, but it watches a different --store path; it will not hot-reconcile this row")
 	case watchStoreNotObserved:
 		r.Note = appendNote(r.Note, "no running maestro daemon was observed from this host; confirm the fleet daemon runs with --watch-store so the row is hot-reconciled")
 	default: // unknown
@@ -254,7 +359,7 @@ func appendNote(existing, add string) string {
 // genesisNextCommands returns the exact next verification commands an adapter/
 // operator should run. It is pure and deterministic so the JSON contract is
 // stable.
-func genesisNextCommands(command, storePath, file, projectID, effect string) []string {
+func genesisNextCommands(command, storePath, file, projectID, fingerprint, baseline, effect string) []string {
 	switch command {
 	case "plan":
 		if effect == configstore.EffectConflict {
@@ -263,7 +368,7 @@ func genesisNextCommands(command, storePath, file, projectID, effect string) []s
 			}
 		}
 		return []string{
-			fmt.Sprintf("maestro project apply --file %s --db %s --confirm %s --json", file, storePath, projectID),
+			fmt.Sprintf("maestro project apply --file %s --db %s --confirm %s --fingerprint %s --baseline %s --json", file, storePath, projectID, fingerprint, baseline),
 		}
 	case "apply":
 		if effect == configstore.EffectConflict {
@@ -295,6 +400,7 @@ func emitGenesisReceipt(r genesisReceipt, asJSON bool) {
 	fmt.Printf("project_id:  %s\n", r.ProjectID)
 	fmt.Printf("store:       %s\n", r.Store)
 	fmt.Printf("fingerprint: %s\n", r.Fingerprint)
+	fmt.Printf("baseline:    %s\n", r.BaselineFingerprint)
 	fmt.Printf("effect:      %s (wrote=%t)\n", r.Effect, r.Wrote)
 	if r.Conflict != "" {
 		fmt.Printf("conflict:    %s\n", r.Conflict)
@@ -315,6 +421,7 @@ func emitGenesisReceipt(r genesisReceipt, asJSON bool) {
 const (
 	watchStoreObserved       = "observed"
 	watchStoreRunningWithout = "running-without-watch-store"
+	watchStoreDifferentStore = "running-with-different-store"
 	watchStoreNotObserved    = "not-observed"
 	watchStoreUnknown        = "unknown"
 )
@@ -323,31 +430,63 @@ const (
 // `maestro daemon --watch-store`. It returns watchStoreUnknown when the process
 // table cannot be read (non-Linux, restricted /proc). The classification itself
 // is delegated to the pure classifyDaemonWatchStore so it stays testable.
-func probeDaemonWatchStore() string {
+func probeDaemonWatchStore(expectedStore string) string {
 	procs, ok := readProcCmdlines()
 	if !ok {
 		return watchStoreUnknown
 	}
-	return classifyDaemonWatchStore(procs)
+	return classifyDaemonWatchStore(procs, expectedStore)
 }
 
 // classifyDaemonWatchStore decides the watch-store status from a snapshot of
 // process argv slices. Pure and deterministic for testing.
-func classifyDaemonWatchStore(procs [][]string) string {
+func classifyDaemonWatchStore(procs [][]string, expectedStore string) string {
 	daemonFound := false
+	watchStoreFound := false
 	for _, argv := range procs {
 		if !looksLikeMaestroDaemon(argv) {
 			continue
 		}
 		daemonFound = true
 		if argvHasWatchStore(argv) {
-			return watchStoreObserved
+			watchStoreFound = true
+			if sameStorePath(daemonStorePath(argv), expectedStore) {
+				return watchStoreObserved
+			}
 		}
+	}
+	if watchStoreFound {
+		return watchStoreDifferentStore
 	}
 	if daemonFound {
 		return watchStoreRunningWithout
 	}
 	return watchStoreNotObserved
+}
+
+func daemonStorePath(argv []string) string {
+	for i, arg := range argv {
+		if (arg == "--store" || arg == "-store") && i+1 < len(argv) {
+			return argv[i+1]
+		}
+		if strings.HasPrefix(arg, "--store=") || strings.HasPrefix(arg, "-store=") {
+			return strings.SplitN(arg, "=", 2)[1]
+		}
+	}
+	return ""
+}
+
+func sameStorePath(got, want string) bool {
+	if strings.TrimSpace(got) == "" || strings.TrimSpace(want) == "" {
+		return false
+	}
+	gotAbs, gotErr := filepath.Abs(got)
+	wantAbs, wantErr := filepath.Abs(want)
+	return gotErr == nil && wantErr == nil && filepath.Clean(gotAbs) == filepath.Clean(wantAbs)
+}
+
+func defaultProjectStorePath() string {
+	return filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.db")
 }
 
 // looksLikeMaestroDaemon reports whether argv is a `maestro daemon ...`

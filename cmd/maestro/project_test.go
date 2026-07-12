@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,8 +19,8 @@ worktree_base: ~/.worktrees/demo
 project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
 management_home:
   kind: obsidian
-  path: /home/god/Obsidian/Dev
-  vault: Obsidian Vault
+  path: /srv/example-vault/Dev
+  vault: Example Vault
   vault_path: Dev/Areas/demo
 `
 
@@ -56,10 +58,17 @@ func TestClassifyDaemonWatchStore(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyDaemonWatchStore(tc.procs); got != tc.want {
+			if got := classifyDaemonWatchStore(tc.procs, "/x/config.db"); got != tc.want {
 				t.Fatalf("classifyDaemonWatchStore = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestClassifyDaemonWatchStoreRequiresMatchingStore(t *testing.T) {
+	procs := [][]string{{"/usr/local/bin/maestro", "daemon", "--watch-store", "--store", "/x/other.db"}}
+	if got := classifyDaemonWatchStore(procs, "/x/config.db"); got != watchStoreDifferentStore {
+		t.Fatalf("classify = %q, want different-store", got)
 	}
 }
 
@@ -95,19 +104,39 @@ func TestSplitProcCmdline(t *testing.T) {
 
 func TestGenesisNextCommands(t *testing.T) {
 	// plan → the exact apply command with the confirm id.
-	next := genesisNextCommands("plan", "/x/store.db", "/p.yaml", "the-id", configstore.EffectCreate)
-	if len(next) != 1 || !strings.Contains(next[0], "project apply") || !strings.Contains(next[0], "--confirm the-id") {
-		t.Fatalf("plan next = %v, want an apply command with --confirm", next)
+	next := genesisNextCommands("plan", "/x/store.db", "/p.yaml", "the-id", "sha256:desired", configstore.BaselineAbsent, configstore.EffectCreate)
+	if len(next) != 1 || !strings.Contains(next[0], "project apply") || !strings.Contains(next[0], "--confirm the-id") || !strings.Contains(next[0], "--fingerprint sha256:desired") || !strings.Contains(next[0], "--baseline absent") {
+		t.Fatalf("plan next = %v, want an apply command with confirm + desired/baseline fingerprints", next)
 	}
 	// apply → re-run plan and expect a no-op (scriptable confirmation).
-	next = genesisNextCommands("apply", "/x/store.db", "/p.yaml", "the-id", configstore.EffectCreate)
+	next = genesisNextCommands("apply", "/x/store.db", "/p.yaml", "the-id", "sha256:desired", configstore.BaselineAbsent, configstore.EffectCreate)
 	if len(next) != 1 || !strings.Contains(next[0], "project plan") || !strings.Contains(next[0], "no-op") {
 		t.Fatalf("apply next = %v, want a plan re-run expecting no-op", next)
 	}
 	// conflict → no runnable next command, just guidance.
-	next = genesisNextCommands("plan", "/x/store.db", "/p.yaml", "the-id", configstore.EffectConflict)
+	next = genesisNextCommands("plan", "/x/store.db", "/p.yaml", "the-id", "sha256:desired", configstore.BaselineAbsent, configstore.EffectConflict)
 	if len(next) != 1 || !strings.Contains(next[0], "conflict") {
 		t.Fatalf("conflict next = %v, want conflict guidance", next)
+	}
+}
+
+func TestValidateApplyApprovalRequiresExactPlanEnvelope(t *testing.T) {
+	p := &configstore.PreparedProject{ProjectID: "the-id", Fingerprint: "sha256:desired"}
+	if err := validateApplyApproval(p, "the-id", "sha256:desired", configstore.BaselineAbsent); err != nil {
+		t.Fatalf("valid approval: %v", err)
+	}
+	for _, tc := range []struct {
+		confirm, fingerprint, baseline string
+	}{
+		{"", "sha256:desired", configstore.BaselineAbsent},
+		{"wrong", "sha256:desired", configstore.BaselineAbsent},
+		{"the-id", "", configstore.BaselineAbsent},
+		{"the-id", "sha256:wrong", configstore.BaselineAbsent},
+		{"the-id", "sha256:desired", ""},
+	} {
+		if err := validateApplyApproval(p, tc.confirm, tc.fingerprint, tc.baseline); err == nil {
+			t.Fatalf("validateApplyApproval(%q,%q,%q) = nil, want refusal", tc.confirm, tc.fingerprint, tc.baseline)
+		}
 	}
 }
 
@@ -148,12 +177,52 @@ func TestPlanReportEmptyStoreCreatesNoFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareProject: %v", err)
 	}
-	report := planReport(dbPath, prepared)
+	report := planReport(dbPath, prepared, false)
 	if report.Effect != configstore.EffectCreate || report.Wrote {
 		t.Fatalf("empty-store plan = %+v, want create+!wrote", report)
 	}
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("plan created the store file %s (want it absent): stat err = %v", dbPath, err)
+	}
+}
+
+func TestPlanReportExistingStoreChangesNoDatabaseBytesOrSidecars(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "config.db")
+	store, err := configstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open writable fixture: %v", err)
+	}
+	if err := store.UpsertProject(context.Background(), "befeast-demo", projectTestYAML); err != nil {
+		t.Fatalf("seed fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close fixture: %v", err)
+	}
+	prepared, err := configstore.PrepareProject("p.yaml", []byte(projectTestYAML))
+	if err != nil {
+		t.Fatalf("PrepareProject: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read DB before plan: %v", err)
+	}
+	walBefore := storeFileExists(dbPath + "-wal")
+	shmBefore := storeFileExists(dbPath + "-shm")
+
+	report := planReport(dbPath, prepared, false)
+	if report.Effect != configstore.EffectNoOp || report.Wrote {
+		t.Fatalf("existing-store plan = %+v, want no-op+!wrote", report)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read DB after plan: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("project plan changed existing SQLite database bytes")
+	}
+	if storeFileExists(dbPath+"-wal") != walBefore || storeFileExists(dbPath+"-shm") != shmBefore {
+		t.Fatal("project plan created or removed SQLite sidecar files")
 	}
 }
 
@@ -173,10 +242,13 @@ func TestGenesisReceiptCycle(t *testing.T) {
 	}
 
 	// plan (absent store) → create.
-	planRep := planReport(dbPath, prepared)
+	planRep := planReport(dbPath, prepared, false)
 	planReceipt := buildGenesisReceipt("plan", dbPath, file, prepared, planRep)
 	if planReceipt.Effect != configstore.EffectCreate || planReceipt.Wrote {
 		t.Fatalf("plan receipt = %+v, want create+!wrote", planReceipt)
+	}
+	if planReceipt.SchemaVersion != 1 || planReceipt.BaselineFingerprint != configstore.BaselineAbsent {
+		t.Fatalf("plan receipt envelope = %+v, want schema v1 + absent baseline", planReceipt)
 	}
 	// The receipt must round-trip through JSON (adapter contract).
 	if _, err := json.Marshal(planReceipt); err != nil {
@@ -189,7 +261,7 @@ func TestGenesisReceiptCycle(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
-	applyRep, err := store.ApplyProject(ctx, prepared, prepared.ProjectID, prepared.Fingerprint)
+	applyRep, err := store.ApplyProject(ctx, prepared, prepared.ProjectID, prepared.Fingerprint, planReceipt.BaselineFingerprint)
 	if err != nil {
 		t.Fatalf("ApplyProject: %v", err)
 	}
@@ -229,5 +301,36 @@ func TestStoreFileExists(t *testing.T) {
 	}
 	if storeFileExists(dir) {
 		t.Fatal("directory reported as a store file")
+	}
+}
+
+func TestValidateGenesisRuntime(t *testing.T) {
+	dir := t.TempDir()
+	repoDir := filepath.Join(dir, "repo")
+	if err := os.Mkdir(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"init", repoDir},
+		{"-C", repoDir, "remote", "add", "origin", "git@github.com:BeFeast/demo.git"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	p := &configstore.PreparedProject{
+		Repo:         "BeFeast/demo",
+		LocalPath:    repoDir,
+		WorktreeBase: filepath.Join(dir, "worktrees", "demo"),
+	}
+	if err := os.Mkdir(filepath.Dir(p.WorktreeBase), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGenesisRuntime(p); err != nil {
+		t.Fatalf("valid runtime preflight: %v", err)
+	}
+	p.Repo = "BeFeast/other"
+	if err := validateGenesisRuntime(p); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("remote mismatch err = %v", err)
 	}
 }

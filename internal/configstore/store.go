@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -95,6 +96,48 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// OpenReadOnly opens an existing config store without initializing schema,
+// changing journal mode, or creating SQLite sidecar files. It is the only store
+// opener suitable for zero-write planning (#871).
+func OpenReadOnly(path string) (*Store, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	u := &url.URL{Scheme: "file", Path: abs}
+	q := u.Query()
+	q.Set("mode", "ro")
+	walExists := pathExists(abs + "-wal")
+	shmExists := pathExists(abs + "-shm")
+	switch {
+	case !walExists && !shmExists:
+		// A closed/checkpointed DB has no WAL state to discover. Immutable mode
+		// prevents SQLite from creating read-lock sidecars, preserving the
+		// zero-file-write plan contract.
+		q.Set("immutable", "1")
+	case walExists != shmExists:
+		return nil, fmt.Errorf("config store has an incomplete WAL sidecar set; refusing zero-write read-only open")
+	}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "query_only(1)")
+	u.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{db: db}, nil
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func (s *Store) Close() error {

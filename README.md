@@ -147,9 +147,11 @@ YAML
 #    Point --db at the same store the daemon unit reads (its --store path):
 maestro project plan  --file ~/myrepo.project.yaml --db ~/.maestro/maestro.db --json
 
-# 5. Apply it — idempotent; --confirm is the exact project_id from the plan:
+# 5. Apply the exact command in plan receipt `next[0]` — it pins identity,
+#    desired config fingerprint, and observed store baseline:
 maestro project apply --file ~/myrepo.project.yaml --db ~/.maestro/maestro.db \
-    --confirm 3f2504e0-4f89-41d3-9a0c-0305e82c3301 --json
+    --confirm 3f2504e0-4f89-41d3-9a0c-0305e82c3301 \
+    --fingerprint <sha256-from-plan> --baseline <baseline-from-plan> --json
 ```
 
 `plan` never writes; `apply` upserts exactly one row (a second identical apply is a
@@ -626,7 +628,8 @@ restart); removal stays a separate explicit action:
 
 ```bash
 maestro project plan  --file ./new-project.yaml --db ~/.maestro/maestro.db --json
-maestro project apply --file ./new-project.yaml --db ~/.maestro/maestro.db --confirm <project-id> --json
+maestro project apply --file ./new-project.yaml --db ~/.maestro/maestro.db \
+  --confirm <project-id> --fingerprint <sha256-from-plan> --baseline <baseline-from-plan> --json
 maestro config-store rm --db ~/.maestro/maestro.db <project>
 ```
 
