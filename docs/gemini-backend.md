@@ -126,7 +126,7 @@ The Gemini backend has unit tests covering:
 - **Config parsing** (`TestParse_GeminiDefaultBackend`, `TestParse_ModelConfigExplicit`): verifies YAML config with Gemini as default and with extra args
 - **Label routing** (`TestBackendFromLabels_AllKnownBackends`): verifies `model:gemini` label is recognized
 - **Backend resolution** (`TestResolveBackend_GeminiAsDefault`, `TestResolveBackend_GeminiLabelOverridesDefault`, `TestResolveBackend_LabelTakesPrecedenceOverAutoRouting`): verifies Gemini works as default and via label override
-- **Init validation** (`validBackends` in `cmd/maestro/init.go`): "gemini" is accepted by `maestro init`
+- **Backend selection**: "gemini" is a first-class `model.default` / `model:gemini` backend in a portable project config applied via `maestro project apply` (the retired `maestro init` wizard no longer gates backends; #871).
 
 ## Troubleshooting
 

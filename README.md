@@ -115,7 +115,11 @@ sudo mv maestro /usr/local/bin/  # or add to PATH
 
 ## Quickstart
 
-Get maestro running in under 5 minutes:
+Maestro runs as **one long-lived daemon** reading a shared SQLite config store:
+`maestro daemon --watch-store`. Each project is a single row in that store — there
+is no per-project service. The retired `maestro init` wizard (which scaffolded a
+per-project `maestro.yaml` + systemd/launchd unit) is gone; add projects with the
+`project plan`/`project apply` genesis flow instead.
 
 ```bash
 # 1. Install maestro
@@ -125,39 +129,44 @@ maestro version   # verify installation
 # 2. Clone your target repo (if not already)
 gh repo clone owner/myrepo ~/src/myrepo
 
-# 3. Run the interactive setup wizard
-cd ~/src/myrepo
-maestro init
+# 3. Write a portable project config (repo, local paths, and a stable project_id).
+#    Generate the UUID once and keep it: it is the durable identity apply confirms.
+cat > ~/myrepo.project.yaml <<'YAML'
+repo: owner/myrepo
+local_path: ~/src/myrepo
+worktree_base: ~/.worktrees/myrepo
+project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301   # e.g. `uuidgen | tr A-Z a-z`
+max_parallel: 3
+issue_labels:
+  - enhancement
+model:
+  default: claude
+YAML
 
-# 4. Add maestro.yaml to .gitignore (it contains local paths)
-echo "maestro.yaml" >> .gitignore
+# 4. Preview the effect on the config store — strictly validated, zero writes.
+#    Point --db at the same store the daemon unit reads (its --store path):
+maestro project plan  --file ~/myrepo.project.yaml --db ~/.maestro/maestro.db --json
+
+# 5. Apply it — idempotent; --confirm is the exact project_id from the plan:
+maestro project apply --file ~/myrepo.project.yaml --db ~/.maestro/maestro.db \
+    --confirm 3f2504e0-4f89-41d3-9a0c-0305e82c3301 --json
 ```
 
-The `maestro init` wizard will ask you for:
-- **GitHub repo** (owner/repo format)
-- **Local clone path** (where the repo lives on disk)
-- **Worktree base dir** (where worker worktrees are created)
-- **Max parallel workers** (how many agents run simultaneously)
-- **Default model backend** (claude, codex, gemini, or cline)
-- **Issue label filter** (which issues to pick up, e.g. `enhancement`)
-- **Telegram notifications** (optional)
-
-It generates a `maestro.yaml` config file and a systemd/launchd service file.
+`plan` never writes; `apply` upserts exactly one row (a second identical apply is a
+reported no-op, and an identity conflict is a hard stop that never overwrites by
+name). The single `maestro daemon --watch-store` observes the new row within one
+poll interval and starts one flow — no restart, no `systemctl enable` per project.
+Removing a project stays a separate explicit operator action (`maestro config-store
+rm <name>`).
 
 ```bash
-# 4. Do a test run (picks one issue, runs once, then exits)
-maestro run --once
-
-# 5. Check status
+# Check status
 maestro status
 
-# 6. Watch the Mission Control dashboard (trusted-LAN default: write-enabled)
+# Watch the Mission Control dashboard (trusted-LAN default: write-enabled)
 #    Add --read-only=true (or set server.read_only: true in YAML) for installs
 #    exposed beyond a trusted LAN; #616 covers optional HTTP auth.
 maestro serve --port 8787
-
-# 7. When ready, run continuously
-maestro run
 ```
 
 That's it. Maestro will now pick up issues matching your configured label, spawn AI agents in isolated worktrees, and auto-merge PRs when CI passes.
@@ -553,30 +562,17 @@ max_parallel: 3
 
 ### Running as a Service
 
-#### Single project (Linux — systemd)
+Maestro runs from **one** unit — `maestro daemon --watch-store` — that drives
+every project in a shared SQLite config store. There is no per-project service:
+the retired `maestro init` wizard no longer generates `maestro.service` or a
+launchd plist. Register projects with `maestro project plan`/`project apply`
+(see [Quickstart](#quickstart)); the daemon hot-reconciles new rows without a
+restart.
 
-`maestro init` automatically creates a systemd user service at `~/.config/systemd/user/maestro.service`. To enable it:
+> **Note:** User services require `loginctl enable-linger $USER` to keep running
+> when you're not logged in.
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now maestro.service
-
-# Check status
-systemctl --user status maestro.service
-journalctl --user -u maestro.service -f
-```
-
-> **Note:** User services require `loginctl enable-linger $USER` to keep running when you're not logged in.
-
-#### Single project (macOS — launchd)
-
-`maestro init` creates a launchd plist at `~/Library/LaunchAgents/com.maestro.agent.plist`:
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.maestro.agent.plist
-```
-
-#### Multiple projects (single-service daemon)
+#### The single-service daemon
 
 For a fleet, run **one** `maestro.service` that drives every project. `maestro
 daemon` runs an orchestrator + supervisor loop per project in a single process
@@ -624,11 +620,14 @@ systemctl --user enable --now maestro@panoptikon maestro@myapp   # re-enable old
 ```
 
 **Adding / removing projects at runtime.** With the daemon you no longer create a
-unit per project. Edit the store and the daemon hot-reconciles (no restart):
+unit per project. Register a project through the genesis flow (strict validation +
+an explicit `project_id` confirmation) and the daemon hot-reconciles it (no
+restart); removal stays a separate explicit action:
 
 ```bash
-maestro config-store add --db ~/.maestro/maestro.db --file ./new-project.yaml
-maestro config-store rm  --db ~/.maestro/maestro.db <project>
+maestro project plan  --file ./new-project.yaml --db ~/.maestro/maestro.db --json
+maestro project apply --file ./new-project.yaml --db ~/.maestro/maestro.db --confirm <project-id> --json
+maestro config-store rm --db ~/.maestro/maestro.db <project>
 ```
 
 The fleet dashboard exposes the same as authenticated, audited endpoints —
@@ -699,7 +698,8 @@ Maestro looks for config in this order:
 2. `maestro.yaml` in the current directory
 3. `~/.maestro/config.yaml`
 
-Run `maestro init` in your repo directory to create a config, or pass an explicit path:
+Write a portable project config and register it with `maestro project apply` (see
+[Quickstart](#quickstart)), or pass an explicit config path for a one-off run:
 
 ```bash
 maestro run --config ~/.maestro/maestro-myapp.yaml

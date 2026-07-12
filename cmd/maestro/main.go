@@ -43,7 +43,8 @@ Usage:
   maestro <command> [flags]
 
 Commands:
-  init          Interactive setup wizard for new projects
+  init          (retired) Redirects to 'project plan/apply' — no longer scaffolds per-project services
+  project       Genesis flow for the single daemon: plan (zero-write validate) / apply (idempotent config-store upsert)
   run           Run the orchestration loop
   supervise     Run supervisor decision loop with safe queue actions
   serve         Run Mission Control read-only web dashboard/API
@@ -171,6 +172,19 @@ Digest flags:
 
 Watch:
   maestro watch             Open tmux dashboard attached to live worker sessions
+
+Project (single-daemon genesis, replaces the retired init wizard):
+  maestro project plan  --file <portable-project.yaml> --db <store> [--json]
+                            Strict-validate the config and preview its effect on the
+                            store (create/update/no-op/conflict). Zero writes.
+  maestro project apply --file <portable-project.yaml> --db <store> --confirm <project-id> [--fingerprint <sha256:...>] [--json]
+                            Idempotently upsert exactly one config-store row after an
+                            explicit project_id confirmation (and optional plan-time
+                            fingerprint gate). A matching row is a reported no-op; an
+                            identity conflict is a hard stop that never overwrites.
+                            The single 'maestro daemon --watch-store' then observes the
+                            row and reconciles one flow — no per-project service is
+                            created. Removal/rollback stays a separate operator action.
 `
 
 // version is set at build time via -ldflags "-X main.version=X.Y.Z".
@@ -358,6 +372,8 @@ func main() {
 		importCmd(args)
 	case "config-store":
 		configStoreCmd(args)
+	case "project":
+		projectCmd(args)
 	case "settings":
 		settingsCmd(args)
 	case "history":

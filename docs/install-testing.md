@@ -24,6 +24,14 @@ Fresh machine (not .14 or .22), testing the full install -> init -> run flow.
 
 ## maestro init
 
+> **Superseded (#871).** The `maestro init` wizard described below is retired.
+> Maestro now runs as one `maestro daemon --watch-store` over a shared config
+> store, and projects are registered with the zero-write `maestro project plan` /
+> idempotent `maestro project apply` genesis flow — no per-project `maestro.yaml`
+> or systemd/launchd service. See the "Adding a project (single-daemon genesis)"
+> section of [`project-setup-runbook.md`](project-setup-runbook.md). The notes
+> below are retained as a historical record of the old flow.
+
 ### What works
 - Interactive prompts with sensible defaults
 - Repo format validation (owner/repo)
