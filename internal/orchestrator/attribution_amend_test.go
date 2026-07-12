@@ -291,8 +291,8 @@ func TestAmendHead_DivergedHeadDefersWithoutDiscard(t *testing.T) {
 	remoteHeadBefore := amendGit(t, origin, "rev-parse", branch)
 
 	err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), time.Now().UTC())
-	if !errors.Is(err, errAmendDeferred) {
-		t.Fatalf("expected errAmendDeferred on divergence, got: %v", err)
+	if !errors.Is(err, errAmendDiverged) {
+		t.Fatalf("expected errAmendDiverged on divergence, got: %v", err)
 	}
 
 	// Origin is untouched, and our unpushed local work still exists locally.
@@ -302,4 +302,173 @@ func TestAmendHead_DivergedHeadDefersWithoutDiscard(t *testing.T) {
 	if got := amendGit(t, wt, "show", "HEAD:local.txt"); !strings.Contains(got, "unpushed") {
 		t.Fatalf("local unpushed commit was discarded: %q", got)
 	}
+}
+
+// setupNarrowAmendRepo builds the same origin + seed as setupAmendRepo, but the
+// orchestrator worktree (wt) intentionally tracks ONLY main — the narrow fetch
+// refspec `+refs/heads/main:refs/remotes/origin/main`. It checks out the feature
+// branch from an explicit fetch (FETCH_HEAD), so there is NO
+// refs/remotes/origin/<branch> tracking ref. This is the exact production shape
+// (#873) where the old implicit `--force-with-lease` had no expected value and
+// git rejected every push as "stale info", wedging a quiet branch forever.
+func setupNarrowAmendRepo(t *testing.T) (origin, wt, seed, branch string) {
+	t.Helper()
+	branch = "feat/sup-873-narrow-refspec"
+	root := t.TempDir()
+	origin = filepath.Join(root, "origin.git")
+	seed = filepath.Join(root, "seed")
+	wt = filepath.Join(root, "wt")
+
+	amendGit(t, root, "init", "--bare", origin)
+	amendGit(t, origin, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	amendGit(t, root, "clone", origin, seed)
+	amendConfig(t, seed)
+	amendWrite(t, seed, "README.md", "v1\n")
+	amendGit(t, seed, "add", "README.md")
+	amendGit(t, seed, "commit", "-m", "initial")
+	amendGit(t, seed, "push", "-u", "origin", "main")
+	amendGit(t, seed, "checkout", "-b", branch)
+	amendWrite(t, seed, "work.txt", "worker output v1\n")
+	amendGit(t, seed, "add", "work.txt")
+	amendGit(t, seed, "commit", "-m", "worker: implement feature")
+	amendGit(t, seed, "push", "-u", "origin", branch)
+
+	// Clone tracking only main, then check out the feature branch from an
+	// explicit fetch so no origin/<branch> remote-tracking ref is ever created.
+	amendGit(t, root, "clone", "--single-branch", "--branch", "main", origin, wt)
+	amendConfig(t, wt)
+	amendGit(t, wt, "fetch", "origin", branch)
+	amendGit(t, wt, "checkout", "-b", branch, "FETCH_HEAD")
+	return origin, wt, seed, branch
+}
+
+// assertNoRemoteTrackingFeatureRef fails if refs/remotes/origin/<branch> exists
+// in wt — the precondition that makes the narrow-refspec wedge reproducible.
+func assertNoRemoteTrackingFeatureRef(t *testing.T, wt, branch string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", wt, "show-ref", "--verify", "--quiet", "refs/remotes/origin/"+branch)
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("precondition failed: refs/remotes/origin/%s exists — narrow-refspec wedge not reproduced", branch)
+	}
+}
+
+// A quiet feature branch (local == remote) under the narrow fetch refspec must
+// receive the attribution trailer exactly once, with NO deferral — the #873
+// wedge. The old implicit `--force-with-lease` had no expected value here and
+// git rejected the push as "stale info", deferring every cycle forever.
+func TestAmendHead_NarrowRefspec_QuietBranchConverges(t *testing.T) {
+	origin, wt, _, branch := setupNarrowAmendRepo(t)
+	assertNoRemoteTrackingFeatureRef(t, wt, branch)
+
+	now := time.Date(2026, 7, 12, 4, 5, 0, 0, time.UTC)
+	if err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), now); err != nil {
+		t.Fatalf("quiet narrow-refspec branch must converge without deferring, got: %v", err)
+	}
+
+	headMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", branch)
+	if !strings.Contains(headMsg, state.AttributionTrailerKey+":") {
+		t.Fatalf("origin head missing attribution trailer:\n%s", headMsg)
+	}
+	if n := trailerCount(headMsg); n != 1 {
+		t.Fatalf("trailer appears %d times, want exactly 1:\n%s", n, headMsg)
+	}
+	// The fix must not broaden the configured refspec as a side effect.
+	if got := amendGit(t, wt, "config", "--get-all", "remote.origin.fetch"); got != "+refs/heads/main:refs/remotes/origin/main" {
+		t.Fatalf("fetch refspec broadened by the amend: %q", got)
+	}
+	// And it must not have created an origin/<branch> tracking ref behind our back.
+	assertNoRemoteTrackingFeatureRef(t, wt, branch)
+}
+
+// Under the narrow refspec, a concurrent worker push that lands in the race
+// window must still be fetched (via FETCH_HEAD, not origin/<branch>),
+// ancestry-checked, retained, and attributed on retry — landing the trailer once
+// on the worker's real commit.
+func TestAmendHead_NarrowRefspec_ConcurrentDescendantAttributedOnRetry(t *testing.T) {
+	origin, wt, seed, branch := setupNarrowAmendRepo(t)
+	assertNoRemoteTrackingFeatureRef(t, wt, branch)
+
+	prevBackoff := amendRetryBackoff
+	amendRetryBackoff = 0
+	defer func() { amendRetryBackoff = prevBackoff }()
+
+	fired := false
+	amendPushRaceHook = func() {
+		if fired {
+			return
+		}
+		fired = true
+		amendWrite(t, seed, "work.txt", "worker output v2 (concurrent)\n")
+		amendGit(t, seed, "commit", "-am", "worker: follow-up commit")
+		amendGit(t, seed, "push", "origin", branch)
+	}
+	defer func() { amendPushRaceHook = nil }()
+
+	now := time.Date(2026, 7, 12, 4, 5, 0, 0, time.UTC)
+	if err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), now); err != nil {
+		t.Fatalf("amend should recover from the race under a narrow refspec, got: %v", err)
+	}
+	if !fired {
+		t.Fatal("race hook never fired — test did not exercise the stale-info path")
+	}
+
+	headMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", branch)
+	if n := trailerCount(headMsg); n != 1 {
+		t.Fatalf("trailer appears %d times, want exactly 1:\n%s", n, headMsg)
+	}
+	if !strings.Contains(headMsg, "worker: follow-up commit") {
+		t.Fatalf("head is not the worker's follow-up commit reworded:\n%s", headMsg)
+	}
+	work := amendGit(t, origin, "show", branch+":work.txt")
+	if !strings.Contains(work, "concurrent") {
+		t.Fatalf("worker's concurrent work.txt was discarded: %q", work)
+	}
+}
+
+// Under the narrow refspec, a divergent remote update (neither head descends from
+// the other) must never be overwritten: the amend defers (errAmendDiverged) and
+// leaves origin untouched.
+func TestAmendHead_NarrowRefspec_DivergenceNeverOverwritten(t *testing.T) {
+	origin, wt, seed, branch := setupNarrowAmendRepo(t)
+	assertNoRemoteTrackingFeatureRef(t, wt, branch)
+
+	// A local unpushed commit on wt...
+	amendWrite(t, wt, "local.txt", "unpushed worker work\n")
+	amendGit(t, wt, "add", "local.txt")
+	amendGit(t, wt, "commit", "-m", "worker: unpushed local commit")
+
+	// ...while origin advances to a diverging sibling commit.
+	amendWrite(t, seed, "work.txt", "diverging remote push\n")
+	amendGit(t, seed, "commit", "-am", "operator: diverging push")
+	amendGit(t, seed, "push", "origin", branch)
+
+	remoteHeadBefore := amendGit(t, origin, "rev-parse", branch)
+
+	err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), time.Now().UTC())
+	if !errors.Is(err, errAmendDiverged) {
+		t.Fatalf("expected errAmendDiverged on divergence, got: %v", err)
+	}
+	if after := amendGit(t, origin, "rev-parse", branch); after != remoteHeadBefore {
+		t.Fatalf("origin head moved on a diverged defer: %s -> %s", remoteHeadBefore, after)
+	}
+	if got := amendGit(t, wt, "show", "HEAD:local.txt"); !strings.Contains(got, "unpushed") {
+		t.Fatalf("local unpushed commit was discarded: %q", got)
+	}
+}
+
+// A missing remote branch must be reported distinctly (errAmendFetchFailed), NOT
+// as an advancing-race deferral: only proven movement says "advancing under
+// concurrent push" (#873).
+func TestAmendHead_NarrowRefspec_MissingBranchReportedDistinctly(t *testing.T) {
+	_, wt, _, branch := setupNarrowAmendRepo(t)
+
+	err := amendHeadWithAttributionTrailer(wt, "feat/sup-873-does-not-exist", testAttribution(), time.Now().UTC())
+	if !errors.Is(err, errAmendFetchFailed) {
+		t.Fatalf("expected errAmendFetchFailed for a missing remote branch, got: %v", err)
+	}
+	if errors.Is(err, errAmendDeferred) {
+		t.Fatal("a missing remote branch must not be reported as an advancing-race deferral")
+	}
+	_ = branch
 }
