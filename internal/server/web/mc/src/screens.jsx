@@ -327,7 +327,7 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
 // managementHomeView (fleetApi.js) or null; a null home renders nothing, so a
 // legacy project shows no dead panel or button. The vault-relative path is the
 // primary label, never the absolute execution-host path.
-function ManagementHomePanel({ home, projectId }) {
+export function ManagementHomePanel({ home, projectId }) {
   if (!home) return null;
   return (
     <Panel title="Management Home" sub={home.kind || undefined}>
@@ -353,7 +353,7 @@ function ManagementHomePanel({ home, projectId }) {
 //
 // The absolute path is display/copy only — this component never emits it to any
 // GitHub-facing surface.
-function ManagementHomeBody({ home, projectId }) {
+export function ManagementHomeBody({ home, projectId }) {
   // null = idle; otherwise "ok" | "unavailable" | "error".
   const [copyState, setCopyState] = React.useState(null);
   const onCopyPath = React.useCallback(async () => {
@@ -387,11 +387,16 @@ function ManagementHomeBody({ home, projectId }) {
           </button>
         )}
         {home.uri && (
-          <a className="tb-btn ghost" href={home.uri} title="Open this Area in Obsidian">
+          <a className="tb-btn ghost" href={home.uri} title="Requires a local Obsidian protocol handler">
             Open in Obsidian →
           </a>
         )}
       </div>
+      {home.uri && (
+        <div className="dim" style={{ marginTop: 8, fontSize: 11.5 }}>
+          Requires Obsidian with its local protocol handler; the selectable path above remains the fallback.
+        </div>
+      )}
       {copyState && (
         <div style={{ marginTop: 8, fontSize: 12, color: copyState === "ok" ? "var(--ok)" : "var(--watch)" }}>
           {copyState === "ok"

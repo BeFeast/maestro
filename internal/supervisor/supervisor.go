@@ -3757,6 +3757,10 @@ func applyQueueAction(cfg *config.Config, decision *state.SupervisorDecision, mu
 	completed := make([]string, 0, len(decision.Mutations))
 	for i := range decision.Mutations {
 		mutation := decision.Mutations[i]
+		if mutation.Type == MutationIssueComment {
+			mutation.Body = sanitizeManagementHomePath(cfg, mutation.Body)
+			decision.Mutations[i].Body = mutation.Body
+		}
 		if err := applyQueueMutation(mutator, mutation); err != nil {
 			markQueueActionFailed(decision, i, classifyGitHubError(err))
 			return
@@ -3779,6 +3783,22 @@ func applyQueueAction(cfg *config.Config, decision *state.SupervisorDecision, mu
 		}
 		decision.Mutations[commentIndex].Status = MutationStatusSucceeded
 	}
+}
+
+// sanitizeManagementHomePath is the last deterministic boundary before an
+// LLM-authored supervisor comment reaches GitHub (#870). The supervisor packet
+// legitimately contains the private execution-host path, but an issue comment
+// must never reproduce it. Redact the exact configured path both from the
+// outbound mutation and from the decision persisted for Mission Control/audit.
+func sanitizeManagementHomePath(cfg *config.Config, body string) string {
+	if cfg == nil {
+		return body
+	}
+	path := strings.TrimSpace(cfg.ManagementHome.Path)
+	if path == "" {
+		return body
+	}
+	return strings.ReplaceAll(body, path, "[management-home-path]")
 }
 
 // decisionAlreadyComments reports whether the decision's mutations already
