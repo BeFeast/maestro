@@ -425,17 +425,52 @@ The capture command runs from the worktree root with
 screenshots. `verify.visual.enabled: true` without `command`/`paths` logs a
 config warning and stays inert.
 
-### Running as a systemd service
+### Adding a project (single-daemon genesis)
+
+Maestro runs as **one long-lived daemon** — `maestro daemon --watch-store` —
+reading a shared SQLite config store. Each project is a single row in that store;
+there is no per-project service. The old `maestro init` wizard (per-project
+`maestro.yaml` + a `maestro@<project>` unit) is retired: running it now only prints
+a redirect to the flow below.
+
+Register a project with the zero-write `plan` / idempotent `apply` genesis flow.
+Write a portable project config with `repo`, `local_path`, `worktree_base`, and a
+stable `project_id` (generate the UUID once — it is the durable identity `apply`
+confirms), then:
+
+Point `--db` at the same store the daemon unit reads (its `--store` path; the
+shipped `maestro.service` uses `%h/.maestro/maestro.db`).
 
 ```bash
-# Single project
-maestro init  # creates ~/.config/systemd/user/maestro.service
+# 1. Preview the effect on the store — strictly validated, changes no files/rows:
+maestro project plan  --file ~/myproject.project.yaml --db ~/.maestro/maestro.db --json
 
-# Multiple projects — use the template unit
-cp maestro@.service ~/.config/systemd/user/
-systemctl --user enable --now maestro@myproject
-# This reads ~/.maestro/maestro-myproject.yaml
+# 2. Apply the exact `next[0]` command returned by the approved plan receipt:
+maestro project apply --file ~/myproject.project.yaml --db ~/.maestro/maestro.db \
+    --confirm <project-id> --fingerprint <sha256-from-plan> \
+    --baseline <baseline-from-plan> --json
 ```
+
+`plan` is read-only and reports the predicted effect (`create` / `update` /
+`no-op` / `conflict`) plus a config fingerprint. `apply` refuses a missing/wrong
+`--confirm`, the exact desired `--fingerprint`, and the plan-time store
+`--baseline`; a config-file or concurrent store change is refused. A second
+identical apply is a reported no-op; an identity conflict is a hard
+stop that never overwrites a row by name. Both emit a machine-readable receipt
+(store, project id, fingerprint, effect, daemon-reconciliation expectation, exact
+next commands) for scripted bootstrap adapters.
+
+The running `maestro daemon --watch-store` observes the new row within one poll
+interval and starts exactly one flow — no restart, no `systemctl` step per project.
+Removal/rollback stays a separate explicit operator action:
+
+```bash
+maestro config-store rm --db ~/.maestro/maestro.db <name>   # drains the flow; the daemon reconciles the removal
+```
+
+The daemon itself runs from a single unit (see the fleet unit below); if it is not
+running with `--watch-store`, a newly applied row is picked up only on its next
+restart, and `project apply` says so in its receipt.
 
 ### Fleet dashboard operating model
 
