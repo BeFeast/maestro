@@ -26,6 +26,7 @@ import {
   workerNextAction,
   workerSessionsFromFleet,
 } from "./fleetApi.js";
+import { copyText } from "./managementHome.js";
 import { parseTimestamp, relTime, truncateBranchName } from "./utils.js";
 
 function cssEscape(value) {
@@ -286,6 +287,8 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
 
         {p.projectBoard && <ProjectBoardPanel board={p.projectBoard} />}
 
+        <ManagementHomePanel home={p.managementHome} projectId={p.projectId} />
+
         <div className="span-2">
           <QueueNextPanel p={p} />
         </div>
@@ -316,6 +319,94 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ManagementHomePanel surfaces a project's configured Management Home (#870) on
+// the project-detail dashboard. `home` is the normalized view from
+// managementHomeView (fleetApi.js) or null; a null home renders nothing, so a
+// legacy project shows no dead panel or button. The vault-relative path is the
+// primary label, never the absolute execution-host path.
+export function ManagementHomePanel({ home, projectId }) {
+  if (!home) return null;
+  return (
+    <Panel title="Management Home" sub={home.kind || undefined}>
+      <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+        <ManagementHomeBody home={home} projectId={projectId} />
+      </div>
+    </Panel>
+  );
+}
+
+// ManagementHomeBody renders the shared Management Home body used by both the
+// project-detail panel and the effective-config surface (#870):
+//
+//   - The vault-relative path (e.g. Dev/Areas/<slug>) is the primary label.
+//   - "Copy Path" copies the EXACT configured absolute execution-host path and
+//     reports success/failure honestly via copyText — when the clipboard is
+//     unavailable it says so, and the absolute path stays selectable below so an
+//     operator can copy it manually.
+//   - "Open in Obsidian" navigates the structured obsidian:// URI derived from
+//     the vault + vault_path fields (managementHome.js), never from slicing the
+//     absolute path. The button is omitted when the URI can't be built, so no
+//     dead link is shown.
+//
+// The absolute path is display/copy only — this component never emits it to any
+// GitHub-facing surface.
+export function ManagementHomeBody({ home, projectId }) {
+  // null = idle; otherwise "ok" | "unavailable" | "error".
+  const [copyState, setCopyState] = React.useState(null);
+  const onCopyPath = React.useCallback(async () => {
+    const res = await copyText(home.path);
+    setCopyState(res.ok ? "ok" : (res.reason || "error"));
+    setTimeout(() => setCopyState(null), 1600);
+  }, [home.path]);
+
+  return (
+    <>
+      <div className="kv">
+        <span>Home</span>
+        <strong className="mono" style={{ userSelect: "text" }}>{home.label}</strong>
+      </div>
+      {home.path && (
+        <div className="kv">
+          <span>Path</span>
+          <span className="mono" style={{ userSelect: "text", wordBreak: "break-all", textAlign: "right" }}>{home.path}</span>
+        </div>
+      )}
+      {projectId && (
+        <div className="kv">
+          <span>Project id</span>
+          <span className="mono dim" style={{ userSelect: "text" }}>{projectId}</span>
+        </div>
+      )}
+      <div className="hb-actions" style={{ marginTop: 12 }}>
+        {home.path && (
+          <button type="button" className="tb-btn" onClick={onCopyPath} title="Copy the absolute execution-host path">
+            Copy Path
+          </button>
+        )}
+        {home.uri && (
+          <a className="tb-btn ghost" href={home.uri} title="Requires a local Obsidian protocol handler">
+            Open in Obsidian →
+          </a>
+        )}
+      </div>
+      {home.uri && (
+        <div className="dim" style={{ marginTop: 8, fontSize: 11.5 }}>
+          Requires Obsidian with its local protocol handler; the selectable path above remains the fallback.
+        </div>
+      )}
+      {copyState && (
+        <div style={{ marginTop: 8, fontSize: 12, color: copyState === "ok" ? "var(--ok)" : "var(--watch)" }}>
+          {copyState === "ok"
+            ? "Path copied to clipboard."
+            : copyState === "unavailable"
+              ? "Clipboard unavailable — select the path above to copy it manually."
+              : "Copy failed — select the path above to copy it manually."}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1796,6 +1887,16 @@ function EffectiveConfigView({ project, onEdit }) {
         <div className="kv"><span>Supervisor approvals</span><TagList values={gate.approvalRequired} /></div>
         <div className="kv"><span>Completion labels</span><TagList values={labels.completionRequired} /></div>
       </div>
+
+      {project.managementHome && (
+        <div className="settings-section">
+          <div className="settings-section-title">Management Home</div>
+          <div className="dim" style={{ fontSize: 11.5, marginBottom: "var(--s-3)" }}>
+            Private PM / control-room link. Metadata only — Maestro never reads or writes it, and the absolute path is never posted to GitHub.
+          </div>
+          <ManagementHomeBody home={project.managementHome} projectId={project.projectId} />
+        </div>
+      )}
 
       <div className="settings-section">
         <div className="settings-section-title">Retention and cost caps</div>

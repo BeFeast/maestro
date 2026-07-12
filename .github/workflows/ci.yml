@@ -25,6 +25,9 @@ jobs:
         run: bash scripts/check-design-recipes.sh
       - name: Design recipe nesting guard
         run: bash scripts/check-design-recipe-nesting.sh
+      - name: Test MC frontend
+        working-directory: internal/server/web/mc
+        run: bun test
       - name: Build MC bundle
         working-directory: internal/server/web/mc
         run: bun run build

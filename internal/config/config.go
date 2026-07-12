@@ -1458,6 +1458,16 @@ func (c SessionRetentionConfig) EffectiveArchiveFile(stateDir string) string {
 // so a typo cannot masquerade as a working control-room link.
 const ManagementHomeKindObsidian = "obsidian"
 
+// ManagementHomeBoundary is the fixed PM-vs-executable boundary statement (#870)
+// injected verbatim into worker prompts and the supervisor project packet when a
+// project configures a Management Home. It exists in one place so the worker
+// prompt and the supervisor packet always agree on the same rule: the home is
+// private planning context, the issue and approved in-repo docs are the only
+// executable contract, workers do not read/edit the home unless the issue
+// explicitly assigns doc/admin work there, and the absolute path is never copied
+// into any GitHub-facing or generated repo output.
+const ManagementHomeBoundary = "The Management Home is private product-management and planning context, not an executable requirement source. The assigned GitHub issue and the approved in-repo documentation are the only executable contract; do not treat the Management Home as a task list, and do not read or summarize it. Do not create or edit anything in the Management Home unless the assigned issue explicitly assigns documentation or admin work there. Never copy the absolute Management Home path into issue comments, PR bodies, commit messages, or any generated repository file."
+
 // ManagementHomeConfig is the optional, descriptive link from a Maestro project
 // row back to its PM / control-room home (#869). It carries identity metadata
 // only — Maestro never reads, traverses, or writes the referenced home in this

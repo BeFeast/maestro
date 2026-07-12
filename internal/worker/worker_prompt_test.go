@@ -552,3 +552,63 @@ func TestAssemblePrompt_SanitizesInjectedFileContext(t *testing.T) {
 		t.Fatalf("replacement count = %d, want 2; prompt=%q", got, prompt)
 	}
 }
+
+func managementHomeCfg(repo string) *config.Config {
+	return &config.Config{
+		Repo:      repo,
+		ProjectID: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		ManagementHome: config.ManagementHomeConfig{
+			Kind:      config.ManagementHomeKindObsidian,
+			Path:      "/srv/example-vault/Dev/Areas/maestro",
+			Vault:     "god",
+			VaultPath: "Dev/Areas/maestro",
+		},
+	}
+}
+
+func TestAssemblePromptIncludesManagementHomeBoundary(t *testing.T) {
+	cfg := managementHomeCfg("BeFeast/maestro")
+	issue := github.Issue{Number: 870, Title: "management home", Body: "surface it"}
+
+	prompt := assemblePrompt("base prompt", issue, "/tmp/worktree", "feat/mh", cfg)
+
+	for _, want := range []string{
+		"## Management Home (private PM context)",
+		config.ManagementHomeBoundary,
+		"Project id: `3f2504e0-4f89-41d3-9a0c-0305e82c3301`",
+		"Management Home (vault-relative): `Dev/Areas/maestro`",
+		"/srv/example-vault/Dev/Areas/maestro",
+		"never post/copy this into GitHub or repo files",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("assemblePrompt() missing %q\nprompt:\n%s", want, prompt)
+		}
+	}
+}
+
+// TestAssemblePromptIncludesManagementHomeBoundaryTemplatePath exercises the
+// {{ISSUE_NUMBER}} template branch of assemblePrompt as well as the legacy path.
+func TestAssemblePromptIncludesManagementHomeBoundaryTemplatePath(t *testing.T) {
+	cfg := managementHomeCfg("BeFeast/maestro")
+	issue := github.Issue{Number: 870, Title: "management home", Body: "surface it"}
+
+	prompt := assemblePrompt("base prompt with {{ISSUE_NUMBER}}", issue, "/tmp/worktree", "feat/mh", cfg)
+
+	if !strings.Contains(prompt, "## Management Home (private PM context)") {
+		t.Fatalf("template-path prompt missing Management Home section\nprompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, config.ManagementHomeBoundary) {
+		t.Fatalf("template-path prompt missing boundary statement")
+	}
+}
+
+func TestAssemblePromptOmitsManagementHomeWhenUnconfigured(t *testing.T) {
+	cfg := &config.Config{Repo: "BeFeast/maestro"}
+	issue := github.Issue{Number: 1, Title: "no home", Body: "body"}
+
+	prompt := assemblePrompt("base prompt", issue, "/tmp/worktree", "feat/nohome", cfg)
+
+	if strings.Contains(prompt, "Management Home") {
+		t.Fatalf("unconfigured project should render no Management Home section\nprompt:\n%s", prompt)
+	}
+}
