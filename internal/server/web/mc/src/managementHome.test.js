@@ -32,12 +32,12 @@ describe("managementHomeView", () => {
   test("primary label is the vault-relative path, not the absolute path", () => {
     const view = managementHomeView({
       kind: "obsidian",
-      path: "/home/god/vault/Dev/Areas/maestro",
+      path: "/srv/example-vault/Dev/Areas/maestro",
       vault: "god",
       vault_path: "Dev/Areas/maestro",
     });
     expect(view.label).toBe("Dev/Areas/maestro");
-    expect(view.path).toBe("/home/god/vault/Dev/Areas/maestro");
+    expect(view.path).toBe("/srv/example-vault/Dev/Areas/maestro");
     expect(view.uri).toBe("obsidian://open?vault=god&file=Dev%2FAreas%2Fmaestro");
   });
 
@@ -49,10 +49,10 @@ describe("managementHomeView", () => {
   });
 
   test("omits the URI when vault/vault_path are incomplete but keeps the path", () => {
-    const view = managementHomeView({ kind: "obsidian", path: "/home/god/notes" });
+    const view = managementHomeView({ kind: "obsidian", path: "/srv/example-vault/notes" });
     expect(view).not.toBe(null);
     expect(view.uri).toBe("");
-    expect(view.label).toBe("/home/god/notes");
+    expect(view.label).toBe("/srv/example-vault/notes");
   });
 });
 
@@ -60,9 +60,9 @@ describe("copyText", () => {
   test("resolves ok on a working clipboard", async () => {
     let written = "";
     const clip = { writeText: async (t) => { written = t; } };
-    const res = await copyText("/home/god/vault/Dev/Areas/maestro", clip);
+    const res = await copyText("/srv/example-vault/Dev/Areas/maestro", clip);
     expect(res.ok).toBe(true);
-    expect(written).toBe("/home/god/vault/Dev/Areas/maestro");
+    expect(written).toBe("/srv/example-vault/Dev/Areas/maestro");
   });
 
   test("reports unavailable when clipboard is missing (degrades honestly)", async () => {

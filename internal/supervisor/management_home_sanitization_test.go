@@ -9,12 +9,12 @@ import (
 )
 
 func TestApplyQueueActionRedactsManagementHomePathFromIssueComment(t *testing.T) {
-	const privatePath = "/home/god/Obsidian Vault/Dev/Areas/maestro"
+	const privatePath = "/srv/example-vault/Dev/Areas/maestro"
 	cfg := testConfig(t)
 	cfg.ManagementHome = config.ManagementHomeConfig{
 		Kind:      config.ManagementHomeKindObsidian,
 		Path:      privatePath,
-		Vault:     "Obsidian Vault",
+		Vault:     "Example Vault",
 		VaultPath: "Dev/Areas/maestro",
 	}
 	reader := &fakeReader{}

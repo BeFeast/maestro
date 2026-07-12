@@ -17,7 +17,7 @@ func TestProjectConfigPacketIncludesManagementHome(t *testing.T) {
 	cfg.ProjectID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
 	cfg.ManagementHome = config.ManagementHomeConfig{
 		Kind:      config.ManagementHomeKindObsidian,
-		Path:      "/home/god/vault/Dev/Areas/maestro",
+		Path:      "/srv/example-vault/Dev/Areas/maestro",
 		Vault:     "god",
 		VaultPath: "Dev/Areas/maestro",
 	}
@@ -34,7 +34,7 @@ func TestProjectConfigPacketIncludesManagementHome(t *testing.T) {
 	if pkt.ManagementHome.VaultPath != "Dev/Areas/maestro" {
 		t.Fatalf("VaultPath = %q, want Dev/Areas/maestro", pkt.ManagementHome.VaultPath)
 	}
-	if pkt.ManagementHome.Path != "/home/god/vault/Dev/Areas/maestro" {
+	if pkt.ManagementHome.Path != "/srv/example-vault/Dev/Areas/maestro" {
 		t.Fatalf("Path = %q, want the absolute execution-host path", pkt.ManagementHome.Path)
 	}
 	if pkt.ManagementHome.Boundary != config.ManagementHomeBoundary {

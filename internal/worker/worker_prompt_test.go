@@ -559,7 +559,7 @@ func managementHomeCfg(repo string) *config.Config {
 		ProjectID: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
 		ManagementHome: config.ManagementHomeConfig{
 			Kind:      config.ManagementHomeKindObsidian,
-			Path:      "/home/god/vault/Dev/Areas/maestro",
+			Path:      "/srv/example-vault/Dev/Areas/maestro",
 			Vault:     "god",
 			VaultPath: "Dev/Areas/maestro",
 		},
@@ -577,7 +577,7 @@ func TestAssemblePromptIncludesManagementHomeBoundary(t *testing.T) {
 		config.ManagementHomeBoundary,
 		"Project id: `3f2504e0-4f89-41d3-9a0c-0305e82c3301`",
 		"Management Home (vault-relative): `Dev/Areas/maestro`",
-		"/home/god/vault/Dev/Areas/maestro",
+		"/srv/example-vault/Dev/Areas/maestro",
 		"never post/copy this into GitHub or repo files",
 	} {
 		if !strings.Contains(prompt, want) {

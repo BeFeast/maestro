@@ -8,7 +8,7 @@ describe("ManagementHomePanel", () => {
   test("renders the vault-relative label, exact selectable path, encoded action, and honest fallback", () => {
     const home = managementHomeView({
       kind: "obsidian",
-      path: "/home/god/My Vault/Dev/Áreas/café notes",
+      path: "/srv/example-vault/Dev/Áreas/café notes",
       vault: "My Vault",
       vault_path: "Dev/Áreas/café notes",
     });
@@ -18,7 +18,7 @@ describe("ManagementHomePanel", () => {
     );
 
     expect(html).toContain("Dev/Áreas/café notes");
-    expect(html).toContain("/home/god/My Vault/Dev/Áreas/café notes");
+    expect(html).toContain("/srv/example-vault/Dev/Áreas/café notes");
     expect(html).toContain("Copy Path");
     expect(html).toContain("vault=My%20Vault&amp;file=Dev%2F%C3%81reas%2Fcaf%C3%A9%20notes");
     expect(html).toContain("Requires Obsidian with its local protocol handler");
