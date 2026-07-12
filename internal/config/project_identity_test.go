@@ -99,6 +99,21 @@ func TestParse_ManagementHomeValidation(t *testing.T) {
 			yaml:    "repo: o/r\nmanagement_home:\n  kind: obsidian\n  path: /x\n  vault: V\n  vault_path: Dev/../../etc\n",
 			wantSub: "traversal",
 		},
+		{
+			name:    "backslash traversal vault_path",
+			yaml:    "repo: o/r\nmanagement_home:\n  kind: obsidian\n  path: /x\n  vault: V\n  vault_path: 'Dev\\..\\secret'\n",
+			wantSub: "backslashes",
+		},
+		{
+			name:    "windows absolute vault_path",
+			yaml:    "repo: o/r\nmanagement_home:\n  kind: obsidian\n  path: /x\n  vault: V\n  vault_path: C:/Vault/Dev\n",
+			wantSub: "vault-relative",
+		},
+		{
+			name:    "non-normalized vault_path",
+			yaml:    "repo: o/r\nmanagement_home:\n  kind: obsidian\n  path: /x\n  vault: V\n  vault_path: Dev//Areas/./foo/\n",
+			wantSub: "normalized",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,6 +150,13 @@ func TestParseStrict_RejectsUnknownKeyByName(t *testing.T) {
 	_, err = ParseStrict([]byte("repo: o/r\nproject_idd: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n"))
 	if err == nil || !strings.Contains(err.Error(), "project_idd") {
 		t.Fatalf("strict decode should name the misspelled top-level key, got: %v", err)
+	}
+
+	// SupervisorConfig has a custom UnmarshalYAML for legacy-read bookkeeping;
+	// strict writes must still reject typos inside that subtree.
+	_, err = ParseStrict([]byte("repo: o/r\nsupervisor:\n  ready_labell: typo\n"))
+	if err == nil || !strings.Contains(err.Error(), "ready_labell") {
+		t.Fatalf("strict decode should name the misspelled supervisor key, got: %v", err)
 	}
 }
 

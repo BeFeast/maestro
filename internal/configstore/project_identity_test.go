@@ -82,11 +82,29 @@ func TestUpsertProjectImmutableProjectID(t *testing.T) {
 		t.Fatalf("re-upsert with same id should be allowed: %v", err)
 	}
 
+	// An ordinary edit from an older/id-unaware client must preserve the stored
+	// identity even when project_id is omitted or explicitly blank.
+	idlessEdit := "repo: BeFeast/maestro\nlocal_path: /srv/maestro\n"
+	if err := store.UpsertProject(ctx, "befeast-maestro", idlessEdit); err != nil {
+		t.Fatalf("id-less edit should preserve identity: %v", err)
+	}
+	blankIDEdit := "repo: BeFeast/maestro\nlocal_path: /srv/maestro-2\nproject_id: \"\"\n"
+	if err := store.UpsertProject(ctx, "befeast-maestro", blankIDEdit); err != nil {
+		t.Fatalf("blank-id edit should preserve identity: %v", err)
+	}
+	preserved, err := store.Load(ctx, "befeast-maestro")
+	if err != nil {
+		t.Fatalf("Load after id-less edits: %v", err)
+	}
+	if preserved.ProjectID != "3f2504e0-4f89-41d3-9a0c-0305e82c3301" {
+		t.Fatalf("stored id was removed by an id-less edit: %q", preserved.ProjectID)
+	}
+
 	// Changing to a DIFFERENT non-empty id is rejected.
 	changed := strings.Replace(identityProjectYAML,
 		"3f2504e0-4f89-41d3-9a0c-0305e82c3301",
 		"11111111-2222-3333-4444-555555555555", 1)
-	err := store.UpsertProject(ctx, "befeast-maestro", changed)
+	err = store.UpsertProject(ctx, "befeast-maestro", changed)
 	if err == nil {
 		t.Fatalf("changing project_id should be rejected")
 	}

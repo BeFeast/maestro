@@ -489,7 +489,8 @@ ON CONFLICT(name) DO UPDATE SET config_yaml = excluded.config_yaml, updated_at =
 // the durable identity an external bootstrap adapter correlates against, so it
 // must not silently flip on an edit. The rules mirror the acceptance criteria:
 //
-//   - incoming id empty            -> allowed (the write does not touch identity);
+//   - incoming id empty            -> preserve the stored id (ordinary edits do
+//     not implicitly clear identity);
 //   - stored id empty              -> allowed (adding an id to a legacy id-less row);
 //   - stored == incoming           -> allowed (no change);
 //   - stored != incoming, both set -> REJECTED as an identity mismatch.
@@ -498,9 +499,6 @@ ON CONFLICT(name) DO UPDATE SET config_yaml = excluded.config_yaml, updated_at =
 // upsert, so the caller must create a new project or migrate deliberately.
 func enforceImmutableProjectID(ctx context.Context, tx *sql.Tx, name string, incomingRoot *yaml.Node) error {
 	incoming := scalarAt(incomingRoot, "project_id")
-	if incoming == "" {
-		return nil
-	}
 	var storedYAML string
 	err := tx.QueryRowContext(ctx, `SELECT config_yaml FROM project WHERE name = ?`, name).Scan(&storedYAML)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -514,6 +512,13 @@ func enforceImmutableProjectID(ctx context.Context, tx *sql.Tx, name string, inc
 		return err
 	}
 	stored := scalarAt(&storedRoot, "project_id")
+	if stored != "" && incoming == "" {
+		// Upserts replace config_yaml wholesale. Preserve the durable id in the
+		// incoming node so an older client or an ordinary id-less edit cannot
+		// silently erase identity (#869).
+		setMappingChild(incomingRoot, "project_id", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: stored})
+		return nil
+	}
 	if stored != "" && stored != incoming {
 		return fmt.Errorf("project %q: project_id is immutable (stored %q, refusing to overwrite with %q); create a new project or run an explicit migration to change it", name, stored, incoming)
 	}

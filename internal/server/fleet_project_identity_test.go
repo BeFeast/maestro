@@ -38,6 +38,10 @@ func TestProjectSnapshotExposesProjectIdentity(t *testing.T) {
 		item.ManagementHome.Vault != "Obsidian Vault" || item.ManagementHome.Path != "/home/god/Obsidian/Dev" {
 		t.Fatalf("management_home fields not surfaced verbatim: %+v", item.ManagementHome)
 	}
+	if item.EffectiveConfig.ProjectID != item.ProjectID || item.EffectiveConfig.ManagementHome == nil ||
+		item.EffectiveConfig.ManagementHome.VaultPath != item.ManagementHome.VaultPath {
+		t.Fatalf("effective_config identity metadata disagrees with project payload: %+v", item.EffectiveConfig)
+	}
 
 	// The JSON projection carries the fields under stable snake_case keys.
 	blob, err := json.Marshal(item)
@@ -69,6 +73,9 @@ func TestProjectSnapshotOmitsIdentityForLegacyProject(t *testing.T) {
 	}
 	if item.ManagementHome != nil {
 		t.Fatalf("legacy management_home should be nil, got %+v", item.ManagementHome)
+	}
+	if item.EffectiveConfig.ProjectID != "" || item.EffectiveConfig.ManagementHome != nil {
+		t.Fatalf("legacy effective_config should omit identity metadata: %+v", item.EffectiveConfig)
 	}
 	blob, _ := json.Marshal(item)
 	if strings.Contains(string(blob), "management_home") {

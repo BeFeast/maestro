@@ -1414,6 +1414,8 @@ type fleetProjectState struct {
 }
 
 type fleetEffectiveConfig struct {
+	ProjectID      string                `json:"project_id,omitempty"`
+	ManagementHome *fleetManagementHome  `json:"management_home,omitempty"`
 	ModelPolicy    fleetModelPolicy      `json:"model_policy"`
 	MaxParallel    int                   `json:"max_parallel"`
 	ReviewGate     string                `json:"review_gate"`
@@ -3676,6 +3678,8 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 
 	retention := cfg.SessionRetention
 	return fleetEffectiveConfig{
+		ProjectID:      strings.TrimSpace(cfg.ProjectID),
+		ManagementHome: fleetManagementHomeFromConfig(cfg.ManagementHome),
 		ModelPolicy: fleetModelPolicy{
 			Default:          strings.TrimSpace(cfg.Model.Default),
 			FallbackBackends: append([]string(nil), cfg.Model.FallbackBackends...),

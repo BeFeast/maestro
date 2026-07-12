@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1539,15 +1540,25 @@ func validateManagementHome(m ManagementHomeConfig) error {
 // a leading-slash test rather than any host filesystem semantics — Maestro never
 // resolves the path against a real directory.
 func validateVaultRelPath(p string) error {
-	if strings.HasPrefix(p, "/") || filepath.IsAbs(p) {
+	if strings.Contains(p, `\`) {
+		return fmt.Errorf("config: management_home.vault_path %q must use normalized forward-slash form (backslashes are not allowed)", p)
+	}
+	if strings.HasPrefix(p, "/") || filepath.IsAbs(p) || pathpkg.IsAbs(p) || windowsDriveAbsPath(p) {
 		return fmt.Errorf("config: management_home.vault_path %q must be vault-relative, not absolute", p)
 	}
-	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+	for _, seg := range strings.Split(p, "/") {
 		if seg == ".." {
 			return fmt.Errorf("config: management_home.vault_path %q must not contain a '..' path traversal segment", p)
 		}
 	}
+	if clean := pathpkg.Clean(p); clean == "." || clean != p {
+		return fmt.Errorf("config: management_home.vault_path %q must be normalized (no empty, '.' or trailing path segments)", p)
+	}
 	return nil
+}
+
+func windowsDriveAbsPath(p string) bool {
+	return len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && p[2] == '/'
 }
 
 type Config struct {
@@ -1699,21 +1710,64 @@ func ParseStrict(data []byte) (*Config, error) {
 // to surface an unknown/misspelled key by name. It ignores every other decode
 // error (missing repo, type mismatches, etc.) — those are reported with better
 // context by parse(); this probe's only job is the unknown-key report. Types
-// with a custom UnmarshalYAML (e.g. SupervisorConfig) decode with their own
-// decoder, so strictness stops at those boundaries, which is sufficient to catch
-// the top-level and management_home typos this guard targets.
+// with a custom UnmarshalYAML decode with their own decoder, so the supervisor
+// subtree is checked separately below with a methodless alias.
 func strictUnknownKeyCheck(data []byte) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	var probe Config
 	err := dec.Decode(&probe)
-	if err == nil || errors.Is(err, io.EOF) {
-		return nil
-	}
-	if strings.Contains(err.Error(), "not found in type") {
+	if err != nil && !errors.Is(err, io.EOF) && strings.Contains(err.Error(), "not found in type") {
 		return fmt.Errorf("config: %w", err)
 	}
 	// Any other decode error is left for parse() to report with full context.
+	return strictSupervisorUnknownKeyCheck(data)
+}
+
+// strictSupervisorConfig is methodless so KnownFields can inspect the
+// supervisor subtree instead of SupervisorConfig.UnmarshalYAML handling it with
+// a tolerant Node.Decode. The normal Parse path remains tolerant for legacy
+// reads; only ParseStrict invokes this probe (#869).
+type strictSupervisorConfig SupervisorConfig
+
+func strictSupervisorUnknownKeyCheck(data []byte) error {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil // parse() reports syntax/type errors with normal context
+	}
+	supervisor := yamlMappingValue(&root, "supervisor")
+	if supervisor == nil {
+		return nil
+	}
+	encoded, err := yaml.Marshal(supervisor)
+	if err != nil {
+		return nil
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(encoded))
+	dec.KnownFields(true)
+	var probe strictSupervisorConfig
+	if err := dec.Decode(&probe); err != nil && strings.Contains(err.Error(), "not found in type") {
+		return fmt.Errorf("config: %w", err)
+	}
+	return nil
+}
+
+func yamlMappingValue(root *yaml.Node, key string) *yaml.Node {
+	if root == nil {
+		return nil
+	}
+	node := root
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
 	return nil
 }
 
