@@ -354,6 +354,21 @@ func dispatchApprovalAction(req controlActionRequest, cfg *config.Config, stateD
 
 	now := time.Now().UTC()
 	decision := buildApprovalDecision(id, req, cfg, authenticatedActor, now)
+
+	// #874: a manual spawn_review_repair enqueue must persist a durable
+	// payload (repo/issue/PR/head SHA/blocking findings/backend) or be
+	// rejected before any mutation. The dispatcher consumes that payload
+	// directly; without it the approval would enter awaiting_dispatch with
+	// no dispatcher path (the exact live wedge on sup-307 / #866). The server
+	// cannot compute review findings itself, so it reuses a payload the
+	// supervisor already proved on this PR's current head.
+	if id == config.SupervisorActionSpawnReviewRepair {
+		res, ok := enrichSpawnReviewRepairDecision(&decision, st, req.PRNumber)
+		if !ok {
+			return res
+		}
+	}
+
 	approval := st.RecordPendingApprovalForDecision(decision, now)
 	if approval == nil {
 		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "failed to record approval"}, err: errors.New("RecordPendingApprovalForDecision returned nil")}
@@ -430,6 +445,45 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 		}
 	}
 	return nil
+}
+
+// enrichSpawnReviewRepairDecision stamps a proven review-repair payload onto a
+// manual spawn_review_repair decision, or returns a rejection result when no
+// proof exists for the target PR (#874). The proof — head SHA, blocking
+// findings, backend — is reused from a payload the supervisor already observed
+// on this PR (an effective approval or a recent decision); the durable payload
+// then rides the minted approval so the dispatcher can converge on exactly one
+// worker without a coincident latest supervisor decision. Returns (result,
+// ok): ok=false means the caller must return result (an HTTP rejection) instead
+// of recording the approval.
+func enrichSpawnReviewRepairDecision(decision *state.SupervisorDecision, st *state.State, prNumber int) (safeActionResult, bool) {
+	payload, provenTarget, ok := st.EffectiveReviewRepairPayloadForPR(prNumber)
+	if !ok {
+		msg := fmt.Sprintf(
+			"cannot enqueue spawn_review_repair for PR #%d: no proven blocking review findings on its current head. "+
+				"The supervisor mints a scoped review-repair (with head SHA + findings) automatically once a green, "+
+				"mergeable, retry-exhausted PR is blocked by review — approve that when it appears. A manual enqueue "+
+				"without that proof would stall in awaiting_dispatch with no dispatcher path, so it is refused here.",
+			prNumber)
+		return safeActionResult{
+			handled: true,
+			status:  http.StatusConflict,
+			body:    map[string]string{"error": msg},
+			err:     fmt.Errorf("spawn_review_repair PR #%d: no proven review-repair payload to enqueue", prNumber),
+		}, false
+	}
+	decision.ReviewRepair = payload
+	if decision.Target == nil {
+		decision.Target = &state.SupervisorTarget{PR: prNumber}
+	}
+	// Key the approval on the proven head SHA so a later head push mints a
+	// distinct approval (approvalTargetsEqual includes HeadSHA) and repeat
+	// clicks on the same head coalesce to the one record.
+	decision.Target.HeadSHA = payload.HeadSHA
+	if decision.Target.Issue == 0 && provenTarget != nil {
+		decision.Target.Issue = provenTarget.Issue
+	}
+	return safeActionResult{}, true
 }
 
 // buildApprovalDecision constructs a synthetic SupervisorDecision so the

@@ -1467,6 +1467,34 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 	}
 }
 
+// #874: the Restart affordance must be disabled for a worker that owns an open
+// PR (restart deletes the worktree and would strand the PR branch), and the
+// disabled reason must name the supported in-place alternative. Stop stays
+// enabled. A PR-less worker keeps Restart enabled.
+func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
+	withPR := workerActionAffordances(false, "/api/v1/actions", sessionInfo{Slot: "slot-0", IssueNumber: 42, PRNumber: 867})
+	restart := findControlAction(t, withPR, "restart_worker")
+	if !restart.Disabled {
+		t.Fatalf("restart_worker for an open-PR worker should be disabled, got %+v", restart)
+	}
+	if !contains(restart.DisabledReason, "PR #867") {
+		t.Fatalf("disabled reason = %q, want it to name the open PR", restart.DisabledReason)
+	}
+	if !contains(restart.DisabledReason, "review-repair") {
+		t.Fatalf("disabled reason = %q, want it to name the supported review-repair alternative", restart.DisabledReason)
+	}
+	stop := findControlAction(t, withPR, "stop_worker")
+	if stop.Disabled {
+		t.Fatalf("stop_worker for an open-PR worker should stay enabled, got %+v", stop)
+	}
+
+	noPR := workerActionAffordances(false, "/api/v1/actions", sessionInfo{Slot: "slot-1", IssueNumber: 43})
+	restartNoPR := findControlAction(t, noPR, "restart_worker")
+	if restartNoPR.Disabled {
+		t.Fatalf("restart_worker for a PR-less worker should be enabled, got %+v", restartNoPR)
+	}
+}
+
 func TestHandleStateProjectBlockedKeepsAttentionForOpenPR(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{Repo: "test/repo", MaxParallel: 1, StateDir: dir}

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -127,5 +128,106 @@ func TestSupervisorSelectedReviewRepair_RequiresEffectiveApproval(t *testing.T) 
 	})
 	if payload, _ := o.supervisorSelectedReviewRepair(s, 442); payload == nil {
 		t.Fatal("expected dispatch after awaiting_dispatch approval was recorded")
+	}
+}
+
+// reviewRepairApproval builds an effective spawn_review_repair approval whose
+// durable payload targets head.
+func reviewRepairApproval(issue, pr int, head string) state.Approval {
+	return state.Approval{
+		ID:     "ap-durable",
+		Action: supervisor.ActionSpawnReviewRepair,
+		Status: state.ApprovalStatusAwaitingDispatch,
+		Target: &state.SupervisorTarget{Issue: issue, PR: pr, HeadSHA: head},
+		ReviewRepair: &state.SupervisorReviewRepairPayload{
+			HeadSHA: head,
+			Backend: "claude",
+			Findings: []state.SupervisorReviewFinding{
+				{Path: "internal/foo.go", Line: 1, Body: "P1: bad", Severity: "P1"},
+			},
+		},
+	}
+}
+
+// #874: the dispatcher must converge from a durable approval's payload even
+// when the LATEST supervisor decision is monitor_open_pr (the live sup-307
+// wedge). The head guard reads the PR head; when it matches the approved
+// payload, the payload + approval id are returned for dispatch.
+func TestResolveReviewRepairDispatch_ConsumesDurableApprovalPayload(t *testing.T) {
+	o := &Orchestrator{cfg: reviewRepairCfg(1), ghPRHeadSHAFn: func(pr int) (string, error) {
+		return "deadbeef", nil
+	}}
+	s := state.NewState()
+	now := time.Now().UTC()
+	// Latest decision is monitor_open_pr — carries no review-repair payload.
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "mon-1",
+		CreatedAt:         now,
+		RecommendedAction: supervisor.ActionMonitorOpenPR,
+		Target:            &state.SupervisorTarget{Issue: 442, PR: 564, HeadSHA: "deadbeef"},
+	}, state.DefaultSupervisorDecisionLimit)
+	s.Approvals = append(s.Approvals, reviewRepairApproval(442, 564, "deadbeef"))
+
+	payload, target, approvalID := o.resolveReviewRepairDispatch(s, 442)
+	if payload == nil || target == nil {
+		t.Fatal("expected dispatch from the durable approval payload despite monitor_open_pr being latest")
+	}
+	if approvalID != "ap-durable" {
+		t.Fatalf("approvalID = %q, want ap-durable (approval-sourced dispatch)", approvalID)
+	}
+	if target.PR != 564 || len(payload.Findings) != 1 {
+		t.Fatalf("payload/target = %+v / %+v", payload, target)
+	}
+}
+
+// #874 changed-head: when the PR head has moved past the approved payload, the
+// dispatcher must NOT repair the stale revision — it supersedes the approval
+// and declines to dispatch.
+func TestResolveReviewRepairDispatch_ChangedHeadSupersedes(t *testing.T) {
+	o := &Orchestrator{cfg: reviewRepairCfg(1), ghPRHeadSHAFn: func(pr int) (string, error) {
+		return "newhead", nil
+	}}
+	s := state.NewState()
+	s.Approvals = append(s.Approvals, reviewRepairApproval(442, 564, "oldhead"))
+
+	payload, _, _ := o.resolveReviewRepairDispatch(s, 442)
+	if payload != nil {
+		t.Fatal("changed head must not dispatch a stale-revision repair")
+	}
+	if s.Approvals[0].Status != state.ApprovalStatusSuperseded {
+		t.Fatalf("approval status = %q, want superseded after head moved", s.Approvals[0].Status)
+	}
+}
+
+// #874: a head-read error is handled conservatively — leave the approval
+// pending rather than repair a possibly-wrong revision.
+func TestResolveReviewRepairDispatch_HeadReadErrorLeavesPending(t *testing.T) {
+	o := &Orchestrator{cfg: reviewRepairCfg(1), ghPRHeadSHAFn: func(pr int) (string, error) {
+		return "", context.DeadlineExceeded
+	}}
+	s := state.NewState()
+	s.Approvals = append(s.Approvals, reviewRepairApproval(442, 564, "oldhead"))
+
+	if payload, _, _ := o.resolveReviewRepairDispatch(s, 442); payload != nil {
+		t.Fatal("head-read error must not dispatch")
+	}
+	if s.Approvals[0].Status != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("approval status = %q, want still awaiting_dispatch after a head-read error", s.Approvals[0].Status)
+	}
+}
+
+// #874: a pending (unapproved) durable approval must NOT dispatch — the
+// cautious gate has to clear first.
+func TestResolveReviewRepairDispatch_PendingApprovalDoesNotDispatch(t *testing.T) {
+	o := &Orchestrator{cfg: reviewRepairCfg(1), ghPRHeadSHAFn: func(pr int) (string, error) {
+		return "deadbeef", nil
+	}}
+	s := state.NewState()
+	pending := reviewRepairApproval(442, 564, "deadbeef")
+	pending.Status = state.ApprovalStatusPending
+	s.Approvals = append(s.Approvals, pending)
+
+	if payload, _, _ := o.resolveReviewRepairDispatch(s, 442); payload != nil {
+		t.Fatal("a pending (unapproved) approval must not be dispatched")
 	}
 }

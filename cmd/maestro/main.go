@@ -1106,7 +1106,9 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 //     and clear NextRetryAt so the orchestrator does NOT respawn.
 //   - restart_worker: terminate the worker, mark the session StatusDead,
 //     and set NextRetryAt = now so respawnDueRetries picks it up on the
-//     next dispatcher cycle.
+//     next dispatcher cycle. worker.Stop removed the worktree, so the stale
+//     worktree/PR pointers are cleared (#874) so respawnDueRetries does a
+//     fresh respawn instead of RespawnInPlace against the deleted directory.
 //
 // Both functions mutate sess in place; the caller of ex.Execute() is
 // responsible for state.Save (the supervisor and CLI approve paths do
@@ -1131,6 +1133,11 @@ func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 			sess.Status = state.StatusDead
 			sess.FinishedAt = &now
 			sess.NextRetryAt = &now
+			// worker.Stop deleted the worktree; drop the stale pointers so
+			// respawnDueRetries fresh-respawns instead of RespawnInPlace
+			// against a directory that no longer exists (#874).
+			sess.Worktree = ""
+			sess.PRNumber = 0
 			return nil
 		},
 	}

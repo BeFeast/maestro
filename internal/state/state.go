@@ -1019,6 +1019,7 @@ const (
 	approvalActionCloseIssueBatch   = "close_issue_batch"
 	approvalActionSpawnWorker       = "spawn_worker"
 	approvalActionSpawnRepairWorker = "spawn_repair_worker"
+	approvalActionSpawnReviewRepair = "spawn_review_repair"
 )
 
 // Approval records a risky supervisor decision that needs explicit resolution.
@@ -1047,6 +1048,17 @@ type Approval struct {
 	// LessonProposalID links apply_lesson_proposal approvals to the durable
 	// proposed rule they gate. Rejection/apply transitions update that record.
 	LessonProposalID string `json:"lesson_proposal_id,omitempty"`
+
+	// ReviewRepair carries the scoped review-repair payload (head SHA,
+	// blocking findings, backend) for a spawn_review_repair approval (#874).
+	// Before #874 this payload lived only on the SupervisorDecision, so the
+	// orchestrator dispatcher resolved it from LatestSupervisorDecision(); a
+	// manually enqueued approval (or one whose decision aged out of the
+	// bounded decision ring) had no payload and could enter awaiting_dispatch
+	// with no dispatcher path. Persisting the payload on the durable approval
+	// lets the dispatcher converge on exactly one worker without a coincident
+	// latest supervisor decision. nil for every non-review-repair approval.
+	ReviewRepair *SupervisorReviewRepairPayload `json:"review_repair,omitempty"`
 }
 
 type ApprovalAudit struct {
@@ -2201,6 +2213,11 @@ func (s *State) RecordPendingApprovalForDecision(decision SupervisorDecision, no
 		TargetStateHash: freshTargetStateHash,
 		Repo:            decision.Repo,
 		Project:         decision.Project,
+		// #874: persist the review-repair payload on the durable approval so
+		// the orchestrator dispatcher can converge from the approval alone,
+		// without needing the coincident LatestSupervisorDecision to still be
+		// a spawn_review_repair carrying the payload.
+		ReviewRepair: cloneReviewRepairPayload(decision.ReviewRepair),
 	}
 	approval.PayloadHash = approval.ComputePayloadHash()
 	approval.Audit = append(approval.Audit, ApprovalAudit{
@@ -2236,9 +2253,75 @@ func (s *State) refreshPendingApproval(approval *Approval, decision SupervisorDe
 	if strings.TrimSpace(decision.Project) != "" {
 		approval.Project = decision.Project
 	}
+	// #874: refresh the durable review-repair payload from a re-minted
+	// decision that still carries one (a fresh supervisor cycle observed new
+	// findings on the same head). Never clobber a good payload with nil — a
+	// non-review-repair re-evaluation of the same target identity must not
+	// strip the proof the dispatcher needs.
+	if decision.ReviewRepair != nil {
+		approval.ReviewRepair = cloneReviewRepairPayload(decision.ReviewRepair)
+	}
 	approval.TargetStateHash = targetStateHash
 	approval.UpdatedAt = normalizedTime(now)
 	approval.PayloadHash = approval.ComputePayloadHash()
+}
+
+// EffectiveReviewRepairPayloadForPR returns a proven review-repair payload
+// (head SHA, blocking findings, backend) for the given PR, searched first on
+// still-effective approvals and then on the recent supervisor decisions
+// (#874). It is the "prove it or reject it" source for a manual
+// spawn_review_repair enqueue: the manual control cannot compute review
+// findings itself, so it reuses a payload the supervisor already observed on
+// this PR. Returns (nil, nil, false) when no such proof exists — the caller
+// must then reject the enqueue rather than mint an approval no dispatcher can
+// complete. The returned payload/target are deep copies safe to stamp onto a
+// fresh decision.
+func (s *State) EffectiveReviewRepairPayloadForPR(prNumber int) (*SupervisorReviewRepairPayload, *SupervisorTarget, bool) {
+	if s == nil || prNumber <= 0 {
+		return nil, nil, false
+	}
+	// Effective approvals win: they are durable across the bounded decision
+	// ring and already carry the payload since #874. Newest UpdatedAt first.
+	var bestApproval *Approval
+	for i := range s.Approvals {
+		a := &s.Approvals[i]
+		if a.Action != approvalActionSpawnReviewRepair || a.ReviewRepair == nil {
+			continue
+		}
+		switch a.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+		default:
+			continue
+		}
+		if a.Target == nil || a.Target.PR != prNumber {
+			continue
+		}
+		if bestApproval == nil || a.UpdatedAt.After(bestApproval.UpdatedAt) {
+			bestApproval = a
+		}
+	}
+	if bestApproval != nil {
+		return cloneReviewRepairPayload(bestApproval.ReviewRepair), cloneSupervisorTarget(bestApproval.Target), true
+	}
+	// Fall back to the most recent supervisor decision that observed blocking
+	// findings on this PR.
+	var best *SupervisorDecision
+	for i := range s.SupervisorDecisions {
+		d := &s.SupervisorDecisions[i]
+		if d.RecommendedAction != approvalActionSpawnReviewRepair || d.ReviewRepair == nil {
+			continue
+		}
+		if d.Target == nil || d.Target.PR != prNumber {
+			continue
+		}
+		if best == nil || d.CreatedAt.After(best.CreatedAt) {
+			best = d
+		}
+	}
+	if best == nil {
+		return nil, nil, false
+	}
+	return cloneReviewRepairPayload(best.ReviewRepair), cloneSupervisorTarget(best.Target), true
 }
 
 // approvalIDInUse reports whether any approval already carries id. Used by the
@@ -2720,6 +2803,64 @@ func (s *State) StaleSpawnRepairWorkerApprovalsForResolvedIssue(issueNumber int,
 	return staled
 }
 
+// SupersedeReviewRepairApprovalsForStaleHead supersedes every still-active
+// spawn_review_repair approval for prNumber whose durable payload targets a
+// head SHA other than currentHead (#874 changed-head). Dispatching such an
+// approval would repair a revision that no longer exists on the PR, so the
+// approval is superseded instead — the next supervisor cycle re-evaluates the
+// current head and mints a fresh proof if findings remain. Returns the ids
+// superseded.
+func (s *State) SupersedeReviewRepairApprovalsForStaleHead(prNumber int, currentHead string, now time.Time, reason string) []string {
+	if s == nil || prNumber <= 0 {
+		return nil
+	}
+	current := strings.TrimSpace(currentHead)
+	var ids []string
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Action != approvalActionSpawnReviewRepair || approval.ReviewRepair == nil {
+			continue
+		}
+		if approval.Target == nil || approval.Target.PR != prNumber {
+			continue
+		}
+		if strings.TrimSpace(approval.ReviewRepair.HeadSHA) == current && current != "" {
+			continue
+		}
+		switch approval.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			s.markApprovalSuperseded(approval, now, reason)
+			ids = append(ids, approval.ID)
+		}
+	}
+	return ids
+}
+
+// ResolveDispatchedReviewRepairApproval supersedes the effective
+// spawn_review_repair approval with the given id once the orchestrator has
+// actually dispatched its worker (#874). This keeps the durable-approval
+// dispatch path from re-resolving (and re-reading the PR head) every cycle,
+// and leaves no active approval behind after a repair reaches a worker.
+// Returns true when an active approval was superseded.
+func (s *State) ResolveDispatchedReviewRepairApproval(id string, now time.Time, reason string) bool {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.ID != id || approval.Action != approvalActionSpawnReviewRepair {
+			continue
+		}
+		switch approval.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			s.markApprovalSuperseded(approval, now, reason)
+			return true
+		}
+		return false
+	}
+	return false
+}
+
 // ActiveSpawnRepairWorkerApprovalIssues returns the sorted, distinct set of
 // issue numbers that still carry an active (pending/approved/awaiting_dispatch)
 // spawn_repair_worker approval. The orchestrator's standing reconciler (#866)
@@ -3036,6 +3177,17 @@ func cloneSupervisorTarget(target *SupervisorTarget) *SupervisorTarget {
 	}
 	clone := *target
 	clone.Issues = append([]SupervisorIssueTarget(nil), target.Issues...)
+	return &clone
+}
+
+// cloneReviewRepairPayload deep-copies a review-repair payload so an
+// approval carries its own copy independent of the source decision (#874).
+func cloneReviewRepairPayload(payload *SupervisorReviewRepairPayload) *SupervisorReviewRepairPayload {
+	if payload == nil {
+		return nil
+	}
+	clone := *payload
+	clone.Findings = append([]SupervisorReviewFinding(nil), payload.Findings...)
 	return &clone
 }
 
