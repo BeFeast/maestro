@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -43,12 +44,13 @@ var ErrIdentityConflict = errors.New("config-store identity conflict")
 // carries everything plan/apply need without re-parsing, so the fingerprint the
 // operator reviewed in `plan` is exactly the one `apply` gates on.
 type PreparedProject struct {
-	Name         string
-	ProjectID    string
-	Repo         string
-	LocalPath    string
-	WorktreeBase string
-	Fingerprint  string
+	Name           string
+	ProjectID      string
+	Repo           string
+	LocalPath      string
+	WorktreeBase   string
+	ManagementHome config.ManagementHomeConfig
+	Fingerprint    string
 	// Canonical is the deterministic project document the fingerprint is taken
 	// over (backends normalized, re-marshaled). Raw is the original file bytes,
 	// stored verbatim on apply so comments/ordering survive the round-trip that
@@ -62,6 +64,7 @@ type PreparedProject struct {
 // would touch, reported so an adapter can see why an effect was chosen.
 type ExistingRow struct {
 	Name        string `json:"name"`
+	Repo        string `json:"repo,omitempty"`
 	ProjectID   string `json:"project_id,omitempty"`
 	Fingerprint string `json:"fingerprint"`
 }
@@ -93,9 +96,6 @@ type GenesisReport struct {
 //   - repo required (config.Parse) — the derived project name comes from it;
 //   - a valid, present project_id (the durable identity the flow is built around);
 //   - local_path and worktree_base required (a genesis row must be runnable).
-//
-// A missing management_home is allowed but warned: an external bootstrap adapter
-// cannot correlate the row back to a control-room home without it.
 func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 	cfg, err := config.ParseStrict(data)
 	if err != nil {
@@ -115,11 +115,25 @@ func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 	if backends := detachBackends(&source); len(backends) > 0 {
 		return nil, fmt.Errorf("portable project genesis must not define shared model.backends; configure fleet backends separately before plan/apply")
 	}
+	repo := strings.TrimSpace(cfg.Repo)
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.ContainsAny(repo, "\\ ") {
+		return nil, fmt.Errorf("repo must use the canonical owner/repository form; got %q", repo)
+	}
 	if strings.TrimSpace(cfg.LocalPath) == "" {
 		return nil, fmt.Errorf("local_path is required for project plan/apply (the on-disk clone the daemon works from)")
 	}
 	if strings.TrimSpace(cfg.WorktreeBase) == "" {
 		return nil, fmt.Errorf("worktree_base is required for project plan/apply (the base dir worker worktrees are created under)")
+	}
+	if !filepath.IsAbs(cfg.LocalPath) || !filepath.IsAbs(cfg.WorktreeBase) {
+		return nil, fmt.Errorf("local_path and worktree_base must resolve to absolute execution-host paths")
+	}
+	if !cfg.ManagementHome.Configured() {
+		return nil, fmt.Errorf("management_home is required for project genesis so the durable row remains linked to its PM/control-room home (#869)")
+	}
+	if !filepath.IsAbs(strings.TrimSpace(cfg.ManagementHome.Path)) {
+		return nil, fmt.Errorf("management_home.path must be an absolute execution-host path")
 	}
 	name, err := ProjectNameFor(sourcePath, data)
 	if err != nil {
@@ -129,20 +143,16 @@ func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize config: %w", err)
 	}
-	var warnings []string
-	if !cfg.ManagementHome.Configured() {
-		warnings = append(warnings, "no management_home block is set; an external bootstrap adapter cannot correlate this row back to a PM/control-room home (#869)")
-	}
 	return &PreparedProject{
-		Name:         name,
-		ProjectID:    id,
-		Repo:         cfg.Repo,
-		LocalPath:    cfg.LocalPath,
-		WorktreeBase: cfg.WorktreeBase,
-		Fingerprint:  fp,
-		Canonical:    canonical,
-		Raw:          data,
-		Warnings:     warnings,
+		Name:           name,
+		ProjectID:      id,
+		Repo:           cfg.Repo,
+		LocalPath:      cfg.LocalPath,
+		WorktreeBase:   cfg.WorktreeBase,
+		ManagementHome: cfg.ManagementHome,
+		Fingerprint:    fp,
+		Canonical:      canonical,
+		Raw:            data,
 	}, nil
 }
 
@@ -151,8 +161,8 @@ func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 // reordering, whitespace) do NOT move the fingerprint, while any real change to a
 // value or a list DOES:
 //
-//   - backends are detached and re-attached in sorted order (matching a
-//     stored+exported row), then every mapping's keys are sorted recursively;
+//   - fleet-shared backends are detached, syntax-only presentation is removed,
+//     then every mapping's keys are sorted recursively;
 //   - sequences are left in place (their order is semantically meaningful, e.g.
 //     issue_labels / ordered_queue.issues).
 //
@@ -170,6 +180,7 @@ func canonicalProjectDoc(data []byte) ([]byte, string, error) {
 	// no-op regardless of unrelated fleet backend changes.
 	detachBackends(&root)
 	removeEmptyTopLevelMapping(&root, "model")
+	normalizeYAMLPresentation(&root)
 	sortMappingKeys(&root)
 	out, err := marshalNode(&root)
 	if err != nil {
@@ -177,6 +188,22 @@ func canonicalProjectDoc(data []byte) ([]byte, string, error) {
 	}
 	sum := sha256.Sum256(out)
 	return out, "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// normalizeYAMLPresentation removes syntax-only details that the config decoder
+// does not treat as state. Comments, flow/block layout, and scalar quoting must
+// not invalidate an approved plan when the effective values are unchanged.
+func normalizeYAMLPresentation(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+	node.HeadComment = ""
+	node.LineComment = ""
+	node.FootComment = ""
+	node.Style = 0
+	for _, child := range node.Content {
+		normalizeYAMLPresentation(child)
+	}
 }
 
 func removeEmptyTopLevelMapping(root *yaml.Node, key string) {
@@ -318,18 +345,19 @@ func (s *Store) ApplyProject(ctx context.Context, p *PreparedProject, confirm, w
 		Existing:            existing,
 		Warnings:            p.Warnings,
 	}
-	if wb != report.BaselineFingerprint {
-		return report, fmt.Errorf("config store changed since plan (approved baseline %s, current %s); re-run `maestro project plan` and review before applying", wb, report.BaselineFingerprint)
-	}
 	switch effect {
 	case EffectConflict:
 		return report, fmt.Errorf("%w: %s", ErrIdentityConflict, conflict)
 	case EffectNoOp:
-		// Second identical apply: the matching row already exists, so this is a
-		// reported no-op and nothing is written.
+		// Desired state is already present. Accept even a stale plan baseline so
+		// retrying the exact approved command after a lost response is genuinely
+		// idempotent; identity and desired-fingerprint gates already matched.
 		report.Wrote = false
 		return report, nil
 	case EffectCreate, EffectUpdate:
+		if wb != report.BaselineFingerprint {
+			return report, fmt.Errorf("config store changed since plan (approved baseline %s, current %s); re-run `maestro project plan` and review before applying", wb, report.BaselineFingerprint)
+		}
 		if err := upsertProjectTx(ctx, tx, p.Name, string(p.Raw)); err != nil {
 			return nil, err
 		}
@@ -360,7 +388,12 @@ func evaluateProjectTx(ctx context.Context, tx *sql.Tx, p *PreparedProject) (eff
 	if row == nil {
 		return EffectCreate, "", nil, nil
 	}
-	if row.ProjectID != "" && row.ProjectID != p.ProjectID {
+	if !strings.EqualFold(strings.TrimSpace(row.Repo), strings.TrimSpace(p.Repo)) {
+		return EffectConflict,
+			fmt.Sprintf("project %q already exists for repo %q, not incoming repo %q; refusing basename adoption", p.Name, row.Repo, p.Repo),
+			row, nil
+	}
+	if row.ProjectID != "" && !strings.EqualFold(row.ProjectID, p.ProjectID) {
 		return EffectConflict,
 			fmt.Sprintf("project %q already exists with a different project_id (stored %s, incoming %s); refusing to overwrite by name", p.Name, row.ProjectID, p.ProjectID),
 			row, nil
@@ -388,7 +421,7 @@ func existingRowTx(ctx context.Context, tx *sql.Tx, name string) (*ExistingRow, 
 	if err := yaml.Unmarshal([]byte(data), &root); err != nil {
 		return nil, err
 	}
-	return &ExistingRow{Name: name, ProjectID: scalarAt(&root, "project_id"), Fingerprint: fp}, nil
+	return &ExistingRow{Name: name, Repo: scalarAt(&root, "repo"), ProjectID: scalarAt(&root, "project_id"), Fingerprint: fp}, nil
 }
 
 func projectNameByIDTx(ctx context.Context, tx *sql.Tx, id, exclude string) (string, error) {
@@ -447,7 +480,12 @@ func (s *Store) evaluate(ctx context.Context, p *PreparedProject) (effect, confl
 	if row == nil {
 		return EffectCreate, "", nil, nil
 	}
-	if row.ProjectID != "" && row.ProjectID != p.ProjectID {
+	if !strings.EqualFold(strings.TrimSpace(row.Repo), strings.TrimSpace(p.Repo)) {
+		return EffectConflict,
+			fmt.Sprintf("project %q already exists for repo %q, not incoming repo %q; refusing basename adoption", p.Name, row.Repo, p.Repo),
+			row, nil
+	}
+	if row.ProjectID != "" && !strings.EqualFold(row.ProjectID, p.ProjectID) {
 		return EffectConflict,
 			fmt.Sprintf("project %q already exists with a different project_id (stored %s, incoming %s); refusing to overwrite by name", p.Name, row.ProjectID, p.ProjectID),
 			row, nil
@@ -482,7 +520,7 @@ func (s *Store) existingRow(ctx context.Context, name string) (*ExistingRow, err
 	if err := yaml.Unmarshal(exported, &root); err != nil {
 		return nil, err
 	}
-	return &ExistingRow{Name: name, ProjectID: scalarAt(&root, "project_id"), Fingerprint: fp}, nil
+	return &ExistingRow{Name: name, Repo: scalarAt(&root, "repo"), ProjectID: scalarAt(&root, "project_id"), Fingerprint: fp}, nil
 }
 
 // projectNameByID returns the name of a stored project whose project_id equals
@@ -513,7 +551,7 @@ func (s *Store) projectNameByID(ctx context.Context, id, exclude string) (string
 		if err := yaml.Unmarshal([]byte(stored), &root); err != nil {
 			return "", err
 		}
-		if scalarAt(&root, "project_id") == id {
+		if strings.EqualFold(strings.TrimSpace(scalarAt(&root, "project_id")), id) {
 			return n, nil
 		}
 	}

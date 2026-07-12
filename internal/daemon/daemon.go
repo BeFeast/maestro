@@ -307,8 +307,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if len(named) == 0 {
+	if len(named) == 0 && d.projectStore == nil {
 		return errors.New("config store has no projects")
+	}
+	if len(named) == 0 {
+		log.Printf("[daemon] config store has no projects yet — serving an empty fleet and waiting for --watch-store hot-add")
 	}
 
 	// Dedup on the flow's real identity (StateDir, falling back to Repo), not

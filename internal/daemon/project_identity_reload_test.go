@@ -30,7 +30,7 @@ func TestIdentityChangedIgnoresProjectMetadata(t *testing.T) {
 		ProjectID:     "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
 		ManagementHome: config.ManagementHomeConfig{
 			Kind:      "obsidian",
-			Path:      "/home/god/Obsidian/Dev",
+			Path:      "/srv/example-vault/Dev",
 			Vault:     "Obsidian Vault",
 			VaultPath: "Dev/Areas/maestro",
 		},

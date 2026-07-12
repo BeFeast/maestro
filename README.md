@@ -126,16 +126,26 @@ per-project `maestro.yaml` + systemd/launchd unit) is gone; add projects with th
 curl -fsSL https://raw.githubusercontent.com/BeFeast/maestro/main/install.sh | sh
 maestro version   # verify installation
 
-# 2. Clone your target repo (if not already)
-gh repo clone owner/myrepo ~/src/myrepo
+# 2. Choose absolute execution-host paths and create the Management Home Area.
+REPO_PATH="$HOME/src/myrepo"
+WORKTREE_BASE="$HOME/.worktrees/myrepo"
+MANAGEMENT_HOME="$HOME/Obsidian Vault/Dev/Areas/myrepo"
+PROJECT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+gh repo clone owner/myrepo "$REPO_PATH"   # omit when it is already cloned
+mkdir -p "$WORKTREE_BASE" "$MANAGEMENT_HOME"
 
 # 3. Write a portable project config (repo, local paths, and a stable project_id).
 #    Generate the UUID once and keep it: it is the durable identity apply confirms.
-cat > ~/myrepo.project.yaml <<'YAML'
+cat > "$HOME/myrepo.project.yaml" <<YAML
 repo: owner/myrepo
-local_path: ~/src/myrepo
-worktree_base: ~/.worktrees/myrepo
-project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301   # e.g. `uuidgen | tr A-Z a-z`
+local_path: ${REPO_PATH}
+worktree_base: ${WORKTREE_BASE}
+project_id: ${PROJECT_ID}
+management_home:
+  kind: obsidian
+  path: ${MANAGEMENT_HOME}
+  vault: Obsidian Vault
+  vault_path: Dev/Areas/myrepo
 max_parallel: 3
 issue_labels:
   - enhancement
@@ -143,45 +153,47 @@ model:
   default: claude
 YAML
 
-# 4. Preview the effect on the config store — strictly validated, zero writes.
+# 4. In a second terminal, start the one fleet daemon. Keep this process running;
+#    for a persistent Linux user service, see "Running as a Service" below.
+mkdir -p ~/.maestro
+maestro daemon --watch-store --store ~/.maestro/maestro.db \
+  --approvals-store sqlite --state-store sqlite
+
+# 5. Preview the effect on the config store — strictly validated, zero writes.
 #    Point --db at the same store the daemon unit reads (its --store path):
 maestro project plan  --file ~/myrepo.project.yaml --db ~/.maestro/maestro.db --json
 
-# 5. Apply the exact command in plan receipt `next[0]` — it pins identity,
+# 6. Apply the exact command in plan receipt `next[0]` — it pins identity,
 #    desired config fingerprint, and observed store baseline:
 maestro project apply --file ~/myrepo.project.yaml --db ~/.maestro/maestro.db \
-    --confirm 3f2504e0-4f89-41d3-9a0c-0305e82c3301 \
+    --confirm "$PROJECT_ID" \
     --fingerprint <sha256-from-plan> --baseline <baseline-from-plan> --json
 ```
 
 `plan` never writes; `apply` upserts exactly one row (a second identical apply is a
 reported no-op, and an identity conflict is a hard stop that never overwrites by
-name). The single `maestro daemon --watch-store` observes the new row within one
+name). The running `maestro daemon --watch-store` observes the new row within one
 poll interval and starts one flow — no restart, no `systemctl enable` per project.
 Removing a project stays a separate explicit operator action (`maestro config-store
 rm <name>`).
 
 ```bash
-# Check status
-maestro status
-
-# Watch the Mission Control dashboard (trusted-LAN default: write-enabled)
-#    Add --read-only=true (or set server.read_only: true in YAML) for installs
-#    exposed beyond a trusted LAN; #616 covers optional HTTP auth.
-maestro serve --port 8787
+# The daemon already serves the fleet Mission Control and API; do not start a
+# separate `maestro serve` process for the same fleet.
+curl -fsS http://127.0.0.1:8786/api/v1/fleet
+# Open http://127.0.0.1:8786/ in a browser.
 ```
 
 That's it. Maestro will now pick up issues matching your configured label, spawn AI agents in isolated worktrees, and auto-merge PRs when CI passes.
 
 To manually spawn a worker for a specific issue:
 ```bash
-maestro spawn --issue 42
+maestro spawn --config-store ~/.maestro/maestro.db \
+  --config-store-project owner-myrepo --issue 42
 ```
 
-To watch Maestro from a browser, use the Mission Control dashboard:
-```bash
-maestro serve --config ./maestro.yaml --host 127.0.0.1 --port 8787
-```
+Use the Mission Control already served by the daemon at
+`http://127.0.0.1:8786/`; do not start a second `maestro serve` process.
 
 The dashboard now boots **write-enabled by default** (trusted-LAN posture, #477). The cautious approval gate still guards the four mutating verbs — `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config` — so even a writable HTTP caller cannot bypass operator approval. For installs exposed beyond a trusted LAN, run with `--read-only=true` (or set `server.read_only: true` in YAML) and configure the optional HTTP auth layer (#616, off by default).
 
@@ -193,16 +205,13 @@ To flip fleet-wide or per-project cost/LLM knobs (`supervisor.enabled`, backends
 
 Maestro's dashboard auth is opt-in and disabled by default. The right posture depends on where the port is reachable from:
 
-- **Trusted LAN (default).** When the dashboard is bound to `127.0.0.1` or a network only operators can reach, leave `server.auth` empty. The cautious approval gate still protects `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config` — flipping `--read-only=false` on a trusted LAN does not expose the four destructive verbs.
-- **Exposed / shared network.** When the dashboard is reachable from anywhere outside the trusted LAN — `--host 0.0.0.0`, behind a reverse proxy, on a multi-tenant host — set `server.auth.token_env`. With auth enabled, **every** endpoint (read GETs, write POSTs, and the SPA HTML) rejects unauthenticated requests with `401`; the cautious approval gate still fires for authenticated callers as defense in depth.
+- **Trusted LAN (default).** When the daemon is bound to `127.0.0.1` or a network only operators can reach, leave `server.auth` empty. The cautious approval gate still protects `merge_pr`, `close_issue`, `delete_worktree`, and `change_global_config`.
+- **Exposed / shared network.** When the daemon uses `--host 0.0.0.0`, sits behind a reverse proxy, or runs on a multi-tenant host, set `server.auth.token_env` in a project row (the fleet derives one shared auth policy) or start the daemon with `--read-only=true`. With auth enabled, **every** endpoint (read GETs, write POSTs, and the SPA HTML) rejects unauthenticated requests with `401`; the cautious approval gate still fires for authenticated callers as defense in depth.
 
 The token is loaded at runtime from an environment variable populated by your secret manager (Infisical, 1Password CLI, etc.) — never hardcoded in YAML:
 
 ```yaml
 server:
-  host: 0.0.0.0
-  port: 8788
-  read_only: false
   auth:
     token_env: MAESTRO_DASHBOARD_TOKEN   # env var name; populate from your secret manager
     actor_name: dashboard-operator       # optional; audit actor recorded for authed requests
@@ -220,14 +229,22 @@ To watch workers live in a tmux dashboard:
 maestro watch
 ```
 
-## Configuration
+## Project Row Configuration
 
-Create `~/.maestro/config.yaml` or `./maestro.yaml`:
+The following is a configuration reference. For a new project, keep the
+portable YAML outside the code repo and register it through `project plan` /
+`project apply`; the running daemon reads the resulting row, not this file.
 
 ```yaml
 repo: OWNER/REPO
 local_path: /path/to/local/clone
 worktree_base: /path/to/worktrees/repo
+project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
+management_home:
+  kind: obsidian
+  path: /absolute/path/to/Obsidian Vault/Dev/Areas/project
+  vault: Obsidian Vault
+  vault_path: Dev/Areas/project
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
 worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N minutes (0 = disabled)
@@ -246,9 +263,8 @@ session_prefix: prj                # worker session name prefix (default: first 
 state_dir: ~/.maestro/<project>    # state/log directory (default: ~/.maestro/<repo-hash>)
 claude_cmd: claude                 # deprecated: use model.backends.claude.cmd
 server:
-  host: 127.0.0.1                  # bind address for `maestro serve`
-  port: 8787                       # 0 = disabled for `maestro run`
-  read_only: false                 # default: trusted-LAN, writes enabled; flip true for exposed installs (#477)
+  auth:
+    token_env: MAESTRO_DASHBOARD_TOKEN  # optional shared fleet auth; secret value stays in the environment
 issue_labels:                      # preferred label filter (OR semantics)
   - enhancement
 exclude_labels:
@@ -526,39 +542,49 @@ cd /worktree/path && codex exec --dangerously-bypass-approvals-and-sandbox -C /w
 cd /worktree/path && cline -y "<assembled prompt>"
 ```
 
-## Cron Mode
+## Legacy Cron Mode
 
-For automatic operation, run on a cron schedule:
-
-```bash
-# ~/.config/cron/maestro.cron
-*/10 * * * * /usr/local/bin/maestro run --config ~/.maestro/maestro-<project>.yaml --once >> ~/.maestro/maestro-<project>.log 2>&1
-```
-
-Or run as a daemon:
-```bash
-maestro run --interval 10m
-```
+Older installations may still contain `maestro run --once` cron jobs. Do not
+create one for a new project: migrate the YAML through
+`scripts/migrate-to-daemon.sh --dry-run`, then let the single
+`maestro daemon --watch-store` process schedule all project flows.
 
 ## Multi-Project Setup
 
-To run maestro for multiple projects simultaneously, use `session_prefix` and `state_dir` to keep workers and state isolated:
+Register each project as one row in the unified config store. Each portable
+project YAML may still set a distinct `session_prefix` and `state_dir`; apply it
+through `maestro project plan` / `maestro project apply` instead of starting a
+process per YAML:
 
 ```yaml
 # ~/.maestro/maestro-panoptikon.yaml
 repo: BeFeast/panoptikon
+project_id: 11111111-2222-4333-8444-555555555555
+management_home:
+  kind: obsidian
+  path: /srv/example-vault/Dev/Areas/panoptikon
+  vault: Example Vault
+  vault_path: Dev/Areas/panoptikon
 session_prefix: pan           # workers: pan-1, pan-2, ...
 state_dir: ~/.maestro/pan
-worktree_base: ~/.worktrees/panoptikon
+local_path: /srv/example-src/panoptikon
+worktree_base: /srv/example-worktrees/panoptikon
 max_parallel: 5
 ```
 
 ```yaml
 # ~/.maestro/maestro-myapp.yaml
 repo: BeFeast/myapp
+project_id: 66666666-7777-4888-8999-aaaaaaaaaaaa
+management_home:
+  kind: obsidian
+  path: /srv/example-vault/Dev/Areas/myapp
+  vault: Example Vault
+  vault_path: Dev/Areas/myapp
 session_prefix: app           # workers: app-1, app-2, ...
 state_dir: ~/.maestro/app
-worktree_base: ~/.worktrees/myapp
+local_path: /srv/example-src/myapp
+worktree_base: /srv/example-worktrees/myapp
 max_parallel: 3
 ```
 
@@ -610,6 +636,12 @@ scripts/migrate-to-daemon.sh            # prompts before changing a running host
 scripts/migrate-to-daemon.sh --dry-run  # show the actions without applying them
 ```
 
+On upgrade hosts, a compatibility guard detects project rows left in the old
+`~/.maestro/config.db`: default CLI commands stay on that legacy store with a
+warning, and the shipped service refuses to present an empty canonical fleet.
+Run the dry-run/cutover above (or the explicit export/migrate commands printed by
+the error) before switching to `~/.maestro/maestro.db`.
+
 The cutover is non-concurrent per project (it stops the legacy units before
 starting the daemon, so no project is ever driven by both). **Rollback** is
 supported because the legacy unit files stay on disk:
@@ -638,8 +670,8 @@ The fleet dashboard exposes the same as authenticated, audited endpoints —
 `DELETE /api/v1/fleet/projects` (body `{"name": "..."}`) — so you can add a
 project from the UI. On `SIGTERM` (`systemctl --user stop`) the daemon drains
 gracefully in-process: it stops claiming new issues and waits for in-flight
-workers to finish before exiting (bounded by `--drain-timeout`, default 25m,
-inside the unit's `TimeoutStopSec=30min`).
+workers to finish before exiting (bounded by `--drain-timeout`, default 5m,
+inside the unit's `TimeoutStopSec=6min`).
 
 ## Mission Control bundle
 

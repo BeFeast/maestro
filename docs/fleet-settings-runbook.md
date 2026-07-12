@@ -65,7 +65,7 @@ maestro settings rm supervisor.enabled --project <row>
 maestro settings audit
 ```
 
-Flags: `--db <path>` (default `~/.maestro/config.db`), `--actor <name>` (default
+Flags: `--db <path>` (default `~/.maestro/maestro.db`), `--actor <name>` (default
 `cli:<user>`), and `--limit N` on `audit`. Flags may appear before or after the
 `key`/`key=value` argument.
 

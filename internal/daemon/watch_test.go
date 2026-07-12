@@ -161,6 +161,37 @@ func TestWatchStoreLoopHotAddsAndRemoves(t *testing.T) {
 	}
 }
 
+func TestWatchStoreEmptyFleetWaitsForFirstProject(t *testing.T) {
+	store := newFakeWatchStore()
+	var run, sup loopTracker
+	d := newWatchDaemon(store, run.loop, sup.superviseLoop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	if names := fleetProjectNames(t, d); len(names) != 0 {
+		t.Fatalf("initial fleet projects = %v, want empty", names)
+	}
+	if got := atomic.LoadInt64(&run.started); got != 0 {
+		t.Fatalf("flows started before first row = %d, want 0", got)
+	}
+
+	store.Set("alpha", testConfig(t, "owner/alpha"))
+	waitForNames(t, d, "alpha")
+	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 1 })
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+}
+
 // A store-backed flow must receive a non-nil reload channel so an edited config
 // row hot-reloads its orchestrator (#757). A nil channel would silently disable
 // reload.

@@ -111,9 +111,9 @@ type Store struct {
 	db *sql.DB
 }
 
-// DefaultDBPath is the shared approvals database (~/.maestro/maestro.db),
-// a sibling of the config store's config.db. A single file holds every
-// project's approvals; rows are tagged by project/repo/state_dir.
+// DefaultDBPath is the unified fleet database (~/.maestro/maestro.db). A single
+// file holds config, approvals, state, and the other fleet tables; rows are
+// tagged by project/repo/state_dir where required.
 func DefaultDBPath() string {
 	return filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.db")
 }

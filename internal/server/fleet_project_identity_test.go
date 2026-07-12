@@ -19,7 +19,7 @@ func TestProjectSnapshotExposesProjectIdentity(t *testing.T) {
 		ProjectID: "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
 		ManagementHome: config.ManagementHomeConfig{
 			Kind:      "obsidian",
-			Path:      "/home/god/Obsidian/Dev",
+			Path:      "/srv/example-vault/Dev",
 			Vault:     "Obsidian Vault",
 			VaultPath: "Dev/Areas/maestro",
 		},
@@ -35,7 +35,7 @@ func TestProjectSnapshotExposesProjectIdentity(t *testing.T) {
 		t.Fatalf("payload management_home should be present")
 	}
 	if item.ManagementHome.Kind != "obsidian" || item.ManagementHome.VaultPath != "Dev/Areas/maestro" ||
-		item.ManagementHome.Vault != "Obsidian Vault" || item.ManagementHome.Path != "/home/god/Obsidian/Dev" {
+		item.ManagementHome.Vault != "Obsidian Vault" || item.ManagementHome.Path != "/srv/example-vault/Dev" {
 		t.Fatalf("management_home fields not surfaced verbatim: %+v", item.ManagementHome)
 	}
 	if item.EffectiveConfig.ProjectID != item.ProjectID || item.EffectiveConfig.ManagementHome == nil ||

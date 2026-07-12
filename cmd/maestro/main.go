@@ -559,7 +559,7 @@ func configStoreCmd(args []string) {
 		configStoreEdit(args[1:])
 	case "migrate":
 		fs := flag.NewFlagSet("config-store migrate", flag.ExitOnError)
-		dbPath := fs.String("db", filepath.Join(os.Getenv("HOME"), ".maestro", "config.db"), "SQLite config store path")
+		dbPath := fs.String("db", defaultConfigStorePath(), "SQLite config store path")
 		dir := fs.String("dir", filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.d"), "Directory containing project YAML files")
 		fs.Parse(args[1:])
 		store, err := configstore.Open(*dbPath)
@@ -573,7 +573,7 @@ func configStoreCmd(args []string) {
 		fmt.Printf("Migrated YAML configs from %s into SQLite store %s.\n", *dir, *dbPath)
 	case "export":
 		fs := flag.NewFlagSet("config-store export", flag.ExitOnError)
-		dbPath := fs.String("db", filepath.Join(os.Getenv("HOME"), ".maestro", "config.db"), "SQLite config store path")
+		dbPath := fs.String("db", defaultConfigStorePath(), "SQLite config store path")
 		dir := fs.String("dir", filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.d.export"), "Directory to write portable YAML files")
 		fs.Parse(args[1:])
 		store, err := configstore.Open(*dbPath)
@@ -591,11 +591,11 @@ func configStoreCmd(args []string) {
 	}
 }
 
-// configStoreDBFlag registers the shared --db flag (default ~/.maestro/config.db)
+// configStoreDBFlag registers the shared --db flag (default ~/.maestro/maestro.db)
 // used by the per-project CRUD subcommands so they target the same store the
 // daemon reads.
 func configStoreDBFlag(fs *flag.FlagSet) *string {
-	return fs.String("db", filepath.Join(os.Getenv("HOME"), ".maestro", "config.db"), "SQLite config store path")
+	return fs.String("db", defaultConfigStorePath(), "SQLite config store path")
 }
 
 // configStoreAdd implements `config-store add --file <yaml> [--name <name>]`:
