@@ -5019,6 +5019,19 @@ func (o *Orchestrator) reconcileMootRepairApprovals(s *state.State, issue int, n
 	return len(staled)
 }
 
+// reconcileMootRepairApprovalsAfterResolution is the edge-triggered counterpart
+// to the standing reconciler. A session may have just reached done while another
+// same-issue session is still active; in that case the repair approval is not
+// moot and must survive. Reuse the same full-session resolution check before
+// staling by issue number so edge and standing paths cannot disagree (#866).
+func (o *Orchestrator) reconcileMootRepairApprovalsAfterResolution(s *state.State, issue int, now time.Time, reason string) int {
+	resolved, _ := o.repairApprovalIssueResolved(s, issue)
+	if !resolved {
+		return 0
+	}
+	return o.reconcileMootRepairApprovals(s, issue, now, reason)
+}
+
 func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 	if o == nil || o.cfg == nil || s == nil {
 		return
@@ -5062,7 +5075,7 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 			if stale > 0 {
 				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
 			}
-			o.reconcileMootRepairApprovals(s, sess.IssueNumber, now,
+			o.reconcileMootRepairApprovalsAfterResolution(s, sess.IssueNumber, now,
 				fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", sess.IssueNumber))
 		}
 	}
@@ -5338,7 +5351,7 @@ func (o *Orchestrator) verifyOutcomeAfterMerge(s *state.State, sess *state.Sessi
 			if stale > 0 {
 				log.Printf("[orch] expired %d stale close_issue approval(s) for auto-closed issue #%d", stale, sess.IssueNumber)
 			}
-			o.reconcileMootRepairApprovals(s, sess.IssueNumber, now,
+			o.reconcileMootRepairApprovalsAfterResolution(s, sess.IssueNumber, now,
 				fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", sess.IssueNumber))
 		}
 		o.notifier.Sendf("✅ maestro: outcome verifier passed after PR #%d; issue #%d can be treated as done", prNumber, sess.IssueNumber)

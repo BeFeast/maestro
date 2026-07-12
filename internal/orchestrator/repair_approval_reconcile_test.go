@@ -10,6 +10,7 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -191,6 +192,78 @@ func TestVerifyOutcomeAfterMerge_ReconcilesRepairApproval(t *testing.T) {
 	}
 	if got := approvalStatus(t, s, "ap-repair-858"); got != state.ApprovalStatusStale {
 		t.Fatalf("repair approval after verified merge = %q, want stale", got)
+	}
+}
+
+func TestVerifyOutcomeAfterMerge_KeepsRepairApprovalForActiveSameIssue(t *testing.T) {
+	now := time.Date(2026, 7, 10, 8, 31, 0, 0, time.UTC)
+	closed := false
+	o := &Orchestrator{
+		cfg:            &config.Config{Repo: "owner/repo"},
+		notifier:       &notify.Notifier{},
+		outcomeCheckFn: healthyOutcome(),
+		isIssueClosedFn: func(int) (bool, error) {
+			return closed, nil
+		},
+		ghCloseIssueFn: func(int, string) error {
+			closed = true
+			return nil
+		},
+	}
+
+	landed := &state.Session{IssueNumber: 858, Status: state.StatusCodeLanded, PRNumber: 864}
+	active := &state.Session{IssueNumber: 858, Status: state.StatusRunning}
+	s := state.NewState()
+	s.Sessions = map[string]*state.Session{"sup-old": landed, "sup-active": active}
+	s.Approvals = []state.Approval{
+		repairApproval("ap-repair-858-active-edge", 858, 864, state.ApprovalStatusPending, now),
+	}
+
+	o.verifyOutcomeAfterMerge(s, landed, 864)
+
+	if landed.Status != state.StatusDone {
+		t.Fatalf("landed session status = %q, want done", landed.Status)
+	}
+	if got := approvalStatus(t, s, "ap-repair-858-active-edge"); got != state.ApprovalStatusPending {
+		t.Fatalf("repair approval with active same-issue session = %q, want pending", got)
+	}
+}
+
+func TestReconcileCodeLandedSessions_KeepsRepairApprovalForActiveSameIssue(t *testing.T) {
+	now := time.Date(2026, 7, 10, 8, 31, 0, 0, time.UTC)
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo: "owner/repo",
+			Outcome: outcome.Brief{
+				DesiredOutcome:      "Live app works",
+				VerifierCommand:     "check-live",
+				PassRequiredForDone: boolPtr(true),
+			},
+		},
+		notifier:       &notify.Notifier{},
+		outcomeCheckFn: healthyOutcome(),
+		isPRMergedFn: func(pr int) (bool, error) {
+			return pr == 864, nil
+		},
+		isIssueClosedFn: func(int) (bool, error) { return false, nil },
+		ghCloseIssueFn:  func(int, string) error { return nil },
+	}
+
+	landed := &state.Session{IssueNumber: 858, Status: state.StatusCodeLanded, PRNumber: 864}
+	active := &state.Session{IssueNumber: 858, Status: state.StatusRunning}
+	s := state.NewState()
+	s.Sessions = map[string]*state.Session{"sup-old": landed, "sup-active": active}
+	s.Approvals = []state.Approval{
+		repairApproval("ap-repair-858-active-reconcile", 858, 864, state.ApprovalStatusPending, now),
+	}
+
+	o.reconcileCodeLandedSessions(s)
+
+	if landed.Status != state.StatusDone {
+		t.Fatalf("landed session status = %q, want done", landed.Status)
+	}
+	if got := approvalStatus(t, s, "ap-repair-858-active-reconcile"); got != state.ApprovalStatusPending {
+		t.Fatalf("repair approval with active same-issue session = %q, want pending", got)
 	}
 }
 
