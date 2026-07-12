@@ -1,10 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"crypto/md5"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1449,10 +1453,126 @@ func (c SessionRetentionConfig) EffectiveArchiveFile(stateDir string) string {
 	return filepath.Join(stateDir, "sessions-archive.jsonl")
 }
 
+// ManagementHomeKind enumerates the supported management-home backends (#869).
+// Only "obsidian" is recognised in this slice; parse() rejects any other value
+// so a typo cannot masquerade as a working control-room link.
+const ManagementHomeKindObsidian = "obsidian"
+
+// ManagementHomeConfig is the optional, descriptive link from a Maestro project
+// row back to its PM / control-room home (#869). It carries identity metadata
+// only — Maestro never reads, traverses, or writes the referenced home in this
+// slice; the block round-trips through config-store and is surfaced on the Fleet
+// API for external bootstrap adapters to correlate Area/repo/Maestro row.
+//
+//   - Kind:      management-home backend ("obsidian" is the only supported value).
+//   - Path:      execution-host absolute path of the home (validated non-empty).
+//   - Vault:     Obsidian vault display name (required for kind obsidian).
+//   - VaultPath: vault-RELATIVE path to the project's Area, e.g. Dev/Areas/<slug>.
+//     Must be relative (not absolute) and contain no ".." traversal (validated).
+type ManagementHomeConfig struct {
+	Kind      string `yaml:"kind,omitempty" json:"kind,omitempty"`
+	Path      string `yaml:"path,omitempty" json:"path,omitempty"`
+	Vault     string `yaml:"vault,omitempty" json:"vault,omitempty"`
+	VaultPath string `yaml:"vault_path,omitempty" json:"vault_path,omitempty"`
+}
+
+// Configured reports whether any management-home field is set, i.e. whether the
+// block is present at all. A config with no management_home leaves every field
+// empty and is skipped by validation, so legacy configs parse unchanged.
+func (m ManagementHomeConfig) Configured() bool {
+	return strings.TrimSpace(m.Kind) != "" ||
+		strings.TrimSpace(m.Path) != "" ||
+		strings.TrimSpace(m.Vault) != "" ||
+		strings.TrimSpace(m.VaultPath) != ""
+}
+
+// projectIDPattern matches a canonical 8-4-4-4-12 UUID (any case). A stable
+// project_id must be a real UUID so an external bootstrap adapter can prove that
+// Area, repo, and Maestro row refer to the same durable project (#869).
+var projectIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// validateProjectID rejects a present-but-malformed project_id. An empty id is
+// allowed (the field is optional and legacy rows have none).
+func validateProjectID(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	if !projectIDPattern.MatchString(id) {
+		return fmt.Errorf("config: project_id %q is not a valid UUID (want canonical 8-4-4-4-12, e.g. 3f2504e0-4f89-41d3-9a0c-0305e82c3301)", id)
+	}
+	return nil
+}
+
+// validateManagementHome enforces the management_home contract (#869): a
+// supported kind, a non-empty path, the obsidian-required vault/vault_path, and
+// a vault-relative vault_path free of absolute prefixes and ".." traversal. An
+// unconfigured block validates trivially so legacy configs are unaffected.
+func validateManagementHome(m ManagementHomeConfig) error {
+	if !m.Configured() {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(m.Kind)) {
+	case ManagementHomeKindObsidian:
+		// supported
+	case "":
+		return fmt.Errorf("config: management_home.kind is required (supported: %s)", ManagementHomeKindObsidian)
+	default:
+		return fmt.Errorf("config: management_home.kind = %q is not supported (supported: %s)", m.Kind, ManagementHomeKindObsidian)
+	}
+	if strings.TrimSpace(m.Path) == "" {
+		return fmt.Errorf("config: management_home.path is required and must be non-empty")
+	}
+	// Obsidian consistency: both the vault name and the vault-relative Area path
+	// are required — a home missing either cannot be resolved back to a project.
+	if strings.TrimSpace(m.Vault) == "" {
+		return fmt.Errorf("config: management_home.vault is required for kind %s", ManagementHomeKindObsidian)
+	}
+	if strings.TrimSpace(m.VaultPath) == "" {
+		return fmt.Errorf("config: management_home.vault_path is required for kind %s", ManagementHomeKindObsidian)
+	}
+	return validateVaultRelPath(strings.TrimSpace(m.VaultPath))
+}
+
+// validateVaultRelPath rejects a vault_path that is absolute or contains a ".."
+// traversal segment. Vault paths are logical, forward-slash, vault-relative
+// references (e.g. Dev/Areas/maestro), so the check is on '/'-split segments and
+// a leading-slash test rather than any host filesystem semantics — Maestro never
+// resolves the path against a real directory.
+func validateVaultRelPath(p string) error {
+	if strings.Contains(p, `\`) {
+		return fmt.Errorf("config: management_home.vault_path %q must use normalized forward-slash form (backslashes are not allowed)", p)
+	}
+	if strings.HasPrefix(p, "/") || filepath.IsAbs(p) || pathpkg.IsAbs(p) || windowsDriveAbsPath(p) {
+		return fmt.Errorf("config: management_home.vault_path %q must be vault-relative, not absolute", p)
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return fmt.Errorf("config: management_home.vault_path %q must not contain a '..' path traversal segment", p)
+		}
+	}
+	if clean := pathpkg.Clean(p); clean == "." || clean != p {
+		return fmt.Errorf("config: management_home.vault_path %q must be normalized (no empty, '.' or trailing path segments)", p)
+	}
+	return nil
+}
+
+func windowsDriveAbsPath(p string) bool {
+	return len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && p[2] == '/'
+}
+
 type Config struct {
-	Server                          ServerConfig                 `yaml:"server"`
-	Supervisor                      SupervisorConfig             `yaml:"supervisor"`
-	Repo                            string                       `yaml:"repo"`
+	Server     ServerConfig     `yaml:"server"`
+	Supervisor SupervisorConfig `yaml:"supervisor"`
+	Repo       string           `yaml:"repo"`
+	// ProjectID is the optional stable UUID identifying this project durably,
+	// independent of the mutable repo/state/store names (#869). Empty for legacy
+	// rows; validated as a canonical UUID when present and kept immutable across
+	// an in-place config-store upsert.
+	ProjectID string `yaml:"project_id,omitempty"`
+	// ManagementHome is the optional, descriptive link back to the project's PM /
+	// control-room home (#869). Metadata only — never read or traversed here.
+	ManagementHome                  ManagementHomeConfig         `yaml:"management_home,omitempty"`
 	Outcome                         outcome.Brief                `yaml:"outcome"`
 	LocalPath                       string                       `yaml:"local_path"`
 	WorktreeBase                    string                       `yaml:"worktree_base"`
@@ -1570,6 +1690,87 @@ func Parse(data []byte) (*Config, error) {
 	return parse(data)
 }
 
+// ParseStrict is Parse plus a strict unknown-key check for project create/edit
+// WRITE paths (#869): a misspelled field (e.g. a mistyped `management_home` key)
+// is rejected by exact name instead of being silently discarded. Read paths keep
+// using the tolerant Parse so legacy rows carrying a field this build does not
+// know still load and run unchanged.
+//
+// The strictness is applied by a separate KnownFields decode probe over the raw
+// document; the returned *Config is produced by the same parse() so defaults and
+// semantic validation are identical to the tolerant path.
+func ParseStrict(data []byte) (*Config, error) {
+	if err := strictUnknownKeyCheck(data); err != nil {
+		return nil, err
+	}
+	return parse(data)
+}
+
+// strictUnknownKeyCheck decodes the document with yaml KnownFields(true) purely
+// to surface an unknown/misspelled key by name. It ignores every other decode
+// error (missing repo, type mismatches, etc.) — those are reported with better
+// context by parse(); this probe's only job is the unknown-key report. Types
+// with a custom UnmarshalYAML decode with their own decoder, so the supervisor
+// subtree is checked separately below with a methodless alias.
+func strictUnknownKeyCheck(data []byte) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var probe Config
+	err := dec.Decode(&probe)
+	if err != nil && !errors.Is(err, io.EOF) && strings.Contains(err.Error(), "not found in type") {
+		return fmt.Errorf("config: %w", err)
+	}
+	// Any other decode error is left for parse() to report with full context.
+	return strictSupervisorUnknownKeyCheck(data)
+}
+
+// strictSupervisorConfig is methodless so KnownFields can inspect the
+// supervisor subtree instead of SupervisorConfig.UnmarshalYAML handling it with
+// a tolerant Node.Decode. The normal Parse path remains tolerant for legacy
+// reads; only ParseStrict invokes this probe (#869).
+type strictSupervisorConfig SupervisorConfig
+
+func strictSupervisorUnknownKeyCheck(data []byte) error {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil // parse() reports syntax/type errors with normal context
+	}
+	supervisor := yamlMappingValue(&root, "supervisor")
+	if supervisor == nil {
+		return nil
+	}
+	encoded, err := yaml.Marshal(supervisor)
+	if err != nil {
+		return nil
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(encoded))
+	dec.KnownFields(true)
+	var probe strictSupervisorConfig
+	if err := dec.Decode(&probe); err != nil && strings.Contains(err.Error(), "not found in type") {
+		return fmt.Errorf("config: %w", err)
+	}
+	return nil
+}
+
+func yamlMappingValue(root *yaml.Node, key string) *yaml.Node {
+	if root == nil {
+		return nil
+	}
+	node := root
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
 func parse(data []byte) (*Config, error) {
 
 	cfg := &Config{
@@ -1594,6 +1795,16 @@ func parse(data []byte) (*Config, error) {
 
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
+	}
+
+	// #869: optional project identity metadata. A present project_id must be a
+	// UUID; a present management_home must satisfy its field contract. Both are
+	// absent in legacy configs, so these checks are no-ops there.
+	if err := validateProjectID(cfg.ProjectID); err != nil {
+		return nil, err
+	}
+	if err := validateManagementHome(cfg.ManagementHome); err != nil {
+		return nil, err
 	}
 
 	// A negative max_live_workers is meaningless; clamp to 0 (legacy: pr_open

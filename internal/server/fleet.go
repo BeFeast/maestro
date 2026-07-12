@@ -1272,15 +1272,32 @@ type fleetQueueSnapshot struct {
 	SkippedCandidates []state.SupervisorSkippedCandidate `json:"skipped_candidates,omitempty"`
 }
 
+// fleetManagementHome is the JSON projection of config.ManagementHomeConfig
+// surfaced on the Fleet API (#869). It carries the descriptive fields verbatim;
+// no file content is read and the vault path is not resolved.
+type fleetManagementHome struct {
+	Kind      string `json:"kind,omitempty"`
+	Path      string `json:"path,omitempty"`
+	Vault     string `json:"vault,omitempty"`
+	VaultPath string `json:"vault_path,omitempty"`
+}
+
 type fleetProjectState struct {
-	Name               string `json:"name"`
-	Repo               string `json:"repo"`
-	ConfigPath         string `json:"config_path"`
-	DashboardURL       string `json:"dashboard_url,omitempty"`
-	StateDir           string `json:"state_dir,omitempty"`
-	MaxParallel        int    `json:"max_parallel"`
-	ReadOnly           bool   `json:"read_only"`
-	DispatchSLASeconds int    `json:"dispatch_sla_seconds,omitempty"`
+	Name string `json:"name"`
+	Repo string `json:"repo"`
+	// ProjectID is the project's stable UUID identity (#869), omitted for legacy
+	// rows that have none. Descriptive only — it never changes routing/display.
+	ProjectID string `json:"project_id,omitempty"`
+	// ManagementHome mirrors the config's descriptive control-room link (#869).
+	// nil when the project has no management_home block. Metadata only: the Fleet
+	// API surfaces the fields verbatim and never reads or traverses the home.
+	ManagementHome     *fleetManagementHome `json:"management_home,omitempty"`
+	ConfigPath         string               `json:"config_path"`
+	DashboardURL       string               `json:"dashboard_url,omitempty"`
+	StateDir           string               `json:"state_dir,omitempty"`
+	MaxParallel        int                  `json:"max_parallel"`
+	ReadOnly           bool                 `json:"read_only"`
+	DispatchSLASeconds int                  `json:"dispatch_sla_seconds,omitempty"`
 
 	// RestartRequired/RestartRequiredReason mirror the orchestrator's restart-required
 	// signal (set when model.default / routing.* changed but cannot be hot-applied).
@@ -1397,6 +1414,8 @@ type fleetProjectState struct {
 }
 
 type fleetEffectiveConfig struct {
+	ProjectID      string                `json:"project_id,omitempty"`
+	ManagementHome *fleetManagementHome  `json:"management_home,omitempty"`
 	ModelPolicy    fleetModelPolicy      `json:"model_policy"`
 	MaxParallel    int                   `json:"max_parallel"`
 	ReviewGate     string                `json:"review_gate"`
@@ -2051,8 +2070,10 @@ func (s *FleetServer) handleFleetProjectUpsert(w http.ResponseWriter, r *http.Re
 		return
 	}
 	// Reject a malformed paste with 400 before touching the store. UpsertProject
-	// re-validates, but parsing here also lets ProjectNameFor derive the name.
-	if _, err := config.Parse([]byte(yamlText)); err != nil {
+	// re-validates strictly, but parsing here also lets ProjectNameFor derive the
+	// name and returns the unknown-key error (#869) to the client as a 400 rather
+	// than a 500 from the store write.
+	if _, err := config.ParseStrict([]byte(yamlText)); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid project config: %v", err))
 		return
 	}
@@ -3610,6 +3631,21 @@ func fleetWorkerStartedAt(worker fleetWorkerState) time.Time {
 	return startedAt
 }
 
+// fleetManagementHomeFromConfig projects a config.ManagementHomeConfig onto the
+// Fleet API shape (#869), returning nil when the block is absent so the payload
+// omits it entirely for legacy projects.
+func fleetManagementHomeFromConfig(m config.ManagementHomeConfig) *fleetManagementHome {
+	if !m.Configured() {
+		return nil
+	}
+	return &fleetManagementHome{
+		Kind:      strings.TrimSpace(m.Kind),
+		Path:      strings.TrimSpace(m.Path),
+		Vault:     strings.TrimSpace(m.Vault),
+		VaultPath: strings.TrimSpace(m.VaultPath),
+	}
+}
+
 func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 	if cfg == nil {
 		return fleetEffectiveConfig{}
@@ -3642,6 +3678,8 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 
 	retention := cfg.SessionRetention
 	return fleetEffectiveConfig{
+		ProjectID:      strings.TrimSpace(cfg.ProjectID),
+		ManagementHome: fleetManagementHomeFromConfig(cfg.ManagementHome),
 		ModelPolicy: fleetModelPolicy{
 			Default:          strings.TrimSpace(cfg.Model.Default),
 			FallbackBackends: append([]string(nil), cfg.Model.FallbackBackends...),
@@ -3737,6 +3775,8 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		return item, nil
 	}
 	item.Repo = cfg.Repo
+	item.ProjectID = strings.TrimSpace(cfg.ProjectID)
+	item.ManagementHome = fleetManagementHomeFromConfig(cfg.ManagementHome)
 	item.StateDir = cfg.StateDir
 	item.MaxParallel = cfg.MaxParallel
 	item.ReadOnly = cfg.Server.ReadOnly || s.readOnly
