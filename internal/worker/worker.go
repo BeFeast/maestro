@@ -884,6 +884,38 @@ func workDisciplinePromptSection() string {
 		"- **Surface conflicts, don't silently switch.** If evidence you gather (test output, file contents, CI logs) contradicts your plan or the issue description, state the conflict and your resolution in the PR body or an issue comment instead of quietly changing approach.\n"
 }
 
+// managementHomePromptSection injects the project's Management Home context and
+// the fixed PM-vs-executable boundary statement into the worker prompt (#870).
+// Returns "" when the project has no management_home block, so legacy projects
+// render a byte-for-byte unchanged prompt and no dead section appears.
+//
+// The section carries the stable project id, the vault-relative path (the
+// primary human label, e.g. Dev/Areas/<slug>), and the absolute execution-host
+// path. The absolute path is legitimate private context for a worker running on
+// the execution host, but the boundary block (config.ManagementHomeBoundary)
+// forbids copying it into any GitHub-facing or generated repo output.
+func managementHomePromptSection(cfg *config.Config) string {
+	if cfg == nil || !cfg.ManagementHome.Configured() {
+		return ""
+	}
+	mh := cfg.ManagementHome
+
+	var b strings.Builder
+	b.WriteString("\n\n---\n\n## Management Home (private PM context)\n\n")
+	b.WriteString(config.ManagementHomeBoundary)
+	b.WriteString("\n\n")
+	if id := strings.TrimSpace(cfg.ProjectID); id != "" {
+		fmt.Fprintf(&b, "- Project id: `%s`\n", id)
+	}
+	if vp := strings.TrimSpace(mh.VaultPath); vp != "" {
+		fmt.Fprintf(&b, "- Management Home (vault-relative): `%s`\n", vp)
+	}
+	if p := strings.TrimSpace(mh.Path); p != "" {
+		fmt.Fprintf(&b, "- Management Home (absolute, execution-host only — never post/copy this into GitHub or repo files): `%s`\n", p)
+	}
+	return b.String()
+}
+
 // subagentHintPromptSection renders the per-backend sub-agent model policy
 // (#706). Orchestrating backends (e.g. Claude Code) spawn their own
 // sub-agents and, by default, run them on the same expensive orchestrator
@@ -941,7 +973,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath) + visualEvidencePromptSection(cfg) + workDisciplinePromptSection()
+		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath) + visualEvidencePromptSection(cfg) + managementHomePromptSection(cfg) + workDisciplinePromptSection()
 		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
@@ -989,6 +1021,7 @@ Always rebase on origin/main immediately before creating the PR.
 	result += repoRulesPromptSection(worktreePath)
 	result += workerSearchSafetyPromptSection(worktreePath)
 	result += visualEvidencePromptSection(cfg)
+	result += managementHomePromptSection(cfg)
 	result += workDisciplinePromptSection()
 	return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, false)
 }

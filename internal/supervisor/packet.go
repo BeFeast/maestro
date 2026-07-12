@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
@@ -30,23 +31,43 @@ type supervisorStatePacket struct {
 	RecentSupervisorEvents []supervisorRecentDecision    `json:"recent_supervisor_decisions,omitempty"`
 }
 
+// supervisorManagementHome is the JSON projection of a project's Management Home
+// (#870). It carries the vault-relative and absolute paths plus the fixed
+// PM-vs-executable boundary statement so the supervisor LLM treats the home as
+// private context, not a task source. Metadata only — the supervisor never reads
+// or writes the referenced home, and must not copy the absolute path into any
+// GitHub-facing output. Nil on the packet when the project configures no home.
+type supervisorManagementHome struct {
+	Kind      string `json:"kind,omitempty"`
+	Path      string `json:"path,omitempty"`
+	Vault     string `json:"vault,omitempty"`
+	VaultPath string `json:"vault_path,omitempty"`
+	Boundary  string `json:"boundary"`
+}
+
 type supervisorProjectConfigPacket struct {
-	Repo                       string            `json:"repo"`
-	MaxParallel                int               `json:"max_parallel"`
-	MaxConcurrentByState       map[string]int    `json:"max_concurrent_by_state,omitempty"`
-	MaxRetriesPerIssue         int               `json:"max_retries_per_issue"`
-	IssueLabels                []string          `json:"issue_labels,omitempty"`
-	ExcludeLabels              []string          `json:"exclude_labels,omitempty"`
-	WorkerSilentTimeoutMinutes int               `json:"worker_silent_timeout_minutes,omitempty"`
-	WorkerMaxTokens            int               `json:"worker_max_tokens,omitempty"`
-	MergeStrategy              string            `json:"merge_strategy"`
-	ReviewGate                 string            `json:"review_gate"`
-	Outcome                    outcome.Status    `json:"outcome"`
-	AutoRetryReviewFeedback    bool              `json:"auto_retry_review_feedback"`
-	AutoRetryRebaseConflicts   bool              `json:"auto_retry_rebase_conflicts"`
-	GitHubProjectsEnabled      bool              `json:"github_projects_enabled"`
-	MissionsEnabled            bool              `json:"missions_enabled"`
-	Supervisor                 supervisorRuntime `json:"supervisor"`
+	Repo string `json:"repo"`
+	// ProjectID is the project's stable UUID identity (#869/#870), omitted for
+	// legacy id-less rows.
+	ProjectID string `json:"project_id,omitempty"`
+	// ManagementHome mirrors the project's descriptive control-room link plus the
+	// boundary statement (#870). Nil when the project has no management_home block.
+	ManagementHome             *supervisorManagementHome `json:"management_home,omitempty"`
+	MaxParallel                int                       `json:"max_parallel"`
+	MaxConcurrentByState       map[string]int            `json:"max_concurrent_by_state,omitempty"`
+	MaxRetriesPerIssue         int                       `json:"max_retries_per_issue"`
+	IssueLabels                []string                  `json:"issue_labels,omitempty"`
+	ExcludeLabels              []string                  `json:"exclude_labels,omitempty"`
+	WorkerSilentTimeoutMinutes int                       `json:"worker_silent_timeout_minutes,omitempty"`
+	WorkerMaxTokens            int                       `json:"worker_max_tokens,omitempty"`
+	MergeStrategy              string                    `json:"merge_strategy"`
+	ReviewGate                 string                    `json:"review_gate"`
+	Outcome                    outcome.Status            `json:"outcome"`
+	AutoRetryReviewFeedback    bool                      `json:"auto_retry_review_feedback"`
+	AutoRetryRebaseConflicts   bool                      `json:"auto_retry_rebase_conflicts"`
+	GitHubProjectsEnabled      bool                      `json:"github_projects_enabled"`
+	MissionsEnabled            bool                      `json:"missions_enabled"`
+	Supervisor                 supervisorRuntime         `json:"supervisor"`
 }
 
 type supervisorRuntime struct {
@@ -164,9 +185,28 @@ func (e *Engine) buildStatePacket(st *state.State, deterministic state.Superviso
 	}, nil
 }
 
+// managementHomePacket projects a config.ManagementHomeConfig onto the packet
+// shape (#870), returning nil for an unconfigured block so legacy projects emit
+// no management_home key. The fixed boundary statement is always attached when a
+// home is present so the supervisor LLM sees the PM-vs-executable rule inline.
+func managementHomePacket(m config.ManagementHomeConfig) *supervisorManagementHome {
+	if !m.Configured() {
+		return nil
+	}
+	return &supervisorManagementHome{
+		Kind:      strings.TrimSpace(m.Kind),
+		Path:      strings.TrimSpace(m.Path),
+		Vault:     strings.TrimSpace(m.Vault),
+		VaultPath: strings.TrimSpace(m.VaultPath),
+		Boundary:  config.ManagementHomeBoundary,
+	}
+}
+
 func (e *Engine) projectConfigPacket(st *state.State) supervisorProjectConfigPacket {
 	return supervisorProjectConfigPacket{
 		Repo:                       e.cfg.Repo,
+		ProjectID:                  strings.TrimSpace(e.cfg.ProjectID),
+		ManagementHome:             managementHomePacket(e.cfg.ManagementHome),
 		MaxParallel:                e.cfg.MaxParallel,
 		MaxConcurrentByState:       copyStringIntMap(e.cfg.MaxConcurrentByState),
 		MaxRetriesPerIssue:         e.cfg.MaxRetriesPerIssue,

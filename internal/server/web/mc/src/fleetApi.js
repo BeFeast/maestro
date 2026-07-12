@@ -1,4 +1,5 @@
 import { parseTimestamp, relTime, slugifyProject } from "./utils.js";
+import { managementHomeView } from "./managementHome.js";
 
 const THEME_STORAGE_KEY = "maestro.mc.theme";
 
@@ -603,6 +604,8 @@ function mapProject(project, workers, now) {
     projectBoard: mapProjectBoard(project.project_board),
     costObservability: mapCostObservability(project.cost_observability),
     effectiveConfig: mapEffectiveConfig(project.effective_config),
+    projectId: String(project.project_id || ""),
+    managementHome: managementHomeView(project.management_home),
     raw: project,
   };
 }
