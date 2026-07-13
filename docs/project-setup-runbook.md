@@ -69,7 +69,7 @@ Alternatively, maestro's built-in `version-bump` command can handle this via the
 
 Either:
 - A **self-hosted runner** that runs after merge, or
-- A **deploy hook** in maestro config (`deploy_cmd`) that maestro calls after a successful merge.
+- A **delivery hook** in maestro config (`delivery:`, approval-gated by default) that maestro runs after a successful merge.
 
 The deploy hook approach is simpler — see section 5.
 
@@ -232,8 +232,26 @@ outcome:
   non_goals:
     - Rewrite unrelated subsystems
 
-# Post-merge deploy hook (runs after each successful merge)
-deploy_cmd: "/path/to/repo/scripts/deploy.sh"
+# Post-merge delivery (#872). Default-safe: a merged revision creates an
+# auditable deploy_project approval pinned to the exact merge commit; only an
+# operator approve runs the command + verifier (exactly once, behind a durable
+# claim). Set mode: automatic to opt back into unattended deploy-on-merge.
+delivery:
+  mode: approval_required        # disabled | approval_required | automatic
+  command: ./scripts/deploy.sh   # argument-free repo-relative executable from the approved SHA
+  verify_command: ./scripts/status.sh # required; runs from a second pristine materialization
+  timeout_minutes: 15
+  approval_timeout_minutes: 1440 # approval expires after 24h; a fresh decision is then required
+  target: "runtime-only target reference" # config-only; never copied to approval state/API
+  rollback: "runtime-only rollback procedure" # config-only; never copied to approval state/API
+  target_label: "production web" # mandatory operator-declared persistence-safe label
+  verification_label: "public health check and release identity" # mandatory safe label
+  rollback_label: "restore the previous accepted release" # mandatory; use "none: reason" only when unavailable
+
+# Legacy: deploy_cmd still works but is deprecated — it maps to
+# delivery.mode: automatic (unattended deploy after every merge) and emits a
+# load-time deprecation warning. Prefer the delivery: block above.
+# deploy_cmd: "/path/to/repo/scripts/deploy.sh"
 
 # Telegram notifications (optional, via OpenClaw gateway)
 telegram:
@@ -256,7 +274,8 @@ telegram:
 | `model.backends.<name>.mcp` | Optional worker MCP attachment for that backend; omitted means no MCP tools |
 | `model.backends.<name>.subagent_hint` | Optional sub-agent model policy injected into the worker prompt for that backend; omitted means the prompt is unchanged |
 | `max_parallel` | Maximum concurrent worker sessions |
-| `deploy_cmd` | Shell command maestro runs after merging a PR |
+| `delivery` | Post-merge delivery block (#872): `mode` (disabled/approval_required/automatic), exact-SHA repo-relative `command` and `verify_command`, timeouts, config-only `target`/`rollback`, and mandatory persistence-safe target/verification/rollback labels. Default-safe: a merge mints an expiring approval and runs nothing until approved |
+| `deploy_cmd` | Deprecated (#872): legacy shell command run automatically after merge; folds into `delivery.mode: automatic` with a deprecation warning |
 | `session_prefix` | Prefix for tmux session names |
 | `worker_prompt` | Path to the worker prompt template file |
 | `hooks.post_edit` | Optional command run inside worker sessions after matching file edit tools |
@@ -746,9 +765,21 @@ The backend build embeds the frontend dist files at compile time. If you build b
 
 Without auto-versioning, multiple PRs merging in sequence all report the same version. This makes debugging deployments difficult. Enable versioning (via CI workflow or maestro's `versioning` config) to auto-increment the patch version on every merge to `main`.
 
-### Deploy hook eliminates manual deploys
+### Delivery hook eliminates manual deploys — with an approval gate by default
 
-Using `deploy_cmd` in maestro config means every merged PR is automatically deployed. This removes the "forgot to deploy" failure mode and keeps the running service in sync with `main`. The deploy command runs in the context of the local machine, so it can `ssh` to servers, `pct exec` into containers, or build locally.
+Configuring `delivery` in maestro config removes the "forgot to deploy" failure mode and keeps the running service in sync with `main`. In `approval_required`, both entrypoints are argument-free repo-relative executables. Private target resolution and credentials arrive only through the runtime environment; never put them in an entrypoint string or public repository.
+
+Delivery is **approval-gated by default** (`delivery.mode: approval_required`): a merged revision creates an auditable `deploy_project` approval pinned to that PR's exact GitHub `merge_commit_sha`, carrying only operator-declared-safe target/verification/rollback labels, structured execution metadata, and an expiry (`approval_timeout_minutes`, default 24 hours). `command`, `verify_command`, raw target/rollback strings, output, and error text are never copied into durable approval state or its API. No command runs until an operator approves it.
+
+Approval binds a digest of the exact entrypoints, timeouts, raw runtime target/rollback configuration, safe labels, mode, and `local_path`; any drift durably stales the old decision and requires a fresh approval. Execution takes a durable SQLite `approved → executing` claim shared by the CLI, daemon, and Fleet UI, so only one contender runs and a restart never replays an interrupted delivery. Maestro fetches the approved full SHA into an isolated repository, executes delivery from that exact revision, then executes the verifier from a second pristine materialization; it does not switch or reset the authoritative `local_path` checkout. Only exit codes, timeout/cleanup flags, timestamps, failure stage, verified status, and executed revision are persisted. A successful verifier marks the matching `code_landed` session deployed and allows outcome reconciliation; pending, rejected, expired, stale, failed, or interrupted delivery keeps the issue open. A newer merge atomically supersedes older actionable generations. Set `delivery.mode: automatic` (or keep a legacy `deploy_cmd`) only to opt back into unattended deploy-on-merge.
+
+If a process interruption strands the durable row in `executing`, do not restart
+or replay the delivery. Follow the explicit local-operator procedure in the
+[Interrupted Delivery Reconciliation Runbook](delivery-reconciliation-runbook.md).
+The recovery command has no `unknown` outcome: inconclusive evidence leaves the
+lease untouched. A verified recovery runs only the configured verifier from a
+fresh pinned checkout; negative recovery requires explicit runner-gone and
+target-safe assertions.
 
 ---
 
@@ -768,3 +799,4 @@ Use this checklist when onboarding a new repo to maestro:
 - [ ] `maestro project plan` is reviewed, its exact `next[0]` apply command succeeds, and a second plan reports `no-op`
 - [ ] The single `maestro daemon --watch-store` shows exactly one hot-loaded flow in `/api/v1/fleet`
 - [ ] Telegram notifications working (if configured)
+- [ ] Operators know where to find the interrupted-delivery reconciliation runbook and the project's read-only target release-identity check

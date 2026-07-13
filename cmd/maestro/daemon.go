@@ -38,7 +38,7 @@ func daemonCmd(args []string) {
 	watchStore := fs.Bool("watch-store", false, "Hot add/remove/reload projects from the config store without a restart (#757)")
 	watchStoreInterval := fs.Duration("watch-store-interval", daemon.DefaultWatchStoreInterval, "Config-store diff/reload poll interval (with --watch-store)")
 	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend for the fleet approve/reject endpoint: json|sqlite (#759)")
-	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "Shared SQLite approvals db path (used with --approvals-store=sqlite)")
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "Shared SQLite approvals DB (always used for delivery; generic gate uses it with --approvals-store=sqlite)")
 	stateStore := fs.String("state-store", "json", "State store backend for sessions/decisions/health/missions: json|sqlite (write-through mirror, #760)")
 	stateDB := fs.String("state-db", statestore.DefaultDBPath(), "Shared SQLite state db path (used with --state-store=sqlite)")
 	webhookSecretFile := fs.String("webhook-secret-file", "", "Path to a file holding the GitHub webhook secret; enables inbound webhook ingestion on the fleet port (#824)")

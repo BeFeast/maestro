@@ -549,7 +549,7 @@ func (s *Store) forceWriteJSON(stateDir string, a *state.Approval) error {
 		return err
 	}
 	defer tx.Rollback()
-	if err := writeApprovalJSONTx(context.Background(), tx, stateDir, a); err != nil {
+	if err := writeApprovalJSONTx(context.Background(), tx, RowBinding{Project: a.Project, Repo: a.Repo, StateDir: stateDir}, a); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -405,6 +405,16 @@ func (e *Executor) dispatchAction(approval *state.Approval) Result {
 			Status:  state.ApprovalStatusAwaitingDispatch,
 			Summary: summary,
 		}
+	case state.ApprovalActionDeployProject:
+		// #872: delivery needs the durable approved→executing store claim
+		// before its side effect, so it is NOT run from the pure Execute()
+		// dispatch. The daemon/CLI drive it through approver.DeliveryExecutor
+		// instead. Returning execution_skipped (not failed) keeps the record
+		// clean while the delivery loop owns the actual run.
+		return Result{
+			Status:  state.ApprovalStatusExecutionSkipped,
+			Summary: "deploy_project runs through the delivery executor (durable approved→executing claim); not dispatched here",
+		}
 	}
 	return Result{
 		Status:  state.ApprovalStatusExecutionFailed,

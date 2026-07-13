@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,7 +10,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,12 +66,14 @@ func resetAppAuthForTest(t *testing.T) func() {
 	appTokenMu.Unlock()
 	origNow := appTokenNow
 	origPost := appTokenHTTPPost
+	origPostContext := appTokenHTTPPostContext
 	return func() {
 		appTokenMu.Lock()
 		appTokenSrc = origSrc
 		appTokenMu.Unlock()
 		appTokenNow = origNow
 		appTokenHTTPPost = origPost
+		appTokenHTTPPostContext = origPostContext
 	}
 }
 
@@ -203,6 +209,65 @@ func TestConfigureAppAuth_FetchesAndCachesToken(t *testing.T) {
 	}
 }
 
+func TestDoAppAuthHTTPPostContextKeepsJWTOutOfSubprocessState(t *testing.T) {
+	jwt := "secret.header.signature"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+jwt {
+			t.Errorf("authorization header = %q", got)
+		}
+		if strings.Contains(r.URL.String(), jwt) {
+			t.Error("JWT leaked into request URL")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(tokenResponse("installation-token", time.Now().Add(time.Hour)))
+	}))
+	defer server.Close()
+
+	// A hostile ambient gh cannot observe the JWT because token exchange no
+	// longer starts a subprocess at all.
+	bin := t.TempDir()
+	marker := filepath.Join(bin, "gh-ran")
+	fakeGH := filepath.Join(bin, "gh")
+	if err := os.WriteFile(fakeGH, []byte("#!/bin/sh\nprintf ran > \""+marker+"\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	t.Setenv("GH_TOKEN", "ambient-token")
+	t.Setenv("GITHUB_TOKEN", "ambient-token-2")
+
+	body, err := doAppAuthHTTPPostContext(context.Background(), server.URL, jwt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "installation-token") {
+		t.Fatalf("response = %q", body)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("token exchange spawned ambient gh (stat err=%v)", err)
+	}
+}
+
+func TestDoAppAuthHTTPPostContextBoundsResponseAndRedactsJWTFromErrors(t *testing.T) {
+	jwt := "must-not-appear"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(strings.Repeat("x", appAuthResponseBodyLimit+1)))
+	}))
+	defer server.Close()
+
+	_, err := doAppAuthHTTPPostContext(context.Background(), server.URL, jwt)
+	if err == nil || !strings.Contains(err.Error(), "safe limit") {
+		t.Fatalf("oversized response err = %v", err)
+	}
+	if strings.Contains(err.Error(), jwt) {
+		t.Fatalf("JWT leaked into error: %v", err)
+	}
+}
+
 func TestAppToken_RefreshBeforeExpiry(t *testing.T) {
 	cleanup := resetAppAuthForTest(t)
 	defer cleanup()
@@ -275,6 +340,63 @@ func TestAppToken_ForcedExpiryRefreshes(t *testing.T) {
 	}
 	if posts != 2 || tok != "tok-2" {
 		t.Fatalf("forced-expiry did not refresh: posts=%d tok=%q", posts, tok)
+	}
+}
+
+func TestAppTokenContext_CancelsWhileAnotherRefreshIsHung(t *testing.T) {
+	cleanup := resetAppAuthForTest(t)
+	defer cleanup()
+
+	_, key := testRSAKeyPEM(t, "pkcs1")
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	appTokenNow = func() time.Time { return now }
+	appTokenMu.Lock()
+	appTokenSrc = &appTokenSource{
+		appID: 1, installationID: 2, privateKey: key,
+		token: "expired", expiry: now.Add(-time.Minute),
+	}
+	appTokenMu.Unlock()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	appTokenHTTPPostContext = func(ctx context.Context, _, _ string) ([]byte, error) {
+		close(started)
+		select {
+		case <-release:
+			return tokenResponse("refreshed", now.Add(time.Hour)), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	backgroundDone := make(chan error, 1)
+	go func() {
+		_, err := appToken()
+		backgroundDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background refresh did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	startedAt := time.Now()
+	if _, err := appTokenContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("context waiter err = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("context waiter remained behind hung refresh for %s", elapsed)
+	}
+
+	close(release)
+	select {
+	case err := <-backgroundDone:
+		if err != nil {
+			t.Fatalf("background refresh: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background refresh did not finish after release")
 	}
 }
 

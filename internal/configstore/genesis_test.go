@@ -112,6 +112,40 @@ func TestPrepareProjectRejections(t *testing.T) {
 	}
 }
 
+// TestPrepareProjectSurfacesDeliveryWarnings: the genesis receipt carries the
+// #872 delivery deprecation so an operator sees, at plan/apply time, that a
+// legacy deploy_cmd runs an unattended deploy and should migrate to the
+// approval_required default — and a config that already uses the safe default
+// stays quiet.
+func TestPrepareProjectSurfacesDeliveryWarnings(t *testing.T) {
+	legacy := genesisYAML + "deploy_cmd: /srv/example-src/maestro/scripts/deploy.sh\n"
+	p, err := PrepareProject("legacy.yaml", []byte(legacy))
+	if err != nil {
+		t.Fatalf("PrepareProject legacy: %v", err)
+	}
+	if !containsSubstr(p.Warnings, "deploy_cmd is deprecated") {
+		t.Fatalf("legacy deploy_cmd genesis must warn about the deprecation; warnings=%v", p.Warnings)
+	}
+
+	safe := genesisYAML + "delivery:\n  mode: approval_required\n  command: ./scripts/deploy.sh\n  verify_command: ./scripts/status.sh\n  target_label: production\n  verification_label: status check\n  rollback_label: previous release\n"
+	q, err := PrepareProject("safe.yaml", []byte(safe))
+	if err != nil {
+		t.Fatalf("PrepareProject safe: %v", err)
+	}
+	if containsSubstr(q.Warnings, "deploy_cmd is deprecated") || containsSubstr(q.Warnings, "delivery.mode: automatic") {
+		t.Fatalf("approval_required delivery must not emit a delivery deprecation/automatic warning; warnings=%v", q.Warnings)
+	}
+}
+
+func containsSubstr(ss []string, sub string) bool {
+	for _, s := range ss {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // PlanProject issues only reads: the store fingerprint (name->updated_at) and
 // the row count are unchanged across a plan.
 func TestPlanProjectIsZeroWrite(t *testing.T) {

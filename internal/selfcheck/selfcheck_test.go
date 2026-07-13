@@ -14,7 +14,7 @@ func TestRunPassesAgainstEmbeddedFixture(t *testing.T) {
 	if !rep.OK {
 		t.Fatalf("Run() against the embedded fixture failed: %s", rep.JSON())
 	}
-	wantChecks := map[string]bool{CheckConfig: false, CheckBackend: false, CheckPrompt: false, CheckState: false}
+	wantChecks := map[string]bool{CheckConfig: false, CheckBackend: false, CheckPrompt: false, CheckState: false, CheckDelivery: false}
 	for _, c := range rep.Checks {
 		if _, known := wantChecks[c.Name]; !known {
 			t.Errorf("unexpected check %q", c.Name)

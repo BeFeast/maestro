@@ -1424,6 +1424,7 @@ function AuditApprovalRow({ a }) {
         {skipped && summary && summary !== a.title && (
           <p className="app-row-skipped-summary">{summary}</p>
         )}
+        <DeliveryApprovalDetails approval={a} />
         {followup && <ManualFollowupBanner followup={followup} />}
       </div>
       <div className="app-row-actions">
@@ -1508,6 +1509,106 @@ function ManualFollowupBanner({ followup }) {
   );
 }
 
+// DeliveryApprovalDetails is shared by active approvals and audit rows. It
+// renders only the API's strict delivery allow-list; there is no command,
+// local path, raw target/rollback, output, or error-text field. Exact revision
+// and expiry remain visible so an operator can verify the approval.
+export function DeliveryApprovalDetails({ approval }) {
+  const d = approval?.delivery;
+  if (!d || String(approval?.action || "").trim() !== "deploy_project") return null;
+
+  const status = String(approval?.status || "");
+  const interrupted = status === "executing";
+  const hasResult = status === "executed" || status === "execution_failed" ||
+    !!(d.started_at || d.finished_at || d.executed_revision || d.failure_stage ||
+      d.deploy_exit_code != null || d.verify_exit_code != null || d.timed_out || d.cleanup_failed);
+  const resultTone = status === "executed" && d.verified ? "ok"
+    : status === "execution_failed" ? "stuck"
+      : "watch";
+
+  return (
+    <section
+      aria-label="Delivery details"
+      style={{
+        marginTop: 12,
+        padding: 12,
+        border: "1px solid var(--border-1)",
+        borderRadius: "var(--r-2)",
+        background: "var(--bg-0)",
+      }}
+    >
+      {interrupted && (
+        <div
+          role="alert"
+          style={{
+            marginBottom: 12,
+            padding: 10,
+            border: "1px solid var(--watch)",
+            borderRadius: "var(--r-2)",
+            color: "var(--watch)",
+            fontSize: 12,
+          }}
+        >
+          <strong>Recovery required.</strong> Delivery was interrupted while executing. Maestro will not replay it automatically; reconcile the target and approval state before retrying.
+        </div>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(120px, 0.35fr) minmax(0, 1fr)", gap: "7px 12px", fontSize: 12 }}>
+        <DeliveryFact label="Merged revision" value={d.merged_sha} mono />
+        <DeliveryFact label="Merged at" value={d.merged_at} mono />
+        <DeliveryFact label="Approval expires" value={d.expires_at} mono />
+        <DeliveryFact label="Approval generation" value={d.approval_generation} />
+        <DeliveryFact label="Target label" value={d.target_label} />
+        <DeliveryFact label="Timeout" value={d.timeout_minutes > 0 ? `${d.timeout_minutes} minutes` : ""} />
+        <DeliveryFact label="Verification label" value={d.verification_label} />
+        <DeliveryFact label="Rollback label" value={d.rollback_label} />
+        <DeliveryFact label="Approved config digest" value={d.config_digest} mono />
+        <DeliveryFact label="Stale cause" value={d.stale_cause} />
+      </div>
+      {hasResult && (
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--border-1)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <strong style={{ fontSize: 12 }}>Execution result</strong>
+            <Pill tone={resultTone} noDot>
+              {status === "executed" && d.verified ? "verified" : status.replace(/_/g, " ") || "recorded"}
+            </Pill>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(120px, 0.35fr) minmax(0, 1fr)", gap: "7px 12px", fontSize: 12 }}>
+            <DeliveryFact label="Executed revision" value={d.executed_revision} mono />
+            <DeliveryFact label="Started" value={d.started_at} mono />
+            <DeliveryFact label="Finished" value={d.finished_at} mono />
+            <DeliveryFact label="Verified" value={d.verified ? "yes" : "no"} />
+            <DeliveryFact label="Failure stage" value={d.failure_stage} />
+            <DeliveryFact label="Deploy exit code" value={d.deploy_exit_code} mono />
+            <DeliveryFact label="Verifier exit code" value={d.verify_exit_code} mono />
+            <DeliveryFact label="Timed out" value={d.timed_out ? "yes" : ""} />
+            <DeliveryFact label="Cleanup failed" value={d.cleanup_failed ? "yes" : ""} />
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DeliveryFact({ label, value, mono = false, pre = false }) {
+  if (value == null || String(value).trim() === "") return null;
+  const style = {
+    margin: 0,
+    minWidth: 0,
+    color: "var(--fg-1)",
+    overflowWrap: "anywhere",
+    whiteSpace: pre ? "pre-wrap" : "normal",
+    userSelect: "text",
+  };
+  return (
+    <>
+      <span className="dim">{label}</span>
+      {pre
+        ? <pre className={mono ? "mono" : undefined} style={style}>{String(value)}</pre>
+        : <span className={mono ? "mono" : undefined} style={style}>{String(value)}</span>}
+    </>
+  );
+}
+
 function ApprovalRow({ a, focused }) {
   const overdue = !a.suggestion && (a.past_sla || a.ageMin > a.sla);
   const { fleet, refresh } = useFleet();
@@ -1569,6 +1670,7 @@ function ApprovalRow({ a, focused }) {
           ))}
         </div>
         {a.body && a.body !== a.title && <p>{a.body}</p>}
+        <DeliveryApprovalDetails approval={a} />
       </div>
       <div className="app-row-actions">
         <span className={`age ${overdue ? "bad" : ""}`}>{a.ageMin}m {overdue && `· SLA ${a.sla}m`}</span>

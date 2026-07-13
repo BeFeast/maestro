@@ -14,6 +14,7 @@
 package github
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -22,10 +23,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -115,6 +118,14 @@ type appTokenSource struct {
 	expiry      time.Time
 	lastRefresh time.Time
 	lastErr     error
+
+	// refreshing/refreshDone serialize installation-token exchange without
+	// holding appTokenMu across a network subprocess. A freshness caller can
+	// therefore stop waiting on an in-flight refresh when its context expires;
+	// the durable delivery execution lease is never stranded behind a mutex
+	// owned by a hung, unrelated GitHub poll.
+	refreshing  bool
+	refreshDone chan struct{}
 }
 
 const (
@@ -126,16 +137,33 @@ const (
 	// Installation tokens live 1 hour; refreshing at 55 min gives 5 min of
 	// headroom so a slow exchange does not serve an expired token.
 	tokenRefreshMargin = 5 * time.Minute
+
+	// The installation-token response is a tiny JSON object. Bound both wall
+	// time and decoded response bytes so a broken/malicious intermediary cannot
+	// strand auth refreshes or grow memory without limit.
+	appAuthHTTPTimeout       = 30 * time.Second
+	appAuthResponseBodyLimit = 1 << 20
 )
+
+var appAuthHTTPClient = &http.Client{
+	Timeout: appAuthHTTPTimeout,
+	// The only valid exchange endpoint is the one we constructed. Refusing
+	// redirects prevents forwarding the App JWT to a different origin.
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 // Process-wide singleton, guarded by appTokenMu.
 var (
-	appTokenMu  sync.Mutex
-	appTokenSrc *appTokenSource
+	appTokenMu          sync.Mutex
+	appTokenConfigureMu sync.Mutex
+	appTokenSrc         *appTokenSource
 
 	// Indirection for tests.
-	appTokenNow      = time.Now
-	appTokenHTTPPost func(url, body string) ([]byte, error) // nil → real HTTP
+	appTokenNow             = time.Now
+	appTokenHTTPPost        func(url, body string) ([]byte, error)                // nil → real HTTP
+	appTokenHTTPPostContext func(context.Context, string, string) ([]byte, error) // nil → real context-aware HTTP
 )
 
 // ConfigureAppAuth sets up (or tears down) GitHub App authentication for the
@@ -147,12 +175,18 @@ var (
 // every exec.Command("gh", …) call. On failure the error is logged and the
 // PAT path remains active.
 func ConfigureAppAuth(appID, installationID int64, privateKeyPath string) error {
-	appTokenMu.Lock()
-	defer appTokenMu.Unlock()
+	// Serialize config changes separately from token-state reads. The initial
+	// network exchange must not hold appTokenMu: a hot-reload with a stalled
+	// GitHub call otherwise blocks a post-claim delivery freshness check beyond
+	// its context deadline.
+	appTokenConfigureMu.Lock()
+	defer appTokenConfigureMu.Unlock()
 
 	if appID <= 0 || installationID <= 0 || strings.TrimSpace(privateKeyPath) == "" {
 		// Tear down: revert to PAT.
+		appTokenMu.Lock()
 		appTokenSrc = nil
+		appTokenMu.Unlock()
 		return nil
 	}
 
@@ -182,14 +216,18 @@ func ConfigureAppAuth(appID, installationID int64, privateKeyPath string) error 
 	token, expiry, err := src.fetchInstallationToken()
 	if err != nil {
 		src.lastErr = err
+		appTokenMu.Lock()
 		appTokenSrc = src
+		appTokenMu.Unlock()
 		return fmt.Errorf("github app auth: initial token fetch: %w", err)
 	}
 	now := appTokenNow()
 	src.token = token
 	src.expiry = expiry
 	src.lastRefresh = now
+	appTokenMu.Lock()
 	appTokenSrc = src
+	appTokenMu.Unlock()
 
 	log.Printf("[github] app auth configured: app_id=%d installation_id=%d token_expiry=%s",
 		appID, installationID, expiry.UTC().Format(time.RFC3339))
@@ -201,32 +239,86 @@ func ConfigureAppAuth(appID, installationID int64, privateKeyPath string) error 
 // Returns ("", err) when App auth IS configured but refresh failed — the caller
 // should fall back to PAT and log loudly.
 func appToken() (string, error) {
-	appTokenMu.Lock()
-	defer appTokenMu.Unlock()
+	return appTokenContext(context.Background())
+}
 
-	if appTokenSrc == nil {
-		return "", nil
+// appTokenContext is the cancellation-aware token accessor used by delivery
+// freshness reads. Token exchange is single-flight per configured source, but
+// the network subprocess runs without appTokenMu held. A caller waiting for an
+// unrelated refresh selects on ctx and returns promptly even if that refresh
+// is hung; ordinary non-delivery callers retain the legacy background behavior
+// through appToken().
+func appTokenContext(ctx context.Context) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 
-	now := appTokenNow()
-	if appTokenSrc.token != "" && now.Before(appTokenSrc.expiry.Add(-tokenRefreshMargin)) {
-		return appTokenSrc.token, nil
+		appTokenMu.Lock()
+		src := appTokenSrc
+		if src == nil {
+			appTokenMu.Unlock()
+			return "", nil
+		}
+		now := appTokenNow()
+		if src.token != "" && now.Before(src.expiry.Add(-tokenRefreshMargin)) {
+			token := src.token
+			appTokenMu.Unlock()
+			return token, nil
+		}
+		if src.refreshing {
+			done := src.refreshDone
+			appTokenMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-done:
+				// Re-read the current source and cache. The completed refresh may
+				// have failed or a concurrent config reload may have replaced it.
+				continue
+			}
+		}
+		src.refreshing = true
+		src.refreshDone = make(chan struct{})
+		appTokenMu.Unlock()
+
+		// Token is expired or within the refresh margin. This is the only
+		// potentially blocking section and it deliberately owns no global lock.
+		token, expiry, err := src.fetchInstallationTokenContext(ctx)
+
+		appTokenMu.Lock()
+		current := appTokenSrc == src
+		if current {
+			if err != nil {
+				src.lastErr = err
+			} else {
+				src.token = token
+				src.expiry = expiry
+				src.lastRefresh = now
+				src.lastErr = nil
+			}
+		}
+		done := src.refreshDone
+		src.refreshing = false
+		src.refreshDone = nil
+		if done != nil {
+			close(done)
+		}
+		appTokenMu.Unlock()
+
+		if !current {
+			continue
+		}
+		if err != nil {
+			log.Printf("[github] app auth: token refresh FAILED (falling back to PAT): %v", err)
+			return "", err
+		}
+		log.Printf("[github] app auth: token refreshed, new expiry %s", expiry.UTC().Format(time.RFC3339))
+		return token, nil
 	}
-
-	// Token is expired or within the refresh margin — refresh.
-	token, expiry, err := appTokenSrc.fetchInstallationToken()
-	if err != nil {
-		appTokenSrc.lastErr = err
-		log.Printf("[github] app auth: token refresh FAILED (falling back to PAT): %v", err)
-		return "", err
-	}
-
-	appTokenSrc.token = token
-	appTokenSrc.expiry = expiry
-	appTokenSrc.lastRefresh = now
-	appTokenSrc.lastErr = nil
-	log.Printf("[github] app auth: token refreshed, new expiry %s", expiry.UTC().Format(time.RFC3339))
-	return token, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +389,13 @@ type installationTokenResponse struct {
 // fetchInstallationToken signs a JWT and exchanges it for an installation
 // access token via the GitHub API.
 func (s *appTokenSource) fetchInstallationToken() (token string, expiry time.Time, err error) {
+	return s.fetchInstallationTokenContext(context.Background())
+}
+
+func (s *appTokenSource) fetchInstallationTokenContext(ctx context.Context) (token string, expiry time.Time, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	jwt, err := signJWT(s.appID, s.privateKey)
 	if err != nil {
 		return "", time.Time{}, err
@@ -305,10 +404,14 @@ func (s *appTokenSource) fetchInstallationToken() (token string, expiry time.Tim
 	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", s.installationID)
 
 	var respBody []byte
-	if appTokenHTTPPost != nil {
+	if appTokenHTTPPostContext != nil {
+		respBody, err = appTokenHTTPPostContext(ctx, url, jwt)
+	} else if appTokenHTTPPost != nil {
+		// Legacy test seam. Production always takes the context-aware path
+		// below; tests that exercise cancellation use appTokenHTTPPostContext.
 		respBody, err = appTokenHTTPPost(url, jwt)
 	} else {
-		respBody, err = doAppAuthHTTPPost(url, jwt)
+		respBody, err = doAppAuthHTTPPostContext(ctx, url, jwt)
 	}
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("POST %s: %w", url, err)
@@ -319,43 +422,50 @@ func (s *appTokenSource) fetchInstallationToken() (token string, expiry time.Tim
 		return "", time.Time{}, fmt.Errorf("decode installation token response: %w", err)
 	}
 	if resp.Token == "" {
-		return "", time.Time{}, fmt.Errorf("installation token response has empty token (body: %s)", truncate(string(respBody), 200))
+		return "", time.Time{}, errors.New("installation token response has empty token")
 	}
 
 	return resp.Token, resp.ExpiresAt, nil
 }
 
 // doAppAuthHTTPPost is the real HTTP POST for installation token exchange.
-// Uses the gh CLI so this package keeps its exec-only dependency shape, but it
-// MUST bypass ghApplyAuth: the exchange authenticates with the App JWT bearer
-// header, and routing it through ghAPIRunner would (a) re-enter appToken() and
-// deadlock on appTokenMu, and (b) inject a stale GH_TOKEN that conflicts with
-// the bearer. It also clears GH_TOKEN/GITHUB_TOKEN from the child env so only
-// the JWT authenticates the call.
+// It deliberately stays in-process: putting the App JWT in `gh -H ...` would
+// expose the bearer through the subprocess argv (and putting it in GH_TOKEN
+// would move the same secret to its environment). The request header is kept
+// in Go memory and never enters argv, env, logs, or a persisted record.
 func doAppAuthHTTPPost(url, jwt string) ([]byte, error) {
-	args := []string{
-		"api", url,
-		"--method", "POST",
-		"-H", "Authorization: Bearer " + jwt,
-		"-H", "Accept: application/vnd.github+json",
-		"--input", "/dev/null",
-	}
-	cmd := exec.Command("gh", args...)
-	env := make([]string, 0, len(os.Environ()))
-	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "GH_TOKEN=") || strings.HasPrefix(kv, "GITHUB_TOKEN=") {
-			continue
-		}
-		env = append(env, kv)
-	}
-	cmd.Env = env
-	return cmd.CombinedOutput()
+	return doAppAuthHTTPPostContext(context.Background(), url, jwt)
 }
 
-// truncate shortens s to at most n bytes for safe error messages.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+func doAppAuthHTTPPostContext(ctx context.Context, url, jwt string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return s[:n] + "…"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
+	if err != nil {
+		return nil, errors.New("create GitHub App token request failed")
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := appAuthHTTPClient.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, errors.New("GitHub App token request failed")
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, appAuthResponseBodyLimit+1))
+	if err != nil {
+		return nil, errors.New("read GitHub App token response failed")
+	}
+	if len(body) > appAuthResponseBodyLimit {
+		return nil, errors.New("GitHub App token response exceeded safe limit")
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("GitHub App token request returned HTTP %d", resp.StatusCode)
+	}
+	return body, nil
 }

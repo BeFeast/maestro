@@ -2,13 +2,20 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 )
@@ -75,6 +82,92 @@ func TestHandleApproval_Approve_HappyPath(t *testing.T) {
 	st, _ := state.Load(dir)
 	if st.Approvals[0].Status != state.ApprovalStatusApproved {
 		t.Fatalf("disk status = %q", st.Approvals[0].Status)
+	}
+}
+
+func TestHandleApproval_DeliveryMirrorSaveFailureAcknowledgesAuthoritativeCommit(t *testing.T) {
+	srv, dir := srvWithStateDir(t)
+	now := time.Now().UTC()
+	st := state.NewState()
+	approval := st.RecordDeliveryApproval(state.DeliveryPayload{
+		Project: "owner/repo", Repo: "owner/repo",
+		MergedSHA:    "0123456789abcdef0123456789abcdef01234567",
+		ConfigDigest: "sha256:approved", ExpiresAt: now.Add(time.Hour),
+	}, now)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "approvals.db")
+	store, err := approvalstore.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.PutDelivery(context.Background(), approval, approvalstore.RowBinding{
+		Project: "owner/repo", Repo: "owner/repo", StateDir: dir,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.SetApprovalStore(approvalstore.ModeJSON, dbPath); err != nil {
+		t.Fatal(err)
+	}
+
+	const privatePath = "/home/private-user/secret-vault/state.json.tmp"
+	originalSave := saveApprovalDecisionState
+	saveApprovalDecisionState = func(string, *state.State) error {
+		return &os.PathError{Op: "rename", Path: privatePath, Err: errors.New("injected mirror failure")}
+	}
+	defer func() { saveApprovalDecisionState = originalSave }()
+	var logs bytes.Buffer
+	oldLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldLogWriter)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+approval.ID+"/approve", nil)
+	w := httptest.NewRecorder()
+	srv.handleApproval(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want committed success; body=%s", w.Code, w.Body.String())
+	}
+	var resp approvalDecisionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Approval == nil || resp.Approval.Status != state.ApprovalStatusApproved || resp.Warning == "" {
+		t.Fatalf("response = %+v, want approved with mirror warning", resp)
+	}
+	if resp.Warning != "approval committed; "+state.DeliveryMirrorReconciliationPending {
+		t.Fatalf("warning = %q, want the path-free mirror warning", resp.Warning)
+	}
+	if strings.Contains(w.Body.String(), privatePath) || strings.Contains(logs.String(), privatePath) ||
+		strings.Contains(w.Body.String(), "private-user") || strings.Contains(logs.String(), "private-user") {
+		t.Fatalf("private state path leaked in API/log surface: body=%q log=%q", w.Body.String(), logs.String())
+	}
+
+	// The losing/retry decision path also attempts to persist the authoritative
+	// status before returning 409. Its mirror failure must preserve that conflict
+	// semantics without exposing the same PathError.
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+approval.ID+"/approve", nil)
+	retryW := httptest.NewRecorder()
+	srv.handleApproval(retryW, retryReq)
+	if retryW.Code != http.StatusConflict {
+		t.Fatalf("retry status = %d, want authoritative conflict; body=%s", retryW.Code, retryW.Body.String())
+	}
+	if strings.Contains(retryW.Body.String(), privatePath) || strings.Contains(logs.String(), privatePath) ||
+		strings.Contains(retryW.Body.String(), "private-user") || strings.Contains(logs.String(), "private-user") {
+		t.Fatalf("private state path leaked on failed-decision mirror path: body=%q log=%q", retryW.Body.String(), logs.String())
+	}
+	authoritative, err := store.Get(context.Background(), dir, approval.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authoritative.Status != state.ApprovalStatusApproved {
+		t.Fatalf("authoritative status = %q, want approved", authoritative.Status)
+	}
+	if _, err := store.ClaimDeliveryExecuting(context.Background(), dir, approval.ID, "sha256:approved", now.Add(time.Second), "daemon-a", "claim"); err != nil {
+		t.Fatalf("first execution claim: %v", err)
+	}
+	if _, err := store.ClaimDeliveryExecuting(context.Background(), dir, approval.ID, "sha256:approved", now.Add(2*time.Second), "daemon-b", "claim"); !errors.Is(err, state.ErrApprovalNotApproved) {
+		t.Fatalf("second execution claim err = %v, want no replay", err)
 	}
 }
 

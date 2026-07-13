@@ -244,7 +244,7 @@ func recoverFlow(flow *projectFlow, loop string) {
 // The pump exits on ctx cancellation or when the watcher closes its channel on
 // shutdown. It never closes orchReloadCh: a closed channel would spin the
 // orchestrator's select on a nil config.
-func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <-chan *config.Config, orchReloadCh chan<- *config.Config) {
+func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <-chan *config.Config, orchReloadCh chan *config.Config) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -257,8 +257,9 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			if newCfg == nil {
 				continue
 			}
-			// Identity / restart-required fields (repo, state_dir, session_prefix)
-			// cannot be hot-applied: the orchestrator, supervisor, watchdog, and the
+			// Identity / restart-required fields (repo, state_dir, session_prefix,
+			// local_path) cannot be hot-applied: the orchestrator, supervisor,
+			// watchdog, and the
 			// supervisor's GitHub client were all built from the flow's STARTUP
 			// identity. Storing a changed identity in the holder would make
 			// supervisor.RunOnce(getCfg(), gh) read a repo/state_dir the rest of the
@@ -267,7 +268,7 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			// the diff-loop handles as a fresh flow); hot-reloadable edits still
 			// apply (#768, Codex).
 			if identityChanged(flow.cfg, newCfg) {
-				log.Printf("[%s] config reload: identity field (repo/state_dir/session_prefix) changed — restart required, live reload skipped", flow.name)
+				log.Printf("[%s] config reload: restart-required field (repo/state_dir/session_prefix/local_path) changed — restart required, live reload skipped", flow.name)
 				continue
 			}
 			// Holder first, so the supervise loop's next cycle and the updated
@@ -284,13 +285,23 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 				fleet.UpdateProjectConfig(flow.name, newCfg)
 			}
 
-			// Forward to the orchestrator. Non-blocking with drop-if-not-drained,
-			// matching configwatch's own buffered-depth-1 semantics: if the
-			// orchestrator is mid-cycle and has not drained the previous reload, it
-			// applies the next edit on the following tick.
+			// Forward to the orchestrator with latest-value coalescing. Dropping the
+			// newest edit when the depth-1 channel is full can leave delivery config
+			// permanently stale (and every fresh approval digest fail-closed) until
+			// an unrelated later edit or restart. Replace the queued stale snapshot,
+			// then guarantee the latest one is enqueued or shutdown wins.
 			select {
 			case orchReloadCh <- newCfg:
 			default:
+				select {
+				case <-orchReloadCh:
+				default:
+				}
+				select {
+				case orchReloadCh <- newCfg:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}
@@ -300,12 +311,15 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 // restart-required field that cannot be hot-applied to a running flow: the
 // orchestrator, supervisor, watchdog, and the supervisor's GitHub client are
 // all built once from these at startup. flowKey already keys on StateDir/Repo;
-// session_prefix names worker sessions. A change here needs a flow restart.
+// session_prefix names worker sessions. LocalPath is also part of the delivery
+// approval digest and selects the supervisor/executor checkout. Applying it to
+// only one reader would make every newly minted delivery approval fail closed
+// with a config mismatch. A change here therefore needs one atomic flow restart.
 func identityChanged(a, b *config.Config) bool {
 	if a == nil || b == nil {
 		return a != b
 	}
-	return a.Repo != b.Repo || a.StateDir != b.StateDir || a.SessionPrefix != b.SessionPrefix
+	return a.Repo != b.Repo || a.StateDir != b.StateDir || a.SessionPrefix != b.SessionPrefix || a.LocalPath != b.LocalPath
 }
 
 // runOrchestrator is the production run loop for one flow. It mirrors the

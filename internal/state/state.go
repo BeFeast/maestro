@@ -1000,6 +1000,13 @@ const (
 	// Distinct from execution_skipped (which means "no action will
 	// happen") so dedup can keep it as a still-effective record.
 	ApprovalStatusAwaitingDispatch ApprovalStatus = "awaiting_dispatch"
+	// ApprovalStatusExecuting is the durable claim an executor takes on an
+	// approved delivery (deploy_project) BEFORE any external side effect
+	// (#872 safety addendum). Exactly one executor wins the approved→executing
+	// transition; a daemon restart that observes an executing row must NOT
+	// replay it — the executor only claims from approved, so an executing row
+	// is skipped and surfaced for operator reconciliation instead.
+	ApprovalStatusExecuting ApprovalStatus = "executing"
 )
 
 const (
@@ -1012,6 +1019,16 @@ const (
 	ApprovalAuditExecutionFailed  = "execution_failed"
 	ApprovalAuditExecutionSkipped = "execution_skipped"
 	ApprovalAuditAwaitingDispatch = "awaiting_dispatch"
+	// ApprovalAuditExecuting records the durable approved→executing claim on a
+	// delivery approval (#872).
+	ApprovalAuditExecuting = "executing"
+	// ApprovalAuditExecutionReleased records a pre-side-effect release of an
+	// executing delivery claim after transient freshness verification failed.
+	ApprovalAuditExecutionReleased = "execution_released"
+	// ApprovalAuditDeliveryReconciled records an explicit operator decision for
+	// an execution whose process ended without a durable terminal result. The
+	// structured outcome lives in DeliveryPayload; audit text stays fixed.
+	ApprovalAuditDeliveryReconciled = "delivery_reconciled"
 )
 
 const (
@@ -1020,6 +1037,9 @@ const (
 	approvalActionSpawnWorker       = "spawn_worker"
 	approvalActionSpawnRepairWorker = "spawn_repair_worker"
 	approvalActionSpawnReviewRepair = "spawn_review_repair"
+	// ApprovalActionDeployProject is the #872 approval-gated post-merge
+	// delivery verb (kept in lockstep with config.SupervisorActionDeployProject).
+	ApprovalActionDeployProject = "deploy_project"
 )
 
 // Approval records a risky supervisor decision that needs explicit resolution.
@@ -1059,6 +1079,90 @@ type Approval struct {
 	// lets the dispatcher converge on exactly one worker without a coincident
 	// latest supervisor decision. nil for every non-review-repair approval.
 	ReviewRepair *SupervisorReviewRepairPayload `json:"review_repair,omitempty"`
+
+	// Delivery carries the #872 approval-gated post-merge delivery payload for
+	// a deploy_project approval: the exact merged revision plus an explicit
+	// operator-declared-safe label/plan, and (once executed) allow-listed result
+	// metadata. Nil on every other verb. It is part of
+	// ComputePayloadHash so a superseding merge (a different MergedSHA) can
+	// never be approved into deploying the stale revision.
+	Delivery *DeliveryPayload `json:"delivery,omitempty"`
+}
+
+// DeliveryPayload is the strict allow-list persisted for a deploy_project
+// approval (#872). It deliberately has no command, verifier, local path,
+// destination, rollback command, stdout/stderr, or error-text fields. Those
+// values are execution inputs and can contain credentials even after a
+// best-effort redaction pass. The executor reads them from live config and
+// persists only immutable coordinates, explicit operator-declared-safe labels,
+// and structured result metadata.
+type DeliveryPayload struct {
+	Project   string    `json:"project,omitempty"`
+	Repo      string    `json:"repo,omitempty"`
+	PR        int       `json:"pr,omitempty"`
+	Issue     int       `json:"issue,omitempty"`
+	MergedSHA string    `json:"merged_sha"`          // exact merge commit, pinned at mint
+	MergedAt  time.Time `json:"merged_at,omitempty"` // authoritative GitHub merge order
+	// ApprovalGeneration increments only when the latest approval for this
+	// exact SHA+config digest became stale because its immutable expiry passed.
+	// It gives an intentional renewal a distinct content-addressed ID without
+	// resurrecting rejected, failed, executing, or otherwise-stale decisions.
+	ApprovalGeneration int `json:"approval_generation,omitempty"`
+
+	// These three fields are copied only from config keys whose names explicitly
+	// declare them safe for durable operator UI/history. They default blank; no
+	// command/target/rollback value is ever inferred into them.
+	TargetLabel       string `json:"target_label,omitempty"`
+	VerificationLabel string `json:"verification_label,omitempty"`
+	RollbackLabel     string `json:"rollback_label,omitempty"`
+	TimeoutMinutes    int    `json:"timeout_minutes,omitempty"`
+	// ConfigDigest binds the exact delivery mode/command/verifier/timeouts and
+	// operator context that were present when the approval was minted. The raw
+	// command remains out of durable state; execution fails closed if the live
+	// config digest differs.
+	ConfigDigest string    `json:"config_digest"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+
+	// Execution result — structured allow-list only. Exit codes are pointers so
+	// an actual exit 0 differs from a stage that never ran. FailureStage is one
+	// of precondition|checkout|deploy|verify|cleanup; no error text is stored.
+	StartedAt      time.Time `json:"started_at,omitempty"`
+	FinishedAt     time.Time `json:"finished_at,omitempty"`
+	FailureStage   string    `json:"failure_stage,omitempty"`
+	DeployExitCode *int      `json:"deploy_exit_code,omitempty"`
+	VerifyExitCode *int      `json:"verify_exit_code,omitempty"`
+	TimedOut       bool      `json:"timed_out,omitempty"`
+	CleanupFailed  bool      `json:"cleanup_failed,omitempty"`
+	Verified       bool      `json:"verified,omitempty"`
+	// CompletionSource/ReconcileOutcome are closed codes used only by explicit
+	// operator reconciliation of an interrupted executing row. Normal executor
+	// completion leaves both empty.
+	CompletionSource string `json:"completion_source,omitempty"`
+	ReconcileOutcome string `json:"reconcile_outcome,omitempty"`
+	// StaleCause is a closed status code, never free text. It distinguishes a
+	// renewable config-drift decision from expiry and integrity/payload failures.
+	StaleCause string `json:"stale_cause,omitempty"`
+	// ExecutedRevision is the revision that was actually checked out at
+	// execute time. It equals MergedSHA on a clean run; a mismatch fails the
+	// delivery before any command runs (never deploy whatever is at LocalPath).
+	ExecutedRevision string `json:"executed_revision,omitempty"`
+}
+
+// Clone returns a deep copy of the payload (all fields are value types).
+func (p *DeliveryPayload) Clone() *DeliveryPayload {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	if p.DeployExitCode != nil {
+		code := *p.DeployExitCode
+		cp.DeployExitCode = &code
+	}
+	if p.VerifyExitCode != nil {
+		code := *p.VerifyExitCode
+		cp.VerifyExitCode = &code
+	}
+	return &cp
 }
 
 type ApprovalAudit struct {
@@ -1394,6 +1498,7 @@ func Load(stateDir string) (*State, error) {
 		return nil, fmt.Errorf("parse state: %w", err)
 	}
 	s.normalize()
+	s.normalizeDeliveryApprovals()
 	s.rememberLoaded(data)
 	return s, nil
 }
@@ -1480,6 +1585,11 @@ func saveLocked(stateDir string, s *State) error {
 		}
 		desired = merged
 	}
+	// Final persistence boundary: a concurrent current snapshot may have been
+	// written by an older binary carrying delivery free text. Project again
+	// after the 3-way merge so neither state.json nor SaveHook can reintroduce
+	// command/target/output/summary secrets.
+	desired.normalizeDeliveryApprovals()
 	desired.ReconcileSpawnWorkerApprovalsForStartedWorkers(time.Now().UTC())
 
 	data, err := json.MarshalIndent(desired, "", "  ")
@@ -1525,6 +1635,7 @@ func readStateFile(path string) (*State, []byte, error) {
 		return nil, nil, fmt.Errorf("parse state: %w", err)
 	}
 	s.normalize()
+	s.normalizeDeliveryApprovals()
 	return s, data, nil
 }
 
@@ -2657,6 +2768,9 @@ func (s *State) ApproveApproval(id string, now time.Time, actor, reason string) 
 	}
 	approval.Status = ApprovalStatusApproved
 	approval.UpdatedAt = normalizedTime(now)
+	if approval.Action == ApprovalActionDeployProject {
+		reason = deliveryAuditReason(ApprovalAuditApproved)
+	}
 	approval.Audit = append(approval.Audit, ApprovalAudit{
 		At:              approval.UpdatedAt,
 		Event:           ApprovalAuditApproved,
@@ -2675,6 +2789,9 @@ func (s *State) RejectApproval(id string, now time.Time, actor, reason string) (
 	}
 	approval.Status = ApprovalStatusRejected
 	approval.UpdatedAt = normalizedTime(now)
+	if approval.Action == ApprovalActionDeployProject {
+		reason = deliveryAuditReason(ApprovalAuditRejected)
+	}
 	approval.Audit = append(approval.Audit, ApprovalAudit{
 		At:              approval.UpdatedAt,
 		Event:           ApprovalAuditRejected,
@@ -2942,6 +3059,10 @@ func (s *State) pendingApproval(id string) (*Approval, error) {
 }
 
 func (s *State) ensureApprovalCurrent(approval *Approval, now time.Time) error {
+	if approval.Action == ApprovalActionDeployProject && approval.Delivery.DeliveryExpired(now) {
+		s.markApprovalStale(approval, now, "delivery approval expired before execution")
+		return ErrApprovalStale
+	}
 	if approval.PayloadHash != "" && approval.ComputePayloadHash() != approval.PayloadHash {
 		s.markApprovalStale(approval, now, "approval payload changed")
 		return ErrApprovalPayloadMismatch
@@ -2968,6 +3089,21 @@ func (s *State) markApprovalStale(approval *Approval, now time.Time, reason stri
 	}
 	approval.Status = ApprovalStatusStale
 	approval.UpdatedAt = normalizedTime(now)
+	if approval.Action == ApprovalActionDeployProject {
+		if approval.Delivery != nil {
+			switch {
+			case strings.Contains(reason, "config changed"):
+				approval.Delivery.StaleCause = DeliveryStaleCauseConfigDrift
+			case strings.Contains(reason, "expired"):
+				approval.Delivery.StaleCause = DeliveryStaleCauseExpired
+			case strings.Contains(reason, "payload changed"), strings.Contains(reason, "integrity"):
+				approval.Delivery.StaleCause = DeliveryStaleCauseIntegrity
+			default:
+				approval.Delivery.StaleCause = DeliveryStaleCauseOther
+			}
+		}
+		reason = deliveryAuditReason(ApprovalAuditStale)
+	}
 	approval.Audit = append(approval.Audit, ApprovalAudit{
 		At:              approval.UpdatedAt,
 		Event:           ApprovalAuditStale,
@@ -3010,6 +3146,9 @@ func (s *State) supersedeApprovalFrom(approval *Approval, now time.Time, reason 
 	}
 	approval.Status = ApprovalStatusSuperseded
 	approval.UpdatedAt = normalizedTime(now)
+	if approval.Action == ApprovalActionDeployProject {
+		reason = deliveryAuditReason(ApprovalAuditSuperseded)
+	}
 	approval.Audit = append(approval.Audit, ApprovalAudit{
 		At:              approval.UpdatedAt,
 		Event:           ApprovalAuditSuperseded,
@@ -3074,6 +3213,7 @@ func (a Approval) ComputePayloadHash() string {
 		Risk:             a.Risk,
 		Evidence:         a.Evidence,
 		LessonProposalID: a.LessonProposalID,
+		Delivery:         a.Delivery.identity(),
 	})
 }
 
@@ -3108,13 +3248,57 @@ func (s *State) ApprovalTargetStateHash(target *SupervisorTarget) string {
 }
 
 type approvalPayload struct {
-	DecisionID       string            `json:"decision_id,omitempty"`
-	Action           string            `json:"action"`
-	Target           *SupervisorTarget `json:"target,omitempty"`
-	Summary          string            `json:"summary"`
-	Risk             string            `json:"risk"`
-	Evidence         []string          `json:"evidence,omitempty"`
-	LessonProposalID string            `json:"lesson_proposal_id,omitempty"`
+	DecisionID       string                   `json:"decision_id,omitempty"`
+	Action           string                   `json:"action"`
+	Target           *SupervisorTarget        `json:"target,omitempty"`
+	Summary          string                   `json:"summary"`
+	Risk             string                   `json:"risk"`
+	Evidence         []string                 `json:"evidence,omitempty"`
+	LessonProposalID string                   `json:"lesson_proposal_id,omitempty"`
+	Delivery         *deliveryPayloadIdentity `json:"delivery,omitempty"`
+}
+
+// deliveryPayloadIdentity is the immutable subset of a DeliveryPayload folded
+// into ComputePayloadHash. It deliberately excludes the mutable execution
+// result (output, timings, verified) so recording a run does not drift the
+// payload hash and stale the approval mid-flight, while the pinned MergedSHA
+// (and target/rollback/preview) IS hashed so a superseding merge for a
+// different revision is a genuinely different payload.
+type deliveryPayloadIdentity struct {
+	Project            string    `json:"project,omitempty"`
+	Repo               string    `json:"repo,omitempty"`
+	PR                 int       `json:"pr,omitempty"`
+	Issue              int       `json:"issue,omitempty"`
+	MergedSHA          string    `json:"merged_sha"`
+	MergedAt           time.Time `json:"merged_at,omitempty"`
+	ApprovalGeneration int       `json:"approval_generation,omitempty"`
+	TargetLabel        string    `json:"target_label,omitempty"`
+	VerificationLabel  string    `json:"verification_label,omitempty"`
+	RollbackLabel      string    `json:"rollback_label,omitempty"`
+	TimeoutMinutes     int       `json:"timeout_minutes,omitempty"`
+	ConfigDigest       string    `json:"config_digest"`
+	ExpiresAt          time.Time `json:"expires_at,omitempty"`
+}
+
+func (p *DeliveryPayload) identity() *deliveryPayloadIdentity {
+	if p == nil {
+		return nil
+	}
+	return &deliveryPayloadIdentity{
+		Project:            p.Project,
+		Repo:               p.Repo,
+		PR:                 p.PR,
+		Issue:              p.Issue,
+		MergedSHA:          p.MergedSHA,
+		MergedAt:           p.MergedAt,
+		ApprovalGeneration: p.ApprovalGeneration,
+		TargetLabel:        p.TargetLabel,
+		VerificationLabel:  p.VerificationLabel,
+		RollbackLabel:      p.RollbackLabel,
+		TimeoutMinutes:     p.TimeoutMinutes,
+		ConfigDigest:       p.ConfigDigest,
+		ExpiresAt:          p.ExpiresAt,
+	}
 }
 
 type approvalTargetStateSnapshot struct {
@@ -4367,6 +4551,9 @@ func (s *State) MarkApprovalExecuted(id string, now time.Time, actor, summary st
 	}
 	approval.Status = ApprovalStatusExecuted
 	approval.UpdatedAt = normalizedTime(now)
+	if approval.Action == ApprovalActionDeployProject {
+		summary = deliveryAuditReason(ApprovalAuditExecuted)
+	}
 	approval.Audit = append(approval.Audit, ApprovalAudit{
 		At:              approval.UpdatedAt,
 		Event:           ApprovalAuditExecuted,
@@ -4390,6 +4577,9 @@ func (s *State) MarkApprovalExecutionFailed(id string, now time.Time, actor, err
 	}
 	approval.Status = ApprovalStatusExecutionFailed
 	approval.UpdatedAt = normalizedTime(now)
+	if approval.Action == ApprovalActionDeployProject {
+		errMsg = deliveryAuditReason(ApprovalAuditExecutionFailed)
+	}
 	approval.Audit = append(approval.Audit, ApprovalAudit{
 		At:              approval.UpdatedAt,
 		Event:           ApprovalAuditExecutionFailed,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,10 +12,12 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -151,7 +154,11 @@ type restPull struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
-	MergedAt *string `json:"merged_at"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+	MergedAt       *string `json:"merged_at"`
+	MergeCommitSHA string  `json:"merge_commit_sha"`
 }
 
 type prLabel struct {
@@ -262,15 +269,24 @@ func ghCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 // the ambient gh auth (PAT path), so behavior is byte-identical to pre-#823. A
 // refresh failure was already logged loudly by appToken.
 func ghApplyAuth(cmd *exec.Cmd) {
-	token, _ := appToken()
+	_ = ghApplyAuthContext(context.Background(), cmd)
+}
+
+// ghApplyAuthContext is the delivery-safe sibling of ghApplyAuth. It lets the
+// caller's freshness deadline cancel both an installation-token refresh and a
+// wait for another goroutine's in-flight refresh. Non-context callers keep the
+// legacy PAT fallback behavior through ghApplyAuth.
+func ghApplyAuthContext(ctx context.Context, cmd *exec.Cmd) error {
+	token, err := appTokenContext(ctx)
 	if token == "" {
-		return
+		return err
 	}
 	// Inherit the current environment and override GH_TOKEN.
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
 	cmd.Env = append(cmd.Env, "GH_TOKEN="+token)
+	return err
 }
 
 // ghAPISleep is the backoff sleeper, injectable so tests do not actually wait.
@@ -660,7 +676,7 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 		}
 	}
 	cacheKey := etagCacheKey(endpoint, paginated)
-	cmdArgs := append([]string{"api", endpoint}, args...)
+	cmdArgs := append([]string{"api", "--hostname", "github.com", endpoint}, args...)
 	var cachedBody []byte
 	if conditional {
 		var cachedETag string
@@ -749,6 +765,176 @@ func ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("gh api %s: inconsistent conditional response", endpoint)
 	}
 	return out, nil
+}
+
+// ghAPIWithArgsContext is the bounded freshness-read sibling of the general
+// polling wrapper. Delivery calls it while holding an execution lease, so the
+// subprocess and secondary-rate-limit backoff must honor cancellation; a hung
+// gh process must never strand a row in executing. Errors deliberately omit
+// provider output because this path is adjacent to deployment authorization.
+func ghAPIWithArgsContext(ctx context.Context, endpoint string, args ...string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmdArgs := append([]string{"api", endpoint}, args...)
+	var lastErr error
+	for attempt := 0; attempt < ghAPIMaxAttempts; attempt++ {
+		cmd := ghFreshnessCommandContext(ctx, cmdArgs...)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		out, err := cmd.Output()
+		if err == nil {
+			noteAPIRequest(false, false)
+			return out, nil
+		}
+		lastErr = err
+		failure := out
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			failure = append(failure, exitErr.Stderr...)
+		}
+		rl := classifyGHRateLimit(failure)
+		noteAPIRequest(false, rl.kind != ghRateLimitNone)
+		if ctx.Err() != nil || rl.kind != ghRateLimitSecondary || attempt == ghAPIMaxAttempts-1 {
+			break
+		}
+		wait := rl.retryAfter
+		if wait <= 0 {
+			wait = ghBackoffDelay(attempt)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if lastErr == nil {
+		lastErr = errors.New("github freshness request failed")
+	}
+	return nil, fmt.Errorf("github freshness request failed: %w", lastErr)
+}
+
+func ghFreshnessCommandContext(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := trustedGHCommandContext(ctx, args...)
+	// Preserve the existing fallback semantics for a non-context auth failure:
+	// the sanitized ambient PAT remains usable. A canceled/deadline context is
+	// observed by ghAPIWithArgsContext before the process is started.
+	_ = ghApplyAuthContext(ctx, cmd)
+	return cmd
+}
+
+// trustedGHCommandContext is the process fence shared by delivery freshness
+// reads and their GitHub App installation-token exchange. It never resolves gh
+// through ambient PATH, carries only the narrow GitHub/network environment,
+// and kills the entire subprocess group on cancellation so a child retaining a
+// pipe cannot strand an executing delivery lease.
+func trustedGHCommandContext(ctx context.Context, args ...string) *exec.Cmd {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path := "/nonexistent/maestro-trusted-gh"
+	if trusted, ok := trustedGHExecutableWithinRoots("gh", []string{"/usr/bin", "/bin", "/usr/local/bin"}); ok {
+		path = trusted
+	}
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.Env = githubFreshnessEnv(os.Environ())
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
+	return cmd
+}
+
+// trustedGHExecutableWithinRoots accepts an executable only when its canonical
+// allowlisted root, every parent below that root, and the executable itself are
+// root-owned and not group/world writable. A fixed absolute path is not a
+// sufficient process fence when an unprivileged user can replace a component.
+func trustedGHExecutableWithinRoots(name string, allowedRoots []string) (string, bool) {
+	if name == "" || strings.ContainsRune(name, filepath.Separator) {
+		return "", false
+	}
+	for _, root := range allowedRoots {
+		canonicalRoot, err := filepath.EvalSymlinks(root)
+		if err != nil || !filepath.IsAbs(canonicalRoot) || !trustedGHRootOwnedPath(canonicalRoot, canonicalRoot) {
+			continue
+		}
+		candidate := filepath.Join(canonicalRoot, name)
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil || !filepath.IsAbs(resolved) {
+			continue
+		}
+		rel, relErr := filepath.Rel(canonicalRoot, resolved)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		info, err := os.Stat(resolved)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 && trustedGHRootOwnedPath(resolved, canonicalRoot) {
+			return resolved, true
+		}
+	}
+	return "", false
+}
+
+func trustedGHRootOwnedPath(path, root string) bool {
+	path = filepath.Clean(path)
+	root = filepath.Clean(root)
+	for current := path; ; current = filepath.Dir(current) {
+		info, err := os.Stat(current)
+		if err != nil || info.Mode().Perm()&0o022 != 0 {
+			return false
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != 0 {
+			return false
+		}
+		if current == root {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+	}
+}
+
+func githubFreshnessEnv(env []string) []string {
+	out := make([]string, 0, 16)
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		allowed := strings.HasPrefix(key, "LC_")
+		if !allowed {
+			switch key {
+			case "HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "GH_CONFIG_DIR",
+				"GH_TOKEN", "GITHUB_TOKEN",
+				"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+				"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+				"SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",
+				"LANG", "LANGUAGE", "TMPDIR":
+				allowed = true
+			}
+		}
+		if allowed {
+			out = append(out, entry)
+		}
+	}
+	return append(out, "PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin")
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,6 +1856,122 @@ func (c *Client) PRHeadSHA(prNumber int) (string, error) {
 	return c.pullHeadSHA(prNumber)
 }
 
+// PRMergeInfo is the immutable merge identity/order GitHub records for a PR.
+type PRMergeInfo struct {
+	SHA      string
+	MergedAt time.Time
+}
+
+// PRMergeInfo returns the exact merge commit and GitHub merge timestamp in one
+// REST read. MergedAt orders delivery generations when an older code_landed
+// session is reconciled after a newer merge.
+func (c *Client) PRMergeInfo(prNumber int) (PRMergeInfo, error) {
+	pr, err := c.getRESTPull(prNumber)
+	if err != nil {
+		return PRMergeInfo{}, err
+	}
+	if pr.MergedAt == nil {
+		return PRMergeInfo{}, fmt.Errorf("PR %d is not merged", prNumber)
+	}
+	sha := strings.TrimSpace(pr.MergeCommitSHA)
+	if len(sha) != 40 {
+		return PRMergeInfo{}, fmt.Errorf("PR %d has invalid merge_commit_sha %q", prNumber, sha)
+	}
+	mergedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(*pr.MergedAt))
+	if err != nil {
+		return PRMergeInfo{}, fmt.Errorf("PR %d has invalid merged_at: %w", prNumber, err)
+	}
+	return PRMergeInfo{SHA: sha, MergedAt: mergedAt.UTC()}, nil
+}
+
+// LatestMergedPRGenerations returns every merged PR tied at the repository's
+// latest merged_at second. GitHub exposes merged_at with second precision, so
+// choosing one tied PR by number or list order would invent a merge order. The
+// delivery executor resolves a tie with canonical-remote commit ancestry and
+// otherwise fails closed.
+func (c *Client) LatestMergedPRGenerations(ctx context.Context) ([]PRMergeInfo, error) {
+	deliveryBase, err := c.RepositoryDefaultBranch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := ghAPIWithArgsContext(ctx, fmt.Sprintf("repos/%s/pulls?state=closed&base=%s&per_page=100&sort=updated&direction=desc", c.Repo, url.QueryEscape(deliveryBase)), "--paginate")
+	if err != nil {
+		return nil, errors.New("list merged delivery generations failed")
+	}
+	merged, err := mergePaginatedJSONArrays(out)
+	if err != nil {
+		return nil, errors.New("decode merged delivery generations failed")
+	}
+	var pulls []restPull
+	if err := json.Unmarshal(merged, &pulls); err != nil {
+		return nil, errors.New("parse merged delivery generations failed")
+	}
+	return latestMergedPRGenerations(pulls, deliveryBase)
+}
+
+// RepositoryDefaultBranch resolves the current authoritative delivery base.
+// Repositories using trunk/master are supported, and a newer merge into an
+// unrelated release/feature branch cannot supersede a default-branch delivery.
+func (c *Client) RepositoryDefaultBranch(ctx context.Context) (string, error) {
+	out, err := ghAPIWithArgsContext(ctx, fmt.Sprintf("repos/%s", c.Repo))
+	if err != nil {
+		return "", errors.New("read repository delivery branch failed")
+	}
+	var repo struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := json.Unmarshal(out, &repo); err != nil {
+		return "", errors.New("parse repository delivery branch failed")
+	}
+	branch := strings.TrimSpace(repo.DefaultBranch)
+	if branch == "" || strings.ContainsAny(branch, "\r\n?&#") {
+		return "", errors.New("repository delivery branch is invalid")
+	}
+	return branch, nil
+}
+
+func latestMergedPRGenerations(pulls []restPull, base string) ([]PRMergeInfo, error) {
+	var latestAt time.Time
+	var latest []PRMergeInfo
+	for _, pr := range pulls {
+		if strings.TrimSpace(pr.Base.Ref) != base {
+			continue
+		}
+		if pr.MergedAt == nil {
+			continue
+		}
+		mergedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(*pr.MergedAt))
+		if err != nil {
+			return nil, errors.New("merged delivery generation has invalid timestamp")
+		}
+		sha := strings.ToLower(strings.TrimSpace(pr.MergeCommitSHA))
+		if len(sha) != 40 {
+			return nil, errors.New("merged delivery generation has invalid revision")
+		}
+		info := PRMergeInfo{SHA: sha, MergedAt: mergedAt.UTC()}
+		switch {
+		case latestAt.IsZero() || info.MergedAt.After(latestAt):
+			latestAt = info.MergedAt
+			latest = []PRMergeInfo{info}
+		case info.MergedAt.Equal(latestAt):
+			latest = append(latest, info)
+		}
+	}
+	if len(latest) == 0 {
+		return nil, errors.New("repository has no merged delivery generation")
+	}
+	return latest, nil
+}
+
+// PRMergeCommitSHA returns GitHub's immutable merge_commit_sha for a PR that
+// is already merged. It deliberately does not infer the revision from main:
+// versioning commits and concurrent merges can advance main immediately after
+// this PR lands, and a delivery approval must pin exactly this PR's merge.
+func (c *Client) PRMergeCommitSHA(prNumber int) (string, error) {
+	info, err := c.PRMergeInfo(prNumber)
+	return info.SHA, err
+}
+
 // BranchHeadSHA returns the current head commit SHA of the given branch. The
 // orchestrator uses it to detect when origin/main has advanced past the running
 // binary so a PR merged outside the orchestrator's own merge path still
@@ -1775,16 +2077,24 @@ func (c *Client) IsPRMerged(prNumber int) (bool, error) {
 // NOT count — that is a reference, not a closure. Matches GitHub's own
 // "Linked pull requests" semantics.
 func (c *Client) HasMergedPRForIssue(issueNumber int) (bool, error) {
+	number, err := c.MergedPRNumberForIssue(issueNumber)
+	return number > 0, err
+}
+
+// MergedPRNumberForIssue returns the newest merged PR that explicitly closed
+// the issue, or 0. Delivery recovery needs the concrete PR number so it can
+// fetch that PR's immutable merge_commit_sha; a boolean is not sufficient.
+func (c *Client) MergedPRNumberForIssue(issueNumber int) (int, error) {
 	prs, err := c.listClosedPRs()
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	for _, pr := range prs {
 		if pr.MergedAt != "" && prClosesIssue(pr, issueNumber) {
-			return true, nil
+			return pr.Number, nil
 		}
 	}
-	return false, nil
+	return 0, nil
 }
 
 // MergedPRNumberForBranch returns the number of a merged PR that used the

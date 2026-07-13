@@ -169,9 +169,28 @@ worker_prompt: /path/to/worker-prompt-template.md
 #   before_remove: ""                                # runs before workspace cleanup
 #   timeout_ms: 60000                                # hook timeout in milliseconds
 
-# Optional: command to run after successful merge (build + deploy)
-# deploy_cmd: "cd /path/to/repo && go build ./cmd/app/ && systemctl --user restart app"
-# deploy_timeout_minutes: 15         # timeout for deploy command in minutes (default: 15)
+# Optional post-merge delivery. The explicit safe mode creates an expiring,
+# exact-revision approval and runs nothing until an operator approves it.
+# `verify_command` is mandatory in approval_required mode.
+# delivery:
+#   mode: approval_required
+#   command: "./scripts/deploy.sh"
+#   verify_command: "./scripts/verify-live.sh"
+#   timeout_minutes: 15
+#   approval_timeout_minutes: 1440   # 24h default
+#   target_label: "production"
+#   verification_label: "live identity and health checks"
+#   rollback_label: "restore the previous accepted release"
+#   target: "production"             # config-only; never persisted in approval state
+#   rollback: "reinstall the previous artifact" # config-only; never persisted
+# If a process dies after the durable executing claim, Maestro never replays it.
+# Use the authenticated local `maestro supervise reconcile-delivery` procedure
+# in docs/delivery-reconciliation-runbook.md; there is no automatic/unknown path.
+#
+# Legacy only: deploy_cmd maps to delivery.mode=automatic and therefore runs
+# unattended after every merge. New projects should use the block above.
+# deploy_cmd: "./scripts/deploy.sh"
+# deploy_timeout_minutes: 15
 
 # Opt-in self-deploy of the maestro binary itself after every merge (#698).
 # Default OFF. For the dogfood project only: builds merged origin/main

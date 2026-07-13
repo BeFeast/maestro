@@ -1020,6 +1020,10 @@ function mapApproval(approval) {
   );
   return {
     ...approval,
+    // Whitelist the delivery fields the operator UI is allowed to render.
+    // In particular there is intentionally no command, local path, raw
+    // target/rollback, output, or error-text field.
+    delivery: mapDeliveryApproval(approval.delivery),
     project: approval.project_name || "",
     pr: approval.pr_number || 0,
     title: approval.summary || actionLabel(approval.action),
@@ -1031,6 +1035,39 @@ function mapApproval(approval) {
     suggestion: String(approval.action || "").trim() === "apply_lesson_proposal",
     body: approval.summary || "",
     stage: actionLabel(approval.action),
+  };
+}
+
+// mapDeliveryApproval normalizes the safe deploy_project payload returned by
+// the Fleet API. Keeping this as an explicit allow-list prevents an accidental
+// future backend field (for example a raw command) from reaching a rendering
+// component through object spread.
+export function mapDeliveryApproval(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    project: String(raw.project || ""),
+    repo: String(raw.repo || ""),
+    pr: Number(raw.pr || 0),
+    issue: Number(raw.issue || 0),
+    merged_sha: String(raw.merged_sha || ""),
+    merged_at: String(raw.merged_at || ""),
+    approval_generation: Number(raw.approval_generation || 0),
+    target_label: String(raw.target_label || ""),
+    verification_label: String(raw.verification_label || ""),
+    rollback_label: String(raw.rollback_label || ""),
+    timeout_minutes: Number(raw.timeout_minutes || 0),
+    config_digest: String(raw.config_digest || ""),
+    expires_at: String(raw.expires_at || ""),
+    started_at: String(raw.started_at || ""),
+    finished_at: String(raw.finished_at || ""),
+    failure_stage: String(raw.failure_stage || ""),
+    deploy_exit_code: raw.deploy_exit_code == null ? null : Number(raw.deploy_exit_code),
+    verify_exit_code: raw.verify_exit_code == null ? null : Number(raw.verify_exit_code),
+    timed_out: raw.timed_out === true,
+    cleanup_failed: raw.cleanup_failed === true,
+    stale_cause: String(raw.stale_cause || ""),
+    verified: raw.verified === true,
+    executed_revision: String(raw.executed_revision || ""),
   };
 }
 
@@ -1273,6 +1310,7 @@ export function actionLabel(action) {
   case "spawn_worker": return "Starting worker";
   case "label_issue_ready": return "Mark issue ready";
   case "add_issue_comment": return "Comment on issue";
+  case "deploy_project": return "Deploy project";
   default:
     return String(action || "-").replace(/_/g, " ");
   }
@@ -1321,6 +1359,8 @@ export function approvalCTA(action, prNumber, issueNumber) {
     return "Start worker";
   case "label_issue_ready":
     return "Mark ready";
+  case "deploy_project":
+    return "Deploy pinned revision";
   default:
     return "Approve";
   }
@@ -1339,6 +1379,8 @@ export function approvalRejectLabel(action) {
     return "Keep worktree";
   case "change_global_config":
     return "Reject change";
+  case "deploy_project":
+    return "Don't deploy";
   default:
     return "Reject";
   }
@@ -1360,6 +1402,8 @@ export function approvalReasonPlaceholder(action, verb) {
       return "e.g. worker abandoned, cleaning up";
     case "change_global_config":
       return "e.g. rolling out new policy";
+    case "deploy_project":
+      return "e.g. pinned revision and rollback plan verified";
     default:
       return "e.g. CI green, manual smoke ok";
     }
@@ -1373,6 +1417,8 @@ export function approvalReasonPlaceholder(action, verb) {
     return "e.g. still investigating, keep state";
   case "change_global_config":
     return "e.g. needs more eyes before rollout";
+  case "deploy_project":
+    return "e.g. target unavailable; hold this revision";
   default:
     return "e.g. failing on review item X";
   }

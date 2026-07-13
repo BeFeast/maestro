@@ -995,7 +995,7 @@ func TestRunDeployCmd_Failure(t *testing.T) {
 	}
 }
 
-func TestRunDeployCmd_CapturesOutput(t *testing.T) {
+func TestRunDeployCmd_DoesNotReturnCommandOutput(t *testing.T) {
 	o := &Orchestrator{
 		cfg: &config.Config{
 			Repo:                 "owner/repo",
@@ -1009,8 +1009,8 @@ func TestRunDeployCmd_CapturesOutput(t *testing.T) {
 	if err == nil {
 		t.Fatal("runDeployCmd() expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "hello-deploy") {
-		t.Errorf("error = %q, want it to contain command output 'hello-deploy'", err.Error())
+	if strings.Contains(err.Error(), "hello-deploy") || err.Error() != "deploy command failed" {
+		t.Errorf("error = %q, want fixed public error without command output", err.Error())
 	}
 }
 

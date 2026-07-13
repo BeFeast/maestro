@@ -1583,6 +1583,11 @@ type fleetApprovalState struct {
 	Risk              string                  `json:"risk,omitempty"`
 	Summary           string                  `json:"summary,omitempty"`
 	PastSLA           bool                    `json:"past_sla,omitempty"`
+	// Delivery is the operator-safe deploy_project payload. The raw delivery
+	// command is deliberately absent from state.DeliveryPayload; the snapshot
+	// takes a sanitized clone so accidental credential-shaped text in previews
+	// or recorded output cannot leak through the Fleet API.
+	Delivery *state.DeliveryPayload `json:"delivery,omitempty"`
 
 	createdAt time.Time
 	updatedAt time.Time
@@ -3003,6 +3008,8 @@ func fleetNextActionCTAForApproval(approval *fleetApprovalState) string {
 			return fmt.Sprintf("Mark issue #%d ready", approval.IssueNumber)
 		}
 		return "Mark issue ready"
+	case state.ApprovalActionDeployProject:
+		return "Deploy pinned revision"
 	}
 	if approval.PRNumber > 0 {
 		return fmt.Sprintf("Review PR #%d", approval.PRNumber)
@@ -4798,6 +4805,11 @@ func makeFleetApprovalStates(project fleetProjectState, st *state.State, now tim
 }
 
 func makeFleetApprovalState(project fleetProjectState, st *state.State, approval state.Approval, now time.Time) fleetApprovalState {
+	if approval.Action == state.ApprovalActionDeployProject {
+		if canonical := state.CanonicalDeliveryApproval(&approval); canonical != nil {
+			approval = *canonical
+		}
+	}
 	issue, pr, session, sessionStatus := fleetApprovalTarget(st, approval.Target)
 	createdAt := approval.CreatedAt.UTC()
 	updatedAt := approval.UpdatedAt.UTC()
@@ -4821,6 +4833,7 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		Status:            string(approval.Status),
 		Risk:              approval.Risk,
 		Summary:           approval.Summary,
+		Delivery:          safeFleetDeliveryPayload(approval.Delivery),
 		CreatedAt:         formatFleetTime(createdAt),
 		UpdatedAt:         formatFleetTime(updatedAt),
 		CreatedAge:        formatFleetAge(createdAt, now),
@@ -4835,6 +4848,18 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 	}
 	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
 	return item
+}
+
+// safeFleetDeliveryPayload returns an API-safe copy of the strict delivery
+// allow-list. DeliveryPayload structurally has no command, local path,
+// destination/rollback execution text, output, or error-string fields, so the
+// read boundary does not depend on heuristic redaction. The source is never
+// mutated.
+func safeFleetDeliveryPayload(payload *state.DeliveryPayload) *state.DeliveryPayload {
+	if payload == nil {
+		return nil
+	}
+	return payload.Clone()
 }
 
 func fleetApprovalTarget(st *state.State, target *state.SupervisorTarget) (issue int, pr int, session string, sessionStatus string) {
@@ -5229,6 +5254,7 @@ func renderFleetApprovalCard(approval fleetApprovalState, muted bool) string {
 	updatedAge := html.EscapeString(firstNonEmpty(approval.UpdatedAge, "-"))
 	summary := html.EscapeString(firstNonEmpty(approval.Summary, "No summary recorded."))
 	risk := html.EscapeString(supervisorRiskLabelServer(firstNonEmpty(approval.Risk, "-")))
+	delivery := renderFleetDeliveryDetailsHTML(approval)
 	sessionStatus := ""
 	if strings.TrimSpace(approval.SessionStatus) != "" {
 		sessionStatus = `<span>Status ` + html.EscapeString(approval.SessionStatus) + `</span>`
@@ -5252,8 +5278,79 @@ func renderFleetApprovalCard(approval fleetApprovalState, muted bool) string {
 		`<div class="approval-target">` + renderFleetApprovalTargetHTML(approval) + sessionStatus + `</div>` +
 		`<div class="approval-main"><div class="approval-age"><span>Created ` + createdAge + ` ago</span><span>Updated ` + updatedAge + ` ago</span></div>` +
 		`<div class="approval-risk"><span>` + risk + `</span></div>` +
-		`<div class="approval-summary">` + summary + `</div></div>` +
+		`<div class="approval-summary">` + summary + `</div>` + delivery + `</div>` +
 		`</article>`
+}
+
+// renderFleetDeliveryDetailsHTML mirrors the SPA's delivery detail block on
+// the durable /approvals/audit page. Values come from safeFleetDeliveryPayload
+// and are HTML-escaped again at the rendering boundary. The raw deploy command
+// has no field in the payload and therefore cannot be rendered here.
+func renderFleetDeliveryDetailsHTML(approval fleetApprovalState) string {
+	d := approval.Delivery
+	if d == nil {
+		return ""
+	}
+	row := func(label, value string, pre bool) string {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return ""
+		}
+		tag := "span"
+		if pre {
+			tag = "pre"
+		}
+		return `<div class="approval-delivery-row"><strong>` + html.EscapeString(label) + `</strong><` + tag + `>` + html.EscapeString(value) + `</` + tag + `></div>`
+	}
+
+	var b strings.Builder
+	b.WriteString(`<section class="approval-delivery" aria-label="Delivery details">`)
+	if approval.Status == string(state.ApprovalStatusExecuting) {
+		b.WriteString(`<div class="approval-delivery-recovery" role="alert">Delivery was interrupted while executing. Maestro will not replay it automatically; reconcile the target and approval state before retrying.</div>`)
+	}
+	b.WriteString(row("Merged revision", d.MergedSHA, false))
+	if !d.MergedAt.IsZero() {
+		b.WriteString(row("Merged at", d.MergedAt.UTC().Format(time.RFC3339), false))
+	}
+	b.WriteString(row("Target label", d.TargetLabel, false))
+	if !d.ExpiresAt.IsZero() {
+		b.WriteString(row("Approval expires", d.ExpiresAt.UTC().Format(time.RFC3339), false))
+	}
+	b.WriteString(row("Approval generation", strconv.Itoa(d.ApprovalGeneration), false))
+	b.WriteString(row("Verification label", d.VerificationLabel, false))
+	b.WriteString(row("Rollback label", d.RollbackLabel, false))
+	b.WriteString(row("Approved config digest", d.ConfigDigest, false))
+	b.WriteString(row("Stale cause", d.StaleCause, false))
+	b.WriteString(row("Executed revision", d.ExecutedRevision, false))
+	if !d.StartedAt.IsZero() {
+		b.WriteString(row("Started", d.StartedAt.UTC().Format(time.RFC3339), false))
+	}
+	if !d.FinishedAt.IsZero() {
+		b.WriteString(row("Finished", d.FinishedAt.UTC().Format(time.RFC3339), false))
+	}
+	if !d.StartedAt.IsZero() || !d.FinishedAt.IsZero() || strings.TrimSpace(d.ExecutedRevision) != "" ||
+		d.FailureStage != "" || d.DeployExitCode != nil || d.VerifyExitCode != nil || d.TimedOut || d.CleanupFailed {
+		verified := "no"
+		if d.Verified {
+			verified = "yes"
+		}
+		b.WriteString(row("Verified", verified, false))
+	}
+	b.WriteString(row("Failure stage", d.FailureStage, false))
+	if d.DeployExitCode != nil {
+		b.WriteString(row("Deploy exit code", strconv.Itoa(*d.DeployExitCode), false))
+	}
+	if d.VerifyExitCode != nil {
+		b.WriteString(row("Verifier exit code", strconv.Itoa(*d.VerifyExitCode), false))
+	}
+	if d.TimedOut {
+		b.WriteString(row("Timed out", "yes", false))
+	}
+	if d.CleanupFailed {
+		b.WriteString(row("Cleanup failed", "yes", false))
+	}
+	b.WriteString(`</section>`)
+	return b.String()
 }
 
 func renderFleetApprovalTargetHTML(approval fleetApprovalState) string {
@@ -5293,6 +5390,8 @@ func actionLabelServer(action string) string {
 		return "Review retry-exhausted work"
 	case "check_outcome_health":
 		return "Check runtime health"
+	case state.ApprovalActionDeployProject:
+		return "Deploy project"
 	case "notify_red":
 		return "Notify red"
 	case "wait_for_running_worker", "wait_for_worker":
