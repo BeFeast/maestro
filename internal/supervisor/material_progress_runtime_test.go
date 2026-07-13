@@ -34,7 +34,6 @@ func TestEvaluateMaterialProgressOnce_CadenceAndConfigTransitions(t *testing.T) 
 		IssueNumber: 7,
 		Status:      state.StatusRunning,
 		PID:         1234,
-		TmuxSession: "tx10-slot-1",
 		StartedAt:   t0.Add(-time.Minute),
 	}
 	if err := state.Save(cfg.StateDir, st); err != nil {

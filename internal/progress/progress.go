@@ -563,6 +563,22 @@ func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, bu
 		return prev, dec
 	}
 
+	// A failed/partial bounded probe makes the whole observation unsuitable for
+	// advancing the durable clock. Even an apparently changed available signal
+	// cannot buy a new silence budget while another required signal is unknown:
+	// preserve the old watermark/deadline and suppress recovery until one
+	// complete observation can be compared atomically.
+	if incomplete {
+		dec.Action = ActionEvidenceUnavailable
+		dec.Reason = "required material-progress evidence is unavailable; preserve the existing watermark/deadline and suppress recovery until a complete observation"
+		dec.Identity = prev.Identity
+		dec.WatermarkAt = prev.At
+		if phase != PhaseDelivered {
+			dec.Deadline = prev.Deadline(budget)
+		}
+		return prev, dec
+	}
+
 	// First observation, or material progress since the last watermark: the
 	// combined identity changed because a signal advanced or the observed set
 	// gained/lost a kind. A single stale signal cannot land here while any
@@ -593,12 +609,6 @@ func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, bu
 		dec.Deadline = time.Time{}
 		return prev, dec
 	}
-	if incomplete {
-		dec.Action = ActionEvidenceUnavailable
-		dec.Reason = "required material-progress evidence is unavailable; preserve the existing watermark/deadline and suppress recovery until a complete observation"
-		return prev, dec
-	}
-
 	if now.Before(deadline) {
 		dec.Action = ActionWaiting
 		dec.Reason = "no new material progress, still inside the silence budget"

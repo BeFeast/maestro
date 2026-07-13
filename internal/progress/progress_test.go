@@ -322,10 +322,18 @@ func TestEvaluateObservation_IncompleteEvidenceSuppressesRecoveryWithoutRearming
 	if !wm2.At.Equal(wm.At) || !dec.Deadline.Equal(originalDeadline) {
 		t.Fatalf("incomplete evidence rearmed deadline: before=%+v after=%+v decision=%+v", wm, wm2, dec)
 	}
+	changedButIncomplete := incomplete
+	changedButIncomplete.Signals = SignalSet{
+		sig(SignalProcessTmux, "pid=42"), sig(SignalTerminalCheckpoint, "new-output"),
+	}
+	wm3, changedDecision := EvaluateObservation(wm2, changedButIncomplete, budget, base.Add(budget+90*time.Second))
+	if changedDecision.Action != ActionEvidenceUnavailable || !wm3.At.Equal(wm.At) || wm3.Identity != wm.Identity {
+		t.Fatalf("partial changed signals rearmed incomplete observation: watermark=%+v decision=%+v", wm3, changedDecision)
+	}
 
 	// Once a complete unchanged observation returns, the original overdue
 	// episode is still overdue and may be recommended; failure did not buy time.
-	_, complete := EvaluateTarget(target, wm2, frozen, PhasePreDelivery, budget, base.Add(budget+2*time.Minute))
+	_, complete := EvaluateTarget(target, wm3, frozen, PhasePreDelivery, budget, base.Add(budget+2*time.Minute))
 	if complete.Action != ActionStopAndRetry || !complete.Deadline.Equal(originalDeadline) {
 		t.Fatalf("complete evidence did not resume original overdue episode: %+v", complete)
 	}
