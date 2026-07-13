@@ -30,6 +30,7 @@ type MaterialProgressTarget struct {
 	Target             progress.Target     `json:"target"`
 	Active             bool                `json:"active"`
 	UpdatedAt          time.Time           `json:"updated_at,omitempty"`
+	PresenceUpdatedAt  time.Time           `json:"presence_updated_at,omitempty"`
 	RetiredAt          time.Time           `json:"retired_at,omitempty"`
 	Watermark          progress.Watermark  `json:"watermark"`
 	LastEvaluatedAt    time.Time           `json:"last_evaluated_at,omitempty"`
@@ -95,6 +96,7 @@ func (s *State) RecordMaterialProgress(observations []progress.Observation, budg
 	now = now.UTC()
 	budgetSeconds := durationSeconds(budget)
 	intervalSeconds := durationSeconds(evalInterval)
+	effectiveBudget := time.Duration(budgetSeconds) * time.Second
 
 	// Validate and de-duplicate the complete snapshot before mutating state so
 	// one malformed target cannot partially retire or reconfigure good records.
@@ -139,6 +141,7 @@ func (s *State) RecordMaterialProgress(observations []progress.Observation, budg
 			target.Active = false
 			target.RetiredAt = now
 			target.UpdatedAt = now
+			target.PresenceUpdatedAt = now
 		}
 	}
 
@@ -156,11 +159,12 @@ func (s *State) RecordMaterialProgress(observations []progress.Observation, budg
 			prev = progress.Watermark{}
 			target.LastRecommendation = nil
 		}
-		wm, decision := progress.EvaluateTarget(observation.Target, prev, observation.Signals, observation.Phase, budget, now)
+		wm, decision := progress.EvaluateTarget(observation.Target, prev, observation.Signals, observation.Phase, effectiveBudget, now)
 		target.Target = observation.Target
 		target.Active = true
 		target.RetiredAt = time.Time{}
 		target.UpdatedAt = now
+		target.PresenceUpdatedAt = now
 		target.Watermark = wm
 		target.LastEvaluatedAt = now
 		d := decision
@@ -178,7 +182,7 @@ func durationSeconds(d time.Duration) int {
 	if d <= 0 {
 		return 0
 	}
-	seconds := int(d / time.Second)
+	seconds := int(d.Round(time.Second) / time.Second)
 	if seconds == 0 {
 		return 1
 	}
@@ -298,10 +302,14 @@ func mergeMaterialProgressTarget(a, b *MaterialProgressTarget) *MaterialProgress
 		base = b
 	}
 	out := cloneMaterialProgressTarget(base)
-	if b.UpdatedAt.After(a.UpdatedAt) {
-		out.Active, out.RetiredAt, out.UpdatedAt = b.Active, b.RetiredAt, b.UpdatedAt
+	if b.PresenceUpdatedAt.After(a.PresenceUpdatedAt) {
+		out.Active, out.RetiredAt, out.PresenceUpdatedAt = b.Active, b.RetiredAt, b.PresenceUpdatedAt
 	} else {
-		out.Active, out.RetiredAt, out.UpdatedAt = a.Active, a.RetiredAt, a.UpdatedAt
+		out.Active, out.RetiredAt, out.PresenceUpdatedAt = a.Active, a.RetiredAt, a.PresenceUpdatedAt
+	}
+	out.UpdatedAt = a.UpdatedAt
+	if b.UpdatedAt.After(out.UpdatedAt) {
+		out.UpdatedAt = b.UpdatedAt
 	}
 	out.LastDecision = laterDecision(a.LastDecision, b.LastDecision)
 	out.LastRecommendation = laterRecommendation(a.LastRecommendation, b.LastRecommendation)

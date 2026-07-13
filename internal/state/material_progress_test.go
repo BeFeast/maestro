@@ -259,6 +259,50 @@ func TestMaterialProgress_ConcurrentSavePreservesRecoveryAndProgress(t *testing.
 	}
 }
 
+func TestMaterialProgress_ConcurrentStaleRecoveryCannotReactivateRetiredTarget(t *testing.T) {
+	dir := t.TempDir()
+	worker := workerObservation(10, "1", 101, "lease-a", "head-a1")
+	seed := NewState()
+	recordOne(t, seed, worker, time.Minute, mpBase)
+	if err := Save(dir, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	recoveryWriter, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retireWriter, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recommendation := recordOne(t, recoveryWriter, worker, time.Minute, mpBase.Add(2*time.Minute))
+	if err := recoveryWriter.RecordMaterialRecovery(worker.Target.Key(), recommendation.RecommendationID, progress.RecoveryAttempted, mpBase.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := retireWriter.RecordMaterialProgress(nil, time.Minute, time.Minute, mpBase.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(dir, retireWriter); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(dir, recoveryWriter); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := targetRecord(t, reloaded, worker)
+	if record.Active {
+		t.Fatal("stale recovery writer reactivated a target retired by a newer complete snapshot")
+	}
+	if recovery := record.LastRecovery(); recovery == nil || recovery.RecommendationID != recommendation.RecommendationID {
+		t.Fatalf("retirement merge dropped recovery history: %+v", recovery)
+	}
+}
+
 func TestMaterialProgress_EvaluationDueIncludesConfigTransitions(t *testing.T) {
 	var nilMP *MaterialProgress
 	if !nilMP.EvaluationDue(20*time.Minute, time.Minute, mpBase) {
