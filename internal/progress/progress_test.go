@@ -317,3 +317,45 @@ func TestDecision_NoSecretsInObservedSignals(t *testing.T) {
 		}
 	}
 }
+
+// A signal that stops advancing while another keeps advancing must show its own
+// last-changed age, not the evaluation time (#887 review: signal ages must not
+// collapse to a single fresh value). The frozen signal's ObservedAt is carried
+// forward while the moving signal's ObservedAt tracks each advance.
+func TestEvaluate_PerSignalObservedAtTracksLastChange(t *testing.T) {
+	budget := 20 * time.Minute
+	// t0: both signals observed together.
+	t0 := base
+	obs0 := SignalSet{
+		{Kind: SignalProcessTmux, Fingerprint: Fingerprint("pid-1"), ObservedAt: t0},
+		{Kind: SignalWorktreeGit, Fingerprint: Fingerprint("head-1"), ObservedAt: t0},
+	}
+	wm, _ := Evaluate(Watermark{}, obs0, PhasePreDelivery, budget, t0)
+
+	// t1: git advances (head-2), process/tmux fingerprint unchanged.
+	t1 := t0.Add(5 * time.Minute)
+	obs1 := SignalSet{
+		{Kind: SignalProcessTmux, Fingerprint: Fingerprint("pid-1"), ObservedAt: t1},
+		{Kind: SignalWorktreeGit, Fingerprint: Fingerprint("head-2"), ObservedAt: t1},
+	}
+	wm, dec := Evaluate(wm, obs1, PhasePreDelivery, budget, t1)
+	if dec.Action != ActionNone {
+		t.Fatalf("git advance should be progress, got %q", dec.Action)
+	}
+
+	byKind := map[SignalKind]time.Time{}
+	for _, s := range wm.Signals {
+		byKind[s.Kind] = s.ObservedAt
+	}
+	// The moving git signal ages from t1; the frozen process signal still ages
+	// from t0 — the two are no longer identical.
+	if got := byKind[SignalWorktreeGit]; !got.Equal(t1) {
+		t.Errorf("worktree_git ObservedAt = %s, want %s (advanced at t1)", got, t1)
+	}
+	if got := byKind[SignalProcessTmux]; !got.Equal(t0) {
+		t.Errorf("process_tmux ObservedAt = %s, want %s (carried forward, not eval time)", got, t0)
+	}
+	if byKind[SignalWorktreeGit].Equal(byKind[SignalProcessTmux]) {
+		t.Fatalf("frozen and moving signals collapsed to one age")
+	}
+}

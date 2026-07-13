@@ -142,3 +142,53 @@ func TestMergeMaterialProgress_NilHandling(t *testing.T) {
 		t.Fatalf("merge dropped the only populated watermark (current)")
 	}
 }
+
+// A concurrent stall record must not be lost when the other writer's progress
+// advance wins the merge base: the newer LastRecovery/LastDecision is preserved
+// independently of the watermark winner (#887 review).
+func TestMergeMaterialProgress_PreservesRecoveryUnderConcurrentAdvance(t *testing.T) {
+	budget := 20 * time.Minute
+	frozen := procGitSet("pid-1", "head-1")
+
+	// Writer A: observes a frozen worker past the budget and records a recovery.
+	a := NewState()
+	a.RecordMaterialProgress(frozen, progress.PhasePreDelivery, budget, time.Minute, mpBase)
+	stallAt := mpBase.Add(budget + time.Minute)
+	decA := a.RecordMaterialProgress(frozen, progress.PhasePreDelivery, budget, time.Minute, stallAt)
+	if decA.Action != progress.ActionStopAndRetry {
+		t.Fatalf("setup: writer A action = %q, want stop_and_retry", decA.Action)
+	}
+	if a.MaterialProgress.LastRecovery == nil {
+		t.Fatalf("setup: writer A recorded no recovery")
+	}
+
+	// Writer B: a fresher progress advance (head-2) even later, no recovery.
+	b := NewState()
+	b.RecordMaterialProgress(procGitSet("pid-1", "head-2"), progress.PhasePreDelivery, budget, time.Minute, stallAt.Add(time.Minute))
+	if b.MaterialProgress.LastRecovery != nil {
+		t.Fatalf("setup: writer B unexpectedly recorded a recovery")
+	}
+
+	// Merge: B's fresher watermark wins the base, but A's recovery must survive.
+	merged := NewState()
+	mergeMaterialProgress(merged, a, b)
+	if merged.MaterialProgress == nil {
+		t.Fatalf("merge dropped the watermark")
+	}
+	if got := merged.MaterialProgress.Watermark.At; !got.Equal(stallAt.Add(time.Minute)) {
+		t.Fatalf("merge kept a stale watermark At=%s, want the fresher progress", got)
+	}
+	if merged.MaterialProgress.LastRecovery == nil {
+		t.Fatalf("merge dropped the concurrently-recorded recovery")
+	}
+	if merged.MaterialProgress.LastRecovery.Action != progress.ActionStopAndRetry {
+		t.Fatalf("LastRecovery.Action = %q, want stop_and_retry", merged.MaterialProgress.LastRecovery.Action)
+	}
+
+	// Order-independent.
+	merged2 := NewState()
+	mergeMaterialProgress(merged2, b, a)
+	if merged2.MaterialProgress.LastRecovery == nil || merged2.MaterialProgress.LastRecovery.Action != progress.ActionStopAndRetry {
+		t.Fatalf("merge not order-independent for recovery preservation")
+	}
+}

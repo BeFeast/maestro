@@ -23,7 +23,7 @@ observed set changes).
 | `issue_session` | issue/session state and lease identity (status, retry counters) |
 | `process_tmux` | process id + exact tmux/session identity of live workers |
 | `terminal_checkpoint` | terminal output hash or checkpoint advancement |
-| `worktree_git` | bounded worktree evidence — branch + PR head (git identity), excluding volatile/generated paths |
+| `worktree_git` | bounded worktree evidence — branch + PR head plus, for a live worker, the newest source-file mtime and git index/HEAD identity, excluding volatile/generated paths so an actively-editing-but-quiet worker still advances |
 | `pr_review` | PR head, CI/check/review state, merge/release identity |
 | `delivery` | delivery approval generation, execution lease, terminal receipt |
 
@@ -92,7 +92,16 @@ survives daemon restart. The deadline is never stored — it is always derived
 from `watermark.at + silence_budget`, so a reload re-reads the same watermark and
 computes the identical deadline. The concurrent-writer merge keeps the snapshot
 with the newer material-progress time, so a concurrent stall record can never
-clobber a fresh progress advance and reset the deadline.
+clobber a fresh progress advance and reset the deadline — while the newer
+recovery/decision from either writer is preserved independently, so a recorded
+recovery is never dropped by a concurrent progress advance.
+
+Per-signal ages track when each signal last changed (not the evaluation time):
+an unchanged signal carries its prior observation time forward, so operators can
+see which specific signal stopped advancing even while the combined watermark is
+still moving on another. A watchdog disabled in config reports a zero budget and
+no deadline even when durable state still carries a previously-enabled budget, so
+Fleet never raises a false overdue alert before the next evaluation.
 
 ## Promotion gate
 

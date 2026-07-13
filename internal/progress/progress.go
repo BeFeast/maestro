@@ -121,6 +121,31 @@ type Signal struct {
 // SignalSet is the phase-appropriate set of signals observed in one evaluation.
 type SignalSet []Signal
 
+// carryForwardObservedAt preserves each present signal's last-changed time. A
+// signal whose (kind, fingerprint) is unchanged from the previous watermark
+// keeps its prior ObservedAt, so Fleet shows the true age since that signal
+// last advanced rather than the current evaluation time; a new or changed
+// signal keeps its own ObservedAt (this tick). This is what lets operators see
+// which specific signal stopped advancing even while the combined watermark is
+// still moving on another signal (#887).
+func carryForwardObservedAt(prev, present []Signal) []Signal {
+	if len(prev) == 0 {
+		return present
+	}
+	prevByKind := make(map[SignalKind]Signal, len(prev))
+	for _, s := range prev {
+		prevByKind[s.Kind] = s
+	}
+	out := make([]Signal, len(present))
+	for i, s := range present {
+		if p, ok := prevByKind[s.Kind]; ok && p.Fingerprint == s.Fingerprint && !p.ObservedAt.IsZero() {
+			s.ObservedAt = p.ObservedAt
+		}
+		out[i] = s
+	}
+	return out
+}
+
 // Present returns the signals with a non-empty fingerprint, de-duplicated by
 // kind (last write wins) and sorted by the stable signal order.
 func (s SignalSet) Present() []Signal {
@@ -307,6 +332,10 @@ func (d Decision) Acted() bool {
 func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time) (Watermark, Decision) {
 	now = now.UTC()
 	id := observed.Combined()
+	// Reconcile per-signal ObservedAt against the previous watermark so an
+	// unchanged signal ages from when it last advanced, not from this
+	// evaluation (#887). Genuinely new/changed signals keep `now`.
+	present := carryForwardObservedAt(prev.Signals, observed.Present())
 	dec := Decision{
 		EvaluatedAt:     now,
 		Phase:           phase,
@@ -319,7 +348,7 @@ func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Durat
 	// Disabled watchdog: record the identity for reporting but never act.
 	if budget <= 0 {
 		if prev.IsZero() && id != "" {
-			prev = Watermark{Identity: id, At: now, Phase: phase, Signals: observed.Present()}
+			prev = Watermark{Identity: id, At: now, Phase: phase, Signals: present}
 		}
 		dec.Action = ActionDisabled
 		dec.Reason = "stalled-progress watchdog disabled (no silence budget)"
@@ -333,7 +362,7 @@ func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Durat
 	// gained/lost a kind. A single stale signal cannot land here while any
 	// other signal is still advancing.
 	if prev.IsZero() || id != prev.Identity {
-		next := Watermark{Identity: id, At: now, Phase: phase, Signals: observed.Present()}
+		next := Watermark{Identity: id, At: now, Phase: phase, Signals: present}
 		dec.Action = ActionNone
 		dec.Reason = "material progress observed; watermark advanced"
 		dec.Identity = next.Identity

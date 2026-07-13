@@ -5103,14 +5103,23 @@ func buildFleetStalledProgressWatchdog(cfg *config.Config, st *state.State, now 
 		return nil
 	}
 	w := &fleetStalledProgressWatchdog{}
+	// Default-on when there is no config to consult, mirroring the config
+	// default, so a cfg-less render (persisted state only) still shows a budget.
+	enabled := true
 	if cfg != nil {
-		w.Enabled = cfg.StalledProgressWatchdog.IsEnabled()
+		enabled = cfg.StalledProgressWatchdog.IsEnabled()
+		w.Enabled = enabled
 		w.SilenceBudgetSeconds = int(cfg.StalledProgressWatchdog.EffectiveMaxSilence() / time.Second)
 	}
 	if mp == nil {
 		return w
 	}
-	if w.SilenceBudgetSeconds == 0 && mp.BudgetSeconds > 0 {
+	// Fall back to the last-recorded budget only while the watchdog is enabled.
+	// A disabled watchdog must report a zero budget and no deadline even when
+	// durable state still carries a previously-enabled budget; otherwise Fleet
+	// raises a false overdue alert (enabled=false with past_deadline=true) until
+	// the next supervisor evaluation rewrites the stored budget (#887 review).
+	if enabled && w.SilenceBudgetSeconds == 0 && mp.BudgetSeconds > 0 {
 		w.SilenceBudgetSeconds = mp.BudgetSeconds
 	}
 	wm := mp.Watermark
@@ -5120,10 +5129,15 @@ func buildFleetStalledProgressWatchdog(cfg *config.Config, st *state.State, now 
 		w.LastMaterialProgressAt = formatFleetTime(wm.At)
 		w.LastMaterialAgeSeconds = fleetAgeSeconds(wm.At, now)
 	}
-	if deadline := mp.Deadline(); !deadline.IsZero() {
-		w.NextDeadlineAt = formatFleetTime(deadline)
-		w.NextDeadlineInSeconds = int64(deadline.Sub(now).Round(time.Second) / time.Second)
-		w.PastDeadline = !now.Before(deadline)
+	// Derive the reported deadline from the reported budget so the two are always
+	// consistent: a disabled watchdog (budget 0) reports no deadline and never a
+	// past-deadline alert.
+	if budget := time.Duration(w.SilenceBudgetSeconds) * time.Second; budget > 0 {
+		if deadline := wm.Deadline(budget); !deadline.IsZero() {
+			w.NextDeadlineAt = formatFleetTime(deadline)
+			w.NextDeadlineInSeconds = int64(deadline.Sub(now).Round(time.Second) / time.Second)
+			w.PastDeadline = !now.Before(deadline)
+		}
 	}
 	for _, sig := range wm.Signals {
 		sp := fleetSignalProgress{Kind: string(sig.Kind), Fingerprint: sig.Fingerprint}

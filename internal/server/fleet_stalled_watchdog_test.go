@@ -100,3 +100,37 @@ func TestFleetPulse_DisabledWatchdog(t *testing.T) {
 		t.Errorf("disabled watchdog reported a budget/deadline: %+v", w)
 	}
 }
+
+// A watchdog disabled in config must report no deadline even when durable state
+// still carries a previously-enabled budget and a past watermark; otherwise
+// Fleet raises a false overdue alert (enabled=false with past_deadline=true)
+// until the next supervisor evaluation rewrites the stored budget (#887 review).
+func TestFleetPulse_DisabledWatchdogIgnoresStaleBudget(t *testing.T) {
+	cfg := &config.Config{}
+	disabled := false
+	cfg.StalledProgressWatchdog.Enabled = &disabled
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+
+	// Durable state from when the watchdog was enabled: a 20m budget and a
+	// watermark 25m old (past the old deadline).
+	st := state.NewState()
+	frozen := progress.SignalSet{{Kind: progress.SignalProcessTmux, Fingerprint: progress.Fingerprint("pid-1")}}
+	st.RecordMaterialProgress(frozen, progress.PhasePreDelivery, 20*time.Minute, time.Minute, now.Add(-25*time.Minute))
+
+	w := buildFleetSupervisorPulse(cfg, st, now).StalledProgressWatchdog
+	if w == nil {
+		t.Fatalf("watchdog view nil")
+	}
+	if w.Enabled {
+		t.Errorf("watchdog reported enabled after explicit disable")
+	}
+	if w.SilenceBudgetSeconds != 0 {
+		t.Errorf("disabled watchdog restored stale budget: %d", w.SilenceBudgetSeconds)
+	}
+	if w.NextDeadlineAt != "" || w.NextDeadlineInSeconds != 0 {
+		t.Errorf("disabled watchdog reported a deadline: at=%q in=%d", w.NextDeadlineAt, w.NextDeadlineInSeconds)
+	}
+	if w.PastDeadline {
+		t.Errorf("disabled watchdog reported past_deadline=true (false overdue alert)")
+	}
+}

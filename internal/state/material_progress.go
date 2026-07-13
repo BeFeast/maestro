@@ -78,24 +78,61 @@ func (s *State) RecordMaterialProgress(observed progress.SignalSet, phase progre
 
 // mergeMaterialProgress resolves concurrent writers of the per-project
 // watermark (#887). The watermark time (last material progress) advances only
-// forward, so the snapshot with the newer Watermark.At wins — this guarantees a
-// concurrent stall record can never clobber a fresh progress advance and reset
-// the deadline. Ties break on the later evaluation time. Mirrors mergePaused /
-// mergeSpawnDrain's latest-write-wins discipline.
+// forward, so the snapshot with the newer Watermark.At wins the progress fields
+// (watermark, budget, cadence) — this guarantees a concurrent stall record can
+// never clobber a fresh progress advance and reset the deadline. Ties break on
+// the later evaluation time.
+//
+// The recovery/decision history is merged independently of that winner: if one
+// writer records a stall decision while another records a newer progress
+// watermark, the progress snapshot wins the base but the stall writer's newer
+// LastRecovery/LastDecision are preserved by EvaluatedAt, so a recorded recovery
+// is never silently dropped from durable state or the Fleet view.
 func mergeMaterialProgress(merged, current, ours *State) {
 	a, b := current.MaterialProgress, ours.MaterialProgress
 	switch {
 	case a == nil:
 		merged.MaterialProgress = b
+		return
 	case b == nil:
 		merged.MaterialProgress = a
+		return
+	}
+
+	// Pick the base by the furthest-advanced watermark (progress beats stall).
+	var base *MaterialProgress
+	switch {
 	case b.Watermark.At.After(a.Watermark.At):
-		merged.MaterialProgress = b
+		base = b
 	case a.Watermark.At.After(b.Watermark.At):
-		merged.MaterialProgress = a
+		base = a
 	case b.LastEvaluatedAt.After(a.LastEvaluatedAt):
-		merged.MaterialProgress = b
+		base = b
 	default:
-		merged.MaterialProgress = a
+		base = a
+	}
+
+	// Copy the base and overlay the most recent recovery/decision from either
+	// writer so a concurrently-recorded recovery survives even when the other
+	// writer's progress advance wins the base snapshot.
+	out := *base
+	out.LastRecovery = laterDecision(a.LastRecovery, b.LastRecovery)
+	out.LastDecision = laterDecision(a.LastDecision, b.LastDecision)
+	merged.MaterialProgress = &out
+}
+
+// laterDecision returns the decision with the later EvaluatedAt, treating a nil
+// decision as "no decision". Used to merge watchdog history across concurrent
+// writers without losing a recorded verdict.
+func laterDecision(a, b *progress.Decision) *progress.Decision {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case b.EvaluatedAt.After(a.EvaluatedAt):
+		return b
+	default:
+		return a
 	}
 }

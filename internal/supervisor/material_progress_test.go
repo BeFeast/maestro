@@ -1,9 +1,12 @@
 package supervisor
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/progress"
 	"github.com/befeast/maestro/internal/state"
 )
@@ -127,5 +130,107 @@ func TestRecordMaterialProgress_FrozenWorkerStallSurvivesRestart(t *testing.T) {
 	}
 	if !dec.Deadline.Equal(deadline) {
 		t.Fatalf("deadline drifted across restart: got %s, want %s", dec.Deadline, deadline)
+	}
+}
+
+// A live worker that only edits files in its worktree (no terminal output, no
+// branch/PR change, no commit) must keep advancing the watermark via bounded
+// filesystem evidence, so the watchdog never records a false stall against
+// ongoing work (#887 review: worktree edits must not be invisible).
+func TestCollectMaterialProgressSignals_QuietFileEditsAdvanceWatermark(t *testing.T) {
+	wt := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(wt, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(wt, ".git", "HEAD"), []byte("ref: refs/heads/feat/x\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(wt, ".git", "index"), []byte("idx"), 0o644)
+	src := filepath.Join(wt, "main.go")
+	if err := os.WriteFile(src, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := state.NewState()
+	// Frozen terminal output, no branch, no PR — only file edits distinguish
+	// the worker from a genuine stall.
+	st.Sessions["s1"] = &state.Session{IssueNumber: 7, Status: state.StatusRunning, PID: 1, TmuxSession: "mae-7", LastOutputHash: "frozen", Worktree: wt}
+
+	budget := 20 * time.Minute
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	mt := now
+	if err := os.Chtimes(src, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	observed, phase := collectMaterialProgressSignals(st, now)
+	st.RecordMaterialProgress(observed, phase, budget, time.Minute, now)
+
+	for i := 1; i <= 3; i++ {
+		now = now.Add(30 * time.Minute) // each cycle is past the 20m budget
+		mt = mt.Add(30 * time.Minute)
+		if err := os.Chtimes(src, mt, mt); err != nil { // the worker edited a file
+			t.Fatal(err)
+		}
+		observed, phase = collectMaterialProgressSignals(st, now)
+		dec := st.RecordMaterialProgress(observed, phase, budget, time.Minute, now)
+		if dec.Acted() {
+			t.Fatalf("cycle %d: watchdog acted on a worker still editing files: %q", i, dec.Action)
+		}
+	}
+}
+
+// The worktree probe must not blind the watchdog to a genuine stall: a live
+// worker whose worktree stops changing (no file edits) still trips the watchdog
+// after the budget.
+func TestCollectMaterialProgressSignals_IdleWorktreeStillStalls(t *testing.T) {
+	wt := t.TempDir()
+	src := filepath.Join(wt, "main.go")
+	if err := os.WriteFile(src, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	frozenMtime := time.Date(2026, 7, 13, 11, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(src, frozenMtime, frozenMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	st := state.NewState()
+	st.Sessions["s1"] = &state.Session{IssueNumber: 7, Status: state.StatusRunning, PID: 1, TmuxSession: "mae-7", LastOutputHash: "frozen", Worktree: wt, Branch: "feat/x"}
+	budget := 20 * time.Minute
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	observed, phase := collectMaterialProgressSignals(st, now)
+	st.RecordMaterialProgress(observed, phase, budget, time.Minute, now)
+
+	now = now.Add(budget + time.Minute)
+	observed, phase = collectMaterialProgressSignals(st, now)
+	dec := st.RecordMaterialProgress(observed, phase, budget, time.Minute, now)
+	if dec.Action != progress.ActionStopAndRetry {
+		t.Fatalf("truly idle worktree should still stall: got %q", dec.Action)
+	}
+}
+
+// The supervisor must honor the watchdog's own evaluation cadence: a fast
+// supervisor loop that cycles inside the interval must not re-evaluate the
+// watchdog every cycle (#887 review: evaluation cadence must not be ignored).
+func TestRecordMaterialProgress_RespectsEvalCadence(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.StalledProgressWatchdog.EvalIntervalSecs = 60 // 1-minute watchdog cadence
+	st := state.NewState()
+	st.Sessions["s1"] = &state.Session{IssueNumber: 1, Status: state.StatusRunning, PID: 1, TmuxSession: "t", LastOutputHash: "a"}
+
+	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	recordMaterialProgress(cfg, st, t0)
+	if st.MaterialProgress == nil {
+		t.Fatal("first evaluation recorded no watermark")
+	}
+	firstEval := st.MaterialProgress.LastEvaluatedAt
+
+	// A second supervisor cycle 10s later is inside the 60s cadence → skip.
+	recordMaterialProgress(cfg, st, t0.Add(10*time.Second))
+	if !st.MaterialProgress.LastEvaluatedAt.Equal(firstEval) {
+		t.Fatalf("watchdog re-evaluated inside its cadence: last eval moved to %s", st.MaterialProgress.LastEvaluatedAt)
+	}
+
+	// A cycle past the cadence re-evaluates.
+	recordMaterialProgress(cfg, st, t0.Add(90*time.Second))
+	if st.MaterialProgress.LastEvaluatedAt.Equal(firstEval) {
+		t.Fatalf("watchdog failed to re-evaluate after its cadence elapsed")
 	}
 }
