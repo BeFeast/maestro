@@ -26,6 +26,7 @@ import (
 	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/mirrorstore"
 	"github.com/befeast/maestro/internal/outcome"
+	"github.com/befeast/maestro/internal/progress"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/statestore"
@@ -1556,6 +1557,59 @@ type fleetSupervisorPulse struct {
 	RecentActions         []string `json:"recent_actions,omitempty"`
 	Stuck                 bool     `json:"stuck,omitempty"`
 	StuckReason           string   `json:"stuck_reason,omitempty"`
+
+	// Cadence separation (#887): poll_interval_seconds describes the
+	// orchestrator cycle, but the supervisor run loop and the stalled-progress
+	// watchdog have their own cadences. Reporting them side-by-side (rather than
+	// one number beside the supervisor pulse) keeps an operator from mistaking
+	// the orchestrator poll for the watchdog's evaluation rhythm.
+	OrchestratorIntervalSeconds int `json:"orchestrator_interval_seconds,omitempty"`
+	WatchdogEvalIntervalSeconds int `json:"watchdog_eval_interval_seconds,omitempty"`
+
+	// StalledProgressWatchdog is the durable material-progress watchdog's
+	// truthful liveness view (#887): whether it is enabled, the configured
+	// silence budget, the last material watermark, the next deadline, the
+	// per-signal progress, and the last recovery action. Nil-safe: zero values
+	// render as "unknown" so older servers degrade gracefully.
+	StalledProgressWatchdog *fleetStalledProgressWatchdog `json:"stalled_progress_watchdog,omitempty"`
+}
+
+// fleetStalledProgressWatchdog reports the durable stalled-progress watchdog's
+// separate, truthful signals (#887): configured budget vs. last watermark vs.
+// next deadline vs. last recovery. Every field is secret-free — signal
+// fingerprints are non-reversible digests.
+type fleetStalledProgressWatchdog struct {
+	Enabled                bool                   `json:"enabled"`
+	Contract               string                 `json:"contract,omitempty"`
+	SilenceBudgetSeconds   int                    `json:"silence_budget_seconds,omitempty"`
+	LastMaterialProgressAt string                 `json:"last_material_progress_at,omitempty"`
+	LastMaterialAgeSeconds int64                  `json:"last_material_age_seconds,omitempty"`
+	Phase                  string                 `json:"phase,omitempty"`
+	NextDeadlineAt         string                 `json:"next_deadline_at,omitempty"`
+	NextDeadlineInSeconds  int64                  `json:"next_deadline_in_seconds,omitempty"`
+	PastDeadline           bool                   `json:"past_deadline,omitempty"`
+	SignalProgress         []fleetSignalProgress  `json:"signal_progress,omitempty"`
+	LastRecovery           *fleetProgressRecovery `json:"last_recovery,omitempty"`
+	LastDecision           *fleetProgressRecovery `json:"last_decision,omitempty"`
+}
+
+// fleetSignalProgress reports one per-signal watermark identity and age so an
+// operator can see which evidence advanced last without any raw material.
+type fleetSignalProgress struct {
+	Kind        string `json:"kind"`
+	Fingerprint string `json:"fingerprint,omitempty"` // short non-reversible digest
+	ObservedAt  string `json:"observed_at,omitempty"`
+	AgeSeconds  int64  `json:"age_seconds,omitempty"`
+}
+
+// fleetProgressRecovery is the operator-facing view of a watchdog decision.
+type fleetProgressRecovery struct {
+	Action         string `json:"action"`
+	Reason         string `json:"reason,omitempty"`
+	Phase          string `json:"phase,omitempty"`
+	At             string `json:"at,omitempty"`
+	AgeSeconds     int64  `json:"age_seconds,omitempty"`
+	ReplayBoundary bool   `json:"replay_boundary,omitempty"`
 }
 
 type fleetApprovalState struct {
@@ -5017,6 +5071,8 @@ func buildFleetSupervisorPulse(cfg *config.Config, st *state.State, now time.Tim
 	pulse := fleetSupervisorPulse{}
 	if cfg != nil {
 		pulse.PollIntervalSeconds = cfg.PollIntervalSeconds
+		pulse.OrchestratorIntervalSeconds = cfg.PollIntervalSeconds
+		pulse.WatchdogEvalIntervalSeconds = int(cfg.StalledProgressWatchdog.EffectiveEvalInterval() / time.Second)
 		pulse.Mode = strings.TrimSpace(cfg.Supervisor.Mode)
 	}
 	if st == nil {
@@ -5029,7 +5085,76 @@ func buildFleetSupervisorPulse(cfg *config.Config, st *state.State, now time.Tim
 	pulse.Stuck = st.SupervisorStuck
 	pulse.StuckReason = strings.TrimSpace(st.SupervisorStuckReason)
 	pulse.RecentActions = recentSupervisorActions(st.SupervisorDecisions, fleetSupervisorPulseRecentLimit)
+	pulse.StalledProgressWatchdog = buildFleetStalledProgressWatchdog(cfg, st, now)
 	return pulse
+}
+
+// buildFleetStalledProgressWatchdog renders the durable material-progress
+// watchdog's truthful view (#887): its enabled/budget config, the last material
+// watermark, the next deadline, the per-signal progress, and the last recovery.
+// Returns nil when there is no watchdog config and no recorded watermark, so the
+// SPA degrades to "unknown" rather than showing a fabricated deadline.
+func buildFleetStalledProgressWatchdog(cfg *config.Config, st *state.State, now time.Time) *fleetStalledProgressWatchdog {
+	var mp *state.MaterialProgress
+	if st != nil {
+		mp = st.MaterialProgress
+	}
+	if cfg == nil && mp == nil {
+		return nil
+	}
+	w := &fleetStalledProgressWatchdog{}
+	if cfg != nil {
+		w.Enabled = cfg.StalledProgressWatchdog.IsEnabled()
+		w.SilenceBudgetSeconds = int(cfg.StalledProgressWatchdog.EffectiveMaxSilence() / time.Second)
+	}
+	if mp == nil {
+		return w
+	}
+	if w.SilenceBudgetSeconds == 0 && mp.BudgetSeconds > 0 {
+		w.SilenceBudgetSeconds = mp.BudgetSeconds
+	}
+	wm := mp.Watermark
+	w.Contract = progress.ContractVersion
+	w.Phase = string(wm.Phase)
+	if !wm.At.IsZero() {
+		w.LastMaterialProgressAt = formatFleetTime(wm.At)
+		w.LastMaterialAgeSeconds = fleetAgeSeconds(wm.At, now)
+	}
+	if deadline := mp.Deadline(); !deadline.IsZero() {
+		w.NextDeadlineAt = formatFleetTime(deadline)
+		w.NextDeadlineInSeconds = int64(deadline.Sub(now).Round(time.Second) / time.Second)
+		w.PastDeadline = !now.Before(deadline)
+	}
+	for _, sig := range wm.Signals {
+		sp := fleetSignalProgress{Kind: string(sig.Kind), Fingerprint: sig.Fingerprint}
+		if !sig.ObservedAt.IsZero() {
+			sp.ObservedAt = formatFleetTime(sig.ObservedAt)
+			sp.AgeSeconds = fleetAgeSeconds(sig.ObservedAt, now)
+		}
+		w.SignalProgress = append(w.SignalProgress, sp)
+	}
+	w.LastRecovery = fleetProgressRecoveryFrom(mp.LastRecovery, now)
+	w.LastDecision = fleetProgressRecoveryFrom(mp.LastDecision, now)
+	return w
+}
+
+// fleetProgressRecoveryFrom maps a durable watchdog decision to its
+// operator-facing view. Returns nil for a nil decision.
+func fleetProgressRecoveryFrom(d *progress.Decision, now time.Time) *fleetProgressRecovery {
+	if d == nil {
+		return nil
+	}
+	r := &fleetProgressRecovery{
+		Action:         string(d.Action),
+		Reason:         strings.TrimSpace(d.Reason),
+		Phase:          string(d.Phase),
+		ReplayBoundary: d.ReplayBoundary,
+	}
+	if !d.EvaluatedAt.IsZero() {
+		r.At = formatFleetTime(d.EvaluatedAt)
+		r.AgeSeconds = fleetAgeSeconds(d.EvaluatedAt, now)
+	}
+	return r
 }
 
 // recentSupervisorActions returns the last `limit` recommended_action

@@ -375,6 +375,12 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		}
 		applyOrMintDecision(cfg, st, reader, &decision)
 		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
+		// #887: record the durable per-project material-progress watermark from
+		// the freshly-applied state so the stalled-progress watchdog's last
+		// watermark / next deadline / last recovery survive the save below and
+		// this restart. Recording is safe every cycle; recovery actuation stays
+		// gated behind live canary evidence (runtime-live completion type).
+		recordMaterialProgress(cfg, st, time.Now().UTC())
 		// Phase 1.2 (#499): stamp the last-run heartbeat just before save
 		// so the watchdog goroutine in cmd/maestro can see this cycle
 		// completed. Also clear any stale SupervisorStuck flag set by a

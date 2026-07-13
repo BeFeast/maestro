@@ -1257,6 +1257,15 @@ type State struct {
 	// on-disk value simply re-examines a window and self-heals next cycle.
 	SpecGroomCursor int `json:"spec_groom_cursor,omitempty"`
 
+	// MaterialProgress is the durable per-project stalled-progress watermark
+	// and last recovery decision (#887). It records the last material progress
+	// identity/time across the full lifecycle (issue → worker → PR/CI/review →
+	// merge/release → approval-gated delivery) and survives daemon restart
+	// without resetting or duplicating the deadline, because the deadline is
+	// always derived from Watermark.At + the silence budget. nil until the
+	// watchdog has evaluated at least once.
+	MaterialProgress *MaterialProgress `json:"material_progress,omitempty"`
+
 	loadedHash  string
 	loadedState *State
 }
@@ -1691,6 +1700,7 @@ func (s *State) copyFrom(src *State) {
 	s.SpawnDrainAt = src.SpawnDrainAt
 	s.Paused = src.Paused
 	s.PausedAt = src.PausedAt
+	s.MaterialProgress = src.MaterialProgress
 }
 
 func cloneState(s *State) *State {
@@ -1739,6 +1749,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	mergeSpawnDrain(merged, current, ours)
 	mergePaused(merged, current, ours)
+	mergeMaterialProgress(merged, current, ours)
 	return merged, nil
 }
 
