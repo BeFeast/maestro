@@ -308,12 +308,15 @@ func TestMaterialProgress_EvaluationDueIncludesConfigTransitions(t *testing.T) {
 	if !nilMP.EvaluationDue(20*time.Minute, time.Minute, mpBase) {
 		t.Fatal("nil state should be due")
 	}
-	mp := &MaterialProgress{BudgetSeconds: 1200, LastEvaluatedAt: mpBase}
+	mp := &MaterialProgress{BudgetSeconds: 1200, EvalIntervalSeconds: 60, LastEvaluatedAt: mpBase}
 	if mp.EvaluationDue(20*time.Minute, time.Minute, mpBase.Add(30*time.Second)) {
 		t.Fatal("evaluation inside cadence reported due")
 	}
 	if !mp.EvaluationDue(60*time.Minute, time.Minute, mpBase.Add(30*time.Second)) {
 		t.Fatal("budget change did not bypass cadence")
+	}
+	if !mp.EvaluationDue(20*time.Minute, 5*time.Minute, mpBase.Add(30*time.Second)) {
+		t.Fatal("evaluation cadence change did not bypass cadence")
 	}
 	if !mp.EvaluationDue(20*time.Minute, time.Minute, mpBase.Add(time.Minute)) {
 		t.Fatal("elapsed cadence did not report due")

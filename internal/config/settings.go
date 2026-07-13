@@ -119,6 +119,12 @@ func FleetSettingSpecs() []FleetSettingSpec {
 			Kind:     SettingKindInt,
 			Value:    func(c *Config) string { return strconv.Itoa(c.StalledProgressWatchdog.MaxSilenceMinutes) },
 		},
+		{
+			Key:      "stalled_progress_watchdog.eval_interval_seconds",
+			YAMLPath: []string{"stalled_progress_watchdog", "eval_interval_seconds"},
+			Kind:     SettingKindInt,
+			Value:    func(c *Config) string { return strconv.Itoa(c.StalledProgressWatchdog.EvalIntervalSecs) },
+		},
 	}
 }
 

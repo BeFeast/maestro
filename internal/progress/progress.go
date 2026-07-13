@@ -5,7 +5,8 @@
 // it could kill a worker that was actively editing files without emitting
 // output, and when disabled (0/absent) it could not recover a genuinely
 // hung-but-alive worker. This package replaces that single-signal heuristic
-// with one durable watermark per exact live worker, PR gate, or delivery lease,
+// with one durable watermark per exact live worker, PR gate, post-merge
+// verification, or delivery lease,
 // derived from whichever phase-appropriate signals are present:
 //
 //   - issue/session state and lease identity;
@@ -42,7 +43,7 @@ import (
 
 // DefaultMaxSilence is the default maximum silence budget for a new hands-off
 // project (#887): 20 minutes with no material progress across any lifecycle
-// signal before the watchdog acts.
+// signal before the watchdog recommends an action.
 const DefaultMaxSilence = 20 * time.Minute
 
 // ContractVersion is the fingerprint-bound capability contract name emitted by
@@ -70,6 +71,10 @@ const (
 	// SignalPRReview covers PR head, CI/check/review state, and merge/release
 	// identity.
 	SignalPRReview SignalKind = "pr_review"
+	// SignalOutcomeVerification covers durable post-merge state and semantic
+	// runtime/outcome verification changes. Poll timestamps alone are excluded
+	// so an unchanged failing check cannot mask a stalled live-verification gate.
+	SignalOutcomeVerification SignalKind = "outcome_verification"
 	// SignalDelivery covers delivery approval generation, execution lease, and
 	// terminal receipt.
 	SignalDelivery SignalKind = "delivery"
@@ -78,12 +83,13 @@ const (
 // signalOrder is the stable iteration order for signals so a combined identity
 // digest is deterministic regardless of the caller's insertion order.
 var signalOrder = map[SignalKind]int{
-	SignalIssueSession:       0,
-	SignalProcessTmux:        1,
-	SignalTerminalCheckpoint: 2,
-	SignalWorktreeGit:        3,
-	SignalPRReview:           4,
-	SignalDelivery:           5,
+	SignalIssueSession:        0,
+	SignalProcessTmux:         1,
+	SignalTerminalCheckpoint:  2,
+	SignalWorktreeGit:         3,
+	SignalPRReview:            4,
+	SignalOutcomeVerification: 5,
+	SignalDelivery:            6,
 }
 
 // Fingerprint reduces raw identity material to a short, stable, non-reversible
@@ -217,21 +223,23 @@ func (s SignalSet) Combined() string {
 }
 
 // TargetKind identifies the exact independently-evaluated lifecycle target.
-// A live worker, a PR gate, and a delivery lease never share a watermark: work
-// by one target therefore cannot hide a stall in another target (#887).
+// A live worker, a PR gate, a post-merge verification, and a delivery lease
+// never share a watermark: work by one target therefore cannot hide a stall in
+// another target (#887).
 type TargetKind string
 
 const (
-	TargetWorker   TargetKind = "worker"
-	TargetPRGate   TargetKind = "pr_gate"
-	TargetDelivery TargetKind = "delivery"
+	TargetWorker    TargetKind = "worker"
+	TargetPRGate    TargetKind = "pr_gate"
+	TargetPostMerge TargetKind = "post_merge"
+	TargetDelivery  TargetKind = "delivery"
 )
 
 // Target is the durable, exact recovery boundary for one watchdog watermark.
 // Worker targets bind issue + slot + session + tmux/process + lease identity;
-// PR gates intentionally carry no process identity; delivery targets bind the
-// durable approval id/generation as LeaseID. No command, output, path, or secret
-// belongs in a Target.
+// PR gates and post-merge verification targets intentionally carry no process
+// identity; delivery targets bind the durable approval id/generation as
+// LeaseID. No command, output, path, or secret belongs in a Target.
 type Target struct {
 	Kind        TargetKind `json:"kind"`
 	IssueNumber int        `json:"issue_number,omitempty"`
@@ -264,6 +272,13 @@ func (t Target) Validate() error {
 		if t.ProcessID != 0 || t.TmuxSession != "" {
 			return fmt.Errorf("PR-gate target must not carry process or tmux identity")
 		}
+	case TargetPostMerge:
+		if t.IssueNumber <= 0 || t.Slot == "" || t.SessionID == "" || t.LeaseID == "" {
+			return fmt.Errorf("post-merge target requires issue, slot, session, and lease identity")
+		}
+		if t.ProcessID != 0 || t.TmuxSession != "" {
+			return fmt.Errorf("post-merge target must not carry process or tmux identity")
+		}
 	case TargetDelivery:
 		if t.LeaseID == "" {
 			return fmt.Errorf("delivery target requires a durable lease identity")
@@ -292,12 +307,14 @@ func (t Target) Key() string {
 }
 
 // Observation is one exact target plus only that target's phase-appropriate
-// signals. Collectors return one Observation per live worker/PR gate/delivery
-// lease and no observation for an idle project.
+// signals. Collectors return one Observation per live worker/PR gate/post-merge
+// verification/delivery lease and no observation for an idle project.
 type Observation struct {
-	Target  Target    `json:"target"`
-	Signals SignalSet `json:"signals,omitempty"`
-	Phase   Phase     `json:"phase,omitempty"`
+	Target             Target       `json:"target"`
+	Signals            SignalSet    `json:"signals,omitempty"`
+	Phase              Phase        `json:"phase,omitempty"`
+	Incomplete         bool         `json:"incomplete,omitempty"`
+	UnavailableSignals []SignalKind `json:"unavailable_signals,omitempty"`
 }
 
 // Phase is the lifecycle phase used to pick the recovery boundary when a stall
@@ -315,6 +332,10 @@ const (
 	// PhasePRGate covers an open PR waiting on CI/review/merge. There is no live
 	// worker process to stop, so an overdue gate is surfaced for reconciliation.
 	PhasePRGate Phase = "pr_gate"
+	// PhasePostMergeVerification covers code that is durably landed but has not
+	// yet reached the configured runtime/live-verification outcome. The merge
+	// cannot be replayed and there is no worker process to retry.
+	PhasePostMergeVerification Phase = "post_merge_verification"
 	// PhaseDeliveryPending is an approval-gated delivery not yet executing:
 	// there is no live worker to retry, so a stall is an operator wait.
 	PhaseDeliveryPending Phase = "delivery_pending"
@@ -387,10 +408,26 @@ const (
 	// retry budget. The caller enforces the "exactly once" via that budget;
 	// Evaluate is idempotent and keeps returning this until progress advances.
 	ActionStopAndRetry Action = "stop_and_retry"
+	// ActionSurfaceGateRepair means an open PR gate is overdue. There is no
+	// worker process or delivery lease to replay: surface a gate repair/no-op
+	// recommendation without claiming the durable-delivery replay boundary.
+	ActionSurfaceGateRepair Action = "surface_gate_repair"
+	// ActionSurfaceOutcomeRepair means code is already merged but the
+	// post-merge/live-verification gate stopped advancing. It surfaces repair
+	// without claiming that an uncertain delivery lease was crossed.
+	ActionSurfaceOutcomeRepair Action = "surface_outcome_repair"
+	// ActionSurfaceDeliveryWait means a delivery approval exists but execution
+	// has not begun. The approval is a control-plane wait, not an uncertain
+	// execution result and therefore not a replay boundary.
+	ActionSurfaceDeliveryWait Action = "surface_delivery_wait"
 	// ActionSurfaceReconciliation means the stall crossed the durable delivery
 	// lease / replay boundary or occurred in a non-retryable phase: hand it to
 	// operator reconciliation and never replay automatically.
 	ActionSurfaceReconciliation Action = "surface_reconciliation"
+	// ActionEvidenceUnavailable means one or more required bounded probes failed
+	// or overflowed. The old deadline remains armed, but destructive recovery is
+	// suppressed until a complete observation is available.
+	ActionEvidenceUnavailable Action = "evidence_unavailable"
 	// ActionDisabled means the watchdog is off (budget <= 0). Kept distinct
 	// from ActionWaiting so Fleet can report "disabled" truthfully rather than
 	// implying a live-but-quiet deadline.
@@ -403,18 +440,21 @@ const (
 // and the action plus its no-op reason — never a secret, raw private path, or
 // command output (#887).
 type Decision struct {
-	EvaluatedAt     time.Time    `json:"evaluated_at"`
-	Target          Target       `json:"target"`
-	Action          Action       `json:"action"`
-	Reason          string       `json:"reason"`
-	Phase           Phase        `json:"phase,omitempty"`
-	Identity        string       `json:"identity,omitempty"`     // watermark identity at decision time
-	WatermarkAt     time.Time    `json:"watermark_at,omitempty"` // last material progress time
-	Deadline        time.Time    `json:"deadline,omitempty"`     // next stall deadline (derived)
-	BudgetSeconds   int          `json:"budget_seconds,omitempty"`
-	ObservedSignals []SignalKind `json:"observed_signals,omitempty"`
-	// ReplayBoundary is true when a durable delivery lease bars automatic
-	// replay: the decision defers to operator reconciliation.
+	EvaluatedAt           time.Time    `json:"evaluated_at"`
+	Target                Target       `json:"target"`
+	Action                Action       `json:"action"`
+	Reason                string       `json:"reason"`
+	Phase                 Phase        `json:"phase,omitempty"`
+	Identity              string       `json:"identity,omitempty"`     // watermark identity at decision time
+	WatermarkAt           time.Time    `json:"watermark_at,omitempty"` // last material progress time
+	Deadline              time.Time    `json:"deadline,omitempty"`     // next stall deadline (derived)
+	BudgetSeconds         int          `json:"budget_seconds,omitempty"`
+	ObservedSignals       []SignalKind `json:"observed_signals,omitempty"`
+	ObservationIncomplete bool         `json:"observation_incomplete,omitempty"`
+	UnavailableSignals    []SignalKind `json:"unavailable_signals,omitempty"`
+	// ReplayBoundary is true only when an executing/uncertain durable delivery
+	// lease bars automatic replay. A pending approval, PR gate, or post-merge
+	// verification wait is not represented as an uncertain execution result.
 	ReplayBoundary bool `json:"replay_boundary,omitempty"`
 	// RecommendationID is a deterministic idempotency key for one overdue
 	// target/watermark/action episode. Repeated evaluations retain the same id;
@@ -433,7 +473,9 @@ func (d Decision) Acted() bool {
 // RecommendsRecovery reports that evaluation recommends an action. It does not
 // claim the action was attempted; actual attempts are separate Recovery values.
 func (d Decision) RecommendsRecovery() bool {
-	return d.Action == ActionStopAndRetry || d.Action == ActionSurfaceReconciliation
+	return d.Action == ActionStopAndRetry || d.Action == ActionSurfaceGateRepair ||
+		d.Action == ActionSurfaceOutcomeRepair || d.Action == ActionSurfaceDeliveryWait ||
+		d.Action == ActionSurfaceReconciliation
 }
 
 // RecoveryOutcome is the durable result of an actual recovery attempt. A
@@ -472,27 +514,38 @@ type Recovery struct {
 // to persist: it equals prev whenever no progress was observed, so re-persisting
 // it across restarts never resets or duplicates the deadline.
 func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time) (Watermark, Decision) {
-	return evaluate(Target{}, prev, observed, phase, budget, now)
+	return evaluate(Target{}, prev, observed, phase, budget, now, false, nil)
 }
 
 // EvaluateTarget is Evaluate bound to one exact worker/PR-gate/delivery target.
 // The target is copied into the decision and binds any recovery recommendation
 // to an exact, independently-watermarked recovery boundary.
 func EvaluateTarget(target Target, prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time) (Watermark, Decision) {
-	return evaluate(target, prev, observed, phase, budget, now)
+	return evaluate(target, prev, observed, phase, budget, now, false, nil)
 }
 
-func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time) (Watermark, Decision) {
+// EvaluateObservation evaluates one collector observation, including whether a
+// bounded evidence probe was incomplete. Incomplete evidence can still carry
+// genuine progress from another signal, but can never authorize a destructive
+// recommendation at the deadline.
+func EvaluateObservation(prev Watermark, observation Observation, budget time.Duration, now time.Time) (Watermark, Decision) {
+	return evaluate(observation.Target, prev, observation.Signals, observation.Phase, budget, now,
+		observation.Incomplete, observation.UnavailableSignals)
+}
+
+func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time, incomplete bool, unavailable []SignalKind) (Watermark, Decision) {
 	now = now.UTC()
 	// Reconcile against durable last-known fingerprints. The evaluator stamps
 	// actual detected changes; signal disappearance alone is not progress.
 	present, signalChanged := reconcileSignals(prev.Signals, observed.Present(), now)
 	id := SignalSet(present).Combined()
 	dec := Decision{
-		EvaluatedAt:     now,
-		Target:          target,
-		Phase:           phase,
-		ObservedSignals: observed.Kinds(),
+		EvaluatedAt:           now,
+		Target:                target,
+		Phase:                 phase,
+		ObservedSignals:       observed.Kinds(),
+		ObservationIncomplete: incomplete,
+		UnavailableSignals:    stableSignalKinds(unavailable),
 	}
 	if budget > 0 {
 		dec.BudgetSeconds = int(budget.Round(time.Second).Seconds())
@@ -540,6 +593,11 @@ func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, bu
 		dec.Deadline = time.Time{}
 		return prev, dec
 	}
+	if incomplete {
+		dec.Action = ActionEvidenceUnavailable
+		dec.Reason = "required material-progress evidence is unavailable; preserve the existing watermark/deadline and suppress recovery until a complete observation"
+		return prev, dec
+	}
 
 	if now.Before(deadline) {
 		dec.Action = ActionWaiting
@@ -552,16 +610,24 @@ func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, bu
 	// Evaluate stays idempotent and the caller's retry budget is the single
 	// authority for "retry exactly once".
 	switch {
+	case phase == PhasePostMergeVerification:
+		dec.Action = ActionSurfaceOutcomeRepair
+		dec.Reason = "code is already merged but runtime/live verification has not advanced; surface outcome repair without replaying the worker or claiming an uncertain delivery result"
 	case phase.RequiresReconciliation():
 		dec.Action = ActionSurfaceReconciliation
 		dec.ReplayBoundary = true
 		dec.Reason = "delivery lease is executing/uncertain; recovery authority ends before the durable delivery lease — surface operator reconciliation, never replay"
+	case phase == PhaseDeliveryPending:
+		dec.Action = ActionSurfaceDeliveryWait
+		dec.Reason = "delivery approval is pending and execution has not begun; surface the control-plane wait without claiming an uncertain delivery result"
 	case phase.AllowsWorkerRetry():
 		dec.Action = ActionStopAndRetry
 		dec.Reason = "proven pre-delivery stall past the silence budget; stop the single stale worker and retry once under the existing retry budget"
+	case phase == PhasePRGate:
+		dec.Action = ActionSurfaceGateRepair
+		dec.Reason = "PR gate is overdue; surface an idempotent gate repair/no-op recommendation without replaying a worker or delivery"
 	default:
 		dec.Action = ActionSurfaceReconciliation
-		dec.ReplayBoundary = true
 		dec.Reason = "stall past the silence budget in a non-retryable phase; surface operator reconciliation"
 	}
 	if dec.RecommendsRecovery() {
@@ -569,6 +635,29 @@ func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, bu
 		dec.RecommendationID = recommendationID(target, dec)
 	}
 	return prev, dec
+}
+
+func stableSignalKinds(kinds []SignalKind) []SignalKind {
+	if len(kinds) == 0 {
+		return nil
+	}
+	seen := make(map[SignalKind]struct{}, len(kinds))
+	out := make([]SignalKind, 0, len(kinds))
+	for _, kind := range kinds {
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		out = append(out, kind)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		oi, oj := signalOrder[out[i]], signalOrder[out[j]]
+		if oi != oj {
+			return oi < oj
+		}
+		return out[i] < out[j]
+	})
+	return out
 }
 
 func recommendationID(target Target, dec Decision) string {

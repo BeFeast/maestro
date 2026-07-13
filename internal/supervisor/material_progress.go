@@ -18,8 +18,9 @@ import (
 )
 
 // recordMaterialProgress collects and independently evaluates every exact
-// worker, PR-gate, and delivery target. The complete snapshot retires targets
-// that disappeared; an idle project therefore has no armed synthetic target.
+// worker, PR-gate, post-merge verification, and delivery target. The complete
+// snapshot retires targets that disappeared; an idle project therefore has no
+// armed synthetic target.
 func recordMaterialProgress(cfg *config.Config, st *state.State, now time.Time) ([]progress.Decision, error) {
 	if cfg == nil || st == nil {
 		return nil, nil
@@ -60,8 +61,9 @@ func recordMaterialProgress(cfg *config.Config, st *state.State, now time.Time) 
 
 // collectMaterialProgressObservations derives a complete snapshot of exact,
 // independently-watermarked lifecycle targets. A running worker is bound to
-// issue+slot+spawn session+PID/tmux+lease; a pr_open session is a PR gate with
-// deliberately zero process identity; and each delivery approval generation is
+// issue+slot+spawn session+PID/tmux+lease; pr_open/queued sessions are PR gates
+// with deliberately zero process identity; code_landed is a distinct
+// post-merge/live-verification target; and each delivery approval generation is
 // its own durable lease. Progress by one target cannot reset another's deadline.
 //
 // Signals contain only non-reversible digests. A failed bounded worktree or
@@ -88,8 +90,12 @@ func collectMaterialProgressObservations(st *state.State, now time.Time) []progr
 			if observation, ok := workerProgressObservation(slot, sess, now); ok {
 				observations = append(observations, observation)
 			}
-		case state.StatusPROpen:
+		case state.StatusPROpen, state.StatusQueued:
 			if observation, ok := prGateProgressObservation(slot, sess, now); ok {
+				observations = append(observations, observation)
+			}
+		case state.StatusCodeLanded:
+			if observation, ok := postMergeProgressObservation(st, slot, sess, now); ok {
 				observations = append(observations, observation)
 			}
 		}
@@ -126,16 +132,24 @@ func workerProgressObservation(slot string, sess *state.Session, now time.Time) 
 		materialProgressSignal(progress.SignalProcessTmux, now,
 			fmt.Sprintf("pid=%d", sess.PID), "tmux="+strings.TrimSpace(sess.TmuxSession), "session="+sessionID),
 	}
-	if terminal := terminalCheckpointFingerprint(sess); terminal != "" {
+	var unavailable []progress.SignalKind
+	if terminal, complete := terminalCheckpointProgress(sess); terminal != "" {
 		signals = append(signals, materialProgressSignal(progress.SignalTerminalCheckpoint, now, terminal))
+	} else if !complete {
+		unavailable = append(unavailable, progress.SignalTerminalCheckpoint)
 	}
-	if worktree := worktreeProgressFingerprint(sess.Worktree); worktree != "" {
+	if worktree, complete := worktreeProgressProbe(sess.Worktree); worktree != "" {
 		signals = append(signals, materialProgressSignal(progress.SignalWorktreeGit, now, worktree))
+	} else if !complete {
+		unavailable = append(unavailable, progress.SignalWorktreeGit)
 	}
 	if pr := prReviewFingerprint(sess); pr != "" {
 		signals = append(signals, materialProgressSignal(progress.SignalPRReview, now, pr))
 	}
-	return progress.Observation{Target: target, Signals: signals, Phase: progress.PhasePreDelivery}, true
+	return progress.Observation{
+		Target: target, Signals: signals, Phase: progress.PhasePreDelivery,
+		Incomplete: len(unavailable) > 0, UnavailableSignals: unavailable,
+	}, true
 }
 
 func prGateProgressObservation(slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
@@ -153,7 +167,7 @@ func prGateProgressObservation(slot string, sess *state.Session, now time.Time) 
 		Slot:        slot,
 		SessionID:   sessionID,
 		LeaseID:     lease,
-		// pr_open is a control-plane gate, not a live process. Never copy stale
+		// pr_open/queued is a control-plane gate, not a live process. Never copy stale
 		// Session.PID/TmuxSession into this target or its signals (#814/#887).
 	}
 	if err := target.Validate(); err != nil {
@@ -168,6 +182,64 @@ func prGateProgressObservation(slot string, sess *state.Session, now time.Time) 
 		signals = append(signals, materialProgressSignal(progress.SignalPRReview, now, pr))
 	}
 	return progress.Observation{Target: target, Signals: signals, Phase: progress.PhasePRGate}, true
+}
+
+func postMergeProgressObservation(st *state.State, slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
+	if sess == nil || sess.IssueNumber <= 0 {
+		return progress.Observation{}, false
+	}
+	sessionID := materialProgressSessionID(slot, sess)
+	lease := fmt.Sprintf("post-merge:pr:%d", sess.PRNumber)
+	if sess.PRNumber <= 0 {
+		lease = "post-merge:legacy:" + sessionID
+	}
+	target := progress.Target{
+		Kind:        progress.TargetPostMerge,
+		IssueNumber: sess.IssueNumber,
+		Slot:        slot,
+		SessionID:   sessionID,
+		LeaseID:     lease,
+		// code_landed is a durable control-plane/outcome gate. A stale PID or
+		// tmux name from the completed implementation worker is never actionable.
+	}
+	if err := target.Validate(); err != nil {
+		return progress.Observation{}, false
+	}
+	signals := progress.SignalSet{
+		materialProgressSignal(progress.SignalIssueSession, now,
+			fmt.Sprintf("status=%s", sess.Status), fmt.Sprintf("pr=%d", sess.PRNumber),
+			"landed="+materialProgressOptionalTime(sess.FinishedAt),
+			"deployed="+materialProgressOptionalTime(sess.DeploymentFinishedAt),
+			fmt.Sprintf("live_verification_notified=%t", sess.LiveVerificationNotified)),
+		materialProgressSignal(progress.SignalOutcomeVerification, now,
+			postMergeOutcomeFingerprint(st, sess)),
+	}
+	return progress.Observation{Target: target, Signals: signals, Phase: progress.PhasePostMergeVerification}, true
+}
+
+// postMergeOutcomeFingerprint includes semantic merge/deploy/outcome evidence
+// but deliberately excludes health-check timestamps and durations. Re-running
+// the same failing check is observability, not material progress; a changed
+// outcome state or durable deploy/live-verification receipt advances the gate.
+func postMergeOutcomeFingerprint(st *state.State, sess *state.Session) string {
+	if sess == nil {
+		return ""
+	}
+	parts := []string{
+		fmt.Sprintf("pr=%d", sess.PRNumber),
+		"landed=" + materialProgressOptionalTime(sess.FinishedAt),
+		"deployed=" + materialProgressOptionalTime(sess.DeploymentFinishedAt),
+		"visual=" + strings.TrimSpace(sess.VisualEvidence),
+		fmt.Sprintf("live_verification_notified=%t", sess.LiveVerificationNotified),
+	}
+	if st != nil && st.OutcomeHealth != nil {
+		parts = append(parts,
+			"health_state="+strings.TrimSpace(st.OutcomeHealth.State),
+			"health_signal="+strings.TrimSpace(st.OutcomeHealth.Signal),
+			fmt.Sprintf("health_exit=%d", st.OutcomeHealth.ExitCode),
+		)
+	}
+	return progress.Fingerprint(parts...)
 }
 
 func materialProgressSessionID(slot string, sess *state.Session) string {
@@ -187,34 +259,82 @@ func materialProgressSignal(kind progress.SignalKind, now time.Time, parts ...st
 	return progress.Signal{Kind: kind, Fingerprint: progress.Fingerprint(parts...), ObservedAt: now.UTC()}
 }
 
-func terminalCheckpointFingerprint(sess *state.Session) string {
+func terminalCheckpointProgress(sess *state.Session) (string, bool) {
 	if sess == nil {
-		return ""
+		return "", true
 	}
-	parts := make([]string, 0, 2)
-	if hash := strings.TrimSpace(sess.LastOutputHash); hash != "" {
-		parts = append(parts, "output="+hash)
+	parts := make([]string, 0, 3)
+	complete := true
+	if strings.TrimSpace(sess.TmuxSession) != "" {
+		if live, ok := tmuxProgressFingerprint(sess.TmuxSession); ok {
+			parts = append(parts, "tmux="+live)
+		} else {
+			complete = false
+		}
+	} else if hash := strings.TrimSpace(sess.LastOutputHash); hash != "" {
+		parts = append(parts, "persisted_output="+hash)
 	}
-	if checkpoint := boundedFileFingerprint(sess.CheckpointFile, 1<<20); checkpoint != "" {
+	if checkpoint, ok := boundedFileFingerprintProbe(sess.CheckpointFile, 1<<20); checkpoint != "" {
 		parts = append(parts, "checkpoint="+checkpoint)
+	} else if !ok {
+		complete = false
 	}
-	return progress.Fingerprint(parts...)
+	return progress.Fingerprint(parts...), complete
 }
 
 func boundedFileFingerprint(path string, maxBytes int64) string {
+	fingerprint, _ := boundedFileFingerprintProbe(path, maxBytes)
+	return fingerprint
+}
+
+// boundedFileFingerprintProbe distinguishes an optional absent path (complete,
+// no signal) from a configured read/stat/size failure (incomplete evidence).
+func boundedFileFingerprintProbe(path string, maxBytes int64) (string, bool) {
 	path = strings.TrimSpace(path)
-	if path == "" || maxBytes <= 0 {
-		return ""
+	if path == "" {
+		return "", true
+	}
+	if maxBytes <= 0 {
+		return "", false
 	}
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxBytes {
-		return ""
+		return "", false
 	}
 	data, err := os.ReadFile(path)
 	if err != nil || int64(len(data)) != info.Size() {
-		return ""
+		return "", false
 	}
-	return progress.Fingerprint(string(data))
+	return progress.Fingerprint(string(data)), true
+}
+
+const (
+	tmuxProgressMaxOutputBytes = 1 << 20
+	tmuxProgressHistoryLines   = "-2000"
+)
+
+var tmuxProgressTimeout = 2 * time.Second
+
+// tmuxProgressFingerprint captures a bounded tail from the exact recorded tmux
+// session. It never persists terminal text: only a non-reversible fingerprint
+// leaves this function. A timeout, command failure, or output overflow is
+// explicit incomplete evidence so the evaluator suppresses destructive action.
+func tmuxProgressFingerprint(session string) (string, bool) {
+	session = strings.TrimSpace(session)
+	if session == "" {
+		return "", true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tmuxProgressTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-t", "="+session, "-S", tmuxProgressHistoryLines)
+	stdout := &boundedOutput{limit: tmuxProgressMaxOutputBytes}
+	stderr := &boundedOutput{limit: 32 << 10}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil || stdout.truncated || stderr.truncated || ctx.Err() != nil {
+		return "", false
+	}
+	return progress.Fingerprint(stdout.buf.String()), true
 }
 
 func prReviewFingerprint(sess *state.Session) string {
@@ -361,6 +481,13 @@ func materialProgressTime(value time.Time) string {
 	return value.UTC().Format(time.RFC3339Nano)
 }
 
+func materialProgressOptionalTime(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return materialProgressTime(*value)
+}
+
 func materialProgressOptionalInt(value *int) string {
 	if value == nil {
 		return ""
@@ -445,13 +572,22 @@ type worktreeChange struct {
 // or fails, it returns an absent signal rather than blessing an incomplete
 // sample as truthful material progress.
 func worktreeProgressFingerprint(worktree string) string {
+	fingerprint, _ := worktreeProgressProbe(worktree)
+	return fingerprint
+}
+
+// worktreeProgressProbe is the status-aware form used by the watchdog. Empty
+// Worktree means the optional signal is not configured; a configured path with
+// any stat/Git/timeout/bounds failure is incomplete evidence, never a silently
+// absent signal that could authorize recovery.
+func worktreeProgressProbe(worktree string) (string, bool) {
 	worktree = strings.TrimSpace(worktree)
 	if worktree == "" {
-		return ""
+		return "", true
 	}
 	info, err := os.Stat(worktree)
 	if err != nil || !info.IsDir() {
-		return ""
+		return "", false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), worktreeProgressTimeout)
@@ -459,20 +595,20 @@ func worktreeProgressFingerprint(worktree string) string {
 
 	head, ok := boundedGitOutput(ctx, worktree, "rev-parse", "--verify", "HEAD^{commit}")
 	if !ok || strings.TrimSpace(string(head)) == "" {
-		return ""
+		return "", false
 	}
 	statusRaw, ok := boundedGitOutput(ctx, worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=dirty")
 	if !ok {
-		return ""
+		return "", false
 	}
 	changes, ok := relevantWorktreeChanges(statusRaw)
 	if !ok {
-		return ""
+		return "", false
 	}
 
 	parts := []string{"head=" + strings.TrimSpace(string(head))}
 	if len(changes) == 0 {
-		return progress.Fingerprint(parts...)
+		return progress.Fingerprint(parts...), true
 	}
 
 	paths := make([]string, 0, len(changes))
@@ -487,7 +623,7 @@ func worktreeProgressFingerprint(worktree string) string {
 		seen[change.path] = struct{}{}
 		pathBytes += len(change.path)
 		if pathBytes > worktreeProgressMaxPathBytes {
-			return ""
+			return "", false
 		}
 		paths = append(paths, change.path)
 	}
@@ -500,11 +636,11 @@ func worktreeProgressFingerprint(worktree string) string {
 	pathspec = append(pathspec, paths...)
 	indexRaw, ok := boundedGitOutput(ctx, worktree, append([]string{"diff", "--cached", "--raw", "-z", "--no-renames"}, pathspec...)...)
 	if !ok {
-		return ""
+		return "", false
 	}
 	worktreeRaw, ok := boundedGitOutput(ctx, worktree, append([]string{"diff", "--raw", "-z", "--no-renames"}, pathspec...)...)
 	if !ok {
-		return ""
+		return "", false
 	}
 	parts = append(parts,
 		"index_diff="+progress.Fingerprint(string(indexRaw)),
@@ -517,6 +653,9 @@ func worktreeProgressFingerprint(worktree string) string {
 	existing := make([]string, 0, len(paths))
 	for _, path := range paths {
 		fi, statErr := os.Lstat(filepath.Join(worktree, filepath.FromSlash(path)))
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return "", false
+		}
 		if statErr == nil && !fi.IsDir() {
 			existing = append(existing, path)
 		}
@@ -526,11 +665,11 @@ func worktreeProgressFingerprint(worktree string) string {
 		hashArgs = append(hashArgs, existing...)
 		workingBlobs, hashOK := boundedGitOutput(ctx, worktree, hashArgs...)
 		if !hashOK {
-			return ""
+			return "", false
 		}
 		parts = append(parts, "working_blobs="+progress.Fingerprint(string(workingBlobs)))
 	}
-	return progress.Fingerprint(parts...)
+	return progress.Fingerprint(parts...), true
 }
 
 func relevantWorktreeChanges(raw []byte) ([]worktreeChange, bool) {

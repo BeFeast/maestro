@@ -13,23 +13,34 @@ command output is persisted.
 
 ## What "material progress" means
 
-The watchdog derives **one durable per-project watermark** from whichever
-phase-appropriate signals are present. A single missing or stale signal is never
-proof of a stall: the watermark advances whenever *any* signal advances (or the
-observed set changes).
+The watchdog derives **one durable watermark per exact lifecycle target**: each
+live worker, PR gate, post-merge/live-verification gate, and delivery lease is
+evaluated independently. Progress by worker B can never hide a frozen worker A.
+Within one target, a single stale signal is never proof of a stall: its
+watermark advances whenever *any* phase-appropriate signal advances.
 
 | Signal | Evidence |
 | --- | --- |
 | `issue_session` | issue/session state and lease identity (status, retry counters) |
 | `process_tmux` | process id + exact tmux/session identity of live workers |
-| `terminal_checkpoint` | terminal output hash or checkpoint advancement |
-| `worktree_git` | bounded worktree evidence — branch + PR head plus, for a live worker, the newest source-file mtime and git index/HEAD identity, excluding volatile/generated paths so an actively-editing-but-quiet worker still advances |
-| `pr_review` | PR head, CI/check/review state, merge/release identity |
+| `terminal_checkpoint` | bounded live capture from the exact tmux session and/or checkpoint content advancement |
+| `worktree_git` | bounded Git HEAD/index/status/diff/blob identity, excluding volatile/generated paths; mtimes alone never count |
+| `pr_review` | durable per-PR head, CI/check/review/finding, late-feedback, and merge identity |
+| `outcome_verification` | semantic post-merge deploy/live-verification outcome changes; repeated identical poll timestamps do not count |
 | `delivery` | delivery approval generation, execution lease, terminal receipt |
 
-The combined identity is a stable digest of the present `(kind, fingerprint)`
-pairs. Two evaluations with the same present signals share one identity; any
-signal advancing changes it and re-arms the deadline.
+Each target's combined identity is a stable digest of its present
+`(kind, fingerprint)` pairs. Two evaluations with the same present signals
+share one identity; any signal advancing changes it and re-arms only that
+target's deadline. Targets absent from a complete evaluation snapshot are
+retired, so an idle project has no synthetic armed deadline.
+
+A configured Git, tmux, or checkpoint probe that fails, times out, or exceeds a
+bound is **explicit incomplete evidence**, not an absent/stale signal. The old
+watermark and deadline remain unchanged, but the evaluator records
+`evidence_unavailable` and suppresses destructive recovery until a complete
+observation returns. Restoring observability therefore does not buy a stalled
+target another silence budget.
 
 ## The three cadences (reported separately, truthfully)
 
@@ -38,63 +49,90 @@ it beside the supervisor pulse as if it were the whole story. The pulse now
 reports the cadences that actually exist, side by side:
 
 - `orchestrator_interval_seconds` — the orchestrator poll cadence.
+- `supervisor_interval_seconds` — the actual running daemon supervisor cadence
+  (runtime-injected; project YAML cannot self-claim it).
 - `watchdog_eval_interval_seconds` — the watchdog's own evaluation cadence
   (`stalled_progress_watchdog.eval_interval_seconds`, default 60s).
-- `silence_budget_seconds` — the configured maximum silence before the watchdog
-  acts (`stalled_progress_watchdog.max_silence_minutes`, default 20m).
 
-The Fleet `supervisor_pulse.stalled_progress_watchdog` block also reports the
-last material watermark, the derived next deadline, per-signal progress, and the
-last recovery decision — each independently, so a quiet-but-active worker is
-visibly *making progress* rather than *about to be killed*.
+`silence_budget_seconds` is reported separately from those three clocks. It is
+the configured maximum silence before the evaluator recommends an action
+(`stalled_progress_watchdog.max_silence_minutes`, default 20m).
+
+The evaluator runs on its own per-project timer, outside `Engine.Decide` and
+GitHub/LLM work, and starts before the first standalone `maestro supervise`
+network/decision cycle. A failed or blocked first supervisor cycle therefore
+cannot pause this cadence. `maestro supervise --once` performs one local
+evaluation before its network/decision work; `--dry-run` remains non-persistent.
+The Fleet `supervisor_pulse.stalled_progress_watchdog` block also reports each
+active target, its watermark/deadline/signals, the latest recommendation, and
+the latest **actual** recovery result separately. A recommendation never appears
+as a completed recovery.
 
 ## Configuration
 
 ```yaml
 stalled_progress_watchdog:
-  enabled: true              # default true for new hands-off projects
+  enabled: true              # explicit opt-in; lifecycle/genesis sets this
   max_silence_minutes: 20    # 0 = default (20); negative or enabled:false = disabled
   eval_interval_seconds: 60  # watchdog evaluation cadence
 ```
 
-Both knobs are fleet-controllable (`maestro settings`):
+All three knobs are fleet-controllable (`maestro settings`):
 
 - `stalled_progress_watchdog.enabled`
 - `stalled_progress_watchdog.max_silence_minutes`
+- `stalled_progress_watchdog.eval_interval_seconds`
+
+Missing watchdog config is inactive. This is an upgrade-safety boundary: a new
+binary never arms recovery fleet-wide for legacy projects. New hands-off
+projects opt in explicitly through lifecycle/genesis. A legacy-only
+`worker_silent_timeout_minutes: N` is migrated in memory to enabled v1 with the
+same `N`-minute budget; explicit `enabled: false` retains the legacy detector as
+a compatibility escape hatch. Any other explicit v1 stanza suppresses legacy,
+including `enabled: true` with a negative/invalid budget; it fails closed instead
+of unexpectedly re-arming the terminal-only killer. The legacy and v1 detectors
+never run together.
 
 A disabled or negative budget collapses to a zero silence budget, which the
 evaluator reads as **disabled** — no quiet worker is ever killed by a
 misconfiguration.
 
-## Recovery semantics (the replay boundary)
+## Recommendation semantics (the replay boundary)
 
-When *no* signal has advanced for the whole silence budget, the watchdog records
-a recovery decision. The action depends on the lifecycle phase:
+When *no* signal for one exact target has advanced for the whole silence budget,
+the evaluator records an idempotent recovery recommendation. Recommendation and
+actuation are separate durable records. **The current v1 runtime is
+recommendation-only: no recovery actuator is wired yet.** Fleet reports
+`last_recommendation` for evaluator output and leaves `last_recovery` empty
+unless an actual actuator attempt is explicitly persisted. The boundary depends
+on the lifecycle phase:
 
-- **pre-delivery** (issue → worker → PR/CI/review → merge): a proven safe stall
-  asks the orchestrator to **stop the single stale worker and retry/resume
-  exactly once** under the existing retry budget. Recovery never creates two
-  live workers for one issue; the retry budget is the single "once" authority.
+- **implementation worker**: a proven safe stall recommends stopping the exact
+  stale worker and retrying/resuming exactly once under the existing retry
+  budget. It does not claim that stop/retry happened.
+- **PR gate** (`pr_open` or `queued`): recommends an idempotent gate repair. It
+  carries no process identity and does not claim a delivery replay boundary.
+- **post-merge/live verification** (`code_landed`): recommends outcome repair,
+  not worker/merge replay. It is not an uncertain executing-delivery result.
+- **delivery approval pending**: surfaces the control-plane wait; execution has
+  not begun, so `replay_boundary=false`.
 - **delivery executing / uncertain**: recovery authority ends **before** the
   durable delivery lease. The watchdog **surfaces operator reconciliation and
-  never replays** the delivery automatically. Use the
+  sets `replay_boundary=true`; it never replays the delivery automatically. Use the
   [delivery-reconciliation runbook](delivery-reconciliation-runbook.md) (#872).
 
-Every recovery decision records the observed signal set (by kind), the last
+Every recommendation decision records the observed signal set (by kind), the last
 material watermark, the deadline, the phase, the idempotency/replay boundary,
 and the action plus its no-op reason — never a secret, raw private path, or
 command output.
 
 ## Durability
 
-The watermark lives in the project's `state.json` (`material_progress`) and
-survives daemon restart. The deadline is never stored — it is always derived
-from `watermark.at + silence_budget`, so a reload re-reads the same watermark and
-computes the identical deadline. The concurrent-writer merge keeps the snapshot
-with the newer material-progress time, so a concurrent stall record can never
-clobber a fresh progress advance and reset the deadline — while the newer
-recovery/decision from either writer is preserved independently, so a recorded
-recovery is never dropped by a concurrent progress advance.
+The per-target watermarks live in the project's `state.json`
+(`material_progress.targets`) and survive daemon restart. Deadlines are never
+stored — each is derived from `target.watermark.at + current_budget`, so reload
+does not reset it. Concurrent writes merge per exact target; actual recovery
+attempt/results are unioned independently from evaluator verdicts.
 
 Per-signal ages track when each signal last changed (not the evaluation time):
 an unchanged signal carries its prior observation time forward, so operators can
@@ -110,6 +148,13 @@ genesis/lifecycle templates only after runtime canary evidence. Until a project
 is live-proven, the capability stays a visible promotion blocker and the
 lifecycle planner fails closed — it does not emit the unsafe legacy
 `worker_silent_timeout_minutes` for new projects.
+
+Fleet reports evaluator `mode` separately, while `contract` remains empty and
+`contract_pending=true` until a durable canary-proof source exists (#896/#897).
+Config, observations, recommendations, or a manually recorded recovery record
+cannot self-assert the live capability. The missing bounded actuator and live
+canaries are tracked in #896/#897; until they land, documentation and UI must
+describe this implementation as recording/recommendation-only.
 
 Two live canaries close the loop (tracked as runtime verification):
 

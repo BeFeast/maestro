@@ -2600,6 +2600,12 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		changed = append(changed, fmt.Sprintf("max_retries_per_issue: %d→%d", old.MaxRetriesPerIssue, newCfg.MaxRetriesPerIssue))
 		o.cfg.MaxRetriesPerIssue = newCfg.MaxRetriesPerIssue
 	}
+	if newCfg.StalledProgressWatchdog != old.StalledProgressWatchdog {
+		changed = append(changed, fmt.Sprintf("stalled_progress_watchdog: active=%t→%t cadence=%s→%s",
+			old.StalledProgressWatchdog.IsActive(), newCfg.StalledProgressWatchdog.IsActive(),
+			old.StalledProgressWatchdog.EffectiveEvalInterval(), newCfg.StalledProgressWatchdog.EffectiveEvalInterval()))
+		o.cfg.StalledProgressWatchdog = newCfg.StalledProgressWatchdog
+	}
 	if newCfg.WorkerSilentTimeoutMinutes != old.WorkerSilentTimeoutMinutes {
 		changed = append(changed, fmt.Sprintf("worker_silent_timeout_minutes: %d→%d", old.WorkerSilentTimeoutMinutes, newCfg.WorkerSilentTimeoutMinutes))
 		o.cfg.WorkerSilentTimeoutMinutes = newCfg.WorkerSilentTimeoutMinutes
@@ -3970,7 +3976,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Silent worker detection ---
-					if o.cfg.WorkerSilentTimeoutMinutes > 0 {
+					if timeout := o.cfg.EffectiveWorkerSilentTimeout(); timeout > 0 {
 						hash := hashOutput(output)
 						now := time.Now().UTC()
 
@@ -3978,9 +3984,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							sess.LastOutputHash = hash
 							sess.LastOutputChangedAt = now
 						} else {
-							timeout := time.Duration(o.cfg.WorkerSilentTimeoutMinutes) * time.Minute
 							if time.Since(sess.LastOutputChangedAt) > timeout {
-								log.Printf("[orch] worker %s silent for >%dm, killing", slotName, o.cfg.WorkerSilentTimeoutMinutes)
+								timeoutMinutes := int(timeout / time.Minute)
+								log.Printf("[orch] worker %s silent for >%dm, killing", slotName, timeoutMinutes)
 								o.runAfterRunHook(sess)
 								if err := o.stopWorker(slotName, sess); err != nil {
 									log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
@@ -4000,7 +4006,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								}
 
 								o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d) killed — no output for %d minutes",
-									slotName, sess.IssueNumber, o.cfg.WorkerSilentTimeoutMinutes)
+									slotName, sess.IssueNumber, timeoutMinutes)
 								continue
 							}
 						}

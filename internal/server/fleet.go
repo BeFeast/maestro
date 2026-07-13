@@ -1564,6 +1564,7 @@ type fleetSupervisorPulse struct {
 	// one number beside the supervisor pulse) keeps an operator from mistaking
 	// the orchestrator poll for the watchdog's evaluation rhythm.
 	OrchestratorIntervalSeconds int `json:"orchestrator_interval_seconds,omitempty"`
+	SupervisorIntervalSeconds   int `json:"supervisor_interval_seconds,omitempty"`
 	WatchdogEvalIntervalSeconds int `json:"watchdog_eval_interval_seconds,omitempty"`
 
 	// StalledProgressWatchdog is the durable material-progress watchdog's
@@ -1579,18 +1580,51 @@ type fleetSupervisorPulse struct {
 // next deadline vs. last recovery. Every field is secret-free — signal
 // fingerprints are non-reversible digests.
 type fleetStalledProgressWatchdog struct {
-	Enabled                bool                   `json:"enabled"`
-	Contract               string                 `json:"contract,omitempty"`
-	SilenceBudgetSeconds   int                    `json:"silence_budget_seconds,omitempty"`
+	Enabled                   bool                   `json:"enabled"`
+	Mode                      string                 `json:"mode,omitempty"`
+	Contract                  string                 `json:"contract,omitempty"`
+	ContractPending           bool                   `json:"contract_pending,omitempty"`
+	EvaluationIntervalSeconds int                    `json:"evaluation_interval_seconds,omitempty"`
+	SilenceBudgetSeconds      int                    `json:"silence_budget_seconds,omitempty"`
+	ConfigPendingEvaluation   bool                   `json:"config_pending_evaluation,omitempty"`
+	LastEvaluatedAt           string                 `json:"last_evaluated_at,omitempty"`
+	ActiveTargetCount         int                    `json:"active_target_count,omitempty"`
+	Targets                   []fleetWatchdogTarget  `json:"targets,omitempty"`
+	LastMaterialProgressAt    string                 `json:"last_material_progress_at,omitempty"`
+	LastMaterialAgeSeconds    int64                  `json:"last_material_age_seconds,omitempty"`
+	Phase                     string                 `json:"phase,omitempty"`
+	NextDeadlineAt            string                 `json:"next_deadline_at,omitempty"`
+	NextDeadlineInSeconds     int64                  `json:"next_deadline_in_seconds,omitempty"`
+	PastDeadline              bool                   `json:"past_deadline,omitempty"`
+	ObservationIncomplete     bool                   `json:"observation_incomplete,omitempty"`
+	UnavailableSignals        []string               `json:"unavailable_signals,omitempty"`
+	SignalProgress            []fleetSignalProgress  `json:"signal_progress,omitempty"`
+	LastRecovery              *fleetProgressRecovery `json:"last_recovery,omitempty"`
+	LastRecommendation        *fleetProgressRecovery `json:"last_recommendation,omitempty"`
+	LastDecision              *fleetProgressRecovery `json:"last_decision,omitempty"`
+}
+
+// fleetWatchdogTarget is one independently-watermarked worker, PR gate,
+// post-merge verification, or delivery lease. TargetKey is already a
+// non-reversible digest; no path,
+// command, terminal output, or secret enters Fleet.
+type fleetWatchdogTarget struct {
+	TargetKey              string                 `json:"target_key"`
+	Kind                   string                 `json:"kind"`
+	IssueNumber            int                    `json:"issue_number,omitempty"`
+	Slot                   string                 `json:"slot,omitempty"`
+	Phase                  string                 `json:"phase,omitempty"`
 	LastMaterialProgressAt string                 `json:"last_material_progress_at,omitempty"`
 	LastMaterialAgeSeconds int64                  `json:"last_material_age_seconds,omitempty"`
-	Phase                  string                 `json:"phase,omitempty"`
 	NextDeadlineAt         string                 `json:"next_deadline_at,omitempty"`
 	NextDeadlineInSeconds  int64                  `json:"next_deadline_in_seconds,omitempty"`
 	PastDeadline           bool                   `json:"past_deadline,omitempty"`
+	ObservationIncomplete  bool                   `json:"observation_incomplete,omitempty"`
+	UnavailableSignals     []string               `json:"unavailable_signals,omitempty"`
 	SignalProgress         []fleetSignalProgress  `json:"signal_progress,omitempty"`
-	LastRecovery           *fleetProgressRecovery `json:"last_recovery,omitempty"`
 	LastDecision           *fleetProgressRecovery `json:"last_decision,omitempty"`
+	LastRecommendation     *fleetProgressRecovery `json:"last_recommendation,omitempty"`
+	LastRecovery           *fleetProgressRecovery `json:"last_recovery,omitempty"`
 }
 
 // fleetSignalProgress reports one per-signal watermark identity and age so an
@@ -1604,12 +1638,17 @@ type fleetSignalProgress struct {
 
 // fleetProgressRecovery is the operator-facing view of a watchdog decision.
 type fleetProgressRecovery struct {
-	Action         string `json:"action"`
-	Reason         string `json:"reason,omitempty"`
-	Phase          string `json:"phase,omitempty"`
-	At             string `json:"at,omitempty"`
-	AgeSeconds     int64  `json:"age_seconds,omitempty"`
-	ReplayBoundary bool   `json:"replay_boundary,omitempty"`
+	Action                string   `json:"action"`
+	Outcome               string   `json:"outcome,omitempty"`
+	RecommendationID      string   `json:"recommendation_id,omitempty"`
+	Reason                string   `json:"reason,omitempty"`
+	Phase                 string   `json:"phase,omitempty"`
+	At                    string   `json:"at,omitempty"`
+	CompletedAt           string   `json:"completed_at,omitempty"`
+	AgeSeconds            int64    `json:"age_seconds,omitempty"`
+	ReplayBoundary        bool     `json:"replay_boundary,omitempty"`
+	ObservationIncomplete bool     `json:"observation_incomplete,omitempty"`
+	UnavailableSignals    []string `json:"unavailable_signals,omitempty"`
 }
 
 type fleetApprovalState struct {
@@ -5072,7 +5111,10 @@ func buildFleetSupervisorPulse(cfg *config.Config, st *state.State, now time.Tim
 	if cfg != nil {
 		pulse.PollIntervalSeconds = cfg.PollIntervalSeconds
 		pulse.OrchestratorIntervalSeconds = cfg.PollIntervalSeconds
-		pulse.WatchdogEvalIntervalSeconds = int(cfg.StalledProgressWatchdog.EffectiveEvalInterval() / time.Second)
+		pulse.SupervisorIntervalSeconds = cfg.RuntimeSuperviseIntervalSeconds
+		if cfg.StalledProgressWatchdog.IsActive() {
+			pulse.WatchdogEvalIntervalSeconds = int(cfg.StalledProgressWatchdog.EffectiveEvalInterval() / time.Second)
+		}
 		pulse.Mode = strings.TrimSpace(cfg.Supervisor.Mode)
 	}
 	if st == nil {
@@ -5086,6 +5128,9 @@ func buildFleetSupervisorPulse(cfg *config.Config, st *state.State, now time.Tim
 	pulse.StuckReason = strings.TrimSpace(st.SupervisorStuckReason)
 	pulse.RecentActions = recentSupervisorActions(st.SupervisorDecisions, fleetSupervisorPulseRecentLimit)
 	pulse.StalledProgressWatchdog = buildFleetStalledProgressWatchdog(cfg, st, now)
+	if pulse.StalledProgressWatchdog != nil {
+		pulse.WatchdogEvalIntervalSeconds = pulse.StalledProgressWatchdog.EvaluationIntervalSeconds
+	}
 	return pulse
 }
 
@@ -5102,71 +5147,206 @@ func buildFleetStalledProgressWatchdog(cfg *config.Config, st *state.State, now 
 	if cfg == nil && mp == nil {
 		return nil
 	}
-	w := &fleetStalledProgressWatchdog{}
-	// Default-on when there is no config to consult, mirroring the config
-	// default, so a cfg-less render (persisted state only) still shows a budget.
-	enabled := true
+	// Mode names the evaluator implementation. Contract remains empty unless the
+	// active config carries the exact runtime-live proof marker: recording/
+	// evaluation (or even one actuator result) does not publish capability.
+	w := &fleetStalledProgressWatchdog{Mode: progress.ContractVersion}
+	// Current config is authoritative for enablement. With no config, infer only
+	// from the last effective persisted budget; never fabricate default-on state
+	// for a state-only/legacy render.
+	enabled := mp != nil && mp.BudgetSeconds > 0
 	if cfg != nil {
-		enabled = cfg.StalledProgressWatchdog.IsEnabled()
-		w.Enabled = enabled
-		w.SilenceBudgetSeconds = int(cfg.StalledProgressWatchdog.EffectiveMaxSilence() / time.Second)
+		enabled = cfg.StalledProgressWatchdog.IsActive()
+		if enabled {
+			w.SilenceBudgetSeconds = int(cfg.StalledProgressWatchdog.EffectiveMaxSilence() / time.Second)
+			w.EvaluationIntervalSeconds = int(cfg.StalledProgressWatchdog.EffectiveEvalInterval() / time.Second)
+		}
+	} else if enabled {
+		w.SilenceBudgetSeconds = mp.BudgetSeconds
+		w.EvaluationIntervalSeconds = mp.EvalIntervalSeconds
 	}
+	w.Enabled = enabled
+	// No durable canary-proof source exists yet (#896/#897), so config cannot
+	// self-assert this runtime-live capability. Enabled means evaluator mode is
+	// armed; contract remains empty/pending until a proof store is implemented.
+	w.ContractPending = enabled
 	if mp == nil {
+		w.ConfigPendingEvaluation = enabled
 		return w
 	}
-	// Fall back to the last-recorded budget only while the watchdog is enabled.
-	// A disabled watchdog must report a zero budget and no deadline even when
-	// durable state still carries a previously-enabled budget; otherwise Fleet
-	// raises a false overdue alert (enabled=false with past_deadline=true) until
-	// the next supervisor evaluation rewrites the stored budget (#887 review).
-	if enabled && w.SilenceBudgetSeconds == 0 && mp.BudgetSeconds > 0 {
-		w.SilenceBudgetSeconds = mp.BudgetSeconds
+	if !mp.LastEvaluatedAt.IsZero() {
+		w.LastEvaluatedAt = formatFleetTime(mp.LastEvaluatedAt)
 	}
-	wm := mp.Watermark
-	w.Contract = progress.ContractVersion
-	w.Phase = string(wm.Phase)
-	if !wm.At.IsZero() {
-		w.LastMaterialProgressAt = formatFleetTime(wm.At)
-		w.LastMaterialAgeSeconds = fleetAgeSeconds(wm.At, now)
+	// Until the independent evaluator consumes a config transition, expose the
+	// current config but do not derive deadlines from a watermark evaluated under
+	// another budget. This prevents disable/re-enable or budget edits from
+	// resurrecting an old deadline in the small hot-reload window.
+	w.ConfigPendingEvaluation = mp.BudgetSeconds != w.SilenceBudgetSeconds
+	// Once the independent runtime evaluator has run, its persisted cadence is
+	// the cadence actually scheduled/observed. Prefer it over a just-edited
+	// config value until the evaluator consumes that live edit. Disabled always
+	// reports zero, even when durable state still carries an old interval.
+	if enabled && mp.EvalIntervalSeconds > 0 {
+		w.EvaluationIntervalSeconds = mp.EvalIntervalSeconds
 	}
-	// Derive the reported deadline from the reported budget so the two are always
-	// consistent: a disabled watchdog (budget 0) reports no deadline and never a
-	// past-deadline alert.
-	if budget := time.Duration(w.SilenceBudgetSeconds) * time.Second; budget > 0 {
-		if deadline := wm.Deadline(budget); !deadline.IsZero() {
-			w.NextDeadlineAt = formatFleetTime(deadline)
-			w.NextDeadlineInSeconds = int64(deadline.Sub(now).Round(time.Second) / time.Second)
-			w.PastDeadline = !now.Before(deadline)
+
+	keys := make([]string, 0, len(mp.Targets))
+	for key := range mp.Targets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var (
+		primary         *fleetWatchdogTarget
+		primaryDeadline time.Time
+		primaryProgress time.Time
+		lastDecision    *progress.Decision
+		lastRecommend   *progress.Decision
+		lastRecovery    *progress.Recovery
+	)
+	for _, key := range keys {
+		target := mp.Targets[key]
+		if target == nil {
+			continue
+		}
+		if target.LastDecision != nil && (lastDecision == nil || target.LastDecision.EvaluatedAt.After(lastDecision.EvaluatedAt)) {
+			lastDecision = target.LastDecision
+		}
+		if target.LastRecommendation != nil && (lastRecommend == nil || decisionEventTime(target.LastRecommendation).After(decisionEventTime(lastRecommend))) {
+			lastRecommend = target.LastRecommendation
+		}
+		if recovery := target.LastRecovery(); recovery != nil && (lastRecovery == nil || recovery.AttemptedAt.After(lastRecovery.AttemptedAt)) {
+			lastRecovery = recovery
+		}
+		if !enabled || w.ConfigPendingEvaluation || !target.Active {
+			continue
+		}
+		view := fleetWatchdogTargetFrom(key, target, w.SilenceBudgetSeconds, now)
+		w.Targets = append(w.Targets, view)
+		w.ActiveTargetCount++
+		deadline := target.Deadline(w.SilenceBudgetSeconds)
+		progressAt := target.Watermark.At
+		if primary == nil ||
+			(!deadline.IsZero() && (primaryDeadline.IsZero() || deadline.Before(primaryDeadline))) ||
+			(deadline.IsZero() && primaryDeadline.IsZero() && progressAt.After(primaryProgress)) {
+			copy := view
+			primary = &copy
+			primaryDeadline = deadline
+			primaryProgress = progressAt
 		}
 	}
-	for _, sig := range wm.Signals {
+	if primary != nil {
+		w.LastMaterialProgressAt = primary.LastMaterialProgressAt
+		w.LastMaterialAgeSeconds = primary.LastMaterialAgeSeconds
+		w.Phase = primary.Phase
+		w.NextDeadlineAt = primary.NextDeadlineAt
+		w.NextDeadlineInSeconds = primary.NextDeadlineInSeconds
+		w.PastDeadline = primary.PastDeadline
+		w.ObservationIncomplete = primary.ObservationIncomplete
+		w.UnavailableSignals = append([]string(nil), primary.UnavailableSignals...)
+		w.SignalProgress = append([]fleetSignalProgress(nil), primary.SignalProgress...)
+	}
+	w.LastDecision = fleetProgressDecisionFrom(lastDecision, now)
+	w.LastRecommendation = fleetProgressDecisionFrom(lastRecommend, now)
+	w.LastRecovery = fleetProgressActualRecoveryFrom(lastRecovery, now)
+	return w
+}
+
+func fleetWatchdogTargetFrom(key string, target *state.MaterialProgressTarget, budgetSeconds int, now time.Time) fleetWatchdogTarget {
+	view := fleetWatchdogTarget{
+		TargetKey:          key,
+		Kind:               string(target.Target.Kind),
+		IssueNumber:        target.Target.IssueNumber,
+		Slot:               strings.TrimSpace(target.Target.Slot),
+		Phase:              string(target.Watermark.Phase),
+		LastDecision:       fleetProgressDecisionFrom(target.LastDecision, now),
+		LastRecommendation: fleetProgressDecisionFrom(target.LastRecommendation, now),
+		LastRecovery:       fleetProgressActualRecoveryFrom(target.LastRecovery(), now),
+	}
+	if target.LastDecision != nil {
+		view.ObservationIncomplete = target.LastDecision.ObservationIncomplete
+		view.UnavailableSignals = fleetSignalKindStrings(target.LastDecision.UnavailableSignals)
+	}
+	if !target.Watermark.At.IsZero() {
+		view.LastMaterialProgressAt = formatFleetTime(target.Watermark.At)
+		view.LastMaterialAgeSeconds = fleetAgeSeconds(target.Watermark.At, now)
+	}
+	if deadline := target.Deadline(budgetSeconds); !deadline.IsZero() {
+		view.NextDeadlineAt = formatFleetTime(deadline)
+		view.NextDeadlineInSeconds = int64(deadline.Sub(now).Round(time.Second) / time.Second)
+		view.PastDeadline = !now.Before(deadline)
+	}
+	for _, sig := range target.Watermark.Signals {
 		sp := fleetSignalProgress{Kind: string(sig.Kind), Fingerprint: sig.Fingerprint}
 		if !sig.ObservedAt.IsZero() {
 			sp.ObservedAt = formatFleetTime(sig.ObservedAt)
 			sp.AgeSeconds = fleetAgeSeconds(sig.ObservedAt, now)
 		}
-		w.SignalProgress = append(w.SignalProgress, sp)
+		view.SignalProgress = append(view.SignalProgress, sp)
 	}
-	w.LastRecovery = fleetProgressRecoveryFrom(mp.LastRecovery, now)
-	w.LastDecision = fleetProgressRecoveryFrom(mp.LastDecision, now)
-	return w
+	return view
 }
 
-// fleetProgressRecoveryFrom maps a durable watchdog decision to its
-// operator-facing view. Returns nil for a nil decision.
-func fleetProgressRecoveryFrom(d *progress.Decision, now time.Time) *fleetProgressRecovery {
+func decisionEventTime(d *progress.Decision) time.Time {
+	if d == nil {
+		return time.Time{}
+	}
+	if !d.RecommendedAt.IsZero() {
+		return d.RecommendedAt
+	}
+	return d.EvaluatedAt
+}
+
+// fleetProgressDecisionFrom maps a durable watchdog verdict/recommendation to
+// the operator-facing view. It never claims evaluation was an actual recovery.
+// Returns nil for a nil decision.
+func fleetProgressDecisionFrom(d *progress.Decision, now time.Time) *fleetProgressRecovery {
 	if d == nil {
 		return nil
 	}
 	r := &fleetProgressRecovery{
-		Action:         string(d.Action),
-		Reason:         strings.TrimSpace(d.Reason),
-		Phase:          string(d.Phase),
-		ReplayBoundary: d.ReplayBoundary,
+		Action:                string(d.Action),
+		RecommendationID:      strings.TrimSpace(d.RecommendationID),
+		Reason:                strings.TrimSpace(d.Reason),
+		Phase:                 string(d.Phase),
+		ReplayBoundary:        d.ReplayBoundary,
+		ObservationIncomplete: d.ObservationIncomplete,
+		UnavailableSignals:    fleetSignalKindStrings(d.UnavailableSignals),
 	}
 	if !d.EvaluatedAt.IsZero() {
 		r.At = formatFleetTime(d.EvaluatedAt)
 		r.AgeSeconds = fleetAgeSeconds(d.EvaluatedAt, now)
+	}
+	return r
+}
+
+func fleetSignalKindStrings(kinds []progress.SignalKind) []string {
+	if len(kinds) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		out = append(out, string(kind))
+	}
+	return out
+}
+
+// fleetProgressActualRecoveryFrom maps only an explicitly recorded actuator
+// attempt/result. A recommendation without this record leaves last_recovery nil.
+func fleetProgressActualRecoveryFrom(recovery *progress.Recovery, now time.Time) *fleetProgressRecovery {
+	if recovery == nil {
+		return nil
+	}
+	r := &fleetProgressRecovery{
+		Action:           string(recovery.Action),
+		Outcome:          string(recovery.Outcome),
+		RecommendationID: strings.TrimSpace(recovery.RecommendationID),
+	}
+	if !recovery.AttemptedAt.IsZero() {
+		r.At = formatFleetTime(recovery.AttemptedAt)
+		r.AgeSeconds = fleetAgeSeconds(recovery.AttemptedAt, now)
+	}
+	if !recovery.CompletedAt.IsZero() {
+		r.CompletedAt = formatFleetTime(recovery.CompletedAt)
 	}
 	return r
 }

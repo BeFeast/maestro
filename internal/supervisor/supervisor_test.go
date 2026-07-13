@@ -790,6 +790,8 @@ func TestDecide_DeadRunningPIDExplained(t *testing.T) {
 func TestDecide_StaleWorkerLogsExplained(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.WorkerSilentTimeoutMinutes = 10
+	legacyOnly := false
+	cfg.StalledProgressWatchdog.Enabled = &legacyOnly
 	reader := &fakeReader{}
 	st := state.NewState()
 	st.Sessions["slot-1"] = &state.Session{

@@ -9,8 +9,9 @@ import (
 )
 
 // MaterialProgress is the durable stalled-progress watchdog state for a
-// project. Targets are independently watermarked exact workers, PR gates, or
-// delivery leases: progress by worker B can never reset worker A's deadline.
+// project. Targets are independently watermarked exact workers, PR gates,
+// post-merge verifications, or delivery leases: progress by worker B can never
+// reset worker A's deadline.
 // An idle project has no active target and therefore no armed deadline.
 type MaterialProgress struct {
 	Targets             map[string]*MaterialProgressTarget `json:"targets,omitempty"`
@@ -40,11 +41,15 @@ type MaterialProgressTarget struct {
 }
 
 // EvaluationDue reports whether the independent watchdog scheduler should run.
-// Configuration transitions bypass cadence so disabled/enabled or budget
-// changes establish a fresh baseline immediately. A backwards clock jump also
-// evaluates rather than suppressing the watchdog indefinitely.
+// Configuration transitions bypass cadence so disabled/enabled, budget, or
+// evaluation-interval changes are persisted immediately. RecordMaterialProgress
+// only treats budget changes as a fresh target baseline; a cadence-only edit
+// must not postpone an already-running silence deadline. A backwards clock jump
+// also evaluates rather than suppressing the watchdog indefinitely.
 func (m *MaterialProgress) EvaluationDue(budget, evalInterval time.Duration, now time.Time) bool {
-	if m == nil || m.LastEvaluatedAt.IsZero() || m.BudgetSeconds != durationSeconds(budget) {
+	if m == nil || m.LastEvaluatedAt.IsZero() ||
+		m.BudgetSeconds != durationSeconds(budget) ||
+		m.EvalIntervalSeconds != durationSeconds(evalInterval) {
 		return true
 	}
 	interval := evalInterval
@@ -159,7 +164,7 @@ func (s *State) RecordMaterialProgress(observations []progress.Observation, budg
 			prev = progress.Watermark{}
 			target.LastRecommendation = nil
 		}
-		wm, decision := progress.EvaluateTarget(observation.Target, prev, observation.Signals, observation.Phase, effectiveBudget, now)
+		wm, decision := progress.EvaluateObservation(prev, observation, effectiveBudget, now)
 		target.Target = observation.Target
 		target.Active = true
 		target.RetiredAt = time.Time{}
@@ -395,5 +400,6 @@ func cloneDecision(decision *progress.Decision) *progress.Decision {
 	}
 	out := *decision
 	out.ObservedSignals = append([]progress.SignalKind(nil), decision.ObservedSignals...)
+	out.UnavailableSignals = append([]progress.SignalKind(nil), decision.UnavailableSignals...)
 	return &out
 }

@@ -3,34 +3,28 @@ package config
 import (
 	"testing"
 	"time"
-
-	"github.com/befeast/maestro/internal/progress"
 )
 
-// A new hands-off project with no watchdog config gets the durable 20-minute
-// max-silence contract by default (#887), and the watchdog is enabled — unlike
-// the legacy worker_silent_timeout_minutes, which defaults to disabled.
-func TestStalledProgressWatchdog_DefaultsForHandsOffProject(t *testing.T) {
+// Missing config is inactive. New hands-off projects opt in through the
+// lifecycle/genesis template; upgrading must never arm recovery for every
+// legacy project implicitly.
+func TestStalledProgressWatchdog_MissingConfigIsInactive(t *testing.T) {
 	path := writeConfig(t, "repo: owner/repo\n")
 	cfg, err := LoadFrom(path)
 	if err != nil {
 		t.Fatalf("LoadFrom: %v", err)
 	}
 	w := cfg.StalledProgressWatchdog
-	if !w.IsEnabled() {
-		t.Fatalf("watchdog disabled by default, want enabled for hands-off projects")
+	if w.IsEnabled() || w.IsActive() {
+		t.Fatalf("watchdog active without explicit opt-in")
 	}
-	if got := w.EffectiveMaxSilence(); got != 20*time.Minute {
-		t.Errorf("EffectiveMaxSilence = %s, want 20m", got)
-	}
-	if got := w.EffectiveMaxSilence(); got != progress.DefaultMaxSilence {
-		t.Errorf("default silence budget = %s, want progress.DefaultMaxSilence", got)
+	if got := w.EffectiveMaxSilence(); got != 0 {
+		t.Errorf("EffectiveMaxSilence = %s, want disabled", got)
 	}
 	if got := w.EffectiveEvalInterval(); got != 60*time.Second {
 		t.Errorf("EffectiveEvalInterval = %s, want 60s", got)
 	}
-	// The legacy terminal-only timeout stays disabled by default: it is never
-	// silently emitted for a new project.
+	// The legacy terminal-only timeout also stays disabled by default.
 	if cfg.WorkerSilentTimeoutMinutes != 0 {
 		t.Errorf("legacy worker_silent_timeout_minutes = %d, want 0 (disabled)", cfg.WorkerSilentTimeoutMinutes)
 	}
@@ -93,6 +87,7 @@ func TestStalledProgressWatchdog_FleetSettingsRegistered(t *testing.T) {
 	for _, key := range []string{
 		"stalled_progress_watchdog.enabled",
 		"stalled_progress_watchdog.max_silence_minutes",
+		"stalled_progress_watchdog.eval_interval_seconds",
 	} {
 		if _, ok := FleetSettingSpecByKey(key); !ok {
 			t.Errorf("fleet setting %q not registered", key)
@@ -105,4 +100,94 @@ func TestStalledProgressWatchdog_FleetSettingsRegistered(t *testing.T) {
 	if _, err := NormalizeSettingValue("stalled_progress_watchdog.enabled", "true"); err != nil {
 		t.Errorf("NormalizeSettingValue(bool): %v", err)
 	}
+	if _, err := NormalizeSettingValue("stalled_progress_watchdog.eval_interval_seconds", "15"); err != nil {
+		t.Errorf("NormalizeSettingValue(cadence): %v", err)
+	}
+}
+
+func TestStalledProgressWatchdog_LegacyAndV1NeverRunInParallel(t *testing.T) {
+	t.Run("explicit v1 budget wins", func(t *testing.T) {
+		cfg, err := Parse([]byte(`repo: owner/repo
+worker_silent_timeout_minutes: 25
+stalled_progress_watchdog:
+  enabled: true
+  max_silence_minutes: 30
+`))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if cfg.WorkerSilentTimeoutMinutes != 0 || cfg.EffectiveWorkerSilentTimeout() != 0 {
+			t.Fatalf("legacy timeout remained active: raw=%d effective=%s", cfg.WorkerSilentTimeoutMinutes, cfg.EffectiveWorkerSilentTimeout())
+		}
+		if got := cfg.StalledProgressWatchdog.EffectiveMaxSilence(); got != 30*time.Minute {
+			t.Fatalf("v1 budget = %s, want 30m", got)
+		}
+	})
+
+	t.Run("explicit v1 disable preserves compatibility escape hatch", func(t *testing.T) {
+		cfg, err := Parse([]byte(`repo: owner/repo
+worker_silent_timeout_minutes: 25
+stalled_progress_watchdog:
+  enabled: false
+`))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		if got := cfg.EffectiveWorkerSilentTimeout(); got != 25*time.Minute {
+			t.Fatalf("effective legacy timeout = %s, want 25m", got)
+		}
+	})
+
+	t.Run("programmatic config is mutually excluded at runtime", func(t *testing.T) {
+		enabled := true
+		cfg := Config{
+			WorkerSilentTimeoutMinutes: 25,
+			StalledProgressWatchdog:    StalledProgressWatchdogConfig{Enabled: &enabled},
+		}
+		if got := cfg.EffectiveWorkerSilentTimeout(); got != 0 {
+			t.Fatalf("effective legacy timeout = %s while v1 is active, want 0", got)
+		}
+	})
+
+	for _, tt := range []struct {
+		name       string
+		stanza     string
+		wantLegacy time.Duration
+		wantV1     time.Duration
+	}{
+		{name: "enabled default suppresses legacy", stanza: "  enabled: true\n", wantV1: 20 * time.Minute},
+		{name: "enabled negative budget fails closed", stanza: "  enabled: true\n  max_silence_minutes: -1\n"},
+		{name: "implicit negative budget suppresses legacy", stanza: "  max_silence_minutes: -1\n"},
+		{name: "cadence-only stanza suppresses legacy", stanza: "  eval_interval_seconds: 15\n"},
+		{name: "explicit disable is escape hatch", stanza: "  enabled: false\n", wantLegacy: 25 * time.Minute},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Parse([]byte("repo: owner/repo\nworker_silent_timeout_minutes: 25\nstalled_progress_watchdog:\n" + tt.stanza))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if got := cfg.EffectiveWorkerSilentTimeout(); got != tt.wantLegacy {
+				t.Fatalf("legacy timeout = %s, want %s (raw=%d)", got, tt.wantLegacy, cfg.WorkerSilentTimeoutMinutes)
+			}
+			if got := cfg.StalledProgressWatchdog.EffectiveMaxSilence(); got != tt.wantV1 {
+				t.Fatalf("v1 budget = %s, want %s", got, tt.wantV1)
+			}
+			if tt.wantLegacy == 0 && cfg.WorkerSilentTimeoutMinutes != 0 {
+				t.Fatalf("explicit v1 stanza left raw legacy timeout=%d", cfg.WorkerSilentTimeoutMinutes)
+			}
+		})
+	}
+
+	t.Run("programmatic enabled invalid budget still suppresses legacy", func(t *testing.T) {
+		enabled := true
+		cfg := Config{
+			WorkerSilentTimeoutMinutes: 25,
+			StalledProgressWatchdog: StalledProgressWatchdogConfig{
+				Enabled: &enabled, MaxSilenceMinutes: -1,
+			},
+		}
+		if got := cfg.EffectiveWorkerSilentTimeout(); got != 0 {
+			t.Fatalf("invalid enabled v1 fell back to legacy timeout %s", got)
+		}
+	})
 }

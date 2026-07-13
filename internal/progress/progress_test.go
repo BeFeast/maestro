@@ -251,6 +251,86 @@ func TestEvaluate_UncertainDelivery_NeverReplay(t *testing.T) {
 	}
 }
 
+func TestEvaluate_PRGateUsesRepairRecommendationWithoutDeliveryReplayBoundary(t *testing.T) {
+	budget := 20 * time.Minute
+	frozen := SignalSet{sig(SignalPRReview, "pr#893@abc123;ci=pending;review=pending")}
+	target := Target{Kind: TargetPRGate, IssueNumber: 887, Slot: "sup-318", SessionID: "spawn-1", LeaseID: "pr:893"}
+	wm, _ := EvaluateTarget(target, Watermark{}, frozen, PhasePRGate, budget, base)
+
+	_, dec := EvaluateTarget(target, wm, frozen, PhasePRGate, budget, base.Add(budget+time.Minute))
+	if dec.Action != ActionSurfaceGateRepair {
+		t.Fatalf("PR-gate stall action = %q, want surface_gate_repair", dec.Action)
+	}
+	if dec.ReplayBoundary {
+		t.Fatalf("PR gate must not claim the durable-delivery replay boundary")
+	}
+	if !dec.RecommendsRecovery() {
+		t.Fatalf("PR-gate repair verdict was not retained as a recommendation")
+	}
+}
+
+func TestEvaluate_PostMergeVerificationSurfacesOutcomeRepairWithoutReplayBoundary(t *testing.T) {
+	budget := 20 * time.Minute
+	frozen := SignalSet{sig(SignalOutcomeVerification, "pr#893;merged;health=failing")}
+	target := Target{Kind: TargetPostMerge, IssueNumber: 887, Slot: "sup-318", SessionID: "spawn-1", LeaseID: "post-merge:pr:893"}
+	wm, _ := EvaluateTarget(target, Watermark{}, frozen, PhasePostMergeVerification, budget, base)
+
+	_, dec := EvaluateTarget(target, wm, frozen, PhasePostMergeVerification, budget, base.Add(budget+time.Minute))
+	if dec.Action != ActionSurfaceOutcomeRepair {
+		t.Fatalf("post-merge stall action = %q, want surface_outcome_repair", dec.Action)
+	}
+	if dec.ReplayBoundary {
+		t.Fatal("post-merge verification incorrectly claimed an uncertain executing-delivery boundary")
+	}
+	if dec.Action == ActionStopAndRetry {
+		t.Fatal("post-merge verification must never replay the implementation worker")
+	}
+}
+
+func TestEvaluate_DeliveryPendingSurfacesWaitWithoutReplayBoundary(t *testing.T) {
+	budget := 20 * time.Minute
+	target := Target{Kind: TargetDelivery, LeaseID: "approval:g1"}
+	frozen := SignalSet{sig(SignalDelivery, "pending")}
+	wm, _ := EvaluateTarget(target, Watermark{}, frozen, PhaseDeliveryPending, budget, base)
+	_, dec := EvaluateTarget(target, wm, frozen, PhaseDeliveryPending, budget, base.Add(budget+time.Minute))
+	if dec.Action != ActionSurfaceDeliveryWait {
+		t.Fatalf("pending delivery action = %q, want surface_delivery_wait", dec.Action)
+	}
+	if dec.ReplayBoundary {
+		t.Fatal("pending approval incorrectly claimed an uncertain executing-delivery boundary")
+	}
+}
+
+func TestEvaluateObservation_IncompleteEvidenceSuppressesRecoveryWithoutRearmingDeadline(t *testing.T) {
+	budget := 20 * time.Minute
+	target := Target{Kind: TargetWorker, IssueNumber: 887, Slot: "sup-318", SessionID: "spawn-1", ProcessID: 42, LeaseID: "spawn:1"}
+	frozen := SignalSet{sig(SignalProcessTmux, "pid=42"), sig(SignalWorktreeGit, "head=a")}
+	wm, _ := EvaluateTarget(target, Watermark{}, frozen, PhasePreDelivery, budget, base)
+	originalDeadline := wm.Deadline(budget)
+
+	incomplete := Observation{
+		Target: target, Signals: SignalSet{sig(SignalProcessTmux, "pid=42")}, Phase: PhasePreDelivery,
+		Incomplete: true, UnavailableSignals: []SignalKind{SignalWorktreeGit},
+	}
+	wm2, dec := EvaluateObservation(wm, incomplete, budget, base.Add(budget+time.Minute))
+	if dec.Action != ActionEvidenceUnavailable || dec.RecommendsRecovery() {
+		t.Fatalf("incomplete at-deadline decision = %+v, want non-destructive evidence_unavailable", dec)
+	}
+	if !dec.ObservationIncomplete || len(dec.UnavailableSignals) != 1 || dec.UnavailableSignals[0] != SignalWorktreeGit {
+		t.Fatalf("incomplete evidence not explicit: %+v", dec)
+	}
+	if !wm2.At.Equal(wm.At) || !dec.Deadline.Equal(originalDeadline) {
+		t.Fatalf("incomplete evidence rearmed deadline: before=%+v after=%+v decision=%+v", wm, wm2, dec)
+	}
+
+	// Once a complete unchanged observation returns, the original overdue
+	// episode is still overdue and may be recommended; failure did not buy time.
+	_, complete := EvaluateTarget(target, wm2, frozen, PhasePreDelivery, budget, base.Add(budget+2*time.Minute))
+	if complete.Action != ActionStopAndRetry || !complete.Deadline.Equal(originalDeadline) {
+		t.Fatalf("complete evidence did not resume original overdue episode: %+v", complete)
+	}
+}
+
 // Requirement: disabled timeout (0/absent) cannot recover — Evaluate reports
 // ActionDisabled and never kills, distinct from a live-but-quiet deadline.
 func TestEvaluate_DisabledBudget(t *testing.T) {
@@ -447,5 +527,15 @@ func TestTargetValidate_PRGateRejectsLiveProcessIdentity(t *testing.T) {
 	}
 	if err := target.Validate(); err == nil {
 		t.Fatal("PR-gate target with live process identity was accepted")
+	}
+}
+
+func TestTargetValidate_PostMergeRejectsLiveProcessIdentity(t *testing.T) {
+	target := Target{
+		Kind: TargetPostMerge, IssueNumber: 42, Slot: "3", SessionID: "started-at",
+		LeaseID: "post-merge:pr:7", ProcessID: 1234,
+	}
+	if err := target.Validate(); err == nil {
+		t.Fatal("post-merge target with live process identity was accepted")
 	}
 }

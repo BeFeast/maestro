@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/progress"
 	"github.com/befeast/maestro/internal/state"
 )
@@ -16,11 +17,11 @@ func TestCollectMaterialProgressObservations_ExactWorkersCannotMaskEachOther(t *
 	st := state.NewState()
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	st.Sessions["slot-a"] = &state.Session{
-		IssueNumber: 11, Status: state.StatusRunning, PID: 101, TmuxSession: "mae-a",
+		IssueNumber: 11, Status: state.StatusRunning, PID: 101,
 		StartedAt: t0.Add(-time.Hour), LastOutputHash: "frozen-a",
 	}
 	st.Sessions["slot-b"] = &state.Session{
-		IssueNumber: 12, Status: state.StatusRunning, PID: 202, TmuxSession: "mae-b",
+		IssueNumber: 12, Status: state.StatusRunning, PID: 202,
 		StartedAt: t0.Add(-30 * time.Minute), LastOutputHash: "output-b-1",
 	}
 
@@ -64,12 +65,11 @@ func TestCollectMaterialProgressObservations_ExactWorkersCannotMaskEachOther(t *
 func TestCollectMaterialProgressObservations_WorkerReplacementHasNewLease(t *testing.T) {
 	st := state.NewState()
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
-	sess := &state.Session{IssueNumber: 9, Status: state.StatusRunning, PID: 100, TmuxSession: "mae-9", StartedAt: t0}
+	sess := &state.Session{IssueNumber: 9, Status: state.StatusRunning, PID: 100, StartedAt: t0}
 	st.Sessions["slot-9"] = sess
 	first := collectMaterialProgressObservations(st, t0)
 
 	sess.PID = 200
-	sess.TmuxSession = "mae-9-retry"
 	sess.StartedAt = t0.Add(10 * time.Minute)
 	second := collectMaterialProgressObservations(st, t0.Add(10*time.Minute))
 	if len(first) != 1 || len(second) != 1 {
@@ -113,8 +113,93 @@ func TestCollectMaterialProgressObservations_PROpenNeverCarriesProcessIdentity(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decisions) != 1 || decisions[0].Action != progress.ActionSurfaceReconciliation {
-		t.Fatalf("overdue pr_gate decisions = %+v, want surface_reconciliation", decisions)
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionSurfaceGateRepair {
+		t.Fatalf("overdue pr_gate decisions = %+v, want surface_gate_repair", decisions)
+	}
+	if decisions[0].ReplayBoundary {
+		t.Fatalf("PR gate recommendation incorrectly claimed delivery replay boundary: %+v", decisions[0])
+	}
+}
+
+func TestCollectMaterialProgressObservations_QueuedRemainsAnActivePRGate(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	st.Sessions["slot-pr"] = &state.Session{
+		IssueNumber: 44, Status: state.StatusQueued, PRNumber: 893,
+		PID: 999, TmuxSession: "stale-tmux", StartedAt: now.Add(-time.Hour),
+		ReviewPendingHeadSHA: "abc123", LastNotifiedStatus: "merge_queued",
+	}
+	observations := collectMaterialProgressObservations(st, now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %d, want one queued PR gate", len(observations))
+	}
+	got := observations[0]
+	if got.Target.Kind != progress.TargetPRGate || got.Phase != progress.PhasePRGate {
+		t.Fatalf("queued target=%+v phase=%q, want pr_gate", got.Target, got.Phase)
+	}
+	if got.Target.ProcessID != 0 || got.Target.TmuxSession != "" {
+		t.Fatalf("queued PR gate leaked stale worker identity: %+v", got.Target)
+	}
+}
+
+func TestCollectMaterialProgressObservations_CodeLandedHasPostMergeOutcomeTarget(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	landedAt := now.Add(-time.Hour)
+	st.Sessions["slot-pr"] = &state.Session{
+		IssueNumber: 44, Status: state.StatusCodeLanded, PRNumber: 893,
+		PID: 999, TmuxSession: "stale-tmux", StartedAt: now.Add(-2 * time.Hour), FinishedAt: &landedAt,
+	}
+	st.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, Signal: "healthcheck", ExitCode: 1, CheckedAt: now}
+	observations := collectMaterialProgressObservations(st, now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %d, want one post-merge verification target", len(observations))
+	}
+	got := observations[0]
+	if got.Target.Kind != progress.TargetPostMerge || got.Phase != progress.PhasePostMergeVerification {
+		t.Fatalf("code_landed target=%+v phase=%q, want post_merge_verification", got.Target, got.Phase)
+	}
+	if got.Target.ProcessID != 0 || got.Target.TmuxSession != "" {
+		t.Fatalf("post-merge target leaked stale worker identity: %+v", got.Target)
+	}
+	if !signalKindPresent(got.Signals, progress.SignalOutcomeVerification) {
+		t.Fatalf("post-merge target lacks outcome evidence: %+v", got.Signals)
+	}
+
+	budget := 20 * time.Minute
+	if _, err := st.RecordMaterialProgress(observations, budget, time.Minute, now); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(budget + time.Minute)
+	decisions, err := st.RecordMaterialProgress(collectMaterialProgressObservations(st, later), budget, time.Minute, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionSurfaceOutcomeRepair || decisions[0].ReplayBoundary {
+		t.Fatalf("overdue post-merge decision = %+v, want no-replay outcome repair", decisions)
+	}
+
+	// Repeating the same failing check at a new poll timestamp is not progress.
+	st.OutcomeHealth.CheckedAt = later
+	laterAgain := later.Add(time.Minute)
+	decisions, err = st.RecordMaterialProgress(collectMaterialProgressObservations(st, laterAgain), budget, time.Minute, laterAgain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionSurfaceOutcomeRepair {
+		t.Fatalf("unchanged failing outcome poll masked stall: %+v", decisions)
+	}
+
+	// A semantic outcome transition is material progress and re-arms the gate.
+	st.OutcomeHealth.State = outcome.HealthHealthy
+	st.OutcomeHealth.ExitCode = 0
+	progressAt := laterAgain.Add(time.Minute)
+	decisions, err = st.RecordMaterialProgress(collectMaterialProgressObservations(st, progressAt), budget, time.Minute, progressAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionNone {
+		t.Fatalf("semantic outcome transition did not advance post-merge target: %+v", decisions)
 	}
 }
 
@@ -302,7 +387,7 @@ func TestCollectMaterialProgressObservations_SourceEditsAdvanceButGeneratedChurn
 	st := state.NewState()
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	st.Sessions["slot"] = &state.Session{
-		IssueNumber: 7, Status: state.StatusRunning, PID: 77, TmuxSession: "mae-7",
+		IssueNumber: 7, Status: state.StatusRunning, PID: 77,
 		StartedAt: t0.Add(-time.Hour), LastOutputHash: "frozen", Worktree: wt,
 	}
 	budget := 20 * time.Minute
@@ -343,9 +428,111 @@ func TestCollectMaterialProgressObservations_SourceEditsAdvanceButGeneratedChurn
 	}
 }
 
+func TestCollectMaterialProgressObservations_LiveExactTmuxAdvancesWithFrozenGitAndPersistedHash(t *testing.T) {
+	bin := t.TempDir()
+	outputPath := filepath.Join(bin, "output")
+	script := filepath.Join(bin, "tmux")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact" ]; then
+  exit 91
+fi
+if [ "${TMUX_FAKE_FAIL:-}" = "1" ]; then
+  exit 92
+fi
+cat "$TMUX_FAKE_OUTPUT"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("first pane\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMUX_FAKE_OUTPUT", outputPath)
+
+	wt := initMaterialProgressGitRepo(t)
+	st := state.NewState()
+	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	st.Sessions["slot"] = &state.Session{
+		IssueNumber: 7, Status: state.StatusRunning, PID: 77, TmuxSession: "mae-exact",
+		StartedAt: t0.Add(-time.Hour), LastOutputHash: "persisted-frozen", Worktree: wt,
+	}
+	first := collectMaterialProgressObservations(st, t0)
+	if len(first) != 1 || first[0].Incomplete {
+		t.Fatalf("first exact-tmux observation = %+v, want complete", first)
+	}
+	budget := 20 * time.Minute
+	if _, err := st.RecordMaterialProgress(first, budget, time.Minute, t0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Neither Git nor the persisted legacy LastOutputHash changes. Fresh bounded
+	// output from the exact tmux session is independently material progress.
+	if err := os.WriteFile(outputPath, []byte("second pane\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t1 := t0.Add(budget + time.Minute)
+	decisions, err := st.RecordMaterialProgress(collectMaterialProgressObservations(st, t1), budget, time.Minute, t1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionNone {
+		t.Fatalf("live tmux change with frozen Git/hash = %+v, want material progress", decisions)
+	}
+
+	// A later tmux probe failure is explicit incomplete evidence and suppresses
+	// recovery at the unchanged deadline instead of silently omitting the signal.
+	t.Setenv("TMUX_FAKE_FAIL", "1")
+	t2 := t1.Add(budget + time.Minute)
+	observations := collectMaterialProgressObservations(st, t2)
+	if len(observations) != 1 || !observations[0].Incomplete || !signalKindListed(observations[0].UnavailableSignals, progress.SignalTerminalCheckpoint) {
+		t.Fatalf("tmux failure was not explicit incomplete evidence: %+v", observations)
+	}
+	decisions, err = st.RecordMaterialProgress(observations, budget, time.Minute, t2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionEvidenceUnavailable || decisions[0].RecommendsRecovery() {
+		t.Fatalf("tmux failure authorized recovery: %+v", decisions)
+	}
+}
+
+func TestTmuxProgressFingerprint_TimeoutAndOverflowAreIncomplete(t *testing.T) {
+	bin := t.TempDir()
+	script := filepath.Join(bin, "tmux")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+if [ "${TMUX_FAKE_SLEEP:-}" = "1" ]; then
+  exec sleep 2
+fi
+cat "$TMUX_FAKE_OUTPUT"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(bin, "output")
+	if err := os.WriteFile(outputPath, make([]byte, tmuxProgressMaxOutputBytes+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMUX_FAKE_OUTPUT", outputPath)
+	if got, complete := tmuxProgressFingerprint("mae-exact"); got != "" || complete {
+		t.Fatalf("overflow probe = (%q,%t), want explicit incomplete", got, complete)
+	}
+
+	oldTimeout := tmuxProgressTimeout
+	tmuxProgressTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { tmuxProgressTimeout = oldTimeout })
+	t.Setenv("TMUX_FAKE_SLEEP", "1")
+	if got, complete := tmuxProgressFingerprint("mae-exact"); got != "" || complete {
+		t.Fatalf("timeout probe = (%q,%t), want explicit incomplete", got, complete)
+	}
+}
+
 func TestWorktreeProgressFingerprint_NonRepositoryIsAbsent(t *testing.T) {
-	if got := worktreeProgressFingerprint(t.TempDir()); got != "" {
+	dir := t.TempDir()
+	if got := worktreeProgressFingerprint(dir); got != "" {
 		t.Fatalf("non-Git directory fingerprint = %q, want absent", got)
+	}
+	if got, complete := worktreeProgressProbe(dir); got != "" || complete {
+		t.Fatalf("non-Git configured probe = (%q,%t), want explicit incomplete", got, complete)
 	}
 }
 
@@ -360,6 +547,15 @@ func decisionsBySlot(decisions []progress.Decision) map[string]progress.Decision
 func signalKindPresent(signals progress.SignalSet, kind progress.SignalKind) bool {
 	for _, signal := range signals.Present() {
 		if signal.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func signalKindListed(signals []progress.SignalKind, kind progress.SignalKind) bool {
+	for _, signal := range signals {
+		if signal == kind {
 			return true
 		}
 	}

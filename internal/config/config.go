@@ -1663,8 +1663,8 @@ func (c SessionRetentionConfig) EffectiveArchiveFile(stateDir string) string {
 // recover a genuinely hung-but-alive worker. The watchdog instead derives one
 // material-progress watermark from whichever phase-appropriate signals are
 // present (issue/session + lease, process/tmux identity, terminal/checkpoint,
-// bounded git evidence, PR/CI/review, delivery lease) and only acts when *no*
-// signal has advanced for the whole silence budget.
+// bounded git evidence, PR/CI/review, delivery lease) and only recommends an
+// action when *no* signal has advanced for the whole silence budget.
 //
 // The default is a 20-minute maximum silence for new hands-off projects. A
 // stall in a safe pre-delivery phase asks the orchestrator to stop the single
@@ -1672,22 +1672,24 @@ func (c SessionRetentionConfig) EffectiveArchiveFile(stateDir string) string {
 // executing/uncertain delivery lease is surfaced for operator reconciliation
 // and never replayed (#872).
 type StalledProgressWatchdogConfig struct {
-	Enabled           *bool `yaml:"enabled,omitempty"`               // default: true for new hands-off projects
+	Enabled           *bool `yaml:"enabled,omitempty"`               // explicit opt-in; lifecycle/genesis templates set true for hands-off projects
 	MaxSilenceMinutes int   `yaml:"max_silence_minutes,omitempty"`   // default: 20 (0 = default; negative = disabled)
 	EvalIntervalSecs  int   `yaml:"eval_interval_seconds,omitempty"` // watchdog evaluation cadence; default: 60
 }
 
-// IsEnabled reports whether the stalled-progress watchdog runs. Default true —
-// a hands-off project without an explicit opt-out gets the liveness contract.
+// IsEnabled reports whether the stalled-progress watchdog is explicitly
+// enabled. Missing config is inactive: upgrading Maestro must not silently arm
+// recovery across every legacy project. Lifecycle/genesis templates opt new
+// hands-off projects in with enabled: true.
 func (c StalledProgressWatchdogConfig) IsEnabled() bool {
 	if c.Enabled == nil {
-		return true
+		return false
 	}
 	return *c.Enabled
 }
 
 // EffectiveMaxSilence returns the maximum silence budget before the watchdog
-// acts. A zero MaxSilenceMinutes means "use the 20-minute default"; a negative
+// recommends an action. A zero MaxSilenceMinutes means "use the 20-minute default"; a negative
 // value (or a disabled watchdog) returns 0, which the evaluator treats as
 // "disabled" so no quiet worker is ever killed by a misconfiguration.
 func (c StalledProgressWatchdogConfig) EffectiveMaxSilence() time.Duration {
@@ -1708,6 +1710,42 @@ func (c StalledProgressWatchdogConfig) EffectiveEvalInterval() time.Duration {
 		return 60 * time.Second
 	}
 	return time.Duration(c.EvalIntervalSecs) * time.Second
+}
+
+// IsActive reports whether the v1 stalled-progress watchdog evaluator is armed.
+// It is deliberately stronger than IsEnabled:
+// an explicit negative silence budget is an operator disable, even when the
+// enabled flag was omitted. Fleet and runtime scheduling use this method so
+// they never advertise or run a watchdog whose effective budget is zero.
+func (c StalledProgressWatchdogConfig) IsActive() bool {
+	return c.EffectiveMaxSilence() > 0
+}
+
+// EffectiveWorkerSilentTimeout returns the deprecated terminal-output-only
+// timeout only when the v1 stalled-progress watchdog is inactive. The two
+// detectors must never run in parallel: doing so lets the legacy detector kill
+// a worker that the multi-signal watchdog correctly sees editing its worktree.
+//
+// Parsed legacy-only configs are migrated to the v1 silence budget below, but
+// this runtime guard also protects programmatically-constructed configs and an
+// older config object during a hot reload.
+func (c *Config) EffectiveWorkerSilentTimeout() time.Duration {
+	if c == nil || c.StalledProgressWatchdog.suppressesLegacyTimeout() || c.WorkerSilentTimeoutMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(c.WorkerSilentTimeoutMinutes) * time.Minute
+}
+
+// suppressesLegacyTimeout is intentionally based on explicit v1 configuration,
+// not IsActive. An enabled:true stanza with an invalid/negative budget must fail
+// closed; otherwise the new watchdog is disabled while the deprecated terminal-
+// only killer unexpectedly remains armed. enabled:false is the sole deliberate
+// compatibility escape hatch.
+func (c StalledProgressWatchdogConfig) suppressesLegacyTimeout() bool {
+	if c.Enabled != nil {
+		return *c.Enabled
+	}
+	return c.MaxSilenceMinutes != 0 || c.EvalIntervalSecs != 0
 }
 
 // ManagementHomeKind enumerates the supported management-home backends (#869).
@@ -1848,7 +1886,7 @@ type Config struct {
 	MaxConcurrentByState            map[string]int                `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
 	MaxRuntimeMinutes               int                           `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes      int                           `yaml:"worker_silent_timeout_minutes"` // deprecated (#887): terminal-output-only kill; superseded by stalled_progress_watchdog. Kills a running worker if tmux output hash doesn't change for N minutes (0 = disabled)
-	StalledProgressWatchdog         StalledProgressWatchdogConfig `yaml:"stalled_progress_watchdog"`     // #887: durable multi-signal stalled-progress watchdog (default 20-minute max silence for hands-off projects)
+	StalledProgressWatchdog         StalledProgressWatchdogConfig `yaml:"stalled_progress_watchdog"`     // #887: explicit-opt-in durable multi-signal watchdog (20-minute max silence when enabled with no override)
 	WorkerMaxTokens                 int                           `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
 	WorkerSoftTokenThreshold        *float64                      `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens to trigger checkpoint+respawn (default: 0.8, 0 = disabled)
 	MaxRetriesPerIssue              int                           `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
@@ -1896,6 +1934,10 @@ type Config struct {
 	StaleSessionReconciler          StaleSessionReconcilerConfig  `yaml:"stale_session_reconciler"` // filter stale supervisor sessions from operator attention
 	SessionRetention                SessionRetentionConfig        `yaml:"session_retention"`        // #497: bound state.Sessions growth via terminal-session compaction
 	SourcePath                      string                        `yaml:"-"`                        // path the config was loaded from (not serialized)
+	// RuntimeSuperviseIntervalSeconds is injected by the daemon from the actual
+	// Options.SuperviseInterval that owns the running loop. It is runtime-only:
+	// project YAML cannot claim a cadence the daemon did not schedule.
+	RuntimeSuperviseIntervalSeconds int `yaml:"-" json:"-"`
 	// SettingsSources records, per fleet-controllable settings key (#839), which
 	// layer supplied the effective value: "project" (the project's own YAML),
 	// "fleet" (a config-store settings default), or "builtin". Populated by
@@ -2061,7 +2103,28 @@ func parse(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	var rawRoot yaml.Node
+	_ = yaml.Unmarshal(data, &rawRoot) // the successful decode above already validated YAML
+	v1StanzaPresent := yamlMappingValue(&rawRoot, "stalled_progress_watchdog") != nil
 
+	// #887 legacy migration / mutual exclusion. A legacy-only timeout is an
+	// existing operator opt-in, so migrate its chosen budget to v1 and mark v1
+	// explicitly enabled. Any explicit v1 stanza wins and suppresses legacy even
+	// when its budget disables v1; otherwise enabled:true + max_silence:-1 would
+	// unexpectedly leave the unsafe terminal-only killer armed. Explicit
+	// enabled:false is the sole compatibility escape hatch. No parse result can
+	// run both paths.
+	if cfg.WorkerSilentTimeoutMinutes > 0 {
+		explicitV1Disable := cfg.StalledProgressWatchdog.Enabled != nil && !*cfg.StalledProgressWatchdog.Enabled
+		if !v1StanzaPresent {
+			enabled := true
+			cfg.StalledProgressWatchdog.Enabled = &enabled
+			cfg.StalledProgressWatchdog.MaxSilenceMinutes = cfg.WorkerSilentTimeoutMinutes
+			cfg.WorkerSilentTimeoutMinutes = 0
+		} else if !explicitV1Disable {
+			cfg.WorkerSilentTimeoutMinutes = 0
+		}
+	}
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
 	}
