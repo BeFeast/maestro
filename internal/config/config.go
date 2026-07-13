@@ -602,7 +602,132 @@ const (
 	// dispatcher spawns a scoped opus repair worker keyed on
 	// (pr_number, head_sha) so the same head is never re-attempted.
 	SupervisorActionSpawnReviewRepair = "spawn_review_repair"
+	// SupervisorActionDeployProject is the #872 approval-gated post-merge
+	// delivery verb. In delivery.mode=approval_required a qualifying merge
+	// enqueues this approval carrying the exact merged revision plus
+	// operator-safe target/rollback/verification context; only an operator
+	// approve runs the project's deploy/install command and live verifier.
+	// The approver runs it exactly once behind a durable approved→executing
+	// claim so a daemon restart cannot replay an in-flight delivery.
+	SupervisorActionDeployProject = "deploy_project"
 )
+
+// DeliveryMode selects the post-merge delivery behavior for a project (#872).
+type DeliveryMode string
+
+const (
+	// DeliveryModeDisabled runs no post-merge delivery.
+	DeliveryModeDisabled DeliveryMode = "disabled"
+	// DeliveryModeApprovalRequired enqueues a pending deploy_project approval
+	// after a qualifying merge and executes the delivery command only when an
+	// operator approves it. This is the default for a project that configures
+	// a delivery command via the new block without naming a mode.
+	DeliveryModeApprovalRequired DeliveryMode = "approval_required"
+	// DeliveryModeAutomatic runs the delivery command immediately after a
+	// qualifying merge — the legacy deploy_cmd behavior, retained for
+	// back-compat and only reachable by an explicit per-project opt-in.
+	DeliveryModeAutomatic DeliveryMode = "automatic"
+)
+
+// DeliveryConfig is the #872 approval-gated post-merge delivery block. It
+// supersedes the legacy top-level deploy_cmd/deploy_timeout_minutes fields
+// (which fold into DeliveryModeAutomatic for back-compat via
+// Config.EffectiveDelivery). A fresh project should set delivery.mode:
+// approval_required so a merged revision creates an auditable approval instead
+// of an immediate, unattended deploy.
+type DeliveryConfig struct {
+	// Mode is disabled | approval_required | automatic. Empty defaults to
+	// approval_required when a Command is set (the safe default), else disabled.
+	Mode DeliveryMode `yaml:"mode" json:"mode,omitempty"`
+	// Command is the deploy/install shell command run from LocalPath.
+	Command string `yaml:"command" json:"command,omitempty"`
+	// TimeoutMinutes bounds Command (and VerifyCommand). Default 15.
+	TimeoutMinutes int `yaml:"timeout_minutes" json:"timeout_minutes,omitempty"`
+	// Target is an operator-safe label for the delivery destination shown in
+	// the approval/history (e.g. "prod web", "kiosk fleet"). Never a secret.
+	Target string `yaml:"target" json:"target,omitempty"`
+	// Rollback is a human rollback reference shown in the approval so an
+	// operator knows how to undo the delivery.
+	Rollback string `yaml:"rollback" json:"rollback,omitempty"`
+	// VerifyCommand is the live/deployment verifier run after Command
+	// succeeds. A non-zero exit marks the delivery execution_failed.
+	VerifyCommand string `yaml:"verify_command" json:"verify_command,omitempty"`
+}
+
+// deliveryTimeoutDefaultMinutes is the fallback delivery timeout.
+const deliveryTimeoutDefaultMinutes = 15
+
+// EffectiveDelivery resolves the delivery configuration for a project, folding
+// the legacy deploy_cmd/deploy_timeout_minutes fields into an automatic-mode
+// DeliveryConfig for back-compat (#872). Resolution order:
+//
+//   - an explicit delivery block wins; an empty delivery.mode defaults to
+//     approval_required when a command is present (safe default) and disabled
+//     when it is not;
+//   - otherwise a legacy deploy_cmd maps to DeliveryModeAutomatic so existing
+//     fleet projects keep firing their deploy immediately after merge with no
+//     silent behavior change (Config.Warnings surfaces the deprecation);
+//   - otherwise delivery is disabled.
+//
+// The returned config always carries a normalized TimeoutMinutes.
+func (c *Config) EffectiveDelivery() DeliveryConfig {
+	if c == nil {
+		return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: deliveryTimeoutDefaultMinutes}
+	}
+	d := c.Delivery
+	if d.configured() {
+		if strings.TrimSpace(string(d.Mode)) == "" {
+			if strings.TrimSpace(d.Command) != "" {
+				d.Mode = DeliveryModeApprovalRequired
+			} else {
+				d.Mode = DeliveryModeDisabled
+			}
+		}
+		d.TimeoutMinutes = normalizeDeliveryTimeout(d.TimeoutMinutes)
+		return d
+	}
+	if strings.TrimSpace(c.DeployCmd) != "" {
+		return DeliveryConfig{
+			Mode:           DeliveryModeAutomatic,
+			Command:        c.DeployCmd,
+			TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes),
+		}
+	}
+	return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes)}
+}
+
+// configured reports whether the operator set any field of the delivery block.
+func (d DeliveryConfig) configured() bool {
+	return strings.TrimSpace(string(d.Mode)) != "" ||
+		strings.TrimSpace(d.Command) != "" ||
+		d.TimeoutMinutes != 0 ||
+		strings.TrimSpace(d.Target) != "" ||
+		strings.TrimSpace(d.Rollback) != "" ||
+		strings.TrimSpace(d.VerifyCommand) != ""
+}
+
+// EffectiveTimeout returns the delivery command timeout as a duration.
+func (d DeliveryConfig) EffectiveTimeout() time.Duration {
+	return time.Duration(normalizeDeliveryTimeout(d.TimeoutMinutes)) * time.Minute
+}
+
+// ValidMode reports whether Mode is one of the three modeled delivery modes.
+// An empty mode is valid (it resolves via EffectiveDelivery).
+func (d DeliveryConfig) ValidMode() bool {
+	switch d.Mode {
+	case "", DeliveryModeDisabled, DeliveryModeApprovalRequired, DeliveryModeAutomatic:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeDeliveryTimeout(min int) int {
+	if min <= 0 {
+		return deliveryTimeoutDefaultMinutes
+	}
+	return min
+}
 
 // SupervisorConfig defines local policy for supervisor decisions.
 type SupervisorConfig struct {
@@ -1608,8 +1733,9 @@ type Config struct {
 	StateDir                        string                       `yaml:"state_dir"`           // state/log directory (default: ~/.maestro/<repo-hash>)
 	Model                           ModelConfig                  `yaml:"model"`
 	Routing                         RoutingConfig                `yaml:"routing"`
-	DeployCmd                       string                       `yaml:"deploy_cmd"`                         // shell command to run after successful PR merge
+	DeployCmd                       string                       `yaml:"deploy_cmd"`                         // deprecated (#872): legacy automatic post-merge deploy; folds into delivery.mode=automatic via EffectiveDelivery
 	DeployTimeoutMinutes            int                          `yaml:"deploy_timeout_minutes"`             // timeout for deploy command in minutes (default: 15)
+	Delivery                        DeliveryConfig               `yaml:"delivery"`                           // #872: approval-gated post-merge delivery (disabled|approval_required|automatic)
 	MergeStrategy                   string                       `yaml:"merge_strategy"`                     // "sequential" | "parallel"
 	MergeIntervalSeconds            int                          `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
 	ReviewGate                      string                       `yaml:"review_gate"`                        // "greptile" (default) | "none"
@@ -2374,7 +2500,43 @@ func (c *Config) Warnings() []string {
 	if msg := c.verifyVisualWarning(); msg != "" {
 		warnings = append(warnings, msg)
 	}
+	warnings = append(warnings, c.deliveryWarnings()...)
 	return warnings
+}
+
+// deliveryWarnings surfaces the #872 delivery-block misconfigurations at load
+// time:
+//
+//   - a legacy deploy_cmd (with no explicit delivery block) still runs
+//     automatically after every merge — retained for back-compat but loud, so
+//     an operator migrates to delivery.mode: approval_required deliberately;
+//   - delivery.mode: automatic runs an unattended deploy on every merge — the
+//     opt-out from the approval gate, worth naming so it is never a silent
+//     default;
+//   - an invalid delivery.mode is rejected loudly rather than silently
+//     resolving to a surprising behavior;
+//   - a delivery block that names no command is inert.
+func (c *Config) deliveryWarnings() []string {
+	if c == nil {
+		return nil
+	}
+	var out []string
+	legacy := strings.TrimSpace(c.DeployCmd) != "" && !c.Delivery.configured()
+	if legacy {
+		out = append(out, "config: deploy_cmd is deprecated (#872) — it runs an unattended deploy automatically after every merge (delivery.mode=automatic). Migrate to a delivery: block with mode: approval_required so a merged revision creates an auditable approval before the deploy runs.")
+	}
+	if !c.Delivery.ValidMode() {
+		out = append(out, fmt.Sprintf("config: delivery.mode %q is invalid — must be one of disabled, approval_required, automatic.", c.Delivery.Mode))
+		return out
+	}
+	eff := c.EffectiveDelivery()
+	if eff.Mode == DeliveryModeAutomatic && c.Delivery.configured() {
+		out = append(out, "config: delivery.mode: automatic runs the delivery command with no approval on every qualifying merge — the opt-out from the #872 approval gate. Use delivery.mode: approval_required unless unattended delivery is intended.")
+	}
+	if c.Delivery.configured() && strings.TrimSpace(c.Delivery.Command) == "" && c.Delivery.Mode != DeliveryModeDisabled {
+		out = append(out, "config: a delivery: block is set but delivery.command is empty — no delivery will run. Set delivery.command or remove the block.")
+	}
+	return out
 }
 
 // verifyVisualWarning surfaces a verify.visual block that is enabled but

@@ -1000,6 +1000,13 @@ const (
 	// Distinct from execution_skipped (which means "no action will
 	// happen") so dedup can keep it as a still-effective record.
 	ApprovalStatusAwaitingDispatch ApprovalStatus = "awaiting_dispatch"
+	// ApprovalStatusExecuting is the durable claim an executor takes on an
+	// approved delivery (deploy_project) BEFORE any external side effect
+	// (#872 safety addendum). Exactly one executor wins the approved→executing
+	// transition; a daemon restart that observes an executing row must NOT
+	// replay it — the executor only claims from approved, so an executing row
+	// is skipped and surfaced for operator reconciliation instead.
+	ApprovalStatusExecuting ApprovalStatus = "executing"
 )
 
 const (
@@ -1012,6 +1019,9 @@ const (
 	ApprovalAuditExecutionFailed  = "execution_failed"
 	ApprovalAuditExecutionSkipped = "execution_skipped"
 	ApprovalAuditAwaitingDispatch = "awaiting_dispatch"
+	// ApprovalAuditExecuting records the durable approved→executing claim on a
+	// delivery approval (#872).
+	ApprovalAuditExecuting = "executing"
 )
 
 const (
@@ -1020,6 +1030,9 @@ const (
 	approvalActionSpawnWorker       = "spawn_worker"
 	approvalActionSpawnRepairWorker = "spawn_repair_worker"
 	approvalActionSpawnReviewRepair = "spawn_review_repair"
+	// ApprovalActionDeployProject is the #872 approval-gated post-merge
+	// delivery verb (kept in lockstep with config.SupervisorActionDeployProject).
+	ApprovalActionDeployProject = "deploy_project"
 )
 
 // Approval records a risky supervisor decision that needs explicit resolution.
@@ -1059,6 +1072,66 @@ type Approval struct {
 	// lets the dispatcher converge on exactly one worker without a coincident
 	// latest supervisor decision. nil for every non-review-repair approval.
 	ReviewRepair *SupervisorReviewRepairPayload `json:"review_repair,omitempty"`
+
+	// Delivery carries the #872 approval-gated post-merge delivery payload for
+	// a deploy_project approval: the exact merged revision plus operator-safe
+	// target/rollback/verification context, and (once executed) the recorded
+	// start/end/result. Nil on every other verb. It is part of
+	// ComputePayloadHash so a superseding merge (a different MergedSHA) can
+	// never be approved into deploying the stale revision.
+	Delivery *DeliveryPayload `json:"delivery,omitempty"`
+}
+
+// DeliveryPayload is the operator-safe, self-describing context a
+// deploy_project approval carries (#872). Everything here is safe to show in
+// the approval, history, and Fleet API: the raw delivery command and any
+// secrets it reads are deliberately NOT stored — the executor reads the command
+// from config at execute time and only a sanitized CommandPreview is persisted.
+type DeliveryPayload struct {
+	Project   string `json:"project,omitempty"`
+	Repo      string `json:"repo,omitempty"`
+	PR        int    `json:"pr,omitempty"`
+	Issue     int    `json:"issue,omitempty"`
+	MergedSHA string `json:"merged_sha"`           // exact merge commit, pinned at mint
+	LocalPath string `json:"local_path,omitempty"` // checkout the command runs in
+	Target    string `json:"target,omitempty"`     // operator-safe destination label
+
+	// CommandPreview is a sanitized, human-facing rendering of the delivery
+	// command. The executor never runs it — it runs the command resolved from
+	// config — so a secret accidentally inlined into the command never has to
+	// live in the durable approval record.
+	CommandPreview   string `json:"command_preview,omitempty"`
+	VerifyPreview    string `json:"verify_preview,omitempty"`
+	Rollback         string `json:"rollback,omitempty"`
+	VerificationPlan string `json:"verification_plan,omitempty"`
+	TimeoutMinutes   int    `json:"timeout_minutes,omitempty"`
+
+	// Release/Artifact/Digest are optional known delivery coordinates surfaced
+	// when the project's merge metadata provides them.
+	Release  string `json:"release,omitempty"`
+	Artifact string `json:"artifact,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+
+	// Execution result — populated only after the executor runs.
+	StartedAt    time.Time `json:"started_at,omitempty"`
+	FinishedAt   time.Time `json:"finished_at,omitempty"`
+	Output       string    `json:"output,omitempty"`        // bounded + sanitized
+	VerifyOutput string    `json:"verify_output,omitempty"` // bounded + sanitized
+	ExitError    string    `json:"exit_error,omitempty"`
+	Verified     bool      `json:"verified,omitempty"`
+	// ExecutedRevision is the revision that was actually checked out at
+	// execute time. It equals MergedSHA on a clean run; a mismatch fails the
+	// delivery before any command runs (never deploy whatever is at LocalPath).
+	ExecutedRevision string `json:"executed_revision,omitempty"`
+}
+
+// Clone returns a deep copy of the payload (all fields are value types).
+func (p *DeliveryPayload) Clone() *DeliveryPayload {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	return &cp
 }
 
 type ApprovalAudit struct {
@@ -3074,6 +3147,7 @@ func (a Approval) ComputePayloadHash() string {
 		Risk:             a.Risk,
 		Evidence:         a.Evidence,
 		LessonProposalID: a.LessonProposalID,
+		Delivery:         a.Delivery.identity(),
 	})
 }
 
@@ -3108,13 +3182,61 @@ func (s *State) ApprovalTargetStateHash(target *SupervisorTarget) string {
 }
 
 type approvalPayload struct {
-	DecisionID       string            `json:"decision_id,omitempty"`
-	Action           string            `json:"action"`
-	Target           *SupervisorTarget `json:"target,omitempty"`
-	Summary          string            `json:"summary"`
-	Risk             string            `json:"risk"`
-	Evidence         []string          `json:"evidence,omitempty"`
-	LessonProposalID string            `json:"lesson_proposal_id,omitempty"`
+	DecisionID       string                   `json:"decision_id,omitempty"`
+	Action           string                   `json:"action"`
+	Target           *SupervisorTarget        `json:"target,omitempty"`
+	Summary          string                   `json:"summary"`
+	Risk             string                   `json:"risk"`
+	Evidence         []string                 `json:"evidence,omitempty"`
+	LessonProposalID string                   `json:"lesson_proposal_id,omitempty"`
+	Delivery         *deliveryPayloadIdentity `json:"delivery,omitempty"`
+}
+
+// deliveryPayloadIdentity is the immutable subset of a DeliveryPayload folded
+// into ComputePayloadHash. It deliberately excludes the mutable execution
+// result (output, timings, verified) so recording a run does not drift the
+// payload hash and stale the approval mid-flight, while the pinned MergedSHA
+// (and target/rollback/preview) IS hashed so a superseding merge for a
+// different revision is a genuinely different payload.
+type deliveryPayloadIdentity struct {
+	Project          string `json:"project,omitempty"`
+	Repo             string `json:"repo,omitempty"`
+	PR               int    `json:"pr,omitempty"`
+	Issue            int    `json:"issue,omitempty"`
+	MergedSHA        string `json:"merged_sha"`
+	LocalPath        string `json:"local_path,omitempty"`
+	Target           string `json:"target,omitempty"`
+	CommandPreview   string `json:"command_preview,omitempty"`
+	VerifyPreview    string `json:"verify_preview,omitempty"`
+	Rollback         string `json:"rollback,omitempty"`
+	VerificationPlan string `json:"verification_plan,omitempty"`
+	TimeoutMinutes   int    `json:"timeout_minutes,omitempty"`
+	Release          string `json:"release,omitempty"`
+	Artifact         string `json:"artifact,omitempty"`
+	Digest           string `json:"digest,omitempty"`
+}
+
+func (p *DeliveryPayload) identity() *deliveryPayloadIdentity {
+	if p == nil {
+		return nil
+	}
+	return &deliveryPayloadIdentity{
+		Project:          p.Project,
+		Repo:             p.Repo,
+		PR:               p.PR,
+		Issue:            p.Issue,
+		MergedSHA:        p.MergedSHA,
+		LocalPath:        p.LocalPath,
+		Target:           p.Target,
+		CommandPreview:   p.CommandPreview,
+		VerifyPreview:    p.VerifyPreview,
+		Rollback:         p.Rollback,
+		VerificationPlan: p.VerificationPlan,
+		TimeoutMinutes:   p.TimeoutMinutes,
+		Release:          p.Release,
+		Artifact:         p.Artifact,
+		Digest:           p.Digest,
+	}
 }
 
 type approvalTargetStateSnapshot struct {

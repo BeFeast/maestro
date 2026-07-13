@@ -72,6 +72,14 @@ var KnownApprovalActions = map[string]struct{}{
 	// starved. Note: the safe-action alias "add_ready_label" stays OUT of
 	// this registry (it is a safe action, never an approval mint).
 	"label_issue_ready": {},
+	// #872: approval-gated post-merge delivery. Unlike the other verbs this one
+	// is NOT dispatched by Executor.Execute — it needs the durable
+	// approved→executing store claim before its side effect, so it runs through
+	// the dedicated DeliveryExecutor (delivery.go). It is registered here so the
+	// at-mint guard accepts the verb; dispatchAction routes it to
+	// execution_skipped with a clear "use the delivery executor" summary rather
+	// than the unknown-action failure.
+	"deploy_project": {},
 }
 
 // KnownSafeActions is the canonical set of safe (non-approval-gated)

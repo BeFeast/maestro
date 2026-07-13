@@ -547,6 +547,109 @@ func (s *Store) markTerminal(ctx context.Context, stateDir, id string, target st
 	return a, nil
 }
 
+// ClaimExecuting takes the durable approved → executing claim on a delivery
+// approval (#872 safety addendum). It is the transactional primitive the daemon
+// and CLI delivery executors contend on BEFORE any external side effect: with
+// the same claim-once UPDATE ... WHERE status='approved' guard, exactly one
+// caller observes rows-affected==1 and proceeds to run the delivery; every
+// other caller — including this process after a crash-and-restart — sees a
+// non-approved row and returns state.ErrApprovalNotApproved, so an in-flight or
+// completed delivery is never replayed automatically. scoped to one state_dir.
+func (s *Store) ClaimExecuting(ctx context.Context, stateDir, id string, now time.Time, actor, reason string) (*state.Approval, error) {
+	return s.markFrom(ctx, stateDir, id, state.ApprovalStatusApproved, state.ApprovalStatusExecuting, state.ApprovalAuditExecuting, state.ErrApprovalNotApproved, now, actor, reason, nil)
+}
+
+// FinishDelivery records the terminal result of a claimed delivery, moving it
+// executing → executed (success) or execution_failed. It persists the
+// caller-provided result payload (sanitized output, timings, verified flag)
+// into the stored approval_json so the Fleet API/history reflect the run. The
+// atomic UPDATE ... WHERE status='executing' guard keeps the result record
+// idempotent: a second caller sees state.ErrApprovalNotExecuting and does not
+// double-record.
+func (s *Store) FinishDelivery(ctx context.Context, stateDir, id string, success bool, result *state.DeliveryPayload, now time.Time, actor, summary string) (*state.Approval, error) {
+	target := state.ApprovalStatusExecuted
+	event := state.ApprovalAuditExecuted
+	if !success {
+		target = state.ApprovalStatusExecutionFailed
+		event = state.ApprovalAuditExecutionFailed
+	}
+	mutate := func(a *state.Approval) {
+		if result != nil {
+			a.Delivery = result.Clone()
+		}
+	}
+	return s.markFrom(ctx, stateDir, id, state.ApprovalStatusExecuting, target, event, state.ErrApprovalNotExecuting, now, actor, summary, mutate)
+}
+
+// markFrom is the generalized single-source claim/transition: it atomically
+// moves id from `from` to `target` behind UPDATE ... WHERE status=from, appends
+// an audit entry, applies the optional mutate to the loaded approval before
+// persisting its JSON, and returns notReady (unchanged) when the row is not in
+// `from`. It generalizes markTerminal (which is from=approved) so the delivery
+// executing claim/finish transitions reuse the same claim-once machinery.
+func (s *Store) markFrom(ctx context.Context, stateDir, id string, from, target state.ApprovalStatus, event string, notReady error, now time.Time, actor, reason string, mutate func(*state.Approval)) (*state.Approval, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	a, b, err := loadApprovalTx(ctx, tx, stateDir, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, state.ErrApprovalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if a.Status != from {
+		return a, notReady
+	}
+
+	now = normalize(now)
+	res, err := tx.ExecContext(ctx,
+		`UPDATE approvals SET status = ?, updated_at = ? WHERE state_dir = ? AND id = ? AND status = ?`,
+		string(target), formatTime(now), stateDir, id, string(from))
+	if err != nil {
+		return a, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return a, err
+	}
+	if n != 1 {
+		reloaded, _, lerr := loadApprovalTx(ctx, tx, stateDir, id)
+		if lerr == nil {
+			a = reloaded
+		}
+		return a, notReady
+	}
+
+	if mutate != nil {
+		mutate(a)
+	}
+	a.Status = target
+	a.UpdatedAt = now
+	audit := state.ApprovalAudit{
+		At:              now,
+		Event:           event,
+		Actor:           actor,
+		Reason:          reason,
+		PayloadHash:     a.PayloadHash,
+		TargetStateHash: a.TargetStateHash,
+	}
+	a.Audit = append(a.Audit, audit)
+	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
+		return a, err
+	}
+	if err := insertAuditTx(ctx, tx, id, b, audit); err != nil {
+		return a, err
+	}
+	if err := tx.Commit(); err != nil {
+		return a, err
+	}
+	return a, nil
+}
+
 // MarkStale idempotently reconciles a moot approval to the terminal `stale`
 // status in SQLite, mirroring state.markApprovalStale. It is the SQLite half of
 // the #866 fix: when the orchestrator stales a spawn_repair_worker approval in

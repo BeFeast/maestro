@@ -19,11 +19,16 @@
 package selfcheck
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/router"
@@ -83,10 +88,11 @@ routing:
 // rollback reason and self-deploy-result.json when a check fails, so keep them
 // short and script-greppable.
 const (
-	CheckConfig  = "config"
-	CheckBackend = "backend"
-	CheckPrompt  = "prompt"
-	CheckState   = "state"
+	CheckConfig   = "config"
+	CheckBackend  = "backend"
+	CheckPrompt   = "prompt"
+	CheckState    = "state"
+	CheckDelivery = "delivery"
 )
 
 // Check is one invariant's outcome.
@@ -159,6 +165,10 @@ func RunWithConfig(configYAML []byte) Report {
 
 	// State persistence is independent of the fixture config.
 	checks = append(checks, checkState())
+
+	// Delivery gate canary (#872): pending → approve → exactly-once → verified
+	// against a harmless fixture command/verifier, no live service touched.
+	checks = append(checks, checkDelivery())
 
 	ok := true
 	for _, c := range checks {
@@ -301,6 +311,90 @@ func checkState() Check {
 	return pass(CheckState, fmt.Sprintf("round-tripped %d session(s) and %d decision(s)",
 		len(got.Sessions), len(got.SupervisorDecisions)))
 }
+
+// checkDelivery proves the #872 approval-gated delivery loop end to end against
+// a harmless fixture: a pending deploy_project approval runs ZERO commands, an
+// approve then runs a fixture command + verifier EXACTLY ONCE behind the durable
+// approved→executing claim, and a second run is a no-op (exactly-once). It
+// touches no live service or device — the command/verifier are recorded, not
+// real deploys, and the revision check is a fixture — so it is safe to run in
+// the deploy gate. A throwaway temp SQLite DB is used and removed.
+func checkDelivery() Check {
+	dir, err := os.MkdirTemp("", "maestro-selfcheck-delivery-")
+	if err != nil {
+		return fail(CheckDelivery, "create temp dir: "+err.Error())
+	}
+	defer os.RemoveAll(dir)
+
+	store, err := approvalstore.Open(filepath.Join(dir, "maestro.db"))
+	if err != nil {
+		return fail(CheckDelivery, "open approvals store: "+err.Error())
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	const (
+		stateDir = "selfcheck-delivery"
+		repo     = "maestro-selfcheck/fixture"
+		id       = "approval-deploy-selfcheck"
+		sha      = "0000000000000000000000000000000000000000"
+	)
+	rb := approvalstore.RowBinding{Project: repo, Repo: repo, StateDir: stateDir}
+
+	// Seed a PENDING delivery and assert it is NOT claimable — approval-required
+	// runs zero delivery before approval.
+	pending := &state.Approval{
+		ID: id, CreatedAt: time.Time{}, Action: state.ApprovalActionDeployProject,
+		Status: state.ApprovalStatusPending, Repo: repo, Project: repo,
+		Delivery: &state.DeliveryPayload{Project: repo, Repo: repo, MergedSHA: sha, LocalPath: dir, Target: "selfcheck-fixture"},
+	}
+	pending.PayloadHash = pending.ComputePayloadHash()
+	if _, err := store.Put(ctx, pending, rb); err != nil {
+		return fail(CheckDelivery, "seed pending: "+err.Error())
+	}
+	if _, err := store.ClaimExecuting(ctx, stateDir, id, fixedNow, "selfcheck", "claim"); err != state.ErrApprovalNotApproved {
+		return fail(CheckDelivery, fmt.Sprintf("pending delivery was claimable (err=%v) — approval gate leaks", err))
+	}
+
+	// Approve it (claim-once), then run the delivery executor twice.
+	if _, err := store.Approve(ctx, stateDir, id, fixedNow, "selfcheck", "approve"); err != nil {
+		return fail(CheckDelivery, "approve: "+err.Error())
+	}
+	var runs int
+	ex := &approver.DeliveryExecutor{
+		Store:    store,
+		StateDir: stateDir,
+		Repo:     repo,
+		Delivery: config.DeliveryConfig{Command: "true", VerifyCommand: "true"},
+		Runner: approver.CommandRunnerFunc(func(context.Context, string, string) (string, error) {
+			runs++
+			return "selfcheck-fixture-ok", nil
+		}),
+		Revision: approver.RevisionCheckerFunc(func(string) (string, error) { return sha, nil }),
+		Actor:    "selfcheck",
+		Now:      func() time.Time { return fixedNow },
+	}
+	first := ex.Deliver(ctx, id)
+	if first.Status != state.ApprovalStatusExecuted {
+		return fail(CheckDelivery, fmt.Sprintf("approve did not execute delivery: status=%q err=%v", first.Status, first.Err))
+	}
+	if first.Approval == nil || first.Approval.Delivery == nil || !first.Approval.Delivery.Verified {
+		return fail(CheckDelivery, "delivery ran but was not verified")
+	}
+	// Exactly-once: the second run must not re-execute the command.
+	second := ex.Deliver(ctx, id)
+	if !second.Skipped {
+		return fail(CheckDelivery, fmt.Sprintf("second delivery re-ran (status=%q) — not exactly-once", second.Status))
+	}
+	if runs != 2 { // one deploy + one verifier, once total
+		return fail(CheckDelivery, fmt.Sprintf("fixture command ran %d times, want 2 (deploy+verify, once)", runs))
+	}
+	return pass(CheckDelivery, "pending→approve→exactly-once→verified against fixture command")
+}
+
+// fixedNow is a deterministic clock for the delivery canary so the gate stays
+// reproducible.
+var fixedNow = time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
 
 // pinnableBackend returns a declared backend name to pin via a model: label.
 // It prefers a backend that is NOT model.default so the label-override

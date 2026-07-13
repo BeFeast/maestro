@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
@@ -4161,6 +4162,88 @@ func clearWorktreeAfterRestart(sess *state.Session) {
 	sess.PRNumber = 0
 }
 
+// deliveryStoreOpener opens the approvals store the #872 delivery executor
+// contends on. It defaults to the unified fleet DB; tests override it to point
+// at a throwaway store.
+var deliveryStoreOpener = func() (*approvalstore.Store, error) {
+	return approvalstore.Open(approvalstore.DefaultDBPath())
+}
+
+// executeApprovedDeliveries runs every approved deploy_project delivery through
+// the DeliveryExecutor and mirrors the store-authoritative result back into JSON
+// state (#872). The store arbitrates the durable approved→executing claim so a
+// daemon and a CLI approve run the delivery exactly once and a restart never
+// replays an in-flight delivery. Failures are logged, never abort the cycle.
+func executeApprovedDeliveries(cfg *config.Config, st *state.State, approvals []*state.Approval) {
+	var pending []*state.Approval
+	for _, a := range approvals {
+		if a.Action == state.ApprovalActionDeployProject {
+			pending = append(pending, a)
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+	store, err := deliveryStoreOpener()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[supervisor] open delivery store: %v\n", err)
+		return
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	rb := approvalstore.RowBinding{Project: cfg.Repo, Repo: cfg.Repo, StateDir: cfg.StateDir}
+	ex := &approver.DeliveryExecutor{
+		Store:    store,
+		StateDir: cfg.StateDir,
+		Repo:     cfg.Repo,
+		Delivery: cfg.EffectiveDelivery(),
+		Actor:    "supervisor",
+	}
+	for _, a := range pending {
+		// Seed the approved row so the durable claim has a target even when the
+		// approve was JSON-gated (INSERT OR IGNORE — a no-op when the SQLite gate
+		// already seeded it).
+		if _, err := store.Put(ctx, a, rb); err != nil {
+			fmt.Fprintf(os.Stderr, "[supervisor] seed delivery %s: %v\n", a.ID, err)
+			continue
+		}
+		res := ex.Deliver(ctx, a.ID)
+		mirrorDeliveryStatus(st, a.ID, res)
+	}
+}
+
+// mirrorDeliveryStatus reconciles the JSON approval to the store-authoritative
+// status the DeliveryExecutor left behind, so the fleet read path (Fleet API,
+// history, CLI) reflects the delivery outcome. It tolerates the idempotent
+// not-approved / not-executing races so a re-run never turns into a spurious
+// error.
+func mirrorDeliveryStatus(st *state.State, id string, res approver.DeliveryResult) {
+	final := res.Approval
+	if final == nil {
+		if res.Err != nil {
+			fmt.Fprintf(os.Stderr, "[supervisor] delivery %s: %v\n", id, res.Err)
+		}
+		return
+	}
+	now := time.Now().UTC()
+	switch final.Status {
+	case state.ApprovalStatusExecuting:
+		// In flight / stuck (crash-recovery): surface it for operator reconcile.
+		if _, err := st.MarkApprovalExecuting(id, now, "supervisor", "delivery claim"); err != nil && err != state.ErrApprovalNotApproved {
+			fmt.Fprintf(os.Stderr, "[supervisor] mirror executing %s: %v\n", id, err)
+		}
+	case state.ApprovalStatusExecuted, state.ApprovalStatusExecutionFailed:
+		if _, err := st.MarkApprovalExecuting(id, now, "supervisor", "delivery claim"); err != nil && err != state.ErrApprovalNotApproved {
+			fmt.Fprintf(os.Stderr, "[supervisor] mirror executing %s: %v\n", id, err)
+		}
+		success := final.Status == state.ApprovalStatusExecuted
+		if _, err := st.RecordDeliveryResult(id, success, final.Delivery, time.Now().UTC(), "supervisor", res.Summary); err != nil && err != state.ErrApprovalNotExecuting {
+			fmt.Fprintf(os.Stderr, "[supervisor] mirror delivery result %s: %v\n", id, err)
+		}
+	}
+}
+
 // executeApprovedApprovals runs any approvals currently in status=approved
 // through the approver.Executor and persists the resulting state
 // transitions. Failures are logged but do not abort the supervisor cycle —
@@ -4171,6 +4254,12 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 	if len(approvals) == 0 {
 		return
 	}
+	// #872: deploy_project approvals run through the dedicated DeliveryExecutor
+	// (durable approved→executing store claim before any side effect), NOT the
+	// pure approver.Executor. Route them separately; the generic loop below
+	// skips the verb (it returns execution_skipped there).
+	executeApprovedDeliveries(cfg, st, approvals)
+
 	// approver.Executor only needs MergePR/CloseIssue from the GH client.
 	// Reader (the broader supervisor surface) is satisfied by *github.Client,
 	// which also satisfies approver.GitHubClient. We assert the narrower
@@ -4191,6 +4280,9 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		State:     st,
 	}
 	for _, a := range approvals {
+		if a.Action == state.ApprovalActionDeployProject {
+			continue // handled by executeApprovedDeliveries above
+		}
 		res := ex.Execute(a)
 		if res.Warning != "" {
 			// #489 deprecation: legacy unstamped approval fell through the
