@@ -80,6 +80,24 @@ func TestDefaultStoreProtectsLegacyProjectsUntilMigration(t *testing.T) {
 	}
 }
 
+func TestDefaultStoreInspectionFailureStaysOnLegacyPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.Mkdir(filepath.Join(home, ".maestro"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := legacyConfigStorePath()
+	if err := os.WriteFile(legacy, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := defaultConfigStorePath(); got != legacy {
+		t.Fatalf("default after legacy inspection failure = %q, want fail-closed legacy %q", got, legacy)
+	}
+	if err := refuseUnmigratedCanonicalStore(canonicalConfigStorePath()); err == nil {
+		t.Fatal("explicit canonical service should refuse when legacy inspection fails")
+	}
+}
+
 func TestClassifyDaemonWatchStore(t *testing.T) {
 	cases := []struct {
 		name  string

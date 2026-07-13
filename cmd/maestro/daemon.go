@@ -143,8 +143,11 @@ func defaultConfigStorePath() string {
 	needsMigration, err := legacyStoreNeedsMigration(canonical, legacy)
 	if err != nil {
 		legacyStoreWarningOnce.Do(func() {
-			fmt.Fprintf(os.Stderr, "warning: could not inspect legacy Maestro config-store compatibility: %v\n", err)
+			fmt.Fprintf(os.Stderr, "warning: could not inspect legacy Maestro config-store compatibility: %v; keeping the legacy path fail-closed so default commands cannot split the fleet\n", err)
 		})
+		if _, statErr := os.Stat(legacy); statErr == nil {
+			return legacy
+		}
 		return canonical
 	}
 	if needsMigration {
