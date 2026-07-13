@@ -157,3 +157,78 @@ func TestResolveDispatchedReviewRepairApproval(t *testing.T) {
 		t.Fatal("second resolve should return false (already terminal)")
 	}
 }
+
+// #874 regression: the orchestrator can dispatch a durable review-repair
+// approval while it is still Approved (before the supervisor executor moves it
+// to awaiting_dispatch). Resolving after dispatch must make an Approved record
+// terminal, not silently leave it active while reporting success.
+func TestResolveDispatchedReviewRepairApproval_FromApproved(t *testing.T) {
+	now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+	st := NewState()
+	a := st.RecordPendingApprovalForDecision(reviewRepairDecision(442, 564, "head"), now)
+	id := a.ID
+	if _, err := st.ApproveApproval(id, now, "operator", "approve"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if st.Approvals[0].Status != ApprovalStatusApproved {
+		t.Fatalf("precondition: status = %q, want approved", st.Approvals[0].Status)
+	}
+
+	if !st.ResolveDispatchedReviewRepairApproval(id, now.Add(time.Minute), "dispatched") {
+		t.Fatal("resolve returned false for an approved (active) approval")
+	}
+	if st.Approvals[0].Status != ApprovalStatusSuperseded {
+		t.Fatalf("status = %q, want superseded", st.Approvals[0].Status)
+	}
+}
+
+// #874 regression: a changed head must supersede an already-approved (not yet
+// dispatched) review-repair approval, not just a pending one — otherwise the
+// stale-revision repair stays active and re-selectable.
+func TestSupersedeReviewRepairApprovalsForStaleHead_FromApproved(t *testing.T) {
+	now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+	st := NewState()
+	a := st.RecordPendingApprovalForDecision(reviewRepairDecision(442, 564, "oldhead"), now)
+	if _, err := st.ApproveApproval(a.ID, now, "operator", "approve"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if st.Approvals[0].Status != ApprovalStatusApproved {
+		t.Fatalf("precondition: status = %q, want approved", st.Approvals[0].Status)
+	}
+
+	ids := st.SupersedeReviewRepairApprovalsForStaleHead(564, "newhead", now.Add(time.Minute), "head moved")
+	if len(ids) != 1 {
+		t.Fatalf("moved head superseded %v, want 1", ids)
+	}
+	if st.Approvals[0].Status != ApprovalStatusSuperseded {
+		t.Fatalf("status = %q, want superseded", st.Approvals[0].Status)
+	}
+}
+
+// #874 regression: a failed worker start must not burn a review-repair attempt.
+// ReleaseReviewRepairAttempt rolls back the claimed slot so the same (pr,head)
+// can be dispatched again on a later cycle.
+func TestReleaseReviewRepairAttempt(t *testing.T) {
+	now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+	st := NewState()
+
+	// Budget of 1 attempt: claim it, then a failed start releases it.
+	if _, spawned := st.RecordReviewRepairAttempt(564, "head", 442, "", 1, now); !spawned {
+		t.Fatal("first claim should be granted")
+	}
+	// Budget is now spent — a second claim without release is refused.
+	if _, spawned := st.RecordReviewRepairAttempt(564, "head", 442, "", 1, now); spawned {
+		t.Fatal("second claim should be refused before release (budget spent)")
+	}
+
+	st.ReleaseReviewRepairAttempt(564, "head", now.Add(time.Minute))
+
+	track, ok := st.LookupReviewRepairTrack(564, "head")
+	if !ok || track.Attempts != 0 || track.Exhausted {
+		t.Fatalf("after release: track=%+v ok=%v, want attempts=0 not exhausted", track, ok)
+	}
+	// The freed slot is dispatchable again.
+	if _, spawned := st.RecordReviewRepairAttempt(564, "head", 442, "", 1, now.Add(2*time.Minute)); !spawned {
+		t.Fatal("claim after release should be granted again")
+	}
+}

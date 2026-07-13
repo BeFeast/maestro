@@ -1239,6 +1239,36 @@ func (s *State) RecordReviewRepairAttempt(prNumber int, headSHA string, issueNum
 	return track, true
 }
 
+// ReleaseReviewRepairAttempt rolls back a single attempt previously taken by
+// RecordReviewRepairAttempt for (pr,head_sha) — used when the dispatch that
+// claimed the slot failed to actually start a worker (#874). A failed start
+// must not burn an attempt from the bounded repair budget, or a run of start
+// failures would exhaust the budget and permanently reject an approved repair
+// that never reached a worker. Decrements the counter (never below zero) and
+// clears an Exhausted flag whose timestamp coincides with this rolled-back
+// attempt. No-op when there is no track or no attempt to release.
+func (s *State) ReleaseReviewRepairAttempt(prNumber int, headSHA string, now time.Time) {
+	if s == nil || prNumber <= 0 || s.ReviewRepairTracks == nil {
+		return
+	}
+	key := reviewRepairTrackKey(prNumber, headSHA)
+	track, ok := s.ReviewRepairTracks[key]
+	if !ok || track.Attempts <= 0 {
+		return
+	}
+	track.Attempts--
+	// A just-claimed attempt never sets Exhausted (RecordReviewRepairAttempt
+	// leaves it false on the budget-reaching attempt), but stay defensive: if
+	// the released attempt was the one that tipped the pair into Exhausted,
+	// undo it so the freed slot is dispatchable again.
+	if track.Attempts == 0 {
+		track.Exhausted = false
+		track.ExhaustedAt = time.Time{}
+	}
+	track.LastDecisionAt = normalizedTime(now)
+	s.ReviewRepairTracks[key] = track
+}
+
 // MarkReviewRepairExhausted records that a (pr,head_sha) pair has run
 // out of repair attempts and the operator must take over. Idempotent —
 // calling twice does not multiply the timestamp.
@@ -2827,9 +2857,11 @@ func (s *State) SupersedeReviewRepairApprovalsForStaleHead(prNumber int, current
 		if strings.TrimSpace(approval.ReviewRepair.HeadSHA) == current && current != "" {
 			continue
 		}
-		switch approval.Status {
-		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
-			s.markApprovalSuperseded(approval, now, reason)
+		// Supersede from any active state, Approved included — a changed head
+		// makes an already-approved (but not yet dispatched) repair target a
+		// stale revision that must not reach a worker (#874).
+		if s.supersedeApprovalFrom(approval, now, reason,
+			ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch) {
 			ids = append(ids, approval.ID)
 		}
 	}
@@ -2851,12 +2883,12 @@ func (s *State) ResolveDispatchedReviewRepairApproval(id string, now time.Time, 
 		if approval.ID != id || approval.Action != approvalActionSpawnReviewRepair {
 			continue
 		}
-		switch approval.Status {
-		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
-			s.markApprovalSuperseded(approval, now, reason)
-			return true
-		}
-		return false
+		// The durable-approval dispatch path spawns from an Approved (or
+		// AwaitingDispatch) record, so the terminal transition must cover
+		// Approved too — otherwise the approval stays active and re-selectable
+		// while SQLite is told it is terminal (#874).
+		return s.supersedeApprovalFrom(approval, now, reason,
+			ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch)
 	}
 	return false
 }
@@ -2949,8 +2981,32 @@ func (s *State) markApprovalSuperseded(approval *Approval, now time.Time, reason
 	// #515: AwaitingDispatch is "still in flight on a separate loop";
 	// reconcile must be allowed to supersede it once the side effect
 	// it's awaiting actually lands (e.g. spawn_worker -> worker started).
-	if approval.Status != ApprovalStatusPending && approval.Status != ApprovalStatusAwaitingDispatch {
-		return
+	// Approved is intentionally excluded here: an approved record is queued
+	// in the supervisor executor (ApprovalsAwaitingExecution), so a general
+	// reconciler must not yank it out from under the executor.
+	s.supersedeApprovalFrom(approval, now, reason, ApprovalStatusPending, ApprovalStatusAwaitingDispatch)
+}
+
+// supersedeApprovalFrom transitions approval → superseded when its current
+// status is one of allowedFrom, appending an audit entry, and reports whether
+// the transition happened. It is the shared core of markApprovalSuperseded; the
+// review-repair dispatch path (#874) also supersedes from Approved because the
+// orchestrator dispatches a durable review-repair approval directly — racing
+// the supervisor executor that would otherwise move it Approved →
+// AwaitingDispatch — so the just-dispatched (or stale-head) approval must become
+// terminal from whichever active state it is observed in. Returning true only on
+// a real transition keeps callers from reporting success (and mirroring a
+// terminal status to SQLite) while the record silently stays active.
+func (s *State) supersedeApprovalFrom(approval *Approval, now time.Time, reason string, allowedFrom ...ApprovalStatus) bool {
+	transition := false
+	for _, from := range allowedFrom {
+		if approval.Status == from {
+			transition = true
+			break
+		}
+	}
+	if !transition {
+		return false
 	}
 	approval.Status = ApprovalStatusSuperseded
 	approval.UpdatedAt = normalizedTime(now)
@@ -2961,6 +3017,7 @@ func (s *State) markApprovalSuperseded(approval *Approval, now time.Time, reason
 		PayloadHash:     approval.PayloadHash,
 		TargetStateHash: s.ApprovalTargetStateHash(approval.Target),
 	})
+	return true
 }
 
 func spawnWorkerApprovalMatchesSession(approval *Approval, slot string, sess *Session) bool {

@@ -480,7 +480,26 @@ func enrichSpawnReviewRepairDecision(decision *state.SupervisorDecision, st *sta
 	// distinct approval (approvalTargetsEqual includes HeadSHA) and repeat
 	// clicks on the same head coalesce to the one record.
 	decision.Target.HeadSHA = payload.HeadSHA
-	if decision.Target.Issue == 0 && provenTarget != nil {
+	// The proven target's issue is authoritative for this PR: the dispatcher
+	// selects durable review-repair approvals by target issue
+	// (approvalSelectedReviewRepair), so a caller-supplied issue that
+	// contradicts the proof would mint an approval that runs the repair with
+	// the wrong issue/PR pairing or is never selected for the PR's real issue.
+	// Adopt the proven issue; reject a nonzero caller issue that disagrees with
+	// a precise reason rather than silently overriding operator intent (#874).
+	if provenTarget != nil && provenTarget.Issue > 0 {
+		if decision.Target.Issue > 0 && decision.Target.Issue != provenTarget.Issue {
+			msg := fmt.Sprintf(
+				"cannot enqueue spawn_review_repair for PR #%d: issue_number #%d does not match the PR's proven issue #%d. "+
+					"Omit issue_number or pass #%d.",
+				prNumber, decision.Target.Issue, provenTarget.Issue, provenTarget.Issue)
+			return safeActionResult{
+				handled: true,
+				status:  http.StatusConflict,
+				body:    map[string]string{"error": msg},
+				err:     fmt.Errorf("spawn_review_repair PR #%d: issue #%d mismatches proven issue #%d", prNumber, decision.Target.Issue, provenTarget.Issue),
+			}, false
+		}
 		decision.Target.Issue = provenTarget.Issue
 	}
 	return safeActionResult{}, true

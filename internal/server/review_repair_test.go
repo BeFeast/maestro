@@ -119,3 +119,57 @@ func TestApprovalAction_SpawnReviewRepair_RequiresPRNumber(t *testing.T) {
 		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
 	}
 }
+
+// #874: a caller-supplied issue_number that contradicts the PR's proven issue
+// must be rejected before any mutation. The dispatcher selects durable
+// review-repair approvals by target issue, so minting one against the wrong
+// issue would run the repair with a wrong issue/PR pairing (or never be
+// selected for the PR's real issue). The rejection is a 409 and leaves state
+// untouched.
+func TestApprovalAction_SpawnReviewRepair_RejectsMismatchedIssue(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	seedProvenReviewRepair(t, dir, 442, 564, "deadbeefcafe")
+
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	// Proven issue is 442; caller asserts 999.
+	w := postApprovalAction(t, srv, `{"action_id":"spawn_review_repair","pr_number":564,"issue_number":999}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (issue mismatch); body=%s", w.Code, w.Body.String())
+	}
+
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if len(st.Approvals) != 0 {
+		t.Fatalf("approvals = %d, want 0 — a mismatched enqueue must not mutate state", len(st.Approvals))
+	}
+}
+
+// #874: omitting issue_number adopts the PR's proven issue, so the minted
+// approval carries the correct issue/PR pairing the dispatcher selects on.
+func TestApprovalAction_SpawnReviewRepair_AdoptsProvenIssueWhenOmitted(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	seedProvenReviewRepair(t, dir, 442, 564, "deadbeefcafe")
+
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"spawn_review_repair","pr_number":564}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if len(st.Approvals) != 1 {
+		t.Fatalf("approvals = %d, want 1", len(st.Approvals))
+	}
+	if a := st.Approvals[0]; a.Target == nil || a.Target.Issue != 442 || a.Target.PR != 564 {
+		t.Fatalf("target = %+v, want proven issue=442 PR=564", a.Target)
+	}
+}

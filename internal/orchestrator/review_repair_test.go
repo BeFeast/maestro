@@ -43,6 +43,31 @@ func TestTryClaimReviewRepairSlot_HonoursBudget(t *testing.T) {
 	}
 }
 
+// #874: a worker start that fails after the slot was claimed must release the
+// attempt, so the bounded budget is not spent by a start that never produced a
+// worker and the still-active approval remains dispatchable next cycle.
+func TestReleaseReviewRepairSlot_RestoresBudgetAfterFailedStart(t *testing.T) {
+	o := &Orchestrator{cfg: reviewRepairCfg(1)}
+	s := state.NewState()
+	target := &state.SupervisorTarget{Issue: 442, PR: 564, HeadSHA: "deadbeef0000"}
+	payload := &state.SupervisorReviewRepairPayload{HeadSHA: "deadbeef0000", MaxRetries: 1, Backend: "claude"}
+
+	if !o.tryClaimReviewRepairSlot(s, target, payload) {
+		t.Fatal("first claim must succeed")
+	}
+	// Simulate the failed start: the dispatcher releases the claimed slot.
+	o.releaseReviewRepairSlot(s, target, payload)
+
+	track, _ := s.LookupReviewRepairTrack(564, "deadbeef0000")
+	if track.Attempts != 0 || track.Exhausted {
+		t.Fatalf("after release: track=%+v, want attempts=0 not exhausted", track)
+	}
+	// Budget restored: the next cycle can claim the same (pr,head) again.
+	if !o.tryClaimReviewRepairSlot(s, target, payload) {
+		t.Fatal("claim after release must succeed — a failed start must not burn the budget")
+	}
+}
+
 // A new head SHA on the same PR (the repair worker pushed a fix) opens
 // a fresh budget. The orchestrator must allow the next claim.
 func TestTryClaimReviewRepairSlot_NewHeadSHAFreshBudget(t *testing.T) {

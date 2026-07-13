@@ -6263,6 +6263,19 @@ func (o *Orchestrator) tryClaimReviewRepairSlot(s *state.State, target *state.Su
 	return true
 }
 
+// releaseReviewRepairSlot rolls back a (pr,head_sha) attempt claimed by
+// tryClaimReviewRepairSlot when the worker start that would have consumed it
+// failed (#874). Without this, a failed start spends an attempt from the
+// bounded budget while the approval stays active, so a run of start failures
+// exhausts the budget and the approved repair can never reach a worker.
+func (o *Orchestrator) releaseReviewRepairSlot(s *state.State, target *state.SupervisorTarget, payload *state.SupervisorReviewRepairPayload) {
+	if s == nil || target == nil || payload == nil {
+		return
+	}
+	s.ReleaseReviewRepairAttempt(target.PR, payload.HeadSHA, time.Now().UTC())
+	log.Printf("[orch] review-repair: released claimed attempt for PR #%d head %s after failed start", target.PR, shortReviewRepairSHA(payload.HeadSHA))
+}
+
 // shortReviewRepairSHA trims a SHA for log messages — keeps the path
 // dependency-free from internal/supervisor's shortSHA helper.
 func shortReviewRepairSHA(sha string) string {
@@ -6832,6 +6845,13 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
 				issue.Number, issue.Title, err)
+			// #874: a review-repair dispatch claimed a (pr,head) attempt via
+			// tryClaimReviewRepairSlot BEFORE this start; release it so a failed
+			// start does not burn a slot from the bounded repair budget and leave
+			// the still-active approval permanently un-dispatchable.
+			if reviewRepair != nil && repairTarget != nil {
+				o.releaseReviewRepairSlot(s, repairTarget, reviewRepair)
+			}
 			continue
 		}
 
