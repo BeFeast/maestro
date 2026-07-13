@@ -17,6 +17,9 @@ import (
 // contiguous secret literal exists in the source (agent-lint secret scanner).
 func writeLegacyCredentialArtifacts(t *testing.T, stateDir string) (envPath, runnerPath, canary string) {
 	t.Helper()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatalf("chmod state dir: %v", err)
+	}
 	canary = "CANARY-" + "oneshot-scrub-" + "d0n0t-persist-" + "0888"
 
 	envPath = filepath.Join(stateDir, "slot-earlier-run.env")

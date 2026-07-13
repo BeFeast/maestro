@@ -389,6 +389,8 @@ func main() {
 		selfcheckCmd(args)
 	case "stream-split":
 		streamSplitCmd(args)
+	case "_worker-exec":
+		workerExecCmd(args)
 	case "_watch-updater":
 		watchUpdaterCmd(args)
 	case "_watch-tail":

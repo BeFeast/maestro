@@ -2493,8 +2493,8 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 func (o *Orchestrator) runStartupTasks(once bool) {
 	// #888: inventory and scrub provider-credential material a pre-fix daemon
 	// left in the state dir — remove stale per-worker `*-run.env` copies, strip
-	// inlined credential exports from legacy `*-run.sh`, redact write-once
-	// prompts, inventory logs, and repair permissions. Runs in every mode; see
+	// inlined credential exports from legacy `*-run.sh`, redact historical text
+	// state/prompts/logs in place, and repair permissions. Runs in every mode; see
 	// this function's doc comment.
 	o.scrubLegacyCredentialArtifactsOnStartup()
 
