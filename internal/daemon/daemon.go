@@ -36,6 +36,7 @@ import (
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/befeast/maestro/internal/webhook"
 	"github.com/befeast/maestro/internal/webhookstore"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // Default loop intervals, shared by the daemon command's flag defaults and the
@@ -538,7 +539,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		drainWatch()
+		// Snapshot flow state dirs before stopAll clears the flow registry, then
+		// checkpoint any worker still in-flight so it resumes exactly once after
+		// the restart instead of a false running->dead (#877).
+		dirs := d.flowStateDirs()
 		d.stopAll()
+		d.checkpointInFlightForRestart(dirs)
 		// Don't block indefinitely on fleet server shutdown: the server's
 		// Shutdown goroutine has a 5s timeout, but bound the read so a
 		// pathological case never keeps the process alive (#817).
@@ -553,7 +559,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// successful bind (rare; the bind failure itself was already handled by
 		// Listen above). Flows are legitimately running, so drain them.
 		drainWatch()
+		dirs := d.flowStateDirs()
 		d.stopAll()
+		d.checkpointInFlightForRestart(dirs)
 		if err != nil {
 			log.Printf("[daemon] fleet server failed on %s:%d: %v", d.opts.Host, d.opts.Port, err)
 			return err
@@ -831,6 +839,95 @@ func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
 			log.Printf("[daemon] drain: aborted (forced shutdown) with %d worker(s) still running", running)
 			return
 		case <-ticker.C:
+		}
+	}
+}
+
+// flowStateDirs returns the deduped per-flow state dirs of the currently
+// registered flows. It is captured BEFORE stopAll (which clears the flow
+// registry) so the shutdown restart-checkpoint pass (#877) knows which project
+// states to scan.
+func (d *Daemon) flowStateDirs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	dirs := make([]string, 0, len(d.flows))
+	seen := make(map[string]bool, len(d.flows))
+	for _, flow := range d.flows {
+		if flow.cfg == nil {
+			continue
+		}
+		dir := strings.TrimSpace(flow.cfg.StateDir)
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
+// checkpointInFlightForRestart records a deliberate, resumable checkpoint for
+// every worker still in-flight at daemon shutdown (#877). It is the safety net
+// that makes a self-deploy/operator restart honor drain semantics even when a
+// worker did not finish within the drain window.
+//
+// Timing: with KillMode=mixed (maestro.service) the worker tmux servers keep
+// running while the daemon drains, so the drain genuinely waits for live
+// workers. Any worker still running when the daemon finally exits is reaped by
+// systemd's cgroup-wide SIGKILL once the main process is gone. Without a
+// checkpoint the next daemon would observe a dead pid on a session still marked
+// "running" and mark it running->dead over a surviving dirty worktree — the
+// exact 2026-07-12 failure. Here, instead, each such session is snapshotted to a
+// CHECKPOINT.md and stamped with RestartCheckpointAt; the next daemon's
+// reconcile resumes the SAME logical session in place exactly once.
+//
+// It runs AFTER stopAll, so the flows are quiescent and nothing else is mutating
+// state — dirs must therefore be captured (flowStateDirs) before stopAll clears
+// the flow registry. It is deliberately conservative: it never kills or replays
+// anything (P1 #877 review — no destructive action on shutdown), only persists a
+// resumable marker.
+func (d *Daemon) checkpointInFlightForRestart(dirs []string) {
+	now := time.Now().UTC()
+	for _, dir := range dirs {
+		s, err := state.Load(dir)
+		if err != nil {
+			log.Printf("[daemon] restart-checkpoint: load state %s failed: %v", dir, err)
+			continue
+		}
+		changed := false
+		for slot, sess := range s.Sessions {
+			if sess == nil || sess.Status != state.StatusRunning {
+				continue
+			}
+			// Idempotent across a repeated shutdown pass (e.g. the fleetErr and
+			// ctx.Done paths both firing): a marker already set is left as-is.
+			if sess.RestartCheckpointAt != nil {
+				continue
+			}
+			// Only a session whose dirty worktree is still on disk can be resumed
+			// in place. A missing worktree has nothing to preserve, so leave it to
+			// the normal reconcile/retry path rather than stamping a marker the
+			// resume could not honor.
+			if strings.TrimSpace(sess.Worktree) == "" {
+				continue
+			}
+			if _, statErr := os.Stat(sess.Worktree); statErr != nil {
+				continue
+			}
+			if cp, cpErr := worker.SaveCheckpoint(sess); cpErr != nil {
+				log.Printf("[daemon] restart-checkpoint: save checkpoint for %s (issue #%d) failed: %v", slot, sess.IssueNumber, cpErr)
+			} else if cp != "" {
+				sess.CheckpointFile = cp
+			}
+			stamp := now
+			sess.RestartCheckpointAt = &stamp
+			changed = true
+			log.Printf("[daemon] restart-checkpoint: %s (issue #%d) marked resumable across restart — worktree preserved for exactly-once in-place resume", slot, sess.IssueNumber)
+		}
+		if changed {
+			if err := state.Save(dir, s); err != nil {
+				log.Printf("[daemon] restart-checkpoint: save state %s failed: %v", dir, err)
+			}
 		}
 	}
 }

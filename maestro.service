@@ -33,6 +33,29 @@ ExecStart=/usr/local/bin/maestro daemon \
 # daemon's own --drain-timeout (default 5m) finishes well inside this window
 # (#817).
 TimeoutStopSec=6min
+# Kill ownership is explicit (#877). Each worker's tmux server is spawned as a
+# child of the daemon, so it lives in this unit's control group. The systemd
+# default KillMode=control-group SIGTERMs the WHOLE cgroup at once on stop —
+# daemon AND every worker — which killed in-flight dogfood workers the instant a
+# self-deploy restart began, while the in-process drain still reported them
+# "running" and waited pointlessly (2026-07-12 incident, #877).
+#
+#   KillMode=mixed: the stop SIGTERM goes to the daemon's MAIN process ONLY, so
+#   worker tmux servers keep running while the daemon drains — the drain now
+#   genuinely waits for live, runnable workers to finish instead of racing a
+#   cgroup-wide SIGTERM. The subsequent SIGKILL (after TimeoutStopSec, or when
+#   the daemon exits) is still sent to the ENTIRE control group, so no worker is
+#   ever orphaned outside the unit lifecycle. This is deliberately NOT
+#   KillMode=process, which would leak surviving children out of systemd's
+#   resource/lifecycle management (rejected in #877 review).
+#
+# The daemon is the belt to this suspenders: any worker still in-flight when the
+# drain deadline elapses is checkpointed to a resumable marker before shutdown
+# and resumed in place — same logical session, exactly once — by the next daemon
+# (internal/worker/checkpoint.go, orchestrator reconcile), so a dirty worktree is
+# never lost and no false running->dead transition occurs even under a forced
+# (second-SIGTERM) shutdown.
+KillMode=mixed
 Restart=on-failure
 RestartSec=30
 

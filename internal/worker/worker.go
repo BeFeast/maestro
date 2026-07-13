@@ -343,6 +343,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PreviousAttemptFeedback = ""
 	sess.PreviousAttemptFeedbackKind = ""
 	sess.CheckpointFile = ""
+	// A fresh respawn is a brand-new attempt in a brand-new worktree, so any
+	// restart-resume marker from a prior in-flight interruption (#877) is stale.
+	sess.RestartCheckpointAt = nil
 
 	return nil
 }

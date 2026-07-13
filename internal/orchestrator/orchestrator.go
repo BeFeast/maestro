@@ -2859,6 +2859,41 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 		}
 
+		// #877: this session was deliberately checkpointed on a previous daemon's
+		// shutdown (self-deploy/operator restart) — its worker process is gone
+		// (reasons above) but its dirty worktree survived. Resume the SAME logical
+		// session in place exactly once instead of a false running->dead. The
+		// marker is consumed UP FRONT so a resume that itself errors falls through
+		// to the normal terminal handling and can never loop, and so a duplicate
+		// dispatch is impossible. This path is deliberately non-destructive: it
+		// never kills a tmux session or replays a runner on an ambiguous state
+		// (P1 #877 review) — RespawnInPlace only starts a fresh runner in the
+		// surviving worktree, and only after the checks above proved the worker is
+		// genuinely gone.
+		if sess.RestartCheckpointAt != nil {
+			sess.RestartCheckpointAt = nil // exactly-once: consume before acting
+			if wt := strings.TrimSpace(sess.Worktree); wt == "" {
+				log.Printf("[orch] reconcile: %s restart-resume skipped — session has no worktree; falling through (%s)", slotName, strings.Join(reasons, ", "))
+			} else if _, statErr := os.Stat(wt); statErr != nil {
+				log.Printf("[orch] reconcile: %s restart-resume skipped — worktree %q gone (%v); falling through", slotName, wt, statErr)
+			} else if issue, fetchErr := o.getIssue(sess.IssueNumber); fetchErr != nil {
+				log.Printf("[orch] reconcile: %s restart-resume aborted — could not fetch issue #%d: %v; falling through", slotName, sess.IssueNumber, fetchErr)
+			} else {
+				o.updateTokensUsedFromWorkerLog(slotName, sess)
+				promptBase := o.selectPrompt(issue)
+				if respawnErr := o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
+					log.Printf("[orch] reconcile: %s restart-resume in-place failed: %v; falling through to terminal handling", slotName, respawnErr)
+				} else {
+					reconciled = true
+					log.Printf("[orch] reconcile: %s resumed in place across restart (issue #%d) — same session, dirty worktree preserved, exactly once (%s)",
+						slotName, sess.IssueNumber, strings.Join(reasons, ", "))
+					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) resumed in place after a restart — dirty worktree preserved, no work lost",
+						slotName, sess.IssueNumber, sess.IssueTitle)
+					continue
+				}
+			}
+		}
+
 		// Before marking the session dead, check whether the worker died because
 		// the provider hit a rate / usage limit. Without this, the reconcile path
 		// races the main exit handler at the start of every cycle and burns the
