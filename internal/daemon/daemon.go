@@ -53,11 +53,15 @@ const (
 	// DefaultDrainTimeout bounds the graceful in-process drain the daemon runs on
 	// SIGTERM (#761, single-service cutover): it sets SpawnDrain on every flow so
 	// no new workers are claimed, then waits for in-flight workers to finish. It
-	// is deliberately UNDER the unit's TimeoutStopSec so the drain finishes
-	// before systemd escalates to SIGKILL. The 5m default covers the vast
-	// majority of in-flight workers; a long-running worker that exceeds it is
-	// an external tmux process the daemon should not wait for (#817).
-	DefaultDrainTimeout = 5 * time.Minute
+	// is deliberately UNDER the unit's TimeoutStopSec (6min) with room to spare so
+	// the drain finishes AND the post-drain shutdown restart-checkpoint pass
+	// (#877) still completes before systemd escalates to SIGKILL. At 4m it leaves
+	// ~2min of the stop window for stopAll + checkpoint I/O — a 5m drain left only
+	// ~1min, which a slow flow shutdown or many state dirs could exhaust, letting
+	// SIGKILL land before the resumable markers were saved (#877 review comment 1).
+	// The 4m still covers the vast majority of in-flight workers; a longer-running
+	// worker is checkpointed and resumed in place rather than waited on (#817).
+	DefaultDrainTimeout = 4 * time.Minute
 	// DefaultEmergencyWatchInterval is how often the daemon re-reads the
 	// fleet-wide EMERGENCY STOP switch from the unified DB (#840). It is short so
 	// the switch takes effect well within one supervise/orchestrate poll interval
@@ -77,6 +81,26 @@ var drainPollInterval = 5 * time.Second
 // and moves on, so the daemon never blocks indefinitely on shutdown (#817).
 // A var so tests can shorten it.
 var shutdownFlowTimeout = 10 * time.Second
+
+// shutdownCheckpointBudget caps the wall-clock the shutdown restart-checkpoint
+// pass (#877) spends generating the best-effort CHECKPOINT.md context blobs
+// (which shell out to git per session). Once it elapses, the pass stops
+// generating context files but STILL stamps the correctness-critical
+// RestartCheckpointAt marker (cheap: a single field + state write), so the
+// marker — the thing that actually prevents the false running->dead — always
+// lands within the stop window even when many sessions are in-flight (#877
+// review comment 1). A var so tests can shorten it.
+var shutdownCheckpointBudget = 60 * time.Second
+
+// restartCheckpointRetries bounds how many times the shutdown checkpoint pass
+// re-loads and re-applies markers after losing a 3-way state merge to a
+// concurrent flow save. stopAll abandons a flow whose RunOnce cycle outruns
+// shutdownFlowTimeout, so that still-live flow can Save between this pass's Load
+// and Save. On ErrStateConflict the pass reloads (picking up the flow's fresher
+// session, re-evaluating its status) and retries, so a late flow save neither
+// drops the marker nor gets clobbered by it (#877 review comment 2). A var so
+// tests can exercise the retry path deterministically.
+var restartCheckpointRetries = 5
 
 // ConfigLoader yields the set of project configs the daemon supervises. It is
 // satisfied by *configstore.Store; tests inject an in-memory fake so the
@@ -544,7 +568,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// the restart instead of a false running->dead (#877).
 		dirs := d.flowStateDirs()
 		d.stopAll()
-		d.checkpointInFlightForRestart(dirs)
+		d.checkpointInFlightForRestart(time.Now().Add(shutdownCheckpointBudget), dirs)
 		// Don't block indefinitely on fleet server shutdown: the server's
 		// Shutdown goroutine has a 5s timeout, but bound the read so a
 		// pathological case never keeps the process alive (#817).
@@ -561,7 +585,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		drainWatch()
 		dirs := d.flowStateDirs()
 		d.stopAll()
-		d.checkpointInFlightForRestart(dirs)
+		d.checkpointInFlightForRestart(time.Now().Add(shutdownCheckpointBudget), dirs)
 		if err != nil {
 			log.Printf("[daemon] fleet server failed on %s:%d: %v", d.opts.Host, d.opts.Port, err)
 			return err
@@ -881,18 +905,39 @@ func (d *Daemon) flowStateDirs() []string {
 // CHECKPOINT.md and stamped with RestartCheckpointAt; the next daemon's
 // reconcile resumes the SAME logical session in place exactly once.
 //
-// It runs AFTER stopAll, so the flows are quiescent and nothing else is mutating
-// state — dirs must therefore be captured (flowStateDirs) before stopAll clears
-// the flow registry. It is deliberately conservative: it never kills or replays
-// anything (P1 #877 review — no destructive action on shutdown), only persists a
-// resumable marker.
-func (d *Daemon) checkpointInFlightForRestart(dirs []string) {
+// It runs AFTER stopAll, so the flows are quiescent — but stopAll abandons a flow
+// whose RunOnce cycle outruns shutdownFlowTimeout, so a still-live flow can Save
+// concurrently with this pass. It therefore does its Load/stamp/Save with a
+// retry-on-conflict loop (checkpointDir): a lost 3-way merge reloads and
+// re-evaluates, so the marker is never dropped and a late flow save is never
+// clobbered (#877 review comment 2). dirs must be captured (flowStateDirs) before
+// stopAll clears the flow registry. It is deliberately conservative: it never
+// kills or replays anything (P1 #877 review — no destructive action on
+// shutdown), only persists a resumable marker (plus a best-effort context blob).
+//
+// deadline caps the wall-clock spent on the best-effort CHECKPOINT.md context
+// blobs; the marker itself is always stamped, so the correctness-critical part
+// completes even under stop-window pressure (#877 review comment 1).
+func (d *Daemon) checkpointInFlightForRestart(deadline time.Time, dirs []string) {
 	now := time.Now().UTC()
 	for _, dir := range dirs {
+		d.checkpointDirForRestart(dir, now, deadline)
+	}
+}
+
+// checkpointDirForRestart stamps resumable markers for the in-flight workers of
+// one flow's state dir, retrying on a lost 3-way merge (ErrStateConflict) so a
+// concurrent save from a timed-out-but-still-running flow neither drops the
+// marker nor overwrites the flow's fresher session state (#877 review comment 2).
+// Generated CHECKPOINT.md paths are memoised across retries so a merge conflict
+// never re-runs the git-heavy context capture.
+func (d *Daemon) checkpointDirForRestart(dir string, now, deadline time.Time) {
+	generated := map[string]string{} // slot -> CHECKPOINT.md path, reused across retries
+	for attempt := 0; attempt < restartCheckpointRetries; attempt++ {
 		s, err := state.Load(dir)
 		if err != nil {
 			log.Printf("[daemon] restart-checkpoint: load state %s failed: %v", dir, err)
-			continue
+			return
 		}
 		changed := false
 		for slot, sess := range s.Sessions {
@@ -900,7 +945,8 @@ func (d *Daemon) checkpointInFlightForRestart(dirs []string) {
 				continue
 			}
 			// Idempotent across a repeated shutdown pass (e.g. the fleetErr and
-			// ctx.Done paths both firing): a marker already set is left as-is.
+			// ctx.Done paths both firing) and across a merge retry: a marker
+			// already set is left as-is.
 			if sess.RestartCheckpointAt != nil {
 				continue
 			}
@@ -914,20 +960,40 @@ func (d *Daemon) checkpointInFlightForRestart(dirs []string) {
 			if _, statErr := os.Stat(sess.Worktree); statErr != nil {
 				continue
 			}
-			if cp, cpErr := worker.SaveCheckpoint(sess); cpErr != nil {
-				log.Printf("[daemon] restart-checkpoint: save checkpoint for %s (issue #%d) failed: %v", slot, sess.IssueNumber, cpErr)
-			} else if cp != "" {
+			// Best-effort context blob, capped by the shutdown budget: the marker
+			// below is what prevents the false running->dead, so under deadline
+			// pressure (many in-flight workers) skip the git-heavy capture and
+			// stamp the marker alone (#877 review comment 1). Memoised so a merge
+			// retry does not regenerate it.
+			if cp, ok := generated[slot]; ok {
 				sess.CheckpointFile = cp
+			} else if time.Now().Before(deadline) {
+				if cp, cpErr := worker.SaveCheckpoint(sess); cpErr != nil {
+					log.Printf("[daemon] restart-checkpoint: save checkpoint for %s (issue #%d) failed: %v", slot, sess.IssueNumber, cpErr)
+				} else if cp != "" {
+					sess.CheckpointFile = cp
+					generated[slot] = cp
+				}
+			} else {
+				log.Printf("[daemon] restart-checkpoint: %s (issue #%d) — shutdown budget spent, stamping resumable marker without CHECKPOINT.md context", slot, sess.IssueNumber)
 			}
 			stamp := now
 			sess.RestartCheckpointAt = &stamp
 			changed = true
 			log.Printf("[daemon] restart-checkpoint: %s (issue #%d) marked resumable across restart — worktree preserved for exactly-once in-place resume", slot, sess.IssueNumber)
 		}
-		if changed {
-			if err := state.Save(dir, s); err != nil {
-				log.Printf("[daemon] restart-checkpoint: save state %s failed: %v", dir, err)
-			}
+		if !changed {
+			return
 		}
+		err = state.Save(dir, s)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, state.ErrStateConflict) && attempt < restartCheckpointRetries-1 {
+			log.Printf("[daemon] restart-checkpoint: save %s lost a merge to a concurrent flow save; reloading and retrying (attempt %d/%d)", dir, attempt+1, restartCheckpointRetries)
+			continue
+		}
+		log.Printf("[daemon] restart-checkpoint: save state %s failed: %v", dir, err)
+		return
 	}
 }

@@ -30,8 +30,10 @@ ExecStart=/usr/local/bin/maestro daemon \
 # Graceful in-process drain on SIGTERM: the daemon sets SpawnDrain on every flow
 # (no new workers) and waits for in-flight workers to finish — there is no
 # per-unit ExecStop=maestro drain anymore. Give it room before SIGKILL; the
-# daemon's own --drain-timeout (default 5m) finishes well inside this window
-# (#817).
+# daemon's own --drain-timeout (default 4m) finishes well inside this window, and
+# the ~2min it leaves covers stopAll + the shutdown restart-checkpoint pass so a
+# worker still in-flight at the deadline is stamped resumable BEFORE SIGKILL,
+# never after (#817, #877 review).
 TimeoutStopSec=6min
 # Kill ownership is explicit (#877). Each worker's tmux server is spawned as a
 # child of the daemon, so it lives in this unit's control group. The systemd

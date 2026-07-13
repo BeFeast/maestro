@@ -8,6 +8,7 @@ package orchestrator
 // worktree, and never dispatch a duplicate.
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -188,6 +189,112 @@ func TestReconcile_NoRestartCheckpoint_DeadWorkerStillGoesDead(t *testing.T) {
 	}
 	if got := s.Sessions["sup-311"].Status; got != state.StatusDead {
 		t.Fatalf("status = %q, want %q (unmarked dead worker keeps existing behavior)", got, state.StatusDead)
+	}
+}
+
+// #877 review comment 3: if a prior restart-resume's new runtime identity did
+// not fully persist (e.g. the post-resume state save failed, so the next daemon
+// reloads the old marker + dead pid and re-enters this branch), the replacement
+// worker started by that first resume is ALREADY running under the slot's
+// deterministic tmux session. Re-entry must ADOPT it — refresh the recorded pid
+// from the live pane and consume the marker — never call RespawnInPlace, which
+// would kill that live replacement and lose the work it did since it started.
+func TestReconcile_RestartCheckpoint_AdoptsLiveReplacement(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+
+	const adoptedPID = 7777
+	const slotTmux = "maestro-sup-310"
+	// The slot's own tmux session is alive (a replacement from a prior resume),
+	// and its pane pid is the live worker. The old recorded pid is dead.
+	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
+	o.pidAliveFn = func(pid int) bool { return pid == adoptedPID }
+	o.tmuxPanePIDFn = func(session string) (int, error) {
+		if session == slotTmux {
+			return adoptedPID, nil
+		}
+		return 0, fmt.Errorf("no such session %q", session)
+	}
+
+	worktree := t.TempDir()
+	stamp := time.Now().UTC().Add(-30 * time.Second)
+	s := state.NewState()
+	s.Sessions["sup-310"] = &state.Session{
+		IssueNumber:         310,
+		IssueTitle:          "in-flight issue",
+		Status:              state.StatusRunning,
+		PID:                 4242, // dead after the restart
+		TmuxSession:         slotTmux,
+		Branch:              "feat/sup-310-310-in-flight",
+		Worktree:            worktree,
+		Backend:             "claude",
+		RestartCheckpointAt: &stamp,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected reconcile to report a change (adoption)")
+	}
+	sess := s.Sessions["sup-310"]
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times, want 0 — a live replacement must be adopted, never respawned over (that would kill it)", resumeCount)
+	}
+	if sess.PID != adoptedPID {
+		t.Fatalf("pid = %d, want the live pane pid %d (adopted, so subsequent reconciles see it alive)", sess.PID, adoptedPID)
+	}
+	if sess.RestartCheckpointAt != nil {
+		t.Fatal("marker must be consumed on a successful adoption")
+	}
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want running — an adopted live replacement must never go dead", sess.Status)
+	}
+
+	// A subsequent reconcile sees a live pid + live tmux and no marker → nothing
+	// fires: no respawn, no duplicate, no false dead.
+	o.reconcileRunningSessions(s)
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times across two reconciles, want 0", resumeCount)
+	}
+	if s.Sessions["sup-310"].Status != state.StatusRunning {
+		t.Fatalf("status after second reconcile = %q, want running", s.Sessions["sup-310"].Status)
+	}
+}
+
+// If a replacement's tmux is alive but its live pane pid can't be read, the
+// marker must be PRESERVED (not consumed) so the next cycle retries the
+// non-destructive adoption — the session must never be respawned over or falsely
+// marked dead while a live replacement is running.
+func TestReconcile_RestartCheckpoint_LiveReplacementUnreadablePID_RetriesNextCycle(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+
+	const slotTmux = "maestro-sup-310"
+	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
+	o.tmuxPanePIDFn = func(session string) (int, error) { return 0, fmt.Errorf("pane gone") }
+
+	worktree := t.TempDir()
+	stamp := time.Now().UTC()
+	s := state.NewState()
+	s.Sessions["sup-310"] = &state.Session{
+		IssueNumber:         310,
+		Status:              state.StatusRunning,
+		PID:                 4242, // dead
+		TmuxSession:         slotTmux,
+		Branch:              "feat/sup-310-310-in-flight",
+		Worktree:            worktree,
+		Backend:             "claude",
+		RestartCheckpointAt: &stamp,
+	}
+
+	o.reconcileRunningSessions(s)
+	sess := s.Sessions["sup-310"]
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times, want 0 — must not respawn over a live replacement", resumeCount)
+	}
+	if sess.RestartCheckpointAt == nil {
+		t.Fatal("marker must be PRESERVED when the live pane pid is unreadable, so the next cycle retries adoption")
+	}
+	if sess.Status != state.StatusRunning {
+		t.Fatalf("status = %q, want running — never false-dead over a live replacement", sess.Status)
 	}
 }
 

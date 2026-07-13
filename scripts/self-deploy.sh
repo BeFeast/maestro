@@ -117,9 +117,11 @@ SHA=""
 STAMP=""
 PREV_VERSION=""
 GATE_FAIL_DETAIL=""
-# #877: installed unit paths this deploy overwrote (each with a <path>.prev
-# backup), so rollback can restore the exact prior unit and daemon-reload. Empty
-# unless a required unit change (e.g. KillMode) actually shipped.
+# #877: installed unit paths this deploy changed. Each carries either a
+# <path>.prev backup (unit existed before — rollback restores it) or a
+# <path>.prev.absent marker (unit newly installed this deploy — rollback removes
+# it), so rollback can never leave a new unit paired with the rolled-back binary.
+# Empty unless a required unit change (e.g. KillMode) actually shipped.
 APPLIED_UNITS=()
 
 IFS=',' read -r -a UNIT_LIST <<<"$UNITS"
@@ -259,6 +261,16 @@ apply_units() {
     log "unit change detected for $unit — installing repo copy over $dest"
     if [[ -f "$dest" ]]; then
       priv cp -p "$dest" "$dest.prev" || fail "backing up unit $dest failed"
+      # Clear any stale absent-marker so rollback restores this .prev, not "remove".
+      priv rm -f "$dest.prev.absent" 2>/dev/null || true
+    else
+      # The unit did not exist before this deploy: there is no .prev to restore,
+      # so record an absent-marker instead. Without it, rollback_units would skip
+      # this path (no .prev) and leave the new unit in place while the binary
+      # rolled back — shipping a unit and binary from different revisions (#877
+      # review). The marker tells rollback to REMOVE the newly-installed unit.
+      priv rm -f "$dest.prev" 2>/dev/null || true
+      priv touch "$dest.prev.absent" || fail "recording new-unit marker for $dest failed"
     fi
     priv install -m 0644 "$src" "$dest" || fail "installing unit $unit to $dest failed"
     APPLIED_UNITS+=("$dest")
@@ -269,21 +281,33 @@ apply_units() {
   fi
 }
 
-# rollback_units restores every unit file apply_units overwrote, from its
-# <path>.prev backup, then daemon-reloads so the restored units are live before
-# the rollback restart runs. Best-effort: a failed restore is logged, not fatal,
-# so binary rollback still proceeds.
+# rollback_units reverts every unit file apply_units changed, then daemon-reloads
+# so the reverted units are live before the rollback restart runs. A unit that
+# EXISTED before this deploy is restored from its <path>.prev backup; a unit that
+# was newly INSTALLED this deploy (no prior file, marked with <path>.prev.absent)
+# is REMOVED, so rollback can never leave a new unit paired with the rolled-back
+# (previous-revision) binary (#877 review). Best-effort: a failed revert is
+# logged, not fatal, so binary rollback still proceeds.
 rollback_units() {
   (( ${#APPLIED_UNITS[@]} )) || return 0
   local dest restored=0
   for dest in "${APPLIED_UNITS[@]}"; do
-    [[ -f "$dest.prev" ]] || continue
-    log "rolling back unit $dest to $dest.prev"
-    if priv cp -p "$dest.prev" "$dest.rollback.$$" && priv mv -f "$dest.rollback.$$" "$dest"; then
-      restored=1
-    else
-      priv rm -f "$dest.rollback.$$" 2>/dev/null || true
-      log "unit rollback of $dest failed"
+    if [[ -f "$dest.prev" ]]; then
+      log "rolling back unit $dest to $dest.prev"
+      if priv cp -p "$dest.prev" "$dest.rollback.$$" && priv mv -f "$dest.rollback.$$" "$dest"; then
+        restored=1
+      else
+        priv rm -f "$dest.rollback.$$" 2>/dev/null || true
+        log "unit rollback of $dest failed"
+      fi
+    elif [[ -f "$dest.prev.absent" ]]; then
+      log "rolling back unit $dest — removing newly-installed unit (no prior file)"
+      if priv rm -f "$dest"; then
+        priv rm -f "$dest.prev.absent" 2>/dev/null || true
+        restored=1
+      else
+        log "unit rollback of $dest failed (could not remove new unit)"
+      fi
     fi
   done
   if (( restored )); then

@@ -58,6 +58,7 @@ type Orchestrator struct {
 	enhancementPromptBase string
 	pidAliveFn            func(pid int) bool
 	tmuxSessionExistsFn   func(name string) bool
+	tmuxPanePIDFn         func(session string) (int, error)
 	listOpenPRsFn         func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
@@ -259,6 +260,15 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 		return false
 	}
 	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+}
+
+// tmuxPanePID reads the live pane pid of a tmux session, used to adopt an
+// already-running worker whose recorded pid is stale (#877 restart-resume).
+func (o *Orchestrator) tmuxPanePID(session string) (int, error) {
+	if o.tmuxPanePIDFn != nil {
+		return o.tmuxPanePIDFn(session)
+	}
+	return worker.TmuxPanePID(session)
 }
 
 func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
@@ -2824,7 +2834,8 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			reasons = append(reasons, fmt.Sprintf("pid %d dead", sess.PID))
 		}
 
-		if !o.tmuxSessionExists(tmuxName) {
+		tmuxAlive := o.tmuxSessionExists(tmuxName)
+		if !tmuxAlive {
 			reasons = append(reasons, fmt.Sprintf("tmux session %q missing", tmuxName))
 		}
 
@@ -2860,25 +2871,54 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		}
 
 		// #877: this session was deliberately checkpointed on a previous daemon's
-		// shutdown (self-deploy/operator restart) — its worker process is gone
+		// shutdown (self-deploy/operator restart) — its recorded pid is gone
 		// (reasons above) but its dirty worktree survived. Resume the SAME logical
-		// session in place exactly once instead of a false running->dead. The
-		// marker is consumed UP FRONT so a resume that itself errors falls through
-		// to the normal terminal handling and can never loop, and so a duplicate
-		// dispatch is impossible. This path is deliberately non-destructive: it
-		// never kills a tmux session or replays a runner on an ambiguous state
-		// (P1 #877 review) — RespawnInPlace only starts a fresh runner in the
-		// surviving worktree, and only after the checks above proved the worker is
-		// genuinely gone.
+		// session in place exactly once instead of a false running->dead. This path
+		// is deliberately non-destructive and duplicate-proof:
+		//
+		//   - If a worker tmux session is ALREADY alive under this slot, a
+		//     replacement started by a PRIOR restart-resume whose new runtime
+		//     identity did not fully persist (e.g. the post-resume state save
+		//     failed, so the next daemon reloaded the old marker + dead pid and
+		//     re-entered here) is still running. ADOPT it — refresh the recorded
+		//     pid from the live pane and consume the marker — rather than calling
+		//     RespawnInPlace, which would KILL that replacement (it kills the
+		//     slot's deterministic tmux session first) and lose the work it did
+		//     since it started (#877 review comment 3). Adoption starts no worker,
+		//     so it cannot duplicate-dispatch. On the FIRST resume after a restart
+		//     the tmux was reaped by the cgroup SIGKILL, so this branch is skipped.
+		//   - Otherwise resume in place. The marker is consumed UP FRONT so a
+		//     respawn that itself errors falls through to terminal handling and can
+		//     never loop or duplicate-dispatch.
 		if sess.RestartCheckpointAt != nil {
-			sess.RestartCheckpointAt = nil // exactly-once: consume before acting
 			if wt := strings.TrimSpace(sess.Worktree); wt == "" {
+				sess.RestartCheckpointAt = nil
 				log.Printf("[orch] reconcile: %s restart-resume skipped — session has no worktree; falling through (%s)", slotName, strings.Join(reasons, ", "))
 			} else if _, statErr := os.Stat(wt); statErr != nil {
+				sess.RestartCheckpointAt = nil
 				log.Printf("[orch] reconcile: %s restart-resume skipped — worktree %q gone (%v); falling through", slotName, wt, statErr)
+			} else if tmuxAlive {
+				// A replacement is already running — adopt it, never respawn over it.
+				if pid, perr := o.tmuxPanePID(tmuxName); perr != nil || pid <= 0 {
+					// Leave the marker SET so the next cycle retries the (harmless,
+					// non-destructive) adoption, rather than consuming it and falling
+					// to a false running->dead over the live replacement. Unlike a
+					// respawn, an adoption retry cannot loop or duplicate.
+					log.Printf("[orch] reconcile: %s restart-resume — replacement tmux %q alive but pane pid unreadable (%v); will retry adoption next cycle", slotName, tmuxName, perr)
+				} else {
+					sess.PID = pid
+					sess.TmuxSession = tmuxName
+					sess.RestartCheckpointAt = nil
+					reconciled = true
+					log.Printf("[orch] reconcile: %s adopted an already-running replacement across restart (issue #%d, pid=%d, tmux=%q) — no respawn, no work lost, exactly once",
+						slotName, sess.IssueNumber, pid, tmuxName)
+				}
+				continue
 			} else if issue, fetchErr := o.getIssue(sess.IssueNumber); fetchErr != nil {
+				sess.RestartCheckpointAt = nil
 				log.Printf("[orch] reconcile: %s restart-resume aborted — could not fetch issue #%d: %v; falling through", slotName, sess.IssueNumber, fetchErr)
 			} else {
+				sess.RestartCheckpointAt = nil // exactly-once: consume before the destructive respawn
 				o.updateTokensUsedFromWorkerLog(slotName, sess)
 				promptBase := o.selectPrompt(issue)
 				if respawnErr := o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {

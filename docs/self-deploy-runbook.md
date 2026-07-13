@@ -325,6 +325,26 @@ graceful drain (the 2026-07-12 incident):
    work. The supervisor suppresses its `dead_running_pid` finding for a
    marked-and-self-healing slot so an operator is not nudged to reconcile it.
 
+   The shutdown checkpoint pass is hardened against two edge cases the drain
+   window creates:
+   - **Budget:** `--drain-timeout` defaults to **4m** (under the unit's 6m
+     `TimeoutStopSec`) so ~2m of the stop window is reserved for `stopAll` plus
+     the checkpoint. The pass stamps the (cheap) `restart_checkpoint_at` marker
+     first and treats the git-heavy `CHECKPOINT.md` capture as best-effort,
+     skipping it once a wall-clock budget elapses — so the marker that actually
+     prevents the false `running -> dead` always lands before SIGKILL, even with
+     many in-flight workers.
+   - **Race:** a flow whose cycle outruns the per-flow stop timeout can still
+     save state concurrently with the pass, so the checkpoint save retries on a
+     lost 3-way merge — it reloads, re-reads the flow's fresher session, and
+     re-stamps, so a late flow save neither drops the marker nor is clobbered by
+     it.
+   - **Re-entry:** if a prior resume's new runtime identity did not fully persist
+     (e.g. its state save failed), the next reconcile finds the replacement's
+     tmux session already alive and **adopts** it (refreshes the recorded pid)
+     instead of respawning over it — so a persistence hiccup never kills the
+     running replacement or loses its work.
+
 Because the `KillMode` fix lives in the unit file, not the binary, the deploy
 script ships the unit too (see below): a binary-only deploy would restart under
 the old `KillMode` and never apply the fix.
@@ -336,11 +356,15 @@ before the restart:
 
 - for each configured unit whose repo copy (built from the deployed SHA) differs
   from the live installed file (resolved via `systemctl show -p FragmentPath`),
-  it backs the installed file up as `<path>.prev`, installs the repo copy, and
-  runs `daemon-reload` so the restart adopts it;
-- **rollback restores every unit it touched** (from `<path>.prev`, with a
-  `daemon-reload`) before the binary rollback and restart, so a failed verify or
-  smoke gate reverts the unit change too;
+  it installs the repo copy and runs `daemon-reload` so the restart adopts it. A
+  unit that **existed** is first backed up as `<path>.prev`; a unit **newly
+  installed** this deploy (no prior file) is instead recorded with a
+  `<path>.prev.absent` marker;
+- **rollback reverts every unit it touched** (with a `daemon-reload`) before the
+  binary rollback and restart: a backed-up unit is restored from `<path>.prev`,
+  and a newly-installed unit is **removed** (per its `.prev.absent` marker). This
+  ensures a rollback can never leave a new unit paired with the rolled-back
+  (previous-revision) binary;
 - units with no repo copy (an operator-managed sibling unit) are left untouched.
 
 > Runtime verification note: the live-canary — one real in-flight worker spanning
