@@ -933,29 +933,27 @@ func superviseCmd(args []string) {
 		printSupervisorDecision(decision, *jsonOutput)
 		return nil
 	}
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if !*once {
-		ctx, cancel = context.WithCancel(ctx)
-	}
-
 	// The first cycle stays fatal so a broken setup (bad config, missing
 	// backend, auth) fails `systemctl start` loudly instead of leaving a
 	// daemon up that can never work. The local material-progress clock is
 	// initialized (and, for a persistent command, launched) before this network/
 	// LLM-dependent cycle so a blocked first RunOnce cannot pause it (#887).
-	if err := runInitialSuperviseCycle(ctx, cfg, *once, *dryRun, runOnce,
-		supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
-		if cancel != nil {
-			cancel()
-		}
-		log.Fatalf("supervise: %v", err)
-	}
 	if *once {
+		if err := runInitialSuperviseCycle(context.Background(), cfg, true, *dryRun, runOnce,
+			supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
+			log.Fatalf("supervise: %v", err)
+		}
 		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if err := runInitialSuperviseCycle(ctx, cfg, false, *dryRun, runOnce,
+		supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
+		cancel()
+		log.Fatalf("supervise: %v", err)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
