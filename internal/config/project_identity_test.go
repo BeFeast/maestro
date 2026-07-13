@@ -12,7 +12,7 @@ repo: BeFeast/maestro
 project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
 management_home:
   kind: obsidian
-  path: /home/god/Obsidian/Dev
+  path: /srv/example-vault/Dev
   vault: Obsidian Vault
   vault_path: Dev/Areas/maestro
 `
@@ -26,7 +26,7 @@ func TestParse_ProjectIdentityExampleRoundTrips(t *testing.T) {
 		t.Fatalf("project_id = %q, want the example UUID", cfg.ProjectID)
 	}
 	mh := cfg.ManagementHome
-	if mh.Kind != "obsidian" || mh.Path != "/home/god/Obsidian/Dev" ||
+	if mh.Kind != "obsidian" || mh.Path != "/srv/example-vault/Dev" ||
 		mh.Vault != "Obsidian Vault" || mh.VaultPath != "Dev/Areas/maestro" {
 		t.Fatalf("management_home not parsed verbatim: %+v", mh)
 	}

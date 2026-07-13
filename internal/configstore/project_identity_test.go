@@ -13,7 +13,7 @@ local_path: ~/src/maestro
 project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
 management_home:
   kind: obsidian
-  path: /home/god/Obsidian/Dev
+  path: /srv/example-vault/Dev
   vault: Obsidian Vault
   vault_path: Dev/Areas/maestro
 `
@@ -37,7 +37,7 @@ func TestUpsertReloadExportLosslessForIdentity(t *testing.T) {
 		t.Fatalf("reloaded project_id = %q", cfg.ProjectID)
 	}
 	if cfg.ManagementHome.Kind != "obsidian" || cfg.ManagementHome.VaultPath != "Dev/Areas/maestro" ||
-		cfg.ManagementHome.Vault != "Obsidian Vault" || cfg.ManagementHome.Path != "/home/god/Obsidian/Dev" {
+		cfg.ManagementHome.Vault != "Obsidian Vault" || cfg.ManagementHome.Path != "/srv/example-vault/Dev" {
 		t.Fatalf("reloaded management_home lost fields: %+v", cfg.ManagementHome)
 	}
 
@@ -119,6 +119,27 @@ func TestUpsertProjectImmutableProjectID(t *testing.T) {
 	}
 	if cfg.ProjectID != "3f2504e0-4f89-41d3-9a0c-0305e82c3301" {
 		t.Fatalf("stored id changed after a rejected edit: %q", cfg.ProjectID)
+	}
+}
+
+func TestUpsertProjectNormalizesLegacyUppercaseProjectID(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	uppercase := strings.Replace(identityProjectYAML,
+		"3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		"3F2504E0-4F89-41D3-9A0C-0305E82C3301", 1)
+	if err := store.UpsertProject(ctx, "befeast-maestro", uppercase); err != nil {
+		t.Fatalf("seed legacy uppercase id: %v", err)
+	}
+	if err := store.UpsertProject(ctx, "befeast-maestro", identityProjectYAML); err != nil {
+		t.Fatalf("same UUID in canonical lowercase should be allowed: %v", err)
+	}
+	cfg, err := store.Load(ctx, "befeast-maestro")
+	if err != nil {
+		t.Fatalf("load normalized row: %v", err)
+	}
+	if cfg.ProjectID != "3f2504e0-4f89-41d3-9a0c-0305e82c3301" {
+		t.Fatalf("project_id = %q, want canonical lowercase", cfg.ProjectID)
 	}
 }
 

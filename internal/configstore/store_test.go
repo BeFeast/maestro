@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -70,6 +71,51 @@ supervisor:
 	fromStore.SettingsSources = nil // provenance map is set by Load, absent from Parse
 	if !reflect.DeepEqual(fromStore, fromYAML) {
 		t.Fatalf("store config differs from yaml\nstore=%#v\nyaml=%#v", fromStore.Model, fromYAML.Model)
+	}
+}
+
+func TestApplySQLiteWALValidatesHeaderChecksum(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "maestro.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertProject(ctx, "owner-demo", "repo: owner/demo\n"); err != nil {
+		t.Fatalf("seed WAL: %v", err)
+	}
+	mainDB, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read main database: %v", err)
+	}
+	wal, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatalf("read WAL: %v", err)
+	}
+	if _, err := applySQLiteWAL(mainDB, wal); err != nil {
+		t.Fatalf("valid WAL: %v", err)
+	}
+	corrupt := append([]byte(nil), wal...)
+	corrupt[24] ^= 0xff
+	if _, err := applySQLiteWAL(mainDB, corrupt); err == nil || !strings.Contains(err.Error(), "header checksum") {
+		t.Fatalf("corrupt WAL err = %v, want header checksum rejection", err)
+	}
+	badVersion := append([]byte(nil), wal...)
+	badVersion[7] ^= 0xff
+	if _, err := applySQLiteWAL(mainDB, badVersion); err == nil || !strings.Contains(err.Error(), "format version") {
+		t.Fatalf("bad-version WAL err = %v, want format-version rejection", err)
+	}
+	want, err := applySQLiteWAL(mainDB, wal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := applySQLiteWAL(mainDB, append(append([]byte(nil), wal...), 1, 2, 3, 4, 5))
+	if err != nil {
+		t.Fatalf("partial WAL tail should be ignored: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("partial WAL tail changed reconstructed snapshot")
 	}
 }
 

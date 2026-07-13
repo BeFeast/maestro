@@ -3,18 +3,19 @@ package configstore
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
 
 const genesisYAML = `repo: BeFeast/maestro
-local_path: ~/src/maestro
-worktree_base: ~/.worktrees/maestro
+local_path: /srv/example-src/maestro
+worktree_base: /srv/example-worktrees/maestro
 project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
 management_home:
   kind: obsidian
-  path: /srv/example-vault/Dev
+  path: /srv/example-vault/Dev/Areas/maestro
   vault: Example Vault
   vault_path: Dev/Areas/maestro
 `
@@ -38,15 +39,15 @@ func TestPrepareProjectValid(t *testing.T) {
 // The fingerprint is deterministic and insensitive to key ordering / backend
 // map ordering, so plan and apply of the same config always agree.
 func TestPrepareProjectFingerprintStable(t *testing.T) {
-	reordered := `local_path: ~/src/maestro
+	reordered := `local_path: /srv/example-src/maestro
 project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
-worktree_base: ~/.worktrees/maestro
+worktree_base: /srv/example-worktrees/maestro
 repo: BeFeast/maestro
 management_home:
   vault_path: Dev/Areas/maestro
   kind: obsidian
   vault: Example Vault
-  path: /srv/example-vault/Dev
+  path: /srv/example-vault/Dev/Areas/maestro
 `
 	a, err := PrepareProject("a.yaml", []byte(genesisYAML))
 	if err != nil {
@@ -59,8 +60,16 @@ management_home:
 	if a.Fingerprint != b.Fingerprint {
 		t.Fatalf("fingerprint not stable across key order: %s vs %s", a.Fingerprint, b.Fingerprint)
 	}
+	presentationOnly := strings.Replace(genesisYAML, "repo: BeFeast/maestro", "# owner/repo\nrepo: \"BeFeast/maestro\" # canonical", 1)
+	d, err := PrepareProject("d.yaml", []byte(presentationOnly))
+	if err != nil {
+		t.Fatalf("PrepareProject presentation-only: %v", err)
+	}
+	if a.Fingerprint != d.Fingerprint {
+		t.Fatalf("fingerprint moved for comments/scalar quoting: %s vs %s", a.Fingerprint, d.Fingerprint)
+	}
 	// A real config change must move the fingerprint.
-	changed := strings.Replace(genesisYAML, "~/src/maestro", "/srv/maestro", 1)
+	changed := strings.Replace(genesisYAML, "/srv/example-src/maestro", "/srv/changed-src/maestro", 1)
 	c, err := PrepareProject("c.yaml", []byte(changed))
 	if err != nil {
 		t.Fatalf("PrepareProject c: %v", err)
@@ -83,6 +92,10 @@ func TestPrepareProjectRejections(t *testing.T) {
 		{"missing repo", "local_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "repo is required"},
 		{"missing local_path", "repo: BeFeast/maestro\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "local_path is required"},
 		{"missing worktree_base", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "worktree_base is required"},
+		{"invalid repo shape", strings.Replace(genesisYAML, "repo: BeFeast/maestro", "repo: maestro", 1), "owner/repository"},
+		{"relative local path", strings.Replace(genesisYAML, "local_path: /srv/example-src/maestro", "local_path: relative/src", 1), "absolute execution-host paths"},
+		{"missing management_home", "repo: BeFeast/maestro\nlocal_path: /srv/example-src/x\nworktree_base: /srv/example-worktrees/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "management_home is required"},
+		{"relative management_home", strings.Replace(genesisYAML, "path: /srv/example-vault/Dev/Areas/maestro", "path: relative/vault", 1), "management_home.path must be an absolute"},
 		{"invalid management_home", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\nmanagement_home:\n  kind: notion\n", "not supported"},
 		{"shared backend definition", "repo: BeFeast/maestro\nlocal_path: ~/src/x\nworktree_base: ~/.wt/x\nproject_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\nmodel:\n  default: claude\n  backends:\n    claude:\n      provider: claude\n", "must not define shared model.backends"},
 	}
@@ -165,16 +178,14 @@ func TestApplyProjectIdempotent(t *testing.T) {
 		t.Fatalf("after first apply names = %v, want [befeast-maestro]", names)
 	}
 
-	// A fresh prepare of the same bytes (the adapter re-reads the file) is a no-op.
+	// Retry the exact same approved command (including its now-stale `absent`
+	// baseline), as an adapter would after losing the first response. It must be
+	// a no-op rather than forcing a new plan.
 	p2, err := PrepareProject("portable.yaml", []byte(genesisYAML))
 	if err != nil {
 		t.Fatalf("re-prepare: %v", err)
 	}
-	secondPlan, err := store.PlanProject(ctx, p2)
-	if err != nil {
-		t.Fatalf("second plan: %v", err)
-	}
-	second, err := store.ApplyProject(ctx, p2, confirm, p2.Fingerprint, secondPlan.BaselineFingerprint)
+	second, err := store.ApplyProject(ctx, p2, confirm, p2.Fingerprint, BaselineAbsent)
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
@@ -276,7 +287,7 @@ func TestApplyProjectRefusesStoreDriftSincePlan(t *testing.T) {
 
 	// Another process creates the same identity with different config after the
 	// plan. Apply must not reinterpret the approved create as an update.
-	drifted := strings.Replace(genesisYAML, "~/src/maestro", "/srv/concurrent-change", 1)
+	drifted := strings.Replace(genesisYAML, "/srv/example-src/maestro", "/srv/concurrent-change", 1)
 	if err := store.UpsertProject(ctx, p.Name, drifted); err != nil {
 		t.Fatalf("seed concurrent change: %v", err)
 	}
@@ -293,6 +304,82 @@ func TestApplyProjectRefusesStoreDriftSincePlan(t *testing.T) {
 	}
 	if cfg.LocalPath != "/srv/concurrent-change" {
 		t.Fatalf("apply overwrote concurrent config: local_path=%q", cfg.LocalPath)
+	}
+}
+
+func TestApplyProjectConcurrentSameIdentityCreatesAtMostOneRow(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "config.db")
+	storeA, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store A: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store B: %v", err)
+	}
+	defer storeB.Close()
+
+	pA, err := PrepareProject("a.yaml", []byte(genesisYAML))
+	if err != nil {
+		t.Fatalf("prepare A: %v", err)
+	}
+	otherYAML := strings.Replace(genesisYAML, "repo: BeFeast/maestro", "repo: BeFeast/other", 1)
+	pB, err := PrepareProject("b.yaml", []byte(otherYAML))
+	if err != nil {
+		t.Fatalf("prepare B: %v", err)
+	}
+	planA, err := storeA.PlanProject(ctx, pA)
+	if err != nil {
+		t.Fatalf("plan A: %v", err)
+	}
+	planB, err := storeB.PlanProject(ctx, pB)
+	if err != nil {
+		t.Fatalf("plan B: %v", err)
+	}
+	if planA.BaselineFingerprint != BaselineAbsent || planB.BaselineFingerprint != BaselineAbsent {
+		t.Fatalf("initial baselines = (%q, %q), want absent", planA.BaselineFingerprint, planB.BaselineFingerprint)
+	}
+
+	start := make(chan struct{})
+	ready := make(chan struct{}, 2)
+	results := make(chan error, 2)
+	apply := func(store *Store, p *PreparedProject, baseline string) {
+		ready <- struct{}{}
+		<-start
+		_, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, baseline)
+		results <- err
+	}
+	go apply(storeA, pA, planA.BaselineFingerprint)
+	go apply(storeB, pB, planB.BaselineFingerprint)
+	<-ready
+	<-ready
+	close(start)
+
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent applies succeeded %d times, want exactly one", successes)
+	}
+
+	names, err := storeA.projectNames(ctx)
+	if err != nil {
+		t.Fatalf("list final projects: %v", err)
+	}
+	if len(names) != 1 {
+		t.Fatalf("concurrent applies created rows %v, want exactly one", names)
+	}
+	cfg, err := storeA.Load(ctx, names[0])
+	if err != nil {
+		t.Fatalf("load winning project: %v", err)
+	}
+	if cfg.ProjectID != pA.ProjectID {
+		t.Fatalf("winning project_id = %q, want %q", cfg.ProjectID, pA.ProjectID)
 	}
 }
 
@@ -364,5 +451,29 @@ func TestApplyProjectIdentityConflictOtherName(t *testing.T) {
 	// No new row was created for befeast-maestro.
 	if names, _ := store.projectNames(ctx); len(names) != 1 {
 		t.Fatalf("conflict created an extra row: %v", names)
+	}
+}
+
+func TestApplyProjectRejectsIdlessSameNameForDifferentRepo(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	legacy := strings.Replace(genesisYAML, "repo: BeFeast/maestro", "repo: Other/project", 1)
+	legacy = strings.Replace(legacy, "project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301\n", "", 1)
+	if err := store.UpsertProject(ctx, "befeast-maestro", legacy); err != nil {
+		t.Fatalf("seed id-less legacy row: %v", err)
+	}
+	p, err := PrepareProject("portable.yaml", []byte(genesisYAML))
+	if err != nil {
+		t.Fatalf("PrepareProject: %v", err)
+	}
+	plan, err := store.PlanProject(ctx, p)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if plan.Effect != EffectConflict || !strings.Contains(plan.Conflict, "basename adoption") {
+		t.Fatalf("plan = %+v, want repo conflict", plan)
+	}
+	if _, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, plan.BaselineFingerprint); !errors.Is(err, ErrIdentityConflict) {
+		t.Fatalf("apply err = %v, want identity conflict", err)
 	}
 }

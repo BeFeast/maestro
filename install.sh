@@ -84,15 +84,34 @@ main() {
 
     echo
     echo "Next steps (single daemon + config store):"
-    echo "  1. Install and start the daemon unit:"
-    echo "     cp maestro.service ~/.config/systemd/user/ && systemctl --user enable --now maestro.service"
-    echo "  2. Register a project (write a portable YAML with repo/local_path/worktree_base/project_id):"
+    echo "  1. Start the one fleet daemon (keep this process running):"
+    echo "     mkdir -p \$HOME/.maestro"
+    echo "     ${INSTALL_DIR}/maestro daemon --watch-store --store \$HOME/.maestro/maestro.db \\"
+    echo "       --approvals-store sqlite --state-store sqlite"
+    if [ "$OS" = "linux" ]; then
+        echo
+        echo "     Optional persistent Linux user service:"
+        if [ "$INSTALL_DIR" = "/usr/local/bin" ]; then
+            echo "     mkdir -p \$HOME/.config/systemd/user"
+            echo "     curl -fsSL https://raw.githubusercontent.com/${REPO}/${LATEST}/maestro.service -o \$HOME/.config/systemd/user/maestro.service"
+            echo "     systemctl --user daemon-reload && systemctl --user enable --now maestro.service"
+        else
+            echo "     The shipped maestro.service uses /usr/local/bin/maestro; update ExecStart"
+            echo "     to ${INSTALL_DIR}/maestro before enabling it."
+        fi
+    else
+        echo "     No launchd plist is shipped; use the foreground command above or your"
+        echo "     preferred macOS process manager."
+    fi
+    echo
+    echo "  2. Register a project (portable YAML: repo, absolute local/worktree paths,"
+    echo "     lowercase project_id, and management_home):"
     echo "     maestro project plan  --file <project.yaml> --db ~/.maestro/maestro.db --json"
     echo "     # Run the exact next[0] command returned by the approved plan receipt:"
     echo "     maestro project apply --file <project.yaml> --db ~/.maestro/maestro.db --confirm <project-id> --fingerprint <sha256-from-plan> --baseline <baseline-from-plan> --json"
     echo
-    echo "The daemon runs with --watch-store and hot-reconciles new rows — no per-project service."
-    echo "Migrating from legacy per-project units? Run scripts/migrate-to-daemon.sh."
+    echo "The running daemon hot-reconciles new rows — no per-project service or separate serve process."
+    echo "Migrating a legacy host? From a source checkout, review scripts/migrate-to-daemon.sh --dry-run first."
 }
 
 main

@@ -235,7 +235,7 @@ supervisor:
       - "## Issue Wave"
       - "## Route Replacement Map"
       - "## Done For The Epic"
-    preflight_command: /home/god/.maestro/bin/scribe-redesign-preflight.sh
+    preflight_command: /opt/maestro/bin/scribe-redesign-preflight.sh
     require_preflight_before_create: true
     require_preflight_before_spawn: true
     max_children_per_cycle: 1
@@ -243,8 +243,8 @@ supervisor:
   completion_gates:
     required_labels: [needs-visual-verification, ui-redesign]
     body_markers: ["## Live Visual Verification"]
-    live_visual_command: /home/god/.maestro/bin/scribe-live-visual.sh
-    deployment_status_command: /home/god/.maestro/bin/scribe-deploy-status.sh
+    live_visual_command: /opt/maestro/bin/scribe-live-visual.sh
+    deployment_status_command: /opt/maestro/bin/scribe-deploy-status.sh
     verification_label: awaiting-verification
 ```
 

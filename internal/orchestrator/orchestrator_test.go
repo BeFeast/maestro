@@ -487,7 +487,7 @@ func TestAutoCreatedPRBody_NoOrchestrationInternals(t *testing.T) {
 		IssueTitle:  "sanitize auto-created PR bodies",
 		PID:         4242,
 		TmuxSession: "maestro-mae-1",
-		Worktree:    "/home/god/worktrees/example/mae-1",
+		Worktree:    "/srv/example-worktrees/mae-1",
 	}
 	body := autoCreatedPRBody(sess, "feat/mae-1-799-sanitize")
 	if !strings.Contains(body, "Refs #799") {
@@ -496,7 +496,7 @@ func TestAutoCreatedPRBody_NoOrchestrationInternals(t *testing.T) {
 	if !strings.Contains(body, "feat/mae-1-799-sanitize") {
 		t.Fatalf("body missing branch name: %q", body)
 	}
-	for _, leak := range []string{"Maestro-Backend", "pid", "tmux", "state_dir", "4242", "maestro-mae-1", "/home/god"} {
+	for _, leak := range []string{"Maestro-Backend", "pid", "tmux", "state_dir", "4242", "maestro-mae-1", "/srv/example-worktrees"} {
 		if strings.Contains(body, leak) {
 			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, body)
 		}

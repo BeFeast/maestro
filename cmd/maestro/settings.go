@@ -53,7 +53,7 @@ func settingsUsage() {
 	fmt.Fprintln(os.Stderr, "  audit [--limit N]                        show the settings change journal (who/when/old->new)")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "known keys: "+strings.Join(config.FleetSettingKeys(), ", "))
-	fmt.Fprintln(os.Stderr, "flags: --db <path> (default ~/.maestro/config.db), --actor <name>")
+	fmt.Fprintln(os.Stderr, "flags: --db <path> (default ~/.maestro/maestro.db), --actor <name>")
 }
 
 // splitSettingsArgs separates flag tokens from positional arguments so a key /

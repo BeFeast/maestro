@@ -4,19 +4,23 @@ Use Fleet Mission Control as the primary operations surface for Maestro-managed 
 
 This runbook is intentionally safe for shared docs. It uses placeholders for local paths and never requires printing tokens, environment variables, raw config dumps, or full worker logs.
 
-## Workshop Services
+## Fleet Service
 
-Reserve these services and ports on the workshop host:
+Run one Maestro service on the execution host:
 
 | Service | Default bind | Port | Purpose | Notes |
 |---|---:|---:|---|---|
-| Fleet Mission Control | `127.0.0.1` | `8787` | The single dashboard for the whole fleet, plus the `/api/v1/fleet` aggregate API and project-scoped routes (`/project/<name>`) | Start with `maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787` (writes enabled on trusted LAN; add `--read-only=true` for exposed installs) |
-| Project runner | none by default | none | Runs `maestro run --config ...` and owns workers, worktrees, PR handling, and merge/deploy loops | It only serves HTTP when that project config has `server.port` set |
-| Supervisor loop | none | none | Runs `maestro supervise --config ...` to record decisions, safe queue label mutations, and approval requests | Can be manual, timer-driven, or a user service |
+| Maestro fleet daemon + Mission Control | `127.0.0.1` CLI default; `0.0.0.0` in the shipped service | `8786` | Runs every project flow and serves the dashboard, `/api/v1/fleet`, and project-scoped routes (`/project/<name>`) | `maestro daemon --watch-store --store ~/.maestro/maestro.db`; the shipped `maestro.service` uses the same store and port |
 | Worker sessions | none | none | tmux sessions and log files created under each project's `state_dir` | Inspect through Mission Control, `maestro status`, or `maestro logs` |
 | OpenClaw relay | `127.0.0.1` | `18789` | Optional Telegram relay endpoint when `telegram.mode: openclaw` is used | Not required for Mission Control |
 
-> Per-project Mission Control ports (`8788+`) were retired in #516. Every project is now reachable through the fleet aggregator at `/project/<name>`. Old `maestro-<project>-web.service` user units can be stopped and disabled; their `server.port` settings in project YAMLs are honored only when a project runs its own single-tenant `maestro serve --config ...` outside the fleet.
+There is no separate fleet dashboard, project runner, or supervisor service. The
+daemon owns all three responsibilities. Per-project ports and
+`maestro-<project>-web.service`, `maestro@<project>`, `fleet.yaml`, and
+`maestro-fleet.service` belong only to the retired topology; use the explicit
+legacy migration procedure in the
+[project setup runbook](project-setup-runbook.md#single-daemon-mission-control-and-config-store-operating-model)
+rather than recreating them.
 
 ### Dashboard auth posture: trusted LAN vs. exposed install
 
@@ -29,17 +33,19 @@ The server advertises both **HTTP Basic** (any username, password equal to the t
 
 ## Config Boundaries
 
-Project config and fleet config have different jobs.
+The config-store row is the runtime source of truth; the portable YAML is an
+approved input to genesis, not a second watched config surface.
 
-| File | Loaded by | Owns | Does not own |
+| Surface | Loaded by | Owns | Does not own |
 |---|---|---|---|
-| `~/.maestro/maestro-<project>.yaml` | `maestro run`, `maestro supervise`, `maestro status`, `maestro logs`, single-project `maestro serve` | Repo, clone path, worktree path, state directory, session prefix, labels, supervisor policy, review gate, merge/deploy policy | Other projects |
-| `~/.maestro/fleet.yaml` | `maestro serve --fleet` | Project display names and project config paths | Queue policy, labels, state directories, review gates, merge behavior |
-| `.maestro/supervisor.yaml`, `.maestro/supervisor.yml`, or `.maestro/supervisor.md` | Loaded beside the project config or inside `local_path/.maestro` | Supervisor policy when the team wants policy beside the repo | Fleet membership |
+| Project row in `~/.maestro/maestro.db` | `maestro daemon --watch-store` | Repo, clone/worktree paths, stable identity, Management Home link, state/session paths, labels, supervisor, review, merge, and deploy policy | Other project rows |
+| Private portable project YAML | `maestro project plan` / `project apply` | Desired project row reviewed during genesis | Runtime fleet membership after apply |
+| In-repo approved policy/specification | Workers and project policy loaders where explicitly supported | Executable requirements and repo-owned policy | Private Management Home planning context |
 
-Fleet config paths may be absolute, `~/...`, or relative to the fleet YAML file. A fleet file should not duplicate project settings. If a project needs a different label, review gate, state directory, or runner interval, change that project's config and restart that project's runner.
-
-`dashboard_url` was historically used to link from the fleet card to a per-project dashboard on its own port. Those ports are retired (#516); the aggregator routes operators to `/project/<name>` instead. Any `dashboard_url` value still present in a fleet.yaml file is ignored and logged as deprecated on load.
+Do not create `fleet.yaml` or duplicate membership in a second file. Add/change a
+row through the supported config-store/project workflow; `--watch-store` applies
+it without restarting the daemon. The built-in dashboard routes operators to
+`/project/<name>` on port `8786`.
 
 Minimal project config shape:
 
@@ -47,6 +53,12 @@ Minimal project config shape:
 repo: OWNER/REPO
 local_path: /path/to/repos/<project>
 worktree_base: /path/to/worktrees/<project>
+project_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
+management_home:
+  kind: obsidian
+  path: /absolute/path/to/Obsidian Vault/Dev/Areas/<project>
+  vault: Obsidian Vault
+  vault_path: Dev/Areas/<project>
 state_dir: ~/.maestro/<project>
 session_prefix: prj
 
@@ -66,11 +78,6 @@ outcome:
   runtime_host: production host or platform
   non_goals:
     - Rewrite unrelated subsystems
-
-server:
-  host: 127.0.0.1
-  port: 8788
-  # read_only defaults to false (#477 trusted-LAN posture); set true for exposed installs.
 
 blocker_patterns:
   - "blocked by.*?#(\\d+)"
@@ -109,23 +116,22 @@ supervisor:
     - change_global_config
 ```
 
-Minimal fleet config shape:
-
-```yaml
-projects:
-  - name: project-a
-    config: maestro-project-a.yaml
-  - name: project-b
-    config: maestro-project-b.yaml
-```
-
-`dashboard_url:` is deprecated and silently ignored on load (#516). Every project is reachable at `/project/<name>` on the aggregator port.
+Apply the portable YAML with `maestro project plan` followed by its exact
+`next[0]` command. A second plan must report `no-op`; the daemon then exposes the
+row at `/project/<name>` and in `/api/v1/fleet`.
 
 ## Operating Model
 
-Fleet Mission Control is an observation surface. It loads each project config, reads each project's state/log metadata, and returns one aggregate response from `/api/v1/fleet`. The header starts with one global operator brief across every configured project; project cards, supervisor details, queues, and worker logs are drilldown/debug data after that brief. One project load error is shown on that project card without hiding the rest of the fleet.
+Mission Control is the daemon's built-in operations surface. The daemon reads
+every project row from `maestro.db`, runs one flow per row, reads each flow's
+state/log metadata, and returns one aggregate response from `/api/v1/fleet`. The
+header starts with one global operator brief; project cards, supervisor details,
+queues, and worker logs are drilldown/debug data. One project load error is shown
+on that project card without hiding the rest of the fleet.
 
-The project runner remains the execution surface. It starts workers, reconciles dead sessions, opens and monitors PRs, waits for review gates, merges eligible PRs, deploys when configured, and updates local state.
+The same daemon is the execution surface. Each flow starts workers, reconciles
+dead sessions, opens and monitors PRs, waits for review gates, merges eligible
+PRs, deploys when configured, and updates local state.
 
 When deploying Maestro itself from source on the fleet host, stamp the binary with the release version from `VERSION`; an unstamped source build leaves `maestro version` reporting build metadata instead of the release. Use the same stamped build shape as the release workflow, then verify the installed binary:
 
@@ -138,7 +144,12 @@ go build -trimpath -ldflags "-X main.version=${VERSION}" -o maestro ./cmd/maestr
 ./maestro version
 ```
 
-The supervisor is the explainability and policy surface. It records queue analysis, selected candidates, stuck states, outcome context, safe label mutations, and approval requests. Safe actions are limited to actions explicitly listed in `supervisor.safe_actions`. Risky recommendations are recorded for an operator; approving them with the CLI records the approval but does not execute the risky action by itself.
+Each daemon flow includes its supervisor explainability and policy loop. It
+records queue analysis, selected candidates, stuck states, outcome context, safe
+label mutations, and approval requests. Safe actions are limited to actions
+explicitly listed in `supervisor.safe_actions`. Risky recommendations are
+recorded for an operator; approving them with the CLI records the approval but
+does not execute the risky action by itself.
 
 Each project card shows an outcome status: goal, runtime target, health state, and next action. If no `outcome` brief is configured, Mission Control says so explicitly because merged PR throughput is not the same as a working runtime. If PRs keep merging while runtime health is unknown or failing, the supervisor records `no_outcome_progress` and recommends a read-only deploy/runtime check instead of mutating production.
 
@@ -186,12 +197,12 @@ This algorithm is intentionally explicit and explainable. There is no ML priorit
 
 Use this order during normal operations:
 
-1. Open Fleet Mission Control at `http://127.0.0.1:8787/`.
+1. Open Fleet Mission Control at `http://127.0.0.1:8786/` (or the trusted host address configured by `maestro.service`).
 2. Read the global operator brief first; if it says no action is needed, treat the rest of the page as supporting detail.
 3. If the brief names an action, follow that project, issue/PR/session, and reason before scanning lower-priority cards.
-4. Open a project dashboard link only when the fleet card needs project-level detail.
-5. Use CLI commands with explicit `--config` paths when you need local state, logs, or a supervised decision.
-6. Restart services rather than editing state files by hand.
+4. Open `/project/<name>` only when the fleet card needs project-level detail.
+5. Use config-store selectors when a supported CLI diagnostic needs one project.
+6. Never edit state files by hand; restart the one daemon service only when the daemon process itself is unhealthy.
 
 ## Queue Policy
 
@@ -265,30 +276,27 @@ Supervisor approvals are stale-sensitive. A pending approval becomes stale if th
 
 ## Safe Commands
 
-Use explicit config paths for project commands. These commands are safe for local operation because they do not print token values or dump entire configs. Treat worker logs as potentially sensitive and avoid pasting full logs into PRs or issues.
+Use the shared store plus an explicit project row for project-scoped diagnostics.
+These commands do not print token values or dump entire configs. Treat worker
+logs as potentially sensitive and avoid pasting full logs into PRs or issues.
 
 ```bash
-# Fleet dashboard and API (writes enabled by default on trusted LAN; add --read-only=true for exposed installs)
-maestro serve --fleet ~/.maestro/fleet.yaml --host 127.0.0.1 --port 8787
-curl -fsS http://127.0.0.1:8787/api/v1/fleet
+# Fleet daemon, dashboard, and API
+maestro daemon --watch-store --store ~/.maestro/maestro.db \
+  --approvals-store sqlite --state-store sqlite
+curl -fsS http://127.0.0.1:8786/api/v1/fleet
 
-# Project status and queue analysis
-maestro status --config ~/.maestro/maestro-<project>.yaml
-maestro status --config ~/.maestro/maestro-<project>.yaml --json
-maestro supervise --config ~/.maestro/maestro-<project>.yaml --once
-maestro supervise --config ~/.maestro/maestro-<project>.yaml --once --json
+# Project status and read-only queue analysis (use the config-store row name)
+maestro status --config-store ~/.maestro/maestro.db --config-store-project <project> --json
+maestro supervise --config-store ~/.maestro/maestro.db --config-store-project <project> --once --dry-run --json
 
-# Worker logs through Maestro
-maestro logs --config ~/.maestro/maestro-<project>.yaml
-maestro logs --config ~/.maestro/maestro-<project>.yaml <session>
+# Worker status/log excerpts are available from the project's Mission Control
+# route; keep full logs on the execution host.
 
-# Service status and restart
-systemctl --user status maestro@<project>.service --no-pager
-journalctl --user -u maestro@<project>.service --since "30 minutes ago" --no-pager
-systemctl --user restart maestro@<project>.service
-systemctl --user status maestro-fleet.service --no-pager
-journalctl --user -u maestro-fleet.service --since "30 minutes ago" --no-pager
-systemctl --user restart maestro-fleet.service
+# The only Maestro service (Linux user-service installation)
+systemctl --user status maestro.service --no-pager
+journalctl --user -u maestro.service --since "30 minutes ago" --no-pager
+systemctl --user restart maestro.service   # only when the daemon itself is unhealthy
 ```
 
 Avoid these during incident handling unless you are deliberately debugging credentials: `env`, raw config dumps, `gh auth token`, shell history dumps, and full worker log pastebacks.
@@ -312,14 +320,14 @@ Mission Control indicators: queue `eligible=0`, `no_eligible_issues`, `all_eligi
 
 Safe response:
 
-1. Run `maestro supervise --config ~/.maestro/maestro-<project>.yaml --once` and read the queue summary.
+1. Run `maestro supervise --config-store ~/.maestro/maestro.db --config-store-project <project> --once --dry-run --json` and read the queue summary.
 2. If there are no open issues, add or wait for work.
 3. If issues are missing the ready label, add the configured `supervisor.ready_label` or let the supervisor add it when `add_ready_label` is allowed.
 4. If issues are excluded, remove the blocking/excluded label only after confirming the issue is actually runnable.
 5. If issues are held as parent/meta work, decompose or retitle/relabel only when the issue should become executable work.
 6. If issues are blocked by dependencies, close or resolve the blocker issue before expecting a worker to start.
-7. If dynamic wave reports non-runnable project status, move one issue to a configured runnable status or update `supervisor.dynamic_wave.runnable_project_statuses` in the project config.
-8. Restart the project runner only if config changed: `systemctl --user restart maestro@<project>.service`.
+7. If dynamic wave reports non-runnable project status, move one issue to a configured runnable status or deliberately update `supervisor.dynamic_wave.runnable_project_statuses` in the project row.
+8. Store changes are hot-reloaded; do not restart the daemon merely because one project config changed.
 
 ### Running but dead PID
 
@@ -327,11 +335,11 @@ Mission Control indicators: status `running` with `alive=false`, CLI `ALIVE no`,
 
 Safe response:
 
-1. Run `maestro status --config ~/.maestro/maestro-<project>.yaml` to confirm the session and PID.
-2. Inspect the session with `maestro logs --config ~/.maestro/maestro-<project>.yaml <session>`.
-3. Restart the project runner with `systemctl --user restart maestro@<project>.service` so the next reconciliation cycle can mark the session dead and retry if eligible.
-4. If you intentionally need to reconcile immediately, run `maestro run --config ~/.maestro/maestro-<project>.yaml --once` knowing it can progress orchestration for that project.
-5. Do not edit `state.json` manually.
+1. Run `maestro status --config-store ~/.maestro/maestro.db --config-store-project <project> --json` to confirm the session and PID.
+2. Inspect the session through the project's Mission Control route; keep full logs on the execution host.
+3. Let the daemon's next reconciliation cycle mark the session dead and retry if eligible.
+4. Restart `maestro.service` only if the daemon process itself is unhealthy, not to restart one project flow.
+5. Do not edit `state.json` manually or launch a competing `maestro run --once` process.
 
 ### PR open waiting Greptile
 
@@ -343,7 +351,7 @@ Safe response:
 2. Check the GitHub PR page if it remains pending unusually long.
 3. If Greptile is not approved, address the feedback or let the configured retry path handle review feedback.
 4. Do not spawn another worker for the same issue while the PR is open.
-5. Change `review_gate` only as an explicit project policy decision, then restart the project runner.
+5. Change `review_gate` only as an explicit project policy decision; the daemon hot-reloads the changed store row.
 
 ### Retry exhausted
 
@@ -354,7 +362,7 @@ Safe response:
 1. Inspect the session status and logs with explicit `--config` commands.
 2. If a PR is still open, keep it in normal merge flow when checks and review gates pass.
 3. If checks failed or no usable PR exists, review failed attempts, split or clarify the issue, and retry intentionally.
-4. If retrying is appropriate, update the issue/config first, then start a new worker with `maestro spawn --config ~/.maestro/maestro-<project>.yaml --issue <number>`.
+4. If retrying is appropriate, update the issue/project row first, then start a new worker with `maestro spawn --config-store ~/.maestro/maestro.db --config-store-project <project> --issue <number>`.
 5. Do not increase retry budgets globally just to clear one incident unless that is the intended project policy change.
 
 ### Stale approval
@@ -364,14 +372,10 @@ Mission Control indicators: approval status `stale` or CLI error `approval is st
 Safe response:
 
 1. Do not approve the stale approval.
-2. Run `maestro supervise --config ~/.maestro/maestro-<project>.yaml --once` to record a fresh decision.
+2. Let the daemon supervisor record a fresh decision, or run a read-only diagnostic with the config-store selectors shown above.
 3. Review the new target, risk, reasons, and stuck states.
-4. Resolve the new approval ID if needed:
-
-```bash
-maestro supervise approve --config ~/.maestro/maestro-<project>.yaml --actor <operator> --reason "approved after fresh status check" <approval-or-decision-id>
-maestro supervise reject --config ~/.maestro/maestro-<project>.yaml --actor <operator> --reason "state changed" <approval-or-decision-id>
-```
+4. Resolve the new approval through the project's Mission Control approval
+   inbox, which is already bound to the daemon flow and shared approval store.
 
 ### Stale supervisor sessions
 
@@ -388,7 +392,7 @@ Safe response:
    - **Idle/worktree path:** the session is past `idle_after_minutes` AND, when `require_worktree_missing` is true, its recorded worktree path is missing on disk.
    - **Linked-PR-merged path:** the session's branch (head ref recorded as `branch` in the API, e.g. `feat/sup-44-346-…`) maps to a PR that the project state already classifies as merged. This path fires regardless of idle time, so a freshly retry-exhausted session whose PR has just merged stops haunting `attention` immediately.
 3. Reconciled sessions are recorded in `audit-log.jsonl` under the project's `state_dir` with action `stale_session_reconciled`. The audit `reason` field carries the trigger (`linked PR merged` for the new path, otherwise the legacy idle-window reason). Sessions remain searchable in `workers` for drilldown.
-4. To temporarily disable filtering for a project, set `stale_session_reconciler.enabled: false` and restart the project runner.
+4. To temporarily disable filtering for a project, set `stale_session_reconciler.enabled: false` in the project row; the daemon hot-reloads it.
 5. To keep only the legacy idle/worktree behaviour from PR #400, set `stale_session_reconciler.merged_pr_dismisses: false`.
 6. To tighten the idle path during dogfood/recovery, lower `idle_after_minutes` (for example `60` for one hour). Keep `require_worktree_missing: true` so a live worker is never reclaimed.
 7. The reconciler reads PR state from the existing project state snapshot (sessions already transitioned to `done`/`code_landed`); it does not issue ad-hoc `gh` calls in the snapshot path.
@@ -412,14 +416,15 @@ Safe response:
 2. Confirm the GitHub user or app has access to the repo and project board.
 3. Retry after GitHub rate limits or project API incidents clear.
 4. If dynamic wave depends on project status, keep work paused until project item data is reliable or make an explicit temporary policy change in the project config.
-5. Restart only the affected project runner after config or auth is fixed.
+5. Project-row changes hot-reload. Restart the single daemon only if the daemon process itself remains unhealthy after auth/config is fixed.
 6. Do not paste raw GraphQL output, tokens, or local config contents into issues or PRs.
 
 ## Operator Checklist
 
-- Fleet dashboard is reachable on `127.0.0.1:8787`; on a trusted LAN it is write-enabled by default (#477), with the cautious approval gate guarding `merge_pr` / `close_issue` / `delete_worktree` / `change_global_config`.
-- Every project in `~/.maestro/fleet.yaml` has a distinct `state_dir`, `session_prefix`, and optional project dashboard port.
-- Project commands use `--config ~/.maestro/maestro-<project>.yaml`.
+- The single daemon and Mission Control are reachable on port `8786`; on a trusted LAN it is write-enabled by default (#477), with the cautious approval gate guarding `merge_pr` / `close_issue` / `delete_worktree` / `change_global_config`.
+- `maestro.service`, project genesis, and operator commands all use `~/.maestro/maestro.db`.
+- Every project row has a distinct stable identity, `state_dir`, and `session_prefix`; there are no per-project dashboard ports or services.
+- Project diagnostics use explicit `--config-store` and `--config-store-project` selectors where supported.
 - Dynamic wave has known runnable statuses and clear ready/blocked label ownership.
 - Greptile gate policy is explicit per project.
 - Approvals are fresh before being approved or rejected.

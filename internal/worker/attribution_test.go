@@ -27,7 +27,7 @@ func attribCfgWithBackends() *config.Config {
 					Effort:   "medium",
 				},
 				"freellm": {
-					Cmd: "/home/god/.maestro/bin/maestro-freellm",
+					Cmd: "/srv/example-home/.maestro/bin/maestro-freellm",
 					// Intentionally no metadata — backends without
 					// declared attribution still work; UI shows "—".
 				},

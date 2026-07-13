@@ -18,7 +18,7 @@ func TestSelectVisualQAKills_MatchesByCmdlineAndCwd(t *testing.T) {
 		// Matches: cwd is under the visual-QA temp dir (crashpad handler).
 		{PID: 102, Cmdline: "chrome_crashpad_handler", Cwd: "/tmp/scribe-visual-qa-abc123"},
 		// No match: generic chrome with an unrelated profile — must NOT be killed.
-		{PID: 103, Cmdline: "chrome --user-data-dir=/home/god/.config/google-chrome"},
+		{PID: 103, Cmdline: "chrome --user-data-dir=/srv/example-home/.config/google-chrome"},
 		// No match: unrelated process.
 		{PID: 104, Cmdline: "node server.js", Cwd: "/srv/app"},
 		// Ignored: non-positive PID is never selected.

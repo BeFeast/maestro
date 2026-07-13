@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -71,7 +71,7 @@ type Store struct {
 func Open(path string) (*Store, error) {
 	// busy_timeout makes a connection wait (up to 5s) for a lock instead of
 	// erroring with "database is locked" immediately: the daemon's watch-loop
-	// reads config.db (ProjectsFingerprint every tick, Load on add) while
+	// reads maestro.db (ProjectsFingerprint every tick, Load on add) while
 	// `config-store add/rm/edit` writes it from a SEPARATE process (#757). WAL
 	// lets a reader and a writer proceed concurrently across processes. The
 	// pragmas go in the DSN so modernc applies them to every pooled connection.
@@ -106,38 +106,196 @@ func OpenReadOnly(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	u := &url.URL{Scheme: "file", Path: abs}
-	q := u.Query()
-	q.Set("mode", "ro")
-	walExists := pathExists(abs + "-wal")
-	shmExists := pathExists(abs + "-shm")
-	switch {
-	case !walExists && !shmExists:
-		// A closed/checkpointed DB has no WAL state to discover. Immutable mode
-		// prevents SQLite from creating read-lock sidecars, preserving the
-		// zero-file-write plan contract.
-		q.Set("immutable", "1")
-	case walExists != shmExists:
-		return nil, fmt.Errorf("config store has an incomplete WAL sidecar set; refusing zero-write read-only open")
+	snapshot, err := readSQLiteSnapshot(abs)
+	if err != nil {
+		return nil, err
 	}
-	q.Add("_pragma", "busy_timeout(5000)")
-	q.Add("_pragma", "query_only(1)")
-	u.RawQuery = q.Encode()
-	db, err := sql.Open("sqlite", u.String())
+	// Committed WAL frames are already overlaid. Mark the detached image as
+	// rollback-journal format so the in-memory connection never looks for a
+	// filesystem WAL after deserialization.
+	snapshot[18], snapshot[19] = 1, 1
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if err := db.Ping(); err != nil {
+	db.SetMaxIdleConns(1)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	err = conn.Raw(func(driverConn any) error {
+		deserializer, ok := driverConn.(interface{ Deserialize([]byte) error })
+		if !ok {
+			return fmt.Errorf("sqlite driver does not support in-memory deserialize")
+		}
+		return deserializer.Deserialize(snapshot)
+	})
+	conn.Close()
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
 }
 
-func pathExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+// ExistingProjectCount inspects an existing store without changing its files.
+// A unified database that contains approvals/state tables but has not yet been
+// initialized as a config store reports zero projects.
+func ExistingProjectCount(path string) (int, error) {
+	store, err := OpenReadOnly(path)
+	if err != nil {
+		return 0, err
+	}
+	defer store.Close()
+	var tableCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'project'`).Scan(&tableCount); err != nil {
+		return 0, err
+	}
+	if tableCount == 0 {
+		return 0, nil
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM project`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// readSQLiteSnapshot reads the database and optional WAL twice. Returning only
+// equal pairs means a concurrent checkpoint/reset cannot produce a torn hybrid
+// snapshot. It never opens SQLite's locking or shared-memory files.
+func readSQLiteSnapshot(path string) ([]byte, error) {
+	const attempts = 5
+	for i := 0; i < attempts; i++ {
+		db1, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		wal1, err := readOptionalFile(path + "-wal")
+		if err != nil {
+			return nil, err
+		}
+		db2, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		wal2, err := readOptionalFile(path + "-wal")
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Equal(db1, db2) && bytes.Equal(wal1, wal2) {
+			return applySQLiteWAL(db1, wal1)
+		}
+	}
+	return nil, fmt.Errorf("config store changed continuously while taking a zero-write snapshot; retry plan")
+}
+
+func readOptionalFile(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return b, err
+}
+
+// applySQLiteWAL reconstructs the last committed database image using SQLite's
+// documented WAL salts and cumulative checksums. A partial or uncommitted tail
+// is ignored; malformed committed state is rejected instead of guessed.
+func applySQLiteWAL(mainDB, wal []byte) ([]byte, error) {
+	if len(mainDB) < 100 || string(mainDB[:16]) != "SQLite format 3\x00" {
+		return nil, fmt.Errorf("invalid SQLite database header")
+	}
+	if len(wal) == 0 {
+		return append([]byte(nil), mainDB...), nil
+	}
+	if len(wal) < 32 {
+		return nil, fmt.Errorf("truncated SQLite WAL header")
+	}
+	magic := binary.BigEndian.Uint32(wal[0:4])
+	var order binary.ByteOrder
+	switch magic {
+	case 0x377f0682:
+		order = binary.LittleEndian
+	case 0x377f0683:
+		order = binary.BigEndian
+	default:
+		return nil, fmt.Errorf("invalid SQLite WAL magic 0x%x", magic)
+	}
+	if version := binary.BigEndian.Uint32(wal[4:8]); version != 3007000 {
+		return nil, fmt.Errorf("unsupported SQLite WAL format version %d", version)
+	}
+	pageSize := int(binary.BigEndian.Uint32(wal[8:12]))
+	if pageSize == 0 {
+		pageSize = 65536
+	}
+	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 {
+		return nil, fmt.Errorf("invalid SQLite WAL page size %d", pageSize)
+	}
+	mainPageSize := int(binary.BigEndian.Uint16(mainDB[16:18]))
+	if mainPageSize == 1 {
+		mainPageSize = 65536
+	}
+	if pageSize != mainPageSize {
+		return nil, fmt.Errorf("SQLite WAL page size %d does not match database page size %d", pageSize, mainPageSize)
+	}
+	s0, s1 := walChecksum(order, 0, 0, wal[:24])
+	if s0 != binary.BigEndian.Uint32(wal[24:28]) || s1 != binary.BigEndian.Uint32(wal[28:32]) {
+		return nil, fmt.Errorf("invalid SQLite WAL header checksum")
+	}
+
+	frameSize := 24 + pageSize
+	frames := (len(wal) - 32) / frameSize
+	lastCommit, commitPages := -1, uint32(0)
+	for i := 0; i < frames; i++ {
+		off := 32 + i*frameSize
+		frame := wal[off : off+frameSize]
+		if !bytes.Equal(frame[8:16], wal[16:24]) {
+			break
+		}
+		s0, s1 = walChecksum(order, s0, s1, frame[:8])
+		s0, s1 = walChecksum(order, s0, s1, frame[24:])
+		if s0 != binary.BigEndian.Uint32(frame[16:20]) || s1 != binary.BigEndian.Uint32(frame[20:24]) {
+			break
+		}
+		if binary.BigEndian.Uint32(frame[0:4]) == 0 {
+			return nil, fmt.Errorf("invalid SQLite WAL page number 0")
+		}
+		if pages := binary.BigEndian.Uint32(frame[4:8]); pages > 0 {
+			lastCommit, commitPages = i, pages
+		}
+	}
+	if lastCommit < 0 {
+		return append([]byte(nil), mainDB...), nil
+	}
+	total := uint64(commitPages) * uint64(pageSize)
+	const maxGenesisSnapshotBytes = uint64(1 << 30)
+	if total == 0 || total > uint64(^uint(0)>>1) || total > maxGenesisSnapshotBytes {
+		return nil, fmt.Errorf("invalid SQLite WAL commit size %d", commitPages)
+	}
+	out := make([]byte, int(total))
+	copy(out, mainDB)
+	for i := 0; i <= lastCommit; i++ {
+		off := 32 + i*frameSize
+		pageNumber := binary.BigEndian.Uint32(wal[off : off+4])
+		if pageNumber > commitPages {
+			// A later committed transaction may shrink a database. Pages above
+			// its final size are intentionally omitted from the snapshot.
+			continue
+		}
+		start := int(pageNumber-1) * pageSize
+		copy(out[start:start+pageSize], wal[off+24:off+frameSize])
+	}
+	return out, nil
+}
+
+func walChecksum(order binary.ByteOrder, s0, s1 uint32, data []byte) (uint32, uint32) {
+	for i := 0; i+8 <= len(data); i += 8 {
+		s0 += order.Uint32(data[i:i+4]) + s1
+		s1 += order.Uint32(data[i+4:i+8]) + s0
+	}
+	return s0, s1
 }
 
 func (s *Store) Close() error {
@@ -535,7 +693,8 @@ ON CONFLICT(name) DO UPDATE SET config_yaml = excluded.config_yaml, updated_at =
 //   - incoming id empty            -> preserve the stored id (ordinary edits do
 //     not implicitly clear identity);
 //   - stored id empty              -> allowed (adding an id to a legacy id-less row);
-//   - stored == incoming           -> allowed (no change);
+//   - stored == incoming           -> allowed (UUID comparison ignores case so
+//     a legacy uppercase row can be normalized to canonical lowercase);
 //   - stored != incoming, both set -> REJECTED as an identity mismatch.
 //
 // A genuinely different id is an explicit migration concern, not an ordinary
@@ -562,7 +721,7 @@ func enforceImmutableProjectID(ctx context.Context, tx *sql.Tx, name string, inc
 		setMappingChild(incomingRoot, "project_id", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: stored})
 		return nil
 	}
-	if stored != "" && stored != incoming {
+	if stored != "" && !strings.EqualFold(stored, incoming) {
 		return fmt.Errorf("project %q: project_id is immutable (stored %q, refusing to overwrite with %q); create a new project or run an explicit migration to change it", name, stored, incoming)
 	}
 	return nil

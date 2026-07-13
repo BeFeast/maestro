@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/befeast/maestro/internal/configstore"
@@ -99,11 +102,21 @@ func projectCmd(args []string) {
 // effect against the store, and prints a receipt. Exit is non-zero on a
 // validation failure or an identity conflict so an adapter can gate on it.
 func projectPlanCmd(args []string) {
-	fs := flag.NewFlagSet("project plan", flag.ExitOnError)
+	requestedJSON := argsRequestJSON(args)
+	fs := flag.NewFlagSet("project plan", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	file := fs.String("file", "", "Path to the portable project YAML")
 	dbPath := fs.String("db", defaultProjectStorePath(), "Path to the SQLite config store")
 	asJSON := fs.Bool("json", false, "Emit the receipt as JSON")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		failGenesis("plan", requestedJSON, "invalid_flags", fmt.Sprintf("project plan: invalid flags: %v", err))
+	}
+	if fs.NArg() != 0 {
+		failGenesis("plan", requestedJSON, "invalid_flags", fmt.Sprintf("project plan: unexpected arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if strings.TrimSpace(*dbPath) == "" {
+		failGenesis("plan", *asJSON, "invalid_input", "project plan: --db must not be empty")
+	}
 
 	prepared := prepareGenesisFile(*file, "project plan", *asJSON)
 	if err := validateGenesisRuntime(prepared); err != nil {
@@ -127,14 +140,24 @@ func projectPlanCmd(args []string) {
 // exactly one row idempotently after the confirm/fingerprint gates. Exit is
 // non-zero on any refusal (missing/wrong confirm, stale fingerprint, conflict).
 func projectApplyCmd(args []string) {
-	fs := flag.NewFlagSet("project apply", flag.ExitOnError)
+	requestedJSON := argsRequestJSON(args)
+	fs := flag.NewFlagSet("project apply", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	file := fs.String("file", "", "Path to the portable project YAML")
 	dbPath := fs.String("db", defaultProjectStorePath(), "Path to the SQLite config store")
 	confirm := fs.String("confirm", "", "Exact project_id to confirm the write (required)")
 	fingerprint := fs.String("fingerprint", "", "Exact plan-time config fingerprint (required)")
 	baseline := fs.String("baseline", "", "Exact plan-time baseline_fingerprint (required; `absent` for create)")
 	asJSON := fs.Bool("json", false, "Emit the receipt as JSON")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		failGenesis("apply", requestedJSON, "invalid_flags", fmt.Sprintf("project apply: invalid flags: %v", err))
+	}
+	if fs.NArg() != 0 {
+		failGenesis("apply", requestedJSON, "invalid_flags", fmt.Sprintf("project apply: unexpected arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if strings.TrimSpace(*dbPath) == "" {
+		failGenesis("apply", *asJSON, "invalid_input", "project apply: --db must not be empty")
+	}
 
 	prepared := prepareGenesisFile(*file, "project apply", *asJSON)
 	if err := validateGenesisRuntime(prepared); err != nil {
@@ -165,6 +188,23 @@ func projectApplyCmd(args []string) {
 	}
 	receipt := buildGenesisReceipt("apply", *dbPath, *file, prepared, report)
 	emitGenesisReceipt(receipt, *asJSON)
+}
+
+// argsRequestJSON preserves the machine-readable error contract even when flag
+// parsing itself fails before the FlagSet can populate its --json variable.
+func argsRequestJSON(args []string) bool {
+	for _, arg := range args {
+		if arg == "--json" || arg == "-json" {
+			return true
+		}
+		for _, prefix := range []string{"--json=", "-json="} {
+			if strings.HasPrefix(arg, prefix) {
+				value, err := strconv.ParseBool(strings.TrimPrefix(arg, prefix))
+				return err != nil || value
+			}
+		}
+	}
+	return false
 }
 
 func validateApplyApproval(p *configstore.PreparedProject, confirm, fingerprint, baseline string) error {
@@ -235,20 +275,46 @@ func validateGenesisRuntime(p *configstore.PreparedProject) error {
 	default:
 		return fmt.Errorf("inspect worktree_base %s: %w", p.WorktreeBase, err)
 	}
+	homeInfo, err := os.Stat(p.ManagementHome.Path)
+	if err != nil {
+		return fmt.Errorf("management_home.path %s is unavailable: %w", p.ManagementHome.Path, err)
+	}
+	if !homeInfo.IsDir() {
+		return fmt.Errorf("management_home.path %s is not a directory", p.ManagementHome.Path)
+	}
 	return nil
 }
 
 func remoteMatchesRepo(remote, repo string) bool {
-	r := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(remote)), ".git")
-	want := strings.ToLower(strings.Trim(strings.TrimSpace(repo), "/"))
-	return want != "" && (strings.HasSuffix(r, "/"+want) || strings.HasSuffix(r, ":"+want))
+	r := strings.TrimSpace(remote)
+	want := strings.ToLower(strings.TrimSuffix(strings.Trim(strings.TrimSpace(repo), "/"), ".git"))
+	lowerRemote := strings.ToLower(r)
+	if strings.HasPrefix(lowerRemote, "git@github.com:") {
+		got := strings.TrimSuffix(strings.TrimPrefix(lowerRemote, "git@github.com:"), ".git")
+		return got == want
+	}
+	u, err := url.Parse(r)
+	if err != nil || !strings.EqualFold(u.Hostname(), "github.com") {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https", "http", "ssh", "git":
+	default:
+		return false
+	}
+	got := strings.TrimSuffix(strings.ToLower(strings.Trim(u.Path, "/")), ".git")
+	return got == want
 }
 
 // planReport previews prepared against the store at dbPath without any write. A
 // store file that does not exist yet is treated as empty (effect create) WITHOUT
 // opening it, so `plan` never creates a schema-only DB — it changes no files.
 func planReport(dbPath string, prepared *configstore.PreparedProject, asJSON bool) *configstore.GenesisReport {
-	if !storeFileExists(dbPath) {
+	exists, err := inspectStoreFile(dbPath)
+	if err != nil {
+		failGenesis("plan", asJSON, "store_preflight_failed", fmt.Sprintf("project plan: inspect config store %s: %v", dbPath, err))
+	}
+	if !exists {
 		return configstore.PlanEmpty(prepared)
 	}
 	store, err := configstore.OpenReadOnly(dbPath)
@@ -266,8 +332,40 @@ func planReport(dbPath string, prepared *configstore.PreparedProject, asJSON boo
 // storeFileExists reports whether the config store path already exists on disk.
 // A missing store is planned as empty rather than created.
 func storeFileExists(path string) bool {
+	exists, _ := inspectStoreFile(path)
+	return exists
+}
+
+func inspectStoreFile(path string) (bool, error) {
 	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
+	if os.IsNotExist(err) {
+		if err := inspectStoreCreateParent(path); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("path exists but is not a regular file")
+	}
+	return true, nil
+}
+
+func inspectStoreCreateParent(path string) error {
+	parent := filepath.Dir(path)
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("store parent %s is unavailable: %w", parent, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("store parent %s is not a directory", parent)
+	}
+	if info.Mode().Perm()&0o222 == 0 {
+		return fmt.Errorf("store parent %s is not writable", parent)
+	}
+	return nil
 }
 
 // buildGenesisReceipt combines the library report with the CLI-only fields (store
@@ -341,6 +439,8 @@ func genesisReconcileFor(command, effect, conflict, watchStore string) genesisRe
 		r.Note = appendNote(r.Note, "a maestro daemon is running WITHOUT --watch-store on this host; it will not hot-reconcile the row — restart it with --watch-store or reconcile manually")
 	case watchStoreDifferentStore:
 		r.Note = appendNote(r.Note, "a maestro daemon with --watch-store is running on this host, but it watches a different --store path; it will not hot-reconcile this row")
+	case watchStoreImplicitStore:
+		r.Note = appendNote(r.Note, "a maestro daemon with --watch-store is running without an explicit --store; its startup-time default cannot be reconstructed safely after store migration — verify the daemon store or restart it with an explicit --store path")
 	case watchStoreNotObserved:
 		r.Note = appendNote(r.Note, "no running maestro daemon was observed from this host; confirm the fleet daemon runs with --watch-store so the row is hot-reconciled")
 	default: // unknown
@@ -368,7 +468,7 @@ func genesisNextCommands(command, storePath, file, projectID, fingerprint, basel
 			}
 		}
 		return []string{
-			fmt.Sprintf("maestro project apply --file %s --db %s --confirm %s --fingerprint %s --baseline %s --json", file, storePath, projectID, fingerprint, baseline),
+			fmt.Sprintf("maestro project apply --file %s --db %s --confirm %s --fingerprint %s --baseline %s --json", shellQuote(file), shellQuote(storePath), shellQuote(projectID), shellQuote(fingerprint), shellQuote(baseline)),
 		}
 	case "apply":
 		if effect == configstore.EffectConflict {
@@ -379,10 +479,19 @@ func genesisNextCommands(command, storePath, file, projectID, fingerprint, basel
 		return []string{
 			// Re-running plan is the scriptable confirmation the row landed: it
 			// must now report effect "no-op".
-			fmt.Sprintf("maestro project plan --file %s --db %s --json   # expect effect \"no-op\": the row is stored", file, storePath),
+			fmt.Sprintf("maestro project plan --file %s --db %s --json   # expect effect \"no-op\": the row is stored", shellQuote(file), shellQuote(storePath)),
 		}
 	}
 	return nil
+}
+
+func shellQuote(s string) string {
+	if s != "" && strings.IndexFunc(s, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("_@%+=:,./-", r))
+	}) == -1 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 // emitGenesisReceipt prints the receipt as JSON (stable, adapter-facing) or as a
@@ -422,6 +531,7 @@ const (
 	watchStoreObserved       = "observed"
 	watchStoreRunningWithout = "running-without-watch-store"
 	watchStoreDifferentStore = "running-with-different-store"
+	watchStoreImplicitStore  = "running-with-implicit-store"
 	watchStoreNotObserved    = "not-observed"
 	watchStoreUnknown        = "unknown"
 )
@@ -443,6 +553,7 @@ func probeDaemonWatchStore(expectedStore string) string {
 func classifyDaemonWatchStore(procs [][]string, expectedStore string) string {
 	daemonFound := false
 	watchStoreFound := false
+	implicitStoreFound := false
 	for _, argv := range procs {
 		if !looksLikeMaestroDaemon(argv) {
 			continue
@@ -450,10 +561,18 @@ func classifyDaemonWatchStore(procs [][]string, expectedStore string) string {
 		daemonFound = true
 		if argvHasWatchStore(argv) {
 			watchStoreFound = true
-			if sameStorePath(daemonStorePath(argv), expectedStore) {
+			storePath, explicit := daemonStorePath(argv)
+			if !explicit {
+				implicitStoreFound = true
+				continue
+			}
+			if sameStorePath(storePath, expectedStore) {
 				return watchStoreObserved
 			}
 		}
+	}
+	if implicitStoreFound {
+		return watchStoreImplicitStore
 	}
 	if watchStoreFound {
 		return watchStoreDifferentStore
@@ -464,16 +583,16 @@ func classifyDaemonWatchStore(procs [][]string, expectedStore string) string {
 	return watchStoreNotObserved
 }
 
-func daemonStorePath(argv []string) string {
+func daemonStorePath(argv []string) (string, bool) {
 	for i, arg := range argv {
 		if (arg == "--store" || arg == "-store") && i+1 < len(argv) {
-			return argv[i+1]
+			return argv[i+1], true
 		}
 		if strings.HasPrefix(arg, "--store=") || strings.HasPrefix(arg, "-store=") {
-			return strings.SplitN(arg, "=", 2)[1]
+			return strings.SplitN(arg, "=", 2)[1], true
 		}
 	}
-	return ""
+	return "", false
 }
 
 func sameStorePath(got, want string) bool {
@@ -486,7 +605,7 @@ func sameStorePath(got, want string) bool {
 }
 
 func defaultProjectStorePath() string {
-	return filepath.Join(os.Getenv("HOME"), ".maestro", "maestro.db")
+	return defaultConfigStorePath()
 }
 
 // looksLikeMaestroDaemon reports whether argv is a `maestro daemon ...`
