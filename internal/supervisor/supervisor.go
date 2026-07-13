@@ -180,6 +180,7 @@ type Engine struct {
 	llm               LLMClient
 	now               func() time.Time
 	pidAlive          func(pid int) bool
+	tmuxAlive         func(name string) bool
 	stat              func(name string) (os.FileInfo, error)
 	lookPath          func(file string) (string, error)
 	preflight         PreflightRunner
@@ -205,6 +206,7 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 		reader:            reader,
 		now:               func() time.Time { return time.Now().UTC() },
 		pidAlive:          pidAlive,
+		tmuxAlive:         tmuxSessionAlive,
 		stat:              os.Stat,
 		lookPath:          exec.LookPath,
 		preflight:         defaultPreflightRunner,
@@ -1500,12 +1502,19 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}
 
 		if sess.Status == state.StatusRunning {
-			if sess.PID <= 0 {
+			// #877: a worker's tmux server runs in a transient scope outside
+			// maestro.service's cgroup, so it survives a self-deploy restart of
+			// the daemon. A live tmux session therefore means the worker is still
+			// executing even when the recorded pane PID went stale across the
+			// restart — do not raise a "dead running pid" finding that would nudge
+			// an operator to reconcile a genuinely-live worker to dead.
+			tmuxLive := e.tmuxAlive(workerTmuxName(slot, sess))
+			if sess.PID <= 0 && !tmuxLive {
 				findings = append(findings, stuckState("dead_running_pid", SeverityBlocked,
 					fmt.Sprintf("Worker %s is marked running, but no live process is recorded.", slot),
 					"Run a Maestro reconciliation cycle or inspect the worker before dispatching more work.", true, target,
 					fmt.Sprintf("Session %s status=running pid=%d", slot, sess.PID)))
-			} else if !e.pidAlive(sess.PID) {
+			} else if sess.PID > 0 && !e.pidAlive(sess.PID) && !tmuxLive {
 				findings = append(findings, stuckState("dead_running_pid", SeverityBlocked,
 					fmt.Sprintf("Worker %s is marked running, but PID %d is not alive.", slot, sess.PID),
 					"Run a Maestro reconciliation cycle so the session can be marked dead and retried if eligible.", true, target,
@@ -3953,6 +3962,27 @@ func pidAlive(pid int) bool {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+// tmuxSessionAlive reports whether the worker's detached tmux session exists.
+// Because maestro launches worker tmux servers in a transient scope outside
+// maestro.service's cgroup (#877), a worker survives a self-deploy restart of
+// the daemon; a live tmux session means the runner script is still executing,
+// even if the recorded pane PID went stale across the restart.
+func tmuxSessionAlive(name string) bool {
+	if name == "" {
+		return false
+	}
+	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+}
+
+// workerTmuxName returns the tmux session name for a running session, falling
+// back to the derived name when the session did not record one.
+func workerTmuxName(slot string, sess *state.Session) string {
+	if sess != nil && sess.TmuxSession != "" {
+		return sess.TmuxSession
+	}
+	return worker.TmuxSessionName(slot)
 }
 
 func stuckState(code, severity, summary, recommendedAction string, supervisorCanAct bool, target *state.SupervisorTarget, evidence ...string) state.SupervisorStuckState {

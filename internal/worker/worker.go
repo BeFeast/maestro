@@ -153,8 +153,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := LaunchTmuxSession(tmuxName, worktreePath, runnerPath); err != nil {
 		return "", fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
@@ -301,8 +300,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := LaunchTmuxSession(tmuxName, worktreePath, runnerPath); err != nil {
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 

@@ -91,8 +91,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	}
 
 	// Start tmux session
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", sess.Worktree, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := LaunchTmuxSession(tmuxName, sess.Worktree, runnerPath); err != nil {
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 

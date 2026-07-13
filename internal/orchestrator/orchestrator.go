@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +59,7 @@ type Orchestrator struct {
 	enhancementPromptBase string
 	pidAliveFn            func(pid int) bool
 	tmuxSessionExistsFn   func(name string) bool
+	tmuxPanePIDFn         func(name string) int
 	listOpenPRsFn         func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
@@ -259,6 +261,58 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 		return false
 	}
 	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+}
+
+// tmuxPanePID returns the live pane PID of tmux session name, or 0 if the
+// session is gone or its PID cannot be read.
+func (o *Orchestrator) tmuxPanePID(name string) int {
+	if o.tmuxPanePIDFn != nil {
+		return o.tmuxPanePIDFn(name)
+	}
+	if name == "" {
+		return 0
+	}
+	out, err := exec.Command("tmux", "list-panes", "-t", name, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+// adoptSurvivingTmux handles the #877 case where a running session's recorded
+// pane PID reads dead but its tmux session is still live. Because maestro
+// launches worker tmux servers in a transient `systemd-run --user --scope`
+// cgroup outside maestro.service (internal/worker/spawn.go), a self-deploy
+// restart of the daemon leaves the worker running; the recorded PID is normally
+// still alive across the restart, but if it went stale (e.g. a phase transition
+// the previous daemon did not persist) a naive liveness check would declare a
+// false running->dead — stranding the dirty worktree and re-dispatching a
+// duplicate. When the tmux session survives with a live pane, adopt it: refresh
+// the recorded PID/session and keep the session running exactly once. Returns
+// true when the session was adopted (caller should treat it as still live).
+func (o *Orchestrator) adoptSurvivingTmux(slotName string, sess *state.Session) bool {
+	tmuxName := sess.TmuxSession
+	if tmuxName == "" {
+		tmuxName = worker.TmuxSessionName(slotName)
+	}
+	if !o.tmuxSessionExists(tmuxName) {
+		return false
+	}
+	pid := o.tmuxPanePID(tmuxName)
+	if pid <= 0 || !o.pidAlive(pid) {
+		return false
+	}
+	if pid != sess.PID {
+		log.Printf("[orch] reconcile: %s tmux session %s survived a daemon restart with a live pane (pid %d, recorded %d) — adopting, no running->dead transition (#877)",
+			slotName, tmuxName, pid, sess.PID)
+	}
+	sess.PID = pid
+	sess.TmuxSession = tmuxName
+	return true
 }
 
 func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
@@ -2832,6 +2886,15 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			continue
 		}
 
+		// #877: the recorded pane PID reads dead/missing but the tmux session is
+		// still live — the worker survived a self-deploy restart in its transient
+		// scope outside maestro.service's cgroup. Adopt the surviving pane (refresh
+		// the recorded PID) rather than a false running->dead + duplicate dispatch.
+		if o.adoptSurvivingTmux(slotName, sess) {
+			reconciled = true
+			continue
+		}
+
 		// Worker process/session is gone. Before marking dead, check whether it
 		// already opened a PR. If so, transition to pr_open — the worker succeeded.
 		// Without this check, reconcile would mark the session dead, causing
@@ -3628,6 +3691,15 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
 				state.MarkWorkerEnded(sess, now)
+				continue
+			}
+
+			// #877: a worker's tmux server runs in a transient scope outside
+			// maestro.service's cgroup, so it (and the worker) survive a
+			// self-deploy restart of the daemon. If the recorded pane PID reads
+			// dead but the tmux session is still live, adopt the surviving pane
+			// rather than declaring a false running->dead over a live worker.
+			if sess.PID > 0 && !o.pidAlive(sess.PID) && o.adoptSurvivingTmux(slotName, sess) {
 				continue
 			}
 

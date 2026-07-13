@@ -58,6 +58,27 @@ The script then:
    stop path runs, so existing **drain semantics are honored**: if your unit
    declares `ExecStop=... drain`, in-flight workers finish before the stop
    completes. Budget for this in `timeout_minutes`.
+
+   **Cgroup / kill ownership — in-flight workers span the restart (#877).** A
+   restart of `maestro.service` must not kill in-flight tmux workers before the
+   drain completes. Two things guarantee that, and both live in-repo:
+   - `maestro.service` declares **`KillMode=process`** (not the systemd default
+     `control-group`). The unit's stop/restart kill is scoped to the daemon's
+     *main* process, so systemd never SIGTERM/SIGKILLs the rest of the unit's
+     control group. The default `control-group` would sweep the worker tmux
+     server and every Claude worker out with the daemon — even while the
+     daemon's in-process drain still reported them running — and the next daemon
+     would mark them `running -> dead` (the 2026-07-12 incident).
+   - maestro launches each worker's tmux server inside a transient
+     **`systemd-run --user --scope`** cgroup (`internal/worker/spawn.go`), a
+     *sibling* of `maestro.service` rather than a child. The worker (and its
+     dirty worktree) therefore outlives a restart of the daemon unit; on the
+     next start the orchestrator re-attaches to the still-live pane instead of a
+     false `running -> dead` (`adoptSurvivingTmux`). On a host without a usable
+     user manager the scope launch degrades to an in-cgroup launch, and
+     `KillMode=process` is the belt that still keeps that worker alive. This
+     makes permanent the manual workaround (resume the run scripts in a tmux
+     server outside the service cgroup).
 4. **Verifies health** — the installed CLI must report the stamped version
    (`maestro version` → `maestro v<VERSION>+g<shortsha>`), every unit must be
    `active`, and (when a health URL is configured) the **running process**

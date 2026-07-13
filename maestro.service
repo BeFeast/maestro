@@ -33,6 +33,20 @@ ExecStart=/usr/local/bin/maestro daemon \
 # daemon's own --drain-timeout (default 5m) finishes well inside this window
 # (#817).
 TimeoutStopSec=6min
+# Cgroup / kill ownership (#877). The default KillMode=control-group makes a
+# `systemctl stop|restart` (notably a self-deploy restart) SIGTERM — then, at
+# TimeoutStopSec, SIGKILL — EVERY process in the unit's control group. A worker's
+# tmux server, spawned as a descendant of the daemon, would otherwise land in
+# that cgroup and be swept out mid-flight, killing in-flight Claude workers while
+# the daemon's own drain still reported them "running" and the next daemon marked
+# them running->dead. KillMode=process scopes the unit's stop/restart to the
+# daemon's MAIN process only: the daemon owns worker lifecycle (in-process drain
+# on the first SIGTERM), and worker tmux servers — which maestro launches in a
+# transient `systemd-run --user --scope` cgroup that is a SIBLING of this unit,
+# not a child (internal/worker/spawn.go) — are never a target of this unit's
+# kill. The scope launch is the primary guarantee; KillMode=process is the belt
+# that also protects the in-cgroup fallback path on hosts without a usable scope.
+KillMode=process
 Restart=on-failure
 RestartSec=30
 
