@@ -1,138 +1,391 @@
 package state
 
 import (
+	"fmt"
+	"sort"
 	"time"
 
 	"github.com/befeast/maestro/internal/progress"
 )
 
-// MaterialProgress is the durable per-project stalled-progress watermark plus
-// the watchdog's cadence and last decisions (#887).
-//
-// The Watermark carries the last material-progress identity/time; the deadline
-// is never stored — it is always derived from Watermark.At + the silence budget
-// so a daemon restart re-reads the same watermark and computes the identical
-// deadline (no reset, no duplication). LastDecision is the most recent watchdog
-// verdict (progress observed / waiting / stall action); LastRecovery is the
-// most recent verdict that actually asked for a recovery action, kept separate
-// so Fleet can report "last recovery" without it being overwritten by a routine
-// progress tick. All fields are secret-free: fingerprints are non-reversible
-// digests and no raw path, secret, or command output is ever persisted.
+// MaterialProgress is the durable stalled-progress watchdog state for a
+// project. Targets are independently watermarked exact workers, PR gates, or
+// delivery leases: progress by worker B can never reset worker A's deadline.
+// An idle project has no active target and therefore no armed deadline.
 type MaterialProgress struct {
-	Watermark           progress.Watermark `json:"watermark"`
-	BudgetSeconds       int                `json:"budget_seconds,omitempty"`        // silence budget in effect at last evaluation (0 = watchdog disabled)
-	EvalIntervalSeconds int                `json:"eval_interval_seconds,omitempty"` // watchdog evaluation cadence, distinct from the poll/supervisor cadences
-	LastEvaluatedAt     time.Time          `json:"last_evaluated_at,omitempty"`
-	LastDecision        *progress.Decision `json:"last_decision,omitempty"`
-	LastRecovery        *progress.Decision `json:"last_recovery,omitempty"`
+	Targets             map[string]*MaterialProgressTarget `json:"targets,omitempty"`
+	BudgetSeconds       int                                `json:"budget_seconds,omitempty"`
+	EvalIntervalSeconds int                                `json:"eval_interval_seconds,omitempty"`
+	LastEvaluatedAt     time.Time                          `json:"last_evaluated_at,omitempty"`
+	ConfigChangedAt     time.Time                          `json:"config_changed_at,omitempty"`
 }
 
-// Deadline returns the next stall deadline, or the zero time when the watchdog
-// is disabled or no progress has been recorded yet.
-func (m *MaterialProgress) Deadline() time.Time {
-	if m == nil || m.BudgetSeconds <= 0 {
+// MaterialProgressTarget contains one exact target's durable watermark and
+// audit records. LastDecision is the latest evaluator verdict.
+// LastRecommendation is the first durable recommendation for the current
+// overdue episode and is not refreshed by repeated overdue evaluations.
+// Recoveries contains only actual attempts recorded explicitly by an actuator;
+// evaluation alone never claims a recovery occurred.
+type MaterialProgressTarget struct {
+	Target             progress.Target     `json:"target"`
+	Active             bool                `json:"active"`
+	UpdatedAt          time.Time           `json:"updated_at,omitempty"`
+	RetiredAt          time.Time           `json:"retired_at,omitempty"`
+	Watermark          progress.Watermark  `json:"watermark"`
+	LastEvaluatedAt    time.Time           `json:"last_evaluated_at,omitempty"`
+	LastDecision       *progress.Decision  `json:"last_decision,omitempty"`
+	LastRecommendation *progress.Decision  `json:"last_recommendation,omitempty"`
+	Recoveries         []progress.Recovery `json:"recoveries,omitempty"`
+}
+
+// EvaluationDue reports whether the independent watchdog scheduler should run.
+// Configuration transitions bypass cadence so disabled/enabled or budget
+// changes establish a fresh baseline immediately. A backwards clock jump also
+// evaluates rather than suppressing the watchdog indefinitely.
+func (m *MaterialProgress) EvaluationDue(budget, evalInterval time.Duration, now time.Time) bool {
+	if m == nil || m.LastEvaluatedAt.IsZero() || m.BudgetSeconds != durationSeconds(budget) {
+		return true
+	}
+	interval := evalInterval
+	if interval <= 0 {
+		return true
+	}
+	now = now.UTC()
+	last := m.LastEvaluatedAt.UTC()
+	if now.Before(last) {
+		return true
+	}
+	return !now.Before(last.Add(interval))
+}
+
+// Deadline returns this active target's next deadline under the container's
+// current budget. Retired/disabled/terminal targets have no active deadline.
+func (t *MaterialProgressTarget) Deadline(budgetSeconds int) time.Time {
+	if t == nil || !t.Active || budgetSeconds <= 0 || t.Watermark.Phase == progress.PhaseDelivered {
 		return time.Time{}
 	}
-	return m.Watermark.Deadline(time.Duration(m.BudgetSeconds) * time.Second)
+	return t.Watermark.Deadline(time.Duration(budgetSeconds) * time.Second)
 }
 
-// RecordMaterialProgress evaluates the stalled-progress watchdog against the
-// observed phase-appropriate signal set and persists the advanced watermark and
-// decision onto the project state. It returns the recovery decision for the
-// caller to act on under the existing retry budget.
-//
-// It is safe to call every watchdog tick: progress.Evaluate is idempotent while
-// the worker stays frozen (the derived deadline never drifts), so the caller's
-// retry budget stays the single "retry exactly once" authority. budget <= 0
-// records the watermark for reporting but never asks for a recovery action.
-func (s *State) RecordMaterialProgress(observed progress.SignalSet, phase progress.Phase, budget, evalInterval time.Duration, now time.Time) progress.Decision {
-	var prev progress.Watermark
-	if s.MaterialProgress != nil {
-		prev = s.MaterialProgress.Watermark
+// LastRecovery returns the latest actual recovery attempt, never a mere
+// evaluator recommendation.
+func (t *MaterialProgressTarget) LastRecovery() *progress.Recovery {
+	if t == nil || len(t.Recoveries) == 0 {
+		return nil
 	}
-	wm, dec := progress.Evaluate(prev, observed, phase, budget, now)
+	last := &t.Recoveries[0]
+	for i := 1; i < len(t.Recoveries); i++ {
+		candidate := &t.Recoveries[i]
+		if candidate.AttemptedAt.After(last.AttemptedAt) {
+			last = candidate
+		}
+	}
+	return last
+}
+
+// RecordMaterialProgress evaluates a complete snapshot of independently scoped
+// observations. Targets absent from the snapshot are retired (not evaluated),
+// so an idle project cannot become a synthetic delivery stall. A newly seen or
+// reactivated target gets a fresh baseline. Disabled->enabled and every budget
+// change also establish a fresh baseline for all observed targets.
+func (s *State) RecordMaterialProgress(observations []progress.Observation, budget, evalInterval time.Duration, now time.Time) ([]progress.Decision, error) {
+	if s == nil {
+		return nil, fmt.Errorf("material-progress state is nil")
+	}
+	now = now.UTC()
+	budgetSeconds := durationSeconds(budget)
+	intervalSeconds := durationSeconds(evalInterval)
+
+	// Validate and de-duplicate the complete snapshot before mutating state so
+	// one malformed target cannot partially retire or reconfigure good records.
+	byKey := make(map[string]progress.Observation, len(observations))
+	keys := make([]string, 0, len(observations))
+	for _, observation := range observations {
+		if err := observation.Target.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid material-progress target: %w", err)
+		}
+		key := observation.Target.Key()
+		if _, duplicate := byKey[key]; duplicate {
+			return nil, fmt.Errorf("duplicate material-progress target %s", key)
+		}
+		byKey[key] = observation
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 
 	mp := s.MaterialProgress
 	if mp == nil {
-		mp = &MaterialProgress{}
+		mp = &MaterialProgress{Targets: make(map[string]*MaterialProgressTarget)}
 		s.MaterialProgress = mp
 	}
-	mp.Watermark = wm
-	mp.LastEvaluatedAt = now.UTC()
-	if budget > 0 {
-		mp.BudgetSeconds = int(budget.Round(time.Second) / time.Second)
-	} else {
-		mp.BudgetSeconds = 0
+	if mp.Targets == nil {
+		mp.Targets = make(map[string]*MaterialProgressTarget)
 	}
-	if evalInterval > 0 {
-		mp.EvalIntervalSeconds = int(evalInterval.Round(time.Second) / time.Second)
+	configChanged := mp.ConfigChangedAt.IsZero() || mp.BudgetSeconds != budgetSeconds
+	if configChanged {
+		mp.ConfigChangedAt = now
 	}
-	d := dec
-	mp.LastDecision = &d
-	if dec.Acted() {
-		r := dec
-		mp.LastRecovery = &r
+	mp.BudgetSeconds = budgetSeconds
+	mp.EvalIntervalSeconds = intervalSeconds
+	mp.LastEvaluatedAt = now
+
+	// Retire targets that are no longer active before evaluating the complete
+	// snapshot. Records/history remain durable, but no deadline remains armed.
+	for key, target := range mp.Targets {
+		if target == nil || !target.Active {
+			continue
+		}
+		if _, present := byKey[key]; !present {
+			target.Active = false
+			target.RetiredAt = now
+			target.UpdatedAt = now
+		}
 	}
-	return dec
+
+	decisions := make([]progress.Decision, 0, len(keys))
+	for _, key := range keys {
+		observation := byKey[key]
+		target := mp.Targets[key]
+		freshBaseline := configChanged || target == nil || !target.Active
+		if target == nil {
+			target = &MaterialProgressTarget{Target: observation.Target}
+			mp.Targets[key] = target
+		}
+		prev := target.Watermark
+		if freshBaseline {
+			prev = progress.Watermark{}
+			target.LastRecommendation = nil
+		}
+		wm, decision := progress.EvaluateTarget(observation.Target, prev, observation.Signals, observation.Phase, budget, now)
+		target.Target = observation.Target
+		target.Active = true
+		target.RetiredAt = time.Time{}
+		target.UpdatedAt = now
+		target.Watermark = wm
+		target.LastEvaluatedAt = now
+		d := decision
+		target.LastDecision = &d
+		if decision.RecommendsRecovery() && !sameRecommendation(target.LastRecommendation, decision) {
+			r := decision
+			target.LastRecommendation = &r
+		}
+		decisions = append(decisions, decision)
+	}
+	return decisions, nil
 }
 
-// mergeMaterialProgress resolves concurrent writers of the per-project
-// watermark (#887). The watermark time (last material progress) advances only
-// forward, so the snapshot with the newer Watermark.At wins the progress fields
-// (watermark, budget, cadence) — this guarantees a concurrent stall record can
-// never clobber a fresh progress advance and reset the deadline. Ties break on
-// the later evaluation time.
-//
-// The recovery/decision history is merged independently of that winner: if one
-// writer records a stall decision while another records a newer progress
-// watermark, the progress snapshot wins the base but the stall writer's newer
-// LastRecovery/LastDecision are preserved by EvaluatedAt, so a recorded recovery
-// is never silently dropped from durable state or the Fleet view.
+func durationSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	seconds := int(d / time.Second)
+	if seconds == 0 {
+		return 1
+	}
+	return seconds
+}
+
+func sameRecommendation(previous *progress.Decision, next progress.Decision) bool {
+	return previous != nil && previous.RecommendationID != "" && previous.RecommendationID == next.RecommendationID
+}
+
+// RecordMaterialRecovery records an actual actuator attempt/result for a prior
+// recommendation. RecommendationID is an exactly-once key: repeated attempted
+// records are idempotent, and a terminal result may complete that same attempt
+// but a second attempt for the episode is rejected.
+func (s *State) RecordMaterialRecovery(targetKey, recommendationID string, outcome progress.RecoveryOutcome, now time.Time) error {
+	if s == nil || s.MaterialProgress == nil {
+		return fmt.Errorf("material-progress state does not exist")
+	}
+	target := s.MaterialProgress.Targets[targetKey]
+	if target == nil || target.LastRecommendation == nil ||
+		target.LastRecommendation.RecommendationID != recommendationID {
+		return fmt.Errorf("material-progress recommendation does not exist")
+	}
+	if outcome != progress.RecoveryAttempted && outcome != progress.RecoverySucceeded && outcome != progress.RecoveryFailed {
+		return fmt.Errorf("invalid material-progress recovery outcome %q", outcome)
+	}
+	now = now.UTC()
+	for i := range target.Recoveries {
+		recovery := &target.Recoveries[i]
+		if recovery.RecommendationID != recommendationID {
+			continue
+		}
+		if recovery.Outcome == outcome {
+			return nil
+		}
+		if recovery.Outcome != progress.RecoveryAttempted || outcome == progress.RecoveryAttempted {
+			return fmt.Errorf("material-progress recovery already completed as %q", recovery.Outcome)
+		}
+		recovery.Outcome = outcome
+		recovery.CompletedAt = now
+		target.UpdatedAt = now
+		return nil
+	}
+	recovery := progress.Recovery{
+		RecommendationID: recommendationID,
+		Target:           target.Target,
+		Action:           target.LastRecommendation.Action,
+		Outcome:          outcome,
+		AttemptedAt:      now,
+	}
+	if outcome != progress.RecoveryAttempted {
+		recovery.CompletedAt = now
+	}
+	target.Recoveries = append(target.Recoveries, recovery)
+	target.UpdatedAt = now
+	return nil
+}
+
+// mergeMaterialProgress merges concurrent complete-snapshot writers per exact
+// target. Progress fields choose the furthest watermark; active/retired state
+// chooses the latest UpdatedAt; decisions/recommendations choose the latest
+// evaluation/recommendation; actual recovery history is unioned independently.
 func mergeMaterialProgress(merged, current, ours *State) {
 	a, b := current.MaterialProgress, ours.MaterialProgress
-	switch {
-	case a == nil:
-		merged.MaterialProgress = b
+	if a == nil && b == nil {
+		merged.MaterialProgress = nil
 		return
-	case b == nil:
-		merged.MaterialProgress = a
+	}
+	if a == nil {
+		merged.MaterialProgress = cloneMaterialProgress(b)
+		return
+	}
+	if b == nil {
+		merged.MaterialProgress = cloneMaterialProgress(a)
 		return
 	}
 
-	// Pick the base by the furthest-advanced watermark (progress beats stall).
-	var base *MaterialProgress
+	out := &MaterialProgress{Targets: make(map[string]*MaterialProgressTarget)}
+	config := a
+	if b.ConfigChangedAt.After(a.ConfigChangedAt) ||
+		(b.ConfigChangedAt.Equal(a.ConfigChangedAt) && b.LastEvaluatedAt.After(a.LastEvaluatedAt)) {
+		config = b
+	}
+	out.BudgetSeconds = config.BudgetSeconds
+	out.EvalIntervalSeconds = config.EvalIntervalSeconds
+	out.ConfigChangedAt = config.ConfigChangedAt
+	out.LastEvaluatedAt = a.LastEvaluatedAt
+	if b.LastEvaluatedAt.After(out.LastEvaluatedAt) {
+		out.LastEvaluatedAt = b.LastEvaluatedAt
+	}
+
+	keys := make(map[string]struct{}, len(a.Targets)+len(b.Targets))
+	for key := range a.Targets {
+		keys[key] = struct{}{}
+	}
+	for key := range b.Targets {
+		keys[key] = struct{}{}
+	}
+	for key := range keys {
+		out.Targets[key] = mergeMaterialProgressTarget(a.Targets[key], b.Targets[key])
+	}
+	merged.MaterialProgress = out
+}
+
+func mergeMaterialProgressTarget(a, b *MaterialProgressTarget) *MaterialProgressTarget {
+	if a == nil {
+		return cloneMaterialProgressTarget(b)
+	}
+	if b == nil {
+		return cloneMaterialProgressTarget(a)
+	}
+	base := a
 	switch {
 	case b.Watermark.At.After(a.Watermark.At):
 		base = b
-	case a.Watermark.At.After(b.Watermark.At):
-		base = a
-	case b.LastEvaluatedAt.After(a.LastEvaluatedAt):
+	case b.Watermark.At.Equal(a.Watermark.At) && b.LastEvaluatedAt.After(a.LastEvaluatedAt):
 		base = b
-	default:
-		base = a
 	}
-
-	// Copy the base and overlay the most recent recovery/decision from either
-	// writer so a concurrently-recorded recovery survives even when the other
-	// writer's progress advance wins the base snapshot.
-	out := *base
-	out.LastRecovery = laterDecision(a.LastRecovery, b.LastRecovery)
+	out := cloneMaterialProgressTarget(base)
+	if b.UpdatedAt.After(a.UpdatedAt) {
+		out.Active, out.RetiredAt, out.UpdatedAt = b.Active, b.RetiredAt, b.UpdatedAt
+	} else {
+		out.Active, out.RetiredAt, out.UpdatedAt = a.Active, a.RetiredAt, a.UpdatedAt
+	}
 	out.LastDecision = laterDecision(a.LastDecision, b.LastDecision)
-	merged.MaterialProgress = &out
+	out.LastRecommendation = laterRecommendation(a.LastRecommendation, b.LastRecommendation)
+	out.Recoveries = mergeRecoveries(a.Recoveries, b.Recoveries)
+	return out
 }
 
-// laterDecision returns the decision with the later EvaluatedAt, treating a nil
-// decision as "no decision". Used to merge watchdog history across concurrent
-// writers without losing a recorded verdict.
 func laterDecision(a, b *progress.Decision) *progress.Decision {
-	switch {
-	case a == nil:
-		return b
-	case b == nil:
-		return a
-	case b.EvaluatedAt.After(a.EvaluatedAt):
-		return b
-	default:
-		return a
+	if a == nil {
+		return cloneDecision(b)
 	}
+	if b == nil {
+		return cloneDecision(a)
+	}
+	if b.EvaluatedAt.After(a.EvaluatedAt) {
+		return cloneDecision(b)
+	}
+	return cloneDecision(a)
+}
+
+func laterRecommendation(a, b *progress.Decision) *progress.Decision {
+	if a == nil {
+		return cloneDecision(b)
+	}
+	if b == nil {
+		return cloneDecision(a)
+	}
+	if b.RecommendedAt.After(a.RecommendedAt) {
+		return cloneDecision(b)
+	}
+	return cloneDecision(a)
+}
+
+func mergeRecoveries(a, b []progress.Recovery) []progress.Recovery {
+	byID := make(map[string]progress.Recovery, len(a)+len(b))
+	for _, recovery := range append(append([]progress.Recovery(nil), a...), b...) {
+		prior, exists := byID[recovery.RecommendationID]
+		if !exists || recovery.CompletedAt.After(prior.CompletedAt) ||
+			(recovery.CompletedAt.Equal(prior.CompletedAt) && recovery.AttemptedAt.After(prior.AttemptedAt)) {
+			byID[recovery.RecommendationID] = recovery
+		}
+	}
+	out := make([]progress.Recovery, 0, len(byID))
+	for _, recovery := range byID {
+		out = append(out, recovery)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AttemptedAt.Equal(out[j].AttemptedAt) {
+			return out[i].RecommendationID < out[j].RecommendationID
+		}
+		return out[i].AttemptedAt.Before(out[j].AttemptedAt)
+	})
+	return out
+}
+
+func cloneMaterialProgress(mp *MaterialProgress) *MaterialProgress {
+	if mp == nil {
+		return nil
+	}
+	out := *mp
+	out.Targets = make(map[string]*MaterialProgressTarget, len(mp.Targets))
+	for key, target := range mp.Targets {
+		out.Targets[key] = cloneMaterialProgressTarget(target)
+	}
+	return &out
+}
+
+func cloneMaterialProgressTarget(target *MaterialProgressTarget) *MaterialProgressTarget {
+	if target == nil {
+		return nil
+	}
+	out := *target
+	out.Watermark.Signals = append([]progress.Signal(nil), target.Watermark.Signals...)
+	out.LastDecision = cloneDecision(target.LastDecision)
+	out.LastRecommendation = cloneDecision(target.LastRecommendation)
+	out.Recoveries = append([]progress.Recovery(nil), target.Recoveries...)
+	return &out
+}
+
+func cloneDecision(decision *progress.Decision) *progress.Decision {
+	if decision == nil {
+		return nil
+	}
+	out := *decision
+	out.ObservedSignals = append([]progress.SignalKind(nil), decision.ObservedSignals...)
+	return &out
 }

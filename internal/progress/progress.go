@@ -5,8 +5,8 @@
 // it could kill a worker that was actively editing files without emitting
 // output, and when disabled (0/absent) it could not recover a genuinely
 // hung-but-alive worker. This package replaces that single-signal heuristic
-// with one durable per-project watermark derived from whichever
-// phase-appropriate signals are present:
+// with one durable watermark per exact live worker, PR gate, or delivery lease,
+// derived from whichever phase-appropriate signals are present:
 //
 //   - issue/session state and lease identity;
 //   - process and exact tmux/session identity;
@@ -17,10 +17,11 @@
 //   - delivery approval generation, execution lease, and terminal receipt.
 //
 // A single missing or stale signal is never proof of a stall: the watermark
-// advances whenever any signal advances (or the observed set changes). Only
+// advances whenever any fingerprint or lifecycle phase advances. A signal
+// disappearing is not progress and cannot re-arm the deadline. Only
 // when *no* signal has advanced for the whole silence budget does the watchdog
-// act, and even then the recovery boundary depends on the lifecycle phase —
-// a safe pre-delivery stall may stop+retry the single worker exactly once,
+// recommend recovery, and even then the boundary depends on lifecycle phase —
+// a safe pre-delivery stall may stop+retry that exact worker exactly once,
 // while an uncertain delivery lease is handed to operator reconciliation and
 // never replayed automatically.
 //
@@ -111,7 +112,9 @@ func Fingerprint(parts ...string) string {
 
 // Signal is one observed progress signal. Fingerprint is an opaque digest (see
 // Fingerprint); an empty Fingerprint means the signal was not observable this
-// tick, which is not itself evidence of a stall.
+// tick, which is not itself evidence of a stall. Collectors may leave
+// ObservedAt zero: Evaluate stamps the durable value only when the fingerprint
+// actually changes and ignores synthetic per-poll timestamps.
 type Signal struct {
 	Kind        SignalKind `json:"kind"`
 	Fingerprint string     `json:"fingerprint,omitempty"`
@@ -121,29 +124,45 @@ type Signal struct {
 // SignalSet is the phase-appropriate set of signals observed in one evaluation.
 type SignalSet []Signal
 
-// carryForwardObservedAt preserves each present signal's last-changed time. A
-// signal whose (kind, fingerprint) is unchanged from the previous watermark
-// keeps its prior ObservedAt, so Fleet shows the true age since that signal
-// last advanced rather than the current evaluation time; a new or changed
-// signal keeps its own ObservedAt (this tick). This is what lets operators see
-// which specific signal stopped advancing even while the combined watermark is
-// still moving on another signal (#887).
-func carryForwardObservedAt(prev, present []Signal) []Signal {
-	if len(prev) == 0 {
-		return present
-	}
-	prevByKind := make(map[SignalKind]Signal, len(prev))
-	for _, s := range prev {
-		prevByKind[s.Kind] = s
-	}
-	out := make([]Signal, len(present))
-	for i, s := range present {
-		if p, ok := prevByKind[s.Kind]; ok && p.Fingerprint == s.Fingerprint && !p.ObservedAt.IsZero() {
-			s.ObservedAt = p.ObservedAt
+// reconcileSignals updates the durable last-known fingerprint per signal kind.
+// ObservedAt is stamped by the evaluator only when that fingerprint genuinely
+// changes; caller-provided timestamps are deliberately ignored because a
+// collector commonly observes every signal at `now`, which would otherwise
+// make stale evidence look fresh on every tick.
+//
+// A temporarily missing signal remains in the last-known set. Disappearance is
+// loss of observability, not material progress, and repeated disappear/reappear
+// cycles with the same fingerprint therefore cannot keep re-arming a deadline.
+// A signal that reappears with a different fingerprint does advance normally.
+func reconcileSignals(prev, present []Signal, now time.Time) ([]Signal, bool) {
+	known := make(map[SignalKind]Signal, len(prev)+len(present))
+	for _, sig := range prev {
+		if strings.TrimSpace(sig.Fingerprint) != "" {
+			known[sig.Kind] = sig
 		}
-		out[i] = s
 	}
-	return out
+	changed := false
+	for _, sig := range present {
+		prior, ok := known[sig.Kind]
+		if ok && prior.Fingerprint == sig.Fingerprint {
+			continue
+		}
+		sig.ObservedAt = now
+		known[sig.Kind] = sig
+		changed = true
+	}
+	out := make([]Signal, 0, len(known))
+	for _, sig := range known {
+		out = append(out, sig)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		oi, oj := signalOrder[out[i].Kind], signalOrder[out[j].Kind]
+		if oi != oj {
+			return oi < oj
+		}
+		return out[i].Kind < out[j].Kind
+	})
+	return out, changed
 }
 
 // Present returns the signals with a non-empty fingerprint, de-duplicated by
@@ -197,6 +216,90 @@ func (s SignalSet) Combined() string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
+// TargetKind identifies the exact independently-evaluated lifecycle target.
+// A live worker, a PR gate, and a delivery lease never share a watermark: work
+// by one target therefore cannot hide a stall in another target (#887).
+type TargetKind string
+
+const (
+	TargetWorker   TargetKind = "worker"
+	TargetPRGate   TargetKind = "pr_gate"
+	TargetDelivery TargetKind = "delivery"
+)
+
+// Target is the durable, exact recovery boundary for one watchdog watermark.
+// Worker targets bind issue + slot + session + tmux/process + lease identity;
+// PR gates intentionally carry no process identity; delivery targets bind the
+// durable approval id/generation as LeaseID. No command, output, path, or secret
+// belongs in a Target.
+type Target struct {
+	Kind        TargetKind `json:"kind"`
+	IssueNumber int        `json:"issue_number,omitempty"`
+	Slot        string     `json:"slot,omitempty"`
+	SessionID   string     `json:"session_id,omitempty"`
+	TmuxSession string     `json:"tmux_session,omitempty"`
+	ProcessID   int        `json:"process_id,omitempty"`
+	LeaseID     string     `json:"lease_id"`
+}
+
+// Validate rejects ambiguous recovery targets. A worker must be addressable by
+// issue, slot, session, process, and durable lease. Tmux is optional because a
+// configured worker may run without tmux; when present it remains part of the
+// exact identity. PR gates have no live process. Delivery targets are keyed only
+// by their durable approval/generation lease.
+func (t Target) Validate() error {
+	t.Slot = strings.TrimSpace(t.Slot)
+	t.SessionID = strings.TrimSpace(t.SessionID)
+	t.TmuxSession = strings.TrimSpace(t.TmuxSession)
+	t.LeaseID = strings.TrimSpace(t.LeaseID)
+	switch t.Kind {
+	case TargetWorker:
+		if t.IssueNumber <= 0 || t.Slot == "" || t.SessionID == "" || t.ProcessID <= 0 || t.LeaseID == "" {
+			return fmt.Errorf("worker target requires issue, slot, session, process, and lease identity")
+		}
+	case TargetPRGate:
+		if t.IssueNumber <= 0 || t.Slot == "" || t.SessionID == "" || t.LeaseID == "" {
+			return fmt.Errorf("PR-gate target requires issue, slot, session, and lease identity")
+		}
+		if t.ProcessID != 0 || t.TmuxSession != "" {
+			return fmt.Errorf("PR-gate target must not carry process or tmux identity")
+		}
+	case TargetDelivery:
+		if t.LeaseID == "" {
+			return fmt.Errorf("delivery target requires a durable lease identity")
+		}
+		if t.ProcessID != 0 || t.TmuxSession != "" {
+			return fmt.Errorf("delivery target must not carry process or tmux identity")
+		}
+	default:
+		return fmt.Errorf("unknown progress target kind %q", t.Kind)
+	}
+	return nil
+}
+
+// Key returns a stable, non-reversible map key for this exact target, or an
+// empty string when the target is invalid. The full exact Target is stored next
+// to the record so a later actuator does not have to reverse the digest.
+func (t Target) Key() string {
+	if err := t.Validate(); err != nil {
+		return ""
+	}
+	return string(t.Kind) + ":" + Fingerprint(
+		fmt.Sprintf("%d", t.IssueNumber), strings.TrimSpace(t.Slot),
+		strings.TrimSpace(t.SessionID), strings.TrimSpace(t.TmuxSession),
+		fmt.Sprintf("%d", t.ProcessID), strings.TrimSpace(t.LeaseID),
+	)
+}
+
+// Observation is one exact target plus only that target's phase-appropriate
+// signals. Collectors return one Observation per live worker/PR gate/delivery
+// lease and no observation for an idle project.
+type Observation struct {
+	Target  Target    `json:"target"`
+	Signals SignalSet `json:"signals,omitempty"`
+	Phase   Phase     `json:"phase,omitempty"`
+}
+
 // Phase is the lifecycle phase used to pick the recovery boundary when a stall
 // is proven. The boundary is deliberately asymmetric: pre-delivery work may be
 // safely retried, but a durable delivery lease must never be replayed on an
@@ -206,9 +309,12 @@ type Phase string
 const (
 	// PhaseUnknown is the zero phase; treated as pre-delivery for recovery.
 	PhaseUnknown Phase = ""
-	// PhasePreDelivery covers issue → worker → PR/CI/review → merge/release:
-	// a proven stall here may stop the single worker and retry once.
+	// PhasePreDelivery covers an exact live implementation worker:
+	// a proven stall here may stop the exact live worker and retry once.
 	PhasePreDelivery Phase = "pre_delivery"
+	// PhasePRGate covers an open PR waiting on CI/review/merge. There is no live
+	// worker process to stop, so an overdue gate is surfaced for reconciliation.
+	PhasePRGate Phase = "pr_gate"
 	// PhaseDeliveryPending is an approval-gated delivery not yet executing:
 	// there is no live worker to retry, so a stall is an operator wait.
 	PhaseDeliveryPending Phase = "delivery_pending"
@@ -265,7 +371,8 @@ func (w Watermark) Deadline(budget time.Duration) time.Time {
 	return w.At.Add(budget)
 }
 
-// Action is the watchdog's recovery verdict for one tick.
+// Action is the evaluator's recommendation/no-op for one tick. It never claims
+// an actual recovery attempt; attempts are persisted separately as Recovery.
 type Action string
 
 const (
@@ -276,7 +383,7 @@ const (
 	// been exhausted, so the watchdog waits.
 	ActionWaiting Action = "waiting"
 	// ActionStopAndRetry means a proven safe pre-delivery stall: stop the
-	// single stale worker and retry/resume exactly once under the existing
+	// exact stale worker and retry/resume exactly once under the existing
 	// retry budget. The caller enforces the "exactly once" via that budget;
 	// Evaluate is idempotent and keeps returning this until progress advances.
 	ActionStopAndRetry Action = "stop_and_retry"
@@ -290,13 +397,14 @@ const (
 	ActionDisabled Action = "disabled"
 )
 
-// Decision is the durable, secret-free recovery record for one watchdog tick.
+// Decision is the durable, secret-free evaluation record for one watchdog tick.
 // It captures the observed signal set (by kind only), the last material
 // watermark, the derived deadline, the phase, the idempotency/replay boundary,
 // and the action plus its no-op reason — never a secret, raw private path, or
 // command output (#887).
 type Decision struct {
 	EvaluatedAt     time.Time    `json:"evaluated_at"`
+	Target          Target       `json:"target"`
 	Action          Action       `json:"action"`
 	Reason          string       `json:"reason"`
 	Phase           Phase        `json:"phase,omitempty"`
@@ -308,12 +416,46 @@ type Decision struct {
 	// ReplayBoundary is true when a durable delivery lease bars automatic
 	// replay: the decision defers to operator reconciliation.
 	ReplayBoundary bool `json:"replay_boundary,omitempty"`
+	// RecommendationID is a deterministic idempotency key for one overdue
+	// target/watermark/action episode. Repeated evaluations retain the same id;
+	// an actuator records at most one recovery attempt for it.
+	RecommendationID string    `json:"recommendation_id,omitempty"`
+	RecommendedAt    time.Time `json:"recommended_at,omitempty"`
 }
 
-// Acted reports whether the decision took (or asks the caller to take) a
-// recovery action, as opposed to observing progress or waiting.
+// Acted is kept for source compatibility. It reports a recommendation, not an
+// actual attempt. New code should call RecommendsRecovery.
+// Deprecated: use RecommendsRecovery.
 func (d Decision) Acted() bool {
+	return d.RecommendsRecovery()
+}
+
+// RecommendsRecovery reports that evaluation recommends an action. It does not
+// claim the action was attempted; actual attempts are separate Recovery values.
+func (d Decision) RecommendsRecovery() bool {
 	return d.Action == ActionStopAndRetry || d.Action == ActionSurfaceReconciliation
+}
+
+// RecoveryOutcome is the durable result of an actual recovery attempt. A
+// recommendation alone never creates one of these records.
+type RecoveryOutcome string
+
+const (
+	RecoveryAttempted RecoveryOutcome = "attempted"
+	RecoverySucceeded RecoveryOutcome = "succeeded"
+	RecoveryFailed    RecoveryOutcome = "failed"
+)
+
+// Recovery records actual actuation separately from the evaluator's verdict
+// and recommendation. RecommendationID is the idempotency key: one overdue
+// episode may have at most one attempt, later completed with success/failure.
+type Recovery struct {
+	RecommendationID string          `json:"recommendation_id"`
+	Target           Target          `json:"target"`
+	Action           Action          `json:"action"`
+	Outcome          RecoveryOutcome `json:"outcome"`
+	AttemptedAt      time.Time       `json:"attempted_at"`
+	CompletedAt      time.Time       `json:"completed_at,omitempty"`
 }
 
 // Evaluate advances the watermark and returns the recovery decision for one
@@ -330,14 +472,25 @@ func (d Decision) Acted() bool {
 // to persist: it equals prev whenever no progress was observed, so re-persisting
 // it across restarts never resets or duplicates the deadline.
 func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time) (Watermark, Decision) {
+	return evaluate(Target{}, prev, observed, phase, budget, now)
+}
+
+// EvaluateTarget is Evaluate bound to one exact worker/PR-gate/delivery target.
+// The target is copied into the decision and binds any recovery recommendation
+// to an exact, independently-watermarked recovery boundary.
+func EvaluateTarget(target Target, prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time) (Watermark, Decision) {
+	return evaluate(target, prev, observed, phase, budget, now)
+}
+
+func evaluate(target Target, prev Watermark, observed SignalSet, phase Phase, budget time.Duration, now time.Time) (Watermark, Decision) {
 	now = now.UTC()
-	id := observed.Combined()
-	// Reconcile per-signal ObservedAt against the previous watermark so an
-	// unchanged signal ages from when it last advanced, not from this
-	// evaluation (#887). Genuinely new/changed signals keep `now`.
-	present := carryForwardObservedAt(prev.Signals, observed.Present())
+	// Reconcile against durable last-known fingerprints. The evaluator stamps
+	// actual detected changes; signal disappearance alone is not progress.
+	present, signalChanged := reconcileSignals(prev.Signals, observed.Present(), now)
+	id := SignalSet(present).Combined()
 	dec := Decision{
 		EvaluatedAt:     now,
+		Target:          target,
 		Phase:           phase,
 		ObservedSignals: observed.Kinds(),
 	}
@@ -361,13 +514,17 @@ func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Durat
 	// combined identity changed because a signal advanced or the observed set
 	// gained/lost a kind. A single stale signal cannot land here while any
 	// other signal is still advancing.
-	if prev.IsZero() || id != prev.Identity {
+	if prev.IsZero() || signalChanged || id != prev.Identity || phase != prev.Phase {
 		next := Watermark{Identity: id, At: now, Phase: phase, Signals: present}
 		dec.Action = ActionNone
 		dec.Reason = "material progress observed; watermark advanced"
 		dec.Identity = next.Identity
 		dec.WatermarkAt = next.At
-		dec.Deadline = next.Deadline(budget)
+		if phase == PhaseDelivered {
+			dec.Reason = "delivery reached a terminal receipt; no recovery is required"
+		} else {
+			dec.Deadline = next.Deadline(budget)
+		}
 		return next, dec
 	}
 
@@ -377,6 +534,12 @@ func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Durat
 	dec.Identity = prev.Identity
 	dec.WatermarkAt = prev.At
 	dec.Deadline = deadline
+	if phase == PhaseDelivered {
+		dec.Action = ActionNone
+		dec.Reason = "delivery reached a terminal receipt; no recovery is required"
+		dec.Deadline = time.Time{}
+		return prev, dec
+	}
 
 	if now.Before(deadline) {
 		dec.Action = ActionWaiting
@@ -401,5 +564,16 @@ func Evaluate(prev Watermark, observed SignalSet, phase Phase, budget time.Durat
 		dec.ReplayBoundary = true
 		dec.Reason = "stall past the silence budget in a non-retryable phase; surface operator reconciliation"
 	}
+	if dec.RecommendsRecovery() {
+		dec.RecommendedAt = deadline
+		dec.RecommendationID = recommendationID(target, dec)
+	}
 	return prev, dec
+}
+
+func recommendationID(target Target, dec Decision) string {
+	return "watchdog:" + Fingerprint(
+		target.Key(), dec.Identity, string(dec.Phase), string(dec.Action),
+		dec.Deadline.UTC().Format(time.RFC3339Nano),
+	)
 }

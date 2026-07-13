@@ -359,3 +359,93 @@ func TestEvaluate_PerSignalObservedAtTracksLastChange(t *testing.T) {
 		t.Fatalf("frozen and moving signals collapsed to one age")
 	}
 }
+
+func TestEvaluate_PerSignalObservedAtIsStampedOnFingerprintChange(t *testing.T) {
+	budget := 20 * time.Minute
+	// Collector timestamps are observation times, not change times. The
+	// evaluator must ignore even a plausible-looking synthetic timestamp.
+	collectorTime := base.Add(-24 * time.Hour)
+	observed := SignalSet{{
+		Kind: SignalWorktreeGit, Fingerprint: Fingerprint("head-1"), ObservedAt: collectorTime,
+	}}
+	wm, _ := Evaluate(Watermark{}, observed, PhasePreDelivery, budget, base)
+	if got := wm.Signals[0].ObservedAt; !got.Equal(base) {
+		t.Fatalf("initial signal timestamp = %s, want evaluator change time %s", got, base)
+	}
+
+	changedAt := base.Add(5 * time.Minute)
+	observed[0].Fingerprint = Fingerprint("head-2")
+	observed[0].ObservedAt = changedAt.Add(10 * time.Hour)
+	wm, _ = Evaluate(wm, observed, PhasePreDelivery, budget, changedAt)
+	if got := wm.Signals[0].ObservedAt; !got.Equal(changedAt) {
+		t.Fatalf("changed signal timestamp = %s, want evaluator change time %s", got, changedAt)
+	}
+}
+
+func TestEvaluate_SignalDisappearanceAndSameReappearanceDoNotRearm(t *testing.T) {
+	budget := 20 * time.Minute
+	process := sig(SignalProcessTmux, "pid-1")
+	git := sig(SignalWorktreeGit, "head-1")
+	wm, _ := Evaluate(Watermark{}, SignalSet{process, git}, PhasePreDelivery, budget, base)
+	identity, watermarkAt := wm.Identity, wm.At
+
+	// Losing git observability is not progress.
+	var dec Decision
+	wm, dec = Evaluate(wm, SignalSet{process}, PhasePreDelivery, budget, base.Add(5*time.Minute))
+	if dec.Action != ActionWaiting || wm.Identity != identity || !wm.At.Equal(watermarkAt) {
+		t.Fatalf("disappearance re-armed watermark: wm=%+v dec=%+v", wm, dec)
+	}
+	// The same fingerprint reappearing is also not progress.
+	wm, dec = Evaluate(wm, SignalSet{process, git}, PhasePreDelivery, budget, base.Add(10*time.Minute))
+	if dec.Action != ActionWaiting || wm.Identity != identity || !wm.At.Equal(watermarkAt) {
+		t.Fatalf("same reappearance re-armed watermark: wm=%+v dec=%+v", wm, dec)
+	}
+	// A changed fingerprint after absence is genuine progress.
+	wm, dec = Evaluate(wm, SignalSet{process, sig(SignalWorktreeGit, "head-2")}, PhasePreDelivery, budget, base.Add(15*time.Minute))
+	if dec.Action != ActionNone || !wm.At.Equal(base.Add(15*time.Minute)) {
+		t.Fatalf("changed reappearance did not advance: wm=%+v dec=%+v", wm, dec)
+	}
+}
+
+func TestEvaluateTarget_RecommendationIsExactAndStable(t *testing.T) {
+	target := Target{
+		Kind: TargetWorker, IssueNumber: 42, Slot: "3", SessionID: "started-at",
+		TmuxSession: "maestro-3", ProcessID: 1234, LeaseID: "lease-42-3",
+	}
+	if err := target.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	observed := SignalSet{sig(SignalProcessTmux, "pid-1234")}
+	wm, _ := EvaluateTarget(target, Watermark{}, observed, PhasePreDelivery, time.Minute, base)
+	_, first := EvaluateTarget(target, wm, observed, PhasePreDelivery, time.Minute, base.Add(2*time.Minute))
+	_, repeated := EvaluateTarget(target, wm, observed, PhasePreDelivery, time.Minute, base.Add(3*time.Minute))
+	if first.Target.Key() != target.Key() || first.RecommendationID == "" {
+		t.Fatalf("recommendation not bound to exact target: %+v", first)
+	}
+	if repeated.RecommendationID != first.RecommendationID || !repeated.RecommendedAt.Equal(first.RecommendedAt) {
+		t.Fatalf("repeated recommendation was refreshed: first=%+v repeated=%+v", first, repeated)
+	}
+}
+
+func TestEvaluateTarget_DeliveredReceiptNeverRecommendsRecovery(t *testing.T) {
+	target := Target{Kind: TargetDelivery, LeaseID: "approval-1:gen-2"}
+	observed := SignalSet{sig(SignalDelivery, "executed-receipt")}
+	wm, first := EvaluateTarget(target, Watermark{}, observed, PhaseDelivered, time.Minute, base)
+	if first.RecommendsRecovery() || !first.Deadline.IsZero() {
+		t.Fatalf("terminal receipt armed recovery: %+v", first)
+	}
+	_, overdue := EvaluateTarget(target, wm, observed, PhaseDelivered, time.Minute, base.Add(time.Hour))
+	if overdue.RecommendsRecovery() || !overdue.Deadline.IsZero() {
+		t.Fatalf("old terminal receipt armed recovery: %+v", overdue)
+	}
+}
+
+func TestTargetValidate_PRGateRejectsLiveProcessIdentity(t *testing.T) {
+	target := Target{
+		Kind: TargetPRGate, IssueNumber: 42, Slot: "3", SessionID: "started-at",
+		LeaseID: "pr-7:head-abc", ProcessID: 1234,
+	}
+	if err := target.Validate(); err == nil {
+		t.Fatal("PR-gate target with live process identity was accepted")
+	}
+}
