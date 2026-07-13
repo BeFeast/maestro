@@ -49,7 +49,7 @@ func TestSelfCheckCLIJSON(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
 		t.Fatalf("--json output is not valid JSON: %v\n%s", err, out.String())
 	}
-	if !rep.OK || len(rep.Checks) != 4 {
+	if !rep.OK || len(rep.Checks) != 5 {
 		t.Fatalf("unexpected report: ok=%v checks=%d\n%s", rep.OK, len(rep.Checks), out.String())
 	}
 }

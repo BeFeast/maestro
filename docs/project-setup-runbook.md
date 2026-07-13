@@ -69,7 +69,7 @@ Alternatively, maestro's built-in `version-bump` command can handle this via the
 
 Either:
 - A **self-hosted runner** that runs after merge, or
-- A **deploy hook** in maestro config (`deploy_cmd`) that maestro calls after a successful merge.
+- A **delivery hook** in maestro config (`delivery:`, approval-gated by default) that maestro runs after a successful merge.
 
 The deploy hook approach is simpler — see section 5.
 
@@ -232,8 +232,22 @@ outcome:
   non_goals:
     - Rewrite unrelated subsystems
 
-# Post-merge deploy hook (runs after each successful merge)
-deploy_cmd: "/path/to/repo/scripts/deploy.sh"
+# Post-merge delivery (#872). Default-safe: a merged revision creates an
+# auditable deploy_project approval pinned to the exact merge commit; only an
+# operator approve runs the command + verifier (exactly once, behind a durable
+# claim). Set mode: automatic to opt back into unattended deploy-on-merge.
+delivery:
+  mode: approval_required        # disabled | approval_required | automatic
+  command: "/path/to/repo/scripts/deploy.sh"
+  timeout_minutes: 15
+  target: "prod web"             # operator-safe destination label (never a secret)
+  rollback: "scripts/rollback.sh"
+  verify_command: "/path/to/repo/scripts/status.sh"
+
+# Legacy: deploy_cmd still works but is deprecated — it maps to
+# delivery.mode: automatic (unattended deploy after every merge) and emits a
+# load-time deprecation warning. Prefer the delivery: block above.
+# deploy_cmd: "/path/to/repo/scripts/deploy.sh"
 
 # Telegram notifications (optional, via OpenClaw gateway)
 telegram:
@@ -256,7 +270,8 @@ telegram:
 | `model.backends.<name>.mcp` | Optional worker MCP attachment for that backend; omitted means no MCP tools |
 | `model.backends.<name>.subagent_hint` | Optional sub-agent model policy injected into the worker prompt for that backend; omitted means the prompt is unchanged |
 | `max_parallel` | Maximum concurrent worker sessions |
-| `deploy_cmd` | Shell command maestro runs after merging a PR |
+| `delivery` | Post-merge delivery block (#872): `mode` (disabled/approval_required/automatic), `command`, `timeout_minutes`, `target`, `rollback`, `verify_command`. Default-safe: a merge mints an approval and runs nothing until approved |
+| `deploy_cmd` | Deprecated (#872): legacy shell command run automatically after merge; folds into `delivery.mode: automatic` with a deprecation warning |
 | `session_prefix` | Prefix for tmux session names |
 | `worker_prompt` | Path to the worker prompt template file |
 | `hooks.post_edit` | Optional command run inside worker sessions after matching file edit tools |
@@ -746,9 +761,11 @@ The backend build embeds the frontend dist files at compile time. If you build b
 
 Without auto-versioning, multiple PRs merging in sequence all report the same version. This makes debugging deployments difficult. Enable versioning (via CI workflow or maestro's `versioning` config) to auto-increment the patch version on every merge to `main`.
 
-### Deploy hook eliminates manual deploys
+### Delivery hook eliminates manual deploys — with an approval gate by default
 
-Using `deploy_cmd` in maestro config means every merged PR is automatically deployed. This removes the "forgot to deploy" failure mode and keeps the running service in sync with `main`. The deploy command runs in the context of the local machine, so it can `ssh` to servers, `pct exec` into containers, or build locally.
+Configuring `delivery` in maestro config removes the "forgot to deploy" failure mode and keeps the running service in sync with `main`. The delivery command runs in the context of the local machine, so it can `ssh` to servers, `pct exec` into containers, or build locally.
+
+Delivery is **approval-gated by default** (`delivery.mode: approval_required`): a merged revision creates an auditable `deploy_project` approval pinned to the exact merge commit, carrying the target label, rollback reference, sanitized command preview, and verification plan. No command runs until an operator approves it; approval executes the command once (behind a durable `approved → executing` claim so a daemon restart never replays an in-flight delivery), then runs the configured `verify_command`. A superseding merge supersedes the stale pending approval so an old revision can never be approved into a deploy. Set `delivery.mode: automatic` (or keep a legacy `deploy_cmd`) to opt back into unattended deploy-on-merge.
 
 ---
 

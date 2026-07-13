@@ -5326,20 +5326,10 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 	// Self-deploy hook (#698)
 	o.maybeSelfDeployAfterMerge(s, pr.Number)
 
-	// Deploy hook
-	deploySucceeded := false
-	if o.cfg.DeployCmd != "" {
-		if err := o.runDeployCmd(pr.Number); err != nil {
-			log.Printf("[orch] deploy command failed for PR #%d: %v", pr.Number, err)
-			o.notifier.Sendf("⚠️ maestro: deploy failed after PR #%d merge: %v", pr.Number, err)
-		} else {
-			deploySucceeded = true
-			o.markDeploymentFinished(sess)
-			o.notifier.Sendf("🚀 maestro: deploy succeeded after PR #%d merge", pr.Number)
-		}
-	} else if !o.cfg.Outcome.RequiresDeploy {
-		deploySucceeded = true
-	}
+	// Delivery hook (#872): route the post-merge deploy/install through the
+	// configured delivery mode. approval_required mints a pending, revision-
+	// pinned deploy_project approval and runs nothing until an operator approves.
+	deploySucceeded := o.deliverAfterMerge(s, sess, pr)
 
 	if o.shouldVerifyOutcomeAfterMerge(deploySucceeded) {
 		o.verifyOutcomeAfterMerge(s, sess, pr.Number)
@@ -5390,22 +5380,128 @@ func (o *Orchestrator) verifyOutcomeAfterMerge(s *state.State, sess *state.Sessi
 	o.notifier.Sendf("⚠️ maestro: outcome verifier after PR #%d is %s: %s", prNumber, result.State, result.Summary)
 }
 
-// runDeployCmd executes the configured deploy command with a configurable timeout.
+// deliverAfterMerge dispatches the post-merge delivery (#872) by the resolved
+// delivery mode:
+//
+//   - automatic (the legacy deploy_cmd behavior and the explicit opt-out from
+//     the approval gate): run the delivery command immediately.
+//   - approval_required: mint a pending deploy_project approval pinned to the
+//     exact merge commit and run NOTHING — an operator approve later executes
+//     the delivery through the DeliveryExecutor behind a durable claim. The
+//     merge itself does not count as a completed deploy.
+//   - disabled: no delivery.
+//
+// It returns whether a deploy has *succeeded* for the purpose of gating
+// immediate outcome verification. When no delivery command completed this cycle
+// (approval_required, disabled, or an inert automatic block), that mirrors the
+// legacy empty-deploy_cmd path: true only when the project does not require a
+// deploy.
+func (o *Orchestrator) deliverAfterMerge(s *state.State, sess *state.Session, pr github.PR) bool {
+	eff := o.cfg.EffectiveDelivery()
+	switch eff.Mode {
+	case config.DeliveryModeAutomatic:
+		if strings.TrimSpace(eff.Command) == "" {
+			break // inert automatic block — nothing to run
+		}
+		if err := o.runDeliveryCommand(pr.Number, eff); err != nil {
+			log.Printf("[orch] deploy command failed for PR #%d: %v", pr.Number, err)
+			o.notifier.Sendf("⚠️ maestro: deploy failed after PR #%d merge: %v", pr.Number, err)
+			return false
+		}
+		o.markDeploymentFinished(sess)
+		o.notifier.Sendf("🚀 maestro: deploy succeeded after PR #%d merge", pr.Number)
+		return true
+	case config.DeliveryModeApprovalRequired:
+		if strings.TrimSpace(eff.Command) != "" {
+			o.enqueueDeliveryApproval(s, sess, pr, eff)
+		}
+	}
+	// approval_required (delivery pending), disabled, or an inert automatic
+	// block: no deploy has completed this cycle.
+	return !o.cfg.Outcome.RequiresDeploy
+}
+
+// enqueueDeliveryApproval mints (or idempotently re-mints / supersedes) a
+// pending deploy_project approval for a merged PR in delivery.mode=
+// approval_required (#872). It pins the exact merge commit — main's HEAD after
+// the merge — so approval later deploys THAT revision and a superseding merge
+// invalidates a stale pending. It executes ZERO delivery command here: the
+// approval carries only operator-safe context (target/rollback/verification and
+// a sanitized command preview), never the raw command or a secret.
+func (o *Orchestrator) enqueueDeliveryApproval(s *state.State, sess *state.Session, pr github.PR, eff config.DeliveryConfig) {
+	if s == nil {
+		return
+	}
+	mergedSHA, err := o.mainHeadSHA()
+	if err != nil || strings.TrimSpace(mergedSHA) == "" {
+		// Without the pinned merge commit we cannot mint a revision-safe
+		// delivery approval — never fall back to deploying whatever revision is
+		// at local_path. Surface it and skip; a later merge re-mints once the
+		// revision is resolvable.
+		log.Printf("[orch] delivery: could not resolve merge commit SHA for PR #%d: %v — skipping delivery approval mint", pr.Number, err)
+		o.notifier.Sendf("⚠️ maestro: could not pin merge commit for PR #%d delivery — no deploy approval created", pr.Number)
+		return
+	}
+	issue := 0
+	if sess != nil {
+		issue = sess.IssueNumber
+	}
+	verifyPlan := ""
+	if strings.TrimSpace(eff.VerifyCommand) != "" {
+		verifyPlan = "run delivery.verify_command against the target after the deploy command succeeds; a non-zero exit fails the delivery"
+	}
+	payload := state.DeliveryPayload{
+		Project:          o.cfg.Repo,
+		Repo:             o.cfg.Repo,
+		PR:               pr.Number,
+		Issue:            issue,
+		MergedSHA:        strings.TrimSpace(mergedSHA),
+		LocalPath:        o.cfg.LocalPath,
+		Target:           eff.Target,
+		CommandPreview:   state.SanitizeDeliveryOutput(eff.Command, 512),
+		VerifyPreview:    state.SanitizeDeliveryOutput(eff.VerifyCommand, 512),
+		Rollback:         eff.Rollback,
+		VerificationPlan: verifyPlan,
+		TimeoutMinutes:   eff.TimeoutMinutes,
+	}
+	approval := s.RecordDeliveryApproval(payload, time.Now().UTC())
+	if approval == nil {
+		return
+	}
+	target := strings.TrimSpace(eff.Target)
+	if target == "" {
+		target = "the configured target"
+	}
+	log.Printf("[orch] delivery: pending deploy_project approval %s for PR #%d @ %s → %s (awaiting operator approval)", approval.ID, pr.Number, shortHeadSHA(mergedSHA), target)
+	o.notifier.Sendf("🔔 maestro: PR #%d merged — delivery to %s awaits approval (%s, revision %s)", pr.Number, target, approval.ID, shortHeadSHA(mergedSHA))
+}
+
+// runDeployCmd executes the configured delivery command with its timeout. It
+// resolves the effective delivery config so the legacy deploy_cmd and an
+// explicit delivery.mode=automatic block share one execution path.
 func (o *Orchestrator) runDeployCmd(prNumber int) error {
-	timeout := time.Duration(o.cfg.DeployTimeoutMinutes) * time.Minute
-	log.Printf("[orch] running deploy command after PR #%d merge (timeout %dm): %s", prNumber, o.cfg.DeployTimeoutMinutes, o.cfg.DeployCmd)
+	return o.runDeliveryCommand(prNumber, o.cfg.EffectiveDelivery())
+}
+
+// runDeliveryCommand runs eff.Command in the project checkout with eff's
+// timeout, bounding it with a context deadline and folding a timeout into a
+// distinct error.
+func (o *Orchestrator) runDeliveryCommand(prNumber int, eff config.DeliveryConfig) error {
+	timeout := eff.EffectiveTimeout()
+	minutes := int(timeout / time.Minute)
+	log.Printf("[orch] running deploy command after PR #%d merge (timeout %dm): %s", prNumber, minutes, eff.Command)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", o.cfg.DeployCmd)
+	cmd := exec.CommandContext(ctx, "bash", "-c", eff.Command)
 	cmd.Dir = o.cfg.LocalPath
 	out, err := cmd.CombinedOutput()
 	if len(out) > 0 {
 		log.Printf("[orch] deploy output:\n%s", out)
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("deploy command timed out after %d minutes", o.cfg.DeployTimeoutMinutes)
+		return fmt.Errorf("deploy command timed out after %d minutes", minutes)
 	}
 	if err != nil {
 		return fmt.Errorf("deploy command failed: %w\n%s", err, out)

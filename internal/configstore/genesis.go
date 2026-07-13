@@ -153,6 +153,13 @@ func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 		Fingerprint:    fp,
 		Canonical:      canonical,
 		Raw:            data,
+		// Surface config load-time warnings on the genesis receipt so an
+		// operator sees them at plan/apply. This is where the #872 delivery
+		// deprecation nudges a legacy deploy_cmd (or an explicit
+		// delivery.mode: automatic) toward the safe approval_required default —
+		// new genesis output that names a delivery command defaults to
+		// approval_required, and an unattended automatic mode is called out.
+		Warnings: cfg.Warnings(),
 	}, nil
 }
 
