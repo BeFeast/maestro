@@ -898,6 +898,25 @@ func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, s
 		sess = live
 	}
 
+	// #874: a restart on a session that owns an open PR is the wrong control.
+	// restart_worker terminates the worker via worker.Stop, which removes the
+	// worktree; respawn would then either fail against the deleted directory
+	// or fresh-restart and discard the PR branch. Refuse it with a precise
+	// pointer to the supported in-place path (spawn_review_repair). stop_worker
+	// is unaffected — terminating a worker whose PR is open is legitimate and
+	// does not touch the PR on GitHub. This is defense-in-depth behind the
+	// fleet API/UI, which disables the restart affordance for the same state.
+	if !stop && sess != nil && sess.PRNumber > 0 {
+		return Result{
+			Status: state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf(
+				"restart_worker refused: slot %s has open PR #%d — restarting deletes its worktree and would repair a stale or missing revision. Use spawn_review_repair to address review feedback in place, or stop_worker to terminate.",
+				slot, sess.PRNumber,
+			),
+			Err: fmt.Errorf("restart_worker on slot %s refused: open PR #%d present", slot, sess.PRNumber),
+		}
+	}
+
 	var err error
 	if stop {
 		err = e.Workers.StopWorker(slot, sess)

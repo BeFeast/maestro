@@ -737,6 +737,45 @@ func TestExecute_RestartWorker_HappyPath(t *testing.T) {
 	}
 }
 
+// #874: restart_worker on a session that owns an open PR is refused before the
+// controller runs — restart deletes the worktree, which would strand or discard
+// the PR branch. The failure summary names the supported in-place alternative.
+func TestExecute_RestartWorker_RefusedForOpenPR(t *testing.T) {
+	wc := &fakeWorkers{}
+	// Finished pr_open gate: worker ended, only live state is the open PR.
+	sess := &state.Session{IssueNumber: 42, Status: state.StatusPROpen, PRNumber: 867, Worktree: "/wt/slot-1"}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": sess}}
+	a := mkApproval(config.SupervisorActionRestartWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "restart me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed (open PR); res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 0 {
+		t.Fatalf("RestartWorker must NOT be called for an open-PR session; got %+v", wc.restartCalls)
+	}
+	if !strings.Contains(res.Summary, "PR #867") || !strings.Contains(res.Summary, "spawn_review_repair") {
+		t.Fatalf("summary = %q, want it to name the open PR and the review-repair alternative", res.Summary)
+	}
+}
+
+// #874: stop_worker is still allowed for an open-PR session — terminating a
+// worker whose PR is open is legitimate and does not touch the PR on GitHub.
+func TestExecute_StopWorker_AllowedForOpenPR(t *testing.T) {
+	wc := &fakeWorkers{}
+	sess := &state.Session{IssueNumber: 42, Status: state.StatusPROpen, PRNumber: 867}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": sess}}
+	a := mkApproval(config.SupervisorActionStopWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "stop me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("status = %q, want executed (stop allowed with open PR); res=%+v", res.Status, res)
+	}
+	if len(wc.stopCalls) != 1 {
+		t.Fatalf("stopCalls = %+v, want exactly one", wc.stopCalls)
+	}
+}
+
 // TestExecute_StopWorker_SlotReuseFence pins the cautious-gate slot-reuse
 // fence (#488 pattern): if the slot now binds a different issue than the
 // approval targeted, refuse the stop without calling the controller.

@@ -7557,6 +7557,62 @@ func TestRespawnDueRetries_WithOpenPRRespawnsInPlace(t *testing.T) {
 	}
 }
 
+// #874: restart_worker on a finished pr_open session tears down the worktree
+// and (via the restart controller) clears sess.Worktree/PRNumber. The dead
+// session that respawnDueRetries then picks up must take the FRESH respawn
+// path, never RespawnInPlace against the directory that was just removed.
+func TestRespawnDueRetries_ClearedWorktreeRespawnsFresh(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	respawnedFresh := false
+	respawnedInPlace := false
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "test prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test issue"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedFresh = true
+			sess.Status = state.StatusRunning
+			sess.PID = 4444
+			return nil
+		},
+		respawnInPlaceFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedInPlace = true
+			return nil
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-1 * time.Second)
+	s := state.NewState()
+	// The restart controller already ran worker.Stop (removed the worktree)
+	// and cleared the pointers: Worktree="" and PRNumber=0.
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber: 112,
+		IssueTitle:  "restarted worker",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		Branch:      "feat/mae-12-112-test",
+		Worktree:    "",
+		PRNumber:    0,
+	}
+
+	o.respawnDueRetries(s, 1)
+
+	if respawnedInPlace {
+		t.Fatal("must NOT choose RespawnInPlace after the restart cleared the worktree")
+	}
+	if !respawnedFresh {
+		t.Fatal("expected a fresh respawn once the stale worktree pointer was cleared")
+	}
+}
+
 func TestRespawnDueRetries_BackoffNotElapsed_Waits(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",

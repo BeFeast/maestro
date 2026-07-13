@@ -5004,6 +5004,25 @@ func repairIssueSessionActive(status state.SessionStatus) bool {
 // single reconcile path shared by the edge-triggered post-merge/outcome callers
 // and the standing reconciler, so every path journals and persists identically
 // (#866). Returns the number staled.
+// mirrorReviewRepairApprovalTerminal mirrors a review-repair approval's
+// terminal transition (changed-head supersede / post-dispatch consume) into
+// the SQLite approval store when one is configured (#874), matching the
+// spawn_repair_worker reconcile mirror. The JSON state is already the source of
+// truth for dispatch; this keeps the queryable mirror from showing a lingering
+// active approval after the JSON record was superseded.
+func (o *Orchestrator) mirrorReviewRepairApprovalTerminal(id string, now time.Time, reason string) {
+	if o == nil || !o.approvalsBinding.UseSQLite() || strings.TrimSpace(id) == "" {
+		return
+	}
+	b := o.approvalsBinding
+	b.StateDir = o.cfg.StateDir
+	b.Repo = o.repo
+	b.Project = o.repo
+	if err := approvalstore.ReconcileMoot(b, id, now, reason); err != nil {
+		log.Printf("[orch] review-repair approval %s terminal mirror to SQLite failed (JSON already updated, retried next cycle): %v", id, err)
+	}
+}
+
 func (o *Orchestrator) reconcileMootRepairApprovals(s *state.State, issue int, now time.Time, reason string) int {
 	staled := s.StaleSpawnRepairWorkerApprovalsForResolvedIssue(issue, now, reason)
 	for i := range staled {
@@ -6244,6 +6263,19 @@ func (o *Orchestrator) tryClaimReviewRepairSlot(s *state.State, target *state.Su
 	return true
 }
 
+// releaseReviewRepairSlot rolls back a (pr,head_sha) attempt claimed by
+// tryClaimReviewRepairSlot when the worker start that would have consumed it
+// failed (#874). Without this, a failed start spends an attempt from the
+// bounded budget while the approval stays active, so a run of start failures
+// exhausts the budget and the approved repair can never reach a worker.
+func (o *Orchestrator) releaseReviewRepairSlot(s *state.State, target *state.SupervisorTarget, payload *state.SupervisorReviewRepairPayload) {
+	if s == nil || target == nil || payload == nil {
+		return
+	}
+	s.ReleaseReviewRepairAttempt(target.PR, payload.HeadSHA, time.Now().UTC())
+	log.Printf("[orch] review-repair: released claimed attempt for PR #%d head %s after failed start", target.PR, shortReviewRepairSHA(payload.HeadSHA))
+}
+
 // shortReviewRepairSHA trims a SHA for log messages — keeps the path
 // dependency-free from internal/supervisor's shortSHA helper.
 func shortReviewRepairSHA(sha string) string {
@@ -6280,6 +6312,78 @@ func (o *Orchestrator) supervisorSelectedReviewRepair(s *state.State, issueNumbe
 		return nil, decision.Target
 	}
 	return decision.ReviewRepair, decision.Target
+}
+
+// resolveReviewRepairDispatch resolves the review-repair payload the
+// dispatcher should act on for issueNumber. It prefers the latest supervisor
+// decision (the auto pipeline), then falls back to a still-effective
+// spawn_review_repair approval's DURABLE payload (#874). The fallback is what
+// makes a manually enqueued or decision-ring-evicted approval dispatchable: it
+// no longer requires the coincident LatestSupervisorDecision to still be a
+// spawn_review_repair. Returns the approval id when the payload came from the
+// durable approval path (so the caller can resolve it after dispatch); "" for
+// the decision path.
+func (o *Orchestrator) resolveReviewRepairDispatch(s *state.State, issueNumber int) (*state.SupervisorReviewRepairPayload, *state.SupervisorTarget, string) {
+	if payload, target := o.supervisorSelectedReviewRepair(s, issueNumber); payload != nil && target != nil {
+		return payload, target, ""
+	}
+	return o.approvalReviewRepairDispatch(s, issueNumber)
+}
+
+// approvalSelectedReviewRepair returns the durable payload + target + id of a
+// still-effective (approved / awaiting_dispatch) spawn_review_repair approval
+// for issueNumber, or nils when none applies. Pending (unapproved) approvals
+// are intentionally excluded — the cautious gate must clear first.
+func (o *Orchestrator) approvalSelectedReviewRepair(s *state.State, issueNumber int) (*state.SupervisorReviewRepairPayload, *state.SupervisorTarget, string) {
+	if s == nil || issueNumber <= 0 {
+		return nil, nil, ""
+	}
+	for i := range s.Approvals {
+		a := &s.Approvals[i]
+		if a.Action != supervisor.ActionSpawnReviewRepair || a.ReviewRepair == nil {
+			continue
+		}
+		switch a.Status {
+		case state.ApprovalStatusApproved, state.ApprovalStatusAwaitingDispatch:
+		default:
+			continue
+		}
+		if a.Target == nil || a.Target.Issue != issueNumber {
+			continue
+		}
+		return a.ReviewRepair, a.Target, a.ID
+	}
+	return nil, nil, ""
+}
+
+// approvalReviewRepairDispatch resolves a durable-approval review-repair
+// payload, enforcing the #874 changed-head guard: before spawning a worker it
+// reads the PR's current head and refuses to repair a stale revision. When the
+// head has moved past the approved payload, the approval is superseded (the
+// next supervisor cycle re-proves the current head) and (nil, nil, "") is
+// returned. A head-read error is treated conservatively — leave the approval
+// pending rather than repair a possibly-wrong revision.
+func (o *Orchestrator) approvalReviewRepairDispatch(s *state.State, issueNumber int) (*state.SupervisorReviewRepairPayload, *state.SupervisorTarget, string) {
+	payload, target, id := o.approvalSelectedReviewRepair(s, issueNumber)
+	if payload == nil || target == nil {
+		return nil, nil, ""
+	}
+	currentHead, err := o.prHeadSHA(target.PR)
+	if err != nil {
+		log.Printf("[orch] review-repair approval %s: PR #%d head read failed; leaving approval pending: %v", id, target.PR, err)
+		return nil, nil, ""
+	}
+	if strings.TrimSpace(currentHead) != strings.TrimSpace(payload.HeadSHA) {
+		now := time.Now().UTC()
+		reason := fmt.Sprintf("PR #%d head moved to %s (review-repair approved for %s) — superseded to avoid repairing a stale revision",
+			target.PR, shortReviewRepairSHA(currentHead), shortReviewRepairSHA(payload.HeadSHA))
+		for _, staled := range s.SupersedeReviewRepairApprovalsForStaleHead(target.PR, currentHead, now, reason) {
+			log.Printf("[orch] %s (approval %s)", reason, staled)
+			o.mirrorReviewRepairApprovalTerminal(staled, now, reason)
+		}
+		return nil, nil, ""
+	}
+	return payload, target, id
 }
 
 // hasEffectiveApprovalForDecision reports whether the supervisor decision
@@ -6650,7 +6754,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// the scoped Greptile-finding prompt. Skip the pipeline preamble
 		// — the review-repair worker is a focused, single-phase fixer
 		// (not a planner/implementer/validator pass).
-		if reviewRepair, repairTarget := o.supervisorSelectedReviewRepair(s, issue.Number); reviewRepair != nil && repairTarget != nil {
+		reviewRepair, repairTarget, reviewRepairApprovalID := o.resolveReviewRepairDispatch(s, issue.Number)
+		if reviewRepair != nil && repairTarget != nil {
 			if !o.tryClaimReviewRepairSlot(s, repairTarget, reviewRepair) {
 				continue
 			}
@@ -6661,8 +6766,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			promptBase = supervisor.FormatReviewRepairPromptFromPayload(issue.Number, repairTarget.PR, reviewRepair)
 			initialPhase = state.PhaseNone
 			backendReason = "review_repair"
-			log.Printf("[orch] starting auto review-repair worker for issue #%d (PR #%d, head %s, backend=%s, %d findings)",
-				issue.Number, repairTarget.PR, shortReviewRepairSHA(reviewRepair.HeadSHA), backendName, len(reviewRepair.Findings))
+			source := "auto"
+			if reviewRepairApprovalID != "" {
+				source = "approval " + reviewRepairApprovalID
+			}
+			log.Printf("[orch] starting review-repair worker for issue #%d (PR #%d, head %s, backend=%s, %d findings, source=%s)",
+				issue.Number, repairTarget.PR, shortReviewRepairSHA(reviewRepair.HeadSHA), backendName, len(reviewRepair.Findings), source)
 		} else if initialPhase != state.PhaseNone && initialPhase != state.PhaseImplement {
 			// Pipeline mode with planner — use planner backend and raw template
 			// (worker.Start → assemblePrompt will substitute {{WORKTREE}} etc.)
@@ -6736,6 +6845,13 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
 				issue.Number, issue.Title, err)
+			// #874: a review-repair dispatch claimed a (pr,head) attempt via
+			// tryClaimReviewRepairSlot BEFORE this start; release it so a failed
+			// start does not burn a slot from the bounded repair budget and leave
+			// the still-active approval permanently un-dispatchable.
+			if reviewRepair != nil && repairTarget != nil {
+				o.releaseReviewRepairSlot(s, repairTarget, reviewRepair)
+			}
 			continue
 		}
 
@@ -6769,6 +6885,19 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 		if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
 			s.MarkProjectStatusSynced(issue.Number, string(github.ProjectStatusInProgress), time.Now().UTC())
+		}
+		// #874: when this review-repair worker was dispatched from a durable
+		// approval (not the live decision path), supersede that approval now
+		// that its worker has really started — so the dispatcher does not
+		// re-resolve (and re-read the PR head) every cycle, and no active
+		// approval is left behind after the repair reaches a worker.
+		if reviewRepairApprovalID != "" {
+			resolveNow := time.Now().UTC()
+			reason := fmt.Sprintf("review-repair worker %s dispatched for PR #%d — approval consumed", slotName, repairTarget.PR)
+			if s.ResolveDispatchedReviewRepairApproval(reviewRepairApprovalID, resolveNow, reason) {
+				log.Printf("[orch] %s (approval %s)", reason, reviewRepairApprovalID)
+				o.mirrorReviewRepairApprovalTerminal(reviewRepairApprovalID, resolveNow, reason)
+			}
 		}
 		o.notifier.Sendf("🚀 maestro: started worker %s for issue #%d: %s", slotName, issue.Number, issue.Title)
 		started++

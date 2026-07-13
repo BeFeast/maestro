@@ -4115,7 +4115,9 @@ func commandBinary(cmd, fallback string) string {
 //     clear NextRetryAt so the orchestrator does NOT respawn.
 //   - restart_worker: terminate the worker, mark StatusDead with
 //     NextRetryAt = now so respawnDueRetries picks it up on the next
-//     dispatcher cycle.
+//     dispatcher cycle. worker.Stop removed the worktree, so the stale
+//     worktree/PR pointers are cleared (#874) — otherwise respawnDueRetries
+//     would choose RespawnInPlace against a directory that no longer exists.
 func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 	return approver.WorkerControllerFuncs{
 		Stop: func(slot string, sess *state.Session) error {
@@ -4136,9 +4138,27 @@ func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 			sess.Status = state.StatusDead
 			sess.FinishedAt = &now
 			sess.NextRetryAt = &now
+			clearWorktreeAfterRestart(sess)
 			return nil
 		},
 	}
+}
+
+// clearWorktreeAfterRestart drops the worktree + PR pointers of a session that
+// worker.Stop just tore down for a restart (#874). worker.Stop removes the
+// worktree directory but does not touch the struct fields; leaving them set
+// makes respawnDueRetries take the RespawnInPlace branch (sess.PRNumber != 0 &&
+// sess.Worktree != "") against a directory that no longer exists. Clearing them
+// forces a fresh respawn — the only convergent choice once the directory is
+// gone. restart_worker never runs for an open-PR session (the executor refuses
+// it and the fleet UI disables it), so this cannot silently discard PR work; it
+// is the fresh-restart cleanup for the process-restart case.
+func clearWorktreeAfterRestart(sess *state.Session) {
+	if sess == nil {
+		return
+	}
+	sess.Worktree = ""
+	sess.PRNumber = 0
 }
 
 // executeApprovedApprovals runs any approvals currently in status=approved

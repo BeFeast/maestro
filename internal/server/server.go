@@ -913,8 +913,24 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 			merge.DisabledReason = "No PR is associated with this worker; approve merge becomes available once a PR is open."
 		}
 	}
+	restart := newApprovalControlAction("restart_worker", "Restart", "Enqueue a cautious-gate approval to restart this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	if worker.PRNumber > 0 {
+		// #874: restarting a worker that already owns an open PR is the wrong
+		// control — restart_worker deletes the worktree, which would strand
+		// or discard the PR branch. The supported in-place path is
+		// spawn_review_repair (address review feedback without touching the
+		// worktree), and stop_worker still terminates if that is the intent.
+		// Disable Restart for this state and name the alternative so the
+		// operator is not offered an action the dispatcher cannot complete.
+		restart.Disabled = true
+		if readOnly {
+			restart.DisabledReason = readOnlyDisabledReason() + fmt.Sprintf(" Additionally, this worker has open PR #%d — restart is unsupported for an open PR; use review-repair (in place) or Stop.", worker.PRNumber)
+		} else {
+			restart.DisabledReason = fmt.Sprintf("This worker has open PR #%d; restart would delete its worktree and strand the PR branch. Use review-repair to address review feedback in place, or Stop to terminate.", worker.PRNumber)
+		}
+	}
 	return []controlAction{
-		newApprovalControlAction("restart_worker", "Restart", "Enqueue a cautious-gate approval to restart this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
+		restart,
 		newApprovalControlAction("stop_worker", "Stop", "Enqueue a cautious-gate approval to stop this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_ready", "Mark ready", "Add the maestro-ready label so the supervisor picks the issue up.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_blocked", "Mark blocked", "Add the blocked label so the supervisor holds the issue.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
