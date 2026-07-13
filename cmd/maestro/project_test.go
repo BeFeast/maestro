@@ -146,11 +146,11 @@ func TestClassifyDaemonWatchStoreRequiresMatchingStore(t *testing.T) {
 	}
 }
 
-func TestClassifyDaemonWatchStoreUsesDaemonDefaultStore(t *testing.T) {
+func TestClassifyDaemonWatchStoreDoesNotGuessImplicitStore(t *testing.T) {
 	t.Setenv("HOME", "/srv/example-home")
 	procs := [][]string{{"/usr/local/bin/maestro", "daemon", "--watch-store"}}
-	if got := classifyDaemonWatchStore(procs, "/srv/example-home/.maestro/maestro.db"); got != watchStoreObserved {
-		t.Fatalf("classify default-store daemon = %q, want observed", got)
+	if got := classifyDaemonWatchStore(procs, "/srv/example-home/.maestro/maestro.db"); got != watchStoreImplicitStore {
+		t.Fatalf("classify implicit-store daemon = %q, want implicit-store", got)
 	}
 }
 
@@ -311,6 +311,10 @@ func TestGenesisReconcileForFoldsWatchStore(t *testing.T) {
 	r = genesisReconcileFor("apply", configstore.EffectCreate, "", watchStoreRunningWithout)
 	if !strings.Contains(r.Note, "WITHOUT --watch-store") {
 		t.Fatalf("running-without note = %q, want a --watch-store warning", r.Note)
+	}
+	r = genesisReconcileFor("apply", configstore.EffectCreate, "", watchStoreImplicitStore)
+	if !strings.Contains(r.Note, "startup-time default") || !strings.Contains(r.Note, "explicit --store") {
+		t.Fatalf("implicit-store note = %q, want migration-safe ambiguity guidance", r.Note)
 	}
 	// A conflict is a hard stop with no reconciliation.
 	r = genesisReconcileFor("plan", configstore.EffectConflict, "boom", watchStoreObserved)

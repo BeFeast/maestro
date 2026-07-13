@@ -439,6 +439,8 @@ func genesisReconcileFor(command, effect, conflict, watchStore string) genesisRe
 		r.Note = appendNote(r.Note, "a maestro daemon is running WITHOUT --watch-store on this host; it will not hot-reconcile the row — restart it with --watch-store or reconcile manually")
 	case watchStoreDifferentStore:
 		r.Note = appendNote(r.Note, "a maestro daemon with --watch-store is running on this host, but it watches a different --store path; it will not hot-reconcile this row")
+	case watchStoreImplicitStore:
+		r.Note = appendNote(r.Note, "a maestro daemon with --watch-store is running without an explicit --store; its startup-time default cannot be reconstructed safely after store migration — verify the daemon store or restart it with an explicit --store path")
 	case watchStoreNotObserved:
 		r.Note = appendNote(r.Note, "no running maestro daemon was observed from this host; confirm the fleet daemon runs with --watch-store so the row is hot-reconciled")
 	default: // unknown
@@ -529,6 +531,7 @@ const (
 	watchStoreObserved       = "observed"
 	watchStoreRunningWithout = "running-without-watch-store"
 	watchStoreDifferentStore = "running-with-different-store"
+	watchStoreImplicitStore  = "running-with-implicit-store"
 	watchStoreNotObserved    = "not-observed"
 	watchStoreUnknown        = "unknown"
 )
@@ -550,6 +553,7 @@ func probeDaemonWatchStore(expectedStore string) string {
 func classifyDaemonWatchStore(procs [][]string, expectedStore string) string {
 	daemonFound := false
 	watchStoreFound := false
+	implicitStoreFound := false
 	for _, argv := range procs {
 		if !looksLikeMaestroDaemon(argv) {
 			continue
@@ -557,10 +561,18 @@ func classifyDaemonWatchStore(procs [][]string, expectedStore string) string {
 		daemonFound = true
 		if argvHasWatchStore(argv) {
 			watchStoreFound = true
-			if sameStorePath(daemonStorePath(argv), expectedStore) {
+			storePath, explicit := daemonStorePath(argv)
+			if !explicit {
+				implicitStoreFound = true
+				continue
+			}
+			if sameStorePath(storePath, expectedStore) {
 				return watchStoreObserved
 			}
 		}
+	}
+	if implicitStoreFound {
+		return watchStoreImplicitStore
 	}
 	if watchStoreFound {
 		return watchStoreDifferentStore
@@ -571,16 +583,16 @@ func classifyDaemonWatchStore(procs [][]string, expectedStore string) string {
 	return watchStoreNotObserved
 }
 
-func daemonStorePath(argv []string) string {
+func daemonStorePath(argv []string) (string, bool) {
 	for i, arg := range argv {
 		if (arg == "--store" || arg == "-store") && i+1 < len(argv) {
-			return argv[i+1]
+			return argv[i+1], true
 		}
 		if strings.HasPrefix(arg, "--store=") || strings.HasPrefix(arg, "-store=") {
-			return strings.SplitN(arg, "=", 2)[1]
+			return strings.SplitN(arg, "=", 2)[1], true
 		}
 	}
-	return defaultConfigStorePath()
+	return "", false
 }
 
 func sameStorePath(got, want string) bool {
