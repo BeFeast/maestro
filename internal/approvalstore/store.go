@@ -30,7 +30,9 @@ package approvalstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 	action        TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL,
 	payload_hash  TEXT NOT NULL DEFAULT '',
+	record_hash   TEXT NOT NULL DEFAULT '',
 	created_at    TEXT NOT NULL,
 	updated_at    TEXT NOT NULL,
 	approval_json TEXT NOT NULL,
@@ -72,7 +75,7 @@ CREATE TABLE IF NOT EXISTS approvals (
 // whatever the legacy table actually has).
 var approvalsColumns = []string{
 	"id", "decision_id", "project", "repo", "state_dir", "action",
-	"status", "payload_hash", "created_at", "updated_at", "approval_json",
+	"status", "payload_hash", "record_hash", "created_at", "updated_at", "approval_json",
 }
 
 // Schema creates the approvals + approval_audit tables. Both are
@@ -110,6 +113,23 @@ type RowBinding struct {
 type Store struct {
 	db *sql.DB
 }
+
+// ErrDeliveryConfigMismatch means the live executor spec no longer matches
+// the digest durably approved by the operator. The authoritative row is made
+// stale in the same transaction, so rolling config back cannot resurrect it.
+var ErrDeliveryConfigMismatch = errors.New("delivery config differs from approved digest")
+
+// ErrDeliveryIntegrity means approval_json, its embedded payload hash, and the
+// denormalized SQLite hash do not agree with the canonical immutable delivery
+// payload. Callers fail closed and run no side effect.
+var ErrDeliveryIntegrity = errors.New("delivery approval integrity check failed")
+
+// ErrDeliveryInFlight means another deploy_project approval for the same
+// project state directory already owns the execution lease. The newer
+// approval remains approved and may be claimed after the in-flight delivery
+// reaches a terminal state; it is never run concurrently with the older
+// generation.
+var ErrDeliveryInFlight = errors.New("another project delivery is already executing")
 
 // DefaultDBPath is the unified fleet database (~/.maestro/maestro.db). A single
 // file holds config, approvals, state, and the other fleet tables; rows are
@@ -174,7 +194,177 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, Schema); err != nil {
 		return err
 	}
-	return s.migrateApprovalsSchema(ctx)
+	if err := s.migrateApprovalsSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureDeliveryRecordHashColumn(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateCanonicalStateDirs(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureDeliveryRecordHashColumn upgrades an already-scoped approvals table
+// created before delivery result records gained their independent integrity
+// digest. Existing rows deliberately remain blank: approval-gated delivery is
+// not yet live, so an old deploy_project row has no trusted terminal result to
+// grandfather and will fail closed on read.
+func (s *Store) ensureDeliveryRecordHashColumn(ctx context.Context) error {
+	_, cols, err := approvalsPKScopedByStateDir(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	for _, col := range cols {
+		if col == "record_hash" {
+			return nil
+		}
+	}
+	_, err = s.db.ExecContext(ctx, `ALTER TABLE approvals ADD COLUMN record_hash TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
+// migrateCanonicalStateDirs folds legacy lexical/symlink aliases into the one
+// canonical state_dir namespace now used by config loading. This migration is
+// intentionally fail-closed on an ID collision: two independently claimable
+// rows for the same physical state directory may represent a historical
+// duplicate-delivery hazard, and guessing which status wins could replay a
+// side effect. Collision-free aliases are updated atomically together with
+// their audit rows before any new mint/claim can occur.
+func (s *Store) migrateCanonicalStateDirs(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+SELECT DISTINCT state_dir FROM (
+  SELECT state_dir FROM approvals
+  UNION ALL
+  SELECT state_dir FROM approval_audit
+)
+WHERE state_dir <> ''`)
+	if err != nil {
+		return err
+	}
+	var rawDirs []string
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			rows.Close()
+			return err
+		}
+		rawDirs = append(rawDirs, raw)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, raw := range rawDirs {
+		if !filepath.IsAbs(raw) {
+			return fmt.Errorf("legacy approval state_dir %q is relative; refusing cwd-dependent automatic migration", raw)
+		}
+		canonical, err := canonicalStateDir(raw)
+		if err != nil {
+			return fmt.Errorf("canonicalize legacy approval state_dir %q: %w", raw, err)
+		}
+		if canonical == raw {
+			continue
+		}
+		var collisionID string
+		err = tx.QueryRowContext(ctx, `
+SELECT old.id
+FROM approvals old
+JOIN approvals current ON current.state_dir = ? AND current.id = old.id
+WHERE old.state_dir = ?
+LIMIT 1`, canonical, raw).Scan(&collisionID)
+		if err == nil {
+			return fmt.Errorf("legacy approval state_dir alias collision for id %s: %q and %q; refusing automatic migration", collisionID, raw, canonical)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// record_hash binds state_dir, so a trusted alias migration must verify
+		// the old record first and then rebind its digest to the canonical path
+		// inside this same transaction. Blindly changing state_dir would make
+		// every valid delivery row look tampered on the next read.
+		type deliveryRebind struct {
+			id, blob, project, repo, action, status, payloadHash, recordHash string
+		}
+		var rebinds []deliveryRebind
+		deliveryRows, err := tx.QueryContext(ctx, `
+SELECT id, approval_json, project, repo, action, status, payload_hash, record_hash
+FROM approvals WHERE state_dir = ? AND (action = ? OR record_hash <> '')`, raw, state.ApprovalActionDeployProject)
+		if err != nil {
+			return err
+		}
+		for deliveryRows.Next() {
+			var row deliveryRebind
+			if err := deliveryRows.Scan(&row.id, &row.blob, &row.project, &row.repo, &row.action, &row.status, &row.payloadHash, &row.recordHash); err != nil {
+				deliveryRows.Close()
+				return err
+			}
+			rebinds = append(rebinds, row)
+		}
+		if err := deliveryRows.Close(); err != nil {
+			return err
+		}
+		for _, row := range rebinds {
+			var approval state.Approval
+			if err := json.Unmarshal([]byte(row.blob), &approval); err != nil {
+				return fmt.Errorf("unmarshal delivery approval %s during state_dir migration: %w", row.id, err)
+			}
+			verified, err := verifyDeliveryIntegrity(&approval, row.payloadHash, row.recordHash, row.id, row.action, row.status,
+				RowBinding{Project: row.project, Repo: row.repo, StateDir: raw})
+			if err != nil {
+				return fmt.Errorf("rebind delivery approval %s: %w", row.id, err)
+			}
+			newHash, err := computeDeliveryRecordHash(verified, RowBinding{Project: row.project, Repo: row.repo, StateDir: canonical})
+			if err != nil {
+				return fmt.Errorf("hash rebound delivery approval %s: %w", row.id, err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE approvals SET record_hash = ? WHERE state_dir = ? AND id = ?`, newHash, raw, row.id); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE approvals SET state_dir = ? WHERE state_dir = ?`, canonical, raw); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE approval_audit SET state_dir = ? WHERE state_dir = ?`, canonical, raw); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func canonicalStateDir(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("state_dir is required")
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	probe := abs
+	var suffix []string
+	for {
+		resolved, evalErr := filepath.EvalSymlinks(probe)
+		if evalErr == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(evalErr) {
+			return "", evalErr
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return abs, nil
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
+	}
 }
 
 // migrateApprovalsSchema upgrades a maestro.db created before approval rows
@@ -291,19 +481,30 @@ func (s *Store) Put(ctx context.Context, a *state.Approval, b RowBinding) (inser
 	if a == nil || strings.TrimSpace(a.ID) == "" {
 		return false, errors.New("approval id is required")
 	}
+	if a.Action == state.ApprovalActionDeployProject && a.Delivery == nil {
+		return false, errors.New("deploy_project approval requires delivery payload")
+	}
+	b.StateDir, err = canonicalStateDir(b.StateDir)
+	if err != nil {
+		return false, fmt.Errorf("canonicalize approval state_dir: %w", err)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	ins, err := putApprovalTx(ctx, tx, a, b)
+	persisted := a
+	if a.Action == state.ApprovalActionDeployProject {
+		persisted = state.CanonicalDeliveryApprovalForWrite(a)
+	}
+	ins, err := putApprovalTx(ctx, tx, persisted, b)
 	if err != nil {
 		return false, err
 	}
 	if ins {
-		for i := range a.Audit {
-			if err := insertAuditTx(ctx, tx, a.ID, b, a.Audit[i]); err != nil {
+		for i := range persisted.Audit {
+			if err := insertAuditTx(ctx, tx, persisted.ID, b, persisted.Audit[i]); err != nil {
 				return false, err
 			}
 		}
@@ -314,11 +515,174 @@ func (s *Store) Put(ctx context.Context, a *state.Approval, b RowBinding) (inser
 	return ins, nil
 }
 
+// PutDelivery atomically seeds a deploy_project approval and supersedes every
+// other still-actionable delivery for the same project in the same state_dir.
+// This is intentionally stronger than generic Put: an old approved SHA/spec
+// must lose the same SQLite race that arbitrates approved→executing, otherwise
+// JSON could say "superseded" while a daemon still executes the old DB row.
+func (s *Store) PutDelivery(ctx context.Context, a *state.Approval, b RowBinding, now time.Time) (inserted bool, err error) {
+	if a == nil || strings.TrimSpace(a.ID) == "" {
+		return false, errors.New("approval id is required")
+	}
+	if a.Action != state.ApprovalActionDeployProject || a.Delivery == nil {
+		return false, errors.New("PutDelivery requires a deploy_project approval with delivery payload")
+	}
+	b.StateDir, err = canonicalStateDir(b.StateDir)
+	if err != nil {
+		return false, fmt.Errorf("canonicalize delivery state_dir: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	// Ensure-row calls from an executor or restart must be side-effect free.
+	// In particular, a late ensure of old A after newer B was minted must not
+	// supersede B. Only a genuinely fresh generation reaches reconciliation.
+	if _, _, loadErr := loadApprovalTx(ctx, tx, b.StateDir, a.ID); loadErr == nil {
+		return false, nil
+	} else if !errors.Is(loadErr, sql.ErrNoRows) {
+		return false, loadErr
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT id FROM approvals
+WHERE state_dir = ? AND action = ? AND id <> ?`,
+		b.StateDir, string(state.ApprovalActionDeployProject), a.ID)
+	if err != nil {
+		return false, err
+	}
+	var siblingIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, err
+		}
+		siblingIDs = append(siblingIDs, id)
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+
+	now = normalize(now)
+	candidate := *state.CanonicalDeliveryApprovalForWrite(a)
+	var staleIDs []string
+	if candidate.Status == state.ApprovalStatusPending || candidate.Status == state.ApprovalStatusApproved {
+		newerExists := false
+		for _, id := range siblingIDs {
+			old, _, loadErr := loadApprovalTx(ctx, tx, b.StateDir, id)
+			if loadErr != nil {
+				return false, loadErr
+			}
+			if state.DeliveryGenerationsAmbiguous(old.Delivery, candidate.Delivery) {
+				// GitHub timestamps are second-resolution. Leave tied revisions
+				// actionable so the execution-time isolated-remote topology fence
+				// can stale the ancestor and admit the descendant.
+				continue
+			} else if state.CompareDeliveryGeneration(old.Delivery, old.CreatedAt, candidate.Delivery, candidate.CreatedAt) > 0 {
+				newerExists = true
+			}
+			if old.Status == state.ApprovalStatusPending || old.Status == state.ApprovalStatusApproved {
+				staleIDs = append(staleIDs, id)
+			}
+		}
+		if newerExists {
+			candidate.Status = state.ApprovalStatusSuperseded
+			candidate.UpdatedAt = now
+			candidate.Audit = append(candidate.Audit, state.ApprovalAudit{
+				At:          now,
+				Event:       state.ApprovalAuditSuperseded,
+				Reason:      "delivery generation is not safely orderable",
+				PayloadHash: candidate.PayloadHash,
+			})
+			candidate = *state.CanonicalDeliveryApprovalForWrite(&candidate)
+		}
+		if newerExists {
+			// A known newer generation remains authoritative; do not mutate it or
+			// its siblings merely because an old standing reconcile arrived late.
+			staleIDs = nil
+		}
+	}
+
+	for _, id := range staleIDs {
+		old, oldBinding, loadErr := loadApprovalTx(ctx, tx, b.StateDir, id)
+		if loadErr != nil {
+			return false, loadErr
+		}
+		old.Status = state.ApprovalStatusSuperseded
+		old.UpdatedAt = now
+		reason := fmt.Sprintf("superseded by delivery approval %s for revision %s", candidate.ID, shortDeliverySHA(candidate.Delivery.MergedSHA))
+		audit := state.ApprovalAudit{
+			At:              now,
+			Event:           state.ApprovalAuditSuperseded,
+			Reason:          reason,
+			PayloadHash:     old.PayloadHash,
+			TargetStateHash: old.TargetStateHash,
+		}
+		old.Audit = append(old.Audit, audit)
+		old = state.CanonicalDeliveryApprovalForWrite(old)
+		audit = old.Audit[len(old.Audit)-1]
+		res, updateErr := tx.ExecContext(ctx,
+			`UPDATE approvals SET status = ?, updated_at = ? WHERE state_dir = ? AND id = ? AND status IN (?, ?)`,
+			string(state.ApprovalStatusSuperseded), formatTime(now), b.StateDir, id,
+			string(state.ApprovalStatusPending), string(state.ApprovalStatusApproved))
+		if updateErr != nil {
+			return false, updateErr
+		}
+		if n, rowsErr := res.RowsAffected(); rowsErr != nil {
+			return false, rowsErr
+		} else if n != 1 {
+			return false, fmt.Errorf("delivery approval %s lost supersede race", id)
+		}
+		if err := writeApprovalJSONTx(ctx, tx, oldBinding, old); err != nil {
+			return false, err
+		}
+		if err := insertAuditTx(ctx, tx, id, oldBinding, audit); err != nil {
+			return false, err
+		}
+	}
+
+	candidate = *state.CanonicalDeliveryApprovalForWrite(&candidate)
+	inserted, err = putApprovalTx(ctx, tx, &candidate, b)
+	if err != nil {
+		return false, err
+	}
+	if inserted {
+		for i := range candidate.Audit {
+			if err := insertAuditTx(ctx, tx, candidate.ID, b, candidate.Audit[i]); err != nil {
+				return false, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return inserted, nil
+}
+
+func shortDeliverySHA(sha string) string {
+	sha = strings.TrimSpace(sha)
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
 // Get returns the full approval (audit included, via approval_json) for id
 // within the given state_dir scope, or state.ErrApprovalNotFound.
 func (s *Store) Get(ctx context.Context, stateDir, id string) (*state.Approval, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT approval_json FROM approvals WHERE state_dir = ? AND id = ?`, stateDir, id)
-	return scanApproval(row)
+	canonical, err := canonicalStateDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize approval state_dir: %w", err)
+	}
+	stateDir = canonical
+	row := s.db.QueryRowContext(ctx, `SELECT approval_json, payload_hash, record_hash, id, project, repo, state_dir, action, status FROM approvals WHERE state_dir = ? AND id = ?`, stateDir, id)
+	a, err := scanApproval(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, state.ErrApprovalNotFound
+	}
+	return a, err
 }
 
 // List returns every approval bound to the given state_dir, ordered by
@@ -329,9 +693,13 @@ func (s *Store) List(ctx context.Context, stateDir string) ([]*state.Approval, e
 		err  error
 	)
 	if strings.TrimSpace(stateDir) == "" {
-		rows, err = s.db.QueryContext(ctx, `SELECT approval_json FROM approvals ORDER BY created_at`)
+		rows, err = s.db.QueryContext(ctx, `SELECT approval_json, payload_hash, record_hash, id, project, repo, state_dir, action, status FROM approvals ORDER BY created_at`)
 	} else {
-		rows, err = s.db.QueryContext(ctx, `SELECT approval_json FROM approvals WHERE state_dir = ? ORDER BY created_at`, stateDir)
+		stateDir, err = canonicalStateDir(stateDir)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize approval state_dir: %w", err)
+		}
+		rows, err = s.db.QueryContext(ctx, `SELECT approval_json, payload_hash, record_hash, id, project, repo, state_dir, action, status FROM approvals WHERE state_dir = ? ORDER BY created_at`, stateDir)
 	}
 	if err != nil {
 		return nil, err
@@ -379,6 +747,11 @@ func (s *Store) Reject(ctx context.Context, stateDir, id string, now time.Time, 
 // claim implements the pending → {approved,rejected} transition with the
 // atomic UPDATE ... WHERE status='pending' guard, scoped to one state_dir.
 func (s *Store) claim(ctx context.Context, stateDir, id string, target state.ApprovalStatus, event string, now time.Time, actor, reason string) (*state.Approval, error) {
+	canonical, err := canonicalStateDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize approval state_dir: %w", err)
+	}
+	stateDir = canonical
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -407,6 +780,16 @@ func (s *Store) claim(ctx context.Context, stateDir, id string, target state.App
 	// Internal-consistency guard, mirroring state.ensureApprovalCurrent: a
 	// pending approval whose payload drifted from its recorded hash is staled
 	// rather than approved.
+	if a.Action == state.ApprovalActionDeployProject && a.Delivery.DeliveryExpired(now) {
+		a.Delivery.StaleCause = state.DeliveryStaleCauseExpired
+		if err := markStaleTx(ctx, tx, a, b, now, "delivery approval expired before execution"); err != nil {
+			return a, err
+		}
+		if err := tx.Commit(); err != nil {
+			return a, err
+		}
+		return a, state.ErrApprovalStale
+	}
 	if a.PayloadHash != "" && a.ComputePayloadHash() != a.PayloadHash {
 		if err := markStaleTx(ctx, tx, a, b, now, "approval payload changed"); err != nil {
 			return a, err
@@ -450,7 +833,11 @@ func (s *Store) claim(ctx context.Context, stateDir, id string, target state.App
 		TargetStateHash: a.TargetStateHash,
 	}
 	a.Audit = append(a.Audit, audit)
-	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
+	if a.Action == state.ApprovalActionDeployProject {
+		a = state.CanonicalDeliveryApprovalForWrite(a)
+		audit = a.Audit[len(a.Audit)-1]
+	}
+	if err := writeApprovalJSONTx(ctx, tx, b, a); err != nil {
 		return a, err
 	}
 	if err := insertAuditTx(ctx, tx, id, b, audit); err != nil {
@@ -488,6 +875,11 @@ func (s *Store) MarkAwaitingDispatch(ctx context.Context, stateDir, id string, n
 // markTerminal implements the approved → terminal transition with the atomic
 // UPDATE ... WHERE status='approved' idempotency guard, scoped to one state_dir.
 func (s *Store) markTerminal(ctx context.Context, stateDir, id string, target state.ApprovalStatus, event string, now time.Time, actor, reason string) (*state.Approval, error) {
+	canonical, err := canonicalStateDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize approval state_dir: %w", err)
+	}
+	stateDir = canonical
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -535,7 +927,11 @@ func (s *Store) markTerminal(ctx context.Context, stateDir, id string, target st
 		TargetStateHash: a.TargetStateHash,
 	}
 	a.Audit = append(a.Audit, audit)
-	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
+	if a.Action == state.ApprovalActionDeployProject {
+		a = state.CanonicalDeliveryApprovalForWrite(a)
+		audit = a.Audit[len(a.Audit)-1]
+	}
+	if err := writeApprovalJSONTx(ctx, tx, b, a); err != nil {
 		return a, err
 	}
 	if err := insertAuditTx(ctx, tx, id, b, audit); err != nil {
@@ -556,7 +952,136 @@ func (s *Store) markTerminal(ctx context.Context, stateDir, id string, target st
 // non-approved row and returns state.ErrApprovalNotApproved, so an in-flight or
 // completed delivery is never replayed automatically. scoped to one state_dir.
 func (s *Store) ClaimExecuting(ctx context.Context, stateDir, id string, now time.Time, actor, reason string) (*state.Approval, error) {
-	return s.markFrom(ctx, stateDir, id, state.ApprovalStatusApproved, state.ApprovalStatusExecuting, state.ApprovalAuditExecuting, state.ErrApprovalNotApproved, now, actor, reason, nil)
+	return s.claimDeliveryExecuting(ctx, stateDir, id, "", now, actor, reason)
+}
+
+// ClaimDeliveryExecuting is ClaimExecuting with an atomic execution-spec
+// fence. expectedConfigDigest is recomputed from the live config by the
+// executor; mismatch durably stales the approval before returning.
+func (s *Store) ClaimDeliveryExecuting(ctx context.Context, stateDir, id, expectedConfigDigest string, now time.Time, actor, reason string) (*state.Approval, error) {
+	if strings.TrimSpace(expectedConfigDigest) == "" {
+		return nil, errors.New("expected delivery config digest is required")
+	}
+	return s.claimDeliveryExecuting(ctx, stateDir, id, strings.TrimSpace(expectedConfigDigest), now, actor, reason)
+}
+
+func (s *Store) claimDeliveryExecuting(ctx context.Context, stateDir, id, expectedConfigDigest string, now time.Time, actor, reason string) (*state.Approval, error) {
+	canonical, err := canonicalStateDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize delivery state_dir: %w", err)
+	}
+	stateDir = canonical
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	a, b, err := loadApprovalTx(ctx, tx, stateDir, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, state.ErrApprovalNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if a.Status != state.ApprovalStatusApproved {
+		return a, state.ErrApprovalNotApproved
+	}
+	if expectedConfigDigest != "" && (a.Delivery == nil || strings.TrimSpace(a.Delivery.ConfigDigest) != expectedConfigDigest) {
+		if a.Delivery != nil {
+			a.Delivery.StaleCause = state.DeliveryStaleCauseConfigDrift
+		}
+		if err := markStaleTx(ctx, tx, a, b, now, "delivery config changed after approval; fresh approval required"); err != nil {
+			return a, err
+		}
+		if err := tx.Commit(); err != nil {
+			return a, err
+		}
+		return a, ErrDeliveryConfigMismatch
+	}
+	// Expiry must contend in the same transaction as approved→executing.
+	// Checking it before this claim leaves a TOCTOU where the deadline passes
+	// between the check and UPDATE, and returning stale without persisting it
+	// leaves an approved row claimable by another process.
+	if a.Action == state.ApprovalActionDeployProject && a.Delivery.DeliveryExpired(now) {
+		a.Delivery.StaleCause = state.DeliveryStaleCauseExpired
+		if err := markStaleTx(ctx, tx, a, b, now, "delivery approval expired before execution"); err != nil {
+			return a, err
+		}
+		if err := tx.Commit(); err != nil {
+			return a, err
+		}
+		return a, state.ErrApprovalStale
+	}
+
+	now = normalize(now)
+	// The NOT EXISTS predicate is the project-scoped delivery execution lease.
+	// It deliberately lives in the same write statement as approved→executing:
+	// SQLite serializes competing writers, so two different approval IDs cannot
+	// both observe the lease as free and start side effects concurrently.
+	res, err := tx.ExecContext(ctx, `
+UPDATE approvals
+SET status = ?, updated_at = ?
+WHERE state_dir = ? AND id = ? AND status = ?
+  AND NOT EXISTS (
+    SELECT 1 FROM approvals
+    WHERE state_dir = ? AND action = ? AND status = ? AND id <> ?
+  )`,
+		string(state.ApprovalStatusExecuting), formatTime(now), stateDir, id, string(state.ApprovalStatusApproved),
+		stateDir, string(state.ApprovalActionDeployProject), string(state.ApprovalStatusExecuting), id)
+	if err != nil {
+		return a, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return a, err
+	}
+	if n != 1 {
+		reloaded, _, loadErr := loadApprovalTx(ctx, tx, stateDir, id)
+		if loadErr == nil {
+			a = reloaded
+		}
+		if a.Status == state.ApprovalStatusApproved {
+			var executingID string
+			leaseErr := tx.QueryRowContext(ctx, `
+SELECT id FROM approvals
+WHERE state_dir = ? AND action = ? AND status = ? AND id <> ?
+LIMIT 1`, stateDir, string(state.ApprovalActionDeployProject), string(state.ApprovalStatusExecuting), id).Scan(&executingID)
+			if leaseErr == nil {
+				return a, ErrDeliveryInFlight
+			}
+			if !errors.Is(leaseErr, sql.ErrNoRows) {
+				return a, leaseErr
+			}
+		}
+		return a, state.ErrApprovalNotApproved
+	}
+
+	a.Status = state.ApprovalStatusExecuting
+	a.UpdatedAt = now
+	audit := state.ApprovalAudit{
+		At:              now,
+		Event:           state.ApprovalAuditExecuting,
+		Actor:           actor,
+		Reason:          reason,
+		PayloadHash:     a.PayloadHash,
+		TargetStateHash: a.TargetStateHash,
+	}
+	a.Audit = append(a.Audit, audit)
+	if a.Action == state.ApprovalActionDeployProject {
+		a = state.CanonicalDeliveryApprovalForWrite(a)
+		audit = a.Audit[len(a.Audit)-1]
+	}
+	if err := writeApprovalJSONTx(ctx, tx, b, a); err != nil {
+		return a, err
+	}
+	if err := insertAuditTx(ctx, tx, id, b, audit); err != nil {
+		return a, err
+	}
+	if err := tx.Commit(); err != nil {
+		return a, err
+	}
+	return a, nil
 }
 
 // FinishDelivery records the terminal result of a claimed delivery, moving it
@@ -574,11 +1099,21 @@ func (s *Store) FinishDelivery(ctx context.Context, stateDir, id string, success
 		event = state.ApprovalAuditExecutionFailed
 	}
 	mutate := func(a *state.Approval) {
-		if result != nil {
-			a.Delivery = result.Clone()
-		}
+		a.Delivery = state.MergeDeliveryResult(a.Delivery, result)
 	}
 	return s.markFrom(ctx, stateDir, id, state.ApprovalStatusExecuting, target, event, state.ErrApprovalNotExecuting, now, actor, summary, mutate)
+}
+
+// ReleaseDeliveryExecuting atomically returns an executing delivery to
+// approved only when the executor has not materialized a checkout or run any
+// side effect. It is the retry path for a transient post-claim freshness check;
+// interrupted/unknown executions must never call it and remain executing for
+// explicit reconciliation.
+func (s *Store) ReleaseDeliveryExecuting(ctx context.Context, stateDir, id string, now time.Time, actor string) (*state.Approval, error) {
+	return s.markFrom(ctx, stateDir, id,
+		state.ApprovalStatusExecuting, state.ApprovalStatusApproved,
+		state.ApprovalAuditExecutionReleased, state.ErrApprovalNotExecuting,
+		now, actor, "delivery claim released before side effect", nil)
 }
 
 // markFrom is the generalized single-source claim/transition: it atomically
@@ -588,6 +1123,11 @@ func (s *Store) FinishDelivery(ctx context.Context, stateDir, id string, success
 // `from`. It generalizes markTerminal (which is from=approved) so the delivery
 // executing claim/finish transitions reuse the same claim-once machinery.
 func (s *Store) markFrom(ctx context.Context, stateDir, id string, from, target state.ApprovalStatus, event string, notReady error, now time.Time, actor, reason string, mutate func(*state.Approval)) (*state.Approval, error) {
+	canonical, err := canonicalStateDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize approval state_dir: %w", err)
+	}
+	stateDir = canonical
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -638,7 +1178,11 @@ func (s *Store) markFrom(ctx context.Context, stateDir, id string, from, target 
 		TargetStateHash: a.TargetStateHash,
 	}
 	a.Audit = append(a.Audit, audit)
-	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
+	if a.Action == state.ApprovalActionDeployProject {
+		a = state.CanonicalDeliveryApprovalForWrite(a)
+		audit = a.Audit[len(a.Audit)-1]
+	}
+	if err := writeApprovalJSONTx(ctx, tx, b, a); err != nil {
 		return a, err
 	}
 	if err := insertAuditTx(ctx, tx, id, b, audit); err != nil {
@@ -662,6 +1206,11 @@ func (s *Store) markFrom(ctx context.Context, stateDir, id string, from, target 
 // duplicate audit entry. A missing row returns state.ErrApprovalNotFound for the
 // caller (approvalstore.ReconcileMoot) to tolerate.
 func (s *Store) MarkStale(ctx context.Context, stateDir, id string, now time.Time, reason string) (*state.Approval, error) {
+	canonical, err := canonicalStateDir(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("canonicalize approval state_dir: %w", err)
+	}
+	stateDir = canonical
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -694,15 +1243,26 @@ func (s *Store) MarkStale(ctx context.Context, stateDir, id string, now time.Tim
 // --- tx helpers -------------------------------------------------------------
 
 func putApprovalTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBinding) (bool, error) {
-	blob, err := json.Marshal(a)
+	persisted := a
+	if a.Action == state.ApprovalActionDeployProject {
+		persisted = state.CanonicalDeliveryApprovalForWrite(a)
+	}
+	blob, err := json.Marshal(persisted)
 	if err != nil {
 		return false, fmt.Errorf("marshal approval %s: %w", a.ID, err)
 	}
+	recordHash := ""
+	if persisted.Action == state.ApprovalActionDeployProject {
+		recordHash, err = computeDeliveryRecordHash(persisted, b)
+		if err != nil {
+			return false, err
+		}
+	}
 	res, err := tx.ExecContext(ctx, `
-INSERT OR IGNORE INTO approvals(id, decision_id, project, repo, state_dir, action, status, payload_hash, created_at, updated_at, approval_json)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.DecisionID, b.Project, b.Repo, b.StateDir, a.Action, string(a.Status), a.PayloadHash,
-		formatTime(normalize(a.CreatedAt)), formatTime(normalize(a.UpdatedAt)), string(blob))
+INSERT OR IGNORE INTO approvals(id, decision_id, project, repo, state_dir, action, status, payload_hash, record_hash, created_at, updated_at, approval_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		persisted.ID, persisted.DecisionID, b.Project, b.Repo, b.StateDir, persisted.Action, string(persisted.Status), persisted.PayloadHash, recordHash,
+		formatTime(normalize(persisted.CreatedAt)), formatTime(normalize(persisted.UpdatedAt)), string(blob))
 	if err != nil {
 		return false, err
 	}
@@ -713,14 +1273,25 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	return n == 1, nil
 }
 
-func writeApprovalJSONTx(ctx context.Context, tx *sql.Tx, stateDir string, a *state.Approval) error {
-	blob, err := json.Marshal(a)
+func writeApprovalJSONTx(ctx context.Context, tx *sql.Tx, b RowBinding, a *state.Approval) error {
+	persisted := a
+	if a.Action == state.ApprovalActionDeployProject {
+		persisted = state.CanonicalDeliveryApprovalForWrite(a)
+	}
+	blob, err := json.Marshal(persisted)
 	if err != nil {
 		return fmt.Errorf("marshal approval %s: %w", a.ID, err)
 	}
+	recordHash := ""
+	if persisted.Action == state.ApprovalActionDeployProject {
+		recordHash, err = computeDeliveryRecordHash(persisted, b)
+		if err != nil {
+			return err
+		}
+	}
 	_, err = tx.ExecContext(ctx,
-		`UPDATE approvals SET payload_hash = ?, approval_json = ? WHERE state_dir = ? AND id = ?`,
-		a.PayloadHash, string(blob), stateDir, a.ID)
+		`UPDATE approvals SET payload_hash = ?, record_hash = ?, approval_json = ? WHERE state_dir = ? AND id = ?`,
+		persisted.PayloadHash, recordHash, string(blob), b.StateDir, persisted.ID)
 	return err
 }
 
@@ -736,6 +1307,9 @@ func markStaleTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBindin
 	now = normalize(now)
 	a.Status = state.ApprovalStatusStale
 	a.UpdatedAt = now
+	if a.Action == state.ApprovalActionDeployProject && a.Delivery != nil && a.Delivery.StaleCause == "" {
+		a.Delivery.StaleCause = state.DeliveryStaleCauseOther
+	}
 	audit := state.ApprovalAudit{
 		At:              now,
 		Event:           state.ApprovalAuditStale,
@@ -744,12 +1318,16 @@ func markStaleTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBindin
 		TargetStateHash: a.TargetStateHash,
 	}
 	a.Audit = append(a.Audit, audit)
+	if a.Action == state.ApprovalActionDeployProject {
+		a = state.CanonicalDeliveryApprovalForWrite(a)
+		audit = a.Audit[len(a.Audit)-1]
+	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE approvals SET status = ?, updated_at = ? WHERE state_dir = ? AND id = ?`,
 		string(state.ApprovalStatusStale), formatTime(now), b.StateDir, a.ID); err != nil {
 		return err
 	}
-	if err := writeApprovalJSONTx(ctx, tx, b.StateDir, a); err != nil {
+	if err := writeApprovalJSONTx(ctx, tx, b, a); err != nil {
 		return err
 	}
 	return insertAuditTx(ctx, tx, a.ID, b, audit)
@@ -759,16 +1337,20 @@ func markStaleTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBindin
 // state_dir binding so audit rows written by a later transition carry the
 // same context that Put seeded.
 func loadApprovalTx(ctx context.Context, tx *sql.Tx, scopeDir, id string) (*state.Approval, RowBinding, error) {
-	var blob, project, repo, stateDir string
+	var blob, project, repo, stateDir, sqlPayloadHash, sqlRecordHash, sqlID, sqlAction, sqlStatus string
 	err := tx.QueryRowContext(ctx,
-		`SELECT approval_json, project, repo, state_dir FROM approvals WHERE state_dir = ? AND id = ?`, scopeDir, id).
-		Scan(&blob, &project, &repo, &stateDir)
+		`SELECT approval_json, project, repo, state_dir, payload_hash, record_hash, id, action, status FROM approvals WHERE state_dir = ? AND id = ?`, scopeDir, id).
+		Scan(&blob, &project, &repo, &stateDir, &sqlPayloadHash, &sqlRecordHash, &sqlID, &sqlAction, &sqlStatus)
 	if err != nil {
 		return nil, RowBinding{}, err
 	}
 	var a state.Approval
 	if err := json.Unmarshal([]byte(blob), &a); err != nil {
 		return nil, RowBinding{}, fmt.Errorf("unmarshal approval %s: %w", id, err)
+	}
+	if a.Action == state.ApprovalActionDeployProject || sqlAction == state.ApprovalActionDeployProject || sqlRecordHash != "" {
+		canonical, integrityErr := verifyDeliveryIntegrity(&a, sqlPayloadHash, sqlRecordHash, sqlID, sqlAction, sqlStatus, RowBinding{Project: project, Repo: repo, StateDir: stateDir})
+		return canonical, RowBinding{Project: project, Repo: repo, StateDir: stateDir}, integrityErr
 	}
 	return &a, RowBinding{Project: project, Repo: repo, StateDir: stateDir}, nil
 }
@@ -779,15 +1361,144 @@ type rowScanner interface {
 }
 
 func scanApproval(row rowScanner) (*state.Approval, error) {
-	var blob string
-	if err := row.Scan(&blob); err != nil {
+	var blob, sqlPayloadHash, sqlRecordHash, sqlID, project, repo, stateDir, sqlAction, sqlStatus string
+	if err := row.Scan(&blob, &sqlPayloadHash, &sqlRecordHash, &sqlID, &project, &repo, &stateDir, &sqlAction, &sqlStatus); err != nil {
 		return nil, err
 	}
 	var a state.Approval
 	if err := json.Unmarshal([]byte(blob), &a); err != nil {
 		return nil, fmt.Errorf("unmarshal approval: %w", err)
 	}
+	if a.Action == state.ApprovalActionDeployProject || sqlAction == state.ApprovalActionDeployProject || sqlRecordHash != "" {
+		return verifyDeliveryIntegrity(&a, sqlPayloadHash, sqlRecordHash, sqlID, sqlAction, sqlStatus, RowBinding{Project: project, Repo: repo, StateDir: stateDir})
+	}
 	return &a, nil
+}
+
+func verifyDeliveryIntegrity(raw *state.Approval, sqlPayloadHash, sqlRecordHash, sqlID, sqlAction, sqlStatus string, b RowBinding) (*state.Approval, error) {
+	canonical := state.CanonicalDeliveryApproval(raw)
+	if canonical == nil || raw.Action != state.ApprovalActionDeployProject || sqlAction != state.ApprovalActionDeployProject ||
+		canonical.Delivery == nil || strings.TrimSpace(raw.PayloadHash) == "" || strings.TrimSpace(sqlRecordHash) == "" ||
+		raw.PayloadHash != strings.TrimSpace(sqlPayloadHash) || canonical.ComputePayloadHash() != raw.PayloadHash ||
+		canonical.ID != sqlID || string(canonical.Status) != sqlStatus ||
+		!strings.EqualFold(strings.TrimSpace(canonical.Repo), strings.TrimSpace(b.Repo)) ||
+		!strings.EqualFold(strings.TrimSpace(canonical.Delivery.Repo), strings.TrimSpace(b.Repo)) ||
+		strings.TrimSpace(canonical.Project) != strings.TrimSpace(b.Project) ||
+		strings.TrimSpace(canonical.Delivery.Project) != strings.TrimSpace(b.Project) {
+		return canonical, ErrDeliveryIntegrity
+	}
+	recordHash, err := computeDeliveryRecordHash(canonical, b)
+	if err != nil || recordHash != strings.TrimSpace(sqlRecordHash) {
+		return canonical, ErrDeliveryIntegrity
+	}
+	return canonical, nil
+}
+
+// computeDeliveryRecordHash binds the complete strict delivery record — row
+// scope, status, immutable approval payload, structured result, and canonical
+// audit — independently from PayloadHash (which intentionally covers only the
+// immutable authorization). Every transition updates this digest in the same
+// SQLite transaction as status + approval_json.
+func computeDeliveryRecordHash(a *state.Approval, b RowBinding) (string, error) {
+	canonical := state.CanonicalDeliveryApproval(a)
+	if canonical == nil || canonical.Delivery == nil || canonical.Action != state.ApprovalActionDeployProject {
+		return "", fmt.Errorf("%w: delivery payload is required", ErrDeliveryIntegrity)
+	}
+	b.Project = strings.TrimSpace(b.Project)
+	b.Repo = strings.TrimSpace(b.Repo)
+	b.StateDir = filepath.Clean(strings.TrimSpace(b.StateDir))
+	if b.Project == "" || b.Repo == "" || b.StateDir == "" || b.StateDir == "." ||
+		strings.TrimSpace(canonical.Project) != b.Project ||
+		strings.TrimSpace(canonical.Delivery.Project) != b.Project ||
+		!strings.EqualFold(strings.TrimSpace(canonical.Repo), b.Repo) ||
+		!strings.EqualFold(strings.TrimSpace(canonical.Delivery.Repo), b.Repo) {
+		return "", fmt.Errorf("%w: delivery row binding mismatch", ErrDeliveryIntegrity)
+	}
+	if err := validateDeliveryTerminalResult(canonical); err != nil {
+		return "", err
+	}
+	record := struct {
+		Version  int             `json:"version"`
+		Binding  RowBinding      `json:"binding"`
+		Approval *state.Approval `json:"approval"`
+	}{Version: 1, Binding: b, Approval: canonical}
+	blob, err := json.Marshal(record)
+	if err != nil {
+		return "", fmt.Errorf("marshal delivery record %s: %w", canonical.ID, err)
+	}
+	sum := sha256.Sum256(blob)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func validateDeliveryTerminalResult(a *state.Approval) error {
+	if a == nil || a.Delivery == nil {
+		return fmt.Errorf("%w: delivery payload is required", ErrDeliveryIntegrity)
+	}
+	p := a.Delivery
+	successTimes := func() bool {
+		return !p.StartedAt.IsZero() && !p.FinishedAt.IsZero() && !p.FinishedAt.Before(p.StartedAt)
+	}
+	zero := func(code *int) bool { return code != nil && *code == 0 }
+	switch a.Status {
+	case state.ApprovalStatusExecuted:
+		if !successTimes() || !p.Verified || p.FailureStage != "" || p.TimedOut ||
+			strings.TrimSpace(p.ExecutedRevision) == "" ||
+			!strings.EqualFold(strings.TrimSpace(p.ExecutedRevision), strings.TrimSpace(p.MergedSHA)) ||
+			!zero(p.VerifyExitCode) {
+			return fmt.Errorf("%w: invalid verified delivery result", ErrDeliveryIntegrity)
+		}
+		switch p.CompletionSource {
+		case "":
+			if p.ReconcileOutcome != "" || !zero(p.DeployExitCode) {
+				return fmt.Errorf("%w: invalid executor delivery result", ErrDeliveryIntegrity)
+			}
+		case state.DeliveryCompletionSourceOperatorReconcile:
+			if p.ReconcileOutcome != state.DeliveryReconcileOutcomeVerified ||
+				(p.DeployExitCode != nil && *p.DeployExitCode != 0) ||
+				!hasOperatorReconcileAudit(a) {
+				return fmt.Errorf("%w: invalid verified reconciliation result", ErrDeliveryIntegrity)
+			}
+		default:
+			return fmt.Errorf("%w: unknown delivery completion source", ErrDeliveryIntegrity)
+		}
+	case state.ApprovalStatusExecutionFailed:
+		if p.Verified || p.FinishedAt.IsZero() {
+			return fmt.Errorf("%w: invalid failed delivery result", ErrDeliveryIntegrity)
+		}
+		switch p.CompletionSource {
+		case "":
+			if p.ReconcileOutcome != "" || p.FailureStage == "" {
+				return fmt.Errorf("%w: invalid executor failure result", ErrDeliveryIntegrity)
+			}
+		case state.DeliveryCompletionSourceOperatorReconcile:
+			if p.ReconcileOutcome != state.DeliveryReconcileOutcomeNotApplied &&
+				p.ReconcileOutcome != state.DeliveryReconcileOutcomeRemediatedFailed {
+				return fmt.Errorf("%w: invalid failed reconciliation result", ErrDeliveryIntegrity)
+			}
+			if !successTimes() || !hasOperatorReconcileAudit(a) {
+				return fmt.Errorf("%w: invalid failed reconciliation result", ErrDeliveryIntegrity)
+			}
+		default:
+			return fmt.Errorf("%w: unknown delivery completion source", ErrDeliveryIntegrity)
+		}
+	default:
+		if p.CompletionSource != "" || p.ReconcileOutcome != "" {
+			return fmt.Errorf("%w: reconciliation metadata on non-terminal delivery", ErrDeliveryIntegrity)
+		}
+	}
+	return nil
+}
+
+// hasOperatorReconcileAudit binds recovery-only result metadata to the sole
+// store transition that enforces the explicit operator assertions. Without
+// this link, a future/internal caller could pass CompletionSource through the
+// general FinishDelivery API and bypass RunnerGone/TargetSafe/config fences.
+func hasOperatorReconcileAudit(a *state.Approval) bool {
+	if a == nil || len(a.Audit) == 0 {
+		return false
+	}
+	last := a.Audit[len(a.Audit)-1]
+	return last.Event == state.ApprovalAuditDeliveryReconciled && last.Actor == DeliveryReconcileActor
 }
 
 func normalize(t time.Time) time.Time {

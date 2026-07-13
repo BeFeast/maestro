@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,36 @@ func TestDeliveryConfig_EffectiveTimeout(t *testing.T) {
 	}
 }
 
+func TestDeliveryConfig_ApprovalDigestBindsCheckoutAndSpec(t *testing.T) {
+	base := DeliveryConfig{
+		Mode: DeliveryModeApprovalRequired, Command: "./deploy.sh", VerifyCommand: "./verify.sh",
+		LocalPath: "/srv/app", Target: "production", Rollback: "restore previous release",
+		TargetLabel: "production kiosk", VerificationLabel: "service healthy", RollbackLabel: "previous release",
+	}
+	mutations := []DeliveryConfig{
+		func() DeliveryConfig { d := base; d.Command = "./deploy-v2.sh"; return d }(),
+		func() DeliveryConfig { d := base; d.VerifyCommand = "./verify-v2.sh"; return d }(),
+		func() DeliveryConfig { d := base; d.LocalPath = "/srv/other"; return d }(),
+		func() DeliveryConfig { d := base; d.TimeoutMinutes = 99; return d }(),
+		func() DeliveryConfig { d := base; d.ApprovalTimeoutMinutes = 30; return d }(),
+		func() DeliveryConfig { d := base; d.Target = "other"; return d }(),
+		func() DeliveryConfig { d := base; d.TargetLabel = "other target"; return d }(),
+		func() DeliveryConfig { d := base; d.VerificationLabel = "other check"; return d }(),
+		func() DeliveryConfig { d := base; d.RollbackLabel = "other rollback"; return d }(),
+	}
+	for i, changed := range mutations {
+		if changed.ApprovalDigest() == base.ApprovalDigest() {
+			t.Fatalf("mutation %d did not change approval digest", i)
+		}
+	}
+}
+
+func TestDeliveryConfig_DefaultApprovalTimeout(t *testing.T) {
+	if got := (DeliveryConfig{}).EffectiveApprovalTimeout(); got != 24*time.Hour {
+		t.Fatalf("default approval timeout = %v, want 24h", got)
+	}
+}
+
 // Legacy deploy_cmd raises a deprecation warning steering to approval_required.
 func TestDeliveryWarnings_LegacyDeployCmdDeprecated(t *testing.T) {
 	cfg := &Config{DeployCmd: "make deploy"}
@@ -122,8 +153,8 @@ func TestDeliveryWarnings_InvalidMode(t *testing.T) {
 	}
 }
 
-func TestDeliveryWarnings_ModeWithoutCommandInert(t *testing.T) {
-	cfg := &Config{Delivery: DeliveryConfig{Mode: DeliveryModeApprovalRequired}}
+func TestDeliveryWarnings_AutomaticModeWithoutCommandInert(t *testing.T) {
+	cfg := &Config{Delivery: DeliveryConfig{Mode: DeliveryModeAutomatic}}
 	if !hasWarning(cfg.Warnings(), "delivery.command is empty") {
 		t.Fatalf("Warnings() = %v, want an inert-delivery warning", cfg.Warnings())
 	}
@@ -139,6 +170,9 @@ delivery:
   timeout_minutes: 20
   target: "prod web"
   rollback: "helm rollback app"
+  target_label: "production web"
+  verification_label: "public health check"
+  rollback_label: "previous release"
   verify_command: "./verify.sh"
 `)
 	cfg, err := ParseStrict(data)
@@ -148,8 +182,116 @@ delivery:
 	d := cfg.EffectiveDelivery()
 	if d.Mode != DeliveryModeApprovalRequired || d.Command != "./deploy.sh" ||
 		d.TimeoutMinutes != 20 || d.Target != "prod web" || d.Rollback != "helm rollback app" ||
+		d.TargetLabel != "production web" || d.VerificationLabel != "public health check" || d.RollbackLabel != "previous release" ||
 		d.VerifyCommand != "./verify.sh" {
 		t.Fatalf("parsed delivery = %+v", d)
+	}
+}
+
+func TestParse_ApprovalRequiredNeedsVerifier(t *testing.T) {
+	_, err := ParseStrict([]byte(`
+repo: owner/app
+delivery:
+  mode: approval_required
+  command: "./deploy.sh"
+`))
+	if err == nil || !strings.Contains(err.Error(), "delivery.verify_command is required") {
+		t.Fatalf("ParseStrict err = %v, want required verifier", err)
+	}
+}
+
+func TestParse_ApprovalRequiredNeedsCompleteSafeContext(t *testing.T) {
+	base := `repo: owner/app
+delivery:
+  mode: approval_required
+  command: "./deploy.sh"
+  verify_command: "./verify.sh"
+  target_label: "production web"
+  verification_label: "public health check"
+  rollback_label: "previous release"
+`
+	cases := []struct {
+		name    string
+		oldLine string
+		newLine string
+		want    string
+	}{
+		{"command", "  command: \"./deploy.sh\"\n", "", "delivery.command is required"},
+		{"target label", "  target_label: \"production web\"\n", "", "delivery.target_label is required"},
+		{"verification label", "  verification_label: \"public health check\"\n", "", "delivery.verification_label is required"},
+		{"rollback label", "  rollback_label: \"previous release\"\n", "", "delivery.rollback_label is required"},
+		{"rollback none reason", `  rollback_label: "previous release"`, `  rollback_label: "none"`, `reason after "none:"`},
+		{"rollback empty none reason", `  rollback_label: "previous release"`, `  rollback_label: "none: "`, `reason after "none:"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseStrict([]byte(strings.Replace(base, tc.oldLine, tc.newLine, 1)))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ParseStrict err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	if _, err := ParseStrict([]byte(strings.Replace(base, `  rollback_label: "previous release"`, `  rollback_label: "none: immutable appliance image"`, 1))); err != nil {
+		t.Fatalf("explicit none reason rejected: %v", err)
+	}
+}
+
+func TestParse_ApprovalRequiredRejectsShellAndUnpinnedEntrypoints(t *testing.T) {
+	base := `repo: owner/app
+delivery:
+  mode: approval_required
+  command: %q
+  verify_command: %q
+  target_label: "production web"
+  verification_label: "public health check"
+  rollback_label: "previous release"
+`
+	invalid := []string{
+		"scripts/deploy.sh",
+		"/usr/local/bin/deploy",
+		"./.",
+		"./..",
+		"./scripts/../deploy.sh",
+		"./scripts/deploy.sh --prod",
+		"./scripts/deploy.sh;reboot",
+		"./scripts/deploy.sh\n./other.sh",
+		"./scripts/$DEPLOY",
+	}
+	for _, command := range invalid {
+		for _, field := range []string{"command", "verify_command"} {
+			t.Run(field+"_"+strings.ReplaceAll(command, "/", "_"), func(t *testing.T) {
+				deploy, verify := "./scripts/deploy.sh", "./scripts/verify-delivery.sh"
+				if field == "command" {
+					deploy = command
+				} else {
+					verify = command
+				}
+				_, err := ParseStrict([]byte(fmt.Sprintf(base, deploy, verify)))
+				if err == nil || !strings.Contains(err.Error(), "repo-relative executable path") {
+					t.Fatalf("ParseStrict(%s=%q) err = %v, want strict entrypoint error", field, command, err)
+				}
+			})
+		}
+	}
+}
+
+func TestParse_ApprovalRequiredValidatesSafeLabelsBeforePersistence(t *testing.T) {
+	base := `repo: owner/app
+delivery:
+  mode: approval_required
+  command: "./scripts/deploy.sh"
+  verify_command: "./scripts/verify.sh"
+  target_label: %q
+  verification_label: "healthy"
+  rollback_label: "previous release"
+`
+	for _, label := range []string{strings.Repeat("ч", 257), "line\nbreak", "prod\u202eevil", "prod\u200bhidden"} {
+		_, err := ParseStrict([]byte(fmt.Sprintf(base, label)))
+		if err == nil || (!strings.Contains(err.Error(), "at most 256") &&
+			!strings.Contains(err.Error(), "control characters") &&
+			!strings.Contains(err.Error(), "format characters")) {
+			t.Fatalf("label validation err = %v", err)
+		}
 	}
 }
 

@@ -21,8 +21,10 @@ package selfcheck
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -313,12 +315,14 @@ func checkState() Check {
 }
 
 // checkDelivery proves the #872 approval-gated delivery loop end to end against
-// a harmless fixture: a pending deploy_project approval runs ZERO commands, an
-// approve then runs a fixture command + verifier EXACTLY ONCE behind the durable
-// approved→executing claim, and a second run is a no-op (exactly-once). It
-// touches no live service or device — the command/verifier are recorded, not
-// real deploys, and the revision check is a fixture — so it is safe to run in
-// the deploy gate. A throwaway temp SQLite DB is used and removed.
+// a harmless real fixture: a pending deploy_project approval runs ZERO
+// commands; after approval the executor fetches a commit from a local bare
+// origin, creates a clean detached temporary worktree at the exact approved
+// SHA, runs a marker command + verifier, cleans the worktree, and records the
+// terminal result. It then reopens SQLite and proves the command cannot replay.
+// The authoritative fixture checkout is deliberately left on another revision
+// with an untracked file and must remain byte-for-byte unchanged. No live repo,
+// service, device, or network endpoint is touched.
 func checkDelivery() Check {
 	dir, err := os.MkdirTemp("", "maestro-selfcheck-delivery-")
 	if err != nil {
@@ -326,27 +330,74 @@ func checkDelivery() Check {
 	}
 	defer os.RemoveAll(dir)
 
-	store, err := approvalstore.Open(filepath.Join(dir, "maestro.db"))
+	origin := filepath.Join(dir, "origin.git")
+	source := filepath.Join(dir, "source")
+	marker := filepath.Join(dir, "delivery-runs")
+	if err := initDeliveryFixture(dir, origin, source, marker); err != nil {
+		return fail(CheckDelivery, "initialize git fixture: "+err.Error())
+	}
+	baseline, err := selfcheckGit(source, "rev-parse", "HEAD~1")
+	if err != nil {
+		return fail(CheckDelivery, "read baseline revision: "+err.Error())
+	}
+	approved, err := selfcheckGit(source, "rev-parse", "HEAD")
+	if err != nil {
+		return fail(CheckDelivery, "read approved revision: "+err.Error())
+	}
+	if _, err := selfcheckGit(source, "push", "-u", "origin", "main"); err != nil {
+		return fail(CheckDelivery, "publish fixture revision: "+err.Error())
+	}
+	if _, err := selfcheckGit(source, "checkout", "--detach", baseline); err != nil {
+		return fail(CheckDelivery, "set authoritative fixture to baseline: "+err.Error())
+	}
+	if err := os.WriteFile(filepath.Join(source, "operator-local.txt"), []byte("must survive unchanged\n"), 0o644); err != nil {
+		return fail(CheckDelivery, "create authoritative-checkout sentinel")
+	}
+	beforeHead, err := selfcheckGit(source, "rev-parse", "HEAD")
+	if err != nil {
+		return fail(CheckDelivery, "read authoritative HEAD: "+err.Error())
+	}
+	beforeStatus, err := selfcheckGit(source, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return fail(CheckDelivery, "read authoritative status: "+err.Error())
+	}
+
+	delivery := config.DeliveryConfig{
+		Mode:          config.DeliveryModeApprovalRequired,
+		LocalPath:     source,
+		Command:       "./deploy.sh",
+		VerifyCommand: "./verify.sh",
+	}
+	dbPath := filepath.Join(dir, "maestro.db")
+	store, err := approvalstore.Open(dbPath)
 	if err != nil {
 		return fail(CheckDelivery, "open approvals store: "+err.Error())
 	}
-	defer store.Close()
+	defer func() {
+		if store != nil {
+			_ = store.Close()
+		}
+	}()
 
 	ctx := context.Background()
 	const (
 		stateDir = "selfcheck-delivery"
 		repo     = "maestro-selfcheck/fixture"
 		id       = "approval-deploy-selfcheck"
-		sha      = "0000000000000000000000000000000000000000"
 	)
 	rb := approvalstore.RowBinding{Project: repo, Repo: repo, StateDir: stateDir}
 
 	// Seed a PENDING delivery and assert it is NOT claimable — approval-required
 	// runs zero delivery before approval.
 	pending := &state.Approval{
-		ID: id, CreatedAt: time.Time{}, Action: state.ApprovalActionDeployProject,
+		ID: id, CreatedAt: fixedNow, UpdatedAt: fixedNow, Action: state.ApprovalActionDeployProject,
 		Status: state.ApprovalStatusPending, Repo: repo, Project: repo,
-		Delivery: &state.DeliveryPayload{Project: repo, Repo: repo, MergedSHA: sha, LocalPath: dir, Target: "selfcheck-fixture"},
+		Delivery: &state.DeliveryPayload{
+			Project: repo, Repo: repo, MergedSHA: approved,
+			ConfigDigest: delivery.ApprovalDigest(),
+			MergedAt:     fixedNow,
+			ExpiresAt:    fixedNow.Add(time.Hour),
+		},
 	}
 	pending.PayloadHash = pending.ComputePayloadHash()
 	if _, err := store.Put(ctx, pending, rb); err != nil {
@@ -356,23 +407,19 @@ func checkDelivery() Check {
 		return fail(CheckDelivery, fmt.Sprintf("pending delivery was claimable (err=%v) — approval gate leaks", err))
 	}
 
-	// Approve it (claim-once), then run the delivery executor twice.
+	// Approve it (claim-once), then run the real delivery executor.
 	if _, err := store.Approve(ctx, stateDir, id, fixedNow, "selfcheck", "approve"); err != nil {
 		return fail(CheckDelivery, "approve: "+err.Error())
 	}
-	var runs int
 	ex := &approver.DeliveryExecutor{
-		Store:    store,
-		StateDir: stateDir,
-		Repo:     repo,
-		Delivery: config.DeliveryConfig{Command: "true", VerifyCommand: "true"},
-		Runner: approver.CommandRunnerFunc(func(context.Context, string, string) (string, error) {
-			runs++
-			return "selfcheck-fixture-ok", nil
-		}),
-		Revision: approver.RevisionCheckerFunc(func(string) (string, error) { return sha, nil }),
-		Actor:    "selfcheck",
-		Now:      func() time.Time { return fixedNow },
+		Store:     store,
+		StateDir:  stateDir,
+		Repo:      repo,
+		Delivery:  delivery,
+		Checkout:  approver.NewLocalFixtureCheckoutPreparer(repo, origin),
+		Actor:     "selfcheck",
+		Freshness: approver.DeliveryFreshnessFunc(func(context.Context, *state.DeliveryPayload) error { return nil }),
+		Now:       func() time.Time { return fixedNow },
 	}
 	first := ex.Deliver(ctx, id)
 	if first.Status != state.ApprovalStatusExecuted {
@@ -381,15 +428,110 @@ func checkDelivery() Check {
 	if first.Approval == nil || first.Approval.Delivery == nil || !first.Approval.Delivery.Verified {
 		return fail(CheckDelivery, "delivery ran but was not verified")
 	}
-	// Exactly-once: the second run must not re-execute the command.
+	if first.Approval.Delivery.ExecutedRevision != approved {
+		return fail(CheckDelivery, "delivery executed a revision other than the approved SHA")
+	}
+	afterHead, err := selfcheckGit(source, "rev-parse", "HEAD")
+	if err != nil || afterHead != beforeHead {
+		return fail(CheckDelivery, "delivery changed the authoritative checkout HEAD")
+	}
+	afterStatus, err := selfcheckGit(source, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil || afterStatus != beforeStatus {
+		return fail(CheckDelivery, "delivery changed the authoritative checkout files")
+	}
+	worktrees, err := selfcheckGit(source, "worktree", "list", "--porcelain")
+	if err != nil || strings.Count(worktrees, "worktree ") != 1 {
+		return fail(CheckDelivery, "temporary delivery worktree was not cleaned up")
+	}
+	markerBefore, err := os.ReadFile(marker)
+	if err != nil || strings.TrimSpace(string(markerBefore)) != approved {
+		return fail(CheckDelivery, "delivery marker does not prove one execution at the approved SHA")
+	}
+
+	// Reopen the durable store before the retry: this proves the no-replay
+	// fence survives a daemon/CLI process boundary, not just one Go object.
+	if err := store.Close(); err != nil {
+		return fail(CheckDelivery, "close approvals store before replay check: "+err.Error())
+	}
+	store = nil
+	reopened, err := approvalstore.Open(dbPath)
+	if err != nil {
+		return fail(CheckDelivery, "reopen approvals store: "+err.Error())
+	}
+	store = reopened
+	ex.Store = reopened
 	second := ex.Deliver(ctx, id)
 	if !second.Skipped {
 		return fail(CheckDelivery, fmt.Sprintf("second delivery re-ran (status=%q) — not exactly-once", second.Status))
 	}
-	if runs != 2 { // one deploy + one verifier, once total
-		return fail(CheckDelivery, fmt.Sprintf("fixture command ran %d times, want 2 (deploy+verify, once)", runs))
+	markerAfter, err := os.ReadFile(marker)
+	if err != nil || string(markerAfter) != string(markerBefore) {
+		return fail(CheckDelivery, "delivery replayed after reopening SQLite")
 	}
-	return pass(CheckDelivery, "pending→approve→exactly-once→verified against fixture command")
+	return pass(CheckDelivery, "pending→approve→exact detached SHA→verified→SQLite reopen no-replay")
+}
+
+func initDeliveryFixture(root, origin, source, marker string) error {
+	if _, err := selfcheckGit(root, "init", "--bare", origin); err != nil {
+		return err
+	}
+	if _, err := selfcheckGit(root, "init", "--initial-branch=main", source); err != nil {
+		return err
+	}
+	for _, setting := range [][2]string{{"user.name", "Maestro Selfcheck"}, {"user.email", "maestro-selfcheck@example.invalid"}} {
+		if _, err := selfcheckGit(source, "config", setting[0], setting[1]); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "artifact.txt"), []byte("baseline\n"), 0o644); err != nil {
+		return errors.New("write baseline fixture file failed")
+	}
+	if _, err := selfcheckGit(source, "add", "artifact.txt"); err != nil {
+		return err
+	}
+	if _, err := selfcheckGit(source, "commit", "-m", "baseline"); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(source, "artifact.txt"), []byte("approved\n"), 0o644); err != nil {
+		return errors.New("write approved fixture file failed")
+	}
+	deployScript := "#!/bin/sh\nset -eu\ntest \"$(cat artifact.txt)\" = approved\ntest -z \"$(git symbolic-ref -q HEAD || true)\"\ngit rev-parse HEAD >> " + shellQuote(marker) + "\n"
+	verifyScript := "#!/bin/sh\nset -eu\ntest \"$(cat " + shellQuote(marker) + ")\" = \"$(git rev-parse HEAD)\"\n"
+	if err := os.WriteFile(filepath.Join(source, "deploy.sh"), []byte(deployScript), 0o700); err != nil {
+		return errors.New("write delivery fixture entrypoint failed")
+	}
+	if err := os.WriteFile(filepath.Join(source, "verify.sh"), []byte(verifyScript), 0o700); err != nil {
+		return errors.New("write delivery fixture verifier failed")
+	}
+	if _, err := selfcheckGit(source, "add", "artifact.txt", "deploy.sh", "verify.sh"); err != nil {
+		return err
+	}
+	if _, err := selfcheckGit(source, "commit", "-m", "approved delivery"); err != nil {
+		return err
+	}
+	if _, err := selfcheckGit(source, "remote", "add", "origin", origin); err != nil {
+		return err
+	}
+	return nil
+}
+
+func selfcheckGit(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	// Fixed commit timestamps keep object IDs reproducible while the report
+	// itself remains free of fixture paths and hashes.
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_DATE=2026-07-12T00:00:00Z",
+		"GIT_COMMITTER_DATE=2026-07-12T00:00:00Z",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s failed: %w", args[0], err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 // fixedNow is a deterministic clock for the delivery canary so the gate stays

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/approvalstore"
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mission"
@@ -63,6 +64,7 @@ type Orchestrator struct {
 	amendHeadFn           func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 	hasMergedPRForIssueFn func(issueNumber int) (bool, error)
+	mergedPRForIssueFn    func(issueNumber int) (int, error)
 	isPRMergedFn          func(prNumber int) (bool, error)
 	mergedPRForBranchFn   func(branch string) (int, error)
 
@@ -143,6 +145,7 @@ type Orchestrator struct {
 	ghCollectPRReviewFeedbackFn  func(prNumber int) (string, error)
 	ghCloseIssueFn               func(number int, comment string) error
 	ghPRHeadSHAFn                func(prNumber int) (string, error)
+	ghPRMergeInfoFn              func(prNumber int) (github.PRMergeInfo, error)
 	ghCommentPRFn                func(prNumber int, body string) error
 	ghPRChangedFilesFn           func(prNumber int) ([]string, error)
 	ghPRVisualEvidenceAttachedFn func(prNumber int) (bool, error)
@@ -150,6 +153,7 @@ type Orchestrator struct {
 	workerStopFn                 func(cfg *config.Config, slotName string, sess *state.Session) error
 	selfDeployStartFn            func(prNumber int) error
 	mainHeadSHAFn                func() (string, error)
+	deliveryRevisionContainsFn   func(ancestor, descendant string) (bool, error)
 	rebaseWorktreeFn             func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error
 	outcomeCheckFn               func(context.Context, outcome.Brief) outcome.HealthCheckResult
 	syncProjectFn                func(issueNumber int, status github.ProjectStatus) bool
@@ -406,6 +410,16 @@ func (o *Orchestrator) hasMergedPRForIssue(issueNumber int) (bool, error) {
 	return o.gh.HasMergedPRForIssue(issueNumber)
 }
 
+func (o *Orchestrator) mergedPRForIssue(issueNumber int) (int, error) {
+	if o.mergedPRForIssueFn != nil {
+		return o.mergedPRForIssueFn(issueNumber)
+	}
+	if o.gh == nil {
+		return 0, fmt.Errorf("no github client configured for merged-pr number check")
+	}
+	return o.gh.MergedPRNumberForIssue(issueNumber)
+}
+
 func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
 	if o.isPRMergedFn != nil {
 		return o.isPRMergedFn(prNumber)
@@ -459,6 +473,19 @@ func (o *Orchestrator) mainHeadSHA() (string, error) {
 		return "", fmt.Errorf("no github client configured for main head sha")
 	}
 	return o.gh.BranchHeadSHA("main")
+}
+
+// prMergeCommitSHA returns the exact immutable commit GitHub records for this
+// merged PR. It must not be inferred from main, which may already contain a
+// version bump or another concurrent merge.
+func (o *Orchestrator) prMergeInfo(prNumber int) (github.PRMergeInfo, error) {
+	if o.ghPRMergeInfoFn != nil {
+		return o.ghPRMergeInfoFn(prNumber)
+	}
+	if o.gh == nil {
+		return github.PRMergeInfo{}, fmt.Errorf("no github client configured for PR merge info")
+	}
+	return o.gh.PRMergeInfo(prNumber)
 }
 
 func (o *Orchestrator) prCIStatus(prNumber int) (string, error) {
@@ -1941,7 +1968,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		// for — the PR may have merged or the issue closed while the backoff
 		// ran. Re-check GitHub before consuming a slot; a stale session
 		// settles instead of respawning a zombie worker.
-		if o.retireStaleRetry(slotName, sess) {
+		if o.retireStaleRetry(s, slotName, sess) {
 			continue
 		}
 
@@ -2100,7 +2127,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 // done (issue closed) instead of respawning. Best-effort: a GitHub read
 // error fails open — the retry proceeds — so a transient API hiccup cannot
 // strand a legitimate retry.
-func (o *Orchestrator) retireStaleRetry(slotName string, sess *state.Session) bool {
+func (o *Orchestrator) retireStaleRetry(s *state.State, slotName string, sess *state.Session) bool {
 	for _, prNumber := range []int{sess.PRNumber, sess.LastClosedPRNumber} {
 		if prNumber <= 0 {
 			continue
@@ -2129,6 +2156,10 @@ func (o *Orchestrator) retireStaleRetry(slotName string, sess *state.Session) bo
 	}
 	if !closed {
 		return false
+	}
+	if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d closed during retry backoff", sess.IssueNumber)) {
+		log.Printf("[orch] worker %s retry invalidated: issue #%d is closed, but a merge delivery/outcome gate is still pending", slotName, sess.IssueNumber)
+		return true
 	}
 	log.Printf("[orch] worker %s retry invalidated: issue #%d is closed — marking done instead of respawning", slotName, sess.IssueNumber)
 	sess.NextRetryAt = nil
@@ -2621,12 +2652,16 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		o.cfg.AutoRetryRebaseConflicts = newCfg.AutoRetryRebaseConflicts
 	}
 	if newCfg.DeployCmd != old.DeployCmd {
-		changed = append(changed, fmt.Sprintf("deploy_cmd: %q→%q", old.DeployCmd, newCfg.DeployCmd))
+		changed = append(changed, "deploy_cmd changed")
 		o.cfg.DeployCmd = newCfg.DeployCmd
 	}
 	if newCfg.DeployTimeoutMinutes != old.DeployTimeoutMinutes {
 		changed = append(changed, fmt.Sprintf("deploy_timeout_minutes: %d→%d", old.DeployTimeoutMinutes, newCfg.DeployTimeoutMinutes))
 		o.cfg.DeployTimeoutMinutes = newCfg.DeployTimeoutMinutes
+	}
+	if !reflect.DeepEqual(newCfg.Delivery, old.Delivery) {
+		changed = append(changed, "delivery")
+		o.cfg.Delivery = newCfg.Delivery
 	}
 	if newCfg.AutoRebase != old.AutoRebase {
 		changed = append(changed, fmt.Sprintf("auto_rebase: %v→%v", old.AutoRebase, newCfg.AutoRebase))
@@ -2818,7 +2853,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			continue
 		}
 		if prErr == nil {
-			if o.reconcilePushedBranch(slotName, sess, strings.Join(reasons, ", ")) {
+			if o.reconcilePushedBranch(s, slotName, sess, strings.Join(reasons, ", ")) {
 				reconciled = true
 				continue
 			}
@@ -3025,7 +3060,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 // dead-marking fall-through in charge. GitHub read errors on the staleness
 // checks fail open — the auto-create rescue proceeds — so a transient API
 // hiccup cannot disable the rescue path.
-func (o *Orchestrator) reconcilePushedBranch(slotName string, sess *state.Session, reasons string) bool {
+func (o *Orchestrator) reconcilePushedBranch(s *state.State, slotName string, sess *state.Session, reasons string) bool {
 	branch := strings.TrimSpace(sess.Branch)
 	if branch == "" {
 		return false
@@ -3061,6 +3096,10 @@ func (o *Orchestrator) reconcilePushedBranch(slotName string, sess *state.Sessio
 	if closed, closedErr := o.isIssueClosed(sess.IssueNumber); closedErr != nil {
 		log.Printf("[orch] reconcile: could not check issue #%d state for %s: %v — proceeding with auto-create", sess.IssueNumber, slotName, closedErr)
 	} else if closed {
+		if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d closed after worker exit", sess.IssueNumber)) {
+			log.Printf("[orch] reconcile: %s held out of done because a merge delivery/outcome gate is pending", slotName)
+			return true
+		}
 		o.updateTokensUsedFromWorkerLog(slotName, sess)
 		sess.PID = 0
 		sess.TmuxSession = ""
@@ -4045,7 +4084,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					// already closes it and auto-close is allowed) or label it
 					// blocked so the supervisor's dynamic-wave drops it and picks
 					// the next eligible candidate.
-					o.reconcileNoPRRetryExhausted(slotName, sess)
+					o.reconcileNoPRRetryExhausted(s, slotName, sess)
 					continue
 				}
 				// #818: retry_exhausted session records a PR, but no open PR
@@ -4053,12 +4092,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				// without merge (→ label blocked so the queue advances).
 				// Previously this logged "waiting for reconciliation" forever,
 				// holding the issue slot and stalling the dynamic-wave queue.
-				o.reconcileClosedPRRetryExhausted(slotName, sess)
+				o.reconcileClosedPRRetryExhausted(s, slotName, sess)
 				continue
 			}
 			log.Printf("[orch] no open PR found for branch %s (slot %s) — assuming merged/closed", sess.Branch, slotName)
 			if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("PR for branch %s is no longer open", sess.Branch)) {
-				if sess.PRNumber > 0 {
+				if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					o.markCodeLanded(sess, sess.PRNumber)
 				}
 				continue
@@ -4418,7 +4457,7 @@ const closedPRCloseRetryStatus = "closed_pr_close_retry"
 // when a merged PR already closes it (and close_issue is a configured safe
 // action), otherwise it adds the configured blocked label so the supervisor
 // drops the issue from the wave and selects the next eligible candidate.
-func (o *Orchestrator) reconcileNoPRRetryExhausted(slotName string, sess *state.Session) {
+func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName string, sess *state.Session) {
 	if sess == nil || sess.IssueNumber <= 0 {
 		return
 	}
@@ -4437,6 +4476,21 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(slotName string, sess *state.
 	}
 
 	if merged {
+		// A closing-keyword PR is a real landed generation. In
+		// approval_required mode it must enter the standing delivery gate before
+		// this retry-reconciliation path may close the issue or report Done.
+		if o.approvalRequiredDeliveryEnabled() {
+			prNumber, prErr := o.mergedPRForIssue(sess.IssueNumber)
+			if prErr != nil || prNumber <= 0 {
+				log.Printf("[orch] no-PR retry_exhausted: merged work for issue #%d could not be pinned to a PR for delivery: %v — holding", sess.IssueNumber, prErr)
+				return
+			}
+			o.markCodeLanded(sess, prNumber)
+			if !o.reconcileCodeLandedDelivery(s, sess) {
+				log.Printf("[orch] no-PR retry_exhausted: issue #%d is held in code_landed for delivery approval", sess.IssueNumber)
+			}
+			return
+		}
 		// The work was already landed by another PR (closing-keyword link).
 		// Auto-close when the operator has granted close_issue as a safe
 		// action without an approval gate; otherwise surface it as a
@@ -4515,7 +4569,7 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(slotName string, sess *state.
 //     so the reconcile does not re-strand it. No blocked label is applied:
 //     only the supervisor removes that label, so labelling blocked would
 //     re-create the exact supervisor-dependence #818 removes.
-func (o *Orchestrator) reconcileClosedPRRetryExhausted(slotName string, sess *state.Session) {
+func (o *Orchestrator) reconcileClosedPRRetryExhausted(s *state.State, slotName string, sess *state.Session) {
 	if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 {
 		return
 	}
@@ -4532,6 +4586,17 @@ func (o *Orchestrator) reconcileClosedPRRetryExhausted(slotName string, sess *st
 	now := time.Now().UTC()
 
 	if merged {
+		// This path knows the PR was merged, so approval-gated projects must not
+		// jump straight from retry_exhausted to Done. Move into the same standing
+		// code_landed gate used by the normal merge path and mint/persist the
+		// exact-SHA approval immediately.
+		if o.approvalRequiredDeliveryEnabled() {
+			o.markCodeLanded(sess, sess.PRNumber)
+			if !o.reconcileCodeLandedDelivery(s, sess) {
+				log.Printf("[orch] closed-PR retry_exhausted: issue #%d PR #%d is held in code_landed for delivery approval", sess.IssueNumber, sess.PRNumber)
+			}
+			return
+		}
 		if o.supervisorActionAllowed(config.SupervisorActionCloseIssue) && !o.supervisorActionRequiresApproval(config.SupervisorActionCloseIssue) {
 			// Post the close comment only on the first attempt; a retry after a
 			// transient close failure passes an empty comment so it does not
@@ -5074,26 +5139,42 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 		return
 	}
 
+	// Delivery is a standing gate, not an edge-triggered post-merge callback.
+	// This recovers a crash immediately after GitHub merged, covers UI/manual
+	// merges, imports the authoritative SQLite result, and prevents code_landed
+	// from closing while the matching delivery is pending or unverified.
+	ready := make([]*state.Session, 0, len(codeLanded))
+	for _, sess := range codeLanded {
+		if !o.codeLandedPRMerged(sess) {
+			continue
+		}
+		if !o.reconcileCodeLandedDelivery(s, sess) {
+			o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
+			continue
+		}
+		ready = append(ready, sess)
+	}
+	if len(ready) == 0 {
+		return
+	}
+
 	if o.cfg.Outcome.PassRequiredForDoneEnabled() {
 		if !o.cfg.Outcome.HasHealthSignal() {
-			log.Printf("[orch] %d code_landed session(s) need outcome verification, but no health signal is configured", len(codeLanded))
+			log.Printf("[orch] %d code_landed session(s) need outcome verification, but no health signal is configured", len(ready))
 			return
 		}
 		result := o.checkOutcome(context.Background())
 		s.OutcomeHealth = &result
 		if result.State != outcome.HealthHealthy {
 			log.Printf("[orch] code_landed reconcile held: outcome verifier is %s: %s", result.State, result.Summary)
-			for _, sess := range codeLanded {
+			for _, sess := range ready {
 				o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
 			}
 			return
 		}
 	}
 
-	for _, sess := range codeLanded {
-		if !o.codeLandedPRMerged(sess) {
-			continue
-		}
+	for _, sess := range ready {
 		log.Printf("[orch] code_landed session for issue #%d passed outcome reconciliation; marking done", sess.IssueNumber)
 		if o.markDoneAfterOutcomePass(sess, sess.PRNumber) {
 			now := time.Now().UTC()
@@ -5105,6 +5186,102 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 				fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", sess.IssueNumber))
 		}
 	}
+}
+
+// reconcileCodeLandedDelivery returns true only when no approval-gated
+// delivery is configured or the approval for this exact PR merge SHA is
+// durably executed and verified. Every other status intentionally holds the
+// session in code_landed for operator action/reconciliation.
+func (o *Orchestrator) reconcileCodeLandedDelivery(s *state.State, sess *state.Session) bool {
+	eff := o.cfg.EffectiveDelivery()
+	if eff.Mode != config.DeliveryModeApprovalRequired || strings.TrimSpace(eff.Command) == "" {
+		return true
+	}
+	if sess == nil || sess.PRNumber <= 0 {
+		log.Printf("[orch] delivery reconcile held: code_landed session has no PR number to pin")
+		return false
+	}
+	approval, err := o.enqueueDeliveryApproval(s, sess, github.PR{Number: sess.PRNumber}, eff)
+	if err != nil || approval == nil {
+		log.Printf("[orch] delivery reconcile held for PR #%d: %v", sess.PRNumber, err)
+		return false
+	}
+	completed := approval
+	if approval.Status != state.ApprovalStatusExecuted || approval.Delivery == nil || !approval.Delivery.Verified {
+		completed = o.verifiedDeliveryCovering(s, approval.Delivery)
+	}
+	if completed == nil || completed.Delivery == nil {
+		log.Printf("[orch] delivery reconcile held for PR #%d: approval %s is %s (verified=%v)",
+			sess.PRNumber, approval.ID, approval.Status, approval.Delivery != nil && approval.Delivery.Verified)
+		return false
+	}
+	if sess.DeploymentFinishedAt == nil {
+		finished := completed.Delivery.FinishedAt
+		if finished.IsZero() {
+			finished = time.Now().UTC()
+		}
+		finished = finished.UTC()
+		sess.DeploymentFinishedAt = &finished
+		if strings.TrimSpace(o.cfg.StateDir) != "" {
+			if err := state.Save(o.cfg.StateDir, s); err != nil {
+				log.Printf("[orch] delivery result matched but deployment timestamp save failed for PR #%d: %v", sess.PRNumber, err)
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// verifiedDeliveryCovering allows a newer verified main revision to satisfy an
+// older code_landed session whose own delivery approval was superseded. It is
+// fail-closed on ancestry: merge timestamps alone do not prove the newer
+// commit contains the older one.
+func (o *Orchestrator) verifiedDeliveryCovering(s *state.State, required *state.DeliveryPayload) *state.Approval {
+	if s == nil || required == nil || strings.TrimSpace(required.MergedSHA) == "" {
+		return nil
+	}
+	var best *state.Approval
+	for i := range s.Approvals {
+		candidate := &s.Approvals[i]
+		if candidate.Action != state.ApprovalActionDeployProject || candidate.Status != state.ApprovalStatusExecuted ||
+			candidate.Delivery == nil || !candidate.Delivery.Verified {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(candidate.Delivery.Repo), strings.TrimSpace(required.Repo)) ||
+			strings.TrimSpace(candidate.Delivery.Project) != strings.TrimSpace(required.Project) ||
+			strings.TrimSpace(candidate.Delivery.ConfigDigest) != strings.TrimSpace(required.ConfigDigest) {
+			continue
+		}
+		contains, err := o.deliveryRevisionContains(required.MergedSHA, candidate.Delivery.MergedSHA)
+		if err != nil || !contains {
+			continue
+		}
+		if best == nil || state.CompareDeliveryGeneration(best.Delivery, best.CreatedAt, candidate.Delivery, candidate.CreatedAt) < 0 {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func (o *Orchestrator) deliveryRevisionContains(ancestor, descendant string) (bool, error) {
+	if o.deliveryRevisionContainsFn != nil {
+		return o.deliveryRevisionContainsFn(ancestor, descendant)
+	}
+	ancestor = strings.TrimSpace(ancestor)
+	descendant = strings.TrimSpace(descendant)
+	if ancestor == descendant && ancestor != "" {
+		return true, nil
+	}
+	if len(ancestor) != 40 || len(descendant) != 40 {
+		return false, errors.New("delivery ancestry requires full 40-character commit SHAs")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	contains, err := approver.RevisionContains(ctx, o.cfg.Repo, o.cfg.LocalPath, ancestor, descendant)
+	if err != nil {
+		return false, fmt.Errorf("check delivery revision ancestry in isolated canonical repository: %w", err)
+	}
+	return contains, nil
 }
 
 func (o *Orchestrator) codeLandedPRMerged(sess *state.Session) bool {
@@ -5182,7 +5359,86 @@ func (o *Orchestrator) supervisorActionRequiresApproval(action string) bool {
 	return false
 }
 
+func (o *Orchestrator) approvalRequiredDeliveryEnabled() bool {
+	if o == nil || o.cfg == nil {
+		return false
+	}
+	eff := o.cfg.EffectiveDelivery()
+	return eff.Mode == config.DeliveryModeApprovalRequired && strings.TrimSpace(eff.Command) != ""
+}
+
+// mergedPRForDoneLikeSession resolves the concrete merged PR, if any, behind a
+// session that reached a Done-like path without passing through the normal
+// merge callback. It checks every durable identity the session may retain.
+// Read errors fail closed: an external/UI merge must never be mistaken for an
+// unmerged close merely because GitHub was temporarily unavailable.
+func (o *Orchestrator) mergedPRForDoneLikeSession(sess *state.Session) (int, error) {
+	if sess == nil {
+		return 0, nil
+	}
+	if sess.PRNumber > 0 {
+		merged, err := o.isPRMerged(sess.PRNumber)
+		if err != nil {
+			return 0, fmt.Errorf("check recorded PR #%d: %w", sess.PRNumber, err)
+		}
+		if merged {
+			return sess.PRNumber, nil
+		}
+	}
+	if branch := strings.TrimSpace(sess.Branch); branch != "" {
+		prNumber, err := o.mergedPRForBranch(branch)
+		if err != nil {
+			return 0, fmt.Errorf("check merged PR for branch %q: %w", branch, err)
+		}
+		if prNumber > 0 {
+			return prNumber, nil
+		}
+	}
+	if sess.IssueNumber > 0 {
+		prNumber, err := o.mergedPRForIssue(sess.IssueNumber)
+		if err != nil {
+			return 0, fmt.Errorf("check merged PR for issue #%d: %w", sess.IssueNumber, err)
+		}
+		if prNumber > 0 {
+			return prNumber, nil
+		}
+	}
+	return 0, nil
+}
+
+// canMarkDoneForDelivery is the central backstop for Done-like transitions
+// that did not originate in mergeReadyPR. If a merge is discoverable, the
+// session first enters code_landed and the exact-SHA approval is persisted;
+// only an executed+verified matching delivery may pass this gate.
+func (o *Orchestrator) canMarkDoneForDelivery(s *state.State, sess *state.Session, trigger string) bool {
+	if !o.approvalRequiredDeliveryEnabled() || sess == nil {
+		return true
+	}
+	prNumber, err := o.mergedPRForDoneLikeSession(sess)
+	if err != nil {
+		log.Printf("[orch] %s, but required delivery merge identity could not be verified: %v — holding out of done", trigger, err)
+		o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
+		return false
+	}
+	if prNumber <= 0 {
+		// A closed/cancelled issue with no merged PR has no product revision to
+		// deliver, so existing non-merge completion behavior remains valid.
+		return true
+	}
+	if sess.Status != state.StatusCodeLanded || sess.PRNumber != prNumber {
+		o.markCodeLanded(sess, prNumber)
+	}
+	if !o.reconcileCodeLandedDelivery(s, sess) {
+		log.Printf("[orch] %s, but merged PR #%d still requires an executed and verified delivery — holding code_landed", trigger, prNumber)
+		return false
+	}
+	return true
+}
+
 func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session, trigger string) bool {
+	if !o.canMarkDoneForDelivery(s, sess, trigger) {
+		return false
+	}
 	if o == nil || o.cfg == nil || !o.cfg.Outcome.PassRequiredForDoneEnabled() {
 		return true
 	}
@@ -5345,6 +5601,10 @@ func (o *Orchestrator) shouldVerifyOutcomeAfterMerge(deploySucceeded bool) bool 
 	if !o.cfg.Outcome.PassRequiredForDoneEnabled() || !o.cfg.Outcome.HasHealthSignal() {
 		return false
 	}
+	if o.approvalRequiredDeliveryEnabled() && !deploySucceeded {
+		log.Printf("[orch] skipping immediate outcome verification after merge: approval-gated delivery has not completed")
+		return false
+	}
 	if o.cfg.Outcome.RequiresDeploy && !deploySucceeded {
 		log.Printf("[orch] skipping immediate outcome verification after merge: deploy is required and has not succeeded yet")
 		return false
@@ -5360,6 +5620,10 @@ func (o *Orchestrator) verifyOutcomeAfterMerge(s *state.State, sess *state.Sessi
 	result := o.checkOutcome(context.Background())
 	s.OutcomeHealth = &result
 	if result.State == outcome.HealthHealthy {
+		if !o.canMarkDoneForDelivery(s, sess, fmt.Sprintf("outcome verifier passed after PR #%d", prNumber)) {
+			log.Printf("[orch] outcome verifier passed after PR #%d, but required delivery is not executed+verified; holding code_landed", prNumber)
+			return
+		}
 		log.Printf("[orch] outcome verifier passed after PR #%d; marking issue #%d done", prNumber, sess.IssueNumber)
 		if o.markDoneAfterOutcomePass(sess, prNumber) {
 			now := time.Now().UTC()
@@ -5413,8 +5677,15 @@ func (o *Orchestrator) deliverAfterMerge(s *state.State, sess *state.Session, pr
 		return true
 	case config.DeliveryModeApprovalRequired:
 		if strings.TrimSpace(eff.Command) != "" {
-			o.enqueueDeliveryApproval(s, sess, pr, eff)
+			if _, err := o.enqueueDeliveryApproval(s, sess, pr, eff); err != nil {
+				log.Printf("[orch] delivery approval mint failed for PR #%d: %v", pr.Number, err)
+				o.notifier.Sendf("⚠️ maestro: delivery approval for PR #%d could not be persisted — no deploy ran", pr.Number)
+			}
 		}
+		// Pending approval is never equivalent to a successful deployment, even
+		// when outcome.requires_deploy is false. The delivery gate is independent
+		// from health/outcome semantics and must keep the session code_landed.
+		return false
 	}
 	// approval_required (delivery pending), disabled, or an inert automatic
 	// block: no deploy has completed this cycle.
@@ -5426,54 +5697,159 @@ func (o *Orchestrator) deliverAfterMerge(s *state.State, sess *state.Session, pr
 // approval_required (#872). It pins the exact merge commit — main's HEAD after
 // the merge — so approval later deploys THAT revision and a superseding merge
 // invalidates a stale pending. It executes ZERO delivery command here: the
-// approval carries only operator-safe context (target/rollback/verification and
-// a sanitized command preview), never the raw command or a secret.
-func (o *Orchestrator) enqueueDeliveryApproval(s *state.State, sess *state.Session, pr github.PR, eff config.DeliveryConfig) {
+// approval carries only explicit operator-declared-safe labels, never command,
+// target/rollback execution text, local paths, output, or error strings.
+func (o *Orchestrator) enqueueDeliveryApproval(s *state.State, sess *state.Session, pr github.PR, eff config.DeliveryConfig) (*state.Approval, error) {
 	if s == nil {
-		return
+		return nil, errors.New("delivery approval requires state")
 	}
-	mergedSHA, err := o.mainHeadSHA()
-	if err != nil || strings.TrimSpace(mergedSHA) == "" {
+	mergeInfo, err := o.prMergeInfo(pr.Number)
+	mergedSHA := strings.TrimSpace(mergeInfo.SHA)
+	if err != nil || mergedSHA == "" {
 		// Without the pinned merge commit we cannot mint a revision-safe
 		// delivery approval — never fall back to deploying whatever revision is
 		// at local_path. Surface it and skip; a later merge re-mints once the
 		// revision is resolvable.
 		log.Printf("[orch] delivery: could not resolve merge commit SHA for PR #%d: %v — skipping delivery approval mint", pr.Number, err)
 		o.notifier.Sendf("⚠️ maestro: could not pin merge commit for PR #%d delivery — no deploy approval created", pr.Number)
-		return
+		return nil, fmt.Errorf("resolve PR #%d merge commit: %w", pr.Number, err)
+	}
+	mergedSHA = strings.TrimSpace(mergedSHA)
+	if len(mergedSHA) != 40 {
+		return nil, fmt.Errorf("PR #%d merge commit is not a full SHA: %q", pr.Number, mergedSHA)
 	}
 	issue := 0
 	if sess != nil {
 		issue = sess.IssueNumber
 	}
-	verifyPlan := ""
-	if strings.TrimSpace(eff.VerifyCommand) != "" {
-		verifyPlan = "run delivery.verify_command against the target after the deploy command succeeds; a non-zero exit fails the delivery"
-	}
+	now := time.Now().UTC()
 	payload := state.DeliveryPayload{
-		Project:          o.cfg.Repo,
-		Repo:             o.cfg.Repo,
-		PR:               pr.Number,
-		Issue:            issue,
-		MergedSHA:        strings.TrimSpace(mergedSHA),
-		LocalPath:        o.cfg.LocalPath,
-		Target:           eff.Target,
-		CommandPreview:   state.SanitizeDeliveryOutput(eff.Command, 512),
-		VerifyPreview:    state.SanitizeDeliveryOutput(eff.VerifyCommand, 512),
-		Rollback:         eff.Rollback,
-		VerificationPlan: verifyPlan,
-		TimeoutMinutes:   eff.TimeoutMinutes,
+		Project:           o.cfg.Repo,
+		Repo:              o.cfg.Repo,
+		PR:                pr.Number,
+		Issue:             issue,
+		MergedSHA:         mergedSHA,
+		MergedAt:          mergeInfo.MergedAt,
+		TargetLabel:       eff.TargetLabel,
+		VerificationLabel: eff.VerificationLabel,
+		RollbackLabel:     eff.RollbackLabel,
+		TimeoutMinutes:    eff.TimeoutMinutes,
+		ConfigDigest:      eff.ApprovalDigest(),
+		ExpiresAt:         now.Add(eff.EffectiveApprovalTimeout()),
 	}
-	approval := s.RecordDeliveryApproval(payload, time.Now().UTC())
+	before := len(s.Approvals)
+	approval := s.RecordDeliveryApproval(payload, now)
 	if approval == nil {
-		return
+		return nil, errors.New("state refused delivery approval")
 	}
-	target := strings.TrimSpace(eff.Target)
-	if target == "" {
-		target = "the configured target"
+	// Only a pending row minted by THIS call may create a new authoritative
+	// ledger record. An approval returned from the JSON mirror is not an
+	// authorization source: after a DB-path mistake, DB loss, or mirror tamper it
+	// may already say approved/executing/terminal. Re-seeding that status into an
+	// empty ledger would bypass the operator claim (and could replay a delivery).
+	// Existing rows remain recoverable because persistDeliveryApproval first reads
+	// the configured ledger and mirrors its authoritative copy.
+	freshlyMintedPending := len(s.Approvals) == before+1 && approval.Status == state.ApprovalStatusPending
+	approval, err = o.persistDeliveryApproval(s, approval, now, freshlyMintedPending)
+	if err != nil {
+		return nil, err
 	}
-	log.Printf("[orch] delivery: pending deploy_project approval %s for PR #%d @ %s → %s (awaiting operator approval)", approval.ID, pr.Number, shortHeadSHA(mergedSHA), target)
-	o.notifier.Sendf("🔔 maestro: PR #%d merged — delivery to %s awaits approval (%s, revision %s)", pr.Number, target, approval.ID, shortHeadSHA(mergedSHA))
+	target := strings.TrimSpace(eff.TargetLabel)
+	if len(s.Approvals) > before && approval.Status == state.ApprovalStatusPending {
+		log.Printf("[orch] delivery: pending deploy_project approval %s for PR #%d @ %s → %s (awaiting operator approval)", approval.ID, pr.Number, shortHeadSHA(mergedSHA), target)
+		o.notifier.Sendf("🔔 maestro: PR #%d merged — delivery to %s awaits approval (%s, revision %s)", pr.Number, target, approval.ID, shortHeadSHA(mergedSHA))
+	}
+	return approval, nil
+}
+
+// persistDeliveryApproval makes the SQLite delivery ledger authoritative even
+// when the generic approval UI is configured for JSON mode. PutDelivery seeds
+// the new generation and supersedes older actionable generations atomically
+// against execution claims. The authoritative row is then mirrored into JSON
+// and saved immediately, closing the merge→end-of-cycle crash window.
+func (o *Orchestrator) persistDeliveryApproval(s *state.State, approval *state.Approval, now time.Time, freshlyMintedPending bool) (*state.Approval, error) {
+	if strings.TrimSpace(o.cfg.StateDir) == "" {
+		// Lightweight unit callers have no durable project state. Production
+		// configs always carry StateDir and take the authoritative path below.
+		return approval, nil
+	}
+	dbPath := strings.TrimSpace(o.approvalsBinding.DBPath)
+	if dbPath == "" {
+		dbPath = approvalstore.DefaultDBPath()
+	}
+	store, err := approvalstore.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open delivery approval store: %w", err)
+	}
+	defer store.Close()
+	binding := approvalstore.RowBinding{
+		Project:  o.repo,
+		Repo:     o.repo,
+		StateDir: o.cfg.StateDir,
+	}
+	if binding.Project == "" {
+		binding.Project = o.cfg.Repo
+		binding.Repo = o.cfg.Repo
+	}
+	// SQLite is the authorization source after first mint. Never reconstruct a
+	// missing row from a pre-existing JSON mirror: an approved mirror in a fresh
+	// or wrong DB would otherwise become immediately executable. A restart after
+	// the normal DB-first/state-second commit point takes the existing-row branch
+	// and remains recoverable.
+	if _, getErr := store.Get(context.Background(), o.cfg.StateDir, approval.ID); getErr != nil {
+		if !errors.Is(getErr, state.ErrApprovalNotFound) {
+			return nil, fmt.Errorf("read delivery approval %s from authoritative ledger: %w", approval.ID, getErr)
+		}
+		if !freshlyMintedPending || approval.Status != state.ApprovalStatusPending {
+			return nil, fmt.Errorf("delivery approval %s is absent from the configured authoritative ledger; refusing to seed it from the state mirror", approval.ID)
+		}
+		if _, err := store.PutDelivery(context.Background(), approval, binding, now); err != nil {
+			return nil, fmt.Errorf("seed delivery approval %s: %w", approval.ID, err)
+		}
+	}
+	rows, err := store.List(context.Background(), o.cfg.StateDir)
+	if err != nil {
+		return nil, fmt.Errorf("read back delivery approvals: %w", err)
+	}
+	var authoritative *state.Approval
+	for _, row := range rows {
+		if row == nil || row.Action != state.ApprovalActionDeployProject || row.Delivery == nil {
+			continue
+		}
+		if row.Delivery.DeliveryExpired(now) &&
+			(row.Status == state.ApprovalStatusPending || row.Status == state.ApprovalStatusApproved) {
+			row, err = store.MarkStale(context.Background(), o.cfg.StateDir, row.ID, now, "delivery approval expired")
+			if err != nil {
+				return nil, fmt.Errorf("expire delivery approval %s: %w", row.ID, err)
+			}
+		}
+		mirrored := replaceStateApproval(s, row)
+		if row.ID == approval.ID {
+			authoritative = mirrored
+		}
+	}
+	if authoritative == nil {
+		return nil, fmt.Errorf("delivery approval %s missing after seed", approval.ID)
+	}
+	approval = authoritative
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		return nil, fmt.Errorf("save state after delivery approval %s: %w", approval.ID, err)
+	}
+	return approval, nil
+}
+
+func replaceStateApproval(s *state.State, authoritative *state.Approval) *state.Approval {
+	if s == nil || authoritative == nil {
+		return authoritative
+	}
+	for i := range s.Approvals {
+		if s.Approvals[i].ID == authoritative.ID {
+			s.Approvals[i] = *authoritative
+			return &s.Approvals[i]
+		}
+	}
+	s.Approvals = append(s.Approvals, *authoritative)
+	return &s.Approvals[len(s.Approvals)-1]
 }
 
 // runDeployCmd executes the configured delivery command with its timeout. It
@@ -5489,22 +5865,24 @@ func (o *Orchestrator) runDeployCmd(prNumber int) error {
 func (o *Orchestrator) runDeliveryCommand(prNumber int, eff config.DeliveryConfig) error {
 	timeout := eff.EffectiveTimeout()
 	minutes := int(timeout / time.Minute)
-	log.Printf("[orch] running deploy command after PR #%d merge (timeout %dm): %s", prNumber, minutes, eff.Command)
+	log.Printf("[orch] running automatic delivery after PR #%d merge (timeout %dm)", prNumber, minutes)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "bash", "-c", eff.Command)
-	cmd.Dir = o.cfg.LocalPath
-	out, err := cmd.CombinedOutput()
-	if len(out) > 0 {
-		log.Printf("[orch] deploy output:\n%s", out)
-	}
+	_, err := approver.RunBoundedShell(ctx, o.cfg.LocalPath, eff.Command, state.DefaultDeliveryOutputLimit)
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("deploy command timed out after %d minutes", minutes)
 	}
 	if err != nil {
-		return fmt.Errorf("deploy command failed: %w\n%s", err, out)
+		return errors.New("deploy command failed")
+	}
+	if verify := strings.TrimSpace(eff.VerifyCommand); verify != "" {
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), timeout)
+		_, verifyErr := approver.RunBoundedShell(verifyCtx, o.cfg.LocalPath, verify, state.DefaultDeliveryOutputLimit)
+		verifyCancel()
+		if verifyErr != nil {
+			return errors.New("delivery verifier failed")
+		}
 	}
 	return nil
 }

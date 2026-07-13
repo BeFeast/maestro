@@ -87,6 +87,7 @@ Supervise flags:
   --json                Output decision as JSON
   maestro supervise approve <approval-or-decision-id>
   maestro supervise reject <approval-or-decision-id>
+  maestro supervise reconcile-delivery <approval-id> --outcome verified|not-applied|remediated-failed
 
 Serve flags:
   --fleet string        Path to fleet YAML file for multi-project dashboard
@@ -760,7 +761,7 @@ func runCmd(args []string) {
 	once := fs.Bool("once", false, "Run once and exit")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend for the HTTP approve/reject endpoint: json|sqlite (#759)")
-	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals db path (used with --approvals-store=sqlite)")
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals DB (always used for delivery; generic gate uses it with --approvals-store=sqlite)")
 	fs.Parse(args)
 
 	approvalsMode, err := approvalstore.ParseMode(*approvalsStore)
@@ -773,6 +774,7 @@ func runCmd(args []string) {
 	if len(cfgs) == 1 {
 		cfg := cfgs[0]
 		orch := orchestrator.New(cfg)
+		orch.SetApprovalStore(string(approvalsMode), *approvalsDB)
 		orch.SetBinaryVersion(resolveVersion())
 		if err := orch.LoadPromptBase(*promptPath); err != nil {
 			log.Printf("warn: load prompt: %v", err)
@@ -835,6 +837,7 @@ func runCmd(args []string) {
 		go func(c *config.Config) {
 			defer wg.Done()
 			orch := orchestrator.New(c)
+			orch.SetApprovalStore(string(approvalsMode), *approvalsDB)
 			orch.SetBinaryVersion(resolveVersion())
 			if err := orch.LoadPromptBase(*promptPath); err != nil {
 				log.Printf("[%s] warn: load prompt: %v", c.SessionPrefix, err)
@@ -884,6 +887,9 @@ func superviseCmd(args []string) {
 		case "approve", "reject":
 			superviseApprovalCmd(args[0], args[1:], "")
 			return
+		case "reconcile-delivery":
+			superviseReconcileDeliveryCmd(args[1:], "", "", "")
+			return
 		}
 	}
 
@@ -894,12 +900,16 @@ func superviseCmd(args []string) {
 	interval := fs.Duration("interval", 5*time.Minute, "Loop interval")
 	jsonOutput := fs.Bool("json", false, "Output decision as JSON")
 	dryRun := fs.Bool("dry-run", false, "Compute decision without recording state")
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals db path used for durable delivery claims")
 	fs.Parse(args)
 	if fs.NArg() > 0 {
 		subcmd := fs.Arg(0)
 		switch subcmd {
 		case "approve", "reject":
 			superviseApprovalCmd(subcmd, fs.Args()[1:], *configPath)
+			return
+		case "reconcile-delivery":
+			superviseReconcileDeliveryCmd(fs.Args()[1:], *configPath, *storePath, *storeProject)
 			return
 		default:
 			log.Fatalf("supervise: unexpected argument %q", subcmd)
@@ -916,7 +926,7 @@ func superviseCmd(args []string) {
 	}
 	gh := github.New(cfg.Repo)
 	runOnce := func() error {
-		decision, err := supervisor.RunOnce(cfg, gh)
+		decision, err := supervisor.RunOnce(cfg, gh, supervisor.WithApprovalsDBPath(*approvalsDB))
 		if err != nil {
 			return err
 		}
@@ -982,7 +992,7 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 	actor := fs.String("actor", "cli", "Audit actor")
 	reason := fs.String("reason", "", "Audit reason")
 	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend: json|sqlite (sqlite gives transactional claim-once)")
-	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals db path (used with --approvals-store=sqlite)")
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals DB (always used for delivery; generic gate uses it with --approvals-store=sqlite)")
 	fs.Parse(reorderArgs(fs, args))
 	if fs.NArg() != 1 {
 		log.Fatalf("supervise %s: expected approval or decision id", action)
@@ -1009,19 +1019,55 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 	// executor below fires exactly once (write-path premortem double-execute).
 	st, approval, err := approvalstore.ApplyDecision(binding, action, id, now, *actor, *reason)
 	if err != nil {
-		if st != nil && (errors.Is(err, state.ErrApprovalStale) || errors.Is(err, state.ErrApprovalPayloadMismatch)) {
+		// ApplyDecision may return a store-authoritative stale/superseded/race
+		// status together with an error. Persist the returned mirror for every
+		// such path; saving an unchanged not-found snapshot is harmless and keeps
+		// CLI behavior aligned with the HTTP approval endpoint.
+		if st != nil {
 			if saveErr := state.Save(cfg.StateDir, st); saveErr != nil {
-				log.Fatalf("supervise %s: save stale approval: %v", action, saveErr)
+				deliveryMirror := approval
+				if deliveryMirror == nil {
+					deliveryMirror, _ = st.FindApproval(id)
+				}
+				if deliveryMirror != nil && deliveryMirror.Action == state.ApprovalActionDeployProject && deliveryMirror.Delivery != nil {
+					log.Fatalf("supervise %s: delivery %s decision failed; %s", action, deliveryMirror.ID, state.DeliveryMirrorReconciliationPending)
+				}
+				log.Fatalf("supervise %s: save approval state failed", action)
 			}
 		}
 		log.Fatalf("supervise %s: %v", action, err)
 	}
 	if err := state.Save(cfg.StateDir, st); err != nil {
-		log.Fatalf("supervise %s: save state: %v", action, err)
+		if approval != nil && approval.Action == state.ApprovalActionDeployProject {
+			// SQLite approval is already committed and authoritative. Do not tell
+			// the operator authorization failed merely because the JSON mirror is
+			// temporarily unwritable; the executor and reconciliation use the DB.
+			log.Printf("supervise %s: delivery %s committed; %s", action, approval.ID, state.DeliveryMirrorReconciliationPending)
+		} else {
+			log.Fatalf("supervise %s: save state: %v", action, err)
+		}
 	}
 
 	if action != "approve" {
 		fmt.Printf("Approval %s %s.\n", approval.ID, approval.Status)
+		return
+	}
+
+	// deploy_project has its own durable execution path. It must contend on the
+	// exact --approvals-db selected by the operator, even while the generic
+	// approve/reject gate still uses JSON. Routing it through approver.Executor
+	// would only return execution_skipped and silently leave the product
+	// undeployed.
+	if approval.Action == state.ApprovalActionDeployProject {
+		res, deliveryErr := executeApprovedDeliveryCLI(cfg, st, approval, *approvalsDB, *actor)
+		if deliveryErr != nil {
+			log.Fatalf("Approval %s delivery failed: %v", approval.ID, deliveryErr)
+		}
+		if res.Status == state.ApprovalStatusApproved {
+			fmt.Printf("Approval %s approved; delivery queued: %s\n", approval.ID, res.Summary)
+			return
+		}
+		fmt.Printf("Approval %s executed: %s\n", approval.ID, res.Summary)
 		return
 	}
 
@@ -1095,6 +1141,228 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 		}
 		log.Fatalf("Approval %s execution failed: %s", approval.ID, res.Summary)
 	}
+}
+
+// superviseReconcileDeliveryCmd is the only operator recovery surface for an
+// interrupted approval-gated delivery. It is deliberately a local CLI command
+// (authenticated shell access), never an HTTP, timer, daemon, or replay path.
+// Every outcome needs explicit closed assertions; uncertainty leaves the row
+// executing and therefore cannot trigger an automatic second deployment.
+func superviseReconcileDeliveryCmd(args []string, defaultConfigPath, defaultStorePath, defaultStoreProject string) {
+	fs := flag.NewFlagSet("supervise reconcile-delivery", flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "Path to config file")
+	storePath, storeProject := configStoreFlags(fs)
+	*storePath = defaultStorePath
+	*storeProject = defaultStoreProject
+	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "Authoritative SQLite approvals DB")
+	outcome := fs.String("outcome", "", "Closed outcome: verified|not-applied|remediated-failed")
+	observedSHA := fs.String("observed-sha", "", "Exact full revision observed on the target (required for verified)")
+	runnerGone := fs.Bool("assert-runner-gone", false, "Assert the interrupted delivery runner/process is no longer running")
+	targetSafe := fs.Bool("assert-target-safe", false, "Assert the target is safe (required for not-applied/remediated-failed)")
+	fs.Parse(reorderArgs(fs, args))
+	if fs.NArg() != 1 {
+		log.Fatalf("supervise reconcile-delivery: expected exactly one delivery approval id")
+	}
+	if _, err := approver.ParseDeliveryReconcileOutcome(*outcome); err != nil {
+		log.Fatalf("supervise reconcile-delivery: --outcome must be verified, not-applied, or remediated-failed")
+	}
+
+	cfg, err := loadDeliveryReconcileConfig(*configPath, *storePath, *storeProject)
+	if err != nil {
+		log.Fatalf("supervise reconcile-delivery: load config: %v", err)
+	}
+	logConfigWarnings(cfg)
+	res, err := executeDeliveryReconciliationCLI(context.Background(), cfg, *approvalsDB, approver.DeliveryReconcileRequest{
+		ID:               fs.Arg(0),
+		Outcome:          *outcome,
+		ObservedRevision: *observedSHA,
+		RunnerGone:       *runnerGone,
+		TargetSafe:       *targetSafe,
+	})
+	if err != nil {
+		log.Fatalf("supervise reconcile-delivery: %v", err)
+	}
+	fmt.Printf("Approval %s reconciled: %s (%s).\n", res.Approval.ID, res.Status, res.Approval.Delivery.ReconcileOutcome)
+}
+
+// loadDeliveryReconcileConfig resolves exactly one authoritative config source
+// for the exceptional recovery command. Unlike broad read commands, recovery
+// never falls back from a failed config store to YAML: verifier/config-digest
+// selection must not silently change source while closing an executing lease.
+func loadDeliveryReconcileConfig(configPath, storePath, storeProject string) (*config.Config, error) {
+	configPath = strings.TrimSpace(configPath)
+	storePath = strings.TrimSpace(storePath)
+	storeProject = strings.TrimSpace(storeProject)
+	if configPath != "" && storePath != "" {
+		return nil, errors.New("--config and --config-store are mutually exclusive")
+	}
+	if storeProject != "" && storePath == "" {
+		return nil, errors.New("--config-store-project requires --config-store")
+	}
+	if storePath != "" {
+		cfg, err := loadConfigFromStore(storePath, storeProject)
+		if err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	}
+	if configPath != "" {
+		return config.LoadFrom(configPath)
+	}
+	return config.Load()
+}
+
+// executeDeliveryReconciliationCLI wires the local operator command to the
+// authoritative ledger and repairs state.json as a best-effort mirror after
+// the atomic transition. A mirror failure is recoverable: the record hash and
+// terminal lease are already committed in SQLite and later fleet
+// reconciliation will copy the same authoritative row.
+func executeDeliveryReconciliationCLI(ctx context.Context, cfg *config.Config, approvalsDBPath string, req approver.DeliveryReconcileRequest) (approver.DeliveryReconcileResult, error) {
+	var result approver.DeliveryReconcileResult
+	if cfg == nil {
+		return result, errors.New("delivery reconciliation requires config")
+	}
+	if strings.TrimSpace(approvalsDBPath) == "" {
+		approvalsDBPath = approvalstore.DefaultDBPath()
+	}
+	store, err := approvalstore.Open(approvalsDBPath)
+	if err != nil {
+		return result, fmt.Errorf("open authoritative approvals ledger: %w", err)
+	}
+	defer store.Close()
+
+	reconciler := &approver.DeliveryReconciler{
+		Store:    store,
+		StateDir: cfg.StateDir,
+		Repo:     cfg.Repo,
+		Delivery: cfg.EffectiveDelivery(),
+		Checkout: deliveryCheckoutPreparerFactory(cfg),
+	}
+	result, err = reconciler.Reconcile(ctx, req)
+	if err != nil {
+		return result, err
+	}
+	if result.Approval == nil || result.Approval.Delivery == nil {
+		return result, errors.New("authoritative reconciliation returned no delivery row")
+	}
+	if mirrorErr := mirrorAuthoritativeDeliveryApproval(cfg.StateDir, result.Approval); mirrorErr != nil {
+		log.Printf("delivery %s reconciliation committed; %s", result.Approval.ID, state.DeliveryMirrorReconciliationPending)
+	}
+	return result, nil
+}
+
+func mirrorAuthoritativeDeliveryApproval(stateDir string, authoritative *state.Approval) error {
+	if authoritative == nil {
+		return errors.New("delivery mirror requires authoritative approval")
+	}
+	st, err := state.Load(stateDir)
+	if err != nil {
+		return err
+	}
+	if current, ok := st.FindApproval(authoritative.ID); ok {
+		*current = *authoritative
+	} else {
+		st.Approvals = append(st.Approvals, *authoritative)
+	}
+	return state.Save(stateDir, st)
+}
+
+// executeApprovedDeliveryCLI runs one approved deploy_project approval behind
+// the same SQLite claim used by the daemon and mirrors the store-authoritative
+// row back into state.json before returning. Keeping this separate from the
+// generic approver.Executor makes the CLI/web/daemon paths converge on one
+// exactly-once delivery state machine.
+var deliveryFreshnessCheckerFactory = func(cfg *config.Config) approver.DeliveryFreshnessChecker {
+	if cfg == nil {
+		return nil
+	}
+	return approver.NewGitHubDeliveryFreshnessChecker(github.New(cfg.Repo), cfg.Repo, cfg.LocalPath)
+}
+
+var deliveryCheckoutPreparerFactory = func(*config.Config) approver.CheckoutPreparer { return nil }
+
+func executeApprovedDeliveryCLI(cfg *config.Config, st *state.State, approval *state.Approval, approvalsDBPath, actor string) (approver.DeliveryResult, error) {
+	var res approver.DeliveryResult
+	if cfg == nil || st == nil || approval == nil {
+		return res, errors.New("delivery approval requires config, state, and approval")
+	}
+	if approval.Action != state.ApprovalActionDeployProject || approval.Delivery == nil {
+		return res, approver.ErrNotDeliverable
+	}
+	if strings.TrimSpace(approvalsDBPath) == "" {
+		approvalsDBPath = approvalstore.DefaultDBPath()
+	}
+
+	store, err := approvalstore.Open(approvalsDBPath)
+	if err != nil {
+		return res, errors.New("open delivery approvals db failed")
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	// ApplyDecision already proved this row exists in the configured
+	// authoritative ledger. Keep this executor helper fail-closed as well for
+	// direct callers and future refactors: never reconstruct a delivery row from
+	// its JSON mirror in a potentially different DB.
+	stored, err := store.Get(ctx, cfg.StateDir, approval.ID)
+	if err != nil {
+		return res, fmt.Errorf("delivery approval %s is absent from configured ledger: %w", approval.ID, err)
+	}
+	if stored.Action != state.ApprovalActionDeployProject || stored.Delivery == nil {
+		return res, fmt.Errorf("configured ledger row %s is not a delivery approval", approval.ID)
+	}
+
+	ex := &approver.DeliveryExecutor{
+		Store:     store,
+		StateDir:  cfg.StateDir,
+		Repo:      cfg.Repo,
+		Delivery:  cfg.EffectiveDelivery(),
+		Checkout:  deliveryCheckoutPreparerFactory(cfg),
+		Actor:     actor,
+		Freshness: deliveryFreshnessCheckerFactory(cfg),
+	}
+	res = ex.Deliver(ctx, approval.ID)
+	if res.Approval != nil {
+		current, ok := st.FindApproval(res.Approval.ID)
+		if !ok {
+			return res, fmt.Errorf("mirror delivery approval %s: %w", res.Approval.ID, state.ErrApprovalNotFound)
+		}
+		// SQLite is authoritative for delivery status, audit, and sanitized
+		// result payload. Copy the exact row instead of replaying transitions.
+		*current = *res.Approval
+	}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		// FinishDelivery has already committed the authoritative result. Treat
+		// JSON as a repairable mirror and preserve the true execution outcome.
+		log.Printf("delivery %s result committed; %s", approval.ID, state.DeliveryMirrorReconciliationPending)
+	}
+	if res.Err != nil {
+		if errors.Is(res.Err, approvalstore.ErrDeliveryInFlight) && res.Approval != nil && res.Approval.Status == state.ApprovalStatusApproved {
+			// Approval is durable and intentionally remains claimable. The daemon
+			// will retry after the older generation releases the project lease;
+			// report accepted/queued, never a false authorization failure.
+			res.Status = state.ApprovalStatusApproved
+			res.Summary = "waiting for the prior project delivery generation to finish"
+			res.Err = nil
+			return res, nil
+		}
+		// A daemon may have won the claim between the CLI approval and this
+		// call. If the authoritative row is already executed+verified, the
+		// requested outcome succeeded exactly once; report convergence rather
+		// than a false CLI failure.
+		if res.Approval != nil && res.Approval.Status == state.ApprovalStatusExecuted &&
+			res.Approval.Delivery != nil && res.Approval.Delivery.Verified {
+			res.Status = state.ApprovalStatusExecuted
+			res.Summary = "delivery already completed and verified by another claimant"
+			res.Err = nil
+			return res, nil
+		}
+		return res, res.Err
+	}
+	if res.Status != state.ApprovalStatusExecuted {
+		return res, fmt.Errorf("delivery ended in status %s", res.Status)
+	}
+	return res, nil
 }
 
 // newWorkerController wires worker.Stop + state transitions into the

@@ -63,7 +63,7 @@ func computeSuperviseJitter(interval time.Duration, frac float64) time.Duration 
 // flow restart (#768). The GitHub client is built once from the startup repo —
 // repo is a restart-required field the orchestrator refuses to hot-apply, so it
 // is stable for the flow's lifetime.
-func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration, emergencyLLMHalt func() bool) {
+func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration, approvalsDBPath string, emergencyLLMHalt func() bool) {
 	// reader is the flow's read surface. The daemon passes a mirror-first source
 	// when github_mirror.source is mirror-first (#826); it satisfies
 	// supervisor.Reader and serves the poll reads locally when the mirror is warm,
@@ -82,7 +82,7 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		// the cycle deterministic-only so the supervisor stops spending on its
 		// backend within one cycle. The rest of the cycle (state, GitHub reads,
 		// journal) is unchanged, so the operator keeps seeing what is happening.
-		var opts []supervisor.RunOption
+		opts := []supervisor.RunOption{supervisor.WithApprovalsDBPath(approvalsDBPath)}
 		if emergencyLLMHalt != nil && emergencyLLMHalt() {
 			opts = append(opts, supervisor.WithEmergencyLLMHalt(true))
 		}

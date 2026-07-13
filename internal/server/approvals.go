@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -26,7 +27,12 @@ type approvalDecisionRequest struct {
 type approvalDecisionResponse struct {
 	OK       bool            `json:"ok"`
 	Approval *state.Approval `json:"approval"`
+	Warning  string          `json:"warning,omitempty"`
 }
+
+// saveApprovalDecisionState is injectable for commit-point tests. SQLite is
+// authoritative for deploy_project; state.json is a reconciled read mirror.
+var saveApprovalDecisionState = state.Save
 
 // approvalRoute is "approve" or "reject" parsed from the URL.
 type approvalRoute struct {
@@ -109,11 +115,23 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("load state: %v", err))
 			return
 		}
+		var deliveryMirror *state.Approval
+		if approval != nil && approval.Action == state.ApprovalActionDeployProject && approval.Delivery != nil {
+			deliveryMirror = approval
+		} else if current, ok := st.FindApproval(route.id); ok && current.Action == state.ApprovalActionDeployProject && current.Delivery != nil {
+			deliveryMirror = current
+		}
 		// Persist any partial state changes (stale/superseded transitions
 		// can mutate even when the verb fails) before returning.
-		if persistErr := state.Save(stateDir, st); persistErr != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state after %s error %v: %v", route.verb, err, persistErr))
-			return
+		if persistErr := saveApprovalDecisionState(stateDir, st); persistErr != nil {
+			if deliveryMirror != nil {
+				// SQLite remains authoritative. Preserve the original decision
+				// status below and keep the private PathError out of API/log output.
+				log.Printf("[server] delivery %s: %s", deliveryMirror.ID, state.DeliveryMirrorReconciliationPending)
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state after %s failed", route.verb))
+				return
+			}
 		}
 		switch {
 		case errors.Is(err, state.ErrApprovalNotFound):
@@ -137,7 +155,21 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 		}
 		return
 	}
-	if err := state.Save(stateDir, st); err != nil {
+	if err := saveApprovalDecisionState(stateDir, st); err != nil {
+		if approval != nil && approval.Action == state.ApprovalActionDeployProject {
+			// ApplyDecision already committed the authorization in the
+			// authoritative SQLite ledger. Returning 500 would falsely tell the
+			// operator it was rejected while the supervisor may legitimately import
+			// and execute it. Acknowledge the commit and surface mirror degradation;
+			// normal reconciliation repairs state.json.
+			// Never return or log the raw Save error here. os.PathError embeds the
+			// private absolute StateDir/temp path, while the operator only needs the
+			// durable commit + reconciliation-pending outcome.
+			warning := "approval committed; " + state.DeliveryMirrorReconciliationPending
+			log.Printf("[server] delivery %s: %s", approval.ID, warning)
+			writeJSON(w, http.StatusOK, approvalDecisionResponse{OK: true, Approval: approval, Warning: warning})
+			return
+		}
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
 		return
 	}

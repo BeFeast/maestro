@@ -14,7 +14,9 @@ import (
 type Mode string
 
 const (
-	// ModeJSON keeps the legacy per-project JSON read-merge-write path.
+	// ModeJSON keeps the legacy per-project JSON read-merge-write path for
+	// generic approvals. deploy_project is always claimed in configured SQLite
+	// because its executor requires a durable approved→executing transition.
 	ModeJSON Mode = "json"
 	// ModeSQLite routes the claim through the transactional SQLite store
 	// (claim-once) while still write-through-mirroring into JSON state for
@@ -38,7 +40,8 @@ func ParseMode(s string) (Mode, error) {
 // Binding is everything ApplyDecision/FinalizeExecution need to resolve the
 // approvals store for one project's approve/reject. StateDir is always the
 // JSON state directory (mint source and write-through target); DBPath is the
-// SQLite database used only in ModeSQLite.
+// SQLite database used by generic approvals in ModeSQLite and by
+// deploy_project in every mode.
 //
 // Handle is an optional already-open store. A long-lived server (the fleet /
 // single-project HTTP server) MUST set Handle to one shared *Store: with a
@@ -77,10 +80,11 @@ func (b Binding) resolveStore() (*Store, func(), error) {
 // The caller owns state.Save (and, for the CLI, executing the approved
 // side effect + FinalizeExecution).
 //
-// In ModeJSON this is exactly st.ApproveApproval / st.RejectApproval — the
-// returned state is mutated identically to the legacy path (including the
-// partial stale transition on a conflict), so the caller's existing save +
-// error-mapping logic is unchanged.
+// In ModeJSON generic approvals use st.ApproveApproval / st.RejectApproval —
+// the returned state is mutated identically to the legacy path. Delivery is
+// the deliberate exception: deploy_project always uses the configured SQLite
+// store so a JSON-only approve cannot bypass or strand its durable execution
+// claim.
 //
 // In ModeSQLite the pending approval is seeded into SQLite (write-through),
 // claimed atomically there (claim-once across processes), and — on a winning
@@ -97,15 +101,24 @@ func ApplyDecision(b Binding, verb, id string, now time.Time, actor, reason stri
 	if err != nil {
 		return nil, nil, err
 	}
-	if !b.UseSQLite() {
+	a0, ok := st.FindApproval(id)
+	if !ok {
+		return st, nil, state.ErrApprovalNotFound
+	}
+	// deploy_project always uses the durable SQLite claim, irrespective of the
+	// generic approvals-store mode. The delivery approval is already minted in
+	// the configured DB so a JSON-only approve would otherwise leave SQLite
+	// pending forever, and the delivery executor could never take its
+	// approved→executing exactly-once claim.
+	deliveryClaim := a0.Action == state.ApprovalActionDeployProject && a0.Delivery != nil
+	if !b.UseSQLite() && !deliveryClaim {
 		approval, terr := applyJSONTransition(st, verb, id, now, actor, reason)
 		return st, approval, terr
 	}
 
 	// SQLite claim-once path.
-	a0, ok := st.FindApproval(id)
-	if !ok {
-		return st, nil, state.ErrApprovalNotFound
+	if strings.TrimSpace(b.DBPath) == "" && b.Handle == nil {
+		b.DBPath = DefaultDBPath()
 	}
 	store, cleanup, err := b.resolveStore()
 	if err != nil {
@@ -115,8 +128,24 @@ func ApplyDecision(b Binding, verb, id string, now time.Time, actor, reason stri
 
 	ctx := context.Background()
 	rb := RowBinding{Project: b.Project, Repo: b.Repo, StateDir: b.StateDir}
-	if _, err := store.Put(ctx, a0, rb); err != nil {
-		return st, nil, err
+	if deliveryClaim {
+		// Delivery approvals are minted into their authoritative ledger by the
+		// orchestrator. Never seed one from the JSON mirror during approval: a
+		// CLI/server pointed at the wrong SQLite file would otherwise create a
+		// second claimable row and execute the same revision twice. Requiring the
+		// row to exist also makes the configured DB identity fail closed.
+		authoritative, getErr := store.Get(ctx, b.StateDir, a0.ID)
+		if getErr != nil {
+			return st, nil, fmt.Errorf("delivery approval %s is absent from the configured authoritative ledger: %w", a0.ID, getErr)
+		}
+		if authoritative.Action != state.ApprovalActionDeployProject || authoritative.Delivery == nil {
+			return st, nil, fmt.Errorf("configured ledger row %s is not a delivery approval", a0.ID)
+		}
+		a0 = replaceApproval(st, authoritative)
+	} else {
+		if _, err := store.Put(ctx, a0, rb); err != nil {
+			return st, nil, err
+		}
 	}
 
 	// Claim the RESOLVED approval id (a0.ID), not the user-supplied value:
@@ -133,12 +162,18 @@ func ApplyDecision(b Binding, verb, id string, now time.Time, actor, reason stri
 		claimed, err = store.Reject(ctx, b.StateDir, a0.ID, now, actor, reason)
 	}
 	if err != nil {
+		if deliveryClaim && claimed != nil {
+			return st, replaceApproval(st, claimed), err
+		}
 		// Mirror a stale / payload-mismatch transition into JSON so both
 		// stores agree and the caller's partial-persist path records it.
 		if errors.Is(err, state.ErrApprovalStale) || errors.Is(err, state.ErrApprovalPayloadMismatch) {
 			_, _ = applyJSONTransition(st, verb, id, now, actor, reason)
 		}
 		return st, claimed, err
+	}
+	if deliveryClaim {
+		return st, replaceApproval(st, claimed), nil
 	}
 
 	// Won the claim — write through to JSON. In the normal same-load case the
@@ -153,6 +188,20 @@ func ApplyDecision(b Binding, verb, id string, now time.Time, actor, reason stri
 		return st, cur, nil
 	}
 	return st, claimed, nil
+}
+
+func replaceApproval(st *state.State, authoritative *state.Approval) *state.Approval {
+	if st == nil || authoritative == nil {
+		return authoritative
+	}
+	for i := range st.Approvals {
+		if st.Approvals[i].ID == authoritative.ID {
+			st.Approvals[i] = *authoritative
+			return &st.Approvals[i]
+		}
+	}
+	st.Approvals = append(st.Approvals, *authoritative)
+	return &st.Approvals[len(st.Approvals)-1]
 }
 
 // FinalizeExecution mirrors a post-execution terminal status into the SQLite

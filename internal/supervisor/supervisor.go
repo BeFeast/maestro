@@ -282,6 +282,7 @@ type RunOption func(*runOptions)
 
 type runOptions struct {
 	emergencyLLMHalt bool
+	approvalsDBPath  string
 }
 
 // WithEmergencyLLMHalt forces this cycle's decision down the deterministic-only
@@ -289,6 +290,14 @@ type runOptions struct {
 // DB's emergency switch is set to llm_stopped/all_stopped.
 func WithEmergencyLLMHalt(halt bool) RunOption {
 	return func(o *runOptions) { o.emergencyLLMHalt = halt }
+}
+
+// WithApprovalsDBPath binds approval-gated deliveries to the same shared
+// SQLite database selected by the daemon/CLI approve surface. Delivery always
+// uses a durable SQLite approved→executing claim, even when the legacy
+// approve/reject surface is still configured for JSON.
+func WithApprovalsDBPath(path string) RunOption {
+	return func(o *runOptions) { o.approvalsDBPath = strings.TrimSpace(path) }
 }
 
 // RunOnce records one supervisor decision in Maestro state and applies any safe
@@ -354,7 +363,7 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		// pass catches web-driven approves and replays after a daemon
 		// restart). Lives inside the dry-run guard so the resulting
 		// state transitions are persisted by the state.Save below.
-		executeApprovedApprovals(cfg, st, reader)
+		executeApprovedApprovals(cfg, st, reader, ro.approvalsDBPath)
 		if proposal, created := recordLessonProposalForDecision(cfg, st, decision); created && proposal != nil {
 			log.Printf("[supervisor] proposed lesson %s for %s/%s; approval=%s", proposal.ID, proposal.FailureClass, proposal.Area, proposal.ApprovalID)
 		}
@@ -4165,8 +4174,11 @@ func clearWorktreeAfterRestart(sess *state.Session) {
 // deliveryStoreOpener opens the approvals store the #872 delivery executor
 // contends on. It defaults to the unified fleet DB; tests override it to point
 // at a throwaway store.
-var deliveryStoreOpener = func() (*approvalstore.Store, error) {
-	return approvalstore.Open(approvalstore.DefaultDBPath())
+var deliveryStoreOpener = func(path string) (*approvalstore.Store, error) {
+	if strings.TrimSpace(path) == "" {
+		path = approvalstore.DefaultDBPath()
+	}
+	return approvalstore.Open(path)
 }
 
 // executeApprovedDeliveries runs every approved deploy_project delivery through
@@ -4174,7 +4186,7 @@ var deliveryStoreOpener = func() (*approvalstore.Store, error) {
 // state (#872). The store arbitrates the durable approved→executing claim so a
 // daemon and a CLI approve run the delivery exactly once and a restart never
 // replays an in-flight delivery. Failures are logged, never abort the cycle.
-func executeApprovedDeliveries(cfg *config.Config, st *state.State, approvals []*state.Approval) {
+func executeApprovedDeliveries(cfg *config.Config, st *state.State, reader Reader, approvals []*state.Approval, approvalsDBPath string) {
 	var pending []*state.Approval
 	for _, a := range approvals {
 		if a.Action == state.ApprovalActionDeployProject {
@@ -4184,7 +4196,7 @@ func executeApprovedDeliveries(cfg *config.Config, st *state.State, approvals []
 	if len(pending) == 0 {
 		return
 	}
-	store, err := deliveryStoreOpener()
+	store, err := deliveryStoreOpener(approvalsDBPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[supervisor] open delivery store: %v\n", err)
 		return
@@ -4192,20 +4204,35 @@ func executeApprovedDeliveries(cfg *config.Config, st *state.State, approvals []
 	defer store.Close()
 
 	ctx := context.Background()
-	rb := approvalstore.RowBinding{Project: cfg.Repo, Repo: cfg.Repo, StateDir: cfg.StateDir}
+	latestReader, ok := reader.(approver.LatestMergedGenerationReader)
+	if !ok {
+		// The normal supervisor reader may be mirror-first and intentionally
+		// omit this freshness-only API. Execution must consult GitHub directly;
+		// a cached mirror is not authoritative for a just-landed merge.
+		latestReader = github.New(cfg.Repo)
+	}
+	var checkout approver.CheckoutPreparer
+	if provider, ok := reader.(interface {
+		DeliveryCheckoutPreparer() approver.CheckoutPreparer
+	}); ok {
+		checkout = provider.DeliveryCheckoutPreparer()
+	}
 	ex := &approver.DeliveryExecutor{
-		Store:    store,
-		StateDir: cfg.StateDir,
-		Repo:     cfg.Repo,
-		Delivery: cfg.EffectiveDelivery(),
-		Actor:    "supervisor",
+		Store:     store,
+		StateDir:  cfg.StateDir,
+		Repo:      cfg.Repo,
+		Delivery:  cfg.EffectiveDelivery(),
+		Checkout:  checkout,
+		Actor:     "supervisor",
+		Freshness: approver.NewGitHubDeliveryFreshnessChecker(latestReader, cfg.Repo, cfg.LocalPath),
 	}
 	for _, a := range pending {
-		// Seed the approved row so the durable claim has a target even when the
-		// approve was JSON-gated (INSERT OR IGNORE — a no-op when the SQLite gate
-		// already seeded it).
-		if _, err := store.Put(ctx, a, rb); err != nil {
-			fmt.Fprintf(os.Stderr, "[supervisor] seed delivery %s: %v\n", a.ID, err)
+		// Approved delivery rows must already exist in the authoritative ledger.
+		// Seeding from JSON here would make a daemon pointed at a different DB a
+		// second independent executor for the same approval.
+		stored, err := store.Get(ctx, cfg.StateDir, a.ID)
+		if err != nil || stored.Action != state.ApprovalActionDeployProject || stored.Delivery == nil {
+			fmt.Fprintf(os.Stderr, "[supervisor] delivery %s absent from configured authoritative ledger: %v\n", a.ID, err)
 			continue
 		}
 		res := ex.Deliver(ctx, a.ID)
@@ -4226,22 +4253,15 @@ func mirrorDeliveryStatus(st *state.State, id string, res approver.DeliveryResul
 		}
 		return
 	}
-	now := time.Now().UTC()
-	switch final.Status {
-	case state.ApprovalStatusExecuting:
-		// In flight / stuck (crash-recovery): surface it for operator reconcile.
-		if _, err := st.MarkApprovalExecuting(id, now, "supervisor", "delivery claim"); err != nil && err != state.ErrApprovalNotApproved {
-			fmt.Fprintf(os.Stderr, "[supervisor] mirror executing %s: %v\n", id, err)
-		}
-	case state.ApprovalStatusExecuted, state.ApprovalStatusExecutionFailed:
-		if _, err := st.MarkApprovalExecuting(id, now, "supervisor", "delivery claim"); err != nil && err != state.ErrApprovalNotApproved {
-			fmt.Fprintf(os.Stderr, "[supervisor] mirror executing %s: %v\n", id, err)
-		}
-		success := final.Status == state.ApprovalStatusExecuted
-		if _, err := st.RecordDeliveryResult(id, success, final.Delivery, time.Now().UTC(), "supervisor", res.Summary); err != nil && err != state.ErrApprovalNotExecuting {
-			fmt.Fprintf(os.Stderr, "[supervisor] mirror delivery result %s: %v\n", id, err)
-		}
+	current, ok := st.FindApproval(id)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "[supervisor] mirror delivery %s: %v\n", id, state.ErrApprovalNotFound)
+		return
 	}
+	// SQLite is authoritative for delivery claims and results. Copy the exact
+	// row (status, audit, sanitized payload, timestamps) instead of replaying
+	// transitions in JSON and risking a partial mirror after a restart/race.
+	*current = *final
 }
 
 // executeApprovedApprovals runs any approvals currently in status=approved
@@ -4249,7 +4269,8 @@ func mirrorDeliveryStatus(st *state.State, id string, res approver.DeliveryResul
 // transitions. Failures are logged but do not abort the supervisor cycle —
 // each approval gets its own audit entry so an operator can see what
 // happened.
-func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader) {
+func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader, approvalsDBPath string) {
+	reconcileDeliveryApprovalsFromStore(cfg, st, approvalsDBPath)
 	approvals := st.ListApprovedApprovals()
 	if len(approvals) == 0 {
 		return
@@ -4258,7 +4279,7 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 	// (durable approved→executing store claim before any side effect), NOT the
 	// pure approver.Executor. Route them separately; the generic loop below
 	// skips the verb (it returns execution_skipped there).
-	executeApprovedDeliveries(cfg, st, approvals)
+	executeApprovedDeliveries(cfg, st, reader, approvals, approvalsDBPath)
 
 	// approver.Executor only needs MergePR/CloseIssue from the GH client.
 	// Reader (the broader supervisor surface) is satisfied by *github.Client,
@@ -4319,6 +4340,68 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 			if _, err := st.MarkApprovalExecutionFailed(a.ID, now, "supervisor", msg); err != nil {
 				fmt.Fprintf(os.Stderr, "[supervisor] mark approval %s failed: %v\n", a.ID, err)
 			}
+		}
+	}
+}
+
+// reconcileDeliveryApprovalsFromStore imports the durable delivery ledger into
+// JSON before the approved scan. This closes the crash window where SQLite won
+// an approve/execute transition but the process died before state.Save: the
+// next supervisor cycle sees the authoritative row, replaces/appends only the
+// matching deploy_project approval, and the existing RunOnce save persists the
+// mirror. It never mints or supersedes approvals.
+func reconcileDeliveryApprovalsFromStore(cfg *config.Config, st *state.State, approvalsDBPath string) {
+	if cfg == nil || st == nil || strings.TrimSpace(cfg.StateDir) == "" {
+		return
+	}
+	needsImport := cfg.EffectiveDelivery().Mode == config.DeliveryModeApprovalRequired
+	if !needsImport {
+		for i := range st.Approvals {
+			if st.Approvals[i].Action == state.ApprovalActionDeployProject {
+				needsImport = true
+				break
+			}
+		}
+	}
+	if !needsImport {
+		return
+	}
+	store, err := deliveryStoreOpener(approvalsDBPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[supervisor] open delivery store for reconciliation: %v\n", err)
+		return
+	}
+	defer store.Close()
+	ctx := context.Background()
+	rows, err := store.List(ctx, cfg.StateDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[supervisor] list delivery approvals for reconciliation: %v\n", err)
+		return
+	}
+	now := time.Now().UTC()
+	for _, authoritative := range rows {
+		if authoritative == nil || authoritative.Action != state.ApprovalActionDeployProject || authoritative.Delivery == nil {
+			continue
+		}
+		if authoritative.Delivery.DeliveryExpired(now) &&
+			(authoritative.Status == state.ApprovalStatusPending || authoritative.Status == state.ApprovalStatusApproved) {
+			staled, staleErr := store.MarkStale(ctx, cfg.StateDir, authoritative.ID, now, "delivery approval expired")
+			if staleErr != nil {
+				fmt.Fprintf(os.Stderr, "[supervisor] expire delivery approval %s: %v\n", authoritative.ID, staleErr)
+				continue
+			}
+			authoritative = staled
+		}
+		replaced := false
+		for i := range st.Approvals {
+			if st.Approvals[i].ID == authoritative.ID {
+				st.Approvals[i] = *authoritative
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			st.Approvals = append(st.Approvals, *authoritative)
 		}
 	}
 }

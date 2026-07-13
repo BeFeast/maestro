@@ -127,7 +127,7 @@ func TestPrepareProjectSurfacesDeliveryWarnings(t *testing.T) {
 		t.Fatalf("legacy deploy_cmd genesis must warn about the deprecation; warnings=%v", p.Warnings)
 	}
 
-	safe := genesisYAML + "delivery:\n  mode: approval_required\n  command: /srv/example-src/maestro/scripts/deploy.sh\n"
+	safe := genesisYAML + "delivery:\n  mode: approval_required\n  command: ./scripts/deploy.sh\n  verify_command: ./scripts/status.sh\n  target_label: production\n  verification_label: status check\n  rollback_label: previous release\n"
 	q, err := PrepareProject("safe.yaml", []byte(safe))
 	if err != nil {
 		t.Fatalf("PrepareProject safe: %v", err)

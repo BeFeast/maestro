@@ -132,8 +132,9 @@ type Options struct {
 	// through the transactional claim-once store at ApprovalsDBPath. Empty is
 	// treated as json.
 	ApprovalsStore string
-	// ApprovalsDBPath is the shared SQLite approvals database used when
-	// ApprovalsStore is "sqlite".
+	// ApprovalsDBPath is the shared SQLite approvals database used by the
+	// generic gate when ApprovalsStore is "sqlite" and by deploy_project in
+	// every mode (delivery always requires a durable execution claim).
 	ApprovalsDBPath string
 
 	// StateStore selects the store backing the remaining orchestration state —
@@ -287,7 +288,7 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		if src := d.newReadSource(getCfg().Repo, getCfg); src != nil {
 			reader = src
 		}
-		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval, d.emergencyLLMHalt)
+		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval, opts.ApprovalsDBPath, d.emergencyLLMHalt)
 	}
 	d.watchdogLoop = supervisor.Watchdog
 	// Default to the real launcher; tests swap it for a counter (#758).

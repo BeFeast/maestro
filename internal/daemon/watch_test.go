@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -219,6 +222,70 @@ func TestWatchStoreWiresReloadChannel(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestReloadPumpCoalescesToLatestConfigWhenOrchestratorChannelIsFull(t *testing.T) {
+	base := testConfig(t, "owner/alpha")
+	base.MaxParallel = 1
+	flow := &projectFlow{name: "alpha", cfg: base, holder: newConfigHolder(base)}
+	watchCh := make(chan *config.Config, 1)
+	orchCh := make(chan *config.Config, 1)
+	stale := *base
+	stale.MaxParallel = 2
+	orchCh <- &stale // orchestrator is mid-cycle; its one-slot queue is full
+	latest := *base
+	latest.MaxParallel = 9
+	watchCh <- &latest
+	close(watchCh)
+
+	d := &Daemon{}
+	d.runReloadPump(context.Background(), flow, watchCh, orchCh)
+	got := <-orchCh
+	if got.MaxParallel != 9 {
+		t.Fatalf("queued reload max_parallel = %d, want latest value 9", got.MaxParallel)
+	}
+	if held := flow.holder.Load().MaxParallel; held != 9 {
+		t.Fatalf("holder max_parallel = %d, want 9", held)
+	}
+}
+
+func TestReloadPumpLocalPathChangeIsAtomicRestartBoundary(t *testing.T) {
+	base := testConfig(t, "owner/alpha")
+	base.LocalPath = "/srv/alpha-old"
+	base.MaxParallel = 1
+	flow := &projectFlow{name: "alpha", cfg: base, holder: newConfigHolder(base)}
+	watchCh := make(chan *config.Config, 1)
+	orchCh := make(chan *config.Config, 1)
+
+	// One store edit changes both a hot field and LocalPath. None of it may be
+	// partially published: the supervisor/Fleet holder and the orchestrator must
+	// keep one coherent old snapshot until the flow is restarted.
+	edited := *base
+	edited.LocalPath = "/srv/alpha-new"
+	edited.MaxParallel = 9
+	watchCh <- &edited
+	close(watchCh)
+
+	var logs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	d := &Daemon{}
+	d.runReloadPump(context.Background(), flow, watchCh, orchCh)
+
+	held := flow.holder.Load()
+	if held.LocalPath != base.LocalPath || held.MaxParallel != base.MaxParallel {
+		t.Fatalf("holder partially reloaded restart-boundary edit: local_path=%q max_parallel=%d", held.LocalPath, held.MaxParallel)
+	}
+	select {
+	case got := <-orchCh:
+		t.Fatalf("orchestrator received partial restart-boundary reload: %+v", got)
+	default:
+	}
+	if !strings.Contains(logs.String(), "restart required") || !strings.Contains(logs.String(), "local_path") {
+		t.Fatalf("restart boundary was not reported clearly: %q", logs.String())
+	}
 }
 
 // #768: a config-store edit must reach the supervise loop AND the /api/v1/fleet

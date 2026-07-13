@@ -3,6 +3,8 @@ package config
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/befeast/maestro/internal/outcome"
 	"gopkg.in/yaml.v3"
@@ -639,23 +643,49 @@ type DeliveryConfig struct {
 	// Mode is disabled | approval_required | automatic. Empty defaults to
 	// approval_required when a Command is set (the safe default), else disabled.
 	Mode DeliveryMode `yaml:"mode" json:"mode,omitempty"`
-	// Command is the deploy/install shell command run from LocalPath.
+	// Command is the deploy/install entrypoint. In approval_required it must be
+	// one argument-free ./repo/relative executable and runs from the isolated
+	// exact-SHA checkout; automatic/legacy mode retains shell-command semantics.
 	Command string `yaml:"command" json:"command,omitempty"`
 	// TimeoutMinutes bounds Command (and VerifyCommand). Default 15.
 	TimeoutMinutes int `yaml:"timeout_minutes" json:"timeout_minutes,omitempty"`
-	// Target is an operator-safe label for the delivery destination shown in
-	// the approval/history (e.g. "prod web", "kiosk fleet"). Never a secret.
+	// ApprovalTimeoutMinutes bounds how long a pending delivery approval stays
+	// actionable. The default is 24 hours; an expired approval is retained in
+	// audit history but can never claim execution.
+	ApprovalTimeoutMinutes int `yaml:"approval_timeout_minutes" json:"approval_timeout_minutes,omitempty"`
+	// Target is legacy free-form context. It participates in the approval
+	// digest but is never copied into approval state/history/API because older
+	// configs may contain hostnames, credentials, or command fragments.
 	Target string `yaml:"target" json:"target,omitempty"`
-	// Rollback is a human rollback reference shown in the approval so an
-	// operator knows how to undo the delivery.
+	// Rollback is legacy free-form context with the same persistence rule as
+	// Target: runtime/config only, never approval state/history/API.
 	Rollback string `yaml:"rollback" json:"rollback,omitempty"`
-	// VerifyCommand is the live/deployment verifier run after Command
-	// succeeds. A non-zero exit marks the delivery execution_failed.
+	// TargetLabel is an explicit operator assertion that this short label is
+	// safe for durable approval/history/API display. It is mandatory for
+	// approval_required and is never inferred from Target.
+	TargetLabel string `yaml:"target_label" json:"target_label,omitempty"`
+	// VerificationLabel is mandatory operator-declared-safe context describing
+	// the verification outcome (the raw VerifyCommand is never persisted).
+	VerificationLabel string `yaml:"verification_label" json:"verification_label,omitempty"`
+	// RollbackLabel is mandatory operator-declared-safe rollback context. When
+	// rollback is deliberately unavailable, use "none: <reason>" explicitly.
+	// It is never inferred from Rollback.
+	RollbackLabel string `yaml:"rollback_label" json:"rollback_label,omitempty"`
+	// VerifyCommand is the live/deployment verifier run after Command succeeds.
+	// The same strict repo-relative entrypoint contract applies in
+	// approval_required. A non-zero exit marks execution_failed.
 	VerifyCommand string `yaml:"verify_command" json:"verify_command,omitempty"`
+	// LocalPath is runtime-only context copied from Config.LocalPath by
+	// EffectiveDelivery. It is deliberately not a delivery-block YAML field,
+	// but it participates in ApprovalDigest: moving the checkout changes what
+	// source and scripts would execute and therefore requires a fresh approval.
+	LocalPath string `yaml:"-" json:"-"`
 }
 
 // deliveryTimeoutDefaultMinutes is the fallback delivery timeout.
 const deliveryTimeoutDefaultMinutes = 15
+
+const deliveryApprovalTimeoutDefaultMinutes = 24 * 60
 
 // EffectiveDelivery resolves the delivery configuration for a project, folding
 // the legacy deploy_cmd/deploy_timeout_minutes fields into an automatic-mode
@@ -684,6 +714,7 @@ func (c *Config) EffectiveDelivery() DeliveryConfig {
 			}
 		}
 		d.TimeoutMinutes = normalizeDeliveryTimeout(d.TimeoutMinutes)
+		d.LocalPath = c.LocalPath
 		return d
 	}
 	if strings.TrimSpace(c.DeployCmd) != "" {
@@ -691,9 +722,10 @@ func (c *Config) EffectiveDelivery() DeliveryConfig {
 			Mode:           DeliveryModeAutomatic,
 			Command:        c.DeployCmd,
 			TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes),
+			LocalPath:      c.LocalPath,
 		}
 	}
-	return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes)}
+	return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes), LocalPath: c.LocalPath}
 }
 
 // configured reports whether the operator set any field of the delivery block.
@@ -701,14 +733,57 @@ func (d DeliveryConfig) configured() bool {
 	return strings.TrimSpace(string(d.Mode)) != "" ||
 		strings.TrimSpace(d.Command) != "" ||
 		d.TimeoutMinutes != 0 ||
+		d.ApprovalTimeoutMinutes != 0 ||
 		strings.TrimSpace(d.Target) != "" ||
 		strings.TrimSpace(d.Rollback) != "" ||
+		strings.TrimSpace(d.TargetLabel) != "" ||
+		strings.TrimSpace(d.VerificationLabel) != "" ||
+		strings.TrimSpace(d.RollbackLabel) != "" ||
 		strings.TrimSpace(d.VerifyCommand) != ""
 }
 
 // EffectiveTimeout returns the delivery command timeout as a duration.
 func (d DeliveryConfig) EffectiveTimeout() time.Duration {
 	return time.Duration(normalizeDeliveryTimeout(d.TimeoutMinutes)) * time.Minute
+}
+
+// EffectiveApprovalTimeout returns the maximum age of a pending delivery
+// approval. It is deliberately separate from the command execution timeout.
+func (d DeliveryConfig) EffectiveApprovalTimeout() time.Duration {
+	minutes := d.ApprovalTimeoutMinutes
+	if minutes <= 0 {
+		minutes = deliveryApprovalTimeoutDefaultMinutes
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// ApprovalDigest binds the exact execution-relevant delivery configuration to
+// the approval without persisting the raw command as an executable payload.
+// Any command, verifier, timeout, mode, target, or rollback drift requires a
+// fresh approval before execution.
+func (d DeliveryConfig) ApprovalDigest() string {
+	parts := []string{
+		string(d.Mode),
+		d.Command,
+		d.VerifyCommand,
+		strconv.Itoa(normalizeDeliveryTimeout(d.TimeoutMinutes)),
+		strconv.Itoa(int(d.EffectiveApprovalTimeout() / time.Minute)),
+		d.Target,
+		d.Rollback,
+		d.TargetLabel,
+		d.VerificationLabel,
+		d.RollbackLabel,
+		d.LocalPath,
+	}
+	var canonical strings.Builder
+	for _, part := range parts {
+		canonical.WriteString(strconv.Itoa(len(part)))
+		canonical.WriteByte(':')
+		canonical.WriteString(part)
+		canonical.WriteByte(';')
+	}
+	sum := sha256.Sum256([]byte(canonical.String()))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // ValidMode reports whether Mode is one of the three modeled delivery modes.
@@ -1942,6 +2017,46 @@ func parse(data []byte) (*Config, error) {
 	if err := validateManagementHome(cfg.ManagementHome); err != nil {
 		return nil, err
 	}
+	if !cfg.Delivery.ValidMode() {
+		return nil, fmt.Errorf("config: delivery.mode %q is invalid (want disabled, approval_required, or automatic)", cfg.Delivery.Mode)
+	}
+	effectiveDelivery := cfg.EffectiveDelivery()
+	if effectiveDelivery.Mode == DeliveryModeApprovalRequired {
+		if strings.TrimSpace(effectiveDelivery.Command) == "" {
+			return nil, fmt.Errorf("config: delivery.command is required when delivery.mode is approval_required")
+		}
+		if !validApprovalDeliveryEntrypoint(effectiveDelivery.Command) {
+			return nil, fmt.Errorf("config: delivery.command must be one repo-relative executable path like ./scripts/deploy.sh when delivery.mode is approval_required (no arguments, whitespace, shell syntax, absolute path, or ..)")
+		}
+		if strings.TrimSpace(effectiveDelivery.VerifyCommand) == "" {
+			return nil, fmt.Errorf("config: delivery.verify_command is required when delivery.mode is approval_required")
+		}
+		if !validApprovalDeliveryEntrypoint(effectiveDelivery.VerifyCommand) {
+			return nil, fmt.Errorf("config: delivery.verify_command must be one repo-relative executable path like ./scripts/verify-delivery.sh when delivery.mode is approval_required (no arguments, whitespace, shell syntax, absolute path, or ..)")
+		}
+		if strings.TrimSpace(effectiveDelivery.TargetLabel) == "" {
+			return nil, fmt.Errorf("config: delivery.target_label is required when delivery.mode is approval_required")
+		}
+		if err := validateDeliverySafeLabel("target_label", effectiveDelivery.TargetLabel, 256); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(effectiveDelivery.VerificationLabel) == "" {
+			return nil, fmt.Errorf("config: delivery.verification_label is required when delivery.mode is approval_required")
+		}
+		if err := validateDeliverySafeLabel("verification_label", effectiveDelivery.VerificationLabel, 512); err != nil {
+			return nil, err
+		}
+		rollbackLabel := strings.TrimSpace(effectiveDelivery.RollbackLabel)
+		if rollbackLabel == "" {
+			return nil, fmt.Errorf("config: delivery.rollback_label is required when delivery.mode is approval_required (use \"none: <reason>\" when rollback is unavailable)")
+		}
+		if err := validateDeliverySafeLabel("rollback_label", effectiveDelivery.RollbackLabel, 512); err != nil {
+			return nil, err
+		}
+		if strings.EqualFold(rollbackLabel, "none") || (strings.HasPrefix(strings.ToLower(rollbackLabel), "none:") && strings.TrimSpace(rollbackLabel[len("none:"):]) == "") {
+			return nil, fmt.Errorf("config: delivery.rollback_label must include a reason after \"none:\" when rollback is unavailable")
+		}
+	}
 
 	// A negative max_live_workers is meaningless; clamp to 0 (legacy: pr_open
 	// counts against max_parallel) so a typo can never silently disable
@@ -2015,6 +2130,11 @@ func parse(data []byte) (*Config, error) {
 		hash := fmt.Sprintf("%x", md5.Sum([]byte(cfg.Repo)))[:12]
 		cfg.StateDir = filepath.Join(os.Getenv("HOME"), ".maestro", hash)
 	}
+	canonicalStateDir, err := canonicalPath(cfg.StateDir)
+	if err != nil {
+		return nil, fmt.Errorf("config: canonicalize state_dir %q: %w", cfg.StateDir, err)
+	}
+	cfg.StateDir = canonicalStateDir
 
 	// Default max_retry_backoff_ms: 300000 (5 minutes)
 	if cfg.MaxRetryBackoffMs <= 0 {
@@ -2253,6 +2373,44 @@ func parse(data []byte) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func validApprovalDeliveryEntrypoint(command string) bool {
+	if command == "" || command != strings.TrimSpace(command) || !strings.HasPrefix(command, "./") {
+		return false
+	}
+	rel := strings.TrimPrefix(command, "./")
+	if rel == "" || pathpkg.IsAbs(rel) || pathpkg.Clean(rel) != rel || strings.HasPrefix(rel, "../") {
+		return false
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	for _, ch := range rel {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '/' || ch == '_' || ch == '-' || ch == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateDeliverySafeLabel(name, value string, maxRunes int) error {
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > maxRunes {
+		return fmt.Errorf("config: delivery.%s must be valid UTF-8 and at most %d characters", name, maxRunes)
+	}
+	for _, ch := range value {
+		if unicode.IsControl(ch) {
+			return fmt.Errorf("config: delivery.%s must not contain control characters", name)
+		}
+		if unicode.Is(unicode.Cf, ch) {
+			return fmt.Errorf("config: delivery.%s must not contain Unicode format characters", name)
+		}
+	}
+	return nil
 }
 
 func normalizeReviewGateStreams(reviewGate string, streams []string) []string {
@@ -2515,7 +2673,8 @@ func (c *Config) Warnings() []string {
 //     default;
 //   - an invalid delivery.mode is rejected loudly rather than silently
 //     resolving to a surprising behavior;
-//   - a delivery block that names no command is inert.
+//   - an automatic delivery block that names no command is inert. The same
+//     omission in approval_required is a hard parse error.
 func (c *Config) deliveryWarnings() []string {
 	if c == nil {
 		return nil
@@ -2533,7 +2692,7 @@ func (c *Config) deliveryWarnings() []string {
 	if eff.Mode == DeliveryModeAutomatic && c.Delivery.configured() {
 		out = append(out, "config: delivery.mode: automatic runs the delivery command with no approval on every qualifying merge — the opt-out from the #872 approval gate. Use delivery.mode: approval_required unless unattended delivery is intended.")
 	}
-	if c.Delivery.configured() && strings.TrimSpace(c.Delivery.Command) == "" && c.Delivery.Mode != DeliveryModeDisabled {
+	if c.Delivery.configured() && strings.TrimSpace(c.Delivery.Command) == "" && eff.Mode == DeliveryModeAutomatic {
 		out = append(out, "config: a delivery: block is set but delivery.command is empty — no delivery will run. Set delivery.command or remove the block.")
 	}
 	return out
@@ -2766,6 +2925,7 @@ func LoadDir(dir string) ([]*Config, error) {
 		return nil, fmt.Errorf("read config dir %s: %w", dir, err)
 	}
 	var cfgs []*Config
+	stateOwners := make(map[string]string)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -2778,12 +2938,53 @@ func LoadDir(dir string) ([]*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", name, err)
 		}
+		if previous, exists := stateOwners[cfg.StateDir]; exists {
+			return nil, fmt.Errorf("load %s: canonical state_dir %q is already used by %s", name, cfg.StateDir, previous)
+		}
+		stateOwners[cfg.StateDir] = name
 		cfgs = append(cfgs, cfg)
 	}
 	if len(cfgs) == 0 {
 		return nil, fmt.Errorf("no config files found in %s", dir)
 	}
 	return cfgs, nil
+}
+
+// canonicalPath returns one stable absolute identity for a path. EvalSymlinks
+// is applied to the deepest existing ancestor so aliases remain canonical even
+// when the final state directory has not been created yet. Delivery claim keys
+// use this value; lexical or symlink aliases must never produce two SQLite rows
+// for the same state.json directory.
+func canonicalPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("path is required")
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	probe := abs
+	var suffix []string
+	for {
+		resolved, evalErr := filepath.EvalSymlinks(probe)
+		if evalErr == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(evalErr) {
+			return "", evalErr
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			// filepath.Abs already produced a stable clean lexical identity;
+			// reaching the root only means no ancestor could be stat'ed.
+			return abs, nil
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
+	}
 }
 
 // ShouldCleanupWorktrees returns whether worktrees should be removed after PR merge.

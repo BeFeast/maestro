@@ -1167,6 +1167,43 @@ func TestLoadDir_SkipsSubdirectories(t *testing.T) {
 	}
 }
 
+func TestParse_CanonicalizesStateDirAliases(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real")
+	if err := os.MkdirAll(realParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(root, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	realCfg, err := parse([]byte(fmt.Sprintf("repo: owner/real\nstate_dir: %s/.\n", filepath.Join(realParent, "state"))))
+	if err != nil {
+		t.Fatalf("parse real: %v", err)
+	}
+	aliasCfg, err := parse([]byte(fmt.Sprintf("repo: owner/alias\nstate_dir: %s\n", filepath.Join(aliasParent, "state"))))
+	if err != nil {
+		t.Fatalf("parse alias: %v", err)
+	}
+	if realCfg.StateDir != aliasCfg.StateDir {
+		t.Fatalf("canonical state dirs differ: real=%q alias=%q", realCfg.StateDir, aliasCfg.StateDir)
+	}
+}
+
+func TestLoadDir_RejectsDuplicateCanonicalStateDir(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.WriteFile(filepath.Join(dir, "a.yaml"), []byte(fmt.Sprintf("repo: owner/a\nstate_dir: %s\n", stateDir)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.yaml"), []byte(fmt.Sprintf("repo: owner/b\nstate_dir: %s/.\n", stateDir)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDir(dir); err == nil || !strings.Contains(err.Error(), "canonical state_dir") {
+		t.Fatalf("LoadDir duplicate error = %v, want canonical state_dir rejection", err)
+	}
+}
+
 func TestParse_DeployCmdEmpty(t *testing.T) {
 	yaml := `repo: owner/repo`
 	cfg, err := parse([]byte(yaml))
