@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,6 +91,7 @@ func TestCollectMaterialProgressObservations_PROpenNeverCarriesProcessIdentity(t
 		PID: 999, TmuxSession: "stale-tmux", StartedAt: now.Add(-time.Hour),
 		ReviewPendingHeadSHA: "abc123", LastNotifiedStatus: "ci_pending",
 	}
+	recordTestPRGateSnapshot(t, st, 44, 893, strings.Repeat("a", 40), now)
 	observations := collectMaterialProgressObservations(st, now)
 	if len(observations) != 1 {
 		t.Fatalf("observations = %d, want one PR gate", len(observations))
@@ -129,6 +131,7 @@ func TestCollectMaterialProgressObservations_QueuedRemainsAnActivePRGate(t *test
 		PID: 999, TmuxSession: "stale-tmux", StartedAt: now.Add(-time.Hour),
 		ReviewPendingHeadSHA: "abc123", LastNotifiedStatus: "merge_queued",
 	}
+	recordTestPRGateSnapshot(t, st, 44, 893, strings.Repeat("a", 40), now)
 	observations := collectMaterialProgressObservations(st, now)
 	if len(observations) != 1 {
 		t.Fatalf("observations = %d, want one queued PR gate", len(observations))
@@ -142,6 +145,27 @@ func TestCollectMaterialProgressObservations_QueuedRemainsAnActivePRGate(t *test
 	}
 }
 
+func TestCollectMaterialProgressObservations_PartialOrWrongProjectPRSnapshotIsIncomplete(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	st.Sessions["slot-pr"] = &state.Session{
+		IssueNumber: 44, Status: state.StatusPROpen, PRNumber: 893, StartedAt: now.Add(-time.Hour),
+	}
+	if _, _, err := st.RecordPRGateTransition(state.PRGateTransition{
+		Project: "owner/repo", IssueNumber: 44, PRNumber: 893, HeadSHA: strings.Repeat("a", 40),
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	partial := collectMaterialProgressObservationsForProject(st, "owner/repo", now)
+	if len(partial) != 1 || !partial[0].Incomplete || !signalKindListed(partial[0].UnavailableSignals, progress.SignalPRReview) {
+		t.Fatalf("head-only PR snapshot was not explicit incomplete evidence: %+v", partial)
+	}
+	wrongProject := collectMaterialProgressObservationsForProject(st, "other/repo", now)
+	if len(wrongProject) != 1 || !wrongProject[0].Incomplete || signalKindPresent(wrongProject[0].Signals, progress.SignalPRReview) {
+		t.Fatalf("different-project PR snapshot was accepted: %+v", wrongProject)
+	}
+}
+
 func TestCollectMaterialProgressObservations_CodeLandedHasPostMergeOutcomeTarget(t *testing.T) {
 	st := state.NewState()
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
@@ -149,6 +173,12 @@ func TestCollectMaterialProgressObservations_CodeLandedHasPostMergeOutcomeTarget
 	st.Sessions["slot-pr"] = &state.Session{
 		IssueNumber: 44, Status: state.StatusCodeLanded, PRNumber: 893,
 		PID: 999, TmuxSession: "stale-tmux", StartedAt: now.Add(-2 * time.Hour), FinishedAt: &landedAt,
+	}
+	if _, _, err := st.RecordPRGateTransition(state.PRGateTransition{
+		Project: "owner/repo", IssueNumber: 44, PRNumber: 893, HeadSHA: strings.Repeat("a", 40),
+		MergeObserved: true, MergeCommitSHA: strings.Repeat("f", 40), MergedAt: landedAt,
+	}, landedAt); err != nil {
+		t.Fatal(err)
 	}
 	st.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, Signal: "healthcheck", ExitCode: 1, CheckedAt: now}
 	observations := collectMaterialProgressObservations(st, now)
@@ -200,6 +230,132 @@ func TestCollectMaterialProgressObservations_CodeLandedHasPostMergeOutcomeTarget
 	}
 	if len(decisions) != 1 || decisions[0].Action != progress.ActionNone {
 		t.Fatalf("semantic outcome transition did not advance post-merge target: %+v", decisions)
+	}
+}
+
+func TestCollectMaterialProgressObservations_AuthoritativePRGateTransitionsAdvanceWatermark(t *testing.T) {
+	st := state.NewState()
+	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	headA := strings.Repeat("a", 40)
+	headB := strings.Repeat("b", 40)
+	st.Sessions["slot-pr"] = &state.Session{
+		IssueNumber: 887, Status: state.StatusPROpen, PRNumber: 7, StartedAt: t0.Add(-time.Hour),
+		LastNotifiedStatus: "ci_pending", ReviewPendingHeadSHA: "legacy-timer-head",
+	}
+	pendingTransition := state.PRGateTransition{
+		Project: "owner/repo", IssueNumber: 887, PRNumber: 7, HeadSHA: headA,
+		CIObserved: true, CIRollupVerdict: state.PRGateCIPending, CIEffectiveVerdict: state.PRGateCIPending,
+		CheckRollupObserved: true, CheckRollupFingerprint: strings.Repeat("1", 16),
+	}
+	if _, _, err := st.RecordPRGateTransition(pendingTransition, t0); err != nil {
+		t.Fatal(err)
+	}
+	pending := onlyPRGateObservation(t, st, t0)
+	if pending.Incomplete {
+		t.Fatalf("authoritative pending snapshot was incomplete: %+v", pending)
+	}
+	if _, err := st.RecordMaterialProgress([]progress.Observation{pending}, 20*time.Minute, time.Minute, t0); err != nil {
+		t.Fatal(err)
+	}
+	targetKey := pending.Target.Key()
+	lastAt := materialProgressWatermarkAt(t, st, targetKey)
+
+	// Notification dedup and the Greptile pending/retrigger clock are control
+	// bookkeeping, not authoritative forge progress. Churning only those fields
+	// must leave both the exact signal and durable watermark unchanged.
+	st.Sessions["slot-pr"].LastNotifiedStatus = "merge_failed"
+	st.Sessions["slot-pr"].ReviewPendingHeadSHA = "another-timer-head"
+	timerNow := t0.Add(time.Minute)
+	timerOnly := onlyPRGateObservation(t, st, timerNow)
+	if timerOnly.Signals.Combined() != pending.Signals.Combined() {
+		t.Fatalf("notification/timer bookkeeping changed PR signal: before=%+v after=%+v", pending.Signals, timerOnly.Signals)
+	}
+	if _, err := st.RecordMaterialProgress([]progress.Observation{timerOnly}, 20*time.Minute, time.Minute, timerNow); err != nil {
+		t.Fatal(err)
+	}
+	if got := materialProgressWatermarkAt(t, st, targetKey); !got.Equal(lastAt) {
+		t.Fatalf("notification/timer bookkeeping advanced watermark: before=%s after=%s", lastAt, got)
+	}
+
+	greenTransition := pendingTransition
+	greenTransition.CIRollupVerdict = state.PRGateCISuccess
+	greenTransition.CIEffectiveVerdict = state.PRGateCISuccess
+	greenTransition.CheckRollupFingerprint = strings.Repeat("2", 16)
+	greenTransition.ReviewObserved = true
+	greenTransition.ReviewDecision = state.PRGateReviewDisabled
+	greenTransition.ReviewVerdictFingerprint = strings.Repeat("6", 16)
+	greenAt := t0.Add(2 * time.Minute)
+	if _, _, err := st.RecordPRGateTransition(greenTransition, greenAt); err != nil {
+		t.Fatal(err)
+	}
+	green := onlyPRGateObservation(t, st, greenAt)
+	if green.Target.Key() != targetKey || green.Signals.Combined() == timerOnly.Signals.Combined() {
+		t.Fatalf("pending->green changed lease or missed progress: pending=%+v green=%+v", pending, green)
+	}
+	if _, err := st.RecordMaterialProgress([]progress.Observation{green}, 20*time.Minute, time.Minute, greenAt); err != nil {
+		t.Fatal(err)
+	}
+	lastAt = assertMaterialProgressWatermarkAt(t, st, targetKey, greenAt)
+
+	newHeadTransition := pendingTransition
+	newHeadTransition.HeadSHA = headB
+	newHeadTransition.CheckRollupFingerprint = strings.Repeat("3", 16)
+	headAt := t0.Add(3 * time.Minute)
+	if _, _, err := st.RecordPRGateTransition(newHeadTransition, headAt); err != nil {
+		t.Fatal(err)
+	}
+	newHead := onlyPRGateObservation(t, st, headAt)
+	if newHead.Target.Key() != targetKey || newHead.Signals.Combined() == green.Signals.Combined() {
+		t.Fatalf("head transition changed stable PR lease or missed progress: green=%+v head=%+v", green, newHead)
+	}
+	if _, err := st.RecordMaterialProgress([]progress.Observation{newHead}, 20*time.Minute, time.Minute, headAt); err != nil {
+		t.Fatal(err)
+	}
+	lastAt = assertMaterialProgressWatermarkAt(t, st, targetKey, headAt)
+
+	feedbackAt := t0.Add(4 * time.Minute)
+	if _, _, err := st.RecordPRGateTransition(state.PRGateTransition{
+		Project: "owner/repo", IssueNumber: 887, PRNumber: 7, HeadSHA: headB,
+		ReviewObserved: true, ReviewDecision: state.PRGateReviewBlocked,
+		ReviewVerdictFingerprint:      strings.Repeat("4", 16),
+		ActionableFindingsFingerprint: strings.Repeat("5", 16), ActionableFindingsCount: 1,
+	}, feedbackAt); err != nil {
+		t.Fatal(err)
+	}
+	feedback := onlyPRGateObservation(t, st, feedbackAt)
+	if feedback.Signals.Combined() == newHead.Signals.Combined() {
+		t.Fatal("actionable late-review feedback did not change PR signal")
+	}
+	if _, err := st.RecordMaterialProgress([]progress.Observation{feedback}, 20*time.Minute, time.Minute, feedbackAt); err != nil {
+		t.Fatal(err)
+	}
+	lastAt = assertMaterialProgressWatermarkAt(t, st, targetKey, feedbackAt)
+
+	mergeAt := t0.Add(5 * time.Minute)
+	if _, _, err := st.RecordPRGateTransition(state.PRGateTransition{
+		Project: "owner/repo", IssueNumber: 887, PRNumber: 7, HeadSHA: headB,
+		MergeObserved: true, MergeCommitSHA: strings.Repeat("f", 40), MergedAt: mergeAt,
+	}, mergeAt); err != nil {
+		t.Fatal(err)
+	}
+	merged := onlyPRGateObservation(t, st, mergeAt)
+	if merged.Signals.Combined() == feedback.Signals.Combined() {
+		t.Fatal("merge identity did not change PR signal")
+	}
+	if _, err := st.RecordMaterialProgress([]progress.Observation{merged}, 20*time.Minute, time.Minute, mergeAt); err != nil {
+		t.Fatal(err)
+	}
+	if got := assertMaterialProgressWatermarkAt(t, st, targetKey, mergeAt); !got.After(lastAt) {
+		t.Fatalf("merge transition did not advance watermark: before=%s after=%s", lastAt, got)
+	}
+
+	// Production immediately moves the session to code_landed. The distinct
+	// post-merge target must carry the same authoritative merge snapshot rather
+	// than inventing a second PR-gate target.
+	st.Sessions["slot-pr"].Status = state.StatusCodeLanded
+	postMerge := collectMaterialProgressObservations(st, mergeAt.Add(time.Minute))
+	if len(postMerge) != 1 || postMerge[0].Target.Kind != progress.TargetPostMerge || !signalKindPresent(postMerge[0].Signals, progress.SignalPRReview) {
+		t.Fatalf("post-merge target did not inherit merge identity: %+v", postMerge)
 	}
 }
 
@@ -573,6 +729,45 @@ func onlyDeliveryObservation(t *testing.T, st *state.State, now time.Time) progr
 		t.Fatalf("delivery observations = %+v, want exactly one delivery", observations)
 	}
 	return observations[0]
+}
+
+func onlyPRGateObservation(t *testing.T, st *state.State, now time.Time) progress.Observation {
+	t.Helper()
+	observations := collectMaterialProgressObservations(st, now)
+	if len(observations) != 1 || observations[0].Target.Kind != progress.TargetPRGate {
+		t.Fatalf("PR-gate observations = %+v, want exactly one PR gate", observations)
+	}
+	return observations[0]
+}
+
+func recordTestPRGateSnapshot(t *testing.T, st *state.State, issueNumber, prNumber int, headSHA string, now time.Time) state.PRGateSnapshot {
+	t.Helper()
+	snapshot, _, err := st.RecordPRGateTransition(state.PRGateTransition{
+		Project: "owner/repo", IssueNumber: issueNumber, PRNumber: prNumber, HeadSHA: headSHA,
+		CIObserved: true, CIRollupVerdict: state.PRGateCIPending, CIEffectiveVerdict: state.PRGateCIPending,
+		CheckRollupObserved: true, CheckRollupFingerprint: strings.Repeat("1", 16),
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func materialProgressWatermarkAt(t *testing.T, st *state.State, key string) time.Time {
+	t.Helper()
+	if st.MaterialProgress == nil || st.MaterialProgress.Targets[key] == nil {
+		t.Fatalf("missing material-progress target %q: %+v", key, st.MaterialProgress)
+	}
+	return st.MaterialProgress.Targets[key].Watermark.At
+}
+
+func assertMaterialProgressWatermarkAt(t *testing.T, st *state.State, key string, want time.Time) time.Time {
+	t.Helper()
+	got := materialProgressWatermarkAt(t, st, key)
+	if !got.Equal(want) {
+		t.Fatalf("watermark at = %s, want %s", got, want)
+	}
+	return got
 }
 
 func initMaterialProgressGitRepo(t *testing.T) string {

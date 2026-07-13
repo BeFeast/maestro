@@ -1237,6 +1237,12 @@ type State struct {
 	// short SHA observed when the decision was recorded.
 	ReviewRepairTracks map[string]ReviewRepairTrack `json:"review_repair_tracks,omitempty"`
 
+	// PRGateSnapshots is the authoritative, durable PR/CI/review/merge progress
+	// observed by the orchestrator (#887). Each value is keyed by the exact
+	// project+issue+PR+head+generation identity; notification-dedup and review
+	// re-trigger timer fields deliberately never enter this map.
+	PRGateSnapshots map[string]PRGateSnapshot `json:"pr_gate_snapshots,omitempty"`
+
 	// SpecLintTracks records the last spec-lint result per issue (#851),
 	// keyed by issue number (project scope is the state.json file itself).
 	// The supervisor lints an issue at most once per body change by comparing
@@ -1419,6 +1425,7 @@ func NewState() *State {
 		ProjectStatusSync: make(map[int]ProjectStatusSync),
 		BackendHealth:     make(map[string]BackendHealth),
 		SpecLintTracks:    make(map[int]SpecLintTrack),
+		PRGateSnapshots:   make(map[string]PRGateSnapshot),
 		NextSlot:          1,
 	}
 }
@@ -1677,6 +1684,9 @@ func (s *State) normalize() {
 	if s.SpecLintTracks == nil {
 		s.SpecLintTracks = make(map[int]SpecLintTrack)
 	}
+	if s.PRGateSnapshots == nil {
+		s.PRGateSnapshots = make(map[string]PRGateSnapshot)
+	}
 	if s.NextSlot == 0 {
 		s.NextSlot = 1
 	}
@@ -1693,6 +1703,7 @@ func (s *State) copyFrom(src *State) {
 	s.BackendHealth = src.BackendHealth
 	s.BackendQuotaUsage = src.BackendQuotaUsage
 	s.SpecLintTracks = src.SpecLintTracks
+	s.PRGateSnapshots = src.PRGateSnapshots
 	s.SpecGroomCursor = src.SpecGroomCursor
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
@@ -1743,6 +1754,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
+	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
 	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)

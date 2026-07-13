@@ -39,7 +39,7 @@ func recordMaterialProgress(cfg *config.Config, st *state.State, now time.Time) 
 	}
 	var observations []progress.Observation
 	if budget > 0 {
-		observations = collectMaterialProgressObservations(st, now)
+		observations = collectMaterialProgressObservationsForProject(st, cfg.Repo, now)
 	}
 	decisions, err := st.RecordMaterialProgress(observations, budget, interval, now)
 	if err != nil {
@@ -69,6 +69,10 @@ func recordMaterialProgress(cfg *config.Config, st *state.State, now time.Time) 
 // Signals contain only non-reversible digests. A failed bounded worktree or
 // checkpoint read is absent evidence, never a fabricated progress event.
 func collectMaterialProgressObservations(st *state.State, now time.Time) []progress.Observation {
+	return collectMaterialProgressObservationsForProject(st, "", now)
+}
+
+func collectMaterialProgressObservationsForProject(st *state.State, project string, now time.Time) []progress.Observation {
 	if st == nil {
 		return nil
 	}
@@ -87,15 +91,15 @@ func collectMaterialProgressObservations(st *state.State, now time.Time) []progr
 		}
 		switch sess.Status {
 		case state.StatusRunning:
-			if observation, ok := workerProgressObservation(slot, sess, now); ok {
+			if observation, ok := workerProgressObservation(st, project, slot, sess, now); ok {
 				observations = append(observations, observation)
 			}
 		case state.StatusPROpen, state.StatusQueued:
-			if observation, ok := prGateProgressObservation(slot, sess, now); ok {
+			if observation, ok := prGateProgressObservation(st, project, slot, sess, now); ok {
 				observations = append(observations, observation)
 			}
 		case state.StatusCodeLanded:
-			if observation, ok := postMergeProgressObservation(st, slot, sess, now); ok {
+			if observation, ok := postMergeProgressObservation(st, project, slot, sess, now); ok {
 				observations = append(observations, observation)
 			}
 		}
@@ -108,7 +112,7 @@ func collectMaterialProgressObservations(st *state.State, now time.Time) []progr
 	return observations
 }
 
-func workerProgressObservation(slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
+func workerProgressObservation(st *state.State, project, slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
 	if sess == nil || sess.IssueNumber <= 0 || sess.PID <= 0 {
 		return progress.Observation{}, false
 	}
@@ -147,8 +151,13 @@ func workerProgressObservation(slot string, sess *state.Session, now time.Time) 
 	if !worktreeComplete {
 		unavailable = append(unavailable, progress.SignalWorktreeGit)
 	}
-	if pr := prReviewFingerprint(sess); pr != "" {
+	if pr, complete := prReviewFingerprint(st, project, sess); pr != "" {
 		signals = append(signals, materialProgressSignal(progress.SignalPRReview, now, pr))
+		if !complete {
+			unavailable = append(unavailable, progress.SignalPRReview)
+		}
+	} else if !complete {
+		unavailable = append(unavailable, progress.SignalPRReview)
 	}
 	return progress.Observation{
 		Target: target, Signals: signals, Phase: progress.PhasePreDelivery,
@@ -156,7 +165,7 @@ func workerProgressObservation(slot string, sess *state.Session, now time.Time) 
 	}, true
 }
 
-func prGateProgressObservation(slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
+func prGateProgressObservation(st *state.State, project, slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
 	if sess == nil || sess.IssueNumber <= 0 {
 		return progress.Observation{}, false
 	}
@@ -182,13 +191,22 @@ func prGateProgressObservation(slot string, sess *state.Session, now time.Time) 
 			fmt.Sprintf("status=%s", sess.Status), fmt.Sprintf("retry=%d", sess.RetryCount),
 			fmt.Sprintf("maintenance_retry=%d", sess.MaintenanceRetryCount)),
 	}
-	if pr := prReviewFingerprint(sess); pr != "" {
+	var unavailable []progress.SignalKind
+	if pr, complete := prReviewFingerprint(st, project, sess); pr != "" {
 		signals = append(signals, materialProgressSignal(progress.SignalPRReview, now, pr))
+		if !complete {
+			unavailable = append(unavailable, progress.SignalPRReview)
+		}
+	} else if !complete {
+		unavailable = append(unavailable, progress.SignalPRReview)
 	}
-	return progress.Observation{Target: target, Signals: signals, Phase: progress.PhasePRGate}, true
+	return progress.Observation{
+		Target: target, Signals: signals, Phase: progress.PhasePRGate,
+		Incomplete: len(unavailable) > 0, UnavailableSignals: unavailable,
+	}, true
 }
 
-func postMergeProgressObservation(st *state.State, slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
+func postMergeProgressObservation(st *state.State, project, slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
 	if sess == nil || sess.IssueNumber <= 0 {
 		return progress.Observation{}, false
 	}
@@ -218,7 +236,19 @@ func postMergeProgressObservation(st *state.State, slot string, sess *state.Sess
 		materialProgressSignal(progress.SignalOutcomeVerification, now,
 			postMergeOutcomeFingerprint(st, sess)),
 	}
-	return progress.Observation{Target: target, Signals: signals, Phase: progress.PhasePostMergeVerification}, true
+	var unavailable []progress.SignalKind
+	if pr, complete := prReviewFingerprint(st, project, sess); pr != "" {
+		signals = append(signals, materialProgressSignal(progress.SignalPRReview, now, pr))
+		if !complete {
+			unavailable = append(unavailable, progress.SignalPRReview)
+		}
+	} else if !complete {
+		unavailable = append(unavailable, progress.SignalPRReview)
+	}
+	return progress.Observation{
+		Target: target, Signals: signals, Phase: progress.PhasePostMergeVerification,
+		Incomplete: len(unavailable) > 0, UnavailableSignals: unavailable,
+	}, true
 }
 
 // postMergeOutcomeFingerprint includes semantic merge/deploy/outcome evidence
@@ -341,16 +371,45 @@ func tmuxProgressFingerprint(session string) (string, bool) {
 	return progress.Fingerprint(stdout.buf.String()), true
 }
 
-func prReviewFingerprint(sess *state.Session) string {
-	if sess == nil || (sess.PRNumber == 0 && strings.TrimSpace(sess.ReviewPendingHeadSHA) == "" && strings.TrimSpace(sess.LastNotifiedStatus) == "") {
-		return ""
+func prReviewFingerprint(st *state.State, project string, sess *state.Session) (string, bool) {
+	if sess == nil || sess.PRNumber <= 0 {
+		return "", true
 	}
-	return progress.Fingerprint(
-		fmt.Sprintf("pr=%d", sess.PRNumber),
-		"head="+strings.TrimSpace(sess.ReviewPendingHeadSHA),
-		"notified="+strings.TrimSpace(sess.LastNotifiedStatus),
-		"visual="+strings.TrimSpace(sess.VisualEvidence),
+	snapshot, ok := st.LatestPRGateSnapshot(strings.TrimSpace(project), sess.IssueNumber, sess.PRNumber)
+	if !ok {
+		return "", false
+	}
+	fingerprint := progress.Fingerprint(
+		"snapshot="+snapshot.Key(),
+		"project="+snapshot.Project,
+		fmt.Sprintf("issue=%d", snapshot.IssueNumber),
+		fmt.Sprintf("pr=%d", snapshot.PRNumber),
+		"head="+snapshot.HeadSHA,
+		fmt.Sprintf("generation=%d", snapshot.Generation),
+		"ci_rollup="+string(snapshot.CIRollupVerdict),
+		"ci_effective="+string(snapshot.CIEffectiveVerdict),
+		"checks="+snapshot.CheckRollupFingerprint,
+		"review="+string(snapshot.ReviewDecision),
+		"review_verdict="+snapshot.ReviewVerdictFingerprint,
+		"findings="+snapshot.ActionableFindingsFingerprint,
+		fmt.Sprintf("findings_count=%d", snapshot.ActionableFindingsCount),
+		fmt.Sprintf("feedback_generation=%d", snapshot.FeedbackGeneration),
+		"merge="+snapshot.MergeCommitSHA,
 	)
+	return fingerprint, prGateSnapshotComplete(snapshot, sess.Status)
+}
+
+func prGateSnapshotComplete(snapshot state.PRGateSnapshot, status state.SessionStatus) bool {
+	if status == state.StatusCodeLanded || snapshot.MergeCommitSHA != "" {
+		return snapshot.MergeCommitSHA != "" && !snapshot.MergedAt.IsZero()
+	}
+	if snapshot.CheckRollupFingerprint == "" || snapshot.CIRollupVerdict == state.PRGateCIUnknown || snapshot.CIEffectiveVerdict == state.PRGateCIUnknown {
+		return false
+	}
+	if snapshot.CIEffectiveVerdict == state.PRGateCISuccess && snapshot.ReviewDecision == state.PRGateReviewUnknown {
+		return false
+	}
+	return true
 }
 
 func deliveryProgressObservations(st *state.State, now time.Time) []progress.Observation {

@@ -136,6 +136,17 @@ stored — each is derived from `target.watermark.at + current_budget`, so reloa
 does not reset it. Concurrent writes merge per exact target; actual recovery
 attempt/results are unioned independently from evaluator verdicts.
 
+PR-gate evidence is first persisted separately in `pr_gate_snapshots`, keyed by
+the exact project, issue, PR, current head SHA, and semantic generation. The
+orchestrator advances that generation only for an actual head change,
+CI/per-check rollup or effective-verdict transition, review decision or
+actionable-finding generation, or immutable merge identity. The supervisor then
+hashes the newest exact snapshot into `pr_review`. Notification dedup fields and
+the Greptile pending/retrigger clock are intentionally excluded: changing either
+without a forge transition does not refresh the watchdog watermark. Check/review
+details are persisted only as bounded opaque digests; raw output, review text,
+paths, URLs, and credentials never enter the snapshot.
+
 Per-signal ages track when each signal last changed (not the evaluation time):
 an unchanged signal carries its prior observation time forward, so operators can
 see which specific signal stopped advancing even while the combined watermark is
