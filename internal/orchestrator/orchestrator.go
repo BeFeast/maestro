@@ -2448,6 +2448,14 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 		// floors. Failures are logged inside the helper.
 		o.compactTerminalSessionsOnStartup()
 
+		// #888: inventory and scrub provider-credential material a pre-fix daemon
+		// left in the state dir — remove stale per-worker `*-run.env` copies,
+		// strip inlined credential exports from legacy `*-run.sh`, redact
+		// write-once prompts, inventory logs, and repair permissions. A pure
+		// file-content/mode pass — it never touches a running worker process, so
+		// it cannot repeat the #877 control-group kill.
+		worker.ScrubLegacyRunArtifacts(o.cfg.StateDir)
+
 		// #794: de-phase this flow from the rest of the fleet before the first
 		// cycle. The daemon starts all flows in a tight loop and each anchors
 		// its poll ticker to its first RunOnce, so without a phase offset the 8
