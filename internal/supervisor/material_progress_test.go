@@ -450,11 +450,15 @@ cat "$TMUX_FAKE_OUTPUT"
 	t.Setenv("TMUX_FAKE_OUTPUT", outputPath)
 
 	wt := initMaterialProgressGitRepo(t)
+	checkpointPath := filepath.Join(bin, "CHECKPOINT.md")
+	if err := os.WriteFile(checkpointPath, []byte("checkpoint frozen\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	st := state.NewState()
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	st.Sessions["slot"] = &state.Session{
 		IssueNumber: 7, Status: state.StatusRunning, PID: 77, TmuxSession: "mae-exact",
-		StartedAt: t0.Add(-time.Hour), LastOutputHash: "persisted-frozen", Worktree: wt,
+		StartedAt: t0.Add(-time.Hour), LastOutputHash: "persisted-frozen", Worktree: wt, CheckpointFile: checkpointPath,
 	}
 	first := collectMaterialProgressObservations(st, t0)
 	if len(first) != 1 || first[0].Incomplete {

@@ -133,14 +133,18 @@ func workerProgressObservation(slot string, sess *state.Session, now time.Time) 
 			fmt.Sprintf("pid=%d", sess.PID), "tmux="+strings.TrimSpace(sess.TmuxSession), "session="+sessionID),
 	}
 	var unavailable []progress.SignalKind
-	if terminal, complete := terminalCheckpointProgress(sess); terminal != "" {
+	terminal, terminalComplete := terminalCheckpointProgress(sess)
+	if terminal != "" && terminalComplete {
 		signals = append(signals, materialProgressSignal(progress.SignalTerminalCheckpoint, now, terminal))
-	} else if !complete {
+	}
+	if !terminalComplete {
 		unavailable = append(unavailable, progress.SignalTerminalCheckpoint)
 	}
-	if worktree, complete := worktreeProgressProbe(sess.Worktree); worktree != "" {
+	worktree, worktreeComplete := worktreeProgressProbe(sess.Worktree)
+	if worktree != "" {
 		signals = append(signals, materialProgressSignal(progress.SignalWorktreeGit, now, worktree))
-	} else if !complete {
+	}
+	if !worktreeComplete {
 		unavailable = append(unavailable, progress.SignalWorktreeGit)
 	}
 	if pr := prReviewFingerprint(sess); pr != "" {

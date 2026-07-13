@@ -46,10 +46,10 @@ import (
 // signal before the watchdog recommends an action.
 const DefaultMaxSilence = 20 * time.Minute
 
-// ContractVersion is the fingerprint-bound capability contract name emitted by
-// genesis/lifecycle templates only after runtime canary evidence proves the
-// multi-signal watchdog. Until then the capability stays a visible promotion
-// blocker (#887).
+// ContractVersion names the fingerprint-bound capability that may be published
+// only after runtime canary evidence proves the multi-signal watchdog. Maestro's
+// own genesis does not auto-publish it; until then the capability stays a visible
+// promotion blocker (#887).
 const ContractVersion = "multi-signal-progress-v1"
 
 // SignalKind identifies one phase-appropriate progress signal. The watchdog

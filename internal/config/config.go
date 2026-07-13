@@ -1672,15 +1672,15 @@ func (c SessionRetentionConfig) EffectiveArchiveFile(stateDir string) string {
 // executing/uncertain delivery lease is surfaced for operator reconciliation
 // and never replayed (#872).
 type StalledProgressWatchdogConfig struct {
-	Enabled           *bool `yaml:"enabled,omitempty"`               // explicit opt-in; lifecycle/genesis templates set true for hands-off projects
+	Enabled           *bool `yaml:"enabled,omitempty"`               // explicit opt-in; external lifecycle tooling may set true only after accepted runtime evidence
 	MaxSilenceMinutes int   `yaml:"max_silence_minutes,omitempty"`   // default: 20 (0 = default; negative = disabled)
 	EvalIntervalSecs  int   `yaml:"eval_interval_seconds,omitempty"` // watchdog evaluation cadence; default: 60
 }
 
 // IsEnabled reports whether the stalled-progress watchdog is explicitly
 // enabled. Missing config is inactive: upgrading Maestro must not silently arm
-// recovery across every legacy project. Lifecycle/genesis templates opt new
-// hands-off projects in with enabled: true.
+// recovery across every legacy project. Maestro's own genesis does not
+// auto-enable it; evidence-gated external lifecycle tooling may opt in.
 func (c StalledProgressWatchdogConfig) IsEnabled() bool {
 	if c.Enabled == nil {
 		return false

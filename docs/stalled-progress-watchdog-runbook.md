@@ -72,7 +72,7 @@ as a completed recovery.
 
 ```yaml
 stalled_progress_watchdog:
-  enabled: true              # explicit opt-in; lifecycle/genesis sets this
+  enabled: true              # explicit opt-in after accepted runtime evidence
   max_silence_minutes: 20    # 0 = default (20); negative or enabled:false = disabled
   eval_interval_seconds: 60  # watchdog evaluation cadence
 ```
@@ -85,7 +85,9 @@ All three knobs are fleet-controllable (`maestro settings`):
 
 Missing watchdog config is inactive. This is an upgrade-safety boundary: a new
 binary never arms recovery fleet-wide for legacy projects. New hands-off
-projects opt in explicitly through lifecycle/genesis. A legacy-only
+projects do not opt in automatically through Maestro's own genesis. External
+lifecycle tooling may emit this nested stanza only after its accepted #897
+evidence prerequisite is satisfied. A legacy-only
 `worker_silent_timeout_minutes: N` is migrated in memory to enabled v1 with the
 same `N`-minute budget; explicit `enabled: false` retains the legacy detector as
 a compatibility escape hatch. Any other explicit v1 stanza suppresses legacy,
@@ -143,11 +145,12 @@ Fleet never raises a false overdue alert before the next evaluation.
 
 ## Promotion gate
 
-The fingerprint-bound `multi-signal-progress-v1` contract is emitted by
-genesis/lifecycle templates only after runtime canary evidence. Until a project
-is live-proven, the capability stays a visible promotion blocker and the
-lifecycle planner fails closed — it does not emit the unsafe legacy
-`worker_silent_timeout_minutes` for new projects.
+The fingerprint-bound `multi-signal-progress-v1` contract may be published only
+after runtime canary evidence. Maestro's own genesis does not currently add the
+watchdog stanza or publish the contract automatically. Evidence-gated external
+lifecycle tooling may emit the nested v1 config after the #897 prerequisite is
+accepted; while pending it omits actuation and never emits the unsafe legacy
+`worker_silent_timeout_minutes` key.
 
 Fleet reports evaluator `mode` separately, while `contract` remains empty and
 `contract_pending=true` until a durable canary-proof source exists (#896/#897).
