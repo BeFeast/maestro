@@ -132,6 +132,7 @@ type Orchestrator struct {
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn               func(prNumber int) (string, error)
+	ghPRCheckRollupFn            func(prNumber int) (github.PRCheckRollup, error)
 	ghPRMergeStatusFn            func(prNumber int) (mergeable string, mergeStateStatus string, err error)
 	ghPRGreptileApprovedFn       func(prNumber int) (approved bool, pending bool, err error)
 	ghPRReviewGateVerdictFn      func(prNumber int, streams []string) (github.ReviewGateVerdict, error)
@@ -495,6 +496,23 @@ func (o *Orchestrator) prCIStatus(prNumber int) (string, error) {
 	return o.gh.PRCIStatus(prNumber)
 }
 
+func (o *Orchestrator) prCheckRollup(prNumber int) (github.PRCheckRollup, error) {
+	if o.ghPRCheckRollupFn != nil {
+		return o.ghPRCheckRollupFn(prNumber)
+	}
+	// Keep existing test/integration hooks source-compatible. A legacy hook has
+	// no authoritative head or per-check identity, so it may drive merge logic
+	// but deliberately cannot mint a durable PR-gate snapshot.
+	if o.ghPRCIStatusFn != nil {
+		verdict, err := o.ghPRCIStatusFn(prNumber)
+		return github.PRCheckRollup{Verdict: verdict}, err
+	}
+	if o.gh == nil {
+		return github.PRCheckRollup{Verdict: "unknown"}, fmt.Errorf("no github client configured for PR check rollup")
+	}
+	return o.gh.PRCheckRollup(prNumber)
+}
+
 // prMergeStatus returns GitHub's per-PR mergeable verdict together with the
 // raw mergeable_state ("clean" / "unstable" / "blocked" / "behind" / "dirty"
 // / "" / "unknown" / "draft" / "has_hooks"). It mirrors the supervisor's
@@ -523,7 +541,14 @@ func (o *Orchestrator) prReviewGateVerdict(prNumber int) (github.ReviewGateVerdi
 	if len(streams) == 0 {
 		return github.ReviewGateVerdict{Passed: true}, nil
 	}
-	if len(streams) == 1 && streams[0] == "greptile" {
+	if o.ghPRReviewGateVerdictFn != nil {
+		return o.ghPRReviewGateVerdictFn(prNumber, streams)
+	}
+	// Preserve the narrow legacy test hook, but let the production aggregate
+	// reader return its structured actionable findings. The bool-only Greptile
+	// verdict cannot distinguish a new late finding while the aggregate decision
+	// remains blocked, so it is insufficient for the durable PR-gate snapshot.
+	if len(streams) == 1 && streams[0] == "greptile" && o.ghPRGreptileApprovedFn != nil {
 		approved, pending, err := o.prGreptileApproved(prNumber)
 		if err != nil {
 			return github.ReviewGateVerdict{}, err
@@ -538,8 +563,8 @@ func (o *Orchestrator) prReviewGateVerdict(prNumber int) (github.ReviewGateVerdi
 			}},
 		}, nil
 	}
-	if o.ghPRReviewGateVerdictFn != nil {
-		return o.ghPRReviewGateVerdictFn(prNumber, streams)
+	if o.gh == nil {
+		return github.ReviewGateVerdict{}, fmt.Errorf("no github client configured for PR review gate")
 	}
 	return o.gh.PRReviewGateVerdict(prNumber, streams)
 }
@@ -2644,6 +2669,12 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		changed = append(changed, fmt.Sprintf("max_retries_per_issue: %d→%d", old.MaxRetriesPerIssue, newCfg.MaxRetriesPerIssue))
 		o.cfg.MaxRetriesPerIssue = newCfg.MaxRetriesPerIssue
 	}
+	if newCfg.StalledProgressWatchdog != old.StalledProgressWatchdog {
+		changed = append(changed, fmt.Sprintf("stalled_progress_watchdog: active=%t→%t cadence=%s→%s",
+			old.StalledProgressWatchdog.IsActive(), newCfg.StalledProgressWatchdog.IsActive(),
+			old.StalledProgressWatchdog.EffectiveEvalInterval(), newCfg.StalledProgressWatchdog.EffectiveEvalInterval()))
+		o.cfg.StalledProgressWatchdog = newCfg.StalledProgressWatchdog
+	}
 	if newCfg.WorkerSilentTimeoutMinutes != old.WorkerSilentTimeoutMinutes {
 		changed = append(changed, fmt.Sprintf("worker_silent_timeout_minutes: %d→%d", old.WorkerSilentTimeoutMinutes, newCfg.WorkerSilentTimeoutMinutes))
 		o.cfg.WorkerSilentTimeoutMinutes = newCfg.WorkerSilentTimeoutMinutes
@@ -4014,7 +4045,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Silent worker detection ---
-					if o.cfg.WorkerSilentTimeoutMinutes > 0 {
+					if timeout := o.cfg.EffectiveWorkerSilentTimeout(); timeout > 0 {
 						hash := hashOutput(output)
 						now := time.Now().UTC()
 
@@ -4022,9 +4053,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							sess.LastOutputHash = hash
 							sess.LastOutputChangedAt = now
 						} else {
-							timeout := time.Duration(o.cfg.WorkerSilentTimeoutMinutes) * time.Minute
 							if time.Since(sess.LastOutputChangedAt) > timeout {
-								log.Printf("[orch] worker %s silent for >%dm, killing", slotName, o.cfg.WorkerSilentTimeoutMinutes)
+								timeoutMinutes := int(timeout / time.Minute)
+								log.Printf("[orch] worker %s silent for >%dm, killing", slotName, timeoutMinutes)
 								o.runAfterRunHook(sess)
 								if err := o.stopWorker(slotName, sess); err != nil {
 									log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
@@ -4044,7 +4075,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								}
 
 								o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d) killed — no output for %d minutes",
-									slotName, sess.IssueNumber, o.cfg.WorkerSilentTimeoutMinutes)
+									slotName, sess.IssueNumber, timeoutMinutes)
 								continue
 							}
 						}
@@ -4173,12 +4204,15 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		// never blocks or delays the merge flow below.
 		o.ensureVisualEvidence(slotName, sess, pr)
 
-		// Check CI
-		ciStatus, err := o.prCIStatus(pr.Number)
+		// Check the actual current head plus its aggregate and per-check rollup.
+		// The normalized rollup remains the merge gate; the durable snapshot below
+		// additionally hashes individual check transitions (#887).
+		ciRollup, err := o.prCheckRollup(pr.Number)
 		if err != nil {
 			log.Printf("[orch] CI status for PR #%d: %v", pr.Number, err)
 			continue
 		}
+		ciStatus := ciRollup.Verdict
 
 		// #424: the aggregate PRCIStatus can stick at "pending" long after
 		// every required check has gone green (a common cause is a legacy
@@ -4197,6 +4231,13 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		}
 
 		log.Printf("[orch] PR #%d (%s) CI=%s", pr.Number, sess.Branch, ciStatus)
+		gateTransition, gateObservable := o.prGateTransitionForCI(sess, pr, ciRollup, ciStatus)
+		observedAt := time.Now().UTC()
+		persistGate := func() {
+			if gateObservable {
+				o.persistPRGateTransition(s, gateTransition, observedAt)
+			}
+		}
 
 		switch ciStatus {
 		case "success":
@@ -4213,6 +4254,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				if err != nil {
 					log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
 				} else if strings.TrimSpace(reviewFeedback) != "" {
+					if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
+						persistGate()
+						continue
+					}
+					addPRGateLateFeedback(&gateTransition, reviewFeedback)
+					persistGate()
 					// #556: once we've already marked this PR retry-exhausted
 					// for review feedback, do NOT re-emit "scheduling retry"
 					// or re-sync the project board every poll. The session
@@ -4244,6 +4291,8 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 
 			if o.reviewGate() == "none" {
+				addPRGateReviewDisabled(&gateTransition)
+				persistGate()
 				ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 				continue
 			}
@@ -4251,8 +4300,15 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			reviewVerdict, err := o.prReviewGateVerdict(pr.Number)
 			if err != nil {
 				log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
+				persistGate()
 				continue // skip this cycle, try next
 			}
+			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
+				persistGate()
+				continue
+			}
+			addPRGateReviewVerdict(&gateTransition, reviewVerdict)
+			persistGate()
 			if reviewVerdict.Pending {
 				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
@@ -4267,6 +4323,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 
 			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 		case "failure":
+			persistGate()
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}
@@ -4277,9 +4334,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				o.handleCIFailureRetry(s, slotName, sess, pr)
 			}
 		case "pending":
+			persistGate()
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}
+		default:
+			persistGate()
 		}
 	}
 
@@ -5192,6 +5252,7 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 		if !o.codeLandedPRMerged(sess) {
 			continue
 		}
+		o.ensureMergedPRGateSnapshot(s, sess, time.Now().UTC())
 		if !o.reconcileCodeLandedDelivery(s, sess) {
 			o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
 			continue
@@ -5598,8 +5659,14 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 	}
 
 	log.Printf("[orch] merged PR #%d ✓", pr.Number)
+	mergedObservedAt := time.Now().UTC()
 	if s != nil {
-		s.LastMergeAt = time.Now().UTC()
+		s.LastMergeAt = mergedObservedAt
+		if mergeInfo, err := o.prMergeInfo(pr.Number); err != nil {
+			log.Printf("[orch] PR-gate merge identity for PR #%d unavailable: %v", pr.Number, err)
+		} else {
+			o.persistMergedPRGateTransition(s, sess, pr.Number, mergeInfo, mergedObservedAt)
+		}
 	}
 	o.markCodeLanded(sess, pr.Number)
 

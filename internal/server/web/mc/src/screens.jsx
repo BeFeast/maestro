@@ -11,6 +11,7 @@ import {
   fetchWorkerDetail,
   formatAttributionSegment,
   formatAttributionTimeline,
+	formatCountdown,
   formatTokens,
   formatUSD,
   isApprovalActionCloseIssue,
@@ -285,6 +286,8 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
           </div>
         </Panel>
 
+		<WatchdogPanel watchdog={p.stalledProgressWatchdog} cadences={p.cadences} now={now} />
+
         {p.projectBoard && <ProjectBoardPanel board={p.projectBoard} />}
 
         <ManagementHomePanel home={p.managementHome} projectId={p.projectId} />
@@ -320,6 +323,85 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
       </div>
     </div>
   );
+}
+
+// WatchdogPanel exposes the three independent runtime cadences and keeps an
+// evaluator recommendation distinct from a proven actuator attempt. Until the
+// durable live-canary proof source exists, an enabled v1 evaluator is rendered
+// as contract pending rather than capability-complete.
+export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
+  const cadence = cadences || {};
+  const sub = !watchdog
+    ? "not reported"
+    : !watchdog.enabled
+      ? "disabled"
+      : watchdog.contractPending
+        ? "contract pending"
+        : (watchdog.contract || "enabled");
+	const deadlineSeconds = watchdog?.nextDeadlineAt
+	  ? Math.round((parseTimestamp(watchdog.nextDeadlineAt) - now) / 1000)
+	  : null;
+  const deadline = watchdog?.configPendingEvaluation
+    ? "pending config evaluation"
+    : watchdog?.nextDeadlineAt
+	  ? watchdog.pastDeadline
+		? `past by ${formatCountdown(Math.abs(deadlineSeconds))}`
+		: `in ${formatCountdown(deadlineSeconds)}`
+      : "—";
+  const recommendation = watchdog?.lastRecommendation;
+  const recovery = watchdog?.lastRecovery;
+
+  return (
+    <Panel title="Stalled-progress watchdog" sub={sub}>
+      <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+        <div className="kv"><span>Orchestrator cadence</span><strong className="mono">{formatCadence(cadence.orchestratorSeconds)}</strong></div>
+        <div className="kv"><span>Supervisor cadence</span><strong className="mono">{formatCadence(cadence.supervisorSeconds)}</strong></div>
+        <div className="kv"><span>Watchdog cadence</span><strong className="mono">{formatCadence(cadence.watchdogSeconds || watchdog?.evaluationIntervalSeconds)}</strong></div>
+        {watchdog && (
+          <>
+            <div className="kv"><span>Mode</span><strong className="mono">{watchdog.mode || "—"}</strong></div>
+            <div className="kv">
+              <span>Contract</span>
+              <strong style={{ color: watchdog.contractPending ? "var(--watch)" : "var(--fg-1)" }}>
+                {watchdog.contract || (watchdog.contractPending ? "pending actuator/live-canary proof" : "not published")}
+              </strong>
+            </div>
+            <div className="kv"><span>Silence budget</span><strong className="mono">{watchdog.enabled ? formatCadence(watchdog.silenceBudgetSeconds) : "0s"}</strong></div>
+            <div className="kv"><span>Active targets</span><strong className="mono">{watchdog.activeTargetCount}</strong></div>
+            <div className="kv"><span>Next deadline</span><strong className="mono" style={{ color: watchdog.pastDeadline ? "var(--stuck)" : "var(--fg-1)" }}>{deadline}</strong></div>
+			<div className="kv">
+			  <span>Evidence</span>
+			  <strong style={{ color: watchdog.observationIncomplete ? "var(--watch)" : "var(--ok)" }}>
+				{watchdog.observationIncomplete
+				  ? `incomplete (${watchdog.unavailableSignals.join(", ") || "unknown"}) · recovery suppressed`
+				  : "complete"}
+			  </strong>
+			</div>
+            <div className="kv">
+              <span>Last recommendation</span>
+              <strong className="mono" title={recommendation?.reason || undefined}>
+                {recommendation?.action ? recommendation.action.replace(/_/g, " ") : "none"}
+              </strong>
+            </div>
+            <div className="kv">
+              <span>Actual recovery</span>
+              <strong className="mono">
+                {recovery?.action ? `${recovery.action.replace(/_/g, " ")} · ${recovery.outcome || "attempted"}` : "none recorded"}
+              </strong>
+            </div>
+          </>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+function formatCadence(seconds) {
+  const value = Number(seconds || 0);
+  if (value <= 0) return "—";
+  if (value < 60) return `${value}s`;
+  if (value % 60 === 0) return `${value / 60}m`;
+  return `${Math.floor(value / 60)}m ${value % 60}s`;
 }
 
 // ManagementHomePanel surfaces a project's configured Management Home (#870) on

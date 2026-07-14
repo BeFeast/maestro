@@ -31,7 +31,7 @@ Mission Control (MC) is the fleet web dashboard maestro serves at `http://127.0.
 
 ![Project view](docs/images/mc/project.png)
 
-*Project view (`/project/<name>`) — single-project drill-down: attention/next-action, live workers, health, project board, and recent supervisor decisions.*
+*Project view (`/project/<name>`) — single-project drill-down: attention/next-action, live workers, health, independent orchestrator/supervisor/watchdog cadences, stalled-progress contract/deadline/recommendation state, project board, and recent supervisor decisions.*
 
 ![Workers](docs/images/mc/workers.png)
 
@@ -247,7 +247,10 @@ management_home:
   vault_path: Dev/Areas/project
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
-worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N minutes (0 = disabled)
+stalled_progress_watchdog:         # explicit opt-in multi-signal evaluator
+  enabled: true
+  max_silence_minutes: 20          # record a recommendation after no material progress; no actuator yet
+  eval_interval_seconds: 60        # independent local evaluation cadence
 worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 merge_strategy: sequential         # "sequential" (default) or "parallel"

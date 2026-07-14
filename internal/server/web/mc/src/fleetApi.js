@@ -407,8 +407,8 @@ export function formatAttributionTimeline(attribution, now = Date.now()) {
 // aggregateSupervisorPulse rolls the per-project `supervisor_pulse` blocks
 // (issue #531) up to a single fleet-level pulse the header verdict card
 // can render. The "freshest" run_once timestamp wins (so the countdown
-// matches the project that just ticked); the poll interval and mode are
-// taken from that same project so the cadence story is consistent; the
+// matches the project that just ticked); all three independent cadences and
+// the mode are taken from that same project so the cadence story is consistent;
 // decision sparkline is the merged-then-sliced last 10 verbs across all
 // projects, oldest → newest, so idle is visible as a positive signal.
 export function aggregateSupervisorPulse(rawProjects) {
@@ -444,6 +444,9 @@ export function aggregateSupervisorPulse(rawProjects) {
       lastRunOnceAt: null,
       lastRunOnceMs: null,
       pollIntervalSeconds: 0,
+	  orchestratorIntervalSeconds: 0,
+	  supervisorIntervalSeconds: 0,
+	  watchdogEvalIntervalSeconds: 0,
       mode: "",
       recentActions,
       stuck: anyStuck,
@@ -454,6 +457,11 @@ export function aggregateSupervisorPulse(rawProjects) {
     lastRunOnceAt: freshest.pulse.last_run_once_at || null,
     lastRunOnceMs: freshestMs,
     pollIntervalSeconds: Number(freshest.pulse.poll_interval_seconds || 0),
+	orchestratorIntervalSeconds: Number(
+	  freshest.pulse.orchestrator_interval_seconds || freshest.pulse.poll_interval_seconds || 0,
+	),
+	supervisorIntervalSeconds: Number(freshest.pulse.supervisor_interval_seconds || 0),
+	watchdogEvalIntervalSeconds: Number(freshest.pulse.watchdog_eval_interval_seconds || 0),
     mode: String(freshest.pulse.mode || ""),
     recentActions,
     stuck: anyStuck,
@@ -470,7 +478,9 @@ export function nextDecisionCountdown(pulse, now = Date.now()) {
   if (!pulse) return null;
   const lastMs = pulse.lastRunOnceMs != null ? pulse.lastRunOnceMs : parseTimestamp(pulse.lastRunOnceAt);
   if (lastMs == null) return null;
-  const interval = Number(pulse.pollIntervalSeconds || 0);
+  // The supervisor decision loop has its own runtime cadence. Fall back to the
+  // old poll field only for snapshots produced by a pre-#887 server.
+  const interval = Number(pulse.supervisorIntervalSeconds || pulse.pollIntervalSeconds || 0);
   if (interval <= 0) return null;
   const dueMs = lastMs + interval * 1000;
   return Math.round((dueMs - now) / 1000);
@@ -502,7 +512,7 @@ export function pulseFreshnessTone(pulse, now = Date.now()) {
   if (pulse.stuck) return "stuck";
   const lastMs = pulse.lastRunOnceMs != null ? pulse.lastRunOnceMs : parseTimestamp(pulse.lastRunOnceAt);
   if (lastMs == null) return "idle";
-  const interval = Number(pulse.pollIntervalSeconds || 0);
+  const interval = Number(pulse.supervisorIntervalSeconds || pulse.pollIntervalSeconds || 0);
   if (interval <= 0) return "ok";
   const ageMs = now - lastMs;
   if (ageMs > interval * 1000 * 3) return "stuck";
@@ -571,6 +581,7 @@ function mapProject(project, workers, now) {
   const slug = slugifyProject(project.name);
   const queue = project.queue_snapshot || {};
   const outcome = project.outcome || {};
+	const pulse = project.supervisor_pulse || {};
   return {
     slug,
     name: project.name,
@@ -594,6 +605,13 @@ function mapProject(project, workers, now) {
     queueSnapshot: queue,
     freshness: project.freshness || {},
     supervisor: project.supervisor || {},
+	supervisorPulse: pulse,
+	cadences: {
+	  orchestratorSeconds: Number(pulse.orchestrator_interval_seconds || pulse.poll_interval_seconds || 0),
+	  supervisorSeconds: Number(pulse.supervisor_interval_seconds || 0),
+	  watchdogSeconds: Number(pulse.watchdog_eval_interval_seconds || 0),
+	},
+	stalledProgressWatchdog: mapStalledProgressWatchdog(pulse.stalled_progress_watchdog),
     error: project.error || "",
     readOnly: project.read_only === true,
     paused: project.paused === true,
@@ -607,6 +625,64 @@ function mapProject(project, workers, now) {
     projectId: String(project.project_id || ""),
     managementHome: managementHomeView(project.management_home),
     raw: project,
+  };
+}
+
+// mapStalledProgressWatchdog keeps recommendations and actual recovery attempts
+// separate. In particular, a last_recommendation must never be rendered as if
+// the actuator ran; contract_pending remains visible while #896/#897 proof is
+// unavailable.
+export function mapStalledProgressWatchdog(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    enabled: raw.enabled === true,
+    mode: String(raw.mode || ""),
+    contract: String(raw.contract || ""),
+    contractPending: raw.contract_pending === true,
+    evaluationIntervalSeconds: Number(raw.evaluation_interval_seconds || 0),
+    silenceBudgetSeconds: Number(raw.silence_budget_seconds || 0),
+    configPendingEvaluation: raw.config_pending_evaluation === true,
+    lastEvaluatedAt: String(raw.last_evaluated_at || ""),
+    activeTargetCount: Number(raw.active_target_count || 0),
+    lastMaterialProgressAt: String(raw.last_material_progress_at || ""),
+    phase: String(raw.phase || ""),
+    nextDeadlineAt: String(raw.next_deadline_at || ""),
+    nextDeadlineInSeconds: Number(raw.next_deadline_in_seconds || 0),
+    pastDeadline: raw.past_deadline === true,
+	observationIncomplete: raw.observation_incomplete === true,
+	unavailableSignals: Array.isArray(raw.unavailable_signals) ? raw.unavailable_signals.map(String) : [],
+    lastDecision: mapWatchdogEvent(raw.last_decision),
+    lastRecommendation: mapWatchdogEvent(raw.last_recommendation),
+    lastRecovery: mapWatchdogEvent(raw.last_recovery),
+    targets: Array.isArray(raw.targets) ? raw.targets.map(target => ({
+      targetKey: String(target?.target_key || ""),
+      kind: String(target?.kind || ""),
+      issueNumber: Number(target?.issue_number || 0),
+      slot: String(target?.slot || ""),
+      phase: String(target?.phase || ""),
+      nextDeadlineAt: String(target?.next_deadline_at || ""),
+      pastDeadline: target?.past_deadline === true,
+	  observationIncomplete: target?.observation_incomplete === true,
+	  unavailableSignals: Array.isArray(target?.unavailable_signals) ? target.unavailable_signals.map(String) : [],
+      lastRecommendation: mapWatchdogEvent(target?.last_recommendation),
+      lastRecovery: mapWatchdogEvent(target?.last_recovery),
+    })) : [],
+  };
+}
+
+function mapWatchdogEvent(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    action: String(raw.action || ""),
+    outcome: String(raw.outcome || ""),
+    recommendationId: String(raw.recommendation_id || ""),
+    reason: String(raw.reason || ""),
+    phase: String(raw.phase || ""),
+    at: String(raw.at || ""),
+    completedAt: String(raw.completed_at || ""),
+    replayBoundary: raw.replay_boundary === true,
+	observationIncomplete: raw.observation_incomplete === true,
+	unavailableSignals: Array.isArray(raw.unavailable_signals) ? raw.unavailable_signals.map(String) : [],
   };
 }
 

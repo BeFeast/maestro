@@ -1526,8 +1526,7 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 				}
 			}
 
-			if e.cfg.WorkerSilentTimeoutMinutes > 0 && !sess.LastOutputChangedAt.IsZero() {
-				timeout := time.Duration(e.cfg.WorkerSilentTimeoutMinutes) * time.Minute
+			if timeout := e.cfg.EffectiveWorkerSilentTimeout(); timeout > 0 && !sess.LastOutputChangedAt.IsZero() {
 				if silentFor := now.Sub(sess.LastOutputChangedAt); silentFor > timeout {
 					findings = append(findings, stuckState("stale_worker_logs", SeverityBlocked,
 						fmt.Sprintf("Worker %s has not produced new output within the silent timeout.", slot),

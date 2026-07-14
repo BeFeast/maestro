@@ -3967,11 +3967,13 @@ func TestMergeReadyPR_NonConflictingMergeErrorFallsThroughToMergeFailed(t *testi
 // It records whether stopWorker was called and which labels were added.
 func newSilentTimeoutOrchestrator(timeoutMinutes int, tmuxOutput string) (*Orchestrator, *bool, *[]string) {
 	stopped := false
+	legacyOnly := false
 	labels := make([]string, 0)
 	return &Orchestrator{
 		cfg: &config.Config{
 			Repo:                       "owner/repo",
 			WorkerSilentTimeoutMinutes: timeoutMinutes,
+			StalledProgressWatchdog:    config.StalledProgressWatchdogConfig{Enabled: &legacyOnly},
 			MaxRuntimeMinutes:          120,
 		},
 		notifier:        &notify.Notifier{},
@@ -4358,10 +4360,12 @@ func TestCheckSessions_SilentTimeoutFirstObservation_SetsHash(t *testing.T) {
 }
 
 func TestCheckSessions_SilentTimeoutTmuxCaptureFails_NoKill(t *testing.T) {
+	legacyOnly := false
 	o := &Orchestrator{
 		cfg: &config.Config{
 			Repo:                       "owner/repo",
 			WorkerSilentTimeoutMinutes: 10,
+			StalledProgressWatchdog:    config.StalledProgressWatchdogConfig{Enabled: &legacyOnly},
 			MaxRuntimeMinutes:          120,
 		},
 		notifier:        &notify.Notifier{},
@@ -4401,10 +4405,12 @@ func TestCheckSessions_SilentTimeoutTmuxCaptureFails_NoKill(t *testing.T) {
 
 func TestCheckSessions_SilentTimeoutStopFails_StillMarksDead(t *testing.T) {
 	output := "static output"
+	legacyOnly := false
 	o := &Orchestrator{
 		cfg: &config.Config{
 			Repo:                       "owner/repo",
 			WorkerSilentTimeoutMinutes: 10,
+			StalledProgressWatchdog:    config.StalledProgressWatchdogConfig{Enabled: &legacyOnly},
 			MaxRuntimeMinutes:          120,
 		},
 		notifier:        &notify.Notifier{},
