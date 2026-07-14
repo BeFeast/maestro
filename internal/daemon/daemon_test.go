@@ -61,10 +61,9 @@ func (lt *loopTracker) superviseLoop(ctx context.Context, name string, getCfg fu
 }
 
 // newTestDaemon builds a daemon with stub loops (no GitHub) over the given
-// configs. The watchdog is also stubbed to a no-op so flows started through
-// this helper stay isolated from the real supervisor.Watchdog goroutine — a
-// future change to its shutdown path must not silently break these lifecycle
-// tests. Tests that assert watchdog behaviour install their own stub.
+// configs. Both watchdog loops are stubbed to no-ops so flows started through
+// this helper stay isolated from real state writers. Tests that assert watchdog
+// behaviour install their own stubs.
 func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, func() *config.Config, Options)) *Daemon {
 	d := New(loader, Options{Host: "127.0.0.1", Port: 0})
 	if run != nil {
@@ -74,6 +73,7 @@ func newTestDaemon(loader ConfigLoader, run func(context.Context, *config.Config
 		d.superviseLoop = supervise
 	}
 	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {}
+	d.materialProgressLoop = func(ctx context.Context, name string, getCfg func() *config.Config) {}
 	return d
 }
 

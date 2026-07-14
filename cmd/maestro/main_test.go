@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/befeast/maestro/internal/config"
 )
 
 // newKillFlagSet mirrors the flags registered by killCmd so reorderArgs can be
@@ -176,5 +180,83 @@ func TestLoadConfigsWithStoreFallsBackToYAMLPath(t *testing.T) {
 	}
 	if cfgs[0].Repo != "owner/repo" {
 		t.Fatalf("Repo = %q, want owner/repo", cfgs[0].Repo)
+	}
+}
+
+func TestRunInitialSuperviseCycle_WatchdogContinuesWhileFirstCycleBlocks(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	evaluated := make(chan struct{}, 1)
+	loopEntered := make(chan struct{}, 1)
+	runEntered := make(chan struct{}, 1)
+	releaseRun := make(chan struct{})
+	done := make(chan error, 1)
+	cfg := &config.Config{SessionPrefix: "test"}
+
+	go func() {
+		done <- runInitialSuperviseCycle(ctx, cfg, false, false,
+			func() error {
+				runEntered <- struct{}{}
+				<-releaseRun
+				return nil
+			},
+			func(*config.Config, time.Time) (bool, error) {
+				evaluated <- struct{}{}
+				return true, nil
+			},
+			func(ctx context.Context, _ string, _ func() *config.Config) {
+				loopEntered <- struct{}{}
+				<-ctx.Done()
+			},
+		)
+	}()
+
+	select {
+	case <-evaluated:
+	case <-time.After(time.Second):
+		t.Fatal("initial local watchdog evaluation did not run")
+	}
+	select {
+	case <-runEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first supervisor cycle did not start")
+	}
+	select {
+	case <-loopEntered:
+		// The independent evaluator is alive even though RunOnce is blocked.
+	case <-time.After(time.Second):
+		t.Fatal("material-progress loop did not start while first supervisor cycle was blocked")
+	}
+	close(releaseRun)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial supervisor helper did not return")
+	}
+}
+
+func TestRunInitialSuperviseCycle_OnceEvaluatesLocallyWithoutStartingLoop(t *testing.T) {
+	events := make([]string, 0, 2)
+	err := runInitialSuperviseCycle(context.Background(), &config.Config{}, true, false,
+		func() error {
+			events = append(events, "run")
+			return nil
+		},
+		func(*config.Config, time.Time) (bool, error) {
+			events = append(events, "evaluate")
+			return true, nil
+		},
+		func(context.Context, string, func() *config.Config) {
+			t.Fatal("--once started a persistent evaluator loop")
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"evaluate", "run"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
 	}
 }

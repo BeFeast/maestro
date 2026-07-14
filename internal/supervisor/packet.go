@@ -212,7 +212,7 @@ func (e *Engine) projectConfigPacket(st *state.State) supervisorProjectConfigPac
 		MaxRetriesPerIssue:         e.cfg.MaxRetriesPerIssue,
 		IssueLabels:                append([]string(nil), e.cfg.IssueLabels...),
 		ExcludeLabels:              append([]string(nil), e.cfg.ExcludeLabels...),
-		WorkerSilentTimeoutMinutes: e.cfg.WorkerSilentTimeoutMinutes,
+		WorkerSilentTimeoutMinutes: int(e.cfg.EffectiveWorkerSilentTimeout() / time.Minute),
 		WorkerMaxTokens:            e.cfg.WorkerMaxTokens,
 		MergeStrategy:              e.cfg.MergeStrategy,
 		ReviewGate:                 e.cfg.ReviewGate,
@@ -352,10 +352,11 @@ func (e *Engine) detectorPackets(st *state.State, deterministic state.Supervisor
 		Target:            deterministic.Target,
 		Reasons:           deterministic.Reasons,
 	}}
-	if e.cfg.WorkerSilentTimeoutMinutes <= 0 {
+	timeout := e.cfg.EffectiveWorkerSilentTimeout()
+	if timeout <= 0 {
 		return detectors
 	}
-	timeout := time.Duration(e.cfg.WorkerSilentTimeoutMinutes) * time.Minute
+	timeoutMinutes := int(timeout / time.Minute)
 	now := e.now().UTC()
 	for _, name := range sortedSessionNames(st) {
 		sess := st.Sessions[name]
@@ -374,7 +375,7 @@ func (e *Engine) detectorPackets(st *state.State, deterministic state.Supervisor
 			Status: status,
 			Target: &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: name},
 			Reasons: []string{
-				fmt.Sprintf("worker_silent_timeout_minutes=%d", e.cfg.WorkerSilentTimeoutMinutes),
+				fmt.Sprintf("worker_silent_timeout_minutes=%d", timeoutMinutes),
 			},
 		})
 	}

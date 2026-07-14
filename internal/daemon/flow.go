@@ -42,6 +42,9 @@ type projectFlow struct {
 // (#764 P2).
 func (d *Daemon) startFlow(parent context.Context, storeName string, proj server.FleetProject) *projectFlow {
 	cfg := proj.Cfg()
+	if cfg != nil {
+		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
+	}
 	fctx, cancel := context.WithCancel(parent)
 	flow := &projectFlow{
 		name:      proj.Name,
@@ -125,6 +128,19 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 			defer wg.Done()
 			defer recoverFlow(flow, "watchdog")
 			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval)
+		}()
+	}
+	// #887: the material-progress evaluator owns a separate per-project clock.
+	// It must keep evaluating when Engine.Decide, GitHub, or the supervisor LLM
+	// fails, so it is a sibling of the supervise loop rather than a callback from
+	// RunOnce. It reads the live config holder on every wake-up and participates
+	// in the flow WaitGroup for race-free stop/restart.
+	if d.materialProgressLoop != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer recoverFlow(flow, "material-progress-watchdog")
+			d.materialProgressLoop(fctx, flow.name, flow.holder.Load)
 		}()
 	}
 	// Mirror reconciliation loop (#827, phase E): a low-frequency GitHub snapshot
@@ -271,6 +287,7 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 				log.Printf("[%s] config reload: restart-required field (repo/state_dir/session_prefix/local_path) changed — restart required, live reload skipped", flow.name)
 				continue
 			}
+			newCfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
 			// Holder first, so the supervise loop's next cycle and the updated
 			// dashboard snapshot below both observe the new config.
 			flow.holder.Store(newCfg)

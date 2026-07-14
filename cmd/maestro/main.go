@@ -933,19 +933,27 @@ func superviseCmd(args []string) {
 		printSupervisorDecision(decision, *jsonOutput)
 		return nil
 	}
-
 	// The first cycle stays fatal so a broken setup (bad config, missing
 	// backend, auth) fails `systemctl start` loudly instead of leaving a
-	// daemon up that can never work.
-	if err := runOnce(); err != nil {
-		log.Fatalf("supervise: %v", err)
-	}
+	// daemon up that can never work. The local material-progress clock is
+	// initialized (and, for a persistent command, launched) before this network/
+	// LLM-dependent cycle so a blocked first RunOnce cannot pause it (#887).
 	if *once {
+		if err := runInitialSuperviseCycle(context.Background(), cfg, true, *dryRun, runOnce,
+			supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
+			log.Fatalf("supervise: %v", err)
+		}
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if err := runInitialSuperviseCycle(ctx, cfg, false, *dryRun, runOnce,
+		supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
+		cancel()
+		log.Fatalf("supervise: %v", err)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -964,7 +972,6 @@ func superviseCmd(args []string) {
 	// (SupervisorStuck=true) so the Fleet API and dashboards can
 	// surface it without grepping the journal.
 	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval)
-
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for {
@@ -984,6 +991,37 @@ func superviseCmd(args []string) {
 			}
 		}
 	}
+}
+
+type materialProgressEvaluateFunc func(*config.Config, time.Time) (bool, error)
+type materialProgressLoopFunc func(context.Context, string, func() *config.Config)
+
+// runInitialSuperviseCycle establishes the local watchdog clock before the
+// first supervisor cycle can block in GitHub/LLM/Engine.Decide. --once performs
+// exactly one local evaluation; a persistent command also starts the independent
+// evaluator loop. --dry-run remains wholly non-persistent.
+func runInitialSuperviseCycle(
+	ctx context.Context,
+	cfg *config.Config,
+	once, dryRun bool,
+	runOnce func() error,
+	evaluate materialProgressEvaluateFunc,
+	runEvaluator materialProgressLoopFunc,
+) error {
+	if !dryRun && evaluate != nil {
+		if _, err := evaluate(cfg, time.Now().UTC()); err != nil {
+			log.Printf("supervise: initial material-progress evaluation failed (independent loop will retry when persistent): %v", err)
+		}
+	}
+	if !once && !dryRun && runEvaluator != nil {
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			runEvaluator(ctx, cfg.SessionPrefix, func() *config.Config { return cfg })
+		}()
+		<-started
+	}
+	return runOnce()
 }
 
 func superviseApprovalCmd(action string, args []string, defaultConfigPath string) {

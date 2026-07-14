@@ -330,9 +330,19 @@ Symphony fails on unknown template variables. Maestro currently uses simple stri
 
 #### 5.4 Stall detection improvement (MEDIUM VALUE)
 
-Symphony has explicit stall detection (`stall_timeout_ms`) based on event timestamps. Maestro's `worker_silent_timeout_minutes` is similar but:
-- Only checks tmux output hash changes, not protocol-level events
-- Could be improved to also monitor actual agent activity timestamps when available
+Symphony has explicit stall detection (`stall_timeout_ms`) based on event
+timestamps. Maestro now has an opt-in `stalled_progress_watchdog` evaluator
+instead of teaching the deprecated terminal-only
+`worker_silent_timeout_minutes` kill path. It independently fingerprints exact
+worker, PR-gate, post-merge, and delivery targets across bounded tmux,
+checkpoint, Git, review/gate, and outcome evidence. Probe failure is explicit
+incomplete evidence and suppresses destructive recovery without resetting the
+old deadline.
+
+The remaining gap is actuation proof, not detection: current v1 records durable
+recommendations only. Fleet reports `contract_pending=true`; it must not claim
+`multi-signal-progress-v1` as a live recovery capability until the bounded
+actuator and no-false-kill/recovery canaries in #896/#897 are durable.
 
 ---
 
@@ -349,7 +359,7 @@ Symphony has explicit stall detection (`stall_timeout_ms`) based on event timest
 | Phase 5.1: Multi-turn agent support | 2-3 days | High | P2 |
 | Phase 5.2: Workspace safety invariants | 0.5 days | Medium | P3 |
 | Phase 5.3: Strict prompt templates | 0.5 days | Low-Medium | P3 |
-| Phase 5.4: Stall detection improvement | 1 day | Medium | P3 |
+| Phase 5.4: Watchdog actuator + live canary proof | 1 day | Medium | P3 |
 
 **Total estimated effort: 13-22 days**
 
