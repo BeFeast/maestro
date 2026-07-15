@@ -18,10 +18,12 @@ func streamSplitCmd(args []string) {
 	fs := flag.NewFlagSet("stream-split", flag.ExitOnError)
 	backend := fs.String("backend", "claude", "backend kind for rendering (claude)")
 	jsonl := fs.String("jsonl", "", "path to append raw NDJSON frames to (side channel)")
+	maxTokens := fs.Int("max-tokens", 0, "hard token ceiling for this worker attempt")
+	budgetMarker := fs.String("budget-marker", "", "path for the deterministic token-budget stop marker")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
-	if err := worker.RunStreamSplit(*backend, *jsonl, os.Stdin, os.Stdout); err != nil {
+	if err := worker.RunStreamSplitWithBudget(*backend, *jsonl, *maxTokens, *budgetMarker, os.Stdin, os.Stdout, worker.StopCurrentProcessGroup); err != nil {
 		fmt.Fprintf(os.Stderr, "[maestro] stream-split: %v\n", err)
 		os.Exit(1)
 	}

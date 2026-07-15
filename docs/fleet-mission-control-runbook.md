@@ -312,6 +312,21 @@ signature-failure counter). See the dedicated
 [Webhook Ingestion Runbook](webhook-ingestion-runbook.md) for setup, tunnel
 configuration, and semantics.
 
+## Worker Token Budgets
+
+For projects with `worker_max_tokens > 0`, the worker drawer's **Spend** section
+shows current-attempt usage beside the configured ceiling. A worker stopped by
+the live ceiling is displayed as `token budget exceeded`, with status `failed`
+and an operator-facing reason; it is never placed in the actually-running
+group, even during the interval before the orchestrator persists its next
+reconciliation cycle. The Fleet API derives that immediate view from the
+non-sensitive per-slot budget marker written by the worker stream.
+
+Treat this outcome as deterministic. Inspect the partial work, then raise or
+disable the limit only when a larger run is intentional. Supervisor polling
+returns a safe `none` decision for this state and does not call an LLM merely to
+rediscover that the configured ceiling stopped the worker.
+
 ## Recovery Playbook
 
 ### No eligible issues

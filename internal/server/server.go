@@ -334,6 +334,7 @@ type sessionInfo struct {
 	PRURL             string `json:"pr_url,omitempty"`
 	TokensUsedAttempt int    `json:"tokens_used_attempt"`
 	TokensUsedTotal   int    `json:"tokens_used_total"`
+	WorkerOutcome     string `json:"worker_outcome,omitempty"`
 	// #739: cache-aware split token breakdown when the backend stamped it
 	// (claude stream-json / Pi). Surfaced so the cost panel can show the
 	// cache-read discount; zero for backends that report only a combined total.
@@ -388,6 +389,24 @@ type sessionInfo struct {
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
+	if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok && sess.WorkerOutcome == "" {
+		view := *sess
+		if marker.TokensObserved > view.TokensUsedAttempt {
+			delta := marker.TokensObserved - view.TokensUsedAttempt
+			view.TokensUsedAttempt = marker.TokensObserved
+			view.TokensUsedTotal += delta
+		}
+		view.WorkerOutcome = worker.TokenBudgetExceededOutcome
+		view.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
+		view.Status = state.StatusFailed
+		view.PID = 0
+		view.TmuxSession = ""
+		if !marker.MeasuredAt.IsZero() {
+			view.FinishedAt = &marker.MeasuredAt
+			state.MarkWorkerEnded(&view, marker.MeasuredAt)
+		}
+		sess = &view
+	}
 	now := time.Now().UTC()
 	info := sessionInfo{
 		Slot:              slot,
@@ -401,6 +420,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		PRURL:             githubPRURL(repo, sess.PRNumber),
 		TokensUsedAttempt: sess.TokensUsedAttempt,
 		TokensUsedTotal:   sess.TokensUsedTotal,
+		WorkerOutcome:     sess.WorkerOutcome,
 		TokensInput:       sess.TokensInput,
 		TokensOutput:      sess.TokensOutput,
 		TokensCacheRead:   sess.TokensCacheRead,

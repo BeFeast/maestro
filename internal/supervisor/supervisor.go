@@ -659,6 +659,18 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return decision, nil
 	}
 
+	if slot, sess, ok := tokenBudgetExceededSession(st); ok {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Session %s for issue #%d stopped deterministically at worker_max_tokens", slot, sess.IssueNumber),
+			"Restarting or re-planning automatically would spend more tokens without an operator budget decision",
+		)
+		decision := e.decision(st, now, projectState, ActionNone,
+			fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", sess.IssueNumber),
+			RiskSafe, 0.99, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return decision, nil
+	}
+
 	if !e.cfg.Supervisor.OrderedQueueActive() && !e.cfg.Supervisor.DynamicWave.Active() {
 		if slot, sess, ok := e.retryExhaustedSession(st, cache); ok {
 			reasons := appendReasons(baseReasons,
@@ -896,6 +908,23 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
+}
+
+func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) {
+	if st == nil {
+		return "", nil, false
+	}
+	var bestSlot string
+	var best *state.Session
+	for slot, sess := range st.Sessions {
+		if sess == nil || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+			continue
+		}
+		if best == nil || sess.StartedAt.After(best.StartedAt) {
+			bestSlot, best = slot, sess
+		}
+	}
+	return bestSlot, best, best != nil
 }
 
 func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult, cache *resolutionCache) (state.SupervisorDecision, error) {

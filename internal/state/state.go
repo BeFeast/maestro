@@ -62,7 +62,10 @@ const (
 	// wait for the window reset" rather than a generic capacity blip. Like
 	// the other backend-block tokens it did not burn the retry budget.
 	DisplayBackendUsageLimit SessionDisplayStatus = "backend_usage_limit"
-	LiveSessionRecentWindow                       = 24 * time.Hour
+	// DisplayTokenBudgetExceeded is a deterministic worker stop, not a retryable
+	// process death or provider outage.
+	DisplayTokenBudgetExceeded SessionDisplayStatus = "token_budget_exceeded"
+	LiveSessionRecentWindow                         = 24 * time.Hour
 )
 
 const RetryReasonReviewFeedback = "review_feedback"
@@ -192,6 +195,7 @@ type Session struct {
 	LastOutputChangedAt      time.Time  `json:"last_output_changed_at,omitempty"`
 	TokensUsedAttempt        int        `json:"tokens_used_attempt,omitempty"` // tokens consumed in current attempt (reset on respawn)
 	TokensUsedTotal          int        `json:"tokens_used_total,omitempty"`   // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
+	WorkerOutcome            string     `json:"worker_outcome,omitempty"`      // deterministic terminal worker outcome, e.g. token_budget_exceeded
 	// #739: cache-aware split token counters stamped from a backend usage
 	// stream (claude stream-json / Pi --mode json). Cumulative run totals so
 	// the cost panel can price each dimension separately — cache_read tokens
@@ -312,6 +316,13 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 	}
 	if attention, ok := reviewFeedbackRetryAttention(sess, alive, now); ok {
 		return attention
+	}
+	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
+		return SessionAttention{
+			Reason:         fmt.Sprintf("Worker stopped after reaching its configured token budget (%s tokens observed).", formatSessionTokens(sess.TokensUsedAttempt)),
+			NextAction:     "Review the partial work and raise or disable worker_max_tokens only if a larger run is intentional.",
+			NeedsAttention: true,
+		}
 	}
 
 	switch sess.Status {
@@ -455,6 +466,9 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 	if sess == nil {
 		return ""
 	}
+	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
+		return string(DisplayTokenBudgetExceeded)
+	}
 	if sess.Status == StatusRunning && alive != nil && !*alive {
 		return string(sess.Status)
 	}
@@ -473,6 +487,13 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 		return string(DisplayBackendRateLimited)
 	}
 	return string(sess.Status)
+}
+
+func formatSessionTokens(tokens int) string {
+	if tokens <= 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", tokens)
 }
 
 // backendRateLimitedDisplayStatus reports whether a session represents a worker

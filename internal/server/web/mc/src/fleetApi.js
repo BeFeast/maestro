@@ -944,6 +944,10 @@ export function workerStatusTaxonomy(worker) {
   const status = String(worker.status || "");
   const display = String(worker.display_status || "");
 
+  if (display === "token_budget_exceeded" || worker.worker_outcome === "token_budget_exceeded") {
+    return { label: "token budget exceeded", tone: "stuck", section: "stuck" };
+  }
+
   if (status === "running" && worker.alive === false) {
     return { label: "running", tone: "stuck", section: "stuck" };
   }

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -333,6 +334,8 @@ type streamSplit struct {
 	MaestroBin string // path to the maestro binary providing the stream-split subcommand
 	Backend    string // backend kind for rendering (e.g. "claude")
 	JSONLPath  string // side-channel file for raw NDJSON frames (slot.jsonl)
+	MaxTokens  int    // active per-attempt hard ceiling (0 = accounting only)
+	MarkerPath string // deterministic budget-stop marker written before termination
 }
 
 // logPipeline builds the trailing `| ... | tee -a LOG` stage. When split is
@@ -348,6 +351,10 @@ func logPipeline(split *streamSplit, logFile string) string {
 		"--backend", split.Backend,
 		"--jsonl", split.JSONLPath,
 	})
+	if split.MaxTokens > 0 {
+		splitter += " --max-tokens " + strconv.Itoa(split.MaxTokens)
+		splitter += " --budget-marker " + shellQuote(split.MarkerPath)
+	}
 	return "2>&1 | " + splitter + " | " + tee
 }
 
@@ -399,6 +406,11 @@ func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFi
 	maestroBin, ok := maestroExecutablePath()
 	if !ok {
 		return fmt.Errorf("resolve maestro executable for credential-safe worker exec")
+	}
+	if split != nil && split.MaxTokens > 0 && split.MarkerPath != "" {
+		if err := os.Remove(split.MarkerPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("clear stale token-budget marker: %w", err)
+		}
 	}
 	runnerContent := buildWorkerRunnerScript(args, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
 	if err := writeFileAtomicMode(filepath.Dir(runnerPath), runnerPath, runnerContent, workerRunnerScriptMode); err != nil {
