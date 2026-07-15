@@ -604,6 +604,12 @@ const (
 	// issue/session in place. Unlike restart_worker it preserves a retained
 	// worktree and never allocates a replacement slot.
 	SupervisorActionSpawnRepairWorker = "spawn_repair_worker"
+	// SupervisorActionRestartStaleBackendWorkers is a fleet helper surfaced
+	// when running workers' immutable attribution differs from the current
+	// effective backend settings (#900). It only enqueues per-worker
+	// restart_worker approvals for PR-less workers; open-PR workers are skipped
+	// and must use in-place repair/handoff.
+	SupervisorActionRestartStaleBackendWorkers = "restart_stale_backend_workers"
 	// SupervisorActionSpawnReviewRepair is the auto review-repair respawn verb
 	// minted by the supervisor when a green+mergeable PR is settled
 	// retry_exhausted on review feedback and at least one Greptile P0/P1
@@ -2938,22 +2944,23 @@ func mergeApprovalGatedVerbs(approvalRequired []string) []string {
 
 func knownSupervisorActions() map[string]bool {
 	return map[string]bool{
-		SupervisorActionAddReadyLabel:       true,
-		SupervisorActionRemoveReadyLabel:    true,
-		SupervisorActionAddBlockedLabel:     true,
-		SupervisorActionRemoveBlockedLabel:  true,
-		SupervisorActionAddIssueComment:     true,
-		SupervisorActionMergePR:             true,
-		SupervisorActionCloseIssue:          true,
-		SupervisorActionCloseIssueBatch:     true,
-		SupervisorActionDeleteWorktree:      true,
-		SupervisorActionChangeGlobalConfig:  true,
-		SupervisorActionApplyLessonProposal: true,
-		SupervisorActionSpawnRepairWorker:   true,
-		SupervisorActionSpawnReviewRepair:   true,
-		SupervisorActionRestartWorker:       true,
-		SupervisorActionStopWorker:          true,
-		SupervisorActionEditIssueBody:       true,
+		SupervisorActionAddReadyLabel:              true,
+		SupervisorActionRemoveReadyLabel:           true,
+		SupervisorActionAddBlockedLabel:            true,
+		SupervisorActionRemoveBlockedLabel:         true,
+		SupervisorActionAddIssueComment:            true,
+		SupervisorActionMergePR:                    true,
+		SupervisorActionCloseIssue:                 true,
+		SupervisorActionCloseIssueBatch:            true,
+		SupervisorActionDeleteWorktree:             true,
+		SupervisorActionChangeGlobalConfig:         true,
+		SupervisorActionApplyLessonProposal:        true,
+		SupervisorActionSpawnRepairWorker:          true,
+		SupervisorActionSpawnReviewRepair:          true,
+		SupervisorActionRestartWorker:              true,
+		SupervisorActionRestartStaleBackendWorkers: true,
+		SupervisorActionStopWorker:                 true,
+		SupervisorActionEditIssueBody:              true,
 	}
 }
 
@@ -2973,6 +2980,7 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionSpawnRepairWorker,
 		SupervisorActionSpawnReviewRepair,
 		SupervisorActionRestartWorker,
+		SupervisorActionRestartStaleBackendWorkers,
 		SupervisorActionStopWorker,
 		SupervisorActionEditIssueBody,
 	}

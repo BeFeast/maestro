@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/befeast/maestro/internal/config"
 )
 
 // #783: a routing tier's effort/model override must be threaded into the worker
@@ -22,6 +24,11 @@ func buildArgs(t *testing.T, backend string, cfg BackendConfig) string {
 		t.Fatalf("BuildWorkerCmd(%s): %v", backend, err)
 	}
 	return strings.Join(cmd.Args, " ")
+}
+
+func buildArgsFromDef(t *testing.T, backend string, def config.BackendDef) string {
+	t.Helper()
+	return buildArgs(t, backend, workerBackendConfig(def))
 }
 
 func TestTierArgv_ClaudeModelEffort(t *testing.T) {
@@ -85,6 +92,30 @@ func TestTierArgv_AttributionMetadataDoesNotLeak(t *testing.T) {
 		if strings.Contains(args, "--effort") || strings.Contains(args, "model_reasoning_effort") {
 			t.Errorf("%s: #513 attribution effort leaked into argv: %s", backend, args)
 		}
+	}
+}
+
+func TestBackendEffortDefault_ClaudeEmitsEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "claude", config.BackendDef{Cmd: "claude", Effort: "high"})
+	if !strings.Contains(args, "--effort high") {
+		t.Errorf("claude backend effort default not emitted: %s", args)
+	}
+}
+
+func TestBackendEffortDefault_CodexEmitsReasoningEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "codex", config.BackendDef{Cmd: "codex", Effort: "high"})
+	if !strings.Contains(args, "model_reasoning_effort=high") {
+		t.Errorf("codex backend effort default not emitted: %s", args)
+	}
+	if strings.Contains(args, "--effort") {
+		t.Errorf("codex must not use --effort for backend effort: %s", args)
+	}
+}
+
+func TestBackendEffortDefault_UnsupportedBackendDropsEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "gemini", config.BackendDef{Cmd: "gemini", Effort: "high"})
+	if strings.Contains(args, "--effort") || strings.Contains(args, "model_reasoning_effort") {
+		t.Errorf("gemini must not emit unsupported effort flag: %s", args)
 	}
 }
 

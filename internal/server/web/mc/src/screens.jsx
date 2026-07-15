@@ -977,17 +977,26 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
 // timeline (older sessions before #518 / backends without metadata).
 export function AttributionInline({ worker, now }) {
   const attribution = worker?.attribution || [];
-  if (!attribution.length) return null;
-  const text = formatAttributionTimeline(attribution, now);
-  if (!text) return null;
+  const text = attribution.length ? formatAttributionTimeline(attribution, now) : "";
+  const drift = worker?.backendDrift;
+  if (!text && !drift) return null;
   return (
-    <div
-      className="mono dim mt-2"
-      style={{ fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-      title={text}
-    >
-      {text}
-    </div>
+    <>
+      {text && (
+        <div
+          className="mono dim mt-2"
+          style={{ fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+          title={text}
+        >
+          {text}
+        </div>
+      )}
+      {drift && (
+        <div className="mono mt-2" style={{ fontSize: 10.5, color: "var(--watch)" }} title={drift.reason}>
+          stale backend settings · effective {formatBackendSettings(drift.effective)}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1031,6 +1040,28 @@ function AttributionTimeline({ attribution, now }) {
       </div>
     </div>
   );
+}
+
+function BackendDriftSection({ drift }) {
+  if (!drift) return null;
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Backend settings drift</div>
+      <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", borderLeft: "2px solid var(--watch)" }}>
+        <div className="mono" style={{ fontSize: 12, color: "var(--fg-1)" }}>
+          running {formatBackendSettings(drift.running)} · effective {formatBackendSettings(drift.effective)}
+        </div>
+        <div className="dim mt-2" style={{ fontSize: 12 }}>
+          {drift.restartable ? "Restart can be approval-gated for this PR-less worker." : drift.refusalReason || drift.reason}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatBackendSettings(settings) {
+  const parts = [settings?.provider, settings?.model, settings?.variant, settings?.effort].filter(Boolean);
+  return parts.length ? parts.join(" ") : "metadata not set";
 }
 
 // WorkerSpendSection surfaces the per-session token / $ counters and
@@ -1212,6 +1243,7 @@ export function WorkerDrawer({ worker, onClose, now }) {
             attribution={detail?.worker?.attribution || worker.attribution}
             now={now}
           />
+          <BackendDriftSection drift={detail?.worker?.backendDrift || worker.backendDrift} />
 
           <div className="drawer-sec" ref={logRef}>
             <div className="drawer-sec-title row" style={{ justifyContent: "space-between" }}>

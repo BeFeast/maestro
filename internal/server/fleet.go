@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -1798,8 +1799,9 @@ type fleetWorkerState struct {
 	// (#513 / #534). The SPA renders the active segment inline on the card
 	// and the complete list with EndReason between segments inside the
 	// worker drawer.
-	Attribution []state.BackendAttribution `json:"attribution,omitempty"`
-	Actions     []controlAction            `json:"actions,omitempty"`
+	Attribution  []state.BackendAttribution `json:"attribution,omitempty"`
+	BackendDrift *backendDriftInfo          `json:"backend_drift,omitempty"`
+	Actions      []controlAction            `json:"actions,omitempty"`
 }
 
 type fleetWorkerDetailResponse struct {
@@ -1865,6 +1867,7 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 		ReadOnly:     project.cfg.Server.ReadOnly || s.readOnly,
 	}
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
+	applyBackendDrift(project.cfg, &infos[0])
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	pricing := backendPricingMap(project.cfg)
 	infos[0].CostUSDEstimate = sessionCostUSD(sess, pricing)
@@ -1978,6 +1981,18 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 			req.Issues = fleetCloseCandidateTargets(fleetCloseCandidates(fleetProjectState{Name: project.Name, Repo: cfg.Repo}, st))
 		}
 	}
+	if strings.TrimSpace(req.ActionID) == config.SupervisorActionRestartStaleBackendWorkers {
+		if !projectOK {
+			writeError(w, http.StatusBadRequest, "project is required for restart_stale_backend_workers")
+			return
+		}
+		res := s.dispatchBackendDriftRestartAction(req, cfg, audit, authenticatedActor)
+		if res.err != nil {
+			log.Printf("[fleet] backend drift restart for project %q failed: %v", req.Project, res.err)
+		}
+		writeJSON(w, res.status, res.body)
+		return
+	}
 
 	if res := dispatchSafeAction(req, cfg, gh, audit, authenticatedActor); res.handled {
 		if res.err != nil {
@@ -2009,6 +2024,106 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown action_id %q", id))
+}
+
+type backendDriftRestartResponse struct {
+	OK       bool                        `json:"ok"`
+	ActionID string                      `json:"action_id"`
+	Enqueued []backendDriftRestartResult `json:"enqueued,omitempty"`
+	Skipped  []controlActionWorkerTarget `json:"skipped,omitempty"`
+	Status   string                      `json:"status"`
+}
+
+type backendDriftRestartResult struct {
+	Slot        string `json:"slot"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	ApprovalID  string `json:"approval_id"`
+	Status      string `json:"status"`
+}
+
+func (s *FleetServer) dispatchBackendDriftRestartAction(req controlActionRequest, cfg *config.Config, audit actionAuditRecorder, authenticatedActor string) safeActionResult {
+	if cfg == nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no project config bound to this server"}, err: errors.New("nil cfg")}
+	}
+	if strings.TrimSpace(cfg.StateDir) == "" {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no state dir is available to record approvals"}, err: errors.New("empty state dir")}
+	}
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("load state: %v", err)}, err: err}
+	}
+	targets, skipped := backendDriftRestartTargets(cfg, st)
+	if len(targets) == 0 && len(skipped) == 0 {
+		body := backendDriftRestartResponse{OK: true, ActionID: config.SupervisorActionRestartStaleBackendWorkers, Status: "no_stale_backend_workers"}
+		return safeActionResult{handled: true, status: http.StatusOK, body: body}
+	}
+	targetSummary := fmt.Sprintf("%d restartable, %d skipped", len(targets), len(skipped))
+	if err := auditOrAbort(audit, req, authenticatedActor, "enqueue:"+config.SupervisorActionRestartStaleBackendWorkers, cfg.Repo, targetSummary); err != nil {
+		return auditFailureResult("enqueue:"+config.SupervisorActionRestartStaleBackendWorkers, cfg.Repo, err)
+	}
+	now := time.Now().UTC()
+	results := make([]backendDriftRestartResult, 0, len(targets))
+	for _, target := range targets {
+		restartReq := req
+		restartReq.ActionID = config.SupervisorActionRestartWorker
+		restartReq.Slot = target.Slot
+		restartReq.IssueNumber = target.IssueNumber
+		restartReq.PRNumber = 0
+		decision := buildApprovalDecision(config.SupervisorActionRestartWorker, restartReq, cfg, authenticatedActor, now)
+		approval := st.RecordPendingApprovalForDecision(decision, now)
+		if approval == nil {
+			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "failed to record restart approval"}, err: errors.New("RecordPendingApprovalForDecision returned nil")}
+		}
+		results = append(results, backendDriftRestartResult{
+			Slot:        target.Slot,
+			IssueNumber: target.IssueNumber,
+			ApprovalID:  approval.ID,
+			Status:      string(approval.Status),
+		})
+	}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("save state: %v", err)}, err: err}
+	}
+	body := backendDriftRestartResponse{
+		OK:       true,
+		ActionID: config.SupervisorActionRestartStaleBackendWorkers,
+		Enqueued: results,
+		Skipped:  skipped,
+		Status:   "approvals_enqueued",
+	}
+	return safeActionResult{handled: true, status: http.StatusAccepted, body: body}
+}
+
+func backendDriftRestartTargets(cfg *config.Config, st *state.State) ([]controlActionWorkerTarget, []controlActionWorkerTarget) {
+	if cfg == nil || st == nil {
+		return nil, nil
+	}
+	infos := allSessionInfos(cfg, st)
+	targets := make([]controlActionWorkerTarget, 0)
+	skipped := make([]controlActionWorkerTarget, 0)
+	seen := map[string]bool{}
+	for _, info := range infos {
+		if info.BackendDrift == nil || !info.BackendDrift.Stale {
+			continue
+		}
+		target := controlActionWorkerTarget{
+			Slot:        info.Slot,
+			IssueNumber: info.IssueNumber,
+			PRNumber:    info.PRNumber,
+		}
+		if info.BackendDrift.Restartable {
+			if seen[info.Slot] {
+				continue
+			}
+			seen[info.Slot] = true
+			target.Reason = info.BackendDrift.Reason
+			targets = append(targets, target)
+			continue
+		}
+		target.Reason = firstNonEmpty(info.BackendDrift.RefusalReason, info.BackendDrift.Reason)
+		skipped = append(skipped, target)
+	}
+	return targets, skipped
 }
 
 // fleetEmergencyRequest is the body for the dashboard EMERGENCY STOP endpoint
@@ -4066,8 +4181,24 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		recordStaleSessionAudits(cfg.StateDir, project.Name, staleAudits)
 	}
 	workers := make([]fleetWorkerState, 0, len(projectState.All))
+	var backendRestartTargets []controlActionWorkerTarget
+	var backendRestartSkipped []controlActionWorkerTarget
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		if worker.BackendDrift != nil && worker.BackendDrift.Stale {
+			target := controlActionWorkerTarget{
+				Slot:        worker.Slot,
+				IssueNumber: worker.IssueNumber,
+				PRNumber:    worker.PRNumber,
+			}
+			if worker.BackendDrift.Restartable {
+				target.Reason = worker.BackendDrift.Reason
+				backendRestartTargets = append(backendRestartTargets, target)
+			} else {
+				target.Reason = firstNonEmpty(worker.BackendDrift.RefusalReason, worker.BackendDrift.Reason)
+				backendRestartSkipped = append(backendRestartSkipped, target)
+			}
+		}
 		if worker.NeedsAttention {
 			if canonical, ok := fleetSupersedingIssueSession(worker, projectState.All); ok {
 				worker.NeedsAttention = false
@@ -4104,6 +4235,9 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			}
 			item.Active = append(item.Active, worker)
 		}
+	}
+	if len(backendRestartTargets) > 0 || len(backendRestartSkipped) > 0 {
+		item.Actions = append(item.Actions, backendDriftRestartControlAction(item.ReadOnly, "/api/v1/fleet/actions", item.Name, backendRestartTargets, backendRestartSkipped))
 	}
 	// #814/#996: classify only after canonical attention has been counted and
 	// stale/historical sessions have been suppressed. Otherwise a failed,
@@ -4245,6 +4379,21 @@ func fleetSessionStartedAfterCanonicalCompletion(candidate, canonical sessionInf
 	started, startErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
 	finished, finishErr := time.Parse(time.RFC3339, strings.TrimSpace(canonical.FinishedAt))
 	return startErr == nil && finishErr == nil && !started.Before(finished)
+}
+
+func backendDriftRestartControlAction(readOnly bool, endpoint, target string, workers, skipped []controlActionWorkerTarget) controlAction {
+	a := newApprovalControlAction(config.SupervisorActionRestartStaleBackendWorkers, "Restart stale backend workers", "Preview and enqueue restart_worker approvals for PR-less workers running stale backend settings; open-PR workers are skipped.", "project", target, 0, 0, endpoint, readOnly)
+	a.Workers = append([]controlActionWorkerTarget(nil), workers...)
+	a.SkippedWorkers = append([]controlActionWorkerTarget(nil), skipped...)
+	if len(workers) == 0 {
+		a.Disabled = true
+		if readOnly {
+			a.DisabledReason = readOnlyDisabledReason()
+		} else {
+			a.DisabledReason = "All stale-backend workers have open PRs or are not restartable; use in-place repair or handoff."
+		}
+	}
+	return a
 }
 
 func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetCloseCandidate {
@@ -5153,6 +5302,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		RetryCount:             worker.RetryCount,
 		LastNotification:       worker.LastNotification,
 		Attribution:            worker.Attribution,
+		BackendDrift:           worker.BackendDrift,
 		Actions:                worker.Actions,
 	}
 }

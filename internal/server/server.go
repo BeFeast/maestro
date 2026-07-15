@@ -291,6 +291,8 @@ type controlAction struct {
 	IssueNumber      int                           `json:"issue_number,omitempty"`
 	PRNumber         int                           `json:"pr_number,omitempty"`
 	Issues           []state.SupervisorIssueTarget `json:"issues,omitempty"`
+	Workers          []controlActionWorkerTarget   `json:"workers,omitempty"`
+	SkippedWorkers   []controlActionWorkerTarget   `json:"skipped_workers,omitempty"`
 	Mutating         bool                          `json:"mutating"`
 	RequiresApproval bool                          `json:"requires_approval"`
 	ApprovalPolicy   string                        `json:"approval_policy,omitempty"`
@@ -298,6 +300,13 @@ type controlAction struct {
 	DisabledReason   string                        `json:"disabled_reason,omitempty"`
 	Method           string                        `json:"method,omitempty"`
 	Endpoint         string                        `json:"endpoint,omitempty"`
+}
+
+type controlActionWorkerTarget struct {
+	Slot        string `json:"slot"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 type controlActionRequest struct {
@@ -390,8 +399,27 @@ type sessionInfo struct {
 	// recorded across spawn / respawn / fallover (#513, PR #518). The SPA
 	// renders the active segment inline on the session card and the full
 	// list with EndReason between segments in the worker drawer.
-	Attribution []state.BackendAttribution `json:"attribution,omitempty"`
-	Actions     []controlAction            `json:"actions,omitempty"`
+	Attribution  []state.BackendAttribution `json:"attribution,omitempty"`
+	BackendDrift *backendDriftInfo          `json:"backend_drift,omitempty"`
+	Actions      []controlAction            `json:"actions,omitempty"`
+}
+
+type backendRuntimeSettings struct {
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Variant  string `json:"variant,omitempty"`
+	Effort   string `json:"effort,omitempty"`
+}
+
+type backendDriftInfo struct {
+	Stale             bool                   `json:"stale"`
+	Backend           string                 `json:"backend,omitempty"`
+	Reason            string                 `json:"reason,omitempty"`
+	Running           backendRuntimeSettings `json:"running"`
+	Effective         backendRuntimeSettings `json:"effective"`
+	Restartable       bool                   `json:"restartable"`
+	RefusalReason     string                 `json:"refusal_reason,omitempty"`
+	RecommendedAction string                 `json:"recommended_action,omitempty"`
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
@@ -804,10 +832,16 @@ func watchSessionName(slot string, sess *state.Session) string {
 	return worker.TmuxSessionName(slot)
 }
 
-func allSessionInfos(repo string, st *state.State) []sessionInfo {
+func allSessionInfos(cfg *config.Config, st *state.State) []sessionInfo {
+	repo := ""
+	if cfg != nil {
+		repo = cfg.Repo
+	}
 	infos := make([]sessionInfo, 0, len(st.Sessions))
 	for slot, sess := range st.Sessions {
-		infos = append(infos, makeSessionInfo(repo, slot, sess))
+		info := makeSessionInfo(repo, slot, sess)
+		applyBackendDrift(cfg, &info)
+		infos = append(infos, info)
 	}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	applyProjectStatusDisplay(infos, st)
@@ -824,6 +858,60 @@ func allSessionInfos(repo string, st *state.State) []sessionInfo {
 		return left.Slot < right.Slot
 	})
 	return infos
+}
+
+func applyBackendDrift(cfg *config.Config, info *sessionInfo) {
+	if cfg == nil || info == nil || !info.Live || info.Backend == "" || len(info.Attribution) == 0 {
+		return
+	}
+	def, ok := cfg.Model.Backends[info.Backend]
+	if !ok {
+		return
+	}
+	seg := latestOpenAttribution(info.Attribution)
+	if seg == nil || seg.Backend != info.Backend {
+		return
+	}
+	running := backendRuntimeSettings{
+		Provider: strings.TrimSpace(seg.Provider),
+		Model:    strings.TrimSpace(seg.Model),
+		Variant:  strings.TrimSpace(seg.Variant),
+		Effort:   strings.TrimSpace(seg.Effort),
+	}
+	effective := backendRuntimeSettings{
+		Provider: strings.TrimSpace(def.Provider),
+		Model:    strings.TrimSpace(def.Model),
+		Variant:  strings.TrimSpace(def.Variant),
+		Effort:   strings.TrimSpace(def.Effort),
+	}
+	if running == effective {
+		return
+	}
+	drift := &backendDriftInfo{
+		Stale:     true,
+		Backend:   info.Backend,
+		Reason:    "running worker uses an immutable backend snapshot that differs from the current effective backend settings",
+		Running:   running,
+		Effective: effective,
+	}
+	if info.PRNumber > 0 {
+		drift.RefusalReason = fmt.Sprintf("worker has open PR #%d; use review-repair or handoff instead of destructive restart", info.PRNumber)
+	} else if state.SessionStatus(info.Status) == state.StatusRunning {
+		drift.Restartable = true
+		drift.RecommendedAction = config.SupervisorActionRestartWorker
+	} else {
+		drift.RefusalReason = "worker is not currently running"
+	}
+	info.BackendDrift = drift
+}
+
+func latestOpenAttribution(attribution []state.BackendAttribution) *state.BackendAttribution {
+	for i := len(attribution) - 1; i >= 0; i-- {
+		if attribution[i].EndedAt == nil {
+			return &attribution[i]
+		}
+	}
+	return nil
 }
 
 func applyProjectStatusDisplay(infos []sessionInfo, st *state.State) {
@@ -926,8 +1014,8 @@ func supervisorStuckNeedsAttention(stuck state.SupervisorStuckState) bool {
 	return stuck.Severity == "blocked"
 }
 
-func sessionInfosWithActions(repo string, st *state.State, readOnly bool, endpoint string) []sessionInfo {
-	infos := allSessionInfos(repo, st)
+func sessionInfosWithActions(cfg *config.Config, st *state.State, readOnly bool, endpoint string) []sessionInfo {
+	infos := allSessionInfos(cfg, st)
 	for i := range infos {
 		infos[i].Actions = workerActionAffordances(readOnly, endpoint, infos[i])
 	}
@@ -1116,7 +1204,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 
 	pricing := backendPricingMap(cfg)
 	var activeTokens, totalTokens int
-	for _, info := range sessionInfosWithActions(cfg.Repo, st, cfg.Server.ReadOnly, "/api/v1/actions") {
+	for _, info := range sessionInfosWithActions(cfg, st, cfg.Server.ReadOnly, "/api/v1/actions") {
 		info.CostUSDEstimate = sessionCostEstimate(info.Backend, info.TokensUsedTotal, info.TokensInput, info.TokensOutput, info.TokensCacheRead, info.TokensCacheWrite, pricing, info.CostUSDBackend)
 		resp.All = append(resp.All, info)
 		summaryStatus := info.Status
@@ -1171,7 +1259,7 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workers := sessionInfosWithActions(s.cfg.Repo, st, s.cfg.Server.ReadOnly, "/api/v1/actions")
+	workers := sessionInfosWithActions(s.cfg, st, s.cfg.Server.ReadOnly, "/api/v1/actions")
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"workers": workers,
@@ -1216,7 +1304,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		Sessions:    make([]sessionInfo, 0),
 	}
 
-	for _, info := range sessionInfosWithActions(s.cfg.Repo, st, s.cfg.Server.ReadOnly, "/api/v1/actions") {
+	for _, info := range sessionInfosWithActions(s.cfg, st, s.cfg.Server.ReadOnly, "/api/v1/actions") {
 		if info.IssueNumber == issueNum {
 			resp.Sessions = append(resp.Sessions, info)
 		}

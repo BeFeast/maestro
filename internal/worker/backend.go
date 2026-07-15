@@ -426,10 +426,15 @@ func appendTierModelEffort(args, pinned []string, kind string, cfg BackendConfig
 
 // workerBackendConfig builds the worker BackendConfig from a resolved backend
 // def. TierModel/TierEffort carry a routing tier's override DISTINCTLY from the
-// #513 attribution Model/Effort so only a real policy tier override reaches the
-// worker argv (see appendTierModelEffort) — the attribution metadata never
-// leaks into a non-policy config's dispatch (#792 P1-A).
+// #513 attribution Model/Effort, but backend Effort now also acts as the stored
+// backend's default reasoning-effort policy (#900). A tier/phase override still
+// rides TierEffort and wins for that single dispatch; otherwise the backend's
+// configured Effort is emitted through the backend-correct flag spelling.
 func workerBackendConfig(def config.BackendDef) BackendConfig {
+	tierEffort := def.TierEffort
+	if strings.TrimSpace(tierEffort) == "" {
+		tierEffort = def.Effort
+	}
 	return BackendConfig{
 		Cmd:         def.Cmd,
 		ExtraArgs:   def.ExtraArgs,
@@ -438,7 +443,7 @@ func workerBackendConfig(def config.BackendDef) BackendConfig {
 		Model:       def.Model,
 		Effort:      def.Effort,
 		TierModel:   def.TierModel,
-		TierEffort:  def.TierEffort,
+		TierEffort:  tierEffort,
 		UsageStream: def.UsageStream,
 		MCP:         def.MCP,
 	}

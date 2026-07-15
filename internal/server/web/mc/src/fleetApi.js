@@ -984,6 +984,31 @@ function mapWorker(worker) {
     done: worker.status === "done",
     stuck: taxonomy.section === "stuck",
     stuckReason: taxonomy.section === "stuck" ? worker.status_reason || status : "",
+    backendDrift: mapBackendDrift(worker.backend_drift),
+  };
+}
+
+function mapBackendDrift(raw) {
+  if (!raw || raw.stale !== true) return null;
+  return {
+    stale: true,
+    backend: String(raw.backend || ""),
+    reason: String(raw.reason || ""),
+    running: mapBackendRuntimeSettings(raw.running),
+    effective: mapBackendRuntimeSettings(raw.effective),
+    restartable: raw.restartable === true,
+    refusalReason: String(raw.refusal_reason || ""),
+    recommendedAction: String(raw.recommended_action || ""),
+  };
+}
+
+function mapBackendRuntimeSettings(raw) {
+  raw = raw || {};
+  return {
+    provider: String(raw.provider || ""),
+    model: String(raw.model || ""),
+    variant: String(raw.variant || ""),
+    effort: String(raw.effort || ""),
   };
 }
 

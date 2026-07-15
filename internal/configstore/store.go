@@ -807,14 +807,14 @@ ON CONFLICT(key) DO UPDATE SET value_yaml = excluded.value_yaml, updated_at = ex
 	return err
 }
 
-// ProjectsFingerprint returns each project's name mapped to its updated_at
-// timestamp. Callers (the daemon diff-loop and configwatch.WatchStore) use it
-// to detect which projects changed since a prior snapshot without loading every
-// config. updated_at is written at RFC3339Nano precision so two writes in the
-// same second do not compare equal — otherwise a config-store edit immediately
-// after add/migrate would never advance the fingerprint and a --watch-store
-// daemon would never hot-reload that project (#757). Parsing with RFC3339Nano
-// also accepts older seconds-precision rows.
+// ProjectsFingerprint returns each project's name mapped to the effective
+// config clock for that project. Callers (the daemon diff-loop and
+// configwatch.WatchStore) use it to detect which projects changed since a prior
+// snapshot without loading every config. updated_at is written at RFC3339Nano
+// precision so two writes in the same second do not compare equal — otherwise a
+// config-store edit immediately after add/migrate would never advance the
+// fingerprint and a --watch-store daemon would never hot-reload that project
+// (#757). Parsing with RFC3339Nano also accepts older seconds-precision rows.
 func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, error) {
 	// A fleet-level settings change (#839) alters every project's effective
 	// config, so fold the latest fleet settings-change timestamp into every
@@ -824,6 +824,15 @@ func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, 
 	// --watch-store would never reload the projects that must revert. The audit
 	// row for that delete keeps the clock moving forward.
 	fleetTS, err := s.latestFleetSettingsChange(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Shared backends are detached from project YAML and re-attached on Load.
+	// A backend-only edit therefore changes the effective config without
+	// touching project.updated_at; fold the latest referenced backend clock into
+	// each project so WatchStore reloads newly spawned workers onto the stored
+	// backend command/model/effort (#900).
+	backendTS, err := s.backendUpdatedAt(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -845,9 +854,35 @@ func (s *Store) ProjectsFingerprint(ctx context.Context) (map[string]time.Time, 
 		if fleetTS.After(ts) {
 			ts = fleetTS
 		}
+		if backendTS.After(ts) {
+			ts = backendTS
+		}
 		out[name] = ts
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) backendUpdatedAt(ctx context.Context) (time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name, updated_at FROM backends`)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rows.Close()
+	var latest time.Time
+	for rows.Next() {
+		var name, updatedAt string
+		if err := rows.Scan(&name, &updatedAt); err != nil {
+			return time.Time{}, err
+		}
+		ts, err := time.Parse(time.RFC3339Nano, updatedAt)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("parse updated_at for backend %q: %w", name, err)
+		}
+		if ts.After(latest) {
+			latest = ts
+		}
+	}
+	return latest, rows.Err()
 }
 
 func (s *Store) exportProjectYAML(ctx context.Context, name string) ([]byte, string, error) {
