@@ -4978,7 +4978,8 @@ func boolPtr(b bool) *bool { return &b }
 // yet and could still be dispatched.
 func TestAllBackendsBlockedPartialHealthNotFullyBlocked(t *testing.T) {
 	cfg := &config.Config{Model: config.ModelConfig{
-		Default: "claude",
+		Default:          "claude",
+		FallbackBackends: []string{"codex"},
 		Backends: map[string]config.BackendDef{
 			"claude": {},
 			"codex":  {},
@@ -5014,7 +5015,8 @@ func TestAllBackendsBlockedPartialHealthNotFullyBlocked(t *testing.T) {
 // is down.
 func TestConfiguredWorkerBackendsOmitsDisabled(t *testing.T) {
 	cfg := &config.Config{Model: config.ModelConfig{
-		Default: "claude",
+		Default:          "claude",
+		FallbackBackends: []string{"codex"},
 		Backends: map[string]config.BackendDef{
 			"claude": {},
 			"codex":  {Enabled: boolPtr(false)},
@@ -5030,6 +5032,29 @@ func TestConfiguredWorkerBackendsOmitsDisabled(t *testing.T) {
 	}
 	if !allBackendsBlocked(health, configured) {
 		t.Fatal("disabled codex must not prevent blocked_by_model_limits when claude is down")
+	}
+}
+
+func TestConfiguredWorkerBackendsIgnoresBackendsOutsideResolvedRoute(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "anthropic", Default: "claude"},
+		},
+		Backends: map[string]config.BackendDef{
+			"claude": {Provider: "anthropic"},
+			"helper": {Provider: "openai"},
+		},
+	}}
+	configured := configuredWorkerBackends(cfg)
+	if !reflect.DeepEqual(configured, []string{"claude"}) {
+		t.Fatalf("configured = %v, want resolved route only", configured)
+	}
+	health := map[string]state.BackendHealth{
+		"claude": {State: state.BackendHealthCooldown},
+	}
+	if !allBackendsBlocked(health, configured) {
+		t.Fatal("unrouted helper backend must not hide a fully blocked route")
 	}
 }
 

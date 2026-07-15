@@ -184,6 +184,18 @@ func TestBackendForPhase(t *testing.T) {
 	}
 }
 
+func TestBackendForPhaseUsesProviderLaneDefault(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "legacy",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+		},
+	}}
+	if got := BackendForPhase(cfg, state.PhasePlan); got != "sol" {
+		t.Fatalf("planner backend = %q, want provider-lane default sol", got)
+	}
+}
+
 func TestEffortForPhase(t *testing.T) {
 	cfg := &config.Config{
 		Pipeline: config.PipelineConfig{

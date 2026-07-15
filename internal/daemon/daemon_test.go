@@ -113,6 +113,9 @@ func TestRunStartsFlowPerProjectAndAggregatesFleet(t *testing.T) {
 	}
 
 	// Each flow ran both loops.
+	waitFor(t, func() bool {
+		return atomic.LoadInt64(&runTracker.started) == 3 && atomic.LoadInt64(&supTracker.started) == 3
+	})
 	if got := atomic.LoadInt64(&runTracker.started); got != 3 {
 		t.Fatalf("run loops started = %d, want 3", got)
 	}

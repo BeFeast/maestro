@@ -2671,21 +2671,19 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		log.Printf("[orch] config reload: repo changed (%s → %s) — requires restart", old.Repo, newCfg.Repo)
 	}
 
-	// The router keeps a pointer to o.cfg, so route policy can be swapped live
-	// without reconstructing the orchestrator. Backend command definitions stay
-	// outside this focused reload path; the selector inputs themselves are safe.
-	if newCfg.Model.Default != old.Model.Default ||
-		!strSliceEqual(newCfg.Model.FallbackBackends, old.Model.FallbackBackends) ||
-		!reflect.DeepEqual(newCfg.Model.ProviderLanes, old.Model.ProviderLanes) {
-		changed = append(changed, fmt.Sprintf("model route: %s→%s",
+	// The router keeps a pointer to o.cfg, so the complete model selector can be
+	// swapped live without reconstructing the orchestrator. Apply backend
+	// definitions with the route so a lane added in the same edit is dispatchable.
+	if !reflect.DeepEqual(newCfg.Model, old.Model) {
+		changed = append(changed, fmt.Sprintf("model policy: %s→%s",
 			old.Model.ResolvedRoute().SelectionReason, newCfg.Model.ResolvedRoute().SelectionReason))
-		o.cfg.Model.Default = newCfg.Model.Default
-		o.cfg.Model.FallbackBackends = append([]string(nil), newCfg.Model.FallbackBackends...)
-		o.cfg.Model.ProviderLanes = append([]config.ProviderLane(nil), newCfg.Model.ProviderLanes...)
+		o.cfg.Model = cloneModelConfig(newCfg.Model)
 	}
 	if !reflect.DeepEqual(newCfg.Routing, old.Routing) {
-		changed = append(changed, fmt.Sprintf("routing: mode %s→%s", old.Routing.Mode, newCfg.Routing.Mode))
-		o.cfg.Routing = newCfg.Routing
+		o.markRestartRequired(fmt.Sprintf("routing.* changed (router_model %s → %s, mode %s → %s)",
+			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode))
+		log.Printf("[orch] config reload: routing.* changed (router_model %s → %s, mode %s → %s) — requires restart (not applied)",
+			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode)
 	}
 
 	// Hot-reloadable fields
@@ -2811,6 +2809,50 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		return
 	}
 	log.Printf("[orch] config reloaded — changed: %s", strings.Join(changed, ", "))
+}
+
+func cloneModelConfig(in config.ModelConfig) config.ModelConfig {
+	out := in
+	out.FallbackBackends = append([]string(nil), in.FallbackBackends...)
+	out.ProviderLanes = make([]config.ProviderLane, len(in.ProviderLanes))
+	for i, lane := range in.ProviderLanes {
+		out.ProviderLanes[i] = lane
+		out.ProviderLanes[i].FallbackBackends = append([]string(nil), lane.FallbackBackends...)
+	}
+	out.Backends = make(map[string]config.BackendDef, len(in.Backends))
+	for name, def := range in.Backends {
+		if def.Enabled != nil {
+			enabled := *def.Enabled
+			def.Enabled = &enabled
+		}
+		def.ExtraArgs = append([]string(nil), def.ExtraArgs...)
+		def.UsageLimitPatterns = append([]string(nil), def.UsageLimitPatterns...)
+		def.MCP.Configs = append([]string(nil), def.MCP.Configs...)
+		if def.MCP.Servers != nil {
+			servers := make(map[string]config.MCPServerDef, len(def.MCP.Servers))
+			for serverName, server := range def.MCP.Servers {
+				server.Args = append([]string(nil), server.Args...)
+				server.AllowedTools = append([]string(nil), server.AllowedTools...)
+				server.Env = cloneStringMap(server.Env)
+				server.Headers = cloneStringMap(server.Headers)
+				servers[serverName] = server
+			}
+			def.MCP.Servers = servers
+		}
+		out.Backends[name] = def
+	}
+	return out
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 // markRestartRequired records a persistent restart-required signal both in memory

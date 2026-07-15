@@ -126,6 +126,9 @@ Provider lanes compose in declaration order. Within a lane the provider default
 is tried first, then that provider's local fallbacks, before Maestro advances to
 the next provider. For example, `anthropic/claude` followed by
 `openai/sol,gpt55` resolves to `claude -> sol -> gpt55`.
+Every referenced backend must be declared in each affected project's
+`model.backends`; an invalid fleet route is rejected when that project's
+effective config is loaded rather than synthesizing an unconfigured backend.
 
 An existing project-level `model.fallback_backends` remains an explicit legacy
 route override and takes precedence over a fleet `model.provider_lanes` default.

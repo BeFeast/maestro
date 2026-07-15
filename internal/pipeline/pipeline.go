@@ -124,16 +124,16 @@ func roleForPhase(cfg *config.Config, phase state.Phase) (config.RoleConfig, boo
 }
 
 // BackendForPhase returns the backend name to use for a given phase.
-// Falls back to the default backend if no role-specific backend is configured.
+// Falls back to the effective route default if no role-specific backend is configured.
 // The implement phase honors pipeline.implementer.backend when set (#841); unset
-// keeps the historical default of model.default.
+// keeps the historical default behavior unless provider lanes override it.
 func BackendForPhase(cfg *config.Config, phase state.Phase) string {
 	if role, ok := roleForPhase(cfg, phase); ok {
 		if b := strings.TrimSpace(role.Backend); b != "" {
 			return b
 		}
 	}
-	return cfg.Model.Default
+	return cfg.Model.EffectiveDefault()
 }
 
 // EffortForPhase returns the reasoning-effort override configured for a pipeline

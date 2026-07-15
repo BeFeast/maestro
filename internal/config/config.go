@@ -2291,6 +2291,12 @@ func parse(data []byte) (*Config, error) {
 			cfg.Model.Backends["claude"] = BackendDef{Cmd: cfg.ClaudeCmd}
 		}
 	}
+	// Provider lanes must reference explicit backend definitions. Validate before
+	// the legacy model.default compatibility block below can synthesize a backend
+	// for the effective default.
+	if err := validateProviderLanes(cfg); err != nil {
+		return nil, err
+	}
 
 	// Ensure the default backend is always present in the map
 	if _, ok := cfg.Model.Backends[cfg.Model.Default]; !ok {
@@ -2315,10 +2321,6 @@ func parse(data []byte) (*Config, error) {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
 		}
 	}
-	if err := validateProviderLanes(cfg); err != nil {
-		return nil, err
-	}
-
 	// #704: quota calibration sanity. Capacities must be non-negative and
 	// the dispatch threshold a fraction in (0, 1]; a percent-style value
 	// (e.g. 85) almost certainly means the operator meant 0.85, so fail

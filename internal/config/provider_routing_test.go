@@ -91,3 +91,17 @@ model:
 		t.Fatalf("error = %v, want provider mismatch", err)
 	}
 }
+
+func TestProviderLaneValidationRejectsUndeclaredDerivedDefault(t *testing.T) {
+	_, err := Parse([]byte(`
+repo: owner/repo
+model:
+  provider_lanes:
+    - provider: openai
+      default: sol
+  backends: {}
+`))
+	if err == nil || !strings.Contains(err.Error(), `references "sol" which is not defined`) {
+		t.Fatalf("error = %v, want undeclared lane default", err)
+	}
+}
