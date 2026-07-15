@@ -90,6 +90,7 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 			IssueTitle:      "Build thing",
 			Status:          state.StatusRunning,
 			StartedAt:       now.Add(-time.Minute),
+			PID:             os.Getpid(),
 			Backend:         "opencode",
 			TokensUsedTotal: 1234,
 		},
@@ -153,7 +154,7 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.Summary.Projects != 2 || resp.Summary.Running != 1 || resp.Summary.PROpen != 0 || resp.Summary.Failed != 1 || resp.Summary.Sessions != 4 || resp.Summary.NeedsAttention != 2 {
+	if resp.Summary.Projects != 2 || resp.Summary.Running != 1 || resp.Summary.PROpen != 0 || resp.Summary.Failed != 1 || resp.Summary.Sessions != 4 || resp.Summary.NeedsAttention != 1 {
 		t.Fatalf("unexpected summary: %+v", resp.Summary)
 	}
 	if resp.Summary.ThroughputMerged7D != 2 {
@@ -229,6 +230,113 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 	if resp.Projects[1].NeedsAttention != len(resp.Projects[1].Attention) {
 		t.Fatalf("project attention count = %d, reasons = %d", resp.Projects[1].NeedsAttention, len(resp.Projects[1].Attention))
+	}
+}
+
+func TestFleetWorkersOrderActuallyRunningFirst(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "workers")
+	finished := now.Add(-2 * time.Minute)
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"run-new": {
+			IssueNumber: 9011,
+			IssueTitle:  "Newest healthy worker",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-1 * time.Minute),
+			PID:         os.Getpid(),
+		},
+		"run-old": {
+			IssueNumber: 9012,
+			IssueTitle:  "Older healthy worker",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-5 * time.Minute),
+			PID:         os.Getpid(),
+		},
+		"stale-running": {
+			IssueNumber: 9013,
+			IssueTitle:  "Dead PID still marked running",
+			Status:      state.StatusRunning,
+			StartedAt:   now.Add(-30 * time.Second),
+			PID:         0,
+		},
+		"review-recheck": {
+			IssueNumber: 9014,
+			IssueTitle:  "Review retry waiting on gates",
+			Status:      state.StatusPROpen,
+			StartedAt:   now.Add(-10 * time.Second),
+			PRNumber:    14,
+			RetryReason: state.RetryReasonReviewFeedback,
+		},
+		"code-landed": {
+			IssueNumber: 9015,
+			IssueTitle:  "Delivery verification needed",
+			Status:      state.StatusCodeLanded,
+			StartedAt:   now.Add(-20 * time.Second),
+			FinishedAt:  &finished,
+			PRNumber:    15,
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("workers", "/tmp/workers.yaml", "", &config.Config{
+			Repo:        "owner/workers",
+			StateDir:    stateDir,
+			MaxParallel: 5,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	if resp.Summary.Running != 2 || resp.Summary.WorkersRunning != 2 || resp.Summary.LiveWorkers != 2 {
+		t.Fatalf("running summary = running:%d workers:%d live:%d, want 2/2/2", resp.Summary.Running, resp.Summary.WorkersRunning, resp.Summary.LiveWorkers)
+	}
+	project := findFleetProject(t, resp.Projects, "workers")
+	if project.Running != 2 || project.WorkersRunning != 2 || project.LiveWorkers != 2 {
+		t.Fatalf("project running = running:%d workers:%d live:%d, want 2/2/2", project.Running, project.WorkersRunning, project.LiveWorkers)
+	}
+
+	gotSlots := make([]string, 0, len(resp.Workers))
+	for _, worker := range resp.Workers {
+		gotSlots = append(gotSlots, worker.Slot)
+	}
+	wantPrefix := []string{"run-new", "run-old"}
+	for i, want := range wantPrefix {
+		if gotSlots[i] != want {
+			t.Fatalf("worker order = %v, want healthy running prefix %v", gotSlots, wantPrefix)
+		}
+		if !fleetWorkerActuallyRunning(resp.Workers[i]) {
+			t.Fatalf("prefix worker %q is not actually running: %+v", resp.Workers[i].Slot, resp.Workers[i])
+		}
+	}
+	visibleRunning := 0
+	for _, worker := range resp.Workers {
+		if fleetWorkerActuallyRunning(worker) {
+			visibleRunning++
+			continue
+		}
+		break
+	}
+	if visibleRunning != resp.Summary.Running {
+		t.Fatalf("visible running group = %d, summary.running = %d", visibleRunning, resp.Summary.Running)
+	}
+
+	stale := findFleetWorker(t, resp.Workers, "stale-running")
+	if stale.Alive == nil || *stale.Alive || !stale.NeedsAttention {
+		t.Fatalf("stale running alive/attention = %#v/%v, want alive=false attention", stale.Alive, stale.NeedsAttention)
+	}
+	if !contains(stale.StatusReason, "PID is not alive") || !contains(stale.NextAction, "reconciliation cycle") {
+		t.Fatalf("stale running explanation = %q / %q", stale.StatusReason, stale.NextAction)
+	}
+	if fleetWorkerActuallyRunning(stale) {
+		t.Fatalf("stale running row must not be classified as actually running: %+v", stale)
+	}
+
+	for _, slot := range []string{"review-recheck", "code-landed", "stale-running"} {
+		for i, worker := range resp.Workers[:resp.Summary.Running] {
+			if worker.Slot == slot {
+				t.Fatalf("%s sorted into running prefix at index %d: %v", slot, i, gotSlots)
+			}
+		}
 	}
 }
 
@@ -817,7 +925,7 @@ func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
 	// several PRs are open — capacity is not blocked by the gates.
 	liveDir := filepath.Join(dir, "separated")
 	liveState := state.NewState()
-	liveState.Sessions["run-1"] = &state.Session{Status: state.StatusRunning, PID: 4242, IssueNumber: 20}
+	liveState.Sessions["run-1"] = &state.Session{Status: state.StatusRunning, PID: os.Getpid(), IssueNumber: 20}
 	liveState.Sessions["gate-1"] = &state.Session{Status: state.StatusPROpen, PRNumber: 201, IssueNumber: 21}
 	liveState.Sessions["gate-2"] = &state.Session{Status: state.StatusPROpen, PRNumber: 202, IssueNumber: 22}
 	liveState.Sessions["gate-3"] = &state.Session{Status: state.StatusPROpen, PRNumber: 203, IssueNumber: 23}
@@ -3904,6 +4012,7 @@ func TestFleetAPIProjectCountersNonNull(t *testing.T) {
 			IssueTitle:  "Running",
 			Status:      state.StatusRunning,
 			StartedAt:   now.Add(-5 * time.Minute),
+			PID:         os.Getpid(),
 		},
 		"slot-pr-open": {
 			IssueNumber: 2,
