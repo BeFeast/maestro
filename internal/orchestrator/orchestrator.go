@@ -2661,6 +2661,10 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		changed = append(changed, fmt.Sprintf("max_parallel: %d→%d", old.MaxParallel, newCfg.MaxParallel))
 		o.cfg.MaxParallel = newCfg.MaxParallel
 	}
+	if newCfg.MaxLiveWorkers != old.MaxLiveWorkers {
+		changed = append(changed, fmt.Sprintf("max_live_workers: %d→%d", old.MaxLiveWorkers, newCfg.MaxLiveWorkers))
+		o.cfg.MaxLiveWorkers = newCfg.MaxLiveWorkers
+	}
 	if newCfg.MaxRuntimeMinutes != old.MaxRuntimeMinutes {
 		changed = append(changed, fmt.Sprintf("max_runtime_minutes: %d→%d", old.MaxRuntimeMinutes, newCfg.MaxRuntimeMinutes))
 		o.cfg.MaxRuntimeMinutes = newCfg.MaxRuntimeMinutes

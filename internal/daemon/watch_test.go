@@ -227,14 +227,17 @@ func TestWatchStoreWiresReloadChannel(t *testing.T) {
 func TestReloadPumpCoalescesToLatestConfigWhenOrchestratorChannelIsFull(t *testing.T) {
 	base := testConfig(t, "owner/alpha")
 	base.MaxParallel = 1
+	base.MaxLiveWorkers = 1
 	flow := &projectFlow{name: "alpha", cfg: base, holder: newConfigHolder(base)}
 	watchCh := make(chan *config.Config, 1)
 	orchCh := make(chan *config.Config, 1)
 	stale := *base
 	stale.MaxParallel = 2
+	stale.MaxLiveWorkers = 2
 	orchCh <- &stale // orchestrator is mid-cycle; its one-slot queue is full
 	latest := *base
 	latest.MaxParallel = 9
+	latest.MaxLiveWorkers = 3
 	watchCh <- &latest
 	close(watchCh)
 
@@ -244,8 +247,14 @@ func TestReloadPumpCoalescesToLatestConfigWhenOrchestratorChannelIsFull(t *testi
 	if got.MaxParallel != 9 {
 		t.Fatalf("queued reload max_parallel = %d, want latest value 9", got.MaxParallel)
 	}
+	if got.MaxLiveWorkers != 3 {
+		t.Fatalf("queued reload max_live_workers = %d, want latest value 3", got.MaxLiveWorkers)
+	}
 	if held := flow.holder.Load().MaxParallel; held != 9 {
 		t.Fatalf("holder max_parallel = %d, want 9", held)
+	}
+	if held := flow.holder.Load().MaxLiveWorkers; held != 3 {
+		t.Fatalf("holder max_live_workers = %d, want 3", held)
 	}
 }
 
@@ -297,11 +306,14 @@ func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
 	store := newFakeWatchStore()
 	cfg := testConfig(t, "owner/alpha")
 	cfg.MaxParallel = 1
+	cfg.MaxLiveWorkers = 1
 	store.Set("alpha", cfg)
 
 	// The supervise stub polls the holder via getCfg() and records the latest
-	// MaxParallel it observed, modelling the real loop reading config each cycle.
+	// MaxParallel/MaxLiveWorkers it observed, modelling the real loop reading
+	// config each cycle.
 	var seenMax int64
+	var seenLiveLimit int64
 	run := func(ctx context.Context, c *config.Config, opts Options, reloadCh <-chan *config.Config) {
 		<-ctx.Done()
 	}
@@ -309,7 +321,9 @@ func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
 		tick := time.NewTicker(3 * time.Millisecond)
 		defer tick.Stop()
 		for {
-			atomic.StoreInt64(&seenMax, int64(getCfg().MaxParallel))
+			current := getCfg()
+			atomic.StoreInt64(&seenMax, int64(current.MaxParallel))
+			atomic.StoreInt64(&seenLiveLimit, int64(current.MaxLiveWorkers))
 			select {
 			case <-ctx.Done():
 				return
@@ -326,19 +340,26 @@ func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
 
 	waitForNames(t, d, "alpha")
 	waitFor(t, func() bool { return atomic.LoadInt64(&seenMax) == 1 })
+	waitFor(t, func() bool { return atomic.LoadInt64(&seenLiveLimit) == 1 })
 	if got := fleetProjectMaxParallel(t, d, "alpha"); got != 1 {
 		t.Fatalf("dashboard max_parallel = %d, want 1 at startup", got)
 	}
+	if got := fleetProjectLiveWorkerLimit(t, d, "alpha"); got != 1 {
+		t.Fatalf("dashboard live_worker_limit = %d, want 1 at startup", got)
+	}
 
-	// Live edit: same StateDir keeps the same flow; only MaxParallel changes.
+	// Live edit: same StateDir keeps the same flow; hot capacity fields change.
 	edited := *cfg
 	edited.MaxParallel = 7
+	edited.MaxLiveWorkers = 3
 	store.Set("alpha", &edited)
 
 	// The supervise loop observes the new config through the holder...
 	waitFor(t, func() bool { return atomic.LoadInt64(&seenMax) == 7 })
+	waitFor(t, func() bool { return atomic.LoadInt64(&seenLiveLimit) == 3 })
 	// ...and the dashboard snapshot reflects it too — both without a restart.
 	waitFor(t, func() bool { return fleetProjectMaxParallel(t, d, "alpha") == 7 })
+	waitFor(t, func() bool { return fleetProjectLiveWorkerLimit(t, d, "alpha") == 3 })
 
 	// No new flow was started: the edit reloaded the existing one in place.
 	d.mu.Lock()
@@ -382,6 +403,34 @@ func fleetProjectMaxParallel(t *testing.T, d *Daemon, name string) int {
 	for _, p := range resp.Projects {
 		if p.Name == name {
 			return p.MaxParallel
+		}
+	}
+	return -1
+}
+
+// fleetProjectLiveWorkerLimit reads live_worker_limit for the named project
+// from the live /api/v1/fleet snapshot, or -1 when the project is absent.
+func fleetProjectLiveWorkerLimit(t *testing.T, d *Daemon, name string) int {
+	t.Helper()
+	fleet := waitForFleet(t, d)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	rec := httptest.NewRecorder()
+	fleet.HandlerForTest().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/fleet = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Projects []struct {
+			Name            string `json:"name"`
+			LiveWorkerLimit int    `json:"live_worker_limit"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode fleet response: %v", err)
+	}
+	for _, p := range resp.Projects {
+		if p.Name == name {
+			return p.LiveWorkerLimit
 		}
 	}
 	return -1
