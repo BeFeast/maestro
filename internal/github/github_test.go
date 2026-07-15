@@ -346,6 +346,31 @@ func TestGreptileCheckDecision(t *testing.T) {
 	}
 }
 
+func TestGreptileBodyApprovesScoreAndExplicitVerdict(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "four of five confidence passes", body: "Greptile Review\nConfidence Score: 4/5\nP2 notes only", want: true},
+		{name: "five of five confidence passes", body: "Confidence score: 5/5", want: true},
+		{name: "explicit ok to merge passes", body: "Greptile result: OK to merge", want: true},
+		{name: "explicit not ok to merge blocks", body: "Greptile result: not OK to merge", want: false},
+		{name: "explicit not okay to merge blocks", body: "Greptile result: not okay to merge", want: false},
+		{name: "explicit not safe to merge blocks", body: "Greptile result: not safe to merge", want: false},
+		{name: "explicit unsafe to merge blocks", body: "Greptile result: unsafe to merge", want: false},
+		{name: "three of five does not pass", body: "Confidence Score: 3/5\nAction required", want: false},
+		{name: "unrelated fraction does not pass", body: "Reviewed 4/5 files", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := greptileBodyApproves(strings.ToLower(tt.body)); got != tt.want {
+				t.Fatalf("greptileBodyApproves(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHasGreptileInlineCommentOnHead(t *testing.T) {
 	makeComment := func(login, sha, body string) greptileReviewComment {
 		var c greptileReviewComment

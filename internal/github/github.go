@@ -2291,11 +2291,7 @@ commentFallback:
 			return false, false, nil
 		}
 
-		if strings.Contains(bodyLower, "safe to merge") {
-			return true, false, nil
-		}
-
-		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
+		if greptileBodyApproves(bodyLower) {
 			return true, false, nil
 		}
 	}
@@ -2305,6 +2301,20 @@ commentFallback:
 	}
 
 	return false, false, nil
+}
+
+func greptileBodyApproves(bodyLower string) bool {
+	bodyLower = strings.ToLower(bodyLower)
+	if strings.Contains(bodyLower, "not ok to merge") || strings.Contains(bodyLower, "not okay to merge") || strings.Contains(bodyLower, "not safe to merge") || strings.Contains(bodyLower, "unsafe to merge") {
+		return false
+	}
+	if strings.Contains(bodyLower, "ok to merge") || strings.Contains(bodyLower, "okay to merge") || strings.Contains(bodyLower, "safe to merge") {
+		return true
+	}
+	if strings.Contains(bodyLower, "4/5") || strings.Contains(bodyLower, "5/5") {
+		return strings.Contains(bodyLower, "confidence score") || strings.Contains(bodyLower, "score:")
+	}
+	return false
 }
 
 func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved bool, pending bool) {

@@ -340,6 +340,164 @@ func TestFleetWorkersOrderActuallyRunningFirst(t *testing.T) {
 	}
 }
 
+func TestFleetMergeActionOperatorStateMapsStatuses(t *testing.T) {
+	now := time.Date(2026, 7, 15, 14, 20, 0, 0, time.UTC)
+	statuses := []struct {
+		status state.ApprovalStatus
+		kind   string
+		label  string
+		tone   string
+		next   string
+	}{
+		{state.ApprovalStatusPending, "merge_requested", "Merge requested", "attention", "Approve or reject"},
+		{state.ApprovalStatusApproved, "merge_approved", "Merge approved", "busy", "executor"},
+		{state.ApprovalStatusAwaitingDispatch, "merge_approved", "Merge approved", "busy", "executor"},
+		{state.ApprovalStatusExecuting, "merge_executing", "Merge executing", "busy", "GitHub"},
+		{state.ApprovalStatusExecuted, "merge_executed", "Merge executed", "busy", "terminal merged"},
+		{state.ApprovalStatusRejected, "merge_rejected", "Merge rejected", "attention", "rejected merge"},
+		{state.ApprovalStatusExecutionFailed, "merge_failed", "Merge failed", "error", "Reconcile"},
+	}
+	for _, tt := range statuses {
+		t.Run(string(tt.status), func(t *testing.T) {
+			project := fleetProjectState{
+				Name: "Project",
+				Repo: "owner/repo",
+				Approvals: []fleetApprovalState{{
+					ID:          "approval-898",
+					Action:      config.SupervisorActionMergePR,
+					Status:      string(tt.status),
+					IssueNumber: 19,
+					PRNumber:    26,
+					createdAt:   now,
+					updatedAt:   now,
+				}},
+			}
+			got, ok := fleetMergeActionOperatorState(project)
+			if !ok {
+				t.Fatal("fleetMergeActionOperatorState returned false")
+			}
+			if got.Kind != tt.kind || got.Label != tt.label || got.Tone != tt.tone {
+				t.Fatalf("operator state = %+v, want kind=%q label=%q tone=%q", got, tt.kind, tt.label, tt.tone)
+			}
+			if !contains(got.Summary, "approval-898") || !contains(got.Summary, string(tt.status)) {
+				t.Fatalf("summary = %q, want approval id and status", got.Summary)
+			}
+			if !contains(got.NextAction, tt.next) {
+				t.Fatalf("next_action = %q, want %q", got.NextAction, tt.next)
+			}
+		})
+	}
+}
+
+func TestFleetSnapshotMergeRequestOutranksStaleGreptileAttention(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 15, 14, 17, 0, 0, time.UTC)
+	st := state.NewState()
+	st.Sessions["pcp-11"] = &state.Session{
+		IssueNumber:     19,
+		IssueTitle:      "Project control plane templates",
+		Status:          state.StatusRetryExhausted,
+		StartedAt:       now.Add(-20 * time.Minute),
+		PRNumber:        26,
+		CIFailureOutput: "",
+	}
+	st.Approvals = append(st.Approvals, state.Approval{
+		ID:        "approval-c835b8f27cd0e394",
+		Action:    config.SupervisorActionMergePR,
+		Status:    state.ApprovalStatusPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Target:    &state.SupervisorTarget{Issue: 19, PR: 26, Session: "pcp-11"},
+		Summary:   "Merge PR #26 after Greptile 4/5 passed.",
+	})
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	cfg := &config.Config{Repo: "owner/repo", StateDir: dir, MaxParallel: 1}
+	resp := NewFleet([]FleetProject{NewFleetProject("Project", "", "", cfg)}, "127.0.0.1", 0, false).snapshot()
+	got := resp.Projects[0].OperatorState
+	if got.Kind != "merge_requested" || got.PRNumber != 26 {
+		t.Fatalf("operator state = %+v, want merge_requested for PR #26", got)
+	}
+	if !contains(got.Summary, "approval-c835b8f27cd0e394") || !contains(got.Summary, "pending") {
+		t.Fatalf("summary = %q, want durable approval id/status", got.Summary)
+	}
+	if contains(strings.ToLower(got.Summary+" "+got.NextAction), "not approved") || contains(got.NextAction, "Address Greptile feedback") {
+		t.Fatalf("operator text still exposes stale Greptile blocker: %+v", got)
+	}
+}
+
+func TestFleetSnapshotTerminalPROutranksStaleReviewState(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 15, 14, 19, 0, 0, time.UTC)
+	st := state.NewState()
+	st.Sessions["pcp-11"] = &state.Session{
+		IssueNumber: 19,
+		IssueTitle:  "Project control plane templates",
+		Status:      state.StatusCodeLanded,
+		StartedAt:   now.Add(-30 * time.Minute),
+		FinishedAt:  fleetTimePtr(now),
+		PRNumber:    26,
+	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "stale-greptile",
+		CreatedAt:         now.Add(-time.Minute),
+		RecommendedAction: "spawn_repair_worker",
+		Summary:           "PR #26 is not approved by Greptile.",
+		Target:            &state.SupervisorTarget{Issue: 19, PR: 26, Session: "pcp-11"},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	cfg := &config.Config{Repo: "owner/repo", StateDir: dir, MaxParallel: 1}
+	resp := NewFleet([]FleetProject{NewFleetProject("Project", "", "", cfg)}, "127.0.0.1", 0, false).snapshot()
+	got := resp.Projects[0].OperatorState
+	if got.Kind != "code_landed" || got.Label != "Code landed" || got.PRNumber != 26 {
+		t.Fatalf("operator state = %+v, want terminal code_landed for PR #26", got)
+	}
+	text := strings.ToLower(got.Summary + " " + got.NextAction)
+	if contains(text, "not approved") || contains(text, "review-repair") || contains(text, "greptile feedback") {
+		t.Fatalf("terminal PR state leaked stale review action: %+v", got)
+	}
+}
+
+func TestFleetSnapshotDonePRDoesNotBecomeTerminalPRTruth(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 15, 14, 21, 0, 0, time.UTC)
+	st := state.NewState()
+	st.Sessions["pcp-11"] = &state.Session{
+		IssueNumber: 19,
+		IssueTitle:  "Project control plane templates",
+		Status:      state.StatusDone,
+		StartedAt:   now.Add(-30 * time.Minute),
+		FinishedAt:  fleetTimePtr(now),
+		PRNumber:    26,
+	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:        "review-gate",
+		CreatedAt: now.Add(-time.Minute),
+		StuckStates: []state.SupervisorStuckState{{
+			Code:              "greptile_not_approved",
+			Severity:          "blocked",
+			Summary:           "PR #26 is not approved by Greptile.",
+			RecommendedAction: "Address Greptile feedback before merging.",
+			Target:            &state.SupervisorTarget{Issue: 19, PR: 26, Session: "pcp-11"},
+		}},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	cfg := &config.Config{Repo: "owner/repo", StateDir: dir, MaxParallel: 1}
+	resp := NewFleet([]FleetProject{NewFleetProject("Project", "", "", cfg)}, "127.0.0.1", 0, false).snapshot()
+	got := resp.Projects[0].OperatorState
+	if got.Kind == "code_landed" {
+		t.Fatalf("StatusDone with PRNumber was treated as merged terminal PR truth: %+v", got)
+	}
+	if got.Kind != "attention" || got.PRNumber != 26 {
+		t.Fatalf("operator state = %+v, want review attention for PR #26", got)
+	}
+}
+
 func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")

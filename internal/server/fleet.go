@@ -1353,11 +1353,12 @@ type fleetProjectState struct {
 	// without operator action — see fleetSessionIsConvergenceBound and
 	// issue #598). The SPA project card uses this to render a calm
 	// "auto-merging" line instead of an alarming attention CTA.
-	SelfResolving   int                   `json:"self_resolving,omitempty"`
-	Active          []sessionInfo         `json:"active,omitempty"`
-	Attention       []sessionInfo         `json:"attention,omitempty"`
-	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
-	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
+	SelfResolving   int                  `json:"self_resolving,omitempty"`
+	Active          []sessionInfo        `json:"active,omitempty"`
+	Attention       []sessionInfo        `json:"attention,omitempty"`
+	Approvals       []fleetApprovalState `json:"approvals,omitempty"`
+	ApprovalSummary map[string]int       `json:"approval_summary,omitempty"`
+	terminalPR      sessionInfo
 	Actions         []controlAction       `json:"actions,omitempty"`
 	CloseCandidates []fleetCloseCandidate `json:"close_candidates,omitempty"`
 	Supervisor      supervisorInfo        `json:"supervisor"`
@@ -2803,7 +2804,7 @@ func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState)
 
 func fleetOperatorStateIsActive(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "working", "monitoring_pr", "pending_dispatch":
+	case "working", "monitoring_pr", "pending_dispatch", "merge_requested", "merge_approved", "merge_executing", "merge_executed", "code_landed":
 		return true
 	default:
 		return false
@@ -2931,9 +2932,9 @@ type fleetNextActionCandidate struct {
 // kinds (working, monitoring_pr, idle, ...) are excluded from the brief.
 func fleetNextActionPriorityForKind(kind string) (int, bool) {
 	switch strings.TrimSpace(kind) {
-	case "error", "dispatch_failure", "metered_backend", "stale_worker":
+	case "error", "dispatch_failure", "metered_backend", "merge_failed", "stale_worker":
 		return 0, true
-	case "attention":
+	case "attention", "merge_rejected":
 		return 1, true
 	case "outcome_drift", "stale", "no_eligible_issues", "queue_blocked":
 		return 2, true
@@ -3193,6 +3194,16 @@ func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 		return "Resolve stuck dispatch"
 	case "metered_backend":
 		return "Fix metered supervisor backend" // #838
+	case "merge_failed":
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Reconcile PR #%d merge", op.PRNumber)
+		}
+		return "Reconcile merge"
+	case "merge_rejected":
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Review PR #%d merge request", op.PRNumber)
+		}
+		return "Review merge request"
 	case "stale_worker":
 		if op.PRNumber > 0 {
 			return fmt.Sprintf("Open worker log for PR #%d", op.PRNumber)
@@ -3321,7 +3332,7 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 
 func fleetOperatorKindNeedsAction(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "error", "dispatch_failure", "metered_backend", "stale_worker", "attention", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
+	case "error", "dispatch_failure", "metered_backend", "merge_failed", "merge_rejected", "stale_worker", "attention", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
 		return true
 	default:
 		return false
@@ -3381,11 +3392,11 @@ func fleetOperatorStatePriority(kind string) int {
 		return 0
 	case "dispatch_failure":
 		return 1
-	case "metered_backend":
+	case "metered_backend", "merge_failed":
 		// #838: supervisor LLM disabled + per-token cost burn risk — an error-tone
 		// project outage that must sort near the top of the fleet list.
 		return 1
-	case "stale_worker":
+	case "merge_rejected", "stale_worker":
 		return 2
 	case "attention":
 		return 3
@@ -3397,7 +3408,7 @@ func fleetOperatorStatePriority(kind string) int {
 		return 6
 	case "working":
 		return 7
-	case "monitoring_pr":
+	case "merge_requested", "merge_approved", "merge_executing", "merge_executed", "code_landed", "monitoring_pr":
 		return 8
 	case "auto_merging":
 		// #598: convergence-bound, calm — sort alongside monitoring_pr,
@@ -4037,6 +4048,9 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	workers := make([]fleetWorkerState, 0, len(projectState.All))
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		if fleetSessionIsTerminalPRTruth(worker) && item.terminalPR.PRNumber == 0 {
+			item.terminalPR = worker
+		}
 		if audit, isStale := staleSlots[worker.Slot]; isStale {
 			worker.NeedsAttention = false
 			if reason := strings.TrimSpace(audit.Reason); reason != "" {
@@ -4350,6 +4364,12 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 	if state, ok := fleetMeteredBackendOperatorState(project); ok {
 		return state
 	}
+	if state, ok := fleetTerminalPROperatorState(project); ok {
+		return state
+	}
+	if state, ok := fleetMergeActionOperatorState(project); ok {
+		return state
+	}
 	if project.NeedsAttention > 0 {
 		// #598: separate "self-resolving" sessions (retry_exhausted with an
 		// open PR and no failing-check evidence — convergence will auto-merge
@@ -4511,6 +4531,130 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		Summary:    summary,
 		NextAction: "Change labels/dependencies/project status if these issues should run now.",
 	}
+}
+
+func fleetSessionIsTerminalPRTruth(worker sessionInfo) bool {
+	if worker.PRNumber <= 0 {
+		return false
+	}
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusCodeLanded:
+		return true
+	default:
+		return false
+	}
+}
+
+func fleetTerminalPROperatorState(project fleetProjectState) (fleetOperatorState, bool) {
+	worker := project.terminalPR
+	if !fleetSessionIsTerminalPRTruth(worker) {
+		return fleetOperatorState{}, false
+	}
+	label := "PR merged"
+	summary := fmt.Sprintf("PR #%d is merged; terminal forge truth outranks stale CI or review-gate data.", worker.PRNumber)
+	if state.SessionStatus(worker.Status) == state.StatusCodeLanded {
+		label = "Code landed"
+		summary = fmt.Sprintf("PR #%d is merged and code has landed.", worker.PRNumber)
+	}
+	return fleetOperatorState{
+		Kind:        "code_landed",
+		Tone:        "healthy",
+		Label:       label,
+		Summary:     summary,
+		NextAction:  "No operator action is required for this PR.",
+		Session:     worker.Slot,
+		IssueNumber: worker.IssueNumber,
+		IssueURL:    firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber)),
+		PRNumber:    worker.PRNumber,
+		PRURL:       firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber)),
+	}, true
+}
+
+func fleetMergeActionOperatorState(project fleetProjectState) (fleetOperatorState, bool) {
+	approval, ok := latestFleetMergeApproval(project.Approvals)
+	if !ok {
+		return fleetOperatorState{}, false
+	}
+	status := state.ApprovalStatus(approval.Status)
+	prNumber := approval.PRNumber
+	issueNumber := approval.IssueNumber
+	session := approval.Session
+	base := fleetOperatorState{
+		Kind:        "merge_requested",
+		Tone:        "busy",
+		Label:       "Merge requested",
+		Summary:     fleetMergeActionSummary(approval),
+		NextAction:  "Wait for the durable merge action to advance.",
+		IssueNumber: issueNumber,
+		IssueURL:    firstNonEmpty(approval.IssueURL, githubIssueURL(project.Repo, issueNumber)),
+		PRNumber:    prNumber,
+		PRURL:       firstNonEmpty(approval.PRURL, githubPRURL(project.Repo, prNumber)),
+		Session:     session,
+	}
+	switch status {
+	case state.ApprovalStatusPending:
+		base.Tone = "attention"
+		base.NextAction = "Approve or reject the pending merge request."
+	case state.ApprovalStatusApproved, state.ApprovalStatusAwaitingDispatch:
+		base.Kind = "merge_approved"
+		base.Label = "Merge approved"
+		base.NextAction = "Wait for the merge executor to pick up the approved request."
+	case state.ApprovalStatusExecuting:
+		base.Kind = "merge_executing"
+		base.Label = "Merge executing"
+		base.NextAction = "Wait for GitHub to accept or settle the merge."
+	case state.ApprovalStatusExecuted:
+		base.Kind = "merge_executed"
+		base.Label = "Merge executed"
+		base.NextAction = "Wait for the next GitHub reconciliation to record the terminal merged state."
+	case state.ApprovalStatusRejected:
+		base.Kind = "merge_rejected"
+		base.Tone = "attention"
+		base.Label = "Merge rejected"
+		base.NextAction = "Review the rejected merge request and decide whether a new attempt is needed."
+	case state.ApprovalStatusExecutionFailed:
+		base.Kind = "merge_failed"
+		base.Tone = "error"
+		base.Label = "Merge failed"
+		base.NextAction = "Reconcile the PR merge state and retry only if the PR is still open."
+	default:
+		return fleetOperatorState{}, false
+	}
+	return base, true
+}
+
+func latestFleetMergeApproval(approvals []fleetApprovalState) (fleetApprovalState, bool) {
+	var selected fleetApprovalState
+	found := false
+	for _, approval := range approvals {
+		if strings.TrimSpace(approval.Action) != config.SupervisorActionMergePR {
+			continue
+		}
+		if !fleetMergeApprovalStatusVisible(state.ApprovalStatus(approval.Status)) {
+			continue
+		}
+		if !found || fleetApprovalRecency(approval).After(fleetApprovalRecency(selected)) {
+			selected, found = approval, true
+		}
+	}
+	return selected, found
+}
+
+func fleetMergeApprovalStatusVisible(status state.ApprovalStatus) bool {
+	switch status {
+	case state.ApprovalStatusPending, state.ApprovalStatusApproved, state.ApprovalStatusAwaitingDispatch, state.ApprovalStatusExecuting, state.ApprovalStatusExecuted, state.ApprovalStatusRejected, state.ApprovalStatusExecutionFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func fleetMergeActionSummary(approval fleetApprovalState) string {
+	target := "merge"
+	if approval.PRNumber > 0 {
+		target = fmt.Sprintf("merge PR #%d", approval.PRNumber)
+	}
+	return fmt.Sprintf("Maestro recorded %s request %s with status %s.", target, approval.ID, firstNonEmpty(approval.Status, "unknown"))
 }
 
 // partitionFleetAttentionByResolvability splits attention sessions into
