@@ -670,6 +670,7 @@ function mapProject(project, workers, now) {
     failed: Number(project.failed || 0),
     sessions: Number(project.sessions || 0),
     needsAttention: Number(project.needs_attention || 0),
+    actions: Array.isArray(project.actions) ? project.actions : [],
     operatorState: project.operator_state || {},
     outcome,
     queueSnapshot: queue,

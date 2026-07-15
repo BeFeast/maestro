@@ -56,7 +56,7 @@ function projectFocusMatches(p, focus) {
 }
 
 export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
-  const { fleet, now } = useFleet();
+  const { fleet, now, refresh } = useFleet();
   const p = projectBySlug(fleet, slug);
   const focusMatch = projectFocusMatches(p, focus);
   useScrollToFocus(focusMatch ? "[data-project-focus='true']" : "", [slug, focus?.approval, focus?.issue, focus?.pr, focusMatch]);
@@ -127,6 +127,8 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
         </div>
         <ProjectMiniHeartbeat tone={vtone} events={p.tapeEvents || []} />
       </div>
+
+      <ProjectActionsPanel project={p} refresh={refresh} />
 
       {p.operatorState?.kind === "attention" && (p.operatorState.summary || p.operatorState.next_action) && (
         <Panel title="Needs attention" sub={p.operatorState.session || undefined}>
@@ -335,6 +337,203 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
           </Panel>
         </div>
       </div>
+    </div>
+  );
+}
+
+function actionWorkerTargets(action, field) {
+  return Array.isArray(action?.[field]) ? action[field] : [];
+}
+
+function actionWorkerTargetLabel(target) {
+  const parts = [
+    target?.slot && `slot ${target.slot}`,
+    Number(target?.issue_number || 0) > 0 && `issue #${target.issue_number}`,
+    Number(target?.pr_number || 0) > 0 && `PR #${target.pr_number}`,
+  ].filter(Boolean);
+  return parts.join(" · ") || "worker";
+}
+
+function projectActionSummary(action) {
+  const workers = actionWorkerTargets(action, "workers");
+  const skipped = actionWorkerTargets(action, "skipped_workers");
+  if (workers.length || skipped.length) {
+    return `${workers.length} restartable · ${skipped.length} skipped`;
+  }
+  return action.description || "";
+}
+
+// ProjectActionsPanel renders project-scoped controls from the same fleet
+// snapshot action contract as worker controls. The stale-backend batch restart
+// action lives here because it targets all restartable PR-less workers in a
+// project, while skipped open-PR workers are previewed but not restarted.
+export function ProjectActionsPanel({ project, refresh }) {
+  const actions = Array.isArray(project?.actions) ? project.actions : [];
+  const [busyId, setBusyId] = React.useState("");
+  const [message, setMessage] = React.useState(null);
+  const [pending, setPending] = React.useState(null);
+  const [pendingReason, setPendingReason] = React.useState("");
+
+  if (!actions.length) return null;
+
+  const closeDialog = () => {
+    if (busyId) return;
+    setPending(null);
+    setPendingReason("");
+  };
+
+  const send = async () => {
+    if (!pending || !project) return;
+    const action = pending;
+    setBusyId(action.id);
+    setMessage(null);
+    try {
+      const resp = await postFleetAction({
+        actionId: action.id,
+        project: project.name,
+        reason: pendingReason.trim(),
+      });
+      const enqueued = Array.isArray(resp?.enqueued) ? resp.enqueued.length : 0;
+      const skipped = Array.isArray(resp?.skipped) ? resp.skipped.length : 0;
+      const suffix = enqueued || skipped
+        ? `${enqueued} approvals queued · ${skipped} skipped`
+        : (resp?.status || resp?.approval_id || "ok").replace(/_/g, " ");
+      setMessage({ tone: "ok", text: `${action.label || action.id}: ${suffix}` });
+      setPending(null);
+      setPendingReason("");
+      if (typeof refresh === "function") {
+        try { await refresh(); } catch (_) { /* status already surfaced */ }
+      }
+    } catch (err) {
+      setMessage({ tone: "stuck", text: `${action.label || action.id}: ${err?.message || String(err)}` });
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const openConfirm = action => {
+    if (action.disabled || busyId) return;
+    setMessage(null);
+    setPendingReason("");
+    setPending(action);
+  };
+
+  return (
+    <Panel title="Project controls" sub={project.readOnly ? "read-only" : "approval gated"}>
+      <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+        <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+          {actions.map(action => {
+            const disabled = action.disabled || !!busyId;
+            const summary = projectActionSummary(action);
+            return (
+              <button
+                key={action.id}
+                className={"tb-btn" + (action.disabled ? " ghost" : "")}
+                disabled={disabled}
+                title={action.disabled ? (action.disabled_reason || "Unavailable") : (action.description || action.label || action.id)}
+                onClick={() => openConfirm(action)}
+              >
+                {busyId === action.id ? "…" : (action.label || action.id)}
+                {summary && <span className="mono dim" style={{ fontSize: 10, marginLeft: 6 }}>{summary}</span>}
+              </button>
+            );
+          })}
+        </div>
+        {message && (
+          <div className="mono mt-2" style={{ fontSize: 11, color: message.tone === "stuck" ? "var(--stuck)" : "var(--ok)" }}>
+            {message.text}
+          </div>
+        )}
+        {project.readOnly && (
+          <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>Controls are disabled while the project runs in read-only mode.</div>
+        )}
+        <ConfirmDialog
+          open={pending !== null}
+          title={pending ? `${pending.label || pending.id}?` : ""}
+          confirmLabel={pending ? (pending.label || pending.id) : "Confirm"}
+          busy={!!busyId}
+          onClose={closeDialog}
+          onConfirm={send}
+        >
+          {pending && (
+            <>
+              <div className="mono dim" style={{ fontSize: 11, marginBottom: 8 }}>
+                action: {pending.label || pending.id} · project {project.name}
+              </div>
+              <div style={{ marginBottom: 12, fontSize: 12, color: "var(--fg-2)" }}>
+                This <strong>enqueues pending Approvals</strong> for restartable targets. Workers with open PRs are skipped and remain for in-place repair or handoff.
+              </div>
+              <ActionTargetPreview action={pending} />
+              {pending.description && (
+                <div className="dim" style={{ fontSize: 11.5, marginBottom: 12 }}>{pending.description}</div>
+              )}
+              <label htmlFor={`reason-project-action-${pending.id}`} style={{ display: "block", fontSize: 11, color: "var(--fg-2)", marginBottom: 4 }}>
+                Reason <span className="dim">(optional, recorded in the audit log)</span>
+              </label>
+              <textarea
+                id={`reason-project-action-${pending.id}`}
+                value={pendingReason}
+                onChange={e => setPendingReason(e.target.value)}
+                placeholder="why this batch approval is being enqueued"
+                autoFocus
+                rows={3}
+                disabled={!!busyId}
+                style={{
+                  width: "100%",
+                  fontFamily: "inherit",
+                  fontSize: 13,
+                  padding: 8,
+                  border: "1px solid var(--border-1)",
+                  borderRadius: "var(--r-2)",
+                  background: "var(--bg-0)",
+                  color: "var(--fg-0)",
+                  resize: "vertical",
+                  boxSizing: "border-box",
+                }}
+                onKeyDown={e => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                    e.preventDefault();
+                    if (!busyId) send();
+                  }
+                }}
+              />
+              <div className="mono dim" style={{ fontSize: 10, marginTop: 4 }}>⌘/Ctrl+Enter to confirm, Esc to cancel.</div>
+            </>
+          )}
+        </ConfirmDialog>
+      </div>
+    </Panel>
+  );
+}
+
+function ActionTargetPreview({ action }) {
+  const workers = actionWorkerTargets(action, "workers");
+  const skipped = actionWorkerTargets(action, "skipped_workers");
+  if (!workers.length && !skipped.length) return null;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      {workers.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Restart approval targets</div>
+          {workers.map(target => (
+            <div key={`target-${target.slot}`} className="kv" style={{ fontSize: 12 }}>
+              <span>{actionWorkerTargetLabel(target)}</span>
+              <strong className="mono">{target.reason || "stale backend settings"}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      {skipped.length > 0 && (
+        <div>
+          <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Skipped</div>
+          {skipped.map(target => (
+            <div key={`skipped-${target.slot}`} className="kv" style={{ fontSize: 12 }}>
+              <span>{actionWorkerTargetLabel(target)}</span>
+              <strong className="mono">{target.reason || "not restartable"}</strong>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
