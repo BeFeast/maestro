@@ -76,7 +76,7 @@ describe("stalled-progress Fleet contract", () => {
       />,
     );
     expect(html).toContain("contract pending");
-    expect(html).toContain("pending actuator/live-canary proof");
+    expect(html).toContain("pending live-canary proof");
     expect(html).toContain("Orchestrator cadence");
     expect(html).toContain("Supervisor cadence");
     expect(html).toContain("Watchdog cadence");
@@ -102,5 +102,24 @@ describe("stalled-progress Fleet contract", () => {
 	expect(project.stalledProgressWatchdog.observationIncomplete).toBe(true);
 	expect(project.stalledProgressWatchdog.lastDecision.action).toBe("evidence_unavailable");
 	expect(html).toContain("incomplete (terminal_checkpoint, worktree_git) · recovery suppressed");
+  });
+
+  test("renders the durable actuator stage separately from its outcome", () => {
+	const raw = watchdogFleet();
+	const watchdog = raw.projects[0].supervisor_pulse.stalled_progress_watchdog;
+	watchdog.last_recovery = {
+	  action: "stop_and_retry",
+	  outcome: "succeeded",
+	  stage: "retry_scheduled",
+	  reason: "retry_scheduled",
+	  lease_generation: 1,
+	};
+	const project = mapFleetResponse(raw, now).projects[0];
+	expect(project.stalledProgressWatchdog.lastRecovery.stage).toBe("retry_scheduled");
+	expect(project.stalledProgressWatchdog.lastRecovery.leaseGeneration).toBe(1);
+	const html = renderToStaticMarkup(
+	  <WatchdogPanel watchdog={project.stalledProgressWatchdog} cadences={project.cadences} now={now} />,
+	);
+	expect(html).toContain("stop and retry · retry scheduled");
   });
 });

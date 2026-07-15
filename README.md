@@ -249,7 +249,7 @@ max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
 stalled_progress_watchdog:         # explicit opt-in multi-signal evaluator
   enabled: true
-  max_silence_minutes: 20          # record a recommendation after no material progress; no actuator yet
+  max_silence_minutes: 20          # exact-lease worker recovery; runtime-live contract remains canary-gated
   eval_interval_seconds: 60        # independent local evaluation cadence
 worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)

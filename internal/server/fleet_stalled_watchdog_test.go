@@ -112,6 +112,36 @@ func TestFleetPulse_StalledWatchdogView(t *testing.T) {
 	if w.LastRecovery == nil || w.LastRecovery.Outcome != string(progress.RecoveryAttempted) {
 		t.Errorf("LastRecovery = %+v, want actual attempted recovery", w.LastRecovery)
 	}
+	if w.LastRecovery.Stage != string(progress.RecoveryStageClaimed) {
+		t.Errorf("LastRecovery.Stage = %q, want claimed", w.LastRecovery.Stage)
+	}
+}
+
+func TestFleetPulse_ReportsRecoveryStageAndBoundedReason(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{}
+	cfg.StalledProgressWatchdog.Enabled = &enabled
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	target := progress.Target{Kind: progress.TargetWorker, IssueNumber: 1, Slot: "slot-1", SessionID: "spawn-1", TmuxSession: "tmux-1", ProcessID: 101, LeaseID: "lease-1"}
+	observation := progress.Observation{
+		Target: target, Phase: progress.PhasePreDelivery,
+		Signals: progress.SignalSet{{Kind: progress.SignalProcessTmux, Fingerprint: progress.Fingerprint("pid-1")}},
+	}
+	_, _ = st.RecordMaterialProgress([]progress.Observation{observation}, time.Minute, time.Minute, now.Add(-2*time.Minute))
+	decisions, _ := st.RecordMaterialProgress([]progress.Observation{observation}, time.Minute, time.Minute, now)
+	claimed, err := st.ClaimMaterialRecovery(target.Key(), decisions[0].RecommendationID, "opaque-lease", time.Minute, now)
+	if err != nil || !claimed {
+		t.Fatalf("claim: claimed=%t err=%v", claimed, err)
+	}
+	if err := st.CompleteMaterialRecovery(target.Key(), decisions[0].RecommendationID, "opaque-lease", progress.RecoverySucceeded,
+		progress.RecoveryStageRetryScheduled, progress.RecoveryReasonRetryScheduled, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	recovery := buildFleetSupervisorPulse(cfg, st, now.Add(time.Second)).StalledProgressWatchdog.LastRecovery
+	if recovery == nil || recovery.Stage != "retry_scheduled" || recovery.Reason != "retry_scheduled" || recovery.LeaseGeneration != 1 {
+		t.Fatalf("Fleet recovery = %+v", recovery)
+	}
 }
 
 // A disabled watchdog reports enabled=false and no deadline — never a
