@@ -135,12 +135,15 @@ type BackendCandidate struct {
 
 // BackendSelection is an audit record for worker backend choice.
 type BackendSelection struct {
-	SelectedBackend string             `json:"selected_backend,omitempty"`
-	SelectionReason string             `json:"selection_reason"`
-	TaskType        string             `json:"task_type,omitempty"`
-	CandidateScores []BackendCandidate `json:"candidate_scores,omitempty"`
-	HardPin         bool               `json:"hard_pin,omitempty"`
-	PreviousBackend string             `json:"previous_backend,omitempty"`
+	SelectedBackend string `json:"selected_backend,omitempty"`
+	SelectionReason string `json:"selection_reason"`
+	// RouteSelectionReason identifies the effective route source used to order
+	// fallbacks: provider_lanes, explicit_backend_chain, or model_default_only.
+	RouteSelectionReason string             `json:"route_selection_reason,omitempty"`
+	TaskType             string             `json:"task_type,omitempty"`
+	CandidateScores      []BackendCandidate `json:"candidate_scores,omitempty"`
+	HardPin              bool               `json:"hard_pin,omitempty"`
+	PreviousBackend      string             `json:"previous_backend,omitempty"`
 
 	// Task-aware policy routing observability (#783, RFC §2.7). Tier is the
 	// strength tier the policy resolved to; Effort/Model are the per-tier

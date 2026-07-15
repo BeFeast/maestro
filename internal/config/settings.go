@@ -1,9 +1,12 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Fleet-controllable settings: the cost/LLM control knobs (#839) that an
@@ -27,6 +30,7 @@ const (
 	SettingKindBool   = "bool"
 	SettingKindInt    = "int"
 	SettingKindString = "string"
+	SettingKindJSON   = "json"
 )
 
 // FleetSettingSpec describes one fleet-controllable knob: its dotted key (the
@@ -47,6 +51,15 @@ type FleetSettingSpec struct {
 // wiring required.
 func FleetSettingSpecs() []FleetSettingSpec {
 	return []FleetSettingSpec{
+		{
+			Key:      "model.provider_lanes",
+			YAMLPath: []string{"model", "provider_lanes"},
+			Kind:     SettingKindJSON,
+			Value: func(c *Config) string {
+				out, _ := json.Marshal(c.Model.ProviderLanes)
+				return string(out)
+			},
+		},
 		{
 			Key:      "supervisor.enabled",
 			YAMLPath: []string{"supervisor", "enabled"},
@@ -172,6 +185,40 @@ func NormalizeSettingValue(key, value string) (string, error) {
 			return "", fmt.Errorf("setting %q wants an integer, got %q", key, value)
 		}
 		return strconv.Itoa(n), nil
+	case SettingKindJSON:
+		var lanes []ProviderLane
+		if err := yaml.Unmarshal([]byte(v), &lanes); err != nil {
+			return "", fmt.Errorf("setting %q wants a provider-lane JSON/YAML array, got %q: %v", key, value, err)
+		}
+		seenProviders := map[string]bool{}
+		seenBackends := map[string]bool{}
+		for i := range lanes {
+			lanes[i].Provider = strings.ToLower(strings.TrimSpace(lanes[i].Provider))
+			lanes[i].Default = strings.TrimSpace(lanes[i].Default)
+			if lanes[i].Provider == "" || lanes[i].Default == "" {
+				return "", fmt.Errorf("setting %q lane %d requires provider and default", key, i)
+			}
+			if seenProviders[lanes[i].Provider] {
+				return "", fmt.Errorf("setting %q repeats provider %q", key, lanes[i].Provider)
+			}
+			seenProviders[lanes[i].Provider] = true
+			entries := append([]string{lanes[i].Default}, lanes[i].FallbackBackends...)
+			for j, raw := range entries {
+				name := strings.TrimSpace(raw)
+				if j > 0 {
+					lanes[i].FallbackBackends[j-1] = name
+				}
+				if name == "" || seenBackends[name] {
+					return "", fmt.Errorf("setting %q contains an empty or duplicate backend %q", key, name)
+				}
+				seenBackends[name] = true
+			}
+		}
+		out, err := json.Marshal(lanes)
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
 	default:
 		return v, nil
 	}

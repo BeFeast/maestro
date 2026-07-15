@@ -1342,7 +1342,7 @@ func (o *Orchestrator) runAfterRunHook(sess *state.Session) {
 // It skips backends that are already in sess.TriedBackends or match the current backend.
 // Returns "" if no fallback is available.
 func (o *Orchestrator) nextFallbackBackend(sess *state.Session) string {
-	fallbacks := o.cfg.Model.FallbackBackends
+	fallbacks := o.cfg.Model.FallbackCandidates(sess.Backend)
 	if len(fallbacks) == 0 {
 		return ""
 	}
@@ -2662,7 +2662,6 @@ func (o *Orchestrator) compactTerminalSessionsOnStartup() {
 }
 
 // reloadConfig applies non-destructive config changes at runtime.
-// Fields that require a restart (repo, model.default) are logged as warnings.
 func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker) {
 	old := o.cfg
 	var changed []string
@@ -2672,21 +2671,21 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		log.Printf("[orch] config reload: repo changed (%s → %s) — requires restart", old.Repo, newCfg.Repo)
 	}
 
-	// model.default and routing.* select the backend router, which is constructed
-	// once at startup and is not safe to re-init mid-flight. Detect a change against
-	// the live (startup) config, do NOT apply it, and raise a persistent
-	// restart-required signal so the operator sees it in `maestro status` / Fleet API
-	// rather than only a one-time log line. Keep o.cfg.Model/Routing unchanged so the
-	// warning keeps firing on every subsequent reload while the config still differs.
-	if newCfg.Model.Default != old.Model.Default {
-		o.markRestartRequired(fmt.Sprintf("model.default changed (%s → %s)", old.Model.Default, newCfg.Model.Default))
-		log.Printf("[orch] config reload: model.default changed (%s → %s) — requires restart (not applied)", old.Model.Default, newCfg.Model.Default)
+	// The router keeps a pointer to o.cfg, so route policy can be swapped live
+	// without reconstructing the orchestrator. Backend command definitions stay
+	// outside this focused reload path; the selector inputs themselves are safe.
+	if newCfg.Model.Default != old.Model.Default ||
+		!strSliceEqual(newCfg.Model.FallbackBackends, old.Model.FallbackBackends) ||
+		!reflect.DeepEqual(newCfg.Model.ProviderLanes, old.Model.ProviderLanes) {
+		changed = append(changed, fmt.Sprintf("model route: %s→%s",
+			old.Model.ResolvedRoute().SelectionReason, newCfg.Model.ResolvedRoute().SelectionReason))
+		o.cfg.Model.Default = newCfg.Model.Default
+		o.cfg.Model.FallbackBackends = append([]string(nil), newCfg.Model.FallbackBackends...)
+		o.cfg.Model.ProviderLanes = append([]config.ProviderLane(nil), newCfg.Model.ProviderLanes...)
 	}
 	if !reflect.DeepEqual(newCfg.Routing, old.Routing) {
-		o.markRestartRequired(fmt.Sprintf("routing.* changed (router_model %s → %s, mode %s → %s)",
-			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode))
-		log.Printf("[orch] config reload: routing.* changed (router_model %s → %s, mode %s → %s) — requires restart (not applied)",
-			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode)
+		changed = append(changed, fmt.Sprintf("routing: mode %s→%s", old.Routing.Mode, newCfg.Routing.Mode))
+		o.cfg.Routing = newCfg.Routing
 	}
 
 	// Hot-reloadable fields
@@ -7504,9 +7503,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				sess.BackendSelection = sel
 			} else {
 				sess.BackendSelection = &state.BackendSelection{
-					SelectedBackend: backendName,
-					SelectionReason: backendReason,
-					TaskType:        taskType,
+					SelectedBackend:      backendName,
+					SelectionReason:      backendReason,
+					RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
+					TaskType:             taskType,
 				}
 			}
 			if taskType != "" && len(sess.Attribution) > 0 {

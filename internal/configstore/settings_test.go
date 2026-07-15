@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,62 @@ func TestProjectOverrideBeatsFleet(t *testing.T) {
 	}
 	if !cfgB.Supervisor.Enabled {
 		t.Fatal("project b keeps its own supervisor.enabled true")
+	}
+}
+
+func TestProviderLanesFleetDefaultAndProjectOverride(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	projectYAML := `
+repo: owner/routes
+model:
+  default: claude
+  backends:
+    claude: {cmd: claude, provider: anthropic}
+    sol: {cmd: codex, provider: openai, model: gpt-5.6-sol, effort: high}
+    gpt55: {cmd: codex, provider: openai, model: gpt-5.5, effort: high}
+`
+	if err := store.UpsertProject(ctx, "routes", projectYAML); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	fleetValue := `[
+  {"provider":"anthropic","default":"claude"},
+  {"provider":"openai","default":"sol","fallback_backends":["gpt55"]}
+]`
+	if err := store.SetFleetSetting(ctx, "model.provider_lanes", fleetValue, "fleet-admin"); err != nil {
+		t.Fatalf("SetFleetSetting: %v", err)
+	}
+	cfg, err := store.Load(ctx, "routes")
+	if err != nil {
+		t.Fatalf("Load fleet route: %v", err)
+	}
+	if got := cfg.Model.ResolvedRoute().Backends; !reflect.DeepEqual(got, []string{"claude", "sol", "gpt55"}) {
+		t.Fatalf("fleet route = %v", got)
+	}
+	if got := cfg.SettingsSources["model.provider_lanes"]; got != config.SettingSourceFleet {
+		t.Fatalf("fleet route source = %q", got)
+	}
+
+	projectValue := `[{"provider":"openai","default":"sol","fallback_backends":["gpt55"]}]`
+	if err := store.SetProjectSetting(ctx, "routes", "model.provider_lanes", projectValue, "project-owner"); err != nil {
+		t.Fatalf("SetProjectSetting: %v", err)
+	}
+	cfg, err = store.Load(ctx, "routes")
+	if err != nil {
+		t.Fatalf("Load project route: %v", err)
+	}
+	if got := cfg.Model.ResolvedRoute().Backends; !reflect.DeepEqual(got, []string{"sol", "gpt55"}) {
+		t.Fatalf("project route = %v", got)
+	}
+	if got := cfg.SettingsSources["model.provider_lanes"]; got != config.SettingSourceProject {
+		t.Fatalf("project route source = %q", got)
+	}
+	audit, err := store.SettingsAudit(ctx, 2)
+	if err != nil {
+		t.Fatalf("SettingsAudit: %v", err)
+	}
+	if len(audit) != 2 || audit[0].Scope != scopeProject("routes") || audit[1].Scope != scopeFleet {
+		t.Fatalf("route audit = %+v", audit)
 	}
 }
 
@@ -269,6 +326,10 @@ func TestExportImportRoundTripsFleetSettings(t *testing.T) {
 	if err := src.SetFleetSetting(ctx, "worker_max_tokens", "123456", "tester"); err != nil {
 		t.Fatalf("set tokens: %v", err)
 	}
+	route := `[{"provider":"anthropic","default":"claude"},{"provider":"openai","default":"sol","fallback_backends":["gpt55"]}]`
+	if err := src.SetFleetSetting(ctx, "model.provider_lanes", route, "tester"); err != nil {
+		t.Fatalf("set provider lanes: %v", err)
+	}
 
 	dir := t.TempDir()
 	if err := src.ExportDir(ctx, dir); err != nil {
@@ -285,5 +346,8 @@ func TestExportImportRoundTripsFleetSettings(t *testing.T) {
 	}
 	if got["supervisor.enabled"] != "false" || got["worker_max_tokens"] != "123456" {
 		t.Fatalf("round-tripped fleet settings = %v", got)
+	}
+	if got["model.provider_lanes"] != route {
+		t.Fatalf("round-tripped provider lanes = %q, want %q", got["model.provider_lanes"], route)
 	}
 }

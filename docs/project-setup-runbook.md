@@ -318,6 +318,44 @@ model:
       cmd: codex
 ```
 
+### Provider-local defaults and fallbacks
+
+Use provider lanes when the project should exhaust models within one provider
+before advancing to the next provider:
+
+```yaml
+model:
+  provider_lanes:
+    - provider: anthropic
+      default: claude
+    - provider: openai
+      default: sol
+      fallback_backends: [gpt55]
+  backends:
+    claude:
+      cmd: claude
+      provider: anthropic
+      model: fable-5
+      effort: high
+    sol:
+      cmd: codex
+      provider: openai
+      model: gpt-5.6-sol
+      effort: high
+    gpt55:
+      cmd: codex
+      provider: openai
+      model: gpt-5.5
+      effort: high
+```
+
+The route is deterministic: `claude -> sol -> gpt55`. Existing
+`model:<backend>` labels still select their named backend, and an explicit
+`model.fallback_backends` list remains a backward-compatible project override.
+Do not leave fallback intent implicit: without either provider lanes or an
+explicit chain, Maestro uses only `model.default` and will not sort the backend
+map to invent a route.
+
 ### Optional: sub-agent model policy (`subagent_hint`)
 
 When a worker backend is an orchestrating CLI such as Claude Code, it spawns its own sub-agents and, by default, runs them on the same expensive model as the orchestrator. Bulk grunt subtasks (file sweeps, searches, mechanical edits) then burn the subscription window at orchestrator-model prices, multiplied across parallel sub-agents. Set `model.backends.<name>.subagent_hint` to steer those sub-agents to cheaper models; the worker prompt gains a "Sub-agent Model Policy" section carrying the text verbatim. The field is optional and field-driven — backends without it render an unchanged prompt, so non-orchestrating backends (codex, gemini, …) can leave it unset. A recommended default ships under the claude backend in `maestro.yaml.example`:

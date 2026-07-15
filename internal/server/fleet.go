@@ -1443,6 +1443,9 @@ type fleetSettingSource struct {
 type fleetModelPolicy struct {
 	Default          string                        `json:"default"`
 	FallbackBackends []string                      `json:"fallback_backends,omitempty"`
+	ProviderLanes    []config.ProviderLane         `json:"provider_lanes,omitempty"`
+	ResolvedRoute    []string                      `json:"resolved_route"`
+	SelectionReason  string                        `json:"selection_reason"`
 	Backends         []fleetEffectiveBackendConfig `json:"backends"`
 	Routing          fleetEffectiveRoutingConfig   `json:"routing"`
 }
@@ -3839,14 +3842,18 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Name < backends[j].Name })
 
 	meteredBackend, meteredRefused := cfg.SupervisorMeteredRefusal()
+	modelRoute := cfg.Model.ResolvedRoute()
 
 	retention := cfg.SessionRetention
 	return fleetEffectiveConfig{
 		ProjectID:      strings.TrimSpace(cfg.ProjectID),
 		ManagementHome: fleetManagementHomeFromConfig(cfg.ManagementHome),
 		ModelPolicy: fleetModelPolicy{
-			Default:          strings.TrimSpace(cfg.Model.Default),
+			Default:          cfg.Model.EffectiveDefault(),
 			FallbackBackends: append([]string(nil), cfg.Model.FallbackBackends...),
+			ProviderLanes:    append([]config.ProviderLane(nil), modelRoute.Lanes...),
+			ResolvedRoute:    append([]string(nil), modelRoute.Backends...),
+			SelectionReason:  modelRoute.SelectionReason,
 			Backends:         backends,
 			Routing: fleetEffectiveRoutingConfig{
 				Mode:                strings.TrimSpace(cfg.Routing.Mode),

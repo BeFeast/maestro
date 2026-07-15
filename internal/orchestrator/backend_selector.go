@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"log"
-	"sort"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -177,8 +176,9 @@ func (o *Orchestrator) selectProviderLimitFallback(st *state.State, sess *state.
 // triggered the fallover in the session's BackendSelection audit record.
 func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Session, now time.Time, selectionReason string) state.BackendSelection {
 	selection := state.BackendSelection{
-		SelectionReason: selectionReason,
-		PreviousBackend: backendName(sess),
+		SelectionReason:      selectionReason,
+		RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
+		PreviousBackend:      backendName(sess),
 	}
 	for _, candidate := range o.backendFallbackCandidates(sess) {
 		entry := state.BackendCandidate{Backend: candidate, Fit: 0.5, Policy: 0.5, Final: 0.5}
@@ -252,7 +252,7 @@ func (o *Orchestrator) resolveDispatchBackend(st *state.State, issue github.Issu
 		return decision, true, nil
 	}
 	earliest := blockedRetry
-	for _, candidate := range o.dispatchBackendCandidates() {
+	for _, candidate := range o.dispatchBackendCandidates(decision.Backend) {
 		if candidate == decision.Backend {
 			continue
 		}
@@ -302,39 +302,11 @@ func (o *Orchestrator) dispatchBackendBlock(st *state.State, name string, now ti
 	return "", nil
 }
 
-// dispatchBackendCandidates is the substitution order for a fresh dispatch
-// whose routed backend is blocked: the default backend first, then the
-// configured fallback chain — the same chain selectBackendFallback walks —
-// and, only when no explicit chain is configured, the remaining configured
-// backends sorted by name.
-func (o *Orchestrator) dispatchBackendCandidates() []string {
-	seen := make(map[string]bool)
-	ordered := make([]string, 0, len(o.cfg.Model.Backends)+1)
-	add := func(name string) {
-		if name == "" || seen[name] {
-			return
-		}
-		seen[name] = true
-		ordered = append(ordered, name)
-	}
-	add(o.cfg.Model.Default)
-	for _, name := range o.cfg.Model.FallbackBackends {
-		add(name)
-	}
-	if len(o.cfg.Model.FallbackBackends) > 0 {
-		return ordered
-	}
-	remaining := make([]string, 0, len(o.cfg.Model.Backends))
-	for name := range o.cfg.Model.Backends {
-		if !seen[name] {
-			remaining = append(remaining, name)
-		}
-	}
-	sort.Strings(remaining)
-	for _, name := range remaining {
-		add(name)
-	}
-	return ordered
+// dispatchBackendCandidates is the deterministic remainder of the effective
+// model route after the routed backend. A backend map is never used as an
+// implicit fallback chain.
+func (o *Orchestrator) dispatchBackendCandidates(current string) []string {
+	return o.cfg.Model.DispatchCandidates(current)
 }
 
 // earliestCandidateRetry returns the earliest cooldown expiry recorded across
@@ -372,45 +344,18 @@ func retryAfterHint(retryAfter *time.Time) string {
 }
 
 func (o *Orchestrator) backendFallbackCandidates(sess *state.Session) []string {
-	seen := make(map[string]bool)
-	ordered := make([]string, 0, len(o.cfg.Model.Backends)+len(o.cfg.Model.FallbackBackends)+1)
-	add := func(name string) {
-		if name == "" || seen[name] {
-			return
-		}
-		seen[name] = true
-		ordered = append(ordered, name)
-	}
-	for _, name := range o.cfg.Model.FallbackBackends {
-		add(name)
-	}
-	if len(o.cfg.Model.FallbackBackends) > 0 {
-		return ordered
-	}
-	add(o.cfg.Model.Default)
-
-	remaining := make([]string, 0, len(o.cfg.Model.Backends))
-	for name := range o.cfg.Model.Backends {
-		if !seen[name] {
-			remaining = append(remaining, name)
-		}
-	}
-	sort.Strings(remaining)
-	for _, name := range remaining {
-		add(name)
-	}
-	return ordered
+	return o.cfg.Model.FallbackCandidates(backendName(sess))
 }
 
 func backendFitScore(name string, cfg *config.Config) float64 {
-	if name == cfg.Model.Default {
+	if name == cfg.Model.EffectiveDefault() {
 		return 0.8
 	}
 	return 0.6
 }
 
 func backendPolicyScore(name string, cfg *config.Config) float64 {
-	if name == cfg.Model.Default {
+	if name == cfg.Model.EffectiveDefault() {
 		return 0.9
 	}
 	return 0.6

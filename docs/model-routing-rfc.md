@@ -25,6 +25,7 @@ Every lever that influences which backend/model/effort a worker runs on lives in
 | `model.default` | the backend used when nothing else fires | `internal/config/config.go:279` (`ModelConfig.Default`) |
 | `model.backends[*]` | `cmd`, `extra_args`, `prompt_mode`, `enabled`, `provider`, `model`, `variant`, `effort`, `pricing`, `quota`, `non_agentic`, `subagent_hint`, `mcp` | `internal/config/config.go:26-90` (`BackendDef`) |
 | `model.fallback_backends` | ordered list tried when the current backend is *blocked* | `internal/config/config.go:281` |
+| `model.provider_lanes` | ordered provider defaults plus provider-local fallback chains; used when no explicit `fallback_backends` override is set | `internal/config/provider_routing.go` |
 | `routing.mode` | `"manual"` (default) or `"auto"` | `internal/config/config.go:786`, default set at `internal/config/config.go:1429-1430` |
 | `routing.router_model` / `routing.router_model_name` | which backend + model id runs the LLM router | `internal/config/config.go:787-788`, defaults at `:1432-1436` |
 | `routing.router_prompt` | router prompt template | `internal/config/config.go:789` |
@@ -204,11 +205,35 @@ on a work-quality failure. The three trigger classes:
 | Backend auth / credential failure | `recordBackendFailure` (`:107-132`) | `selectBackendFallback` with `fallback_after_backend_auth_failure` |
 | Model unavailable (model pulled/renamed/no access) | `recordBackendFailure` with `BackendBlockModelUnavailable` (copy at `:38-55`; detector `internal/worker/backendfailure.go:37-97`) | `selectBackendFallback` with `fallback_after_backend_model_unavailable` |
 
-`selectBackendFallback` walks `backendFallbackCandidates`
-(`internal/orchestrator/backend_selector.go:313-342`) — the configured
-`fallback_backends` chain, else `model.default` + remaining backends — skipping
-disabled, current, already-tried, and cooling-down candidates. Fresh dispatch
-uses the parallel `dispatchBackendCandidates` (`:275-303`).
+`selectBackendFallback` walks the exact route resolved by
+`ModelConfig.ResolvedRoute`. A project-level `fallback_backends` chain is the
+legacy explicit override. Otherwise `provider_lanes` composes each provider's
+default and local fallbacks before moving to the next provider. With neither
+configured, only `model.default` is eligible; backend-map iteration order is
+never a fallback policy. Disabled, current, already-tried, and cooling-down
+candidates are skipped. Fresh dispatch uses the same route, with wraparound only
+to recover from an unavailable label/policy pin; a live outage fallback moves
+forward and never cycles back to an earlier backend.
+
+Example:
+
+```yaml
+model:
+  provider_lanes:
+    - provider: anthropic
+      default: claude
+    - provider: openai
+      default: sol
+      fallback_backends: [gpt55]
+  backends:
+    claude: {provider: anthropic, model: fable-5, effort: high}
+    sol: {provider: openai, model: gpt-5.6-sol, effort: high}
+    gpt55: {provider: openai, model: gpt-5.5, effort: high}
+```
+
+The effective route is `claude -> sol -> gpt55`. A model-specific cooldown is
+keyed by backend, so cooling `sol` does not block `gpt55` even though both are in
+the OpenAI lane.
 
 All three trigger classes set `sess.RateLimitHit = true`
 (`internal/orchestrator/backend_selector.go:79`, `:120`), which **excludes the

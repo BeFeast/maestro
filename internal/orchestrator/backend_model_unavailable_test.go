@@ -297,3 +297,42 @@ func TestResolveDispatchBackend_DefaultInModelUnavailableCooldown_SubstitutesFal
 		t.Fatalf("retryAt = %v, want nil for a dispatchable decision", retryAt)
 	}
 }
+
+func TestProviderLaneFallback_ClaudeThenSOLThenGPT55(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "anthropic", Default: "claude"},
+			{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+		},
+		Backends: map[string]config.BackendDef{
+			"claude": {Cmd: "claude", Provider: "anthropic"},
+			"sol":    {Cmd: "codex", Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+			"gpt55":  {Cmd: "codex", Provider: "openai", Model: "gpt-5.5", Effort: "high"},
+		},
+	}}
+	o := &Orchestrator{cfg: cfg}
+	now := time.Now().UTC()
+	st := state.NewState()
+
+	fromClaude := &state.Session{Backend: "claude", TriedBackends: []string{"claude"}}
+	first := o.selectBackendFallback(st, fromClaude, now, selectionReasonModelUnavailableFallback)
+	if first.SelectedBackend != "sol" || first.RouteSelectionReason != config.ModelRouteProviderLanes {
+		t.Fatalf("claude fallback = %+v, want sol via provider_lanes", first)
+	}
+
+	retryAfter := now.Add(10 * time.Minute)
+	st.BackendHealth["sol"] = state.BackendHealth{
+		State: state.BackendHealthCooldown, Reason: state.BackendBlockModelUnavailable, RetryAfter: &retryAfter,
+	}
+	fromSOL := &state.Session{Backend: "sol", TriedBackends: []string{"claude", "sol"}}
+	second := o.selectBackendFallback(st, fromSOL, now, selectionReasonModelUnavailableFallback)
+	if second.SelectedBackend != "gpt55" {
+		t.Fatalf("SOL fallback = %+v, want gpt55", second)
+	}
+	for _, candidate := range second.CandidateScores {
+		if candidate.Backend == "gpt55" && !candidate.Available {
+			t.Fatalf("SOL model cooldown incorrectly blocked gpt55: %+v", candidate)
+		}
+	}
+}

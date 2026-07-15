@@ -1169,6 +1169,15 @@ export function WorkerDrawer({ worker, onClose, now }) {
 
           <WorkerSpendSection worker={worker} fleet={fleet} />
 
+          {worker.backend_selection && (
+            <div className="drawer-sec">
+              <div className="drawer-sec-title">Backend selection</div>
+              <div className="kv"><span>Backend</span><strong className="mono">{worker.backend_selection.selected_backend || worker.backend || "—"}</strong></div>
+              <div className="kv"><span>Decision</span><span className="mono">{worker.backend_selection.selection_reason || "—"}</span></div>
+              <div className="kv"><span>Route</span><span className="mono">{worker.backend_selection.route_selection_reason || "—"}</span></div>
+            </div>
+          )}
+
           <div className="drawer-sec">
             <div className="drawer-sec-title">Next action</div>
             <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", fontSize: 12.5, color: "var(--fg-1)", borderLeft: "2px solid var(--accent)" }}>
@@ -2083,7 +2092,15 @@ function EffectiveConfigView({ project, onEdit }) {
         <div className="settings-section-title">Model policy</div>
         <div className="kv"><span>Default</span><strong className="mono">{cfg.modelPolicy?.default || "—"}</strong></div>
         <div className="kv"><span>Fallbacks</span><TagList values={cfg.modelPolicy?.fallbackBackends} /></div>
+        <div className="kv"><span>Resolved route</span><TagList values={cfg.modelPolicy?.resolvedRoute} /></div>
+        <div className="kv"><span>Selection reason</span><strong className="mono">{cfg.modelPolicy?.selectionReason || "—"}</strong></div>
         <div className="kv"><span>Routing</span><span className="mono">{routingLabel(cfg.modelPolicy?.routing)}</span></div>
+        {(cfg.modelPolicy?.providerLanes || []).map(lane => (
+          <div className="kv" key={`${lane.provider}:${lane.default}`}>
+            <span>{lane.provider}</span>
+            <TagList values={[lane.default, ...(lane.fallbackBackends || [])]} />
+          </div>
+        ))}
         <div className="settings-backends">
           {(cfg.modelPolicy?.backends || []).map(backend => (
             <div key={backend.name} className="settings-backend">

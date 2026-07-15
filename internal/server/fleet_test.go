@@ -500,6 +500,31 @@ func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 	}
 }
 
+func TestFleetEffectiveConfigShowsProviderLanesAndResolvedRoute(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "anthropic", Default: "claude"},
+			{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+		},
+		Backends: map[string]config.BackendDef{
+			"claude": {Provider: "anthropic"},
+			"sol":    {Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+			"gpt55":  {Provider: "openai", Model: "gpt-5.5", Effort: "high"},
+		},
+	}}
+	eff := buildFleetEffectiveConfig(cfg)
+	if eff.ModelPolicy.SelectionReason != config.ModelRouteProviderLanes {
+		t.Fatalf("selection reason = %q", eff.ModelPolicy.SelectionReason)
+	}
+	if !reflect.DeepEqual(eff.ModelPolicy.ResolvedRoute, []string{"claude", "sol", "gpt55"}) {
+		t.Fatalf("resolved route = %v", eff.ModelPolicy.ResolvedRoute)
+	}
+	if len(eff.ModelPolicy.ProviderLanes) != 2 || eff.ModelPolicy.ProviderLanes[1].FallbackBackends[0] != "gpt55" {
+		t.Fatalf("provider lanes = %+v", eff.ModelPolicy.ProviderLanes)
+	}
+}
+
 // effective_config.settings reports each cost/LLM knob with the layer that
 // supplied its value (#839), so Mission Control can highlight non-default overrides.
 func TestFleetEffectiveConfigSettingsSource(t *testing.T) {

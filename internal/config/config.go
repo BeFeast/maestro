@@ -350,6 +350,11 @@ type ModelConfig struct {
 	Default          string                `yaml:"default"` // "claude", "codex", etc.
 	Backends         map[string]BackendDef `yaml:"backends"`
 	FallbackBackends []string              `yaml:"fallback_backends"` // ordered list of backends to try when rate-limited
+	// ProviderLanes declares provider-local defaults and fallback order. When
+	// fallback_backends is set, that legacy explicit backend chain remains the
+	// project override. Otherwise lanes compose in declaration order, with each
+	// provider's default followed by its local fallbacks before the next provider.
+	ProviderLanes []ProviderLane `yaml:"provider_lanes,omitempty"`
 }
 
 // VersioningConfig controls automatic version bumping on PR merge.
@@ -2271,7 +2276,11 @@ func parse(data []byte) (*Config, error) {
 
 	// Model backend defaults
 	if cfg.Model.Default == "" {
-		cfg.Model.Default = "claude"
+		if len(cfg.Model.ProviderLanes) > 0 && strings.TrimSpace(cfg.Model.ProviderLanes[0].Default) != "" {
+			cfg.Model.Default = strings.TrimSpace(cfg.Model.ProviderLanes[0].Default)
+		} else {
+			cfg.Model.Default = "claude"
+		}
 	}
 	if cfg.Model.Backends == nil {
 		cfg.Model.Backends = make(map[string]BackendDef)
@@ -2305,6 +2314,9 @@ func parse(data []byte) (*Config, error) {
 		if def.NonAgentic {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
 		}
+	}
+	if err := validateProviderLanes(cfg); err != nil {
+		return nil, err
 	}
 
 	// #704: quota calibration sanity. Capacities must be non-negative and
