@@ -631,6 +631,13 @@ systemctl --user list-units 'maestro*'
 journalctl --user -u maestro.service -f
 ```
 
+Provider tokens/keys must not be literal `Environment=` values. Install one
+owner-only service credential file and reference it with
+`MAESTRO_WORKER_CREDENTIALS_FILE`; see the
+[worker credential boundary and migration runbook](docs/worker-credential-boundary-runbook.md).
+Generated workers receive values only at process start and persist names/path
+references only.
+
 The whole cutover (seed store → stop legacy units → start the daemon → verify
 `:8786/api/v1/fleet`) is automated by `scripts/migrate-to-daemon.sh`:
 

@@ -2445,34 +2445,14 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 	// (+ crashpad) processes and their temp dirs behind; clean them on startup.
 	worker.SweepStaleVisualQA()
 
+	// One-time startup sequence before the first poll cycle. The provider-
+	// credential scrub (#888) runs in BOTH the long-running daemon and a
+	// `run --once` reconcile; the daemon-restart reconciliation steps are
+	// daemon-only. Split into runStartupTasks so the once/daemon gating is
+	// unit-testable without driving a full poll cycle.
+	o.runStartupTasks(once)
+
 	if !once {
-		// The long-running daemon just (re)started — that is the "restart" the
-		// restart-required banner asks for. Reconcile any stale restart_required
-		// flag persisted by a previous process into this process's reality (the
-		// in-memory signal is false on a clean start) so the banner does not
-		// survive the very restart it requested. A genuine post-start config
-		// change still re-raises the signal via reloadConfig.
-		o.clearStaleRestartRequired()
-
-		// Full ProjectV2 item sweeps are expensive and only repair board drift.
-		// Do not run one immediately after every daemon restart; session-state
-		// mirroring still runs, and the broad sweep can wait for the normal
-		// throttle window.
-		o.deferProjectBoardSweep(time.Now().UTC())
-
-		// Graceful drain (#541) is a one-shot "drain then restart" request. A
-		// fresh daemon must start in normal (non-drained) mode, so clear any
-		// leftover drain flag before the first cycle. Only the long-running
-		// daemon clears it — a `run --once` reconcile tick must not lift a
-		// drain that an operator is mid-way through.
-		o.clearSpawnDrainOnStartup()
-
-		// #497: bound state.Sessions growth — sweep terminal sessions
-		// older than the retention window at daemon startup, before the
-		// first poll cycle. Idempotent: a no-op when nothing is past the
-		// floors. Failures are logged inside the helper.
-		o.compactTerminalSessionsOnStartup()
-
 		// #794: de-phase this flow from the rest of the fleet before the first
 		// cycle. The daemon starts all flows in a tight loop and each anchors
 		// its poll ticker to its first RunOnce, so without a phase offset the 8
@@ -2519,6 +2499,70 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 			o.reloadConfig(newCfg, &ticker)
 		}
 	}
+}
+
+// runStartupTasks performs the one-time startup sequence before the first poll
+// cycle, gated on run mode. It is split out of Run so the once/daemon gating is
+// unit-testable without driving a full cycle (which would touch GitHub).
+//
+// The provider-credential scrub (#888) runs in BOTH the long-running daemon and
+// a `run --once` reconcile: a one-shot deployment must not retain stale, raw
+// `*-run.env` credential copies until some future daemon happens to start
+// (greptile P1 on #890). It is a pure file-content/mode pass that never signals
+// a worker process, so it is safe on a live fleet and cannot repeat the #877
+// control-group kill.
+//
+// The restart-reconciliation steps below only make sense for the long-running
+// daemon (they lift flags a previous process persisted, or defer expensive
+// sweeps) and are deliberately skipped for a `run --once` reconcile tick.
+func (o *Orchestrator) runStartupTasks(once bool) {
+	// #888: inventory and scrub provider-credential material a pre-fix daemon
+	// left in the state dir — remove stale per-worker `*-run.env` copies, strip
+	// inlined credential exports from legacy `*-run.sh`, redact historical text
+	// state/prompts/logs in place, and repair permissions. Runs in every mode; see
+	// this function's doc comment.
+	o.scrubLegacyCredentialArtifactsOnStartup()
+
+	if once {
+		return
+	}
+
+	// The long-running daemon just (re)started — that is the "restart" the
+	// restart-required banner asks for. Reconcile any stale restart_required flag
+	// persisted by a previous process into this process's reality (the in-memory
+	// signal is false on a clean start) so the banner does not survive the very
+	// restart it requested. A genuine post-start config change still re-raises
+	// the signal via reloadConfig.
+	o.clearStaleRestartRequired()
+
+	// Full ProjectV2 item sweeps are expensive and only repair board drift. Do
+	// not run one immediately after every daemon restart; session-state mirroring
+	// still runs, and the broad sweep can wait for the normal throttle window.
+	o.deferProjectBoardSweep(time.Now().UTC())
+
+	// Graceful drain (#541) is a one-shot "drain then restart" request. A fresh
+	// daemon must start in normal (non-drained) mode, so clear any leftover drain
+	// flag before the first cycle. Only the long-running daemon clears it — a
+	// `run --once` reconcile tick must not lift a drain that an operator is
+	// mid-way through.
+	o.clearSpawnDrainOnStartup()
+
+	// #497: bound state.Sessions growth — sweep terminal sessions older than the
+	// retention window at daemon startup, before the first poll cycle. Idempotent:
+	// a no-op when nothing is past the floors. Failures are logged inside the
+	// helper.
+	o.compactTerminalSessionsOnStartup()
+}
+
+// scrubLegacyCredentialArtifactsOnStartup neutralizes provider-credential
+// material a pre-#888 (or attempt-0) daemon left in the state dir. See
+// worker.ScrubLegacyRunArtifacts for the exact file/mode operations; it is a
+// pure file-content/mode pass that preserves active workers.
+func (o *Orchestrator) scrubLegacyCredentialArtifactsOnStartup() {
+	if o == nil || o.cfg == nil {
+		return
+	}
+	worker.ScrubLegacyRunArtifacts(o.cfg.StateDir)
 }
 
 func (o *Orchestrator) deferProjectBoardSweep(now time.Time) {

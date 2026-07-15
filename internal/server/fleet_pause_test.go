@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,5 +93,45 @@ func TestFleetAPIExposesPausedFlag(t *testing.T) {
 	// project (no omitempty), so the SPA never reads undefined.
 	if got := strings.Count(w.Body.String(), `"paused":`); got != 2 {
 		t.Fatalf(`found %d "paused" keys in response, want one per project (2)`, got)
+	}
+}
+
+// #888: Fleet serializes state/config projections, never the private service
+// credential file. A synthetic canary in the one approved boundary must not
+// appear in the API response.
+func TestFleetAPIDoesNotExposeWorkerCredentialBoundary(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := state.Save(stateDir, state.NewState()); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	credentialDir := t.TempDir()
+	if err := os.Chmod(credentialDir, 0o700); err != nil {
+		t.Fatalf("mkdir credential dir: %v", err)
+	}
+	canary := "CANARY-" + "fleet-zero-copy-" + "0888"
+	credentialFile := filepath.Join(credentialDir, "worker-proxy.env")
+	if err := os.WriteFile(
+		credentialFile,
+		[]byte("OPENAI_API_KEY='"+canary+"'\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write synthetic credential boundary: %v", err)
+	}
+	t.Setenv("MAESTRO_WORKER_CREDENTIALS_FILE", credentialFile)
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("Safe", "/tmp/safe.yaml", "", &config.Config{
+			Repo:        "owner/safe",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if strings.Contains(w.Body.String(), canary) {
+		t.Fatal("Fleet API exposed the private worker credential value")
 	}
 }
