@@ -677,8 +677,10 @@ function mapWatchdogEvent(raw) {
   return {
     action: String(raw.action || ""),
     outcome: String(raw.outcome || ""),
+	stage: String(raw.stage || ""),
     recommendationId: String(raw.recommendation_id || ""),
     reason: String(raw.reason || ""),
+	leaseGeneration: Number(raw.lease_generation || 0),
     phase: String(raw.phase || ""),
     at: String(raw.at || ""),
     completedAt: String(raw.completed_at || ""),
