@@ -488,6 +488,33 @@ const (
 	RecoveryFailed    RecoveryOutcome = "failed"
 )
 
+// RecoveryStage identifies the durable actuator checkpoint reached for one
+// recommendation. Stages are deliberately bounded tokens rather than free text
+// so Fleet can explain recovery without persisting command output or paths.
+type RecoveryStage string
+
+const (
+	RecoveryStageClaimed        RecoveryStage = "claimed"
+	RecoveryStageWorkerStopped  RecoveryStage = "worker_stopped"
+	RecoveryStageRetryScheduled RecoveryStage = "retry_scheduled"
+	RecoveryStageRetryExhausted RecoveryStage = "retry_exhausted"
+	RecoveryStageReconciled     RecoveryStage = "reconciled"
+	RecoveryStageOperatorNeeded RecoveryStage = "operator_reconciliation"
+)
+
+// RecoveryReason is a bounded, secret-free result code for an actuator attempt.
+type RecoveryReason string
+
+const (
+	RecoveryReasonNone              RecoveryReason = ""
+	RecoveryReasonRetryScheduled    RecoveryReason = "retry_scheduled"
+	RecoveryReasonRetryExhausted    RecoveryReason = "retry_budget_exhausted"
+	RecoveryReasonTargetCompleted   RecoveryReason = "target_completed"
+	RecoveryReasonTargetReplaced    RecoveryReason = "target_replaced"
+	RecoveryReasonIdentityUncertain RecoveryReason = "identity_uncertain"
+	RecoveryReasonStopFailed        RecoveryReason = "stop_failed"
+)
+
 // Recovery records actual actuation separately from the evaluator's verdict
 // and recommendation. RecommendationID is the idempotency key: one overdue
 // episode may have at most one attempt, later completed with success/failure.
@@ -496,8 +523,17 @@ type Recovery struct {
 	Target           Target          `json:"target"`
 	Action           Action          `json:"action"`
 	Outcome          RecoveryOutcome `json:"outcome"`
+	Stage            RecoveryStage   `json:"stage,omitempty"`
+	Reason           RecoveryReason  `json:"reason,omitempty"`
 	AttemptedAt      time.Time       `json:"attempted_at"`
+	UpdatedAt        time.Time       `json:"updated_at,omitempty"`
 	CompletedAt      time.Time       `json:"completed_at,omitempty"`
+	// LeaseID is an opaque, non-reversible actuator claim. A concurrent cycle
+	// may take over only after LeaseExpiresAt, and an older owner cannot commit
+	// a result after that takeover.
+	LeaseID         string    `json:"lease_id,omitempty"`
+	LeaseGeneration int       `json:"lease_generation,omitempty"`
+	LeaseExpiresAt  time.Time `json:"lease_expires_at,omitempty"`
 }
 
 // Evaluate advances the watermark and returns the recovery decision for one

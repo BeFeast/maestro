@@ -50,16 +50,24 @@ func EvaluateMaterialProgressOnce(cfg *config.Config, now time.Time) (bool, erro
 	if st.MaterialProgress == nil && budget <= 0 {
 		return false, nil
 	}
-	if st.MaterialProgress != nil && !st.MaterialProgress.EvaluationDue(budget, interval, now) {
-		return false, nil
+	evaluated := false
+	if st.MaterialProgress == nil || st.MaterialProgress.EvaluationDue(budget, interval, now) {
+		if _, err := recordMaterialProgress(cfg, st, now); err != nil {
+			return false, fmt.Errorf("material-progress evaluator: evaluate: %w", err)
+		}
+		if err := state.Save(cfg.StateDir, st); err != nil {
+			return false, fmt.Errorf("material-progress evaluator: save state: %w", err)
+		}
+		evaluated = true
 	}
-	if _, err := recordMaterialProgress(cfg, st, now); err != nil {
-		return false, fmt.Errorf("material-progress evaluator: evaluate: %w", err)
+	// Recovery reconciliation runs even inside the evaluation cadence. A prior
+	// owner may have crashed after claiming/stopping but before scheduling the
+	// existing orchestrator retry; the durable lease expiry, not a fresh
+	// watermark evaluation, controls that takeover.
+	if err := reconcileMaterialProgressRecoveries(cfg, now, defaultMaterialProgressRecoveryRuntime); err != nil {
+		return evaluated, fmt.Errorf("material-progress evaluator: reconcile recovery: %w", err)
 	}
-	if err := state.Save(cfg.StateDir, st); err != nil {
-		return false, fmt.Errorf("material-progress evaluator: save state: %w", err)
-	}
-	return true, nil
+	return evaluated, nil
 }
 
 // RunMaterialProgressEvaluator runs the durable per-project evaluation clock.

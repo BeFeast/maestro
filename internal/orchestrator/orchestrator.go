@@ -2181,7 +2181,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		promptBase = o.maybeAppendPriorAttemptPostmortem(slotName, sess, promptBase)
 
 		var respawnErr error
-		if sess.PRNumber != 0 && sess.Worktree != "" {
+		if sess.Worktree != "" && (sess.PRNumber != 0 || sess.RetryReason == state.RetryReasonStalledProgress) {
 			respawnErr = o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		} else {
 			respawnErr = o.respawnWorkerWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
