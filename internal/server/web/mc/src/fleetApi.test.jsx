@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  aggregateBackendQuota,
+  aggregateProviderModelHealth,
+  formatBackendQuotaSentence,
+  formatProviderModelHealthSentence,
   mapFleetResponse,
   workerSessionsFromFleet,
   workerStatusTaxonomy,
@@ -95,5 +99,67 @@ describe("Fleet workers ordering contract", () => {
       tone: "stuck",
       section: "stuck",
     });
+  });
+});
+
+describe("provider/model credential health", () => {
+  test("surfaces aggregate rotation counts without credential identifiers", () => {
+    const projects = [{
+      provider_model_health: {
+        claude: {
+          "claude-fable-5": {
+            state: "cooldown",
+            reason: "model_cooldown",
+            credential_candidates: 2,
+            credential_candidates_known: true,
+            credential_usable: 0,
+            credential_usable_known: true,
+            aggregate_reason: "all_model_credentials_cooling_down",
+            retry_after: "2026-07-15T12:05:00Z",
+          },
+        },
+      },
+    }];
+
+    const rows = aggregateProviderModelHealth(projects, now);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      provider: "claude",
+      model: "claude-fable-5",
+      credentialCandidates: 2,
+      credentialUsable: 0,
+    });
+    expect(formatProviderModelHealthSentence(rows[0], now)).toContain("0/2 credentials usable");
+    expect(JSON.stringify(rows)).not.toContain("credential_file");
+  });
+
+  test("quota sentence explains a low-usage credential pool can still reject Fable", () => {
+    const modelHealth = aggregateProviderModelHealth([{
+      provider_model_health: {
+        claude: {
+          "claude-fable-5": {
+            state: "cooldown",
+            reason: "model_cooldown",
+            credential_candidates: 2,
+            credential_candidates_known: true,
+            credential_usable: 0,
+            credential_usable_known: true,
+          },
+        },
+      },
+    }], now);
+    const quota = aggregateBackendQuota([{
+      backend_quota: [{
+        backend: "claude",
+        window_cap_tokens: 1000,
+        window_used_tokens: 0,
+        window_percent: 0,
+        dispatch_threshold: 0.85,
+      }],
+    }], modelHealth);
+
+    expect(formatBackendQuotaSentence(quota[0], now)).toContain(
+      "claude-fable-5 unavailable: 0/2 credentials usable",
+    );
   });
 });

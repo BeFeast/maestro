@@ -1732,7 +1732,7 @@ func buildProjectStatusJSON(cfg *config.Config, s *state.State) projectStatusJSO
 // treats those backends as available again even before ReconcileBackendHealth
 // clears the row.
 func showBackendHealth(s *state.State) {
-	if len(s.BackendHealth) == 0 {
+	if len(s.BackendHealth) == 0 && len(s.ProviderModelHealth) == 0 {
 		return
 	}
 	now := time.Now().UTC()
@@ -1747,22 +1747,50 @@ func showBackendHealth(s *state.State) {
 		}
 		names = append(names, name)
 	}
-	if len(names) == 0 {
+	type routeHealth struct {
+		name   string
+		health state.BackendHealth
+	}
+	var routes []routeHealth
+	for provider, models := range s.ProviderModelHealth {
+		for model, health := range models {
+			if health.State != state.BackendHealthCooldown || (health.RetryAfter != nil && !now.Before(*health.RetryAfter)) {
+				continue
+			}
+			routes = append(routes, routeHealth{name: provider + "/" + model, health: health})
+		}
+	}
+	if len(names) == 0 && len(routes) == 0 {
 		return
 	}
 	sort.Strings(names)
+	sort.Slice(routes, func(i, j int) bool { return routes[i].name < routes[j].name })
 	fmt.Printf("Backend health:\n")
-	for _, name := range names {
-		h := s.BackendHealth[name]
+	printHealth := func(name string, h state.BackendHealth) {
 		when := "auto-recovery pending"
 		if h.RetryAfter != nil {
 			when = "until " + h.RetryAfter.UTC().Format("2006-01-02 15:04 MST")
 		}
 		detail := h.Reason
-		if h.Pattern != "" && h.Pattern != h.Reason {
+		if h.CredentialUsableKnown {
+			if h.CredentialCandidatesKnown {
+				detail += fmt.Sprintf("; credentials %d/%d usable", h.CredentialUsable, h.CredentialCandidates)
+			} else {
+				detail += fmt.Sprintf("; credentials %d usable (candidate total not reported)", h.CredentialUsable)
+			}
+		}
+		if h.AggregateReason != "" && h.AggregateReason != h.Reason {
+			detail += "; " + h.AggregateReason
+		} else if h.Pattern != "" && h.Pattern != h.Reason {
 			detail += "; " + h.Pattern
 		}
-		fmt.Printf("  %-16s cooling down %s (%s)\n", name+":", when, detail)
+		fmt.Printf("  %-32s cooling down %s (%s)\n", name+":", when, detail)
+	}
+	for _, name := range names {
+		printHealth(name, s.BackendHealth[name])
+	}
+	for _, route := range routes {
+		printHealth(route.name, route.health)
 	}
 }
 

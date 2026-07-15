@@ -201,14 +201,21 @@ on a work-quality failure. The three trigger classes:
 | Trigger | Detection | Action |
 | --- | --- | --- |
 | Provider rate-limit / quota | `recordProviderLimit` marks the backend cooling-down + `RateLimitHit` — `internal/orchestrator/backend_selector.go:69-95` | `selectProviderLimitFallback` → `selectBackendFallback` — `:134-200` |
-| Backend auth / credential failure | `recordBackendFailure` (`:107-132`) | `selectBackendFallback` with `fallback_after_backend_auth_failure` |
-| Model unavailable (model pulled/renamed/no access) | `recordBackendFailure` with `BackendBlockModelUnavailable` (copy at `:38-55`; detector `internal/worker/backendfailure.go:37-97`) | `selectBackendFallback` with `fallback_after_backend_model_unavailable` |
+| Backend auth / account credential failure | `recordBackendFailure` writes backend-wide `backend_health` | `selectBackendFallback` with `fallback_after_backend_auth_failure` |
+| Model unavailable (model pulled/renamed/no access) | `recordBackendFailure` writes provider/model health when the requested model is known | `selectBackendFallback` with `fallback_after_backend_model_unavailable` |
+| CLIProxyAPI credential pool exhausted for one model | `internal/worker/credential_rotation.go` parses `model_cooldown`; `recordBackendFailure` writes `provider_model_health[provider][model]` with aggregate candidate/usable counts and retry time | `selectBackendFallback` with `fallback_after_backend_model_cooldown`; other models on the provider remain eligible |
 
 `selectBackendFallback` walks `backendFallbackCandidates`
 (`internal/orchestrator/backend_selector.go:313-342`) — the configured
 `fallback_backends` chain, else `model.default` + remaining backends — skipping
 disabled, current, already-tried, and cooling-down candidates. Fresh dispatch
 uses the parallel `dispatchBackendCandidates` (`:275-303`).
+
+Backend-wide health and provider/model health are intentionally separate. A
+single credential entering cooldown is not a Maestro failure signal: the proxy
+continues rotating compatible credentials. Maestro gates a model route only
+after the proxy returns the aggregate `model_cooldown` result, meaning no
+compatible credential is currently usable for that requested model.
 
 All three trigger classes set `sess.RateLimitHit = true`
 (`internal/orchestrator/backend_selector.go:79`, `:120`), which **excludes the

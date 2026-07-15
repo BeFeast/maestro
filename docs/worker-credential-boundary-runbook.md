@@ -83,6 +83,15 @@ After the code and unit migration are installed, the operator still must:
 The synthetic regression suite exercises the same zero-copy invariant without
 using production values.
 
+CLIProxyAPI rotation failures cross this boundary only as a secret-free
+aggregate: provider, requested model, number of candidates when the proxy
+reports it, number usable for that model, aggregate reason, and retry time.
+Credential filenames, account identifiers, selector bindings, request headers,
+and raw proxy payloads must not enter Maestro state, Fleet API responses, or
+Mission Control. A per-credential cooldown is not surfaced as a provider
+failure; the proxy keeps rotating until a compatible credential succeeds or it
+returns the aggregate `model_cooldown` result.
+
 ## Rollback
 
 Keep a reference-only backup drop-in and the prior private credential generation

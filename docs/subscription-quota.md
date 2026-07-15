@@ -16,6 +16,9 @@ With quota calibration configured, maestro instead:
 2. **Exposes it** — `/api/v1/fleet` carries a `backend_quota` row per
    calibrated backend (percent used, reset ETA, pressured flag), and
    Mission Control renders a gauge next to the backend health pills.
+   Provider/model cooldowns are shown alongside the gauge with aggregate
+   credential-pool availability. A low account-level percentage does not prove
+   that a specific model is enabled or currently usable on that credential.
 3. **Steers dispatch** — once estimated usage crosses
    `dispatch_threshold` (default **0.85**), the backend gets a
    BackendHealth cooldown with reason `quota_pressure` and `RetryAfter`
@@ -25,8 +28,9 @@ With quota calibration configured, maestro instead:
    `backend_quota_pressure` supervisor finding (warning) is emitted once
    per pressure episode and self-clears at reset.
 
-Out of scope (by design): keep-alive pings to start the window early,
-multi-account rotation.
+Out of scope (by design): keep-alive pings to start the window early. Credential
+rotation remains owned by CLIProxyAPI; Maestro consumes only its aggregate,
+secret-free result and applies model-scoped fallback.
 
 ## Configuration
 

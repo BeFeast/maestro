@@ -4775,6 +4775,20 @@ func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
 		RetryAfter: &cooldownUntil,
 	}
 	st.BackendHealth["codex"] = state.BackendHealth{State: state.BackendHealthAvailable}
+	st.ProviderModelHealth["claude"] = map[string]state.BackendHealth{
+		"claude-fable-5": {
+			State:                     state.BackendHealthCooldown,
+			Reason:                    state.BackendBlockModelCooldown,
+			Provider:                  "claude",
+			Model:                     "claude-fable-5",
+			CredentialCandidates:      2,
+			CredentialCandidatesKnown: true,
+			CredentialUsable:          0,
+			CredentialUsableKnown:     true,
+			AggregateReason:           "all_model_credentials_cooling_down",
+			RetryAfter:                &cooldownUntil,
+		},
+	}
 	if err := state.Save(stateDir, st); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
@@ -4812,6 +4826,13 @@ func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
 	codexHealth, ok := project.BackendHealth["codex"]
 	if !ok || codexHealth.State != state.BackendHealthAvailable {
 		t.Fatalf("codex health = %+v, want available", codexHealth)
+	}
+	fableHealth, ok := project.ProviderModelHealth["claude"]["claude-fable-5"]
+	if !ok {
+		t.Fatalf("project.provider_model_health missing Fable route: %+v", project.ProviderModelHealth)
+	}
+	if fableHealth.CredentialCandidates != 2 || fableHealth.CredentialUsable != 0 || fableHealth.Reason != state.BackendBlockModelCooldown {
+		t.Fatalf("Fable route health = %+v", fableHealth)
 	}
 
 	worker := findFleetWorker(t, resp.Workers, "one-1")
