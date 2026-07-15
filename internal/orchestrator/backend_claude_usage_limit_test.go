@@ -76,15 +76,15 @@ func TestClassifyBackendFailure_ClaudeSignatures(t *testing.T) {
 				StartedAt: time.Now().UTC().Add(-90 * time.Second),
 				LogFile:   logFile,
 			}
-			hit, reason, pattern := o.classifyBackendFailure(sess, time.Now().UTC())
+			failure, hit := o.classifyBackendFailure(sess, time.Now().UTC())
 			if !hit {
 				t.Fatalf("classifyBackendFailure(%q) = false, want a backend-failure classification", tc.death)
 			}
-			if reason != state.BackendBlockUsageLimit {
-				t.Fatalf("reason = %q, want %q", reason, state.BackendBlockUsageLimit)
+			if failure.reason != state.BackendBlockUsageLimit {
+				t.Fatalf("reason = %q, want %q", failure.reason, state.BackendBlockUsageLimit)
 			}
-			if pattern != tc.pattern {
-				t.Errorf("pattern = %q, want %q", pattern, tc.pattern)
+			if failure.pattern != tc.pattern {
+				t.Errorf("pattern = %q, want %q", failure.pattern, tc.pattern)
 			}
 		})
 	}
