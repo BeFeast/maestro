@@ -18,8 +18,8 @@ credential copy.
 ## File contract
 
 - The file is a regular file owned by the Maestro service user, mode `0600` or
-  stricter, below a directory that is not group/other writable. Symlinks in the
-  path are rejected.
+  stricter, below an owner-only directory owned by that same user (mode `0700`
+  or stricter). Symlinks in the path are rejected.
 - Use simple `KEY=value` assignments. Single- or double-quoted values are
   accepted. Only `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
   `ANTHROPIC_AUTH_TOKEN`, `CLIPROXY_API_KEY`, `GEMINI_API_KEY`,
@@ -62,7 +62,9 @@ Startup reconciliation removes legacy `*-run.env` copies and the obsolete
 exports/source lines, and masks known legacy values in text state, prompts,
 postmortems, audit JSONL, structured output, and logs. Log masking is same-inode
 and same-length, so an active worker's open append descriptor remains valid; the
-scrub never signals or kills a process.
+scrub never signals or kills a process. It also repairs recognized worker text
+artifacts to owner-only modes and the worker log directory to `0700`, even when
+there is no currently known value to mask.
 
 ## Rotation, canary, and zero-copy proof
 
