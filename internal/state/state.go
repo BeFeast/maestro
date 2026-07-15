@@ -68,7 +68,10 @@ const (
 	LiveSessionRecentWindow                         = 24 * time.Hour
 )
 
-const RetryReasonReviewFeedback = "review_feedback"
+const (
+	RetryReasonReviewFeedback  = "review_feedback"
+	RetryReasonStalledProgress = "stalled_progress"
+)
 
 const (
 	BackendHealthAvailable = "available"
@@ -636,6 +639,7 @@ var (
 	ErrApprovalSuperseded      = errors.New("approval is superseded")
 	ErrApprovalPayloadMismatch = errors.New("approval payload changed")
 	ErrStateConflict           = errors.New("state write conflict")
+	ErrNoStateChange           = errors.New("state update made no change")
 )
 
 // SupervisorTarget identifies the primary object a supervisor decision refers to.
@@ -1594,6 +1598,44 @@ func Save(stateDir string, s *State) error {
 	// unchanged.
 	if hook := currentSaveHook(); hook != nil {
 		hook(stateDir, s)
+	}
+	return nil
+}
+
+// Update applies fn to the latest state snapshot while holding the per-project
+// flock, then persists that exact mutation before releasing the lock. It is the
+// compare-and-swap boundary for operations that must validate current identity
+// immediately before changing durable ownership, such as watchdog recovery
+// lease claims. fn must not perform external side effects or re-enter Load/Save.
+func Update(stateDir string, fn func(*State) error) error {
+	if fn == nil {
+		return fmt.Errorf("update state: nil callback")
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+	unlock, err := lockState(stateDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	current, data, err := readStateFile(StatePath(stateDir))
+	if err != nil {
+		return err
+	}
+	current.rememberLoaded(data)
+	if err := fn(current); err != nil {
+		if errors.Is(err, ErrNoStateChange) {
+			return nil
+		}
+		return err
+	}
+	if err := saveLocked(stateDir, current); err != nil {
+		return err
+	}
+	if hook := currentSaveHook(); hook != nil {
+		hook(stateDir, current)
 	}
 	return nil
 }
