@@ -39,6 +39,10 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		}
 	}
 	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		return err
+	}
 	// #841: thread the phase role's effort override into the worker argv via the
 	// existing tier-effort path (claude --effort, codex -c model_reasoning_effort;
 	// gemini drops it). An operator-pinned effort still wins — appendTierModelEffort
@@ -118,6 +122,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.TokensUsedAttempt = 0
+	sess.WorkerOutcome = ""
 	sess.LastNotifiedStatus = ""
 
 	return nil

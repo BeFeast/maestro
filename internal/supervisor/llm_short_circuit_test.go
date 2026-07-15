@@ -7,6 +7,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // idleLLM is an LLM decision that agrees with an idle (action=none) guardrail.
@@ -108,6 +109,30 @@ func TestDecideWithLLM_WaitForRunningWorker_SkipsLLM(t *testing.T) {
 	}
 	if decision.RecommendedAction != ActionWaitForRunningWorker {
 		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionWaitForRunningWorker)
+	}
+}
+
+func TestDecideWithLLM_TokenBudgetExceeded_SkipsLLM(t *testing.T) {
+	cfg := testConfig(t)
+	st := state.NewState()
+	st.Sessions["slot-budget"] = &state.Session{
+		IssueNumber:       906,
+		Status:            state.StatusFailed,
+		WorkerOutcome:     worker.TokenBudgetExceededOutcome,
+		TokensUsedAttempt: 80_000,
+		StartedAt:         time.Now().UTC(),
+	}
+	llm := idleLLM()
+
+	decision, err := testLLMEngine(cfg, &fakeReader{}, llm).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if llm.calls != 0 {
+		t.Fatalf("LLM calls = %d, want 0 for deterministic token budget state", llm.calls)
+	}
+	if decision.RecommendedAction != ActionNone || decision.Target == nil || decision.Target.Session != "slot-budget" {
+		t.Fatalf("decision = %+v, want action=none targeting slot-budget", decision)
 	}
 }
 

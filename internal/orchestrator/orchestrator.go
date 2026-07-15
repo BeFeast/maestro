@@ -1038,6 +1038,39 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	return true
 }
 
+func applyTokenBudgetObservation(sess *state.Session, observed int) {
+	if sess == nil || observed <= sess.TokensUsedAttempt {
+		return
+	}
+	delta := observed - sess.TokensUsedAttempt
+	sess.TokensUsedAttempt = observed
+	sess.TokensUsedTotal += delta
+}
+
+func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Session, marker worker.TokenBudgetMarker, now time.Time) {
+	if sess == nil || sess.WorkerOutcome == worker.TokenBudgetExceededOutcome {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	o.updateTokensUsedFromWorkerLog(slotName, sess)
+	applyTokenBudgetObservation(sess, marker.TokensObserved)
+	sess.WorkerOutcome = worker.TokenBudgetExceededOutcome
+	sess.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
+	sess.Status = state.StatusFailed
+	sess.PID = 0
+	sess.TmuxSession = ""
+	sess.NextRetryAt = nil
+	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
+	log.Printf("[orch] worker %s stopped by token budget: observed=%d max=%d", slotName, sess.TokensUsedAttempt, marker.MaxTokens)
+	if o.notifier != nil {
+		o.notifier.Sendf("maestro: worker %s (issue #%d) stopped at its token budget: %s observed / %s configured",
+			slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(marker.MaxTokens))
+	}
+}
+
 // updatePiUsageFromOutput parses a Pi --mode json event stream from the
 // worker log and stamps model/tokens/cost_usd onto the session. Tokens use
 // the run-total (sum across turns); model is the provider-reported model;
@@ -2886,6 +2919,12 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		if sess.Status != state.StatusRunning {
 			continue
 		}
+		if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+			o.runAfterRunHook(sess)
+			o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+			reconciled = true
+			continue
+		}
 
 		tmuxName := sess.TmuxSession
 		if tmuxName == "" {
@@ -3689,6 +3728,11 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 		// Check if issue is now closed (only for running sessions)
 		if sess.Status == state.StatusRunning {
+			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+				o.runAfterRunHook(sess)
+				o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+				continue
+			}
 			closed, err := o.isIssueClosed(sess.IssueNumber)
 			if err != nil {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
@@ -4027,20 +4071,21 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Token limit enforcement ---
-					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
-						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
+					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt >= o.cfg.WorkerMaxTokens && sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+						log.Printf("[orch] worker %s reached token limit (%d >= %d), killing",
 							slotName, sess.TokensUsedAttempt, o.cfg.WorkerMaxTokens)
 						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
 						}
 						now := time.Now().UTC()
-						sess.Status = state.StatusDead
-						sess.LastNotifiedStatus = "token_limit"
-						sess.FinishedAt = &now
-						state.MarkWorkerEnded(sess, now)
-						o.notifier.Sendf("⚠️ Worker %s (issue #%d) exceeded token limit: %s tokens used (attempt), %s total",
-							slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(sess.TokensUsedTotal))
+						o.markTokenBudgetExceeded(slotName, sess, worker.TokenBudgetMarker{
+							Outcome:        worker.TokenBudgetExceededOutcome,
+							Backend:        sess.Backend,
+							TokensObserved: sess.TokensUsedAttempt,
+							MaxTokens:      o.cfg.WorkerMaxTokens,
+							MeasuredAt:     now,
+						}, now)
 						continue
 					}
 

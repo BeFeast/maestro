@@ -53,6 +53,27 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
 
+	// Resolve and validate the backend before creating a worktree or running the
+	// pre-worker pipeline. A positive hard budget must fail closed before any
+	// auxiliary planning/model work can spend tokens.
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return "", fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		return "", err
+	}
+
 	// #734: sync the local base branch to origin so the worker branches from an
 	// up-to-date base, then root the worktree directly at origin/main. A stale
 	// or diverged base fails loudly here rather than silently branching from it.
@@ -94,21 +115,6 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	if section := pipelineResult.PromptSection(); section != "" {
 		promptBase = promptBase + section
 	}
-
-	// Determine backend
-	if backendName == "" {
-		backendName = cfg.Model.Default
-	}
-	backendDef, ok := cfg.Model.Backends[backendName]
-	if !ok {
-		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
-		backendName = cfg.Model.Default
-		backendDef, ok = cfg.Model.Backends[backendName]
-		if !ok {
-			return "", fmt.Errorf("backend %q (default) not found in config", backendName)
-		}
-	}
-	backendCfg := workerBackendConfig(backendDef)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -194,6 +200,25 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
 // The session is updated in place with new PID, worktree, branch, and timestamps.
 func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	// Validate the replacement backend before killing the old session or
+	// removing its worktree.
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		return err
+	}
+
 	// Clean up old worker (tmux session, process, worktree)
 	Stop(cfg, slotName, sess)
 
@@ -243,20 +268,6 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	if section := pipelineResult.PromptSection(); section != "" {
 		promptBase = promptBase + section
 	}
-
-	// Determine backend
-	if backendName == "" {
-		backendName = cfg.Model.Default
-	}
-	backendDef, ok := cfg.Model.Backends[backendName]
-	if !ok {
-		backendName = cfg.Model.Default
-		backendDef, ok = cfg.Model.Backends[backendName]
-		if !ok {
-			return fmt.Errorf("backend %q (default) not found in config", backendName)
-		}
-	}
-	backendCfg := workerBackendConfig(backendDef)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -336,6 +347,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.TokensUsedAttempt = 0
+	sess.WorkerOutcome = ""
 	// CIFailureOutput and PreviousAttemptFeedback are normally cleared by
 	// respawnDueRetries before this call, but cleared here defensively in
 	// case Respawn is called from other paths.

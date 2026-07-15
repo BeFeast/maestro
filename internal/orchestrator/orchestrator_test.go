@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 func makeIssue(number int, title string, labels ...string) github.Issue {
@@ -2949,11 +2951,11 @@ func TestCheckSessions_TokenLimitExceeded_KillsWorker(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-1"]
-	if sess.Status != state.StatusDead {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusFailed)
 	}
-	if sess.LastNotifiedStatus != "token_limit" {
-		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "token_limit")
+	if sess.LastNotifiedStatus != worker.TokenBudgetExceededOutcome || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("budget outcome = %q/%q, want %q", sess.LastNotifiedStatus, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
 	}
 	if sess.TokensUsedAttempt != 75000 {
 		t.Fatalf("tokens_used = %d, want 75000", sess.TokensUsedAttempt)
@@ -3086,7 +3088,7 @@ func TestCheckSessions_TokenLimitZero_NoEnforcement(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_TokenLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
+func TestCheckSessions_LegacyTokenNotificationDoesNotSuppressOutcome(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",
 		WorkerMaxTokens:   50000,
@@ -3109,22 +3111,21 @@ func TestCheckSessions_TokenLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-4"]
-	// Should remain running — the token_limit kill was already applied in a prior cycle
-	if sess.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want %q (already notified, should not re-kill)", sess.Status, state.StatusRunning)
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/outcome = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
 	}
-	if len(*stopped) != 0 {
-		t.Fatalf("stopped = %v, want empty (should not duplicate kill)", *stopped)
+	if len(*stopped) != 1 {
+		t.Fatalf("stopped = %v, want one deterministic stop", *stopped)
 	}
 }
 
-func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
+func TestCheckSessions_TokensAtExactLimit_WorkerStops(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",
 		WorkerMaxTokens:   50000,
 		MaxRuntimeMinutes: 999,
 	}
-	// Worker output reports exactly 50,000 tokens — at limit, not over (strict >)
+	// The hard ceiling stops before another provider response can exceed it.
 	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 50000")
 
 	s := state.NewState()
@@ -3140,8 +3141,8 @@ func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-5"]
-	if sess.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want %q (at exact limit, uses strict >)", sess.Status, state.StatusRunning)
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/outcome = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
 	}
 	if sess.TokensUsedAttempt != 50000 {
 		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsedAttempt)
@@ -3149,8 +3150,8 @@ func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
 	if sess.TokensUsedTotal != 50000 {
 		t.Fatalf("tokens_used_total = %d, want 50000", sess.TokensUsedTotal)
 	}
-	if len(*stopped) != 0 {
-		t.Fatalf("stopped = %v, want empty", *stopped)
+	if len(*stopped) != 1 {
+		t.Fatalf("stopped = %v, want [mae-5]", *stopped)
 	}
 }
 
@@ -3212,8 +3213,8 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 	o.checkSessions(s)
 
 	sess6 := s.Sessions["mae-6"]
-	if sess6.Status != state.StatusDead {
-		t.Fatalf("mae-6 status = %q, want %q", sess6.Status, state.StatusDead)
+	if sess6.Status != state.StatusFailed {
+		t.Fatalf("mae-6 status = %q, want %q", sess6.Status, state.StatusFailed)
 	}
 	if sess6.TokensUsedAttempt != 75000 {
 		t.Fatalf("mae-6 tokens_used = %d, want 75000", sess6.TokensUsedAttempt)
@@ -3235,6 +3236,62 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 
 	if len(stopped) != 1 || stopped[0] != "mae-6" {
 		t.Fatalf("stopped = %v, want [mae-6]", stopped)
+	}
+}
+
+func TestReconcileRunningSessions_TokenBudgetMarkerPreemptsOpenPR(t *testing.T) {
+	dir := t.TempDir()
+	logFile := dir + "/sup-906.log"
+	if err := os.WriteFile(logFile, []byte("working\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := worker.TokenBudgetMarker{
+		Outcome:        worker.TokenBudgetExceededOutcome,
+		Backend:        "claude",
+		TokensObserved: 85_000,
+		MaxTokens:      80_000,
+		MeasuredAt:     time.Now().UTC(),
+	}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.TokenBudgetMarkerPathForLog(logFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	o := &Orchestrator{
+		cfg:      &config.Config{StateDir: dir, WorkerMaxTokens: 80_000},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 906, HeadRefName: "feat/sup-906"}}, nil
+		},
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+	s := state.NewState()
+	s.Sessions["sup-906"] = &state.Session{
+		IssueNumber: 906,
+		Status:      state.StatusRunning,
+		PID:         1234,
+		Branch:      "feat/sup-906",
+		LogFile:     logFile,
+		Backend:     "claude",
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected reconciliation change")
+	}
+	sess := s.Sessions["sup-906"]
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/outcome = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
+	}
+	if sess.PRNumber != 0 || sess.NextRetryAt != nil || sess.PID != 0 {
+		t.Fatalf("budget stop was reclassified as PR/retry/running: %+v", sess)
+	}
+	if sess.TokensUsedAttempt != 85_000 || sess.TokensUsedTotal != 85_000 {
+		t.Fatalf("tokens = %d/%d, want 85000/85000", sess.TokensUsedAttempt, sess.TokensUsedTotal)
 	}
 }
 

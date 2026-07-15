@@ -80,4 +80,20 @@ describe("Fleet workers ordering contract", () => {
       section: "stuck",
     });
   });
+
+  test("token budget outcome is stuck even if stale state still says running", () => {
+    const taxonomy = workerStatusTaxonomy({
+      status: "running",
+      alive: false,
+      display_status: "token_budget_exceeded",
+      worker_outcome: "token_budget_exceeded",
+      needs_attention: true,
+    });
+
+    expect(taxonomy).toEqual({
+      label: "token budget exceeded",
+      tone: "stuck",
+      section: "stuck",
+    });
+  });
 });

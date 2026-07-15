@@ -121,6 +121,10 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		}
 	}
 	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		return err
+	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -199,6 +203,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// and the new one began.
 	recordBackendAttribution(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
 	sess.TokensUsedAttempt = 0
+	sess.WorkerOutcome = ""
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""

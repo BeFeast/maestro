@@ -363,6 +363,14 @@ model:
 
 When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` (claude) or `--json` (codex) in `extra_args` overrides it. Claude reports its own `total_cost_usd`; codex does not, so its cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
 
+When `worker_max_tokens` is positive, structured usage is no longer optional:
+Maestro fails the worker start closed if the selected backend/output mode cannot
+enforce a live ceiling. Claude, Pi, and OpenCode stop from their usage event
+stream; Codex combines cumulative rollout `token_count` telemetry with its
+native rollout budget inside the agent loop (`--ephemeral` is rejected).
+Enforcement lags by at most one provider response, not by the orchestration poll
+interval.
+
 ### Optional worker MCP tools
 
 Worker sessions receive no MCP tools by default. Attach project-specific MCP servers per backend with `model.backends.<name>.mcp`:

@@ -62,6 +62,23 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 	var out ClaudeUsage
 	seen := false
 	var systemModel, assistantModel string
+	var live claudeUsageBlock
+	flushLive := func(authoritative *claudeUsageBlock) {
+		usage := authoritative
+		if usage == nil || claudeUsageTotal(&live) > claudeUsageTotal(usage) {
+			usage = &live
+		}
+		if claudeUsageTotal(usage) == 0 {
+			live = claudeUsageBlock{}
+			return
+		}
+		out.Input += usage.InputTokens
+		out.Output += usage.OutputTokens
+		out.CacheRead += usage.CacheReadInputTokens
+		out.CacheWrite += usage.CacheCreationInputTokens
+		seen = true
+		live = claudeUsageBlock{}
+	}
 
 	for _, raw := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(raw)
@@ -74,25 +91,31 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 		}
 		switch fr.Type {
 		case "system":
+			flushLive(nil)
 			if strings.TrimSpace(fr.Model) != "" {
 				systemModel = fr.Model
 			}
 		case "assistant":
-			if fr.Message != nil && strings.TrimSpace(fr.Message.Model) != "" {
-				assistantModel = fr.Message.Model
+			if fr.Message != nil {
+				if strings.TrimSpace(fr.Message.Model) != "" {
+					assistantModel = fr.Message.Model
+				}
+				if fr.Message.Usage != nil {
+					live.InputTokens += fr.Message.Usage.InputTokens
+					live.OutputTokens += fr.Message.Usage.OutputTokens
+					live.CacheReadInputTokens += fr.Message.Usage.CacheReadInputTokens
+					live.CacheCreationInputTokens += fr.Message.Usage.CacheCreationInputTokens
+				}
 			}
 		case "result":
 			if fr.Usage == nil {
 				continue
 			}
-			out.Input += fr.Usage.InputTokens
-			out.Output += fr.Usage.OutputTokens
-			out.CacheRead += fr.Usage.CacheReadInputTokens
-			out.CacheWrite += fr.Usage.CacheCreationInputTokens
+			flushLive(fr.Usage)
 			out.CostUSD += fr.TotalCostUSD
-			seen = true
 		}
 	}
+	flushLive(nil)
 
 	// Prefer the session model from the system/init frame (the configured
 	// model, e.g. claude-opus-4-8[1m]); fall back to the assistant message

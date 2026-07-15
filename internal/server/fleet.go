@@ -1712,6 +1712,8 @@ type fleetWorkerState struct {
 	PRURL             string                  `json:"pr_url,omitempty"`
 	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
 	TokensUsedTotal   int                     `json:"tokens_used_total"`
+	WorkerMaxTokens   int                     `json:"worker_max_tokens,omitempty"`
+	WorkerOutcome     string                  `json:"worker_outcome,omitempty"`
 	// CostUSDEstimate is the $ estimate for TokensUsedTotal under the
 	// project's configured per-backend pricing (#619), OR the backend's
 	// self-reported cost when present (#730, Pi --mode json cost.total). 0
@@ -4924,6 +4926,8 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		PRURL:                  worker.PRURL,
 		TokensUsedAttempt:      worker.TokensUsedAttempt,
 		TokensUsedTotal:        worker.TokensUsedTotal,
+		WorkerMaxTokens:        project.EffectiveConfig.CostCaps.WorkerMaxTokens,
+		WorkerOutcome:          worker.WorkerOutcome,
 		CostUSDEstimate:        worker.CostUSDEstimate,
 		CostUSDBackend:         worker.CostUSDBackend,
 		Runtime:                worker.Runtime,
