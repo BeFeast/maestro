@@ -4009,23 +4009,12 @@ func (s *State) DonePRCount() int {
 	return count
 }
 
-// IssueInProgress returns true if the given issue is already being handled.
-// This includes dead sessions with a pending retry (NextRetryAt set) to prevent
-// duplicate worker spawns during backoff periods.
+// IssueInProgress returns true if the given issue already has a durable claim.
+// Claims include active sessions, scheduled retries, retained open-PR
+// maintenance work, and approved repair dispatch reservations.
 func (s *State) IssueInProgress(issueNum int) bool {
-	for _, sess := range s.Sessions {
-		if sess.IssueNumber != issueNum {
-			continue
-		}
-		if sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued || sess.Status == StatusCodeLanded {
-			return true
-		}
-		// Dead session with pending retry — still in progress
-		if sess.Status == StatusDead && sess.NextRetryAt != nil {
-			return true
-		}
-	}
-	return false
+	_, ok := s.IssueClaimFor(issueNum)
+	return ok
 }
 
 // IssueDone returns true if the given issue already has a completed session.

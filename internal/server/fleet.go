@@ -1356,6 +1356,7 @@ type fleetProjectState struct {
 	SelfResolving   int                   `json:"self_resolving,omitempty"`
 	Active          []sessionInfo         `json:"active,omitempty"`
 	Attention       []sessionInfo         `json:"attention,omitempty"`
+	IssueClaims     []state.IssueClaim    `json:"issue_claims,omitempty"`
 	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
 	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
 	Actions         []controlAction       `json:"actions,omitempty"`
@@ -4001,6 +4002,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
 	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
 	item.Epics, item.EpicSummary = fleetEpicProgressFromState(st)
+	item.IssueClaims = st.ActiveIssueClaims()
 	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)

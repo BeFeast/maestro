@@ -5173,13 +5173,11 @@ func repairIssueSessionActive(status state.SessionStatus) bool {
 // single reconcile path shared by the edge-triggered post-merge/outcome callers
 // and the standing reconciler, so every path journals and persists identically
 // (#866). Returns the number staled.
-// mirrorReviewRepairApprovalTerminal mirrors a review-repair approval's
-// terminal transition (changed-head supersede / post-dispatch consume) into
-// the SQLite approval store when one is configured (#874), matching the
-// spawn_repair_worker reconcile mirror. The JSON state is already the source of
-// truth for dispatch; this keeps the queryable mirror from showing a lingering
-// active approval after the JSON record was superseded.
-func (o *Orchestrator) mirrorReviewRepairApprovalTerminal(id string, now time.Time, reason string) {
+// mirrorRepairApprovalTerminal mirrors a repair approval's terminal transition
+// (changed-head supersede / post-dispatch consume) into the SQLite approval
+// store when one is configured. JSON state remains the dispatch source of truth;
+// this keeps the queryable mirror from showing a lingering active approval.
+func (o *Orchestrator) mirrorRepairApprovalTerminal(id string, now time.Time, reason string) {
 	if o == nil || !o.approvalsBinding.UseSQLite() || strings.TrimSpace(id) == "" {
 		return
 	}
@@ -5188,7 +5186,7 @@ func (o *Orchestrator) mirrorReviewRepairApprovalTerminal(id string, now time.Ti
 	b.Repo = o.repo
 	b.Project = o.repo
 	if err := approvalstore.ReconcileMoot(b, id, now, reason); err != nil {
-		log.Printf("[orch] review-repair approval %s terminal mirror to SQLite failed (JSON already updated, retried next cycle): %v", id, err)
+		log.Printf("[orch] repair approval %s terminal mirror to SQLite failed (JSON already updated, retried next cycle): %v", id, err)
 	}
 }
 
@@ -6799,6 +6797,12 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 	if s == nil || issueNumber <= 0 {
 		return false
 	}
+	if _, ok := s.ActiveRepairDispatchApproval(issueNumber, supervisor.ActionSpawnRepairWorker); ok {
+		return true
+	}
+	if _, ok := s.ActiveRepairDispatchApproval(issueNumber, supervisor.ActionSpawnReviewRepair); ok {
+		return true
+	}
 	decision := s.LatestSupervisorDecision()
 	if decision == nil {
 		return false
@@ -6819,6 +6823,109 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 		return false
 	}
 	return true
+}
+
+type spawnRepairDispatch struct {
+	target     *state.SupervisorTarget
+	approvalID string
+}
+
+func (o *Orchestrator) resolveSpawnRepairDispatch(s *state.State, issueNumber int) *spawnRepairDispatch {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	if approval, ok := s.ActiveRepairDispatchApproval(issueNumber, supervisor.ActionSpawnRepairWorker); ok {
+		return &spawnRepairDispatch{target: approval.Target, approvalID: approval.ID}
+	}
+	decision := s.LatestSupervisorDecision()
+	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker || decision.Target == nil || decision.Target.Issue != issueNumber {
+		return nil
+	}
+	if decision.RequiresApproval || decision.Risk == supervisor.RiskApprovalGated {
+		return nil
+	}
+	return &spawnRepairDispatch{target: decision.Target}
+}
+
+// dispatchSpawnRepairWorker revalidates the durable issue/session reservation
+// and repairs that exact session. It never allocates a second slot or removes a
+// competing worktree.
+func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Issue, dispatch *spawnRepairDispatch) bool {
+	if s == nil || dispatch == nil || dispatch.target == nil {
+		return false
+	}
+	target := dispatch.target
+	slot := strings.TrimSpace(target.Session)
+	if slot == "" {
+		log.Printf("[orch] refusing repair dispatch for issue #%d: reservation has no target session", issue.Number)
+		return false
+	}
+	sess, ok := s.SessionAt(slot)
+	if !ok || sess.IssueNumber != issue.Number {
+		log.Printf("[orch] refusing repair dispatch for issue #%d: reserved session %s is missing or belongs to another issue", issue.Number, slot)
+		return false
+	}
+	if target.PR > 0 && sess.PRNumber != target.PR {
+		log.Printf("[orch] refusing repair dispatch for issue #%d: reserved PR #%d no longer matches session %s PR #%d", issue.Number, target.PR, slot, sess.PRNumber)
+		return false
+	}
+	for _, claim := range s.ActiveIssueClaims() {
+		if claim.IssueNumber != issue.Number || claim.Session == "" || claim.Session == slot {
+			continue
+		}
+		log.Printf("[orch] refusing repair dispatch for issue #%d on %s: competing claim on session %s (%s)", issue.Number, slot, claim.Session, claim.Reason)
+		return false
+	}
+
+	// A prior dispatch may have reached the worker and persisted the running
+	// session before its approval terminal transition. Reconcile the approval
+	// without restarting an already-running target.
+	if sess.Status == state.StatusRunning {
+		o.resolveSpawnRepairApproval(s, dispatch.approvalID, slot, target.PR, "reserved session already running")
+		return false
+	}
+
+	backend := strings.TrimSpace(sess.Backend)
+	if backend == "" {
+		backend = o.cfg.Model.Default
+	}
+	promptBase := o.selectPrompt(issue)
+	var err error
+	if sess.PRNumber > 0 {
+		if strings.TrimSpace(sess.Worktree) == "" {
+			log.Printf("[orch] refusing repair dispatch for issue #%d on %s: PR #%d worktree is missing", issue.Number, slot, sess.PRNumber)
+			return false
+		}
+		err = o.respawnInPlaceWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+	} else {
+		err = o.respawnWorkerWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+	}
+	if err != nil {
+		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)
+		return false
+	}
+	sess.NextRetryAt = nil
+	o.resolveSpawnRepairApproval(s, dispatch.approvalID, slot, target.PR, "repair worker dispatched")
+	if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
+		s.MarkProjectStatusSynced(issue.Number, string(github.ProjectStatusInProgress), time.Now().UTC())
+	}
+	o.notifier.Sendf("🔄 maestro: repairing issue #%d in place on worker %s: %s", issue.Number, slot, issue.Title)
+	return true
+}
+
+func (o *Orchestrator) resolveSpawnRepairApproval(s *state.State, approvalID, slot string, pr int, outcome string) {
+	if strings.TrimSpace(approvalID) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	reason := fmt.Sprintf("repair worker %s for PR #%d: %s — approval consumed", slot, pr, outcome)
+	if pr <= 0 {
+		reason = fmt.Sprintf("repair worker %s: %s — approval consumed", slot, outcome)
+	}
+	if s.ResolveDispatchedSpawnRepairApproval(approvalID, now, reason) {
+		log.Printf("[orch] %s (approval %s)", reason, approvalID)
+		o.mirrorRepairApprovalTerminal(approvalID, now, reason)
+	}
 }
 
 // tryClaimReviewRepairSlot bumps the (pr_number, head_sha) attempt counter
@@ -6964,7 +7071,7 @@ func (o *Orchestrator) approvalReviewRepairDispatch(s *state.State, issueNumber 
 			target.PR, shortReviewRepairSHA(currentHead), shortReviewRepairSHA(payload.HeadSHA))
 		for _, staled := range s.SupersedeReviewRepairApprovalsForStaleHead(target.PR, currentHead, now, reason) {
 			log.Printf("[orch] %s (approval %s)", reason, staled)
-			o.mirrorReviewRepairApprovalTerminal(staled, now, reason)
+			o.mirrorRepairApprovalTerminal(staled, now, reason)
 		}
 		return nil, nil, ""
 	}
@@ -7194,10 +7301,6 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			if !repairSpawn {
 				continue
 			}
-			if o.issueHasLiveRunningSession(s, issue.Number) {
-				log.Printf("[orch] skipping issue #%d: supervisor selected repair, but a worker is already running for this issue", issue.Number)
-				continue
-			}
 		}
 
 		// Pre-spawn guard (issue #456): never start a new worker for an issue that is
@@ -7316,6 +7419,16 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				continue
 			}
 			log.Printf("[orch] allowing repair worker for issue #%d despite open PR because supervisor selected spawn_repair_worker", issue.Number)
+		}
+
+		// A classic repair is a same-session maintenance operation, not a fresh
+		// issue dispatch. Resolve and revalidate the durable reservation before
+		// any backend routing or slot allocation can create a second worktree.
+		if repairDispatch := o.resolveSpawnRepairDispatch(s, issue.Number); repairDispatch != nil {
+			if o.dispatchSpawnRepairWorker(s, issue, repairDispatch) {
+				started++
+			}
+			continue
 		}
 
 		// Determine initial phase and backend. A pipeline:full issue label
@@ -7481,7 +7594,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			reason := fmt.Sprintf("review-repair worker %s dispatched for PR #%d — approval consumed", slotName, repairTarget.PR)
 			if s.ResolveDispatchedReviewRepairApproval(reviewRepairApprovalID, resolveNow, reason) {
 				log.Printf("[orch] %s (approval %s)", reason, reviewRepairApprovalID)
-				o.mirrorReviewRepairApprovalTerminal(reviewRepairApprovalID, resolveNow, reason)
+				o.mirrorRepairApprovalTerminal(reviewRepairApprovalID, resolveNow, reason)
 			}
 		}
 		o.notifier.Sendf("🚀 maestro: started worker %s for issue #%d: %s", slotName, issue.Number, issue.Title)

@@ -1,0 +1,227 @@
+package state
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
+
+// IssueClaim describes why an issue is not eligible for a fresh worker. Claims
+// are derived from durable approvals and sessions so selection and Fleet
+// diagnostics explain the same reservation.
+type IssueClaim struct {
+	IssueNumber int    `json:"issue_number"`
+	Kind        string `json:"kind"`
+	Session     string `json:"session,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Reason      string `json:"reason"`
+}
+
+const (
+	IssueClaimImplementation       = "implementation"
+	IssueClaimOpenPRMaintenance    = "open_pr_maintenance"
+	IssueClaimScheduledRetry       = "scheduled_retry"
+	IssueClaimRepairDispatch       = "repair_dispatch"
+	IssueClaimReviewRepairDispatch = "review_repair_dispatch"
+)
+
+// ActiveIssueClaims returns every durable issue claim in deterministic order.
+// An approved repair approval takes precedence over the session it reserves;
+// any different same-issue session is still returned so diagnostics expose a
+// competing worker instead of hiding it.
+func (s *State) ActiveIssueClaims() []IssueClaim {
+	if s == nil {
+		return nil
+	}
+
+	claims := make([]IssueClaim, 0)
+	reservedSessions := make(map[string]struct{})
+	approvalIndexes := make([]int, 0, len(s.Approvals))
+	for i := range s.Approvals {
+		if activeRepairDispatchApproval(&s.Approvals[i]) {
+			approvalIndexes = append(approvalIndexes, i)
+		}
+	}
+	sort.Slice(approvalIndexes, func(i, j int) bool {
+		return s.Approvals[approvalIndexes[i]].ID < s.Approvals[approvalIndexes[j]].ID
+	})
+	for _, index := range approvalIndexes {
+		approval := &s.Approvals[index]
+		target := approval.Target
+		kind := IssueClaimRepairDispatch
+		if approval.Action == approvalActionSpawnReviewRepair {
+			kind = IssueClaimReviewRepairDispatch
+		}
+		session := strings.TrimSpace(target.Session)
+		if session != "" {
+			reservedSessions[session] = struct{}{}
+		}
+		claims = append(claims, IssueClaim{
+			IssueNumber: target.Issue,
+			Kind:        kind,
+			Session:     session,
+			PRNumber:    target.PR,
+			ApprovalID:  approval.ID,
+			Status:      string(approval.Status),
+			Reason:      repairDispatchClaimReason(approval),
+		})
+	}
+
+	slots := make([]string, 0, len(s.Sessions))
+	for slot := range s.Sessions {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+	for _, slot := range slots {
+		sess := s.Sessions[slot]
+		if sess == nil || sess.IssueNumber <= 0 {
+			continue
+		}
+		if _, reserved := reservedSessions[slot]; reserved {
+			continue
+		}
+		if claim, ok := sessionIssueClaim(slot, sess); ok {
+			claims = append(claims, claim)
+		}
+	}
+
+	sort.SliceStable(claims, func(i, j int) bool {
+		if claims[i].IssueNumber != claims[j].IssueNumber {
+			return claims[i].IssueNumber < claims[j].IssueNumber
+		}
+		if issueClaimPriority(claims[i]) != issueClaimPriority(claims[j]) {
+			return issueClaimPriority(claims[i]) < issueClaimPriority(claims[j])
+		}
+		if claims[i].ApprovalID != claims[j].ApprovalID {
+			return claims[i].ApprovalID < claims[j].ApprovalID
+		}
+		return claims[i].Session < claims[j].Session
+	})
+	return claims
+}
+
+func issueClaimPriority(claim IssueClaim) int {
+	switch claim.Kind {
+	case IssueClaimRepairDispatch, IssueClaimReviewRepairDispatch:
+		return 0
+	case IssueClaimImplementation, IssueClaimScheduledRetry:
+		return 1
+	case IssueClaimOpenPRMaintenance:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// IssueClaimFor returns the first durable claim for issueNumber.
+func (s *State) IssueClaimFor(issueNumber int) (IssueClaim, bool) {
+	if issueNumber <= 0 {
+		return IssueClaim{}, false
+	}
+	for _, claim := range s.ActiveIssueClaims() {
+		if claim.IssueNumber == issueNumber {
+			return claim, true
+		}
+	}
+	return IssueClaim{}, false
+}
+
+// ActiveRepairDispatchApproval returns the effective approval reserving the
+// issue for action. Approved is included with awaiting_dispatch so the brief
+// transition between operator approval and executor finalization is also safe.
+func (s *State) ActiveRepairDispatchApproval(issueNumber int, action string) (*Approval, bool) {
+	if s == nil || issueNumber <= 0 {
+		return nil, false
+	}
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Action != action || !activeRepairDispatchApproval(approval) || approval.Target.Issue != issueNumber {
+			continue
+		}
+		return approval, true
+	}
+	return nil, false
+}
+
+// ResolveDispatchedSpawnRepairApproval retires a classic repair approval only
+// after its reserved session has successfully reached a worker. Re-running
+// after a save/reload is idempotent because terminal approvals are ignored.
+func (s *State) ResolveDispatchedSpawnRepairApproval(id string, now time.Time, reason string) bool {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.ID != id || approval.Action != approvalActionSpawnRepairWorker {
+			continue
+		}
+		return s.supersedeApprovalFrom(approval, now, reason,
+			ApprovalStatusApproved, ApprovalStatusAwaitingDispatch)
+	}
+	return false
+}
+
+func activeRepairDispatchApproval(approval *Approval) bool {
+	if approval == nil || approval.Target == nil || approval.Target.Issue <= 0 {
+		return false
+	}
+	if approval.Action != approvalActionSpawnRepairWorker && approval.Action != approvalActionSpawnReviewRepair {
+		return false
+	}
+	return approval.Status == ApprovalStatusApproved || approval.Status == ApprovalStatusAwaitingDispatch
+}
+
+func repairDispatchClaimReason(approval *Approval) string {
+	target := approval.Target
+	label := "repair dispatch"
+	if approval.Action == approvalActionSpawnReviewRepair {
+		label = "review-repair dispatch"
+	}
+	reason := fmt.Sprintf("issue #%d reserved for %s by approval %s", target.Issue, label, approval.ID)
+	if session := strings.TrimSpace(target.Session); session != "" {
+		reason += fmt.Sprintf(" on session %s", session)
+	}
+	if target.PR > 0 {
+		reason += fmt.Sprintf(" for PR #%d", target.PR)
+	}
+	return reason
+}
+
+func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
+	claim := IssueClaim{
+		IssueNumber: sess.IssueNumber,
+		Session:     slot,
+		PRNumber:    sess.PRNumber,
+		Status:      string(sess.Status),
+	}
+	switch sess.Status {
+	case StatusRunning, StatusQueued, StatusCodeLanded:
+		claim.Kind = IssueClaimImplementation
+		claim.Reason = fmt.Sprintf("issue #%d already has active session %s (%s)", sess.IssueNumber, slot, sess.Status)
+		return claim, true
+	case StatusPROpen:
+		claim.Kind = IssueClaimOpenPRMaintenance
+		claim.Reason = fmt.Sprintf("issue #%d is maintained by session %s for PR #%d", sess.IssueNumber, slot, sess.PRNumber)
+		return claim, true
+	case StatusDead:
+		if sess.NextRetryAt != nil {
+			claim.Kind = IssueClaimScheduledRetry
+			claim.Reason = fmt.Sprintf("issue #%d is reserved for retry on session %s", sess.IssueNumber, slot)
+			return claim, true
+		}
+	}
+
+	// A dead/retry-exhausted/conflict session with a retained PR/worktree remains
+	// the maintenance owner until reconciliation proves the PR is closed or
+	// explicitly releases it for redispatch.
+	if sess.PRNumber > 0 && !sess.ReleasedForRedispatch &&
+		(sess.Status == StatusDead || sess.Status == StatusRetryExhausted || sess.Status == StatusConflictFailed) {
+		claim.Kind = IssueClaimOpenPRMaintenance
+		claim.Reason = fmt.Sprintf("issue #%d retains PR #%d maintenance claim on session %s (%s)", sess.IssueNumber, sess.PRNumber, slot, sess.Status)
+		return claim, true
+	}
+	return IssueClaim{}, false
+}
