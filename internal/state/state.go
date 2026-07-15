@@ -55,6 +55,10 @@ const (
 	// "the model is gone" (swap the model id) rather than "fix credentials".
 	// Like the other backend-block tokens it did not burn the retry budget.
 	DisplayBackendModelUnavailable SessionDisplayStatus = "backend_model_unavailable"
+	// DisplayBackendModelCooldown marks a session whose provider exhausted the
+	// compatible credential pool for one requested model. Other models on the
+	// provider remain eligible.
+	DisplayBackendModelCooldown SessionDisplayStatus = "backend_model_cooldown"
 	// DisplayBackendUsageLimit marks a session whose worker exited because
 	// its backend's account usage quota is exhausted (#805; live: codex
 	// "You've hit your usage limit") with no fallback available. Distinct
@@ -88,6 +92,10 @@ const (
 	// auth_failure so the operator remediation differs (swap the model id vs
 	// fix credentials).
 	BackendBlockModelUnavailable = "model_unavailable"
+	// BackendBlockModelCooldown gates one provider/model route after the proxy
+	// has rotated through every compatible credential and found none usable.
+	// It must never become a provider-wide BackendHealth gate.
+	BackendBlockModelCooldown = "model_cooldown"
 	// BackendBlockUsageLimit gates a backend whose CLI died because the
 	// account's usage quota is exhausted (#805; live: codex "You've hit
 	// your usage limit ... try again at 12:30 PM" killed every worker on
@@ -114,17 +122,26 @@ const (
 
 // BackendHealth records cross-session availability for a configured backend.
 type BackendHealth struct {
-	State       string     `json:"state"`
-	Reason      string     `json:"reason,omitempty"`
-	Pattern     string     `json:"pattern,omitempty"`
-	Since       time.Time  `json:"since,omitempty"`
-	RetryAfter  *time.Time `json:"retry_after,omitempty"`
-	LastSession string     `json:"last_session,omitempty"`
+	State                     string     `json:"state"`
+	Reason                    string     `json:"reason,omitempty"`
+	Pattern                   string     `json:"pattern,omitempty"`
+	Provider                  string     `json:"provider,omitempty"`
+	Model                     string     `json:"model,omitempty"`
+	CredentialCandidates      int        `json:"credential_candidates,omitempty"`
+	CredentialCandidatesKnown bool       `json:"credential_candidates_known,omitempty"`
+	CredentialUsable          int        `json:"credential_usable,omitempty"`
+	CredentialUsableKnown     bool       `json:"credential_usable_known,omitempty"`
+	AggregateReason           string     `json:"aggregate_reason,omitempty"`
+	Since                     time.Time  `json:"since,omitempty"`
+	RetryAfter                *time.Time `json:"retry_after,omitempty"`
+	LastSession               string     `json:"last_session,omitempty"`
 }
 
 // BackendCandidate explains why one backend was or was not selectable.
 type BackendCandidate struct {
 	Backend    string  `json:"backend"`
+	Provider   string  `json:"provider,omitempty"`
+	Model      string  `json:"model,omitempty"`
 	Available  bool    `json:"available"`
 	BlockedBy  string  `json:"blocked_by,omitempty"`
 	RetryAfter string  `json:"retry_after,omitempty"`
@@ -212,6 +229,13 @@ type Session struct {
 	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit or auth failure
 	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // backend block signature or class (e.g. BackendBlockAuthFailure)
 	ProviderLimitResetAt        *time.Time        `json:"provider_limit_reset_at,omitempty"`        // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
+	ProviderLimitProvider       string            `json:"provider_limit_provider,omitempty"`        // secret-free provider route for model-scoped failures
+	ProviderLimitModel          string            `json:"provider_limit_model,omitempty"`           // requested model for model-scoped failures
+	CredentialCandidates        int               `json:"credential_candidates,omitempty"`          // aggregate candidate count reported by the proxy
+	CredentialCandidatesKnown   bool              `json:"credential_candidates_known,omitempty"`    // distinguishes an omitted count from a real zero
+	CredentialUsable            int               `json:"credential_usable,omitempty"`              // candidates usable for ProviderLimitModel
+	CredentialUsableKnown       bool              `json:"credential_usable_known,omitempty"`        // distinguishes an omitted count from a real zero
+	CredentialAggregateReason   string            `json:"credential_aggregate_reason,omitempty"`    // aggregate proxy reason; never a credential identifier
 	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
 	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
 	PipelineFull                bool              `json:"pipeline_full,omitempty"`                  // true when issue label opted this session into plan/implement/validate
@@ -399,6 +423,20 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 					NeedsAttention: true,
 				}
 			}
+			if sess.ProviderLimitReason == BackendBlockModelCooldown {
+				route := backend
+				if sess.ProviderLimitProvider != "" {
+					route = sess.ProviderLimitProvider
+				}
+				if sess.ProviderLimitModel != "" {
+					route += "/" + sess.ProviderLimitModel
+				}
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Provider/model route %s has no usable compatible credential; other models on the provider remain eligible.", route),
+					NextAction:     "Wait for the route retry time or restore model access on a compatible credential; the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			if sess.ProviderLimitReason == BackendBlockUsageLimit {
 				return SessionAttention{
 					Reason:         fmt.Sprintf("Backend %s has exhausted its account usage quota; no fallback backend is currently available or allowed.", backend),
@@ -481,6 +519,8 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 			return string(DisplayBackendAuthFailure)
 		case BackendBlockModelUnavailable:
 			return string(DisplayBackendModelUnavailable)
+		case BackendBlockModelCooldown:
+			return string(DisplayBackendModelCooldown)
 		case BackendBlockUsageLimit:
 			return string(DisplayBackendUsageLimit)
 		}
@@ -1196,17 +1236,18 @@ type ApprovalAudit struct {
 }
 
 type State struct {
-	Sessions            map[string]*Session           `json:"sessions"`
-	Missions            map[int]*Mission              `json:"missions,omitempty"` // parent issue number → mission
-	SupervisorDecisions []SupervisorDecision          `json:"supervisor_decisions,omitempty"`
-	Approvals           []Approval                    `json:"approvals,omitempty"`
-	LessonProposals     []LessonProposal              `json:"lesson_proposals,omitempty"`
-	OutcomeHealth       *outcome.HealthCheckResult    `json:"outcome_health,omitempty"`
-	BackendHealth       map[string]BackendHealth      `json:"backend_health,omitempty"`
-	BackendQuotaUsage   map[string]*BackendQuotaUsage `json:"backend_quota_usage,omitempty"`
-	ProjectStatusSync   map[int]ProjectStatusSync     `json:"project_status_sync,omitempty"`
-	NextSlot            int                           `json:"next_slot"`
-	LastMergeAt         time.Time                     `json:"last_merge_at,omitempty"`
+	Sessions            map[string]*Session                 `json:"sessions"`
+	Missions            map[int]*Mission                    `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision                `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval                          `json:"approvals,omitempty"`
+	LessonProposals     []LessonProposal                    `json:"lesson_proposals,omitempty"`
+	OutcomeHealth       *outcome.HealthCheckResult          `json:"outcome_health,omitempty"`
+	BackendHealth       map[string]BackendHealth            `json:"backend_health,omitempty"`
+	ProviderModelHealth map[string]map[string]BackendHealth `json:"provider_model_health,omitempty"`
+	BackendQuotaUsage   map[string]*BackendQuotaUsage       `json:"backend_quota_usage,omitempty"`
+	ProjectStatusSync   map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
+	NextSlot            int                                 `json:"next_slot"`
+	LastMergeAt         time.Time                           `json:"last_merge_at,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
 	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
@@ -1441,13 +1482,14 @@ type ProjectStatusSync struct {
 
 func NewState() *State {
 	return &State{
-		Sessions:          make(map[string]*Session),
-		Missions:          make(map[int]*Mission),
-		ProjectStatusSync: make(map[int]ProjectStatusSync),
-		BackendHealth:     make(map[string]BackendHealth),
-		SpecLintTracks:    make(map[int]SpecLintTrack),
-		PRGateSnapshots:   make(map[string]PRGateSnapshot),
-		NextSlot:          1,
+		Sessions:            make(map[string]*Session),
+		Missions:            make(map[int]*Mission),
+		ProjectStatusSync:   make(map[int]ProjectStatusSync),
+		BackendHealth:       make(map[string]BackendHealth),
+		ProviderModelHealth: make(map[string]map[string]BackendHealth),
+		SpecLintTracks:      make(map[int]SpecLintTrack),
+		PRGateSnapshots:     make(map[string]PRGateSnapshot),
+		NextSlot:            1,
 	}
 }
 
@@ -1702,6 +1744,9 @@ func (s *State) normalize() {
 	if s.BackendHealth == nil {
 		s.BackendHealth = make(map[string]BackendHealth)
 	}
+	if s.ProviderModelHealth == nil {
+		s.ProviderModelHealth = make(map[string]map[string]BackendHealth)
+	}
 	if s.SpecLintTracks == nil {
 		s.SpecLintTracks = make(map[int]SpecLintTrack)
 	}
@@ -1722,6 +1767,7 @@ func (s *State) copyFrom(src *State) {
 	s.OutcomeHealth = src.OutcomeHealth
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
+	s.ProviderModelHealth = src.ProviderModelHealth
 	s.BackendQuotaUsage = src.BackendQuotaUsage
 	s.SpecLintTracks = src.SpecLintTracks
 	s.PRGateSnapshots = src.PRGateSnapshots
@@ -1777,6 +1823,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
 	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
+	merged.ProviderModelHealth = mergeProviderModelHealth(current.ProviderModelHealth, ours.ProviderModelHealth)
 	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
@@ -1856,6 +1903,35 @@ func mergeBackendHealth(current, ours map[string]BackendHealth) map[string]Backe
 		}
 	}
 	return merged
+}
+
+func mergeProviderModelHealth(current, ours map[string]map[string]BackendHealth) map[string]map[string]BackendHealth {
+	if len(current) == 0 && len(ours) == 0 {
+		return nil
+	}
+	merged := make(map[string]map[string]BackendHealth)
+	for _, provider := range unionBackendHealthKeysForNested(current, ours) {
+		models := mergeBackendHealth(current[provider], ours[provider])
+		if len(models) > 0 {
+			merged[provider] = models
+		}
+	}
+	return merged
+}
+
+func unionBackendHealthKeysForNested(maps ...map[string]map[string]BackendHealth) []string {
+	seen := make(map[string]struct{})
+	for _, values := range maps {
+		for key := range values {
+			seen[key] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func unionBackendHealthKeys(maps ...map[string]BackendHealth) []string {
@@ -3926,7 +4002,7 @@ const MaxBackendCooldownTTL = 24 * time.Hour
 // Returns true when at least one entry was cleared so the caller can
 // decide whether to persist the change.
 func ReconcileBackendHealth(s *State, now time.Time) bool {
-	if s == nil || len(s.BackendHealth) == 0 {
+	if s == nil || (len(s.BackendHealth) == 0 && len(s.ProviderModelHealth) == 0) {
 		return false
 	}
 	changed := false
@@ -3953,6 +4029,25 @@ func ReconcileBackendHealth(s *State, now time.Time) bool {
 			delete(s.BackendHealth, name)
 			changed = true
 			continue
+		}
+	}
+	for provider, models := range s.ProviderModelHealth {
+		for model, health := range models {
+			if health.State != BackendHealthCooldown {
+				continue
+			}
+			if health.RetryAfter != nil && !now.Before(*health.RetryAfter) {
+				delete(models, model)
+				changed = true
+				continue
+			}
+			if health.RetryAfter == nil && !health.Since.IsZero() && now.Sub(health.Since) >= MaxBackendCooldownTTL {
+				delete(models, model)
+				changed = true
+			}
+		}
+		if len(models) == 0 {
+			delete(s.ProviderModelHealth, provider)
 		}
 	}
 	return changed

@@ -196,25 +196,26 @@ func SetBinaryVersion(v string) {
 
 // stateResponse is the JSON shape for GET /api/v1/state.
 type stateResponse struct {
-	Repo                string                         `json:"repo"`
-	Version             string                         `json:"version,omitempty"` // running maestro binary version (#698)
-	MaxParallel         int                            `json:"max_parallel"`
-	ReadOnly            bool                           `json:"read_only"`
-	Outcome             outcome.Status                 `json:"outcome"`
-	Actions             []controlAction                `json:"actions,omitempty"`
-	SupervisorPolicy    config.SupervisorConfig        `json:"supervisor_policy"`
-	All                 []sessionInfo                  `json:"all"`
-	Running             []sessionInfo                  `json:"running"`
-	PROpen              []sessionInfo                  `json:"pr_open"`
-	Queued              []sessionInfo                  `json:"queued"`
-	TokenTotals         tokenTotalsInfo                `json:"token_totals"`
-	Summary             map[string]int                 `json:"summary"`
-	StuckStates         []state.SupervisorStuckState   `json:"stuck_states,omitempty"`
-	Supervisor          supervisorInfo                 `json:"supervisor"`
-	SupervisorLatest    *state.SupervisorDecision      `json:"supervisor_latest,omitempty"`
-	SupervisorDecisions []state.SupervisorDecision     `json:"supervisor_decisions,omitempty"`
-	Approvals           []state.Approval               `json:"approvals,omitempty"`
-	BackendHealth       map[string]state.BackendHealth `json:"backend_health,omitempty"`
+	Repo                string                                    `json:"repo"`
+	Version             string                                    `json:"version,omitempty"` // running maestro binary version (#698)
+	MaxParallel         int                                       `json:"max_parallel"`
+	ReadOnly            bool                                      `json:"read_only"`
+	Outcome             outcome.Status                            `json:"outcome"`
+	Actions             []controlAction                           `json:"actions,omitempty"`
+	SupervisorPolicy    config.SupervisorConfig                   `json:"supervisor_policy"`
+	All                 []sessionInfo                             `json:"all"`
+	Running             []sessionInfo                             `json:"running"`
+	PROpen              []sessionInfo                             `json:"pr_open"`
+	Queued              []sessionInfo                             `json:"queued"`
+	TokenTotals         tokenTotalsInfo                           `json:"token_totals"`
+	Summary             map[string]int                            `json:"summary"`
+	StuckStates         []state.SupervisorStuckState              `json:"stuck_states,omitempty"`
+	Supervisor          supervisorInfo                            `json:"supervisor"`
+	SupervisorLatest    *state.SupervisorDecision                 `json:"supervisor_latest,omitempty"`
+	SupervisorDecisions []state.SupervisorDecision                `json:"supervisor_decisions,omitempty"`
+	Approvals           []state.Approval                          `json:"approvals,omitempty"`
+	BackendHealth       map[string]state.BackendHealth            `json:"backend_health,omitempty"`
+	ProviderModelHealth map[string]map[string]state.BackendHealth `json:"provider_model_health,omitempty"`
 }
 
 type supervisorInfo struct {
@@ -1043,6 +1044,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		Outcome:             outcomeStatusForState(cfg, st),
 		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions", cfg.Repo),
 		BackendHealth:       st.BackendHealth,
+		ProviderModelHealth: st.ProviderModelHealth,
 		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
 		Running:             make([]sessionInfo, 0),

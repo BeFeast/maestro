@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -15,6 +16,7 @@ const (
 	selectionReasonProviderLimitFallback    = "fallback_after_provider_limit"
 	selectionReasonAuthFailureFallback      = "fallback_after_backend_auth_failure"
 	selectionReasonModelUnavailableFallback = "fallback_after_backend_model_unavailable"
+	selectionReasonModelCooldownFallback    = "fallback_after_backend_model_cooldown"
 	selectionReasonUsageLimitFallback       = "fallback_after_backend_usage_limit"
 	// selectionReasonDispatchBlockedFallback marks a fresh dispatch whose
 	// routed backend was blocked (disabled or in BackendHealth cooldown), so
@@ -59,6 +61,14 @@ func backendFailureCopyFor(reason string) backendFailureCopy {
 			noun:            "backend usage limit",
 			remedy:          "wait for the provider quota window to reset or raise the plan limit",
 		}
+	case state.BackendBlockModelCooldown:
+		return backendFailureCopy{
+			selectionReason: selectionReasonModelCooldownFallback,
+			displayToken:    string(state.DisplayBackendModelCooldown),
+			desc:            "exhausted compatible credentials for the requested model",
+			noun:            "provider/model credential cooldown",
+			remedy:          "wait for the route retry time or restore model access on a compatible credential",
+		}
 	}
 	return backendFailureCopy{
 		selectionReason: selectionReasonAuthFailureFallback,
@@ -67,6 +77,20 @@ func backendFailureCopyFor(reason string) backendFailureCopy {
 		noun:            "backend auth failure",
 		remedy:          "fix credentials",
 	}
+}
+
+type backendFailure struct {
+	reason                    string
+	pattern                   string
+	provider                  string
+	model                     string
+	credentialCandidates      int
+	credentialCandidatesKnown bool
+	credentialUsable          int
+	credentialUsableKnown     bool
+	aggregateReason           string
+	retryAfter                *time.Time
+	modelScoped               bool
 }
 
 // backendAuthFailureCooldown is how long an auth-failed backend stays gated
@@ -114,6 +138,13 @@ func (o *Orchestrator) recordProviderLimit(st *state.State, slotName string, ses
 	sess.ProviderLimitBackend = sess.Backend
 	sess.ProviderLimitReason = pattern
 	sess.ProviderLimitResetAt = resetAt
+	sess.ProviderLimitProvider = ""
+	sess.ProviderLimitModel = ""
+	sess.CredentialCandidates = 0
+	sess.CredentialCandidatesKnown = false
+	sess.CredentialUsable = 0
+	sess.CredentialUsableKnown = false
+	sess.CredentialAggregateReason = ""
 	health := state.BackendHealth{
 		State:       state.BackendHealthCooldown,
 		Reason:      state.BackendBlockProviderLimit,
@@ -139,13 +170,12 @@ func (o *Orchestrator) recordProviderLimit(st *state.State, slotName string, ses
 // the per-issue retry budget. reason is the gating reason recorded on both
 // the session and BackendHealth so the supervisor and dashboard can tell an
 // auth outage from a missing model from an exhausted quota.
-func (o *Orchestrator) recordBackendFailure(st *state.State, slotName string, sess *state.Session, reason, pattern string, now time.Time) {
+func (o *Orchestrator) recordBackendFailure(st *state.State, slotName string, sess *state.Session, failure backendFailure, now time.Time) {
 	if st == nil || sess == nil || sess.Backend == "" {
 		return
 	}
-	if st.BackendHealth == nil {
-		st.BackendHealth = make(map[string]state.BackendHealth)
-	}
+	reason := failure.reason
+	pattern := failure.pattern
 	if reason == "" {
 		reason = state.BackendBlockAuthFailure
 	}
@@ -155,15 +185,49 @@ func (o *Orchestrator) recordBackendFailure(st *state.State, slotName string, se
 	sess.RateLimitHit = true
 	sess.ProviderLimitBackend = sess.Backend
 	sess.ProviderLimitReason = reason
-	retryAfter := now.UTC().Add(backendFailureCooldownFor(reason))
-	st.BackendHealth[sess.Backend] = state.BackendHealth{
+	retryAfter := failure.retryAfter
+	if retryAfter == nil {
+		fallbackRetry := now.UTC().Add(backendFailureCooldownFor(reason))
+		retryAfter = &fallbackRetry
+	}
+	sess.ProviderLimitResetAt = retryAfter
+	provider, model := o.providerModelRouteForSession(sess, failure.provider, failure.model)
+	sess.ProviderLimitProvider = provider
+	sess.ProviderLimitModel = model
+	sess.CredentialCandidates = failure.credentialCandidates
+	sess.CredentialCandidatesKnown = failure.credentialCandidatesKnown
+	sess.CredentialUsable = failure.credentialUsable
+	sess.CredentialUsableKnown = failure.credentialUsableKnown
+	sess.CredentialAggregateReason = failure.aggregateReason
+	health := state.BackendHealth{
 		State:       state.BackendHealthCooldown,
 		Reason:      reason,
 		Pattern:     pattern,
+		Provider:    provider,
+		Model:       model,
 		Since:       now.UTC(),
-		RetryAfter:  &retryAfter,
+		RetryAfter:  retryAfter,
 		LastSession: slotName,
 	}
+	health.CredentialCandidates = failure.credentialCandidates
+	health.CredentialCandidatesKnown = failure.credentialCandidatesKnown
+	health.CredentialUsable = failure.credentialUsable
+	health.CredentialUsableKnown = failure.credentialUsableKnown
+	health.AggregateReason = failure.aggregateReason
+	if failure.modelScoped && provider != "" && model != "" {
+		if st.ProviderModelHealth == nil {
+			st.ProviderModelHealth = make(map[string]map[string]state.BackendHealth)
+		}
+		if st.ProviderModelHealth[provider] == nil {
+			st.ProviderModelHealth[provider] = make(map[string]state.BackendHealth)
+		}
+		st.ProviderModelHealth[provider][model] = health
+		return
+	}
+	if st.BackendHealth == nil {
+		st.BackendHealth = make(map[string]state.BackendHealth)
+	}
+	st.BackendHealth[sess.Backend] = health
 }
 
 func (o *Orchestrator) selectProviderLimitFallback(st *state.State, sess *state.Session, now time.Time) state.BackendSelection {
@@ -181,7 +245,8 @@ func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Sessio
 		PreviousBackend: backendName(sess),
 	}
 	for _, candidate := range o.backendFallbackCandidates(sess) {
-		entry := state.BackendCandidate{Backend: candidate, Fit: 0.5, Policy: 0.5, Final: 0.5}
+		provider, model := o.providerModelRouteForBackend(candidate, "")
+		entry := state.BackendCandidate{Backend: candidate, Provider: provider, Model: model, Fit: 0.5, Policy: 0.5, Final: 0.5}
 		if candidate == "" {
 			continue
 		}
@@ -221,6 +286,17 @@ func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Sessio
 				continue
 			}
 		}
+		if health, ok := providerModelHealth(st, provider, model); ok && health.State == state.BackendHealthCooldown {
+			if health.RetryAfter == nil || now.Before(*health.RetryAfter) {
+				entry.Available = false
+				entry.BlockedBy = health.Reason
+				if health.RetryAfter != nil {
+					entry.RetryAfter = health.RetryAfter.Format(time.RFC3339)
+				}
+				selection.CandidateScores = append(selection.CandidateScores, entry)
+				continue
+			}
+		}
 
 		entry.Available = true
 		entry.Fit = backendFitScore(candidate, o.cfg)
@@ -247,7 +323,7 @@ func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Sessio
 // until a cooldown lapses instead of spawn-die churning.
 func (o *Orchestrator) resolveDispatchBackend(st *state.State, issue github.Issue, now time.Time) (decision router.BackendDecision, ok bool, retryAt *time.Time) {
 	decision = o.resolveBackendDecision(issue)
-	blockedBy, blockedRetry := o.dispatchBackendBlock(st, decision.Backend, now)
+	blockedBy, blockedRetry := o.dispatchBackendBlock(st, decision.Backend, decision.Model, now)
 	if blockedBy == "" {
 		return decision, true, nil
 	}
@@ -256,7 +332,7 @@ func (o *Orchestrator) resolveDispatchBackend(st *state.State, issue github.Issu
 		if candidate == decision.Backend {
 			continue
 		}
-		candidateBlock, candidateRetry := o.dispatchBackendBlock(st, candidate, now)
+		candidateBlock, candidateRetry := o.dispatchBackendBlock(st, candidate, "", now)
 		if candidateBlock != "" {
 			if candidateRetry != nil && (earliest == nil || candidateRetry.Before(*earliest)) {
 				earliest = candidateRetry
@@ -279,7 +355,7 @@ func (o *Orchestrator) resolveDispatchBackend(st *state.State, issue github.Issu
 // disabled backends are never dispatchable, and a backend in BackendHealth
 // cooldown stays blocked until its RetryAfter passes (or indefinitely while
 // RetryAfter is unset). retryAfter is the cooldown expiry when one exists.
-func (o *Orchestrator) dispatchBackendBlock(st *state.State, name string, now time.Time) (blockedBy string, retryAfter *time.Time) {
+func (o *Orchestrator) dispatchBackendBlock(st *state.State, name, modelOverride string, now time.Time) (blockedBy string, retryAfter *time.Time) {
 	backendDef, ok := o.cfg.Model.Backends[name]
 	if !ok {
 		return state.BackendBlockUnknown, nil
@@ -299,7 +375,92 @@ func (o *Orchestrator) dispatchBackendBlock(st *state.State, name string, now ti
 			return reason, health.RetryAfter
 		}
 	}
+	provider, model := o.providerModelRouteForBackend(name, modelOverride)
+	if health, ok := providerModelHealth(st, provider, model); ok && health.State == state.BackendHealthCooldown {
+		if health.RetryAfter == nil || now.Before(*health.RetryAfter) {
+			reason := health.Reason
+			if reason == "" {
+				reason = state.BackendBlockModelCooldown
+			}
+			return reason, health.RetryAfter
+		}
+	}
 	return "", nil
+}
+
+func providerModelHealth(st *state.State, provider, model string) (state.BackendHealth, bool) {
+	if st == nil || provider == "" || model == "" {
+		return state.BackendHealth{}, false
+	}
+	models := st.ProviderModelHealth[provider]
+	if models == nil {
+		return state.BackendHealth{}, false
+	}
+	health, ok := models[model]
+	return health, ok
+}
+
+func (o *Orchestrator) providerModelRouteForSession(sess *state.Session, providerOverride, modelOverride string) (string, string) {
+	if sess == nil {
+		return strings.TrimSpace(providerOverride), strings.TrimSpace(modelOverride)
+	}
+	model := strings.TrimSpace(modelOverride)
+	if model == "" && sess.BackendSelection != nil {
+		model = strings.TrimSpace(sess.BackendSelection.Model)
+	}
+	if model == "" {
+		model = strings.TrimSpace(sess.Model)
+	}
+	provider, configuredModel := o.providerModelRouteForBackend(sess.Backend, model)
+	configuredProvider := ""
+	if o != nil && o.cfg != nil {
+		configuredProvider = strings.TrimSpace(o.cfg.Model.Backends[sess.Backend].Provider)
+	}
+	if strings.TrimSpace(providerOverride) != "" && configuredProvider == "" {
+		provider = strings.TrimSpace(providerOverride)
+	}
+	if model == "" {
+		model = configuredModel
+	}
+	return provider, model
+}
+
+func (o *Orchestrator) providerModelRouteForBackend(name, modelOverride string) (string, string) {
+	provider := strings.TrimSpace(name)
+	model := strings.TrimSpace(modelOverride)
+	if o == nil || o.cfg == nil {
+		return provider, model
+	}
+	def, ok := o.cfg.Model.Backends[name]
+	if !ok {
+		return provider, model
+	}
+	if configuredProvider := strings.TrimSpace(def.Provider); configuredProvider != "" {
+		provider = configuredProvider
+	}
+	if model == "" {
+		model = backendConfiguredModel(def)
+	}
+	return provider, model
+}
+
+func backendConfiguredModel(def config.BackendDef) string {
+	args := append(strings.Fields(def.Cmd), def.ExtraArgs...)
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "--model" || arg == "-m":
+			if i+1 < len(args) {
+				return strings.TrimSpace(args[i+1])
+			}
+		case strings.HasPrefix(arg, "--model="):
+			return strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
+		}
+	}
+	if model := strings.TrimSpace(def.TierModel); model != "" {
+		return model
+	}
+	return strings.TrimSpace(def.Model)
 }
 
 // dispatchBackendCandidates is the substitution order for a fresh dispatch

@@ -1384,6 +1384,11 @@ type fleetProjectState struct {
 	// auto-recovery is on a known clock.
 	BackendHealth map[string]state.BackendHealth `json:"backend_health,omitempty"`
 
+	// ProviderModelHealth carries cooldowns scoped to one provider/model route.
+	// A route can be unavailable while the provider and its other models remain
+	// healthy, so this must not be folded into BackendHealth.
+	ProviderModelHealth map[string]map[string]state.BackendHealth `json:"provider_model_health,omitempty"`
+
 	// BackendQuota is the per-backend subscription quota position (#704)
 	// for backends with quota config: window/weekly percent used, reset
 	// ETAs and whether dispatch is currently steered to fallbacks. The
@@ -3976,6 +3981,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	// session recorded after the cooldown was set all render as healthy.
 	state.ReconcileBackendHealth(st, now)
 	item.BackendHealth = st.BackendHealth
+	item.ProviderModelHealth = st.ProviderModelHealth
 	item.BackendQuota = buildFleetBackendQuota(cfg, st, now)
 	item.CostObservability = buildFleetCostObservability(cfg, st, now)
 	projectState := buildStateResponse(cfg, st)
