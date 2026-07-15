@@ -829,13 +829,41 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
               <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>· {allRecent.length} active in last 24 h</span>
               <span className="dim mono" style={{ fontSize: 10.5, marginLeft: "auto" }}>refresh 12s · auto</span>
             </div>
-            {allRecent.length === 0 ? (
+            {allRunning.length === 0 ? (
               <div style={{ padding: "var(--s-8) var(--s-4)", textAlign: "center", color: "var(--fg-2)", background: "var(--bg-1)", borderBottom: "1px solid var(--border-1)" }}>
                 <div style={{ fontSize: 13 }}>No workers running.</div>
                 <div className="mono dim mt-2" style={{ fontSize: 11 }}>{fleet?.daemonAlive ? "Supervisor checking for eligible issues." : "Daemon offline."}</div>
               </div>
-            ) : allRecent.map(w => (
+            ) : allRunning.map(w => (
               <div key={w.slot} data-worker-slot={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
+                <div className="wt-slot">{w.slot}</div>
+                <div className="wt-issue-cell">
+                  <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
+                  <div className="wt-project">{w.project}</div>
+                  <AttributionInline worker={w} now={now} />
+                </div>
+                <div className="wt-status"><Pill tone={w.tone} noDot title={w.status}>{w.status}</Pill></div>
+                <div className="wt-branch mono">
+                  {w.pr ? <>PR #{w.pr}</> : <span className="dim">draft</span>}
+                  {w.branch && (
+                    <div className="wt-branch-name dim" title={w.branch}>{truncateBranchName(w.branch)}</div>
+                  )}
+                </div>
+                <div className="wt-next">{w.summary}</div>
+                <div className="wt-age">{relTime(w.age, now)}</div>
+              </div>
+            ))}
+          </>
+        )}
+
+        {(scope === "live" || scope === "today" || scope === "all") && allRecent.length > 0 && (
+          <>
+            <div className="wt-group">
+              <span className="pill info no-dot" style={{ background: "transparent", border: "none", padding: 0, color: "var(--info)" }}>● active</span>
+              <strong>{allRecent.length} progressing or recent</strong>
+            </div>
+            {allRecent.map(w => (
+              <div key={`${w.slot}-recent`} data-worker-slot={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
                 <div className="wt-slot">{w.slot}</div>
                 <div className="wt-issue-cell">
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
