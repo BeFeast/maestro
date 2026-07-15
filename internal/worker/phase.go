@@ -3,7 +3,6 @@ package worker
 import (
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -62,7 +61,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 
 	// Prepare log file
 	logDir := state.LogDir(cfg.StateDir)
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := ensureWorkerLogDir(logDir); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
 	}
 	logFile := fmt.Sprintf("%s/%s-%s.log", logDir, slotName, sess.Phase)
