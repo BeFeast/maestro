@@ -258,8 +258,8 @@ func (s *State) RecordMaterialRecovery(targetKey, recommendationID string, outco
 
 // ClaimMaterialRecovery acquires one bounded actuator lease for an exact
 // recommendation. A live lease suppresses concurrent cycles; an expired lease
-// may be renewed after a crash so reconciliation can continue. Terminal
-// recoveries are never claimed again.
+// may be renewed after a crash only while the latest evaluator decision still
+// authorizes it. Terminal recoveries are never claimed again.
 func (s *State) ClaimMaterialRecovery(targetKey, recommendationID, leaseID string, leaseDuration time.Duration, now time.Time) (bool, error) {
 	if s == nil || s.MaterialProgress == nil {
 		return false, fmt.Errorf("material-progress state does not exist")
@@ -274,6 +274,11 @@ func (s *State) ClaimMaterialRecovery(targetKey, recommendationID, leaseID strin
 	}
 	if target.LastRecommendation.Action != progress.ActionStopAndRetry {
 		return false, fmt.Errorf("material-progress recommendation is not automatically recoverable")
+	}
+	if !target.Active || target.LastDecision == nil ||
+		target.LastDecision.Action != progress.ActionStopAndRetry ||
+		target.LastDecision.RecommendationID != recommendationID {
+		return false, nil
 	}
 	now = now.UTC()
 	for i := range target.Recoveries {

@@ -186,6 +186,56 @@ func TestMaterialProgressRecovery_ExpiredClaimResumesAfterStop(t *testing.T) {
 	}
 }
 
+func TestMaterialProgressRecovery_ExpiredClaimAfterProgressDoesNotTakeOver(t *testing.T) {
+	cfg := stalledRecoveryConfig(t)
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	target, recommendationID := seedStalledRecovery(t, cfg, now, 0)
+	if err := state.Update(cfg.StateDir, func(st *state.State) error {
+		claimed, err := st.ClaimMaterialRecovery(target.Key(), recommendationID, "recovery:crashed", time.Minute, now)
+		if err != nil || !claimed {
+			t.Fatalf("initial claim: claimed=%t err=%v", claimed, err)
+		}
+		record := st.MaterialProgress.Targets[target.Key()]
+		advanced := progress.Observation{
+			Target: target, Phase: progress.PhasePreDelivery,
+			Signals: progress.SignalSet{
+				{Kind: progress.SignalIssueSession, Fingerprint: progress.Fingerprint("running")},
+				{Kind: progress.SignalProcessTmux, Fingerprint: progress.Fingerprint("4242", target.TmuxSession)},
+				{Kind: progress.SignalWorktreeGit, Fingerprint: progress.Fingerprint("head-2")},
+			},
+		}
+		watermark, decision := progress.EvaluateObservation(record.Watermark, advanced, 20*time.Minute, now.Add(time.Minute))
+		record.Watermark = watermark
+		record.LastDecision = &decision
+		if decision.Action != progress.ActionNone {
+			t.Fatalf("advanced decision = %+v", decision)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int32
+	runtime := materialProgressRecoveryRuntime{
+		inspect: func(progress.Target) exactWorkerLeaseState { calls.Add(1); return exactWorkerLeaseExact },
+		stop:    func(progress.Target) exactWorkerLeaseState { calls.Add(1); return exactWorkerLeaseAbsent },
+	}
+	if err := reconcileMaterialProgressRecoveries(cfg, now.Add(2*time.Minute), runtime); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("stale recovery claim inspected or stopped a progressing worker")
+	}
+	st, _ := state.Load(cfg.StateDir)
+	if st.Sessions[target.Slot].Status != state.StatusRunning {
+		t.Fatalf("progressing worker was mutated: %+v", st.Sessions[target.Slot])
+	}
+	recovery := latestMaterialRecovery(t, st)
+	if recovery.Outcome != progress.RecoveryAttempted || recovery.LeaseGeneration != 1 || recovery.LeaseID != "recovery:crashed" {
+		t.Fatalf("stale recovery claim changed: %+v", recovery)
+	}
+}
+
 func TestMaterialProgressRecovery_ReplacementAndUncertainIdentityAreNeverKilled(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -329,6 +379,12 @@ func TestMaterialProgressRecovery_ExecutingDeliveryNeverInvokesWorkerRuntime(t *
 	loaded, _ := state.Load(cfg.StateDir)
 	if recovery := latestMaterialRecoveryOrNil(loaded); recovery != nil {
 		t.Fatalf("delivery recommendation created an actuator recovery: %+v", recovery)
+	}
+}
+
+func TestExactTmuxSessionTarget(t *testing.T) {
+	if got := exactTmuxSessionTarget(" maestro-slot-1 "); got != "=maestro-slot-1" {
+		t.Fatalf("exact tmux target = %q", got)
 	}
 }
 

@@ -139,22 +139,9 @@ func materialProgressRecoveryActionable(target *state.MaterialProgressTarget) bo
 		target.LastRecommendation.Action != progress.ActionStopAndRetry {
 		return false
 	}
-	if target.Active && target.LastDecision != nil &&
+	return target.Active && target.LastDecision != nil &&
 		target.LastDecision.Action == progress.ActionStopAndRetry &&
-		target.LastDecision.RecommendationID == target.LastRecommendation.RecommendationID {
-		return true
-	}
-	// A claimed owner may have stopped the worker and crashed before the next
-	// state transition. Resume only that existing attempt after its lease expires;
-	// never create a new attempt from historical recommendation data.
-	for i := range target.Recoveries {
-		recovery := &target.Recoveries[i]
-		if recovery.RecommendationID == target.LastRecommendation.RecommendationID &&
-			recovery.Outcome == progress.RecoveryAttempted {
-			return true
-		}
-	}
-	return false
+		target.LastDecision.RecommendationID == target.LastRecommendation.RecommendationID
 }
 
 func scheduleMaterialProgressRetry(cfg *config.Config, targetKey, recID, leaseID string, target progress.Target, now time.Time) error {
@@ -240,7 +227,7 @@ func inspectExactWorkerLease(target progress.Target) exactWorkerLeaseState {
 	if target.Kind != progress.TargetWorker || strings.TrimSpace(target.TmuxSession) == "" || target.ProcessID <= 0 {
 		return exactWorkerLeaseUncertain
 	}
-	out, err := exec.Command("tmux", "list-panes", "-t", target.TmuxSession, "-F", "#{pane_pid}").Output()
+	out, err := exec.Command("tmux", "list-panes", "-t", exactTmuxSessionTarget(target.TmuxSession), "-F", "#{pane_pid}").Output()
 	if err != nil {
 		if worker.IsAlive(target.ProcessID) {
 			return exactWorkerLeaseUncertain
@@ -267,8 +254,12 @@ func stopExactWorkerLease(target progress.Target) exactWorkerLeaseState {
 		return observed
 	}
 	worker.KillProcessTree(target.ProcessID)
-	_ = exec.Command("tmux", "kill-session", "-t", target.TmuxSession).Run()
+	_ = exec.Command("tmux", "kill-session", "-t", exactTmuxSessionTarget(target.TmuxSession)).Run()
 	return inspectExactWorkerLease(target)
+}
+
+func exactTmuxSessionTarget(session string) string {
+	return "=" + strings.TrimSpace(session)
 }
 
 func newMaterialProgressRecoveryLeaseID() (string, error) {
