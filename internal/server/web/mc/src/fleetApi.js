@@ -549,6 +549,8 @@ export function relTimePrecise(date, now) {
 
 function collectWorkers(raw) {
   if (Array.isArray(raw.workers) && raw.workers.length) {
+    // The Fleet API owns the Workers ordering contract. Preserve raw order here;
+    // screen-level filters only partition it into visible groups.
     return raw.workers.map(mapWorker);
   }
   return (raw.projects || []).flatMap(project =>
@@ -920,7 +922,8 @@ function mapWorker(worker) {
 // and the section it should render under in the Workers screen.
 //
 // Sections:
-//   - "running": actively in flight (running, queued, review_retry_*)
+//   - "running": actively in flight (running with alive=true, queued,
+//                review_retry_* waiting/progress states)
 //   - "recent":  not running but live in the last 24h (pr_open, code_landed,
 //                blocked-by-project, idle awaiting reconciliation)
 //   - "stuck":   needs operator attention (dead, failed, conflict_failed,
@@ -940,6 +943,10 @@ function mapWorker(worker) {
 export function workerStatusTaxonomy(worker) {
   const status = String(worker.status || "");
   const display = String(worker.display_status || "");
+
+  if (status === "running" && worker.alive === false) {
+    return { label: "running", tone: "stuck", section: "stuck" };
+  }
 
   if (display.startsWith("review_retry_")) {
     return {
@@ -971,6 +978,10 @@ export function workerStatusTaxonomy(worker) {
 
   if (display === "blocked" && !isStuckStatus(status)) {
     return { label: "blocked", tone: "idle", section: "recent" };
+  }
+
+  if (worker.needs_attention === true) {
+    return { label: (display || status || "needs attention").replace(/_/g, " "), tone: "stuck", section: "stuck" };
   }
 
   switch (status) {
@@ -1293,7 +1304,8 @@ export function deriveTapeEvents(project, workers, now) {
 
 export function workerSessionsFromFleet(fleet, now) {
   // Session-status taxonomy (issue #540):
-  //   - running = `rawStatus === "running"` — actually executing right now.
+  //   - running = `rawStatus === "running" && alive === true` — actually
+  //               executing right now.
   //   - recent  = live (24-h window from the server) AND not stuck. Includes
   //               pr_open, code_landed, blocked-by-project, etc. so the
   //               "in flight" group reflects active flow only.
@@ -1323,8 +1335,9 @@ export function workerSessionsFromFleet(fleet, now) {
     const finished = parseTimestamp(worker.finished_at) || worker.age;
     const rawStatus = worker.rawStatus || worker.status || "";
 
-    if (rawStatus === "running") {
+    if (workerActuallyRunning(worker)) {
       running.push(worker);
+      continue;
     }
 
     if (section === "stuck") {
@@ -1360,6 +1373,10 @@ export function workerSessionsFromFleet(fleet, now) {
     stuckToday,
     olderCount,
   };
+}
+
+function workerActuallyRunning(worker) {
+  return (worker.rawStatus || worker.status || "") === "running" && worker.alive === true;
 }
 
 export function supervisorDecisionsFromProject(project, now) {

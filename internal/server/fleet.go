@@ -2416,22 +2416,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 		return resp.Projects[i].Name < resp.Projects[j].Name
 	})
 	sort.SliceStable(resp.Workers, func(i, j int) bool {
-		left, right := resp.Workers[i], resp.Workers[j]
-		if left.NeedsAttention != right.NeedsAttention {
-			return left.NeedsAttention
-		}
-		li := state.StatusPriority(state.SessionStatus(left.Status))
-		ri := state.StatusPriority(state.SessionStatus(right.Status))
-		if li != ri {
-			return li < ri
-		}
-		if left.StartedAt != right.StartedAt {
-			return left.StartedAt > right.StartedAt
-		}
-		if left.ProjectName != right.ProjectName {
-			return left.ProjectName < right.ProjectName
-		}
-		return left.Slot < right.Slot
+		return fleetWorkerLess(resp.Workers[i], resp.Workers[j])
 	})
 	sort.SliceStable(resp.Attention, func(i, j int) bool {
 		left, right := resp.Attention[i], resp.Attention[j]
@@ -2459,6 +2444,83 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.Mirror = s.mirrorStatsSnapshot()
 	resp.Emergency = s.emergencySnapshot()
 	return resp
+}
+
+func fleetWorkerLess(left, right fleetWorkerState) bool {
+	lg := fleetWorkerOrderGroup(left)
+	rg := fleetWorkerOrderGroup(right)
+	if lg != rg {
+		return lg < rg
+	}
+	if lg == 0 {
+		if left.StartedAt != right.StartedAt {
+			return left.StartedAt > right.StartedAt
+		}
+	} else if lg == 2 {
+		li := fleetAttentionSeverity(left)
+		ri := fleetAttentionSeverity(right)
+		if li != ri {
+			return li < ri
+		}
+	}
+	li := state.StatusPriority(state.SessionStatus(left.Status))
+	ri := state.StatusPriority(state.SessionStatus(right.Status))
+	if li != ri {
+		return li < ri
+	}
+	if left.StartedAt != right.StartedAt {
+		return left.StartedAt > right.StartedAt
+	}
+	if left.ProjectName != right.ProjectName {
+		return left.ProjectName < right.ProjectName
+	}
+	return left.Slot < right.Slot
+}
+
+func fleetWorkerOrderGroup(worker fleetWorkerState) int {
+	// Fleet API owns the /workers ordering contract:
+	// 0 actually running now (status=running and alive=true)
+	// 1 self-progressing active work
+	// 2 needs operator attention
+	// 3 recent terminal/history rows
+	// 4 older searchable history
+	switch {
+	case fleetWorkerActuallyRunning(worker):
+		return 0
+	case fleetWorkerSelfProgressing(worker):
+		return 1
+	case worker.NeedsAttention:
+		return 2
+	case fleetWorkerRecentlyActive(worker):
+		return 3
+	default:
+		return 4
+	}
+}
+
+func fleetWorkerActuallyRunning(worker fleetWorkerState) bool {
+	return state.SessionStatus(worker.Status) == state.StatusRunning && worker.Alive != nil && *worker.Alive
+}
+
+func fleetSessionActuallyRunning(worker sessionInfo) bool {
+	return state.SessionStatus(worker.Status) == state.StatusRunning && worker.Alive != nil && *worker.Alive
+}
+
+func fleetWorkerSelfProgressing(worker fleetWorkerState) bool {
+	switch worker.DisplayStatus {
+	case string(state.DisplayReviewRetryBackoff), string(state.DisplayReviewRetryPending), string(state.DisplayReviewRetryRunning), string(state.DisplayReviewRetryRecheck):
+		return true
+	}
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusQueued, state.StatusPROpen:
+		return !worker.NeedsAttention
+	default:
+		return false
+	}
+}
+
+func fleetWorkerRecentlyActive(worker fleetWorkerState) bool {
+	return worker.Live || strings.TrimSpace(worker.FinishedAt) != "" || state.SessionStatus(worker.Status) == state.StatusCodeLanded
 }
 
 func buildFleetVerdict(resp fleetResponse, now time.Time) fleetVerdict {
@@ -3917,9 +3979,9 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	projectState := buildStateResponse(cfg, st)
 	item.Summary = projectState.Summary
 	item.Outcome = projectState.Outcome
-	item.Running = len(projectState.Running)
+	item.Running = 0
 	item.PROpen = len(projectState.PROpen)
-	item.WorkersRunning = item.Running
+	item.WorkersRunning = 0
 	// #814: expose the live-worker vs PR-gate capacity split so Mission
 	// Control never renders "0 workers" for a gate-bound-but-busy project.
 	capacity := st.Capacity(state.CapacityInput{
@@ -3927,7 +3989,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		MaxLiveWorkers:       cfg.MaxLiveWorkers,
 		MaxConcurrentByState: cfg.MaxConcurrentByState,
 	})
-	item.LiveWorkers = capacity.LiveWorkers
+	item.LiveWorkers = 0
 	item.PRGates = capacity.PRGates
 	item.CapacityUsed = capacity.CapacityUsed
 	item.CapacityBlockedByGates = capacity.BlockedByGates
@@ -3988,6 +4050,11 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			if fleetSessionIsConvergenceBound(worker) {
 				item.SelfResolving++
 			}
+		}
+		if fleetSessionActuallyRunning(worker) {
+			item.Running++
+			item.WorkersRunning++
+			item.LiveWorkers++
 		}
 		workers = append(workers, makeFleetWorkerState(item, worker))
 		if _, isStale := staleSlots[worker.Slot]; isStale {
