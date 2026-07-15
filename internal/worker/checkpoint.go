@@ -140,7 +140,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 
 	// Prepare log file
 	logDir := state.LogDir(cfg.StateDir)
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := ensureWorkerLogDir(logDir); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
 	}
 	logFile := filepath.Join(logDir, slotName+".log")

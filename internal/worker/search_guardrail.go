@@ -615,12 +615,15 @@ func openPrivateCredentialFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("open credential parent without following links: %w", err)
 	}
 	defer parent.Close()
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+	parentInfo, err := parent.Stat()
+	if err != nil {
 		return nil, fmt.Errorf("stat credential parent: %w", err)
 	}
-	if os.FileMode(parentStat.Mode).Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("parent dir is group/other writable")
+	if err := checkOwnedByUs(parentPath, parentInfo); err != nil {
+		return nil, fmt.Errorf("credential parent: %w", err)
+	}
+	if parentInfo.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("credential parent is group/other accessible (mode %o)", parentInfo.Mode().Perm())
 	}
 	fd, err := unix.Openat(int(parent.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -983,8 +986,8 @@ func ScrubLegacyRunArtifacts(stateDir string) {
 		scrubRunnerScript(path)
 	}
 
-	if len(secrets) == 0 {
-		return
+	if err := ensureWorkerLogDir(filepath.Join(stateDir, "logs")); err != nil && !os.IsNotExist(err) {
+		log.Printf("[worker] repair worker log dir permissions: %v", err)
 	}
 	if approvedBoundary != "" {
 		approvedBoundary, _ = filepath.Abs(approvedBoundary)
@@ -1148,7 +1151,20 @@ func scrubSecretValuesInPlace(path string, secrets []string) (bool, error) {
 			maxLen = len(secret)
 		}
 	}
+	repairedMode := os.FileMode(0o600)
+	if info.Mode().Perm()&0o100 != 0 {
+		repairedMode = 0o700
+	}
+	modeChanged := info.Mode().Perm() != repairedMode
 	if maxLen == 0 || info.Size() == 0 {
+		if modeChanged {
+			if err := f.Chmod(repairedMode); err != nil {
+				return false, err
+			}
+			if err := f.Sync(); err != nil {
+				return false, err
+			}
+		}
 		return false, nil
 	}
 	const chunkSize = 64 * 1024
@@ -1188,11 +1204,7 @@ func scrubSecretValuesInPlace(path string, secrets []string) (bool, error) {
 			break
 		}
 	}
-	if changed {
-		repairedMode := os.FileMode(0o600)
-		if info.Mode().Perm()&0o100 != 0 {
-			repairedMode = 0o700
-		}
+	if changed || modeChanged {
 		if err := f.Chmod(repairedMode); err != nil {
 			return false, err
 		}

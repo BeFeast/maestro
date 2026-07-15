@@ -547,6 +547,15 @@ func TestValidatePrivateCredentialFile(t *testing.T) {
 	if err := validatePrivateCredentialFile(good); err != nil {
 		t.Fatalf("valid file rejected: %v", err)
 	}
+	if err := os.Chmod(dir, 0o710); err != nil {
+		t.Fatalf("chmod accessible credential dir: %v", err)
+	}
+	if err := validatePrivateCredentialFile(good); err == nil {
+		t.Fatal("credential file below a group-accessible parent was accepted")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("restore credential dir mode: %v", err)
+	}
 
 	link := filepath.Join(dir, "link.env")
 	if err := os.Symlink(good, link); err != nil {
@@ -722,6 +731,71 @@ func TestRunWorkerWithCredentialsInjectsOnlyAtExecTime(t *testing.T) {
 	}
 	if output.String() != fmt.Sprintf("%d|unset", len(current)) {
 		t.Fatalf("exec-time environment proof = %q, want current length and no stale key", output.String())
+	}
+}
+
+func TestCredentialArgvHelperProcess(t *testing.T) {
+	if os.Getenv("MAESTRO_TEST_CREDENTIAL_ARGV_HELPER") != "1" {
+		return
+	}
+	secret := os.Getenv("OPENAI_API_KEY")
+	if secret == "" {
+		os.Exit(92)
+	}
+	for _, arg := range os.Args {
+		if strings.Contains(arg, secret) {
+			os.Exit(93)
+		}
+	}
+	_, _ = fmt.Fprint(os.Stdout, "argv-clean")
+	os.Exit(0)
+}
+
+func TestRunWorkerWithCredentialsKeepsCredentialOutOfProcessArguments(t *testing.T) {
+	canary := "CANARY-" + "child-argv-zero-copy-" + "0888"
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod credential dir: %v", err)
+	}
+	credentialFile := filepath.Join(dir, "worker.env")
+	if err := os.WriteFile(credentialFile, []byte("OPENAI_API_KEY="+shellQuote(canary)+"\n"), 0o600); err != nil {
+		t.Fatalf("write credential file: %v", err)
+	}
+	t.Setenv("MAESTRO_TEST_CREDENTIAL_ARGV_HELPER", "1")
+	var output bytes.Buffer
+	err := RunWorkerWithCredentials(credentialFile, []string{
+		os.Args[0], "-test.run=^TestCredentialArgvHelperProcess$",
+	}, strings.NewReader(""), &output)
+	if err != nil {
+		t.Fatalf("run argv helper: %v (%q)", err, output.String())
+	}
+	if output.String() != "argv-clean" {
+		t.Fatalf("argv helper output = %q", output.String())
+	}
+}
+
+func TestShippedSystemdUnitContainsNoLiteralWorkerCredential(t *testing.T) {
+	canary := "CANARY-" + "systemd-unit-zero-copy-" + "0888"
+	t.Setenv("OPENAI_API_KEY", canary)
+	unit, err := os.ReadFile(filepath.Join("..", "..", "maestro.service"))
+	if err != nil {
+		t.Fatalf("read shipped maestro.service: %v", err)
+	}
+	text := string(unit)
+	if strings.Contains(text, canary) {
+		t.Fatal("shipped systemd unit contains the synthetic credential value")
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Environment=") {
+			continue
+		}
+		assignment := strings.Trim(strings.TrimPrefix(line, "Environment="), `"'`)
+		for _, key := range workerCredentialSecretKeys {
+			if strings.HasPrefix(assignment, key+"=") {
+				t.Fatalf("shipped systemd unit has a literal %s assignment", key)
+			}
+		}
 	}
 }
 
@@ -973,8 +1047,8 @@ func TestScrubLegacyRunArtifactsPreservesApprovedBoundaryInsideStateDir(t *testi
 	}
 }
 
-// #888: a legacy runner without credential material still has its permissions
-// repaired, while unrelated artifacts are untouched.
+// #888: a legacy runner without credential material and recognized worker text
+// artifacts still have their permissions repaired.
 func TestScrubLegacyRunArtifactsRepairsPlainRunnerPerms(t *testing.T) {
 	for _, key := range workerCredentialEnvKeys {
 		t.Setenv(key, "")
@@ -1003,8 +1077,13 @@ func TestScrubLegacyRunArtifactsRepairsPlainRunnerPerms(t *testing.T) {
 	if info, _ := os.Stat(runner); info.Mode().Perm() != workerRunnerScriptMode {
 		t.Fatalf("plain runner perm = %o, want %o", info.Mode().Perm(), workerRunnerScriptMode)
 	}
-	if info, _ := os.Stat(unrelated); info.Mode().Perm() != 0o644 {
-		t.Fatalf("unrelated file perm changed to %o", info.Mode().Perm())
+	if info, _ := os.Stat(unrelated); info.Mode().Perm() != 0o600 {
+		t.Fatalf("worker text artifact perm = %o, want 600", info.Mode().Perm())
+	}
+	if info, err := os.Stat(filepath.Join(stateDir, "logs")); err != nil {
+		t.Fatalf("stat repaired log dir: %v", err)
+	} else if info.Mode().Perm() != workerLogDirMode {
+		t.Fatalf("worker log dir perm = %o, want %o", info.Mode().Perm(), workerLogDirMode)
 	}
 }
 
