@@ -33,6 +33,10 @@ import (
 //     not false-positive
 //   - HTTP 404 paired with an HTTP / status / code / error / response marker
 //     (bare "404" is NOT matched — same discipline as http_401)
+//   - HTTP/API 529 paired with an overloaded marker. CLIProxyAPI does not
+//     retry 529 across credentials, so a terminal 529 must cool only the
+//     requested provider/model route and let the orchestrator try a different
+//     model on the same provider before crossing providers (#908).
 var modelUnavailablePatterns = []struct {
 	label string
 	re    *regexp.Regexp
@@ -47,6 +51,11 @@ var modelUnavailablePatterns = []struct {
 	// Not Found" line do not false-positive — only an anchored 404 (e.g. "API
 	// Error: 404", "status: 404") is treated as a model-unavailable signal.
 	{"http_404", regexp.MustCompile(`(?i)\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*404\b`)},
+	// A bare 529 or the word "overloaded" is not enough: both must occur on
+	// the same terminal line, and 529 must be anchored to an HTTP/API status
+	// context. This matches Claude's live `API Error: 529 ... overloaded_error`
+	// while avoiding issue numbers, counters, and ordinary work output.
+	{"model_overloaded", regexp.MustCompile(`(?i)(?:\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*529\b[^\n]{0,160}\boverloaded(?:_error)?\b|\boverloaded(?:_error)?\b[^\n]{0,160}\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*529\b)`)},
 }
 
 // DetectModelUnavailable scans multi-line output for known model-unavailable

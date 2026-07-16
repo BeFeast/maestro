@@ -18,11 +18,12 @@ func credentialAwareFallbackConfig() *config.Config {
 		Repo: "owner/repo",
 		Model: config.ModelConfig{
 			Default:          "fable",
-			FallbackBackends: []string{"codex"},
+			FallbackBackends: []string{"claude-opus", "codex"},
 			Backends: map[string]config.BackendDef{
-				"fable":  {Cmd: "claude --model claude-fable-5"},
-				"sonnet": {Cmd: "claude --model claude-sonnet-4-6"},
-				"codex":  {Cmd: "codex --model gpt-5.5"},
+				"fable":       {Cmd: "claude --model claude-fable-5", Provider: "fable", Model: "claude-fable-5"},
+				"claude-opus": {Cmd: "claude --model claude-opus-4-8", Provider: "fable", Model: "claude-opus-4-8"},
+				"sonnet":      {Cmd: "claude --model claude-sonnet-4-6", Provider: "fable", Model: "claude-sonnet-4-6"},
+				"codex":       {Cmd: "codex --model gpt-5.5", Provider: "openai", Model: "gpt-5.5"},
 			},
 		},
 	}
@@ -77,8 +78,8 @@ func TestReconcileRunningSessions_ModelCredentialPoolExhausted_GatesOnlyRoute(t 
 	if !o.reconcileRunningSessions(s) {
 		t.Fatal("expected model cooldown reconciliation")
 	}
-	if respawned != "codex" {
-		t.Fatalf("respawned backend = %q, want codex after both Fable credentials were unavailable", respawned)
+	if respawned != "claude-opus" {
+		t.Fatalf("respawned backend = %q, want claude-opus after Fable was unavailable", respawned)
 	}
 	if _, ok := s.BackendHealth["fable"]; ok {
 		t.Fatalf("model cooldown must not gate the whole backend: %+v", s.BackendHealth["fable"])
@@ -119,8 +120,8 @@ func TestResolveDispatchBackend_ModelCooldownLeavesOtherProviderModelEligible(t 
 
 	fableIssue := makeIssue(908, "Fable route", "model:fable")
 	decision, ok, _ := o.resolveDispatchBackend(s, fableIssue, now)
-	if !ok || decision.Backend != "codex" {
-		t.Fatalf("Fable decision = %+v ok=%v, want precise fallback to codex", decision, ok)
+	if !ok || decision.Backend != "claude-opus" {
+		t.Fatalf("Fable decision = %+v ok=%v, want same-provider fallback to claude-opus", decision, ok)
 	}
 
 	sonnetIssue := makeIssue(909, "Sonnet route", "model:sonnet")
@@ -187,7 +188,7 @@ func TestRespawnDueRetries_ModelRouteCooldownBreaksSessionAffinity(t *testing.T)
 	o.respawnDueRetries(s, 10)
 
 	sess := s.Sessions["sup-909"]
-	if respawned != "codex" || sess.Backend != "codex" {
+	if respawned != "claude-opus" || sess.Backend != "claude-opus" {
 		t.Fatalf("retry remained pinned to unavailable route: respawned=%q session=%q", respawned, sess.Backend)
 	}
 	if sess.BackendSelection == nil || sess.BackendSelection.SelectionReason != selectionReasonRetryBlockedFallback {
