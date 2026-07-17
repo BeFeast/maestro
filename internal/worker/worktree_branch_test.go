@@ -42,6 +42,26 @@ func TestEnsureWorktreeBranchPreservesDirtyRetainedCheckout(t *testing.T) {
 	}
 }
 
+func TestUniqueBranchCommitsReturnsOnlySiblingPatch(t *testing.T) {
+	repo := newBranchTestRepo(t)
+	runBranchGit(t, repo, "branch", "canonical")
+	runBranchGit(t, repo, "switch", "-c", "duplicate")
+	if err := os.WriteFile(filepath.Join(repo, "repair.txt"), []byte("preserved repair\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runBranchGit(t, repo, "add", "repair.txt")
+	runBranchGit(t, repo, "commit", "-m", "preserved repair")
+	want := strings.TrimSpace(runBranchGit(t, repo, "rev-parse", "HEAD"))
+
+	got, err := UniqueBranchCommits(repo, "canonical", "duplicate")
+	if err != nil {
+		t.Fatalf("UniqueBranchCommits: %v", err)
+	}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("unique commits = %v, want [%s]", got, want)
+	}
+}
+
 func newBranchTestRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()

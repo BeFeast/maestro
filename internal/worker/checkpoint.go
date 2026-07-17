@@ -88,6 +88,34 @@ func EnsureWorktreeBranch(worktree, branch string) error {
 	return nil
 }
 
+// UniqueBranchCommits returns patch-unique, non-merge commits that exist on a
+// preserved sibling branch but not on the canonical branch. Recovery uses the
+// exact immutable SHAs as a handoff to the canonical repair worker instead of
+// silently abandoning completed work or opening a duplicate PR.
+func UniqueBranchCommits(localPath, canonicalBranch, siblingBranch string) ([]string, error) {
+	localPath = strings.TrimSpace(localPath)
+	canonicalBranch = strings.TrimSpace(canonicalBranch)
+	siblingBranch = strings.TrimSpace(siblingBranch)
+	if localPath == "" || canonicalBranch == "" || siblingBranch == "" {
+		return nil, fmt.Errorf("unique branch commits: repository and both branches are required")
+	}
+	if canonicalBranch == siblingBranch {
+		return nil, nil
+	}
+	out, err := exec.Command(
+		"git", "-C", localPath, "log", "--format=%H", "--cherry-pick", "--right-only", "--no-merges",
+		canonicalBranch+"..."+siblingBranch,
+	).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("compare canonical branch %q with preserved sibling %q: %w: %s", canonicalBranch, siblingBranch, err, strings.TrimSpace(string(out)))
+	}
+	commits := strings.Fields(string(out))
+	if len(commits) > 20 {
+		commits = commits[:20]
+	}
+	return commits, nil
+}
+
 // RestoreMissingWorktree recreates a missing deterministic worker worktree at
 // the session's already-existing local branch. It deliberately does not create
 // a branch, reset a ref, or choose a different path: recovery must preserve the

@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -122,6 +123,15 @@ func TestReconcileCanonicalPRSelectsExactHistoricalSessionAfterCompetingWorkerSt
 	}
 	if got := s.Sessions["ok-player-294"].Status; got != state.StatusFailed {
 		t.Fatalf("new duplicate historical session activated: %q", got)
+	}
+}
+
+func TestAppendRecoveryHandoffContextRequiresExistingCanonicalPR(t *testing.T) {
+	prompt := appendRecoveryHandoffContext("base", "- session duplicate: unique commit `abc123`")
+	for _, want := range []string{"existing PR", "abc123", "do NOT open another PR"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("recovery prompt missing %q: %s", want, prompt)
+		}
 	}
 }
 

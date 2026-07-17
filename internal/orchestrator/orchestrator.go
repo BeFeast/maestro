@@ -1828,8 +1828,9 @@ func appendCIFailureContext(promptBase, ciOutput string, attempt int) string {
 
 ## IMPORTANT: Previous CI Failure (Attempt %d)
 
-A previous worker created a PR for this issue, but CI failed. The PR has been closed.
-You are a retry worker — please fix the CI failures described below.
+The current canonical PR for this issue failed CI and remains open.
+You are an in-place retry worker on that same branch and worktree. Fix the CI
+failures described below, push to the existing PR, and do NOT open another PR.
 
 **CI output from the failed run:**
 `+"```"+`
@@ -1854,6 +1855,22 @@ The following code review comments were left on the previous PR. Address ALL of 
 IMPORTANT: Address ALL code review findings above before creating a new PR.
 Do NOT repeat the same mistakes.
 `, promptBase, feedback)
+}
+
+func appendRecoveryHandoffContext(promptBase, handoff string) string {
+	return fmt.Sprintf(`%s
+
+### Preserved Work From a Superseded Session
+
+Maestro recovered the canonical issue/PR identity after a duplicate or stale
+session. The following committed work is preserved locally:
+
+%s
+
+Inspect these exact commits, carry every useful change onto your current
+canonical branch, and push only to the existing PR. Do NOT delete the preserved
+branch/worktree and do NOT open another PR.
+`, promptBase, handoff)
 }
 
 // failingCheckExcerptCapBytes hard-caps the failing-check excerpt placed in a
@@ -2196,6 +2213,8 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		if sess.PreviousAttemptFeedback != "" {
 			if sess.PreviousAttemptFeedbackKind == "rebase_conflict" {
 				promptBase = appendRebaseConflictContext(promptBase, sess.PreviousAttemptFeedback)
+			} else if sess.PreviousAttemptFeedbackKind == "recovery_handoff" {
+				promptBase = appendRecoveryHandoffContext(promptBase, sess.PreviousAttemptFeedback)
 			} else {
 				if sess.PreviousAttemptFeedbackKind == state.RetryReasonReviewFeedback {
 					sess.RetryReason = state.RetryReasonReviewFeedback
@@ -4705,6 +4724,26 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 				continue
 			}
 		}
+		var handoffs []string
+		if o.cfg != nil && strings.TrimSpace(o.cfg.LocalPath) != "" {
+			for _, siblingSlot := range allSlots {
+				if siblingSlot == candidateSlot {
+					continue
+				}
+				sibling := s.Sessions[siblingSlot]
+				if sibling == nil || strings.TrimSpace(sibling.Branch) == "" || sibling.Branch == canonical.HeadRefName {
+					continue
+				}
+				commits, err := worker.UniqueBranchCommits(o.cfg.LocalPath, canonical.HeadRefName, sibling.Branch)
+				if err != nil {
+					log.Printf("[orch] terminal/open-PR reconcile: could not inspect preserved sibling branch %s for issue #%d: %v", sibling.Branch, issue, err)
+					continue
+				}
+				if len(commits) > 0 {
+					handoffs = append(handoffs, fmt.Sprintf("- session %s branch `%s`: unique commits `%s`", siblingSlot, sibling.Branch, strings.Join(commits, "`, `")))
+				}
+			}
+		}
 		oldPR := sess.PRNumber
 		if oldPR > 0 && oldPR != canonical.Number {
 			sess.LastClosedPRNumber = oldPR
@@ -4714,6 +4753,15 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 		sess.Status = state.StatusPROpen
 		sess.FinishedAt = nil
 		sess.ReleasedForRedispatch = false
+		if len(handoffs) > 0 {
+			handoff := strings.Join(handoffs, "\n")
+			if strings.TrimSpace(sess.PreviousAttemptFeedback) == "" {
+				sess.PreviousAttemptFeedback = handoff
+				sess.PreviousAttemptFeedbackKind = "recovery_handoff"
+			} else {
+				sess.PreviousAttemptFeedback += "\n\nPreserved sibling work:\n" + handoff
+			}
+		}
 		log.Printf("[orch] reconciled terminal session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", candidateSlot, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
 	}
 }
