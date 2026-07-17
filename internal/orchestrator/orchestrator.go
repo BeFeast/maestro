@@ -4689,6 +4689,22 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 		if closed {
 			continue
 		}
+		// A retained terminal worktree may still be checked out on the closed
+		// duplicate branch. Metadata alone cannot adopt the canonical PR because
+		// RespawnInPlace deliberately preserves the existing checkout. Reattach a
+		// clean worktree first and fail closed on dirty/mismatched state so no work
+		// is lost or accidentally pushed to the wrong PR.
+		if strings.TrimSpace(sess.Worktree) != "" {
+			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
+				if err := worker.EnsureWorktreeBranch(sess.Worktree, canonical.HeadRefName); err != nil {
+					log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: canonical worktree reattach failed: %v", sess.IssueNumber, candidateSlot, err)
+					continue
+				}
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: stat retained worktree: %v", sess.IssueNumber, candidateSlot, statErr)
+				continue
+			}
+		}
 		oldPR := sess.PRNumber
 		if oldPR > 0 && oldPR != canonical.Number {
 			sess.LastClosedPRNumber = oldPR

@@ -55,6 +55,39 @@ func WorktreeDirty(worktree string) (bool, error) {
 	return strings.TrimSpace(string(out)) != "", nil
 }
 
+// EnsureWorktreeBranch verifies that a retained worktree is attached to the
+// branch recorded by its canonical session. It switches only a clean worktree;
+// dirty changes are never stashed, reset, or moved implicitly because doing so
+// would make recovery destructive and could attach work to the wrong PR.
+func EnsureWorktreeBranch(worktree, branch string) error {
+	worktree = strings.TrimSpace(worktree)
+	branch = strings.TrimSpace(branch)
+	if worktree == "" || branch == "" {
+		return fmt.Errorf("ensure worktree branch: worktree and branch are required")
+	}
+	currentOut, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("inspect retained worktree branch: %w: %s", err, strings.TrimSpace(string(currentOut)))
+	}
+	current := strings.TrimSpace(string(currentOut))
+	if current == branch {
+		return nil
+	}
+	dirty, err := WorktreeDirty(worktree)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		return fmt.Errorf("retained worktree is dirty on branch %q; refusing to switch to canonical branch %q", current, branch)
+	}
+	out, err := exec.Command("git", "-C", worktree, "switch", branch).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("switch retained worktree from %q to canonical branch %q: %w: %s", current, branch, err, strings.TrimSpace(string(out)))
+	}
+	log.Printf("[worker] reattached retained worktree %s from branch %s to canonical branch %s", worktree, current, branch)
+	return nil
+}
+
 // RestoreMissingWorktree recreates a missing deterministic worker worktree at
 // the session's already-existing local branch. It deliberately does not create
 // a branch, reset a ref, or choose a different path: recovery must preserve the
