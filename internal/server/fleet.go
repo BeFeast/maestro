@@ -4112,7 +4112,9 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 		}
 		switch state.SessionStatus(peer.Status) {
 		case state.StatusPROpen, state.StatusCodeLanded:
-			return peer, true
+			if candidate.PRNumber == 0 || candidate.PRNumber == peer.PRNumber {
+				return peer, true
+			}
 		}
 	}
 	return sessionInfo{}, false

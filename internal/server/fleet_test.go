@@ -3941,6 +3941,12 @@ func TestFleetSupersedingIssueSessionUsesCanonicalOpenPR(t *testing.T) {
 	if !ok || got.Slot != canonical.Slot {
 		t.Fatalf("superseding PR session = %+v, %v; want %s", got, ok, canonical.Slot)
 	}
+
+	differentPR := duplicate
+	differentPR.PRNumber = 352
+	if got, ok := fleetSupersedingIssueSession(differentPR, []sessionInfo{differentPR, canonical}); ok {
+		t.Fatalf("different PR identity incorrectly superseded: %+v", got)
+	}
 }
 
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
