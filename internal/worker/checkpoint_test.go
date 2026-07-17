@@ -140,6 +140,43 @@ func TestRestoreMissingWorktreeRejectsNonCanonicalPath(t *testing.T) {
 	}
 }
 
+func TestRestoreMissingWorktreePreservesOrphanedDirectoryAndRecreatesCheckout(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	base := filepath.Join(root, "worktrees")
+	runBranchGit(t, root, "init", "-b", "main", repo)
+	runBranchGit(t, repo, "config", "user.email", "test@example.com")
+	runBranchGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runBranchGit(t, repo, "add", "base.txt")
+	runBranchGit(t, repo, "commit", "-m", "base")
+	runBranchGit(t, repo, "branch", "feat/canonical")
+
+	worktree := filepath.Join(base, "ok-player-277")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "preserved-artifact.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RestoreMissingWorktree(repo, base, "ok-player-277", worktree, "feat/canonical"); err != nil {
+		t.Fatalf("RestoreMissingWorktree: %v", err)
+	}
+	if got := strings.TrimSpace(runBranchGit(t, worktree, "branch", "--show-current")); got != "feat/canonical" {
+		t.Fatalf("restored branch = %q, want feat/canonical", got)
+	}
+	backups, err := filepath.Glob(worktree + ".orphaned-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("orphan backups = %v, %v; want exactly one", backups, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(backups[0], "preserved-artifact.txt")); err != nil || string(got) != "keep me\n" {
+		t.Fatalf("orphaned content was not preserved: %q, %v", got, err)
+	}
+}
+
 func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.T) {
 	ended := time.Date(2026, 7, 17, 11, 5, 0, 0, time.UTC)
 	started := ended.Add(time.Hour)

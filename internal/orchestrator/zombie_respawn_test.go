@@ -118,12 +118,11 @@ func TestRespawnDueRetries_SessionPRMerged_RetiresInsteadOfRespawning(t *testing
 }
 
 // Regression for the BeFeast/ok-player 2026-07-02 incident (#800): CI fails on
-// the PR, the CI-retry path closes it and schedules a backoff retry; an
-// operator then pushes a fix, reopens the PR, and merges it. When the backoff
-// elapses the orchestrator must NOT respawn — the closed-then-merged PR is
-// tracked via LastClosedPRNumber and invalidates the retry even though the
+// the PR and schedules an in-place backoff retry; an operator then pushes a fix
+// and merges that same open PR. When the backoff elapses the orchestrator must
+// NOT respawn — the retained canonical PR invalidates the retry even though the
 // issue itself is still open (maestro PRs carry no auto-closing keywords).
-func TestRespawnDueRetries_PRClosedByCIRetryThenReopenedAndMerged_NoRespawn(t *testing.T) {
+func TestRespawnDueRetries_PROpenDuringCIRetryThenMerged_NoRespawn(t *testing.T) {
 	respawned := false
 	o := zombieRetryOrchestrator(t, &respawned)
 	o.ghPRChecksOutputFn = func(prNumber int) (string, error) { return "build failed", nil }
@@ -142,21 +141,21 @@ func TestRespawnDueRetries_PRClosedByCIRetryThenReopenedAndMerged_NoRespawn(t *t
 	}
 	s.Sessions["ok-player-1"] = sess
 
-	// Step 1: CI fails — maestro closes PR #135 and schedules a retry.
+	// Step 1: CI fails — maestro retains PR #135 and schedules an in-place retry.
 	o.handleCIFailureRetry(s, "ok-player-1", sess, github.PR{Number: 135, HeadRefName: sess.Branch})
 
 	if sess.Status != state.StatusDead || sess.NextRetryAt == nil {
 		t.Fatalf("after CI-retry: status = %q nextRetryAt = %v, want dead with a scheduled retry", sess.Status, sess.NextRetryAt)
 	}
-	if sess.PRNumber != 0 {
-		t.Fatalf("after CI-retry: PRNumber = %d, want 0 (PR closed)", sess.PRNumber)
+	if sess.PRNumber != 135 {
+		t.Fatalf("after CI-retry: PRNumber = %d, want 135 (canonical PR retained)", sess.PRNumber)
 	}
-	if sess.LastClosedPRNumber != 135 {
-		t.Fatalf("after CI-retry: LastClosedPRNumber = %d, want 135", sess.LastClosedPRNumber)
+	if sess.LastClosedPRNumber == 135 {
+		t.Fatalf("after CI-retry: LastClosedPRNumber = %d, canonical PR must remain open", sess.LastClosedPRNumber)
 	}
 
-	// Step 2: operator pushes a fix, reopens PR #135, and merges it. The
-	// issue stays open (no auto-closing keywords on maestro PRs).
+	// Step 2: operator pushes a fix and merges PR #135 during backoff. The issue
+	// stays open (no auto-closing keywords on maestro PRs).
 	o.isPRMergedFn = func(prNumber int) (bool, error) {
 		return prNumber == 135, nil
 	}
@@ -171,7 +170,7 @@ func TestRespawnDueRetries_PRClosedByCIRetryThenReopenedAndMerged_NoRespawn(t *t
 	o.respawnDueRetries(s, 10)
 
 	if respawned {
-		t.Fatal("worker must NOT respawn after the CI-closed PR was reopened and merged")
+		t.Fatal("worker must NOT respawn after the retained PR merged during CI backoff")
 	}
 	if sess.Status != state.StatusCodeLanded {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)

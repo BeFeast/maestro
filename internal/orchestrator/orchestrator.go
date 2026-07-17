@@ -1828,8 +1828,9 @@ func appendCIFailureContext(promptBase, ciOutput string, attempt int) string {
 
 ## IMPORTANT: Previous CI Failure (Attempt %d)
 
-A previous worker created a PR for this issue, but CI failed. The PR has been closed.
-You are a retry worker — please fix the CI failures described below.
+The current canonical PR for this issue failed CI and remains open.
+You are an in-place retry worker on that same branch and worktree. Fix the CI
+failures described below, push to the existing PR, and do NOT open another PR.
 
 **CI output from the failed run:**
 `+"```"+`
@@ -1854,6 +1855,22 @@ The following code review comments were left on the previous PR. Address ALL of 
 IMPORTANT: Address ALL code review findings above before creating a new PR.
 Do NOT repeat the same mistakes.
 `, promptBase, feedback)
+}
+
+func appendRecoveryHandoffContext(promptBase, handoff string) string {
+	return fmt.Sprintf(`%s
+
+### Preserved Work From a Superseded Session
+
+Maestro recovered the canonical issue/PR identity after a duplicate or stale
+session. The following committed work is preserved locally:
+
+%s
+
+Inspect these exact commits, carry every useful change onto your current
+canonical branch, and push only to the existing PR. Do NOT delete the preserved
+branch/worktree and do NOT open another PR.
+`, promptBase, handoff)
 }
 
 // failingCheckExcerptCapBytes hard-caps the failing-check excerpt placed in a
@@ -2196,6 +2213,8 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		if sess.PreviousAttemptFeedback != "" {
 			if sess.PreviousAttemptFeedbackKind == "rebase_conflict" {
 				promptBase = appendRebaseConflictContext(promptBase, sess.PreviousAttemptFeedback)
+			} else if sess.PreviousAttemptFeedbackKind == "recovery_handoff" {
+				promptBase = appendRecoveryHandoffContext(promptBase, sess.PreviousAttemptFeedback)
 			} else {
 				if sess.PreviousAttemptFeedbackKind == state.RetryReasonReviewFeedback {
 					sess.RetryReason = state.RetryReasonReviewFeedback
@@ -4268,6 +4287,13 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		numberToPR[pr.Number] = pr
 	}
 
+	// A session previously marked done from a disappearing branch can
+	// contradict the authoritative open-PR snapshot (live #949: a closed
+	// duplicate PR hid an older canonical draft). Rebind only when exactly one
+	// open PR references the issue. Multiple candidates are ambiguous and must
+	// remain untouched; choosing one would manufacture a new canonical identity.
+	o.reconcileTerminalSessionsWithOpenPRs(s, prs)
+
 	type mergeCandidate struct {
 		slotName string
 		sess     *state.Session
@@ -4285,6 +4311,22 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if !found {
 			if sess.Status == state.StatusRetryExhausted {
 				if sess.PRNumber == 0 {
+					// A no-PR terminal sibling is not an issue-level blocker when
+					// another open PR already owns the issue. In particular, it must
+					// not apply the blocked label behind the canonical PR's back.
+					// Preserve the sibling for commit handoff and let the canonical
+					// PR maintenance path converge in place.
+					canonicalOpen := false
+					for _, openPR := range prs {
+						if github.PRReferencesIssue(openPR, sess.IssueNumber) {
+							canonicalOpen = true
+							break
+						}
+					}
+					if canonicalOpen {
+						log.Printf("[orch] no-PR retry_exhausted session %s for issue #%d is superseded by an open canonical PR — preserving sibling work without blocking the issue", slotName, sess.IssueNumber)
+						continue
+					}
 					// #577: worker exhausted retries without ever producing a PR
 					// (e.g. the issue was already implemented by a prior merge via
 					// `Refs #N`, so the worker found zero diff). Without action the
@@ -4305,7 +4347,29 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				o.reconcileClosedPRRetryExhausted(s, slotName, sess)
 				continue
 			}
-			log.Printf("[orch] no open PR found for branch %s (slot %s) — assuming merged/closed", sess.Branch, slotName)
+			merged := false
+			var mergedErr error
+			if sess.PRNumber > 0 {
+				merged, mergedErr = o.isPRMerged(sess.PRNumber)
+			} else {
+				merged, mergedErr = o.hasMergedPRForIssue(sess.IssueNumber)
+			}
+			if mergedErr != nil {
+				log.Printf("[orch] no open PR found for branch %s (slot %s), but merge state is unavailable: %v — preserving session for retry", sess.Branch, slotName, mergedErr)
+				continue
+			}
+			if !merged {
+				closed, closedErr := o.isIssueClosed(sess.IssueNumber)
+				if closedErr != nil {
+					log.Printf("[orch] no open PR found for branch %s (slot %s), but issue state is unavailable: %v — preserving session for retry", sess.Branch, slotName, closedErr)
+					continue
+				}
+				if !closed {
+					o.releaseClosedUnmergedSession(sess, slotName)
+					continue
+				}
+			}
+			log.Printf("[orch] no open PR found for branch %s (slot %s) — authoritative merge/closed outcome confirmed", sess.Branch, slotName)
 			if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("PR for branch %s is no longer open", sess.Branch)) {
 				if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					o.markCodeLanded(sess, sess.PRNumber)
@@ -4352,13 +4416,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		// #424: the aggregate PRCIStatus can stick at "pending" long after
 		// every required check has gone green (a common cause is a legacy
 		// commit-status used by some review bots that never resolves).
-		// GitHub's own per-PR mergeable_state already encodes the
-		// required-check verdict, so "clean" or "unstable" overrides the
-		// stale aggregate and lets autoMergePRs converge instead of looping.
+		// GitHub's own per-PR mergeable_state encodes the required-check
+		// verdict. Only "clean" may override the stale aggregate. "unstable"
+		// can coexist with explicitly failed check runs (live #397), so treating
+		// it as success can merge known-red work.
 		if ciStatus == "pending" {
 			if mergeable, mergeState, mErr := o.prMergeStatus(pr.Number); mErr == nil && mergeable == "MERGEABLE" {
 				switch mergeState {
-				case "clean", "unstable":
+				case "clean":
 					log.Printf("[orch] PR #%d (%s) aggregate CI=pending but mergeable_state=%s — treating as success (#424)", pr.Number, sess.Branch, mergeState)
 					ciStatus = "success"
 				}
@@ -4566,6 +4631,192 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
+}
+
+func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs []github.PR) {
+	if s == nil || len(prs) == 0 {
+		return
+	}
+	prsByIssue := make(map[int][]github.PR)
+	for _, pr := range prs {
+		for _, sess := range s.Sessions {
+			if sess == nil || sess.IssueNumber <= 0 || !github.PRReferencesIssue(pr, sess.IssueNumber) {
+				continue
+			}
+			already := false
+			for _, known := range prsByIssue[sess.IssueNumber] {
+				if known.Number == pr.Number {
+					already = true
+					break
+				}
+			}
+			if !already {
+				prsByIssue[sess.IssueNumber] = append(prsByIssue[sess.IssueNumber], pr)
+			}
+		}
+	}
+
+	for issue, matches := range prsByIssue {
+		if len(matches) != 1 {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d: %d open PRs reference the issue; canonical identity is ambiguous", issue, len(matches))
+			continue
+		}
+		canonical := matches[0]
+		var allSlots, exactSlots []string
+		activeOther := ""
+		for _, slotName := range sortedStateSessionNames(s) {
+			sess := s.Sessions[slotName]
+			if sess == nil || sess.IssueNumber != issue {
+				continue
+			}
+			allSlots = append(allSlots, slotName)
+			if repairIssueSessionActive(sess.Status) || (sess.PRNumber == canonical.Number && sess.Status == state.StatusRetryExhausted) {
+				activeOther = slotName
+			}
+			if (sess.Status == state.StatusDone || sess.Status == state.StatusFailed) &&
+				(sess.PRNumber == canonical.Number || sess.LastClosedPRNumber == canonical.Number || sess.Branch == canonical.HeadRefName) {
+				exactSlots = append(exactSlots, slotName)
+			}
+		}
+		if activeOther != "" {
+			// Never activate a second session while another issue-level lease is
+			// live, even if the open PR points at an older canonical branch. The
+			// active canonical session still needs a durable handoff from terminal
+			// sibling branches, however: otherwise work preserved by a duplicate
+			// worker remains invisible once the canonical PR is reattached.
+			active := s.Sessions[activeOther]
+			if active != nil && (active.PRNumber == canonical.Number || active.Branch == canonical.HeadRefName) {
+				o.attachPreservedSiblingHandoffs(s, issue, activeOther, active, canonical, allSlots)
+			}
+			continue
+		}
+
+		candidateSlot := ""
+		switch {
+		case len(exactSlots) == 1:
+			candidateSlot = exactSlots[0]
+		case len(exactSlots) > 1:
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / PR #%d: %d terminal sessions claim the canonical identity", issue, canonical.Number, len(exactSlots))
+			continue
+		case len(allSlots) == 1:
+			candidateSlot = allSlots[0]
+		default:
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / PR #%d: no exact session among %d historical sessions", issue, canonical.Number, len(allSlots))
+			continue
+		}
+		sess := s.Sessions[candidateSlot]
+		if sess == nil || (sess.Status != state.StatusDone && sess.Status != state.StatusFailed) {
+			continue
+		}
+		merged := false
+		var err error
+		if sess.PRNumber > 0 && sess.PRNumber != canonical.Number {
+			merged, err = o.isPRMerged(sess.PRNumber)
+		} else if sess.PRNumber == 0 && sess.LastClosedPRNumber > 0 && sess.LastClosedPRNumber != canonical.Number {
+			merged, err = o.isPRMerged(sess.LastClosedPRNumber)
+		} else if sess.PRNumber == 0 && sess.LastClosedPRNumber == 0 {
+			merged, err = o.hasMergedPRForIssue(sess.IssueNumber)
+		}
+		if err != nil {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: authoritative merge state unavailable: %v", sess.IssueNumber, candidateSlot, err)
+			continue
+		}
+		if merged {
+			continue
+		}
+		closed, err := o.isIssueClosed(sess.IssueNumber)
+		if err != nil {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: authoritative issue state unavailable: %v", sess.IssueNumber, candidateSlot, err)
+			continue
+		}
+		if closed {
+			continue
+		}
+		// A retained terminal worktree may still be checked out on the closed
+		// duplicate branch. Metadata alone cannot adopt the canonical PR because
+		// RespawnInPlace deliberately preserves the existing checkout. Reattach a
+		// clean worktree first and fail closed on dirty/mismatched state so no work
+		// is lost or accidentally pushed to the wrong PR.
+		if strings.TrimSpace(sess.Worktree) != "" {
+			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
+				if err := worker.EnsureWorktreeBranch(sess.Worktree, canonical.HeadRefName); err != nil {
+					log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: canonical worktree reattach failed: %v", sess.IssueNumber, candidateSlot, err)
+					continue
+				}
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: stat retained worktree: %v", sess.IssueNumber, candidateSlot, statErr)
+				continue
+			}
+		}
+		oldPR := sess.PRNumber
+		if oldPR > 0 && oldPR != canonical.Number {
+			sess.LastClosedPRNumber = oldPR
+		}
+		sess.PRNumber = canonical.Number
+		sess.Branch = canonical.HeadRefName
+		sess.Status = state.StatusPROpen
+		sess.FinishedAt = nil
+		sess.ReleasedForRedispatch = false
+		o.attachPreservedSiblingHandoffs(s, issue, candidateSlot, sess, canonical, allSlots)
+		log.Printf("[orch] reconciled terminal session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", candidateSlot, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
+	}
+}
+
+func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int, canonicalSlot string, canonicalSession *state.Session, canonical github.PR, allSlots []string) {
+	if o.cfg == nil || strings.TrimSpace(o.cfg.LocalPath) == "" || canonicalSession == nil {
+		return
+	}
+	var handoffs []string
+	for _, siblingSlot := range allSlots {
+		if siblingSlot == canonicalSlot {
+			continue
+		}
+		sibling := s.Sessions[siblingSlot]
+		if sibling == nil || repairIssueSessionActive(sibling.Status) || strings.TrimSpace(sibling.Branch) == "" || sibling.Branch == canonical.HeadRefName {
+			continue
+		}
+		commits, err := worker.UniqueBranchCommits(o.cfg.LocalPath, canonical.HeadRefName, sibling.Branch)
+		if err != nil {
+			log.Printf("[orch] terminal/open-PR reconcile: could not inspect preserved sibling branch %s for issue #%d: %v", sibling.Branch, issue, err)
+			continue
+		}
+		if len(commits) == 0 {
+			continue
+		}
+		handoff := fmt.Sprintf("- session %s branch `%s`: unique commits `%s`", siblingSlot, sibling.Branch, strings.Join(commits, "`, `"))
+		if strings.Contains(canonicalSession.PreviousAttemptFeedback, handoff) {
+			continue
+		}
+		handoffs = append(handoffs, handoff)
+	}
+	if len(handoffs) == 0 {
+		return
+	}
+	handoff := strings.Join(handoffs, "\n")
+	if strings.TrimSpace(canonicalSession.PreviousAttemptFeedback) == "" {
+		canonicalSession.PreviousAttemptFeedback = handoff
+		canonicalSession.PreviousAttemptFeedbackKind = "recovery_handoff"
+	} else {
+		canonicalSession.PreviousAttemptFeedback += "\n\nPreserved sibling work:\n" + handoff
+	}
+	log.Printf("[orch] attached preserved sibling commit handoff to canonical session %s for issue #%d / PR #%d", canonicalSlot, issue, canonical.Number)
+}
+
+func (o *Orchestrator) releaseClosedUnmergedSession(sess *state.Session, slotName string) {
+	if sess == nil {
+		return
+	}
+	now := time.Now().UTC()
+	oldPR := sess.PRNumber
+	if oldPR > 0 {
+		sess.LastClosedPRNumber = oldPR
+	}
+	sess.PRNumber = 0
+	sess.Status = state.StatusFailed
+	sess.ReleasedForRedispatch = true
+	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
+	log.Printf("[orch] PR #%d for issue #%d / session %s closed without merge while issue remains open — released for truthful redispatch", oldPR, sess.IssueNumber, slotName)
 }
 
 // greptileRetriggerComment is the PR comment that asks Greptile to (re)run
@@ -5020,8 +5271,11 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.MaintenanceRetryCount, maxRetries, backoffMs/1000)
 }
 
-// handleCIFailureRetry closes the failed PR, captures CI output, cleans up,
-// and schedules a retry for the worker (respecting max_retries_per_issue).
+// handleCIFailureRetry captures the failed checks and schedules an in-place
+// repair on the same slot/worktree/branch/PR. A red check is not a reason to
+// destroy canonical identity: closing the PR and clearing its session lease
+// let the ready issue dispatch a second worker before the retry completed
+// (live #949 / OK Player #346).
 func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, sess *state.Session, pr github.PR) {
 	maxRetries := o.cfg.MaxRetriesPerIssue
 	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
@@ -5046,14 +5300,14 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		return
 	}
 
-	// Capture CI failure output before closing the PR
+	// Capture CI failure output while the failed head is still authoritative.
 	ciOutput, err := o.prChecksOutput(pr.Number)
 	if err != nil {
 		log.Printf("[orch] warn: could not capture CI output for PR #%d: %v", pr.Number, err)
 		ciOutput = "(CI output unavailable)"
 	}
 
-	// Collect Greptile review feedback before closing the PR
+	// Collect review feedback for the same in-place repair prompt.
 	reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
 	if err != nil {
 		log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
@@ -5063,23 +5317,22 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	// takes — its failure conclusion makes the aggregate CI verdict "failure".
 	// CIFailureOutput above is only the bare checks overview (name + state); the
 	// concrete `##[error]` annotation lines that say WHY the check failed live
-	// here. Capture them before closing the PR so the retry worker sees the
+	// here. Capture them while the failed head is authoritative so the retry worker sees the
 	// exact lint constraint its previous push broke, not just "agent-lint
 	// failed" — this was the observed PR #850 blindness.
 	failingCheckContext := o.collectFailingCheckContext(pr.Number)
 
-	// Close the failed PR with an explanation
-	closeComment := fmt.Sprintf("CI failed — maestro is closing this PR and respawning a new worker to retry (attempt %d).\n\nCI output:\n```\n%s\n```",
-		sess.RetryCount+1, ciOutput)
-	if err := o.closePR(pr.Number, closeComment); err != nil {
-		log.Printf("[orch] warn: could not close PR #%d: %v — skipping retry", pr.Number, err)
-		return
+	// Preserve the exact PR lease. Cleanup may already have cleared the
+	// worktree field on a terminal transition; record only the deterministic
+	// same-slot path so respawnPreservingWorktreeWithConfig can restore the
+	// retained local branch without allocating a new slot or branch.
+	sess.PRNumber = pr.Number
+	if strings.TrimSpace(sess.Branch) == "" {
+		sess.Branch = pr.HeadRefName
 	}
-	log.Printf("[orch] closed PR #%d due to CI failure", pr.Number)
-
-	// Clean up the worktree
-	o.stopWorker(slotName, sess)
-	sess.Worktree = ""
+	if strings.TrimSpace(sess.Worktree) == "" && strings.TrimSpace(o.cfg.WorktreeBase) != "" {
+		sess.Worktree = filepath.Join(o.cfg.WorktreeBase, slotName)
+	}
 
 	// Store CI failure output and review feedback for the next worker
 	sess.CIFailureOutput = ciOutput
@@ -5091,23 +5344,21 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		sess.PreviousAttemptFeedbackKind = ""
 	}
 
-	// Schedule retry with exponential backoff. Remember which PR this retry
-	// closed (#800): if an operator reopens and merges it while the backoff
-	// runs, the pre-respawn staleness check cancels the retry.
+	// Schedule the same-session repair with exponential backoff. The open PR
+	// remains the issue-level lease throughout the wait, so ordinary dispatch
+	// cannot race the repair with a fresh worker.
 	sess.RetryCount++
 	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 	sess.NextRetryAt = &retryAt
 	sess.Status = state.StatusDead
-	sess.LastClosedPRNumber = pr.Number
-	sess.PRNumber = 0
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
 
-	log.Printf("[orch] CI failure on PR #%d — scheduling retry %d in %dms for issue #%d",
-		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
-	o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), retry %d scheduled in %ds",
+	log.Printf("[orch] CI failure on PR #%d — scheduling in-place retry %d in %dms for issue #%d on session %s",
+		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber, slotName)
+	o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), in-place retry %d scheduled in %ds",
 		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
 }
 
@@ -5330,17 +5581,9 @@ func (o *Orchestrator) reconcileGuardedRepairApprovals(s *state.State) {
 // under an operator.
 func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (bool, string) {
 	activeSession := false
-	doneSession := false
-	failedSession := false
 	for _, sess := range s.Sessions {
 		if sess == nil || sess.IssueNumber != issue {
 			continue
-		}
-		if sess.Status == state.StatusDone {
-			doneSession = true
-		}
-		if state.IsTerminal(sess.Status) && sess.Status != state.StatusDone {
-			failedSession = true
 		}
 		if repairIssueSessionActive(sess.Status) {
 			activeSession = true
@@ -5349,9 +5592,6 @@ func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (b
 	if activeSession {
 		return false, ""
 	}
-	if doneSession && !failedSession {
-		return true, fmt.Sprintf("issue #%d resolved (session done) — repair worker moot", issue)
-	}
 	closed, err := o.isIssueClosed(issue)
 	if err != nil {
 		log.Printf("[orch] repair-approval reconcile: issue #%d closed-state check failed; leaving approval pending: %v", issue, err)
@@ -5359,6 +5599,14 @@ func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (b
 	}
 	if closed {
 		return true, fmt.Sprintf("issue #%d closed — repair worker moot", issue)
+	}
+	merged, err := o.hasMergedPRForIssue(issue)
+	if err != nil {
+		log.Printf("[orch] repair-approval reconcile: issue #%d merged-PR check failed; leaving approval pending: %v", issue, err)
+		return false, ""
+	}
+	if merged {
+		return true, fmt.Sprintf("issue #%d has an authoritative merged PR — repair worker moot", issue)
 	}
 	return false, ""
 }
@@ -7205,11 +7453,21 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 				sess.Worktree = restored
 				log.Printf("[orch] reattached restored worktree %s to reserved repair session %s / PR #%d", restored, slot, sess.PRNumber)
 			} else {
-				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: PR #%d worktree is missing", issue.Number, slot, sess.PRNumber)
-				return false
+				// Cleanup may have removed the worktree directory while retaining
+				// the canonical local branch. Record the deterministic path and let
+				// the preserving recovery helper recreate that exact worktree; it
+				// fails closed if the branch is unavailable or another worktree owns it.
+				sess.Worktree = restored
 			}
 		}
-		err = o.respawnInPlaceWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+		if o.respawnInPlaceFn != nil {
+			// Synthetic tests provide their own in-place executor and paths.
+			// Production has no hook and always takes the checkpointing,
+			// missing-worktree-restoring path below.
+			err = o.respawnInPlaceWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+		} else {
+			err = o.respawnPreservingWorktreeWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+		}
 	} else {
 		err = o.respawnPreservingWorktreeWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
 	}

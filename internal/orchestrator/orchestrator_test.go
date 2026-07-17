@@ -1332,6 +1332,9 @@ func TestAutoMergePRs_MissingOpenPRDoesNotBecomeDoneWhenOutcomePassRequiredFails
 		},
 	}
 	o, merged := newMergeTestOrchestrator(cfg, nil)
+	o.isPRMergedFn = func(prNumber int) (bool, error) {
+		return prNumber == 10, nil
+	}
 	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
 	s.OutcomeHealth = &outcome.HealthCheckResult{
 		CheckedAt: time.Now().UTC(),
@@ -2761,9 +2764,9 @@ func TestAutoMergePRs_CIPendingAndMergeStateBlocked_DoesNotMerge(t *testing.T) {
 	}
 }
 
-// mergeable_state="unstable" — only non-required checks are failing, so
-// the PR is still safe to merge under the same #424 override.
-func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
+// mergeable_state="unstable" can coexist with failed check runs. It is not
+// authoritative green evidence and must never override the check rollup.
+func TestAutoMergePRs_CIPendingMergeStateUnstable_DoesNotMerge(t *testing.T) {
 	prs := []github.PR{{Number: 102, HeadRefName: "feat/unstable"}}
 
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
@@ -2795,8 +2798,8 @@ func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	if len(merged) != 1 || merged[0] != 102 {
-		t.Fatalf("merged = %v, want [102] (mergeable_state=unstable should still allow merge)", merged)
+	if len(merged) != 0 {
+		t.Fatalf("merged = %v, want [] (mergeable_state=unstable must not override pending/failed checks)", merged)
 	}
 }
 
@@ -2856,13 +2859,13 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		t.Errorf("merged PR #%d, want #20", merged[0])
 	}
 
-	// PR #10 should have been closed and session scheduled for retry
-	if len(closedPRs) != 1 || closedPRs[0] != 10 {
-		t.Errorf("closedPRs = %v, want [10]", closedPRs)
+	// PR #10 remains canonical while its same-session repair is scheduled.
+	if len(closedPRs) != 0 {
+		t.Errorf("closedPRs = %v, want none", closedPRs)
 	}
 	for _, sess := range s.Sessions {
-		if sess.PRNumber == 0 && sess.IssueNumber == 100 {
-			// This is the session for PR #10 (PR cleared after CI failure retry)
+		if sess.PRNumber == 10 && sess.IssueNumber == 100 {
+			// This is the session for PR #10 (identity retained for in-place retry).
 			if sess.Status != state.StatusDead {
 				t.Errorf("CI-failed session status = %q, want %q", sess.Status, state.StatusDead)
 			}
@@ -8588,7 +8591,7 @@ func newCIFailureRetryOrchestrator(cfg *config.Config, prs []github.PR, ciStatus
 	}, &merged, &closedPRs
 }
 
-func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_KeepsCanonicalPRAndSchedulesInPlaceRetry(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8603,9 +8606,9 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 		t.Fatalf("expected 0 merges, got %d", len(*merged))
 	}
 
-	// Should close the PR
-	if len(*closedPRs) != 1 || (*closedPRs)[0] != 10 {
-		t.Fatalf("closedPRs = %v, want [10]", *closedPRs)
+	// A failed check must not destroy canonical PR identity.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none for in-place retry", *closedPRs)
 	}
 
 	// Session should be dead with NextRetryAt scheduled
@@ -8619,17 +8622,14 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 	if sess.RetryCount != 1 {
 		t.Fatalf("RetryCount = %d, want 1", sess.RetryCount)
 	}
-	if sess.PRNumber != 0 {
-		t.Fatalf("PRNumber = %d, want 0 (cleared after PR close)", sess.PRNumber)
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10 (same PR retained)", sess.PRNumber)
 	}
 	if sess.CIFailureOutput == "" {
 		t.Fatal("CIFailureOutput should be set")
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("FinishedAt should be set")
-	}
-	if sess.Worktree != "" {
-		t.Fatalf("Worktree = %q, want empty (cleaned up)", sess.Worktree)
 	}
 }
 
@@ -8706,9 +8706,9 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// Should close the PR and schedule retry
-	if len(*closedPRs) != 1 {
-		t.Fatalf("closedPRs = %v, want 1 PR closed (unlimited retries)", *closedPRs)
+	// Should preserve the PR and schedule an in-place retry.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none (unlimited in-place retries)", *closedPRs)
 	}
 	sess := s.Sessions["slot-0"]
 	if sess.Status != state.StatusDead {
@@ -8719,7 +8719,7 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 	}
 }
 
-func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_DoesNotDependOnClosePR(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8759,13 +8759,16 @@ func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// When closePR fails, session should stay in pr_open (no retry scheduled)
+	// closePR is deliberately absent; the in-place retry must still schedule.
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusPROpen {
-		t.Fatalf("status = %q, want %q (closePR failed, no retry)", sess.Status, state.StatusPROpen)
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (closePR is not part of retry)", sess.Status, state.StatusDead)
 	}
-	if sess.NextRetryAt != nil {
-		t.Fatal("NextRetryAt should be nil when closePR fails")
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set without closing the PR")
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want canonical PR 10 retained", sess.PRNumber)
 	}
 }
 
@@ -10034,6 +10037,51 @@ func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 	o.autoMergePRs(s)
 	if len(addedLabels) != 0 {
 		t.Fatalf("second cycle re-applied labels = %v, want none (idempotency)", addedLabels)
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedSiblingDoesNotBlockCanonicalOpenPR(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		ReviewGate: "none",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	addedLabels := make(map[int]string)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 397, HeadRefName: "canonical", Title: "Fedora fix for #346"}}, nil
+		},
+		ghPRCIStatusFn: func(int) (string, error) { return "pending", nil },
+		ghPRMergeStatusFn: func(int) (string, string, error) {
+			return "MERGEABLE", "blocked", nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			addedLabels[number] = label
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["canonical-slot"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    397,
+		Branch:      "canonical",
+	}
+	s.Sessions["preserved-sibling"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusRetryExhausted,
+		Branch:      "preserved-sibling",
+	}
+
+	o.autoMergePRs(s)
+
+	if len(addedLabels) != 0 {
+		t.Fatalf("terminal sibling applied labels behind canonical PR: %v", addedLabels)
+	}
+	if got := s.Sessions["preserved-sibling"].LastNotifiedStatus; got == noPRReconciledStatus {
+		t.Fatalf("terminal sibling was falsely reconciled as a blocking no-PR outcome")
 	}
 }
 

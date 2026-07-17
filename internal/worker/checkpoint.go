@@ -55,6 +55,73 @@ func WorktreeDirty(worktree string) (bool, error) {
 	return strings.TrimSpace(string(out)) != "", nil
 }
 
+// EnsureWorktreeBranch verifies that a retained worktree is attached to the
+// branch recorded by its canonical session. It switches only a clean worktree;
+// dirty changes are never stashed, reset, or moved implicitly because doing so
+// would make recovery destructive and could attach work to the wrong PR.
+func EnsureWorktreeBranch(worktree, branch string) error {
+	worktree = strings.TrimSpace(worktree)
+	branch = strings.TrimSpace(branch)
+	if worktree == "" || branch == "" {
+		return fmt.Errorf("ensure worktree branch: worktree and branch are required")
+	}
+	currentOut, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	current := strings.TrimSpace(string(currentOut))
+	if err != nil {
+		// A valid retained checkout may be detached after an interrupted
+		// rebase/gate repair. Treat that as a branch mismatch, not as proof the
+		// worktree is unusable. Dirty state still fails closed below.
+		if insideOut, insideErr := exec.Command("git", "-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput(); insideErr != nil || strings.TrimSpace(string(insideOut)) != "true" {
+			return fmt.Errorf("inspect retained worktree branch: %w: %s", err, strings.TrimSpace(string(currentOut)))
+		}
+		current = "detached HEAD"
+	}
+	if current == branch {
+		return nil
+	}
+	dirty, err := WorktreeDirty(worktree)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		return fmt.Errorf("retained worktree is dirty on branch %q; refusing to switch to canonical branch %q", current, branch)
+	}
+	out, err := exec.Command("git", "-C", worktree, "switch", branch).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("switch retained worktree from %q to canonical branch %q: %w: %s", current, branch, err, strings.TrimSpace(string(out)))
+	}
+	log.Printf("[worker] reattached retained worktree %s from branch %s to canonical branch %s", worktree, current, branch)
+	return nil
+}
+
+// UniqueBranchCommits returns patch-unique, non-merge commits that exist on a
+// preserved sibling branch but not on the canonical branch. Recovery uses the
+// exact immutable SHAs as a handoff to the canonical repair worker instead of
+// silently abandoning completed work or opening a duplicate PR.
+func UniqueBranchCommits(localPath, canonicalBranch, siblingBranch string) ([]string, error) {
+	localPath = strings.TrimSpace(localPath)
+	canonicalBranch = strings.TrimSpace(canonicalBranch)
+	siblingBranch = strings.TrimSpace(siblingBranch)
+	if localPath == "" || canonicalBranch == "" || siblingBranch == "" {
+		return nil, fmt.Errorf("unique branch commits: repository and both branches are required")
+	}
+	if canonicalBranch == siblingBranch {
+		return nil, nil
+	}
+	out, err := exec.Command(
+		"git", "-C", localPath, "log", "--format=%H", "--cherry-pick", "--right-only", "--no-merges",
+		canonicalBranch+"..."+siblingBranch,
+	).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("compare canonical branch %q with preserved sibling %q: %w: %s", canonicalBranch, siblingBranch, err, strings.TrimSpace(string(out)))
+	}
+	commits := strings.Fields(string(out))
+	if len(commits) > 20 {
+		commits = commits[:20]
+	}
+	return commits, nil
+}
+
 // RestoreMissingWorktree recreates a missing deterministic worker worktree at
 // the session's already-existing local branch. It deliberately does not create
 // a branch, reset a ref, or choose a different path: recovery must preserve the
@@ -80,8 +147,23 @@ func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch 
 	if filepath.Clean(actual) != filepath.Clean(expected) {
 		return fmt.Errorf("restore missing worktree: recorded path %q is not deterministic slot path %q", actual, expected)
 	}
-	if _, err := os.Stat(actual); err == nil {
-		return nil
+	backup := ""
+	if info, err := os.Stat(actual); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("restore missing worktree: recorded path %s exists but is not a directory", actual)
+		}
+		if out, gitErr := exec.Command("git", "-C", actual, "rev-parse", "--is-inside-work-tree").CombinedOutput(); gitErr == nil && strings.TrimSpace(string(out)) == "true" {
+			return EnsureWorktreeBranch(actual, branch)
+		}
+		// Cleanup can remove Git's worktree metadata before failing to remove
+		// root-owned build artifacts. Preserve the entire orphaned directory and
+		// restore the deterministic path from the retained branch; directory
+		// existence alone is not proof of a usable worktree.
+		backup = fmt.Sprintf("%s.orphaned-%d", actual, time.Now().UTC().UnixNano())
+		if err := os.Rename(actual, backup); err != nil {
+			return fmt.Errorf("preserve orphaned worktree directory %s: %w", actual, err)
+		}
+		log.Printf("[worker] preserved orphaned worktree directory %s at %s before canonical restore", actual, backup)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat recorded worktree %s: %w", actual, err)
 	}
@@ -93,8 +175,18 @@ func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch 
 	if err := os.MkdirAll(filepath.Dir(actual), 0o755); err != nil {
 		return fmt.Errorf("create worktree parent: %w", err)
 	}
+	// Clear only stale administrative records for paths Git already considers
+	// missing. This never deletes a working tree or branch.
+	if out, err := exec.Command("git", "-C", localPath, "worktree", "prune", "--expire", "now").CombinedOutput(); err != nil {
+		return fmt.Errorf("prune stale worktree metadata before restore: %w: %s", err, strings.TrimSpace(string(out)))
+	}
 	out, err := exec.Command("git", "-C", localPath, "worktree", "add", actual, branch).CombinedOutput()
 	if err != nil {
+		if backup != "" {
+			if _, statErr := os.Stat(actual); errors.Is(statErr, os.ErrNotExist) {
+				_ = os.Rename(backup, actual)
+			}
+		}
 		return fmt.Errorf("restore missing worktree %s on existing branch %s: %w: %s", actual, branch, err, strings.TrimSpace(string(out)))
 	}
 	log.Printf("[worker] restored missing canonical worktree %s on existing branch %s", actual, branch)
