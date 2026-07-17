@@ -25,8 +25,9 @@ func TestParse_ReviewRepairDefaults(t *testing.T) {
 		t.Error("FallThroughMergeEnabled must default to false")
 	}
 
-	// Default policy lists must contain spawn_review_repair so cautious
-	// mode gates it and the executor registry mints it.
+	// Review repair is bounded to the canonical PR/head attempt and therefore
+	// runs as hands-off mechanical recovery by default. It remains allowed, but
+	// must not create an operator approval.
 	wantInAllowed := false
 	for _, a := range cfg.Supervisor.AllowedActions {
 		if a == SupervisorActionSpawnReviewRepair {
@@ -44,8 +45,8 @@ func TestParse_ReviewRepairDefaults(t *testing.T) {
 			break
 		}
 	}
-	if !wantInApprovalRequired {
-		t.Errorf("ApprovalRequiredActions missing %q: %v", SupervisorActionSpawnReviewRepair, cfg.Supervisor.ApprovalRequiredActions)
+	if wantInApprovalRequired {
+		t.Errorf("ApprovalRequiredActions unexpectedly gates %q: %v", SupervisorActionSpawnReviewRepair, cfg.Supervisor.ApprovalRequiredActions)
 	}
 }
 
