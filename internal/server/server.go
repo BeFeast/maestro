@@ -981,6 +981,16 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		} else {
 			restart.DisabledReason = fmt.Sprintf("This worker has open PR #%d; restart would delete its worktree and strand the PR branch. Use review-repair to address review feedback in place, or Stop to terminate.", worker.PRNumber)
 		}
+	} else if strings.TrimSpace(worker.Worktree) != "" {
+		// #964: PR-less does not mean disposable. A retained worktree can hold
+		// completed, uncommitted work; the current restart controller deletes it.
+		// Offer only the canonical in-place repair path for this state.
+		restart.Disabled = true
+		if readOnly {
+			restart.DisabledReason = readOnlyDisabledReason() + " Additionally, this worker retains a worktree; recover the same slot in place with repair instead of restarting."
+		} else {
+			restart.DisabledReason = "This worker retains a worktree that may contain completed work; restart would delete it. Recover the same slot and worktree in place with repair, or Stop to terminate."
+		}
 	}
 	return []controlAction{
 		restart,

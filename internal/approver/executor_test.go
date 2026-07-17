@@ -737,6 +737,59 @@ func TestExecute_RestartWorker_HappyPath(t *testing.T) {
 	}
 }
 
+// #964: an approval stamped for an earlier session snapshot must not execute
+// after the canonical session changes. This fences delayed watchdog approvals
+// before the worker controller can terminate a replacement worker.
+func TestExecute_RestartWorker_StaleTargetStateSkipped(t *testing.T) {
+	wc := &fakeWorkers{}
+	target := &state.SupervisorTarget{Session: "slot-1", Issue: 42}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 42, Status: state.StatusDead, RetryCount: 1}
+	a := mkApproval(config.SupervisorActionRestartWorker, target, "restart me", "")
+	a.TargetStateHash = st.ApprovalTargetStateHash(target)
+
+	// A repair has already started since the approval was minted.
+	st.Sessions["slot-1"].Status = state.StatusRunning
+	st.Sessions["slot-1"].StartedAt = time.Now().UTC()
+	ex := &Executor{
+		Cfg:      newCfg(),
+		Workers:  wc,
+		Sessions: fakeSessions{"slot-1": st.Sessions["slot-1"]},
+		State:    st,
+	}
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped; res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 0 || len(wc.stopCalls) != 0 {
+		t.Fatalf("stale approval must not touch the worker; restart=%+v stop=%+v", wc.restartCalls, wc.stopCalls)
+	}
+	if !strings.Contains(res.Summary, "changed after approval") || !strings.Contains(res.Summary, "no worker or worktree was touched") {
+		t.Fatalf("summary = %q, want stale-state and no-side-effect explanation", res.Summary)
+	}
+}
+
+// #964: a PR-less retained worktree is still canonical durable work. The
+// destructive restart controller must not run; repair resumes it in place.
+func TestExecute_RestartWorker_RefusedForRetainedWorktree(t *testing.T) {
+	wc := &fakeWorkers{}
+	sess := &state.Session{IssueNumber: 42, Status: state.StatusDead, Worktree: "/srv/wt/slot-1"}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": sess}}
+	a := mkApproval(config.SupervisorActionRestartWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "restart me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed; res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 0 || len(wc.stopCalls) != 0 {
+		t.Fatalf("retained worktree must not be touched; restart=%+v stop=%+v", wc.restartCalls, wc.stopCalls)
+	}
+	if !strings.Contains(res.Summary, "/srv/wt/slot-1") || !strings.Contains(res.Summary, "spawn_repair_worker") {
+		t.Fatalf("summary = %q, want retained path and in-place repair guidance", res.Summary)
+	}
+}
+
 // #874: restart_worker on a session that owns an open PR is refused before the
 // controller runs — restart deletes the worktree, which would strand or discard
 // the PR branch. The failure summary names the supported in-place alternative.

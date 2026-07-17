@@ -1491,7 +1491,18 @@ func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
 	noPR := workerActionAffordances(false, "/api/v1/actions", sessionInfo{Slot: "slot-1", IssueNumber: 43})
 	restartNoPR := findControlAction(t, noPR, "restart_worker")
 	if restartNoPR.Disabled {
-		t.Fatalf("restart_worker for a PR-less worker should be enabled, got %+v", restartNoPR)
+		t.Fatalf("restart_worker for a PR-less worker without a retained worktree should be enabled, got %+v", restartNoPR)
+	}
+
+	retained := workerActionAffordances(false, "/api/v1/actions", sessionInfo{
+		Slot: "slot-2", IssueNumber: 44, Worktree: "/srv/wt/slot-2",
+	})
+	restartRetained := findControlAction(t, retained, "restart_worker")
+	if !restartRetained.Disabled {
+		t.Fatalf("restart_worker for a retained PR-less worktree should be disabled, got %+v", restartRetained)
+	}
+	if !contains(restartRetained.DisabledReason, "retains a worktree") || !contains(restartRetained.DisabledReason, "same slot") {
+		t.Fatalf("disabled reason = %q, want preserved-work and same-slot repair guidance", restartRetained.DisabledReason)
 	}
 }
 
