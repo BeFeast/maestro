@@ -2364,9 +2364,6 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Supervisor.ApprovalRequiredActions == nil {
 		cfg.Supervisor.ApprovalRequiredActions = []string{
 			"review_retry_exhausted",
-			"spawn_worker",
-			"spawn_repair_worker",
-			"spawn_review_repair",
 			"label_issue_ready",
 			"add_ready_label",
 			"open_child_issue",

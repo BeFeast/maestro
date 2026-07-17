@@ -2786,6 +2786,9 @@ func TestDecideWithLLM_UnknownActionRejected(t *testing.T) {
 func TestDecideWithLLM_ApprovalRequiredActionRejectedWithoutApproval(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	// Explicit operator policy can still gate mechanical dispatch even though
+	// hands-off projects no longer do so by default.
+	cfg.Supervisor.ApprovalRequiredActions = []string{ActionSpawnWorker}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
 	llm := &fakeLLM{output: `{
   "summary": "Issue #42 is ready to feed.",

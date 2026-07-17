@@ -5094,7 +5094,6 @@ func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.
 	}
 
 	oldFinished := time.Date(2026, 7, 14, 18, 59, 0, 0, time.UTC)
-	newStarted := oldFinished.Add(24 * time.Hour)
 	s := state.NewState()
 	s.Sessions["sup-318"] = &state.Session{
 		IssueNumber: 887,
@@ -5110,7 +5109,9 @@ func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.
 		PRNumber:    914,
 		Branch:      "feat/sup-360-887-watchdog-recovery",
 		Backend:     "codex",
-		StartedAt:   newStarted,
+		// Cleanup/import can lose the attempt timestamp. Canonical PR identity,
+		// not an optional timestamp, orders an older completed PR claim.
+		StartedAt: time.Time{},
 	}
 	s.RecordSupervisorDecision(state.SupervisorDecision{
 		ID:                "sup-repair-newer-pr",
