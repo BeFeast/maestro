@@ -7100,7 +7100,15 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 			if !exists || claimed.IssueNumber != issue.Number || (claim.PRNumber > 0 && claimed.PRNumber != claim.PRNumber) {
 				reason := fmt.Sprintf("issue #%d competing repair reservation %s is invalid: session missing, belongs to another issue, or no longer matches PR #%d", issue.Number, claim.Session, claim.PRNumber)
 				o.staleInvalidRepairApproval(s, claim.ApprovalID, reason)
-				continue
+				// Approval reservations suppress the underlying session claim.
+				// Rebuild claims after staling so a real running/open-PR session
+				// cannot be hidden by its obsolete approval and accidentally run
+				// concurrently with the selected repair.
+				revealed, stillClaimed := activeIssueClaimForSession(s, issue.Number, claim.Session)
+				if !stillClaimed {
+					continue
+				}
+				claim = revealed
 			}
 		}
 		// A completed older PR can retain the issue's terminal-reconciliation
@@ -7204,6 +7212,18 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	}
 	o.notifier.Sendf("🔄 maestro: repairing issue #%d in place on worker %s: %s", issue.Number, slot, issue.Title)
 	return true
+}
+
+func activeIssueClaimForSession(s *state.State, issueNumber int, slot string) (state.IssueClaim, bool) {
+	if s == nil || issueNumber <= 0 || strings.TrimSpace(slot) == "" {
+		return state.IssueClaim{}, false
+	}
+	for _, claim := range s.ActiveIssueClaims() {
+		if claim.IssueNumber == issueNumber && claim.Session == slot {
+			return claim, true
+		}
+	}
+	return state.IssueClaim{}, false
 }
 
 // staleInvalidSpawnRepairApproval makes an irrecoverably invalid exact
