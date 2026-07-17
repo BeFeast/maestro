@@ -1779,6 +1779,15 @@ func (s *State) copyFrom(src *State) {
 	s.Paused = src.Paused
 	s.PausedAt = src.PausedAt
 	s.MaterialProgress = src.MaterialProgress
+	// Keep the caller's in-memory snapshot aligned with the merged file. Save
+	// calls copyFrom after a three-way merge, then rememberLoaded records the
+	// merged file hash. Omitting the heartbeat tuple here leaves a long-lived
+	// writer (notably the material-progress watchdog) holding an older pulse
+	// while believing it loaded the current file. Its next non-conflicting save
+	// can then regress LastRunOnceAt and resurrect an obsolete stuck verdict.
+	s.LastRunOnceAt = src.LastRunOnceAt
+	s.SupervisorStuck = src.SupervisorStuck
+	s.SupervisorStuckReason = src.SupervisorStuckReason
 }
 
 func cloneState(s *State) *State {
