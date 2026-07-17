@@ -84,6 +84,7 @@ const (
 	ErrorClassGitHubNotFound    = "github_not_found"
 	ErrorClassGitHubRateLimited = "github_rate_limited"
 	ErrorClassUnsupportedClient = "unsupported_client"
+	ErrorClassSupervisorBackend = "supervisor_backend_unavailable"
 
 	SeverityInfo    = "info"
 	SeverityWarning = "warning"

@@ -8,7 +8,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
@@ -53,12 +55,17 @@ type backendLLMClient struct {
 	cfg *config.Config
 }
 
+const (
+	supervisorBackendAttemptTimeout = 45 * time.Second
+	supervisorBackendTotalTimeout   = 3 * time.Minute
+)
+
 func NewBackendLLMClient(cfg *config.Config) LLMClient {
 	return &backendLLMClient{cfg: cfg}
 }
 
 func (c *backendLLMClient) Complete(prompt string) (string, error) {
-	backendName, backendDef, err := supervisorBackend(c.cfg)
+	candidates, err := supervisorBackendCandidates(c.cfg)
 	if err != nil {
 		return "", err
 	}
@@ -80,35 +87,109 @@ func (c *backendLLMClient) Complete(prompt string) (string, error) {
 		return "", fmt.Errorf("close supervisor prompt file: %w", err)
 	}
 
-	backendCfg := worker.BackendConfig{
-		Cmd:        backendDef.Cmd,
-		ExtraArgs:  backendDef.ExtraArgs,
-		PromptMode: backendDef.PromptMode,
-		Provider:   backendDef.Provider,
-		Model:      c.cfg.Supervisor.Model,
-		Effort:     c.cfg.Supervisor.Effort,
-	}
 	worktree := c.cfg.LocalPath
 	if strings.TrimSpace(worktree) == "" {
 		worktree = "."
 	}
-	cmd, stdinFile, err := worker.BuildSupervisorCmd(backendName, backendCfg, promptPath, worktree)
+	deadline := time.Now().Add(supervisorBackendTotalTimeout)
+	var failed []string
+	for _, candidate := range candidates {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		attemptTimeout := supervisorBackendAttemptTimeout
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+		out, runErr := completeSupervisorBackend(candidate.name, candidate.def, c.cfg, promptPath, worktree, attemptTimeout)
+		if runErr == nil {
+			if len(failed) > 0 {
+				log.Printf("[supervisor] backend fallback selected %s after %s failed", candidate.name, strings.Join(failed, ", "))
+			}
+			return strings.TrimSpace(string(out)), nil
+		}
+		failed = append(failed, candidate.name)
+		log.Printf("[supervisor] backend %s unavailable for this cycle; trying configured fallback", candidate.name)
+	}
+	return "", fmt.Errorf("run supervisor backends: all bounded candidates failed (%s)", strings.Join(failed, ", "))
+}
+
+type supervisorBackendCandidate struct {
+	name string
+	def  config.BackendDef
+}
+
+func supervisorBackendCandidates(cfg *config.Config) ([]supervisorBackendCandidate, error) {
+	primary, def, err := supervisorBackend(cfg)
 	if err != nil {
-		return "", fmt.Errorf("build supervisor backend cmd: %w", err)
+		return nil, err
+	}
+	names := append([]string{primary}, cfg.Model.FallbackBackends...)
+	seen := make(map[string]struct{}, len(names))
+	out := make([]supervisorBackendCandidate, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		candidate, ok := cfg.Model.Backends[name]
+		if !ok || !candidate.IsEnabled() {
+			continue
+		}
+		if name == primary {
+			candidate = def
+		}
+		out = append(out, supervisorBackendCandidate{name: name, def: candidate})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("supervisor has no enabled backend candidates")
+	}
+	return out, nil
+}
+
+func completeSupervisorBackend(name string, def config.BackendDef, cfg *config.Config, promptPath, worktree string, timeout time.Duration) ([]byte, error) {
+	backendCfg := worker.BackendConfig{
+		Cmd: def.Cmd, ExtraArgs: def.ExtraArgs, PromptMode: def.PromptMode, Provider: def.Provider,
+		Model: cfg.Supervisor.Model, Effort: cfg.Supervisor.Effort,
+	}
+	cmd, stdinFile, err := worker.BuildSupervisorCmd(name, backendCfg, promptPath, worktree)
+	if err != nil {
+		return nil, fmt.Errorf("build supervisor backend cmd: %w", err)
 	}
 	if stdinFile != "" {
 		in, err := os.Open(stdinFile)
 		if err != nil {
-			return "", fmt.Errorf("open supervisor prompt stdin: %w", err)
+			return nil, fmt.Errorf("open supervisor prompt stdin: %w", err)
 		}
 		defer in.Close()
 		cmd.Stdin = in
 	}
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("run supervisor backend %q: %w", backendName, err)
+	return outputWithTimeout(cmd, timeout)
+}
+
+func outputWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Start(); err != nil {
+		return nil, err
 	}
-	return strings.TrimSpace(string(out)), nil
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return out.Bytes(), err
+	case <-timer.C:
+		worker.KillProcessTree(cmd.Process.Pid)
+		<-done
+		return nil, fmt.Errorf("timed out after %s", timeout.Round(time.Second))
+	}
 }
 
 func supervisorBackend(cfg *config.Config) (string, config.BackendDef, error) {
@@ -167,7 +248,13 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 	}
 	output, err := client.Complete(prompt)
 	if err != nil {
-		return state.SupervisorDecision{}, err
+		// The deterministic guardrail already selected the only action the LLM
+		// is allowed to agree with. Provider failure must not freeze the project
+		// control loop: preserve that decision and make the degraded route visible.
+		log.Printf("[supervisor] all model backends unavailable; continuing with deterministic guardrail: %v", err)
+		deterministic.ErrorClass = ErrorClassSupervisorBackend
+		deterministic.Reasons = append(deterministic.Reasons, "Supervisor model backends were unavailable; deterministic guardrail executed without model synthesis.")
+		return deterministic, nil
 	}
 	llmDecision, err := ParseLLMDecision(output)
 	if err != nil {
