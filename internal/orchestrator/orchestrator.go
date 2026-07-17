@@ -5229,21 +5229,10 @@ func (o *Orchestrator) reconcileGuardedRepairApprovals(s *state.State) {
 	if o == nil || o.cfg == nil || s == nil {
 		return
 	}
-	issues := make(map[int]struct{})
-	for _, claim := range s.ActiveIssueClaims() {
-		switch claim.Kind {
-		case state.IssueClaimRepairDispatch, state.IssueClaimReviewRepairDispatch:
-			issues[claim.IssueNumber] = struct{}{}
-		}
-	}
-	if len(issues) == 0 {
+	numbers := s.ActiveRepairDispatchApprovalIssues()
+	if len(numbers) == 0 {
 		return
 	}
-	numbers := make([]int, 0, len(issues))
-	for issue := range issues {
-		numbers = append(numbers, issue)
-	}
-	sort.Ints(numbers)
 	now := time.Now().UTC()
 	for _, issueNumber := range numbers {
 		issue, err := o.getIssue(issueNumber)
