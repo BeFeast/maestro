@@ -2806,6 +2806,25 @@ func TestDecideWithLLM_ApprovalRequiredActionRejectedWithoutApproval(t *testing.
 	}
 }
 
+func TestDecideWithLLM_BackendFailureUsesDeterministicGuardrail(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.ApprovalRequiredActions = []string{ActionMergePR}
+	reader := &fakeReader{issues: []github.Issue{testIssue(940, "prove unattended SLA", "maestro-ready")}}
+	llm := &fakeLLM{err: errors.New("provider unavailable")}
+
+	decision, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker || decision.Target == nil || decision.Target.Issue != 940 {
+		t.Fatalf("decision = %+v, want deterministic spawn_worker for #940", decision)
+	}
+	if decision.ErrorClass != ErrorClassSupervisorBackend {
+		t.Fatalf("ErrorClass = %q, want %q", decision.ErrorClass, ErrorClassSupervisorBackend)
+	}
+}
+
 func TestDecideWithLLM_MalformedOutputRejected(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}

@@ -61,6 +61,22 @@ func KillProcessTree(pid int) {
 	signalPIDs(pids, syscall.SIGKILL)
 }
 
+// ForceKillProcessTree immediately terminates pid and every currently visible
+// descendant. It is reserved for callers whose own hard deadline has already
+// expired; unlike KillProcessTree it deliberately provides no graceful-exit
+// window.
+func ForceKillProcessTree(pid int) {
+	if pid <= 0 {
+		return
+	}
+
+	pids := []int{pid}
+	if runtime.GOOS == "linux" {
+		pids = collectProcessTree(pid)
+	}
+	signalPIDs(pids, syscall.SIGKILL)
+}
+
 // signalPIDs sends sig to each pid in reverse order (children before the root).
 func signalPIDs(pids []int, sig syscall.Signal) {
 	for i := len(pids) - 1; i >= 0; i-- {
