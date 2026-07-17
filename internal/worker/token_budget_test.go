@@ -104,10 +104,24 @@ func TestBuildWorkerCmd_TokenBudgetFailClosedAndCodexProxy(t *testing.T) {
 			t.Fatal(err)
 		}
 		joined := strings.Join(cmd.Args, " ")
-		for _, want := range []string{"--json", "--enable rollout_budget", "features.rollout_budget.limit_tokens=80000", "sampling_token_weight=1.0", "prefill_token_weight=1.0"} {
+		for _, want := range []string{"--json", "features.rollout_budget.enabled=true", "features.rollout_budget.limit_tokens=80000", "features.rollout_budget.reminder_at_remaining_tokens=[16000,8000]", "sampling_token_weight=1.0", "prefill_token_weight=1.0"} {
 			if !strings.Contains(joined, want) {
 				t.Errorf("codex args missing %q: %s", want, joined)
 			}
+		}
+		if strings.Contains(joined, "--enable rollout_budget") {
+			t.Errorf("codex args use boolean rollout_budget form that discards configured limits: %s", joined)
+		}
+	})
+
+	t.Run("codex tiny budget emits valid required reminder list", func(t *testing.T) {
+		cmd, _, err := BuildWorkerCmd("codex", BackendConfig{Cmd: "codex", UsageStream: true, TokenBudget: 1}, "/tmp/prompt", "/tmp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(cmd.Args, " ")
+		if !strings.Contains(joined, "features.rollout_budget.reminder_at_remaining_tokens=[]") {
+			t.Fatalf("codex args missing valid empty reminder list: %s", joined)
 		}
 	})
 
