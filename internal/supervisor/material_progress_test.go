@@ -589,7 +589,7 @@ func TestCollectMaterialProgressObservations_LiveExactTmuxAdvancesWithFrozenGitA
 	outputPath := filepath.Join(bin, "output")
 	script := filepath.Join(bin, "tmux")
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
-if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact" ]; then
+if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact:" ]; then
   exit 91
 fi
 if [ "${TMUX_FAKE_FAIL:-}" = "1" ]; then
