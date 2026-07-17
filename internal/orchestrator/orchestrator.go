@@ -7080,6 +7080,32 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	if backend == "" {
 		backend = o.cfg.Model.Default
 	}
+	previousBackend := backend
+	// A current model:<backend> label is an explicit operator routing decision
+	// and outranks the backend recorded on the failed attempt. This matters for
+	// retained-worktree recovery: changing model:claude to model:sol must resume
+	// the same slot/worktree on Sol, not silently replay the stale Fable route.
+	// Without an explicit label, keep the already-selected session backend so an
+	// in-place recovery does not forget a successful fallover route (#911).
+	var explicitSelection *router.BackendDecision
+	if labelBackend := router.BackendFromLabels(issue); labelBackend != "" {
+		decision := o.resolveBackendDecision(issue)
+		if decision.Backend == labelBackend {
+			if _, exists := o.cfg.Model.Backends[labelBackend]; !exists {
+				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: explicit backend %s is not configured", issue.Number, slot, labelBackend)
+				return false
+			}
+			if blockedBy, retryAt := o.dispatchBackendBlock(s, labelBackend, decision.Model, time.Now().UTC()); blockedBy != "" {
+				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: explicit backend %s is blocked (%s%s)", issue.Number, slot, labelBackend, blockedBy, retryAfterHint(retryAt))
+				return false
+			}
+			if labelBackend != backend {
+				log.Printf("[orch] issue #%d repair recovery honors current model label: %s → %s on retained session %s", issue.Number, backend, labelBackend, slot)
+			}
+			backend = labelBackend
+			explicitSelection = &decision
+		}
+	}
 	promptBase := o.selectPrompt(issue)
 	var err error
 	if sess.PRNumber > 0 {
@@ -7094,6 +7120,12 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	if err != nil {
 		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)
 		return false
+	}
+	if explicitSelection != nil {
+		selection := o.policyBackendSelection(*explicitSelection)
+		selection.PreviousBackend = previousBackend
+		sess.BackendSelection = selection
+		sess.Backend = backend
 	}
 	sess.NextRetryAt = nil
 	o.resolveSpawnRepairApproval(s, dispatch.approvalID, slot, target.PR, "repair worker dispatched")

@@ -5042,6 +5042,50 @@ func TestStartNewWorkers_SupervisorRepairSpawnRepairsReservedSessionInPlace(t *t
 	}
 }
 
+func TestStartNewWorkers_SupervisorRepairSpawnHonorsCurrentModelLabelInPlace(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex", "sol")
+	issues := []github.Issue{makeIssue(345, "resume retained packaging work", "model:sol")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return false, nil }
+	gotBackend := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		gotBackend = backend
+		sess.Status = state.StatusRunning
+		sess.Backend = backend
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345,
+		IssueTitle:  "resume retained packaging work",
+		Status:      state.StatusDead,
+		Worktree:    "/work/ok-player-273",
+		Branch:      "feat/ok-player-273-345",
+		Backend:     "codex",
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair-label",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 345, Session: "ok-player-273"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want retained-session repair", *started)
+	}
+	if gotBackend != "sol" {
+		t.Fatalf("repair backend = %q, want current explicit label backend sol", gotBackend)
+	}
+	if got := s.Sessions["ok-player-273"].Backend; got != "sol" {
+		t.Fatalf("session backend = %q, want sol", got)
+	}
+}
+
 func TestStartNewWorkers_SupervisorRepairSpawnDoesNotDuplicateRunningWorker(t *testing.T) {
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(808, "repair retry exhausted")}
