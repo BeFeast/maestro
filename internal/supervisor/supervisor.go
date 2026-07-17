@@ -2731,6 +2731,12 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	// spawn_repair_worker is now a registered awaiting-dispatch action, so the
 	// cautious gate can safely authorize that recovery without creating a new
 	// slot, worktree, or PR.
+	if mergeReader, ok := e.reader.(prMergeableReader); ok {
+		if mergeable, err := mergeReader.PRMergeable(pr.Number); err == nil &&
+			strings.EqualFold(strings.TrimSpace(mergeable), "CONFLICTING") {
+			return true
+		}
+	}
 	if pr.IsDraft {
 		return true
 	}
