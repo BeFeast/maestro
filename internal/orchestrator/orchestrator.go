@@ -7384,6 +7384,12 @@ type spawnRepairDispatch struct {
 	approvalID string
 }
 
+type spawnRepairGateDecision struct {
+	actionable bool
+	stale      bool
+	reason     string
+}
+
 func (o *Orchestrator) resolveSpawnRepairDispatch(s *state.State, issueNumber int) *spawnRepairDispatch {
 	if s == nil || issueNumber <= 0 {
 		return nil
@@ -7503,6 +7509,17 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		o.resolveSpawnRepairApproval(s, dispatch.approvalID, slot, target.PR, "reserved session already running")
 		return false
 	}
+	if target.PR > 0 {
+		gate := o.revalidateSpawnRepairPR(target)
+		if !gate.actionable {
+			log.Printf("[orch] refusing repair dispatch for issue #%d / PR #%d on %s: %s", issue.Number, target.PR, slot, gate.reason)
+			if gate.stale {
+				o.staleInvalidSpawnRepairApproval(s, dispatch, gate.reason)
+			}
+			return false
+		}
+		log.Printf("[orch] current PR gate authorizes in-place repair for issue #%d / PR #%d on %s: %s", issue.Number, target.PR, slot, gate.reason)
+	}
 
 	backend := strings.TrimSpace(sess.Backend)
 	if backend == "" {
@@ -7583,6 +7600,82 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	}
 	o.notifier.Sendf("🔄 maestro: repairing issue #%d in place on worker %s: %s", issue.Number, slot, issue.Title)
 	return true
+}
+
+// revalidateSpawnRepairPR prevents a delayed approval or supervisor decision
+// from replaying a repair against a PR state that no longer exists. The live
+// GitHub head and gates, not the state captured when the decision was minted,
+// authorize worker spend. A current CI failure, merge conflict, or blocking
+// review finding is actionable; pending/green gates make an old repair intent
+// stale. Read errors and unknown states fail closed without consuming the
+// approval so a later healthy control-loop read can retry safely.
+func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) spawnRepairGateDecision {
+	if target == nil || target.PR <= 0 {
+		return spawnRepairGateDecision{actionable: true, reason: "repair has no PR gate to revalidate"}
+	}
+	pr := target.PR
+	currentHead, err := o.prHeadSHA(pr)
+	if err != nil || strings.TrimSpace(currentHead) == "" {
+		return spawnRepairGateDecision{reason: fmt.Sprintf("current PR head is unavailable: %v", err)}
+	}
+	currentHead = strings.TrimSpace(currentHead)
+	boundHead := strings.TrimSpace(target.HeadSHA)
+	if boundHead != "" && !strings.EqualFold(boundHead, currentHead) {
+		return spawnRepairGateDecision{
+			stale:  true,
+			reason: fmt.Sprintf("repair intent was bound to head %s, but current head is %s", shortHeadSHA(boundHead), shortHeadSHA(currentHead)),
+		}
+	}
+
+	rollup, err := o.prCheckRollup(pr)
+	if err != nil {
+		return spawnRepairGateDecision{reason: fmt.Sprintf("current PR checks are unavailable: %v", err)}
+	}
+	if observedHead := strings.TrimSpace(rollup.HeadSHA); observedHead != "" && !strings.EqualFold(observedHead, currentHead) {
+		return spawnRepairGateDecision{reason: "PR head changed while current checks were being read"}
+	}
+	ci := strings.ToLower(strings.TrimSpace(rollup.Verdict))
+	actionableReason := ""
+	if ci == "failure" {
+		actionableReason = "current-head CI is failing"
+	}
+
+	if actionableReason == "" {
+		mergeable, mergeState, mergeErr := o.prMergeStatus(pr)
+		if mergeErr != nil {
+			return spawnRepairGateDecision{reason: fmt.Sprintf("current PR merge state is unavailable: %v", mergeErr)}
+		}
+		if strings.EqualFold(strings.TrimSpace(mergeable), "CONFLICTING") || strings.EqualFold(strings.TrimSpace(mergeState), "dirty") {
+			actionableReason = "current PR head has a merge conflict"
+		}
+	}
+
+	if actionableReason == "" {
+		review, reviewErr := o.prReviewGateVerdict(pr)
+		if reviewErr != nil {
+			return spawnRepairGateDecision{reason: fmt.Sprintf("current PR review gate is unavailable: %v", reviewErr)}
+		}
+		if !review.Pending && !review.Passed {
+			actionableReason = "current PR head has blocking review findings"
+		}
+	}
+
+	latestHead, err := o.prHeadSHA(pr)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(latestHead), currentHead) {
+		return spawnRepairGateDecision{reason: "PR head changed while repair gates were being revalidated"}
+	}
+	if actionableReason != "" {
+		return spawnRepairGateDecision{actionable: true, reason: actionableReason}
+	}
+
+	switch ci {
+	case "pending":
+		return spawnRepairGateDecision{stale: true, reason: "current PR head checks are pending; no repair is presently actionable"}
+	case "success":
+		return spawnRepairGateDecision{stale: true, reason: "current PR head is green and has no actionable conflict or review blocker"}
+	default:
+		return spawnRepairGateDecision{reason: fmt.Sprintf("current PR check verdict %q is not authoritative", ci)}
+	}
 }
 
 func activeIssueClaimForSession(s *state.State, issueNumber int, slot string) (state.IssueClaim, bool) {

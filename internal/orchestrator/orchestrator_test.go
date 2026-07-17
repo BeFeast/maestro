@@ -5101,6 +5101,7 @@ func TestStartNewWorkers_SupervisorRepairSpawnRepairsReservedSessionInPlace(t *t
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(767, "repair stale PR")}
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 769)
 	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
 		return issueNumber == 767, nil
 	}
@@ -5156,6 +5157,7 @@ func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.
 	}
 	issues := []github.Issue{makeIssue(887, "finish watchdog recovery")}
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 914)
 	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
 		return issueNumber == 887, nil
 	}
