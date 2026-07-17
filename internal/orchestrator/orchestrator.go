@@ -7078,6 +7078,25 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		if claim.IssueNumber != issue.Number || claim.Session == "" || claim.Session == slot {
 			continue
 		}
+		// A completed older PR can retain the issue's terminal-reconciliation
+		// claim until GitHub closes the issue. That claim must still prevent a
+		// fresh implementation dispatch, but it must not veto an explicitly
+		// approved repair of a newer, already-existing canonical PR/session.
+		// The repair reservation is exact (issue + session + PR), so ignoring
+		// only a chronologically earlier done session cannot create another
+		// worker identity. Other active/open/retry claims continue to fail
+		// closed below.
+		if claim.Kind == state.IssueClaimTerminalReconcile &&
+			claim.Status == string(state.StatusDone) &&
+			claim.PRNumber > 0 && target.PR > 0 && claim.PRNumber != target.PR {
+			prior, exists := s.SessionAt(claim.Session)
+			if exists && prior.Status == state.StatusDone && prior.FinishedAt != nil &&
+				!sess.StartedAt.IsZero() && !prior.FinishedAt.After(sess.StartedAt) {
+				log.Printf("[orch] ignoring older terminal claim on session %s / PR #%d while repairing reserved newer session %s / PR #%d for issue #%d",
+					claim.Session, claim.PRNumber, slot, target.PR, issue.Number)
+				continue
+			}
+		}
 		log.Printf("[orch] refusing repair dispatch for issue #%d on %s: competing claim on session %s (%s)", issue.Number, slot, claim.Session, claim.Reason)
 		return false
 	}
@@ -7124,8 +7143,19 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	var err error
 	if sess.PRNumber > 0 {
 		if strings.TrimSpace(sess.Worktree) == "" {
-			log.Printf("[orch] refusing repair dispatch for issue #%d on %s: PR #%d worktree is missing", issue.Number, slot, sess.PRNumber)
-			return false
+			// Cleanup can clear the persisted Worktree field after a terminal
+			// attempt even when an operator has restored the exact slot worktree
+			// from the canonical PR branch. Reattach only the deterministic
+			// <worktree_base>/<slot> path and require git worktree metadata; never
+			// discover or allocate a different slot here.
+			restored := filepath.Join(o.cfg.WorktreeBase, slot)
+			if _, statErr := os.Stat(filepath.Join(restored, ".git")); statErr == nil {
+				sess.Worktree = restored
+				log.Printf("[orch] reattached restored worktree %s to reserved repair session %s / PR #%d", restored, slot, sess.PRNumber)
+			} else {
+				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: PR #%d worktree is missing", issue.Number, slot, sess.PRNumber)
+				return false
+			}
 		}
 		err = o.respawnInPlaceWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
 	} else {
