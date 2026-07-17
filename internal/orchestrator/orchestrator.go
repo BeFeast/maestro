@@ -28,6 +28,7 @@ import (
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/worker"
 )
@@ -259,7 +260,7 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 	if name == "" {
 		return false
 	}
-	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+	return tmuxsession.HasSession(name)
 }
 
 func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
@@ -1763,7 +1764,7 @@ func tmuxCapture(session string) (string, error) {
 	if strings.TrimSpace(session) == "" {
 		return "", fmt.Errorf("empty tmux session")
 	}
-	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
+	out, err := tmuxsession.CommandForSession(session, "capture-pane", "-t", "="+session+":", "-p").Output()
 	if err != nil {
 		return "", err
 	}

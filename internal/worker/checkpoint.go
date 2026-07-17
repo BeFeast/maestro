@@ -14,6 +14,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // WorktreeDirty reports whether a retained worker worktree contains any
@@ -119,7 +120,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// worker grandchildren that reparented away (e.g. headless Chrome) do not
 	// leak across a respawn.
 	tmuxName := TmuxSessionName(slotName)
-	if out, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
+	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
 		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
 	}
 	if sess.PID > 0 && IsAlive(sess.PID) {
@@ -214,13 +215,12 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	}
 
 	// Start tmux session in existing worktree
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", sess.Worktree, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, sess.Worktree, runnerPath); err != nil {
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
 		return fmt.Errorf("tmux list-panes: %w", err)
 	}
