@@ -1030,6 +1030,7 @@ function WorkerSpendSection({ worker, fleet }) {
   const tokens = Number(worker.tokens_used_total || 0);
   const attemptTokens = Number(worker.tokens_used_attempt || 0);
   const maxTokens = Number(worker.worker_max_tokens || 0);
+  const budgetMeasure = String(worker.token_budget_measure || "uncached_tokens");
   const usd = Number(worker.cost_usd_estimate || 0);
   // Find the issue-level rollup so retries are visible on the drawer.
   const projectName = worker.project_name || worker.project || "";
@@ -1058,9 +1059,11 @@ function WorkerSpendSection({ worker, fleet }) {
       </div>
       {maxTokens > 0 && (
         <div className="kv">
-          <span>Configured budget</span>
+          <span>
+            Configured cap ({budgetMeasure === "uncached_tokens" ? "uncached tokens" : budgetMeasure})
+          </span>
           <strong className="mono">
-            {formatTokens(attemptTokens)} / {formatTokens(maxTokens)} tok
+            {formatTokens(maxTokens)} tok
           </strong>
         </div>
       )}

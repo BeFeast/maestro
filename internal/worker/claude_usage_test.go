@@ -69,6 +69,19 @@ func TestParseClaudeUsage_LiveAssistantFramesBeforeResult(t *testing.T) {
 	}
 }
 
+func TestParseClaudeUsage_DeduplicatesRepeatedAssistantMessageFrames(t *testing.T) {
+	const live = `{"type":"assistant","message":{"id":"msg-same","role":"assistant","model":"claude-fable-5","content":[{"type":"thinking"}],"usage":{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":12258,"cache_read_input_tokens":30869}}}
+{"type":"assistant","message":{"id":"msg-same","role":"assistant","model":"claude-fable-5","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":12258,"cache_read_input_tokens":30869}}}
+`
+	usage, ok := ParseClaudeUsage(live)
+	if !ok {
+		t.Fatal("live assistant usage must be available")
+	}
+	if usage.TotalTokens != 43_134 {
+		t.Fatalf("TotalTokens = %d, want one message's 43134 rather than duplicate 86268", usage.TotalTokens)
+	}
+}
+
 // Multiple result frames (the slot.jsonl after a respawn appends a second
 // run's frames) must SUM to the cumulative run total — the property the
 // respawn-safe token watermark relies on.

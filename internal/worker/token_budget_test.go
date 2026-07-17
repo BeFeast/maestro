@@ -32,12 +32,41 @@ func TestRunStreamSplitWithBudget_StopsBeforeRunawayCompletion(t *testing.T) {
 	if marker.TokensObserved != 85_000 || marker.MaxTokens != 80_000 {
 		t.Fatalf("marker = %+v, want observed=85000 max=80000", marker)
 	}
+	if marker.Measure != TokenBudgetMeasureUncached {
+		t.Fatalf("marker measure = %q, want %q", marker.Measure, TokenBudgetMeasureUncached)
+	}
 	data, err := os.ReadFile(jsonl)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), "92038") {
 		t.Fatal("177k runaway tail was consumed after the 80k budget stop")
+	}
+}
+
+func TestLiveTokenMonitor_ClaudeIgnoresCacheReadAndDeduplicatesMessageFrames(t *testing.T) {
+	monitor := newLiveTokenMonitor("claude", 160_000)
+	// The same assistant message is emitted once for thinking and again for its
+	// text block. The live finance-tracker failure carried 123,476 cached tokens
+	// but only 77,030 uncached tokens; neither the cache replay nor the duplicate
+	// frame may exhaust the worker budget.
+	frame := `{"type":"assistant","message":{"id":"msg-fin-26","role":"assistant","usage":{"input_tokens":10,"output_tokens":30,"cache_creation_input_tokens":76990,"cache_read_input_tokens":123476}}}`
+	observed, exceeded := monitor.observe(frame)
+	if exceeded || observed != 77_030 {
+		t.Fatalf("first frame = %d,%t, want 77030,false", observed, exceeded)
+	}
+	observed, exceeded = monitor.observe(frame)
+	if exceeded || observed != 77_030 {
+		t.Fatalf("duplicate frame = %d,%t, want 77030,false", observed, exceeded)
+	}
+}
+
+func TestLiveTokenMonitor_PiIgnoresCacheRead(t *testing.T) {
+	monitor := newLiveTokenMonitor("pi", 100_000)
+	line := `{"type":"turn_end","message":{"role":"assistant","usage":{"input":10,"output":20,"cacheRead":150000,"cacheWrite":30000}}}`
+	observed, exceeded := monitor.observe(line)
+	if exceeded || observed != 30_030 {
+		t.Fatalf("observe = %d,%t, want 30030,false", observed, exceeded)
 	}
 }
 

@@ -355,6 +355,7 @@ func TestFleetTokenBudgetMarkerShowsStoppedWorkerAndConfiguredBudget(t *testing.
 		Backend:        "claude",
 		TokensObserved: 85_000,
 		MaxTokens:      80_000,
+		Measure:        worker.TokenBudgetMeasureUncached,
 		MeasuredAt:     time.Now().UTC(),
 	}
 	data, err := json.Marshal(marker)
@@ -390,6 +391,9 @@ func TestFleetTokenBudgetMarkerShowsStoppedWorkerAndConfiguredBudget(t *testing.
 	}
 	if got.WorkerMaxTokens != 80_000 || got.TokensUsedAttempt != 85_000 || got.WorkerOutcome != worker.TokenBudgetExceededOutcome {
 		t.Fatalf("budget view = %+v, want max=80000 usage=85000 outcome", got)
+	}
+	if got.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Fatalf("budget measure = %q, want %q", got.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
 	}
 	if !strings.Contains(got.StatusReason, "token budget") {
 		t.Fatalf("status reason = %q, want budget stop reason", got.StatusReason)
