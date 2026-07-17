@@ -4125,12 +4125,18 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 			// delivered PR and this attempt was explicitly reconciled as a
 			// duplicate. Do not hide a genuine failed follow-up merely because
 			// an older session for the issue once completed.
-			if peer.PRNumber > 0 && candidate.WorkerOutcome == "duplicate_dispatch_reconciled" {
+			if peer.PRNumber > 0 && (candidate.WorkerOutcome == "duplicate_dispatch_reconciled" || fleetSessionStartedAfterCanonicalCompletion(candidate, peer)) {
 				return peer, true
 			}
 		}
 	}
 	return sessionInfo{}, false
+}
+
+func fleetSessionStartedAfterCanonicalCompletion(candidate, canonical sessionInfo) bool {
+	started, startErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
+	finished, finishErr := time.Parse(time.RFC3339, strings.TrimSpace(canonical.FinishedAt))
+	return startErr == nil && finishErr == nil && !started.Before(finished)
 }
 
 func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetCloseCandidate {

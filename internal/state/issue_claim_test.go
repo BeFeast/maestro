@@ -86,3 +86,22 @@ func TestIssueClaimFor_DeadScheduledRetryRemainsReserved(t *testing.T) {
 		t.Fatalf("claim = %+v, %v, want scheduled retry", claim, ok)
 	}
 }
+
+func TestIssueClaimFor_DonePRRemainsReservedUntilExplicitRelease(t *testing.T) {
+	s := NewState()
+	finishedAt := time.Now().UTC()
+	s.Sessions["ok-player-274"] = &Session{IssueNumber: 365, Status: StatusDone, PRNumber: 370, FinishedAt: &finishedAt}
+
+	claim, ok := s.IssueClaimFor(365)
+	if !ok || claim.Kind != IssueClaimTerminalReconcile || claim.Session != "ok-player-274" || claim.PRNumber != 370 {
+		t.Fatalf("claim = %+v, %v; want terminal reconciliation lease", claim, ok)
+	}
+	if !s.IssueInProgress(365) {
+		t.Fatal("done PR must keep issue reserved through close-issue reconciliation")
+	}
+
+	s.Sessions["ok-player-274"].ReleasedForRedispatch = true
+	if _, ok := s.IssueClaimFor(365); ok {
+		t.Fatal("explicitly released done session must not retain terminal reconciliation lease")
+	}
+}

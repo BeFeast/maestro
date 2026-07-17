@@ -25,6 +25,7 @@ const (
 	IssueClaimOpenPRMaintenance    = "open_pr_maintenance"
 	IssueClaimScheduledRetry       = "scheduled_retry"
 	IssueClaimRetainedWorktree     = "retained_worktree"
+	IssueClaimTerminalReconcile    = "terminal_reconciliation"
 	IssueClaimRepairDispatch       = "repair_dispatch"
 	IssueClaimReviewRepairDispatch = "review_repair_dispatch"
 )
@@ -261,6 +262,18 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		claim.Kind = IssueClaimOpenPRMaintenance
 		claim.Reason = fmt.Sprintf("issue #%d is maintained by session %s for PR #%d", sess.IssueNumber, slot, sess.PRNumber)
 		return claim, true
+	case StatusDone:
+		// A merged/completed PR is not the end of issue identity until forge
+		// reconciliation closes the linked issue (or explicitly releases the
+		// session for redispatch). Without this lease there is a real race:
+		// pr_open -> done removes the open-PR claim, then the still-open issue
+		// retains its ready label and the next selector cycle starts a duplicate
+		// worker before close-issue reconciliation completes.
+		if sess.PRNumber > 0 && sess.FinishedAt != nil && !sess.ReleasedForRedispatch {
+			claim.Kind = IssueClaimTerminalReconcile
+			claim.Reason = fmt.Sprintf("issue #%d awaits terminal reconciliation on completed session %s / PR #%d", sess.IssueNumber, slot, sess.PRNumber)
+			return claim, true
+		}
 	case StatusDead:
 		if sess.NextRetryAt != nil {
 			claim.Kind = IssueClaimScheduledRetry

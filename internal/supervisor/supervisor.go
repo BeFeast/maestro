@@ -609,7 +609,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
-	if slot, sess, pr, ok := e.sessionWithOpenPR(st, prs, cache); ok {
+	if slot, sess, pr, mergeReady, mergeReasons, ok := e.sessionWithOpenPR(st, prs, cache); ok {
 		// #565: auto review-repair respawn. When a green+mergeable PR is
 		// settled retry_exhausted on review feedback AND Greptile flags
 		// ≥1 P0/P1 inline comment on its current head SHA, mint a
@@ -665,7 +665,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		// rule, every CLEAN/SUCCESS PR sat in pr_open forever while supervisor
 		// emitted monitor_open_pr loops; the reasoning even claimed "Maestro will
 		// merge when the merge gate allows it" — aspirational, never implemented.
-		if ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr); ready {
+		if mergeReady {
 			summary := fmt.Sprintf("Merge PR #%d for issue #%d — checks green, mergeable, review gates passed.", pr.Number, sess.IssueNumber)
 			reasons := appendReasons(baseReasons, mergeReasons...)
 			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
@@ -2653,7 +2653,7 @@ func sessionWithOpenPR(st *state.State, prs []github.PR) (string, *state.Session
 	return "", nil, github.PR{}, false
 }
 
-func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool) {
+func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool, []string, bool) {
 	branchToPR := make(map[string]github.PR, len(prs))
 	numberToPR := make(map[int]github.PR, len(prs))
 	for _, pr := range prs {
@@ -2665,10 +2665,12 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 	// is intentionally blocked for QA: a later conflict_failed/retry_exhausted
 	// canonical PR still needs the project's one actionable recommendation.
 	// Keep the sort order as a deterministic tie-breaker within each rank.
-	bestRank := 2
+	bestRank := 3
 	var bestSlot string
 	var bestSession *state.Session
 	var bestPR github.PR
+	var bestReady bool
+	var bestMergeReasons []string
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || e.sessionResolvedOnGitHub(sess, cache) {
@@ -2685,25 +2687,37 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		if !found {
 			continue
 		}
-		rank := 1
-		switch sess.Status {
-		case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed, state.StatusDead:
+		// Evaluate merge eligibility across the whole candidate set before
+		// choosing one session. Previously every ordinary pr_open candidate had
+		// the same rank, so the lexicographically first slot (often an old
+		// blocked draft) prevented a later CLEAN green PR from ever reaching the
+		// merge rule. One ready PR is the highest-priority action in sequential
+		// merge mode; attention states remain next, then passive PR gates.
+		ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr)
+		rank := 2
+		if ready {
 			rank = 0
+		} else {
+			switch sess.Status {
+			case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed, state.StatusDead:
+				rank = 1
+			}
 		}
 		if bestSession == nil || rank < bestRank {
 			bestRank = rank
 			bestSlot, bestSession, bestPR = slot, sess, pr
+			bestReady, bestMergeReasons = ready, mergeReasons
 		}
 		if bestRank == 0 {
-			// sortedSessionNames already provides the deterministic tie-break;
-			// no later candidate can outrank an attention state.
+			// sortedSessionNames provides the deterministic tie-break among
+			// equally merge-ready PRs; no later candidate can outrank this one.
 			break
 		}
 	}
 	if bestSession != nil {
-		return bestSlot, bestSession, bestPR, true
+		return bestSlot, bestSession, bestPR, bestReady, bestMergeReasons, true
 	}
-	return "", nil, github.PR{}, false
+	return "", nil, github.PR{}, false, nil, false
 }
 
 func runningSession(st *state.State) (string, *state.Session, bool) {

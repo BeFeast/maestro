@@ -3950,6 +3950,27 @@ func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForReconciledDuplicate
 	}
 }
 
+func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForLaterDuplicate(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot: "ok-player-278", IssueNumber: 365, Status: string(state.StatusDead), NeedsAttention: true,
+		StartedAt: "2026-07-17T13:28:26Z",
+	}
+	canonical := sessionInfo{
+		Slot: "ok-player-274", IssueNumber: 365, Status: string(state.StatusDone), PRNumber: 370,
+		FinishedAt: "2026-07-17T13:28:21Z",
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("later duplicate superseding session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	earlierFailure := duplicate
+	earlierFailure.StartedAt = "2026-07-17T13:20:00Z"
+	if got, ok := fleetSupersedingIssueSession(earlierFailure, []sessionInfo{earlierFailure, canonical}); ok {
+		t.Fatalf("earlier genuine failure incorrectly superseded: %+v", got)
+	}
+}
+
 func TestFleetSupersedingIssueSessionUsesCanonicalOpenPR(t *testing.T) {
 	duplicate := sessionInfo{
 		Slot:           "ok-player-259",

@@ -1039,6 +1039,44 @@ func TestDecide_BlockedIssueWithOpenPRNeverMintsRepairApproval(t *testing.T) {
 	}
 }
 
+func TestDecide_MergeReadyPRRanksAheadOfOlderBlockedDraft(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(331, "old blocked draft", "blocked"),
+			testIssue(365, "clean P0"),
+		},
+		prs: []github.PR{
+			{Number: 335, HeadRefName: "feat/old-draft", State: "OPEN", Mergeable: "MERGEABLE", IsDraft: true},
+			{Number: 370, HeadRefName: "feat/clean-p0", State: "OPEN", Mergeable: "MERGEABLE"},
+		},
+		ciStatuses: map[int]string{335: "success", 370: "success"},
+		greptileOK: map[int]bool{335: true, 370: true},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331, IssueTitle: "old blocked draft", Status: state.StatusPROpen,
+		PRNumber: 335, Branch: "feat/old-draft",
+	}
+	st.Sessions["ok-player-274"] = &state.Session{
+		IssueNumber: 365, IssueTitle: "clean P0", Status: state.StatusPROpen,
+		PRNumber: 370, Branch: "feat/clean-p0",
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMergePR {
+		t.Fatalf("action = %q, want %q; summary=%q", decision.RecommendedAction, ActionMergePR, decision.Summary)
+	}
+	if decision.Target == nil || decision.Target.PR != 370 || decision.Target.Issue != 365 || decision.Target.Session != "ok-player-274" {
+		t.Fatalf("target = %#v, want clean PR #370 / issue #365 / ok-player-274", decision.Target)
+	}
+}
+
 func TestDecide_RetryExhaustedReadyIssueSpawnsRepairWorkerEvenWhenProjectBlocked(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
