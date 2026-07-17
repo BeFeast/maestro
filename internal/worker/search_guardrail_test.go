@@ -289,6 +289,11 @@ func TestBuildWorkerRunnerScriptStreamSplitPipeline(t *testing.T) {
 // built by concatenation so no contiguous credential-shaped literal exists in
 // the source (agent-lint).
 func TestWriteWorkerRunnerScriptUsesSingleSharedCredentialBoundary(t *testing.T) {
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	tokenCanary := "CANARY-" + "auth-token-" + "d0n0t-persist-" + "0001"
 	keyCanary := "CANARY-" + "cliproxy-key-" + "d0n0t-persist-" + "0002"
 
@@ -655,6 +660,11 @@ func TestResolveWorkerCredentialsFileRejectsSymlinkedPrivateDirectory(t *testing
 }
 
 func TestWriteWorkerRunnerScriptAtomicallyReplacesTargetSymlink(t *testing.T) {
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, key := range workerCredentialEnvKeys {
 		t.Setenv(key, "")
 	}
