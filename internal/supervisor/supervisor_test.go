@@ -960,6 +960,7 @@ func TestDecide_FailingChecksExplained(t *testing.T) {
 func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
+		issues: []github.Issue{testIssue(94, "failing checks", "maestro-ready")},
 		prs: []github.PR{{
 			Number:      31,
 			HeadRefName: "feat/checks",
@@ -995,6 +996,46 @@ func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T
 	}
 	if !strings.Contains(strings.ToLower(decision.Summary), "repair worker") {
 		t.Fatalf("summary = %q, want repair worker", decision.Summary)
+	}
+}
+
+func TestDecide_BlockedIssueWithOpenPRNeverMintsRepairApproval(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{
+		issues: []github.Issue{testIssue(331, "canonical PR #335", "blocked")},
+		prs: []github.PR{{
+			Number:      335,
+			HeadRefName: "feat/ok-player-247-331-fix",
+			State:       "OPEN",
+			Mergeable:   "MERGEABLE",
+			IsDraft:     true,
+		}},
+		ciStatuses: map[int]string{335: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		IssueTitle:  "canonical PR #335",
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Branch:      "feat/ok-player-247-331-fix",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionMonitorOpenPR)
+	}
+	if decision.RequiresApproval || decision.ApprovalID != "" {
+		t.Fatalf("blocked decision minted approval: requires=%v id=%q", decision.RequiresApproval, decision.ApprovalID)
+	}
+	if !strings.Contains(decision.Summary, `label "blocked"`) {
+		t.Fatalf("summary = %q, want current blocked-label guard", decision.Summary)
 	}
 }
 

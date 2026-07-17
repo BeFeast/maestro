@@ -298,6 +298,24 @@ func TestApprovalAction_RestartWorker_Enqueues202(t *testing.T) {
 	}
 }
 
+func TestApprovalAction_SpawnRepairWorker_EnqueuesReservedSession(t *testing.T) {
+	cfg, dir := approvalEnqueueCfg(t)
+	srv := New(cfg, nil)
+	srv.SetActionDeps(&fakeActionGH{}, nil)
+
+	w := postApprovalAction(t, srv, `{"action_id":"spawn_repair_worker","slot":"ok-player-273","issue_number":345,"reason":"resume retained worktree in place"}`)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	st := loadStateAt(t, dir)
+	if len(st.Approvals) != 1 || st.Approvals[0].Action != "spawn_repair_worker" {
+		t.Fatalf("state.Approvals = %+v", st.Approvals)
+	}
+	if got := st.Approvals[0].Target; got == nil || got.Session != "ok-player-273" || got.Issue != 345 {
+		t.Fatalf("target = %+v, want session=ok-player-273 issue=345", got)
+	}
+}
+
 func TestApprovalAction_StopWorker_Enqueues202(t *testing.T) {
 	cfg, dir := approvalEnqueueCfg(t)
 	srv := New(cfg, nil)

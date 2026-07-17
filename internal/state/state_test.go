@@ -363,6 +363,48 @@ func TestBackendHealthMergeKeepsLatest(t *testing.T) {
 	}
 }
 
+func TestStateMergePreservesNewestSupervisorHeartbeat(t *testing.T) {
+	base := NewState()
+	base.LastRunOnceAt = time.Date(2026, 7, 17, 10, 16, 0, 0, time.UTC)
+	base.SupervisorStuck = true
+	base.SupervisorStuckReason = "old pulse"
+	current := cloneState(base)
+	current.Sessions["other-writer"] = &Session{IssueNumber: 1, Status: StatusRunning}
+	ours := cloneState(base)
+	ours.LastRunOnceAt = time.Date(2026, 7, 17, 10, 44, 0, 0, time.UTC)
+	ours.SupervisorStuck = false
+	ours.SupervisorStuckReason = ""
+
+	merged, err := mergeStateSnapshots(base, current, ours)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !merged.LastRunOnceAt.Equal(ours.LastRunOnceAt) {
+		t.Fatalf("last_run_once_at = %s, want %s", merged.LastRunOnceAt, ours.LastRunOnceAt)
+	}
+	if merged.SupervisorStuck || merged.SupervisorStuckReason != "" {
+		t.Fatalf("new heartbeat did not clear stale verdict: stuck=%v reason=%q", merged.SupervisorStuck, merged.SupervisorStuckReason)
+	}
+}
+
+func TestStateMergePreservesWatchdogStuckAtSameHeartbeat(t *testing.T) {
+	base := NewState()
+	base.LastRunOnceAt = time.Date(2026, 7, 17, 10, 16, 0, 0, time.UTC)
+	current := cloneState(base)
+	current.SupervisorStuck = true
+	current.SupervisorStuckReason = "15-minute threshold exceeded"
+	ours := cloneState(base)
+	ours.BackendHealth["claude"] = BackendHealth{State: BackendHealthAvailable, Since: time.Now().UTC()}
+
+	merged, err := mergeStateSnapshots(base, current, ours)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !merged.SupervisorStuck || merged.SupervisorStuckReason != current.SupervisorStuckReason {
+		t.Fatalf("watchdog verdict lost: stuck=%v reason=%q", merged.SupervisorStuck, merged.SupervisorStuckReason)
+	}
+}
+
 func TestNotifiedCIFail_OmittedWhenFalse(t *testing.T) {
 	dir := t.TempDir()
 

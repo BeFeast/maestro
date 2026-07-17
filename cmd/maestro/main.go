@@ -32,6 +32,7 @@ import (
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/watch"
 	"github.com/befeast/maestro/internal/worker"
@@ -2088,13 +2089,10 @@ func logsCmd(args []string) {
 
 			// If worker's tmux session is alive, attach to it for live output
 			tmuxName := worker.TmuxSessionName(slotName)
-			if sess.Status == state.StatusRunning && exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil {
-				tmuxPath, err := exec.LookPath("tmux")
-				if err != nil {
-					log.Fatalf("find tmux: %v", err)
-				}
+			if sess.Status == state.StatusRunning && tmuxsession.HasSession(tmuxName) {
+				tmuxPath, tmuxArgs := tmuxsession.ClientArgsForSession(tmuxName, "attach-session", "-t", "="+tmuxName+":", "-r")
 				fmt.Printf("Attaching to tmux session %s (read-only)...\n", tmuxName)
-				syscall.Exec(tmuxPath, []string{"tmux", "attach-session", "-t", tmuxName, "-r"}, os.Environ())
+				syscall.Exec(tmuxPath, tmuxArgs, os.Environ())
 				log.Fatalf("exec tmux attach: should not reach here")
 			}
 
@@ -2306,7 +2304,7 @@ func tmuxSessionAlive(name string) bool {
 	if strings.TrimSpace(name) == "" {
 		return false
 	}
-	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+	return tmuxsession.HasSession(name)
 }
 
 func watchCmd(args []string) {

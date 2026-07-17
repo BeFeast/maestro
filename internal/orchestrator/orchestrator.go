@@ -28,6 +28,7 @@ import (
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/worker"
 )
@@ -259,7 +260,7 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 	if name == "" {
 		return false
 	}
-	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+	return tmuxsession.HasSession(name)
 }
 
 func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
@@ -1763,7 +1764,7 @@ func tmuxCapture(session string) (string, error) {
 	if strings.TrimSpace(session) == "" {
 		return "", fmt.Errorf("empty tmux session")
 	}
-	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
+	out, err := tmuxsession.CommandForSession(session, "capture-pane", "-t", "="+session+":", "-p").Output()
 	if err != nil {
 		return "", err
 	}
@@ -4363,7 +4364,24 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			sess.NotifiedCIFail = false // backward compat
 
-			if o.cfg.AutoRetryReviewFeedback {
+			// The configured review gate is authoritative. In particular, a
+			// successful Greptile check means "ok to merge" (4/5 or 5/5) even
+			// when the review left advisory inline findings. The old ordering
+			// collected P1 comments first and scheduled a repair before reading
+			// the successful gate, producing the contradictory
+			// greptile_not_approved/retry_exhausted state seen on OK Player #361.
+			// Read the verdict first and only feed comments to a repair worker
+			// when the configured gate itself has not passed.
+			var currentReviewVerdict *github.ReviewGateVerdict
+			if o.reviewGate() != "none" {
+				verdict, reviewErr := o.prReviewGateVerdict(pr.Number)
+				if reviewErr == nil {
+					currentReviewVerdict = &verdict
+				}
+			}
+
+			if o.cfg.AutoRetryReviewFeedback &&
+				(currentReviewVerdict == nil || currentReviewVerdict.Pending || !currentReviewVerdict.Passed) {
 				reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
 				if err != nil {
 					log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
@@ -4411,11 +4429,17 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue
 			}
 
-			reviewVerdict, err := o.prReviewGateVerdict(pr.Number)
-			if err != nil {
-				log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
-				persistGate()
-				continue // skip this cycle, try next
+			var reviewVerdict github.ReviewGateVerdict
+			if currentReviewVerdict != nil {
+				reviewVerdict = *currentReviewVerdict
+			} else {
+				var err error
+				reviewVerdict, err = o.prReviewGateVerdict(pr.Number)
+				if err != nil {
+					log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
+					persistGate()
+					continue // skip this cycle, try next
+				}
 			}
 			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
 				persistGate()
@@ -4484,6 +4508,27 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		for _, candidate := range ready {
 			o.mergeReadyPR(s, candidate.slotName, candidate.sess, candidate.pr)
 		}
+		return
+	}
+
+	// Sequential means one successful merge at a time, not "the oldest
+	// unmergeable PR blocks the fleet". Freshly preflight candidates and remove
+	// real conflicts before selecting the single merge slot. Conflict repair is
+	// handled against the existing session/worktree by the rebase/repair paths;
+	// skipping it here prevents a failed merge attempt from consuming this
+	// cycle's head-of-line position and lets a younger clean PR advance.
+	mergeableReady := ready[:0]
+	for _, candidate := range ready {
+		mergeable, mergeState, err := o.prMergeStatus(candidate.pr.Number)
+		if err == nil && mergeable == "CONFLICTING" {
+			log.Printf("[orch] sequential merge mode: PR #%d is %s/CONFLICTING — skipping merge slot and leaving canonical session %s for in-place conflict repair",
+				candidate.pr.Number, mergeState, candidate.slotName)
+			continue
+		}
+		mergeableReady = append(mergeableReady, candidate)
+	}
+	ready = mergeableReady
+	if len(ready) == 0 {
 		return
 	}
 
@@ -5229,21 +5274,10 @@ func (o *Orchestrator) reconcileGuardedRepairApprovals(s *state.State) {
 	if o == nil || o.cfg == nil || s == nil {
 		return
 	}
-	issues := make(map[int]struct{})
-	for _, claim := range s.ActiveIssueClaims() {
-		switch claim.Kind {
-		case state.IssueClaimRepairDispatch, state.IssueClaimReviewRepairDispatch:
-			issues[claim.IssueNumber] = struct{}{}
-		}
-	}
-	if len(issues) == 0 {
+	numbers := s.ActiveRepairDispatchApprovalIssues()
+	if len(numbers) == 0 {
 		return
 	}
-	numbers := make([]int, 0, len(issues))
-	for issue := range issues {
-		numbers = append(numbers, issue)
-	}
-	sort.Ints(numbers)
 	now := time.Now().UTC()
 	for _, issueNumber := range numbers {
 		issue, err := o.getIssue(issueNumber)
@@ -7046,6 +7080,32 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	if backend == "" {
 		backend = o.cfg.Model.Default
 	}
+	previousBackend := backend
+	// A current model:<backend> label is an explicit operator routing decision
+	// and outranks the backend recorded on the failed attempt. This matters for
+	// retained-worktree recovery: changing model:claude to model:sol must resume
+	// the same slot/worktree on Sol, not silently replay the stale Fable route.
+	// Without an explicit label, keep the already-selected session backend so an
+	// in-place recovery does not forget a successful fallover route (#911).
+	var explicitSelection *router.BackendDecision
+	if labelBackend := router.BackendFromLabels(issue); labelBackend != "" {
+		decision := o.resolveBackendDecision(issue)
+		if decision.Backend == labelBackend {
+			if _, exists := o.cfg.Model.Backends[labelBackend]; !exists {
+				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: explicit backend %s is not configured", issue.Number, slot, labelBackend)
+				return false
+			}
+			if blockedBy, retryAt := o.dispatchBackendBlock(s, labelBackend, decision.Model, time.Now().UTC()); blockedBy != "" {
+				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: explicit backend %s is blocked (%s%s)", issue.Number, slot, labelBackend, blockedBy, retryAfterHint(retryAt))
+				return false
+			}
+			if labelBackend != backend {
+				log.Printf("[orch] issue #%d repair recovery honors current model label: %s → %s on retained session %s", issue.Number, backend, labelBackend, slot)
+			}
+			backend = labelBackend
+			explicitSelection = &decision
+		}
+	}
 	promptBase := o.selectPrompt(issue)
 	var err error
 	if sess.PRNumber > 0 {
@@ -7060,6 +7120,12 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	if err != nil {
 		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)
 		return false
+	}
+	if explicitSelection != nil {
+		selection := o.policyBackendSelection(*explicitSelection)
+		selection.PreviousBackend = previousBackend
+		sess.BackendSelection = selection
+		sess.Backend = backend
 	}
 	sess.NextRetryAt = nil
 	o.resolveSpawnRepairApproval(s, dispatch.approvalID, slot, target.PR, "repair worker dispatched")

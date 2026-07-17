@@ -177,13 +177,46 @@ func (s *State) StaleActiveRepairDispatchApprovals(issueNumber int, now time.Tim
 	var staled []Approval
 	for i := range s.Approvals {
 		approval := &s.Approvals[i]
-		if !activeRepairDispatchApproval(approval) || approval.Target.Issue != issueNumber {
+		if !repairDispatchApprovalNeedsGuardReconcile(approval) || approval.Target.Issue != issueNumber {
 			continue
 		}
 		s.markApprovalStale(approval, now, reason)
 		staled = append(staled, *approval)
 	}
 	return staled
+}
+
+// ActiveRepairDispatchApprovalIssues returns every issue with a non-terminal
+// classic or review-repair approval. Pending is included: it cannot dispatch
+// yet, but it is still an operator-visible gate that must become stale when the
+// issue is blocked before approval.
+func (s *State) ActiveRepairDispatchApprovalIssues() []int {
+	if s == nil {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if repairDispatchApprovalNeedsGuardReconcile(approval) {
+			seen[approval.Target.Issue] = struct{}{}
+		}
+	}
+	issues := make([]int, 0, len(seen))
+	for issue := range seen {
+		issues = append(issues, issue)
+	}
+	sort.Ints(issues)
+	return issues
+}
+
+func repairDispatchApprovalNeedsGuardReconcile(approval *Approval) bool {
+	if approval == nil || approval.Target == nil || approval.Target.Issue <= 0 {
+		return false
+	}
+	if approval.Action != approvalActionSpawnRepairWorker && approval.Action != approvalActionSpawnReviewRepair {
+		return false
+	}
+	return approval.Status == ApprovalStatusPending || activeRepairDispatchApproval(approval)
 }
 
 func activeRepairDispatchApproval(approval *Approval) bool {

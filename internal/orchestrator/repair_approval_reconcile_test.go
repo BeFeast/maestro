@@ -175,11 +175,13 @@ func TestReconcileGuardedRepairApprovals_BlockedWithoutReadyLabel(t *testing.T) 
 	review := repairApproval("review-repair-331", 331, 335, state.ApprovalStatusApproved, now)
 	review.Action = supervisor.ActionSpawnReviewRepair
 	review.Target.Session = "ok-player-247"
-	s.Approvals = []state.Approval{classic, review}
+	pending := repairApproval("pending-repair-331", 331, 335, state.ApprovalStatusPending, now)
+	pending.Target.Session = "ok-player-247"
+	s.Approvals = []state.Approval{classic, review, pending}
 
 	o.reconcileGuardedRepairApprovals(s)
 
-	for _, id := range []string{"repair-331", "review-repair-331"} {
+	for _, id := range []string{"repair-331", "review-repair-331", "pending-repair-331"} {
 		if got := approvalStatus(t, s, id); got != state.ApprovalStatusStale {
 			t.Fatalf("approval %s = %q, want stale", id, got)
 		}

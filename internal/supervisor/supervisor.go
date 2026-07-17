@@ -631,6 +631,23 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
+			guardReason, guardErr := e.currentIssueRepairGuard(sess.IssueNumber)
+			if guardErr != nil {
+				guardReason = fmt.Sprintf("current issue dispatch guards could not be verified: %v", guardErr)
+			}
+			if guardReason != "" {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
+					"Repair dispatch is fail-closed against the issue's current forge state",
+					guardReason,
+				)
+				target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+				decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+					fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", sess.IssueNumber, guardReason),
+					RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+				decision.StuckStates = stuckStates
+				return decision, nil
+			}
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
 				"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
@@ -944,6 +961,29 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
+}
+
+// currentIssueRepairGuard re-reads the current open issue before the
+// supervisor recommends repair for an existing PR. PR/session state alone is
+// insufficient authority: an operator may have added blocked (or another
+// excluded label) after the worker/approval was created. A missing issue is
+// treated as closed and a read failure is returned so the caller can fail
+// closed without minting another approval.
+func (e *Engine) currentIssueRepairGuard(issueNumber int) (string, error) {
+	issues, err := e.reader.ListOpenIssues(nil)
+	if err != nil {
+		return "", err
+	}
+	for _, issue := range issues {
+		if issue.Number != issueNumber {
+			continue
+		}
+		if label, ok := firstMatchingIssueLabel(issue, e.dynamicWaveExcludedLabels()); ok {
+			return fmt.Sprintf("current issue label %q excludes repair dispatch", label), nil
+		}
+		return "", nil
+	}
+	return "issue is not currently open", nil
 }
 
 func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) {
@@ -2620,21 +2660,48 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		branchToPR[pr.HeadRefName] = pr
 		numberToPR[pr.Number] = pr
 	}
+	// Attention states must not sit behind an ordinary open PR merely because
+	// its slot sorts earlier. This is especially important when the earlier PR
+	// is intentionally blocked for QA: a later conflict_failed/retry_exhausted
+	// canonical PR still needs the project's one actionable recommendation.
+	// Keep the sort order as a deterministic tie-breaker within each rank.
+	bestRank := 2
+	var bestSlot string
+	var bestSession *state.Session
+	var bestPR github.PR
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
+		var pr github.PR
+		var found bool
 		if sess.Branch != "" {
-			if pr, ok := branchToPR[sess.Branch]; ok {
-				return slot, sess, pr, true
-			}
+			pr, found = branchToPR[sess.Branch]
 		}
-		if sess.PRNumber > 0 {
-			if pr, ok := numberToPR[sess.PRNumber]; ok {
-				return slot, sess, pr, true
-			}
+		if !found && sess.PRNumber > 0 {
+			pr, found = numberToPR[sess.PRNumber]
 		}
+		if !found {
+			continue
+		}
+		rank := 1
+		switch sess.Status {
+		case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed, state.StatusDead:
+			rank = 0
+		}
+		if bestSession == nil || rank < bestRank {
+			bestRank = rank
+			bestSlot, bestSession, bestPR = slot, sess, pr
+		}
+		if bestRank == 0 {
+			// sortedSessionNames already provides the deterministic tie-break;
+			// no later candidate can outrank an attention state.
+			break
+		}
+	}
+	if bestSession != nil {
+		return bestSlot, bestSession, bestPR, true
 	}
 	return "", nil, github.PR{}, false
 }
@@ -2659,14 +2726,16 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	if availableSlots(e.cfg, st) <= 0 {
 		return false
 	}
-	// #556: a retry-exhausted session has spent its retry budget — spawning
-	// another repair worker would not be effective, and the executor refuses
-	// `spawn_repair_worker` because the verb is not in the action registry.
-	// Falling through here lets the deterministic path land on
-	// monitor_open_pr (or merge_pr when the feedback was addressed and the
-	// PR is now green) instead of looping on the refused verb each cycle.
-	if sess.Status == state.StatusRetryExhausted {
-		return false
+	// A retry-exhausted session may still need an explicitly approved in-place
+	// repair (for example, a real rebase conflict on its canonical open PR).
+	// spawn_repair_worker is now a registered awaiting-dispatch action, so the
+	// cautious gate can safely authorize that recovery without creating a new
+	// slot, worktree, or PR.
+	if mergeReader, ok := e.reader.(prMergeableReader); ok {
+		if mergeable, err := mergeReader.PRMergeable(pr.Number); err == nil &&
+			strings.EqualFold(strings.TrimSpace(mergeable), "CONFLICTING") {
+			return true
+		}
 	}
 	if pr.IsDraft {
 		return true
@@ -2681,7 +2750,7 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			}
 		}
 		switch stuck.Code {
-		case "failing_checks", "greptile_not_approved":
+		case "failing_checks", "greptile_not_approved", "unmergeable_pr":
 			return true
 		case "stale_review_feedback":
 			// Review feedback from a PREVIOUS attempt does not mean the
