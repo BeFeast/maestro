@@ -337,6 +337,10 @@ type sessionInfo struct {
 	TokensUsedTotal    int    `json:"tokens_used_total"`
 	TokenBudgetMeasure string `json:"token_budget_measure,omitempty"`
 	WorkerOutcome      string `json:"worker_outcome,omitempty"`
+	// ReleasedForRedispatch means a terminal session no longer owns the issue.
+	// Fleet duplicate projection must preserve this bit so an older completed
+	// PR cannot hide a genuine follow-up after the issue is reopened (#949).
+	ReleasedForRedispatch bool `json:"released_for_redispatch,omitempty"`
 	// #739: cache-aware split token breakdown when the backend stamped it
 	// (claude stream-json / Pi). Surfaced so the cost panel can show the
 	// cache-read discount; zero for backends that report only a combined total.
@@ -416,34 +420,35 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	}
 	now := time.Now().UTC()
 	info := sessionInfo{
-		Slot:               slot,
-		IssueNumber:        sess.IssueNumber,
-		IssueTitle:         sess.IssueTitle,
-		IssueURL:           githubIssueURL(repo, sess.IssueNumber),
-		Status:             string(sess.Status),
-		Backend:            sess.Backend,
-		Model:              currentSessionModel(sess),
-		PRNumber:           sess.PRNumber,
-		PRURL:              githubPRURL(repo, sess.PRNumber),
-		TokensUsedAttempt:  sess.TokensUsedAttempt,
-		TokensUsedTotal:    sess.TokensUsedTotal,
-		TokenBudgetMeasure: tokenBudgetMeasure,
-		WorkerOutcome:      sess.WorkerOutcome,
-		TokensInput:        sess.TokensInput,
-		TokensOutput:       sess.TokensOutput,
-		TokensCacheRead:    sess.TokensCacheRead,
-		TokensCacheWrite:   sess.TokensCacheWrite,
-		CostUSDBackend:     sess.CostUSDBackend,
-		StartedAt:          sess.StartedAt.Format(time.RFC3339),
-		Worktree:           sess.Worktree,
-		Branch:             sess.Branch,
-		TmuxSession:        watchSessionName(slot, sess),
-		HasLog:             strings.TrimSpace(sess.LogFile) != "",
-		RetryCount:         sess.RetryCount,
-		LastNotification:   sess.LastNotifiedStatus,
-		BackendSelection:   sess.BackendSelection,
-		Attribution:        sess.Attribution,
-		Live:               state.SessionLiveAt(sess, now),
+		Slot:                  slot,
+		IssueNumber:           sess.IssueNumber,
+		IssueTitle:            sess.IssueTitle,
+		IssueURL:              githubIssueURL(repo, sess.IssueNumber),
+		Status:                string(sess.Status),
+		Backend:               sess.Backend,
+		Model:                 currentSessionModel(sess),
+		PRNumber:              sess.PRNumber,
+		PRURL:                 githubPRURL(repo, sess.PRNumber),
+		TokensUsedAttempt:     sess.TokensUsedAttempt,
+		TokensUsedTotal:       sess.TokensUsedTotal,
+		TokenBudgetMeasure:    tokenBudgetMeasure,
+		WorkerOutcome:         sess.WorkerOutcome,
+		ReleasedForRedispatch: sess.ReleasedForRedispatch,
+		TokensInput:           sess.TokensInput,
+		TokensOutput:          sess.TokensOutput,
+		TokensCacheRead:       sess.TokensCacheRead,
+		TokensCacheWrite:      sess.TokensCacheWrite,
+		CostUSDBackend:        sess.CostUSDBackend,
+		StartedAt:             sess.StartedAt.Format(time.RFC3339),
+		Worktree:              sess.Worktree,
+		Branch:                sess.Branch,
+		TmuxSession:           watchSessionName(slot, sess),
+		HasLog:                strings.TrimSpace(sess.LogFile) != "",
+		RetryCount:            sess.RetryCount,
+		LastNotification:      sess.LastNotifiedStatus,
+		BackendSelection:      sess.BackendSelection,
+		Attribution:           sess.Attribution,
+		Live:                  state.SessionLiveAt(sess, now),
 	}
 
 	// Calculate runtime breakdown (#426). The workflow runtime is the

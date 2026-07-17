@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +17,22 @@ import (
 	"github.com/befeast/maestro/internal/supervisor"
 )
 
+func authorizeCurrentFailedRepairGate(o *Orchestrator, pr int) {
+	head := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	o.ghPRHeadSHAFn = func(got int) (string, error) {
+		if got != pr {
+			return "", fmt.Errorf("unexpected PR #%d", got)
+		}
+		return head, nil
+	}
+	o.ghPRCheckRollupFn = func(got int) (github.PRCheckRollup, error) {
+		if got != pr {
+			return github.PRCheckRollup{}, fmt.Errorf("unexpected PR #%d", got)
+		}
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "failure", Complete: true}, nil
+	}
+}
+
 // TestAwaitingRepairDispatchReservesAndRespawnsOriginalSession is the #892
 // incident regression: PR #7 is retained on txc-1, its approved repair is
 // awaiting dispatch, and the ready issue is visible to the normal poll. The
@@ -27,6 +44,7 @@ func TestAwaitingRepairDispatchReservesAndRespawnsOriginalSession(t *testing.T) 
 	cfg.StateDir = t.TempDir()
 	issues := []github.Issue{makeIssue(1, "repair PR #7", "maestro-ready")}
 	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 7)
 	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 1, nil }
 	respawns := 0
 	o.respawnInPlaceFn = func(cfg *config.Config, slot string, sess *state.Session, repo string, issue github.Issue, prompt, backend string) error {
@@ -192,6 +210,7 @@ func TestAwaitingRepairDispatchValidReservationOutranksInvalidSiblingApproval(t 
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(877, "repair PR #891", "maestro-ready")}
 	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 891)
 	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 877, nil }
 	respawns := 0
 	o.respawnInPlaceFn = func(_ *config.Config, slot string, sess *state.Session, _ string, _ github.Issue, _, _ string) error {
@@ -234,6 +253,7 @@ func TestAwaitingRepairDispatchValidReservationOutranksMultipleInvalidSiblingApp
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(877, "repair PR #891", "maestro-ready")}
 	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 891)
 	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 877, nil }
 	respawns := 0
 	o.respawnInPlaceFn = func(_ *config.Config, slot string, sess *state.Session, _ string, _ github.Issue, _, _ string) error {
@@ -278,6 +298,7 @@ func TestAwaitingRepairDispatchRechecksSessionRevealedByStaleSiblingApproval(t *
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(877, "repair PR #891", "maestro-ready")}
 	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 891)
 	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 877, nil }
 	respawns := 0
 	o.respawnInPlaceFn = func(_ *config.Config, _ string, _ *state.Session, _ string, _ github.Issue, _, _ string) error {
