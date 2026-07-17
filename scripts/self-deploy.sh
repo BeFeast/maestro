@@ -15,6 +15,12 @@
 #      failing the whole build (merges silently never shipped). The version is
 #      stamped via -ldflags, so VCS stamping is redundant here anyway,
 #   2. install atomically, keeping the previous binary as <bin>.prev,
+#   2c. apply any required systemd unit change (#877): for each configured unit
+#      whose repo copy differs from the live installed file (FragmentPath), back
+#      the installed file up as <path>.prev, install the repo copy, and
+#      daemon-reload so the restart adopts it. A fix such as KillMode=mixed lives
+#      in the unit file, not the binary, so a binary-only deploy would restart
+#      under the OLD unit and never ship it. Rollback restores every unit touched,
 #   3. restart the maestro units — the units' normal stop path runs, so
 #      existing drain semantics are honored,
 #   4. verify post-restart health: installed CLI reports the stamped version,
@@ -111,6 +117,12 @@ SHA=""
 STAMP=""
 PREV_VERSION=""
 GATE_FAIL_DETAIL=""
+# #877: installed unit paths this deploy changed. Each carries either a
+# <path>.prev backup (unit existed before — rollback restores it) or a
+# <path>.prev.absent marker (unit newly installed this deploy — rollback removes
+# it), so rollback can never leave a new unit paired with the rolled-back binary.
+# Empty unless a required unit change (e.g. KillMode) actually shipped.
+APPLIED_UNITS=()
 
 IFS=',' read -r -a UNIT_LIST <<<"$UNITS"
 
@@ -202,6 +214,107 @@ units_active() {
   done
 }
 
+# daemon_reload reloads the systemd manager so a freshly installed unit file
+# takes effect, scoped per --scope (system manager needs sudo -n).
+daemon_reload() {
+  if [[ "$SCOPE" == "system" ]]; then
+    sudo -n systemctl daemon-reload
+  else
+    systemctl --user daemon-reload
+  fi
+}
+
+# installed_unit_path prints the live FragmentPath systemd loaded a unit from
+# (the authoritative install destination), or empty when the unit is unknown.
+# Read-only, so it needs no privilege even for system units.
+installed_unit_path() {
+  local unit=$1
+  if [[ "$SCOPE" == "system" ]]; then
+    systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true
+  else
+    systemctl --user show -p FragmentPath --value "$unit" 2>/dev/null || true
+  fi
+}
+
+# apply_units ships any required systemd unit change alongside the binary (#877).
+# A fix such as KillMode=mixed lives in the repo's unit file, not the binary, so a
+# binary-only deploy would restart under the OLD unit and the fix would never go
+# live (P1 #877 review). For each configured unit whose repo copy (built from the
+# deployed SHA) differs from the live installed file, back the installed file up
+# as <path>.prev, install the repo copy, and remember it in APPLIED_UNITS. A
+# single daemon-reload afterward makes the subsequent restart pick up every
+# change. rollback() restores exactly these files. Units with no repo copy (an
+# operator-managed sibling unit) are left untouched.
+apply_units() {
+  local unit src dest reloaded=0
+  for unit in "${UNIT_LIST[@]}"; do
+    src="$BUILD_DIR/$unit"
+    [[ -f "$src" ]] || continue
+    dest=$(installed_unit_path "$unit")
+    if [[ -z "$dest" ]]; then
+      log "no installed FragmentPath for $unit — skipping unit apply (restart uses the live unit)"
+      continue
+    fi
+    if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+      continue
+    fi
+    log "unit change detected for $unit — installing repo copy over $dest"
+    if [[ -f "$dest" ]]; then
+      priv cp -p "$dest" "$dest.prev" || fail "backing up unit $dest failed"
+      # Clear any stale absent-marker so rollback restores this .prev, not "remove".
+      priv rm -f "$dest.prev.absent" 2>/dev/null || true
+    else
+      # The unit did not exist before this deploy: there is no .prev to restore,
+      # so record an absent-marker instead. Without it, rollback_units would skip
+      # this path (no .prev) and leave the new unit in place while the binary
+      # rolled back — shipping a unit and binary from different revisions (#877
+      # review). The marker tells rollback to REMOVE the newly-installed unit.
+      priv rm -f "$dest.prev" 2>/dev/null || true
+      priv touch "$dest.prev.absent" || fail "recording new-unit marker for $dest failed"
+    fi
+    priv install -m 0644 "$src" "$dest" || fail "installing unit $unit to $dest failed"
+    APPLIED_UNITS+=("$dest")
+  done
+  if (( ${#APPLIED_UNITS[@]} )); then
+    daemon_reload || fail "systemd daemon-reload failed after unit change"
+    log "applied ${#APPLIED_UNITS[@]} unit change(s) and reloaded the systemd manager"
+  fi
+}
+
+# rollback_units reverts every unit file apply_units changed, then daemon-reloads
+# so the reverted units are live before the rollback restart runs. A unit that
+# EXISTED before this deploy is restored from its <path>.prev backup; a unit that
+# was newly INSTALLED this deploy (no prior file, marked with <path>.prev.absent)
+# is REMOVED, so rollback can never leave a new unit paired with the rolled-back
+# (previous-revision) binary (#877 review). Best-effort: a failed revert is
+# logged, not fatal, so binary rollback still proceeds.
+rollback_units() {
+  (( ${#APPLIED_UNITS[@]} )) || return 0
+  local dest restored=0
+  for dest in "${APPLIED_UNITS[@]}"; do
+    if [[ -f "$dest.prev" ]]; then
+      log "rolling back unit $dest to $dest.prev"
+      if priv cp -p "$dest.prev" "$dest.rollback.$$" && priv mv -f "$dest.rollback.$$" "$dest"; then
+        restored=1
+      else
+        priv rm -f "$dest.rollback.$$" 2>/dev/null || true
+        log "unit rollback of $dest failed"
+      fi
+    elif [[ -f "$dest.prev.absent" ]]; then
+      log "rolling back unit $dest — removing newly-installed unit (no prior file)"
+      if priv rm -f "$dest"; then
+        priv rm -f "$dest.prev.absent" 2>/dev/null || true
+        restored=1
+      else
+        log "unit rollback of $dest failed (could not remove new unit)"
+      fi
+    fi
+  done
+  if (( restored )); then
+    daemon_reload || log "daemon-reload after unit rollback failed"
+  fi
+}
+
 health_ok() {
   # Running-process check: the API must answer and report a version built from
   # the deployed commit. Match on the commit SHA (embedded in the stamp as
@@ -276,6 +389,10 @@ smoke_gate() {
 
 rollback() {
   local reason=$1
+  # Restore any unit files this deploy shipped BEFORE restarting, so the
+  # rollback restart brings the units back on their previous definition too
+  # (#877). No-op unless apply_units actually changed a unit.
+  rollback_units
   if [[ ! -f "$BIN.prev" ]]; then
     write_result failed "$reason; no $BIN.prev to roll back to"
     return
@@ -409,6 +526,12 @@ if (( HAVE_PREV )); then
 else
   log "installed $BIN (first deploy — no previous binary to keep)"
 fi
+
+# --- 2c. apply any required systemd unit change + daemon-reload (#877) -------
+# Must run BEFORE the restart so the restart adopts the new unit definition (a
+# fix like KillMode=mixed lives in the unit file, not the binary). fail() ->
+# rollback() restores every unit this step overwrote, exactly like the binary.
+apply_units
 
 # --- 3. restart units (drain semantics via the units' own stop path) --------
 RESTART_BUDGET=$((DEADLINE - $(date +%s)))

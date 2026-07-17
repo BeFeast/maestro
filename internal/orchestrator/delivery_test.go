@@ -395,6 +395,19 @@ func TestEnqueueDeliveryApproval_ConcurrentFreshMintConvergesOnOneLedgerRow(t *t
 	cfg := persistentDeliveryTestConfig(root)
 	dbPath := filepath.Join(root, "maestro.db")
 
+	// Warm the approvals DB once (schema + WAL journal-mode) before the
+	// concurrent mint. In production the daemon opens the approvals store at
+	// startup, long before any concurrent mint, so two goroutines never race on
+	// the one-time cold-start WAL conversion of a brand-new file — a race that
+	// surfaces as SQLITE_BUSY at open and is unrelated to the behavior under test
+	// (claim convergence on a single ledger row). Mirror that here so the test
+	// exercises concurrency of the mint, not of first-open.
+	if warm, err := approvalstore.Open(dbPath); err != nil {
+		t.Fatalf("warm approvals db: %v", err)
+	} else {
+		warm.Close()
+	}
+
 	start := make(chan struct{})
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
