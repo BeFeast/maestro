@@ -4048,6 +4048,13 @@ func TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly(t *testing.T) {
 			Project:           "maestro",
 			RecommendedAction: "monitor_open_pr",
 			Risk:              "safe",
+			StuckStates: []state.SupervisorStuckState{
+				{
+					Code:     "retry_exhausted_open_pr",
+					Target:   &state.SupervisorTarget{Issue: 442, PR: 564},
+					Evidence: []string{"Session sup-stuck status=retry_exhausted pr=564 checks=success"},
+				},
+			},
 		},
 	})
 
@@ -4124,8 +4131,7 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 			PRNumber:           600,
 			StartedAt:          finishedRecent.Add(-time.Hour),
 			FinishedAt:         &finishedRecent,
-			LastNotifiedStatus: "ci_failure",
-			CIFailureOutput:    "FAIL: pkg/foo TestBar",
+			LastNotifiedStatus: "review_retry_exhausted",
 		},
 	}, []state.SupervisorDecision{
 		{
@@ -4134,6 +4140,17 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 			Project:           "maestro",
 			RecommendedAction: "monitor_open_pr",
 			Risk:              "safe",
+			StuckStates: []state.SupervisorStuckState{
+				{
+					Code:     "retry_exhausted_open_pr",
+					Target:   &state.SupervisorTarget{Issue: 443, PR: 600},
+					Evidence: []string{"Session sup-failing status=retry_exhausted pr=600 checks=failure"},
+				},
+				{
+					Code:   "failing_checks",
+					Target: &state.SupervisorTarget{Issue: 443, PR: 600},
+				},
+			},
 		},
 	})
 
