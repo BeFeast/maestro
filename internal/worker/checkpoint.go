@@ -116,9 +116,6 @@ func UniqueBranchCommits(localPath, canonicalBranch, siblingBranch string) ([]st
 		return nil, fmt.Errorf("compare canonical branch %q with preserved sibling %q: %w: %s", canonicalBranch, siblingBranch, err, strings.TrimSpace(string(out)))
 	}
 	commits := strings.Fields(string(out))
-	if len(commits) > 20 {
-		commits = commits[:20]
-	}
 	return commits, nil
 }
 

@@ -96,6 +96,35 @@ func TestUniqueBranchCommitsReturnsOnlySiblingPatch(t *testing.T) {
 	}
 }
 
+func TestUniqueBranchCommitsDoesNotTruncatePreservedHistory(t *testing.T) {
+	repo := newBranchTestRepo(t)
+	runBranchGit(t, repo, "branch", "canonical")
+	runBranchGit(t, repo, "switch", "-c", "duplicate")
+	wants := make(map[string]bool)
+	for i := 0; i < 25; i++ {
+		path := filepath.Join(repo, "preserved.txt")
+		if err := os.WriteFile(path, []byte(strings.Repeat("preserved\n", i+1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runBranchGit(t, repo, "add", "preserved.txt")
+		runBranchGit(t, repo, "commit", "-m", "preserved repair")
+		wants[strings.TrimSpace(runBranchGit(t, repo, "rev-parse", "HEAD"))] = true
+	}
+
+	got, err := UniqueBranchCommits(repo, "canonical", "duplicate")
+	if err != nil {
+		t.Fatalf("UniqueBranchCommits: %v", err)
+	}
+	if len(got) != len(wants) {
+		t.Fatalf("unique commits = %d, want all %d preserved commits", len(got), len(wants))
+	}
+	for _, commit := range got {
+		if !wants[commit] {
+			t.Fatalf("unexpected unique commit %s", commit)
+		}
+	}
+}
+
 func newBranchTestRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()
