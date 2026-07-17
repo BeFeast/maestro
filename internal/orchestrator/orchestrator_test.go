@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -5066,6 +5067,76 @@ func TestStartNewWorkers_SupervisorRepairSpawnRepairsReservedSessionInPlace(t *t
 	}
 	if len(s.Sessions) != 1 || s.Sessions["pan-12"].Status != state.StatusRunning {
 		t.Fatalf("sessions = %+v, want only pan-12 running", s.Sessions)
+	}
+}
+
+func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.WorktreeBase = t.TempDir()
+	restoredWorktree := filepath.Join(cfg.WorktreeBase, "sup-360")
+	if err := os.MkdirAll(restoredWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir restored worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(restoredWorktree, ".git"), []byte("gitdir: test\n"), 0o644); err != nil {
+		t.Fatalf("write restored worktree metadata: %v", err)
+	}
+	issues := []github.Issue{makeIssue(887, "finish watchdog recovery")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 887, nil
+	}
+	respawned := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		respawned = slotName
+		sess.Status = state.StatusRunning
+		sess.PID = 5555
+		return nil
+	}
+
+	oldFinished := time.Date(2026, 7, 14, 18, 59, 0, 0, time.UTC)
+	newStarted := oldFinished.Add(24 * time.Hour)
+	s := state.NewState()
+	s.Sessions["sup-318"] = &state.Session{
+		IssueNumber: 887,
+		Status:      state.StatusDone,
+		PRNumber:    893,
+		StartedAt:   oldFinished.Add(-time.Hour),
+		FinishedAt:  &oldFinished,
+	}
+	s.Sessions["sup-360"] = &state.Session{
+		IssueNumber: 887,
+		IssueTitle:  "finish watchdog recovery",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    914,
+		Branch:      "feat/sup-360-887-watchdog-recovery",
+		Backend:     "codex",
+		StartedAt:   newStarted,
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair-newer-pr",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 887, PR: 914, Session: "sup-360"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want exact in-place repair", *started)
+	}
+	if respawned != "sup-360" {
+		t.Fatalf("respawned = %q, want sup-360", respawned)
+	}
+	if got := s.Sessions["sup-318"].Status; got != state.StatusDone {
+		t.Fatalf("older terminal session status = %q, want done", got)
+	}
+	if got := s.Sessions["sup-360"].Worktree; got != restoredWorktree {
+		t.Fatalf("restored worktree = %q, want %q", got, restoredWorktree)
+	}
+	if len(s.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want no new session", len(s.Sessions))
 	}
 }
 
