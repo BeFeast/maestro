@@ -3996,6 +3996,26 @@ func TestFleetSupersedingIssueSessionUsesCanonicalOpenPR(t *testing.T) {
 	}
 }
 
+func TestFleetSupersedingIssueSessionUsesRetryExhaustedCanonicalOpenPR(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot:           "ok-player-294",
+		IssueNumber:    346,
+		Status:         string(state.StatusRetryExhausted),
+		NeedsAttention: true,
+	}
+	canonical := sessionInfo{
+		Slot:           "ok-player-277",
+		IssueNumber:    346,
+		Status:         string(state.StatusRetryExhausted),
+		PRNumber:       397,
+		NeedsAttention: true,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding retry-exhausted PR session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+}
+
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
 // regression. A retry_exhausted session whose linked PR is still open and
 // whose last notification is NOT a CI failure is convergence-bound: the

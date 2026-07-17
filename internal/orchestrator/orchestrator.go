@@ -4311,6 +4311,22 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if !found {
 			if sess.Status == state.StatusRetryExhausted {
 				if sess.PRNumber == 0 {
+					// A no-PR terminal sibling is not an issue-level blocker when
+					// another open PR already owns the issue. In particular, it must
+					// not apply the blocked label behind the canonical PR's back.
+					// Preserve the sibling for commit handoff and let the canonical
+					// PR maintenance path converge in place.
+					canonicalOpen := false
+					for _, openPR := range prs {
+						if github.PRReferencesIssue(openPR, sess.IssueNumber) {
+							canonicalOpen = true
+							break
+						}
+					}
+					if canonicalOpen {
+						log.Printf("[orch] no-PR retry_exhausted session %s for issue #%d is superseded by an open canonical PR — preserving sibling work without blocking the issue", slotName, sess.IssueNumber)
+						continue
+					}
 					// #577: worker exhausted retries without ever producing a PR
 					// (e.g. the issue was already implemented by a prior merge via
 					// `Refs #N`, so the worker found zero diff). Without action the
@@ -4400,13 +4416,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		// #424: the aggregate PRCIStatus can stick at "pending" long after
 		// every required check has gone green (a common cause is a legacy
 		// commit-status used by some review bots that never resolves).
-		// GitHub's own per-PR mergeable_state already encodes the
-		// required-check verdict, so "clean" or "unstable" overrides the
-		// stale aggregate and lets autoMergePRs converge instead of looping.
+		// GitHub's own per-PR mergeable_state encodes the required-check
+		// verdict. Only "clean" may override the stale aggregate. "unstable"
+		// can coexist with explicitly failed check runs (live #397), so treating
+		// it as success can merge known-red work.
 		if ciStatus == "pending" {
 			if mergeable, mergeState, mErr := o.prMergeStatus(pr.Number); mErr == nil && mergeable == "MERGEABLE" {
 				switch mergeState {
-				case "clean", "unstable":
+				case "clean":
 					log.Printf("[orch] PR #%d (%s) aggregate CI=pending but mergeable_state=%s — treating as success (#424)", pr.Number, sess.Branch, mergeState)
 					ciStatus = "success"
 				}
@@ -4653,7 +4670,7 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 				continue
 			}
 			allSlots = append(allSlots, slotName)
-			if repairIssueSessionActive(sess.Status) {
+			if repairIssueSessionActive(sess.Status) || (sess.PRNumber == canonical.Number && sess.Status == state.StatusRetryExhausted) {
 				activeOther = slotName
 			}
 			if (sess.Status == state.StatusDone || sess.Status == state.StatusFailed) &&

@@ -2764,9 +2764,9 @@ func TestAutoMergePRs_CIPendingAndMergeStateBlocked_DoesNotMerge(t *testing.T) {
 	}
 }
 
-// mergeable_state="unstable" — only non-required checks are failing, so
-// the PR is still safe to merge under the same #424 override.
-func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
+// mergeable_state="unstable" can coexist with failed check runs. It is not
+// authoritative green evidence and must never override the check rollup.
+func TestAutoMergePRs_CIPendingMergeStateUnstable_DoesNotMerge(t *testing.T) {
 	prs := []github.PR{{Number: 102, HeadRefName: "feat/unstable"}}
 
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
@@ -2798,8 +2798,8 @@ func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	if len(merged) != 1 || merged[0] != 102 {
-		t.Fatalf("merged = %v, want [102] (mergeable_state=unstable should still allow merge)", merged)
+	if len(merged) != 0 {
+		t.Fatalf("merged = %v, want [] (mergeable_state=unstable must not override pending/failed checks)", merged)
 	}
 }
 
@@ -10037,6 +10037,51 @@ func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 	o.autoMergePRs(s)
 	if len(addedLabels) != 0 {
 		t.Fatalf("second cycle re-applied labels = %v, want none (idempotency)", addedLabels)
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedSiblingDoesNotBlockCanonicalOpenPR(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		ReviewGate: "none",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	addedLabels := make(map[int]string)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 397, HeadRefName: "canonical", Title: "Fedora fix for #346"}}, nil
+		},
+		ghPRCIStatusFn: func(int) (string, error) { return "pending", nil },
+		ghPRMergeStatusFn: func(int) (string, string, error) {
+			return "MERGEABLE", "blocked", nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			addedLabels[number] = label
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["canonical-slot"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    397,
+		Branch:      "canonical",
+	}
+	s.Sessions["preserved-sibling"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusRetryExhausted,
+		Branch:      "preserved-sibling",
+	}
+
+	o.autoMergePRs(s)
+
+	if len(addedLabels) != 0 {
+		t.Fatalf("terminal sibling applied labels behind canonical PR: %v", addedLabels)
+	}
+	if got := s.Sessions["preserved-sibling"].LastNotifiedStatus; got == noPRReconciledStatus {
+		t.Fatalf("terminal sibling was falsely reconciled as a blocking no-PR outcome")
 	}
 }
 

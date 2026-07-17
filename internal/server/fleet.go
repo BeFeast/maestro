@@ -4122,6 +4122,13 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 		switch state.SessionStatus(peer.Status) {
 		case state.StatusPROpen, state.StatusCodeLanded:
 			return peer, true
+		case state.StatusRetryExhausted:
+			// A retry-exhausted canonical session still owns its open PR and
+			// remains the only valid repair identity. A no-PR terminal sibling
+			// must not dominate operator_state or ask the operator to restart it.
+			if peer.PRNumber > 0 {
+				return peer, true
+			}
 		case state.StatusDone:
 			// A terminal peer is authoritative only when it owns the issue's
 			// delivered PR and this attempt was explicitly reconciled as a
