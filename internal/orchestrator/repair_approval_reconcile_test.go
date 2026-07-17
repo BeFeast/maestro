@@ -77,6 +77,44 @@ func TestAwaitingRepairDispatchReservesAndRespawnsOriginalSession(t *testing.T) 
 	}
 }
 
+// A newer dynamic-wave candidate must not head-of-line block an exact-session
+// repair that was already approved and moved to awaiting_dispatch. Fresh issue
+// selection remains single-candidate; the repair is maintenance of an existing
+// identity and survives the owned-ready filter.
+func TestOwnedReadyFilterKeepsAwaitingExactSessionRepair(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	dynamicWaveEnabled := true
+	cfg.Supervisor.DynamicWave.Enabled = &dynamicWaveEnabled
+	cfg.Supervisor.DynamicWave.OwnsReadyLabel = true
+	o, _, _ := newStartWorkersOrchestrator(cfg, nil)
+
+	now := time.Date(2026, 7, 17, 19, 0, 0, 0, time.UTC)
+	s := state.NewState()
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "fresh-392",
+		CreatedAt:         now,
+		PolicyRule:        supervisor.PolicyRuleDynamicWave,
+		RecommendedAction: supervisor.ActionSpawnWorker,
+		Target:            &state.SupervisorTarget{Issue: 392},
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			SelectedCandidate: &state.SupervisorIssueCandidate{Number: 392},
+		},
+	}, state.DefaultSupervisorDecisionLimit)
+	repair := repairApproval("repair-390", 390, 0, state.ApprovalStatusAwaitingDispatch, now.Add(-time.Minute))
+	repair.Target.Session = "ok-player-287"
+	s.Approvals = append(s.Approvals, repair)
+
+	issues := []github.Issue{
+		makeIssue(390, "recover canonical worker", "ok-player-ready"),
+		makeIssue(391, "unselected fresh work", "ok-player-ready"),
+		makeIssue(392, "selected P0", "ok-player-ready"),
+	}
+	got := o.applySupervisorOwnedReadyFilter(s, issues)
+	if len(got) != 2 || got[0].Number != 390 || got[1].Number != 392 {
+		t.Fatalf("filtered issues = %+v, want exact repair #390 plus selected #392", got)
+	}
+}
+
 // A competing same-issue worker is preserved and blocks the approved repair.
 // The dispatcher must not kill/remove either worktree and must leave the
 // approval active for explicit reconciliation.
