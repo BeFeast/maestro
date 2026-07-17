@@ -1027,6 +1027,7 @@ function WorkerSpendSection({ worker, fleet }) {
   if (!worker) return null;
   const tokens = Number(worker.tokens_used_total || 0);
   const attemptTokens = Number(worker.tokens_used_attempt || 0);
+  const maxTokens = Number(worker.worker_max_tokens || 0);
   const usd = Number(worker.cost_usd_estimate || 0);
   // Find the issue-level rollup so retries are visible on the drawer.
   const projectName = worker.project_name || worker.project || "";
@@ -1037,7 +1038,7 @@ function WorkerSpendSection({ worker, fleet }) {
   const issueRow = (project?.costObservability?.perIssue || []).find(
     e => Number(e.issueNumber) === Number(issueNum),
   );
-  if (tokens <= 0 && !(issueRow && issueRow.tokens > 0)) return null;
+  if (tokens <= 0 && maxTokens <= 0 && !(issueRow && issueRow.tokens > 0)) return null;
   return (
     <div className="drawer-sec">
       <div className="drawer-sec-title">Spend</div>
@@ -1053,6 +1054,14 @@ function WorkerSpendSection({ worker, fleet }) {
           )}
         </strong>
       </div>
+      {maxTokens > 0 && (
+        <div className="kv">
+          <span>Configured budget</span>
+          <strong className="mono">
+            {formatTokens(attemptTokens)} / {formatTokens(maxTokens)} tok
+          </strong>
+        </div>
+      )}
       {issueRow && (
         <div className="kv">
           <span>Issue #{issueRow.issueNumber} (all attempts)</span>

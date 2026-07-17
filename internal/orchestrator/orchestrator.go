@@ -963,24 +963,49 @@ func (o *Orchestrator) backendUsageLimitPatterns(backend string) []string {
 	return def.UsageLimitPatterns
 }
 
-// classifyBackendFailure inspects a dead worker's log for any hard backend
-// failure that must not burn the per-issue retry budget. It returns the gating
-// reason (state.BackendBlockAuthFailure, state.BackendBlockModelUnavailable,
-// or state.BackendBlockUsageLimit) and the matched signature label. Auth is
-// checked first: a 401 and a model 404 can co-occur in a noisy log, and a
-// credential outage is the more common recovery path (re-login / cred-sync)
-// than a config change. hit=false leaves the death to the ordinary retry path.
-func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time) (hit bool, reason string, pattern string) {
+// classifyBackendFailure inspects a dead worker's terminal output for hard
+// backend failures that must not burn the issue retry budget. A structured
+// CLIProxyAPI model_cooldown is checked first because it is explicitly scoped
+// to one provider/model route and carries the credential-rotation aggregate.
+func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time) (backendFailure, bool) {
+	if sess != nil {
+		result, ok := worker.IsCredentialRotationUnavailable(sess.LogFile, now)
+		if ok && (result.Structured || (!sess.StartedAt.IsZero() && now.Sub(sess.StartedAt) <= backendAuthFailureWindow)) {
+			pattern := result.AggregateReason
+			if pattern == "" {
+				pattern = state.BackendBlockModelCooldown
+			}
+			return backendFailure{
+				reason:                    state.BackendBlockModelCooldown,
+				pattern:                   pattern,
+				provider:                  result.Provider,
+				model:                     result.Model,
+				credentialCandidates:      result.Candidates,
+				credentialCandidatesKnown: result.CandidatesKnown,
+				credentialUsable:          result.Usable,
+				credentialUsableKnown:     result.UsableKnown,
+				aggregateReason:           result.AggregateReason,
+				retryAfter:                result.RetryAfter,
+				modelScoped:               true,
+			}, true
+		}
+	}
 	if ok, label := o.backendAuthFailureFromLog(sess, now); ok {
-		return true, state.BackendBlockAuthFailure, label
+		return backendFailure{reason: state.BackendBlockAuthFailure, pattern: label}, true
 	}
 	if ok, label := o.backendModelUnavailableFromLog(sess, now); ok {
-		return true, state.BackendBlockModelUnavailable, label
+		_, model := o.providerModelRouteForSession(sess, "", "")
+		return backendFailure{
+			reason:      state.BackendBlockModelUnavailable,
+			pattern:     label,
+			model:       model,
+			modelScoped: model != "",
+		}, true
 	}
 	if ok, label := o.backendUsageLimitFromLog(sess, now); ok {
-		return true, state.BackendBlockUsageLimit, label
+		return backendFailure{reason: state.BackendBlockUsageLimit, pattern: label}, true
 	}
-	return false, "", ""
+	return backendFailure{}, false
 }
 
 func (o *Orchestrator) workerLogFile(slotName string, sess *state.Session) string {
@@ -1036,6 +1061,39 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	sess.TokensUsedTotal += delta
 	log.Printf("[orch] %s tokens_used updated: attempt=%d total=%d", slotName, tokens, sess.TokensUsedTotal)
 	return true
+}
+
+func applyTokenBudgetObservation(sess *state.Session, observed int) {
+	if sess == nil || observed <= sess.TokensUsedAttempt {
+		return
+	}
+	delta := observed - sess.TokensUsedAttempt
+	sess.TokensUsedAttempt = observed
+	sess.TokensUsedTotal += delta
+}
+
+func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Session, marker worker.TokenBudgetMarker, now time.Time) {
+	if sess == nil || sess.WorkerOutcome == worker.TokenBudgetExceededOutcome {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	o.updateTokensUsedFromWorkerLog(slotName, sess)
+	applyTokenBudgetObservation(sess, marker.TokensObserved)
+	sess.WorkerOutcome = worker.TokenBudgetExceededOutcome
+	sess.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
+	sess.Status = state.StatusFailed
+	sess.PID = 0
+	sess.TmuxSession = ""
+	sess.NextRetryAt = nil
+	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
+	log.Printf("[orch] worker %s stopped by token budget: observed=%d max=%d", slotName, sess.TokensUsedAttempt, marker.MaxTokens)
+	if o.notifier != nil {
+		o.notifier.Sendf("maestro: worker %s (issue #%d) stopped at its token budget: %s observed / %s configured",
+			slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(marker.MaxTokens))
+	}
 }
 
 // updatePiUsageFromOutput parses a Pi --mode json event stream from the
@@ -2048,7 +2106,11 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		// backend (legacy states, minimal configs) keep the old behavior.
 		if respawnBackend != "" && len(o.cfg.Model.Backends) > 0 {
 			now := time.Now().UTC()
-			if blockedBy, blockedRetry := o.dispatchBackendBlock(s, respawnBackend, now); blockedBy != "" {
+			model := ""
+			if sess.BackendSelection != nil {
+				model = sess.BackendSelection.Model
+			}
+			if blockedBy, blockedRetry := o.dispatchBackendBlock(s, respawnBackend, model, now); blockedBy != "" {
 				selection := o.selectBackendFallback(s, sess, now, selectionReasonRetryBlockedFallback)
 				if selection.SelectedBackend == "" {
 					// Defer to the EARLIEST cooldown expiry across the blocked
@@ -2886,6 +2948,12 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		if sess.Status != state.StatusRunning {
 			continue
 		}
+		if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+			o.runAfterRunHook(sess)
+			o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+			reconciled = true
+			continue
+		}
 
 		tmuxName := sess.TmuxSession
 		if tmuxName == "" {
@@ -3031,11 +3099,11 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// re-login / cred-sync, a pulled model recovers via a config swap),
 		// keep the budget intact, and respawn the same attempt on the next
 		// fallback backend. The gating reason picks the operator copy.
-		if hit, reason, pattern := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
+		if failure, hit := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
 			now := time.Now().UTC()
-			cp := backendFailureCopyFor(reason)
+			cp := backendFailureCopyFor(failure.reason)
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
-			o.recordBackendFailure(s, slotName, sess, reason, pattern, now)
+			o.recordBackendFailure(s, slotName, sess, failure, now)
 			selection := o.selectBackendFallback(s, sess, now, cp.selectionReason)
 			sess.BackendSelection = &selection
 			oldPID := sess.PID
@@ -3052,9 +3120,9 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.Status = state.StatusDead
 				reconciled = true
 				log.Printf("[orch] reconcile: %s running->dead via %s on backend=%s signature=%s (no fallback available; %s); pid=%d tmux=%q",
-					slotName, cp.noun, previousBackend, pattern, strings.Join(reasons, ", "), oldPID, oldTmux)
+					slotName, cp.noun, previousBackend, failure.pattern, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
-					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, pattern, cp.remedy)
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, failure.pattern, cp.remedy)
 				continue
 			}
 
@@ -3068,7 +3136,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.Status = state.StatusDead
 				reconciled = true
 				log.Printf("[orch] reconcile: %s running->dead via %s on backend=%s signature=%s (fallback to %s aborted: could not fetch issue #%d: %v; %s); pid=%d tmux=%q",
-					slotName, cp.noun, previousBackend, pattern, nextBackend, sess.IssueNumber, fetchErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+					slotName, cp.noun, previousBackend, failure.pattern, nextBackend, sess.IssueNumber, fetchErr, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s; fallback to %s failed (could not fetch issue): %v",
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, nextBackend, fetchErr)
 				continue
@@ -3087,7 +3155,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.Status = state.StatusDead
 				reconciled = true
 				log.Printf("[orch] reconcile: %s running->dead via %s on backend=%s signature=%s (fallback respawn on %s failed: %v; %s); pid=%d tmux=%q",
-					slotName, cp.noun, previousBackend, pattern, nextBackend, respawnErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+					slotName, cp.noun, previousBackend, failure.pattern, nextBackend, respawnErr, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s; fallback to %s failed: %v",
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, nextBackend, respawnErr)
 				continue
@@ -3095,9 +3163,9 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 			reconciled = true
 			log.Printf("[orch] reconcile: %s %s on backend=%s signature=%s — respawned with backend=%s, retry budget preserved (%s); old pid=%d tmux=%q",
-				slotName, cp.noun, previousBackend, pattern, nextBackend, strings.Join(reasons, ", "), oldPID, oldTmux)
+				slotName, cp.noun, previousBackend, failure.pattern, nextBackend, strings.Join(reasons, ", "), oldPID, oldTmux)
 			o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) backend %s %s (%s) — respawned on %s, retry budget preserved",
-				slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, pattern, nextBackend)
+				slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, failure.pattern, nextBackend)
 			continue
 		}
 
@@ -3689,6 +3757,11 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 		// Check if issue is now closed (only for running sessions)
 		if sess.Status == state.StatusRunning {
+			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+				o.runAfterRunHook(sess)
+				o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+				continue
+			}
 			closed, err := o.isIssueClosed(sess.IssueNumber)
 			if err != nil {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
@@ -3786,7 +3859,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
 						slotName, sess.IssueNumber, previousBackend, nextBackend)
-				} else if hit, reason, pattern := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
+				} else if failure, hit := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
 					// Hard backend failure: a credential outage (#693, claude
 					// CLI "Failed to authenticate. API Error: 401") or a model
 					// that is unavailable / no longer accessible (#713, "It may
@@ -3797,24 +3870,24 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					// budget intact, and respawn the same attempt on the next
 					// fallback backend. The gating reason picks the operator copy.
 					now := time.Now().UTC()
-					cp := backendFailureCopyFor(reason)
+					cp := backendFailureCopyFor(failure.reason)
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
-					o.recordBackendFailure(s, slotName, sess, reason, pattern, now)
+					o.recordBackendFailure(s, slotName, sess, failure, now)
 					selection := o.selectBackendFallback(s, sess, now, cp.selectionReason)
 					sess.BackendSelection = &selection
 					nextBackend := selection.SelectedBackend
 					if nextBackend == "" {
-						log.Printf("[orch] worker %s (backend=%s) %s (%s); no fallback backend available", slotName, sess.Backend, cp.noun, pattern)
+						log.Printf("[orch] worker %s (backend=%s) %s (%s); no fallback backend available", slotName, sess.Backend, cp.noun, failure.pattern)
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = cp.displayToken
 						sess.FinishedAt = &now
 						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
-							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, cp.desc, pattern, cp.remedy)
+							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, cp.desc, failure.pattern, cp.remedy)
 						continue
 					}
 					log.Printf("[orch] worker %s (backend=%s) %s (%s), falling back to %s — retry budget preserved",
-						slotName, sess.Backend, cp.desc, pattern, nextBackend)
+						slotName, sess.Backend, cp.desc, failure.pattern, nextBackend)
 
 					issue, err := o.getIssue(sess.IssueNumber)
 					if err != nil {
@@ -3845,7 +3918,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) backend %s %s (%s), switched to %s — retry budget preserved",
-						slotName, sess.IssueNumber, previousBackend, cp.desc, pattern, nextBackend)
+						slotName, sess.IssueNumber, previousBackend, cp.desc, failure.pattern, nextBackend)
 				} else if o.canRetryIssue(s, sess) {
 					// Schedule retry with exponential backoff (respects max_retries_per_issue)
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
@@ -4027,20 +4100,21 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Token limit enforcement ---
-					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
-						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
+					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt >= o.cfg.WorkerMaxTokens && sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+						log.Printf("[orch] worker %s reached token limit (%d >= %d), killing",
 							slotName, sess.TokensUsedAttempt, o.cfg.WorkerMaxTokens)
 						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
 						}
 						now := time.Now().UTC()
-						sess.Status = state.StatusDead
-						sess.LastNotifiedStatus = "token_limit"
-						sess.FinishedAt = &now
-						state.MarkWorkerEnded(sess, now)
-						o.notifier.Sendf("⚠️ Worker %s (issue #%d) exceeded token limit: %s tokens used (attempt), %s total",
-							slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(sess.TokensUsedTotal))
+						o.markTokenBudgetExceeded(slotName, sess, worker.TokenBudgetMarker{
+							Outcome:        worker.TokenBudgetExceededOutcome,
+							Backend:        sess.Backend,
+							TokensObserved: sess.TokensUsedAttempt,
+							MaxTokens:      o.cfg.WorkerMaxTokens,
+							MeasuredAt:     now,
+						}, now)
 						continue
 					}
 

@@ -19,6 +19,7 @@ import (
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 func TestLoadFleetProjects(t *testing.T) {
@@ -337,6 +338,59 @@ func TestFleetWorkersOrderActuallyRunningFirst(t *testing.T) {
 				t.Fatalf("%s sorted into running prefix at index %d: %v", slot, i, gotSlots)
 			}
 		}
+	}
+}
+
+func TestFleetTokenBudgetMarkerShowsStoppedWorkerAndConfiguredBudget(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	logFile := filepath.Join(dir, "sup-906.log")
+	if err := os.WriteFile(logFile, []byte("working\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := worker.TokenBudgetMarker{
+		Outcome:        worker.TokenBudgetExceededOutcome,
+		Backend:        "claude",
+		TokensObserved: 85_000,
+		MaxTokens:      80_000,
+		MeasuredAt:     time.Now().UTC(),
+	}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.TokenBudgetMarkerPathForLog(logFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"sup-906": {
+			IssueNumber: 906,
+			IssueTitle:  "bounded work",
+			Status:      state.StatusRunning,
+			PID:         999999,
+			LogFile:     logFile,
+			Backend:     "claude",
+			StartedAt:   time.Now().UTC().Add(-time.Minute),
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("budget", "", "", &config.Config{
+			Repo:            "owner/budget",
+			StateDir:        stateDir,
+			MaxParallel:     1,
+			WorkerMaxTokens: 80_000,
+		}),
+	}, "127.0.0.1", 8786, true)
+	got := findFleetWorker(t, srv.snapshot().Workers, "sup-906")
+	if got.Status != string(state.StatusFailed) || got.DisplayStatus != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/display = %q/%q, want failed/token_budget_exceeded", got.Status, got.DisplayStatus)
+	}
+	if got.WorkerMaxTokens != 80_000 || got.TokensUsedAttempt != 85_000 || got.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("budget view = %+v, want max=80000 usage=85000 outcome", got)
+	}
+	if !strings.Contains(got.StatusReason, "token budget") {
+		t.Fatalf("status reason = %q, want budget stop reason", got.StatusReason)
 	}
 }
 
@@ -4721,6 +4775,20 @@ func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
 		RetryAfter: &cooldownUntil,
 	}
 	st.BackendHealth["codex"] = state.BackendHealth{State: state.BackendHealthAvailable}
+	st.ProviderModelHealth["claude"] = map[string]state.BackendHealth{
+		"claude-fable-5": {
+			State:                     state.BackendHealthCooldown,
+			Reason:                    state.BackendBlockModelCooldown,
+			Provider:                  "claude",
+			Model:                     "claude-fable-5",
+			CredentialCandidates:      2,
+			CredentialCandidatesKnown: true,
+			CredentialUsable:          0,
+			CredentialUsableKnown:     true,
+			AggregateReason:           "all_model_credentials_cooling_down",
+			RetryAfter:                &cooldownUntil,
+		},
+	}
 	if err := state.Save(stateDir, st); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
@@ -4758,6 +4826,13 @@ func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
 	codexHealth, ok := project.BackendHealth["codex"]
 	if !ok || codexHealth.State != state.BackendHealthAvailable {
 		t.Fatalf("codex health = %+v, want available", codexHealth)
+	}
+	fableHealth, ok := project.ProviderModelHealth["claude"]["claude-fable-5"]
+	if !ok {
+		t.Fatalf("project.provider_model_health missing Fable route: %+v", project.ProviderModelHealth)
+	}
+	if fableHealth.CredentialCandidates != 2 || fableHealth.CredentialUsable != 0 || fableHealth.Reason != state.BackendBlockModelCooldown {
+		t.Fatalf("Fable route health = %+v", fableHealth)
 	}
 
 	worker := findFleetWorker(t, resp.Workers, "one-1")

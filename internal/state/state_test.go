@@ -1201,6 +1201,21 @@ func TestSessionDisplayStatusFor_StaleReviewRetryWorkerStaysRunning(t *testing.T
 	}
 }
 
+func TestSessionTokenBudgetExceededAttentionAndDisplay(t *testing.T) {
+	sess := &Session{
+		Status:            StatusFailed,
+		WorkerOutcome:     string(DisplayTokenBudgetExceeded),
+		TokensUsedAttempt: 85_000,
+	}
+	if got := SessionDisplayStatusFor(sess, nil); got != string(DisplayTokenBudgetExceeded) {
+		t.Fatalf("display = %q, want %q", got, DisplayTokenBudgetExceeded)
+	}
+	attention := SessionAttentionFor(sess, nil)
+	if !attention.NeedsAttention || !containsString(attention.Reason, "token budget") || !containsString(attention.NextAction, "worker_max_tokens") {
+		t.Fatalf("attention = %+v, want deterministic budget guidance", attention)
+	}
+}
+
 func TestSessionDisplayStatusFor_BackendRateLimited(t *testing.T) {
 	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
 	reset := time.Date(2026, 5, 30, 20, 13, 0, 0, time.UTC)

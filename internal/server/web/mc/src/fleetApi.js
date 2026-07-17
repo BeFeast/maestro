@@ -71,6 +71,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
     Number(summary.dispatch_failures || 0) +
     Number(summary.outcome_drift || 0) +
     Number(summary.no_eligible_issues || 0);
+  const providerModelHealth = aggregateProviderModelHealth(raw.projects || [], now);
 
   return {
     raw,
@@ -102,9 +103,66 @@ export function mapFleetResponse(raw, now = Date.now()) {
     lastDecisionAge: latestSupervisorAge(raw.projects || []),
     supervisorPulse: aggregateSupervisorPulse(raw.projects || []),
     backendHealth: aggregateBackendHealth(raw.projects || []),
-    backendQuota: aggregateBackendQuota(raw.projects || []),
+    providerModelHealth,
+    backendQuota: aggregateBackendQuota(raw.projects || [], providerModelHealth),
     costObservability: mapCostObservability(raw.cost_observability),
   };
+}
+
+// aggregateProviderModelHealth folds secret-free provider/model cooldowns into
+// fleet rows. Each row describes aggregate pool availability only; credential
+// identifiers are neither accepted nor rendered.
+export function aggregateProviderModelHealth(rawProjects, now = Date.now()) {
+  const out = new Map();
+  for (const project of rawProjects || []) {
+    const providers = project?.provider_model_health || {};
+    for (const [provider, models] of Object.entries(providers)) {
+      for (const [model, raw] of Object.entries(models || {})) {
+        if (!raw || typeof raw !== "object") continue;
+        const retryAfter = raw.retry_after || null;
+        const retryAfterMs = retryAfter ? parseTimestamp(retryAfter) : null;
+        if (raw.state === "cooldown" && retryAfterMs != null && retryAfterMs <= now) continue;
+        const key = `${provider}\u0000${model}`;
+        const entry = {
+          provider,
+          model,
+          state: String(raw.state || ""),
+          reason: String(raw.reason || ""),
+          aggregateReason: String(raw.aggregate_reason || raw.pattern || raw.reason || ""),
+          credentialCandidates: Number(raw.credential_candidates || 0),
+          credentialCandidatesKnown: raw.credential_candidates_known === true,
+          credentialUsable: Number(raw.credential_usable || 0),
+          credentialUsableKnown: raw.credential_usable_known === true,
+          retryAfter,
+          retryAfterMs,
+        };
+        const existing = out.get(key);
+        if (!existing || (entry.retryAfterMs != null && (existing.retryAfterMs == null || entry.retryAfterMs < existing.retryAfterMs))) {
+          out.set(key, entry);
+        }
+      }
+    }
+  }
+  return Array.from(out.values()).sort((a, b) =>
+    a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model));
+}
+
+export function formatProviderModelHealthSentence(entry, now = Date.now()) {
+  if (!entry) return "";
+  const parts = [];
+  if (entry.credentialUsableKnown) {
+    parts.push(entry.credentialCandidatesKnown
+      ? `${entry.credentialUsable}/${entry.credentialCandidates} credentials usable`
+      : `${entry.credentialUsable} credentials usable; candidate total not reported`);
+  }
+  if (entry.aggregateReason) {
+    parts.push(String(entry.aggregateReason).replaceAll("_", " "));
+  }
+  const target = entry.retryAfterMs != null ? entry.retryAfterMs : parseTimestamp(entry.retryAfter);
+  if (target != null && target > now) {
+    parts.push(`retry in ${formatCountdown(Math.round((target - now) / 1000))}`);
+  }
+  return parts.join(" · ");
 }
 
 // mapCostObservability normalizes the server-side cost rollup (#619)
@@ -280,7 +338,7 @@ export function formatBackendHealthSentence(entry, now = Date.now()) {
 // subscription, so when the same backend appears across projects the
 // fullest reading wins (max of window/week percent) — the displayed
 // gauge is then a lower bound on the true account-level usage.
-export function aggregateBackendQuota(rawProjects) {
+export function aggregateBackendQuota(rawProjects, providerModelHealth = []) {
   const out = new Map();
   for (const project of rawProjects || []) {
     for (const raw of project?.backend_quota || []) {
@@ -297,6 +355,7 @@ export function aggregateBackendQuota(rawProjects) {
         weekResetAt: raw.week_reset_at || null,
         dispatchThreshold: Number(raw.dispatch_threshold || 0),
         pressured: raw.pressured === true,
+        modelHealth: providerModelHealth.filter(route => route.provider === String(raw.backend || "")),
       };
       if (!entry.backend) continue;
       const existing = out.get(entry.backend);
@@ -346,6 +405,15 @@ export function formatBackendQuotaSentence(entry, now = Date.now()) {
   }
   if (entry.pressured) {
     parts.push("dispatch → fallback");
+  }
+  if (entry.modelHealth?.length) {
+    const route = entry.modelHealth[0];
+    const pool = route.credentialUsableKnown
+      ? (route.credentialCandidatesKnown
+        ? `${route.credentialUsable}/${route.credentialCandidates} credentials usable`
+        : `${route.credentialUsable} credentials usable`)
+      : "credential pool unavailable";
+    parts.push(`${route.model} unavailable: ${pool}`);
   }
   return parts.join(" · ");
 }
@@ -943,6 +1011,10 @@ function mapWorker(worker) {
 export function workerStatusTaxonomy(worker) {
   const status = String(worker.status || "");
   const display = String(worker.display_status || "");
+
+  if (display === "token_budget_exceeded" || worker.worker_outcome === "token_budget_exceeded") {
+    return { label: "token budget exceeded", tone: "stuck", section: "stuck" };
+  }
 
   if (status === "running" && worker.alive === false) {
     return { label: "running", tone: "stuck", section: "stuck" };
