@@ -8,9 +8,11 @@ Description=Maestro agent orchestrator (single-service daemon, all projects)
 After=network.target
 
 [Service]
+User=god
+WorkingDirectory=/home/god
 Type=simple
-Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
-# One unified SQLite database (%h/.maestro/maestro.db) holds config + approvals +
+Environment=PATH=/home/god/.local/bin:/home/god/.bun/bin:/home/god/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# One unified SQLite database (/home/god/.maestro/maestro.db) holds config + approvals +
 # state; --approvals-db / --state-db default to that same file. --watch-store lets
 # the daemon hot add/remove/reload projects from the store (and powers dashboard
 # project CRUD: POST/DELETE /api/v1/fleet/projects) without a restart.
@@ -22,7 +24,7 @@ Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/us
 # is the write-path safety boundary.
 ExecStart=/usr/local/bin/maestro daemon \
     --host 0.0.0.0 \
-    --store %h/.maestro/maestro.db \
+    --store /home/god/.maestro/maestro.db \
     --port 8786 \
     --watch-store \
     --approvals-store sqlite \
@@ -62,4 +64,4 @@ Restart=on-failure
 RestartSec=30
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
