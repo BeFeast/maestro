@@ -7094,10 +7094,9 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		// closed below.
 		if claim.Kind == state.IssueClaimTerminalReconcile &&
 			claim.Status == string(state.StatusDone) &&
-			claim.PRNumber > 0 && target.PR > 0 && claim.PRNumber != target.PR {
+			claim.PRNumber > 0 && target.PR > claim.PRNumber {
 			prior, exists := s.SessionAt(claim.Session)
-			if exists && prior.Status == state.StatusDone && prior.FinishedAt != nil &&
-				!sess.StartedAt.IsZero() && !prior.FinishedAt.After(sess.StartedAt) {
+			if exists && prior.Status == state.StatusDone {
 				log.Printf("[orch] ignoring older terminal claim on session %s / PR #%d while repairing reserved newer session %s / PR #%d for issue #%d",
 					claim.Session, claim.PRNumber, slot, target.PR, issue.Number)
 				continue
