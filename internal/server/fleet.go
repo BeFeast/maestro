@@ -4120,6 +4120,14 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 		switch state.SessionStatus(peer.Status) {
 		case state.StatusPROpen, state.StatusCodeLanded:
 			return peer, true
+		case state.StatusDone:
+			// A terminal peer is authoritative only when it owns the issue's
+			// delivered PR and this attempt was explicitly reconciled as a
+			// duplicate. Do not hide a genuine failed follow-up merely because
+			// an older session for the issue once completed.
+			if peer.PRNumber > 0 && candidate.WorkerOutcome == "duplicate_dispatch_reconciled" {
+				return peer, true
+			}
 		}
 	}
 	return sessionInfo{}, false

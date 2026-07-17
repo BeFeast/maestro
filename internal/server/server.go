@@ -416,7 +416,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		IssueURL:          githubIssueURL(repo, sess.IssueNumber),
 		Status:            string(sess.Status),
 		Backend:           sess.Backend,
-		Model:             sess.Model,
+		Model:             currentSessionModel(sess),
 		PRNumber:          sess.PRNumber,
 		PRURL:             githubPRURL(repo, sess.PRNumber),
 		TokensUsedAttempt: sess.TokensUsedAttempt,
@@ -458,11 +458,14 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	info.WorkflowRuntimeSeconds = info.RuntimeSeconds
 
 	workerEnd := end
-	if sess.WorkerEndedAt != nil {
+	// A running attempt is authoritative over a stale terminal marker left by
+	// an older binary. This also repairs the live projection immediately after
+	// upgrading, before that session is respawned again.
+	if sess.Status == state.StatusRunning {
+		workerEnd = now
+	} else if sess.WorkerEndedAt != nil {
 		workerEnd = *sess.WorkerEndedAt
 		info.WorkerEndedAt = sess.WorkerEndedAt.Format(time.RFC3339)
-	} else if sess.Status == state.StatusRunning {
-		workerEnd = now
 	}
 	workerDur := workerEnd.Sub(sess.StartedAt).Round(time.Second)
 	if workerDur < 0 {
@@ -512,6 +515,23 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	}
 
 	return info
+}
+
+// currentSessionModel returns the model for the live route. A backend may not
+// self-report usage/model data immediately (or at all), so the active
+// attribution segment is the truthful configured fallback. Terminal sessions
+// retain the last self-reported model for historical display.
+func currentSessionModel(sess *state.Session) string {
+	if sess == nil {
+		return ""
+	}
+	if sess.Status == state.StatusRunning && len(sess.Attribution) > 0 {
+		active := sess.Attribution[len(sess.Attribution)-1]
+		if active.EndedAt == nil && active.Backend == sess.Backend && strings.TrimSpace(active.Model) != "" {
+			return active.Model
+		}
+	}
+	return sess.Model
 }
 
 func githubIssueURL(repo string, issueNumber int) string {

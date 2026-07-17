@@ -3924,6 +3924,32 @@ func TestFleetSupersedingIssueSessionSuppressesTerminalDuplicate(t *testing.T) {
 	}
 }
 
+func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForReconciledDuplicate(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot:           "ok-player-271",
+		IssueNumber:    328,
+		Status:         string(state.StatusFailed),
+		NeedsAttention: true,
+		WorkerOutcome:  "duplicate_dispatch_reconciled",
+	}
+	canonical := sessionInfo{
+		Slot:        "ok-player-250",
+		IssueNumber: 328,
+		Status:      string(state.StatusDone),
+		PRNumber:    363,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding merged session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	genuineFailure := duplicate
+	genuineFailure.WorkerOutcome = ""
+	if got, ok := fleetSupersedingIssueSession(genuineFailure, []sessionInfo{genuineFailure, canonical}); ok {
+		t.Fatalf("genuine failed follow-up incorrectly superseded: %+v", got)
+	}
+}
+
 func TestFleetSupersedingIssueSessionUsesCanonicalOpenPR(t *testing.T) {
 	duplicate := sessionInfo{
 		Slot:           "ok-player-259",
