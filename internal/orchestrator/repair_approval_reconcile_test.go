@@ -116,8 +116,8 @@ func TestOwnedReadyFilterKeepsAwaitingExactSessionRepair(t *testing.T) {
 }
 
 // A competing same-issue worker is preserved and blocks the approved repair.
-// The dispatcher must not kill/remove either worktree and must leave the
-// approval active for explicit reconciliation.
+// The dispatcher must not kill/remove either worktree and must make the exact
+// obsolete approval terminal so it cannot retry forever.
 func TestAwaitingRepairDispatchRefusesCompetingWorker(t *testing.T) {
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(1, "repair PR #7", "maestro-ready")}
@@ -144,8 +144,44 @@ func TestAwaitingRepairDispatchRefusesCompetingWorker(t *testing.T) {
 	if len(s.Sessions) != 2 || s.Sessions["txc-2"].Worktree != "/work/txc-2" {
 		t.Fatalf("competing material changed: %+v", s.Sessions)
 	}
-	if got := approvalStatus(t, s, "repair-1"); got != state.ApprovalStatusAwaitingDispatch {
-		t.Fatalf("repair approval = %q, want awaiting_dispatch for operator reconciliation", got)
+	if got := approvalStatus(t, s, "repair-1"); got != state.ApprovalStatusStale {
+		t.Fatalf("repair approval = %q, want stale after canonical claim wins", got)
+	}
+}
+
+// The live #940 soak regression: an old awaiting-dispatch approval referenced
+// a session that no longer existed. The dispatcher refused it every minute but
+// left it active for days. One failed exact-reservation validation must stale
+// the approval, preserve every other approval, and make later cycles no-ops.
+func TestAwaitingRepairDispatchMissingReservedSessionBecomesStale(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	issues := []github.Issue{makeIssue(877, "repair PR #891", "maestro-ready")}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 877, nil }
+
+	now := time.Date(2026, 7, 17, 20, 52, 47, 0, time.UTC)
+	s := state.NewState()
+	missing := repairApproval("repair-missing", 877, 891, state.ApprovalStatusAwaitingDispatch, now)
+	missing.Target.Session = "sup-316"
+	unrelated := repairApproval("repair-unrelated", 900, 904, state.ApprovalStatusAwaitingDispatch, now)
+	unrelated.Target.Session = "sup-347"
+	s.Approvals = []state.Approval{missing, unrelated}
+
+	o.startNewWorkers(s, 1)
+	o.startNewWorkers(s, 1)
+
+	if len(*freshStarts) != 0 || len(s.Sessions) != 0 {
+		t.Fatalf("invalid exact repair created work: starts=%v sessions=%v", *freshStarts, s.Sessions)
+	}
+	if got := approvalStatus(t, s, "repair-missing"); got != state.ApprovalStatusStale {
+		t.Fatalf("missing-session approval = %q, want stale", got)
+	}
+	if got := approvalStatus(t, s, "repair-unrelated"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("unrelated approval = %q, want awaiting_dispatch", got)
+	}
+	approval, _ := s.FindApproval("repair-missing")
+	if last := approval.Audit[len(approval.Audit)-1]; last.Event != state.ApprovalAuditStale || !strings.Contains(last.Reason, "sup-316") {
+		t.Fatalf("stale audit = {%q,%q}, want exact missing-session reason", last.Event, last.Reason)
 	}
 }
 

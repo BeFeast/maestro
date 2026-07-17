@@ -7068,16 +7068,22 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	target := dispatch.target
 	slot := strings.TrimSpace(target.Session)
 	if slot == "" {
-		log.Printf("[orch] refusing repair dispatch for issue #%d: reservation has no target session", issue.Number)
+		reason := fmt.Sprintf("issue #%d repair reservation has no target session", issue.Number)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
 		return false
 	}
 	sess, ok := s.SessionAt(slot)
 	if !ok || sess.IssueNumber != issue.Number {
-		log.Printf("[orch] refusing repair dispatch for issue #%d: reserved session %s is missing or belongs to another issue", issue.Number, slot)
+		reason := fmt.Sprintf("issue #%d reserved session %s is missing or belongs to another issue", issue.Number, slot)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
 		return false
 	}
 	if target.PR > 0 && sess.PRNumber != target.PR {
-		log.Printf("[orch] refusing repair dispatch for issue #%d: reserved PR #%d no longer matches session %s PR #%d", issue.Number, target.PR, slot, sess.PRNumber)
+		reason := fmt.Sprintf("issue #%d reserved PR #%d no longer matches session %s PR #%d", issue.Number, target.PR, slot, sess.PRNumber)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
 		return false
 	}
 	for _, claim := range s.ActiveIssueClaims() {
@@ -7102,7 +7108,9 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 				continue
 			}
 		}
-		log.Printf("[orch] refusing repair dispatch for issue #%d on %s: competing claim on session %s (%s)", issue.Number, slot, claim.Session, claim.Reason)
+		reason := fmt.Sprintf("issue #%d reserved session %s is superseded by competing canonical claim on session %s (%s)", issue.Number, slot, claim.Session, claim.Reason)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
 		return false
 	}
 
@@ -7183,6 +7191,23 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 	}
 	o.notifier.Sendf("🔄 maestro: repairing issue #%d in place on worker %s: %s", issue.Number, slot, issue.Title)
 	return true
+}
+
+// staleInvalidSpawnRepairApproval makes an irrecoverably invalid exact
+// reservation terminal in both the project state and the SQLite approval
+// mirror. Without this convergence an awaiting_dispatch record is selected and
+// refused every orchestrator cycle forever, presenting a false operator gate
+// and burning control-loop work even though no safe dispatch is possible.
+func (o *Orchestrator) staleInvalidSpawnRepairApproval(s *state.State, dispatch *spawnRepairDispatch, reason string) {
+	if s == nil || dispatch == nil || strings.TrimSpace(dispatch.approvalID) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	if !s.StaleActiveRepairDispatchApproval(dispatch.approvalID, now, reason) {
+		return
+	}
+	log.Printf("[orch] reconciled invalid repair approval %s as stale: %s", dispatch.approvalID, reason)
+	o.mirrorRepairApprovalTerminal(dispatch.approvalID, now, reason)
 }
 
 func (o *Orchestrator) resolveSpawnRepairApproval(s *state.State, approvalID, slot string, pr int, outcome string) {
