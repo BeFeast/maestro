@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -384,6 +385,18 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		st.SupervisorStuck = false
 		st.SupervisorStuckReason = ""
 		if err := state.Save(cfg.StateDir, st); err != nil {
+			// The orchestrator, supervisor, and watchdog share state.json. A
+			// conflicting orchestrator write can legitimately make this full
+			// snapshot lose its compare-and-merge race even though Decide completed.
+			// Persist the liveness fields against a freshly loaded snapshot so Fleet
+			// never reports a dead control loop for a cycle that actually ran. The
+			// original error is still returned: decision/approval persistence remains
+			// fail-closed and is retried on the next scheduled cycle.
+			if errors.Is(err, state.ErrStateConflict) {
+				if heartbeatErr := persistSupervisorHeartbeat(cfg.StateDir, st.LastRunOnceAt); heartbeatErr != nil {
+					return state.SupervisorDecision{}, fmt.Errorf("save state: %w (heartbeat recovery: %v)", err, heartbeatErr)
+				}
+			}
 			return state.SupervisorDecision{}, fmt.Errorf("save state: %w", err)
 		}
 		// #497: bound state.Sessions growth by compacting old terminal
@@ -393,6 +406,29 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		compactTerminalSessions(cfg, st, "supervisor")
 	}
 	return decision, nil
+}
+
+func persistSupervisorHeartbeat(stateDir string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		latest, err := state.Load(stateDir)
+		if err != nil {
+			return err
+		}
+		latest.LastRunOnceAt = at.UTC()
+		latest.SupervisorStuck = false
+		latest.SupervisorStuckReason = ""
+		if err := state.Save(stateDir, latest); err != nil {
+			if errors.Is(err, state.ErrStateConflict) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("supervisor heartbeat state remained conflicted after bounded retries")
 }
 
 // applyOrMintDecision is the post-decision side-effect stage of RunOnce,
@@ -573,7 +609,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
-	if slot, sess, pr, ok := e.sessionWithOpenPR(st, prs, cache); ok {
+	if slot, sess, pr, mergeReady, mergeReasons, ok := e.sessionWithOpenPR(st, prs, cache); ok {
 		// #565: auto review-repair respawn. When a green+mergeable PR is
 		// settled retry_exhausted on review feedback AND Greptile flags
 		// ≥1 P0/P1 inline comment on its current head SHA, mint a
@@ -595,6 +631,23 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
+			guardReason, guardErr := e.currentIssueRepairGuard(sess.IssueNumber)
+			if guardErr != nil {
+				guardReason = fmt.Sprintf("current issue dispatch guards could not be verified: %v", guardErr)
+			}
+			if guardReason != "" {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
+					"Repair dispatch is fail-closed against the issue's current forge state",
+					guardReason,
+				)
+				target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+				decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+					fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", sess.IssueNumber, guardReason),
+					RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+				decision.StuckStates = stuckStates
+				return decision, nil
+			}
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
 				"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
@@ -612,7 +665,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		// rule, every CLEAN/SUCCESS PR sat in pr_open forever while supervisor
 		// emitted monitor_open_pr loops; the reasoning even claimed "Maestro will
 		// merge when the merge gate allows it" — aspirational, never implemented.
-		if ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr); ready {
+		if mergeReady {
 			summary := fmt.Sprintf("Merge PR #%d for issue #%d — checks green, mergeable, review gates passed.", pr.Number, sess.IssueNumber)
 			reasons := appendReasons(baseReasons, mergeReasons...)
 			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
@@ -908,6 +961,29 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
+}
+
+// currentIssueRepairGuard re-reads the current open issue before the
+// supervisor recommends repair for an existing PR. PR/session state alone is
+// insufficient authority: an operator may have added blocked (or another
+// excluded label) after the worker/approval was created. A missing issue is
+// treated as closed and a read failure is returned so the caller can fail
+// closed without minting another approval.
+func (e *Engine) currentIssueRepairGuard(issueNumber int) (string, error) {
+	issues, err := e.reader.ListOpenIssues(nil)
+	if err != nil {
+		return "", err
+	}
+	for _, issue := range issues {
+		if issue.Number != issueNumber {
+			continue
+		}
+		if label, ok := firstMatchingIssueLabel(issue, e.dynamicWaveExcludedLabels()); ok {
+			return fmt.Sprintf("current issue label %q excludes repair dispatch", label), nil
+		}
+		return "", nil
+	}
+	return "issue is not currently open", nil
 }
 
 func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) {
@@ -2577,30 +2653,71 @@ func sessionWithOpenPR(st *state.State, prs []github.PR) (string, *state.Session
 	return "", nil, github.PR{}, false
 }
 
-func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool) {
+func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool, []string, bool) {
 	branchToPR := make(map[string]github.PR, len(prs))
 	numberToPR := make(map[int]github.PR, len(prs))
 	for _, pr := range prs {
 		branchToPR[pr.HeadRefName] = pr
 		numberToPR[pr.Number] = pr
 	}
+	// Attention states must not sit behind an ordinary open PR merely because
+	// its slot sorts earlier. This is especially important when the earlier PR
+	// is intentionally blocked for QA: a later conflict_failed/retry_exhausted
+	// canonical PR still needs the project's one actionable recommendation.
+	// Keep the sort order as a deterministic tie-breaker within each rank.
+	bestRank := 3
+	var bestSlot string
+	var bestSession *state.Session
+	var bestPR github.PR
+	var bestReady bool
+	var bestMergeReasons []string
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
+		var pr github.PR
+		var found bool
 		if sess.Branch != "" {
-			if pr, ok := branchToPR[sess.Branch]; ok {
-				return slot, sess, pr, true
+			pr, found = branchToPR[sess.Branch]
+		}
+		if !found && sess.PRNumber > 0 {
+			pr, found = numberToPR[sess.PRNumber]
+		}
+		if !found {
+			continue
+		}
+		// Evaluate merge eligibility across the whole candidate set before
+		// choosing one session. Previously every ordinary pr_open candidate had
+		// the same rank, so the lexicographically first slot (often an old
+		// blocked draft) prevented a later CLEAN green PR from ever reaching the
+		// merge rule. One ready PR is the highest-priority action in sequential
+		// merge mode; attention states remain next, then passive PR gates.
+		ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr)
+		rank := 2
+		if ready {
+			rank = 0
+		} else {
+			switch sess.Status {
+			case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed, state.StatusDead:
+				rank = 1
 			}
 		}
-		if sess.PRNumber > 0 {
-			if pr, ok := numberToPR[sess.PRNumber]; ok {
-				return slot, sess, pr, true
-			}
+		if bestSession == nil || rank < bestRank {
+			bestRank = rank
+			bestSlot, bestSession, bestPR = slot, sess, pr
+			bestReady, bestMergeReasons = ready, mergeReasons
+		}
+		if bestRank == 0 {
+			// sortedSessionNames provides the deterministic tie-break among
+			// equally merge-ready PRs; no later candidate can outrank this one.
+			break
 		}
 	}
-	return "", nil, github.PR{}, false
+	if bestSession != nil {
+		return bestSlot, bestSession, bestPR, bestReady, bestMergeReasons, true
+	}
+	return "", nil, github.PR{}, false, nil, false
 }
 
 func runningSession(st *state.State) (string, *state.Session, bool) {
@@ -2623,14 +2740,16 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	if availableSlots(e.cfg, st) <= 0 {
 		return false
 	}
-	// #556: a retry-exhausted session has spent its retry budget — spawning
-	// another repair worker would not be effective, and the executor refuses
-	// `spawn_repair_worker` because the verb is not in the action registry.
-	// Falling through here lets the deterministic path land on
-	// monitor_open_pr (or merge_pr when the feedback was addressed and the
-	// PR is now green) instead of looping on the refused verb each cycle.
-	if sess.Status == state.StatusRetryExhausted {
-		return false
+	// A retry-exhausted session may still need an explicitly approved in-place
+	// repair (for example, a real rebase conflict on its canonical open PR).
+	// spawn_repair_worker is now a registered awaiting-dispatch action, so the
+	// cautious gate can safely authorize that recovery without creating a new
+	// slot, worktree, or PR.
+	if mergeReader, ok := e.reader.(prMergeableReader); ok {
+		if mergeable, err := mergeReader.PRMergeable(pr.Number); err == nil &&
+			strings.EqualFold(strings.TrimSpace(mergeable), "CONFLICTING") {
+			return true
+		}
 	}
 	if pr.IsDraft {
 		return true
@@ -2645,7 +2764,7 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			}
 		}
 		switch stuck.Code {
-		case "failing_checks", "greptile_not_approved":
+		case "failing_checks", "greptile_not_approved", "unmergeable_pr":
 			return true
 		case "stale_review_feedback":
 			// Review feedback from a PREVIOUS attempt does not mean the

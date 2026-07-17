@@ -382,12 +382,6 @@ func TestMaterialProgressRecovery_ExecutingDeliveryNeverInvokesWorkerRuntime(t *
 	}
 }
 
-func TestExactTmuxSessionTarget(t *testing.T) {
-	if got := exactTmuxSessionTarget(" maestro-slot-1 "); got != "=maestro-slot-1" {
-		t.Fatalf("exact tmux target = %q", got)
-	}
-}
-
 func latestMaterialRecovery(t *testing.T, st *state.State) *progress.Recovery {
 	t.Helper()
 	recovery := latestMaterialRecoveryOrNil(st)

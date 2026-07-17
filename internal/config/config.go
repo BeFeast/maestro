@@ -600,6 +600,10 @@ const (
 	// respawn.
 	SupervisorActionRestartWorker = "restart_worker"
 	SupervisorActionStopWorker    = "stop_worker"
+	// SupervisorActionSpawnRepairWorker resumes one explicitly reserved
+	// issue/session in place. Unlike restart_worker it preserves a retained
+	// worktree and never allocates a replacement slot.
+	SupervisorActionSpawnRepairWorker = "spawn_repair_worker"
 	// SupervisorActionSpawnReviewRepair is the auto review-repair respawn verb
 	// minted by the supervisor when a green+mergeable PR is settled
 	// retry_exhausted on review feedback and at least one Greptile P0/P1
@@ -2360,9 +2364,6 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Supervisor.ApprovalRequiredActions == nil {
 		cfg.Supervisor.ApprovalRequiredActions = []string{
 			"review_retry_exhausted",
-			"spawn_worker",
-			"spawn_repair_worker",
-			"spawn_review_repair",
 			"label_issue_ready",
 			"add_ready_label",
 			"open_child_issue",
@@ -2945,6 +2946,7 @@ func knownSupervisorActions() map[string]bool {
 		SupervisorActionDeleteWorktree:      true,
 		SupervisorActionChangeGlobalConfig:  true,
 		SupervisorActionApplyLessonProposal: true,
+		SupervisorActionSpawnRepairWorker:   true,
 		SupervisorActionSpawnReviewRepair:   true,
 		SupervisorActionRestartWorker:       true,
 		SupervisorActionStopWorker:          true,
@@ -2965,6 +2967,7 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionDeleteWorktree,
 		SupervisorActionChangeGlobalConfig,
 		SupervisorActionApplyLessonProposal,
+		SupervisorActionSpawnRepairWorker,
 		SupervisorActionSpawnReviewRepair,
 		SupervisorActionRestartWorker,
 		SupervisorActionStopWorker,

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -255,6 +256,33 @@ func TestReconcileRunningSessions_DeadWithPendingRetry_NotFlippedToPROpen(t *tes
 	}
 	if sess.NextRetryAt == nil {
 		t.Fatal("NextRetryAt must be preserved — the in-place respawn depends on it")
+	}
+}
+
+func TestCheckSessions_DonePRReleasesTerminalClaimAfterIssueCloses(t *testing.T) {
+	finishedAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-274"] = &state.Session{
+		IssueNumber: 365, Status: state.StatusDone, PRNumber: 370, FinishedAt: &finishedAt,
+	}
+	if _, ok := s.IssueClaimFor(365); !ok {
+		t.Fatal("done PR must hold a terminal reconciliation claim before issue closure")
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(issueNumber int) (bool, error) { return issueNumber == 365, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	if !s.Sessions["ok-player-274"].ReleasedForRedispatch {
+		t.Fatal("closed issue must release its completed PR terminal claim")
+	}
+	if _, ok := s.IssueClaimFor(365); ok {
+		t.Fatal("closed issue retained terminal reconciliation claim")
 	}
 }
 
@@ -1946,6 +1974,56 @@ func TestAutoMergePRs_SequentialMergesOnlyFirst(t *testing.T) {
 	}
 	if (*merged)[0] != 10 {
 		t.Errorf("sequential should merge lowest PR number first; merged PR #%d, want #10", (*merged)[0])
+	}
+}
+
+func TestAutoMergePRs_SequentialSkipsOlderConflictAndMergesCleanPR(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/conflicting"},
+		{Number: 20, HeadRefName: "feat/clean"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "sequential"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghPRMergeStatusFn = func(prNumber int) (string, string, error) {
+		if prNumber == 10 {
+			return "CONFLICTING", "dirty", nil
+		}
+		return "MERGEABLE", "clean", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{20}) {
+		t.Fatalf("merged = %v, want clean PR #20; older conflicting PR must not consume the sequential merge slot", *merged)
+	}
+	if got := s.Sessions["slot-0"].Status; got != state.StatusPROpen {
+		t.Fatalf("conflicting canonical session status = %q, want pr_open for in-place repair", got)
+	}
+}
+
+func TestAutoMergePRs_PassedReviewGateDoesNotRetryAdvisoryFeedback(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "sequential",
+		ReviewGate:              "greptile",
+		AutoRetryReviewFeedback: true,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+		return "P1 advisory finding on a head Greptile has approved", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{10}) {
+		t.Fatalf("merged = %v, want approved PR #10; successful gate is authoritative", *merged)
+	}
+	if got := s.Sessions["slot-0"].MaintenanceRetryCount; got != 0 {
+		t.Fatalf("maintenance retries = %d, want 0 after successful review gate", got)
 	}
 }
 
@@ -4629,7 +4707,7 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 	}
 }
 
-func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
+func TestStartNewWorkers_RepairSpawnCannotBypassExcludedLabel(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
 	cfg.ExcludeLabels = []string{"blocked"}
 	cfg.Supervisor.ReviewRepair.MaxRetries = 1
@@ -4659,12 +4737,11 @@ func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
 
 	o.startNewWorkers(s, 1)
 
-	if len(*started) != 1 || (*started)[0] != 669 {
-		t.Fatalf("started = %v, want [669] for supervisor-selected maintenance despite excluded label", *started)
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want no worker: current blocked label outranks delayed repair intent", *started)
 	}
-	track, ok := s.LookupReviewRepairTrack(1001, "deadbeef")
-	if !ok || track.Attempts != 1 {
-		t.Fatalf("review repair track = %+v, ok=%v; want one maintenance attempt", track, ok)
+	if track, ok := s.LookupReviewRepairTrack(1001, "deadbeef"); ok || track.Attempts != 0 {
+		t.Fatalf("review repair track = %+v, ok=%v; blocked dispatch must not consume an attempt", track, ok)
 	}
 }
 
@@ -4946,12 +5023,19 @@ func TestStartNewWorkers_WithoutPipelineFullLabelKeepsSingleSession(t *testing.T
 	}
 }
 
-func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testing.T) {
+func TestStartNewWorkers_SupervisorRepairSpawnRepairsReservedSessionInPlace(t *testing.T) {
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(767, "repair stale PR")}
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
 	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
 		return issueNumber == 767, nil
+	}
+	respawned := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		respawned = slotName
+		sess.Status = state.StatusRunning
+		sess.PID = 5555
+		return nil
 	}
 
 	s := state.NewState()
@@ -4961,6 +5045,8 @@ func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testi
 		Status:      state.StatusPROpen,
 		PRNumber:    769,
 		Branch:      "codex/old-pr",
+		Worktree:    "/work/pan-12",
+		Backend:     "codex",
 	}
 	s.RecordSupervisorDecision(state.SupervisorDecision{
 		ID:                "sup-repair",
@@ -4973,8 +5059,129 @@ func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testi
 
 	o.startNewWorkers(s, 1)
 
-	if len(*started) != 1 || (*started)[0] != 767 {
-		t.Fatalf("started = %v, want [767] for supervisor-selected repair", *started)
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want none for same-session repair", *started)
+	}
+	if respawned != "pan-12" {
+		t.Fatalf("respawned = %q, want reserved session pan-12", respawned)
+	}
+	if len(s.Sessions) != 1 || s.Sessions["pan-12"].Status != state.StatusRunning {
+		t.Fatalf("sessions = %+v, want only pan-12 running", s.Sessions)
+	}
+}
+
+func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.WorktreeBase = t.TempDir()
+	restoredWorktree := filepath.Join(cfg.WorktreeBase, "sup-360")
+	if err := os.MkdirAll(restoredWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir restored worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(restoredWorktree, ".git"), []byte("gitdir: test\n"), 0o644); err != nil {
+		t.Fatalf("write restored worktree metadata: %v", err)
+	}
+	issues := []github.Issue{makeIssue(887, "finish watchdog recovery")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 887, nil
+	}
+	respawned := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		respawned = slotName
+		sess.Status = state.StatusRunning
+		sess.PID = 5555
+		return nil
+	}
+
+	oldFinished := time.Date(2026, 7, 14, 18, 59, 0, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["sup-318"] = &state.Session{
+		IssueNumber: 887,
+		Status:      state.StatusDone,
+		PRNumber:    893,
+		StartedAt:   oldFinished.Add(-time.Hour),
+		FinishedAt:  &oldFinished,
+	}
+	s.Sessions["sup-360"] = &state.Session{
+		IssueNumber: 887,
+		IssueTitle:  "finish watchdog recovery",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    914,
+		Branch:      "feat/sup-360-887-watchdog-recovery",
+		Backend:     "codex",
+		// Cleanup/import can lose the attempt timestamp. Canonical PR identity,
+		// not an optional timestamp, orders an older completed PR claim.
+		StartedAt: time.Time{},
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair-newer-pr",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 887, PR: 914, Session: "sup-360"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want exact in-place repair", *started)
+	}
+	if respawned != "sup-360" {
+		t.Fatalf("respawned = %q, want sup-360", respawned)
+	}
+	if got := s.Sessions["sup-318"].Status; got != state.StatusDone {
+		t.Fatalf("older terminal session status = %q, want done", got)
+	}
+	if got := s.Sessions["sup-360"].Worktree; got != restoredWorktree {
+		t.Fatalf("restored worktree = %q, want %q", got, restoredWorktree)
+	}
+	if len(s.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want no new session", len(s.Sessions))
+	}
+}
+
+func TestStartNewWorkers_SupervisorRepairSpawnHonorsCurrentModelLabelInPlace(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex", "sol")
+	issues := []github.Issue{makeIssue(345, "resume retained packaging work", "model:sol")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return false, nil }
+	gotBackend := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		gotBackend = backend
+		sess.Status = state.StatusRunning
+		sess.Backend = backend
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345,
+		IssueTitle:  "resume retained packaging work",
+		Status:      state.StatusDead,
+		Worktree:    "/work/ok-player-273",
+		Branch:      "feat/ok-player-273-345",
+		Backend:     "codex",
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair-label",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 345, Session: "ok-player-273"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want retained-session repair", *started)
+	}
+	if gotBackend != "sol" {
+		t.Fatalf("repair backend = %q, want current explicit label backend sol", gotBackend)
+	}
+	if got := s.Sessions["ok-player-273"].Backend; got != "sol" {
+		t.Fatalf("session backend = %q, want sol", got)
 	}
 }
 

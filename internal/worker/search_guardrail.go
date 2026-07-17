@@ -392,6 +392,16 @@ func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardD
 }
 
 func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit) error {
+	// Resolve argv[0] while the daemon is generating the runner. A long-lived
+	// tmux server can retain an older PATH than maestro.service, so leaving a
+	// bare command such as "claude" makes retry/repair launches depend on stale
+	// tmux state. Every launch path writes through this helper; persisting the
+	// absolute service-resolved path therefore covers initial spawn, retry,
+	// repair, fallback, phase transition, and in-place resume uniformly.
+	resolvedArgs, err := resolveWorkerCommandPath(args)
+	if err != nil {
+		return err
+	}
 	guardDir, err := ensureSearchGuardrailWrappers(stateDir)
 	if err != nil {
 		return err
@@ -412,11 +422,37 @@ func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFi
 			return fmt.Errorf("clear stale token-budget marker: %w", err)
 		}
 	}
-	runnerContent := buildWorkerRunnerScript(args, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
+	runnerContent := buildWorkerRunnerScript(resolvedArgs, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
 	if err := writeFileAtomicMode(filepath.Dir(runnerPath), runnerPath, runnerContent, workerRunnerScriptMode); err != nil {
 		return fmt.Errorf("write runner script: %w", err)
 	}
 	return nil
+}
+
+func resolveWorkerCommandPath(args []string) ([]string, error) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return nil, fmt.Errorf("worker command is empty")
+	}
+	name := strings.TrimSpace(args[0])
+	resolved := name
+	if !filepath.IsAbs(name) {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve worker executable %q from maestro service PATH: %w", name, err)
+		}
+		resolved, err = filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("make worker executable %q absolute: %w", path, err)
+		}
+	}
+	if info, err := os.Stat(resolved); err != nil {
+		return nil, fmt.Errorf("validate worker executable %q: %w", resolved, err)
+	} else if info.IsDir() || info.Mode()&0111 == 0 {
+		return nil, fmt.Errorf("worker executable %q is not executable", resolved)
+	}
+	out := append([]string(nil), args...)
+	out[0] = resolved
+	return out, nil
 }
 
 // resolveWorkerCredentialsFile returns the single authoritative private path the

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,16 +14,17 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 const tmuxSpawnReconcileAttempts = 3
 
 var (
 	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
-		return exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktree, "bash", runnerPath).CombinedOutput()
+		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath)
 	}
 	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
-		out, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}\t#{pane_current_path}").Output()
+		out, err := tmuxsession.CommandForSession(tmuxName, "list-panes", "-t", "="+strings.TrimSpace(tmuxName)+":", "-F", "#{pane_pid}\t#{pane_current_path}").Output()
 		if err != nil {
 			return 0, "", err
 		}
@@ -37,6 +39,89 @@ var (
 		return pid, filepath.Clean(strings.TrimSpace(parts[1])), nil
 	}
 )
+
+// WorktreeDirty reports whether a retained worker worktree contains any
+// tracked, staged, or untracked changes. Recovery paths use this before a
+// provider transition so completed work is checkpointed instead of being
+// discarded by the fresh-worktree Respawn path.
+func WorktreeDirty(worktree string) (bool, error) {
+	if strings.TrimSpace(worktree) == "" {
+		return false, nil
+	}
+	out, err := exec.Command("git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all").CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("inspect worktree before recovery: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// RestoreMissingWorktree recreates a missing deterministic worker worktree at
+// the session's already-existing local branch. It deliberately does not create
+// a branch, reset a ref, or choose a different path: recovery must preserve the
+// original slot/branch identity and its committed work.
+func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch string) error {
+	localPath = strings.TrimSpace(localPath)
+	worktreeBase = strings.TrimSpace(worktreeBase)
+	slotName = strings.TrimSpace(slotName)
+	worktree = strings.TrimSpace(worktree)
+	branch = strings.TrimSpace(branch)
+	if localPath == "" || worktreeBase == "" || slotName == "" || worktree == "" || branch == "" {
+		return fmt.Errorf("restore missing worktree: local path, base, slot, worktree, and branch are required")
+	}
+
+	expected, err := filepath.Abs(filepath.Join(worktreeBase, slotName))
+	if err != nil {
+		return fmt.Errorf("resolve deterministic worktree path: %w", err)
+	}
+	actual, err := filepath.Abs(worktree)
+	if err != nil {
+		return fmt.Errorf("resolve recorded worktree path: %w", err)
+	}
+	if filepath.Clean(actual) != filepath.Clean(expected) {
+		return fmt.Errorf("restore missing worktree: recorded path %q is not deterministic slot path %q", actual, expected)
+	}
+	if _, err := os.Stat(actual); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat recorded worktree %s: %w", actual, err)
+	}
+
+	ref := "refs/heads/" + branch
+	if out, err := exec.Command("git", "-C", localPath, "show-ref", "--verify", "--quiet", ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("restore missing worktree: recorded local branch %q is unavailable: %w: %s", branch, err, strings.TrimSpace(string(out)))
+	}
+	if err := os.MkdirAll(filepath.Dir(actual), 0o755); err != nil {
+		return fmt.Errorf("create worktree parent: %w", err)
+	}
+	out, err := exec.Command("git", "-C", localPath, "worktree", "add", actual, branch).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("restore missing worktree %s on existing branch %s: %w: %s", actual, branch, err, strings.TrimSpace(string(out)))
+	}
+	log.Printf("[worker] restored missing canonical worktree %s on existing branch %s", actual, branch)
+	return nil
+}
+
+// rotateWorkerAttemptLog preserves the previous attempt while ensuring all
+// backend-failure classifiers see only the current attempt. Without this, a
+// Fable 429 left in a shared append-only log can be re-read after a successful
+// Opus fallback and falsely attributed to Opus during dead-session recovery.
+func rotateWorkerAttemptLog(logFile string) error {
+	if strings.TrimSpace(logFile) == "" {
+		return nil
+	}
+	suffix := fmt.Sprintf(".attempt-%d", time.Now().UTC().UnixNano())
+	for _, path := range []string{logFile, logFile + ".jsonl"} {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("stat previous attempt log %s: %w", path, err)
+		}
+		if err := os.Rename(path, path+suffix); err != nil {
+			return fmt.Errorf("rotate previous attempt log %s: %w", path, err)
+		}
+	}
+	return nil
+}
 
 // SaveCheckpoint captures the worker's progress and writes a CHECKPOINT.md
 // file to the worktree. Returns the path to the checkpoint file.
@@ -104,7 +189,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// worker grandchildren that reparented away (e.g. headless Chrome) do not
 	// leak across a respawn.
 	tmuxName := TmuxSessionName(slotName)
-	if out, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
+	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
 		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
 	}
 	if sess.PID > 0 && IsAlive(sess.PID) {
@@ -171,6 +256,9 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return fmt.Errorf("create log dir: %w", err)
 	}
 	logFile := filepath.Join(logDir, slotName+".log")
+	if err := rotateWorkerAttemptLog(logFile); err != nil {
+		return err
+	}
 
 	// Build the worker command
 	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, sess.Worktree)
@@ -210,16 +298,9 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
-	sess.Backend = backendName
-	// #513: in-place respawn (post-checkpoint resume) — record a new
-	// segment so the timeline shows where the previous segment ended
-	// and the new one began.
-	recordBackendAttribution(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
-	sess.TokensUsedAttempt = 0
-	sess.WorkerOutcome = ""
+	// #513/#931: start a new attempt projection while preserving the same
+	// worktree/session identity and cumulative attribution history.
+	beginSessionAttempt(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""

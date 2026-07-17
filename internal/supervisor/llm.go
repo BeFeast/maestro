@@ -459,8 +459,6 @@ func defaultAllowedActions() []string {
 func defaultApprovalRequiredActions() []string {
 	return []string{
 		ActionReviewRetryExhausted,
-		ActionSpawnWorker,
-		ActionSpawnRepairWorker,
 		ActionLabelIssueReady,
 		ActionOpenChildIssue,
 	}

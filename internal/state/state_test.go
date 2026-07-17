@@ -363,6 +363,107 @@ func TestBackendHealthMergeKeepsLatest(t *testing.T) {
 	}
 }
 
+func TestStateMergePreservesNewestSupervisorHeartbeat(t *testing.T) {
+	base := NewState()
+	base.LastRunOnceAt = time.Date(2026, 7, 17, 10, 16, 0, 0, time.UTC)
+	base.SupervisorStuck = true
+	base.SupervisorStuckReason = "old pulse"
+	current := cloneState(base)
+	current.Sessions["other-writer"] = &Session{IssueNumber: 1, Status: StatusRunning}
+	ours := cloneState(base)
+	ours.LastRunOnceAt = time.Date(2026, 7, 17, 10, 44, 0, 0, time.UTC)
+	ours.SupervisorStuck = false
+	ours.SupervisorStuckReason = ""
+
+	merged, err := mergeStateSnapshots(base, current, ours)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !merged.LastRunOnceAt.Equal(ours.LastRunOnceAt) {
+		t.Fatalf("last_run_once_at = %s, want %s", merged.LastRunOnceAt, ours.LastRunOnceAt)
+	}
+	if merged.SupervisorStuck || merged.SupervisorStuckReason != "" {
+		t.Fatalf("new heartbeat did not clear stale verdict: stuck=%v reason=%q", merged.SupervisorStuck, merged.SupervisorStuckReason)
+	}
+}
+
+func TestStateMergePreservesWatchdogStuckAtSameHeartbeat(t *testing.T) {
+	base := NewState()
+	base.LastRunOnceAt = time.Date(2026, 7, 17, 10, 16, 0, 0, time.UTC)
+	current := cloneState(base)
+	current.SupervisorStuck = true
+	current.SupervisorStuckReason = "15-minute threshold exceeded"
+	ours := cloneState(base)
+	ours.BackendHealth["claude"] = BackendHealth{State: BackendHealthAvailable, Since: time.Now().UTC()}
+
+	merged, err := mergeStateSnapshots(base, current, ours)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !merged.SupervisorStuck || merged.SupervisorStuckReason != current.SupervisorStuckReason {
+		t.Fatalf("watchdog verdict lost: stuck=%v reason=%q", merged.SupervisorStuck, merged.SupervisorStuckReason)
+	}
+}
+
+func TestSaveConcurrentWatchdogSecondWriteDoesNotRegressSupervisorHeartbeat(t *testing.T) {
+	dir := t.TempDir()
+	oldPulse := time.Date(2026, 7, 17, 11, 53, 50, 0, time.UTC)
+	newPulse := time.Date(2026, 7, 17, 12, 0, 2, 0, time.UTC)
+
+	seed := NewState()
+	seed.LastRunOnceAt = oldPulse
+	seed.SupervisorStuck = true
+	seed.SupervisorStuckReason = "old pulse exceeded threshold"
+	if err := Save(dir, seed); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	// The supervisor and the independently scheduled material-progress
+	// evaluator both retain snapshots loaded from the same old file.
+	supervisorState, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load supervisor state: %v", err)
+	}
+	watchdogState, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load watchdog state: %v", err)
+	}
+
+	supervisorState.LastRunOnceAt = newPulse
+	supervisorState.SupervisorStuck = false
+	supervisorState.SupervisorStuckReason = ""
+	if err := Save(dir, supervisorState); err != nil {
+		t.Fatalf("supervisor save: %v", err)
+	}
+
+	// First watchdog save conflicts and three-way-merges with the newer pulse.
+	// copyFrom must update its long-lived in-memory snapshot as well as disk.
+	watchdogState.MaterialProgress = &MaterialProgress{LastEvaluatedAt: newPulse.Add(time.Second)}
+	if err := Save(dir, watchdogState); err != nil {
+		t.Fatalf("first watchdog save: %v", err)
+	}
+	if !watchdogState.LastRunOnceAt.Equal(newPulse) || watchdogState.SupervisorStuck || watchdogState.SupervisorStuckReason != "" {
+		t.Fatalf("watchdog snapshot kept stale heartbeat tuple after merge: pulse=%s stuck=%v reason=%q",
+			watchdogState.LastRunOnceAt, watchdogState.SupervisorStuck, watchdogState.SupervisorStuckReason)
+	}
+
+	// The next evaluator save is non-conflicting because rememberLoaded carries
+	// the merged file hash. Before #929, this exact save wrote the stale pulse
+	// back to disk even though the preceding merge had selected newPulse.
+	watchdogState.MaterialProgress.LastEvaluatedAt = newPulse.Add(2 * time.Second)
+	if err := Save(dir, watchdogState); err != nil {
+		t.Fatalf("second watchdog save: %v", err)
+	}
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !got.LastRunOnceAt.Equal(newPulse) || got.SupervisorStuck || got.SupervisorStuckReason != "" {
+		t.Fatalf("second watchdog save regressed heartbeat tuple: pulse=%s stuck=%v reason=%q",
+			got.LastRunOnceAt, got.SupervisorStuck, got.SupervisorStuckReason)
+	}
+}
+
 func TestNotifiedCIFail_OmittedWhenFalse(t *testing.T) {
 	dir := t.TempDir()
 

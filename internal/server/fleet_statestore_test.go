@@ -4,11 +4,44 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/statestore"
 )
+
+func TestFleetProjectSnapshotSurfacesRepairReservation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{Repo: "owner/repo", StateDir: dir, MaxParallel: 1}
+	st := state.NewState()
+	st.Sessions["txc-1"] = &state.Session{
+		IssueNumber: 1,
+		Status:      state.StatusDead,
+		PRNumber:    7,
+		Worktree:    "/work/txc-1",
+	}
+	st.Approvals = []state.Approval{{
+		ID:     "repair-1",
+		Action: "spawn_repair_worker",
+		Status: state.ApprovalStatusAwaitingDispatch,
+		Target: &state.SupervisorTarget{Issue: 1, PR: 7, Session: "txc-1"},
+	}}
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	project := NewFleetProject("repo", "", "", cfg)
+	fleet := NewFleet([]FleetProject{project}, "127.0.0.1", 0, false)
+	snapshot, _ := fleet.projectSnapshot(project, time.Now().UTC())
+	if len(snapshot.IssueClaims) != 1 {
+		t.Fatalf("issue claims = %+v, want one repair reservation", snapshot.IssueClaims)
+	}
+	claim := snapshot.IssueClaims[0]
+	if claim.Kind != state.IssueClaimRepairDispatch || claim.IssueNumber != 1 || claim.Session != "txc-1" || claim.PRNumber != 7 || claim.ApprovalID != "repair-1" {
+		t.Fatalf("repair claim = %+v", claim)
+	}
+}
 
 // TestFleetStateStoreCrossProject proves the #760 wiring end to end at the
 // fleet layer: SetStateStore(sqlite) opens a shared maestro.db, mirrorState

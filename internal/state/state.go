@@ -202,7 +202,7 @@ type Session struct {
 	// configured per-backend pricing estimate.
 	Model                    string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
 	CostUSDBackend           float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark     int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of a backend usage stream's full-log cumulative token count (Pi --mode json, claude stream-json); persists across respawns so re-parsing the appended log/jsonl does not double-count prior attempts
+	UsageTokensWatermark     int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
 	LongRunning              bool       `json:"long_running,omitempty"`
 	RebaseAttempted          bool       `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail           bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
@@ -1821,6 +1821,15 @@ func (s *State) copyFrom(src *State) {
 	s.Paused = src.Paused
 	s.PausedAt = src.PausedAt
 	s.MaterialProgress = src.MaterialProgress
+	// Keep the caller's in-memory snapshot aligned with the merged file. Save
+	// calls copyFrom after a three-way merge, then rememberLoaded records the
+	// merged file hash. Omitting the heartbeat tuple here leaves a long-lived
+	// writer (notably the material-progress watchdog) holding an older pulse
+	// while believing it loaded the current file. Its next non-conflicting save
+	// can then regress LastRunOnceAt and resurrect an obsolete stuck verdict.
+	s.LastRunOnceAt = src.LastRunOnceAt
+	s.SupervisorStuck = src.SupervisorStuck
+	s.SupervisorStuckReason = src.SupervisorStuckReason
 }
 
 func cloneState(s *State) *State {
@@ -1871,8 +1880,42 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	mergeSpawnDrain(merged, current, ours)
 	mergePaused(merged, current, ours)
+	mergeSupervisorHeartbeat(merged, current, ours)
 	mergeMaterialProgress(merged, current, ours)
 	return merged, nil
+}
+
+// mergeSupervisorHeartbeat preserves the newest completed supervisor pulse
+// across ordinary three-way merges. The orchestrator and material-progress
+// evaluator write the same state concurrently; before this field-specific
+// merge, their otherwise-compatible writes silently kept current's old pulse
+// while accepting the new supervisor decision. Stuck state follows the pulse
+// that produced it. At an equal pulse, a watchdog's stuck=true wins so an
+// unrelated save cannot erase a real overdue verdict; a later RunOnce clears it
+// by advancing LastRunOnceAt.
+func mergeSupervisorHeartbeat(merged, current, ours *State) {
+	switch {
+	case ours.LastRunOnceAt.After(current.LastRunOnceAt):
+		merged.LastRunOnceAt = ours.LastRunOnceAt
+		merged.SupervisorStuck = ours.SupervisorStuck
+		merged.SupervisorStuckReason = ours.SupervisorStuckReason
+	case current.LastRunOnceAt.After(ours.LastRunOnceAt):
+		merged.LastRunOnceAt = current.LastRunOnceAt
+		merged.SupervisorStuck = current.SupervisorStuck
+		merged.SupervisorStuckReason = current.SupervisorStuckReason
+	default:
+		merged.LastRunOnceAt = current.LastRunOnceAt
+		if current.SupervisorStuck || ours.SupervisorStuck {
+			merged.SupervisorStuck = true
+			merged.SupervisorStuckReason = current.SupervisorStuckReason
+			if merged.SupervisorStuckReason == "" {
+				merged.SupervisorStuckReason = ours.SupervisorStuckReason
+			}
+			return
+		}
+		merged.SupervisorStuck = false
+		merged.SupervisorStuckReason = ""
+	}
 }
 
 // mergeSpawnDrain resolves the drain flag (#541) latest-write-wins by
@@ -4167,23 +4210,12 @@ func (s *State) DonePRCount() int {
 	return count
 }
 
-// IssueInProgress returns true if the given issue is already being handled.
-// This includes dead sessions with a pending retry (NextRetryAt set) to prevent
-// duplicate worker spawns during backoff periods.
+// IssueInProgress returns true if the given issue already has a durable claim.
+// Claims include active sessions, scheduled retries, retained open-PR
+// maintenance work, and approved repair dispatch reservations.
 func (s *State) IssueInProgress(issueNum int) bool {
-	for _, sess := range s.Sessions {
-		if sess.IssueNumber != issueNum {
-			continue
-		}
-		if sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued || sess.Status == StatusCodeLanded {
-			return true
-		}
-		// Dead session with pending retry — still in progress
-		if sess.Status == StatusDead && sess.NextRetryAt != nil {
-			return true
-		}
-	}
-	return false
+	_, ok := s.IssueClaimFor(issueNum)
+	return ok
 }
 
 // IssueDone returns true if the given issue already has a completed session.

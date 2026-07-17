@@ -3898,6 +3898,104 @@ func TestFleetAPIStaleDeadSessionsAgeOutOfAttention(t *testing.T) {
 	}
 }
 
+func TestFleetSupersedingIssueSessionSuppressesTerminalDuplicate(t *testing.T) {
+	alive := true
+	canonical := sessionInfo{
+		Slot:        "ok-player-250",
+		IssueNumber: 328,
+		Status:      string(state.StatusRunning),
+		Alive:       &alive,
+	}
+	duplicate := sessionInfo{
+		Slot:           "ok-player-271",
+		IssueNumber:    328,
+		Status:         string(state.StatusFailed),
+		NeedsAttention: true,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	otherIssue := canonical
+	otherIssue.IssueNumber = 329
+	if got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, otherIssue}); ok {
+		t.Fatalf("unrelated session incorrectly superseded duplicate: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForReconciledDuplicate(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot:           "ok-player-271",
+		IssueNumber:    328,
+		Status:         string(state.StatusFailed),
+		NeedsAttention: true,
+		WorkerOutcome:  "duplicate_dispatch_reconciled",
+	}
+	canonical := sessionInfo{
+		Slot:        "ok-player-250",
+		IssueNumber: 328,
+		Status:      string(state.StatusDone),
+		PRNumber:    363,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding merged session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	genuineFailure := duplicate
+	genuineFailure.WorkerOutcome = ""
+	if got, ok := fleetSupersedingIssueSession(genuineFailure, []sessionInfo{genuineFailure, canonical}); ok {
+		t.Fatalf("genuine failed follow-up incorrectly superseded: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForLaterDuplicate(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot: "ok-player-278", IssueNumber: 365, Status: string(state.StatusDead), NeedsAttention: true,
+		StartedAt: "2026-07-17T13:28:26Z",
+	}
+	canonical := sessionInfo{
+		Slot: "ok-player-274", IssueNumber: 365, Status: string(state.StatusDone), PRNumber: 370,
+		FinishedAt: "2026-07-17T13:28:21Z",
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("later duplicate superseding session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	earlierFailure := duplicate
+	earlierFailure.StartedAt = "2026-07-17T13:20:00Z"
+	if got, ok := fleetSupersedingIssueSession(earlierFailure, []sessionInfo{earlierFailure, canonical}); ok {
+		t.Fatalf("earlier genuine failure incorrectly superseded: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionUsesCanonicalOpenPR(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot:           "ok-player-259",
+		IssueNumber:    331,
+		Status:         string(state.StatusDead),
+		NeedsAttention: true,
+	}
+	canonical := sessionInfo{
+		Slot:        "ok-player-247",
+		IssueNumber: 331,
+		Status:      string(state.StatusPROpen),
+		PRNumber:    335,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding PR session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	differentPR := duplicate
+	differentPR.PRNumber = 352
+	if got, ok := fleetSupersedingIssueSession(differentPR, []sessionInfo{differentPR, canonical}); ok {
+		t.Fatalf("different PR identity incorrectly superseded: %+v", got)
+	}
+}
+
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
 // regression. A retry_exhausted session whose linked PR is still open and
 // whose last notification is NOT a CI failure is convergence-bound: the

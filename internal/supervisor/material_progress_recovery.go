@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/progress"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/worker"
 )
 
@@ -227,7 +227,7 @@ func inspectExactWorkerLease(target progress.Target) exactWorkerLeaseState {
 	if target.Kind != progress.TargetWorker || strings.TrimSpace(target.TmuxSession) == "" || target.ProcessID <= 0 {
 		return exactWorkerLeaseUncertain
 	}
-	out, err := exec.Command("tmux", "list-panes", "-t", exactTmuxSessionTarget(target.TmuxSession), "-F", "#{pane_pid}").Output()
+	out, err := tmuxsession.PanePID(target.TmuxSession)
 	if err != nil {
 		if worker.IsAlive(target.ProcessID) {
 			return exactWorkerLeaseUncertain
@@ -254,12 +254,8 @@ func stopExactWorkerLease(target progress.Target) exactWorkerLeaseState {
 		return observed
 	}
 	worker.KillProcessTree(target.ProcessID)
-	_ = exec.Command("tmux", "kill-session", "-t", exactTmuxSessionTarget(target.TmuxSession)).Run()
+	_, _ = tmuxsession.KillSession(target.TmuxSession)
 	return inspectExactWorkerLease(target)
-}
-
-func exactTmuxSessionTarget(session string) string {
-	return "=" + strings.TrimSpace(session)
 }
 
 func newMaterialProgressRecoveryLeaseID() (string, error) {

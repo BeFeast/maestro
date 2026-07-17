@@ -160,10 +160,22 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 		// codex exec's public JSONL reports usage only at turn completion. The
 		// native rollout budget is enforced inside the agent loop after every
 		// provider response, including sub-agent work, so it is the enforceable
-		// live proxy for the configured Maestro ceiling.
+		// live proxy for the configured Maestro ceiling. Codex 0.144 changed
+		// rollout_budget from a boolean feature to a configured feature object:
+		// `--enable rollout_budget` now replaces that object and discards its
+		// limit. Set the object's enabled field directly and provide the required
+		// reminder thresholds instead.
+		reminders := make([]string, 0, 2)
+		for _, divisor := range []int{5, 10} {
+			threshold := cfg.TokenBudget / divisor
+			if threshold > 0 && threshold < cfg.TokenBudget {
+				reminders = append(reminders, strconv.Itoa(threshold))
+			}
+		}
 		args = append(args,
-			"--enable", "rollout_budget",
+			"-c", "features.rollout_budget.enabled=true",
 			"-c", fmt.Sprintf("features.rollout_budget.limit_tokens=%d", cfg.TokenBudget),
+			"-c", fmt.Sprintf("features.rollout_budget.reminder_at_remaining_tokens=[%s]", strings.Join(reminders, ",")),
 			"-c", "features.rollout_budget.sampling_token_weight=1.0",
 			"-c", "features.rollout_budget.prefill_token_weight=1.0",
 		)

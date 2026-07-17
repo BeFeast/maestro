@@ -3,7 +3,6 @@ package worker
 import (
 	"fmt"
 	"log"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // StartPhase launches a new worker session for a pipeline phase in an existing worktree.
@@ -23,7 +23,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 
 	// Kill any leftover tmux session from the previous phase
 	tmuxName := TmuxSessionName(slotName)
-	exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput()
+	tmuxsession.KillSession(tmuxName)
 
 	// Determine backend
 	if backendName == "" {
@@ -94,13 +94,12 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	}
 
 	// Start tmux session
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", sess.Worktree, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, sess.Worktree, runnerPath); err != nil {
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
 		return fmt.Errorf("tmux list-panes: %w", err)
 	}
@@ -115,14 +114,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
-	sess.Backend = backendName
+	beginSessionAttempt(cfg, sess, backendName, "phase_transition", "phase_transition", time.Now())
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
-	sess.TokensUsedAttempt = 0
-	sess.WorkerOutcome = ""
 	sess.LastNotifiedStatus = ""
 
 	return nil

@@ -15,6 +15,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // SlotPrefix derives the slot prefix from the repo name ("BeFeast/panoptikon" → "pan")
@@ -159,13 +160,12 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
 		return "", fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID of the shell running inside the tmux pane
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
 		return "", fmt.Errorf("tmux list-panes: %w", err)
 	}
@@ -312,13 +312,12 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
 		return fmt.Errorf("tmux list-panes: %w", err)
 	}
@@ -335,19 +334,15 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
+	now := time.Now()
 	sess.PRNumber = 0
-	sess.Backend = backendName
-	// #513: stamp the fallover attribution segment.
-	recordBackendAttribution(cfg, sess, backendName, "fallover", "fallover", time.Now())
+	// #513/#931: stamp the fallover segment and clear the previous attempt's
+	// terminal/model projection without losing cumulative history.
+	beginSessionAttempt(cfg, sess, backendName, "fallover", "fallover", now)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
-	sess.TokensUsedAttempt = 0
-	sess.WorkerOutcome = ""
 	// CIFailureOutput and PreviousAttemptFeedback are normally cleared by
 	// respawnDueRetries before this call, but cleared here defensively in
 	// case Respawn is called from other paths.
@@ -363,7 +358,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	// Try to kill the tmux session first (covers tmux-spawned workers)
 	tmuxName := TmuxSessionName(slotName)
-	if out, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
+	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
 		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
 	}
 
