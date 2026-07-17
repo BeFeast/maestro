@@ -4663,7 +4663,14 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 		}
 		if activeOther != "" {
 			// Never activate a second session while another issue-level lease is
-			// live, even if the open PR points at an older canonical branch.
+			// live, even if the open PR points at an older canonical branch. The
+			// active canonical session still needs a durable handoff from terminal
+			// sibling branches, however: otherwise work preserved by a duplicate
+			// worker remains invisible once the canonical PR is reattached.
+			active := s.Sessions[activeOther]
+			if active != nil && (active.PRNumber == canonical.Number || active.Branch == canonical.HeadRefName) {
+				o.attachPreservedSiblingHandoffs(s, issue, activeOther, active, canonical, allSlots)
+			}
 			continue
 		}
 
@@ -4724,26 +4731,6 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 				continue
 			}
 		}
-		var handoffs []string
-		if o.cfg != nil && strings.TrimSpace(o.cfg.LocalPath) != "" {
-			for _, siblingSlot := range allSlots {
-				if siblingSlot == candidateSlot {
-					continue
-				}
-				sibling := s.Sessions[siblingSlot]
-				if sibling == nil || strings.TrimSpace(sibling.Branch) == "" || sibling.Branch == canonical.HeadRefName {
-					continue
-				}
-				commits, err := worker.UniqueBranchCommits(o.cfg.LocalPath, canonical.HeadRefName, sibling.Branch)
-				if err != nil {
-					log.Printf("[orch] terminal/open-PR reconcile: could not inspect preserved sibling branch %s for issue #%d: %v", sibling.Branch, issue, err)
-					continue
-				}
-				if len(commits) > 0 {
-					handoffs = append(handoffs, fmt.Sprintf("- session %s branch `%s`: unique commits `%s`", siblingSlot, sibling.Branch, strings.Join(commits, "`, `")))
-				}
-			}
-		}
 		oldPR := sess.PRNumber
 		if oldPR > 0 && oldPR != canonical.Number {
 			sess.LastClosedPRNumber = oldPR
@@ -4753,17 +4740,49 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 		sess.Status = state.StatusPROpen
 		sess.FinishedAt = nil
 		sess.ReleasedForRedispatch = false
-		if len(handoffs) > 0 {
-			handoff := strings.Join(handoffs, "\n")
-			if strings.TrimSpace(sess.PreviousAttemptFeedback) == "" {
-				sess.PreviousAttemptFeedback = handoff
-				sess.PreviousAttemptFeedbackKind = "recovery_handoff"
-			} else {
-				sess.PreviousAttemptFeedback += "\n\nPreserved sibling work:\n" + handoff
-			}
-		}
+		o.attachPreservedSiblingHandoffs(s, issue, candidateSlot, sess, canonical, allSlots)
 		log.Printf("[orch] reconciled terminal session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", candidateSlot, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
 	}
+}
+
+func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int, canonicalSlot string, canonicalSession *state.Session, canonical github.PR, allSlots []string) {
+	if o.cfg == nil || strings.TrimSpace(o.cfg.LocalPath) == "" || canonicalSession == nil {
+		return
+	}
+	var handoffs []string
+	for _, siblingSlot := range allSlots {
+		if siblingSlot == canonicalSlot {
+			continue
+		}
+		sibling := s.Sessions[siblingSlot]
+		if sibling == nil || repairIssueSessionActive(sibling.Status) || strings.TrimSpace(sibling.Branch) == "" || sibling.Branch == canonical.HeadRefName {
+			continue
+		}
+		commits, err := worker.UniqueBranchCommits(o.cfg.LocalPath, canonical.HeadRefName, sibling.Branch)
+		if err != nil {
+			log.Printf("[orch] terminal/open-PR reconcile: could not inspect preserved sibling branch %s for issue #%d: %v", sibling.Branch, issue, err)
+			continue
+		}
+		if len(commits) == 0 {
+			continue
+		}
+		handoff := fmt.Sprintf("- session %s branch `%s`: unique commits `%s`", siblingSlot, sibling.Branch, strings.Join(commits, "`, `"))
+		if strings.Contains(canonicalSession.PreviousAttemptFeedback, handoff) {
+			continue
+		}
+		handoffs = append(handoffs, handoff)
+	}
+	if len(handoffs) == 0 {
+		return
+	}
+	handoff := strings.Join(handoffs, "\n")
+	if strings.TrimSpace(canonicalSession.PreviousAttemptFeedback) == "" {
+		canonicalSession.PreviousAttemptFeedback = handoff
+		canonicalSession.PreviousAttemptFeedbackKind = "recovery_handoff"
+	} else {
+		canonicalSession.PreviousAttemptFeedback += "\n\nPreserved sibling work:\n" + handoff
+	}
+	log.Printf("[orch] attached preserved sibling commit handoff to canonical session %s for issue #%d / PR #%d", canonicalSlot, issue, canonical.Number)
 }
 
 func (o *Orchestrator) releaseClosedUnmergedSession(sess *state.Session, slotName string) {

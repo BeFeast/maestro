@@ -1,6 +1,9 @@
 package orchestrator
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -124,6 +127,77 @@ func TestReconcileCanonicalPRSelectsExactHistoricalSessionAfterCompetingWorkerSt
 	if got := s.Sessions["ok-player-294"].Status; got != state.StatusFailed {
 		t.Fatalf("new duplicate historical session activated: %q", got)
 	}
+}
+
+func TestReconcileActiveCanonicalPRReceivesTerminalSiblingCommitHandoffOnce(t *testing.T) {
+	repo := newReconcileBranchRepo(t)
+	runReconcileGit(t, repo, "branch", "canonical")
+	runReconcileGit(t, repo, "switch", "-c", "preserved-sibling")
+	if err := os.WriteFile(filepath.Join(repo, "repair.txt"), []byte("preserved repair\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runReconcileGit(t, repo, "add", "repair.txt")
+	runReconcileGit(t, repo, "commit", "-m", "preserved repair")
+	wantCommit := strings.TrimSpace(runReconcileGit(t, repo, "rev-parse", "HEAD"))
+
+	s := state.NewState()
+	s.Sessions["canonical-slot"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusPROpen,
+		PRNumber:    397,
+		Branch:      "canonical",
+	}
+	s.Sessions["preserved-slot"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusRetryExhausted,
+		Branch:      "preserved-sibling",
+	}
+	o := &Orchestrator{cfg: &config.Config{LocalPath: repo}}
+	prs := []github.PR{{Number: 397, HeadRefName: "canonical", Title: "Fedora fix for #346"}}
+
+	o.reconcileTerminalSessionsWithOpenPRs(s, prs)
+	feedback := s.Sessions["canonical-slot"].PreviousAttemptFeedback
+	for _, want := range []string{"preserved-slot", "preserved-sibling", wantCommit} {
+		if !strings.Contains(feedback, want) {
+			t.Fatalf("handoff missing %q: %s", want, feedback)
+		}
+	}
+	if got := s.Sessions["canonical-slot"].PreviousAttemptFeedbackKind; got != "recovery_handoff" {
+		t.Fatalf("feedback kind = %q, want recovery_handoff", got)
+	}
+	if got := s.Sessions["canonical-slot"].Status; got != state.StatusPROpen {
+		t.Fatalf("canonical status = %q, want pr_open", got)
+	}
+
+	// Repeated minute-level reconciliation must not grow the prompt forever.
+	o.reconcileTerminalSessionsWithOpenPRs(s, prs)
+	if got := s.Sessions["canonical-slot"].PreviousAttemptFeedback; got != feedback {
+		t.Fatalf("handoff was duplicated:\n%s", got)
+	}
+}
+
+func newReconcileBranchRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	runReconcileGit(t, repo, "init", "-b", "main")
+	runReconcileGit(t, repo, "config", "user.email", "test@example.com")
+	runReconcileGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runReconcileGit(t, repo, "add", "README.md")
+	runReconcileGit(t, repo, "commit", "-m", "seed")
+	return repo
+}
+
+func runReconcileGit(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmdArgs := append([]string{"-C", repo}, args...)
+	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return string(out)
 }
 
 func TestAppendRecoveryHandoffContextRequiresExistingCanonicalPR(t *testing.T) {
