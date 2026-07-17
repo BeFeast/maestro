@@ -110,6 +110,43 @@ func TestAwaitingRepairDispatchRefusesCompetingWorker(t *testing.T) {
 	}
 }
 
+// A repair approval is authority for the state that was reviewed, not a
+// timeless bypass. If the operator adds blocked before dispatch, the current
+// guard wins, the approval becomes stale, and neither an in-place nor a fresh
+// worker may start even though the canonical PR remains open.
+func TestAwaitingRepairDispatchBlockedBeforeExecutionDoesNotSpawn(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.ExcludeLabels = []string{"blocked"}
+	issues := []github.Issue{makeIssue(331, "canonical PR #335", "maestro-ready", "blocked")}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 331, nil }
+	respawns := 0
+	o.respawnInPlaceFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+		respawns++
+		return nil
+	}
+
+	now := time.Date(2026, 7, 17, 9, 18, 38, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Worktree:    "/work/ok-player-247",
+	}
+	s.Approvals = []state.Approval{repairApproval("repair-331", 331, 335, state.ApprovalStatusAwaitingDispatch, now)}
+	s.Approvals[0].Target.Session = "ok-player-247"
+
+	o.startNewWorkers(s, 1)
+
+	if respawns != 0 || len(*freshStarts) != 0 || len(s.Sessions) != 1 {
+		t.Fatalf("blocked repair dispatched: respawns=%d fresh=%v sessions=%v", respawns, *freshStarts, s.Sessions)
+	}
+	if got := approvalStatus(t, s, "repair-331"); got != state.ApprovalStatusStale {
+		t.Fatalf("repair approval = %q, want stale after current blocked guard", got)
+	}
+}
+
 const actionSpawnRepairWorker = "spawn_repair_worker"
 
 func repairApproval(id string, issue, pr int, status state.ApprovalStatus, now time.Time) state.Approval {

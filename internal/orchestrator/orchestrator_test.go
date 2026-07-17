@@ -4629,7 +4629,7 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 	}
 }
 
-func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
+func TestStartNewWorkers_RepairSpawnCannotBypassExcludedLabel(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
 	cfg.ExcludeLabels = []string{"blocked"}
 	cfg.Supervisor.ReviewRepair.MaxRetries = 1
@@ -4659,12 +4659,11 @@ func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
 
 	o.startNewWorkers(s, 1)
 
-	if len(*started) != 1 || (*started)[0] != 669 {
-		t.Fatalf("started = %v, want [669] for supervisor-selected maintenance despite excluded label", *started)
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want no worker: current blocked label outranks delayed repair intent", *started)
 	}
-	track, ok := s.LookupReviewRepairTrack(1001, "deadbeef")
-	if !ok || track.Attempts != 1 {
-		t.Fatalf("review repair track = %+v, ok=%v; want one maintenance attempt", track, ok)
+	if track, ok := s.LookupReviewRepairTrack(1001, "deadbeef"); ok || track.Attempts != 0 {
+		t.Fatalf("review repair track = %+v, ok=%v; blocked dispatch must not consume an attempt", track, ok)
 	}
 }
 

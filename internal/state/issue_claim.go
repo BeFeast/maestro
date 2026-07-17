@@ -24,6 +24,7 @@ const (
 	IssueClaimImplementation       = "implementation"
 	IssueClaimOpenPRMaintenance    = "open_pr_maintenance"
 	IssueClaimScheduledRetry       = "scheduled_retry"
+	IssueClaimRetainedWorktree     = "retained_worktree"
 	IssueClaimRepairDispatch       = "repair_dispatch"
 	IssueClaimReviewRepairDispatch = "review_repair_dispatch"
 )
@@ -164,6 +165,27 @@ func (s *State) ResolveDispatchedSpawnRepairApproval(id string, now time.Time, r
 	return false
 }
 
+// StaleActiveRepairDispatchApprovals retires delayed repair authority when a
+// current issue guard (for example a newly-added blocked label) says dispatch
+// is no longer allowed. Approval is not timeless authority: dispatch must
+// revalidate the issue at execution time and make the obsolete intent terminal
+// so it cannot keep bypassing the guard on every later cycle.
+func (s *State) StaleActiveRepairDispatchApprovals(issueNumber int, now time.Time, reason string) []Approval {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	var staled []Approval
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if !activeRepairDispatchApproval(approval) || approval.Target.Issue != issueNumber {
+			continue
+		}
+		s.markApprovalStale(approval, now, reason)
+		staled = append(staled, *approval)
+	}
+	return staled
+}
+
 func activeRepairDispatchApproval(approval *Approval) bool {
 	if approval == nil || approval.Target == nil || approval.Target.Issue <= 0 {
 		return false
@@ -221,6 +243,17 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		(sess.Status == StatusDead || sess.Status == StatusRetryExhausted || sess.Status == StatusConflictFailed) {
 		claim.Kind = IssueClaimOpenPRMaintenance
 		claim.Reason = fmt.Sprintf("issue #%d retains PR #%d maintenance claim on session %s (%s)", sess.IssueNumber, sess.PRNumber, slot, sess.Status)
+		return claim, true
+	}
+
+	// A retained worktree is an issue-level lease even before PR registration.
+	// A worker may finish with completed staged changes while gates are still
+	// running; treating that dead session as free creates a second worktree and
+	// risks deleting the first one during fallback recovery.
+	if strings.TrimSpace(sess.Worktree) != "" && !sess.ReleasedForRedispatch &&
+		(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted || sess.Status == StatusConflictFailed) {
+		claim.Kind = IssueClaimRetainedWorktree
+		claim.Reason = fmt.Sprintf("issue #%d retains resumable worktree on session %s (%s)", sess.IssueNumber, slot, sess.Status)
 		return claim, true
 	}
 	return IssueClaim{}, false

@@ -768,6 +768,41 @@ func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName str
 	return worker.RespawnInPlace(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 }
 
+// respawnPreservingWorktreeWithConfig is the only recovery path for a session
+// that still owns a worktree. A provider transition or post-exit retry must not
+// call worker.Respawn: that function intentionally deletes and recreates the
+// worktree, which loses completed-but-uncommitted work. Dirty work is first
+// checkpointed into the existing resumable checkpoint contract, then the same
+// slot/branch/worktree is restarted in place on the selected backend.
+func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
+	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
+		return o.respawnWorkerWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+	}
+	// Unit tests inject an in-place respawner with synthetic paths. Production
+	// never has that hook and therefore still fails closed if a retained
+	// worktree cannot be inspected.
+	if _, statErr := os.Stat(sess.Worktree); errors.Is(statErr, os.ErrNotExist) && o.respawnInPlaceFn != nil {
+		return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+	}
+	dirty, err := worker.WorktreeDirty(sess.Worktree)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		checkpoint, err := o.saveCheckpoint(sess)
+		if err != nil {
+			return fmt.Errorf("checkpoint dirty worktree before recovery: %w", err)
+		}
+		sess.CheckpointFile = checkpoint
+		log.Printf("[orch] worker %s: checkpointed dirty worktree before in-place recovery on %s", slotName, backendName)
+	}
+	return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+}
+
+func (o *Orchestrator) respawnPreservingWorktree(slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
+	return o.respawnPreservingWorktreeWithConfig(o.cfg, slotName, sess, issue, promptBase, backendName)
+}
+
 func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
 	if o.rebaseWorktreeFn != nil {
 		return o.rebaseWorktreeFn(worktreePath, branch, o.cfg.AutoResolveFiles, o.cfg.AutoRestoreFiles)
@@ -2180,12 +2215,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		// RespawnInPlace repoint sess.LogFile to the new attempt's log.
 		promptBase = o.maybeAppendPriorAttemptPostmortem(slotName, sess, promptBase)
 
-		var respawnErr error
-		if sess.PRNumber != 0 && sess.Worktree != "" {
-			respawnErr = o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
-		} else {
-			respawnErr = o.respawnWorkerWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
-		}
+		respawnErr := o.respawnPreservingWorktreeWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		if respawnErr != nil {
 			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, respawnErr)
 			sess.Status = state.StatusFailed
@@ -3066,7 +3096,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 			}
 			promptBase := o.selectPrompt(issue)
-			if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
+			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
@@ -3146,7 +3176,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 			}
 			promptBase := o.selectPrompt(issue)
-			if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
+			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
@@ -3722,6 +3752,15 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
 			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
+					dirty, dirtyErr := worker.WorktreeDirty(sess.Worktree)
+					if dirtyErr != nil {
+						log.Printf("[orch] refusing stale-worktree cleanup for %s: could not prove worktree clean: %v", slotName, dirtyErr)
+						continue
+					}
+					if dirty {
+						log.Printf("[orch] preserving stale worktree for %s: uncommitted work requires in-place recovery", slotName)
+						continue
+					}
 					if sess.FinishedAt != nil {
 						log.Printf("[orch] cleaning up stale worktree for %s (finished %s ago)", slotName, time.Since(*sess.FinishedAt).Round(time.Minute))
 					} else {
@@ -3846,7 +3885,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 					}
 					promptBase := o.selectPrompt(issue)
-					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
+					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
 						log.Printf("[orch] fallback respawn worker %s with %s: %v — marking as failed", slotName, nextBackend, err)
 						sess.Status = state.StatusFailed
 						now := time.Now().UTC()
@@ -3906,7 +3945,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 					}
 					promptBase := o.selectPrompt(issue)
-					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
+					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
 						log.Printf("[orch] %s fallback respawn worker %s with %s: %v — marking as dead (%s)", cp.noun, slotName, nextBackend, err, cp.displayToken)
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = cp.displayToken
@@ -4031,7 +4070,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 								}
 								promptBase := o.selectPrompt(issue)
-								if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
+								if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
 									log.Printf("[orch] rate-limit fallback respawn %s: %v — marking dead", slotName, respawnErr)
 									sess.Status = state.StatusDead
 									sess.LastNotifiedStatus = "rate_limit"
@@ -6972,7 +7011,7 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		}
 		err = o.respawnInPlaceWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
 	} else {
-		err = o.respawnWorkerWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+		err = o.respawnPreservingWorktreeWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
 	}
 	if err != nil {
 		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)
@@ -7415,11 +7454,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
 			if repairSpawn {
-				log.Printf("[orch] allowing repair worker for issue #%d despite excluded label because supervisor selected repair maintenance", issue.Number)
-			} else {
-				log.Printf("[orch] skipping issue #%d (excluded label)", issue.Number)
-				continue
+				reason := fmt.Sprintf("issue #%d gained an excluded label before repair dispatch — approval/intent is stale", issue.Number)
+				for _, approval := range s.StaleActiveRepairDispatchApprovals(issue.Number, time.Now().UTC(), reason) {
+					log.Printf("[orch] refusing delayed repair for issue #%d (excluded label); staled approval %s", issue.Number, approval.ID)
+					o.mirrorRepairApprovalTerminal(approval.ID, time.Now().UTC(), reason)
+				}
 			}
+			log.Printf("[orch] skipping issue #%d (excluded label; repair authority does not bypass current guards)", issue.Number)
+			continue
 		}
 
 		// Check retry limit: skip issues that have exhausted their retry budget
