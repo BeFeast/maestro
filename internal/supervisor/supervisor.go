@@ -2660,21 +2660,48 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		branchToPR[pr.HeadRefName] = pr
 		numberToPR[pr.Number] = pr
 	}
+	// Attention states must not sit behind an ordinary open PR merely because
+	// its slot sorts earlier. This is especially important when the earlier PR
+	// is intentionally blocked for QA: a later conflict_failed/retry_exhausted
+	// canonical PR still needs the project's one actionable recommendation.
+	// Keep the sort order as a deterministic tie-breaker within each rank.
+	bestRank := 2
+	var bestSlot string
+	var bestSession *state.Session
+	var bestPR github.PR
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
+		var pr github.PR
+		var found bool
 		if sess.Branch != "" {
-			if pr, ok := branchToPR[sess.Branch]; ok {
-				return slot, sess, pr, true
-			}
+			pr, found = branchToPR[sess.Branch]
 		}
-		if sess.PRNumber > 0 {
-			if pr, ok := numberToPR[sess.PRNumber]; ok {
-				return slot, sess, pr, true
-			}
+		if !found && sess.PRNumber > 0 {
+			pr, found = numberToPR[sess.PRNumber]
 		}
+		if !found {
+			continue
+		}
+		rank := 1
+		switch sess.Status {
+		case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed, state.StatusDead:
+			rank = 0
+		}
+		if bestSession == nil || rank < bestRank {
+			bestRank = rank
+			bestSlot, bestSession, bestPR = slot, sess, pr
+		}
+		if bestRank == 0 {
+			// sortedSessionNames already provides the deterministic tie-break;
+			// no later candidate can outrank an attention state.
+			break
+		}
+	}
+	if bestSession != nil {
+		return bestSlot, bestSession, bestPR, true
 	}
 	return "", nil, github.PR{}, false
 }
@@ -2699,15 +2726,11 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	if availableSlots(e.cfg, st) <= 0 {
 		return false
 	}
-	// #556: a retry-exhausted session has spent its retry budget — spawning
-	// another repair worker would not be effective, and the executor refuses
-	// `spawn_repair_worker` because the verb is not in the action registry.
-	// Falling through here lets the deterministic path land on
-	// monitor_open_pr (or merge_pr when the feedback was addressed and the
-	// PR is now green) instead of looping on the refused verb each cycle.
-	if sess.Status == state.StatusRetryExhausted {
-		return false
-	}
+	// A retry-exhausted session may still need an explicitly approved in-place
+	// repair (for example, a real rebase conflict on its canonical open PR).
+	// spawn_repair_worker is now a registered awaiting-dispatch action, so the
+	// cautious gate can safely authorize that recovery without creating a new
+	// slot, worktree, or PR.
 	if pr.IsDraft {
 		return true
 	}
@@ -2721,7 +2744,7 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			}
 		}
 		switch stuck.Code {
-		case "failing_checks", "greptile_not_approved":
+		case "failing_checks", "greptile_not_approved", "unmergeable_pr":
 			return true
 		case "stale_review_feedback":
 			// Review feedback from a PREVIOUS attempt does not mean the

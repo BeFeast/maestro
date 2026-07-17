@@ -1949,6 +1949,56 @@ func TestAutoMergePRs_SequentialMergesOnlyFirst(t *testing.T) {
 	}
 }
 
+func TestAutoMergePRs_SequentialSkipsOlderConflictAndMergesCleanPR(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/conflicting"},
+		{Number: 20, HeadRefName: "feat/clean"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "sequential"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghPRMergeStatusFn = func(prNumber int) (string, string, error) {
+		if prNumber == 10 {
+			return "CONFLICTING", "dirty", nil
+		}
+		return "MERGEABLE", "clean", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{20}) {
+		t.Fatalf("merged = %v, want clean PR #20; older conflicting PR must not consume the sequential merge slot", *merged)
+	}
+	if got := s.Sessions["slot-0"].Status; got != state.StatusPROpen {
+		t.Fatalf("conflicting canonical session status = %q, want pr_open for in-place repair", got)
+	}
+}
+
+func TestAutoMergePRs_PassedReviewGateDoesNotRetryAdvisoryFeedback(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "sequential",
+		ReviewGate:              "greptile",
+		AutoRetryReviewFeedback: true,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+		return "P1 advisory finding on a head Greptile has approved", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{10}) {
+		t.Fatalf("merged = %v, want approved PR #10; successful gate is authoritative", *merged)
+	}
+	if got := s.Sessions["slot-0"].MaintenanceRetryCount; got != 0 {
+		t.Fatalf("maintenance retries = %d, want 0 after successful review gate", got)
+	}
+}
+
 func TestAutoMergePRs_SequentialRespectsInterval(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},

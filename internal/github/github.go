@@ -2222,8 +2222,10 @@ func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus
 //
 // Primary path: reads GitHub Check Runs for the PR's head SHA.
 //   - Looks for a check whose name contains "greptile" (case-insensitive).
-//   - conclusion == "success" or "neutral" approves when there are no high
-//     severity Greptile inline review comments on the current head SHA.
+//   - conclusion == "success" or "neutral" is the authoritative Greptile
+//     decision and approves the current head. Greptile uses that successful
+//     check for its "ok to merge" / 4-of-5-or-better verdict; inline findings
+//     remain review detail and must not contradict the completed gate.
 //   - check found, other conclusion → approved=false, pending=false
 //   - check not found → falls through to comment-based fallback
 //
@@ -2255,12 +2257,6 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 				return false, false, nil
 			}
 
-			// Greptile check run passed, but high-severity inline comments on
-			// the current head are still actionable and should block the gate.
-			comments, err := c.greptileReviewComments(prNumber)
-			if err == nil && hasGreptileInlineCommentOnHead(comments, sha) {
-				return false, false, nil
-			}
 			return true, false, nil
 		}
 		// No greptile check run found → fall through to comment fallback

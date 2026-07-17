@@ -4363,7 +4363,24 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			sess.NotifiedCIFail = false // backward compat
 
-			if o.cfg.AutoRetryReviewFeedback {
+			// The configured review gate is authoritative. In particular, a
+			// successful Greptile check means "ok to merge" (4/5 or 5/5) even
+			// when the review left advisory inline findings. The old ordering
+			// collected P1 comments first and scheduled a repair before reading
+			// the successful gate, producing the contradictory
+			// greptile_not_approved/retry_exhausted state seen on OK Player #361.
+			// Read the verdict first and only feed comments to a repair worker
+			// when the configured gate itself has not passed.
+			var currentReviewVerdict *github.ReviewGateVerdict
+			if o.reviewGate() != "none" {
+				verdict, reviewErr := o.prReviewGateVerdict(pr.Number)
+				if reviewErr == nil {
+					currentReviewVerdict = &verdict
+				}
+			}
+
+			if o.cfg.AutoRetryReviewFeedback &&
+				(currentReviewVerdict == nil || currentReviewVerdict.Pending || !currentReviewVerdict.Passed) {
 				reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
 				if err != nil {
 					log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
@@ -4411,11 +4428,17 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue
 			}
 
-			reviewVerdict, err := o.prReviewGateVerdict(pr.Number)
-			if err != nil {
-				log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
-				persistGate()
-				continue // skip this cycle, try next
+			var reviewVerdict github.ReviewGateVerdict
+			if currentReviewVerdict != nil {
+				reviewVerdict = *currentReviewVerdict
+			} else {
+				var err error
+				reviewVerdict, err = o.prReviewGateVerdict(pr.Number)
+				if err != nil {
+					log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
+					persistGate()
+					continue // skip this cycle, try next
+				}
 			}
 			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
 				persistGate()
@@ -4484,6 +4507,27 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		for _, candidate := range ready {
 			o.mergeReadyPR(s, candidate.slotName, candidate.sess, candidate.pr)
 		}
+		return
+	}
+
+	// Sequential means one successful merge at a time, not "the oldest
+	// unmergeable PR blocks the fleet". Freshly preflight candidates and remove
+	// real conflicts before selecting the single merge slot. Conflict repair is
+	// handled against the existing session/worktree by the rebase/repair paths;
+	// skipping it here prevents a failed merge attempt from consuming this
+	// cycle's head-of-line position and lets a younger clean PR advance.
+	mergeableReady := ready[:0]
+	for _, candidate := range ready {
+		mergeable, mergeState, err := o.prMergeStatus(candidate.pr.Number)
+		if err == nil && mergeable == "CONFLICTING" {
+			log.Printf("[orch] sequential merge mode: PR #%d is %s/CONFLICTING — skipping merge slot and leaving canonical session %s for in-place conflict repair",
+				candidate.pr.Number, mergeState, candidate.slotName)
+			continue
+		}
+		mergeableReady = append(mergeableReady, candidate)
+	}
+	ready = mergeableReady
+	if len(ready) == 0 {
 		return
 	}
 
