@@ -3,6 +3,7 @@ package github
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1404,6 +1406,14 @@ func prReferencesIssue(pr PR, issueNumber int) bool {
 	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + stripCodeForRefMatch(pr.Body))
 }
 
+// PRReferencesIssue reports whether the PR title/body references issueNumber.
+// It exposes the same code/log-safe matcher used by HasOpenPRForIssue so
+// control-plane reconcilers can match an already-fetched open-PR snapshot
+// without issuing another GitHub request.
+func PRReferencesIssue(pr PR, issueNumber int) bool {
+	return prReferencesIssue(pr, issueNumber)
+}
+
 // prClosesIssue is the STRICT variant for "this merged PR closed issue N".
 // Unlike prReferencesIssue, it requires one of GitHub's recognised closing
 // keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved)
@@ -1859,6 +1869,7 @@ func (c *Client) PRHeadSHA(prNumber int) (string, error) {
 // PRMergeInfo is the immutable merge identity/order GitHub records for a PR.
 type PRMergeInfo struct {
 	SHA      string
+	HeadSHA  string
 	MergedAt time.Time
 }
 
@@ -1881,7 +1892,7 @@ func (c *Client) PRMergeInfo(prNumber int) (PRMergeInfo, error) {
 	if err != nil {
 		return PRMergeInfo{}, fmt.Errorf("PR %d has invalid merged_at: %w", prNumber, err)
 	}
-	return PRMergeInfo{SHA: sha, MergedAt: mergedAt.UTC()}, nil
+	return PRMergeInfo{SHA: sha, HeadSHA: strings.TrimSpace(pr.Head.SHA), MergedAt: mergedAt.UTC()}, nil
 }
 
 // LatestMergedPRGenerations returns every merged PR tied at the repository's
@@ -2124,18 +2135,67 @@ func (c *Client) MergedPRNumberForBranch(branch string) (int, error) {
 	return 0, nil
 }
 
-// PRCIStatus returns "success", "failure", "pending", or "unknown"
-func (c *Client) PRCIStatus(prNumber int) (string, error) {
+// PRCheckRollup is a bounded, non-secret identity for the actual current PR
+// head and its CI/check rollup. Fingerprint hashes check names and closed
+// status/conclusion fields only; it never carries descriptions, URLs, output,
+// annotations, paths, or credentials (#887).
+type PRCheckRollup struct {
+	HeadSHA     string
+	Verdict     string
+	Fingerprint string
+	Complete    bool
+}
+
+// PRCheckRollup returns the current head, normalized aggregate verdict, and a
+// stable digest of individual check/status transitions. When one of GitHub's
+// two CI sources is unavailable the legacy aggregate verdict still degrades to
+// the source that did answer, but Complete=false and Fingerprint is absent so a
+// partial poll cannot fabricate material progress.
+func (c *Client) PRCheckRollup(prNumber int) (PRCheckRollup, error) {
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
-		return "unknown", fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+		return PRCheckRollup{Verdict: "unknown"}, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
 	}
 	checks, checksErr := c.checkRunsForSHA(sha)
 	combined, statusErr := c.combinedStatusForSHA(sha)
 	if checksErr != nil && statusErr != nil {
-		return "unknown", fmt.Errorf("get checks for PR %d: check-runs: %v; statuses: %v", prNumber, checksErr, statusErr)
+		return PRCheckRollup{HeadSHA: sha, Verdict: "unknown"}, fmt.Errorf("get checks for PR %d: check-runs: %v; statuses: %v", prNumber, checksErr, statusErr)
 	}
-	return ciStatusFromREST(checks, combined), nil
+	rollup := PRCheckRollup{
+		HeadSHA:  sha,
+		Verdict:  ciStatusFromREST(checks, combined),
+		Complete: checksErr == nil && statusErr == nil,
+	}
+	if rollup.Complete {
+		rollup.Fingerprint = ciCheckRollupFingerprint(checks, combined)
+	}
+	return rollup, nil
+}
+
+// PRCIStatus returns "success", "failure", "pending", or "unknown".
+func (c *Client) PRCIStatus(prNumber int) (string, error) {
+	rollup, err := c.PRCheckRollup(prNumber)
+	return rollup.Verdict, err
+}
+
+func ciCheckRollupFingerprint(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	parts := make([]string, 0, len(checks)+len(combined.Statuses)+1)
+	parts = append(parts, "combined="+strings.ToLower(strings.TrimSpace(combined.State)))
+	for _, check := range checks {
+		parts = append(parts, fmt.Sprintf("check:%s:%s:%s",
+			strings.TrimSpace(check.Name), strings.ToLower(strings.TrimSpace(check.Status)), strings.ToLower(strings.TrimSpace(check.Conclusion))))
+	}
+	for _, status := range combined.Statuses {
+		parts = append(parts, fmt.Sprintf("status:%s:%s",
+			strings.TrimSpace(status.Context), strings.ToLower(strings.TrimSpace(status.State))))
+	}
+	sort.Strings(parts)
+	h := sha256.New()
+	for _, part := range parts {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }
 
 // PRMergeable returns the mergeable state: "MERGEABLE", "CONFLICTING", "UNKNOWN"
@@ -2170,8 +2230,10 @@ func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus
 //
 // Primary path: reads GitHub Check Runs for the PR's head SHA.
 //   - Looks for a check whose name contains "greptile" (case-insensitive).
-//   - conclusion == "success" or "neutral" approves when there are no high
-//     severity Greptile inline review comments on the current head SHA.
+//   - conclusion == "success" or "neutral" is the authoritative Greptile
+//     decision and approves the current head. Greptile uses that successful
+//     check for its "ok to merge" / 4-of-5-or-better verdict; inline findings
+//     remain review detail and must not contradict the completed gate.
 //   - check found, other conclusion → approved=false, pending=false
 //   - check not found → falls through to comment-based fallback
 //
@@ -2203,12 +2265,6 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 				return false, false, nil
 			}
 
-			// Greptile check run passed, but high-severity inline comments on
-			// the current head are still actionable and should block the gate.
-			comments, err := c.greptileReviewComments(prNumber)
-			if err == nil && hasGreptileInlineCommentOnHead(comments, sha) {
-				return false, false, nil
-			}
 			return true, false, nil
 		}
 		// No greptile check run found → fall through to comment fallback

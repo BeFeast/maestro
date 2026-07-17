@@ -120,6 +120,7 @@ func (d *Daemon) reconcileStore(flowParent context.Context, fp map[string]time.T
 		if cfg == nil {
 			continue
 		}
+		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
 		key := flowKey(cfg)
 		if takenKeys[key] {
 			if !loggedDupSkip[name] {

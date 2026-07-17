@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParse_StaleSessionReconcilerDefaults(t *testing.T) {
@@ -738,7 +739,7 @@ func TestParse_WorkerSilentTimeoutMinutesDefault(t *testing.T) {
 	}
 }
 
-func TestParse_WorkerSilentTimeoutMinutesExplicit(t *testing.T) {
+func TestParse_WorkerSilentTimeoutMinutesMigratesToV1Watchdog(t *testing.T) {
 	yaml := `
 repo: owner/repo
 worker_silent_timeout_minutes: 25
@@ -747,8 +748,11 @@ worker_silent_timeout_minutes: 25
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if cfg.WorkerSilentTimeoutMinutes != 25 {
-		t.Errorf("WorkerSilentTimeoutMinutes = %d, want 25", cfg.WorkerSilentTimeoutMinutes)
+	if cfg.WorkerSilentTimeoutMinutes != 0 {
+		t.Errorf("WorkerSilentTimeoutMinutes = %d, want 0 after migration", cfg.WorkerSilentTimeoutMinutes)
+	}
+	if got := cfg.StalledProgressWatchdog.EffectiveMaxSilence(); got != 25*time.Minute {
+		t.Errorf("migrated stalled-progress budget = %s, want 25m", got)
 	}
 }
 

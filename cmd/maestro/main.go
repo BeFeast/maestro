@@ -32,6 +32,7 @@ import (
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/watch"
 	"github.com/befeast/maestro/internal/worker"
@@ -389,6 +390,8 @@ func main() {
 		selfcheckCmd(args)
 	case "stream-split":
 		streamSplitCmd(args)
+	case "_worker-exec":
+		workerExecCmd(args)
 	case "_watch-updater":
 		watchUpdaterCmd(args)
 	case "_watch-tail":
@@ -933,19 +936,27 @@ func superviseCmd(args []string) {
 		printSupervisorDecision(decision, *jsonOutput)
 		return nil
 	}
-
 	// The first cycle stays fatal so a broken setup (bad config, missing
 	// backend, auth) fails `systemctl start` loudly instead of leaving a
-	// daemon up that can never work.
-	if err := runOnce(); err != nil {
-		log.Fatalf("supervise: %v", err)
-	}
+	// daemon up that can never work. The local material-progress clock is
+	// initialized (and, for a persistent command, launched) before this network/
+	// LLM-dependent cycle so a blocked first RunOnce cannot pause it (#887).
 	if *once {
+		if err := runInitialSuperviseCycle(context.Background(), cfg, true, *dryRun, runOnce,
+			supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
+			log.Fatalf("supervise: %v", err)
+		}
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if err := runInitialSuperviseCycle(ctx, cfg, false, *dryRun, runOnce,
+		supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
+		cancel()
+		log.Fatalf("supervise: %v", err)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -964,7 +975,6 @@ func superviseCmd(args []string) {
 	// (SupervisorStuck=true) so the Fleet API and dashboards can
 	// surface it without grepping the journal.
 	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval)
-
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for {
@@ -984,6 +994,37 @@ func superviseCmd(args []string) {
 			}
 		}
 	}
+}
+
+type materialProgressEvaluateFunc func(*config.Config, time.Time) (bool, error)
+type materialProgressLoopFunc func(context.Context, string, func() *config.Config)
+
+// runInitialSuperviseCycle establishes the local watchdog clock before the
+// first supervisor cycle can block in GitHub/LLM/Engine.Decide. --once performs
+// exactly one local evaluation; a persistent command also starts the independent
+// evaluator loop. --dry-run remains wholly non-persistent.
+func runInitialSuperviseCycle(
+	ctx context.Context,
+	cfg *config.Config,
+	once, dryRun bool,
+	runOnce func() error,
+	evaluate materialProgressEvaluateFunc,
+	runEvaluator materialProgressLoopFunc,
+) error {
+	if !dryRun && evaluate != nil {
+		if _, err := evaluate(cfg, time.Now().UTC()); err != nil {
+			log.Printf("supervise: initial material-progress evaluation failed (independent loop will retry when persistent): %v", err)
+		}
+	}
+	if !once && !dryRun && runEvaluator != nil {
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			runEvaluator(ctx, cfg.SessionPrefix, func() *config.Config { return cfg })
+		}()
+		<-started
+	}
+	return runOnce()
 }
 
 func superviseApprovalCmd(action string, args []string, defaultConfigPath string) {
@@ -1692,7 +1733,7 @@ func buildProjectStatusJSON(cfg *config.Config, s *state.State) projectStatusJSO
 // treats those backends as available again even before ReconcileBackendHealth
 // clears the row.
 func showBackendHealth(s *state.State) {
-	if len(s.BackendHealth) == 0 {
+	if len(s.BackendHealth) == 0 && len(s.ProviderModelHealth) == 0 {
 		return
 	}
 	now := time.Now().UTC()
@@ -1707,22 +1748,50 @@ func showBackendHealth(s *state.State) {
 		}
 		names = append(names, name)
 	}
-	if len(names) == 0 {
+	type routeHealth struct {
+		name   string
+		health state.BackendHealth
+	}
+	var routes []routeHealth
+	for provider, models := range s.ProviderModelHealth {
+		for model, health := range models {
+			if health.State != state.BackendHealthCooldown || (health.RetryAfter != nil && !now.Before(*health.RetryAfter)) {
+				continue
+			}
+			routes = append(routes, routeHealth{name: provider + "/" + model, health: health})
+		}
+	}
+	if len(names) == 0 && len(routes) == 0 {
 		return
 	}
 	sort.Strings(names)
+	sort.Slice(routes, func(i, j int) bool { return routes[i].name < routes[j].name })
 	fmt.Printf("Backend health:\n")
-	for _, name := range names {
-		h := s.BackendHealth[name]
+	printHealth := func(name string, h state.BackendHealth) {
 		when := "auto-recovery pending"
 		if h.RetryAfter != nil {
 			when = "until " + h.RetryAfter.UTC().Format("2006-01-02 15:04 MST")
 		}
 		detail := h.Reason
-		if h.Pattern != "" && h.Pattern != h.Reason {
+		if h.CredentialUsableKnown {
+			if h.CredentialCandidatesKnown {
+				detail += fmt.Sprintf("; credentials %d/%d usable", h.CredentialUsable, h.CredentialCandidates)
+			} else {
+				detail += fmt.Sprintf("; credentials %d usable (candidate total not reported)", h.CredentialUsable)
+			}
+		}
+		if h.AggregateReason != "" && h.AggregateReason != h.Reason {
+			detail += "; " + h.AggregateReason
+		} else if h.Pattern != "" && h.Pattern != h.Reason {
 			detail += "; " + h.Pattern
 		}
-		fmt.Printf("  %-16s cooling down %s (%s)\n", name+":", when, detail)
+		fmt.Printf("  %-32s cooling down %s (%s)\n", name+":", when, detail)
+	}
+	for _, name := range names {
+		printHealth(name, s.BackendHealth[name])
+	}
+	for _, route := range routes {
+		printHealth(route.name, route.health)
 	}
 }
 
@@ -2020,13 +2089,10 @@ func logsCmd(args []string) {
 
 			// If worker's tmux session is alive, attach to it for live output
 			tmuxName := worker.TmuxSessionName(slotName)
-			if sess.Status == state.StatusRunning && exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil {
-				tmuxPath, err := exec.LookPath("tmux")
-				if err != nil {
-					log.Fatalf("find tmux: %v", err)
-				}
+			if sess.Status == state.StatusRunning && tmuxsession.HasSession(tmuxName) {
+				tmuxPath, tmuxArgs := tmuxsession.ClientArgsForSession(tmuxName, "attach-session", "-t", "="+tmuxName+":", "-r")
 				fmt.Printf("Attaching to tmux session %s (read-only)...\n", tmuxName)
-				syscall.Exec(tmuxPath, []string{"tmux", "attach-session", "-t", tmuxName, "-r"}, os.Environ())
+				syscall.Exec(tmuxPath, tmuxArgs, os.Environ())
 				log.Fatalf("exec tmux attach: should not reach here")
 			}
 
@@ -2238,7 +2304,7 @@ func tmuxSessionAlive(name string) bool {
 	if strings.TrimSpace(name) == "" {
 		return false
 	}
-	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+	return tmuxsession.HasSession(name)
 }
 
 func watchCmd(args []string) {

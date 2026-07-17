@@ -91,6 +91,35 @@ func TestRuntimeBreakdownRunningSessionWorkerRuntimeIsLiveWallClock(t *testing.T
 	}
 }
 
+func TestRuntimeBreakdownRunningRespawnIgnoresPriorWorkerEndAndUsesActiveRouteModel(t *testing.T) {
+	now := time.Now().UTC()
+	priorEnd := now.Add(-time.Hour)
+	sess := &state.Session{
+		IssueNumber:   346,
+		IssueTitle:    "Fedora packaging",
+		StartedAt:     now.Add(-2 * time.Minute),
+		Status:        state.StatusRunning,
+		Backend:       "sol",
+		Model:         "claude-fable-5",
+		WorkerEndedAt: &priorEnd,
+		Attribution: []state.BackendAttribution{
+			{Backend: "claude", Model: "claude-fable-5", StartedAt: now.Add(-time.Hour), EndedAt: &priorEnd},
+			{Backend: "sol", Provider: "openai", Model: "gpt-5.6-sol", Effort: "high", StartedAt: now.Add(-2 * time.Minute)},
+		},
+	}
+
+	info := makeSessionInfo("BeFeast/ok-player", "ok-player-272", sess)
+	if info.WorkerRuntimeSeconds < 100 || info.WorkerRuntimeSeconds > 140 {
+		t.Fatalf("worker runtime = %d, want current attempt around 120s", info.WorkerRuntimeSeconds)
+	}
+	if info.WorkerEndedAt != "" {
+		t.Fatalf("running worker exposed stale worker_ended_at %q", info.WorkerEndedAt)
+	}
+	if info.Model != "gpt-5.6-sol" {
+		t.Fatalf("model = %q, want active route gpt-5.6-sol", info.Model)
+	}
+}
+
 // TestMarkWorkerEndedIsIdempotent guards against later status transitions
 // (pr_open -> code_landed -> done) sliding WorkerEndedAt forward and
 // undoing the agent-vs-workflow distinction.

@@ -75,6 +75,17 @@ const (
 // the in-flight worker count has reached zero. A var so tests can shorten it.
 var drainPollInterval = 5 * time.Second
 
+func runtimeIntervalSeconds(interval time.Duration) int {
+	if interval <= 0 {
+		return 0
+	}
+	seconds := int(interval / time.Second)
+	if seconds == 0 {
+		return 1
+	}
+	return seconds
+}
+
 // shutdownFlowTimeout is the maximum time stopAll waits for a single flow's
 // goroutines (orchestrator, supervisor, watchdog) to exit after context
 // cancellation. If a flow hangs beyond this deadline stopAll logs a warning
@@ -254,7 +265,8 @@ type Daemon struct {
 	emergencyState    emergencystore.State
 	emergencyNotifier *notify.Notifier
 
-	// runLoop, superviseLoop, and watchdogLoop build the per-project loops.
+	// runLoop, superviseLoop, watchdogLoop, and materialProgressLoop build the
+	// per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
 	// override them to drive flows (and assert WaitGroup tracking) without
 	// reaching GitHub. runLoop receives the orchestrator's hot-reload channel
@@ -262,9 +274,10 @@ type Daemon struct {
 	// closure rather than a fixed *config.Config so it reads the flow's current
 	// config each cycle through the shared holder — a config-store edit reaches
 	// the supervise loop live, not just the orchestrator (#768).
-	runLoop       func(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config)
-	superviseLoop func(ctx context.Context, name string, getCfg func() *config.Config, opts Options)
-	watchdogLoop  func(ctx context.Context, name, stateDir string, interval time.Duration)
+	runLoop              func(ctx context.Context, cfg *config.Config, opts Options, reloadCh <-chan *config.Config)
+	superviseLoop        func(ctx context.Context, name string, getCfg func() *config.Config, opts Options)
+	watchdogLoop         func(ctx context.Context, name, stateDir string, interval time.Duration)
+	materialProgressLoop func(ctx context.Context, name string, getCfg func() *config.Config)
 }
 
 // New constructs a Daemon that loads projects from store on Run.
@@ -316,6 +329,7 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		runSupervise(ctx, name, getCfg, reader, opts.SuperviseInterval, opts.ApprovalsDBPath, d.emergencyLLMHalt)
 	}
 	d.watchdogLoop = supervisor.Watchdog
+	d.materialProgressLoop = supervisor.RunMaterialProgressEvaluator
 	// Default to the real launcher; tests swap it for a counter (#758).
 	d.selfDeployTrigger = selfdeploy.Trigger
 	return d

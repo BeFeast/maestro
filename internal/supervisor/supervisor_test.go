@@ -790,6 +790,8 @@ func TestDecide_DeadRunningPIDExplained(t *testing.T) {
 func TestDecide_StaleWorkerLogsExplained(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.WorkerSilentTimeoutMinutes = 10
+	legacyOnly := false
+	cfg.StalledProgressWatchdog.Enabled = &legacyOnly
 	reader := &fakeReader{}
 	st := state.NewState()
 	st.Sessions["slot-1"] = &state.Session{
@@ -958,6 +960,7 @@ func TestDecide_FailingChecksExplained(t *testing.T) {
 func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
+		issues: []github.Issue{testIssue(94, "failing checks", "maestro-ready")},
 		prs: []github.PR{{
 			Number:      31,
 			HeadRefName: "feat/checks",
@@ -993,6 +996,84 @@ func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T
 	}
 	if !strings.Contains(strings.ToLower(decision.Summary), "repair worker") {
 		t.Fatalf("summary = %q, want repair worker", decision.Summary)
+	}
+}
+
+func TestDecide_BlockedIssueWithOpenPRNeverMintsRepairApproval(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{
+		issues: []github.Issue{testIssue(331, "canonical PR #335", "blocked")},
+		prs: []github.PR{{
+			Number:      335,
+			HeadRefName: "feat/ok-player-247-331-fix",
+			State:       "OPEN",
+			Mergeable:   "MERGEABLE",
+			IsDraft:     true,
+		}},
+		ciStatuses: map[int]string{335: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		IssueTitle:  "canonical PR #335",
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Branch:      "feat/ok-player-247-331-fix",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionMonitorOpenPR)
+	}
+	if decision.RequiresApproval || decision.ApprovalID != "" {
+		t.Fatalf("blocked decision minted approval: requires=%v id=%q", decision.RequiresApproval, decision.ApprovalID)
+	}
+	if !strings.Contains(decision.Summary, `label "blocked"`) {
+		t.Fatalf("summary = %q, want current blocked-label guard", decision.Summary)
+	}
+}
+
+func TestDecide_MergeReadyPRRanksAheadOfOlderBlockedDraft(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(331, "old blocked draft", "blocked"),
+			testIssue(365, "clean P0"),
+		},
+		prs: []github.PR{
+			{Number: 335, HeadRefName: "feat/old-draft", State: "OPEN", Mergeable: "MERGEABLE", IsDraft: true},
+			{Number: 370, HeadRefName: "feat/clean-p0", State: "OPEN", Mergeable: "MERGEABLE"},
+		},
+		ciStatuses: map[int]string{335: "success", 370: "success"},
+		greptileOK: map[int]bool{335: true, 370: true},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331, IssueTitle: "old blocked draft", Status: state.StatusPROpen,
+		PRNumber: 335, Branch: "feat/old-draft",
+	}
+	st.Sessions["ok-player-274"] = &state.Session{
+		IssueNumber: 365, IssueTitle: "clean P0", Status: state.StatusPROpen,
+		PRNumber: 370, Branch: "feat/clean-p0",
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMergePR {
+		t.Fatalf("action = %q, want %q; summary=%q", decision.RecommendedAction, ActionMergePR, decision.Summary)
+	}
+	if decision.Target == nil || decision.Target.PR != 370 || decision.Target.Issue != 365 || decision.Target.Session != "ok-player-274" {
+		t.Fatalf("target = %#v, want clean PR #370 / issue #365 / ok-player-274", decision.Target)
 	}
 }
 
@@ -1342,6 +1423,34 @@ func TestRunOnce_StampsLastRunOnceAt(t *testing.T) {
 	if st.LastRunOnceAt.Before(before) || st.LastRunOnceAt.After(after.Add(time.Second)) {
 		t.Fatalf("LastRunOnceAt=%s is outside the call window [%s, %s]",
 			st.LastRunOnceAt, before, after)
+	}
+}
+
+func TestPersistSupervisorHeartbeatClearsStuckState(t *testing.T) {
+	cfg := testConfig(t)
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	st.SupervisorStuck = true
+	st.SupervisorStuckReason = "synthetic concurrent writer conflict"
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	want := time.Now().UTC().Truncate(time.Microsecond)
+	if err := persistSupervisorHeartbeat(cfg.StateDir, want); err != nil {
+		t.Fatalf("persistSupervisorHeartbeat: %v", err)
+	}
+	got, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !got.LastRunOnceAt.Equal(want) {
+		t.Fatalf("LastRunOnceAt = %s, want %s", got.LastRunOnceAt, want)
+	}
+	if got.SupervisorStuck || got.SupervisorStuckReason != "" {
+		t.Fatalf("stuck state not cleared: stuck=%v reason=%q", got.SupervisorStuck, got.SupervisorStuckReason)
 	}
 }
 
@@ -2677,6 +2786,9 @@ func TestDecideWithLLM_UnknownActionRejected(t *testing.T) {
 func TestDecideWithLLM_ApprovalRequiredActionRejectedWithoutApproval(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	// Explicit operator policy can still gate mechanical dispatch even though
+	// hands-off projects no longer do so by default.
+	cfg.Supervisor.ApprovalRequiredActions = []string{ActionSpawnWorker}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
 	llm := &fakeLLM{output: `{
   "summary": "Issue #42 is ready to feed.",
@@ -2691,6 +2803,25 @@ func TestDecideWithLLM_ApprovalRequiredActionRejectedWithoutApproval(t *testing.
 	_, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
 	if err == nil || !strings.Contains(err.Error(), "requires approval") {
 		t.Fatalf("Decide error = %v, want requires approval", err)
+	}
+}
+
+func TestDecideWithLLM_BackendFailureUsesDeterministicGuardrail(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.ApprovalRequiredActions = []string{ActionMergePR}
+	reader := &fakeReader{issues: []github.Issue{testIssue(940, "prove unattended SLA", "maestro-ready")}}
+	llm := &fakeLLM{err: errors.New("provider unavailable")}
+
+	decision, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker || decision.Target == nil || decision.Target.Issue != 940 {
+		t.Fatalf("decision = %+v, want deterministic spawn_worker for #940", decision)
+	}
+	if decision.ErrorClass != ErrorClassSupervisorBackend {
+		t.Fatalf("ErrorClass = %q, want %q", decision.ErrorClass, ErrorClassSupervisorBackend)
 	}
 }
 

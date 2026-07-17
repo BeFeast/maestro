@@ -55,6 +55,10 @@ const (
 	// "the model is gone" (swap the model id) rather than "fix credentials".
 	// Like the other backend-block tokens it did not burn the retry budget.
 	DisplayBackendModelUnavailable SessionDisplayStatus = "backend_model_unavailable"
+	// DisplayBackendModelCooldown marks a session whose provider exhausted the
+	// compatible credential pool for one requested model. Other models on the
+	// provider remain eligible.
+	DisplayBackendModelCooldown SessionDisplayStatus = "backend_model_cooldown"
 	// DisplayBackendUsageLimit marks a session whose worker exited because
 	// its backend's account usage quota is exhausted (#805; live: codex
 	// "You've hit your usage limit") with no fallback available. Distinct
@@ -62,10 +66,16 @@ const (
 	// wait for the window reset" rather than a generic capacity blip. Like
 	// the other backend-block tokens it did not burn the retry budget.
 	DisplayBackendUsageLimit SessionDisplayStatus = "backend_usage_limit"
-	LiveSessionRecentWindow                       = 24 * time.Hour
+	// DisplayTokenBudgetExceeded is a deterministic worker stop, not a retryable
+	// process death or provider outage.
+	DisplayTokenBudgetExceeded SessionDisplayStatus = "token_budget_exceeded"
+	LiveSessionRecentWindow                         = 24 * time.Hour
 )
 
-const RetryReasonReviewFeedback = "review_feedback"
+const (
+	RetryReasonReviewFeedback  = "review_feedback"
+	RetryReasonStalledProgress = "stalled_progress"
+)
 
 const (
 	BackendHealthAvailable = "available"
@@ -85,6 +95,10 @@ const (
 	// auth_failure so the operator remediation differs (swap the model id vs
 	// fix credentials).
 	BackendBlockModelUnavailable = "model_unavailable"
+	// BackendBlockModelCooldown gates one provider/model route after the proxy
+	// has rotated through every compatible credential and found none usable.
+	// It must never become a provider-wide BackendHealth gate.
+	BackendBlockModelCooldown = "model_cooldown"
 	// BackendBlockUsageLimit gates a backend whose CLI died because the
 	// account's usage quota is exhausted (#805; live: codex "You've hit
 	// your usage limit ... try again at 12:30 PM" killed every worker on
@@ -111,17 +125,26 @@ const (
 
 // BackendHealth records cross-session availability for a configured backend.
 type BackendHealth struct {
-	State       string     `json:"state"`
-	Reason      string     `json:"reason,omitempty"`
-	Pattern     string     `json:"pattern,omitempty"`
-	Since       time.Time  `json:"since,omitempty"`
-	RetryAfter  *time.Time `json:"retry_after,omitempty"`
-	LastSession string     `json:"last_session,omitempty"`
+	State                     string     `json:"state"`
+	Reason                    string     `json:"reason,omitempty"`
+	Pattern                   string     `json:"pattern,omitempty"`
+	Provider                  string     `json:"provider,omitempty"`
+	Model                     string     `json:"model,omitempty"`
+	CredentialCandidates      int        `json:"credential_candidates,omitempty"`
+	CredentialCandidatesKnown bool       `json:"credential_candidates_known,omitempty"`
+	CredentialUsable          int        `json:"credential_usable,omitempty"`
+	CredentialUsableKnown     bool       `json:"credential_usable_known,omitempty"`
+	AggregateReason           string     `json:"aggregate_reason,omitempty"`
+	Since                     time.Time  `json:"since,omitempty"`
+	RetryAfter                *time.Time `json:"retry_after,omitempty"`
+	LastSession               string     `json:"last_session,omitempty"`
 }
 
 // BackendCandidate explains why one backend was or was not selectable.
 type BackendCandidate struct {
 	Backend    string  `json:"backend"`
+	Provider   string  `json:"provider,omitempty"`
+	Model      string  `json:"model,omitempty"`
 	Available  bool    `json:"available"`
 	BlockedBy  string  `json:"blocked_by,omitempty"`
 	RetryAfter string  `json:"retry_after,omitempty"`
@@ -179,7 +202,7 @@ type Session struct {
 	// configured per-backend pricing estimate.
 	Model                    string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
 	CostUSDBackend           float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark     int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of a backend usage stream's full-log cumulative token count (Pi --mode json, claude stream-json); persists across respawns so re-parsing the appended log/jsonl does not double-count prior attempts
+	UsageTokensWatermark     int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
 	LongRunning              bool       `json:"long_running,omitempty"`
 	RebaseAttempted          bool       `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail           bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
@@ -192,6 +215,7 @@ type Session struct {
 	LastOutputChangedAt      time.Time  `json:"last_output_changed_at,omitempty"`
 	TokensUsedAttempt        int        `json:"tokens_used_attempt,omitempty"` // tokens consumed in current attempt (reset on respawn)
 	TokensUsedTotal          int        `json:"tokens_used_total,omitempty"`   // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
+	WorkerOutcome            string     `json:"worker_outcome,omitempty"`      // deterministic terminal worker outcome, e.g. token_budget_exceeded
 	// #739: cache-aware split token counters stamped from a backend usage
 	// stream (claude stream-json / Pi --mode json). Cumulative run totals so
 	// the cost panel can price each dimension separately — cache_read tokens
@@ -208,6 +232,13 @@ type Session struct {
 	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit or auth failure
 	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // backend block signature or class (e.g. BackendBlockAuthFailure)
 	ProviderLimitResetAt        *time.Time        `json:"provider_limit_reset_at,omitempty"`        // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
+	ProviderLimitProvider       string            `json:"provider_limit_provider,omitempty"`        // secret-free provider route for model-scoped failures
+	ProviderLimitModel          string            `json:"provider_limit_model,omitempty"`           // requested model for model-scoped failures
+	CredentialCandidates        int               `json:"credential_candidates,omitempty"`          // aggregate candidate count reported by the proxy
+	CredentialCandidatesKnown   bool              `json:"credential_candidates_known,omitempty"`    // distinguishes an omitted count from a real zero
+	CredentialUsable            int               `json:"credential_usable,omitempty"`              // candidates usable for ProviderLimitModel
+	CredentialUsableKnown       bool              `json:"credential_usable_known,omitempty"`        // distinguishes an omitted count from a real zero
+	CredentialAggregateReason   string            `json:"credential_aggregate_reason,omitempty"`    // aggregate proxy reason; never a credential identifier
 	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
 	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
 	PipelineFull                bool              `json:"pipeline_full,omitempty"`                  // true when issue label opted this session into plan/implement/validate
@@ -314,6 +345,13 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 	if attention, ok := reviewFeedbackRetryAttention(sess, alive, now); ok {
 		return attention
 	}
+	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
+		return SessionAttention{
+			Reason:         fmt.Sprintf("Worker stopped after reaching its configured token budget (%s tokens observed).", formatSessionTokens(sess.TokensUsedAttempt)),
+			NextAction:     "Review the partial work and raise or disable worker_max_tokens only if a larger run is intentional.",
+			NeedsAttention: true,
+		}
+	}
 
 	switch sess.Status {
 	case StatusRunning:
@@ -389,6 +427,20 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 					NeedsAttention: true,
 				}
 			}
+			if sess.ProviderLimitReason == BackendBlockModelCooldown {
+				route := backend
+				if sess.ProviderLimitProvider != "" {
+					route = sess.ProviderLimitProvider
+				}
+				if sess.ProviderLimitModel != "" {
+					route += "/" + sess.ProviderLimitModel
+				}
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Provider/model route %s has no usable compatible credential; other models on the provider remain eligible.", route),
+					NextAction:     "Wait for the route retry time or restore model access on a compatible credential; the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			if sess.ProviderLimitReason == BackendBlockUsageLimit {
 				return SessionAttention{
 					Reason:         fmt.Sprintf("Backend %s has exhausted its account usage quota; no fallback backend is currently available or allowed.", backend),
@@ -456,6 +508,9 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 	if sess == nil {
 		return ""
 	}
+	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
+		return string(DisplayTokenBudgetExceeded)
+	}
 	if sess.Status == StatusRunning && alive != nil && !*alive {
 		return string(sess.Status)
 	}
@@ -468,12 +523,21 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 			return string(DisplayBackendAuthFailure)
 		case BackendBlockModelUnavailable:
 			return string(DisplayBackendModelUnavailable)
+		case BackendBlockModelCooldown:
+			return string(DisplayBackendModelCooldown)
 		case BackendBlockUsageLimit:
 			return string(DisplayBackendUsageLimit)
 		}
 		return string(DisplayBackendRateLimited)
 	}
 	return string(sess.Status)
+}
+
+func formatSessionTokens(tokens int) string {
+	if tokens <= 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", tokens)
 }
 
 // backendRateLimitedDisplayStatus reports whether a session represents a worker
@@ -616,6 +680,7 @@ var (
 	ErrApprovalSuperseded      = errors.New("approval is superseded")
 	ErrApprovalPayloadMismatch = errors.New("approval payload changed")
 	ErrStateConflict           = errors.New("state write conflict")
+	ErrNoStateChange           = errors.New("state update made no change")
 )
 
 // SupervisorTarget identifies the primary object a supervisor decision refers to.
@@ -1176,17 +1241,18 @@ type ApprovalAudit struct {
 }
 
 type State struct {
-	Sessions            map[string]*Session           `json:"sessions"`
-	Missions            map[int]*Mission              `json:"missions,omitempty"` // parent issue number → mission
-	SupervisorDecisions []SupervisorDecision          `json:"supervisor_decisions,omitempty"`
-	Approvals           []Approval                    `json:"approvals,omitempty"`
-	LessonProposals     []LessonProposal              `json:"lesson_proposals,omitempty"`
-	OutcomeHealth       *outcome.HealthCheckResult    `json:"outcome_health,omitempty"`
-	BackendHealth       map[string]BackendHealth      `json:"backend_health,omitempty"`
-	BackendQuotaUsage   map[string]*BackendQuotaUsage `json:"backend_quota_usage,omitempty"`
-	ProjectStatusSync   map[int]ProjectStatusSync     `json:"project_status_sync,omitempty"`
-	NextSlot            int                           `json:"next_slot"`
-	LastMergeAt         time.Time                     `json:"last_merge_at,omitempty"`
+	Sessions            map[string]*Session                 `json:"sessions"`
+	Missions            map[int]*Mission                    `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision                `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval                          `json:"approvals,omitempty"`
+	LessonProposals     []LessonProposal                    `json:"lesson_proposals,omitempty"`
+	OutcomeHealth       *outcome.HealthCheckResult          `json:"outcome_health,omitempty"`
+	BackendHealth       map[string]BackendHealth            `json:"backend_health,omitempty"`
+	ProviderModelHealth map[string]map[string]BackendHealth `json:"provider_model_health,omitempty"`
+	BackendQuotaUsage   map[string]*BackendQuotaUsage       `json:"backend_quota_usage,omitempty"`
+	ProjectStatusSync   map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
+	NextSlot            int                                 `json:"next_slot"`
+	LastMergeAt         time.Time                           `json:"last_merge_at,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
 	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
@@ -1238,6 +1304,12 @@ type State struct {
 	// short SHA observed when the decision was recorded.
 	ReviewRepairTracks map[string]ReviewRepairTrack `json:"review_repair_tracks,omitempty"`
 
+	// PRGateSnapshots is the authoritative, durable PR/CI/review/merge progress
+	// observed by the orchestrator (#887). Each value is keyed by the exact
+	// project+issue+PR+head+generation identity; notification-dedup and review
+	// re-trigger timer fields deliberately never enter this map.
+	PRGateSnapshots map[string]PRGateSnapshot `json:"pr_gate_snapshots,omitempty"`
+
 	// SpecLintTracks records the last spec-lint result per issue (#851),
 	// keyed by issue number (project scope is the state.json file itself).
 	// The supervisor lints an issue at most once per body change by comparing
@@ -1257,6 +1329,15 @@ type State struct {
 	// idempotency (guaranteed by SpecLintTracks), so a merge that keeps the
 	// on-disk value simply re-examines a window and self-heals next cycle.
 	SpecGroomCursor int `json:"spec_groom_cursor,omitempty"`
+
+	// MaterialProgress is the durable per-project stalled-progress watermark
+	// and last recovery decision (#887). It records the last material progress
+	// identity/time across the full lifecycle (issue → worker → PR/CI/review →
+	// merge/release → approval-gated delivery) and survives daemon restart
+	// without resetting or duplicating the deadline, because the deadline is
+	// always derived from Watermark.At + the silence budget. nil until the
+	// watchdog has evaluated at least once.
+	MaterialProgress *MaterialProgress `json:"material_progress,omitempty"`
 
 	loadedHash  string
 	loadedState *State
@@ -1406,12 +1487,14 @@ type ProjectStatusSync struct {
 
 func NewState() *State {
 	return &State{
-		Sessions:          make(map[string]*Session),
-		Missions:          make(map[int]*Mission),
-		ProjectStatusSync: make(map[int]ProjectStatusSync),
-		BackendHealth:     make(map[string]BackendHealth),
-		SpecLintTracks:    make(map[int]SpecLintTrack),
-		NextSlot:          1,
+		Sessions:            make(map[string]*Session),
+		Missions:            make(map[int]*Mission),
+		ProjectStatusSync:   make(map[int]ProjectStatusSync),
+		BackendHealth:       make(map[string]BackendHealth),
+		ProviderModelHealth: make(map[string]map[string]BackendHealth),
+		SpecLintTracks:      make(map[int]SpecLintTrack),
+		PRGateSnapshots:     make(map[string]PRGateSnapshot),
+		NextSlot:            1,
 	}
 }
 
@@ -1562,6 +1645,44 @@ func Save(stateDir string, s *State) error {
 	return nil
 }
 
+// Update applies fn to the latest state snapshot while holding the per-project
+// flock, then persists that exact mutation before releasing the lock. It is the
+// compare-and-swap boundary for operations that must validate current identity
+// immediately before changing durable ownership, such as watchdog recovery
+// lease claims. fn must not perform external side effects or re-enter Load/Save.
+func Update(stateDir string, fn func(*State) error) error {
+	if fn == nil {
+		return fmt.Errorf("update state: nil callback")
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+	unlock, err := lockState(stateDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	current, data, err := readStateFile(StatePath(stateDir))
+	if err != nil {
+		return err
+	}
+	current.rememberLoaded(data)
+	if err := fn(current); err != nil {
+		if errors.Is(err, ErrNoStateChange) {
+			return nil
+		}
+		return err
+	}
+	if err := saveLocked(stateDir, current); err != nil {
+		return err
+	}
+	if hook := currentSaveHook(); hook != nil {
+		hook(stateDir, current)
+	}
+	return nil
+}
+
 func saveLocked(stateDir string, s *State) error {
 	if s == nil {
 		s = NewState()
@@ -1666,8 +1787,14 @@ func (s *State) normalize() {
 	if s.BackendHealth == nil {
 		s.BackendHealth = make(map[string]BackendHealth)
 	}
+	if s.ProviderModelHealth == nil {
+		s.ProviderModelHealth = make(map[string]map[string]BackendHealth)
+	}
 	if s.SpecLintTracks == nil {
 		s.SpecLintTracks = make(map[int]SpecLintTrack)
+	}
+	if s.PRGateSnapshots == nil {
+		s.PRGateSnapshots = make(map[string]PRGateSnapshot)
 	}
 	if s.NextSlot == 0 {
 		s.NextSlot = 1
@@ -1683,8 +1810,10 @@ func (s *State) copyFrom(src *State) {
 	s.OutcomeHealth = src.OutcomeHealth
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
+	s.ProviderModelHealth = src.ProviderModelHealth
 	s.BackendQuotaUsage = src.BackendQuotaUsage
 	s.SpecLintTracks = src.SpecLintTracks
+	s.PRGateSnapshots = src.PRGateSnapshots
 	s.SpecGroomCursor = src.SpecGroomCursor
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
@@ -1692,6 +1821,16 @@ func (s *State) copyFrom(src *State) {
 	s.SpawnDrainAt = src.SpawnDrainAt
 	s.Paused = src.Paused
 	s.PausedAt = src.PausedAt
+	s.MaterialProgress = src.MaterialProgress
+	// Keep the caller's in-memory snapshot aligned with the merged file. Save
+	// calls copyFrom after a three-way merge, then rememberLoaded records the
+	// merged file hash. Omitting the heartbeat tuple here leaves a long-lived
+	// writer (notably the material-progress watchdog) holding an older pulse
+	// while believing it loaded the current file. Its next non-conflicting save
+	// can then regress LastRunOnceAt and resurrect an obsolete stuck verdict.
+	s.LastRunOnceAt = src.LastRunOnceAt
+	s.SupervisorStuck = src.SupervisorStuck
+	s.SupervisorStuckReason = src.SupervisorStuckReason
 }
 
 func cloneState(s *State) *State {
@@ -1734,13 +1873,50 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
+	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
+	merged.ProviderModelHealth = mergeProviderModelHealth(current.ProviderModelHealth, ours.ProviderModelHealth)
 	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
 	mergeSpawnDrain(merged, current, ours)
 	mergePaused(merged, current, ours)
+	mergeSupervisorHeartbeat(merged, current, ours)
+	mergeMaterialProgress(merged, current, ours)
 	return merged, nil
+}
+
+// mergeSupervisorHeartbeat preserves the newest completed supervisor pulse
+// across ordinary three-way merges. The orchestrator and material-progress
+// evaluator write the same state concurrently; before this field-specific
+// merge, their otherwise-compatible writes silently kept current's old pulse
+// while accepting the new supervisor decision. Stuck state follows the pulse
+// that produced it. At an equal pulse, a watchdog's stuck=true wins so an
+// unrelated save cannot erase a real overdue verdict; a later RunOnce clears it
+// by advancing LastRunOnceAt.
+func mergeSupervisorHeartbeat(merged, current, ours *State) {
+	switch {
+	case ours.LastRunOnceAt.After(current.LastRunOnceAt):
+		merged.LastRunOnceAt = ours.LastRunOnceAt
+		merged.SupervisorStuck = ours.SupervisorStuck
+		merged.SupervisorStuckReason = ours.SupervisorStuckReason
+	case current.LastRunOnceAt.After(ours.LastRunOnceAt):
+		merged.LastRunOnceAt = current.LastRunOnceAt
+		merged.SupervisorStuck = current.SupervisorStuck
+		merged.SupervisorStuckReason = current.SupervisorStuckReason
+	default:
+		merged.LastRunOnceAt = current.LastRunOnceAt
+		if current.SupervisorStuck || ours.SupervisorStuck {
+			merged.SupervisorStuck = true
+			merged.SupervisorStuckReason = current.SupervisorStuckReason
+			if merged.SupervisorStuckReason == "" {
+				merged.SupervisorStuckReason = ours.SupervisorStuckReason
+			}
+			return
+		}
+		merged.SupervisorStuck = false
+		merged.SupervisorStuckReason = ""
+	}
 }
 
 // mergeSpawnDrain resolves the drain flag (#541) latest-write-wins by
@@ -1813,6 +1989,35 @@ func mergeBackendHealth(current, ours map[string]BackendHealth) map[string]Backe
 		}
 	}
 	return merged
+}
+
+func mergeProviderModelHealth(current, ours map[string]map[string]BackendHealth) map[string]map[string]BackendHealth {
+	if len(current) == 0 && len(ours) == 0 {
+		return nil
+	}
+	merged := make(map[string]map[string]BackendHealth)
+	for _, provider := range unionBackendHealthKeysForNested(current, ours) {
+		models := mergeBackendHealth(current[provider], ours[provider])
+		if len(models) > 0 {
+			merged[provider] = models
+		}
+	}
+	return merged
+}
+
+func unionBackendHealthKeysForNested(maps ...map[string]map[string]BackendHealth) []string {
+	seen := make(map[string]struct{})
+	for _, values := range maps {
+		for key := range values {
+			seen[key] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func unionBackendHealthKeys(maps ...map[string]BackendHealth) []string {
@@ -3883,7 +4088,7 @@ const MaxBackendCooldownTTL = 24 * time.Hour
 // Returns true when at least one entry was cleared so the caller can
 // decide whether to persist the change.
 func ReconcileBackendHealth(s *State, now time.Time) bool {
-	if s == nil || len(s.BackendHealth) == 0 {
+	if s == nil || (len(s.BackendHealth) == 0 && len(s.ProviderModelHealth) == 0) {
 		return false
 	}
 	changed := false
@@ -3910,6 +4115,25 @@ func ReconcileBackendHealth(s *State, now time.Time) bool {
 			delete(s.BackendHealth, name)
 			changed = true
 			continue
+		}
+	}
+	for provider, models := range s.ProviderModelHealth {
+		for model, health := range models {
+			if health.State != BackendHealthCooldown {
+				continue
+			}
+			if health.RetryAfter != nil && !now.Before(*health.RetryAfter) {
+				delete(models, model)
+				changed = true
+				continue
+			}
+			if health.RetryAfter == nil && !health.Since.IsZero() && now.Sub(health.Since) >= MaxBackendCooldownTTL {
+				delete(models, model)
+				changed = true
+			}
+		}
+		if len(models) == 0 {
+			delete(s.ProviderModelHealth, provider)
 		}
 	}
 	return changed
@@ -3987,23 +4211,12 @@ func (s *State) DonePRCount() int {
 	return count
 }
 
-// IssueInProgress returns true if the given issue is already being handled.
-// This includes dead sessions with a pending retry (NextRetryAt set) to prevent
-// duplicate worker spawns during backoff periods.
+// IssueInProgress returns true if the given issue already has a durable claim.
+// Claims include active sessions, scheduled retries, retained open-PR
+// maintenance work, and approved repair dispatch reservations.
 func (s *State) IssueInProgress(issueNum int) bool {
-	for _, sess := range s.Sessions {
-		if sess.IssueNumber != issueNum {
-			continue
-		}
-		if sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued || sess.Status == StatusCodeLanded {
-			return true
-		}
-		// Dead session with pending retry — still in progress
-		if sess.Status == StatusDead && sess.NextRetryAt != nil {
-			return true
-		}
-	}
-	return false
+	_, ok := s.IssueClaimFor(issueNum)
+	return ok
 }
 
 // IssueDone returns true if the given issue already has a completed session.

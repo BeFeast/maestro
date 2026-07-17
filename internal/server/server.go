@@ -196,25 +196,26 @@ func SetBinaryVersion(v string) {
 
 // stateResponse is the JSON shape for GET /api/v1/state.
 type stateResponse struct {
-	Repo                string                         `json:"repo"`
-	Version             string                         `json:"version,omitempty"` // running maestro binary version (#698)
-	MaxParallel         int                            `json:"max_parallel"`
-	ReadOnly            bool                           `json:"read_only"`
-	Outcome             outcome.Status                 `json:"outcome"`
-	Actions             []controlAction                `json:"actions,omitempty"`
-	SupervisorPolicy    config.SupervisorConfig        `json:"supervisor_policy"`
-	All                 []sessionInfo                  `json:"all"`
-	Running             []sessionInfo                  `json:"running"`
-	PROpen              []sessionInfo                  `json:"pr_open"`
-	Queued              []sessionInfo                  `json:"queued"`
-	TokenTotals         tokenTotalsInfo                `json:"token_totals"`
-	Summary             map[string]int                 `json:"summary"`
-	StuckStates         []state.SupervisorStuckState   `json:"stuck_states,omitempty"`
-	Supervisor          supervisorInfo                 `json:"supervisor"`
-	SupervisorLatest    *state.SupervisorDecision      `json:"supervisor_latest,omitempty"`
-	SupervisorDecisions []state.SupervisorDecision     `json:"supervisor_decisions,omitempty"`
-	Approvals           []state.Approval               `json:"approvals,omitempty"`
-	BackendHealth       map[string]state.BackendHealth `json:"backend_health,omitempty"`
+	Repo                string                                    `json:"repo"`
+	Version             string                                    `json:"version,omitempty"` // running maestro binary version (#698)
+	MaxParallel         int                                       `json:"max_parallel"`
+	ReadOnly            bool                                      `json:"read_only"`
+	Outcome             outcome.Status                            `json:"outcome"`
+	Actions             []controlAction                           `json:"actions,omitempty"`
+	SupervisorPolicy    config.SupervisorConfig                   `json:"supervisor_policy"`
+	All                 []sessionInfo                             `json:"all"`
+	Running             []sessionInfo                             `json:"running"`
+	PROpen              []sessionInfo                             `json:"pr_open"`
+	Queued              []sessionInfo                             `json:"queued"`
+	TokenTotals         tokenTotalsInfo                           `json:"token_totals"`
+	Summary             map[string]int                            `json:"summary"`
+	StuckStates         []state.SupervisorStuckState              `json:"stuck_states,omitempty"`
+	Supervisor          supervisorInfo                            `json:"supervisor"`
+	SupervisorLatest    *state.SupervisorDecision                 `json:"supervisor_latest,omitempty"`
+	SupervisorDecisions []state.SupervisorDecision                `json:"supervisor_decisions,omitempty"`
+	Approvals           []state.Approval                          `json:"approvals,omitempty"`
+	BackendHealth       map[string]state.BackendHealth            `json:"backend_health,omitempty"`
+	ProviderModelHealth map[string]map[string]state.BackendHealth `json:"provider_model_health,omitempty"`
 }
 
 type supervisorInfo struct {
@@ -334,6 +335,7 @@ type sessionInfo struct {
 	PRURL             string `json:"pr_url,omitempty"`
 	TokensUsedAttempt int    `json:"tokens_used_attempt"`
 	TokensUsedTotal   int    `json:"tokens_used_total"`
+	WorkerOutcome     string `json:"worker_outcome,omitempty"`
 	// #739: cache-aware split token breakdown when the backend stamped it
 	// (claude stream-json / Pi). Surfaced so the cost panel can show the
 	// cache-read discount; zero for backends that report only a combined total.
@@ -388,6 +390,24 @@ type sessionInfo struct {
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
+	if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok && sess.WorkerOutcome == "" {
+		view := *sess
+		if marker.TokensObserved > view.TokensUsedAttempt {
+			delta := marker.TokensObserved - view.TokensUsedAttempt
+			view.TokensUsedAttempt = marker.TokensObserved
+			view.TokensUsedTotal += delta
+		}
+		view.WorkerOutcome = worker.TokenBudgetExceededOutcome
+		view.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
+		view.Status = state.StatusFailed
+		view.PID = 0
+		view.TmuxSession = ""
+		if !marker.MeasuredAt.IsZero() {
+			view.FinishedAt = &marker.MeasuredAt
+			state.MarkWorkerEnded(&view, marker.MeasuredAt)
+		}
+		sess = &view
+	}
 	now := time.Now().UTC()
 	info := sessionInfo{
 		Slot:              slot,
@@ -396,11 +416,12 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		IssueURL:          githubIssueURL(repo, sess.IssueNumber),
 		Status:            string(sess.Status),
 		Backend:           sess.Backend,
-		Model:             sess.Model,
+		Model:             currentSessionModel(sess),
 		PRNumber:          sess.PRNumber,
 		PRURL:             githubPRURL(repo, sess.PRNumber),
 		TokensUsedAttempt: sess.TokensUsedAttempt,
 		TokensUsedTotal:   sess.TokensUsedTotal,
+		WorkerOutcome:     sess.WorkerOutcome,
 		TokensInput:       sess.TokensInput,
 		TokensOutput:      sess.TokensOutput,
 		TokensCacheRead:   sess.TokensCacheRead,
@@ -437,11 +458,14 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	info.WorkflowRuntimeSeconds = info.RuntimeSeconds
 
 	workerEnd := end
-	if sess.WorkerEndedAt != nil {
+	// A running attempt is authoritative over a stale terminal marker left by
+	// an older binary. This also repairs the live projection immediately after
+	// upgrading, before that session is respawned again.
+	if sess.Status == state.StatusRunning {
+		workerEnd = now
+	} else if sess.WorkerEndedAt != nil {
 		workerEnd = *sess.WorkerEndedAt
 		info.WorkerEndedAt = sess.WorkerEndedAt.Format(time.RFC3339)
-	} else if sess.Status == state.StatusRunning {
-		workerEnd = now
 	}
 	workerDur := workerEnd.Sub(sess.StartedAt).Round(time.Second)
 	if workerDur < 0 {
@@ -491,6 +515,23 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	}
 
 	return info
+}
+
+// currentSessionModel returns the model for the live route. A backend may not
+// self-report usage/model data immediately (or at all), so the active
+// attribution segment is the truthful configured fallback. Terminal sessions
+// retain the last self-reported model for historical display.
+func currentSessionModel(sess *state.Session) string {
+	if sess == nil {
+		return ""
+	}
+	if sess.Status == state.StatusRunning && len(sess.Attribution) > 0 {
+		active := sess.Attribution[len(sess.Attribution)-1]
+		if active.EndedAt == nil && active.Backend == sess.Backend && strings.TrimSpace(active.Model) != "" {
+			return active.Model
+		}
+	}
+	return sess.Model
 }
 
 func githubIssueURL(repo string, issueNumber int) string {
@@ -1023,6 +1064,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 		Outcome:             outcomeStatusForState(cfg, st),
 		Actions:             projectActionAffordances(cfg.Server.ReadOnly, "/api/v1/actions", cfg.Repo),
 		BackendHealth:       st.BackendHealth,
+		ProviderModelHealth: st.ProviderModelHealth,
 		SupervisorPolicy:    cfg.Supervisor,
 		All:                 make([]sessionInfo, 0, len(st.Sessions)),
 		Running:             make([]sessionInfo, 0),

@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/befeast/maestro/internal/outcome"
+	"github.com/befeast/maestro/internal/progress"
 	"gopkg.in/yaml.v3"
 )
 
@@ -599,6 +600,10 @@ const (
 	// respawn.
 	SupervisorActionRestartWorker = "restart_worker"
 	SupervisorActionStopWorker    = "stop_worker"
+	// SupervisorActionSpawnRepairWorker resumes one explicitly reserved
+	// issue/session in place. Unlike restart_worker it preserves a retained
+	// worktree and never allocates a replacement slot.
+	SupervisorActionSpawnRepairWorker = "spawn_repair_worker"
 	// SupervisorActionSpawnReviewRepair is the auto review-repair respawn verb
 	// minted by the supervisor when a green+mergeable PR is settled
 	// retry_exhausted on review feedback and at least one Greptile P0/P1
@@ -1653,6 +1658,100 @@ func (c SessionRetentionConfig) EffectiveArchiveFile(stateDir string) string {
 	return filepath.Join(stateDir, "sessions-archive.jsonl")
 }
 
+// StalledProgressWatchdogConfig configures the durable per-project
+// stalled-progress watchdog (#887).
+//
+// It supersedes the legacy `worker_silent_timeout_minutes`, which watched
+// terminal output only — so it could kill a worker that was actively editing
+// files without emitting output, and when disabled (0/absent) it could not
+// recover a genuinely hung-but-alive worker. The watchdog instead derives one
+// material-progress watermark from whichever phase-appropriate signals are
+// present (issue/session + lease, process/tmux identity, terminal/checkpoint,
+// bounded git evidence, PR/CI/review, delivery lease) and only recommends an
+// action when *no* signal has advanced for the whole silence budget.
+//
+// The default is a 20-minute maximum silence for new hands-off projects. A
+// stall in a safe pre-delivery phase asks the orchestrator to stop the single
+// stale worker and retry once under the existing retry budget; a stall on an
+// executing/uncertain delivery lease is surfaced for operator reconciliation
+// and never replayed (#872).
+type StalledProgressWatchdogConfig struct {
+	Enabled           *bool `yaml:"enabled,omitempty"`               // explicit opt-in; external lifecycle tooling may set true only after accepted runtime evidence
+	MaxSilenceMinutes int   `yaml:"max_silence_minutes,omitempty"`   // default: 20 (0 = default; negative = disabled)
+	EvalIntervalSecs  int   `yaml:"eval_interval_seconds,omitempty"` // watchdog evaluation cadence; default: 60
+}
+
+// IsEnabled reports whether the stalled-progress watchdog is explicitly
+// enabled. Missing config is inactive: upgrading Maestro must not silently arm
+// recovery across every legacy project. Maestro's own genesis does not
+// auto-enable it; evidence-gated external lifecycle tooling may opt in.
+func (c StalledProgressWatchdogConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
+// EffectiveMaxSilence returns the maximum silence budget before the watchdog
+// recommends an action. A zero MaxSilenceMinutes means "use the 20-minute default"; a negative
+// value (or a disabled watchdog) returns 0, which the evaluator treats as
+// "disabled" so no quiet worker is ever killed by a misconfiguration.
+func (c StalledProgressWatchdogConfig) EffectiveMaxSilence() time.Duration {
+	if !c.IsEnabled() || c.MaxSilenceMinutes < 0 {
+		return 0
+	}
+	if c.MaxSilenceMinutes == 0 {
+		return progress.DefaultMaxSilence
+	}
+	return time.Duration(c.MaxSilenceMinutes) * time.Minute
+}
+
+// EffectiveEvalInterval returns the watchdog's own evaluation cadence, which is
+// distinct from the orchestrator poll interval and the supervisor loop cadence
+// (#887 requirement that Fleet report them separately). Default 60s.
+func (c StalledProgressWatchdogConfig) EffectiveEvalInterval() time.Duration {
+	if c.EvalIntervalSecs <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(c.EvalIntervalSecs) * time.Second
+}
+
+// IsActive reports whether the v1 stalled-progress watchdog evaluator is armed.
+// It is deliberately stronger than IsEnabled:
+// an explicit negative silence budget is an operator disable, even when the
+// enabled flag was omitted. Fleet and runtime scheduling use this method so
+// they never advertise or run a watchdog whose effective budget is zero.
+func (c StalledProgressWatchdogConfig) IsActive() bool {
+	return c.EffectiveMaxSilence() > 0
+}
+
+// EffectiveWorkerSilentTimeout returns the deprecated terminal-output-only
+// timeout only when the v1 stalled-progress watchdog is inactive. The two
+// detectors must never run in parallel: doing so lets the legacy detector kill
+// a worker that the multi-signal watchdog correctly sees editing its worktree.
+//
+// Parsed legacy-only configs are migrated to the v1 silence budget below, but
+// this runtime guard also protects programmatically-constructed configs and an
+// older config object during a hot reload.
+func (c *Config) EffectiveWorkerSilentTimeout() time.Duration {
+	if c == nil || c.StalledProgressWatchdog.suppressesLegacyTimeout() || c.WorkerSilentTimeoutMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(c.WorkerSilentTimeoutMinutes) * time.Minute
+}
+
+// suppressesLegacyTimeout is intentionally based on explicit v1 configuration,
+// not IsActive. An enabled:true stanza with an invalid/negative budget must fail
+// closed; otherwise the new watchdog is disabled while the deprecated terminal-
+// only killer unexpectedly remains armed. enabled:false is the sole deliberate
+// compatibility escape hatch.
+func (c StalledProgressWatchdogConfig) suppressesLegacyTimeout() bool {
+	if c.Enabled != nil {
+		return *c.Enabled
+	}
+	return c.MaxSilenceMinutes != 0 || c.EvalIntervalSecs != 0
+}
+
 // ManagementHomeKind enumerates the supported management-home backends (#869).
 // Only "obsidian" is recognised in this slice; parse() rejects any other value
 // so a typo cannot masquerade as a working control-room link.
@@ -1782,62 +1881,67 @@ type Config struct {
 	ProjectID string `yaml:"project_id,omitempty"`
 	// ManagementHome is the optional, descriptive link back to the project's PM /
 	// control-room home (#869). Metadata only — never read or traversed here.
-	ManagementHome                  ManagementHomeConfig         `yaml:"management_home,omitempty"`
-	Outcome                         outcome.Brief                `yaml:"outcome"`
-	LocalPath                       string                       `yaml:"local_path"`
-	WorktreeBase                    string                       `yaml:"worktree_base"`
-	MaxParallel                     int                          `yaml:"max_parallel"`
-	MaxLiveWorkers                  int                          `yaml:"max_live_workers"`              // #814: cap on live implementation workers (StatusRunning). When >0, pr_open PR-gate sessions no longer consume spawn capacity, so a gate-bound queue keeps dispatching live workers up to this limit. 0 = legacy (pr_open counts against max_parallel).
-	MaxConcurrentByState            map[string]int               `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
-	MaxRuntimeMinutes               int                          `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
-	WorkerSilentTimeoutMinutes      int                          `yaml:"worker_silent_timeout_minutes"` // kill running worker if tmux output hash doesn't change for N minutes (0 = disabled)
-	WorkerMaxTokens                 int                          `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
-	WorkerSoftTokenThreshold        *float64                     `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens to trigger checkpoint+respawn (default: 0.8, 0 = disabled)
-	MaxRetriesPerIssue              int                          `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
-	AutoRebase                      bool                         `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
-	ClaudeCmd                       string                       `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
-	IssueLabel                      string                       `yaml:"issue_label"`                   // deprecated: use issue_labels
-	IssueLabels                     []string                     `yaml:"issue_labels"`
-	ExcludeLabels                   []string                     `yaml:"exclude_labels"`
-	WorkerPrompt                    string                       `yaml:"worker_prompt"`
-	BugPrompt                       string                       `yaml:"bug_prompt"`          // prompt template for issues with "bug" label
-	EnhancementPrompt               string                       `yaml:"enhancement_prompt"`  // prompt template for issues with "enhancement" label
-	PromptSections                  []string                     `yaml:"prompt_sections"`     // additional prompt section files appended to the base prompt
-	ValidationContract              bool                         `yaml:"validation_contract"` // generate VALIDATION.md in worktree with test-first guidance
-	SessionPrefix                   string                       `yaml:"session_prefix"`      // worker session name prefix (default: first 3 chars of repo name)
-	StateDir                        string                       `yaml:"state_dir"`           // state/log directory (default: ~/.maestro/<repo-hash>)
-	Model                           ModelConfig                  `yaml:"model"`
-	Routing                         RoutingConfig                `yaml:"routing"`
-	DeployCmd                       string                       `yaml:"deploy_cmd"`                         // deprecated (#872): legacy automatic post-merge deploy; folds into delivery.mode=automatic via EffectiveDelivery
-	DeployTimeoutMinutes            int                          `yaml:"deploy_timeout_minutes"`             // timeout for deploy command in minutes (default: 15)
-	Delivery                        DeliveryConfig               `yaml:"delivery"`                           // #872: approval-gated post-merge delivery (disabled|approval_required|automatic)
-	MergeStrategy                   string                       `yaml:"merge_strategy"`                     // "sequential" | "parallel"
-	MergeIntervalSeconds            int                          `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
-	ReviewGate                      string                       `yaml:"review_gate"`                        // "greptile" (default) | "none"
-	ReviewGateStreams               []string                     `yaml:"review_gate_streams"`                // optional review dimensions; default ["greptile"], opt-in ["greptile","simplicity"]
-	ReviewRetrigger                 ReviewRetriggerConfig        `yaml:"review_retrigger"`                   // #691: re-post "@greptile review" when the gate wedges at pending with no review on head
-	AutoRetryReviewFeedback         bool                         `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
-	MergeExhaustedNonCriticalReview *bool                        `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
-	AutoRetryRebaseConflicts        bool                         `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts
-	Telegram                        TelegramConfig               `yaml:"telegram"`
-	Versioning                      VersioningConfig             `yaml:"versioning"`
-	SelfDeploy                      SelfDeployConfig             `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
-	GitHubProjects                  GitHubProjectsConfig         `yaml:"github_projects"`
-	GitHubApp                       GitHubAppConfig              `yaml:"github_app"`                 // #823: GitHub App auth (app_id + private_key_path + installation_id)
-	GitHubMirror                    GitHubMirrorConfig           `yaml:"github_mirror"`              // #826: mirror-first vs api-direct supervisor/orchestrator reads
-	MaxRetryBackoffMs               int                          `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
-	AutoResolveFiles                []string                     `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
-	AutoRestoreFiles                []string                     `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase
-	CleanupWorktreesOnMerge         *bool                        `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
-	Pipeline                        PipelineConfig               `yaml:"pipeline"`
-	Verify                          VerifyConfig                 `yaml:"verify"` // #705: opt-in post-implementation verify steps (visual evidence)
-	Hooks                           HooksConfig                  `yaml:"hooks"`
-	Missions                        MissionsConfig               `yaml:"missions"`
-	BlockerPatterns                 []string                     `yaml:"blocker_patterns"`         // regex patterns to detect blocker references in issue body for queue skips and dependency_unblock (e.g. "blocked by #(\\d+)"; first capture group must be issue number)
-	PollIntervalSeconds             int                          `yaml:"poll_interval_seconds"`    // override poll interval from config (0 = use CLI flag)
-	StaleSessionReconciler          StaleSessionReconcilerConfig `yaml:"stale_session_reconciler"` // filter stale supervisor sessions from operator attention
-	SessionRetention                SessionRetentionConfig       `yaml:"session_retention"`        // #497: bound state.Sessions growth via terminal-session compaction
-	SourcePath                      string                       `yaml:"-"`                        // path the config was loaded from (not serialized)
+	ManagementHome                  ManagementHomeConfig          `yaml:"management_home,omitempty"`
+	Outcome                         outcome.Brief                 `yaml:"outcome"`
+	LocalPath                       string                        `yaml:"local_path"`
+	WorktreeBase                    string                        `yaml:"worktree_base"`
+	MaxParallel                     int                           `yaml:"max_parallel"`
+	MaxLiveWorkers                  int                           `yaml:"max_live_workers"`              // #814: cap on live implementation workers (StatusRunning). When >0, pr_open PR-gate sessions no longer consume spawn capacity, so a gate-bound queue keeps dispatching live workers up to this limit. 0 = legacy (pr_open counts against max_parallel).
+	MaxConcurrentByState            map[string]int                `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
+	MaxRuntimeMinutes               int                           `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
+	WorkerSilentTimeoutMinutes      int                           `yaml:"worker_silent_timeout_minutes"` // deprecated (#887): terminal-output-only kill; superseded by stalled_progress_watchdog. Kills a running worker if tmux output hash doesn't change for N minutes (0 = disabled)
+	StalledProgressWatchdog         StalledProgressWatchdogConfig `yaml:"stalled_progress_watchdog"`     // #887: explicit-opt-in durable multi-signal watchdog (20-minute max silence when enabled with no override)
+	WorkerMaxTokens                 int                           `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
+	WorkerSoftTokenThreshold        *float64                      `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens to trigger checkpoint+respawn (default: 0.8, 0 = disabled)
+	MaxRetriesPerIssue              int                           `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
+	AutoRebase                      bool                          `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
+	ClaudeCmd                       string                        `yaml:"claude_cmd"`                    // deprecated: use model.backends.claude.cmd
+	IssueLabel                      string                        `yaml:"issue_label"`                   // deprecated: use issue_labels
+	IssueLabels                     []string                      `yaml:"issue_labels"`
+	ExcludeLabels                   []string                      `yaml:"exclude_labels"`
+	WorkerPrompt                    string                        `yaml:"worker_prompt"`
+	BugPrompt                       string                        `yaml:"bug_prompt"`          // prompt template for issues with "bug" label
+	EnhancementPrompt               string                        `yaml:"enhancement_prompt"`  // prompt template for issues with "enhancement" label
+	PromptSections                  []string                      `yaml:"prompt_sections"`     // additional prompt section files appended to the base prompt
+	ValidationContract              bool                          `yaml:"validation_contract"` // generate VALIDATION.md in worktree with test-first guidance
+	SessionPrefix                   string                        `yaml:"session_prefix"`      // worker session name prefix (default: first 3 chars of repo name)
+	StateDir                        string                        `yaml:"state_dir"`           // state/log directory (default: ~/.maestro/<repo-hash>)
+	Model                           ModelConfig                   `yaml:"model"`
+	Routing                         RoutingConfig                 `yaml:"routing"`
+	DeployCmd                       string                        `yaml:"deploy_cmd"`                         // deprecated (#872): legacy automatic post-merge deploy; folds into delivery.mode=automatic via EffectiveDelivery
+	DeployTimeoutMinutes            int                           `yaml:"deploy_timeout_minutes"`             // timeout for deploy command in minutes (default: 15)
+	Delivery                        DeliveryConfig                `yaml:"delivery"`                           // #872: approval-gated post-merge delivery (disabled|approval_required|automatic)
+	MergeStrategy                   string                        `yaml:"merge_strategy"`                     // "sequential" | "parallel"
+	MergeIntervalSeconds            int                           `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
+	ReviewGate                      string                        `yaml:"review_gate"`                        // "greptile" (default) | "none"
+	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default ["greptile"], opt-in ["greptile","simplicity"]
+	ReviewRetrigger                 ReviewRetriggerConfig         `yaml:"review_retrigger"`                   // #691: re-post "@greptile review" when the gate wedges at pending with no review on head
+	AutoRetryReviewFeedback         bool                          `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
+	MergeExhaustedNonCriticalReview *bool                         `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
+	AutoRetryRebaseConflicts        bool                          `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts
+	Telegram                        TelegramConfig                `yaml:"telegram"`
+	Versioning                      VersioningConfig              `yaml:"versioning"`
+	SelfDeploy                      SelfDeployConfig              `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
+	GitHubProjects                  GitHubProjectsConfig          `yaml:"github_projects"`
+	GitHubApp                       GitHubAppConfig               `yaml:"github_app"`                 // #823: GitHub App auth (app_id + private_key_path + installation_id)
+	GitHubMirror                    GitHubMirrorConfig            `yaml:"github_mirror"`              // #826: mirror-first vs api-direct supervisor/orchestrator reads
+	MaxRetryBackoffMs               int                           `yaml:"max_retry_backoff_ms"`       // cap for exponential retry backoff in milliseconds (default: 300000 = 5 min)
+	AutoResolveFiles                []string                      `yaml:"auto_resolve_files"`         // files to auto-resolve conflicts by keeping both sides
+	AutoRestoreFiles                []string                      `yaml:"auto_restore_files"`         // dirty files that may be restored before auto-rebase
+	CleanupWorktreesOnMerge         *bool                         `yaml:"cleanup_worktrees_on_merge"` // remove worktrees immediately after PR merge (default: true)
+	Pipeline                        PipelineConfig                `yaml:"pipeline"`
+	Verify                          VerifyConfig                  `yaml:"verify"` // #705: opt-in post-implementation verify steps (visual evidence)
+	Hooks                           HooksConfig                   `yaml:"hooks"`
+	Missions                        MissionsConfig                `yaml:"missions"`
+	BlockerPatterns                 []string                      `yaml:"blocker_patterns"`         // regex patterns to detect blocker references in issue body for queue skips and dependency_unblock (e.g. "blocked by #(\\d+)"; first capture group must be issue number)
+	PollIntervalSeconds             int                           `yaml:"poll_interval_seconds"`    // override poll interval from config (0 = use CLI flag)
+	StaleSessionReconciler          StaleSessionReconcilerConfig  `yaml:"stale_session_reconciler"` // filter stale supervisor sessions from operator attention
+	SessionRetention                SessionRetentionConfig        `yaml:"session_retention"`        // #497: bound state.Sessions growth via terminal-session compaction
+	SourcePath                      string                        `yaml:"-"`                        // path the config was loaded from (not serialized)
+	// RuntimeSuperviseIntervalSeconds is injected by the daemon from the actual
+	// Options.SuperviseInterval that owns the running loop. It is runtime-only:
+	// project YAML cannot claim a cadence the daemon did not schedule.
+	RuntimeSuperviseIntervalSeconds int `yaml:"-" json:"-"`
 	// SettingsSources records, per fleet-controllable settings key (#839), which
 	// layer supplied the effective value: "project" (the project's own YAML),
 	// "fleet" (a config-store settings default), or "builtin". Populated by
@@ -2003,7 +2107,28 @@ func parse(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	var rawRoot yaml.Node
+	_ = yaml.Unmarshal(data, &rawRoot) // the successful decode above already validated YAML
+	v1StanzaPresent := yamlMappingValue(&rawRoot, "stalled_progress_watchdog") != nil
 
+	// #887 legacy migration / mutual exclusion. A legacy-only timeout is an
+	// existing operator opt-in, so migrate its chosen budget to v1 and mark v1
+	// explicitly enabled. Any explicit v1 stanza wins and suppresses legacy even
+	// when its budget disables v1; otherwise enabled:true + max_silence:-1 would
+	// unexpectedly leave the unsafe terminal-only killer armed. Explicit
+	// enabled:false is the sole compatibility escape hatch. No parse result can
+	// run both paths.
+	if cfg.WorkerSilentTimeoutMinutes > 0 {
+		explicitV1Disable := cfg.StalledProgressWatchdog.Enabled != nil && !*cfg.StalledProgressWatchdog.Enabled
+		if !v1StanzaPresent {
+			enabled := true
+			cfg.StalledProgressWatchdog.Enabled = &enabled
+			cfg.StalledProgressWatchdog.MaxSilenceMinutes = cfg.WorkerSilentTimeoutMinutes
+			cfg.WorkerSilentTimeoutMinutes = 0
+		} else if !explicitV1Disable {
+			cfg.WorkerSilentTimeoutMinutes = 0
+		}
+	}
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
 	}
@@ -2239,9 +2364,6 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Supervisor.ApprovalRequiredActions == nil {
 		cfg.Supervisor.ApprovalRequiredActions = []string{
 			"review_retry_exhausted",
-			"spawn_worker",
-			"spawn_repair_worker",
-			"spawn_review_repair",
 			"label_issue_ready",
 			"add_ready_label",
 			"open_child_issue",
@@ -2824,6 +2946,7 @@ func knownSupervisorActions() map[string]bool {
 		SupervisorActionDeleteWorktree:      true,
 		SupervisorActionChangeGlobalConfig:  true,
 		SupervisorActionApplyLessonProposal: true,
+		SupervisorActionSpawnRepairWorker:   true,
 		SupervisorActionSpawnReviewRepair:   true,
 		SupervisorActionRestartWorker:       true,
 		SupervisorActionStopWorker:          true,
@@ -2844,6 +2967,7 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionDeleteWorktree,
 		SupervisorActionChangeGlobalConfig,
 		SupervisorActionApplyLessonProposal,
+		SupervisorActionSpawnRepairWorker,
 		SupervisorActionSpawnReviewRepair,
 		SupervisorActionRestartWorker,
 		SupervisorActionStopWorker,

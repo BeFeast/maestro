@@ -31,7 +31,7 @@ Mission Control (MC) is the fleet web dashboard maestro serves at `http://127.0.
 
 ![Project view](docs/images/mc/project.png)
 
-*Project view (`/project/<name>`) — single-project drill-down: attention/next-action, live workers, health, project board, and recent supervisor decisions.*
+*Project view (`/project/<name>`) — single-project drill-down: attention/next-action, live workers, health, independent orchestrator/supervisor/watchdog cadences, stalled-progress contract/deadline/recommendation state, project board, and recent supervisor decisions.*
 
 ![Workers](docs/images/mc/workers.png)
 
@@ -247,7 +247,10 @@ management_home:
   vault_path: Dev/Areas/project
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
-worker_silent_timeout_minutes: 0   # kill worker if tmux output is unchanged for N minutes (0 = disabled)
+stalled_progress_watchdog:         # explicit opt-in multi-signal evaluator
+  enabled: true
+  max_silence_minutes: 20          # exact-lease worker recovery; runtime-live contract remains canary-gated
+  eval_interval_seconds: 60        # independent local evaluation cadence
 worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 merge_strategy: sequential         # "sequential" (default) or "parallel"
@@ -359,6 +362,14 @@ model:
 ```
 
 When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` (claude) or `--json` (codex) in `extra_args` overrides it. Claude reports its own `total_cost_usd`; codex does not, so its cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
+
+When `worker_max_tokens` is positive, structured usage is no longer optional:
+Maestro fails the worker start closed if the selected backend/output mode cannot
+enforce a live ceiling. Claude, Pi, and OpenCode stop from their usage event
+stream; Codex combines cumulative rollout `token_count` telemetry with its
+native rollout budget inside the agent loop (`--ephemeral` is rejected).
+Enforcement lags by at most one provider response, not by the orchestration poll
+interval.
 
 ### Optional worker MCP tools
 
@@ -627,6 +638,13 @@ systemctl --user enable --now maestro.service
 systemctl --user list-units 'maestro*'
 journalctl --user -u maestro.service -f
 ```
+
+Provider tokens/keys must not be literal `Environment=` values. Install one
+owner-only service credential file and reference it with
+`MAESTRO_WORKER_CREDENTIALS_FILE`; see the
+[worker credential boundary and migration runbook](docs/worker-credential-boundary-runbook.md).
+Generated workers receive values only at process start and persist names/path
+references only.
 
 The whole cutover (seed store → stop legacy units → start the daemon → verify
 `:8786/api/v1/fleet`) is automated by `scripts/migrate-to-daemon.sh`:

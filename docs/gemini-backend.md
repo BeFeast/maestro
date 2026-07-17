@@ -22,19 +22,33 @@ Authenticate with Google:
 gemini auth
 ```
 
-Or set the `GEMINI_API_KEY` environment variable:
+Or have your secret manager populate the `GEMINI_API_KEY` environment variable.
+Do not put the value in a shell argument or history. For a direct, interactive
+Gemini CLI session (not a Maestro daemon), read it silently and export the
+variable only for that session:
 
 ```bash
-export GEMINI_API_KEY="your-api-key-here"
+read -rsp 'Gemini API key: ' GEMINI_API_KEY && echo
+export GEMINI_API_KEY
 ```
 
-If running maestro as a systemd service, add the key to your service environment:
+Maestro fails closed when provider variables are ambient without an explicit
+private-file boundary. For Maestro workers, use the service file below instead
+of relying on a shell export.
+
+For the systemd service, put the assignment in Maestro's owner-only service
+credential file and reference that file from a drop-in. The unit contains paths
+and names only — never a literal key:
 
 ```ini
 [Service]
-Environment=GEMINI_API_KEY=your-api-key-here
+EnvironmentFile=%h/.config/maestro/private/worker-proxy.env
+Environment=MAESTRO_WORKER_CREDENTIALS_FILE=%h/.config/maestro/private/worker-proxy.env
 Environment=PATH=/usr/local/bin:/usr/bin:/home/user/.npm-global/bin
 ```
+
+See the [worker credential boundary runbook](worker-credential-boundary-runbook.md)
+for ownership/mode, migration, rotation, and rollback requirements.
 
 ## Configuration
 
@@ -148,8 +162,8 @@ Re-authenticate:
 gemini auth
 ```
 
-Or verify your API key:
+Verify presence without printing the value:
 
 ```bash
-echo $GEMINI_API_KEY
+test -n "${GEMINI_API_KEY:-}" && echo 'GEMINI_API_KEY is set' || echo 'GEMINI_API_KEY is unset'
 ```

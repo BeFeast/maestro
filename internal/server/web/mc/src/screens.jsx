@@ -11,6 +11,7 @@ import {
   fetchWorkerDetail,
   formatAttributionSegment,
   formatAttributionTimeline,
+	formatCountdown,
   formatTokens,
   formatUSD,
   isApprovalActionCloseIssue,
@@ -285,6 +286,8 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
           </div>
         </Panel>
 
+		<WatchdogPanel watchdog={p.stalledProgressWatchdog} cadences={p.cadences} now={now} />
+
         {p.projectBoard && <ProjectBoardPanel board={p.projectBoard} />}
 
         <ManagementHomePanel home={p.managementHome} projectId={p.projectId} />
@@ -320,6 +323,87 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
       </div>
     </div>
   );
+}
+
+// WatchdogPanel exposes the three independent runtime cadences and keeps an
+// evaluator recommendation distinct from a proven actuator attempt. Until the
+// durable live-canary proof source exists, an enabled v1 evaluator is rendered
+// as contract pending rather than capability-complete.
+export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
+  const cadence = cadences || {};
+  const sub = !watchdog
+    ? "not reported"
+    : !watchdog.enabled
+      ? "disabled"
+      : watchdog.contractPending
+        ? "contract pending"
+        : (watchdog.contract || "enabled");
+	const deadlineSeconds = watchdog?.nextDeadlineAt
+	  ? Math.round((parseTimestamp(watchdog.nextDeadlineAt) - now) / 1000)
+	  : null;
+  const deadline = watchdog?.configPendingEvaluation
+    ? "pending config evaluation"
+    : watchdog?.nextDeadlineAt
+	  ? watchdog.pastDeadline
+		? `past by ${formatCountdown(Math.abs(deadlineSeconds))}`
+		: `in ${formatCountdown(deadlineSeconds)}`
+      : "—";
+  const recommendation = watchdog?.lastRecommendation;
+  const recovery = watchdog?.lastRecovery;
+
+  return (
+    <Panel title="Stalled-progress watchdog" sub={sub}>
+      <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+        <div className="kv"><span>Orchestrator cadence</span><strong className="mono">{formatCadence(cadence.orchestratorSeconds)}</strong></div>
+        <div className="kv"><span>Supervisor cadence</span><strong className="mono">{formatCadence(cadence.supervisorSeconds)}</strong></div>
+        <div className="kv"><span>Watchdog cadence</span><strong className="mono">{formatCadence(cadence.watchdogSeconds || watchdog?.evaluationIntervalSeconds)}</strong></div>
+        {watchdog && (
+          <>
+            <div className="kv"><span>Mode</span><strong className="mono">{watchdog.mode || "—"}</strong></div>
+            <div className="kv">
+              <span>Contract</span>
+              <strong style={{ color: watchdog.contractPending ? "var(--watch)" : "var(--fg-1)" }}>
+                {watchdog.contract || (watchdog.contractPending ? "pending live-canary proof" : "not published")}
+              </strong>
+            </div>
+            <div className="kv"><span>Silence budget</span><strong className="mono">{watchdog.enabled ? formatCadence(watchdog.silenceBudgetSeconds) : "0s"}</strong></div>
+            <div className="kv"><span>Active targets</span><strong className="mono">{watchdog.activeTargetCount}</strong></div>
+            <div className="kv"><span>Next deadline</span><strong className="mono" style={{ color: watchdog.pastDeadline ? "var(--stuck)" : "var(--fg-1)" }}>{deadline}</strong></div>
+			<div className="kv">
+			  <span>Evidence</span>
+			  <strong style={{ color: watchdog.observationIncomplete ? "var(--watch)" : "var(--ok)" }}>
+				{watchdog.observationIncomplete
+				  ? `incomplete (${watchdog.unavailableSignals.join(", ") || "unknown"}) · recovery suppressed`
+				  : "complete"}
+			  </strong>
+			</div>
+            <div className="kv">
+              <span>Last recommendation</span>
+              <strong className="mono" title={recommendation?.reason || undefined}>
+                {recommendation?.action ? recommendation.action.replace(/_/g, " ") : "none"}
+              </strong>
+            </div>
+            <div className="kv">
+              <span>Actual recovery</span>
+              <strong className="mono" title={recovery?.reason || undefined}>
+                {recovery?.action
+                  ? `${recovery.action.replace(/_/g, " ")} · ${(recovery.stage || recovery.outcome || "attempted").replace(/_/g, " ")}`
+                  : "none recorded"}
+              </strong>
+            </div>
+          </>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+function formatCadence(seconds) {
+  const value = Number(seconds || 0);
+  if (value <= 0) return "—";
+  if (value < 60) return `${value}s`;
+  if (value % 60 === 0) return `${value / 60}m`;
+  return `${Math.floor(value / 60)}m ${value % 60}s`;
 }
 
 // ManagementHomePanel surfaces a project's configured Management Home (#870) on
@@ -747,13 +831,41 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
               <span className="dim" style={{ fontSize: 11, marginLeft: 8 }}>· {allRecent.length} active in last 24 h</span>
               <span className="dim mono" style={{ fontSize: 10.5, marginLeft: "auto" }}>refresh 12s · auto</span>
             </div>
-            {allRecent.length === 0 ? (
+            {allRunning.length === 0 ? (
               <div style={{ padding: "var(--s-8) var(--s-4)", textAlign: "center", color: "var(--fg-2)", background: "var(--bg-1)", borderBottom: "1px solid var(--border-1)" }}>
                 <div style={{ fontSize: 13 }}>No workers running.</div>
                 <div className="mono dim mt-2" style={{ fontSize: 11 }}>{fleet?.daemonAlive ? "Supervisor checking for eligible issues." : "Daemon offline."}</div>
               </div>
-            ) : allRecent.map(w => (
+            ) : allRunning.map(w => (
               <div key={w.slot} data-worker-slot={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
+                <div className="wt-slot">{w.slot}</div>
+                <div className="wt-issue-cell">
+                  <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
+                  <div className="wt-project">{w.project}</div>
+                  <AttributionInline worker={w} now={now} />
+                </div>
+                <div className="wt-status"><Pill tone={w.tone} noDot title={w.status}>{w.status}</Pill></div>
+                <div className="wt-branch mono">
+                  {w.pr ? <>PR #{w.pr}</> : <span className="dim">draft</span>}
+                  {w.branch && (
+                    <div className="wt-branch-name dim" title={w.branch}>{truncateBranchName(w.branch)}</div>
+                  )}
+                </div>
+                <div className="wt-next">{w.summary}</div>
+                <div className="wt-age">{relTime(w.age, now)}</div>
+              </div>
+            ))}
+          </>
+        )}
+
+        {(scope === "live" || scope === "today" || scope === "all") && allRecent.length > 0 && (
+          <>
+            <div className="wt-group">
+              <span className="pill info no-dot" style={{ background: "transparent", border: "none", padding: 0, color: "var(--info)" }}>● active</span>
+              <strong>{allRecent.length} progressing or recent</strong>
+            </div>
+            {allRecent.map(w => (
+              <div key={`${w.slot}-recent`} data-worker-slot={w.slot} className={`wt-row ${selectedSlot === w.slot ? "selected" : ""}`} onClick={() => openDrawer(w)}>
                 <div className="wt-slot">{w.slot}</div>
                 <div className="wt-issue-cell">
                   <div className="wt-issue">#{w.issue.num} {w.issue.title}</div>
@@ -917,6 +1029,7 @@ function WorkerSpendSection({ worker, fleet }) {
   if (!worker) return null;
   const tokens = Number(worker.tokens_used_total || 0);
   const attemptTokens = Number(worker.tokens_used_attempt || 0);
+  const maxTokens = Number(worker.worker_max_tokens || 0);
   const usd = Number(worker.cost_usd_estimate || 0);
   // Find the issue-level rollup so retries are visible on the drawer.
   const projectName = worker.project_name || worker.project || "";
@@ -927,7 +1040,7 @@ function WorkerSpendSection({ worker, fleet }) {
   const issueRow = (project?.costObservability?.perIssue || []).find(
     e => Number(e.issueNumber) === Number(issueNum),
   );
-  if (tokens <= 0 && !(issueRow && issueRow.tokens > 0)) return null;
+  if (tokens <= 0 && maxTokens <= 0 && !(issueRow && issueRow.tokens > 0)) return null;
   return (
     <div className="drawer-sec">
       <div className="drawer-sec-title">Spend</div>
@@ -943,6 +1056,14 @@ function WorkerSpendSection({ worker, fleet }) {
           )}
         </strong>
       </div>
+      {maxTokens > 0 && (
+        <div className="kv">
+          <span>Configured budget</span>
+          <strong className="mono">
+            {formatTokens(attemptTokens)} / {formatTokens(maxTokens)} tok
+          </strong>
+        </div>
+      )}
       {issueRow && (
         <div className="kv">
           <span>Issue #{issueRow.issueNumber} (all attempts)</span>

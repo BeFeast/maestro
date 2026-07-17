@@ -62,6 +62,10 @@ type BackendConfig struct {
 	// --verbose` (#737) and codex `exec --json` (#738). Off by default;
 	// ignored by backends without a structured-stream mode.
 	UsageStream bool
+	// TokenBudget is the active per-attempt hard ceiling. A positive value
+	// requires an enforceable live-usage mode; BuildWorkerCmd fails closed for
+	// backend/output combinations that only reveal usage after process exit.
+	TokenBudget int
 	MCP         config.MCPConfig
 }
 
@@ -152,6 +156,30 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	// operator pinned the model/effort in cmd/extra_args.
 	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindCodex, cfg)
 	args = append(args, cfg.ExtraArgs...)
+	if cfg.TokenBudget > 0 {
+		// codex exec's public JSONL reports usage only at turn completion. The
+		// native rollout budget is enforced inside the agent loop after every
+		// provider response, including sub-agent work, so it is the enforceable
+		// live proxy for the configured Maestro ceiling. Codex 0.144 changed
+		// rollout_budget from a boolean feature to a configured feature object:
+		// `--enable rollout_budget` now replaces that object and discards its
+		// limit. Set the object's enabled field directly and provide the required
+		// reminder thresholds instead.
+		reminders := make([]string, 0, 2)
+		for _, divisor := range []int{5, 10} {
+			threshold := cfg.TokenBudget / divisor
+			if threshold > 0 && threshold < cfg.TokenBudget {
+				reminders = append(reminders, strconv.Itoa(threshold))
+			}
+		}
+		args = append(args,
+			"-c", "features.rollout_budget.enabled=true",
+			"-c", fmt.Sprintf("features.rollout_budget.limit_tokens=%d", cfg.TokenBudget),
+			"-c", fmt.Sprintf("features.rollout_budget.reminder_at_remaining_tokens=[%s]", strings.Join(reminders, ",")),
+			"-c", "features.rollout_budget.sampling_token_weight=1.0",
+			"-c", "features.rollout_budget.prefill_token_weight=1.0",
+		)
+	}
 	args = append(args, "-")
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
@@ -606,11 +634,11 @@ func maestroExecutablePath() (string, bool) {
 // The resolved backend kind is passed to the splitter so it renders the right
 // human-readable form into slot.log.
 func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string) *streamSplit {
-	if !cfg.UsageStream {
+	kind := resolveBackendKind(backendName, cfg)
+	if !cfg.UsageStream && !(cfg.TokenBudget > 0 && kind == config.BackendKindPi) {
 		return nil
 	}
-	kind := resolveBackendKind(backendName, cfg)
-	if kind != config.BackendKindClaude && kind != config.BackendKindCodex && kind != config.BackendKindOpencode {
+	if kind != config.BackendKindClaude && kind != config.BackendKindCodex && kind != config.BackendKindOpencode && kind != config.BackendKindPi {
 		return nil
 	}
 	bin, ok := maestroExecutablePath()
@@ -621,6 +649,8 @@ func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string
 		MaestroBin: bin,
 		Backend:    kind,
 		JSONLPath:  JSONLPathForLog(logFile),
+		MaxTokens:  cfg.TokenBudget,
+		MarkerPath: TokenBudgetMarkerPathForLog(logFile),
 	}
 }
 
@@ -631,12 +661,47 @@ func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string
 // Returns the command, an optional stdinFile path (for backends that read
 // the prompt via stdin, e.g. claude/codex), and any error.
 func BuildWorkerCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
+	if err := validateLiveTokenBudget(backendName, cfg); err != nil {
+		return nil, "", err
+	}
 	if b, ok := knownBackends[resolveBackendKind(backendName, cfg)]; ok {
 		return b.BuildCmd(cfg, promptFile, worktree)
 	}
 
 	// Fallback: use generic backend for unknown backends
 	return (genericBackend{}).BuildCmd(cfg, promptFile, worktree)
+}
+
+func validateLiveTokenBudget(backendName string, cfg BackendConfig) error {
+	if cfg.TokenBudget <= 0 {
+		return nil
+	}
+	kind := resolveBackendKind(backendName, cfg)
+	_, cmdArgs := splitCmd(cfg.Cmd)
+	switch kind {
+	case config.BackendKindClaude:
+		if !cfg.UsageStream || argsHaveOutputFormat(cmdArgs) || argsHaveOutputFormat(cfg.ExtraArgs) {
+			return fmt.Errorf("worker_max_tokens=%d requires claude usage_stream with Maestro-managed stream-json output", cfg.TokenBudget)
+		}
+	case config.BackendKindCodex:
+		if !cfg.UsageStream {
+			return fmt.Errorf("worker_max_tokens=%d requires codex usage_stream so the native rollout budget outcome is observable", cfg.TokenBudget)
+		}
+		if argsHaveFlag(cmdArgs, "--ephemeral") || argsHaveFlag(cfg.ExtraArgs, "--ephemeral") {
+			return fmt.Errorf("worker_max_tokens=%d requires persisted Codex live token telemetry; --ephemeral is not enforceable", cfg.TokenBudget)
+		}
+	case config.BackendKindPi:
+		if argsHaveFlag(cfg.ExtraArgs, "--mode") {
+			return fmt.Errorf("worker_max_tokens=%d requires Pi's Maestro-managed JSON mode", cfg.TokenBudget)
+		}
+	case config.BackendKindOpencode:
+		if !cfg.UsageStream || argsHaveFlag(cfg.ExtraArgs, "--format") {
+			return fmt.Errorf("worker_max_tokens=%d requires OpenCode usage_stream with Maestro-managed JSON output", cfg.TokenBudget)
+		}
+	default:
+		return fmt.Errorf("worker_max_tokens=%d cannot be enforced live for backend %q; disable the budget or use claude, codex, pi, or opencode structured usage", cfg.TokenBudget, backendName)
+	}
+	return nil
 }
 
 // BuildSupervisorCmd creates a read-only model command for supervisor decisions.
