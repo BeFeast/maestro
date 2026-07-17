@@ -4135,7 +4135,8 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 			// delivered PR and this attempt was explicitly reconciled as a
 			// duplicate. Do not hide a genuine failed follow-up merely because
 			// an older session for the issue once completed.
-			if peer.PRNumber > 0 && (candidate.WorkerOutcome == "duplicate_dispatch_reconciled" || fleetSessionStartedAfterCanonicalCompletion(candidate, peer)) {
+			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch &&
+				(candidate.WorkerOutcome == "duplicate_dispatch_reconciled" || fleetSessionStartedAfterCanonicalCompletion(candidate, peer)) {
 				return peer, true
 			}
 		}

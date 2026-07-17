@@ -3977,6 +3977,21 @@ func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForLaterDuplicate(t *t
 	}
 }
 
+func TestFleetSupersedingIssueSessionDoesNotUseReleasedDoneSessionForReopenedFollowUp(t *testing.T) {
+	followUp := sessionInfo{
+		Slot: "ok-player-292", IssueNumber: 343, Status: string(state.StatusDead), NeedsAttention: true,
+		StartedAt: "2026-07-17T23:25:21Z",
+	}
+	oldCompleted := sessionInfo{
+		Slot: "ok-player-262", IssueNumber: 343, Status: string(state.StatusDone), PRNumber: 357,
+		FinishedAt: "2026-07-17T09:37:56Z", ReleasedForRedispatch: true,
+	}
+
+	if got, ok := fleetSupersedingIssueSession(followUp, []sessionInfo{followUp, oldCompleted}); ok {
+		t.Fatalf("released terminal session incorrectly hid reopened follow-up: %+v", got)
+	}
+}
+
 func TestFleetSupersedingIssueSessionUsesCanonicalOpenPR(t *testing.T) {
 	duplicate := sessionInfo{
 		Slot:           "ok-player-259",
