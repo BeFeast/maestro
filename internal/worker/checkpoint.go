@@ -17,6 +17,29 @@ import (
 	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
+const tmuxSpawnReconcileAttempts = 3
+
+var (
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath)
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		out, err := tmuxsession.CommandForSession(tmuxName, "list-panes", "-t", "="+strings.TrimSpace(tmuxName)+":", "-F", "#{pane_pid}\t#{pane_current_path}").Output()
+		if err != nil {
+			return 0, "", err
+		}
+		parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 2)
+		if len(parts) != 2 {
+			return 0, "", fmt.Errorf("unexpected tmux pane identity")
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil || pid <= 0 {
+			return 0, "", fmt.Errorf("invalid tmux pane pid")
+		}
+		return pid, filepath.Clean(strings.TrimSpace(parts[1])), nil
+	}
+)
+
 // WorktreeDirty reports whether a retained worker worktree contains any
 // tracked, staged, or untracked changes. Recovery paths use this before a
 // provider transition so completed work is checkpointed instead of being
@@ -260,19 +283,13 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
-	// Start tmux session in existing worktree
-	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, sess.Worktree, runnerPath); err != nil {
-		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
-	}
-
-	// Get PID
-	pidOut, err := tmuxsession.PanePID(tmuxName)
+	// Start exactly once, then reconcile the result by exact tmux session,
+	// pane PID, and worktree. A command transport error may arrive after tmux
+	// created the runner; observing that exact session adopts it instead of
+	// replaying the runner command and creating two live workers.
+	pid, err := startOrReconcileTmuxSession(tmuxName, sess.Worktree, runnerPath, sess.PID)
 	if err != nil {
-		return fmt.Errorf("tmux list-panes: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
-	if err != nil {
-		return fmt.Errorf("parse pane pid: %w", err)
+		return err
 	}
 
 	log.Printf("[worker] respawned in-place %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
@@ -290,6 +307,30 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	sess.LastOutputChangedAt = time.Time{}
 
 	return nil
+}
+
+func startOrReconcileTmuxSession(tmuxName, worktree, runnerPath string, previousPID int) (int, error) {
+	spawnOut, spawnErr := runTmuxNewSession(tmuxName, worktree, runnerPath)
+	wantWorktree := filepath.Clean(worktree)
+	var observeErr error
+	for i := 0; i < tmuxSpawnReconcileAttempts; i++ {
+		pid, paneWorktree, err := readTmuxPaneIdentity(tmuxName)
+		if err != nil {
+			observeErr = err
+			continue
+		}
+		if paneWorktree != wantWorktree {
+			return 0, fmt.Errorf("tmux spawn identity mismatch")
+		}
+		if spawnErr != nil && previousPID > 0 && pid == previousPID {
+			return 0, fmt.Errorf("tmux spawn left the previous worker session alive")
+		}
+		return pid, nil
+	}
+	if spawnErr != nil {
+		return 0, fmt.Errorf("tmux new-session: %w\n%s", spawnErr, spawnOut)
+	}
+	return 0, fmt.Errorf("tmux list-panes after spawn: %w", observeErr)
 }
 
 // assemblePromptWithCheckpoint builds a prompt that includes checkpoint context

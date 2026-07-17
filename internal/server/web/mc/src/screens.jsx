@@ -363,7 +363,7 @@ export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
             <div className="kv">
               <span>Contract</span>
               <strong style={{ color: watchdog.contractPending ? "var(--watch)" : "var(--fg-1)" }}>
-                {watchdog.contract || (watchdog.contractPending ? "pending actuator/live-canary proof" : "not published")}
+                {watchdog.contract || (watchdog.contractPending ? "pending live-canary proof" : "not published")}
               </strong>
             </div>
             <div className="kv"><span>Silence budget</span><strong className="mono">{watchdog.enabled ? formatCadence(watchdog.silenceBudgetSeconds) : "0s"}</strong></div>
@@ -385,8 +385,10 @@ export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
             </div>
             <div className="kv">
               <span>Actual recovery</span>
-              <strong className="mono">
-                {recovery?.action ? `${recovery.action.replace(/_/g, " ")} · ${recovery.outcome || "attempted"}` : "none recorded"}
+              <strong className="mono" title={recovery?.reason || undefined}>
+                {recovery?.action
+                  ? `${recovery.action.replace(/_/g, " ")} · ${(recovery.stage || recovery.outcome || "attempted").replace(/_/g, " ")}`
+                  : "none recorded"}
               </strong>
             </div>
           </>

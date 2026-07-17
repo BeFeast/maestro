@@ -7827,6 +7827,56 @@ func TestRespawnDueRetries_WithOpenPRRespawnsInPlace(t *testing.T) {
 	}
 }
 
+func TestRespawnDueRetries_StalledProgressResumesExactWorktreeInPlace(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	respawnedFresh := false
+	respawnedInPlace := false
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "test prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test issue"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedFresh = true
+			return nil
+		},
+		respawnInPlaceFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedInPlace = true
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			return nil
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-time.Second)
+	s := state.NewState()
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber: 112,
+		IssueTitle:  "test issue",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		RetryReason: state.RetryReasonStalledProgress,
+		Branch:      "feat/mae-12-112-test",
+		Worktree:    "/tmp/maestro-mae-12",
+	}
+
+	o.respawnDueRetries(s, 1)
+
+	if !respawnedInPlace || respawnedFresh {
+		t.Fatalf("stalled-progress respawn: in_place=%t fresh=%t", respawnedInPlace, respawnedFresh)
+	}
+	if s.Sessions["mae-12"].Worktree != "/tmp/maestro-mae-12" {
+		t.Fatalf("stalled-progress retry changed worktree: %+v", s.Sessions["mae-12"])
+	}
+}
+
 // #874: restart_worker on a finished pr_open session tears down the worktree
 // and (via the restart controller) clears sess.Worktree/PRNumber. The dead
 // session that respawnDueRetries then picks up must take the FRESH respawn

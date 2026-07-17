@@ -1646,8 +1646,10 @@ type fleetSignalProgress struct {
 type fleetProgressRecovery struct {
 	Action                string   `json:"action"`
 	Outcome               string   `json:"outcome,omitempty"`
+	Stage                 string   `json:"stage,omitempty"`
 	RecommendationID      string   `json:"recommendation_id,omitempty"`
 	Reason                string   `json:"reason,omitempty"`
+	LeaseGeneration       int      `json:"lease_generation,omitempty"`
 	Phase                 string   `json:"phase,omitempty"`
 	At                    string   `json:"at,omitempty"`
 	CompletedAt           string   `json:"completed_at,omitempty"`
@@ -5476,7 +5478,10 @@ func fleetProgressActualRecoveryFrom(recovery *progress.Recovery, now time.Time)
 	r := &fleetProgressRecovery{
 		Action:           string(recovery.Action),
 		Outcome:          string(recovery.Outcome),
+		Stage:            string(recovery.Stage),
 		RecommendationID: strings.TrimSpace(recovery.RecommendationID),
+		Reason:           string(recovery.Reason),
+		LeaseGeneration:  recovery.LeaseGeneration,
 	}
 	if !recovery.AttemptedAt.IsZero() {
 		r.At = formatFleetTime(recovery.AttemptedAt)

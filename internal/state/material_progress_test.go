@@ -142,6 +142,64 @@ func TestRecordMaterialRecovery_ExplicitExactlyOnceAttemptAndResult(t *testing.T
 	}
 }
 
+func TestMaterialProgressRecoveryLease_ExpiresAndRejectsStaleCompletion(t *testing.T) {
+	s := NewState()
+	worker := workerObservation(10, "1", 101, "lease-a", "head-a1")
+	recordOne(t, s, worker, time.Minute, mpBase)
+	decision := recordOne(t, s, worker, time.Minute, mpBase.Add(2*time.Minute))
+	key := worker.Target.Key()
+	claimed, err := s.ClaimMaterialRecovery(key, decision.RecommendationID, "lease-1", time.Minute, mpBase.Add(2*time.Minute))
+	if err != nil || !claimed {
+		t.Fatalf("first claim: claimed=%t err=%v", claimed, err)
+	}
+	claimed, err = s.ClaimMaterialRecovery(key, decision.RecommendationID, "lease-2", time.Minute, mpBase.Add(2*time.Minute+30*time.Second))
+	if err != nil || claimed {
+		t.Fatalf("live lease takeover: claimed=%t err=%v", claimed, err)
+	}
+	claimed, err = s.ClaimMaterialRecovery(key, decision.RecommendationID, "lease-2", time.Minute, mpBase.Add(4*time.Minute))
+	if err != nil || !claimed {
+		t.Fatalf("expired lease takeover: claimed=%t err=%v", claimed, err)
+	}
+	if err := s.CompleteMaterialRecovery(key, decision.RecommendationID, "lease-1", progress.RecoverySucceeded,
+		progress.RecoveryStageRetryScheduled, progress.RecoveryReasonRetryScheduled, mpBase.Add(4*time.Minute)); err == nil {
+		t.Fatal("stale lease completed a newer recovery claim")
+	}
+	if err := s.CompleteMaterialRecovery(key, decision.RecommendationID, "lease-2", progress.RecoverySucceeded,
+		progress.RecoveryStageRetryScheduled, progress.RecoveryReasonRetryScheduled, mpBase.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	recovery := targetRecord(t, s, worker).LastRecovery()
+	if recovery == nil || recovery.LeaseGeneration != 2 || recovery.Outcome != progress.RecoverySucceeded {
+		t.Fatalf("recovery = %+v", recovery)
+	}
+}
+
+func TestMaterialProgressRecoveryLease_RejectsTakeoverAfterProgress(t *testing.T) {
+	s := NewState()
+	worker := workerObservation(10, "1", 101, "lease-a", "head-a1")
+	recordOne(t, s, worker, time.Minute, mpBase)
+	decision := recordOne(t, s, worker, time.Minute, mpBase.Add(2*time.Minute))
+	key := worker.Target.Key()
+	claimed, err := s.ClaimMaterialRecovery(key, decision.RecommendationID, "lease-1", time.Minute, mpBase.Add(2*time.Minute))
+	if err != nil || !claimed {
+		t.Fatalf("first claim: claimed=%t err=%v", claimed, err)
+	}
+
+	advanced := workerObservation(10, "1", 101, "lease-a", "head-a2")
+	advancedDecision := recordOne(t, s, advanced, time.Minute, mpBase.Add(3*time.Minute))
+	if advancedDecision.Action != progress.ActionNone {
+		t.Fatalf("advanced decision = %+v", advancedDecision)
+	}
+	claimed, err = s.ClaimMaterialRecovery(key, decision.RecommendationID, "lease-2", time.Minute, mpBase.Add(4*time.Minute))
+	if err != nil || claimed {
+		t.Fatalf("stale recovery takeover: claimed=%t err=%v", claimed, err)
+	}
+	recovery := targetRecord(t, s, advanced).LastRecovery()
+	if recovery == nil || recovery.LeaseGeneration != 1 || recovery.LeaseID != "lease-1" {
+		t.Fatalf("stale recovery claim changed = %+v", recovery)
+	}
+}
+
 func TestRecordMaterialProgress_DisabledToEnabledGetsFreshBaseline(t *testing.T) {
 	s := NewState()
 	worker := workerObservation(10, "1", 101, "lease-a", "head-a1")

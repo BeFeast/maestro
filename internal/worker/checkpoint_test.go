@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,85 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
+
+func TestStartOrReconcileTmuxSession_UncertainSpawnAdoptsExactSessionWithoutReplay(t *testing.T) {
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+	})
+	spawnCalls := 0
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+		spawnCalls++
+		return nil, errors.New("command result uncertain")
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		return 202, "/worktrees/slot-1", nil
+	}
+
+	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 101)
+	if err != nil || pid != 202 {
+		t.Fatalf("reconciled spawn: pid=%d err=%v", pid, err)
+	}
+	if spawnCalls != 1 {
+		t.Fatalf("runner spawn calls = %d, want exactly 1", spawnCalls)
+	}
+}
+
+func TestStartOrReconcileTmuxSession_RejectsDifferentSessionIdentity(t *testing.T) {
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+	})
+	spawnCalls := 0
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+		spawnCalls++
+		return nil, errors.New("command result uncertain")
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		return 303, "/worktrees/different-slot", nil
+	}
+
+	if _, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 101); err == nil {
+		t.Fatal("different tmux/worktree identity was adopted")
+	}
+	if spawnCalls != 1 {
+		t.Fatalf("runner spawn calls = %d, want exactly 1", spawnCalls)
+	}
+}
+
+func TestStartOrReconcileTmuxSession_ObservesAfterConfirmedSpawnWithoutReplay(t *testing.T) {
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+	})
+	spawnCalls := 0
+	readCalls := 0
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+		spawnCalls++
+		return nil, nil
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		readCalls++
+		if readCalls < 3 {
+			return 0, "", errors.New("pane not visible yet")
+		}
+		return 404, "/worktrees/slot-1", nil
+	}
+
+	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 0)
+	if err != nil || pid != 404 {
+		t.Fatalf("observed spawn: pid=%d err=%v", pid, err)
+	}
+	if spawnCalls != 1 || readCalls != 3 {
+		t.Fatalf("spawn/read calls = %d/%d, want 1/3", spawnCalls, readCalls)
+	}
+}
 
 func TestRestoreMissingWorktreePreservesExistingBranchHead(t *testing.T) {
 	root := t.TempDir()
