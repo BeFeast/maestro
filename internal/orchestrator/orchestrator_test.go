@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -49,6 +50,76 @@ func TestHashOutput_UsesLast50LinesOnly(t *testing.T) {
 	want := hashOutput(last50)
 	if got != want {
 		t.Fatalf("hashOutput() should only depend on last 50 lines; got %q want %q", got, want)
+	}
+}
+
+func TestRespawnPreservingWorktreeRepairsExistingDirectoryWithInvalidGitMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	base := filepath.Join(root, "worktrees")
+	worktree := filepath.Join(base, "ok-player-277")
+	branch := "feat/ok-player-277-346"
+	for _, args := range [][]string{
+		{"init", "-b", "main", repo},
+		{"-C", repo, "config", "user.email", "test@example.com"},
+		{"-C", repo, "config", "user.name", "Test"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"-C", repo, "add", "base.txt"},
+		{"-C", repo, "commit", "-m", "base"},
+		{"-C", repo, "branch", branch},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: /missing/admin/metadata\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "preserved.txt"), []byte("do not lose\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{LocalPath: repo, WorktreeBase: base}
+	sess := &state.Session{IssueNumber: 346, Worktree: worktree, Branch: branch}
+	respawned := false
+	o := &Orchestrator{
+		cfg:               cfg,
+		restoreWorktreeFn: worker.RestoreMissingWorktree,
+		respawnInPlaceFn: func(_ *config.Config, slotName string, _ *state.Session, _ string, _ github.Issue, _, _ string) error {
+			respawned = true
+			if slotName != "ok-player-277" {
+				t.Fatalf("slot = %q, want canonical ok-player-277", slotName)
+			}
+			out, err := exec.Command("git", "-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != "true" {
+				t.Fatalf("restored worktree unusable: %v: %s", err, out)
+			}
+			return nil
+		},
+	}
+	if err := o.respawnPreservingWorktreeWithConfig(cfg, "ok-player-277", sess, github.Issue{Number: 346}, "prompt", "sol"); err != nil {
+		t.Fatalf("respawn preserving worktree: %v", err)
+	}
+	if !respawned {
+		t.Fatal("canonical in-place respawn was not invoked")
+	}
+	backups, err := filepath.Glob(worktree + ".orphaned-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("orphan backups = %v, %v; want one", backups, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(backups[0], "preserved.txt")); err != nil || string(got) != "do not lose\n" {
+		t.Fatalf("preserved orphan content = %q, %v", got, err)
 	}
 }
 

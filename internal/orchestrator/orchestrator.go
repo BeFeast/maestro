@@ -84,9 +84,12 @@ type Orchestrator struct {
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	getIssueFn      func(number int) (github.Issue, error)
-	// saveCheckpointFn / respawnInPlaceFn: used for soft token threshold checkpoint+respawn
-	saveCheckpointFn func(sess *state.Session) (string, error)
-	respawnInPlaceFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
+	// saveCheckpointFn / restoreWorktreeFn / respawnInPlaceFn: used for soft
+	// token threshold checkpoint+respawn. restoreWorktreeFn lets tests exercise
+	// the production validation path without starting a real model process.
+	saveCheckpointFn  func(sess *state.Session) (string, error)
+	restoreWorktreeFn func(localPath, worktreeBase, slotName, worktree, branch string) error
+	respawnInPlaceFn  func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 
 	// Testing hooks for pipeline phase transitions
 	workerStartPhaseFn func(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error
@@ -789,11 +792,19 @@ func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, s
 	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
 		return o.respawnWorkerWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
 	}
-	if _, statErr := os.Stat(sess.Worktree); errors.Is(statErr, os.ErrNotExist) && o.respawnInPlaceFn == nil {
-		if err := worker.RestoreMissingWorktree(cfg.LocalPath, cfg.WorktreeBase, slotName, sess.Worktree, sess.Branch); err != nil {
+	restoreWorktree := o.restoreWorktreeFn
+	if restoreWorktree == nil && o.respawnInPlaceFn == nil {
+		restoreWorktree = worker.RestoreMissingWorktree
+	}
+	if restoreWorktree != nil {
+		// Directory existence is insufficient: a retained directory can contain
+		// a stale .git pointer after administrative metadata was removed. The
+		// restore helper validates Git usability, preserves an invalid directory,
+		// and recreates only the exact canonical slot/path/branch (#957).
+		if err := restoreWorktree(cfg.LocalPath, cfg.WorktreeBase, slotName, sess.Worktree, sess.Branch); err != nil {
 			return err
 		}
-		log.Printf("[orch] worker %s: recovered missing canonical worktree from existing branch %s", slotName, sess.Branch)
+		log.Printf("[orch] worker %s: verified canonical worktree on existing branch %s", slotName, sess.Branch)
 	}
 	// Unit tests inject an in-place respawner with synthetic paths. Production
 	// never has that hook and therefore still fails closed if a retained
