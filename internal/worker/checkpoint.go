@@ -235,16 +235,9 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
-	sess.Backend = backendName
-	// #513: in-place respawn (post-checkpoint resume) — record a new
-	// segment so the timeline shows where the previous segment ended
-	// and the new one began.
-	recordBackendAttribution(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
-	sess.TokensUsedAttempt = 0
-	sess.WorkerOutcome = ""
+	// #513/#931: start a new attempt projection while preserving the same
+	// worktree/session identity and cumulative attribution history.
+	beginSessionAttempt(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""

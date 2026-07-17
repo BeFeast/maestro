@@ -114,14 +114,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
-	sess.Backend = backendName
+	beginSessionAttempt(cfg, sess, backendName, "phase_transition", "phase_transition", time.Now())
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
-	sess.TokensUsedAttempt = 0
-	sess.WorkerOutcome = ""
 	sess.LastNotifiedStatus = ""
 
 	return nil

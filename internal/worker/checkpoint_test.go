@@ -5,11 +5,57 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
+
+func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.T) {
+	ended := time.Date(2026, 7, 17, 11, 5, 0, 0, time.UTC)
+	started := ended.Add(time.Hour)
+	sess := &state.Session{
+		IssueNumber:          346,
+		PRNumber:             335,
+		Worktree:             "/tmp/kept-worktree",
+		Branch:               "feat/kept-branch",
+		Backend:              "claude",
+		Model:                "claude-fable-5",
+		Status:               state.StatusDead,
+		FinishedAt:           &ended,
+		WorkerEndedAt:        &ended,
+		CostUSDBackend:       1.25,
+		UsageTokensWatermark: 1_730_413,
+		TokensUsedAttempt:    1_730_413,
+		TokensUsedTotal:      1_730_413,
+		WorkerOutcome:        "failed",
+		Attribution: []state.BackendAttribution{{
+			Backend: "claude", Model: "claude-fable-5", StartedAt: ended.Add(-time.Minute),
+		}},
+	}
+	cfg := &config.Config{Model: config.ModelConfig{Backends: map[string]config.BackendDef{
+		"sol": {Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+	}}}
+
+	beginSessionAttempt(cfg, sess, "sol", "in_place_respawn", "in_place_respawn", started)
+
+	if sess.Status != state.StatusRunning || sess.Backend != "sol" || !sess.StartedAt.Equal(started) {
+		t.Fatalf("live attempt = status %q backend %q start %v", sess.Status, sess.Backend, sess.StartedAt)
+	}
+	if sess.FinishedAt != nil || sess.WorkerEndedAt != nil || sess.Model != "" || sess.CostUSDBackend != 0 {
+		t.Fatalf("stale projection retained: finished=%v ended=%v model=%q cost=%v", sess.FinishedAt, sess.WorkerEndedAt, sess.Model, sess.CostUSDBackend)
+	}
+	if sess.TokensUsedAttempt != 0 || sess.UsageTokensWatermark != 0 || sess.WorkerOutcome != "" {
+		t.Fatalf("attempt counters not reset: attempt=%d watermark=%d outcome=%q", sess.TokensUsedAttempt, sess.UsageTokensWatermark, sess.WorkerOutcome)
+	}
+	if sess.TokensUsedTotal != 1_730_413 || sess.Worktree != "/tmp/kept-worktree" || sess.Branch != "feat/kept-branch" || sess.PRNumber != 335 {
+		t.Fatalf("cumulative/session identity changed: total=%d worktree=%q branch=%q PR=%d", sess.TokensUsedTotal, sess.Worktree, sess.Branch, sess.PRNumber)
+	}
+	if len(sess.Attribution) != 2 || sess.Attribution[0].EndedAt == nil || sess.Attribution[1].Backend != "sol" || sess.Attribution[1].Model != "gpt-5.6-sol" || sess.Attribution[1].EndedAt != nil {
+		t.Fatalf("attribution = %+v", sess.Attribution)
+	}
+}
 
 func TestSaveCheckpoint_WritesFile(t *testing.T) {
 	tmpDir := t.TempDir()

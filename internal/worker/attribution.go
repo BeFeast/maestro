@@ -7,6 +7,30 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
+// beginSessionAttempt resets fields whose meaning is scoped to the currently
+// executing backend process while preserving issue/worktree identity and the
+// cumulative attribution/token history. Recovery and phase transitions reuse
+// the same state.Session, so leaving a previous attempt's terminal timestamp or
+// self-reported model behind makes a live replacement look finished (and can
+// label a Sol worker as Fable in Mission Control).
+func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, reason, previousEndReason string, now time.Time) {
+	if sess == nil {
+		return
+	}
+	now = now.UTC()
+	sess.StartedAt = now
+	sess.FinishedAt = nil
+	sess.WorkerEndedAt = nil
+	sess.Status = state.StatusRunning
+	sess.Backend = backendName
+	sess.Model = ""
+	sess.CostUSDBackend = 0
+	sess.UsageTokensWatermark = 0
+	sess.TokensUsedAttempt = 0
+	sess.WorkerOutcome = ""
+	recordBackendAttribution(cfg, sess, backendName, reason, previousEndReason, now)
+}
+
 // recordBackendAttribution appends a new BackendAttribution segment to
 // sess.Attribution and closes the previous one's EndedAt + EndReason.
 // Called from every place that sets sess.Backend (Start, Respawn,

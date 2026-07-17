@@ -334,19 +334,15 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
+	now := time.Now()
 	sess.PRNumber = 0
-	sess.Backend = backendName
-	// #513: stamp the fallover attribution segment.
-	recordBackendAttribution(cfg, sess, backendName, "fallover", "fallover", time.Now())
+	// #513/#931: stamp the fallover segment and clear the previous attempt's
+	// terminal/model projection without losing cumulative history.
+	beginSessionAttempt(cfg, sess, backendName, "fallover", "fallover", now)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
-	sess.TokensUsedAttempt = 0
-	sess.WorkerOutcome = ""
 	// CIFailureOutput and PreviousAttemptFeedback are normally cleared by
 	// respawnDueRetries before this call, but cleared here defensively in
 	// case Respawn is called from other paths.
