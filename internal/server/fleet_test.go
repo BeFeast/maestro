@@ -176,14 +176,15 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if len(resp.Attention) != resp.Summary.NeedsAttention {
 		t.Fatalf("attention inbox len = %d, want %d", len(resp.Attention), resp.Summary.NeedsAttention)
 	}
-	if resp.Projects[0].Name != "One" {
-		t.Fatalf("first project = %q, want One", resp.Projects[0].Name)
+	// Fleet projects are deliberately sorted by current operator priority, so
+	// an attention project may precede the first configured project. Assert the
+	// named project's aggregate instead of depending on live priority order.
+	one := findFleetProject(t, resp.Projects, "One")
+	if len(one.Active) != 2 {
+		t.Fatalf("project active len = %d, want 2", len(one.Active))
 	}
-	if len(resp.Projects[0].Active) != 2 {
-		t.Fatalf("project active len = %d, want 2", len(resp.Projects[0].Active))
-	}
-	if !resp.Projects[0].Outcome.Configured || resp.Projects[0].Outcome.Goal != "One is deployed" || resp.Projects[0].Outcome.HealthState != outcome.HealthUnknown {
-		t.Fatalf("project outcome = %+v, want configured unknown health", resp.Projects[0].Outcome)
+	if !one.Outcome.Configured || one.Outcome.Goal != "One is deployed" || one.Outcome.HealthState != outcome.HealthUnknown {
+		t.Fatalf("project outcome = %+v, want configured unknown health", one.Outcome)
 	}
 	if len(resp.Workers) != 4 {
 		t.Fatalf("fleet workers len = %d, want 4", len(resp.Workers))
@@ -210,10 +211,10 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	for _, action := range worker.Actions {
 		assertFleetReadOnlyAction(t, action)
 	}
-	if len(resp.Projects[0].Actions) != 3 {
-		t.Fatalf("project actions = %d, want 3", len(resp.Projects[0].Actions))
+	if len(one.Actions) != 3 {
+		t.Fatalf("project actions = %d, want 3", len(one.Actions))
 	}
-	for _, action := range resp.Projects[0].Actions {
+	for _, action := range one.Actions {
 		assertFleetReadOnlyAction(t, action)
 		if action.Target != "One" {
 			t.Fatalf("project action target = %q, want project name One", action.Target)
@@ -229,8 +230,9 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if !contains(attentionWorker.NextAction, "Fix failing checks") {
 		t.Fatalf("attention next_action = %q, want fix checks guidance", attentionWorker.NextAction)
 	}
-	if resp.Projects[1].NeedsAttention != len(resp.Projects[1].Attention) {
-		t.Fatalf("project attention count = %d, reasons = %d", resp.Projects[1].NeedsAttention, len(resp.Projects[1].Attention))
+	two := findFleetProject(t, resp.Projects, "Two")
+	if two.NeedsAttention != len(two.Attention) {
+		t.Fatalf("project attention count = %d, reasons = %d", two.NeedsAttention, len(two.Attention))
 	}
 }
 
