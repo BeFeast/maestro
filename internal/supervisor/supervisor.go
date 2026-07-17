@@ -631,6 +631,23 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
+			guardReason, guardErr := e.currentIssueRepairGuard(sess.IssueNumber)
+			if guardErr != nil {
+				guardReason = fmt.Sprintf("current issue dispatch guards could not be verified: %v", guardErr)
+			}
+			if guardReason != "" {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
+					"Repair dispatch is fail-closed against the issue's current forge state",
+					guardReason,
+				)
+				target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+				decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+					fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", sess.IssueNumber, guardReason),
+					RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+				decision.StuckStates = stuckStates
+				return decision, nil
+			}
 			reasons := appendReasons(baseReasons,
 				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
 				"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
@@ -944,6 +961,29 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
+}
+
+// currentIssueRepairGuard re-reads the current open issue before the
+// supervisor recommends repair for an existing PR. PR/session state alone is
+// insufficient authority: an operator may have added blocked (or another
+// excluded label) after the worker/approval was created. A missing issue is
+// treated as closed and a read failure is returned so the caller can fail
+// closed without minting another approval.
+func (e *Engine) currentIssueRepairGuard(issueNumber int) (string, error) {
+	issues, err := e.reader.ListOpenIssues(nil)
+	if err != nil {
+		return "", err
+	}
+	for _, issue := range issues {
+		if issue.Number != issueNumber {
+			continue
+		}
+		if label, ok := firstMatchingIssueLabel(issue, e.dynamicWaveExcludedLabels()); ok {
+			return fmt.Sprintf("current issue label %q excludes repair dispatch", label), nil
+		}
+		return "", nil
+	}
+	return "issue is not currently open", nil
 }
 
 func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) {
