@@ -4098,6 +4098,13 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 	if candidate.IssueNumber <= 0 || !candidate.NeedsAttention {
 		return sessionInfo{}, false
 	}
+	// A terminal attempt with its own PR is not merely stale execution state:
+	// it may still require operator action or reconciliation for that distinct
+	// artifact. Only no-PR duplicate attempts may be hidden behind the issue's
+	// canonical live or PR-bearing session.
+	if candidate.PRNumber > 0 {
+		return sessionInfo{}, false
+	}
 	switch state.SessionStatus(candidate.Status) {
 	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
 	default:
@@ -4112,9 +4119,7 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 		}
 		switch state.SessionStatus(peer.Status) {
 		case state.StatusPROpen, state.StatusCodeLanded:
-			if candidate.PRNumber == 0 || candidate.PRNumber == peer.PRNumber {
-				return peer, true
-			}
+			return peer, true
 		}
 	}
 	return sessionInfo{}, false
