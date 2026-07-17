@@ -113,8 +113,23 @@ func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch 
 	if filepath.Clean(actual) != filepath.Clean(expected) {
 		return fmt.Errorf("restore missing worktree: recorded path %q is not deterministic slot path %q", actual, expected)
 	}
-	if _, err := os.Stat(actual); err == nil {
-		return nil
+	backup := ""
+	if info, err := os.Stat(actual); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("restore missing worktree: recorded path %s exists but is not a directory", actual)
+		}
+		if out, gitErr := exec.Command("git", "-C", actual, "rev-parse", "--is-inside-work-tree").CombinedOutput(); gitErr == nil && strings.TrimSpace(string(out)) == "true" {
+			return EnsureWorktreeBranch(actual, branch)
+		}
+		// Cleanup can remove Git's worktree metadata before failing to remove
+		// root-owned build artifacts. Preserve the entire orphaned directory and
+		// restore the deterministic path from the retained branch; directory
+		// existence alone is not proof of a usable worktree.
+		backup = fmt.Sprintf("%s.orphaned-%d", actual, time.Now().UTC().UnixNano())
+		if err := os.Rename(actual, backup); err != nil {
+			return fmt.Errorf("preserve orphaned worktree directory %s: %w", actual, err)
+		}
+		log.Printf("[worker] preserved orphaned worktree directory %s at %s before canonical restore", actual, backup)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat recorded worktree %s: %w", actual, err)
 	}
@@ -126,8 +141,18 @@ func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch 
 	if err := os.MkdirAll(filepath.Dir(actual), 0o755); err != nil {
 		return fmt.Errorf("create worktree parent: %w", err)
 	}
+	// Clear only stale administrative records for paths Git already considers
+	// missing. This never deletes a working tree or branch.
+	if out, err := exec.Command("git", "-C", localPath, "worktree", "prune", "--expire", "now").CombinedOutput(); err != nil {
+		return fmt.Errorf("prune stale worktree metadata before restore: %w: %s", err, strings.TrimSpace(string(out)))
+	}
 	out, err := exec.Command("git", "-C", localPath, "worktree", "add", actual, branch).CombinedOutput()
 	if err != nil {
+		if backup != "" {
+			if _, statErr := os.Stat(actual); errors.Is(statErr, os.ErrNotExist) {
+				_ = os.Rename(backup, actual)
+			}
+		}
 		return fmt.Errorf("restore missing worktree %s on existing branch %s: %w: %s", actual, branch, err, strings.TrimSpace(string(out)))
 	}
 	log.Printf("[worker] restored missing canonical worktree %s on existing branch %s", actual, branch)
