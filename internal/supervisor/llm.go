@@ -186,7 +186,10 @@ func outputWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
 	case err := <-done:
 		return out.Bytes(), err
 	case <-timer.C:
-		worker.KillProcessTree(cmd.Process.Pid)
+		// This is already a hard attempt deadline. Do not spend the worker
+		// reaper's two-second SIGTERM grace period here or the bounded fallback
+		// chain can overrun its advertised total deadline.
+		worker.ForceKillProcessTree(cmd.Process.Pid)
 		<-done
 		return nil, fmt.Errorf("timed out after %s", timeout.Round(time.Second))
 	}
