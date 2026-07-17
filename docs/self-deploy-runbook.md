@@ -298,6 +298,81 @@ Prerequisites on the host:
 > /usr/local/bin/maestro.next failed`) and the merge self-deploys nothing —
 > the symptom that motivated #711.
 
+## In-flight workers across a restart (#877)
+
+A self-deploy restarts `maestro.service`, and each worker's tmux server is a
+child of the daemon, so it lives in the unit's control group. Two mechanisms keep
+an in-flight worker from being silently killed while the daemon reports a
+graceful drain (the 2026-07-12 incident):
+
+1. **Kill ownership — `KillMode=mixed`.** The systemd default
+   (`control-group`) SIGTERMs the *whole* cgroup at once on stop, so the workers
+   died the instant a restart began while the in-process drain still reported
+   them "running". `mixed` sends the stop SIGTERM to the daemon's **main process
+   only**, so worker tmux servers keep running and the drain genuinely waits for
+   them to finish. The final SIGKILL is still sent to the entire control group,
+   so no worker is ever orphaned outside the unit lifecycle — this is
+   deliberately **not** `KillMode=process`, which would leak arbitrary service
+   children out of systemd's management.
+
+2. **Deliberate checkpoint + exactly-once resume.** Any worker still in-flight
+   when the daemon finally exits (drain timeout, or a forced second-SIGTERM
+   shutdown) is checkpointed: the daemon writes a `CHECKPOINT.md` into its
+   worktree and stamps the session with a durable `restart_checkpoint_at`
+   marker. The next daemon's reconcile sees the marker (not a bare dead pid) and
+   **resumes the same logical session in place exactly once** in its surviving
+   dirty worktree — no false `running -> dead`, no duplicate dispatch, no lost
+   work. The supervisor suppresses its `dead_running_pid` finding for a
+   marked-and-self-healing slot so an operator is not nudged to reconcile it.
+
+   The shutdown checkpoint pass is hardened against two edge cases the drain
+   window creates:
+   - **Budget:** `--drain-timeout` defaults to **4m** (under the unit's 6m
+     `TimeoutStopSec`) so ~2m of the stop window is reserved for `stopAll` plus
+     the checkpoint. The pass stamps the (cheap) `restart_checkpoint_at` marker
+     first and treats the git-heavy `CHECKPOINT.md` capture as best-effort,
+     skipping it once a wall-clock budget elapses — so the marker that actually
+     prevents the false `running -> dead` always lands before SIGKILL, even with
+     many in-flight workers.
+   - **Race:** a flow whose cycle outruns the per-flow stop timeout can still
+     save state concurrently with the pass, so the checkpoint save retries on a
+     lost 3-way merge — it reloads, re-reads the flow's fresher session, and
+     re-stamps, so a late flow save neither drops the marker nor is clobbered by
+     it.
+   - **Re-entry:** if a prior resume's new runtime identity did not fully persist
+     (e.g. its state save failed), the next reconcile finds the replacement's
+     tmux session already alive and **adopts** it (refreshes the recorded pid)
+     instead of respawning over it — so a persistence hiccup never kills the
+     running replacement or loses its work.
+
+Because the `KillMode` fix lives in the unit file, not the binary, the deploy
+script ships the unit too (see below): a binary-only deploy would restart under
+the old `KillMode` and never apply the fix.
+
+### Shipping a unit change (#877)
+
+`scripts/self-deploy.sh` installs any required unit change alongside the binary,
+before the restart:
+
+- for each configured unit whose repo copy (built from the deployed SHA) differs
+  from the live installed file (resolved via `systemctl show -p FragmentPath`),
+  it installs the repo copy and runs `daemon-reload` so the restart adopts it. A
+  unit that **existed** is first backed up as `<path>.prev`; a unit **newly
+  installed** this deploy (no prior file) is instead recorded with a
+  `<path>.prev.absent` marker;
+- **rollback reverts every unit it touched** (with a `daemon-reload`) before the
+  binary rollback and restart: a backed-up unit is restored from `<path>.prev`,
+  and a newly-installed unit is **removed** (per its `.prev.absent` marker). This
+  ensures a rollback can never leave a new unit paired with the rolled-back
+  (previous-revision) binary;
+- units with no repo copy (an operator-managed sibling unit) are left untouched.
+
+> Runtime verification note: the live-canary — one real in-flight worker spanning
+> a self-deploy restart with its exact session identity preserved and no
+> duplicate execution — is an operator step against the running fleet. Confirm it
+> after the first deploy that ships the `KillMode=mixed` unit:
+> `journalctl -u maestro.service | grep -E 'restart-checkpoint|resumed in place'`.
+
 ## Verifying a rollout
 
 After a merge, within `timeout_minutes`:
@@ -353,6 +428,8 @@ maestro version
 | Log `self-deploy debounced for PR #… < … window` | A deploy was triggered within `min_interval_minutes` of the previous one — expected on a burst of merges (#722) | None; the in-flight/previous deploy covers the merged code. Lower `min_interval_minutes` for faster successive deploys |
 | Deploy log `another self-deploy holds … — skipping` | A deploy started while one was already in flight; the single-flight lock skipped it (#722) | None; the in-flight deploy owns the rollout |
 | Units inactive after rollback | Rollback restart also failed | `systemctl --user start maestro.service` by hand; binary on disk is the previous version |
+| Deploy log `unit change detected for maestro.service — installing repo copy` | A unit change (e.g. `KillMode`) shipped with this deploy; the daemon was reloaded before the restart (#877) | Expected when the repo unit changed; the previous unit is kept at `<path>.prev` |
+| Deploy log `installing unit … failed` / `daemon-reload failed after unit change` | The deploy user cannot write the unit's `FragmentPath` or reload the manager (system scope needs `sudo -n`) (#877) | Grant passwordless sudo for the unit install + `systemctl daemon-reload`, or run the unit install by hand; the deploy rolls back |
 
 ## Interaction with `deploy_cmd`
 

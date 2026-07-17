@@ -394,6 +394,10 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
+	// #877: a successful in-place resume consumes the restart-checkpoint marker
+	// (the reconcile path clears it before calling this too — belt and braces —
+	// so a resumed session can never be resumed a second time).
+	sess.RestartCheckpointAt = nil
 
 	return nil
 }

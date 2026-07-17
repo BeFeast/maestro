@@ -1605,7 +1605,12 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 		}
 		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}
 
-		if sess.Status == state.StatusRunning {
+		// #877: a session the daemon deliberately checkpointed on shutdown
+		// (RestartCheckpointAt set) is marked running with a now-dead pid ONLY
+		// until the next reconcile resumes it in place. It is not stuck and needs
+		// no operator action, so suppress the transient dead-pid / runtime / silent
+		// findings that would otherwise nudge a reconcile of a self-healing slot.
+		if sess.Status == state.StatusRunning && sess.RestartCheckpointAt == nil {
 			if sess.PID <= 0 {
 				findings = append(findings, stuckState("dead_running_pid", SeverityBlocked,
 					fmt.Sprintf("Worker %s is marked running, but no live process is recorded.", slot),

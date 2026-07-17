@@ -46,6 +46,22 @@ func TmuxSessionName(slotName string) string {
 	return "maestro-" + slotName
 }
 
+// TmuxPanePID returns the pane pid of a live tmux session, so a caller can
+// recover the runtime pid of a worker whose recorded pid is stale (e.g. a
+// restart-resume adopting an already-running replacement, #877). It errors if
+// the session is gone or the pid is unparseable.
+func TmuxPanePID(session string) (int, error) {
+	out, err := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return 0, fmt.Errorf("tmux list-panes %s: %w", session, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse pane pid for %s: %w", session, err)
+	}
+	return pid, nil
+}
+
 // Start spawns a new worker for the given issue inside a tmux session.
 // backendName selects the model backend ("claude", "codex", etc.); empty defaults to config.
 func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string) (string, error) {
@@ -350,6 +366,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PreviousAttemptFeedback = ""
 	sess.PreviousAttemptFeedbackKind = ""
 	sess.CheckpointFile = ""
+	// A fresh respawn is a brand-new attempt in a brand-new worktree, so any
+	// restart-resume marker from a prior in-flight interruption (#877) is stale.
+	sess.RestartCheckpointAt = nil
 
 	return nil
 }
