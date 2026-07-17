@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,43 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
+
+// WorktreeDirty reports whether a retained worker worktree contains any
+// tracked, staged, or untracked changes. Recovery paths use this before a
+// provider transition so completed work is checkpointed instead of being
+// discarded by the fresh-worktree Respawn path.
+func WorktreeDirty(worktree string) (bool, error) {
+	if strings.TrimSpace(worktree) == "" {
+		return false, nil
+	}
+	out, err := exec.Command("git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all").CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("inspect worktree before recovery: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// rotateWorkerAttemptLog preserves the previous attempt while ensuring all
+// backend-failure classifiers see only the current attempt. Without this, a
+// Fable 429 left in a shared append-only log can be re-read after a successful
+// Opus fallback and falsely attributed to Opus during dead-session recovery.
+func rotateWorkerAttemptLog(logFile string) error {
+	if strings.TrimSpace(logFile) == "" {
+		return nil
+	}
+	suffix := fmt.Sprintf(".attempt-%d", time.Now().UTC().UnixNano())
+	for _, path := range []string{logFile, logFile + ".jsonl"} {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("stat previous attempt log %s: %w", path, err)
+		}
+		if err := os.Rename(path, path+suffix); err != nil {
+			return fmt.Errorf("rotate previous attempt log %s: %w", path, err)
+		}
+	}
+	return nil
+}
 
 // SaveCheckpoint captures the worker's progress and writes a CHECKPOINT.md
 // file to the worktree. Returns the path to the checkpoint file.
@@ -148,6 +186,9 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return fmt.Errorf("create log dir: %w", err)
 	}
 	logFile := filepath.Join(logDir, slotName+".log")
+	if err := rotateWorkerAttemptLog(logFile); err != nil {
+		return err
+	}
 
 	// Build the worker command
 	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, sess.Worktree)

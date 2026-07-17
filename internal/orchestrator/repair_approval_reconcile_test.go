@@ -9,10 +9,182 @@ import (
 
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/supervisor"
 )
+
+// TestAwaitingRepairDispatchReservesAndRespawnsOriginalSession is the #892
+// incident regression: PR #7 is retained on txc-1, its approved repair is
+// awaiting dispatch, and the ready issue is visible to the normal poll. The
+// dispatcher must repair txc-1 in place, consume the approval, and never call
+// the fresh slot allocator. Persist/reload then proves the completed dispatch
+// is idempotent.
+func TestAwaitingRepairDispatchReservesAndRespawnsOriginalSession(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.StateDir = t.TempDir()
+	issues := []github.Issue{makeIssue(1, "repair PR #7", "maestro-ready")}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 1, nil }
+	respawns := 0
+	o.respawnInPlaceFn = func(cfg *config.Config, slot string, sess *state.Session, repo string, issue github.Issue, prompt, backend string) error {
+		respawns++
+		if slot != "txc-1" {
+			t.Fatalf("respawn slot = %q, want txc-1", slot)
+		}
+		sess.Status = state.StatusRunning
+		sess.PID = 7001
+		return nil
+	}
+
+	now := time.Date(2026, 7, 13, 9, 3, 20, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["txc-1"] = &state.Session{
+		IssueNumber: 1,
+		IssueTitle:  "repair PR #7",
+		Status:      state.StatusDead,
+		PRNumber:    7,
+		Worktree:    "/work/txc-1",
+		Branch:      "feat/txc-1-1-repair",
+		Backend:     "codex",
+	}
+	s.Approvals = []state.Approval{repairApproval("repair-1", 1, 7, state.ApprovalStatusAwaitingDispatch, now)}
+	s.Approvals[0].Target.Session = "txc-1"
+
+	o.startNewWorkers(s, 1)
+
+	if respawns != 1 {
+		t.Fatalf("in-place respawns = %d, want 1", respawns)
+	}
+	if len(*freshStarts) != 0 || len(s.Sessions) != 1 {
+		t.Fatalf("fresh starts=%v sessions=%v, want only original txc-1", *freshStarts, s.Sessions)
+	}
+	if got := approvalStatus(t, s, "repair-1"); got != state.ApprovalStatusSuperseded {
+		t.Fatalf("repair approval = %q, want consumed/superseded", got)
+	}
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		t.Fatalf("save dispatched state: %v", err)
+	}
+	reloaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("reload dispatched state: %v", err)
+	}
+	o.startNewWorkers(reloaded, 1)
+	if respawns != 1 || len(*freshStarts) != 0 || len(reloaded.Sessions) != 1 {
+		t.Fatalf("reload re-dispatched work: respawns=%d fresh=%v sessions=%v", respawns, *freshStarts, reloaded.Sessions)
+	}
+}
+
+// A competing same-issue worker is preserved and blocks the approved repair.
+// The dispatcher must not kill/remove either worktree and must leave the
+// approval active for explicit reconciliation.
+func TestAwaitingRepairDispatchRefusesCompetingWorker(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	issues := []github.Issue{makeIssue(1, "repair PR #7", "maestro-ready")}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 1, nil }
+	respawns := 0
+	o.respawnInPlaceFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+		respawns++
+		return nil
+	}
+
+	now := time.Date(2026, 7, 13, 9, 5, 15, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["txc-1"] = &state.Session{IssueNumber: 1, Status: state.StatusDead, PRNumber: 7, Worktree: "/work/txc-1"}
+	s.Sessions["txc-2"] = &state.Session{IssueNumber: 1, Status: state.StatusRunning, Worktree: "/work/txc-2", PID: 7002}
+	s.Approvals = []state.Approval{repairApproval("repair-1", 1, 7, state.ApprovalStatusAwaitingDispatch, now)}
+	s.Approvals[0].Target.Session = "txc-1"
+
+	o.startNewWorkers(s, 1)
+
+	if respawns != 0 || len(*freshStarts) != 0 {
+		t.Fatalf("dispatch occurred despite competitor: respawns=%d fresh=%v", respawns, *freshStarts)
+	}
+	if len(s.Sessions) != 2 || s.Sessions["txc-2"].Worktree != "/work/txc-2" {
+		t.Fatalf("competing material changed: %+v", s.Sessions)
+	}
+	if got := approvalStatus(t, s, "repair-1"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("repair approval = %q, want awaiting_dispatch for operator reconciliation", got)
+	}
+}
+
+// A repair approval is authority for the state that was reviewed, not a
+// timeless bypass. If the operator adds blocked before dispatch, the current
+// guard wins, the approval becomes stale, and neither an in-place nor a fresh
+// worker may start even though the canonical PR remains open.
+func TestAwaitingRepairDispatchBlockedBeforeExecutionDoesNotSpawn(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.ExcludeLabels = []string{"blocked"}
+	issues := []github.Issue{makeIssue(331, "canonical PR #335", "maestro-ready", "blocked")}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 331, nil }
+	respawns := 0
+	o.respawnInPlaceFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+		respawns++
+		return nil
+	}
+
+	now := time.Date(2026, 7, 17, 9, 18, 38, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Worktree:    "/work/ok-player-247",
+	}
+	s.Approvals = []state.Approval{repairApproval("repair-331", 331, 335, state.ApprovalStatusAwaitingDispatch, now)}
+	s.Approvals[0].Target.Session = "ok-player-247"
+
+	o.startNewWorkers(s, 1)
+
+	if respawns != 0 || len(*freshStarts) != 0 || len(s.Sessions) != 1 {
+		t.Fatalf("blocked repair dispatched: respawns=%d fresh=%v sessions=%v", respawns, *freshStarts, s.Sessions)
+	}
+	if got := approvalStatus(t, s, "repair-331"); got != state.ApprovalStatusStale {
+		t.Fatalf("repair approval = %q, want stale after current blocked guard", got)
+	}
+}
+
+// A blocked issue normally loses its ready label and therefore never enters
+// startNewWorkers. The standing reconciler must still retire any delayed
+// classic or review-repair authority so it cannot execute on a later cycle.
+func TestReconcileGuardedRepairApprovals_BlockedWithoutReadyLabel(t *testing.T) {
+	now := time.Date(2026, 7, 17, 9, 22, 0, 0, time.UTC)
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", ExcludeLabels: []string{"blocked"}},
+		notifier: &notify.Notifier{},
+		getIssueFn: func(issue int) (github.Issue, error) {
+			if issue != 331 {
+				t.Fatalf("get issue = %d, want 331", issue)
+			}
+			return makeIssue(331, "canonical PR #335", "blocked"), nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Worktree:    "/work/ok-player-247",
+	}
+	classic := repairApproval("repair-331", 331, 335, state.ApprovalStatusAwaitingDispatch, now)
+	classic.Target.Session = "ok-player-247"
+	review := repairApproval("review-repair-331", 331, 335, state.ApprovalStatusApproved, now)
+	review.Action = supervisor.ActionSpawnReviewRepair
+	review.Target.Session = "ok-player-247"
+	s.Approvals = []state.Approval{classic, review}
+
+	o.reconcileGuardedRepairApprovals(s)
+
+	for _, id := range []string{"repair-331", "review-repair-331"} {
+		if got := approvalStatus(t, s, id); got != state.ApprovalStatusStale {
+			t.Fatalf("approval %s = %q, want stale", id, got)
+		}
+	}
+}
 
 const actionSpawnRepairWorker = "spawn_repair_worker"
 

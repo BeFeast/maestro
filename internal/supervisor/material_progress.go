@@ -360,7 +360,10 @@ func tmuxProgressFingerprint(session string) (string, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxProgressTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-t", "="+session, "-S", tmuxProgressHistoryLines)
+	// A pane target needs the trailing colon to identify the first pane of an
+	// exact session name. Without it, tmux interprets "=session" as a pane name
+	// and every real worker observation fails with "can't find pane".
+	cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-t", "="+session+":", "-S", tmuxProgressHistoryLines)
 	stdout := &boundedOutput{limit: tmuxProgressMaxOutputBytes}
 	stderr := &boundedOutput{limit: 32 << 10}
 	cmd.Stdout = stdout

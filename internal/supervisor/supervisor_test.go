@@ -1347,6 +1347,34 @@ func TestRunOnce_StampsLastRunOnceAt(t *testing.T) {
 	}
 }
 
+func TestPersistSupervisorHeartbeatClearsStuckState(t *testing.T) {
+	cfg := testConfig(t)
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	st.SupervisorStuck = true
+	st.SupervisorStuckReason = "synthetic concurrent writer conflict"
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	want := time.Now().UTC().Truncate(time.Microsecond)
+	if err := persistSupervisorHeartbeat(cfg.StateDir, want); err != nil {
+		t.Fatalf("persistSupervisorHeartbeat: %v", err)
+	}
+	got, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !got.LastRunOnceAt.Equal(want) {
+		t.Fatalf("LastRunOnceAt = %s, want %s", got.LastRunOnceAt, want)
+	}
+	if got.SupervisorStuck || got.SupervisorStuckReason != "" {
+		t.Fatalf("stuck state not cleared: stuck=%v reason=%q", got.SupervisorStuck, got.SupervisorStuckReason)
+	}
+}
+
 // Phase 1.2 (#499): a successful RunOnce clears any prior SupervisorStuck
 // flag set by the watchdog. This is the only signal that unwedges the
 // daemon — a healthy cycle is recovery.

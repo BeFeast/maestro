@@ -1356,6 +1356,7 @@ type fleetProjectState struct {
 	SelfResolving   int                   `json:"self_resolving,omitempty"`
 	Active          []sessionInfo         `json:"active,omitempty"`
 	Attention       []sessionInfo         `json:"attention,omitempty"`
+	IssueClaims     []state.IssueClaim    `json:"issue_claims,omitempty"`
 	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
 	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
 	Actions         []controlAction       `json:"actions,omitempty"`
@@ -4009,6 +4010,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
 	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
 	item.Epics, item.EpicSummary = fleetEpicProgressFromState(st)
+	item.IssueClaims = st.ActiveIssueClaims()
 	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
@@ -4045,6 +4047,13 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	workers := make([]fleetWorkerState, 0, len(projectState.All))
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		if worker.NeedsAttention {
+			if canonical, ok := fleetSupersedingIssueSession(worker, projectState.All); ok {
+				worker.NeedsAttention = false
+				worker.StatusReason = fmt.Sprintf("superseded by canonical session %s (%s)", canonical.Slot, canonical.Status)
+				worker.NextAction = "No operator action required: follow the canonical session for this issue."
+			}
+		}
 		if audit, isStale := staleSlots[worker.Slot]; isStale {
 			worker.NeedsAttention = false
 			if reason := strings.TrimSpace(audit.Reason); reason != "" {
@@ -4077,6 +4086,43 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	}
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+// fleetSupersedingIssueSession identifies terminal duplicate attempts that
+// should not dominate project operator_state while the same issue already has
+// one canonical live or PR-bearing session. This is display/reconciliation
+// truth only: it does not delete history or choose a different dispatcher
+// lease. The durable issue claim remains the authority that prevents another
+// worker from being created.
+func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (sessionInfo, bool) {
+	if candidate.IssueNumber <= 0 || !candidate.NeedsAttention {
+		return sessionInfo{}, false
+	}
+	// A terminal attempt with its own PR is not merely stale execution state:
+	// it may still require operator action or reconciliation for that distinct
+	// artifact. Only no-PR duplicate attempts may be hidden behind the issue's
+	// canonical live or PR-bearing session.
+	if candidate.PRNumber > 0 {
+		return sessionInfo{}, false
+	}
+	switch state.SessionStatus(candidate.Status) {
+	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+	default:
+		return sessionInfo{}, false
+	}
+	for _, peer := range all {
+		if peer.Slot == candidate.Slot || peer.IssueNumber != candidate.IssueNumber {
+			continue
+		}
+		if fleetSessionActuallyRunning(peer) {
+			return peer, true
+		}
+		switch state.SessionStatus(peer.Status) {
+		case state.StatusPROpen, state.StatusCodeLanded:
+			return peer, true
+		}
+	}
+	return sessionInfo{}, false
 }
 
 func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetCloseCandidate {

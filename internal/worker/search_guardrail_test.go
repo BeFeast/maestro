@@ -227,6 +227,41 @@ func TestBuildWorkerRunnerScriptIncludesSearchGuardrails(t *testing.T) {
 	}
 }
 
+func TestResolveWorkerCommandPathPinsServiceExecutable(t *testing.T) {
+	serviceBin := t.TempDir()
+	workerBin := filepath.Join(serviceBin, "claude")
+	if err := os.WriteFile(workerBin, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake worker: %v", err)
+	}
+	t.Setenv("PATH", serviceBin)
+
+	args, err := resolveWorkerCommandPath([]string{"claude", "--model", "claude-fable-5"})
+	if err != nil {
+		t.Fatalf("resolveWorkerCommandPath: %v", err)
+	}
+	if args[0] != workerBin {
+		t.Fatalf("resolved executable = %q, want %q", args[0], workerBin)
+	}
+	if got := strings.Join(args[1:], " "); got != "--model claude-fable-5" {
+		t.Fatalf("arguments changed: %q", got)
+	}
+
+	// Once generated, a stale tmux PATH cannot change the pinned executable.
+	t.Setenv("PATH", "/usr/bin:/bin")
+	script := buildWorkerRunnerScript(args, "", "/tmp/worker.log", "/tmp/worktree", "/tmp/guard", "", "/usr/local/bin/maestro", nil)
+	if !strings.Contains(script, workerBin) {
+		t.Fatalf("runner does not pin service-resolved executable:\n%s", script)
+	}
+}
+
+func TestResolveWorkerCommandPathRejectsMissingServiceExecutable(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	_, err := resolveWorkerCommandPath([]string{"claude", "--model", "claude-fable-5"})
+	if err == nil || !strings.Contains(err.Error(), "maestro service PATH") {
+		t.Fatalf("error = %v, want service PATH resolution failure", err)
+	}
+}
+
 // #737: with a stream-split config the worker command is piped through
 // `maestro stream-split` (raw NDJSON -> slot.jsonl) before tee, keeping
 // slot.log human-readable while capturing usage on the side channel.
@@ -254,6 +289,11 @@ func TestBuildWorkerRunnerScriptStreamSplitPipeline(t *testing.T) {
 // built by concatenation so no contiguous credential-shaped literal exists in
 // the source (agent-lint).
 func TestWriteWorkerRunnerScriptUsesSingleSharedCredentialBoundary(t *testing.T) {
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	tokenCanary := "CANARY-" + "auth-token-" + "d0n0t-persist-" + "0001"
 	keyCanary := "CANARY-" + "cliproxy-key-" + "d0n0t-persist-" + "0002"
 
@@ -620,6 +660,11 @@ func TestResolveWorkerCredentialsFileRejectsSymlinkedPrivateDirectory(t *testing
 }
 
 func TestWriteWorkerRunnerScriptAtomicallyReplacesTargetSymlink(t *testing.T) {
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, key := range workerCredentialEnvKeys {
 		t.Setenv(key, "")
 	}
