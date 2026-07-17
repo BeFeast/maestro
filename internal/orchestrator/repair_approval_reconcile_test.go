@@ -415,12 +415,19 @@ func approvalStatus(t *testing.T, s *state.State, id string) state.ApprovalStatu
 // regression: even when the edge-triggered post-merge stale call was lost (the
 // live #858 incident left the approval pending with only its `created` audit
 // event), the standing reconciler stales the moot spawn_repair_worker approval
-// on the next cycle because the target issue's session is already done. Unrelated
+// on the next cycle because GitHub confirms the target issue is closed. A local
+// done token alone is not authoritative (#949). Unrelated
 // approvals — a repair approval for an actively-worked issue and a spawn_worker
 // approval — are untouched, and the pass is idempotent.
 func TestReconcileResolvedRepairApprovals_DoneSessionSelfHeals(t *testing.T) {
 	now := time.Date(2026, 7, 10, 9, 47, 0, 0, time.UTC)
-	o := &Orchestrator{cfg: &config.Config{Repo: "owner/repo"}, notifier: &notify.Notifier{}}
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo"},
+		notifier: &notify.Notifier{},
+		isIssueClosedFn: func(issue int) (bool, error) {
+			return issue == 858, nil
+		},
+	}
 
 	s := state.NewState()
 	s.Sessions = map[string]*state.Session{
@@ -441,8 +448,8 @@ func TestReconcileResolvedRepairApprovals_DoneSessionSelfHeals(t *testing.T) {
 	}
 	moot, _ := s.FindApproval("ap-repair-858")
 	last := moot.Audit[len(moot.Audit)-1]
-	if last.Event != state.ApprovalAuditStale || !strings.Contains(last.Reason, "session done") {
-		t.Fatalf("stale audit = {%q,%q}, want stale reason mentioning session done", last.Event, last.Reason)
+	if last.Event != state.ApprovalAuditStale || !strings.Contains(last.Reason, "closed") {
+		t.Fatalf("stale audit = {%q,%q}, want stale reason mentioning authoritative issue close", last.Event, last.Reason)
 	}
 	if got := approvalStatus(t, s, "ap-repair-900"); got != state.ApprovalStatusPending {
 		t.Fatalf("repair approval for actively-worked issue = %q, want pending (untouched)", got)
@@ -460,6 +467,33 @@ func TestReconcileResolvedRepairApprovals_DoneSessionSelfHeals(t *testing.T) {
 	moot2, _ := s.FindApproval("ap-repair-858")
 	if len(moot2.Audit) != auditLen {
 		t.Fatalf("re-run appended audit entries (%d -> %d); reconcile must be idempotent", auditLen, len(moot2.Audit))
+	}
+}
+
+// A false local done token must not erase repair authority while GitHub still
+// shows an open issue and no merged linked PR (#949).
+func TestReconcileResolvedRepairApprovals_FalseDoneDoesNotStale(t *testing.T) {
+	now := time.Date(2026, 7, 17, 19, 22, 0, 0, time.UTC)
+	o := &Orchestrator{
+		cfg:                   &config.Config{Repo: "owner/repo"},
+		notifier:              &notify.Notifier{},
+		isIssueClosedFn:       func(int) (bool, error) { return false, nil },
+		hasMergedPRForIssueFn: func(int) (bool, error) { return false, nil },
+	}
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345,
+		Status:      state.StatusDone,
+		PRNumber:    389,
+	}
+	s.Approvals = []state.Approval{
+		repairApproval("repair-345", 345, 388, state.ApprovalStatusAwaitingDispatch, now),
+	}
+
+	o.reconcileResolvedRepairApprovals(s)
+
+	if got := approvalStatus(t, s, "repair-345"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("approval = %q, want awaiting_dispatch while issue remains open and unmerged", got)
 	}
 }
 

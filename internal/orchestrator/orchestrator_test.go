@@ -1332,6 +1332,9 @@ func TestAutoMergePRs_MissingOpenPRDoesNotBecomeDoneWhenOutcomePassRequiredFails
 		},
 	}
 	o, merged := newMergeTestOrchestrator(cfg, nil)
+	o.isPRMergedFn = func(prNumber int) (bool, error) {
+		return prNumber == 10, nil
+	}
 	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
 	s.OutcomeHealth = &outcome.HealthCheckResult{
 		CheckedAt: time.Now().UTC(),

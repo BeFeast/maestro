@@ -1406,6 +1406,14 @@ func prReferencesIssue(pr PR, issueNumber int) bool {
 	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + stripCodeForRefMatch(pr.Body))
 }
 
+// PRReferencesIssue reports whether the PR title/body references issueNumber.
+// It exposes the same code/log-safe matcher used by HasOpenPRForIssue so
+// control-plane reconcilers can match an already-fetched open-PR snapshot
+// without issuing another GitHub request.
+func PRReferencesIssue(pr PR, issueNumber int) bool {
+	return prReferencesIssue(pr, issueNumber)
+}
+
 // prClosesIssue is the STRICT variant for "this merged PR closed issue N".
 // Unlike prReferencesIssue, it requires one of GitHub's recognised closing
 // keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved)
