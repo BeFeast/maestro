@@ -42,6 +42,40 @@ func TestEnsureWorktreeBranchPreservesDirtyRetainedCheckout(t *testing.T) {
 	}
 }
 
+func TestEnsureWorktreeBranchReattachesCleanDetachedCheckout(t *testing.T) {
+	repo := newBranchTestRepo(t)
+	runBranchGit(t, repo, "branch", "canonical")
+	runBranchGit(t, repo, "switch", "--detach", "HEAD")
+
+	if err := EnsureWorktreeBranch(repo, "canonical"); err != nil {
+		t.Fatalf("EnsureWorktreeBranch: %v", err)
+	}
+	if got := strings.TrimSpace(runBranchGit(t, repo, "branch", "--show-current")); got != "canonical" {
+		t.Fatalf("current branch = %q, want canonical", got)
+	}
+}
+
+func TestEnsureWorktreeBranchPreservesDirtyDetachedCheckout(t *testing.T) {
+	repo := newBranchTestRepo(t)
+	runBranchGit(t, repo, "branch", "canonical")
+	runBranchGit(t, repo, "switch", "--detach", "HEAD")
+	path := filepath.Join(repo, "work.txt")
+	if err := os.WriteFile(path, []byte("preserve detached work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := EnsureWorktreeBranch(repo, "canonical")
+	if err == nil || !strings.Contains(err.Error(), "dirty") {
+		t.Fatalf("error = %v, want dirty-worktree refusal", err)
+	}
+	if got := strings.TrimSpace(runBranchGit(t, repo, "branch", "--show-current")); got != "" {
+		t.Fatalf("current branch = %q, want detached checkout retained", got)
+	}
+	if got, readErr := os.ReadFile(path); readErr != nil || string(got) != "preserve detached work\n" {
+		t.Fatalf("dirty detached change was not preserved: %q, %v", got, readErr)
+	}
+}
+
 func TestUniqueBranchCommitsReturnsOnlySiblingPatch(t *testing.T) {
 	repo := newBranchTestRepo(t)
 	runBranchGit(t, repo, "branch", "canonical")

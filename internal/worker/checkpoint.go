@@ -66,10 +66,16 @@ func EnsureWorktreeBranch(worktree, branch string) error {
 		return fmt.Errorf("ensure worktree branch: worktree and branch are required")
 	}
 	currentOut, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("inspect retained worktree branch: %w: %s", err, strings.TrimSpace(string(currentOut)))
-	}
 	current := strings.TrimSpace(string(currentOut))
+	if err != nil {
+		// A valid retained checkout may be detached after an interrupted
+		// rebase/gate repair. Treat that as a branch mismatch, not as proof the
+		// worktree is unusable. Dirty state still fails closed below.
+		if insideOut, insideErr := exec.Command("git", "-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput(); insideErr != nil || strings.TrimSpace(string(insideOut)) != "true" {
+			return fmt.Errorf("inspect retained worktree branch: %w: %s", err, strings.TrimSpace(string(currentOut)))
+		}
+		current = "detached HEAD"
+	}
 	if current == branch {
 		return nil
 	}
