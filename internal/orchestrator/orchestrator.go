@@ -4273,7 +4273,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	// duplicate PR hid an older canonical draft). Rebind only when exactly one
 	// open PR references the issue. Multiple candidates are ambiguous and must
 	// remain untouched; choosing one would manufacture a new canonical identity.
-	o.reconcileFalseDoneSessionsWithOpenPRs(s, prs)
+	o.reconcileTerminalSessionsWithOpenPRs(s, prs)
 
 	type mergeCandidate struct {
 		slotName string
@@ -4597,36 +4597,85 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	}
 }
 
-func (o *Orchestrator) reconcileFalseDoneSessionsWithOpenPRs(s *state.State, prs []github.PR) {
+func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs []github.PR) {
 	if s == nil || len(prs) == 0 {
 		return
 	}
-	for _, slotName := range sortedStateSessionNames(s) {
-		sess := s.Sessions[slotName]
-		if sess == nil || sess.Status != state.StatusDone || sess.IssueNumber <= 0 {
+	prsByIssue := make(map[int][]github.PR)
+	for _, pr := range prs {
+		for _, sess := range s.Sessions {
+			if sess == nil || sess.IssueNumber <= 0 || !github.PRReferencesIssue(pr, sess.IssueNumber) {
+				continue
+			}
+			already := false
+			for _, known := range prsByIssue[sess.IssueNumber] {
+				if known.Number == pr.Number {
+					already = true
+					break
+				}
+			}
+			if !already {
+				prsByIssue[sess.IssueNumber] = append(prsByIssue[sess.IssueNumber], pr)
+			}
+		}
+	}
+
+	for issue, matches := range prsByIssue {
+		if len(matches) != 1 {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d: %d open PRs reference the issue; canonical identity is ambiguous", issue, len(matches))
 			continue
 		}
-		matches := make([]github.PR, 0, 1)
-		for _, pr := range prs {
-			if github.PRReferencesIssue(pr, sess.IssueNumber) {
-				matches = append(matches, pr)
+		canonical := matches[0]
+		var allSlots, exactSlots []string
+		activeOther := ""
+		for _, slotName := range sortedStateSessionNames(s) {
+			sess := s.Sessions[slotName]
+			if sess == nil || sess.IssueNumber != issue {
+				continue
+			}
+			allSlots = append(allSlots, slotName)
+			if repairIssueSessionActive(sess.Status) {
+				activeOther = slotName
+			}
+			if (sess.Status == state.StatusDone || sess.Status == state.StatusFailed) &&
+				(sess.PRNumber == canonical.Number || sess.LastClosedPRNumber == canonical.Number || sess.Branch == canonical.HeadRefName) {
+				exactSlots = append(exactSlots, slotName)
 			}
 		}
-		if len(matches) != 1 {
-			if len(matches) > 1 {
-				log.Printf("[orch] false-done reconcile held for issue #%d / session %s: %d open PRs reference the issue; canonical identity is ambiguous", sess.IssueNumber, slotName, len(matches))
-			}
+		if activeOther != "" {
+			// Never activate a second session while another issue-level lease is
+			// live, even if the open PR points at an older canonical branch.
+			continue
+		}
+
+		candidateSlot := ""
+		switch {
+		case len(exactSlots) == 1:
+			candidateSlot = exactSlots[0]
+		case len(exactSlots) > 1:
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / PR #%d: %d terminal sessions claim the canonical identity", issue, canonical.Number, len(exactSlots))
+			continue
+		case len(allSlots) == 1:
+			candidateSlot = allSlots[0]
+		default:
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / PR #%d: no exact session among %d historical sessions", issue, canonical.Number, len(allSlots))
+			continue
+		}
+		sess := s.Sessions[candidateSlot]
+		if sess == nil || (sess.Status != state.StatusDone && sess.Status != state.StatusFailed) {
 			continue
 		}
 		merged := false
 		var err error
-		if sess.PRNumber > 0 {
+		if sess.PRNumber > 0 && sess.PRNumber != canonical.Number {
 			merged, err = o.isPRMerged(sess.PRNumber)
-		} else {
+		} else if sess.PRNumber == 0 && sess.LastClosedPRNumber > 0 && sess.LastClosedPRNumber != canonical.Number {
+			merged, err = o.isPRMerged(sess.LastClosedPRNumber)
+		} else if sess.PRNumber == 0 && sess.LastClosedPRNumber == 0 {
 			merged, err = o.hasMergedPRForIssue(sess.IssueNumber)
 		}
 		if err != nil {
-			log.Printf("[orch] false-done reconcile held for issue #%d / session %s: authoritative merge state unavailable: %v", sess.IssueNumber, slotName, err)
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: authoritative merge state unavailable: %v", sess.IssueNumber, candidateSlot, err)
 			continue
 		}
 		if merged {
@@ -4634,13 +4683,12 @@ func (o *Orchestrator) reconcileFalseDoneSessionsWithOpenPRs(s *state.State, prs
 		}
 		closed, err := o.isIssueClosed(sess.IssueNumber)
 		if err != nil {
-			log.Printf("[orch] false-done reconcile held for issue #%d / session %s: authoritative issue state unavailable: %v", sess.IssueNumber, slotName, err)
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: authoritative issue state unavailable: %v", sess.IssueNumber, candidateSlot, err)
 			continue
 		}
 		if closed {
 			continue
 		}
-		canonical := matches[0]
 		oldPR := sess.PRNumber
 		if oldPR > 0 && oldPR != canonical.Number {
 			sess.LastClosedPRNumber = oldPR
@@ -4650,7 +4698,7 @@ func (o *Orchestrator) reconcileFalseDoneSessionsWithOpenPRs(s *state.State, prs
 		sess.Status = state.StatusPROpen
 		sess.FinishedAt = nil
 		sess.ReleasedForRedispatch = false
-		log.Printf("[orch] reconciled false done session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", slotName, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
+		log.Printf("[orch] reconciled terminal session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", candidateSlot, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
 	}
 }
 
@@ -5123,8 +5171,11 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.MaintenanceRetryCount, maxRetries, backoffMs/1000)
 }
 
-// handleCIFailureRetry closes the failed PR, captures CI output, cleans up,
-// and schedules a retry for the worker (respecting max_retries_per_issue).
+// handleCIFailureRetry captures the failed checks and schedules an in-place
+// repair on the same slot/worktree/branch/PR. A red check is not a reason to
+// destroy canonical identity: closing the PR and clearing its session lease
+// let the ready issue dispatch a second worker before the retry completed
+// (live #949 / OK Player #346).
 func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, sess *state.Session, pr github.PR) {
 	maxRetries := o.cfg.MaxRetriesPerIssue
 	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
@@ -5149,14 +5200,14 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		return
 	}
 
-	// Capture CI failure output before closing the PR
+	// Capture CI failure output while the failed head is still authoritative.
 	ciOutput, err := o.prChecksOutput(pr.Number)
 	if err != nil {
 		log.Printf("[orch] warn: could not capture CI output for PR #%d: %v", pr.Number, err)
 		ciOutput = "(CI output unavailable)"
 	}
 
-	// Collect Greptile review feedback before closing the PR
+	// Collect review feedback for the same in-place repair prompt.
 	reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
 	if err != nil {
 		log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
@@ -5166,23 +5217,22 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	// takes — its failure conclusion makes the aggregate CI verdict "failure".
 	// CIFailureOutput above is only the bare checks overview (name + state); the
 	// concrete `##[error]` annotation lines that say WHY the check failed live
-	// here. Capture them before closing the PR so the retry worker sees the
+	// here. Capture them while the failed head is authoritative so the retry worker sees the
 	// exact lint constraint its previous push broke, not just "agent-lint
 	// failed" — this was the observed PR #850 blindness.
 	failingCheckContext := o.collectFailingCheckContext(pr.Number)
 
-	// Close the failed PR with an explanation
-	closeComment := fmt.Sprintf("CI failed — maestro is closing this PR and respawning a new worker to retry (attempt %d).\n\nCI output:\n```\n%s\n```",
-		sess.RetryCount+1, ciOutput)
-	if err := o.closePR(pr.Number, closeComment); err != nil {
-		log.Printf("[orch] warn: could not close PR #%d: %v — skipping retry", pr.Number, err)
-		return
+	// Preserve the exact PR lease. Cleanup may already have cleared the
+	// worktree field on a terminal transition; record only the deterministic
+	// same-slot path so respawnPreservingWorktreeWithConfig can restore the
+	// retained local branch without allocating a new slot or branch.
+	sess.PRNumber = pr.Number
+	if strings.TrimSpace(sess.Branch) == "" {
+		sess.Branch = pr.HeadRefName
 	}
-	log.Printf("[orch] closed PR #%d due to CI failure", pr.Number)
-
-	// Clean up the worktree
-	o.stopWorker(slotName, sess)
-	sess.Worktree = ""
+	if strings.TrimSpace(sess.Worktree) == "" && strings.TrimSpace(o.cfg.WorktreeBase) != "" {
+		sess.Worktree = filepath.Join(o.cfg.WorktreeBase, slotName)
+	}
 
 	// Store CI failure output and review feedback for the next worker
 	sess.CIFailureOutput = ciOutput
@@ -5194,23 +5244,21 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		sess.PreviousAttemptFeedbackKind = ""
 	}
 
-	// Schedule retry with exponential backoff. Remember which PR this retry
-	// closed (#800): if an operator reopens and merges it while the backoff
-	// runs, the pre-respawn staleness check cancels the retry.
+	// Schedule the same-session repair with exponential backoff. The open PR
+	// remains the issue-level lease throughout the wait, so ordinary dispatch
+	// cannot race the repair with a fresh worker.
 	sess.RetryCount++
 	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 	sess.NextRetryAt = &retryAt
 	sess.Status = state.StatusDead
-	sess.LastClosedPRNumber = pr.Number
-	sess.PRNumber = 0
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
 
-	log.Printf("[orch] CI failure on PR #%d — scheduling retry %d in %dms for issue #%d",
-		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
-	o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), retry %d scheduled in %ds",
+	log.Printf("[orch] CI failure on PR #%d — scheduling in-place retry %d in %dms for issue #%d on session %s",
+		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber, slotName)
+	o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), in-place retry %d scheduled in %ds",
 		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
 }
 

@@ -2859,13 +2859,13 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		t.Errorf("merged PR #%d, want #20", merged[0])
 	}
 
-	// PR #10 should have been closed and session scheduled for retry
-	if len(closedPRs) != 1 || closedPRs[0] != 10 {
-		t.Errorf("closedPRs = %v, want [10]", closedPRs)
+	// PR #10 remains canonical while its same-session repair is scheduled.
+	if len(closedPRs) != 0 {
+		t.Errorf("closedPRs = %v, want none", closedPRs)
 	}
 	for _, sess := range s.Sessions {
-		if sess.PRNumber == 0 && sess.IssueNumber == 100 {
-			// This is the session for PR #10 (PR cleared after CI failure retry)
+		if sess.PRNumber == 10 && sess.IssueNumber == 100 {
+			// This is the session for PR #10 (identity retained for in-place retry).
 			if sess.Status != state.StatusDead {
 				t.Errorf("CI-failed session status = %q, want %q", sess.Status, state.StatusDead)
 			}
@@ -8591,7 +8591,7 @@ func newCIFailureRetryOrchestrator(cfg *config.Config, prs []github.PR, ciStatus
 	}, &merged, &closedPRs
 }
 
-func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_KeepsCanonicalPRAndSchedulesInPlaceRetry(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8606,9 +8606,9 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 		t.Fatalf("expected 0 merges, got %d", len(*merged))
 	}
 
-	// Should close the PR
-	if len(*closedPRs) != 1 || (*closedPRs)[0] != 10 {
-		t.Fatalf("closedPRs = %v, want [10]", *closedPRs)
+	// A failed check must not destroy canonical PR identity.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none for in-place retry", *closedPRs)
 	}
 
 	// Session should be dead with NextRetryAt scheduled
@@ -8622,17 +8622,14 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 	if sess.RetryCount != 1 {
 		t.Fatalf("RetryCount = %d, want 1", sess.RetryCount)
 	}
-	if sess.PRNumber != 0 {
-		t.Fatalf("PRNumber = %d, want 0 (cleared after PR close)", sess.PRNumber)
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10 (same PR retained)", sess.PRNumber)
 	}
 	if sess.CIFailureOutput == "" {
 		t.Fatal("CIFailureOutput should be set")
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("FinishedAt should be set")
-	}
-	if sess.Worktree != "" {
-		t.Fatalf("Worktree = %q, want empty (cleaned up)", sess.Worktree)
 	}
 }
 
@@ -8709,9 +8706,9 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// Should close the PR and schedule retry
-	if len(*closedPRs) != 1 {
-		t.Fatalf("closedPRs = %v, want 1 PR closed (unlimited retries)", *closedPRs)
+	// Should preserve the PR and schedule an in-place retry.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none (unlimited in-place retries)", *closedPRs)
 	}
 	sess := s.Sessions["slot-0"]
 	if sess.Status != state.StatusDead {
@@ -8722,7 +8719,7 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 	}
 }
 
-func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_DoesNotDependOnClosePR(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8762,13 +8759,16 @@ func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// When closePR fails, session should stay in pr_open (no retry scheduled)
+	// closePR is deliberately absent; the in-place retry must still schedule.
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusPROpen {
-		t.Fatalf("status = %q, want %q (closePR failed, no retry)", sess.Status, state.StatusPROpen)
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (closePR is not part of retry)", sess.Status, state.StatusDead)
 	}
-	if sess.NextRetryAt != nil {
-		t.Fatal("NextRetryAt should be nil when closePR fails")
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set without closing the PR")
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want canonical PR 10 retained", sess.PRNumber)
 	}
 }
 
