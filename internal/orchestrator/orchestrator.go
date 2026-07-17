@@ -3715,6 +3715,20 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					continue
 				}
 			}
+			// A completed PR keeps a terminal-reconciliation issue lease while the
+			// linked issue is still open, closing the merge->close redispatch gap.
+			// Once the forge proves the issue closed, release that lease so Fleet
+			// diagnostics do not retain a permanent active claim. A later explicit
+			// issue reopen is then eligible by design.
+			if sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && !sess.ReleasedForRedispatch {
+				closed, err := o.isIssueClosed(sess.IssueNumber)
+				if err != nil {
+					log.Printf("[orch] terminal claim check for issue #%d / PR #%d: %v", sess.IssueNumber, sess.PRNumber, err)
+				} else if closed {
+					sess.ReleasedForRedispatch = true
+					log.Printf("[orch] terminal claim reconciled for issue #%d / PR #%d on %s: issue is closed", sess.IssueNumber, sess.PRNumber, slotName)
+				}
+			}
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
 			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).

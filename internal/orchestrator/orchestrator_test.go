@@ -258,6 +258,33 @@ func TestReconcileRunningSessions_DeadWithPendingRetry_NotFlippedToPROpen(t *tes
 	}
 }
 
+func TestCheckSessions_DonePRReleasesTerminalClaimAfterIssueCloses(t *testing.T) {
+	finishedAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-274"] = &state.Session{
+		IssueNumber: 365, Status: state.StatusDone, PRNumber: 370, FinishedAt: &finishedAt,
+	}
+	if _, ok := s.IssueClaimFor(365); !ok {
+		t.Fatal("done PR must hold a terminal reconciliation claim before issue closure")
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(issueNumber int) (bool, error) { return issueNumber == 365, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	if !s.Sessions["ok-player-274"].ReleasedForRedispatch {
+		t.Fatal("closed issue must release its completed PR terminal claim")
+	}
+	if _, ok := s.IssueClaimFor(365); ok {
+		t.Fatal("closed issue retained terminal reconciliation claim")
+	}
+}
+
 func TestReconcileRunningSessions_DeadWorkerWithOpenPR_CapturesTokensFromPersistedLog(t *testing.T) {
 	stateDir := t.TempDir()
 	logDir := state.LogDir(stateDir)
