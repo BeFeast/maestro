@@ -32,6 +32,52 @@ func WorktreeDirty(worktree string) (bool, error) {
 	return strings.TrimSpace(string(out)) != "", nil
 }
 
+// RestoreMissingWorktree recreates a missing deterministic worker worktree at
+// the session's already-existing local branch. It deliberately does not create
+// a branch, reset a ref, or choose a different path: recovery must preserve the
+// original slot/branch identity and its committed work.
+func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch string) error {
+	localPath = strings.TrimSpace(localPath)
+	worktreeBase = strings.TrimSpace(worktreeBase)
+	slotName = strings.TrimSpace(slotName)
+	worktree = strings.TrimSpace(worktree)
+	branch = strings.TrimSpace(branch)
+	if localPath == "" || worktreeBase == "" || slotName == "" || worktree == "" || branch == "" {
+		return fmt.Errorf("restore missing worktree: local path, base, slot, worktree, and branch are required")
+	}
+
+	expected, err := filepath.Abs(filepath.Join(worktreeBase, slotName))
+	if err != nil {
+		return fmt.Errorf("resolve deterministic worktree path: %w", err)
+	}
+	actual, err := filepath.Abs(worktree)
+	if err != nil {
+		return fmt.Errorf("resolve recorded worktree path: %w", err)
+	}
+	if filepath.Clean(actual) != filepath.Clean(expected) {
+		return fmt.Errorf("restore missing worktree: recorded path %q is not deterministic slot path %q", actual, expected)
+	}
+	if _, err := os.Stat(actual); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat recorded worktree %s: %w", actual, err)
+	}
+
+	ref := "refs/heads/" + branch
+	if out, err := exec.Command("git", "-C", localPath, "show-ref", "--verify", "--quiet", ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("restore missing worktree: recorded local branch %q is unavailable: %w: %s", branch, err, strings.TrimSpace(string(out)))
+	}
+	if err := os.MkdirAll(filepath.Dir(actual), 0o755); err != nil {
+		return fmt.Errorf("create worktree parent: %w", err)
+	}
+	out, err := exec.Command("git", "-C", localPath, "worktree", "add", actual, branch).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("restore missing worktree %s on existing branch %s: %w: %s", actual, branch, err, strings.TrimSpace(string(out)))
+	}
+	log.Printf("[worker] restored missing canonical worktree %s on existing branch %s", actual, branch)
+	return nil
+}
+
 // rotateWorkerAttemptLog preserves the previous attempt while ensuring all
 // backend-failure classifiers see only the current attempt. Without this, a
 // Fable 429 left in a shared append-only log can be re-read after a successful

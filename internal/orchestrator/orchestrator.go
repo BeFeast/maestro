@@ -779,6 +779,12 @@ func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, s
 	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
 		return o.respawnWorkerWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
 	}
+	if _, statErr := os.Stat(sess.Worktree); errors.Is(statErr, os.ErrNotExist) && o.respawnInPlaceFn == nil {
+		if err := worker.RestoreMissingWorktree(cfg.LocalPath, cfg.WorktreeBase, slotName, sess.Worktree, sess.Branch); err != nil {
+			return err
+		}
+		log.Printf("[orch] worker %s: recovered missing canonical worktree from existing branch %s", slotName, sess.Branch)
+	}
 	// Unit tests inject an in-place respawner with synthetic paths. Production
 	// never has that hook and therefore still fails closed if a retained
 	// worktree cannot be inspected.
@@ -7444,22 +7450,28 @@ func (o *Orchestrator) applySupervisorOwnedReadyFilter(s *state.State, issues []
 	}
 
 	selected, ok := o.supervisorOwnedReadySelectedIssue(s)
-	if !ok {
-		for _, issue := range issues {
-			log.Printf("[orch] skipping issue #%d: supervisor-owned ready label has no selected dynamic-wave candidate yet", issue.Number)
-		}
-		return nil
-	}
-
+	// Dynamic-wave ownership constrains fresh issue selection, but it must not
+	// hide already-authorized exact-session repairs. Those approvals reserve an
+	// existing issue/session/PR identity and cannot allocate a competing slot;
+	// filtering them out behind the latest fresh candidate leaves dead workers
+	// in awaiting_dispatch forever (#940).
 	filtered := make([]github.Issue, 0, 1)
 	for _, issue := range issues {
-		if issue.Number == selected {
+		if o.supervisorSelectedRepairSpawn(s, issue.Number) {
 			filtered = append(filtered, issue)
 			continue
 		}
-		log.Printf("[orch] skipping issue #%d: not supervisor-selected candidate #%d for supervisor-owned ready label", issue.Number, selected)
+		if ok && issue.Number == selected {
+			filtered = append(filtered, issue)
+			continue
+		}
+		if ok {
+			log.Printf("[orch] skipping issue #%d: not supervisor-selected candidate #%d for supervisor-owned ready label", issue.Number, selected)
+		} else {
+			log.Printf("[orch] skipping issue #%d: supervisor-owned ready label has no selected dynamic-wave candidate yet", issue.Number)
+		}
 	}
-	if len(filtered) == 0 {
+	if ok && len(filtered) == 0 {
 		log.Printf("[orch] supervisor-owned ready label selected issue #%d, but it is not currently returned by issue_labels", selected)
 	}
 	return filtered
