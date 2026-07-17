@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -384,6 +385,18 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		st.SupervisorStuck = false
 		st.SupervisorStuckReason = ""
 		if err := state.Save(cfg.StateDir, st); err != nil {
+			// The orchestrator, supervisor, and watchdog share state.json. A
+			// conflicting orchestrator write can legitimately make this full
+			// snapshot lose its compare-and-merge race even though Decide completed.
+			// Persist the liveness fields against a freshly loaded snapshot so Fleet
+			// never reports a dead control loop for a cycle that actually ran. The
+			// original error is still returned: decision/approval persistence remains
+			// fail-closed and is retried on the next scheduled cycle.
+			if errors.Is(err, state.ErrStateConflict) {
+				if heartbeatErr := persistSupervisorHeartbeat(cfg.StateDir, st.LastRunOnceAt); heartbeatErr != nil {
+					return state.SupervisorDecision{}, fmt.Errorf("save state: %w (heartbeat recovery: %v)", err, heartbeatErr)
+				}
+			}
 			return state.SupervisorDecision{}, fmt.Errorf("save state: %w", err)
 		}
 		// #497: bound state.Sessions growth by compacting old terminal
@@ -393,6 +406,29 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		compactTerminalSessions(cfg, st, "supervisor")
 	}
 	return decision, nil
+}
+
+func persistSupervisorHeartbeat(stateDir string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		latest, err := state.Load(stateDir)
+		if err != nil {
+			return err
+		}
+		latest.LastRunOnceAt = at.UTC()
+		latest.SupervisorStuck = false
+		latest.SupervisorStuckReason = ""
+		if err := state.Save(stateDir, latest); err != nil {
+			if errors.Is(err, state.ErrStateConflict) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("supervisor heartbeat state remained conflicted after bounded retries")
 }
 
 // applyOrMintDecision is the post-decision side-effect stage of RunOnce,

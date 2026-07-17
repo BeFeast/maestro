@@ -4047,6 +4047,13 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	workers := make([]fleetWorkerState, 0, len(projectState.All))
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		if worker.NeedsAttention {
+			if canonical, ok := fleetSupersedingIssueSession(worker, projectState.All); ok {
+				worker.NeedsAttention = false
+				worker.StatusReason = fmt.Sprintf("superseded by canonical session %s (%s)", canonical.Slot, canonical.Status)
+				worker.NextAction = "No operator action required: follow the canonical session for this issue."
+			}
+		}
 		if audit, isStale := staleSlots[worker.Slot]; isStale {
 			worker.NeedsAttention = false
 			if reason := strings.TrimSpace(audit.Reason); reason != "" {
@@ -4079,6 +4086,36 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	}
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+// fleetSupersedingIssueSession identifies terminal duplicate attempts that
+// should not dominate project operator_state while the same issue already has
+// one canonical live or PR-bearing session. This is display/reconciliation
+// truth only: it does not delete history or choose a different dispatcher
+// lease. The durable issue claim remains the authority that prevents another
+// worker from being created.
+func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (sessionInfo, bool) {
+	if candidate.IssueNumber <= 0 || !candidate.NeedsAttention {
+		return sessionInfo{}, false
+	}
+	switch state.SessionStatus(candidate.Status) {
+	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+	default:
+		return sessionInfo{}, false
+	}
+	for _, peer := range all {
+		if peer.Slot == candidate.Slot || peer.IssueNumber != candidate.IssueNumber {
+			continue
+		}
+		if fleetSessionActuallyRunning(peer) {
+			return peer, true
+		}
+		switch state.SessionStatus(peer.Status) {
+		case state.StatusPROpen, state.StatusCodeLanded:
+			return peer, true
+		}
+	}
+	return sessionInfo{}, false
 }
 
 func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetCloseCandidate {
