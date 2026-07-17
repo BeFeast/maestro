@@ -227,6 +227,50 @@ func TestAwaitingRepairDispatchValidReservationOutranksInvalidSiblingApproval(t 
 	}
 }
 
+// Multiple stale approvals can suppress one another for the same missing
+// sibling session. Reconciliation must peel the whole chain before deciding
+// whether the selected canonical repair has a competing claim.
+func TestAwaitingRepairDispatchValidReservationOutranksMultipleInvalidSiblingApprovals(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	issues := []github.Issue{makeIssue(877, "repair PR #891", "maestro-ready")}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 877, nil }
+	respawns := 0
+	o.respawnInPlaceFn = func(_ *config.Config, slot string, sess *state.Session, _ string, _ github.Issue, _, _ string) error {
+		respawns++
+		if slot != "sup-valid" {
+			t.Fatalf("respawn slot = %q, want sup-valid", slot)
+		}
+		sess.Status = state.StatusRunning
+		return nil
+	}
+
+	now := time.Date(2026, 7, 17, 21, 35, 0, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["sup-valid"] = &state.Session{IssueNumber: 877, Status: state.StatusDead, PRNumber: 891, Worktree: "/work/sup-valid"}
+	valid := repairApproval("z-valid", 877, 891, state.ApprovalStatusAwaitingDispatch, now)
+	valid.Target.Session = "sup-valid"
+	invalidA := repairApproval("a-invalid", 877, 891, state.ApprovalStatusAwaitingDispatch, now)
+	invalidA.Target.Session = "sup-missing"
+	invalidB := repairApproval("b-invalid", 877, 891, state.ApprovalStatusAwaitingDispatch, now)
+	invalidB.Target.Session = "sup-missing"
+	s.Approvals = []state.Approval{valid, invalidA, invalidB}
+
+	o.startNewWorkers(s, 1)
+
+	if respawns != 1 || len(*freshStarts) != 0 || len(s.Sessions) != 1 {
+		t.Fatalf("valid repair did not dispatch exactly once: respawns=%d fresh=%v sessions=%v", respawns, *freshStarts, s.Sessions)
+	}
+	if got := approvalStatus(t, s, "z-valid"); got != state.ApprovalStatusSuperseded {
+		t.Fatalf("valid approval = %q, want consumed/superseded", got)
+	}
+	for _, id := range []string{"a-invalid", "b-invalid"} {
+		if got := approvalStatus(t, s, id); got != state.ApprovalStatusStale {
+			t.Fatalf("invalid sibling approval %s = %q, want stale", id, got)
+		}
+	}
+}
+
 // Staling an approval can reveal the session claim that the approval had been
 // suppressing. If that real session is still running, it remains canonical and
 // must block the selected repair even though its old approval named a stale PR.

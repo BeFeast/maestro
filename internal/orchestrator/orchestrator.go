@@ -7095,21 +7095,39 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		// sibling reservation before comparing it with this valid exact repair;
 		// otherwise lexical claim order can stale both approvals and lose the
 		// one recovery that was still safe to dispatch.
-		if claim.Kind == state.IssueClaimRepairDispatch {
+		seenInvalidApprovals := make(map[string]struct{})
+		for claim.Kind == state.IssueClaimRepairDispatch {
 			claimed, exists := s.SessionAt(claim.Session)
-			if !exists || claimed.IssueNumber != issue.Number || (claim.PRNumber > 0 && claimed.PRNumber != claim.PRNumber) {
-				reason := fmt.Sprintf("issue #%d competing repair reservation %s is invalid: session missing, belongs to another issue, or no longer matches PR #%d", issue.Number, claim.Session, claim.PRNumber)
-				o.staleInvalidRepairApproval(s, claim.ApprovalID, reason)
-				// Approval reservations suppress the underlying session claim.
-				// Rebuild claims after staling so a real running/open-PR session
-				// cannot be hidden by its obsolete approval and accidentally run
-				// concurrently with the selected repair.
-				revealed, stillClaimed := activeIssueClaimForSession(s, issue.Number, claim.Session)
-				if !stillClaimed {
-					continue
-				}
-				claim = revealed
+			if exists && claimed.IssueNumber == issue.Number && (claim.PRNumber <= 0 || claimed.PRNumber == claim.PRNumber) {
+				break
 			}
+			// More than one obsolete approval can reserve the same missing or
+			// mismatched sibling session. Peel every invalid approval-derived
+			// claim until either no claim remains or a real session claim is
+			// revealed; validating only the first revealed approval loses the
+			// selected canonical repair on the next stale sibling.
+			if claim.ApprovalID == "" {
+				break
+			}
+			if _, repeated := seenInvalidApprovals[claim.ApprovalID]; repeated {
+				break
+			}
+			seenInvalidApprovals[claim.ApprovalID] = struct{}{}
+			reason := fmt.Sprintf("issue #%d competing repair reservation %s is invalid: session missing, belongs to another issue, or no longer matches PR #%d", issue.Number, claim.Session, claim.PRNumber)
+			o.staleInvalidRepairApproval(s, claim.ApprovalID, reason)
+			// Approval reservations suppress the underlying session claim.
+			// Rebuild claims after each stale transition so a real
+			// running/open-PR session cannot remain hidden behind a chain of
+			// obsolete approvals.
+			revealed, stillClaimed := activeIssueClaimForSession(s, issue.Number, claim.Session)
+			if !stillClaimed {
+				claim = state.IssueClaim{}
+				break
+			}
+			claim = revealed
+		}
+		if claim.Session == "" {
+			continue
 		}
 		// A completed older PR can retain the issue's terminal-reconciliation
 		// claim until GitHub closes the issue. That claim must still prevent a
