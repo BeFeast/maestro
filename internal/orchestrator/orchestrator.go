@@ -2409,6 +2409,7 @@ func (o *Orchestrator) RunOnce() error {
 	// conflicting concurrent state save self-heals here instead of aging past
 	// SLA as a false operator gate. Runs after checkSessions/reconcileCodeLanded
 	// so freshly-done sessions are already reflected in state.
+	o.reconcileGuardedRepairApprovals(s)
 	o.reconcileResolvedRepairApprovals(s)
 
 	// Step 3c: Observe-merge self-deploy (#751). A PR merged outside the
@@ -5215,6 +5216,49 @@ func (o *Orchestrator) reconcileResolvedRepairApprovals(s *state.State) {
 			continue
 		}
 		o.reconcileMootRepairApprovals(s, issue, now, reason)
+	}
+}
+
+// reconcileGuardedRepairApprovals retires delayed repair authority when the
+// issue's current labels no longer permit dispatch. This is deliberately a
+// standing pass rather than only a startNewWorkers guard: removing the ready
+// label also removes the issue from the normal candidate list, but must not
+// leave an already-approved repair intent active forever or let it execute
+// after the issue becomes blocked.
+func (o *Orchestrator) reconcileGuardedRepairApprovals(s *state.State) {
+	if o == nil || o.cfg == nil || s == nil {
+		return
+	}
+	issues := make(map[int]struct{})
+	for _, claim := range s.ActiveIssueClaims() {
+		switch claim.Kind {
+		case state.IssueClaimRepairDispatch, state.IssueClaimReviewRepairDispatch:
+			issues[claim.IssueNumber] = struct{}{}
+		}
+	}
+	if len(issues) == 0 {
+		return
+	}
+	numbers := make([]int, 0, len(issues))
+	for issue := range issues {
+		numbers = append(numbers, issue)
+	}
+	sort.Ints(numbers)
+	now := time.Now().UTC()
+	for _, issueNumber := range numbers {
+		issue, err := o.getIssue(issueNumber)
+		if err != nil {
+			log.Printf("[orch] repair-approval guard: issue #%d label check failed; leaving approval active: %v", issueNumber, err)
+			continue
+		}
+		if !github.HasLabel(issue, o.cfg.ExcludeLabels) {
+			continue
+		}
+		reason := fmt.Sprintf("issue #%d has a current excluded label — delayed repair approval/intent is stale", issueNumber)
+		for _, approval := range s.StaleActiveRepairDispatchApprovals(issueNumber, now, reason) {
+			log.Printf("[orch] reconciled guarded repair approval %s for issue #%d: %s", approval.ID, issueNumber, reason)
+			o.mirrorRepairApprovalTerminal(approval.ID, now, reason)
+		}
 	}
 }
 

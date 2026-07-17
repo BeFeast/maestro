@@ -13,6 +13,7 @@ import (
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/supervisor"
 )
 
 // TestAwaitingRepairDispatchReservesAndRespawnsOriginalSession is the #892
@@ -144,6 +145,44 @@ func TestAwaitingRepairDispatchBlockedBeforeExecutionDoesNotSpawn(t *testing.T) 
 	}
 	if got := approvalStatus(t, s, "repair-331"); got != state.ApprovalStatusStale {
 		t.Fatalf("repair approval = %q, want stale after current blocked guard", got)
+	}
+}
+
+// A blocked issue normally loses its ready label and therefore never enters
+// startNewWorkers. The standing reconciler must still retire any delayed
+// classic or review-repair authority so it cannot execute on a later cycle.
+func TestReconcileGuardedRepairApprovals_BlockedWithoutReadyLabel(t *testing.T) {
+	now := time.Date(2026, 7, 17, 9, 22, 0, 0, time.UTC)
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", ExcludeLabels: []string{"blocked"}},
+		notifier: &notify.Notifier{},
+		getIssueFn: func(issue int) (github.Issue, error) {
+			if issue != 331 {
+				t.Fatalf("get issue = %d, want 331", issue)
+			}
+			return makeIssue(331, "canonical PR #335", "blocked"), nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Worktree:    "/work/ok-player-247",
+	}
+	classic := repairApproval("repair-331", 331, 335, state.ApprovalStatusAwaitingDispatch, now)
+	classic.Target.Session = "ok-player-247"
+	review := repairApproval("review-repair-331", 331, 335, state.ApprovalStatusApproved, now)
+	review.Action = supervisor.ActionSpawnReviewRepair
+	review.Target.Session = "ok-player-247"
+	s.Approvals = []state.Approval{classic, review}
+
+	o.reconcileGuardedRepairApprovals(s)
+
+	for _, id := range []string{"repair-331", "review-repair-331"} {
+		if got := approvalStatus(t, s, id); got != state.ApprovalStatusStale {
+			t.Fatalf("approval %s = %q, want stale", id, got)
+		}
 	}
 }
 
