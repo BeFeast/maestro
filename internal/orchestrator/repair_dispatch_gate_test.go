@@ -81,6 +81,32 @@ func TestSpawnRepairDispatch_HeadMoveStalesBoundApprovalBeforeReadingOldGates(t 
 	}
 }
 
+func TestSpawnRepairDispatch_PartialGreenRollupFailsClosedWithoutConsumingApproval(t *testing.T) {
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg := cfgWithBackends("codex", "codex")
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, []github.Issue{makeIssue(7, "repair exact PR", "maestro-ready")})
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Complete: false}, nil
+	}
+	respawns := 0
+	o.respawnInPlaceFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+		respawns++
+		return nil
+	}
+
+	s := repairGateTestState(time.Now().UTC(), head)
+	o.startNewWorkers(s, 1)
+
+	if respawns != 0 || len(*freshStarts) != 0 {
+		t.Fatalf("repair dispatched from partial green rollup: respawns=%d fresh=%v", respawns, *freshStarts)
+	}
+	if got := approvalStatus(t, s, "repair-7"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("repair approval = %q, want awaiting_dispatch for retryable partial read", got)
+	}
+}
+
 func TestSpawnRepairDispatch_CurrentReviewFindingAllowsExactInPlaceRepair(t *testing.T) {
 	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	cfg := cfgWithBackends("codex", "codex")

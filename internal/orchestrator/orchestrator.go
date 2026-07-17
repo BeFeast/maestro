@@ -7634,6 +7634,9 @@ func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) s
 	if observedHead := strings.TrimSpace(rollup.HeadSHA); observedHead != "" && !strings.EqualFold(observedHead, currentHead) {
 		return spawnRepairGateDecision{reason: "PR head changed while current checks were being read"}
 	}
+	if !rollup.Complete {
+		return spawnRepairGateDecision{reason: "current PR check rollup is incomplete; repair authority remains retryable"}
+	}
 	ci := strings.ToLower(strings.TrimSpace(rollup.Verdict))
 	actionableReason := ""
 	if ci == "failure" {
