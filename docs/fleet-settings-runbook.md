@@ -78,6 +78,15 @@ read its live cumulative `token_count` rollout events (including cached input),
 and the same value is also installed as Codex's native `rollout_budget` fallback
 inside the agent loop, including sub-agent work.
 
+For Claude and Pi the ceiling measure is **uncached tokens**: input + output +
+new cache-write tokens. Cache reads remain visible in cost/usage telemetry but
+are excluded from the ceiling because they replay previously produced context;
+counting the full cached context on every turn can kill a healthy worker after
+only a few new tokens. Repeated Claude stream frames for the same assistant
+message are de-duplicated by message id. Token-budget markers and Fleet worker
+rows expose `token_budget_measure: uncached_tokens`; total session/cost counters
+continue to retain the provider's full cache-aware usage.
+
 The measurement lag and maximum overshoot are therefore **one provider
 response**, plus the time needed to flush one JSONL line. There is no additional
 minutes-long Maestro poll delay. A single provider response can contain a

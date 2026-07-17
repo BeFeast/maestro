@@ -330,12 +330,13 @@ type sessionInfo struct {
 	Backend        string `json:"backend,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
-	Model             string `json:"model,omitempty"`
-	PRNumber          int    `json:"pr_number,omitempty"`
-	PRURL             string `json:"pr_url,omitempty"`
-	TokensUsedAttempt int    `json:"tokens_used_attempt"`
-	TokensUsedTotal   int    `json:"tokens_used_total"`
-	WorkerOutcome     string `json:"worker_outcome,omitempty"`
+	Model              string `json:"model,omitempty"`
+	PRNumber           int    `json:"pr_number,omitempty"`
+	PRURL              string `json:"pr_url,omitempty"`
+	TokensUsedAttempt  int    `json:"tokens_used_attempt"`
+	TokensUsedTotal    int    `json:"tokens_used_total"`
+	TokenBudgetMeasure string `json:"token_budget_measure,omitempty"`
+	WorkerOutcome      string `json:"worker_outcome,omitempty"`
 	// #739: cache-aware split token breakdown when the backend stamped it
 	// (claude stream-json / Pi). Surfaced so the cost panel can show the
 	// cache-read discount; zero for backends that report only a combined total.
@@ -390,7 +391,12 @@ type sessionInfo struct {
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
-	if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok && sess.WorkerOutcome == "" {
+	tokenBudgetMeasure := ""
+	marker, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile)
+	if markerOK {
+		tokenBudgetMeasure = marker.Measure
+	}
+	if markerOK && sess.WorkerOutcome == "" {
 		view := *sess
 		if marker.TokensObserved > view.TokensUsedAttempt {
 			delta := marker.TokensObserved - view.TokensUsedAttempt
@@ -410,33 +416,34 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	}
 	now := time.Now().UTC()
 	info := sessionInfo{
-		Slot:              slot,
-		IssueNumber:       sess.IssueNumber,
-		IssueTitle:        sess.IssueTitle,
-		IssueURL:          githubIssueURL(repo, sess.IssueNumber),
-		Status:            string(sess.Status),
-		Backend:           sess.Backend,
-		Model:             currentSessionModel(sess),
-		PRNumber:          sess.PRNumber,
-		PRURL:             githubPRURL(repo, sess.PRNumber),
-		TokensUsedAttempt: sess.TokensUsedAttempt,
-		TokensUsedTotal:   sess.TokensUsedTotal,
-		WorkerOutcome:     sess.WorkerOutcome,
-		TokensInput:       sess.TokensInput,
-		TokensOutput:      sess.TokensOutput,
-		TokensCacheRead:   sess.TokensCacheRead,
-		TokensCacheWrite:  sess.TokensCacheWrite,
-		CostUSDBackend:    sess.CostUSDBackend,
-		StartedAt:         sess.StartedAt.Format(time.RFC3339),
-		Worktree:          sess.Worktree,
-		Branch:            sess.Branch,
-		TmuxSession:       watchSessionName(slot, sess),
-		HasLog:            strings.TrimSpace(sess.LogFile) != "",
-		RetryCount:        sess.RetryCount,
-		LastNotification:  sess.LastNotifiedStatus,
-		BackendSelection:  sess.BackendSelection,
-		Attribution:       sess.Attribution,
-		Live:              state.SessionLiveAt(sess, now),
+		Slot:               slot,
+		IssueNumber:        sess.IssueNumber,
+		IssueTitle:         sess.IssueTitle,
+		IssueURL:           githubIssueURL(repo, sess.IssueNumber),
+		Status:             string(sess.Status),
+		Backend:            sess.Backend,
+		Model:              currentSessionModel(sess),
+		PRNumber:           sess.PRNumber,
+		PRURL:              githubPRURL(repo, sess.PRNumber),
+		TokensUsedAttempt:  sess.TokensUsedAttempt,
+		TokensUsedTotal:    sess.TokensUsedTotal,
+		TokenBudgetMeasure: tokenBudgetMeasure,
+		WorkerOutcome:      sess.WorkerOutcome,
+		TokensInput:        sess.TokensInput,
+		TokensOutput:       sess.TokensOutput,
+		TokensCacheRead:    sess.TokensCacheRead,
+		TokensCacheWrite:   sess.TokensCacheWrite,
+		CostUSDBackend:     sess.CostUSDBackend,
+		StartedAt:          sess.StartedAt.Format(time.RFC3339),
+		Worktree:           sess.Worktree,
+		Branch:             sess.Branch,
+		TmuxSession:        watchSessionName(slot, sess),
+		HasLog:             strings.TrimSpace(sess.LogFile) != "",
+		RetryCount:         sess.RetryCount,
+		LastNotification:   sess.LastNotifiedStatus,
+		BackendSelection:   sess.BackendSelection,
+		Attribution:        sess.Attribution,
+		Live:               state.SessionLiveAt(sess, now),
 	}
 
 	// Calculate runtime breakdown (#426). The workflow runtime is the

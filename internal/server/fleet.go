@@ -1715,13 +1715,14 @@ type fleetWorkerState struct {
 	// BackendSelection records why this backend was chosen (label, role, auto,
 	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
-	BackendSelection  *state.BackendSelection `json:"backend_selection,omitempty"`
-	PRNumber          int                     `json:"pr_number,omitempty"`
-	PRURL             string                  `json:"pr_url,omitempty"`
-	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
-	TokensUsedTotal   int                     `json:"tokens_used_total"`
-	WorkerMaxTokens   int                     `json:"worker_max_tokens,omitempty"`
-	WorkerOutcome     string                  `json:"worker_outcome,omitempty"`
+	BackendSelection   *state.BackendSelection `json:"backend_selection,omitempty"`
+	PRNumber           int                     `json:"pr_number,omitempty"`
+	PRURL              string                  `json:"pr_url,omitempty"`
+	TokensUsedAttempt  int                     `json:"tokens_used_attempt"`
+	TokensUsedTotal    int                     `json:"tokens_used_total"`
+	WorkerMaxTokens    int                     `json:"worker_max_tokens,omitempty"`
+	TokenBudgetMeasure string                  `json:"token_budget_measure,omitempty"`
+	WorkerOutcome      string                  `json:"worker_outcome,omitempty"`
 	// CostUSDEstimate is the $ estimate for TokensUsedTotal under the
 	// project's configured per-backend pricing (#619), OR the backend's
 	// self-reported cost when present (#730, Pi --mode json cost.total). 0
@@ -4980,6 +4981,10 @@ func isFleetWorkerDefaultVisible(worker sessionInfo) bool {
 }
 
 func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
+	tokenBudgetMeasure := worker.TokenBudgetMeasure
+	if project.EffectiveConfig.CostCaps.WorkerMaxTokens > 0 && tokenBudgetMeasure == "" {
+		tokenBudgetMeasure = "uncached_tokens"
+	}
 	return fleetWorkerState{
 		ProjectName:            project.Name,
 		ProjectRepo:            project.Repo,
@@ -5002,6 +5007,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		TokensUsedAttempt:      worker.TokensUsedAttempt,
 		TokensUsedTotal:        worker.TokensUsedTotal,
 		WorkerMaxTokens:        project.EffectiveConfig.CostCaps.WorkerMaxTokens,
+		TokenBudgetMeasure:     tokenBudgetMeasure,
 		WorkerOutcome:          worker.WorkerOutcome,
 		CostUSDEstimate:        worker.CostUSDEstimate,
 		CostUSDBackend:         worker.CostUSDBackend,

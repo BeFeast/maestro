@@ -39,6 +39,7 @@ type claudeStreamFrame struct {
 // carries the model name (and a per-turn usage block we do not aggregate —
 // the result frame's usage is the authoritative run total).
 type claudeStreamMessage struct {
+	ID    string            `json:"id"`
 	Model string            `json:"model"`
 	Usage *claudeUsageBlock `json:"usage"`
 }
@@ -63,6 +64,7 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 	seen := false
 	var systemModel, assistantModel string
 	var live claudeUsageBlock
+	liveMessages := make(map[string]claudeUsageBlock)
 	flushLive := func(authoritative *claudeUsageBlock) {
 		usage := authoritative
 		if usage == nil || claudeUsageTotal(&live) > claudeUsageTotal(usage) {
@@ -78,6 +80,7 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 		out.CacheWrite += usage.CacheCreationInputTokens
 		seen = true
 		live = claudeUsageBlock{}
+		clear(liveMessages)
 	}
 
 	for _, raw := range strings.Split(text, "\n") {
@@ -101,10 +104,20 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 					assistantModel = fr.Message.Model
 				}
 				if fr.Message.Usage != nil {
-					live.InputTokens += fr.Message.Usage.InputTokens
-					live.OutputTokens += fr.Message.Usage.OutputTokens
-					live.CacheReadInputTokens += fr.Message.Usage.CacheReadInputTokens
-					live.CacheCreationInputTokens += fr.Message.Usage.CacheCreationInputTokens
+					messageID := strings.TrimSpace(fr.Message.ID)
+					if messageID == "" {
+						live.InputTokens += fr.Message.Usage.InputTokens
+						live.OutputTokens += fr.Message.Usage.OutputTokens
+						live.CacheReadInputTokens += fr.Message.Usage.CacheReadInputTokens
+						live.CacheCreationInputTokens += fr.Message.Usage.CacheCreationInputTokens
+					} else {
+						previous := liveMessages[messageID]
+						live.InputTokens += positiveDelta(fr.Message.Usage.InputTokens, previous.InputTokens)
+						live.OutputTokens += positiveDelta(fr.Message.Usage.OutputTokens, previous.OutputTokens)
+						live.CacheReadInputTokens += positiveDelta(fr.Message.Usage.CacheReadInputTokens, previous.CacheReadInputTokens)
+						live.CacheCreationInputTokens += positiveDelta(fr.Message.Usage.CacheCreationInputTokens, previous.CacheCreationInputTokens)
+						liveMessages[messageID] = *fr.Message.Usage
+					}
 				}
 			}
 		case "result":
@@ -123,4 +136,11 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 	out.Model = nonEmpty(assistantModel, systemModel)
 	out.TotalTokens = out.Input + out.Output + out.CacheRead + out.CacheWrite
 	return out, seen
+}
+
+func positiveDelta(current, previous int) int {
+	if current > previous {
+		return current - previous
+	}
+	return 0
 }

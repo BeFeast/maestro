@@ -12,6 +12,8 @@ import (
 )
 
 const TokenBudgetExceededOutcome = "token_budget_exceeded"
+const TokenBudgetMeasureUncached = "uncached_tokens"
+const tokenBudgetMeasureLegacy = "provider_total_tokens_legacy"
 
 var ErrTokenBudgetExceeded = errors.New(TokenBudgetExceededOutcome)
 
@@ -22,6 +24,7 @@ type TokenBudgetMarker struct {
 	Backend        string    `json:"backend"`
 	TokensObserved int       `json:"tokens_observed"`
 	MaxTokens      int       `json:"max_tokens"`
+	Measure        string    `json:"measure"`
 	MeasuredAt     time.Time `json:"measured_at"`
 }
 
@@ -48,6 +51,9 @@ func ReadTokenBudgetMarker(logFile string) (TokenBudgetMarker, bool) {
 	if json.Unmarshal(data, &marker) != nil || marker.Outcome != TokenBudgetExceededOutcome || marker.MaxTokens <= 0 {
 		return TokenBudgetMarker{}, false
 	}
+	if strings.TrimSpace(marker.Measure) == "" {
+		marker.Measure = tokenBudgetMeasureLegacy
+	}
 	return marker, true
 }
 
@@ -63,6 +69,7 @@ func writeTokenBudgetMarker(path, backend string, observed, maxTokens int) error
 		Backend:        backend,
 		TokensObserved: observed,
 		MaxTokens:      maxTokens,
+		Measure:        TokenBudgetMeasureUncached,
 		MeasuredAt:     time.Now().UTC(),
 	}
 	data, err := json.Marshal(marker)
@@ -92,11 +99,16 @@ type liveTokenMonitor struct {
 	maxTokens        int
 	totalTokens      int
 	claudeAssistants int
+	claudeMessages   map[string]int
 	codexThreadID    string
 }
 
 func newLiveTokenMonitor(backend string, maxTokens int) *liveTokenMonitor {
-	return &liveTokenMonitor{backend: strings.TrimSpace(backend), maxTokens: maxTokens}
+	return &liveTokenMonitor{
+		backend:        strings.TrimSpace(backend),
+		maxTokens:      maxTokens,
+		claudeMessages: make(map[string]int),
+	}
 }
 
 func (m *liveTokenMonitor) observe(line string) (int, bool) {
@@ -117,14 +129,21 @@ func (m *liveTokenMonitor) observe(line string) (int, bool) {
 		switch fr.Type {
 		case "assistant":
 			if fr.Message != nil && fr.Message.Usage != nil {
-				m.claudeAssistants += claudeUsageTotal(fr.Message.Usage)
+				measured := claudeBudgetUsage(fr.Message.Usage)
+				messageID := strings.TrimSpace(fr.Message.ID)
+				if messageID == "" {
+					m.claudeAssistants += measured
+				} else if previous := m.claudeMessages[messageID]; measured > previous {
+					m.claudeAssistants += measured - previous
+					m.claudeMessages[messageID] = measured
+				}
 				if m.claudeAssistants > m.totalTokens {
 					m.totalTokens = m.claudeAssistants
 				}
 			}
 		case "result":
 			if fr.Usage != nil {
-				if total := claudeUsageTotal(fr.Usage); total > m.totalTokens {
+				if total := claudeBudgetUsage(fr.Usage); total > m.totalTokens {
 					m.totalTokens = total
 				}
 			}
@@ -160,7 +179,7 @@ func (m *liveTokenMonitor) observe(line string) (int, bool) {
 	case "pi":
 		var ev piUsageEvent
 		if json.Unmarshal([]byte(trimmed), &ev) == nil && ev.Type == "turn_end" && ev.Message != nil && ev.Message.Usage != nil {
-			m.totalTokens += piUsageTotal(ev.Message.Usage)
+			m.totalTokens += piBudgetUsage(ev.Message.Usage)
 		}
 	case "opencode":
 		var fr opencodeStreamFrame
@@ -257,4 +276,23 @@ func piUsageTotal(usage *piUsageBlock) int {
 		return 0
 	}
 	return usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+}
+
+// claudeBudgetUsage is the live ceiling measure, intentionally distinct from
+// claudeUsageTotal (provider/cost telemetry). Cache reads are already-produced
+// context replayed into a later turn; charging them again makes the ceiling
+// grow by the whole context on every assistant response. The ceiling therefore
+// counts only uncached input, output, and freshly-created cache tokens.
+func claudeBudgetUsage(usage *claudeUsageBlock) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.InputTokens + usage.OutputTokens + usage.CacheCreationInputTokens
+}
+
+func piBudgetUsage(usage *piUsageBlock) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.Input + usage.Output + usage.CacheWrite
 }
