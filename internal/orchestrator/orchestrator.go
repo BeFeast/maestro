@@ -4767,6 +4767,7 @@ func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int,
 		return
 	}
 	var handoffs []string
+	var released []string
 	for _, siblingSlot := range allSlots {
 		if siblingSlot == canonicalSlot {
 			continue
@@ -4780,26 +4781,34 @@ func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int,
 			log.Printf("[orch] terminal/open-PR reconcile: could not inspect preserved sibling branch %s for issue #%d: %v", sibling.Branch, issue, err)
 			continue
 		}
-		if len(commits) == 0 {
-			continue
+		if len(commits) > 0 {
+			handoff := fmt.Sprintf("- session %s branch `%s`: unique commits `%s`", siblingSlot, sibling.Branch, strings.Join(commits, "`, `"))
+			if !strings.Contains(canonicalSession.PreviousAttemptFeedback, handoff) {
+				handoffs = append(handoffs, handoff)
+			}
 		}
-		handoff := fmt.Sprintf("- session %s branch `%s`: unique commits `%s`", siblingSlot, sibling.Branch, strings.Join(commits, "`, `"))
-		if strings.Contains(canonicalSession.PreviousAttemptFeedback, handoff) {
-			continue
+		// A successful patch-equivalence comparison proves that every durable
+		// sibling change is either already canonical or represented by the exact
+		// commit handoff above. Release only the sibling's dispatcher claim; keep
+		// its branch/worktree intact for forensics and recovery. Without this,
+		// the preserved worktree itself blocks the canonical repair forever.
+		sibling.ReleasedForRedispatch = true
+		sibling.WorkerOutcome = "duplicate_dispatch_reconciled"
+		released = append(released, siblingSlot)
+	}
+	if len(handoffs) > 0 {
+		handoff := strings.Join(handoffs, "\n")
+		if strings.TrimSpace(canonicalSession.PreviousAttemptFeedback) == "" {
+			canonicalSession.PreviousAttemptFeedback = handoff
+			canonicalSession.PreviousAttemptFeedbackKind = "recovery_handoff"
+		} else {
+			canonicalSession.PreviousAttemptFeedback += "\n\nPreserved sibling work:\n" + handoff
 		}
-		handoffs = append(handoffs, handoff)
+		log.Printf("[orch] attached preserved sibling commit handoff to canonical session %s for issue #%d / PR #%d", canonicalSlot, issue, canonical.Number)
 	}
-	if len(handoffs) == 0 {
-		return
+	if len(released) > 0 {
+		log.Printf("[orch] released reconciled sibling claim(s) %s behind canonical session %s for issue #%d / PR #%d", strings.Join(released, ","), canonicalSlot, issue, canonical.Number)
 	}
-	handoff := strings.Join(handoffs, "\n")
-	if strings.TrimSpace(canonicalSession.PreviousAttemptFeedback) == "" {
-		canonicalSession.PreviousAttemptFeedback = handoff
-		canonicalSession.PreviousAttemptFeedbackKind = "recovery_handoff"
-	} else {
-		canonicalSession.PreviousAttemptFeedback += "\n\nPreserved sibling work:\n" + handoff
-	}
-	log.Printf("[orch] attached preserved sibling commit handoff to canonical session %s for issue #%d / PR #%d", canonicalSlot, issue, canonical.Number)
 }
 
 func (o *Orchestrator) releaseClosedUnmergedSession(sess *state.Session, slotName string) {

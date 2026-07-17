@@ -132,6 +132,7 @@ func TestReconcileCanonicalPRSelectsExactHistoricalSessionAfterCompetingWorkerSt
 func TestReconcileActiveCanonicalPRReceivesTerminalSiblingCommitHandoffOnce(t *testing.T) {
 	repo := newReconcileBranchRepo(t)
 	runReconcileGit(t, repo, "branch", "canonical")
+	runReconcileGit(t, repo, "branch", "equivalent-sibling")
 	runReconcileGit(t, repo, "switch", "-c", "preserved-sibling")
 	if err := os.WriteFile(filepath.Join(repo, "repair.txt"), []byte("preserved repair\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -152,6 +153,11 @@ func TestReconcileActiveCanonicalPRReceivesTerminalSiblingCommitHandoffOnce(t *t
 		Status:      state.StatusRetryExhausted,
 		Branch:      "preserved-sibling",
 	}
+	s.Sessions["equivalent-slot"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusFailed,
+		Branch:      "equivalent-sibling",
+	}
 	o := &Orchestrator{cfg: &config.Config{LocalPath: repo}}
 	prs := []github.PR{{Number: 397, HeadRefName: "canonical", Title: "Fedora fix for #346"}}
 
@@ -167,6 +173,12 @@ func TestReconcileActiveCanonicalPRReceivesTerminalSiblingCommitHandoffOnce(t *t
 	}
 	if got := s.Sessions["canonical-slot"].Status; got != state.StatusPROpen {
 		t.Fatalf("canonical status = %q, want pr_open", got)
+	}
+	if sibling := s.Sessions["preserved-slot"]; !sibling.ReleasedForRedispatch || sibling.WorkerOutcome != "duplicate_dispatch_reconciled" {
+		t.Fatalf("preserved sibling claim was not released after durable handoff: %+v", sibling)
+	}
+	if sibling := s.Sessions["equivalent-slot"]; !sibling.ReleasedForRedispatch || sibling.WorkerOutcome != "duplicate_dispatch_reconciled" {
+		t.Fatalf("patch-equivalent sibling claim was not released: %+v", sibling)
 	}
 
 	// Repeated minute-level reconciliation must not grow the prompt forever.
