@@ -4067,7 +4067,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 			item.Attention = append(item.Attention, worker)
-			if fleetSessionIsConvergenceBound(worker) {
+			if fleetSessionIsConvergenceBound(worker, item.Supervisor.Latest) {
 				item.SelfResolving++
 			}
 		}
@@ -4435,7 +4435,7 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		// attention is self-resolving the project reads calm ("auto-merging,
 		// no action needed") instead of alarming the fleet verdict with a
 		// passive `Action required — p1`.
-		actionable, autoMerging := partitionFleetAttentionByResolvability(project.Attention)
+		actionable, autoMerging := partitionFleetAttentionByResolvability(project.Attention, project.Supervisor.Latest)
 		if len(actionable) == 0 && len(autoMerging) > 0 {
 			return fleetAutoMergingOperatorState(project, autoMerging[0])
 		}
@@ -4598,9 +4598,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 // will auto-merge it as soon as the merge gate clears, so the fleet verdict
 // must not alarm with `Action required — p1`. Other shapes are returned in
 // the actionable slice; the order of both slices mirrors the input.
-func partitionFleetAttentionByResolvability(workers []sessionInfo) (actionable, autoMerging []sessionInfo) {
+func partitionFleetAttentionByResolvability(workers []sessionInfo, latest *supervisorDecisionInfo) (actionable, autoMerging []sessionInfo) {
 	for _, w := range workers {
-		if fleetSessionIsConvergenceBound(w) {
+		if fleetSessionIsConvergenceBound(w, latest) {
 			autoMerging = append(autoMerging, w)
 			continue
 		}
@@ -4612,12 +4612,13 @@ func partitionFleetAttentionByResolvability(workers []sessionInfo) (actionable, 
 // fleetSessionIsConvergenceBound reports whether a session in the
 // attention list is "self-resolving" — convergence (the orchestrator's
 // auto-merge once gates clear) will resolve it without operator action.
-// Today this is the retry_exhausted-with-open-PR-and-no-failing-checks
-// shape from issue #598: a green PR whose retry budget has been used up
-// but whose merge will land naturally once the merge gate clears. A PR
-// known to have failed checks (CIFailureOutput / LastNotifiedStatus =
-// ci_failure) is NOT convergence-bound and stays actionable.
-func fleetSessionIsConvergenceBound(worker sessionInfo) bool {
+// Today this is the retry_exhausted-with-open-PR shape from issue #598, but
+// only when the latest supervisor reconciliation contains positive GitHub
+// evidence that the PR checks succeeded. Absence of failure evidence is not
+// proof of green: session notification fields can lag a freshly failed check
+// run, which previously produced the false "checks are green" state from
+// issue #955. Any current gate blocker for the same PR wins over success.
+func fleetSessionIsConvergenceBound(worker sessionInfo, latest *supervisorDecisionInfo) bool {
 	if state.SessionStatus(worker.Status) != state.StatusRetryExhausted {
 		return false
 	}
@@ -4627,7 +4628,28 @@ func fleetSessionIsConvergenceBound(worker sessionInfo) bool {
 	if strings.EqualFold(strings.TrimSpace(worker.LastNotification), "ci_failure") {
 		return false
 	}
-	return true
+	if latest == nil {
+		return false
+	}
+	checksSucceeded := false
+	for _, stuck := range latest.StuckStates {
+		if stuck.Target == nil || stuck.Target.PR != worker.PRNumber {
+			continue
+		}
+		switch strings.TrimSpace(stuck.Code) {
+		case "failing_checks", state.StuckPendingChecks, "draft_pr", "unmergeable_pr",
+			"greptile_not_approved", "greptile_pending", "review_gate_not_approved",
+			"review_gate_pending", state.StuckReviewRepairExhausted:
+			return false
+		case "retry_exhausted_open_pr":
+			for _, evidence := range stuck.Evidence {
+				if strings.Contains(strings.ToLower(evidence), "checks=success") {
+					checksSucceeded = true
+				}
+			}
+		}
+	}
+	return checksSucceeded
 }
 
 // fleetAutoMergingOperatorState builds the calm operator state for a
