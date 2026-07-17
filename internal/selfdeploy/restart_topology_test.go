@@ -53,6 +53,27 @@ func TestMaestroServiceKillOwnershipExplicit(t *testing.T) {
 	}
 }
 
+// #953: maestro.service is a system-scoped unit. Without an explicit User and
+// home/store path, systemd expands %h for root and self-deploy boots an empty
+// fleet from /root/.maestro instead of the operator's live config store.
+func TestMaestroServiceUsesDeterministicRuntimeIdentity(t *testing.T) {
+	unit := repoFile(t, "maestro.service")
+	for _, want := range []string{
+		"User=god",
+		"WorkingDirectory=/home/god",
+		"Environment=PATH=/home/god/.local/bin:/home/god/.bun/bin:/home/god/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
+		"--store /home/god/.maestro/maestro.db",
+		"WantedBy=multi-user.target",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("maestro.service missing deterministic system-runtime directive %q", want)
+		}
+	}
+	if strings.Contains(unit, "%h/.maestro") {
+		t.Error("system-scoped maestro.service must not derive the fleet store from manager HOME")
+	}
+}
+
 // #877: a fix that requires a unit change (KillMode) lives in the unit file, not
 // the binary, so the self-deploy script must ship the unit alongside the binary
 // — install it over the live FragmentPath, daemon-reload, and roll it back on
