@@ -166,6 +166,26 @@ func (s *State) ResolveDispatchedSpawnRepairApproval(id string, now time.Time, r
 	return false
 }
 
+// StaleActiveRepairDispatchApproval retires one exact repair authority after
+// dispatch proves that its durable issue/session/PR reservation is no longer
+// valid. This is intentionally ID-scoped: another independently reviewed
+// repair for the same issue must not be invalidated as a side effect. Repeated
+// calls are idempotent because terminal approvals are ignored.
+func (s *State) StaleActiveRepairDispatchApproval(id string, now time.Time, reason string) bool {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.ID != id || !repairDispatchApprovalNeedsGuardReconcile(approval) {
+			continue
+		}
+		s.markApprovalStale(approval, now, reason)
+		return true
+	}
+	return false
+}
+
 // StaleActiveRepairDispatchApprovals retires delayed repair authority when a
 // current issue guard (for example a newly-added blocked label) says dispatch
 // is no longer allowed. Approval is not timeless authority: dispatch must
