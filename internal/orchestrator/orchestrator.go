@@ -2554,7 +2554,7 @@ func (o *Orchestrator) RunOnce() error {
 	// Persist immediately when reconciliation changes state, so slot calculation
 	// always sees healed state on disk.
 	if reconciled {
-		if err := state.Save(o.cfg.StateDir, s); err != nil {
+		if err := o.saveStatePreservingLiveRuntime(s); err != nil {
 			return fmt.Errorf("save state after reconcile: %w", err)
 		}
 	}
@@ -2622,7 +2622,7 @@ func (o *Orchestrator) RunOnce() error {
 	state.ReconcileBackendHealth(s, time.Now().UTC())
 
 	// Save after all checks/reconciliation
-	if err := state.Save(o.cfg.StateDir, s); err != nil {
+	if err := o.saveStatePreservingLiveRuntime(s); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 
@@ -2641,7 +2641,7 @@ func (o *Orchestrator) RunOnce() error {
 
 	if slots > 0 {
 		o.startNewWorkers(s, slots)
-		if err := state.Save(o.cfg.StateDir, s); err != nil {
+		if err := o.saveStatePreservingLiveRuntime(s); err != nil {
 			return fmt.Errorf("save state after workers: %w", err)
 		}
 	}
@@ -3148,6 +3148,18 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 	reconciled := false
 	for slotName, sess := range s.Sessions {
+		// A worker launch is an external side effect: tmux may have accepted it
+		// even when the following state.Save lost a concurrent supervisor/watchdog
+		// merge race. Older code only inspected StatusRunning, so a live in-place
+		// repair hidden behind the previous pr_open/dead projection became invisible
+		// to Fleet and the progress watchdog indefinitely. Recover exact ownership
+		// before the status filter. Done/code_landed are outcome terminals and must
+		// never be reopened merely because an obsolete pane survived.
+		if sess.Status != state.StatusRunning && sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded {
+			if o.adoptLiveWorkerRuntime(slotName, sess, time.Now().UTC()) {
+				reconciled = true
+			}
+		}
 		isRestartCheckpointedDead := sess.Status == state.StatusDead && sess.RestartCheckpointAt != nil
 		if sess.Status != state.StatusRunning && !isRestartCheckpointedDead {
 			continue
@@ -3519,6 +3531,126 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 	return reconciled
 }
 
+// adoptLiveWorkerRuntime adopts only the deterministic tmux identity belonging
+// to slotName and only when its pane cwd matches the retained worktree exactly.
+// A same-name foreign/unreadable pane is left untouched and is not evidence of
+// ownership. No worker is started or stopped here, so retrying every cycle is
+// idempotent and cannot create a duplicate.
+func (o *Orchestrator) adoptLiveWorkerRuntime(slotName string, sess *state.Session, observedAt time.Time) bool {
+	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
+		return false
+	}
+	tmuxName := strings.TrimSpace(sess.TmuxSession)
+	if tmuxName == "" {
+		tmuxName = worker.TmuxSessionName(slotName)
+	}
+	if !o.tmuxSessionExists(tmuxName) {
+		return false
+	}
+	pid, paneWorktree, err := o.tmuxPaneIdentity(tmuxName)
+	if err != nil || pid <= 0 {
+		log.Printf("[orch] reconcile: %s has live tmux %q but pane identity is unreadable (%v); refusing unsafe adoption", slotName, tmuxName, err)
+		return false
+	}
+	if filepath.Clean(paneWorktree) != filepath.Clean(sess.Worktree) {
+		log.Printf("[orch] reconcile: %s refusing foreign tmux %q: pane worktree %q != retained worktree %q", slotName, tmuxName, paneWorktree, sess.Worktree)
+		return false
+	}
+	if !o.pidAlive(pid) {
+		log.Printf("[orch] reconcile: %s tmux %q reported dead pane pid %d; refusing adoption", slotName, tmuxName, pid)
+		return false
+	}
+	previous := sess.Status
+	worker.AdoptLiveRuntime(o.cfg, sess, pid, tmuxName, observedAt)
+	log.Printf("[orch] reconcile: %s adopted live worker runtime hidden behind status=%s (issue #%d, pid=%d, tmux=%q, worktree=%q) — no respawn, no duplicate",
+		slotName, previous, sess.IssueNumber, pid, tmuxName, sess.Worktree)
+	return true
+}
+
+// saveStatePreservingLiveRuntime closes the side-effect/state gap around worker
+// launches. A normal three-way Save remains the fast path. If it conflicts on
+// the same session after tmux already accepted a launch, recover only runtime
+// snapshots whose exact deterministic tmux + pane cwd are still live, and
+// overlay those snapshots onto the latest state under state.Update's lock.
+//
+// Other concurrent supervisor/watchdog fields stay authoritative. This does
+// not retry a spawn and cannot create a process; it merely prevents a proven
+// live worker from becoming invisible because its post-launch Save lost a CAS
+// race. All other conflicting mutations remain fail-closed for the next cycle.
+func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		if !errors.Is(err, state.ErrStateConflict) {
+			return err
+		}
+		originalErr := err
+		live := make(map[string]state.Session)
+		for slotName, sess := range s.Sessions {
+			if sess == nil || sess.Status != state.StatusRunning || strings.TrimSpace(sess.Worktree) == "" {
+				continue
+			}
+			tmuxName := strings.TrimSpace(sess.TmuxSession)
+			if tmuxName == "" {
+				tmuxName = worker.TmuxSessionName(slotName)
+			}
+			if !o.tmuxSessionExists(tmuxName) {
+				continue
+			}
+			pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
+			if identityErr != nil || pid <= 0 || !o.pidAlive(pid) || filepath.Clean(paneWorktree) != filepath.Clean(sess.Worktree) {
+				continue
+			}
+			copy := *sess
+			copy.PID = pid
+			copy.TmuxSession = tmuxName
+			live[slotName] = copy
+		}
+		if len(live) == 0 {
+			return originalErr
+		}
+
+		adopted := 0
+		updateErr := state.Update(o.cfg.StateDir, func(latest *state.State) error {
+			for slotName, runtime := range live {
+				current, exists := latest.Sessions[slotName]
+				if exists {
+					if current == nil || current.IssueNumber != runtime.IssueNumber || strings.TrimSpace(current.Branch) != strings.TrimSpace(runtime.Branch) || filepath.Clean(current.Worktree) != filepath.Clean(runtime.Worktree) {
+						continue
+					}
+				} else {
+					// A fresh spawn can be absent from the concurrently-written
+					// snapshot. Only accept its deterministic slot worktree; never
+					// attach an arbitrary tmux pane/path as a new session.
+					expected := filepath.Join(o.cfg.WorktreeBase, slotName)
+					if filepath.Clean(runtime.Worktree) != filepath.Clean(expected) {
+						continue
+					}
+				}
+				copy := runtime
+				latest.Sessions[slotName] = &copy
+				adopted++
+			}
+			if adopted == 0 {
+				return state.ErrNoStateChange
+			}
+			return nil
+		})
+		if updateErr != nil {
+			return fmt.Errorf("%w (live-runtime recovery: %v)", originalErr, updateErr)
+		}
+		if adopted == 0 {
+			return originalErr
+		}
+		latest, loadErr := state.Load(o.cfg.StateDir)
+		if loadErr != nil {
+			return fmt.Errorf("reload after preserving %d live runtime(s): %w", adopted, loadErr)
+		}
+		*s = *latest
+		log.Printf("[orch] state conflict recovered by preserving %d exact live worker runtime(s); concurrent supervisor/watchdog fields retained", adopted)
+		return nil
+	}
+	return nil
+}
+
 // reconcilePushedBranch handles a stale running session whose worker died
 // after pushing its branch. Outcomes, in order (#800):
 //
@@ -3661,6 +3793,25 @@ Maestro auto-created this pull request for pushed branch %s because no open pull
 func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *state.Session) (deferred bool) {
 	if sess == nil || len(sess.Attribution) == 0 {
 		return false
+	}
+	// Runtime ownership is stronger evidence than the persisted status. A
+	// repair worker can already be live while a concurrent state write still
+	// shows pr_open/PID=0. Never amend/force-push underneath that agent: doing so
+	// rewrites HEAD while it is editing, testing, or pushing. We intentionally
+	// fail closed even when pane identity is unreadable or foreign; a live exact
+	// tmux name is enough uncertainty to forbid a branch mutation this cycle.
+	tmuxName := strings.TrimSpace(sess.TmuxSession)
+	if tmuxName == "" {
+		tmuxName = worker.TmuxSessionName(slotName)
+	}
+	if o.tmuxSessionExists(tmuxName) {
+		pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
+		if identityErr == nil && pid > 0 && filepath.Clean(paneWorktree) == filepath.Clean(sess.Worktree) {
+			log.Printf("[orch] attribution: deferring amend for %s (live worker owns branch %q via pid=%d tmux=%q)", slotName, sess.Branch, pid, tmuxName)
+		} else {
+			log.Printf("[orch] attribution: deferring amend for %s (tmux %q is live but ownership is not safely readable: pid=%d worktree=%q err=%v)", slotName, tmuxName, pid, paneWorktree, identityErr)
+		}
+		return true
 	}
 	err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC())
 	if err == nil {
