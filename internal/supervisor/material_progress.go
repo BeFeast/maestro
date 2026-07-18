@@ -80,11 +80,19 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 	now = now.UTC()
 	slots := make([]string, 0, len(st.Sessions))
 	livePRs := make(map[int]struct{})
+	prGateOwners := make(map[int]string)
 	for slot := range st.Sessions {
 		slots = append(slots, slot)
 		sess := st.Sessions[slot]
 		if sess != nil && sess.Status == state.StatusRunning && sess.PID > 0 && sess.PRNumber > 0 {
 			livePRs[sess.PRNumber] = struct{}{}
+		}
+		if sess == nil || sess.PRNumber <= 0 || (sess.Status != state.StatusPROpen && sess.Status != state.StatusQueued) {
+			continue
+		}
+		ownerSlot, exists := prGateOwners[sess.PRNumber]
+		if !exists || materialProgressGateOwnerPrecedes(slot, sess, ownerSlot, st.Sessions[ownerSlot]) {
+			prGateOwners[sess.PRNumber] = slot
 		}
 	}
 	sort.Strings(slots)
@@ -109,6 +117,13 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 			if _, ownedByLiveWorker := livePRs[sess.PRNumber]; sess.PRNumber > 0 && ownedByLiveWorker {
 				continue
 			}
+			// A PR is one lifecycle gate even when historical/continuation sessions
+			// from different issues reference it. Keep the newest exact session as
+			// the deterministic owner so a completed continuation does not revive a
+			// second overdue target for the same PR.
+			if ownerSlot := prGateOwners[sess.PRNumber]; sess.PRNumber > 0 && ownerSlot != slot {
+				continue
+			}
 			if observation, ok := prGateProgressObservation(st, project, slot, sess, now); ok {
 				observations = append(observations, observation)
 			}
@@ -124,6 +139,22 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 		return observations[i].Target.Key() < observations[j].Target.Key()
 	})
 	return observations
+}
+
+func materialProgressGateOwnerPrecedes(candidateSlot string, candidate *state.Session, currentSlot string, current *state.Session) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil || candidate.StartedAt.After(current.StartedAt) {
+		return true
+	}
+	if current.StartedAt.After(candidate.StartedAt) {
+		return false
+	}
+	if candidate.Status != current.Status {
+		return candidate.Status == state.StatusQueued
+	}
+	return candidateSlot < currentSlot
 }
 
 func workerProgressObservation(st *state.State, project, slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
