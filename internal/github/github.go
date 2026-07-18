@@ -24,13 +24,20 @@ import (
 )
 
 type greptileCheckRun struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-	HTMLURL    string `json:"html_url"`
-	DetailsURL string `json:"details_url"`
-	Output     struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion"`
+	CreatedAt   string `json:"created_at"`
+	StartedAt   string `json:"started_at"`
+	CompletedAt string `json:"completed_at"`
+	HTMLURL     string `json:"html_url"`
+	DetailsURL  string `json:"details_url"`
+	App         struct {
+		ID   int64  `json:"id"`
+		Slug string `json:"slug"`
+	} `json:"app"`
+	Output struct {
 		Title   string `json:"title"`
 		Summary string `json:"summary"`
 		Text    string `json:"text"`
@@ -1523,7 +1530,68 @@ func parseCheckRuns(out []byte) ([]greptileCheckRun, error) {
 	if err := json.Unmarshal(out, &payload); err != nil {
 		return nil, err
 	}
-	return payload.CheckRuns, nil
+	return latestLogicalCheckRuns(payload.CheckRuns), nil
+}
+
+// latestLogicalCheckRuns collapses historical rerun attempts into GitHub's
+// current logical check contexts. The checks API returns every attempt for a
+// commit, so treating all rows as simultaneously authoritative lets an old
+// failure override a newer successful rerun on the same head (#998). GitHub
+// check contexts are identified by app + name; creation/start time and the
+// public monotonic check-run ID select the newest attempt deterministically.
+func latestLogicalCheckRuns(checks []greptileCheckRun) []greptileCheckRun {
+	if len(checks) < 2 {
+		return checks
+	}
+	latest := make(map[string]greptileCheckRun, len(checks))
+	order := make([]string, 0, len(checks))
+	for _, check := range checks {
+		key := logicalCheckRunKey(check)
+		current, ok := latest[key]
+		if !ok {
+			latest[key] = check
+			order = append(order, key)
+			continue
+		}
+		if checkRunNewer(check, current) {
+			latest[key] = check
+		}
+	}
+	result := make([]greptileCheckRun, 0, len(order))
+	for _, key := range order {
+		result = append(result, latest[key])
+	}
+	return result
+}
+
+func logicalCheckRunKey(check greptileCheckRun) string {
+	name := strings.ToLower(strings.TrimSpace(check.Name))
+	if name == "" {
+		return fmt.Sprintf("id:%d", check.ID)
+	}
+	app := fmt.Sprintf("id:%d", check.App.ID)
+	if check.App.ID == 0 {
+		app = "slug:" + strings.ToLower(strings.TrimSpace(check.App.Slug))
+	}
+	return app + "\x00" + name
+}
+
+func checkRunNewer(candidate, current greptileCheckRun) bool {
+	candidateAt := checkRunCreatedAt(candidate)
+	currentAt := checkRunCreatedAt(current)
+	if !candidateAt.Equal(currentAt) {
+		return candidateAt.After(currentAt)
+	}
+	return candidate.ID > current.ID
+}
+
+func checkRunCreatedAt(check greptileCheckRun) time.Time {
+	for _, raw := range []string{check.StartedAt, check.CreatedAt, check.CompletedAt} {
+		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw)); err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
 }
 
 func parseCombinedStatus(out []byte) (combinedStatusResponse, error) {
@@ -1535,6 +1603,7 @@ func parseCombinedStatus(out []byte) (combinedStatusResponse, error) {
 }
 
 func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	checks = latestLogicalCheckRuns(checks)
 	// GitHub's combined commit-status API returns state:"pending" with
 	// statuses:[] for any commit that has zero legacy commit statuses — the
 	// normal case for repos that report CI exclusively via check-runs.
@@ -1568,6 +1637,7 @@ func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse
 }
 
 func formatChecksOverview(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	checks = latestLogicalCheckRuns(checks)
 	var lines []string
 	for _, check := range checks {
 		state := strings.TrimSpace(check.Conclusion)
@@ -2206,6 +2276,7 @@ func (c *Client) PRCIStatus(prNumber int) (string, error) {
 }
 
 func ciCheckRollupFingerprint(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	checks = latestLogicalCheckRuns(checks)
 	parts := make([]string, 0, len(checks)+len(combined.Statuses)+1)
 	parts = append(parts, "combined="+strings.ToLower(strings.TrimSpace(combined.State)))
 	for _, check := range checks {
