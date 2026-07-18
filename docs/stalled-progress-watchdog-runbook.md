@@ -118,6 +118,24 @@ phase:
   carries no process identity and does not claim a delivery replay boundary.
 - **post-merge/live verification** (`code_landed`): recommends outcome repair,
   not worker/merge replay. It is not an uncertain executing-delivery result.
+
+### Automatic outcome recovery
+
+Projects may opt into `outcome.recovery_mode: automatic` with an idempotent
+`outcome.recovery_command`. The independent material-progress loop checks the
+configured health signal at `recovery_interval_seconds` (default 60 seconds).
+On failure it saves an `executing` lease before launching the command, stores
+only timestamps/exit code/status, and immediately re-runs the authoritative
+healthcheck after a successful command. Command text and output are never
+copied into state or Fleet. `verification_pending` waits through the configured
+cooldown while the 60-second health clock continues; a healthy signal marks the
+receipt `verified`. An execution interrupted without a receipt becomes
+`uncertain` and is never replayed blindly.
+
+The recovery entrypoint must enforce its own external idempotency boundary
+(for example, refuse a workflow dispatch when an equal/newer run is already
+queued or running). This mechanism does not replay an uncertain delivery lease
+and does not change project pause/concurrency settings.
 - **delivery approval pending**: surfaces the control-plane wait; execution has
   not begun, so `replay_boundary=false`.
 - **delivery executing / uncertain**: recovery authority ends **before** the

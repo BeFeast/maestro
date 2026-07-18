@@ -276,6 +276,20 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                   <div className="kv"><span>Dashboard</span><UrlValue url={p.dashboardUrl} /></div>
                 )}
                 <div className="kv"><span>Last check</span><span className="mono">{p.outcome?.health_checked_at ? relTime(parseTimestamp(p.outcome.health_checked_at), now) : "—"}</span></div>
+                {(p.outcome?.checks || []).filter((check) => check.blocking || check.status !== "pass").map((check) => (
+                  <div className="kv" key={check.name}>
+                    <span>{check.name}</span>
+                    <span className="mono" title={check.summary || ""} style={{ color: check.status === "pass" ? "var(--ok)" : "var(--watch)" }}>{check.status}</span>
+                  </div>
+                ))}
+                {p.outcome?.recovery && (
+                  <>
+                    <div className="kv"><span>Recovery</span><strong className="mono">{p.outcome.recovery.status || "unknown"}</strong></div>
+                    {p.outcome.recovery.summary && <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{p.outcome.recovery.summary}</div>}
+                    {p.outcome.recovery.started_at && <div className="kv"><span>Last attempt</span><span className="mono">{relTime(parseTimestamp(p.outcome.recovery.started_at), now)}</span></div>}
+                    {p.outcome.recovery.next_eligible_at && <div className="kv"><span>Retry eligible</span><span className="mono">{relTime(parseTimestamp(p.outcome.recovery.next_eligible_at), now)}</span></div>}
+                  </>
+                )}
                 <div className="kv"><span>Sessions</span><strong className="mono">{p.sessions}</strong></div>
               </>
             ) : (

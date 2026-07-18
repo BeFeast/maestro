@@ -2042,6 +2042,15 @@ func showOutcomeStatus(cfg *config.Config, s *state.State) {
 	if status.HealthSummary != "" {
 		fmt.Printf("Outcome check:  %s\n", status.HealthSummary)
 	}
+	if status.Recovery != nil {
+		fmt.Printf("Recovery:       %s\n", valueOrDash(status.Recovery.Status))
+		if status.Recovery.Summary != "" {
+			fmt.Printf("Recovery state: %s\n", status.Recovery.Summary)
+		}
+		if !status.Recovery.NextEligibleAt.IsZero() {
+			fmt.Printf("Recovery next:  %s\n", status.Recovery.NextEligibleAt.UTC().Format(time.RFC3339))
+		}
+	}
 	if status.NextAction != "" {
 		fmt.Printf("Outcome next:   %s\n", status.NextAction)
 	}
@@ -2051,10 +2060,13 @@ func outcomeStatusForState(cfg *config.Config, s *state.State) outcome.Status {
 	if cfg == nil || s == nil {
 		return outcome.StatusFor(outcome.Brief{}, 0, time.Time{})
 	}
+	var status outcome.Status
 	if s.OutcomeHealth != nil {
-		return outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt, *s.OutcomeHealth)
+		status = outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt, *s.OutcomeHealth)
+	} else {
+		status = outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt)
 	}
-	return outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt)
+	return outcome.AttachRecovery(status, s.OutcomeRecovery)
 }
 
 func valueOrDash(value string) string {

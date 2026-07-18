@@ -42,6 +42,14 @@ auto_retry_rebase_conflicts: false # retry PRs whose auto-rebase fails with conf
 #   requires_deploy: true
 #   pass_required_for_done: true
 #   fail_requires_visible_work: true
+#   # Optional bounded hands-off recovery (#1002). Disabled by default. The
+#   # command must be idempotent; Maestro persists an execution lease before
+#   # launch and never stores command text or output in runtime state.
+#   recovery_mode: automatic              # disabled | automatic
+#   recovery_command: ./scripts/recover-live-outcome.sh
+#   recovery_interval_seconds: 60
+#   recovery_cooldown_minutes: 20
+#   recovery_timeout_seconds: 120
 #   non_goals:
 #     - Mutate production deploys without explicit approval controls
 #     - Generate broad issue waves automatically

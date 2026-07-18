@@ -1,6 +1,7 @@
 package outcome
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -11,6 +12,21 @@ const (
 	HealthUnknown       = "unknown"
 	HealthHealthy       = "healthy"
 	HealthFailing       = "failing"
+
+	RecoveryModeDisabled  = "disabled"
+	RecoveryModeAutomatic = "automatic"
+
+	RecoveryStatusExecuting           = "executing"
+	RecoveryStatusVerificationPending = "verification_pending"
+	RecoveryStatusVerified            = "verified"
+	RecoveryStatusFailed              = "failed"
+	RecoveryStatusUncertain           = "uncertain"
+)
+
+const (
+	defaultRecoveryInterval = time.Minute
+	defaultRecoveryCooldown = 20 * time.Minute
+	defaultRecoveryTimeout  = 2 * time.Minute
 )
 
 // Brief is the project operating brief Maestro uses to judge progress by the
@@ -31,47 +47,86 @@ type Brief struct {
 	PassRequiredForDone     *bool    `yaml:"pass_required_for_done" json:"-"`
 	FailRequiresVisibleWork *bool    `yaml:"fail_requires_visible_work" json:"-"`
 	NonGoals                []string `yaml:"non_goals" json:"non_goals,omitempty"`
+	// RecoveryCommand is omitted from API JSON: Fleet exposes only its bounded
+	// execution receipt, never command text or output.
+	RecoveryCommand         string `yaml:"recovery_command" json:"-"`
+	RecoveryMode            string `yaml:"recovery_mode" json:"recovery_mode,omitempty"`
+	RecoveryIntervalSeconds int    `yaml:"recovery_interval_seconds" json:"recovery_interval_seconds,omitempty"`
+	RecoveryCooldownMinutes int    `yaml:"recovery_cooldown_minutes" json:"recovery_cooldown_minutes,omitempty"`
+	RecoveryTimeoutSeconds  int    `yaml:"recovery_timeout_seconds" json:"recovery_timeout_seconds,omitempty"`
 }
 
 // Status is the concise outcome state exposed by CLI/API/dashboard surfaces.
 type Status struct {
-	Configured              bool     `json:"configured"`
-	Goal                    string   `json:"goal,omitempty"`
-	DesiredOutcome          string   `json:"desired_outcome,omitempty"`
-	RuntimeTarget           string   `json:"runtime_target,omitempty"`
-	RuntimeURL              string   `json:"runtime_url,omitempty"`
-	RuntimeHost             string   `json:"runtime_host,omitempty"`
-	HealthState             string   `json:"health_state"`
-	HealthCheckedAt         string   `json:"health_checked_at,omitempty"`
-	HealthSignal            string   `json:"health_signal,omitempty"`
-	HealthSummary           string   `json:"health_summary,omitempty"`
-	HealthDetail            string   `json:"health_detail,omitempty"`
-	NextAction              string   `json:"next_action,omitempty"`
-	SourceRepoPath          string   `json:"source_repo_path,omitempty"`
-	DeploymentStatusCommand string   `json:"deployment_status_command,omitempty"`
-	DeployStatusCommand     string   `json:"deploy_status_command,omitempty"`
-	HealthcheckCommand      string   `json:"healthcheck_command,omitempty"`
-	VerifierCommand         string   `json:"verifier_command,omitempty"`
-	HealthcheckURL          string   `json:"healthcheck_url,omitempty"`
-	RequiredRoutes          []string `json:"required_routes,omitempty"`
-	RequiresDeploy          bool     `json:"requires_deploy,omitempty"`
-	NonGoals                []string `json:"non_goals,omitempty"`
-	PassRequiredForDone     bool     `json:"pass_required_for_done,omitempty"`
-	FailRequiresVisibleWork bool     `json:"fail_requires_visible_work,omitempty"`
-	MergedPRs               int      `json:"merged_prs,omitempty"`
-	LastMergeAt             string   `json:"last_merge_at,omitempty"`
+	Configured              bool              `json:"configured"`
+	Goal                    string            `json:"goal,omitempty"`
+	DesiredOutcome          string            `json:"desired_outcome,omitempty"`
+	RuntimeTarget           string            `json:"runtime_target,omitempty"`
+	RuntimeURL              string            `json:"runtime_url,omitempty"`
+	RuntimeHost             string            `json:"runtime_host,omitempty"`
+	HealthState             string            `json:"health_state"`
+	HealthCheckedAt         string            `json:"health_checked_at,omitempty"`
+	HealthSignal            string            `json:"health_signal,omitempty"`
+	HealthSummary           string            `json:"health_summary,omitempty"`
+	HealthDetail            string            `json:"health_detail,omitempty"`
+	NextAction              string            `json:"next_action,omitempty"`
+	SourceRepoPath          string            `json:"source_repo_path,omitempty"`
+	DeploymentStatusCommand string            `json:"deployment_status_command,omitempty"`
+	DeployStatusCommand     string            `json:"deploy_status_command,omitempty"`
+	HealthcheckCommand      string            `json:"healthcheck_command,omitempty"`
+	VerifierCommand         string            `json:"verifier_command,omitempty"`
+	HealthcheckURL          string            `json:"healthcheck_url,omitempty"`
+	RequiredRoutes          []string          `json:"required_routes,omitempty"`
+	RequiresDeploy          bool              `json:"requires_deploy,omitempty"`
+	NonGoals                []string          `json:"non_goals,omitempty"`
+	PassRequiredForDone     bool              `json:"pass_required_for_done,omitempty"`
+	FailRequiresVisibleWork bool              `json:"fail_requires_visible_work,omitempty"`
+	MergedPRs               int               `json:"merged_prs,omitempty"`
+	LastMergeAt             string            `json:"last_merge_at,omitempty"`
+	Checks                  []HealthCheckItem `json:"checks,omitempty"`
+	RecoveryConfigured      bool              `json:"recovery_configured,omitempty"`
+	RecoveryMode            string            `json:"recovery_mode,omitempty"`
+	Recovery                *RecoveryState    `json:"recovery,omitempty"`
+}
+
+// HealthCheckItem is the allow-listed, bounded part of structured checker
+// output safe to persist and render. Unknown fields and raw details are
+// intentionally discarded.
+type HealthCheckItem struct {
+	Name     string `json:"name"`
+	Blocking bool   `json:"blocking,omitempty"`
+	Status   string `json:"status"`
+	Summary  string `json:"summary,omitempty"`
 }
 
 // HealthCheckResult is the durable result of a read-only runtime/deploy health
 // check. It is intentionally compact because it is stored in Maestro state.
 type HealthCheckResult struct {
-	CheckedAt      time.Time `json:"checked_at,omitempty"`
-	Signal         string    `json:"signal,omitempty"`
-	State          string    `json:"state"`
-	Summary        string    `json:"summary,omitempty"`
-	Detail         string    `json:"detail,omitempty"`
-	ExitCode       int       `json:"exit_code,omitempty"`
-	DurationMillis int64     `json:"duration_ms,omitempty"`
+	CheckedAt      time.Time         `json:"checked_at,omitempty"`
+	Signal         string            `json:"signal,omitempty"`
+	State          string            `json:"state"`
+	Summary        string            `json:"summary,omitempty"`
+	Detail         string            `json:"detail,omitempty"`
+	ExitCode       int               `json:"exit_code,omitempty"`
+	DurationMillis int64             `json:"duration_ms,omitempty"`
+	Checks         []HealthCheckItem `json:"checks,omitempty"`
+}
+
+// RecoveryState is the durable, command-text-free execution lease and receipt
+// for automatic outcome recovery. Executing is persisted before launch so a
+// service restart or overlapping loop never replays an uncertain command.
+type RecoveryState struct {
+	AttemptID        string    `json:"attempt_id,omitempty"`
+	Status           string    `json:"status,omitempty"`
+	Attempts         int       `json:"attempts,omitempty"`
+	TriggerCheckedAt time.Time `json:"trigger_checked_at,omitempty"`
+	StartedAt        time.Time `json:"started_at,omitempty"`
+	FinishedAt       time.Time `json:"finished_at,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+	NextEligibleAt   time.Time `json:"next_eligible_at,omitempty"`
+	VerifiedAt       time.Time `json:"verified_at,omitempty"`
+	ExitCode         *int      `json:"exit_code,omitempty"`
+	Summary          string    `json:"summary,omitempty"`
 }
 
 func (b Brief) Normalized() Brief {
@@ -102,7 +157,59 @@ func (b Brief) Normalized() Brief {
 	b.RuntimeHost = strings.TrimSpace(b.RuntimeHost)
 	b.RequiredRoutes = compactStrings(b.RequiredRoutes)
 	b.NonGoals = compactStrings(b.NonGoals)
+	b.RecoveryCommand = strings.TrimSpace(b.RecoveryCommand)
+	b.RecoveryMode = strings.ToLower(strings.TrimSpace(b.RecoveryMode))
+	if b.RecoveryMode == "" {
+		b.RecoveryMode = RecoveryModeDisabled
+	}
 	return b
+}
+
+func (b Brief) Validate() error {
+	b = b.Normalized()
+	if b.RecoveryIntervalSeconds < 0 || b.RecoveryCooldownMinutes < 0 || b.RecoveryTimeoutSeconds < 0 {
+		return fmt.Errorf("outcome recovery interval, cooldown, and timeout must be >= 0")
+	}
+	switch b.RecoveryMode {
+	case RecoveryModeDisabled:
+		return nil
+	case RecoveryModeAutomatic:
+		if !b.HasHealthSignal() {
+			return fmt.Errorf("outcome.recovery_mode automatic requires a health signal")
+		}
+		if b.RecoveryCommand == "" {
+			return fmt.Errorf("outcome.recovery_mode automatic requires outcome.recovery_command")
+		}
+		return nil
+	default:
+		return fmt.Errorf("outcome.recovery_mode %q is invalid; use disabled or automatic", b.RecoveryMode)
+	}
+}
+
+func (b Brief) AutomaticRecoveryEnabled() bool {
+	b = b.Normalized()
+	return b.RecoveryMode == RecoveryModeAutomatic && b.RecoveryCommand != "" && b.HasHealthSignal()
+}
+
+func (b Brief) EffectiveRecoveryInterval() time.Duration {
+	if b.RecoveryIntervalSeconds > 0 {
+		return time.Duration(b.RecoveryIntervalSeconds) * time.Second
+	}
+	return defaultRecoveryInterval
+}
+
+func (b Brief) EffectiveRecoveryCooldown() time.Duration {
+	if b.RecoveryCooldownMinutes > 0 {
+		return time.Duration(b.RecoveryCooldownMinutes) * time.Minute
+	}
+	return defaultRecoveryCooldown
+}
+
+func (b Brief) EffectiveRecoveryTimeout() time.Duration {
+	if b.RecoveryTimeoutSeconds > 0 {
+		return time.Duration(b.RecoveryTimeoutSeconds) * time.Second
+	}
+	return defaultRecoveryTimeout
 }
 
 func (b Brief) Configured() bool {
@@ -165,6 +272,8 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...Heal
 		NonGoals:                append([]string(nil), brief.NonGoals...),
 		PassRequiredForDone:     brief.PassRequiredForDoneEnabled(),
 		FailRequiresVisibleWork: brief.FailRequiresVisibleWorkEnabled(),
+		RecoveryConfigured:      brief.AutomaticRecoveryEnabled(),
+		RecoveryMode:            brief.RecoveryMode,
 		MergedPRs:               mergedPRs,
 	}
 	if !lastMergeAt.IsZero() {
@@ -177,6 +286,7 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...Heal
 		status.HealthSignal = check.Signal
 		status.HealthSummary = check.Summary
 		status.HealthDetail = check.Detail
+		status.Checks = append([]HealthCheckItem(nil), check.Checks...)
 		if lastMergeAt.IsZero() || !check.CheckedAt.Before(lastMergeAt) {
 			status.HealthState = normalizedHealthState(check.State)
 			switch status.HealthState {
@@ -201,6 +311,21 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...Heal
 	if mergedPRs > 0 && (status.HealthState == HealthUnknown || status.HealthState == HealthUnmonitored) {
 		status.NextAction = "Verify the configured runtime outcome before dispatching more issue throughput."
 	}
+	return status
+}
+
+// AttachRecovery adds the persisted receipt to a status without exposing the
+// configured command.
+func AttachRecovery(status Status, recovery *RecoveryState) Status {
+	if recovery == nil {
+		return status
+	}
+	copy := *recovery
+	if recovery.ExitCode != nil {
+		code := *recovery.ExitCode
+		copy.ExitCode = &code
+	}
+	status.Recovery = &copy
 	return status
 }
 

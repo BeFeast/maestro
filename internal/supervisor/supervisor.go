@@ -1505,10 +1505,16 @@ func (e *Engine) outcomeStatus(st *state.State) outcome.Status {
 		mergedPRs = st.DonePRCount()
 		lastMergeAt = st.LastMergeAt
 	}
+	var status outcome.Status
 	if st != nil && st.OutcomeHealth != nil {
-		return outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt, *st.OutcomeHealth)
+		status = outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt, *st.OutcomeHealth)
+	} else {
+		status = outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt)
 	}
-	return outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt)
+	if st != nil {
+		status = outcome.AttachRecovery(status, st.OutcomeRecovery)
+	}
+	return status
 }
 
 func outcomeDecisionReason(status outcome.Status) string {

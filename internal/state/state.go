@@ -1248,6 +1248,7 @@ type State struct {
 	Approvals           []Approval                          `json:"approvals,omitempty"`
 	LessonProposals     []LessonProposal                    `json:"lesson_proposals,omitempty"`
 	OutcomeHealth       *outcome.HealthCheckResult          `json:"outcome_health,omitempty"`
+	OutcomeRecovery     *outcome.RecoveryState              `json:"outcome_recovery,omitempty"`
 	BackendHealth       map[string]BackendHealth            `json:"backend_health,omitempty"`
 	ProviderModelHealth map[string]map[string]BackendHealth `json:"provider_model_health,omitempty"`
 	BackendQuotaUsage   map[string]*BackendQuotaUsage       `json:"backend_quota_usage,omitempty"`
@@ -1872,6 +1873,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 		return nil, err
 	}
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
+	merged.OutcomeRecovery = mergeOutcomeRecovery(base.OutcomeRecovery, current.OutcomeRecovery, ours.OutcomeRecovery)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
 	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
@@ -2225,6 +2227,30 @@ func cloneOutcomeHealth(value *outcome.HealthCheckResult) *outcome.HealthCheckRe
 		return nil
 	}
 	clone := *value
+	clone.Checks = append([]outcome.HealthCheckItem(nil), value.Checks...)
+	return &clone
+}
+
+func mergeOutcomeRecovery(base, current, ours *outcome.RecoveryState) *outcome.RecoveryState {
+	latest := current
+	if latest == nil || (ours != nil && ours.UpdatedAt.After(latest.UpdatedAt)) {
+		latest = ours
+	}
+	if latest == nil {
+		latest = base
+	}
+	return cloneOutcomeRecovery(latest)
+}
+
+func cloneOutcomeRecovery(value *outcome.RecoveryState) *outcome.RecoveryState {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	if value.ExitCode != nil {
+		code := *value.ExitCode
+		clone.ExitCode = &code
+	}
 	return &clone
 }
 

@@ -2187,6 +2187,8 @@ function outcomeHTML(project) {
   const next = o.next_action || (configured ? "Verify runtime health." : "Add an outcome brief to config.");
   const checked = o.health_checked_at ? formatTimestamp(o.health_checked_at) : "-";
   const summary = o.health_summary || "";
+  const checks = Array.isArray(o.checks) ? o.checks.filter(function(check) { return check.blocking || check.status !== "pass"; }) : [];
+  const recovery = o.recovery || null;
   return '<div class="outcome-status"><div class="label">Outcome Status</div>' +
     '<div class="outcome-lines">' +
       '<div class="outcome-line"><strong>Goal</strong> ' + escapeText(goal) + '</div>' +
@@ -2194,6 +2196,8 @@ function outcomeHTML(project) {
       '<div class="outcome-line"><strong>Health</strong> ' + escapeText(health.replace(/_/g, " ")) + '</div>' +
       '<div class="outcome-line"><strong>Checked</strong> ' + escapeText(checked) + '</div>' +
       (summary ? '<div class="outcome-line"><strong>Signal</strong> ' + escapeText(summary) + '</div>' : "") +
+      checks.map(function(check) { return '<div class="outcome-line"><strong>' + escapeText(check.name || "check") + '</strong> ' + escapeText(check.status || "unknown") + (check.summary ? ' · ' + escapeText(check.summary) : '') + '</div>'; }).join("") +
+      (recovery ? '<div class="outcome-line"><strong>Recovery</strong> ' + escapeText(recovery.status || "unknown") + (recovery.summary ? ' · ' + escapeText(recovery.summary) : '') + '</div>' : "") +
       '<div class="outcome-line"><strong>Next</strong> ' + escapeText(next) + '</div>' +
     '</div></div>';
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -164,5 +165,34 @@ func TestCheckerCommandFailure(t *testing.T) {
 	})
 	if result.State != HealthFailing || result.ExitCode != 7 || result.Detail != "not healthy" {
 		t.Fatalf("result = %+v, want failing command result", result)
+	}
+}
+
+func TestCheckerProjectsStructuredHealthWithoutRawDetails(t *testing.T) {
+	output := []byte(`{"healthy":false,"checks":[{"name":"candidate","blocking":true,"status":"fail","summary":"stale; api_key=do-not-store","details":["token=also-secret"]}],"unknown":"discard"}`)
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return output, 1, context.DeadlineExceeded
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if len(result.Checks) != 1 || result.Checks[0].Name != "candidate" || result.Checks[0].Status != "fail" {
+		t.Fatalf("projected checks=%+v", result.Checks)
+	}
+	if result.Checks[0].Summary != "stale; api_key=[REDACTED]" {
+		t.Fatalf("summary was not redacted: %q", result.Checks[0].Summary)
+	}
+	if strings.Contains(result.Detail, "also-secret") || strings.Contains(result.Detail, "unknown") || strings.Contains(result.Detail, "do-not-store") {
+		t.Fatalf("raw structured output leaked into detail: %q", result.Detail)
+	}
+}
+
+func TestCheckerHonorsStructuredUnhealthyWhenCommandExitsZero(t *testing.T) {
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return []byte(`{"healthy":false,"checks":[{"name":"candidate","blocking":true,"status":"fail","summary":"stale"}]}`), 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if result.State != HealthFailing || result.ExitCode != 0 || len(result.Checks) != 1 {
+		t.Fatalf("structured unhealthy result=%+v", result)
 	}
 }
