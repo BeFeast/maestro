@@ -1504,6 +1504,16 @@ func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
 	if !contains(restartRetained.DisabledReason, "retains a worktree") || !contains(restartRetained.DisabledReason, "same slot") {
 		t.Fatalf("disabled reason = %q, want preserved-work and same-slot repair guidance", restartRetained.DisabledReason)
 	}
+	repairRetained := findControlAction(t, retained, config.SupervisorActionSpawnRepairWorker)
+	if repairRetained.Disabled {
+		t.Fatalf("in-place repair for a retained PR-less worktree should be enabled, got %+v", repairRetained)
+	}
+	if !repairRetained.RequiresApproval || repairRetained.Target != "slot-2" || repairRetained.IssueNumber != 44 {
+		t.Fatalf("in-place repair action is not scoped to the canonical worker: %+v", repairRetained)
+	}
+	if !contains(repairRetained.Description, "retained worktree") || !contains(repairRetained.Description, "duplicate") {
+		t.Fatalf("repair description = %q, want retained-worktree and duplicate-prevention contract", repairRetained.Description)
+	}
 }
 
 func TestHandleStateProjectBlockedKeepsAttentionForOpenPR(t *testing.T) {
