@@ -26,9 +26,11 @@ func TestUnexpectedWorkerExitSchedulesImmediateCanonicalRetry(t *testing.T) {
 	respawned := 0
 	o := &Orchestrator{
 		cfg: &config.Config{
-			Repo:               "owner/repo",
-			StateDir:           t.TempDir(),
-			MaxRetriesPerIssue: 3,
+			Repo:     "owner/repo",
+			StateDir: t.TempDir(),
+			// One allowed retry must still recover the first unexpected exit; the
+			// current running attempt must not be counted twice.
+			MaxRetriesPerIssue: 1,
 		},
 		repo:                 "owner/repo",
 		notifier:             &notify.Notifier{},

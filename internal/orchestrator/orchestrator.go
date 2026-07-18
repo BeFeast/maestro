@@ -3362,6 +3362,11 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 		oldPID := sess.PID
 		oldTmux := tmuxName
+		// Evaluate retry capacity while this attempt is still Running. Once the
+		// status becomes Dead, FailedAttemptsForIssue includes this session; adding
+		// sess.RetryCount after that would count the same exit twice and suppress
+		// the first recovery when max_retries_per_issue is 1.
+		unexpectedRetryAllowed := strings.TrimSpace(sess.Worktree) != "" && o.canRetryIssue(s, sess)
 		o.updateTokensUsedFromWorkerLog(slotName, sess)
 		sess.Status = state.StatusDead
 		sess.PID = 0
@@ -3380,7 +3385,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.RestartCheckpointAt = &stamp
 				log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
 			}
-		} else if strings.TrimSpace(sess.Worktree) != "" && o.canRetryIssue(s, sess) {
+		} else if unexpectedRetryAllowed {
 			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
 				// Unexpected process loss used to become an unscheduled dead
 				// session. Dead sessions are outside the material-progress watchdog,
