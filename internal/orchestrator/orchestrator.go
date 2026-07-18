@@ -3224,6 +3224,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			sess.PRNumber = pr.Number
 			sess.PID = 0
 			sess.TmuxSession = ""
+			sess.NextRetryAt = nil
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
 			state.MarkWorkerEnded(sess, now)
@@ -5142,6 +5143,15 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 		case "failure":
 			persistGate()
+			// A failed rollup is actionable only for the exact head that was
+			// observed. Attribution stamping, an operator push, or another repair
+			// can advance the branch between listOpenPRsForCycle and this decision.
+			// Success/review paths already re-check this identity before mutating;
+			// failure must do the same or an old red head can schedule a repair
+			// after the new head is already pending (OK Player PR #388).
+			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
+				continue
+			}
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}

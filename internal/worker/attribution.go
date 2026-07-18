@@ -28,6 +28,11 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 	sess.UsageTokensWatermark = 0
 	sess.TokensUsedAttempt = 0
 	sess.WorkerOutcome = ""
+	// A scheduled retry owns NextRetryAt only until a replacement process has
+	// actually started. Keeping the elapsed timestamp on a Running attempt makes
+	// Fleet report contradictory queued/running state and lets a later terminal
+	// transition accidentally inherit an already-due retry.
+	sess.NextRetryAt = nil
 	recordBackendAttribution(cfg, sess, backendName, reason, previousEndReason, now)
 }
 

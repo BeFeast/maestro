@@ -245,6 +245,7 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 // to pr_open so that IssueInProgress returns true and no duplicate worker is spawned.
 func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *testing.T) {
 	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-time.Minute)
 	s.Sessions["mae-5"] = &state.Session{
 		IssueNumber: 105,
 		IssueTitle:  "fix crash",
@@ -252,6 +253,7 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 		PID:         9999,
 		TmuxSession: "maestro-mae-5",
 		Branch:      "feat/mae-5-105-fix-crash",
+		NextRetryAt: &retryAt,
 	}
 
 	openPRs := []github.PR{
@@ -281,6 +283,9 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 	}
 	if sess.TmuxSession != "" {
 		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil after authoritative PR-open reconciliation", sess.NextRetryAt)
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("finished_at should be set")
