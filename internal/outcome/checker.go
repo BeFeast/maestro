@@ -103,6 +103,18 @@ func (c Checker) checkCommand(ctx context.Context, command, dir, signal string) 
 
 	output, exitCode, err := c.runCommand(ctx, command, dir)
 	checks, projectedDetail, projectedSummary, declaredHealthy := projectStructuredHealth(output)
+	if state, summary := blockingStructuredHealthState(checks); state != "" {
+		if summary != "" {
+			summary = fmt.Sprintf("%s: %s", signal, summary)
+		} else if state == HealthPending {
+			summary = fmt.Sprintf("%s pending", signal)
+		} else {
+			summary = fmt.Sprintf("%s reported unhealthy", signal)
+		}
+		result := c.result(start, signal, state, summary, projectedDetail, exitCode)
+		result.Checks = checks
+		return result
+	}
 	if err != nil {
 		summary := fmt.Sprintf("%s failed", signal)
 		if ctx.Err() == context.DeadlineExceeded {
@@ -249,9 +261,33 @@ func projectHealthCheckName(value string) string {
 
 func projectHealthCheckStatus(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "pass", "fail", "warning", "unknown", "error", "healthy", "failing":
+	case "pass", "fail", "warning", "unknown", "error", "healthy", "failing", "pending", "in_progress", "queued":
 		return strings.ToLower(strings.TrimSpace(value))
+	case "in-progress":
+		return "in_progress"
 	default:
 		return "unknown"
 	}
+}
+
+func blockingStructuredHealthState(checks []HealthCheckItem) (state, summary string) {
+	for _, check := range checks {
+		if !check.Blocking {
+			continue
+		}
+		switch check.Status {
+		case "fail", "failing", "error":
+			return HealthFailing, check.Name + " reported " + check.Status
+		}
+	}
+	for _, check := range checks {
+		if !check.Blocking {
+			continue
+		}
+		switch check.Status {
+		case "pending", "in_progress", "queued":
+			return HealthPending, check.Name + " reported " + check.Status
+		}
+	}
+	return "", ""
 }

@@ -11,6 +11,7 @@ const (
 	HealthUnmonitored   = "unmonitored"
 	HealthUnknown       = "unknown"
 	HealthHealthy       = "healthy"
+	HealthPending       = "pending"
 	HealthFailing       = "failing"
 
 	RecoveryModeDisabled  = "disabled"
@@ -294,6 +295,8 @@ func StatusFor(brief Brief, mergedPRs int, lastMergeAt time.Time, checks ...Heal
 			switch status.HealthState {
 			case HealthHealthy:
 				status.NextAction = "Runtime outcome health is passing; continue normal supervisor policy."
+			case HealthPending:
+				status.NextAction = "Required outcome checks are still pending; continue normal supervisor policy while they complete."
 			case HealthFailing:
 				status.NextAction = "Fix runtime/deploy health before dispatching more issue work."
 			default:
@@ -351,6 +354,8 @@ func normalizedHealthState(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case HealthHealthy:
 		return HealthHealthy
+	case HealthPending:
+		return HealthPending
 	case HealthFailing:
 		return HealthFailing
 	case HealthUnknown:
