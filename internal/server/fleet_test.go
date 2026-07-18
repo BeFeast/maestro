@@ -4243,6 +4243,12 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 		t.Fatalf("verdict tone = %q, want attention (failing-CI PR is operator-actionable)", resp.Verdict.Tone)
 	}
 	project := findFleetProject(t, resp.Projects, "maestro")
+	if project.Activity != string(state.ActivityNeedsAttention) {
+		t.Fatalf("project activity = %q, want %q (failed canonical work must not render queue_empty)", project.Activity, state.ActivityNeedsAttention)
+	}
+	if !contains(project.ActivityReason, "Needs attention") {
+		t.Fatalf("project activity reason = %q, want explicit attention blocker", project.ActivityReason)
+	}
 	if project.OperatorState.Kind != "attention" {
 		t.Fatalf("project operator_state.kind = %q, want attention", project.OperatorState.Kind)
 	}

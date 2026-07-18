@@ -4021,24 +4021,6 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.ApprovalSummary[approval.Status]++
 		}
 	}
-	// #814: classify why the project is (not) implementing so operators can tell
-	// an empty queue from a gate-bound-but-eligible pipeline. Signals are read
-	// from the same snapshot: eligible from the supervisor queue analysis,
-	// pending approvals from the approval summary, model limits from backend
-	// health.
-	eligibleIssues := 0
-	if item.QueueSnapshot != nil {
-		eligibleIssues = item.QueueSnapshot.Eligible
-	}
-	activity, activityReason := state.ClassifyActivity(state.ActivityInput{
-		Capacity:         capacity,
-		EligibleIssues:   eligibleIssues,
-		PendingApprovals: item.ApprovalSummary["pending"],
-		BackendsBlocked:  allBackendsBlocked(item.BackendHealth, configuredWorkerBackends(cfg)),
-		Paused:           item.Paused,
-	})
-	item.Activity = string(activity)
-	item.ActivityReason = activityReason
 	staleAudits := reconcileStaleSessions(cfg, st, now)
 	staleSlots := make(map[string]state.StaleSessionAudit, len(staleAudits))
 	for _, audit := range staleAudits {
@@ -4087,6 +4069,28 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.Active = append(item.Active, worker)
 		}
 	}
+	// #814/#996: classify only after canonical attention has been counted and
+	// stale/historical sessions have been suppressed. Otherwise a failed,
+	// retry-exhausted open PR has no live worker or PRGate capacity entry and
+	// falsely falls through to queue_empty while its in-place repair is pending.
+	eligibleIssues := 0
+	if item.QueueSnapshot != nil {
+		eligibleIssues = item.QueueSnapshot.Eligible
+	}
+	actionableAttention := item.NeedsAttention - item.SelfResolving
+	if actionableAttention < 0 {
+		actionableAttention = 0
+	}
+	activity, activityReason := state.ClassifyActivity(state.ActivityInput{
+		Capacity:            capacity,
+		EligibleIssues:      eligibleIssues,
+		PendingApprovals:    item.ApprovalSummary["pending"],
+		ActionableAttention: actionableAttention,
+		BackendsBlocked:     allBackendsBlocked(item.BackendHealth, configuredWorkerBackends(cfg)),
+		Paused:              item.Paused,
+	})
+	item.Activity = string(activity)
+	item.ActivityReason = activityReason
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
 }
