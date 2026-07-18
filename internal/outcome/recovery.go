@@ -47,6 +47,21 @@ func (r RecoveryRunner) runCommand(ctx context.Context, command, dir string) (in
 	if strings.TrimSpace(dir) != "" {
 		cmd.Dir = dir
 	}
+	// A bounded recovery must not leave a helper alive after the shell exits.
+	// Give the shell and every descendant one process group, then make context
+	// cancellation kill that entire group before a later cooldown retry can run.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
 	// Do not attach buffers: output may contain provider credentials or private
 	// quota state. The durable receipt records only exit code and timestamps.
 	err := cmd.Run()
