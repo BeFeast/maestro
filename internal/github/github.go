@@ -1863,6 +1863,17 @@ func (c *Client) getRESTPull(prNumber int) (restPull, error) {
 	return pr, nil
 }
 
+// PRDetails returns the current forge metadata for one PR. Unlike a cached
+// open-PR list, this exact read is suitable for an actuation guard whose safety
+// depends on mutable metadata such as draft/open state.
+func (c *Client) PRDetails(prNumber int) (PR, error) {
+	pr, err := c.getRESTPull(prNumber)
+	if err != nil {
+		return PR{}, err
+	}
+	return pr.pr(), nil
+}
+
 func (c *Client) pullHeadSHA(prNumber int) (string, error) {
 	pr, err := c.getRESTPull(prNumber)
 	if err != nil {

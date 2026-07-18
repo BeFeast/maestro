@@ -161,6 +161,7 @@ type Orchestrator struct {
 	ghCollectPRReviewFeedbackFn  func(prNumber int) (string, error)
 	ghCloseIssueFn               func(number int, comment string) error
 	ghPRHeadSHAFn                func(prNumber int) (string, error)
+	ghPRDetailsFn                func(prNumber int) (github.PR, error)
 	ghPRMergeInfoFn              func(prNumber int) (github.PRMergeInfo, error)
 	ghCommentPRFn                func(prNumber int, body string) error
 	ghPRChangedFilesFn           func(prNumber int) ([]string, error)
@@ -688,6 +689,16 @@ func (o *Orchestrator) prHeadSHA(prNumber int) (string, error) {
 		return "", fmt.Errorf("no github client configured for head SHA")
 	}
 	return o.gh.PRHeadSHA(prNumber)
+}
+
+func (o *Orchestrator) prDetails(prNumber int) (github.PR, error) {
+	if o.ghPRDetailsFn != nil {
+		return o.ghPRDetailsFn(prNumber)
+	}
+	if o.gh == nil {
+		return github.PR{}, fmt.Errorf("no github client configured for PR details")
+	}
+	return o.gh.PRDetails(prNumber)
 }
 
 func (o *Orchestrator) commentPR(prNumber int, body string) error {
@@ -8185,6 +8196,7 @@ func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) s
 		}
 	}
 
+	reviewPending := false
 	if actionableReason == "" {
 		review, reviewErr := o.prReviewGateVerdict(pr)
 		if reviewErr != nil {
@@ -8193,6 +8205,7 @@ func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) s
 		if !review.Pending && !review.Passed {
 			actionableReason = "current PR head has blocking review findings"
 		}
+		reviewPending = review.Pending
 	}
 
 	latestHead, err := o.prHeadSHA(pr)
@@ -8201,6 +8214,24 @@ func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) s
 	}
 	if actionableReason != "" {
 		return spawnRepairGateDecision{actionable: true, reason: actionableReason}
+	}
+	// A green open draft is still explicitly incomplete. Supervisor already
+	// treats draft PRs as repairable, so the executor must not reinterpret green
+	// CI as terminal and strand a deliberate WIP forever. Re-read this mutable
+	// metadata from the exact PR at actuation time (not the cycle's cached list),
+	// and wait rather than spend while a review is still in progress. A green
+	// non-draft PR remains stale repair intent and proceeds through merge gates.
+	if ci == "success" && !reviewPending {
+		details, detailsErr := o.prDetails(pr)
+		if detailsErr != nil {
+			return spawnRepairGateDecision{reason: fmt.Sprintf("current PR draft state is unavailable: %v", detailsErr)}
+		}
+		if !strings.EqualFold(strings.TrimSpace(details.State), "OPEN") {
+			return spawnRepairGateDecision{stale: true, reason: "current PR is no longer open"}
+		}
+		if details.IsDraft {
+			return spawnRepairGateDecision{actionable: true, reason: "current PR remains an explicit draft/WIP continuation"}
+		}
 	}
 
 	switch ci {
