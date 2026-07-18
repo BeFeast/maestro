@@ -3023,7 +3023,16 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 	reconciled := false
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusRunning {
+		isRestartCheckpointedDead := sess.Status == state.StatusDead && sess.RestartCheckpointAt != nil
+		if sess.Status != state.StatusRunning && !isRestartCheckpointedDead {
+			continue
+		}
+		// #967: a worker may die after drain starts but before the daemon's
+		// shutdown checkpoint pass. Its terminal transition carries the restart
+		// marker, but the old draining daemon must not immediately replay it.
+		// The replacement daemon clears the one-shot drain flag on startup and
+		// then consumes the marker below.
+		if isRestartCheckpointedDead && s.DrainActive() {
 			continue
 		}
 		if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
@@ -3126,14 +3135,21 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				}
 				continue
 			} else if issue, fetchErr := o.getIssue(sess.IssueNumber); fetchErr != nil {
-				sess.RestartCheckpointAt = nil
-				log.Printf("[orch] reconcile: %s restart-resume aborted — could not fetch issue #%d: %v; falling through", slotName, sess.IssueNumber, fetchErr)
+				// A transient GitHub read is not proof that the durable recovery is
+				// invalid. Preserve the marker and retry next cycle; consuming it here
+				// would strand the retained worktree as dead with no retry.
+				log.Printf("[orch] reconcile: %s restart-resume deferred — could not fetch issue #%d: %v; marker preserved for next cycle", slotName, sess.IssueNumber, fetchErr)
+				continue
 			} else {
-				sess.RestartCheckpointAt = nil // exactly-once: consume before the destructive respawn
 				o.updateTokensUsedFromWorkerLog(slotName, sess)
 				promptBase := o.selectPrompt(issue)
 				if respawnErr := o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
-					log.Printf("[orch] reconcile: %s restart-resume in-place failed: %v; falling through to terminal handling", slotName, respawnErr)
+					// RespawnInPlace reconciles against the deterministic tmux identity,
+					// so retrying cannot create a parallel worker. Keep the marker: a
+					// transient backend/launcher failure must not erase recovery intent.
+					sess.Status = state.StatusDead
+					log.Printf("[orch] reconcile: %s restart-resume in-place failed: %v; marker preserved for next cycle", slotName, respawnErr)
+					continue
 				} else {
 					reconciled = true
 					log.Printf("[orch] reconcile: %s resumed in place across restart (issue #%d) — same session, dirty worktree preserved, exactly once (%s)",
@@ -3321,6 +3337,18 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
 		state.MarkWorkerEnded(sess, now)
+		// #967: during graceful drain the daemon shutdown pass may run only
+		// after this flow has already persisted running->dead. Stamp the same
+		// resumable identity here while the cause is still known. Dead markers
+		// are held while drain remains active and consumed by the replacement
+		// daemon, preserving this exact slot/worktree without a new dispatch.
+		if s.DrainActive() && strings.TrimSpace(sess.Worktree) != "" {
+			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
+				stamp := now
+				sess.RestartCheckpointAt = &stamp
+				log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
+			}
+		}
 		reconciled = true
 
 		log.Printf("[orch] reconcile: %s running->dead (%s); pid=%d tmux=%q",

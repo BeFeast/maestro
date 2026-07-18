@@ -101,6 +101,67 @@ func TestReconcile_RestartCheckpoint_ResumesInPlaceExactlyOnce(t *testing.T) {
 	}
 }
 
+// #967: a worker can exit after drain begins but before the daemon shutdown
+// checkpoint pass. The flow that observes the exit must persist a marker on
+// the dead session, hold it while the old daemon is draining, and let only the
+// replacement daemon resume the same slot/worktree.
+func TestReconcile_DrainDeathResumesDeadCheckpointAfterRestart(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+
+	worktree := t.TempDir()
+	s := state.NewState()
+	s.SetSpawnDrain(time.Now().UTC().Add(-time.Minute))
+	s.Sessions["sup-313"] = &state.Session{
+		IssueNumber: 313,
+		IssueTitle:  "dies during drain",
+		Status:      state.StatusRunning,
+		PID:         4245,
+		TmuxSession: "maestro-sup-313",
+		Branch:      "feat/sup-313-313-drain",
+		Worktree:    worktree,
+		Backend:     "claude",
+	}
+
+	// Old daemon observes the worker exit while drain is active. It records a
+	// durable dead checkpoint but must not respawn during this process.
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected drain-time death to change session state")
+	}
+	sess := s.Sessions["sup-313"]
+	if sess.Status != state.StatusDead || sess.RestartCheckpointAt == nil {
+		t.Fatalf("drain-time state = status %q marker %v, want dead with restart marker", sess.Status, sess.RestartCheckpointAt)
+	}
+	if resumeCount != 0 {
+		t.Fatalf("old draining daemon resumed %d workers, want 0", resumeCount)
+	}
+	o.reconcileRunningSessions(s)
+	if resumeCount != 0 {
+		t.Fatalf("old draining daemon replayed dead checkpoint %d times, want 0", resumeCount)
+	}
+
+	// New daemon clears the one-shot drain flag before its first cycle and
+	// consumes the dead marker exactly once on the same logical session.
+	s.ClearSpawnDrain(time.Now().UTC())
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("replacement daemon did not resume dead checkpoint")
+	}
+	if resumeCount != 1 {
+		t.Fatalf("replacement daemon resume count = %d, want 1", resumeCount)
+	}
+	if sess.Status != state.StatusRunning || sess.RestartCheckpointAt != nil {
+		t.Fatalf("resumed state = status %q marker %v, want running with consumed marker", sess.Status, sess.RestartCheckpointAt)
+	}
+	if sess.IssueNumber != 313 || sess.Branch != "feat/sup-313-313-drain" || sess.Worktree != worktree {
+		t.Fatalf("session identity changed: issue=%d branch=%q worktree=%q", sess.IssueNumber, sess.Branch, sess.Worktree)
+	}
+
+	o.reconcileRunningSessions(s)
+	if resumeCount != 1 {
+		t.Fatalf("dead checkpoint resumed %d times, want exactly once", resumeCount)
+	}
+}
+
 // TestReconcile_RestartCheckpoint_SurvivesRestartBoundary is the end-to-end
 // reproduction the #877 review asked for: an in-flight worker checkpointed at
 // shutdown, persisted to the state file, and read back by the NEXT daemon
