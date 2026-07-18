@@ -33,8 +33,8 @@ func applyTierOverride(cfg *config.Config, backendName string, decision router.B
 	for k, v := range cfg.Model.Backends {
 		backends[k] = v
 	}
-	// Set BOTH the #513 attribution Model/Effort (so the dashboard + the durable
-	// Maestro-Backend: trailer reflect the model the tier actually ran, and the
+	// Set BOTH the #513 attribution Model/Effort (so the dashboard and durable
+	// internal session timeline reflect the model the tier actually ran, and the
 	// pi backend, which reads cfg.Model directly, still receives the override) AND
 	// the distinct TierModel/TierEffort carriers that thread into the worker argv
 	// for claude/codex/gemini. The distinct carriers are what keep a non-policy

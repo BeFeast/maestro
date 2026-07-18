@@ -487,8 +487,7 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	}
 
 	var gotTitle, gotBody, gotBase, gotHead string
-	var amendedWorktree, amendedBranch string
-	var amendedAttribution []state.BackendAttribution
+	var amended bool
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return false },
@@ -501,9 +500,7 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 			return 144, nil
 		},
 		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
-			amendedWorktree = worktreePath
-			amendedBranch = branch
-			amendedAttribution = append([]state.BackendAttribution(nil), attribution...)
+			amended = true
 			return nil
 		},
 	}
@@ -555,20 +552,17 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, gotBody)
 		}
 	}
-	if amendedWorktree != "/tmp/mae-8" || amendedBranch != "feat/mae-8-108-add-branch-rescue" {
-		t.Fatalf("amend target = %q/%q", amendedWorktree, amendedBranch)
-	}
-	if len(amendedAttribution) != 2 {
-		t.Fatalf("amended attribution len = %d, want 2", len(amendedAttribution))
+	if amended {
+		t.Fatal("auto-created PR reconciliation must not rewrite the product branch for attribution")
 	}
 	if !s.IssueInProgress(108) {
 		t.Fatal("IssueInProgress(108) must remain true after auto-created PR")
 	}
 }
 
-// The Maestro-Backend attribution trailer stays on commits only; PR bodies on
-// the (possibly public) target repo must not be rewritten to carry it (#799).
-func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *testing.T) {
+// Backend attribution is internal control-plane state. Reconciliation must
+// adopt the existing PR without changing its public commit or PR body (#1000).
+func TestReconcileRunningSessions_OpenPR_DoesNotAmendProductCommit(t *testing.T) {
 	s := state.NewState()
 	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	s.Sessions["mae-9"] = &state.Session{
@@ -616,8 +610,8 @@ func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *t
 	if sess.PRNumber != 145 {
 		t.Fatalf("pr_number = %d, want 145", sess.PRNumber)
 	}
-	if !amended {
-		t.Fatal("expected branch head amend hook")
+	if amended {
+		t.Fatal("existing PR reconciliation must not rewrite the product branch for attribution")
 	}
 }
 

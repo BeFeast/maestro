@@ -3217,7 +3217,6 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// IssueInProgress to return false and startNewWorkers to spawn a duplicate.
 		if pr, found := branchToPR[sess.Branch]; found {
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
-			o.ensureAttributionTrailerOnBranch(slotName, sess)
 			log.Printf("[orch] reconcile: %s running->pr_open (PR #%d already open for branch %q; %s)",
 				slotName, pr.Number, sess.Branch, strings.Join(reasons, ", "))
 			sess.Status = state.StatusPROpen
@@ -3799,7 +3798,6 @@ func (o *Orchestrator) reconcilePushedBranch(s *state.State, slotName string, se
 	}
 
 	title := autoCreatedPRTitle(sess)
-	o.ensureAttributionTrailerOnBranch(slotName, sess)
 	body := autoCreatedPRBody(sess, branch)
 	prNumber, err := o.createPR(title, body, "main", branch)
 	if err != nil {
@@ -3852,7 +3850,12 @@ Maestro auto-created this pull request for pushed branch %s because no open pull
 `, sess.IssueNumber, branch)
 }
 
-// ensureAttributionTrailerOnBranch stamps the durable Maestro-Backend trailer
+// ensureAttributionTrailerOnBranch is retained only as a compatibility helper
+// for historical trailer tests. Production lifecycle paths no longer call it:
+// backend attribution is internal control-plane state and must never mutate a
+// target repository's commits (#1000).
+//
+// Historically this stamped the durable Maestro-Backend trailer
 // onto the branch head. It returns deferred=true when the amend could not land
 // the trailer this cycle — the branch is advancing under a concurrent push, it
 // diverged from the attributed head, the worktree is mid-write, or the remote
@@ -4306,7 +4309,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if sess.Status == state.StatusDead && sess.NextRetryAt != nil {
 						continue
 					}
-					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] session %s %s->pr_open (PR #%d now open for branch %q)", slotName, sess.Status, pr.Number, sess.Branch)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -4470,7 +4472,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
-					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -4994,38 +4995,6 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if sess.PRNumber == 0 {
 			sess.PRNumber = pr.Number
 		}
-		if o.ensureAttributionTrailerOnBranch(slotName, sess) {
-			// The attribution amend deferred because the branch is still moving
-			// under a concurrent worker/operator push. Do NOT let this PR reach
-			// the merge decision this cycle: merging now would land it without
-			// the durable Maestro-Backend trailer, and the deferral's "retry next
-			// cycle" would then have nothing left to amend. Skip it; a later quiet
-			// cycle stamps the trailer and this PR becomes merge-eligible (#858).
-			// Attribution is a merge precondition, not an observability precondition.
-			// Keep recording the authoritative current head/check rollup while the
-			// safe amend is deferred; otherwise the watchdog retains an old head and
-			// reports a false stale gate while a rerun is visibly in progress.
-			_, ciStatus, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
-			if err != nil {
-				log.Printf("[orch] CI status for PR #%d while attribution is deferred: %v", pr.Number, err)
-			} else if gateObservable {
-				// Complete the read-only gate observation when CI is green. This
-				// remains merge-inert: attribution still blocks every ready/merge
-				// path, but a successful review must not remain durable "unknown".
-				if ciStatus == "success" {
-					if o.reviewGate() == "none" {
-						addPRGateReviewDisabled(&gateTransition)
-					} else if verdict, reviewErr := o.prReviewGateVerdict(pr.Number); reviewErr != nil {
-						log.Printf("[orch] review gate check PR #%d while attribution is deferred: %v", pr.Number, reviewErr)
-					} else if o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
-						addPRGateReviewVerdict(&gateTransition, verdict)
-					}
-				}
-				o.persistPRGateTransition(s, gateTransition, observedAt)
-			}
-			continue
-		}
-
 		// #705: opt-in visual evidence for UI-affecting PRs. One-shot,
 		// advisory — posts a warning comment when evidence is missing but
 		// never blocks or delays the merge flow below.
