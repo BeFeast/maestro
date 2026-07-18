@@ -6090,19 +6090,19 @@ func (o *Orchestrator) mergedPRForDoneLikeSession(sess *state.Session) (int, err
 			return sess.PRNumber, nil
 		}
 	}
+	if sess.LastClosedPRNumber > 0 && sess.LastClosedPRNumber != sess.PRNumber {
+		merged, err := o.isPRMerged(sess.LastClosedPRNumber)
+		if err != nil {
+			return 0, fmt.Errorf("check recorded closed PR #%d: %w", sess.LastClosedPRNumber, err)
+		}
+		if merged {
+			return sess.LastClosedPRNumber, nil
+		}
+	}
 	if branch := strings.TrimSpace(sess.Branch); branch != "" {
 		prNumber, err := o.mergedPRForBranch(branch)
 		if err != nil {
 			return 0, fmt.Errorf("check merged PR for branch %q: %w", branch, err)
-		}
-		if prNumber > 0 {
-			return prNumber, nil
-		}
-	}
-	if sess.IssueNumber > 0 {
-		prNumber, err := o.mergedPRForIssue(sess.IssueNumber)
-		if err != nil {
-			return 0, fmt.Errorf("check merged PR for issue #%d: %w", sess.IssueNumber, err)
 		}
 		if prNumber > 0 {
 			return prNumber, nil
@@ -6164,7 +6164,7 @@ func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session
 	// hold a resumable-worktree claim indefinitely. The project outcome remains
 	// independently visible and actionable, but this no-delivery session may
 	// become terminal. Conversely, a merged revision discovered only through the
-	// branch/issue link must still enter code_landed and remain held here.
+	// recorded PR/branch link must still enter code_landed and remain held here.
 	if sess != nil {
 		prNumber, err := o.mergedPRForDoneLikeSession(sess)
 		if err != nil {

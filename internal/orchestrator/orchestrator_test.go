@@ -5871,7 +5871,10 @@ func TestCheckSessions_ClosedNoDeliveryIssueBecomesDoneWhenProjectOutcomeFails(t
 			return 0, nil
 		},
 		mergedPRForIssueFn: func(issueNumber int) (int, error) {
-			return 0, nil
+			// A prior lifecycle of this issue shipped PR #77 before the issue was
+			// reopened. That historical issue-level link must not be attributed to
+			// this later no-delivery session.
+			return 77, nil
 		},
 		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
 			t.Fatalf("terminal reconciliation must preserve the retained worktree; workerStopFn must not run")
@@ -5927,12 +5930,7 @@ func TestCheckSessions_ClosedMergedIssueRemainsCodeLandedWhenProjectOutcomeFails
 		notifier:        &notify.Notifier{},
 		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
 		isIssueClosedFn: func(issueNumber int) (bool, error) { return true, nil },
-		mergedPRForIssueFn: func(issueNumber int) (int, error) {
-			if issueNumber != 100 {
-				t.Fatalf("merged PR lookup issue = %d, want 100", issueNumber)
-			}
-			return 77, nil
-		},
+		isPRMergedFn:    func(prNumber int) (bool, error) { return prNumber == 77, nil },
 	}
 
 	s := state.NewState()
@@ -5943,10 +5941,11 @@ func TestCheckSessions_ClosedMergedIssueRemainsCodeLandedWhenProjectOutcomeFails
 		Summary:   "live verifier failed",
 	}
 	s.Sessions["pan-10"] = &state.Session{
-		IssueNumber: 100,
-		IssueTitle:  "merged worker",
-		Status:      state.StatusFailed,
-		FinishedAt:  &now,
+		IssueNumber:        100,
+		IssueTitle:         "merged worker",
+		Status:             state.StatusFailed,
+		LastClosedPRNumber: 77,
+		FinishedAt:         &now,
 	}
 
 	o.checkSessions(s)
