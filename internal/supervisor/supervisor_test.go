@@ -136,6 +136,15 @@ func (f *fakeReader) PRCIStatus(prNumber int) (string, error) {
 	return f.ciStatuses[prNumber], nil
 }
 
+func (f *fakeReader) PRMergeable(prNumber int) (string, error) {
+	for _, pr := range f.prs {
+		if pr.Number == prNumber {
+			return pr.Mergeable, nil
+		}
+	}
+	return "", nil
+}
+
 func (f *fakeReader) PRMergeStatus(prNumber int) (string, string, error) {
 	mergeable := ""
 	for _, pr := range f.prs {
@@ -725,6 +734,94 @@ func TestDecide_OpenPR_CIPending_StaysMonitor(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(decision.Summary), "ci status=pending") {
 		t.Fatalf("summary = %q, want a substring naming CI status pending", decision.Summary)
+	}
+}
+
+func TestDecide_DraftPRCurrentHeadCIPending_StaysMonitor(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 406, Title: "Flatpak repair"}},
+		prs:        []github.PR{{Number: 388, HeadRefName: "feat/flatpak", Mergeable: "MERGEABLE", IsDraft: true}},
+		ciStatuses: map[int]string{388: "pending"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		Status:      state.StatusRetryExhausted,
+		Branch:      "feat/flatpak",
+		PRNumber:    388,
+		RetryCount:  3,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr while exact-head CI is pending", decision.RecommendedAction)
+	}
+	if decision.Target == nil || decision.Target.PR != 388 || decision.Target.Session != "ok-player-302" {
+		t.Fatalf("target = %#v, want canonical PR #388 / ok-player-302", decision.Target)
+	}
+}
+
+func TestDecide_DraftPRCurrentHeadCIFailed_RecommendsRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 407, Title: "Flatpak red"}},
+		prs:        []github.PR{{Number: 389, HeadRefName: "feat/flatpak-red", Mergeable: "MERGEABLE", IsDraft: true}},
+		ciStatuses: map[int]string{389: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-303"] = &state.Session{
+		IssueNumber: 407,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/flatpak-red",
+		PRNumber:    389,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want spawn_repair_worker for a failed draft head", decision.RecommendedAction)
+	}
+}
+
+func TestDecide_ConflictingDraftPRWithCIPending_RecommendsConflictRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 408, Title: "Conflict"}},
+		prs:        []github.PR{{Number: 390, HeadRefName: "feat/conflict", Mergeable: "CONFLICTING", IsDraft: true}},
+		ciStatuses: map[int]string{390: "pending"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-304"] = &state.Session{
+		IssueNumber: 408,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/conflict",
+		PRNumber:    390,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want conflict repair to outrank pending CI", decision.RecommendedAction)
 	}
 }
 

@@ -2784,6 +2784,18 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			return true
 		}
 	}
+	// A draft/WIP marker means the PR still needs lifecycle work, but it does
+	// not make that work actionable while the exact current head is already
+	// being tested. Recommending a repair here disagrees with the executor's
+	// current-head guard, burns one supervisor call every cycle, and presents a
+	// false action in Fleet. Conflicts remain actionable above; failed CI and an
+	// unavailable/unknown CI read retain the existing fail-closed repair path.
+	if ciReader, ok := e.reader.(prCIStatusReader); ok {
+		if ciStatus, err := ciReader.PRCIStatus(pr.Number); err == nil &&
+			strings.EqualFold(strings.TrimSpace(ciStatus), "pending") {
+			return false
+		}
+	}
 	if pr.IsDraft {
 		return true
 	}
