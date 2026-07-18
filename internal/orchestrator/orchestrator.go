@@ -2152,6 +2152,18 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 				slotName, sess.IssueNumber, sess.IssueTitle)
 			continue
 		}
+		// A saved retry is not authority to bypass the issue's current dispatch
+		// guards. The issue may have gained `blocked` (or another configured
+		// exclude label) while the worker ran or while the retry waited. Preserve
+		// the canonical session/worktree and re-check next cycle; never consume
+		// the retry into a forbidden or duplicate worker.
+		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
+			retryAt := time.Now().UTC().Add(time.Minute)
+			sess.NextRetryAt = &retryAt
+			log.Printf("[orch] worker %s retry deferred until %s: issue #%d has a current excluded label",
+				slotName, retryAt.Format(time.RFC3339), sess.IssueNumber)
+			continue
+		}
 
 		promptBase := o.selectPrompt(issue)
 
@@ -3367,6 +3379,20 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				stamp := now
 				sess.RestartCheckpointAt = &stamp
 				log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
+			}
+		} else if strings.TrimSpace(sess.Worktree) != "" && o.canRetryIssue(s, sess) {
+			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
+				// Unexpected process loss used to become an unscheduled dead
+				// session. Dead sessions are outside the material-progress watchdog,
+				// so recovery waited for a later supervisor cycle and could exceed
+				// the 10-minute SLA. Reserve an immediate bounded retry here;
+				// respawnDueRetries runs in this same orchestrator cycle and reuses
+				// the exact slot/branch/worktree after re-checking GitHub guards.
+				retryAt := now
+				sess.RetryCount++
+				sess.RetryReason = state.RetryReasonStalledProgress
+				sess.NextRetryAt = &retryAt
+				log.Printf("[orch] reconcile: %s scheduled immediate canonical in-place retry %d after unexpected worker exit", slotName, sess.RetryCount)
 			}
 		}
 		reconciled = true
