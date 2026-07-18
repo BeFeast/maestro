@@ -234,7 +234,7 @@ func TestAutoMergePRs_HeadChangeWhileCollectingFailureContextDoesNotScheduleStal
 	}
 }
 
-func TestAutoMergePRs_AttributionDeferralStillObservesCurrentPRGate(t *testing.T) {
+func TestAutoMergePRs_PendingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 	pr := github.PR{Number: 13, HeadRefName: "feat/deferred-attribution"}
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
 	o, merged := newMergeTestOrchestrator(cfg, []github.PR{pr})
@@ -244,7 +244,9 @@ func TestAutoMergePRs_AttributionDeferralStillObservesCurrentPRGate(t *testing.T
 			HeadSHA: currentHead, Verdict: "pending", Fingerprint: strings.Repeat("7", 16), Complete: true,
 		}, nil
 	}
+	amended := false
 	o.amendHeadFn = func(string, string, []state.BackendAttribution, time.Time) error {
+		amended = true
 		return errAmendDiverged
 	}
 	st := makeTestState([]github.PR{pr})
@@ -258,11 +260,14 @@ func TestAutoMergePRs_AttributionDeferralStillObservesCurrentPRGate(t *testing.T
 		t.Fatalf("deferred-attribution snapshot = %+v", snapshot)
 	}
 	if len(*merged) != 0 {
-		t.Fatalf("attribution-deferred PR unexpectedly merged: %v", *merged)
+		t.Fatalf("pending PR unexpectedly merged: %v", *merged)
+	}
+	if amended {
+		t.Fatal("PR gate observation must not rewrite the product branch for attribution")
 	}
 }
 
-func TestAutoMergePRs_AttributionDeferralStillObservesPassingReview(t *testing.T) {
+func TestAutoMergePRs_PassingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 	pr := github.PR{Number: 14, HeadRefName: "feat/deferred-review"}
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "greptile", ReviewGateStreams: []string{"greptile"}}
 	o, merged := newMergeTestOrchestrator(cfg, []github.PR{pr})
@@ -274,7 +279,11 @@ func TestAutoMergePRs_AttributionDeferralStillObservesPassingReview(t *testing.T
 	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
 		return github.ReviewGateVerdict{Passed: true, Streams: []github.ReviewStreamVerdict{{Name: "greptile", Passed: true}}}, nil
 	}
-	o.amendHeadFn = func(string, string, []state.BackendAttribution, time.Time) error { return errAmendDiverged }
+	amended := false
+	o.amendHeadFn = func(string, string, []state.BackendAttribution, time.Time) error {
+		amended = true
+		return errAmendDiverged
+	}
 	st := makeTestState([]github.PR{pr})
 	sess := st.Sessions["slot-0"]
 	sess.Attribution = []state.BackendAttribution{{Backend: "sol", StartedAt: time.Now().UTC()}}
@@ -285,8 +294,11 @@ func TestAutoMergePRs_AttributionDeferralStillObservesPassingReview(t *testing.T
 	if snapshot.HeadSHA != currentHead || snapshot.CIEffectiveVerdict != state.PRGateCISuccess || snapshot.ReviewDecision != state.PRGateReviewPassed {
 		t.Fatalf("deferred passing-review snapshot = %+v", snapshot)
 	}
-	if len(*merged) != 0 {
-		t.Fatalf("attribution-deferred PR unexpectedly merged: %v", *merged)
+	if len(*merged) != 1 || (*merged)[0] != pr.Number {
+		t.Fatalf("passing PR was not merged normally: %v", *merged)
+	}
+	if amended {
+		t.Fatal("passing merge gate must not rewrite the product branch for attribution")
 	}
 }
 

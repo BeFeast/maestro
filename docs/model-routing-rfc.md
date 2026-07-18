@@ -283,8 +283,9 @@ dispatched to the single `model.default` regardless of band.
 - Surfaced in `maestro status` (the `BACKEND` column,
   `cmd/maestro/main.go:1461`), the fleet API / Mission Control drawer
   (`internal/server/fleet.go:1152-1155`, `internal/server/server.go:381,416`),
-  and the durable `Maestro-Backend:` commit/PR trailer
-  (`internal/state/attribution.go:9-20`).
+  and the durable internal session attribution timeline. Historical
+  `Maestro-Backend:` trailers remain parseable for compatibility, but routing
+  telemetry is not written to product commits (#1000).
 
 The gap: `SelectionReason` records **which lever fired**, not **why the task
 warranted a strength**. And `CandidateScores.Fit`/`Policy` are constant
@@ -495,10 +496,10 @@ Make the decision self-explaining (closing the §1.6 gap):
     (`internal/server/web/mc/src/` never reads `backend_selection`); rendering
     them in the drawer is a tracked frontend follow-up, not part of #791/#792.
     The data is already exposed on the API for whoever wires the view.
-- Keep the durable `Maestro-Backend:` trailer
-  (`internal/state/attribution.go:9-20`) as the canonical backend timeline —
-  escalation simply appends a new segment with its `EndReason`, which the trailer
-  already models.
+- Keep the durable internal session attribution timeline as the canonical
+  backend record. Escalation appends a new segment with its `EndReason` in
+  Maestro state and Fleet; it must not rewrite the product repository's commit
+  history (#1000).
 
 ### 2.8 Rollout
 
