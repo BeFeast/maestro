@@ -214,6 +214,38 @@ func TestCIStatusFromREST(t *testing.T) {
 		{name: "cancelled check fails", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "cancelled"}}, want: "failure"},
 		{name: "success checks pass", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, want: "success"},
 		{
+			name: "new success supersedes same-head failed attempt",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:49:50Z"},
+				{ID: 20, Name: "agent-lint", Status: "completed", Conclusion: "success", StartedAt: "2026-07-18T06:51:30Z"},
+			},
+			want: "success",
+		},
+		{
+			name: "new failure supersedes same-head successful attempt",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "success", StartedAt: "2026-07-18T06:49:50Z"},
+				{ID: 20, Name: "agent-lint", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:51:30Z"},
+			},
+			want: "failure",
+		},
+		{
+			name: "new pending rerun supersedes same-head failure",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:49:50Z"},
+				{ID: 20, Name: "agent-lint", Status: "in_progress", StartedAt: "2026-07-18T06:51:30Z"},
+			},
+			want: "pending",
+		},
+		{
+			name: "different failing check remains authoritative",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "success", StartedAt: "2026-07-18T06:51:30Z"},
+				{ID: 20, Name: "build", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:50:12Z"},
+			},
+			want: "failure",
+		},
+		{
 			name:     "green checks with empty combined pending succeed",
 			checks:   []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
 			combined: combinedStatusResponse{State: "pending", Statuses: nil},
@@ -249,6 +281,26 @@ func TestCIStatusFromREST(t *testing.T) {
 				t.Fatalf("ciStatusFromREST() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseCheckRunsKeepsLatestAttemptPerAppAndName(t *testing.T) {
+	checks, err := parseCheckRuns([]byte(`{
+		"check_runs": [
+			{"id": 30, "name": "agent-lint", "status": "completed", "conclusion": "success", "started_at": "2026-07-18T06:51:30Z", "app": {"id": 15368, "slug": "github-actions"}},
+			{"id": 10, "name": "agent-lint", "status": "completed", "conclusion": "failure", "started_at": "2026-07-18T06:49:50Z", "app": {"id": 15368, "slug": "github-actions"}},
+			{"id": 20, "name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-07-18T06:50:12Z", "app": {"id": 15368, "slug": "github-actions"}},
+			{"id": 40, "name": "agent-lint", "status": "completed", "conclusion": "failure", "started_at": "2026-07-18T06:52:00Z", "app": {"id": 999, "slug": "another-app"}}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("parseCheckRuns() error = %v", err)
+	}
+	if len(checks) != 3 {
+		t.Fatalf("len(checks) = %d, want 3 logical contexts: %#v", len(checks), checks)
+	}
+	if checks[0].ID != 30 || checks[0].Conclusion != "success" {
+		t.Fatalf("github-actions agent-lint = %#v, want latest success id 30", checks[0])
 	}
 }
 

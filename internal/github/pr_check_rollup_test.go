@@ -35,3 +35,14 @@ func TestCICheckRollupFingerprint_IsOrderStableAndSemantic(t *testing.T) {
 		t.Fatalf("fingerprint length = %d, want bounded digest", len(first))
 	}
 }
+
+func TestCICheckRollupFingerprintIgnoresSupersededAttemptHistory(t *testing.T) {
+	current := greptileCheckRun{ID: 20, Name: "agent-lint", Status: "completed", Conclusion: "success", StartedAt: "2026-07-18T06:51:30Z"}
+	stale := greptileCheckRun{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:49:50Z"}
+
+	want := ciCheckRollupFingerprint([]greptileCheckRun{current}, combinedStatusResponse{})
+	got := ciCheckRollupFingerprint([]greptileCheckRun{stale, current}, combinedStatusResponse{})
+	if got != want {
+		t.Fatalf("superseded attempt changed fingerprint: got=%q want=%q", got, want)
+	}
+}
