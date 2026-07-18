@@ -227,16 +227,26 @@ func (s *State) RecordMaterialRecovery(targetKey, recommendationID string, outco
 			return fmt.Errorf("material-progress recovery already completed as %q", recovery.Outcome)
 		}
 		recovery.Outcome = outcome
+		if recovery.Stage == "" {
+			recovery.Stage = progress.RecoveryStageReconciled
+		}
+		recovery.UpdatedAt = now
 		recovery.CompletedAt = now
 		target.UpdatedAt = now
 		return nil
+	}
+	stage := progress.RecoveryStageClaimed
+	if outcome != progress.RecoveryAttempted {
+		stage = progress.RecoveryStageReconciled
 	}
 	recovery := progress.Recovery{
 		RecommendationID: recommendationID,
 		Target:           target.Target,
 		Action:           target.LastRecommendation.Action,
 		Outcome:          outcome,
+		Stage:            stage,
 		AttemptedAt:      now,
+		UpdatedAt:        now,
 	}
 	if outcome != progress.RecoveryAttempted {
 		recovery.CompletedAt = now
@@ -244,6 +254,106 @@ func (s *State) RecordMaterialRecovery(targetKey, recommendationID string, outco
 	target.Recoveries = append(target.Recoveries, recovery)
 	target.UpdatedAt = now
 	return nil
+}
+
+// ClaimMaterialRecovery acquires one bounded actuator lease for an exact
+// recommendation. A live lease suppresses concurrent cycles; an expired lease
+// may be renewed after a crash only while the latest evaluator decision still
+// authorizes it. Terminal recoveries are never claimed again.
+func (s *State) ClaimMaterialRecovery(targetKey, recommendationID, leaseID string, leaseDuration time.Duration, now time.Time) (bool, error) {
+	if s == nil || s.MaterialProgress == nil {
+		return false, fmt.Errorf("material-progress state does not exist")
+	}
+	if leaseID == "" || leaseDuration <= 0 {
+		return false, fmt.Errorf("material-progress recovery lease is invalid")
+	}
+	target := s.MaterialProgress.Targets[targetKey]
+	if target == nil || target.LastRecommendation == nil ||
+		target.LastRecommendation.RecommendationID != recommendationID {
+		return false, fmt.Errorf("material-progress recommendation does not exist")
+	}
+	if target.LastRecommendation.Action != progress.ActionStopAndRetry {
+		return false, fmt.Errorf("material-progress recommendation is not automatically recoverable")
+	}
+	if !target.Active || target.LastDecision == nil ||
+		target.LastDecision.Action != progress.ActionStopAndRetry ||
+		target.LastDecision.RecommendationID != recommendationID {
+		return false, nil
+	}
+	now = now.UTC()
+	for i := range target.Recoveries {
+		recovery := &target.Recoveries[i]
+		if recovery.RecommendationID != recommendationID {
+			continue
+		}
+		if recovery.Outcome != progress.RecoveryAttempted {
+			return false, nil
+		}
+		if recovery.LeaseID != "" && now.Before(recovery.LeaseExpiresAt) {
+			return false, nil
+		}
+		recovery.LeaseID = leaseID
+		recovery.LeaseGeneration++
+		recovery.LeaseExpiresAt = now.Add(leaseDuration)
+		recovery.Stage = progress.RecoveryStageClaimed
+		recovery.Reason = progress.RecoveryReasonNone
+		recovery.UpdatedAt = now
+		target.UpdatedAt = now
+		return true, nil
+	}
+	target.Recoveries = append(target.Recoveries, progress.Recovery{
+		RecommendationID: recommendationID,
+		Target:           target.Target,
+		Action:           target.LastRecommendation.Action,
+		Outcome:          progress.RecoveryAttempted,
+		Stage:            progress.RecoveryStageClaimed,
+		AttemptedAt:      now,
+		UpdatedAt:        now,
+		LeaseID:          leaseID,
+		LeaseGeneration:  1,
+		LeaseExpiresAt:   now.Add(leaseDuration),
+	})
+	target.UpdatedAt = now
+	return true, nil
+}
+
+// CompleteMaterialRecovery records the result owned by leaseID. A stale owner
+// cannot overwrite a newer takeover, and a terminal result remains exactly-once.
+func (s *State) CompleteMaterialRecovery(targetKey, recommendationID, leaseID string, outcome progress.RecoveryOutcome, stage progress.RecoveryStage, reason progress.RecoveryReason, now time.Time) error {
+	if s == nil || s.MaterialProgress == nil {
+		return fmt.Errorf("material-progress state does not exist")
+	}
+	if outcome != progress.RecoverySucceeded && outcome != progress.RecoveryFailed {
+		return fmt.Errorf("invalid material-progress terminal recovery outcome %q", outcome)
+	}
+	target := s.MaterialProgress.Targets[targetKey]
+	if target == nil {
+		return fmt.Errorf("material-progress target does not exist")
+	}
+	now = now.UTC()
+	for i := range target.Recoveries {
+		recovery := &target.Recoveries[i]
+		if recovery.RecommendationID != recommendationID {
+			continue
+		}
+		if recovery.Outcome == outcome && recovery.LeaseID == leaseID {
+			return nil
+		}
+		if recovery.Outcome != progress.RecoveryAttempted {
+			return fmt.Errorf("material-progress recovery already completed as %q", recovery.Outcome)
+		}
+		if recovery.LeaseID != leaseID {
+			return fmt.Errorf("material-progress recovery lease changed")
+		}
+		recovery.Outcome = outcome
+		recovery.Stage = stage
+		recovery.Reason = reason
+		recovery.UpdatedAt = now
+		recovery.CompletedAt = now
+		target.UpdatedAt = now
+		return nil
+	}
+	return fmt.Errorf("material-progress recovery attempt does not exist")
 }
 
 // mergeMaterialProgress merges concurrent complete-snapshot writers per exact
@@ -352,8 +462,9 @@ func mergeRecoveries(a, b []progress.Recovery) []progress.Recovery {
 	byID := make(map[string]progress.Recovery, len(a)+len(b))
 	for _, recovery := range append(append([]progress.Recovery(nil), a...), b...) {
 		prior, exists := byID[recovery.RecommendationID]
-		if !exists || recovery.CompletedAt.After(prior.CompletedAt) ||
-			(recovery.CompletedAt.Equal(prior.CompletedAt) && recovery.AttemptedAt.After(prior.AttemptedAt)) {
+		if !exists || recovery.LeaseGeneration > prior.LeaseGeneration ||
+			(recovery.LeaseGeneration == prior.LeaseGeneration && recovery.UpdatedAt.After(prior.UpdatedAt)) ||
+			(recovery.LeaseGeneration == prior.LeaseGeneration && recovery.UpdatedAt.Equal(prior.UpdatedAt) && recovery.CompletedAt.After(prior.CompletedAt)) {
 			byID[recovery.RecommendationID] = recovery
 		}
 	}

@@ -28,6 +28,7 @@ import (
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/worker"
 )
@@ -36,8 +37,17 @@ const (
 	minProjectGraphQLRemaining = 100
 	projectBoardSweepInterval  = 30 * time.Minute
 	projectBoardSweepRetry     = 10 * time.Minute
-	pipelineFullLabel          = "pipeline:full"
+	// Leave one orchestrator tick of scheduling margin so a 60-second loop
+	// observes the authoritative terminal state within the 10-minute SLA even
+	// when the prior check landed immediately after a cycle boundary.
+	terminalReconcileInterval = 9 * time.Minute
+	pipelineFullLabel         = "pipeline:full"
 )
+
+type cycleBoolResult struct {
+	value bool
+	err   error
+}
 
 // Orchestrator coordinates all agent sessions
 type Orchestrator struct {
@@ -58,7 +68,9 @@ type Orchestrator struct {
 	enhancementPromptBase string
 	pidAliveFn            func(pid int) bool
 	tmuxSessionExistsFn   func(name string) bool
+	tmuxPaneIdentityFn    func(session string) (int, string, error)
 	listOpenPRsFn         func() ([]github.PR, error)
+	listClosedPRsFn       func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
 	amendHeadFn           func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error
@@ -82,9 +94,12 @@ type Orchestrator struct {
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	getIssueFn      func(number int) (github.Issue, error)
-	// saveCheckpointFn / respawnInPlaceFn: used for soft token threshold checkpoint+respawn
-	saveCheckpointFn func(sess *state.Session) (string, error)
-	respawnInPlaceFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
+	// saveCheckpointFn / restoreWorktreeFn / respawnInPlaceFn: used for soft
+	// token threshold checkpoint+respawn. restoreWorktreeFn lets tests exercise
+	// the production validation path without starting a real model process.
+	saveCheckpointFn  func(sess *state.Session) (string, error)
+	restoreWorktreeFn func(localPath, worktreeBase, slotName, worktree, branch string) error
+	respawnInPlaceFn  func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 
 	// Testing hooks for pipeline phase transitions
 	workerStartPhaseFn func(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error
@@ -146,6 +161,7 @@ type Orchestrator struct {
 	ghCollectPRReviewFeedbackFn  func(prNumber int) (string, error)
 	ghCloseIssueFn               func(number int, comment string) error
 	ghPRHeadSHAFn                func(prNumber int) (string, error)
+	ghPRDetailsFn                func(prNumber int) (github.PR, error)
 	ghPRMergeInfoFn              func(prNumber int) (github.PRMergeInfo, error)
 	ghCommentPRFn                func(prNumber int, body string) error
 	ghPRChangedFilesFn           func(prNumber int) ([]string, error)
@@ -172,10 +188,15 @@ type Orchestrator struct {
 	// and every call fetches fresh, preserving the semantics of callers (and
 	// tests) that invoke those steps in isolation. RunOnce is serial per flow,
 	// so no locking is required.
-	cycleActive   bool
-	cyclePRsValid bool
-	cyclePRs      []github.PR
-	cyclePRsErr   error
+	cycleActive         bool
+	cyclePRsValid       bool
+	cyclePRs            []github.PR
+	cyclePRsErr         error
+	cycleClosedPRsValid bool
+	cycleClosedPRs      []github.PR
+	cycleClosedPRsErr   error
+	cycleIssueClosed    map[int]cycleBoolResult
+	cyclePRMerged       map[int]cycleBoolResult
 }
 
 // New creates a new Orchestrator
@@ -259,7 +280,18 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 	if name == "" {
 		return false
 	}
-	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+	return tmuxsession.HasSession(name)
+}
+
+// tmuxPaneIdentity reads the live pane pid and worktree of a tmux session,
+// used to adopt an already-running worker whose recorded pid is stale (#877
+// restart-resume). Both values are required: a matching tmux name alone may
+// refer to a stale or unrelated pane after a failed resume.
+func (o *Orchestrator) tmuxPaneIdentity(session string) (int, string, error) {
+	if o.tmuxPaneIdentityFn != nil {
+		return o.tmuxPaneIdentityFn(session)
+	}
+	return worker.TmuxPaneIdentity(session)
 }
 
 func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
@@ -279,6 +311,11 @@ func (o *Orchestrator) beginCycle() {
 	o.cyclePRsValid = false
 	o.cyclePRs = nil
 	o.cyclePRsErr = nil
+	o.cycleClosedPRsValid = false
+	o.cycleClosedPRs = nil
+	o.cycleClosedPRsErr = nil
+	o.cycleIssueClosed = make(map[int]cycleBoolResult)
+	o.cyclePRMerged = make(map[int]cycleBoolResult)
 }
 
 // endCycle clears the per-cycle cache and deactivates memoization so any
@@ -288,6 +325,11 @@ func (o *Orchestrator) endCycle() {
 	o.cyclePRsValid = false
 	o.cyclePRs = nil
 	o.cyclePRsErr = nil
+	o.cycleClosedPRsValid = false
+	o.cycleClosedPRs = nil
+	o.cycleClosedPRsErr = nil
+	o.cycleIssueClosed = nil
+	o.cyclePRMerged = nil
 }
 
 // invalidateCyclePRs drops the memoized per-cycle open-PR snapshot so the next
@@ -309,6 +351,37 @@ func (o *Orchestrator) invalidateCyclePRs() {
 	o.cyclePRsValid = false
 	o.cyclePRs = nil
 	o.cyclePRsErr = nil
+	o.cycleClosedPRsValid = false
+	o.cycleClosedPRs = nil
+	o.cycleClosedPRsErr = nil
+	o.cyclePRMerged = make(map[int]cycleBoolResult)
+}
+
+// listClosedPRsForCycle shares one closed-PR snapshot across every historical
+// issue/branch lookup in a RunOnce. The old path launched a fresh gh process for
+// every retry_exhausted session, which made the single daemon sustain load 6-10
+// while doing no worker computation (#940).
+func (o *Orchestrator) listClosedPRsForCycle() ([]github.PR, error) {
+	fetch := func() ([]github.PR, error) {
+		if o.listClosedPRsFn != nil {
+			return o.listClosedPRsFn()
+		}
+		if o.gh == nil {
+			return nil, fmt.Errorf("no github client configured for closed-pr list")
+		}
+		return o.gh.ListClosedPRs()
+	}
+	if !o.cycleActive {
+		return fetch()
+	}
+	if o.cycleClosedPRsValid {
+		return o.cycleClosedPRs, o.cycleClosedPRsErr
+	}
+	prs, err := fetch()
+	o.cycleClosedPRs = prs
+	o.cycleClosedPRsErr = err
+	o.cycleClosedPRsValid = true
+	return prs, err
 }
 
 // listOpenPRsForCycle returns the open-PR list, fetching it at most once per
@@ -408,6 +481,10 @@ func (o *Orchestrator) hasMergedPRForIssue(issueNumber int) (bool, error) {
 	if o.gh == nil {
 		return false, fmt.Errorf("no github client configured for merged-pr check")
 	}
+	if o.cycleActive {
+		prNumber, err := o.mergedPRForIssue(issueNumber)
+		return prNumber > 0, err
+	}
 	return o.gh.HasMergedPRForIssue(issueNumber)
 }
 
@@ -418,6 +495,18 @@ func (o *Orchestrator) mergedPRForIssue(issueNumber int) (int, error) {
 	if o.gh == nil {
 		return 0, fmt.Errorf("no github client configured for merged-pr number check")
 	}
+	if o.cycleActive {
+		prs, err := o.listClosedPRsForCycle()
+		if err != nil {
+			return 0, err
+		}
+		for _, pr := range prs {
+			if pr.MergedAt != "" && github.PRClosesIssue(pr, issueNumber) {
+				return pr.Number, nil
+			}
+		}
+		return 0, nil
+	}
 	return o.gh.MergedPRNumberForIssue(issueNumber)
 }
 
@@ -425,13 +514,24 @@ func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
 	if o.isPRMergedFn != nil {
 		return o.isPRMergedFn(prNumber)
 	}
+	if o.cycleActive {
+		if result, ok := o.cyclePRMerged[prNumber]; ok {
+			return result.value, result.err
+		}
+	}
+	var merged bool
+	var err error
 	if o.readSource != nil {
-		return o.readSource.IsPRMerged(prNumber)
+		merged, err = o.readSource.IsPRMerged(prNumber)
+	} else if o.gh == nil {
+		err = fmt.Errorf("no github client configured for pr-merged check")
+	} else {
+		merged, err = o.gh.IsPRMerged(prNumber)
 	}
-	if o.gh == nil {
-		return false, fmt.Errorf("no github client configured for pr-merged check")
+	if o.cycleActive {
+		o.cyclePRMerged[prNumber] = cycleBoolResult{value: merged, err: err}
 	}
-	return o.gh.IsPRMerged(prNumber)
+	return merged, err
 }
 
 func (o *Orchestrator) mergedPRForBranch(branch string) (int, error) {
@@ -440,6 +540,18 @@ func (o *Orchestrator) mergedPRForBranch(branch string) (int, error) {
 	}
 	if o.gh == nil {
 		return 0, fmt.Errorf("no github client configured for merged-branch check")
+	}
+	if o.cycleActive {
+		prs, err := o.listClosedPRsForCycle()
+		if err != nil {
+			return 0, err
+		}
+		for _, pr := range prs {
+			if strings.EqualFold(pr.State, "closed") && pr.MergedAt != "" && pr.HeadRefName == branch {
+				return pr.Number, nil
+			}
+		}
+		return 0, nil
 	}
 	return o.gh.MergedPRNumberForBranch(branch)
 }
@@ -579,6 +691,16 @@ func (o *Orchestrator) prHeadSHA(prNumber int) (string, error) {
 	return o.gh.PRHeadSHA(prNumber)
 }
 
+func (o *Orchestrator) prDetails(prNumber int) (github.PR, error) {
+	if o.ghPRDetailsFn != nil {
+		return o.ghPRDetailsFn(prNumber)
+	}
+	if o.gh == nil {
+		return github.PR{}, fmt.Errorf("no github client configured for PR details")
+	}
+	return o.gh.PRDetails(prNumber)
+}
+
 func (o *Orchestrator) commentPR(prNumber int, body string) error {
 	if o.ghCommentPRFn != nil {
 		return o.ghCommentPRFn(prNumber, body)
@@ -692,13 +814,18 @@ func (o *Orchestrator) collectFailingCheckContext(prNumber int) string {
 }
 
 func (o *Orchestrator) closeIssue(number int, comment string) error {
+	var err error
 	if o.ghCloseIssueFn != nil {
-		return o.ghCloseIssueFn(number, comment)
+		err = o.ghCloseIssueFn(number, comment)
+	} else if o.gh == nil {
+		err = fmt.Errorf("no github client configured for close-issue")
+	} else {
+		err = o.gh.CloseIssue(number, comment)
 	}
-	if o.gh == nil {
-		return fmt.Errorf("no github client configured for close-issue")
+	if err == nil && o.cycleActive {
+		delete(o.cycleIssueClosed, number)
 	}
-	return o.gh.CloseIssue(number, comment)
+	return err
 }
 
 func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
@@ -768,6 +895,55 @@ func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName str
 	return worker.RespawnInPlace(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 }
 
+// respawnPreservingWorktreeWithConfig is the only recovery path for a session
+// that still owns a worktree. A provider transition or post-exit retry must not
+// call worker.Respawn: that function intentionally deletes and recreates the
+// worktree, which loses completed-but-uncommitted work. Dirty work is first
+// checkpointed into the existing resumable checkpoint contract, then the same
+// slot/branch/worktree is restarted in place on the selected backend.
+func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
+	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
+		return o.respawnWorkerWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+	}
+	restoreWorktree := o.restoreWorktreeFn
+	if restoreWorktree == nil && o.respawnInPlaceFn == nil {
+		restoreWorktree = worker.RestoreMissingWorktree
+	}
+	if restoreWorktree != nil {
+		// Directory existence is insufficient: a retained directory can contain
+		// a stale .git pointer after administrative metadata was removed. The
+		// restore helper validates Git usability, preserves an invalid directory,
+		// and recreates only the exact canonical slot/path/branch (#957).
+		if err := restoreWorktree(cfg.LocalPath, cfg.WorktreeBase, slotName, sess.Worktree, sess.Branch); err != nil {
+			return err
+		}
+		log.Printf("[orch] worker %s: verified canonical worktree on existing branch %s", slotName, sess.Branch)
+	}
+	// Unit tests inject an in-place respawner with synthetic paths. Production
+	// never has that hook and therefore still fails closed if a retained
+	// worktree cannot be inspected.
+	if _, statErr := os.Stat(sess.Worktree); errors.Is(statErr, os.ErrNotExist) && o.respawnInPlaceFn != nil {
+		return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+	}
+	dirty, err := worker.WorktreeDirty(sess.Worktree)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		checkpoint, err := o.saveCheckpoint(sess)
+		if err != nil {
+			return fmt.Errorf("checkpoint dirty worktree before recovery: %w", err)
+		}
+		sess.CheckpointFile = checkpoint
+		log.Printf("[orch] worker %s: checkpointed dirty worktree before in-place recovery on %s", slotName, backendName)
+	}
+	return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+}
+
+func (o *Orchestrator) respawnPreservingWorktree(slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
+	return o.respawnPreservingWorktreeWithConfig(o.cfg, slotName, sess, issue, promptBase, backendName)
+}
+
 func (o *Orchestrator) rebaseWorktree(worktreePath, branch string) error {
 	if o.rebaseWorktreeFn != nil {
 		return o.rebaseWorktreeFn(worktreePath, branch, o.cfg.AutoResolveFiles, o.cfg.AutoRestoreFiles)
@@ -789,13 +965,24 @@ func (o *Orchestrator) isIssueClosed(number int) (bool, error) {
 	if o.isIssueClosedFn != nil {
 		return o.isIssueClosedFn(number)
 	}
+	if o.cycleActive {
+		if result, ok := o.cycleIssueClosed[number]; ok {
+			return result.value, result.err
+		}
+	}
+	var closed bool
+	var err error
 	if o.readSource != nil {
-		return o.readSource.IsIssueClosed(number)
+		closed, err = o.readSource.IsIssueClosed(number)
+	} else if o.gh == nil {
+		err = fmt.Errorf("no github client configured for issue-closed check")
+	} else {
+		closed, err = o.gh.IsIssueClosed(number)
 	}
-	if o.gh == nil {
-		return false, fmt.Errorf("no github client configured for issue-closed check")
+	if o.cycleActive {
+		o.cycleIssueClosed[number] = cycleBoolResult{value: closed, err: err}
 	}
-	return o.gh.IsIssueClosed(number)
+	return closed, err
 }
 
 func (o *Orchestrator) addIssueLabel(number int, label string) error {
@@ -963,24 +1150,49 @@ func (o *Orchestrator) backendUsageLimitPatterns(backend string) []string {
 	return def.UsageLimitPatterns
 }
 
-// classifyBackendFailure inspects a dead worker's log for any hard backend
-// failure that must not burn the per-issue retry budget. It returns the gating
-// reason (state.BackendBlockAuthFailure, state.BackendBlockModelUnavailable,
-// or state.BackendBlockUsageLimit) and the matched signature label. Auth is
-// checked first: a 401 and a model 404 can co-occur in a noisy log, and a
-// credential outage is the more common recovery path (re-login / cred-sync)
-// than a config change. hit=false leaves the death to the ordinary retry path.
-func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time) (hit bool, reason string, pattern string) {
+// classifyBackendFailure inspects a dead worker's terminal output for hard
+// backend failures that must not burn the issue retry budget. A structured
+// CLIProxyAPI model_cooldown is checked first because it is explicitly scoped
+// to one provider/model route and carries the credential-rotation aggregate.
+func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time) (backendFailure, bool) {
+	if sess != nil {
+		result, ok := worker.IsCredentialRotationUnavailable(sess.LogFile, now)
+		if ok && (result.Structured || (!sess.StartedAt.IsZero() && now.Sub(sess.StartedAt) <= backendAuthFailureWindow)) {
+			pattern := result.AggregateReason
+			if pattern == "" {
+				pattern = state.BackendBlockModelCooldown
+			}
+			return backendFailure{
+				reason:                    state.BackendBlockModelCooldown,
+				pattern:                   pattern,
+				provider:                  result.Provider,
+				model:                     result.Model,
+				credentialCandidates:      result.Candidates,
+				credentialCandidatesKnown: result.CandidatesKnown,
+				credentialUsable:          result.Usable,
+				credentialUsableKnown:     result.UsableKnown,
+				aggregateReason:           result.AggregateReason,
+				retryAfter:                result.RetryAfter,
+				modelScoped:               true,
+			}, true
+		}
+	}
 	if ok, label := o.backendAuthFailureFromLog(sess, now); ok {
-		return true, state.BackendBlockAuthFailure, label
+		return backendFailure{reason: state.BackendBlockAuthFailure, pattern: label}, true
 	}
 	if ok, label := o.backendModelUnavailableFromLog(sess, now); ok {
-		return true, state.BackendBlockModelUnavailable, label
+		_, model := o.providerModelRouteForSession(sess, "", "")
+		return backendFailure{
+			reason:      state.BackendBlockModelUnavailable,
+			pattern:     label,
+			model:       model,
+			modelScoped: model != "",
+		}, true
 	}
 	if ok, label := o.backendUsageLimitFromLog(sess, now); ok {
-		return true, state.BackendBlockUsageLimit, label
+		return backendFailure{reason: state.BackendBlockUsageLimit, pattern: label}, true
 	}
-	return false, "", ""
+	return backendFailure{}, false
 }
 
 func (o *Orchestrator) workerLogFile(slotName string, sess *state.Session) string {
@@ -1036,6 +1248,39 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	sess.TokensUsedTotal += delta
 	log.Printf("[orch] %s tokens_used updated: attempt=%d total=%d", slotName, tokens, sess.TokensUsedTotal)
 	return true
+}
+
+func applyTokenBudgetObservation(sess *state.Session, observed int) {
+	if sess == nil || observed <= sess.TokensUsedAttempt {
+		return
+	}
+	delta := observed - sess.TokensUsedAttempt
+	sess.TokensUsedAttempt = observed
+	sess.TokensUsedTotal += delta
+}
+
+func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Session, marker worker.TokenBudgetMarker, now time.Time) {
+	if sess == nil || sess.WorkerOutcome == worker.TokenBudgetExceededOutcome {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	o.updateTokensUsedFromWorkerLog(slotName, sess)
+	applyTokenBudgetObservation(sess, marker.TokensObserved)
+	sess.WorkerOutcome = worker.TokenBudgetExceededOutcome
+	sess.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
+	sess.Status = state.StatusFailed
+	sess.PID = 0
+	sess.TmuxSession = ""
+	sess.NextRetryAt = nil
+	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
+	log.Printf("[orch] worker %s stopped by token budget: observed=%d max=%d", slotName, sess.TokensUsedAttempt, marker.MaxTokens)
+	if o.notifier != nil {
+		o.notifier.Sendf("maestro: worker %s (issue #%d) stopped at its token budget: %s observed / %s configured",
+			slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(marker.MaxTokens))
+	}
 }
 
 // updatePiUsageFromOutput parses a Pi --mode json event stream from the
@@ -1670,7 +1915,7 @@ func tmuxCapture(session string) (string, error) {
 	if strings.TrimSpace(session) == "" {
 		return "", fmt.Errorf("empty tmux session")
 	}
-	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
+	out, err := tmuxsession.CommandForSession(session, "capture-pane", "-t", "="+session+":", "-p").Output()
 	if err != nil {
 		return "", err
 	}
@@ -1728,8 +1973,9 @@ func appendCIFailureContext(promptBase, ciOutput string, attempt int) string {
 
 ## IMPORTANT: Previous CI Failure (Attempt %d)
 
-A previous worker created a PR for this issue, but CI failed. The PR has been closed.
-You are a retry worker — please fix the CI failures described below.
+The current canonical PR for this issue failed CI and remains open.
+You are an in-place retry worker on that same branch and worktree. Fix the CI
+failures described below, push to the existing PR, and do NOT open another PR.
 
 **CI output from the failed run:**
 `+"```"+`
@@ -1754,6 +2000,22 @@ The following code review comments were left on the previous PR. Address ALL of 
 IMPORTANT: Address ALL code review findings above before creating a new PR.
 Do NOT repeat the same mistakes.
 `, promptBase, feedback)
+}
+
+func appendRecoveryHandoffContext(promptBase, handoff string) string {
+	return fmt.Sprintf(`%s
+
+### Preserved Work From a Superseded Session
+
+Maestro recovered the canonical issue/PR identity after a duplicate or stale
+session. The following committed work is preserved locally:
+
+%s
+
+Inspect these exact commits, carry every useful change onto your current
+canonical branch, and push only to the existing PR. Do NOT delete the preserved
+branch/worktree and do NOT open another PR.
+`, promptBase, handoff)
 }
 
 // failingCheckExcerptCapBytes hard-caps the failing-check excerpt placed in a
@@ -2012,6 +2274,18 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 				slotName, sess.IssueNumber, sess.IssueTitle)
 			continue
 		}
+		// A saved retry is not authority to bypass the issue's current dispatch
+		// guards. The issue may have gained `blocked` (or another configured
+		// exclude label) while the worker ran or while the retry waited. Preserve
+		// the canonical session/worktree and re-check next cycle; never consume
+		// the retry into a forbidden or duplicate worker.
+		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
+			retryAt := time.Now().UTC().Add(time.Minute)
+			sess.NextRetryAt = &retryAt
+			log.Printf("[orch] worker %s retry deferred until %s: issue #%d has a current excluded label",
+				slotName, retryAt.Format(time.RFC3339), sess.IssueNumber)
+			continue
+		}
 
 		promptBase := o.selectPrompt(issue)
 
@@ -2048,7 +2322,11 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		// backend (legacy states, minimal configs) keep the old behavior.
 		if respawnBackend != "" && len(o.cfg.Model.Backends) > 0 {
 			now := time.Now().UTC()
-			if blockedBy, blockedRetry := o.dispatchBackendBlock(s, respawnBackend, now); blockedBy != "" {
+			model := ""
+			if sess.BackendSelection != nil {
+				model = sess.BackendSelection.Model
+			}
+			if blockedBy, blockedRetry := o.dispatchBackendBlock(s, respawnBackend, model, now); blockedBy != "" {
 				selection := o.selectBackendFallback(s, sess, now, selectionReasonRetryBlockedFallback)
 				if selection.SelectedBackend == "" {
 					// Defer to the EARLIEST cooldown expiry across the blocked
@@ -2092,6 +2370,8 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		if sess.PreviousAttemptFeedback != "" {
 			if sess.PreviousAttemptFeedbackKind == "rebase_conflict" {
 				promptBase = appendRebaseConflictContext(promptBase, sess.PreviousAttemptFeedback)
+			} else if sess.PreviousAttemptFeedbackKind == "recovery_handoff" {
+				promptBase = appendRecoveryHandoffContext(promptBase, sess.PreviousAttemptFeedback)
 			} else {
 				if sess.PreviousAttemptFeedbackKind == state.RetryReasonReviewFeedback {
 					sess.RetryReason = state.RetryReasonReviewFeedback
@@ -2118,12 +2398,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		// RespawnInPlace repoint sess.LogFile to the new attempt's log.
 		promptBase = o.maybeAppendPriorAttemptPostmortem(slotName, sess, promptBase)
 
-		var respawnErr error
-		if sess.PRNumber != 0 && sess.Worktree != "" {
-			respawnErr = o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
-		} else {
-			respawnErr = o.respawnWorkerWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
-		}
+		respawnErr := o.respawnPreservingWorktreeWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		if respawnErr != nil {
 			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, respawnErr)
 			sess.Status = state.StatusFailed
@@ -2290,7 +2565,7 @@ func (o *Orchestrator) RunOnce() error {
 	// Persist immediately when reconciliation changes state, so slot calculation
 	// always sees healed state on disk.
 	if reconciled {
-		if err := state.Save(o.cfg.StateDir, s); err != nil {
+		if err := o.saveStatePreservingLiveRuntime(s); err != nil {
 			return fmt.Errorf("save state after reconcile: %w", err)
 		}
 	}
@@ -2317,6 +2592,7 @@ func (o *Orchestrator) RunOnce() error {
 	// conflicting concurrent state save self-heals here instead of aging past
 	// SLA as a false operator gate. Runs after checkSessions/reconcileCodeLanded
 	// so freshly-done sessions are already reflected in state.
+	o.reconcileGuardedRepairApprovals(s)
 	o.reconcileResolvedRepairApprovals(s)
 
 	// Step 3c: Observe-merge self-deploy (#751). A PR merged outside the
@@ -2357,7 +2633,7 @@ func (o *Orchestrator) RunOnce() error {
 	state.ReconcileBackendHealth(s, time.Now().UTC())
 
 	// Save after all checks/reconciliation
-	if err := state.Save(o.cfg.StateDir, s); err != nil {
+	if err := o.saveStatePreservingLiveRuntime(s); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 
@@ -2376,7 +2652,7 @@ func (o *Orchestrator) RunOnce() error {
 
 	if slots > 0 {
 		o.startNewWorkers(s, slots)
-		if err := state.Save(o.cfg.StateDir, s); err != nil {
+		if err := o.saveStatePreservingLiveRuntime(s); err != nil {
 			return fmt.Errorf("save state after workers: %w", err)
 		}
 	}
@@ -2887,7 +3163,34 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 	reconciled := false
 	for slotName, sess := range s.Sessions {
-		if sess.Status != state.StatusRunning {
+		// A worker launch is an external side effect: tmux may have accepted it
+		// even when the following state.Save lost a concurrent supervisor/watchdog
+		// merge race. Older code only inspected StatusRunning, so a live in-place
+		// repair hidden behind the previous pr_open/dead projection became invisible
+		// to Fleet and the progress watchdog indefinitely. Recover exact ownership
+		// before the status filter. Done/code_landed are outcome terminals and must
+		// never be reopened merely because an obsolete pane survived.
+		if sess.Status != state.StatusRunning && sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded {
+			if o.adoptLiveWorkerRuntime(slotName, sess, time.Now().UTC()) {
+				reconciled = true
+			}
+		}
+		isRestartCheckpointedDead := sess.Status == state.StatusDead && sess.RestartCheckpointAt != nil
+		if sess.Status != state.StatusRunning && !isRestartCheckpointedDead {
+			continue
+		}
+		// #967: a worker may die after drain starts but before the daemon's
+		// shutdown checkpoint pass. Its terminal transition carries the restart
+		// marker, but the old draining daemon must not immediately replay it.
+		// The replacement daemon clears the one-shot drain flag on startup and
+		// then consumes the marker below.
+		if isRestartCheckpointedDead && s.DrainActive() {
+			continue
+		}
+		if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+			o.runAfterRunHook(sess)
+			o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+			reconciled = true
 			continue
 		}
 
@@ -2903,7 +3206,8 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			reasons = append(reasons, fmt.Sprintf("pid %d dead", sess.PID))
 		}
 
-		if !o.tmuxSessionExists(tmuxName) {
+		tmuxAlive := o.tmuxSessionExists(tmuxName)
+		if !tmuxAlive {
 			reasons = append(reasons, fmt.Sprintf("tmux session %q missing", tmuxName))
 		}
 
@@ -2917,13 +3221,13 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// IssueInProgress to return false and startNewWorkers to spawn a duplicate.
 		if pr, found := branchToPR[sess.Branch]; found {
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
-			o.ensureAttributionTrailerOnBranch(slotName, sess)
 			log.Printf("[orch] reconcile: %s running->pr_open (PR #%d already open for branch %q; %s)",
 				slotName, pr.Number, sess.Branch, strings.Join(reasons, ", "))
 			sess.Status = state.StatusPROpen
 			sess.PRNumber = pr.Number
 			sess.PID = 0
 			sess.TmuxSession = ""
+			sess.NextRetryAt = nil
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
 			state.MarkWorkerEnded(sess, now)
@@ -2935,6 +3239,95 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			if o.reconcilePushedBranch(s, slotName, sess, strings.Join(reasons, ", ")) {
 				reconciled = true
 				continue
+			}
+		}
+
+		// #877: this session was deliberately checkpointed on a previous daemon's
+		// shutdown (self-deploy/operator restart) — its recorded pid is gone
+		// (reasons above) but its dirty worktree survived. Resume the SAME logical
+		// session in place exactly once instead of a false running->dead. This path
+		// is deliberately non-destructive and duplicate-proof:
+		//
+		//   - If a worker tmux session is ALREADY alive under this slot, a
+		//     replacement started by a PRIOR restart-resume whose new runtime
+		//     identity did not fully persist (e.g. the post-resume state save
+		//     failed, so the next daemon reloaded the old marker + dead pid and
+		//     re-entered here) is still running. ADOPT it — refresh the recorded
+		//     pid from the live pane and consume the marker — rather than calling
+		//     RespawnInPlace, which would KILL that replacement (it kills the
+		//     slot's deterministic tmux session first) and lose the work it did
+		//     since it started (#877 review comment 3). Adoption starts no worker,
+		//     so it cannot duplicate-dispatch. On the FIRST resume after a restart
+		//     the tmux was reaped by the cgroup SIGKILL, so this branch is skipped.
+		//   - Otherwise resume in place. The marker is consumed UP FRONT so a
+		//     respawn that itself errors falls through to terminal handling and can
+		//     never loop or duplicate-dispatch.
+		if sess.RestartCheckpointAt != nil {
+			if wt := strings.TrimSpace(sess.Worktree); wt == "" {
+				sess.RestartCheckpointAt = nil
+				log.Printf("[orch] reconcile: %s restart-resume skipped — session has no worktree; falling through (%s)", slotName, strings.Join(reasons, ", "))
+			} else if _, statErr := os.Stat(wt); statErr != nil {
+				sess.RestartCheckpointAt = nil
+				log.Printf("[orch] reconcile: %s restart-resume skipped — worktree %q gone (%v); falling through", slotName, wt, statErr)
+			} else if tmuxAlive {
+				// A replacement is already running — adopt it only when both its
+				// live PID and worktree match this retained session. Never respawn
+				// over a live pane, and never adopt a same-name foreign pane.
+				pid, paneWorktree, perr := o.tmuxPaneIdentity(tmuxName)
+				if perr != nil || pid <= 0 {
+					// Leave the marker SET so the next cycle retries the (harmless,
+					// non-destructive) adoption, rather than consuming it and falling
+					// to a false running->dead over the live replacement. Unlike a
+					// respawn, an adoption retry cannot loop or duplicate.
+					log.Printf("[orch] reconcile: %s restart-resume — replacement tmux %q alive but pane identity unreadable (%v); will retry adoption next cycle", slotName, tmuxName, perr)
+				} else if filepath.Clean(paneWorktree) != filepath.Clean(wt) {
+					// A same-name tmux pane in another directory is not this worker.
+					// Fail closed without killing it and consume the automatic resume
+					// marker so the next cycle cannot repeatedly adopt or overwrite an
+					// unrelated process. The retained worktree remains untouched for
+					// explicit operator repair.
+					now := time.Now().UTC()
+					sess.Status = state.StatusDead
+					sess.PID = 0
+					sess.TmuxSession = ""
+					sess.RestartCheckpointAt = nil
+					sess.FinishedAt = &now
+					sess.LastNotifiedStatus = "restart_resume_identity_mismatch"
+					reconciled = true
+					log.Printf("[orch] reconcile: %s restart-resume refused foreign tmux %q: pane worktree %q != retained worktree %q; session left dead, retained worktree preserved, no process killed", slotName, tmuxName, paneWorktree, wt)
+				} else {
+					sess.PID = pid
+					sess.TmuxSession = tmuxName
+					sess.RestartCheckpointAt = nil
+					reconciled = true
+					log.Printf("[orch] reconcile: %s adopted an already-running replacement across restart (issue #%d, pid=%d, tmux=%q) — no respawn, no work lost, exactly once",
+						slotName, sess.IssueNumber, pid, tmuxName)
+				}
+				continue
+			} else if issue, fetchErr := o.getIssue(sess.IssueNumber); fetchErr != nil {
+				// A transient GitHub read is not proof that the durable recovery is
+				// invalid. Preserve the marker and retry next cycle; consuming it here
+				// would strand the retained worktree as dead with no retry.
+				log.Printf("[orch] reconcile: %s restart-resume deferred — could not fetch issue #%d: %v; marker preserved for next cycle", slotName, sess.IssueNumber, fetchErr)
+				continue
+			} else {
+				o.updateTokensUsedFromWorkerLog(slotName, sess)
+				promptBase := o.selectPrompt(issue)
+				if respawnErr := o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
+					// RespawnInPlace reconciles against the deterministic tmux identity,
+					// so retrying cannot create a parallel worker. Keep the marker: a
+					// transient backend/launcher failure must not erase recovery intent.
+					sess.Status = state.StatusDead
+					log.Printf("[orch] reconcile: %s restart-resume in-place failed: %v; marker preserved for next cycle", slotName, respawnErr)
+					continue
+				} else {
+					reconciled = true
+					log.Printf("[orch] reconcile: %s resumed in place across restart (issue #%d) — same session, dirty worktree preserved, exactly once (%s)",
+						slotName, sess.IssueNumber, strings.Join(reasons, ", "))
+					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) resumed in place after a restart — dirty worktree preserved, no work lost",
+						slotName, sess.IssueNumber, sess.IssueTitle)
+					continue
+				}
 			}
 		}
 
@@ -3002,7 +3395,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 			}
 			promptBase := o.selectPrompt(issue)
-			if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
+			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
@@ -3035,11 +3428,11 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// re-login / cred-sync, a pulled model recovers via a config swap),
 		// keep the budget intact, and respawn the same attempt on the next
 		// fallback backend. The gating reason picks the operator copy.
-		if hit, reason, pattern := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
+		if failure, hit := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
 			now := time.Now().UTC()
-			cp := backendFailureCopyFor(reason)
+			cp := backendFailureCopyFor(failure.reason)
 			o.updateTokensUsedFromWorkerLog(slotName, sess)
-			o.recordBackendFailure(s, slotName, sess, reason, pattern, now)
+			o.recordBackendFailure(s, slotName, sess, failure, now)
 			selection := o.selectBackendFallback(s, sess, now, cp.selectionReason)
 			sess.BackendSelection = &selection
 			oldPID := sess.PID
@@ -3056,9 +3449,9 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.Status = state.StatusDead
 				reconciled = true
 				log.Printf("[orch] reconcile: %s running->dead via %s on backend=%s signature=%s (no fallback available; %s); pid=%d tmux=%q",
-					slotName, cp.noun, previousBackend, pattern, strings.Join(reasons, ", "), oldPID, oldTmux)
+					slotName, cp.noun, previousBackend, failure.pattern, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
-					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, pattern, cp.remedy)
+					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, failure.pattern, cp.remedy)
 				continue
 			}
 
@@ -3072,7 +3465,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.Status = state.StatusDead
 				reconciled = true
 				log.Printf("[orch] reconcile: %s running->dead via %s on backend=%s signature=%s (fallback to %s aborted: could not fetch issue #%d: %v; %s); pid=%d tmux=%q",
-					slotName, cp.noun, previousBackend, pattern, nextBackend, sess.IssueNumber, fetchErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+					slotName, cp.noun, previousBackend, failure.pattern, nextBackend, sess.IssueNumber, fetchErr, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s; fallback to %s failed (could not fetch issue): %v",
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, nextBackend, fetchErr)
 				continue
@@ -3082,7 +3475,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 			}
 			promptBase := o.selectPrompt(issue)
-			if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
+			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
@@ -3091,7 +3484,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.Status = state.StatusDead
 				reconciled = true
 				log.Printf("[orch] reconcile: %s running->dead via %s on backend=%s signature=%s (fallback respawn on %s failed: %v; %s); pid=%d tmux=%q",
-					slotName, cp.noun, previousBackend, pattern, nextBackend, respawnErr, strings.Join(reasons, ", "), oldPID, oldTmux)
+					slotName, cp.noun, previousBackend, failure.pattern, nextBackend, respawnErr, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s; fallback to %s failed: %v",
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, nextBackend, respawnErr)
 				continue
@@ -3099,14 +3492,19 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 			reconciled = true
 			log.Printf("[orch] reconcile: %s %s on backend=%s signature=%s — respawned with backend=%s, retry budget preserved (%s); old pid=%d tmux=%q",
-				slotName, cp.noun, previousBackend, pattern, nextBackend, strings.Join(reasons, ", "), oldPID, oldTmux)
+				slotName, cp.noun, previousBackend, failure.pattern, nextBackend, strings.Join(reasons, ", "), oldPID, oldTmux)
 			o.notifier.Sendf("🔄 maestro: worker %s (issue #%d: %s) backend %s %s (%s) — respawned on %s, retry budget preserved",
-				slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, pattern, nextBackend)
+				slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, failure.pattern, nextBackend)
 			continue
 		}
 
 		oldPID := sess.PID
 		oldTmux := tmuxName
+		// Evaluate retry capacity while this attempt is still Running. Once the
+		// status becomes Dead, FailedAttemptsForIssue includes this session; adding
+		// sess.RetryCount after that would count the same exit twice and suppress
+		// the first recovery when max_retries_per_issue is 1.
+		unexpectedRetryAllowed := strings.TrimSpace(sess.Worktree) != "" && o.canRetryIssue(s, sess)
 		o.updateTokensUsedFromWorkerLog(slotName, sess)
 		sess.Status = state.StatusDead
 		sess.PID = 0
@@ -3114,12 +3512,219 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		now := time.Now().UTC()
 		sess.FinishedAt = &now
 		state.MarkWorkerEnded(sess, now)
+		// #967: during graceful drain the daemon shutdown pass may run only
+		// after this flow has already persisted running->dead. Stamp the same
+		// resumable identity here while the cause is still known. Dead markers
+		// are held while drain remains active and consumed by the replacement
+		// daemon, preserving this exact slot/worktree without a new dispatch.
+		if s.DrainActive() && strings.TrimSpace(sess.Worktree) != "" {
+			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
+				stamp := now
+				sess.RestartCheckpointAt = &stamp
+				log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
+			}
+		} else if unexpectedRetryAllowed {
+			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
+				// Unexpected process loss used to become an unscheduled dead
+				// session. Dead sessions are outside the material-progress watchdog,
+				// so recovery waited for a later supervisor cycle and could exceed
+				// the 10-minute SLA. Reserve an immediate bounded retry here;
+				// respawnDueRetries runs in this same orchestrator cycle and reuses
+				// the exact slot/branch/worktree after re-checking GitHub guards.
+				retryAt := now
+				sess.RetryCount++
+				sess.RetryReason = state.RetryReasonStalledProgress
+				sess.NextRetryAt = &retryAt
+				log.Printf("[orch] reconcile: %s scheduled immediate canonical in-place retry %d after unexpected worker exit", slotName, sess.RetryCount)
+			}
+		}
 		reconciled = true
 
 		log.Printf("[orch] reconcile: %s running->dead (%s); pid=%d tmux=%q",
 			slotName, strings.Join(reasons, ", "), oldPID, oldTmux)
 	}
 	return reconciled
+}
+
+// adoptLiveWorkerRuntime adopts only the deterministic tmux identity belonging
+// to slotName and only when its pane cwd matches the retained worktree exactly.
+// A same-name foreign/unreadable pane is left untouched and is not evidence of
+// ownership. No worker is started or stopped here, so retrying every cycle is
+// idempotent and cannot create a duplicate.
+func (o *Orchestrator) adoptLiveWorkerRuntime(slotName string, sess *state.Session, observedAt time.Time) bool {
+	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
+		return false
+	}
+	tmuxName := strings.TrimSpace(sess.TmuxSession)
+	if tmuxName == "" {
+		tmuxName = worker.TmuxSessionName(slotName)
+	}
+	if !o.tmuxSessionExists(tmuxName) {
+		return false
+	}
+	pid, paneWorktree, err := o.tmuxPaneIdentity(tmuxName)
+	if err != nil || pid <= 0 {
+		log.Printf("[orch] reconcile: %s has live tmux %q but pane identity is unreadable (%v); refusing unsafe adoption", slotName, tmuxName, err)
+		return false
+	}
+	if filepath.Clean(paneWorktree) != filepath.Clean(sess.Worktree) {
+		log.Printf("[orch] reconcile: %s refusing foreign tmux %q: pane worktree %q != retained worktree %q", slotName, tmuxName, paneWorktree, sess.Worktree)
+		return false
+	}
+	if !o.pidAlive(pid) {
+		log.Printf("[orch] reconcile: %s tmux %q reported dead pane pid %d; refusing adoption", slotName, tmuxName, pid)
+		return false
+	}
+	previous := sess.Status
+	worker.AdoptLiveRuntime(o.cfg, sess, pid, tmuxName, observedAt)
+	log.Printf("[orch] reconcile: %s adopted live worker runtime hidden behind status=%s (issue #%d, pid=%d, tmux=%q, worktree=%q) — no respawn, no duplicate",
+		slotName, previous, sess.IssueNumber, pid, tmuxName, sess.Worktree)
+	return true
+}
+
+// saveStatePreservingLiveRuntime closes the side-effect/state gap around worker
+// launches. A normal three-way Save remains the fast path. If it conflicts on
+// the same session after tmux already accepted a launch, recover only runtime
+// snapshots whose exact deterministic tmux + pane cwd are still live, and
+// overlay those snapshots onto the latest state under state.Update's lock.
+//
+// Other concurrent supervisor/watchdog fields stay authoritative. This does
+// not retry a spawn and cannot create a process; it merely prevents a proven
+// live worker from becoming invisible because its post-launch Save lost a CAS
+// race. All other conflicting mutations remain fail-closed for the next cycle.
+func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		if !errors.Is(err, state.ErrStateConflict) {
+			return err
+		}
+		originalErr := err
+		live := make(map[string]state.Session)
+		for slotName, sess := range s.Sessions {
+			if sess == nil || sess.Status != state.StatusRunning || strings.TrimSpace(sess.Worktree) == "" {
+				continue
+			}
+			tmuxName := strings.TrimSpace(sess.TmuxSession)
+			if tmuxName == "" {
+				tmuxName = worker.TmuxSessionName(slotName)
+			}
+			if !o.tmuxSessionExists(tmuxName) {
+				continue
+			}
+			pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
+			if identityErr != nil || pid <= 0 || !o.pidAlive(pid) || filepath.Clean(paneWorktree) != filepath.Clean(sess.Worktree) {
+				continue
+			}
+			copy := *sess
+			copy.PID = pid
+			copy.TmuxSession = tmuxName
+			live[slotName] = copy
+		}
+		if len(live) == 0 {
+			return originalErr
+		}
+
+		adopted := 0
+		updateErr := state.Update(o.cfg.StateDir, func(latest *state.State) error {
+			for slotName, runtime := range live {
+				current, exists := latest.Sessions[slotName]
+				if exists {
+					if current == nil || current.IssueNumber != runtime.IssueNumber || strings.TrimSpace(current.Branch) != strings.TrimSpace(runtime.Branch) || filepath.Clean(current.Worktree) != filepath.Clean(runtime.Worktree) {
+						continue
+					}
+					// A stop/reconcile that completed after this runtime began is
+					// authoritative. The pre-lock liveness observation may have
+					// raced that stop, so never resurrect a newer terminal state.
+					if liveRuntimeSuperseded(current, &runtime) {
+						continue
+					}
+					applyLiveRuntimeProjection(current, &runtime)
+				} else {
+					// A fresh spawn can be absent from the concurrently-written
+					// snapshot. Only accept its deterministic slot worktree; never
+					// attach an arbitrary tmux pane/path as a new session.
+					expected := filepath.Join(o.cfg.WorktreeBase, slotName)
+					if filepath.Clean(runtime.Worktree) != filepath.Clean(expected) {
+						continue
+					}
+					copy := runtime
+					latest.Sessions[slotName] = &copy
+				}
+				adopted++
+			}
+			if adopted == 0 {
+				return state.ErrNoStateChange
+			}
+			return nil
+		})
+		if updateErr != nil {
+			return fmt.Errorf("%w (live-runtime recovery: %v)", originalErr, updateErr)
+		}
+		if adopted == 0 {
+			return originalErr
+		}
+		latest, loadErr := state.Load(o.cfg.StateDir)
+		if loadErr != nil {
+			return fmt.Errorf("reload after preserving %d live runtime(s): %w", adopted, loadErr)
+		}
+		*s = *latest
+		log.Printf("[orch] state conflict recovered by preserving %d exact live worker runtime(s); concurrent supervisor/watchdog fields retained", adopted)
+		return nil
+	}
+	return nil
+}
+
+func liveRuntimeSuperseded(current, runtime *state.Session) bool {
+	if current == nil || runtime == nil {
+		return true
+	}
+	if current.Status == state.StatusDone || current.Status == state.StatusCodeLanded {
+		return true
+	}
+	if current.Status == state.StatusRunning && current.PID > 0 && current.PID != runtime.PID && !current.StartedAt.Before(runtime.StartedAt) {
+		return true
+	}
+	if current.FinishedAt != nil && !current.FinishedAt.Before(runtime.StartedAt) {
+		return true
+	}
+	if current.WorkerEndedAt != nil && !current.WorkerEndedAt.Before(runtime.StartedAt) {
+		return true
+	}
+	return false
+}
+
+// applyLiveRuntimeProjection copies only fields owned by the external worker
+// launch/attempt. Concurrent supervisor fields on the same session (review
+// observations, retry accounting, PR identity, etc.) remain on current. This
+// narrow overlay is the critical distinction between recovering process truth
+// and replaying an entire stale orchestrator snapshot after a CAS conflict.
+func applyLiveRuntimeProjection(current, runtime *state.Session) {
+	if current == nil || runtime == nil {
+		return
+	}
+	current.PID = runtime.PID
+	current.TmuxSession = runtime.TmuxSession
+	current.LogFile = runtime.LogFile
+	current.StartedAt = runtime.StartedAt
+	current.FinishedAt = runtime.FinishedAt
+	current.WorkerEndedAt = runtime.WorkerEndedAt
+	current.Status = state.StatusRunning
+	current.Backend = runtime.Backend
+	current.Model = runtime.Model
+	current.CostUSDBackend = runtime.CostUSDBackend
+	current.UsageTokensWatermark = runtime.UsageTokensWatermark
+	current.TokensUsedAttempt = runtime.TokensUsedAttempt
+	current.WorkerOutcome = runtime.WorkerOutcome
+	current.Attribution = append([]state.BackendAttribution(nil), runtime.Attribution...)
+	current.NextRetryAt = runtime.NextRetryAt
+	current.RestartCheckpointAt = runtime.RestartCheckpointAt
+	current.LastOutputHash = runtime.LastOutputHash
+	current.LastOutputChangedAt = runtime.LastOutputChangedAt
+	current.LastNotifiedStatus = runtime.LastNotifiedStatus
+	current.NotifiedCIFail = runtime.NotifiedCIFail
+	if runtime.BackendSelection != nil {
+		selection := *runtime.BackendSelection
+		current.BackendSelection = &selection
+	}
 }
 
 // reconcilePushedBranch handles a stale running session whose worker died
@@ -3197,7 +3802,6 @@ func (o *Orchestrator) reconcilePushedBranch(s *state.State, slotName string, se
 	}
 
 	title := autoCreatedPRTitle(sess)
-	o.ensureAttributionTrailerOnBranch(slotName, sess)
 	body := autoCreatedPRBody(sess, branch)
 	prNumber, err := o.createPR(title, body, "main", branch)
 	if err != nil {
@@ -3250,7 +3854,12 @@ Maestro auto-created this pull request for pushed branch %s because no open pull
 `, sess.IssueNumber, branch)
 }
 
-// ensureAttributionTrailerOnBranch stamps the durable Maestro-Backend trailer
+// ensureAttributionTrailerOnBranch is retained only as a compatibility helper
+// for historical trailer tests. Production lifecycle paths no longer call it:
+// backend attribution is internal control-plane state and must never mutate a
+// target repository's commits (#1000).
+//
+// Historically this stamped the durable Maestro-Backend trailer
 // onto the branch head. It returns deferred=true when the amend could not land
 // the trailer this cycle — the branch is advancing under a concurrent push, it
 // diverged from the attributed head, the worktree is mid-write, or the remote
@@ -3265,7 +3874,26 @@ func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *s
 	if sess == nil || len(sess.Attribution) == 0 {
 		return false
 	}
-	err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC())
+	// Runtime ownership is stronger evidence than the persisted status. A
+	// repair worker can already be live while a concurrent state write still
+	// shows pr_open/PID=0. Never amend/force-push underneath that agent: doing so
+	// rewrites HEAD while it is editing, testing, or pushing. We intentionally
+	// fail closed even when pane identity is unreadable or foreign; a live exact
+	// tmux name is enough uncertainty to forbid a branch mutation this cycle.
+	tmuxName := strings.TrimSpace(sess.TmuxSession)
+	if tmuxName == "" {
+		tmuxName = worker.TmuxSessionName(slotName)
+	}
+	if o.tmuxSessionExists(tmuxName) {
+		pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
+		if identityErr == nil && pid > 0 && filepath.Clean(paneWorktree) == filepath.Clean(sess.Worktree) {
+			log.Printf("[orch] attribution: deferring amend for %s (live worker owns branch %q via pid=%d tmux=%q)", slotName, sess.Branch, pid, tmuxName)
+		} else {
+			log.Printf("[orch] attribution: deferring amend for %s (tmux %q is live but ownership is not safely readable: pid=%d worktree=%q err=%v)", slotName, tmuxName, pid, paneWorktree, identityErr)
+		}
+		return true
+	}
+	err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC(), sess.CheckpointFile)
 	if err == nil {
 		return false
 	}
@@ -3295,11 +3923,32 @@ func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *s
 	}
 }
 
-func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time, checkpointFile string) error {
 	if o.amendHeadFn != nil {
 		return o.amendHeadFn(worktreePath, branch, attribution, now)
 	}
-	return amendHeadWithAttributionTrailer(worktreePath, branch, attribution, now)
+	// CHECKPOINT.md is a Maestro-owned resumability artifact, not product work.
+	// A completed worker may deliberately leave it untracked in the canonical
+	// worktree. Ignore only this session's exact checkpoint path, and only while
+	// it is untracked; every other dirty path remains a hard amend deferral.
+	ignoredCheckpoint := attributionCheckpointRelativePath(worktreePath, checkpointFile)
+	return amendHeadWithAttributionTrailer(worktreePath, branch, attribution, now, ignoredCheckpoint)
+}
+
+func attributionCheckpointRelativePath(worktreePath, checkpointFile string) string {
+	worktreePath = strings.TrimSpace(worktreePath)
+	checkpointFile = strings.TrimSpace(checkpointFile)
+	if worktreePath == "" || checkpointFile == "" {
+		return ""
+	}
+	if !filepath.IsAbs(checkpointFile) {
+		checkpointFile = filepath.Join(worktreePath, checkpointFile)
+	}
+	rel, err := filepath.Rel(worktreePath, checkpointFile)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(rel))
 }
 
 // amendMaxAttempts bounds how many times amendHeadWithAttributionTrailer will
@@ -3393,7 +4042,7 @@ func isStaleInfoLeaseRejection(out string) bool {
 // When the remote advances between our fetch and our push, git rejects the lease
 // with "stale info"; the amend re-fetches and retries with backoff, deferring
 // (errAmendDeferred) if the branch keeps moving (#858).
-func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time, ignoredUntrackedPaths ...string) error {
 	worktreePath = strings.TrimSpace(worktreePath)
 	branch = strings.TrimSpace(branch)
 	if worktreePath == "" || branch == "" || len(attribution) == 0 {
@@ -3407,14 +4056,15 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 	}
 
 	for attempt := 1; attempt <= amendMaxAttempts; attempt++ {
-		// Never amend over a dirty tree: a worker may still be writing, and a
-		// force-push here could clobber uncommitted work the lease cannot
-		// protect (it only guards committed history). Defer instead.
-		status, err := amendGitCommand(worktreePath, "status", "--porcelain").CombinedOutput()
+		// Never amend over product work: a worker may still be writing, and a
+		// force-push here could clobber changes the lease cannot protect (it only
+		// guards committed history). The sole exception is the exact untracked
+		// Maestro checkpoint explicitly supplied by the owning session.
+		status, err := amendGitCommand(worktreePath, "status", "--porcelain=v1", "-z", "--untracked-files=all").CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("git status: %w\n%s", err, status)
 		}
-		if strings.TrimSpace(string(status)) != "" {
+		if attributionWorktreeHasBlockingChanges(status, ignoredUntrackedPaths) {
 			return errAmendWorktreeBusy
 		}
 
@@ -3525,6 +4175,34 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 	return errAmendDeferred
 }
 
+// attributionWorktreeHasBlockingChanges permits only explicitly named
+// untracked Maestro artifacts. Tracked modifications, staged files, renames,
+// and every other untracked path remain blocking. Porcelain -z keeps filenames
+// unquoted; a rename emits an extra path record, which intentionally falls
+// through as blocking rather than being parsed optimistically.
+func attributionWorktreeHasBlockingChanges(status []byte, ignoredUntrackedPaths []string) bool {
+	ignored := make(map[string]struct{}, len(ignoredUntrackedPaths))
+	for _, path := range ignoredUntrackedPaths {
+		path = filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+		if path != "" && path != "." {
+			ignored[path] = struct{}{}
+		}
+	}
+	for _, record := range strings.Split(string(status), "\x00") {
+		if record == "" {
+			continue
+		}
+		if len(record) >= 4 && record[:3] == "?? " {
+			path := filepath.ToSlash(filepath.Clean(record[3:]))
+			if _, ok := ignored[path]; ok {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // fetchRemoteBranchOID fetches the remote branch tip into FETCH_HEAD and returns
 // its OID. It deliberately does NOT rely on a refs/remotes/origin/<branch>
 // tracking ref: a checkout may intentionally track only main (narrow fetch
@@ -3559,6 +4237,22 @@ func isAncestorCommit(worktreePath, ancestor, descendant string) bool {
 	return amendGitCommand(worktreePath, "merge-base", "--is-ancestor", ancestor, descendant).Run() == nil
 }
 
+// terminalReconcileDue bounds authoritative forge polling for historical
+// sessions. A successful check remains valid for at most the hands-off stall
+// SLA; failures are not stamped and therefore retry on the next cycle. The
+// timestamp is durable so restarting the single daemon does not fan every old
+// issue/PR back out into hundreds of gh subprocesses at once (#940).
+func terminalReconcileDue(sess *state.Session, now time.Time) bool {
+	if sess == nil || sess.LastTerminalReconcileAt == nil {
+		return true
+	}
+	if sess.StartedAt.After(*sess.LastTerminalReconcileAt) ||
+		(sess.FinishedAt != nil && sess.FinishedAt.After(*sess.LastTerminalReconcileAt)) {
+		return true
+	}
+	return now.Sub(*sess.LastTerminalReconcileAt) >= terminalReconcileInterval
+}
+
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
 	// Fetch open PRs once for the whole check cycle (shared per-cycle, #794)
@@ -3573,8 +4267,22 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	}
 
 	for slotName, sess := range s.Sessions {
+		// NextRetryAt is meaningful only while a dead session is queued for an
+		// in-place respawn. A pr_open session already owns its canonical PR and
+		// has no pending process start; retaining an expired retry marker there
+		// makes Fleet report a contradictory "open PR + overdue retry" state and
+		// can survive daemon restarts indefinitely. Normalize legacy/racy state
+		// before any remote reconciliation so the durable store self-heals.
+		if sess.Status == state.StatusPROpen && sess.NextRetryAt != nil {
+			log.Printf("[orch] clearing stale retry marker for pr_open session %s / PR #%d", slotName, sess.PRNumber)
+			sess.NextRetryAt = nil
+		}
 		switch sess.Status {
 		case state.StatusDone, state.StatusCodeLanded, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
+			now := time.Now().UTC()
+			remoteReconcileDue := terminalReconcileDue(sess, now)
+			remoteReconcileSucceeded := false
+			remoteReconcileFailed := false
 			if sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded && prErr == nil {
 				if pr, found := branchToPR[sess.Branch]; found {
 					// #556: when a retry-exhausted session has already been
@@ -3605,7 +4313,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					if sess.Status == state.StatusDead && sess.NextRetryAt != nil {
 						continue
 					}
-					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] session %s %s->pr_open (PR #%d now open for branch %q)", slotName, sess.Status, pr.Number, sess.Branch)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -3619,18 +4326,40 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					continue
 				}
 			}
+			// A completed PR keeps a terminal-reconciliation issue lease while the
+			// linked issue is still open, closing the merge->close redispatch gap.
+			// Once the forge proves the issue closed, release that lease so Fleet
+			// diagnostics do not retain a permanent active claim. A later explicit
+			// issue reopen is then eligible by design.
+			if remoteReconcileDue && sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && !sess.ReleasedForRedispatch {
+				closed, err := o.isIssueClosed(sess.IssueNumber)
+				if err != nil {
+					remoteReconcileFailed = true
+					log.Printf("[orch] terminal claim check for issue #%d / PR #%d: %v", sess.IssueNumber, sess.PRNumber, err)
+				} else {
+					remoteReconcileSucceeded = true
+					if closed {
+						sess.ReleasedForRedispatch = true
+						log.Printf("[orch] terminal claim reconciled for issue #%d / PR #%d on %s: issue is closed", sess.IssueNumber, sess.PRNumber, slotName)
+					}
+				}
+			}
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
 			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).
-			if sess.Status != state.StatusDone {
+			if remoteReconcileDue && sess.Status != state.StatusDone {
 				done := false
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
+					remoteReconcileFailed = true
 					log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
-				} else if closed {
-					if o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-						log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-						done = true
+				} else {
+					remoteReconcileSucceeded = true
+					if closed {
+						if o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
+							log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+							done = true
+						}
 					}
 				}
 				if done {
@@ -3644,12 +4373,20 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					merged, err := o.isPRMerged(sess.PRNumber)
 					if err != nil {
+						remoteReconcileFailed = true
 						log.Printf("[orch] check PR #%d merged: %v", sess.PRNumber, err)
-					} else if merged {
-						log.Printf("[orch] PR #%d merged, transitioning zombie session %s from %s to code_landed", sess.PRNumber, slotName, sess.Status)
-						o.markCodeLanded(sess, sess.PRNumber)
+					} else {
+						remoteReconcileSucceeded = true
+						if merged {
+							log.Printf("[orch] PR #%d merged, transitioning zombie session %s from %s to code_landed", sess.PRNumber, slotName, sess.Status)
+							o.markCodeLanded(sess, sess.PRNumber)
+						}
 					}
 				}
+			}
+			if remoteReconcileSucceeded && !remoteReconcileFailed {
+				checkedAt := time.Now().UTC()
+				sess.LastTerminalReconcileAt = &checkedAt
 			}
 			// Terminal states — cleanup old worktrees after 1h
 			// Use StartedAt as fallback when FinishedAt is nil (orphaned sessions)
@@ -3658,6 +4395,15 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
 			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
+					dirty, dirtyErr := worker.WorktreeDirty(sess.Worktree)
+					if dirtyErr != nil {
+						log.Printf("[orch] refusing stale-worktree cleanup for %s: could not prove worktree clean: %v", slotName, dirtyErr)
+						continue
+					}
+					if dirty {
+						log.Printf("[orch] preserving stale worktree for %s: uncommitted work requires in-place recovery", slotName)
+						continue
+					}
 					if sess.FinishedAt != nil {
 						log.Printf("[orch] cleaning up stale worktree for %s (finished %s ago)", slotName, time.Since(*sess.FinishedAt).Round(time.Minute))
 					} else {
@@ -3693,6 +4439,11 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 		// Check if issue is now closed (only for running sessions)
 		if sess.Status == state.StatusRunning {
+			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+				o.runAfterRunHook(sess)
+				o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+				continue
+			}
 			closed, err := o.isIssueClosed(sess.IssueNumber)
 			if err != nil {
 				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
@@ -3725,7 +4476,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
-					o.ensureAttributionTrailerOnBranch(slotName, sess)
 					log.Printf("[orch] worker %s exited but PR #%d is open — transitioning to pr_open", slotName, pr.Number)
 					sess.Status = state.StatusPROpen
 					sess.PRNumber = pr.Number
@@ -3777,7 +4527,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 					}
 					promptBase := o.selectPrompt(issue)
-					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
+					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
 						log.Printf("[orch] fallback respawn worker %s with %s: %v — marking as failed", slotName, nextBackend, err)
 						sess.Status = state.StatusFailed
 						now := time.Now().UTC()
@@ -3790,7 +4540,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) rate-limited on %s, switched to %s",
 						slotName, sess.IssueNumber, previousBackend, nextBackend)
-				} else if hit, reason, pattern := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
+				} else if failure, hit := o.classifyBackendFailure(sess, time.Now().UTC()); hit {
 					// Hard backend failure: a credential outage (#693, claude
 					// CLI "Failed to authenticate. API Error: 401") or a model
 					// that is unavailable / no longer accessible (#713, "It may
@@ -3801,24 +4551,24 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					// budget intact, and respawn the same attempt on the next
 					// fallback backend. The gating reason picks the operator copy.
 					now := time.Now().UTC()
-					cp := backendFailureCopyFor(reason)
+					cp := backendFailureCopyFor(failure.reason)
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
-					o.recordBackendFailure(s, slotName, sess, reason, pattern, now)
+					o.recordBackendFailure(s, slotName, sess, failure, now)
 					selection := o.selectBackendFallback(s, sess, now, cp.selectionReason)
 					sess.BackendSelection = &selection
 					nextBackend := selection.SelectedBackend
 					if nextBackend == "" {
-						log.Printf("[orch] worker %s (backend=%s) %s (%s); no fallback backend available", slotName, sess.Backend, cp.noun, pattern)
+						log.Printf("[orch] worker %s (backend=%s) %s (%s); no fallback backend available", slotName, sess.Backend, cp.noun, failure.pattern)
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = cp.displayToken
 						sess.FinishedAt = &now
 						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
-							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, cp.desc, pattern, cp.remedy)
+							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, cp.desc, failure.pattern, cp.remedy)
 						continue
 					}
 					log.Printf("[orch] worker %s (backend=%s) %s (%s), falling back to %s — retry budget preserved",
-						slotName, sess.Backend, cp.desc, pattern, nextBackend)
+						slotName, sess.Backend, cp.desc, failure.pattern, nextBackend)
 
 					issue, err := o.getIssue(sess.IssueNumber)
 					if err != nil {
@@ -3837,7 +4587,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 					}
 					promptBase := o.selectPrompt(issue)
-					if err := o.respawnWorker(slotName, sess, issue, promptBase, nextBackend); err != nil {
+					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
 						log.Printf("[orch] %s fallback respawn worker %s with %s: %v — marking as dead (%s)", cp.noun, slotName, nextBackend, err, cp.displayToken)
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = cp.displayToken
@@ -3849,7 +4599,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) backend %s %s (%s), switched to %s — retry budget preserved",
-						slotName, sess.IssueNumber, previousBackend, cp.desc, pattern, nextBackend)
+						slotName, sess.IssueNumber, previousBackend, cp.desc, failure.pattern, nextBackend)
 				} else if o.canRetryIssue(s, sess) {
 					// Schedule retry with exponential backoff (respects max_retries_per_issue)
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
@@ -3962,7 +4712,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									sess.TriedBackends = append(sess.TriedBackends, previousBackend)
 								}
 								promptBase := o.selectPrompt(issue)
-								if respawnErr := o.respawnWorker(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
+								if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
 									log.Printf("[orch] rate-limit fallback respawn %s: %v — marking dead", slotName, respawnErr)
 									sess.Status = state.StatusDead
 									sess.LastNotifiedStatus = "rate_limit"
@@ -4031,20 +4781,21 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Token limit enforcement ---
-					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt > o.cfg.WorkerMaxTokens && sess.LastNotifiedStatus != "token_limit" {
-						log.Printf("[orch] worker %s exceeded token limit (%d > %d), killing",
+					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt >= o.cfg.WorkerMaxTokens && sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+						log.Printf("[orch] worker %s reached token limit (%d >= %d), killing",
 							slotName, sess.TokensUsedAttempt, o.cfg.WorkerMaxTokens)
 						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
 						}
 						now := time.Now().UTC()
-						sess.Status = state.StatusDead
-						sess.LastNotifiedStatus = "token_limit"
-						sess.FinishedAt = &now
-						state.MarkWorkerEnded(sess, now)
-						o.notifier.Sendf("⚠️ Worker %s (issue #%d) exceeded token limit: %s tokens used (attempt), %s total",
-							slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(sess.TokensUsedTotal))
+						o.markTokenBudgetExceeded(slotName, sess, worker.TokenBudgetMarker{
+							Outcome:        worker.TokenBudgetExceededOutcome,
+							Backend:        sess.Backend,
+							TokensObserved: sess.TokensUsedAttempt,
+							MaxTokens:      o.cfg.WorkerMaxTokens,
+							MeasuredAt:     now,
+						}, now)
 						continue
 					}
 
@@ -4137,6 +4888,21 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		numberToPR[pr.Number] = pr
 	}
 
+	// A session previously marked done from a disappearing branch can
+	// contradict the authoritative open-PR snapshot (live #949: a closed
+	// duplicate PR hid an older canonical draft). Rebind only when exactly one
+	// open PR references the issue. Multiple candidates are ambiguous and must
+	// remain untouched; choosing one would manufacture a new canonical identity.
+	o.reconcileTerminalSessionsWithOpenPRs(s, prs)
+	// One open PR is one maintenance/merge lifecycle even when a continuation
+	// issue and its historical source issue both retain exact session records.
+	// Gate side effects (CI retry accounting, review repair, rebase, merge) must
+	// run through one deterministic owner. Without this, a red head can be
+	// observed twice: the current continuation safely defers while its branch is
+	// moving, then an older session consumes retry budget and becomes
+	// retry_exhausted for the same PR (OK Player #388 / issues #345 and #406).
+	mergeOwners := canonicalMergeFlowOwners(s, branchToPR, numberToPR)
+
 	type mergeCandidate struct {
 		slotName string
 		sess     *state.Session
@@ -4154,6 +4920,22 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if !found {
 			if sess.Status == state.StatusRetryExhausted {
 				if sess.PRNumber == 0 {
+					// A no-PR terminal sibling is not an issue-level blocker when
+					// another open PR already owns the issue. In particular, it must
+					// not apply the blocked label behind the canonical PR's back.
+					// Preserve the sibling for commit handoff and let the canonical
+					// PR maintenance path converge in place.
+					canonicalOpen := false
+					for _, openPR := range prs {
+						if github.PRReferencesIssue(openPR, sess.IssueNumber) {
+							canonicalOpen = true
+							break
+						}
+					}
+					if canonicalOpen {
+						log.Printf("[orch] no-PR retry_exhausted session %s for issue #%d is superseded by an open canonical PR — preserving sibling work without blocking the issue", slotName, sess.IssueNumber)
+						continue
+					}
 					// #577: worker exhausted retries without ever producing a PR
 					// (e.g. the issue was already implemented by a prior merge via
 					// `Refs #N`, so the worker found zero diff). Without action the
@@ -4174,7 +4956,29 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				o.reconcileClosedPRRetryExhausted(s, slotName, sess)
 				continue
 			}
-			log.Printf("[orch] no open PR found for branch %s (slot %s) — assuming merged/closed", sess.Branch, slotName)
+			merged := false
+			var mergedErr error
+			if sess.PRNumber > 0 {
+				merged, mergedErr = o.isPRMerged(sess.PRNumber)
+			} else {
+				merged, mergedErr = o.hasMergedPRForIssue(sess.IssueNumber)
+			}
+			if mergedErr != nil {
+				log.Printf("[orch] no open PR found for branch %s (slot %s), but merge state is unavailable: %v — preserving session for retry", sess.Branch, slotName, mergedErr)
+				continue
+			}
+			if !merged {
+				closed, closedErr := o.isIssueClosed(sess.IssueNumber)
+				if closedErr != nil {
+					log.Printf("[orch] no open PR found for branch %s (slot %s), but issue state is unavailable: %v — preserving session for retry", sess.Branch, slotName, closedErr)
+					continue
+				}
+				if !closed {
+					o.releaseClosedUnmergedSession(sess, slotName)
+					continue
+				}
+			}
+			log.Printf("[orch] no open PR found for branch %s (slot %s) — authoritative merge/closed outcome confirmed", sess.Branch, slotName)
 			if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("PR for branch %s is no longer open", sess.Branch)) {
 				if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					o.markCodeLanded(sess, sess.PRNumber)
@@ -4187,22 +4991,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			state.MarkWorkerEnded(sess, now)
 			continue
 		}
+		if owner := mergeOwners[pr.Number]; owner != "" && owner != slotName {
+			log.Printf("[orch] PR #%d lifecycle is owned by canonical session %s; skipping historical session %s", pr.Number, owner, slotName)
+			continue
+		}
 
 		if sess.PRNumber == 0 {
 			sess.PRNumber = pr.Number
 		}
-		if o.ensureAttributionTrailerOnBranch(slotName, sess) {
-			// The attribution amend deferred because the branch is still moving
-			// under a concurrent worker/operator push. Do NOT let this PR reach
-			// the merge decision this cycle: merging now would land it without
-			// the durable Maestro-Backend trailer, and the deferral's "retry next
-			// cycle" would then have nothing left to amend. Skip it; a later quiet
-			// cycle stamps the trailer and this PR becomes merge-eligible (#858).
-			// ensureAttributionTrailerOnBranch already logged the concise defer
-			// line, so no extra journal noise here.
-			continue
-		}
-
 		// #705: opt-in visual evidence for UI-affecting PRs. One-shot,
 		// advisory — posts a warning comment when evidence is missing but
 		// never blocks or delays the merge flow below.
@@ -4211,32 +5007,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		// Check the actual current head plus its aggregate and per-check rollup.
 		// The normalized rollup remains the merge gate; the durable snapshot below
 		// additionally hashes individual check transitions (#887).
-		ciRollup, err := o.prCheckRollup(pr.Number)
+		_, ciStatus, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
 		if err != nil {
 			log.Printf("[orch] CI status for PR #%d: %v", pr.Number, err)
 			continue
 		}
-		ciStatus := ciRollup.Verdict
-
-		// #424: the aggregate PRCIStatus can stick at "pending" long after
-		// every required check has gone green (a common cause is a legacy
-		// commit-status used by some review bots that never resolves).
-		// GitHub's own per-PR mergeable_state already encodes the
-		// required-check verdict, so "clean" or "unstable" overrides the
-		// stale aggregate and lets autoMergePRs converge instead of looping.
-		if ciStatus == "pending" {
-			if mergeable, mergeState, mErr := o.prMergeStatus(pr.Number); mErr == nil && mergeable == "MERGEABLE" {
-				switch mergeState {
-				case "clean", "unstable":
-					log.Printf("[orch] PR #%d (%s) aggregate CI=pending but mergeable_state=%s — treating as success (#424)", pr.Number, sess.Branch, mergeState)
-					ciStatus = "success"
-				}
-			}
-		}
-
-		log.Printf("[orch] PR #%d (%s) CI=%s", pr.Number, sess.Branch, ciStatus)
-		gateTransition, gateObservable := o.prGateTransitionForCI(sess, pr, ciRollup, ciStatus)
-		observedAt := time.Now().UTC()
 		persistGate := func() {
 			if gateObservable {
 				o.persistPRGateTransition(s, gateTransition, observedAt)
@@ -4253,7 +5028,24 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			sess.NotifiedCIFail = false // backward compat
 
-			if o.cfg.AutoRetryReviewFeedback {
+			// The configured review gate is authoritative. In particular, a
+			// successful Greptile check means "ok to merge" (4/5 or 5/5) even
+			// when the review left advisory inline findings. The old ordering
+			// collected P1 comments first and scheduled a repair before reading
+			// the successful gate, producing the contradictory
+			// greptile_not_approved/retry_exhausted state seen on OK Player #361.
+			// Read the verdict first and only feed comments to a repair worker
+			// when the configured gate itself has not passed.
+			var currentReviewVerdict *github.ReviewGateVerdict
+			if o.reviewGate() != "none" {
+				verdict, reviewErr := o.prReviewGateVerdict(pr.Number)
+				if reviewErr == nil {
+					currentReviewVerdict = &verdict
+				}
+			}
+
+			if o.cfg.AutoRetryReviewFeedback &&
+				(currentReviewVerdict == nil || currentReviewVerdict.Pending || !currentReviewVerdict.Passed) {
 				reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
 				if err != nil {
 					log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
@@ -4301,11 +5093,17 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue
 			}
 
-			reviewVerdict, err := o.prReviewGateVerdict(pr.Number)
-			if err != nil {
-				log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
-				persistGate()
-				continue // skip this cycle, try next
+			var reviewVerdict github.ReviewGateVerdict
+			if currentReviewVerdict != nil {
+				reviewVerdict = *currentReviewVerdict
+			} else {
+				var err error
+				reviewVerdict, err = o.prReviewGateVerdict(pr.Number)
+				if err != nil {
+					log.Printf("[orch] review gate check PR #%d: %v", pr.Number, err)
+					persistGate()
+					continue // skip this cycle, try next
+				}
 			}
 			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
 				persistGate()
@@ -4328,14 +5126,21 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 		case "failure":
 			persistGate()
+			// A failed rollup is actionable only for the exact head that was
+			// observed. Attribution stamping, an operator push, or another repair
+			// can advance the branch between listOpenPRsForCycle and this decision.
+			// Success/review paths already re-check this identity before mutating;
+			// failure must do the same or an old red head can schedule a repair
+			// after the new head is already pending (OK Player PR #388).
+			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
+				continue
+			}
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}
 			// Auto-retry on CI failure: close the PR, capture CI output, and schedule retry
 			if sess.LastNotifiedStatus != "ci_failure" && sess.LastNotifiedStatus != "ci_retry_exhausted" {
-				sess.NotifiedCIFail = true // backward compat
-
-				o.handleCIFailureRetry(s, slotName, sess, pr)
+				o.handleCIFailureRetry(s, slotName, sess, pr, gateTransition.HeadSHA)
 			}
 		case "pending":
 			persistGate()
@@ -4377,6 +5182,27 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		return
 	}
 
+	// Sequential means one successful merge at a time, not "the oldest
+	// unmergeable PR blocks the fleet". Freshly preflight candidates and remove
+	// real conflicts before selecting the single merge slot. Conflict repair is
+	// handled against the existing session/worktree by the rebase/repair paths;
+	// skipping it here prevents a failed merge attempt from consuming this
+	// cycle's head-of-line position and lets a younger clean PR advance.
+	mergeableReady := ready[:0]
+	for _, candidate := range ready {
+		mergeable, mergeState, err := o.prMergeStatus(candidate.pr.Number)
+		if err == nil && mergeable == "CONFLICTING" {
+			log.Printf("[orch] sequential merge mode: PR #%d is %s/CONFLICTING — skipping merge slot and leaving canonical session %s for in-place conflict repair",
+				candidate.pr.Number, mergeState, candidate.slotName)
+			continue
+		}
+		mergeableReady = append(mergeableReady, candidate)
+	}
+	ready = mergeableReady
+	if len(ready) == 0 {
+		return
+	}
+
 	interval := o.mergeInterval()
 	if !s.LastMergeAt.IsZero() {
 		sinceLastMerge := time.Since(s.LastMergeAt)
@@ -4391,6 +5217,222 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
+}
+
+func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs []github.PR) {
+	if s == nil || len(prs) == 0 {
+		return
+	}
+	prsByIssue := make(map[int][]github.PR)
+	for _, pr := range prs {
+		for _, sess := range s.Sessions {
+			if sess == nil || sess.IssueNumber <= 0 || !github.PRReferencesIssue(pr, sess.IssueNumber) {
+				continue
+			}
+			already := false
+			for _, known := range prsByIssue[sess.IssueNumber] {
+				if known.Number == pr.Number {
+					already = true
+					break
+				}
+			}
+			if !already {
+				prsByIssue[sess.IssueNumber] = append(prsByIssue[sess.IssueNumber], pr)
+			}
+		}
+	}
+
+	for issue, matches := range prsByIssue {
+		if len(matches) != 1 {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d: %d open PRs reference the issue; canonical identity is ambiguous", issue, len(matches))
+			continue
+		}
+		canonical := matches[0]
+		var allSlots, exactSlots []string
+		activeOther := ""
+		for _, slotName := range sortedStateSessionNames(s) {
+			sess := s.Sessions[slotName]
+			if sess == nil || sess.IssueNumber != issue {
+				continue
+			}
+			allSlots = append(allSlots, slotName)
+			if repairIssueSessionActive(sess.Status) || (sess.PRNumber == canonical.Number && sess.Status == state.StatusRetryExhausted) {
+				activeOther = slotName
+			}
+			if terminalOpenPRAdoptionCandidate(sess) &&
+				(sess.PRNumber == canonical.Number || sess.LastClosedPRNumber == canonical.Number || sess.Branch == canonical.HeadRefName) {
+				exactSlots = append(exactSlots, slotName)
+			}
+		}
+		if activeOther != "" {
+			// Never activate a second session while another issue-level lease is
+			// live, even if the open PR points at an older canonical branch. The
+			// active canonical session still needs a durable handoff from terminal
+			// sibling branches, however: otherwise work preserved by a duplicate
+			// worker remains invisible once the canonical PR is reattached.
+			active := s.Sessions[activeOther]
+			if active != nil && (active.PRNumber == canonical.Number || active.Branch == canonical.HeadRefName) {
+				o.attachPreservedSiblingHandoffs(s, issue, activeOther, active, canonical, allSlots)
+			}
+			continue
+		}
+
+		candidateSlot := ""
+		switch {
+		case len(exactSlots) == 1:
+			candidateSlot = exactSlots[0]
+		case len(exactSlots) > 1:
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / PR #%d: %d terminal sessions claim the canonical identity", issue, canonical.Number, len(exactSlots))
+			continue
+		case len(allSlots) == 1:
+			candidateSlot = allSlots[0]
+		default:
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / PR #%d: no exact session among %d historical sessions", issue, canonical.Number, len(allSlots))
+			continue
+		}
+		sess := s.Sessions[candidateSlot]
+		if !terminalOpenPRAdoptionCandidate(sess) {
+			continue
+		}
+		merged := false
+		var err error
+		if sess.PRNumber > 0 && sess.PRNumber != canonical.Number {
+			merged, err = o.isPRMerged(sess.PRNumber)
+		} else if sess.PRNumber == 0 && sess.LastClosedPRNumber > 0 && sess.LastClosedPRNumber != canonical.Number {
+			merged, err = o.isPRMerged(sess.LastClosedPRNumber)
+		} else if sess.PRNumber == 0 && sess.LastClosedPRNumber == 0 {
+			merged, err = o.hasMergedPRForIssue(sess.IssueNumber)
+		}
+		if err != nil {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: authoritative merge state unavailable: %v", sess.IssueNumber, candidateSlot, err)
+			continue
+		}
+		if merged {
+			continue
+		}
+		closed, err := o.isIssueClosed(sess.IssueNumber)
+		if err != nil {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: authoritative issue state unavailable: %v", sess.IssueNumber, candidateSlot, err)
+			continue
+		}
+		if closed {
+			continue
+		}
+		// A retained terminal worktree may still be checked out on the closed
+		// duplicate branch. Metadata alone cannot adopt the canonical PR because
+		// RespawnInPlace deliberately preserves the existing checkout. Reattach a
+		// clean worktree first and fail closed on dirty/mismatched state so no work
+		// is lost or accidentally pushed to the wrong PR.
+		if strings.TrimSpace(sess.Worktree) != "" {
+			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
+				if err := worker.EnsureWorktreeBranch(sess.Worktree, canonical.HeadRefName); err != nil {
+					log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: canonical worktree reattach failed: %v", sess.IssueNumber, candidateSlot, err)
+					continue
+				}
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: stat retained worktree: %v", sess.IssueNumber, candidateSlot, statErr)
+				continue
+			}
+		}
+		oldPR := sess.PRNumber
+		if oldPR > 0 && oldPR != canonical.Number {
+			sess.LastClosedPRNumber = oldPR
+		}
+		sess.PRNumber = canonical.Number
+		sess.Branch = canonical.HeadRefName
+		sess.Status = state.StatusPROpen
+		sess.FinishedAt = nil
+		sess.ReleasedForRedispatch = false
+		o.attachPreservedSiblingHandoffs(s, issue, candidateSlot, sess, canonical, allSlots)
+		log.Printf("[orch] reconciled terminal session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", candidateSlot, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
+	}
+}
+
+// terminalOpenPRAdoptionCandidate reports whether authoritative GitHub state
+// may rebind this non-running session to the sole open PR that references its
+// issue. An unscheduled dead session is eligible: the worker may have pushed to
+// an existing PR branch that differs from the synthetic session branch before
+// exiting. A dead session with NextRetryAt is deliberately excluded because it
+// still owns a pending in-place retry; flipping it to pr_open would consume the
+// retry without running the repair (#758).
+func terminalOpenPRAdoptionCandidate(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	switch sess.Status {
+	case state.StatusDone, state.StatusFailed:
+		return true
+	case state.StatusDead:
+		return sess.NextRetryAt == nil
+	default:
+		return false
+	}
+}
+
+func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int, canonicalSlot string, canonicalSession *state.Session, canonical github.PR, allSlots []string) {
+	if o.cfg == nil || strings.TrimSpace(o.cfg.LocalPath) == "" || canonicalSession == nil {
+		return
+	}
+	var handoffs []string
+	var released []string
+	for _, siblingSlot := range allSlots {
+		if siblingSlot == canonicalSlot {
+			continue
+		}
+		sibling := s.Sessions[siblingSlot]
+		if sibling == nil || repairIssueSessionActive(sibling.Status) || strings.TrimSpace(sibling.Branch) == "" || sibling.Branch == canonical.HeadRefName {
+			continue
+		}
+		commits, err := worker.UniqueBranchCommits(o.cfg.LocalPath, canonical.HeadRefName, sibling.Branch)
+		if err != nil {
+			log.Printf("[orch] terminal/open-PR reconcile: could not inspect preserved sibling branch %s for issue #%d: %v", sibling.Branch, issue, err)
+			continue
+		}
+		if len(commits) > 0 {
+			handoff := fmt.Sprintf("- session %s branch `%s`: unique commits `%s`", siblingSlot, sibling.Branch, strings.Join(commits, "`, `"))
+			if !strings.Contains(canonicalSession.PreviousAttemptFeedback, handoff) {
+				handoffs = append(handoffs, handoff)
+			}
+		}
+		// A successful patch-equivalence comparison proves that every durable
+		// sibling change is either already canonical or represented by the exact
+		// commit handoff above. Release only the sibling's dispatcher claim; keep
+		// its branch/worktree intact for forensics and recovery. Without this,
+		// the preserved worktree itself blocks the canonical repair forever.
+		sibling.ReleasedForRedispatch = true
+		sibling.WorkerOutcome = "duplicate_dispatch_reconciled"
+		released = append(released, siblingSlot)
+	}
+	if len(handoffs) > 0 {
+		handoff := strings.Join(handoffs, "\n")
+		if strings.TrimSpace(canonicalSession.PreviousAttemptFeedback) == "" {
+			canonicalSession.PreviousAttemptFeedback = handoff
+			canonicalSession.PreviousAttemptFeedbackKind = "recovery_handoff"
+		} else {
+			canonicalSession.PreviousAttemptFeedback += "\n\nPreserved sibling work:\n" + handoff
+		}
+		log.Printf("[orch] attached preserved sibling commit handoff to canonical session %s for issue #%d / PR #%d", canonicalSlot, issue, canonical.Number)
+	}
+	if len(released) > 0 {
+		log.Printf("[orch] released reconciled sibling claim(s) %s behind canonical session %s for issue #%d / PR #%d", strings.Join(released, ","), canonicalSlot, issue, canonical.Number)
+	}
+}
+
+func (o *Orchestrator) releaseClosedUnmergedSession(sess *state.Session, slotName string) {
+	if sess == nil {
+		return
+	}
+	now := time.Now().UTC()
+	oldPR := sess.PRNumber
+	if oldPR > 0 {
+		sess.LastClosedPRNumber = oldPR
+	}
+	sess.PRNumber = 0
+	sess.Status = state.StatusFailed
+	sess.ReleasedForRedispatch = true
+	sess.FinishedAt = &now
+	state.MarkWorkerEnded(sess, now)
+	log.Printf("[orch] PR #%d for issue #%d / session %s closed without merge while issue remains open — released for truthful redispatch", oldPR, sess.IssueNumber, slotName)
 }
 
 // greptileRetriggerComment is the PR comment that asks Greptile to (re)run
@@ -4479,6 +5521,68 @@ func mergeFlowEligibleStatus(sess *state.Session) bool {
 	default:
 		return false
 	}
+}
+
+// canonicalMergeFlowOwners elects exactly one session for each open PR before
+// autoMergePRs performs any gate mutation. The ordering deliberately matches
+// supervisor/watchdog PR ownership: a live worker wins; otherwise the newest
+// unresolved session wins, with stable tie-breaking. Keeping this election
+// local to the current open-PR snapshot also means a closed/merged PR is left
+// to terminal reconciliation rather than retaining a synthetic owner.
+func canonicalMergeFlowOwners(s *state.State, byBranch map[string]github.PR, byNumber map[int]github.PR) map[int]string {
+	owners := make(map[int]string)
+	if s == nil {
+		return owners
+	}
+	for _, slot := range sortedStateSessionNames(s) {
+		sess := s.Sessions[slot]
+		if !mergeFlowOwnerEligibleStatus(sess) {
+			continue
+		}
+		pr, found := mergeFlowPRForSession(sess, byBranch, byNumber)
+		if !found {
+			continue
+		}
+		currentSlot, exists := owners[pr.Number]
+		if !exists || mergeFlowOwnerPrecedes(slot, sess, currentSlot, s.Sessions[currentSlot]) {
+			owners[pr.Number] = slot
+		}
+	}
+	return owners
+}
+
+func mergeFlowOwnerEligibleStatus(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	switch sess.Status {
+	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusDead,
+		state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return sess.PRNumber > 0 || strings.TrimSpace(sess.Branch) != ""
+	default:
+		return false
+	}
+}
+
+func mergeFlowOwnerPrecedes(candidateSlot string, candidate *state.Session, currentSlot string, current *state.Session) bool {
+	if candidate == nil {
+		return false
+	}
+	candidateLive := candidate.Status == state.StatusRunning && candidate.PID > 0
+	currentLive := current != nil && current.Status == state.StatusRunning && current.PID > 0
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	if current == nil || candidate.StartedAt.After(current.StartedAt) {
+		return true
+	}
+	if current.StartedAt.After(candidate.StartedAt) {
+		return false
+	}
+	if candidate.Status != current.Status {
+		return candidate.Status == state.StatusQueued
+	}
+	return candidateSlot < currentSlot
 }
 
 // isSettledRetryExhausted reports whether a session has already been marked
@@ -4845,13 +5949,22 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.MaintenanceRetryCount, maxRetries, backoffMs/1000)
 }
 
-// handleCIFailureRetry closes the failed PR, captures CI output, cleans up,
-// and schedules a retry for the worker (respecting max_retries_per_issue).
-func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, sess *state.Session, pr github.PR) {
+// handleCIFailureRetry captures the failed checks and schedules an in-place
+// repair on the same slot/worktree/branch/PR. A red check is not a reason to
+// destroy canonical identity: closing the PR and clearing its session lease
+// let the ready issue dispatch a second worker before the retry completed
+// (live #949 / OK Player #346).
+func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, sess *state.Session, pr github.PR, expectedHead string) {
 	maxRetries := o.cfg.MaxRetriesPerIssue
 	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
 
 	if maxRetries > 0 && totalAttempts >= maxRetries {
+		// Exhaustion is also a mutation of the exact PR lifecycle. Never mark a
+		// newer head retry-exhausted from an obsolete failed rollup.
+		if strings.TrimSpace(expectedHead) != "" && !o.prGateHeadMatches(pr.Number, expectedHead) {
+			return
+		}
+		sess.NotifiedCIFail = true // backward compat
 		log.Printf("[orch] CI failure on PR #%d — retry limit reached (%d/%d) for issue #%d",
 			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
 		alreadyNotified := sess.LastNotifiedStatus == "ci_retry_exhausted"
@@ -4871,14 +5984,14 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		return
 	}
 
-	// Capture CI failure output before closing the PR
+	// Capture CI failure output while the failed head is still authoritative.
 	ciOutput, err := o.prChecksOutput(pr.Number)
 	if err != nil {
 		log.Printf("[orch] warn: could not capture CI output for PR #%d: %v", pr.Number, err)
 		ciOutput = "(CI output unavailable)"
 	}
 
-	// Collect Greptile review feedback before closing the PR
+	// Collect review feedback for the same in-place repair prompt.
 	reviewFeedback, err := o.collectPRReviewFeedback(pr.Number)
 	if err != nil {
 		log.Printf("[orch] warn: could not collect review feedback for PR #%d: %v", pr.Number, err)
@@ -4888,23 +6001,32 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	// takes — its failure conclusion makes the aggregate CI verdict "failure".
 	// CIFailureOutput above is only the bare checks overview (name + state); the
 	// concrete `##[error]` annotation lines that say WHY the check failed live
-	// here. Capture them before closing the PR so the retry worker sees the
+	// here. Capture them while the failed head is authoritative so the retry worker sees the
 	// exact lint constraint its previous push broke, not just "agent-lint
 	// failed" — this was the observed PR #850 blindness.
 	failingCheckContext := o.collectFailingCheckContext(pr.Number)
 
-	// Close the failed PR with an explanation
-	closeComment := fmt.Sprintf("CI failed — maestro is closing this PR and respawning a new worker to retry (attempt %d).\n\nCI output:\n```\n%s\n```",
-		sess.RetryCount+1, ciOutput)
-	if err := o.closePR(pr.Number, closeComment); err != nil {
-		log.Printf("[orch] warn: could not close PR #%d: %v — skipping retry", pr.Number, err)
+	// The reads above can take seconds. A worker/operator push in that window
+	// invalidates every captured failure/review excerpt just as surely as a push
+	// before the caller's first head check. Re-check immediately before the first
+	// durable session mutation; the next cycle will observe the new head and
+	// decide from its own rollup instead of repairing stale evidence.
+	if strings.TrimSpace(expectedHead) != "" && !o.prGateHeadMatches(pr.Number, expectedHead) {
 		return
 	}
-	log.Printf("[orch] closed PR #%d due to CI failure", pr.Number)
+	sess.NotifiedCIFail = true // backward compat
 
-	// Clean up the worktree
-	o.stopWorker(slotName, sess)
-	sess.Worktree = ""
+	// Preserve the exact PR lease. Cleanup may already have cleared the
+	// worktree field on a terminal transition; record only the deterministic
+	// same-slot path so respawnPreservingWorktreeWithConfig can restore the
+	// retained local branch without allocating a new slot or branch.
+	sess.PRNumber = pr.Number
+	if strings.TrimSpace(sess.Branch) == "" {
+		sess.Branch = pr.HeadRefName
+	}
+	if strings.TrimSpace(sess.Worktree) == "" && strings.TrimSpace(o.cfg.WorktreeBase) != "" {
+		sess.Worktree = filepath.Join(o.cfg.WorktreeBase, slotName)
+	}
 
 	// Store CI failure output and review feedback for the next worker
 	sess.CIFailureOutput = ciOutput
@@ -4916,23 +6038,21 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 		sess.PreviousAttemptFeedbackKind = ""
 	}
 
-	// Schedule retry with exponential backoff. Remember which PR this retry
-	// closed (#800): if an operator reopens and merges it while the backoff
-	// runs, the pre-respawn staleness check cancels the retry.
+	// Schedule the same-session repair with exponential backoff. The open PR
+	// remains the issue-level lease throughout the wait, so ordinary dispatch
+	// cannot race the repair with a fresh worker.
 	sess.RetryCount++
 	backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 	retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 	sess.NextRetryAt = &retryAt
 	sess.Status = state.StatusDead
-	sess.LastClosedPRNumber = pr.Number
-	sess.PRNumber = 0
 	now := time.Now().UTC()
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
 
-	log.Printf("[orch] CI failure on PR #%d — scheduling retry %d in %dms for issue #%d",
-		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber)
-	o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), retry %d scheduled in %ds",
+	log.Printf("[orch] CI failure on PR #%d — scheduling in-place retry %d in %dms for issue #%d on session %s",
+		pr.Number, sess.RetryCount, backoffMs, sess.IssueNumber, slotName)
+	o.notifier.Sendf("🔄 maestro: CI failed on PR #%d (issue #%d: %s), in-place retry %d scheduled in %ds",
 		pr.Number, sess.IssueNumber, sess.IssueTitle, sess.RetryCount, backoffMs/1000)
 }
 
@@ -5109,6 +6229,38 @@ func (o *Orchestrator) reconcileResolvedRepairApprovals(s *state.State) {
 	}
 }
 
+// reconcileGuardedRepairApprovals retires delayed repair authority when the
+// issue's current labels no longer permit dispatch. This is deliberately a
+// standing pass rather than only a startNewWorkers guard: removing the ready
+// label also removes the issue from the normal candidate list, but must not
+// leave an already-approved repair intent active forever or let it execute
+// after the issue becomes blocked.
+func (o *Orchestrator) reconcileGuardedRepairApprovals(s *state.State) {
+	if o == nil || o.cfg == nil || s == nil {
+		return
+	}
+	numbers := s.ActiveRepairDispatchApprovalIssues()
+	if len(numbers) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	for _, issueNumber := range numbers {
+		issue, err := o.getIssue(issueNumber)
+		if err != nil {
+			log.Printf("[orch] repair-approval guard: issue #%d label check failed; leaving approval active: %v", issueNumber, err)
+			continue
+		}
+		if !github.HasLabel(issue, o.cfg.ExcludeLabels) {
+			continue
+		}
+		reason := fmt.Sprintf("issue #%d has a current excluded label — delayed repair approval/intent is stale", issueNumber)
+		for _, approval := range s.StaleActiveRepairDispatchApprovals(issueNumber, now, reason) {
+			log.Printf("[orch] reconciled guarded repair approval %s for issue #%d: %s", approval.ID, issueNumber, reason)
+			o.mirrorRepairApprovalTerminal(approval.ID, now, reason)
+		}
+	}
+}
+
 // repairApprovalIssueResolved reports whether a spawn_repair_worker approval for
 // issue is moot: its target work reached a terminal state. An active session
 // always takes precedence over an older done session for the same issue, because
@@ -5123,17 +6275,9 @@ func (o *Orchestrator) reconcileResolvedRepairApprovals(s *state.State) {
 // under an operator.
 func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (bool, string) {
 	activeSession := false
-	doneSession := false
-	failedSession := false
 	for _, sess := range s.Sessions {
 		if sess == nil || sess.IssueNumber != issue {
 			continue
-		}
-		if sess.Status == state.StatusDone {
-			doneSession = true
-		}
-		if state.IsTerminal(sess.Status) && sess.Status != state.StatusDone {
-			failedSession = true
 		}
 		if repairIssueSessionActive(sess.Status) {
 			activeSession = true
@@ -5142,9 +6286,6 @@ func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (b
 	if activeSession {
 		return false, ""
 	}
-	if doneSession && !failedSession {
-		return true, fmt.Sprintf("issue #%d resolved (session done) — repair worker moot", issue)
-	}
 	closed, err := o.isIssueClosed(issue)
 	if err != nil {
 		log.Printf("[orch] repair-approval reconcile: issue #%d closed-state check failed; leaving approval pending: %v", issue, err)
@@ -5152,6 +6293,14 @@ func (o *Orchestrator) repairApprovalIssueResolved(s *state.State, issue int) (b
 	}
 	if closed {
 		return true, fmt.Sprintf("issue #%d closed — repair worker moot", issue)
+	}
+	merged, err := o.hasMergedPRForIssue(issue)
+	if err != nil {
+		log.Printf("[orch] repair-approval reconcile: issue #%d merged-PR check failed; leaving approval pending: %v", issue, err)
+		return false, ""
+	}
+	if merged {
+		return true, fmt.Sprintf("issue #%d has an authoritative merged PR — repair worker moot", issue)
 	}
 	return false, ""
 }
@@ -5177,13 +6326,11 @@ func repairIssueSessionActive(status state.SessionStatus) bool {
 // single reconcile path shared by the edge-triggered post-merge/outcome callers
 // and the standing reconciler, so every path journals and persists identically
 // (#866). Returns the number staled.
-// mirrorReviewRepairApprovalTerminal mirrors a review-repair approval's
-// terminal transition (changed-head supersede / post-dispatch consume) into
-// the SQLite approval store when one is configured (#874), matching the
-// spawn_repair_worker reconcile mirror. The JSON state is already the source of
-// truth for dispatch; this keeps the queryable mirror from showing a lingering
-// active approval after the JSON record was superseded.
-func (o *Orchestrator) mirrorReviewRepairApprovalTerminal(id string, now time.Time, reason string) {
+// mirrorRepairApprovalTerminal mirrors a repair approval's terminal transition
+// (changed-head supersede / post-dispatch consume) into the SQLite approval
+// store when one is configured. JSON state remains the dispatch source of truth;
+// this keeps the queryable mirror from showing a lingering active approval.
+func (o *Orchestrator) mirrorRepairApprovalTerminal(id string, now time.Time, reason string) {
 	if o == nil || !o.approvalsBinding.UseSQLite() || strings.TrimSpace(id) == "" {
 		return
 	}
@@ -5192,7 +6339,7 @@ func (o *Orchestrator) mirrorReviewRepairApprovalTerminal(id string, now time.Ti
 	b.Repo = o.repo
 	b.Project = o.repo
 	if err := approvalstore.ReconcileMoot(b, id, now, reason); err != nil {
-		log.Printf("[orch] review-repair approval %s terminal mirror to SQLite failed (JSON already updated, retried next cycle): %v", id, err)
+		log.Printf("[orch] repair approval %s terminal mirror to SQLite failed (JSON already updated, retried next cycle): %v", id, err)
 	}
 }
 
@@ -5253,10 +6400,23 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 	// from closing while the matching delivery is pending or unverified.
 	ready := make([]*state.Session, 0, len(codeLanded))
 	for _, sess := range codeLanded {
+		now := time.Now().UTC()
+		if !terminalReconcileDue(sess, now) {
+			// Delivery execution is mirrored into project state by the shared
+			// executor. Consume an exact verified mirror immediately without
+			// polling GitHub again; unchanged pending/terminal approvals wait for
+			// the bounded authoritative refresh below (#940).
+			if o.reconcileVerifiedDeliveryFromState(s, sess, o.cfg.EffectiveDelivery()) {
+				ready = append(ready, sess)
+			}
+			continue
+		}
 		if !o.codeLandedPRMerged(sess) {
 			continue
 		}
-		o.ensureMergedPRGateSnapshot(s, sess, time.Now().UTC())
+		checkedAt := time.Now().UTC()
+		sess.LastTerminalReconcileAt = &checkedAt
+		o.ensureMergedPRGateSnapshot(s, sess, checkedAt)
 		if !o.reconcileCodeLandedDelivery(s, sess) {
 			o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
 			continue
@@ -5306,6 +6466,9 @@ func (o *Orchestrator) reconcileCodeLandedDelivery(s *state.State, sess *state.S
 	if eff.Mode != config.DeliveryModeApprovalRequired || strings.TrimSpace(eff.Command) == "" {
 		return true
 	}
+	if o.reconcileVerifiedDeliveryFromState(s, sess, eff) {
+		return true
+	}
 	if sess == nil || sess.PRNumber <= 0 {
 		log.Printf("[orch] delivery reconcile held: code_landed session has no PR number to pin")
 		return false
@@ -5322,6 +6485,43 @@ func (o *Orchestrator) reconcileCodeLandedDelivery(s *state.State, sess *state.S
 	if completed == nil || completed.Delivery == nil {
 		log.Printf("[orch] delivery reconcile held for PR #%d: approval %s is %s (verified=%v)",
 			sess.PRNumber, approval.ID, approval.Status, approval.Delivery != nil && approval.Delivery.Verified)
+		return false
+	}
+	return o.recordVerifiedDelivery(s, sess, completed)
+}
+
+// reconcileVerifiedDeliveryFromState consumes the exact verified delivery
+// mirror for a code_landed session without any GitHub or repository read. This
+// keeps approval execution responsive while unchanged historical delivery gates
+// use the bounded terminal reconciliation interval instead of polling the forge
+// every orchestrator cycle (#940).
+func (o *Orchestrator) reconcileVerifiedDeliveryFromState(s *state.State, sess *state.Session, eff config.DeliveryConfig) bool {
+	if eff.Mode != config.DeliveryModeApprovalRequired || strings.TrimSpace(eff.Command) == "" {
+		return true
+	}
+	if s == nil || sess == nil || sess.PRNumber <= 0 {
+		return false
+	}
+	digest := eff.ApprovalDigest()
+	var completed *state.Approval
+	for i := range s.Approvals {
+		candidate := &s.Approvals[i]
+		if candidate.Action != state.ApprovalActionDeployProject || candidate.Status != state.ApprovalStatusExecuted ||
+			candidate.Delivery == nil || !candidate.Delivery.Verified || candidate.Delivery.PR != sess.PRNumber ||
+			!strings.EqualFold(strings.TrimSpace(candidate.Delivery.Repo), strings.TrimSpace(o.cfg.Repo)) ||
+			strings.TrimSpace(candidate.Delivery.Project) != strings.TrimSpace(o.cfg.Repo) ||
+			strings.TrimSpace(candidate.Delivery.ConfigDigest) != strings.TrimSpace(digest) {
+			continue
+		}
+		if completed == nil || state.CompareDeliveryGeneration(completed.Delivery, completed.CreatedAt, candidate.Delivery, candidate.CreatedAt) < 0 {
+			completed = candidate
+		}
+	}
+	return o.recordVerifiedDelivery(s, sess, completed)
+}
+
+func (o *Orchestrator) recordVerifiedDelivery(s *state.State, sess *state.Session, completed *state.Approval) bool {
+	if sess == nil || completed == nil || completed.Delivery == nil || !completed.Delivery.Verified {
 		return false
 	}
 	if sess.DeploymentFinishedAt == nil {
@@ -5494,19 +6694,19 @@ func (o *Orchestrator) mergedPRForDoneLikeSession(sess *state.Session) (int, err
 			return sess.PRNumber, nil
 		}
 	}
+	if sess.LastClosedPRNumber > 0 && sess.LastClosedPRNumber != sess.PRNumber {
+		merged, err := o.isPRMerged(sess.LastClosedPRNumber)
+		if err != nil {
+			return 0, fmt.Errorf("check recorded closed PR #%d: %w", sess.LastClosedPRNumber, err)
+		}
+		if merged {
+			return sess.LastClosedPRNumber, nil
+		}
+	}
 	if branch := strings.TrimSpace(sess.Branch); branch != "" {
 		prNumber, err := o.mergedPRForBranch(branch)
 		if err != nil {
 			return 0, fmt.Errorf("check merged PR for branch %q: %w", branch, err)
-		}
-		if prNumber > 0 {
-			return prNumber, nil
-		}
-	}
-	if sess.IssueNumber > 0 {
-		prNumber, err := o.mergedPRForIssue(sess.IssueNumber)
-		if err != nil {
-			return 0, fmt.Errorf("check merged PR for issue #%d: %w", sess.IssueNumber, err)
 		}
 		if prNumber > 0 {
 			return prNumber, nil
@@ -5560,6 +6760,28 @@ func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session
 	status := outcome.StatusFor(o.cfg.Outcome, donePRs, lastMergeAt, outcomeHealthChecks(s)...)
 	if status.HealthState == outcome.HealthHealthy {
 		return true
+	}
+	// #970: project-wide outcome drift only gates a session that owns a merged
+	// product revision. A closed/cancelled issue with no discoverable merged PR
+	// has nothing left to deploy or live-verify; retaining its prior dead/failed
+	// status forever makes a reconciled issue dominate Fleet operator_state and
+	// hold a resumable-worktree claim indefinitely. The project outcome remains
+	// independently visible and actionable, but this no-delivery session may
+	// become terminal. Conversely, a merged revision discovered only through the
+	// recorded PR/branch link must still enter code_landed and remain held here.
+	if sess != nil {
+		prNumber, err := o.mergedPRForDoneLikeSession(sess)
+		if err != nil {
+			log.Printf("[orch] %s, but merged delivery identity could not be verified while outcome health is %s: %v — holding out of done", trigger, status.HealthState, err)
+			return false
+		}
+		if prNumber <= 0 {
+			log.Printf("[orch] %s with no merged delivery identity; project outcome health is %s but does not keep this session non-terminal", trigger, status.HealthState)
+			return true
+		}
+		if sess.Status != state.StatusCodeLanded || sess.PRNumber != prNumber {
+			o.markCodeLanded(sess, prNumber)
+		}
 	}
 	issue := 0
 	if sess != nil {
@@ -6306,12 +7528,21 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 	}
 
 	branchToPR := make(map[string]github.PR)
+	numberToPR := make(map[int]github.PR)
 	for _, pr := range prs {
 		branchToPR[pr.HeadRefName] = pr
+		numberToPR[pr.Number] = pr
 	}
+	owners := canonicalMergeFlowOwners(s, branchToPR, numberToPR)
 
 	for slotName, sess := range s.Sessions {
-		pr, hasPR := branchToPR[sess.Branch]
+		pr, hasPR := mergeFlowPRForSession(sess, branchToPR, numberToPR)
+		if hasPR {
+			if owner := owners[pr.Number]; owner != "" && owner != slotName {
+				log.Printf("[orch] PR #%d rebase lifecycle is owned by canonical session %s; skipping historical session %s", pr.Number, owner, slotName)
+				continue
+			}
+		}
 
 		switch sess.Status {
 		case state.StatusPROpen:
@@ -6803,6 +8034,12 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 	if s == nil || issueNumber <= 0 {
 		return false
 	}
+	if _, ok := s.ActiveRepairDispatchApproval(issueNumber, supervisor.ActionSpawnRepairWorker); ok {
+		return true
+	}
+	if _, ok := s.ActiveRepairDispatchApproval(issueNumber, supervisor.ActionSpawnReviewRepair); ok {
+		return true
+	}
 	decision := s.LatestSupervisorDecision()
 	if decision == nil {
 		return false
@@ -6823,6 +8060,386 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 		return false
 	}
 	return true
+}
+
+type spawnRepairDispatch struct {
+	target     *state.SupervisorTarget
+	approvalID string
+}
+
+type spawnRepairGateDecision struct {
+	actionable bool
+	stale      bool
+	reason     string
+}
+
+func (o *Orchestrator) resolveSpawnRepairDispatch(s *state.State, issueNumber int) *spawnRepairDispatch {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	if approval, ok := s.ActiveRepairDispatchApproval(issueNumber, supervisor.ActionSpawnRepairWorker); ok {
+		return &spawnRepairDispatch{target: approval.Target, approvalID: approval.ID}
+	}
+	decision := s.LatestSupervisorDecision()
+	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker || decision.Target == nil || decision.Target.Issue != issueNumber {
+		return nil
+	}
+	if decision.RequiresApproval || decision.Risk == supervisor.RiskApprovalGated {
+		return nil
+	}
+	return &spawnRepairDispatch{target: decision.Target}
+}
+
+// dispatchSpawnRepairWorker revalidates the durable issue/session reservation
+// and repairs that exact session. It never allocates a second slot or removes a
+// competing worktree.
+func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Issue, dispatch *spawnRepairDispatch) bool {
+	if s == nil || dispatch == nil || dispatch.target == nil {
+		return false
+	}
+	target := dispatch.target
+	slot := strings.TrimSpace(target.Session)
+	if slot == "" {
+		reason := fmt.Sprintf("issue #%d repair reservation has no target session", issue.Number)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
+		return false
+	}
+	sess, ok := s.SessionAt(slot)
+	if !ok || sess.IssueNumber != issue.Number {
+		reason := fmt.Sprintf("issue #%d reserved session %s is missing or belongs to another issue", issue.Number, slot)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
+		return false
+	}
+	if target.PR > 0 && sess.PRNumber != target.PR {
+		reason := fmt.Sprintf("issue #%d reserved PR #%d no longer matches session %s PR #%d", issue.Number, target.PR, slot, sess.PRNumber)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
+		return false
+	}
+	for _, claim := range s.ActiveIssueClaims() {
+		if claim.IssueNumber != issue.Number || claim.Session == "" || claim.Session == slot {
+			continue
+		}
+		// Approval-derived claims are durable intent, not proof that their
+		// reserved session still exists or remains canonical. Retire an invalid
+		// sibling reservation before comparing it with this valid exact repair;
+		// otherwise lexical claim order can stale both approvals and lose the
+		// one recovery that was still safe to dispatch.
+		seenInvalidApprovals := make(map[string]struct{})
+		for claim.Kind == state.IssueClaimRepairDispatch {
+			claimed, exists := s.SessionAt(claim.Session)
+			if exists && claimed.IssueNumber == issue.Number && (claim.PRNumber <= 0 || claimed.PRNumber == claim.PRNumber) {
+				break
+			}
+			// More than one obsolete approval can reserve the same missing or
+			// mismatched sibling session. Peel every invalid approval-derived
+			// claim until either no claim remains or a real session claim is
+			// revealed; validating only the first revealed approval loses the
+			// selected canonical repair on the next stale sibling.
+			if claim.ApprovalID == "" {
+				break
+			}
+			if _, repeated := seenInvalidApprovals[claim.ApprovalID]; repeated {
+				break
+			}
+			seenInvalidApprovals[claim.ApprovalID] = struct{}{}
+			reason := fmt.Sprintf("issue #%d competing repair reservation %s is invalid: session missing, belongs to another issue, or no longer matches PR #%d", issue.Number, claim.Session, claim.PRNumber)
+			o.staleInvalidRepairApproval(s, claim.ApprovalID, reason)
+			// Approval reservations suppress the underlying session claim.
+			// Rebuild claims after each stale transition so a real
+			// running/open-PR session cannot remain hidden behind a chain of
+			// obsolete approvals.
+			revealed, stillClaimed := activeIssueClaimForSession(s, issue.Number, claim.Session)
+			if !stillClaimed {
+				claim = state.IssueClaim{}
+				break
+			}
+			claim = revealed
+		}
+		if claim.Session == "" {
+			continue
+		}
+		// A completed older PR can retain the issue's terminal-reconciliation
+		// claim until GitHub closes the issue. That claim must still prevent a
+		// fresh implementation dispatch, but it must not veto an explicitly
+		// approved repair of a newer, already-existing canonical PR/session.
+		// The repair reservation is exact (issue + session + PR), so ignoring
+		// only a chronologically earlier done session cannot create another
+		// worker identity. Other active/open/retry claims continue to fail
+		// closed below.
+		if claim.Kind == state.IssueClaimTerminalReconcile &&
+			claim.Status == string(state.StatusDone) &&
+			claim.PRNumber > 0 && target.PR > claim.PRNumber {
+			prior, exists := s.SessionAt(claim.Session)
+			if exists && prior.Status == state.StatusDone {
+				log.Printf("[orch] ignoring older terminal claim on session %s / PR #%d while repairing reserved newer session %s / PR #%d for issue #%d",
+					claim.Session, claim.PRNumber, slot, target.PR, issue.Number)
+				continue
+			}
+		}
+		reason := fmt.Sprintf("issue #%d reserved session %s is superseded by competing canonical claim on session %s (%s)", issue.Number, slot, claim.Session, claim.Reason)
+		log.Printf("[orch] refusing repair dispatch: %s", reason)
+		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
+		return false
+	}
+
+	// A prior dispatch may have reached the worker and persisted the running
+	// session before its approval terminal transition. Reconcile the approval
+	// without restarting an already-running target.
+	if sess.Status == state.StatusRunning {
+		o.resolveSpawnRepairApproval(s, dispatch.approvalID, slot, target.PR, "reserved session already running")
+		return false
+	}
+	if target.PR > 0 {
+		gate := o.revalidateSpawnRepairPR(target)
+		if !gate.actionable {
+			log.Printf("[orch] refusing repair dispatch for issue #%d / PR #%d on %s: %s", issue.Number, target.PR, slot, gate.reason)
+			if gate.stale {
+				o.staleInvalidSpawnRepairApproval(s, dispatch, gate.reason)
+			}
+			return false
+		}
+		log.Printf("[orch] current PR gate authorizes in-place repair for issue #%d / PR #%d on %s: %s", issue.Number, target.PR, slot, gate.reason)
+	}
+
+	backend := strings.TrimSpace(sess.Backend)
+	if backend == "" {
+		backend = o.cfg.Model.Default
+	}
+	previousBackend := backend
+	// A current model:<backend> label is an explicit operator routing decision
+	// and outranks the backend recorded on the failed attempt. This matters for
+	// retained-worktree recovery: changing model:claude to model:sol must resume
+	// the same slot/worktree on Sol, not silently replay the stale Fable route.
+	// Without an explicit label, keep the already-selected session backend so an
+	// in-place recovery does not forget a successful fallover route (#911).
+	var explicitSelection *router.BackendDecision
+	if labelBackend := router.BackendFromLabels(issue); labelBackend != "" {
+		decision := o.resolveBackendDecision(issue)
+		if decision.Backend == labelBackend {
+			if _, exists := o.cfg.Model.Backends[labelBackend]; !exists {
+				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: explicit backend %s is not configured", issue.Number, slot, labelBackend)
+				return false
+			}
+			if blockedBy, retryAt := o.dispatchBackendBlock(s, labelBackend, decision.Model, time.Now().UTC()); blockedBy != "" {
+				log.Printf("[orch] refusing repair dispatch for issue #%d on %s: explicit backend %s is blocked (%s%s)", issue.Number, slot, labelBackend, blockedBy, retryAfterHint(retryAt))
+				return false
+			}
+			if labelBackend != backend {
+				log.Printf("[orch] issue #%d repair recovery honors current model label: %s → %s on retained session %s", issue.Number, backend, labelBackend, slot)
+			}
+			backend = labelBackend
+			explicitSelection = &decision
+		}
+	}
+	promptBase := o.selectPrompt(issue)
+	var err error
+	if sess.PRNumber > 0 {
+		if strings.TrimSpace(sess.Worktree) == "" {
+			// Cleanup can clear the persisted Worktree field after a terminal
+			// attempt even when an operator has restored the exact slot worktree
+			// from the canonical PR branch. Reattach only the deterministic
+			// <worktree_base>/<slot> path and require git worktree metadata; never
+			// discover or allocate a different slot here.
+			restored := filepath.Join(o.cfg.WorktreeBase, slot)
+			if _, statErr := os.Stat(filepath.Join(restored, ".git")); statErr == nil {
+				sess.Worktree = restored
+				log.Printf("[orch] reattached restored worktree %s to reserved repair session %s / PR #%d", restored, slot, sess.PRNumber)
+			} else {
+				// Cleanup may have removed the worktree directory while retaining
+				// the canonical local branch. Record the deterministic path and let
+				// the preserving recovery helper recreate that exact worktree; it
+				// fails closed if the branch is unavailable or another worktree owns it.
+				sess.Worktree = restored
+			}
+		}
+		if o.respawnInPlaceFn != nil {
+			// Synthetic tests provide their own in-place executor and paths.
+			// Production has no hook and always takes the checkpointing,
+			// missing-worktree-restoring path below.
+			err = o.respawnInPlaceWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+		} else {
+			err = o.respawnPreservingWorktreeWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+		}
+	} else {
+		err = o.respawnPreservingWorktreeWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+	}
+	if err != nil {
+		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)
+		return false
+	}
+	if explicitSelection != nil {
+		selection := o.policyBackendSelection(*explicitSelection)
+		selection.PreviousBackend = previousBackend
+		sess.BackendSelection = selection
+		sess.Backend = backend
+	}
+	sess.NextRetryAt = nil
+	o.resolveSpawnRepairApproval(s, dispatch.approvalID, slot, target.PR, "repair worker dispatched")
+	if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
+		s.MarkProjectStatusSynced(issue.Number, string(github.ProjectStatusInProgress), time.Now().UTC())
+	}
+	o.notifier.Sendf("🔄 maestro: repairing issue #%d in place on worker %s: %s", issue.Number, slot, issue.Title)
+	return true
+}
+
+// revalidateSpawnRepairPR prevents a delayed approval or supervisor decision
+// from replaying a repair against a PR state that no longer exists. The live
+// GitHub head and gates, not the state captured when the decision was minted,
+// authorize worker spend. A current CI failure, merge conflict, or blocking
+// review finding is actionable; pending/green gates make an old repair intent
+// stale. Read errors and unknown states fail closed without consuming the
+// approval so a later healthy control-loop read can retry safely.
+func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) spawnRepairGateDecision {
+	if target == nil || target.PR <= 0 {
+		return spawnRepairGateDecision{actionable: true, reason: "repair has no PR gate to revalidate"}
+	}
+	pr := target.PR
+	currentHead, err := o.prHeadSHA(pr)
+	if err != nil || strings.TrimSpace(currentHead) == "" {
+		return spawnRepairGateDecision{reason: fmt.Sprintf("current PR head is unavailable: %v", err)}
+	}
+	currentHead = strings.TrimSpace(currentHead)
+	boundHead := strings.TrimSpace(target.HeadSHA)
+	if boundHead != "" && !strings.EqualFold(boundHead, currentHead) {
+		return spawnRepairGateDecision{
+			stale:  true,
+			reason: fmt.Sprintf("repair intent was bound to head %s, but current head is %s", shortHeadSHA(boundHead), shortHeadSHA(currentHead)),
+		}
+	}
+
+	rollup, err := o.prCheckRollup(pr)
+	if err != nil {
+		return spawnRepairGateDecision{reason: fmt.Sprintf("current PR checks are unavailable: %v", err)}
+	}
+	if observedHead := strings.TrimSpace(rollup.HeadSHA); observedHead != "" && !strings.EqualFold(observedHead, currentHead) {
+		return spawnRepairGateDecision{reason: "PR head changed while current checks were being read"}
+	}
+	if !rollup.Complete {
+		return spawnRepairGateDecision{reason: "current PR check rollup is incomplete; repair authority remains retryable"}
+	}
+	ci := strings.ToLower(strings.TrimSpace(rollup.Verdict))
+	actionableReason := ""
+	if ci == "failure" {
+		actionableReason = "current-head CI is failing"
+	}
+
+	if actionableReason == "" {
+		mergeable, mergeState, mergeErr := o.prMergeStatus(pr)
+		if mergeErr != nil {
+			return spawnRepairGateDecision{reason: fmt.Sprintf("current PR merge state is unavailable: %v", mergeErr)}
+		}
+		if strings.EqualFold(strings.TrimSpace(mergeable), "CONFLICTING") || strings.EqualFold(strings.TrimSpace(mergeState), "dirty") {
+			actionableReason = "current PR head has a merge conflict"
+		}
+	}
+	// A current-head CI run in progress is not repair authority. In particular,
+	// do not let a stale/legacy review verdict override that fresh pending state
+	// and spend another worker before the exact-head checks and review settle.
+	// A real merge conflict above remains immediately actionable.
+	if actionableReason == "" && ci == "pending" {
+		return spawnRepairGateDecision{stale: true, reason: "current PR head checks are pending; no repair is presently actionable"}
+	}
+
+	reviewPending := false
+	if actionableReason == "" {
+		review, reviewErr := o.prReviewGateVerdict(pr)
+		if reviewErr != nil {
+			return spawnRepairGateDecision{reason: fmt.Sprintf("current PR review gate is unavailable: %v", reviewErr)}
+		}
+		if !review.Pending && !review.Passed {
+			actionableReason = "current PR head has blocking review findings"
+		}
+		reviewPending = review.Pending
+	}
+
+	latestHead, err := o.prHeadSHA(pr)
+	if err != nil || !strings.EqualFold(strings.TrimSpace(latestHead), currentHead) {
+		return spawnRepairGateDecision{reason: "PR head changed while repair gates were being revalidated"}
+	}
+	if actionableReason != "" {
+		return spawnRepairGateDecision{actionable: true, reason: actionableReason}
+	}
+	// A green open draft is still explicitly incomplete. Supervisor already
+	// treats draft PRs as repairable, so the executor must not reinterpret green
+	// CI as terminal and strand a deliberate WIP forever. Re-read this mutable
+	// metadata from the exact PR at actuation time (not the cycle's cached list),
+	// and wait rather than spend while a review is still in progress. A green
+	// non-draft PR remains stale repair intent and proceeds through merge gates.
+	if ci == "success" && !reviewPending {
+		details, detailsErr := o.prDetails(pr)
+		if detailsErr != nil {
+			return spawnRepairGateDecision{reason: fmt.Sprintf("current PR draft state is unavailable: %v", detailsErr)}
+		}
+		if !strings.EqualFold(strings.TrimSpace(details.State), "OPEN") {
+			return spawnRepairGateDecision{stale: true, reason: "current PR is no longer open"}
+		}
+		if details.IsDraft {
+			return spawnRepairGateDecision{actionable: true, reason: "current PR remains an explicit draft/WIP continuation"}
+		}
+	}
+
+	switch ci {
+	case "pending":
+		return spawnRepairGateDecision{stale: true, reason: "current PR head checks are pending; no repair is presently actionable"}
+	case "success":
+		return spawnRepairGateDecision{stale: true, reason: "current PR head is green and has no actionable conflict or review blocker"}
+	default:
+		return spawnRepairGateDecision{reason: fmt.Sprintf("current PR check verdict %q is not authoritative", ci)}
+	}
+}
+
+func activeIssueClaimForSession(s *state.State, issueNumber int, slot string) (state.IssueClaim, bool) {
+	if s == nil || issueNumber <= 0 || strings.TrimSpace(slot) == "" {
+		return state.IssueClaim{}, false
+	}
+	for _, claim := range s.ActiveIssueClaims() {
+		if claim.IssueNumber == issueNumber && claim.Session == slot {
+			return claim, true
+		}
+	}
+	return state.IssueClaim{}, false
+}
+
+// staleInvalidSpawnRepairApproval makes an irrecoverably invalid exact
+// reservation terminal in both the project state and the SQLite approval
+// mirror. Without this convergence an awaiting_dispatch record is selected and
+// refused every orchestrator cycle forever, presenting a false operator gate
+// and burning control-loop work even though no safe dispatch is possible.
+func (o *Orchestrator) staleInvalidSpawnRepairApproval(s *state.State, dispatch *spawnRepairDispatch, reason string) {
+	if s == nil || dispatch == nil || strings.TrimSpace(dispatch.approvalID) == "" {
+		return
+	}
+	o.staleInvalidRepairApproval(s, dispatch.approvalID, reason)
+}
+
+func (o *Orchestrator) staleInvalidRepairApproval(s *state.State, approvalID, reason string) {
+	if s == nil || strings.TrimSpace(approvalID) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	if !s.StaleActiveRepairDispatchApproval(approvalID, now, reason) {
+		return
+	}
+	log.Printf("[orch] reconciled invalid repair approval %s as stale: %s", approvalID, reason)
+	o.mirrorRepairApprovalTerminal(approvalID, now, reason)
+}
+
+func (o *Orchestrator) resolveSpawnRepairApproval(s *state.State, approvalID, slot string, pr int, outcome string) {
+	if strings.TrimSpace(approvalID) == "" {
+		return
+	}
+	now := time.Now().UTC()
+	reason := fmt.Sprintf("repair worker %s for PR #%d: %s — approval consumed", slot, pr, outcome)
+	if pr <= 0 {
+		reason = fmt.Sprintf("repair worker %s: %s — approval consumed", slot, outcome)
+	}
+	if s.ResolveDispatchedSpawnRepairApproval(approvalID, now, reason) {
+		log.Printf("[orch] %s (approval %s)", reason, approvalID)
+		o.mirrorRepairApprovalTerminal(approvalID, now, reason)
+	}
 }
 
 // tryClaimReviewRepairSlot bumps the (pr_number, head_sha) attempt counter
@@ -6968,7 +8585,7 @@ func (o *Orchestrator) approvalReviewRepairDispatch(s *state.State, issueNumber 
 			target.PR, shortReviewRepairSHA(currentHead), shortReviewRepairSHA(payload.HeadSHA))
 		for _, staled := range s.SupersedeReviewRepairApprovalsForStaleHead(target.PR, currentHead, now, reason) {
 			log.Printf("[orch] %s (approval %s)", reason, staled)
-			o.mirrorReviewRepairApprovalTerminal(staled, now, reason)
+			o.mirrorRepairApprovalTerminal(staled, now, reason)
 		}
 		return nil, nil, ""
 	}
@@ -7074,22 +8691,28 @@ func (o *Orchestrator) applySupervisorOwnedReadyFilter(s *state.State, issues []
 	}
 
 	selected, ok := o.supervisorOwnedReadySelectedIssue(s)
-	if !ok {
-		for _, issue := range issues {
-			log.Printf("[orch] skipping issue #%d: supervisor-owned ready label has no selected dynamic-wave candidate yet", issue.Number)
-		}
-		return nil
-	}
-
+	// Dynamic-wave ownership constrains fresh issue selection, but it must not
+	// hide already-authorized exact-session repairs. Those approvals reserve an
+	// existing issue/session/PR identity and cannot allocate a competing slot;
+	// filtering them out behind the latest fresh candidate leaves dead workers
+	// in awaiting_dispatch forever (#940).
 	filtered := make([]github.Issue, 0, 1)
 	for _, issue := range issues {
-		if issue.Number == selected {
+		if o.supervisorSelectedRepairSpawn(s, issue.Number) {
 			filtered = append(filtered, issue)
 			continue
 		}
-		log.Printf("[orch] skipping issue #%d: not supervisor-selected candidate #%d for supervisor-owned ready label", issue.Number, selected)
+		if ok && issue.Number == selected {
+			filtered = append(filtered, issue)
+			continue
+		}
+		if ok {
+			log.Printf("[orch] skipping issue #%d: not supervisor-selected candidate #%d for supervisor-owned ready label", issue.Number, selected)
+		} else {
+			log.Printf("[orch] skipping issue #%d: supervisor-owned ready label has no selected dynamic-wave candidate yet", issue.Number)
+		}
 	}
-	if len(filtered) == 0 {
+	if ok && len(filtered) == 0 {
 		log.Printf("[orch] supervisor-owned ready label selected issue #%d, but it is not currently returned by issue_labels", selected)
 	}
 	return filtered
@@ -7198,10 +8821,6 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			if !repairSpawn {
 				continue
 			}
-			if o.issueHasLiveRunningSession(s, issue.Number) {
-				log.Printf("[orch] skipping issue #%d: supervisor selected repair, but a worker is already running for this issue", issue.Number)
-				continue
-			}
 		}
 
 		// Pre-spawn guard (issue #456): never start a new worker for an issue that is
@@ -7242,11 +8861,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
 			if repairSpawn {
-				log.Printf("[orch] allowing repair worker for issue #%d despite excluded label because supervisor selected repair maintenance", issue.Number)
-			} else {
-				log.Printf("[orch] skipping issue #%d (excluded label)", issue.Number)
-				continue
+				reason := fmt.Sprintf("issue #%d gained an excluded label before repair dispatch — approval/intent is stale", issue.Number)
+				for _, approval := range s.StaleActiveRepairDispatchApprovals(issue.Number, time.Now().UTC(), reason) {
+					log.Printf("[orch] refusing delayed repair for issue #%d (excluded label); staled approval %s", issue.Number, approval.ID)
+					o.mirrorRepairApprovalTerminal(approval.ID, time.Now().UTC(), reason)
+				}
 			}
+			log.Printf("[orch] skipping issue #%d (excluded label; repair authority does not bypass current guards)", issue.Number)
+			continue
 		}
 
 		// Check retry limit: skip issues that have exhausted their retry budget
@@ -7320,6 +8942,16 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				continue
 			}
 			log.Printf("[orch] allowing repair worker for issue #%d despite open PR because supervisor selected spawn_repair_worker", issue.Number)
+		}
+
+		// A classic repair is a same-session maintenance operation, not a fresh
+		// issue dispatch. Resolve and revalidate the durable reservation before
+		// any backend routing or slot allocation can create a second worktree.
+		if repairDispatch := o.resolveSpawnRepairDispatch(s, issue.Number); repairDispatch != nil {
+			if o.dispatchSpawnRepairWorker(s, issue, repairDispatch) {
+				started++
+			}
+			continue
 		}
 
 		// Determine initial phase and backend. A pipeline:full issue label
@@ -7485,7 +9117,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			reason := fmt.Sprintf("review-repair worker %s dispatched for PR #%d — approval consumed", slotName, repairTarget.PR)
 			if s.ResolveDispatchedReviewRepairApproval(reviewRepairApprovalID, resolveNow, reason) {
 				log.Printf("[orch] %s (approval %s)", reason, reviewRepairApprovalID)
-				o.mirrorReviewRepairApprovalTerminal(reviewRepairApprovalID, resolveNow, reason)
+				o.mirrorRepairApprovalTerminal(reviewRepairApprovalID, resolveNow, reason)
 			}
 		}
 		o.notifier.Sendf("🚀 maestro: started worker %s for issue #%d: %s", slotName, issue.Number, issue.Title)

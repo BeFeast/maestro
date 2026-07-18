@@ -32,6 +32,7 @@ import (
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/watch"
 	"github.com/befeast/maestro/internal/worker"
@@ -1732,7 +1733,7 @@ func buildProjectStatusJSON(cfg *config.Config, s *state.State) projectStatusJSO
 // treats those backends as available again even before ReconcileBackendHealth
 // clears the row.
 func showBackendHealth(s *state.State) {
-	if len(s.BackendHealth) == 0 {
+	if len(s.BackendHealth) == 0 && len(s.ProviderModelHealth) == 0 {
 		return
 	}
 	now := time.Now().UTC()
@@ -1747,22 +1748,50 @@ func showBackendHealth(s *state.State) {
 		}
 		names = append(names, name)
 	}
-	if len(names) == 0 {
+	type routeHealth struct {
+		name   string
+		health state.BackendHealth
+	}
+	var routes []routeHealth
+	for provider, models := range s.ProviderModelHealth {
+		for model, health := range models {
+			if health.State != state.BackendHealthCooldown || (health.RetryAfter != nil && !now.Before(*health.RetryAfter)) {
+				continue
+			}
+			routes = append(routes, routeHealth{name: provider + "/" + model, health: health})
+		}
+	}
+	if len(names) == 0 && len(routes) == 0 {
 		return
 	}
 	sort.Strings(names)
+	sort.Slice(routes, func(i, j int) bool { return routes[i].name < routes[j].name })
 	fmt.Printf("Backend health:\n")
-	for _, name := range names {
-		h := s.BackendHealth[name]
+	printHealth := func(name string, h state.BackendHealth) {
 		when := "auto-recovery pending"
 		if h.RetryAfter != nil {
 			when = "until " + h.RetryAfter.UTC().Format("2006-01-02 15:04 MST")
 		}
 		detail := h.Reason
-		if h.Pattern != "" && h.Pattern != h.Reason {
+		if h.CredentialUsableKnown {
+			if h.CredentialCandidatesKnown {
+				detail += fmt.Sprintf("; credentials %d/%d usable", h.CredentialUsable, h.CredentialCandidates)
+			} else {
+				detail += fmt.Sprintf("; credentials %d usable (candidate total not reported)", h.CredentialUsable)
+			}
+		}
+		if h.AggregateReason != "" && h.AggregateReason != h.Reason {
+			detail += "; " + h.AggregateReason
+		} else if h.Pattern != "" && h.Pattern != h.Reason {
 			detail += "; " + h.Pattern
 		}
-		fmt.Printf("  %-16s cooling down %s (%s)\n", name+":", when, detail)
+		fmt.Printf("  %-32s cooling down %s (%s)\n", name+":", when, detail)
+	}
+	for _, name := range names {
+		printHealth(name, s.BackendHealth[name])
+	}
+	for _, route := range routes {
+		printHealth(route.name, route.health)
 	}
 }
 
@@ -2060,13 +2089,10 @@ func logsCmd(args []string) {
 
 			// If worker's tmux session is alive, attach to it for live output
 			tmuxName := worker.TmuxSessionName(slotName)
-			if sess.Status == state.StatusRunning && exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil {
-				tmuxPath, err := exec.LookPath("tmux")
-				if err != nil {
-					log.Fatalf("find tmux: %v", err)
-				}
+			if sess.Status == state.StatusRunning && tmuxsession.HasSession(tmuxName) {
+				tmuxPath, tmuxArgs := tmuxsession.ClientArgsForSession(tmuxName, "attach-session", "-t", "="+tmuxName+":", "-r")
 				fmt.Printf("Attaching to tmux session %s (read-only)...\n", tmuxName)
-				syscall.Exec(tmuxPath, []string{"tmux", "attach-session", "-t", tmuxName, "-r"}, os.Environ())
+				syscall.Exec(tmuxPath, tmuxArgs, os.Environ())
 				log.Fatalf("exec tmux attach: should not reach here")
 			}
 
@@ -2278,7 +2304,7 @@ func tmuxSessionAlive(name string) bool {
 	if strings.TrimSpace(name) == "" {
 		return false
 	}
-	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+	return tmuxsession.HasSession(name)
 }
 
 func watchCmd(args []string) {

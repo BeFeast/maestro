@@ -190,6 +190,10 @@ func isApprovalRequiredAction(id string) bool {
 		// the orchestrator dispatcher loop spawns the actual worker once
 		// the cautious gate approves.
 		config.SupervisorActionSpawnReviewRepair,
+		// Classic in-place repair is also approval-gated. The target must bind
+		// both issue and reserved session so the dispatcher cannot allocate a
+		// replacement slot or repair a recycled one.
+		config.SupervisorActionSpawnRepairWorker,
 		// #567: per-session worker-control verbs surfaced by the fleet
 		// snapshot — both go through the cautious gate before the
 		// executor calls into the WorkerController.
@@ -431,6 +435,13 @@ func validateApprovalRequest(id string, req controlActionRequest) error {
 		// manually against the latest head).
 		if req.PRNumber <= 0 {
 			return errors.New("pr_number is required for spawn_review_repair")
+		}
+	case config.SupervisorActionSpawnRepairWorker:
+		if err := state.ValidateSlotID(req.Slot); err != nil {
+			return fmt.Errorf("spawn_repair_worker: %w", err)
+		}
+		if req.IssueNumber <= 0 {
+			return errors.New("issue_number is required for spawn_repair_worker (slot-reuse fence)")
 		}
 	case config.SupervisorActionRestartWorker, config.SupervisorActionStopWorker:
 		// #567: the executor / WorkerController needs the slot to kill

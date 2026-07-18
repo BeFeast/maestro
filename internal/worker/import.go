@@ -12,6 +12,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // ImportResult describes the outcome of importing a single worktree.
@@ -88,14 +89,14 @@ func Import(cfg *config.Config, s *state.State) ([]ImportResult, error) {
 
 		// Check if tmux session is alive
 		tmuxName := TmuxSessionName(slotName)
-		tmuxAlive := exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil
+		tmuxAlive := tmuxsession.HasSession(tmuxName)
 
 		status := state.StatusDead
 		pid := 0
 		if tmuxAlive {
 			status = state.StatusRunning
 			// Try to get PID from tmux pane
-			if pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output(); err == nil {
+			if pidOut, err := tmuxsession.PanePID(tmuxName); err == nil {
 				if p, err := strconv.Atoi(strings.TrimSpace(string(pidOut))); err == nil {
 					pid = p
 				}

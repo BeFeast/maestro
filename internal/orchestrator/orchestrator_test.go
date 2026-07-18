@@ -2,9 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,6 +21,7 @@ import (
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 func makeIssue(number int, title string, labels ...string) github.Issue {
@@ -46,6 +50,76 @@ func TestHashOutput_UsesLast50LinesOnly(t *testing.T) {
 	want := hashOutput(last50)
 	if got != want {
 		t.Fatalf("hashOutput() should only depend on last 50 lines; got %q want %q", got, want)
+	}
+}
+
+func TestRespawnPreservingWorktreeRepairsExistingDirectoryWithInvalidGitMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	base := filepath.Join(root, "worktrees")
+	worktree := filepath.Join(base, "ok-player-277")
+	branch := "feat/ok-player-277-346"
+	for _, args := range [][]string{
+		{"init", "-b", "main", repo},
+		{"-C", repo, "config", "user.email", "test@example.com"},
+		{"-C", repo, "config", "user.name", "Test"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"-C", repo, "add", "base.txt"},
+		{"-C", repo, "commit", "-m", "base"},
+		{"-C", repo, "branch", branch},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: /missing/admin/metadata\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "preserved.txt"), []byte("do not lose\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{LocalPath: repo, WorktreeBase: base}
+	sess := &state.Session{IssueNumber: 346, Worktree: worktree, Branch: branch}
+	respawned := false
+	o := &Orchestrator{
+		cfg:               cfg,
+		restoreWorktreeFn: worker.RestoreMissingWorktree,
+		respawnInPlaceFn: func(_ *config.Config, slotName string, _ *state.Session, _ string, _ github.Issue, _, _ string) error {
+			respawned = true
+			if slotName != "ok-player-277" {
+				t.Fatalf("slot = %q, want canonical ok-player-277", slotName)
+			}
+			out, err := exec.Command("git", "-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != "true" {
+				t.Fatalf("restored worktree unusable: %v: %s", err, out)
+			}
+			return nil
+		},
+	}
+	if err := o.respawnPreservingWorktreeWithConfig(cfg, "ok-player-277", sess, github.Issue{Number: 346}, "prompt", "sol"); err != nil {
+		t.Fatalf("respawn preserving worktree: %v", err)
+	}
+	if !respawned {
+		t.Fatal("canonical in-place respawn was not invoked")
+	}
+	backups, err := filepath.Glob(worktree + ".orphaned-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("orphan backups = %v, %v; want one", backups, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(backups[0], "preserved.txt")); err != nil || string(got) != "do not lose\n" {
+		t.Fatalf("preserved orphan content = %q, %v", got, err)
 	}
 }
 
@@ -171,6 +245,7 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 // to pr_open so that IssueInProgress returns true and no duplicate worker is spawned.
 func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *testing.T) {
 	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-time.Minute)
 	s.Sessions["mae-5"] = &state.Session{
 		IssueNumber: 105,
 		IssueTitle:  "fix crash",
@@ -178,6 +253,7 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 		PID:         9999,
 		TmuxSession: "maestro-mae-5",
 		Branch:      "feat/mae-5-105-fix-crash",
+		NextRetryAt: &retryAt,
 	}
 
 	openPRs := []github.PR{
@@ -207,6 +283,9 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 	}
 	if sess.TmuxSession != "" {
 		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil after authoritative PR-open reconciliation", sess.NextRetryAt)
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("finished_at should be set")
@@ -253,6 +332,67 @@ func TestReconcileRunningSessions_DeadWithPendingRetry_NotFlippedToPROpen(t *tes
 	}
 	if sess.NextRetryAt == nil {
 		t.Fatal("NextRetryAt must be preserved — the in-place respawn depends on it")
+	}
+}
+
+func TestCheckSessions_PROpenClearsStaleRetryMarker(t *testing.T) {
+	retryAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		IssueTitle:  "canonical Flatpak repair",
+		Status:      state.StatusPROpen,
+		NextRetryAt: &retryAt,
+		RetryCount:  2,
+		Branch:      "feat/ok-player-345-flatpak-beta-retry",
+		PRNumber:    388,
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(int) (bool, error) { return false, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["ok-player-302"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil for pr_open canonical session", sess.NextRetryAt)
+	}
+	if sess.RetryCount != 2 {
+		t.Fatalf("retry_count = %d, want preserved history 2", sess.RetryCount)
+	}
+}
+
+func TestCheckSessions_DonePRReleasesTerminalClaimAfterIssueCloses(t *testing.T) {
+	finishedAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-274"] = &state.Session{
+		IssueNumber: 365, Status: state.StatusDone, PRNumber: 370, FinishedAt: &finishedAt,
+	}
+	if _, ok := s.IssueClaimFor(365); !ok {
+		t.Fatal("done PR must hold a terminal reconciliation claim before issue closure")
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(issueNumber int) (bool, error) { return issueNumber == 365, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	if !s.Sessions["ok-player-274"].ReleasedForRedispatch {
+		t.Fatal("closed issue must release its completed PR terminal claim")
+	}
+	if _, ok := s.IssueClaimFor(365); ok {
+		t.Fatal("closed issue retained terminal reconciliation claim")
 	}
 }
 
@@ -347,8 +487,7 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	}
 
 	var gotTitle, gotBody, gotBase, gotHead string
-	var amendedWorktree, amendedBranch string
-	var amendedAttribution []state.BackendAttribution
+	var amended bool
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return false },
@@ -361,9 +500,7 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 			return 144, nil
 		},
 		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
-			amendedWorktree = worktreePath
-			amendedBranch = branch
-			amendedAttribution = append([]state.BackendAttribution(nil), attribution...)
+			amended = true
 			return nil
 		},
 	}
@@ -415,20 +552,17 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, gotBody)
 		}
 	}
-	if amendedWorktree != "/tmp/mae-8" || amendedBranch != "feat/mae-8-108-add-branch-rescue" {
-		t.Fatalf("amend target = %q/%q", amendedWorktree, amendedBranch)
-	}
-	if len(amendedAttribution) != 2 {
-		t.Fatalf("amended attribution len = %d, want 2", len(amendedAttribution))
+	if amended {
+		t.Fatal("auto-created PR reconciliation must not rewrite the product branch for attribution")
 	}
 	if !s.IssueInProgress(108) {
 		t.Fatal("IssueInProgress(108) must remain true after auto-created PR")
 	}
 }
 
-// The Maestro-Backend attribution trailer stays on commits only; PR bodies on
-// the (possibly public) target repo must not be rewritten to carry it (#799).
-func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *testing.T) {
+// Backend attribution is internal control-plane state. Reconciliation must
+// adopt the existing PR without changing its public commit or PR body (#1000).
+func TestReconcileRunningSessions_OpenPR_DoesNotAmendProductCommit(t *testing.T) {
 	s := state.NewState()
 	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	s.Sessions["mae-9"] = &state.Session{
@@ -476,8 +610,8 @@ func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *t
 	if sess.PRNumber != 145 {
 		t.Fatalf("pr_number = %d, want 145", sess.PRNumber)
 	}
-	if !amended {
-		t.Fatal("expected branch head amend hook")
+	if amended {
+		t.Fatal("existing PR reconciliation must not rewrite the product branch for attribution")
 	}
 }
 
@@ -1302,6 +1436,9 @@ func TestAutoMergePRs_MissingOpenPRDoesNotBecomeDoneWhenOutcomePassRequiredFails
 		},
 	}
 	o, merged := newMergeTestOrchestrator(cfg, nil)
+	o.isPRMergedFn = func(prNumber int) (bool, error) {
+		return prNumber == 10, nil
+	}
 	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
 	s.OutcomeHealth = &outcome.HealthCheckResult{
 		CheckedAt: time.Now().UTC(),
@@ -1944,6 +2081,56 @@ func TestAutoMergePRs_SequentialMergesOnlyFirst(t *testing.T) {
 	}
 	if (*merged)[0] != 10 {
 		t.Errorf("sequential should merge lowest PR number first; merged PR #%d, want #10", (*merged)[0])
+	}
+}
+
+func TestAutoMergePRs_SequentialSkipsOlderConflictAndMergesCleanPR(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/conflicting"},
+		{Number: 20, HeadRefName: "feat/clean"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "sequential"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghPRMergeStatusFn = func(prNumber int) (string, string, error) {
+		if prNumber == 10 {
+			return "CONFLICTING", "dirty", nil
+		}
+		return "MERGEABLE", "clean", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{20}) {
+		t.Fatalf("merged = %v, want clean PR #20; older conflicting PR must not consume the sequential merge slot", *merged)
+	}
+	if got := s.Sessions["slot-0"].Status; got != state.StatusPROpen {
+		t.Fatalf("conflicting canonical session status = %q, want pr_open for in-place repair", got)
+	}
+}
+
+func TestAutoMergePRs_PassedReviewGateDoesNotRetryAdvisoryFeedback(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "sequential",
+		ReviewGate:              "greptile",
+		AutoRetryReviewFeedback: true,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+		return "P1 advisory finding on a head Greptile has approved", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{10}) {
+		t.Fatalf("merged = %v, want approved PR #10; successful gate is authoritative", *merged)
+	}
+	if got := s.Sessions["slot-0"].MaintenanceRetryCount; got != 0 {
+		t.Fatalf("maintenance retries = %d, want 0 after successful review gate", got)
 	}
 }
 
@@ -2681,9 +2868,9 @@ func TestAutoMergePRs_CIPendingAndMergeStateBlocked_DoesNotMerge(t *testing.T) {
 	}
 }
 
-// mergeable_state="unstable" — only non-required checks are failing, so
-// the PR is still safe to merge under the same #424 override.
-func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
+// mergeable_state="unstable" can coexist with failed check runs. It is not
+// authoritative green evidence and must never override the check rollup.
+func TestAutoMergePRs_CIPendingMergeStateUnstable_DoesNotMerge(t *testing.T) {
 	prs := []github.PR{{Number: 102, HeadRefName: "feat/unstable"}}
 
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
@@ -2715,8 +2902,8 @@ func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	if len(merged) != 1 || merged[0] != 102 {
-		t.Fatalf("merged = %v, want [102] (mergeable_state=unstable should still allow merge)", merged)
+	if len(merged) != 0 {
+		t.Fatalf("merged = %v, want [] (mergeable_state=unstable must not override pending/failed checks)", merged)
 	}
 }
 
@@ -2776,13 +2963,13 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		t.Errorf("merged PR #%d, want #20", merged[0])
 	}
 
-	// PR #10 should have been closed and session scheduled for retry
-	if len(closedPRs) != 1 || closedPRs[0] != 10 {
-		t.Errorf("closedPRs = %v, want [10]", closedPRs)
+	// PR #10 remains canonical while its same-session repair is scheduled.
+	if len(closedPRs) != 0 {
+		t.Errorf("closedPRs = %v, want none", closedPRs)
 	}
 	for _, sess := range s.Sessions {
-		if sess.PRNumber == 0 && sess.IssueNumber == 100 {
-			// This is the session for PR #10 (PR cleared after CI failure retry)
+		if sess.PRNumber == 10 && sess.IssueNumber == 100 {
+			// This is the session for PR #10 (identity retained for in-place retry).
 			if sess.Status != state.StatusDead {
 				t.Errorf("CI-failed session status = %q, want %q", sess.Status, state.StatusDead)
 			}
@@ -2949,11 +3136,11 @@ func TestCheckSessions_TokenLimitExceeded_KillsWorker(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-1"]
-	if sess.Status != state.StatusDead {
-		t.Fatalf("status = %q, want %q", sess.Status, state.StatusDead)
+	if sess.Status != state.StatusFailed {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusFailed)
 	}
-	if sess.LastNotifiedStatus != "token_limit" {
-		t.Fatalf("last_notified_status = %q, want %q", sess.LastNotifiedStatus, "token_limit")
+	if sess.LastNotifiedStatus != worker.TokenBudgetExceededOutcome || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("budget outcome = %q/%q, want %q", sess.LastNotifiedStatus, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
 	}
 	if sess.TokensUsedAttempt != 75000 {
 		t.Fatalf("tokens_used = %d, want 75000", sess.TokensUsedAttempt)
@@ -3086,7 +3273,7 @@ func TestCheckSessions_TokenLimitZero_NoEnforcement(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_TokenLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
+func TestCheckSessions_LegacyTokenNotificationDoesNotSuppressOutcome(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",
 		WorkerMaxTokens:   50000,
@@ -3109,22 +3296,21 @@ func TestCheckSessions_TokenLimitAlreadyNotified_NoDuplicateKill(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-4"]
-	// Should remain running — the token_limit kill was already applied in a prior cycle
-	if sess.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want %q (already notified, should not re-kill)", sess.Status, state.StatusRunning)
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/outcome = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
 	}
-	if len(*stopped) != 0 {
-		t.Fatalf("stopped = %v, want empty (should not duplicate kill)", *stopped)
+	if len(*stopped) != 1 {
+		t.Fatalf("stopped = %v, want one deterministic stop", *stopped)
 	}
 }
 
-func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
+func TestCheckSessions_TokensAtExactLimit_WorkerStops(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",
 		WorkerMaxTokens:   50000,
 		MaxRuntimeMinutes: 999,
 	}
-	// Worker output reports exactly 50,000 tokens — at limit, not over (strict >)
+	// The hard ceiling stops before another provider response can exceed it.
 	o, stopped := newCheckSessionsOrchestrator(cfg, "tokens 50000")
 
 	s := state.NewState()
@@ -3140,8 +3326,8 @@ func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
 	o.checkSessions(s)
 
 	sess := s.Sessions["mae-5"]
-	if sess.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want %q (at exact limit, uses strict >)", sess.Status, state.StatusRunning)
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/outcome = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
 	}
 	if sess.TokensUsedAttempt != 50000 {
 		t.Fatalf("tokens_used = %d, want 50000", sess.TokensUsedAttempt)
@@ -3149,8 +3335,8 @@ func TestCheckSessions_TokensAtExactLimit_WorkerSurvives(t *testing.T) {
 	if sess.TokensUsedTotal != 50000 {
 		t.Fatalf("tokens_used_total = %d, want 50000", sess.TokensUsedTotal)
 	}
-	if len(*stopped) != 0 {
-		t.Fatalf("stopped = %v, want empty", *stopped)
+	if len(*stopped) != 1 {
+		t.Fatalf("stopped = %v, want [mae-5]", *stopped)
 	}
 }
 
@@ -3212,8 +3398,8 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 	o.checkSessions(s)
 
 	sess6 := s.Sessions["mae-6"]
-	if sess6.Status != state.StatusDead {
-		t.Fatalf("mae-6 status = %q, want %q", sess6.Status, state.StatusDead)
+	if sess6.Status != state.StatusFailed {
+		t.Fatalf("mae-6 status = %q, want %q", sess6.Status, state.StatusFailed)
 	}
 	if sess6.TokensUsedAttempt != 75000 {
 		t.Fatalf("mae-6 tokens_used = %d, want 75000", sess6.TokensUsedAttempt)
@@ -3235,6 +3421,62 @@ func TestCheckSessions_TokenLimitOnlyExceedingSessionKilled(t *testing.T) {
 
 	if len(stopped) != 1 || stopped[0] != "mae-6" {
 		t.Fatalf("stopped = %v, want [mae-6]", stopped)
+	}
+}
+
+func TestReconcileRunningSessions_TokenBudgetMarkerPreemptsOpenPR(t *testing.T) {
+	dir := t.TempDir()
+	logFile := dir + "/sup-906.log"
+	if err := os.WriteFile(logFile, []byte("working\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := worker.TokenBudgetMarker{
+		Outcome:        worker.TokenBudgetExceededOutcome,
+		Backend:        "claude",
+		TokensObserved: 85_000,
+		MaxTokens:      80_000,
+		MeasuredAt:     time.Now().UTC(),
+	}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.TokenBudgetMarkerPathForLog(logFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	o := &Orchestrator{
+		cfg:      &config.Config{StateDir: dir, WorkerMaxTokens: 80_000},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 906, HeadRefName: "feat/sup-906"}}, nil
+		},
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+	s := state.NewState()
+	s.Sessions["sup-906"] = &state.Session{
+		IssueNumber: 906,
+		Status:      state.StatusRunning,
+		PID:         1234,
+		Branch:      "feat/sup-906",
+		LogFile:     logFile,
+		Backend:     "claude",
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected reconciliation change")
+	}
+	sess := s.Sessions["sup-906"]
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/outcome = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
+	}
+	if sess.PRNumber != 0 || sess.NextRetryAt != nil || sess.PID != 0 {
+		t.Fatalf("budget stop was reclassified as PR/retry/running: %+v", sess)
+	}
+	if sess.TokensUsedAttempt != 85_000 || sess.TokensUsedTotal != 85_000 {
+		t.Fatalf("tokens = %d/%d, want 85000/85000", sess.TokensUsedAttempt, sess.TokensUsedTotal)
 	}
 }
 
@@ -3924,6 +4166,46 @@ func TestRebaseConflicts_OpenPRBehindMainUpdatesUnderMaintenance(t *testing.T) {
 	}
 }
 
+func TestRebaseConflicts_SharedPRMutatesOnlyNewestContinuation(t *testing.T) {
+	updateCalled := 0
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "behind", nil
+		},
+		ghUpdateBranchFn: func(prNumber int) error {
+			updateCalled++
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC),
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.rebaseConflicts(s)
+
+	if updateCalled != 1 {
+		t.Fatalf("updateBranch called %d times, want exactly one canonical update", updateCalled)
+	}
+	if got := s.Sessions["ok-player-273"].Status; got != state.StatusPROpen {
+		t.Fatalf("historical session status = %q, want untouched pr_open", got)
+	}
+	if got := s.Sessions["ok-player-302"].Status; got != state.StatusQueued {
+		t.Fatalf("canonical continuation status = %q, want queued after update", got)
+	}
+}
+
 // #602 — When the merge fails with a non-"not up to date" error AND GitHub
 // reports MERGEABLE (so it's not actually a conflict), fall through to the
 // existing single-notification merge_failed path instead of mis-routing.
@@ -4572,7 +4854,7 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 	}
 }
 
-func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
+func TestStartNewWorkers_RepairSpawnCannotBypassExcludedLabel(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
 	cfg.ExcludeLabels = []string{"blocked"}
 	cfg.Supervisor.ReviewRepair.MaxRetries = 1
@@ -4602,12 +4884,11 @@ func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
 
 	o.startNewWorkers(s, 1)
 
-	if len(*started) != 1 || (*started)[0] != 669 {
-		t.Fatalf("started = %v, want [669] for supervisor-selected maintenance despite excluded label", *started)
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want no worker: current blocked label outranks delayed repair intent", *started)
 	}
-	track, ok := s.LookupReviewRepairTrack(1001, "deadbeef")
-	if !ok || track.Attempts != 1 {
-		t.Fatalf("review repair track = %+v, ok=%v; want one maintenance attempt", track, ok)
+	if track, ok := s.LookupReviewRepairTrack(1001, "deadbeef"); ok || track.Attempts != 0 {
+		t.Fatalf("review repair track = %+v, ok=%v; blocked dispatch must not consume an attempt", track, ok)
 	}
 }
 
@@ -4889,12 +5170,20 @@ func TestStartNewWorkers_WithoutPipelineFullLabelKeepsSingleSession(t *testing.T
 	}
 }
 
-func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testing.T) {
+func TestStartNewWorkers_SupervisorRepairSpawnRepairsReservedSessionInPlace(t *testing.T) {
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(767, "repair stale PR")}
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 769)
 	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
 		return issueNumber == 767, nil
+	}
+	respawned := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		respawned = slotName
+		sess.Status = state.StatusRunning
+		sess.PID = 5555
+		return nil
 	}
 
 	s := state.NewState()
@@ -4904,6 +5193,8 @@ func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testi
 		Status:      state.StatusPROpen,
 		PRNumber:    769,
 		Branch:      "codex/old-pr",
+		Worktree:    "/work/pan-12",
+		Backend:     "codex",
 	}
 	s.RecordSupervisorDecision(state.SupervisorDecision{
 		ID:                "sup-repair",
@@ -4916,8 +5207,130 @@ func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testi
 
 	o.startNewWorkers(s, 1)
 
-	if len(*started) != 1 || (*started)[0] != 767 {
-		t.Fatalf("started = %v, want [767] for supervisor-selected repair", *started)
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want none for same-session repair", *started)
+	}
+	if respawned != "pan-12" {
+		t.Fatalf("respawned = %q, want reserved session pan-12", respawned)
+	}
+	if len(s.Sessions) != 1 || s.Sessions["pan-12"].Status != state.StatusRunning {
+		t.Fatalf("sessions = %+v, want only pan-12 running", s.Sessions)
+	}
+}
+
+func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.WorktreeBase = t.TempDir()
+	restoredWorktree := filepath.Join(cfg.WorktreeBase, "sup-360")
+	if err := os.MkdirAll(restoredWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir restored worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(restoredWorktree, ".git"), []byte("gitdir: test\n"), 0o644); err != nil {
+		t.Fatalf("write restored worktree metadata: %v", err)
+	}
+	issues := []github.Issue{makeIssue(887, "finish watchdog recovery")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 914)
+	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 887, nil
+	}
+	respawned := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		respawned = slotName
+		sess.Status = state.StatusRunning
+		sess.PID = 5555
+		return nil
+	}
+
+	oldFinished := time.Date(2026, 7, 14, 18, 59, 0, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["sup-318"] = &state.Session{
+		IssueNumber: 887,
+		Status:      state.StatusDone,
+		PRNumber:    893,
+		StartedAt:   oldFinished.Add(-time.Hour),
+		FinishedAt:  &oldFinished,
+	}
+	s.Sessions["sup-360"] = &state.Session{
+		IssueNumber: 887,
+		IssueTitle:  "finish watchdog recovery",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    914,
+		Branch:      "feat/sup-360-887-watchdog-recovery",
+		Backend:     "codex",
+		// Cleanup/import can lose the attempt timestamp. Canonical PR identity,
+		// not an optional timestamp, orders an older completed PR claim.
+		StartedAt: time.Time{},
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair-newer-pr",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 887, PR: 914, Session: "sup-360"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want exact in-place repair", *started)
+	}
+	if respawned != "sup-360" {
+		t.Fatalf("respawned = %q, want sup-360", respawned)
+	}
+	if got := s.Sessions["sup-318"].Status; got != state.StatusDone {
+		t.Fatalf("older terminal session status = %q, want done", got)
+	}
+	if got := s.Sessions["sup-360"].Worktree; got != restoredWorktree {
+		t.Fatalf("restored worktree = %q, want %q", got, restoredWorktree)
+	}
+	if len(s.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want no new session", len(s.Sessions))
+	}
+}
+
+func TestStartNewWorkers_SupervisorRepairSpawnHonorsCurrentModelLabelInPlace(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex", "sol")
+	issues := []github.Issue{makeIssue(345, "resume retained packaging work", "model:sol")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return false, nil }
+	gotBackend := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		gotBackend = backend
+		sess.Status = state.StatusRunning
+		sess.Backend = backend
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345,
+		IssueTitle:  "resume retained packaging work",
+		Status:      state.StatusDead,
+		Worktree:    "/work/ok-player-273",
+		Branch:      "feat/ok-player-273-345",
+		Backend:     "codex",
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair-label",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 345, Session: "ok-player-273"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want retained-session repair", *started)
+	}
+	if gotBackend != "sol" {
+		t.Fatalf("repair backend = %q, want current explicit label backend sol", gotBackend)
+	}
+	if got := s.Sessions["ok-player-273"].Backend; got != "sol" {
+		t.Fatalf("session backend = %q, want sol", got)
 	}
 }
 
@@ -5503,8 +5916,13 @@ func TestCheckSessions_FailedClosedIssue_TransitionsToDone(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(t *testing.T) {
+func TestCheckSessions_ClosedNoDeliveryIssueBecomesDoneWhenProjectOutcomeFails(t *testing.T) {
 	now := time.Now().UTC()
+	worktree := t.TempDir()
+	preserved := filepath.Join(worktree, "preserved.txt")
+	if err := os.WriteFile(preserved, []byte("completed work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	o := &Orchestrator{
 		cfg: &config.Config{
 			Repo:              "owner/repo",
@@ -5522,8 +5940,17 @@ func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(
 		isIssueClosedFn: func(issueNumber int) (bool, error) {
 			return true, nil
 		},
+		mergedPRForBranchFn: func(branch string) (int, error) {
+			return 0, nil
+		},
+		mergedPRForIssueFn: func(issueNumber int) (int, error) {
+			// A prior lifecycle of this issue shipped PR #77 before the issue was
+			// reopened. That historical issue-level link must not be attributed to
+			// this later no-delivery session.
+			return 77, nil
+		},
 		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
-			t.Fatalf("workerStopFn should not run before outcome verification passes")
+			t.Fatalf("terminal reconciliation must preserve the retained worktree; workerStopFn must not run")
 			return nil
 		},
 	}
@@ -5540,14 +5967,65 @@ func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(
 		IssueTitle:  "failed worker",
 		Status:      state.StatusFailed,
 		Branch:      "feat/pan-10-100-failed",
+		Worktree:    worktree,
 		FinishedAt:  &now,
 	}
 
 	o.checkSessions(s)
 
 	sess := s.Sessions["pan-10"]
-	if sess.Status != state.StatusFailed {
-		t.Fatalf("status = %q, want %q until live verification passes", sess.Status, state.StatusFailed)
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q: no merged revision is owned by this closed issue", sess.Status, state.StatusDone)
+	}
+	if sess.Branch != "feat/pan-10-100-failed" {
+		t.Fatalf("branch = %q, want retained branch unchanged", sess.Branch)
+	}
+	if sess.Worktree != worktree {
+		t.Fatalf("worktree = %q, want retained %q", sess.Worktree, worktree)
+	}
+	if _, err := os.Stat(preserved); err != nil {
+		t.Fatalf("retained work disappeared: %v", err)
+	}
+}
+
+func TestCheckSessions_ClosedMergedIssueRemainsCodeLandedWhenProjectOutcomeFails(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:              "owner/repo",
+			MaxRuntimeMinutes: 120,
+			Outcome: outcome.Brief{
+				DesiredOutcome:      "Live app works",
+				VerifierCommand:     "check-live",
+				PassRequiredForDone: boolPtr(true),
+			},
+		},
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return true, nil },
+		isPRMergedFn:    func(prNumber int) (bool, error) { return prNumber == 77, nil },
+	}
+
+	s := state.NewState()
+	s.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now,
+		State:     outcome.HealthFailing,
+		Signal:    "verifier_command",
+		Summary:   "live verifier failed",
+	}
+	s.Sessions["pan-10"] = &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "merged worker",
+		Status:             state.StatusFailed,
+		LastClosedPRNumber: 77,
+		FinishedAt:         &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-10"]
+	if sess.Status != state.StatusCodeLanded || sess.PRNumber != 77 {
+		t.Fatalf("session = status %q PR #%d, want code_landed PR #77 until live verification passes", sess.Status, sess.PRNumber)
 	}
 }
 
@@ -7638,6 +8116,56 @@ func TestRespawnDueRetries_WithOpenPRRespawnsInPlace(t *testing.T) {
 	}
 }
 
+func TestRespawnDueRetries_StalledProgressResumesExactWorktreeInPlace(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	respawnedFresh := false
+	respawnedInPlace := false
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "test prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test issue"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedFresh = true
+			return nil
+		},
+		respawnInPlaceFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedInPlace = true
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			return nil
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-time.Second)
+	s := state.NewState()
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber: 112,
+		IssueTitle:  "test issue",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		RetryReason: state.RetryReasonStalledProgress,
+		Branch:      "feat/mae-12-112-test",
+		Worktree:    "/tmp/maestro-mae-12",
+	}
+
+	o.respawnDueRetries(s, 1)
+
+	if !respawnedInPlace || respawnedFresh {
+		t.Fatalf("stalled-progress respawn: in_place=%t fresh=%t", respawnedInPlace, respawnedFresh)
+	}
+	if s.Sessions["mae-12"].Worktree != "/tmp/maestro-mae-12" {
+		t.Fatalf("stalled-progress retry changed worktree: %+v", s.Sessions["mae-12"])
+	}
+}
+
 // #874: restart_worker on a finished pr_open session tears down the worktree
 // and (via the restart controller) clears sess.Worktree/PRNumber. The dead
 // session that respawnDueRetries then picks up must take the FRESH respawn
@@ -8349,7 +8877,7 @@ func newCIFailureRetryOrchestrator(cfg *config.Config, prs []github.PR, ciStatus
 	}, &merged, &closedPRs
 }
 
-func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_KeepsCanonicalPRAndSchedulesInPlaceRetry(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8364,9 +8892,9 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 		t.Fatalf("expected 0 merges, got %d", len(*merged))
 	}
 
-	// Should close the PR
-	if len(*closedPRs) != 1 || (*closedPRs)[0] != 10 {
-		t.Fatalf("closedPRs = %v, want [10]", *closedPRs)
+	// A failed check must not destroy canonical PR identity.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none for in-place retry", *closedPRs)
 	}
 
 	// Session should be dead with NextRetryAt scheduled
@@ -8380,8 +8908,8 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 	if sess.RetryCount != 1 {
 		t.Fatalf("RetryCount = %d, want 1", sess.RetryCount)
 	}
-	if sess.PRNumber != 0 {
-		t.Fatalf("PRNumber = %d, want 0 (cleared after PR close)", sess.PRNumber)
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10 (same PR retained)", sess.PRNumber)
 	}
 	if sess.CIFailureOutput == "" {
 		t.Fatal("CIFailureOutput should be set")
@@ -8389,8 +8917,61 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 	if sess.FinishedAt == nil {
 		t.Fatal("FinishedAt should be set")
 	}
-	if sess.Worktree != "" {
-		t.Fatalf("Worktree = %q, want empty (cleaned up)", sess.Worktree)
+}
+
+func TestAutoMergePRs_SharedPRFailureMutatesOnlyNewestContinuation(t *testing.T) {
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, closedPRs := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{388: "failure"})
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC), RetryCount: 3,
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.autoMergePRs(s)
+
+	historical := s.Sessions["ok-player-273"]
+	if historical.Status != state.StatusPROpen || historical.LastNotifiedStatus != "" {
+		t.Fatalf("historical session mutated by shared PR failure: %+v", historical)
+	}
+	canonical := s.Sessions["ok-player-302"]
+	if canonical.Status != state.StatusDead || canonical.NextRetryAt == nil || canonical.RetryCount != 1 {
+		t.Fatalf("canonical continuation = %+v, want one scheduled in-place retry", canonical)
+	}
+	if canonical.PRNumber != 388 || len(*closedPRs) != 0 {
+		t.Fatalf("canonical identity changed: pr=%d closed=%v", canonical.PRNumber, *closedPRs)
+	}
+}
+
+func TestAutoMergePRs_SharedPRLiveContinuationBlocksHistoricalGateMutation(t *testing.T) {
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, closedPRs := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{388: "failure"})
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC), RetryCount: 3,
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PRNumber: 388, Branch: "feat/shared-pr", PID: 12345,
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.autoMergePRs(s)
+
+	if got := s.Sessions["ok-player-273"]; got.Status != state.StatusPROpen || got.LastNotifiedStatus != "" {
+		t.Fatalf("historical session mutated while canonical repair is live: %+v", got)
+	}
+	if got := s.Sessions["ok-player-302"]; got.Status != state.StatusRunning || got.RetryCount != 0 {
+		t.Fatalf("live canonical continuation mutated by merge flow: %+v", got)
+	}
+	if len(*closedPRs) != 0 {
+		t.Fatalf("shared PR closed while canonical repair is live: %v", *closedPRs)
 	}
 }
 
@@ -8467,9 +9048,9 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// Should close the PR and schedule retry
-	if len(*closedPRs) != 1 {
-		t.Fatalf("closedPRs = %v, want 1 PR closed (unlimited retries)", *closedPRs)
+	// Should preserve the PR and schedule an in-place retry.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none (unlimited in-place retries)", *closedPRs)
 	}
 	sess := s.Sessions["slot-0"]
 	if sess.Status != state.StatusDead {
@@ -8480,7 +9061,7 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 	}
 }
 
-func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_DoesNotDependOnClosePR(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8520,13 +9101,16 @@ func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// When closePR fails, session should stay in pr_open (no retry scheduled)
+	// closePR is deliberately absent; the in-place retry must still schedule.
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusPROpen {
-		t.Fatalf("status = %q, want %q (closePR failed, no retry)", sess.Status, state.StatusPROpen)
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (closePR is not part of retry)", sess.Status, state.StatusDead)
 	}
-	if sess.NextRetryAt != nil {
-		t.Fatal("NextRetryAt should be nil when closePR fails")
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set without closing the PR")
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want canonical PR 10 retained", sess.PRNumber)
 	}
 }
 
@@ -9795,6 +10379,51 @@ func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 	o.autoMergePRs(s)
 	if len(addedLabels) != 0 {
 		t.Fatalf("second cycle re-applied labels = %v, want none (idempotency)", addedLabels)
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedSiblingDoesNotBlockCanonicalOpenPR(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		ReviewGate: "none",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	addedLabels := make(map[int]string)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return []github.PR{{Number: 397, HeadRefName: "canonical", Title: "Fedora fix for #346"}}, nil
+		},
+		ghPRCIStatusFn: func(int) (string, error) { return "pending", nil },
+		ghPRMergeStatusFn: func(int) (string, string, error) {
+			return "MERGEABLE", "blocked", nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			addedLabels[number] = label
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["canonical-slot"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    397,
+		Branch:      "canonical",
+	}
+	s.Sessions["preserved-sibling"] = &state.Session{
+		IssueNumber: 346,
+		Status:      state.StatusRetryExhausted,
+		Branch:      "preserved-sibling",
+	}
+
+	o.autoMergePRs(s)
+
+	if len(addedLabels) != 0 {
+		t.Fatalf("terminal sibling applied labels behind canonical PR: %v", addedLabels)
+	}
+	if got := s.Sessions["preserved-sibling"].LastNotifiedStatus; got == noPRReconciledStatus {
+		t.Fatalf("terminal sibling was falsely reconciled as a blocking no-PR outcome")
 	}
 }
 

@@ -141,6 +141,11 @@ func TestClassifyActivity(t *testing.T) {
 			want: ActivityBlockedByApprovals,
 		},
 		{
+			name: "actionable failed work is not an empty queue",
+			in:   ActivityInput{Capacity: Capacity{AvailableSlots: 4}, EligibleIssues: 0, ActionableAttention: 1},
+			want: ActivityNeedsAttention,
+		},
+		{
 			name: "gate-bound with eligible work is the intervention loop",
 			in:   ActivityInput{Capacity: Capacity{PRGates: 3, AvailableSlots: 0}, EligibleIssues: 5},
 			want: ActivityBlockedByGates,
@@ -149,6 +154,16 @@ func TestClassifyActivity(t *testing.T) {
 			name: "gate-bound with no eligible work is just waiting",
 			in:   ActivityInput{Capacity: Capacity{PRGates: 3, AvailableSlots: 0}, EligibleIssues: 0},
 			want: ActivityWaitingOnGates,
+		},
+		{
+			name: "separated gates with free slots and no eligible work are still waiting",
+			in:   ActivityInput{Capacity: Capacity{PRGates: 1, AvailableSlots: 20, Separated: true}, EligibleIssues: 0},
+			want: ActivityWaitingOnGates,
+		},
+		{
+			name: "separated gates do not block eligible work when slots remain",
+			in:   ActivityInput{Capacity: Capacity{PRGates: 1, AvailableSlots: 19, Separated: true}, EligibleIssues: 2},
+			want: ActivityIdle,
 		},
 		{
 			name: "empty queue",

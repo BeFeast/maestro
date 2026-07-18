@@ -660,14 +660,14 @@ func TestClassifyBackendFailure_CodexCLIProxyMissingEnvVar_IsAuthFailure(t *test
 		StartedAt: time.Now().UTC().Add(-90 * time.Second),
 		LogFile:   logFile,
 	}
-	hit, reason, pattern := o.classifyBackendFailure(sess, time.Now().UTC())
+	failure, hit := o.classifyBackendFailure(sess, time.Now().UTC())
 	if !hit {
 		t.Fatal("classifyBackendFailure = false, want true")
 	}
-	if reason != state.BackendBlockAuthFailure {
-		t.Fatalf("reason = %q, want %q", reason, state.BackendBlockAuthFailure)
+	if failure.reason != state.BackendBlockAuthFailure {
+		t.Fatalf("reason = %q, want %q", failure.reason, state.BackendBlockAuthFailure)
 	}
-	if pattern != "missing_api_key_env_var" {
-		t.Fatalf("pattern = %q, want missing_api_key_env_var", pattern)
+	if failure.pattern != "missing_api_key_env_var" {
+		t.Fatalf("pattern = %q, want missing_api_key_env_var", failure.pattern)
 	}
 }

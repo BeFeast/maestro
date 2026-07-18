@@ -39,6 +39,7 @@ type claudeStreamFrame struct {
 // carries the model name (and a per-turn usage block we do not aggregate —
 // the result frame's usage is the authoritative run total).
 type claudeStreamMessage struct {
+	ID    string            `json:"id"`
 	Model string            `json:"model"`
 	Usage *claudeUsageBlock `json:"usage"`
 }
@@ -62,6 +63,25 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 	var out ClaudeUsage
 	seen := false
 	var systemModel, assistantModel string
+	var live claudeUsageBlock
+	liveMessages := make(map[string]claudeUsageBlock)
+	flushLive := func(authoritative *claudeUsageBlock) {
+		usage := authoritative
+		if usage == nil || claudeUsageTotal(&live) > claudeUsageTotal(usage) {
+			usage = &live
+		}
+		if claudeUsageTotal(usage) == 0 {
+			live = claudeUsageBlock{}
+			return
+		}
+		out.Input += usage.InputTokens
+		out.Output += usage.OutputTokens
+		out.CacheRead += usage.CacheReadInputTokens
+		out.CacheWrite += usage.CacheCreationInputTokens
+		seen = true
+		live = claudeUsageBlock{}
+		clear(liveMessages)
+	}
 
 	for _, raw := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(raw)
@@ -74,25 +94,41 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 		}
 		switch fr.Type {
 		case "system":
+			flushLive(nil)
 			if strings.TrimSpace(fr.Model) != "" {
 				systemModel = fr.Model
 			}
 		case "assistant":
-			if fr.Message != nil && strings.TrimSpace(fr.Message.Model) != "" {
-				assistantModel = fr.Message.Model
+			if fr.Message != nil {
+				if strings.TrimSpace(fr.Message.Model) != "" {
+					assistantModel = fr.Message.Model
+				}
+				if fr.Message.Usage != nil {
+					messageID := strings.TrimSpace(fr.Message.ID)
+					if messageID == "" {
+						live.InputTokens += fr.Message.Usage.InputTokens
+						live.OutputTokens += fr.Message.Usage.OutputTokens
+						live.CacheReadInputTokens += fr.Message.Usage.CacheReadInputTokens
+						live.CacheCreationInputTokens += fr.Message.Usage.CacheCreationInputTokens
+					} else {
+						previous := liveMessages[messageID]
+						live.InputTokens += positiveDelta(fr.Message.Usage.InputTokens, previous.InputTokens)
+						live.OutputTokens += positiveDelta(fr.Message.Usage.OutputTokens, previous.OutputTokens)
+						live.CacheReadInputTokens += positiveDelta(fr.Message.Usage.CacheReadInputTokens, previous.CacheReadInputTokens)
+						live.CacheCreationInputTokens += positiveDelta(fr.Message.Usage.CacheCreationInputTokens, previous.CacheCreationInputTokens)
+						liveMessages[messageID] = *fr.Message.Usage
+					}
+				}
 			}
 		case "result":
 			if fr.Usage == nil {
 				continue
 			}
-			out.Input += fr.Usage.InputTokens
-			out.Output += fr.Usage.OutputTokens
-			out.CacheRead += fr.Usage.CacheReadInputTokens
-			out.CacheWrite += fr.Usage.CacheCreationInputTokens
+			flushLive(fr.Usage)
 			out.CostUSD += fr.TotalCostUSD
-			seen = true
 		}
 	}
+	flushLive(nil)
 
 	// Prefer the session model from the system/init frame (the configured
 	// model, e.g. claude-opus-4-8[1m]); fall back to the assistant message
@@ -100,4 +136,11 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 	out.Model = nonEmpty(assistantModel, systemModel)
 	out.TotalTokens = out.Input + out.Output + out.CacheRead + out.CacheWrite
 	return out, seen
+}
+
+func positiveDelta(current, previous int) int {
+	if current > previous {
+		return current - previous
+	}
+	return 0
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // SlotPrefix derives the slot prefix from the repo name ("BeFeast/panoptikon" → "pan")
@@ -45,6 +46,22 @@ func TmuxSessionName(slotName string) string {
 	return "maestro-" + slotName
 }
 
+// TmuxPanePID returns the pane pid of a live tmux session, so a caller can
+// recover the runtime pid of a worker whose recorded pid is stale (e.g. a
+// restart-resume adopting an already-running replacement, #877). It errors if
+// the session is gone or the pid is unparseable.
+func TmuxPanePID(session string) (int, error) {
+	out, err := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return 0, fmt.Errorf("tmux list-panes %s: %w", session, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse pane pid for %s: %w", session, err)
+	}
+	return pid, nil
+}
+
 // Start spawns a new worker for the given issue inside a tmux session.
 // backendName selects the model backend ("claude", "codex", etc.); empty defaults to config.
 func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string) (string, error) {
@@ -52,6 +69,27 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+
+	// Resolve and validate the backend before creating a worktree or running the
+	// pre-worker pipeline. A positive hard budget must fail closed before any
+	// auxiliary planning/model work can spend tokens.
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return "", fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		return "", err
+	}
 
 	// #734: sync the local base branch to origin so the worker branches from an
 	// up-to-date base, then root the worktree directly at origin/main. A stale
@@ -95,21 +133,6 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		promptBase = promptBase + section
 	}
 
-	// Determine backend
-	if backendName == "" {
-		backendName = cfg.Model.Default
-	}
-	backendDef, ok := cfg.Model.Backends[backendName]
-	if !ok {
-		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
-		backendName = cfg.Model.Default
-		backendDef, ok = cfg.Model.Backends[backendName]
-		if !ok {
-			return "", fmt.Errorf("backend %q (default) not found in config", backendName)
-		}
-	}
-	backendCfg := workerBackendConfig(backendDef)
-
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
 		return "", fmt.Errorf("setup worker tool hooks: %w", err)
@@ -128,7 +151,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	// Prepare log file
 	logDir := state.LogDir(cfg.StateDir)
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := ensureWorkerLogDir(logDir); err != nil {
 		return "", fmt.Errorf("create log dir: %w", err)
 	}
 	logFile := filepath.Join(logDir, slotName+".log")
@@ -153,13 +176,12 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
 		return "", fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID of the shell running inside the tmux pane
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
 		return "", fmt.Errorf("tmux list-panes: %w", err)
 	}
@@ -194,6 +216,25 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
 // The session is updated in place with new PID, worktree, branch, and timestamps.
 func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	// Validate the replacement backend before killing the old session or
+	// removing its worktree.
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		return err
+	}
+
 	// Clean up old worker (tmux session, process, worktree)
 	Stop(cfg, slotName, sess)
 
@@ -244,20 +285,6 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		promptBase = promptBase + section
 	}
 
-	// Determine backend
-	if backendName == "" {
-		backendName = cfg.Model.Default
-	}
-	backendDef, ok := cfg.Model.Backends[backendName]
-	if !ok {
-		backendName = cfg.Model.Default
-		backendDef, ok = cfg.Model.Backends[backendName]
-		if !ok {
-			return fmt.Errorf("backend %q (default) not found in config", backendName)
-		}
-	}
-	backendCfg := workerBackendConfig(backendDef)
-
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
 		return fmt.Errorf("setup worker tool hooks: %w", err)
@@ -276,7 +303,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Prepare log file
 	logDir := state.LogDir(cfg.StateDir)
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := ensureWorkerLogDir(logDir); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
 	}
 	logFile := filepath.Join(logDir, slotName+".log")
@@ -301,13 +328,12 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
+	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
 		return fmt.Errorf("tmux list-panes: %w", err)
 	}
@@ -324,18 +350,15 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
+	now := time.Now()
 	sess.PRNumber = 0
-	sess.Backend = backendName
-	// #513: stamp the fallover attribution segment.
-	recordBackendAttribution(cfg, sess, backendName, "fallover", "fallover", time.Now())
+	// #513/#931: stamp the fallover segment and clear the previous attempt's
+	// terminal/model projection without losing cumulative history.
+	beginSessionAttempt(cfg, sess, backendName, "fallover", "fallover", now)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
-	sess.TokensUsedAttempt = 0
 	// CIFailureOutput and PreviousAttemptFeedback are normally cleared by
 	// respawnDueRetries before this call, but cleared here defensively in
 	// case Respawn is called from other paths.
@@ -343,6 +366,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PreviousAttemptFeedback = ""
 	sess.PreviousAttemptFeedbackKind = ""
 	sess.CheckpointFile = ""
+	// A fresh respawn is a brand-new attempt in a brand-new worktree, so any
+	// restart-resume marker from a prior in-flight interruption (#877) is stale.
+	sess.RestartCheckpointAt = nil
 
 	return nil
 }
@@ -351,7 +377,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	// Try to kill the tmux session first (covers tmux-spawned workers)
 	tmuxName := TmuxSessionName(slotName)
-	if out, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
+	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
 		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
 	}
 
@@ -1002,7 +1028,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 4. Commit your changes with a clear message.
 5. Before committing or opening a PR, check for accidental secrets and generated artifacts. Do NOT commit or mention API keys, bearer tokens, oauth tokens, bot tokens, env values, raw config dumps, or diagnostic logs. Do NOT commit temp/debug artifacts such as tmp/, _tmp/, *.log, *.logs, *.test, or *.test.json unless the issue explicitly requires them.
 6. Keep the PR body minimal and safe. Use: gh pr create --repo %s --title "%s" --body "Refs #%d". Never use closing keywords such as Closes/Fixes/Resolves in PR bodies for Maestro-managed work. Do NOT paste logs, doctor output, env dumps, or secret-bearing snippets into the PR body or comments.
-7. Preserve any Maestro-Backend: attribution trailer that Maestro adds to commit messages. Do NOT add backend/model attribution, pids, tmux session names, or host paths to PR bodies.
+7. Do NOT add backend/model attribution, effort, retry history, pids, tmux session names, or host paths to commit messages or PR bodies. Maestro records this control-plane telemetry internally.
 8. After creating the PR, you are done. Do NOT merge it yourself.
 
 Important: Always run cargo fmt --all before committing if this is a Rust project.

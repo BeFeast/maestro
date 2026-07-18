@@ -15,6 +15,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/progress"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // recordMaterialProgress collects and independently evaluates every exact
@@ -78,8 +79,21 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 	}
 	now = now.UTC()
 	slots := make([]string, 0, len(st.Sessions))
+	livePRs := make(map[int]struct{})
+	prGateOwners := make(map[int]string)
 	for slot := range st.Sessions {
 		slots = append(slots, slot)
+		sess := st.Sessions[slot]
+		if sess != nil && sess.Status == state.StatusRunning && sess.PID > 0 && sess.PRNumber > 0 {
+			livePRs[sess.PRNumber] = struct{}{}
+		}
+		if sess == nil || sess.PRNumber <= 0 || (sess.Status != state.StatusPROpen && sess.Status != state.StatusQueued) {
+			continue
+		}
+		ownerSlot, exists := prGateOwners[sess.PRNumber]
+		if !exists || prSessionOwnerPrecedes(slot, sess, ownerSlot, st.Sessions[ownerSlot]) {
+			prGateOwners[sess.PRNumber] = slot
+		}
 	}
 	sort.Strings(slots)
 
@@ -95,6 +109,21 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 				observations = append(observations, observation)
 			}
 		case state.StatusPROpen, state.StatusQueued:
+			// A live continuation/repair worker that owns this exact PR is the
+			// actionable progress target. Keeping the older pr_open session as a
+			// second gate target fabricates an overdue gate while the repair is
+			// actively advancing (OK Player #345/#406, PR #388). The gate becomes
+			// observable again automatically when the worker leaves StatusRunning.
+			if _, ownedByLiveWorker := livePRs[sess.PRNumber]; sess.PRNumber > 0 && ownedByLiveWorker {
+				continue
+			}
+			// A PR is one lifecycle gate even when historical/continuation sessions
+			// from different issues reference it. Keep the newest exact session as
+			// the deterministic owner so a completed continuation does not revive a
+			// second overdue target for the same PR.
+			if ownerSlot := prGateOwners[sess.PRNumber]; sess.PRNumber > 0 && ownerSlot != slot {
+				continue
+			}
 			if observation, ok := prGateProgressObservation(st, project, slot, sess, now); ok {
 				observations = append(observations, observation)
 			}
@@ -110,6 +139,27 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 		return observations[i].Target.Key() < observations[j].Target.Key()
 	})
 	return observations
+}
+
+func prSessionOwnerPrecedes(candidateSlot string, candidate *state.Session, currentSlot string, current *state.Session) bool {
+	if candidate == nil {
+		return false
+	}
+	candidateLive := candidate.Status == state.StatusRunning && candidate.PID > 0
+	currentLive := current != nil && current.Status == state.StatusRunning && current.PID > 0
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	if current == nil || candidate.StartedAt.After(current.StartedAt) {
+		return true
+	}
+	if current.StartedAt.After(candidate.StartedAt) {
+		return false
+	}
+	if candidate.Status != current.Status {
+		return candidate.Status == state.StatusQueued
+	}
+	return candidateSlot < currentSlot
 }
 
 func workerProgressObservation(st *state.State, project, slot string, sess *state.Session, now time.Time) (progress.Observation, bool) {
@@ -299,9 +349,11 @@ func terminalCheckpointProgress(sess *state.Session) (string, bool) {
 	}
 	parts := make([]string, 0, 3)
 	complete := true
+	liveTerminal := false
 	if strings.TrimSpace(sess.TmuxSession) != "" {
 		if live, ok := tmuxProgressFingerprint(sess.TmuxSession); ok {
 			parts = append(parts, "tmux="+live)
+			liveTerminal = true
 		} else {
 			complete = false
 		}
@@ -310,7 +362,12 @@ func terminalCheckpointProgress(sess *state.Session) (string, bool) {
 	}
 	if checkpoint, ok := boundedFileFingerprintProbe(sess.CheckpointFile, 1<<20); checkpoint != "" {
 		parts = append(parts, "checkpoint="+checkpoint)
-	} else if !ok {
+	} else if !ok && !liveTerminal {
+		// A checkpoint is an optional durable fallback while the exact live tmux
+		// terminal is readable. In-place resume can legitimately consume/remove
+		// CHECKPOINT.md while retaining its path in historical session state; that
+		// stale optional path must not poison fresh terminal evidence forever. If
+		// the live terminal is also unavailable, keep failing closed.
 		complete = false
 	}
 	return progress.Fingerprint(parts...), complete
@@ -360,7 +417,10 @@ func tmuxProgressFingerprint(session string) (string, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), tmuxProgressTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-p", "-t", "="+session, "-S", tmuxProgressHistoryLines)
+	// A pane target needs the trailing colon to identify the first pane of an
+	// exact session name. Without it, tmux interprets "=session" as a pane name
+	// and every real worker observation fails with "can't find pane".
+	cmd := tmuxsession.CommandContextForSession(ctx, session, "capture-pane", "-p", "-t", "="+session+":", "-S", tmuxProgressHistoryLines)
 	stdout := &boundedOutput{limit: tmuxProgressMaxOutputBytes}
 	stderr := &boundedOutput{limit: 32 << 10}
 	cmd.Stdout = stdout

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -333,6 +334,8 @@ type streamSplit struct {
 	MaestroBin string // path to the maestro binary providing the stream-split subcommand
 	Backend    string // backend kind for rendering (e.g. "claude")
 	JSONLPath  string // side-channel file for raw NDJSON frames (slot.jsonl)
+	MaxTokens  int    // active per-attempt hard ceiling (0 = accounting only)
+	MarkerPath string // deterministic budget-stop marker written before termination
 }
 
 // logPipeline builds the trailing `| ... | tee -a LOG` stage. When split is
@@ -348,6 +351,10 @@ func logPipeline(split *streamSplit, logFile string) string {
 		"--backend", split.Backend,
 		"--jsonl", split.JSONLPath,
 	})
+	if split.MaxTokens > 0 {
+		splitter += " --max-tokens " + strconv.Itoa(split.MaxTokens)
+		splitter += " --budget-marker " + shellQuote(split.MarkerPath)
+	}
 	return "2>&1 | " + splitter + " | " + tee
 }
 
@@ -385,6 +392,16 @@ func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardD
 }
 
 func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit) error {
+	// Resolve argv[0] while the daemon is generating the runner. A long-lived
+	// tmux server can retain an older PATH than maestro.service, so leaving a
+	// bare command such as "claude" makes retry/repair launches depend on stale
+	// tmux state. Every launch path writes through this helper; persisting the
+	// absolute service-resolved path therefore covers initial spawn, retry,
+	// repair, fallback, phase transition, and in-place resume uniformly.
+	resolvedArgs, err := resolveWorkerCommandPath(args)
+	if err != nil {
+		return err
+	}
 	guardDir, err := ensureSearchGuardrailWrappers(stateDir)
 	if err != nil {
 		return err
@@ -400,11 +417,42 @@ func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFi
 	if !ok {
 		return fmt.Errorf("resolve maestro executable for credential-safe worker exec")
 	}
-	runnerContent := buildWorkerRunnerScript(args, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
+	if split != nil && split.MaxTokens > 0 && split.MarkerPath != "" {
+		if err := os.Remove(split.MarkerPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("clear stale token-budget marker: %w", err)
+		}
+	}
+	runnerContent := buildWorkerRunnerScript(resolvedArgs, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
 	if err := writeFileAtomicMode(filepath.Dir(runnerPath), runnerPath, runnerContent, workerRunnerScriptMode); err != nil {
 		return fmt.Errorf("write runner script: %w", err)
 	}
 	return nil
+}
+
+func resolveWorkerCommandPath(args []string) ([]string, error) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return nil, fmt.Errorf("worker command is empty")
+	}
+	name := strings.TrimSpace(args[0])
+	resolved := name
+	if !filepath.IsAbs(name) {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve worker executable %q from maestro service PATH: %w", name, err)
+		}
+		resolved, err = filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("make worker executable %q absolute: %w", path, err)
+		}
+	}
+	if info, err := os.Stat(resolved); err != nil {
+		return nil, fmt.Errorf("validate worker executable %q: %w", resolved, err)
+	} else if info.IsDir() || info.Mode()&0111 == 0 {
+		return nil, fmt.Errorf("worker executable %q is not executable", resolved)
+	}
+	out := append([]string(nil), args...)
+	out[0] = resolved
+	return out, nil
 }
 
 // resolveWorkerCredentialsFile returns the single authoritative private path the
@@ -615,12 +663,15 @@ func openPrivateCredentialFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("open credential parent without following links: %w", err)
 	}
 	defer parent.Close()
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(int(parent.Fd()), &parentStat); err != nil {
+	parentInfo, err := parent.Stat()
+	if err != nil {
 		return nil, fmt.Errorf("stat credential parent: %w", err)
 	}
-	if os.FileMode(parentStat.Mode).Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("parent dir is group/other writable")
+	if err := checkOwnedByUs(parentPath, parentInfo); err != nil {
+		return nil, fmt.Errorf("credential parent: %w", err)
+	}
+	if parentInfo.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("credential parent is group/other accessible (mode %o)", parentInfo.Mode().Perm())
 	}
 	fd, err := unix.Openat(int(parent.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -983,8 +1034,8 @@ func ScrubLegacyRunArtifacts(stateDir string) {
 		scrubRunnerScript(path)
 	}
 
-	if len(secrets) == 0 {
-		return
+	if err := ensureWorkerLogDir(filepath.Join(stateDir, "logs")); err != nil && !os.IsNotExist(err) {
+		log.Printf("[worker] repair worker log dir permissions: %v", err)
 	}
 	if approvedBoundary != "" {
 		approvedBoundary, _ = filepath.Abs(approvedBoundary)
@@ -1148,7 +1199,20 @@ func scrubSecretValuesInPlace(path string, secrets []string) (bool, error) {
 			maxLen = len(secret)
 		}
 	}
+	repairedMode := os.FileMode(0o600)
+	if info.Mode().Perm()&0o100 != 0 {
+		repairedMode = 0o700
+	}
+	modeChanged := info.Mode().Perm() != repairedMode
 	if maxLen == 0 || info.Size() == 0 {
+		if modeChanged {
+			if err := f.Chmod(repairedMode); err != nil {
+				return false, err
+			}
+			if err := f.Sync(); err != nil {
+				return false, err
+			}
+		}
 		return false, nil
 	}
 	const chunkSize = 64 * 1024
@@ -1188,11 +1252,7 @@ func scrubSecretValuesInPlace(path string, secrets []string) (bool, error) {
 			break
 		}
 	}
-	if changed {
-		repairedMode := os.FileMode(0o600)
-		if info.Mode().Perm()&0o100 != 0 {
-			repairedMode = 0o700
-		}
+	if changed || modeChanged {
 		if err := f.Chmod(repairedMode); err != nil {
 			return false, err
 		}

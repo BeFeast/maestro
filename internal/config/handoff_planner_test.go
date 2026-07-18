@@ -140,4 +140,9 @@ func TestSupervisorDefaults_IncludeHandoffActions(t *testing.T) {
 	if !approval["open_child_issue"] {
 		t.Errorf("ApprovalRequiredActions missing open_child_issue: %#v", cfg.Supervisor.ApprovalRequiredActions)
 	}
+	for _, action := range []string{"spawn_worker", "spawn_repair_worker", "spawn_review_repair"} {
+		if approval[action] {
+			t.Errorf("mechanical action %q must be autonomous by default: %#v", action, cfg.Supervisor.ApprovalRequiredActions)
+		}
+	}
 }

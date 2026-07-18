@@ -55,6 +55,33 @@ not json at all
 	}
 }
 
+func TestParseClaudeUsage_LiveAssistantFramesBeforeResult(t *testing.T) {
+	const live = `{"type":"system","subtype":"init","model":"claude-opus"}
+{"type":"assistant","message":{"role":"assistant","model":"claude-opus","usage":{"input_tokens":30000,"output_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":7000}}}
+{"type":"assistant","message":{"role":"assistant","model":"claude-opus","usage":{"input_tokens":25000,"output_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":14000}}}
+`
+	usage, ok := ParseClaudeUsage(live)
+	if !ok {
+		t.Fatal("live assistant usage must be available before the terminal result frame")
+	}
+	if usage.TotalTokens != 80_000 {
+		t.Fatalf("TotalTokens = %d, want 80000", usage.TotalTokens)
+	}
+}
+
+func TestParseClaudeUsage_DeduplicatesRepeatedAssistantMessageFrames(t *testing.T) {
+	const live = `{"type":"assistant","message":{"id":"msg-same","role":"assistant","model":"claude-fable-5","content":[{"type":"thinking"}],"usage":{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":12258,"cache_read_input_tokens":30869}}}
+{"type":"assistant","message":{"id":"msg-same","role":"assistant","model":"claude-fable-5","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":12258,"cache_read_input_tokens":30869}}}
+`
+	usage, ok := ParseClaudeUsage(live)
+	if !ok {
+		t.Fatal("live assistant usage must be available")
+	}
+	if usage.TotalTokens != 43_134 {
+		t.Fatalf("TotalTokens = %d, want one message's 43134 rather than duplicate 86268", usage.TotalTokens)
+	}
+}
+
 // Multiple result frames (the slot.jsonl after a respawn appends a second
 // run's frames) must SUM to the cumulative run total — the property the
 // respawn-safe token watermark relies on.

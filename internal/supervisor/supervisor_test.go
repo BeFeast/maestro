@@ -136,6 +136,15 @@ func (f *fakeReader) PRCIStatus(prNumber int) (string, error) {
 	return f.ciStatuses[prNumber], nil
 }
 
+func (f *fakeReader) PRMergeable(prNumber int) (string, error) {
+	for _, pr := range f.prs {
+		if pr.Number == prNumber {
+			return pr.Mergeable, nil
+		}
+	}
+	return "", nil
+}
+
 func (f *fakeReader) PRMergeStatus(prNumber int) (string, string, error) {
 	mergeable := ""
 	for _, pr := range f.prs {
@@ -728,6 +737,94 @@ func TestDecide_OpenPR_CIPending_StaysMonitor(t *testing.T) {
 	}
 }
 
+func TestDecide_DraftPRCurrentHeadCIPending_StaysMonitor(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 406, Title: "Flatpak repair"}},
+		prs:        []github.PR{{Number: 388, HeadRefName: "feat/flatpak", Mergeable: "MERGEABLE", IsDraft: true}},
+		ciStatuses: map[int]string{388: "pending"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		Status:      state.StatusRetryExhausted,
+		Branch:      "feat/flatpak",
+		PRNumber:    388,
+		RetryCount:  3,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr while exact-head CI is pending", decision.RecommendedAction)
+	}
+	if decision.Target == nil || decision.Target.PR != 388 || decision.Target.Session != "ok-player-302" {
+		t.Fatalf("target = %#v, want canonical PR #388 / ok-player-302", decision.Target)
+	}
+}
+
+func TestDecide_DraftPRCurrentHeadCIFailed_RecommendsRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 407, Title: "Flatpak red"}},
+		prs:        []github.PR{{Number: 389, HeadRefName: "feat/flatpak-red", Mergeable: "MERGEABLE", IsDraft: true}},
+		ciStatuses: map[int]string{389: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-303"] = &state.Session{
+		IssueNumber: 407,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/flatpak-red",
+		PRNumber:    389,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want spawn_repair_worker for a failed draft head", decision.RecommendedAction)
+	}
+}
+
+func TestDecide_ConflictingDraftPRWithCIPending_RecommendsConflictRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 408, Title: "Conflict"}},
+		prs:        []github.PR{{Number: 390, HeadRefName: "feat/conflict", Mergeable: "CONFLICTING", IsDraft: true}},
+		ciStatuses: map[int]string{390: "pending"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-304"] = &state.Session{
+		IssueNumber: 408,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/conflict",
+		PRNumber:    390,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want conflict repair to outrank pending CI", decision.RecommendedAction)
+	}
+}
+
 // #512: PR is conflicting / dirty → planner stays on monitor_open_pr.
 // (The repair branch above already catches drafts, so we exercise
 // the post-repair-check fall-through here.)
@@ -930,6 +1027,197 @@ func TestDecide_ClosedPRWithActiveSessionExplained(t *testing.T) {
 	}
 }
 
+func TestDetectPRStuckStates_SkipsSettledSessionsBeforeRemoteResolution(t *testing.T) {
+	reader := &fakeReader{}
+	eng := testEngine(testConfig(t), reader)
+	st := state.NewState()
+	st.Sessions["done-slot"] = &state.Session{
+		IssueNumber: 101,
+		Status:      state.StatusDone,
+		PRNumber:    201,
+	}
+	st.Sessions["landed-slot"] = &state.Session{
+		IssueNumber: 102,
+		Status:      state.StatusCodeLanded,
+		PRNumber:    202,
+	}
+
+	findings := eng.detectPRStuckStates(st, nil, newResolutionCache(eng.reader))
+
+	if len(findings) != 0 {
+		t.Fatalf("settled sessions produced PR stuck findings: %#v", findings)
+	}
+	if got := reader.mergedPRCalls[201]; got != 0 {
+		t.Fatalf("done session PR remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.mergedPRCalls[202]; got != 0 {
+		t.Fatalf("code_landed session PR remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.closedIssueCalls[101]; got != 0 {
+		t.Fatalf("done session issue remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.closedIssueCalls[102]; got != 0 {
+		t.Fatalf("code_landed session issue remote-resolution calls = %d, want 0", got)
+	}
+}
+
+func TestSessionWithOpenPR_SkipsSettledSessionsBeforeRemoteResolution(t *testing.T) {
+	reader := &fakeReader{}
+	eng := testEngine(testConfig(t), reader)
+	st := state.NewState()
+	st.Sessions["done-slot"] = &state.Session{
+		IssueNumber: 101,
+		Status:      state.StatusDone,
+		PRNumber:    201,
+	}
+	st.Sessions["landed-slot"] = &state.Session{
+		IssueNumber: 102,
+		Status:      state.StatusCodeLanded,
+		PRNumber:    202,
+	}
+
+	_, _, _, found, _, _ := eng.sessionWithOpenPR(st, nil, newResolutionCache(eng.reader))
+
+	if found {
+		t.Fatal("settled session was selected as an open-PR candidate")
+	}
+	if got := reader.mergedPRCalls[201]; got != 0 {
+		t.Fatalf("done session PR remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.mergedPRCalls[202]; got != 0 {
+		t.Fatalf("code_landed session PR remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.closedIssueCalls[101]; got != 0 {
+		t.Fatalf("done session issue remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.closedIssueCalls[102]; got != 0 {
+		t.Fatalf("code_landed session issue remote-resolution calls = %d, want 0", got)
+	}
+}
+
+func TestDetectPRStuckStates_SharedPRUsesNewestContinuationSession(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "greptile"
+	cfg.AutoRetryReviewFeedback = true
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 388, HeadRefName: "feat/shared-pr", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{388: "success"},
+		greptileOK: map[int]bool{388: false},
+	}
+	eng := testEngine(cfg, reader)
+	st := state.NewState()
+	st.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 20, 0, 0, 0, time.UTC),
+	}
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC),
+	}
+
+	findings := eng.detectPRStuckStates(st, reader.prs, newResolutionCache(eng.reader))
+
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want one canonical PR finding", findings)
+	}
+	if findings[0].Code != "greptile_not_approved" || findings[0].Target == nil {
+		t.Fatalf("finding = %#v, want Greptile finding with target", findings[0])
+	}
+	if findings[0].Target.Issue != 406 || findings[0].Target.Session != "ok-player-302" || findings[0].Target.PR != 388 {
+		t.Fatalf("target = %#v, want continuation issue #406 / ok-player-302 / PR #388", findings[0].Target)
+	}
+}
+
+func TestDecide_SharedPRRepairUsesNewestUnblockedContinuation(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.ReviewGate = "greptile"
+	cfg.AutoRetryReviewFeedback = true
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(345, "historical issue", "blocked"),
+			testIssue(406, "continuation", "maestro-ready"),
+		},
+		prs:        []github.PR{{Number: 388, HeadRefName: "feat/shared-pr", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{388: "success"},
+		greptileOK: map[int]bool{388: false},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 20, 0, 0, 0, time.UTC),
+	}
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want %q; summary=%q", decision.RecommendedAction, ActionSpawnRepairWorker, decision.Summary)
+	}
+	if decision.Target == nil || decision.Target.Issue != 406 || decision.Target.Session != "ok-player-302" || decision.Target.PR != 388 {
+		t.Fatalf("target = %#v, want unblocked continuation issue #406 / ok-player-302 / PR #388", decision.Target)
+	}
+}
+
+func TestDecide_LivePRWorkerDoesNotBlockIndependentGateRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ReviewGate = "greptile"
+	cfg.AutoRetryReviewFeedback = true
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(406, "active repair", "maestro-ready"),
+			testIssue(412, "independent gate", "maestro-ready"),
+		},
+		prs: []github.PR{
+			{Number: 388, HeadRefName: "feat/active-repair", State: "OPEN", Mergeable: "MERGEABLE"},
+			{Number: 413, HeadRefName: "feat/independent-gate", State: "OPEN", Mergeable: "MERGEABLE"},
+		},
+		ciStatuses: map[int]string{388: "success", 413: "success"},
+		greptileOK: map[int]bool{388: false, 413: false},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PID: 1234,
+		PRNumber: 388, Branch: "feat/active-repair",
+		StartedAt: time.Date(2026, 7, 18, 3, 43, 0, 0, time.UTC),
+	}
+	st.Sessions["ok-player-305"] = &state.Session{
+		IssueNumber: 412, Status: state.StatusPROpen,
+		PRNumber: 413, Branch: "feat/independent-gate",
+		StartedAt: time.Date(2026, 7, 18, 2, 21, 0, 0, time.UTC),
+	}
+
+	eng := testEngine(cfg, reader)
+	findings := eng.detectPRStuckStates(st, reader.prs, newResolutionCache(eng.reader))
+	for _, finding := range findings {
+		if finding.Target != nil && finding.Target.PR == 388 {
+			t.Fatalf("live worker PR produced a separate stuck finding: %#v", finding)
+		}
+	}
+	stuck := requireStuckState(t, state.SupervisorDecision{StuckStates: findings}, "greptile_not_approved")
+	if stuck.Target == nil || stuck.Target.Issue != 412 || stuck.Target.Session != "ok-player-305" || stuck.Target.PR != 413 {
+		t.Fatalf("independent finding target = %#v, want issue #412 / ok-player-305 / PR #413", stuck.Target)
+	}
+
+	decision, err := eng.Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want %q; summary=%q", decision.RecommendedAction, ActionSpawnRepairWorker, decision.Summary)
+	}
+	if decision.Target == nil || decision.Target.Issue != 412 || decision.Target.Session != "ok-player-305" || decision.Target.PR != 413 {
+		t.Fatalf("decision target = %#v, want issue #412 / ok-player-305 / PR #413", decision.Target)
+	}
+}
+
 func TestDecide_FailingChecksExplained(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
@@ -960,6 +1248,7 @@ func TestDecide_FailingChecksExplained(t *testing.T) {
 func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
+		issues: []github.Issue{testIssue(94, "failing checks", "maestro-ready")},
 		prs: []github.PR{{
 			Number:      31,
 			HeadRefName: "feat/checks",
@@ -995,6 +1284,84 @@ func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T
 	}
 	if !strings.Contains(strings.ToLower(decision.Summary), "repair worker") {
 		t.Fatalf("summary = %q, want repair worker", decision.Summary)
+	}
+}
+
+func TestDecide_BlockedIssueWithOpenPRNeverMintsRepairApproval(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{
+		issues: []github.Issue{testIssue(331, "canonical PR #335", "blocked")},
+		prs: []github.PR{{
+			Number:      335,
+			HeadRefName: "feat/ok-player-247-331-fix",
+			State:       "OPEN",
+			Mergeable:   "MERGEABLE",
+			IsDraft:     true,
+		}},
+		ciStatuses: map[int]string{335: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		IssueTitle:  "canonical PR #335",
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Branch:      "feat/ok-player-247-331-fix",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionMonitorOpenPR)
+	}
+	if decision.RequiresApproval || decision.ApprovalID != "" {
+		t.Fatalf("blocked decision minted approval: requires=%v id=%q", decision.RequiresApproval, decision.ApprovalID)
+	}
+	if !strings.Contains(decision.Summary, `label "blocked"`) {
+		t.Fatalf("summary = %q, want current blocked-label guard", decision.Summary)
+	}
+}
+
+func TestDecide_MergeReadyPRRanksAheadOfOlderBlockedDraft(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(331, "old blocked draft", "blocked"),
+			testIssue(365, "clean P0"),
+		},
+		prs: []github.PR{
+			{Number: 335, HeadRefName: "feat/old-draft", State: "OPEN", Mergeable: "MERGEABLE", IsDraft: true},
+			{Number: 370, HeadRefName: "feat/clean-p0", State: "OPEN", Mergeable: "MERGEABLE"},
+		},
+		ciStatuses: map[int]string{335: "success", 370: "success"},
+		greptileOK: map[int]bool{335: true, 370: true},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331, IssueTitle: "old blocked draft", Status: state.StatusPROpen,
+		PRNumber: 335, Branch: "feat/old-draft",
+	}
+	st.Sessions["ok-player-274"] = &state.Session{
+		IssueNumber: 365, IssueTitle: "clean P0", Status: state.StatusPROpen,
+		PRNumber: 370, Branch: "feat/clean-p0",
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMergePR {
+		t.Fatalf("action = %q, want %q; summary=%q", decision.RecommendedAction, ActionMergePR, decision.Summary)
+	}
+	if decision.Target == nil || decision.Target.PR != 370 || decision.Target.Issue != 365 || decision.Target.Session != "ok-player-274" {
+		t.Fatalf("target = %#v, want clean PR #370 / issue #365 / ok-player-274", decision.Target)
 	}
 }
 
@@ -1344,6 +1711,34 @@ func TestRunOnce_StampsLastRunOnceAt(t *testing.T) {
 	if st.LastRunOnceAt.Before(before) || st.LastRunOnceAt.After(after.Add(time.Second)) {
 		t.Fatalf("LastRunOnceAt=%s is outside the call window [%s, %s]",
 			st.LastRunOnceAt, before, after)
+	}
+}
+
+func TestPersistSupervisorHeartbeatClearsStuckState(t *testing.T) {
+	cfg := testConfig(t)
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	st.SupervisorStuck = true
+	st.SupervisorStuckReason = "synthetic concurrent writer conflict"
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	want := time.Now().UTC().Truncate(time.Microsecond)
+	if err := persistSupervisorHeartbeat(cfg.StateDir, want); err != nil {
+		t.Fatalf("persistSupervisorHeartbeat: %v", err)
+	}
+	got, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !got.LastRunOnceAt.Equal(want) {
+		t.Fatalf("LastRunOnceAt = %s, want %s", got.LastRunOnceAt, want)
+	}
+	if got.SupervisorStuck || got.SupervisorStuckReason != "" {
+		t.Fatalf("stuck state not cleared: stuck=%v reason=%q", got.SupervisorStuck, got.SupervisorStuckReason)
 	}
 }
 
@@ -2679,6 +3074,9 @@ func TestDecideWithLLM_UnknownActionRejected(t *testing.T) {
 func TestDecideWithLLM_ApprovalRequiredActionRejectedWithoutApproval(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	// Explicit operator policy can still gate mechanical dispatch even though
+	// hands-off projects no longer do so by default.
+	cfg.Supervisor.ApprovalRequiredActions = []string{ActionSpawnWorker}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
 	llm := &fakeLLM{output: `{
   "summary": "Issue #42 is ready to feed.",
@@ -2693,6 +3091,25 @@ func TestDecideWithLLM_ApprovalRequiredActionRejectedWithoutApproval(t *testing.
 	_, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
 	if err == nil || !strings.Contains(err.Error(), "requires approval") {
 		t.Fatalf("Decide error = %v, want requires approval", err)
+	}
+}
+
+func TestDecideWithLLM_BackendFailureUsesDeterministicGuardrail(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.ApprovalRequiredActions = []string{ActionMergePR}
+	reader := &fakeReader{issues: []github.Issue{testIssue(940, "prove unattended SLA", "maestro-ready")}}
+	llm := &fakeLLM{err: errors.New("provider unavailable")}
+
+	decision, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker || decision.Target == nil || decision.Target.Issue != 940 {
+		t.Fatalf("decision = %+v, want deterministic spawn_worker for #940", decision)
+	}
+	if decision.ErrorClass != ErrorClassSupervisorBackend {
+		t.Fatalf("ErrorClass = %q, want %q", decision.ErrorClass, ErrorClassSupervisorBackend)
 	}
 }
 

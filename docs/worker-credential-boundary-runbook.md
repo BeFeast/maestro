@@ -18,8 +18,8 @@ credential copy.
 ## File contract
 
 - The file is a regular file owned by the Maestro service user, mode `0600` or
-  stricter, below a directory that is not group/other writable. Symlinks in the
-  path are rejected.
+  stricter, below an owner-only directory owned by that same user (mode `0700`
+  or stricter). Symlinks in the path are rejected.
 - Use simple `KEY=value` assignments. Single- or double-quoted values are
   accepted. Only `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
   `ANTHROPIC_AUTH_TOKEN`, `CLIPROXY_API_KEY`, `GEMINI_API_KEY`,
@@ -62,7 +62,9 @@ Startup reconciliation removes legacy `*-run.env` copies and the obsolete
 exports/source lines, and masks known legacy values in text state, prompts,
 postmortems, audit JSONL, structured output, and logs. Log masking is same-inode
 and same-length, so an active worker's open append descriptor remains valid; the
-scrub never signals or kills a process.
+scrub never signals or kills a process. It also repairs recognized worker text
+artifacts to owner-only modes and the worker log directory to `0700`, even when
+there is no currently known value to mask.
 
 ## Rotation, canary, and zero-copy proof
 
@@ -80,6 +82,15 @@ After the code and unit migration are installed, the operator still must:
 
 The synthetic regression suite exercises the same zero-copy invariant without
 using production values.
+
+CLIProxyAPI rotation failures cross this boundary only as a secret-free
+aggregate: provider, requested model, number of candidates when the proxy
+reports it, number usable for that model, aggregate reason, and retry time.
+Credential filenames, account identifiers, selector bindings, request headers,
+and raw proxy payloads must not enter Maestro state, Fleet API responses, or
+Mission Control. A per-credential cooldown is not surfaced as a provider
+failure; the proxy keeps rotating until a compatible credential succeeds or it
+returns the aggregate `model_cooldown` result.
 
 ## Rollback
 

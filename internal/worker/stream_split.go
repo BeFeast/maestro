@@ -32,6 +32,13 @@ func JSONLPathForLog(logFile string) string {
 // flushed per line so the orchestrator's live log polling (rate-limit /
 // silent-timeout detection) sees output in real time.
 func RunStreamSplit(backend, jsonlPath string, r io.Reader, w io.Writer) error {
+	return RunStreamSplitWithBudget(backend, jsonlPath, 0, "", r, w, nil)
+}
+
+// RunStreamSplitWithBudget adds live token enforcement to the structured
+// stream. Usage is evaluated once per provider response/event, so measurement
+// lag is bounded to one backend response plus line-flush time.
+func RunStreamSplitWithBudget(backend, jsonlPath string, maxTokens int, markerPath string, r io.Reader, w io.Writer, stop func()) error {
 	var jf *os.File
 	if strings.TrimSpace(jsonlPath) != "" {
 		f, err := os.OpenFile(jsonlPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -46,6 +53,7 @@ func RunStreamSplit(backend, jsonlPath string, r io.Reader, w io.Writer) error {
 	br := bufio.NewReader(r)
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
+	monitor := newLiveTokenMonitor(backend, maxTokens)
 
 	for {
 		// ReadString tolerates arbitrarily long frames (tool results / large
@@ -60,6 +68,22 @@ func RunStreamSplit(backend, jsonlPath string, r io.Reader, w io.Writer) error {
 				}
 			}
 			line := strings.TrimRight(chunk, "\r\n")
+			if observed, exceeded := monitor.observe(line); exceeded {
+				if err := writeTokenBudgetMarker(markerPath, backend, observed, maxTokens); err != nil {
+					if stop != nil {
+						stop()
+					}
+					return fmt.Errorf("write token-budget marker: %w", err)
+				}
+				bw.Flush()
+				if jf != nil {
+					_ = jf.Sync()
+				}
+				if stop != nil {
+					stop()
+				}
+				return ErrTokenBudgetExceeded
+			}
 			if rendered := renderStreamLine(backend, line); rendered != "" {
 				bw.WriteString(rendered)
 				if !strings.HasSuffix(rendered, "\n") {
@@ -340,9 +364,9 @@ func renderCodexItem(item *codexRenderItem, completed bool) string {
 // opencodeRenderFrame is the subset of an opencode --format json event line the
 // renderer decodes. step_finish carries the usage block with tokens/cost.
 type opencodeRenderFrame struct {
-	Type      string               `json:"type"`
-	Timestamp int64                `json:"timestamp"`
-	Part      *opencodeRenderPart  `json:"part"`
+	Type      string              `json:"type"`
+	Timestamp int64               `json:"timestamp"`
+	Part      *opencodeRenderPart `json:"part"`
 }
 
 type opencodeRenderPart struct {

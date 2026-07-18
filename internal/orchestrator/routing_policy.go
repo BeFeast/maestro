@@ -33,8 +33,8 @@ func applyTierOverride(cfg *config.Config, backendName string, decision router.B
 	for k, v := range cfg.Model.Backends {
 		backends[k] = v
 	}
-	// Set BOTH the #513 attribution Model/Effort (so the dashboard + the durable
-	// Maestro-Backend: trailer reflect the model the tier actually ran, and the
+	// Set BOTH the #513 attribution Model/Effort (so the dashboard and durable
+	// internal session timeline reflect the model the tier actually ran, and the
 	// pi backend, which reads cfg.Model directly, still receives the override) AND
 	// the distinct TierModel/TierEffort carriers that thread into the worker argv
 	// for claude/codex/gemini. The distinct carriers are what keep a non-policy
@@ -177,7 +177,7 @@ func (o *Orchestrator) applyPolicyBudget(s *state.State, decision router.Backend
 	// original (top-tier) decision was already health-gated, so when the downgrade
 	// target is blocked, keep the healthy strong dispatch this wave rather than
 	// spawn a doomed worker; the cap re-applies next cycle.
-	if blockedBy, _ := o.dispatchBackendBlock(s, downgraded.Backend, time.Now().UTC()); blockedBy != "" {
+	if blockedBy, _ := o.dispatchBackendBlock(s, downgraded.Backend, downgraded.Model, time.Now().UTC()); blockedBy != "" {
 		log.Printf("[orch] policy budget: downgrade target %s blocked (%s) — keeping %s (%s) dispatch this wave",
 			downgraded.Backend, blockedBy, decision.Backend, decision.Tier)
 		return decision
@@ -281,7 +281,7 @@ func (o *Orchestrator) escalateRetryBackend(s *state.State, sess *state.Session,
 	// Reuse BackendHealth gating (RFC §2.6): never escalate onto a backend that
 	// is disabled or cooling down after an auth failure / provider limit — leave
 	// the retry on its current backend instead of spawning a doomed worker.
-	if blockedBy, _ := o.dispatchBackendBlock(s, decision.Backend, time.Now().UTC()); blockedBy != "" {
+	if blockedBy, _ := o.dispatchBackendBlock(s, decision.Backend, decision.Model, time.Now().UTC()); blockedBy != "" {
 		log.Printf("[orch] issue #%d retry: escalation target %s blocked (%s) — keeping backend %s",
 			sess.IssueNumber, decision.Backend, blockedBy, sess.Backend)
 		return router.BackendDecision{}, false

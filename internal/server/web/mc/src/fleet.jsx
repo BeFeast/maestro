@@ -11,6 +11,7 @@ import {
   formatBackendHealthSentence,
   formatBackendQuotaSentence,
   formatCountdown,
+  formatProviderModelHealthSentence,
   formatTokens,
   formatUSD,
   nextDecisionCountdown,
@@ -120,6 +121,7 @@ export function FleetScreen({ navigate }) {
 
       <BackendHealthRow entries={fleet.backendHealth || []} now={now} />
       <BackendQuotaRow entries={fleet.backendQuota || []} now={now} />
+      <ProviderModelHealthRow entries={fleet.providerModelHealth || []} now={now} />
 
       <div className="stats">
         <Stat
@@ -584,6 +586,27 @@ function BackendQuotaRow({ entries, now }) {
               <span style={{ display: "block", width: `${width}%`, height: "100%", borderRadius: 3, background: "currentColor" }} />
             </span>
             <span style={{ fontSize: 10.5, opacity: 0.85 }}>{sentence}</span>
+          </Pill>
+        );
+      })}
+    </div>
+  );
+}
+
+function ProviderModelHealthRow({ entries, now }) {
+  if (!entries || entries.length === 0) return null;
+  return (
+    <div className="backend-health row gap-2" style={{ flexWrap: "wrap", marginTop: "var(--s-3)", marginBottom: "var(--s-3)" }}>
+      <span className="mono dim" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+        model routes
+      </span>
+      {entries.map(entry => {
+        const sentence = formatProviderModelHealthSentence(entry, now);
+        const title = `${entry.provider}/${entry.model} ${entry.state || "unknown"}; ${sentence}`;
+        return (
+          <Pill key={`${entry.provider}/${entry.model}`} tone={backendHealthTone(entry.state)} noDot title={title}>
+            <strong style={{ fontSize: 11.5, marginRight: 6 }}>{entry.provider}/{entry.model}</strong>
+            <span style={{ fontSize: 10.5, opacity: 0.85 }}>{sentence || entry.state || "unknown"}</span>
           </Pill>
         );
       })}

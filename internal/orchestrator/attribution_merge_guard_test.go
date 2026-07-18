@@ -11,9 +11,9 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
-// mergeGuardSession builds a merge-eligible session that carries attribution, so
-// autoMergePRs will attempt the pre-merge attribution amend before deciding
-// whether to merge.
+// mergeGuardSession builds a merge-eligible session carrying a complete
+// internal attribution timeline. That state must not cause any target-branch
+// mutation (#1000).
 func mergeGuardSession(branch string, pr int) *state.Session {
 	return &state.Session{
 		IssueNumber: 858,
@@ -32,119 +32,38 @@ func mergeGuardSession(branch string, pr int) *state.Session {
 	}
 }
 
-// When the pre-merge attribution amend defers (the branch is still advancing
-// under a concurrent worker/operator push), autoMergePRs must NOT let the PR
-// reach the merge decision this cycle: merging now would land it permanently
-// without the required Maestro-Backend trailer while the deferral's promised
-// retry never runs. The guard must short-circuit before even querying CI, so a
-// later quiet cycle can stamp the trailer and then merge (#858).
-func TestAutoMergePRs_DeferredAttributionBlocksMerge(t *testing.T) {
-	branch := "feat/sup-858-amend-race"
+// Attribution is durable in Maestro state and Fleet, not in product commits.
+// The merge path must ignore the legacy amend hook and continue to observe the
+// authoritative PR gate even if that hook would have failed (#1000).
+func TestAutoMergePRs_InternalAttributionNeverAmendsProductBranch(t *testing.T) {
+	branch := "feat/sup-1000-internal-attribution"
 	s := state.NewState()
 	s.Sessions["sup-858"] = mergeGuardSession(branch, 864)
 
 	ciQueried := false
-	merged := false
+	amendCalled := false
 	o := &Orchestrator{
 		cfg: &config.Config{},
 		listOpenPRsFn: func() ([]github.PR, error) {
 			return []github.PR{{Number: 864, HeadRefName: branch}}, nil
 		},
 		amendHeadFn: func(worktreePath, b string, attribution []state.BackendAttribution, now time.Time) error {
-			return errAmendDeferred
+			amendCalled = true
+			return errors.New("legacy amend hook must be unreachable")
 		},
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			ciQueried = true
-			return "success", nil
-		},
-		ghMergePRFn: func(prNumber int) error {
-			merged = true
-			return nil
+			return "", errors.New("stop after proving normal gate observation")
 		},
 	}
 
 	o.autoMergePRs(s)
 
-	if merged {
-		t.Fatal("deferred attribution amend must block the merge — ghMergePRFn was called (#858)")
+	if amendCalled {
+		t.Fatal("merge path invoked legacy attribution amend hook")
 	}
-	if ciQueried {
-		t.Fatal("deferred attribution amend must short-circuit before the merge flow continues (CI was queried)")
-	}
-	// The session stays merge-eligible so a later quiet cycle completes it.
-	if s.Sessions["sup-858"].Status != state.StatusPROpen {
-		t.Fatalf("session status = %q, want pr_open (still awaiting a quiet cycle)", s.Sessions["sup-858"].Status)
-	}
-}
-
-// An unexpected amend failure is just as unsafe as a known deferral: the
-// trailer is not known to be on the remote, so the merge path must fail closed
-// before querying CI or attempting the merge.
-func TestAutoMergePRs_UnexpectedAttributionFailureBlocksMerge(t *testing.T) {
-	branch := "feat/sup-873-amend-error"
-	s := state.NewState()
-	s.Sessions["sup-873"] = mergeGuardSession(branch, 875)
-
-	ciQueried := false
-	merged := false
-	o := &Orchestrator{
-		cfg: &config.Config{},
-		listOpenPRsFn: func() ([]github.PR, error) {
-			return []github.PR{{Number: 875, HeadRefName: branch}}, nil
-		},
-		amendHeadFn: func(worktreePath, b string, attribution []state.BackendAttribution, now time.Time) error {
-			return errors.New("ordinary git failure")
-		},
-		ghPRCIStatusFn: func(prNumber int) (string, error) {
-			ciQueried = true
-			return "success", nil
-		},
-		ghMergePRFn: func(prNumber int) error {
-			merged = true
-			return nil
-		},
-	}
-
-	o.autoMergePRs(s)
-
-	if merged {
-		t.Fatal("unexpected attribution failure must block the merge")
-	}
-	if ciQueried {
-		t.Fatal("unexpected attribution failure must short-circuit before CI is queried")
-	}
-}
-
-// The guard is specific to the deferral: when the attribution amend lands (or is
-// a no-op), autoMergePRs proceeds past the attribution step into the normal
-// merge flow (here it reaches the CI query). This proves the guard does not
-// over-block PRs whose trailer is already settled.
-func TestAutoMergePRs_SettledAttributionProceedsToMergeFlow(t *testing.T) {
-	branch := "feat/sup-858-amend-settled"
-	s := state.NewState()
-	s.Sessions["sup-858"] = mergeGuardSession(branch, 870)
-
-	ciQueried := false
-	o := &Orchestrator{
-		cfg: &config.Config{},
-		listOpenPRsFn: func() ([]github.PR, error) {
-			return []github.PR{{Number: 870, HeadRefName: branch}}, nil
-		},
-		amendHeadFn: func(worktreePath, b string, attribution []state.BackendAttribution, now time.Time) error {
-			return nil // trailer landed / already present
-		},
-		ghPRCIStatusFn: func(prNumber int) (string, error) {
-			ciQueried = true
-			// Return an error so the flow stops here without needing the full
-			// review-gate/merge machinery; reaching this hook is the assertion.
-			return "", errors.New("ci lookup stops the test here")
-		},
-	}
-
-	o.autoMergePRs(s)
-
 	if !ciQueried {
-		t.Fatal("a settled attribution amend must let the merge flow proceed past attribution to the CI query")
+		t.Fatal("normal CI gate observation was blocked by internal attribution state")
 	}
 }
 

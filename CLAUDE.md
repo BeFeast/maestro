@@ -6,9 +6,9 @@ from the repo root) working in the maestro repository.
 ## Commit-message & PR convention
 
 - **Do NOT add `Co-authored-by: Claude …` or `🤖 Generated with Claude Code`
-  trailers** to commit messages or PR bodies. maestro attributes work via its
-  own durable trailer (below); the Claude/agent byline is noise in this repo's
-  history and is intentionally suppressed.
+  trailers** to commit messages or PR bodies. Maestro attributes work in its
+  internal durable state; agent bylines and control-plane telemetry are noise
+  in product history and are intentionally suppressed.
 
   > Note: the `Co-authored-by` byline is emitted by the Claude Code *harness*,
   > not by maestro code. The deterministic switch that stops it is
@@ -16,12 +16,12 @@ from the repo root) working in the maestro repository.
   > document records the convention; an operator still has to set that flag for
   > the trailer to actually disappear.
 
-- **Do preserve the `Maestro-Backend:` trailer on commits.** maestro stamps it
-  on commit messages (`internal/state/attribution.go`,
-  `state.AttributionTrailerKey`) to record the backend timeline for a session.
-  It is the canonical, queryable attribution for this repo — never strip,
-  rewrite, or duplicate it. It goes on commits only: PR bodies must contain no
-  backend/model attribution, pids, tmux session names, or host-side paths,
+- **Keep backend attribution internal.** Maestro records the backend timeline
+  in its durable state and Fleet Mission Control. Do not add provider/model,
+  effort, retry, host, or session telemetry to product commit messages or PR
+  bodies. Historical `Maestro-Backend:` trailers remain readable, but Maestro
+  must not amend or force-push target branches solely to add them. PR bodies
+  must contain no backend/model attribution, pids, tmux session names, or host-side paths,
   because they land on target repos that may be public (#799).
 
 - **Do NOT use GitHub auto-closing keywords** (`Closes`, `Fixes`, `Resolves`,

@@ -35,7 +35,7 @@ overrides.
 | `supervisor.allow_metered_backend` | bool | allow a per-token supervisor backend (#838) |
 | `supervisor.always_consult_llm` | bool | force an LLM call every cycle (#837) |
 | `poll_interval_seconds` | int | supervise/orchestrate poll cadence |
-| `worker_max_tokens` | int | kill a worker over this token budget (0 = unlimited) |
+| `worker_max_tokens` | int | enforce a per-attempt live token ceiling (0 = unlimited) |
 
 ## Commands
 
@@ -68,6 +68,46 @@ maestro settings audit
 Flags: `--db <path>` (default `~/.maestro/maestro.db`), `--actor <name>` (default
 `cli:<user>`), and `--limit N` on `audit`. Flags may appear before or after the
 `key`/`key=value` argument.
+
+## Live token ceiling
+
+`worker_max_tokens` is enforced in the worker stream, independently of the
+normal orchestration poll interval. Claude, Pi, and OpenCode usage is evaluated
+after each usage-bearing provider response. Codex's emitted thread id is used to
+read its live cumulative `token_count` rollout events (including cached input),
+and the same value is also installed as Codex's native `rollout_budget` fallback
+inside the agent loop, including sub-agent work.
+
+For Claude and Pi the ceiling measure is **uncached tokens**: input + output +
+new cache-write tokens. Cache reads remain visible in cost/usage telemetry but
+are excluded from the ceiling because they replay previously produced context;
+counting the full cached context on every turn can kill a healthy worker after
+only a few new tokens. Repeated Claude stream frames for the same assistant
+message are de-duplicated by message id. Token-budget markers and Fleet worker
+rows expose `token_budget_measure: uncached_tokens`; total session/cost counters
+continue to retain the provider's full cache-aware usage.
+
+The measurement lag and maximum overshoot are therefore **one provider
+response**, plus the time needed to flush one JSONL line. There is no additional
+minutes-long Maestro poll delay. A single provider response can contain a
+variable number of tokens, so the bound is expressed in response units rather
+than a fixed token constant; the regression suite verifies later responses are
+not consumed after the first event reaches the ceiling.
+
+The ceiling fails closed when Maestro cannot enforce it live:
+
+- Claude and Codex require `usage_stream: true` with Maestro-managed structured
+  output; Codex `--ephemeral` mode is rejected because it removes the live
+  rollout telemetry file.
+- Pi must retain Maestro-managed JSON mode.
+- OpenCode requires `usage_stream: true` with Maestro-managed JSON output.
+- Gemini, Cline, generic CLIs, and operator-overridden non-structured output
+  cannot start while a positive `worker_max_tokens` is active.
+
+Codex's rollout file supplies the same cumulative total shown in Mission
+Control. Its native fallback counts sampled output plus non-cached input at
+weight 1.0 and prevents an older or temporarily unreadable rollout path from
+degrading all the way back to post-exit-only enforcement.
 
 ## Hot reload — no restart
 

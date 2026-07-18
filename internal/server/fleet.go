@@ -1356,6 +1356,7 @@ type fleetProjectState struct {
 	SelfResolving   int                   `json:"self_resolving,omitempty"`
 	Active          []sessionInfo         `json:"active,omitempty"`
 	Attention       []sessionInfo         `json:"attention,omitempty"`
+	IssueClaims     []state.IssueClaim    `json:"issue_claims,omitempty"`
 	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
 	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
 	Actions         []controlAction       `json:"actions,omitempty"`
@@ -1383,6 +1384,11 @@ type fleetProjectState struct {
 	// so an operator can see that a whole backend is paused and that
 	// auto-recovery is on a known clock.
 	BackendHealth map[string]state.BackendHealth `json:"backend_health,omitempty"`
+
+	// ProviderModelHealth carries cooldowns scoped to one provider/model route.
+	// A route can be unavailable while the provider and its other models remain
+	// healthy, so this must not be folded into BackendHealth.
+	ProviderModelHealth map[string]map[string]state.BackendHealth `json:"provider_model_health,omitempty"`
 
 	// BackendQuota is the per-backend subscription quota position (#704)
 	// for backends with quota config: window/weekly percent used, reset
@@ -1640,8 +1646,10 @@ type fleetSignalProgress struct {
 type fleetProgressRecovery struct {
 	Action                string   `json:"action"`
 	Outcome               string   `json:"outcome,omitempty"`
+	Stage                 string   `json:"stage,omitempty"`
 	RecommendationID      string   `json:"recommendation_id,omitempty"`
 	Reason                string   `json:"reason,omitempty"`
+	LeaseGeneration       int      `json:"lease_generation,omitempty"`
 	Phase                 string   `json:"phase,omitempty"`
 	At                    string   `json:"at,omitempty"`
 	CompletedAt           string   `json:"completed_at,omitempty"`
@@ -1707,11 +1715,14 @@ type fleetWorkerState struct {
 	// BackendSelection records why this backend was chosen (label, role, auto,
 	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
-	BackendSelection  *state.BackendSelection `json:"backend_selection,omitempty"`
-	PRNumber          int                     `json:"pr_number,omitempty"`
-	PRURL             string                  `json:"pr_url,omitempty"`
-	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
-	TokensUsedTotal   int                     `json:"tokens_used_total"`
+	BackendSelection   *state.BackendSelection `json:"backend_selection,omitempty"`
+	PRNumber           int                     `json:"pr_number,omitempty"`
+	PRURL              string                  `json:"pr_url,omitempty"`
+	TokensUsedAttempt  int                     `json:"tokens_used_attempt"`
+	TokensUsedTotal    int                     `json:"tokens_used_total"`
+	WorkerMaxTokens    int                     `json:"worker_max_tokens,omitempty"`
+	TokenBudgetMeasure string                  `json:"token_budget_measure,omitempty"`
+	WorkerOutcome      string                  `json:"worker_outcome,omitempty"`
 	// CostUSDEstimate is the $ estimate for TokensUsedTotal under the
 	// project's configured per-backend pricing (#619), OR the backend's
 	// self-reported cost when present (#730, Pi --mode json cost.total). 0
@@ -3974,6 +3985,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	// session recorded after the cooldown was set all render as healthy.
 	state.ReconcileBackendHealth(st, now)
 	item.BackendHealth = st.BackendHealth
+	item.ProviderModelHealth = st.ProviderModelHealth
 	item.BackendQuota = buildFleetBackendQuota(cfg, st, now)
 	item.CostObservability = buildFleetCostObservability(cfg, st, now)
 	projectState := buildStateResponse(cfg, st)
@@ -4001,6 +4013,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
 	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
 	item.Epics, item.EpicSummary = fleetEpicProgressFromState(st)
+	item.IssueClaims = st.ActiveIssueClaims()
 	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
@@ -4008,24 +4021,6 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.ApprovalSummary[approval.Status]++
 		}
 	}
-	// #814: classify why the project is (not) implementing so operators can tell
-	// an empty queue from a gate-bound-but-eligible pipeline. Signals are read
-	// from the same snapshot: eligible from the supervisor queue analysis,
-	// pending approvals from the approval summary, model limits from backend
-	// health.
-	eligibleIssues := 0
-	if item.QueueSnapshot != nil {
-		eligibleIssues = item.QueueSnapshot.Eligible
-	}
-	activity, activityReason := state.ClassifyActivity(state.ActivityInput{
-		Capacity:         capacity,
-		EligibleIssues:   eligibleIssues,
-		PendingApprovals: item.ApprovalSummary["pending"],
-		BackendsBlocked:  allBackendsBlocked(item.BackendHealth, configuredWorkerBackends(cfg)),
-		Paused:           item.Paused,
-	})
-	item.Activity = string(activity)
-	item.ActivityReason = activityReason
 	staleAudits := reconcileStaleSessions(cfg, st, now)
 	staleSlots := make(map[string]state.StaleSessionAudit, len(staleAudits))
 	for _, audit := range staleAudits {
@@ -4037,6 +4032,13 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	workers := make([]fleetWorkerState, 0, len(projectState.All))
 	for _, worker := range projectState.All {
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		if worker.NeedsAttention {
+			if canonical, ok := fleetSupersedingIssueSession(worker, projectState.All); ok {
+				worker.NeedsAttention = false
+				worker.StatusReason = fmt.Sprintf("superseded by canonical session %s (%s)", canonical.Slot, canonical.Status)
+				worker.NextAction = "No operator action required: follow the canonical session for this issue."
+			}
+		}
 		if audit, isStale := staleSlots[worker.Slot]; isStale {
 			worker.NeedsAttention = false
 			if reason := strings.TrimSpace(audit.Reason); reason != "" {
@@ -4047,7 +4049,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 			item.Attention = append(item.Attention, worker)
-			if fleetSessionIsConvergenceBound(worker) {
+			if fleetSessionIsConvergenceBound(worker, item.Supervisor.Latest) {
 				item.SelfResolving++
 			}
 		}
@@ -4067,8 +4069,146 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.Active = append(item.Active, worker)
 		}
 	}
+	// #814/#996: classify only after canonical attention has been counted and
+	// stale/historical sessions have been suppressed. Otherwise a failed,
+	// retry-exhausted open PR has no live worker or PRGate capacity entry and
+	// falsely falls through to queue_empty while its in-place repair is pending.
+	eligibleIssues := 0
+	if item.QueueSnapshot != nil {
+		eligibleIssues = item.QueueSnapshot.Eligible
+	}
+	actionableAttention := item.NeedsAttention - item.SelfResolving
+	if actionableAttention < 0 {
+		actionableAttention = 0
+	}
+	activity, activityReason := state.ClassifyActivity(state.ActivityInput{
+		Capacity:            capacity,
+		EligibleIssues:      eligibleIssues,
+		PendingApprovals:    item.ApprovalSummary["pending"],
+		ActionableAttention: actionableAttention,
+		BackendsBlocked:     allBackendsBlocked(item.BackendHealth, configuredWorkerBackends(cfg)),
+		Paused:              item.Paused,
+	})
+	item.Activity = string(activity)
+	item.ActivityReason = activityReason
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+// fleetSupersedingIssueSession identifies terminal duplicate attempts that
+// should not dominate project operator_state while the same issue already has
+// one canonical live or PR-bearing session. This is display/reconciliation
+// truth only: it does not delete history or choose a different dispatcher
+// lease. The durable issue claim remains the authority that prevents another
+// worker from being created.
+func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (sessionInfo, bool) {
+	if candidate.IssueNumber <= 0 || !candidate.NeedsAttention {
+		return sessionInfo{}, false
+	}
+	// A PR is one lifecycle artifact even when a continuation issue and its
+	// historical source issue both retain session rows. Suppress a terminal
+	// attention row behind the deterministic current owner of that exact PR;
+	// otherwise an old retry_exhausted attempt can dominate operator_state while
+	// the newer continuation is the only session allowed to repair the PR.
+	if candidate.PRNumber > 0 {
+		owner := candidate
+		for _, peer := range all {
+			if peer.Slot == candidate.Slot || peer.PRNumber != candidate.PRNumber || !fleetSessionCanOwnOpenPR(peer) {
+				continue
+			}
+			if fleetPRSessionOwnerPrecedes(peer, owner) {
+				owner = peer
+			}
+		}
+		if owner.Slot != candidate.Slot {
+			return owner, true
+		}
+	}
+	// A terminal attempt with its own PR is not merely stale execution state:
+	// it may still require operator action or reconciliation for that distinct
+	// artifact. Only no-PR duplicate attempts may be hidden behind the issue's
+	// canonical live or PR-bearing session.
+	if candidate.PRNumber > 0 {
+		return sessionInfo{}, false
+	}
+	switch state.SessionStatus(candidate.Status) {
+	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+	default:
+		return sessionInfo{}, false
+	}
+	for _, peer := range all {
+		if peer.Slot == candidate.Slot || peer.IssueNumber != candidate.IssueNumber {
+			continue
+		}
+		if fleetSessionActuallyRunning(peer) {
+			return peer, true
+		}
+		switch state.SessionStatus(peer.Status) {
+		case state.StatusPROpen, state.StatusCodeLanded:
+			return peer, true
+		case state.StatusRetryExhausted:
+			// A retry-exhausted canonical session still owns its open PR and
+			// remains the only valid repair identity. A no-PR terminal sibling
+			// must not dominate operator_state or ask the operator to restart it.
+			if peer.PRNumber > 0 {
+				return peer, true
+			}
+		case state.StatusDone:
+			// A terminal peer is authoritative only when it owns the issue's
+			// delivered PR and this attempt was explicitly reconciled as a
+			// duplicate. Do not hide a genuine failed follow-up merely because
+			// an older session for the issue once completed.
+			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch &&
+				(candidate.WorkerOutcome == "duplicate_dispatch_reconciled" || fleetSessionStartedAfterCanonicalCompletion(candidate, peer)) {
+				return peer, true
+			}
+		}
+	}
+	return sessionInfo{}, false
+}
+
+func fleetSessionCanOwnOpenPR(sess sessionInfo) bool {
+	if sess.PRNumber <= 0 {
+		return false
+	}
+	switch state.SessionStatus(sess.Status) {
+	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusDead,
+		state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
+func fleetPRSessionOwnerPrecedes(candidate, current sessionInfo) bool {
+	candidateLive := fleetSessionActuallyRunning(candidate)
+	currentLive := fleetSessionActuallyRunning(current)
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	candidateStarted, candidateErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(candidate.StartedAt))
+	currentStarted, currentErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(current.StartedAt))
+	if candidateErr == nil && currentErr != nil {
+		return true
+	}
+	if candidateErr == nil && currentErr == nil {
+		if candidateStarted.After(currentStarted) {
+			return true
+		}
+		if currentStarted.After(candidateStarted) {
+			return false
+		}
+	}
+	if candidate.Status != current.Status {
+		return state.SessionStatus(candidate.Status) == state.StatusQueued
+	}
+	return candidate.Slot < current.Slot
+}
+
+func fleetSessionStartedAfterCanonicalCompletion(candidate, canonical sessionInfo) bool {
+	started, startErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
+	finished, finishErr := time.Parse(time.RFC3339, strings.TrimSpace(canonical.FinishedAt))
+	return startErr == nil && finishErr == nil && !started.Before(finished)
 }
 
 func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetCloseCandidate {
@@ -4357,7 +4497,7 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		// attention is self-resolving the project reads calm ("auto-merging,
 		// no action needed") instead of alarming the fleet verdict with a
 		// passive `Action required — p1`.
-		actionable, autoMerging := partitionFleetAttentionByResolvability(project.Attention)
+		actionable, autoMerging := partitionFleetAttentionByResolvability(project.Attention, project.Supervisor.Latest)
 		if len(actionable) == 0 && len(autoMerging) > 0 {
 			return fleetAutoMergingOperatorState(project, autoMerging[0])
 		}
@@ -4520,9 +4660,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 // will auto-merge it as soon as the merge gate clears, so the fleet verdict
 // must not alarm with `Action required — p1`. Other shapes are returned in
 // the actionable slice; the order of both slices mirrors the input.
-func partitionFleetAttentionByResolvability(workers []sessionInfo) (actionable, autoMerging []sessionInfo) {
+func partitionFleetAttentionByResolvability(workers []sessionInfo, latest *supervisorDecisionInfo) (actionable, autoMerging []sessionInfo) {
 	for _, w := range workers {
-		if fleetSessionIsConvergenceBound(w) {
+		if fleetSessionIsConvergenceBound(w, latest) {
 			autoMerging = append(autoMerging, w)
 			continue
 		}
@@ -4534,12 +4674,13 @@ func partitionFleetAttentionByResolvability(workers []sessionInfo) (actionable, 
 // fleetSessionIsConvergenceBound reports whether a session in the
 // attention list is "self-resolving" — convergence (the orchestrator's
 // auto-merge once gates clear) will resolve it without operator action.
-// Today this is the retry_exhausted-with-open-PR-and-no-failing-checks
-// shape from issue #598: a green PR whose retry budget has been used up
-// but whose merge will land naturally once the merge gate clears. A PR
-// known to have failed checks (CIFailureOutput / LastNotifiedStatus =
-// ci_failure) is NOT convergence-bound and stays actionable.
-func fleetSessionIsConvergenceBound(worker sessionInfo) bool {
+// Today this is the retry_exhausted-with-open-PR shape from issue #598, but
+// only when the latest supervisor reconciliation contains positive GitHub
+// evidence that the PR checks succeeded. Absence of failure evidence is not
+// proof of green: session notification fields can lag a freshly failed check
+// run, which previously produced the false "checks are green" state from
+// issue #955. Any current gate blocker for the same PR wins over success.
+func fleetSessionIsConvergenceBound(worker sessionInfo, latest *supervisorDecisionInfo) bool {
 	if state.SessionStatus(worker.Status) != state.StatusRetryExhausted {
 		return false
 	}
@@ -4549,7 +4690,28 @@ func fleetSessionIsConvergenceBound(worker sessionInfo) bool {
 	if strings.EqualFold(strings.TrimSpace(worker.LastNotification), "ci_failure") {
 		return false
 	}
-	return true
+	if latest == nil {
+		return false
+	}
+	checksSucceeded := false
+	for _, stuck := range latest.StuckStates {
+		if stuck.Target == nil || stuck.Target.PR != worker.PRNumber {
+			continue
+		}
+		switch strings.TrimSpace(stuck.Code) {
+		case "failing_checks", state.StuckPendingChecks, "draft_pr", "unmergeable_pr",
+			"greptile_not_approved", "greptile_pending", "review_gate_not_approved",
+			"review_gate_pending", state.StuckReviewRepairExhausted:
+			return false
+		case "retry_exhausted_open_pr":
+			for _, evidence := range stuck.Evidence {
+				if strings.Contains(strings.ToLower(evidence), "checks=success") {
+					checksSucceeded = true
+				}
+			}
+		}
+	}
+	return checksSucceeded
 }
 
 // fleetAutoMergingOperatorState builds the calm operator state for a
@@ -4903,6 +5065,10 @@ func isFleetWorkerDefaultVisible(worker sessionInfo) bool {
 }
 
 func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
+	tokenBudgetMeasure := worker.TokenBudgetMeasure
+	if project.EffectiveConfig.CostCaps.WorkerMaxTokens > 0 && tokenBudgetMeasure == "" {
+		tokenBudgetMeasure = "uncached_tokens"
+	}
 	return fleetWorkerState{
 		ProjectName:            project.Name,
 		ProjectRepo:            project.Repo,
@@ -4924,6 +5090,9 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		PRURL:                  worker.PRURL,
 		TokensUsedAttempt:      worker.TokensUsedAttempt,
 		TokensUsedTotal:        worker.TokensUsedTotal,
+		WorkerMaxTokens:        project.EffectiveConfig.CostCaps.WorkerMaxTokens,
+		TokenBudgetMeasure:     tokenBudgetMeasure,
+		WorkerOutcome:          worker.WorkerOutcome,
 		CostUSDEstimate:        worker.CostUSDEstimate,
 		CostUSDBackend:         worker.CostUSDBackend,
 		Runtime:                worker.Runtime,
@@ -5406,7 +5575,10 @@ func fleetProgressActualRecoveryFrom(recovery *progress.Recovery, now time.Time)
 	r := &fleetProgressRecovery{
 		Action:           string(recovery.Action),
 		Outcome:          string(recovery.Outcome),
+		Stage:            string(recovery.Stage),
 		RecommendationID: strings.TrimSpace(recovery.RecommendationID),
+		Reason:           string(recovery.Reason),
+		LeaseGeneration:  recovery.LeaseGeneration,
 	}
 	if !recovery.AttemptedAt.IsZero() {
 		r.At = formatFleetTime(recovery.AttemptedAt)

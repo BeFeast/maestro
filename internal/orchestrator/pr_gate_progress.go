@@ -47,6 +47,33 @@ func normalizePRGateCIVerdict(value string) state.PRGateCIVerdict {
 	}
 }
 
+// observePRGateCI reads the exact current PR head/check rollup and applies the
+// narrow mergeable-state compatibility rule used by the merge flow. It does
+// not mutate state: callers may enrich the returned transition with review
+// evidence before persisting it, or persist the CI-only observation when a
+// separate merge precondition (such as attribution) is safely deferred.
+func (o *Orchestrator) observePRGateCI(sess *state.Session, pr github.PR) (github.PRCheckRollup, string, state.PRGateTransition, bool, time.Time, error) {
+	ciRollup, err := o.prCheckRollup(pr.Number)
+	if err != nil {
+		return github.PRCheckRollup{}, "", state.PRGateTransition{}, false, time.Time{}, err
+	}
+	ciStatus := ciRollup.Verdict
+
+	// #424: an aggregate can remain pending after every required check is green.
+	// Only GitHub's clean mergeable state may override it; unstable can coexist
+	// with explicitly failed checks and therefore remains pending/failing.
+	if ciStatus == "pending" {
+		if mergeable, mergeState, mergeErr := o.prMergeStatus(pr.Number); mergeErr == nil && mergeable == "MERGEABLE" && mergeState == "clean" {
+			log.Printf("[orch] PR #%d (%s) aggregate CI=pending but mergeable_state=%s — treating as success (#424)", pr.Number, sess.Branch, mergeState)
+			ciStatus = "success"
+		}
+	}
+
+	log.Printf("[orch] PR #%d (%s) CI=%s", pr.Number, sess.Branch, ciStatus)
+	transition, observable := o.prGateTransitionForCI(sess, pr, ciRollup, ciStatus)
+	return ciRollup, ciStatus, transition, observable, time.Now().UTC(), nil
+}
+
 func (o *Orchestrator) persistPRGateTransition(s *state.State, transition state.PRGateTransition, now time.Time) {
 	if s == nil || strings.TrimSpace(transition.HeadSHA) == "" {
 		return

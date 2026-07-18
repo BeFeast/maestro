@@ -363,7 +363,7 @@ export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
             <div className="kv">
               <span>Contract</span>
               <strong style={{ color: watchdog.contractPending ? "var(--watch)" : "var(--fg-1)" }}>
-                {watchdog.contract || (watchdog.contractPending ? "pending actuator/live-canary proof" : "not published")}
+                {watchdog.contract || (watchdog.contractPending ? "pending live-canary proof" : "not published")}
               </strong>
             </div>
             <div className="kv"><span>Silence budget</span><strong className="mono">{watchdog.enabled ? formatCadence(watchdog.silenceBudgetSeconds) : "0s"}</strong></div>
@@ -385,8 +385,10 @@ export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
             </div>
             <div className="kv">
               <span>Actual recovery</span>
-              <strong className="mono">
-                {recovery?.action ? `${recovery.action.replace(/_/g, " ")} · ${recovery.outcome || "attempted"}` : "none recorded"}
+              <strong className="mono" title={recovery?.reason || undefined}>
+                {recovery?.action
+                  ? `${recovery.action.replace(/_/g, " ")} · ${(recovery.stage || recovery.outcome || "attempted").replace(/_/g, " ")}`
+                  : "none recorded"}
               </strong>
             </div>
           </>
@@ -1027,6 +1029,8 @@ function WorkerSpendSection({ worker, fleet }) {
   if (!worker) return null;
   const tokens = Number(worker.tokens_used_total || 0);
   const attemptTokens = Number(worker.tokens_used_attempt || 0);
+  const maxTokens = Number(worker.worker_max_tokens || 0);
+  const budgetMeasure = String(worker.token_budget_measure || "uncached_tokens");
   const usd = Number(worker.cost_usd_estimate || 0);
   // Find the issue-level rollup so retries are visible on the drawer.
   const projectName = worker.project_name || worker.project || "";
@@ -1037,7 +1041,7 @@ function WorkerSpendSection({ worker, fleet }) {
   const issueRow = (project?.costObservability?.perIssue || []).find(
     e => Number(e.issueNumber) === Number(issueNum),
   );
-  if (tokens <= 0 && !(issueRow && issueRow.tokens > 0)) return null;
+  if (tokens <= 0 && maxTokens <= 0 && !(issueRow && issueRow.tokens > 0)) return null;
   return (
     <div className="drawer-sec">
       <div className="drawer-sec-title">Spend</div>
@@ -1053,6 +1057,16 @@ function WorkerSpendSection({ worker, fleet }) {
           )}
         </strong>
       </div>
+      {maxTokens > 0 && (
+        <div className="kv">
+          <span>
+            Configured cap ({budgetMeasure === "uncached_tokens" ? "uncached tokens" : budgetMeasure})
+          </span>
+          <strong className="mono">
+            {formatTokens(maxTokens)} tok
+          </strong>
+        </div>
+      )}
       {issueRow && (
         <div className="kv">
           <span>Issue #{issueRow.issueNumber} (all attempts)</span>

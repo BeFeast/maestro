@@ -19,6 +19,7 @@ import (
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 func TestLoadFleetProjects(t *testing.T) {
@@ -175,14 +176,15 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if len(resp.Attention) != resp.Summary.NeedsAttention {
 		t.Fatalf("attention inbox len = %d, want %d", len(resp.Attention), resp.Summary.NeedsAttention)
 	}
-	if resp.Projects[0].Name != "One" {
-		t.Fatalf("first project = %q, want One", resp.Projects[0].Name)
+	// Fleet projects are deliberately sorted by current operator priority, so
+	// an attention project may precede the first configured project. Assert the
+	// named project's aggregate instead of depending on live priority order.
+	one := findFleetProject(t, resp.Projects, "One")
+	if len(one.Active) != 2 {
+		t.Fatalf("project active len = %d, want 2", len(one.Active))
 	}
-	if len(resp.Projects[0].Active) != 2 {
-		t.Fatalf("project active len = %d, want 2", len(resp.Projects[0].Active))
-	}
-	if !resp.Projects[0].Outcome.Configured || resp.Projects[0].Outcome.Goal != "One is deployed" || resp.Projects[0].Outcome.HealthState != outcome.HealthUnknown {
-		t.Fatalf("project outcome = %+v, want configured unknown health", resp.Projects[0].Outcome)
+	if !one.Outcome.Configured || one.Outcome.Goal != "One is deployed" || one.Outcome.HealthState != outcome.HealthUnknown {
+		t.Fatalf("project outcome = %+v, want configured unknown health", one.Outcome)
 	}
 	if len(resp.Workers) != 4 {
 		t.Fatalf("fleet workers len = %d, want 4", len(resp.Workers))
@@ -209,10 +211,10 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	for _, action := range worker.Actions {
 		assertFleetReadOnlyAction(t, action)
 	}
-	if len(resp.Projects[0].Actions) != 3 {
-		t.Fatalf("project actions = %d, want 3", len(resp.Projects[0].Actions))
+	if len(one.Actions) != 3 {
+		t.Fatalf("project actions = %d, want 3", len(one.Actions))
 	}
-	for _, action := range resp.Projects[0].Actions {
+	for _, action := range one.Actions {
 		assertFleetReadOnlyAction(t, action)
 		if action.Target != "One" {
 			t.Fatalf("project action target = %q, want project name One", action.Target)
@@ -228,8 +230,9 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if !contains(attentionWorker.NextAction, "Fix failing checks") {
 		t.Fatalf("attention next_action = %q, want fix checks guidance", attentionWorker.NextAction)
 	}
-	if resp.Projects[1].NeedsAttention != len(resp.Projects[1].Attention) {
-		t.Fatalf("project attention count = %d, reasons = %d", resp.Projects[1].NeedsAttention, len(resp.Projects[1].Attention))
+	two := findFleetProject(t, resp.Projects, "Two")
+	if two.NeedsAttention != len(two.Attention) {
+		t.Fatalf("project attention count = %d, reasons = %d", two.NeedsAttention, len(two.Attention))
 	}
 }
 
@@ -337,6 +340,63 @@ func TestFleetWorkersOrderActuallyRunningFirst(t *testing.T) {
 				t.Fatalf("%s sorted into running prefix at index %d: %v", slot, i, gotSlots)
 			}
 		}
+	}
+}
+
+func TestFleetTokenBudgetMarkerShowsStoppedWorkerAndConfiguredBudget(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	logFile := filepath.Join(dir, "sup-906.log")
+	if err := os.WriteFile(logFile, []byte("working\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := worker.TokenBudgetMarker{
+		Outcome:        worker.TokenBudgetExceededOutcome,
+		Backend:        "claude",
+		TokensObserved: 85_000,
+		MaxTokens:      80_000,
+		Measure:        worker.TokenBudgetMeasureUncached,
+		MeasuredAt:     time.Now().UTC(),
+	}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.TokenBudgetMarkerPathForLog(logFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"sup-906": {
+			IssueNumber: 906,
+			IssueTitle:  "bounded work",
+			Status:      state.StatusRunning,
+			PID:         999999,
+			LogFile:     logFile,
+			Backend:     "claude",
+			StartedAt:   time.Now().UTC().Add(-time.Minute),
+		},
+	})
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("budget", "", "", &config.Config{
+			Repo:            "owner/budget",
+			StateDir:        stateDir,
+			MaxParallel:     1,
+			WorkerMaxTokens: 80_000,
+		}),
+	}, "127.0.0.1", 8786, true)
+	got := findFleetWorker(t, srv.snapshot().Workers, "sup-906")
+	if got.Status != string(state.StatusFailed) || got.DisplayStatus != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("status/display = %q/%q, want failed/token_budget_exceeded", got.Status, got.DisplayStatus)
+	}
+	if got.WorkerMaxTokens != 80_000 || got.TokensUsedAttempt != 85_000 || got.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("budget view = %+v, want max=80000 usage=85000 outcome", got)
+	}
+	if got.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Fatalf("budget measure = %q, want %q", got.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+	}
+	if !strings.Contains(got.StatusReason, "token budget") {
+		t.Fatalf("status reason = %q, want budget stop reason", got.StatusReason)
 	}
 }
 
@@ -933,6 +993,16 @@ func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
 		t.Fatalf("save live state: %v", err)
 	}
 
+	// Separated waiting project: open PR work remains, but there is no live
+	// implementation worker or eligible ready issue. Free implementation slots
+	// must not make Fleet erase the PR gate behind a generic queue_empty label.
+	waitingDir := filepath.Join(dir, "separated-waiting")
+	waitingState := state.NewState()
+	waitingState.Sessions["gate-1"] = &state.Session{Status: state.StatusPROpen, PRNumber: 301, IssueNumber: 31}
+	if err := state.Save(waitingDir, waitingState); err != nil {
+		t.Fatalf("save separated waiting state: %v", err)
+	}
+
 	srv := NewFleet([]FleetProject{
 		NewFleetProject("GateBound", "/tmp/gatebound.yaml", "", &config.Config{
 			Repo:        "owner/gatebound",
@@ -944,6 +1014,12 @@ func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
 			StateDir:       liveDir,
 			MaxParallel:    2,
 			MaxLiveWorkers: 3,
+		}),
+		NewFleetProject("SeparatedWaiting", "/tmp/separated-waiting.yaml", "", &config.Config{
+			Repo:           "owner/separated-waiting",
+			StateDir:       waitingDir,
+			MaxParallel:    20,
+			MaxLiveWorkers: 20,
 		}),
 	}, "127.0.0.1", 8786, true)
 	resp := srv.snapshot()
@@ -979,8 +1055,19 @@ func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
 		t.Errorf("separated activity = %q, want %q", sep.Activity, state.ActivityImplementing)
 	}
 
-	if resp.Summary.LiveWorkers != 1 || resp.Summary.PRGates != 5 {
-		t.Errorf("summary live_workers=%d pr_gates=%d, want 1/5", resp.Summary.LiveWorkers, resp.Summary.PRGates)
+	waiting := findFleetProject(t, resp.Projects, "SeparatedWaiting")
+	if waiting.LiveWorkers != 0 || waiting.PRGates != 1 || waiting.CapacityUsed != 0 || waiting.LiveWorkerLimit != 20 {
+		t.Fatalf("separated waiting live=%d gates=%d used=%d limit=%d, want 0/1/0/20", waiting.LiveWorkers, waiting.PRGates, waiting.CapacityUsed, waiting.LiveWorkerLimit)
+	}
+	if waiting.Activity != string(state.ActivityWaitingOnGates) {
+		t.Errorf("separated waiting activity = %q, want %q", waiting.Activity, state.ActivityWaitingOnGates)
+	}
+	if !contains(waiting.ActivityReason, "Waiting on PR gates") {
+		t.Errorf("separated waiting reason = %q, want truthful PR-gate explanation", waiting.ActivityReason)
+	}
+
+	if resp.Summary.LiveWorkers != 1 || resp.Summary.PRGates != 6 {
+		t.Errorf("summary live_workers=%d pr_gates=%d, want 1/6", resp.Summary.LiveWorkers, resp.Summary.PRGates)
 	}
 	if resp.Summary.CapacityBlockedByGates != 2 {
 		t.Errorf("summary capacity_blocked_by_gates = %d, want 2", resp.Summary.CapacityBlockedByGates)
@@ -3844,6 +3931,161 @@ func TestFleetAPIStaleDeadSessionsAgeOutOfAttention(t *testing.T) {
 	}
 }
 
+func TestFleetSupersedingIssueSessionSuppressesTerminalDuplicate(t *testing.T) {
+	alive := true
+	canonical := sessionInfo{
+		Slot:        "ok-player-250",
+		IssueNumber: 328,
+		Status:      string(state.StatusRunning),
+		Alive:       &alive,
+	}
+	duplicate := sessionInfo{
+		Slot:           "ok-player-271",
+		IssueNumber:    328,
+		Status:         string(state.StatusFailed),
+		NeedsAttention: true,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	otherIssue := canonical
+	otherIssue.IssueNumber = 329
+	if got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, otherIssue}); ok {
+		t.Fatalf("unrelated session incorrectly superseded duplicate: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForReconciledDuplicate(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot:           "ok-player-271",
+		IssueNumber:    328,
+		Status:         string(state.StatusFailed),
+		NeedsAttention: true,
+		WorkerOutcome:  "duplicate_dispatch_reconciled",
+	}
+	canonical := sessionInfo{
+		Slot:        "ok-player-250",
+		IssueNumber: 328,
+		Status:      string(state.StatusDone),
+		PRNumber:    363,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding merged session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	genuineFailure := duplicate
+	genuineFailure.WorkerOutcome = ""
+	if got, ok := fleetSupersedingIssueSession(genuineFailure, []sessionInfo{genuineFailure, canonical}); ok {
+		t.Fatalf("genuine failed follow-up incorrectly superseded: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForLaterDuplicate(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot: "ok-player-278", IssueNumber: 365, Status: string(state.StatusDead), NeedsAttention: true,
+		StartedAt: "2026-07-17T13:28:26Z",
+	}
+	canonical := sessionInfo{
+		Slot: "ok-player-274", IssueNumber: 365, Status: string(state.StatusDone), PRNumber: 370,
+		FinishedAt: "2026-07-17T13:28:21Z",
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("later duplicate superseding session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	earlierFailure := duplicate
+	earlierFailure.StartedAt = "2026-07-17T13:20:00Z"
+	if got, ok := fleetSupersedingIssueSession(earlierFailure, []sessionInfo{earlierFailure, canonical}); ok {
+		t.Fatalf("earlier genuine failure incorrectly superseded: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionDoesNotUseReleasedDoneSessionForReopenedFollowUp(t *testing.T) {
+	followUp := sessionInfo{
+		Slot: "ok-player-292", IssueNumber: 343, Status: string(state.StatusDead), NeedsAttention: true,
+		StartedAt: "2026-07-17T23:25:21Z",
+	}
+	oldCompleted := sessionInfo{
+		Slot: "ok-player-262", IssueNumber: 343, Status: string(state.StatusDone), PRNumber: 357,
+		FinishedAt: "2026-07-17T09:37:56Z", ReleasedForRedispatch: true,
+	}
+
+	if got, ok := fleetSupersedingIssueSession(followUp, []sessionInfo{followUp, oldCompleted}); ok {
+		t.Fatalf("released terminal session incorrectly hid reopened follow-up: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionUsesCanonicalOpenPR(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot:           "ok-player-259",
+		IssueNumber:    331,
+		Status:         string(state.StatusDead),
+		NeedsAttention: true,
+	}
+	canonical := sessionInfo{
+		Slot:        "ok-player-247",
+		IssueNumber: 331,
+		Status:      string(state.StatusPROpen),
+		PRNumber:    335,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding PR session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+
+	differentPR := duplicate
+	differentPR.PRNumber = 352
+	if got, ok := fleetSupersedingIssueSession(differentPR, []sessionInfo{differentPR, canonical}); ok {
+		t.Fatalf("different PR identity incorrectly superseded: %+v", got)
+	}
+}
+
+func TestFleetSupersedingIssueSessionUsesRetryExhaustedCanonicalOpenPR(t *testing.T) {
+	duplicate := sessionInfo{
+		Slot:           "ok-player-294",
+		IssueNumber:    346,
+		Status:         string(state.StatusRetryExhausted),
+		NeedsAttention: true,
+	}
+	canonical := sessionInfo{
+		Slot:           "ok-player-277",
+		IssueNumber:    346,
+		Status:         string(state.StatusRetryExhausted),
+		PRNumber:       397,
+		NeedsAttention: true,
+	}
+	got, ok := fleetSupersedingIssueSession(duplicate, []sessionInfo{duplicate, canonical})
+	if !ok || got.Slot != canonical.Slot {
+		t.Fatalf("superseding retry-exhausted PR session = %+v, %v; want %s", got, ok, canonical.Slot)
+	}
+}
+
+func TestFleetSupersedingIssueSessionSuppressesHistoricalSharedPRAttention(t *testing.T) {
+	historical := sessionInfo{
+		Slot: "ok-player-273", IssueNumber: 345, Status: string(state.StatusRetryExhausted),
+		PRNumber: 388, NeedsAttention: true, StartedAt: "2026-07-17T23:06:00Z",
+	}
+	continuation := sessionInfo{
+		Slot: "ok-player-302", IssueNumber: 406, Status: string(state.StatusPROpen),
+		PRNumber: 388, StartedAt: "2026-07-18T04:57:43Z",
+	}
+
+	got, ok := fleetSupersedingIssueSession(historical, []sessionInfo{historical, continuation})
+	if !ok || got.Slot != continuation.Slot {
+		t.Fatalf("shared-PR owner = %+v, %v; want %s", got, ok, continuation.Slot)
+	}
+
+	otherPR := continuation
+	otherPR.PRNumber = 413
+	if got, ok := fleetSupersedingIssueSession(historical, []sessionInfo{historical, otherPR}); ok {
+		t.Fatalf("different PR incorrectly superseded historical attention: %+v", got)
+	}
+}
+
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
 // regression. A retry_exhausted session whose linked PR is still open and
 // whose last notification is NOT a CI failure is convergence-bound: the
@@ -3876,6 +4118,13 @@ func TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly(t *testing.T) {
 			Project:           "maestro",
 			RecommendedAction: "monitor_open_pr",
 			Risk:              "safe",
+			StuckStates: []state.SupervisorStuckState{
+				{
+					Code:     "retry_exhausted_open_pr",
+					Target:   &state.SupervisorTarget{Issue: 442, PR: 564},
+					Evidence: []string{"Session sup-stuck status=retry_exhausted pr=564 checks=success"},
+				},
+			},
 		},
 	})
 
@@ -3952,8 +4201,7 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 			PRNumber:           600,
 			StartedAt:          finishedRecent.Add(-time.Hour),
 			FinishedAt:         &finishedRecent,
-			LastNotifiedStatus: "ci_failure",
-			CIFailureOutput:    "FAIL: pkg/foo TestBar",
+			LastNotifiedStatus: "review_retry_exhausted",
 		},
 	}, []state.SupervisorDecision{
 		{
@@ -3962,6 +4210,17 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 			Project:           "maestro",
 			RecommendedAction: "monitor_open_pr",
 			Risk:              "safe",
+			StuckStates: []state.SupervisorStuckState{
+				{
+					Code:     "retry_exhausted_open_pr",
+					Target:   &state.SupervisorTarget{Issue: 443, PR: 600},
+					Evidence: []string{"Session sup-failing status=retry_exhausted pr=600 checks=failure"},
+				},
+				{
+					Code:   "failing_checks",
+					Target: &state.SupervisorTarget{Issue: 443, PR: 600},
+				},
+			},
 		},
 	})
 
@@ -3984,6 +4243,12 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 		t.Fatalf("verdict tone = %q, want attention (failing-CI PR is operator-actionable)", resp.Verdict.Tone)
 	}
 	project := findFleetProject(t, resp.Projects, "maestro")
+	if project.Activity != string(state.ActivityNeedsAttention) {
+		t.Fatalf("project activity = %q, want %q (failed canonical work must not render queue_empty)", project.Activity, state.ActivityNeedsAttention)
+	}
+	if !contains(project.ActivityReason, "Needs attention") {
+		t.Fatalf("project activity reason = %q, want explicit attention blocker", project.ActivityReason)
+	}
 	if project.OperatorState.Kind != "attention" {
 		t.Fatalf("project operator_state.kind = %q, want attention", project.OperatorState.Kind)
 	}
@@ -4721,6 +4986,20 @@ func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
 		RetryAfter: &cooldownUntil,
 	}
 	st.BackendHealth["codex"] = state.BackendHealth{State: state.BackendHealthAvailable}
+	st.ProviderModelHealth["claude"] = map[string]state.BackendHealth{
+		"claude-fable-5": {
+			State:                     state.BackendHealthCooldown,
+			Reason:                    state.BackendBlockModelCooldown,
+			Provider:                  "claude",
+			Model:                     "claude-fable-5",
+			CredentialCandidates:      2,
+			CredentialCandidatesKnown: true,
+			CredentialUsable:          0,
+			CredentialUsableKnown:     true,
+			AggregateReason:           "all_model_credentials_cooling_down",
+			RetryAfter:                &cooldownUntil,
+		},
+	}
 	if err := state.Save(stateDir, st); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
@@ -4758,6 +5037,13 @@ func TestFleetAPISurfacesBackendHealthAndAttribution(t *testing.T) {
 	codexHealth, ok := project.BackendHealth["codex"]
 	if !ok || codexHealth.State != state.BackendHealthAvailable {
 		t.Fatalf("codex health = %+v, want available", codexHealth)
+	}
+	fableHealth, ok := project.ProviderModelHealth["claude"]["claude-fable-5"]
+	if !ok {
+		t.Fatalf("project.provider_model_health missing Fable route: %+v", project.ProviderModelHealth)
+	}
+	if fableHealth.CredentialCandidates != 2 || fableHealth.CredentialUsable != 0 || fableHealth.Reason != state.BackendBlockModelCooldown {
+		t.Fatalf("Fable route health = %+v", fableHealth)
 	}
 
 	worker := findFleetWorker(t, resp.Workers, "one-1")

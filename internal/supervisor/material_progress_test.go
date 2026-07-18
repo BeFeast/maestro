@@ -145,6 +145,47 @@ func TestCollectMaterialProgressObservations_QueuedRemainsAnActivePRGate(t *test
 	}
 }
 
+func TestCollectMaterialProgressObservations_LiveWorkerOwnsExactPRGate(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 18, 3, 0, 0, 0, time.UTC)
+	st.Sessions["old-gate"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Hour),
+	}
+	st.Sessions["continuation"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PRNumber: 388, PID: 1234, StartedAt: now.Add(-time.Minute),
+	}
+	recordTestPRGateSnapshot(t, st, 345, 388, strings.Repeat("a", 40), now.Add(-time.Hour))
+
+	observations := collectMaterialProgressObservationsForProject(st, "owner/repo", now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %+v, want only the live continuation", observations)
+	}
+	if observations[0].Target.Kind != progress.TargetWorker || observations[0].Target.IssueNumber != 406 || observations[0].Target.ProcessID != 1234 {
+		t.Fatalf("active target = %+v, want live continuation worker", observations[0].Target)
+	}
+}
+
+func TestCollectMaterialProgressObservations_NewestSessionOwnsSharedPRGate(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 18, 3, 15, 0, 0, time.UTC)
+	st.Sessions["old-gate"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Hour),
+	}
+	st.Sessions["continuation"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Minute),
+	}
+	recordTestPRGateSnapshot(t, st, 345, 388, strings.Repeat("a", 40), now.Add(-time.Hour))
+	recordTestPRGateSnapshot(t, st, 406, 388, strings.Repeat("a", 40), now.Add(-time.Minute))
+
+	observations := collectMaterialProgressObservationsForProject(st, "owner/repo", now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %+v, want one canonical PR gate", observations)
+	}
+	if observations[0].Target.Kind != progress.TargetPRGate || observations[0].Target.IssueNumber != 406 || observations[0].Target.Slot != "continuation" {
+		t.Fatalf("canonical PR target = %+v, want newest continuation", observations[0].Target)
+	}
+}
+
 func TestCollectMaterialProgressObservations_PartialOrWrongProjectPRSnapshotIsIncomplete(t *testing.T) {
 	st := state.NewState()
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
@@ -589,7 +630,7 @@ func TestCollectMaterialProgressObservations_LiveExactTmuxAdvancesWithFrozenGitA
 	outputPath := filepath.Join(bin, "output")
 	script := filepath.Join(bin, "tmux")
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
-if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact" ]; then
+if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact:" ]; then
   exit 91
 fi
 if [ "${TMUX_FAKE_FAIL:-}" = "1" ]; then
@@ -653,6 +694,37 @@ cat "$TMUX_FAKE_OUTPUT"
 	}
 	if len(decisions) != 1 || decisions[0].Action != progress.ActionEvidenceUnavailable || decisions[0].RecommendsRecovery() {
 		t.Fatalf("tmux failure authorized recovery: %+v", decisions)
+	}
+}
+
+func TestTerminalCheckpointProgress_LiveTmuxIsCompleteWhenConsumedCheckpointIsMissing(t *testing.T) {
+	bin := t.TempDir()
+	outputPath := filepath.Join(bin, "output")
+	script := filepath.Join(bin, "tmux")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+if [ "$1" = "has-session" ]; then
+  exit 1
+fi
+if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact:" ]; then
+  exit 91
+fi
+cat "$TMUX_FAKE_OUTPUT"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("live terminal progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMUX_FAKE_OUTPUT", outputPath)
+
+	sess := &state.Session{
+		TmuxSession:    "mae-exact",
+		CheckpointFile: filepath.Join(bin, "consumed-CHECKPOINT.md"),
+	}
+	got, complete := terminalCheckpointProgress(sess)
+	if got == "" || !complete {
+		t.Fatalf("live tmux with consumed checkpoint = (%q,%t), want non-empty complete evidence", got, complete)
 	}
 }
 

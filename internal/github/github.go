@@ -24,13 +24,20 @@ import (
 )
 
 type greptileCheckRun struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-	HTMLURL    string `json:"html_url"`
-	DetailsURL string `json:"details_url"`
-	Output     struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion"`
+	CreatedAt   string `json:"created_at"`
+	StartedAt   string `json:"started_at"`
+	CompletedAt string `json:"completed_at"`
+	HTMLURL     string `json:"html_url"`
+	DetailsURL  string `json:"details_url"`
+	App         struct {
+		ID   int64  `json:"id"`
+		Slug string `json:"slug"`
+	} `json:"app"`
+	Output struct {
 		Title   string `json:"title"`
 		Summary string `json:"summary"`
 		Text    string `json:"text"`
@@ -1406,6 +1413,21 @@ func prReferencesIssue(pr PR, issueNumber int) bool {
 	return issueRefRegexp(issueNumber).MatchString(pr.Title + "\n" + stripCodeForRefMatch(pr.Body))
 }
 
+// PRReferencesIssue reports whether the PR title/body references issueNumber.
+// It exposes the same code/log-safe matcher used by HasOpenPRForIssue so
+// control-plane reconcilers can match an already-fetched open-PR snapshot
+// without issuing another GitHub request.
+func PRReferencesIssue(pr PR, issueNumber int) bool {
+	return prReferencesIssue(pr, issueNumber)
+}
+
+// PRClosesIssue reports whether a PR uses a GitHub closing keyword for the
+// issue. It is exported so an orchestrator can evaluate one shared closed-PR
+// snapshot for many terminal sessions without re-fetching that snapshot.
+func PRClosesIssue(pr PR, issueNumber int) bool {
+	return prClosesIssue(pr, issueNumber)
+}
+
 // prClosesIssue is the STRICT variant for "this merged PR closed issue N".
 // Unlike prReferencesIssue, it requires one of GitHub's recognised closing
 // keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved)
@@ -1508,7 +1530,68 @@ func parseCheckRuns(out []byte) ([]greptileCheckRun, error) {
 	if err := json.Unmarshal(out, &payload); err != nil {
 		return nil, err
 	}
-	return payload.CheckRuns, nil
+	return latestLogicalCheckRuns(payload.CheckRuns), nil
+}
+
+// latestLogicalCheckRuns collapses historical rerun attempts into GitHub's
+// current logical check contexts. The checks API returns every attempt for a
+// commit, so treating all rows as simultaneously authoritative lets an old
+// failure override a newer successful rerun on the same head (#998). GitHub
+// check contexts are identified by app + name; creation/start time and the
+// public monotonic check-run ID select the newest attempt deterministically.
+func latestLogicalCheckRuns(checks []greptileCheckRun) []greptileCheckRun {
+	if len(checks) < 2 {
+		return checks
+	}
+	latest := make(map[string]greptileCheckRun, len(checks))
+	order := make([]string, 0, len(checks))
+	for _, check := range checks {
+		key := logicalCheckRunKey(check)
+		current, ok := latest[key]
+		if !ok {
+			latest[key] = check
+			order = append(order, key)
+			continue
+		}
+		if checkRunNewer(check, current) {
+			latest[key] = check
+		}
+	}
+	result := make([]greptileCheckRun, 0, len(order))
+	for _, key := range order {
+		result = append(result, latest[key])
+	}
+	return result
+}
+
+func logicalCheckRunKey(check greptileCheckRun) string {
+	name := strings.ToLower(strings.TrimSpace(check.Name))
+	if name == "" {
+		return fmt.Sprintf("id:%d", check.ID)
+	}
+	app := fmt.Sprintf("id:%d", check.App.ID)
+	if check.App.ID == 0 {
+		app = "slug:" + strings.ToLower(strings.TrimSpace(check.App.Slug))
+	}
+	return app + "\x00" + name
+}
+
+func checkRunNewer(candidate, current greptileCheckRun) bool {
+	candidateAt := checkRunCreatedAt(candidate)
+	currentAt := checkRunCreatedAt(current)
+	if !candidateAt.Equal(currentAt) {
+		return candidateAt.After(currentAt)
+	}
+	return candidate.ID > current.ID
+}
+
+func checkRunCreatedAt(check greptileCheckRun) time.Time {
+	for _, raw := range []string{check.StartedAt, check.CreatedAt, check.CompletedAt} {
+		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw)); err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
 }
 
 func parseCombinedStatus(out []byte) (combinedStatusResponse, error) {
@@ -1520,6 +1603,7 @@ func parseCombinedStatus(out []byte) (combinedStatusResponse, error) {
 }
 
 func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	checks = latestLogicalCheckRuns(checks)
 	// GitHub's combined commit-status API returns state:"pending" with
 	// statuses:[] for any commit that has zero legacy commit statuses — the
 	// normal case for repos that report CI exclusively via check-runs.
@@ -1553,6 +1637,7 @@ func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse
 }
 
 func formatChecksOverview(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	checks = latestLogicalCheckRuns(checks)
 	var lines []string
 	for _, check := range checks {
 		state := strings.TrimSpace(check.Conclusion)
@@ -1829,6 +1914,13 @@ func (c *Client) listClosedPRs() ([]PR, error) {
 	return prs, nil
 }
 
+// ListClosedPRs returns the newest closed PR page. Orchestrator cycles use this
+// as one shared snapshot for terminal reconciliation instead of spawning one
+// `gh api ... pulls?state=closed` process per historical session.
+func (c *Client) ListClosedPRs() ([]PR, error) {
+	return c.listClosedPRs()
+}
+
 func (c *Client) getRESTPull(prNumber int) (restPull, error) {
 	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber))
 	if err != nil {
@@ -1839,6 +1931,17 @@ func (c *Client) getRESTPull(prNumber int) (restPull, error) {
 		return restPull{}, err
 	}
 	return pr, nil
+}
+
+// PRDetails returns the current forge metadata for one PR. Unlike a cached
+// open-PR list, this exact read is suitable for an actuation guard whose safety
+// depends on mutable metadata such as draft/open state.
+func (c *Client) PRDetails(prNumber int) (PR, error) {
+	pr, err := c.getRESTPull(prNumber)
+	if err != nil {
+		return PR{}, err
+	}
+	return pr.pr(), nil
 }
 
 func (c *Client) pullHeadSHA(prNumber int) (string, error) {
@@ -2128,9 +2231,9 @@ func (c *Client) MergedPRNumberForBranch(branch string) (int, error) {
 }
 
 // PRCheckRollup is a bounded, non-secret identity for the actual current PR
-// head and its CI/check rollup. Fingerprint hashes check names and closed
-// status/conclusion fields only; it never carries descriptions, URLs, output,
-// annotations, paths, or credentials (#887).
+// head and its CI/check rollup. Fingerprint hashes public check-run IDs, names,
+// and closed status/conclusion fields only; it never carries descriptions,
+// URLs, output, annotations, paths, or credentials (#887/#940).
 type PRCheckRollup struct {
 	HeadSHA     string
 	Verdict     string
@@ -2139,7 +2242,9 @@ type PRCheckRollup struct {
 }
 
 // PRCheckRollup returns the current head, normalized aggregate verdict, and a
-// stable digest of individual check/status transitions. When one of GitHub's
+// stable digest of individual check/status transitions and public check-run
+// identities. A manual rerun on the same head therefore advances once instead
+// of looking identical to the exhausted run it replaced. When one of GitHub's
 // two CI sources is unavailable the legacy aggregate verdict still degrades to
 // the source that did answer, but Complete=false and Fingerprint is absent so a
 // partial poll cannot fabricate material progress.
@@ -2171,11 +2276,12 @@ func (c *Client) PRCIStatus(prNumber int) (string, error) {
 }
 
 func ciCheckRollupFingerprint(checks []greptileCheckRun, combined combinedStatusResponse) string {
+	checks = latestLogicalCheckRuns(checks)
 	parts := make([]string, 0, len(checks)+len(combined.Statuses)+1)
 	parts = append(parts, "combined="+strings.ToLower(strings.TrimSpace(combined.State)))
 	for _, check := range checks {
-		parts = append(parts, fmt.Sprintf("check:%s:%s:%s",
-			strings.TrimSpace(check.Name), strings.ToLower(strings.TrimSpace(check.Status)), strings.ToLower(strings.TrimSpace(check.Conclusion))))
+		parts = append(parts, fmt.Sprintf("check:%d:%s:%s:%s",
+			check.ID, strings.TrimSpace(check.Name), strings.ToLower(strings.TrimSpace(check.Status)), strings.ToLower(strings.TrimSpace(check.Conclusion))))
 	}
 	for _, status := range combined.Statuses {
 		parts = append(parts, fmt.Sprintf("status:%s:%s",
@@ -2222,8 +2328,10 @@ func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus
 //
 // Primary path: reads GitHub Check Runs for the PR's head SHA.
 //   - Looks for a check whose name contains "greptile" (case-insensitive).
-//   - conclusion == "success" or "neutral" approves when there are no high
-//     severity Greptile inline review comments on the current head SHA.
+//   - conclusion == "success" or "neutral" is the authoritative Greptile
+//     decision and approves the current head. Greptile uses that successful
+//     check for its "ok to merge" / 4-of-5-or-better verdict; inline findings
+//     remain review detail and must not contradict the completed gate.
 //   - check found, other conclusion → approved=false, pending=false
 //   - check not found → falls through to comment-based fallback
 //
@@ -2255,12 +2363,6 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 				return false, false, nil
 			}
 
-			// Greptile check run passed, but high-severity inline comments on
-			// the current head are still actionable and should block the gate.
-			comments, err := c.greptileReviewComments(prNumber)
-			if err == nil && hasGreptileInlineCommentOnHead(comments, sha) {
-				return false, false, nil
-			}
 			return true, false, nil
 		}
 		// No greptile check run found → fall through to comment fallback
@@ -2278,33 +2380,39 @@ commentFallback:
 		return false, false, fmt.Errorf("parse pr %d comments: %w", prNumber, err)
 	}
 
-	foundGreptile := false
-	for _, comment := range comments {
-		bodyLower := strings.ToLower(comment.Body)
-		if !strings.Contains(bodyLower, "greptile") {
-			continue
-		}
-
-		foundGreptile = true
-
-		if strings.Contains(bodyLower, "not safe to merge") || strings.Contains(bodyLower, "unsafe to merge") {
-			return false, false, nil
-		}
-
-		if strings.Contains(bodyLower, "safe to merge") {
-			return true, false, nil
-		}
-
-		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
-			return true, false, nil
-		}
-	}
-
+	foundGreptile, approved := greptileCommentDecision(comments)
 	if !foundGreptile {
 		return false, true, nil
 	}
+	return approved, false, nil
+}
 
-	return false, false, nil
+// greptileCommentDecision is the legacy comment-mode fallback. Only comments
+// authored by Greptile are verdicts: operator prompts such as "@greptile
+// review" or human status summaries must not turn a missing current-head check
+// into a false rejection. GitHub returns issue comments oldest-first, so the
+// latest bot verdict wins.
+func greptileCommentDecision(comments []issueComment) (found bool, approved bool) {
+	for i := len(comments) - 1; i >= 0; i-- {
+		comment := comments[i]
+		if !isGreptileLogin(comment.User.Login) {
+			continue
+		}
+		bodyLower := strings.ToLower(comment.Body)
+		if strings.Contains(bodyLower, "not safe to merge") || strings.Contains(bodyLower, "unsafe to merge") {
+			return true, false
+		}
+		if strings.Contains(bodyLower, "safe to merge") {
+			return true, true
+		}
+		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
+			return true, true
+		}
+		// A Greptile-authored comment without an approving phrase is still an
+		// authoritative non-pass in legacy comment mode.
+		return true, false
+	}
+	return false, false
 }
 
 func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved bool, pending bool) {

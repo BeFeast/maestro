@@ -8,9 +8,11 @@ Description=Maestro agent orchestrator (single-service daemon, all projects)
 After=network.target
 
 [Service]
+User=god
+WorkingDirectory=/home/god
 Type=simple
-Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
-# One unified SQLite database (%h/.maestro/maestro.db) holds config + approvals +
+Environment=PATH=/home/god/.local/bin:/home/god/.bun/bin:/home/god/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# One unified SQLite database (/home/god/.maestro/maestro.db) holds config + approvals +
 # state; --approvals-db / --state-db default to that same file. --watch-store lets
 # the daemon hot add/remove/reload projects from the store (and powers dashboard
 # project CRUD: POST/DELETE /api/v1/fleet/projects) without a restart.
@@ -22,7 +24,7 @@ Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/us
 # is the write-path safety boundary.
 ExecStart=/usr/local/bin/maestro daemon \
     --host 0.0.0.0 \
-    --store %h/.maestro/maestro.db \
+    --store /home/god/.maestro/maestro.db \
     --port 8786 \
     --watch-store \
     --approvals-store sqlite \
@@ -30,11 +32,36 @@ ExecStart=/usr/local/bin/maestro daemon \
 # Graceful in-process drain on SIGTERM: the daemon sets SpawnDrain on every flow
 # (no new workers) and waits for in-flight workers to finish — there is no
 # per-unit ExecStop=maestro drain anymore. Give it room before SIGKILL; the
-# daemon's own --drain-timeout (default 5m) finishes well inside this window
-# (#817).
+# daemon's own --drain-timeout (default 4m) finishes well inside this window, and
+# the ~2min it leaves covers stopAll + the shutdown restart-checkpoint pass so a
+# worker still in-flight at the deadline is stamped resumable BEFORE SIGKILL,
+# never after (#817, #877 review).
 TimeoutStopSec=6min
+# Kill ownership is explicit (#877). Each worker's tmux server is spawned as a
+# child of the daemon, so it lives in this unit's control group. The systemd
+# default KillMode=control-group SIGTERMs the WHOLE cgroup at once on stop —
+# daemon AND every worker — which killed in-flight dogfood workers the instant a
+# self-deploy restart began, while the in-process drain still reported them
+# "running" and waited pointlessly (2026-07-12 incident, #877).
+#
+#   KillMode=mixed: the stop SIGTERM goes to the daemon's MAIN process ONLY, so
+#   worker tmux servers keep running while the daemon drains — the drain now
+#   genuinely waits for live, runnable workers to finish instead of racing a
+#   cgroup-wide SIGTERM. The subsequent SIGKILL (after TimeoutStopSec, or when
+#   the daemon exits) is still sent to the ENTIRE control group, so no worker is
+#   ever orphaned outside the unit lifecycle. This is deliberately NOT
+#   KillMode=process, which would leak surviving children out of systemd's
+#   resource/lifecycle management (rejected in #877 review).
+#
+# The daemon is the belt to this suspenders: any worker still in-flight when the
+# drain deadline elapses is checkpointed to a resumable marker before shutdown
+# and resumed in place — same logical session, exactly once — by the next daemon
+# (internal/worker/checkpoint.go, orchestrator reconcile), so a dirty worktree is
+# never lost and no false running->dead transition occurs even under a forced
+# (second-SIGTERM) shutdown.
+KillMode=mixed
 Restart=on-failure
 RestartSec=30
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

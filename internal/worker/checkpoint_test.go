@@ -1,15 +1,226 @@
 package worker
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
+
+func TestStartOrReconcileTmuxSession_UncertainSpawnAdoptsExactSessionWithoutReplay(t *testing.T) {
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+	})
+	spawnCalls := 0
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+		spawnCalls++
+		return nil, errors.New("command result uncertain")
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		return 202, "/worktrees/slot-1", nil
+	}
+
+	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 101)
+	if err != nil || pid != 202 {
+		t.Fatalf("reconciled spawn: pid=%d err=%v", pid, err)
+	}
+	if spawnCalls != 1 {
+		t.Fatalf("runner spawn calls = %d, want exactly 1", spawnCalls)
+	}
+}
+
+func TestStartOrReconcileTmuxSession_RejectsDifferentSessionIdentity(t *testing.T) {
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+	})
+	spawnCalls := 0
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+		spawnCalls++
+		return nil, errors.New("command result uncertain")
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		return 303, "/worktrees/different-slot", nil
+	}
+
+	if _, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 101); err == nil {
+		t.Fatal("different tmux/worktree identity was adopted")
+	}
+	if spawnCalls != 1 {
+		t.Fatalf("runner spawn calls = %d, want exactly 1", spawnCalls)
+	}
+}
+
+func TestStartOrReconcileTmuxSession_ObservesAfterConfirmedSpawnWithoutReplay(t *testing.T) {
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+	})
+	spawnCalls := 0
+	readCalls := 0
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+		spawnCalls++
+		return nil, nil
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		readCalls++
+		if readCalls < 3 {
+			return 0, "", errors.New("pane not visible yet")
+		}
+		return 404, "/worktrees/slot-1", nil
+	}
+
+	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 0)
+	if err != nil || pid != 404 {
+		t.Fatalf("observed spawn: pid=%d err=%v", pid, err)
+	}
+	if spawnCalls != 1 || readCalls != 3 {
+		t.Fatalf("spawn/read calls = %d/%d, want 1/3", spawnCalls, readCalls)
+	}
+}
+
+func TestRestoreMissingWorktreePreservesExistingBranchHead(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	base := filepath.Join(root, "worktrees")
+	if out, err := exec.Command("git", "init", "-b", "main", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	for _, args := range [][]string{
+		{"-C", repo, "config", "user.email", "test@example.com"},
+		{"-C", repo, "config", "user.name", "Test"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"-C", repo, "add", "base.txt"}, {"-C", repo, "commit", "-m", "base"}, {"-C", repo, "branch", "feat/ok-player-277-346"}} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	want, err := exec.Command("git", "-C", repo, "rev-parse", "refs/heads/feat/ok-player-277-346").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(base, "ok-player-277")
+	if err := RestoreMissingWorktree(repo, base, "ok-player-277", worktree, "feat/ok-player-277-346"); err != nil {
+		t.Fatalf("RestoreMissingWorktree: %v", err)
+	}
+	got, err := exec.Command("git", "-C", worktree, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != strings.TrimSpace(string(want)) {
+		t.Fatalf("restored HEAD = %s, want %s", got, want)
+	}
+}
+
+func TestRestoreMissingWorktreeRejectsNonCanonicalPath(t *testing.T) {
+	err := RestoreMissingWorktree(t.TempDir(), t.TempDir(), "ok-player-277", filepath.Join(t.TempDir(), "other"), "feat/branch")
+	if err == nil || !strings.Contains(err.Error(), "not deterministic slot path") {
+		t.Fatalf("error = %v, want deterministic path rejection", err)
+	}
+}
+
+func TestRestoreMissingWorktreePreservesOrphanedDirectoryAndRecreatesCheckout(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	base := filepath.Join(root, "worktrees")
+	runBranchGit(t, root, "init", "-b", "main", repo)
+	runBranchGit(t, repo, "config", "user.email", "test@example.com")
+	runBranchGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runBranchGit(t, repo, "add", "base.txt")
+	runBranchGit(t, repo, "commit", "-m", "base")
+	runBranchGit(t, repo, "branch", "feat/canonical")
+
+	worktree := filepath.Join(base, "ok-player-277")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "preserved-artifact.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RestoreMissingWorktree(repo, base, "ok-player-277", worktree, "feat/canonical"); err != nil {
+		t.Fatalf("RestoreMissingWorktree: %v", err)
+	}
+	if got := strings.TrimSpace(runBranchGit(t, worktree, "branch", "--show-current")); got != "feat/canonical" {
+		t.Fatalf("restored branch = %q, want feat/canonical", got)
+	}
+	backups, err := filepath.Glob(worktree + ".orphaned-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("orphan backups = %v, %v; want exactly one", backups, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(backups[0], "preserved-artifact.txt")); err != nil || string(got) != "keep me\n" {
+		t.Fatalf("orphaned content was not preserved: %q, %v", got, err)
+	}
+}
+
+func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.T) {
+	ended := time.Date(2026, 7, 17, 11, 5, 0, 0, time.UTC)
+	started := ended.Add(time.Hour)
+	sess := &state.Session{
+		IssueNumber:          346,
+		PRNumber:             335,
+		Worktree:             "/tmp/kept-worktree",
+		Branch:               "feat/kept-branch",
+		Backend:              "claude",
+		Model:                "claude-fable-5",
+		Status:               state.StatusDead,
+		FinishedAt:           &ended,
+		WorkerEndedAt:        &ended,
+		CostUSDBackend:       1.25,
+		UsageTokensWatermark: 1_730_413,
+		TokensUsedAttempt:    1_730_413,
+		TokensUsedTotal:      1_730_413,
+		WorkerOutcome:        "failed",
+		Attribution: []state.BackendAttribution{{
+			Backend: "claude", Model: "claude-fable-5", StartedAt: ended.Add(-time.Minute),
+		}},
+	}
+	cfg := &config.Config{Model: config.ModelConfig{Backends: map[string]config.BackendDef{
+		"sol": {Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+	}}}
+
+	beginSessionAttempt(cfg, sess, "sol", "in_place_respawn", "in_place_respawn", started)
+
+	if sess.Status != state.StatusRunning || sess.Backend != "sol" || !sess.StartedAt.Equal(started) {
+		t.Fatalf("live attempt = status %q backend %q start %v", sess.Status, sess.Backend, sess.StartedAt)
+	}
+	if sess.FinishedAt != nil || sess.WorkerEndedAt != nil || sess.Model != "" || sess.CostUSDBackend != 0 {
+		t.Fatalf("stale projection retained: finished=%v ended=%v model=%q cost=%v", sess.FinishedAt, sess.WorkerEndedAt, sess.Model, sess.CostUSDBackend)
+	}
+	if sess.TokensUsedAttempt != 0 || sess.UsageTokensWatermark != 0 || sess.WorkerOutcome != "" {
+		t.Fatalf("attempt counters not reset: attempt=%d watermark=%d outcome=%q", sess.TokensUsedAttempt, sess.UsageTokensWatermark, sess.WorkerOutcome)
+	}
+	if sess.TokensUsedTotal != 1_730_413 || sess.Worktree != "/tmp/kept-worktree" || sess.Branch != "feat/kept-branch" || sess.PRNumber != 335 {
+		t.Fatalf("cumulative/session identity changed: total=%d worktree=%q branch=%q PR=%d", sess.TokensUsedTotal, sess.Worktree, sess.Branch, sess.PRNumber)
+	}
+	if len(sess.Attribution) != 2 || sess.Attribution[0].EndedAt == nil || sess.Attribution[1].Backend != "sol" || sess.Attribution[1].Model != "gpt-5.6-sol" || sess.Attribution[1].EndedAt != nil {
+		t.Fatalf("attribution = %+v", sess.Attribution)
+	}
+}
 
 func TestSaveCheckpoint_WritesFile(t *testing.T) {
 	tmpDir := t.TempDir()
