@@ -146,3 +146,73 @@ func TestSpawnRepairDispatch_CurrentReviewFindingAllowsExactInPlaceRepair(t *tes
 		t.Fatalf("repair approval = %q, want consumed/superseded", got)
 	}
 }
+
+func TestSpawnRepairDispatch_CurrentGreenDraftAllowsExactInPlaceContinuation(t *testing.T) {
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg := cfgWithBackends("codex", "codex")
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, []github.Issue{makeIssue(7, "continue explicit draft", "maestro-ready")})
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Complete: true}, nil
+	}
+	o.ghPRMergeStatusFn = func(int) (string, string, error) { return "MERGEABLE", "clean", nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{Passed: true}, nil
+	}
+	o.ghPRDetailsFn = func(pr int) (github.PR, error) {
+		return github.PR{Number: pr, State: "OPEN", IsDraft: true, Body: "<!-- maestro:wip -->"}, nil
+	}
+	respawns := 0
+	o.respawnInPlaceFn = func(_ *config.Config, slot string, sess *state.Session, _ string, _ github.Issue, _, _ string) error {
+		if slot != "slot-7" {
+			t.Fatalf("respawn slot = %q, want slot-7", slot)
+		}
+		respawns++
+		sess.Status = state.StatusRunning
+		return nil
+	}
+
+	s := repairGateTestState(time.Now().UTC(), head)
+	o.startNewWorkers(s, 1)
+
+	if respawns != 1 || len(*freshStarts) != 0 || len(s.Sessions) != 1 {
+		t.Fatalf("exact draft continuation mismatch: respawns=%d fresh=%v sessions=%d", respawns, *freshStarts, len(s.Sessions))
+	}
+	if got := approvalStatus(t, s, "repair-7"); got != state.ApprovalStatusSuperseded {
+		t.Fatalf("repair approval = %q, want consumed/superseded", got)
+	}
+}
+
+func TestSpawnRepairDispatch_CurrentGreenNonDraftStalesRepair(t *testing.T) {
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg := cfgWithBackends("codex", "codex")
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, []github.Issue{makeIssue(7, "ready PR", "maestro-ready")})
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Complete: true}, nil
+	}
+	o.ghPRMergeStatusFn = func(int) (string, string, error) { return "MERGEABLE", "clean", nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{Passed: true}, nil
+	}
+	o.ghPRDetailsFn = func(pr int) (github.PR, error) {
+		return github.PR{Number: pr, State: "OPEN", IsDraft: false}, nil
+	}
+	respawns := 0
+	o.respawnInPlaceFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+		respawns++
+		return nil
+	}
+
+	s := repairGateTestState(time.Now().UTC(), head)
+	o.startNewWorkers(s, 1)
+
+	if respawns != 0 || len(*freshStarts) != 0 {
+		t.Fatalf("green non-draft repair dispatched: respawns=%d fresh=%v", respawns, *freshStarts)
+	}
+	if got := approvalStatus(t, s, "repair-7"); got != state.ApprovalStatusStale {
+		t.Fatalf("repair approval = %q, want stale", got)
+	}
+}
