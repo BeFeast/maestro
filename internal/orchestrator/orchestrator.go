@@ -4921,10 +4921,22 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			// Keep recording the authoritative current head/check rollup while the
 			// safe amend is deferred; otherwise the watchdog retains an old head and
 			// reports a false stale gate while a rerun is visibly in progress.
-			_, _, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
+			_, ciStatus, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
 			if err != nil {
 				log.Printf("[orch] CI status for PR #%d while attribution is deferred: %v", pr.Number, err)
 			} else if gateObservable {
+				// Complete the read-only gate observation when CI is green. This
+				// remains merge-inert: attribution still blocks every ready/merge
+				// path, but a successful review must not remain durable "unknown".
+				if ciStatus == "success" {
+					if o.reviewGate() == "none" {
+						addPRGateReviewDisabled(&gateTransition)
+					} else if verdict, reviewErr := o.prReviewGateVerdict(pr.Number); reviewErr != nil {
+						log.Printf("[orch] review gate check PR #%d while attribution is deferred: %v", pr.Number, reviewErr)
+					} else if o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
+						addPRGateReviewVerdict(&gateTransition, verdict)
+					}
+				}
 				o.persistPRGateTransition(s, gateTransition, observedAt)
 			}
 			continue

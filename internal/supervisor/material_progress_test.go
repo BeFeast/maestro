@@ -165,6 +165,27 @@ func TestCollectMaterialProgressObservations_LiveWorkerOwnsExactPRGate(t *testin
 	}
 }
 
+func TestCollectMaterialProgressObservations_NewestSessionOwnsSharedPRGate(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 18, 3, 15, 0, 0, time.UTC)
+	st.Sessions["old-gate"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Hour),
+	}
+	st.Sessions["continuation"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Minute),
+	}
+	recordTestPRGateSnapshot(t, st, 345, 388, strings.Repeat("a", 40), now.Add(-time.Hour))
+	recordTestPRGateSnapshot(t, st, 406, 388, strings.Repeat("a", 40), now.Add(-time.Minute))
+
+	observations := collectMaterialProgressObservationsForProject(st, "owner/repo", now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %+v, want one canonical PR gate", observations)
+	}
+	if observations[0].Target.Kind != progress.TargetPRGate || observations[0].Target.IssueNumber != 406 || observations[0].Target.Slot != "continuation" {
+		t.Fatalf("canonical PR target = %+v, want newest continuation", observations[0].Target)
+	}
+}
+
 func TestCollectMaterialProgressObservations_PartialOrWrongProjectPRSnapshotIsIncomplete(t *testing.T) {
 	st := state.NewState()
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)

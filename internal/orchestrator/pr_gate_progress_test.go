@@ -167,8 +167,36 @@ func TestAutoMergePRs_AttributionDeferralStillObservesCurrentPRGate(t *testing.T
 	o.autoMergePRs(st)
 
 	snapshot := mustLatestPRGateSnapshot(t, st, sess.IssueNumber, pr.Number)
-	if snapshot.HeadSHA != currentHead || snapshot.CIEffectiveVerdict != state.PRGateCIPending || snapshot.CheckRollupFingerprint != strings.Repeat("7", 16) {
+	if snapshot.HeadSHA != currentHead || snapshot.CIEffectiveVerdict != state.PRGateCIPending || snapshot.CheckRollupFingerprint != strings.Repeat("7", 16) || snapshot.ReviewDecision != state.PRGateReviewUnknown {
 		t.Fatalf("deferred-attribution snapshot = %+v", snapshot)
+	}
+	if len(*merged) != 0 {
+		t.Fatalf("attribution-deferred PR unexpectedly merged: %v", *merged)
+	}
+}
+
+func TestAutoMergePRs_AttributionDeferralStillObservesPassingReview(t *testing.T) {
+	pr := github.PR{Number: 14, HeadRefName: "feat/deferred-review"}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "greptile", ReviewGateStreams: []string{"greptile"}}
+	o, merged := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	currentHead := strings.Repeat("d", 40)
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: currentHead, Verdict: "success", Fingerprint: strings.Repeat("8", 16), Complete: true}, nil
+	}
+	o.ghPRHeadSHAFn = func(int) (string, error) { return currentHead, nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{Passed: true, Streams: []github.ReviewStreamVerdict{{Name: "greptile", Passed: true}}}, nil
+	}
+	o.amendHeadFn = func(string, string, []state.BackendAttribution, time.Time) error { return errAmendDiverged }
+	st := makeTestState([]github.PR{pr})
+	sess := st.Sessions["slot-0"]
+	sess.Attribution = []state.BackendAttribution{{Backend: "sol", StartedAt: time.Now().UTC()}}
+
+	o.autoMergePRs(st)
+
+	snapshot := mustLatestPRGateSnapshot(t, st, sess.IssueNumber, pr.Number)
+	if snapshot.HeadSHA != currentHead || snapshot.CIEffectiveVerdict != state.PRGateCISuccess || snapshot.ReviewDecision != state.PRGateReviewPassed {
+		t.Fatalf("deferred passing-review snapshot = %+v", snapshot)
 	}
 	if len(*merged) != 0 {
 		t.Fatalf("attribution-deferred PR unexpectedly merged: %v", *merged)
