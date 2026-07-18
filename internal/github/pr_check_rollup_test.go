@@ -4,8 +4,8 @@ import "testing"
 
 func TestCICheckRollupFingerprint_IsOrderStableAndSemantic(t *testing.T) {
 	checks := []greptileCheckRun{
-		{Name: "lint", Status: "completed", Conclusion: "success"},
-		{Name: "test", Status: "in_progress"},
+		{ID: 10, Name: "lint", Status: "completed", Conclusion: "success"},
+		{ID: 20, Name: "test", Status: "in_progress"},
 	}
 	combined := combinedStatusResponse{State: "pending"}
 	combined.Statuses = append(combined.Statuses, struct {
@@ -25,6 +25,11 @@ func TestCICheckRollupFingerprint_IsOrderStableAndSemantic(t *testing.T) {
 	green := ciCheckRollupFingerprint(checks, combined)
 	if green == first {
 		t.Fatalf("individual check transition did not change rollup fingerprint: %q", green)
+	}
+	checks[1] = greptileCheckRun{ID: 21, Name: "test", Status: "in_progress"}
+	rerun := ciCheckRollupFingerprint(checks, combined)
+	if rerun == first {
+		t.Fatalf("same-head check rerun did not change rollup fingerprint: %q", rerun)
 	}
 	if len(first) != 16 {
 		t.Fatalf("fingerprint length = %d, want bounded digest", len(first))

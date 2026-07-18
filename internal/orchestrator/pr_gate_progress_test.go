@@ -147,6 +147,34 @@ func TestAutoMergePRs_HeadChangeDuringReviewDefersExactSnapshotAndMerge(t *testi
 	}
 }
 
+func TestAutoMergePRs_AttributionDeferralStillObservesCurrentPRGate(t *testing.T) {
+	pr := github.PR{Number: 13, HeadRefName: "feat/deferred-attribution"}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
+	o, merged := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	currentHead := strings.Repeat("c", 40)
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{
+			HeadSHA: currentHead, Verdict: "pending", Fingerprint: strings.Repeat("7", 16), Complete: true,
+		}, nil
+	}
+	o.amendHeadFn = func(string, string, []state.BackendAttribution, time.Time) error {
+		return errAmendDiverged
+	}
+	st := makeTestState([]github.PR{pr})
+	sess := st.Sessions["slot-0"]
+	sess.Attribution = []state.BackendAttribution{{Backend: "sol", StartedAt: time.Now().UTC()}}
+
+	o.autoMergePRs(st)
+
+	snapshot := mustLatestPRGateSnapshot(t, st, sess.IssueNumber, pr.Number)
+	if snapshot.HeadSHA != currentHead || snapshot.CIEffectiveVerdict != state.PRGateCIPending || snapshot.CheckRollupFingerprint != strings.Repeat("7", 16) {
+		t.Fatalf("deferred-attribution snapshot = %+v", snapshot)
+	}
+	if len(*merged) != 0 {
+		t.Fatalf("attribution-deferred PR unexpectedly merged: %v", *merged)
+	}
+}
+
 func mustLatestPRGateSnapshot(t *testing.T, st *state.State, issueNumber, prNumber int) state.PRGateSnapshot {
 	t.Helper()
 	snapshot, ok := st.LatestPRGateSnapshot("owner/repo", issueNumber, prNumber)
