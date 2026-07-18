@@ -1711,6 +1711,9 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		if sess == nil {
 			continue
 		}
+		if !sessionCanStillBlockProgress(sess.Status) {
+			continue
+		}
 		if e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}

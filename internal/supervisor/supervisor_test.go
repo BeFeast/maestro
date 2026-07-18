@@ -930,6 +930,40 @@ func TestDecide_ClosedPRWithActiveSessionExplained(t *testing.T) {
 	}
 }
 
+func TestDetectPRStuckStates_SkipsSettledSessionsBeforeRemoteResolution(t *testing.T) {
+	reader := &fakeReader{}
+	eng := testEngine(testConfig(t), reader)
+	st := state.NewState()
+	st.Sessions["done-slot"] = &state.Session{
+		IssueNumber: 101,
+		Status:      state.StatusDone,
+		PRNumber:    201,
+	}
+	st.Sessions["landed-slot"] = &state.Session{
+		IssueNumber: 102,
+		Status:      state.StatusCodeLanded,
+		PRNumber:    202,
+	}
+
+	findings := eng.detectPRStuckStates(st, nil, newResolutionCache(eng.reader))
+
+	if len(findings) != 0 {
+		t.Fatalf("settled sessions produced PR stuck findings: %#v", findings)
+	}
+	if got := reader.mergedPRCalls[201]; got != 0 {
+		t.Fatalf("done session PR remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.mergedPRCalls[202]; got != 0 {
+		t.Fatalf("code_landed session PR remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.closedIssueCalls[101]; got != 0 {
+		t.Fatalf("done session issue remote-resolution calls = %d, want 0", got)
+	}
+	if got := reader.closedIssueCalls[102]; got != 0 {
+		t.Fatalf("code_landed session issue remote-resolution calls = %d, want 0", got)
+	}
+}
+
 func TestDecide_FailingChecksExplained(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
