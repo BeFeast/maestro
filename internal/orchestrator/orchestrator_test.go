@@ -335,6 +335,40 @@ func TestReconcileRunningSessions_DeadWithPendingRetry_NotFlippedToPROpen(t *tes
 	}
 }
 
+func TestCheckSessions_PROpenClearsStaleRetryMarker(t *testing.T) {
+	retryAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		IssueTitle:  "canonical Flatpak repair",
+		Status:      state.StatusPROpen,
+		NextRetryAt: &retryAt,
+		RetryCount:  2,
+		Branch:      "feat/ok-player-345-flatpak-beta-retry",
+		PRNumber:    388,
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(int) (bool, error) { return false, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["ok-player-302"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil for pr_open canonical session", sess.NextRetryAt)
+	}
+	if sess.RetryCount != 2 {
+		t.Fatalf("retry_count = %d, want preserved history 2", sess.RetryCount)
+	}
+}
+
 func TestCheckSessions_DonePRReleasesTerminalClaimAfterIssueCloses(t *testing.T) {
 	finishedAt := time.Now().UTC().Add(-time.Minute)
 	s := state.NewState()
