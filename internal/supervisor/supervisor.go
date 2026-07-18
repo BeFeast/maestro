@@ -116,6 +116,10 @@ type prCheckRollupReader interface {
 	PRCheckRollup(prNumber int) (github.PRCheckRollup, error)
 }
 
+type prHeadSHAReader interface {
+	PRHeadSHA(prNumber int) (string, error)
+}
+
 type prGreptileReader interface {
 	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
 }
@@ -2878,30 +2882,18 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	if pr.IsDraft {
 		return false, nil
 	}
-	// #543: GitHub LIST endpoint never populates `mergeable`; fetch via
-	// single-PR endpoint when reader supports it. Without this every
-	// PR.Mergeable read here was "" → "UNKNOWN" → merge_pr never
-	// recommended.
-	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
-	if mr, ok := e.reader.(prMergeableReader); ok {
-		if fresh, err := mr.PRMergeable(pr.Number); err == nil {
-			mergeable = strings.ToUpper(strings.TrimSpace(fresh))
-		}
-	}
-	if mergeable != "MERGEABLE" {
-		return false, nil
-	}
-
 	// CI must be green. Production readers expose the current-head rollup so
 	// a real queued/in-progress check-run can never be confused with the
 	// legacy commit-status-only pending state handled by #425.
 	ciStatus := ""
 	pendingCheckRuns := false
+	rollupHeadSHA := ""
 	if rollupReader, ok := e.reader.(prCheckRollupReader); ok {
 		rollup, err := rollupReader.PRCheckRollup(pr.Number)
-		if err != nil || !rollup.Complete {
+		if err != nil || !rollup.Complete || strings.TrimSpace(rollup.HeadSHA) == "" {
 			return false, nil
 		}
+		rollupHeadSHA = strings.TrimSpace(rollup.HeadSHA)
 		ciStatus = rollup.Verdict
 		pendingCheckRuns = rollup.PendingCheckRuns
 	} else {
@@ -2915,6 +2907,21 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 			return false, nil
 		}
 	}
+
+	// #543: GitHub LIST endpoint never populates `mergeable`; fetch via
+	// single-PR endpoint when reader supports it. Read it after the rollup so
+	// the final head identity check below proves every gate was observed for
+	// one unchanged PR head.
+	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
+	if mr, ok := e.reader.(prMergeableReader); ok {
+		if fresh, err := mr.PRMergeable(pr.Number); err == nil {
+			mergeable = strings.ToUpper(strings.TrimSpace(fresh))
+		}
+	}
+	if mergeable != "MERGEABLE" {
+		return false, nil
+	}
+
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
 		if pendingCheckRuns {
@@ -2946,6 +2953,20 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 			return false, nil
 		}
 		if !approved {
+			return false, nil
+		}
+	}
+
+	// A force-push or repair commit can land between the rollup read and the
+	// merge decision. Production readers expose PRHeadSHA; fail closed unless
+	// the current head still matches the exact head whose checks were read.
+	if rollupHeadSHA != "" {
+		headReader, ok := e.reader.(prHeadSHAReader)
+		if !ok {
+			return false, nil
+		}
+		currentHead, err := headReader.PRHeadSHA(pr.Number)
+		if err != nil || strings.TrimSpace(currentHead) != rollupHeadSHA {
 			return false, nil
 		}
 	}

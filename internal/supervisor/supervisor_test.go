@@ -139,9 +139,23 @@ func (f *fakeReader) PRCIStatus(prNumber int) (string, error) {
 
 func (f *fakeReader) PRCheckRollup(prNumber int) (github.PRCheckRollup, error) {
 	if rollup, ok := f.checkRollups[prNumber]; ok {
+		if rollup.HeadSHA == "" {
+			rollup.HeadSHA = strings.Repeat("f", 40)
+		}
 		return rollup, nil
 	}
-	return github.PRCheckRollup{Verdict: f.ciStatuses[prNumber], Complete: true}, nil
+	return github.PRCheckRollup{
+		HeadSHA:  strings.Repeat("f", 40),
+		Verdict:  f.ciStatuses[prNumber],
+		Complete: true,
+	}, nil
+}
+
+func (f *fakeReader) PRHeadSHA(prNumber int) (string, error) {
+	if rollup, ok := f.checkRollups[prNumber]; ok && rollup.HeadSHA != "" {
+		return rollup.HeadSHA, nil
+	}
+	return strings.Repeat("f", 40), nil
 }
 
 func (f *fakeReader) PRMergeable(prNumber int) (string, error) {
@@ -234,7 +248,7 @@ func enableDynamicWave(cfg *config.Config) {
 	cfg.Supervisor.DynamicWave.Enabled = &enabled
 }
 
-func testEngine(cfg *config.Config, reader *fakeReader) *Engine {
+func testEngine(cfg *config.Config, reader Reader) *Engine {
 	eng := NewEngine(cfg, reader)
 	eng.now = func() time.Time { return time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC) }
 	eng.pidAlive = func(pid int) bool { return true }
