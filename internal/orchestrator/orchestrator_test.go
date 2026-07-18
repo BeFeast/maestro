@@ -487,7 +487,6 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	}
 
 	var gotTitle, gotBody, gotBase, gotHead string
-	var amended bool
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return false },
@@ -498,10 +497,6 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 		createPRFn: func(title, body, base, head string) (int, error) {
 			gotTitle, gotBody, gotBase, gotHead = title, body, base, head
 			return 144, nil
-		},
-		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
-			amended = true
-			return nil
 		},
 	}
 
@@ -552,9 +547,6 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, gotBody)
 		}
 	}
-	if amended {
-		t.Fatal("auto-created PR reconciliation must not rewrite the product branch for attribution")
-	}
 	if !s.IssueInProgress(108) {
 		t.Fatal("IssueInProgress(108) must remain true after auto-created PR")
 	}
@@ -582,7 +574,6 @@ func TestReconcileRunningSessions_OpenPR_DoesNotAmendProductCommit(t *testing.T)
 		}},
 	}
 
-	var amended bool
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return false },
@@ -592,10 +583,6 @@ func TestReconcileRunningSessions_OpenPR_DoesNotAmendProductCommit(t *testing.T)
 				HeadRefName: "feat/mae-9-109-existing-pr",
 				Body:        "Refs #109\n",
 			}}, nil
-		},
-		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
-			amended = true
-			return nil
 		},
 	}
 
@@ -609,9 +596,6 @@ func TestReconcileRunningSessions_OpenPR_DoesNotAmendProductCommit(t *testing.T)
 	}
 	if sess.PRNumber != 145 {
 		t.Fatalf("pr_number = %d, want 145", sess.PRNumber)
-	}
-	if amended {
-		t.Fatal("existing PR reconciliation must not rewrite the product branch for attribution")
 	}
 }
 
@@ -634,6 +618,35 @@ func TestAutoCreatedPRBody_NoOrchestrationInternals(t *testing.T) {
 		if strings.Contains(body, leak) {
 			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, body)
 		}
+	}
+}
+
+func TestCreatePR_NoAttributionPolicyRejectsForbiddenPublicText(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("No AI attribution anywhere in git/GitHub artifacts.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	o := &Orchestrator{
+		cfg: &config.Config{LocalPath: root},
+		createPRFn: func(title, body, base, head string) (int, error) {
+			called = true
+			return 974, nil
+		},
+	}
+	if _, err := o.createPR("policy regression", "Refs #974\n\nMaestro-Backend: sol openai gpt-5.6-sol\n", "main", "feat/policy"); err == nil {
+		t.Fatal("forbidden PR attribution was published")
+	}
+	if called {
+		t.Fatal("PR creation reached the public write after policy rejection")
+	}
+
+	if _, err := o.createPR("policy regression", "Refs #974\n", "main", "feat/policy"); err != nil {
+		t.Fatalf("clean PR text was rejected: %v", err)
+	}
+	if !called {
+		t.Fatal("clean PR text did not reach the public write")
 	}
 }
 

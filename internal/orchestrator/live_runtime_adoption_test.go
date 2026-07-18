@@ -76,35 +76,6 @@ func TestReconcileRunningSessionsRefusesForeignLiveTmux(t *testing.T) {
 	}
 }
 
-func TestEnsureAttributionTrailerDefersWhileExactTmuxIsLive(t *testing.T) {
-	worktree := t.TempDir()
-	called := false
-	o := &Orchestrator{
-		cfg:                 &config.Config{},
-		tmuxSessionExistsFn: func(name string) bool { return name == "maestro-slot-1" },
-		tmuxPaneIdentityFn:  func(string) (int, string, error) { return 5151, worktree, nil },
-		amendHeadFn: func(string, string, []state.BackendAttribution, time.Time) error {
-			called = true
-			return nil
-		},
-	}
-	sess := &state.Session{
-		Worktree: worktree,
-		Branch:   "feat/slot-1",
-		Status:   state.StatusPROpen, // persisted status is deliberately stale
-		Attribution: []state.BackendAttribution{{
-			Backend: "sol", StartedAt: time.Now().UTC(),
-		}},
-	}
-
-	if !o.ensureAttributionTrailerOnBranch("slot-1", sess) {
-		t.Fatal("live worker ownership must defer attribution amend")
-	}
-	if called {
-		t.Fatal("attribution amend ran underneath a live worker")
-	}
-}
-
 func TestSaveStatePreservingLiveRuntimeRecoversSameSessionConflict(t *testing.T) {
 	stateDir := t.TempDir()
 	worktreeBase := t.TempDir()

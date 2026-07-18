@@ -33,23 +33,18 @@ func mergeGuardSession(branch string, pr int) *state.Session {
 }
 
 // Attribution is durable in Maestro state and Fleet, not in product commits.
-// The merge path must ignore the legacy amend hook and continue to observe the
-// authoritative PR gate even if that hook would have failed (#1000).
+// The merge path must continue to observe the authoritative PR gate regardless
+// of how many internal backend segments the session carries (#974/#1000).
 func TestAutoMergePRs_InternalAttributionNeverAmendsProductBranch(t *testing.T) {
 	branch := "feat/sup-1000-internal-attribution"
 	s := state.NewState()
 	s.Sessions["sup-858"] = mergeGuardSession(branch, 864)
 
 	ciQueried := false
-	amendCalled := false
 	o := &Orchestrator{
 		cfg: &config.Config{},
 		listOpenPRsFn: func() ([]github.PR, error) {
 			return []github.PR{{Number: 864, HeadRefName: branch}}, nil
-		},
-		amendHeadFn: func(worktreePath, b string, attribution []state.BackendAttribution, now time.Time) error {
-			amendCalled = true
-			return errors.New("legacy amend hook must be unreachable")
 		},
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			ciQueried = true
@@ -59,9 +54,6 @@ func TestAutoMergePRs_InternalAttributionNeverAmendsProductBranch(t *testing.T) 
 
 	o.autoMergePRs(s)
 
-	if amendCalled {
-		t.Fatal("merge path invoked legacy attribution amend hook")
-	}
 	if !ciQueried {
 		t.Fatal("normal CI gate observation was blocked by internal attribution state")
 	}
