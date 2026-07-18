@@ -7514,6 +7514,7 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	cfg := &config.Config{
 		Repo:               "owner/repo",
 		MaxParallel:        5,
+		MaxLiveWorkers:     1,
 		MaxRuntimeMinutes:  120,
 		MaxRetriesPerIssue: 3,
 		Model: config.ModelConfig{
@@ -7531,6 +7532,7 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	newCfg := &config.Config{
 		Repo:               "owner/repo",
 		MaxParallel:        10,
+		MaxLiveWorkers:     3,
 		MaxRuntimeMinutes:  60,
 		MaxRetriesPerIssue: 5,
 		Model: config.ModelConfig{
@@ -7546,11 +7548,84 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	if o.cfg.MaxParallel != 10 {
 		t.Errorf("MaxParallel = %d, want 10", o.cfg.MaxParallel)
 	}
+	if o.cfg.MaxLiveWorkers != 3 {
+		t.Errorf("MaxLiveWorkers = %d, want 3", o.cfg.MaxLiveWorkers)
+	}
 	if o.cfg.MaxRuntimeMinutes != 60 {
 		t.Errorf("MaxRuntimeMinutes = %d, want 60", o.cfg.MaxRuntimeMinutes)
 	}
 	if o.cfg.MaxRetriesPerIssue != 5 {
 		t.Errorf("MaxRetriesPerIssue = %d, want 5", o.cfg.MaxRetriesPerIssue)
+	}
+}
+
+func TestReloadConfig_MaxLiveWorkersIncreaseExpandsCapacity(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxParallel = 3
+	cfg.MaxLiveWorkers = 1
+	o, started, _ := newStartWorkersOrchestrator(cfg, []github.Issue{
+		makeIssue(901, "first ready issue"),
+		makeIssue(902, "second ready issue"),
+		makeIssue(903, "third ready issue"),
+	})
+
+	s := state.NewState()
+	s.Sessions["existing"] = &state.Session{IssueNumber: 900, Status: state.StatusRunning}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 0 {
+		t.Fatalf("initial available slots = %d, want 0 at max_live_workers=1", got)
+	}
+
+	newCfg := *cfg
+	newCfg.MaxLiveWorkers = 3
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	slots := s.Capacity(capacityInput(o.cfg)).AvailableSlots
+	if slots != 2 {
+		t.Fatalf("available slots after reload = %d, want 2", slots)
+	}
+	o.startNewWorkers(s, slots)
+	if len(*started) != 2 {
+		t.Fatalf("started workers after reload = %v, want two new workers", *started)
+	}
+	if got := s.Capacity(capacityInput(o.cfg)).LiveWorkers; got != 3 {
+		t.Fatalf("live workers after dispatch = %d, want 3", got)
+	}
+}
+
+func TestReloadConfig_MaxLiveWorkersDecreaseStopsNewDispatch(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxParallel = 3
+	cfg.MaxLiveWorkers = 3
+	o, started, _ := newStartWorkersOrchestrator(cfg, []github.Issue{
+		makeIssue(904, "ready after downshift"),
+		makeIssue(905, "another ready after downshift"),
+	})
+
+	s := state.NewState()
+	s.Sessions["one"] = &state.Session{IssueNumber: 901, Status: state.StatusRunning}
+	s.Sessions["two"] = &state.Session{IssueNumber: 902, Status: state.StatusRunning}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 1 {
+		t.Fatalf("initial available slots = %d, want 1 at max_live_workers=3", got)
+	}
+
+	newCfg := *cfg
+	newCfg.MaxLiveWorkers = 1
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	slots := s.Capacity(capacityInput(o.cfg)).AvailableSlots
+	if slots != 0 {
+		t.Fatalf("available slots after downshift = %d, want 0", slots)
+	}
+	o.startNewWorkers(s, 2)
+	if len(*started) != 0 {
+		t.Fatalf("started workers after downshift = %v, want none beyond lowered limit", *started)
+	}
+	if got := s.Capacity(capacityInput(o.cfg)).LiveWorkers; got != 2 {
+		t.Fatalf("live workers after blocked dispatch = %d, want existing workers only", got)
 	}
 }
 
