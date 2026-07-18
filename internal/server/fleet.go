@@ -58,12 +58,38 @@ type FleetProject struct {
 	// safe actions for this project. Tests inject a fake via SetActionGH.
 	actionGH actionGitHubClient
 
+	// approvalExecutor is the project-scoped, in-process execution path for
+	// safety approvals that cannot wait for the next supervisor cadence. The
+	// daemon wires it to the live project's approver.Executor and worker
+	// controller. It is deliberately narrow: today only stop_worker is routed
+	// through it by handleFleetApproval.
+	approvalExecutor ApprovalExecutor
+
+	// approvalMu serializes approval decisions and their immediate execution
+	// for this project. FleetProject values are copied in snapshots, so this is
+	// a pointer shared by every copy rather than an embedded mutex.
+	approvalMu *sync.Mutex
+
 	// board is the GitHub Project board refresher state used by the
 	// /api/v1/fleet snapshot to surface the operator-glance WIP rollup
 	// (#529). nil disables board surfacing for the project. Wired by
 	// cmd/maestro via SetBoardClient when github_projects is enabled.
 	board *boardState
 }
+
+// ApprovalExecutionResult is the terminal outcome returned by a project's
+// immediate safety-approval executor. The fleet handler owns the durable
+// approval transitions; the callback owns only the exact side effect and any
+// in-memory session mutation performed by the worker controller.
+type ApprovalExecutionResult struct {
+	Status  state.ApprovalStatus
+	Summary string
+}
+
+// ApprovalExecutor executes one immutable approved target against the state
+// snapshot that was durably transitioned to approved immediately beforehand.
+// Implementations must return a terminal approval status.
+type ApprovalExecutor func(st *state.State, approval state.Approval) ApprovalExecutionResult
 
 // SetActionGH wires the per-project GitHub client used by the safe-action
 // dispatcher. Call this on startup; nil leaves safe actions disabled for the
@@ -73,6 +99,15 @@ func (p *FleetProject) SetActionGH(gh actionGitHubClient) {
 		return
 	}
 	p.actionGH = gh
+}
+
+// SetApprovalExecutor wires the project-scoped immediate safety executor.
+// Call this during fleet construction before the project is served.
+func (p *FleetProject) SetApprovalExecutor(execute ApprovalExecutor) {
+	if p == nil {
+		return
+	}
+	p.approvalExecutor = execute
 }
 
 // Cfg exposes the loaded *config.Config so callers (cmd/maestro) that need
@@ -102,6 +137,7 @@ func NewFleetProject(name, configPath, dashboardURL string, cfg *config.Config) 
 		ConfigPath:   strings.TrimSpace(configPath),
 		DashboardURL: fleetProjectScopedPath(trimmedName),
 		cfg:          cfg,
+		approvalMu:   &sync.Mutex{},
 	}
 }
 

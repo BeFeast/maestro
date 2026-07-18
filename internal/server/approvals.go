@@ -72,7 +72,7 @@ func parseApprovalPath(prefix, urlPath string) (approvalRoute, bool) {
 // overrides any actor field in the request body — closing the bypass where
 // "approve IS the human-authorization step, and approve has no auth"
 // (write-path premortem failure mode #4).
-func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, stateDir string, route approvalRoute, auth authChecker, store approvalstore.Binding) {
+func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool, scope string, stateDir string, route approvalRoute, auth authChecker, store approvalstore.Binding, execute ApprovalExecutor) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -173,7 +173,82 @@ func applyApprovalDecision(w http.ResponseWriter, r *http.Request, readOnly bool
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("save state: %v", err))
 		return
 	}
+
+	// A safety stop is different from every cadence-owned approval: once the
+	// authenticated operator has durably authorized it, execute that exact
+	// immutable target before returning. Leaving it in approved for the next
+	// supervisor poll is the containment gap this path exists to close.
+	if route.verb == "approve" && approval != nil && approval.Action == config.SupervisorActionStopWorker {
+		terminal, execErr := executeApprovedStopWorker(st, approval, actor, stateDir, store, execute)
+		if execErr != nil {
+			writeError(w, http.StatusInternalServerError, execErr.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, approvalDecisionResponse{OK: true, Approval: terminal})
+		return
+	}
 	writeJSON(w, http.StatusOK, approvalDecisionResponse{OK: true, Approval: approval})
+}
+
+// executeApprovedStopWorker runs the project-scoped safety callback only after
+// the approved transition has been saved, then records and persists a terminal
+// result before the HTTP request returns. The callback receives a detached
+// approval value so it cannot retarget the durable authorization in memory.
+func executeApprovedStopWorker(st *state.State, approval *state.Approval, actor, stateDir string, store approvalstore.Binding, execute ApprovalExecutor) (*state.Approval, error) {
+	result := ApprovalExecutionResult{
+		Status:  state.ApprovalStatusExecutionFailed,
+		Summary: "stop_worker immediate executor is unavailable for this project",
+	}
+	if execute != nil {
+		result = execute(st, immutableApprovalSnapshot(approval))
+	}
+
+	if result.Summary == "" {
+		result.Summary = fmt.Sprintf("stop_worker completed with status %s", result.Status)
+	}
+	now := time.Now().UTC()
+	var (
+		terminal *state.Approval
+		err      error
+	)
+	switch result.Status {
+	case state.ApprovalStatusExecuted:
+		terminal, err = st.MarkApprovalExecuted(approval.ID, now, actor, result.Summary)
+	case state.ApprovalStatusExecutionSkipped:
+		terminal, err = st.MarkApprovalExecutionSkipped(approval.ID, now, actor, result.Summary)
+	case state.ApprovalStatusExecutionFailed:
+		terminal, err = st.MarkApprovalExecutionFailed(approval.ID, now, actor, result.Summary)
+	default:
+		result.Status = state.ApprovalStatusExecutionFailed
+		result.Summary = fmt.Sprintf("stop_worker immediate executor returned non-terminal status %q", result.Status)
+		terminal, err = st.MarkApprovalExecutionFailed(approval.ID, now, actor, result.Summary)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("record stop_worker terminal result: %w", err)
+	}
+	if err := saveApprovalDecisionState(stateDir, st); err != nil {
+		return nil, fmt.Errorf("save stop_worker terminal result: %w", err)
+	}
+	store.StateDir = stateDir
+	if err := approvalstore.FinalizeExecution(store, approval.ID, terminal.Status, now, actor, result.Summary); err != nil {
+		return nil, fmt.Errorf("finalize stop_worker terminal result: %w", err)
+	}
+	return terminal, nil
+}
+
+func immutableApprovalSnapshot(approval *state.Approval) state.Approval {
+	if approval == nil {
+		return state.Approval{}
+	}
+	snapshot := *approval
+	if approval.Target != nil {
+		target := *approval.Target
+		target.Issues = append([]state.SupervisorIssueTarget(nil), approval.Target.Issues...)
+		snapshot.Target = &target
+	}
+	snapshot.Evidence = append([]string(nil), approval.Evidence...)
+	snapshot.Audit = append([]state.ApprovalAudit(nil), approval.Audit...)
+	return snapshot
 }
 
 // --- single-project server hookup -------------------------------------------
@@ -189,7 +264,7 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	if cfg != nil {
 		stateDir = cfg.StateDir
 	}
-	applyApprovalDecision(w, r, cfgServerReadOnly(cfg), "server", stateDir, route, s.auth, s.approvalBinding(cfg))
+	applyApprovalDecision(w, r, cfgServerReadOnly(cfg), "server", stateDir, route, s.auth, s.approvalBinding(cfg), nil)
 }
 
 func cfgServerReadOnly(cfg *config.Config) bool {
@@ -232,6 +307,10 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, fmt.Sprintf("unknown project %q", projectName))
 		return
 	}
+	if project.approvalMu != nil {
+		project.approvalMu.Lock()
+		defer project.approvalMu.Unlock()
+	}
 
 	// Project-scoped read-only: either the global flag or the project's own.
 	readOnly := s.readOnly
@@ -242,5 +321,5 @@ func (s *FleetServer) handleFleetApproval(w http.ResponseWriter, r *http.Request
 	if project.cfg != nil {
 		stateDir = project.cfg.StateDir
 	}
-	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route, auth, s.approvalBinding(project.cfg))
+	applyApprovalDecision(w, r, readOnly, fmt.Sprintf("fleet project %q", projectName), stateDir, route, auth, s.approvalBinding(project.cfg), project.approvalExecutor)
 }

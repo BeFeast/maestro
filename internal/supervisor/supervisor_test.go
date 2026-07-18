@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/outcome"
@@ -61,6 +64,131 @@ type fakeLLM struct {
 	prompt string
 	calls  int
 	err    error
+}
+
+func startApprovalStopSleeper(t *testing.T) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleeper: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return cmd
+}
+
+func requireApprovalStopProcessAlive(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	time.Sleep(50 * time.Millisecond)
+	var status syscall.WaitStatus
+	waited, err := syscall.Wait4(cmd.Process.Pid, &status, syscall.WNOHANG, nil)
+	if err != nil {
+		t.Fatalf("check replacement pid %d: %v", cmd.Process.Pid, err)
+	}
+	if waited != 0 {
+		t.Fatalf("replacement pid %d was killed; wait status=%v", cmd.Process.Pid, status)
+	}
+}
+
+func TestExecuteStopWorker_StaleOrReusedSlotDoesNotKillReplacementPID(t *testing.T) {
+	t.Run("stale snapshot is skipped", func(t *testing.T) {
+		cmd := startApprovalStopSleeper(t)
+		cfg := &config.Config{Repo: "owner/repo"}
+		target := &state.SupervisorTarget{Session: "slot-1", Issue: 42}
+		st := state.NewState()
+		st.Sessions["slot-1"] = &state.Session{IssueNumber: 42, PID: 1, Status: state.StatusDead}
+		approval := &state.Approval{
+			ID:              "stop-stale",
+			Repo:            cfg.Repo,
+			Action:          config.SupervisorActionStopWorker,
+			Target:          target,
+			TargetStateHash: st.ApprovalTargetStateHash(target),
+			Status:          state.ApprovalStatusApproved,
+		}
+		st.Sessions["slot-1"] = &state.Session{
+			IssueNumber: 42,
+			PID:         cmd.Process.Pid,
+			Status:      state.StatusRunning,
+			StartedAt:   time.Now().UTC(),
+		}
+		executor := &approver.Executor{
+			Cfg:      cfg,
+			Sessions: approver.SessionLookupFunc(st.SessionAt),
+			Workers:  NewWorkerController(cfg),
+			State:    st,
+		}
+
+		result := executor.Execute(approval)
+		if result.Status != state.ApprovalStatusExecutionSkipped {
+			t.Fatalf("status = %q, want execution_skipped; result=%+v", result.Status, result)
+		}
+		requireApprovalStopProcessAlive(t, cmd)
+	})
+
+	t.Run("reused slot fails closed", func(t *testing.T) {
+		cmd := startApprovalStopSleeper(t)
+		cfg := &config.Config{Repo: "owner/repo"}
+		st := state.NewState()
+		st.Sessions["slot-1"] = &state.Session{
+			IssueNumber: 99,
+			PID:         cmd.Process.Pid,
+			Status:      state.StatusRunning,
+			StartedAt:   time.Now().UTC(),
+		}
+		approval := &state.Approval{
+			ID:     "stop-reused",
+			Repo:   cfg.Repo,
+			Action: config.SupervisorActionStopWorker,
+			Target: &state.SupervisorTarget{Session: "slot-1", Issue: 42},
+			Status: state.ApprovalStatusApproved,
+		}
+		executor := &approver.Executor{
+			Cfg:      cfg,
+			Sessions: approver.SessionLookupFunc(st.SessionAt),
+			Workers:  NewWorkerController(cfg),
+			State:    st,
+		}
+
+		result := executor.Execute(approval)
+		if result.Status != state.ApprovalStatusExecutionFailed {
+			t.Fatalf("status = %q, want execution_failed; result=%+v", result.Status, result)
+		}
+		requireApprovalStopProcessAlive(t, cmd)
+	})
+}
+
+func TestNewWorkerController_StopPreservesWorktreeBranchAndPR(t *testing.T) {
+	cmd := startApprovalStopSleeper(t)
+	sess := &state.Session{
+		IssueNumber: 42,
+		Worktree:    "/srv/worktrees/slot-1",
+		Branch:      "maestro/issue-42",
+		PID:         cmd.Process.Pid,
+		Status:      state.StatusRunning,
+		PRNumber:    1008,
+	}
+	controller := NewWorkerController(&config.Config{Repo: "owner/repo"})
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- controller.StopWorker("slot-1", sess)
+	}()
+	_ = cmd.Wait()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("StopWorker: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopWorker did not return after terminating the worker")
+	}
+	if sess.Status != state.StatusDead || sess.FinishedAt == nil || sess.NextRetryAt != nil {
+		t.Fatalf("session lifecycle after stop = status:%q finished:%v retry:%v", sess.Status, sess.FinishedAt, sess.NextRetryAt)
+	}
+	if sess.Worktree != "/srv/worktrees/slot-1" || sess.Branch != "maestro/issue-42" || sess.PRNumber != 1008 {
+		t.Fatalf("stop destroyed durable work pointers: worktree=%q branch=%q pr=%d", sess.Worktree, sess.Branch, sess.PRNumber)
+	}
 }
 
 func (f *fakeLLM) Complete(prompt string) (string, error) {
