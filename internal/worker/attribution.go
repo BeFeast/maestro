@@ -31,6 +31,30 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 	recordBackendAttribution(cfg, sess, backendName, reason, previousEndReason, now)
 }
 
+// AdoptLiveRuntime repairs the persisted runtime projection after a worker
+// process was started successfully but the state write that followed lost a
+// concurrent compare-and-merge race. The caller must first prove the exact
+// tmux session, pane PID, and worktree identity; this function deliberately
+// performs no process discovery of its own.
+//
+// Adoption starts a new observable attempt at the time Maestro recovered
+// ownership. That is an honest lower bound for worker_runtime and avoids
+// reusing terminal timestamps/token watermarks from the attempt whose state
+// was stranded. Issue, worktree, branch, and PR identity stay unchanged.
+func AdoptLiveRuntime(cfg *config.Config, sess *state.Session, pid int, tmuxName string, observedAt time.Time) {
+	if sess == nil || pid <= 0 || tmuxName == "" {
+		return
+	}
+	beginSessionAttempt(cfg, sess, sess.Backend, "runtime_adoption", "runtime_state_lost", observedAt)
+	sess.PID = pid
+	sess.TmuxSession = tmuxName
+	sess.NextRetryAt = nil
+	sess.RestartCheckpointAt = nil
+	sess.LastNotifiedStatus = ""
+	sess.LastOutputHash = ""
+	sess.LastOutputChangedAt = time.Time{}
+}
+
 // recordBackendAttribution appends a new BackendAttribution segment to
 // sess.Attribution and closes the previous one's EndedAt + EndReason.
 // Called from every place that sets sess.Backend (Start, Respawn,
