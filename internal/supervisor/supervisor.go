@@ -2796,14 +2796,14 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	// current-head guard, burns one supervisor call every cycle, and presents a
 	// false action in Fleet. Conflicts remain actionable above; failed CI and an
 	// unavailable/unknown CI read retain the existing fail-closed repair path.
+	ciStatus := ""
 	if ciReader, ok := e.reader.(prCIStatusReader); ok {
-		if ciStatus, err := ciReader.PRCIStatus(pr.Number); err == nil &&
-			strings.EqualFold(strings.TrimSpace(ciStatus), "pending") {
+		if current, err := ciReader.PRCIStatus(pr.Number); err == nil {
+			ciStatus = strings.ToLower(strings.TrimSpace(current))
+		}
+		if ciStatus == "pending" {
 			return false
 		}
-	}
-	if pr.IsDraft {
-		return true
 	}
 	for _, stuck := range stuckStates {
 		if stuck.Target != nil {
@@ -2832,8 +2832,18 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 		case "retry_exhausted_open_pr":
 			return stuck.Severity == SeverityBlocked
 		case state.StuckNoOutcomeProgress:
+			if e.cfg != nil && e.cfg.Outcome.AutomaticRecoveryEnabled() {
+				return false
+			}
 			return e.outcomeStatus(st).HealthState == outcome.HealthFailing
 		}
+	}
+	if pr.IsDraft {
+		status := e.outcomeStatus(st)
+		if e.cfg != nil && e.cfg.Outcome.AutomaticRecoveryEnabled() && status.HealthState == outcome.HealthFailing && ciStatus == "success" {
+			return false
+		}
+		return true
 	}
 	return false
 }

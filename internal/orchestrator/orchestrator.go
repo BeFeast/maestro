@@ -8115,7 +8115,7 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		return false
 	}
 	if target.PR > 0 {
-		gate := o.revalidateSpawnRepairPR(target)
+		gate := o.revalidateSpawnRepairPR(s, target)
 		if !gate.actionable {
 			log.Printf("[orch] refusing repair dispatch for issue #%d / PR #%d on %s: %s", issue.Number, target.PR, slot, gate.reason)
 			if gate.stale {
@@ -8214,7 +8214,7 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 // review finding is actionable; pending/green gates make an old repair intent
 // stale. Read errors and unknown states fail closed without consuming the
 // approval so a later healthy control-loop read can retry safely.
-func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) spawnRepairGateDecision {
+func (o *Orchestrator) revalidateSpawnRepairPR(s *state.State, target *state.SupervisorTarget) spawnRepairGateDecision {
 	if target == nil || target.PR <= 0 {
 		return spawnRepairGateDecision{actionable: true, reason: "repair has no PR gate to revalidate"}
 	}
@@ -8299,6 +8299,9 @@ func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) s
 			return spawnRepairGateDecision{stale: true, reason: "current PR is no longer open"}
 		}
 		if details.IsDraft {
+			if o.automaticOutcomeRecoveryOwnsFailure(s) {
+				return spawnRepairGateDecision{stale: true, reason: "automatic outcome recovery owns the failing project outcome; green draft repair is not independently actionable"}
+			}
 			return spawnRepairGateDecision{actionable: true, reason: "current PR remains an explicit draft/WIP continuation"}
 		}
 	}
@@ -8311,6 +8314,11 @@ func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) s
 	default:
 		return spawnRepairGateDecision{reason: fmt.Sprintf("current PR check verdict %q is not authoritative", ci)}
 	}
+}
+
+func (o *Orchestrator) automaticOutcomeRecoveryOwnsFailure(s *state.State) bool {
+	return o != nil && o.cfg != nil && o.cfg.Outcome.AutomaticRecoveryEnabled() &&
+		s != nil && s.OutcomeHealth != nil && s.OutcomeHealth.State == outcome.HealthFailing
 }
 
 func activeIssueClaimForSession(s *state.State, issueNumber int, slot string) (state.IssueClaim, bool) {
