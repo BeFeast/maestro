@@ -59,7 +59,7 @@ type Orchestrator struct {
 	enhancementPromptBase string
 	pidAliveFn            func(pid int) bool
 	tmuxSessionExistsFn   func(name string) bool
-	tmuxPanePIDFn         func(session string) (int, error)
+	tmuxPaneIdentityFn    func(session string) (int, string, error)
 	listOpenPRsFn         func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
@@ -267,13 +267,15 @@ func (o *Orchestrator) tmuxSessionExists(name string) bool {
 	return tmuxsession.HasSession(name)
 }
 
-// tmuxPanePID reads the live pane pid of a tmux session, used to adopt an
-// already-running worker whose recorded pid is stale (#877 restart-resume).
-func (o *Orchestrator) tmuxPanePID(session string) (int, error) {
-	if o.tmuxPanePIDFn != nil {
-		return o.tmuxPanePIDFn(session)
+// tmuxPaneIdentity reads the live pane pid and worktree of a tmux session,
+// used to adopt an already-running worker whose recorded pid is stale (#877
+// restart-resume). Both values are required: a matching tmux name alone may
+// refer to a stale or unrelated pane after a failed resume.
+func (o *Orchestrator) tmuxPaneIdentity(session string) (int, string, error) {
+	if o.tmuxPaneIdentityFn != nil {
+		return o.tmuxPaneIdentityFn(session)
 	}
-	return worker.TmuxPanePID(session)
+	return worker.TmuxPaneIdentity(session)
 }
 
 func (o *Orchestrator) listOpenPRs() ([]github.PR, error) {
@@ -3118,13 +3120,31 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				sess.RestartCheckpointAt = nil
 				log.Printf("[orch] reconcile: %s restart-resume skipped — worktree %q gone (%v); falling through", slotName, wt, statErr)
 			} else if tmuxAlive {
-				// A replacement is already running — adopt it, never respawn over it.
-				if pid, perr := o.tmuxPanePID(tmuxName); perr != nil || pid <= 0 {
+				// A replacement is already running — adopt it only when both its
+				// live PID and worktree match this retained session. Never respawn
+				// over a live pane, and never adopt a same-name foreign pane.
+				pid, paneWorktree, perr := o.tmuxPaneIdentity(tmuxName)
+				if perr != nil || pid <= 0 {
 					// Leave the marker SET so the next cycle retries the (harmless,
 					// non-destructive) adoption, rather than consuming it and falling
 					// to a false running->dead over the live replacement. Unlike a
 					// respawn, an adoption retry cannot loop or duplicate.
-					log.Printf("[orch] reconcile: %s restart-resume — replacement tmux %q alive but pane pid unreadable (%v); will retry adoption next cycle", slotName, tmuxName, perr)
+					log.Printf("[orch] reconcile: %s restart-resume — replacement tmux %q alive but pane identity unreadable (%v); will retry adoption next cycle", slotName, tmuxName, perr)
+				} else if filepath.Clean(paneWorktree) != filepath.Clean(wt) {
+					// A same-name tmux pane in another directory is not this worker.
+					// Fail closed without killing it and consume the automatic resume
+					// marker so the next cycle cannot repeatedly adopt or overwrite an
+					// unrelated process. The retained worktree remains untouched for
+					// explicit operator repair.
+					now := time.Now().UTC()
+					sess.Status = state.StatusDead
+					sess.PID = 0
+					sess.TmuxSession = ""
+					sess.RestartCheckpointAt = nil
+					sess.FinishedAt = &now
+					sess.LastNotifiedStatus = "restart_resume_identity_mismatch"
+					reconciled = true
+					log.Printf("[orch] reconcile: %s restart-resume refused foreign tmux %q: pane worktree %q != retained worktree %q; session left dead, retained worktree preserved, no process killed", slotName, tmuxName, paneWorktree, wt)
 				} else {
 					sess.PID = pid
 					sess.TmuxSession = tmuxName

@@ -9,6 +9,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -270,14 +271,14 @@ func TestReconcile_RestartCheckpoint_AdoptsLiveReplacement(t *testing.T) {
 	// and its pane pid is the live worker. The old recorded pid is dead.
 	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
 	o.pidAliveFn = func(pid int) bool { return pid == adoptedPID }
-	o.tmuxPanePIDFn = func(session string) (int, error) {
+	worktree := t.TempDir()
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
 		if session == slotTmux {
-			return adoptedPID, nil
+			return adoptedPID, worktree, nil
 		}
-		return 0, fmt.Errorf("no such session %q", session)
+		return 0, "", fmt.Errorf("no such session %q", session)
 	}
 
-	worktree := t.TempDir()
 	stamp := time.Now().UTC().Add(-30 * time.Second)
 	s := state.NewState()
 	s.Sessions["sup-310"] = &state.Session{
@@ -330,7 +331,9 @@ func TestReconcile_RestartCheckpoint_LiveReplacementUnreadablePID_RetriesNextCyc
 
 	const slotTmux = "maestro-sup-310"
 	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
-	o.tmuxPanePIDFn = func(session string) (int, error) { return 0, fmt.Errorf("pane gone") }
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
+		return 0, "", fmt.Errorf("pane gone")
+	}
 
 	worktree := t.TempDir()
 	stamp := time.Now().UTC()
@@ -356,6 +359,54 @@ func TestReconcile_RestartCheckpoint_LiveReplacementUnreadablePID_RetriesNextCyc
 	}
 	if sess.Status != state.StatusRunning {
 		t.Fatalf("status = %q, want running — never false-dead over a live replacement", sess.Status)
+	}
+}
+
+// A deterministic tmux name is not sufficient identity. If a failed resume
+// leaves (or encounters) a same-name pane in another worktree, recovery must
+// neither adopt nor kill it, and must not retry into a destructive loop.
+func TestReconcile_RestartCheckpoint_ForeignLiveReplacementFailsClosed(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+
+	const slotTmux = "maestro-sup-310"
+	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
+		return 7777, filepath.Join(t.TempDir(), "foreign"), nil
+	}
+
+	worktree := t.TempDir()
+	stamp := time.Now().UTC()
+	s := state.NewState()
+	s.Sessions["sup-310"] = &state.Session{
+		IssueNumber:         310,
+		Status:              state.StatusRunning,
+		PID:                 4242,
+		TmuxSession:         slotTmux,
+		Branch:              "feat/sup-310-310-in-flight",
+		Worktree:            worktree,
+		Backend:             "claude",
+		RestartCheckpointAt: &stamp,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected foreign pane identity to reconcile fail-closed state")
+	}
+	sess := s.Sessions["sup-310"]
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times, want 0", resumeCount)
+	}
+	if sess.Status != state.StatusDead || sess.PID != 0 || sess.TmuxSession != "" {
+		t.Fatalf("session = status %q pid %d tmux %q, want dead/0/empty", sess.Status, sess.PID, sess.TmuxSession)
+	}
+	if sess.RestartCheckpointAt != nil {
+		t.Fatal("marker must be consumed after a foreign-pane identity mismatch")
+	}
+	if sess.Worktree != worktree {
+		t.Fatalf("retained worktree = %q, want preserved %q", sess.Worktree, worktree)
+	}
+	if sess.LastNotifiedStatus != "restart_resume_identity_mismatch" {
+		t.Fatalf("last notified status = %q, want mismatch blocker", sess.LastNotifiedStatus)
 	}
 }
 

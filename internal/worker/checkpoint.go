@@ -40,6 +40,14 @@ var (
 	}
 )
 
+// TmuxPaneIdentity returns the live pane PID and its current worktree for an
+// exact tmux session. Recovery callers must validate both values before
+// adopting a pane: a deterministic session name alone is not sufficient proof
+// that the pane belongs to the retained worker after a failed respawn.
+func TmuxPaneIdentity(tmuxName string) (int, string, error) {
+	return readTmuxPaneIdentity(tmuxName)
+}
+
 // WorktreeDirty reports whether a retained worker worktree contains any
 // tracked, staged, or untracked changes. Recovery paths use this before a
 // provider transition so completed work is checkpointed instead of being
