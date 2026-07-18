@@ -3885,7 +3885,7 @@ func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *s
 		}
 		return true
 	}
-	err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC())
+	err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC(), sess.CheckpointFile)
 	if err == nil {
 		return false
 	}
@@ -3915,11 +3915,32 @@ func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *s
 	}
 }
 
-func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time, checkpointFile string) error {
 	if o.amendHeadFn != nil {
 		return o.amendHeadFn(worktreePath, branch, attribution, now)
 	}
-	return amendHeadWithAttributionTrailer(worktreePath, branch, attribution, now)
+	// CHECKPOINT.md is a Maestro-owned resumability artifact, not product work.
+	// A completed worker may deliberately leave it untracked in the canonical
+	// worktree. Ignore only this session's exact checkpoint path, and only while
+	// it is untracked; every other dirty path remains a hard amend deferral.
+	ignoredCheckpoint := attributionCheckpointRelativePath(worktreePath, checkpointFile)
+	return amendHeadWithAttributionTrailer(worktreePath, branch, attribution, now, ignoredCheckpoint)
+}
+
+func attributionCheckpointRelativePath(worktreePath, checkpointFile string) string {
+	worktreePath = strings.TrimSpace(worktreePath)
+	checkpointFile = strings.TrimSpace(checkpointFile)
+	if worktreePath == "" || checkpointFile == "" {
+		return ""
+	}
+	if !filepath.IsAbs(checkpointFile) {
+		checkpointFile = filepath.Join(worktreePath, checkpointFile)
+	}
+	rel, err := filepath.Rel(worktreePath, checkpointFile)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(rel))
 }
 
 // amendMaxAttempts bounds how many times amendHeadWithAttributionTrailer will
@@ -4013,7 +4034,7 @@ func isStaleInfoLeaseRejection(out string) bool {
 // When the remote advances between our fetch and our push, git rejects the lease
 // with "stale info"; the amend re-fetches and retries with backoff, deferring
 // (errAmendDeferred) if the branch keeps moving (#858).
-func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
+func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time, ignoredUntrackedPaths ...string) error {
 	worktreePath = strings.TrimSpace(worktreePath)
 	branch = strings.TrimSpace(branch)
 	if worktreePath == "" || branch == "" || len(attribution) == 0 {
@@ -4027,14 +4048,15 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 	}
 
 	for attempt := 1; attempt <= amendMaxAttempts; attempt++ {
-		// Never amend over a dirty tree: a worker may still be writing, and a
-		// force-push here could clobber uncommitted work the lease cannot
-		// protect (it only guards committed history). Defer instead.
-		status, err := amendGitCommand(worktreePath, "status", "--porcelain").CombinedOutput()
+		// Never amend over product work: a worker may still be writing, and a
+		// force-push here could clobber changes the lease cannot protect (it only
+		// guards committed history). The sole exception is the exact untracked
+		// Maestro checkpoint explicitly supplied by the owning session.
+		status, err := amendGitCommand(worktreePath, "status", "--porcelain=v1", "-z", "--untracked-files=all").CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("git status: %w\n%s", err, status)
 		}
-		if strings.TrimSpace(string(status)) != "" {
+		if attributionWorktreeHasBlockingChanges(status, ignoredUntrackedPaths) {
 			return errAmendWorktreeBusy
 		}
 
@@ -4143,6 +4165,34 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 		}
 	}
 	return errAmendDeferred
+}
+
+// attributionWorktreeHasBlockingChanges permits only explicitly named
+// untracked Maestro artifacts. Tracked modifications, staged files, renames,
+// and every other untracked path remain blocking. Porcelain -z keeps filenames
+// unquoted; a rename emits an extra path record, which intentionally falls
+// through as blocking rather than being parsed optimistically.
+func attributionWorktreeHasBlockingChanges(status []byte, ignoredUntrackedPaths []string) bool {
+	ignored := make(map[string]struct{}, len(ignoredUntrackedPaths))
+	for _, path := range ignoredUntrackedPaths {
+		path = filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+		if path != "" && path != "." {
+			ignored[path] = struct{}{}
+		}
+	}
+	for _, record := range strings.Split(string(status), "\x00") {
+		if record == "" {
+			continue
+		}
+		if len(record) >= 4 && record[:3] == "?? " {
+			path := filepath.ToSlash(filepath.Clean(record[3:]))
+			if _, ok := ignored[path]; ok {
+				continue
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // fetchRemoteBranchOID fetches the remote branch tip into FETCH_HEAD and returns
