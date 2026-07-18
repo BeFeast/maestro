@@ -1414,6 +1414,13 @@ func PRReferencesIssue(pr PR, issueNumber int) bool {
 	return prReferencesIssue(pr, issueNumber)
 }
 
+// PRClosesIssue reports whether a PR uses a GitHub closing keyword for the
+// issue. It is exported so an orchestrator can evaluate one shared closed-PR
+// snapshot for many terminal sessions without re-fetching that snapshot.
+func PRClosesIssue(pr PR, issueNumber int) bool {
+	return prClosesIssue(pr, issueNumber)
+}
+
 // prClosesIssue is the STRICT variant for "this merged PR closed issue N".
 // Unlike prReferencesIssue, it requires one of GitHub's recognised closing
 // keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved)
@@ -1835,6 +1842,13 @@ func (c *Client) listClosedPRs() ([]PR, error) {
 		return nil, fmt.Errorf("parse closed prs: %w", err)
 	}
 	return prs, nil
+}
+
+// ListClosedPRs returns the newest closed PR page. Orchestrator cycles use this
+// as one shared snapshot for terminal reconciliation instead of spawning one
+// `gh api ... pulls?state=closed` process per historical session.
+func (c *Client) ListClosedPRs() ([]PR, error) {
+	return c.listClosedPRs()
 }
 
 func (c *Client) getRESTPull(prNumber int) (restPull, error) {
