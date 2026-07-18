@@ -3616,6 +3616,12 @@ func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
 					if current == nil || current.IssueNumber != runtime.IssueNumber || strings.TrimSpace(current.Branch) != strings.TrimSpace(runtime.Branch) || filepath.Clean(current.Worktree) != filepath.Clean(runtime.Worktree) {
 						continue
 					}
+					// A stop/reconcile that completed after this runtime began is
+					// authoritative. The pre-lock liveness observation may have
+					// raced that stop, so never resurrect a newer terminal state.
+					if liveRuntimeSuperseded(current, &runtime) {
+						continue
+					}
 					applyLiveRuntimeProjection(current, &runtime)
 				} else {
 					// A fresh spawn can be absent from the concurrently-written
@@ -3650,6 +3656,25 @@ func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
 		return nil
 	}
 	return nil
+}
+
+func liveRuntimeSuperseded(current, runtime *state.Session) bool {
+	if current == nil || runtime == nil {
+		return true
+	}
+	if current.Status == state.StatusDone || current.Status == state.StatusCodeLanded {
+		return true
+	}
+	if current.Status == state.StatusRunning && current.PID > 0 && current.PID != runtime.PID && !current.StartedAt.Before(runtime.StartedAt) {
+		return true
+	}
+	if current.FinishedAt != nil && !current.FinishedAt.Before(runtime.StartedAt) {
+		return true
+	}
+	if current.WorkerEndedAt != nil && !current.WorkerEndedAt.Before(runtime.StartedAt) {
+		return true
+	}
+	return false
 }
 
 // applyLiveRuntimeProjection copies only fields owned by the external worker

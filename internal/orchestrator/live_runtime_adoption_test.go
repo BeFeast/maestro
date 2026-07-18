@@ -168,4 +168,52 @@ func TestSaveStatePreservingLiveRuntimeRecoversSameSessionConflict(t *testing.T)
 	}
 }
 
+func TestSaveStatePreservingLiveRuntimeDoesNotResurrectNewerStop(t *testing.T) {
+	stateDir := t.TempDir()
+	worktreeBase := t.TempDir()
+	worktree := worktreeBase + "/slot-1"
+	started := time.Date(2026, 7, 18, 2, 45, 0, 0, time.UTC)
+	initial := state.NewState()
+	initial.Sessions["slot-1"] = &state.Session{
+		IssueNumber: 42, Worktree: worktree, Branch: "feat/slot-1-42",
+		Status: state.StatusPROpen, PRNumber: 99, Backend: "sol",
+	}
+	if err := state.Save(stateDir, initial); err != nil {
+		t.Fatal(err)
+	}
+	runSnapshot, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopSnapshot, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := runSnapshot.Sessions["slot-1"]
+	run.Status, run.PID, run.TmuxSession, run.StartedAt = state.StatusRunning, 6262, "maestro-slot-1", started
+	stoppedAt := started.Add(time.Second)
+	stopped := stopSnapshot.Sessions["slot-1"]
+	stopped.Status, stopped.PID, stopped.FinishedAt = state.StatusDead, 0, &stoppedAt
+	if err := state.Save(stateDir, stopSnapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: stateDir, WorktreeBase: worktreeBase},
+		tmuxSessionExistsFn: func(string) bool { return true },
+		tmuxPaneIdentityFn:  func(string) (int, string, error) { return 6262, worktree, nil },
+		pidAliveFn:          func(int) bool { return true },
+	}
+	if err := o.saveStatePreservingLiveRuntime(runSnapshot); err == nil {
+		t.Fatal("newer terminal state must win even if pre-lock liveness probe observed the old runtime")
+	}
+	loaded, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Sessions["slot-1"]; got.Status != state.StatusDead || got.PID != 0 {
+		t.Fatalf("newer stop was resurrected: %#v", got)
+	}
+}
+
 func ptrTime(v time.Time) *time.Time { return &v }
