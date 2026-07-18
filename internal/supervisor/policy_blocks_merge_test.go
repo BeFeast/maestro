@@ -177,6 +177,9 @@ func TestDecide_OpenPR_CIAggregateStaleButMergeStateClean_Merges(t *testing.T) {
 	if decision.RecommendedAction != ActionMergePR {
 		t.Fatalf("action = %q, want merge_pr (mergeable_state=clean must override stale aggregate CI=pending)", decision.RecommendedAction)
 	}
+	if decision.Target == nil || decision.Target.HeadSHA == "" {
+		t.Fatalf("target = %#v, want merge approval bound to checked head SHA", decision.Target)
+	}
 }
 
 func TestDecide_OpenPR_RealPendingCheckRunBlocksCleanMergeState(t *testing.T) {

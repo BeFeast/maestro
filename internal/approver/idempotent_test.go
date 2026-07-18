@@ -38,6 +38,8 @@ func (b *blockingGH) MergePR(pr int) error {
 	}
 	return nil
 }
+func (b *blockingGH) MergePRAtHead(pr int, _ string) error { return b.MergePR(pr) }
+func (b *blockingGH) PRHeadSHA(int) (string, error)        { return testMergeHeadSHA, nil }
 func (b *blockingGH) CloseIssue(issue int, comment string) error {
 	atomic.AddInt32(&b.calls, 1)
 	return nil
@@ -73,7 +75,7 @@ func TestExecute_ConcurrentSameApproval_OnlyOneSideEffect(t *testing.T) {
 	gh := &blockingGH{gate: gate, released: released}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	results := make(chan Result, 2)
 	go func() { results <- ex.Execute(a) }()

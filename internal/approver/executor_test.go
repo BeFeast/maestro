@@ -22,6 +22,7 @@ import (
 // #547 paths set mergeable/mergeState explicitly.
 type fakeGH struct {
 	mergeCalls    []int
+	mergeHeads    []string
 	closeCalls    []closeCall
 	updateCalls   []int
 	labelCalls    []labelCall
@@ -43,7 +44,11 @@ type fakeGH struct {
 	mergeStatusErr error
 	// updateErr is returned by UpdateBranch.
 	updateErr error
+	headSHA   string
+	headErr   error
 }
+
+const testMergeHeadSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 type closeCall struct {
 	issue   int
@@ -63,6 +68,19 @@ type editBodyCall struct {
 func (f *fakeGH) MergePR(pr int) error {
 	f.mergeCalls = append(f.mergeCalls, pr)
 	return f.mergeErr
+}
+func (f *fakeGH) MergePRAtHead(pr int, headSHA string) error {
+	f.mergeHeads = append(f.mergeHeads, headSHA)
+	return f.MergePR(pr)
+}
+func (f *fakeGH) PRHeadSHA(int) (string, error) {
+	if f.headErr != nil {
+		return "", f.headErr
+	}
+	if f.headSHA != "" {
+		return f.headSHA, nil
+	}
+	return testMergeHeadSHA, nil
 }
 func (f *fakeGH) CloseIssue(issue int, comment string) error {
 	f.closeCalls = append(f.closeCalls, closeCall{issue: issue, comment: comment})
@@ -231,7 +249,7 @@ func TestExecute_ApplyLessonProposal_AppendsWorkerPromptAndMarksApplied(t *testi
 func TestExecute_MergePR_HappyPath(t *testing.T) {
 	gh := &fakeGH{}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99}, "merge me", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecuted {
@@ -242,6 +260,26 @@ func TestExecute_MergePR_HappyPath(t *testing.T) {
 	}
 	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != 99 {
 		t.Fatalf("mergeCalls = %v", gh.mergeCalls)
+	}
+	if len(gh.mergeHeads) != 1 || gh.mergeHeads[0] != testMergeHeadSHA {
+		t.Fatalf("mergeHeads = %v, want atomic merge at %s", gh.mergeHeads, testMergeHeadSHA)
+	}
+}
+
+func TestExecute_MergePR_ChangedHeadSkipsWithoutMerge(t *testing.T) {
+	gh := &fakeGH{headSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped; res=%+v", res.Status, res)
+	}
+	if len(gh.mergeCalls) != 0 || len(gh.mergeHeads) != 0 {
+		t.Fatalf("changed head must not merge: calls=%v heads=%v", gh.mergeCalls, gh.mergeHeads)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "head changed") {
+		t.Fatalf("summary = %q, want head-changed explanation", res.Summary)
 	}
 }
 
@@ -255,7 +293,7 @@ func TestExecute_MergePR_HappyPath(t *testing.T) {
 func TestExecute_MergePR_Behind_UpdatesBranchAndSkips(t *testing.T) {
 	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "behind"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 542}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 542, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionSkipped {
@@ -283,7 +321,7 @@ func TestExecute_MergePR_Behind_UpdatesBranchAndSkips(t *testing.T) {
 func TestExecute_MergePR_Clean_Merges(t *testing.T) {
 	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "clean"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 100}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 100, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecuted {
@@ -303,7 +341,7 @@ func TestExecute_MergePR_Clean_Merges(t *testing.T) {
 func TestExecute_MergePR_Conflicting_Fails(t *testing.T) {
 	gh := &fakeGH{mergeable: "CONFLICTING", mergeState: "dirty"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
@@ -326,7 +364,7 @@ func TestExecute_MergePR_Conflicting_Fails(t *testing.T) {
 func TestExecute_MergePR_BehindButConflicting_DoesNotUpdate(t *testing.T) {
 	gh := &fakeGH{mergeable: "CONFLICTING", mergeState: "behind"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 8}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 8, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionFailed {
@@ -343,7 +381,7 @@ func TestExecute_MergePR_BehindButConflicting_DoesNotUpdate(t *testing.T) {
 func TestExecute_MergePR_Behind_UpdateBranchError_Fails(t *testing.T) {
 	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "behind", updateErr: errors.New("update boom")}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 9}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 9, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
@@ -364,7 +402,7 @@ func TestExecute_MergePR_Behind_UpdateBranchError_Fails(t *testing.T) {
 func TestExecute_MergePR_StatusFetchError_StillMerges(t *testing.T) {
 	gh := &fakeGH{mergeStatusErr: errors.New("rate limited")}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 11}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 11, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecuted {

@@ -1217,7 +1217,7 @@ func TestSessionWithOpenPR_SkipsSettledSessionsBeforeRemoteResolution(t *testing
 		PRNumber:    202,
 	}
 
-	_, _, _, found, _, _ := eng.sessionWithOpenPR(st, nil, newResolutionCache(eng.reader))
+	_, _, _, found, _, _, _ := eng.sessionWithOpenPR(st, nil, newResolutionCache(eng.reader))
 
 	if found {
 		t.Fatal("settled session was selected as an open-PR candidate")
