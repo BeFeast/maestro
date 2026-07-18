@@ -133,6 +133,9 @@ func TestReconcile_DrainDeathResumesDeadCheckpointAfterRestart(t *testing.T) {
 	if sess.Status != state.StatusDead || sess.RestartCheckpointAt == nil {
 		t.Fatalf("drain-time state = status %q marker %v, want dead with restart marker", sess.Status, sess.RestartCheckpointAt)
 	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("drain-time death must wait for replacement-daemon resume, got ordinary retry %v", sess.NextRetryAt)
+	}
 	if resumeCount != 0 {
 		t.Fatalf("old draining daemon resumed %d workers, want 0", resumeCount)
 	}
