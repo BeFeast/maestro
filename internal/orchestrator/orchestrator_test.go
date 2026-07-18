@@ -4133,6 +4133,46 @@ func TestRebaseConflicts_OpenPRBehindMainUpdatesUnderMaintenance(t *testing.T) {
 	}
 }
 
+func TestRebaseConflicts_SharedPRMutatesOnlyNewestContinuation(t *testing.T) {
+	updateCalled := 0
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "behind", nil
+		},
+		ghUpdateBranchFn: func(prNumber int) error {
+			updateCalled++
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC),
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.rebaseConflicts(s)
+
+	if updateCalled != 1 {
+		t.Fatalf("updateBranch called %d times, want exactly one canonical update", updateCalled)
+	}
+	if got := s.Sessions["ok-player-273"].Status; got != state.StatusPROpen {
+		t.Fatalf("historical session status = %q, want untouched pr_open", got)
+	}
+	if got := s.Sessions["ok-player-302"].Status; got != state.StatusQueued {
+		t.Fatalf("canonical continuation status = %q, want queued after update", got)
+	}
+}
+
 // #602 — When the merge fails with a non-"not up to date" error AND GitHub
 // reports MERGEABLE (so it's not actually a conflict), fall through to the
 // existing single-notification merge_failed path instead of mis-routing.
@@ -8768,6 +8808,62 @@ func TestAutoMergePRs_CIFailure_KeepsCanonicalPRAndSchedulesInPlaceRetry(t *test
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("FinishedAt should be set")
+	}
+}
+
+func TestAutoMergePRs_SharedPRFailureMutatesOnlyNewestContinuation(t *testing.T) {
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, closedPRs := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{388: "failure"})
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC), RetryCount: 3,
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.autoMergePRs(s)
+
+	historical := s.Sessions["ok-player-273"]
+	if historical.Status != state.StatusPROpen || historical.LastNotifiedStatus != "" {
+		t.Fatalf("historical session mutated by shared PR failure: %+v", historical)
+	}
+	canonical := s.Sessions["ok-player-302"]
+	if canonical.Status != state.StatusDead || canonical.NextRetryAt == nil || canonical.RetryCount != 1 {
+		t.Fatalf("canonical continuation = %+v, want one scheduled in-place retry", canonical)
+	}
+	if canonical.PRNumber != 388 || len(*closedPRs) != 0 {
+		t.Fatalf("canonical identity changed: pr=%d closed=%v", canonical.PRNumber, *closedPRs)
+	}
+}
+
+func TestAutoMergePRs_SharedPRLiveContinuationBlocksHistoricalGateMutation(t *testing.T) {
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, closedPRs := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{388: "failure"})
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC), RetryCount: 3,
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PRNumber: 388, Branch: "feat/shared-pr", PID: 12345,
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.autoMergePRs(s)
+
+	if got := s.Sessions["ok-player-273"]; got.Status != state.StatusPROpen || got.LastNotifiedStatus != "" {
+		t.Fatalf("historical session mutated while canonical repair is live: %+v", got)
+	}
+	if got := s.Sessions["ok-player-302"]; got.Status != state.StatusRunning || got.RetryCount != 0 {
+		t.Fatalf("live canonical continuation mutated by merge flow: %+v", got)
+	}
+	if len(*closedPRs) != 0 {
+		t.Fatalf("shared PR closed while canonical repair is live: %v", *closedPRs)
 	}
 }
 

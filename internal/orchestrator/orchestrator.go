@@ -4828,6 +4828,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	// open PR references the issue. Multiple candidates are ambiguous and must
 	// remain untouched; choosing one would manufacture a new canonical identity.
 	o.reconcileTerminalSessionsWithOpenPRs(s, prs)
+	// One open PR is one maintenance/merge lifecycle even when a continuation
+	// issue and its historical source issue both retain exact session records.
+	// Gate side effects (CI retry accounting, review repair, rebase, merge) must
+	// run through one deterministic owner. Without this, a red head can be
+	// observed twice: the current continuation safely defers while its branch is
+	// moving, then an older session consumes retry budget and becomes
+	// retry_exhausted for the same PR (OK Player #388 / issues #345 and #406).
+	mergeOwners := canonicalMergeFlowOwners(s, branchToPR, numberToPR)
 
 	type mergeCandidate struct {
 		slotName string
@@ -4915,6 +4923,10 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
 			state.MarkWorkerEnded(sess, now)
+			continue
+		}
+		if owner := mergeOwners[pr.Number]; owner != "" && owner != slotName {
+			log.Printf("[orch] PR #%d lifecycle is owned by canonical session %s; skipping historical session %s", pr.Number, owner, slotName)
 			continue
 		}
 
@@ -5468,6 +5480,68 @@ func mergeFlowEligibleStatus(sess *state.Session) bool {
 	default:
 		return false
 	}
+}
+
+// canonicalMergeFlowOwners elects exactly one session for each open PR before
+// autoMergePRs performs any gate mutation. The ordering deliberately matches
+// supervisor/watchdog PR ownership: a live worker wins; otherwise the newest
+// unresolved session wins, with stable tie-breaking. Keeping this election
+// local to the current open-PR snapshot also means a closed/merged PR is left
+// to terminal reconciliation rather than retaining a synthetic owner.
+func canonicalMergeFlowOwners(s *state.State, byBranch map[string]github.PR, byNumber map[int]github.PR) map[int]string {
+	owners := make(map[int]string)
+	if s == nil {
+		return owners
+	}
+	for _, slot := range sortedStateSessionNames(s) {
+		sess := s.Sessions[slot]
+		if !mergeFlowOwnerEligibleStatus(sess) {
+			continue
+		}
+		pr, found := mergeFlowPRForSession(sess, byBranch, byNumber)
+		if !found {
+			continue
+		}
+		currentSlot, exists := owners[pr.Number]
+		if !exists || mergeFlowOwnerPrecedes(slot, sess, currentSlot, s.Sessions[currentSlot]) {
+			owners[pr.Number] = slot
+		}
+	}
+	return owners
+}
+
+func mergeFlowOwnerEligibleStatus(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	switch sess.Status {
+	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusDead,
+		state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return sess.PRNumber > 0 || strings.TrimSpace(sess.Branch) != ""
+	default:
+		return false
+	}
+}
+
+func mergeFlowOwnerPrecedes(candidateSlot string, candidate *state.Session, currentSlot string, current *state.Session) bool {
+	if candidate == nil {
+		return false
+	}
+	candidateLive := candidate.Status == state.StatusRunning && candidate.PID > 0
+	currentLive := current != nil && current.Status == state.StatusRunning && current.PID > 0
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	if current == nil || candidate.StartedAt.After(current.StartedAt) {
+		return true
+	}
+	if current.StartedAt.After(candidate.StartedAt) {
+		return false
+	}
+	if candidate.Status != current.Status {
+		return candidate.Status == state.StatusQueued
+	}
+	return candidateSlot < currentSlot
 }
 
 // isSettledRetryExhausted reports whether a session has already been marked
@@ -7397,12 +7471,21 @@ func (o *Orchestrator) rebaseConflicts(s *state.State) {
 	}
 
 	branchToPR := make(map[string]github.PR)
+	numberToPR := make(map[int]github.PR)
 	for _, pr := range prs {
 		branchToPR[pr.HeadRefName] = pr
+		numberToPR[pr.Number] = pr
 	}
+	owners := canonicalMergeFlowOwners(s, branchToPR, numberToPR)
 
 	for slotName, sess := range s.Sessions {
-		pr, hasPR := branchToPR[sess.Branch]
+		pr, hasPR := mergeFlowPRForSession(sess, branchToPR, numberToPR)
+		if hasPR {
+			if owner := owners[pr.Number]; owner != "" && owner != slotName {
+				log.Printf("[orch] PR #%d rebase lifecycle is owned by canonical session %s; skipping historical session %s", pr.Number, owner, slotName)
+				continue
+			}
+		}
 
 		switch sess.Status {
 		case state.StatusPROpen:
