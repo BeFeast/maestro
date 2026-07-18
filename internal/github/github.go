@@ -2150,9 +2150,9 @@ func (c *Client) MergedPRNumberForBranch(branch string) (int, error) {
 }
 
 // PRCheckRollup is a bounded, non-secret identity for the actual current PR
-// head and its CI/check rollup. Fingerprint hashes check names and closed
-// status/conclusion fields only; it never carries descriptions, URLs, output,
-// annotations, paths, or credentials (#887).
+// head and its CI/check rollup. Fingerprint hashes public check-run IDs, names,
+// and closed status/conclusion fields only; it never carries descriptions,
+// URLs, output, annotations, paths, or credentials (#887/#940).
 type PRCheckRollup struct {
 	HeadSHA     string
 	Verdict     string
@@ -2161,7 +2161,9 @@ type PRCheckRollup struct {
 }
 
 // PRCheckRollup returns the current head, normalized aggregate verdict, and a
-// stable digest of individual check/status transitions. When one of GitHub's
+// stable digest of individual check/status transitions and public check-run
+// identities. A manual rerun on the same head therefore advances once instead
+// of looking identical to the exhausted run it replaced. When one of GitHub's
 // two CI sources is unavailable the legacy aggregate verdict still degrades to
 // the source that did answer, but Complete=false and Fingerprint is absent so a
 // partial poll cannot fabricate material progress.
@@ -2196,8 +2198,8 @@ func ciCheckRollupFingerprint(checks []greptileCheckRun, combined combinedStatus
 	parts := make([]string, 0, len(checks)+len(combined.Statuses)+1)
 	parts = append(parts, "combined="+strings.ToLower(strings.TrimSpace(combined.State)))
 	for _, check := range checks {
-		parts = append(parts, fmt.Sprintf("check:%s:%s:%s",
-			strings.TrimSpace(check.Name), strings.ToLower(strings.TrimSpace(check.Status)), strings.ToLower(strings.TrimSpace(check.Conclusion))))
+		parts = append(parts, fmt.Sprintf("check:%d:%s:%s:%s",
+			check.ID, strings.TrimSpace(check.Name), strings.ToLower(strings.TrimSpace(check.Status)), strings.ToLower(strings.TrimSpace(check.Conclusion))))
 	}
 	for _, status := range combined.Statuses {
 		parts = append(parts, fmt.Sprintf("status:%s:%s",

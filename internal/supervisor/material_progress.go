@@ -79,8 +79,13 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 	}
 	now = now.UTC()
 	slots := make([]string, 0, len(st.Sessions))
+	livePRs := make(map[int]struct{})
 	for slot := range st.Sessions {
 		slots = append(slots, slot)
+		sess := st.Sessions[slot]
+		if sess != nil && sess.Status == state.StatusRunning && sess.PID > 0 && sess.PRNumber > 0 {
+			livePRs[sess.PRNumber] = struct{}{}
+		}
 	}
 	sort.Strings(slots)
 
@@ -96,6 +101,14 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 				observations = append(observations, observation)
 			}
 		case state.StatusPROpen, state.StatusQueued:
+			// A live continuation/repair worker that owns this exact PR is the
+			// actionable progress target. Keeping the older pr_open session as a
+			// second gate target fabricates an overdue gate while the repair is
+			// actively advancing (OK Player #345/#406, PR #388). The gate becomes
+			// observable again automatically when the worker leaves StatusRunning.
+			if _, ownedByLiveWorker := livePRs[sess.PRNumber]; sess.PRNumber > 0 && ownedByLiveWorker {
+				continue
+			}
 			if observation, ok := prGateProgressObservation(st, project, slot, sess, now); ok {
 				observations = append(observations, observation)
 			}

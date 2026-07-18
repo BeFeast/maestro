@@ -36,8 +36,8 @@ func mergeGuardSession(branch string, pr int) *state.Session {
 // under a concurrent worker/operator push), autoMergePRs must NOT let the PR
 // reach the merge decision this cycle: merging now would land it permanently
 // without the required Maestro-Backend trailer while the deferral's promised
-// retry never runs. The guard must short-circuit before even querying CI, so a
-// later quiet cycle can stamp the trailer and then merge (#858).
+// retry never runs. CI observation is still safe and required for watchdog
+// truth; a later quiet cycle can stamp the trailer and then merge (#858/#940).
 func TestAutoMergePRs_DeferredAttributionBlocksMerge(t *testing.T) {
 	branch := "feat/sup-858-amend-race"
 	s := state.NewState()
@@ -68,8 +68,8 @@ func TestAutoMergePRs_DeferredAttributionBlocksMerge(t *testing.T) {
 	if merged {
 		t.Fatal("deferred attribution amend must block the merge — ghMergePRFn was called (#858)")
 	}
-	if ciQueried {
-		t.Fatal("deferred attribution amend must short-circuit before the merge flow continues (CI was queried)")
+	if !ciQueried {
+		t.Fatal("deferred attribution amend must still observe CI for watchdog truth")
 	}
 	// The session stays merge-eligible so a later quiet cycle completes it.
 	if s.Sessions["sup-858"].Status != state.StatusPROpen {
@@ -78,8 +78,8 @@ func TestAutoMergePRs_DeferredAttributionBlocksMerge(t *testing.T) {
 }
 
 // An unexpected amend failure is just as unsafe as a known deferral: the
-// trailer is not known to be on the remote, so the merge path must fail closed
-// before querying CI or attempting the merge.
+// trailer is not known to be on the remote, so the merge path must fail closed.
+// Read-only CI observation remains allowed and keeps durable gate state fresh.
 func TestAutoMergePRs_UnexpectedAttributionFailureBlocksMerge(t *testing.T) {
 	branch := "feat/sup-873-amend-error"
 	s := state.NewState()
@@ -110,8 +110,8 @@ func TestAutoMergePRs_UnexpectedAttributionFailureBlocksMerge(t *testing.T) {
 	if merged {
 		t.Fatal("unexpected attribution failure must block the merge")
 	}
-	if ciQueried {
-		t.Fatal("unexpected attribution failure must short-circuit before CI is queried")
+	if !ciQueried {
+		t.Fatal("unexpected attribution failure must still observe CI for watchdog truth")
 	}
 }
 

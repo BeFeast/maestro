@@ -4917,8 +4917,16 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			// the durable Maestro-Backend trailer, and the deferral's "retry next
 			// cycle" would then have nothing left to amend. Skip it; a later quiet
 			// cycle stamps the trailer and this PR becomes merge-eligible (#858).
-			// ensureAttributionTrailerOnBranch already logged the concise defer
-			// line, so no extra journal noise here.
+			// Attribution is a merge precondition, not an observability precondition.
+			// Keep recording the authoritative current head/check rollup while the
+			// safe amend is deferred; otherwise the watchdog retains an old head and
+			// reports a false stale gate while a rerun is visibly in progress.
+			_, _, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
+			if err != nil {
+				log.Printf("[orch] CI status for PR #%d while attribution is deferred: %v", pr.Number, err)
+			} else if gateObservable {
+				o.persistPRGateTransition(s, gateTransition, observedAt)
+			}
 			continue
 		}
 
@@ -4930,33 +4938,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		// Check the actual current head plus its aggregate and per-check rollup.
 		// The normalized rollup remains the merge gate; the durable snapshot below
 		// additionally hashes individual check transitions (#887).
-		ciRollup, err := o.prCheckRollup(pr.Number)
+		_, ciStatus, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
 		if err != nil {
 			log.Printf("[orch] CI status for PR #%d: %v", pr.Number, err)
 			continue
 		}
-		ciStatus := ciRollup.Verdict
-
-		// #424: the aggregate PRCIStatus can stick at "pending" long after
-		// every required check has gone green (a common cause is a legacy
-		// commit-status used by some review bots that never resolves).
-		// GitHub's own per-PR mergeable_state encodes the required-check
-		// verdict. Only "clean" may override the stale aggregate. "unstable"
-		// can coexist with explicitly failed check runs (live #397), so treating
-		// it as success can merge known-red work.
-		if ciStatus == "pending" {
-			if mergeable, mergeState, mErr := o.prMergeStatus(pr.Number); mErr == nil && mergeable == "MERGEABLE" {
-				switch mergeState {
-				case "clean":
-					log.Printf("[orch] PR #%d (%s) aggregate CI=pending but mergeable_state=%s — treating as success (#424)", pr.Number, sess.Branch, mergeState)
-					ciStatus = "success"
-				}
-			}
-		}
-
-		log.Printf("[orch] PR #%d (%s) CI=%s", pr.Number, sess.Branch, ciStatus)
-		gateTransition, gateObservable := o.prGateTransitionForCI(sess, pr, ciRollup, ciStatus)
-		observedAt := time.Now().UTC()
 		persistGate := func() {
 			if gateObservable {
 				o.persistPRGateTransition(s, gateTransition, observedAt)

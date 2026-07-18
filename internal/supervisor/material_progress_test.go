@@ -145,6 +145,26 @@ func TestCollectMaterialProgressObservations_QueuedRemainsAnActivePRGate(t *test
 	}
 }
 
+func TestCollectMaterialProgressObservations_LiveWorkerOwnsExactPRGate(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 18, 3, 0, 0, 0, time.UTC)
+	st.Sessions["old-gate"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Hour),
+	}
+	st.Sessions["continuation"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PRNumber: 388, PID: 1234, StartedAt: now.Add(-time.Minute),
+	}
+	recordTestPRGateSnapshot(t, st, 345, 388, strings.Repeat("a", 40), now.Add(-time.Hour))
+
+	observations := collectMaterialProgressObservationsForProject(st, "owner/repo", now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %+v, want only the live continuation", observations)
+	}
+	if observations[0].Target.Kind != progress.TargetWorker || observations[0].Target.IssueNumber != 406 || observations[0].Target.ProcessID != 1234 {
+		t.Fatalf("active target = %+v, want live continuation worker", observations[0].Target)
+	}
+}
+
 func TestCollectMaterialProgressObservations_PartialOrWrongProjectPRSnapshotIsIncomplete(t *testing.T) {
 	st := state.NewState()
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
