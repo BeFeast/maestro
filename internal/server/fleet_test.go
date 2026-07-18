@@ -1207,6 +1207,54 @@ func TestFleetAPIOperatorStateExplainsZeroRunningActiveWork(t *testing.T) {
 	}
 }
 
+func TestFleetAPIIssueGuardRetryHoldDoesNotBecomeProjectAttention(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	retryAt := now.Add(time.Minute)
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber:     406,
+		IssueTitle:      "Blocked canonical retry",
+		Status:          state.StatusDead,
+		StartedAt:       now.Add(-time.Hour),
+		FinishedAt:      &now,
+		NextRetryAt:     &retryAt,
+		RetryHoldReason: "issue #406 has a current excluded label",
+		Worktree:        "/worktrees/ok-player-302",
+		Branch:          "feat/ok-player-302-406-recover",
+		PRNumber:        388,
+	}
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save held retry state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("ok-player", "/tmp/ok-player.yaml", "", &config.Config{
+			Repo:        "befeast/ok-player",
+			StateDir:    dir,
+			MaxParallel: 20,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+	project := findFleetProject(t, resp.Projects, "ok-player")
+	if project.OperatorState.Kind == "attention" || project.NeedsAttention != 0 || resp.Summary.NeedsAttention != 0 {
+		t.Fatalf("held retry projected as attention: project=%+v fleet_summary=%+v", project.OperatorState, resp.Summary)
+	}
+	var held *fleetWorkerState
+	for i := range resp.Workers {
+		if resp.Workers[i].Slot == "ok-player-302" {
+			held = &resp.Workers[i]
+			break
+		}
+	}
+	if held == nil {
+		t.Fatal("held canonical retry missing from Fleet workers")
+	}
+	if held.DisplayStatus != string(state.DisplayWaitingForIssueGuard) || held.NeedsAttention || !held.Live {
+		t.Fatalf("held retry projection = display %q attention %v live %v", held.DisplayStatus, held.NeedsAttention, held.Live)
+	}
+}
+
 func TestFleetAPIEscalatesSelectedPendingDispatchPastSLA(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

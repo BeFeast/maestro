@@ -1030,6 +1030,10 @@ export function workerStatusTaxonomy(worker) {
     };
   }
 
+  if (display === "waiting_for_issue_guard") {
+    return { label: "waiting for issue guard", tone: "policy", section: "recent" };
+  }
+
   if (display === "backend_rate_limited") {
     return { label: "rate limited", tone: "watch", section: "stuck" };
   }
@@ -1097,6 +1101,13 @@ export function workerNextAction(worker) {
   const status = String(worker.rawStatus || worker.status || "");
   const display = String(worker.displayStatus || worker.display_status || "");
   const fallback = worker.next_action || worker.status_reason || "";
+
+  if (display === "waiting_for_issue_guard") {
+    return {
+      text: fallback || "Canonical retry is held by the issue's current dispatch guard and will resume in place after it clears.",
+      buttons: worker.issue_url ? [{ label: "Open issue →", href: worker.issue_url }] : [],
+    };
+  }
 
   if (display === "backend_rate_limited") {
     const backend = String(worker.provider_limit_backend || worker.backend || "the backend");

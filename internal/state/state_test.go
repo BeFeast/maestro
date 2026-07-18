@@ -1302,6 +1302,32 @@ func TestSessionDisplayStatusFor_StaleReviewRetryWorkerStaysRunning(t *testing.T
 	}
 }
 
+func TestSessionIssueGuardRetryHoldIsVisibleButNotActionableFailure(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	retryAt := now.Add(time.Minute)
+	sess := &Session{
+		IssueNumber:     406,
+		Status:          StatusDead,
+		StartedAt:       now.Add(-time.Hour),
+		NextRetryAt:     &retryAt,
+		RetryHoldReason: "issue #406 has a current excluded label",
+	}
+
+	if got := SessionDisplayStatusForAt(sess, nil, now); got != string(DisplayWaitingForIssueGuard) {
+		t.Fatalf("display = %q, want %q", got, DisplayWaitingForIssueGuard)
+	}
+	attention := SessionAttentionForAt(sess, nil, now)
+	if attention.NeedsAttention {
+		t.Fatalf("guarded retry must not need operator attention: %+v", attention)
+	}
+	if !containsString(attention.Reason, "dispatch guard") || !containsString(attention.NextAction, "same canonical session") {
+		t.Fatalf("guarded retry explanation = %+v, want truthful automatic-resume copy", attention)
+	}
+	if !SessionLiveAt(sess, now) {
+		t.Fatal("guarded retry must remain visible as a live canonical lease")
+	}
+}
+
 func TestSessionTokenBudgetExceededAttentionAndDisplay(t *testing.T) {
 	sess := &Session{
 		Status:            StatusFailed,
