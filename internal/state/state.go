@@ -3827,12 +3827,17 @@ func ClassifyActivity(in ActivityInput) (ProjectActivity, string) {
 	}
 	// Gate-bound: no live worker and no free slot while PRs are open. Only a
 	// problem when eligible work is waiting — that is the recurring #814
-	// intervention loop. With eligible work drained it is simply "waiting".
-	if c.PRGates > 0 && c.AvailableSlots == 0 {
-		if in.EligibleIssues > 0 {
+	// intervention loop. With eligible work drained it is simply "waiting",
+	// including separated-concurrency projects where PR gates intentionally do
+	// not consume otherwise-free implementation slots. Calling that state
+	// queue_empty hides the real gate/outcome work still in flight.
+	if c.PRGates > 0 {
+		if in.EligibleIssues > 0 && c.AvailableSlots == 0 {
 			return ActivityBlockedByGates, fmt.Sprintf("Blocked by PR gates: %d PR gate(s) hold all capacity while %d ready issue(s) wait; raise max_live_workers or max_parallel to keep implementing.", c.PRGates, in.EligibleIssues)
 		}
-		return ActivityWaitingOnGates, fmt.Sprintf("Waiting on PR gates: %d PR(s) open, no eligible work left to dispatch.", c.PRGates)
+		if in.EligibleIssues <= 0 {
+			return ActivityWaitingOnGates, fmt.Sprintf("Waiting on PR gates: %d PR(s) open, no eligible work left to dispatch.", c.PRGates)
+		}
 	}
 	if in.EligibleIssues <= 0 {
 		return ActivityQueueEmpty, "Queue empty: no eligible ready issues to dispatch."
