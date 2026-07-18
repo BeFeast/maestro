@@ -2235,10 +2235,11 @@ func (c *Client) MergedPRNumberForBranch(branch string) (int, error) {
 // and closed status/conclusion fields only; it never carries descriptions,
 // URLs, output, annotations, paths, or credentials (#887/#940).
 type PRCheckRollup struct {
-	HeadSHA     string
-	Verdict     string
-	Fingerprint string
-	Complete    bool
+	HeadSHA          string
+	Verdict          string
+	Fingerprint      string
+	Complete         bool
+	PendingCheckRuns bool
 }
 
 // PRCheckRollup returns the current head, normalized aggregate verdict, and a
@@ -2259,14 +2260,27 @@ func (c *Client) PRCheckRollup(prNumber int) (PRCheckRollup, error) {
 		return PRCheckRollup{HeadSHA: sha, Verdict: "unknown"}, fmt.Errorf("get checks for PR %d: check-runs: %v; statuses: %v", prNumber, checksErr, statusErr)
 	}
 	rollup := PRCheckRollup{
-		HeadSHA:  sha,
-		Verdict:  ciStatusFromREST(checks, combined),
-		Complete: checksErr == nil && statusErr == nil,
+		HeadSHA:          sha,
+		Verdict:          ciStatusFromREST(checks, combined),
+		Complete:         checksErr == nil && statusErr == nil,
+		PendingCheckRuns: hasPendingCheckRuns(checks),
 	}
 	if rollup.Complete {
 		rollup.Fingerprint = ciCheckRollupFingerprint(checks, combined)
 	}
 	return rollup, nil
+}
+
+func hasPendingCheckRuns(checks []greptileCheckRun) bool {
+	for _, check := range checks {
+		status := strings.ToLower(strings.TrimSpace(check.Status))
+		conclusion := strings.ToLower(strings.TrimSpace(check.Conclusion))
+		if status == "queued" || status == "in_progress" || status == "waiting" || status == "requested" ||
+			(status != "completed" && conclusion == "") {
+			return true
+		}
+	}
+	return false
 }
 
 // PRCIStatus returns "success", "failure", "pending", or "unknown".

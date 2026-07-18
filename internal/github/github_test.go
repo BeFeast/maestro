@@ -284,6 +284,30 @@ func TestCIStatusFromREST(t *testing.T) {
 	}
 }
 
+func TestHasPendingCheckRuns(t *testing.T) {
+	tests := []struct {
+		name   string
+		checks []greptileCheckRun
+		want   bool
+	}{
+		{name: "none"},
+		{name: "queued", checks: []greptileCheckRun{{Status: "queued"}}, want: true},
+		{name: "in progress", checks: []greptileCheckRun{{Status: "in_progress"}}, want: true},
+		{name: "waiting", checks: []greptileCheckRun{{Status: "waiting"}}, want: true},
+		{name: "requested", checks: []greptileCheckRun{{Status: "requested"}}, want: true},
+		{name: "unknown nonterminal", checks: []greptileCheckRun{{Status: "pending"}}, want: true},
+		{name: "success", checks: []greptileCheckRun{{Status: "completed", Conclusion: "success"}}},
+		{name: "failure", checks: []greptileCheckRun{{Status: "completed", Conclusion: "failure"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasPendingCheckRuns(tt.checks); got != tt.want {
+				t.Fatalf("hasPendingCheckRuns() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseCheckRunsKeepsLatestAttemptPerAppAndName(t *testing.T) {
 	checks, err := parseCheckRuns([]byte(`{
 		"check_runs": [
