@@ -6157,6 +6157,28 @@ func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session
 	if status.HealthState == outcome.HealthHealthy {
 		return true
 	}
+	// #970: project-wide outcome drift only gates a session that owns a merged
+	// product revision. A closed/cancelled issue with no discoverable merged PR
+	// has nothing left to deploy or live-verify; retaining its prior dead/failed
+	// status forever makes a reconciled issue dominate Fleet operator_state and
+	// hold a resumable-worktree claim indefinitely. The project outcome remains
+	// independently visible and actionable, but this no-delivery session may
+	// become terminal. Conversely, a merged revision discovered only through the
+	// branch/issue link must still enter code_landed and remain held here.
+	if sess != nil {
+		prNumber, err := o.mergedPRForDoneLikeSession(sess)
+		if err != nil {
+			log.Printf("[orch] %s, but merged delivery identity could not be verified while outcome health is %s: %v — holding out of done", trigger, status.HealthState, err)
+			return false
+		}
+		if prNumber <= 0 {
+			log.Printf("[orch] %s with no merged delivery identity; project outcome health is %s but does not keep this session non-terminal", trigger, status.HealthState)
+			return true
+		}
+		if sess.Status != state.StatusCodeLanded || sess.PRNumber != prNumber {
+			o.markCodeLanded(sess, prNumber)
+		}
+	}
 	issue := 0
 	if sess != nil {
 		issue = sess.IssueNumber
