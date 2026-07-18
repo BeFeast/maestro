@@ -3224,6 +3224,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			sess.PRNumber = pr.Number
 			sess.PID = 0
 			sess.TmuxSession = ""
+			sess.NextRetryAt = nil
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
 			state.MarkWorkerEnded(sess, now)
@@ -4259,6 +4260,16 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	}
 
 	for slotName, sess := range s.Sessions {
+		// NextRetryAt is meaningful only while a dead session is queued for an
+		// in-place respawn. A pr_open session already owns its canonical PR and
+		// has no pending process start; retaining an expired retry marker there
+		// makes Fleet report a contradictory "open PR + overdue retry" state and
+		// can survive daemon restarts indefinitely. Normalize legacy/racy state
+		// before any remote reconciliation so the durable store self-heals.
+		if sess.Status == state.StatusPROpen && sess.NextRetryAt != nil {
+			log.Printf("[orch] clearing stale retry marker for pr_open session %s / PR #%d", slotName, sess.PRNumber)
+			sess.NextRetryAt = nil
+		}
 		switch sess.Status {
 		case state.StatusDone, state.StatusCodeLanded, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
 			now := time.Now().UTC()
@@ -5142,14 +5153,21 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 		case "failure":
 			persistGate()
+			// A failed rollup is actionable only for the exact head that was
+			// observed. Attribution stamping, an operator push, or another repair
+			// can advance the branch between listOpenPRsForCycle and this decision.
+			// Success/review paths already re-check this identity before mutating;
+			// failure must do the same or an old red head can schedule a repair
+			// after the new head is already pending (OK Player PR #388).
+			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
+				continue
+			}
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}
 			// Auto-retry on CI failure: close the PR, capture CI output, and schedule retry
 			if sess.LastNotifiedStatus != "ci_failure" && sess.LastNotifiedStatus != "ci_retry_exhausted" {
-				sess.NotifiedCIFail = true // backward compat
-
-				o.handleCIFailureRetry(s, slotName, sess, pr)
+				o.handleCIFailureRetry(s, slotName, sess, pr, gateTransition.HeadSHA)
 			}
 		case "pending":
 			persistGate()
@@ -5963,11 +5981,17 @@ func (o *Orchestrator) handleReviewFeedbackRetry(s *state.State, slotName string
 // destroy canonical identity: closing the PR and clearing its session lease
 // let the ready issue dispatch a second worker before the retry completed
 // (live #949 / OK Player #346).
-func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, sess *state.Session, pr github.PR) {
+func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, sess *state.Session, pr github.PR, expectedHead string) {
 	maxRetries := o.cfg.MaxRetriesPerIssue
 	totalAttempts := s.FailedAttemptsForIssue(sess.IssueNumber) + sess.RetryCount
 
 	if maxRetries > 0 && totalAttempts >= maxRetries {
+		// Exhaustion is also a mutation of the exact PR lifecycle. Never mark a
+		// newer head retry-exhausted from an obsolete failed rollup.
+		if strings.TrimSpace(expectedHead) != "" && !o.prGateHeadMatches(pr.Number, expectedHead) {
+			return
+		}
+		sess.NotifiedCIFail = true // backward compat
 		log.Printf("[orch] CI failure on PR #%d — retry limit reached (%d/%d) for issue #%d",
 			pr.Number, totalAttempts, maxRetries, sess.IssueNumber)
 		alreadyNotified := sess.LastNotifiedStatus == "ci_retry_exhausted"
@@ -6008,6 +6032,16 @@ func (o *Orchestrator) handleCIFailureRetry(s *state.State, slotName string, ses
 	// exact lint constraint its previous push broke, not just "agent-lint
 	// failed" — this was the observed PR #850 blindness.
 	failingCheckContext := o.collectFailingCheckContext(pr.Number)
+
+	// The reads above can take seconds. A worker/operator push in that window
+	// invalidates every captured failure/review excerpt just as surely as a push
+	// before the caller's first head check. Re-check immediately before the first
+	// durable session mutation; the next cycle will observe the new head and
+	// decide from its own rollup instead of repairing stale evidence.
+	if strings.TrimSpace(expectedHead) != "" && !o.prGateHeadMatches(pr.Number, expectedHead) {
+		return
+	}
+	sess.NotifiedCIFail = true // backward compat
 
 	// Preserve the exact PR lease. Cleanup may already have cleared the
 	// worktree field on a terminal transition; record only the deterministic

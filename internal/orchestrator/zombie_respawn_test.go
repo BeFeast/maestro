@@ -142,7 +142,7 @@ func TestRespawnDueRetries_PROpenDuringCIRetryThenMerged_NoRespawn(t *testing.T)
 	s.Sessions["ok-player-1"] = sess
 
 	// Step 1: CI fails — maestro retains PR #135 and schedules an in-place retry.
-	o.handleCIFailureRetry(s, "ok-player-1", sess, github.PR{Number: 135, HeadRefName: sess.Branch})
+	o.handleCIFailureRetry(s, "ok-player-1", sess, github.PR{Number: 135, HeadRefName: sess.Branch}, "")
 
 	if sess.Status != state.StatusDead || sess.NextRetryAt == nil {
 		t.Fatalf("after CI-retry: status = %q nextRetryAt = %v, want dead with a scheduled retry", sess.Status, sess.NextRetryAt)

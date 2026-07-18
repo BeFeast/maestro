@@ -147,6 +147,93 @@ func TestAutoMergePRs_HeadChangeDuringReviewDefersExactSnapshotAndMerge(t *testi
 	}
 }
 
+func TestAutoMergePRs_HeadChangeAfterFailedRollupDoesNotScheduleStaleRetry(t *testing.T) {
+	pr := github.PR{Number: 388, HeadRefName: "feat/current-head-race"}
+	cfg := &config.Config{
+		Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none",
+		MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	oldHead := strings.Repeat("a", 40)
+	newHead := strings.Repeat("b", 40)
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{
+			HeadSHA: oldHead, Verdict: "failure", Fingerprint: strings.Repeat("9", 16), Complete: true,
+		}, nil
+	}
+	o.ghPRHeadSHAFn = func(int) (string, error) { return newHead, nil }
+	o.ghPRChecksOutputFn = func(int) (string, error) {
+		t.Fatal("stale failed head must not be consumed into a repair prompt")
+		return "", nil
+	}
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+		t.Fatal("stale failed head must not read review feedback for a repair")
+		return "", nil
+	}
+	o.ghPRFailingChecksFn = func(int) ([]github.FailingCheck, error) {
+		t.Fatal("stale failed head must not read failing-check logs for a repair")
+		return nil, nil
+	}
+	st := makeTestState([]github.PR{pr})
+	sess := st.Sessions["slot-0"]
+
+	o.autoMergePRs(st)
+
+	if sess.Status != state.StatusPROpen || sess.RetryCount != 0 || sess.NextRetryAt != nil {
+		t.Fatalf("stale failed head mutated session: status=%q retry=%d next=%v", sess.Status, sess.RetryCount, sess.NextRetryAt)
+	}
+	if len(*merged) != 0 {
+		t.Fatalf("head changed during failed-rollup observation but PR merged: %v", *merged)
+	}
+	snapshot := mustLatestPRGateSnapshot(t, st, sess.IssueNumber, pr.Number)
+	if snapshot.HeadSHA != oldHead || snapshot.CIEffectiveVerdict != state.PRGateCIFailure {
+		t.Fatalf("failed-head observation was not retained as read-only history: %+v", snapshot)
+	}
+}
+
+func TestAutoMergePRs_HeadChangeWhileCollectingFailureContextDoesNotScheduleStaleRetry(t *testing.T) {
+	pr := github.PR{Number: 389, HeadRefName: "feat/late-head-race"}
+	cfg := &config.Config{
+		Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none",
+		MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	oldHead := strings.Repeat("c", 40)
+	newHead := strings.Repeat("d", 40)
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{
+			HeadSHA: oldHead, Verdict: "failure", Fingerprint: strings.Repeat("8", 16), Complete: true,
+		}, nil
+	}
+	headReads := 0
+	o.ghPRHeadSHAFn = func(int) (string, error) {
+		headReads++
+		if headReads == 1 {
+			return oldHead, nil
+		}
+		return newHead, nil
+	}
+	o.ghPRChecksOutputFn = func(int) (string, error) { return "old head failed", nil }
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) { return "old head review", nil }
+	o.ghPRFailingChecksFn = func(int) ([]github.FailingCheck, error) {
+		return []github.FailingCheck{{Name: "old-check", Conclusion: "failure", Excerpt: "old head"}}, nil
+	}
+	st := makeTestState([]github.PR{pr})
+	sess := st.Sessions["slot-0"]
+
+	o.autoMergePRs(st)
+
+	if headReads != 2 {
+		t.Fatalf("head reads = %d, want pre-context and pre-mutation checks", headReads)
+	}
+	if sess.Status != state.StatusPROpen || sess.RetryCount != 0 || sess.NextRetryAt != nil || sess.NotifiedCIFail || sess.CIFailureOutput != "" || sess.FailingCheckContext != "" || sess.PreviousAttemptFeedback != "" {
+		t.Fatalf("late head move persisted stale retry context: %+v", sess)
+	}
+	if len(*merged) != 0 {
+		t.Fatalf("head changed while collecting failed context but PR merged: %v", *merged)
+	}
+}
+
 func TestAutoMergePRs_AttributionDeferralStillObservesCurrentPRGate(t *testing.T) {
 	pr := github.PR{Number: 13, HeadRefName: "feat/deferred-attribution"}
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}

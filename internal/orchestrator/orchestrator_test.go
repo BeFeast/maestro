@@ -245,6 +245,7 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 // to pr_open so that IssueInProgress returns true and no duplicate worker is spawned.
 func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *testing.T) {
 	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-time.Minute)
 	s.Sessions["mae-5"] = &state.Session{
 		IssueNumber: 105,
 		IssueTitle:  "fix crash",
@@ -252,6 +253,7 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 		PID:         9999,
 		TmuxSession: "maestro-mae-5",
 		Branch:      "feat/mae-5-105-fix-crash",
+		NextRetryAt: &retryAt,
 	}
 
 	openPRs := []github.PR{
@@ -281,6 +283,9 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 	}
 	if sess.TmuxSession != "" {
 		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil after authoritative PR-open reconciliation", sess.NextRetryAt)
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("finished_at should be set")
@@ -327,6 +332,40 @@ func TestReconcileRunningSessions_DeadWithPendingRetry_NotFlippedToPROpen(t *tes
 	}
 	if sess.NextRetryAt == nil {
 		t.Fatal("NextRetryAt must be preserved — the in-place respawn depends on it")
+	}
+}
+
+func TestCheckSessions_PROpenClearsStaleRetryMarker(t *testing.T) {
+	retryAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		IssueTitle:  "canonical Flatpak repair",
+		Status:      state.StatusPROpen,
+		NextRetryAt: &retryAt,
+		RetryCount:  2,
+		Branch:      "feat/ok-player-345-flatpak-beta-retry",
+		PRNumber:    388,
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(int) (bool, error) { return false, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["ok-player-302"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil for pr_open canonical session", sess.NextRetryAt)
+	}
+	if sess.RetryCount != 2 {
+		t.Fatalf("retry_count = %d, want preserved history 2", sess.RetryCount)
 	}
 }
 
