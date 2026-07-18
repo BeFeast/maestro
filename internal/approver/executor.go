@@ -61,6 +61,14 @@ type GitHubClient interface {
 	UpdateBranch(prNumber int) error
 }
 
+type prHeadSHAReader interface {
+	PRHeadSHA(prNumber int) (string, error)
+}
+
+type prHeadBoundMerger interface {
+	MergePRAtHead(prNumber int, expectedHeadSHA string) error
+}
+
 // WorktreeRemover removes a git worktree. *worker.RemoveWorktree-shaped
 // callers satisfy this. Tests inject a fake.
 type WorktreeRemover interface {
@@ -431,6 +439,29 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
 	}
 	pr := approval.Target.PR
+	expectedHead := strings.TrimSpace(approval.Target.HeadSHA)
+	if expectedHead != "" {
+		headReader, ok := e.GH.(prHeadSHAReader)
+		if !ok {
+			return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot verify PR head SHA before merge")}
+		}
+		currentHead, err := headReader.PRHeadSHA(pr)
+		if err != nil {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("verify head for PR #%d before merge: %v", pr, err),
+				Err:     fmt.Errorf("verify head for PR #%d: %w", pr, err),
+			}
+		}
+		if strings.TrimSpace(currentHead) != expectedHead {
+			return Result{
+				Status: state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf(
+					"PR #%d head changed after approval; expected %s, current %s — re-validate before merging",
+					pr, expectedHead, strings.TrimSpace(currentHead)),
+			}
+		}
+	}
 
 	// #547: a green PR that has fallen BEHIND main cannot merge under
 	// "branches must be up to date" protection — `gh pr merge` fails with
@@ -477,11 +508,24 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		}
 	}
 
-	if err := e.GH.MergePR(pr); err != nil {
+	var mergeErr error
+	if expectedHead != "" {
+		headMerger, ok := e.GH.(prHeadBoundMerger)
+		if !ok {
+			return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot atomically bind merge to PR head SHA")}
+		}
+		mergeErr = headMerger.MergePRAtHead(pr, expectedHead)
+	} else {
+		// Backward compatibility for operator-authored and pre-upgrade approvals.
+		// Fresh supervisor approvals always carry HeadSHA and take the atomic
+		// path above; the next decision supersedes an older unstamped approval.
+		mergeErr = e.GH.MergePR(pr)
+	}
+	if mergeErr != nil {
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
-			Summary: fmt.Sprintf("merge PR #%d: %v", pr, err),
-			Err:     fmt.Errorf("merge PR #%d: %w", pr, err),
+			Summary: fmt.Sprintf("merge PR #%d: %v", pr, mergeErr),
+			Err:     fmt.Errorf("merge PR #%d: %w", pr, mergeErr),
 		}
 	}
 	return Result{

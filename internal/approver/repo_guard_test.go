@@ -16,7 +16,7 @@ func TestExecute_CrossProjectMutation_Refused(t *testing.T) {
 	cfg := newCfg() // cfg.Repo = "owner/repo"
 	ex := &Executor{GH: gh, Cfg: cfg}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 	a.Repo = "BeFeast/scribe-service" // mismatch
 
 	res := ex.Execute(a)
@@ -36,7 +36,7 @@ func TestExecute_RepoMatch_Proceeds(t *testing.T) {
 	cfg := newCfg()
 	ex := &Executor{GH: gh, Cfg: cfg}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 	a.Repo = cfg.Repo // explicit match
 
 	res := ex.Execute(a)
@@ -54,7 +54,7 @@ func TestExecute_LegacyApprovalNoRepo_FallsThrough(t *testing.T) {
 	gh := &fakeGH{}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 	// a.Repo intentionally left empty.
 
 	res := ex.Execute(a)
@@ -74,7 +74,7 @@ func TestExecute_NoCfgRepo_SkipsGuard(t *testing.T) {
 	cfg.Repo = ""
 	ex := &Executor{GH: gh, Cfg: cfg}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 	a.Repo = "BeFeast/something" // irrelevant — cfg has nothing to compare against
 
 	res := ex.Execute(a)
@@ -90,7 +90,7 @@ func TestExecute_LegacyApprovalNoRepo_EmitsDeprecationWarning(t *testing.T) {
 	gh := &fakeGH{}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 	// a.Repo intentionally left empty — simulates a pre-#489 approval.
 
 	res := ex.Execute(a)
@@ -112,7 +112,7 @@ func TestExecute_RepoMatch_NoLegacyWarning(t *testing.T) {
 	cfg := newCfg()
 	ex := &Executor{GH: gh, Cfg: cfg}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 	a.Repo = cfg.Repo
 
 	res := ex.Execute(a)

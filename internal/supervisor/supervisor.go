@@ -116,6 +116,10 @@ type prCheckRollupReader interface {
 	PRCheckRollup(prNumber int) (github.PRCheckRollup, error)
 }
 
+type prHeadSHAReader interface {
+	PRHeadSHA(prNumber int) (string, error)
+}
+
 type prGreptileReader interface {
 	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
 }
@@ -614,7 +618,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
-	if slot, sess, pr, mergeReady, mergeReasons, ok := e.sessionWithOpenPR(st, prs, cache); ok {
+	if slot, sess, pr, mergeReady, mergeHeadSHA, mergeReasons, ok := e.sessionWithOpenPR(st, prs, cache); ok {
 		// #565: auto review-repair respawn. When a green+mergeable PR is
 		// settled retry_exhausted on review feedback AND Greptile flags
 		// ≥1 P0/P1 inline comment on its current head SHA, mint a
@@ -673,7 +677,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		if mergeReady {
 			summary := fmt.Sprintf("Merge PR #%d for issue #%d — checks green, mergeable, review gates passed.", pr.Number, sess.IssueNumber)
 			reasons := appendReasons(baseReasons, mergeReasons...)
-			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, HeadSHA: mergeHeadSHA, Session: slot}
 			decision := e.decision(st, now, projectState, ActionMergePR,
 				summary,
 				RiskMutating, 0.9, target, PolicyRuleRuntimeState, reasons)
@@ -2685,7 +2689,7 @@ func sessionWithOpenPR(st *state.State, prs []github.PR) (string, *state.Session
 	return "", nil, github.PR{}, false
 }
 
-func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool, []string, bool) {
+func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool, string, []string, bool) {
 	branchToPR := make(map[string]github.PR, len(prs))
 	numberToPR := make(map[int]github.PR, len(prs))
 	for _, pr := range prs {
@@ -2703,6 +2707,7 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 	var bestSession *state.Session
 	var bestPR github.PR
 	var bestReady bool
+	var bestMergeHeadSHA string
 	var bestMergeReasons []string
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
@@ -2736,7 +2741,7 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		// blocked draft) prevented a later CLEAN green PR from ever reaching the
 		// merge rule. One ready PR is the highest-priority action in sequential
 		// merge mode; attention states remain next, then passive PR gates.
-		ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr)
+		ready, mergeHeadSHA, mergeReasons := e.openPRReadyToMerge(slot, sess, pr)
 		rank := 2
 		if ready {
 			rank = 0
@@ -2749,7 +2754,7 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		if bestSession == nil || rank < bestRank {
 			bestRank = rank
 			bestSlot, bestSession, bestPR = slot, sess, pr
-			bestReady, bestMergeReasons = ready, mergeReasons
+			bestReady, bestMergeHeadSHA, bestMergeReasons = ready, mergeHeadSHA, mergeReasons
 		}
 		if bestRank == 0 {
 			// sortedSessionNames provides the deterministic tie-break among
@@ -2758,9 +2763,9 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		}
 	}
 	if bestSession != nil {
-		return bestSlot, bestSession, bestPR, bestReady, bestMergeReasons, true
+		return bestSlot, bestSession, bestPR, bestReady, bestMergeHeadSHA, bestMergeReasons, true
 	}
-	return "", nil, github.PR{}, false, nil, false
+	return "", nil, github.PR{}, false, "", nil, false
 }
 
 func runningSession(st *state.State) (string, *state.Session, bool) {
@@ -2829,7 +2834,7 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			// instead of looping on spawn_repair_worker, which the executor
 			// refuses (not in the action registry) and wedges a green PR
 			// forever.
-			if ready, _ := e.openPRReadyToMerge(slot, sess, pr); ready {
+			if ready, _, _ := e.openPRReadyToMerge(slot, sess, pr); ready {
 				return false
 			}
 			return true
@@ -2871,17 +2876,43 @@ func (e *Engine) automaticOutcomeRecoveryOwnsFailure(st *state.State) bool {
 // Strict: an UNKNOWN mergeable, "pending" CI, or "unknown" review state
 // blocks the merge. We never speculate — a missing signal is treated as
 // "not ready" so we don't merge a PR whose state we couldn't read.
-func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.PR) (bool, []string) {
+func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.PR) (bool, string, []string) {
 	if sess == nil {
-		return false, nil
+		return false, "", nil
 	}
 	if pr.IsDraft {
-		return false, nil
+		return false, "", nil
 	}
+	// CI must be green. Production readers expose the current-head rollup so
+	// a real queued/in-progress check-run can never be confused with the
+	// legacy commit-status-only pending state handled by #425.
+	ciStatus := ""
+	pendingCheckRuns := false
+	rollupHeadSHA := ""
+	if rollupReader, ok := e.reader.(prCheckRollupReader); ok {
+		rollup, err := rollupReader.PRCheckRollup(pr.Number)
+		if err != nil || !rollup.Complete || strings.TrimSpace(rollup.HeadSHA) == "" {
+			return false, "", nil
+		}
+		rollupHeadSHA = strings.TrimSpace(rollup.HeadSHA)
+		ciStatus = rollup.Verdict
+		pendingCheckRuns = rollup.PendingCheckRuns
+	} else {
+		ciReader, ok := e.reader.(prCIStatusReader)
+		if !ok {
+			return false, "", nil
+		}
+		var err error
+		ciStatus, err = ciReader.PRCIStatus(pr.Number)
+		if err != nil {
+			return false, "", nil
+		}
+	}
+
 	// #543: GitHub LIST endpoint never populates `mergeable`; fetch via
-	// single-PR endpoint when reader supports it. Without this every
-	// PR.Mergeable read here was "" → "UNKNOWN" → merge_pr never
-	// recommended.
+	// single-PR endpoint when reader supports it. Read it after the rollup so
+	// the final head identity check below proves every gate was observed for
+	// one unchanged PR head.
 	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
 	if mr, ok := e.reader.(prMergeableReader); ok {
 		if fresh, err := mr.PRMergeable(pr.Number); err == nil {
@@ -2889,36 +2920,13 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		}
 	}
 	if mergeable != "MERGEABLE" {
-		return false, nil
+		return false, "", nil
 	}
 
-	// CI must be green. Production readers expose the current-head rollup so
-	// a real queued/in-progress check-run can never be confused with the
-	// legacy commit-status-only pending state handled by #425.
-	ciStatus := ""
-	pendingCheckRuns := false
-	if rollupReader, ok := e.reader.(prCheckRollupReader); ok {
-		rollup, err := rollupReader.PRCheckRollup(pr.Number)
-		if err != nil || !rollup.Complete {
-			return false, nil
-		}
-		ciStatus = rollup.Verdict
-		pendingCheckRuns = rollup.PendingCheckRuns
-	} else {
-		ciReader, ok := e.reader.(prCIStatusReader)
-		if !ok {
-			return false, nil
-		}
-		var err error
-		ciStatus, err = ciReader.PRCIStatus(pr.Number)
-		if err != nil {
-			return false, nil
-		}
-	}
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
 		if pendingCheckRuns {
-			return false, nil
+			return false, "", nil
 		}
 		// #425 (sup-98): the aggregate PRCIStatus can stick at "pending"
 		// long after every required check has gone green — the most common
@@ -2929,7 +2937,7 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		// "blocked" / "behind" / "dirty" / "" / "unknown" all stay
 		// not-ready.
 		if !mergeStateAllowsMerge(e.reader, pr.Number) {
-			return false, nil
+			return false, "", nil
 		}
 	}
 
@@ -2940,13 +2948,27 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	if greptileReader, ok := e.reader.(prGreptileReader); ok {
 		approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 		if err != nil {
-			return false, nil
+			return false, "", nil
 		}
 		if pending {
-			return false, nil
+			return false, "", nil
 		}
 		if !approved {
-			return false, nil
+			return false, "", nil
+		}
+	}
+
+	// A force-push or repair commit can land between the rollup read and the
+	// merge decision. Production readers expose PRHeadSHA; fail closed unless
+	// the current head still matches the exact head whose checks were read.
+	if rollupHeadSHA != "" {
+		headReader, ok := e.reader.(prHeadSHAReader)
+		if !ok {
+			return false, "", nil
+		}
+		currentHead, err := headReader.PRHeadSHA(pr.Number)
+		if err != nil || strings.TrimSpace(currentHead) != rollupHeadSHA {
+			return false, "", nil
 		}
 	}
 
@@ -2966,7 +2988,7 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	if _, ok := e.reader.(prGreptileReader); ok {
 		reasons = append(reasons, fmt.Sprintf("PR #%d Greptile review approved", pr.Number))
 	}
-	return true, reasons
+	return true, rollupHeadSHA, reasons
 }
 
 // monitorOpenPRReasons returns a short list of human-readable reasons

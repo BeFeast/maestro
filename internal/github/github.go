@@ -2864,6 +2864,26 @@ func (c *Client) MergePR(prNumber int) error {
 	return nil
 }
 
+// MergePRAtHead squash-merges a PR only when its current head still matches
+// expectedHeadSHA. GitHub enforces the comparison atomically with the merge,
+// closing the force-push race between a gate/approval read and execution.
+func (c *Client) MergePRAtHead(prNumber int, expectedHeadSHA string) error {
+	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
+	if expectedHeadSHA == "" {
+		return fmt.Errorf("merge PR %d: expected head SHA is required", prNumber)
+	}
+	out, err := ghCommand("pr", "merge",
+		fmt.Sprint(prNumber),
+		"--repo", c.Repo,
+		"--squash",
+		"--delete-branch",
+		"--match-head-commit", expectedHeadSHA).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr merge %d at head %s: %w\n%s", prNumber, expectedHeadSHA, err, out)
+	}
+	return nil
+}
+
 // MarkPRReady marks a draft pull request as ready for review (wraps
 // `gh pr ready`). `gh pr merge` on a draft fails with "still a draft", so
 // the orchestrator readies a green draft PR before merging it (#697).
