@@ -797,6 +797,125 @@ func TestDecide_DraftPRCurrentHeadCIFailed_RecommendsRepair(t *testing.T) {
 	}
 }
 
+func TestDecide_AutomaticOutcomeRecoveryOwnsGreenDraftOutcomeDrift(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:     "candidate feed follows main",
+		HealthcheckCommand: "check-outcome",
+		RecoveryMode:       outcome.RecoveryModeAutomatic,
+		RecoveryCommand:    "recover-outcome",
+	}
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 406, Title: "Flatpak continuation"}},
+		prs:        []github.PR{{Number: 388, HeadRefName: "feat/flatpak", Mergeable: "MERGEABLE", IsDraft: true}},
+		ciStatuses: map[int]string{388: "success"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/flatpak",
+		PRNumber:    388,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+	st.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, CheckedAt: time.Now().UTC()}
+	st.OutcomeRecovery = &outcome.RecoveryState{Status: outcome.RecoveryStatusVerificationPending, AttemptID: "outcome-live"}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr while automatic outcome recovery owns drift", decision.RecommendedAction)
+	}
+	if decision.Target == nil || decision.Target.PR != 388 || decision.Target.Session != "ok-player-302" {
+		t.Fatalf("target = %#v, want canonical PR #388 / ok-player-302", decision.Target)
+	}
+}
+
+func TestDecide_ConfiguredButInactiveOutcomeRecoveryDoesNotOwnGreenDraft(t *testing.T) {
+	for _, recovery := range []*outcome.RecoveryState{
+		nil,
+		{Status: outcome.RecoveryStatusFailed, AttemptID: "outcome-failed"},
+		{Status: outcome.RecoveryStatusUncertain, AttemptID: "outcome-uncertain"},
+	} {
+		t.Run(fmt.Sprintf("recovery_%v", recovery), func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.ReviewGate = "none"
+			cfg.MaxParallel = 20
+			cfg.MaxLiveWorkers = 20
+			cfg.Outcome = outcome.Brief{
+				DesiredOutcome:     "candidate feed follows main",
+				HealthcheckCommand: "check-outcome",
+				RecoveryMode:       outcome.RecoveryModeAutomatic,
+				RecoveryCommand:    "recover-outcome",
+			}
+			reader := &fakeReader{
+				issues:     []github.Issue{{Number: 406, Title: "Flatpak continuation"}},
+				prs:        []github.PR{{Number: 388, HeadRefName: "feat/flatpak", Mergeable: "MERGEABLE", IsDraft: true}},
+				ciStatuses: map[int]string{388: "success"},
+			}
+			st := state.NewState()
+			st.Sessions["ok-player-302"] = &state.Session{
+				IssueNumber: 406,
+				Status:      state.StatusPROpen,
+				Branch:      "feat/flatpak",
+				PRNumber:    388,
+				StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+			}
+			st.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, CheckedAt: time.Now().UTC()}
+			st.OutcomeRecovery = recovery
+
+			decision, err := testEngine(cfg, reader).Decide(st)
+			if err != nil {
+				t.Fatalf("Decide: %v", err)
+			}
+			if decision.RecommendedAction != ActionSpawnRepairWorker {
+				t.Fatalf("action = %q, want spawn_repair_worker without active recovery ownership", decision.RecommendedAction)
+			}
+		})
+	}
+}
+
+func TestDecide_AutomaticOutcomeRecoveryDoesNotSuppressFailedCIRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	cfg.MaxParallel = 20
+	cfg.MaxLiveWorkers = 20
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:     "candidate feed follows main",
+		HealthcheckCommand: "check-outcome",
+		RecoveryMode:       outcome.RecoveryModeAutomatic,
+		RecoveryCommand:    "recover-outcome",
+	}
+	reader := &fakeReader{
+		issues:     []github.Issue{{Number: 407, Title: "Flatpak red"}},
+		prs:        []github.PR{{Number: 389, HeadRefName: "feat/flatpak-red", Mergeable: "MERGEABLE", IsDraft: true}},
+		ciStatuses: map[int]string{389: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-303"] = &state.Session{
+		IssueNumber: 407,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/flatpak-red",
+		PRNumber:    389,
+		StartedAt:   time.Now().UTC().Add(-10 * time.Minute),
+	}
+	st.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, CheckedAt: time.Now().UTC()}
+	st.OutcomeRecovery = &outcome.RecoveryState{Status: outcome.RecoveryStatusVerificationPending, AttemptID: "outcome-live"}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want spawn_repair_worker for independent failed CI", decision.RecommendedAction)
+	}
+}
+
 func TestDecide_ConflictingDraftPRWithCIPending_RecommendsConflictRepair(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ReviewGate = "none"
