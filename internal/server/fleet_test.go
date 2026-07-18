@@ -993,6 +993,16 @@ func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
 		t.Fatalf("save live state: %v", err)
 	}
 
+	// Separated waiting project: open PR work remains, but there is no live
+	// implementation worker or eligible ready issue. Free implementation slots
+	// must not make Fleet erase the PR gate behind a generic queue_empty label.
+	waitingDir := filepath.Join(dir, "separated-waiting")
+	waitingState := state.NewState()
+	waitingState.Sessions["gate-1"] = &state.Session{Status: state.StatusPROpen, PRNumber: 301, IssueNumber: 31}
+	if err := state.Save(waitingDir, waitingState); err != nil {
+		t.Fatalf("save separated waiting state: %v", err)
+	}
+
 	srv := NewFleet([]FleetProject{
 		NewFleetProject("GateBound", "/tmp/gatebound.yaml", "", &config.Config{
 			Repo:        "owner/gatebound",
@@ -1004,6 +1014,12 @@ func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
 			StateDir:       liveDir,
 			MaxParallel:    2,
 			MaxLiveWorkers: 3,
+		}),
+		NewFleetProject("SeparatedWaiting", "/tmp/separated-waiting.yaml", "", &config.Config{
+			Repo:           "owner/separated-waiting",
+			StateDir:       waitingDir,
+			MaxParallel:    20,
+			MaxLiveWorkers: 20,
 		}),
 	}, "127.0.0.1", 8786, true)
 	resp := srv.snapshot()
@@ -1039,8 +1055,19 @@ func TestFleetSnapshotSeparatesLiveWorkersFromPRGates(t *testing.T) {
 		t.Errorf("separated activity = %q, want %q", sep.Activity, state.ActivityImplementing)
 	}
 
-	if resp.Summary.LiveWorkers != 1 || resp.Summary.PRGates != 5 {
-		t.Errorf("summary live_workers=%d pr_gates=%d, want 1/5", resp.Summary.LiveWorkers, resp.Summary.PRGates)
+	waiting := findFleetProject(t, resp.Projects, "SeparatedWaiting")
+	if waiting.LiveWorkers != 0 || waiting.PRGates != 1 || waiting.CapacityUsed != 0 || waiting.LiveWorkerLimit != 20 {
+		t.Fatalf("separated waiting live=%d gates=%d used=%d limit=%d, want 0/1/0/20", waiting.LiveWorkers, waiting.PRGates, waiting.CapacityUsed, waiting.LiveWorkerLimit)
+	}
+	if waiting.Activity != string(state.ActivityWaitingOnGates) {
+		t.Errorf("separated waiting activity = %q, want %q", waiting.Activity, state.ActivityWaitingOnGates)
+	}
+	if !contains(waiting.ActivityReason, "Waiting on PR gates") {
+		t.Errorf("separated waiting reason = %q, want truthful PR-gate explanation", waiting.ActivityReason)
+	}
+
+	if resp.Summary.LiveWorkers != 1 || resp.Summary.PRGates != 6 {
+		t.Errorf("summary live_workers=%d pr_gates=%d, want 1/6", resp.Summary.LiveWorkers, resp.Summary.PRGates)
 	}
 	if resp.Summary.CapacityBlockedByGates != 2 {
 		t.Errorf("summary capacity_blocked_by_gates = %d, want 2", resp.Summary.CapacityBlockedByGates)

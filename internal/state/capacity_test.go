@@ -151,6 +151,16 @@ func TestClassifyActivity(t *testing.T) {
 			want: ActivityWaitingOnGates,
 		},
 		{
+			name: "separated gates with free slots and no eligible work are still waiting",
+			in:   ActivityInput{Capacity: Capacity{PRGates: 1, AvailableSlots: 20, Separated: true}, EligibleIssues: 0},
+			want: ActivityWaitingOnGates,
+		},
+		{
+			name: "separated gates do not block eligible work when slots remain",
+			in:   ActivityInput{Capacity: Capacity{PRGates: 1, AvailableSlots: 19, Separated: true}, EligibleIssues: 2},
+			want: ActivityIdle,
+		},
+		{
 			name: "empty queue",
 			in:   ActivityInput{Capacity: Capacity{AvailableSlots: 4}, EligibleIssues: 0},
 			want: ActivityQueueEmpty,
