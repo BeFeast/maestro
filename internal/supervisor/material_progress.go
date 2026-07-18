@@ -349,9 +349,11 @@ func terminalCheckpointProgress(sess *state.Session) (string, bool) {
 	}
 	parts := make([]string, 0, 3)
 	complete := true
+	liveTerminal := false
 	if strings.TrimSpace(sess.TmuxSession) != "" {
 		if live, ok := tmuxProgressFingerprint(sess.TmuxSession); ok {
 			parts = append(parts, "tmux="+live)
+			liveTerminal = true
 		} else {
 			complete = false
 		}
@@ -360,7 +362,12 @@ func terminalCheckpointProgress(sess *state.Session) (string, bool) {
 	}
 	if checkpoint, ok := boundedFileFingerprintProbe(sess.CheckpointFile, 1<<20); checkpoint != "" {
 		parts = append(parts, "checkpoint="+checkpoint)
-	} else if !ok {
+	} else if !ok && !liveTerminal {
+		// A checkpoint is an optional durable fallback while the exact live tmux
+		// terminal is readable. In-place resume can legitimately consume/remove
+		// CHECKPOINT.md while retaining its path in historical session state; that
+		// stale optional path must not poison fresh terminal evidence forever. If
+		// the live terminal is also unavailable, keep failing closed.
 		complete = false
 	}
 	return progress.Fingerprint(parts...), complete

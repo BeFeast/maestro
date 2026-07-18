@@ -697,6 +697,37 @@ cat "$TMUX_FAKE_OUTPUT"
 	}
 }
 
+func TestTerminalCheckpointProgress_LiveTmuxIsCompleteWhenConsumedCheckpointIsMissing(t *testing.T) {
+	bin := t.TempDir()
+	outputPath := filepath.Join(bin, "output")
+	script := filepath.Join(bin, "tmux")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+if [ "$1" = "has-session" ]; then
+  exit 1
+fi
+if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact:" ]; then
+  exit 91
+fi
+cat "$TMUX_FAKE_OUTPUT"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("live terminal progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMUX_FAKE_OUTPUT", outputPath)
+
+	sess := &state.Session{
+		TmuxSession:    "mae-exact",
+		CheckpointFile: filepath.Join(bin, "consumed-CHECKPOINT.md"),
+	}
+	got, complete := terminalCheckpointProgress(sess)
+	if got == "" || !complete {
+		t.Fatalf("live tmux with consumed checkpoint = (%q,%t), want non-empty complete evidence", got, complete)
+	}
+}
+
 func TestTmuxProgressFingerprint_TimeoutAndOverflowAreIncomplete(t *testing.T) {
 	bin := t.TempDir()
 	script := filepath.Join(bin, "tmux")
