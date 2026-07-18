@@ -112,6 +112,10 @@ type prCIStatusReader interface {
 	PRCIStatus(prNumber int) (string, error)
 }
 
+type prCheckRollupReader interface {
+	PRCheckRollup(prNumber int) (github.PRCheckRollup, error)
+}
+
 type prGreptileReader interface {
 	PRGreptileApproved(prNumber int) (approved bool, pending bool, err error)
 }
@@ -2888,18 +2892,34 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		return false, nil
 	}
 
-	// CI must be green. PRCIStatus is an optional reader interface; when
-	// the reader does not implement it we conservatively refuse to merge.
-	ciReader, ok := e.reader.(prCIStatusReader)
-	if !ok {
-		return false, nil
-	}
-	ciStatus, err := ciReader.PRCIStatus(pr.Number)
-	if err != nil {
-		return false, nil
+	// CI must be green. Production readers expose the current-head rollup so
+	// a real queued/in-progress check-run can never be confused with the
+	// legacy commit-status-only pending state handled by #425.
+	ciStatus := ""
+	pendingCheckRuns := false
+	if rollupReader, ok := e.reader.(prCheckRollupReader); ok {
+		rollup, err := rollupReader.PRCheckRollup(pr.Number)
+		if err != nil || !rollup.Complete {
+			return false, nil
+		}
+		ciStatus = rollup.Verdict
+		pendingCheckRuns = rollup.PendingCheckRuns
+	} else {
+		ciReader, ok := e.reader.(prCIStatusReader)
+		if !ok {
+			return false, nil
+		}
+		var err error
+		ciStatus, err = ciReader.PRCIStatus(pr.Number)
+		if err != nil {
+			return false, nil
+		}
 	}
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
+		if pendingCheckRuns {
+			return false, nil
+		}
 		// #425 (sup-98): the aggregate PRCIStatus can stick at "pending"
 		// long after every required check has gone green — the most common
 		// cause is a legacy commit-status (used by some review bots) that

@@ -25,6 +25,7 @@ type fakeReader struct {
 	closedIssues         map[int]bool
 	mergedPRs            map[int]bool
 	ciStatuses           map[int]string
+	checkRollups         map[int]github.PRCheckRollup
 	greptileOK           map[int]bool
 	greptilePend         map[int]bool
 	reviewVerdicts       map[int]github.ReviewGateVerdict
@@ -134,6 +135,13 @@ func (f *fakeReader) CommentIssue(issueNumber int, body string) error {
 
 func (f *fakeReader) PRCIStatus(prNumber int) (string, error) {
 	return f.ciStatuses[prNumber], nil
+}
+
+func (f *fakeReader) PRCheckRollup(prNumber int) (github.PRCheckRollup, error) {
+	if rollup, ok := f.checkRollups[prNumber]; ok {
+		return rollup, nil
+	}
+	return github.PRCheckRollup{Verdict: f.ciStatuses[prNumber], Complete: true}, nil
 }
 
 func (f *fakeReader) PRMergeable(prNumber int) (string, error) {

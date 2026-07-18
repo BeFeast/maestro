@@ -157,6 +157,9 @@ func TestDecide_OpenPR_CIAggregateStaleButMergeStateClean_Merges(t *testing.T) {
 		prs:         []github.PR{{Number: 115, HeadRefName: "feat/auth", Mergeable: "MERGEABLE"}},
 		ciStatuses:  map[int]string{115: "pending"},
 		mergeStates: map[int]string{115: "clean"},
+		checkRollups: map[int]github.PRCheckRollup{
+			115: {Verdict: "pending", Complete: true},
+		},
 	}
 	st := state.NewState()
 	st.Sessions["scribe-1"] = &state.Session{
@@ -173,6 +176,40 @@ func TestDecide_OpenPR_CIAggregateStaleButMergeStateClean_Merges(t *testing.T) {
 	}
 	if decision.RecommendedAction != ActionMergePR {
 		t.Fatalf("action = %q, want merge_pr (mergeable_state=clean must override stale aggregate CI=pending)", decision.RecommendedAction)
+	}
+}
+
+func TestDecide_OpenPR_RealPendingCheckRunBlocksCleanMergeState(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:         []github.PR{{Number: 119, HeadRefName: "feat/new-pr", Mergeable: "MERGEABLE"}},
+		ciStatuses:  map[int]string{119: "pending"},
+		mergeStates: map[int]string{119: "clean"},
+		checkRollups: map[int]github.PRCheckRollup{
+			119: {
+				HeadSHA:          strings.Repeat("a", 40),
+				Verdict:          "pending",
+				Complete:         true,
+				PendingCheckRuns: true,
+			},
+		},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-1"] = &state.Session{
+		IssueNumber: 201,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/new-pr",
+		PRNumber:    119,
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr while current-head check-runs are pending", decision.RecommendedAction)
 	}
 }
 
