@@ -9,6 +9,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -98,6 +99,67 @@ func TestReconcile_RestartCheckpoint_ResumesInPlaceExactlyOnce(t *testing.T) {
 	}
 	if s.Sessions["sup-310"].Status != state.StatusRunning {
 		t.Fatalf("status after second reconcile = %q, want running", s.Sessions["sup-310"].Status)
+	}
+}
+
+// #967: a worker can exit after drain begins but before the daemon shutdown
+// checkpoint pass. The flow that observes the exit must persist a marker on
+// the dead session, hold it while the old daemon is draining, and let only the
+// replacement daemon resume the same slot/worktree.
+func TestReconcile_DrainDeathResumesDeadCheckpointAfterRestart(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+
+	worktree := t.TempDir()
+	s := state.NewState()
+	s.SetSpawnDrain(time.Now().UTC().Add(-time.Minute))
+	s.Sessions["sup-313"] = &state.Session{
+		IssueNumber: 313,
+		IssueTitle:  "dies during drain",
+		Status:      state.StatusRunning,
+		PID:         4245,
+		TmuxSession: "maestro-sup-313",
+		Branch:      "feat/sup-313-313-drain",
+		Worktree:    worktree,
+		Backend:     "claude",
+	}
+
+	// Old daemon observes the worker exit while drain is active. It records a
+	// durable dead checkpoint but must not respawn during this process.
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected drain-time death to change session state")
+	}
+	sess := s.Sessions["sup-313"]
+	if sess.Status != state.StatusDead || sess.RestartCheckpointAt == nil {
+		t.Fatalf("drain-time state = status %q marker %v, want dead with restart marker", sess.Status, sess.RestartCheckpointAt)
+	}
+	if resumeCount != 0 {
+		t.Fatalf("old draining daemon resumed %d workers, want 0", resumeCount)
+	}
+	o.reconcileRunningSessions(s)
+	if resumeCount != 0 {
+		t.Fatalf("old draining daemon replayed dead checkpoint %d times, want 0", resumeCount)
+	}
+
+	// New daemon clears the one-shot drain flag before its first cycle and
+	// consumes the dead marker exactly once on the same logical session.
+	s.ClearSpawnDrain(time.Now().UTC())
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("replacement daemon did not resume dead checkpoint")
+	}
+	if resumeCount != 1 {
+		t.Fatalf("replacement daemon resume count = %d, want 1", resumeCount)
+	}
+	if sess.Status != state.StatusRunning || sess.RestartCheckpointAt != nil {
+		t.Fatalf("resumed state = status %q marker %v, want running with consumed marker", sess.Status, sess.RestartCheckpointAt)
+	}
+	if sess.IssueNumber != 313 || sess.Branch != "feat/sup-313-313-drain" || sess.Worktree != worktree {
+		t.Fatalf("session identity changed: issue=%d branch=%q worktree=%q", sess.IssueNumber, sess.Branch, sess.Worktree)
+	}
+
+	o.reconcileRunningSessions(s)
+	if resumeCount != 1 {
+		t.Fatalf("dead checkpoint resumed %d times, want exactly once", resumeCount)
 	}
 }
 
@@ -209,14 +271,14 @@ func TestReconcile_RestartCheckpoint_AdoptsLiveReplacement(t *testing.T) {
 	// and its pane pid is the live worker. The old recorded pid is dead.
 	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
 	o.pidAliveFn = func(pid int) bool { return pid == adoptedPID }
-	o.tmuxPanePIDFn = func(session string) (int, error) {
+	worktree := t.TempDir()
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
 		if session == slotTmux {
-			return adoptedPID, nil
+			return adoptedPID, worktree, nil
 		}
-		return 0, fmt.Errorf("no such session %q", session)
+		return 0, "", fmt.Errorf("no such session %q", session)
 	}
 
-	worktree := t.TempDir()
 	stamp := time.Now().UTC().Add(-30 * time.Second)
 	s := state.NewState()
 	s.Sessions["sup-310"] = &state.Session{
@@ -269,7 +331,9 @@ func TestReconcile_RestartCheckpoint_LiveReplacementUnreadablePID_RetriesNextCyc
 
 	const slotTmux = "maestro-sup-310"
 	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
-	o.tmuxPanePIDFn = func(session string) (int, error) { return 0, fmt.Errorf("pane gone") }
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
+		return 0, "", fmt.Errorf("pane gone")
+	}
 
 	worktree := t.TempDir()
 	stamp := time.Now().UTC()
@@ -295,6 +359,54 @@ func TestReconcile_RestartCheckpoint_LiveReplacementUnreadablePID_RetriesNextCyc
 	}
 	if sess.Status != state.StatusRunning {
 		t.Fatalf("status = %q, want running — never false-dead over a live replacement", sess.Status)
+	}
+}
+
+// A deterministic tmux name is not sufficient identity. If a failed resume
+// leaves (or encounters) a same-name pane in another worktree, recovery must
+// neither adopt nor kill it, and must not retry into a destructive loop.
+func TestReconcile_RestartCheckpoint_ForeignLiveReplacementFailsClosed(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+
+	const slotTmux = "maestro-sup-310"
+	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
+		return 7777, filepath.Join(t.TempDir(), "foreign"), nil
+	}
+
+	worktree := t.TempDir()
+	stamp := time.Now().UTC()
+	s := state.NewState()
+	s.Sessions["sup-310"] = &state.Session{
+		IssueNumber:         310,
+		Status:              state.StatusRunning,
+		PID:                 4242,
+		TmuxSession:         slotTmux,
+		Branch:              "feat/sup-310-310-in-flight",
+		Worktree:            worktree,
+		Backend:             "claude",
+		RestartCheckpointAt: &stamp,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected foreign pane identity to reconcile fail-closed state")
+	}
+	sess := s.Sessions["sup-310"]
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times, want 0", resumeCount)
+	}
+	if sess.Status != state.StatusDead || sess.PID != 0 || sess.TmuxSession != "" {
+		t.Fatalf("session = status %q pid %d tmux %q, want dead/0/empty", sess.Status, sess.PID, sess.TmuxSession)
+	}
+	if sess.RestartCheckpointAt != nil {
+		t.Fatal("marker must be consumed after a foreign-pane identity mismatch")
+	}
+	if sess.Worktree != worktree {
+		t.Fatalf("retained worktree = %q, want preserved %q", sess.Worktree, worktree)
+	}
+	if sess.LastNotifiedStatus != "restart_resume_identity_mismatch" {
+		t.Fatalf("last notified status = %q, want mismatch blocker", sess.LastNotifiedStatus)
 	}
 }
 
