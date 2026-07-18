@@ -1741,6 +1741,15 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		if ownerSlot := canonicalOwners[pr.Number]; ownerSlot != "" && ownerSlot != slot {
 			continue
 		}
+		// A live worker is already the actuator for this exact PR. Reporting the
+		// same review/CI gate as a separate stuck target makes Fleet claim the
+		// active repair is blocked and lets it head-of-line block another PR that
+		// has no worker. Worker silence is tracked independently by the bounded
+		// material-progress watchdog; only return this PR to gate supervision
+		// after the worker leaves the running state.
+		if sess.Status == state.StatusRunning && sess.PID > 0 {
+			continue
+		}
 		if _, ok := seenPRs[pr.Number]; ok {
 			continue
 		}
@@ -2702,6 +2711,13 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 			continue
 		}
 		if ownerSlot := canonicalOwners[pr.Number]; ownerSlot != "" && ownerSlot != slot {
+			continue
+		}
+		// Do not spend the project's single supervisor recommendation monitoring
+		// a PR that already has a live exact worker. This preserves parallel
+		// hands-off repair: another independent overdue PR can be selected now,
+		// while the worker watchdog remains responsible for the running attempt.
+		if sess.Status == state.StatusRunning && sess.PID > 0 {
 			continue
 		}
 		// Evaluate merge eligibility across the whole candidate set before
