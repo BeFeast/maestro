@@ -213,6 +213,48 @@ func TestDecide_OpenPR_RealPendingCheckRunBlocksCleanMergeState(t *testing.T) {
 	}
 }
 
+type headChangingReader struct {
+	*fakeReader
+	headSHA string
+	headErr error
+}
+
+func (r *headChangingReader) PRHeadSHA(int) (string, error) {
+	return r.headSHA, r.headErr
+}
+
+func TestDecide_OpenPR_HeadChangedAfterCheckRollup_StaysMonitor(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	checkedHead := strings.Repeat("a", 40)
+	reader := &headChangingReader{
+		fakeReader: &fakeReader{
+			prs:         []github.PR{{Number: 120, HeadRefName: "feat/force-pushed", Mergeable: "MERGEABLE"}},
+			mergeStates: map[int]string{120: "clean"},
+			checkRollups: map[int]github.PRCheckRollup{
+				120: {HeadSHA: checkedHead, Verdict: "success", Complete: true},
+			},
+		},
+		headSHA: strings.Repeat("b", 40),
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-2"] = &state.Session{
+		IssueNumber: 202,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/force-pushed",
+		PRNumber:    120,
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr after PR head changed", decision.RecommendedAction)
+	}
+}
+
 // mergeable_state="blocked" means a required check is still failing;
 // stay on monitor_open_pr even if a legacy commit status would otherwise
 // have been pending-but-not-failure.
