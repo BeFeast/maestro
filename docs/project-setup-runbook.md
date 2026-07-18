@@ -229,6 +229,13 @@ outcome:
   healthcheck_url: https://app.example.com/healthz
   source_repo_path: /path/to/local/clone
   runtime_host: production host or platform
+  # Opt-in bounded hands-off recovery for a failing health signal. The
+  # entrypoint must refuse duplicate external side effects itself.
+  recovery_mode: disabled          # disabled | automatic
+  # recovery_command: ./scripts/recover-live-outcome.sh
+  recovery_interval_seconds: 60
+  recovery_cooldown_minutes: 20
+  recovery_timeout_seconds: 120
   non_goals:
     - Rewrite unrelated subsystems
 
@@ -269,7 +276,7 @@ telegram:
 | `worktree_base` | Directory where maestro creates per-worker worktrees |
 | `issue_labels` | Only pick issues with at least one of these labels (OR semantics) |
 | `exclude_labels` | Skip issues with any of these labels |
-| `outcome` | Project operating brief used by the supervisor to judge runtime progress |
+| `outcome` | Project operating brief used by the supervisor to judge runtime progress; optional `recovery_mode: automatic` runs one leased, cooldown-bounded, idempotent recovery command after a failing health result and verifies health again |
 | `supervisor` | Optional local policy for supervisor queue order, safe actions, dispatch SLA, and issue-type skips |
 | `model.backends.<name>.mcp` | Optional worker MCP attachment for that backend; omitted means no MCP tools |
 | `model.backends.<name>.subagent_hint` | Optional sub-agent model policy injected into the worker prompt for that backend; omitted means the prompt is unchanged |

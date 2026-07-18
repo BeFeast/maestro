@@ -2493,6 +2493,9 @@ func parse(data []byte) (*Config, error) {
 	if err := normalizeSupervisorPolicy(&cfg.Supervisor); err != nil {
 		return nil, err
 	}
+	if err := cfg.Outcome.Validate(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
 
 	return cfg, nil
 }

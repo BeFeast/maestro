@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -162,7 +163,59 @@ func TestCheckerCommandFailure(t *testing.T) {
 		DesiredOutcome:     "App is live",
 		HealthcheckCommand: "status.sh",
 	})
-	if result.State != HealthFailing || result.ExitCode != 7 || result.Detail != "not healthy" {
+	if result.State != HealthFailing || result.ExitCode != 7 || result.Detail != "" {
 		t.Fatalf("result = %+v, want failing command result", result)
+	}
+}
+
+func TestCheckerProjectsStructuredHealthWithoutRawDetails(t *testing.T) {
+	output := []byte(`{"healthy":false,"checks":[{"name":"candidate","blocking":true,"status":"fail","summary":"stale; api_key=do-not-store","details":["token=also-secret"]}],"unknown":"discard"}`)
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return output, 1, context.DeadlineExceeded
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if len(result.Checks) != 1 || result.Checks[0].Name != "candidate" || result.Checks[0].Status != "fail" {
+		t.Fatalf("projected checks=%+v", result.Checks)
+	}
+	if strings.Contains(result.Summary, "do-not-store") || strings.Contains(result.Detail, "also-secret") || strings.Contains(result.Detail, "unknown") || strings.Contains(result.Detail, "do-not-store") {
+		t.Fatalf("raw structured output leaked into detail: %q", result.Detail)
+	}
+}
+
+func TestCheckerStructuredHealthRejectsFreeFormFields(t *testing.T) {
+	output := []byte(`{"healthy":false,"summary":"bearer top-secret","checks":[{"name":"candidate token=secret","blocking":true,"status":"secret-status","summary":"password: top-secret"}]}`)
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return output, 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if len(result.Checks) != 1 || result.Checks[0].Name != "structured-check" || result.Checks[0].Status != "unknown" {
+		t.Fatalf("unsafe structured fields were not projected: %+v", result.Checks)
+	}
+	persisted := result.Summary + result.Detail
+	if strings.Contains(persisted, "top-secret") || strings.Contains(persisted, "token=secret") || strings.Contains(persisted, "secret-status") {
+		t.Fatalf("free-form structured output entered durable result: %q", persisted)
+	}
+}
+
+func TestBriefAutomaticRecoveryRequiresDesiredOutcome(t *testing.T) {
+	brief := Brief{HealthcheckCommand: "check", RecoveryMode: RecoveryModeAutomatic, RecoveryCommand: "recover"}
+	if err := brief.Validate(); err == nil || !strings.Contains(err.Error(), "desired_outcome") {
+		t.Fatalf("Validate() error = %v, want desired_outcome requirement", err)
+	}
+	if brief.AutomaticRecoveryEnabled() {
+		t.Fatal("AutomaticRecoveryEnabled = true without desired_outcome")
+	}
+}
+
+func TestCheckerHonorsStructuredUnhealthyWhenCommandExitsZero(t *testing.T) {
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return []byte(`{"healthy":false,"checks":[{"name":"candidate","blocking":true,"status":"fail","summary":"stale"}]}`), 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if result.State != HealthFailing || result.ExitCode != 0 || len(result.Checks) != 1 {
+		t.Fatalf("structured unhealthy result=%+v", result)
 	}
 }

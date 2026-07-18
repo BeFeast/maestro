@@ -380,6 +380,39 @@ outcome:
 	}
 }
 
+func TestParse_OutcomeAutomaticRecoveryRequiresHealthAndCommand(t *testing.T) {
+	for _, yaml := range []string{
+		"repo: owner/repo\noutcome:\n  desired_outcome: healthy\n  recovery_mode: automatic\n  recovery_command: ./recover.sh\n",
+		"repo: owner/repo\noutcome:\n  desired_outcome: healthy\n  healthcheck_command: ./check.sh\n  recovery_mode: automatic\n",
+	} {
+		if _, err := parse([]byte(yaml)); err == nil {
+			t.Fatalf("parse accepted incomplete automatic recovery:\n%s", yaml)
+		}
+	}
+}
+
+func TestParse_OutcomeAutomaticRecoveryContract(t *testing.T) {
+	yaml := `
+repo: owner/repo
+local_path: /srv/repo
+outcome:
+  desired_outcome: Candidate follows main.
+  healthcheck_command: ./check.sh
+  recovery_mode: automatic
+  recovery_command: ./recover.sh
+  recovery_interval_seconds: 60
+  recovery_cooldown_minutes: 20
+  recovery_timeout_seconds: 120
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Outcome.AutomaticRecoveryEnabled() || cfg.Outcome.EffectiveRecoveryInterval() != time.Minute || cfg.Outcome.EffectiveRecoveryCooldown() != 20*time.Minute {
+		t.Fatalf("recovery contract=%+v", cfg.Outcome)
+	}
+}
+
 func TestParse_AutoRestoreFiles(t *testing.T) {
 	yaml := `
 repo: owner/repo

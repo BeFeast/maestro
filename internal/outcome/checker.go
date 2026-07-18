@@ -3,11 +3,13 @@ package outcome
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -100,16 +102,33 @@ func (c Checker) checkCommand(ctx context.Context, command, dir, signal string) 
 	defer cancel()
 
 	output, exitCode, err := c.runCommand(ctx, command, dir)
+	checks, projectedDetail, projectedSummary, declaredHealthy := projectStructuredHealth(output)
 	if err != nil {
 		summary := fmt.Sprintf("%s failed", signal)
 		if ctx.Err() == context.DeadlineExceeded {
 			summary = fmt.Sprintf("%s timed out after %s", signal, c.timeout().String())
-		} else if strings.TrimSpace(err.Error()) != "" {
-			summary = fmt.Sprintf("%s failed: %v", signal, err)
+		} else if exitCode >= 0 {
+			summary = fmt.Sprintf("%s failed with exit code %d", signal, exitCode)
 		}
-		return c.result(start, signal, HealthFailing, summary, string(output), exitCode)
+		if projectedSummary != "" {
+			summary = fmt.Sprintf("%s failed: %s", signal, projectedSummary)
+		}
+		result := c.result(start, signal, HealthFailing, summary, projectedDetail, exitCode)
+		result.Checks = checks
+		return result
 	}
-	return c.result(start, signal, HealthHealthy, fmt.Sprintf("%s passed", signal), "", exitCode)
+	if declaredHealthy != nil && !*declaredHealthy {
+		summary := fmt.Sprintf("%s reported unhealthy", signal)
+		if projectedSummary != "" {
+			summary += ": " + projectedSummary
+		}
+		result := c.result(start, signal, HealthFailing, summary, projectedDetail, exitCode)
+		result.Checks = checks
+		return result
+	}
+	result := c.result(start, signal, HealthHealthy, fmt.Sprintf("%s passed", signal), "", exitCode)
+	result.Checks = checks
+	return result
 }
 
 func (c Checker) runCommand(ctx context.Context, command, dir string) ([]byte, int, error) {
@@ -177,4 +196,62 @@ func compactDetail(detail string) string {
 	buf.Write(data[:maxCheckDetailBytes])
 	buf.WriteString("\n... truncated ...")
 	return buf.String()
+}
+
+type structuredHealthEnvelope struct {
+	Healthy *bool                   `json:"healthy"`
+	Checks  []structuredHealthCheck `json:"checks"`
+}
+
+type structuredHealthCheck struct {
+	Name     string `json:"name"`
+	Blocking bool   `json:"blocking"`
+	Status   string `json:"status"`
+}
+
+var safeHealthCheckName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
+
+// projectStructuredHealth keeps only an allow-listed envelope from checker
+// JSON. Raw details and unknown fields are discarded so quota/token/credential
+// material cannot accidentally enter durable state or Fleet.
+func projectStructuredHealth(output []byte) (checks []HealthCheckItem, detail, summary string, healthy *bool) {
+	var envelope structuredHealthEnvelope
+	if err := json.Unmarshal(output, &envelope); err != nil || (envelope.Healthy == nil && len(envelope.Checks) == 0) {
+		return nil, "", "", nil
+	}
+	for _, raw := range envelope.Checks {
+		item := HealthCheckItem{
+			Name:     projectHealthCheckName(raw.Name),
+			Blocking: raw.Blocking,
+			Status:   projectHealthCheckStatus(raw.Status),
+		}
+		checks = append(checks, item)
+		if summary == "" && (item.Status == "fail" || item.Status == "failing" || item.Status == "error") {
+			summary = item.Name + " reported " + item.Status
+		}
+	}
+	if len(checks) > 0 {
+		projected, _ := json.Marshal(struct {
+			Checks []HealthCheckItem `json:"checks"`
+		}{Checks: checks})
+		detail = string(projected)
+	}
+	return checks, detail, summary, envelope.Healthy
+}
+
+func projectHealthCheckName(value string) string {
+	value = strings.TrimSpace(value)
+	if !safeHealthCheckName.MatchString(value) {
+		return "structured-check"
+	}
+	return value
+}
+
+func projectHealthCheckStatus(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "pass", "fail", "warning", "unknown", "error", "healthy", "failing":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
+	}
 }

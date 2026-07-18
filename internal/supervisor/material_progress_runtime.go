@@ -99,6 +99,9 @@ func RunMaterialProgressEvaluator(ctx context.Context, name string, getCfg func(
 			if _, err := EvaluateMaterialProgressOnce(cfg, time.Now().UTC()); err != nil {
 				log.Printf("[%s] evaluation failed (will retry): %v", logPrefix, err)
 			}
+			if _, err := EvaluateOutcomeRecoveryOnce(cfg, time.Now().UTC()); err != nil {
+				log.Printf("[%s] outcome recovery evaluation failed (will retry): %v", logPrefix, err)
+			}
 		}
 		if wait <= 0 {
 			wait = time.Second
