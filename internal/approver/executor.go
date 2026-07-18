@@ -880,6 +880,26 @@ func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, s
 
 	slot := approval.Target.Session
 
+	// #964: an approved worker-control action is a capability for one exact
+	// session snapshot, not a standing instruction for the slot. A delayed
+	// restart can otherwise execute after an in-place repair or redispatch has
+	// changed the canonical session, killing the replacement worker and
+	// deleting its preserved worktree. Recompute the same target-state digest
+	// stamped when the approval was created and skip stale approvals before any
+	// controller side effect.
+	if e.State != nil && strings.TrimSpace(approval.TargetStateHash) != "" {
+		currentHash := e.State.ApprovalTargetStateHash(approval.Target)
+		if currentHash != approval.TargetStateHash {
+			return Result{
+				Status: state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf(
+					"%s skipped: session state for slot %s changed after approval; no worker or worktree was touched",
+					verb, slot,
+				),
+			}
+		}
+	}
+
 	// Slot-reuse fence — same shape as executeDeleteWorktree (#488 /
 	// premortem #7). By the time the operator approves a stop/restart,
 	// the slot may have been recycled to a different live issue.
@@ -924,6 +944,21 @@ func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, s
 				slot, sess.PRNumber,
 			),
 			Err: fmt.Errorf("restart_worker on slot %s refused: open PR #%d present", slot, sess.PRNumber),
+		}
+	}
+
+	// #964: restart_worker is destructive in the current controller: it stops
+	// the worker and removes the worktree before the orchestrator recreates the
+	// slot. A retained worktree, even before a PR exists, may contain completed
+	// uncommitted work. Recovery must use the in-place repair path instead.
+	if !stop && sess != nil && strings.TrimSpace(sess.Worktree) != "" {
+		return Result{
+			Status: state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf(
+				"restart_worker refused: slot %s retains worktree %s; destructive restart could discard completed work. Use spawn_repair_worker to recover the same slot and worktree in place, or stop_worker to terminate.",
+				slot, sess.Worktree,
+			),
+			Err: fmt.Errorf("restart_worker on slot %s refused: retained worktree %s", slot, sess.Worktree),
 		}
 	}
 

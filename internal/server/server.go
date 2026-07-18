@@ -967,6 +967,7 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		}
 	}
 	restart := newApprovalControlAction("restart_worker", "Restart", "Enqueue a cautious-gate approval to restart this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	var repair *controlAction
 	if worker.PRNumber > 0 {
 		// #874: restarting a worker that already owns an open PR is the wrong
 		// control — restart_worker deletes the worktree, which would strand
@@ -981,14 +982,35 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		} else {
 			restart.DisabledReason = fmt.Sprintf("This worker has open PR #%d; restart would delete its worktree and strand the PR branch. Use review-repair to address review feedback in place, or Stop to terminate.", worker.PRNumber)
 		}
+	} else if strings.TrimSpace(worker.Worktree) != "" {
+		// #964: PR-less does not mean disposable. A retained worktree can hold
+		// completed, uncommitted work; the current restart controller deletes it.
+		// Offer only the canonical in-place repair path for this state.
+		restart.Disabled = true
+		if readOnly {
+			restart.DisabledReason = readOnlyDisabledReason() + " Additionally, this worker retains a worktree; recover the same slot in place with repair instead of restarting."
+		} else {
+			restart.DisabledReason = "This worker retains a worktree that may contain completed work; restart would delete it. Recover the same slot and worktree in place with repair, or Stop to terminate."
+		}
+		inPlace := newApprovalControlAction(
+			config.SupervisorActionSpawnRepairWorker,
+			"Repair in place",
+			"Enqueue a cautious-gate repair that resumes this canonical slot, branch, and retained worktree without creating a duplicate.",
+			"worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly,
+		)
+		repair = &inPlace
 	}
-	return []controlAction{
+	actions := []controlAction{
 		restart,
 		newApprovalControlAction("stop_worker", "Stop", "Enqueue a cautious-gate approval to stop this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_ready", "Mark ready", "Add the maestro-ready label so the supervisor picks the issue up.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_blocked", "Mark blocked", "Add the blocked label so the supervisor holds the issue.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		merge,
 	}
+	if repair != nil {
+		actions = append(actions, *repair)
+	}
+	return actions
 }
 
 // newSafeControlAction returns a button for a safe verb (label/comment).
