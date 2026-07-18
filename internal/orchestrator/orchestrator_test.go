@@ -5843,8 +5843,13 @@ func TestCheckSessions_FailedClosedIssue_TransitionsToDone(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(t *testing.T) {
+func TestCheckSessions_ClosedNoDeliveryIssueBecomesDoneWhenProjectOutcomeFails(t *testing.T) {
 	now := time.Now().UTC()
+	worktree := t.TempDir()
+	preserved := filepath.Join(worktree, "preserved.txt")
+	if err := os.WriteFile(preserved, []byte("completed work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	o := &Orchestrator{
 		cfg: &config.Config{
 			Repo:              "owner/repo",
@@ -5862,8 +5867,17 @@ func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(
 		isIssueClosedFn: func(issueNumber int) (bool, error) {
 			return true, nil
 		},
+		mergedPRForBranchFn: func(branch string) (int, error) {
+			return 0, nil
+		},
+		mergedPRForIssueFn: func(issueNumber int) (int, error) {
+			// A prior lifecycle of this issue shipped PR #77 before the issue was
+			// reopened. That historical issue-level link must not be attributed to
+			// this later no-delivery session.
+			return 77, nil
+		},
 		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
-			t.Fatalf("workerStopFn should not run before outcome verification passes")
+			t.Fatalf("terminal reconciliation must preserve the retained worktree; workerStopFn must not run")
 			return nil
 		},
 	}
@@ -5880,14 +5894,65 @@ func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(
 		IssueTitle:  "failed worker",
 		Status:      state.StatusFailed,
 		Branch:      "feat/pan-10-100-failed",
+		Worktree:    worktree,
 		FinishedAt:  &now,
 	}
 
 	o.checkSessions(s)
 
 	sess := s.Sessions["pan-10"]
-	if sess.Status != state.StatusFailed {
-		t.Fatalf("status = %q, want %q until live verification passes", sess.Status, state.StatusFailed)
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q: no merged revision is owned by this closed issue", sess.Status, state.StatusDone)
+	}
+	if sess.Branch != "feat/pan-10-100-failed" {
+		t.Fatalf("branch = %q, want retained branch unchanged", sess.Branch)
+	}
+	if sess.Worktree != worktree {
+		t.Fatalf("worktree = %q, want retained %q", sess.Worktree, worktree)
+	}
+	if _, err := os.Stat(preserved); err != nil {
+		t.Fatalf("retained work disappeared: %v", err)
+	}
+}
+
+func TestCheckSessions_ClosedMergedIssueRemainsCodeLandedWhenProjectOutcomeFails(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:              "owner/repo",
+			MaxRuntimeMinutes: 120,
+			Outcome: outcome.Brief{
+				DesiredOutcome:      "Live app works",
+				VerifierCommand:     "check-live",
+				PassRequiredForDone: boolPtr(true),
+			},
+		},
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return true, nil },
+		isPRMergedFn:    func(prNumber int) (bool, error) { return prNumber == 77, nil },
+	}
+
+	s := state.NewState()
+	s.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now,
+		State:     outcome.HealthFailing,
+		Signal:    "verifier_command",
+		Summary:   "live verifier failed",
+	}
+	s.Sessions["pan-10"] = &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "merged worker",
+		Status:             state.StatusFailed,
+		LastClosedPRNumber: 77,
+		FinishedAt:         &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-10"]
+	if sess.Status != state.StatusCodeLanded || sess.PRNumber != 77 {
+		t.Fatalf("session = status %q PR #%d, want code_landed PR #77 until live verification passes", sess.Status, sess.PRNumber)
 	}
 }
 
