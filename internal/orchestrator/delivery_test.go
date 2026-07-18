@@ -453,7 +453,16 @@ func TestReconcileCodeLandedSessions_RecoversExternalMergeAndWaitsForDelivery(t 
 		},
 	}
 	o := newDeliveryOrch(cfg)
-	o.isPRMergedFn = func(pr int) (bool, error) { return pr == 7, nil }
+	mergedReads := 0
+	mergeInfoReads := 0
+	o.isPRMergedFn = func(pr int) (bool, error) {
+		mergedReads++
+		return pr == 7, nil
+	}
+	o.ghPRMergeInfoFn = func(int) (github.PRMergeInfo, error) {
+		mergeInfoReads++
+		return github.PRMergeInfo{SHA: deliveryMergeSHA, MergedAt: time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)}, nil
+	}
 	s := state.NewState()
 	sess := &state.Session{IssueNumber: 42, PRNumber: 7, Status: state.StatusCodeLanded}
 	s.Sessions["slot"] = sess
@@ -465,6 +474,22 @@ func TestReconcileCodeLandedSessions_RecoversExternalMergeAndWaitsForDelivery(t 
 	approvals := deployApprovals(s)
 	if len(approvals) != 1 || approvals[0].Status != state.ApprovalStatusPending {
 		t.Fatalf("standing reconcile did not recover pending delivery: %+v", approvals)
+	}
+	if mergedReads != 1 || mergeInfoReads != 2 {
+		t.Fatalf("initial delivery reconciliation reads merged=%d info=%d, want 1/2", mergedReads, mergeInfoReads)
+	}
+
+	// An unchanged pending approval is checked from durable state without
+	// re-reading GitHub until the bounded terminal reconciliation is due.
+	o.reconcileCodeLandedSessions(s)
+	if mergedReads != 1 || mergeInfoReads != 2 {
+		t.Fatalf("immediate repeated delivery reconciliation reads merged=%d info=%d, want still 1/2", mergedReads, mergeInfoReads)
+	}
+	due := time.Now().UTC().Add(-terminalReconcileInterval - time.Second)
+	sess.LastTerminalReconcileAt = &due
+	o.reconcileCodeLandedSessions(s)
+	if mergedReads != 2 || mergeInfoReads != 4 {
+		t.Fatalf("due delivery reconciliation reads merged=%d info=%d, want 2/4", mergedReads, mergeInfoReads)
 	}
 
 	// Simulate the shared executor's verified terminal row mirrored into state.
@@ -479,6 +504,9 @@ func TestReconcileCodeLandedSessions_RecoversExternalMergeAndWaitsForDelivery(t 
 	}
 	if sess.Status != state.StatusDone {
 		t.Fatalf("status = %q, want done after verified delivery", sess.Status)
+	}
+	if mergedReads != 2 || mergeInfoReads != 4 {
+		t.Fatalf("verified mirror triggered remote reads merged=%d info=%d, want still 2/4", mergedReads, mergeInfoReads)
 	}
 }
 

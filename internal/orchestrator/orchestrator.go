@@ -6048,10 +6048,23 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 	// from closing while the matching delivery is pending or unverified.
 	ready := make([]*state.Session, 0, len(codeLanded))
 	for _, sess := range codeLanded {
+		now := time.Now().UTC()
+		if !terminalReconcileDue(sess, now) {
+			// Delivery execution is mirrored into project state by the shared
+			// executor. Consume an exact verified mirror immediately without
+			// polling GitHub again; unchanged pending/terminal approvals wait for
+			// the bounded authoritative refresh below (#940).
+			if o.reconcileVerifiedDeliveryFromState(s, sess, o.cfg.EffectiveDelivery()) {
+				ready = append(ready, sess)
+			}
+			continue
+		}
 		if !o.codeLandedPRMerged(sess) {
 			continue
 		}
-		o.ensureMergedPRGateSnapshot(s, sess, time.Now().UTC())
+		checkedAt := time.Now().UTC()
+		sess.LastTerminalReconcileAt = &checkedAt
+		o.ensureMergedPRGateSnapshot(s, sess, checkedAt)
 		if !o.reconcileCodeLandedDelivery(s, sess) {
 			o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
 			continue
@@ -6101,6 +6114,9 @@ func (o *Orchestrator) reconcileCodeLandedDelivery(s *state.State, sess *state.S
 	if eff.Mode != config.DeliveryModeApprovalRequired || strings.TrimSpace(eff.Command) == "" {
 		return true
 	}
+	if o.reconcileVerifiedDeliveryFromState(s, sess, eff) {
+		return true
+	}
 	if sess == nil || sess.PRNumber <= 0 {
 		log.Printf("[orch] delivery reconcile held: code_landed session has no PR number to pin")
 		return false
@@ -6117,6 +6133,43 @@ func (o *Orchestrator) reconcileCodeLandedDelivery(s *state.State, sess *state.S
 	if completed == nil || completed.Delivery == nil {
 		log.Printf("[orch] delivery reconcile held for PR #%d: approval %s is %s (verified=%v)",
 			sess.PRNumber, approval.ID, approval.Status, approval.Delivery != nil && approval.Delivery.Verified)
+		return false
+	}
+	return o.recordVerifiedDelivery(s, sess, completed)
+}
+
+// reconcileVerifiedDeliveryFromState consumes the exact verified delivery
+// mirror for a code_landed session without any GitHub or repository read. This
+// keeps approval execution responsive while unchanged historical delivery gates
+// use the bounded terminal reconciliation interval instead of polling the forge
+// every orchestrator cycle (#940).
+func (o *Orchestrator) reconcileVerifiedDeliveryFromState(s *state.State, sess *state.Session, eff config.DeliveryConfig) bool {
+	if eff.Mode != config.DeliveryModeApprovalRequired || strings.TrimSpace(eff.Command) == "" {
+		return true
+	}
+	if s == nil || sess == nil || sess.PRNumber <= 0 {
+		return false
+	}
+	digest := eff.ApprovalDigest()
+	var completed *state.Approval
+	for i := range s.Approvals {
+		candidate := &s.Approvals[i]
+		if candidate.Action != state.ApprovalActionDeployProject || candidate.Status != state.ApprovalStatusExecuted ||
+			candidate.Delivery == nil || !candidate.Delivery.Verified || candidate.Delivery.PR != sess.PRNumber ||
+			!strings.EqualFold(strings.TrimSpace(candidate.Delivery.Repo), strings.TrimSpace(o.cfg.Repo)) ||
+			strings.TrimSpace(candidate.Delivery.Project) != strings.TrimSpace(o.cfg.Repo) ||
+			strings.TrimSpace(candidate.Delivery.ConfigDigest) != strings.TrimSpace(digest) {
+			continue
+		}
+		if completed == nil || state.CompareDeliveryGeneration(completed.Delivery, completed.CreatedAt, candidate.Delivery, candidate.CreatedAt) < 0 {
+			completed = candidate
+		}
+	}
+	return o.recordVerifiedDelivery(s, sess, completed)
+}
+
+func (o *Orchestrator) recordVerifiedDelivery(s *state.State, sess *state.Session, completed *state.Approval) bool {
+	if sess == nil || completed == nil || completed.Delivery == nil || !completed.Delivery.Verified {
 		return false
 	}
 	if sess.DeploymentFinishedAt == nil {
