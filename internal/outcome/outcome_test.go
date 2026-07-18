@@ -122,6 +122,34 @@ func TestStatusForUsesFreshHealthCheck(t *testing.T) {
 	}
 }
 
+func TestStatusForPersistsPendingHealthCheck(t *testing.T) {
+	checkedAt := time.Date(2026, 7, 18, 12, 15, 56, 0, time.UTC)
+	status := StatusFor(Brief{
+		DesiredOutcome:     "Merged main passes required CI",
+		HealthcheckCommand: "check-main-ci",
+	}, 1, checkedAt.Add(-time.Minute), HealthCheckResult{
+		CheckedAt: checkedAt,
+		Signal:    "healthcheck_command",
+		State:     HealthPending,
+		Summary:   "source-main-ci reported pending",
+		Checks: []HealthCheckItem{{
+			Name:     "source-main-ci",
+			Blocking: true,
+			Status:   "pending",
+		}},
+	})
+
+	if status.HealthState != HealthPending {
+		t.Fatalf("HealthState = %q, want %q", status.HealthState, HealthPending)
+	}
+	if len(status.Checks) != 1 || status.Checks[0].Status != "pending" {
+		t.Fatalf("Checks = %+v, want persisted pending check", status.Checks)
+	}
+	if strings.Contains(status.NextAction, "before dispatching") {
+		t.Fatalf("NextAction = %q, pending must not block dispatch", status.NextAction)
+	}
+}
+
 func TestStatusForIgnoresHealthCheckBeforeLastMerge(t *testing.T) {
 	lastMerge := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	status := StatusFor(Brief{
@@ -217,5 +245,44 @@ func TestCheckerHonorsStructuredUnhealthyWhenCommandExitsZero(t *testing.T) {
 	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
 	if result.State != HealthFailing || result.ExitCode != 0 || len(result.Checks) != 1 {
 		t.Fatalf("structured unhealthy result=%+v", result)
+	}
+}
+
+func TestCheckerTreatsBlockingStructuredPendingAsTransitional(t *testing.T) {
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return []byte(`{"healthy":false,"checks":[{"name":"source-main-ci","blocking":true,"status":"in_progress"}]}`), 1, context.DeadlineExceeded
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "main is healthy", HealthcheckCommand: "check"})
+
+	if result.State != HealthPending || result.ExitCode != 1 {
+		t.Fatalf("structured pending result=%+v, want pending", result)
+	}
+	if len(result.Checks) != 1 || result.Checks[0].Status != "in_progress" {
+		t.Fatalf("Checks = %+v, want projected in-progress check", result.Checks)
+	}
+}
+
+func TestCheckerTreatsBlockingStructuredFailureAsFailing(t *testing.T) {
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return []byte(`{"healthy":true,"checks":[{"name":"source-main-ci","blocking":true,"status":"error"},{"name":"deploy","blocking":true,"status":"queued"}]}`), 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "main is healthy", HealthcheckCommand: "check"})
+
+	if result.State != HealthFailing {
+		t.Fatalf("State = %q, want %q: %+v", result.State, HealthFailing, result)
+	}
+}
+
+func TestCheckerTreatsConcludedStructuredSuccessAsHealthy(t *testing.T) {
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return []byte(`{"healthy":true,"checks":[{"name":"source-main-ci","blocking":true,"status":"pass"}]}`), 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "main is healthy", HealthcheckCommand: "check"})
+
+	if result.State != HealthHealthy {
+		t.Fatalf("State = %q, want %q: %+v", result.State, HealthHealthy, result)
 	}
 }
