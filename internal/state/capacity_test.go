@@ -141,6 +141,11 @@ func TestClassifyActivity(t *testing.T) {
 			want: ActivityBlockedByApprovals,
 		},
 		{
+			name: "actionable failed work is not an empty queue",
+			in:   ActivityInput{Capacity: Capacity{AvailableSlots: 4}, EligibleIssues: 0, ActionableAttention: 1},
+			want: ActivityNeedsAttention,
+		},
+		{
 			name: "gate-bound with eligible work is the intervention loop",
 			in:   ActivityInput{Capacity: Capacity{PRGates: 3, AvailableSlots: 0}, EligibleIssues: 5},
 			want: ActivityBlockedByGates,

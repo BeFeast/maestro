@@ -3792,6 +3792,7 @@ const (
 	ActivityWaitingOnGates       ProjectActivity = "waiting_on_pr_gates"     // no live worker, PRs open, and no eligible work left — just waiting for gates
 	ActivityBlockedByApprovals   ProjectActivity = "blocked_by_approvals"    // dispatch is held pending an operator approval decision
 	ActivityBlockedByModelLimits ProjectActivity = "blocked_by_model_limits" // every eligible backend is blocked by a model/usage limit
+	ActivityNeedsAttention       ProjectActivity = "needs_attention"         // no live worker; canonical actionable work requires repair/reconciliation
 	ActivityPaused               ProjectActivity = "paused"                  // operator paused the project
 	ActivityQueueEmpty           ProjectActivity = "queue_empty"             // no eligible ready issues remain
 	ActivityIdle                 ProjectActivity = "idle"                    // idle for none of the more specific reasons above
@@ -3800,11 +3801,12 @@ const (
 // ActivityInput carries the non-session signals ClassifyActivity needs beyond
 // the session-derived Capacity snapshot.
 type ActivityInput struct {
-	Capacity         Capacity
-	EligibleIssues   int  // ready issues that could be dispatched now
-	PendingApprovals int  // spawn/merge approvals awaiting an operator decision
-	BackendsBlocked  bool // every eligible backend is blocked by a model/usage limit
-	Paused           bool // operator paused the project
+	Capacity            Capacity
+	EligibleIssues      int  // ready issues that could be dispatched now
+	PendingApprovals    int  // spawn/merge approvals awaiting an operator decision
+	ActionableAttention int  // canonical, non-self-resolving worker/session blockers
+	BackendsBlocked     bool // every eligible backend is blocked by a model/usage limit
+	Paused              bool // operator paused the project
 }
 
 // ClassifyActivity returns the ProjectActivity token and a concise
@@ -3824,6 +3826,9 @@ func ClassifyActivity(in ActivityInput) (ProjectActivity, string) {
 	}
 	if in.PendingApprovals > 0 {
 		return ActivityBlockedByApprovals, fmt.Sprintf("Blocked by approvals: %d decision(s) awaiting an operator.", in.PendingApprovals)
+	}
+	if in.ActionableAttention > 0 {
+		return ActivityNeedsAttention, fmt.Sprintf("Needs attention: %d actionable worker/session blocker(s) require repair or reconciliation.", in.ActionableAttention)
 	}
 	// Gate-bound: no live worker and no free slot while PRs are open. Only a
 	// problem when eligible work is waiting — that is the recurring #814
