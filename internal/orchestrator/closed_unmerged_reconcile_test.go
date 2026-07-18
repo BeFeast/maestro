@@ -65,6 +65,63 @@ func TestReconcileFalseDoneSessionRefusesAmbiguousOpenPRs(t *testing.T) {
 	}
 }
 
+func TestReconcileUnscheduledDeadSessionAdoptsSoleOpenPR(t *testing.T) {
+	repo := newReconcileBranchRepo(t)
+	canonicalBranch := "feat/ok-player-345-flatpak-beta-retry"
+	runReconcileGit(t, repo, "switch", "-c", canonicalBranch)
+	finished := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		Status:      state.StatusDead,
+		Branch:      "feat/ok-player-302-406-synthetic",
+		Worktree:    repo,
+		FinishedAt:  &finished,
+	}
+	o := &Orchestrator{
+		hasMergedPRForIssueFn: func(int) (bool, error) { return false, nil },
+		isIssueClosedFn:       func(int) (bool, error) { return false, nil },
+	}
+
+	o.reconcileTerminalSessionsWithOpenPRs(s, []github.PR{{
+		Number:      388,
+		HeadRefName: canonicalBranch,
+		Title:       "Flatpak continuation",
+		Body:        "Refs #406",
+	}})
+
+	sess := s.Sessions["ok-player-302"]
+	if sess.Status != state.StatusPROpen || sess.PRNumber != 388 || sess.Branch != canonicalBranch {
+		t.Fatalf("reconciled session = %+v, want pr_open on existing PR #388", sess)
+	}
+	if sess.Worktree != repo || sess.FinishedAt != nil {
+		t.Fatalf("canonical worktree/timing changed: worktree=%q finished=%v", sess.Worktree, sess.FinishedAt)
+	}
+}
+
+func TestReconcileDeadSessionWithPendingRetryDoesNotAdoptOpenPR(t *testing.T) {
+	retryAt := time.Now().UTC().Add(time.Minute)
+	s := state.NewState()
+	s.Sessions["slot"] = &state.Session{
+		IssueNumber: 406,
+		Status:      state.StatusDead,
+		Branch:      "synthetic",
+		NextRetryAt: &retryAt,
+	}
+	o := &Orchestrator{}
+
+	o.reconcileTerminalSessionsWithOpenPRs(s, []github.PR{{
+		Number:      388,
+		HeadRefName: "canonical",
+		Body:        "Refs #406",
+	}})
+
+	sess := s.Sessions["slot"]
+	if sess.Status != state.StatusDead || sess.PRNumber != 0 || sess.NextRetryAt == nil {
+		t.Fatalf("pending retry was consumed by PR adoption: %+v", sess)
+	}
+}
+
 func TestReconcileDoneSessionKeepsAuthoritativeMergedOutcome(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["slot"] = &state.Session{IssueNumber: 345, Status: state.StatusDone, PRNumber: 389}

@@ -4807,7 +4807,7 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 			if repairIssueSessionActive(sess.Status) || (sess.PRNumber == canonical.Number && sess.Status == state.StatusRetryExhausted) {
 				activeOther = slotName
 			}
-			if (sess.Status == state.StatusDone || sess.Status == state.StatusFailed) &&
+			if terminalOpenPRAdoptionCandidate(sess) &&
 				(sess.PRNumber == canonical.Number || sess.LastClosedPRNumber == canonical.Number || sess.Branch == canonical.HeadRefName) {
 				exactSlots = append(exactSlots, slotName)
 			}
@@ -4839,7 +4839,7 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 			continue
 		}
 		sess := s.Sessions[candidateSlot]
-		if sess == nil || (sess.Status != state.StatusDone && sess.Status != state.StatusFailed) {
+		if !terminalOpenPRAdoptionCandidate(sess) {
 			continue
 		}
 		merged := false
@@ -4893,6 +4893,27 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 		sess.ReleasedForRedispatch = false
 		o.attachPreservedSiblingHandoffs(s, issue, candidateSlot, sess, canonical, allSlots)
 		log.Printf("[orch] reconciled terminal session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", candidateSlot, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
+	}
+}
+
+// terminalOpenPRAdoptionCandidate reports whether authoritative GitHub state
+// may rebind this non-running session to the sole open PR that references its
+// issue. An unscheduled dead session is eligible: the worker may have pushed to
+// an existing PR branch that differs from the synthetic session branch before
+// exiting. A dead session with NextRetryAt is deliberately excluded because it
+// still owns a pending in-place retry; flipping it to pr_open would consume the
+// retry without running the repair (#758).
+func terminalOpenPRAdoptionCandidate(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	switch sess.Status {
+	case state.StatusDone, state.StatusFailed:
+		return true
+	case state.StatusDead:
+		return sess.NextRetryAt == nil
+	default:
+		return false
 	}
 }
 
