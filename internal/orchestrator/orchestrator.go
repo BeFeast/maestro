@@ -37,8 +37,17 @@ const (
 	minProjectGraphQLRemaining = 100
 	projectBoardSweepInterval  = 30 * time.Minute
 	projectBoardSweepRetry     = 10 * time.Minute
-	pipelineFullLabel          = "pipeline:full"
+	// Leave one orchestrator tick of scheduling margin so a 60-second loop
+	// observes the authoritative terminal state within the 10-minute SLA even
+	// when the prior check landed immediately after a cycle boundary.
+	terminalReconcileInterval = 9 * time.Minute
+	pipelineFullLabel         = "pipeline:full"
 )
+
+type cycleBoolResult struct {
+	value bool
+	err   error
+}
 
 // Orchestrator coordinates all agent sessions
 type Orchestrator struct {
@@ -61,6 +70,7 @@ type Orchestrator struct {
 	tmuxSessionExistsFn   func(name string) bool
 	tmuxPaneIdentityFn    func(session string) (int, string, error)
 	listOpenPRsFn         func() ([]github.PR, error)
+	listClosedPRsFn       func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
 	amendHeadFn           func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error
@@ -177,10 +187,15 @@ type Orchestrator struct {
 	// and every call fetches fresh, preserving the semantics of callers (and
 	// tests) that invoke those steps in isolation. RunOnce is serial per flow,
 	// so no locking is required.
-	cycleActive   bool
-	cyclePRsValid bool
-	cyclePRs      []github.PR
-	cyclePRsErr   error
+	cycleActive         bool
+	cyclePRsValid       bool
+	cyclePRs            []github.PR
+	cyclePRsErr         error
+	cycleClosedPRsValid bool
+	cycleClosedPRs      []github.PR
+	cycleClosedPRsErr   error
+	cycleIssueClosed    map[int]cycleBoolResult
+	cyclePRMerged       map[int]cycleBoolResult
 }
 
 // New creates a new Orchestrator
@@ -295,6 +310,11 @@ func (o *Orchestrator) beginCycle() {
 	o.cyclePRsValid = false
 	o.cyclePRs = nil
 	o.cyclePRsErr = nil
+	o.cycleClosedPRsValid = false
+	o.cycleClosedPRs = nil
+	o.cycleClosedPRsErr = nil
+	o.cycleIssueClosed = make(map[int]cycleBoolResult)
+	o.cyclePRMerged = make(map[int]cycleBoolResult)
 }
 
 // endCycle clears the per-cycle cache and deactivates memoization so any
@@ -304,6 +324,11 @@ func (o *Orchestrator) endCycle() {
 	o.cyclePRsValid = false
 	o.cyclePRs = nil
 	o.cyclePRsErr = nil
+	o.cycleClosedPRsValid = false
+	o.cycleClosedPRs = nil
+	o.cycleClosedPRsErr = nil
+	o.cycleIssueClosed = nil
+	o.cyclePRMerged = nil
 }
 
 // invalidateCyclePRs drops the memoized per-cycle open-PR snapshot so the next
@@ -325,6 +350,37 @@ func (o *Orchestrator) invalidateCyclePRs() {
 	o.cyclePRsValid = false
 	o.cyclePRs = nil
 	o.cyclePRsErr = nil
+	o.cycleClosedPRsValid = false
+	o.cycleClosedPRs = nil
+	o.cycleClosedPRsErr = nil
+	o.cyclePRMerged = make(map[int]cycleBoolResult)
+}
+
+// listClosedPRsForCycle shares one closed-PR snapshot across every historical
+// issue/branch lookup in a RunOnce. The old path launched a fresh gh process for
+// every retry_exhausted session, which made the single daemon sustain load 6-10
+// while doing no worker computation (#940).
+func (o *Orchestrator) listClosedPRsForCycle() ([]github.PR, error) {
+	fetch := func() ([]github.PR, error) {
+		if o.listClosedPRsFn != nil {
+			return o.listClosedPRsFn()
+		}
+		if o.gh == nil {
+			return nil, fmt.Errorf("no github client configured for closed-pr list")
+		}
+		return o.gh.ListClosedPRs()
+	}
+	if !o.cycleActive {
+		return fetch()
+	}
+	if o.cycleClosedPRsValid {
+		return o.cycleClosedPRs, o.cycleClosedPRsErr
+	}
+	prs, err := fetch()
+	o.cycleClosedPRs = prs
+	o.cycleClosedPRsErr = err
+	o.cycleClosedPRsValid = true
+	return prs, err
 }
 
 // listOpenPRsForCycle returns the open-PR list, fetching it at most once per
@@ -424,6 +480,10 @@ func (o *Orchestrator) hasMergedPRForIssue(issueNumber int) (bool, error) {
 	if o.gh == nil {
 		return false, fmt.Errorf("no github client configured for merged-pr check")
 	}
+	if o.cycleActive {
+		prNumber, err := o.mergedPRForIssue(issueNumber)
+		return prNumber > 0, err
+	}
 	return o.gh.HasMergedPRForIssue(issueNumber)
 }
 
@@ -434,6 +494,18 @@ func (o *Orchestrator) mergedPRForIssue(issueNumber int) (int, error) {
 	if o.gh == nil {
 		return 0, fmt.Errorf("no github client configured for merged-pr number check")
 	}
+	if o.cycleActive {
+		prs, err := o.listClosedPRsForCycle()
+		if err != nil {
+			return 0, err
+		}
+		for _, pr := range prs {
+			if pr.MergedAt != "" && github.PRClosesIssue(pr, issueNumber) {
+				return pr.Number, nil
+			}
+		}
+		return 0, nil
+	}
 	return o.gh.MergedPRNumberForIssue(issueNumber)
 }
 
@@ -441,13 +513,24 @@ func (o *Orchestrator) isPRMerged(prNumber int) (bool, error) {
 	if o.isPRMergedFn != nil {
 		return o.isPRMergedFn(prNumber)
 	}
+	if o.cycleActive {
+		if result, ok := o.cyclePRMerged[prNumber]; ok {
+			return result.value, result.err
+		}
+	}
+	var merged bool
+	var err error
 	if o.readSource != nil {
-		return o.readSource.IsPRMerged(prNumber)
+		merged, err = o.readSource.IsPRMerged(prNumber)
+	} else if o.gh == nil {
+		err = fmt.Errorf("no github client configured for pr-merged check")
+	} else {
+		merged, err = o.gh.IsPRMerged(prNumber)
 	}
-	if o.gh == nil {
-		return false, fmt.Errorf("no github client configured for pr-merged check")
+	if o.cycleActive {
+		o.cyclePRMerged[prNumber] = cycleBoolResult{value: merged, err: err}
 	}
-	return o.gh.IsPRMerged(prNumber)
+	return merged, err
 }
 
 func (o *Orchestrator) mergedPRForBranch(branch string) (int, error) {
@@ -456,6 +539,18 @@ func (o *Orchestrator) mergedPRForBranch(branch string) (int, error) {
 	}
 	if o.gh == nil {
 		return 0, fmt.Errorf("no github client configured for merged-branch check")
+	}
+	if o.cycleActive {
+		prs, err := o.listClosedPRsForCycle()
+		if err != nil {
+			return 0, err
+		}
+		for _, pr := range prs {
+			if strings.EqualFold(pr.State, "closed") && pr.MergedAt != "" && pr.HeadRefName == branch {
+				return pr.Number, nil
+			}
+		}
+		return 0, nil
 	}
 	return o.gh.MergedPRNumberForBranch(branch)
 }
@@ -708,13 +803,18 @@ func (o *Orchestrator) collectFailingCheckContext(prNumber int) string {
 }
 
 func (o *Orchestrator) closeIssue(number int, comment string) error {
+	var err error
 	if o.ghCloseIssueFn != nil {
-		return o.ghCloseIssueFn(number, comment)
+		err = o.ghCloseIssueFn(number, comment)
+	} else if o.gh == nil {
+		err = fmt.Errorf("no github client configured for close-issue")
+	} else {
+		err = o.gh.CloseIssue(number, comment)
 	}
-	if o.gh == nil {
-		return fmt.Errorf("no github client configured for close-issue")
+	if err == nil && o.cycleActive {
+		delete(o.cycleIssueClosed, number)
 	}
-	return o.gh.CloseIssue(number, comment)
+	return err
 }
 
 func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
@@ -854,13 +954,24 @@ func (o *Orchestrator) isIssueClosed(number int) (bool, error) {
 	if o.isIssueClosedFn != nil {
 		return o.isIssueClosedFn(number)
 	}
+	if o.cycleActive {
+		if result, ok := o.cycleIssueClosed[number]; ok {
+			return result.value, result.err
+		}
+	}
+	var closed bool
+	var err error
 	if o.readSource != nil {
-		return o.readSource.IsIssueClosed(number)
+		closed, err = o.readSource.IsIssueClosed(number)
+	} else if o.gh == nil {
+		err = fmt.Errorf("no github client configured for issue-closed check")
+	} else {
+		closed, err = o.gh.IsIssueClosed(number)
 	}
-	if o.gh == nil {
-		return false, fmt.Errorf("no github client configured for issue-closed check")
+	if o.cycleActive {
+		o.cycleIssueClosed[number] = cycleBoolResult{value: closed, err: err}
 	}
-	return o.gh.IsIssueClosed(number)
+	return closed, err
 }
 
 func (o *Orchestrator) addIssueLabel(number int, label string) error {
@@ -3845,6 +3956,22 @@ func isAncestorCommit(worktreePath, ancestor, descendant string) bool {
 	return amendGitCommand(worktreePath, "merge-base", "--is-ancestor", ancestor, descendant).Run() == nil
 }
 
+// terminalReconcileDue bounds authoritative forge polling for historical
+// sessions. A successful check remains valid for at most the hands-off stall
+// SLA; failures are not stamped and therefore retry on the next cycle. The
+// timestamp is durable so restarting the single daemon does not fan every old
+// issue/PR back out into hundreds of gh subprocesses at once (#940).
+func terminalReconcileDue(sess *state.Session, now time.Time) bool {
+	if sess == nil || sess.LastTerminalReconcileAt == nil {
+		return true
+	}
+	if sess.StartedAt.After(*sess.LastTerminalReconcileAt) ||
+		(sess.FinishedAt != nil && sess.FinishedAt.After(*sess.LastTerminalReconcileAt)) {
+		return true
+	}
+	return now.Sub(*sess.LastTerminalReconcileAt) >= terminalReconcileInterval
+}
+
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
 	// Fetch open PRs once for the whole check cycle (shared per-cycle, #794)
@@ -3861,6 +3988,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	for slotName, sess := range s.Sessions {
 		switch sess.Status {
 		case state.StatusDone, state.StatusCodeLanded, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
+			now := time.Now().UTC()
+			remoteReconcileDue := terminalReconcileDue(sess, now)
+			remoteReconcileSucceeded := false
+			remoteReconcileFailed := false
 			if sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded && prErr == nil {
 				if pr, found := branchToPR[sess.Branch]; found {
 					// #556: when a retry-exhausted session has already been
@@ -3910,27 +4041,35 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			// Once the forge proves the issue closed, release that lease so Fleet
 			// diagnostics do not retain a permanent active claim. A later explicit
 			// issue reopen is then eligible by design.
-			if sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && !sess.ReleasedForRedispatch {
+			if remoteReconcileDue && sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && !sess.ReleasedForRedispatch {
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
+					remoteReconcileFailed = true
 					log.Printf("[orch] terminal claim check for issue #%d / PR #%d: %v", sess.IssueNumber, sess.PRNumber, err)
-				} else if closed {
-					sess.ReleasedForRedispatch = true
-					log.Printf("[orch] terminal claim reconciled for issue #%d / PR #%d on %s: issue is closed", sess.IssueNumber, sess.PRNumber, slotName)
+				} else {
+					remoteReconcileSucceeded = true
+					if closed {
+						sess.ReleasedForRedispatch = true
+						log.Printf("[orch] terminal claim reconciled for issue #%d / PR #%d on %s: issue is closed", sess.IssueNumber, sess.PRNumber, slotName)
+					}
 				}
 			}
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
 			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).
-			if sess.Status != state.StatusDone {
+			if remoteReconcileDue && sess.Status != state.StatusDone {
 				done := false
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
+					remoteReconcileFailed = true
 					log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
-				} else if closed {
-					if o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-						log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-						done = true
+				} else {
+					remoteReconcileSucceeded = true
+					if closed {
+						if o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
+							log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
+							done = true
+						}
 					}
 				}
 				if done {
@@ -3944,12 +4083,20 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					merged, err := o.isPRMerged(sess.PRNumber)
 					if err != nil {
+						remoteReconcileFailed = true
 						log.Printf("[orch] check PR #%d merged: %v", sess.PRNumber, err)
-					} else if merged {
-						log.Printf("[orch] PR #%d merged, transitioning zombie session %s from %s to code_landed", sess.PRNumber, slotName, sess.Status)
-						o.markCodeLanded(sess, sess.PRNumber)
+					} else {
+						remoteReconcileSucceeded = true
+						if merged {
+							log.Printf("[orch] PR #%d merged, transitioning zombie session %s from %s to code_landed", sess.PRNumber, slotName, sess.Status)
+							o.markCodeLanded(sess, sess.PRNumber)
+						}
 					}
 				}
+			}
+			if remoteReconcileSucceeded && !remoteReconcileFailed {
+				checkedAt := time.Now().UTC()
+				sess.LastTerminalReconcileAt = &checkedAt
 			}
 			// Terminal states — cleanup old worktrees after 1h
 			// Use StartedAt as fallback when FinishedAt is nil (orphaned sessions)
