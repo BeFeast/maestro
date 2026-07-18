@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -360,6 +362,101 @@ func TestHandleFleetApproval_Approve_HappyPath(t *testing.T) {
 	st, _ := state.Load(dir)
 	if st.Approvals[0].Status != state.ApprovalStatusApproved {
 		t.Fatalf("status = %q", st.Approvals[0].Status)
+	}
+}
+
+func TestHandleFleetApproval_ApproveStopExecutesBeforeReturn(t *testing.T) {
+	dir := t.TempDir()
+	projectName := "scribe-service"
+	cfg := &config.Config{Repo: "owner/scribe-service", StateDir: dir}
+	proj := NewFleetProject(projectName, "/tmp/scribe.yaml", "", cfg)
+	var calls int32
+	proj.SetApprovalExecutor(func(st *state.State, approval state.Approval) ApprovalExecutionResult {
+		atomic.AddInt32(&calls, 1)
+		if approval.Status != state.ApprovalStatusApproved {
+			t.Errorf("callback approval status = %q, want approved", approval.Status)
+		}
+		live, ok := st.FindApproval(approval.ID)
+		if !ok || live.Status != state.ApprovalStatusApproved {
+			t.Errorf("callback observed durable approval = %#v, want approved", live)
+		}
+		return ApprovalExecutionResult{Status: state.ApprovalStatusExecuted, Summary: "worker stopped"}
+	})
+	srv := NewFleet([]FleetProject{proj}, "127.0.0.1", 0, false)
+	a := enqueuedApproval(t, dir, config.SupervisorActionStopWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42})
+
+	url := fmt.Sprintf("/api/v1/fleet/approvals/%s/approve?project=%s", a.ID, projectName)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewBufferString(`{"actor":"web"}`))
+	w := httptest.NewRecorder()
+	srv.handleFleetApproval(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("callback calls = %d, want 1", got)
+	}
+	var resp approvalDecisionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Approval == nil || resp.Approval.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("response approval = %#v, want terminal executed before return", resp.Approval)
+	}
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, ok := st.FindApproval(a.ID)
+	if !ok || terminal.Status != state.ApprovalStatusExecuted {
+		t.Fatalf("persisted approval = %#v, want terminal executed before return", terminal)
+	}
+}
+
+func TestHandleFleetApproval_ConcurrentDuplicateStopExecutesOnce(t *testing.T) {
+	dir := t.TempDir()
+	projectName := "scribe-service"
+	cfg := &config.Config{Repo: "owner/scribe-service", StateDir: dir}
+	proj := NewFleetProject(projectName, "/tmp/scribe.yaml", "", cfg)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int32
+	proj.SetApprovalExecutor(func(_ *state.State, _ state.Approval) ApprovalExecutionResult {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			close(started)
+		}
+		<-release
+		return ApprovalExecutionResult{Status: state.ApprovalStatusExecuted, Summary: "worker stopped"}
+	})
+	srv := NewFleet([]FleetProject{proj}, "127.0.0.1", 0, false)
+	a := enqueuedApproval(t, dir, config.SupervisorActionStopWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42})
+	url := fmt.Sprintf("/api/v1/fleet/approvals/%s/approve?project=%s", a.ID, projectName)
+
+	responses := make(chan int, 2)
+	request := func() {
+		req := httptest.NewRequest(http.MethodPost, url, bytes.NewBufferString(`{"actor":"web"}`))
+		w := httptest.NewRecorder()
+		srv.handleFleetApproval(w, req)
+		responses <- w.Code
+	}
+	go request()
+	<-started
+	var secondStarted sync.WaitGroup
+	secondStarted.Add(1)
+	go func() {
+		secondStarted.Done()
+		request()
+	}()
+	secondStarted.Wait()
+	close(release)
+
+	codes := []int{<-responses, <-responses}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("callback calls = %d, want exactly 1", got)
+	}
+	if !((codes[0] == http.StatusOK && codes[1] == http.StatusConflict) ||
+		(codes[1] == http.StatusOK && codes[0] == http.StatusConflict)) {
+		t.Fatalf("response statuses = %v, want one 200 and one 409", codes)
 	}
 }
 

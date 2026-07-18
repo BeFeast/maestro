@@ -202,6 +202,12 @@ var ErrUnknownAction = errors.New("unknown approval action")
 // target field the executor needs (PR number, issue number, session).
 var ErrMissingTarget = errors.New("approval target is missing required fields")
 
+// ErrWorkerAlreadyStopped lets a worker controller report that the immutable
+// process instance named by a stop approval was already gone. Safety stops
+// treat this as a terminal no-op, never as a reason to act on a later process
+// that happens to reuse the slot.
+var ErrWorkerAlreadyStopped = errors.New("worker process is already stopped")
+
 // Execute drives one approval to its real-world side effect. The caller
 // is responsible for the state transition (Mark*) using the returned
 // Result. Execute itself does NOT touch state — keeping state mutation
@@ -1013,6 +1019,12 @@ func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, s
 		err = e.Workers.RestartWorker(slot, sess)
 	}
 	if err != nil {
+		if stop && errors.Is(err, ErrWorkerAlreadyStopped) {
+			return Result{
+				Status:  state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf("%s skipped: worker process for slot %s was already stopped", verb, slot),
+			}
+		}
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
 			Summary: fmt.Sprintf("%s on slot %s: %v", verb, slot, err),

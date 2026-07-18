@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/approvalstore"
+	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configwatch"
 	"github.com/befeast/maestro/internal/emergencystore"
@@ -398,7 +399,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		seen[key] = true
 		name := server.UniqueFleetName(cfg.Repo, usedNames)
-		projects = append(projects, server.NewFleetProjectWithGitHubNamed(name, cfg))
+		project := server.NewFleetProjectWithGitHubNamed(name, cfg)
+		wireApprovalExecutor(&project)
+		projects = append(projects, project)
 		storeNames = append(storeNames, nc.name)
 		importCfgs = append(importCfgs, cfg)
 	}
@@ -607,6 +610,34 @@ func (d *Daemon) Run(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}
+}
+
+// wireApprovalExecutor gives a fleet project the same in-process approval
+// executor used by the supervisor, but bound to the state snapshot loaded by
+// the authenticated fleet request. Keeping one executor per project preserves
+// its per-approval concurrency fence while the FleetProject mutex serializes
+// the state pointer updates below.
+func wireApprovalExecutor(project *server.FleetProject) {
+	if project == nil {
+		return
+	}
+	cfg := project.Cfg()
+	executor := &approver.Executor{
+		Cfg:     cfg,
+		Workers: supervisor.NewWorkerController(cfg),
+	}
+	project.SetApprovalExecutor(func(st *state.State, approval state.Approval) server.ApprovalExecutionResult {
+		if st == nil {
+			return server.ApprovalExecutionResult{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: "stop_worker immediate executor received nil state",
+			}
+		}
+		executor.Sessions = approver.SessionLookupFunc(st.SessionAt)
+		executor.State = st
+		result := executor.Execute(&approval)
+		return server.ApprovalExecutionResult{Status: result.Status, Summary: result.Summary}
+	})
 }
 
 // namedConfig pairs a config-store project name with its loaded config. The

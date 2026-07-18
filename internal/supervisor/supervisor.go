@@ -4406,28 +4406,35 @@ func commandBinary(cmd, fallback string) string {
 	return fields[0]
 }
 
-// newWorkerController wires worker.Stop + state transitions into the
+// NewWorkerController wires worker process control + state transitions into the
 // approver WorkerController interface (#567). The supervisor's
 // executeApprovedApprovals loop uses this to apply approved
 // restart_worker / stop_worker verbs from the fleet snapshot.
 //
 //   - stop_worker: terminate the worker, mark the session StatusDead,
-//     clear NextRetryAt so the orchestrator does NOT respawn.
+//     clear NextRetryAt so the orchestrator does NOT respawn, and preserve the
+//     worktree/branch/PR for later inspection or repair.
 //   - restart_worker: terminate the worker, mark StatusDead with
 //     NextRetryAt = now so respawnDueRetries picks it up on the next
 //     dispatcher cycle. worker.Stop removed the worktree, so the stale
 //     worktree/PR pointers are cleared (#874) — otherwise respawnDueRetries
 //     would choose RespawnInPlace against a directory that no longer exists.
-func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
+func NewWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 	return approver.WorkerControllerFuncs{
 		Stop: func(slot string, sess *state.Session) error {
-			if err := worker.Stop(cfg, slot, sess); err != nil {
+			alreadyStopped := sess == nil || sess.PID <= 0 || !worker.IsAlive(sess.PID)
+			if err := worker.StopProcess(slot, sess); err != nil {
 				return err
 			}
 			now := time.Now().UTC()
-			sess.Status = state.StatusDead
-			sess.FinishedAt = &now
-			sess.NextRetryAt = nil
+			if sess != nil {
+				sess.Status = state.StatusDead
+				sess.FinishedAt = &now
+				sess.NextRetryAt = nil
+			}
+			if alreadyStopped {
+				return approver.ErrWorkerAlreadyStopped
+			}
 			return nil
 		},
 		Restart: func(slot string, sess *state.Session) error {
@@ -4587,7 +4594,7 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
 		Sessions:  approver.SessionLookupFunc(st.SessionAt),
-		Workers:   newWorkerController(cfg),
+		Workers:   NewWorkerController(cfg),
 		State:     st,
 	}
 	for _, a := range approvals {

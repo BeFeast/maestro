@@ -374,8 +374,10 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	return nil
 }
 
-// Stop kills a worker and removes its worktree
-func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
+// StopProcess terminates only the worker runtime for a slot. It deliberately
+// preserves the worktree, branch, and PR so a safety stop cannot destroy the
+// worker's durable output; cleanup remains a separate, explicit operation.
+func StopProcess(slotName string, sess *state.Session) error {
 	// Try to kill the tmux session first (covers tmux-spawned workers)
 	tmuxName := TmuxSessionName(slotName)
 	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
@@ -386,8 +388,19 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	// processes still parented to the pane shell; worker grandchildren that
 	// reparent away (notably headless Chrome + its crashpad handler) survive a
 	// plain pane-PID kill, so signal the recorded PID's full descendant tree.
-	if sess.PID > 0 && IsAlive(sess.PID) {
+	if sess != nil && sess.PID > 0 && IsAlive(sess.PID) {
 		KillProcessTree(sess.PID)
+	}
+	return nil
+}
+
+// Stop kills a worker and removes its worktree.
+func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
+	if err := StopProcess(slotName, sess); err != nil {
+		return err
+	}
+	if sess == nil {
+		return nil
 	}
 
 	// Run before_remove hook
