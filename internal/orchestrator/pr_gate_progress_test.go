@@ -244,11 +244,6 @@ func TestAutoMergePRs_PendingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 			HeadSHA: currentHead, Verdict: "pending", Fingerprint: strings.Repeat("7", 16), Complete: true,
 		}, nil
 	}
-	amended := false
-	o.amendHeadFn = func(string, string, []state.BackendAttribution, time.Time) error {
-		amended = true
-		return errAmendDiverged
-	}
 	st := makeTestState([]github.PR{pr})
 	sess := st.Sessions["slot-0"]
 	sess.Attribution = []state.BackendAttribution{{Backend: "sol", StartedAt: time.Now().UTC()}}
@@ -261,9 +256,6 @@ func TestAutoMergePRs_PendingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 	}
 	if len(*merged) != 0 {
 		t.Fatalf("pending PR unexpectedly merged: %v", *merged)
-	}
-	if amended {
-		t.Fatal("PR gate observation must not rewrite the product branch for attribution")
 	}
 }
 
@@ -279,11 +271,6 @@ func TestAutoMergePRs_PassingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
 		return github.ReviewGateVerdict{Passed: true, Streams: []github.ReviewStreamVerdict{{Name: "greptile", Passed: true}}}, nil
 	}
-	amended := false
-	o.amendHeadFn = func(string, string, []state.BackendAttribution, time.Time) error {
-		amended = true
-		return errAmendDiverged
-	}
 	st := makeTestState([]github.PR{pr})
 	sess := st.Sessions["slot-0"]
 	sess.Attribution = []state.BackendAttribution{{Backend: "sol", StartedAt: time.Now().UTC()}}
@@ -296,9 +283,6 @@ func TestAutoMergePRs_PassingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 	}
 	if len(*merged) != 1 || (*merged)[0] != pr.Number {
 		t.Fatalf("passing PR was not merged normally: %v", *merged)
-	}
-	if amended {
-		t.Fatal("passing merge gate must not rewrite the product branch for attribution")
 	}
 }
 

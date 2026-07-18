@@ -14,6 +14,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/pipeline"
+	"github.com/befeast/maestro/internal/repopolicy"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/tmuxsession"
 )
@@ -509,11 +510,33 @@ func RebaseWorktree(worktreePath, branch string, autoResolveFiles, autoRestoreFi
 			return fmt.Errorf("rebase failed: %v; auto-resolve failed: %v", rebaseErr, resolveErr)
 		}
 	}
+	if err := validateAttributionPolicyBeforeForcePush(worktreePath); err != nil {
+		return err
+	}
 
 	if _, err := runGit(worktreePath, "push", "--force-with-lease", "origin", branch); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+func validateAttributionPolicyBeforeForcePush(worktreePath string) error {
+	prohibited, err := repopolicy.ProhibitsPublicAIAttribution(worktreePath)
+	if err != nil {
+		return err
+	}
+	if !prohibited {
+		return nil
+	}
+
+	messages, err := runGit(worktreePath, "log", "--format=%B%x00", "origin/main..HEAD")
+	if err != nil {
+		return fmt.Errorf("inspect commits before force-push: %w", err)
+	}
+	if repopolicy.ContainsForbiddenPublicAttribution(messages) {
+		return fmt.Errorf("repository policy prohibits AI attribution; refusing force-push")
+	}
 	return nil
 }
 

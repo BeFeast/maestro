@@ -24,6 +24,7 @@ import (
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/pipeline"
+	"github.com/befeast/maestro/internal/repopolicy"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/state"
@@ -73,7 +74,6 @@ type Orchestrator struct {
 	listClosedPRsFn       func() ([]github.PR, error)
 	remoteBranchExistsFn  func(branch string) (bool, error)
 	createPRFn            func(title, body, base, head string) (int, error)
-	amendHeadFn           func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error
 	hasOpenPRForIssueFn   func(issueNumber int) (bool, error)
 	hasMergedPRForIssueFn func(issueNumber int) (bool, error)
 	mergedPRForIssueFn    func(issueNumber int) (int, error)
@@ -449,6 +449,15 @@ func (o *Orchestrator) remoteBranchExists(branch string) (bool, error) {
 }
 
 func (o *Orchestrator) createPR(title, body, base, head string) (int, error) {
+	if o.cfg != nil {
+		prohibited, err := repopolicy.ProhibitsPublicAIAttribution(o.cfg.LocalPath)
+		if err != nil {
+			return 0, err
+		}
+		if prohibited && repopolicy.ContainsForbiddenPublicAttribution(title+"\n"+body) {
+			return 0, fmt.Errorf("repository policy prohibits AI attribution in public PR text")
+		}
+	}
 	var (
 		prNumber int
 		err      error
@@ -3854,103 +3863,6 @@ Maestro auto-created this pull request for pushed branch %s because no open pull
 `, sess.IssueNumber, branch)
 }
 
-// ensureAttributionTrailerOnBranch is retained only as a compatibility helper
-// for historical trailer tests. Production lifecycle paths no longer call it:
-// backend attribution is internal control-plane state and must never mutate a
-// target repository's commits (#1000).
-//
-// Historically this stamped the durable Maestro-Backend trailer
-// onto the branch head. It returns deferred=true when the amend could not land
-// the trailer this cycle — the branch is advancing under a concurrent push, it
-// diverged from the attributed head, the worktree is mid-write, or the remote
-// tip could not be fetched. The merge flow MUST NOT merge a PR whose amend
-// deferred: merging now would land the PR permanently without the required
-// attribution trailer while the "later retry" the deferral promises never gets
-// to run (#858). A later quiet cycle re-invokes this and completes the trailer
-// before the merge proceeds. Non-merge callers (reconcile, pr_open transitions)
-// can ignore the return: for them the trailer legitimately lands on a later
-// cycle and nothing irreversible happens in between.
-func (o *Orchestrator) ensureAttributionTrailerOnBranch(slotName string, sess *state.Session) (deferred bool) {
-	if sess == nil || len(sess.Attribution) == 0 {
-		return false
-	}
-	// Runtime ownership is stronger evidence than the persisted status. A
-	// repair worker can already be live while a concurrent state write still
-	// shows pr_open/PID=0. Never amend/force-push underneath that agent: doing so
-	// rewrites HEAD while it is editing, testing, or pushing. We intentionally
-	// fail closed even when pane identity is unreadable or foreign; a live exact
-	// tmux name is enough uncertainty to forbid a branch mutation this cycle.
-	tmuxName := strings.TrimSpace(sess.TmuxSession)
-	if tmuxName == "" {
-		tmuxName = worker.TmuxSessionName(slotName)
-	}
-	if o.tmuxSessionExists(tmuxName) {
-		pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
-		if identityErr == nil && pid > 0 && filepath.Clean(paneWorktree) == filepath.Clean(sess.Worktree) {
-			log.Printf("[orch] attribution: deferring amend for %s (live worker owns branch %q via pid=%d tmux=%q)", slotName, sess.Branch, pid, tmuxName)
-		} else {
-			log.Printf("[orch] attribution: deferring amend for %s (tmux %q is live but ownership is not safely readable: pid=%d worktree=%q err=%v)", slotName, tmuxName, pid, paneWorktree, identityErr)
-		}
-		return true
-	}
-	err := o.amendHeadWithAttributionTrailer(sess.Worktree, sess.Branch, sess.Attribution, time.Now().UTC(), sess.CheckpointFile)
-	if err == nil {
-		return false
-	}
-	// Every deferral means the trailer is not on the branch yet, so the merge flow
-	// must wait (autoMergePRs re-invokes this on every cycle, so a later quiet
-	// cycle or the pre-merge pass completes it). The reasons are logged distinctly
-	// so a quiet-branch convergence bug or a missing-branch / network failure is
-	// never masked as an "advancing under concurrent push" race (#858, #873).
-	switch {
-	case errors.Is(err, errAmendDeferred):
-		log.Printf("[orch] attribution: deferring amend for %s (branch %q advancing under concurrent push; will retry next cycle)", slotName, sess.Branch)
-		return true
-	case errors.Is(err, errAmendDiverged):
-		log.Printf("[orch] attribution: deferring amend for %s (branch %q diverged from the attributed head; not overwriting, will retry next cycle)", slotName, sess.Branch)
-		return true
-	case errors.Is(err, errAmendWorktreeBusy):
-		log.Printf("[orch] attribution: deferring amend for %s (branch %q worktree busy mid-write; will retry next cycle)", slotName, sess.Branch)
-		return true
-	case errors.Is(err, errAmendFetchFailed):
-		log.Printf("[orch] attribution: deferring amend for %s (could not fetch remote branch %q: %v; will retry next cycle)", slotName, sess.Branch, err)
-		return true
-	default:
-		// Any unexpected amend failure means the trailer is not known to be on
-		// the remote. Fail closed: block the merge and retry on a later cycle.
-		log.Printf("[orch] attribution: deferring amend for %s (could not amend branch %q: %v; will retry next cycle)", slotName, sess.Branch, err)
-		return true
-	}
-}
-
-func (o *Orchestrator) amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time, checkpointFile string) error {
-	if o.amendHeadFn != nil {
-		return o.amendHeadFn(worktreePath, branch, attribution, now)
-	}
-	// CHECKPOINT.md is a Maestro-owned resumability artifact, not product work.
-	// A completed worker may deliberately leave it untracked in the canonical
-	// worktree. Ignore only this session's exact checkpoint path, and only while
-	// it is untracked; every other dirty path remains a hard amend deferral.
-	ignoredCheckpoint := attributionCheckpointRelativePath(worktreePath, checkpointFile)
-	return amendHeadWithAttributionTrailer(worktreePath, branch, attribution, now, ignoredCheckpoint)
-}
-
-func attributionCheckpointRelativePath(worktreePath, checkpointFile string) string {
-	worktreePath = strings.TrimSpace(worktreePath)
-	checkpointFile = strings.TrimSpace(checkpointFile)
-	if worktreePath == "" || checkpointFile == "" {
-		return ""
-	}
-	if !filepath.IsAbs(checkpointFile) {
-		checkpointFile = filepath.Join(worktreePath, checkpointFile)
-	}
-	rel, err := filepath.Rel(worktreePath, checkpointFile)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ""
-	}
-	return filepath.ToSlash(filepath.Clean(rel))
-}
-
 // amendMaxAttempts bounds how many times amendHeadWithAttributionTrailer will
 // re-fetch and re-apply the trailer after a stale-info lease rejection before
 // deferring to a later cycle: one initial try plus up to two refetch-retries.
@@ -4046,6 +3958,16 @@ func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []
 	worktreePath = strings.TrimSpace(worktreePath)
 	branch = strings.TrimSpace(branch)
 	if worktreePath == "" || branch == "" || len(attribution) == 0 {
+		return nil
+	}
+	prohibited, err := repopolicy.ProhibitsPublicAIAttribution(worktreePath)
+	if err != nil {
+		return err
+	}
+	if prohibited {
+		// Public attribution is forbidden by the repository's authoritative
+		// policy. Finalization is a no-op even if internal attribution gained new
+		// fallover, retry, checkpoint-resume, or continuation segments.
 		return nil
 	}
 	if _, err := os.Stat(worktreePath); err != nil {

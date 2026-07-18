@@ -90,19 +90,57 @@ func trailerCount(msg string) int {
 	return strings.Count(msg, state.AttributionTrailerKey+":")
 }
 
-func TestEnsureAttributionTrailer_IgnoresOnlyPreservedUntrackedCheckpoint(t *testing.T) {
+func TestAmendHead_NoAttributionPolicyNeverReinjectsOrChangesExactHead(t *testing.T) {
 	origin, wt, _, branch := setupAmendRepo(t)
-	checkpoint := filepath.Join(wt, "CHECKPOINT.md")
-	amendWrite(t, wt, "CHECKPOINT.md", "durable worker progress\n")
-	o := &Orchestrator{tmuxSessionExistsFn: func(string) bool { return false }}
-	sess := &state.Session{
-		Worktree: wt, Branch: branch, Attribution: testAttribution(), CheckpointFile: checkpoint,
+	amendWrite(t, wt, "AGENTS.md", "No AI attribution anywhere in git/GitHub artifacts.\n")
+	amendGit(t, wt, "add", "AGENTS.md")
+	amendGit(t, wt, "commit", "--amend", "-m", "worker: implement feature", "-m", state.FormatAttributionTrailer(testAttribution(), time.Now().UTC()))
+	amendGit(t, wt, "push", "--force-with-lease", "origin", branch)
+
+	// The worker explicitly strips the forbidden trailer before finalization.
+	amendGit(t, wt, "commit", "--amend", "-m", "worker: implement feature")
+	amendGit(t, wt, "push", "--force-with-lease", "origin", branch)
+	cleanHead := amendGit(t, origin, "rev-parse", branch)
+
+	timeline := testAttribution()
+	ended := time.Date(2026, 7, 10, 4, 5, 0, 0, time.UTC)
+	timeline[0].EndedAt = &ended
+	timeline[0].EndReason = "fallover"
+	timeline = append(timeline, state.BackendAttribution{
+		Backend: "sol", Provider: "openai", Model: "gpt-5.6-sol",
+		StartedAt: ended, Reason: "checkpoint_resume",
+	})
+
+	for _, phase := range []string{"fallover", "checkpoint resume", "in-place continuation"} {
+		if err := amendHeadWithAttributionTrailer(wt, branch, timeline, time.Now().UTC()); err != nil {
+			t.Fatalf("%s finalization: %v", phase, err)
+		}
+		if got := amendGit(t, origin, "rev-parse", branch); got != cleanHead {
+			t.Fatalf("%s changed accepted exact head: got %s want %s", phase, got, cleanHead)
+		}
+		msg := amendGit(t, origin, "log", "-1", "--pretty=%B", branch)
+		if strings.Contains(msg, state.AttributionTrailerKey+":") {
+			t.Fatalf("%s re-injected forbidden attribution:\n%s", phase, msg)
+		}
+		timeline = append(timeline, state.BackendAttribution{
+			Backend: "codex", Provider: "openai", Model: "gpt-5.6-codex",
+			StartedAt: time.Now().UTC(), Reason: "in_place_continuation",
+		})
 	}
 
-	if deferred := o.ensureAttributionTrailerOnBranch("slot-checkpoint", sess); deferred {
-		t.Fatal("exact untracked session checkpoint incorrectly deferred attribution")
+	if len(timeline) != 5 || timeline[0].EndReason != "fallover" || timeline[1].Reason != "checkpoint_resume" {
+		t.Fatalf("internal backend attribution was not preserved: %#v", timeline)
 	}
-	if got, err := os.ReadFile(checkpoint); err != nil || string(got) != "durable worker progress\n" {
+}
+
+func TestEnsureAttributionTrailer_IgnoresOnlyPreservedUntrackedCheckpoint(t *testing.T) {
+	origin, wt, _, branch := setupAmendRepo(t)
+	amendWrite(t, wt, "CHECKPOINT.md", "durable worker progress\n")
+
+	if err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), time.Now().UTC(), "CHECKPOINT.md"); err != nil {
+		t.Fatalf("exact untracked session checkpoint incorrectly blocked historical amend: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(wt, "CHECKPOINT.md")); err != nil || string(got) != "durable worker progress\n" {
 		t.Fatalf("checkpoint was not preserved: content=%q err=%v", got, err)
 	}
 	headMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", branch)
