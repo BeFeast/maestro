@@ -2682,7 +2682,7 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 	var bestMergeReasons []string
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || e.sessionResolvedOnGitHub(sess, cache) {
+		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
 		var pr github.PR
