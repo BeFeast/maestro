@@ -4037,6 +4037,28 @@ func TestFleetSupersedingIssueSessionUsesRetryExhaustedCanonicalOpenPR(t *testin
 	}
 }
 
+func TestFleetSupersedingIssueSessionSuppressesHistoricalSharedPRAttention(t *testing.T) {
+	historical := sessionInfo{
+		Slot: "ok-player-273", IssueNumber: 345, Status: string(state.StatusRetryExhausted),
+		PRNumber: 388, NeedsAttention: true, StartedAt: "2026-07-17T23:06:00Z",
+	}
+	continuation := sessionInfo{
+		Slot: "ok-player-302", IssueNumber: 406, Status: string(state.StatusPROpen),
+		PRNumber: 388, StartedAt: "2026-07-18T04:57:43Z",
+	}
+
+	got, ok := fleetSupersedingIssueSession(historical, []sessionInfo{historical, continuation})
+	if !ok || got.Slot != continuation.Slot {
+		t.Fatalf("shared-PR owner = %+v, %v; want %s", got, ok, continuation.Slot)
+	}
+
+	otherPR := continuation
+	otherPR.PRNumber = 413
+	if got, ok := fleetSupersedingIssueSession(historical, []sessionInfo{historical, otherPR}); ok {
+		t.Fatalf("different PR incorrectly superseded historical attention: %+v", got)
+	}
+}
+
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
 // regression. A retry_exhausted session whose linked PR is still open and
 // whose last notification is NOT a CI failure is convergence-bound: the

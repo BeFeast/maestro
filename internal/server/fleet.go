@@ -4101,6 +4101,25 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 	if candidate.IssueNumber <= 0 || !candidate.NeedsAttention {
 		return sessionInfo{}, false
 	}
+	// A PR is one lifecycle artifact even when a continuation issue and its
+	// historical source issue both retain session rows. Suppress a terminal
+	// attention row behind the deterministic current owner of that exact PR;
+	// otherwise an old retry_exhausted attempt can dominate operator_state while
+	// the newer continuation is the only session allowed to repair the PR.
+	if candidate.PRNumber > 0 {
+		owner := candidate
+		for _, peer := range all {
+			if peer.Slot == candidate.Slot || peer.PRNumber != candidate.PRNumber || !fleetSessionCanOwnOpenPR(peer) {
+				continue
+			}
+			if fleetPRSessionOwnerPrecedes(peer, owner) {
+				owner = peer
+			}
+		}
+		if owner.Slot != candidate.Slot {
+			return owner, true
+		}
+	}
 	// A terminal attempt with its own PR is not merely stale execution state:
 	// it may still require operator action or reconciliation for that distinct
 	// artifact. Only no-PR duplicate attempts may be hidden behind the issue's
@@ -4142,6 +4161,44 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 		}
 	}
 	return sessionInfo{}, false
+}
+
+func fleetSessionCanOwnOpenPR(sess sessionInfo) bool {
+	if sess.PRNumber <= 0 {
+		return false
+	}
+	switch state.SessionStatus(sess.Status) {
+	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusDead,
+		state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
+func fleetPRSessionOwnerPrecedes(candidate, current sessionInfo) bool {
+	candidateLive := fleetSessionActuallyRunning(candidate)
+	currentLive := fleetSessionActuallyRunning(current)
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	candidateStarted, candidateErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(candidate.StartedAt))
+	currentStarted, currentErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(current.StartedAt))
+	if candidateErr == nil && currentErr != nil {
+		return true
+	}
+	if candidateErr == nil && currentErr == nil {
+		if candidateStarted.After(currentStarted) {
+			return true
+		}
+		if currentStarted.After(candidateStarted) {
+			return false
+		}
+	}
+	if candidate.Status != current.Status {
+		return state.SessionStatus(candidate.Status) == state.StatusQueued
+	}
+	return candidate.Slot < current.Slot
 }
 
 func fleetSessionStartedAfterCanonicalCompletion(candidate, canonical sessionInfo) bool {
