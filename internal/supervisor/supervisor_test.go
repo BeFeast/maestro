@@ -1782,6 +1782,51 @@ func TestDecide_HealthyOutcomeAllowsIssueWorkAfterMerges(t *testing.T) {
 	}
 }
 
+func TestDecide_PendingOutcomeAllowsUnrelatedIssueWorkAfterMerge(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome:     "Merged main passes required CI",
+		HealthcheckCommand: "check-main-ci",
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(312, "next independent iteration", "maestro-ready")}}
+	now := time.Date(2026, 7, 18, 12, 15, 56, 0, time.UTC)
+	st := state.NewState()
+	st.LastMergeAt = now.Add(-time.Minute)
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now,
+		Signal:    "healthcheck_command",
+		State:     outcome.HealthPending,
+		Summary:   "source-main-ci reported in_progress",
+	}
+	st.Sessions["done-421"] = &state.Session{
+		IssueNumber: 421,
+		IssueTitle:  "merged work",
+		Status:      state.StatusDone,
+		PRNumber:    421,
+		StartedAt:   now.Add(-time.Hour),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 312 {
+		t.Fatalf("target = %#v, want unrelated ready issue 312", decision.Target)
+	}
+	if decision.Outcome == nil || decision.Outcome.HealthState != outcome.HealthPending {
+		t.Fatalf("Outcome = %+v, want persisted pending outcome", decision.Outcome)
+	}
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == state.StuckNoOutcomeProgress {
+			t.Fatalf("pending outcome suppressed material progress: %+v", stuck)
+		}
+	}
+}
+
 func TestDecide_EmptyStateNoAction(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{}

@@ -102,6 +102,47 @@ func TestEvaluateOutcomeRecoveryOnce_NonFailingHealthNeverRunsCommand(t *testing
 	}
 }
 
+func TestEvaluateOutcomeRecoveryOnce_PendingPersistsWithoutRecoveryCooldown(t *testing.T) {
+	cfg := recoveryTestConfig(t)
+	t0 := time.Date(2026, 7, 18, 12, 15, 56, 0, time.UTC)
+	if err := state.Save(cfg.StateDir, state.NewState()); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	originalCheck, originalRun := checkOutcomeForRecovery, runOutcomeRecovery
+	t.Cleanup(func() { checkOutcomeForRecovery, runOutcomeRecovery = originalCheck, originalRun })
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		return outcome.HealthCheckResult{
+			CheckedAt: t0,
+			Signal:    "healthcheck_command",
+			State:     outcome.HealthPending,
+			Summary:   "source-main-ci reported in_progress",
+		}
+	}
+	runCalls := 0
+	runOutcomeRecovery = func(_ context.Context, _ outcome.Brief) outcome.RecoveryExecution {
+		runCalls++
+		return outcome.RecoveryExecution{}
+	}
+
+	if evaluated, err := EvaluateOutcomeRecoveryOnce(cfg, t0); err != nil || !evaluated {
+		t.Fatalf("evaluation: evaluated=%t err=%v", evaluated, err)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if runCalls != 0 {
+		t.Fatalf("pending health launched recovery %d time(s)", runCalls)
+	}
+	if loaded.OutcomeHealth == nil || loaded.OutcomeHealth.State != outcome.HealthPending {
+		t.Fatalf("stored outcome health = %+v, want pending", loaded.OutcomeHealth)
+	}
+	if loaded.OutcomeRecovery != nil {
+		t.Fatalf("pending health entered recovery/cooldown: %+v", loaded.OutcomeRecovery)
+	}
+}
+
 func TestEvaluateOutcomeRecoveryOnce_LeasesRunsOnceAndVerifies(t *testing.T) {
 	cfg := recoveryTestConfig(t)
 	t0 := time.Date(2026, 7, 18, 8, 0, 0, 0, time.UTC)
