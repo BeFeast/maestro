@@ -8318,7 +8318,16 @@ func (o *Orchestrator) revalidateSpawnRepairPR(s *state.State, target *state.Sup
 
 func (o *Orchestrator) automaticOutcomeRecoveryOwnsFailure(s *state.State) bool {
 	return o != nil && o.cfg != nil && o.cfg.Outcome.AutomaticRecoveryEnabled() &&
-		s != nil && s.OutcomeHealth != nil && s.OutcomeHealth.State == outcome.HealthFailing
+		s != nil && s.OutcomeHealth != nil && s.OutcomeHealth.State == outcome.HealthFailing &&
+		activeOutcomeRecovery(s.OutcomeRecovery)
+}
+
+func activeOutcomeRecovery(recovery *outcome.RecoveryState) bool {
+	if recovery == nil {
+		return false
+	}
+	return recovery.Status == outcome.RecoveryStatusExecuting ||
+		recovery.Status == outcome.RecoveryStatusVerificationPending
 }
 
 func activeIssueClaimForSession(s *state.State, issueNumber int, slot string) (state.IssueClaim, bool) {

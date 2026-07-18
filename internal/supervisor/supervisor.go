@@ -2832,7 +2832,7 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 		case "retry_exhausted_open_pr":
 			return stuck.Severity == SeverityBlocked
 		case state.StuckNoOutcomeProgress:
-			if e.cfg != nil && e.cfg.Outcome.AutomaticRecoveryEnabled() {
+			if e.automaticOutcomeRecoveryOwnsFailure(st) {
 				return false
 			}
 			return e.outcomeStatus(st).HealthState == outcome.HealthFailing
@@ -2840,12 +2840,22 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	}
 	if pr.IsDraft {
 		status := e.outcomeStatus(st)
-		if e.cfg != nil && e.cfg.Outcome.AutomaticRecoveryEnabled() && status.HealthState == outcome.HealthFailing && ciStatus == "success" {
+		if e.automaticOutcomeRecoveryOwnsFailure(st) && status.HealthState == outcome.HealthFailing && ciStatus == "success" {
 			return false
 		}
 		return true
 	}
 	return false
+}
+
+func (e *Engine) automaticOutcomeRecoveryOwnsFailure(st *state.State) bool {
+	if e == nil || e.cfg == nil || !e.cfg.Outcome.AutomaticRecoveryEnabled() ||
+		st == nil || st.OutcomeHealth == nil || st.OutcomeHealth.State != outcome.HealthFailing ||
+		st.OutcomeRecovery == nil {
+		return false
+	}
+	return st.OutcomeRecovery.Status == outcome.RecoveryStatusExecuting ||
+		st.OutcomeRecovery.Status == outcome.RecoveryStatusVerificationPending
 }
 
 // openPRReadyToMerge returns (true, reasons[]) when a session's open PR can

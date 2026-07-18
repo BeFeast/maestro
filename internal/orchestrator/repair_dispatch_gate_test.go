@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -255,6 +256,52 @@ func TestSpawnRepairDispatch_AutomaticOutcomeRecoveryStalesGreenDraftRepair(t *t
 	}
 	if got := approvalStatus(t, s, "repair-7"); got != state.ApprovalStatusStale {
 		t.Fatalf("repair approval = %q, want stale", got)
+	}
+}
+
+func TestSpawnRepairDispatch_ConfiguredButInactiveOutcomeRecoveryKeepsGreenDraftRepair(t *testing.T) {
+	for _, recovery := range []*outcome.RecoveryState{
+		nil,
+		{Status: outcome.RecoveryStatusFailed, AttemptID: "outcome-failed"},
+		{Status: outcome.RecoveryStatusUncertain, AttemptID: "outcome-uncertain"},
+	} {
+		t.Run(fmt.Sprintf("recovery_%v", recovery), func(t *testing.T) {
+			const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			cfg := cfgWithBackends("codex", "codex")
+			cfg.Outcome = outcome.Brief{
+				DesiredOutcome:     "candidate feed follows main",
+				HealthcheckCommand: "check-outcome",
+				RecoveryMode:       outcome.RecoveryModeAutomatic,
+				RecoveryCommand:    "recover-outcome",
+			}
+			o, freshStarts, _ := newStartWorkersOrchestrator(cfg, []github.Issue{makeIssue(7, "continue explicit draft", "maestro-ready")})
+			o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+			o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+			o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+				return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Complete: true}, nil
+			}
+			o.ghPRMergeStatusFn = func(int) (string, string, error) { return "MERGEABLE", "clean", nil }
+			o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+				return github.ReviewGateVerdict{Passed: true}, nil
+			}
+			o.ghPRDetailsFn = func(pr int) (github.PR, error) {
+				return github.PR{Number: pr, State: "OPEN", IsDraft: true, Body: "<!-- maestro:wip -->"}, nil
+			}
+			respawns := 0
+			o.respawnInPlaceFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+				respawns++
+				return nil
+			}
+
+			s := repairGateTestState(time.Now().UTC(), head)
+			s.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, CheckedAt: time.Now().UTC()}
+			s.OutcomeRecovery = recovery
+			o.startNewWorkers(s, 1)
+
+			if respawns != 1 || len(*freshStarts) != 0 {
+				t.Fatalf("inactive outcome recovery suppressed repair: respawns=%d fresh=%v", respawns, *freshStarts)
+			}
+		})
 	}
 }
 
