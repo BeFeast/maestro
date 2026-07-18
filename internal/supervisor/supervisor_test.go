@@ -998,6 +998,76 @@ func TestSessionWithOpenPR_SkipsSettledSessionsBeforeRemoteResolution(t *testing
 	}
 }
 
+func TestDetectPRStuckStates_SharedPRUsesNewestContinuationSession(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "greptile"
+	cfg.AutoRetryReviewFeedback = true
+	reader := &fakeReader{
+		prs:        []github.PR{{Number: 388, HeadRefName: "feat/shared-pr", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{388: "success"},
+		greptileOK: map[int]bool{388: false},
+	}
+	eng := testEngine(cfg, reader)
+	st := state.NewState()
+	st.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 20, 0, 0, 0, time.UTC),
+	}
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC),
+	}
+
+	findings := eng.detectPRStuckStates(st, reader.prs, newResolutionCache(eng.reader))
+
+	if len(findings) != 1 {
+		t.Fatalf("findings = %#v, want one canonical PR finding", findings)
+	}
+	if findings[0].Code != "greptile_not_approved" || findings[0].Target == nil {
+		t.Fatalf("finding = %#v, want Greptile finding with target", findings[0])
+	}
+	if findings[0].Target.Issue != 406 || findings[0].Target.Session != "ok-player-302" || findings[0].Target.PR != 388 {
+		t.Fatalf("target = %#v, want continuation issue #406 / ok-player-302 / PR #388", findings[0].Target)
+	}
+}
+
+func TestDecide_SharedPRRepairUsesNewestUnblockedContinuation(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.ReviewGate = "greptile"
+	cfg.AutoRetryReviewFeedback = true
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(345, "historical issue", "blocked"),
+			testIssue(406, "continuation", "maestro-ready"),
+		},
+		prs:        []github.PR{{Number: 388, HeadRefName: "feat/shared-pr", State: "OPEN", Mergeable: "MERGEABLE"}},
+		ciStatuses: map[int]string{388: "success"},
+		greptileOK: map[int]bool{388: false},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 20, 0, 0, 0, time.UTC),
+	}
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want %q; summary=%q", decision.RecommendedAction, ActionSpawnRepairWorker, decision.Summary)
+	}
+	if decision.Target == nil || decision.Target.Issue != 406 || decision.Target.Session != "ok-player-302" || decision.Target.PR != 388 {
+		t.Fatalf("target = %#v, want unblocked continuation issue #406 / ok-player-302 / PR #388", decision.Target)
+	}
+}
+
 func TestDecide_FailingChecksExplained(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{

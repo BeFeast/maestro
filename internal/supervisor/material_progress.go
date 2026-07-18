@@ -91,7 +91,7 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 			continue
 		}
 		ownerSlot, exists := prGateOwners[sess.PRNumber]
-		if !exists || materialProgressGateOwnerPrecedes(slot, sess, ownerSlot, st.Sessions[ownerSlot]) {
+		if !exists || prSessionOwnerPrecedes(slot, sess, ownerSlot, st.Sessions[ownerSlot]) {
 			prGateOwners[sess.PRNumber] = slot
 		}
 	}
@@ -141,9 +141,14 @@ func collectMaterialProgressObservationsForProject(st *state.State, project stri
 	return observations
 }
 
-func materialProgressGateOwnerPrecedes(candidateSlot string, candidate *state.Session, currentSlot string, current *state.Session) bool {
+func prSessionOwnerPrecedes(candidateSlot string, candidate *state.Session, currentSlot string, current *state.Session) bool {
 	if candidate == nil {
 		return false
+	}
+	candidateLive := candidate.Status == state.StatusRunning && candidate.PID > 0
+	currentLive := current != nil && current.Status == state.StatusRunning && current.PID > 0
+	if candidateLive != currentLive {
+		return candidateLive
 	}
 	if current == nil || candidate.StartedAt.After(current.StartedAt) {
 		return true

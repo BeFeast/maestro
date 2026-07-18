@@ -1703,6 +1703,7 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 			}
 		}
 	}
+	canonicalOwners := e.canonicalOpenPROwners(st, byNumber, byBranch, cache)
 
 	var findings []state.SupervisorStuckState
 	seenPRs := make(map[int]struct{})
@@ -1736,6 +1737,9 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		}
 		if sess.PRNumber == 0 {
 			target.PR = pr.Number
+		}
+		if ownerSlot := canonicalOwners[pr.Number]; ownerSlot != "" && ownerSlot != slot {
+			continue
 		}
 		if _, ok := seenPRs[pr.Number]; ok {
 			continue
@@ -2669,6 +2673,7 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		branchToPR[pr.HeadRefName] = pr
 		numberToPR[pr.Number] = pr
 	}
+	canonicalOwners := e.canonicalOpenPROwners(st, numberToPR, branchToPR, cache)
 	// Attention states must not sit behind an ordinary open PR merely because
 	// its slot sorts earlier. This is especially important when the earlier PR
 	// is intentionally blocked for QA: a later conflict_failed/retry_exhausted
@@ -2694,6 +2699,9 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 			pr, found = numberToPR[sess.PRNumber]
 		}
 		if !found {
+			continue
+		}
+		if ownerSlot := canonicalOwners[pr.Number]; ownerSlot != "" && ownerSlot != slot {
 			continue
 		}
 		// Evaluate merge eligibility across the whole candidate set before
@@ -4164,6 +4172,36 @@ func openPRForSession(sess *state.Session, byNumber map[int]github.PR, byBranch 
 		}
 	}
 	return github.PR{}, false
+}
+
+// canonicalOpenPROwners elects one actionable session identity for each open
+// PR. Historical issue/session rows can legitimately remain after an in-place
+// continuation or repair, but they must not compete with the continuation in
+// stuck-state, operator-state, or repair selection. A live worker wins while it
+// is advancing the PR; otherwise the newest unresolved session owns the gate.
+func (e *Engine) canonicalOpenPROwners(st *state.State, byNumber map[int]github.PR, byBranch map[string]github.PR, cache *resolutionCache) map[int]string {
+	owners := make(map[int]string)
+	if st == nil {
+		return owners
+	}
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
+			continue
+		}
+		if sess.Status == state.StatusRetryExhausted && e.retryExhaustedSessionSupersededByIssueProgress(st, sess) {
+			continue
+		}
+		pr, found := openPRForSession(sess, byNumber, byBranch)
+		if !found {
+			continue
+		}
+		ownerSlot, exists := owners[pr.Number]
+		if !exists || prSessionOwnerPrecedes(slot, sess, ownerSlot, st.Sessions[ownerSlot]) {
+			owners[pr.Number] = slot
+		}
+	}
+	return owners
 }
 
 func sessionCanStillBlockProgress(status state.SessionStatus) bool {
