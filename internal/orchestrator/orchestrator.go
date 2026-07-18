@@ -4838,7 +4838,7 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 			if repairIssueSessionActive(sess.Status) || (sess.PRNumber == canonical.Number && sess.Status == state.StatusRetryExhausted) {
 				activeOther = slotName
 			}
-			if (sess.Status == state.StatusDone || sess.Status == state.StatusFailed) &&
+			if terminalOpenPRAdoptionCandidate(sess) &&
 				(sess.PRNumber == canonical.Number || sess.LastClosedPRNumber == canonical.Number || sess.Branch == canonical.HeadRefName) {
 				exactSlots = append(exactSlots, slotName)
 			}
@@ -4870,7 +4870,7 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 			continue
 		}
 		sess := s.Sessions[candidateSlot]
-		if sess == nil || (sess.Status != state.StatusDone && sess.Status != state.StatusFailed) {
+		if !terminalOpenPRAdoptionCandidate(sess) {
 			continue
 		}
 		merged := false
@@ -4924,6 +4924,27 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 		sess.ReleasedForRedispatch = false
 		o.attachPreservedSiblingHandoffs(s, issue, candidateSlot, sess, canonical, allSlots)
 		log.Printf("[orch] reconciled terminal session %s for issue #%d: closed/unavailable PR #%d replaced by sole open canonical PR #%d on branch %s", candidateSlot, sess.IssueNumber, oldPR, canonical.Number, canonical.HeadRefName)
+	}
+}
+
+// terminalOpenPRAdoptionCandidate reports whether authoritative GitHub state
+// may rebind this non-running session to the sole open PR that references its
+// issue. An unscheduled dead session is eligible: the worker may have pushed to
+// an existing PR branch that differs from the synthetic session branch before
+// exiting. A dead session with NextRetryAt is deliberately excluded because it
+// still owns a pending in-place retry; flipping it to pr_open would consume the
+// retry without running the repair (#758).
+func terminalOpenPRAdoptionCandidate(sess *state.Session) bool {
+	if sess == nil {
+		return false
+	}
+	switch sess.Status {
+	case state.StatusDone, state.StatusFailed:
+		return true
+	case state.StatusDead:
+		return sess.NextRetryAt == nil
+	default:
+		return false
 	}
 }
 
@@ -6121,19 +6142,19 @@ func (o *Orchestrator) mergedPRForDoneLikeSession(sess *state.Session) (int, err
 			return sess.PRNumber, nil
 		}
 	}
+	if sess.LastClosedPRNumber > 0 && sess.LastClosedPRNumber != sess.PRNumber {
+		merged, err := o.isPRMerged(sess.LastClosedPRNumber)
+		if err != nil {
+			return 0, fmt.Errorf("check recorded closed PR #%d: %w", sess.LastClosedPRNumber, err)
+		}
+		if merged {
+			return sess.LastClosedPRNumber, nil
+		}
+	}
 	if branch := strings.TrimSpace(sess.Branch); branch != "" {
 		prNumber, err := o.mergedPRForBranch(branch)
 		if err != nil {
 			return 0, fmt.Errorf("check merged PR for branch %q: %w", branch, err)
-		}
-		if prNumber > 0 {
-			return prNumber, nil
-		}
-	}
-	if sess.IssueNumber > 0 {
-		prNumber, err := o.mergedPRForIssue(sess.IssueNumber)
-		if err != nil {
-			return 0, fmt.Errorf("check merged PR for issue #%d: %w", sess.IssueNumber, err)
 		}
 		if prNumber > 0 {
 			return prNumber, nil
@@ -6187,6 +6208,28 @@ func (o *Orchestrator) canMarkDoneForOutcome(s *state.State, sess *state.Session
 	status := outcome.StatusFor(o.cfg.Outcome, donePRs, lastMergeAt, outcomeHealthChecks(s)...)
 	if status.HealthState == outcome.HealthHealthy {
 		return true
+	}
+	// #970: project-wide outcome drift only gates a session that owns a merged
+	// product revision. A closed/cancelled issue with no discoverable merged PR
+	// has nothing left to deploy or live-verify; retaining its prior dead/failed
+	// status forever makes a reconciled issue dominate Fleet operator_state and
+	// hold a resumable-worktree claim indefinitely. The project outcome remains
+	// independently visible and actionable, but this no-delivery session may
+	// become terminal. Conversely, a merged revision discovered only through the
+	// recorded PR/branch link must still enter code_landed and remain held here.
+	if sess != nil {
+		prNumber, err := o.mergedPRForDoneLikeSession(sess)
+		if err != nil {
+			log.Printf("[orch] %s, but merged delivery identity could not be verified while outcome health is %s: %v — holding out of done", trigger, status.HealthState, err)
+			return false
+		}
+		if prNumber <= 0 {
+			log.Printf("[orch] %s with no merged delivery identity; project outcome health is %s but does not keep this session non-terminal", trigger, status.HealthState)
+			return true
+		}
+		if sess.Status != state.StatusCodeLanded || sess.PRNumber != prNumber {
+			o.markCodeLanded(sess, prNumber)
+		}
 	}
 	issue := 0
 	if sess != nil {
