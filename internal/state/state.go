@@ -38,6 +38,12 @@ const (
 	DisplayReviewRetryPending SessionDisplayStatus = "review_retry_pending"
 	DisplayReviewRetryRunning SessionDisplayStatus = "review_retry_running"
 	DisplayReviewRetryRecheck SessionDisplayStatus = "review_retry_recheck"
+	// DisplayWaitingForIssueGuard marks a canonical retry that is deliberately
+	// held because the issue currently carries a configured exclude label. The
+	// retry still owns its issue/worktree lease, but it is not a failed worker
+	// requiring operator attention; removing the guard lets the same session
+	// resume on the next orchestrator cycle.
+	DisplayWaitingForIssueGuard SessionDisplayStatus = "waiting_for_issue_guard"
 	// DisplayBackendRateLimited marks a session whose worker exited because its
 	// backend hit a provider usage limit with no fallback available. It is a
 	// distinct, non-failure display token so operators do not confuse a
@@ -211,6 +217,7 @@ type Session struct {
 	RetryCount               int        `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
 	MaintenanceRetryCount    int        `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
 	NextRetryAt              *time.Time `json:"next_retry_at,omitempty"`
+	RetryHoldReason          string     `json:"retry_hold_reason,omitempty"` // current dispatch guard holding a scheduled canonical retry; does not release its issue/worktree lease
 	LastOutputHash           string     `json:"last_output_hash,omitempty"`
 	LastOutputChangedAt      time.Time  `json:"last_output_changed_at,omitempty"`
 	TokensUsedAttempt        int        `json:"tokens_used_attempt,omitempty"` // tokens consumed in current attempt (reset on respawn)
@@ -342,6 +349,12 @@ func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
 func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAttention {
 	if sess == nil {
 		return SessionAttention{}
+	}
+	if sess.Status == StatusDead && sess.NextRetryAt != nil && strings.TrimSpace(sess.RetryHoldReason) != "" {
+		return SessionAttention{
+			Reason:     "Automatic retry is waiting for the issue's current dispatch guard to clear.",
+			NextAction: "No worker restart is allowed while the guard remains; Maestro will resume the same canonical session after it clears.",
+		}
 	}
 	if attention, ok := reviewFeedbackRetryAttention(sess, alive, now); ok {
 		return attention
@@ -514,6 +527,9 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 	}
 	if sess.Status == StatusRunning && alive != nil && !*alive {
 		return string(sess.Status)
+	}
+	if sess.Status == StatusDead && sess.NextRetryAt != nil && strings.TrimSpace(sess.RetryHoldReason) != "" {
+		return string(DisplayWaitingForIssueGuard)
 	}
 	if display := reviewFeedbackRetryDisplayStatus(sess, now); display != "" {
 		return string(display)
@@ -3999,7 +4015,7 @@ func SessionLiveAt(sess *Session, now time.Time) bool {
 	}
 
 	switch SessionDisplayStatus(SessionDisplayStatusForAt(sess, nil, now)) {
-	case DisplayReviewRetryBackoff, DisplayReviewRetryPending, DisplayReviewRetryRunning, DisplayReviewRetryRecheck:
+	case DisplayReviewRetryBackoff, DisplayReviewRetryPending, DisplayReviewRetryRunning, DisplayReviewRetryRecheck, DisplayWaitingForIssueGuard:
 		return true
 	}
 

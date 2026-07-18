@@ -59,6 +59,7 @@ const statusOrder = new Map([
   ["pr_open", 1],
   ["review_retry_pending", 2],
   ["review_retry_backoff", 2],
+	["waiting_for_issue_guard", 2],
   ["queued", 2],
   ["code_landed", 3],
   ["dead", 4],
@@ -895,7 +896,7 @@ function isLiveWorker(worker) {
   const terminal = new Set(["done", "failed", "dead", "conflict_failed", "retry_exhausted"]);
   if (terminal.has(displayed) || terminal.has(worker.status || "")) return false;
   if (worker.live === true) return true;
-  return ["running", "pr_open", "queued", "review_retry_running", "review_retry_recheck", "review_retry_pending", "review_retry_backoff"].includes(displayed) ||
+  return ["running", "pr_open", "queued", "review_retry_running", "review_retry_recheck", "review_retry_pending", "review_retry_backoff", "waiting_for_issue_guard"].includes(displayed) ||
     ["running", "pr_open", "queued"].includes(worker.status || "");
 }
 

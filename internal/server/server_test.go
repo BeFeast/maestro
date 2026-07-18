@@ -311,6 +311,35 @@ func TestHandleStateReviewRetryLifecycleDisplay(t *testing.T) {
 	}
 }
 
+func TestBuildStateResponseIssueGuardRetryHold(t *testing.T) {
+	now := time.Now().UTC()
+	retryAt := now.Add(time.Minute)
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber:     406,
+		IssueTitle:      "Blocked canonical retry",
+		Status:          state.StatusDead,
+		StartedAt:       now.Add(-time.Hour),
+		NextRetryAt:     &retryAt,
+		RetryHoldReason: "issue #406 has a current excluded label",
+	}
+
+	resp := buildStateResponse(&config.Config{Repo: "owner/repo", MaxParallel: 20}, st)
+	worker := findSessionInfo(t, resp.All, "ok-player-302")
+	if worker.DisplayStatus != string(state.DisplayWaitingForIssueGuard) {
+		t.Fatalf("display_status = %q, want %q", worker.DisplayStatus, state.DisplayWaitingForIssueGuard)
+	}
+	if worker.NeedsAttention || !worker.Live {
+		t.Fatalf("guarded retry attention/live = %v/%v, want false/true", worker.NeedsAttention, worker.Live)
+	}
+	if !contains(worker.StatusReason, "dispatch guard") || !contains(worker.NextAction, "same canonical session") {
+		t.Fatalf("guarded retry explanation = %q / %q", worker.StatusReason, worker.NextAction)
+	}
+	if resp.Summary[string(state.DisplayWaitingForIssueGuard)] != 1 {
+		t.Fatalf("summary waiting_for_issue_guard = %d, want 1", resp.Summary[string(state.DisplayWaitingForIssueGuard)])
+	}
+}
+
 func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
 	srv, cfg := setupTestServer(t)
 	cfg.Server.ReadOnly = true

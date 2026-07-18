@@ -2519,7 +2519,7 @@ func fleetSessionActuallyRunning(worker sessionInfo) bool {
 
 func fleetWorkerSelfProgressing(worker fleetWorkerState) bool {
 	switch worker.DisplayStatus {
-	case string(state.DisplayReviewRetryBackoff), string(state.DisplayReviewRetryPending), string(state.DisplayReviewRetryRunning), string(state.DisplayReviewRetryRecheck):
+	case string(state.DisplayReviewRetryBackoff), string(state.DisplayReviewRetryPending), string(state.DisplayReviewRetryRunning), string(state.DisplayReviewRetryRecheck), string(state.DisplayWaitingForIssueGuard):
 		return true
 	}
 	switch state.SessionStatus(worker.Status) {

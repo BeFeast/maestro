@@ -2275,6 +2275,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		issue, err := o.getIssue(sess.IssueNumber)
 		if err != nil {
 			log.Printf("[orch] fetch issue #%d for retry: %v — marking as failed", sess.IssueNumber, err)
+			sess.RetryHoldReason = ""
 			sess.Status = state.StatusFailed
 			now := time.Now().UTC()
 			sess.FinishedAt = &now
@@ -2291,10 +2292,14 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		if github.HasLabel(issue, o.cfg.ExcludeLabels) {
 			retryAt := time.Now().UTC().Add(time.Minute)
 			sess.NextRetryAt = &retryAt
+			sess.RetryHoldReason = fmt.Sprintf("issue #%d has a current excluded label", sess.IssueNumber)
 			log.Printf("[orch] worker %s retry deferred until %s: issue #%d has a current excluded label",
 				slotName, retryAt.Format(time.RFC3339), sess.IssueNumber)
 			continue
 		}
+		// The current issue read is authoritative: a previously persisted hold
+		// has cleared, so this exact canonical retry may proceed in place.
+		sess.RetryHoldReason = ""
 
 		promptBase := o.selectPrompt(issue)
 
@@ -2451,6 +2456,7 @@ func (o *Orchestrator) retireStaleRetry(s *state.State, slotName string, sess *s
 		}
 		log.Printf("[orch] worker %s retry invalidated: PR #%d for issue #%d is merged — marking code_landed instead of respawning", slotName, prNumber, sess.IssueNumber)
 		sess.NextRetryAt = nil
+		sess.RetryHoldReason = ""
 		o.markCodeLanded(sess, prNumber)
 		if o.notifier != nil {
 			o.notifier.Sendf("🧟 maestro: cancelled scheduled retry for issue #%d (%s) — PR #%d already merged", sess.IssueNumber, sess.IssueTitle, prNumber)
@@ -2472,6 +2478,7 @@ func (o *Orchestrator) retireStaleRetry(s *state.State, slotName string, sess *s
 	}
 	log.Printf("[orch] worker %s retry invalidated: issue #%d is closed — marking done instead of respawning", slotName, sess.IssueNumber)
 	sess.NextRetryAt = nil
+	sess.RetryHoldReason = ""
 	sess.Status = state.StatusDone
 	now := time.Now().UTC()
 	sess.FinishedAt = &now

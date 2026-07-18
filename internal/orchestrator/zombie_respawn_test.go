@@ -55,12 +55,13 @@ func TestRespawnDueRetries_IssueClosed_RetiresInsteadOfRespawning(t *testing.T) 
 	pastTime := time.Now().UTC().Add(-1 * time.Second)
 	s := state.NewState()
 	s.Sessions["ok-player-1"] = &state.Session{
-		IssueNumber: 133,
-		IssueTitle:  "closed while backoff ran",
-		Status:      state.StatusDead,
-		RetryCount:  1,
-		NextRetryAt: &pastTime,
-		Branch:      "feat/ok-player-1-133-test",
+		IssueNumber:     133,
+		IssueTitle:      "closed while backoff ran",
+		Status:          state.StatusDead,
+		RetryCount:      1,
+		NextRetryAt:     &pastTime,
+		RetryHoldReason: "issue #133 has a current excluded label",
+		Branch:          "feat/ok-player-1-133-test",
 	}
 
 	o.respawnDueRetries(s, 10)
@@ -74,6 +75,9 @@ func TestRespawnDueRetries_IssueClosed_RetiresInsteadOfRespawning(t *testing.T) 
 	}
 	if sess.NextRetryAt != nil {
 		t.Fatal("NextRetryAt must be cleared when the retry is retired")
+	}
+	if sess.RetryHoldReason != "" {
+		t.Fatalf("retry hold must be cleared when the issue closes: %q", sess.RetryHoldReason)
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("FinishedAt should be set when the retry is retired")
@@ -93,14 +97,15 @@ func TestRespawnDueRetries_SessionPRMerged_RetiresInsteadOfRespawning(t *testing
 	pastTime := time.Now().UTC().Add(-1 * time.Second)
 	s := state.NewState()
 	s.Sessions["ok-player-1"] = &state.Session{
-		IssueNumber: 133,
-		IssueTitle:  "review retry with merged PR",
-		Status:      state.StatusDead,
-		RetryCount:  1,
-		NextRetryAt: &pastTime,
-		Branch:      "feat/ok-player-1-133-test",
-		Worktree:    "/tmp/maestro-ok-player-1",
-		PRNumber:    135,
+		IssueNumber:     133,
+		IssueTitle:      "review retry with merged PR",
+		Status:          state.StatusDead,
+		RetryCount:      1,
+		NextRetryAt:     &pastTime,
+		RetryHoldReason: "issue #133 has a current excluded label",
+		Branch:          "feat/ok-player-1-133-test",
+		Worktree:        "/tmp/maestro-ok-player-1",
+		PRNumber:        135,
 	}
 
 	o.respawnDueRetries(s, 10)
@@ -114,6 +119,9 @@ func TestRespawnDueRetries_SessionPRMerged_RetiresInsteadOfRespawning(t *testing
 	}
 	if sess.NextRetryAt != nil {
 		t.Fatal("NextRetryAt must be cleared when the retry is retired")
+	}
+	if sess.RetryHoldReason != "" {
+		t.Fatalf("retry hold must be cleared when the PR merges: %q", sess.RetryHoldReason)
 	}
 }
 

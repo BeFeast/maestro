@@ -6,6 +6,7 @@ import {
   formatProviderModelHealthSentence,
   mapFleetResponse,
   workerSessionsFromFleet,
+  workerNextAction,
   workerStatusTaxonomy,
 } from "./fleetApi.js";
 
@@ -98,6 +99,31 @@ describe("Fleet workers ordering contract", () => {
       label: "token budget exceeded",
       tone: "stuck",
       section: "stuck",
+    });
+  });
+
+  test("issue-guard retry hold is visible recent work, not a stuck worker", () => {
+    const taxonomy = workerStatusTaxonomy({
+      status: "dead",
+      display_status: "waiting_for_issue_guard",
+      live: true,
+      needs_attention: false,
+    });
+
+    expect(taxonomy).toEqual({
+      label: "waiting for issue guard",
+      tone: "policy",
+      section: "recent",
+    });
+
+    expect(workerNextAction({
+      status: "dead",
+      display_status: "waiting_for_issue_guard",
+      issue_url: "https://github.com/BeFeast/ok-player/issues/406",
+      next_action: "Maestro will resume the same canonical session.",
+    })).toEqual({
+      text: "Maestro will resume the same canonical session.",
+      buttons: [{ label: "Open issue →", href: "https://github.com/BeFeast/ok-player/issues/406" }],
     });
   });
 });

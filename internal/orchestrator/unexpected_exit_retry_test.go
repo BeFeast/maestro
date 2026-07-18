@@ -129,4 +129,71 @@ func TestDueRetryDefersWhenIssueGainsExcludedLabel(t *testing.T) {
 	if sess.Status != state.StatusDead || sess.NextRetryAt == nil || !sess.NextRetryAt.After(time.Now().UTC()) {
 		t.Fatalf("blocked retry state = status %q retry=%v, want preserved deferred retry", sess.Status, sess.NextRetryAt)
 	}
+	if sess.RetryHoldReason == "" {
+		t.Fatal("blocked retry must persist its issue-guard hold reason")
+	}
+	if got := state.SessionDisplayStatusFor(sess, nil); got != string(state.DisplayWaitingForIssueGuard) {
+		t.Fatalf("blocked retry display = %q, want %q", got, state.DisplayWaitingForIssueGuard)
+	}
+	if attention := state.SessionAttentionFor(sess, nil); attention.NeedsAttention {
+		t.Fatalf("intentional issue-guard hold must not require attention: %+v", attention)
+	}
+	if !s.IssueInProgress(407) {
+		t.Fatal("issue-guard hold must retain the canonical issue lease")
+	}
+}
+
+func TestDueRetryResumesCanonicalSessionAfterExcludedLabelClears(t *testing.T) {
+	blocked := true
+	respawned := 0
+	past := time.Now().UTC().Add(-time.Second)
+	o := &Orchestrator{
+		cfg:             &config.Config{Repo: "owner/repo", ExcludeLabels: []string{"blocked"}},
+		repo:            "owner/repo",
+		notifier:        &notify.Notifier{},
+		promptBase:      "test prompt",
+		isIssueClosedFn: func(int) (bool, error) { return false, nil },
+		getIssueFn: func(number int) (github.Issue, error) {
+			if blocked {
+				return makeIssue(number, "guarded retry", "blocked"), nil
+			}
+			return makeIssue(number, "guarded retry"), nil
+		},
+		respawnInPlaceFn: func(_ *config.Config, slot string, sess *state.Session, _ string, issue github.Issue, _, _ string) error {
+			respawned++
+			if slot != "ok-player-302" || issue.Number != 406 || sess.Worktree != "/worktrees/ok-player-302" {
+				t.Fatalf("canonical retry identity drifted: slot=%q issue=%d worktree=%q", slot, issue.Number, sess.Worktree)
+			}
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			return nil
+		},
+	}
+	s := state.NewState()
+	sess := &state.Session{
+		IssueNumber: 406,
+		IssueTitle:  "guarded retry",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &past,
+		Worktree:    "/worktrees/ok-player-302",
+		Branch:      "feat/ok-player-302-406-recover",
+		PRNumber:    388,
+	}
+	s.Sessions["ok-player-302"] = sess
+
+	o.respawnDueRetries(s, 1)
+	if respawned != 0 || sess.RetryHoldReason == "" {
+		t.Fatalf("guarded cycle = respawned %d hold %q, want held canonical retry", respawned, sess.RetryHoldReason)
+	}
+
+	blocked = false
+	sess.NextRetryAt = &past
+	o.respawnDueRetries(s, 1)
+	if respawned != 1 || sess.Status != state.StatusRunning || sess.PID != 5555 {
+		t.Fatalf("cleared cycle = respawned %d status %q pid %d, want one in-place resume", respawned, sess.Status, sess.PID)
+	}
+	if sess.RetryHoldReason != "" {
+		t.Fatalf("retry hold survived guard removal: %q", sess.RetryHoldReason)
+	}
 }
