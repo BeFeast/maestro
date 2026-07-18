@@ -346,6 +346,32 @@ func TestGreptileCheckDecision(t *testing.T) {
 	}
 }
 
+func TestGreptileCommentDecisionIgnoresHumanMentionsAndUsesLatestBotVerdict(t *testing.T) {
+	comment := func(login, body string) issueComment {
+		var got issueComment
+		got.User.Login = login
+		got.Body = body
+		return got
+	}
+
+	found, approved := greptileCommentDecision([]issueComment{
+		comment("kossoy", "Please run @greptile review on the new exact head"),
+		comment("operator", "Greptile is still pending"),
+	})
+	if found || approved {
+		t.Fatalf("human Greptile mentions = (%t,%t), want no verdict", found, approved)
+	}
+
+	found, approved = greptileCommentDecision([]issueComment{
+		comment("greptile-app[bot]", "Not safe to merge"),
+		comment("kossoy", "@greptile review"),
+		comment("greptile-app[bot]", "Confidence Score: 4/5 — safe to merge"),
+	})
+	if !found || !approved {
+		t.Fatalf("latest Greptile bot verdict = (%t,%t), want approved", found, approved)
+	}
+}
+
 func TestHasGreptileInlineCommentOnHead(t *testing.T) {
 	makeComment := func(login, sha, body string) greptileReviewComment {
 		var c greptileReviewComment

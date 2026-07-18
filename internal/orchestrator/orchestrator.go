@@ -8195,6 +8195,13 @@ func (o *Orchestrator) revalidateSpawnRepairPR(target *state.SupervisorTarget) s
 			actionableReason = "current PR head has a merge conflict"
 		}
 	}
+	// A current-head CI run in progress is not repair authority. In particular,
+	// do not let a stale/legacy review verdict override that fresh pending state
+	// and spend another worker before the exact-head checks and review settle.
+	// A real merge conflict above remains immediately actionable.
+	if actionableReason == "" && ci == "pending" {
+		return spawnRepairGateDecision{stale: true, reason: "current PR head checks are pending; no repair is presently actionable"}
+	}
 
 	reviewPending := false
 	if actionableReason == "" {

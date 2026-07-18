@@ -2309,33 +2309,39 @@ commentFallback:
 		return false, false, fmt.Errorf("parse pr %d comments: %w", prNumber, err)
 	}
 
-	foundGreptile := false
-	for _, comment := range comments {
-		bodyLower := strings.ToLower(comment.Body)
-		if !strings.Contains(bodyLower, "greptile") {
-			continue
-		}
-
-		foundGreptile = true
-
-		if strings.Contains(bodyLower, "not safe to merge") || strings.Contains(bodyLower, "unsafe to merge") {
-			return false, false, nil
-		}
-
-		if strings.Contains(bodyLower, "safe to merge") {
-			return true, false, nil
-		}
-
-		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
-			return true, false, nil
-		}
-	}
-
+	foundGreptile, approved := greptileCommentDecision(comments)
 	if !foundGreptile {
 		return false, true, nil
 	}
+	return approved, false, nil
+}
 
-	return false, false, nil
+// greptileCommentDecision is the legacy comment-mode fallback. Only comments
+// authored by Greptile are verdicts: operator prompts such as "@greptile
+// review" or human status summaries must not turn a missing current-head check
+// into a false rejection. GitHub returns issue comments oldest-first, so the
+// latest bot verdict wins.
+func greptileCommentDecision(comments []issueComment) (found bool, approved bool) {
+	for i := len(comments) - 1; i >= 0; i-- {
+		comment := comments[i]
+		if !isGreptileLogin(comment.User.Login) {
+			continue
+		}
+		bodyLower := strings.ToLower(comment.Body)
+		if strings.Contains(bodyLower, "not safe to merge") || strings.Contains(bodyLower, "unsafe to merge") {
+			return true, false
+		}
+		if strings.Contains(bodyLower, "safe to merge") {
+			return true, true
+		}
+		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
+			return true, true
+		}
+		// A Greptile-authored comment without an approving phrase is still an
+		// authoritative non-pass in legacy comment mode.
+		return true, false
+	}
+	return false, false
 }
 
 func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved bool, pending bool) {

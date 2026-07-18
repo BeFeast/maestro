@@ -57,6 +57,38 @@ func TestSpawnRepairDispatch_CurrentPendingHeadStalesApprovalWithoutRespawn(t *t
 	}
 }
 
+func TestSpawnRepairDispatch_CurrentPendingHeadIgnoresStaleReviewFinding(t *testing.T) {
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg := cfgWithBackends("codex", "codex")
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, []github.Issue{makeIssue(7, "repair exact PR", "maestro-ready")})
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "pending", Complete: true}, nil
+	}
+	o.ghPRMergeStatusFn = func(int) (string, string, error) { return "MERGEABLE", "unstable", nil }
+	reviewReads := 0
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		reviewReads++
+		return github.ReviewGateVerdict{Passed: false}, nil
+	}
+	respawns := 0
+	o.respawnInPlaceFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+		respawns++
+		return nil
+	}
+
+	s := repairGateTestState(time.Now().UTC(), head)
+	o.startNewWorkers(s, 1)
+
+	if respawns != 0 || reviewReads != 0 || len(*freshStarts) != 0 {
+		t.Fatalf("pending head consumed stale review: respawns=%d reviewReads=%d fresh=%v", respawns, reviewReads, *freshStarts)
+	}
+	if got := approvalStatus(t, s, "repair-7"); got != state.ApprovalStatusStale {
+		t.Fatalf("repair approval = %q, want stale", got)
+	}
+}
+
 func TestSpawnRepairDispatch_HeadMoveStalesBoundApprovalBeforeReadingOldGates(t *testing.T) {
 	const oldHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const newHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
