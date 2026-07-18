@@ -53,97 +53,144 @@ func EvaluateOutcomeRecoveryOnce(cfg *config.Config, now time.Time) (bool, error
 	}
 
 	health := checkOutcomeForRecovery(context.Background(), brief)
-	st.OutcomeHealth = &health
 	if health.State == outcome.HealthHealthy {
-		markOutcomeRecoveryVerified(st, now)
-		if err := state.Save(cfg.StateDir, st); err != nil {
+		if err := state.Update(cfg.StateDir, func(latest *state.State) error {
+			if setOutcomeHealthIfNewer(latest, health) {
+				markOutcomeRecoveryVerified(latest, now)
+			}
+			return nil
+		}); err != nil {
 			return false, fmt.Errorf("outcome recovery: save healthy check: %w", err)
 		}
 		return true, nil
 	}
-
-	if recovery := st.OutcomeRecovery; recovery != nil {
-		if recovery.Status == outcome.RecoveryStatusExecuting {
-			// The process identity is deliberately not replayable. Once its bounded
-			// timeout elapsed, surface an uncertain receipt and wait for the health
-			// signal to prove whether the side effect landed.
-			if !recovery.StartedAt.IsZero() && now.After(recovery.StartedAt.Add(brief.EffectiveRecoveryTimeout()+time.Minute)) {
-				recovery.Status = outcome.RecoveryStatusUncertain
-				recovery.UpdatedAt = now
-				recovery.Summary = "outcome recovery process ended without a durable receipt; health verification remains authoritative"
-			}
-			if err := state.Save(cfg.StateDir, st); err != nil {
-				return false, fmt.Errorf("outcome recovery: save executing check: %w", err)
-			}
-			return true, nil
+	if health.State != outcome.HealthFailing {
+		if err := state.Update(cfg.StateDir, func(latest *state.State) error {
+			setOutcomeHealthIfNewer(latest, health)
+			return nil
+		}); err != nil {
+			return false, fmt.Errorf("outcome recovery: save non-failing check: %w", err)
 		}
-		if !recovery.NextEligibleAt.IsZero() && now.Before(recovery.NextEligibleAt) {
-			if err := state.Save(cfg.StateDir, st); err != nil {
-				return false, fmt.Errorf("outcome recovery: save cooldown check: %w", err)
-			}
-			return true, nil
-		}
+		return true, nil
 	}
 
-	attempts := 1
-	if st.OutcomeRecovery != nil {
-		attempts = st.OutcomeRecovery.Attempts + 1
-	}
-	attemptID := outcomeRecoveryAttemptID(cfg.StateDir, health.CheckedAt, attempts)
-	st.OutcomeRecovery = &outcome.RecoveryState{
-		AttemptID:        attemptID,
-		Status:           outcome.RecoveryStatusExecuting,
-		Attempts:         attempts,
-		TriggerCheckedAt: health.CheckedAt,
-		StartedAt:        now,
-		UpdatedAt:        now,
-		Summary:          "outcome recovery execution leased",
-	}
-	if err := state.Save(cfg.StateDir, st); err != nil {
+	claimed := false
+	attemptID := ""
+	if err := state.Update(cfg.StateDir, func(latest *state.State) error {
+		setOutcomeHealthIfNewer(latest, health)
+		if recovery := latest.OutcomeRecovery; recovery != nil {
+			if recovery.Status == outcome.RecoveryStatusExecuting {
+				// The process identity is deliberately not replayable. Once its bounded
+				// timeout elapsed, surface an uncertain receipt and wait for the health
+				// signal to prove whether the side effect landed.
+				if !recovery.StartedAt.IsZero() && now.After(recovery.StartedAt.Add(brief.EffectiveRecoveryTimeout()+time.Minute)) {
+					recovery.Status = outcome.RecoveryStatusUncertain
+					recovery.UpdatedAt = now
+					recovery.Summary = "outcome recovery process ended without a durable receipt; health verification remains authoritative"
+				}
+				return nil
+			}
+			if !recovery.NextEligibleAt.IsZero() && now.Before(recovery.NextEligibleAt) {
+				return nil
+			}
+		}
+
+		attempts := 1
+		if latest.OutcomeRecovery != nil {
+			attempts = latest.OutcomeRecovery.Attempts + 1
+		}
+		attemptID = outcomeRecoveryAttemptID(cfg.StateDir, health.CheckedAt, attempts)
+		latest.OutcomeRecovery = &outcome.RecoveryState{
+			AttemptID:        attemptID,
+			Status:           outcome.RecoveryStatusExecuting,
+			Attempts:         attempts,
+			TriggerCheckedAt: health.CheckedAt,
+			StartedAt:        now,
+			UpdatedAt:        now,
+			Summary:          "outcome recovery execution leased",
+		}
+		claimed = true
+		return nil
+	}); err != nil {
 		return false, fmt.Errorf("outcome recovery: persist execution lease: %w", err)
+	}
+	if !claimed {
+		return true, nil
 	}
 
 	log.Printf("[outcome/recovery] leased automatic recovery attempt %s after failing %s", attemptID, health.Signal)
 	execution := runOutcomeRecovery(context.Background(), brief)
-	latest, err := state.Load(cfg.StateDir)
-	if err != nil {
-		return true, fmt.Errorf("outcome recovery: reload after execution: %w", err)
+	finishedAt := execution.FinishedAt.UTC()
+	if finishedAt.IsZero() {
+		finishedAt = time.Now().UTC()
 	}
-	if latest.OutcomeRecovery == nil || latest.OutcomeRecovery.AttemptID != attemptID {
+	leaseLost := false
+	if err := state.Update(cfg.StateDir, func(latest *state.State) error {
+		if latest.OutcomeRecovery == nil || latest.OutcomeRecovery.AttemptID != attemptID {
+			leaseLost = true
+			return nil
+		}
+		code := execution.ExitCode
+		recovery := latest.OutcomeRecovery
+		recovery.ExitCode = &code
+		recovery.FinishedAt = finishedAt
+		recovery.UpdatedAt = finishedAt
+		recovery.NextEligibleAt = finishedAt.Add(brief.EffectiveRecoveryCooldown())
+		if execution.ExitCode != 0 {
+			recovery.Status = outcome.RecoveryStatusFailed
+			if execution.TimedOut {
+				recovery.Summary = "outcome recovery command timed out; retry held until cooldown"
+			} else {
+				recovery.Summary = "outcome recovery command failed; retry held until cooldown"
+			}
+			return nil
+		}
+		recovery.Status = outcome.RecoveryStatusVerificationPending
+		recovery.Summary = "outcome recovery command completed; awaiting authoritative health verification"
+		return nil
+	}); err != nil {
+		return true, fmt.Errorf("outcome recovery: persist execution receipt: %w", err)
+	}
+	if leaseLost {
 		return true, fmt.Errorf("outcome recovery: execution lease %s lost before receipt", attemptID)
 	}
-	code := execution.ExitCode
-	recovery := latest.OutcomeRecovery
-	recovery.ExitCode = &code
-	recovery.FinishedAt = execution.FinishedAt
-	recovery.UpdatedAt = execution.FinishedAt
-	recovery.NextEligibleAt = execution.FinishedAt.Add(brief.EffectiveRecoveryCooldown())
 	if execution.ExitCode != 0 {
-		recovery.Status = outcome.RecoveryStatusFailed
-		if execution.TimedOut {
-			recovery.Summary = "outcome recovery command timed out; retry held until cooldown"
-		} else {
-			recovery.Summary = "outcome recovery command failed; retry held until cooldown"
-		}
-		if err := state.Save(cfg.StateDir, latest); err != nil {
-			return true, fmt.Errorf("outcome recovery: save failed receipt: %w", err)
-		}
-		log.Printf("[outcome/recovery] attempt %s failed exit=%d; retry_at=%s", attemptID, execution.ExitCode, recovery.NextEligibleAt.Format(time.RFC3339))
+		log.Printf("[outcome/recovery] attempt %s failed exit=%d; retry_at=%s", attemptID, execution.ExitCode, finishedAt.Add(brief.EffectiveRecoveryCooldown()).Format(time.RFC3339))
 		return true, nil
 	}
 
-	recovery.Status = outcome.RecoveryStatusVerificationPending
-	recovery.Summary = "outcome recovery command completed; awaiting authoritative health verification"
 	verification := checkOutcomeForRecovery(context.Background(), brief)
-	latest.OutcomeHealth = &verification
-	if verification.State == outcome.HealthHealthy {
-		markOutcomeRecoveryVerified(latest, verification.CheckedAt)
-	}
-	if err := state.Save(cfg.StateDir, latest); err != nil {
+	leaseLost = false
+	if err := state.Update(cfg.StateDir, func(latest *state.State) error {
+		if latest.OutcomeRecovery == nil || latest.OutcomeRecovery.AttemptID != attemptID {
+			leaseLost = true
+			return nil
+		}
+		accepted := setOutcomeHealthIfNewer(latest, verification)
+		if accepted && verification.State == outcome.HealthHealthy {
+			markOutcomeRecoveryVerified(latest, verification.CheckedAt)
+		}
+		return nil
+	}); err != nil {
 		return true, fmt.Errorf("outcome recovery: save execution receipt: %w", err)
 	}
-	log.Printf("[outcome/recovery] attempt %s completed exit=0 verification=%s next_eligible_at=%s", attemptID, verification.State, recovery.NextEligibleAt.Format(time.RFC3339))
+	if leaseLost {
+		return true, fmt.Errorf("outcome recovery: execution lease %s lost before verification receipt", attemptID)
+	}
+	log.Printf("[outcome/recovery] attempt %s completed exit=0 verification=%s next_eligible_at=%s", attemptID, verification.State, finishedAt.Add(brief.EffectiveRecoveryCooldown()).Format(time.RFC3339))
 	return true, nil
+}
+
+func setOutcomeHealthIfNewer(st *state.State, health outcome.HealthCheckResult) bool {
+	if st == nil {
+		return false
+	}
+	if st.OutcomeHealth != nil && !health.CheckedAt.IsZero() && health.CheckedAt.Before(st.OutcomeHealth.CheckedAt) {
+		return false
+	}
+	copy := health
+	st.OutcomeHealth = &copy
+	return true
 }
 
 func markOutcomeRecoveryVerified(st *state.State, at time.Time) {

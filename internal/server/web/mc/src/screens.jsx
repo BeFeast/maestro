@@ -279,7 +279,7 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                 {(p.outcome?.checks || []).filter((check) => check.blocking || check.status !== "pass").map((check) => (
                   <div className="kv" key={check.name}>
                     <span>{check.name}</span>
-                    <span className="mono" title={check.summary || ""} style={{ color: check.status === "pass" ? "var(--ok)" : "var(--watch)" }}>{check.status}</span>
+                    <span className="mono" style={{ color: check.status === "pass" ? "var(--ok)" : "var(--watch)" }}>{check.status}</span>
                   </div>
                 ))}
                 {p.outcome?.recovery && (

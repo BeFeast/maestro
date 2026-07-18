@@ -107,13 +107,13 @@ func (c Checker) checkCommand(ctx context.Context, command, dir, signal string) 
 		summary := fmt.Sprintf("%s failed", signal)
 		if ctx.Err() == context.DeadlineExceeded {
 			summary = fmt.Sprintf("%s timed out after %s", signal, c.timeout().String())
-		} else if strings.TrimSpace(err.Error()) != "" {
-			summary = fmt.Sprintf("%s failed: %v", signal, err)
+		} else if exitCode >= 0 {
+			summary = fmt.Sprintf("%s failed with exit code %d", signal, exitCode)
 		}
 		if projectedSummary != "" {
 			summary = fmt.Sprintf("%s failed: %s", signal, projectedSummary)
 		}
-		result := c.result(start, signal, HealthFailing, summary, firstNonEmpty(projectedDetail, string(output)), exitCode)
+		result := c.result(start, signal, HealthFailing, summary, projectedDetail, exitCode)
 		result.Checks = checks
 		return result
 	}
@@ -199,12 +199,17 @@ func compactDetail(detail string) string {
 }
 
 type structuredHealthEnvelope struct {
-	Healthy *bool             `json:"healthy"`
-	Summary string            `json:"summary"`
-	Checks  []HealthCheckItem `json:"checks"`
+	Healthy *bool                   `json:"healthy"`
+	Checks  []structuredHealthCheck `json:"checks"`
 }
 
-var sensitiveHealthValue = regexp.MustCompile(`(?i)\b(token|password|secret|api[_-]?key|authorization)\b\s*[:=]\s*[^\s,;]+`)
+type structuredHealthCheck struct {
+	Name     string `json:"name"`
+	Blocking bool   `json:"blocking"`
+	Status   string `json:"status"`
+}
+
+var safeHealthCheckName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
 
 // projectStructuredHealth keeps only an allow-listed envelope from checker
 // JSON. Raw details and unknown fields are discarded so quota/token/credential
@@ -214,23 +219,16 @@ func projectStructuredHealth(output []byte) (checks []HealthCheckItem, detail, s
 	if err := json.Unmarshal(output, &envelope); err != nil || (envelope.Healthy == nil && len(envelope.Checks) == 0) {
 		return nil, "", "", nil
 	}
-	for _, item := range envelope.Checks {
-		item.Name = boundedHealthText(item.Name, 128)
-		item.Status = strings.ToLower(boundedHealthText(item.Status, 64))
-		item.Summary = boundedHealthText(item.Summary, 512)
-		if item.Name == "" || item.Status == "" {
-			continue
+	for _, raw := range envelope.Checks {
+		item := HealthCheckItem{
+			Name:     projectHealthCheckName(raw.Name),
+			Blocking: raw.Blocking,
+			Status:   projectHealthCheckStatus(raw.Status),
 		}
 		checks = append(checks, item)
 		if summary == "" && (item.Status == "fail" || item.Status == "failing" || item.Status == "error") {
-			summary = item.Summary
-			if summary == "" {
-				summary = item.Name + " reported " + item.Status
-			}
+			summary = item.Name + " reported " + item.Status
 		}
-	}
-	if summary == "" {
-		summary = boundedHealthText(envelope.Summary, 512)
 	}
 	if len(checks) > 0 {
 		projected, _ := json.Marshal(struct {
@@ -241,20 +239,19 @@ func projectStructuredHealth(output []byte) (checks []HealthCheckItem, detail, s
 	return checks, detail, summary, envelope.Healthy
 }
 
-func boundedHealthText(value string, limit int) string {
+func projectHealthCheckName(value string) string {
 	value = strings.TrimSpace(value)
-	value = sensitiveHealthValue.ReplaceAllString(value, "$1=[REDACTED]")
-	if limit > 0 && len(value) > limit {
-		value = value[:limit] + "…"
+	if !safeHealthCheckName.MatchString(value) {
+		return "structured-check"
 	}
 	return value
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
+func projectHealthCheckStatus(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "pass", "fail", "warning", "unknown", "error", "healthy", "failing":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "unknown"
 	}
-	return ""
 }

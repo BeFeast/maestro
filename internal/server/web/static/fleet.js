@@ -2196,7 +2196,7 @@ function outcomeHTML(project) {
       '<div class="outcome-line"><strong>Health</strong> ' + escapeText(health.replace(/_/g, " ")) + '</div>' +
       '<div class="outcome-line"><strong>Checked</strong> ' + escapeText(checked) + '</div>' +
       (summary ? '<div class="outcome-line"><strong>Signal</strong> ' + escapeText(summary) + '</div>' : "") +
-      checks.map(function(check) { return '<div class="outcome-line"><strong>' + escapeText(check.name || "check") + '</strong> ' + escapeText(check.status || "unknown") + (check.summary ? ' · ' + escapeText(check.summary) : '') + '</div>'; }).join("") +
+      checks.map(function(check) { return '<div class="outcome-line"><strong>' + escapeText(check.name || "check") + '</strong> ' + escapeText(check.status || "unknown") + '</div>'; }).join("") +
       (recovery ? '<div class="outcome-line"><strong>Recovery</strong> ' + escapeText(recovery.status || "unknown") + (recovery.summary ? ' · ' + escapeText(recovery.summary) : '') + '</div>' : "") +
       '<div class="outcome-line"><strong>Next</strong> ' + escapeText(next) + '</div>' +
     '</div></div>';

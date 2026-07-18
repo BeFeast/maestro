@@ -96,7 +96,6 @@ type HealthCheckItem struct {
 	Name     string `json:"name"`
 	Blocking bool   `json:"blocking,omitempty"`
 	Status   string `json:"status"`
-	Summary  string `json:"summary,omitempty"`
 }
 
 // HealthCheckResult is the durable result of a read-only runtime/deploy health
@@ -174,6 +173,9 @@ func (b Brief) Validate() error {
 	case RecoveryModeDisabled:
 		return nil
 	case RecoveryModeAutomatic:
+		if !b.Configured() {
+			return fmt.Errorf("outcome.recovery_mode automatic requires outcome.desired_outcome")
+		}
 		if !b.HasHealthSignal() {
 			return fmt.Errorf("outcome.recovery_mode automatic requires a health signal")
 		}
@@ -188,7 +190,7 @@ func (b Brief) Validate() error {
 
 func (b Brief) AutomaticRecoveryEnabled() bool {
 	b = b.Normalized()
-	return b.RecoveryMode == RecoveryModeAutomatic && b.RecoveryCommand != "" && b.HasHealthSignal()
+	return b.Configured() && b.RecoveryMode == RecoveryModeAutomatic && b.RecoveryCommand != "" && b.HasHealthSignal()
 }
 
 func (b Brief) EffectiveRecoveryInterval() time.Duration {

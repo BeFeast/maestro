@@ -2,6 +2,8 @@ package supervisor
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,6 +11,96 @@ import (
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/state"
 )
+
+func TestEvaluateOutcomeRecoveryOnce_ConcurrentEvaluatorsClaimOneLease(t *testing.T) {
+	cfg := recoveryTestConfig(t)
+	t0 := time.Date(2026, 7, 18, 7, 30, 0, 0, time.UTC)
+	if err := state.Save(cfg.StateDir, state.NewState()); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	originalCheck, originalRun := checkOutcomeForRecovery, runOutcomeRecovery
+	t.Cleanup(func() { checkOutcomeForRecovery, runOutcomeRecovery = originalCheck, originalRun })
+	checksReady := make(chan struct{}, 2)
+	releaseChecks := make(chan struct{})
+	var checkCalls atomic.Int32
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		call := checkCalls.Add(1)
+		if call <= 2 {
+			checksReady <- struct{}{}
+			<-releaseChecks
+			return outcome.HealthCheckResult{CheckedAt: t0, Signal: "healthcheck_command", State: outcome.HealthFailing}
+		}
+		return outcome.HealthCheckResult{CheckedAt: t0.Add(time.Minute), Signal: "healthcheck_command", State: outcome.HealthHealthy}
+	}
+	runStarted := make(chan struct{}, 1)
+	releaseRun := make(chan struct{})
+	var runCalls atomic.Int32
+	runOutcomeRecovery = func(_ context.Context, _ outcome.Brief) outcome.RecoveryExecution {
+		runCalls.Add(1)
+		runStarted <- struct{}{}
+		<-releaseRun
+		return outcome.RecoveryExecution{StartedAt: t0, FinishedAt: t0.Add(time.Second), ExitCode: 0}
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := EvaluateOutcomeRecoveryOnce(cfg, t0)
+			errs <- err
+		}()
+	}
+	<-checksReady
+	<-checksReady
+	close(releaseChecks)
+	<-runStarted
+	close(releaseRun)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent evaluator: %v", err)
+		}
+	}
+	if got := runCalls.Load(); got != 1 {
+		t.Fatalf("recovery command ran %d times, want one atomic lease winner", got)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if loaded.OutcomeRecovery == nil || loaded.OutcomeRecovery.Attempts != 1 {
+		t.Fatalf("recovery receipt = %+v, want exactly one attempt", loaded.OutcomeRecovery)
+	}
+}
+
+func TestEvaluateOutcomeRecoveryOnce_NonFailingHealthNeverRunsCommand(t *testing.T) {
+	cfg := recoveryTestConfig(t)
+	t0 := time.Date(2026, 7, 18, 7, 45, 0, 0, time.UTC)
+	if err := state.Save(cfg.StateDir, state.NewState()); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	originalCheck, originalRun := checkOutcomeForRecovery, runOutcomeRecovery
+	t.Cleanup(func() { checkOutcomeForRecovery, runOutcomeRecovery = originalCheck, originalRun })
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		return outcome.HealthCheckResult{CheckedAt: t0, Signal: "healthcheck_command", State: outcome.HealthUnknown}
+	}
+	runCalls := 0
+	runOutcomeRecovery = func(_ context.Context, _ outcome.Brief) outcome.RecoveryExecution {
+		runCalls++
+		return outcome.RecoveryExecution{}
+	}
+	if evaluated, err := EvaluateOutcomeRecoveryOnce(cfg, t0); err != nil || !evaluated {
+		t.Fatalf("evaluation: evaluated=%t err=%v", evaluated, err)
+	}
+	if runCalls != 0 {
+		t.Fatalf("unknown health launched recovery %d time(s)", runCalls)
+	}
+}
 
 func TestEvaluateOutcomeRecoveryOnce_LeasesRunsOnceAndVerifies(t *testing.T) {
 	cfg := recoveryTestConfig(t)
