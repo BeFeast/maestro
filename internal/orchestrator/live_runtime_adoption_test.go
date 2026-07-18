@@ -137,6 +137,7 @@ func TestSaveStatePreservingLiveRuntimeRecoversSameSessionConflict(t *testing.T)
 	run.TmuxSession = "maestro-slot-1"
 	run.StartedAt = now
 	concurrent.Sessions["slot-1"].LastNotifiedStatus = "concurrent-supervisor-observation"
+	concurrent.Sessions["slot-1"].MaintenanceRetryCount = 7
 	concurrent.LastRunOnceAt = now.Add(time.Minute)
 	if err := state.Save(stateDir, concurrent); err != nil {
 		t.Fatal(err)
@@ -158,6 +159,9 @@ func TestSaveStatePreservingLiveRuntimeRecoversSameSessionConflict(t *testing.T)
 	}
 	if got := loaded.Sessions["slot-1"]; got.Status != state.StatusRunning || got.PID != 6262 {
 		t.Fatalf("persisted runtime = %#v", got)
+	}
+	if got := loaded.Sessions["slot-1"].MaintenanceRetryCount; got != 7 {
+		t.Fatalf("concurrent non-runtime session field lost: maintenance_retry_count=%d", got)
 	}
 	if !loaded.LastRunOnceAt.Equal(now.Add(time.Minute)) {
 		t.Fatalf("concurrent heartbeat lost: %s", loaded.LastRunOnceAt)

@@ -3616,6 +3616,7 @@ func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
 					if current == nil || current.IssueNumber != runtime.IssueNumber || strings.TrimSpace(current.Branch) != strings.TrimSpace(runtime.Branch) || filepath.Clean(current.Worktree) != filepath.Clean(runtime.Worktree) {
 						continue
 					}
+					applyLiveRuntimeProjection(current, &runtime)
 				} else {
 					// A fresh spawn can be absent from the concurrently-written
 					// snapshot. Only accept its deterministic slot worktree; never
@@ -3624,9 +3625,9 @@ func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
 					if filepath.Clean(runtime.Worktree) != filepath.Clean(expected) {
 						continue
 					}
+					copy := runtime
+					latest.Sessions[slotName] = &copy
 				}
-				copy := runtime
-				latest.Sessions[slotName] = &copy
 				adopted++
 			}
 			if adopted == 0 {
@@ -3649,6 +3650,41 @@ func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
 		return nil
 	}
 	return nil
+}
+
+// applyLiveRuntimeProjection copies only fields owned by the external worker
+// launch/attempt. Concurrent supervisor fields on the same session (review
+// observations, retry accounting, PR identity, etc.) remain on current. This
+// narrow overlay is the critical distinction between recovering process truth
+// and replaying an entire stale orchestrator snapshot after a CAS conflict.
+func applyLiveRuntimeProjection(current, runtime *state.Session) {
+	if current == nil || runtime == nil {
+		return
+	}
+	current.PID = runtime.PID
+	current.TmuxSession = runtime.TmuxSession
+	current.LogFile = runtime.LogFile
+	current.StartedAt = runtime.StartedAt
+	current.FinishedAt = runtime.FinishedAt
+	current.WorkerEndedAt = runtime.WorkerEndedAt
+	current.Status = state.StatusRunning
+	current.Backend = runtime.Backend
+	current.Model = runtime.Model
+	current.CostUSDBackend = runtime.CostUSDBackend
+	current.UsageTokensWatermark = runtime.UsageTokensWatermark
+	current.TokensUsedAttempt = runtime.TokensUsedAttempt
+	current.WorkerOutcome = runtime.WorkerOutcome
+	current.Attribution = append([]state.BackendAttribution(nil), runtime.Attribution...)
+	current.NextRetryAt = runtime.NextRetryAt
+	current.RestartCheckpointAt = runtime.RestartCheckpointAt
+	current.LastOutputHash = runtime.LastOutputHash
+	current.LastOutputChangedAt = runtime.LastOutputChangedAt
+	current.LastNotifiedStatus = runtime.LastNotifiedStatus
+	current.NotifiedCIFail = runtime.NotifiedCIFail
+	if runtime.BackendSelection != nil {
+		selection := *runtime.BackendSelection
+		current.BackendSelection = &selection
+	}
 }
 
 // reconcilePushedBranch handles a stale running session whose worker died
