@@ -90,6 +90,42 @@ func trailerCount(msg string) int {
 	return strings.Count(msg, state.AttributionTrailerKey+":")
 }
 
+func TestEnsureAttributionTrailer_IgnoresOnlyPreservedUntrackedCheckpoint(t *testing.T) {
+	origin, wt, _, branch := setupAmendRepo(t)
+	checkpoint := filepath.Join(wt, "CHECKPOINT.md")
+	amendWrite(t, wt, "CHECKPOINT.md", "durable worker progress\n")
+	o := &Orchestrator{tmuxSessionExistsFn: func(string) bool { return false }}
+	sess := &state.Session{
+		Worktree: wt, Branch: branch, Attribution: testAttribution(), CheckpointFile: checkpoint,
+	}
+
+	if deferred := o.ensureAttributionTrailerOnBranch("slot-checkpoint", sess); deferred {
+		t.Fatal("exact untracked session checkpoint incorrectly deferred attribution")
+	}
+	if got, err := os.ReadFile(checkpoint); err != nil || string(got) != "durable worker progress\n" {
+		t.Fatalf("checkpoint was not preserved: content=%q err=%v", got, err)
+	}
+	headMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", branch)
+	if trailerCount(headMsg) != 1 {
+		t.Fatalf("remote trailer count = %d, want 1:\n%s", trailerCount(headMsg), headMsg)
+	}
+}
+
+func TestAmendHead_IgnoredCheckpointDoesNotHideOtherUntrackedWork(t *testing.T) {
+	origin, wt, _, branch := setupAmendRepo(t)
+	amendWrite(t, wt, "CHECKPOINT.md", "durable worker progress\n")
+	amendWrite(t, wt, "product-change.txt", "uncommitted product work\n")
+
+	err := amendHeadWithAttributionTrailer(wt, branch, testAttribution(), time.Now().UTC(), "CHECKPOINT.md")
+	if !errors.Is(err, errAmendWorktreeBusy) {
+		t.Fatalf("other untracked work must keep amend fail-closed, got %v", err)
+	}
+	headMsg := amendGit(t, origin, "log", "-1", "--pretty=%B", branch)
+	if strings.Contains(headMsg, state.AttributionTrailerKey+":") {
+		t.Fatalf("dirty product worktree was amended despite fail-closed guard:\n%s", headMsg)
+	}
+}
+
 // On a stale-info rejection, the amend re-fetches, re-applies the trailer onto
 // the commit the worker actually pushed, and retries — landing the trailer
 // exactly once without discarding the worker's concurrent commit.
