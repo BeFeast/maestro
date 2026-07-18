@@ -1068,6 +1068,59 @@ func TestDecide_SharedPRRepairUsesNewestUnblockedContinuation(t *testing.T) {
 	}
 }
 
+func TestDecide_LivePRWorkerDoesNotBlockIndependentGateRepair(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ReviewGate = "greptile"
+	cfg.AutoRetryReviewFeedback = true
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(406, "active repair", "maestro-ready"),
+			testIssue(412, "independent gate", "maestro-ready"),
+		},
+		prs: []github.PR{
+			{Number: 388, HeadRefName: "feat/active-repair", State: "OPEN", Mergeable: "MERGEABLE"},
+			{Number: 413, HeadRefName: "feat/independent-gate", State: "OPEN", Mergeable: "MERGEABLE"},
+		},
+		ciStatuses: map[int]string{388: "success", 413: "success"},
+		greptileOK: map[int]bool{388: false, 413: false},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PID: 1234,
+		PRNumber: 388, Branch: "feat/active-repair",
+		StartedAt: time.Date(2026, 7, 18, 3, 43, 0, 0, time.UTC),
+	}
+	st.Sessions["ok-player-305"] = &state.Session{
+		IssueNumber: 412, Status: state.StatusPROpen,
+		PRNumber: 413, Branch: "feat/independent-gate",
+		StartedAt: time.Date(2026, 7, 18, 2, 21, 0, 0, time.UTC),
+	}
+
+	eng := testEngine(cfg, reader)
+	findings := eng.detectPRStuckStates(st, reader.prs, newResolutionCache(eng.reader))
+	for _, finding := range findings {
+		if finding.Target != nil && finding.Target.PR == 388 {
+			t.Fatalf("live worker PR produced a separate stuck finding: %#v", finding)
+		}
+	}
+	stuck := requireStuckState(t, state.SupervisorDecision{StuckStates: findings}, "greptile_not_approved")
+	if stuck.Target == nil || stuck.Target.Issue != 412 || stuck.Target.Session != "ok-player-305" || stuck.Target.PR != 413 {
+		t.Fatalf("independent finding target = %#v, want issue #412 / ok-player-305 / PR #413", stuck.Target)
+	}
+
+	decision, err := eng.Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want %q; summary=%q", decision.RecommendedAction, ActionSpawnRepairWorker, decision.Summary)
+	}
+	if decision.Target == nil || decision.Target.Issue != 412 || decision.Target.Session != "ok-player-305" || decision.Target.PR != 413 {
+		t.Fatalf("decision target = %#v, want issue #412 / ok-player-305 / PR #413", decision.Target)
+	}
+}
+
 func TestDecide_FailingChecksExplained(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
