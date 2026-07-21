@@ -190,18 +190,23 @@ const (
 )
 
 type Session struct {
-	IssueNumber int           `json:"issue_number"`
-	IssueTitle  string        `json:"issue_title"`
-	Worktree    string        `json:"worktree"`
-	Branch      string        `json:"branch"`
-	PID         int           `json:"pid"`
-	TmuxSession string        `json:"tmux_session,omitempty"`
-	LogFile     string        `json:"log_file"`
-	StartedAt   time.Time     `json:"started_at"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	Status      SessionStatus `json:"status"`
-	PRNumber    int           `json:"pr_number,omitempty"`
-	Backend     string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	IssueNumber int       `json:"issue_number"`
+	IssueTitle  string    `json:"issue_title"`
+	Worktree    string    `json:"worktree"`
+	Branch      string    `json:"branch"`
+	PID         int       `json:"pid"`
+	TmuxSession string    `json:"tmux_session,omitempty"`
+	LogFile     string    `json:"log_file"`
+	StartedAt   time.Time `json:"started_at"`
+	// WorkerGeneration is the durable lease generation for the process that
+	// owns this canonical session. Every successful spawn, respawn, phase
+	// transition, or live-runtime adoption advances it. Destructive cleanup
+	// captures and revalidates this exact value before touching the worktree.
+	WorkerGeneration uint64        `json:"worker_generation,omitempty"`
+	FinishedAt       *time.Time    `json:"finished_at,omitempty"`
+	Status           SessionStatus `json:"status"`
+	PRNumber         int           `json:"pr_number,omitempty"`
+	Backend          string        `json:"backend,omitempty"` // "claude", "codex", etc.
 	// #730: model + self-reported cost captured from the backend's own
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the

@@ -23,6 +23,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // GitHubClient is the surface the executor needs from a GitHub client.
@@ -167,6 +168,12 @@ type Executor struct {
 	// State is optional for most actions. apply_lesson_proposal uses it to
 	// fetch the proposed rule and mark it applied after the gated append.
 	State *state.State
+
+	// Runtime probes are optional deterministic overrides for the exact worker
+	// lease checked by delete_worktree. Production defaults use worker/tmux
+	// liveness; tests can inject stable observations.
+	PIDAlive  func(int) bool
+	TmuxAlive func(string) bool
 
 	// locks serializes Execute(approval) per approval.ID within the same
 	// process. The second concurrent caller for the same ID returns
@@ -872,26 +879,73 @@ func (e *Executor) executeDeleteWorktree(approval *state.Approval) Result {
 	// When the approval lacks a target issue (rare; older approvals), or
 	// the session lookup is not wired, fall through to the previous
 	// behaviour to preserve compatibility.
+	var live *state.Session
 	if e.Sessions != nil && approval.Target.Issue > 0 {
-		if live, ok := e.Sessions.LookupSession(slot); ok && live != nil {
-			if live.IssueNumber != approval.Target.Issue {
+		if current, ok := e.Sessions.LookupSession(slot); ok && current != nil {
+			live = current
+			if current.IssueNumber != approval.Target.Issue {
 				return Result{
 					Status: state.ApprovalStatusExecutionFailed,
 					Summary: fmt.Sprintf(
 						"slot %s now bound to issue #%d (approval expected #%d) — refusing to delete a recycled worktree",
-						slot, live.IssueNumber, approval.Target.Issue,
+						slot, current.IssueNumber, approval.Target.Issue,
 					),
-					Err: fmt.Errorf("slot %s reused: live=#%d approval=#%d", slot, live.IssueNumber, approval.Target.Issue),
+					Err: fmt.Errorf("slot %s reused: live=#%d approval=#%d", slot, current.IssueNumber, approval.Target.Issue),
+				}
+			}
+			if current.Status == state.StatusRunning {
+				return Result{
+					Status: state.ApprovalStatusExecutionFailed,
+					Summary: fmt.Sprintf(
+						"slot %s holds a live %s session for issue #%d — refusing to delete a canonical worktree owned by an in-place repair worker",
+						slot, current.Status, approval.Target.Issue,
+					),
+					Err: fmt.Errorf("slot %s live: status=%s issue=#%d", slot, current.Status, approval.Target.Issue),
 				}
 			}
 		}
 	}
+	if e.State != nil && approval.Target.Issue > 0 {
+		if repair, ok := e.State.ApprovedRepairOwnsSession(slot, approval.Target.Issue, approval.Target.PR); ok {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("approved repair %s owns slot %s — refusing worktree deletion", repair.ID, slot),
+				Err:     fmt.Errorf("slot %s reserved by approved repair %s", slot, repair.ID),
+			}
+		}
+	}
 
-	if err := e.Worktrees.RemoveWorktree(e.Cfg.LocalPath, worktreePath); err != nil {
+	remove := func(localPath, path string) error {
+		return e.Worktrees.RemoveWorktree(localPath, path)
+	}
+	var removeErr error
+	if live != nil && strings.TrimSpace(live.Worktree) != "" && filepath.Clean(live.Worktree) == filepath.Clean(worktreePath) && e.State != nil {
+		lease := worker.CaptureCleanupLease(slot, live)
+		removeErr = worker.CleanupLeasedWorktree(
+			e.Cfg,
+			e.State,
+			lease,
+			worker.CleanupProbes{PIDAlive: e.PIDAlive, TmuxAlive: e.TmuxAlive},
+			worker.CleanupPolicy{},
+			worker.CleanupHooks{Remove: remove},
+		)
+	} else {
+		removeErr = state.WithSessionLease(e.Cfg.StateDir, slot, func() error {
+			if e.Sessions != nil && approval.Target.Issue > 0 {
+				if current, ok := e.Sessions.LookupSession(slot); ok && current != nil {
+					if current.IssueNumber != approval.Target.Issue || current.Status == state.StatusRunning {
+						return fmt.Errorf("slot %s changed or is running", slot)
+					}
+				}
+			}
+			return remove(e.Cfg.LocalPath, worktreePath)
+		})
+	}
+	if removeErr != nil {
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
-			Summary: fmt.Sprintf("delete worktree %s: %v", worktreePath, err),
-			Err:     fmt.Errorf("delete worktree %s: %w", worktreePath, err),
+			Summary: fmt.Sprintf("delete worktree %s: %v", worktreePath, removeErr),
+			Err:     fmt.Errorf("delete worktree %s: %w", worktreePath, removeErr),
 		}
 	}
 	return Result{
