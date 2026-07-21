@@ -148,9 +148,9 @@ type Orchestrator struct {
 	// restart. In-flight workers are unaffected — this gate only refuses NEW work.
 	emergencyHaltFn func() bool
 
-	// Restart-required signal. Some config fields (model.default, routing.*) cannot
-	// be hot-applied because the backend router is built once at startup. When such a
-	// field changes during a config reload we do not apply it; instead we raise this
+	// Restart-required signal. Some config fields (currently routing.*) cannot be
+	// hot-applied because their runtime components are built once at startup. When
+	// such a field changes during a config reload we do not apply it; instead we raise this
 	// persistent flag so a long-running daemon surfaces "restart required" in
 	// `maestro status` and the Fleet API instead of silently ignoring the change.
 	restartRequired       bool
@@ -1610,7 +1610,7 @@ func (o *Orchestrator) runAfterRunHook(sess *state.Session) {
 // It skips backends that are already in sess.TriedBackends or match the current backend.
 // Returns "" if no fallback is available.
 func (o *Orchestrator) nextFallbackBackend(sess *state.Session) string {
-	fallbacks := o.cfg.Model.FallbackBackends
+	fallbacks := o.cfg.Model.FallbackCandidates(sess.Backend)
 	if len(fallbacks) == 0 {
 		return ""
 	}
@@ -3001,7 +3001,6 @@ func (o *Orchestrator) compactTerminalSessionsOnStartup() {
 }
 
 // reloadConfig applies non-destructive config changes at runtime.
-// Fields that require a restart (repo, model.default) are logged as warnings.
 func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker) {
 	old := o.cfg
 	var changed []string
@@ -3011,15 +3010,13 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		log.Printf("[orch] config reload: repo changed (%s → %s) — requires restart", old.Repo, newCfg.Repo)
 	}
 
-	// model.default and routing.* select the backend router, which is constructed
-	// once at startup and is not safe to re-init mid-flight. Detect a change against
-	// the live (startup) config, do NOT apply it, and raise a persistent
-	// restart-required signal so the operator sees it in `maestro status` / Fleet API
-	// rather than only a one-time log line. Keep o.cfg.Model/Routing unchanged so the
-	// warning keeps firing on every subsequent reload while the config still differs.
-	if newCfg.Model.Default != old.Model.Default {
-		o.markRestartRequired(fmt.Sprintf("model.default changed (%s → %s)", old.Model.Default, newCfg.Model.Default))
-		log.Printf("[orch] config reload: model.default changed (%s → %s) — requires restart (not applied)", old.Model.Default, newCfg.Model.Default)
+	// The router keeps a pointer to o.cfg, so the complete model selector can be
+	// swapped live without reconstructing the orchestrator. Apply backend
+	// definitions with the route so a lane added in the same edit is dispatchable.
+	if !reflect.DeepEqual(newCfg.Model, old.Model) {
+		changed = append(changed, fmt.Sprintf("model policy: %s→%s",
+			old.Model.ResolvedRoute().SelectionReason, newCfg.Model.ResolvedRoute().SelectionReason))
+		o.cfg.Model = cloneModelConfig(newCfg.Model)
 	}
 	if !reflect.DeepEqual(newCfg.Routing, old.Routing) {
 		o.markRestartRequired(fmt.Sprintf("routing.* changed (router_model %s → %s, mode %s → %s)",
@@ -3155,6 +3152,50 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		return
 	}
 	log.Printf("[orch] config reloaded — changed: %s", strings.Join(changed, ", "))
+}
+
+func cloneModelConfig(in config.ModelConfig) config.ModelConfig {
+	out := in
+	out.FallbackBackends = append([]string(nil), in.FallbackBackends...)
+	out.ProviderLanes = make([]config.ProviderLane, len(in.ProviderLanes))
+	for i, lane := range in.ProviderLanes {
+		out.ProviderLanes[i] = lane
+		out.ProviderLanes[i].FallbackBackends = append([]string(nil), lane.FallbackBackends...)
+	}
+	out.Backends = make(map[string]config.BackendDef, len(in.Backends))
+	for name, def := range in.Backends {
+		if def.Enabled != nil {
+			enabled := *def.Enabled
+			def.Enabled = &enabled
+		}
+		def.ExtraArgs = append([]string(nil), def.ExtraArgs...)
+		def.UsageLimitPatterns = append([]string(nil), def.UsageLimitPatterns...)
+		def.MCP.Configs = append([]string(nil), def.MCP.Configs...)
+		if def.MCP.Servers != nil {
+			servers := make(map[string]config.MCPServerDef, len(def.MCP.Servers))
+			for serverName, server := range def.MCP.Servers {
+				server.Args = append([]string(nil), server.Args...)
+				server.AllowedTools = append([]string(nil), server.AllowedTools...)
+				server.Env = cloneStringMap(server.Env)
+				server.Headers = cloneStringMap(server.Headers)
+				servers[serverName] = server
+			}
+			def.MCP.Servers = servers
+		}
+		out.Backends[name] = def
+	}
+	return out
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 // markRestartRequired records a persistent restart-required signal both in memory
@@ -8218,7 +8259,7 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 
 	backend := strings.TrimSpace(sess.Backend)
 	if backend == "" {
-		backend = o.cfg.Model.Default
+		backend = o.cfg.Model.EffectiveDefault()
 	}
 	previousBackend := backend
 	// A current model:<backend> label is an explicit operator routing decision
@@ -9294,9 +9335,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				sess.BackendSelection = sel
 			} else {
 				sess.BackendSelection = &state.BackendSelection{
-					SelectedBackend: backendName,
-					SelectionReason: backendReason,
-					TaskType:        taskType,
+					SelectedBackend:      backendName,
+					SelectionReason:      backendReason,
+					RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
+					TaskType:             taskType,
 				}
 			}
 			if taskType != "" && len(sess.Attribution) > 0 {

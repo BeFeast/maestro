@@ -130,6 +130,51 @@ func TestResolveDispatchBackend_ModelCooldownLeavesOtherProviderModelEligible(t 
 	}
 }
 
+func TestProviderLaneFallback_ClaudeUnavailableThenSOLModelCooldownThenGPT55(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "anthropic", Default: "claude"},
+			{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+		},
+		Backends: map[string]config.BackendDef{
+			"claude": {Cmd: "claude", Provider: "anthropic", Model: "fable-5", Effort: "high"},
+			"sol":    {Cmd: "codex", Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+			"gpt55":  {Cmd: "codex", Provider: "openai", Model: "gpt-5.5", Effort: "high"},
+		},
+	}}
+	o := &Orchestrator{cfg: cfg}
+	now := time.Now().UTC()
+	st := state.NewState()
+
+	first := o.selectBackendFallback(st, &state.Session{
+		Backend:       "claude",
+		TriedBackends: []string{"claude"},
+	}, now, selectionReasonModelUnavailableFallback)
+	if first.SelectedBackend != "sol" || first.RouteSelectionReason != config.ModelRouteProviderLanes {
+		t.Fatalf("claude fallback = %+v, want sol via provider_lanes", first)
+	}
+
+	retryAfter := now.Add(10 * time.Minute)
+	st.ProviderModelHealth["openai"] = map[string]state.BackendHealth{
+		"gpt-5.6-sol": {
+			State:      state.BackendHealthCooldown,
+			Reason:     state.BackendBlockModelCooldown,
+			RetryAfter: &retryAfter,
+		},
+	}
+	second := o.selectBackendFallback(st, &state.Session{
+		Backend:       "sol",
+		TriedBackends: []string{"claude", "sol"},
+	}, now, selectionReasonModelCooldownFallback)
+	if second.SelectedBackend != "gpt55" {
+		t.Fatalf("SOL fallback = %+v, want gpt55", second)
+	}
+	if len(second.CandidateScores) != 1 || second.CandidateScores[0].Backend != "gpt55" || !second.CandidateScores[0].Available {
+		t.Fatalf("GPT-5.5 candidate = %+v, want available despite SOL model cooldown", second.CandidateScores)
+	}
+}
+
 func TestClassifyBackendFailure_SingleCredentialRotationDoesNotGateRoute(t *testing.T) {
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "worker.log")
