@@ -118,9 +118,10 @@ type Status struct {
 // output safe to persist and render. Unknown fields and raw details are
 // intentionally discarded.
 type HealthCheckItem struct {
-	Name     string `json:"name"`
-	Blocking bool   `json:"blocking,omitempty"`
-	Status   string `json:"status"`
+	Name       string `json:"name"`
+	Blocking   bool   `json:"blocking,omitempty"`
+	Status     string `json:"status"`
+	DeadlineAt string `json:"deadline_at,omitempty"`
 }
 
 // HealthCheckResult is the durable result of a read-only runtime/deploy health

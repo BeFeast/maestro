@@ -245,6 +245,42 @@ func TestEvaluateOutcomeRecoveryOnce_ExecutingLeaseNeverReplays(t *testing.T) {
 	if loaded.OutcomeRecovery.Status != outcome.RecoveryStatusUncertain || runCalls != 0 {
 		t.Fatalf("stale lease=%+v runCalls=%d, want uncertain/no replay", loaded.OutcomeRecovery, runCalls)
 	}
+
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		return outcome.HealthCheckResult{CheckedAt: t0.Add(8 * time.Minute), Signal: "healthcheck_command", State: outcome.HealthFailing}
+	}
+	if _, err := EvaluateOutcomeRecoveryOnce(cfg, t0.Add(8*time.Minute)); err != nil {
+		t.Fatalf("evaluate unchanged uncertain failure: %v", err)
+	}
+	loaded, _ = state.Load(cfg.StateDir)
+	if loaded.OutcomeRecovery.Status != outcome.RecoveryStatusUncertain || runCalls != 0 {
+		t.Fatalf("uncertain lease replayed on a later cycle: receipt=%+v runCalls=%d", loaded.OutcomeRecovery, runCalls)
+	}
+
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		return outcome.HealthCheckResult{CheckedAt: t0.Add(10 * time.Minute), Signal: "healthcheck_command", State: outcome.HealthHealthy}
+	}
+	if _, err := EvaluateOutcomeRecoveryOnce(cfg, t0.Add(10*time.Minute)); err != nil {
+		t.Fatalf("evaluate authoritative healthy result: %v", err)
+	}
+	loaded, _ = state.Load(cfg.StateDir)
+	if loaded.OutcomeRecovery.Status != outcome.RecoveryStatusVerified || runCalls != 0 {
+		t.Fatalf("healthy check did not clear uncertain fence: receipt=%+v runCalls=%d", loaded.OutcomeRecovery, runCalls)
+	}
+
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		return outcome.HealthCheckResult{CheckedAt: t0.Add(12 * time.Minute), Signal: "healthcheck_command", State: outcome.HealthFailing}
+	}
+	runOutcomeRecovery = func(_ context.Context, _ outcome.Brief) outcome.RecoveryExecution {
+		runCalls++
+		return outcome.RecoveryExecution{StartedAt: t0.Add(12 * time.Minute), FinishedAt: t0.Add(12*time.Minute + time.Second), ExitCode: 7}
+	}
+	if _, err := EvaluateOutcomeRecoveryOnce(cfg, t0.Add(12*time.Minute)); err != nil {
+		t.Fatalf("evaluate new post-healthy failure: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("verified receipt blocked a later failure: runCalls=%d, want 1", runCalls)
+	}
 }
 
 func TestEvaluateOutcomeRecoveryOnce_FailedCommandHonorsCooldown(t *testing.T) {
