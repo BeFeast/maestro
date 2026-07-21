@@ -882,8 +882,11 @@ function mapEffectivePipeline(raw) {
   });
   return {
     planner: role(raw?.planner || {}),
+    advisor: role(raw?.advisor || {}),
     implementer: role(raw?.implementer || {}),
     validator: role(raw?.validator || {}),
+    advisorReviewRounds: Number(raw?.advisor_review_rounds || 0),
+    advisorBestEffort: raw?.advisor_best_effort === true,
   };
 }
 
@@ -1018,6 +1021,37 @@ function mapWorker(worker) {
     stuck: taxonomy.section === "stuck",
     stuckReason: taxonomy.section === "stuck" ? worker.status_reason || status : "",
     backendDrift: mapBackendDrift(worker.backend_drift),
+    advisor: mapAdvisor(worker),
+  };
+}
+
+export function mapAdvisor(worker) {
+  if (!worker || !(worker.advisor_backend || worker.advisor_verdict || worker.advisor_terminal_reason || worker.advisor_review_round || worker.phase === "advisor")) {
+    return null;
+  }
+  return {
+    phase: String(worker.phase || ""),
+    planVersion: Number(worker.plan_version || 0),
+    reviewRound: Number(worker.advisor_review_round || 0),
+    maxReviewRounds: Number(worker.advisor_max_review_rounds || 0),
+    backend: String(worker.advisor_backend || ""),
+    model: String(worker.advisor_model || ""),
+    verdict: String(worker.advisor_verdict || ""),
+    unresolvedFindings: String(worker.advisor_unresolved_findings || ""),
+    terminalReason: String(worker.advisor_terminal_reason || ""),
+    bestEffort: worker.advisor_best_effort === true,
+    bypassed: worker.advisor_bypassed === true,
+    reviews: Array.isArray(worker.advisor_reviews) ? worker.advisor_reviews.map(review => ({
+      planVersion: Number(review?.plan_version || 0),
+      reviewRound: Number(review?.review_round || 0),
+      backend: String(review?.backend || ""),
+      model: String(review?.model || ""),
+      verdict: String(review?.verdict || ""),
+      findings: String(review?.findings || ""),
+      terminalReason: String(review?.terminal_reason || ""),
+      bypassed: review?.bypassed === true,
+      reviewedAt: String(review?.reviewed_at || ""),
+    })) : [],
   };
 }
 

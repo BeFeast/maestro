@@ -1544,9 +1544,12 @@ type fleetEffectiveRoutingTier struct {
 }
 
 type fleetEffectivePipeline struct {
-	Planner     fleetEffectivePipelineRole `json:"planner"`
-	Implementer fleetEffectivePipelineRole `json:"implementer"`
-	Validator   fleetEffectivePipelineRole `json:"validator"`
+	Planner             fleetEffectivePipelineRole `json:"planner"`
+	Advisor             fleetEffectivePipelineRole `json:"advisor"`
+	Implementer         fleetEffectivePipelineRole `json:"implementer"`
+	Validator           fleetEffectivePipelineRole `json:"validator"`
+	AdvisorReviewRounds int                        `json:"advisor_review_rounds,omitempty"`
+	AdvisorBestEffort   bool                       `json:"advisor_best_effort,omitempty"`
 }
 
 type fleetEffectivePipelineRole struct {
@@ -1786,7 +1789,19 @@ type fleetWorkerState struct {
 	Backend        string `json:"backend,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
-	Model string `json:"model,omitempty"`
+	Model                     string                `json:"model,omitempty"`
+	Phase                     string                `json:"phase,omitempty"`
+	PlanVersion               int                   `json:"plan_version,omitempty"`
+	AdvisorReviewRound        int                   `json:"advisor_review_round,omitempty"`
+	AdvisorMaxReviewRounds    int                   `json:"advisor_max_review_rounds,omitempty"`
+	AdvisorBackend            string                `json:"advisor_backend,omitempty"`
+	AdvisorModel              string                `json:"advisor_model,omitempty"`
+	AdvisorVerdict            string                `json:"advisor_verdict,omitempty"`
+	AdvisorUnresolvedFindings string                `json:"advisor_unresolved_findings,omitempty"`
+	AdvisorTerminalReason     string                `json:"advisor_terminal_reason,omitempty"`
+	AdvisorBestEffort         bool                  `json:"advisor_best_effort,omitempty"`
+	AdvisorBypassed           bool                  `json:"advisor_bypassed,omitempty"`
+	AdvisorReviews            []state.AdvisorReview `json:"advisor_reviews,omitempty"`
 	// BackendSelection records why this backend was chosen (label, role, auto,
 	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
@@ -4075,9 +4090,12 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			},
 		},
 		Pipeline: fleetEffectivePipeline{
-			Planner:     fleetEffectivePipelineRoleFrom(cfg.Pipeline.Planner),
-			Implementer: fleetEffectivePipelineRoleFrom(cfg.Pipeline.Implementer),
-			Validator:   fleetEffectivePipelineRoleFrom(cfg.Pipeline.Validator),
+			Planner:             fleetEffectivePipelineRoleFrom(cfg.Pipeline.Planner),
+			Advisor:             fleetEffectivePipelineRoleFrom(cfg.Pipeline.Advisor),
+			Implementer:         fleetEffectivePipelineRoleFrom(cfg.Pipeline.Implementer),
+			Validator:           fleetEffectivePipelineRoleFrom(cfg.Pipeline.Validator),
+			AdvisorReviewRounds: cfg.Pipeline.EffectiveAdvisorReviewRounds(),
+			AdvisorBestEffort:   cfg.Pipeline.AdvisorBestEffort,
 		},
 		MaxParallel: cfg.MaxParallel,
 		ReviewGate:  strings.TrimSpace(cfg.ReviewGate),
@@ -5416,56 +5434,68 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		tokenBudgetMeasure = "uncached_tokens"
 	}
 	return fleetWorkerState{
-		ProjectName:            project.Name,
-		ProjectRepo:            project.Repo,
-		DashboardURL:           project.DashboardURL,
-		Slot:                   worker.Slot,
-		IssueNumber:            worker.IssueNumber,
-		IssueTitle:             worker.IssueTitle,
-		IssueURL:               worker.IssueURL,
-		Status:                 worker.Status,
-		DisplayStatus:          worker.DisplayStatus,
-		StatusReason:           worker.StatusReason,
-		NextAction:             worker.NextAction,
-		NeedsAttention:         worker.NeedsAttention,
-		Live:                   worker.Live,
-		Backend:                worker.Backend,
-		Model:                  worker.Model,
-		BackendSelection:       worker.BackendSelection,
-		PRNumber:               worker.PRNumber,
-		PRURL:                  worker.PRURL,
-		TokensUsedAttempt:      worker.TokensUsedAttempt,
-		TokensUsedTotal:        worker.TokensUsedTotal,
-		WorkerMaxTokens:        project.EffectiveConfig.CostCaps.WorkerMaxTokens,
-		TokenBudgetMeasure:     tokenBudgetMeasure,
-		WorkerOutcome:          worker.WorkerOutcome,
-		CostUSDEstimate:        worker.CostUSDEstimate,
-		CostUSDBackend:         worker.CostUSDBackend,
-		Runtime:                worker.Runtime,
-		RuntimeSeconds:         worker.RuntimeSeconds,
-		WorkerRuntime:          worker.WorkerRuntime,
-		WorkerRuntimeSeconds:   worker.WorkerRuntimeSeconds,
-		WorkflowRuntime:        worker.WorkflowRuntime,
-		WorkflowRuntimeSeconds: worker.WorkflowRuntimeSeconds,
-		PROpenRuntime:          worker.PROpenRuntime,
-		PROpenRuntimeSeconds:   worker.PROpenRuntimeSeconds,
-		StartedAt:              worker.StartedAt,
-		WorkerGeneration:       worker.WorkerGeneration,
-		FinishedAt:             worker.FinishedAt,
-		WorkerEndedAt:          worker.WorkerEndedAt,
-		PROpenedAt:             worker.PROpenedAt,
-		NextRetryAt:            worker.NextRetryAt,
-		PID:                    worker.PID,
-		Alive:                  worker.Alive,
-		Worktree:               worker.Worktree,
-		Branch:                 worker.Branch,
-		TmuxSession:            worker.TmuxSession,
-		HasLog:                 worker.HasLog,
-		RetryCount:             worker.RetryCount,
-		LastNotification:       worker.LastNotification,
-		Attribution:            worker.Attribution,
-		BackendDrift:           worker.BackendDrift,
-		Actions:                worker.Actions,
+		ProjectName:               project.Name,
+		ProjectRepo:               project.Repo,
+		DashboardURL:              project.DashboardURL,
+		Slot:                      worker.Slot,
+		IssueNumber:               worker.IssueNumber,
+		IssueTitle:                worker.IssueTitle,
+		IssueURL:                  worker.IssueURL,
+		Status:                    worker.Status,
+		DisplayStatus:             worker.DisplayStatus,
+		StatusReason:              worker.StatusReason,
+		NextAction:                worker.NextAction,
+		NeedsAttention:            worker.NeedsAttention,
+		Live:                      worker.Live,
+		Backend:                   worker.Backend,
+		Model:                     worker.Model,
+		Phase:                     worker.Phase,
+		PlanVersion:               worker.PlanVersion,
+		AdvisorReviewRound:        worker.AdvisorReviewRound,
+		AdvisorMaxReviewRounds:    worker.AdvisorMaxReviewRounds,
+		AdvisorBackend:            worker.AdvisorBackend,
+		AdvisorModel:              worker.AdvisorModel,
+		AdvisorVerdict:            worker.AdvisorVerdict,
+		AdvisorUnresolvedFindings: worker.AdvisorUnresolvedFindings,
+		AdvisorTerminalReason:     worker.AdvisorTerminalReason,
+		AdvisorBestEffort:         worker.AdvisorBestEffort,
+		AdvisorBypassed:           worker.AdvisorBypassed,
+		AdvisorReviews:            append([]state.AdvisorReview(nil), worker.AdvisorReviews...),
+		BackendSelection:          worker.BackendSelection,
+		PRNumber:                  worker.PRNumber,
+		PRURL:                     worker.PRURL,
+		TokensUsedAttempt:         worker.TokensUsedAttempt,
+		TokensUsedTotal:           worker.TokensUsedTotal,
+		WorkerMaxTokens:           project.EffectiveConfig.CostCaps.WorkerMaxTokens,
+		TokenBudgetMeasure:        tokenBudgetMeasure,
+		WorkerOutcome:             worker.WorkerOutcome,
+		CostUSDEstimate:           worker.CostUSDEstimate,
+		CostUSDBackend:            worker.CostUSDBackend,
+		Runtime:                   worker.Runtime,
+		RuntimeSeconds:            worker.RuntimeSeconds,
+		WorkerRuntime:             worker.WorkerRuntime,
+		WorkerRuntimeSeconds:      worker.WorkerRuntimeSeconds,
+		WorkflowRuntime:           worker.WorkflowRuntime,
+		WorkflowRuntimeSeconds:    worker.WorkflowRuntimeSeconds,
+		PROpenRuntime:             worker.PROpenRuntime,
+		PROpenRuntimeSeconds:      worker.PROpenRuntimeSeconds,
+		StartedAt:                 worker.StartedAt,
+		WorkerGeneration:          worker.WorkerGeneration,
+		FinishedAt:                worker.FinishedAt,
+		WorkerEndedAt:             worker.WorkerEndedAt,
+		PROpenedAt:                worker.PROpenedAt,
+		NextRetryAt:               worker.NextRetryAt,
+		PID:                       worker.PID,
+		Alive:                     worker.Alive,
+		Worktree:                  worker.Worktree,
+		Branch:                    worker.Branch,
+		TmuxSession:               worker.TmuxSession,
+		HasLog:                    worker.HasLog,
+		RetryCount:                worker.RetryCount,
+		LastNotification:          worker.LastNotification,
+		Attribution:               worker.Attribution,
+		BackendDrift:              worker.BackendDrift,
+		Actions:                   worker.Actions,
 	}
 }
 
