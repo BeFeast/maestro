@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/emergencystore"
+	"github.com/befeast/maestro/internal/notify"
 )
 
 // fakeEmergencySwitch is an in-memory EmergencySwitch for the endpoint tests.
@@ -31,7 +32,10 @@ func (f *fakeEmergencySwitch) Get(_ context.Context) (emergencystore.State, erro
 	return f.st, nil
 }
 
-type fakeEmergencyNotifier struct{ msgs []string }
+type fakeEmergencyNotifier struct {
+	msgs   []string
+	alerts []notify.AlertClass
+}
 
 func (f *fakeEmergencyNotifier) Sendf(format string, args ...any) {
 	f.msgs = append(f.msgs, format)
@@ -40,6 +44,11 @@ func (f *fakeEmergencyNotifier) Sendf(format string, args ...any) {
 			f.msgs[len(f.msgs)-1] = s
 		}
 	}
+}
+
+func (f *fakeEmergencyNotifier) Alert(class notify.AlertClass, _, _, _ string) error {
+	f.alerts = append(f.alerts, class)
+	return nil
 }
 
 // TestFleetAPIExposesEmergencyBlock pins #840: GET /api/v1/fleet always carries

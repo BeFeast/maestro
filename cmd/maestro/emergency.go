@@ -210,16 +210,22 @@ func emergencyConfigs(ef *emergencyFlags) []*config.Config {
 	return cfgs
 }
 
-// notifyEmergency sends the notify_red-grade alert from the first project with a
-// Telegram target. Best-effort: the switch is already written; a notification
-// failure only logs.
+// notifyEmergency sends the notify_red-grade alert from the first project that
+// configures a notification channel (Telegram target or the ntfy transport).
+// Best-effort: the switch is already written; a notification failure only logs.
 func notifyEmergency(ef *emergencyFlags, msg string) {
 	for _, cfg := range emergencyConfigs(ef) {
-		if cfg == nil || strings.TrimSpace(cfg.Telegram.Target) == "" {
+		if cfg == nil || (strings.TrimSpace(cfg.Telegram.Target) == "" && !cfg.Notify.Ntfy.Enabled()) {
 			continue
 		}
 		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+		n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
 		n.Sendf("%s", msg)
+		// Fan the notify_red-grade alert to ntfy (#1018). Keyed by message so a
+		// repeated identical emergency state does not re-notify.
+		if err := n.Alert(notify.AlertEmergency, "emergency", "maestro emergency", msg); err != nil {
+			log.Printf("[emergency] ntfy alert failed: %v", err)
+		}
 		return
 	}
 }
