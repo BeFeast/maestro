@@ -2699,9 +2699,15 @@ func (o *Orchestrator) RunOnce() error {
 
 	if slots > 0 {
 		o.startNewWorkers(s, slots)
-		if err := o.saveStatePreservingLiveRuntime(s); err != nil {
-			return fmt.Errorf("save state after workers: %w", err)
-		}
+	}
+
+	// Step 5b: persist the machine-readable top-level dispatch hold and the
+	// two-cycle idle-stall debounce after fresh dispatch had its chance to
+	// create a live worker. This also records gate-bound and paused cycles where
+	// slots==0 and startNewWorkers was intentionally skipped.
+	o.reconcileDispatchVisibility(s, time.Now().UTC())
+	if err := o.saveStatePreservingLiveRuntime(s); err != nil {
+		return fmt.Errorf("save state after dispatch visibility: %w", err)
 	}
 
 	// Step 6: Reconcile project board — mirror Maestro session state onto the
