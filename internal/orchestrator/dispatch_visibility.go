@@ -196,7 +196,7 @@ func (o *Orchestrator) allDispatchBackendsCoolingDown(s *state.State, now time.T
 	if o == nil || o.cfg == nil {
 		return false, nil
 	}
-	candidates := o.dispatchBackendCandidates()
+	candidates := o.dispatchBackendCandidates("")
 	if len(candidates) == 0 {
 		return false, nil
 	}

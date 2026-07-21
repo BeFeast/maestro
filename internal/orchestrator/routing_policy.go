@@ -83,13 +83,14 @@ func (o *Orchestrator) tierOverrideConfigForSession(sess *state.Session) *config
 // placeholders for the policy path).
 func (o *Orchestrator) policyBackendSelection(decision router.BackendDecision) *state.BackendSelection {
 	sel := &state.BackendSelection{
-		SelectedBackend: decision.Backend,
-		SelectionReason: decision.Reason,
-		TaskType:        decision.TaskType,
-		Tier:            decision.Tier,
-		Effort:          decision.Effort,
-		Model:           decision.Model,
-		ShadowTier:      decision.ShadowTier,
+		SelectedBackend:      decision.Backend,
+		SelectionReason:      decision.Reason,
+		RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
+		TaskType:             decision.TaskType,
+		Tier:                 decision.Tier,
+		Effort:               decision.Effort,
+		Model:                decision.Model,
+		ShadowTier:           decision.ShadowTier,
 	}
 	if decision.Tier != "" {
 		sel.CandidateScores = o.policyCandidateScores(decision.Tier)

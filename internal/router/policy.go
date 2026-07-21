@@ -21,11 +21,12 @@ import (
 // model.default and the would-pick tier is attached as ShadowTier so a wave can
 // be validated before the policy is enabled (RFC §2.8).
 func (r *Router) resolvePolicyDecision(issue github.Issue, escalationSteps int) BackendDecision {
+	defaultBackend := r.cfg.Model.EffectiveDefault()
 	pol := r.cfg.Routing.Policy
 	if pol == nil {
 		// mode: policy without a policy block is rejected at config load, but
 		// stay safe at runtime and fall through to the default backend.
-		return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonDefault}
+		return BackendDecision{Backend: defaultBackend, Reason: ReasonDefault}
 	}
 
 	startTier, signal, matched := r.matchPolicyTier(issue)
@@ -43,13 +44,13 @@ func (r *Router) resolvePolicyDecision(issue github.Issue, escalationSteps int) 
 	tier, ok := r.cfg.Routing.Tiers[tierName]
 	if !ok {
 		log.Printf("[router] issue #%d: policy tier %q not declared — using default %q with reason=%s",
-			issue.Number, tierName, r.cfg.Model.Default, ReasonPolicyError)
-		return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonPolicyError, Tier: tierName}
+			issue.Number, tierName, defaultBackend, ReasonPolicyError)
+		return BackendDecision{Backend: defaultBackend, Reason: ReasonPolicyError, Tier: tierName}
 	}
 	backend, valid := ValidateBackend(strings.TrimSpace(tier.Backend), r.cfg)
 	if !valid {
 		log.Printf("[router] issue #%d: policy tier %q backend %q not declared — using default %q with reason=%s",
-			issue.Number, tierName, tier.Backend, r.cfg.Model.Default, ReasonPolicyError)
+			issue.Number, tierName, tier.Backend, defaultBackend, ReasonPolicyError)
 		return BackendDecision{Backend: backend, Reason: ReasonPolicyError, Tier: tierName}
 	}
 
@@ -58,9 +59,9 @@ func (r *Router) resolvePolicyDecision(issue github.Issue, escalationSteps int) 
 	// Shadow mode: keep dispatch on model.default, but record the would-pick.
 	if pol.Shadow {
 		log.Printf("[router] issue #%d: policy SHADOW would pick tier %q (backend=%s, %s) — dispatching default %q unchanged",
-			issue.Number, tierName, backend, signal, r.cfg.Model.Default)
+			issue.Number, tierName, backend, signal, defaultBackend)
 		return BackendDecision{
-			Backend:      r.cfg.Model.Default,
+			Backend:      defaultBackend,
 			Reason:       ReasonDefault,
 			ShadowTier:   tierName,
 			ShadowReason: reason,

@@ -236,6 +236,13 @@ Dynamic wave policy:
 
 Fleet cards surface `open`, `eligible`, `excluded`, `held/meta`, `blocked-deps`, `non_runnable_project_status`, selected candidate, and top skipped reason so operators can tell whether the queue is empty, held by parent/meta policy, blocked by dependencies, or waiting on project status.
 
+The Settings view also surfaces the effective model route as provider lanes, a
+flattened backend order, and its exact source (`provider_lanes`,
+`explicit_backend_chain`, or `model_default_only`). Worker drawers show the
+immediate backend decision reason separately from that route source. This makes
+an outage transition such as `claude -> sol -> gpt55` auditable without reading
+raw project YAML or inferring order from backend names.
+
 ### Queue / Next decision plane (#720)
 
 The per-project **Queue / Next** panel in Mission Control visualizes the supervisor's selection decision: the **next** issue (selected candidate, highlighted with its priority label), the **eligible** set in real selection order (priority `P0<P1<P2<P3`, then ascending issue number — the same order as the supervisor's `sortDynamicWaveCandidates`), and every **skipped** candidate with its reason (`retry limit exhausted`, `epic`/`meta`, `blocked`, `project status not runnable`, etc.) and queue counts. Rows link to their GitHub issue.

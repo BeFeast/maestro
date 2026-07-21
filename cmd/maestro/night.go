@@ -60,11 +60,10 @@ func nightStartCmd(args []string) {
 		MaxRetriesIssue: cfg.MaxRetriesPerIssue,
 	}
 
-	// 1. Worker chain — default + fallbacks. Each one we can probe at all,
+	// 1. Worker chain — the exact effective route. Each one we can probe at all,
 	//    we probe; missing is a non-fatal warning, exhausted is a soft fail
 	//    (we can still rely on later fallbacks if any of them are ok).
-	chain := []string{cfg.Model.Default}
-	chain = append(chain, cfg.Model.FallbackBackends...)
+	chain := nightWorkerChain(cfg)
 	report.WorkerChain = chain
 
 	anyAgentic := false
@@ -156,6 +155,13 @@ func nightStartCmd(args []string) {
 	runArgs := []string{"--config", *configPath, "--interval", interval.String()}
 	fmt.Fprintf(os.Stderr, "[night-start] entering run-loop (interval=%s) — Ctrl+C to stop\n", interval)
 	runCmd(runArgs)
+}
+
+func nightWorkerChain(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	return append([]string(nil), cfg.Model.ResolvedRoute().Backends...)
 }
 
 // probeBackend runs a tiny "say hi" probe against the backend's CLI.
