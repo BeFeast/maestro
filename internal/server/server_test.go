@@ -663,6 +663,43 @@ func TestApplySupervisorAttentionSessionTargetDoesNotFallback(t *testing.T) {
 	}
 }
 
+func TestAllSessionInfosSuppressesDeadPIDFindingAfterRespawn(t *testing.T) {
+	now := time.Now().UTC()
+	pid := os.Getpid()
+	st := state.NewState()
+	st.Sessions["project-273"] = &state.Session{
+		IssueNumber: 345,
+		IssueTitle:  "flatpak beta retry",
+		Status:      state.StatusRunning,
+		PID:         pid,
+		StartedAt:   now,
+		PRNumber:    388,
+	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:        "before-respawn",
+		CreatedAt: now.Add(-time.Minute),
+		StuckStates: []state.SupervisorStuckState{{
+			Code:              "dead_running_pid",
+			Severity:          "blocked",
+			Summary:           "Worker project-273 is marked running, but PID 481040 is not alive.",
+			RecommendedAction: "Run a Maestro reconciliation cycle.",
+			Target:            &state.SupervisorTarget{Issue: 345, PR: 388, Session: "project-273"},
+		}},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	infos := allSessionInfos(&config.Config{Repo: "BeFeast/ok-player"}, st)
+	if len(infos) != 1 {
+		t.Fatalf("session projections = %d, want 1", len(infos))
+	}
+	got := infos[0]
+	if got.Status != string(state.StatusRunning) || got.PID != pid || got.Alive == nil || !*got.Alive {
+		t.Fatalf("runtime tuple = status:%q pid:%d alive:%v, want coherent live replacement", got.Status, got.PID, got.Alive)
+	}
+	if !contains(got.StatusReason, "alive") || contains(got.StatusReason, "481040") || contains(got.StatusReason, "not alive") || got.NextAction != "" || got.NeedsAttention {
+		t.Fatalf("stale predecessor finding leaked into live projection: reason=%q next=%q attention=%v", got.StatusReason, got.NextAction, got.NeedsAttention)
+	}
+}
+
 func TestApplySupervisorAttentionSuppressesResolvedStaleReviewFeedback(t *testing.T) {
 	infos := []sessionInfo{
 		{
