@@ -670,6 +670,7 @@ function mapProject(project, workers, now) {
     failed: Number(project.failed || 0),
     sessions: Number(project.sessions || 0),
     needsAttention: Number(project.needs_attention || 0),
+    actions: Array.isArray(project.actions) ? project.actions : [],
     operatorState: project.operator_state || {},
     outcome,
     queueSnapshot: queue,
@@ -775,8 +776,10 @@ function mapEffectiveConfig(raw) {
         routerModel: String((policy.routing || {}).router_model || ""),
         routerModelName: String((policy.routing || {}).router_model_name || ""),
         allowMeteredBackend: (policy.routing || {}).allow_metered_backend === true,
+        tiers: Array.isArray((policy.routing || {}).tiers) ? (policy.routing || {}).tiers.map(mapEffectiveRoutingTier) : [],
       },
     },
+    pipeline: mapEffectivePipeline(raw.pipeline),
     maxParallel: Number(raw.max_parallel || 0),
     reviewGate: String(raw.review_gate || ""),
     labels: {
@@ -851,6 +854,29 @@ function mapEffectiveBackend(raw) {
     outputUSDPerMtok: Number(raw?.output_usd_per_mtok || 0),
     pricingClass: String(raw?.pricing_class || ""),
     metered: raw?.metered === true,
+  };
+}
+
+function mapEffectiveRoutingTier(raw) {
+  return {
+    name: String(raw?.name || ""),
+    backend: String(raw?.backend || ""),
+    effort: String(raw?.effort || ""),
+    model: String(raw?.model || ""),
+    rank: Number(raw?.rank || 0),
+  };
+}
+
+function mapEffectivePipeline(raw) {
+  const role = value => ({
+    enabled: value?.enabled === true,
+    backend: String(value?.backend || ""),
+    effort: String(value?.effort || ""),
+  });
+  return {
+    planner: role(raw?.planner || {}),
+    implementer: role(raw?.implementer || {}),
+    validator: role(raw?.validator || {}),
   };
 }
 
@@ -984,6 +1010,31 @@ function mapWorker(worker) {
     done: worker.status === "done",
     stuck: taxonomy.section === "stuck",
     stuckReason: taxonomy.section === "stuck" ? worker.status_reason || status : "",
+    backendDrift: mapBackendDrift(worker.backend_drift),
+  };
+}
+
+function mapBackendDrift(raw) {
+  if (!raw || raw.stale !== true) return null;
+  return {
+    stale: true,
+    backend: String(raw.backend || ""),
+    reason: String(raw.reason || ""),
+    running: mapBackendRuntimeSettings(raw.running),
+    effective: mapBackendRuntimeSettings(raw.effective),
+    restartable: raw.restartable === true,
+    refusalReason: String(raw.refusal_reason || ""),
+    recommendedAction: String(raw.recommended_action || ""),
+  };
+}
+
+function mapBackendRuntimeSettings(raw) {
+  raw = raw || {};
+  return {
+    provider: String(raw.provider || ""),
+    model: String(raw.model || ""),
+    variant: String(raw.variant || ""),
+    effort: String(raw.effort || ""),
   };
 }
 

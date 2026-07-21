@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 )
@@ -140,6 +141,44 @@ func TestLoadKeepsImportedSourcePath(t *testing.T) {
 	}
 	if cfg.SourcePath != path {
 		t.Fatalf("SourcePath = %q, want %q", cfg.SourcePath, path)
+	}
+}
+
+func TestProjectsFingerprintAdvancesOnSharedBackendUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertProject(ctx, "owner-demo", `
+repo: owner/demo
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude --model opus --effort xhigh
+      effort: xhigh
+`); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	before, err := store.ProjectsFingerprint(ctx)
+	if err != nil {
+		t.Fatalf("ProjectsFingerprint before: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+	if err := store.UpsertBackend(ctx, "claude", "cmd: claude --model opus --effort high\neffort: high\n"); err != nil {
+		t.Fatalf("UpsertBackend: %v", err)
+	}
+	after, err := store.ProjectsFingerprint(ctx)
+	if err != nil {
+		t.Fatalf("ProjectsFingerprint after: %v", err)
+	}
+	if !after["owner-demo"].After(before["owner-demo"]) {
+		t.Fatalf("fingerprint did not advance after backend-only update: before=%s after=%s", before["owner-demo"], after["owner-demo"])
+	}
+	cfg, err := store.Load(ctx, "owner-demo")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Model.Backends["claude"].Effort; got != "high" {
+		t.Fatalf("loaded backend effort = %q, want high", got)
 	}
 }
 

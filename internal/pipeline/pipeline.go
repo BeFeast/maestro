@@ -169,6 +169,7 @@ func ApplyPhaseEffort(cfg *config.Config, backendName string, phase state.Phase)
 	for k, v := range cfg.Model.Backends {
 		backends[k] = v
 	}
+	def.Effort = effort
 	def.TierEffort = effort
 	backends[backendName] = def
 	clone.Model.Backends = backends

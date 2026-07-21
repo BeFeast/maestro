@@ -321,9 +321,13 @@ model:
   backends:
     claude:
       cmd: claude
+      effort: high
     codex:
       cmd: codex
+      effort: high
 ```
+
+`model.backends.<name>.effort` is the backend's default reasoning-effort policy for newly started workers. For Claude-compatible workers Maestro emits `--effort <value>`; for Codex-compatible workers it emits `-c model_reasoning_effort=<value>`; backends without a supported effort flag receive no effort flag. A configured backend effort replaces stale effort pins in Claude/Codex `cmd` or `extra_args`; routing-tier or pipeline phase effort overrides are narrower per-dispatch overrides and are shown in backend-selection/effective-config surfaces so an operator can tell whether the backend default or the dispatch override applied.
 
 ### Optional: sub-agent model policy (`subagent_hint`)
 
