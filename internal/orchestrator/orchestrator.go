@@ -1402,9 +1402,9 @@ func (o *Orchestrator) workerJSONLFile(slotName string, sess *state.Session) str
 // ParseClaudeUsage returns the cumulative run total across every attempt;
 // the monotonic UsageTokensWatermark persists across respawns so only the
 // new attempt's tokens are added (no double-count on retry/respawn). Cost
-// prefers the backend-reported total_cost_usd. Returns true when anything
-// changed; false (usage stays 0) when the jsonl is absent — the documented
-// degradation when the stream-splitter was unavailable.
+// prefers the backend-reported total_cost_usd. A successful terminal frame
+// with missing/zero usage marks the active attribution usage-unreliable and
+// logs once; zero never advances token counters or budget progress.
 func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
 	if jsonlPath == "" {
@@ -1417,11 +1417,14 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		return false
 	}
 	usage, ok := worker.ParseClaudeUsage(string(data))
-	if !ok {
-		return false
-	}
 	changed := false
-	if usage.TotalTokens > sess.UsageTokensWatermark {
+	if usage.UsageUnreliable && state.MarkActiveAttributionUsageUnreliable(sess, usage.UsageUnreliableReason, usage.UsageUnreliableScope) {
+		log.Printf("[orch] %s claude usage-unreliable: scope=%s reason=%s; preserving observed counters and treating zero tokens as unavailable, not progress",
+			slotName, usage.UsageUnreliableScope, usage.UsageUnreliableReason)
+		changed = true
+	}
+	telemetryChanged := false
+	if ok && usage.TotalTokens > sess.UsageTokensWatermark {
 		delta := usage.TotalTokens - sess.UsageTokensWatermark
 		sess.UsageTokensWatermark = usage.TotalTokens
 		sess.TokensUsedAttempt += delta
@@ -1434,24 +1437,24 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		sess.TokensOutput = usage.Output
 		sess.TokensCacheRead = usage.CacheRead
 		sess.TokensCacheWrite = usage.CacheWrite
-		changed = true
+		telemetryChanged = true
 	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
 		sess.Model = usage.Model
-		changed = true
+		telemetryChanged = true
 	}
 	// total_cost_usd is the run-cumulative the full-jsonl parse sums across
 	// every result frame, so guard with `>` (mirrors the Pi cost fix in #732):
 	// a first-non-zero freeze would never update past the first attempt.
 	if usage.CostUSD > sess.CostUSDBackend {
 		sess.CostUSDBackend = usage.CostUSD
-		changed = true
+		telemetryChanged = true
 	}
-	if changed {
+	if telemetryChanged {
 		log.Printf("[orch] %s claude usage: model=%s tokens=%d cost=$%.4f (total=%d)",
 			slotName, usage.Model, usage.TotalTokens, usage.CostUSD, sess.TokensUsedTotal)
 	}
-	return changed
+	return changed || telemetryChanged
 }
 
 // updateCodexUsageFromJSONL parses the codex `exec --json` side-channel

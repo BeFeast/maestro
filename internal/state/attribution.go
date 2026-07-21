@@ -69,7 +69,89 @@ func attributionSegmentLabel(seg BackendAttribution) string {
 		seen[key] = struct{}{}
 		parts = append(parts, value)
 	}
+	if seg.UsageUnreliable {
+		parts = append(parts, "usage-unreliable")
+	}
 	return strings.Join(parts, " ")
+}
+
+// MarkActiveAttributionUsageUnreliable marks the currently-open backend
+// segment as unable to provide trustworthy token usage. The marker is
+// monotonic for the segment: a later good frame cannot reconstruct usage that
+// was absent from an earlier provider response, so it must not clear the flag.
+// It returns true only when durable attribution changed, which lets callers
+// log the degradation once instead of on every polling cycle.
+func MarkActiveAttributionUsageUnreliable(sess *Session, reason, scope string) bool {
+	if sess == nil {
+		return false
+	}
+	if len(sess.Attribution) == 0 {
+		// Imported/legacy sessions can predate the attribution timeline. Create a
+		// minimal segment from durable session identity rather than dropping the
+		// reliability warning; newer sessions already have a metadata-rich segment.
+		sess.Attribution = append(sess.Attribution, BackendAttribution{
+			Backend:   strings.TrimSpace(sess.Backend),
+			Model:     strings.TrimSpace(sess.Model),
+			StartedAt: sess.StartedAt,
+			Reason:    "usage_observation",
+		})
+	}
+	seg := &sess.Attribution[len(sess.Attribution)-1]
+	reason = strings.TrimSpace(reason)
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		scope = UsageUnreliableScopeAccounting
+	}
+	changed := false
+	if !seg.UsageUnreliable {
+		seg.UsageUnreliable = true
+		changed = true
+	}
+	// Accounting loss is stronger than live-budget-only loss: once a terminal
+	// result itself is incomplete, the session totals become a lower bound and
+	// the active marker must upgrade accordingly.
+	upgradeScope := seg.UsageUnreliableScope == "" ||
+		(seg.UsageUnreliableScope == UsageUnreliableScopeLiveBudget && scope == UsageUnreliableScopeAccounting)
+	if upgradeScope {
+		seg.UsageUnreliableScope = scope
+		changed = true
+	}
+	if reason != "" && (seg.UsageUnreliableReason == "" || upgradeScope) {
+		seg.UsageUnreliableReason = reason
+		changed = true
+	}
+	return changed
+}
+
+// SessionUsageUnreliable reports whether any backend segment in the session
+// lost trustworthy usage telemetry. Session token/cost totals span all
+// segments, so one unreliable segment makes the aggregate a lower bound.
+func SessionUsageUnreliable(sess *Session) bool {
+	if sess == nil {
+		return false
+	}
+	for _, seg := range sess.Attribution {
+		if seg.UsageUnreliable {
+			return true
+		}
+	}
+	return false
+}
+
+// SessionUsageAccountingUnreliable reports whether session-level token/cost
+// totals are a lower bound. A live_budget-only marker does not qualify because
+// a later terminal result can still make accounting exact even though the live
+// worker ceiling could not be enforced response-by-response.
+func SessionUsageAccountingUnreliable(sess *Session) bool {
+	if sess == nil {
+		return false
+	}
+	for _, seg := range sess.Attribution {
+		if seg.UsageUnreliable && seg.UsageUnreliableScope != UsageUnreliableScopeLiveBudget {
+			return true
+		}
+	}
+	return false
 }
 
 func attributionSegmentRange(origin time.Time, seg BackendAttribution, now time.Time) string {

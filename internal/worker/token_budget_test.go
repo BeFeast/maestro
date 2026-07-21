@@ -61,6 +61,19 @@ func TestLiveTokenMonitor_ClaudeIgnoresCacheReadAndDeduplicatesMessageFrames(t *
 	}
 }
 
+func TestLiveTokenMonitor_ClaudeMissingUsageDoesNotKillHealthyWorker(t *testing.T) {
+	monitor := newLiveTokenMonitor("claude", 1)
+	for _, frame := range []string{
+		`{"type":"assistant","message":{"id":"msg-1","role":"assistant","usage":{"input_tokens":0,"output_tokens":0}}}`,
+		`{"type":"result","subtype":"success","result":"done"}`,
+	} {
+		observed, exceeded := monitor.observe(frame)
+		if observed != 0 || exceeded {
+			t.Fatalf("missing usage produced budget progress/kill: observed=%d exceeded=%t", observed, exceeded)
+		}
+	}
+}
+
 func TestLiveTokenMonitor_PiIgnoresCacheRead(t *testing.T) {
 	monitor := newLiveTokenMonitor("pi", 100_000)
 	line := `{"type":"turn_end","message":{"role":"assistant","usage":{"input":10,"output":20,"cacheRead":150000,"cacheWrite":30000}}}`

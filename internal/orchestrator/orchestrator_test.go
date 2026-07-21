@@ -11142,7 +11142,14 @@ func claudeTestOrchestrator(t *testing.T, slot string) (*Orchestrator, *state.Se
 		},
 	}
 	logFile := dir + "/" + slot + ".log"
-	sess := &state.Session{Backend: "claude", LogFile: logFile}
+	sess := &state.Session{
+		Backend: "claude",
+		LogFile: logFile,
+		Attribution: []state.BackendAttribution{{
+			Backend:   "claude",
+			StartedAt: time.Now().UTC(),
+		}},
+	}
 	return o, sess, dir + "/" + slot + ".jsonl"
 }
 
@@ -11184,6 +11191,34 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendStampsUsage(t *testing.T) {
 	}
 	if !sess.HasSplitTokens() {
 		t.Error("HasSplitTokens() = false, want true")
+	}
+}
+
+// A translated upstream that completes successfully but emits zero usage is
+// explicit degraded observability, never zero-token progress. The worker stays
+// alive/terminal according to its own lifecycle; token budget enforcement does
+// not synthesize a kill from missing data.
+func TestUpdateTokensUsedFromOutput_ClaudeZeroUsageMarksAttributionWithoutProgress(t *testing.T) {
+	o, sess, jsonlPath := claudeTestOrchestrator(t, "sup-946")
+	frames := `{"type":"system","subtype":"init","model":"proxy-model"}` + "\n" +
+		`{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":0,"output_tokens":0}}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(frames), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !o.updateTokensUsedFromOutput("sup-946", sess, "healthy rendered output") {
+		t.Fatal("expected the reliability marker to change durable state")
+	}
+	if sess.TokensUsedAttempt != 0 || sess.TokensUsedTotal != 0 || sess.UsageTokensWatermark != 0 {
+		t.Fatalf("zero usage advanced token progress: attempt=%d total=%d watermark=%d",
+			sess.TokensUsedAttempt, sess.TokensUsedTotal, sess.UsageTokensWatermark)
+	}
+	seg := sess.Attribution[len(sess.Attribution)-1]
+	if !seg.UsageUnreliable || seg.UsageUnreliableReason != "terminal_result_zero_input_or_output" || seg.UsageUnreliableScope != state.UsageUnreliableScopeAccounting {
+		t.Fatalf("attribution = %+v, want explicit usage-unreliable marker", seg)
+	}
+	if o.updateTokensUsedFromOutput("sup-946", sess, "healthy rendered output") {
+		t.Fatal("unchanged unreliable stream should not report another state change")
 	}
 }
 
