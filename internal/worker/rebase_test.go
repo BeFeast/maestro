@@ -185,6 +185,47 @@ func TestRebaseWorktree_NoAttributionPolicyFailsClosedBeforeForcePush(t *testing
 	}
 }
 
+func TestRebaseWorktree_PreservesHistoricalAttributionTrailer(t *testing.T) {
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	worktree := filepath.Join(root, "worktree")
+	branch := "feat/historical-attribution"
+
+	gitTest(t, root, "init", "--bare", origin)
+	gitTest(t, root, "clone", origin, seed)
+	gitTest(t, seed, "config", "user.email", "test@example.com")
+	gitTest(t, seed, "config", "user.name", "Test User")
+	writeTestFile(t, seed, "README.md", "base\n")
+	gitTest(t, seed, "add", "README.md")
+	gitTest(t, seed, "commit", "-m", "initial")
+	gitTest(t, seed, "branch", "-M", "main")
+	gitTest(t, seed, "push", "-u", "origin", "main")
+	gitTest(t, seed, "checkout", "-b", branch)
+	writeTestFile(t, seed, "feature.txt", "implemented\n")
+	gitTest(t, seed, "add", "feature.txt")
+	gitTest(t, seed, "commit", "-m", "worker: implement feature", "-m", "Maestro-Backend: legacy provider model")
+	gitTest(t, seed, "push", "-u", "origin", branch)
+
+	gitTest(t, seed, "checkout", "main")
+	writeTestFile(t, seed, "README.md", "base advanced\n")
+	gitTest(t, seed, "commit", "-am", "advance main")
+	gitTest(t, seed, "push", "origin", "main")
+
+	gitTest(t, root, "clone", origin, worktree)
+	gitTest(t, worktree, "config", "user.email", "test@example.com")
+	gitTest(t, worktree, "config", "user.name", "Test User")
+	gitTest(t, worktree, "checkout", branch)
+
+	if err := RebaseWorktree(worktree, branch, nil, nil); err != nil {
+		t.Fatalf("rebase historical trailer: %v", err)
+	}
+	msg := gitOutput(t, origin, "log", "-1", "--pretty=%B", branch)
+	if !strings.Contains(msg, "Maestro-Backend: legacy provider model") {
+		t.Fatalf("historical attribution trailer was not preserved:\n%s", msg)
+	}
+}
+
 func gitTest(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
