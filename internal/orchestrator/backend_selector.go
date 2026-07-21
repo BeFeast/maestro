@@ -16,6 +16,7 @@ const (
 	selectionReasonAuthFailureFallback      = "fallback_after_backend_auth_failure"
 	selectionReasonModelUnavailableFallback = "fallback_after_backend_model_unavailable"
 	selectionReasonModelCooldownFallback    = "fallback_after_backend_model_cooldown"
+	selectionReasonModelOverloadedFallback  = "fallback_after_backend_model_overloaded"
 	selectionReasonUsageLimitFallback       = "fallback_after_backend_usage_limit"
 	// selectionReasonDispatchBlockedFallback marks a fresh dispatch whose
 	// routed backend was blocked (disabled or in BackendHealth cooldown), so
@@ -68,6 +69,14 @@ func backendFailureCopyFor(reason string) backendFailureCopy {
 			noun:            "provider/model credential cooldown",
 			remedy:          "wait for the route retry time or restore model access on a compatible credential",
 		}
+	case state.BackendBlockModelOverloaded:
+		return backendFailureCopy{
+			selectionReason: selectionReasonModelOverloadedFallback,
+			displayToken:    string(state.DisplayBackendModelOverloaded),
+			desc:            "hit transient capacity for its configured model",
+			noun:            "backend model overloaded",
+			remedy:          "wait for the short route cooldown or use another model on the same provider",
+		}
 	}
 	return backendFailureCopy{
 		selectionReason: selectionReasonAuthFailureFallback,
@@ -109,11 +118,19 @@ const backendAuthFailureCooldown = 10 * time.Minute
 // stays exhausted for hours.
 const backendUsageLimitCooldown = 30 * time.Minute
 
+// backendModelOverloadCooldown keeps a terminal HTTP 529 scoped to the
+// affected route while allowing a quick re-probe. Overload is transient
+// capacity, not a multi-hour quota window or a missing model id.
+const backendModelOverloadCooldown = time.Minute
+
 // backendFailureCooldownFor picks the fixed re-probe window for a hard
 // backend failure by gating reason.
 func backendFailureCooldownFor(reason string) time.Duration {
-	if reason == state.BackendBlockUsageLimit {
+	switch reason {
+	case state.BackendBlockUsageLimit:
 		return backendUsageLimitCooldown
+	case state.BackendBlockModelOverloaded:
+		return backendModelOverloadCooldown
 	}
 	return backendAuthFailureCooldown
 }
@@ -244,7 +261,7 @@ func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Sessio
 		RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
 		PreviousBackend:      backendName(sess),
 	}
-	for _, candidate := range o.backendFallbackCandidates(sess) {
+	for _, candidate := range o.backendFallbackCandidates(st, sess, selectionReason) {
 		provider, model := o.providerModelRouteForBackend(candidate, "")
 		entry := state.BackendCandidate{Backend: candidate, Provider: provider, Model: model, Fit: 0.5, Policy: 0.5, Final: 0.5}
 		if candidate == "" {
@@ -328,7 +345,12 @@ func (o *Orchestrator) resolveDispatchBackend(st *state.State, issue github.Issu
 		return decision, true, nil
 	}
 	earliest := blockedRetry
-	for _, candidate := range o.dispatchBackendCandidates(decision.Backend) {
+	candidates := o.dispatchBackendCandidates(decision.Backend)
+	if isProviderModelBlock(blockedBy) {
+		provider, _ := o.providerModelRouteForBackend(decision.Backend, decision.Model)
+		candidates = o.providerFirstCandidates(candidates, provider)
+	}
+	for _, candidate := range candidates {
 		if candidate == decision.Backend {
 			continue
 		}
@@ -504,8 +526,64 @@ func retryAfterHint(retryAfter *time.Time) string {
 	return ", retry after " + retryAfter.UTC().Format(time.RFC3339)
 }
 
-func (o *Orchestrator) backendFallbackCandidates(sess *state.Session) []string {
-	return o.cfg.Model.FallbackCandidates(backendName(sess))
+func (o *Orchestrator) backendFallbackCandidates(st *state.State, sess *state.Session, selectionReason string) []string {
+	candidates := o.cfg.Model.FallbackCandidates(backendName(sess))
+	provider, model := o.providerModelRouteForSession(sess, "", "")
+	reason := ""
+	if sess != nil {
+		reason = sess.ProviderLimitReason
+	}
+	if health, ok := providerModelHealth(st, provider, model); ok && isProviderModelBlock(health.Reason) {
+		reason = health.Reason
+	}
+	if !isProviderModelBlock(reason) && !isProviderModelSelectionReason(selectionReason) {
+		return candidates
+	}
+	return o.providerFirstCandidates(candidates, provider)
+}
+
+func isProviderModelSelectionReason(reason string) bool {
+	switch reason {
+	case selectionReasonModelUnavailableFallback, selectionReasonModelCooldownFallback, selectionReasonModelOverloadedFallback:
+		return true
+	default:
+		return false
+	}
+}
+
+func isProviderModelBlock(reason string) bool {
+	switch reason {
+	case state.BackendBlockModelUnavailable, state.BackendBlockModelCooldown, state.BackendBlockModelOverloaded:
+		return true
+	default:
+		return false
+	}
+}
+
+// providerFirstCandidates keeps the configured route order within each group,
+// but tries every fallback model on the failed provider before crossing to a
+// different provider. Credential rotation for the requested model remains the
+// proxy's responsibility; this ordering applies only after Maestro receives a
+// route-scoped aggregate failure.
+func (o *Orchestrator) providerFirstCandidates(candidates []string, provider string) []string {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || len(candidates) < 2 {
+		return candidates
+	}
+	ordered := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidateProvider, _ := o.providerModelRouteForBackend(candidate, "")
+		if strings.EqualFold(strings.TrimSpace(candidateProvider), provider) {
+			ordered = append(ordered, candidate)
+		}
+	}
+	for _, candidate := range candidates {
+		candidateProvider, _ := o.providerModelRouteForBackend(candidate, "")
+		if !strings.EqualFold(strings.TrimSpace(candidateProvider), provider) {
+			ordered = append(ordered, candidate)
+		}
+	}
+	return ordered
 }
 
 func backendFitScore(name string, cfg *config.Config) float64 {

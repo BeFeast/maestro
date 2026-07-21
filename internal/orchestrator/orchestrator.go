@@ -1243,8 +1243,12 @@ func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time
 	}
 	if ok, label := o.backendModelUnavailableFromLog(sess, now); ok {
 		_, model := o.providerModelRouteForSession(sess, "", "")
+		reason := state.BackendBlockModelUnavailable
+		if label == "model_overloaded" {
+			reason = state.BackendBlockModelOverloaded
+		}
 		return backendFailure{
-			reason:      state.BackendBlockModelUnavailable,
+			reason:      reason,
 			pattern:     label,
 			model:       model,
 			modelScoped: model != "",

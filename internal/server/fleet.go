@@ -1776,20 +1776,30 @@ type fleetApprovalState struct {
 }
 
 type fleetWorkerState struct {
-	ProjectName    string `json:"project_name"`
-	ProjectRepo    string `json:"project_repo,omitempty"`
-	DashboardURL   string `json:"dashboard_url,omitempty"`
-	Slot           string `json:"slot"`
-	IssueNumber    int    `json:"issue_number"`
-	IssueTitle     string `json:"issue_title"`
-	IssueURL       string `json:"issue_url,omitempty"`
-	Status         string `json:"status"`
-	DisplayStatus  string `json:"display_status,omitempty"`
-	StatusReason   string `json:"status_reason,omitempty"`
-	NextAction     string `json:"next_action,omitempty"`
-	NeedsAttention bool   `json:"needs_attention,omitempty"`
-	Live           bool   `json:"live"`
-	Backend        string `json:"backend,omitempty"`
+	ProjectName               string `json:"project_name"`
+	ProjectRepo               string `json:"project_repo,omitempty"`
+	DashboardURL              string `json:"dashboard_url,omitempty"`
+	Slot                      string `json:"slot"`
+	IssueNumber               int    `json:"issue_number"`
+	IssueTitle                string `json:"issue_title"`
+	IssueURL                  string `json:"issue_url,omitempty"`
+	Status                    string `json:"status"`
+	DisplayStatus             string `json:"display_status,omitempty"`
+	StatusReason              string `json:"status_reason,omitempty"`
+	NextAction                string `json:"next_action,omitempty"`
+	NeedsAttention            bool   `json:"needs_attention,omitempty"`
+	Live                      bool   `json:"live"`
+	Backend                   string `json:"backend,omitempty"`
+	ProviderLimitBackend      string `json:"provider_limit_backend,omitempty"`
+	ProviderLimitReason       string `json:"provider_limit_reason,omitempty"`
+	ProviderLimitProvider     string `json:"provider_limit_provider,omitempty"`
+	ProviderLimitModel        string `json:"provider_limit_model,omitempty"`
+	ProviderLimitResetAt      string `json:"provider_limit_reset_at,omitempty"`
+	CredentialCandidates      int    `json:"credential_candidates,omitempty"`
+	CredentialCandidatesKnown bool   `json:"credential_candidates_known,omitempty"`
+	CredentialUsable          int    `json:"credential_usable,omitempty"`
+	CredentialUsableKnown     bool   `json:"credential_usable_known,omitempty"`
+	CredentialAggregateReason string `json:"credential_aggregate_reason,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
 	Model                     string                `json:"model,omitempty"`
@@ -5442,6 +5452,16 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		NeedsAttention:            worker.NeedsAttention,
 		Live:                      worker.Live,
 		Backend:                   worker.Backend,
+		ProviderLimitBackend:      worker.ProviderLimitBackend,
+		ProviderLimitReason:       worker.ProviderLimitReason,
+		ProviderLimitProvider:     worker.ProviderLimitProvider,
+		ProviderLimitModel:        worker.ProviderLimitModel,
+		ProviderLimitResetAt:      worker.ProviderLimitResetAt,
+		CredentialCandidates:      worker.CredentialCandidates,
+		CredentialCandidatesKnown: worker.CredentialCandidatesKnown,
+		CredentialUsable:          worker.CredentialUsable,
+		CredentialUsableKnown:     worker.CredentialUsableKnown,
+		CredentialAggregateReason: worker.CredentialAggregateReason,
 		Model:                     worker.Model,
 		Phase:                     worker.Phase,
 		PlanVersion:               worker.PlanVersion,

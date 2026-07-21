@@ -17,12 +17,16 @@ func credentialAwareFallbackConfig() *config.Config {
 	return &config.Config{
 		Repo: "owner/repo",
 		Model: config.ModelConfig{
-			Default:          "fable",
-			FallbackBackends: []string{"codex"},
+			Default: "fable",
+			// Cross-provider codex is intentionally listed first to prove a
+			// provider/model failure still tries the healthy Claude model before
+			// abandoning the provider.
+			FallbackBackends: []string{"codex", "claude-opus"},
 			Backends: map[string]config.BackendDef{
-				"fable":  {Cmd: "claude --model claude-fable-5"},
-				"sonnet": {Cmd: "claude --model claude-sonnet-4-6"},
-				"codex":  {Cmd: "codex --model gpt-5.5"},
+				"fable":       {Cmd: "claude --model claude-fable-5", Provider: "claude", Model: "claude-fable-5"},
+				"claude-opus": {Cmd: "claude --model claude-opus-4-8", Provider: "claude", Model: "claude-opus-4-8"},
+				"sonnet":      {Cmd: "claude --model claude-sonnet-4-6", Provider: "claude", Model: "claude-sonnet-4-6"},
+				"codex":       {Cmd: "codex --model gpt-5.5", Provider: "openai", Model: "gpt-5.5"},
 			},
 		},
 	}
@@ -32,7 +36,7 @@ func TestReconcileRunningSessions_ModelCredentialPoolExhausted_GatesOnlyRoute(t 
 	now := time.Now().UTC()
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "worker.log")
-	payload := `{"error":{"code":"model_cooldown","message":"All credentials for model claude-fable-5 are cooling down via provider fable","model":"claude-fable-5","provider":"fable","candidate_count":2,"usable_count":0,"aggregate_reason":"all_model_credentials_cooling_down","reset_seconds":90}}`
+	payload := `{"error":{"code":"model_cooldown","message":"All credentials for model claude-fable-5 are cooling down via provider claude","model":"claude-fable-5","provider":"claude","candidate_count":2,"usable_count":0,"aggregate_reason":"all_model_credentials_cooling_down","reset_seconds":90}}`
 	if err := os.WriteFile(logFile, []byte(payload+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -77,13 +81,13 @@ func TestReconcileRunningSessions_ModelCredentialPoolExhausted_GatesOnlyRoute(t 
 	if !o.reconcileRunningSessions(s) {
 		t.Fatal("expected model cooldown reconciliation")
 	}
-	if respawned != "codex" {
-		t.Fatalf("respawned backend = %q, want codex after both Fable credentials were unavailable", respawned)
+	if respawned != "claude-opus" {
+		t.Fatalf("respawned backend = %q, want claude-opus after both Fable credentials were unavailable", respawned)
 	}
 	if _, ok := s.BackendHealth["fable"]; ok {
 		t.Fatalf("model cooldown must not gate the whole backend: %+v", s.BackendHealth["fable"])
 	}
-	health, ok := s.ProviderModelHealth["fable"]["claude-fable-5"]
+	health, ok := s.ProviderModelHealth["claude"]["claude-fable-5"]
 	if !ok {
 		t.Fatalf("provider/model health missing: %+v", s.ProviderModelHealth)
 	}
@@ -107,7 +111,7 @@ func TestResolveDispatchBackend_ModelCooldownLeavesOtherProviderModelEligible(t 
 	now := time.Now().UTC()
 	retry := now.Add(10 * time.Minute)
 	s := state.NewState()
-	s.ProviderModelHealth["fable"] = map[string]state.BackendHealth{
+	s.ProviderModelHealth["claude"] = map[string]state.BackendHealth{
 		"claude-fable-5": {
 			State:      state.BackendHealthCooldown,
 			Reason:     state.BackendBlockModelCooldown,
@@ -119,8 +123,8 @@ func TestResolveDispatchBackend_ModelCooldownLeavesOtherProviderModelEligible(t 
 
 	fableIssue := makeIssue(908, "Fable route", "model:fable")
 	decision, ok, _ := o.resolveDispatchBackend(s, fableIssue, now)
-	if !ok || decision.Backend != "codex" {
-		t.Fatalf("Fable decision = %+v ok=%v, want precise fallback to codex", decision, ok)
+	if !ok || decision.Backend != "claude-opus" {
+		t.Fatalf("Fable decision = %+v ok=%v, want same-provider fallback to claude-opus", decision, ok)
 	}
 
 	sonnetIssue := makeIssue(909, "Sonnet route", "model:sonnet")
@@ -213,7 +217,7 @@ func TestRespawnDueRetries_ModelRouteCooldownBreaksSessionAffinity(t *testing.T)
 	past := now.Add(-time.Second)
 	retry := now.Add(10 * time.Minute)
 	s := state.NewState()
-	s.ProviderModelHealth["fable"] = map[string]state.BackendHealth{
+	s.ProviderModelHealth["claude"] = map[string]state.BackendHealth{
 		"claude-fable-5": {
 			State:      state.BackendHealthCooldown,
 			Reason:     state.BackendBlockModelCooldown,
@@ -232,10 +236,83 @@ func TestRespawnDueRetries_ModelRouteCooldownBreaksSessionAffinity(t *testing.T)
 	o.respawnDueRetries(s, 10)
 
 	sess := s.Sessions["sup-909"]
-	if respawned != "codex" || sess.Backend != "codex" {
+	if respawned != "claude-opus" || sess.Backend != "claude-opus" {
 		t.Fatalf("retry remained pinned to unavailable route: respawned=%q session=%q", respawned, sess.Backend)
 	}
 	if sess.BackendSelection == nil || sess.BackendSelection.SelectionReason != selectionReasonRetryBlockedFallback {
 		t.Fatalf("selection = %+v, want retry blocked fallback", sess.BackendSelection)
+	}
+}
+
+func TestReconcileRunningSessions_ModelOverloaded_FallsBackWithinProvider(t *testing.T) {
+	now := time.Now().UTC()
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	if err := os.WriteFile(logFile, []byte("API Error: 529\n"+`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := state.NewState()
+	s.Sessions["sup-908"] = &state.Session{
+		IssueNumber: 908,
+		IssueTitle:  "credential-aware fallback",
+		Status:      state.StatusRunning,
+		PID:         515152,
+		TmuxSession: "maestro-sup-908-overload",
+		Backend:     "fable",
+		StartedAt:   now.Add(-time.Minute),
+		LogFile:     logFile,
+	}
+
+	var respawned string
+	o := &Orchestrator{
+		cfg:                 credentialAwareFallbackConfig(),
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isRateLimitedFn:     func(string) bool { return false },
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "credential-aware fallback"}, nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+			respawned = backendName
+			sess.Backend = backendName
+			sess.Status = state.StatusRunning
+			sess.PID = 9192
+			sess.StartedAt = time.Now().UTC()
+			sess.FinishedAt = nil
+			return nil
+		},
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected model overload reconciliation")
+	}
+	if respawned != "claude-opus" {
+		t.Fatalf("respawned backend = %q, want same-provider claude-opus before codex", respawned)
+	}
+	if _, ok := s.BackendHealth["fable"]; ok {
+		t.Fatalf("model overload must not gate the whole backend: %+v", s.BackendHealth["fable"])
+	}
+	health, ok := s.ProviderModelHealth["claude"]["claude-fable-5"]
+	if !ok {
+		t.Fatalf("provider/model overload health missing: %+v", s.ProviderModelHealth)
+	}
+	if health.Reason != state.BackendBlockModelOverloaded || health.Pattern != "model_overloaded" {
+		t.Fatalf("route health = %+v, want model_overloaded", health)
+	}
+	if health.RetryAfter == nil || !health.RetryAfter.After(now) || health.RetryAfter.After(now.Add(2*time.Minute)) {
+		t.Fatalf("route retry = %v, want short overload cooldown", health.RetryAfter)
+	}
+	sess := s.Sessions["sup-908"]
+	if sess.ProviderLimitReason != state.BackendBlockModelOverloaded || sess.ProviderLimitProvider != "claude" || sess.ProviderLimitModel != "claude-fable-5" {
+		t.Fatalf("session overload route = %+v", sess)
+	}
+	if sess.BackendSelection == nil || sess.BackendSelection.SelectionReason != selectionReasonModelOverloadedFallback {
+		t.Fatalf("selection = %+v, want %s", sess.BackendSelection, selectionReasonModelOverloadedFallback)
+	}
+	if sess.RetryCount != 0 || s.FailedAttemptsForIssue(908) != 0 {
+		t.Fatalf("model overload burned retry budget: retry=%d failed=%d", sess.RetryCount, s.FailedAttemptsForIssue(908))
 	}
 }

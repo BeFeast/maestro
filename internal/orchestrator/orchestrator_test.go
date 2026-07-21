@@ -10010,7 +10010,7 @@ func TestReloadConfig_ProviderLanesUpdateLiveFallbackSelector(t *testing.T) {
 	defer ticker.Stop()
 	o.reloadConfig(&newCfg, &ticker)
 
-	got := o.backendFallbackCandidates(&state.Session{Backend: "claude"})
+	got := o.backendFallbackCandidates(nil, &state.Session{Backend: "claude"}, "")
 	if !reflect.DeepEqual(got, []string{"sol", "gpt55"}) {
 		t.Fatalf("live fallback selector = %v, want [sol gpt55]", got)
 	}
