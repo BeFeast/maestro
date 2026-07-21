@@ -68,6 +68,36 @@ func (r RecoveryRunner) runCommand(ctx context.Context, command, dir string) (in
 	return recoveryExitCode(err), err
 }
 
+// OwnsActiveFailure reports whether this automatic-recovery lease/receipt is
+// still the sole actuator for the failing project outcome at time now.
+//
+// Ownership holds while the recovery is:
+//   - executing (a bounded command is running under the durable lease), or
+//   - verification-pending (the command finished exit 0 and the authoritative
+//     health check has not yet confirmed the fix), or
+//   - cooldown-bounded: a failed attempt whose retry cooldown has not yet
+//     elapsed. The project-scoped actuator will re-lease at NextEligibleAt, so
+//     the drift is still owned and an outcome-driven product repair must not
+//     race in during the cooldown window.
+//
+// A verified receipt (the outcome recovered), an uncertain receipt (no durable
+// receipt; health verification is authoritative and no cooldown fence exists),
+// or a failed attempt whose cooldown already elapsed do NOT own the failure —
+// genuine independent PR blockers remain repairable in those states.
+func (r *RecoveryState) OwnsActiveFailure(now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	switch r.Status {
+	case RecoveryStatusExecuting, RecoveryStatusVerificationPending:
+		return true
+	case RecoveryStatusFailed:
+		return !r.NextEligibleAt.IsZero() && now.UTC().Before(r.NextEligibleAt)
+	default:
+		return false
+	}
+}
+
 func (r RecoveryRunner) now() time.Time {
 	if r.Now != nil {
 		return r.Now().UTC()
