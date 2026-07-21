@@ -155,6 +155,38 @@ func TestExecute_DeleteWorktree_SlotMatchesProceeds(t *testing.T) {
 	}
 }
 
+func TestExecute_DeleteWorktree_ApprovedRepairOwnsSameSlot(t *testing.T) {
+	wt := &fakeWT{}
+	st := state.NewState()
+	st.Sessions["sup-77"] = &state.Session{
+		IssueNumber: 812,
+		PRNumber:    900,
+		Status:      state.StatusRetryExhausted,
+		Worktree:    "/srv/wt/sup-77",
+	}
+	st.Approvals = append(st.Approvals, state.Approval{
+		ID:     "approval-repair-812",
+		Action: "spawn_repair_worker",
+		Target: &state.SupervisorTarget{Session: "sup-77", Issue: 812, PR: 900},
+		Status: state.ApprovalStatusAwaitingDispatch,
+	})
+	ex := &Executor{
+		Worktrees: wt,
+		Cfg:       newCfg(),
+		State:     st,
+		Sessions:  fakeSessionLookup(st.Sessions),
+	}
+	a := mkApproval(config.SupervisorActionDeleteWorktree, &state.SupervisorTarget{Session: "sup-77", Issue: 812, PR: 900}, "stale", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("res = %+v, want execution_failed", res)
+	}
+	if len(wt.calls) != 0 {
+		t.Fatalf("RemoveWorktree was called %d times", len(wt.calls))
+	}
+}
+
 func TestExecute_DeleteWorktree_NoSessionsLookupSkipsFence(t *testing.T) {
 	// Backward compat: callers that don't wire Sessions get the previous
 	// behaviour (no fence).

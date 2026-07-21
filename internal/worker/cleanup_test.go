@@ -1,14 +1,166 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 )
+
+func neverAlive(int) bool    { return false }
+func alwaysAlive(int) bool   { return true }
+func neverTmux(string) bool  { return false }
+func alwaysTmux(string) bool { return true }
+
+// TestValidateCleanupLease_AllowsUnchangedTerminalSession is the baseline: a
+// terminal session with a dead PID that has not been re-leased is safe to clean.
+func TestValidateCleanupLease_AllowsUnchangedTerminalSession(t *testing.T) {
+	started := time.Now().Add(-2 * time.Hour)
+	sess := &state.Session{
+		IssueNumber:      331,
+		PRNumber:         398,
+		PID:              111,
+		Worktree:         "/wt/ok-player-296",
+		Branch:           "feat/x",
+		StartedAt:        started,
+		WorkerGeneration: 4,
+		Status:           state.StatusRetryExhausted,
+	}
+	lease := CaptureCleanupLease("ok-player-296", sess)
+	if err := ValidateCleanupLease(lease, sess, CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}, CleanupPolicy{RequireTerminal: true}); err != nil {
+		t.Fatalf("unchanged terminal session with dead PID should be cleanable, got: %v", err)
+	}
+}
+
+func TestValidateCleanupLease_AbortsOnEachReleaseSignal(t *testing.T) {
+	started := time.Now().Add(-2 * time.Hour)
+	base := func() *state.Session {
+		return &state.Session{
+			IssueNumber:      331,
+			PRNumber:         398,
+			PID:              111,
+			Worktree:         "/wt/ok-player-296",
+			Branch:           "feat/x",
+			StartedAt:        started,
+			WorkerGeneration: 4,
+			Status:           state.StatusRetryExhausted,
+		}
+	}
+	lease := CaptureCleanupLease("ok-player-296", base())
+
+	cases := []struct {
+		name    string
+		current *state.Session
+		probes  CleanupProbes
+	}{
+		{"slot vanished", nil, CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"issue recycled", func() *state.Session { s := base(); s.IssueNumber = 999; return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"pr changed", func() *state.Session { s := base(); s.PRNumber = 399; return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"generation changed", func() *state.Session { s := base(); s.WorkerGeneration++; return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"pid changed", func() *state.Session { s := base(); s.PID = 758258; return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"tmux changed", func() *state.Session { s := base(); s.TmuxSession = "maestro-new"; return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"started changed", func() *state.Session { s := base(); s.StartedAt = time.Now(); return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"no longer terminal", func() *state.Session { s := base(); s.Status = state.StatusRunning; return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+		{"pid alive", base(), CleanupProbes{PIDAlive: alwaysAlive, TmuxAlive: neverTmux}},
+		{"tmux alive", base(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: alwaysTmux}},
+		{"worktree re-pointed", func() *state.Session { s := base(); s.Worktree = "/wt/other"; return s }(), CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateCleanupLease(lease, tc.current, tc.probes, CleanupPolicy{RequireTerminal: true})
+			if err == nil {
+				t.Fatalf("expected cleanup to abort for %q, got nil", tc.name)
+			}
+			if !errors.Is(err, ErrCleanupLeaseChanged) {
+				t.Fatalf("expected ErrCleanupLeaseChanged for %q, got: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestCleanupLeasedWorktree_RestoresAfterPartialRemoval(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	worktreeBase := filepath.Join(root, "worktrees")
+	stateDir := filepath.Join(root, "state")
+	slot := "sup-963"
+	branch := "feat/sup-963"
+	worktree := filepath.Join(worktreeBase, slot)
+
+	runCleanupGit(t, root, "init", repo)
+	runCleanupGit(t, repo, "config", "user.email", "maestro@example.invalid")
+	runCleanupGit(t, repo, "config", "user.name", "Maestro Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCleanupGit(t, repo, "add", "README.md")
+	runCleanupGit(t, repo, "commit", "-m", "base")
+	runCleanupGit(t, repo, "branch", branch)
+	if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCleanupGit(t, repo, "worktree", "add", worktree, branch)
+
+	finished := time.Now().UTC().Add(-2 * time.Hour)
+	s := state.NewState()
+	s.Sessions[slot] = &state.Session{
+		IssueNumber:      963,
+		PRNumber:         1001,
+		Worktree:         worktree,
+		Branch:           branch,
+		StartedAt:        finished.Add(-time.Hour),
+		FinishedAt:       &finished,
+		Status:           state.StatusRetryExhausted,
+		WorkerGeneration: 3,
+	}
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatal(err)
+	}
+
+	lease := CaptureCleanupLease(slot, s.Sessions[slot])
+	cfg := &config.Config{LocalPath: repo, WorktreeBase: worktreeBase, StateDir: stateDir}
+	err := CleanupLeasedWorktree(
+		cfg,
+		s,
+		lease,
+		CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux},
+		CleanupPolicy{RequireTerminal: true, RequireClean: true},
+		CleanupHooks{Remove: func(localPath, worktreePath string) error {
+			if err := RemoveWorktree(localPath, worktreePath); err != nil {
+				return err
+			}
+			return errors.New("simulated failure after git metadata removal")
+		}},
+	)
+	if !errors.Is(err, ErrCleanupConsistencyViolation) {
+		t.Fatalf("cleanup err = %v, want ErrCleanupConsistencyViolation", err)
+	}
+	if out, gitErr := exec.Command("git", "-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput(); gitErr != nil || string(out) != "true\n" {
+		t.Fatalf("worktree was not automatically restored: err=%v out=%q", gitErr, out)
+	}
+	canonical, loadErr := state.Load(stateDir)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if got := canonical.Sessions[slot].Worktree; got != worktree {
+		t.Fatalf("canonical worktree claim = %q, want %q", got, worktree)
+	}
+}
+
+func runCleanupGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
 
 func TestCleanupWorktrees_RemovesTerminalSessionWorktrees(t *testing.T) {
 	// Create fake worktree directories
