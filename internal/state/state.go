@@ -296,12 +296,11 @@ type Session struct {
 	WorkerEndedAt *time.Time `json:"worker_ended_at,omitempty"`
 	PROpenedAt    *time.Time `json:"pr_opened_at,omitempty"`
 
-	// #513: per-segment attribution timeline. Every spawn / respawn /
-	// fallover appends a new entry; the previous entry's EndedAt is
-	// closed at the same moment. Records who actually produced the
-	// commits (provider/model/variant/effort) so the dashboard +
-	// commit trailer can show "first 12m on claude opus-4.8 xhigh,
-	// then 4m on codex gpt-5.5 medium after rate-limit fallover".
+	// #513/#1000: per-segment internal attribution timeline. Every spawn /
+	// respawn / fallover appends a new entry; the previous entry's EndedAt is
+	// closed at the same moment. Records which backend produced the work so
+	// durable state and Fleet Mission Control can show routing and fallover
+	// history without writing control-plane telemetry into product commits.
 	Attribution []BackendAttribution `json:"attribution,omitempty"`
 }
 

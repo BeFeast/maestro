@@ -6,23 +6,10 @@ import (
 	"time"
 )
 
-const AttributionTrailerKey = "Maestro-Backend"
-
-// FormatAttributionTrailer renders the durable git commit trailer for a
-// session's backend timeline. It uses relative ranges from the first segment
-// so the line remains stable and queryable after the live state file is gone.
-// The trailer goes on commit messages only — never on PR bodies, which land on
-// the target repo and may be public (#799).
-func FormatAttributionTrailer(attribution []BackendAttribution, now time.Time) string {
-	timeline := FormatAttributionTimeline(attribution, now)
-	if timeline == "" {
-		return ""
-	}
-	return AttributionTrailerKey + ": " + timeline
-}
-
 // FormatAttributionTimeline renders BackendAttribution segments in order as a
-// compact, semicolon-separated audit line.
+// compact, semicolon-separated internal audit line. The structured segments
+// remain durable in Maestro state and are surfaced by Fleet Mission Control;
+// this formatter must not be used to mutate product commits (#1000).
 func FormatAttributionTimeline(attribution []BackendAttribution, now time.Time) string {
 	if len(attribution) == 0 {
 		return ""
@@ -121,18 +108,4 @@ func attributionElapsedLabel(d time.Duration) string {
 		return fmt.Sprintf("%dh %dm", hours, rem)
 	}
 	return fmt.Sprintf("%dh", hours)
-}
-
-// AppendAttributionTrailer appends the attribution trailer to text unless the
-// trailer is empty or already present.
-func AppendAttributionTrailer(text string, attribution []BackendAttribution, now time.Time) string {
-	trailer := FormatAttributionTrailer(attribution, now)
-	if trailer == "" || strings.Contains(text, AttributionTrailerKey+":") {
-		return text
-	}
-	text = strings.TrimRight(text, " \t\r\n")
-	if text == "" {
-		return trailer + "\n"
-	}
-	return text + "\n\n" + trailer + "\n"
 }
