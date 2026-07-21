@@ -4368,6 +4368,10 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		}
 	}
 	for _, runtimeAttention := range st.WorkerLeaseAttention {
+		if sess := st.Sessions[strings.TrimSpace(runtimeAttention.Slot)]; sess != nil &&
+			strings.TrimSpace(sess.WorkerLeaseAttention) == strings.TrimSpace(runtimeAttention.Reason) {
+			continue
+		}
 		info := workerLeaseAttentionSessionInfo(runtimeAttention)
 		item.NeedsAttention++
 		item.Attention = append(item.Attention, info)

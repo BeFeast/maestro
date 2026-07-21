@@ -290,6 +290,44 @@ func TestFleetAPISurfacesWorkerLeaseOwnershipAttentionWithoutPrivatePaths(t *tes
 	}
 }
 
+func TestFleetAPIDeduplicatesSessionBoundWorkerLeaseAttention(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	now := time.Now().UTC()
+	st := state.NewState()
+	st.Sessions["slot-a"] = &state.Session{
+		IssueNumber:          927,
+		IssueTitle:           "Isolate worker scratch",
+		Status:               state.StatusRunning,
+		PID:                  os.Getpid(),
+		StartedAt:            now.Add(-time.Minute),
+		WorkerLeaseAttention: "persisted session and ownership manifest disagree",
+	}
+	st.WorkerLeaseAttention = []state.WorkerLeaseAttention{{
+		Identity:   "ambiguous-a1b2c3d4e5f6",
+		Slot:       "slot-a",
+		Reason:     "persisted session and ownership manifest disagree",
+		NextAction: "Inspect the exact persisted lease and ownership manifest.",
+		DetectedAt: now.Add(-time.Minute),
+	}}
+	st.WorkerLeaseReconciledAt = now
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatal(err)
+	}
+
+	project := NewFleetProject("One", "", "", &config.Config{Repo: "owner/one", StateDir: stateDir, MaxParallel: 1})
+	resp := NewFleet([]FleetProject{project}, "127.0.0.1", 8786, true).snapshot()
+
+	if resp.Summary.NeedsAttention != 1 || len(resp.Attention) != 1 {
+		t.Fatalf("attention projection = summary %+v inbox %d, want one session-bound record", resp.Summary, len(resp.Attention))
+	}
+	if len(resp.Workers) != 1 || resp.Workers[0].Slot != "slot-a" || !resp.Workers[0].NeedsAttention {
+		t.Fatalf("workers = %+v, want only the original session attention", resp.Workers)
+	}
+	if strings.HasPrefix(resp.Attention[0].Slot, "worker-lease-attention-") {
+		t.Fatalf("session-bound attention was duplicated as synthetic worker %q", resp.Attention[0].Slot)
+	}
+}
+
 func TestFleetWorkersOrderActuallyRunningFirst(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
