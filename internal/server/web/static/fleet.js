@@ -2190,6 +2190,7 @@ function outcomeHTML(project) {
   const summary = o.health_summary || "";
   const checks = Array.isArray(o.checks) ? o.checks.filter(function(check) { return check.blocking || check.status !== "pass"; }) : [];
   const recovery = o.recovery || null;
+  const recoveryHasExitCode = recovery && recovery.exit_code !== undefined && recovery.exit_code !== null;
   return '<div class="outcome-status"><div class="label">Outcome Status</div>' +
     '<div class="outcome-lines">' +
       '<div class="outcome-line"><strong>Goal</strong> ' + escapeText(goal) + '</div>' +
@@ -2197,8 +2198,14 @@ function outcomeHTML(project) {
       '<div class="outcome-line"><strong>Health</strong> ' + escapeText(health.replace(/_/g, " ")) + '</div>' +
       '<div class="outcome-line"><strong>Checked</strong> ' + escapeText(checked) + '</div>' +
       (summary ? '<div class="outcome-line"><strong>Signal</strong> ' + escapeText(summary) + '</div>' : "") +
-      checks.map(function(check) { return '<div class="outcome-line"><strong>' + escapeText(check.name || "check") + '</strong> ' + escapeText(check.status || "unknown") + '</div>'; }).join("") +
+      checks.map(function(check) {
+        const deadline = check.deadline_at ? ' · deadline ' + check.deadline_at : '';
+        return '<div class="outcome-line"><strong>' + escapeText(check.name || "check") + '</strong> ' + escapeText((check.status || "unknown") + deadline) + '</div>';
+      }).join("") +
       (recovery ? '<div class="outcome-line"><strong>Recovery</strong> ' + escapeText(recovery.status || "unknown") + (recovery.summary ? ' · ' + escapeText(recovery.summary) : '') + '</div>' : "") +
+      (recovery && recovery.started_at ? '<div class="outcome-line"><strong>Last attempt</strong> ' + escapeText(formatTimestamp(recovery.started_at)) + '</div>' : "") +
+      (recovery && recovery.next_eligible_at ? '<div class="outcome-line"><strong>Next attempt</strong> ' + escapeText(formatTimestamp(recovery.next_eligible_at)) + '</div>' : "") +
+      (recoveryHasExitCode ? '<div class="outcome-line"><strong>Exit code</strong> ' + escapeText(String(recovery.exit_code)) + '</div>' : "") +
       '<div class="outcome-line"><strong>Next</strong> ' + escapeText(next) + '</div>' +
     '</div></div>';
 }

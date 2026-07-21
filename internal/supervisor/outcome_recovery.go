@@ -98,6 +98,12 @@ func EvaluateOutcomeRecoveryOnce(cfg *config.Config, now time.Time) (bool, error
 				recovery.NextEligibleAt = time.Time{}
 				recovery.UpdatedAt = now
 			}
+			if recovery.Status == outcome.RecoveryStatusUncertain {
+				// The prior process ended without a durable receipt, so the same
+				// failing signal cannot prove whether its external side effect landed.
+				// Only an authoritative healthy check may clear this no-replay fence.
+				return nil
+			}
 			if recovery.Status == outcome.RecoveryStatusExecuting {
 				// The process identity is deliberately not replayable. Once its bounded
 				// timeout elapsed, surface an uncertain receipt and wait for the health

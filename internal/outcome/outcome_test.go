@@ -2,6 +2,7 @@ package outcome
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -133,16 +134,17 @@ func TestStatusForPersistsPendingHealthCheck(t *testing.T) {
 		State:     HealthPending,
 		Summary:   "source-main-ci reported pending",
 		Checks: []HealthCheckItem{{
-			Name:     "source-main-ci",
-			Blocking: true,
-			Status:   "pending",
+			Name:       "source-main-ci",
+			Blocking:   true,
+			Status:     "pending",
+			DeadlineAt: "2026-07-18T12:45:56Z",
 		}},
 	})
 
 	if status.HealthState != HealthPending {
 		t.Fatalf("HealthState = %q, want %q", status.HealthState, HealthPending)
 	}
-	if len(status.Checks) != 1 || status.Checks[0].Status != "pending" {
+	if len(status.Checks) != 1 || status.Checks[0].Status != "pending" || status.Checks[0].DeadlineAt != "2026-07-18T12:45:56Z" {
 		t.Fatalf("Checks = %+v, want persisted pending check", status.Checks)
 	}
 	if strings.Contains(status.NextAction, "before dispatching") {
@@ -208,6 +210,79 @@ func TestCheckerProjectsStructuredHealthWithoutRawDetails(t *testing.T) {
 	}
 	if strings.Contains(result.Summary, "do-not-store") || strings.Contains(result.Detail, "also-secret") || strings.Contains(result.Detail, "unknown") || strings.Contains(result.Detail, "do-not-store") {
 		t.Fatalf("raw structured output leaked into detail: %q", result.Detail)
+	}
+}
+
+func TestCheckerProjectsStructuredHealthDeadline(t *testing.T) {
+	output := []byte(`{"healthy":false,"deadline_at":"2026-07-18T09:35:00-04:00","checks":[{"name":"linux-candidate-delivery","blocking":true,"status":"fail"},{"name":"feed","blocking":false,"status":"warning","deadline":"2026-07-18T14:00:00Z"}]}`)
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return output, 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if len(result.Checks) != 2 {
+		t.Fatalf("projected checks=%+v", result.Checks)
+	}
+	if got := result.Checks[0]; got.Name != "linux-candidate-delivery" || got.DeadlineAt != "2026-07-18T13:35:00Z" {
+		t.Fatalf("blocking deadline=%+v, want normalized envelope deadline", got)
+	}
+	if got := result.Checks[1]; got.DeadlineAt != "2026-07-18T14:00:00Z" {
+		t.Fatalf("per-check deadline=%+v, want safe deadline alias", got)
+	}
+	if strings.Contains(result.Detail, "-04:00") {
+		t.Fatalf("detail retained unnormalized deadline: %q", result.Detail)
+	}
+}
+
+func TestCheckerDropsInvalidStructuredHealthDeadline(t *testing.T) {
+	output := []byte(`{"healthy":false,"checks":[{"name":"candidate","blocking":true,"status":"fail","deadline_at":"not-a-timestamp"}]}`)
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return output, 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if len(result.Checks) != 1 || result.Checks[0].DeadlineAt != "" {
+		t.Fatalf("invalid deadline was not discarded: %+v", result.Checks)
+	}
+	if strings.Contains(result.Detail, "not-a-timestamp") {
+		t.Fatalf("invalid deadline entered durable detail: %q", result.Detail)
+	}
+}
+
+func TestCheckerBoundsStructuredHealthChecksWithoutHidingFailure(t *testing.T) {
+	var output strings.Builder
+	output.WriteString(`{"healthy":false,"checks":[`)
+	for i := 0; i < maxStructuredHealthChecks+20; i++ {
+		if i > 0 {
+			output.WriteByte(',')
+		}
+		fmt.Fprintf(&output, `{"name":"pass-%02d","blocking":false,"status":"pass"}`, i)
+	}
+	output.WriteString(`,{"name":"candidate","blocking":true,"status":"fail","deadline_at":"2026-07-18T13:35:00Z"}]}`)
+
+	result := Checker{
+		RunCommand: func(context.Context, string, string) ([]byte, int, error) {
+			return []byte(output.String()), 0, nil
+		},
+	}.Check(context.Background(), Brief{DesiredOutcome: "candidate is fresh", HealthcheckCommand: "check"})
+	if len(result.Checks) != maxStructuredHealthChecks {
+		t.Fatalf("checks=%d, want bounded %d", len(result.Checks), maxStructuredHealthChecks)
+	}
+	if got := result.Checks[0]; got.Name != "candidate" || got.Status != "fail" {
+		t.Fatalf("blocking failure was crowded out by passing checks: %+v", result.Checks)
+	}
+}
+
+func TestCheckerBoundsCommandOutput(t *testing.T) {
+	result := Checker{}.Check(context.Background(), Brief{
+		DesiredOutcome:     "candidate is fresh",
+		HealthcheckCommand: fmt.Sprintf("head -c %d /dev/zero", maxCheckOutputBytes+1),
+	})
+	if result.State != HealthFailing || !strings.Contains(result.Summary, "safety limit") {
+		t.Fatalf("oversized command output result=%+v, want bounded failure", result)
+	}
+	if result.Detail != "" || len(result.Checks) != 0 {
+		t.Fatalf("oversized command output entered durable state: %+v", result)
 	}
 }
 
