@@ -2876,12 +2876,10 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 
 func (e *Engine) automaticOutcomeRecoveryOwnsFailure(st *state.State) bool {
 	if e == nil || e.cfg == nil || !e.cfg.Outcome.AutomaticRecoveryEnabled() ||
-		st == nil || st.OutcomeHealth == nil || st.OutcomeHealth.State != outcome.HealthFailing ||
-		st.OutcomeRecovery == nil {
+		st == nil || st.OutcomeHealth == nil || st.OutcomeHealth.State != outcome.HealthFailing {
 		return false
 	}
-	return st.OutcomeRecovery.Status == outcome.RecoveryStatusExecuting ||
-		st.OutcomeRecovery.Status == outcome.RecoveryStatusVerificationPending
+	return st.OutcomeRecovery.OwnsActiveFailure(e.now())
 }
 
 // openPRReadyToMerge returns (true, reasons[]) when a session's open PR can
