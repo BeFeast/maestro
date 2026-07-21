@@ -89,21 +89,28 @@ func TestRespawnPreservingWorktreeRepairsExistingDirectoryWithInvalidGitMetadata
 	if err := os.WriteFile(filepath.Join(worktree, "preserved.txt"), []byte("do not lose\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	branchesBefore, err := exec.Command("git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/heads").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list branches before recovery: %v: %s", err, branchesBefore)
+	}
 
 	cfg := &config.Config{LocalPath: repo, WorktreeBase: base}
-	sess := &state.Session{IssueNumber: 346, Worktree: worktree, Branch: branch}
+	sess := &state.Session{IssueNumber: 346, PRNumber: 397, Worktree: worktree, Branch: branch}
 	respawned := false
 	o := &Orchestrator{
 		cfg:               cfg,
 		restoreWorktreeFn: worker.RestoreMissingWorktree,
-		respawnInPlaceFn: func(_ *config.Config, slotName string, _ *state.Session, _ string, _ github.Issue, _, _ string) error {
+		respawnInPlaceFn: func(_ *config.Config, slotName string, got *state.Session, _ string, _ github.Issue, _, _ string) error {
 			respawned = true
 			if slotName != "ok-player-277" {
 				t.Fatalf("slot = %q, want canonical ok-player-277", slotName)
 			}
-			out, err := exec.Command("git", "-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput()
-			if err != nil || strings.TrimSpace(string(out)) != "true" {
-				t.Fatalf("restored worktree unusable: %v: %s", err, out)
+			if got.Worktree != worktree || got.Branch != branch || got.PRNumber != 397 {
+				t.Fatalf("canonical identity changed: worktree=%q branch=%q PR=%d", got.Worktree, got.Branch, got.PRNumber)
+			}
+			out, err := exec.Command("git", "-C", worktree, "rev-parse", "--show-toplevel").CombinedOutput()
+			if err != nil || filepath.Clean(strings.TrimSpace(string(out))) != filepath.Clean(worktree) {
+				t.Fatalf("restored worktree root = %q, %v; want %q", strings.TrimSpace(string(out)), err, worktree)
 			}
 			return nil
 		},
@@ -113,6 +120,10 @@ func TestRespawnPreservingWorktreeRepairsExistingDirectoryWithInvalidGitMetadata
 	}
 	if !respawned {
 		t.Fatal("canonical in-place respawn was not invoked")
+	}
+	branchesAfter, err := exec.Command("git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/heads").CombinedOutput()
+	if err != nil || string(branchesAfter) != string(branchesBefore) {
+		t.Fatalf("branches changed during recovery: before=%q after=%q err=%v", branchesBefore, branchesAfter, err)
 	}
 	backups, err := filepath.Glob(worktree + ".orphaned-*")
 	if err != nil || len(backups) != 1 {
