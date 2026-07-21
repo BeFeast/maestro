@@ -60,6 +60,7 @@
 # Usage:
 #   self-deploy.sh --repo-dir DIR --bin PATH --units a.service[,b.service] \
 #     --result-file PATH --timeout-seconds N --pr N \
+#     [--restart-timeout-seconds N] \
 #     [--health-url URL] [--health-token-env ENVVAR] [--install-via-sudo] \
 #     [--scope user|system]
 
@@ -70,6 +71,7 @@ BIN=""
 UNITS=""
 RESULT_FILE=""
 TIMEOUT_SECONDS=1800
+RESTART_TIMEOUT_SECONDS=270
 PR=0
 HEALTH_URL=""
 HEALTH_TOKEN_ENV=""
@@ -83,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --units) UNITS="$2"; shift 2 ;;
     --result-file) RESULT_FILE="$2"; shift 2 ;;
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --restart-timeout-seconds) RESTART_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --pr) PR="$2"; shift 2 ;;
     --health-url) HEALTH_URL="$2"; shift 2 ;;
     --health-token-env) HEALTH_TOKEN_ENV="$2"; shift 2 ;;
@@ -117,6 +120,8 @@ SHA=""
 STAMP=""
 PREV_VERSION=""
 GATE_FAIL_DETAIL=""
+RESTART_FAIL_DETAIL=""
+RESTART_TIMED_OUT=0
 # #877: installed unit paths this deploy changed. Each carries either a
 # <path>.prev backup (unit existed before — rollback restores it) or a
 # <path>.prev.absent marker (unit newly installed this deploy — rollback removes
@@ -181,22 +186,31 @@ cleanup_build() {
 # targets the system manager via `sudo -n systemctl restart` (non-interactive,
 # mirroring --install-via-sudo), since restarting a system unit needs privilege.
 # Either way the unit's normal stop path runs, so drain semantics are honored.
-# The user-scope command is byte-for-byte unchanged from before scope support.
+# All configured units are passed to one systemctl invocation so they share the
+# same absolute restart budget instead of multiplying it per unit (#966).
 restart_units() {
-  local budget=$1 unit
+  local budget=$1 rc units
   local -a restart_cmd
   if [[ "$SCOPE" == "system" ]]; then
     restart_cmd=(sudo -n systemctl restart)
   else
     restart_cmd=(systemctl --user restart)
   fi
-  for unit in "${UNIT_LIST[@]}"; do
-    log "restarting $unit (scope=$SCOPE; honors the unit's stop/drain path; budget ${budget}s)"
-    if ! timeout "$budget" "${restart_cmd[@]}" "$unit"; then
-      log "restart of $unit failed or timed out"
-      return 1
-    fi
-  done
+  units=${UNIT_LIST[*]}
+  log "restarting $units (scope=$SCOPE; honors each unit's stop/drain path; shared budget ${budget}s)"
+  if timeout "$budget" "${restart_cmd[@]}" "${UNIT_LIST[@]}"; then
+    return 0
+  else
+    rc=$?
+  fi
+  if (( rc == 124 || rc == 137 )); then
+    RESTART_TIMED_OUT=1
+    RESTART_FAIL_DETAIL="restart of configured unit(s) [$units] exceeded the shared bounded drain/restart budget (${budget}s) while Fleet may be unavailable"
+  else
+    RESTART_FAIL_DETAIL="restart of configured unit(s) [$units] failed (rc=$rc)"
+  fi
+  log "$RESTART_FAIL_DETAIL"
+  return 1
 }
 
 # units_active is scope-aware too (#716). The read-only liveness query needs no
@@ -425,6 +439,19 @@ fail() {
   exit 1
 }
 
+# A timed-out systemctl client may leave its manager-side restart job pending.
+# Starting a second rollback restart would merely stack another blocking job and
+# postpone the failure report under the much larger rollback timeout. Leave the
+# newly installed binary/unit pair intact for the pending job, record the outage
+# immediately, and require operator verification (#966).
+fail_restart_timeout() {
+  local reason=$1
+  log "FAILED: $reason"
+  write_result failed "$reason; no rollback restart attempted because the original restart job may still be pending"
+  cleanup_build
+  exit 1
+}
+
 on_exit() {
   local rc=$?
   if (( rc != 0 )) && (( ! RESULT_WRITTEN )); then
@@ -534,9 +561,18 @@ fi
 apply_units
 
 # --- 3. restart units (drain semantics via the units' own stop path) --------
-RESTART_BUDGET=$((DEADLINE - $(date +%s)))
-(( RESTART_BUDGET > 30 )) || RESTART_BUDGET=30
-restart_units "$RESTART_BUDGET" || fail "unit restart failed or exceeded ${RESTART_BUDGET}s"
+RESTART_BUDGET=$RESTART_TIMEOUT_SECONDS
+DEPLOY_REMAINING=$((DEADLINE - $(date +%s)))
+if (( DEPLOY_REMAINING < RESTART_BUDGET )); then
+  RESTART_BUDGET=$DEPLOY_REMAINING
+fi
+(( RESTART_BUDGET > 0 )) || fail "deploy deadline expired before unit restart"
+if ! restart_units "$RESTART_BUDGET"; then
+  if (( RESTART_TIMED_OUT )); then
+    fail_restart_timeout "$RESTART_FAIL_DETAIL"
+  fi
+  fail "${RESTART_FAIL_DETAIL:-unit restart failed}"
+fi
 
 # --- 4. verify post-restart health ------------------------------------------
 verify || fail "post-restart verification failed (expected v$STAMP from sha $SHA)"

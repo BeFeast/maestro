@@ -98,6 +98,17 @@ func (d *Daemon) RequestSelfDeploy(cfg *config.Config, prNumber int) error {
 func (d *Daemon) selfDeployConfig(cfg *config.Config) *config.Config {
 	dc := *cfg
 	sd := cfg.SelfDeploy
+	if sd.RestartTimeoutSeconds <= 0 {
+		// Keep the detached helper aligned with this daemon's actual configured
+		// drain deadline, plus the same small fixed start/report grace used by the
+		// default config value. An operator changing --drain-timeout therefore does
+		// not get a stale hard-coded restart budget (#966).
+		restartTimeout := d.opts.DrainTimeout + 30*time.Second
+		sd.RestartTimeoutSeconds = int(restartTimeout / time.Second)
+		if sd.RestartTimeoutSeconds < 1 {
+			sd.RestartTimeoutSeconds = 1
+		}
+	}
 	if strings.TrimSpace(sd.HealthURL) == "" {
 		sd.HealthURL = d.fleetHealthURL() // "" when no fleet port is bound
 		if sd.HealthURL != "" {

@@ -3314,6 +3314,25 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		}
 
 		if len(reasons) == 0 {
+			// Isolated worker scopes survive maestro.service restarts (#891). A
+			// shutdown marker can therefore arrive at the replacement daemon while
+			// the original PID/tmux is still alive. Validate the exact pane/worktree
+			// identity and consume the one-shot marker without respawning or changing
+			// the attempt: the same process keeps running exactly once (#966).
+			if sess.RestartCheckpointAt != nil {
+				pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
+				if identityErr != nil || pid <= 0 {
+					log.Printf("[orch] reconcile: %s survived restart but pane identity is unreadable (%v); preserving restart marker for a later non-destructive retry", slotName, identityErr)
+				} else if strings.TrimSpace(sess.Worktree) == "" || filepath.Clean(paneWorktree) != filepath.Clean(sess.Worktree) {
+					log.Printf("[orch] reconcile: %s survived restart but pane worktree %q does not match retained worktree %q; preserving marker and leaving the live worker untouched", slotName, paneWorktree, sess.Worktree)
+				} else {
+					sess.PID = pid
+					sess.TmuxSession = tmuxName
+					sess.RestartCheckpointAt = nil
+					reconciled = true
+					log.Printf("[orch] reconcile: %s adopted the same surviving worker across daemon restart (issue #%d, pid=%d, tmux=%q) — no respawn, no duplicate", slotName, sess.IssueNumber, pid, tmuxName)
+				}
+			}
 			continue
 		}
 
