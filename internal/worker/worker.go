@@ -143,6 +143,10 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
+	if err := assertCanonicalPrompt(slotName, issue.Number, prompt); err != nil {
+		return "", err
+	}
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
@@ -217,6 +221,12 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
 // The session is updated in place with new PID, worktree, branch, and timestamps.
 func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	// #959: assert the rendered issue matches the session's canonical
+	// issue_number before tearing anything down, so a slot-suffix-derived number
+	// can never launch a mis-scoped worker.
+	if err := assertCanonicalIssue(slotName, sess, issue); err != nil {
+		return err
+	}
 	// Validate the replacement backend before killing the old session or
 	// removing its worktree.
 	if backendName == "" {
@@ -295,6 +305,10 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
+	if err := assertCanonicalPrompt(slotName, sess.IssueNumber, prompt); err != nil {
+		return err
+	}
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
