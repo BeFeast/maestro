@@ -280,10 +280,23 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		return claim, true
 	}
 	switch sess.Status {
-	case StatusRunning, StatusQueued, StatusCodeLanded:
+	case StatusRunning, StatusQueued:
 		claim.Kind = IssueClaimImplementation
 		claim.Reason = fmt.Sprintf("issue #%d already has active session %s (%s)", sess.IssueNumber, slot, sess.Status)
 		return claim, true
+	case StatusCodeLanded:
+		// #1020: a code_landed session normally holds an implementation claim
+		// until post-merge verification settles the issue. But when that session
+		// is released for redispatch — because its merged PR delivered only
+		// non-functional (docs/record) changes, or its blocking outcome check
+		// stayed red past the verification deadline — the merge did NOT fix the
+		// issue. The claim must drop so the dynamic wave re-dispatches a fresh
+		// worker instead of silencing the issue behind an ineffective merge.
+		if !sess.ReleasedForRedispatch {
+			claim.Kind = IssueClaimImplementation
+			claim.Reason = fmt.Sprintf("issue #%d already has active session %s (%s)", sess.IssueNumber, slot, sess.Status)
+			return claim, true
+		}
 	case StatusPROpen:
 		claim.Kind = IssueClaimOpenPRMaintenance
 		claim.Reason = fmt.Sprintf("issue #%d is maintained by session %s for PR #%d", sess.IssueNumber, slot, sess.PRNumber)
