@@ -200,16 +200,17 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	// Save session to state
 	startedAt := time.Now().UTC()
 	s.Sessions[slotName] = &state.Session{
-		IssueNumber: issue.Number,
-		IssueTitle:  issue.Title,
-		Worktree:    worktreePath,
-		Branch:      branchName,
-		PID:         pid,
-		TmuxSession: tmuxName,
-		LogFile:     logFile,
-		StartedAt:   startedAt,
-		Status:      state.StatusRunning,
-		Backend:     backendName,
+		IssueNumber:      issue.Number,
+		IssueTitle:       issue.Title,
+		Worktree:         worktreePath,
+		Branch:           branchName,
+		PID:              pid,
+		TmuxSession:      tmuxName,
+		LogFile:          logFile,
+		StartedAt:        startedAt,
+		WorkerGeneration: 1,
+		Status:           state.StatusRunning,
+		Backend:          backendName,
 	}
 	// #513: stamp the first attribution segment for this session.
 	recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn", "", startedAt)
@@ -466,18 +467,25 @@ func CleanupWorktrees(cfg *config.Config, s *state.State) []CleanupResult {
 			sess.Worktree = ""
 			continue
 		}
-		err := RemoveWorktree(cfg.LocalPath, sess.Worktree)
+		lease := CaptureCleanupLease(slotName, sess)
+		err := CleanupLeasedWorktree(
+			cfg,
+			s,
+			lease,
+			CleanupProbes{},
+			CleanupPolicy{RequireTerminal: true},
+			CleanupHooks{},
+		)
 		r := CleanupResult{
 			SlotName:    slotName,
 			IssueNumber: sess.IssueNumber,
-			Worktree:    sess.Worktree,
+			Worktree:    lease.Worktree,
 		}
 		if err != nil {
 			r.Error = err
 			log.Printf("[worker] cleanup worktree %s for %s: %v", sess.Worktree, slotName, err)
 		} else {
 			r.Removed = true
-			sess.Worktree = ""
 			log.Printf("[worker] cleaned up worktree %s for %s", r.Worktree, slotName)
 		}
 		results = append(results, r)

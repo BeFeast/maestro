@@ -18,6 +18,7 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 		return
 	}
 	now = now.UTC()
+	sess.WorkerGeneration++
 	sess.StartedAt = now
 	sess.FinishedAt = nil
 	sess.WorkerEndedAt = nil

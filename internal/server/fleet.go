@@ -1821,6 +1821,7 @@ type fleetWorkerState struct {
 	PROpenRuntime          string `json:"pr_open_runtime,omitempty"`
 	PROpenRuntimeSeconds   int64  `json:"pr_open_runtime_seconds,omitempty"`
 	StartedAt              string `json:"started_at"`
+	WorkerGeneration       uint64 `json:"worker_generation,omitempty"`
 	FinishedAt             string `json:"finished_at,omitempty"`
 	WorkerEndedAt          string `json:"worker_ended_at,omitempty"`
 	PROpenedAt             string `json:"pr_opened_at,omitempty"`
@@ -5418,6 +5419,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		PROpenRuntime:          worker.PROpenRuntime,
 		PROpenRuntimeSeconds:   worker.PROpenRuntimeSeconds,
 		StartedAt:              worker.StartedAt,
+		WorkerGeneration:       worker.WorkerGeneration,
 		FinishedAt:             worker.FinishedAt,
 		WorkerEndedAt:          worker.WorkerEndedAt,
 		PROpenedAt:             worker.PROpenedAt,

@@ -90,6 +90,8 @@ type Orchestrator struct {
 	authFailureFromLogFn      func(logFile string) (bool, string)
 	modelUnavailableFromLogFn func(logFile string) (bool, string)
 	usageLimitFromLogFn       func(logFile string, extraPatterns []string) (bool, string)
+	beforeWorktreeCleanupFn   func(slotName string)
+	removeWorktreeFn          func(localPath, worktreePath string) error
 	// workerRespawnFn / respawnWorkerFn: used by respawnWorker() for dead-worker fallback (tests set one or the other)
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
@@ -877,6 +879,12 @@ func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue
 // the escalation ladder uses to carry a tier's per-tier effort/model override
 // (#783). It defaults to o.cfg via respawnWorker.
 func (o *Orchestrator) respawnWorkerWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
+		return o.respawnWorkerUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
+	})
+}
+
+func (o *Orchestrator) respawnWorkerUnlocked(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	// Support both hook names for test compatibility (respawnWorkerFn = branch, workerRespawnFn = HEAD)
 	if o.respawnWorkerFn != nil {
 		return o.respawnWorkerFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
@@ -913,6 +921,12 @@ func (o *Orchestrator) rateLimit() (github.RateLimitStatus, error) {
 // per-tier effort/model override (#783/#792). Callers that have no override pass
 // o.cfg.
 func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
+		return o.respawnInPlaceUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
+	})
+}
+
+func (o *Orchestrator) respawnInPlaceUnlocked(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	if o.respawnInPlaceFn != nil {
 		return o.respawnInPlaceFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
@@ -926,8 +940,14 @@ func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName str
 // checkpointed into the existing resumable checkpoint contract, then the same
 // slot/branch/worktree is restarted in place on the selected backend.
 func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
+	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
+		return o.respawnPreservingWorktreeUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
+	})
+}
+
+func (o *Orchestrator) respawnPreservingWorktreeUnlocked(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
 	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
-		return o.respawnWorkerWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+		return o.respawnWorkerUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 	}
 	restoreWorktree := o.restoreWorktreeFn
 	if restoreWorktree == nil && o.respawnInPlaceFn == nil {
@@ -947,7 +967,7 @@ func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, s
 	// never has that hook and therefore still fails closed if a retained
 	// worktree cannot be inspected.
 	if _, statErr := os.Stat(sess.Worktree); errors.Is(statErr, os.ErrNotExist) && o.respawnInPlaceFn != nil {
-		return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+		return o.respawnInPlaceUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 	}
 	dirty, err := worker.WorktreeDirty(sess.Worktree)
 	if err != nil {
@@ -961,7 +981,7 @@ func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, s
 		sess.CheckpointFile = checkpoint
 		log.Printf("[orch] worker %s: checkpointed dirty worktree before in-place recovery on %s", slotName, backendName)
 	}
-	return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+	return o.respawnInPlaceUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 }
 
 func (o *Orchestrator) respawnPreservingWorktree(slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
@@ -3777,6 +3797,9 @@ func liveRuntimeSuperseded(current, runtime *state.Session) bool {
 	if current.Status == state.StatusDone || current.Status == state.StatusCodeLanded {
 		return true
 	}
+	if current.WorkerGeneration > runtime.WorkerGeneration {
+		return true
+	}
 	if current.Status == state.StatusRunning && current.PID > 0 && current.PID != runtime.PID && !current.StartedAt.Before(runtime.StartedAt) {
 		return true
 	}
@@ -3800,6 +3823,7 @@ func applyLiveRuntimeProjection(current, runtime *state.Session) {
 	}
 	current.PID = runtime.PID
 	current.TmuxSession = runtime.TmuxSession
+	current.WorkerGeneration = runtime.WorkerGeneration
 	current.LogFile = runtime.LogFile
 	current.StartedAt = runtime.StartedAt
 	current.FinishedAt = runtime.FinishedAt
@@ -4109,22 +4133,22 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
 			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
-					dirty, dirtyErr := worker.WorktreeDirty(sess.Worktree)
-					if dirtyErr != nil {
-						log.Printf("[orch] refusing stale-worktree cleanup for %s: could not prove worktree clean: %v", slotName, dirtyErr)
-						continue
-					}
-					if dirty {
-						log.Printf("[orch] preserving stale worktree for %s: uncommitted work requires in-place recovery", slotName)
-						continue
+					lease := worker.CaptureCleanupLease(slotName, sess)
+					if o.beforeWorktreeCleanupFn != nil {
+						o.beforeWorktreeCleanupFn(slotName)
 					}
 					if sess.FinishedAt != nil {
 						log.Printf("[orch] cleaning up stale worktree for %s (finished %s ago)", slotName, time.Since(*sess.FinishedAt).Round(time.Minute))
 					} else {
 						log.Printf("[orch] cleaning up orphaned worktree for %s (started %s ago, no finishedAt)", slotName, time.Since(sess.StartedAt).Round(time.Minute))
 					}
-					worker.Stop(o.cfg, slotName, sess)
-					sess.Worktree = "" // Mark as cleaned
+					if cleanupErr := o.cleanupLeasedWorktree(s, lease); cleanupErr != nil {
+						if errors.Is(cleanupErr, worker.ErrCleanupConsistencyViolation) {
+							log.Printf("[orch] P0 consistency violation during stale-worktree cleanup for %s: %v", slotName, cleanupErr)
+						} else {
+							log.Printf("[orch] aborting stale-worktree cleanup for %s before filesystem mutation: %v", slotName, cleanupErr)
+						}
+					}
 				}
 			}
 			continue
@@ -4584,6 +4608,30 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 		}
 	}
+}
+
+func (o *Orchestrator) cleanupLeasedWorktree(s *state.State, lease worker.WorktreeCleanupLease) error {
+	remove := o.removeWorktreeFn
+	if remove == nil {
+		remove = worker.RemoveWorktree
+	}
+	return worker.CleanupLeasedWorktree(
+		o.cfg,
+		s,
+		lease,
+		worker.CleanupProbes{PIDAlive: o.pidAlive, TmuxAlive: o.tmuxSessionExists},
+		worker.CleanupPolicy{RequireTerminal: true, RequireClean: true},
+		worker.CleanupHooks{
+			BeforeRemove: func() error {
+				return worker.RunHook(o.cfg, "before_remove", o.cfg.Hooks.BeforeRemove, worker.HookEnv{
+					IssueID:       fmt.Sprintf("%s#%d", o.cfg.Repo, lease.IssueNumber),
+					IssueNumber:   lease.IssueNumber,
+					WorkspacePath: lease.Worktree,
+				})
+			},
+			Remove: remove,
+		},
+	)
 }
 
 // autoMergePRs checks open PRs and merges ones with green CI

@@ -227,10 +227,12 @@ func (o *Orchestrator) startPhase(cfg *config.Config, slotName string, sess *sta
 	if cfg == nil {
 		cfg = o.cfg
 	}
-	if o.workerStartPhaseFn != nil {
-		return o.workerStartPhaseFn(cfg, sess, slotName, prompt, backendName)
-	}
-	return worker.StartPhase(cfg, sess, slotName, prompt, backendName)
+	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
+		if o.workerStartPhaseFn != nil {
+			return o.workerStartPhaseFn(cfg, sess, slotName, prompt, backendName)
+		}
+		return worker.StartPhase(cfg, sess, slotName, prompt, backendName)
+	})
 }
 
 func truncateFeedback(s string) string {

@@ -149,6 +149,32 @@ func (s *State) ActiveRepairDispatchApproval(issueNumber int, action string) (*A
 	return nil, false
 }
 
+// ApprovedRepairOwnsSession reports whether an approved/awaiting-dispatch
+// repair authority reserves the exact canonical issue/session/PR identity.
+// Cleanup uses this immediately before filesystem mutation: an operator's
+// approved in-place recovery is a durable ownership claim even during the
+// short window before the replacement PID is persisted.
+func (s *State) ApprovedRepairOwnsSession(slot string, issueNumber, prNumber int) (*Approval, bool) {
+	if s == nil || strings.TrimSpace(slot) == "" || issueNumber <= 0 {
+		return nil, false
+	}
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if !activeRepairDispatchApproval(approval) || approval.Target == nil {
+			continue
+		}
+		target := approval.Target
+		if strings.TrimSpace(target.Session) != strings.TrimSpace(slot) || target.Issue != issueNumber {
+			continue
+		}
+		if target.PR > 0 && prNumber > 0 && target.PR != prNumber {
+			continue
+		}
+		return approval, true
+	}
+	return nil, false
+}
+
 // ResolveDispatchedSpawnRepairApproval retires a classic repair approval only
 // after its reserved session has successfully reached a worker. Re-running
 // after a save/reload is idempotent because terminal approvals are ignored.
