@@ -7807,6 +7807,11 @@ func issueHasLabel(issue github.Issue, label string) bool {
 	return false
 }
 
+func isOutcomeRepairIssue(issue github.Issue) bool {
+	return issueHasLabel(issue, outcome.OutcomeRepairLabel) ||
+		strings.Contains(issue.Body, outcome.OutcomeRepairMarkerPrefix)
+}
+
 func pipelineConfigForIssue(base *config.Config, issue github.Issue) (*config.Config, bool) {
 	if base == nil || !issueHasLabel(issue, pipelineFullLabel) {
 		return base, false
@@ -8648,6 +8653,14 @@ func (o *Orchestrator) applySupervisorOwnedReadyFilter(s *state.State, issues []
 	filtered := make([]github.Issue, 0, 1)
 	for _, issue := range issues {
 		if o.supervisorSelectedRepairSpawn(s, issue.Number) {
+			filtered = append(filtered, issue)
+			continue
+		}
+		// A bounded-futility intake issue is the one fresh issue allowed through
+		// the red-outcome hold. This bypasses only supervisor-owned ready
+		// selection; the normal closed/merged, exclusion, operator-gate, retry,
+		// claim, and backend checks below still apply.
+		if isOutcomeRepairIssue(issue) {
 			filtered = append(filtered, issue)
 			continue
 		}

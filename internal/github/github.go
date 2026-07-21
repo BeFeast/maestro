@@ -2989,6 +2989,28 @@ func (c *Client) AddIssueLabel(issueNumber int, label string) error {
 	return nil
 }
 
+// EnsureLabel creates a repository label when it is missing. --force makes the
+// operation idempotent under concurrent intake cycles and keeps the label's
+// owned metadata deterministic when it already exists.
+func (c *Client) EnsureLabel(name, color, description string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("ensure label: empty name")
+	}
+	args := []string{"label", "create", name, "--repo", c.Repo, "--force"}
+	if color = strings.TrimPrefix(strings.TrimSpace(color), "#"); color != "" {
+		args = append(args, "--color", color)
+	}
+	if description = strings.TrimSpace(description); description != "" {
+		args = append(args, "--description", description)
+	}
+	out, err := ghCommand(args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh label create %q: %w\n%s", name, err, out)
+	}
+	return nil
+}
+
 // RemoveIssueLabel removes a label from an issue.
 func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
 	out, err := ghCommand("issue", "edit",
