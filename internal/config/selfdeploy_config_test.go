@@ -64,6 +64,7 @@ self_deploy:
   units: ["maestro.service", " maestro-fleet.service "]
   health_url: http://127.0.0.1:9999/api/v1/state
   timeout_minutes: 45
+  restart_timeout_seconds: 333
 `
 	cfg, err := Parse([]byte(yaml))
 	if err != nil {
@@ -88,6 +89,9 @@ self_deploy:
 	if got := sd.EffectiveTimeoutMinutes(); got != 45 {
 		t.Errorf("EffectiveTimeoutMinutes() = %d", got)
 	}
+	if got := sd.EffectiveRestartTimeoutSeconds(); got != 333 {
+		t.Errorf("EffectiveRestartTimeoutSeconds() = %d", got)
+	}
 }
 
 func TestSelfDeployEffectiveDefaults(t *testing.T) {
@@ -104,6 +108,9 @@ func TestSelfDeployEffectiveDefaults(t *testing.T) {
 	}
 	if got := sd.EffectiveTimeoutMinutes(); got != 30 {
 		t.Errorf("EffectiveTimeoutMinutes() = %d, want 30", got)
+	}
+	if got := sd.EffectiveRestartTimeoutSeconds(); got != DefaultSelfDeployRestartTimeoutSeconds {
+		t.Errorf("EffectiveRestartTimeoutSeconds() = %d, want %d", got, DefaultSelfDeployRestartTimeoutSeconds)
 	}
 	// #722: the debounce window defaults to the deploy timeout so at most one
 	// deploy runs per budget.
