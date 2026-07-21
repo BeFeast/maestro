@@ -123,6 +123,33 @@ issue_labels: []
 	}
 }
 
+func TestParse_SupervisorOperatorGate(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  operator_gate:
+    check_names:
+      - Android SDK license acceptance gate
+      - legal/*
+    labels:
+      - operator-decision
+    required_action: Record legal acceptance, then rerun CI.
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := strings.Join(cfg.Supervisor.OperatorGate.CheckNames, ","); got != "Android SDK license acceptance gate,legal/*" {
+		t.Fatalf("check_names = %q", got)
+	}
+	if got := strings.Join(cfg.Supervisor.OperatorGate.Labels, ","); got != "operator-decision" {
+		t.Fatalf("labels = %q", got)
+	}
+	if cfg.Supervisor.OperatorGate.RequiredAction != "Record legal acceptance, then rerun CI." {
+		t.Fatalf("required_action = %q", cfg.Supervisor.OperatorGate.RequiredAction)
+	}
+}
+
 func TestParse_SupervisorOrderedQueue(t *testing.T) {
 	yaml := `
 repo: owner/repo

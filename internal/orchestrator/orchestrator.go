@@ -165,6 +165,7 @@ type Orchestrator struct {
 	ghPRMergeInfoFn              func(prNumber int) (github.PRMergeInfo, error)
 	ghCommentPRFn                func(prNumber int, body string) error
 	ghPRChangedFilesFn           func(prNumber int) ([]string, error)
+	ghPRLabelsFn                 func(prNumber int) ([]string, error)
 	ghPRVisualEvidenceAttachedFn func(prNumber int) (bool, error)
 	runVisualCaptureFn           func(v config.VerifyVisualConfig, worktreePath string) ([]string, error)
 	workerStopFn                 func(cfg *config.Config, slotName string, sess *state.Session) error
@@ -721,6 +722,16 @@ func (o *Orchestrator) commentPR(prNumber int, body string) error {
 	return o.gh.CommentPR(prNumber, body)
 }
 
+func (o *Orchestrator) prLabels(prNumber int) ([]string, error) {
+	if o.ghPRLabelsFn != nil {
+		return o.ghPRLabelsFn(prNumber)
+	}
+	if o.gh == nil {
+		return nil, fmt.Errorf("no github client configured for PR labels")
+	}
+	return o.gh.PRLabels(prNumber)
+}
+
 func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
 	if o.ghPRHasCriticalReviewFn != nil {
 		return o.ghPRHasCriticalReviewFn(prNumber)
@@ -851,6 +862,9 @@ func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
 	}
 	if o.readSource != nil {
 		return o.readSource.GetIssue(number)
+	}
+	if o.gh == nil {
+		return github.Issue{}, fmt.Errorf("no github client configured for get issue")
 	}
 	return o.gh.GetIssue(number)
 }
@@ -2268,6 +2282,12 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		if o.retireStaleRetry(s, slotName, sess) {
 			continue
 		}
+		if hold, prNumber, ok := o.operatorGateHoldForRetry(sess); ok {
+			o.applyOperatorGateHold(sess, github.PR{Number: prNumber}, hold)
+			log.Printf("[orch] worker %s retry held by operator gate %q - not respawning", slotName, hold.Name)
+			continue
+		}
+		clearOperatorGateHold(sess)
 
 		// Backoff elapsed — respawn the worker
 		log.Printf("[orch] worker %s backoff elapsed, respawning (retry %d)", slotName, sess.RetryCount)
@@ -4937,7 +4957,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		// Check the actual current head plus its aggregate and per-check rollup.
 		// The normalized rollup remains the merge gate; the durable snapshot below
 		// additionally hashes individual check transitions (#887).
-		_, ciStatus, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
+		ciRollup, ciStatus, gateTransition, gateObservable, observedAt, err := o.observePRGateCI(sess, pr)
 		if err != nil {
 			log.Printf("[orch] CI status for PR #%d: %v", pr.Number, err)
 			continue
@@ -4947,15 +4967,21 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				o.persistPRGateTransition(s, gateTransition, observedAt)
 			}
 		}
+		if hold, ok := o.operatorGateHoldFromLabels(sess.IssueNumber, pr.Number); ok {
+			persistGate()
+			o.applyOperatorGateHold(sess, pr, hold)
+			continue
+		}
 
 		switch ciStatus {
 		case "success":
 			// Reset CI-failure notification state when CI goes green. Keep
 			// review retry-exhausted markers so actionable feedback does not
 			// re-notify on every orchestration cycle.
-			if sess.LastNotifiedStatus == "ci_failure" || sess.LastNotifiedStatus == "ci_retry_exhausted" {
+			if sess.LastNotifiedStatus == "ci_failure" || sess.LastNotifiedStatus == "ci_retry_exhausted" || sess.LastNotifiedStatus == operatorGateStatus {
 				sess.LastNotifiedStatus = ""
 			}
+			clearOperatorGateHold(sess)
 			sess.NotifiedCIFail = false // backward compat
 
 			// The configured review gate is authoritative. In particular, a
@@ -5056,6 +5082,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
 		case "failure":
 			persistGate()
+			if sess.Status == state.StatusQueued {
+				sess.Status = state.StatusPROpen
+			}
+			if hold, ok := o.operatorGateHoldForPR(sess, pr, ciRollup); ok {
+				o.applyOperatorGateHold(sess, pr, hold)
+				continue
+			}
+			clearOperatorGateHold(sess)
 			// A failed rollup is actionable only for the exact head that was
 			// observed. Attribution stamping, an operator push, or another repair
 			// can advance the branch between listOpenPRsForCycle and this decision.
@@ -5064,9 +5098,6 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			// after the new head is already pending (OK Player PR #388).
 			if gateObservable && !o.prGateHeadMatches(pr.Number, gateTransition.HeadSHA) {
 				continue
-			}
-			if sess.Status == state.StatusQueued {
-				sess.Status = state.StatusPROpen
 			}
 			// Auto-retry on CI failure: close the PR, capture CI output, and schedule retry
 			if sess.LastNotifiedStatus != "ci_failure" && sess.LastNotifiedStatus != "ci_retry_exhausted" {
@@ -5077,6 +5108,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			if sess.Status == state.StatusQueued {
 				sess.Status = state.StatusPROpen
 			}
+			if hold, ok := o.operatorGateHoldForPR(sess, pr, ciRollup); ok {
+				o.applyOperatorGateHold(sess, pr, hold)
+				continue
+			}
+			clearOperatorGateHold(sess)
 		default:
 			persistGate()
 		}
@@ -7899,6 +7935,9 @@ func (o *Orchestrator) orderedQueueIssuePauseReason(s *state.State, issue github
 	if github.HasLabel(issue, o.cfg.ExcludeLabels) {
 		return fmt.Sprintf("issue #%d is excluded by configured label", issue.Number)
 	}
+	if label, ok := matchingIssueLabel(issue, o.operatorGateLabels()); ok {
+		return fmt.Sprintf("issue #%d is held by operator gate label %q", issue.Number, label)
+	}
 	if len(o.cfg.BlockerPatterns) > 0 {
 		blockers := github.FindBlockers(issue.Body, o.cfg.BlockerPatterns)
 		if len(blockers) > 0 {
@@ -8815,6 +8854,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 				}
 			}
 			log.Printf("[orch] skipping issue #%d (excluded label; repair authority does not bypass current guards)", issue.Number)
+			continue
+		}
+		if label, ok := matchingIssueLabel(issue, o.operatorGateLabels()); ok {
+			log.Printf("[orch] skipping issue #%d: held by operator gate label %q", issue.Number, label)
 			continue
 		}
 

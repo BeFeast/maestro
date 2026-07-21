@@ -2240,6 +2240,16 @@ type PRCheckRollup struct {
 	Fingerprint      string
 	Complete         bool
 	PendingCheckRuns bool
+	Signals          []PRCheckSignal
+}
+
+// PRCheckSignal is a non-secret check-run or commit-status identity used by the
+// control plane to recognize configured gates without reading log prose.
+type PRCheckSignal struct {
+	Source     string
+	Name       string
+	Status     string
+	Conclusion string
 }
 
 // PRCheckRollup returns the current head, normalized aggregate verdict, and a
@@ -2267,6 +2277,7 @@ func (c *Client) PRCheckRollup(prNumber int) (PRCheckRollup, error) {
 	}
 	if rollup.Complete {
 		rollup.Fingerprint = ciCheckRollupFingerprint(checks, combined)
+		rollup.Signals = ciCheckRollupSignals(checks, combined)
 	}
 	return rollup, nil
 }
@@ -2308,6 +2319,34 @@ func ciCheckRollupFingerprint(checks []greptileCheckRun, combined combinedStatus
 		h.Write([]byte{0})
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
+}
+
+func ciCheckRollupSignals(checks []greptileCheckRun, combined combinedStatusResponse) []PRCheckSignal {
+	checks = latestLogicalCheckRuns(checks)
+	signals := make([]PRCheckSignal, 0, len(checks)+len(combined.Statuses))
+	for _, check := range checks {
+		signals = append(signals, PRCheckSignal{
+			Source:     "check_run",
+			Name:       strings.TrimSpace(check.Name),
+			Status:     strings.ToLower(strings.TrimSpace(check.Status)),
+			Conclusion: strings.ToLower(strings.TrimSpace(check.Conclusion)),
+		})
+	}
+	for _, status := range combined.Statuses {
+		signals = append(signals, PRCheckSignal{
+			Source:     "commit_status",
+			Name:       strings.TrimSpace(status.Context),
+			Status:     strings.ToLower(strings.TrimSpace(status.State)),
+			Conclusion: strings.ToLower(strings.TrimSpace(status.State)),
+		})
+	}
+	sort.SliceStable(signals, func(i, j int) bool {
+		if signals[i].Source != signals[j].Source {
+			return signals[i].Source < signals[j].Source
+		}
+		return signals[i].Name < signals[j].Name
+	})
+	return signals
 }
 
 // PRMergeable returns the mergeable state: "MERGEABLE", "CONFLICTING", "UNKNOWN"
