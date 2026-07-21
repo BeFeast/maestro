@@ -17,6 +17,8 @@ import (
 	"github.com/befeast/maestro/internal/workerlease"
 )
 
+var workerRuntimeCurrentUser = user.Current
+
 func prepareAttemptRunner(cfg *config.Config, slotName, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit, reason string) (*workerlease.Lease, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("worker config is required")
@@ -46,16 +48,16 @@ func prepareAttemptRunner(cfg *config.Config, slotName, runnerPath string, args 
 	if err != nil {
 		return nil, err
 	}
-	currentUser, err := user.Current()
-	if err != nil {
-		return nil, fmt.Errorf("resolve worker runtime user: %w", err)
-	}
 	rollback := true
 	defer func() {
 		if rollback {
 			_ = workerlease.CleanupManifest(lease.ManifestPath, lease.ID)
 		}
 	}()
+	currentUser, err := workerRuntimeCurrentUser()
+	if err != nil {
+		return nil, fmt.Errorf("resolve worker runtime user: %w", err)
+	}
 
 	payloadPath := filepath.Join(lease.ScratchDir, "payload.sh")
 	if err := writeWorkerRunnerScript(cfg.StateDir, payloadPath, args, stdinFile, logFile, worktree, split); err != nil {

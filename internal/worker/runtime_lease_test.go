@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -103,6 +104,47 @@ func TestWorkerLeaseProjectRootSeparatesProjectsSharingScratchBase(t *testing.T)
 	}
 	if filepath.Dir(workerLeaseProjectRoot(a)) != filepath.Dir(workerLeaseProjectRoot(&b)) {
 		t.Fatal("project roots should remain under the configured scratch base")
+	}
+}
+
+func TestPrepareAttemptRunnerCleansLeaseWhenCurrentUserLookupFails(t *testing.T) {
+	cfg := isolatedRuntimeConfig(t, "project-a")
+	cfg.WorkerRuntime.Scope = config.WorkerRuntimeScopeUser
+
+	binDir := t.TempDir()
+	systemctl := filepath.Join(binDir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	originalCurrentUser := workerRuntimeCurrentUser
+	workerRuntimeCurrentUser = func() (*user.User, error) {
+		return nil, errors.New("forced current-user lookup failure")
+	}
+	t.Cleanup(func() { workerRuntimeCurrentUser = originalCurrentUser })
+
+	_, err := prepareAttemptRunner(
+		cfg,
+		"slot-user-failure",
+		filepath.Join(t.TempDir(), "runner.sh"),
+		[]string{"true"},
+		"",
+		filepath.Join(t.TempDir(), "worker.log"),
+		t.TempDir(),
+		nil,
+		"test",
+	)
+	if err == nil || !strings.Contains(err.Error(), "resolve worker runtime user") {
+		t.Fatalf("error = %v, want current-user lookup failure", err)
+	}
+
+	entries, err := os.ReadDir(workerLeaseProjectRoot(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("prepared worker lease survived failed user lookup: %v", entries)
 	}
 }
 
