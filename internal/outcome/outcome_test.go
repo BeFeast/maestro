@@ -237,6 +237,18 @@ func TestBriefAutomaticRecoveryRequiresDesiredOutcome(t *testing.T) {
 	}
 }
 
+func TestBriefRecoveryMaxFutileAttemptsDefaultsAndValidates(t *testing.T) {
+	if got := (Brief{}).EffectiveRecoveryMaxFutileAttempts(); got != 3 {
+		t.Fatalf("default recovery_max_futile_attempts = %d, want 3", got)
+	}
+	if got := (Brief{RecoveryMaxFutileAttempts: 5}).EffectiveRecoveryMaxFutileAttempts(); got != 5 {
+		t.Fatalf("configured recovery_max_futile_attempts = %d, want 5", got)
+	}
+	if err := (Brief{RecoveryMaxFutileAttempts: -1}).Validate(); err == nil || !strings.Contains(err.Error(), "recovery_max_futile_attempts") {
+		t.Fatalf("negative recovery_max_futile_attempts error = %v", err)
+	}
+}
+
 func TestCheckerHonorsStructuredUnhealthyWhenCommandExitsZero(t *testing.T) {
 	result := Checker{
 		RunCommand: func(context.Context, string, string) ([]byte, int, error) {

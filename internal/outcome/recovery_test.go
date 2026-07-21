@@ -40,6 +40,7 @@ func TestRecoveryStateOwnsActiveFailure(t *testing.T) {
 		{name: "executing", state: &RecoveryState{Status: RecoveryStatusExecuting}, want: true},
 		{name: "verification_pending", state: &RecoveryState{Status: RecoveryStatusVerificationPending}, want: true},
 		{name: "verified", state: &RecoveryState{Status: RecoveryStatusVerified}, want: false},
+		{name: "capped_yields_to_repair_issue", state: &RecoveryState{Status: RecoveryStatusCapped}, want: false},
 		{name: "uncertain", state: &RecoveryState{Status: RecoveryStatusUncertain}, want: false},
 		{name: "failed_no_cooldown", state: &RecoveryState{Status: RecoveryStatusFailed}, want: false},
 		{

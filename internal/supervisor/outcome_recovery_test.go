@@ -277,6 +277,163 @@ func TestEvaluateOutcomeRecoveryOnce_FailedCommandHonorsCooldown(t *testing.T) {
 	if runCalls != 1 {
 		t.Fatalf("runCalls=%d, want 1", runCalls)
 	}
+	if loaded.OutcomeRecovery.ConsecutiveFailures != 1 {
+		t.Fatalf("post-attempt failing verification count = %d, want 1", loaded.OutcomeRecovery.ConsecutiveFailures)
+	}
+}
+
+func TestEvaluateOutcomeRecoveryOnce_NonZeroCommandStillUsesPostAttemptHealth(t *testing.T) {
+	cfg := recoveryTestConfig(t)
+	cfg.Outcome.RecoveryMaxFutileAttempts = 1
+	t0 := time.Date(2026, 7, 18, 11, 0, 0, 0, time.UTC)
+	if err := state.Save(cfg.StateDir, state.NewState()); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	originalCheck, originalRun := checkOutcomeForRecovery, runOutcomeRecovery
+	t.Cleanup(func() { checkOutcomeForRecovery, runOutcomeRecovery = originalCheck, originalRun })
+	checkCalls := 0
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		checkCalls++
+		if checkCalls == 1 {
+			return outcome.HealthCheckResult{
+				CheckedAt: t0,
+				Signal:    "healthcheck_command",
+				State:     outcome.HealthFailing,
+				Checks:    []outcome.HealthCheckItem{{Name: "candidate-delivery", Blocking: true, Status: "fail"}},
+			}
+		}
+		return outcome.HealthCheckResult{
+			CheckedAt: t0.Add(2 * time.Second),
+			Signal:    "healthcheck_command",
+			State:     outcome.HealthHealthy,
+			Checks:    []outcome.HealthCheckItem{{Name: "candidate-delivery", Blocking: true, Status: "pass"}},
+		}
+	}
+	runOutcomeRecovery = func(_ context.Context, _ outcome.Brief) outcome.RecoveryExecution {
+		return outcome.RecoveryExecution{StartedAt: t0, FinishedAt: t0.Add(time.Second), ExitCode: 7}
+	}
+
+	if _, err := EvaluateOutcomeRecoveryOnce(cfg, t0); err != nil {
+		t.Fatalf("evaluate recovery: %v", err)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if checkCalls != 2 {
+		t.Fatalf("health checks = %d, want trigger + post-attempt verification", checkCalls)
+	}
+	if loaded.OutcomeRecovery == nil || loaded.OutcomeRecovery.Status != outcome.RecoveryStatusVerified {
+		t.Fatalf("non-zero command ignored healthy post-attempt verification: %+v", loaded.OutcomeRecovery)
+	}
+	if loaded.OutcomeRecovery.ConsecutiveFailures != 0 || !loaded.OutcomeRecovery.CappedAt.IsZero() {
+		t.Fatalf("healthy post-attempt verification counted as futile: %+v", loaded.OutcomeRecovery)
+	}
+}
+
+func TestEvaluateOutcomeRecoveryOnce_BoundsFutileAttemptsAndStopsLeasing(t *testing.T) {
+	cfg := recoveryTestConfig(t)
+	cfg.Outcome.RecoveryMaxFutileAttempts = 3
+	t0 := time.Date(2026, 7, 19, 6, 0, 0, 0, time.UTC)
+	if err := state.Save(cfg.StateDir, state.NewState()); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	originalCheck, originalRun := checkOutcomeForRecovery, runOutcomeRecovery
+	t.Cleanup(func() { checkOutcomeForRecovery, runOutcomeRecovery = originalCheck, originalRun })
+	checkCalls := 0
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		checkCalls++
+		return outcome.HealthCheckResult{
+			CheckedAt: t0.Add(time.Duration(checkCalls) * time.Minute),
+			Signal:    "healthcheck_command",
+			State:     outcome.HealthFailing,
+			Summary:   "healthcheck_command: linux-candidate-delivery reported fail",
+			Checks: []outcome.HealthCheckItem{{
+				Name: "linux-candidate-delivery", Blocking: true, Status: "fail",
+			}},
+		}
+	}
+	runCalls := 0
+	runOutcomeRecovery = func(_ context.Context, _ outcome.Brief) outcome.RecoveryExecution {
+		runCalls++
+		finished := t0.Add(time.Duration(runCalls) * time.Minute)
+		return outcome.RecoveryExecution{StartedAt: finished.Add(-time.Second), FinishedAt: finished, ExitCode: 0}
+	}
+
+	for cycle := 0; cycle < 5; cycle++ {
+		if _, err := EvaluateOutcomeRecoveryOnce(cfg, t0.Add(time.Duration(cycle)*25*time.Minute)); err != nil {
+			t.Fatalf("cycle %d: %v", cycle, err)
+		}
+	}
+	if runCalls != 3 {
+		t.Fatalf("recovery command ran %d times, want cap K=3", runCalls)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	recovery := loaded.OutcomeRecovery
+	if recovery == nil || recovery.Status != outcome.RecoveryStatusCapped {
+		t.Fatalf("recovery = %+v, want capped", recovery)
+	}
+	if recovery.ConsecutiveFailures != 3 || recovery.FailureFingerprint == "" || recovery.CappedAt.IsZero() {
+		t.Fatalf("cap-hit state incomplete: %+v", recovery)
+	}
+}
+
+func TestEvaluateOutcomeRecoveryOnce_ChangedFailureFingerprintRearmsImmediately(t *testing.T) {
+	cfg := recoveryTestConfig(t)
+	cfg.Outcome.RecoveryMaxFutileAttempts = 2
+	t0 := time.Date(2026, 7, 19, 9, 0, 0, 0, time.UTC)
+	if err := state.Save(cfg.StateDir, state.NewState()); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	originalCheck, originalRun := checkOutcomeForRecovery, runOutcomeRecovery
+	t.Cleanup(func() { checkOutcomeForRecovery, runOutcomeRecovery = originalCheck, originalRun })
+	gate := "gate-a"
+	checkCalls := 0
+	checkOutcomeForRecovery = func(_ context.Context, _ outcome.Brief) outcome.HealthCheckResult {
+		checkCalls++
+		return outcome.HealthCheckResult{
+			CheckedAt: t0.Add(time.Duration(checkCalls) * time.Minute),
+			Signal:    "healthcheck_command",
+			State:     outcome.HealthFailing,
+			Checks:    []outcome.HealthCheckItem{{Name: gate, Blocking: true, Status: "fail"}},
+		}
+	}
+	runCalls := 0
+	runOutcomeRecovery = func(_ context.Context, _ outcome.Brief) outcome.RecoveryExecution {
+		runCalls++
+		finished := t0.Add(time.Duration(runCalls) * time.Minute)
+		return outcome.RecoveryExecution{FinishedAt: finished, ExitCode: 0}
+	}
+
+	for cycle := 0; cycle < 3; cycle++ {
+		if _, err := EvaluateOutcomeRecoveryOnce(cfg, t0.Add(time.Duration(cycle)*25*time.Minute)); err != nil {
+			t.Fatalf("gate-a cycle %d: %v", cycle, err)
+		}
+	}
+	if runCalls != 2 {
+		t.Fatalf("gate-a recovery ran %d times, want 2", runCalls)
+	}
+
+	gate = "gate-b"
+	if _, err := EvaluateOutcomeRecoveryOnce(cfg, t0.Add(75*time.Minute)); err != nil {
+		t.Fatalf("gate-b cycle: %v", err)
+	}
+	if runCalls != 3 {
+		t.Fatalf("changed fingerprint did not re-arm immediately: runCalls=%d", runCalls)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if loaded.OutcomeRecovery.Status == outcome.RecoveryStatusCapped || loaded.OutcomeRecovery.ConsecutiveFailures != 1 {
+		t.Fatalf("changed fingerprint did not start a fresh streak: %+v", loaded.OutcomeRecovery)
+	}
 }
 
 func recoveryTestConfig(t *testing.T) *config.Config {

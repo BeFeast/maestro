@@ -22,12 +22,26 @@ const (
 	RecoveryStatusVerified            = "verified"
 	RecoveryStatusFailed              = "failed"
 	RecoveryStatusUncertain           = "uncertain"
+	// RecoveryStatusCapped means automatic recovery reached its bounded
+	// futility limit: K consecutive attempts left the same failing signal in
+	// place. No further attempt is leased until that signal changes.
+	RecoveryStatusCapped = "capped"
+
+	// OutcomeRepairLabel marks an issue filed by the futile-recovery intake
+	// path. It keeps the product/infrastructure repair worker distinct from the
+	// project-scoped recovery actuator and lets dispatch recognize the one issue
+	// that may proceed while the outcome gate is red.
+	OutcomeRepairLabel = "outcome-repair"
+	// OutcomeRepairMarkerPrefix identifies intake-created issues even when the
+	// repository does not permit Maestro to provision the optional label.
+	OutcomeRepairMarkerPrefix = "<!-- maestro:outcome-repair fingerprint="
 )
 
 const (
-	defaultRecoveryInterval = time.Minute
-	defaultRecoveryCooldown = 20 * time.Minute
-	defaultRecoveryTimeout  = 2 * time.Minute
+	defaultRecoveryInterval          = time.Minute
+	defaultRecoveryCooldown          = 20 * time.Minute
+	defaultRecoveryTimeout           = 2 * time.Minute
+	defaultRecoveryMaxFutileAttempts = 3
 )
 
 // Brief is the project operating brief Maestro uses to judge progress by the
@@ -55,6 +69,10 @@ type Brief struct {
 	RecoveryIntervalSeconds int    `yaml:"recovery_interval_seconds" json:"recovery_interval_seconds,omitempty"`
 	RecoveryCooldownMinutes int    `yaml:"recovery_cooldown_minutes" json:"recovery_cooldown_minutes,omitempty"`
 	RecoveryTimeoutSeconds  int    `yaml:"recovery_timeout_seconds" json:"recovery_timeout_seconds,omitempty"`
+	// RecoveryMaxFutileAttempts bounds consecutive attempts whose authoritative
+	// post-attempt verification remains failing with the same fingerprint. Zero
+	// uses the default (3).
+	RecoveryMaxFutileAttempts int `yaml:"recovery_max_futile_attempts" json:"recovery_max_futile_attempts,omitempty"`
 	// GateFailStreakThreshold is the number of consecutive same-fingerprint
 	// scheduled-gate failures at which Maestro emits a first-class supervisor
 	// event (notification + deduped repair intake). Zero uses the default (2); a
@@ -133,6 +151,21 @@ type RecoveryState struct {
 	VerifiedAt       time.Time `json:"verified_at,omitempty"`
 	ExitCode         *int      `json:"exit_code,omitempty"`
 	Summary          string    `json:"summary,omitempty"`
+
+	// ConsecutiveFailures counts authoritative post-attempt verifications that
+	// remained failing with FailureFingerprint. It resets when the failure
+	// fingerprint changes or health recovers.
+	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
+	// FailureFingerprint identifies the failing signal counted above.
+	FailureFingerprint string `json:"failure_fingerprint,omitempty"`
+	// CappedAt records when RecoveryStatusCapped was reached.
+	CappedAt time.Time `json:"capped_at,omitempty"`
+	// RepairIssue and RepairFingerprint record the deduped repair intake result.
+	RepairIssue       int    `json:"repair_issue,omitempty"`
+	RepairFingerprint string `json:"repair_fingerprint,omitempty"`
+	// NotifiedFingerprint records the cap fingerprint whose futile_recovery
+	// alert was successfully handed to the notify layer.
+	NotifiedFingerprint string `json:"notified_fingerprint,omitempty"`
 }
 
 func (b Brief) Normalized() Brief {
@@ -175,6 +208,9 @@ func (b Brief) Validate() error {
 	b = b.Normalized()
 	if b.RecoveryIntervalSeconds < 0 || b.RecoveryCooldownMinutes < 0 || b.RecoveryTimeoutSeconds < 0 {
 		return fmt.Errorf("outcome recovery interval, cooldown, and timeout must be >= 0")
+	}
+	if b.RecoveryMaxFutileAttempts < 0 {
+		return fmt.Errorf("outcome recovery_max_futile_attempts must be >= 0")
 	}
 	switch b.RecoveryMode {
 	case RecoveryModeDisabled:
@@ -219,6 +255,15 @@ func (b Brief) EffectiveRecoveryTimeout() time.Duration {
 		return time.Duration(b.RecoveryTimeoutSeconds) * time.Second
 	}
 	return defaultRecoveryTimeout
+}
+
+// EffectiveRecoveryMaxFutileAttempts returns the consecutive post-attempt
+// failing-verification cap. Zero config uses the safe default.
+func (b Brief) EffectiveRecoveryMaxFutileAttempts() int {
+	if b.RecoveryMaxFutileAttempts > 0 {
+		return b.RecoveryMaxFutileAttempts
+	}
+	return defaultRecoveryMaxFutileAttempts
 }
 
 // EffectiveGateFailStreakThreshold is the consecutive-failure count at which a
@@ -400,6 +445,27 @@ func normalizedHealthState(value string) string {
 	default:
 		return HealthUnknown
 	}
+}
+
+// FailingGateName returns the allow-listed blocking check name responsible for
+// a failing health result, falling back to its signal when no structured check
+// names the failure.
+func FailingGateName(h HealthCheckResult) string {
+	for _, check := range h.Checks {
+		if !check.Blocking {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(check.Status)) {
+		case "fail", "failing", "error":
+			if name := strings.TrimSpace(check.Name); name != "" {
+				return name
+			}
+		}
+	}
+	if signal := strings.TrimSpace(h.Signal); signal != "" {
+		return signal
+	}
+	return "outcome"
 }
 
 func compactStrings(values []string) []string {
