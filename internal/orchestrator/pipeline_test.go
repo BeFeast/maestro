@@ -46,7 +46,7 @@ func TestAdvancePipeline_NonPipelineSession(t *testing.T) {
 	cfg := pipelineConfig()
 	o := pipelineOrchestrator(cfg)
 	sess := &state.Session{Phase: state.PhaseNone}
-	if o.advancePipeline("slot-1", sess) {
+	if o.advancePipeline(state.NewState(), "slot-1", sess) {
 		t.Error("expected false for non-pipeline session")
 	}
 }
@@ -63,7 +63,7 @@ func TestAdvancePipeline_PlanComplete_NoArtifacts(t *testing.T) {
 		Status:      state.StatusRunning,
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if !handled {
 		t.Fatal("expected handled")
 	}
@@ -101,7 +101,7 @@ func TestAdvancePipeline_PlanComplete_WithArtifacts(t *testing.T) {
 		return nil
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if !handled {
 		t.Fatal("expected handled")
 	}
@@ -136,7 +136,7 @@ func TestAdvancePipeline_ImplementComplete_ValidatorEnabled(t *testing.T) {
 		return nil
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if !handled {
 		t.Fatal("expected handled")
 	}
@@ -178,7 +178,7 @@ func TestAdvancePipeline_PipelineFullSessionUsesValidatorBackendWithGlobalPipeli
 		return nil
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if !handled {
 		t.Fatal("expected handled")
 	}
@@ -203,7 +203,7 @@ func TestAdvancePipeline_ImplementComplete_ValidatorDisabled(t *testing.T) {
 		Status: state.StatusRunning,
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if handled {
 		t.Error("expected not handled (should fall through to normal dead-worker flow)")
 	}
@@ -226,7 +226,7 @@ func TestAdvancePipeline_ValidatePass(t *testing.T) {
 		Status:      state.StatusRunning,
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if handled {
 		t.Error("expected not handled (should fall through for PR detection)")
 	}
@@ -261,7 +261,7 @@ func TestAdvancePipeline_ValidateFail_RetryImplementer(t *testing.T) {
 		return nil
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if !handled {
 		t.Fatal("expected handled")
 	}
@@ -292,7 +292,7 @@ func TestAdvancePipeline_ValidateFail_ExhaustedRetries(t *testing.T) {
 		ValidationFails: 2, // Already failed twice, this will be the 3rd
 	}
 
-	handled := o.advancePipeline("slot-1", sess)
+	handled := o.advancePipeline(state.NewState(), "slot-1", sess)
 	if !handled {
 		t.Fatal("expected handled")
 	}

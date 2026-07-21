@@ -1501,7 +1501,7 @@ func (a ServerAuthConfig) ResolvedActorName() string {
 	return name
 }
 
-// RoleConfig defines settings for a single pipeline role (planner,
+// RoleConfig defines settings for a single pipeline role (planner, advisor,
 // implementer, validator).
 type RoleConfig struct {
 	Enabled           bool   `yaml:"enabled"`
@@ -1518,13 +1518,24 @@ type RoleConfig struct {
 	Effort string `yaml:"effort"`
 }
 
-// PipelineConfig controls the planner → implementer → validator phase pipeline
-// and deterministic pre-worker context preparation phases.
+const (
+	DefaultAdvisorReviewRounds = 2
+	MaxAdvisorReviewRounds     = 5
+)
+
+// PipelineConfig controls the planner → optional advisor → implementer →
+// validator phase pipeline and deterministic pre-worker context preparation
+// phases.
 type PipelineConfig struct {
-	// Phase-based pipeline (planner → implementer → validator)
-	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline globally (default: false; issue label pipeline:full opts in per worker)
-	Planner   RoleConfig `yaml:"planner"`   // planner role settings
-	Validator RoleConfig `yaml:"validator"` // validator role settings
+	// Phase-based pipeline (planner → optional advisor → implementer → validator)
+	Enabled bool       `yaml:"enabled"` // enable the phase pipeline globally (default: false; issue labels can opt in per worker)
+	Planner RoleConfig `yaml:"planner"` // planner role settings
+	Advisor RoleConfig `yaml:"advisor"` // independent, review-only plan advisor (default: disabled)
+	// AdvisorReviewRounds bounds Advisor passes across planner revisions. Zero
+	// means the default of two; parse rejects values above the hard cap of five.
+	AdvisorReviewRounds int        `yaml:"advisor_review_rounds"`
+	AdvisorBestEffort   bool       `yaml:"advisor_best_effort"` // explicit auditable bypass instead of fail-closed (default: false)
+	Validator           RoleConfig `yaml:"validator"`           // validator role settings
 	// Implementer carries the implement phase's own backend/effort override (#841)
 	// so the token-heavy implement phase can run on a cheap backend + low effort
 	// while plan/validate keep the strong model. Empty backend falls back to
@@ -1537,6 +1548,20 @@ type PipelineConfig struct {
 	Research       bool  `yaml:"research"`        // scan repo context before worker starts (default: false)
 	PlanValidation *bool `yaml:"plan_validation"` // heuristic plan coverage check before coding starts (default: true)
 	TestMapping    *bool `yaml:"test_mapping"`    // map requirements to verify commands (default: true)
+}
+
+// EffectiveAdvisorReviewRounds returns the bounded number of Advisor passes.
+// Directly-constructed configs are clamped defensively even though Parse rejects
+// values above the hard cap.
+func (p PipelineConfig) EffectiveAdvisorReviewRounds() int {
+	rounds := p.AdvisorReviewRounds
+	if rounds <= 0 {
+		rounds = DefaultAdvisorReviewRounds
+	}
+	if rounds > MaxAdvisorReviewRounds {
+		return MaxAdvisorReviewRounds
+	}
+	return rounds
 }
 
 // PlanValidationEnabled returns whether plan validation is enabled (default: true).
@@ -2264,6 +2289,9 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
 	}
+	if cfg.Pipeline.AdvisorReviewRounds < 0 || cfg.Pipeline.AdvisorReviewRounds > MaxAdvisorReviewRounds {
+		return nil, fmt.Errorf("config: pipeline.advisor_review_rounds must be between 1 and %d when set (0 uses the default of %d)", MaxAdvisorReviewRounds, DefaultAdvisorReviewRounds)
+	}
 
 	// #869: optional project identity metadata. A present project_id must be a
 	// UUID; a present management_home must satisfy its field contract. Both are
@@ -2361,6 +2389,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.BugPrompt = expandHome(cfg.BugPrompt)
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
+	cfg.Pipeline.Advisor.Prompt = expandHome(cfg.Pipeline.Advisor.Prompt)
 	cfg.Pipeline.Implementer.Prompt = expandHome(cfg.Pipeline.Implementer.Prompt)
 	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
 	cfg.Supervisor.Prompt = expandHome(cfg.Supervisor.Prompt)
@@ -3014,11 +3043,12 @@ func (c *Config) manualRoutingLabelPinWarning() string {
 		return ""
 	}
 	if strings.TrimSpace(c.Pipeline.Planner.Backend) != "" ||
+		strings.TrimSpace(c.Pipeline.Advisor.Backend) != "" ||
 		strings.TrimSpace(c.Pipeline.Validator.Backend) != "" {
 		return ""
 	}
 	return fmt.Sprintf(
-		"config: %d backends are configured but routing.mode is %q and no pipeline.{planner,validator}.backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: policy for task-aware routing, routing.mode: auto for LLM routing, or per-role pipeline backends for role-based routing.",
+		"config: %d backends are configured but routing.mode is %q and no pipeline.{planner,advisor,validator}.backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: policy for task-aware routing, routing.mode: auto for LLM routing, or per-role pipeline backends for role-based routing.",
 		len(c.Model.Backends),
 		coalesceRoutingMode(c.Routing.Mode),
 	)
