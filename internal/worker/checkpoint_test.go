@@ -309,7 +309,7 @@ func TestAssemblePromptWithCheckpoint_NoCheckpoint(t *testing.T) {
 	iss := github.Issue{Number: 1, Title: "test", Body: "body"}
 	cfg := &config.Config{Repo: "owner/repo"}
 
-	result := assemblePromptWithCheckpoint("base prompt", iss, "/tmp/wt", "feat/branch", cfg, "")
+	result := assemblePromptWithCheckpoint("base prompt", iss, "/tmp/wt", "feat/branch", cfg, "", "")
 	if strings.Contains(result, "Previous Session Checkpoint") {
 		t.Error("should not contain checkpoint section when checkpoint is empty")
 	}
@@ -320,15 +320,115 @@ func TestAssemblePromptWithCheckpoint_WithCheckpoint(t *testing.T) {
 	cfg := &config.Config{Repo: "owner/repo"}
 
 	checkpoint := "# Checkpoint\nTokens used: 80000\n## Commits made\nabc123 feat: stuff"
-	result := assemblePromptWithCheckpoint("base prompt", iss, "/tmp/wt", "feat/branch", cfg, checkpoint)
+	result := assemblePromptWithCheckpoint("base prompt", iss, "/tmp/wt", "feat/branch", cfg, checkpoint, "/state/slot-1/CHECKPOINT.md")
 	if !strings.Contains(result, "Previous Session Checkpoint") {
 		t.Error("should contain checkpoint section header")
 	}
 	if !strings.Contains(result, "abc123 feat: stuff") {
 		t.Error("should contain checkpoint content")
 	}
-	if !strings.Contains(result, "continue where the previous session left off") {
-		t.Error("should contain continuation instructions")
+	if !strings.Contains(result, "Checkpoint source: /state/slot-1/CHECKPOINT.md") {
+		t.Error("should record the checkpoint source")
+	}
+	if !strings.Contains(result, "AUTHORITATIVE (revision "+continuationRevision("base prompt")) {
+		t.Error("should record the fresh continuation revision behind a precedence marker")
+	}
+}
+
+// TestAssemblePromptWithCheckpoint_FreshPayloadOutranksStaleCheckpoint is the
+// #973 regression: a completed prior worker log ending in a terminal stop message
+// must not appear as an authoritative instruction, and the fresh continuation
+// payload must be emitted after the checkpoint behind an explicit precedence
+// marker so it wins recency.
+func TestAssemblePromptWithCheckpoint_FreshPayloadOutranksStaleCheckpoint(t *testing.T) {
+	iss := github.Issue{Number: 973, Title: "continuation", Body: "add tests, amend push"}
+	cfg := &config.Config{Repo: "owner/repo"}
+
+	checkpoint := strings.Join([]string{
+		"# Checkpoint",
+		"## Last worker output",
+		"PR already opened. Ready for review — stopping as instructed.",
+		"All done, nothing more to do.",
+	}, "\n")
+	freshBase := "MAESTRO_FRESH_CONTINUATION_MARKER: add the missing regression test and amend the push"
+
+	result := assemblePromptWithCheckpoint(freshBase, iss, "/tmp/wt", "feat/branch", cfg, checkpoint, "/state/CHECKPOINT.md")
+
+	cpIdx := strings.Index(result, "Previous Session Checkpoint")
+	freshIdx := strings.Index(result, "MAESTRO_FRESH_CONTINUATION_MARKER")
+	precIdx := strings.Index(result, "Current continuation requirements — AUTHORITATIVE")
+	if cpIdx < 0 || freshIdx < 0 || precIdx < 0 {
+		t.Fatalf("missing sections: checkpoint=%d fresh=%d precedence=%d", cpIdx, freshIdx, precIdx)
+	}
+	// Ordering: checkpoint context, then precedence marker, then fresh payload.
+	if !(cpIdx < precIdx && precIdx < freshIdx) {
+		t.Fatalf("ordering wrong: checkpoint=%d precedence=%d fresh=%d (want checkpoint < precedence < fresh)", cpIdx, precIdx, freshIdx)
+	}
+	// The stale terminal sign-off lines must be annotated as superseded, never
+	// left as bare authoritative instructions.
+	for _, stale := range []string{
+		"PR already opened. Ready for review — stopping as instructed.",
+		"All done, nothing more to do.",
+	} {
+		marked := supersededDirectiveMarker + stale
+		if !strings.Contains(result, marked) {
+			t.Errorf("stale terminal line not annotated as superseded:\n%q", stale)
+		}
+	}
+}
+
+func TestSanitizeCheckpointTerminalDirectives(t *testing.T) {
+	neutralized := []string{
+		"PR already opened, stopping.",
+		"The pull request has already been opened.",
+		"Ready for review.",
+		"Stopping as instructed by the task.",
+		"You are done — exiting now.",
+		"All done, nothing left to do.",
+		"Task complete.",
+		"I'll stop now.",
+	}
+	for _, line := range neutralized {
+		got := sanitizeCheckpointTerminalDirectives(line)
+		if !strings.HasPrefix(got, supersededDirectiveMarker) {
+			t.Errorf("terminal directive not annotated: %q -> %q", line, got)
+		}
+	}
+
+	preserved := []string{
+		"Refactored the token accounting helper.",
+		"Added a regression test for the parser.",
+		"Committed abc123 with the fix.",
+	}
+	for _, line := range preserved {
+		if got := sanitizeCheckpointTerminalDirectives(line); got != line {
+			t.Errorf("benign line altered: %q -> %q", line, got)
+		}
+	}
+
+	if got := sanitizeCheckpointTerminalDirectives(""); got != "" {
+		t.Errorf("empty checkpoint should stay empty, got %q", got)
+	}
+}
+
+// TestAssemblePromptWithCheckpoint_TokenBudgetRecoveryPreserved covers acceptance
+// #5: a genuine token-budget respawn still carries its checkpoint context and the
+// guidance to skip already-committed work.
+func TestAssemblePromptWithCheckpoint_TokenBudgetRecoveryPreserved(t *testing.T) {
+	iss := github.Issue{Number: 42, Title: "big feature", Body: "implement it"}
+	cfg := &config.Config{Repo: "owner/repo"}
+
+	checkpoint := "# Checkpoint\nTokens used (attempt): 190000\n## Commits made\n```\ndef456 feat: partial work\n```"
+	result := assemblePromptWithCheckpoint("continue the feature", iss, "/tmp/wt", "feat/branch", cfg, checkpoint, "/state/CHECKPOINT.md")
+
+	for _, want := range []string{
+		"def456 feat: partial work",
+		"avoid redoing",
+		"same worktree and the same",
+	} {
+		if !strings.Contains(result, want) {
+			t.Errorf("token-budget recovery prompt missing %q", want)
+		}
 	}
 }
 
