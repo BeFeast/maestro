@@ -48,6 +48,9 @@ func TestDrainSetsSpawnDrainAndReturnsWhenIdle(t *testing.T) {
 		if !s.DrainActive() {
 			t.Fatalf("flow %s: SpawnDrain not set after Drain", name)
 		}
+		if !s.ShutdownDrainActive() {
+			t.Fatalf("flow %s: daemon Drain did not persist shutdown-specific drain intent", name)
+		}
 	}
 }
 
@@ -86,8 +89,8 @@ func TestDrainWaitsForWorkersThenAbortsOnCancel(t *testing.T) {
 	}
 
 	// SpawnDrain was still requested in phase 1.
-	if s, err := state.Load(cfg.StateDir); err != nil || !s.DrainActive() {
-		t.Fatalf("SpawnDrain not set during wait (err=%v)", err)
+	if s, err := state.Load(cfg.StateDir); err != nil || !s.ShutdownDrainActive() {
+		t.Fatalf("shutdown drain intent not set during wait (err=%v)", err)
 	}
 
 	// Second signal → ctx cancel → Drain aborts the wait.
