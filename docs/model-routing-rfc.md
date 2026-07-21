@@ -37,7 +37,8 @@ A subtle but load-bearing fact, with one backend-specific exception: for the
 first-class agentic backends (claude/codex/gemini) **`BackendDef.model`,
 `.variant`, `.effort`, and `.provider` are attribution metadata, not worker
 inputs** — documented as "optional per-backend attribution metadata" used by the
-dashboard and the commit trailer (`internal/config/config.go:33-42`). **The Pi
+durable session timeline and Fleet Mission Control
+(`internal/config/config.go`). **The Pi
 backend is the exception:** its `Provider` and `Model` *are* live worker inputs —
 they are copied into `worker.BackendConfig` (`internal/worker/worker.go:115-116`)
 and `piBackend.BuildCmd` turns them into `--provider` / `--model` argv
@@ -284,7 +285,7 @@ dispatched to the single `model.default` regardless of band.
   `cmd/maestro/main.go:1461`), the fleet API / Mission Control drawer
   (`internal/server/fleet.go:1152-1155`, `internal/server/server.go:381,416`),
   and the durable internal session attribution timeline. Historical
-  `Maestro-Backend:` trailers remain parseable for compatibility, but routing
+  `Maestro-Backend:` trailers remain recognizable for compatibility, but routing
   telemetry is not written to product commits (#1000).
 
 The gap: `SelectionReason` records **which lever fired**, not **why the task

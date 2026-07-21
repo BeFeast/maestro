@@ -76,12 +76,10 @@ type BackendDef struct {
 	Enabled    *bool     `yaml:"enabled"`     // nil means enabled for backward compatibility
 	MCP        MCPConfig `yaml:"mcp,omitempty"`
 
-	// #513: optional per-backend attribution metadata. Lets the
-	// dashboard / commit trailer record which provider+model actually
-	// produced the work, beyond the shim name. All four are optional;
-	// absent fields render as "—" in UI and are omitted from commit
-	// trailers. Backends that don't set them keep working unchanged
-	// (legacy behaviour preserved).
+	// #513/#1000: optional per-backend attribution metadata. Maestro stores it
+	// in durable session state and surfaces it in Fleet Mission Control; it must
+	// never be injected into product commits. All four fields are optional, and
+	// absent values render as "—" in the UI (legacy behavior preserved).
 	Provider string `yaml:"provider,omitempty"` // e.g. "anthropic", "openai", "groq"
 	Model    string `yaml:"model,omitempty"`    // e.g. "opus-4.8", "gpt-5.5", "llama-3.3-70b-versatile"
 	Variant  string `yaml:"variant,omitempty"`  // e.g. "opus[1m]", "fast", "sonnet"
