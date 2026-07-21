@@ -933,6 +933,15 @@ func TestIssueInProgress_CodeLandedCountsAsInProgress(t *testing.T) {
 	}
 }
 
+func TestIssueInProgress_OperatorGateCountsAsInProgress(t *testing.T) {
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 102, Status: StatusDead, OperatorGateName: "label:operator-decision"}
+
+	if !s.IssueInProgress(102) {
+		t.Error("IssueInProgress should return true for operator-gated session")
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }

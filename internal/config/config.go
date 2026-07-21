@@ -872,6 +872,7 @@ type SupervisorConfig struct {
 	ReviewRepair            SupervisorReviewRepairConfig    `yaml:"review_repair" json:"review_repair,omitempty"`
 	PreflightCommand        string                          `yaml:"preflight_command" json:"preflight_command,omitempty"`
 	CompletionGates         SupervisorCompletionGatesConfig `yaml:"completion_gates" json:"completion_gates,omitempty"`
+	OperatorGate            SupervisorOperatorGateConfig    `yaml:"operator_gate" json:"operator_gate,omitempty"`
 	SafeActions             []string                        `yaml:"safe_actions" json:"safe_actions,omitempty"`
 	ApprovalRequired        []string                        `yaml:"approval_required" json:"approval_required,omitempty"`
 	AllowedActions          []string                        `yaml:"allowed_actions" json:"allowed_actions,omitempty"`
@@ -957,6 +958,16 @@ type SupervisorSpecGroomConfig struct {
 	// still gets its lint comment but keeps its normal labeling flow). Has no
 	// effect unless Enabled is also true.
 	RequireLintPass bool `yaml:"require_lint_pass" json:"require_lint_pass,omitempty"`
+}
+
+// SupervisorOperatorGateConfig describes deliberate human/operator holds that
+// must be treated as waiting states, not retryable implementation failures.
+// Check names are machine-readable check-run names or commit-status contexts;
+// shell-style globs are allowed for repository-specific naming variants.
+type SupervisorOperatorGateConfig struct {
+	CheckNames     []string `yaml:"check_names" json:"check_names,omitempty"`
+	Labels         []string `yaml:"labels" json:"labels,omitempty"`
+	RequiredAction string   `yaml:"required_action" json:"required_action,omitempty"`
 }
 
 // SpecGroomOn reports whether the spec-lint + grooming capability is enabled
@@ -2779,6 +2790,9 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	policy.CompletionGates.LiveVisualCommand = strings.TrimSpace(policy.CompletionGates.LiveVisualCommand)
 	policy.CompletionGates.DeploymentStatusCmd = strings.TrimSpace(policy.CompletionGates.DeploymentStatusCmd)
 	policy.CompletionGates.VerificationLabel = strings.TrimSpace(policy.CompletionGates.VerificationLabel)
+	policy.OperatorGate.CheckNames = normalizeStringList(policy.OperatorGate.CheckNames)
+	policy.OperatorGate.Labels = normalizeStringList(policy.OperatorGate.Labels)
+	policy.OperatorGate.RequiredAction = strings.TrimSpace(policy.OperatorGate.RequiredAction)
 	if policy.DynamicWave.DependencyUnblock.Enabled == nil &&
 		policy.DynamicWave.Active() &&
 		policy.DynamicWave.OwnsReadyLabel &&
