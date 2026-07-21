@@ -1345,9 +1345,12 @@ type State struct {
 	// workers but lets in-flight workers finish. It is set by `maestro
 	// drain` and cleared automatically when the orchestrator starts, so a
 	// drain never persists across a legitimate restart. SpawnDrainAt records
-	// when the drain was requested (UTC).
-	SpawnDrain   bool      `json:"spawn_drain,omitempty"`
-	SpawnDrainAt time.Time `json:"spawn_drain_at,omitempty"`
+	// when the drain was requested (UTC). ShutdownDrain distinguishes the
+	// daemon's in-process SIGTERM drain from a standalone operator drain: only
+	// the former makes a process loss restart-resumable (#967).
+	SpawnDrain    bool      `json:"spawn_drain,omitempty"`
+	SpawnDrainAt  time.Time `json:"spawn_drain_at,omitempty"`
+	ShutdownDrain bool      `json:"shutdown_drain,omitempty"`
 
 	// Paused is the first-class operator pause (#683): while it is set, the
 	// orchestrator skips issue selection entirely and spawns no new workers,
@@ -1886,6 +1889,7 @@ func (s *State) copyFrom(src *State) {
 	s.LastMergeAt = src.LastMergeAt
 	s.SpawnDrain = src.SpawnDrain
 	s.SpawnDrainAt = src.SpawnDrainAt
+	s.ShutdownDrain = src.ShutdownDrain
 	s.Paused = src.Paused
 	s.PausedAt = src.PausedAt
 	s.MaterialProgress = src.MaterialProgress
@@ -1998,10 +2002,12 @@ func mergeSpawnDrain(merged, current, ours *State) {
 	if ours.SpawnDrainAt.After(current.SpawnDrainAt) {
 		merged.SpawnDrain = ours.SpawnDrain
 		merged.SpawnDrainAt = ours.SpawnDrainAt
+		merged.ShutdownDrain = ours.ShutdownDrain
 		return
 	}
 	merged.SpawnDrain = current.SpawnDrain
 	merged.SpawnDrainAt = current.SpawnDrainAt
+	merged.ShutdownDrain = current.ShutdownDrain
 }
 
 // mergePaused resolves the pause flag (#683) latest-write-wins by PausedAt,
@@ -4024,6 +4030,20 @@ func (s *State) SetSpawnDrain(at time.Time) {
 		return
 	}
 	s.SpawnDrain = true
+	s.ShutdownDrain = false
+	s.SpawnDrainAt = normalizedTime(at)
+}
+
+// SetShutdownDrain requests the daemon's in-process graceful shutdown drain.
+// Unlike a standalone `maestro drain`, a worker process lost during this window
+// is presumed interrupted by the daemon restart and may carry restart intent
+// across its running-to-dead transition (#967).
+func (s *State) SetShutdownDrain(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.SpawnDrain = true
+	s.ShutdownDrain = true
 	s.SpawnDrainAt = normalizedTime(at)
 }
 
@@ -4034,12 +4054,19 @@ func (s *State) ClearSpawnDrain(at time.Time) {
 		return
 	}
 	s.SpawnDrain = false
+	s.ShutdownDrain = false
 	s.SpawnDrainAt = normalizedTime(at)
 }
 
 // DrainActive reports whether a graceful drain is currently requested.
 func (s *State) DrainActive() bool {
 	return s != nil && s.SpawnDrain
+}
+
+// ShutdownDrainActive reports whether the active drain belongs to an in-process
+// daemon shutdown rather than a standalone operator drain.
+func (s *State) ShutdownDrainActive() bool {
+	return s != nil && s.SpawnDrain && s.ShutdownDrain
 }
 
 // SetPaused marks the project paused (#683): the orchestrator skips issue

@@ -207,6 +207,47 @@ func TestCheckpointInFlightForRestart_YieldsToTerminalSession(t *testing.T) {
 	}
 }
 
+// A FinishedAt timestamp inside the drain window does not prove shutdown caused
+// the terminal transition. Ordinary failures and scheduled retries can also be
+// persisted while flows drain, so the shutdown checkpoint pass must continue to
+// accept only sessions that are still running rather than infer restart intent
+// from timestamp ordering.
+func TestCheckpointInFlightForRestart_DoesNotInferDeadDuringDrain(t *testing.T) {
+	stateDir := t.TempDir()
+	worktree := t.TempDir()
+	drainStart := time.Now().UTC().Add(-time.Minute)
+	finished := drainStart.Add(30 * time.Second)
+	retryAt := finished.Add(5 * time.Minute)
+
+	s := state.NewState()
+	s.SetSpawnDrain(drainStart)
+	s.Sessions["sup-320"] = &state.Session{
+		IssueNumber: 320,
+		Status:      state.StatusDead,
+		Worktree:    worktree,
+		FinishedAt:  &finished,
+		NextRetryAt: &retryAt,
+	}
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	d := &Daemon{}
+	d.checkpointInFlightForRestart(time.Now().Add(time.Hour), []string{stateDir})
+
+	reloaded, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got := reloaded.Sessions["sup-320"]
+	if got.RestartCheckpointAt != nil {
+		t.Fatalf("ordinary dead session received restart marker %v", got.RestartCheckpointAt)
+	}
+	if got.NextRetryAt == nil || !got.NextRetryAt.Equal(retryAt) {
+		t.Fatalf("ordinary retry policy changed: next_retry_at=%v, want %v", got.NextRetryAt, retryAt)
+	}
+}
+
 // A running session whose worktree no longer exists cannot be resumed in place,
 // so it is left unmarked for the normal reconcile/retry path.
 func TestCheckpointInFlightForRestart_SkipsMissingWorktree(t *testing.T) {
