@@ -5286,14 +5286,12 @@ func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.
 		// not an optional timestamp, orders an older completed PR claim.
 		StartedAt: time.Time{},
 	}
-	s.RecordSupervisorDecision(state.SupervisorDecision{
-		ID:                "sup-repair-newer-pr",
-		CreatedAt:         time.Now().UTC(),
-		RecommendedAction: supervisor.ActionSpawnRepairWorker,
-		Risk:              supervisor.RiskMutating,
-		RequiresApproval:  false,
-		Target:            &state.SupervisorTarget{Issue: 887, PR: 914, Session: "sup-360"},
-	}, state.DefaultSupervisorDecisionLimit)
+	repair := repairApproval("repair-newer-pr", 887, 914, state.ApprovalStatusPending, oldFinished.Add(24*time.Hour))
+	repair.Target.Session = "sup-360"
+	s.Approvals = []state.Approval{repair}
+	if _, err := s.ApproveApproval("repair-newer-pr", oldFinished.Add(25*time.Hour), "operator", "approve exact repair"); err != nil {
+		t.Fatalf("approve repair: %v", err)
+	}
 
 	o.startNewWorkers(s, 1)
 
@@ -5308,6 +5306,9 @@ func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.
 	}
 	if got := s.Sessions["sup-360"].Worktree; got != restoredWorktree {
 		t.Fatalf("restored worktree = %q, want %q", got, restoredWorktree)
+	}
+	if got := approvalStatus(t, s, "repair-newer-pr"); got != state.ApprovalStatusSuperseded {
+		t.Fatalf("repair approval = %q, want consumed/superseded", got)
 	}
 	if len(s.Sessions) != 2 {
 		t.Fatalf("sessions = %d, want no new session", len(s.Sessions))
