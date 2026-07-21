@@ -1353,7 +1353,7 @@ type fleetProjectState struct {
 	DispatchSLASeconds int                  `json:"dispatch_sla_seconds,omitempty"`
 
 	// RestartRequired/RestartRequiredReason mirror the orchestrator's restart-required
-	// signal (set when model.default / routing.* changed but cannot be hot-applied).
+	// signal (set when routing.* changes but cannot be hot-applied).
 	RestartRequired       bool   `json:"restart_required,omitempty"`
 	RestartRequiredReason string `json:"restart_required_reason,omitempty"`
 
@@ -1503,6 +1503,9 @@ type fleetSettingSource struct {
 type fleetModelPolicy struct {
 	Default          string                        `json:"default"`
 	FallbackBackends []string                      `json:"fallback_backends,omitempty"`
+	ProviderLanes    []config.ProviderLane         `json:"provider_lanes,omitempty"`
+	ResolvedRoute    []string                      `json:"resolved_route"`
+	SelectionReason  string                        `json:"selection_reason"`
 	Backends         []fleetEffectiveBackendConfig `json:"backends"`
 	Routing          fleetEffectiveRoutingConfig   `json:"routing"`
 }
@@ -4072,14 +4075,18 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Name < backends[j].Name })
 
 	meteredBackend, meteredRefused := cfg.SupervisorMeteredRefusal()
+	modelRoute := cfg.Model.ResolvedRoute()
 
 	retention := cfg.SessionRetention
 	return fleetEffectiveConfig{
 		ProjectID:      strings.TrimSpace(cfg.ProjectID),
 		ManagementHome: fleetManagementHomeFromConfig(cfg.ManagementHome),
 		ModelPolicy: fleetModelPolicy{
-			Default:          strings.TrimSpace(cfg.Model.Default),
+			Default:          cfg.Model.EffectiveDefault(),
 			FallbackBackends: append([]string(nil), cfg.Model.FallbackBackends...),
+			ProviderLanes:    append([]config.ProviderLane(nil), modelRoute.Lanes...),
+			ResolvedRoute:    append([]string(nil), modelRoute.Backends...),
+			SelectionReason:  modelRoute.SelectionReason,
 			Backends:         backends,
 			Routing: fleetEffectiveRoutingConfig{
 				Mode:                strings.TrimSpace(cfg.Routing.Mode),
@@ -4649,34 +4656,21 @@ func fleetIssuesCoveredByExecutedCloseApproval(st *state.State) map[int]bool {
 	return covered
 }
 
-// configuredWorkerBackends returns the set of backends a fresh dispatch could
-// route a worker to: the default backend plus every enabled backend declared
-// in model.backends. Disabled backends are omitted — they are never
-// dispatchable, so they cannot serve as an available escape hatch when
-// deciding whether the project is fully blocked by model limits (#814).
+// configuredWorkerBackends returns the enabled backends in the exact effective
+// dispatch route. Unrelated backend definitions are not escape hatches because
+// the selector will never try them without an explicit label or policy pin.
 func configuredWorkerBackends(cfg *config.Config) []string {
 	if cfg == nil {
 		return nil
 	}
-	seen := make(map[string]bool)
 	var names []string
-	add := func(name string) {
+	for _, name := range cfg.Model.ResolvedRoute().Backends {
 		name = strings.TrimSpace(name)
-		if name == "" || seen[name] {
-			return
+		def, ok := cfg.Model.Backends[name]
+		if name == "" || !ok || !def.IsEnabled() {
+			continue
 		}
-		seen[name] = true
 		names = append(names, name)
-	}
-	// The default backend is auto-defined and dispatchable unless it is
-	// explicitly present-and-disabled in model.backends.
-	if def, ok := cfg.Model.Backends[cfg.Model.Default]; !ok || def.IsEnabled() {
-		add(cfg.Model.Default)
-	}
-	for name, def := range cfg.Model.Backends {
-		if def.IsEnabled() {
-			add(name)
-		}
 	}
 	return names
 }

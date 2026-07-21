@@ -69,7 +69,7 @@ func ValidateBackend(name string, cfg *config.Config) (string, bool) {
 	if _, ok := cfg.Model.Backends[name]; ok {
 		return name, true
 	}
-	return cfg.Model.Default, false
+	return cfg.Model.EffectiveDefault(), false
 }
 
 // ResolveBackend determines the backend for an issue using 3-tier priority:
@@ -100,12 +100,13 @@ func (r *Router) ResolveBackendDecision(issue github.Issue) BackendDecision {
 // it only applies under routing.mode == "policy" and is ignored otherwise. The
 // label override and model.default precedence is identical at every level.
 func (r *Router) ResolveBackendDecisionForAttempt(issue github.Issue, escalationSteps int) BackendDecision {
+	defaultBackend := r.cfg.Model.EffectiveDefault()
 	// 1. Check for model: label (highest priority)
 	if name := BackendFromLabels(issue); name != "" {
 		validated, ok := ValidateBackend(name, r.cfg)
 		if !ok {
 			log.Printf("[router] issue #%d: label specifies unknown backend %q, falling back to default %q",
-				issue.Number, name, r.cfg.Model.Default)
+				issue.Number, name, defaultBackend)
 			return BackendDecision{Backend: validated, Reason: ReasonUnknownPin}
 		}
 		log.Printf("[router] issue #%d → %s (label override)", issue.Number, validated)
@@ -128,8 +129,8 @@ func (r *Router) ResolveBackendDecisionForAttempt(issue github.Issue, escalation
 		// deterministically instead of dispatching the call.
 		if backend, refused := r.cfg.RouterMeteredRefusal(); refused {
 			log.Printf("[router] issue #%d: router_model %q is metered (per-token) and routing.allow_metered_backend is not set — skipping router LLM, using default %q (#838)",
-				issue.Number, backend, r.cfg.Model.Default)
-			return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonMeteredRefused}
+				issue.Number, backend, defaultBackend)
+			return BackendDecision{Backend: defaultBackend, Reason: ReasonMeteredRefused}
 		}
 		routeDecisionFn := r.RouteDecision
 		if r.DecisionFn != nil {
@@ -143,8 +144,8 @@ func (r *Router) ResolveBackendDecisionForAttempt(issue github.Issue, escalation
 		routeDecision, err := routeDecisionFn(issue)
 		if err != nil {
 			log.Printf("[router] issue #%d: auto-routing failed (%v) — using default %q with reason=%s",
-				issue.Number, err, r.cfg.Model.Default, ReasonRouterError)
-			return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonRouterError, TaskType: routeDecision.TaskType}
+				issue.Number, err, defaultBackend, ReasonRouterError)
+			return BackendDecision{Backend: defaultBackend, Reason: ReasonRouterError, TaskType: routeDecision.TaskType}
 		}
 		taskType := normalizeTaskType(routeDecision.TaskType)
 		if taskType != "" {
@@ -152,7 +153,7 @@ func (r *Router) ResolveBackendDecisionForAttempt(issue github.Issue, escalation
 				validated, ok := ValidateBackend(mappedBackend, r.cfg)
 				if !ok {
 					log.Printf("[router] issue #%d: task_type=%s maps to unknown backend %q — using default %q with reason=%s",
-						issue.Number, taskType, mappedBackend, r.cfg.Model.Default, ReasonRouterError)
+						issue.Number, taskType, mappedBackend, defaultBackend, ReasonRouterError)
 					return BackendDecision{Backend: validated, Reason: ReasonRouterError, TaskType: taskType}
 				}
 				log.Printf("[router] issue #%d → %s (auto task_type=%s mapped from router backend=%s: %s)",
@@ -167,10 +168,10 @@ func (r *Router) ResolveBackendDecisionForAttempt(issue github.Issue, escalation
 		// Auto-routing returned empty without an error — treat as router_error too
 		// so the dashboard can distinguish silent fallback from manual mode.
 		log.Printf("[router] issue #%d: auto-routing returned empty backend — using default %q with reason=%s",
-			issue.Number, r.cfg.Model.Default, ReasonRouterError)
-		return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonRouterError, TaskType: taskType}
+			issue.Number, defaultBackend, ReasonRouterError)
+		return BackendDecision{Backend: defaultBackend, Reason: ReasonRouterError, TaskType: taskType}
 	}
 
 	// 4. Default backend
-	return BackendDecision{Backend: r.cfg.Model.Default, Reason: ReasonDefault}
+	return BackendDecision{Backend: defaultBackend, Reason: ReasonDefault}
 }

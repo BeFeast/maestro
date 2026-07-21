@@ -7108,7 +7108,7 @@ func TestCheckSessions_NoRateLimit_NormalRetry(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_RateLimitNoFallbackConfigured_UsesDefaultFallback(t *testing.T) {
+func TestCheckSessions_RateLimitNoFallbackConfigured_DoesNotUseBackendMapOrder(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex")
 	// No fallback_backends configured
 	cfg.MaxRuntimeMinutes = 999
@@ -7131,14 +7131,14 @@ func TestCheckSessions_RateLimitNoFallbackConfigured_UsesDefaultFallback(t *test
 	o.checkSessions(s)
 
 	sess2 := s.Sessions["mae-1"]
-	if sess2.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want running after default fallback", sess2.Status)
+	if sess2.Status != state.StatusDead {
+		t.Fatalf("status = %q, want dead with no configured fallback", sess2.Status)
 	}
-	if sess2.Backend != "codex" {
-		t.Fatalf("backend = %q, want codex", sess2.Backend)
+	if sess2.Backend != "claude" {
+		t.Fatalf("backend = %q, want unchanged claude", sess2.Backend)
 	}
-	if len(*respawned) != 1 || (*respawned)[0] != "codex" {
-		t.Fatalf("respawned = %v, want [codex]", *respawned)
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want none", *respawned)
 	}
 	if sess2.RetryCount != 0 {
 		t.Fatalf("retry_count = %d, want 0", sess2.RetryCount)
@@ -9942,13 +9942,9 @@ func TestAutoMergePRs_CIFailure_NoGreptileFeedback_FeedbackEmpty(t *testing.T) {
 	}
 }
 
-// --- issue #455: restart-required signal for model.default / routing.* reloads ---
+// --- issue #909: live model-route selector reloads ---
 
-// TestReloadConfig_ModelDefaultChangeSetsRestartRequired verifies that changing
-// model.default during a reload does NOT hot-apply (the backend router is built at
-// startup) but instead raises a persistent restart-required signal that is mirrored
-// into the state file so `maestro status` / Fleet API can surface it.
-func TestReloadConfig_ModelDefaultChangeSetsRestartRequired(t *testing.T) {
+func TestReloadConfig_ModelDefaultChangeUpdatesLiveRouter(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
 		Repo:     "owner/repo",
@@ -9978,40 +9974,56 @@ func TestReloadConfig_ModelDefaultChangeSetsRestartRequired(t *testing.T) {
 	defer ticker.Stop()
 	o.reloadConfig(newCfg, &ticker)
 
-	if !o.restartRequired {
-		t.Fatal("restartRequired not set after model.default change")
+	if o.restartRequired {
+		t.Fatalf("model route reload unexpectedly requires restart: %s", o.restartRequiredReason)
 	}
-	if !strings.Contains(o.restartRequiredReason, "model.default") {
-		t.Fatalf("restartRequiredReason = %q, want it to mention model.default", o.restartRequiredReason)
+	if o.cfg.Model.Default != "claude" {
+		t.Fatalf("model.default = %q, want hot-applied claude", o.cfg.Model.Default)
 	}
-	// model.default must NOT be hot-applied (restart-required, not live-applied)
-	if o.cfg.Model.Default != "codex" {
-		t.Fatalf("model.default = %q, want unchanged %q (restart required, not applied)", o.cfg.Model.Default, "codex")
-	}
-
-	// The signal must be persisted to the state file so a separate `maestro status`
-	// process observes it.
-	st, err := state.Load(dir)
-	if err != nil {
-		t.Fatalf("load state: %v", err)
-	}
-	if !st.RestartRequired {
-		t.Fatal("state.RestartRequired not persisted after model.default change")
-	}
-	if !strings.Contains(st.RestartRequiredReason, "model.default") {
-		t.Fatalf("state.RestartRequiredReason = %q, want it to mention model.default", st.RestartRequiredReason)
-	}
-
-	// A subsequent reload that still differs must keep the signal set (not a one-time log).
-	o.reloadConfig(newCfg, &ticker)
-	if !o.restartRequired {
-		t.Fatal("restartRequired cleared on a second reload while config still differs")
+	decision := o.router.ResolveBackendDecision(github.Issue{Number: 909, Title: "route reload"})
+	if decision.Backend != "claude" {
+		t.Fatalf("live router backend = %q, want claude after reload", decision.Backend)
 	}
 }
 
-// TestReloadConfig_RoutingChangeSetsRestartRequired verifies that routing.* changes
-// (previously a fully silent no-op) now raise the restart-required signal too.
-func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
+func TestReloadConfig_ProviderLanesUpdateLiveFallbackSelector(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		Backends: map[string]config.BackendDef{
+			"claude": {Cmd: "claude", Provider: "anthropic"},
+		},
+	}}
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	newCfg := *cfg
+	newCfg.Model = cfg.Model
+	newCfg.Model.Backends = map[string]config.BackendDef{
+		"claude": {Cmd: "claude", Provider: "anthropic"},
+		"sol":    {Cmd: "codex", Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+		"gpt55":  {Cmd: "codex", Provider: "openai", Model: "gpt-5.5", Effort: "high"},
+	}
+	newCfg.Model.ProviderLanes = []config.ProviderLane{
+		{Provider: "anthropic", Default: "claude"},
+		{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	got := o.backendFallbackCandidates(&state.Session{Backend: "claude"})
+	if !reflect.DeepEqual(got, []string{"sol", "gpt55"}) {
+		t.Fatalf("live fallback selector = %v, want [sol gpt55]", got)
+	}
+	if got := o.cfg.Model.Backends["sol"]; got.Model != "gpt-5.6-sol" || got.Effort != "high" {
+		t.Fatalf("live SOL backend = %+v, want reloaded definition", got)
+	}
+	decision, ok, _ := o.resolveDispatchBackend(state.NewState(), github.Issue{Number: 909}, time.Now())
+	if !ok || decision.Backend != "claude" {
+		t.Fatalf("live dispatch decision = %+v, ok=%t", decision, ok)
+	}
+}
+
+func TestReloadConfig_RoutingChangeStillRequiresRestart(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
 		Repo:     "owner/repo",
@@ -10049,6 +10061,9 @@ func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
 	if !strings.Contains(o.restartRequiredReason, "routing") {
 		t.Fatalf("restartRequiredReason = %q, want it to mention routing", o.restartRequiredReason)
 	}
+	if o.cfg.Routing.RouterModel != "codex" {
+		t.Fatalf("routing.router_model = %q, want unchanged codex", o.cfg.Routing.RouterModel)
+	}
 	st, err := state.Load(dir)
 	if err != nil {
 		t.Fatalf("load state: %v", err)
@@ -10061,7 +10076,8 @@ func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
 // TestClearStaleRestartRequired_ClearsOnFreshStart verifies that a restart_required
 // flag persisted by a previous process is reconciled away on a fresh daemon start
 // (issue #549). The banner must not survive the very restart it asked the operator to
-// perform. A genuine config change after start must still re-raise the signal.
+// perform. A genuine restart-required config change after start must still
+// re-raise the signal.
 func TestClearStaleRestartRequired_ClearsOnFreshStart(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
@@ -10071,6 +10087,7 @@ func TestClearStaleRestartRequired_ClearsOnFreshStart(t *testing.T) {
 			Default:  "codex",
 			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
 		},
+		Routing: config.RoutingConfig{Mode: "manual", RouterModel: "codex"},
 	}
 
 	// Seed state.json with a stale restart-required flag left over from a previous
@@ -10110,30 +10127,23 @@ func TestClearStaleRestartRequired_ClearsOnFreshStart(t *testing.T) {
 		t.Fatalf("state.RestartRequiredReason = %q, want empty after fresh start", st.RestartRequiredReason)
 	}
 
-	// A real config change applied AFTER start must still surface the signal — the
-	// fix clears stale state, it must not break the live signal.
-	newCfg := &config.Config{
-		Repo:     "owner/repo",
-		StateDir: dir,
-		Model: config.ModelConfig{
-			Default:  "claude",
-			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
-		},
-	}
+	newCfg := *cfg
+	newCfg.Routing = config.RoutingConfig{Mode: "manual", RouterModel: "claude"}
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
-	o.reloadConfig(newCfg, &ticker)
+	o.reloadConfig(&newCfg, &ticker)
 
 	if !o.restartRequired {
-		t.Fatal("restartRequired not re-raised by a real config change after start")
+		t.Fatal("restartRequired not re-raised by a routing change after start")
 	}
 	st, err = state.Load(dir)
 	if err != nil {
 		t.Fatalf("reload state after change: %v", err)
 	}
-	if !st.RestartRequired || !strings.Contains(st.RestartRequiredReason, "model.default") {
-		t.Fatalf("state restart-required not re-persisted after real change: %+v", st)
+	if !st.RestartRequired || !strings.Contains(st.RestartRequiredReason, "routing") {
+		t.Fatalf("state restart-required not re-persisted after routing change: %+v", st)
 	}
+
 }
 
 // TestClearStaleRestartRequired_PreservesInProcessSignal verifies that if a real

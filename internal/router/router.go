@@ -74,18 +74,19 @@ func (r *Router) Route(issue github.Issue) (backendName string, reason string, e
 // RouteDecision calls the router model and returns the structured backend
 // decision including the task taxonomy classification.
 func (r *Router) RouteDecision(issue github.Issue) (Decision, error) {
+	defaultBackend := r.cfg.Model.EffectiveDefault()
 	prompt := r.buildPrompt(issue)
 
 	output, err := r.callModel(prompt)
 	if err != nil {
 		log.Printf("[router] model call failed: %v — falling back to default", err)
-		return Decision{Backend: r.cfg.Model.Default, Reason: "router error"}, err
+		return Decision{Backend: defaultBackend, Reason: "router error"}, err
 	}
 
 	resp, err := parseResponse(output)
 	if err != nil {
 		log.Printf("[router] parse response failed: %v — falling back to default", err)
-		return Decision{Backend: r.cfg.Model.Default, Reason: "parse error"}, err
+		return Decision{Backend: defaultBackend, Reason: "parse error"}, err
 	}
 
 	// Validate that the chosen backend exists in config. Return an error so
@@ -93,7 +94,7 @@ func (r *Router) RouteDecision(issue github.Issue) (Decision, error) {
 	// silently presenting the default backend as if it was task-routed (#427).
 	if _, ok := r.cfg.Model.Backends[resp.Backend]; !ok {
 		log.Printf("[router] unknown backend %q — falling back to default", resp.Backend)
-		return Decision{Backend: r.cfg.Model.Default, TaskType: resp.TaskType, Reason: fmt.Sprintf("unknown backend %q", resp.Backend)}, fmt.Errorf("router picked unknown backend %q", resp.Backend)
+		return Decision{Backend: defaultBackend, TaskType: resp.TaskType, Reason: fmt.Sprintf("unknown backend %q", resp.Backend)}, fmt.Errorf("router picked unknown backend %q", resp.Backend)
 	}
 
 	return Decision{Backend: resp.Backend, TaskType: resp.TaskType, Reason: resp.Reason}, nil

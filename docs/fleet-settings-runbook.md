@@ -28,6 +28,7 @@ overrides.
 
 | Key | Kind | Meaning |
 |---|---|---|
+| `model.provider_lanes` | JSON/YAML array | ordered provider defaults and provider-local fallback backends (#909) |
 | `supervisor.enabled` | bool | LLM supervisor on/off |
 | `supervisor.backend` | string | supervisor LLM backend |
 | `supervisor.model` | string | supervisor model |
@@ -44,6 +45,10 @@ overrides.
 ```
 # Flip the LLM supervisor OFF fleet-wide (all projects without an override):
 maestro settings set supervisor.enabled=false --actor incident-responder
+
+# Apply provider defaults fleet-wide. Quote the JSON so the shell passes it as
+# one key=value argument:
+maestro settings set 'model.provider_lanes=[{"provider":"anthropic","default":"claude"},{"provider":"openai","default":"sol","fallback_backends":["gpt55"]}]'
 
 # Pin one project back ON despite the fleet default:
 maestro settings set supervisor.enabled=true --project <row>
@@ -120,6 +125,30 @@ advances **every** project's fingerprint (it comes from the append-only
 affected projects to reload back to the builtin value), so
 `maestro settings set supervisor.enabled=false` takes effect on the next cycle
 across all projects without a restart.
+
+`model.provider_lanes` uses that same path. The orchestrator updates its live
+router and fallback selector when the store watcher delivers the new config;
+the Fleet API and supervisor holder do not merely display a newer
+`effective_config` while dispatch continues using the old route.
+
+## Provider-lane migration
+
+Provider lanes compose in declaration order. Within a lane the provider default
+is tried first, then that provider's local fallbacks, before Maestro advances to
+the next provider. For example, `anthropic/claude` followed by
+`openai/sol,gpt55` resolves to `claude -> sol -> gpt55`.
+Every referenced backend must be declared in each affected project's
+`model.backends`; an invalid fleet route is rejected when that project's
+effective config is loaded rather than synthesizing an unconfigured backend.
+
+An existing project-level `model.fallback_backends` remains an explicit legacy
+route override and takes precedence over a fleet `model.provider_lanes` default.
+Remove that project chain only after confirming the provider-lane route shown in
+Mission Control is the intended replacement. A project can instead set its own
+`model.provider_lanes` value, which is recorded as source `project` and wins over
+the fleet value. When neither an explicit chain nor provider lanes exist,
+Maestro uses only `model.default`; it never derives fallback order from the
+alphabetical order of `model.backends`.
 
 ## Audit trail
 
