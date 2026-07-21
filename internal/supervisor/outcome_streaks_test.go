@@ -204,3 +204,23 @@ func TestEvaluateGateFailureStreaksOnce_DisabledWithoutHealthSignal(t *testing.T
 		t.Fatalf("gate-streak evaluator should be a no-op without a health signal")
 	}
 }
+
+func TestEvaluateGateFailureStreaksOnce_AutomaticRecoveryUsesFutileController(t *testing.T) {
+	cfg := streakTestConfig(t)
+	cfg.Outcome.RecoveryMode = outcome.RecoveryModeAutomatic
+	cfg.Outcome.RecoveryCommand = "./recover-outcome.sh"
+	if err := state.Save(cfg.StateDir, state.NewState()); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	notifications, intakes, _ := installStreakDispatchStubs(t)
+	current := failingScheduledResult("candidate-delivery", time.Now().UTC())
+	stubScheduledCheck(t, &current)
+
+	evaluated, err := EvaluateGateFailureStreaksOnce(cfg, current.CheckedAt)
+	if err != nil {
+		t.Fatalf("EvaluateGateFailureStreaksOnce: %v", err)
+	}
+	if evaluated || len(*notifications) != 0 || len(*intakes) != 0 {
+		t.Fatalf("generic gate streak overlapped automatic recovery: evaluated=%t notifications=%d intakes=%d", evaluated, len(*notifications), len(*intakes))
+	}
+}
