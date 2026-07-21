@@ -2826,6 +2826,9 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 			case <-ctx.Done():
 				t.Stop()
 				return nil
+			case <-refreshCh:
+				t.Stop()
+				log.Printf("[orch] startup jitter interrupted by refresh (%s)", o.repo)
 			case <-t.C:
 			}
 		}

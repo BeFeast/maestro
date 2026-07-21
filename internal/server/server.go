@@ -345,9 +345,14 @@ type sessionInfo struct {
 	Backend        string `json:"backend,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
-	Model              string `json:"model,omitempty"`
-	PRNumber           int    `json:"pr_number,omitempty"`
-	PRURL              string `json:"pr_url,omitempty"`
+	Model    string `json:"model,omitempty"`
+	PRNumber int    `json:"pr_number,omitempty"`
+	PRURL    string `json:"pr_url,omitempty"`
+	// prGateSnapshot is the latest durable, reconciled gate observation for
+	// this exact issue/PR. It is projection-only state: Fleet uses it to keep
+	// operator_state aligned with the current PR head/check rollup, but does not
+	// expose the internal snapshot on the session JSON shape.
+	prGateSnapshot     *state.PRGateSnapshot
 	TokensUsedAttempt  int    `json:"tokens_used_attempt"`
 	TokensUsedTotal    int    `json:"tokens_used_total"`
 	TokenBudgetMeasure string `json:"token_budget_measure,omitempty"`

@@ -59,10 +59,11 @@ type Projector interface {
 // observability counters are guarded by a mutex, so the endpoint keeps working
 // while the daemon is under normal fleet load (#824 acceptance).
 type Ingestor struct {
-	store     Store
-	secret    string
-	now       func() time.Time
-	projector Projector
+	store         Store
+	secret        string
+	now           func() time.Time
+	projector     Projector
+	afterAccepted func(eventType, repo string)
 
 	mu sync.Mutex
 	// Session counters. accepted/duplicates/byEventType are seeded from the
@@ -108,6 +109,22 @@ func (in *Ingestor) liveProjector() Projector {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	return in.projector
+}
+
+// SetAfterAccepted wires a non-blocking runtime notification for newly stored
+// deliveries. The daemon uses it to wake the matching project flow after gate
+// events; duplicates do not call it because they carry no new GitHub state.
+// The callback must return quickly because it runs before the webhook response.
+func (in *Ingestor) SetAfterAccepted(fn func(eventType, repo string)) {
+	in.mu.Lock()
+	in.afterAccepted = fn
+	in.mu.Unlock()
+}
+
+func (in *Ingestor) liveAfterAccepted() func(eventType, repo string) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.afterAccepted
 }
 
 // seed loads durable totals from the store into the in-memory counters so a
@@ -243,6 +260,9 @@ func (in *Ingestor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[webhook] mirror projection failed (delivery stored, mirror will lag) event=%q delivery=%s: %v",
 				eventType, deliveryID, err)
 		}
+	}
+	if afterAccepted := in.liveAfterAccepted(); afterAccepted != nil {
+		afterAccepted(eventType, env.Repo)
 	}
 	// One journal line per accepted delivery gives the "last webhook delivery
 	// time and counts" diagnostic straight from journalctl (#824 AC 10). The

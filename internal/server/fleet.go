@@ -4286,6 +4286,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	var backendRestartTargets []controlActionWorkerTarget
 	var backendRestartSkipped []controlActionWorkerTarget
 	for _, worker := range projectState.All {
+		worker = reconcileFleetWorkerPRGate(worker, st, cfg.Repo)
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
 		if worker.BackendDrift != nil && worker.BackendDrift.Stale {
 			target := controlActionWorkerTarget{
@@ -4365,6 +4366,37 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.ActivityReason = activityReason
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+// reconcileFleetWorkerPRGate attaches the latest durable gate observation to
+// the Fleet-only session projection. A current failed rollup also replaces any
+// stale retry/session wording so the attention row and project operator_state
+// tell one conservative story: repair the existing PR and do not merge it.
+func reconcileFleetWorkerPRGate(worker sessionInfo, st *state.State, project string) sessionInfo {
+	if st == nil || worker.IssueNumber <= 0 || worker.PRNumber <= 0 {
+		return worker
+	}
+	snapshot, ok := st.LatestPRGateSnapshot(project, worker.IssueNumber, worker.PRNumber)
+	if !ok {
+		return worker
+	}
+	worker.prGateSnapshot = &snapshot
+	if state.SessionStatus(worker.Status) == state.StatusRetryExhausted && fleetPRGateHasFailingChecks(&snapshot) {
+		worker.StatusReason = fmt.Sprintf("PR #%d has failing checks on the current reconciled head and is awaiting in-place repair after retry exhaustion.", worker.PRNumber)
+		worker.NextAction = "Repair the existing PR in place and wait for every required check to pass; do not merge while any check is failing."
+		worker.NeedsAttention = true
+	}
+	return worker
+}
+
+func fleetPRGateHasFailingChecks(snapshot *state.PRGateSnapshot) bool {
+	return snapshot != nil &&
+		(snapshot.CIRollupVerdict == state.PRGateCIFailure || snapshot.CIEffectiveVerdict == state.PRGateCIFailure)
+}
+
+func fleetPRGateChecksSucceeded(snapshot *state.PRGateSnapshot) bool {
+	return snapshot != nil && snapshot.CIRollupVerdict != state.PRGateCIFailure &&
+		snapshot.CIEffectiveVerdict == state.PRGateCISuccess
 }
 
 // fleetSupersedingIssueSession identifies terminal duplicate attempts that
@@ -4990,11 +5022,11 @@ func partitionFleetAttentionByResolvability(workers []sessionInfo, latest *super
 // attention list is "self-resolving" — convergence (the orchestrator's
 // auto-merge once gates clear) will resolve it without operator action.
 // Today this is the retry_exhausted-with-open-PR shape from issue #598, but
-// only when the latest supervisor reconciliation contains positive GitHub
-// evidence that the PR checks succeeded. Absence of failure evidence is not
-// proof of green: session notification fields can lag a freshly failed check
-// run, which previously produced the false "checks are green" state from
-// issue #955. Any current gate blocker for the same PR wins over success.
+// only when the durable PR-gate snapshot contains positive current-head
+// evidence that the effective CI gate succeeded. Absence of failure evidence
+// is not proof of green: session/retry and supervisor metadata can lag a freshly
+// failed check run, which previously produced the false "checks are green"
+// state from issue #955. Any contradictory failing attention state wins.
 func fleetSessionIsConvergenceBound(worker sessionInfo, latest *supervisorDecisionInfo) bool {
 	if state.SessionStatus(worker.Status) != state.StatusRetryExhausted {
 		return false
@@ -5002,13 +5034,12 @@ func fleetSessionIsConvergenceBound(worker sessionInfo, latest *supervisorDecisi
 	if worker.PRNumber <= 0 {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(worker.LastNotification), "ci_failure") {
+	if !fleetPRGateChecksSucceeded(worker.prGateSnapshot) {
 		return false
 	}
 	if latest == nil {
-		return false
+		return true
 	}
-	checksSucceeded := false
 	for _, stuck := range latest.StuckStates {
 		if stuck.Target == nil || stuck.Target.PR != worker.PRNumber {
 			continue
@@ -5020,13 +5051,13 @@ func fleetSessionIsConvergenceBound(worker sessionInfo, latest *supervisorDecisi
 			return false
 		case "retry_exhausted_open_pr":
 			for _, evidence := range stuck.Evidence {
-				if strings.Contains(strings.ToLower(evidence), "checks=success") {
-					checksSucceeded = true
+				if strings.Contains(strings.ToLower(evidence), "checks=failure") {
+					return false
 				}
 			}
 		}
 	}
-	return checksSucceeded
+	return true
 }
 
 // fleetAutoMergingOperatorState builds the calm operator state for a
