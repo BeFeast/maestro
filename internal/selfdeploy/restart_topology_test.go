@@ -24,6 +24,52 @@ func repoFile(t *testing.T, rel ...string) string {
 	return string(data)
 }
 
+// activeUnitDirectives returns the active key/value directives in section.
+// It joins backslash-continuation lines so callers inspect the effective
+// ExecStart rather than matching comments or disconnected fragments.
+func activeUnitDirectives(unit, section string) map[string][]string {
+	directives := make(map[string][]string)
+	lines := strings.Split(unit, "\n")
+	activeSection := ""
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			activeSection = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			continue
+		}
+		if activeSection != section || line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		logical := line
+		for strings.HasSuffix(logical, `\`) && i+1 < len(lines) {
+			logical = strings.TrimSpace(strings.TrimSuffix(logical, `\`))
+			i++
+			next := strings.TrimSpace(lines[i])
+			if next == "" || strings.HasPrefix(next, "#") {
+				continue
+			}
+			logical += " " + next
+		}
+
+		key, value, ok := strings.Cut(logical, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		directives[key] = append(directives[key], strings.TrimSpace(value))
+	}
+	return directives
+}
+
+func requireSingleUnitDirective(t *testing.T, directives map[string][]string, key, want string) {
+	t.Helper()
+	got := directives[key]
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("active %s directives = %q, want exactly [%q]", key, got, want)
+	}
+}
+
 // #877: kill ownership must be explicit and safe. KillMode=mixed sends the stop
 // SIGTERM to the daemon's main process only (so the in-process drain genuinely
 // waits for live workers), while the final SIGKILL still reaps the whole control
@@ -58,20 +104,48 @@ func TestMaestroServiceKillOwnershipExplicit(t *testing.T) {
 // fleet from /root/.maestro instead of the operator's live config store.
 func TestMaestroServiceUsesDeterministicRuntimeIdentity(t *testing.T) {
 	unit := repoFile(t, "maestro.service")
-	for _, want := range []string{
-		"User=god",
-		"WorkingDirectory=/home/god",
-		"Environment=PATH=/home/god/.local/bin:/home/god/.bun/bin:/home/god/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
-		"--store /home/god/.maestro/maestro.db",
-		"WantedBy=multi-user.target",
-	} {
-		if !strings.Contains(unit, want) {
-			t.Errorf("maestro.service missing deterministic system-runtime directive %q", want)
+	service := activeUnitDirectives(unit, "Service")
+	requireSingleUnitDirective(t, service, "User", "god")
+	requireSingleUnitDirective(t, service, "WorkingDirectory", "/home/god")
+
+	const wantPATH = "PATH=/home/god/.local/bin:/home/god/.bun/bin:/home/god/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+	var paths []string
+	for _, environment := range service["Environment"] {
+		for _, assignment := range strings.Fields(environment) {
+			if strings.HasPrefix(assignment, "PATH=") {
+				paths = append(paths, assignment)
+			}
 		}
 	}
-	if strings.Contains(unit, "%h/.maestro") {
-		t.Error("system-scoped maestro.service must not derive the fleet store from manager HOME")
+	if len(paths) != 1 || paths[0] != wantPATH {
+		t.Errorf("active PATH assignments = %q, want exactly [%q]", paths, wantPATH)
 	}
+
+	execStarts := service["ExecStart"]
+	if len(execStarts) != 1 {
+		t.Fatalf("active ExecStart directives = %q, want exactly one", execStarts)
+	}
+	var stores []string
+	args := strings.Fields(execStarts[0])
+	for i, arg := range args {
+		if arg == "--store" && i+1 < len(args) {
+			stores = append(stores, args[i+1])
+		}
+	}
+	if len(stores) != 1 || stores[0] != "/home/god/.maestro/maestro.db" {
+		t.Errorf("active ExecStart --store values = %q, want exactly [/home/god/.maestro/maestro.db]", stores)
+	}
+
+	for key, values := range service {
+		for _, value := range values {
+			if strings.Contains(value, "%h") || strings.Contains(value, "/root/.maestro") {
+				t.Errorf("active %s directive must not derive runtime paths from root or manager HOME: %q", key, value)
+			}
+		}
+	}
+
+	install := activeUnitDirectives(unit, "Install")
+	requireSingleUnitDirective(t, install, "WantedBy", "multi-user.target")
 }
 
 // #877: a fix that requires a unit change (KillMode) lives in the unit file, not
