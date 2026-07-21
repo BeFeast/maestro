@@ -31,6 +31,7 @@ func daemonCmd(args []string) {
 	storePath := fs.String("store", defaultConfigStorePath(), "Path to SQLite config store")
 	runInterval := fs.Duration("run-interval", daemon.DefaultRunInterval, "Orchestrator loop interval")
 	superviseInterval := fs.Duration("supervise-interval", daemon.DefaultSuperviseInterval, "Supervisor loop interval")
+	tmpfsHygieneInterval := fs.Duration("tmpfs-hygiene-interval", daemon.DefaultTmpfsHygieneInterval, "Protect-aware /tmp apply interval")
 	host := fs.String("host", "127.0.0.1", "Host/interface to bind the fleet web server")
 	port := fs.Int("port", 8786, "Port to bind the fleet web server")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
@@ -61,13 +62,14 @@ func daemonCmd(args []string) {
 	defer store.Close()
 
 	d := daemon.New(store, daemon.Options{
-		Host:              *host,
-		Port:              *port,
-		RunInterval:       *runInterval,
-		SuperviseInterval: *superviseInterval,
-		PromptPath:        *promptPath,
-		Version:           resolveVersion(),
-		ReadOnly:          *readOnly,
+		Host:                 *host,
+		Port:                 *port,
+		RunInterval:          *runInterval,
+		SuperviseInterval:    *superviseInterval,
+		TmpfsHygieneInterval: *tmpfsHygieneInterval,
+		PromptPath:           *promptPath,
+		Version:              resolveVersion(),
+		ReadOnly:             *readOnly,
 		// Centralized self-deploy debounce marker (#758): one shared location next
 		// to the config store so every flow's RequestSelfDeploy debounces on the
 		// same marker, and it survives the daemon being restarted by its own

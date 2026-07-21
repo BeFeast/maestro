@@ -32,6 +32,7 @@ import (
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/statestore"
+	"github.com/befeast/maestro/internal/tmpfshygiene"
 	"github.com/befeast/maestro/internal/webhook"
 	"gopkg.in/yaml.v3"
 )
@@ -381,6 +382,13 @@ type FleetServer struct {
 	emergencySource   func() emergencystore.State
 	emergencyStore    EmergencySwitch
 	emergencyNotifier EmergencyNotifier
+
+	// tmpfsHygieneSource exposes the latest daemon-owned /tmp sweep summary.
+	// It is a callback rather than copied state so every API request sees the
+	// newest post-apply use_pct and tmpfs_pressure signal without rebuilding the
+	// FleetServer. Plain `serve --fleet` leaves it nil and omits the block.
+	tmpfsHygieneMu     sync.RWMutex
+	tmpfsHygieneSource func() (tmpfshygiene.Summary, bool)
 }
 
 // EmergencySwitch is the write side of the fleet-wide EMERGENCY STOP store the
@@ -422,6 +430,32 @@ func (s *FleetServer) SetEmergencySource(src func() emergencystore.State) {
 	s.emergencyMu.Lock()
 	s.emergencySource = src
 	s.emergencyMu.Unlock()
+}
+
+// SetTmpfsHygieneSource wires the latest scheduled sweep result into
+// /api/v1/fleet. The summary's attention_code is tmpfs_pressure whenever the
+// post-sweep use_pct remains at or above 85.
+func (s *FleetServer) SetTmpfsHygieneSource(src func() (tmpfshygiene.Summary, bool)) {
+	if s == nil {
+		return
+	}
+	s.tmpfsHygieneMu.Lock()
+	s.tmpfsHygieneSource = src
+	s.tmpfsHygieneMu.Unlock()
+}
+
+func (s *FleetServer) tmpfsHygieneSnapshot() *tmpfshygiene.Summary {
+	s.tmpfsHygieneMu.RLock()
+	src := s.tmpfsHygieneSource
+	s.tmpfsHygieneMu.RUnlock()
+	if src == nil {
+		return nil
+	}
+	summary, ok := src()
+	if !ok {
+		return nil
+	}
+	return &summary
 }
 
 // SetEmergencyStore wires the write side used by POST /api/v1/fleet/emergency
@@ -1011,6 +1045,12 @@ type fleetResponse struct {
 	// of none|llm_stopped|all_stopped — the acceptance criterion "fleet API
 	// reports emergency: llm_stopped".
 	Emergency fleetEmergency `json:"emergency"`
+
+	// TmpfsHygiene is the latest daemon-scheduled apply result. In pressure
+	// state it carries attention_code="tmpfs_pressure" and the post-sweep
+	// utilization, allowing API and Mission Control consumers to alert without
+	// treating host pressure as a synthetic worker session.
+	TmpfsHygiene *tmpfshygiene.Summary `json:"tmpfs_hygiene,omitempty"`
 }
 
 // fleetEmergency is the fleet-wide big-red-button state on the snapshot (#840).
@@ -2679,6 +2719,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.Webhooks = s.webhookStatsSnapshot()
 	resp.Mirror = s.mirrorStatsSnapshot()
 	resp.Emergency = s.emergencySnapshot()
+	resp.TmpfsHygiene = s.tmpfsHygieneSnapshot()
 	return resp
 }
 

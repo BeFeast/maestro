@@ -66,6 +66,10 @@ const (
 	// polling one SQLite row is negligible. It runs independently of
 	// --watch-store, since the emergency switch must always be honored.
 	DefaultEmergencyWatchInterval = 5 * time.Second
+	// DefaultTmpfsHygieneInterval is the host-level /tmp apply cadence. It sits
+	// inside the requested 5–10 minute window and is independent of project
+	// orchestration/supervisor polling.
+	DefaultTmpfsHygieneInterval = 10 * time.Minute
 )
 
 // drainPollInterval is how often Drain re-reads each flow's state to see whether
@@ -169,6 +173,9 @@ type Options struct {
 	refreshCh <-chan struct{}
 	// SuperviseInterval is the supervisor decision-loop interval per flow.
 	SuperviseInterval time.Duration
+	// TmpfsHygieneInterval is the daemon-owned protect-aware /tmp apply cadence.
+	// Non-positive values are clamped to DefaultTmpfsHygieneInterval.
+	TmpfsHygieneInterval time.Duration
 
 	// PromptPath is an optional worker prompt base file applied to every flow.
 	PromptPath string
@@ -314,6 +321,10 @@ type Daemon struct {
 	emergencyState    emergencystore.State
 	emergencyNotifier *notify.Notifier
 
+	// tmpfsHygiene owns the host-level scheduled sweep and latest Fleet-facing
+	// summary. It is independent of per-project flow state.
+	tmpfsHygiene *tmpfsHygieneRuntime
+
 	// runLoop, superviseLoop, watchdogLoop, and materialProgressLoop build the
 	// per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
@@ -388,6 +399,9 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		log.Printf("[daemon] supervise-interval %s is not positive; clamping to default %s", opts.SuperviseInterval, DefaultSuperviseInterval)
 		opts.SuperviseInterval = DefaultSuperviseInterval
 	}
+	if opts.TmpfsHygieneInterval <= 0 {
+		opts.TmpfsHygieneInterval = DefaultTmpfsHygieneInterval
+	}
 	if opts.WatchStore && opts.WatchStoreInterval <= 0 {
 		log.Printf("[daemon] watch-store-interval %s is not positive; clamping to default %s", opts.WatchStoreInterval, DefaultWatchStoreInterval)
 		opts.WatchStoreInterval = DefaultWatchStoreInterval
@@ -400,6 +414,7 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		opts:  opts,
 		flows: make(map[string]*projectFlow),
 	}
+	d.tmpfsHygiene = newTmpfsHygieneRuntime(d)
 	if opts.WatchStore {
 		// Only the richer store (Load + ProjectsFingerprint) can drive hot
 		// add/remove/reload. Degrade loudly rather than silently if an embedder
@@ -502,6 +517,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// One FleetServer for the whole fleet — replaces the N per-project
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
+	fleet.SetTmpfsHygieneSource(d.tmpfsHygieneSummary)
 	// Back the dashboard project-CRUD endpoint (#761) with the SAME config store
 	// the daemon reads, when the store supports the write API. A UI add/remove
 	// then writes the store and the --watch-store diff-loop reconciles it into a
@@ -657,12 +673,33 @@ func (d *Daemon) Run(ctx context.Context) error {
 			<-emergencyDone
 		}
 	}
+	// Protect-aware /tmp sweep: one host-level apply loop for the single daemon,
+	// not one per project. The first run occurs after one interval, avoiding a
+	// surprise startup prune while still bounding abandoned residue to 10m past
+	// its age gate. Each result is emitted as one JSON line and published to Fleet.
+	var stopTmpfsHygiene func()
+	if d.tmpfsHygiene != nil {
+		hctx, hygieneCancel := context.WithCancel(ctx)
+		hygieneDone := make(chan struct{})
+		go func() {
+			defer close(hygieneDone)
+			d.tmpfsHygieneLoop(hctx, d.opts.TmpfsHygieneInterval)
+		}()
+		log.Printf("[daemon] tmpfs hygiene enabled — apply every %s", d.opts.TmpfsHygieneInterval)
+		stopTmpfsHygiene = func() {
+			hygieneCancel()
+			<-hygieneDone
+		}
+	}
 	drainWatch := func() {
 		if stopWatch != nil {
 			stopWatch()
 		}
 		if stopEmergencyWatch != nil {
 			stopEmergencyWatch()
+		}
+		if stopTmpfsHygiene != nil {
+			stopTmpfsHygiene()
 		}
 	}
 

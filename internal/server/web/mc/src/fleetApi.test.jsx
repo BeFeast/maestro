@@ -5,6 +5,7 @@ import {
   formatBackendQuotaSentence,
   formatProviderModelHealthSentence,
   mapFleetResponse,
+  mapTmpfsHygiene,
   supervisorDecisionsFromProject,
   workerSessionsFromFleet,
   workerNextAction,
@@ -148,6 +149,27 @@ describe("Fleet workers ordering contract", () => {
       text: "claude/claude-fable-5 is temporarily overloaded. Maestro kept the retry budget and can use another model on the same provider.",
       buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
     });
+  });
+});
+
+describe("tmpfs hygiene pressure", () => {
+  test("maps the exact pressure attention code and counts host attention", () => {
+    const raw = {
+      summary: {},
+      tmpfs_hygiene: {
+        timestamp: "2026-07-21T18:00:00Z",
+        mode: "apply",
+        tmpfs: true,
+        use_pct: 87,
+        pressure: true,
+        attention_code: "tmpfs_pressure",
+        freed_bytes: 8192,
+      },
+    };
+    const mapped = mapTmpfsHygiene(raw.tmpfs_hygiene);
+    expect(mapped.attentionCode).toBe("tmpfs_pressure");
+    expect(mapped.usePct).toBe(87);
+    expect(mapFleetResponse(raw, now).attentionCount).toBe(1);
   });
 });
 
