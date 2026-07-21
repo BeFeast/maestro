@@ -18,17 +18,19 @@ import (
 // cleanup. It is revalidated against canonical state under the same per-slot
 // lease used by respawn, immediately before any destructive filesystem work.
 type WorktreeCleanupLease struct {
-	Slot             string
-	IssueNumber      int
-	PRNumber         int
-	PID              int
-	TmuxSession      string
-	Worktree         string
-	Branch           string
-	StartedAt        time.Time
-	FinishedAt       *time.Time
-	Status           state.SessionStatus
-	WorkerGeneration uint64
+	Slot                string
+	IssueNumber         int
+	PRNumber            int
+	PID                 int
+	TmuxSession         string
+	ProcessLeaseUnit    string
+	ProcessLeaseManager string
+	Worktree            string
+	Branch              string
+	StartedAt           time.Time
+	FinishedAt          *time.Time
+	Status              state.SessionStatus
+	WorkerGeneration    uint64
 }
 
 // CleanupProbes supplies deterministic runtime checks. Production callers may
@@ -74,6 +76,8 @@ func CaptureCleanupLease(slot string, sess *state.Session) WorktreeCleanupLease 
 	lease.PRNumber = sess.PRNumber
 	lease.PID = sess.PID
 	lease.TmuxSession = sess.TmuxSession
+	lease.ProcessLeaseUnit = sess.ProcessLeaseUnit
+	lease.ProcessLeaseManager = sess.ProcessLeaseManager
 	lease.Worktree = sess.Worktree
 	lease.Branch = sess.Branch
 	lease.StartedAt = sess.StartedAt
@@ -110,6 +114,9 @@ func ValidateCleanupLease(lease WorktreeCleanupLease, current *state.Session, pr
 	if current.PID > 0 && pidAlive(current.PID) {
 		return fmt.Errorf("%w: slot %s worker PID %d is alive", ErrCleanupLeaseChanged, lease.Slot, current.PID)
 	}
+	if strings.TrimSpace(current.ProcessLeaseUnit) != "" {
+		return fmt.Errorf("%w: slot %s process lease %q is not released", ErrCleanupLeaseChanged, lease.Slot, current.ProcessLeaseUnit)
+	}
 	tmuxName := strings.TrimSpace(current.TmuxSession)
 	if tmuxName == "" {
 		tmuxName = TmuxSessionName(lease.Slot)
@@ -138,6 +145,10 @@ func validateCleanupIdentity(lease WorktreeCleanupLease, current *state.Session,
 	}
 	if strings.TrimSpace(current.TmuxSession) != strings.TrimSpace(lease.TmuxSession) {
 		return fmt.Errorf("%w: slot %s tmux identity changed %q->%q", ErrCleanupLeaseChanged, lease.Slot, lease.TmuxSession, current.TmuxSession)
+	}
+	if strings.TrimSpace(current.ProcessLeaseUnit) != strings.TrimSpace(lease.ProcessLeaseUnit) ||
+		strings.TrimSpace(current.ProcessLeaseManager) != strings.TrimSpace(lease.ProcessLeaseManager) {
+		return fmt.Errorf("%w: slot %s process lease changed", ErrCleanupLeaseChanged, lease.Slot)
 	}
 	if filepath.Clean(current.Worktree) != filepath.Clean(lease.Worktree) {
 		return fmt.Errorf("%w: slot %s worktree claim changed %q->%q", ErrCleanupLeaseChanged, lease.Slot, lease.Worktree, current.Worktree)

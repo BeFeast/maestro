@@ -37,16 +37,20 @@ ExecStart=/usr/local/bin/maestro daemon \
 # the deadline if a callback never returns (#966). TimeoutStopSec stays longer as
 # a defense-in-depth systemd backstop, not part of normal restart latency.
 TimeoutStopSec=6min
-# Kill ownership is explicit (#877). New worker tmux servers run in a sibling
-# transient scope (#891), so they survive maestro.service. KillMode=mixed also
-# protects any legacy worker still inside this unit's cgroup: the systemd default
-# KillMode=control-group would SIGTERM daemon and legacy workers together before
-# the in-process drain could observe them finishing.
+# Kill ownership is explicit (#877/#920). The private worker tmux server runs in
+# a sibling transient scope (#891), and every runner it launches is moved again
+# into its own generation-specific scope below maestro-workers.slice. A worker's
+# model CLI, tools, and reparented descendants therefore survive daemon restart
+# but remain exactly attributable and independently terminable. KillMode=mixed
+# also protects any legacy worker still inside this unit's cgroup: the systemd
+# default KillMode=control-group would SIGTERM daemon and legacy workers together
+# before the in-process drain could observe them finishing.
 #
 #   KillMode=mixed: the stop SIGTERM goes to the daemon's MAIN process ONLY, so
 #   unit-owned descendants keep running while the daemon drains. A subsequent
-#   SIGKILL still reaps this unit's control group; isolated worker scopes remain
-#   independently owned by systemd and are reconciled by the replacement daemon.
+#   SIGKILL still reaps this unit's control group; per-worker scopes remain
+#   independently owned by systemd and are adopted or terminated by exact
+#   persisted scope identity in the replacement daemon.
 #   This is deliberately NOT KillMode=process, which would leak descendants out
 #   of systemd lifecycle management (rejected in #877 review).
 #
