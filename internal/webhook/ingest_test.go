@@ -71,6 +71,29 @@ func TestIngestValidStoredOnce(t *testing.T) {
 	}
 }
 
+func TestIngestAfterAcceptedRunsForNewDeliveryOnly(t *testing.T) {
+	in, _ := newTestIngestor(t)
+	body := []byte(`{"action":"completed","repository":{"full_name":"BeFeast/ok-player"}}`)
+	var events []string
+	in.SetAfterAccepted(func(eventType, repo string) {
+		events = append(events, eventType+" "+repo)
+	})
+
+	first := httptest.NewRecorder()
+	in.ServeHTTP(first, signedRequest(t, DefaultPath, "check_run", "check-397", body, true))
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first delivery: status=%d body=%s", first.Code, first.Body.String())
+	}
+	duplicate := httptest.NewRecorder()
+	in.ServeHTTP(duplicate, signedRequest(t, DefaultPath, "check_run", "check-397", body, true))
+	if duplicate.Code != http.StatusOK {
+		t.Fatalf("duplicate delivery: status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	if len(events) != 1 || events[0] != "check_run BeFeast/ok-player" {
+		t.Fatalf("after-accepted events = %v, want one matching new delivery", events)
+	}
+}
+
 func TestIngestReplayIsNoOp(t *testing.T) {
 	in, store := newTestIngestor(t)
 	body := readFixture(t, "issues_opened.json")

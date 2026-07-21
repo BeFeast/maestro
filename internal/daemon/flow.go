@@ -28,6 +28,10 @@ type projectFlow struct {
 	holder *configHolder
 	cancel context.CancelFunc
 	done   chan struct{} // closed once every flow goroutine has exited
+	// refreshCh coalesces webhook gate updates into immediate orchestrator
+	// reconciliations for this repository. One buffered wake-up is sufficient:
+	// a RunOnce reads the complete current PR head/check rollup.
+	refreshCh chan struct{}
 }
 
 // startFlow launches the orchestrator + supervisor loops (and the liveness
@@ -54,6 +58,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		holder:    newConfigHolder(cfg),
 		cancel:    cancel,
 		done:      make(chan struct{}),
+		refreshCh: make(chan struct{}, 1),
 	}
 
 	// Per-flow hot-reload (#757, #768): when store-watch is enabled and this
@@ -93,7 +98,9 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		defer recoverFlow(flow, "orchestrator")
 		// orchReloadCh (fed by the pump) is typed as <-chan; a nil channel
 		// leaves the orchestrator's reload arm inert (store-watch disabled).
-		d.runLoop(fctx, cfg, d.opts, orchReloadCh)
+		flowOpts := d.opts
+		flowOpts.refreshCh = flow.refreshCh
+		d.runLoop(fctx, cfg, flowOpts, orchReloadCh)
 	}()
 	go func() {
 		defer wg.Done()
@@ -451,14 +458,8 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 		runInterval = time.Duration(cfg.PollIntervalSeconds) * time.Second
 	}
 
-	// The daemon has no API-triggered refresh channel: the per-project HTTP
-	// server that drove one in `maestro run` is replaced by the shared
-	// FleetServer, which does not signal individual flows. Pass nil rather than
-	// a buffered channel nothing ever sends on, so orch.Run's `case <-refreshCh`
-	// arm is plainly inert instead of looking like a wired-but-dead feature
-	// (#764).
 	log.Printf("[%s] starting orchestrator — repo=%s interval=%s", cfg.SessionPrefix, cfg.Repo, runInterval)
-	if err := orch.Run(ctx, runInterval, false, nil); err != nil {
+	if err := orch.Run(ctx, runInterval, false, opts.refreshCh); err != nil {
 		log.Printf("[%s] orchestrator exited: %v", cfg.SessionPrefix, err)
 	}
 }

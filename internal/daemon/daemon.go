@@ -162,6 +162,11 @@ type Options struct {
 	// RunInterval is the orchestrator poll interval; a project's
 	// poll_interval_seconds in config overrides it per flow.
 	RunInterval time.Duration
+	// refreshCh is the daemon-internal edge trigger for an immediate project
+	// reconciliation. It is populated per flow and intentionally unexported:
+	// callers configure cadence, while accepted GitHub gate webhooks wake the
+	// matching flow without waiting for that cadence.
+	refreshCh <-chan struct{}
 	// SuperviseInterval is the supervisor decision-loop interval per flow.
 	SuperviseInterval time.Duration
 
@@ -872,6 +877,7 @@ func (d *Daemon) configureWebhookIngestion(fleet *server.FleetServer) {
 	}
 
 	ingestor := webhook.NewIngestor(store, secret)
+	ingestor.SetAfterAccepted(d.refreshPRGateFromWebhook)
 
 	// Wire the GitHub mirror read model (#825, phase C). It lives in the same
 	// maestro.db as the raw deliveries; the ingestor projects each accepted
@@ -900,6 +906,39 @@ func (d *Daemon) configureWebhookIngestion(fleet *server.FleetServer) {
 	}
 	fleet.SetWebhookIngestor(ingestor, path)
 	log.Printf("[daemon] webhook ingestion active — POST %s validates X-Hub-Signature-256 and lands deliveries in %s", path, dbPath)
+}
+
+// refreshPRGateFromWebhook coalesces accepted GitHub gate updates into one
+// immediate orchestrator cycle for every flow serving that repository. The
+// channel is buffered and the send is non-blocking, so a burst of check-run
+// updates cannot queue concurrent RunOnce calls or delay the webhook response.
+func (d *Daemon) refreshPRGateFromWebhook(eventType, repo string) {
+	switch strings.TrimSpace(eventType) {
+	case "check_run", "check_suite", "status":
+	default:
+		return
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return
+	}
+
+	d.mu.Lock()
+	channels := make([]chan struct{}, 0, 1)
+	for _, flow := range d.flows {
+		if flow == nil || flow.cfg == nil || flow.refreshCh == nil || !strings.EqualFold(strings.TrimSpace(flow.cfg.Repo), repo) {
+			continue
+		}
+		channels = append(channels, flow.refreshCh)
+	}
+	d.mu.Unlock()
+
+	for _, refreshCh := range channels {
+		select {
+		case refreshCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // readWebhookSecret reads and trims the webhook secret from disk. The secret's

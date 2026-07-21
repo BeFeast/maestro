@@ -4317,8 +4317,8 @@ func TestFleetSupersedingIssueSessionSuppressesDeadSourceBehindActiveContinuatio
 
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
 // regression. A retry_exhausted session whose linked PR is still open and
-// whose last notification is NOT a CI failure is convergence-bound: the
-// orchestrator will auto-merge it once the merge gate clears. The session
+// whose durable current-head gate snapshot is successful is convergence-bound:
+// the orchestrator will auto-merge it once the merge gate clears. The session
 // must stay surfaced (#564) AND counted in prs_open (#566), but the fleet
 // verdict tone must read calm — never the alarming "Action required — p1"
 // the legacy code path produced. The matching project card surfaces an
@@ -4356,6 +4356,10 @@ func TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly(t *testing.T) {
 			},
 		},
 	})
+	recordFleetTestPRGate(t, stateDir, state.PRGateTransition{
+		Project: "befeast/maestro", IssueNumber: 442, PRNumber: 564, HeadSHA: strings.Repeat("a", 40),
+		CIObserved: true, CIRollupVerdict: state.PRGateCISuccess, CIEffectiveVerdict: state.PRGateCISuccess,
+	}, now.Add(-30*time.Second))
 
 	srv := NewFleet([]FleetProject{
 		NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
@@ -4489,6 +4493,90 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 	}
 	if cta := resp.NextAction.CTALabel; cta == "" || !contains(cta, "600") {
 		t.Fatalf("next_action.cta_label = %q, want a label naming PR #600", cta)
+	}
+}
+
+// TestFleetAPIRetryExhaustedStaleSuccessLosesToCurrentFailedGate pins #955.
+// Retry/session and supervisor metadata still say the PR is green, while the
+// durable current-head rollup says required checks failed. Fleet must project
+// one conservative repair state and must never suggest auto-merge.
+func TestFleetAPIRetryExhaustedStaleSuccessLosesToCurrentFailedGate(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	finished := now.Add(-30 * time.Minute)
+	saveFleetTestSnapshot(t, stateDir, map[string]*state.Session{
+		"ok-player-277": {
+			IssueNumber:        346,
+			IssueTitle:         "Repair Fedora package checks",
+			Status:             state.StatusRetryExhausted,
+			PRNumber:           397,
+			StartedAt:          finished.Add(-time.Hour),
+			FinishedAt:         &finished,
+			LastNotifiedStatus: "review_retry_exhausted",
+		},
+	}, []state.SupervisorDecision{
+		{
+			ID:                "dec-stale-success",
+			CreatedAt:         now.Add(-time.Minute),
+			Project:           "ok-player",
+			RecommendedAction: "monitor_open_pr",
+			Risk:              "safe",
+			StuckStates: []state.SupervisorStuckState{
+				{
+					Code:     "retry_exhausted_open_pr",
+					Target:   &state.SupervisorTarget{Issue: 346, PR: 397},
+					Evidence: []string{"Session ok-player-277 status=retry_exhausted pr=397 checks=success"},
+				},
+			},
+		},
+	})
+	recordFleetTestPRGate(t, stateDir, state.PRGateTransition{
+		Project: "BeFeast/ok-player", IssueNumber: 346, PRNumber: 397,
+		HeadSHA:    "93f4f93d41350d2e4c14eb9455e4c1ee6321f412",
+		CIObserved: true, CIRollupVerdict: state.PRGateCIFailure, CIEffectiveVerdict: state.PRGateCIFailure,
+	}, now)
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("ok-player", "/tmp/ok-player.yaml", "", &config.Config{
+			Repo:        "BeFeast/ok-player",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	project := findFleetProject(t, resp.Projects, "ok-player")
+	if project.OperatorState.Kind != "attention" || project.OperatorState.Tone != "attention" {
+		t.Fatalf("operator_state = %+v, want one attention-tone repair state", project.OperatorState)
+	}
+	if project.OperatorState.PRNumber != 397 {
+		t.Fatalf("operator_state.pr_number = %d, want 397", project.OperatorState.PRNumber)
+	}
+	operatorText := strings.ToLower(project.OperatorState.Summary + " " + project.OperatorState.NextAction)
+	for _, forbidden := range []string{"checks are green", "auto-merg", "no action needed"} {
+		if strings.Contains(operatorText, forbidden) {
+			t.Fatalf("operator_state contains unsafe %q wording: %+v", forbidden, project.OperatorState)
+		}
+	}
+	for _, required := range []string{"failing checks", "in place", "do not merge"} {
+		if !strings.Contains(operatorText, required) {
+			t.Fatalf("operator_state text = %q, want %q", operatorText, required)
+		}
+	}
+	if project.SelfResolving != 0 || resp.Summary.SelfResolving != 0 {
+		t.Fatalf("self_resolving project=%d fleet=%d, want 0 for a failed current gate", project.SelfResolving, resp.Summary.SelfResolving)
+	}
+	if resp.Verdict.Tone != "attention" {
+		t.Fatalf("verdict tone = %q, want attention", resp.Verdict.Tone)
+	}
+
+	worker := findFleetWorker(t, resp.Workers, "ok-player-277")
+	workerText := strings.ToLower(worker.StatusReason + " " + worker.NextAction)
+	for _, required := range []string{"failing checks", "current reconciled head", "in place", "do not merge"} {
+		if !strings.Contains(workerText, required) {
+			t.Fatalf("worker repair projection = %q, want %q", workerText, required)
+		}
 	}
 }
 
@@ -5105,6 +5193,20 @@ func saveFleetTestSnapshot(t *testing.T, dir string, sessions map[string]*state.
 	}
 	if err := state.Save(dir, st); err != nil {
 		t.Fatalf("save state: %v", err)
+	}
+}
+
+func recordFleetTestPRGate(t *testing.T, dir string, transition state.PRGateTransition, at time.Time) {
+	t.Helper()
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state for PR gate: %v", err)
+	}
+	if _, _, err := st.RecordPRGateTransition(transition, at); err != nil {
+		t.Fatalf("record PR gate: %v", err)
+	}
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save PR gate: %v", err)
 	}
 }
 
