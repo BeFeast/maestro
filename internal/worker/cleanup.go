@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -88,6 +89,10 @@ func CaptureCleanupLease(slot string, sess *state.Session) WorktreeCleanupLease 
 // ValidateCleanupLease verifies every ownership signal required by #963. It
 // does not mutate state or files.
 func ValidateCleanupLease(lease WorktreeCleanupLease, current *state.Session, probes CleanupProbes, policy CleanupPolicy) error {
+	if err := validateCleanupIdentity(lease, current, policy); err != nil {
+		return err
+	}
+
 	pidAlive := probes.PIDAlive
 	if pidAlive == nil {
 		pidAlive = IsAlive
@@ -102,6 +107,20 @@ func ValidateCleanupLease(lease WorktreeCleanupLease, current *state.Session, pr
 		}
 	}
 
+	if current.PID > 0 && pidAlive(current.PID) {
+		return fmt.Errorf("%w: slot %s worker PID %d is alive", ErrCleanupLeaseChanged, lease.Slot, current.PID)
+	}
+	tmuxName := strings.TrimSpace(current.TmuxSession)
+	if tmuxName == "" {
+		tmuxName = TmuxSessionName(lease.Slot)
+	}
+	if tmuxAlive(tmuxName) {
+		return fmt.Errorf("%w: slot %s tmux session %q is alive", ErrCleanupLeaseChanged, lease.Slot, tmuxName)
+	}
+	return nil
+}
+
+func validateCleanupIdentity(lease WorktreeCleanupLease, current *state.Session, policy CleanupPolicy) error {
 	if current == nil {
 		return fmt.Errorf("%w: slot %s no longer holds a session", ErrCleanupLeaseChanged, lease.Slot)
 	}
@@ -137,16 +156,6 @@ func ValidateCleanupLease(lease WorktreeCleanupLease, current *state.Session, pr
 	}
 	if policy.RequireTerminal && !state.IsTerminal(current.Status) {
 		return fmt.Errorf("%w: slot %s is %s, not terminal", ErrCleanupLeaseChanged, lease.Slot, current.Status)
-	}
-	if current.PID > 0 && pidAlive(current.PID) {
-		return fmt.Errorf("%w: slot %s worker PID %d is alive", ErrCleanupLeaseChanged, lease.Slot, current.PID)
-	}
-	tmuxName := strings.TrimSpace(current.TmuxSession)
-	if tmuxName == "" {
-		tmuxName = TmuxSessionName(lease.Slot)
-	}
-	if tmuxAlive(tmuxName) {
-		return fmt.Errorf("%w: slot %s tmux session %q is alive", ErrCleanupLeaseChanged, lease.Slot, tmuxName)
 	}
 	return nil
 }
@@ -211,44 +220,36 @@ func CleanupLeasedWorktree(cfg *config.Config, s *state.State, lease WorktreeCle
 		if err := ValidateCleanupLease(lease, local, probes, policy); err != nil {
 			return err
 		}
-		local.Worktree = ""
-		if strings.TrimSpace(cfg.StateDir) != "" {
-			if err := state.Save(cfg.StateDir, s); err != nil {
-				local.Worktree = lease.Worktree
+		if strings.TrimSpace(cfg.StateDir) == "" {
+			local.Worktree = ""
+		} else {
+			// Commit only the matching canonical session field. Saving s here would
+			// three-way merge a cycle-old full snapshot and may replace s.Sessions
+			// while its caller is ranging over that map.
+			if err := state.Update(cfg.StateDir, func(latest *state.State) error {
+				current := latest.Sessions[lease.Slot]
+				if err := validateCleanupIdentity(lease, current, policy); err != nil {
+					return err
+				}
+				if approval, ok := latest.ApprovedRepairOwnsSession(lease.Slot, lease.IssueNumber, lease.PRNumber); ok {
+					return fmt.Errorf("%w: approved repair %s owns slot %s / PR #%d", ErrCleanupLeaseChanged, approval.ID, lease.Slot, lease.PRNumber)
+				}
+				current.Worktree = ""
+				return nil
+			}); err != nil {
 				return fmt.Errorf("%w: commit cleanup claim before filesystem mutation: %v", ErrCleanupLeaseChanged, err)
 			}
+			local.Worktree = ""
 		}
 
-		// Re-read after the committed transition. Project the cleared worktree
-		// back to the captured path solely for identity validation; every other
-		// canonical field must still match the selected generation.
-		if strings.TrimSpace(cfg.StateDir) != "" {
-			latest, err := state.Load(cfg.StateDir)
-			if err != nil {
-				_ = restoreCleanupStateClaim(cfg.StateDir, s, lease)
-				return fmt.Errorf("%w: final canonical re-read before removal: %v", ErrCleanupLeaseChanged, err)
-			}
-			current = latest.Sessions[lease.Slot]
-			if current == nil || strings.TrimSpace(current.Worktree) != "" {
-				_ = restoreCleanupStateClaim(cfg.StateDir, s, lease)
-				return fmt.Errorf("%w: committed cleanup claim was replaced", ErrCleanupLeaseChanged)
-			}
-			projected := *current
-			projected.Worktree = lease.Worktree
-			if err := ValidateCleanupLease(lease, &projected, probes, policy); err != nil {
-				_ = restoreCleanupStateClaim(cfg.StateDir, s, lease)
-				return err
-			}
-			if approval, ok := latest.ApprovedRepairOwnsSession(lease.Slot, lease.IssueNumber, lease.PRNumber); ok {
-				_ = restoreCleanupStateClaim(cfg.StateDir, s, lease)
-				return fmt.Errorf("%w: approved repair %s acquired slot %s before removal", ErrCleanupLeaseChanged, approval.ID, lease.Slot)
-			}
+		if err := validateCommittedCleanupClaim(cfg.StateDir, s, lease, probes, policy); err != nil {
+			_ = restoreCleanupStateClaim(cfg.StateDir, s, lease)
+			return err
 		}
 
 		if hooks.BeforeRemove != nil {
 			if err := hooks.BeforeRemove(); err != nil {
-				_ = restoreCleanupStateClaim(cfg.StateDir, s, lease)
-				return fmt.Errorf("before-remove hook: %w", err)
+				log.Printf("[worker] before_remove hook failed: %v", err)
 			}
 		}
 		if policy.RequireClean {
@@ -261,6 +262,13 @@ func CleanupLeasedWorktree(cfg *config.Config, s *state.State, lease WorktreeCle
 				return fmt.Errorf("%w: worktree became dirty before removal", ErrCleanupLeaseChanged)
 			}
 		}
+		// Hooks and cleanliness checks can take time, and approvals are not
+		// serialized by the per-slot lease. Re-read one last time immediately
+		// before the destructive operation.
+		if err := validateCommittedCleanupClaim(cfg.StateDir, s, lease, probes, policy); err != nil {
+			_ = restoreCleanupStateClaim(cfg.StateDir, s, lease)
+			return err
+		}
 
 		if err := remove(cfg.LocalPath, lease.Worktree); err != nil {
 			restoreErr := preserveOrRestoreWorktree(cfg, lease, restore)
@@ -271,9 +279,33 @@ func CleanupLeasedWorktree(cfg *config.Config, s *state.State, lease WorktreeCle
 	})
 }
 
+func validateCommittedCleanupClaim(stateDir string, s *state.State, lease WorktreeCleanupLease, probes CleanupProbes, policy CleanupPolicy) error {
+	latest := s
+	if strings.TrimSpace(stateDir) != "" {
+		loaded, err := state.Load(stateDir)
+		if err != nil {
+			return fmt.Errorf("%w: final canonical re-read before removal: %v", ErrCleanupLeaseChanged, err)
+		}
+		latest = loaded
+	}
+	current := latest.Sessions[lease.Slot]
+	if current == nil || strings.TrimSpace(current.Worktree) != "" {
+		return fmt.Errorf("%w: committed cleanup claim was replaced", ErrCleanupLeaseChanged)
+	}
+	projected := *current
+	projected.Worktree = lease.Worktree
+	if err := ValidateCleanupLease(lease, &projected, probes, policy); err != nil {
+		return err
+	}
+	if approval, ok := latest.ApprovedRepairOwnsSession(lease.Slot, lease.IssueNumber, lease.PRNumber); ok {
+		return fmt.Errorf("%w: approved repair %s acquired slot %s before removal", ErrCleanupLeaseChanged, approval.ID, lease.Slot)
+	}
+	return nil
+}
+
 func restoreCleanupStateClaim(stateDir string, s *state.State, lease WorktreeCleanupLease) error {
 	if strings.TrimSpace(stateDir) == "" {
-		if current := s.Sessions[lease.Slot]; current != nil {
+		if current := s.Sessions[lease.Slot]; cleanupCompensationMatches(lease, current) {
 			current.Worktree = lease.Worktree
 		}
 		return nil
@@ -283,8 +315,7 @@ func restoreCleanupStateClaim(stateDir string, s *state.State, lease WorktreeCle
 		if current == nil {
 			return fmt.Errorf("%w: slot vanished during cleanup compensation", ErrCleanupLeaseChanged)
 		}
-		if current.IssueNumber != lease.IssueNumber || current.PRNumber != lease.PRNumber || current.WorkerGeneration != lease.WorkerGeneration ||
-			strings.TrimSpace(current.Branch) != strings.TrimSpace(lease.Branch) || !current.StartedAt.Equal(lease.StartedAt) {
+		if !cleanupCompensationMatches(lease, current) {
 			return fmt.Errorf("%w: slot changed during cleanup compensation", ErrCleanupLeaseChanged)
 		}
 		if strings.TrimSpace(current.Worktree) == "" {
@@ -292,14 +323,19 @@ func restoreCleanupStateClaim(stateDir string, s *state.State, lease WorktreeCle
 		}
 		return nil
 	})
-	latest, loadErr := state.Load(stateDir)
-	if loadErr == nil {
-		*s = *latest
+	if current := s.Sessions[lease.Slot]; cleanupCompensationMatches(lease, current) {
+		current.Worktree = lease.Worktree
 	}
-	if err != nil {
-		return err
+	return err
+}
+
+func cleanupCompensationMatches(lease WorktreeCleanupLease, current *state.Session) bool {
+	if current == nil || (strings.TrimSpace(current.Worktree) != "" && filepath.Clean(current.Worktree) != filepath.Clean(lease.Worktree)) {
+		return false
 	}
-	return loadErr
+	projected := *current
+	projected.Worktree = lease.Worktree
+	return validateCleanupIdentity(lease, &projected, CleanupPolicy{}) == nil
 }
 
 func preserveOrRestoreWorktree(cfg *config.Config, lease WorktreeCleanupLease, restore func(localPath, worktreeBase, slotName, worktree, branch string) error) error {

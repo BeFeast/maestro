@@ -931,11 +931,59 @@ func (e *Executor) executeDeleteWorktree(approval *state.Approval) Result {
 		)
 	} else {
 		removeErr = state.WithSessionLease(e.Cfg.StateDir, slot, func() error {
-			if e.Sessions != nil && approval.Target.Issue > 0 {
-				if current, ok := e.Sessions.LookupSession(slot); ok && current != nil {
-					if current.IssueNumber != approval.Target.Issue || current.Status == state.StatusRunning {
-						return fmt.Errorf("slot %s changed or is running", slot)
+			// This fallback is selected from a cached lookup. Reload persisted
+			// canonical state after acquiring the slot lease so a replacement that
+			// landed between selection and deletion cannot remain invisible.
+			canonical := e.State
+			if strings.TrimSpace(e.Cfg.StateDir) != "" {
+				latest, err := state.Load(e.Cfg.StateDir)
+				if err != nil {
+					return fmt.Errorf("reload canonical session for slot %s: %w", slot, err)
+				}
+				canonical = latest
+			}
+
+			var current *state.Session
+			if canonical != nil {
+				current = canonical.Sessions[slot]
+			} else if e.Sessions != nil {
+				current, _ = e.Sessions.LookupSession(slot)
+			}
+			if current != nil {
+				if approval.Target.Issue > 0 && current.IssueNumber != approval.Target.Issue {
+					return fmt.Errorf("slot %s changed from issue #%d to #%d", slot, approval.Target.Issue, current.IssueNumber)
+				}
+				if approval.Target.PR > 0 && current.PRNumber > 0 && current.PRNumber != approval.Target.PR {
+					return fmt.Errorf("slot %s changed from PR #%d to #%d", slot, approval.Target.PR, current.PRNumber)
+				}
+				if current.Status == state.StatusRunning {
+					return fmt.Errorf("slot %s is running", slot)
+				}
+				lease := worker.CaptureCleanupLease(slot, current)
+				if err := worker.ValidateCleanupLease(
+					lease,
+					current,
+					worker.CleanupProbes{PIDAlive: e.PIDAlive, TmuxAlive: e.TmuxAlive},
+					worker.CleanupPolicy{},
+				); err != nil {
+					return err
+				}
+				if strings.TrimSpace(current.Worktree) != "" {
+					return fmt.Errorf("slot %s has canonical worktree claim %q; refusing fallback deletion", slot, current.Worktree)
+				}
+			}
+			if canonical != nil {
+				issueNumber, prNumber := approval.Target.Issue, approval.Target.PR
+				if current != nil {
+					if issueNumber <= 0 {
+						issueNumber = current.IssueNumber
 					}
+					if prNumber <= 0 {
+						prNumber = current.PRNumber
+					}
+				}
+				if repair, ok := canonical.ApprovedRepairOwnsSession(slot, issueNumber, prNumber); ok {
+					return fmt.Errorf("slot %s reserved by approved repair %s", slot, repair.ID)
 				}
 			}
 			return remove(e.Cfg.LocalPath, worktreePath)

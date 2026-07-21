@@ -119,6 +119,13 @@ func TestCleanupLeasedWorktree_RestoresAfterPartialRemoval(t *testing.T) {
 		Status:           state.StatusRetryExhausted,
 		WorkerGeneration: 3,
 	}
+	s.Sessions["sup-other"] = &state.Session{
+		IssueNumber:      964,
+		Status:           state.StatusRunning,
+		StartedAt:        time.Now().UTC(),
+		WorkerGeneration: 9,
+	}
+	otherSession := s.Sessions["sup-other"]
 	if err := state.Save(stateDir, s); err != nil {
 		t.Fatal(err)
 	}
@@ -150,6 +157,222 @@ func TestCleanupLeasedWorktree_RestoresAfterPartialRemoval(t *testing.T) {
 	}
 	if got := canonical.Sessions[slot].Worktree; got != worktree {
 		t.Fatalf("canonical worktree claim = %q, want %q", got, worktree)
+	}
+	if s.Sessions["sup-other"] != otherSession {
+		t.Fatal("cleanup compensation replaced the caller's sessions map")
+	}
+}
+
+func TestCleanupLeasedWorktree_PreservesConcurrentCanonicalUpdatesWithoutReplacingCycleMap(t *testing.T) {
+	stateDir := t.TempDir()
+	finished := time.Now().UTC().Add(-2 * time.Hour)
+	initial := state.NewState()
+	initial.Sessions["sup-cleanup"] = &state.Session{
+		IssueNumber:      963,
+		PRNumber:         1044,
+		Worktree:         "/worktrees/sup-cleanup",
+		Branch:           "feat/cleanup",
+		StartedAt:        finished.Add(-time.Hour),
+		FinishedAt:       &finished,
+		Status:           state.StatusRetryExhausted,
+		WorkerGeneration: 3,
+	}
+	initial.Sessions["sup-concurrent"] = &state.Session{
+		IssueNumber:      1000,
+		IssueTitle:       "original",
+		Status:           state.StatusRunning,
+		StartedAt:        time.Now().UTC(),
+		WorkerGeneration: 1,
+	}
+	initial.Sessions["sup-later"] = &state.Session{
+		IssueNumber:      1001,
+		IssueTitle:       "original",
+		Status:           state.StatusRunning,
+		StartedAt:        time.Now().UTC(),
+		WorkerGeneration: 1,
+	}
+	if err := state.Save(stateDir, initial); err != nil {
+		t.Fatal(err)
+	}
+
+	cycle, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	laterSession := cycle.Sessions["sup-later"]
+	lease := CaptureCleanupLease("sup-cleanup", cycle.Sessions["sup-cleanup"])
+
+	if err := state.Update(stateDir, func(latest *state.State) error {
+		latest.Sessions["sup-concurrent"].PID = 4242
+		latest.Sessions["sup-concurrent"].WorkerGeneration = 2
+		latest.Approvals = append(latest.Approvals, state.Approval{
+			ID:     "approval-unrelated",
+			Action: "merge_pr",
+			Target: &state.SupervisorTarget{PR: 2000},
+			Status: state.ApprovalStatusPending,
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var removeCalls int
+	err = CleanupLeasedWorktree(
+		&config.Config{StateDir: stateDir},
+		cycle,
+		lease,
+		CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux},
+		CleanupPolicy{RequireTerminal: true},
+		CleanupHooks{Remove: func(string, string) error {
+			removeCalls++
+			return nil
+		}},
+	)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("remove calls = %d, want 1", removeCalls)
+	}
+	if cycle.Sessions["sup-later"] != laterSession {
+		t.Fatal("cleanup replaced the caller's sessions map during iteration")
+	}
+
+	// Simulate a later mutation by the same checkSessions range. The final
+	// three-way merge must retain both that local change and the independently
+	// persisted canonical update.
+	laterSession.IssueTitle = "cycle update"
+	if err := state.Save(stateDir, cycle); err != nil {
+		t.Fatalf("save cycle state: %v", err)
+	}
+	canonical, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := canonical.Sessions["sup-cleanup"].Worktree; got != "" {
+		t.Fatalf("cleanup worktree claim = %q, want empty", got)
+	}
+	concurrent := canonical.Sessions["sup-concurrent"]
+	if concurrent.PID != 4242 || concurrent.WorkerGeneration != 2 {
+		t.Fatalf("concurrent session update lost: %+v", concurrent)
+	}
+	later := canonical.Sessions["sup-later"]
+	if later.IssueTitle != "cycle update" {
+		t.Fatalf("later cycle mutation lost: %+v", later)
+	}
+	if _, ok := canonical.FindApproval("approval-unrelated"); !ok {
+		t.Fatal("unrelated approval was discarded by cleanup transition")
+	}
+}
+
+func TestCleanupLeasedWorktree_BeforeRemoveFailureIsNonFatal(t *testing.T) {
+	stateDir := t.TempDir()
+	finished := time.Now().UTC().Add(-2 * time.Hour)
+	s := state.NewState()
+	s.Sessions["sup-963"] = &state.Session{
+		IssueNumber:      963,
+		PRNumber:         1044,
+		Worktree:         "/worktrees/sup-963",
+		Branch:           "feat/sup-963",
+		StartedAt:        finished.Add(-time.Hour),
+		FinishedAt:       &finished,
+		Status:           state.StatusRetryExhausted,
+		WorkerGeneration: 3,
+	}
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatal(err)
+	}
+	lease := CaptureCleanupLease("sup-963", s.Sessions["sup-963"])
+
+	var removeCalls int
+	err := CleanupLeasedWorktree(
+		&config.Config{StateDir: stateDir},
+		s,
+		lease,
+		CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux},
+		CleanupPolicy{RequireTerminal: true},
+		CleanupHooks{
+			BeforeRemove: func() error { return errors.New("hook failed") },
+			Remove: func(string, string) error {
+				removeCalls++
+				return nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("cleanup should continue after before_remove failure: %v", err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("remove calls = %d, want 1", removeCalls)
+	}
+	canonical, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := canonical.Sessions["sup-963"].Worktree; got != "" {
+		t.Fatalf("worktree claim = %q, want empty", got)
+	}
+}
+
+func TestCleanupLeasedWorktree_ApprovalDuringHookRestoresClaimBeforeRemove(t *testing.T) {
+	stateDir := t.TempDir()
+	finished := time.Now().UTC().Add(-2 * time.Hour)
+	s := state.NewState()
+	s.Sessions["sup-963"] = &state.Session{
+		IssueNumber:      963,
+		PRNumber:         1044,
+		Worktree:         "/worktrees/sup-963",
+		Branch:           "feat/sup-963",
+		StartedAt:        finished.Add(-time.Hour),
+		FinishedAt:       &finished,
+		Status:           state.StatusRetryExhausted,
+		WorkerGeneration: 3,
+	}
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatal(err)
+	}
+	lease := CaptureCleanupLease("sup-963", s.Sessions["sup-963"])
+
+	var removeCalls int
+	err := CleanupLeasedWorktree(
+		&config.Config{StateDir: stateDir},
+		s,
+		lease,
+		CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux},
+		CleanupPolicy{RequireTerminal: true},
+		CleanupHooks{
+			BeforeRemove: func() error {
+				return state.Update(stateDir, func(latest *state.State) error {
+					latest.Approvals = append(latest.Approvals, state.Approval{
+						ID:     "approval-repair-963",
+						Action: "spawn_repair_worker",
+						Target: &state.SupervisorTarget{Session: "sup-963", Issue: 963, PR: 1044},
+						Status: state.ApprovalStatusAwaitingDispatch,
+					})
+					return nil
+				})
+			},
+			Remove: func(string, string) error {
+				removeCalls++
+				return nil
+			},
+		},
+	)
+	if !errors.Is(err, ErrCleanupLeaseChanged) {
+		t.Fatalf("cleanup err = %v, want ErrCleanupLeaseChanged", err)
+	}
+	if removeCalls != 0 {
+		t.Fatalf("remove calls = %d, want 0", removeCalls)
+	}
+	canonical, loadErr := state.Load(stateDir)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if got := canonical.Sessions["sup-963"].Worktree; got != "/worktrees/sup-963" {
+		t.Fatalf("worktree claim = %q, want restored path", got)
+	}
+	if _, ok := canonical.FindApproval("approval-repair-963"); !ok {
+		t.Fatal("repair approval was lost during cleanup compensation")
 	}
 }
 

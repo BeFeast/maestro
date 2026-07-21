@@ -187,6 +187,54 @@ func TestExecute_DeleteWorktree_ApprovedRepairOwnsSameSlot(t *testing.T) {
 	}
 }
 
+func TestExecute_DeleteWorktree_FallbackReloadsCanonicalReplacement(t *testing.T) {
+	wt := &fakeWT{}
+	stateDir := t.TempDir()
+	canonical := state.NewState()
+	canonical.Sessions["sup-77"] = &state.Session{
+		IssueNumber:      812,
+		PRNumber:         900,
+		PID:              758258,
+		TmuxSession:      "maestro-sup-77",
+		Status:           state.StatusRunning,
+		Worktree:         "/srv/wt/sup-77",
+		StartedAt:        time.Now().UTC(),
+		WorkerGeneration: 2,
+	}
+	if err := state.Save(stateDir, canonical); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := newCfg()
+	cfg.StateDir = stateDir
+	ex := &Executor{
+		Worktrees: wt,
+		Cfg:       cfg,
+		// The cached lookup predates the replacement and selects the fallback
+		// path because it has no canonical worktree claim.
+		Sessions: fakeSessionLookup{
+			"sup-77": &state.Session{
+				IssueNumber:      812,
+				PRNumber:         900,
+				Status:           state.StatusRetryExhausted,
+				StartedAt:        time.Now().UTC().Add(-2 * time.Hour),
+				WorkerGeneration: 1,
+			},
+		},
+		PIDAlive:  func(int) bool { return true },
+		TmuxAlive: func(string) bool { return true },
+	}
+	a := mkApproval(config.SupervisorActionDeleteWorktree, &state.SupervisorTarget{Session: "sup-77", Issue: 812, PR: 900}, "stale", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("res = %+v, want execution_failed", res)
+	}
+	if len(wt.calls) != 0 {
+		t.Fatalf("RemoveWorktree was called %d times", len(wt.calls))
+	}
+}
+
 func TestExecute_DeleteWorktree_NoSessionsLookupSkipsFence(t *testing.T) {
 	// Backward compat: callers that don't wire Sessions get the previous
 	// behaviour (no fence).
