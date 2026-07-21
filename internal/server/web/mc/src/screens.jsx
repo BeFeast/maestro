@@ -331,6 +331,20 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                       {d.warn && <span style={{ color: "var(--watch)", marginLeft: 6 }}>· past SLA</span>}
                     </div>
                     <div className="dec-note">{d.note}</div>
+                    <div
+                      className="mono dim mt-2"
+                      style={{ fontSize: 10.5 }}
+                      title={[
+                        d.firstSeen ? `first seen ${new Date(d.firstSeen).toISOString()}` : "",
+                        d.lastSeen ? `last seen ${new Date(d.lastSeen).toISOString()}` : "",
+                        d.recommendationId ? `recommendation ${d.recommendationId}` : "",
+                      ].filter(Boolean).join(" · ")}
+                    >
+                      {d.firstSeen ? `first seen ${relTime(d.firstSeen, now)}` : "first seen unknown"}
+                      {` · last seen ${relTime(d.lastSeen, now)}`}
+                      {` · seen ${d.seenCount} time${d.seenCount === 1 ? "" : "s"}`}
+                      {d.disposition?.reason ? ` · ${String(d.disposition.reason).replaceAll("_", " ")}` : ""}
+                    </div>
                   </div>
                   <div className="dec-conf">conf {(d.conf * 100).toFixed(0)}%</div>
                 </div>
