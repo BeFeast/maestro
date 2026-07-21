@@ -177,6 +177,42 @@ func TestRestoreMissingWorktreePreservesOrphanedDirectoryAndRecreatesCheckout(t 
 	}
 }
 
+func TestGitWorktreeUsabilityRequiresExactLinkedCheckout(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	runBranchGit(t, root, "init", "-b", "main", repo)
+	runBranchGit(t, repo, "config", "user.email", "test@example.com")
+	runBranchGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runBranchGit(t, repo, "add", "base.txt")
+	runBranchGit(t, repo, "commit", "-m", "base")
+	runBranchGit(t, repo, "branch", "feat/valid")
+
+	valid := filepath.Join(root, "valid")
+	runBranchGit(t, repo, "worktree", "add", valid, "feat/valid")
+	if !isGitWorktreeForRepo(repo, valid) {
+		t.Fatal("linked worktree was not recognized as usable")
+	}
+
+	outer := filepath.Join(root, "outer")
+	runBranchGit(t, root, "init", "-b", "main", outer)
+	nested := filepath.Join(outer, "worktrees", "slot")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isGitWorktreeForRepo(repo, nested) {
+		t.Fatal("nested directory inherited parent repository usability")
+	}
+
+	unrelated := filepath.Join(root, "unrelated")
+	runBranchGit(t, root, "init", "-b", "main", unrelated)
+	if isGitWorktreeForRepo(repo, unrelated) {
+		t.Fatal("unrelated repository was accepted as the canonical checkout")
+	}
+}
+
 func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.T) {
 	ended := time.Date(2026, 7, 17, 11, 5, 0, 0, time.UTC)
 	started := ended.Add(time.Hour)

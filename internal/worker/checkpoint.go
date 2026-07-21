@@ -66,6 +66,53 @@ func WorktreeDirty(worktree string) (bool, error) {
 	return strings.TrimSpace(string(out)) != "", nil
 }
 
+func resolvedGitPath(repo, field string) (string, error) {
+	out, err := exec.Command("git", "-C", repo, "rev-parse", field).CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", fmt.Errorf("git rev-parse %s returned an empty path", field)
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repo, path)
+	}
+	return filepath.Abs(path)
+}
+
+func sameFile(pathA, pathB string) bool {
+	infoA, err := os.Stat(pathA)
+	if err != nil {
+		return false
+	}
+	infoB, err := os.Stat(pathB)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(infoA, infoB)
+}
+
+// isGitWorktreeForRepo reports whether worktree is the exact root of a usable
+// checkout linked to localPath. Git discovery alone is insufficient because
+// `git -C worktree` walks up through parent directories, and an unrelated
+// repository can also occupy the canonical path.
+func isGitWorktreeForRepo(localPath, worktree string) bool {
+	root, err := resolvedGitPath(worktree, "--show-toplevel")
+	if err != nil || !sameFile(worktree, root) {
+		return false
+	}
+	localCommonDir, err := resolvedGitPath(localPath, "--git-common-dir")
+	if err != nil {
+		return false
+	}
+	worktreeCommonDir, err := resolvedGitPath(worktree, "--git-common-dir")
+	if err != nil {
+		return false
+	}
+	return sameFile(localCommonDir, worktreeCommonDir)
+}
+
 // EnsureWorktreeBranch verifies that a retained worktree is attached to the
 // branch recorded by its canonical session. It switches only a clean worktree;
 // dirty changes are never stashed, reset, or moved implicitly because doing so
@@ -160,7 +207,7 @@ func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch 
 		if !info.IsDir() {
 			return fmt.Errorf("restore missing worktree: recorded path %s exists but is not a directory", actual)
 		}
-		if out, gitErr := exec.Command("git", "-C", actual, "rev-parse", "--is-inside-work-tree").CombinedOutput(); gitErr == nil && strings.TrimSpace(string(out)) == "true" {
+		if isGitWorktreeForRepo(localPath, actual) {
 			return EnsureWorktreeBranch(actual, branch)
 		}
 		// Cleanup can remove Git's worktree metadata before failing to remove
