@@ -905,7 +905,42 @@ type SupervisorConfig struct {
 	// the approval-gated edit_issue_body verb.
 	SpecGroom SupervisorSpecGroomConfig `yaml:"spec_groom" json:"spec_groom,omitempty"`
 
+	// NonFunctionalPaths lists extra doublestar globs whose EXCLUSIVE change in a
+	// merged PR must not settle a bug issue (#1020): a docs-only QA record is a
+	// record delivery, not a fix, so the session is released for fresh dispatch
+	// instead of silencing the issue. docs/** is always included; this field only
+	// extends the set (for example a project-specific records/ or qa/ tree).
+	NonFunctionalPaths []string `yaml:"non_functional_paths" json:"non_functional_paths,omitempty"`
+
 	excludedLabelsSet bool
+}
+
+// defaultNonFunctionalPaths mirrors pipeline.DefaultNonFunctionalPaths. It is
+// duplicated here to keep the config package free of a dependency on pipeline
+// (pipeline imports config, so the reverse edge would be an import cycle).
+var defaultNonFunctionalPaths = []string{"docs/**"}
+
+// EffectiveNonFunctionalPaths returns the non-functional path globs used to
+// classify a merged PR as a documentation/record delivery (#1020): the docs/**
+// default unioned with any project-configured extensions, de-duplicated with
+// input order preserved (defaults first).
+func (c SupervisorConfig) EffectiveNonFunctionalPaths() []string {
+	seen := make(map[string]struct{}, len(defaultNonFunctionalPaths)+len(c.NonFunctionalPaths))
+	out := make([]string, 0, len(defaultNonFunctionalPaths)+len(c.NonFunctionalPaths))
+	for _, group := range [][]string{defaultNonFunctionalPaths, c.NonFunctionalPaths} {
+		for _, p := range group {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // SupervisorSpecGroomConfig gates the spec-lint + grooming capability (#851).

@@ -1703,7 +1703,9 @@ func (o *Orchestrator) projectBoardSweepDue(now time.Time) bool {
 //   - running               => In Progress
 //   - queued / pr_open      => In Review
 //   - code_landed           => Deploying or Live Verification (depending on
-//     whether the outcome contract requires deploy)
+//     whether the outcome contract requires deploy), unless
+//     ReleasedForRedispatch (#1020) which maps to Todo so an issue whose merge
+//     did not fix it (docs-only / ineffective) stays runnable
 //   - done                  => Done
 //   - retry_exhausted /
 //     conflict_failed       => Blocked
@@ -1721,6 +1723,14 @@ func projectStatusForSession(sess *state.Session, requiresDeploy bool) (github.P
 	case state.StatusQueued, state.StatusPROpen:
 		return github.ProjectStatusInReview, true
 	case state.StatusCodeLanded:
+		// #1020: a code_landed session released for redispatch (docs-only /
+		// record-only delivery, or an ineffective fix whose blocking outcome
+		// check never recovered) did not settle its issue. Mirror it as runnable
+		// Todo, not Deploying/Live Verification, so the dynamic wave re-dispatches
+		// instead of leaving the issue stranded behind an ineffective merge.
+		if sess.ReleasedForRedispatch {
+			return github.ProjectStatusTodo, true
+		}
 		return codeLandedProjectStatusForSession(sess, requiresDeploy), true
 	case state.StatusDone:
 		return github.ProjectStatusDone, true
@@ -6316,7 +6326,11 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 	codeLanded := make([]*state.Session, 0)
 	for _, slotName := range sortedStateSessionNames(s) {
 		sess := s.Sessions[slotName]
-		if sess != nil && sess.Status == state.StatusCodeLanded {
+		// #1020: a code_landed session already released for redispatch (docs-only
+		// record delivery or an ineffective fix) is terminal for reconciliation —
+		// it no longer owns its issue and must never be settled toward done, or a
+		// later cycle would re-close the issue the release just re-opened.
+		if sess != nil && sess.Status == state.StatusCodeLanded && !sess.ReleasedForRedispatch {
 			codeLanded = append(codeLanded, sess)
 		}
 	}
@@ -6347,6 +6361,15 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 		checkedAt := time.Now().UTC()
 		sess.LastTerminalReconcileAt = &checkedAt
 		o.ensureMergedPRGateSnapshot(s, sess, checkedAt)
+		// #1020: before settling, inspect the merged diff. A bug issue whose PR
+		// changed only non-functional (docs/record) paths is a record delivery,
+		// not a fix: release it for fresh dispatch instead of silencing the issue.
+		switch o.classifyMergedCodeLandedDelivery(s, sess) {
+		case codeLandedRecordOnly:
+			continue // released for redispatch; must not settle the issue
+		case codeLandedHold:
+			continue // transient classification read error; retry next cycle
+		}
 		if !o.reconcileCodeLandedDelivery(s, sess) {
 			o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
 			continue
@@ -6366,7 +6389,15 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 		s.OutcomeHealth = &result
 		if result.State != outcome.HealthHealthy {
 			log.Printf("[orch] code_landed reconcile held: outcome verifier is %s: %s", result.State, result.Summary)
+			now := time.Now().UTC()
 			for _, sess := range ready {
+				// #1020 independent guard: a real code fix that merged but left the
+				// blocking outcome check failing with the SAME fingerprint past the
+				// verification deadline is ineffective — release it for redispatch
+				// instead of holding the issue in live-verification indefinitely.
+				if o.reconcileIneffectiveCodeLanded(s, sess, result, now) {
+					continue
+				}
 				o.syncProject(sess.IssueNumber, github.ProjectStatusLiveVerify)
 			}
 			return
@@ -6385,6 +6416,134 @@ func (o *Orchestrator) reconcileCodeLandedSessions(s *state.State) {
 				fmt.Sprintf("issue #%d resolved (verified merge) — repair worker moot", sess.IssueNumber))
 		}
 	}
+}
+
+// codeLandedVerifyGraceDefault is how long a code_landed session may keep
+// failing its blocking outcome check before the merge is judged ineffective
+// (#1020). It must exceed one terminalReconcileInterval so the same failure
+// fingerprint is observed on at least two independent cycles before conviction.
+const codeLandedVerifyGraceDefault = 30 * time.Minute
+
+func (o *Orchestrator) codeLandedVerifyGrace() time.Duration {
+	return codeLandedVerifyGraceDefault
+}
+
+// codeLandedClassification is the verdict of inspecting a merged code_landed PR
+// before it settles its issue (#1020).
+type codeLandedClassification int
+
+const (
+	codeLandedSettle     codeLandedClassification = iota // proceed to the normal settle path
+	codeLandedRecordOnly                                 // released as a docs/record delivery
+	codeLandedHold                                       // transient read error; retry next cycle
+)
+
+// classifyMergedCodeLandedDelivery inspects a merged code_landed session before
+// it settles its issue. For a bug-labelled issue whose merged PR changed only
+// non-functional (docs/record) paths, it releases the session for fresh
+// dispatch and returns codeLandedRecordOnly — the merge delivered evidence, not
+// a fix, so the issue must stay dispatchable rather than being silenced. A
+// transient GitHub read failure returns codeLandedHold so the caller retries
+// next cycle instead of settling on incomplete evidence. Every other case
+// (non-bug issue, or any functional path in the diff) returns codeLandedSettle.
+func (o *Orchestrator) classifyMergedCodeLandedDelivery(s *state.State, sess *state.Session) codeLandedClassification {
+	if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 || sess.ReleasedForRedispatch {
+		return codeLandedSettle
+	}
+	// Cheapest discriminator first: the changed-file set. A merged PR that
+	// touches any functional path is a fix and settles exactly as today. Only a
+	// fully non-functional diff is worth the extra issue read below, so a normal
+	// code PR (and any changed-files read failure) falls straight through to
+	// settle without ever calling getIssue — preserving the legacy close path.
+	files, err := o.prChangedFiles(sess.PRNumber)
+	if err != nil {
+		log.Printf("[orch] code_landed classify: changed-files lookup for PR #%d failed; settling on the legacy path: %v", sess.PRNumber, err)
+		return codeLandedSettle
+	}
+	if !pipeline.AllPathsNonFunctional(o.cfg.Supervisor.EffectiveNonFunctionalPaths(), files) {
+		return codeLandedSettle
+	}
+	// The diff is entirely non-functional. Only bug-labelled issues are guarded:
+	// a docs/enhancement issue may legitimately be closed by a docs-only PR.
+	issue, err := o.getIssue(sess.IssueNumber)
+	if err != nil {
+		log.Printf("[orch] code_landed classify: issue #%d lookup failed for a non-functional PR #%d; holding (will retry next cycle): %v", sess.IssueNumber, sess.PRNumber, err)
+		return codeLandedHold
+	}
+	if !github.HasLabel(issue, []string{"bug"}) {
+		return codeLandedSettle
+	}
+	o.releaseCodeLandedForRedispatch(s, sess, state.WorkerOutcomeRecordOnlyDelivery,
+		fmt.Sprintf("bug issue #%d merged PR #%d changed only non-functional paths (%s) — record delivery, not a fix",
+			sess.IssueNumber, sess.PRNumber, summarizeChangedPaths(files)))
+	if o.notifier != nil {
+		o.notifier.Sendf("♻️ maestro: PR #%d for bug issue #%d changed only documentation/record paths — released for fresh dispatch instead of settling the issue", sess.PRNumber, sess.IssueNumber)
+	}
+	return codeLandedRecordOnly
+}
+
+// reconcileIneffectiveCodeLanded is the independent #1020 guard: a code_landed
+// session whose real code change merged but whose blocking outcome check stayed
+// failing with the SAME fingerprint past the verification deadline is released
+// for fresh dispatch. Deterministic and logged. The deadline is armed the first
+// time a given failure fingerprint is observed; a changed fingerprint re-arms
+// (a new, different failure is not evidence the merged fix was ineffective).
+// Returns true only when it released the session.
+func (o *Orchestrator) reconcileIneffectiveCodeLanded(s *state.State, sess *state.Session, result outcome.HealthCheckResult, now time.Time) bool {
+	if sess == nil || sess.ReleasedForRedispatch {
+		return false
+	}
+	fp := state.OutcomeFailureFingerprint(result)
+	if fp == "" {
+		return false // pending/unknown/healthy: not a definite failure, keep holding
+	}
+	if sess.CodeLandedVerifyDeadline == nil || sess.OutcomeFailureFingerprint != fp {
+		deadline := now.Add(o.codeLandedVerifyGrace())
+		sess.CodeLandedVerifyDeadline = &deadline
+		sess.OutcomeFailureFingerprint = fp
+		log.Printf("[orch] issue #%d code_landed but blocking outcome check is failing (%s); verification deadline armed until %s",
+			sess.IssueNumber, fp, deadline.Format(time.RFC3339))
+		return false
+	}
+	if !state.CodeLandedIneffective(sess, result, now) {
+		return false
+	}
+	o.releaseCodeLandedForRedispatch(s, sess, state.WorkerOutcomeCodeLandedIneffective,
+		fmt.Sprintf("issue #%d code_landed via PR #%d but the blocking outcome check stayed failing with the same fingerprint (%s) past the verification deadline",
+			sess.IssueNumber, sess.PRNumber, fp))
+	if o.notifier != nil {
+		o.notifier.Sendf("♻️ maestro: PR #%d for issue #%d merged but the blocking outcome check never recovered — released for fresh dispatch (code_landed_ineffective)", sess.PRNumber, sess.IssueNumber)
+	}
+	return true
+}
+
+// releaseCodeLandedForRedispatch marks a code_landed session terminal-but-
+// released: it keeps its status and history (the PR really did merge) while
+// ReleasedForRedispatch drops its issue claim (state.sessionIssueClaim) and
+// maps the board to runnable Todo (projectStatusForSession), so the dynamic
+// wave dispatches a fresh worker within one cycle. State is persisted eagerly
+// so a crash before end-of-tick cannot resurrect the settled-but-ineffective
+// claim.
+func (o *Orchestrator) releaseCodeLandedForRedispatch(s *state.State, sess *state.Session, workerOutcome, reason string) {
+	sess.ReleasedForRedispatch = true
+	sess.WorkerOutcome = workerOutcome
+	o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+	log.Printf("[orch] %s: %s — released for redispatch", workerOutcome, reason)
+	if strings.TrimSpace(o.cfg.StateDir) != "" {
+		if err := state.Save(o.cfg.StateDir, s); err != nil {
+			log.Printf("[orch] release for redispatch: state save failed for issue #%d: %v", sess.IssueNumber, err)
+		}
+	}
+}
+
+// summarizeChangedPaths renders a bounded, operator-facing list of changed
+// paths for a log line.
+func summarizeChangedPaths(files []string) string {
+	const max = 3
+	if len(files) <= max {
+		return strings.Join(files, ", ")
+	}
+	return fmt.Sprintf("%s, … (+%d more)", strings.Join(files[:max], ", "), len(files)-max)
 }
 
 // reconcileCodeLandedDelivery returns true only when no approval-gated
