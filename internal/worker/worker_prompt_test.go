@@ -369,6 +369,26 @@ func TestWorkerPromptTemplateExplainsVisualEvidenceAttachment(t *testing.T) {
 	}
 }
 
+func TestWorkerPromptTemplateKeepsBackendAttributionInternal(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "worker-prompt-template.md"))
+	if err != nil {
+		t.Fatalf("read worker-prompt-template.md: %v", err)
+	}
+	prompt := string(data)
+	if !strings.Contains(prompt, "Maestro records this control-plane telemetry internally") {
+		t.Fatal("worker prompt must direct backend attribution to Maestro internal state")
+	}
+	for _, forbidden := range []string{
+		"Maestro-Backend:",
+		"preserve the attribution trailer",
+		"preserve backend attribution",
+	} {
+		if strings.Contains(strings.ToLower(prompt), strings.ToLower(forbidden)) {
+			t.Fatalf("worker prompt still asks workers to preserve public attribution (%q)", forbidden)
+		}
+	}
+}
+
 // --- Tests from main: validation contract placeholder ---
 
 func TestAssemblePrompt_ValidationContractFromFile(t *testing.T) {
