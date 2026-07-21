@@ -4041,10 +4041,16 @@ func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForReconciledDuplicate
 		t.Fatalf("superseding merged session = %+v, %v; want %s", got, ok, canonical.Slot)
 	}
 
+	// #976: a genuine failed predecessor (no reconciliation outcome) for a
+	// still-open issue is also superseded by the canonical done session that
+	// merged the issue's PR. The failed row stays in history/usage accounting
+	// but must not become operator_state. Genuine regressions are protected by
+	// ReleasedForRedispatch (see the reopened-follow-up test), not by treating
+	// every predecessor failure as current attention.
 	genuineFailure := duplicate
 	genuineFailure.WorkerOutcome = ""
-	if got, ok := fleetSupersedingIssueSession(genuineFailure, []sessionInfo{genuineFailure, canonical}); ok {
-		t.Fatalf("genuine failed follow-up incorrectly superseded: %+v", got)
+	if got, ok := fleetSupersedingIssueSession(genuineFailure, []sessionInfo{genuineFailure, canonical}); !ok || got.Slot != canonical.Slot {
+		t.Fatalf("failed predecessor not superseded by canonical done session = %+v, %v; want %s", got, ok, canonical.Slot)
 	}
 }
 
@@ -4062,10 +4068,14 @@ func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForLaterDuplicate(t *t
 		t.Fatalf("later duplicate superseding session = %+v, %v; want %s", got, ok, canonical.Slot)
 	}
 
+	// #976: an earlier predecessor failure (started before the canonical done
+	// session finished) is superseded too. Supersession no longer depends on
+	// relative wall-clock ordering between the failed row and the completion —
+	// only on the canonical done session still owning its delivered PR.
 	earlierFailure := duplicate
 	earlierFailure.StartedAt = "2026-07-17T13:20:00Z"
-	if got, ok := fleetSupersedingIssueSession(earlierFailure, []sessionInfo{earlierFailure, canonical}); ok {
-		t.Fatalf("earlier genuine failure incorrectly superseded: %+v", got)
+	if got, ok := fleetSupersedingIssueSession(earlierFailure, []sessionInfo{earlierFailure, canonical}); !ok || got.Slot != canonical.Slot {
+		t.Fatalf("earlier predecessor failure not superseded = %+v, %v; want %s", got, ok, canonical.Slot)
 	}
 }
 
@@ -4081,6 +4091,41 @@ func TestFleetSupersedingIssueSessionDoesNotUseReleasedDoneSessionForReopenedFol
 
 	if got, ok := fleetSupersedingIssueSession(followUp, []sessionInfo{followUp, oldCompleted}); ok {
 		t.Fatalf("released terminal session incorrectly hid reopened follow-up: %+v", got)
+	}
+}
+
+// TestFleetSupersedingIssueSessionSuppressesPredecessorFailuresBehindLaterDone
+// pins the #976 regression: an issue accumulated two failed implementation
+// sessions, then a later canonical session merged its PR and reached done while
+// the issue intentionally stayed open/blocked for installed-runtime QA. Neither
+// failed predecessor may become operator_state; the canonical done session
+// wins. Selection is order-independent and idempotent across the full session
+// set (both predecessors present at once).
+func TestFleetSupersedingIssueSessionSuppressesPredecessorFailuresBehindLaterDone(t *testing.T) {
+	failedA := sessionInfo{
+		Slot: "ok-player-410", IssueNumber: 512, Status: string(state.StatusFailed),
+		NeedsAttention: true, StartedAt: "2026-07-19T08:00:00Z",
+	}
+	failedB := sessionInfo{
+		Slot: "ok-player-418", IssueNumber: 512, Status: string(state.StatusDead),
+		NeedsAttention: true, StartedAt: "2026-07-19T10:30:00Z",
+	}
+	doneC := sessionInfo{
+		Slot: "ok-player-431", IssueNumber: 512, Status: string(state.StatusDone),
+		PRNumber: 540, FinishedAt: "2026-07-19T13:15:00Z",
+	}
+	all := []sessionInfo{failedA, failedB, doneC}
+
+	if got, ok := fleetSupersedingIssueSession(failedA, all); !ok || got.Slot != doneC.Slot {
+		t.Fatalf("failed A superseding session = %+v, %v; want %s", got, ok, doneC.Slot)
+	}
+	if got, ok := fleetSupersedingIssueSession(failedB, all); !ok || got.Slot != doneC.Slot {
+		t.Fatalf("failed B superseding session = %+v, %v; want %s", got, ok, doneC.Slot)
+	}
+	// The canonical done session itself is never a suppression candidate: it is
+	// not flagged as needing attention, so it remains the surfaced state.
+	if _, ok := fleetSupersedingIssueSession(doneC, all); ok {
+		t.Fatalf("canonical done session must not be superseded")
 	}
 }
 

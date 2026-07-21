@@ -4400,12 +4400,22 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 				return peer, true
 			}
 		case state.StatusDone:
-			// A terminal peer is authoritative only when it owns the issue's
-			// delivered PR and this attempt was explicitly reconciled as a
-			// duplicate. Do not hide a genuine failed follow-up merely because
-			// an older session for the issue once completed.
-			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch &&
-				(candidate.WorkerOutcome == "duplicate_dispatch_reconciled" || fleetSessionStartedAfterCanonicalCompletion(candidate, peer)) {
+			// A canonical session that delivered the issue's PR and still owns
+			// it authoritatively supersedes a no-PR terminal sibling for the
+			// same issue — whether that sibling was an earlier predecessor
+			// attempt (failed A, failed B before the later done C) or a later
+			// duplicate that raced the merge. The old row is preserved in
+			// history/usage accounting but must not consume operator attention
+			// or become operator_state (#976).
+			//
+			// ReleasedForRedispatch is the discriminator that protects a
+			// genuine regression: when the issue is intentionally reopened for a
+			// real follow-up, the done session's dispatch claim is released, so
+			// it no longer hides the new attempt and the current session
+			// surfaces instead of a predecessor (#949). Selection stays
+			// deterministic and idempotent because it depends only on durable
+			// session fields, not on relative wall-clock ordering.
+			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch {
 				return peer, true
 			}
 		}
@@ -4449,12 +4459,6 @@ func fleetPRSessionOwnerPrecedes(candidate, current sessionInfo) bool {
 		return state.SessionStatus(candidate.Status) == state.StatusQueued
 	}
 	return candidate.Slot < current.Slot
-}
-
-func fleetSessionStartedAfterCanonicalCompletion(candidate, canonical sessionInfo) bool {
-	started, startErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
-	finished, finishErr := time.Parse(time.RFC3339, strings.TrimSpace(canonical.FinishedAt))
-	return startErr == nil && finishErr == nil && !started.Before(finished)
 }
 
 func backendDriftRestartControlAction(readOnly bool, endpoint, target string, workers, skipped []controlActionWorkerTarget) controlAction {
