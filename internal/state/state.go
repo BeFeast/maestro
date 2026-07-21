@@ -185,9 +185,25 @@ type Phase string
 const (
 	PhaseNone      Phase = ""          // legacy single-phase mode (no pipeline)
 	PhasePlan      Phase = "plan"      // planner: creates MAESTRO_PLAN.md + VALIDATION.md
+	PhaseAdvisor   Phase = "advisor"   // advisor: independently reviews the plan before implementation
 	PhaseImplement Phase = "implement" // implementer: writes code based on plan
 	PhaseValidate  Phase = "validate"  // validator: checks assertions, gates PR creation
 )
+
+// AdvisorReview is one durable, auditable Advisor verdict. The session also
+// carries the latest projection for fast Fleet rendering; this slice preserves
+// the full bounded review history across restarts and later phase transitions.
+type AdvisorReview struct {
+	PlanVersion    int       `json:"plan_version"`
+	ReviewRound    int       `json:"review_round"`
+	Backend        string    `json:"backend,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	Verdict        string    `json:"verdict,omitempty"`
+	Findings       string    `json:"findings,omitempty"`
+	TerminalReason string    `json:"terminal_reason,omitempty"`
+	Bypassed       bool      `json:"bypassed,omitempty"`
+	ReviewedAt     time.Time `json:"reviewed_at"`
+}
 
 type Session struct {
 	IssueNumber int       `json:"issue_number"`
@@ -234,43 +250,61 @@ type Session struct {
 	// dominate an agentic run and cost ~10% of input, so blending them into
 	// TokensUsedTotal over-states cost. Zero for backends that do not stamp a
 	// split; the cost rollup then falls back to the blended estimate.
-	TokensInput                 int               `json:"tokens_input,omitempty"`                   // cumulative non-cached input tokens
-	TokensOutput                int               `json:"tokens_output,omitempty"`                  // cumulative output (generated) tokens
-	TokensCacheRead             int               `json:"tokens_cache_read,omitempty"`              // cumulative cache-read (reused context) tokens, discounted
-	TokensCacheWrite            int               `json:"tokens_cache_write,omitempty"`             // cumulative cache-write (cache creation) tokens
-	QuotaTokensAccounted        int               `json:"quota_tokens_accounted,omitempty"`         // portion of TokensUsedTotal already accrued into BackendQuotaUsage windows (#704)
-	RateLimitHit                bool              `json:"rate_limit_hit,omitempty"`                 // true when the worker died on a transient backend block (provider limit or auth failure, #693); excludes the session from the per-issue retry budget
-	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for backend-failure fallback)
-	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit or auth failure
-	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // backend block signature or class (e.g. BackendBlockAuthFailure)
-	ProviderLimitResetAt        *time.Time        `json:"provider_limit_reset_at,omitempty"`        // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
-	ProviderLimitProvider       string            `json:"provider_limit_provider,omitempty"`        // secret-free provider route for model-scoped failures
-	ProviderLimitModel          string            `json:"provider_limit_model,omitempty"`           // requested model for model-scoped failures
-	CredentialCandidates        int               `json:"credential_candidates,omitempty"`          // aggregate candidate count reported by the proxy
-	CredentialCandidatesKnown   bool              `json:"credential_candidates_known,omitempty"`    // distinguishes an omitted count from a real zero
-	CredentialUsable            int               `json:"credential_usable,omitempty"`              // candidates usable for ProviderLimitModel
-	CredentialUsableKnown       bool              `json:"credential_usable_known,omitempty"`        // distinguishes an omitted count from a real zero
-	CredentialAggregateReason   string            `json:"credential_aggregate_reason,omitempty"`    // aggregate proxy reason; never a credential identifier
-	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
-	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
-	PipelineFull                bool              `json:"pipeline_full,omitempty"`                  // true when issue label opted this session into plan/implement/validate
-	ValidationFails             int               `json:"validation_fails,omitempty"`               // number of failed validation attempts
-	ValidationFeedback          string            `json:"validation_feedback,omitempty"`            // feedback from last failed validation
-	CIFailureOutput             string            `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)
-	FailingCheckContext         string            `json:"failing_check_context,omitempty"`          // #857: bounded excerpt of a check-run still failing on the PR head, carried into a retry so the worker sees the red check its previous push introduced (consumed on respawn)
-	PreviousAttemptFeedback     string            `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
-	PreviousAttemptFeedbackKind string            `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
-	RetryReason                 string            `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
-	OperatorGateName            string            `json:"operator_gate_name,omitempty"`             // explicit human/operator gate holding this PR; cleared when the gate opens
-	OperatorGateRequiredAction  string            `json:"operator_gate_required_action,omitempty"`  // concise operator action needed to clear OperatorGateName
-	LastClosedPRNumber          int               `json:"last_closed_pr_number,omitempty"`          // PR the retry path closed before scheduling this retry (#800); if an operator reopens and merges it while the backoff runs, the pre-respawn staleness check sees the merge and cancels the retry
-	ReleasedForRedispatch       bool              `json:"released_for_redispatch,omitempty"`        // #818: a retry_exhausted session whose closed-unmerged PR was reconciled and the issue released for fresh dispatch. Marked failed so the attempt counts toward max_retries_per_issue, but the board must mirror it as runnable Todo (not Blocked) so the dynamic wave re-dispatches instead of re-stranding it
-	LastTerminalReconcileAt     *time.Time        `json:"last_terminal_reconcile_at,omitempty"`     // #940: last successful authoritative issue/PR reconciliation for a terminal session. Bounds historical forge polling while preserving the 10-minute hands-off SLA across daemon restarts
-	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
-	RestartCheckpointAt         *time.Time        `json:"restart_checkpoint_at,omitempty"`          // #877/#966: set when the daemon deliberately checkpoints this still-running worker on shutdown. A non-nil value tells the next daemon to adopt the same surviving isolated PID/worktree, or resume the same logical session in place if the worker exited, exactly once. Cleared on successful adoption/resume so it cannot duplicate.
-	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
-	CodeLandedVerifyDeadline    *time.Time        `json:"code_landed_verify_deadline,omitempty"`    // #1020: when a code_landed session was first observed failing its blocking outcome check; past this the fix is judged ineffective if the SAME fingerprint persists
-	OutcomeFailureFingerprint   string            `json:"outcome_failure_fingerprint,omitempty"`    // #1020: stable identity of the blocking outcome failure captured when the deadline was armed; a changed fingerprint re-arms rather than convicting
+	TokensInput                     int               `json:"tokens_input,omitempty"`                       // cumulative non-cached input tokens
+	TokensOutput                    int               `json:"tokens_output,omitempty"`                      // cumulative output (generated) tokens
+	TokensCacheRead                 int               `json:"tokens_cache_read,omitempty"`                  // cumulative cache-read (reused context) tokens, discounted
+	TokensCacheWrite                int               `json:"tokens_cache_write,omitempty"`                 // cumulative cache-write (cache creation) tokens
+	QuotaTokensAccounted            int               `json:"quota_tokens_accounted,omitempty"`             // portion of TokensUsedTotal already accrued into BackendQuotaUsage windows (#704)
+	RateLimitHit                    bool              `json:"rate_limit_hit,omitempty"`                     // true when the worker died on a transient backend block (provider limit or auth failure, #693); excludes the session from the per-issue retry budget
+	TriedBackends                   []string          `json:"tried_backends,omitempty"`                     // backends already attempted (for backend-failure fallback)
+	ProviderLimitBackend            string            `json:"provider_limit_backend,omitempty"`             // backend that hit a provider capacity limit or auth failure
+	ProviderLimitReason             string            `json:"provider_limit_reason,omitempty"`              // backend block signature or class (e.g. BackendBlockAuthFailure)
+	ProviderLimitResetAt            *time.Time        `json:"provider_limit_reset_at,omitempty"`            // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
+	ProviderLimitProvider           string            `json:"provider_limit_provider,omitempty"`            // secret-free provider route for model-scoped failures
+	ProviderLimitModel              string            `json:"provider_limit_model,omitempty"`               // requested model for model-scoped failures
+	CredentialCandidates            int               `json:"credential_candidates,omitempty"`              // aggregate candidate count reported by the proxy
+	CredentialCandidatesKnown       bool              `json:"credential_candidates_known,omitempty"`        // distinguishes an omitted count from a real zero
+	CredentialUsable                int               `json:"credential_usable,omitempty"`                  // candidates usable for ProviderLimitModel
+	CredentialUsableKnown           bool              `json:"credential_usable_known,omitempty"`            // distinguishes an omitted count from a real zero
+	CredentialAggregateReason       string            `json:"credential_aggregate_reason,omitempty"`        // aggregate proxy reason; never a credential identifier
+	BackendSelection                *BackendSelection `json:"backend_selection,omitempty"`                  // latest backend selection audit record
+	Phase                           Phase             `json:"phase,omitempty"`                              // current pipeline phase (empty = legacy single-phase)
+	PipelineFull                    bool              `json:"pipeline_full,omitempty"`                      // true when issue label opted this session into plan/implement/validate
+	PipelineAdvised                 bool              `json:"pipeline_advised,omitempty"`                   // true when issue label explicitly opted this session into the advised pipeline
+	PlanVersion                     int               `json:"plan_version,omitempty"`                       // canonical plan generation completed by the planner
+	AdvisorReviewRound              int               `json:"advisor_review_round,omitempty"`               // current/latest bounded Advisor pass
+	AdvisorMaxReviewRounds          int               `json:"advisor_max_review_rounds,omitempty"`          // review budget pinned when the gate starts
+	AdvisorBackend                  string            `json:"advisor_backend,omitempty"`                    // actual Advisor backend used
+	AdvisorModel                    string            `json:"advisor_model,omitempty"`                      // configured or self-reported Advisor model
+	AdvisorVerdict                  string            `json:"advisor_verdict,omitempty"`                    // PLAN_APPROVED, PLAN_REVISE, PLAN_INVALID, or PLAN_BYPASSED
+	AdvisorUnresolvedFindings       string            `json:"advisor_unresolved_findings,omitempty"`        // exact latest findings that still block implementation
+	AdvisorFindingsLedger           string            `json:"advisor_findings_ledger,omitempty"`            // compact accumulated findings passed back to the planner
+	AdvisorTerminalReason           string            `json:"advisor_terminal_reason,omitempty"`            // fail-closed or bypass reason
+	AdvisorBestEffort               bool              `json:"advisor_best_effort,omitempty"`                // explicit config opt-out from fail-closed behavior
+	AdvisorBypassed                 bool              `json:"advisor_bypassed,omitempty"`                   // terminal Advisor failure was explicitly bypassed
+	AdvisorReviews                  []AdvisorReview   `json:"advisor_reviews,omitempty"`                    // bounded review history
+	AdvisorBaselineHead             string            `json:"advisor_baseline_head,omitempty"`              // internal review-only invariant snapshot
+	AdvisorBaselineWorktree         string            `json:"advisor_baseline_worktree,omitempty"`          // internal review-only invariant snapshot
+	AdvisorBaselineRemoteRefs       string            `json:"advisor_baseline_remote_refs,omitempty"`       // internal review-only invariant snapshot
+	AdvisorBaselinePlanDigest       string            `json:"advisor_baseline_plan_digest,omitempty"`       // internal review-only invariant snapshot
+	AdvisorBaselineValidationDigest string            `json:"advisor_baseline_validation_digest,omitempty"` // internal review-only invariant snapshot
+	ValidationFails                 int               `json:"validation_fails,omitempty"`                   // number of failed validation attempts
+	ValidationFeedback              string            `json:"validation_feedback,omitempty"`                // feedback from last failed validation
+	CIFailureOutput                 string            `json:"ci_failure_output,omitempty"`                  // CI failure output captured before retry (passed to next worker as context)
+	FailingCheckContext             string            `json:"failing_check_context,omitempty"`              // #857: bounded excerpt of a check-run still failing on the PR head, carried into a retry so the worker sees the red check its previous push introduced (consumed on respawn)
+	PreviousAttemptFeedback         string            `json:"previous_attempt_feedback,omitempty"`          // feedback from previous failed PR attempt
+	PreviousAttemptFeedbackKind     string            `json:"previous_attempt_feedback_kind,omitempty"`     // review_feedback, rebase_conflict
+	RetryReason                     string            `json:"retry_reason,omitempty"`                       // current retry lifecycle reason, e.g. review_feedback
+	OperatorGateName                string            `json:"operator_gate_name,omitempty"`                 // explicit human/operator gate holding this PR; cleared when the gate opens
+	OperatorGateRequiredAction      string            `json:"operator_gate_required_action,omitempty"`      // concise operator action needed to clear OperatorGateName
+	LastClosedPRNumber              int               `json:"last_closed_pr_number,omitempty"`              // PR the retry path closed before scheduling this retry (#800); if an operator reopens and merges it while the backoff runs, the pre-respawn staleness check sees the merge and cancels the retry
+	ReleasedForRedispatch           bool              `json:"released_for_redispatch,omitempty"`            // #818: a retry_exhausted session whose closed-unmerged PR was reconciled and the issue released for fresh dispatch. Marked failed so the attempt counts toward max_retries_per_issue, but the board must mirror it as runnable Todo (not Blocked) so the dynamic wave re-dispatches instead of re-stranding it
+	LastTerminalReconcileAt         *time.Time        `json:"last_terminal_reconcile_at,omitempty"`         // #940: last successful authoritative issue/PR reconciliation for a terminal session. Bounds historical forge polling while preserving the 10-minute hands-off SLA across daemon restarts
+	CheckpointFile                  string            `json:"checkpoint_file,omitempty"`                    // path to CHECKPOINT.md saved at soft token threshold
+	RestartCheckpointAt             *time.Time        `json:"restart_checkpoint_at,omitempty"`              // #877/#966: set when the daemon deliberately checkpoints this still-running worker on shutdown. A non-nil value tells the next daemon to adopt the same surviving isolated PID/worktree, or resume the same logical session in place if the worker exited, exactly once. Cleared on successful adoption/resume so it cannot duplicate.
+	DeploymentFinishedAt            *time.Time        `json:"deployment_finished_at,omitempty"`             // set when the post-merge deploy hook succeeds
+	CodeLandedVerifyDeadline        *time.Time        `json:"code_landed_verify_deadline,omitempty"`        // #1020: when a code_landed session was first observed failing its blocking outcome check; past this the fix is judged ineffective if the SAME fingerprint persists
+	OutcomeFailureFingerprint       string            `json:"outcome_failure_fingerprint,omitempty"`        // #1020: stable identity of the blocking outcome failure captured when the deadline was armed; a changed fingerprint re-arms rather than convicting
 
 	// #705: opt-in verify.visual outcome for this session's PR. Set once by
 	// the orchestrator's merge flow: "not_required" (no UI paths touched),
@@ -374,6 +408,18 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 	}
 	if attention, ok := reviewFeedbackRetryAttention(sess, alive, now); ok {
 		return attention
+	}
+	if strings.TrimSpace(sess.AdvisorTerminalReason) != "" && !sess.AdvisorBypassed && sess.Status == StatusFailed {
+		findings := strings.TrimSpace(sess.AdvisorUnresolvedFindings)
+		reason := fmt.Sprintf("Advisor gate failed closed before implementation (%s).", sess.AdvisorTerminalReason)
+		if findings != "" {
+			reason += "\n" + findings
+		}
+		return SessionAttention{
+			Reason:         reason,
+			NextAction:     "Review the exact Advisor findings and terminal reason, repair the plan or Advisor backend, then restart intentionally; implementation was not started.",
+			NeedsAttention: true,
+		}
 	}
 	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
 		return SessionAttention{

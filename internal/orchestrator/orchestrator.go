@@ -50,6 +50,7 @@ const (
 	// it never allocates a duplicate identity merely to retry startup.
 	freshDispatchLeaseDuration = 10 * time.Minute
 	pipelineFullLabel          = "pipeline:full"
+	pipelineAdvisedLabel       = "pipeline:advised"
 )
 
 type cycleBoolResult struct {
@@ -4194,6 +4195,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
 				o.runAfterRunHook(sess)
 				o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+				if sess.Phase == state.PhaseAdvisor {
+					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "token_budget_exceeded", fmt.Sprintf("Advisor reached its configured token budget before producing %s.", pipeline.AdvisorReviewFile))
+				}
 				continue
 			}
 			closed, err := o.isIssueClosed(sess.IssueNumber)
@@ -4215,10 +4219,20 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if process is still alive
 			if sess.PID > 0 && !o.pidAlive(sess.PID) {
+				if sess.Phase == state.PhaseAdvisor {
+					if pr, found := branchToPR[sess.Branch]; found {
+						o.runAfterRunHook(sess)
+						o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "advisor_pr_created", fmt.Sprintf("Advisor created or exposed PR #%d before implementation.", pr.Number))
+						continue
+					}
+					if o.handleAdvisorBackendDeath(s, slotName, sess) {
+						continue
+					}
+				}
 				// Pipeline phase transition: if this is a pipeline session,
 				// try to advance to the next phase before falling through
 				// to normal dead-worker handling.
-				if sess.Phase != state.PhaseNone && o.advancePipeline(slotName, sess) {
+				if sess.Phase != state.PhaseNone && o.advancePipeline(s, slotName, sess) {
 					continue
 				}
 
@@ -4385,6 +4399,14 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if running session has opened a PR (worker still alive)
 			if pr, found := branchToPR[sess.Branch]; found {
+				if sess.Phase == state.PhaseAdvisor {
+					o.runAfterRunHook(sess)
+					if err := o.stopWorker(slotName, sess); err != nil {
+						log.Printf("[pipeline] stop Advisor %s after premature PR #%d: %v", slotName, pr.Number, err)
+					}
+					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "advisor_pr_created", fmt.Sprintf("Advisor created or exposed PR #%d before implementation.", pr.Number))
+					continue
+				}
 				if sess.PRNumber == pr.Number {
 					// In-place review/CI retries intentionally keep working on an
 					// already-open PR. Do not transition back to pr_open until the
@@ -4441,6 +4463,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							now := time.Now().UTC()
 							resetAt := &resetTime
 							o.recordProviderLimit(s, slotName, sess, pattern, resetAt, now)
+							if sess.Phase == state.PhaseAdvisor {
+								o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "backend_unavailable", fmt.Sprintf("Required Advisor backend %s hit a provider limit (%s).", sess.Backend, pattern))
+								continue
+							}
 							selection := o.selectProviderLimitFallback(s, sess, now)
 							sess.BackendSelection = &selection
 
@@ -4495,7 +4521,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Soft token threshold: checkpoint + respawn ---
-					if o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
+					if sess.Phase != state.PhaseAdvisor && o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
 						softLimit := int(float64(o.cfg.WorkerMaxTokens) * o.cfg.SoftTokenThreshold())
 						if sess.TokensUsedAttempt >= softLimit {
 							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d), checkpointing",
@@ -4548,6 +4574,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							MaxTokens:      o.cfg.WorkerMaxTokens,
 							MeasuredAt:     now,
 						}, now)
+						if sess.Phase == state.PhaseAdvisor {
+							o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "token_budget_exceeded", fmt.Sprintf("Advisor reached its configured token budget before producing %s.", pipeline.AdvisorReviewFile))
+						}
 						continue
 					}
 
@@ -4572,10 +4601,15 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								// so the current kill is not included in the count.
 								prevSilentKills := countSilentTimeoutKillsForIssue(s, sess.IssueNumber)
 
-								sess.Status = state.StatusDead
-								sess.LastNotifiedStatus = "silent_timeout"
-								sess.FinishedAt = &now
-								state.MarkWorkerEnded(sess, now)
+								if sess.Phase == state.PhaseAdvisor {
+									o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "silent_timeout", sess.AdvisorUnresolvedFindings)
+									continue
+								} else {
+									sess.Status = state.StatusDead
+									sess.LastNotifiedStatus = "silent_timeout"
+									sess.FinishedAt = &now
+									state.MarkWorkerEnded(sess, now)
+								}
 
 								if prevSilentKills > 0 {
 									// auto-label blocked disabled
@@ -4591,7 +4625,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 
 			// Check if worker exceeded max runtime — hard fail (no retry) with diagnostics
-			maxMinutes := o.cfg.MaxRuntimeMinutes
+			maxMinutes := pipeline.MaxRuntimeForPhase(o.pipelineConfigForSession(sess), sess.Phase)
 			if sess.LongRunning {
 				maxMinutes *= 2
 			}
@@ -4610,15 +4644,19 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				if err := o.stopWorker(slotName, sess); err != nil {
 					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
 				}
-				// auto-label blocked disabled
-				o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
-				sess.Status = state.StatusFailed
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				state.MarkWorkerEnded(sess, now)
+				if sess.Phase == state.PhaseAdvisor {
+					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "timeout", sess.AdvisorUnresolvedFindings)
+				} else {
+					// auto-label blocked disabled
+					o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
+					sess.Status = state.StatusFailed
+					now := time.Now().UTC()
+					sess.FinishedAt = &now
+					state.MarkWorkerEnded(sess, now)
 
-				o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d: %s) timed out after %d min.\nLast log lines:\n%s",
-					slotName, sess.IssueNumber, sess.IssueTitle, maxMinutes, logTail)
+					o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d: %s) timed out after %d min.\nLast log lines:\n%s",
+						slotName, sess.IssueNumber, sess.IssueTitle, maxMinutes, logTail)
+				}
 			}
 		}
 	}
@@ -7833,15 +7871,23 @@ func isOutcomeRepairIssue(issue github.Issue) bool {
 		strings.Contains(issue.Body, outcome.OutcomeRepairMarkerPrefix)
 }
 
-func pipelineConfigForIssue(base *config.Config, issue github.Issue) (*config.Config, bool) {
-	if base == nil || !issueHasLabel(issue, pipelineFullLabel) {
-		return base, false
+func pipelineConfigForIssue(base *config.Config, issue github.Issue) (*config.Config, bool, bool) {
+	if base == nil {
+		return base, false, false
+	}
+	pipelineFull := issueHasLabel(issue, pipelineFullLabel)
+	pipelineAdvised := issueHasLabel(issue, pipelineAdvisedLabel)
+	if !pipelineFull && !pipelineAdvised {
+		return base, false, false
 	}
 	cfg := *base
 	cfg.Pipeline.Enabled = true
 	cfg.Pipeline.Planner.Enabled = true
 	cfg.Pipeline.Validator.Enabled = true
-	return &cfg, true
+	if pipelineAdvised {
+		cfg.Pipeline.Advisor.Enabled = true
+	}
+	return &cfg, pipelineFull, pipelineAdvised
 }
 
 func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (bool, string, error) {
@@ -9080,7 +9126,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 		// Determine initial phase and backend. A pipeline:full issue label
 		// enables the phase pipeline only for this worker's copied config.
-		workerCfg, pipelineFull := pipelineConfigForIssue(o.cfg, issue)
+		workerCfg, pipelineFull, pipelineAdvised := pipelineConfigForIssue(o.cfg, issue)
 		initialPhase := pipeline.InitialPhase(workerCfg)
 		var backendName string
 		var promptBase string
@@ -9231,6 +9277,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 		if pipelineFull {
 			s.Sessions[slotName].PipelineFull = true
+		}
+		if pipelineAdvised {
+			s.Sessions[slotName].PipelineAdvised = true
 		}
 		// #427/#783: stamp the backend selection reason on the session so the
 		// dashboard / fleet API can show why this backend was chosen (label /

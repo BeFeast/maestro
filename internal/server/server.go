@@ -345,9 +345,21 @@ type sessionInfo struct {
 	Backend        string `json:"backend,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
-	Model    string `json:"model,omitempty"`
-	PRNumber int    `json:"pr_number,omitempty"`
-	PRURL    string `json:"pr_url,omitempty"`
+	Model                     string                `json:"model,omitempty"`
+	PRNumber                  int                   `json:"pr_number,omitempty"`
+	PRURL                     string                `json:"pr_url,omitempty"`
+	Phase                     string                `json:"phase,omitempty"`
+	PlanVersion               int                   `json:"plan_version,omitempty"`
+	AdvisorReviewRound        int                   `json:"advisor_review_round,omitempty"`
+	AdvisorMaxReviewRounds    int                   `json:"advisor_max_review_rounds,omitempty"`
+	AdvisorBackend            string                `json:"advisor_backend,omitempty"`
+	AdvisorModel              string                `json:"advisor_model,omitempty"`
+	AdvisorVerdict            string                `json:"advisor_verdict,omitempty"`
+	AdvisorUnresolvedFindings string                `json:"advisor_unresolved_findings,omitempty"`
+	AdvisorTerminalReason     string                `json:"advisor_terminal_reason,omitempty"`
+	AdvisorBestEffort         bool                  `json:"advisor_best_effort,omitempty"`
+	AdvisorBypassed           bool                  `json:"advisor_bypassed,omitempty"`
+	AdvisorReviews            []state.AdvisorReview `json:"advisor_reviews,omitempty"`
 	// prGateSnapshot is the latest durable, reconciled gate observation for
 	// this exact issue/PR. It is projection-only state: Fleet uses it to keep
 	// operator_state aligned with the current PR head/check rollup, but does not
@@ -460,36 +472,48 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	}
 	now := time.Now().UTC()
 	info := sessionInfo{
-		Slot:                  slot,
-		IssueNumber:           sess.IssueNumber,
-		IssueTitle:            sess.IssueTitle,
-		IssueURL:              githubIssueURL(repo, sess.IssueNumber),
-		Status:                string(sess.Status),
-		Backend:               sess.Backend,
-		Model:                 currentSessionModel(sess),
-		PRNumber:              sess.PRNumber,
-		PRURL:                 githubPRURL(repo, sess.PRNumber),
-		TokensUsedAttempt:     sess.TokensUsedAttempt,
-		TokensUsedTotal:       sess.TokensUsedTotal,
-		TokenBudgetMeasure:    tokenBudgetMeasure,
-		WorkerOutcome:         sess.WorkerOutcome,
-		ReleasedForRedispatch: sess.ReleasedForRedispatch,
-		TokensInput:           sess.TokensInput,
-		TokensOutput:          sess.TokensOutput,
-		TokensCacheRead:       sess.TokensCacheRead,
-		TokensCacheWrite:      sess.TokensCacheWrite,
-		CostUSDBackend:        sess.CostUSDBackend,
-		StartedAt:             sess.StartedAt.Format(time.RFC3339),
-		WorkerGeneration:      sess.WorkerGeneration,
-		Worktree:              sess.Worktree,
-		Branch:                sess.Branch,
-		TmuxSession:           watchSessionName(slot, sess),
-		HasLog:                strings.TrimSpace(sess.LogFile) != "",
-		RetryCount:            sess.RetryCount,
-		LastNotification:      sess.LastNotifiedStatus,
-		BackendSelection:      sess.BackendSelection,
-		Attribution:           sess.Attribution,
-		Live:                  state.SessionLiveAt(sess, now),
+		Slot:                      slot,
+		IssueNumber:               sess.IssueNumber,
+		IssueTitle:                sess.IssueTitle,
+		IssueURL:                  githubIssueURL(repo, sess.IssueNumber),
+		Status:                    string(sess.Status),
+		Backend:                   sess.Backend,
+		Model:                     currentSessionModel(sess),
+		PRNumber:                  sess.PRNumber,
+		PRURL:                     githubPRURL(repo, sess.PRNumber),
+		Phase:                     string(sess.Phase),
+		PlanVersion:               sess.PlanVersion,
+		AdvisorReviewRound:        sess.AdvisorReviewRound,
+		AdvisorMaxReviewRounds:    sess.AdvisorMaxReviewRounds,
+		AdvisorBackend:            sess.AdvisorBackend,
+		AdvisorModel:              sess.AdvisorModel,
+		AdvisorVerdict:            sess.AdvisorVerdict,
+		AdvisorUnresolvedFindings: sess.AdvisorUnresolvedFindings,
+		AdvisorTerminalReason:     sess.AdvisorTerminalReason,
+		AdvisorBestEffort:         sess.AdvisorBestEffort,
+		AdvisorBypassed:           sess.AdvisorBypassed,
+		AdvisorReviews:            append([]state.AdvisorReview(nil), sess.AdvisorReviews...),
+		TokensUsedAttempt:         sess.TokensUsedAttempt,
+		TokensUsedTotal:           sess.TokensUsedTotal,
+		TokenBudgetMeasure:        tokenBudgetMeasure,
+		WorkerOutcome:             sess.WorkerOutcome,
+		ReleasedForRedispatch:     sess.ReleasedForRedispatch,
+		TokensInput:               sess.TokensInput,
+		TokensOutput:              sess.TokensOutput,
+		TokensCacheRead:           sess.TokensCacheRead,
+		TokensCacheWrite:          sess.TokensCacheWrite,
+		CostUSDBackend:            sess.CostUSDBackend,
+		StartedAt:                 sess.StartedAt.Format(time.RFC3339),
+		WorkerGeneration:          sess.WorkerGeneration,
+		Worktree:                  sess.Worktree,
+		Branch:                    sess.Branch,
+		TmuxSession:               watchSessionName(slot, sess),
+		HasLog:                    strings.TrimSpace(sess.LogFile) != "",
+		RetryCount:                sess.RetryCount,
+		LastNotification:          sess.LastNotifiedStatus,
+		BackendSelection:          sess.BackendSelection,
+		Attribution:               sess.Attribution,
+		Live:                      state.SessionLiveAt(sess, now),
 	}
 
 	// Calculate runtime breakdown (#426). The workflow runtime is the
