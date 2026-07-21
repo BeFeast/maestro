@@ -191,6 +191,45 @@ func TestRespawnDueRetries_PROpenDuringCIRetryThenMerged_NoRespawn(t *testing.T)
 	}
 }
 
+// #1013: markCodeLanded is the shared sink for every merge-detection path
+// (retireStaleRetry, reconcile branch-merge, outcome verification, …). A
+// canonical retry deliberately held behind a current issue-guard label carries
+// NextRetryAt + RetryHoldReason; when any of those paths observes the merge the
+// hold must not outlive it, regardless of which caller reached the sink and
+// whether that caller pre-cleared the fields. Pin the invariant to the sink so
+// a future merge path added without an explicit clear cannot resurrect the
+// "false operator attention forever" state.
+func TestMarkCodeLanded_ClearsHeldRetry(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Repo: "owner/repo"}}
+
+	pastTime := time.Now().UTC().Add(-1 * time.Second)
+	sess := &state.Session{
+		IssueNumber:     406,
+		IssueTitle:      "held retry that merged out-of-band",
+		Status:          state.StatusDead,
+		RetryCount:      3,
+		NextRetryAt:     &pastTime,
+		RetryHoldReason: "issue #406 has a current excluded label",
+		Branch:          "feat/ok-player-302-406-test",
+		PRNumber:        388,
+	}
+
+	o.markCodeLanded(sess, 388)
+
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt must be cleared at the code_landed sink")
+	}
+	if sess.RetryHoldReason != "" {
+		t.Fatalf("issue-guard hold must be cleared at the code_landed sink: %q", sess.RetryHoldReason)
+	}
+	if sess.PRNumber != 388 {
+		t.Fatalf("PRNumber = %d, want 388 (canonical PR preserved)", sess.PRNumber)
+	}
+}
+
 func TestRespawnDueRetries_GitHubReadErrorFailsOpen(t *testing.T) {
 	respawned := false
 	o := zombieRetryOrchestrator(t, &respawned)
