@@ -5,6 +5,7 @@ import {
   formatBackendQuotaSentence,
   formatProviderModelHealthSentence,
   mapFleetResponse,
+  supervisorDecisionsFromProject,
   workerSessionsFromFleet,
   workerNextAction,
   workerStatusTaxonomy,
@@ -187,5 +188,36 @@ describe("provider/model credential health", () => {
     expect(formatBackendQuotaSentence(quota[0], now)).toContain(
       "claude-fable-5 unavailable: 0/2 credentials usable",
     );
+  });
+});
+
+describe("supervisor recommendation episodes", () => {
+  test("keeps latest recommendation first/last/count/disposition metadata", () => {
+    const decisions = supervisorDecisionsFromProject({
+      needsAttention: 0,
+      operatorState: {},
+      supervisor: {
+        latest: {
+          created_at: "2026-07-15T10:00:00Z",
+          first_seen_at: "2026-07-15T10:00:00Z",
+          last_seen_at: "2026-07-15T12:00:00Z",
+          seen_count: 25,
+          recommendation_id: "supervisor:held",
+          recommended_action: "monitor_open_pr",
+          summary: "Waiting on the current dispatch guard.",
+          disposition: { status: "dropped", reason: "ttl_expired_unconsumed" },
+        },
+      },
+    }, now);
+
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      t: now,
+      firstSeen: Date.parse("2026-07-15T10:00:00Z"),
+      lastSeen: now,
+      seenCount: 25,
+      recommendationId: "supervisor:held",
+      disposition: { status: "dropped", reason: "ttl_expired_unconsumed" },
+    });
   });
 });

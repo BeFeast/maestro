@@ -929,7 +929,35 @@ type SupervisorConfig struct {
 	// extends the set (for example a project-specific records/ or qa/ tree).
 	NonFunctionalPaths []string `yaml:"non_functional_paths" json:"non_functional_paths,omitempty"`
 
+	// Recommendation lifecycle policy. Zero selects the built-in defaults;
+	// negative values are rejected during normalization.
+	UnchangedDecisionWindowSeconds int `yaml:"unchanged_decision_window_seconds" json:"unchanged_decision_window_seconds,omitempty"`
+	RecommendationTTLSeconds       int `yaml:"recommendation_ttl_seconds" json:"recommendation_ttl_seconds,omitempty"`
+
 	excludedLabelsSet bool
+}
+
+const (
+	defaultUnchangedDecisionWindow = time.Hour
+	defaultRecommendationTTL       = 24 * time.Hour
+)
+
+// EffectiveUnchangedDecisionWindow returns the durable journal suppression
+// window for identical recommendations. Zero keeps the default at one hour.
+func (c SupervisorConfig) EffectiveUnchangedDecisionWindow() time.Duration {
+	if c.UnchangedDecisionWindowSeconds <= 0 {
+		return defaultUnchangedDecisionWindow
+	}
+	return time.Duration(c.UnchangedDecisionWindowSeconds) * time.Second
+}
+
+// EffectiveRecommendationTTL returns the maximum age of an unconsumed
+// recommendation before it is durably dropped with a disposition reason.
+func (c SupervisorConfig) EffectiveRecommendationTTL() time.Duration {
+	if c.RecommendationTTLSeconds <= 0 {
+		return defaultRecommendationTTL
+	}
+	return time.Duration(c.RecommendationTTLSeconds) * time.Second
 }
 
 // defaultNonFunctionalPaths mirrors pipeline.DefaultNonFunctionalPaths. It is
@@ -2790,6 +2818,12 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	policy.PreflightCommand = strings.TrimSpace(policy.PreflightCommand)
 	if policy.DispatchSLASeconds < 0 {
 		return fmt.Errorf("supervisor.dispatch_sla_seconds must be >= 0")
+	}
+	if policy.UnchangedDecisionWindowSeconds < 0 {
+		return fmt.Errorf("supervisor.unchanged_decision_window_seconds must be >= 0")
+	}
+	if policy.RecommendationTTLSeconds < 0 {
+		return fmt.Errorf("supervisor.recommendation_ttl_seconds must be >= 0")
 	}
 	policy.ExcludedLabels = normalizeStringList(policy.ExcludedLabels)
 	policy.AllowIssueTypes = normalizeStringList(policy.AllowIssueTypes)

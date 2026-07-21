@@ -497,6 +497,64 @@ func TestLogSupervisorDecisionEmitsStructuredLine(t *testing.T) {
 	}
 }
 
+func TestLogSupervisorDecisionSuppressesRepeatsAndEmitsRollup(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := state.SupervisorDecision{
+		RecommendedAction: "monitor_open_pr",
+		RecommendationID:  "supervisor:held",
+		FirstSeenAt:       base,
+		LastSeenAt:        base.Add(time.Hour),
+		SeenCount:         13,
+		Target:            &state.SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "blocked-label guard still holds",
+		JournalEvent:      state.SupervisorJournalSuppressed,
+	}
+	logSupervisorDecision("maestro", decision)
+	if buf.Len() != 0 {
+		t.Fatalf("suppressed decision logged %q", buf.String())
+	}
+
+	decision.JournalEvent = state.SupervisorJournalRollup
+	logSupervisorDecision("maestro", decision)
+	out := buf.String()
+	for _, want := range []string{
+		"still held, seen 13 times since 2026-07-21T10:00:00Z",
+		"action=monitor_open_pr",
+		"recommendation=supervisor:held",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("roll-up log %q missing %q", out, want)
+		}
+	}
+}
+
+func TestLogSupervisorDecisionEmitsTTLDisposition(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	logSupervisorDecision("maestro", state.SupervisorDecision{
+		RecommendedAction: "monitor_open_pr",
+		JournalEvent:      state.SupervisorJournalDisposition,
+		Disposition: &state.RecommendationDisposition{
+			Status: state.RecommendationDispositionDropped,
+			Reason: state.RecommendationDispositionTTLExpired,
+		},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "supervise recommendation disposition") ||
+		!strings.Contains(out, "disposition=dropped") ||
+		!strings.Contains(out, "disposition_reason=ttl_expired_unconsumed") {
+		t.Fatalf("disposition log = %q", out)
+	}
+}
+
 func waitForFleet(t *testing.T, d *Daemon) *server.FleetServer {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

@@ -425,8 +425,17 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 		ProjectState:      state.SupervisorProjectState{Sessions: 2, PROpen: 1, Queued: 1, OpenPRs: 2},
 	}, state.DefaultSupervisorDecisionLimit)
 	st.RecordSupervisorDecision(state.SupervisorDecision{
-		ID:                "sup-latest",
-		CreatedAt:         now,
+		ID:               "sup-latest",
+		CreatedAt:        now,
+		RecommendationID: "supervisor:latest",
+		FirstSeenAt:      now.Add(-2 * time.Hour),
+		LastSeenAt:       now,
+		SeenCount:        25,
+		Disposition: &state.RecommendationDisposition{
+			Status: state.RecommendationDispositionDropped,
+			Reason: state.RecommendationDispositionTTLExpired,
+			At:     now,
+		},
 		Project:           "test/repo",
 		Mode:              "read_only",
 		Summary:           "Issue #43 exhausted its retry budget and needs manual review.",
@@ -465,6 +474,15 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 	}
 	if resp.Supervisor.Latest.RecommendedAction != "review_retry_exhausted" {
 		t.Fatalf("latest action = %q", resp.Supervisor.Latest.RecommendedAction)
+	}
+	if resp.Supervisor.Latest.RecommendationID != "supervisor:latest" ||
+		!resp.Supervisor.Latest.FirstSeenAt.Equal(now.Add(-2*time.Hour)) ||
+		!resp.Supervisor.Latest.LastSeenAt.Equal(now) ||
+		resp.Supervisor.Latest.SeenCount != 25 {
+		t.Fatalf("latest recommendation observation = %#v", resp.Supervisor.Latest)
+	}
+	if resp.Supervisor.Latest.Disposition == nil || resp.Supervisor.Latest.Disposition.Reason != state.RecommendationDispositionTTLExpired {
+		t.Fatalf("latest disposition = %#v", resp.Supervisor.Latest.Disposition)
 	}
 	if resp.Supervisor.Latest.OperatorSentence != "Reviewing failed feedback on PR #20 before retrying work." {
 		t.Fatalf("latest operator sentence = %q", resp.Supervisor.Latest.OperatorSentence)
