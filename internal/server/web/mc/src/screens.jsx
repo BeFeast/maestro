@@ -130,6 +130,8 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
 
       <ProjectActionsPanel project={p} refresh={refresh} />
 
+      <DispatchBlockersPanel project={p} now={now} />
+
       {p.operatorState?.kind === "attention" && (p.operatorState.summary || p.operatorState.next_action) && (
         <Panel title="Needs attention" sub={p.operatorState.session || undefined}>
           <div style={{ padding: "var(--s-4) var(--s-5)" }}>
@@ -878,6 +880,114 @@ function QueueNextPanel({ p }) {
       </div>
     </Panel>
   );
+}
+
+// DispatchBlockersPanel turns the queue decision plane into the direct answer
+// to “why are there 0 workers?” Eligible candidates are explicitly marked
+// dispatchable unless a project-wide hold applies; skipped candidates retain
+// the exact per-issue guard supplied by SupervisorQueueAnalysis.
+export function DispatchBlockersPanel({ project: p, now = Date.now() }) {
+  const hold = p?.dispatchHold || {};
+  const q = p?.queueSnapshot || {};
+  const rows = dispatchGuardRows(q);
+  const issueURL = num => (p?.repo && num ? `https://github.com/${p.repo}/issues/${num}` : "");
+  const sinceMs = hold.since ? parseTimestamp(hold.since) : null;
+  const heldLabel = displayReasonClass(hold.reasonClass) || "dispatch hold";
+
+  return (
+    <div className="mt-4">
+      <Panel
+        title="Dispatch blockers"
+        sub={`${rows.length} issue guard${rows.length === 1 ? "" : "s"}`}
+      >
+        <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+          {hold.active && (
+            <div className="dispatch-hold-banner" role="status">
+              <div className="row gap-2" style={{ flexWrap: "wrap", alignItems: "center" }}>
+                <Pill tone="stuck" noDot>dispatch held</Pill>
+                <strong>{heldLabel}</strong>
+                {sinceMs != null && <span className="mono dim">since {relTime(sinceMs, now)}</span>}
+              </div>
+              <div className="dispatch-hold-detail">
+                {hold.detail || "Fresh issue dispatch is suspended by the current project guard."}
+              </div>
+            </div>
+          )}
+
+          {rows.length > 0 ? (
+            <div className={hold.active ? "mt-3" : ""}>
+              {rows.map((row, i) => {
+                const globallyHeld = row.dispatchable && hold.active;
+                const dispatchable = row.dispatchable && !hold.active;
+                const guard = globallyHeld
+                  ? (hold.detail || heldLabel)
+                  : row.guard;
+                return (
+                  <div key={`${row.number || "x"}-${i}`} className="dispatch-guard-row">
+                    <div className="row gap-2" style={{ minWidth: 0, flexWrap: "wrap" }}>
+                      <PriorityPill label={row.priorityLabel} fallbackTone="idle" />
+                      {row.number ? <IssueLink num={row.number} url={issueURL(row.number)} /> : null}
+                      <span className="dispatch-guard-title">{row.title || "Ready issue"}</span>
+                    </div>
+                    <div className="dispatch-guard-verdict">
+                      <Pill tone={dispatchable ? "ok" : globallyHeld ? "watch" : "stuck"} noDot>
+                        {dispatchable ? "dispatchable" : globallyHeld ? "held" : "blocked"}
+                      </Pill>
+                      <span>{guard || "dispatchable now"}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="dim" style={{ padding: "var(--s-3) 0" }}>
+              {hold.active
+                ? "No per-issue candidates were reported in the latest supervisor snapshot."
+                : "No ready issue guards are active."}
+            </div>
+          )}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function dispatchGuardRows(queue) {
+  const byNumber = new Map();
+  const eligible = Array.isArray(queue?.eligible_ranked) ? queue.eligible_ranked : [];
+  const selected = queue?.selected_candidate || null;
+  const skipped = Array.isArray(queue?.skipped_candidates) ? queue.skipped_candidates : [];
+  const addEligible = candidate => {
+    if (!candidate) return;
+    const number = Number(candidate.number || 0);
+    const key = number > 0 ? `issue-${number}` : `eligible-${byNumber.size}`;
+    if (byNumber.has(key)) return;
+    byNumber.set(key, {
+      number,
+      title: candidate.title || "",
+      priorityLabel: candidate.priority_label || "",
+      dispatchable: true,
+      guard: "dispatchable now",
+    });
+  };
+  addEligible(selected);
+  eligible.forEach(addEligible);
+  skipped.forEach((candidate, index) => {
+    const number = Number(candidate?.number || 0);
+    const key = number > 0 ? `issue-${number}` : `skipped-${index}`;
+    byNumber.set(key, {
+      number,
+      title: candidate?.title || "",
+      priorityLabel: candidate?.priority_label || "",
+      dispatchable: false,
+      guard: candidate?.reason || "skipped by the current issue guard",
+    });
+  });
+  return Array.from(byNumber.values());
+}
+
+function displayReasonClass(reasonClass) {
+  return String(reasonClass || "").trim().replaceAll("_", " ");
 }
 
 function QueueCount({ tone, label, value }) {
