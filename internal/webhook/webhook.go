@@ -3,11 +3,10 @@
 // validation, envelope parsing, and an idempotent HTTP handler that lands every
 // valid delivery in the shared maestro.db via internal/webhookstore.
 //
-// This is ingestion only. Nothing here mutates orchestration state or joins the
-// stored deliveries into the read path — that is phase C/D. The handler's job
-// is to authenticate a delivery by signature, key it by X-GitHub-Delivery for
-// idempotency, and persist it durably so a later phase can consume it and the
-// fleet stops polling GitHub for the same state.
+// This package does not interpret or mutate orchestration state. The handler
+// authenticates a delivery, keys it by X-GitHub-Delivery for idempotency, and
+// persists it durably; optional projector and after-accept hooks let the daemon
+// update its read model and wake the matching reconciliation loop.
 package webhook
 
 import (

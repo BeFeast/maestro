@@ -139,6 +139,39 @@ func TestRunStartsFlowPerProjectAndAggregatesFleet(t *testing.T) {
 	}
 }
 
+func TestCheckWebhookRefreshesOnlyMatchingProjectFlow(t *testing.T) {
+	d := New(fakeLoader{}, Options{Port: 0})
+	alpha := &projectFlow{
+		cfg:       &config.Config{Repo: "BeFeast/ok-player"},
+		refreshCh: make(chan struct{}, 1),
+	}
+	beta := &projectFlow{
+		cfg:       &config.Config{Repo: "BeFeast/maestro"},
+		refreshCh: make(chan struct{}, 1),
+	}
+	d.flows = map[string]*projectFlow{"alpha": alpha, "beta": beta}
+
+	// A burst coalesces to one pending reconciliation for the matching repo.
+	d.refreshPRGateFromWebhook("check_run", "befeast/OK-PLAYER")
+	d.refreshPRGateFromWebhook("check_suite", "BeFeast/ok-player")
+	if got := len(alpha.refreshCh); got != 1 {
+		t.Fatalf("alpha refreshes = %d, want one coalesced wake-up", got)
+	}
+	if got := len(beta.refreshCh); got != 0 {
+		t.Fatalf("beta refreshes = %d, want 0 for an unrelated repo", got)
+	}
+
+	<-alpha.refreshCh
+	d.refreshPRGateFromWebhook("issues", "BeFeast/ok-player")
+	if got := len(alpha.refreshCh); got != 0 {
+		t.Fatalf("non-gate event refreshes = %d, want 0", got)
+	}
+	d.refreshPRGateFromWebhook("status", "BeFeast/ok-player")
+	if got := len(alpha.refreshCh); got != 1 {
+		t.Fatalf("commit-status refreshes = %d, want 1", got)
+	}
+}
+
 func TestRunSkipsDuplicateFlowIdentity(t *testing.T) {
 	// Two configs that resolve to the same flow identity (same StateDir) are a
 	// true duplicate — the second must be skipped, not silently overwrite the
