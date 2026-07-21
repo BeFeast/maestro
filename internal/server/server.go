@@ -343,6 +343,19 @@ type sessionInfo struct {
 	NeedsAttention bool   `json:"needs_attention,omitempty"`
 	Live           bool   `json:"live"`
 	Backend        string `json:"backend,omitempty"`
+	// Provider-limit fields are the secret-free route/aggregate projection
+	// recorded by the orchestrator. Credential identifiers and raw proxy payloads
+	// are deliberately absent.
+	ProviderLimitBackend      string `json:"provider_limit_backend,omitempty"`
+	ProviderLimitReason       string `json:"provider_limit_reason,omitempty"`
+	ProviderLimitProvider     string `json:"provider_limit_provider,omitempty"`
+	ProviderLimitModel        string `json:"provider_limit_model,omitempty"`
+	ProviderLimitResetAt      string `json:"provider_limit_reset_at,omitempty"`
+	CredentialCandidates      int    `json:"credential_candidates,omitempty"`
+	CredentialCandidatesKnown bool   `json:"credential_candidates_known,omitempty"`
+	CredentialUsable          int    `json:"credential_usable,omitempty"`
+	CredentialUsableKnown     bool   `json:"credential_usable_known,omitempty"`
+	CredentialAggregateReason string `json:"credential_aggregate_reason,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
 	Model                     string                `json:"model,omitempty"`
@@ -478,6 +491,15 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		IssueURL:                  githubIssueURL(repo, sess.IssueNumber),
 		Status:                    string(sess.Status),
 		Backend:                   sess.Backend,
+		ProviderLimitBackend:      sess.ProviderLimitBackend,
+		ProviderLimitReason:       sess.ProviderLimitReason,
+		ProviderLimitProvider:     sess.ProviderLimitProvider,
+		ProviderLimitModel:        sess.ProviderLimitModel,
+		CredentialCandidates:      sess.CredentialCandidates,
+		CredentialCandidatesKnown: sess.CredentialCandidatesKnown,
+		CredentialUsable:          sess.CredentialUsable,
+		CredentialUsableKnown:     sess.CredentialUsableKnown,
+		CredentialAggregateReason: sess.CredentialAggregateReason,
 		Model:                     currentSessionModel(sess),
 		PRNumber:                  sess.PRNumber,
 		PRURL:                     githubPRURL(repo, sess.PRNumber),
@@ -514,6 +536,9 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		BackendSelection:          sess.BackendSelection,
 		Attribution:               sess.Attribution,
 		Live:                      state.SessionLiveAt(sess, now),
+	}
+	if sess.ProviderLimitResetAt != nil {
+		info.ProviderLimitResetAt = sess.ProviderLimitResetAt.UTC().Format(time.RFC3339)
 	}
 
 	// Calculate runtime breakdown (#426). The workflow runtime is the

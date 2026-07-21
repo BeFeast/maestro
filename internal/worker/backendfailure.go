@@ -44,10 +44,16 @@ var modelUnavailablePatterns = []struct {
 	{"not_found_error", regexp.MustCompile(`(?i)(?:not_found_error\b[^\n]{0,80}?\bmodel\b|\bmodel\b[^\n]{0,80}?not_found_error\b)`)},
 	// A bare 529 or the word "overloaded" is not enough: both must occur on
 	// the same terminal line, and 529 must be anchored to an HTTP/API status
-	// context. This matches Claude's live `API Error: 529 ... overloaded_error`
-	// while avoiding issue numbers, counters, and ordinary work output.
+	// context. A separately wrapped structured body is handled below, where it
+	// must carry the stronger overloaded_error marker.
 	{"model_overloaded", regexp.MustCompile(`(?i)(?:\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*529\b[^\n]{0,160}\boverloaded(?:_error)?\b|\boverloaded(?:_error)?\b[^\n]{0,160}\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*529\b)`)},
 }
+
+// modelOverloadedWrappedPattern covers CLI wrappers that print the status and
+// structured provider body on adjacent lines. Requiring overloaded_error in
+// the second line keeps an unrelated mention of an overloaded queue from being
+// paired with a bare 529 status in ordinary worker output.
+var modelOverloadedWrappedPattern = regexp.MustCompile(`(?i)\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*529\b[^\n]*\r?\n[^\n]{0,320}\boverloaded_error\b`)
 
 // DetectModelUnavailable scans multi-line output for known model-unavailable
 // signatures. Returns true and the matching pattern label on the first match,
@@ -63,6 +69,9 @@ func DetectModelUnavailable(output string) (bool, string) {
 				return true, p.label
 			}
 		}
+	}
+	if modelOverloadedWrappedPattern.MatchString(output) {
+		return true, "model_overloaded"
 	}
 	return false, ""
 }

@@ -17,8 +17,11 @@ func credentialAwareFallbackConfig() *config.Config {
 	return &config.Config{
 		Repo: "owner/repo",
 		Model: config.ModelConfig{
-			Default:          "fable",
-			FallbackBackends: []string{"claude-opus", "codex"},
+			Default: "fable",
+			// Cross-provider codex is intentionally listed first to prove a
+			// provider/model failure still tries the healthy Claude model before
+			// abandoning the provider.
+			FallbackBackends: []string{"codex", "claude-opus"},
 			Backends: map[string]config.BackendDef{
 				"fable":       {Cmd: "claude --model claude-fable-5", Provider: "claude", Model: "claude-fable-5"},
 				"claude-opus": {Cmd: "claude --model claude-opus-4-8", Provider: "claude", Model: "claude-opus-4-8"},
@@ -245,7 +248,7 @@ func TestReconcileRunningSessions_ModelOverloaded_FallsBackWithinProvider(t *tes
 	now := time.Now().UTC()
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "worker.log")
-	if err := os.WriteFile(logFile, []byte(`API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(logFile, []byte("API Error: 529\n"+`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

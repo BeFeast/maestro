@@ -64,6 +64,11 @@ func TestDetectModelUnavailable_KnownSignatures(t *testing.T) {
 			output:    "HTTP 529: Overloaded",
 			wantLabel: "model_overloaded",
 		},
+		{
+			name:      "wrapped CLIProxyAPI model overloaded",
+			output:    "API Error: 529\n" + `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+			wantLabel: "model_overloaded",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,6 +102,7 @@ func TestDetectModelUnavailable_NoFalsePositives(t *testing.T) {
 		"issue #529 tracks upstream overload handling",
 		"HTTP 529 without an overload marker",
 		"overloaded queue recovered without an HTTP status",
+		"API Error: 529\nworker overloaded queue recovered after backpressure",
 		"the issue body says the model may not exist, but that is the prompt",
 		`assert_eq!(state.last_load_error.as_deref(), Some("libmpv error 404"));`,
 		"HTTP 404/retry",

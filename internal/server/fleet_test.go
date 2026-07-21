@@ -2917,6 +2917,63 @@ func TestFleetWorkerDetailIncludesMetadataAndLog(t *testing.T) {
 	}
 }
 
+func TestFleetWorkerDetailIncludesProviderModelAggregate(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	resetAt := now.Add(90 * time.Second)
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"one-908": {
+			IssueNumber:               908,
+			IssueTitle:                "Credential-aware fallback",
+			Status:                    state.StatusDead,
+			StartedAt:                 now.Add(-time.Minute),
+			FinishedAt:                &now,
+			Backend:                   "fable",
+			RateLimitHit:              true,
+			ProviderLimitBackend:      "fable",
+			ProviderLimitReason:       state.BackendBlockModelCooldown,
+			ProviderLimitProvider:     "claude",
+			ProviderLimitModel:        "claude-fable-5",
+			ProviderLimitResetAt:      &resetAt,
+			CredentialCandidates:      2,
+			CredentialCandidatesKnown: true,
+			CredentialUsable:          0,
+			CredentialUsableKnown:     true,
+			CredentialAggregateReason: "all_model_credentials_cooling_down",
+		},
+	})
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet/worker?project=One&slot=one-908", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetWorker(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp fleetWorkerDetailResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	worker := resp.Worker
+	if worker.ProviderLimitBackend != "fable" || worker.ProviderLimitReason != state.BackendBlockModelCooldown || worker.ProviderLimitProvider != "claude" || worker.ProviderLimitModel != "claude-fable-5" {
+		t.Fatalf("provider/model route = %+v", worker)
+	}
+	if !worker.CredentialCandidatesKnown || worker.CredentialCandidates != 2 || !worker.CredentialUsableKnown || worker.CredentialUsable != 0 {
+		t.Fatalf("credential aggregate = %+v", worker)
+	}
+	if worker.CredentialAggregateReason != "all_model_credentials_cooling_down" || worker.ProviderLimitResetAt != resetAt.Format(time.RFC3339) {
+		t.Fatalf("aggregate reason/reset = %q/%q", worker.CredentialAggregateReason, worker.ProviderLimitResetAt)
+	}
+}
+
 func TestFleetWorkerDetailReportsActualLogLineCount(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
