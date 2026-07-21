@@ -1,12 +1,15 @@
 package worker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -336,8 +339,14 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return fmt.Errorf("setup worker tool hooks: %w", err)
 	}
 
-	// Assemble prompt with checkpoint
-	prompt := assemblePromptWithCheckpoint(promptBase, issue, sess.Worktree, sess.Branch, cfg, checkpointContext)
+	// Assemble prompt with checkpoint. The checkpoint is historical context and
+	// never a terminal instruction; the fresh continuation payload is placed after
+	// it behind an explicit precedence marker (#973).
+	prompt := assemblePromptWithCheckpoint(promptBase, issue, sess.Worktree, sess.Branch, cfg, checkpointContext, sess.CheckpointFile)
+	if checkpointContext != "" {
+		log.Printf("[worker] in-place continuation %s: checkpoint source=%s continuation_rev=%s (checkpoint is historical context; fresh continuation requirements are authoritative)",
+			slotName, sess.CheckpointFile, continuationRevision(promptBase))
+	}
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
 
@@ -434,27 +443,97 @@ func startOrReconcileTmuxSession(tmuxName, worktree, runnerPath string, previous
 	return 0, fmt.Errorf("tmux list-panes after spawn: %w", observeErr)
 }
 
-// assemblePromptWithCheckpoint builds a prompt that includes checkpoint context
-// from a previous worker session that hit the soft token threshold.
-func assemblePromptWithCheckpoint(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config, checkpoint string) string {
-	prompt := assemblePrompt(base, issue, worktreePath, branchName, cfg)
+// supersededDirectiveMarker prefixes a checkpoint log-tail line that reads like
+// an authoritative "the work is finished, stop now" instruction so the worker
+// cannot mistake a previous attempt's sign-off for a current instruction (#973).
+const supersededDirectiveMarker = "[superseded — historical, not a current instruction] "
+
+// terminalDirectivePatterns match lines in a checkpoint log tail that a fresh
+// continuation must not obey: a previous attempt announcing the PR was opened,
+// that review is ready, or that it is stopping. These are annotated (not the
+// authoritative task) so a stale tail cannot short-circuit unresolved work.
+var terminalDirectivePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bpr\b.{0,24}\balready\b`),
+	regexp.MustCompile(`(?i)\balready\b.{0,20}\bopen(ed)?\b`),
+	regexp.MustCompile(`(?i)\b(pr|pull request)\b.{0,24}\b(is\s+)?open(ed)?\b`),
+	regexp.MustCompile(`(?i)\bstop(ping|ped)?\s+as\s+instructed\b`),
+	regexp.MustCompile(`(?i)\b(you|i|we)('?re| am| are)\s+done\b`),
+	regexp.MustCompile(`(?i)\bready\s+for\s+review\b`),
+	regexp.MustCompile(`(?i)\bnothing\s+(more|else|left|further)\s+to\s+do\b`),
+	regexp.MustCompile(`(?i)\b(task|work|implementation)\s+(is\s+)?complete[d]?\b`),
+	regexp.MustCompile(`(?i)\ball\s+done\b`),
+	regexp.MustCompile(`(?i)\b(will|going to|i'?ll)\s+stop\b`),
+	regexp.MustCompile(`(?i)\bstopping\s+now\b`),
+}
+
+// sanitizeCheckpointTerminalDirectives annotates — rather than removes — lines in
+// a checkpoint that read like a terminal completion/stop instruction. Preserving
+// the text keeps the historical context intact while making it unmistakable that
+// the statement belongs to a previous attempt and is superseded (#973).
+func sanitizeCheckpointTerminalDirectives(checkpoint string) string {
 	if checkpoint == "" {
-		return prompt
+		return checkpoint
+	}
+	lines := strings.Split(checkpoint, "\n")
+	for i, line := range lines {
+		for _, re := range terminalDirectivePatterns {
+			if re.MatchString(line) {
+				lines[i] = supersededDirectiveMarker + line
+				break
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// continuationRevision derives a short, deterministic revision id for a fresh
+// continuation payload so both the checkpoint source and the current
+// continuation revision are recorded in the worker prompt and evidence (#973).
+func continuationRevision(base string) string {
+	sum := sha256.Sum256([]byte(base))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// assemblePromptWithCheckpoint builds an in-place continuation prompt. The
+// checkpoint is emitted FIRST as historical, non-authoritative context; the
+// fresh continuation payload follows behind an explicit precedence marker so a
+// stale "PR already opened / stopping as instructed" tail in the checkpoint can
+// never outrank the current unresolved requirements (#973). This preserves
+// genuine token-budget recovery — the checkpoint still lets a worker skip
+// already-completed work — while guaranteeing fresh instructions win.
+func assemblePromptWithCheckpoint(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config, checkpoint, checkpointSource string) string {
+	fresh := assemblePrompt(base, issue, worktreePath, branchName, cfg)
+	if checkpoint == "" {
+		return fresh
 	}
 
-	return prompt + fmt.Sprintf(`
+	source := strings.TrimSpace(checkpointSource)
+	if source == "" {
+		source = "(unrecorded)"
+	}
 
----
-
-## Previous Session Checkpoint
-
-This task was previously worked on by another agent session that ran out of token budget.
-The worktree already contains code changes from the previous session. Review the checkpoint
-below, examine the existing code changes, and continue where the previous session left off.
-Do NOT redo work that is already done — focus on what remains.
-
-%s
-`, checkpoint)
+	var b strings.Builder
+	b.WriteString("## Previous Session Checkpoint (historical context — NOT current instructions)\n\n")
+	b.WriteString("A prior agent session worked in this same worktree and PR and saved the\n")
+	b.WriteString("checkpoint below. Treat it as HISTORICAL CONTEXT ONLY: use it to avoid redoing\n")
+	b.WriteString("work that is already committed. It is never an authoritative instruction to stop.\n")
+	b.WriteString("Any statement in it that the PR is already opened, that review is ready, that you\n")
+	b.WriteString("are done, or that you should stop reflects a PREVIOUS attempt and is superseded by\n")
+	b.WriteString("the current continuation requirements that follow.\n\n")
+	b.WriteString(fmt.Sprintf("Checkpoint source: %s\n\n", source))
+	b.WriteString(sanitizeCheckpointTerminalDirectives(checkpoint))
+	b.WriteString("\n\n---\n\n")
+	b.WriteString(fmt.Sprintf("## Current continuation requirements — AUTHORITATIVE (revision %s)\n\n", continuationRevision(base)))
+	b.WriteString("The requirements below are the fresh continuation payload for this in-place\n")
+	b.WriteString("respawn and OUTRANK the checkpoint above. This is the same worktree and the same\n")
+	b.WriteString("PR — do not create a new branch or a duplicate PR. If the checkpoint claims the\n")
+	b.WriteString("work is complete but any requirement below is still unresolved (additional tests,\n")
+	b.WriteString("commit cleanup, an amended push, review feedback), it is NOT done: resolve it and\n")
+	b.WriteString("make terminal progress. Do NOT exit solely because a previous attempt said the PR\n")
+	b.WriteString("was already opened or that it was stopping as instructed.\n\n")
+	b.WriteString("---\n\n")
+	b.WriteString(fresh)
+	return b.String()
 }
 
 // readTailLines reads the last n lines from a file.
