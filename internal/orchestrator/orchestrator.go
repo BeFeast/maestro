@@ -2486,8 +2486,8 @@ func (o *Orchestrator) retireStaleRetry(s *state.State, slotName string, sess *s
 			continue
 		}
 		log.Printf("[orch] worker %s retry invalidated: PR #%d for issue #%d is merged — marking code_landed instead of respawning", slotName, prNumber, sess.IssueNumber)
-		sess.NextRetryAt = nil
-		sess.RetryHoldReason = ""
+		// markCodeLanded clears NextRetryAt and the issue-guard hold at the
+		// shared code_landed sink (#1013), so the retry cannot outlive the merge.
 		o.markCodeLanded(sess, prNumber)
 		if o.notifier != nil {
 			o.notifier.Sendf("🧟 maestro: cancelled scheduled retry for issue #%d (%s) — PR #%d already merged", sess.IssueNumber, sess.IssueTitle, prNumber)
@@ -6061,6 +6061,13 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	// #1013: a code_landed transition is terminal reconciliation — the PR
+	// merged, so any scheduled retry (including one deliberately held behind a
+	// current issue-guard label) is settled and must not survive. Clear it at
+	// this shared sink so the invariant holds for every merge-detection path,
+	// not only the retireStaleRetry pre-check that also clears it explicitly.
+	sess.NextRetryAt = nil
+	sess.RetryHoldReason = ""
 	sess.DeploymentFinishedAt = nil
 	o.syncProject(sess.IssueNumber, codeLandedProjectStatus(o.cfg.Outcome.RequiresDeploy))
 	sess.Status = state.StatusCodeLanded
