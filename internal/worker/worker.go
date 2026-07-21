@@ -88,9 +88,13 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	if cfg == nil || s == nil || strings.TrimSpace(slotName) == "" {
 		return "", fmt.Errorf("reserved worker start requires config, state, and slot")
 	}
+	if cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
+		return "", fmt.Errorf("remote runner v1 does not support phase-pipeline dispatches")
+	}
 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := BranchName(slotName, issue)
+	executionWorktree := workerExecutionWorktree(cfg, slotName, worktreePath)
 
 	// Resolve and validate the backend before creating a worktree or running the
 	// pre-worker pipeline. A positive hard budget must fail closed before any
@@ -203,10 +207,14 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		}
 	}
 
-	// Run GSD pre-worker pipeline (research, plan validation, test mapping)
-	pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
-	if section := pipelineResult.PromptSection(); section != "" {
-		promptBase = promptBase + section
+	// Run deterministic control-plane context preparation only for local
+	// workers. The remote spike deliberately avoids heavy local scans and the
+	// generated verify.sh would exist only in the shadow worktree.
+	if !cfg.RemoteRunner.Enabled {
+		pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
+		if section := pipelineResult.PromptSection(); section != "" {
+			promptBase = promptBase + section
+		}
 	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
@@ -215,7 +223,7 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	// Assemble worker prompt
-	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
 	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
@@ -237,7 +245,7 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	logFile := filepath.Join(logDir, slotName+".log")
 
 	// Build the worker command to generate the runner script
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return "", fmt.Errorf("build worker cmd: %w", err)
 	}
@@ -245,7 +253,7 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return "", err
 	}
 
@@ -347,6 +355,9 @@ func freshRunningSession(issue github.Issue, worktree, branch string, pid int, t
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
 // The session is updated in place with new PID, worktree, branch, and timestamps.
 func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
+		return fmt.Errorf("remote runner v1 does not support phase-pipeline respawns")
+	}
 	// #959: assert the rendered issue matches the session's canonical
 	// issue_number before tearing anything down, so a slot-suffix-derived number
 	// can never launch a mis-scoped worker.
@@ -383,6 +394,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// Create fresh worktree with new branch
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+	executionWorktree := workerExecutionWorktree(cfg, slotName, worktreePath)
 
 	// #734: sync the local base branch to origin and root the worktree directly
 	// at origin/main so the respawned worker branches from an up-to-date base.
@@ -418,10 +430,13 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		}
 	}
 
-	// Run GSD pre-worker pipeline (research, plan validation, test mapping)
-	pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
-	if section := pipelineResult.PromptSection(); section != "" {
-		promptBase = promptBase + section
+	// Keep deterministic pre-worker scans off the control-plane host for the
+	// remote spike; see the initial-spawn path above.
+	if !cfg.RemoteRunner.Enabled {
+		pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
+		if section := pipelineResult.PromptSection(); section != "" {
+			promptBase = promptBase + section
+		}
 	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
@@ -430,7 +445,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	// Assemble worker prompt
-	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
 	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
@@ -452,7 +467,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	logFile := filepath.Join(logDir, slotName+".log")
 
 	// Build the worker command
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
@@ -460,7 +475,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return err
 	}
 
@@ -1156,7 +1171,7 @@ func managementHomePromptSection(cfg *config.Config) string {
 	if vp := strings.TrimSpace(mh.VaultPath); vp != "" {
 		fmt.Fprintf(&b, "- Management Home (vault-relative): `%s`\n", vp)
 	}
-	if p := strings.TrimSpace(mh.Path); p != "" {
+	if p := strings.TrimSpace(mh.Path); p != "" && !cfg.RemoteRunner.Enabled {
 		fmt.Fprintf(&b, "- Management Home (absolute, execution-host only — never post/copy this into GitHub or repo files): `%s`\n", p)
 	}
 	return b.String()
@@ -1193,8 +1208,17 @@ func subagentHintPromptSection(hint string) string {
 //   - If VALIDATION.md exists but no placeholder is present, appends the contract
 //   - Loads and appends any prompt section files from cfg.PromptSections
 func assemblePrompt(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config) string {
-	// Load validation contract from worktree (if present)
-	validationContract := readValidationContract(worktreePath)
+	return assemblePromptWithSource(base, issue, worktreePath, worktreePath, branchName, cfg)
+}
+
+// assemblePromptWithSource separates the path presented to the agent from the
+// control-plane worktree used to read repository rules and generated context.
+// They are identical for local workers. The SSH spike presents the runner-side
+// path while still embedding the checked-out repository's CLAUDE/AGENTS rules
+// from the lightweight local shadow.
+func assemblePromptWithSource(base string, issue github.Issue, executionWorktree, sourceWorktree, branchName string, cfg *config.Config) string {
+	// Load validation contract from the source worktree (if present).
+	validationContract := readValidationContract(sourceWorktree)
 
 	if strings.Contains(base, "{{ISSUE_NUMBER}}") {
 		// Template-style substitution
@@ -1203,7 +1227,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 			"{{ISSUE_TITLE}}", issue.Title,
 			"{{ISSUE_BODY}}", issue.Body,
 			"{{BRANCH}}", branchName,
-			"{{WORKTREE}}", worktreePath,
+			"{{WORKTREE}}", executionWorktree,
 			"{{REPO}}", cfg.Repo,
 		}
 
@@ -1219,7 +1243,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath) + visualEvidencePromptSection(cfg) + managementHomePromptSection(cfg) + workDisciplinePromptSection()
+		result := r.Replace(base) + repoRulesPromptSection(sourceWorktree) + workerSearchSafetyPromptSection(executionWorktree) + visualEvidencePromptSection(cfg) + managementHomePromptSection(cfg) + workDisciplinePromptSection()
 		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
@@ -1257,15 +1281,15 @@ Always rebase on origin/main immediately before creating the PR.
 		base,
 		issue.Number, issue.Title,
 		cfg.Repo,
-		worktreePath,
+		executionWorktree,
 		issue.Body,
-		worktreePath,
+		executionWorktree,
 		cfg.Repo,
 		issue.Title,
 		issue.Number,
 	)
-	result += repoRulesPromptSection(worktreePath)
-	result += workerSearchSafetyPromptSection(worktreePath)
+	result += repoRulesPromptSection(sourceWorktree)
+	result += workerSearchSafetyPromptSection(executionWorktree)
 	result += visualEvidencePromptSection(cfg)
 	result += managementHomePromptSection(cfg)
 	result += workDisciplinePromptSection()
