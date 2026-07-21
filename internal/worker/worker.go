@@ -139,6 +139,13 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		if !active {
 			return "", fmt.Errorf("reserved tmux session %s has no active durable process lease %s", tmuxName, processLease.Unit)
 		}
+		owned, err := workerProcessLeaseAnchored(processLease, pid)
+		if err != nil {
+			return "", fmt.Errorf("inspect reserved worker pane ownership: %w", err)
+		}
+		if !owned {
+			return "", fmt.Errorf("reserved tmux session %s pane pid %d is not owned by durable process lease %s", tmuxName, pid, processLease.Unit)
+		}
 		startedAt := time.Now().UTC()
 		logFile := filepath.Join(state.LogDir(cfg.StateDir), slotName+".log")
 		s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)

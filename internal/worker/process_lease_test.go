@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
@@ -79,6 +80,72 @@ func TestLaunchWorkerProcessLeaseReturnsReceiptWhenCleanupIsUncertain(t *testing
 	_, got, err := launchWorkerProcessLease(cfg, "sup-920", "maestro-sup-920", "/work/sup-920", "/state/sup-920-run.sh", 5, 0)
 	if err == nil || got.Unit == "" || got.Manager != tmuxsession.ProcessLeaseManagerSystem {
 		t.Fatalf("uncertain cleanup result lease=%+v err=%v, want durable system lease receipt", got, err)
+	}
+}
+
+func TestLaunchWorkerProcessLeaseRefusesPaneOutsidePreparedScope(t *testing.T) {
+	t.Setenv("INVOCATION_ID", "maestro-test")
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	originalConfirm := confirmWorkerProcessLease
+	originalTerminate := terminateWorkerProcessLease
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+		confirmWorkerProcessLease = originalConfirm
+		terminateWorkerProcessLease = originalTerminate
+	})
+
+	runTmuxNewSession = func(_, _, _ string, _ tmuxsession.ProcessLease) ([]byte, error) {
+		return nil, nil
+	}
+	readTmuxPaneIdentity = func(string) (int, string, error) {
+		return 4242, "/work/sup-920", nil
+	}
+	var confirmed tmuxsession.ProcessLease
+	confirmWorkerProcessLease = func(lease tmuxsession.ProcessLease, pid int, timeout time.Duration) (bool, error) {
+		confirmed = lease
+		if pid != 4242 || timeout != processLeaseStartWait {
+			t.Fatalf("confirm pane pid/timeout = %d/%s, want 4242/%s", pid, timeout, processLeaseStartWait)
+		}
+		return false, nil
+	}
+	var terminated tmuxsession.ProcessLease
+	terminateWorkerProcessLease = func(lease tmuxsession.ProcessLease) error {
+		terminated = lease
+		return nil
+	}
+
+	cfg := &config.Config{Repo: "BeFeast/maestro"}
+	pid, receipt, err := launchWorkerProcessLease(cfg, "sup-920", "maestro-sup-920", "/work/sup-920", "/state/sup-920-run.sh", 6, 0)
+	if err == nil {
+		t.Fatal("pane outside exact worker scope was accepted")
+	}
+	if pid != 0 || receipt.Unit != "" || confirmed.Unit == "" || terminated != confirmed {
+		t.Fatalf("unowned launch pid=%d receipt=%+v confirmed=%+v terminated=%+v", pid, receipt, confirmed, terminated)
+	}
+}
+
+func TestWaitWorkerProcessLeaseReadyRetriesUntilScopeOwnsPane(t *testing.T) {
+	originalActive := workerProcessLeaseActive
+	originalAnchored := workerProcessLeaseAnchored
+	t.Cleanup(func() {
+		workerProcessLeaseActive = originalActive
+		workerProcessLeaseAnchored = originalAnchored
+	})
+
+	checks := 0
+	workerProcessLeaseActive = func(tmuxsession.ProcessLease) (bool, error) {
+		checks++
+		return checks >= 2, nil
+	}
+	workerProcessLeaseAnchored = func(tmuxsession.ProcessLease, int) (bool, error) {
+		return true, nil
+	}
+	lease := tmuxsession.ProcessLease{Unit: "maestro-worker-0123456789abcdef0123456789abcdef-g8.scope", Manager: tmuxsession.ProcessLeaseManagerSystem}
+	ready, err := waitWorkerProcessLeaseReady(lease, 4242, 100*time.Millisecond)
+	if err != nil || !ready || checks < 2 {
+		t.Fatalf("ready=%v checks=%d err=%v, want retry then ready", ready, checks, err)
 	}
 }
 

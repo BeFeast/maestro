@@ -104,6 +104,51 @@ func TestWorkerProcessLeaseIsUniquePerSlotAndGeneration(t *testing.T) {
 	}
 }
 
+func TestProcessLeaseUnitInCgroupRequiresExactPathComponent(t *testing.T) {
+	unit := "maestro-worker-0123456789abcdef0123456789abcdef-g7.scope"
+	for _, tc := range []struct {
+		name string
+		data string
+		want bool
+	}{
+		{name: "unified", data: "0::/maestro-workers.slice/" + unit + "\n", want: true},
+		{name: "legacy controllers", data: "5:cpu,memory:/maestro-workers.slice/" + unit + "\n", want: true},
+		{name: "prefix only", data: "0::/maestro-workers.slice/" + strings.TrimSuffix(unit, ".scope") + "-neighbor.scope\n"},
+		{name: "text outside path", data: "not-a-cgroup-line " + unit + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := processLeaseUnitInCgroup([]byte(tc.data), unit); got != tc.want {
+				t.Fatalf("processLeaseUnitInCgroup(%q, %q) = %v, want %v", tc.data, unit, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessLeaseAnchoredAtPIDFindsOwnedWrapperDescendant(t *testing.T) {
+	lease := ProcessLease{Unit: "maestro-worker-0123456789abcdef0123456789abcdef-g7.scope", Manager: ProcessLeaseManagerSystem}
+	graph := map[int][]int{
+		10: {20},
+		20: {30},
+	}
+	owns := func(got ProcessLease, pid int) (bool, error) {
+		if got != lease {
+			t.Fatalf("lease = %+v, want %+v", got, lease)
+		}
+		return pid == 30, nil
+	}
+	children := func(pid int) ([]int, error) {
+		return graph[pid], nil
+	}
+	anchored, err := processLeaseAnchoredAtPID(lease, 10, owns, children)
+	if err != nil || !anchored {
+		t.Fatalf("anchored=%v err=%v, want owned descendant beneath pane wrapper", anchored, err)
+	}
+	anchored, err = processLeaseAnchoredAtPID(lease, 40, owns, children)
+	if err != nil || anchored {
+		t.Fatalf("unrelated pane anchored=%v err=%v, want false", anchored, err)
+	}
+}
+
 func TestProcessLeaseLaunchCommandUsesExactSystemScope(t *testing.T) {
 	lease := ProcessLease{Unit: "maestro-worker-0123456789abcdef0123456789abcdef-g7.scope", Manager: ProcessLeaseManagerSystem}
 	got, err := processLeaseLaunchCommand(lease, "/state/sup-7-run.sh", 1000, "/usr/local/bin:/usr/bin:/bin")

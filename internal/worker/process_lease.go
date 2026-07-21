@@ -13,11 +13,14 @@ import (
 var (
 	terminateWorkerProcessLease = tmuxsession.TerminateProcessLease
 	workerProcessLeaseActive    = tmuxsession.ProcessLeaseActive
+	workerProcessLeaseAnchored  = tmuxsession.ProcessLeaseAnchoredAtPID
+	confirmWorkerProcessLease   = waitWorkerProcessLeaseReady
 	killWorkerTmuxSession       = tmuxsession.KillSession
 	workerTmuxSessionExists     = tmuxsession.HasSession
 )
 
 const (
+	processLeaseStartWait    = 2 * time.Second
 	processLeaseTmuxExitWait = 500 * time.Millisecond
 	processLeaseTmuxPoll     = 25 * time.Millisecond
 )
@@ -32,7 +35,15 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 	}
 	pid, err := startOrReconcileTmuxSession(tmuxName, worktree, runnerPath, lease, previousPID)
 	if err == nil {
-		return pid, lease, nil
+		ready, readyErr := confirmWorkerProcessLease(lease, pid, processLeaseStartWait)
+		switch {
+		case readyErr != nil:
+			err = fmt.Errorf("confirm worker process lease %s ownership: %w", lease.Unit, readyErr)
+		case !ready:
+			err = fmt.Errorf("worker process lease %s did not own pane pid %d before startup deadline", lease.Unit, pid)
+		default:
+			return pid, lease, nil
+		}
 	}
 
 	// A failed or ambiguous start must not strand a partially-created cgroup.
@@ -47,6 +58,28 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 		return 0, lease, fmt.Errorf("%w (failed-start process lease cleanup: %v)", err, terminateErr)
 	}
 	return 0, tmuxsession.ProcessLease{}, err
+}
+
+func waitWorkerProcessLeaseReady(lease tmuxsession.ProcessLease, pid int, timeout time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
+	var ownershipErr error
+	for {
+		active, err := workerProcessLeaseActive(lease)
+		if err != nil {
+			return false, err
+		}
+		if active {
+			owned, err := workerProcessLeaseAnchored(lease, pid)
+			if err == nil && owned {
+				return true, nil
+			}
+			ownershipErr = err
+		}
+		if !time.Now().Before(deadline) {
+			return false, ownershipErr
+		}
+		time.Sleep(processLeaseTmuxPoll)
+	}
 }
 
 func workerProcessLease(cfg *config.Config, slotName string, generation uint64) (tmuxsession.ProcessLease, error) {

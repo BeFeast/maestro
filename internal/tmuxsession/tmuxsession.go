@@ -10,6 +10,7 @@ package tmuxsession
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -256,6 +257,110 @@ func ProcessLeaseActive(lease ProcessLease) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return processLeaseActive(ctx, lease, runProcessLeaseCommand)
+}
+
+// ProcessLeaseOwnsPID proves that pid is currently a member of the exact
+// persisted worker scope. Scope liveness alone is not enough for adoption: a
+// same-name tmux pane and an independently-active deterministic unit could
+// otherwise be mistaken for one another after an ambiguous launch response.
+func ProcessLeaseOwnsPID(lease ProcessLease, pid int) (bool, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return false, err
+	}
+	if pid <= 0 {
+		return false, fmt.Errorf("worker process lease requires positive pid")
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return false, fmt.Errorf("inspect pid %d cgroup for worker process lease %s: %w", pid, lease.Unit, err)
+	}
+	return processLeaseUnitInCgroup(data, lease.Unit), nil
+}
+
+// ProcessLeaseAnchoredAtPID proves that the pane process or one of its current
+// descendants belongs to lease. The pane may be a sudo/systemd-run wrapper in
+// the shared tmux-server scope, so requiring the pane PID itself to have moved
+// would reject a valid launch. An ancestry check is safe here because it is
+// used only to bind the newly-observed pane to its exact cgroup; all subsequent
+// ownership and teardown use the durable cgroup receipt, not PPID ancestry.
+func ProcessLeaseAnchoredAtPID(lease ProcessLease, panePID int) (bool, error) {
+	return processLeaseAnchoredAtPID(lease, panePID, ProcessLeaseOwnsPID, readProcessChildren)
+}
+
+type processLeasePIDOwner func(ProcessLease, int) (bool, error)
+type processChildrenReader func(int) ([]int, error)
+
+func processLeaseAnchoredAtPID(lease ProcessLease, panePID int, owns processLeasePIDOwner, children processChildrenReader) (bool, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return false, err
+	}
+	if panePID <= 0 {
+		return false, fmt.Errorf("worker process lease requires positive pane pid")
+	}
+	queue := []int{panePID}
+	seen := make(map[int]struct{})
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		if len(seen) > 4096 {
+			return false, fmt.Errorf("worker process lease pane tree exceeds safety limit")
+		}
+		owned, err := owns(lease, pid)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		if owned {
+			return true, nil
+		}
+		descendants, err := children(pid)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		queue = append(queue, descendants...)
+	}
+	return false, nil
+}
+
+func readProcessChildren(pid int) ([]int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(data))
+	children := make([]int, 0, len(fields))
+	for _, field := range fields {
+		child, err := strconv.Atoi(field)
+		if err != nil || child <= 0 {
+			return nil, fmt.Errorf("parse child pid %q for process %d", field, pid)
+		}
+		children = append(children, child)
+	}
+	return children, nil
+}
+
+func processLeaseUnitInCgroup(data []byte, unit string) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		for _, component := range strings.Split(parts[2], "/") {
+			if component == unit {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TerminateProcessLease gracefully terminates every process in lease, waits a

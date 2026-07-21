@@ -53,10 +53,12 @@ func TestStartReserved_AdoptsExactLiveWorkerWithoutDiscardingWorktree(t *testing
 	originalExists := tmuxSessionExists
 	originalRead := readTmuxPaneIdentity
 	originalLeaseActive := workerProcessLeaseActive
+	originalLeaseAnchored := workerProcessLeaseAnchored
 	t.Cleanup(func() {
 		tmuxSessionExists = originalExists
 		readTmuxPaneIdentity = originalRead
 		workerProcessLeaseActive = originalLeaseActive
+		workerProcessLeaseAnchored = originalLeaseAnchored
 	})
 	tmuxSessionExists = func(name string) bool { return name == TmuxSessionName(slot) }
 	readTmuxPaneIdentity = func(name string) (int, string, error) { return 4242, worktree, nil }
@@ -64,6 +66,9 @@ func TestStartReserved_AdoptsExactLiveWorkerWithoutDiscardingWorktree(t *testing
 	workerProcessLeaseActive = func(lease tmuxsession.ProcessLease) (bool, error) {
 		inspectedLease = lease
 		return true, nil
+	}
+	workerProcessLeaseAnchored = func(lease tmuxsession.ProcessLease, pid int) (bool, error) {
+		return lease == inspectedLease && pid == 4242, nil
 	}
 
 	cfg := &config.Config{
