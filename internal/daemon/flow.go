@@ -199,6 +199,14 @@ func (d *Daemon) stopFlow(key string) {
 // RunOnce is not ctx-cancellable mid-cycle, so the sum could be many minutes
 // (#764).
 func (d *Daemon) stopAll() {
+	d.stopAllUntil(time.Now().Add(shutdownFlowTimeout))
+}
+
+// stopAllUntil cancels every flow and waits for them concurrently until the
+// earlier of shutdownFlowTimeout or the global shutdown deadline. A non-returning
+// flow is logged and detached from daemon shutdown; it cannot serialize another
+// per-flow timeout or hold the systemd restart job (#966).
+func (d *Daemon) stopAllUntil(deadline time.Time) {
 	// Covers the teardown paths where Drain never ran (e.g. a serve error):
 	// gh reads fail fast on rate limits instead of blocking flow stop (#797).
 	github.BeginShutdown()
@@ -214,18 +222,43 @@ func (d *Daemon) stopAll() {
 	for _, flow := range flows {
 		flow.cancel()
 	}
-	// Give each flow its own independent deadline so a stuck cycle in one
-	// flow never consumes the timeout for a later one (review #660). Each
-	// flow gets shutdownFlowTimeout to exit after context cancellation;
-	// after that we log a warning and move on (#817).
+	if len(flows) == 0 {
+		return
+	}
+
+	cutoff := time.Now().Add(shutdownFlowTimeout)
+	if !deadline.IsZero() && deadline.Before(cutoff) {
+		cutoff = deadline
+	}
+	type stoppedFlow struct{ flow *projectFlow }
+	stopped := make(chan stoppedFlow, len(flows))
+	pending := make(map[*projectFlow]struct{}, len(flows))
 	for _, flow := range flows {
-		t := time.NewTimer(shutdownFlowTimeout)
+		pending[flow] = struct{}{}
+		go func(f *projectFlow) {
+			<-f.done
+			stopped <- stoppedFlow{flow: f}
+		}(flow)
+	}
+
+	remaining := time.Until(cutoff)
+	if remaining < 0 {
+		remaining = 0
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	for len(pending) > 0 {
 		select {
-		case <-flow.done:
-			t.Stop()
-			log.Printf("[daemon] stopped flow %q", flow.name)
-		case <-t.C:
-			log.Printf("[daemon] stopAll: timed out waiting for flow %q — proceeding with shutdown", flow.name)
+		case result := <-stopped:
+			if _, ok := pending[result.flow]; ok {
+				delete(pending, result.flow)
+				log.Printf("[daemon] stopped flow %q", result.flow.name)
+			}
+		case <-timer.C:
+			for flow := range pending {
+				log.Printf("[daemon] stopAll: deadline reached waiting for flow %q — detaching it from daemon shutdown; restart checkpoint pass will preserve any running worker", flow.name)
+			}
+			return
 		}
 	}
 }
