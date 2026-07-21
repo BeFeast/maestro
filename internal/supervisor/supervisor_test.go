@@ -169,6 +169,8 @@ func TestNewWorkerController_StopPreservesWorktreeBranchAndPR(t *testing.T) {
 		Status:      state.StatusRunning,
 		PRNumber:    1008,
 	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = sess
 	controller := NewWorkerController(&config.Config{Repo: "owner/repo"})
 	stopDone := make(chan error, 1)
 	go func() {
@@ -188,6 +190,9 @@ func TestNewWorkerController_StopPreservesWorktreeBranchAndPR(t *testing.T) {
 	}
 	if sess.Worktree != "/srv/worktrees/slot-1" || sess.Branch != "maestro/issue-42" || sess.PRNumber != 1008 {
 		t.Fatalf("stop destroyed durable work pointers: worktree=%q branch=%q pr=%d", sess.Worktree, sess.Branch, sess.PRNumber)
+	}
+	if claim, ok := st.IssueClaimFor(42); !ok || claim.Kind != state.IssueClaimOpenPRMaintenance || claim.Session != "slot-1" {
+		t.Fatalf("stopped open-PR session lost its dispatch lease: claim=%+v ok=%v", claim, ok)
 	}
 }
 
