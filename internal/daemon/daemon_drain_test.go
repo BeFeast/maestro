@@ -197,6 +197,31 @@ func TestDrainReturnsAfterDefaultTimeoutWithStuckWorkers(t *testing.T) {
 	}
 }
 
+// #966: the absolute drain deadline must wake the wait directly. Relying on the
+// next poll tick can consume the entire handoff grace when the production poll
+// interval and reserved teardown window are the same length.
+func TestDrainUntilWakesAtDeadlineBeforeNextPoll(t *testing.T) {
+	old := drainPollInterval
+	drainPollInterval = 5 * time.Second
+	defer func() { drainPollInterval = old }()
+
+	cfg := testConfig(t, "owner/deadline")
+	d := New(fakeLoader{cfgs: nil}, Options{})
+	d.flows[flowKey(cfg)] = &projectFlow{name: "deadline", key: flowKey(cfg), cfg: cfg}
+	seed := &state.State{Sessions: map[string]*state.Session{
+		"deadline-1": {Status: state.StatusRunning},
+	}}
+	if err := state.Save(cfg.StateDir, seed); err != nil {
+		t.Fatalf("seed running state: %v", err)
+	}
+
+	started := time.Now()
+	d.DrainUntil(context.Background(), started.Add(75*time.Millisecond))
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("DrainUntil returned after %v, want the 75ms deadline rather than the 5s poll tick", elapsed)
+	}
+}
+
 // #966 production-topology regression: twelve flows, four isolated in-flight
 // workers, and one flow callback that ignores cancellation. Fleet stays reachable
 // while the worker drain is active; the global deadline then detaches the hung

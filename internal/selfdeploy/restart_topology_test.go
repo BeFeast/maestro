@@ -304,3 +304,47 @@ func TestRestartUnitsReportsBoundedDrainBudgetOverrun(t *testing.T) {
 		t.Fatal("timed-out restart must report immediately without entering the 10-minute rollback restart path")
 	}
 }
+
+// #966: restart_timeout_seconds bounds the whole configured unit set, not each
+// unit independently. A slow first restart must consume the time available to a
+// wedged second restart instead of multiplying Fleet downtime by len(units).
+func TestRestartUnitsSharesBudgetAcrossConfiguredUnits(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	stubDir := t.TempDir()
+	counter := filepath.Join(stubDir, "calls")
+	writeExec(t, filepath.Join(stubDir, "systemctl"), strings.Join([]string{
+		"#!/bin/bash",
+		"count=0",
+		"[[ -f " + shellQuote(counter) + " ]] && count=$(<" + shellQuote(counter) + ")",
+		"count=$((count + 1))",
+		"printf '%s' \"$count\" > " + shellQuote(counter),
+		"if (( count == 1 )); then sleep 1; exit 0; fi",
+		"sleep 30",
+	}, "\n")+"\n")
+
+	script := repoFile(t, "scripts", "self-deploy.sh")
+	harness := strings.Join([]string{
+		"set -euo pipefail",
+		"PATH=" + shellQuote(stubDir) + ":$PATH",
+		`log() { :; }`,
+		`SCOPE="user"`,
+		`UNIT_LIST=(first.service second.service)`,
+		`RESTART_FAIL_DETAIL=""`,
+		`RESTART_TIMED_OUT=0`,
+		extractShellFunc(t, script, "restart_units"),
+		`if restart_units 2; then echo "restart unexpectedly succeeded" >&2; exit 1; fi`,
+		`(( RESTART_TIMED_OUT == 1 )) || { echo "restart timeout flag not set" >&2; exit 1; }`,
+		`[[ "$RESTART_FAIL_DETAIL" == *"2s total"* ]] || { echo "missing shared total budget: $RESTART_FAIL_DETAIL" >&2; exit 1; }`,
+	}, "\n")
+
+	started := time.Now()
+	out, err := exec.Command("bash", "-c", harness).CombinedOutput()
+	if err != nil {
+		t.Fatalf("shared restart budget harness failed: %v\n%s", err, out)
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("two restarts took %v, want one shared 2s budget", elapsed)
+	}
+}

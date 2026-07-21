@@ -106,6 +106,13 @@ func daemonCmd(args []string) {
 // exits by the advertised deadline (#966). A var so tests can shorten it.
 var shutdownHandoffGrace = 5 * time.Second
 
+// forcedShutdownGrace is the maximum cleanup window retained after an operator
+// sends the documented second signal. It is deliberately short: the second
+// signal still gives the daemon a moment to persist restart markers, but it
+// cannot leave a wedged process waiting on the original multi-minute deadline.
+// A var so tests can shorten it.
+var forcedShutdownGrace = time.Second
+
 // forceExit is the process-exit call the hard-shutdown backstop uses. A var so
 // tests can observe it firing without terminating the test binary.
 var forceExit = func(code int) { os.Exit(code) }
@@ -154,13 +161,17 @@ func handleDaemonSignalStream(ctx context.Context, cancel context.CancelFunc, d 
 	log.Printf("received signal — draining flows in-process (no new workers; up to %s total, reserving %s for bounded handoff); the daemon exits on its own by the deadline even if a flow stop wedges — send the signal again to force shutdown now", drainTimeout, handoffGrace)
 	// Start the hard backstop before any drain state I/O. Even a wedged state
 	// load/save cannot leave maestro.service deactivating past the deadline.
-	go awaitShutdownOrForceExit(shutdownDeadline, runDone)
+	deadlineUpdates := make(chan time.Time, 1)
+	go awaitShutdownOrForceExit(shutdownDeadline, runDone, deadlineUpdates)
 	drainCtx, abortDrain := context.WithCancel(ctx)
 	defer abortDrain()
 	go func() {
 		select {
 		case <-signals:
-			log.Printf("received second signal — aborting drain and shutting down now")
+			forcedDeadline := time.Now().Add(forcedShutdownGraceFor(drainTimeout))
+			d.SetShutdownDeadline(forcedDeadline)
+			deadlineUpdates <- forcedDeadline
+			log.Printf("received second signal — aborting drain and forcing shutdown within %s", time.Until(forcedDeadline).Round(time.Millisecond))
 			abortDrain()
 		case <-drainCtx.Done():
 		}
@@ -180,33 +191,63 @@ func shutdownHandoffGraceFor(timeout time.Duration) time.Duration {
 	return grace
 }
 
+func forcedShutdownGraceFor(timeout time.Duration) time.Duration {
+	grace := forcedShutdownGrace
+	if grace <= 0 {
+		return 0
+	}
+	if timeout <= grace {
+		return timeout / 2
+	}
+	return grace
+}
+
 // awaitShutdownOrForceExit blocks until Run finishes its post-cancel teardown
 // (runDone closed) or the hard shutdown deadline elapses, whichever comes first.
 // On the deadline it force-exits: some non-context-aware shutdown work overran
 // its budget, so detaching it is the correct recovery. Surviving isolated workers
 // keep their worktrees and are reconciled by the new daemon while Fleet comes
 // back instead of hanging in deactivating (#877, #966).
-func awaitShutdownOrForceExit(hardDeadline time.Time, runDone <-chan struct{}) {
-	remaining := time.Until(hardDeadline)
-	if remaining < 0 {
-		remaining = 0
-	}
-	timer := time.NewTimer(remaining)
+func awaitShutdownOrForceExit(hardDeadline time.Time, runDone <-chan struct{}, deadlineUpdates <-chan time.Time) {
+	timer := time.NewTimer(timeUntilOrZero(hardDeadline))
 	defer timer.Stop()
-	select {
-	case <-runDone:
-		return
-	case <-timer.C:
-		// Resolve the timer/runDone race in favor of a clean return when Run closed
-		// concurrently with the deadline tick.
+	for {
 		select {
 		case <-runDone:
 			return
-		default:
+		case next := <-deadlineUpdates:
+			if next.IsZero() || !next.Before(hardDeadline) {
+				continue
+			}
+			hardDeadline = next
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(timeUntilOrZero(hardDeadline))
+		case <-timer.C:
+			// Resolve the timer/runDone race in favor of a clean return when Run
+			// closed concurrently with the deadline tick.
+			select {
+			case <-runDone:
+				return
+			default:
+			}
+			log.Printf("shutdown reached its current deadline — force-exiting once so the restart handoff completes (#966)")
+			forceExit(0)
+			return
 		}
-		log.Printf("shutdown reached the configured drain deadline — force-exiting once so the restart handoff completes (#966)")
-		forceExit(0)
 	}
+}
+
+func timeUntilOrZero(deadline time.Time) time.Duration {
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 var legacyStoreWarningOnce sync.Once

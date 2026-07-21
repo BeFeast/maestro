@@ -188,23 +188,31 @@ cleanup_build() {
 # Either way the unit's normal stop path runs, so drain semantics are honored.
 # The user-scope command is byte-for-byte unchanged from before scope support.
 restart_units() {
-  local budget=$1 unit rc
+  local budget=$1 unit rc deadline remaining
   local -a restart_cmd
   if [[ "$SCOPE" == "system" ]]; then
     restart_cmd=(sudo -n systemctl restart)
   else
     restart_cmd=(systemctl --user restart)
   fi
+  deadline=$(( $(date +%s) + budget ))
   for unit in "${UNIT_LIST[@]}"; do
-    log "restarting $unit (scope=$SCOPE; honors the unit's stop/drain path; budget ${budget}s)"
-    if timeout "$budget" "${restart_cmd[@]}" "$unit"; then
+    remaining=$(( deadline - $(date +%s) ))
+    if (( remaining <= 0 )); then
+      RESTART_TIMED_OUT=1
+      RESTART_FAIL_DETAIL="restart budget exhausted before $unit completed (bounded drain/restart budget ${budget}s total) while Fleet may be unavailable"
+      log "$RESTART_FAIL_DETAIL"
+      return 1
+    fi
+    log "restarting $unit (scope=$SCOPE; honors the unit's stop/drain path; ${remaining}s remaining of ${budget}s total budget)"
+    if timeout "$remaining" "${restart_cmd[@]}" "$unit"; then
       continue
     else
       rc=$?
     fi
     if (( rc == 124 || rc == 137 )); then
       RESTART_TIMED_OUT=1
-      RESTART_FAIL_DETAIL="restart of $unit exceeded the bounded drain/restart budget (${budget}s) while Fleet may be unavailable"
+      RESTART_FAIL_DETAIL="restart of $unit exceeded the bounded drain/restart budget (${budget}s total) while Fleet may be unavailable"
     else
       RESTART_FAIL_DETAIL="restart of $unit failed (rc=$rc)"
     fi
