@@ -38,6 +38,59 @@ type MaterialProgressTarget struct {
 	LastDecision       *progress.Decision  `json:"last_decision,omitempty"`
 	LastRecommendation *progress.Decision  `json:"last_recommendation,omitempty"`
 	Recoveries         []progress.Recovery `json:"recoveries,omitempty"`
+
+	LastJournaledRecommendation string    `json:"last_journaled_recommendation,omitempty"`
+	RecommendationFirstSeenAt   time.Time `json:"recommendation_first_seen_at,omitempty"`
+	RecommendationLastSeenAt    time.Time `json:"recommendation_last_seen_at,omitempty"`
+	RecommendationSeenCount     int       `json:"recommendation_seen_count,omitempty"`
+	RecommendationLastJournalAt time.Time `json:"recommendation_last_journal_at,omitempty"`
+}
+
+// RecommendationJournalDue records one watchdog recommendation observation
+// and reports whether its journal line is due. A changed recommendation starts
+// a fresh episode and logs immediately; an unchanged recommendation increments
+// the observation count and emits at most one roll-up per window.
+func (t *MaterialProgressTarget) RecommendationJournalDue(recommendationID string, window time.Duration, now time.Time) (due, rollUp bool, count int) {
+	if t == nil {
+		return true, false, 1
+	}
+	now = now.UTC()
+	transition := recommendationID == "" || t.LastJournaledRecommendation != recommendationID
+	if transition {
+		t.LastJournaledRecommendation = recommendationID
+		t.RecommendationFirstSeenAt = now
+		t.RecommendationLastSeenAt = now
+		t.RecommendationSeenCount = 1
+		t.RecommendationLastJournalAt = now
+		return true, false, 1
+	}
+
+	if t.RecommendationFirstSeenAt.IsZero() {
+		t.RecommendationFirstSeenAt = now
+	}
+	t.RecommendationLastSeenAt = now
+	t.RecommendationSeenCount++
+	if t.RecommendationSeenCount < 2 {
+		t.RecommendationSeenCount = 2
+	}
+	journalDue := window <= 0 || t.RecommendationLastJournalAt.IsZero() ||
+		now.Before(t.RecommendationLastJournalAt) ||
+		!now.Before(t.RecommendationLastJournalAt.Add(window))
+	if journalDue {
+		t.RecommendationLastJournalAt = now
+	}
+	return journalDue, true, t.RecommendationSeenCount
+}
+
+func (t *MaterialProgressTarget) resetRecommendationJournal() {
+	if t == nil {
+		return
+	}
+	t.LastJournaledRecommendation = ""
+	t.RecommendationFirstSeenAt = time.Time{}
+	t.RecommendationLastSeenAt = time.Time{}
+	t.RecommendationSeenCount = 0
+	t.RecommendationLastJournalAt = time.Time{}
 }
 
 // EvaluationDue reports whether the independent watchdog scheduler should run.
@@ -163,6 +216,7 @@ func (s *State) RecordMaterialProgress(observations []progress.Observation, budg
 		if freshBaseline {
 			prev = progress.Watermark{}
 			target.LastRecommendation = nil
+			target.resetRecommendationJournal()
 		}
 		wm, decision := progress.EvaluateObservation(prev, observation, effectiveBudget, now)
 		target.Target = observation.Target
@@ -177,6 +231,8 @@ func (s *State) RecordMaterialProgress(observations []progress.Observation, budg
 		if decision.RecommendsRecovery() && !sameRecommendation(target.LastRecommendation, decision) {
 			r := decision
 			target.LastRecommendation = &r
+		} else if !decision.RecommendsRecovery() {
+			target.resetRecommendationJournal()
 		}
 		decisions = append(decisions, decision)
 	}

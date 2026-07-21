@@ -7978,7 +7978,7 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 		return true
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil {
+	if decision == nil || decision.RecommendationDropped() {
 		return false
 	}
 	switch decision.RecommendedAction {
@@ -8018,7 +8018,7 @@ func (o *Orchestrator) resolveSpawnRepairDispatch(s *state.State, issueNumber in
 		return &spawnRepairDispatch{target: approval.Target, approvalID: approval.ID}
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker || decision.Target == nil || decision.Target.Issue != issueNumber {
+	if decision == nil || decision.RecommendationDropped() || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker || decision.Target == nil || decision.Target.Issue != issueNumber {
 		return nil
 	}
 	if decision.RequiresApproval || decision.Risk == supervisor.RiskApprovalGated {
@@ -8449,7 +8449,7 @@ func (o *Orchestrator) supervisorSelectedReviewRepair(s *state.State, issueNumbe
 		return nil, nil
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnReviewRepair {
+	if decision == nil || decision.RecommendationDropped() || decision.RecommendedAction != supervisor.ActionSpawnReviewRepair {
 		return nil, nil
 	}
 	if decision.Target == nil || decision.Target.Issue != issueNumber {
@@ -8606,7 +8606,7 @@ func (o *Orchestrator) supervisorOwnedReadySelectedIssue(s *state.State) (int, b
 		return 0, false
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil {
+	if decision == nil || decision.RecommendationDropped() {
 		return 0, false
 	}
 
@@ -8745,7 +8745,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		log.Printf("[orch] list issues: %v", err)
 		return
 	}
-	if decision := s.LatestSupervisorDecision(); decision != nil && decision.RecommendedAction == supervisor.ActionSpawnRepairWorker && decision.Target != nil {
+	if decision := s.LatestSupervisorDecision(); decision != nil && !decision.RecommendationDropped() && decision.RecommendedAction == supervisor.ActionSpawnRepairWorker && decision.Target != nil {
 		if !decision.RequiresApproval && decision.Risk != supervisor.RiskApprovalGated {
 			issues = o.appendFetchedSupervisorIssue(issues, decision.Target.Issue)
 		}
@@ -8899,6 +8899,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// any backend routing or slot allocation can create a second worktree.
 		if repairDispatch := o.resolveSpawnRepairDispatch(s, issue.Number); repairDispatch != nil {
 			if o.dispatchSpawnRepairWorker(s, issue, repairDispatch) {
+				markSupervisorWorkerRecommendationMaterialized(s, issue.Number, time.Now().UTC())
 				started++
 			}
 			continue
@@ -9025,6 +9026,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 			continue
 		}
+		markSupervisorWorkerRecommendationMaterialized(s, issue.Number, time.Now().UTC())
 
 		if longRunning {
 			s.Sessions[slotName].LongRunning = true
@@ -9077,4 +9079,24 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	if started == 0 {
 		log.Printf("[orch] no new workers started (%d issues checked)", len(issues))
 	}
+}
+
+func markSupervisorWorkerRecommendationMaterialized(s *state.State, issueNumber int, now time.Time) bool {
+	if s == nil || issueNumber <= 0 {
+		return false
+	}
+	decision := s.LatestSupervisorDecision()
+	if decision == nil || decision.RecommendationDropped() || decision.Target == nil || decision.Target.Issue != issueNumber {
+		return false
+	}
+	switch decision.RecommendedAction {
+	case supervisor.ActionSpawnWorker, supervisor.ActionSpawnRepairWorker, supervisor.ActionSpawnReviewRepair:
+	default:
+		return false
+	}
+	return s.MarkSupervisorRecommendationMaterialized(
+		decision.ID,
+		state.RecommendationDispositionWorkerStarted,
+		now,
+	)
 }

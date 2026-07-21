@@ -723,6 +723,40 @@ type Mission struct {
 
 const DefaultSupervisorDecisionLimit = 20
 
+const (
+	RecommendationDispositionMaterialized = "materialized"
+	RecommendationDispositionDropped      = "dropped"
+
+	RecommendationDispositionApprovalRecorded = "approval_recorded"
+	RecommendationDispositionSafeAction       = "safe_action_applied"
+	RecommendationDispositionWorkerStarted    = "worker_started"
+	RecommendationDispositionTTLExpired       = "ttl_expired_unconsumed"
+	RecommendationDispositionSuperseded       = "superseded_by_new_decision"
+
+	SupervisorJournalInitial     = "initial"
+	SupervisorJournalRollup      = "rollup"
+	SupervisorJournalDisposition = "disposition"
+	SupervisorJournalSuppressed  = "suppressed"
+)
+
+// RecommendationDisposition is the terminal handling record for one durable
+// recommendation episode. A recommendation is either materialized into an
+// action/approval or dropped with an explicit reason; it never silently ages
+// forever in the decision ring.
+type RecommendationDisposition struct {
+	Status string    `json:"status"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+// RecommendationDropped reports whether this recommendation episode reached a
+// terminal dropped disposition and therefore must not be consumed by a later
+// actuator. Materialized recommendations remain visible and actionable through
+// their normal downstream receipt (for example an approval).
+func (d SupervisorDecision) RecommendationDropped() bool {
+	return d.Disposition != nil && d.Disposition.Status == RecommendationDispositionDropped
+}
+
 var (
 	ErrApprovalNotFound        = errors.New("approval not found")
 	ErrApprovalNotPending      = errors.New("approval is not pending")
@@ -1015,8 +1049,22 @@ type SupervisorStuckState struct {
 
 // SupervisorDecision is a stable, machine-readable supervisor orchestration record.
 type SupervisorDecision struct {
-	ID                string                   `json:"id"`
-	CreatedAt         time.Time                `json:"created_at"`
+	ID               string                     `json:"id"`
+	CreatedAt        time.Time                  `json:"created_at"`
+	RecommendationID string                     `json:"recommendation_id,omitempty"`
+	FirstSeenAt      time.Time                  `json:"first_seen_at,omitempty"`
+	LastSeenAt       time.Time                  `json:"last_seen_at,omitempty"`
+	SeenCount        int                        `json:"seen_count,omitempty"`
+	LastJournaledAt  time.Time                  `json:"last_journaled_at,omitempty"`
+	Disposition      *RecommendationDisposition `json:"disposition,omitempty"`
+	// Quiescent marks a dispatch-guard decision whose unchanged observations
+	// update the durable first/last/count metadata but emit no periodic journal
+	// roll-up. Entry and exit edges remain ordinary journaled decisions.
+	Quiescent bool `json:"quiescent,omitempty"`
+	// JournalEvent is transient output routing for the current RunOnce result.
+	// Durable suppression is carried by LastJournaledAt; this field must never
+	// be serialized into state or the SQLite mirror.
+	JournalEvent      string                   `json:"-"`
 	Project           string                   `json:"project"`
 	Repo              string                   `json:"repo,omitempty"`
 	Mode              string                   `json:"mode"`
@@ -2595,16 +2643,243 @@ func (s *State) RecordSupervisorDecision(decision SupervisorDecision, limit int)
 	}
 }
 
-// LatestSupervisorDecision returns the newest supervisor decision by creation time.
-func (s *State) LatestSupervisorDecision() *SupervisorDecision {
-	if len(s.SupervisorDecisions) == 0 {
+// PrepareSupervisorRecommendation stamps the stable idempotency key used by
+// the recommendation episode recorder. The key deliberately excludes volatile
+// per-cycle counters/project snapshots while including the recommendation's
+// action, target, policy, summary, and error class; a material change therefore
+// creates a transition edge while an unchanged cycle retains one identity.
+func PrepareSupervisorRecommendation(decision *SupervisorDecision) {
+	if decision == nil || strings.TrimSpace(decision.RecommendationID) != "" {
+		return
+	}
+	payload := struct {
+		Action     string            `json:"action"`
+		Target     *SupervisorTarget `json:"target,omitempty"`
+		PolicyRule string            `json:"policy_rule,omitempty"`
+		Summary    string            `json:"summary,omitempty"`
+		ErrorClass string            `json:"error_class,omitempty"`
+	}{
+		Action:     strings.TrimSpace(decision.RecommendedAction),
+		Target:     decision.Target,
+		PolicyRule: strings.TrimSpace(decision.PolicyRule),
+		Summary:    strings.TrimSpace(decision.Summary),
+		ErrorClass: strings.TrimSpace(decision.ErrorClass),
+	}
+	decision.RecommendationID = "supervisor:" + stableHash(payload)
+}
+
+// SupervisorRecommendationDropped reports whether the current latest episode
+// for this exact recommendation has already reached a dropped disposition.
+// Callers use it before actuation so an expired recommendation cannot execute
+// later merely because an external dependency recovered.
+func (s *State) SupervisorRecommendationDropped(decision SupervisorDecision) bool {
+	if s == nil {
+		return false
+	}
+	PrepareSupervisorRecommendation(&decision)
+	latest := s.LatestSupervisorDecision()
+	return latest != nil && sameSupervisorRecommendation(*latest, decision) &&
+		latest.RecommendationDropped()
+}
+
+// RecordSupervisorDecisionWithPolicy coalesces consecutive identical
+// recommendation observations into one durable episode. The first observation
+// is journaled, active unchanged episodes emit one roll-up per window, and an
+// unconsumed episode receives a dropped disposition at TTL. A different
+// recommendation closes the previous unconsumed episode as superseded and is
+// appended as a transition edge.
+func (s *State) RecordSupervisorDecisionWithPolicy(decision SupervisorDecision, limit int, unchangedWindow, ttl time.Duration, now time.Time) SupervisorDecision {
+	if s == nil {
+		return decision
+	}
+	if limit <= 0 {
+		limit = DefaultSupervisorDecisionLimit
+	}
+	if unchangedWindow <= 0 {
+		unchangedWindow = time.Hour
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	now = normalizedTime(now)
+	PrepareSupervisorRecommendation(&decision)
+	expired := s.expireSupervisorRecommendations(now, ttl)
+
+	latestIndex := s.latestSupervisorDecisionIndex()
+	if latestIndex >= 0 && sameSupervisorRecommendation(s.SupervisorDecisions[latestIndex], decision) {
+		incomingDisposition := cloneRecommendationDisposition(decision.Disposition)
+		existing := s.SupervisorDecisions[latestIndex]
+		decision.ID = existing.ID
+		decision.CreatedAt = now
+		decision.FirstSeenAt = supervisorDecisionFirstSeen(existing)
+		decision.LastSeenAt = now
+		decision.SeenCount = existing.SeenCount
+		if decision.SeenCount <= 0 {
+			decision.SeenCount = 1
+		}
+		decision.SeenCount++
+		decision.LastJournaledAt = existing.LastJournaledAt
+		decision.Disposition = cloneRecommendationDisposition(existing.Disposition)
+		if decision.ApprovalID == "" {
+			decision.ApprovalID = existing.ApprovalID
+		}
+		decision.JournalEvent = SupervisorJournalSuppressed
+
+		if expired[existing.ID] {
+			decision.LastJournaledAt = now
+			decision.JournalEvent = SupervisorJournalDisposition
+		} else if decision.Disposition == nil {
+			if incomingDisposition != nil {
+				decision.Disposition = incomingDisposition
+				decision.LastJournaledAt = now
+				decision.JournalEvent = SupervisorJournalDisposition
+			}
+		}
+		if supervisorRecommendationCanRollUp(decision) &&
+			(decision.LastJournaledAt.IsZero() || now.Before(decision.LastJournaledAt) ||
+				!now.Before(decision.LastJournaledAt.Add(unchangedWindow))) {
+			decision.LastJournaledAt = now
+			decision.JournalEvent = SupervisorJournalRollup
+		}
+		s.SupervisorDecisions[latestIndex] = decision
+		return decision
+	}
+
+	if latestIndex >= 0 {
+		s.disposeSupervisorDecision(&s.SupervisorDecisions[latestIndex], RecommendationDispositionDropped, RecommendationDispositionSuperseded, now)
+	}
+	if decision.ID == "" {
+		decision.ID = "sup-" + now.Format("20060102T150405.000000000Z")
+	}
+	decision.CreatedAt = now
+	decision.FirstSeenAt = now
+	decision.LastSeenAt = now
+	decision.SeenCount = 1
+	decision.LastJournaledAt = now
+	decision.Disposition = cloneRecommendationDisposition(decision.Disposition)
+	decision.JournalEvent = SupervisorJournalInitial
+	s.SupervisorDecisions = append(s.SupervisorDecisions, decision)
+	if len(s.SupervisorDecisions) > limit {
+		s.SupervisorDecisions = append([]SupervisorDecision(nil), s.SupervisorDecisions[len(s.SupervisorDecisions)-limit:]...)
+	}
+	return decision
+}
+
+// UpdateSupervisorDecisionEpisode replaces the durable record for an episode
+// after its actuator has attached an approval, mutation result, or disposition.
+// It deliberately does not increment SeenCount: actuation finalizes the same
+// observation that RecordSupervisorDecisionWithPolicy already counted.
+func (s *State) UpdateSupervisorDecisionEpisode(decision SupervisorDecision) bool {
+	if s == nil || strings.TrimSpace(decision.ID) == "" {
+		return false
+	}
+	for i := range s.SupervisorDecisions {
+		if s.SupervisorDecisions[i].ID != decision.ID {
+			continue
+		}
+		decision.Disposition = cloneRecommendationDisposition(decision.Disposition)
+		s.SupervisorDecisions[i] = decision
+		return true
+	}
+	return false
+}
+
+// MarkSupervisorRecommendationMaterialized attaches a downstream consumption
+// receipt to an existing episode. The orchestrator uses this after it starts a
+// worker from a supervisor recommendation; approval and safe-mutation receipts
+// are attached directly by RunOnce.
+func (s *State) MarkSupervisorRecommendationMaterialized(decisionID, reason string, now time.Time) bool {
+	if s == nil || strings.TrimSpace(decisionID) == "" || strings.TrimSpace(reason) == "" {
+		return false
+	}
+	for i := range s.SupervisorDecisions {
+		decision := &s.SupervisorDecisions[i]
+		if decision.ID != decisionID || decision.Disposition != nil {
+			continue
+		}
+		decision.Disposition = &RecommendationDisposition{
+			Status: RecommendationDispositionMaterialized,
+			Reason: strings.TrimSpace(reason),
+			At:     normalizedTime(now),
+		}
+		return true
+	}
+	return false
+}
+
+func (s *State) expireSupervisorRecommendations(now time.Time, ttl time.Duration) map[string]bool {
+	expired := make(map[string]bool)
+	for i := range s.SupervisorDecisions {
+		decision := &s.SupervisorDecisions[i]
+		if decision.Disposition != nil {
+			continue
+		}
+		firstSeen := supervisorDecisionFirstSeen(*decision)
+		if firstSeen.IsZero() || now.Before(firstSeen.Add(ttl)) {
+			continue
+		}
+		s.disposeSupervisorDecision(decision, RecommendationDispositionDropped, RecommendationDispositionTTLExpired, now)
+		expired[decision.ID] = true
+	}
+	return expired
+}
+
+func (s *State) disposeSupervisorDecision(decision *SupervisorDecision, status, reason string, now time.Time) {
+	if decision == nil || decision.Disposition != nil {
+		return
+	}
+	decision.Disposition = &RecommendationDisposition{Status: status, Reason: reason, At: now.UTC()}
+}
+
+func supervisorRecommendationCanRollUp(decision SupervisorDecision) bool {
+	if decision.Quiescent || decision.RecommendationDropped() {
+		return false
+	}
+	return true
+}
+
+func sameSupervisorRecommendation(a, b SupervisorDecision) bool {
+	if strings.TrimSpace(a.RecommendationID) == "" || strings.TrimSpace(b.RecommendationID) == "" {
+		return false
+	}
+	return a.RecommendedAction == b.RecommendedAction &&
+		a.RecommendationID == b.RecommendationID &&
+		stableHash(a.Target) == stableHash(b.Target)
+}
+
+func supervisorDecisionFirstSeen(decision SupervisorDecision) time.Time {
+	if !decision.FirstSeenAt.IsZero() {
+		return decision.FirstSeenAt.UTC()
+	}
+	return decision.CreatedAt.UTC()
+}
+
+func cloneRecommendationDisposition(disposition *RecommendationDisposition) *RecommendationDisposition {
+	if disposition == nil {
 		return nil
+	}
+	clone := *disposition
+	return &clone
+}
+
+func (s *State) latestSupervisorDecisionIndex() int {
+	if s == nil || len(s.SupervisorDecisions) == 0 {
+		return -1
 	}
 	latest := 0
 	for i := 1; i < len(s.SupervisorDecisions); i++ {
 		if s.SupervisorDecisions[i].CreatedAt.After(s.SupervisorDecisions[latest].CreatedAt) {
 			latest = i
 		}
+	}
+	return latest
+}
+
+// LatestSupervisorDecision returns the newest supervisor decision by creation time.
+func (s *State) LatestSupervisorDecision() *SupervisorDecision {
+	latest := s.latestSupervisorDecisionIndex()
+	if latest < 0 {
+		return nil
 	}
 	return &s.SupervisorDecisions[latest]
 }

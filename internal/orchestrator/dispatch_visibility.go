@@ -137,7 +137,7 @@ func blockingOutcomeDispatchHold(s *state.State) (state.DispatchHold, bool) {
 		return state.DispatchHold{}, false
 	}
 	decision := s.LatestSupervisorDecision()
-	heldByDecision := decision != nil && decision.RecommendedAction == supervisor.ActionCheckOutcomeHealth
+	heldByDecision := decision != nil && !decision.RecommendationDropped() && decision.RecommendedAction == supervisor.ActionCheckOutcomeHealth
 	heldByCodeLanded := false
 	for _, sess := range s.Sessions {
 		if sess != nil && sess.Status == state.StatusCodeLanded && !sess.ReleasedForRedispatch {
