@@ -4451,6 +4451,9 @@ func commandBinary(cmd, fallback string) string {
 //     dispatcher cycle. worker.Stop removed the worktree, so the stale
 //     worktree/PR pointers are cleared (#874) — otherwise respawnDueRetries
 //     would choose RespawnInPlace against a directory that no longer exists.
+//     A session that still retains a worktree is refused here at the
+//     destructive boundary (#964): restart never deletes retained canonical
+//     work, so recovery for such a slot must go through spawn_repair_worker.
 func NewWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 	return approver.WorkerControllerFuncs{
 		Stop: func(slot string, sess *state.Session) error {
@@ -4470,6 +4473,23 @@ func NewWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 			return nil
 		},
 		Restart: func(slot string, sess *state.Session) error {
+			// #964: restart is destructive — worker.Stop below runs
+			// `git worktree remove --force` on sess.Worktree before the
+			// orchestrator respawns the slot. The approver executor already
+			// fences restart_worker away from any session that retains a
+			// worktree (open PR or PR-less durable work) and routes recovery to
+			// spawn_repair_worker in place. Enforce the same invariant here at
+			// the destructive boundary itself so the guarantee does not depend
+			// on a single upstream gate: a future control path, a reconcile that
+			// reaches the controller directly, or a regression that drops the
+			// executor fence must not silently delete a retained canonical
+			// worktree. Fail closed instead of removing it.
+			if sess != nil && strings.TrimSpace(sess.Worktree) != "" {
+				return fmt.Errorf(
+					"restart_worker refused: slot %s retains worktree %s; destructive restart would discard it — use spawn_repair_worker to recover the same slot in place",
+					slot, sess.Worktree,
+				)
+			}
 			if err := worker.Stop(cfg, slot, sess); err != nil {
 				return err
 			}
