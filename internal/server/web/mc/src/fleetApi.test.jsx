@@ -104,6 +104,37 @@ describe("Fleet workers ordering contract", () => {
     });
   });
 
+  test("closed terminal session stays done despite historical failure tokens", () => {
+    const taxonomy = workerStatusTaxonomy({
+      status: "done",
+      issue_closed_at: "2026-07-15T11:30:00Z",
+      display_status: "token_budget_exceeded",
+      worker_outcome: "token_budget_exceeded",
+      needs_attention: true,
+    });
+
+    expect(taxonomy).toEqual({
+      label: "done",
+      tone: "ok",
+      section: "done",
+    });
+  });
+
+  test("ordinary done session keeps a historical token-budget failure visible", () => {
+    const taxonomy = workerStatusTaxonomy({
+      status: "done",
+      display_status: "token_budget_exceeded",
+      worker_outcome: "token_budget_exceeded",
+      needs_attention: true,
+    });
+
+    expect(taxonomy).toEqual({
+      label: "token budget exceeded",
+      tone: "stuck",
+      section: "stuck",
+    });
+  });
+
   test("issue-guard retry hold is visible recent work, not a stuck worker", () => {
     const taxonomy = workerStatusTaxonomy({
       status: "dead",

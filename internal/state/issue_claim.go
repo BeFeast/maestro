@@ -538,6 +538,12 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		PRNumber:    sess.PRNumber,
 		Status:      string(sess.Status),
 	}
+	// GitHub issue closure is terminal external truth. Historical retry,
+	// operator-gate, PR, and worktree fields remain on the session for audit,
+	// but none of them may keep an issue claim alive after reconciliation.
+	if sess.Status == StatusDone && sess.IssueClosedAt != nil {
+		return IssueClaim{}, false
+	}
 	if strings.TrimSpace(sess.OperatorGateName) != "" {
 		claim.Kind = IssueClaimOperatorGate
 		claim.Reason = fmt.Sprintf("issue #%d is held by operator gate %q on session %s", sess.IssueNumber, sess.OperatorGateName, slot)

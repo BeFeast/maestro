@@ -666,6 +666,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, fmt.Errorf("list open PRs: %w", err)
 	}
 	projectState.OpenPRs = len(prs)
+	projectState.OpenPRNumbers = supervisorOpenPRNumbers(prs)
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
@@ -2144,6 +2145,23 @@ func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {
 	}
 }
 
+func supervisorOpenPRNumbers(prs []github.PR) []int {
+	numbers := make([]int, 0, len(prs))
+	seen := make(map[int]struct{}, len(prs))
+	for _, pr := range prs {
+		if pr.Number <= 0 {
+			continue
+		}
+		if _, ok := seen[pr.Number]; ok {
+			continue
+		}
+		seen[pr.Number] = struct{}{}
+		numbers = append(numbers, pr.Number)
+	}
+	sort.Ints(numbers)
+	return numbers
+}
+
 type policyCandidateResult struct {
 	candidates  []github.Issue
 	skipped     []string
@@ -2382,9 +2400,6 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
-		if !e.canTreatIssueDoneForOutcome(st) {
-			return false, "issue is closed but outcome health is not verified", nil
-		}
 		return true, "issue is closed", nil
 	}
 

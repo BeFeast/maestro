@@ -517,6 +517,9 @@ func TestDecide_RunningWorkerWaits(t *testing.T) {
 	if decision.Target == nil || decision.Target.Session != "slot-1" || decision.Target.Issue != 42 {
 		t.Fatalf("target = %#v, want slot-1 issue 42", decision.Target)
 	}
+	if len(decision.ProjectState.OpenPRNumbers) != 1 || decision.ProjectState.OpenPRNumbers[0] != 55 {
+		t.Fatalf("open PR identities = %v, want [55]", decision.ProjectState.OpenPRNumbers)
+	}
 	if reader.issueCalls != 0 {
 		t.Fatalf("ListOpenIssues called %d time(s), want 0 for running-worker decision", reader.issueCalls)
 	}
@@ -3180,7 +3183,7 @@ func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
 	}
 }
 
-func TestOrderedQueueIssueDone_ClosedIssueWaitsForOutcomeWhenRequired(t *testing.T) {
+func TestOrderedQueueIssueDone_ClosedIssueAdvancesDespiteFailingOutcome(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Outcome = outcome.Brief{
 		DesiredOutcome:      "Live app works",
@@ -3200,11 +3203,11 @@ func TestOrderedQueueIssueDone_ClosedIssueWaitsForOutcomeWhenRequired(t *testing
 	if err != nil {
 		t.Fatalf("orderedQueueIssueDone: %v", err)
 	}
-	if done {
-		t.Fatalf("done = true, want false while outcome is failing")
+	if !done {
+		t.Fatalf("done = false, want true because GitHub issue closure is terminal")
 	}
-	if !strings.Contains(reason, "outcome health is not verified") {
-		t.Fatalf("reason = %q, want outcome gate reason", reason)
+	if !strings.Contains(reason, "issue is closed") {
+		t.Fatalf("reason = %q, want closed-issue reason", reason)
 	}
 }
 

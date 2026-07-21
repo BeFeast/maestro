@@ -360,6 +360,7 @@ type sessionInfo struct {
 	// Empty for backends that do not self-report a model.
 	Model                     string                `json:"model,omitempty"`
 	PRNumber                  int                   `json:"pr_number,omitempty"`
+	PRMerged                  bool                  `json:"pr_merged,omitempty"`
 	PRURL                     string                `json:"pr_url,omitempty"`
 	Phase                     string                `json:"phase,omitempty"`
 	PlanVersion               int                   `json:"plan_version,omitempty"`
@@ -420,6 +421,7 @@ type sessionInfo struct {
 	StartedAt              string                  `json:"started_at"`
 	WorkerGeneration       uint64                  `json:"worker_generation,omitempty"`
 	FinishedAt             string                  `json:"finished_at,omitempty"`
+	IssueClosedAt          string                  `json:"issue_closed_at,omitempty"`
 	WorkerEndedAt          string                  `json:"worker_ended_at,omitempty"`
 	PROpenedAt             string                  `json:"pr_opened_at,omitempty"`
 	NextRetryAt            string                  `json:"next_retry_at,omitempty"`
@@ -502,6 +504,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		CredentialAggregateReason: sess.CredentialAggregateReason,
 		Model:                     currentSessionModel(sess),
 		PRNumber:                  sess.PRNumber,
+		PRMerged:                  sess.PRMerged,
 		PRURL:                     githubPRURL(repo, sess.PRNumber),
 		Phase:                     string(sess.Phase),
 		PlanVersion:               sess.PlanVersion,
@@ -552,6 +555,9 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	if sess.FinishedAt != nil {
 		end = *sess.FinishedAt
 		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339)
+	}
+	if sess.IssueClosedAt != nil {
+		info.IssueClosedAt = sess.IssueClosedAt.Format(time.RFC3339)
 	}
 	workflowDur := end.Sub(sess.StartedAt).Round(time.Second)
 	info.Runtime = workflowDur.String()
@@ -1049,6 +1055,9 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 }
 
 func staleSupervisorFindingResolved(stuck state.SupervisorStuckState, info sessionInfo) bool {
+	if state.SessionStatus(info.Status) == state.StatusDone && strings.TrimSpace(info.IssueClosedAt) != "" {
+		return true
+	}
 	if staleReviewFeedbackResolved(stuck, info) {
 		return true
 	}
@@ -1125,6 +1134,13 @@ func closeIssueBatchControlAction(readOnly bool, endpoint, target string, candid
 }
 
 func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {
+	// code_landed records a merged PR, and done records a terminal issue.
+	// Neither state has a live merge/restart/stop/label control surface; keep
+	// the row as audit history without describing the merged PR as open.
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusCodeLanded, state.StatusDone:
+		return nil
+	}
 	merge := newApprovalControlAction("approve_merge", "Approve merge", "Enqueue a cautious-gate approval to merge this PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
 	if worker.PRNumber == 0 {
 		// PR-less workers can't enqueue merge_pr regardless of read-only;
