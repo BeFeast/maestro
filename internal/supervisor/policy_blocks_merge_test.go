@@ -158,7 +158,14 @@ func TestDecide_OpenPR_CIAggregateStaleButMergeStateClean_Merges(t *testing.T) {
 		ciStatuses:  map[int]string{115: "pending"},
 		mergeStates: map[int]string{115: "clean"},
 		checkRollups: map[int]github.PRCheckRollup{
-			115: {Verdict: "pending", Complete: true},
+			115: {
+				Verdict:  "pending",
+				Complete: true,
+				Signals: []github.PRCheckSignal{
+					{Source: "check_run", Name: "Fedora 43", Status: "completed", Conclusion: "success"},
+					{Source: "commit_status", Name: "legacy/review", Status: "pending"},
+				},
+			},
 		},
 	}
 	st := state.NewState()
@@ -182,19 +189,23 @@ func TestDecide_OpenPR_CIAggregateStaleButMergeStateClean_Merges(t *testing.T) {
 	}
 }
 
-func TestDecide_OpenPR_RealPendingCheckRunBlocksCleanMergeState(t *testing.T) {
+func TestDecide_OpenPR420_RealPendingCheckRunBlocksCleanMergeState(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.ReviewGate = "none"
 	reader := &fakeReader{
-		prs:         []github.PR{{Number: 119, HeadRefName: "feat/new-pr", Mergeable: "MERGEABLE"}},
-		ciStatuses:  map[int]string{119: "pending"},
-		mergeStates: map[int]string{119: "clean"},
+		prs:         []github.PR{{Number: 420, HeadRefName: "ok-player/fedora", Mergeable: "MERGEABLE"}},
+		ciStatuses:  map[int]string{420: "pending"},
+		mergeStates: map[int]string{420: "clean"},
 		checkRollups: map[int]github.PRCheckRollup{
-			119: {
+			420: {
 				HeadSHA:          strings.Repeat("a", 40),
 				Verdict:          "pending",
 				Complete:         true,
 				PendingCheckRuns: true,
+				Signals: []github.PRCheckSignal{
+					{Source: "check_run", Name: "Fedora 43", Status: "in_progress"},
+					{Source: "check_run", Name: "Fedora 44", Status: "queued"},
+				},
 			},
 		},
 	}
@@ -202,8 +213,8 @@ func TestDecide_OpenPR_RealPendingCheckRunBlocksCleanMergeState(t *testing.T) {
 	st.Sessions["ok-player-1"] = &state.Session{
 		IssueNumber: 201,
 		Status:      state.StatusPROpen,
-		Branch:      "feat/new-pr",
-		PRNumber:    119,
+		Branch:      "ok-player/fedora",
+		PRNumber:    420,
 		StartedAt:   time.Now().UTC().Add(-time.Minute),
 	}
 
@@ -213,6 +224,146 @@ func TestDecide_OpenPR_RealPendingCheckRunBlocksCleanMergeState(t *testing.T) {
 	}
 	if decision.RecommendedAction != ActionMonitorOpenPR {
 		t.Fatalf("action = %q, want monitor_open_pr while current-head check-runs are pending", decision.RecommendedAction)
+	}
+}
+
+func TestDecide_OpenPR_LegacyPendingDoesNotMaskTerminalFailedCheckRun(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:         []github.PR{{Number: 123, HeadRefName: "feat/failed-check", Mergeable: "MERGEABLE"}},
+		mergeStates: map[int]string{123: "clean"},
+		checkRollups: map[int]github.PRCheckRollup{
+			123: {
+				Verdict:  "pending",
+				Complete: true,
+				Signals: []github.PRCheckSignal{
+					{Source: "check_run", Name: "build", Status: "completed", Conclusion: "failure"},
+					{Source: "commit_status", Name: "legacy/review", Status: "pending"},
+				},
+			},
+		},
+	}
+	st := state.NewState()
+	st.Sessions["failed-check-1"] = &state.Session{
+		IssueNumber: 206,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/failed-check",
+		PRNumber:    123,
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr when a terminal check-run failed", decision.RecommendedAction)
+	}
+}
+
+func TestDecide_OpenPR_PendingRollupWithoutLegacyPendingSignalBlocksCleanMergeState(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:         []github.PR{{Number: 124, HeadRefName: "feat/unproven-pending", Mergeable: "MERGEABLE"}},
+		mergeStates: map[int]string{124: "clean"},
+		checkRollups: map[int]github.PRCheckRollup{
+			124: {
+				Verdict:  "pending",
+				Complete: true,
+				Signals: []github.PRCheckSignal{
+					{Source: "check_run", Name: "build", Status: "completed", Conclusion: "success"},
+				},
+			},
+		},
+	}
+	st := state.NewState()
+	st.Sessions["unproven-pending-1"] = &state.Session{
+		IssueNumber: 207,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/unproven-pending",
+		PRNumber:    124,
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr without a legacy pending status signal", decision.RecommendedAction)
+	}
+}
+
+type aggregateOnlyReader struct {
+	Reader
+	ciStatus   string
+	mergeState string
+}
+
+func (r *aggregateOnlyReader) PRCIStatus(int) (string, error) {
+	return r.ciStatus, nil
+}
+
+func (r *aggregateOnlyReader) PRMergeStatus(int) (string, string, error) {
+	return "MERGEABLE", r.mergeState, nil
+}
+
+func TestDecide_OpenPR_CheckRollupUnavailableBlocksCleanMergeState(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	base := &fakeReader{
+		prs: []github.PR{{Number: 121, HeadRefName: "feat/no-rollup", Mergeable: "MERGEABLE"}},
+	}
+	reader := &aggregateOnlyReader{
+		Reader:     base,
+		ciStatus:   "pending",
+		mergeState: "clean",
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-3"] = &state.Session{
+		IssueNumber: 204,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/no-rollup",
+		PRNumber:    121,
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr when current-head check rollup is unavailable", decision.RecommendedAction)
+	}
+}
+
+func TestDecide_OpenPR_PartialCheckRollupBlocksCleanMergeState(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ReviewGate = "none"
+	reader := &fakeReader{
+		prs:         []github.PR{{Number: 122, HeadRefName: "feat/partial-rollup", Mergeable: "MERGEABLE"}},
+		mergeStates: map[int]string{122: "clean"},
+		checkRollups: map[int]github.PRCheckRollup{
+			122: {Verdict: "pending", Complete: false},
+		},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-4"] = &state.Session{
+		IssueNumber: 205,
+		Status:      state.StatusPROpen,
+		Branch:      "feat/partial-rollup",
+		PRNumber:    122,
+		StartedAt:   time.Now().UTC().Add(-time.Minute),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionMonitorOpenPR {
+		t.Fatalf("action = %q, want monitor_open_pr when current-head check rollup is partial", decision.RecommendedAction)
 	}
 }
 
