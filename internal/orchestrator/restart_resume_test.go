@@ -110,9 +110,10 @@ func TestReconcile_DrainDeathResumesDeadCheckpointAfterRestart(t *testing.T) {
 	resumeCount := 0
 	o := restartResumeOrchestrator(t, &resumeCount)
 
+	stateDir := t.TempDir()
 	worktree := t.TempDir()
 	s := state.NewState()
-	s.SetSpawnDrain(time.Now().UTC().Add(-time.Minute))
+	s.SetShutdownDrain(time.Now().UTC().Add(-time.Minute))
 	s.Sessions["sup-313"] = &state.Session{
 		IssueNumber: 313,
 		IssueTitle:  "dies during drain",
@@ -139,15 +140,50 @@ func TestReconcile_DrainDeathResumesDeadCheckpointAfterRestart(t *testing.T) {
 	if resumeCount != 0 {
 		t.Fatalf("old draining daemon resumed %d workers, want 0", resumeCount)
 	}
-	o.reconcileRunningSessions(s)
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatalf("persist drain-time death: %v", err)
+	}
+
+	// Cross the actual daemon restart boundary. The dead marker and canonical
+	// slot identity must survive persistence, and the retained-worktree claim
+	// must suppress a fresh ready-queue dispatch before restart reconcile runs.
+	post, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("reload drain-time death: %v", err)
+	}
+	sess = post.Sessions["sup-313"]
+	if sess.Status != state.StatusDead || sess.RestartCheckpointAt == nil {
+		t.Fatalf("persisted drain-time state = status %q marker %v, want dead with restart marker", sess.Status, sess.RestartCheckpointAt)
+	}
+	if sess.IssueNumber != 313 || sess.Branch != "feat/sup-313-313-drain" || sess.Worktree != worktree {
+		t.Fatalf("persisted session identity changed: issue=%d branch=%q worktree=%q", sess.IssueNumber, sess.Branch, sess.Worktree)
+	}
+	if !post.IssueInProgress(313) {
+		t.Fatal("persisted retained worktree must keep the issue claimed against duplicate dispatch")
+	}
+
+	o.reconcileRunningSessions(post)
 	if resumeCount != 0 {
 		t.Fatalf("old draining daemon replayed dead checkpoint %d times, want 0", resumeCount)
 	}
 
 	// New daemon clears the one-shot drain flag before its first cycle and
-	// consumes the dead marker exactly once on the same logical session.
-	s.ClearSpawnDrain(time.Now().UTC())
-	if !o.reconcileRunningSessions(s) {
+	// consumes the dead marker exactly once on the same logical session. Even if
+	// fresh dispatch were evaluated first, the retained claim must win.
+	post.ClearSpawnDrain(time.Now().UTC())
+	freshDispatches := 0
+	o.listOpenIssuesFn = func([]string) ([]github.Issue, error) {
+		return []github.Issue{makeIssue(313, "dies during drain")}, nil
+	}
+	o.workerStartFn = func(*config.Config, *state.State, string, github.Issue, string, string) (string, error) {
+		freshDispatches++
+		return "duplicate", nil
+	}
+	o.startNewWorkers(post, 1)
+	if freshDispatches != 0 {
+		t.Fatalf("fresh dispatch count = %d, want 0 while canonical dead checkpoint owns issue", freshDispatches)
+	}
+	if !o.reconcileRunningSessions(post) {
 		t.Fatal("replacement daemon did not resume dead checkpoint")
 	}
 	if resumeCount != 1 {
@@ -160,9 +196,113 @@ func TestReconcile_DrainDeathResumesDeadCheckpointAfterRestart(t *testing.T) {
 		t.Fatalf("session identity changed: issue=%d branch=%q worktree=%q", sess.IssueNumber, sess.Branch, sess.Worktree)
 	}
 
-	o.reconcileRunningSessions(s)
+	// Persist marker consumption too. A later daemon/cycle sees the live resumed
+	// runtime and cannot replay the checkpoint or dispatch another worker.
+	if err := state.Save(stateDir, post); err != nil {
+		t.Fatalf("persist resumed session: %v", err)
+	}
+	next, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("reload resumed session: %v", err)
+	}
+	o.reconcileRunningSessions(next)
 	if resumeCount != 1 {
 		t.Fatalf("dead checkpoint resumed %d times, want exactly once", resumeCount)
+	}
+}
+
+// A terminal failure recorded during the drain window is not proof that
+// shutdown caused it. In particular, a dead session with an ordinary retry
+// remains governed by its backoff; recovery must never infer restart intent
+// later from FinishedAt relative to SpawnDrainAt.
+func TestCheckpointDrainDeathForRestart_DoesNotInferOrdinaryTerminal(t *testing.T) {
+	worktree := t.TempDir()
+	drainStart := time.Now().UTC().Add(-time.Minute)
+	finished := drainStart.Add(30 * time.Second)
+	retryAt := finished.Add(5 * time.Minute)
+
+	s := state.NewState()
+	s.SetSpawnDrain(drainStart)
+	sess := &state.Session{
+		IssueNumber: 313,
+		Status:      state.StatusDead,
+		Worktree:    worktree,
+		FinishedAt:  &finished,
+		NextRetryAt: &retryAt,
+	}
+
+	if checkpointDrainDeathForRestart(s, sess, finished) {
+		t.Fatal("already-terminal failure must not be inferred to be restart-resumable")
+	}
+	if sess.RestartCheckpointAt != nil {
+		t.Fatalf("ordinary terminal failure received restart marker %v", sess.RestartCheckpointAt)
+	}
+	if sess.NextRetryAt == nil || !sess.NextRetryAt.Equal(retryAt) {
+		t.Fatalf("ordinary retry policy changed: next_retry_at=%v, want %v", sess.NextRetryAt, retryAt)
+	}
+}
+
+// A standalone operator drain only stops fresh dispatch; it does not prove an
+// unrelated process loss was caused by a daemon restart. The ordinary crash
+// must therefore remain dead and must not be replayed after a later restart.
+func TestReconcile_GenericDrainCrashDoesNotBecomeRestartCheckpoint(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+	o.cfg.MaxRetriesPerIssue = 1
+	stateDir := t.TempDir()
+	worktree := t.TempDir()
+
+	s := state.NewState()
+	s.SetSpawnDrain(time.Now().UTC().Add(-time.Minute))
+	// Exhaust the ordinary retry budget so this process loss is terminal. The
+	// shutdown-resume marker must not silently override that policy.
+	s.Sessions["sup-776"] = &state.Session{
+		IssueNumber: 777,
+		Status:      state.StatusDead,
+	}
+	s.Sessions["sup-777"] = &state.Session{
+		IssueNumber: 777,
+		IssueTitle:  "ordinary crash during operator drain",
+		Status:      state.StatusRunning,
+		PID:         424242,
+		TmuxSession: "sup-777",
+		Branch:      "feat/sup-777-ordinary-crash",
+		Worktree:    worktree,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected ordinary process loss to be reconciled")
+	}
+	sess := s.Sessions["sup-777"]
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want dead", sess.Status)
+	}
+	if sess.RestartCheckpointAt != nil {
+		t.Fatalf("generic drain crash received restart marker %v", sess.RestartCheckpointAt)
+	}
+	if resumeCount != 0 {
+		t.Fatalf("old daemon resumed %d workers, want 0", resumeCount)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("retry-exhausted crash unexpectedly scheduled retry %v", sess.NextRetryAt)
+	}
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatalf("persist ordinary terminal crash: %v", err)
+	}
+
+	post, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("reload ordinary terminal crash: %v", err)
+	}
+	sess = post.Sessions["sup-777"]
+	if sess.Status != state.StatusDead || sess.RestartCheckpointAt != nil || sess.NextRetryAt != nil {
+		t.Fatalf("persisted ordinary crash = status %q marker %v retry %v, want terminal dead without restart policy", sess.Status, sess.RestartCheckpointAt, sess.NextRetryAt)
+	}
+
+	post.ClearSpawnDrain(time.Now().UTC())
+	o.reconcileRunningSessions(post)
+	if resumeCount != 0 {
+		t.Fatalf("ordinary crash resumed after restart %d times, want 0", resumeCount)
 	}
 }
 

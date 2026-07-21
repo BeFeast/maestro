@@ -2,6 +2,9 @@ package orchestrator
 
 import (
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,17 +14,83 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
-// mergeGuardSession builds a merge-eligible session carrying a complete
-// internal attribution timeline. That state must not cause any target-branch
-// mutation (#1000).
-func mergeGuardSession(branch string, pr int) *state.Session {
-	return &state.Session{
-		IssueNumber: 858,
-		IssueTitle:  "attribution amend race",
+func attributionGuardGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s (in %s): %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func setupUnattributedBranch(t *testing.T) (origin, worktree, branch, head string) {
+	t.Helper()
+	root := t.TempDir()
+	origin = filepath.Join(root, "origin.git")
+	worktree = filepath.Join(root, "worktree")
+	branch = "feat/sup-1000-internal-attribution"
+
+	attributionGuardGit(t, root, "init", "--bare", origin)
+	attributionGuardGit(t, origin, "symbolic-ref", "HEAD", "refs/heads/main")
+	attributionGuardGit(t, root, "clone", origin, worktree)
+	attributionGuardGit(t, worktree, "config", "user.email", "test@example.com")
+	attributionGuardGit(t, worktree, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(worktree, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	attributionGuardGit(t, worktree, "add", "README.md")
+	attributionGuardGit(t, worktree, "commit", "-m", "initial")
+	attributionGuardGit(t, worktree, "push", "-u", "origin", "main")
+	attributionGuardGit(t, worktree, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(worktree, "feature.txt"), []byte("product change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	attributionGuardGit(t, worktree, "add", "feature.txt")
+	attributionGuardGit(t, worktree, "commit", "-m", "worker: product change")
+	attributionGuardGit(t, worktree, "push", "-u", "origin", branch)
+	return origin, worktree, branch, attributionGuardGit(t, origin, "rev-parse", branch)
+}
+
+// Backend attribution is durable in Maestro state and Fleet, not in product
+// commits. An unattributed PR head must remain byte-for-byte identical across
+// orchestration cycles and must still reach the ordinary merge attempt (#1000).
+func TestAutoMergePRs_UnattributedHeadStaysExactAndMergeEligibleAcrossCycles(t *testing.T) {
+	origin, worktree, branch, originalHead := setupUnattributedBranch(t)
+	pr := github.PR{Number: 864, HeadRefName: branch}
+	cfg := &config.Config{
+		Repo:          "owner/repo",
+		LocalPath:     worktree,
+		MergeStrategy: "parallel",
+		ReviewGate:    "none",
+	}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{
+			HeadSHA:     originalHead,
+			Verdict:     "success",
+			Fingerprint: strings.Repeat("1", 16),
+			Complete:    true,
+		}, nil
+	}
+	o.ghPRHeadSHAFn = func(int) (string, error) { return originalHead, nil }
+	mergeAttempts := 0
+	o.ghMergePRFn = func(int) error {
+		mergeAttempts++
+		return errors.New("deliberate merge stop after readiness proof")
+	}
+	o.ghPRMergeStatusFn = func(int) (string, string, error) {
+		return "MERGEABLE", "CLEAN", nil
+	}
+
+	s := state.NewState()
+	s.Sessions["sup-1000"] = &state.Session{
+		IssueNumber: 1000,
+		IssueTitle:  "keep backend attribution internal",
 		Status:      state.StatusPROpen,
-		PRNumber:    pr,
+		PRNumber:    pr.Number,
 		Branch:      branch,
-		Worktree:    "/tmp/does-not-matter",
+		Worktree:    worktree,
 		Attribution: []state.BackendAttribution{{
 			Backend:   "claude",
 			Provider:  "anthropic",
@@ -30,79 +99,17 @@ func mergeGuardSession(branch string, pr int) *state.Session {
 			StartedAt: time.Date(2026, 7, 10, 4, 0, 0, 0, time.UTC),
 		}},
 	}
-}
 
-// Attribution is durable in Maestro state and Fleet, not in product commits.
-// The merge path must continue to observe the authoritative PR gate regardless
-// of how many internal backend segments the session carries (#974/#1000).
-func TestAutoMergePRs_InternalAttributionNeverAmendsProductBranch(t *testing.T) {
-	branch := "feat/sup-1000-internal-attribution"
-	s := state.NewState()
-	s.Sessions["sup-858"] = mergeGuardSession(branch, 864)
-
-	ciQueried := false
-	o := &Orchestrator{
-		cfg: &config.Config{},
-		listOpenPRsFn: func() ([]github.PR, error) {
-			return []github.PR{{Number: 864, HeadRefName: branch}}, nil
-		},
-		ghPRCIStatusFn: func(prNumber int) (string, error) {
-			ciQueried = true
-			return "", errors.New("stop after proving normal gate observation")
-		},
-	}
-
-	o.autoMergePRs(s)
-
-	if !ciQueried {
-		t.Fatal("normal CI gate observation was blocked by internal attribution state")
-	}
-}
-
-// amendGitCommand must pin LC_ALL=C on the git subprocess so git's "stale info"
-// force-with-lease rejection is emitted in English regardless of the host
-// locale. Without this the git child inherits the orchestrator's environment,
-// and under a non-English locale the rejection is translated — so
-// isStaleInfoLeaseRejection would miss the real race and take the hard-error
-// path instead of retrying/deferring (#858).
-func TestAmendGitCommand_ForcesCLocale(t *testing.T) {
-	// Simulate an orchestrator running under a translating locale.
-	t.Setenv("LC_ALL", "fr_FR.UTF-8")
-
-	cmd := amendGitCommand(t.TempDir(), "status", "--porcelain")
-
-	// os/exec keeps the last value for a duplicate key, so resolve LC_ALL the
-	// same way the child process will: last occurrence wins.
-	got := ""
-	for _, kv := range cmd.Env {
-		if strings.HasPrefix(kv, "LC_ALL=") {
-			got = strings.TrimPrefix(kv, "LC_ALL=")
+	for cycle := 1; cycle <= 2; cycle++ {
+		o.autoMergePRs(s)
+		if mergeAttempts != cycle {
+			t.Fatalf("cycle %d merge attempts = %d, want %d; unattributed head was rejected before merge", cycle, mergeAttempts, cycle)
 		}
-	}
-	if got != "C" {
-		t.Fatalf("amendGitCommand LC_ALL resolved to %q, want \"C\" (inherited locale would translate git's stale-info text)", got)
-	}
-}
-
-// isStaleInfoLeaseRejection recognizes git's English stale-info marker (which is
-// what git emits under the forced C locale) and is unfazed by casing/framing,
-// while not false-positiving on unrelated push failures.
-func TestIsStaleInfoLeaseRejection(t *testing.T) {
-	cases := []struct {
-		name string
-		out  string
-		want bool
-	}{
-		{"english stale info", " ! [rejected]        feat -> feat (stale info)", true},
-		{"uppercase framing", "! [REJECTED] (STALE INFO)", true},
-		{"non-fast-forward is not stale", " ! [rejected] feat -> feat (non-fast-forward)", false},
-		{"auth failure is not stale", "fatal: Authentication failed", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isStaleInfoLeaseRejection(tc.out); got != tc.want {
-				t.Fatalf("isStaleInfoLeaseRejection(%q) = %v, want %v", tc.out, got, tc.want)
-			}
-		})
+		if got := attributionGuardGit(t, origin, "rev-parse", branch); got != originalHead {
+			t.Fatalf("cycle %d changed exact product head: got %s want %s", cycle, got, originalHead)
+		}
+		if msg := attributionGuardGit(t, origin, "log", "-1", "--pretty=%B", branch); strings.Contains(msg, "Maestro-Backend:") {
+			t.Fatalf("cycle %d injected backend telemetry into product commit:\n%s", cycle, msg)
+		}
 	}
 }

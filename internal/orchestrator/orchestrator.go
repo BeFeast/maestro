@@ -3241,6 +3241,27 @@ func strSliceEqual(a, b []string) bool {
 	return true
 }
 
+// checkpointDrainDeathForRestart marks one explicit unexpected process-loss
+// transition as resumable while the session is still running. The caller must
+// invoke it before changing Status to Dead, and only the daemon's persisted
+// in-process shutdown drain qualifies: a generic operator drain can overlap an
+// ordinary crash and must not override its terminal or retry policy (#967).
+func checkpointDrainDeathForRestart(s *state.State, sess *state.Session, at time.Time) bool {
+	if s == nil || sess == nil || sess.Status != state.StatusRunning || !s.ShutdownDrainActive() {
+		return false
+	}
+	worktree := strings.TrimSpace(sess.Worktree)
+	if worktree == "" {
+		return false
+	}
+	if _, err := os.Stat(worktree); err != nil {
+		return false
+	}
+	stamp := at.UTC()
+	sess.RestartCheckpointAt = &stamp
+	return true
+}
+
 // reconcileRunningSessions self-heals stale "running" sessions.
 // If a session is marked running but either its PID is dead/missing OR its tmux session
 // is missing, the session is transitioned to a terminal state.
@@ -3637,24 +3658,20 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// the first recovery when max_retries_per_issue is 1.
 		unexpectedRetryAllowed := strings.TrimSpace(sess.Worktree) != "" && o.canRetryIssue(s, sess)
 		o.updateTokensUsedFromWorkerLog(slotName, sess)
+		now := time.Now().UTC()
+		// #967: preserve recovery intent while this is still known to be the
+		// explicit process/tmux-gone path. Inferring the cause later from a dead
+		// session's FinishedAt would also revive ordinary provider failures and
+		// scheduled retries that happened during drain.
+		if checkpointDrainDeathForRestart(s, sess, now) {
+			log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
+		}
 		sess.Status = state.StatusDead
 		sess.PID = 0
 		sess.TmuxSession = ""
-		now := time.Now().UTC()
 		sess.FinishedAt = &now
 		state.MarkWorkerEnded(sess, now)
-		// #967: during graceful drain the daemon shutdown pass may run only
-		// after this flow has already persisted running->dead. Stamp the same
-		// resumable identity here while the cause is still known. Dead markers
-		// are held while drain remains active and consumed by the replacement
-		// daemon, preserving this exact slot/worktree without a new dispatch.
-		if s.DrainActive() && strings.TrimSpace(sess.Worktree) != "" {
-			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
-				stamp := now
-				sess.RestartCheckpointAt = &stamp
-				log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
-			}
-		} else if unexpectedRetryAllowed {
+		if !s.DrainActive() && unexpectedRetryAllowed {
 			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
 				// Unexpected process loss used to become an unscheduled dead
 				// session. Dead sessions are outside the material-progress watchdog,
@@ -3989,302 +4006,6 @@ func autoCreatedPRBody(sess *state.Session, branch string) string {
 
 Maestro auto-created this pull request for pushed branch %s because no open pull request was found for it.
 `, sess.IssueNumber, branch)
-}
-
-// amendMaxAttempts bounds how many times amendHeadWithAttributionTrailer will
-// re-fetch and re-apply the trailer after a stale-info lease rejection before
-// deferring to a later cycle: one initial try plus up to two refetch-retries.
-const amendMaxAttempts = 3
-
-// amendRetryBackoff is the pause between stale-info retry attempts. It is a var
-// so tests can shorten it.
-var amendRetryBackoff = 400 * time.Millisecond
-
-// amendPushRaceHook, when non-nil, runs immediately before each force-with-lease
-// push inside amendHeadWithAttributionTrailer. Tests use it to advance the
-// remote and deterministically reproduce the stale-info race; it is nil in
-// production.
-var amendPushRaceHook func()
-
-// The attribution amend can decline to land the trailer this cycle for several
-// distinct reasons. Each is a "retry next cycle" deferral — never a merge without
-// the trailer — but they are kept separate so the orchestrator reports them
-// distinctly: only a proven lease race says "advancing under concurrent push".
-// Misreporting a quiet branch — or a missing-branch / network failure — as an
-// advancing race is exactly the wedge #873 fixes.
-var (
-	// errAmendDeferred: the remote branch genuinely advanced under a concurrent
-	// worker/operator push and the force-with-lease was lost on every attempt
-	// (proven movement). A later quieter cycle or the pre-merge pass completes it.
-	errAmendDeferred = errors.New("attribution amend deferred: branch advancing under concurrent push")
-	// errAmendDiverged: the remote head does not descend from the commit we were
-	// attributing (a real divergence, e.g. an unpushed local commit or an operator
-	// force-push). Never overwrite it; defer.
-	errAmendDiverged = errors.New("attribution amend deferred: remote branch diverged from the attributed head")
-	// errAmendWorktreeBusy: the worktree has uncommitted changes (a worker is
-	// mid-write). Amending would race the writer, so defer.
-	errAmendWorktreeBusy = errors.New("attribution amend deferred: worktree has uncommitted changes")
-	// errAmendFetchFailed: the remote branch tip could not be fetched — a missing
-	// remote branch, or an auth / network failure. This is not movement; defer with
-	// a distinct message rather than mislabeling it an advancing race (#873).
-	errAmendFetchFailed = errors.New("attribution amend deferred: could not fetch remote branch tip")
-)
-
-// amendGitCommand builds a git subprocess for the attribution amend with a
-// forced C locale. Git localizes its porcelain and error text per
-// LC_ALL/LC_MESSAGES/LANG, which the git child would otherwise inherit from the
-// orchestrator's environment. Under a non-English locale git translates the
-// "stale info" force-with-lease rejection, so isStaleInfoLeaseRejection (which
-// matches that English marker) would miss the real race and take the hard-error
-// path instead of retrying/deferring. Pinning LC_ALL=C keeps git's messages
-// stable and English regardless of the host locale (#858). os/exec keeps the
-// last value for a duplicate key, so this overrides any inherited LC_ALL, and
-// LC_ALL outranks LC_MESSAGES/LANG in the locale precedence.
-func amendGitCommand(worktreePath string, args ...string) *exec.Cmd {
-	cmd := exec.Command("git", append([]string{"-C", worktreePath}, args...)...)
-	cmd.Env = append(os.Environ(), "LC_ALL=C")
-	return cmd
-}
-
-// isStaleInfoLeaseRejection reports whether `git push --force-with-lease` output
-// is the "stale info" rejection that occurs when the remote branch advanced
-// between our fetch and our push — i.e. a worker or operator pushed first. The
-// git subprocess is run under LC_ALL=C (see amendGitCommand), so this English
-// marker is locale-stable and cannot be missed under a translated locale.
-func isStaleInfoLeaseRejection(out string) bool {
-	return strings.Contains(strings.ToLower(out), "stale info")
-}
-
-// amendHeadWithAttributionTrailer amends the branch head to carry the durable
-// Maestro-Backend attribution trailer and force-pushes it. It is race-tolerant
-// and — crucially — does not depend on a refs/remotes/origin/<branch>
-// remote-tracking ref, which a checkout tracking only main (narrow fetch refspec
-// `+refs/heads/main:refs/remotes/origin/main`) never has.
-//
-// Each attempt fetches the remote branch tip explicitly (FETCH_HEAD) and uses
-// that OID both as the ancestry reference and as an explicit
-// `--force-with-lease=refs/heads/<branch>:<oid>` expectation. The implicit
-// `--force-with-lease` form derives its expectation from the remote-tracking
-// ref; when that ref is absent git rejects every push as "stale info", so a
-// quiet branch (local == remote) was misread as an advancing race and wedged
-// forever (#873).
-//
-// The commit that gets attributed is chosen by ancestry, so no push ever
-// discards a commit that is not our own reworded head:
-//   - remote == local: quiet branch; attribute the shared head.
-//   - local is an ancestor of remote: a worker/operator pushed a descendant;
-//     reword that remote head so nothing is lost.
-//   - remote is an ancestor of local: local carries commits the remote lacks;
-//     attribute the local head (remote is fully contained).
-//   - otherwise: a genuine divergence — defer (errAmendDiverged), never
-//     overwrite.
-//
-// When the remote advances between our fetch and our push, git rejects the lease
-// with "stale info"; the amend re-fetches and retries with backoff, deferring
-// (errAmendDeferred) if the branch keeps moving (#858).
-func amendHeadWithAttributionTrailer(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time, ignoredUntrackedPaths ...string) error {
-	worktreePath = strings.TrimSpace(worktreePath)
-	branch = strings.TrimSpace(branch)
-	if worktreePath == "" || branch == "" || len(attribution) == 0 {
-		return nil
-	}
-	prohibited, err := repopolicy.ProhibitsPublicAIAttribution(worktreePath)
-	if err != nil {
-		return err
-	}
-	if prohibited {
-		// Public attribution is forbidden by the repository's authoritative
-		// policy. Finalization is a no-op even if internal attribution gained new
-		// fallover, retry, checkpoint-resume, or continuation segments.
-		return nil
-	}
-	if _, err := os.Stat(worktreePath); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-
-	for attempt := 1; attempt <= amendMaxAttempts; attempt++ {
-		// Never amend over product work: a worker may still be writing, and a
-		// force-push here could clobber changes the lease cannot protect (it only
-		// guards committed history). The sole exception is the exact untracked
-		// Maestro checkpoint explicitly supplied by the owning session.
-		status, err := amendGitCommand(worktreePath, "status", "--porcelain=v1", "-z", "--untracked-files=all").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("git status: %w\n%s", err, status)
-		}
-		if attributionWorktreeHasBlockingChanges(status, ignoredUntrackedPaths) {
-			return errAmendWorktreeBusy
-		}
-
-		localHeadRaw, err := amendGitCommand(worktreePath, "rev-parse", "HEAD").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("git rev-parse HEAD: %w\n%s", err, localHeadRaw)
-		}
-		localHead := strings.TrimSpace(string(localHeadRaw))
-
-		// Learn the remote branch tip explicitly. This OID is both the lease
-		// expectation and the ancestry reference; we never read
-		// refs/remotes/origin/<branch>, which a narrow-refspec checkout lacks. A
-		// fetch failure (missing branch / auth / network) is reported distinctly,
-		// not as an advancing race (#873).
-		remoteOID, err := fetchRemoteBranchOID(worktreePath, branch)
-		if err != nil {
-			return err
-		}
-
-		// Choose the commit to attribute by ancestry (see the doc comment). base
-		// is the commit we reword; on a push failure we restore HEAD to it so a
-		// deferral never leaves an un-pushed local trailer that would poison the
-		// next cycle (#858).
-		base := localHead
-		switch {
-		case remoteOID == localHead:
-			// Quiet branch: local and remote are identical; attribute the shared
-			// head. This is the common case the old implicit lease wedged (#873).
-		case isAncestorCommit(worktreePath, localHead, remoteOID):
-			// A worker/operator pushed a descendant of our head: reword that
-			// remote head so their concurrent work survives, attributed.
-			base = remoteOID
-			if out, err := amendGitCommand(worktreePath, "reset", "--hard", remoteOID).CombinedOutput(); err != nil {
-				return fmt.Errorf("git reset --hard %s: %w\n%s", remoteOID, err, out)
-			}
-		case isAncestorCommit(worktreePath, remoteOID, localHead):
-			// Local is ahead of the remote and fully contains it; attribute the
-			// local head. The lease still guards against a concurrent push.
-		default:
-			// Neither head descends from the other: a genuine divergence. Never
-			// overwrite it (lease semantics preserved, #858).
-			return errAmendDiverged
-		}
-
-		out, err := amendGitCommand(worktreePath, "log", "-1", "--pretty=%B").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("git log -1: %w\n%s", err, out)
-		}
-		msg := state.AppendAttributionTrailer(string(out), attribution, now)
-		if msg == string(out) && base == remoteOID {
-			// Trailer already present on this head (idempotent — a prior cycle
-			// landed it, or we reset onto an already-attributed remote head), so
-			// there is nothing to push and never a duplicate.
-			return nil
-		}
-
-		if msg != string(out) {
-			cmd := amendGitCommand(worktreePath, "commit", "--amend", "-F", "-")
-			cmd.Stdin = strings.NewReader(msg)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("git commit --amend: %w\n%s", err, out)
-			}
-		}
-
-		if amendPushRaceHook != nil {
-			amendPushRaceHook()
-		}
-
-		// Explicit lease: require the remote ref to still be at the OID we fetched,
-		// independent of any remote-tracking ref. The implicit form derives the
-		// expectation from refs/remotes/origin/<branch>, which a narrow-refspec
-		// checkout lacks — there git rejects every push as "stale info" and wedges
-		// a quiet branch forever (#873).
-		remoteRef := "refs/heads/" + branch
-		pushOut, pushErr := amendGitCommand(worktreePath, "push",
-			"--force-with-lease="+remoteRef+":"+remoteOID, "origin", "HEAD:"+remoteRef).CombinedOutput()
-		if pushErr == nil {
-			return nil // trailer landed exactly once
-		}
-
-		// The push did not land, so the local --amend is an un-pushed commit
-		// carrying the trailer while the remote does not. Undo it before we return
-		// or retry, restoring HEAD to the pre-amend base. Otherwise a later cycle
-		// reads the local trailer, AppendAttributionTrailer no-ops before any
-		// fetch/push, and attribution is lost despite the deferral promising a
-		// retry (#858). Resetting to base discards nothing but our own reword — the
-		// remote's real commits live on the remote, not in this un-pushed amend.
-		if out, err := amendGitCommand(worktreePath, "reset", "--hard", base).CombinedOutput(); err != nil {
-			return fmt.Errorf("git reset --hard %s (undo un-pushed amend): %w\n%s", base, err, out)
-		}
-
-		if !isStaleInfoLeaseRejection(string(pushOut)) {
-			return fmt.Errorf("git push --force-with-lease origin HEAD:%s: %w\n%s", remoteRef, pushErr, pushOut)
-		}
-
-		// Stale lease: the remote advanced under a concurrent push between our
-		// fetch and our push (proven movement). Out of attempts → defer to a later
-		// cycle rather than erroring. HEAD is back on an untrailered commit, so the
-		// next cycle re-reads the untrailered message and genuinely retries. The
-		// loop's next iteration re-fetches the head the worker actually pushed.
-		if attempt == amendMaxAttempts {
-			return errAmendDeferred
-		}
-		if amendRetryBackoff > 0 {
-			time.Sleep(amendRetryBackoff)
-		}
-	}
-	return errAmendDeferred
-}
-
-// attributionWorktreeHasBlockingChanges permits only explicitly named
-// untracked Maestro artifacts. Tracked modifications, staged files, renames,
-// and every other untracked path remain blocking. Porcelain -z keeps filenames
-// unquoted; a rename emits an extra path record, which intentionally falls
-// through as blocking rather than being parsed optimistically.
-func attributionWorktreeHasBlockingChanges(status []byte, ignoredUntrackedPaths []string) bool {
-	ignored := make(map[string]struct{}, len(ignoredUntrackedPaths))
-	for _, path := range ignoredUntrackedPaths {
-		path = filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
-		if path != "" && path != "." {
-			ignored[path] = struct{}{}
-		}
-	}
-	for _, record := range strings.Split(string(status), "\x00") {
-		if record == "" {
-			continue
-		}
-		if len(record) >= 4 && record[:3] == "?? " {
-			path := filepath.ToSlash(filepath.Clean(record[3:]))
-			if _, ok := ignored[path]; ok {
-				continue
-			}
-		}
-		return true
-	}
-	return false
-}
-
-// fetchRemoteBranchOID fetches the remote branch tip into FETCH_HEAD and returns
-// its OID. It deliberately does NOT rely on a refs/remotes/origin/<branch>
-// tracking ref: a checkout may intentionally track only main (narrow fetch
-// refspec `+refs/heads/main:refs/remotes/origin/main`), so that ref never exists.
-// `git fetch origin refs/heads/<branch>` updates FETCH_HEAD regardless of the
-// configured refspec and without broadening or rewriting it. The fully qualified
-// source ref prevents a same-named tag from being selected instead of the branch
-// tip (#873). A fetch failure — missing remote branch, auth, or network — is
-// wrapped in errAmendFetchFailed so the caller reports it distinctly rather than
-// as an advancing race.
-func fetchRemoteBranchOID(worktreePath, branch string) (string, error) {
-	remoteRef := "refs/heads/" + branch
-	if out, err := amendGitCommand(worktreePath, "fetch", "origin", remoteRef).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("%w: git fetch origin %s: %v\n%s", errAmendFetchFailed, remoteRef, err, out)
-	}
-	oidRaw, err := amendGitCommand(worktreePath, "rev-parse", "FETCH_HEAD").CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%w: git rev-parse FETCH_HEAD: %v\n%s", errAmendFetchFailed, err, oidRaw)
-	}
-	oid := strings.TrimSpace(string(oidRaw))
-	if oid == "" {
-		return "", fmt.Errorf("%w: empty FETCH_HEAD after fetching %s", errAmendFetchFailed, branch)
-	}
-	return oid, nil
-}
-
-// isAncestorCommit reports whether ancestor is an ancestor of (or equal to)
-// descendant in worktreePath's object graph. A non-nil error from git
-// merge-base (unrelated histories, missing objects) reads as "not an ancestor",
-// which is the fail-safe: callers then defer rather than force-push.
-func isAncestorCommit(worktreePath, ancestor, descendant string) bool {
-	return amendGitCommand(worktreePath, "merge-base", "--is-ancestor", ancestor, descendant).Run() == nil
 }
 
 // terminalReconcileDue bounds authoritative forge polling for historical
