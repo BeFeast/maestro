@@ -9,6 +9,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 func TestStartReserved_AdoptsExactLiveWorkerWithoutDiscardingWorktree(t *testing.T) {
@@ -51,12 +52,19 @@ func TestStartReserved_AdoptsExactLiveWorkerWithoutDiscardingWorktree(t *testing
 
 	originalExists := tmuxSessionExists
 	originalRead := readTmuxPaneIdentity
+	originalLeaseActive := workerProcessLeaseActive
 	t.Cleanup(func() {
 		tmuxSessionExists = originalExists
 		readTmuxPaneIdentity = originalRead
+		workerProcessLeaseActive = originalLeaseActive
 	})
 	tmuxSessionExists = func(name string) bool { return name == TmuxSessionName(slot) }
 	readTmuxPaneIdentity = func(name string) (int, string, error) { return 4242, worktree, nil }
+	var inspectedLease tmuxsession.ProcessLease
+	workerProcessLeaseActive = func(lease tmuxsession.ProcessLease) (bool, error) {
+		inspectedLease = lease
+		return true, nil
+	}
 
 	cfg := &config.Config{
 		Repo:          "owner/repo",
@@ -85,5 +93,12 @@ func TestStartReserved_AdoptsExactLiveWorkerWithoutDiscardingWorktree(t *testing
 	sess := s.Sessions[slot]
 	if sess == nil || sess.IssueNumber != issue.Number || sess.Branch != branch || sess.Worktree != worktree || sess.PID != 4242 {
 		t.Fatalf("adopted session = %+v", sess)
+	}
+	wantLease, err := workerProcessLease(cfg, slot, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspectedLease != wantLease || sess.ProcessLeaseUnit != wantLease.Unit || sess.ProcessLeaseManager != wantLease.Manager {
+		t.Fatalf("adopted process lease inspected=%+v session=%+v, want %+v", inspectedLease, sess, wantLease)
 	}
 }
