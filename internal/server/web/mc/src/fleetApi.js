@@ -777,6 +777,9 @@ function mapEffectiveConfig(raw) {
     modelPolicy: {
       default: String(policy.default || ""),
       fallbackBackends: Array.isArray(policy.fallback_backends) ? policy.fallback_backends.map(String) : [],
+      providerLanes: Array.isArray(policy.provider_lanes) ? policy.provider_lanes.map(mapProviderLane) : [],
+      resolvedRoute: arrayOfString(policy.resolved_route),
+      selectionReason: String(policy.selection_reason || ""),
       backends: Array.isArray(policy.backends) ? policy.backends.map(mapEffectiveBackend) : [],
       routing: {
         mode: String((policy.routing || {}).mode || ""),
@@ -831,6 +834,14 @@ function mapEffectiveConfig(raw) {
     },
     approvalAction: String(raw.approval_action || "change_global_config"),
     settings: Array.isArray(raw.settings) ? raw.settings.map(mapSettingSource) : [],
+  };
+}
+
+function mapProviderLane(raw) {
+  return {
+    provider: String(raw?.provider || ""),
+    default: String(raw?.default || ""),
+    fallbackBackends: arrayOfString(raw?.fallback_backends),
   };
 }
 

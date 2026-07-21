@@ -221,3 +221,34 @@ describe("supervisor recommendation episodes", () => {
     });
   });
 });
+
+describe("Provider route mapping", () => {
+  test("preserves provider lanes, flattened route, and selection reason", () => {
+    const fleet = mapFleetResponse({
+      projects: [{
+        name: "maestro",
+        effective_config: {
+          model_policy: {
+            default: "claude",
+            provider_lanes: [
+              { provider: "anthropic", default: "claude" },
+              { provider: "openai", default: "sol", fallback_backends: ["gpt55"] },
+            ],
+            resolved_route: ["claude", "sol", "gpt55"],
+            selection_reason: "provider_lanes",
+          },
+        },
+      }],
+    }, now);
+
+    expect(fleet.projects[0].effectiveConfig.modelPolicy).toMatchObject({
+      default: "claude",
+      resolvedRoute: ["claude", "sol", "gpt55"],
+      selectionReason: "provider_lanes",
+      providerLanes: [
+        { provider: "anthropic", default: "claude", fallbackBackends: [] },
+        { provider: "openai", default: "sol", fallbackBackends: ["gpt55"] },
+      ],
+    });
+  });
+});
