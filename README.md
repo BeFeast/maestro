@@ -247,6 +247,11 @@ management_home:
   vault_path: Dev/Areas/project
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
+worker_runtime:                     # config-gated private scratch + OS lease runtime
+  mode: legacy                     # legacy (default rollback path) | isolated
+  scope: system                    # system (shipped service) | user
+  scratch_root: /var/tmp/maestro-workers
+  memory_max_mb: 0                 # optional per-worker hard cap; 0 uses the shared slice only
 stalled_progress_watchdog:         # explicit opt-in multi-signal evaluator
   enabled: true
   max_silence_minutes: 20          # exact-lease worker recovery; runtime-live contract remains canary-gated

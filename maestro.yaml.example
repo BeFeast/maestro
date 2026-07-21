@@ -9,6 +9,11 @@ local_path: /path/to/local/repo
 worktree_base: /path/to/worktrees/repo
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
+worker_runtime:
+  mode: legacy                     # legacy (default rollback path) | isolated
+  scope: system                    # system for shipped maestro.service; user for a user unit
+  scratch_root: /var/tmp/maestro-workers
+  memory_max_mb: 0                 # optional per-worker cap; isolated workers also share a 70%/80% slice boundary
 stalled_progress_watchdog:         # explicit opt-in; evaluates independently of GitHub/LLM cycles
   enabled: true
   max_silence_minutes: 20          # recommendation threshold; current v1 does not actuate recovery
