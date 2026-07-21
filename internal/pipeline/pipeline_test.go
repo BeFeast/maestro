@@ -225,14 +225,21 @@ func TestApplyPhaseEffort(t *testing.T) {
 		},
 	}
 
-	// Effort set → clone carries the effort as a TierEffort override on the
-	// selected backend def, without mutating the base config.
+	// Effort set → clone carries the effort as both attribution metadata and a
+	// TierEffort argv override on the selected backend def, without mutating the
+	// base config.
 	got := ApplyPhaseEffort(base, "codex", state.PhaseImplement)
 	if got == base {
 		t.Fatal("expected a cloned config when effort is applied")
 	}
+	if effort := got.Model.Backends["codex"].Effort; effort != "low" {
+		t.Errorf("clone Effort: got %q, want low", effort)
+	}
 	if te := got.Model.Backends["codex"].TierEffort; te != "low" {
 		t.Errorf("clone TierEffort: got %q, want low", te)
+	}
+	if effort := base.Model.Backends["codex"].Effort; effort != "" {
+		t.Errorf("base config was mutated: Effort=%q, want empty", effort)
 	}
 	if te := base.Model.Backends["codex"].TierEffort; te != "" {
 		t.Errorf("base config was mutated: TierEffort=%q, want empty", te)

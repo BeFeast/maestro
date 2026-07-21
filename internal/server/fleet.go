@@ -1458,16 +1458,17 @@ type fleetProjectState struct {
 }
 
 type fleetEffectiveConfig struct {
-	ProjectID      string                `json:"project_id,omitempty"`
-	ManagementHome *fleetManagementHome  `json:"management_home,omitempty"`
-	ModelPolicy    fleetModelPolicy      `json:"model_policy"`
-	MaxParallel    int                   `json:"max_parallel"`
-	ReviewGate     string                `json:"review_gate"`
-	Labels         fleetConfigLabels     `json:"labels"`
-	Retention      fleetConfigRetention  `json:"retention"`
-	CostCaps       fleetConfigCostCaps   `json:"cost_caps"`
-	SupervisorGate fleetConfigSupervisor `json:"supervisor_gate"`
-	ApprovalAction string                `json:"approval_action"`
+	ProjectID      string                 `json:"project_id,omitempty"`
+	ManagementHome *fleetManagementHome   `json:"management_home,omitempty"`
+	ModelPolicy    fleetModelPolicy       `json:"model_policy"`
+	Pipeline       fleetEffectivePipeline `json:"pipeline"`
+	MaxParallel    int                    `json:"max_parallel"`
+	ReviewGate     string                 `json:"review_gate"`
+	Labels         fleetConfigLabels      `json:"labels"`
+	Retention      fleetConfigRetention   `json:"retention"`
+	CostCaps       fleetConfigCostCaps    `json:"cost_caps"`
+	SupervisorGate fleetConfigSupervisor  `json:"supervisor_gate"`
+	ApprovalAction string                 `json:"approval_action"`
 	// Settings is the fleet-controllable cost/LLM knob layer (#839): each
 	// registered key with its effective value and the layer that supplied it
 	// (builtin/fleet/project). Mission Control uses Source to highlight
@@ -1514,7 +1515,28 @@ type fleetEffectiveRoutingConfig struct {
 	RouterModelName string `json:"router_model_name,omitempty"`
 	// AllowMeteredBackend surfaces the router opt-in for a metered router_model
 	// (#838); false is the default guarded behavior.
-	AllowMeteredBackend bool `json:"allow_metered_backend,omitempty"`
+	AllowMeteredBackend bool                        `json:"allow_metered_backend,omitempty"`
+	Tiers               []fleetEffectiveRoutingTier `json:"tiers,omitempty"`
+}
+
+type fleetEffectiveRoutingTier struct {
+	Name    string `json:"name"`
+	Backend string `json:"backend,omitempty"`
+	Effort  string `json:"effort,omitempty"`
+	Model   string `json:"model,omitempty"`
+	Rank    int    `json:"rank,omitempty"`
+}
+
+type fleetEffectivePipeline struct {
+	Planner     fleetEffectivePipelineRole `json:"planner"`
+	Implementer fleetEffectivePipelineRole `json:"implementer"`
+	Validator   fleetEffectivePipelineRole `json:"validator"`
+}
+
+type fleetEffectivePipelineRole struct {
+	Enabled bool   `json:"enabled,omitempty"`
+	Backend string `json:"backend,omitempty"`
+	Effort  string `json:"effort,omitempty"`
 }
 
 type fleetConfigLabels struct {
@@ -4013,7 +4035,13 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 				RouterModel:         strings.TrimSpace(cfg.Routing.RouterModel),
 				RouterModelName:     strings.TrimSpace(cfg.Routing.RouterModelName),
 				AllowMeteredBackend: cfg.Routing.AllowMeteredBackend,
+				Tiers:               buildFleetEffectiveRoutingTiers(cfg),
 			},
+		},
+		Pipeline: fleetEffectivePipeline{
+			Planner:     fleetEffectivePipelineRoleFrom(cfg.Pipeline.Planner),
+			Implementer: fleetEffectivePipelineRoleFrom(cfg.Pipeline.Implementer),
+			Validator:   fleetEffectivePipelineRoleFrom(cfg.Pipeline.Validator),
 		},
 		MaxParallel: cfg.MaxParallel,
 		ReviewGate:  strings.TrimSpace(cfg.ReviewGate),
@@ -4060,6 +4088,43 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 		},
 		ApprovalAction: config.SupervisorActionChangeGlobalConfig,
 		Settings:       buildFleetSettingSources(cfg),
+	}
+}
+
+func buildFleetEffectiveRoutingTiers(cfg *config.Config) []fleetEffectiveRoutingTier {
+	if cfg == nil || len(cfg.Routing.Tiers) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Routing.Tiers))
+	for name := range cfg.Routing.Tiers {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		li, lj := cfg.Routing.Tiers[names[i]], cfg.Routing.Tiers[names[j]]
+		if li.Rank != lj.Rank {
+			return li.Rank < lj.Rank
+		}
+		return names[i] < names[j]
+	})
+	out := make([]fleetEffectiveRoutingTier, 0, len(names))
+	for _, name := range names {
+		tier := cfg.Routing.Tiers[name]
+		out = append(out, fleetEffectiveRoutingTier{
+			Name:    name,
+			Backend: strings.TrimSpace(tier.Backend),
+			Effort:  strings.TrimSpace(tier.Effort),
+			Model:   strings.TrimSpace(tier.Model),
+			Rank:    tier.Rank,
+		})
+	}
+	return out
+}
+
+func fleetEffectivePipelineRoleFrom(role config.RoleConfig) fleetEffectivePipelineRole {
+	return fleetEffectivePipelineRole{
+		Enabled: role.Enabled,
+		Backend: strings.TrimSpace(role.Backend),
+		Effort:  strings.TrimSpace(role.Effort),
 	}
 }
 

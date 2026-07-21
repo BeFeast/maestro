@@ -102,6 +102,20 @@ func TestBackendEffortDefault_ClaudeEmitsEffort(t *testing.T) {
 	}
 }
 
+func TestBackendEffortDefault_ClaudeReplacesStalePinnedEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "claude", config.BackendDef{
+		Cmd:       "claude --model opus --effort xhigh",
+		ExtraArgs: []string{"--effort", "medium"},
+		Effort:    "high",
+	})
+	if strings.Contains(args, "--effort xhigh") || strings.Contains(args, "--effort medium") {
+		t.Errorf("stale claude effort pin survived backend effort update: %s", args)
+	}
+	if strings.Count(args, "--effort") != 1 || !strings.Contains(args, "--effort high") {
+		t.Errorf("claude args should contain exactly backend effort high: %s", args)
+	}
+}
+
 func TestBackendEffortDefault_CodexEmitsReasoningEffort(t *testing.T) {
 	args := buildArgsFromDef(t, "codex", config.BackendDef{Cmd: "codex", Effort: "high"})
 	if !strings.Contains(args, "model_reasoning_effort=high") {
@@ -109,6 +123,20 @@ func TestBackendEffortDefault_CodexEmitsReasoningEffort(t *testing.T) {
 	}
 	if strings.Contains(args, "--effort") {
 		t.Errorf("codex must not use --effort for backend effort: %s", args)
+	}
+}
+
+func TestBackendEffortDefault_CodexReplacesStalePinnedEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "codex", config.BackendDef{
+		Cmd:       "codex -c model_reasoning_effort=xhigh",
+		ExtraArgs: []string{"-c", "model_reasoning_effort=medium"},
+		Effort:    "high",
+	})
+	if strings.Contains(args, "model_reasoning_effort=xhigh") || strings.Contains(args, "model_reasoning_effort=medium") {
+		t.Errorf("stale codex effort pin survived backend effort update: %s", args)
+	}
+	if strings.Count(args, "model_reasoning_effort=") != 1 || !strings.Contains(args, "model_reasoning_effort=high") {
+		t.Errorf("codex args should contain exactly backend reasoning effort high: %s", args)
 	}
 }
 
@@ -130,17 +158,17 @@ func TestTierArgv_OperatorPinnedModelWins(t *testing.T) {
 	}
 }
 
-func TestTierArgv_OperatorPinnedCodexEffortWins(t *testing.T) {
+func TestTierArgv_CodexEffortOverrideReplacesPinnedEffort(t *testing.T) {
 	args := buildArgs(t, "codex", BackendConfig{
 		Cmd:        "codex",
 		ExtraArgs:  []string{"-c", "model_reasoning_effort=xhigh"},
 		TierEffort: "low",
 	})
-	if strings.Contains(args, "model_reasoning_effort=low") {
-		t.Errorf("tier effort must not override operator-pinned codex effort: %s", args)
+	if strings.Contains(args, "model_reasoning_effort=xhigh") {
+		t.Errorf("stale operator-pinned codex effort must not override configured effort: %s", args)
 	}
-	if !strings.Contains(args, "model_reasoning_effort=xhigh") {
-		t.Errorf("operator-pinned codex effort missing: %s", args)
+	if strings.Count(args, "model_reasoning_effort=") != 1 || !strings.Contains(args, "model_reasoning_effort=low") {
+		t.Errorf("configured codex effort missing or duplicated: %s", args)
 	}
 }
 

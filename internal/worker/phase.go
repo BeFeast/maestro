@@ -43,10 +43,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
 		return err
 	}
-	// #841: thread the phase role's effort override into the worker argv via the
-	// existing tier-effort path (claude --effort, codex -c model_reasoning_effort;
-	// gemini drops it). An operator-pinned effort still wins — appendTierModelEffort
-	// skips the override when the flag is already present in cmd/extra_args.
+	// #841/#900: thread the phase role's effort override into the worker argv via
+	// the existing tier-effort path (claude --effort, codex -c
+	// model_reasoning_effort; gemini drops it).
 	if effort := pipeline.EffortForPhase(cfg, sess.Phase); effort != "" {
 		backendCfg.TierEffort = effort
 	}

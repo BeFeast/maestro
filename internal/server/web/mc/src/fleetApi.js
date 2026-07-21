@@ -776,8 +776,10 @@ function mapEffectiveConfig(raw) {
         routerModel: String((policy.routing || {}).router_model || ""),
         routerModelName: String((policy.routing || {}).router_model_name || ""),
         allowMeteredBackend: (policy.routing || {}).allow_metered_backend === true,
+        tiers: Array.isArray((policy.routing || {}).tiers) ? (policy.routing || {}).tiers.map(mapEffectiveRoutingTier) : [],
       },
     },
+    pipeline: mapEffectivePipeline(raw.pipeline),
     maxParallel: Number(raw.max_parallel || 0),
     reviewGate: String(raw.review_gate || ""),
     labels: {
@@ -852,6 +854,29 @@ function mapEffectiveBackend(raw) {
     outputUSDPerMtok: Number(raw?.output_usd_per_mtok || 0),
     pricingClass: String(raw?.pricing_class || ""),
     metered: raw?.metered === true,
+  };
+}
+
+function mapEffectiveRoutingTier(raw) {
+  return {
+    name: String(raw?.name || ""),
+    backend: String(raw?.backend || ""),
+    effort: String(raw?.effort || ""),
+    model: String(raw?.model || ""),
+    rank: Number(raw?.rank || 0),
+  };
+}
+
+function mapEffectivePipeline(raw) {
+  const role = value => ({
+    enabled: value?.enabled === true,
+    backend: String(value?.backend || ""),
+    effort: String(value?.effort || ""),
+  });
+  return {
+    planner: role(raw?.planner || {}),
+    implementer: role(raw?.implementer || {}),
+    validator: role(raw?.validator || {}),
   };
 }
 

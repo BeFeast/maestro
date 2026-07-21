@@ -450,6 +450,17 @@ func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 			SafeActions:             []string{config.SupervisorActionAddIssueComment},
 			CompletionGates:         config.SupervisorCompletionGatesConfig{RequiredLabels: []string{"runtime-verified"}},
 		},
+		Routing: config.RoutingConfig{
+			Mode: "policy",
+			Tiers: map[string]config.RoutingTier{
+				"cheap":  {Backend: "codex", Effort: "low", Rank: 1},
+				"strong": {Backend: "codex", Effort: "high", Model: "gpt-5.5", Rank: 2},
+			},
+		},
+		Pipeline: config.PipelineConfig{
+			Planner:     config.RoleConfig{Enabled: true, Backend: "codex", Effort: "high"},
+			Implementer: config.RoleConfig{Backend: "codex", Effort: "low"},
+		},
 		SessionRetention: config.SessionRetentionConfig{
 			KeepLast:    12,
 			MinAgeDays:  3,
@@ -503,6 +514,12 @@ func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 	}
 	if !codex.Enabled || codex.Provider != "openai" || codex.Model != "gpt-5.5" || !codex.PriceConfigured {
 		t.Fatalf("codex backend = %+v", codex)
+	}
+	if len(eff.ModelPolicy.Routing.Tiers) != 2 || eff.ModelPolicy.Routing.Tiers[0].Name != "cheap" || eff.ModelPolicy.Routing.Tiers[1].Effort != "high" {
+		t.Fatalf("routing tiers = %+v", eff.ModelPolicy.Routing.Tiers)
+	}
+	if eff.Pipeline.Planner.Effort != "high" || eff.Pipeline.Implementer.Effort != "low" {
+		t.Fatalf("pipeline effort overrides = %+v", eff.Pipeline)
 	}
 }
 

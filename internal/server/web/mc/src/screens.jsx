@@ -2334,6 +2334,8 @@ function EffectiveConfigView({ project, onEdit }) {
         <div className="kv"><span>Default</span><strong className="mono">{cfg.modelPolicy?.default || "—"}</strong></div>
         <div className="kv"><span>Fallbacks</span><TagList values={cfg.modelPolicy?.fallbackBackends} /></div>
         <div className="kv"><span>Routing</span><span className="mono">{routingLabel(cfg.modelPolicy?.routing)}</span></div>
+        <RoutingTierList tiers={cfg.modelPolicy?.routing?.tiers} />
+        <PipelineOverrideList pipeline={cfg.pipeline} />
         <div className="settings-backends">
           {(cfg.modelPolicy?.backends || []).map(backend => (
             <div key={backend.name} className="settings-backend">
@@ -2412,6 +2414,46 @@ function TagList({ values, empty = "—" }) {
   const list = (values || []).filter(Boolean);
   if (!list.length) return <span className="dim">{empty}</span>;
   return <span className="settings-tags">{list.map(v => <span key={v} className="mono">{v}</span>)}</span>;
+}
+
+function RoutingTierList({ tiers }) {
+  const rows = Array.isArray(tiers) ? tiers.filter(t => t?.name) : [];
+  if (!rows.length) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Routing tiers</div>
+      {rows.map(tier => (
+        <div key={tier.name} className="kv">
+          <span className="mono">{tier.name}</span>
+          <strong className="mono">
+            {[tier.backend, tier.model, tier.effort].filter(Boolean).join(" · ") || "—"}
+          </strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PipelineOverrideList({ pipeline }) {
+  const roles = [
+    ["planner", pipeline?.planner],
+    ["implementer", pipeline?.implementer],
+    ["validator", pipeline?.validator],
+  ].filter(([, role]) => role?.backend || role?.effort || role?.enabled);
+  if (!roles.length) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Pipeline phase overrides</div>
+      {roles.map(([name, role]) => (
+        <div key={name} className="kv">
+          <span className="mono">{name}</span>
+          <strong className="mono">
+            {[role.backend, role.effort].filter(Boolean).join(" · ") || (role.enabled ? "enabled" : "—")}
+          </strong>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function routingLabel(routing) {
