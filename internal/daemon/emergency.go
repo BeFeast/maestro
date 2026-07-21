@@ -152,10 +152,15 @@ func emergencyNotifierFor(cfgs []*config.Config) *notify.Notifier {
 		if cfg == nil {
 			continue
 		}
-		if strings.TrimSpace(cfg.Telegram.Target) == "" {
+		// Prefer a project that configures notifications (Telegram target or the
+		// ntfy transport) so the notify_red-grade alert reaches an operator via
+		// at least one channel (#1018).
+		if strings.TrimSpace(cfg.Telegram.Target) == "" && !cfg.Notify.Ntfy.Enabled() {
 			continue
 		}
-		return notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+		n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
+		return n
 	}
 	return nil
 }

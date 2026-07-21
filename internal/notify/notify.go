@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +18,34 @@ type Notifier struct {
 	Mode        string // "direct" (Telegram Bot API) or "openclaw" (OpenClaw relay)
 	OpenclawURL string
 
+	// ntfy push transport (#1018). When NtfyBaseURL+NtfyTopic are set, the
+	// alert-class router fans out to ntfy via a plain HTTP POST. NtfyToken is
+	// resolved from the environment by the caller — never stored in config.
+	NtfyBaseURL string
+	NtfyTopic   string
+	NtfyToken   string
+
 	mu         sync.Mutex
 	digestMode bool
 	buffer     []string
+	// alertState dedups (class,key) alerts: the last body sent per identity.
+	// An alert whose body equals the last-sent body is a no-op (no state
+	// change), so a supervisor cycle re-emitting the same condition sends once.
+	alertState map[string]string
+}
+
+// WithNtfy configures the ntfy push transport and returns the notifier for
+// chaining. base and topic empty leaves the transport disabled.
+func (n *Notifier) WithNtfy(base, topic, token string) *Notifier {
+	n.NtfyBaseURL = base
+	n.NtfyTopic = topic
+	n.NtfyToken = token
+	return n
+}
+
+// NtfyConfigured reports whether the ntfy transport can POST.
+func (n *Notifier) NtfyConfigured() bool {
+	return strings.TrimSpace(n.NtfyBaseURL) != "" && strings.TrimSpace(n.NtfyTopic) != ""
 }
 
 func New(openclawURL, target string) *Notifier {
@@ -148,4 +174,76 @@ func (n *Notifier) Sendf(format string, args ...any) {
 	if err := n.Send(fmt.Sprintf(format, args...)); err != nil {
 		log.Printf("[notify] failed to send: %v", err)
 	}
+}
+
+// Alert emits a classified operator alert (#1018). The class selects the ntfy
+// priority + tags; key is the dedup identity (e.g. "project:gate"); title and
+// body are the human-readable payload.
+//
+// Dedup is per-state-change: for a given (class,key) the alert fires once, then
+// stays silent until body differs from the last-sent body. This mirrors the
+// digest/notify contract so a supervisor loop re-detecting the same condition
+// every cycle produces one notification, not one per cycle.
+//
+// The alert fans out to the ntfy transport when configured; a nil-config ntfy
+// is a no-op. Returns the ntfy send error (nil when ntfy is not configured).
+func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
+	stateKey := string(class) + "\x00" + key
+
+	n.mu.Lock()
+	if n.alertState == nil {
+		n.alertState = make(map[string]string)
+	}
+	if last, ok := n.alertState[stateKey]; ok && last == body {
+		n.mu.Unlock()
+		return nil // no state change since last send — dedup
+	}
+	n.alertState[stateKey] = body
+	n.mu.Unlock()
+
+	if !n.NtfyConfigured() {
+		return nil
+	}
+	route := RouteFor(class)
+	return n.sendNtfy(title, body, route)
+}
+
+// ResetAlertState clears the dedup memory (test/rotation helper).
+func (n *Notifier) ResetAlertState() {
+	n.mu.Lock()
+	n.alertState = nil
+	n.mu.Unlock()
+}
+
+func (n *Notifier) sendNtfy(title, body string, route AlertRoute) error {
+	base := strings.TrimRight(strings.TrimSpace(n.NtfyBaseURL), "/")
+	topic := strings.Trim(strings.TrimSpace(n.NtfyTopic), "/")
+	url := base + "/" + topic
+
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("ntfy request: %w", err)
+	}
+	if title != "" {
+		req.Header.Set("Title", title)
+	}
+	if route.Priority > 0 {
+		req.Header.Set("Priority", strconv.Itoa(route.Priority))
+	}
+	if len(route.Tags) > 0 {
+		req.Header.Set("Tags", strings.Join(route.Tags, ","))
+	}
+	if tok := strings.TrimSpace(n.NtfyToken); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("ntfy post: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("ntfy returned %d", resp.StatusCode)
+	}
+	return nil
 }

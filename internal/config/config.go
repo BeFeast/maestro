@@ -33,6 +33,41 @@ type TelegramConfig struct {
 	DigestMode  bool   `yaml:"digest_mode"`  // batch notifications per cycle instead of sending immediately
 }
 
+// NotifyConfig (#1018) carries lightweight push-notification transports that
+// live alongside the Telegram digest channel. The first transport is ntfy —
+// a plain HTTP POST push channel the supervisor/orchestrator/watchdog use to
+// emit alert-class notifications (gate-fail streaks, idle stalls, delivery
+// advances). Absent config = no ntfy fan-out; the Telegram path is unaffected.
+type NotifyConfig struct {
+	Ntfy NtfyConfig `yaml:"ntfy"`
+}
+
+// NtfyConfig configures the ntfy push transport. Topic is a per-project value
+// (fleet config supplies the default, a project overrides it). The auth token
+// is NEVER stored in config or repo: TokenEnv names an environment variable /
+// secret-store key the process reads at send time.
+type NtfyConfig struct {
+	BaseURL  string `yaml:"base_url"`  // e.g. https://ntfy.sh or a self-hosted base URL
+	Topic    string `yaml:"topic"`     // per-project topic (fleet default, project override)
+	TokenEnv string `yaml:"token_env"` // env var name holding the bearer token; the token itself is never stored here
+}
+
+// Enabled reports whether the ntfy transport has enough config to POST.
+func (c NtfyConfig) Enabled() bool {
+	return strings.TrimSpace(c.BaseURL) != "" && strings.TrimSpace(c.Topic) != ""
+}
+
+// Token resolves the ntfy bearer token from the configured env var. Returns ""
+// when TokenEnv is unset or the env var is unset/empty. Callers treat "" as
+// "unauthenticated ntfy" (public topics need no token).
+func (c NtfyConfig) Token() string {
+	env := strings.TrimSpace(c.TokenEnv)
+	if env == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv(env))
+}
+
 // BackendDef defines a model backend CLI.
 type BackendDef struct {
 	Cmd        string    `yaml:"cmd"`
@@ -1926,6 +1961,7 @@ type Config struct {
 	MergeExhaustedNonCriticalReview *bool                         `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
 	AutoRetryRebaseConflicts        bool                          `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts
 	Telegram                        TelegramConfig                `yaml:"telegram"`
+	Notify                          NotifyConfig                  `yaml:"notify"` // #1018: ntfy push transport + alert-class routing
 	Versioning                      VersioningConfig              `yaml:"versioning"`
 	SelfDeploy                      SelfDeployConfig              `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
 	GitHubProjects                  GitHubProjectsConfig          `yaml:"github_projects"`
