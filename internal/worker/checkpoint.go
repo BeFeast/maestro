@@ -23,6 +23,7 @@ import (
 const tmuxSpawnReconcileAttempts = 3
 
 var (
+	tmuxSessionExists = tmuxsession.HasSession
 	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
 		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath)
 	}

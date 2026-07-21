@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -67,9 +68,29 @@ func TmuxPanePID(session string) (int, error) {
 // backendName selects the model backend ("claude", "codex", etc.); empty defaults to config.
 func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string) (string, error) {
 	slotName := s.NextSlotName(cfg.SessionPrefix)
+	return StartReserved(cfg, s, repo, issue, promptBase, backendName, slotName)
+}
+
+// BranchName returns the deterministic branch identity for a fresh dispatch.
+// The orchestrator persists this beside the reserved slot before worker setup
+// begins so an interrupted start can be resumed in place without allocating a
+// duplicate branch or worktree.
+func BranchName(slotName string, issue github.Issue) string {
+	return fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+}
+
+// StartReserved starts or adopts a fresh worker on an already-reserved exact
+// slot. If a prior owner crashed after launching tmux but before committing the
+// Session, the exact tmux/worktree/branch identity is adopted. If setup created
+// the canonical worktree but no process, it is reused in place. Mismatched or
+// invalid identities fail closed and are never deleted.
+func StartReserved(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string, slotName string) (string, error) {
+	if cfg == nil || s == nil || strings.TrimSpace(slotName) == "" {
+		return "", fmt.Errorf("reserved worker start requires config, state, and slot")
+	}
 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
-	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+	branchName := BranchName(slotName, issue)
 
 	// Resolve and validate the backend before creating a worktree or running the
 	// pre-worker pipeline. A positive hard budget must fail closed before any
@@ -92,17 +113,53 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		return "", err
 	}
 
-	// #734: sync the local base branch to origin so the worker branches from an
-	// up-to-date base, then root the worktree directly at origin/main. A stale
-	// or diverged base fails loudly here rather than silently branching from it.
-	if err := SyncBaseBranch(cfg.LocalPath, defaultBaseBranch); err != nil {
-		return "", fmt.Errorf("sync base branch before spawning worker: %w", err)
+	// The process may already exist when a previous owner died between tmux
+	// launch and the atomic state commit. Adopt only the exact canonical pane;
+	// a session-name match without worktree+branch proof is not sufficient.
+	tmuxName := TmuxSessionName(slotName)
+	if tmuxSessionExists(tmuxName) {
+		pid, panePath, err := TmuxPaneIdentity(tmuxName)
+		if err != nil {
+			return "", fmt.Errorf("inspect reserved tmux session %s: %w", tmuxName, err)
+		}
+		if !sameCleanPath(panePath, worktreePath) {
+			return "", fmt.Errorf("reserved tmux session %s runs in %q, want canonical worktree %q", tmuxName, panePath, worktreePath)
+		}
+		if err := validateExactWorktreeIdentity(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", fmt.Errorf("validate reserved live worker identity: %w", err)
+		}
+		startedAt := time.Now().UTC()
+		logFile := filepath.Join(state.LogDir(cfg.StateDir), slotName+".log")
+		s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, startedAt)
+		recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn_adopted", "", startedAt)
+		log.Printf("[worker] adopted reserved worker %s in tmux session %s (pane_pid=%d)", slotName, tmuxName, pid)
+		return slotName, nil
 	}
 
-	// Create worktree
-	log.Printf("[worker] creating worktree %s on branch %s", worktreePath, branchName)
-	if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
-		return "", err
+	if info, err := os.Stat(worktreePath); err == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf("reserved worktree path %s exists but is not a directory", worktreePath)
+		}
+		if err := validateExactWorktreeIdentity(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", err
+		}
+		log.Printf("[worker] reusing reserved worktree %s on branch %s", worktreePath, branchName)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat reserved worktree %s: %w", worktreePath, err)
+	} else if localBranchExists(cfg.LocalPath, branchName) {
+		if err := RestoreMissingWorktree(cfg.LocalPath, cfg.WorktreeBase, slotName, worktreePath, branchName); err != nil {
+			return "", err
+		}
+	} else {
+		// #734: sync the local base branch to origin so the worker branches from
+		// an up-to-date base, then root the worktree directly at origin/main.
+		if err := SyncBaseBranch(cfg.LocalPath, defaultBaseBranch); err != nil {
+			return "", fmt.Errorf("sync base branch before spawning worker: %w", err)
+		}
+		log.Printf("[worker] creating reserved worktree %s on branch %s", worktreePath, branchName)
+		if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", err
+		}
 	}
 
 	// Run after_create hook
@@ -180,43 +237,58 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 
 	// Start tmux session
-	tmuxName := TmuxSessionName(slotName)
-	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
-		return "", fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
-	}
-
-	// Get PID of the shell running inside the tmux pane
-	pidOut, err := tmuxsession.PanePID(tmuxName)
+	pid, err := startOrReconcileTmuxSession(tmuxName, worktreePath, runnerPath, 0)
 	if err != nil {
-		return "", fmt.Errorf("tmux list-panes: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
-	if err != nil {
-		return "", fmt.Errorf("parse pane pid: %w", err)
+		return "", err
 	}
 
 	log.Printf("[worker] started %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
 
 	// Save session to state
 	startedAt := time.Now().UTC()
-	s.Sessions[slotName] = &state.Session{
-		IssueNumber:      issue.Number,
-		IssueTitle:       issue.Title,
-		Worktree:         worktreePath,
-		Branch:           branchName,
-		PID:              pid,
-		TmuxSession:      tmuxName,
-		LogFile:          logFile,
-		StartedAt:        startedAt,
-		WorkerGeneration: 1,
-		Status:           state.StatusRunning,
-		Backend:          backendName,
-	}
+	s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, startedAt)
 	// #513: stamp the first attribution segment for this session.
 	recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn", "", startedAt)
 	s.ReconcileSpawnWorkerApprovalsForStartedSession(slotName, s.Sessions[slotName], startedAt)
 
 	return slotName, nil
+}
+
+func localBranchExists(localPath, branch string) bool {
+	if strings.TrimSpace(localPath) == "" || strings.TrimSpace(branch) == "" {
+		return false
+	}
+	return exec.Command("git", "-C", localPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
+}
+
+func validateExactWorktreeIdentity(localPath, worktree, branch string) error {
+	if !isGitWorktreeForRepo(localPath, worktree) {
+		return fmt.Errorf("reserved path %s is not a worktree for the configured repository", worktree)
+	}
+	out, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("inspect reserved worktree branch: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if current := strings.TrimSpace(string(out)); current != strings.TrimSpace(branch) {
+		return fmt.Errorf("reserved worktree is on branch %q, want %q", current, branch)
+	}
+	return nil
+}
+
+func freshRunningSession(issue github.Issue, worktree, branch string, pid int, tmuxName, logFile, backend string, startedAt time.Time) *state.Session {
+	return &state.Session{
+		IssueNumber:      issue.Number,
+		IssueTitle:       issue.Title,
+		Worktree:         worktree,
+		Branch:           branch,
+		PID:              pid,
+		TmuxSession:      tmuxName,
+		LogFile:          logFile,
+		StartedAt:        startedAt.UTC(),
+		WorkerGeneration: 1,
+		Status:           state.StatusRunning,
+		Backend:          backend,
+	}
 }
 
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
