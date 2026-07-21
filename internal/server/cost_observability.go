@@ -13,9 +13,10 @@ import (
 // answer "how much did each backend / each issue burn today, this week"
 // before turning up max_parallel or adding another project.
 //
-// The aggregation reads only the per-session counters already persisted
-// on state.Session (TokensUsedTotal, Backend, FinishedAt/StartedAt). No
-// new on-disk fields are required.
+// The aggregation reads the per-session counters and backend attribution
+// already persisted on state.Session. Usage-unreliable sessions remain in the
+// rollup even when their token lower bound is zero, so the API never describes
+// missing telemetry as "no activity".
 type fleetCostObservability struct {
 	// WindowToday is the local-day rollup (UTC midnight floor).
 	WindowToday fleetCostWindow `json:"window_today"`
@@ -35,17 +36,19 @@ type fleetCostObservability struct {
 }
 
 // fleetCostWindow carries token + USD totals for one time window. USD
-// is the estimate computed via BackendPricing.EstimateCostUSD; tokens
-// are exact. PricedTokens / UnpricedTokens split the same tokens by
+// is the estimate computed via BackendPricing.EstimateCostUSD; tokens are
+// exact unless UsageUnreliableSessions is non-zero, in which case they are a
+// lower bound. PricedTokens / UnpricedTokens split the same tokens by
 // whether the backend has pricing configured — this lets the SPA tell
 // the operator "today: 1.2M tokens, $14.30 priced + 200K from
 // backends without rates".
 type fleetCostWindow struct {
-	Tokens         int     `json:"tokens"`
-	PricedTokens   int     `json:"priced_tokens"`
-	UnpricedTokens int     `json:"unpriced_tokens"`
-	USD            float64 `json:"usd"`
-	Sessions       int     `json:"sessions"`
+	Tokens                  int     `json:"tokens"`
+	PricedTokens            int     `json:"priced_tokens"`
+	UnpricedTokens          int     `json:"unpriced_tokens"`
+	USD                     float64 `json:"usd"`
+	Sessions                int     `json:"sessions"`
+	UsageUnreliableSessions int     `json:"usage_unreliable_sessions,omitempty"`
 }
 
 // fleetCostBackend is one backend row in the per-backend rollup.
@@ -67,12 +70,13 @@ type fleetCostBackend struct {
 // retries are visible. The SPA renders this on the worker / issue
 // drawer next to the current attempt's counters.
 type fleetCostIssue struct {
-	IssueNumber int      `json:"issue_number"`
-	IssueTitle  string   `json:"issue_title,omitempty"`
-	Tokens      int      `json:"tokens"`
-	USD         float64  `json:"usd"`
-	Sessions    int      `json:"sessions"`
-	Backends    []string `json:"backends,omitempty"`
+	IssueNumber             int      `json:"issue_number"`
+	IssueTitle              string   `json:"issue_title,omitempty"`
+	Tokens                  int      `json:"tokens"`
+	USD                     float64  `json:"usd"`
+	Sessions                int      `json:"sessions"`
+	UsageUnreliableSessions int      `json:"usage_unreliable_sessions,omitempty"`
+	Backends                []string `json:"backends,omitempty"`
 }
 
 // maxFleetCostIssues bounds the per-issue table size. Picked to keep
@@ -103,12 +107,13 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 		lifetime fleetCostWindow
 	}
 	type issueRow struct {
-		issue    int
-		title    string
-		tokens   int
-		usd      float64
-		sessions int
-		backends map[string]struct{}
+		issue                   int
+		title                   string
+		tokens                  int
+		usd                     float64
+		sessions                int
+		usageUnreliableSessions int
+		backends                map[string]struct{}
 	}
 
 	backends := make(map[string]*backendRow)
@@ -120,12 +125,13 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 			continue
 		}
 		tokens := sess.TokensUsedTotal
-		if tokens <= 0 {
+		usd := sessionCostUSD(sess, pricing)
+		usageUnreliable := state.SessionUsageAccountingUnreliable(sess)
+		if tokens <= 0 && usd <= 0 && !usageUnreliable {
 			continue
 		}
 		stamp := sessionCostTimestamp(sess)
 		backend := sess.Backend
-		usd := sessionCostUSD(sess, pricing)
 		priced := priceConfigured(backend)
 
 		row, ok := backends[backend]
@@ -133,16 +139,16 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 			row = &backendRow{}
 			backends[backend] = row
 		}
-		applyCostWindow(&row.lifetime, tokens, usd, priced, 1)
-		applyCostWindow(&out.Lifetime, tokens, usd, priced, 1)
+		applyCostWindow(&row.lifetime, tokens, usd, priced, 1, usageUnreliable)
+		applyCostWindow(&out.Lifetime, tokens, usd, priced, 1, usageUnreliable)
 		if !stamp.IsZero() {
 			if !stamp.Before(dayStart) {
-				applyCostWindow(&row.today, tokens, usd, priced, 1)
-				applyCostWindow(&out.WindowToday, tokens, usd, priced, 1)
+				applyCostWindow(&row.today, tokens, usd, priced, 1, usageUnreliable)
+				applyCostWindow(&out.WindowToday, tokens, usd, priced, 1, usageUnreliable)
 			}
 			if !stamp.Before(weekStart) {
-				applyCostWindow(&row.week, tokens, usd, priced, 1)
-				applyCostWindow(&out.Window7D, tokens, usd, priced, 1)
+				applyCostWindow(&row.week, tokens, usd, priced, 1, usageUnreliable)
+				applyCostWindow(&out.Window7D, tokens, usd, priced, 1, usageUnreliable)
 			}
 		}
 
@@ -158,6 +164,9 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 			ir.tokens += tokens
 			ir.usd += usd
 			ir.sessions++
+			if usageUnreliable {
+				ir.usageUnreliableSessions++
+			}
 			if backend != "" {
 				ir.backends[backend] = struct{}{}
 			}
@@ -206,12 +215,13 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 		}
 		sort.Strings(backendList)
 		out.PerIssue = append(out.PerIssue, fleetCostIssue{
-			IssueNumber: ir.issue,
-			IssueTitle:  ir.title,
-			Tokens:      ir.tokens,
-			USD:         ir.usd,
-			Sessions:    ir.sessions,
-			Backends:    backendList,
+			IssueNumber:             ir.issue,
+			IssueTitle:              ir.title,
+			Tokens:                  ir.tokens,
+			USD:                     ir.usd,
+			Sessions:                ir.sessions,
+			UsageUnreliableSessions: ir.usageUnreliableSessions,
+			Backends:                backendList,
 		})
 	}
 	sort.Slice(out.PerIssue, func(i, j int) bool {
@@ -227,7 +237,7 @@ func buildFleetCostObservability(cfg *config.Config, st *state.State, now time.T
 }
 
 // applyCostWindow accumulates a session into a window bucket.
-func applyCostWindow(w *fleetCostWindow, tokens int, usd float64, priced bool, sessions int) {
+func applyCostWindow(w *fleetCostWindow, tokens int, usd float64, priced bool, sessions int, usageUnreliable bool) {
 	w.Tokens += tokens
 	if priced {
 		w.PricedTokens += tokens
@@ -236,6 +246,9 @@ func applyCostWindow(w *fleetCostWindow, tokens int, usd float64, priced bool, s
 	}
 	w.USD += usd
 	w.Sessions += sessions
+	if usageUnreliable {
+		w.UsageUnreliableSessions += sessions
+	}
 }
 
 // backendPricingMap returns the per-backend pricing table from a config
@@ -362,6 +375,7 @@ func mergeCostWindow(dst *fleetCostWindow, src fleetCostWindow) {
 	dst.UnpricedTokens += src.UnpricedTokens
 	dst.USD += src.USD
 	dst.Sessions += src.Sessions
+	dst.UsageUnreliableSessions += src.UsageUnreliableSessions
 }
 
 // applySessionCostEstimate returns the USD estimate for a single

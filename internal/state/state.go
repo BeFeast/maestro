@@ -326,17 +326,25 @@ const (
 // rate-limit fallover or pipeline-phase machinery respawns it on a
 // different backend.
 type BackendAttribution struct {
-	Backend   string     `json:"backend"`              // shim name (claude, codex, freellm, opencode, …)
-	Provider  string     `json:"provider,omitempty"`   // anthropic, openai, groq, …
-	Model     string     `json:"model,omitempty"`      // opus-4.8, gpt-5.5, llama-3.3-70b-versatile, …
-	Variant   string     `json:"variant,omitempty"`    // opus[1m], fast, sonnet, …
-	Effort    string     `json:"effort,omitempty"`     // xhigh, medium, low, …
-	TaskType  string     `json:"task_type,omitempty"`  // router classification: refactor, bugfix, test, vision, design, docs, infra
-	StartedAt time.Time  `json:"started_at"`           // when this segment became active
-	EndedAt   *time.Time `json:"ended_at,omitempty"`   // when the segment was closed; nil if still active
-	EndReason string     `json:"end_reason,omitempty"` // why the segment closed: "completed", "provider_limit", "fallover", "in_place_respawn", "killed"
-	Reason    string     `json:"reason,omitempty"`     // why this segment was started: "initial_spawn", "fallover", "in_place_respawn", "phase_transition"
+	Backend               string     `json:"backend"`                           // shim name (claude, codex, freellm, opencode, …)
+	Provider              string     `json:"provider,omitempty"`                // anthropic, openai, groq, …
+	Model                 string     `json:"model,omitempty"`                   // opus-4.8, gpt-5.5, llama-3.3-70b-versatile, …
+	Variant               string     `json:"variant,omitempty"`                 // opus[1m], fast, sonnet, …
+	Effort                string     `json:"effort,omitempty"`                  // xhigh, medium, low, …
+	TaskType              string     `json:"task_type,omitempty"`               // router classification: refactor, bugfix, test, vision, design, docs, infra
+	UsageUnreliable       bool       `json:"usage_unreliable,omitempty"`        // provider stream omitted plausible input/output usage for live budgets or terminal accounting
+	UsageUnreliableReason string     `json:"usage_unreliable_reason,omitempty"` // stable secret-free reason for the degradation
+	UsageUnreliableScope  string     `json:"usage_unreliable_scope,omitempty"`  // live_budget (terminal totals still usable) or accounting (session totals are a lower bound)
+	StartedAt             time.Time  `json:"started_at"`                        // when this segment became active
+	EndedAt               *time.Time `json:"ended_at,omitempty"`                // when the segment was closed; nil if still active
+	EndReason             string     `json:"end_reason,omitempty"`              // why the segment closed: "completed", "provider_limit", "fallover", "in_place_respawn", "killed"
+	Reason                string     `json:"reason,omitempty"`                  // why this segment was started: "initial_spawn", "fallover", "in_place_respawn", "phase_transition"
 }
+
+const (
+	UsageUnreliableScopeLiveBudget = "live_budget"
+	UsageUnreliableScopeAccounting = "accounting"
+)
 
 // SessionAttention explains why a session needs operator attention and the
 // safest next action Maestro can infer from persisted state.
