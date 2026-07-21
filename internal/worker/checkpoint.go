@@ -284,6 +284,13 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 // with checkpoint context included in the prompt. Unlike Respawn, this preserves
 // the existing worktree with all committed and staged code.
 func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	// #959: assert the rendered issue matches the session's canonical
+	// issue_number before killing the current worker, so a slot-suffix-derived
+	// number can never respawn a mis-scoped worker in the preserved worktree.
+	if err := assertCanonicalIssue(slotName, sess, issue); err != nil {
+		return err
+	}
+
 	// Kill tmux session + process subtree (but do NOT remove worktree). Reaping
 	// the whole descendant tree — not just the recorded pane PID — ensures
 	// worker grandchildren that reparented away (e.g. headless Chrome) do not
@@ -349,6 +356,10 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	}
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
+	if err := assertCanonicalPrompt(slotName, sess.IssueNumber, prompt); err != nil {
+		return err
+	}
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
