@@ -110,8 +110,69 @@ func TestAwaitShutdownOrForceExitPrefersCompletedRun(t *testing.T) {
 
 	runDone := make(chan struct{})
 	close(runDone)
-	awaitShutdownOrForceExit(time.Now().Add(10*time.Millisecond), runDone)
+	awaitShutdownOrForceExit(time.Now().Add(10*time.Millisecond), runDone, nil)
 	if got := exitCalls.Load(); got != 0 {
 		t.Fatalf("forceExit calls = %d, want 0 after Run completed", got)
+	}
+}
+
+func TestHandleDaemonSignalStreamSecondSignalForcesImmediateExit(t *testing.T) {
+	oldGrace, oldForceExit := shutdownHandoffGrace, forceExit
+	shutdownHandoffGrace = 50 * time.Millisecond
+	defer func() {
+		shutdownHandoffGrace = oldGrace
+		forceExit = oldForceExit
+	}()
+
+	var exitCalls atomic.Int32
+	exited := make(chan struct{}, 1)
+	forceExit = func(code int) {
+		if code != 0 {
+			t.Errorf("forceExit code = %d, want 0", code)
+		}
+		if exitCalls.Add(1) == 1 {
+			exited <- struct{}{}
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake := &fakeDaemonShutdown{drainStarted: make(chan struct{})}
+	runDone := make(chan struct{}) // deliberately never closed: Run is wedged
+	signals := make(chan os.Signal, 2)
+	signals <- syscall.SIGTERM
+	handlerDone := make(chan struct{})
+	go func() {
+		handleDaemonSignalStream(ctx, cancel, fake, 5*time.Second, runDone, signals)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-fake.drainStarted:
+	case <-time.After(time.Second):
+		t.Fatal("drain did not start")
+	}
+	secondSignalAt := time.Now()
+	signals <- syscall.SIGTERM
+
+	select {
+	case <-exited:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("second signal retained the original hard deadline")
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("signal handler did not return after second signal")
+	}
+
+	fake.mu.Lock()
+	deadline := fake.shutdownDeadline
+	fake.mu.Unlock()
+	if deadline.After(secondSignalAt.Add(100 * time.Millisecond)) {
+		t.Fatalf("shutdown deadline = %v, want shortened to the second signal at %v", deadline, secondSignalAt)
+	}
+	if got := exitCalls.Load(); got != 1 {
+		t.Fatalf("forceExit calls = %d, want exactly 1", got)
 	}
 }

@@ -13,7 +13,7 @@ func TestOutputWithTimeoutKillsHungBackend(t *testing.T) {
 	started := time.Now()
 	// Ignore SIGTERM so this catches accidental use of the graceful worker
 	// reaper, whose two-second grace period would violate the hard deadline.
-	_, err := outputWithTimeout(exec.Command("sh", "-c", `trap '' TERM; while :; do sleep 1; done`), 25*time.Millisecond)
+	_, err := outputWithTimeout(exec.Command("sh", "-c", `trap '' TERM; while :; do :; done`), 25*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("error = %v, want timeout", err)
 	}

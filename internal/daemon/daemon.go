@@ -1016,6 +1016,8 @@ func (d *Daemon) DrainUntil(ctx context.Context, deadline time.Time) {
 	// Phase 2: wait for in-flight workers to finish across every flow.
 	ticker := time.NewTicker(drainPollInterval)
 	defer ticker.Stop()
+	deadlineTimer := time.NewTimer(remaining)
+	defer deadlineTimer.Stop()
 	lastReported := -1
 	for {
 		running := 0
@@ -1034,13 +1036,18 @@ func (d *Daemon) DrainUntil(ctx context.Context, deadline time.Time) {
 			log.Printf("[daemon] drain: complete — no in-flight workers remain")
 			return
 		}
-		if !time.Now().Before(deadline) {
+		select {
+		case <-deadlineTimer.C:
 			log.Printf("[daemon] drain: timed out after %s with %d worker(s) still running; proceeding with bounded shutdown", time.Since(started).Round(time.Millisecond), running)
 			return
+		default:
 		}
 		select {
 		case <-ctx.Done():
 			log.Printf("[daemon] drain: aborted (forced shutdown) with %d worker(s) still running", running)
+			return
+		case <-deadlineTimer.C:
+			log.Printf("[daemon] drain: timed out after %s with %d worker(s) still running; proceeding with bounded shutdown", time.Since(started).Round(time.Millisecond), running)
 			return
 		case <-ticker.C:
 		}

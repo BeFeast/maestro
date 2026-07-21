@@ -186,31 +186,31 @@ cleanup_build() {
 # targets the system manager via `sudo -n systemctl restart` (non-interactive,
 # mirroring --install-via-sudo), since restarting a system unit needs privilege.
 # Either way the unit's normal stop path runs, so drain semantics are honored.
-# The user-scope command is byte-for-byte unchanged from before scope support.
+# All configured units are passed to one systemctl invocation so they share the
+# same absolute restart budget instead of multiplying it per unit (#966).
 restart_units() {
-  local budget=$1 unit rc
+  local budget=$1 rc units
   local -a restart_cmd
   if [[ "$SCOPE" == "system" ]]; then
     restart_cmd=(sudo -n systemctl restart)
   else
     restart_cmd=(systemctl --user restart)
   fi
-  for unit in "${UNIT_LIST[@]}"; do
-    log "restarting $unit (scope=$SCOPE; honors the unit's stop/drain path; budget ${budget}s)"
-    if timeout "$budget" "${restart_cmd[@]}" "$unit"; then
-      continue
-    else
-      rc=$?
-    fi
-    if (( rc == 124 || rc == 137 )); then
-      RESTART_TIMED_OUT=1
-      RESTART_FAIL_DETAIL="restart of $unit exceeded the bounded drain/restart budget (${budget}s) while Fleet may be unavailable"
-    else
-      RESTART_FAIL_DETAIL="restart of $unit failed (rc=$rc)"
-    fi
-    log "$RESTART_FAIL_DETAIL"
-    return 1
-  done
+  units=${UNIT_LIST[*]}
+  log "restarting $units (scope=$SCOPE; honors each unit's stop/drain path; shared budget ${budget}s)"
+  if timeout "$budget" "${restart_cmd[@]}" "${UNIT_LIST[@]}"; then
+    return 0
+  else
+    rc=$?
+  fi
+  if (( rc == 124 || rc == 137 )); then
+    RESTART_TIMED_OUT=1
+    RESTART_FAIL_DETAIL="restart of configured unit(s) [$units] exceeded the shared bounded drain/restart budget (${budget}s) while Fleet may be unavailable"
+  else
+    RESTART_FAIL_DETAIL="restart of configured unit(s) [$units] failed (rc=$rc)"
+  fi
+  log "$RESTART_FAIL_DETAIL"
+  return 1
 }
 
 # units_active is scope-aware too (#716). The read-only liveness query needs no

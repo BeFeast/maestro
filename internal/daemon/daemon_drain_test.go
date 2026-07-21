@@ -197,6 +197,28 @@ func TestDrainReturnsAfterDefaultTimeoutWithStuckWorkers(t *testing.T) {
 	}
 }
 
+func TestDrainUntilWakesAtAbsoluteDeadlineBetweenPolls(t *testing.T) {
+	old := drainPollInterval
+	drainPollInterval = time.Second
+	defer func() { drainPollInterval = old }()
+
+	cfg := testConfig(t, "owner/deadline")
+	d := New(fakeLoader{cfgs: nil}, Options{})
+	d.flows[flowKey(cfg)] = &projectFlow{name: "deadline", key: flowKey(cfg), cfg: cfg}
+	seed := &state.State{Sessions: map[string]*state.Session{
+		"deadline-1": {Status: state.StatusRunning},
+	}}
+	if err := state.Save(cfg.StateDir, seed); err != nil {
+		t.Fatalf("seed running state: %v", err)
+	}
+
+	started := time.Now()
+	d.DrainUntil(context.Background(), started.Add(50*time.Millisecond))
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("DrainUntil returned after %v, want the absolute deadline rather than the 1s poll tick", elapsed)
+	}
+}
+
 // #966 production-topology regression: twelve flows, four isolated in-flight
 // workers, and one flow callback that ignores cancellation. Fleet stays reachable
 // while the worker drain is active; the global deadline then detaches the hung

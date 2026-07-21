@@ -154,14 +154,21 @@ func handleDaemonSignalStream(ctx context.Context, cancel context.CancelFunc, d 
 	log.Printf("received signal — draining flows in-process (no new workers; up to %s total, reserving %s for bounded handoff); the daemon exits on its own by the deadline even if a flow stop wedges — send the signal again to force shutdown now", drainTimeout, handoffGrace)
 	// Start the hard backstop before any drain state I/O. Even a wedged state
 	// load/save cannot leave maestro.service deactivating past the deadline.
-	go awaitShutdownOrForceExit(shutdownDeadline, runDone)
+	forceShutdown := make(chan struct{})
+	go awaitShutdownOrForceExit(shutdownDeadline, runDone, forceShutdown)
 	drainCtx, abortDrain := context.WithCancel(ctx)
 	defer abortDrain()
 	go func() {
 		select {
 		case <-signals:
 			log.Printf("received second signal — aborting drain and shutting down now")
+			// Shorten both Run's teardown deadline and the independent process-exit
+			// backstop. Cancelling DrainUntil alone would still let checkpointing or
+			// a stuck flow join consume the original multi-minute budget.
+			d.SetShutdownDeadline(time.Now())
 			abortDrain()
+			cancel()
+			close(forceShutdown)
 		case <-drainCtx.Done():
 		}
 	}()
@@ -186,7 +193,7 @@ func shutdownHandoffGraceFor(timeout time.Duration) time.Duration {
 // its budget, so detaching it is the correct recovery. Surviving isolated workers
 // keep their worktrees and are reconciled by the new daemon while Fleet comes
 // back instead of hanging in deactivating (#877, #966).
-func awaitShutdownOrForceExit(hardDeadline time.Time, runDone <-chan struct{}) {
+func awaitShutdownOrForceExit(hardDeadline time.Time, runDone, forceNow <-chan struct{}) {
 	remaining := time.Until(hardDeadline)
 	if remaining < 0 {
 		remaining = 0
@@ -196,6 +203,15 @@ func awaitShutdownOrForceExit(hardDeadline time.Time, runDone <-chan struct{}) {
 	select {
 	case <-runDone:
 		return
+	case <-forceNow:
+		// Resolve a simultaneous Run completion in favor of the clean return.
+		select {
+		case <-runDone:
+			return
+		default:
+		}
+		log.Printf("second shutdown signal received — force-exiting now so the restart handoff completes")
+		forceExit(0)
 	case <-timer.C:
 		// Resolve the timer/runDone race in favor of a clean return when Run closed
 		// concurrently with the deadline tick.

@@ -304,3 +304,39 @@ func TestRestartUnitsReportsBoundedDrainBudgetOverrun(t *testing.T) {
 		t.Fatal("timed-out restart must report immediately without entering the 10-minute rollback restart path")
 	}
 }
+
+func TestRestartUnitsSharesOneBudgetAcrossConfiguredUnits(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	stubDir := t.TempDir()
+	writeExec(t, filepath.Join(stubDir, "systemctl"), `#!/bin/bash
+shift 2
+for unit in "$@"; do
+  sleep 0.75
+done
+`)
+
+	script := repoFile(t, "scripts", "self-deploy.sh")
+	harness := strings.Join([]string{
+		"set -euo pipefail",
+		"PATH=" + shellQuote(stubDir) + ":$PATH",
+		`log() { :; }`,
+		`SCOPE="user"`,
+		`UNIT_LIST=(maestro.service maestro-fleet.service)`,
+		`RESTART_FAIL_DETAIL=""`,
+		`RESTART_TIMED_OUT=0`,
+		extractShellFunc(t, script, "restart_units"),
+		`if restart_units 1; then echo "restart unexpectedly received a fresh budget per unit" >&2; exit 1; fi`,
+		`(( RESTART_TIMED_OUT == 1 )) || { echo "shared restart timeout flag not set" >&2; exit 1; }`,
+	}, "\n")
+
+	started := time.Now()
+	out, err := exec.Command("bash", "-c", harness).CombinedOutput()
+	if err != nil {
+		t.Fatalf("multi-unit restart timeout harness failed: %v\n%s", err, out)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("multi-unit restart used more than one shared 1s budget: %v", elapsed)
+	}
+}
