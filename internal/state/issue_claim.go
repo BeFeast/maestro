@@ -20,6 +20,39 @@ type IssueClaim struct {
 	Reason      string `json:"reason"`
 }
 
+// FreshDispatchClaim is the durable pre-spawn issue lease for a brand-new
+// implementation worker. Worker.Start performs bounded but potentially slow
+// setup before it can register a running Session (base sync, worktree creation,
+// hooks, and prompt assembly). Persisting this exact identity first closes the
+// window where another orchestrator process can select the same ready issue and
+// allocate a second slot while the first setup is still in progress.
+//
+// Completed claims remain as compact duplicate-prevention evidence. Only
+// Status=claimed participates in ActiveIssueClaims.
+type FreshDispatchClaim struct {
+	IssueNumber      int       `json:"issue_number"`
+	Slot             string    `json:"slot"`
+	Branch           string    `json:"branch,omitempty"`
+	Worktree         string    `json:"worktree,omitempty"`
+	Status           string    `json:"status"`
+	LeaseID          string    `json:"lease_id,omitempty"`
+	LeaseGeneration  int       `json:"lease_generation,omitempty"`
+	ClaimedAt        time.Time `json:"claimed_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	LeaseExpiresAt   time.Time `json:"lease_expires_at,omitempty"`
+	CompletedAt      time.Time `json:"completed_at,omitempty"`
+	ContentionCount  int       `json:"contention_count,omitempty"`
+	LastContendedAt  time.Time `json:"last_contended_at,omitempty"`
+	SessionStartedAt time.Time `json:"session_started_at,omitempty"`
+	TerminalReason   string    `json:"terminal_reason,omitempty"`
+}
+
+const (
+	FreshDispatchClaimStatusClaimed    = "claimed"
+	FreshDispatchClaimStatusCompleted  = "completed"
+	FreshDispatchClaimStatusSuperseded = "superseded"
+)
+
 const (
 	IssueClaimImplementation       = "implementation"
 	IssueClaimOpenPRMaintenance    = "open_pr_maintenance"
@@ -29,6 +62,7 @@ const (
 	IssueClaimOperatorGate         = "operator_gate"
 	IssueClaimRepairDispatch       = "repair_dispatch"
 	IssueClaimReviewRepairDispatch = "review_repair_dispatch"
+	IssueClaimFreshDispatch        = "fresh_dispatch"
 )
 
 // ActiveIssueClaims returns every durable issue claim in deterministic order.
@@ -41,6 +75,23 @@ func (s *State) ActiveIssueClaims() []IssueClaim {
 	}
 
 	claims := make([]IssueClaim, 0)
+	freshIssues := make([]int, 0, len(s.FreshDispatchClaims))
+	for issue, claim := range s.FreshDispatchClaims {
+		if claim != nil && claim.Status == FreshDispatchClaimStatusClaimed && issue > 0 {
+			freshIssues = append(freshIssues, issue)
+		}
+	}
+	sort.Ints(freshIssues)
+	for _, issue := range freshIssues {
+		claim := s.FreshDispatchClaims[issue]
+		claims = append(claims, IssueClaim{
+			IssueNumber: issue,
+			Kind:        IssueClaimFreshDispatch,
+			Session:     claim.Slot,
+			Status:      claim.Status,
+			Reason:      fmt.Sprintf("issue #%d is reserved for fresh dispatch on canonical session %s", issue, claim.Slot),
+		})
+	}
 	reservedSessions := make(map[string]struct{})
 	approvalIndexes := make([]int, 0, len(s.Approvals))
 	for i := range s.Approvals {
@@ -108,15 +159,202 @@ func (s *State) ActiveIssueClaims() []IssueClaim {
 
 func issueClaimPriority(claim IssueClaim) int {
 	switch claim.Kind {
-	case IssueClaimRepairDispatch, IssueClaimReviewRepairDispatch:
+	case IssueClaimFreshDispatch:
 		return 0
-	case IssueClaimImplementation, IssueClaimScheduledRetry, IssueClaimOperatorGate:
+	case IssueClaimRepairDispatch, IssueClaimReviewRepairDispatch:
 		return 1
-	case IssueClaimOpenPRMaintenance:
+	case IssueClaimImplementation, IssueClaimScheduledRetry, IssueClaimOperatorGate:
 		return 2
-	default:
+	case IssueClaimOpenPRMaintenance:
 		return 3
+	default:
+		return 4
 	}
+}
+
+// FreshDispatchClaimFor returns the active pre-spawn lease for issueNumber.
+// Completed evidence is intentionally excluded from the dispatch gate.
+func (s *State) FreshDispatchClaimFor(issueNumber int) (*FreshDispatchClaim, bool) {
+	if s == nil || issueNumber <= 0 {
+		return nil, false
+	}
+	claim := s.FreshDispatchClaims[issueNumber]
+	return claim, claim != nil && claim.Status == FreshDispatchClaimStatusClaimed
+}
+
+// IssueHasNonFreshClaim reports whether sessions or repair approvals already
+// own the issue independently of its pre-spawn lease. It lets the dispatcher
+// resume an expired fresh claim while still failing closed if a canonical
+// worker/PR appeared concurrently.
+func (s *State) IssueHasNonFreshClaim(issueNumber int) bool {
+	if s == nil || issueNumber <= 0 {
+		return false
+	}
+	for _, claim := range s.ActiveIssueClaims() {
+		if claim.IssueNumber == issueNumber && claim.Kind != IssueClaimFreshDispatch {
+			return true
+		}
+	}
+	return false
+}
+
+// ClaimFreshDispatch atomically reserves or renews one exact fresh-worker
+// identity. An unexpired lease records contention and refuses a second owner.
+// An expired lease is renewed in place on the same slot/branch/worktree; it
+// never allocates a replacement identity merely to retry startup.
+//
+// The caller may fill Branch and Worktree on a newly returned claim before the
+// enclosing State.Update callback returns.
+func (s *State) ClaimFreshDispatch(issueNumber int, slotPrefix, leaseID string, leaseDuration time.Duration, now time.Time) (*FreshDispatchClaim, bool, error) {
+	if s == nil || issueNumber <= 0 || strings.TrimSpace(slotPrefix) == "" || strings.TrimSpace(leaseID) == "" || leaseDuration <= 0 {
+		return nil, false, fmt.Errorf("fresh dispatch claim is invalid")
+	}
+	if s.FreshDispatchClaims == nil {
+		s.FreshDispatchClaims = make(map[int]*FreshDispatchClaim)
+	}
+	now = now.UTC()
+	if existing, ok := s.FreshDispatchClaimFor(issueNumber); ok {
+		if now.Before(existing.LeaseExpiresAt) {
+			existing.ContentionCount++
+			existing.LastContendedAt = now
+			existing.UpdatedAt = now
+			return existing, false, nil
+		}
+		if s.IssueHasNonFreshClaim(issueNumber) {
+			return existing, false, nil
+		}
+		existing.LeaseID = leaseID
+		existing.LeaseGeneration++
+		existing.LeaseExpiresAt = now.Add(leaseDuration)
+		existing.UpdatedAt = now
+		return existing, true, nil
+	}
+	if s.IssueHasNonFreshClaim(issueNumber) {
+		return nil, false, nil
+	}
+	claim := &FreshDispatchClaim{
+		IssueNumber:     issueNumber,
+		Slot:            s.NextSlotName(slotPrefix),
+		Status:          FreshDispatchClaimStatusClaimed,
+		LeaseID:         leaseID,
+		LeaseGeneration: 1,
+		ClaimedAt:       now,
+		UpdatedAt:       now,
+		LeaseExpiresAt:  now.Add(leaseDuration),
+	}
+	s.FreshDispatchClaims[issueNumber] = claim
+	return claim, true, nil
+}
+
+// CompleteFreshDispatch records the exact running Session and makes its
+// pre-spawn lease terminal in one state transaction. A stale lease owner cannot
+// overwrite a takeover, and an identity mismatch is rejected without stopping
+// either process or discarding its worktree.
+func (s *State) CompleteFreshDispatch(issueNumber int, leaseID string, sess *Session, now time.Time) error {
+	claim, ok := s.FreshDispatchClaimFor(issueNumber)
+	if !ok || strings.TrimSpace(leaseID) == "" || claim.LeaseID != leaseID {
+		return fmt.Errorf("fresh dispatch lease changed")
+	}
+	if sess == nil || sess.IssueNumber != issueNumber || strings.TrimSpace(claim.Slot) == "" ||
+		strings.TrimSpace(sess.Branch) != strings.TrimSpace(claim.Branch) ||
+		strings.TrimSpace(sess.Worktree) != strings.TrimSpace(claim.Worktree) {
+		return fmt.Errorf("fresh dispatch session identity does not match claim")
+	}
+	if existing := s.Sessions[claim.Slot]; existing != nil && existing.IssueNumber != issueNumber {
+		return fmt.Errorf("fresh dispatch slot is owned by another issue")
+	}
+	copy := *sess
+	copy.Attribution = append([]BackendAttribution(nil), sess.Attribution...)
+	s.Sessions[claim.Slot] = &copy
+	now = now.UTC()
+	claim.Status = FreshDispatchClaimStatusCompleted
+	claim.UpdatedAt = now
+	claim.CompletedAt = now
+	claim.SessionStartedAt = sess.StartedAt.UTC()
+	claim.LeaseExpiresAt = time.Time{}
+	claim.TerminalReason = "session_committed"
+	return nil
+}
+
+// ReconcileFreshDispatchClaims makes a pre-spawn lease terminal when its exact
+// Session was persisted by a later compatible save, or when a different
+// canonical session/PR claim appeared. This is the crash-after-launch repair:
+// it preserves the worker identity already present and prevents an old startup
+// lease from blocking the issue forever.
+func (s *State) ReconcileFreshDispatchClaims(now time.Time) int {
+	if s == nil || len(s.FreshDispatchClaims) == 0 {
+		return 0
+	}
+	now = now.UTC()
+	changed := 0
+	for issue, claim := range s.FreshDispatchClaims {
+		if claim == nil || claim.Status != FreshDispatchClaimStatusClaimed {
+			continue
+		}
+		if sess := s.Sessions[claim.Slot]; sess != nil && sess.IssueNumber == issue &&
+			strings.TrimSpace(sess.Branch) == strings.TrimSpace(claim.Branch) &&
+			strings.TrimSpace(sess.Worktree) == strings.TrimSpace(claim.Worktree) {
+			claim.Status = FreshDispatchClaimStatusCompleted
+			claim.CompletedAt = now
+			claim.UpdatedAt = now
+			claim.SessionStartedAt = sess.StartedAt.UTC()
+			claim.LeaseExpiresAt = time.Time{}
+			claim.TerminalReason = "session_persisted"
+			changed++
+			continue
+		}
+		if s.IssueHasNonFreshClaim(issue) {
+			claim.Status = FreshDispatchClaimStatusSuperseded
+			claim.CompletedAt = now
+			claim.UpdatedAt = now
+			claim.LeaseExpiresAt = time.Time{}
+			claim.TerminalReason = "canonical_claim_appeared"
+			changed++
+		}
+	}
+	return changed
+}
+
+func mergeFreshDispatchClaims(current, ours map[int]*FreshDispatchClaim) map[int]*FreshDispatchClaim {
+	merged := make(map[int]*FreshDispatchClaim, len(current)+len(ours))
+	copyClaim := func(claim *FreshDispatchClaim) *FreshDispatchClaim {
+		if claim == nil {
+			return nil
+		}
+		copy := *claim
+		return &copy
+	}
+	for issue, claim := range current {
+		merged[issue] = copyClaim(claim)
+	}
+	for issue, candidate := range ours {
+		if candidate == nil {
+			continue
+		}
+		prior := merged[issue]
+		if prior == nil || candidate.UpdatedAt.After(prior.UpdatedAt) ||
+			(candidate.UpdatedAt.Equal(prior.UpdatedAt) && candidate.LeaseGeneration > prior.LeaseGeneration) ||
+			(candidate.UpdatedAt.Equal(prior.UpdatedAt) && candidate.LeaseGeneration == prior.LeaseGeneration && candidate.Status == FreshDispatchClaimStatusCompleted) {
+			chosen := copyClaim(candidate)
+			if prior != nil {
+				if prior.ContentionCount > chosen.ContentionCount {
+					chosen.ContentionCount = prior.ContentionCount
+				}
+				if prior.LastContendedAt.After(chosen.LastContendedAt) {
+					chosen.LastContendedAt = prior.LastContendedAt
+				}
+			}
+			merged[issue] = chosen
+		} else if prior != nil {
+			if candidate.ContentionCount > prior.ContentionCount {
+				prior.ContentionCount = candidate.ContentionCount
+			}
+			if candidate.LastContendedAt.After(prior.LastContendedAt) {
+				prior.LastContendedAt = candidate.LastContendedAt
+			}
+		}
+	}
+	return merged
 }
 
 // IssueClaimFor returns the first durable claim for issueNumber.
