@@ -2974,28 +2974,20 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	// CI must be green. Production readers expose the current-head rollup so
 	// a real queued/in-progress check-run can never be confused with the
 	// legacy commit-status-only pending state handled by #425.
-	ciStatus := ""
-	pendingCheckRuns := false
-	rollupHeadSHA := ""
-	if rollupReader, ok := e.reader.(prCheckRollupReader); ok {
-		rollup, err := rollupReader.PRCheckRollup(pr.Number)
-		if err != nil || !rollup.Complete || strings.TrimSpace(rollup.HeadSHA) == "" {
-			return false, "", nil
-		}
-		rollupHeadSHA = strings.TrimSpace(rollup.HeadSHA)
-		ciStatus = rollup.Verdict
-		pendingCheckRuns = rollup.PendingCheckRuns
-	} else {
-		ciReader, ok := e.reader.(prCIStatusReader)
-		if !ok {
-			return false, "", nil
-		}
-		var err error
-		ciStatus, err = ciReader.PRCIStatus(pr.Number)
-		if err != nil {
-			return false, "", nil
-		}
+	rollupReader, ok := e.reader.(prCheckRollupReader)
+	if !ok {
+		// Aggregate CI alone cannot distinguish an active check-run from a
+		// stale legacy commit status. Without the current-head rollup, the
+		// merge-state override is unsafe, so fail closed.
+		return false, "", nil
 	}
+	rollup, err := rollupReader.PRCheckRollup(pr.Number)
+	if err != nil || !rollup.Complete || strings.TrimSpace(rollup.HeadSHA) == "" {
+		return false, "", nil
+	}
+	rollupHeadSHA := strings.TrimSpace(rollup.HeadSHA)
+	ciStatus := rollup.Verdict
+	pendingCheckRuns := rollup.PendingCheckRuns
 
 	// #543: GitHub LIST endpoint never populates `mergeable`; fetch via
 	// single-PR endpoint when reader supports it. Read it after the rollup so
@@ -3013,7 +3005,7 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
-		if pendingCheckRuns {
+		if pendingCheckRuns || !legacyStatusOnlyPending(rollup) {
 			return false, "", nil
 		}
 		// #425 (sup-98): the aggregate PRCIStatus can stick at "pending"
@@ -3077,6 +3069,46 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		reasons = append(reasons, fmt.Sprintf("PR #%d Greptile review approved", pr.Number))
 	}
 	return true, rollupHeadSHA, reasons
+}
+
+// legacyStatusOnlyPending proves the narrow #425 exception: the aggregate
+// verdict is pending because at least one legacy commit status is pending,
+// while every observed check-run is complete and non-blocking. Any missing,
+// unfamiliar, or failed signal keeps the deterministic merge path closed.
+func legacyStatusOnlyPending(rollup github.PRCheckRollup) bool {
+	if !strings.EqualFold(strings.TrimSpace(rollup.Verdict), "pending") {
+		return false
+	}
+
+	pendingLegacyStatus := false
+	for _, signal := range rollup.Signals {
+		source := strings.ToLower(strings.TrimSpace(signal.Source))
+		status := strings.ToLower(strings.TrimSpace(signal.Status))
+		conclusion := strings.ToLower(strings.TrimSpace(signal.Conclusion))
+
+		switch source {
+		case "check_run":
+			if status != "completed" {
+				return false
+			}
+			switch conclusion {
+			case "success", "neutral", "skipped":
+			default:
+				return false
+			}
+		case "commit_status":
+			switch status {
+			case "pending":
+				pendingLegacyStatus = true
+			case "success":
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return pendingLegacyStatus
 }
 
 // monitorOpenPRReasons returns a short list of human-readable reasons
