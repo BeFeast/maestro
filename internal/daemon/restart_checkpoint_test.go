@@ -127,6 +127,54 @@ func TestCheckpointInFlightForRestart_PastDeadlineStampsMarkerWithoutCheckpointF
 	}
 }
 
+// #966: a wedged git snapshot for the first worker must not consume the shutdown
+// tail before later workers receive their correctness-critical restart markers.
+// Markers are persisted for the whole state dir first; CHECKPOINT.md is optional.
+func TestCheckpointInFlightForRestart_WedgedContextStillMarksEveryWorker(t *testing.T) {
+	oldCheckpointFn := checkpointFn
+	blocked := make(chan struct{})
+	checkpointFinished := make(chan struct{})
+	checkpointFn = func(*state.Session) (string, error) {
+		defer close(checkpointFinished)
+		<-blocked
+		return "", nil
+	}
+	defer func() {
+		close(blocked)
+		<-checkpointFinished
+		checkpointFn = oldCheckpointFn
+	}()
+
+	stateDir := t.TempDir()
+	s := state.NewState()
+	for i, slot := range []string{"sup-410", "sup-411", "sup-412", "sup-413"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 410 + i,
+			Status:      state.StatusRunning,
+			Worktree:    t.TempDir(),
+		}
+	}
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	started := time.Now()
+	(&Daemon{}).checkpointInFlightForRestart(time.Now().Add(60*time.Millisecond), []string{stateDir})
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("wedged context capture held shutdown for %v", elapsed)
+	}
+
+	reloaded, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	for slot, sess := range reloaded.Sessions {
+		if sess.RestartCheckpointAt == nil {
+			t.Errorf("%s missing restart marker after another worker's checkpoint wedged", slot)
+		}
+	}
+}
+
 // #877 review comment 2: stopAll abandons a flow whose cycle outruns its stop
 // timeout, so that still-live flow can Save concurrently with this pass. The
 // pass's 3-way-merged save must let the two writes COEXIST — a concurrent flow

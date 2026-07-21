@@ -324,6 +324,56 @@ func TestReconcile_RestartCheckpoint_AdoptsLiveReplacement(t *testing.T) {
 	}
 }
 
+// #966: workers launched in the isolated worker scope survive maestro.service
+// itself. The replacement daemon must consume the restart marker by adopting the
+// same PID/worktree, without respawning or starting a duplicate attempt.
+func TestReconcile_RestartCheckpoint_ConsumesMarkerForSameSurvivingWorker(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+
+	const survivingPID = 7888
+	const slotTmux = "maestro-sup-313"
+	worktree := t.TempDir()
+	o.pidAliveFn = func(pid int) bool { return pid == survivingPID }
+	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
+		return survivingPID, worktree, nil
+	}
+
+	stamp := time.Now().UTC()
+	s := state.NewState()
+	s.Sessions["sup-313"] = &state.Session{
+		IssueNumber:         313,
+		IssueTitle:          "surviving worker",
+		Status:              state.StatusRunning,
+		PID:                 survivingPID,
+		TmuxSession:         slotTmux,
+		Worktree:            worktree,
+		RestartCheckpointAt: &stamp,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected surviving worker marker adoption to report a state change")
+	}
+	sess := s.Sessions["sup-313"]
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times, want 0 for the same surviving worker", resumeCount)
+	}
+	if sess.PID != survivingPID || sess.Worktree != worktree || sess.Status != state.StatusRunning {
+		t.Fatalf("surviving runtime changed: status=%q pid=%d worktree=%q", sess.Status, sess.PID, sess.Worktree)
+	}
+	if sess.RestartCheckpointAt != nil {
+		t.Fatal("restart marker was not consumed after exact surviving-worker adoption")
+	}
+
+	if o.reconcileRunningSessions(s) {
+		t.Fatal("second reconcile changed an already-adopted live worker")
+	}
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times across two reconciles, want 0", resumeCount)
+	}
+}
+
 // If a replacement's tmux is alive but its live pane pid can't be read, the
 // marker must be PRESERVED (not consumed) so the next cycle retries the
 // non-destructive adoption — the session must never be respawned over or falsely
