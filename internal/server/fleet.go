@@ -4917,15 +4917,20 @@ func fleetPRStateNewer(candidate, current fleetPRGateState) bool {
 }
 
 func fleetPRStatePriority(gate fleetPRGateState) int {
-	if gate.Merged {
+	// Terminal truth wins when several sessions describe the same PR (the
+	// deduplication above handles that case). Across distinct PRs, however, an
+	// open durable merge action or repair-required gate is the current operator
+	// concern and must not be hidden by an older completed PR.
+	if !gate.Merged && gate.MergeAction != nil {
 		return 0
 	}
-	if gate.MergeAction != nil {
+	if !gate.Merged && (state.PRGateCIVerdict(gate.CI) == state.PRGateCIFailure || state.PRGateReviewDecision(gate.Review) == state.PRGateReviewBlocked) {
 		return 1
 	}
-	switch state.PRGateReviewDecision(gate.Review) {
-	case state.PRGateReviewBlocked:
+	if gate.Merged {
 		return 2
+	}
+	switch state.PRGateReviewDecision(gate.Review) {
 	case state.PRGateReviewPending:
 		return 3
 	case state.PRGateReviewPassed:

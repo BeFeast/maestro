@@ -2416,7 +2416,11 @@ type greptileReviewSignal struct {
 	Verdict  string
 }
 
-var greptileScorePattern = regexp.MustCompile(`(?i)\b([0-9]+)\s*/\s*([0-9]+)\b`)
+var (
+	greptileConfidenceScorePattern = regexp.MustCompile(`(?i)\bconfidence(\s+score)?\s*[:=-]?\s*([0-9]+)\s*/\s*([0-9]+)\b`)
+	greptilePositiveMergePattern   = regexp.MustCompile(`(?i)\b(ok|okay|safe)\s+to\s+merge\b`)
+	greptileNegativeMergePattern   = regexp.MustCompile(`(?i)\b(no|not|never|isn't|isnt|wasn't|wasnt|can't|cant|cannot|don't|dont|doesn't|doesnt)\s+([[:alnum:]'-]+\s+){0,4}(ok|okay|safe)\s+to\s+merge\b|\bunsafe\s+to\s+merge\b`)
+)
 
 func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdict, error) {
 	// --- 1. Get head SHA of the PR ---
@@ -2524,12 +2528,12 @@ func greptileCheckReviewSignal(checkRuns []greptileCheckRun) (found bool, signal
 func greptileSignalFromText(text string) greptileReviewSignal {
 	normalized := normalizedReviewText(text)
 	signal := greptileReviewSignal{}
-	for _, match := range greptileScorePattern.FindAllStringSubmatch(normalized, -1) {
-		if len(match) != 3 {
+	for _, match := range greptileConfidenceScorePattern.FindAllStringSubmatch(normalized, -1) {
+		if len(match) != 4 {
 			continue
 		}
-		score, scoreErr := strconv.Atoi(match[1])
-		maxScore, maxErr := strconv.Atoi(match[2])
+		score, scoreErr := strconv.Atoi(match[2])
+		maxScore, maxErr := strconv.Atoi(match[3])
 		if scoreErr != nil || maxErr != nil || maxScore != 5 || score < 0 || score > maxScore {
 			continue
 		}
@@ -2538,17 +2542,34 @@ func greptileSignalFromText(text string) greptileReviewSignal {
 		signal.Observed = true
 	}
 
-	negativeOK := strings.Contains(normalized, "not ok to merge") || strings.Contains(normalized, "not okay to merge")
-	explicitOK := !negativeOK && (strings.Contains(normalized, "ok to merge") || strings.Contains(normalized, "okay to merge"))
-	negative := negativeOK || strings.Contains(normalized, "not safe to merge") || strings.Contains(normalized, "unsafe to merge")
-	explicitSafe := strings.Contains(normalized, "safe to merge") && !negative
-	if explicitOK || explicitSafe || negative || strings.Contains(normalized, "repair required") || strings.Contains(normalized, "changes requested") {
+	negativeRanges := greptileNegativeMergePattern.FindAllStringIndex(normalized, -1)
+	explicitObserved := false
+	explicitPassed := false
+	lastExplicitStart := -1
+	for _, negativeRange := range negativeRanges {
+		if len(negativeRange) == 2 && negativeRange[0] > lastExplicitStart {
+			explicitObserved = true
+			explicitPassed = false
+			lastExplicitStart = negativeRange[0]
+		}
+	}
+	for _, positiveRange := range greptilePositiveMergePattern.FindAllStringIndex(normalized, -1) {
+		if !rangeContainedByAny(positiveRange, negativeRanges) && positiveRange[0] > lastExplicitStart {
+			explicitObserved = true
+			explicitPassed = true
+			lastExplicitStart = positiveRange[0]
+		}
+	}
+	repairRequired := strings.Contains(normalized, "repair required") || strings.Contains(normalized, "changes requested")
+	if explicitObserved || repairRequired {
 		signal.Observed = true
 	}
 	switch {
-	case explicitOK || explicitSafe:
+	case explicitObserved && explicitPassed:
 		signal.Passed = true
 		signal.Verdict = reviewVerdictOKToMerge
+	case explicitObserved || repairRequired:
+		signal.Verdict = reviewVerdictRepairRequired
 	case signal.ScoreMax > 0:
 		signal.Passed = signal.Score >= 4
 		if signal.Passed {
@@ -2556,12 +2577,22 @@ func greptileSignalFromText(text string) greptileReviewSignal {
 		} else {
 			signal.Verdict = reviewVerdictRepairRequired
 		}
-	case negative || strings.Contains(normalized, "repair required") || strings.Contains(normalized, "changes requested"):
-		signal.Verdict = reviewVerdictRepairRequired
 	default:
 		signal.Verdict = reviewVerdictRepairRequired
 	}
 	return signal
+}
+
+func rangeContainedByAny(candidate []int, containers [][]int) bool {
+	if len(candidate) != 2 {
+		return false
+	}
+	for _, container := range containers {
+		if len(container) == 2 && candidate[0] >= container[0] && candidate[1] <= container[1] {
+			return true
+		}
+	}
+	return false
 }
 
 func reviewStreamVerdictFromGreptileSignal(signal greptileReviewSignal) ReviewStreamVerdict {

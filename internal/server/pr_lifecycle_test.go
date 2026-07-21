@@ -140,6 +140,62 @@ func TestFleetExplicitGreptileOKToMergeStaysOperatorVisible(t *testing.T) {
 	}
 }
 
+func TestFleetActionableOpenPROutranksOlderMergedPR(t *testing.T) {
+	now := time.Date(2026, 7, 15, 14, 30, 0, 0, time.UTC)
+	merged := fleetPRGateState{
+		PRNumber: 501, Merged: true, Summary: "Greptile 4/5 · passed · PR merged",
+		UpdatedAt: formatFleetTime(now.Add(-time.Minute)),
+	}
+	for _, tt := range []struct {
+		name     string
+		open     fleetPRGateState
+		wantKind string
+	}{
+		{
+			name: "durable merge action",
+			open: fleetPRGateState{
+				PRNumber: 502, Review: string(state.PRGateReviewPassed), Summary: "Merge requested for PR #502",
+				UpdatedAt: formatFleetTime(now),
+				MergeAction: &fleetMergeActionState{
+					ApprovalID: "approval-open", Status: string(state.ApprovalStatusPending), Label: "Merge requested",
+					Summary: "Merge requested for PR #502", NextAction: "Approve or reject merge approval approval-open.", ActionRequired: true,
+				},
+			},
+			wantKind: "merge_action_required",
+		},
+		{
+			name: "failed CI",
+			open: fleetPRGateState{
+				PRNumber: 502, CI: string(state.PRGateCIFailure), Review: string(state.PRGateReviewPassed),
+				ReviewSummary: "Greptile 4/5 · passed", Summary: "Greptile 4/5 · passed", UpdatedAt: formatFleetTime(now),
+			},
+			wantKind: "attention",
+		},
+		{
+			name: "review repair",
+			open: fleetPRGateState{
+				PRNumber: 502, CI: string(state.PRGateCISuccess), Review: string(state.PRGateReviewBlocked),
+				ReviewSummary: "Greptile 3/5 · repair required", Summary: "Greptile 3/5 · repair required", UpdatedAt: formatFleetTime(now),
+			},
+			wantKind: "review_repair",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			states := []fleetPRGateState{merged, tt.open}
+			sortFleetProjectPRStates(states)
+			if states[0].PRNumber != 502 {
+				t.Fatalf("sorted PR states = %+v, want actionable open PR first", states)
+			}
+			operatorState, ok := fleetProjectPRLifecycleOperatorState(fleetProjectState{
+				Repo: "BeFeast/project-control-plane", PRStates: states,
+			})
+			if !ok || operatorState.PRNumber != 502 || operatorState.Kind != tt.wantKind {
+				t.Fatalf("operator state = %+v, want PR #502 kind %q", operatorState, tt.wantKind)
+			}
+		})
+	}
+}
+
 func TestFleetMergedTruthOutranksPendingApprovalAndStaleReview(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")
