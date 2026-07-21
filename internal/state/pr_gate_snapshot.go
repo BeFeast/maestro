@@ -31,6 +31,33 @@ const (
 	PRGateReviewBlocked  PRGateReviewDecision = "blocked"
 )
 
+// PRGateReviewVerdict is a closed, operator-safe review-provider fact. It is
+// deliberately narrower than provider output: raw summaries/findings stay out
+// of the durable gate snapshot, while score and merge/repair intent remain
+// available to Fleet after the broad GitHub observation cycle has completed.
+type PRGateReviewVerdict string
+
+const (
+	PRGateReviewVerdictUnknown        PRGateReviewVerdict = "unknown"
+	PRGateReviewVerdictPending        PRGateReviewVerdict = "pending"
+	PRGateReviewVerdictPassed         PRGateReviewVerdict = "passed"
+	PRGateReviewVerdictOKToMerge      PRGateReviewVerdict = "ok_to_merge"
+	PRGateReviewVerdictRepairRequired PRGateReviewVerdict = "repair_required"
+)
+
+// PRGateReviewStream is the safe, durable fact for one configured review
+// stream. FindingsCount is a count only; raw review bodies and paths remain in
+// the bounded repair payload, never in this read-model snapshot.
+type PRGateReviewStream struct {
+	Name          string              `json:"name"`
+	Passed        bool                `json:"passed"`
+	Pending       bool                `json:"pending"`
+	Score         int                 `json:"score,omitempty"`
+	ScoreMax      int                 `json:"score_max,omitempty"`
+	Verdict       PRGateReviewVerdict `json:"verdict,omitempty"`
+	FindingsCount int                 `json:"findings_count,omitempty"`
+}
+
 // PRGateSnapshot is one durable, semantic PR-gate generation. It contains only
 // public forge identity, closed verdicts, timestamps, counts, and opaque
 // non-reversible fingerprints. Raw check output, review bodies, private paths,
@@ -46,6 +73,7 @@ type PRGateSnapshot struct {
 	CIEffectiveVerdict            PRGateCIVerdict      `json:"ci_effective_verdict"`
 	CheckRollupFingerprint        string               `json:"check_rollup_fingerprint,omitempty"`
 	ReviewDecision                PRGateReviewDecision `json:"review_decision"`
+	ReviewStreams                 []PRGateReviewStream `json:"review_streams,omitempty"`
 	ReviewVerdictFingerprint      string               `json:"review_verdict_fingerprint,omitempty"`
 	ActionableFindingsFingerprint string               `json:"actionable_findings_fingerprint,omitempty"`
 	ActionableFindingsCount       int                  `json:"actionable_findings_count,omitempty"`
@@ -72,6 +100,7 @@ type PRGateTransition struct {
 
 	ReviewObserved                bool
 	ReviewDecision                PRGateReviewDecision
+	ReviewStreams                 []PRGateReviewStream
 	ReviewVerdictFingerprint      string
 	ActionableFindingsFingerprint string
 	ActionableFindingsCount       int
@@ -136,6 +165,16 @@ func (s *State) RecordPRGateTransition(transition PRGateTransition, now time.Tim
 	}
 
 	previous, hadPrevious := s.LatestPRGateSnapshot(project, transition.IssueNumber, transition.PRNumber)
+	// Terminal forge truth freezes the captured head and open-PR gates. A delayed
+	// webhook/poll may carry an older head or repeat merge truth alongside stale
+	// CI/review data; neither may replace the successful facts recorded before
+	// GitHub's merged transition.
+	if hadPrevious && previous.MergeCommitSHA != "" && !previous.MergedAt.IsZero() {
+		head = previous.HeadSHA
+		transition.CIObserved = false
+		transition.CheckRollupObserved = false
+		transition.ReviewObserved = false
+	}
 	next := previous
 	if !hadPrevious || previous.HeadSHA != head {
 		next = PRGateSnapshot{
@@ -185,7 +224,12 @@ func (s *State) RecordPRGateTransition(transition PRGateTransition, now time.Tim
 		if next.ActionableFindingsFingerprint != findingFingerprint || next.ActionableFindingsCount != transition.ActionableFindingsCount {
 			next.FeedbackGeneration++
 		}
+		streams, valid := normalizePRGateReviewStreams(transition.ReviewStreams)
+		if !valid {
+			return PRGateSnapshot{}, false, fmt.Errorf("invalid PR-gate review stream facts")
+		}
 		next.ReviewDecision = decision
+		next.ReviewStreams = streams
 		next.ReviewVerdictFingerprint = verdictFingerprint
 		next.ActionableFindingsFingerprint = findingFingerprint
 		next.ActionableFindingsCount = transition.ActionableFindingsCount
@@ -229,6 +273,7 @@ func prGateSnapshotSemanticEqual(a, b PRGateSnapshot) bool {
 	return a.Project == b.Project && a.IssueNumber == b.IssueNumber && a.PRNumber == b.PRNumber && a.HeadSHA == b.HeadSHA &&
 		a.CIRollupVerdict == b.CIRollupVerdict && a.CIEffectiveVerdict == b.CIEffectiveVerdict &&
 		a.CheckRollupFingerprint == b.CheckRollupFingerprint && a.ReviewDecision == b.ReviewDecision &&
+		prGateReviewStreamsEqual(a.ReviewStreams, b.ReviewStreams) &&
 		a.ReviewVerdictFingerprint == b.ReviewVerdictFingerprint &&
 		a.ActionableFindingsFingerprint == b.ActionableFindingsFingerprint && a.ActionableFindingsCount == b.ActionableFindingsCount &&
 		a.FeedbackGeneration == b.FeedbackGeneration && a.MergeCommitSHA == b.MergeCommitSHA && a.MergedAt.Equal(b.MergedAt)
@@ -252,6 +297,68 @@ func normalizePRGateReviewDecision(value PRGateReviewDecision) (PRGateReviewDeci
 	default:
 		return "", false
 	}
+}
+
+func normalizePRGateReviewStreams(streams []PRGateReviewStream) ([]PRGateReviewStream, bool) {
+	if len(streams) == 0 {
+		return nil, true
+	}
+	out := make([]PRGateReviewStream, 0, len(streams))
+	seen := make(map[string]struct{}, len(streams))
+	for _, stream := range streams {
+		name := strings.ToLower(strings.TrimSpace(stream.Name))
+		if name == "" || len(name) > 64 || stream.Score < 0 || stream.ScoreMax < 0 || stream.FindingsCount < 0 {
+			return nil, false
+		}
+		if stream.ScoreMax == 0 && stream.Score != 0 {
+			return nil, false
+		}
+		if stream.ScoreMax > 0 && stream.Score > stream.ScoreMax {
+			return nil, false
+		}
+		if _, exists := seen[name]; exists {
+			return nil, false
+		}
+		seen[name] = struct{}{}
+		verdict, valid := normalizePRGateReviewVerdict(stream.Verdict)
+		if !valid {
+			return nil, false
+		}
+		stream.Name = name
+		stream.Verdict = verdict
+		out = append(out, stream)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, true
+}
+
+func normalizePRGateReviewVerdict(value PRGateReviewVerdict) (PRGateReviewVerdict, bool) {
+	value = PRGateReviewVerdict(strings.ToLower(strings.TrimSpace(string(value))))
+	if value == "" {
+		value = PRGateReviewVerdictUnknown
+	}
+	switch value {
+	case PRGateReviewVerdictUnknown,
+		PRGateReviewVerdictPending,
+		PRGateReviewVerdictPassed,
+		PRGateReviewVerdictOKToMerge,
+		PRGateReviewVerdictRepairRequired:
+		return value, true
+	default:
+		return "", false
+	}
+}
+
+func prGateReviewStreamsEqual(a, b []PRGateReviewStream) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizePRGateProject(value string) (string, bool) {

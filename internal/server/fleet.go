@@ -1254,16 +1254,53 @@ type fleetOperatorBrief struct {
 }
 
 type fleetOperatorState struct {
-	Kind        string `json:"kind"`
-	Tone        string `json:"tone"`
-	Label       string `json:"label"`
-	Summary     string `json:"summary"`
-	NextAction  string `json:"next_action,omitempty"`
-	IssueNumber int    `json:"issue_number,omitempty"`
-	IssueURL    string `json:"issue_url,omitempty"`
-	PRNumber    int    `json:"pr_number,omitempty"`
-	PRURL       string `json:"pr_url,omitempty"`
-	Session     string `json:"session,omitempty"`
+	Kind           string            `json:"kind"`
+	Tone           string            `json:"tone"`
+	Label          string            `json:"label"`
+	Summary        string            `json:"summary"`
+	NextAction     string            `json:"next_action,omitempty"`
+	IssueNumber    int               `json:"issue_number,omitempty"`
+	IssueURL       string            `json:"issue_url,omitempty"`
+	PRNumber       int               `json:"pr_number,omitempty"`
+	PRURL          string            `json:"pr_url,omitempty"`
+	Session        string            `json:"session,omitempty"`
+	ApprovalID     string            `json:"approval_id,omitempty"`
+	ApprovalStatus string            `json:"approval_status,omitempty"`
+	PRGate         *fleetPRGateState `json:"pr_gate,omitempty"`
+}
+
+type fleetPRReviewStream struct {
+	Name          string `json:"name"`
+	Passed        bool   `json:"passed"`
+	Pending       bool   `json:"pending"`
+	Score         int    `json:"score,omitempty"`
+	ScoreMax      int    `json:"score_max,omitempty"`
+	Verdict       string `json:"verdict,omitempty"`
+	FindingsCount int    `json:"findings_count,omitempty"`
+	Summary       string `json:"summary"`
+}
+
+type fleetMergeActionState struct {
+	ApprovalID     string `json:"approval_id"`
+	Status         string `json:"status"`
+	Label          string `json:"label"`
+	Summary        string `json:"summary"`
+	NextAction     string `json:"next_action,omitempty"`
+	ActionRequired bool   `json:"action_required,omitempty"`
+	UpdatedAt      string `json:"updated_at,omitempty"`
+}
+
+type fleetPRGateState struct {
+	PRNumber      int                    `json:"pr_number"`
+	CI            string                 `json:"ci,omitempty"`
+	Review        string                 `json:"review,omitempty"`
+	ReviewSummary string                 `json:"review_summary,omitempty"`
+	ReviewStreams []fleetPRReviewStream  `json:"review_streams,omitempty"`
+	MergeAction   *fleetMergeActionState `json:"merge_action,omitempty"`
+	Merged        bool                   `json:"merged"`
+	MergedAt      string                 `json:"merged_at,omitempty"`
+	Summary       string                 `json:"summary"`
+	UpdatedAt     string                 `json:"updated_at,omitempty"`
 }
 
 type fleetSummary struct {
@@ -1456,6 +1493,7 @@ type fleetProjectState struct {
 	// issue #598). The SPA project card uses this to render a calm
 	// "auto-merging" line instead of an alarming attention CTA.
 	SelfResolving   int                   `json:"self_resolving,omitempty"`
+	PRStates        []fleetPRGateState    `json:"pr_states,omitempty"`
 	Active          []sessionInfo         `json:"active,omitempty"`
 	Attention       []sessionInfo         `json:"attention,omitempty"`
 	IssueClaims     []state.IssueClaim    `json:"issue_claims,omitempty"`
@@ -1817,6 +1855,7 @@ type fleetApprovalState struct {
 	Risk              string                  `json:"risk,omitempty"`
 	Summary           string                  `json:"summary,omitempty"`
 	PastSLA           bool                    `json:"past_sla,omitempty"`
+	TargetTerminal    bool                    `json:"target_terminal,omitempty"`
 	// Delivery is the operator-safe deploy_project payload. The raw delivery
 	// command is deliberately absent from state.DeliveryPayload; the snapshot
 	// takes a sanitized clone so accidental credential-shaped text in previews
@@ -1867,6 +1906,7 @@ type fleetWorkerState struct {
 	AdvisorBestEffort         bool                  `json:"advisor_best_effort,omitempty"`
 	AdvisorBypassed           bool                  `json:"advisor_bypassed,omitempty"`
 	AdvisorReviews            []state.AdvisorReview `json:"advisor_reviews,omitempty"`
+	PRGate                    *fleetPRGateState     `json:"pr_gate,omitempty"`
 	// BackendSelection records why this backend was chosen (label, role, auto,
 	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
@@ -1990,6 +2030,7 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
 	applyBackendDrift(project.cfg, &infos[0])
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
+	infos[0] = reconcileFleetWorkerPRGate(infos[0], st, project.cfg.Repo)
 	pricing := backendPricingMap(project.cfg)
 	infos[0].CostUSDEstimate = sessionCostUSD(sess, pricing)
 	infos[0].Actions = workerActionAffordances(projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
@@ -3072,7 +3113,7 @@ func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState)
 		summary.Active++
 	}
 	switch kind {
-	case "monitoring_pr":
+	case "monitoring_pr", "merge_in_progress":
 		summary.MonitoringPR++
 	case "pending_dispatch":
 		summary.DispatchPending++
@@ -3094,7 +3135,7 @@ func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState)
 
 func fleetOperatorStateIsActive(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "working", "monitoring_pr", "pending_dispatch":
+	case "working", "monitoring_pr", "pending_dispatch", "merge_in_progress", "code_landed":
 		return true
 	default:
 		return false
@@ -3107,12 +3148,13 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 	}
 
 	if approval := oldestPastSLAPendingFleetApproval(approvals, now); approval != nil {
+		label, reason := fleetPendingApprovalBrief(projects, approval, "Approval past SLA")
 		return fleetOperatorBrief{
 			Tone:           "daemon-down",
-			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval past SLA", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, label, reason, approval.IssueNumber, approval.PRNumber, approval.Session),
 			Project:        approval.ProjectName,
 			Kind:           "approval_pending",
-			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			Reason:         truncateFleetOperatorText(reason, 150),
 			NextAction:     "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now.",
 			ActionRequired: true,
 			IssueNumber:    approval.IssueNumber,
@@ -3124,12 +3166,13 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 	}
 
 	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
+		label, reason := fleetPendingApprovalBrief(projects, approval, "Approval pending")
 		return fleetOperatorBrief{
 			Tone:           "attention",
-			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval pending", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, label, reason, approval.IssueNumber, approval.PRNumber, approval.Session),
 			Project:        approval.ProjectName,
 			Kind:           "approval_pending",
-			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			Reason:         truncateFleetOperatorText(reason, 150),
 			NextAction:     "Approve or reject the pending supervisor approval after checking the target state.",
 			ActionRequired: true,
 			IssueNumber:    approval.IssueNumber,
@@ -3169,6 +3212,27 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 		return brief
 	}
 
+	for i := range projects {
+		project := &projects[i]
+		switch strings.TrimSpace(project.OperatorState.Kind) {
+		case "merge_in_progress", "code_landed":
+			op := project.OperatorState
+			return fleetOperatorBrief{
+				Tone:        fleetActionTone(op.Tone),
+				Sentence:    fmt.Sprintf("Global brief: %s — %s", project.Name, op.Summary),
+				Project:     project.Name,
+				Kind:        op.Kind,
+				Reason:      op.Summary,
+				NextAction:  op.NextAction,
+				IssueNumber: op.IssueNumber,
+				IssueURL:    op.IssueURL,
+				PRNumber:    op.PRNumber,
+				PRURL:       op.PRURL,
+				Session:     op.Session,
+			}
+		}
+	}
+
 	working, monitoring, pending, attention := 0, 0, 0, 0
 	for _, project := range projects {
 		switch project.OperatorState.Kind {
@@ -3201,6 +3265,29 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 	return fleetOperatorBrief{Tone: "busy", Kind: "active", Sentence: "Global brief: " + strings.Join(parts, "; ") + "; no operator action is needed right now."}
 }
 
+func fleetPendingApprovalBrief(projects []fleetProjectState, approval *fleetApprovalState, fallbackLabel string) (string, string) {
+	if approval == nil || approval.Action != config.SupervisorActionMergePR {
+		if approval == nil {
+			return fallbackLabel, ""
+		}
+		return fallbackLabel, approval.Summary
+	}
+	label := "Merge requested"
+	reason := strings.TrimSpace(approval.Summary)
+	for i := range projects {
+		project := &projects[i]
+		if project.Name != approval.ProjectName {
+			continue
+		}
+		for _, gate := range project.PRStates {
+			if gate.PRNumber == approval.PRNumber && gate.MergeAction != nil && gate.MergeAction.ApprovalID == approval.ID {
+				return label, gate.Summary
+			}
+		}
+	}
+	return label, reason
+}
+
 // fleetNextActionCandidate is one possible "what needs me now" item before
 // priority/age sorting picks the canonical winner.
 type fleetNextActionCandidate struct {
@@ -3224,7 +3311,7 @@ func fleetNextActionPriorityForKind(kind string) (int, bool) {
 	switch strings.TrimSpace(kind) {
 	case "error", "dispatch_failure", "metered_backend", "stale_worker":
 		return 0, true
-	case "attention":
+	case "attention", "merge_action_required", "review_repair":
 		return 1, true
 	case "outcome_drift", "stale", "no_eligible_issues", "queue_blocked":
 		return 2, true
@@ -3245,6 +3332,11 @@ func fleetNextActionPriorityForKind(kind string) (int, bool) {
 // input returns the same picked_at.
 func fleetProjectOperatorUpdatedAt(project fleetProjectState) time.Time {
 	kind := strings.TrimSpace(project.OperatorState.Kind)
+	if project.OperatorState.PRGate != nil {
+		if t := parseFleetWorkerTime(project.OperatorState.PRGate.UpdatedAt); !t.IsZero() {
+			return t
+		}
+	}
 	switch kind {
 	case "attention", "stale_worker":
 		if len(project.Attention) > 0 {
@@ -3320,7 +3412,7 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || approval.TargetTerminal {
 			continue
 		}
 		priority := 1
@@ -3332,7 +3424,8 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 			priority = 0
 			reason = "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now."
 		}
-		if summary := strings.TrimSpace(approval.Summary); summary != "" {
+		_, approvalSummary := fleetPendingApprovalBrief(projects, approval, "Approval pending")
+		if summary := strings.TrimSpace(approvalSummary); summary != "" {
 			reason = summary + " " + reason
 		}
 		target := firstNonEmpty(approval.DashboardURL, fleetApprovalsFocusedPath(approval.ID))
@@ -3358,6 +3451,9 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 			continue
 		}
 		reason := strings.TrimSpace(project.OperatorState.NextAction)
+		if kind == "merge_action_required" || kind == "review_repair" {
+			reason = strings.TrimSpace(project.OperatorState.Summary + " " + reason)
+		}
 		if reason == "" {
 			reason = strings.TrimSpace(project.OperatorState.Summary)
 		}
@@ -3506,6 +3602,19 @@ func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 			return fmt.Sprintf("Review issue #%d", op.IssueNumber)
 		}
 		return "Review attention"
+	case "merge_action_required":
+		if state.ApprovalStatus(op.ApprovalStatus) == state.ApprovalStatusPending && op.PRNumber > 0 {
+			return fmt.Sprintf("Approve PR #%d", op.PRNumber)
+		}
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Review merge for PR #%d", op.PRNumber)
+		}
+		return "Review merge request"
+	case "review_repair":
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Repair review findings on PR #%d", op.PRNumber)
+		}
+		return "Repair review findings"
 	case "auto_merging":
 		return ""
 	case "outcome_drift":
@@ -3564,7 +3673,7 @@ func fleetPendingDispatchPastSLA(project fleetProjectState, now time.Time) bool 
 }
 
 func approvalPastSLA(approval *fleetApprovalState, now time.Time) bool {
-	if approval == nil {
+	if approval == nil || approval.TargetTerminal {
 		return false
 	}
 	if approval.CreatedAgeSeconds > fleetApprovalSLASeconds {
@@ -3580,7 +3689,7 @@ func oldestPastSLAPendingFleetApproval(approvals []fleetApprovalState, now time.
 	var selected *fleetApprovalState
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || fleetApprovalIsSuggestion(approval) || !approvalPastSLA(approval, now) {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || approval.TargetTerminal || fleetApprovalIsSuggestion(approval) || !approvalPastSLA(approval, now) {
 			continue
 		}
 		if selected == nil || fleetApprovalRecency(*approval).Before(fleetApprovalRecency(*selected)) {
@@ -3594,7 +3703,7 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 	var selected *fleetApprovalState
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || fleetApprovalIsSuggestion(approval) {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || approval.TargetTerminal || fleetApprovalIsSuggestion(approval) {
 			continue
 		}
 		if selected == nil {
@@ -3612,7 +3721,7 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 
 func fleetOperatorKindNeedsAction(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "error", "dispatch_failure", "metered_backend", "stale_worker", "attention", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
+	case "error", "dispatch_failure", "metered_backend", "stale_worker", "attention", "merge_action_required", "review_repair", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
 		return true
 	default:
 		return false
@@ -3680,6 +3789,8 @@ func fleetOperatorStatePriority(kind string) int {
 		return 2
 	case "attention":
 		return 3
+	case "merge_action_required", "review_repair":
+		return 3
 	case "outcome_drift":
 		return 4
 	case "stale":
@@ -3689,6 +3800,8 @@ func fleetOperatorStatePriority(kind string) int {
 	case "working":
 		return 7
 	case "monitoring_pr":
+		return 8
+	case "merge_in_progress", "code_landed":
 		return 8
 	case "auto_merging":
 		// #598: convergence-bound, calm — sort alongside monitoring_pr,
@@ -3973,6 +4086,10 @@ func latestTime(left, right time.Time) time.Time {
 }
 
 func addFleetApprovalSummary(summary *fleetSummary, approval fleetApprovalState) {
+	if approval.TargetTerminal && state.ApprovalStatus(approval.Status) == state.ApprovalStatusPending {
+		summary.ApprovalsHistorical++
+		return
+	}
 	switch state.ApprovalStatus(approval.Status) {
 	case state.ApprovalStatusPending:
 		summary.Approvals++
@@ -4367,6 +4484,9 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
 		for _, approval := range item.Approvals {
+			if approval.TargetTerminal && state.ApprovalStatus(approval.Status) == state.ApprovalStatusPending {
+				continue
+			}
 			item.ApprovalSummary[approval.Status]++
 		}
 	}
@@ -4383,6 +4503,9 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	var backendRestartSkipped []controlActionWorkerTarget
 	for _, worker := range projectState.All {
 		worker = reconcileFleetWorkerPRGate(worker, st, cfg.Repo)
+		if worker.PRGate != nil && fleetWorkerPRStateCurrent(worker) {
+			item.PRStates = appendFleetProjectPRState(item.PRStates, *worker.PRGate)
+		}
 		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
 		if worker.BackendDrift != nil && worker.BackendDrift.Stale {
 			target := controlActionWorkerTarget{
@@ -4460,6 +4583,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	})
 	item.Activity = string(activity)
 	item.ActivityReason = activityReason
+	sortFleetProjectPRStates(item.PRStates)
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
 }
@@ -4472,17 +4596,348 @@ func reconcileFleetWorkerPRGate(worker sessionInfo, st *state.State, project str
 	if st == nil || worker.IssueNumber <= 0 || worker.PRNumber <= 0 {
 		return worker
 	}
-	snapshot, ok := st.LatestPRGateSnapshot(project, worker.IssueNumber, worker.PRNumber)
-	if !ok {
+	var snapshot *state.PRGateSnapshot
+	if latest, ok := st.LatestPRGateSnapshot(project, worker.IssueNumber, worker.PRNumber); ok {
+		snapshot = &latest
+		worker.prGateSnapshot = snapshot
+	}
+	mergeApproval := latestFleetMergeApprovalForPR(st, worker.PRNumber)
+	if snapshot == nil && mergeApproval == nil && state.SessionStatus(worker.Status) != state.StatusCodeLanded {
 		return worker
 	}
-	worker.prGateSnapshot = &snapshot
-	if state.SessionStatus(worker.Status) == state.StatusRetryExhausted && fleetPRGateHasFailingChecks(&snapshot) {
+	worker.PRGate = makeFleetPRGateState(worker, snapshot, mergeApproval)
+	if worker.PRGate == nil {
+		return worker
+	}
+	if worker.PRGate.Merged {
+		if state.SessionStatus(worker.Status) != state.StatusDone {
+			worker.Status = string(state.StatusCodeLanded)
+			worker.DisplayStatus = ""
+			worker.Live = true
+		}
+		worker.StatusReason = fmt.Sprintf("PR #%d merged and code landed. %s", worker.PRNumber, worker.PRGate.Summary)
+		worker.NextAction = worker.PRGate.Summary + ". No merge or review-repair action is available; wait for any configured runtime or delivery verification."
+		worker.NeedsAttention = false
+		return worker
+	}
+	if action := worker.PRGate.MergeAction; action != nil {
+		worker.Status = string(state.StatusPROpen)
+		worker.DisplayStatus = fleetMergeActionDisplayStatus(action.Status)
+		worker.StatusReason = worker.PRGate.Summary
+		worker.NextAction = strings.TrimSpace(worker.PRGate.Summary + " " + action.NextAction)
+		worker.NeedsAttention = action.ActionRequired
+		worker.Live = true
+		return worker
+	}
+	if state.SessionStatus(worker.Status) == state.StatusRetryExhausted && fleetPRGateHasFailingChecks(snapshot) {
 		worker.StatusReason = fmt.Sprintf("PR #%d has failing checks on the current reconciled head and is awaiting in-place repair after retry exhaustion.", worker.PRNumber)
 		worker.NextAction = "Repair the existing PR in place and wait for every required check to pass; do not merge while any check is failing."
 		worker.NeedsAttention = true
+		return worker
+	}
+	if snapshot != nil {
+		switch snapshot.ReviewDecision {
+		case state.PRGateReviewBlocked:
+			worker.StatusReason = firstNonEmpty(worker.PRGate.ReviewSummary, fmt.Sprintf("PR #%d review gate requires repair.", worker.PRNumber))
+			worker.NextAction = strings.TrimSpace(worker.StatusReason + " Address the concrete review findings through the bounded review-repair/retry flow, then wait for a new current-head verdict.")
+			worker.NeedsAttention = true
+		case state.PRGateReviewPending:
+			worker.StatusReason = firstNonEmpty(worker.PRGate.ReviewSummary, fmt.Sprintf("PR #%d review gate is pending.", worker.PRNumber))
+			worker.NextAction = strings.TrimSpace(worker.StatusReason + " Wait for the current-head review result; Maestro will re-trigger or repair through the bounded flow if needed.")
+			worker.NeedsAttention = false
+		case state.PRGateReviewPassed:
+			worker.StatusReason = firstNonEmpty(worker.PRGate.ReviewSummary, fmt.Sprintf("PR #%d review gate passed.", worker.PRNumber))
+			worker.NextAction = strings.TrimSpace(worker.StatusReason + " Wait for CI/mergeability and the configured merge path.")
+			if !fleetPRGateHasFailingChecks(snapshot) {
+				worker.NeedsAttention = false
+			}
+		}
 	}
 	return worker
+}
+
+func latestFleetMergeApprovalForPR(st *state.State, prNumber int) *state.Approval {
+	if st == nil || prNumber <= 0 {
+		return nil
+	}
+	var selected *state.Approval
+	for i := range st.Approvals {
+		approval := &st.Approvals[i]
+		if approval.Action != config.SupervisorActionMergePR || approval.Target == nil || approval.Target.PR != prNumber {
+			continue
+		}
+		switch approval.Status {
+		case state.ApprovalStatusStale, state.ApprovalStatusSuperseded:
+			continue
+		}
+		if selected == nil || fleetApprovalTime(*approval).After(fleetApprovalTime(*selected)) ||
+			(fleetApprovalTime(*approval).Equal(fleetApprovalTime(*selected)) && approval.ID > selected.ID) {
+			selected = approval
+		}
+	}
+	return selected
+}
+
+func fleetApprovalTime(approval state.Approval) time.Time {
+	if !approval.UpdatedAt.IsZero() {
+		return approval.UpdatedAt.UTC()
+	}
+	return approval.CreatedAt.UTC()
+}
+
+func makeFleetPRGateState(worker sessionInfo, snapshot *state.PRGateSnapshot, mergeApproval *state.Approval) *fleetPRGateState {
+	if worker.PRNumber <= 0 {
+		return nil
+	}
+	gate := &fleetPRGateState{PRNumber: worker.PRNumber}
+	if snapshot != nil {
+		gate.CI = string(snapshot.CIEffectiveVerdict)
+		gate.Review = string(snapshot.ReviewDecision)
+		gate.UpdatedAt = formatFleetTime(snapshot.UpdatedAt)
+		if snapshot.MergeCommitSHA != "" && !snapshot.MergedAt.IsZero() {
+			gate.Merged = true
+			gate.MergedAt = formatFleetTime(snapshot.MergedAt)
+		}
+		for _, stream := range snapshot.ReviewStreams {
+			fact := fleetPRReviewStream{
+				Name:          stream.Name,
+				Passed:        stream.Passed,
+				Pending:       stream.Pending,
+				Score:         stream.Score,
+				ScoreMax:      stream.ScoreMax,
+				Verdict:       string(stream.Verdict),
+				FindingsCount: stream.FindingsCount,
+			}
+			fact.Summary = fleetPRReviewStreamSummary(fact)
+			gate.ReviewStreams = append(gate.ReviewStreams, fact)
+		}
+		gate.ReviewSummary = fleetPRReviewSummary(gate.ReviewStreams, snapshot.ReviewDecision)
+	}
+	if state.SessionStatus(worker.Status) == state.StatusCodeLanded {
+		gate.Merged = true
+	}
+	if gate.Merged {
+		if gate.ReviewSummary != "" {
+			gate.Summary = gate.ReviewSummary + " · PR merged"
+		} else {
+			gate.Summary = "PR merged"
+		}
+		return gate
+	}
+	if mergeApproval != nil {
+		gate.MergeAction = makeFleetMergeActionState(*mergeApproval, worker.PRNumber)
+		if gate.MergeAction.UpdatedAt != "" {
+			gate.UpdatedAt = gate.MergeAction.UpdatedAt
+		}
+		gate.Summary = gate.MergeAction.Summary
+		if gate.ReviewSummary != "" {
+			gate.Summary += " " + gate.ReviewSummary + "."
+		}
+		return gate
+	}
+	gate.Summary = gate.ReviewSummary
+	if gate.Summary == "" && gate.CI != "" && gate.CI != string(state.PRGateCIUnknown) {
+		gate.Summary = "CI " + gate.CI
+	}
+	return gate
+}
+
+func fleetPRReviewStreamSummary(stream fleetPRReviewStream) string {
+	name := strings.TrimSpace(stream.Name)
+	if strings.EqualFold(name, "greptile") {
+		name = "Greptile"
+	} else if name != "" {
+		name = strings.ToUpper(name[:1]) + name[1:]
+	} else {
+		name = "Review"
+	}
+	if stream.ScoreMax > 0 {
+		name += fmt.Sprintf(" %d/%d", stream.Score, stream.ScoreMax)
+	}
+	status := "passed"
+	switch {
+	case stream.Pending:
+		status = "pending"
+	case !stream.Passed:
+		status = "repair required"
+	case stream.ScoreMax == 0 && stream.Verdict == string(state.PRGateReviewVerdictOKToMerge):
+		status = "OK to merge"
+	}
+	return name + " · " + status
+}
+
+func fleetPRReviewSummary(streams []fleetPRReviewStream, decision state.PRGateReviewDecision) string {
+	if len(streams) > 0 {
+		parts := make([]string, 0, len(streams))
+		for _, stream := range streams {
+			parts = append(parts, stream.Summary)
+		}
+		return strings.Join(parts, " · ")
+	}
+	switch decision {
+	case state.PRGateReviewPassed:
+		return "Review gate · passed"
+	case state.PRGateReviewPending:
+		return "Review gate · pending"
+	case state.PRGateReviewBlocked:
+		return "Review gate · repair required"
+	case state.PRGateReviewDisabled:
+		return "Review gate · disabled"
+	default:
+		return ""
+	}
+}
+
+func makeFleetMergeActionState(approval state.Approval, prNumber int) *fleetMergeActionState {
+	status := approval.Status
+	item := &fleetMergeActionState{
+		ApprovalID: approval.ID,
+		Status:     string(status),
+		UpdatedAt:  formatFleetTime(fleetApprovalTime(approval)),
+	}
+	ref := fmt.Sprintf("PR #%d", prNumber)
+	id := approval.ID
+	switch status {
+	case state.ApprovalStatusPending:
+		item.Label = "Merge requested"
+		item.Summary = fmt.Sprintf("Merge requested for %s; approval %s is pending operator review.", ref, id)
+		item.NextAction = fmt.Sprintf("Approve or reject merge approval %s.", id)
+		item.ActionRequired = true
+	case state.ApprovalStatusApproved:
+		item.Label = "Merge approved"
+		item.Summary = fmt.Sprintf("Merge approved for %s under approval %s; execution has not started yet.", ref, id)
+		item.NextAction = "Await the merge executor; no second merge request is needed."
+	case state.ApprovalStatusAwaitingDispatch:
+		item.Label = "Merge awaiting execution"
+		item.Summary = fmt.Sprintf("Merge approval %s for %s is awaiting execution.", id, ref)
+		item.NextAction = "Await the merge executor; no second merge request is needed."
+	case state.ApprovalStatusExecuting:
+		item.Label = "Merge executing"
+		item.Summary = fmt.Sprintf("Merge approval %s is executing for %s.", id, ref)
+		item.NextAction = "Wait for GitHub terminal truth; do not submit another merge request."
+	case state.ApprovalStatusExecuted:
+		item.Label = "Merge executed"
+		item.Summary = fmt.Sprintf("Merge approval %s executed for %s; awaiting GitHub terminal reconciliation.", id, ref)
+		item.NextAction = "Wait for GitHub to report the PR as merged; no second merge request is needed."
+	case state.ApprovalStatusRejected:
+		item.Label = "Merge rejected"
+		item.Summary = fmt.Sprintf("Merge request %s for %s was rejected.", id, ref)
+		item.NextAction = "Review the rejection; request merge again only if merge is still intended."
+		item.ActionRequired = true
+	case state.ApprovalStatusExecutionFailed:
+		item.Label = "Merge execution failed"
+		item.Summary = fmt.Sprintf("Merge approval %s failed while executing for %s.", id, ref)
+		item.NextAction = "Inspect the merge failure, correct the blocker, then request merge again."
+		item.ActionRequired = true
+	case state.ApprovalStatusExecutionSkipped:
+		item.Label = "Merge deferred"
+		item.Summary = fmt.Sprintf("Merge approval %s for %s was deferred without merging.", id, ref)
+		item.NextAction = "Revalidate the current PR head and request a fresh merge when ready."
+		item.ActionRequired = true
+	default:
+		item.Label = "Merge requested"
+		item.Summary = fmt.Sprintf("Merge request %s for %s is in status %s.", id, ref, status)
+		item.NextAction = "Review the durable merge approval state."
+		item.ActionRequired = true
+	}
+	return item
+}
+
+func fleetMergeActionDisplayStatus(status string) string {
+	switch state.ApprovalStatus(status) {
+	case state.ApprovalStatusPending:
+		return "merge_requested"
+	case state.ApprovalStatusApproved:
+		return "merge_approved"
+	case state.ApprovalStatusAwaitingDispatch:
+		return "merge_awaiting_execution"
+	case state.ApprovalStatusExecuting:
+		return "merge_executing"
+	case state.ApprovalStatusExecuted:
+		return "merge_executed"
+	case state.ApprovalStatusRejected:
+		return "merge_rejected"
+	case state.ApprovalStatusExecutionFailed:
+		return "merge_execution_failed"
+	case state.ApprovalStatusExecutionSkipped:
+		return "merge_deferred"
+	default:
+		return "merge_requested"
+	}
+}
+
+func appendFleetProjectPRState(states []fleetPRGateState, candidate fleetPRGateState) []fleetPRGateState {
+	for i := range states {
+		if states[i].PRNumber != candidate.PRNumber {
+			continue
+		}
+		if fleetPRStateNewer(candidate, states[i]) {
+			states[i] = candidate
+		}
+		return states
+	}
+	return append(states, candidate)
+}
+
+func fleetWorkerPRStateCurrent(worker sessionInfo) bool {
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusDone:
+		return worker.Live && worker.PRGate != nil && worker.PRGate.Merged
+	case state.StatusPROpen, state.StatusCodeLanded, state.StatusRetryExhausted,
+		state.StatusFailed, state.StatusConflictFailed, state.StatusDead:
+		return true
+	default:
+		return worker.Live || worker.NeedsAttention
+	}
+}
+
+func sortFleetProjectPRStates(states []fleetPRGateState) {
+	sort.SliceStable(states, func(i, j int) bool {
+		li, lj := fleetPRStatePriority(states[i]), fleetPRStatePriority(states[j])
+		if li != lj {
+			return li < lj
+		}
+		ti, tj := parseFleetTime(states[i].UpdatedAt), parseFleetTime(states[j].UpdatedAt)
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return states[i].PRNumber > states[j].PRNumber
+	})
+}
+
+func fleetPRStateNewer(candidate, current fleetPRGateState) bool {
+	if candidate.Merged != current.Merged {
+		return candidate.Merged
+	}
+	ct, pt := parseFleetTime(candidate.UpdatedAt), parseFleetTime(current.UpdatedAt)
+	if !ct.Equal(pt) {
+		return ct.After(pt)
+	}
+	return candidate.PRNumber >= current.PRNumber
+}
+
+func fleetPRStatePriority(gate fleetPRGateState) int {
+	if gate.Merged {
+		return 0
+	}
+	if gate.MergeAction != nil {
+		return 1
+	}
+	switch state.PRGateReviewDecision(gate.Review) {
+	case state.PRGateReviewBlocked:
+		return 2
+	case state.PRGateReviewPending:
+		return 3
+	case state.PRGateReviewPassed:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func parseFleetTime(value string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339, strings.TrimSpace(value))
+	return parsed
 }
 
 func fleetPRGateHasFailingChecks(snapshot *state.PRGateSnapshot) bool {
@@ -4962,6 +5417,13 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			NextAction: "Fix the project state/config load error before Maestro can supervise it.",
 		}
 	}
+	// PR lifecycle precedence is explicit: terminal forge truth first, then the
+	// durable merge action, then open-PR gates. This projection runs after the
+	// worker rows have been reconciled from the durable gate snapshot, so a stale
+	// supervisor "not approved" finding cannot outrank a merge request or merge.
+	if lifecycle, ok := fleetProjectPRLifecycleOperatorState(project); ok {
+		return lifecycle
+	}
 	if state, ok := fleetDispatchFailureOperatorState(project); ok {
 		return state
 	}
@@ -5131,6 +5593,86 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		Label:      "No eligible issues",
 		Summary:    summary,
 		NextAction: "Change labels/dependencies/project status if these issues should run now.",
+	}
+}
+
+func fleetProjectPRLifecycleOperatorState(project fleetProjectState) (fleetOperatorState, bool) {
+	if len(project.PRStates) == 0 {
+		return fleetOperatorState{}, false
+	}
+	gate := project.PRStates[0]
+	base := fleetOperatorState{
+		PRNumber: gate.PRNumber,
+		PRURL:    githubPRURL(project.Repo, gate.PRNumber),
+		PRGate:   &gate,
+	}
+	for _, worker := range append(append([]sessionInfo{}, project.Active...), project.Attention...) {
+		if worker.PRNumber != gate.PRNumber {
+			continue
+		}
+		base.Session = worker.Slot
+		base.IssueNumber = worker.IssueNumber
+		base.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+		break
+	}
+	if gate.Merged {
+		base.Kind = "code_landed"
+		base.Tone = "healthy"
+		base.Label = "Merged · code landed"
+		base.Summary = fmt.Sprintf("PR #%d merged and code landed. %s", gate.PRNumber, gate.Summary)
+		base.NextAction = "No merge or review-repair action is available; wait for any configured runtime or delivery verification."
+		return base, true
+	}
+	if action := gate.MergeAction; action != nil {
+		base.ApprovalID = action.ApprovalID
+		base.ApprovalStatus = action.Status
+		base.Label = action.Label
+		base.Summary = gate.Summary
+		base.NextAction = action.NextAction
+		if action.ActionRequired {
+			base.Kind = "merge_action_required"
+			base.Tone = "attention"
+		} else {
+			base.Kind = "merge_in_progress"
+			base.Tone = "busy"
+		}
+		return base, true
+	}
+	if state.PRGateCIVerdict(gate.CI) == state.PRGateCIFailure {
+		base.Kind = "attention"
+		base.Tone = "attention"
+		base.Label = "CI repair required"
+		base.Summary = fmt.Sprintf("PR #%d has failing checks", gate.PRNumber)
+		if gate.ReviewSummary != "" {
+			base.Summary += ". " + gate.ReviewSummary + "."
+		}
+		base.NextAction = "Repair the existing PR in place and wait for every required check to pass; do not merge while checks are failing."
+		return base, true
+	}
+	switch state.PRGateReviewDecision(gate.Review) {
+	case state.PRGateReviewBlocked:
+		base.Kind = "review_repair"
+		base.Tone = "attention"
+		base.Label = "Review repair required"
+		base.Summary = firstNonEmpty(gate.ReviewSummary, fmt.Sprintf("PR #%d review gate requires repair.", gate.PRNumber))
+		base.NextAction = "Address the concrete review findings through the bounded review-repair/retry flow."
+		return base, true
+	case state.PRGateReviewPending:
+		base.Kind = "monitoring_pr"
+		base.Tone = "busy"
+		base.Label = "Review pending"
+		base.Summary = firstNonEmpty(gate.ReviewSummary, fmt.Sprintf("PR #%d review gate is pending.", gate.PRNumber))
+		base.NextAction = "Wait for the current-head review result."
+		return base, true
+	case state.PRGateReviewPassed:
+		base.Kind = "monitoring_pr"
+		base.Tone = "busy"
+		base.Label = "Review passed"
+		base.Summary = firstNonEmpty(gate.ReviewSummary, fmt.Sprintf("PR #%d review gate passed.", gate.PRNumber))
+		base.NextAction = "Review passed; wait for CI/mergeability and the configured merge path."
+		return base, true
+	default:
+		return fleetOperatorState{}, false
 	}
 }
 
@@ -5619,6 +6161,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		AdvisorBestEffort:         worker.AdvisorBestEffort,
 		AdvisorBypassed:           worker.AdvisorBypassed,
 		AdvisorReviews:            append([]state.AdvisorReview(nil), worker.AdvisorReviews...),
+		PRGate:                    worker.PRGate,
 		BackendSelection:          worker.BackendSelection,
 		PRNumber:                  worker.PRNumber,
 		PRMerged:                  worker.PRMerged,
@@ -5734,7 +6277,10 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		}
 		item.Summary = fmt.Sprintf("Issue #%d is closed; deployment/outcome work for merged PR #%d remains project-scoped (approval status: %s).", closedIssue, pr, approval.Status)
 	}
-	if approval.Status == state.ApprovalStatusPending {
+	if approval.Action == config.SupervisorActionMergePR && fleetPRMergedInState(st, project.Repo, issue, pr) {
+		item.TargetTerminal = true
+	}
+	if approval.Status == state.ApprovalStatusPending && !item.TargetTerminal {
 		item.PastSLA = approvalPastSLA(&item, now)
 	}
 	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
@@ -5783,6 +6329,23 @@ func fleetClosedIssueForApproval(st *state.State, approval state.Approval, issue
 		}
 	}
 	return 0
+}
+
+func fleetPRMergedInState(st *state.State, project string, issueNumber, prNumber int) bool {
+	if st == nil || prNumber <= 0 {
+		return false
+	}
+	if issueNumber > 0 {
+		if snapshot, ok := st.LatestPRGateSnapshot(project, issueNumber, prNumber); ok && snapshot.MergeCommitSHA != "" && !snapshot.MergedAt.IsZero() {
+			return true
+		}
+	}
+	for _, sess := range st.Sessions {
+		if sess != nil && sess.PRNumber == prNumber && sess.Status == state.StatusCodeLanded {
+			return true
+		}
+	}
+	return false
 }
 
 // safeFleetDeliveryPayload returns an API-safe copy of the strict delivery

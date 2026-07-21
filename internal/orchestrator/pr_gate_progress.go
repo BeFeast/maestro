@@ -102,7 +102,7 @@ func (o *Orchestrator) prGateHeadMatches(prNumber int, expected string) bool {
 	return true
 }
 
-func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewDecision, string, string, int) {
+func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewDecision, string, string, int, []state.PRGateReviewStream) {
 	decision := state.PRGateReviewBlocked
 	switch {
 	case verdict.Pending:
@@ -112,6 +112,7 @@ func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewD
 	}
 
 	streamParts := make([]string, 0, len(verdict.Streams))
+	streamFacts := make([]state.PRGateReviewStream, 0, len(verdict.Streams))
 	findingDigests := make([]string, 0)
 	for _, stream := range verdict.Streams {
 		perStreamFindings := make([]string, 0, len(stream.Findings))
@@ -126,13 +127,25 @@ func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewD
 			findingDigests = append(findingDigests, digest)
 		}
 		sort.Strings(perStreamFindings)
+		streamFacts = append(streamFacts, state.PRGateReviewStream{
+			Name:          strings.TrimSpace(stream.Name),
+			Passed:        stream.Passed,
+			Pending:       stream.Pending,
+			Score:         stream.Score,
+			ScoreMax:      stream.ScoreMax,
+			Verdict:       state.PRGateReviewVerdict(stream.Verdict),
+			FindingsCount: len(stream.Findings),
+		})
 		streamParts = append(streamParts, prGateOpaqueFingerprint(
 			"stream="+strings.TrimSpace(stream.Name),
 			fmt.Sprintf("passed=%t", stream.Passed),
 			fmt.Sprintf("pending=%t", stream.Pending),
+			fmt.Sprintf("score=%d/%d", stream.Score, stream.ScoreMax),
+			"verdict="+strings.TrimSpace(stream.Verdict),
 			"findings="+strings.Join(perStreamFindings, ","),
 		))
 	}
+	sort.Slice(streamFacts, func(i, j int) bool { return streamFacts[i].Name < streamFacts[j].Name })
 	sort.Strings(streamParts)
 	sort.Strings(findingDigests)
 	verdictFingerprint := prGateOpaqueFingerprint(
@@ -143,16 +156,17 @@ func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewD
 	if len(findingDigests) > 0 {
 		findingFingerprint = prGateOpaqueFingerprint("findings=" + strings.Join(findingDigests, ","))
 	}
-	return decision, verdictFingerprint, findingFingerprint, len(findingDigests)
+	return decision, verdictFingerprint, findingFingerprint, len(findingDigests), streamFacts
 }
 
 func addPRGateReviewVerdict(transition *state.PRGateTransition, verdict github.ReviewGateVerdict) {
 	if transition == nil {
 		return
 	}
-	decision, verdictFingerprint, findingsFingerprint, findingsCount := prGateReviewProgress(verdict)
+	decision, verdictFingerprint, findingsFingerprint, findingsCount, streams := prGateReviewProgress(verdict)
 	transition.ReviewObserved = true
 	transition.ReviewDecision = decision
+	transition.ReviewStreams = streams
 	transition.ReviewVerdictFingerprint = verdictFingerprint
 	transition.ActionableFindingsFingerprint = findingsFingerprint
 	transition.ActionableFindingsCount = findingsCount

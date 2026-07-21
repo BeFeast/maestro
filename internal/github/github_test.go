@@ -406,6 +406,57 @@ func TestGreptileCheckDecision(t *testing.T) {
 			wantFound: true,
 		},
 		{
+			name: "three of five requires repair even on successful check",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "success",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "Confidence Score: 3/5"},
+			}},
+			wantFound: true,
+		},
+		{
+			name: "four of five passes even on generic failed conclusion",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "failure",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "Confidence Score: 4/5"},
+			}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
+			name: "five of five passes",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "success",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "Confidence Score: 5/5"},
+			}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
+			name: "explicit ok to merge passes",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "failure",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "OK to merge"},
+			}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
 			name:   "non-greptile is ignored",
 			checks: []greptileCheckRun{{Name: "CI", Conclusion: "success"}},
 		},
@@ -445,6 +496,33 @@ func TestGreptileCommentDecisionIgnoresHumanMentionsAndUsesLatestBotVerdict(t *t
 	})
 	if !found || !approved {
 		t.Fatalf("latest Greptile bot verdict = (%t,%t), want approved", found, approved)
+	}
+
+	found, approved = greptileCommentDecision([]issueComment{
+		comment("greptile-app[bot]", "Confidence Score: 3/5\n**OK to merge**"),
+	})
+	if !found || !approved {
+		t.Fatalf("explicit OK to merge verdict = (%t,%t), want approved", found, approved)
+	}
+}
+
+func TestGreptileReviewSignalCarriesScoreAndVerdict(t *testing.T) {
+	for _, tt := range []struct {
+		text        string
+		wantScore   int
+		wantPassed  bool
+		wantVerdict string
+	}{
+		{text: "Confidence Score: 3/5", wantScore: 3, wantVerdict: reviewVerdictRepairRequired},
+		{text: "Confidence Score: 4/5", wantScore: 4, wantPassed: true, wantVerdict: reviewVerdictPassed},
+		{text: "Confidence Score: 5/5", wantScore: 5, wantPassed: true, wantVerdict: reviewVerdictPassed},
+		{text: "3/5 — OK to merge", wantScore: 3, wantPassed: true, wantVerdict: reviewVerdictOKToMerge},
+		{text: "3/5 — not OK to merge", wantScore: 3, wantVerdict: reviewVerdictRepairRequired},
+	} {
+		got := greptileSignalFromText(tt.text)
+		if got.Score != tt.wantScore || got.ScoreMax != 5 || got.Passed != tt.wantPassed || got.Verdict != tt.wantVerdict {
+			t.Fatalf("greptileSignalFromText(%q) = %+v", tt.text, got)
+		}
 	}
 }
 
