@@ -4,14 +4,14 @@ Maestro workers use one service-level private environment file. Generated
 `*-run.sh` files contain only variable names and that file's path; no worker gets
 a per-slot secret copy. Immediately before starting a worker, Maestro opens the
 file without following symlinks, verifies ownership and mode, allow-lists the
-provider variables, removes stale values inherited from tmux, and injects the
+worker provider/GitHub variables, removes stale values inherited from tmux, and injects the
 current values only into the worker process environment. Combined worker output
 is redacted from that same in-memory snapshot before JSONL or log persistence.
 
 The production boundary is an operator-owned file named by
-`MAESTRO_WORKER_CREDENTIALS_FILE`. If any known provider value is present in the
+`MAESTRO_WORKER_CREDENTIALS_FILE`. If any known worker credential value is present in the
 daemon environment without that reference, worker spawn fails closed. A worker
-that uses CLI-native authentication and has no ambient provider values may run
+that uses CLI-native authentication and has no ambient worker credential values may run
 without the file. Maestro never creates a fallback, project-local, or per-slot
 credential copy.
 
@@ -22,9 +22,9 @@ credential copy.
   or stricter). Symlinks in the path are rejected.
 - Use simple `KEY=value` assignments. Single- or double-quoted values are
   accepted. Only `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN`, `CLIPROXY_API_KEY`, `GEMINI_API_KEY`,
-  `OPENAI_BASE_URL`, and `OPENAI_API_KEY` are passed to a worker; unrelated
-  assignments are ignored.
+  `ANTHROPIC_AUTH_TOKEN`, `CLIPROXY_API_KEY`, `GEMINI_API_KEY`, `GH_TOKEN`,
+  `GITHUB_TOKEN`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` are passed to a
+  worker; unrelated assignments are ignored.
 - A secret manager must write/rotate the file directly. Never place a value in a
   shell argument, issue, PR, note, unit, journal message, or pasteback.
 
@@ -45,7 +45,7 @@ perform it while merely reviewing the code change.
    Environment=MAESTRO_WORKER_CREDENTIALS_FILE=%h/.config/maestro/private/worker-proxy.env
    ```
 
-3. In the same change, remove every provider token/key from literal
+3. In the same change, remove every worker provider/GitHub token or key from literal
    `Environment=` lines and from any other drop-in. Keep non-secret settings such
    as `PATH` unchanged.
 4. Let the single daemon's normal SIGTERM path drain active workers, then reload

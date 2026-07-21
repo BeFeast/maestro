@@ -279,6 +279,10 @@ telegram:
 
 `issue_label` is still supported for backward compatibility, but `issue_labels` is recommended for new configs.
 
+For the explicit, default-off SSH worker spike, including runner provisioning,
+short-lived credential handling, measurements, rollback, and exact zombie
+cleanup, see the [remote worker runbook](docs/remote-runner-spike.md).
+
 ## AI Backends
 
 Maestro supports multiple AI coding agents. Configure via `model:` in `maestro.yaml`:
