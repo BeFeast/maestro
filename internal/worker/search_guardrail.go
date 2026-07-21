@@ -13,12 +13,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 var searchGuardedCommands = []string{"rg", "find", "grep"}
+
+var searchGuardrailInstallMu sync.Mutex
+
+const (
+	searchGuardrailDirName     = "search-guardrails"
+	searchGuardrailMarker      = "[maestro] search guardrail:"
+	searchGuardrailScriptMark  = "# maestro-search-guardrail-wrapper"
+	searchGuardrailWrapperMode = 0o755
+)
 
 // workerCredentialEnvKeys are the provider credential env vars the worker
 // harness needs to reach CLIProxyAPI / upstream APIs. The daemon inherits them
@@ -84,27 +94,148 @@ const (
 )
 
 func ensureSearchGuardrailWrappers(stateDir string) (string, error) {
+	searchGuardrailInstallMu.Lock()
+	defer searchGuardrailInstallMu.Unlock()
+
 	if strings.TrimSpace(stateDir) == "" {
 		return "", fmt.Errorf("empty state dir")
 	}
-	guardDir := filepath.Join(stateDir, "search-guardrails")
+	guardDir, err := filepath.Abs(filepath.Join(stateDir, searchGuardrailDirName))
+	if err != nil {
+		return "", fmt.Errorf("prepare search guardrails: resolve destination directory")
+	}
+
+	// Resolve every target from the daemon's PATH before creating or publishing
+	// wrappers. In particular, never let a nested Maestro worker pin an older
+	// wrapper inherited through PATH as the "real" command.
+	targets := make(map[string]string, len(searchGuardedCommands))
+	for _, name := range searchGuardedCommands {
+		target, err := resolveTrustedSearchCommand(name, guardDir)
+		if err != nil {
+			return "", fmt.Errorf("prepare search guardrail %s: resolve trusted executable", name)
+		}
+		targets[name] = target
+	}
+
 	if err := os.MkdirAll(guardDir, 0755); err != nil {
-		return "", fmt.Errorf("create search guardrail dir: %w", err)
+		return "", fmt.Errorf("prepare search guardrails: create destination directory")
 	}
 	for _, name := range searchGuardedCommands {
 		path := filepath.Join(guardDir, name)
-		if err := os.WriteFile(path, []byte(searchGuardrailWrapperScript), 0755); err != nil {
-			return "", fmt.Errorf("write search guardrail wrapper %s: %w", name, err)
+		content := buildSearchGuardrailWrapperScript(name, targets[name], guardDir)
+		if searchGuardrailWrapperCurrent(path, content) {
+			continue
+		}
+		if err := writeFileAtomicMode(guardDir, path, content, searchGuardrailWrapperMode); err != nil {
+			// These errors can be surfaced through worker failures and eventually
+			// copied to GitHub. Keep the command and failed stage, but not a private
+			// state-directory path from the underlying filesystem error.
+			return "", fmt.Errorf("prepare search guardrail %s: install wrapper atomically", name)
 		}
 	}
 	return guardDir, nil
 }
 
-const searchGuardrailWrapperScript = `#!/bin/sh
-cmd=${0##*/}
-real_path=$(PATH="${MAESTRO_ORIGINAL_PATH:-$PATH}" command -v "$cmd" 2>/dev/null)
-if [ -z "$real_path" ]; then
-  echo "[maestro] search guardrail: unable to locate real $cmd" >&2
+func searchGuardrailWrapperCurrent(path, content string) bool {
+	f, err := openFilePathNoFollow(path, unix.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != searchGuardrailWrapperMode {
+		return false
+	}
+	if err := checkOwnedByUs(path, info); err != nil {
+		return false
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(len(content)+1)))
+	return err == nil && string(data) == content
+}
+
+func resolveTrustedSearchCommand(name, guardDir string) (string, error) {
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate, err := filepath.Abs(filepath.Join(dir, name))
+		if err != nil || isSearchGuardrailPath(candidate, guardDir) {
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil || isSearchGuardrailPath(resolved, guardDir) {
+			continue
+		}
+		if isMaestroSearchGuardrailExecutable(resolved) {
+			continue
+		}
+		return resolved, nil
+	}
+	return "", fmt.Errorf("no executable outside a search guardrail directory")
+}
+
+func isMaestroSearchGuardrailExecutable(path string) bool {
+	f, err := openFilePathNoFollow(path, unix.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 64<<10))
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(data, []byte(searchGuardrailScriptMark)) ||
+		bytes.Contains(data, []byte(searchGuardrailMarker))
+}
+
+func isSearchGuardrailPath(path, guardDir string) bool {
+	path = filepath.Clean(path)
+	guardDir = filepath.Clean(guardDir)
+	if rel, err := filepath.Rel(guardDir, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return true
+	}
+	for dir := filepath.Dir(path); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		if filepath.Base(dir) == searchGuardrailDirName {
+			return true
+		}
+	}
+	return false
+}
+
+func buildSearchGuardrailWrapperScript(name, realPath, guardDir string) string {
+	return `#!/bin/sh
+` + searchGuardrailScriptMark + `
+cmd=` + shellQuote(name) + `
+real_path=` + shellQuote(realPath) + `
+guard_dir=` + shellQuote(guardDir) + `
+
+case "$real_path" in
+  "$guard_dir"|"$guard_dir"/*|*/search-guardrails/*)
+    echo "[maestro] search guardrail: refusing unsafe executable for $cmd" >&2
+    exit 126
+    ;;
+esac
+if [ "$real_path" = "$0" ] || [ "$real_path" -ef "$0" ] 2>/dev/null; then
+  echo "[maestro] search guardrail: refusing self-execution for $cmd" >&2
+  exit 126
+fi
+for guard_path in "$guard_dir"/*; do
+  [ -e "$guard_path" ] || continue
+  if [ "$real_path" -ef "$guard_path" ] 2>/dev/null; then
+    echo "[maestro] search guardrail: refusing unsafe executable for $cmd" >&2
+    exit 126
+  fi
+done
+if [ ! -f "$real_path" ] || [ ! -x "$real_path" ]; then
+  echo "[maestro] search guardrail: trusted executable unavailable for $cmd" >&2
   exit 127
 fi
 
@@ -324,6 +455,7 @@ fi
 
 exec "$real_path" "$@"
 `
+}
 
 // streamSplit configures the worker runner to route a backend's structured
 // NDJSON stream through `maestro stream-split` before tee: the raw frames are
