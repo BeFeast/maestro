@@ -72,11 +72,13 @@ export function mapFleetResponse(raw, now = Date.now()) {
     Number(summary.outcome_drift || 0) +
     Number(summary.no_eligible_issues || 0);
   const providerModelHealth = aggregateProviderModelHealth(raw.projects || [], now);
+  const tmpfsHygiene = mapTmpfsHygiene(raw.tmpfs_hygiene);
 
   return {
     raw,
     readOnly: raw.read_only === true,
     emergency: mapEmergency(raw.emergency),
+    tmpfsHygiene,
     refreshedAt: raw.refreshed_at || "",
     nextAction: raw.next_action || null,
     verdict: pickVerdictTuple(raw.verdict, raw.operator_brief),
@@ -93,7 +95,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
     heartbeatBpm: estimateHeartbeatBpm(summary, raw.verdict?.tone),
     workerCount: Number(summary.running || 0),
     prCount: Number(summary.pr_open || 0),
-    attentionCount,
+    attentionCount: attentionCount + (tmpfsHygiene?.pressure ? 1 : 0),
     activeApprovals: Number(summary.approvals_pending || 0),
     selfResolvingCount: selfResolving,
     throughputMerged7d: Number(summary.throughput_merged_7d || 0),
@@ -106,6 +108,21 @@ export function mapFleetResponse(raw, now = Date.now()) {
     providerModelHealth,
     backendQuota: aggregateBackendQuota(raw.projects || [], providerModelHealth),
     costObservability: mapCostObservability(raw.cost_observability),
+  };
+}
+
+export function mapTmpfsHygiene(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    timestamp: String(raw.timestamp || ""),
+    mode: String(raw.mode || ""),
+    tmpfs: raw.tmpfs === true,
+    usePct: Number(raw.use_pct || 0),
+    pressure: raw.pressure === true,
+    attentionCode: String(raw.attention_code || ""),
+    freedBytes: Number(raw.freed_bytes || 0),
+    protectedEntries: Number(raw.protected_entries || 0),
+    error: String(raw.error || ""),
   };
 }
 
