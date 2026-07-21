@@ -2768,6 +2768,14 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 	// (+ crashpad) processes and their temp dirs behind; clean them on startup.
 	worker.SweepStaleVisualQA()
 
+	// Reap orphan container-client wrappers left by a previous run (#977): a
+	// `docker run` verification wrapper whose owning worker died can outlive it
+	// as a parentless (PPID=1) zombie once its named container exits. A unit
+	// restart cannot reparent it back, so clear terminal-container orphans on
+	// startup alongside the visual-QA sweep. The watchdog interval catches ones
+	// that appear while the daemon keeps running.
+	worker.ReapOrphanContainerWrappers(nil)
+
 	// One-time startup sequence before the first poll cycle. The provider-
 	// credential scrub (#888) runs in BOTH the long-running daemon and a
 	// `run --once` reconcile; the daemon-restart reconciliation steps are
@@ -8532,15 +8540,7 @@ func (o *Orchestrator) revalidateSpawnRepairPR(s *state.State, target *state.Sup
 func (o *Orchestrator) automaticOutcomeRecoveryOwnsFailure(s *state.State) bool {
 	return o != nil && o.cfg != nil && o.cfg.Outcome.AutomaticRecoveryEnabled() &&
 		s != nil && s.OutcomeHealth != nil && s.OutcomeHealth.State == outcome.HealthFailing &&
-		activeOutcomeRecovery(s.OutcomeRecovery)
-}
-
-func activeOutcomeRecovery(recovery *outcome.RecoveryState) bool {
-	if recovery == nil {
-		return false
-	}
-	return recovery.Status == outcome.RecoveryStatusExecuting ||
-		recovery.Status == outcome.RecoveryStatusVerificationPending
+		s.OutcomeRecovery.OwnsActiveFailure(time.Now().UTC())
 }
 
 func activeIssueClaimForSession(s *state.State, issueNumber int, slot string) (state.IssueClaim, bool) {
