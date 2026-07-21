@@ -5977,9 +5977,9 @@ func TestCheckSessions_ClosedNoDeliveryIssueBecomesDoneWhenProjectOutcomeFails(t
 	}
 	s.Sessions["pan-10"] = &state.Session{
 		IssueNumber: 100,
-		IssueTitle:  "failed worker",
-		Status:      state.StatusFailed,
-		Branch:      "feat/pan-10-100-failed",
+		IssueTitle:  "dead worker",
+		Status:      state.StatusDead,
+		Branch:      "feat/pan-10-100-dead",
 		Worktree:    worktree,
 		FinishedAt:  &now,
 	}
@@ -5990,7 +5990,7 @@ func TestCheckSessions_ClosedNoDeliveryIssueBecomesDoneWhenProjectOutcomeFails(t
 	if sess.Status != state.StatusDone {
 		t.Fatalf("status = %q, want %q: no merged revision is owned by this closed issue", sess.Status, state.StatusDone)
 	}
-	if sess.Branch != "feat/pan-10-100-failed" {
+	if sess.Branch != "feat/pan-10-100-dead" {
 		t.Fatalf("branch = %q, want retained branch unchanged", sess.Branch)
 	}
 	if sess.Worktree != worktree {
