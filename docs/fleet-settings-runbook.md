@@ -34,6 +34,8 @@ overrides.
 | `supervisor.effort` | string | supervisor reasoning effort |
 | `supervisor.allow_metered_backend` | bool | allow a per-token supervisor backend (#838) |
 | `supervisor.always_consult_llm` | bool | force an LLM call every cycle (#837) |
+| `supervisor.unchanged_decision_window_seconds` | int | roll up identical recommendation journal lines (default 3600) |
+| `supervisor.recommendation_ttl_seconds` | int | drop unconsumed recommendations with a disposition after this age (default 86400) |
 | `poll_interval_seconds` | int | supervise/orchestrate poll cadence |
 | `worker_max_tokens` | int | enforce a per-attempt live token ceiling (0 = unlimited) |
 

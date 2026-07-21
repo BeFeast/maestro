@@ -147,6 +147,32 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 // operator at the right cycle, and `maestro supervise --json` remains the
 // source for the full record. Keyed on the unique fleet name passed in.
 func logSupervisorDecision(name string, decision state.SupervisorDecision) {
+	if decision.JournalEvent == state.SupervisorJournalSuppressed {
+		return
+	}
+	if decision.JournalEvent == state.SupervisorJournalRollup {
+		firstSeen := decision.FirstSeenAt
+		if firstSeen.IsZero() {
+			firstSeen = decision.CreatedAt
+		}
+		parts := supervisorDecisionLogParts(decision)
+		log.Printf("[%s] supervise decision still held, seen %d times since %s: %s",
+			name, decision.SeenCount, firstSeen.UTC().Format(time.RFC3339), strings.Join(parts, " "))
+		return
+	}
+	if decision.JournalEvent == state.SupervisorJournalDisposition && decision.Disposition != nil {
+		parts := supervisorDecisionLogParts(decision)
+		parts = append(parts,
+			fmt.Sprintf("disposition=%s", decision.Disposition.Status),
+			fmt.Sprintf("disposition_reason=%s", decision.Disposition.Reason),
+		)
+		log.Printf("[%s] supervise recommendation disposition: %s", name, strings.Join(parts, " "))
+		return
+	}
+	log.Printf("[%s] supervise decision: %s", name, strings.Join(supervisorDecisionLogParts(decision), " "))
+}
+
+func supervisorDecisionLogParts(decision state.SupervisorDecision) []string {
 	parts := []string{fmt.Sprintf("action=%s", decision.RecommendedAction)}
 	if decision.Status != "" {
 		parts = append(parts, fmt.Sprintf("status=%s", decision.Status))
@@ -173,7 +199,10 @@ func logSupervisorDecision(name string, decision state.SupervisorDecision) {
 	if summary := strings.TrimSpace(decision.Summary); summary != "" {
 		parts = append(parts, fmt.Sprintf("summary=%q", summary))
 	}
-	log.Printf("[%s] supervise decision: %s", name, strings.Join(parts, " "))
+	if recommendationID := strings.TrimSpace(decision.RecommendationID); recommendationID != "" {
+		parts = append(parts, fmt.Sprintf("recommendation=%s", recommendationID))
+	}
+	return parts
 }
 
 // supervisorTargetLabel renders a decision target compactly (issue/PR/session)

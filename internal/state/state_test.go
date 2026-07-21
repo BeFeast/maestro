@@ -1853,6 +1853,190 @@ func TestRecordSupervisorDecisionPrunesOldRecords(t *testing.T) {
 	}
 }
 
+func TestRecordSupervisorDecisionWithPolicyCoalescesAndRollsUp(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := SupervisorDecision{
+		ID:                "sup-first",
+		CreatedAt:         base,
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100, Session: "slot-1"},
+		PolicyRule:        "runtime_state",
+		Summary:           "Monitor PR #1100 for issue #1022: CI status=pending",
+	}
+
+	first := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	if first.JournalEvent != SupervisorJournalInitial || first.SeenCount != 1 {
+		t.Fatalf("first observation = %+v, want initial/count=1", first)
+	}
+	second := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(5*time.Minute))
+	if second.JournalEvent != SupervisorJournalSuppressed || second.SeenCount != 2 {
+		t.Fatalf("second observation = %+v, want suppressed/count=2", second)
+	}
+	third := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(time.Hour))
+	if third.JournalEvent != SupervisorJournalRollup || third.SeenCount != 3 {
+		t.Fatalf("third observation = %+v, want rollup/count=3", third)
+	}
+	if len(s.SupervisorDecisions) != 1 {
+		t.Fatalf("decision episodes = %d, want 1", len(s.SupervisorDecisions))
+	}
+	latest := s.LatestSupervisorDecision()
+	if latest == nil || !latest.FirstSeenAt.Equal(base) || !latest.LastSeenAt.Equal(base.Add(time.Hour)) {
+		t.Fatalf("latest first/last = %+v", latest)
+	}
+	if latest.ID != "sup-first" || latest.RecommendationID == "" {
+		t.Fatalf("stable episode identity = id:%q recommendation:%q", latest.ID, latest.RecommendationID)
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyDropsExpiredRecommendation(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := SupervisorDecision{
+		ID:                "sup-expiring",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "Monitor unchanged blocked PR",
+	}
+	s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+
+	expired := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(24*time.Hour))
+	if expired.JournalEvent != SupervisorJournalDisposition {
+		t.Fatalf("journal event = %q, want disposition", expired.JournalEvent)
+	}
+	if expired.Disposition == nil || expired.Disposition.Status != RecommendationDispositionDropped || expired.Disposition.Reason != RecommendationDispositionTTLExpired {
+		t.Fatalf("disposition = %+v, want dropped/ttl", expired.Disposition)
+	}
+	if !s.SupervisorRecommendationDropped(decision) {
+		t.Fatal("expired recommendation was not fenced from later actuation")
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyReturningIdentityStartsFreshEpisode(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	a := SupervisorDecision{
+		ID:                "sup-a-first",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "Monitor PR #1100",
+	}
+	b := SupervisorDecision{
+		ID:                "sup-b",
+		RecommendedAction: "wait_for_review",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "Wait for review on PR #1100",
+	}
+
+	firstA := s.RecordSupervisorDecisionWithPolicy(a, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	s.RecordSupervisorDecisionWithPolicy(b, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(10*time.Minute))
+	a.ID = "sup-a-returned"
+	returnedA := s.RecordSupervisorDecisionWithPolicy(a, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(20*time.Minute))
+
+	if returnedA.JournalEvent != SupervisorJournalInitial || returnedA.SeenCount != 1 {
+		t.Fatalf("returned A = %+v, want a fresh transition episode", returnedA)
+	}
+	if returnedA.ID == firstA.ID || !returnedA.FirstSeenAt.Equal(base.Add(20*time.Minute)) {
+		t.Fatalf("returned A reused historical episode: first=%+v returned=%+v", firstA, returnedA)
+	}
+	if returnedA.Disposition != nil {
+		t.Fatalf("returned A inherited historical disposition: %+v", returnedA.Disposition)
+	}
+	if len(s.SupervisorDecisions) != 3 {
+		t.Fatalf("episodes = %d, want A -> B -> A", len(s.SupervisorDecisions))
+	}
+	if got := s.SupervisorDecisions[0].Disposition; got == nil || got.Reason != RecommendationDispositionSuperseded {
+		t.Fatalf("first A disposition = %+v, want superseded", got)
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyRollsUpMaterializedRecommendation(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := SupervisorDecision{
+		ID:                "sup-approval",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 1022},
+		Summary:           "Start a worker",
+	}
+	decision = s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	decision.ApprovalID = "approval-1"
+	decision.Disposition = &RecommendationDisposition{
+		Status: RecommendationDispositionMaterialized,
+		Reason: RecommendationDispositionApprovalRecorded,
+		At:     base,
+	}
+	if !s.UpdateSupervisorDecisionEpisode(decision) {
+		t.Fatal("materialized episode update failed")
+	}
+
+	rollup := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(time.Hour))
+	if rollup.JournalEvent != SupervisorJournalRollup || rollup.SeenCount != 2 {
+		t.Fatalf("materialized repeat = %+v, want hourly roll-up", rollup)
+	}
+	if rollup.ApprovalID != "approval-1" || rollup.Disposition == nil || rollup.Disposition.Status != RecommendationDispositionMaterialized {
+		t.Fatalf("materialization receipt was not preserved: %+v", rollup)
+	}
+}
+
+func TestMarkSupervisorRecommendationMaterialized(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := s.RecordSupervisorDecisionWithPolicy(SupervisorDecision{
+		ID:                "sup-worker",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 1022},
+		Summary:           "Start a worker",
+	}, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+
+	if !s.MarkSupervisorRecommendationMaterialized(decision.ID, RecommendationDispositionWorkerStarted, base.Add(time.Minute)) {
+		t.Fatal("worker-start materialization was not recorded")
+	}
+	latest := s.LatestSupervisorDecision()
+	if latest == nil || latest.Disposition == nil || latest.Disposition.Status != RecommendationDispositionMaterialized || latest.Disposition.Reason != RecommendationDispositionWorkerStarted {
+		t.Fatalf("latest disposition = %+v, want materialized/worker_started", latest)
+	}
+	if s.MarkSupervisorRecommendationMaterialized(decision.ID, RecommendationDispositionWorkerStarted, base.Add(2*time.Minute)) {
+		t.Fatal("terminal materialization changed on a duplicate receipt")
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyLogsGuardTransitionsOnly(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	blocked := SupervisorDecision{
+		ID:                "sup-blocked",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		PolicyRule:        "supervisor.excluded_labels",
+		Summary:           `Do not repair while current issue label "blocked" excludes dispatch`,
+		Quiescent:         true,
+	}
+	first := s.RecordSupervisorDecisionWithPolicy(blocked, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	repeat := s.RecordSupervisorDecisionWithPolicy(blocked, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(3*time.Hour))
+	if first.JournalEvent != SupervisorJournalInitial || repeat.JournalEvent != SupervisorJournalSuppressed {
+		t.Fatalf("blocked events = %q, %q; want initial then suppressed", first.JournalEvent, repeat.JournalEvent)
+	}
+	if len(s.SupervisorDecisions) != 1 || repeat.SeenCount != 2 {
+		t.Fatalf("blocked episode = len:%d count:%d", len(s.SupervisorDecisions), repeat.SeenCount)
+	}
+
+	unblocked := blocked
+	unblocked.ID = "sup-unblocked"
+	unblocked.RecommendedAction = "spawn_repair_worker"
+	unblocked.PolicyRule = "runtime_state"
+	unblocked.Summary = "Start a repair worker"
+	unblocked.Quiescent = false
+	edge := s.RecordSupervisorDecisionWithPolicy(unblocked, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(3*time.Hour+time.Minute))
+	if edge.JournalEvent != SupervisorJournalInitial || len(s.SupervisorDecisions) != 2 {
+		t.Fatalf("transition edge = %+v, episodes=%d", edge, len(s.SupervisorDecisions))
+	}
+	prior := s.SupervisorDecisions[0]
+	if prior.Disposition == nil || prior.Disposition.Reason != RecommendationDispositionSuperseded {
+		t.Fatalf("blocked episode disposition = %+v, want superseded", prior.Disposition)
+	}
+}
+
 func TestSaveMergesIndependentConcurrentUpdates(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 5, 1, 13, 46, 2, 0, time.UTC)
