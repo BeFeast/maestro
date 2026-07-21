@@ -4571,10 +4571,11 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			}
 		}
 		if worker.NeedsAttention {
-			if canonical, ok := fleetSupersedingIssueSession(worker, projectState.All); ok {
+			if canonical, ok := fleetSupersedingAttentionSession(worker, projectState.All, st); ok {
 				worker.NeedsAttention = false
+				worker.Live = false
 				worker.StatusReason = fmt.Sprintf("superseded by canonical session %s (%s)", canonical.Slot, canonical.Status)
-				worker.NextAction = "No operator action required: follow the canonical session for this issue."
+				worker.NextAction = "No operator action required: follow the current session or declared continuation."
 			}
 		}
 		if audit, isStale := staleSlots[worker.Slot]; isStale {
@@ -5045,6 +5046,24 @@ func fleetPRGateHasFailingChecks(snapshot *state.PRGateSnapshot) bool {
 func fleetPRGateChecksSucceeded(snapshot *state.PRGateSnapshot) bool {
 	return snapshot != nil && snapshot.CIRollupVerdict != state.PRGateCIFailure &&
 		snapshot.CIEffectiveVerdict == state.PRGateCISuccess
+}
+
+// fleetSupersedingAttentionSession applies the durable lifecycle predicate
+// before the Fleet-only compatibility rules below. State owns same-issue and
+// shared-PR chronological truth with full time.Time precision; the legacy
+// projection rules retain explicit duplicate-dispatch handling for historical
+// snapshots that predate precise session ordering.
+func fleetSupersedingAttentionSession(candidate sessionInfo, all []sessionInfo, st *state.State) (sessionInfo, bool) {
+	if st != nil {
+		if slot, _, ok := st.SupersedingSession(st.Sessions[candidate.Slot]); ok {
+			for _, peer := range all {
+				if peer.Slot == slot {
+					return peer, true
+				}
+			}
+		}
+	}
+	return fleetSupersedingIssueSession(candidate, all)
 }
 
 // fleetSupersedingIssueSession identifies terminal duplicate attempts that

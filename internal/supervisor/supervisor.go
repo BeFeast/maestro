@@ -1548,6 +1548,9 @@ func detectVisualEvidenceStuckStates(st *state.State) []state.SupervisorStuckSta
 		if sess == nil || sess.VisualEvidence != state.VisualEvidenceMissing || sess.PRNumber <= 0 {
 			continue
 		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
+			continue
+		}
 		switch sess.Status {
 		case state.StatusPROpen, state.StatusQueued, state.StatusRetryExhausted:
 		default:
@@ -1886,6 +1889,9 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 		if sess == nil {
 			continue
 		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
+			continue
+		}
 		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}
 
 		// #877: a session the daemon deliberately checkpointed on shutdown
@@ -2003,13 +2009,13 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		if sess == nil {
 			continue
 		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
+			continue
+		}
 		if !sessionCanStillBlockProgress(sess.Status) {
 			continue
 		}
 		if e.sessionResolvedOnGitHub(sess, cache) {
-			continue
-		}
-		if sess.Status == state.StatusRetryExhausted && e.retryExhaustedSessionSupersededByIssueProgress(st, sess) {
 			continue
 		}
 		pr, found := openPRForSession(sess, byNumber, byBranch)
@@ -2247,6 +2253,9 @@ func (e *Engine) detectEnvironmentStuckStates(st *state.State, eligible []github
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || strings.TrimSpace(sess.Worktree) == "" || strings.TrimSpace(e.cfg.WorktreeBase) == "" {
+			continue
+		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
 			continue
 		}
 		if !pathWithinBase(sess.Worktree, e.cfg.WorktreeBase) {
@@ -3043,6 +3052,9 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
+			continue
+		}
 		var pr github.PR
 		var found bool
 		if sess.Branch != "" {
@@ -3607,42 +3619,8 @@ func (e *Engine) retryExhaustedSessionResolvedOnGitHub(sess *state.Session, cach
 }
 
 func (e *Engine) retryExhaustedSessionResolved(st *state.State, sess *state.Session, cache *resolutionCache) bool {
-	return e.retryExhaustedSessionResolvedOnGitHub(sess, cache) || e.retryExhaustedSessionSupersededByIssueProgress(st, sess)
-}
-
-func (e *Engine) retryExhaustedSessionSupersededByIssueProgress(st *state.State, exhausted *state.Session) bool {
-	if st == nil || exhausted == nil || exhausted.IssueNumber <= 0 {
-		return false
-	}
-	exhaustedAt := state.SessionChangedAt(exhausted)
-	for _, sess := range st.Sessions {
-		if sess == nil || sess == exhausted || sess.IssueNumber != exhausted.IssueNumber {
-			continue
-		}
-		if !sessionCanSupersedeRetryExhausted(sess) {
-			continue
-		}
-		if !exhaustedAt.IsZero() && !state.SessionChangedAt(sess).After(exhaustedAt) {
-			continue
-		}
-		if sess.Status == state.StatusRunning && sess.PID > 0 && !e.pidAlive(sess.PID) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-func sessionCanSupersedeRetryExhausted(sess *state.Session) bool {
-	if sess == nil {
-		return false
-	}
-	switch sess.Status {
-	case state.StatusRunning, state.StatusQueued, state.StatusPROpen, state.StatusCodeLanded, state.StatusDone:
-		return true
-	default:
-		return false
-	}
+	_, _, superseded := st.SupersedingSession(sess)
+	return e.retryExhaustedSessionResolvedOnGitHub(sess, cache) || superseded
 }
 
 func (e *Engine) sessionResolvedOnGitHub(sess *state.Session, cache *resolutionCache) bool {
@@ -4664,7 +4642,7 @@ func (e *Engine) canonicalOpenPROwners(st *state.State, byNumber map[int]github.
 		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
-		if sess.Status == state.StatusRetryExhausted && e.retryExhaustedSessionSupersededByIssueProgress(st, sess) {
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
 			continue
 		}
 		pr, found := openPRForSession(sess, byNumber, byBranch)
