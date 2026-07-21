@@ -1287,19 +1287,25 @@ type ApprovalAudit struct {
 }
 
 type State struct {
-	Sessions            map[string]*Session                 `json:"sessions"`
-	Missions            map[int]*Mission                    `json:"missions,omitempty"` // parent issue number → mission
-	SupervisorDecisions []SupervisorDecision                `json:"supervisor_decisions,omitempty"`
-	Approvals           []Approval                          `json:"approvals,omitempty"`
-	LessonProposals     []LessonProposal                    `json:"lesson_proposals,omitempty"`
-	OutcomeHealth       *outcome.HealthCheckResult          `json:"outcome_health,omitempty"`
-	OutcomeRecovery     *outcome.RecoveryState              `json:"outcome_recovery,omitempty"`
-	BackendHealth       map[string]BackendHealth            `json:"backend_health,omitempty"`
-	ProviderModelHealth map[string]map[string]BackendHealth `json:"provider_model_health,omitempty"`
-	BackendQuotaUsage   map[string]*BackendQuotaUsage       `json:"backend_quota_usage,omitempty"`
-	ProjectStatusSync   map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
-	NextSlot            int                                 `json:"next_slot"`
-	LastMergeAt         time.Time                           `json:"last_merge_at,omitempty"`
+	Sessions            map[string]*Session        `json:"sessions"`
+	Missions            map[int]*Mission           `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision       `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval                 `json:"approvals,omitempty"`
+	LessonProposals     []LessonProposal           `json:"lesson_proposals,omitempty"`
+	OutcomeHealth       *outcome.HealthCheckResult `json:"outcome_health,omitempty"`
+	OutcomeRecovery     *outcome.RecoveryState     `json:"outcome_recovery,omitempty"`
+	// OutcomeGateStreaks tracks per-gate consecutive scheduled-failure runs with
+	// a failure fingerprint (gate name + reason class). OutcomeGateStreakCheckedAt
+	// is the CheckedAt of the last health result already folded into the streaks,
+	// so each scheduled run increments a streak exactly once.
+	OutcomeGateStreaks         []outcome.GateStreak                `json:"outcome_gate_streaks,omitempty"`
+	OutcomeGateStreakCheckedAt time.Time                           `json:"outcome_gate_streak_checked_at,omitempty"`
+	BackendHealth              map[string]BackendHealth            `json:"backend_health,omitempty"`
+	ProviderModelHealth        map[string]map[string]BackendHealth `json:"provider_model_health,omitempty"`
+	BackendQuotaUsage          map[string]*BackendQuotaUsage       `json:"backend_quota_usage,omitempty"`
+	ProjectStatusSync          map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
+	NextSlot                   int                                 `json:"next_slot"`
+	LastMergeAt                time.Time                           `json:"last_merge_at,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
 	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
@@ -1855,6 +1861,8 @@ func (s *State) copyFrom(src *State) {
 	s.Approvals = src.Approvals
 	s.LessonProposals = src.LessonProposals
 	s.OutcomeHealth = src.OutcomeHealth
+	s.OutcomeGateStreaks = src.OutcomeGateStreaks
+	s.OutcomeGateStreakCheckedAt = src.OutcomeGateStreakCheckedAt
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
 	s.ProviderModelHealth = src.ProviderModelHealth
@@ -1919,6 +1927,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	}
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.OutcomeRecovery = mergeOutcomeRecovery(base.OutcomeRecovery, current.OutcomeRecovery, ours.OutcomeRecovery)
+	merged.OutcomeGateStreaks, merged.OutcomeGateStreakCheckedAt = mergeOutcomeGateStreaks(current, ours)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
 	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
@@ -2297,6 +2306,71 @@ func cloneOutcomeRecovery(value *outcome.RecoveryState) *outcome.RecoveryState {
 		clone.ExitCode = &code
 	}
 	return &clone
+}
+
+// mergeOutcomeGateStreaks keeps the streak table whose folded-run watermark is
+// newest. The table and its watermark advance together on every scheduled fold,
+// so the newer watermark carries the authoritative counters and emission marks.
+func mergeOutcomeGateStreaks(current, ours *State) ([]outcome.GateStreak, time.Time) {
+	winner := current
+	if winner == nil || (ours != nil && ours.OutcomeGateStreakCheckedAt.After(winner.OutcomeGateStreakCheckedAt)) {
+		winner = ours
+	}
+	if winner == nil {
+		return nil, time.Time{}
+	}
+	return append([]outcome.GateStreak(nil), winner.OutcomeGateStreaks...), winner.OutcomeGateStreakCheckedAt
+}
+
+// RecordOutcomeGateStreaks folds one scheduled health check result into the
+// per-gate streak table and returns the streaks that reached the escalation
+// threshold with a pending notification or intake. It records each distinct
+// scheduled run at most once: a result whose CheckedAt is not newer than the
+// last folded run is ignored, so overlapping evaluators never double-count.
+func (s *State) RecordOutcomeGateStreaks(result outcome.HealthCheckResult, threshold int, runLink string, now time.Time) []outcome.GateStreakEvent {
+	if s == nil {
+		return nil
+	}
+	if !result.CheckedAt.IsZero() && !result.CheckedAt.After(s.OutcomeGateStreakCheckedAt) {
+		return nil
+	}
+	next, events := outcome.RecordGateStreaks(s.OutcomeGateStreaks, result, threshold, runLink, now)
+	s.OutcomeGateStreaks = next
+	if !result.CheckedAt.IsZero() {
+		s.OutcomeGateStreakCheckedAt = result.CheckedAt.UTC()
+	}
+	return events
+}
+
+// MarkGateStreakNotified records that the gate_fail_streak notification for a
+// fingerprint has been sent, deduping repeat same-fingerprint escalations.
+func (s *State) MarkGateStreakNotified(gate, fingerprint string, now time.Time) {
+	if s == nil {
+		return
+	}
+	for i := range s.OutcomeGateStreaks {
+		if s.OutcomeGateStreaks[i].Gate == gate && s.OutcomeGateStreaks[i].Fingerprint == fingerprint {
+			s.OutcomeGateStreaks[i].NotifiedFingerprint = fingerprint
+			return
+		}
+	}
+}
+
+// MarkGateStreakIntaken records that the deduped repair issue for a fingerprint
+// has been filed, so a repeat same-fingerprint failure never re-files.
+func (s *State) MarkGateStreakIntaken(gate, fingerprint string, issue int, now time.Time) {
+	if s == nil {
+		return
+	}
+	for i := range s.OutcomeGateStreaks {
+		if s.OutcomeGateStreaks[i].Gate == gate && s.OutcomeGateStreaks[i].Fingerprint == fingerprint {
+			s.OutcomeGateStreaks[i].IntakeFingerprint = fingerprint
+			if issue > 0 {
+				s.OutcomeGateStreaks[i].IntakeIssue = issue
+			}
+			return
+		}
+	}
 }
 
 func unionKeys(maps ...map[string]*Session) []string {

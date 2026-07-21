@@ -55,6 +55,11 @@ type Brief struct {
 	RecoveryIntervalSeconds int    `yaml:"recovery_interval_seconds" json:"recovery_interval_seconds,omitempty"`
 	RecoveryCooldownMinutes int    `yaml:"recovery_cooldown_minutes" json:"recovery_cooldown_minutes,omitempty"`
 	RecoveryTimeoutSeconds  int    `yaml:"recovery_timeout_seconds" json:"recovery_timeout_seconds,omitempty"`
+	// GateFailStreakThreshold is the number of consecutive same-fingerprint
+	// scheduled-gate failures at which Maestro emits a first-class supervisor
+	// event (notification + deduped repair intake). Zero uses the default (2); a
+	// negative value disables the escalation.
+	GateFailStreakThreshold int `yaml:"gate_fail_streak_threshold" json:"gate_fail_streak_threshold,omitempty"`
 }
 
 // Status is the concise outcome state exposed by CLI/API/dashboard surfaces.
@@ -88,6 +93,7 @@ type Status struct {
 	RecoveryConfigured      bool              `json:"recovery_configured,omitempty"`
 	RecoveryMode            string            `json:"recovery_mode,omitempty"`
 	Recovery                *RecoveryState    `json:"recovery,omitempty"`
+	GateStreaks             []GateStreak      `json:"gate_streaks,omitempty"`
 }
 
 // HealthCheckItem is the allow-listed, bounded part of structured checker
@@ -215,6 +221,24 @@ func (b Brief) EffectiveRecoveryTimeout() time.Duration {
 	return defaultRecoveryTimeout
 }
 
+// EffectiveGateFailStreakThreshold is the consecutive-failure count at which a
+// scheduled gate streak escalates. Zero uses the default; a negative value is
+// returned as-is so callers can treat it as disabled.
+func (b Brief) EffectiveGateFailStreakThreshold() int {
+	if b.GateFailStreakThreshold == 0 {
+		return DefaultGateFailStreakThreshold
+	}
+	return b.GateFailStreakThreshold
+}
+
+// GateFailStreakEnabled reports whether scheduled-gate failure-streak
+// escalation should run. It needs a health signal to observe gates and a
+// positive threshold.
+func (b Brief) GateFailStreakEnabled() bool {
+	b = b.Normalized()
+	return b.HasHealthSignal() && b.EffectiveGateFailStreakThreshold() > 0
+}
+
 func (b Brief) Configured() bool {
 	b = b.Normalized()
 	return b.DesiredOutcome != ""
@@ -331,6 +355,17 @@ func AttachRecovery(status Status, recovery *RecoveryState) Status {
 		copy.ExitCode = &code
 	}
 	status.Recovery = &copy
+	return status
+}
+
+// AttachGateStreaks exposes the persisted scheduled-gate failure-streak table
+// (counter, fingerprint, and last transition per gate) on a status without
+// mutating the caller's slice.
+func AttachGateStreaks(status Status, streaks []GateStreak) Status {
+	if len(streaks) == 0 {
+		return status
+	}
+	status.GateStreaks = append([]GateStreak(nil), streaks...)
 	return status
 }
 

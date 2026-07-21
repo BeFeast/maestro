@@ -1244,7 +1244,8 @@ func outcomeStatusForState(cfg *config.Config, st *state.State) outcome.Status {
 	} else {
 		status = outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt)
 	}
-	return outcome.AttachRecovery(status, st.OutcomeRecovery)
+	status = outcome.AttachRecovery(status, st.OutcomeRecovery)
+	return outcome.AttachGateStreaks(status, st.OutcomeGateStreaks)
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
