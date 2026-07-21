@@ -32,14 +32,29 @@ func TestSetAndClearSpawnDrain(t *testing.T) {
 	if !s.DrainActive() {
 		t.Fatal("DrainActive() false after SetSpawnDrain")
 	}
+	if s.ShutdownDrainActive() {
+		t.Fatal("standalone SetSpawnDrain must not claim daemon shutdown intent")
+	}
 	if !s.SpawnDrainAt.Equal(at) {
 		t.Fatalf("SpawnDrainAt = %v, want %v", s.SpawnDrainAt, at)
+	}
+
+	shutdownAt := at.Add(30 * time.Second)
+	s.SetShutdownDrain(shutdownAt)
+	if !s.ShutdownDrainActive() {
+		t.Fatal("ShutdownDrainActive() false after SetShutdownDrain")
+	}
+	if !s.SpawnDrainAt.Equal(shutdownAt) {
+		t.Fatalf("SpawnDrainAt = %v, want %v after shutdown drain", s.SpawnDrainAt, shutdownAt)
 	}
 
 	later := at.Add(time.Minute)
 	s.ClearSpawnDrain(later)
 	if s.DrainActive() {
 		t.Fatal("DrainActive() true after ClearSpawnDrain")
+	}
+	if s.ShutdownDrainActive() {
+		t.Fatal("ShutdownDrainActive() true after ClearSpawnDrain")
 	}
 	if !s.SpawnDrainAt.Equal(later) {
 		t.Fatalf("SpawnDrainAt = %v, want %v after clear", s.SpawnDrainAt, later)
@@ -67,6 +82,27 @@ func TestSpawnDrain_SurvivesSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestShutdownDrain_SurvivesSaveLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := NewState()
+	at := time.Date(2026, 7, 18, 0, 5, 0, 0, time.UTC)
+	s.SetShutdownDrain(at)
+	if err := Save(dir, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	reloaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !reloaded.ShutdownDrainActive() {
+		t.Fatal("shutdown-specific drain intent lost across save/load")
+	}
+	if !reloaded.SpawnDrainAt.Equal(at) {
+		t.Fatalf("SpawnDrainAt = %v, want %v after round trip", reloaded.SpawnDrainAt, at)
+	}
+}
+
 // TestMergeSpawnDrain_LatestWriteWins covers the concurrent-save path: a drain
 // request must survive an orchestrator save that does not carry the flag (older
 // timestamp), and a fresh clear must not be undone by a stale set.
@@ -85,6 +121,21 @@ func TestMergeSpawnDrain_LatestWriteWins(t *testing.T) {
 		}
 		if !merged.DrainActive() {
 			t.Fatal("fresh drain request lost to stale concurrent save")
+		}
+	})
+
+	t.Run("fresh shutdown drain keeps its cause marker", func(t *testing.T) {
+		base := NewState()
+		current := NewState()
+		ours := NewState()
+		ours.SetShutdownDrain(t0.Add(time.Minute))
+
+		merged, err := mergeStateSnapshots(base, current, ours)
+		if err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+		if !merged.ShutdownDrainActive() {
+			t.Fatal("fresh shutdown drain lost its persisted cause marker")
 		}
 	})
 
