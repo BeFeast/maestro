@@ -1514,6 +1514,55 @@ func TestDecide_FailingChecksExplained(t *testing.T) {
 	}
 }
 
+func TestDecide_OperatorGateSuppressesDraftFailingRepair(t *testing.T) {
+	cfg := testConfig(t)
+	reader := &fakeReader{
+		prs: []github.PR{{
+			Number:      31,
+			HeadRefName: "feat/checks",
+			State:       "OPEN",
+			Mergeable:   "MERGEABLE",
+			IsDraft:     true,
+		}},
+		ciStatuses: map[int]string{31: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{
+		IssueNumber:                94,
+		IssueTitle:                 "operator gate",
+		Status:                     state.StatusPROpen,
+		PRNumber:                   31,
+		Branch:                     "feat/checks",
+		StartedAt:                  time.Now().UTC().Add(-time.Hour),
+		OperatorGateName:           "check:Android SDK license acceptance gate",
+		OperatorGateRequiredAction: "Record Android SDK license acceptance, then rerun CI.",
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	stuck := requireStuckState(t, decision, "operator_gate")
+	if stuck.Severity != SeverityInfo {
+		t.Errorf("severity = %q, want %q", stuck.Severity, SeverityInfo)
+	}
+	if stuck.SupervisorCanAct {
+		t.Fatal("operator gate must be a waiting verdict, not an actionable repair")
+	}
+	if !strings.Contains(stuck.Summary, "Android SDK license acceptance gate") || !strings.Contains(stuck.RecommendedAction, "retry budget was not consumed") {
+		t.Fatalf("operator gate stuck state = %+v", stuck)
+	}
+	for _, got := range decision.StuckStates {
+		if got.Code == "failing_checks" || got.Code == "draft_pr" {
+			t.Fatalf("held PR surfaced generic stuck state %q: %+v", got.Code, got)
+		}
+	}
+	if decision.RecommendedAction == ActionSpawnRepairWorker {
+		t.Fatalf("action = %q, want monitor/wait rather than repair spawn", decision.RecommendedAction)
+	}
+}
+
 func TestDecide_DeadSessionWithDraftFailingPRRecommendsRepairWorker(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
@@ -2305,6 +2354,24 @@ func TestDecide_SupervisorBlockedLabelSkipsIssue(t *testing.T) {
 	cfg.Supervisor.BlockedLabel = "blocked"
 	reader := &fakeReader{issues: []github.Issue{
 		testIssue(1, "blocked", "maestro-ready", "blocked"),
+		testIssue(2, "regular", "maestro-ready"),
+	}}
+
+	decision, err := testEngine(cfg, reader).Decide(state.NewState())
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+
+	if decision.Target == nil || decision.Target.Issue != 2 {
+		t.Fatalf("target = %#v, want issue 2", decision.Target)
+	}
+}
+
+func TestDecide_OperatorDecisionLabelSkipsReadyIssue(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{
+		testIssue(1, "operator held", "maestro-ready", "operator-decision"),
 		testIssue(2, "regular", "maestro-ready"),
 	}}
 

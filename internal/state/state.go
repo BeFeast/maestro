@@ -256,6 +256,8 @@ type Session struct {
 	PreviousAttemptFeedback     string            `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
 	PreviousAttemptFeedbackKind string            `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
 	RetryReason                 string            `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
+	OperatorGateName            string            `json:"operator_gate_name,omitempty"`             // explicit human/operator gate holding this PR; cleared when the gate opens
+	OperatorGateRequiredAction  string            `json:"operator_gate_required_action,omitempty"`  // concise operator action needed to clear OperatorGateName
 	LastClosedPRNumber          int               `json:"last_closed_pr_number,omitempty"`          // PR the retry path closed before scheduling this retry (#800); if an operator reopens and merges it while the backoff runs, the pre-respawn staleness check sees the merge and cancels the retry
 	ReleasedForRedispatch       bool              `json:"released_for_redispatch,omitempty"`        // #818: a retry_exhausted session whose closed-unmerged PR was reconciled and the issue released for fresh dispatch. Marked failed so the attempt counts toward max_retries_per_issue, but the board must mirror it as runnable Todo (not Blocked) so the dynamic wave re-dispatches instead of re-stranding it
 	LastTerminalReconcileAt     *time.Time        `json:"last_terminal_reconcile_at,omitempty"`     // #940: last successful authoritative issue/PR reconciliation for a terminal session. Bounds historical forge polling while preserving the 10-minute hands-off SLA across daemon restarts
@@ -365,6 +367,9 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 			NextAction:     "Review the partial work and raise or disable worker_max_tokens only if a larger run is intentional.",
 			NeedsAttention: true,
 		}
+	}
+	if attention, ok := OperatorGateAttention(sess); ok {
+		return attention
 	}
 
 	switch sess.Status {
@@ -510,6 +515,28 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 	default:
 		return SessionAttention{Reason: "Session is waiting for the next Maestro reconciliation cycle."}
 	}
+}
+
+// OperatorGateAttention returns a stable, state-backed waiting verdict for an
+// explicit human/operator gate. It is independent of the runtime status because
+// an operator can apply a hold while a retry is already scheduled.
+func OperatorGateAttention(sess *Session) (SessionAttention, bool) {
+	if sess == nil || strings.TrimSpace(sess.OperatorGateName) == "" {
+		return SessionAttention{}, false
+	}
+	action := strings.TrimSpace(sess.OperatorGateRequiredAction)
+	if action == "" {
+		action = "Complete the operator decision, then remove the hold label or let the gated check pass."
+	}
+	pr := "the session"
+	if sess.PRNumber > 0 {
+		pr = fmt.Sprintf("PR #%d", sess.PRNumber)
+	}
+	return SessionAttention{
+		Reason:         fmt.Sprintf("%s is held by operator gate %q.", pr, sess.OperatorGateName),
+		NextAction:     action + " The retry budget was not consumed.",
+		NeedsAttention: true,
+	}, true
 }
 
 // SessionDisplayStatusFor returns the status token dashboards should display.
