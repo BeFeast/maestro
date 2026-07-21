@@ -757,6 +757,9 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			"Verify outcome health before starting more issue work.",
 			RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
 		decision.StuckStates = stuckStates
+		if st.OutcomeHealth != nil && st.OutcomeHealth.State == outcome.HealthFailing {
+			decision.QueueAnalysis = e.dispatchBlockerQueueAnalysis(st)
+		}
 		return decision, nil
 	}
 
@@ -2144,6 +2147,62 @@ func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) (
 	return policyCandidateResult{skipped: skipped, policyRule: PolicyRuleOrderedQueue}, nil
 }
 
+// dispatchBlockerQueueAnalysis keeps the per-issue decision plane populated
+// when the supervisor returns early for a top-level failing outcome gate. It is
+// best-effort: the red outcome finding remains more important than a transient
+// issue-list/guard read failure, so the last queue analysis is retained when a
+// fresh snapshot cannot be built.
+func (e *Engine) dispatchBlockerQueueAnalysis(st *state.State) *state.SupervisorQueueAnalysis {
+	previous := func() *state.SupervisorQueueAnalysis {
+		if st == nil {
+			return nil
+		}
+		if latest := st.LatestSupervisorDecision(); latest != nil {
+			return cloneSupervisorQueueAnalysis(latest.QueueAnalysis)
+		}
+		return nil
+	}
+	issues, err := e.reader.ListOpenIssues(nil)
+	if err != nil {
+		log.Printf("[supervisor] dispatch blocker queue snapshot: list open issues: %v", err)
+		return previous()
+	}
+	result, err := e.policyCandidateIssues(st, issues)
+	if err != nil {
+		log.Printf("[supervisor] dispatch blocker queue snapshot: classify candidates: %v", err)
+		return previous()
+	}
+	if result.dynamicWave && result.analysis != nil {
+		return cloneSupervisorQueueAnalysis(result.analysis)
+	}
+	eligible, skipped, err := e.eligibleIssues(st, result.candidates, true)
+	if err != nil {
+		log.Printf("[supervisor] dispatch blocker queue snapshot: evaluate guards: %v", err)
+		return previous()
+	}
+	skipped = append(result.skipped, skipped...)
+	return supervisorQueueAnalysis(result.policyRule, len(issues), eligible, skipped)
+}
+
+func cloneSupervisorQueueAnalysis(src *state.SupervisorQueueAnalysis) *state.SupervisorQueueAnalysis {
+	if src == nil {
+		return nil
+	}
+	cp := *src
+	if src.SelectedCandidate != nil {
+		selected := *src.SelectedCandidate
+		selected.Labels = append([]string(nil), src.SelectedCandidate.Labels...)
+		cp.SelectedCandidate = &selected
+	}
+	cp.SkippedReasons = append([]string(nil), src.SkippedReasons...)
+	cp.EligibleRanked = append([]state.SupervisorIssueCandidate(nil), src.EligibleRanked...)
+	for i := range cp.EligibleRanked {
+		cp.EligibleRanked[i].Labels = append([]string(nil), src.EligibleRanked[i].Labels...)
+	}
+	cp.SkippedCandidates = append([]state.SupervisorSkippedCandidate(nil), src.SkippedCandidates...)
+	return &cp
+}
+
 func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Issue, prefixSkipped []string) (policyCandidateResult, error) {
 	skipped := append([]string(nil), prefixSkipped...)
 	analysis := &state.SupervisorQueueAnalysis{
@@ -2200,8 +2259,8 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 }
 
 func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue, issues []github.Issue) (string, dynamicSkipCategory, error) {
-	if st.IssueInProgress(issue.Number) {
-		return "already in progress", dynamicSkipOther, nil
+	if reason, ok := issueInProgressSkipReason(st, issue.Number); ok {
+		return reason, dynamicSkipOther, nil
 	}
 	if st.IssueDone(issue.Number) {
 		if !e.canTreatIssueDoneForOutcome(st) {
@@ -2244,6 +2303,20 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue, issu
 		}
 	}
 	return "", dynamicSkipOther, nil
+}
+
+func issueInProgressSkipReason(st *state.State, issueNumber int) (string, bool) {
+	if st == nil {
+		return "", false
+	}
+	claim, ok := st.IssueClaimFor(issueNumber)
+	if !ok {
+		return "", false
+	}
+	if claim.Status == string(state.StatusCodeLanded) {
+		return "already in progress (code_landed, awaiting verification)", true
+	}
+	return "already in progress", true
 }
 
 func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, string, error) {
@@ -2548,8 +2621,8 @@ func (e *Engine) issueQueueSkipReason(st *state.State, issue github.Issue, block
 }
 
 func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (string, error) {
-	if st.IssueInProgress(issue.Number) {
-		return "already in progress", nil
+	if reason, ok := issueInProgressSkipReason(st, issue.Number); ok {
+		return reason, nil
 	}
 	if st.IssueDone(issue.Number) {
 		return "already completed in state", nil
@@ -2590,8 +2663,8 @@ func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (str
 }
 
 func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.Issue, excludeLabels []string, ignoredBlockedLabel string) (string, error) {
-	if st.IssueInProgress(issue.Number) {
-		return "already in progress", nil
+	if reason, ok := issueInProgressSkipReason(st, issue.Number); ok {
+		return reason, nil
 	}
 	if st.IssueDone(issue.Number) {
 		return "already completed in state", nil

@@ -651,6 +651,7 @@ function mapProject(project, workers, now) {
   const slug = slugifyProject(project.name);
   const queue = project.queue_snapshot || {};
   const outcome = project.outcome || {};
+	const dispatchHold = project.dispatch_hold || {};
 	const pulse = project.supervisor_pulse || {};
   return {
     slug,
@@ -674,6 +675,12 @@ function mapProject(project, workers, now) {
     operatorState: project.operator_state || {},
     outcome,
     queueSnapshot: queue,
+    dispatchHold: {
+      active: dispatchHold.active === true,
+      reasonClass: String(dispatchHold.reason_class || ""),
+      detail: String(dispatchHold.detail || ""),
+      since: String(dispatchHold.since || ""),
+    },
     freshness: project.freshness || {},
     supervisor: project.supervisor || {},
 	supervisorPulse: pulse,

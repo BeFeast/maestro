@@ -1198,6 +1198,44 @@ func TestFleetQueueSnapshotFromSupervisorCarriesDecisionPlane(t *testing.T) {
 	}
 }
 
+func TestFleetProjectExposesPublicDispatchHoldProjection(t *testing.T) {
+	stateDir := t.TempDir()
+	now := time.Date(2026, 7, 21, 18, 0, 0, 0, time.UTC)
+	st := state.NewState()
+	st.DispatchHold = state.DispatchHold{
+		Active:      true,
+		ReasonClass: state.DispatchHoldBlockingOutcomeCheck,
+		Detail:      "blocking outcome check source-main-ci is fail",
+		Since:       now.Add(-time.Minute),
+		EvaluatedAt: now,
+	}
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("DispatchHold", "/tmp/dispatch-hold.yaml", "", &config.Config{
+			Repo:        "owner/dispatch-hold",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+	project := findFleetProject(t, srv.snapshot().Projects, "DispatchHold")
+	if !project.DispatchHold.Active || project.DispatchHold.ReasonClass != state.DispatchHoldBlockingOutcomeCheck || !contains(project.DispatchHold.Detail, "source-main-ci") {
+		t.Fatalf("dispatch hold = %+v, want active source-main-ci blocker", project.DispatchHold)
+	}
+	if project.DispatchHold.Since != now.Add(-time.Minute).Format(time.RFC3339) {
+		t.Fatalf("dispatch hold since = %q", project.DispatchHold.Since)
+	}
+	encoded, err := json.Marshal(project.DispatchHold)
+	if err != nil {
+		t.Fatalf("marshal dispatch hold: %v", err)
+	}
+	if strings.Contains(string(encoded), "evaluated_at") {
+		t.Fatalf("internal dispatch metadata leaked into Fleet: %s", encoded)
+	}
+}
+
 func TestFleetAPIOperatorStateExplainsZeroRunningActiveWork(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

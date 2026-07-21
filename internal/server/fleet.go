@@ -1315,6 +1315,17 @@ type fleetQueueSnapshot struct {
 	SkippedCandidates []state.SupervisorSkippedCandidate `json:"skipped_candidates,omitempty"`
 }
 
+// fleetDispatchHold is the public, command/output-free projection of the
+// orchestrator's durable dispatch visibility state. EvaluatedAt and the
+// idle-stall debounce stay internal; Fleet exposes only the issue #1023
+// contract.
+type fleetDispatchHold struct {
+	Active      bool   `json:"active"`
+	ReasonClass string `json:"reason_class,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	Since       string `json:"since,omitempty"`
+}
+
 // fleetManagementHome is the JSON projection of config.ManagementHomeConfig
 // surfaced on the Fleet API (#869). It carries the descriptive fields verbatim;
 // no file content is read and the vault path is not resolved.
@@ -1405,6 +1416,7 @@ type fleetProjectState struct {
 	CloseCandidates []fleetCloseCandidate `json:"close_candidates,omitempty"`
 	Supervisor      supervisorInfo        `json:"supervisor"`
 	QueueSnapshot   *fleetQueueSnapshot   `json:"queue_snapshot,omitempty"`
+	DispatchHold    fleetDispatchHold     `json:"dispatch_hold"`
 	Freshness       fleetProjectFreshness `json:"freshness"`
 	// ProjectBoard is the cached GitHub Project board snapshot (#529). nil
 	// when the project has no github_projects configuration, or while the
@@ -3855,6 +3867,18 @@ func fleetQueueSnapshotFromSupervisor(info supervisorInfo) *fleetQueueSnapshot {
 	return snapshot
 }
 
+func fleetDispatchHoldFromState(hold state.DispatchHold) fleetDispatchHold {
+	out := fleetDispatchHold{
+		Active:      hold.Active,
+		ReasonClass: strings.TrimSpace(hold.ReasonClass),
+		Detail:      strings.TrimSpace(hold.Detail),
+	}
+	if hold.Active && !hold.Since.IsZero() {
+		out.Since = hold.Since.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
 func latestProjectLogModTime(st *state.State) time.Time {
 	if st == nil {
 		return time.Time{}
@@ -4268,6 +4292,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
+	item.DispatchHold = fleetDispatchHoldFromState(st.DispatchHold)
 	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
 	item.Epics, item.EpicSummary = fleetEpicProgressFromState(st)
 	item.IssueClaims = st.ActiveIssueClaims()
