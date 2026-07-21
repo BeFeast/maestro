@@ -9,9 +9,10 @@ import {
   approvalSlotLabel,
   attributionSegmentDuration,
   fetchWorkerDetail,
+  formatAbsoluteTimestamp,
   formatAttributionSegment,
   formatAttributionTimeline,
-	formatCountdown,
+  formatCountdown,
   formatTokens,
   formatUSD,
   isApprovalActionCloseIssue,
@@ -53,6 +54,28 @@ function projectFocusMatches(p, focus) {
   return (issue > 0 && Number(op.issue_number || 0) === issue) ||
     (pr > 0 && Number(op.pr_number || 0) === pr) ||
     !!focus.approval;
+}
+
+export function OutcomeCheckReceipt({ check }) {
+  const deadline = check?.deadline_at ? (formatAbsoluteTimestamp(check.deadline_at) || check.deadline_at) : "";
+  return (
+    <span className="mono" style={{ color: check?.status === "pass" ? "var(--ok)" : "var(--watch)" }}>
+      {check?.status || "unknown"}{deadline ? ` · deadline ${deadline}` : ""}
+    </span>
+  );
+}
+
+export function OutcomeRecoveryReceipt({ recovery, now }) {
+  if (!recovery) return null;
+  return (
+    <>
+      <div className="kv"><span>Recovery</span><strong className="mono">{recovery.status || "unknown"}</strong></div>
+      {recovery.summary && <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{recovery.summary}</div>}
+      {recovery.started_at && <div className="kv"><span>Last attempt</span><span className="mono">{relTime(parseTimestamp(recovery.started_at), now)}</span></div>}
+      {recovery.next_eligible_at && <div className="kv"><span>Retry eligible</span><span className="mono">{relTime(parseTimestamp(recovery.next_eligible_at), now)}</span></div>}
+      {recovery.exit_code != null && <div className="kv"><span>Exit code</span><strong className="mono">{recovery.exit_code}</strong></div>}
+    </>
+  );
 }
 
 export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
@@ -280,20 +303,13 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                   <div className="kv"><span>Dashboard</span><UrlValue url={p.dashboardUrl} /></div>
                 )}
                 <div className="kv"><span>Last check</span><span className="mono">{p.outcome?.health_checked_at ? relTime(parseTimestamp(p.outcome.health_checked_at), now) : "—"}</span></div>
-                {(p.outcome?.checks || []).filter((check) => check.blocking || check.status !== "pass").map((check) => (
-                  <div className="kv" key={check.name}>
+                {(p.outcome?.checks || []).filter((check) => check.blocking || check.status !== "pass").map((check, index) => (
+                  <div className="kv" key={`${check.name || "check"}-${index}`}>
                     <span>{check.name}</span>
-                    <span className="mono" style={{ color: check.status === "pass" ? "var(--ok)" : "var(--watch)" }}>{check.status}</span>
+                    <OutcomeCheckReceipt check={check} />
                   </div>
                 ))}
-                {p.outcome?.recovery && (
-                  <>
-                    <div className="kv"><span>Recovery</span><strong className="mono">{p.outcome.recovery.status || "unknown"}</strong></div>
-                    {p.outcome.recovery.summary && <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{p.outcome.recovery.summary}</div>}
-                    {p.outcome.recovery.started_at && <div className="kv"><span>Last attempt</span><span className="mono">{relTime(parseTimestamp(p.outcome.recovery.started_at), now)}</span></div>}
-                    {p.outcome.recovery.next_eligible_at && <div className="kv"><span>Retry eligible</span><span className="mono">{relTime(parseTimestamp(p.outcome.recovery.next_eligible_at), now)}</span></div>}
-                  </>
-                )}
+                <OutcomeRecoveryReceipt recovery={p.outcome?.recovery} now={now} />
                 <div className="kv"><span>Sessions</span><strong className="mono">{p.sessions}</strong></div>
               </>
             ) : (

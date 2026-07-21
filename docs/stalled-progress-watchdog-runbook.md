@@ -132,6 +132,13 @@ cooldown while the 60-second health clock continues; a healthy signal marks the
 receipt `verified`. An execution interrupted without a receipt becomes
 `uncertain` and is never replayed blindly.
 
+Command healthchecks may return a structured JSON envelope with `healthy` and
+`checks`. Maestro keeps at most 16 allow-listed check receipts (`name`,
+`blocking`, `status`, and an RFC3339 `deadline_at`/`deadline`) and prioritizes
+blocking failures so passing entries cannot crowd the actionable check out of
+Fleet. Unknown/free-form fields are discarded, invalid deadlines are omitted,
+and command output capture is capped at 64 KiB before any state is written.
+
 The recovery entrypoint must enforce its own external idempotency boundary
 (for example, refuse a workflow dispatch when an equal/newer run is already
 queued or running). This mechanism does not replay an uncertain delivery lease

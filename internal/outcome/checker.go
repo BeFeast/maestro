@@ -11,14 +11,19 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	defaultCheckTimeout = 15 * time.Second
-	maxCheckDetailBytes = 4000
+	defaultCheckTimeout       = 15 * time.Second
+	maxCheckDetailBytes       = 4000
+	maxCheckOutputBytes       = 64 * 1024
+	maxStructuredHealthChecks = 16
 )
+
+var errCheckOutputTooLarge = errors.New("outcome check output exceeded safe limit")
 
 // Checker executes configured read-only outcome signals and returns a compact
 // result that can be persisted in Maestro state.
@@ -117,7 +122,9 @@ func (c Checker) checkCommand(ctx context.Context, command, dir, signal string) 
 	}
 	if err != nil {
 		summary := fmt.Sprintf("%s failed", signal)
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(err, errCheckOutputTooLarge) {
+			summary = fmt.Sprintf("%s output exceeded the %d-byte safety limit", signal, maxCheckOutputBytes)
+		} else if ctx.Err() == context.DeadlineExceeded {
 			summary = fmt.Sprintf("%s timed out after %s", signal, c.timeout().String())
 		} else if exitCode >= 0 {
 			summary = fmt.Sprintf("%s failed with exit code %d", signal, exitCode)
@@ -151,7 +158,18 @@ func (c Checker) runCommand(ctx context.Context, command, dir string) ([]byte, i
 	if strings.TrimSpace(dir) != "" {
 		cmd.Dir = dir
 	}
-	output, err := cmd.CombinedOutput()
+	capture := &boundedOutputBuffer{limit: maxCheckOutputBytes}
+	cmd.Stdout = capture
+	cmd.Stderr = capture
+	err := cmd.Run()
+	output := capture.Bytes()
+	if capture.Truncated() {
+		if err != nil {
+			err = errors.Join(err, errCheckOutputTooLarge)
+		} else {
+			err = errCheckOutputTooLarge
+		}
+	}
 	return output, exitCode(err), err
 }
 
@@ -211,14 +229,18 @@ func compactDetail(detail string) string {
 }
 
 type structuredHealthEnvelope struct {
-	Healthy *bool                   `json:"healthy"`
-	Checks  []structuredHealthCheck `json:"checks"`
+	Healthy    *bool                   `json:"healthy"`
+	DeadlineAt string                  `json:"deadline_at"`
+	Deadline   string                  `json:"deadline"`
+	Checks     []structuredHealthCheck `json:"checks"`
 }
 
 type structuredHealthCheck struct {
-	Name     string `json:"name"`
-	Blocking bool   `json:"blocking"`
-	Status   string `json:"status"`
+	Name       string `json:"name"`
+	Blocking   bool   `json:"blocking"`
+	Status     string `json:"status"`
+	DeadlineAt string `json:"deadline_at"`
+	Deadline   string `json:"deadline"`
 }
 
 var safeHealthCheckName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
@@ -231,13 +253,35 @@ func projectStructuredHealth(output []byte) (checks []HealthCheckItem, detail, s
 	if err := json.Unmarshal(output, &envelope); err != nil || (envelope.Healthy == nil && len(envelope.Checks) == 0) {
 		return nil, "", "", nil
 	}
+	envelopeDeadline := projectHealthCheckDeadline(firstNonEmpty(envelope.DeadlineAt, envelope.Deadline))
+	projected := make([]HealthCheckItem, 0, len(envelope.Checks))
 	for _, raw := range envelope.Checks {
 		item := HealthCheckItem{
-			Name:     projectHealthCheckName(raw.Name),
-			Blocking: raw.Blocking,
-			Status:   projectHealthCheckStatus(raw.Status),
+			Name:       projectHealthCheckName(raw.Name),
+			Blocking:   raw.Blocking,
+			Status:     projectHealthCheckStatus(raw.Status),
+			DeadlineAt: projectHealthCheckDeadline(firstNonEmpty(raw.DeadlineAt, raw.Deadline)),
 		}
-		checks = append(checks, item)
+		if item.DeadlineAt == "" && item.Status != "pass" && item.Status != "healthy" {
+			item.DeadlineAt = envelopeDeadline
+		}
+		projected = append(projected, item)
+	}
+	// Keep the state bounded while prioritizing the blocking failure/pending
+	// checks an operator actually needs. A long list of passing checks cannot
+	// crowd the failing check out of Fleet.
+	for priority := 0; priority <= 4 && len(checks) < maxStructuredHealthChecks; priority++ {
+		for _, item := range projected {
+			if structuredHealthPriority(item) != priority {
+				continue
+			}
+			checks = append(checks, item)
+			if len(checks) == maxStructuredHealthChecks {
+				break
+			}
+		}
+	}
+	for _, item := range checks {
 		if summary == "" && (item.Status == "fail" || item.Status == "failing" || item.Status == "error") {
 			summary = item.Name + " reported " + item.Status
 		}
@@ -268,6 +312,86 @@ func projectHealthCheckStatus(value string) string {
 	default:
 		return "unknown"
 	}
+}
+
+func projectHealthCheckDeadline(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > len(time.RFC3339Nano)+16 {
+		return ""
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return ""
+	}
+	return parsed.UTC().Format(time.RFC3339Nano)
+}
+
+func structuredHealthPriority(item HealthCheckItem) int {
+	switch item.Status {
+	case "fail", "failing", "error":
+		if item.Blocking {
+			return 0
+		}
+		return 3
+	case "pending", "in_progress", "queued":
+		if item.Blocking {
+			return 1
+		}
+		return 3
+	case "pass", "healthy":
+		return 4
+	default:
+		if item.Blocking {
+			return 2
+		}
+		return 3
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+type boundedOutputBuffer struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *boundedOutputBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	written := len(p)
+	remaining := b.limit - b.buf.Len()
+	if remaining <= 0 {
+		b.truncated = b.truncated || len(p) > 0
+		return written, nil
+	}
+	if len(p) > remaining {
+		_, _ = b.buf.Write(p[:remaining])
+		b.truncated = true
+		return written, nil
+	}
+	_, _ = b.buf.Write(p)
+	return written, nil
+}
+
+func (b *boundedOutputBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func (b *boundedOutputBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
 }
 
 func blockingStructuredHealthState(checks []HealthCheckItem) (state, summary string) {
