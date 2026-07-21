@@ -31,6 +31,9 @@ import (
 //   - Anthropic API error type "not_found_error" paired with a model context
 //     word (either order) so a not_found_error about some other resource does
 //     not false-positive
+//   - HTTP/API 529 paired with an overloaded marker. A terminal overload is
+//     model-scoped transient capacity, not credential exhaustion or evidence
+//     that the configured model id is invalid.
 var modelUnavailablePatterns = []struct {
 	label string
 	re    *regexp.Regexp
@@ -39,6 +42,11 @@ var modelUnavailablePatterns = []struct {
 	{"model_does_not_exist", regexp.MustCompile(`(?i)\bthe model\b[^\n]{0,80}?\b(?:does not|doesn'?t) exist\b`)},
 	{"model_not_found", regexp.MustCompile(`(?i)\bmodel[_ ]not[_ ]found\b|\bmodel\b[\s:="'` + "`" + `-]+[^\n]{0,80}?\bnot found\b`)},
 	{"not_found_error", regexp.MustCompile(`(?i)(?:not_found_error\b[^\n]{0,80}?\bmodel\b|\bmodel\b[^\n]{0,80}?not_found_error\b)`)},
+	// A bare 529 or the word "overloaded" is not enough: both must occur on
+	// the same terminal line, and 529 must be anchored to an HTTP/API status
+	// context. This matches Claude's live `API Error: 529 ... overloaded_error`
+	// while avoiding issue numbers, counters, and ordinary work output.
+	{"model_overloaded", regexp.MustCompile(`(?i)(?:\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*529\b[^\n]{0,160}\boverloaded(?:_error)?\b|\boverloaded(?:_error)?\b[^\n]{0,160}\b(?:http|https|status|code|err(?:or)?|response|received)\b[ \t]*[:=]?[ \t]*529\b)`)},
 }
 
 // DetectModelUnavailable scans multi-line output for known model-unavailable

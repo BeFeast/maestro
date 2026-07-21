@@ -54,6 +54,16 @@ func TestDetectModelUnavailable_KnownSignatures(t *testing.T) {
 			output:    "request rejected: model: claude-fable-5 not found",
 			wantLabel: "model_not_found",
 		},
+		{
+			name:      "CLIProxyAPI model overloaded",
+			output:    `API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+			wantLabel: "model_overloaded",
+		},
+		{
+			name:      "HTTP 529 overloaded",
+			output:    "HTTP 529: Overloaded",
+			wantLabel: "model_overloaded",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -83,6 +93,10 @@ func TestDetectModelUnavailable_NoFalsePositives(t *testing.T) {
 		"the existing model works fine in production",
 		"HTTP 200 OK — model loaded",
 		"all tests passed: 404 assertions",
+		"processed 529 overloaded fixtures successfully",
+		"issue #529 tracks upstream overload handling",
+		"HTTP 529 without an overload marker",
+		"overloaded queue recovered without an HTTP status",
 		"the issue body says the model may not exist, but that is the prompt",
 		`assert_eq!(state.last_load_error.as_deref(), Some("libmpv error 404"));`,
 		"HTTP 404/retry",

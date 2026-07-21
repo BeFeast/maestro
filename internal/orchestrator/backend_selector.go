@@ -16,6 +16,7 @@ const (
 	selectionReasonAuthFailureFallback      = "fallback_after_backend_auth_failure"
 	selectionReasonModelUnavailableFallback = "fallback_after_backend_model_unavailable"
 	selectionReasonModelCooldownFallback    = "fallback_after_backend_model_cooldown"
+	selectionReasonModelOverloadedFallback  = "fallback_after_backend_model_overloaded"
 	selectionReasonUsageLimitFallback       = "fallback_after_backend_usage_limit"
 	// selectionReasonDispatchBlockedFallback marks a fresh dispatch whose
 	// routed backend was blocked (disabled or in BackendHealth cooldown), so
@@ -68,6 +69,14 @@ func backendFailureCopyFor(reason string) backendFailureCopy {
 			noun:            "provider/model credential cooldown",
 			remedy:          "wait for the route retry time or restore model access on a compatible credential",
 		}
+	case state.BackendBlockModelOverloaded:
+		return backendFailureCopy{
+			selectionReason: selectionReasonModelOverloadedFallback,
+			displayToken:    string(state.DisplayBackendModelOverloaded),
+			desc:            "hit transient capacity for its configured model",
+			noun:            "backend model overloaded",
+			remedy:          "wait for the short route cooldown or use another model on the same provider",
+		}
 	}
 	return backendFailureCopy{
 		selectionReason: selectionReasonAuthFailureFallback,
@@ -109,11 +118,19 @@ const backendAuthFailureCooldown = 10 * time.Minute
 // stays exhausted for hours.
 const backendUsageLimitCooldown = 30 * time.Minute
 
+// backendModelOverloadCooldown keeps a terminal HTTP 529 scoped to the
+// affected route while allowing a quick re-probe. Overload is transient
+// capacity, not a multi-hour quota window or a missing model id.
+const backendModelOverloadCooldown = time.Minute
+
 // backendFailureCooldownFor picks the fixed re-probe window for a hard
 // backend failure by gating reason.
 func backendFailureCooldownFor(reason string) time.Duration {
-	if reason == state.BackendBlockUsageLimit {
+	switch reason {
+	case state.BackendBlockUsageLimit:
 		return backendUsageLimitCooldown
+	case state.BackendBlockModelOverloaded:
+		return backendModelOverloadCooldown
 	}
 	return backendAuthFailureCooldown
 }

@@ -210,6 +210,7 @@ on a work-quality failure. The three trigger classes:
 | Backend auth / account credential failure | `recordBackendFailure` writes backend-wide `backend_health` | `selectBackendFallback` with `fallback_after_backend_auth_failure` |
 | Model unavailable (model pulled/renamed/no access) | `recordBackendFailure` writes provider/model health when the requested model is known | `selectBackendFallback` with `fallback_after_backend_model_unavailable` |
 | CLIProxyAPI credential pool exhausted for one model | `internal/worker/credential_rotation.go` parses `model_cooldown`; `recordBackendFailure` writes `provider_model_health[provider][model]` with aggregate candidate/usable counts and retry time | `selectBackendFallback` with `fallback_after_backend_model_cooldown`; other models on the provider remain eligible |
+| Model overloaded (terminal HTTP 529 + `overloaded_error`) | `internal/worker/backendfailure.go` records a short provider/model cooldown without claiming credential exhaustion or a bad model id | `selectBackendFallback` with `fallback_after_backend_model_overloaded`; provider-local model fallbacks remain ahead of cross-provider fallbacks |
 
 `selectBackendFallback` walks the exact route resolved by
 `ModelConfig.ResolvedRoute`. A project-level `fallback_backends` chain is the
@@ -247,7 +248,13 @@ continues rotating compatible credentials. Maestro gates a model route only
 after the proxy returns the aggregate `model_cooldown` result, meaning no
 compatible credential is currently usable for that requested model.
 
-All three trigger classes set `sess.RateLimitHit = true`
+A terminal HTTP 529 overload is a separate route-health class. It carries no
+credential-pool count, so Maestro must not describe it as `model_cooldown` or
+infer that every credential is exhausted. It briefly cools only the requested
+provider/model route and follows the configured fallback order; CLIProxyAPI
+remains responsible for rotating compatible credentials within the request.
+
+All backend-failure trigger classes set `sess.RateLimitHit = true`
 (`internal/orchestrator/backend_selector.go:79`, `:120`), which **excludes the
 session from the per-issue retry budget**: `FailedAttemptsForIssue` counts only
 `PRNumber == 0` dead/failed/retry-exhausted sessions where `!RateLimitHit`

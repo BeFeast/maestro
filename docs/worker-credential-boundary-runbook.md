@@ -92,6 +92,12 @@ Mission Control. A per-credential cooldown is not surfaced as a provider
 failure; the proxy keeps rotating until a compatible credential succeeds or it
 returns the aggregate `model_cooldown` result.
 
+A terminal HTTP 529 `overloaded_error` has no credential-pool aggregate and is
+therefore surfaced separately as `model_overloaded`. Maestro applies only a
+short provider/model route cooldown and does not claim that all credentials are
+exhausted; credential selection and session-affinity failover remain owned by
+CLIProxyAPI.
+
 ## Per-worker process ownership (#920)
 
 Credential isolation and process ownership share the same runner boundary but

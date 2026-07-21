@@ -127,6 +127,28 @@ describe("Fleet workers ordering contract", () => {
       buttons: [{ label: "Open issue →", href: "https://github.com/BeFeast/ok-player/issues/406" }],
     });
   });
+
+  test("model overload is distinct from model access and credential cooldown", () => {
+    expect(workerStatusTaxonomy({
+      status: "dead",
+      display_status: "backend_model_overloaded",
+      needs_attention: true,
+    })).toEqual({
+      label: "model overloaded",
+      tone: "watch",
+      section: "stuck",
+    });
+
+    expect(workerNextAction({
+      status: "dead",
+      display_status: "backend_model_overloaded",
+      provider_limit_provider: "claude",
+      provider_limit_model: "claude-fable-5",
+    })).toEqual({
+      text: "claude/claude-fable-5 is temporarily overloaded. Maestro kept the retry budget and can use another model on the same provider.",
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    });
+  });
 });
 
 describe("provider/model credential health", () => {

@@ -65,6 +65,11 @@ const (
 	// compatible credential pool for one requested model. Other models on the
 	// provider remain eligible.
 	DisplayBackendModelCooldown SessionDisplayStatus = "backend_model_cooldown"
+	// DisplayBackendModelOverloaded marks a model-scoped transient capacity
+	// failure (for example Anthropic HTTP 529). It is distinct from a missing
+	// model and from credential-pool exhaustion so operators see the right
+	// remediation while other models on the provider remain eligible.
+	DisplayBackendModelOverloaded SessionDisplayStatus = "backend_model_overloaded"
 	// DisplayBackendUsageLimit marks a session whose worker exited because
 	// its backend's account usage quota is exhausted (#805; live: codex
 	// "You've hit your usage limit") with no fallback available. Distinct
@@ -105,6 +110,11 @@ const (
 	// has rotated through every compatible credential and found none usable.
 	// It must never become a provider-wide BackendHealth gate.
 	BackendBlockModelCooldown = "model_cooldown"
+	// BackendBlockModelOverloaded gates one provider/model route after a
+	// terminal upstream overload response (for example Anthropic HTTP 529).
+	// Unlike model_cooldown it does not claim the credential pool is exhausted,
+	// and unlike model_unavailable it does not imply an invalid model id.
+	BackendBlockModelOverloaded = "model_overloaded"
 	// BackendBlockUsageLimit gates a backend whose CLI died because the
 	// account's usage quota is exhausted (#805; live: codex "You've hit
 	// your usage limit ... try again at 12:30 PM" killed every worker on
@@ -532,6 +542,20 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 					NeedsAttention: true,
 				}
 			}
+			if sess.ProviderLimitReason == BackendBlockModelOverloaded {
+				route := backend
+				if sess.ProviderLimitProvider != "" {
+					route = sess.ProviderLimitProvider
+				}
+				if sess.ProviderLimitModel != "" {
+					route += "/" + sess.ProviderLimitModel
+				}
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Provider/model route %s is temporarily overloaded; other models on the provider remain eligible.", route),
+					NextAction:     "Wait for the short route cooldown or use the next provider-local model; the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			if sess.ProviderLimitReason == BackendBlockUsageLimit {
 				return SessionAttention{
 					Reason:         fmt.Sprintf("Backend %s has exhausted its account usage quota; no fallback backend is currently available or allowed.", backend),
@@ -641,6 +665,8 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 			return string(DisplayBackendModelUnavailable)
 		case BackendBlockModelCooldown:
 			return string(DisplayBackendModelCooldown)
+		case BackendBlockModelOverloaded:
+			return string(DisplayBackendModelOverloaded)
 		case BackendBlockUsageLimit:
 			return string(DisplayBackendUsageLimit)
 		}

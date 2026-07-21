@@ -1157,6 +1157,10 @@ export function workerStatusTaxonomy(worker) {
     return { label: "model unavailable", tone: "watch", section: "stuck" };
   }
 
+  if (display === "backend_model_overloaded") {
+    return { label: "model overloaded", tone: "watch", section: "stuck" };
+  }
+
   if (display === "blocked" && !isStuckStatus(status)) {
     return { label: "blocked", tone: "idle", section: "recent" };
   }
@@ -1234,6 +1238,15 @@ export function workerNextAction(worker) {
     const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
     return {
       text: `Backend ${backend} cannot load its configured model (unavailable or no access). Swap the model id or restore access; the retry budget is preserved.`,
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    };
+  }
+
+  if (display === "backend_model_overloaded") {
+    const provider = String(worker.provider_limit_provider || worker.provider || worker.provider_limit_backend || worker.backend || "the provider");
+    const model = String(worker.provider_limit_model || worker.model || "the requested model");
+    return {
+      text: `${provider}/${model} is temporarily overloaded. Maestro kept the retry budget and can use another model on the same provider.`,
       buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
     };
   }
