@@ -29,7 +29,9 @@ service journal. Important fields are:
 
 - `reclaimable_bytes`: bytes eligible after every protection and age gate;
 - `freed_bytes`: bytes successfully removed by an apply run (zero on dry-run);
-- `categories`: candidate/protected/deleted/byte counts by policy category;
+- `partial_entries`: candidates where recursive removal reclaimed some content
+  before failing; the remaining object is restored when its public name is free;
+- `categories`: candidate/protected/deleted/partial/byte counts by policy category;
 - `protect_hits`: counts for cwd, fd, cmdline, age, configured-path, git,
   socket/lock, ownership, symlink, scan, and filesystem-boundary guards;
 - `use_pct`: tmpfs utilization after the sweep;

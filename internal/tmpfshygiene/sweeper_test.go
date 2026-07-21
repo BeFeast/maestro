@@ -1,12 +1,17 @@
+//go:build linux
+
 package tmpfshygiene
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestSweepRefusesNonTmpfsWithoutMutation(t *testing.T) {
@@ -213,6 +218,61 @@ func TestCandidateNamesFromValueFindsEveryCmdlinePath(t *testing.T) {
 	}
 }
 
+func TestCollectProcessProtectsSkipsSweeperProcess(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	candidate := oldDir(t, root, "tmp.self", now, 2*time.Hour, "payload")
+	processDir := filepath.Join(proc, "789")
+	if err := os.MkdirAll(filepath.Join(processDir, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(candidate, filepath.Join(processDir, "fd", "5")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("maestro\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	protected, scanErrors, err := collectProcessProtects(proc, root, map[string]struct{}{"tmp.self": {}}, 789)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanErrors != 0 || len(protected) != 0 {
+		t.Fatalf("protected = %#v, scanErrors = %d", protected, scanErrors)
+	}
+}
+
+func TestCollectProcessProtectsMapsIsolatedCandidatePath(t *testing.T) {
+	root, proc, _ := fakeRoots(t)
+	quarantineName := ".maestro-tmpfs-hygiene-deadbeef"
+	isolated := filepath.Join(root, quarantineName, "tmp.live")
+	processDir := filepath.Join(proc, "790")
+	if err := os.MkdirAll(filepath.Join(processDir, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(isolated, filepath.Join(processDir, "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("worker\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	protected, scanErrors, err := collectProcessProtects(
+		proc,
+		root,
+		map[string]struct{}{quarantineName: {}},
+		-1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanErrors != 0 {
+		t.Fatalf("scanErrors = %d", scanErrors)
+	}
+	if _, ok := protected[quarantineName]["process_cwd"]; !ok {
+		t.Fatalf("protected = %#v, want isolated cwd hit", protected)
+	}
+}
+
 func TestSweepRevalidatesAgeImmediatelyBeforeApply(t *testing.T) {
 	root, proc, now := fakeRoots(t)
 	candidate := oldDir(t, root, "tmp.changed", now, 2*time.Hour, "old")
@@ -231,6 +291,145 @@ func TestSweepRevalidatesAgeImmediatelyBeforeApply(t *testing.T) {
 		t.Fatalf("summary = %+v", summary)
 	}
 	assertExists(t, candidate)
+}
+
+func TestSweepRevalidatesTheObjectMovedIntoQuarantine(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	candidate := oldDir(t, root, "tmp.changed", now, 2*time.Hour, "original")
+	original := filepath.Join(root, "saved-original")
+	replaced := false
+	opts := fakeOptions(root, proc, now, ModeApply, 40, true)
+	opts.beforeApply = func(string) {
+		if replaced {
+			return
+		}
+		replaced = true
+		if err := os.Rename(candidate, original); err != nil {
+			t.Fatal(err)
+		}
+		replacement := oldDir(t, root, "tmp.changed", now, 2*time.Hour, "replacement")
+		if err := os.WriteFile(filepath.Join(replacement, ".git"), []byte("gitdir: elsewhere"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		setTreeAge(t, replacement, now.Add(-2*time.Hour))
+	}
+
+	summary, err := Sweep(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProtectHits["git_worktree"] != 1 || summary.DeletedEntries != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	assertExists(t, original)
+	got, err := os.ReadFile(filepath.Join(candidate, "payload"))
+	if err != nil || string(got) != "replacement" {
+		t.Fatalf("replacement payload = %q, err=%v", got, err)
+	}
+	assertNoSweepQuarantine(t, root)
+}
+
+func TestSweepRefreshesProcessProtectionAfterIsolation(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	candidate := oldDir(t, root, "tmp.became-live", now, 2*time.Hour, "payload")
+	opts := fakeOptions(root, proc, now, ModeApply, 40, true)
+	opts.beforeApply = func(path string) {
+		processDir := filepath.Join(proc, "456")
+		if err := os.MkdirAll(filepath.Join(processDir, "fd"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(path, filepath.Join(processDir, "cwd")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("worker\x00"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := Sweep(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProtectHits["process_cwd"] != 1 || summary.DeletedEntries != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	assertExists(t, candidate)
+	assertNoSweepQuarantine(t, root)
+}
+
+func TestSweepRootCanDeleteOtherOwnerCandidates(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	candidate := oldDir(t, root, "tmp.other-owner", now, 2*time.Hour, "payload")
+	if os.Geteuid() == 0 {
+		chownTree(t, candidate, 12345, 12345)
+	}
+	opts := fakeOptions(root, proc, now, ModeApply, 40, true)
+	opts.EffectiveUID = func() int { return 0 }
+
+	summary, err := Sweep(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProtectHits["owner_mismatch"] != 0 || summary.DeletedEntries != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	assertMissing(t, candidate)
+}
+
+func TestSweepNonRootProtectsOtherOwnerCandidates(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	candidate := oldDir(t, root, "tmp.other-owner", now, 2*time.Hour, "payload")
+	fakeUID := os.Geteuid() + 1
+	if fakeUID == 0 {
+		fakeUID = 1
+	}
+	opts := fakeOptions(root, proc, now, ModeApply, 40, true)
+	opts.EffectiveUID = func() int { return fakeUID }
+
+	summary, err := Sweep(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProtectHits["owner_mismatch"] != 1 || summary.DeletedEntries != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	assertExists(t, candidate)
+}
+
+func TestSweepReportsPartialDeletionBeforeReturningError(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	candidate := oldDir(t, root, "tmp.partial", now, 2*time.Hour, "payload")
+	opts := fakeOptions(root, proc, now, ModeApply, 40, true)
+	opts.removeEntry = func(_ context.Context, parentFD int, name string, _ uint64) (removalResult, error) {
+		fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return removalResult{}, err
+		}
+		defer unix.Close(fd)
+		var st unix.Stat_t
+		if err := unix.Fstatat(fd, "payload", &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return removalResult{}, err
+		}
+		if err := unix.Unlinkat(fd, "payload", 0); err != nil {
+			return removalResult{}, err
+		}
+		return removalResult{freedBytes: st.Size, removedObjects: 1}, errors.New("injected recursive removal failure")
+	}
+
+	summary, err := Sweep(context.Background(), opts)
+	if err == nil || !strings.Contains(err.Error(), "injected recursive removal failure") {
+		t.Fatalf("error = %v, want injected removal failure", err)
+	}
+	if summary.FreedBytes != int64(len("payload")) || summary.PartialEntries != 1 || summary.DeletedEntries != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	stats := summary.Categories["outcome_snapshot"]
+	if stats.FreedBytes != int64(len("payload")) || stats.Partial != 1 || stats.Deleted != 0 {
+		t.Fatalf("category stats = %+v", stats)
+	}
+	assertExists(t, candidate)
+	assertMissing(t, filepath.Join(candidate, "payload"))
+	assertNoSweepQuarantine(t, root)
 }
 
 func TestSweepRefusesSymlinkRoot(t *testing.T) {
@@ -278,6 +477,7 @@ func fakeOptions(root, proc string, now time.Time, mode string, usePct int, tmpf
 			return MountUsage{Tmpfs: tmpfs, UsePct: usePct, TotalBytes: 100, UsedBytes: int64(usePct)}, nil
 		},
 		EffectiveUID: os.Geteuid,
+		processID:    func() int { return -1 },
 	}
 }
 
@@ -303,6 +503,31 @@ func setTreeAge(t *testing.T, root string, at time.Time) {
 		return os.Chtimes(path, at, at)
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func chownTree(t *testing.T, root string, uid, gid int) {
+	t.Helper()
+	if err := filepath.Walk(root, func(path string, _ os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chown(path, uid, gid)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertNoSweepQuarantine(t *testing.T, root string) {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".maestro-tmpfs-hygiene-") {
+			t.Fatalf("unexpected sweep quarantine %s", filepath.Join(root, entry.Name()))
+		}
 	}
 }
 

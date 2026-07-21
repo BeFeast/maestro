@@ -132,8 +132,10 @@ on that project card without hiding the rest of the fleet.
 The same single daemon also runs the protect-aware `/tmp` tmpfs hygiene sweep
 every 10 minutes. Its latest JSONL result is exposed as `tmpfs_hygiene`; a
 post-sweep utilization of at least 85% carries `attention_code:
-tmpfs_pressure`. See the [`/tmp` tmpfs hygiene runbook](tmpfs-hygiene-runbook.md)
-for the allowlist, protection rules, dry-run command, and 24-hour dogfood check.
+tmpfs_pressure`. Mission Control renders that host alert with utilization, sweep
+results, the safe dry-run command, and a direct runbook link. See the [`/tmp`
+tmpfs hygiene runbook](tmpfs-hygiene-runbook.md) for the allowlist, protection
+rules, dry-run command, and 24-hour dogfood check.
 
 The same daemon is the execution surface. Each flow starts workers, reconciles
 dead sessions, opens and monitors PRs, waits for review gates, merges eligible

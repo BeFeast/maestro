@@ -120,8 +120,12 @@ export function mapTmpfsHygiene(raw) {
     usePct: Number(raw.use_pct || 0),
     pressure: raw.pressure === true,
     attentionCode: String(raw.attention_code || ""),
+    reclaimableBytes: Number(raw.reclaimable_bytes || 0),
     freedBytes: Number(raw.freed_bytes || 0),
     protectedEntries: Number(raw.protected_entries || 0),
+    deletedEntries: Number(raw.deleted_entries || 0),
+    partialEntries: Number(raw.partial_entries || 0),
+    procScanErrors: Number(raw.proc_scan_errors || 0),
     error: String(raw.error || ""),
   };
 }

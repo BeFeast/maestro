@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package tmpfshygiene implements Maestro's conservative, protect-aware tmpfs
 // sweeper. It only considers top-level entries that match the compiled policy
 // table, refuses non-tmpfs roots, and removes entries relative to an already
@@ -6,6 +8,8 @@ package tmpfshygiene
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -18,15 +22,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-)
-
-const (
-	// PressureThresholdPct is the post-sweep tmpfs utilization that Fleet
-	// promotes to the tmpfs_pressure attention signal.
-	PressureThresholdPct = 85
-
-	ModeDryRun = "dry-run"
-	ModeApply  = "apply"
 )
 
 // policy is one explicit top-level allowlist entry. The sweeper never deletes
@@ -56,60 +51,6 @@ var defaultPolicies = []policy{
 	{Category: "worker_scratch", Pattern: "claude-*", MinAge: 6 * time.Hour},
 	{Category: "worker_scratch", Pattern: "codex-*", MinAge: 6 * time.Hour},
 	{Category: "worker_scratch", Pattern: "opencode-*", MinAge: 6 * time.Hour},
-}
-
-// MountUsage is the filesystem identity and capacity snapshot used before and
-// after a sweep. InspectMount is injectable so tests never inspect or mutate the
-// live host /tmp.
-type MountUsage struct {
-	Tmpfs          bool  `json:"tmpfs"`
-	UsePct         int   `json:"use_pct"`
-	TotalBytes     int64 `json:"total_bytes"`
-	UsedBytes      int64 `json:"used_bytes"`
-	AvailableBytes int64 `json:"available_bytes"`
-}
-
-// CategoryStats reports what each allowlisted category matched and reclaimed.
-type CategoryStats struct {
-	Candidates       int   `json:"candidates"`
-	Protected        int   `json:"protected"`
-	Deleted          int   `json:"deleted"`
-	ReclaimableBytes int64 `json:"reclaimable_bytes"`
-	FreedBytes       int64 `json:"freed_bytes"`
-}
-
-// Summary is emitted as one JSON line by every CLI or scheduled sweep.
-type Summary struct {
-	Timestamp        time.Time                `json:"timestamp"`
-	Mode             string                   `json:"mode"`
-	Root             string                   `json:"root"`
-	Tmpfs            bool                     `json:"tmpfs"`
-	UsePct           int                      `json:"use_pct"`
-	Pressure         bool                     `json:"pressure"`
-	AttentionCode    string                   `json:"attention_code,omitempty"`
-	ScannedEntries   int                      `json:"scanned_entries"`
-	MatchedEntries   int                      `json:"matched_entries"`
-	ProtectedEntries int                      `json:"protected_entries"`
-	DeletedEntries   int                      `json:"deleted_entries"`
-	ReclaimableBytes int64                    `json:"reclaimable_bytes"`
-	FreedBytes       int64                    `json:"freed_bytes"`
-	Categories       map[string]CategoryStats `json:"categories"`
-	ProtectHits      map[string]int           `json:"protect_hits"`
-	ProcScanErrors   int                      `json:"proc_scan_errors,omitempty"`
-	Error            string                   `json:"error,omitempty"`
-}
-
-// Options supplies the sweep roots and safety dependencies. Production uses
-// /tmp, /proc, InspectLinuxMount, and the process effective uid.
-type Options struct {
-	Root           string
-	ProcRoot       string
-	Mode           string
-	ProtectedPaths []string
-	Now            func() time.Time
-	InspectMount   func(string) (MountUsage, error)
-	EffectiveUID   func() int
-	beforeApply    func(string) // deterministic revalidation test hook
 }
 
 type treeInfo struct {
@@ -214,7 +155,7 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 			if item.info.crossDevice {
 				item.protects["mount_boundary"] = struct{}{}
 			}
-			if item.info.ownerUID >= 0 && item.info.ownerUID != opts.EffectiveUID() {
+			if ownerMismatch(item.info.ownerUID, opts.EffectiveUID()) {
 				item.protects["owner_mismatch"] = struct{}{}
 			}
 			if !item.info.newest.IsZero() && summary.Timestamp.Sub(item.info.newest) < policy.MinAge {
@@ -228,7 +169,7 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 		nameSet[item.name] = struct{}{}
 	}
 
-	procProtect, scanErrors, err := collectProcessProtects(opts.ProcRoot, opts.Root, nameSet)
+	procProtect, scanErrors, err := collectProcessProtects(opts.ProcRoot, opts.Root, nameSet, opts.processID())
 	if err != nil {
 		return fail(fmt.Errorf("build process protect set: %w", err))
 	}
@@ -236,6 +177,9 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 	for i := range candidates {
 		for reason := range procProtect[candidates[i].name] {
 			candidates[i].protects[reason] = struct{}{}
+		}
+		if scanErrors > 0 {
+			candidates[i].protects["proc_scan_error"] = struct{}{}
 		}
 	}
 
@@ -247,6 +191,13 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 		}
 		defer unix.Close(rootFD)
 	}
+
+	var quarantine *sweepQuarantine
+	defer func() {
+		if quarantine != nil {
+			quarantine.close(rootFD)
+		}
+	}()
 
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
 	for _, item := range candidates {
@@ -260,37 +211,87 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 			if opts.beforeApply != nil {
 				opts.beforeApply(item.path)
 			}
-			// The initial tree scan can be long on a pressured host. Revalidate the
-			// candidate immediately before deletion so a newly-written file, git
-			// marker, owner change, symlink swap, or bind mount cannot inherit the
-			// earlier abandoned-tree decision.
-			entryInfo, lerr := os.Lstat(item.path)
-			switch {
-			case errors.Is(lerr, fs.ErrNotExist):
-				item.protects["disappeared"] = struct{}{}
-			case lerr != nil:
-				item.protects["scan_error"] = struct{}{}
-			case entryInfo.Mode()&os.ModeSymlink != 0:
-				item.protects["symlink"] = struct{}{}
-			case entryInfo.Mode()&os.ModeSocket != 0:
-				item.protects["always_keep"] = struct{}{}
-			default:
-				refreshed, refreshErr := inspectTree(item.path, uint64(rootStat.Dev))
-				if refreshErr != nil {
-					item.protects["scan_error"] = struct{}{}
+			if quarantine == nil {
+				quarantine, err = createSweepQuarantine(rootFD, opts.Root, uint64(rootStat.Dev))
+				if err != nil {
+					summary.Categories[item.policy.Category] = stats
+					return fail(fmt.Errorf("create private sweep quarantine: %w", err))
+				}
+			}
+			isolated := false
+			if err := unix.Renameat(rootFD, item.name, quarantine.fd, item.name); err != nil {
+				if err == unix.ENOENT {
+					item.protects["disappeared"] = struct{}{}
 				} else {
-					item.info = refreshed
-					if refreshed.hasGit {
-						item.protects["git_worktree"] = struct{}{}
+					summary.Categories[item.policy.Category] = stats
+					return fail(fmt.Errorf("isolate %s safely: %w", item.path, err))
+				}
+			} else {
+				isolated = true
+			}
+
+			if isolated {
+				// Isolation closes the replacement race: every mutable check below is
+				// performed on the exact object moved into the private directory, and
+				// ordinary processes can no longer open it through its public name.
+				isolatedPath := filepath.Join(quarantine.path, item.name)
+				entryInfo, lerr := os.Lstat(isolatedPath)
+				switch {
+				case errors.Is(lerr, fs.ErrNotExist):
+					item.protects["disappeared"] = struct{}{}
+				case lerr != nil:
+					item.protects["scan_error"] = struct{}{}
+				case entryInfo.Mode()&os.ModeSymlink != 0:
+					item.protects["symlink"] = struct{}{}
+				case entryInfo.Mode()&os.ModeSocket != 0:
+					item.protects["always_keep"] = struct{}{}
+				default:
+					refreshed, refreshErr := inspectTree(isolatedPath, uint64(rootStat.Dev))
+					if refreshErr != nil {
+						item.protects["scan_error"] = struct{}{}
+					} else {
+						item.info = refreshed
+						if refreshed.hasGit {
+							item.protects["git_worktree"] = struct{}{}
+						}
+						if refreshed.crossDevice {
+							item.protects["mount_boundary"] = struct{}{}
+						}
+						if ownerMismatch(refreshed.ownerUID, opts.EffectiveUID()) {
+							item.protects["owner_mismatch"] = struct{}{}
+						}
+						if !refreshed.newest.IsZero() && summary.Timestamp.Sub(refreshed.newest) < item.policy.MinAge {
+							item.protects["too_young"] = struct{}{}
+						}
 					}
-					if refreshed.crossDevice {
-						item.protects["mount_boundary"] = struct{}{}
+				}
+
+				// The initial /proc snapshot may be stale by the time a large tree is
+				// reached. Scan again after isolation. cwd/fd links follow the isolated
+				// path; cmdlines can still contain the former public path, so both top-
+				// level names are mapped back to this candidate.
+				freshNames := map[string]struct{}{item.name: {}, quarantine.name: {}}
+				freshProtect, freshScanErrors, scanErr := collectProcessProtects(opts.ProcRoot, opts.Root, freshNames, opts.processID())
+				summary.ProcScanErrors += freshScanErrors
+				if scanErr != nil {
+					if restoreErr := quarantine.restore(rootFD, item.name); restoreErr != nil {
+						scanErr = fmt.Errorf("%w; also failed to restore isolated candidate: %v", scanErr, restoreErr)
 					}
-					if refreshed.ownerUID >= 0 && refreshed.ownerUID != opts.EffectiveUID() {
-						item.protects["owner_mismatch"] = struct{}{}
+					summary.Categories[item.policy.Category] = stats
+					return fail(fmt.Errorf("refresh process protect set for %s: %w", item.path, scanErr))
+				}
+				for _, name := range []string{item.name, quarantine.name} {
+					for reason := range freshProtect[name] {
+						item.protects[reason] = struct{}{}
 					}
-					if !refreshed.newest.IsZero() && summary.Timestamp.Sub(refreshed.newest) < item.policy.MinAge {
-						item.protects["too_young"] = struct{}{}
+				}
+				if freshScanErrors > 0 {
+					item.protects["proc_scan_error"] = struct{}{}
+				}
+				if len(item.protects) > 0 {
+					if restoreErr := quarantine.restore(rootFD, item.name); restoreErr != nil {
+						summary.Categories[item.policy.Category] = stats
+						return fail(fmt.Errorf("restore protected %s: %w", item.path, restoreErr))
 					}
 				}
 			}
@@ -307,14 +308,22 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 		summary.ReclaimableBytes += item.info.bytes
 		stats.ReclaimableBytes += item.info.bytes
 		if opts.Mode == ModeApply {
-			if err := removeEntryAt(ctx, rootFD, item.name, uint64(rootStat.Dev)); err != nil {
+			result, removeErr := opts.removeEntry(ctx, quarantine.fd, item.name, uint64(rootStat.Dev))
+			summary.FreedBytes += result.freedBytes
+			stats.FreedBytes += result.freedBytes
+			if removeErr != nil {
+				if result.removedObjects > 0 {
+					summary.PartialEntries++
+					stats.Partial++
+				}
+				if restoreErr := quarantine.restore(rootFD, item.name); restoreErr != nil {
+					removeErr = fmt.Errorf("%w; partially removed candidate remains quarantined because restore failed: %v", removeErr, restoreErr)
+				}
 				summary.Categories[item.policy.Category] = stats
-				return fail(fmt.Errorf("remove %s safely: %w", item.path, err))
+				return fail(fmt.Errorf("remove %s safely: %w", item.path, removeErr))
 			}
 			summary.DeletedEntries++
-			summary.FreedBytes += item.info.bytes
 			stats.Deleted++
-			stats.FreedBytes += item.info.bytes
 		}
 		summary.Categories[item.policy.Category] = stats
 	}
@@ -350,7 +359,64 @@ func normalizeOptions(opts Options) Options {
 	if opts.EffectiveUID == nil {
 		opts.EffectiveUID = os.Geteuid
 	}
+	if opts.processID == nil {
+		opts.processID = os.Getpid
+	}
+	if opts.removeEntry == nil {
+		opts.removeEntry = removeEntryAt
+	}
 	return opts
+}
+
+func ownerMismatch(ownerUID, effectiveUID int) bool {
+	return effectiveUID != 0 && ownerUID >= 0 && ownerUID != effectiveUID
+}
+
+type sweepQuarantine struct {
+	name string
+	path string
+	fd   int
+}
+
+func createSweepQuarantine(rootFD int, root string, rootDevice uint64) (*sweepQuarantine, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		var random [8]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return nil, err
+		}
+		name := ".maestro-tmpfs-hygiene-" + hex.EncodeToString(random[:])
+		if err := unix.Mkdirat(rootFD, name, 0o700); err != nil {
+			if err == unix.EEXIST {
+				continue
+			}
+			return nil, err
+		}
+		fd, err := unix.Openat(rootFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			_ = unix.Unlinkat(rootFD, name, unix.AT_REMOVEDIR)
+			return nil, err
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil || uint64(st.Dev) != rootDevice {
+			_ = unix.Close(fd)
+			_ = unix.Unlinkat(rootFD, name, unix.AT_REMOVEDIR)
+			if err != nil {
+				return nil, err
+			}
+			return nil, errors.New("quarantine crossed filesystem boundary")
+		}
+		return &sweepQuarantine{name: name, path: filepath.Join(root, name), fd: fd}, nil
+	}
+	return nil, errors.New("could not allocate unique quarantine directory")
+}
+
+func (q *sweepQuarantine) restore(rootFD int, name string) error {
+	return unix.Renameat2(q.fd, name, rootFD, name, unix.RENAME_NOREPLACE)
+}
+
+func (q *sweepQuarantine) close(rootFD int) {
+	_ = unix.Close(q.fd)
+	_ = unix.Unlinkat(rootFD, q.name, unix.AT_REMOVEDIR)
 }
 
 // InspectLinuxMount identifies tmpfs by filesystem magic and calculates the
@@ -488,7 +554,7 @@ func pathWithin(path, base string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]struct{}) (map[string]map[string]struct{}, int, error) {
+func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]struct{}, ignoredPID int) (map[string]map[string]struct{}, int, error) {
 	protected := make(map[string]map[string]struct{})
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -510,7 +576,11 @@ func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]stru
 		if !entry.IsDir() {
 			continue
 		}
-		if _, err := strconv.Atoi(entry.Name()); err != nil {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if pid == ignoredPID {
 			continue
 		}
 		processDir := filepath.Join(procRoot, entry.Name())
@@ -585,59 +655,69 @@ func candidateNamesFromValue(value, root string) []string {
 // removeEntryAt recursively unlinks a direct child of rootFD. Every directory
 // is opened with O_NOFOLLOW and every lookup uses *at syscalls, so neither the
 // target nor an intermediate component can be redirected through a symlink.
-func removeEntryAt(ctx context.Context, rootFD int, name string, rootDevice uint64) error {
+func removeEntryAt(ctx context.Context, rootFD int, name string, rootDevice uint64) (removalResult, error) {
 	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, filepath.Separator) {
-		return fmt.Errorf("invalid root entry %q", name)
+		return removalResult{}, fmt.Errorf("invalid root entry %q", name)
 	}
 	return removeAt(ctx, rootFD, name, rootDevice)
 }
 
-func removeAt(ctx context.Context, parentFD int, name string, rootDevice uint64) error {
+func removeAt(ctx context.Context, parentFD int, name string, rootDevice uint64) (removalResult, error) {
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return removalResult{}, ctx.Err()
 	default:
 	}
 	var st unix.Stat_t
 	if err := unix.Fstatat(parentFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		if err == unix.ENOENT {
-			return nil
+			return removalResult{}, nil
 		}
-		return err
+		return removalResult{}, err
 	}
 	if uint64(st.Dev) != rootDevice {
-		return errors.New("refusing to cross filesystem boundary")
+		return removalResult{}, errors.New("refusing to cross filesystem boundary")
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
 		if err := unix.Unlinkat(parentFD, name, 0); err != nil && err != unix.ENOENT {
-			return err
+			return removalResult{}, err
 		}
-		return nil
+		result := removalResult{removedObjects: 1}
+		if st.Mode&unix.S_IFMT == unix.S_IFREG {
+			result.freedBytes = st.Size
+		}
+		return result, nil
 	}
 
 	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return removalResult{}, err
 	}
 	dir := os.NewFile(uintptr(fd), name)
 	entries, readErr := dir.ReadDir(-1)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	result := removalResult{}
 	if readErr == nil {
 		for _, entry := range entries {
-			if err := removeAt(ctx, fd, entry.Name(), rootDevice); err != nil {
+			childResult, err := removeAt(ctx, fd, entry.Name(), rootDevice)
+			result.freedBytes += childResult.freedBytes
+			result.removedObjects += childResult.removedObjects
+			if err != nil {
 				dir.Close()
-				return err
+				return result, err
 			}
 		}
 	}
 	closeErr := dir.Close()
 	if readErr != nil {
-		return readErr
+		return result, readErr
 	}
 	if closeErr != nil {
-		return closeErr
+		return result, closeErr
 	}
 	if err := unix.Unlinkat(parentFD, name, unix.AT_REMOVEDIR); err != nil && err != unix.ENOENT {
-		return err
+		return result, err
 	}
-	return nil
+	result.removedObjects++
+	return result, nil
 }
