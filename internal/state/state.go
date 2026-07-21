@@ -1339,13 +1339,14 @@ type ApprovalAudit struct {
 }
 
 type State struct {
-	Sessions            map[string]*Session        `json:"sessions"`
-	Missions            map[int]*Mission           `json:"missions,omitempty"` // parent issue number → mission
-	SupervisorDecisions []SupervisorDecision       `json:"supervisor_decisions,omitempty"`
-	Approvals           []Approval                 `json:"approvals,omitempty"`
-	LessonProposals     []LessonProposal           `json:"lesson_proposals,omitempty"`
-	OutcomeHealth       *outcome.HealthCheckResult `json:"outcome_health,omitempty"`
-	OutcomeRecovery     *outcome.RecoveryState     `json:"outcome_recovery,omitempty"`
+	Sessions            map[string]*Session         `json:"sessions"`
+	FreshDispatchClaims map[int]*FreshDispatchClaim `json:"fresh_dispatch_claims,omitempty"`
+	Missions            map[int]*Mission            `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision        `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval                  `json:"approvals,omitempty"`
+	LessonProposals     []LessonProposal            `json:"lesson_proposals,omitempty"`
+	OutcomeHealth       *outcome.HealthCheckResult  `json:"outcome_health,omitempty"`
+	OutcomeRecovery     *outcome.RecoveryState      `json:"outcome_recovery,omitempty"`
 	// OutcomeGateStreaks tracks per-gate consecutive scheduled-failure runs with
 	// a failure fingerprint (gate name + reason class). OutcomeGateStreakCheckedAt
 	// is the CheckedAt of the last health result already folded into the streaks,
@@ -1602,6 +1603,7 @@ type ProjectStatusSync struct {
 func NewState() *State {
 	return &State{
 		Sessions:            make(map[string]*Session),
+		FreshDispatchClaims: make(map[int]*FreshDispatchClaim),
 		Missions:            make(map[int]*Mission),
 		ProjectStatusSync:   make(map[int]ProjectStatusSync),
 		BackendHealth:       make(map[string]BackendHealth),
@@ -1892,6 +1894,9 @@ func (s *State) normalize() {
 	if s.Sessions == nil {
 		s.Sessions = make(map[string]*Session)
 	}
+	if s.FreshDispatchClaims == nil {
+		s.FreshDispatchClaims = make(map[int]*FreshDispatchClaim)
+	}
 	if s.Missions == nil {
 		s.Missions = make(map[int]*Mission)
 	}
@@ -1917,6 +1922,7 @@ func (s *State) normalize() {
 
 func (s *State) copyFrom(src *State) {
 	s.Sessions = src.Sessions
+	s.FreshDispatchClaims = src.FreshDispatchClaims
 	s.Missions = src.Missions
 	s.SupervisorDecisions = src.SupervisorDecisions
 	s.Approvals = src.Approvals
@@ -1977,6 +1983,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	if err := mergeSessions(merged, base, current, ours); err != nil {
 		return nil, err
 	}
+	merged.FreshDispatchClaims = mergeFreshDispatchClaims(current.FreshDispatchClaims, ours.FreshDispatchClaims)
 	if err := mergeMissions(merged, base, current, ours); err != nil {
 		return nil, err
 	}

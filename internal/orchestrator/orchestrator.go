@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +45,11 @@ const (
 	// observes the authoritative terminal state within the 10-minute SLA even
 	// when the prior check landed immediately after a cycle boundary.
 	terminalReconcileInterval = 9 * time.Minute
-	pipelineFullLabel         = "pipeline:full"
+	// A fresh dispatch lease spans the slow pre-worker setup window. If its
+	// owner dies, the next cycle renews the same exact slot/worktree/branch;
+	// it never allocates a duplicate identity merely to retry startup.
+	freshDispatchLeaseDuration = 10 * time.Minute
+	pipelineFullLabel          = "pipeline:full"
 )
 
 type cycleBoolResult struct {
@@ -107,8 +114,9 @@ type Orchestrator struct {
 	workerStartPhaseFn func(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error
 
 	// Testing hooks for startNewWorkers
-	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
-	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
+	listOpenIssuesFn     func(labels []string) ([]github.Issue, error)
+	workerStartFn        func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
+	workerStartClaimedFn func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend, slot string) (string, error)
 
 	// Cached project board metadata and sweep cadence.
 	projectField           *github.ProjectField
@@ -7798,6 +7806,16 @@ func (o *Orchestrator) startWorker(cfg *config.Config, s *state.State, issue git
 	return worker.Start(cfg, s, o.repo, issue, promptBase, backend)
 }
 
+func (o *Orchestrator) startClaimedWorker(cfg *config.Config, s *state.State, issue github.Issue, promptBase, backend, slot string) (string, error) {
+	if cfg == nil {
+		cfg = o.cfg
+	}
+	if o.workerStartClaimedFn != nil {
+		return o.workerStartClaimedFn(cfg, s, o.repo, issue, promptBase, backend, slot)
+	}
+	return worker.StartReserved(cfg, s, o.repo, issue, promptBase, backend, slot)
+}
+
 func issueHasLabel(issue github.Issue, label string) bool {
 	for _, issueLabel := range issue.Labels {
 		if strings.EqualFold(strings.TrimSpace(issueLabel.Name), label) {
@@ -7873,7 +7891,7 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 }
 
 func (o *Orchestrator) orderedQueueIssueNumberPauseReason(s *state.State, issueNumber int) string {
-	if s.IssueInProgress(issueNumber) {
+	if s.IssueInProgress(issueNumber) && s.IssueHasNonFreshClaim(issueNumber) {
 		return fmt.Sprintf("issue #%d already has an active session", issueNumber)
 	}
 
@@ -8652,6 +8670,10 @@ func (o *Orchestrator) applySupervisorOwnedReadyFilter(s *state.State, issues []
 	// in awaiting_dispatch forever (#940).
 	filtered := make([]github.Issue, 0, 1)
 	for _, issue := range issues {
+		if _, claimed := s.FreshDispatchClaimFor(issue.Number); claimed {
+			filtered = append(filtered, issue)
+			continue
+		}
 		if o.supervisorSelectedRepairSpawn(s, issue.Number) {
 			filtered = append(filtered, issue)
 			continue
@@ -8701,6 +8723,25 @@ func (o *Orchestrator) augmentWithSupervisorSelectedIssue(s *state.State, issues
 	return o.appendFetchedSupervisorIssue(issues, selected)
 }
 
+func (o *Orchestrator) augmentWithFreshDispatchClaims(s *state.State, issues []github.Issue) []github.Issue {
+	if s == nil || len(s.FreshDispatchClaims) == 0 {
+		return issues
+	}
+	numbers := make([]int, 0, len(s.FreshDispatchClaims))
+	for issue := range s.FreshDispatchClaims {
+		if _, active := s.FreshDispatchClaimFor(issue); active {
+			numbers = append(numbers, issue)
+		}
+	}
+	sort.Ints(numbers)
+	for _, issue := range numbers {
+		if !containsIssueNumber(issues, issue) {
+			issues = o.appendFetchedSupervisorIssue(issues, issue)
+		}
+	}
+	return issues
+}
+
 func (o *Orchestrator) appendFetchedSupervisorIssue(issues []github.Issue, selected int) []github.Issue {
 	if selected <= 0 || containsIssueNumber(issues, selected) {
 		return issues
@@ -8716,6 +8757,113 @@ func (o *Orchestrator) appendFetchedSupervisorIssue(issues []github.Issue, selec
 	return append(issues, issue)
 }
 
+func (o *Orchestrator) durableFreshDispatchClaimsEnabled() bool {
+	if o == nil || o.cfg == nil || strings.TrimSpace(o.cfg.StateDir) == "" {
+		return false
+	}
+	// Legacy unit hooks synthesize arbitrary slot names and intentionally bypass
+	// production worker identity. A reservation-aware hook opts tests into the
+	// durable path explicitly.
+	return o.workerStartFn == nil || o.workerStartClaimedFn != nil
+}
+
+func (o *Orchestrator) claimFreshDispatch(s *state.State, issue github.Issue, now time.Time) (*state.FreshDispatchClaim, bool, error) {
+	if !o.durableFreshDispatchClaimsEnabled() {
+		return nil, true, nil
+	}
+	leaseID, err := newFreshDispatchLeaseID()
+	if err != nil {
+		return nil, false, err
+	}
+	var (
+		claim    state.FreshDispatchClaim
+		acquired bool
+	)
+	err = state.Update(o.cfg.StateDir, func(latest *state.State) error {
+		reserved, ok, claimErr := latest.ClaimFreshDispatch(issue.Number, o.cfg.SessionPrefix, leaseID, freshDispatchLeaseDuration, now)
+		if claimErr != nil {
+			return claimErr
+		}
+		if reserved == nil {
+			return state.ErrNoStateChange
+		}
+		if ok && strings.TrimSpace(reserved.Branch) == "" {
+			reserved.Branch = worker.BranchName(reserved.Slot, issue)
+			reserved.Worktree = filepath.Join(o.cfg.WorktreeBase, reserved.Slot)
+			reserved.UpdatedAt = now.UTC()
+		}
+		claim = *reserved
+		acquired = ok
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if claim.IssueNumber > 0 {
+		if s.FreshDispatchClaims == nil {
+			s.FreshDispatchClaims = make(map[int]*state.FreshDispatchClaim)
+		}
+		copy := claim
+		s.FreshDispatchClaims[issue.Number] = &copy
+		if next := freshDispatchSlotSequence(claim.Slot, o.cfg.SessionPrefix) + 1; next > s.NextSlot {
+			s.NextSlot = next
+		}
+	}
+	return &claim, acquired, nil
+}
+
+func (o *Orchestrator) completeFreshDispatch(s *state.State, claim *state.FreshDispatchClaim, sess *state.Session, now time.Time) error {
+	if claim == nil {
+		return nil
+	}
+	if err := state.Update(o.cfg.StateDir, func(latest *state.State) error {
+		return latest.CompleteFreshDispatch(claim.IssueNumber, claim.LeaseID, sess, now)
+	}); err != nil {
+		return err
+	}
+	copy := *claim
+	copy.Status = state.FreshDispatchClaimStatusCompleted
+	copy.UpdatedAt = now.UTC()
+	copy.CompletedAt = now.UTC()
+	copy.SessionStartedAt = sess.StartedAt.UTC()
+	copy.LeaseExpiresAt = time.Time{}
+	copy.TerminalReason = "session_committed"
+	s.FreshDispatchClaims[claim.IssueNumber] = &copy
+	return nil
+}
+
+func (o *Orchestrator) reconcileFreshDispatchClaims(s *state.State, now time.Time) {
+	if !o.durableFreshDispatchClaimsEnabled() || s == nil {
+		return
+	}
+	if err := state.Update(o.cfg.StateDir, func(latest *state.State) error {
+		if latest.ReconcileFreshDispatchClaims(now) == 0 {
+			return state.ErrNoStateChange
+		}
+		return nil
+	}); err != nil {
+		log.Printf("[orch] reconcile fresh dispatch claims: %v", err)
+	}
+	s.ReconcileFreshDispatchClaims(now)
+}
+
+func freshDispatchSlotSequence(slot, prefix string) int {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" || !strings.HasPrefix(slot, prefix+"-") {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimPrefix(slot, prefix+"-"))
+	return n
+}
+
+func newFreshDispatchLeaseID() (string, error) {
+	var raw [16]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("create fresh dispatch lease: %w", err)
+	}
+	return "dispatch:" + hex.EncodeToString(raw[:]), nil
+}
+
 func sortedStateSessionNames(s *state.State) []string {
 	names := make([]string, 0, len(s.Sessions))
 	for name := range s.Sessions {
@@ -8726,6 +8874,7 @@ func sortedStateSessionNames(s *state.State) []string {
 }
 
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
+	o.reconcileFreshDispatchClaims(s, time.Now().UTC())
 	// EMERGENCY STOP (#840): the fleet-wide big red button closes the spawn gate
 	// ahead of every other check. It halts ALL new worker spawns (and, since the
 	// router is only consulted inside this issue loop, every router LLM call for a
@@ -8767,6 +8916,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 	}
 	issues = o.augmentWithSupervisorSelectedIssue(s, issues)
+	issues = o.augmentWithFreshDispatchClaims(s, issues)
 	if filtered, ordered := o.applyOrderedQueueFilter(s, issues); ordered {
 		issues = filtered
 	} else {
@@ -8779,10 +8929,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	dispatchPauseLogged := false
 	for _, issue := range issues {
 		repairSpawn := o.supervisorSelectedRepairSpawn(s, issue.Number)
-		if s.IssueInProgress(issue.Number) {
+		_, freshDispatchPending := s.FreshDispatchClaimFor(issue.Number)
+		if s.IssueInProgress(issue.Number) && !freshDispatchPending {
 			if !repairSpawn {
 				continue
 			}
+		} else if freshDispatchPending && s.IssueHasNonFreshClaim(issue.Number) {
+			log.Printf("[orch] refusing fresh dispatch renewal for issue #%d: a canonical session/PR claim appeared", issue.Number)
+			continue
 		}
 
 		// Pre-spawn guard (issue #456): never start a new worker for an issue that is
@@ -9027,8 +9181,30 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			log.Printf("[orch] issue #%d: policy SHADOW would pick %s — dispatching %s unchanged",
 				issue.Number, backendDecision.ShadowReason, backendName)
 		}
+		var freshClaim *state.FreshDispatchClaim
+		if !repairSpawn {
+			claimedAt := time.Now().UTC()
+			claim, acquired, claimErr := o.claimFreshDispatch(s, issue, claimedAt)
+			if claimErr != nil {
+				log.Printf("[orch] claim fresh dispatch for issue #%d: %v", issue.Number, claimErr)
+				continue
+			}
+			if !acquired {
+				if claim != nil && claim.Slot != "" {
+					log.Printf("[orch] skipping duplicate fresh dispatch for issue #%d: canonical startup lease is %s (generation=%d)", issue.Number, claim.Slot, claim.LeaseGeneration)
+				}
+				continue
+			}
+			freshClaim = claim
+		}
 		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, reason=%s, phase=%s, long_running=%v)", issue.Number, issue.Title, backendName, backendReason, initialPhase, longRunning)
-		slotName, err := o.startWorker(workerCfg, s, issue, promptBase, backendName)
+		var slotName string
+		var err error
+		if freshClaim != nil {
+			slotName, err = o.startClaimedWorker(workerCfg, s, issue, promptBase, backendName, freshClaim.Slot)
+		} else {
+			slotName, err = o.startWorker(workerCfg, s, issue, promptBase, backendName)
+		}
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
@@ -9057,6 +9233,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// dashboard / fleet API can show why this backend was chosen (label /
 		// auto / default / router_error / phase / review_repair / policy:<tier>).
 		if sess := s.Sessions[slotName]; sess != nil {
+			if freshClaim != nil && !freshClaim.ClaimedAt.IsZero() && (sess.StartedAt.IsZero() || freshClaim.ClaimedAt.Before(sess.StartedAt)) {
+				sess.StartedAt = freshClaim.ClaimedAt.UTC()
+			}
 			if backendDecision.Tier != "" || backendDecision.ShadowTier != "" {
 				sel := o.policyBackendSelection(backendDecision)
 				sel.SelectedBackend = backendName
@@ -9070,6 +9249,19 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 			if taskType != "" && len(sess.Attribution) > 0 {
 				sess.Attribution[len(sess.Attribution)-1].TaskType = taskType
+			}
+		}
+		if freshClaim != nil {
+			sess := s.Sessions[slotName]
+			if slotName != freshClaim.Slot || sess == nil {
+				log.Printf("[orch] fresh dispatch for issue #%d returned non-canonical slot %q (want %q); lease remains active", issue.Number, slotName, freshClaim.Slot)
+				started++
+				continue
+			}
+			if err := o.completeFreshDispatch(s, freshClaim, sess, time.Now().UTC()); err != nil {
+				log.Printf("[orch] persist fresh dispatch for issue #%d on %s: %v (lease remains authoritative)", issue.Number, slotName, err)
+				started++
+				continue
 			}
 		}
 		if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
